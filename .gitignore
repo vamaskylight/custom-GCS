@@ -1,0 +1,50 @@
+# Reference-only legacy GCS (not part of VGCS product source)
+Ground-Control-Station-for-UAV/
+
+# Internal planning / milestones (keep local or private; omit from client-facing checkouts)
+DOCS/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+.venv/
+env/
+.env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Logs & local secrets
+*.log
+*.pem
+secrets/
