@@ -7,6 +7,7 @@ import time
 from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -17,8 +18,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
-    QSplitter,
     QDoubleSpinBox,
     QTextEdit,
     QVBoxLayout,
@@ -45,17 +46,17 @@ class MainWindow(QMainWindow):
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
 
-        conn_label = QLabel("MAVLink connection string")
+        self._conn_label = QLabel("MAVLink connection string")
         self._conn_edit = QLineEdit()
         self._conn_edit.setText(
             str(self._settings.value("last_connection_string", "udp:127.0.0.1:14550"))
         )
-        timeout_label = QLabel("Watchdog timeout (s)")
+        self._timeout_label = QLabel("Watchdog timeout (s)")
         self._timeout_spin = QDoubleSpinBox()
         self._timeout_spin.setRange(1.0, 10.0)
         self._timeout_spin.setSingleStep(0.5)
         self._timeout_spin.setValue(self._timeout_s)
-        theme_label = QLabel("State color theme")
+        self._theme_label = QLabel("State color theme")
         self._theme_combo = QComboBox()
         self._theme_combo.addItems(["Default", "High Contrast", "Dark Friendly"])
         self._theme_combo.setCurrentText(self._theme_name)
@@ -81,67 +82,60 @@ class MainWindow(QMainWindow):
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setPlaceholderText("MAVLink log…")
+        self._log.setMinimumHeight(150)
 
-        link_grid = QGridLayout()
-        link_grid.setVerticalSpacing(6 if self._compact_ui else 8)
-        link_grid.setColumnStretch(1, 1)
-        link_grid.addWidget(conn_label, 0, 0)
-        link_grid.addWidget(self._conn_edit, 0, 1, 1, 3)
-        link_grid.addWidget(timeout_label, 1, 0)
-        link_grid.addWidget(self._timeout_spin, 1, 1)
-        link_grid.addWidget(theme_label, 1, 2)
-        link_grid.addWidget(self._theme_combo, 1, 3)
+        self._link_grid = QGridLayout()
+        self._link_grid.setVerticalSpacing(6 if self._compact_ui else 8)
+        self._link_grid.setColumnStretch(1, 1)
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6 if self._compact_ui else 8)
-        btn_row.addWidget(self._btn_connect)
-        btn_row.addWidget(self._btn_disconnect)
-        btn_row.addWidget(self._btn_reset)
-        btn_row.addWidget(self._btn_restore_defaults)
+        self._btn_grid = QGridLayout()
+        self._btn_grid.setHorizontalSpacing(6 if self._compact_ui else 8)
+        self._btn_grid.setVerticalSpacing(6 if self._compact_ui else 8)
 
         link_box = QGroupBox("Connection")
         link_inner = QVBoxLayout()
-        link_inner.addLayout(link_grid)
-        link_inner.addLayout(btn_row)
+        link_inner.addLayout(self._link_grid)
+        link_inner.addLayout(self._btn_grid)
         link_box.setLayout(link_inner)
+        self._link_box = link_box
 
-        status_row = QHBoxLayout()
-        status_row.setSpacing(8 if self._compact_ui else 12)
-        status_row.addWidget(self._status_frame, 1)
-        status_row.addWidget(self._hb_frame, 1)
-        status_row.addWidget(self._watchdog_frame, 1)
+        self._status_row = QHBoxLayout()
+        self._status_row.setSpacing(8 if self._compact_ui else 12)
+        self._status_row.addWidget(self._status_frame, 1)
+        self._status_row.addWidget(self._hb_frame, 1)
+        self._status_row.addWidget(self._watchdog_frame, 1)
 
-        dash_row = QHBoxLayout()
-        dash_row.setSpacing(8 if self._compact_ui else 12)
-        dash_row.addWidget(self._telemetry_body, 1)
+        self._dash_row = QBoxLayout(QBoxLayout.LeftToRight)
+        self._dash_row.setSpacing(8 if self._compact_ui else 12)
+        self._dash_row.addWidget(self._telemetry_body, 1)
         right_col = QVBoxLayout()
         compass_title = QLabel("Compass")
         compass_title.setStyleSheet("color: #7d869c; font-weight: 600; font-size: 12px;")
         right_col.addWidget(compass_title)
         right_col.addWidget(self._compass, 0, Qt.AlignHCenter)
         right_col.addStretch()
-        dash_row.addLayout(right_col, 0)
+        self._dash_row.addLayout(right_col, 0)
 
-        top_panel = QWidget()
-        top_layout = QVBoxLayout()
-        top_layout.setSpacing(8 if self._compact_ui else 12)
-        top_layout.addWidget(self._build_header_bar())
-        top_layout.addWidget(link_box)
-        top_layout.addLayout(status_row)
-        top_layout.addLayout(dash_row)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_panel.setLayout(top_layout)
+        content_panel = QWidget()
+        self._content_layout = QVBoxLayout()
+        self._content_layout.setSpacing(8 if self._compact_ui else 12)
+        self._content_layout.addWidget(self._build_header_bar())
+        self._content_layout.addWidget(link_box)
+        self._content_layout.addLayout(self._status_row)
+        self._content_layout.addLayout(self._dash_row)
+        self._content_layout.addWidget(self._log)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        content_panel.setLayout(self._content_layout)
 
-        self._splitter = QSplitter(Qt.Vertical)
-        self._splitter.addWidget(top_panel)
-        self._splitter.addWidget(self._log)
-        self._splitter.setStretchFactor(0, 3)
-        self._splitter.setStretchFactor(1, 2)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setWidget(content_panel)
 
         central = QWidget()
         central.setObjectName("centralRoot")
         layout = QVBoxLayout()
-        layout.addWidget(self._splitter)
+        layout.addWidget(self._scroll)
         margin = 8 if self._compact_ui else 14
         layout.setContentsMargins(margin, margin, margin, margin)
         central.setLayout(layout)
@@ -159,8 +153,8 @@ class MainWindow(QMainWindow):
         self._flight_timer.timeout.connect(self._on_flight_timer_tick)
         self._flight_timer.start()
         self._restore_window_geometry()
-        self._restore_splitter_state()
         self._fit_to_screen()
+        self._apply_responsive_layout(self.width())
 
     def _detect_compact_ui(self) -> bool:
         screen = QGuiApplication.primaryScreen()
@@ -168,6 +162,47 @@ class MainWindow(QMainWindow):
             return False
         area = screen.availableGeometry()
         return area.height() <= 800 or area.width() <= 1366
+
+    def _apply_responsive_layout(self, width: int) -> None:
+        narrow = width < 1120
+
+        while self._link_grid.count():
+            self._link_grid.takeAt(0)
+        while self._btn_grid.count():
+            self._btn_grid.takeAt(0)
+
+        if narrow:
+            self._link_grid.addWidget(self._conn_label, 0, 0)
+            self._link_grid.addWidget(self._conn_edit, 1, 0, 1, 4)
+            self._link_grid.addWidget(self._timeout_label, 2, 0)
+            self._link_grid.addWidget(self._timeout_spin, 2, 1)
+            self._link_grid.addWidget(self._theme_label, 2, 2)
+            self._link_grid.addWidget(self._theme_combo, 2, 3)
+
+            self._btn_grid.addWidget(self._btn_connect, 0, 0)
+            self._btn_grid.addWidget(self._btn_disconnect, 0, 1)
+            self._btn_grid.addWidget(self._btn_reset, 1, 0)
+            self._btn_grid.addWidget(self._btn_restore_defaults, 1, 1)
+            self._btn_grid.setColumnStretch(0, 1)
+            self._btn_grid.setColumnStretch(1, 1)
+            self._dash_row.setDirection(QBoxLayout.TopToBottom)
+        else:
+            self._link_grid.addWidget(self._conn_label, 0, 0)
+            self._link_grid.addWidget(self._conn_edit, 0, 1, 1, 3)
+            self._link_grid.addWidget(self._timeout_label, 1, 0)
+            self._link_grid.addWidget(self._timeout_spin, 1, 1)
+            self._link_grid.addWidget(self._theme_label, 1, 2)
+            self._link_grid.addWidget(self._theme_combo, 1, 3)
+
+            self._btn_grid.addWidget(self._btn_connect, 0, 0)
+            self._btn_grid.addWidget(self._btn_disconnect, 0, 1)
+            self._btn_grid.addWidget(self._btn_reset, 0, 2)
+            self._btn_grid.addWidget(self._btn_restore_defaults, 0, 3)
+            self._btn_grid.setColumnStretch(0, 1)
+            self._btn_grid.setColumnStretch(1, 1)
+            self._btn_grid.setColumnStretch(2, 1)
+            self._btn_grid.setColumnStretch(3, 1)
+            self._dash_row.setDirection(QBoxLayout.LeftToRight)
 
     def _make_value_label(self) -> QLabel:
         lab = QLabel("—")
@@ -179,7 +214,7 @@ class MainWindow(QMainWindow):
     def _make_status_chip(self, title: str, initial: str) -> tuple[QLabel, QFrame]:
         frame = QFrame()
         frame.setObjectName("statusChip")
-        frame.setMinimumWidth(140 if self._compact_ui else 180)
+        frame.setMinimumWidth(120 if self._compact_ui else 180)
         lay = QVBoxLayout()
         lay.setSpacing(4)
         t = QLabel(title)
@@ -555,16 +590,6 @@ class MainWindow(QMainWindow):
         if self.width() < 820 or self.height() < 560:
             self.resize(920, 620)
 
-    def _restore_splitter_state(self) -> None:
-        splitter_state = self._settings.value("main_splitter_state")
-        if splitter_state is not None:
-            self._splitter.restoreState(splitter_state)
-        else:
-            self._splitter.setSizes([480, 180] if self._compact_ui else [560, 240])
-        sizes = self._splitter.sizes()
-        if len(sizes) != 2 or min(sizes) < 80:
-            self._splitter.setSizes([480, 180] if self._compact_ui else [560, 240])
-
     def _fit_to_screen(self) -> None:
         screen = QGuiApplication.primaryScreen()
         if screen is None:
@@ -576,6 +601,10 @@ class MainWindow(QMainWindow):
         target_h = min(self.height(), max_h)
         if target_w != self.width() or target_h != self.height():
             self.resize(target_w, target_h)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_responsive_layout(event.size().width())
 
     def _on_restore_defaults(self) -> None:
         if self._thread is not None and self._thread.isRunning():
@@ -608,5 +637,4 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt API
         self._on_disconnect()
         self._settings.setValue("window_geometry", self.saveGeometry())
-        self._settings.setValue("main_splitter_state", self._splitter.saveState())
         super().closeEvent(event)
