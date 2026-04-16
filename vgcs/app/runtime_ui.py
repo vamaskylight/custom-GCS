@@ -17,9 +17,9 @@ class UiFontProfile:
 
 
 def configure_high_dpi_policy() -> None:
-    """Use a stable DPI rounding strategy to reduce cross-machine drift."""
+    """Respect OS scaling to avoid tiny UI on high-DPI screens."""
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.RoundPreferFloor
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
 
 
