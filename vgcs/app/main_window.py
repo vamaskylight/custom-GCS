@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from PySide6.QtCore import Qt, QSettings, QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -34,7 +35,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("VGCS — Ground Control Station")
         self.resize(1024, 700)
-        self.setMinimumSize(980, 660)
+        self.setMinimumSize(820, 560)
 
         self._settings = QSettings("VGCS", "VGCS")
         self._thread: MavlinkThread | None = None
@@ -42,6 +43,7 @@ class MainWindow(QMainWindow):
         self._armed_since: float | None = None
         self._theme_name = str(self._settings.value("ui_theme", "Default"))
         self._theme_colors = self._build_theme_colors(self._theme_name)
+        self._compact_ui = self._detect_compact_ui()
 
         conn_label = QLabel("MAVLink connection string")
         self._conn_edit = QLineEdit()
@@ -81,6 +83,7 @@ class MainWindow(QMainWindow):
         self._log.setPlaceholderText("MAVLink log…")
 
         link_grid = QGridLayout()
+        link_grid.setVerticalSpacing(6 if self._compact_ui else 8)
         link_grid.setColumnStretch(1, 1)
         link_grid.addWidget(conn_label, 0, 0)
         link_grid.addWidget(self._conn_edit, 0, 1, 1, 3)
@@ -90,6 +93,7 @@ class MainWindow(QMainWindow):
         link_grid.addWidget(self._theme_combo, 1, 3)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(6 if self._compact_ui else 8)
         btn_row.addWidget(self._btn_connect)
         btn_row.addWidget(self._btn_disconnect)
         btn_row.addWidget(self._btn_reset)
@@ -102,11 +106,13 @@ class MainWindow(QMainWindow):
         link_box.setLayout(link_inner)
 
         status_row = QHBoxLayout()
+        status_row.setSpacing(8 if self._compact_ui else 12)
         status_row.addWidget(self._status_frame, 1)
         status_row.addWidget(self._hb_frame, 1)
         status_row.addWidget(self._watchdog_frame, 1)
 
         dash_row = QHBoxLayout()
+        dash_row.setSpacing(8 if self._compact_ui else 12)
         dash_row.addWidget(self._telemetry_body, 1)
         right_col = QVBoxLayout()
         compass_title = QLabel("Compass")
@@ -118,7 +124,7 @@ class MainWindow(QMainWindow):
 
         top_panel = QWidget()
         top_layout = QVBoxLayout()
-        top_layout.setSpacing(12)
+        top_layout.setSpacing(8 if self._compact_ui else 12)
         top_layout.addWidget(self._build_header_bar())
         top_layout.addWidget(link_box)
         top_layout.addLayout(status_row)
@@ -136,7 +142,8 @@ class MainWindow(QMainWindow):
         central.setObjectName("centralRoot")
         layout = QVBoxLayout()
         layout.addWidget(self._splitter)
-        layout.setContentsMargins(14, 14, 14, 14)
+        margin = 8 if self._compact_ui else 14
+        layout.setContentsMargins(margin, margin, margin, margin)
         central.setLayout(layout)
         self.setCentralWidget(central)
 
@@ -153,6 +160,14 @@ class MainWindow(QMainWindow):
         self._flight_timer.start()
         self._restore_window_geometry()
         self._restore_splitter_state()
+        self._fit_to_screen()
+
+    def _detect_compact_ui(self) -> bool:
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return False
+        area = screen.availableGeometry()
+        return area.height() <= 800 or area.width() <= 1366
 
     def _make_value_label(self) -> QLabel:
         lab = QLabel("—")
@@ -164,7 +179,7 @@ class MainWindow(QMainWindow):
     def _make_status_chip(self, title: str, initial: str) -> tuple[QLabel, QFrame]:
         frame = QFrame()
         frame.setObjectName("statusChip")
-        frame.setMinimumWidth(180)
+        frame.setMinimumWidth(140 if self._compact_ui else 180)
         lay = QVBoxLayout()
         lay.setSpacing(4)
         t = QLabel(title)
@@ -182,7 +197,7 @@ class MainWindow(QMainWindow):
         bar.setObjectName("headerBar")
         bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         h = QHBoxLayout()
-        h.setContentsMargins(16, 12, 16, 12)
+        h.setContentsMargins(12, 8, 12, 8)
         left = QVBoxLayout()
         title = QLabel("VGCS")
         title.setObjectName("headerTitle")
@@ -205,8 +220,8 @@ class MainWindow(QMainWindow):
 
         primary = QGroupBox("Primary flight data")
         pg = QGridLayout()
-        pg.setHorizontalSpacing(16)
-        pg.setVerticalSpacing(8)
+        pg.setHorizontalSpacing(12 if self._compact_ui else 16)
+        pg.setVerticalSpacing(6 if self._compact_ui else 8)
         r = 0
 
         def row_pair(
@@ -240,8 +255,8 @@ class MainWindow(QMainWindow):
 
         systems = QGroupBox("Navigation & systems")
         sg = QGridLayout()
-        sg.setHorizontalSpacing(16)
-        sg.setVerticalSpacing(8)
+        sg.setHorizontalSpacing(12 if self._compact_ui else 16)
+        sg.setVerticalSpacing(6 if self._compact_ui else 8)
         sr = 0
 
         def row_sys(a: str, ka: str, b: str, kb: str) -> None:
@@ -271,7 +286,7 @@ class MainWindow(QMainWindow):
 
         col = QWidget()
         v = QVBoxLayout()
-        v.setSpacing(12)
+        v.setSpacing(8 if self._compact_ui else 12)
         v.addWidget(primary)
         v.addWidget(systems)
         col.setLayout(v)
@@ -527,23 +542,40 @@ class MainWindow(QMainWindow):
         self._refresh_state_styles()
 
     def _restore_window_geometry(self) -> None:
+        screen = QGuiApplication.primaryScreen()
+        area = screen.availableGeometry() if screen is not None else None
         geometry = self._settings.value("window_geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
         else:
-            self.resize(1024, 700)
-        if self.width() < 900 or self.height() < 620:
-            self.resize(1024, 700)
+            if area is None:
+                self.resize(1024, 700)
+            else:
+                self.resize(min(1024, area.width() - 20), min(700, area.height() - 20))
+        if self.width() < 820 or self.height() < 560:
+            self.resize(920, 620)
 
     def _restore_splitter_state(self) -> None:
         splitter_state = self._settings.value("main_splitter_state")
         if splitter_state is not None:
             self._splitter.restoreState(splitter_state)
         else:
-            self._splitter.setSizes([560, 240])
+            self._splitter.setSizes([480, 180] if self._compact_ui else [560, 240])
         sizes = self._splitter.sizes()
         if len(sizes) != 2 or min(sizes) < 80:
-            self._splitter.setSizes([560, 240])
+            self._splitter.setSizes([480, 180] if self._compact_ui else [560, 240])
+
+    def _fit_to_screen(self) -> None:
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        max_w = max(820, area.width() - 12)
+        max_h = max(560, area.height() - 12)
+        target_w = min(self.width(), max_w)
+        target_h = min(self.height(), max_h)
+        if target_w != self.width() or target_h != self.height():
+            self.resize(target_w, target_h)
 
     def _on_restore_defaults(self) -> None:
         if self._thread is not None and self._thread.isRunning():
