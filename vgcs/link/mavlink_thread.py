@@ -6,6 +6,7 @@ Runs blocking pymavlink I/O off the GUI thread and emits decoded telemetry.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Optional
 
@@ -42,10 +43,19 @@ class MavlinkThread(QThread):
 
     def run(self) -> None:
         self._running = True
+        # Normalize common serial formats so pymavlink always parses correctly.
+        # Some environments treat `COM58:115200` as a network endpoint, causing:
+        #   bind(): port must be 0-65535
+        # Fix: convert to `serial:COM58:115200`.
+        connection_string = self._connection_string.strip()
+        m = re.match(r"^(COM\d+):(\d+)$", connection_string, flags=re.IGNORECASE)
+        if m:
+            connection_string = f"serial:{m.group(1)}:{m.group(2)}"
+        self.log_line.emit(f"Using: {connection_string}")
         try:
-            self.log_line.emit(f"Opening: {self._connection_string}")
+            self.log_line.emit(f"Opening: {connection_string}")
             self._master = mavutil.mavlink_connection(
-                self._connection_string,
+                connection_string,
                 autoreconnect=True,
             )
         except Exception as e:
