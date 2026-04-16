@@ -22,6 +22,9 @@ def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> s
         background-color: #1a1d24;
         color: #e8eaef;
     }
+    QLabel {
+        color: #dbe1ee;
+    }
     QScrollArea, QAbstractScrollArea {
         background-color: #1a1d24;
         border: none;
@@ -32,6 +35,7 @@ def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> s
     QGroupBox {
         font-weight: 600;
         font-size: 13px;
+        color: #c9d2e8;
         border: 1px solid #343b4d;
         border-radius: 8px;
         margin-top: 14px;
@@ -82,13 +86,26 @@ def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> s
     }
     QLineEdit, QTextEdit, QComboBox, QDoubleSpinBox {
         background-color: #1e222b;
+        color: #e8edf9;
         border: 1px solid #3d465a;
         border-radius: 6px;
         padding: 6px 10px;
         selection-background-color: #3d6fb8;
     }
+    QLineEdit::placeholder, QTextEdit::placeholder {
+        color: #7f88a0;
+    }
+    QComboBox QAbstractItemView {
+        background-color: #202531;
+        color: #e8edf9;
+        selection-background-color: #3d6fb8;
+    }
+    QAbstractSpinBox {
+        color: #e8edf9;
+    }
     QPushButton {
         background-color: #2d3545;
+        color: #e8edf9;
         border: 1px solid #4a5570;
         border-radius: 6px;
         padding: 8px 16px;
@@ -103,8 +120,9 @@ def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> s
         background-color: #252b38;
     }
     QPushButton:disabled {
-        color: #5c6375;
+        color: #8d97b2;
         border-color: #353b4a;
+        background-color: #283042;
     }
     QSplitter::handle {
         background-color: #2c3344;
