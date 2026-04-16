@@ -43,25 +43,60 @@ class MavlinkThread(QThread):
 
     def run(self) -> None:
         self._running = True
-        # Normalize common serial formats so pymavlink always parses correctly.
-        # Some environments treat `COM58:115200` as a network endpoint, causing:
-        #   bind(): port must be 0-65535
-        # Fix: convert to `serial:COM58:115200`.
-        connection_string = self._connection_string.strip()
-        m = re.match(r"^(COM\d+):(\d+)$", connection_string, flags=re.IGNORECASE)
+        raw = self._connection_string.strip()
+
+        # PyMAVLink often expects Windows serial as:
+        #   mavutil.mavlink_connection("COM58", baud=115200)
+        # Using "serial:COM58:115200" may behave differently across versions and can
+        # lead to confusing parsing errors. We try the correct COM+baud form first.
+        attempts: list[tuple[str, int | None]] = []
+
+        # Normalize optional "serial:" prefix.
+        trimmed = raw
+        if raw.lower().startswith("serial:"):
+            trimmed = raw[len("serial:") :]
+
+        m = re.match(r"^(COM\d+)[,:](\d+)$", trimmed, flags=re.IGNORECASE)
         if m:
-            connection_string = f"serial:{m.group(1)}:{m.group(2)}"
-        self.log_line.emit(f"Using: {connection_string}")
-        try:
-            self.log_line.emit(f"Opening: {connection_string}")
-            self._master = mavutil.mavlink_connection(
-                connection_string,
-                autoreconnect=True,
+            com = m.group(1).upper()
+            baud = int(m.group(2))
+            attempts = [
+                (com, baud),
+                (f"serial:{com}:{baud}", None),
+                (f"serial:{com},{baud}", None),
+            ]
+        else:
+            attempts = [(raw, None)]
+
+        last_error: Exception | None = None
+        used_connection: str = raw
+
+        for conn, baud in attempts:
+            if baud is not None:
+                self.log_line.emit(f"Using: {conn} baud={baud}")
+            else:
+                self.log_line.emit(f"Using: {conn}")
+
+            try:
+                kwargs = {"autoreconnect": True}
+                if baud is not None:
+                    kwargs["baud"] = baud
+                self._master = mavutil.mavlink_connection(conn, **kwargs)
+                used_connection = conn if baud is None else f"{conn}:{baud}"
+                break
+            except Exception as e:
+                last_error = e
+                self.error.emit(str(e))
+                self._master = None
+
+        if self._master is None:
+            self.error.emit(
+                f"Failed to open MAVLink connection. Last error: {last_error}"
             )
-        except Exception as e:
-            self.error.emit(str(e))
             self.link_down.emit()
             return
+
+        self.log_line.emit(f"Opened: {used_connection}")
 
         self.link_up.emit()
         self.log_line.emit("Socket open; waiting for MAVLink telemetry...")
