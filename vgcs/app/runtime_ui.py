@@ -17,15 +17,36 @@ class UiFontProfile:
     mono_family: str
 
 
+def read_scale_override() -> float | None:
+    """Return user-requested UI scale override if valid."""
+    override = os.getenv("VGCS_UI_SCALE", "").strip()
+    if not override:
+        return None
+    try:
+        parsed = float(override)
+    except ValueError:
+        return None
+    return max(0.85, min(parsed, 2.0))
+
+
+def apply_qt_scale_override() -> float | None:
+    """
+    Apply explicit Qt global scale when VGCS_UI_SCALE is set.
+
+    This must run before QApplication creation.
+    """
+    scale = read_scale_override()
+    if scale is None:
+        return None
+    os.environ["QT_SCALE_FACTOR"] = f"{scale:.3f}"
+    return scale
+
+
 def detect_ui_scale() -> float:
     """Derive a conservative UI scale and allow manual override."""
-    override = os.getenv("VGCS_UI_SCALE", "").strip()
-    if override:
-        try:
-            parsed = float(override)
-            return max(0.85, min(parsed, 2.0))
-        except ValueError:
-            pass
+    override = read_scale_override()
+    if override is not None:
+        return override
 
     screen = QGuiApplication.primaryScreen()
     if screen is None:
