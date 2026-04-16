@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
         self._thread: MavlinkThread | None = None
         self._timeout_s = float(self._settings.value("watchdog_timeout_s", 2.0))
         self._armed_since: float | None = None
+        self._heartbeat_seen = False
         self._theme_name = str(self._settings.value("ui_theme", "Default"))
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
@@ -441,6 +442,7 @@ class MainWindow(QMainWindow):
         self._timeout_spin.setEnabled(False)
         self._theme_combo.setEnabled(False)
         self._btn_reset.setEnabled(False)
+        self._heartbeat_seen = False
         self._status.setText("Connecting…")
         self._apply_state_style(self._status, "warn")
         self._thread.start()
@@ -452,8 +454,8 @@ class MainWindow(QMainWindow):
                 self._thread.wait(3000)
 
     def _on_link_up(self) -> None:
-        self._status.setText("Connected")
-        self._apply_state_style(self._status, "ok")
+        self._status.setText("Port open, waiting for heartbeat…")
+        self._apply_state_style(self._status, "warn")
         self._btn_disconnect.setEnabled(True)
         self._watchdog.setText(f"OK · {self._timeout_s:.1f}s")
         self._apply_state_style(self._watchdog, "ok")
@@ -462,6 +464,7 @@ class MainWindow(QMainWindow):
         self._status.setText("Disconnected")
         self._apply_state_style(self._status, "bad")
         self._hb.setText("—")
+        self._heartbeat_seen = False
         self._apply_state_style(self._hb, "na")
         self._watchdog.setText(f"Idle · {self._timeout_s:.1f}s")
         self._apply_state_style(self._watchdog, "warn")
@@ -475,6 +478,10 @@ class MainWindow(QMainWindow):
         self._reset_telemetry_fields()
 
     def _on_heartbeat(self, sysid: int, compid: int, mav_ver: int) -> None:
+        if not self._heartbeat_seen:
+            self._heartbeat_seen = True
+            self._status.setText("Connected")
+            self._apply_state_style(self._status, "ok")
         self._hb.setText(f"sys {sysid} · comp {compid} · mav {mav_ver}")
         self._apply_state_style(self._hb, "ok")
 

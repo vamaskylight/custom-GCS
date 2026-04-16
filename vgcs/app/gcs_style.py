@@ -134,13 +134,13 @@ def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> s
     }
     QScrollBar:vertical {
         background: #1e222b;
-        width: 12px;
+        width: 5px;
         margin: 0;
     }
     QScrollBar::handle:vertical {
         background: #4a5568;
-        min-height: 24px;
-        border-radius: 4px;
+        min-height: 20px;
+        border-radius: 3px;
     }
     """.replace("__MONO_FAMILY__", mono_family)
     return _scale_px(css, ui_scale)
