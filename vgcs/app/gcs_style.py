@@ -1,9 +1,23 @@
 """Shared Qt stylesheet for VGCS (dark GCS-style shell)."""
 
+import re
 
-def gcs_stylesheet(*, mono_family: str = "Consolas") -> str:
+
+def _scale_px(css: str, scale: float) -> str:
+    if abs(scale - 1.0) < 1e-3:
+        return css
+
+    def repl(match: re.Match[str]) -> str:
+        value = float(match.group(1))
+        scaled = max(1, int(round(value * scale)))
+        return f"{scaled}px"
+
+    return re.sub(r"(\d+(?:\.\d+)?)px", repl, css)
+
+
+def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> str:
     """Fusion-friendly QSS: palette inspired by common GCS dark UIs (~#252a35 / #2c313c)."""
-    return """
+    css = """
     QMainWindow, QWidget#centralRoot {
         background-color: #1a1d24;
         color: #e8eaef;
@@ -104,3 +118,4 @@ def gcs_stylesheet(*, mono_family: str = "Consolas") -> str:
         border-radius: 4px;
     }
     """.replace("__MONO_FAMILY__", mono_family)
+    return _scale_px(css, ui_scale)

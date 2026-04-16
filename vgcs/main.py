@@ -9,6 +9,7 @@ from vgcs.app.main_window import MainWindow
 from vgcs.app.runtime_ui import (
     build_base_font,
     configure_high_dpi_policy,
+    detect_ui_scale,
     select_font_profile,
 )
 
@@ -16,10 +17,11 @@ from vgcs.app.runtime_ui import (
 def main() -> int:
     configure_high_dpi_policy()
     app = QApplication(sys.argv)
+    ui_scale = detect_ui_scale()
     profile = select_font_profile()
-    app.setFont(build_base_font(profile))
+    app.setFont(build_base_font(profile, ui_scale=ui_scale))
     app.setStyle("Fusion")
-    app.setStyleSheet(gcs_stylesheet(mono_family=profile.mono_family))
+    app.setStyleSheet(gcs_stylesheet(mono_family=profile.mono_family, ui_scale=ui_scale))
     win = MainWindow()
     win.show()
     return app.exec()
