@@ -18,9 +18,16 @@ def _scale_px(css: str, scale: float) -> str:
 def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> str:
     """Fusion-friendly QSS: palette inspired by common GCS dark UIs (~#252a35 / #2c313c)."""
     css = """
-    QMainWindow, QWidget#centralRoot {
+    QMainWindow, QWidget#centralRoot, QWidget#contentRoot, QWidget#contentViewport {
         background-color: #1a1d24;
         color: #e8eaef;
+    }
+    QScrollArea, QAbstractScrollArea {
+        background-color: #1a1d24;
+        border: none;
+    }
+    QScrollArea > QWidget > QWidget {
+        background-color: #1a1d24;
     }
     QGroupBox {
         font-weight: 600;

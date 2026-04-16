@@ -117,6 +117,7 @@ class MainWindow(QMainWindow):
         self._dash_row.addLayout(right_col, 0)
 
         content_panel = QWidget()
+        content_panel.setObjectName("contentRoot")
         self._content_layout = QVBoxLayout()
         self._content_layout.setSpacing(8 if self._compact_ui else 12)
         self._content_layout.addWidget(self._build_header_bar())
@@ -131,6 +132,7 @@ class MainWindow(QMainWindow):
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setWidget(content_panel)
+        self._scroll.viewport().setObjectName("contentViewport")
 
         central = QWidget()
         central.setObjectName("centralRoot")
