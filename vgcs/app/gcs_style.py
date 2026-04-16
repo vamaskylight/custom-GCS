@@ -1,7 +1,7 @@
 """Shared Qt stylesheet for VGCS (dark GCS-style shell)."""
 
 
-def gcs_stylesheet() -> str:
+def gcs_stylesheet(*, mono_family: str = "Consolas") -> str:
     """Fusion-friendly QSS: palette inspired by common GCS dark UIs (~#252a35 / #2c313c)."""
     return """
     QMainWindow, QWidget#centralRoot {
@@ -35,7 +35,7 @@ def gcs_stylesheet() -> str:
         color: #7d869c;
     }
     QLabel#telemetryValue {
-        font-family: "Cascadia Mono", "Consolas", "JetBrains Mono", monospace;
+        font-family: "__MONO_FAMILY__", "Consolas", "Courier New", monospace;
         font-size: 13px;
         color: #dce1ef;
     }
@@ -90,7 +90,7 @@ def gcs_stylesheet() -> str:
         height: 4px;
     }
     QTextEdit {
-        font-family: "Cascadia Mono", "Consolas", monospace;
+        font-family: "__MONO_FAMILY__", "Consolas", "Courier New", monospace;
         font-size: 12px;
     }
     QScrollBar:vertical {
@@ -103,4 +103,4 @@ def gcs_stylesheet() -> str:
         min-height: 24px;
         border-radius: 4px;
     }
-    """
+    """.replace("__MONO_FAMILY__", mono_family)

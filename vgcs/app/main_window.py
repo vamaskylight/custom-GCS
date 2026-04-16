@@ -34,6 +34,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("VGCS — Ground Control Station")
         self.resize(1024, 700)
+        self.setMinimumSize(980, 660)
 
         self._settings = QSettings("VGCS", "VGCS")
         self._thread: MavlinkThread | None = None
@@ -531,12 +532,17 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
         else:
             self.resize(1024, 700)
+        if self.width() < 900 or self.height() < 620:
+            self.resize(1024, 700)
 
     def _restore_splitter_state(self) -> None:
         splitter_state = self._settings.value("main_splitter_state")
         if splitter_state is not None:
             self._splitter.restoreState(splitter_state)
         else:
+            self._splitter.setSizes([560, 240])
+        sizes = self._splitter.sizes()
+        if len(sizes) != 2 or min(sizes) < 80:
             self._splitter.setSizes([560, 240])
 
     def _on_restore_defaults(self) -> None:
