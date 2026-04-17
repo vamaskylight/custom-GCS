@@ -48,3 +48,6 @@ htmlcov/
 *.log
 *.pem
 secrets/
+
+# Local ArduPilot checkout
+/ardupilot/
