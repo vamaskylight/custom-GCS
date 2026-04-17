@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import struct
 import time
+import math
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QSettings, QTimer
+from PySide6.QtCore import QPoint, QSize, Qt, QSettings, QTimer
 from PySide6.QtGui import (
     QColor,
     QGuiApplication,
@@ -21,12 +22,14 @@ from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
     QComboBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -44,7 +47,7 @@ from pymavlink import mavutil
 
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
-from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name
+from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
 from vgcs.map import MapWidget
 from vgcs.app.widgets import CompassWidget
@@ -63,9 +66,20 @@ class MainWindow(QMainWindow):
         self._timeout_s = float(self._settings.value("watchdog_timeout_s", 2.0))
         self._armed_since: float | None = None
         self._heartbeat_seen = False
+        self._connect_attempt_active = False
         self._theme_name = str(self._settings.value("ui_theme", "Default"))
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
+        self._last_vehicle_type: int | None = None
+        self._arm_not_ready_alert_shown = False
+        self._rid_live_available = False
+        self._map_rel_alt_m = 0.0
+        self._map_msl_alt_m = 0.0
+        self._map_groundspeed_mps = 0.0
+        self._heading = 0.0
+        self._max_telem_dist_m = 0.0
+        self._home_lat: float | None = None
+        self._home_lon: float | None = None
 
         self._conn_label = QLabel("MAVLink connection string")
         self._conn_edit = QLineEdit()
@@ -116,6 +130,8 @@ class MainWindow(QMainWindow):
         self._btn_param_set = QPushButton("Set param")
         self._btn_params_refresh.setEnabled(False)
         self._btn_param_set.setEnabled(False)
+        self._btn_tiles_online = QPushButton("Online tiles")
+        self._btn_tiles_offline = QPushButton("Offline tiles…")
 
         self._btn_connect = QPushButton("Connect")
         self._btn_disconnect = QPushButton("Disconnect")
@@ -177,6 +193,8 @@ class MainWindow(QMainWindow):
         self._status_row.addWidget(self._watchdog_frame, 1)
 
         operations_widget = self._build_m2_operations_layout()
+        self._operations_widget = operations_widget
+        self._map_only_dashboard = True
 
         content_panel = QWidget()
         content_panel.setObjectName("contentRoot")
@@ -185,7 +203,8 @@ class MainWindow(QMainWindow):
         self._content_layout.addWidget(self._top_dashboard)
         self._content_layout.addWidget(operations_widget)
         self._content_layout.addWidget(link_box)
-        self._content_layout.addWidget(self._build_m2_controls_panel())
+        self._m2_controls_panel = self._build_m2_controls_panel()
+        self._content_layout.addWidget(self._m2_controls_panel)
         self._content_layout.addLayout(self._status_row)
         self._mission_list_panel = self._build_mission_list_panel()
         self._content_layout.addWidget(self._mission_list_panel)
@@ -202,9 +221,11 @@ class MainWindow(QMainWindow):
         central = QWidget()
         central.setObjectName("centralRoot")
         layout = QVBoxLayout()
+        self._central_layout = layout
         layout.addWidget(self._scroll)
-        margin = 8 if self._compact_ui else 14
-        layout.setContentsMargins(margin, margin, margin, margin)
+        # Keep the header flush to the window edges (top + full-width),
+        # as requested by the UI direction.
+        layout.setContentsMargins(0, 0, 0, 0)
         central.setLayout(layout)
         self.setCentralWidget(central)
 
@@ -218,12 +239,21 @@ class MainWindow(QMainWindow):
         self._btn_apply_fence.clicked.connect(self._on_upload_fence)
         self._btn_params_refresh.clicked.connect(self._on_params_refresh)
         self._btn_param_set.clicked.connect(self._on_param_set)
+        self._btn_tiles_online.clicked.connect(self._on_tiles_online)
+        self._btn_tiles_offline.clicked.connect(self._on_tiles_offline)
         self._timeout_spin.valueChanged.connect(self._on_timeout_changed)
         self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self._map_widget.waypoints_changed.connect(self._on_map_waypoints_changed)
         self._map_widget.mission_upload_requested.connect(self._on_mission_upload_requested)
         self._map_widget.mission_download_requested.connect(self._on_mission_download_requested)
         self._map_widget.geofence_upload_requested.connect(self._on_map_geofence_requested)
+        self._map_widget.menu_requested.connect(self._on_map_menu_requested)
+        self._map_widget.connect_requested.connect(self._on_map_connect_requested)
+        self._map_widget.takeoff_requested.connect(self._on_takeoff)
+        self._map_widget.return_requested.connect(self._on_map_return_requested)
+        self._map_widget.plan_tool_requested.connect(self._on_plan_tool_requested)
+        self._map_widget.toggle_3d_requested.connect(self._on_map_toggle_3d_requested)
+        self._map_widget.mission_start_requested.connect(self._on_map_mission_start_requested)
 
         self._flight_timer = QTimer(self)
         self._flight_timer.setInterval(1000)
@@ -231,9 +261,17 @@ class MainWindow(QMainWindow):
         self._flight_timer.start()
         self._dev_reload_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
         self._dev_reload_shortcut.activated.connect(self._on_dev_reload)
+        self._map_3d_shortcut = QShortcut(QKeySequence("Ctrl+3"), self)
+        self._map_3d_shortcut.activated.connect(self._on_toggle_map_3d_shortcut)
         self._restore_window_geometry()
         self._fit_to_screen()
         self._apply_responsive_layout(self.width())
+        self._set_preconnect_dashboard_mode(True)
+        self._set_map_only_dashboard_mode(self._map_only_dashboard)
+        self._set_dashboard_flight_status(
+            "red",
+            "Communication lost - Not Ready to Arm",
+        )
 
     def _detect_compact_ui(self) -> bool:
         screen = QGuiApplication.primaryScreen()
@@ -523,6 +561,12 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    def _menu_icon(self, filename: str) -> QIcon:
+        path = Path(__file__).resolve().parents[1] / "assets" / "menu_icons" / filename
+        if path.exists():
+            return QIcon(str(path))
+        return QIcon()
+
     def _build_mission_list_panel(self) -> QGroupBox:
         box = QGroupBox("Mission waypoints")
         lay = QVBoxLayout()
@@ -533,6 +577,7 @@ class MainWindow(QMainWindow):
     def _build_m2_operations_layout(self) -> QWidget:
         root = QWidget()
         v = QVBoxLayout()
+        self._operations_layout = v
         v.setSpacing(8 if self._compact_ui else 12)
         v.setContentsMargins(0, 0, 0, 0)
 
@@ -540,7 +585,8 @@ class MainWindow(QMainWindow):
         self._center_row.setSpacing(8 if self._compact_ui else 12)
         self._center_row.addWidget(self._vehicle_msg_frame, 0, Qt.AlignTop)
         self._center_row.addWidget(self._map_widget, 1)
-        self._center_row.addWidget(self._build_camera_control_panel(), 0)
+        self._camera_panel = self._build_camera_control_panel()
+        self._center_row.addWidget(self._camera_panel, 0)
 
         self._footer_row = QBoxLayout(QBoxLayout.LeftToRight)
         self._footer_row.setSpacing(8 if self._compact_ui else 12)
@@ -548,9 +594,11 @@ class MainWindow(QMainWindow):
         self._footer_row.addWidget(self._build_primary_flight_footer(), 1)
         self._footer_row.addWidget(self._build_compass_footer(), 1)
         self._footer_row.addWidget(self._build_nav_system_footer(), 1)
+        self._footer_widget = QWidget()
+        self._footer_widget.setLayout(self._footer_row)
 
         v.addLayout(self._center_row)
-        v.addLayout(self._footer_row)
+        v.addWidget(self._footer_widget)
         root.setLayout(v)
         return root
 
@@ -572,7 +620,7 @@ class MainWindow(QMainWindow):
     def _build_split_camera_panel(self) -> QGroupBox:
         box = QGroupBox("Split camera video")
         lay = QVBoxLayout()
-        self._split_video_note = QLabel("M3 integration")
+        self._split_video_note = QLabel("Live preview available on map overlay")
         self._split_video_note.setObjectName("telemetryValue")
         lay.addWidget(self._split_video_note)
         lay.addStretch()
@@ -629,8 +677,46 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._param_value_spin, 2, 3)
         lay.addWidget(self._btn_params_refresh, 2, 4)
         lay.addWidget(self._btn_param_set, 2, 5)
+        lay.addWidget(self._btn_tiles_online, 3, 0, 1, 2)
+        lay.addWidget(self._btn_tiles_offline, 3, 2, 1, 2)
         box.setLayout(lay)
         return box
+
+    def _set_preconnect_dashboard_mode(self, enabled: bool) -> None:
+        """
+        Pre-connect visual mode: map-centric dashboard like reference image.
+        Full M2 operator panels are shown after link-up.
+        """
+        # Keep map visible always.
+        self._footer_widget.setVisible(not enabled)
+        self._m2_controls_panel.setVisible(not enabled)
+        self._mission_list_panel.setVisible(not enabled)
+        self._log.setVisible(not enabled)
+        self._status_frame.setVisible(not enabled)
+        self._hb_frame.setVisible(not enabled)
+        self._watchdog_frame.setVisible(not enabled)
+
+    def _set_map_only_dashboard_mode(self, enabled: bool) -> None:
+        """Hard map-only dashboard mode requested by UI direction."""
+        if not enabled:
+            return
+        self._central_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(0)
+        self._operations_layout.setContentsMargins(0, 0, 0, 0)
+        self._operations_layout.setSpacing(0)
+        self._center_row.setSpacing(0)
+        self._top_dashboard.setVisible(False)
+        self._link_box.setVisible(False)
+        self._m2_controls_panel.setVisible(False)
+        self._status_frame.setVisible(False)
+        self._hb_frame.setVisible(False)
+        self._watchdog_frame.setVisible(False)
+        self._mission_list_panel.setVisible(False)
+        self._log.setVisible(False)
+        self._footer_widget.setVisible(False)
+        self._vehicle_msg_frame.setVisible(False)
+        self._camera_panel.setVisible(False)
 
     def _build_header_bar(self) -> QFrame:
         bar = QFrame()
@@ -788,6 +874,8 @@ class MainWindow(QMainWindow):
             self._apply_state_style(label, "bad")
 
     def _append_log(self, line: str) -> None:
+        # Dashboard log panel can be hidden in map-only mode; always mirror to console.
+        print(line, flush=True)
         self._log.append(line)
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
 
@@ -925,6 +1013,19 @@ class MainWindow(QMainWindow):
             self._btn_map_3d.blockSignals(True)
             self._btn_map_3d.setChecked(active)
             self._btn_map_3d.blockSignals(False)
+            return
+
+        def _sync_btn() -> None:
+            real = bool(getattr(self._map_widget, "_is_3d_mode", False))
+            self._btn_map_3d.blockSignals(True)
+            self._btn_map_3d.setChecked(real)
+            self._btn_map_3d.blockSignals(False)
+
+        QTimer.singleShot(180, _sync_btn)
+
+    def _on_map_toggle_3d_requested(self) -> None:
+        current = bool(getattr(self._map_widget, "_is_3d_mode", False))
+        self._on_toggle_map_3d(not current)
 
     def _scroll_main_to(self, widget: QWidget, *, y_margin: int = 20) -> None:
         """Scroll the main content area so ``widget`` is visible."""
@@ -933,28 +1034,79 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, _do)
 
-    def _on_logo_menu(self) -> None:
+    def _on_map_menu_requested(self, gx: int, gy: int) -> None:
+        # Always anchor under the header/logo area (fixed position),
+        # not under the exact mouse click coordinate.
+        self._on_logo_menu()
+
+    def _on_toggle_map_3d_shortcut(self) -> None:
+        current = bool(getattr(self._map_widget, "_is_3d_mode", False))
+        self._on_toggle_map_3d(not current)
+        self._append_log("Shortcut: toggle map 3D view (Ctrl+3)")
+
+    def _on_logo_menu(self, anchor_pos: QPoint | None = None) -> None:
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
+        menu.setStyleSheet(
+            "QMenu {"
+            " background-color: #f4f4f4;"
+            " color: #222222;"
+            " border: 1px solid #8f8f8f;"
+            " border-radius: 6px;"
+            " padding: 8px 6px;"
+            " }"
+            "QMenu::item {"
+            " background-color: #e9e9e9;"
+            " margin: 4px 4px;"
+            " padding: 10px 16px 10px 40px;"
+            " border-radius: 2px;"
+            " }"
+            "QMenu::item:selected {"
+            " background-color: #dddddd;"
+            " color: #111111;"
+            " }"
+            "QMenu::icon { left: 12px; }"
+            "QMenu::separator {"
+            " height: 1px;"
+            " margin: 6px 8px;"
+            " background: #bfbfbf;"
+            " }"
+        )
 
         action_plan = menu.addAction("Plan Flight")
         action_plan.setToolTip("Mission planning and waypoint management")
+        action_plan.setIcon(self._menu_icon("plan_flight.svg"))
         action_analyze = menu.addAction("Analyze Tools")
         action_analyze.setToolTip("Post-flight and real-time data review.")
+        action_analyze.setIcon(self._menu_icon("analyze_tools.svg"))
         action_vehicle = menu.addAction("Vehicle Configuration")
         action_vehicle.setToolTip("Hardware-level settings and calibration.")
-        action_settings = menu.addAction("Application Setting")
+        action_vehicle.setIcon(self._menu_icon("vehicle_config.svg"))
+        action_settings = menu.addAction("Application Settings")
         action_settings.setToolTip("GCS-specific preferences.")
+        action_settings.setIcon(self._menu_icon("app_settings.svg"))
+        action_toggle_3d = menu.addAction("Toggle 3D View")
+        action_toggle_3d.setToolTip("Switch between 2D and 3D map view.")
         menu.addSeparator()
         action_close = menu.addAction("Close VGCS")
         action_close.setToolTip("Exit the application.")
+        action_close.setIcon(self._menu_icon("close_vgcs.svg"))
 
-        picked = menu.exec(self._logo_btn.mapToGlobal(self._logo_btn.rect().bottomLeft()))
+        if anchor_pos is not None:
+            pos = anchor_pos
+        elif self._map_only_dashboard:
+            # In map-only mode, anchor under the map header logo strip.
+            pos = self._map_widget.mapToGlobal(QPoint(10, 56))
+        else:
+            pos = self._logo_btn.mapToGlobal(self._logo_btn.rect().bottomLeft())
+        pos = QPoint(pos.x(), pos.y() + 6)
+        picked = menu.exec(pos)
         if picked is action_close:
             self.close()
             return
         if picked is action_plan:
             self._append_log("Menu: Plan Flight — mission waypoints")
+            self._map_widget.set_plan_flight_visible(True)
             self._scroll_main_to(self._mission_list_panel)
 
             def _focus_mission_table() -> None:
@@ -964,21 +1116,12 @@ class MainWindow(QMainWindow):
 
             QTimer.singleShot(80, _focus_mission_table)
         elif picked is action_analyze:
-            QMessageBox.information(
-                self,
-                "Analyze Tools",
-                "Post-flight and real-time data review.\n\n"
-                "This area will host log review, plots, and playback in a future milestone.",
-            )
-            self._append_log("Menu: Analyze Tools (placeholder)")
+            report = self._build_analyze_tools_report()
+            QMessageBox.information(self, "Analyze Tools", report)
+            self._append_log("Menu: Analyze Tools")
         elif picked is action_vehicle:
-            QMessageBox.information(
-                self,
-                "Vehicle Configuration",
-                "Hardware-level settings and calibration.\n\n"
-                "This will connect to MAVLink configuration screens when implemented.",
-            )
-            self._append_log("Menu: Vehicle Configuration (placeholder)")
+            self._show_vehicle_configuration_help()
+            self._append_log("Menu: Vehicle Configuration")
         elif picked is action_settings:
             self._append_log("Menu: Application Setting — connection & theme")
             self._scroll_main_to(self._link_box)
@@ -987,6 +1130,45 @@ class MainWindow(QMainWindow):
                 self._theme_combo.setFocus()
 
             QTimer.singleShot(80, _focus_settings)
+        elif picked is action_toggle_3d:
+            current = bool(getattr(self._map_widget, "_is_3d_mode", False))
+            self._on_toggle_map_3d(not current)
+            self._append_log("Menu: Toggle 3D View")
+
+    def _build_analyze_tools_report(self) -> str:
+        # M2 scope: quick mission/link analysis snapshot from live state.
+        wp_count = len(getattr(self._map_widget, "_waypoints_model", []))
+        status = self._status.text()
+        hb = self._hb.text()
+        mode = self._top_flight_mode.text()
+        battery = self._top_battery.text()
+        gps = self._top_gps_hdop.text()
+        mission_distance_ft = f"{self._max_telem_dist_m * 3.28084:.0f}"
+        return (
+            "Live Analysis Snapshot\n\n"
+            f"Link: {status}\n"
+            f"Heartbeat: {hb}\n"
+            f"Flight mode: {mode}\n"
+            f"Battery: {battery}\n"
+            f"GPS/HDOP: {gps}\n"
+            f"Mission waypoints: {wp_count}\n"
+            f"Max telemetry distance: {mission_distance_ft} ft\n\n"
+            "Use Plan Flight to edit/upload waypoints and use M2 controls for "
+            "mode, takeoff/land, geofence, params, and tile source."
+        )
+
+    def _show_vehicle_configuration_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "Vehicle Configuration",
+            "Vehicle configuration tools are available in M2 controls:\n\n"
+            "- Flight mode command\n"
+            "- Takeoff/Land actions\n"
+            "- Geofence upload/clear\n"
+            "- Parameter refresh/set\n\n"
+            "Tip: connect first, then use the controls panel to apply changes.",
+        )
+        self._scroll_main_to(self._m2_controls_panel)
 
     def _on_flight_status_popup(self) -> None:
         msg = (
@@ -1000,8 +1182,133 @@ class MainWindow(QMainWindow):
         )
         QMessageBox.information(self, "Flight Status", msg)
 
+    def _set_dashboard_flight_status(self, state: str, message: str) -> None:
+        state_norm = (state or "").strip().lower()
+        if state_norm == "green":
+            self._flight_status_btn.setStyleSheet(
+                "background-color: #2f8f42; color: #ffffff; border: 1px solid #8ee7a1;"
+                "border-radius: 4px; font-weight: 700;"
+            )
+            self._flight_status_btn.setText("READY TO ARM")
+            self._top_vehicle_msg.setText(message)
+            self._map_widget.set_flight_status("green", message)
+            return
+        if state_norm == "yellow":
+            self._flight_status_btn.setStyleSheet(
+                "background-color: #b58917; color: #141414; border: 1px solid #f7d85e;"
+                "border-radius: 4px; font-weight: 700;"
+            )
+            self._flight_status_btn.setText("NOT READY TO ARM")
+            self._top_vehicle_msg.setText(message)
+            self._map_widget.set_flight_status("yellow", message)
+            return
+        self._flight_status_btn.setStyleSheet(
+            "background-color: #a42424; color: #ffffff; border: 1px solid #ff8d8d;"
+            "border-radius: 4px; font-weight: 700;"
+        )
+        self._flight_status_btn.setText("NOT READY TO ARM")
+        self._top_vehicle_msg.setText(message)
+        self._map_widget.set_flight_status("red", message)
+
+    def _push_map_flight_overlay(self) -> None:
+        if self._armed_since is None:
+            flight_time_text = "00:00"
+        else:
+            elapsed = int(time.monotonic() - self._armed_since)
+            flight_time_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+        self._map_widget.set_flight_telemetry(
+            relative_alt_m=float(self._map_rel_alt_m),
+            ground_speed_mps=float(self._map_groundspeed_mps),
+            flight_time_text=flight_time_text,
+            msl_alt_m=float(self._map_msl_alt_m),
+        )
+
+    @staticmethod
+    def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        r = 6_371_000.0
+        p1 = math.radians(lat1)
+        p2 = math.radians(lat2)
+        dp = math.radians(lat2 - lat1)
+        dl = math.radians(lon2 - lon1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * r * math.asin(min(1.0, math.sqrt(max(0.0, a))))
+
+    def _refresh_plan_flight_metrics(self) -> None:
+        # M2 plan bar live values (best-effort from real telemetry).
+        heading_val = float(getattr(self, "_heading", 0.0) or 0.0)
+        alt_diff_ft = f"{self._map_rel_alt_m * 3.28084:.1f} ft"
+        gradient = "--"
+        azimuth = f"{int(round(heading_val))}"
+        heading = f"{int(round(heading_val))}"
+        dist_prev_wp_ft = "0.0 ft"
+
+        mission_distance_m = 0.0
+        model = list(getattr(self._map_widget, "_waypoints_model", []))
+        for i in range(1, len(model)):
+            a = model[i - 1]
+            b = model[i]
+            mission_distance_m += self._haversine_m(float(a.lat), float(a.lon), float(b.lat), float(b.lon))
+        mission_distance_ft = f"{mission_distance_m * 3.28084:.0f} ft"
+
+        if self._armed_since is None:
+            mission_time = "00:00:00"
+        else:
+            elapsed = int(time.monotonic() - self._armed_since)
+            mission_time = f"{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}"
+
+        max_telem_dist_ft = f"{self._max_telem_dist_m * 3.28084:.0f} ft"
+        self._map_widget.set_plan_flight_metrics(
+            alt_diff_ft=alt_diff_ft,
+            gradient=gradient,
+            azimuth=azimuth,
+            heading=heading,
+            dist_prev_wp_ft=dist_prev_wp_ft,
+            mission_distance_ft=mission_distance_ft,
+            mission_time=mission_time,
+            max_telem_dist_ft=max_telem_dist_ft,
+        )
+
+    @staticmethod
+    def _extract_remote_id_text(data: dict[str, object]) -> str:
+        candidates = (
+            "uas_id",
+            "id_or_mac",
+            "operator_id",
+            "self_id",
+            "description",
+        )
+        for key in candidates:
+            raw = data.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, str):
+                txt = raw.strip().strip("\x00")
+                if txt:
+                    return txt
+            elif isinstance(raw, (bytes, bytearray)):
+                txt = raw.decode("ascii", errors="ignore").strip().strip("\x00")
+                if txt:
+                    return txt
+            elif isinstance(raw, list):
+                try:
+                    txt = bytes(int(v) & 0xFF for v in raw).decode(
+                        "ascii", errors="ignore"
+                    ).strip().strip("\x00")
+                except Exception:
+                    txt = ""
+                if txt:
+                    return txt
+        return ""
+
     def _reset_telemetry_fields(self) -> None:
         self._armed_since = None
+        self._map_rel_alt_m = 0.0
+        self._map_msl_alt_m = 0.0
+        self._map_groundspeed_mps = 0.0
+        self._heading = 0.0
+        self._max_telem_dist_m = 0.0
+        self._home_lat = None
+        self._home_lon = None
         self._fields["armed"].setText("No")
         self._apply_state_style(self._fields["armed"], "warn")
         self._fields["flight_time"].setText("00:00")
@@ -1030,9 +1337,16 @@ class MainWindow(QMainWindow):
         self._top_battery.setText("—")
         self._top_remote_id.setText("N/A")
         self._top_vehicle_msg.setText("—")
+        self._map_widget.set_header_mode("—")
+        self._map_widget.set_header_vehicle_msg("—")
+        self._map_widget.set_header_gps(0, "N/A")
+        self._map_widget.set_header_battery("N/A")
+        self._map_widget.set_header_remote_id("N/A")
         self._mission_table_updating = True
         self._mission_table.setRowCount(0)
         self._mission_table_updating = False
+        self._push_map_flight_overlay()
+        self._refresh_plan_flight_metrics()
         self._refresh_footer_summary()
 
     def _on_connect(self) -> None:
@@ -1078,15 +1392,18 @@ class MainWindow(QMainWindow):
         self._btn_param_set.setEnabled(False)
         self._btn_reset.setEnabled(False)
         self._heartbeat_seen = False
+        self._connect_attempt_active = True
+        self._arm_not_ready_alert_shown = False
         self._status.setText("Connecting…")
         self._apply_state_style(self._status, "warn")
+        self._set_dashboard_flight_status("yellow", "Connecting to vehicle...")
         self._thread.start()
 
     def _on_disconnect(self) -> None:
         if self._thread is not None:
             self._thread.stop()
             if self._thread.isRunning():
-                self._thread.wait(3000)
+                self._thread.wait(8000)
 
     def _on_link_up(self) -> None:
         self._status.setText("Port open, waiting for heartbeat…")
@@ -1094,7 +1411,7 @@ class MainWindow(QMainWindow):
         self._btn_disconnect.setEnabled(True)
         self._watchdog.setText(f"OK · {self._timeout_s:.1f}s")
         self._apply_state_style(self._watchdog, "ok")
-        self._top_vehicle_msg.setText("Link open")
+        self._set_dashboard_flight_status("yellow", "Link open - waiting for heartbeat")
         self._mode_combo.setEnabled(True)
         self._btn_set_mode.setEnabled(True)
         self._btn_takeoff.setEnabled(True)
@@ -1102,8 +1419,15 @@ class MainWindow(QMainWindow):
         self._btn_apply_fence.setEnabled(True)
         self._btn_params_refresh.setEnabled(True)
         self._btn_param_set.setEnabled(True)
+        # Do not mark connected in map UI until HEARTBEAT is actually received.
+        self._map_widget.set_link_connected(False)
+        self._set_preconnect_dashboard_mode(False)
+        self._set_map_only_dashboard_mode(self._map_only_dashboard)
 
     def _on_link_down(self) -> None:
+        self._connect_attempt_active = False
+        self._arm_not_ready_alert_shown = False
+        self._rid_live_available = False
         self._status.setText("Disconnected")
         self._apply_state_style(self._status, "bad")
         self._hb.setText("—")
@@ -1126,16 +1450,26 @@ class MainWindow(QMainWindow):
         self._btn_params_refresh.setEnabled(False)
         self._btn_param_set.setEnabled(False)
         self._reset_telemetry_fields()
-        self._top_vehicle_msg.setText("Disconnected")
+        self._set_dashboard_flight_status(
+            "red",
+            "Communication lost - Not Ready to Arm",
+        )
+        self._map_widget.set_link_connected(False)
+        self._set_preconnect_dashboard_mode(True)
+        self._set_map_only_dashboard_mode(self._map_only_dashboard)
 
     def _on_heartbeat(self, sysid: int, compid: int, mav_ver: int) -> None:
         if not self._heartbeat_seen:
             self._heartbeat_seen = True
+            self._connect_attempt_active = False
             self._status.setText("Connected")
             self._apply_state_style(self._status, "ok")
-            self._top_vehicle_msg.setText("Heartbeat received")
+            self._set_dashboard_flight_status("yellow", "Connected - validating arm checks")
+            self._map_widget.set_link_connected(True)
         self._hb.setText(f"sys {sysid} · comp {compid} · mav {mav_ver}")
         self._apply_state_style(self._hb, "ok")
+        if not self._rid_live_available:
+            self._map_widget.set_header_remote_id(f"ID {sysid}")
 
     def _on_telemetry(self, msg_type: str, payload: object) -> None:
         data = payload if isinstance(payload, dict) else {}
@@ -1152,29 +1486,64 @@ class MainWindow(QMainWindow):
             arm_ready = system_status >= 3
             self._fields["arm_ready"].setText("Likely ready" if arm_ready else f"System status {system_status}")
             self._apply_state_style(self._fields["arm_ready"], "ok" if arm_ready else "warn")
+            if arm_ready:
+                self._arm_not_ready_alert_shown = False
+                self._set_dashboard_flight_status(
+                    "green",
+                    "Parameter downloading... Ready to Arm",
+                )
+            else:
+                self._set_dashboard_flight_status(
+                    "yellow",
+                    "Connected - Not Ready to Arm",
+                )
+                if not self._arm_not_ready_alert_shown:
+                    self._arm_not_ready_alert_shown = True
+                    QMessageBox.warning(
+                        self,
+                        "Vehicle Msg",
+                        "Vehicle connected, but not ready to arm.\n"
+                        "Please check pre-arm errors in vehicle messages.",
+                    )
             mode_text = human_mode_name(
                 vehicle_type=int(data.get("vehicle_type", 0) or 0),
                 custom_mode=int(data.get("custom_mode", 0) or 0),
             )
+            self._sync_mode_options_for_vehicle(int(data.get("vehicle_type", 0) or 0))
             self._top_flight_mode.setText(mode_text)
+            self._map_widget.set_header_mode(mode_text)
         elif msg_type == "GLOBAL_POSITION_INT":
+            lat = float(data.get("lat", 0.0))
+            lon = float(data.get("lon", 0.0))
+            self._map_rel_alt_m = float(data.get("relative_alt_m", 0.0))
+            self._map_msl_alt_m = float(data.get("alt_msl_m", 0.0))
+            if self._home_lat is None or self._home_lon is None:
+                self._home_lat = lat
+                self._home_lon = lon
+            if self._home_lat is not None and self._home_lon is not None:
+                d = self._haversine_m(self._home_lat, self._home_lon, lat, lon)
+                self._max_telem_dist_m = max(self._max_telem_dist_m, d)
             self._fields["lat_lon"].setText(
                 f"{data.get('lat', 0.0):.7f}, {data.get('lon', 0.0):.7f}"
             )
             self._fields["alt_rel"].setText(f"{data.get('relative_alt_m', 0.0):.1f} m")
             self._fields["alt_msl"].setText(f"{data.get('alt_msl_m', 0.0):.1f} m")
             self._map_widget.set_vehicle_position(
-                float(data.get("lat", 0.0)),
-                float(data.get("lon", 0.0)),
+                lat,
+                lon,
                 relative_alt_m=float(data.get("relative_alt_m", 0.0)),
             )
+            self._push_map_flight_overlay()
         elif msg_type == "VFR_HUD":
+            self._map_groundspeed_mps = float(data.get("groundspeed", 0.0))
             self._fields["groundspeed"].setText(f"{data.get('groundspeed', 0.0):.1f} m/s")
             self._fields["airspeed"].setText(f"{data.get('airspeed', 0.0):.1f} m/s")
             hd = float(data.get("heading", 0.0))
+            self._heading = hd
             self._fields["heading"].setText(f"{int(hd)}°")
             self._compass.set_heading_deg(hd)
             self._map_widget.set_vehicle_heading(hd)
+            self._push_map_flight_overlay()
         elif msg_type == "ATTITUDE":
             self._fields["attitude"].setText(
                 f"{data.get('roll_deg', 0.0):.1f} / "
@@ -1182,16 +1551,20 @@ class MainWindow(QMainWindow):
                 f"{data.get('yaw_deg', 0.0):.1f} deg"
             )
             yaw_deg = float(data.get("yaw_deg", 0.0))
+            self._heading = (yaw_deg + 360.0) % 360.0
             self._compass.set_heading_deg((yaw_deg + 360.0) % 360.0)
+            self._map_widget.set_vehicle_heading((yaw_deg + 360.0) % 360.0)
         elif msg_type == "GPS_RAW_INT":
             hdop = data.get("hdop")
             hdop_text = "N/A" if hdop is None else f"{hdop:.2f}"
+            sat = int(data.get("satellites_visible", 0))
             self._fields["gps"].setText(
-                f"fix={int(data.get('fix_type', 0))} sat={int(data.get('satellites_visible', 0))} hdop={hdop_text}"
+                f"fix={int(data.get('fix_type', 0))} sat={sat} hdop={hdop_text}"
             )
             self._top_gps_hdop.setText(
                 f"fix {int(data.get('fix_type', 0))} / {hdop_text}"
             )
+            self._map_widget.set_header_gps(sat, hdop_text)
         elif msg_type == "SYS_STATUS":
             pct = int(data.get("battery_remaining", -1))
             pct_text = "N/A" if pct < 0 else f"{pct}%"
@@ -1202,6 +1575,9 @@ class MainWindow(QMainWindow):
                 f"{voltage:.2f} V, {current_text}, {pct_text}"
             )
             self._top_battery.setText(pct_text if pct_text != "N/A" else f"{voltage:.1f}V")
+            self._map_widget.set_header_battery(
+                pct_text if pct_text != "N/A" else f"{voltage:.1f}V"
+            )
             sensors_present = int(data.get("sensors_present", 0))
             sensors_enabled = int(data.get("sensors_enabled", 0))
             sensors_health = int(data.get("sensors_health", 0))
@@ -1227,8 +1603,17 @@ class MainWindow(QMainWindow):
             text = str(data.get("text", "")).strip()
             if text:
                 self._top_vehicle_msg.setText(text)
+                self._map_widget.set_header_vehicle_msg(text)
                 self._append_log(f"STATUSTEXT: {text}")
+        elif msg_type.startswith("OPEN_DRONE_ID_"):
+            rid_text = self._extract_remote_id_text(data)
+            if rid_text:
+                self._rid_live_available = True
+                rid_display = f"RID: {rid_text}"
+                self._top_remote_id.setText(rid_display)
+                self._map_widget.set_header_remote_id(rid_display)
         self._refresh_footer_summary()
+        self._refresh_plan_flight_metrics()
 
     def _on_set_mode(self) -> None:
         mode_name = self._mode_combo.currentText().strip()
@@ -1282,6 +1667,140 @@ class MainWindow(QMainWindow):
         if isinstance(cfg, dict):
             self._thread.queue_geofence_upload(cfg)
 
+    def _on_map_connect_requested(self) -> None:
+        # Header click must always request an explicit connection string.
+        current = self._conn_edit.text().strip()
+        if not current:
+            current = str(self._settings.value("last_connection_string", "udp:127.0.0.1:14550"))
+
+        value, ok = QInputDialog.getText(
+            self,
+            "Connect Vehicle",
+            "MAVLink connection string:",
+            QLineEdit.EchoMode.Normal,
+            current,
+        )
+        if not ok:
+            return
+        connection_string = value.strip()
+        if not connection_string:
+            QMessageBox.warning(self, "VGCS", "Enter a connection string.")
+            return
+        # Ensure this always triggers a real connection attempt with the entered link.
+        if self._thread is not None and self._thread.isRunning():
+            self._on_disconnect()
+        self._conn_edit.setText(connection_string)
+        self._append_log(f"Manual connect requested: {connection_string}")
+        self._on_connect()
+
+    def _on_map_return_requested(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before return command.")
+            return
+        self._thread.queue_mode_change("RTL")
+        self._append_log("Mode change queued: RTL")
+
+    def _on_map_mission_start_requested(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before mission start.")
+            return
+        model = list(getattr(self._map_widget, "_waypoints_model", []))
+        if not model:
+            QMessageBox.warning(
+                self,
+                "Mission Start",
+                "No waypoints available. Create/import waypoints first.",
+            )
+            return
+        armed_text = self._fields.get("armed").text().strip().lower()
+        if armed_text != "yes":
+            QMessageBox.warning(
+                self,
+                "Mission Start",
+                "Vehicle is not armed.\nArm the vehicle before starting mission navigation.",
+            )
+            return
+        payload = [{"lat": float(wp.lat), "lon": float(wp.lon), "alt_m": float(wp.alt_m)} for wp in model]
+        self._thread.queue_mission_upload(payload)
+        self._thread.queue_mission_start()
+        self._append_log(
+            f"Mission start queued: upload {len(payload)} WPs (+TAKEOFF item) + AUTO start"
+        )
+
+    @staticmethod
+    def _offset_lat_lon_m(lat_deg: float, lon_deg: float, east_m: float, north_m: float) -> tuple[float, float]:
+        d_lat = north_m / 111_320.0
+        cos_lat = math.cos(math.radians(lat_deg))
+        d_lon = east_m / (111_320.0 * max(0.1, cos_lat))
+        return lat_deg + d_lat, lon_deg + d_lon
+
+    def _build_m2_grid_pattern(self) -> list[Waypoint]:
+        ref = self._map_widget.get_vehicle_position()
+        if ref is None:
+            return []
+        lat0, lon0 = ref
+        # M2 default: compact lawnmower around vehicle position.
+        width_m = 80.0
+        height_m = 60.0
+        line_spacing_m = 20.0
+        half_w = width_m / 2.0
+        half_h = height_m / 2.0
+        rows = max(2, int(round(height_m / line_spacing_m)) + 1)
+        waypoints: list[Waypoint] = []
+        for row in range(rows):
+            north = -half_h + row * line_spacing_m
+            left = self._offset_lat_lon_m(lat0, lon0, -half_w, north)
+            right = self._offset_lat_lon_m(lat0, lon0, half_w, north)
+            if row % 2 == 0:
+                seq = (left, right)
+            else:
+                seq = (right, left)
+            for lat, lon in seq:
+                waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=20.0))
+        return waypoints
+
+    def _on_plan_tool_requested(self, tool_name: str) -> None:
+        tool = (tool_name or "").strip().lower()
+        if not tool:
+            return
+        if tool == "file":
+            self._append_log("Plan tool: File -> import mission")
+            self._map_widget.open_mission_file()
+            return
+        if tool == "takeoff":
+            self._append_log("Plan tool: Takeoff")
+            self._on_takeoff()
+            return
+        if tool == "waypoint":
+            self._append_log("Plan tool: Waypoint mode")
+            self._map_widget.start_waypoint_planning()
+            return
+        if tool == "roi":
+            self._append_log("Plan tool: ROI mode")
+            self._map_widget.start_roi_planning()
+            return
+        if tool == "pattern":
+            self._append_log("Plan tool: Pattern (M2 grid)")
+            wps = self._build_m2_grid_pattern()
+            if not wps:
+                QMessageBox.warning(
+                    self,
+                    "Plan Flight",
+                    "Pattern requires current vehicle position.\nConnect and wait for GPS position first.",
+                )
+                return
+            self._map_widget.set_waypoints(wps)
+            self._append_log(f"Pattern generated: {len(wps)} waypoints (M2 grid)")
+            return
+        if tool == "return":
+            self._append_log("Plan tool: Return (RTL)")
+            self._on_map_return_requested()
+            return
+        if tool == "center":
+            self._append_log("Plan tool: Center map on vehicle")
+            self._map_widget.center_on_vehicle()
+            return
+
     def _on_params_refresh(self) -> None:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before parameter fetch.")
@@ -1324,13 +1843,52 @@ class MainWindow(QMainWindow):
         msg = f"Param {'OK' if ok else 'FAIL'}: {name} {detail}"
         self._append_log(msg)
 
+    def _on_tiles_online(self) -> None:
+        self._map_widget.activate_online_tiles()
+        self._append_log("Map tiles: online source selected")
+
+    def _on_tiles_offline(self) -> None:
+        root = QFileDialog.getExistingDirectory(
+            self,
+            "Select offline tile root (contains z/x/y.png)",
+            "",
+        )
+        if not root:
+            return
+        self._map_widget.activate_offline_tiles(root)
+        self._append_log(f"Map tiles: offline source selected ({root})")
+
+    def _sync_mode_options_for_vehicle(self, vehicle_type: int) -> None:
+        if self._last_vehicle_type == vehicle_type:
+            return
+        self._last_vehicle_type = vehicle_type
+        modes = modes_for_vehicle_type(vehicle_type)
+        current = self._mode_combo.currentText().strip()
+        self._mode_combo.blockSignals(True)
+        self._mode_combo.clear()
+        self._mode_combo.addItems(modes)
+        if current and current in modes:
+            self._mode_combo.setCurrentText(current)
+        self._mode_combo.blockSignals(False)
+
     def _on_link_timeout(self, elapsed_s: float) -> None:
         self._watchdog.setText(f"Lost · {elapsed_s:.1f}s no MAVLink")
         self._apply_state_style(self._watchdog, "bad")
-        self._top_vehicle_msg.setText("No MAVLink")
+        self._set_dashboard_flight_status(
+            "red",
+            "Communication lost - Not Ready to Arm",
+        )
         self._append_log(
             f"GCS link watchdog triggered: no messages for {elapsed_s:.1f}s"
         )
+        if self._connect_attempt_active and not self._heartbeat_seen:
+            self._connect_attempt_active = False
+            QMessageBox.warning(
+                self,
+                "Connection failed",
+                f"No MAVLink heartbeat received within {elapsed_s:.1f}s.\n"
+                f"Check connection string, port/protocol, and vehicle/SITL state.",
+            )
 
     def _on_timeout_changed(self, value: float) -> None:
         self._timeout_s = float(value)
@@ -1345,6 +1903,8 @@ class MainWindow(QMainWindow):
         self._apply_state_style(self._watchdog, "ok")
         self._compass.clear()
         self._reset_telemetry_fields()
+        self._arm_not_ready_alert_shown = False
+        self._set_dashboard_flight_status("red", "Communication lost - Not Ready to Arm")
         self._append_log("Telemetry fields reset.")
 
     def _on_theme_changed(self, theme_name: str) -> None:
@@ -1399,15 +1959,22 @@ class MainWindow(QMainWindow):
 
     def _on_flight_timer_tick(self) -> None:
         if self._armed_since is None:
+            self._push_map_flight_overlay()
+            self._refresh_plan_flight_metrics()
             return
         elapsed = int(time.monotonic() - self._armed_since)
         mm = elapsed // 60
         ss = elapsed % 60
         self._fields["flight_time"].setText(f"{mm:02d}:{ss:02d}")
+        self._push_map_flight_overlay()
+        self._refresh_plan_flight_metrics()
 
     def _on_link_error(self, text: str) -> None:
         self._append_log(f"Error: {text}")
-        self._top_vehicle_msg.setText("Error")
+        self._set_dashboard_flight_status("red", "Communication lost - Not Ready to Arm")
+        if self._connect_attempt_active and not self._heartbeat_seen:
+            self._connect_attempt_active = False
+            QMessageBox.warning(self, "Connection failed", f"{text}")
 
     def _on_dev_reload(self) -> None:
         app = QApplication.instance()

@@ -64,6 +64,17 @@ AP_ROVER_MODE_MAP = {
 }
 
 
+def modes_for_vehicle_type(vehicle_type: int | None) -> list[str]:
+    """Return available mode names for a MAV_TYPE."""
+    if vehicle_type in {2, 13, 14, 15, 16}:
+        return list(AP_COPTER_MODE_MAP.values())
+    if vehicle_type == 1:
+        return list(AP_PLANE_MODE_MAP.values())
+    if vehicle_type == 10:
+        return list(AP_ROVER_MODE_MAP.values())
+    return list(AP_COPTER_MODE_MAP.values())
+
+
 def human_mode_name(
     *, vehicle_type: int | None, custom_mode: int | None
 ) -> str:

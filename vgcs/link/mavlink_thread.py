@@ -53,6 +53,10 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("mission_download", None))
 
+    def queue_mission_start(self) -> None:
+        with self._cmd_lock:
+            self._cmd_queue.append(("mission_start", None))
+
     def queue_mode_change(self, mode_name: str) -> None:
         with self._cmd_lock:
             self._cmd_queue.append(("mode_change", mode_name.strip()))
@@ -293,6 +297,29 @@ class MavlinkThread(QThread):
                         "remnoise": int(getattr(msg, "remnoise", 0) or 0),
                     },
                 )
+            elif msg_type.startswith("OPEN_DRONE_ID_"):
+                payload: dict[str, object] = {}
+                try:
+                    raw = msg.to_dict()
+                    if isinstance(raw, dict):
+                        payload = raw
+                except Exception:
+                    payload = {}
+                # Best-effort normalize of common byte-array identifier fields.
+                for key in ("id_or_mac", "uas_id", "operator_id", "self_id"):
+                    if key not in payload:
+                        continue
+                    value = payload.get(key)
+                    if isinstance(value, (bytes, bytearray)):
+                        payload[key] = value.decode("ascii", errors="ignore").strip("\x00 ").strip()
+                    elif isinstance(value, list):
+                        try:
+                            payload[key] = bytes(int(v) & 0xFF for v in value).decode(
+                                "ascii", errors="ignore"
+                            ).strip("\x00 ").strip()
+                        except Exception:
+                            pass
+                self.telemetry.emit(msg_type, payload)
 
         try:
             if self._master is not None:
@@ -315,6 +342,8 @@ class MavlinkThread(QThread):
                 self._mission_upload(payload if isinstance(payload, list) else [])
             elif cmd == "mission_download":
                 self._mission_download()
+            elif cmd == "mission_start":
+                self._mission_start()
             elif cmd == "mode_change":
                 self._mode_change(str(payload or ""))
             elif cmd == "takeoff":
@@ -339,8 +368,30 @@ class MavlinkThread(QThread):
             self.error.emit("Mission upload: no waypoints")
             return
 
-        count = len(waypoints)
-        self.log_line.emit(f"Mission upload start: {count} WPs")
+        # Build an executable mission sequence for Copter-style workflows:
+        # NAV_TAKEOFF (seq 0) + NAV_WAYPOINT items from planned points.
+        mission_items: list[dict] = []
+        first = waypoints[0]
+        mission_items.append(
+            {
+                "cmd": int(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF),
+                "lat": float(first.get("lat", 0.0)),
+                "lon": float(first.get("lon", 0.0)),
+                "alt_m": max(1.0, float(first.get("alt_m", 20.0))),
+            }
+        )
+        for wp in waypoints:
+            mission_items.append(
+                {
+                    "cmd": int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT),
+                    "lat": float(wp.get("lat", 0.0)),
+                    "lon": float(wp.get("lon", 0.0)),
+                    "alt_m": max(1.0, float(wp.get("alt_m", 20.0))),
+                }
+            )
+
+        count = len(mission_items)
+        self.log_line.emit(f"Mission upload start: {len(waypoints)} WPs ({count} mission items)")
         try:
             self._master.mav.mission_count_send(
                 self._target_sysid,
@@ -370,17 +421,18 @@ class MavlinkThread(QThread):
             seq = int(getattr(req, "seq", sent) or sent)
             if seq < 0 or seq >= count:
                 continue
-            wp = waypoints[seq]
-            lat = float(wp.get("lat", 0.0))
-            lon = float(wp.get("lon", 0.0))
-            alt = float(wp.get("alt_m", 20.0))
+            item = mission_items[seq]
+            lat = float(item.get("lat", 0.0))
+            lon = float(item.get("lon", 0.0))
+            alt = float(item.get("alt_m", 20.0))
+            cmd = int(item.get("cmd", int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT)))
             try:
                 self._master.mav.mission_item_int_send(
                     self._target_sysid,
                     self._target_compid,
                     seq,
                     mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                    cmd,
                     1 if seq == 0 else 0,
                     1,
                     0.0,
@@ -398,7 +450,7 @@ class MavlinkThread(QThread):
                     self._target_compid,
                     seq,
                     mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                    cmd,
                     1 if seq == 0 else 0,
                     1,
                     0.0,
@@ -421,8 +473,8 @@ class MavlinkThread(QThread):
         ack_type = int(getattr(ack, "type", mavutil.mavlink.MAV_MISSION_ERROR))
         if ack_type != int(mavutil.mavlink.MAV_MISSION_ACCEPTED):
             raise RuntimeError(f"mission upload ACK type={ack_type}")
-        self.log_line.emit(f"Mission upload complete: {count} WPs")
-        self.mission_uploaded.emit(count)
+        self.log_line.emit(f"Mission upload complete: {count} mission items")
+        self.mission_uploaded.emit(len(waypoints))
 
     def _mission_download(self) -> None:
         if self._master is None:
@@ -512,6 +564,31 @@ class MavlinkThread(QThread):
             self.mode_changed.emit(mode_name, False)
             self.error.emit(f"Mode change failed: {e}")
 
+    def _mission_start(self) -> None:
+        if self._master is None:
+            self.action_result.emit("mission_start", False, "Link not ready")
+            self.error.emit("Mission start: link not ready")
+            return
+        try:
+            # ArduPilot mission navigation requires AUTO mode + mission start command.
+            # Ensure mission index starts at first item.
+            self._master.mav.mission_set_current_send(
+                self._target_sysid,
+                self._target_compid,
+                0,
+            )
+            self._master.set_mode("AUTO")
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_MISSION_START,
+                p1=0.0,
+                p2=0.0,
+            )
+            self.action_result.emit("mission_start", True, "AUTO mission start sent")
+            self.log_line.emit("Mission start command sent (AUTO)")
+        except Exception as e:
+            self.action_result.emit("mission_start", False, str(e))
+            self.error.emit(f"Mission start failed: {e}")
+
     def _send_command_long(
         self,
         command: int,
@@ -574,7 +651,26 @@ class MavlinkThread(QThread):
         )
 
     def _geofence_upload(self, cfg: dict) -> None:
-        # M2 subset: configure ArduPilot circular fence parameters.
+        if bool(cfg.get("disable")):
+            try:
+                self._param_set_value("FENCE_ENABLE", 0.0)
+                self.geofence_result.emit(True, "Fence disabled")
+                return
+            except Exception as e:
+                self.geofence_result.emit(False, str(e))
+                self.error.emit(f"Geofence disable failed: {e}")
+                return
+
+        points = cfg.get("points")
+        if isinstance(points, list) and len(points) >= 3:
+            try:
+                self._upload_polygon_fence(points)
+                self.geofence_result.emit(True, f"Polygon uploaded ({len(points)} pts)")
+                return
+            except Exception as e:
+                self.error.emit(f"Polygon fence upload failed; fallback to circle: {e}")
+
+        # M2 subset fallback: configure ArduPilot circular fence parameters.
         radius_m = max(10.0, float(cfg.get("radius_m", 80.0)))
         alt_max_m = max(5.0, float(cfg.get("alt_max_m", 120.0)))
         try:
@@ -592,6 +688,33 @@ class MavlinkThread(QThread):
         except Exception as e:
             self.geofence_result.emit(False, str(e))
             self.error.emit(f"Geofence upload failed: {e}")
+
+    def _upload_polygon_fence(self, points: list[object]) -> None:
+        if self._master is None:
+            raise RuntimeError("Link not ready")
+        norm: list[tuple[float, float]] = []
+        for row in points:
+            if not (isinstance(row, list) or isinstance(row, tuple)) or len(row) < 2:
+                continue
+            lat = float(row[0])
+            lon = float(row[1])
+            norm.append((lat, lon))
+        if len(norm) < 3:
+            raise RuntimeError("Polygon requires >=3 points")
+        self._param_set_value("FENCE_ENABLE", 1.0)
+        self._param_set_value("FENCE_TYPE", 4.0)  # polygon fence
+        self._param_set_value("FENCE_TOTAL", float(len(norm)))
+        for idx, (lat, lon) in enumerate(norm):
+            self._master.mav.fence_point_send(
+                self._target_sysid,
+                self._target_compid,
+                idx,
+                len(norm),
+                lat,
+                lon,
+            )
+            time.sleep(0.02)
+        self.log_line.emit(f"Polygon geofence points sent: {len(norm)}")
 
     def _params_fetch(self, names: list[str]) -> None:
         if self._master is None:

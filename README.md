@@ -14,7 +14,7 @@
 
 | **Python** | 3.10+ recommended |
 
-| **Current milestone** | **M1** — telemetry dashboard, link watchdog, GCS-style UI shell |
+| **Current milestone** | **M2** — map-first operator dashboard, plan tools, mission + geofence ops |
 
 
 
@@ -74,7 +74,7 @@
 
 
 
-At **M1**, VGCS provides a **dark GCS-style dashboard**: link settings, status chips, grouped flight/system telemetry, **compass** + heading, configurable link watchdog, and message log. **Map, mission editing, and video** are planned for **M2 / M3**.
+At **M2**, VGCS provides a **map-first GCS dashboard** with live telemetry overlays, operator actions, mission planning/editing, geofence controls, and MAVLink command workflows (mode, takeoff/land, params). Video controls are integrated in the map UI with a preview overlay.
 
 
 
@@ -92,7 +92,7 @@ At **M1**, VGCS provides a **dark GCS-style dashboard**: link settings, status c
 
 | **Log** | Connection and telemetry log. |
 
-**Next milestone planning:** aligned to M2 dashboard spec and implementation checklist.
+**Milestone status:** M2 implementation is complete.
 
 
 
@@ -359,10 +359,16 @@ You should see the **VGCS** window: connection settings, status chips, telemetry
 For near-immediate UI iteration while coding:
 
 ```bash
-python tools/dev_autorestart.py
+py dev.py
 ```
 
 This watches `vgcs/**/*.py` and restarts the app automatically on save.
+
+Equivalent (older) command:
+
+```bash
+py tools/dev_autorestart.py
+```
 
 Inside the running app, you can also press:
 
