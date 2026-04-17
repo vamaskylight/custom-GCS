@@ -74,7 +74,7 @@
 
 
 
-At **M1**, VGCS provides a **dark GCS-style dashboard**: link settings, status chips, grouped flight/system telemetry, **compass** + heading, configurable link watchdog, and message log. **Map, mission editing, and video** are planned for **M2 / M3** (see [DOCS/UI-ROADMAP.md](./DOCS/UI-ROADMAP.md)).
+At **M1**, VGCS provides a **dark GCS-style dashboard**: link settings, status chips, grouped flight/system telemetry, **compass** + heading, configurable link watchdog, and message log. **Map, mission editing, and video** are planned for **M2 / M3**.
 
 
 
@@ -86,13 +86,13 @@ At **M1**, VGCS provides a **dark GCS-style dashboard**: link settings, status c
 
 | **Connect / Disconnect** | Background MAVLink thread; UI stays responsive. |
 
-| **Telemetry** | Core flight and navigation fields from agreed MAVLink messages ([DOCS/M1-MESSAGE-MAP.md](./DOCS/M1-MESSAGE-MAP.md)). |
+| **Telemetry** | Core flight and navigation fields from the agreed M1 telemetry set. |
 
 | **Compass** | Heading needle (VFR_HUD / attitude yaw). |
 
 | **Log** | Connection and telemetry log. |
 
-**M1 acceptance testing (client / field):** see [DOCS/M1-CLIENT-TEST-GUIDE.md](./DOCS/M1-CLIENT-TEST-GUIDE.md).
+**Next milestone planning:** aligned to M2 dashboard spec and implementation checklist.
 
 
 
@@ -351,6 +351,26 @@ You should see the **VGCS** window: connection settings, status chips, telemetry
 - **Disconnect** is disabled until you connect (depending on state); after a successful connect cycle, you can disconnect cleanly.
 
 
+
+---
+
+## Dev Fast Loop
+
+For near-immediate UI iteration while coding:
+
+```bash
+python tools/dev_autorestart.py
+```
+
+This watches `vgcs/**/*.py` and restarts the app automatically on save.
+
+Inside the running app, you can also press:
+
+```text
+Ctrl+Shift+R
+```
+
+to re-apply fonts/styles without a full process restart.
 
 ---
 
