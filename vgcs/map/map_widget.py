@@ -164,7 +164,9 @@ LEAFLET_HTML = """<!doctype html>
       flex: 0 0 auto;
     }
     #hdrVehiclePill {
-      flex: 1 1 0;
+      /* Don't consume all remaining width (creates a large blank gap). */
+      flex: 0 1 auto;
+      max-width: 52vw;
       min-width: 0;
       overflow: hidden;
     }
