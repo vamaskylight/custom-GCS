@@ -164,14 +164,14 @@ LEAFLET_HTML = """<!doctype html>
       flex: 0 0 auto;
     }
     #hdrVehiclePill {
-      flex: 1 1 auto;
+      flex: 1 1 0;
       min-width: 0;
       overflow: hidden;
-      text-overflow: ellipsis;
     }
     #hdrVehicleMsg {
       display:inline-block;
       min-width: 0;
+      max-width: 100%;
       overflow: hidden;
       text-overflow: ellipsis;
     }
