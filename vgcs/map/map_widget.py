@@ -60,6 +60,7 @@ _KEY_TOOLBAR_EXPORT_MISSION_JSON = "toolbar_export_mission_json"
 _KEY_PLAN_LAST_MISSION_JSON_LEGACY = "plan_last_mission_json"  # legacy; read fallback only
 _KEY_MAP_OFFLINE_TILE_ROOT = "map_offline_tile_root"
 _KEY_MAP_WEBCAM_ENABLED = "map_webcam_enabled"
+_KEY_MAP_LOW_SPEC_MODE = "map_low_spec_mode"  # 'auto' | 'on' | 'off'
 
 
 try:
@@ -2235,6 +2236,10 @@ LEAFLET_HTML = """<!doctype html>
     let labelLayer = null;
     let __tileErrorCount = 0;
     let __tileErrorLastSignalAt = 0;
+    window.__lowSpec = false;
+    window.__tileTemplate = '';
+    window.__tileAttribution = '';
+    window.__tileMaxZoom = 19;
     const LABELS_TEMPLATE_ESRI =
       'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
     function setTileSource(urlTemplate, attribution, maxZoom) {
@@ -2242,16 +2247,21 @@ LEAFLET_HTML = """<!doctype html>
       if (labelLayer) map.removeLayer(labelLayer);
       const mz = maxZoom || 19;
       __tileErrorCount = 0;
+      window.__tileTemplate = urlTemplate || '';
+      window.__tileAttribution = attribution || '';
+      window.__tileMaxZoom = mz;
+      const low = !!window.__lowSpec;
+      const effectiveMz = low ? Math.min(mz, 17) : mz;
       tileLayer = L.tileLayer(urlTemplate, {
-        maxZoom: mz,
+        maxZoom: effectiveMz,
         attribution: attribution || '',
         // Performance: reduce tile churn while panning/zooming in Qt WebEngine.
         updateWhenIdle: true,
         updateWhenZooming: false,
         // Smaller buffer = fewer tiles kept/decoded during pans.
-        keepBuffer: 2,
+        keepBuffer: low ? 1 : 2,
         // Throttle tile updates a bit to keep panning responsive.
-        updateInterval: 140,
+        updateInterval: low ? 260 : 140,
         // Avoid higher-res tile fetches that can double work.
         detectRetina: false
       }).addTo(map);
@@ -2265,58 +2275,72 @@ LEAFLET_HTML = """<!doctype html>
           }
         });
       } catch (e) {}
-      // Add borders + place labels overlay (transparent tiles) to match client reference.
-      // Works best over satellite imagery; safe to keep enabled for other sources too.
-      try {
-        labelLayer = L.tileLayer(LABELS_TEMPLATE_ESRI, {
-          maxZoom: mz,
-          // Avoid fetching labels at very low zooms (saves a lot of requests).
-          minZoom: 3,
-          opacity: 0.9,
-          attribution: '',
-          updateWhenIdle: true,
-          updateWhenZooming: false,
-          keepBuffer: 1,
-          updateInterval: 180,
-          detectRetina: false,
-          pane: 'overlayPane'
-        }).addTo(map);
+      if (!low) {
+        // Add borders + place labels overlay (transparent tiles) to match client reference.
+        // Works best over satellite imagery; safe to keep enabled for other sources too.
         try {
-          labelLayer.on('tileerror', function() {
-            __tileErrorCount += 1;
-            const now = Date.now();
-            if (__tileErrorCount >= 10 && (now - __tileErrorLastSignalAt) > 8000) {
-              __tileErrorLastSignalAt = now;
-              document.title = 'VGCS_TILE_ERROR:' + now;
-            }
-          });
-        } catch (e2) {}
-      } catch (e) {
+          labelLayer = L.tileLayer(LABELS_TEMPLATE_ESRI, {
+            maxZoom: effectiveMz,
+            // Avoid fetching labels at very low zooms (saves a lot of requests).
+            minZoom: 3,
+            opacity: 0.9,
+            attribution: '',
+            updateWhenIdle: true,
+            updateWhenZooming: false,
+            keepBuffer: 1,
+            updateInterval: 180,
+            detectRetina: false,
+            pane: 'overlayPane'
+          }).addTo(map);
+          try {
+            labelLayer.on('tileerror', function() {
+              __tileErrorCount += 1;
+              const now = Date.now();
+              if (__tileErrorCount >= 10 && (now - __tileErrorLastSignalAt) > 8000) {
+                __tileErrorLastSignalAt = now;
+                document.title = 'VGCS_TILE_ERROR:' + now;
+              }
+            });
+          } catch (e2) {}
+        } catch (e) {
+          labelLayer = null;
+        }
+        // Performance: hide labels while interacting, restore when idle.
+        // This avoids expensive compositing of semi-transparent tiles during drag.
+        try {
+          if (!window.__labelsPanHooked) {
+            window.__labelsPanHooked = true;
+            let __labelsRestoreT = null;
+            const hide = () => { try { if (labelLayer) labelLayer.setOpacity(0.0); } catch (e) {} };
+            const restoreSoon = () => {
+              try {
+                if (__labelsRestoreT) clearTimeout(__labelsRestoreT);
+                __labelsRestoreT = setTimeout(() => {
+                  try { if (labelLayer) labelLayer.setOpacity(0.9); } catch (e) {}
+                }, 140);
+              } catch (e) {}
+            };
+            map.on('movestart', hide);
+            map.on('zoomstart', hide);
+            map.on('moveend', restoreSoon);
+            map.on('zoomend', restoreSoon);
+          }
+          if (labelLayer) labelLayer.setOpacity(0.9);
+        } catch (e) {}
+      } else {
         labelLayer = null;
       }
-      // Performance: hide labels while interacting, restore when idle.
-      // This avoids expensive compositing of semi-transparent tiles during drag.
-      try {
-        if (!window.__labelsPanHooked) {
-          window.__labelsPanHooked = true;
-          let __labelsRestoreT = null;
-          const hide = () => { try { if (labelLayer) labelLayer.setOpacity(0.0); } catch (e) {} };
-          const restoreSoon = () => {
-            try {
-              if (__labelsRestoreT) clearTimeout(__labelsRestoreT);
-              __labelsRestoreT = setTimeout(() => {
-                try { if (labelLayer) labelLayer.setOpacity(0.9); } catch (e) {}
-              }, 140);
-            } catch (e) {}
-          };
-          map.on('movestart', hide);
-          map.on('zoomstart', hide);
-          map.on('moveend', restoreSoon);
-          map.on('zoomend', restoreSoon);
-        }
-        if (labelLayer) labelLayer.setOpacity(0.9);
-      } catch (e) {}
       return 1;
+    }
+
+    function setLowSpecMode(enabled) {
+      window.__lowSpec = !!enabled;
+      try {
+        if (window.__tileTemplate) {
+          setTileSource(window.__tileTemplate, window.__tileAttribution || '', window.__tileMaxZoom || 19);
+        }
+      } catch (e) {}
+      return window.__lowSpec ? 1 : 0;
     }
     // Satellite-like default view similar to the provided reference.
     setTileSource(
@@ -3874,6 +3898,8 @@ class MapWidget(QWidget):
         self._last_plan_vehicle_info_key: tuple[str, str] | None = None
         self._plan_rail_tool_state = "File"
         self._tile_error_notified = False
+        self._low_spec_effective = False
+        self._low_spec_autodetected = False
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -3924,6 +3950,20 @@ class MapWidget(QWidget):
         self._btn_tiles_pick = QPushButton("Offline Tiles…")
         self._btn_webcam = QPushButton("Webcam")
         self._btn_webcam.setCheckable(True)
+        self._perf_mode = QComboBox()
+        self._perf_mode.setMinimumWidth(92)
+        self._perf_mode.addItems(["Perf: Auto", "Perf: Low", "Perf: High"])
+        try:
+            s = QSettings(_QS_NS, _QS_APP)
+            mode = str(s.value(_KEY_MAP_LOW_SPEC_MODE, "auto") or "auto").strip().lower()
+        except Exception:
+            mode = "auto"
+        if mode == "on":
+            self._perf_mode.setCurrentIndex(1)
+        elif mode == "off":
+            self._perf_mode.setCurrentIndex(2)
+        else:
+            self._perf_mode.setCurrentIndex(0)
         try:
             s = QSettings(_QS_NS, _QS_APP)
             self._btn_webcam.setChecked(bool(s.value(_KEY_MAP_WEBCAM_ENABLED, False)))
@@ -3999,6 +4039,7 @@ class MapWidget(QWidget):
         tools.addWidget(self._btn_tiles_online, 2, 8)
         tools.addWidget(self._btn_tiles_pick, 2, 9)
         tools.addWidget(self._btn_webcam, 2, 10)
+        tools.addWidget(self._perf_mode, 2, 11)
         toolbar.setLayout(tools)
         self._toolbar = toolbar
 
@@ -4034,6 +4075,7 @@ class MapWidget(QWidget):
         self._btn_tiles_online.clicked.connect(self._set_online_tiles)
         self._btn_tiles_pick.clicked.connect(self._pick_offline_tiles)
         self._btn_webcam.toggled.connect(self._set_webcam_enabled)
+        self._perf_mode.currentIndexChanged.connect(self._on_perf_mode_changed)
         self._wp_selector.currentIndexChanged.connect(self._on_wp_selected)
         self._btn_apply_wp_alt.clicked.connect(self._apply_altitude_to_selected)
         self._btn_apply_all_alt.clicked.connect(self._apply_altitude_to_all)
@@ -4097,6 +4139,86 @@ class MapWidget(QWidget):
             self._set_status("Webcam enabled")
         else:
             self._set_status("Webcam enabled (will start when connected)")
+
+    def _on_perf_mode_changed(self, idx: int) -> None:
+        # 0=Auto, 1=Low, 2=High
+        mode = "auto"
+        if int(idx) == 1:
+            mode = "on"
+        elif int(idx) == 2:
+            mode = "off"
+        try:
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_LOW_SPEC_MODE, mode)
+        except Exception:
+            pass
+        if mode == "on":
+            self._apply_low_spec_mode(True, reason="manual")
+        elif mode == "off":
+            self._apply_low_spec_mode(False, reason="manual")
+        else:
+            # Auto: apply any already-detected effective mode; otherwise default to high.
+            self._apply_low_spec_mode(bool(getattr(self, "_low_spec_autodetected", False)), reason="auto")
+
+    def _apply_low_spec_mode(self, enabled: bool, *, reason: str) -> None:
+        on = bool(enabled)
+        self._low_spec_effective = on
+        # Python-side throttles (JS bridge pressure is a major cause of lag).
+        try:
+            self._vehicle_pose_timer.setInterval(240 if on else 120)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_video_push_timer"):
+                self._video_push_timer.setInterval(400 if on else 200)
+        except Exception:
+            pass
+        # JS-side tile/label adjustments.
+        try:
+            self._run_js("setLowSpecMode(true);" if on else "setLowSpecMode(false);")
+        except Exception:
+            pass
+        if reason == "manual":
+            self._set_status("Performance: Low" if on else "Performance: High")
+
+    def _maybe_autodetect_low_spec(self) -> None:
+        # Heuristic: measure WebEngine JS callback latency; if it's consistently high, enable low-spec.
+        try:
+            s = QSettings(_QS_NS, _QS_APP)
+            mode = str(s.value(_KEY_MAP_LOW_SPEC_MODE, "auto") or "auto").strip().lower()
+        except Exception:
+            mode = "auto"
+        if mode != "auto":
+            return
+        if getattr(self, "_low_spec_autodetected", False):
+            return
+        if not bool(getattr(self, "_web_ready", False)):
+            return
+
+        try:
+            from time import perf_counter
+        except Exception:
+            return
+
+        samples: list[float] = []
+
+        def one() -> None:
+            t0 = perf_counter()
+
+            def cb(_val) -> None:
+                dt = (perf_counter() - t0) * 1000.0
+                samples.append(float(dt))
+                if len(samples) >= 3:
+                    avg = sum(samples) / len(samples)
+                    if avg >= 120.0:
+                        self._low_spec_autodetected = True
+                        self._apply_low_spec_mode(True, reason="auto")
+                        self._set_status("Performance: Auto (low-spec detected)")
+                    return
+                one()
+
+            self._run_js("Date.now();", callback=cb)
+
+        one()
 
     def set_flight_status(self, status: str, detail: str = "") -> None:
         st = (status or "").strip().lower()
@@ -4298,6 +4420,29 @@ class MapWidget(QWidget):
             self._web.titleChanged.connect(self._on_web_title_changed)
             self._map_canvas_layout.addWidget(self._web)
             self._set_status("Map backend: Leaflet (WebEngine)")
+        # Apply saved performance preference immediately; Auto detection will run after load.
+        try:
+            s = QSettings(_QS_NS, _QS_APP)
+            mode = str(s.value(_KEY_MAP_LOW_SPEC_MODE, "auto") or "auto").strip().lower()
+        except Exception:
+            mode = "auto"
+        if mode == "on":
+            self._apply_low_spec_mode(True, reason="manual")
+            try:
+                self._perf_mode.setCurrentIndex(1)
+            except Exception:
+                pass
+        elif mode == "off":
+            self._apply_low_spec_mode(False, reason="manual")
+            try:
+                self._perf_mode.setCurrentIndex(2)
+            except Exception:
+                pass
+        else:
+            try:
+                self._perf_mode.setCurrentIndex(0)
+            except Exception:
+                pass
             return
 
         backend_notice = QLabel(
@@ -4418,6 +4563,11 @@ class MapWidget(QWidget):
             try:
                 if bool(self._last_link_connected) and bool(self._btn_webcam.isChecked()):
                     self._start_video_preview()
+            except Exception:
+                pass
+            # Auto-detect low-spec devices and reduce map workload if needed.
+            try:
+                QTimer.singleShot(250, self._maybe_autodetect_low_spec)
             except Exception:
                 pass
         else:
