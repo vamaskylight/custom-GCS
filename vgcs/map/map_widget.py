@@ -3861,7 +3861,8 @@ class MapWidget(QWidget):
         self._last_plan_flight_metrics_payload: dict[str, object] | None = None
         self._vehicle_pose_timer = QTimer(self)
         self._vehicle_pose_timer.setSingleShot(True)
-        self._vehicle_pose_timer.setInterval(48)
+        # Throttle JS bridge updates; very high rates can make WebEngine feel laggy on low-end devices.
+        self._vehicle_pose_timer.setInterval(120)
         self._vehicle_pose_timer.timeout.connect(self._flush_vehicle_pose_js)
         self._heading_js_source = "mixed"
         self._last_flight_telemetry_sig: str | None = None
@@ -4742,6 +4743,18 @@ class MapWidget(QWidget):
         self.clear_plan_current_mission_path()
 
     def _sync_waypoint_count_from_map(self) -> None:
+        # Poll lightweight count only; fetching full waypoint JSON every second can stall WebEngine on slow clients.
+        self._run_js("getWaypointCount();", callback=self._on_waypoint_count)
+
+    def _on_waypoint_count(self, count) -> None:
+        try:
+            c = int(count)
+        except Exception:
+            return
+        c = max(0, c)
+        if c == int(getattr(self, "_waypoint_count", 0) or 0):
+            return
+        # Count changed; now fetch full list once to sync model/UI.
         self._run_js("JSON.stringify(getWaypoints());", callback=self._on_waypoints_json)
 
     def _on_waypoints_json(self, payload: str | None) -> None:
