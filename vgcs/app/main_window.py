@@ -2183,8 +2183,9 @@ class MainWindow(QMainWindow):
                 f"{voltage:.2f} V, {current_text}, {pct_text}"
             )
             # Always show voltage in the header; percent alone is not actionable for operators.
+            # Use 2 decimals so small real-time changes are visible (e.g. 11.80 -> 11.74).
             bat_header = (
-                f"{voltage:.1f}V ({pct_text})" if pct_text != "N/A" else f"{voltage:.1f}V"
+                f"{voltage:.2f}V ({pct_text})" if pct_text != "N/A" else f"{voltage:.2f}V"
             )
             self._top_battery.setText(bat_header)
             self._map_widget.set_header_battery(bat_header)
@@ -2224,7 +2225,7 @@ class MainWindow(QMainWindow):
             if voltage_v <= 0.1:
                 return
             bat_header = (
-                f"{voltage_v:.1f}V ({pct_text})" if pct_text != "N/A" else f"{voltage_v:.1f}V"
+                f"{voltage_v:.2f}V ({pct_text})" if pct_text != "N/A" else f"{voltage_v:.2f}V"
             )
             self._top_battery.setText(bat_header)
             self._map_widget.set_header_battery(bat_header)

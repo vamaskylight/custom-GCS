@@ -2369,12 +2369,41 @@ LEAFLET_HTML = """<!doctype html>
       } catch (e) {}
       return window.__lowSpec ? 1 : 0;
     }
-    // Satellite-like default view similar to the provided reference.
-    setTileSource(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-      'Tiles © Esri',
-      19
-    );
+    // Choose a reliable default tile source for the current network.
+    const ESRI_SAT =
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+    const OSM =
+      'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+
+    function probeTile(urlTemplate, timeoutMs, cb) {
+      try {
+        const img = new Image();
+        let done = false;
+        const finish = (ok) => { if (done) return; done = true; try { cb(!!ok); } catch(e) {} };
+        const t = setTimeout(() => finish(false), Math.max(400, Number(timeoutMs) || 2200));
+        img.onload = () => { try { clearTimeout(t); } catch(e) {} finish(true); };
+        img.onerror = () => { try { clearTimeout(t); } catch(e) {} finish(false); };
+        // Use a low zoom tile that should exist everywhere.
+        const url = String(urlTemplate || '').replace('{z}','0').replace('{x}','0').replace('{y}','0').replace('{s}','a');
+        img.src = url;
+      } catch (e) {
+        try { cb(false); } catch(e2) {}
+      }
+    }
+
+    function selectDefaultTiles() {
+      probeTile(ESRI_SAT, 2600, (esriOk) => {
+        if (esriOk) {
+          setTileSource(ESRI_SAT, 'Tiles © Esri', 19);
+          return;
+        }
+        // Fallback when Esri is blocked/rate-limited on client networks.
+        setTileSource(OSM, '© OpenStreetMap', 19);
+        try { document.title = 'VGCS_TILE_FALLBACK:' + Date.now(); } catch(e) {}
+      });
+    }
+
+    selectDefaultTiles();
 
     const vehicleMarkerSvg =
       '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">' +
@@ -4752,6 +4781,14 @@ class MapWidget(QWidget):
             if not getattr(self, "_tile_error_notified", False):
                 self._tile_error_notified = True
                 self._set_status("Tile load errors detected — use Offline Tiles… or check network/proxy")
+            try:
+                self._run_js("document.title = 'VGCS Map';")
+            except Exception:
+                pass
+            return
+        if title.startswith("VGCS_TILE_FALLBACK:"):
+            # Esri blocked/unreachable: we auto-fell back to OSM to keep the map usable.
+            self._set_status("Tiles: Esri blocked — using OpenStreetMap")
             try:
                 self._run_js("document.title = 'VGCS Map';")
             except Exception:

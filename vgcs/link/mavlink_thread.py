@@ -549,7 +549,8 @@ class MavlinkThread(QThread):
             self.log_line.emit(f"request_data_stream_send failed: {e}")
         try:
             interval_us = int(1_000_000 / max(1, hz))
-            slow_interval_us = int(1_000_000 / 1)  # 1 Hz for heavy/slow-changing messages
+            # Battery voltage feels "laggy" at 1 Hz on real vehicles; use 2 Hz.
+            slow_interval_us = int(1_000_000 / 2)  # 2 Hz for status messages
             self._master.mav.command_long_send(
                 ts,
                 tc,
