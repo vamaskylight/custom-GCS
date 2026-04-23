@@ -2436,6 +2436,24 @@ LEAFLET_HTML = """<!doctype html>
       return 1;
     }
 
+    // Provide current map view + active tile template for Python-side probes.
+    try {
+      window.__vgcsGetMapView = function() {
+        try {
+          const c = map && map.getCenter ? map.getCenter() : { lat: 0, lng: 0 };
+          const z = map && map.getZoom ? map.getZoom() : 0;
+          return JSON.stringify({
+            z: Number(z) || 0,
+            lat: Number(c.lat) || 0,
+            lng: Number(c.lng) || 0,
+            template: String(window.__tileTemplate || '')
+          });
+        } catch (e) {
+          return JSON.stringify({ z: 0, lat: 0, lng: 0, template: String(window.__tileTemplate || '') });
+        }
+      };
+    } catch (e) {}
+
     function setLowSpecMode(enabled) {
       window.__lowSpec = !!enabled;
       try {
@@ -4403,44 +4421,86 @@ class MapWidget(QWidget):
             self._start_video_preview()
 
     def _probe_current_tiles(self, *, reason: str) -> None:
-        try:
-            tmpl = str(getattr(self, "_last_tile_template", "") or "")
-        except Exception:
-            tmpl = ""
-        # If we don't know current template yet, probe both imagery and streets.
-        if not tmpl:
-            candidates = [
-                (
-                    "esri_imagery",
-                    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/0/0/0",
-                ),
-                (
-                    "esri_streets",
-                    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/0/0/0",
-                ),
-            ]
-        else:
-            url = (
-                tmpl.replace("{z}", "0")
-                .replace("{x}", "0")
-                .replace("{y}", "0")
-                .replace("{s}", "a")
-            )
-            candidates = [("active", url)]
-        for label, url in candidates:
+        # Probe the *current* view tile (not just z=0), because placeholders often occur only at higher zooms.
+        def _kick(payload: str | None) -> None:
             try:
-                QThreadPool.globalInstance().start(
-                    _TileProbeTask(url=url, provider_label=f"{label}:{reason}", bridge=self._tile_probe_bridge)
-                )
+                data = json.loads(payload or "{}")
             except Exception:
-                pass
+                data = {}
+            try:
+                z = int(data.get("z", 0) or 0)
+                lat = float(data.get("lat", 0.0) or 0.0)
+                lng = float(data.get("lng", 0.0) or 0.0)
+                tmpl = str(data.get("template", "") or "")
+            except Exception:
+                z, lat, lng, tmpl = 0, 0.0, 0.0, ""
+
+            def slippy_xy(lat_deg: float, lon_deg: float, zoom: int) -> tuple[int, int]:
+                import math
+
+                lat_rad = math.radians(max(-85.0511, min(85.0511, lat_deg)))
+                n = 2.0**zoom
+                xt = int((lon_deg + 180.0) / 360.0 * n)
+                yt = int((1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+                return max(0, xt), max(0, yt)
+
+            candidates: list[tuple[str, str]] = []
+            if tmpl:
+                x, y = slippy_xy(lat, lng, max(0, min(19, z)))
+                url = (
+                    tmpl.replace("{z}", str(z))
+                    .replace("{x}", str(x))
+                    .replace("{y}", str(y))
+                    .replace("{s}", "a")
+                )
+                candidates.append(("active_view", url))
+            else:
+                candidates.extend(
+                    [
+                        ("esri_imagery_view", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/10/0/0"),
+                        ("esri_streets_view", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/10/0/0"),
+                    ]
+                )
+
+            # Always also probe z=0 as a baseline.
+            if tmpl:
+                z0 = (
+                    tmpl.replace("{z}", "0")
+                    .replace("{x}", "0")
+                    .replace("{y}", "0")
+                    .replace("{s}", "a")
+                )
+                candidates.append(("active_world", z0))
+
+            for label, url in candidates:
+                try:
+                    QThreadPool.globalInstance().start(
+                        _TileProbeTask(
+                            url=url,
+                            provider_label=f"{label}:{reason}",
+                            bridge=self._tile_probe_bridge,
+                        )
+                    )
+                except Exception:
+                    pass
+
+        try:
+            self._run_js("window.__vgcsGetMapView ? window.__vgcsGetMapView() : '';", callback=_kick)
+        except Exception:
+            _kick(None)
 
     def _on_tile_probe_result(self, provider_label: str, outcome: str) -> None:
         try:
             print(f"[VGCS:map] tile_probe {provider_label} -> {outcome}")
         except Exception:
             pass
-        # If imagery is placeholder, guide user to Streets/Offline in status.
+        # If the *active view* tile is a placeholder, auto-fallback to Streets and guide the user.
+        if "active_view" in str(provider_label) and outcome == "placeholder_suspected":
+            self._set_status("Satellite tiles are placeholders — auto-switching to Streets")
+            try:
+                self.activate_esri_street_tiles()
+            except Exception:
+                pass
         if "esri_imagery" in str(provider_label) and outcome == "placeholder_suspected":
             self._set_status("Satellite tiles blocked/placeholder — switch to Streets or Offline Tiles…")
 
