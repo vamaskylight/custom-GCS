@@ -1694,14 +1694,14 @@ LEAFLET_HTML = """<!doctype html>
         <span class="hdrPill"><img class="hdrIcon hdrIconBroadcast" src="__ICON_LINK_SRC__" alt="Vehicle Message"/><span id="hdrVehicleMsg">Vehicle Msg</span></span>
         <span class="hdrSep"></span>
         <span class="hdrPill" id="hdrGpsPill">
-          <img class="hdrIcon hdrIconSmall" src="__ICON_GPS_SRC__" alt="GPS"
+          <img id="hdrGpsIcon" class="hdrIcon hdrIconSmall" src="__ICON_GPS_SRC__" alt="GPS"
                onerror="this.style.display='none'; var e=document.getElementById('hdrGpsEmoji'); if(e) e.style.display='inline';"/>
           <span id="hdrGpsEmoji" style="display:none; font-weight:700;">GPS</span>
           <span class="hdrTinyStack" id="hdrGpsStack"><span id="hdrGpsSat">10</span><span id="hdrGpsHdop">0.7</span></span>
         </span>
         <span class="hdrSep"></span>
         <span class="hdrPill" id="hdrBatteryPill">
-          <img class="hdrIcon" src="__ICON_BATTERY_SRC__" alt="Battery"
+          <img id="hdrBatIcon" class="hdrIcon" src="__ICON_BATTERY_SRC__" alt="Battery"
                onerror="this.style.display='none'; var e=document.getElementById('hdrBatEmoji'); if(e) e.style.display='inline';"/>
           <span id="hdrBatEmoji" style="display:none; font-weight:700;">BAT</span>
           <span id="hdrBatteryText">100%</span>
@@ -2033,6 +2033,23 @@ LEAFLET_HTML = """<!doctype html>
     if (linkBannerLogo && linkBannerLogo.getAttribute('src')) {
       linkBannerLogo.style.display = 'block';
     }
+    // If header icon assets are missing (src empty), force deterministic text fallbacks.
+    function ensureIconFallback(imgId, fallbackId) {
+      try {
+        const img = document.getElementById(imgId);
+        const fb = document.getElementById(fallbackId);
+        if (!img || !fb) return 0;
+        const src = String(img.getAttribute('src') || '').trim();
+        if (!src) {
+          img.style.display = 'none';
+          fb.style.display = 'inline';
+          return 1;
+        }
+      } catch (e) {}
+      return 0;
+    }
+    ensureIconFallback('hdrGpsIcon', 'hdrGpsEmoji');
+    ensureIconFallback('hdrBatIcon', 'hdrBatEmoji');
     if (linkBanner) {
       linkBanner.style.cursor = 'pointer';
       linkBanner.addEventListener('click', function(ev) {
