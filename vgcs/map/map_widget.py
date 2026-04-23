@@ -7,7 +7,18 @@ import json
 from pathlib import Path
 from urllib.parse import quote
 
-from PySide6.QtCore import QByteArray, QBuffer, QPoint, QSettings, QTimer, Qt, QUrl
+from PySide6.QtCore import (
+    QByteArray,
+    QBuffer,
+    QObject,
+    QPoint,
+    QRunnable,
+    QSettings,
+    QThreadPool,
+    QTimer,
+    Qt,
+    QUrl,
+)
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -68,8 +79,8 @@ LEAFLET_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <link rel="stylesheet" href="https://unpkg.com/cesium@1.125/Build/Cesium/Widgets/widgets.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" onerror="document.title='VGCS_ASSET_ERROR:leaflet_css:'+Date.now()"/>
+  <link rel="stylesheet" href="https://unpkg.com/cesium@1.125/Build/Cesium/Widgets/widgets.css" onerror="document.title='VGCS_ASSET_ERROR:cesium_css:'+Date.now()"/>
   <style>
     html, body, #mapWrap, #map2d, #map3d { height:100%; margin:0; background:#1a1d24; }
     /* Single scroll/compositor root; avoid promoted layers that confuse WebEngine on Windows. */
@@ -1975,11 +1986,35 @@ LEAFLET_HTML = """<!doctype html>
       </div>
     </div>
   </div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://unpkg.com/cesium@1.125/Build/Cesium/Cesium.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" onerror="document.title='VGCS_ASSET_ERROR:leaflet_js:'+Date.now()"></script>
+  <script src="https://unpkg.com/cesium@1.125/Build/Cesium/Cesium.js" onerror="document.title='VGCS_ASSET_ERROR:cesium_js:'+Date.now()"></script>
   <script>
+    // Fail fast with a clear signal if core assets are blocked/unreachable.
+    setTimeout(() => {
+      try {
+        if (typeof L === 'undefined') {
+          document.title = 'VGCS_ASSET_ERROR:leaflet_missing:' + Date.now();
+        }
+        if (typeof Cesium === 'undefined') {
+          // 3D is optional; this just lets Python disable the toggle on restricted clients.
+          document.title = 'VGCS_ASSET_ERROR:cesium_missing:' + Date.now();
+        }
+      } catch (e) {}
+    }, 2500);
+
     /* preferCanvas false: tile/img renderer composites more reliably with plan HTML overlays in Qt WebEngine. */
-    const map = L.map('map2d', { zoomControl: false, preferCanvas: false }).setView([24.7136, 46.6753], 10);
+    if (typeof L === 'undefined') {
+      document.title = 'VGCS_ASSET_ERROR:leaflet_missing:' + Date.now();
+      throw new Error('Leaflet missing');
+    }
+    const map = L.map('map2d', {
+      zoomControl: false,
+      preferCanvas: false,
+      // Qt WebEngine: disabling these animations significantly improves pan smoothness.
+      fadeAnimation: false,
+      zoomAnimation: false,
+      markerZoomAnimation: false,
+    }).setView([24.7136, 46.6753], 10);
     L.control.zoom({ position: 'bottomleft' }).addTo(map);
     const linkBanner = document.getElementById('linkBanner');
     const linkBannerLogo = document.getElementById('linkBannerLogo');
@@ -2197,34 +2232,89 @@ LEAFLET_HTML = """<!doctype html>
     }
     let tileLayer = null;
     let labelLayer = null;
+    let __tileErrorCount = 0;
+    let __tileErrorLastSignalAt = 0;
     const LABELS_TEMPLATE_ESRI =
       'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
     function setTileSource(urlTemplate, attribution, maxZoom) {
       if (tileLayer) map.removeLayer(tileLayer);
       if (labelLayer) map.removeLayer(labelLayer);
+      const mz = maxZoom || 19;
+      __tileErrorCount = 0;
       tileLayer = L.tileLayer(urlTemplate, {
-        maxZoom: maxZoom || 19,
+        maxZoom: mz,
         attribution: attribution || '',
         // Performance: reduce tile churn while panning/zooming in Qt WebEngine.
         updateWhenIdle: true,
         updateWhenZooming: false,
-        keepBuffer: 4
+        // Smaller buffer = fewer tiles kept/decoded during pans.
+        keepBuffer: 2,
+        // Throttle tile updates a bit to keep panning responsive.
+        updateInterval: 140,
+        // Avoid higher-res tile fetches that can double work.
+        detectRetina: false
       }).addTo(map);
+      try {
+        tileLayer.on('tileerror', function() {
+          __tileErrorCount += 1;
+          const now = Date.now();
+          if (__tileErrorCount >= 10 && (now - __tileErrorLastSignalAt) > 8000) {
+            __tileErrorLastSignalAt = now;
+            document.title = 'VGCS_TILE_ERROR:' + now;
+          }
+        });
+      } catch (e) {}
       // Add borders + place labels overlay (transparent tiles) to match client reference.
       // Works best over satellite imagery; safe to keep enabled for other sources too.
       try {
         labelLayer = L.tileLayer(LABELS_TEMPLATE_ESRI, {
-          maxZoom: maxZoom || 19,
-          opacity: 0.95,
+          maxZoom: mz,
+          // Avoid fetching labels at very low zooms (saves a lot of requests).
+          minZoom: 3,
+          opacity: 0.9,
           attribution: '',
           updateWhenIdle: true,
           updateWhenZooming: false,
-          keepBuffer: 4,
+          keepBuffer: 1,
+          updateInterval: 180,
+          detectRetina: false,
           pane: 'overlayPane'
         }).addTo(map);
+        try {
+          labelLayer.on('tileerror', function() {
+            __tileErrorCount += 1;
+            const now = Date.now();
+            if (__tileErrorCount >= 10 && (now - __tileErrorLastSignalAt) > 8000) {
+              __tileErrorLastSignalAt = now;
+              document.title = 'VGCS_TILE_ERROR:' + now;
+            }
+          });
+        } catch (e2) {}
       } catch (e) {
         labelLayer = null;
       }
+      // Performance: hide labels while interacting, restore when idle.
+      // This avoids expensive compositing of semi-transparent tiles during drag.
+      try {
+        if (!window.__labelsPanHooked) {
+          window.__labelsPanHooked = true;
+          let __labelsRestoreT = null;
+          const hide = () => { try { if (labelLayer) labelLayer.setOpacity(0.0); } catch (e) {} };
+          const restoreSoon = () => {
+            try {
+              if (__labelsRestoreT) clearTimeout(__labelsRestoreT);
+              __labelsRestoreT = setTimeout(() => {
+                try { if (labelLayer) labelLayer.setOpacity(0.9); } catch (e) {}
+              }, 140);
+            } catch (e) {}
+          };
+          map.on('movestart', hide);
+          map.on('zoomstart', hide);
+          map.on('moveend', restoreSoon);
+          map.on('zoomend', restoreSoon);
+        }
+        if (labelLayer) labelLayer.setOpacity(0.9);
+      } catch (e) {}
       return 1;
     }
     // Satellite-like default view similar to the provided reference.
@@ -3698,6 +3788,47 @@ LEAFLET_HTML = """<!doctype html>
 """
 
 
+class _VideoEncodeBridge(QObject):
+    encoded = Signal(str)
+
+
+class _VideoEncodeTask(QRunnable):
+    def __init__(self, img, bridge: _VideoEncodeBridge) -> None:
+        super().__init__()
+        self._img = img
+        self._bridge = bridge
+
+    def run(self) -> None:
+        try:
+            img = self._img
+            if img is None or img.isNull():
+                return
+            try:
+                img = img.scaled(
+                    230,
+                    130,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            except Exception:
+                pass
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            if not buf.open(QBuffer.OpenModeFlag.WriteOnly):
+                return
+            try:
+                img.save(buf, "PNG")
+            finally:
+                buf.close()
+            raw = bytes(ba)
+            if not raw:
+                return
+            data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+            self._bridge.encoded.emit(data_url)
+        except Exception:
+            return
+
+
 class MapWidget(QWidget):
     """Map panel with Leaflet backend and waypoint click workflow."""
     waypoints_changed = Signal(list)  # list[Waypoint]
@@ -3740,6 +3871,7 @@ class MapWidget(QWidget):
         self._last_header_mode: str | None = None
         self._last_plan_vehicle_info_key: tuple[str, str] | None = None
         self._plan_rail_tool_state = "File"
+        self._tile_error_notified = False
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -4270,6 +4402,11 @@ class MapWidget(QWidget):
         self._capture_session = None
         self._video_sink = None
         self._video_last_data_url = ""
+        self._video_encode_bridge = _VideoEncodeBridge(self)
+        self._video_encode_bridge.encoded.connect(self._on_video_frame_encoded)
+        self._video_encode_inflight = False
+        self._video_encode_pending = None
+        self._video_pool = QThreadPool.globalInstance()
         self._video_push_timer = QTimer(self)
         self._video_push_timer.setInterval(200)  # 5 fps push to WebEngine
         self._video_push_timer.timeout.connect(self._push_video_preview_to_overlay)
@@ -4322,32 +4459,45 @@ class MapWidget(QWidget):
             self._run_js("setVideoPreviewImage('');")
 
     def _on_video_frame_changed(self, frame) -> None:
-        # Called on the GUI thread; convert to a small PNG data URL.
+        # Called on the GUI thread; offload encoding to a worker to avoid UI freezes on low-end devices.
         try:
             img = frame.toImage()
         except Exception:
             return
         if img is None or img.isNull():
             return
-        # Match the overlay box aspect ratio to minimize resampling work in the browser.
         try:
-            img = img.scaled(230, 130, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+            img2 = img.copy()
         except Exception:
-            pass
-        ba = QByteArray()
-        buf = QBuffer(ba)
-        if not buf.open(QBuffer.OpenModeFlag.WriteOnly):
+            img2 = img
+
+        if bool(getattr(self, "_video_encode_inflight", False)):
+            self._video_encode_pending = img2
             return
+
+        self._video_encode_inflight = True
+        task = _VideoEncodeTask(img2, self._video_encode_bridge)
         try:
-            img.save(buf, "PNG")
+            self._video_pool.start(task)
         except Exception:
+            # If threadpool is unavailable, drop rather than blocking the GUI.
+            self._video_encode_inflight = False
             return
-        finally:
-            buf.close()
-        raw = bytes(ba)
-        if not raw:
+
+    def _on_video_frame_encoded(self, data_url: str) -> None:
+        self._video_last_data_url = str(data_url or "")
+        self._video_encode_inflight = False
+        pending = getattr(self, "_video_encode_pending", None)
+        if pending is None:
             return
-        self._video_last_data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        self._video_encode_pending = None
+        self._video_encode_inflight = True
+        task = _VideoEncodeTask(pending, self._video_encode_bridge)
+        try:
+            self._video_pool.start(task)
+        except Exception:
+            self._video_encode_inflight = False
+            return
 
     def _push_video_preview_to_overlay(self) -> None:
         if not getattr(self, "_web_ready", False):
@@ -4363,6 +4513,31 @@ class MapWidget(QWidget):
         self._run_js(f"setVideoPreviewImage({json.dumps(src)});")
 
     def _on_web_title_changed(self, title: str) -> None:
+        if title.startswith("VGCS_ASSET_ERROR:"):
+            reason = title.split(":", 2)[1] if ":" in title else "asset"
+            if "cesium" in reason:
+                try:
+                    self._btn_3d.setChecked(False)
+                    self._btn_3d.setEnabled(False)
+                except Exception:
+                    pass
+                self._set_status("3D unavailable (Cesium blocked/unreachable)")
+            else:
+                self._set_status("Map assets failed to load (check internet/proxy/firewall)")
+            try:
+                self._run_js("document.title = 'VGCS Map';")
+            except Exception:
+                pass
+            return
+        if title.startswith("VGCS_TILE_ERROR:"):
+            if not getattr(self, "_tile_error_notified", False):
+                self._tile_error_notified = True
+                self._set_status("Tile load errors detected — use Offline Tiles… or check network/proxy")
+            try:
+                self._run_js("document.title = 'VGCS Map';")
+            except Exception:
+                pass
+            return
         if title.startswith("VGCS_PLAN_EXIT:"):
             self.plan_flight_exited.emit()
             self._run_js("disablePlanEditModes(); document.title = 'VGCS Map';")
