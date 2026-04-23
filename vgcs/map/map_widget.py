@@ -4967,26 +4967,23 @@ class MapWidget(QWidget):
             self._run_js(
                 f"window.__planRailTool = {json.dumps(t)}; setPlanRailTool({json.dumps(t)});"
             )
-            # Restore offline tiles if previously configured (client requirement: offline map).
+            # Tile selection strategy:
+            # - If offline tiles are configured, always prefer them (guaranteed).
+            # - Otherwise, always TRY satellite first on every launch (matches desired default),
+            #   then allow fallback (probe) to Streets if the client network returns placeholders.
             try:
                 s = QSettings(_QS_NS, _QS_APP)
                 root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
                 if root and Path(root).is_dir():
                     self.activate_offline_tiles(root)
                 else:
-                    # Default to satellite imagery where available.
-                    mode = str(s.value(_KEY_MAP_TILE_MODE, "sat") or "sat").strip().lower()
-                    if mode == "sat":
-                        self.activate_satellite_tiles()
-                    elif mode == "osm":
-                        # OSM frequently blocks desktop apps (referrer required). Migrate old setting to Esri Streets.
-                        try:
-                            s.setValue(_KEY_MAP_TILE_MODE, "esri_streets")
-                        except Exception:
-                            pass
-                        self.activate_esri_street_tiles()
-                    else:
-                        self.activate_esri_street_tiles()
+                    # Always try Satellite first (even if a client previously used Streets).
+                    self.activate_satellite_tiles()
+                    # Run a quick probe to detect placeholders and fallback automatically if needed.
+                    try:
+                        QTimer.singleShot(1200, lambda: self._probe_current_tiles(reason="startup"))
+                    except Exception:
+                        pass
             except Exception:
                 pass
             self.map_page_ready.emit()
