@@ -5,8 +5,9 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
+from urllib.parse import quote
 
-from PySide6.QtCore import QPoint, QTimer, Qt, QUrl
+from PySide6.QtCore import QPoint, QSettings, QTimer, Qt, QUrl
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -16,18 +17,33 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QLabel,
     QFileDialog,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
-from vgcs.mission import Waypoint, load_waypoints_json, save_waypoints_json
+from vgcs.mission import (
+    Waypoint,
+    load_waypoints_json,
+    save_waypoints_json,
+    save_waypoints_kml,
+)
+
+# QSettings: Plan Flight Save vs map toolbar export use different "last file" keys.
+_QS_NS = "VGCS"
+_QS_APP = "VGCS"
+_KEY_PLAN_CURRENT_MISSION_JSON = "plan_current_mission_json"
+_KEY_TOOLBAR_EXPORT_MISSION_JSON = "toolbar_export_mission_json"
+_KEY_PLAN_LAST_MISSION_JSON_LEGACY = "plan_last_mission_json"  # legacy; read fallback only
 
 
 try:
+    from PySide6.QtWebEngineCore import QWebEngineSettings
     from PySide6.QtWebEngineWidgets import QWebEngineView
 
     HAS_WEBENGINE = True
 except Exception:  # pragma: no cover - environment-specific availability
+    QWebEngineSettings = None  # type: ignore[assignment,misc]
     QWebEngineView = None  # type: ignore[assignment]
     HAS_WEBENGINE = False
 
@@ -41,7 +57,8 @@ LEAFLET_HTML = """<!doctype html>
   <link rel="stylesheet" href="https://unpkg.com/cesium@1.125/Build/Cesium/Widgets/widgets.css"/>
   <style>
     html, body, #mapWrap, #map2d, #map3d { height:100%; margin:0; background:#1a1d24; }
-    #mapWrap { position: relative; overflow: hidden; }
+    /* Single scroll/compositor root; avoid promoted layers that confuse WebEngine on Windows. */
+    #mapWrap { position: relative; overflow: hidden; z-index: 0; }
     #map2d, #map3d { position: absolute; inset: 0; }
     #map3d { display: none; }
     .leaflet-control-attribution { background: rgba(26,29,36,0.7); color:#a8b0c4; }
@@ -175,16 +192,36 @@ LEAFLET_HTML = """<!doctype html>
       left:0;
       right:0;
       min-height:64px;
-      background: rgba(250, 251, 253, 0.96);
-      color:#111827;
+      background: rgba(32, 34, 40, 0.97);
+      color:#e8eaef;
       display:flex;
       align-items:stretch;
       gap:14px;
       padding: 6px 14px 8px;
       font-size:15px;
-      border-bottom:1px solid rgba(108, 114, 126, 0.30);
+      border-bottom:1px solid rgba(70, 76, 88, 0.85);
       pointer-events:auto;
       flex-wrap: nowrap;
+    }
+    #planBarUpload {
+      align-self:center;
+      height:32px;
+      padding:0 18px;
+      border-radius:6px;
+      border:1px solid rgba(110, 118, 135, 0.85);
+      background: rgba(58, 62, 74, 0.95);
+      color:#e8eaef;
+      font-size:13px;
+      font-weight:600;
+      cursor:pointer;
+      flex:0 0 auto;
+    }
+    #planBarUpload:hover {
+      background: rgba(72, 78, 92, 0.98);
+    }
+    #planBarUpload:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
     }
     #planFlightTopBar .pfGroup {
       display:flex;
@@ -196,7 +233,7 @@ LEAFLET_HTML = """<!doctype html>
     }
     #planFlightTopBar .pfLabel {
       font-size:11px;
-      color:#4b5563;
+      color:#9ca3b0;
       font-weight:600;
       line-height:1.1;
       white-space: nowrap;
@@ -204,13 +241,14 @@ LEAFLET_HTML = """<!doctype html>
     }
     #planFlightTopBar .pfMetric {
       font-size:13px;
-      color:#111827;
+      color:#f3f4f6;
       line-height:1.2;
       white-space:nowrap;
       font-weight: 400;
     }
     #planFlightTopBar .pfMetric b {
       font-weight: 700;
+      color:#ffffff;
     }
     #planFlightTopBar .pfMetricGhost {
       visibility: hidden;
@@ -224,7 +262,7 @@ LEAFLET_HTML = """<!doctype html>
       display:inline-flex;
       align-items:flex-start;
       padding-top: 6px;
-      color:#111827;
+      color:#f3f4f6;
       white-space: nowrap;
       min-width: 92px;
       cursor:pointer;
@@ -242,10 +280,10 @@ LEAFLET_HTML = """<!doctype html>
       pointer-events:none;
     }
     #planFlightToolRail {
-      width:74px;
+      width:78px;
       border-radius:8px;
-      background: rgba(244, 245, 247, 0.97);
-      border:1px solid rgba(130, 136, 146, 0.36);
+      background: rgba(28, 30, 36, 0.96);
+      border:1px solid rgba(65, 70, 82, 0.9);
       box-shadow: 0 2px 8px rgba(0,0,0,0.16);
       padding:5px 0;
       display:flex;
@@ -254,12 +292,13 @@ LEAFLET_HTML = """<!doctype html>
       pointer-events:auto;
     }
     .planToolBtn {
+      position: relative;
       margin:0 5px;
       min-height:52px;
       border-radius:6px;
-      border:1px solid rgba(158, 164, 176, 0.34);
-      background:#f8f8f8;
-      color:#1f2937;
+      border:1px solid rgba(70, 76, 88, 0.85);
+      background: rgba(40, 44, 52, 0.95);
+      color:#e8eaef;
       font-size:11px;
       font-weight:600;
       display:flex;
@@ -286,130 +325,410 @@ LEAFLET_HTML = """<!doctype html>
       flex:0 0 auto;
     }
     .planToolBtn.active {
-      background:#ad6a05;
-      color:#ffffff;
-      border-color:#8d5405;
+      background:#facc15;
+      color:#111827;
+      border-color:#ca8a04;
+      margin-right: 10px;
     }
-    .planToolBtn:hover { background:#eceff3; }
+    .planToolBtn.active .planToolIcon {
+      color:#111827;
+    }
+    .planToolBtn.active::after {
+      content: "";
+      position: absolute;
+      right: -7px;
+      top: 50%;
+      transform: translateY(-50%);
+      border-width: 9px 0 9px 9px;
+      border-style: solid;
+      border-color: transparent transparent transparent #facc15;
+      filter: drop-shadow(1px 0 0 rgba(0,0,0,0.12));
+    }
+    .planToolBtn:hover { background: rgba(55, 60, 72, 0.98); }
+    .planToolBtn.active:hover { background:#eab308; }
     #planCenterPanel {
-      width:420px;
-      border-radius:6px;
+      min-width: 540px;
+      max-width: 620px;
+      border-radius:8px;
       overflow:hidden;
-      background: rgba(238, 239, 241, 0.95);
-      border:1px solid rgba(145, 150, 160, 0.45);
-      box-shadow: 0 2px 10px rgba(0,0,0,0.16);
+      background: rgba(36, 39, 48, 0.98);
+      border:1px solid rgba(70, 76, 88, 0.9);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
       pointer-events:auto;
     }
-    #planCenterBanner {
-      padding:8px 12px;
-      font-size:14px;
-      font-weight:500;
-      color:#0f172a;
-      background:#ffffff;
-      border-bottom:1px solid rgba(165, 170, 182, 0.45);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    #planCenterBody {
-      padding:10px 12px 12px;
-      color:#111827;
+    #planFileFlyout {
+      padding: 12px 14px 14px;
+      color:#e8eaef;
       font-size:12px;
     }
-    #planCenterBody .title {
-      font-size:30px;
-      font-weight:700;
-      margin-bottom:8px;
+    .planFileSection {
+      margin-bottom: 16px;
     }
-    #planCards {
+    .planFileSection:last-child {
+      margin-bottom: 0;
+    }
+    .planFileSectionTitle {
+      font-size: 13px;
+      font-weight: 700;
+      color: #f9fafb;
+      margin-bottom: 10px;
+      letter-spacing: 0.02em;
+    }
+    .planFileCardGrid {
       display:grid;
       grid-template-columns: 1fr 1fr;
-      gap:7px;
-      margin-top:6px;
+      gap:8px;
     }
-    .planCard {
-      background:#e5e7eb;
-      border:1px solid rgba(143, 149, 159, 0.45);
-      border-radius:4px;
-      min-height:104px;
+    .planTplCard {
+      border-radius:6px;
       overflow:hidden;
+      border:1px solid rgba(90, 96, 110, 0.85);
+      cursor:pointer;
       display:flex;
       flex-direction:column;
+      background: rgba(28, 30, 36, 0.98);
     }
-    .planCardPreview {
-      flex:1;
-      min-height:76px;
-      background: linear-gradient(140deg, #6f7783, #a2aab6);
+    .planTplCard:hover {
+      border-color: rgba(250, 204, 21, 0.65);
+      box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.25);
     }
-    .planCardLabel {
-      background:#f3f4f6;
-      border-top:1px solid rgba(143, 149, 159, 0.35);
+    .planTplPrev {
+      flex: 1 1 82px;
+      min-height: 82px;
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(145deg, #2d3748, #4a5568);
+    }
+    .planTplPrevImg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center;
+      display: block;
+    }
+    .planTplLabel {
+      background: rgba(24, 26, 32, 0.98);
+      border-top:1px solid rgba(70, 76, 88, 0.85);
       text-align:center;
       font-size:11px;
       font-weight:600;
-      padding:4px 4px 6px;
-      color:#111827;
+      padding:6px 4px 7px;
+      color:#e8eaef;
+    }
+    .planFileBtnRow {
+      display:flex;
+      flex-wrap: wrap;
+      gap:8px;
+      margin-bottom:8px;
+    }
+    .planFileBtn {
+      flex: 1 1 auto;
+      min-height:30px;
+      padding: 0 12px;
+      border-radius:5px;
+      border:1px solid rgba(90, 96, 110, 0.9);
+      background: rgba(48, 52, 62, 0.95);
+      color:#e8eaef;
+      font-size:12px;
+      font-weight:600;
+      cursor:pointer;
+    }
+    .planFileBtn:hover:not(:disabled) {
+      background: rgba(62, 68, 82, 0.98);
+    }
+    .planFileBtn:disabled {
+      opacity:0.38;
+      cursor:not-allowed;
+    }
+    .planFileBtnPrimary {
+      background: rgba(88, 82, 118, 0.95);
+      border-color: rgba(120, 110, 160, 0.85);
+    }
+    .planFileBtnPrimary:hover:not(:disabled) {
+      background: rgba(100, 94, 132, 0.98);
+    }
+    .planFileBtnSecondary {
+      background: rgba(52, 56, 66, 0.95);
+    }
+    .planFileBtnWide {
+      width:100%;
+      display:block;
+    }
+    #planOtherToolPanel {
+      padding: 20px 16px;
+      color:#e8eaef;
+      font-size: 13px;
+      line-height: 1.45;
+      min-height: 120px;
     }
     #planRightPanel {
       margin-left:auto;
-      width:282px;
-      border-radius:5px;
-      background: rgba(236, 239, 242, 0.95);
-      border:1px solid rgba(135, 142, 153, 0.42);
-      box-shadow: 0 2px 10px rgba(0,0,0,0.14);
-      overflow:hidden;
+      width: 340px;
+      max-width: min(340px, calc(100vw - 24px));
+      max-height: calc(100vh - 120px);
+      border-radius:6px;
+      background: rgba(36, 38, 46, 0.94);
+      border:1px solid rgba(92, 96, 120, 0.85);
+      box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+      overflow-x: visible;
+      overflow-y: auto;
       pointer-events:auto;
+      display:flex;
+      flex-direction:column;
+      font-family: "Segoe UI", Arial, sans-serif;
     }
     #planTabs {
       display:flex;
-      height:34px;
-      background:#eceef1;
-      border-bottom:1px solid rgba(150, 156, 167, 0.42);
+      flex-shrink:0;
+      min-height:38px;
+      background:#3a3d4a;
+      border-bottom:1px solid rgba(0,0,0,0.35);
+    }
+    #planTabs:focus-within {
+      outline: none;
     }
     .planTab {
-      flex:1;
+      flex: 1 1 0;
+      min-width: 0;
       border:none;
-      background:transparent;
-      color:#1f2937;
+      border-right:1px solid rgba(0,0,0,0.28);
+      background:#3a3d4a;
+      color:#e8eaef;
       font-size:12px;
-      font-weight:500;
+      font-weight:600;
+      cursor:pointer;
+      padding:8px 4px;
+      position: relative;
+    }
+    .planTab:focus-visible {
+      outline: 2px solid rgba(250, 204, 21, 0.85);
+      outline-offset: -2px;
+      z-index: 1;
+    }
+    .planTab:last-child { border-right:none; }
+    .planTab:hover:not(.active) {
+      background:#45485a;
     }
     .planTab.active {
-      background:#b7791f;
-      color:#ffffff;
-      font-weight:600;
+      background:#f5e6a0;
+      color:#111827;
+      font-weight:700;
     }
     #planSection {
       padding:0;
     }
+    .planTabBody {
+      padding: 0;
+      flex:1;
+      min-height:0;
+    }
+    .planTabBody[hidden] {
+      display: none !important;
+    }
+    .planTabHint {
+      font-size: 12px;
+      color: rgba(232, 234, 239, 0.92);
+      line-height: 1.5;
+      margin: 0 0 12px;
+    }
     .planSectionHeader {
-      background:#b8dddd;
-      color:#0f172a;
+      background:#4d5170;
+      color:#f9fafb;
       font-size:13px;
       font-weight:600;
-      padding:8px 10px;
+      padding:9px 12px;
+      letter-spacing:0.02em;
     }
     .planSectionBody {
-      padding:10px;
-      background:#c8c8cb;
-      color:#111827;
+      padding:12px;
+      background:#0c0c0e;
+      color:#e8eaef;
       font-size:12px;
+    }
+    .planSectionBody--fence {
+      background:#14151a;
     }
     .planFieldLabel {
-      color:#374151;
+      color:rgba(248, 250, 252, 0.88);
       font-size:11px;
-      margin:8px 0 3px;
+      font-weight:600;
+      margin:10px 0 5px;
     }
-    .planFieldValue {
-      background:#f3f4f6;
-      border:1px solid rgba(136, 141, 151, 0.45);
-      border-radius:4px;
-      min-height:30px;
+    .planFieldLabel:first-child { margin-top:0; }
+    .planRailSelect {
+      width:100%;
+      box-sizing:border-box;
+      min-height:32px;
+      padding:6px 28px 6px 10px;
+      border-radius:5px;
+      border:1px solid rgba(100, 106, 124, 0.65);
+      background:#ffffff;
+      color:#111827;
+      font-size:12px;
+      font-weight:500;
+      cursor:pointer;
+      appearance:none;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23374151' d='M3 4.5L6 8l3-3.5z'/%3E%3C/svg%3E");
+      background-repeat:no-repeat;
+      background-position:right 10px center;
+    }
+    .planRailInput {
       display:flex;
       align-items:center;
+      box-sizing:border-box;
+      min-height:32px;
       padding:0 10px;
-      font-size:12px;
+      border-radius:5px;
+      border:1px solid rgba(100, 106, 124, 0.65);
+      background:#ffffff;
       color:#111827;
+    }
+    .planRailInput input {
+      flex:1;
+      min-width:0;
+      border:none;
+      background:transparent;
+      color:#111827;
+      font-size:13px;
+      font-weight:500;
+      padding:6px 0;
+      outline:none;
+    }
+    .planRailUnit {
+      flex:0 0 auto;
+      margin-left:8px;
+      font-size:12px;
+      font-weight:600;
+      color:#374151;
+    }
+    .planKvRow {
+      display:flex;
+      justify-content:space-between;
+      align-items:baseline;
+      gap:10px;
+      font-size:12px;
+      margin:8px 0;
+      color:#e8eaef;
+    }
+    .planKvRow span:first-child { color:rgba(210, 214, 222, 0.88); }
+    .planKvRow b { font-weight:700; color:#fff; }
+    .planNoteMission {
+      font-size:11px;
+      line-height:1.5;
+      color:rgba(218, 220, 228, 0.88);
+      font-weight:400;
+      margin:12px 0 14px;
+    }
+    #planVehicleDetails.planRailDetails summary {
+      font-weight:700;
+      font-size:13px;
+      color:#fff;
+      padding:12px 0 10px;
+      margin:0;
+      border-bottom:1px solid rgba(255,255,255,0.92);
+    }
+    #planVehicleDetails.planRailDetails .planRailDetailsInner {
+      padding-top:12px;
+      padding-bottom:4px;
+    }
+    #planVehicleDetails.planRailDetails .planRailDetailsInner > .planFieldLabel {
+      margin-top:2px;
+    }
+    .planHelpMuted {
+      font-size:11px;
+      line-height:1.45;
+      color:rgba(232,234,239,0.72);
+      margin:8px 0 10px;
+    }
+    .planRailDetails {
+      margin-top:4px;
+      border-top:1px solid rgba(255,255,255,0.28);
+    }
+    .planRailDetails + .planRailDetails { margin-top:0; }
+    .planRailDetails summary {
+      list-style:none;
+      cursor:pointer;
+      color:#f9fafb;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      font-size:13px;
+      font-weight:600;
+      padding:12px 0 10px;
+    }
+    .planRailDetails summary::-webkit-details-marker { display:none; }
+    .planRailDetails .planRailChev {
+      display:inline-block;
+      font-size:10px;
+      opacity:0.85;
+      transition: transform 0.15s ease;
+    }
+    .planRailDetails[open] .planRailChev { transform: rotate(180deg); }
+    .planRailDetailsInner {
+      padding-bottom:12px;
+    }
+    .planGeoLead {
+      font-size:11px;
+      color:rgba(232,234,239,0.8);
+      line-height:1.45;
+      margin:0 0 14px;
+    }
+    .planGeoBlock {
+      margin-bottom:14px;
+      padding-bottom:12px;
+      border-bottom:1px solid rgba(255,255,255,0.22);
+    }
+    .planGeoBlock:last-child {
+      border-bottom:none;
+      margin-bottom:0;
+      padding-bottom:0;
+    }
+    .planGeoTitle {
+      font-size:12px;
+      font-weight:700;
+      color:#fff;
+      margin:0 0 10px;
+    }
+    .planGeoStatus {
+      font-size:12px;
+      color:rgba(232,234,239,0.78);
+    }
+    .planGeoBtnStack {
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .planGeoBtn {
+      width:100%;
+      box-sizing:border-box;
+      min-height:34px;
+      padding:8px 12px;
+      border-radius:6px;
+      border:1px solid rgba(80, 86, 102, 0.9);
+      background:#3d414d;
+      color:#f3f4f6;
+      font-size:12px;
+      font-weight:600;
+      cursor:pointer;
+    }
+    .planGeoBtn:hover:not(:disabled) {
+      background:#4a4f5e;
+    }
+    .planGeoBtn:disabled {
+      opacity:0.45;
+      cursor:not-allowed;
+    }
+    .planRallyInfo {
+      margin:0;
+      padding:14px 14px 16px;
+      border-radius:8px;
+      background:#121318;
+      border:1px solid rgba(80, 86, 102, 0.55);
+      color:#e8eaef;
+      font-size:12px;
+      line-height:1.5;
     }
     .planFold {
       margin-top:12px;
@@ -422,19 +741,34 @@ LEAFLET_HTML = """<!doctype html>
       align-items:center;
     }
     #planStartMissionBtn {
-      margin-top:10px;
+      margin-top:14px;
       width:100%;
-      min-height:30px;
-      border-radius:4px;
-      border:1px solid rgba(140, 146, 156, 0.55);
-      background:#ad6a05;
+      min-height:36px;
+      border-radius:6px;
+      border:1px solid rgba(120, 90, 40, 0.85);
+      background:#9a6b2d;
       color:#ffffff;
-      font-size:12px;
+      font-size:13px;
       font-weight:700;
       cursor:pointer;
     }
     #planStartMissionBtn:hover {
-      background:#c27a09;
+      background:#b07a34;
+    }
+    #planSetLaunchMapCenterBtn {
+      width:100%;
+      margin-top:10px;
+      min-height:34px;
+      border-radius:6px;
+      border:1px solid rgba(80, 86, 102, 0.9);
+      background:#3d414d;
+      color:#f3f4f6;
+      font-size:12px;
+      font-weight:600;
+      cursor:pointer;
+    }
+    #planSetLaunchMapCenterBtn:hover {
+      background:#4a4f5e;
     }
     #cameraRail {
       top: 78px;
@@ -445,9 +779,8 @@ LEAFLET_HTML = """<!doctype html>
       gap: 12px;
       padding: 12px 12px 14px;
       border-radius: 14px;
-      background: linear-gradient(180deg, rgba(39, 47, 61, 0.92), rgba(30, 38, 52, 0.92));
+      background: linear-gradient(180deg, rgba(39, 47, 61, 0.96), rgba(30, 38, 52, 0.96));
       border: 1px solid rgba(188, 202, 224, 0.42);
-      backdrop-filter: blur(3px);
       box-shadow: 0 10px 24px rgba(0, 0, 0, 0.34);
       min-width: 108px;
       z-index: 1215;
@@ -616,33 +949,73 @@ LEAFLET_HTML = """<!doctype html>
       display: block;
       color: currentColor;
     }
-    #telemetryStrip {
-      right:188px; bottom:12px; padding:10px 14px; border-radius:8px;
-      background: rgba(26, 33, 45, 0.94); color:#dce5f5; font-size:15px;
-      line-height: 1.35;
-      display:flex; flex-direction:column; gap:4px;
+    /* Bottom HUD: compass (racchip) bottom-right; telemetry on a single orbit (no duplicate strips). */
+    #mapFooterHud {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 8px;
+      z-index: 1210;
+      display: flex;
+      flex-direction: row;
+      align-items: flex-end;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 0;
+      padding-right: 10px;
+      pointer-events: none;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    #compassHud {
+      position: relative;
+      width: 312px;
+      height: 312px;
+      flex-shrink: 0;
+      pointer-events: none;
+      --orbit-r: 122px;
+    }
+    .telOrbitItem {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      z-index: 5;
+      transform: translate(-50%, -50%) rotate(var(--oa, 0deg)) translateY(calc(-1 * var(--orbit-r))) rotate(calc(-1 * var(--oa, 0deg)));
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 9px;
+      border-radius: 8px;
+      background: rgba(26, 33, 45, 0.94);
+      color: #dce5f5;
+      font-size: 13px;
+      line-height: 1.25;
       white-space: nowrap;
-    }
-    .telemetryRow {
-      display:flex; align-items:center; gap:12px;
-    }
-    .telemetryItem {
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+      border: 1px solid rgba(80, 92, 118, 0.45);
+      pointer-events: none;
     }
     .telemetryIcon {
-      font-size:18px;
-      line-height:1;
+      font-size: 16px;
+      line-height: 1;
     }
     .telemetryIconHuman {
-      font-size:22px;
-      line-height:1;
+      font-size: 19px;
+      line-height: 1;
     }
-    #compass {
-      right:8px; bottom:4px; width:176px; height:176px;
+    #compassHud #compass {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: 176px;
+      height: 176px;
+      flex-shrink: 0;
       background: transparent;
-      display:flex; justify-content:center; align-items:center;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      pointer-events: none;
+      z-index: 3;
     }
     #compass::before {
       content: "";
@@ -732,6 +1105,492 @@ LEAFLET_HTML = """<!doctype html>
       border:2px solid rgba(244,248,255,0.92);
       clip-path: polygon(50% 0%, 100% 58%, 67% 56%, 50% 100%, 33% 56%, 0% 58%);
     }
+    /* Vehicle on map: high-contrast heading chevron (matches product reference). */
+    .vgcs-vehicle-marker {
+      background: transparent !important;
+      border: none !important;
+    }
+    .vgcs-vehicle-marker-inner {
+      width: 30px;
+      height: 30px;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transform-origin: 50% 50%;
+      filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35));
+    }
+    .vgcs-vehicle-marker-inner svg {
+      display: block;
+    }
+    .vgcs-wp-divicon {
+      background: transparent !important;
+      border: none !important;
+    }
+    .vgcs-wp-pin {
+      position: relative;
+      width: 26px;
+      height: 26px;
+    }
+    .vgcs-wp-disc {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: #facc15;
+      border: 2px solid #111827;
+      box-sizing: border-box;
+    }
+    .vgcs-wp-num {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 26px;
+      height: 26px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font: 700 12px/1 system-ui, sans-serif;
+      color: #111827;
+      pointer-events: none;
+    }
+    .planWpDetails {
+      margin: 10px 0 12px 0;
+      padding: 10px;
+      border-radius: 10px;
+      background: rgba(18, 20, 26, 0.96);
+      border: 1px solid rgba(70, 76, 92, 0.85);
+      overflow: visible;
+    }
+    .planWpDetailsTitle {
+      font-weight: 800;
+      color: #e5e7eb;
+      margin: 0 0 8px 0;
+      font-size: 12px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .planWpRow {
+      display: grid;
+      grid-template-columns: 56px 1fr;
+      gap: 8px;
+      align-items: center;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(70, 76, 92, 0.55);
+    }
+    .planWpRow:last-child { border-bottom: none; }
+    .planWpRow--start .planWpLabel { color: #e7d494; }
+    .planWpStartHint {
+      font-size: 11px;
+      color: #94a3b8;
+      line-height: 1.35;
+      padding: 0 2px;
+    }
+    .planWpLabel {
+      color: #cbd5e1;
+      font-weight: 800;
+      font-size: 12px;
+    }
+    .planWpFields {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 6px;
+    }
+    .planWpField {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(26, 28, 36, 0.85);
+      border: 1px solid rgba(70, 76, 92, 0.8);
+      border-radius: 10px;
+      padding: 7px 10px;
+      min-width: 0;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .planWpField input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: #f8fafc;
+      font-weight: 700;
+      font-size: 13px;
+      min-width: 0;
+    }
+    .planWpUnit {
+      color: #94a3b8;
+      font-weight: 800;
+      font-size: 12px;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+    /* Mission tab: sequence list (Takeoff card + pattern template row), reference UI */
+    .planMissionSequence {
+      margin-bottom: 14px;
+      max-height: 42vh;
+      overflow-y: auto;
+      padding-right: 2px;
+    }
+    .planSeqCard {
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid rgba(70, 76, 92, 0.95);
+      background: rgba(22, 24, 30, 0.98);
+      margin-bottom: 10px;
+    }
+    .planSeqCardHead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 40px;
+      padding: 0 8px 0 6px;
+      background: linear-gradient(180deg, #6a5cb8 0%, #4d5696 100%);
+      color: #f8fafc;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .planSeqCardTitle {
+      flex: 1;
+      text-align: center;
+    }
+    .planSeqIconBtn {
+      width: 32px;
+      height: 32px;
+      border: none;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.12);
+      color: #f1f5ff;
+      font-size: 14px;
+      line-height: 1;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .planSeqIconBtn:disabled {
+      opacity: 0.35;
+      cursor: default;
+    }
+    .planSeqIconBtn:not(:disabled):hover {
+      background: rgba(255,255,255,0.22);
+    }
+    .planSeqCardBody {
+      padding: 12px;
+      background: #0c0c0e;
+    }
+    .planSeqCardDesc {
+      font-size: 12px;
+      line-height: 1.45;
+      color: rgba(220, 224, 235, 0.9);
+      margin: 0 0 12px;
+    }
+    #planSeqPatternRow {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+      padding: 11px 12px;
+      border-radius: 6px;
+      background: rgba(36, 38, 48, 0.96);
+      border: 2px solid rgba(80, 86, 102, 0.75);
+      box-sizing: border-box;
+    }
+    #planSeqPatternRow.planSeqPatternRow--visible {
+      display: flex;
+    }
+    #planSeqPatternRow.planSeqPatternRow--focus {
+      border-color: #e11d48;
+      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.35);
+    }
+    .planSeqPatternGlyph {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: rgba(72, 78, 96, 0.95);
+      color: #f9fafb;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      font-weight: 800;
+      flex-shrink: 0;
+    }
+    .planSeqPatternLabel {
+      font-size: 13px;
+      font-weight: 600;
+      color: #f3f4f6;
+    }
+    .planSeqRtlBtn {
+      width: 100%;
+      box-sizing: border-box;
+      min-height: 38px;
+      margin-top: 2px;
+      border-radius: 6px;
+      border: 1px solid rgba(90, 96, 118, 0.85);
+      background: rgba(52, 56, 68, 0.96);
+      color: #e8eaef;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .planSeqRtlBtn:hover {
+      background: rgba(64, 68, 82, 0.98);
+    }
+    /* Empty plan mission style (compact "Mission Start" panel). */
+    #planTabPanelMission.planMissionEmpty .planMissionSequence {
+      margin-bottom: 8px;
+      max-height: none;
+      overflow: visible;
+      padding-right: 0;
+    }
+    #planTabPanelMission.planMissionEmpty .planSeqCard {
+      border: none;
+      background: transparent;
+      margin-bottom: 0;
+    }
+    #planTabPanelMission.planMissionEmpty .planSeqCardHead,
+    #planTabPanelMission.planMissionEmpty .planSeqCardDesc,
+    #planTabPanelMission.planMissionEmpty #planSeqPatternRow,
+    #planTabPanelMission.planMissionEmpty #planSeqRtlBtn {
+      display: none !important;
+    }
+    #planTabPanelMission.planMissionEmpty .planSeqCardBody {
+      padding: 0;
+      background: transparent;
+    }
+    #planTabPanelMission.planMissionEmpty .planFieldLabel {
+      margin-top: 6px;
+      margin-bottom: 4px;
+    }
+    #planTabPanelMission.planMissionEmpty .planRailSelect,
+    #planTabPanelMission.planMissionEmpty .planRailInput {
+      min-height: 30px;
+    }
+    #planSeqCompactList {
+      display: none;
+      margin-top: 0;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #planTabPanelMission.planMissionStack #planSeqCompactList {
+      display: flex;
+      margin-top: 10px;
+    }
+    /* Survey stack uses independent mission tabs. Bodies are toggled by JS. */
+    #planTabPanelMission.planMissionStack .planSeqCardBody,
+    #planTabPanelMission.planMissionStack #planVehicleDetails,
+    #planTabPanelMission.planMissionStack #planLaunchDetails {
+      display: none;
+    }
+    /* Each step: title row + detail stacked; groups are spaced in #planSeqCompactList */
+    .planSeqCompactGroup {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      width: 100%;
+    }
+    .planSeqCompactTab {
+      min-height: 34px;
+      border-radius: 6px;
+      border: 1px solid rgba(86, 93, 116, 0.9);
+      background: #4d5170;
+      color: #f5f7ff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 8px;
+      padding: 0 10px;
+      font-size: 14px;
+      font-weight: 600;
+      box-sizing: border-box;
+      width: 100%;
+      cursor: pointer;
+      user-select: none;
+      text-align: left;
+    }
+    .planSeqCompactTab.is-active {
+      background: #616790;
+      border-color: rgba(120, 132, 170, 0.95);
+      box-shadow: 0 0 0 1px rgba(146, 160, 201, 0.24) inset;
+    }
+    .planSeqCompactRow {
+      min-height: 34px;
+      border-radius: 6px;
+      border: 2px solid rgba(225, 29, 72, 0.9);
+      background: rgba(32, 35, 44, 0.9);
+      color: #e8eaef;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 10px;
+      font-size: 14px;
+      font-weight: 600;
+      box-sizing: border-box;
+    }
+    .planSeqCompactTakeoffCard {
+      border-radius: 6px;
+      border: 2px solid rgba(225, 29, 72, 0.9);
+      background: rgba(18, 21, 29, 0.9);
+      overflow: hidden;
+      display: none;
+    }
+    .planSeqCompactTakeoffCard.is-active {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.32);
+    }
+    .planSeqCompactTakeoffHead {
+      min-height: 34px;
+      border-bottom: 1px solid rgba(99, 108, 136, 0.62);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 8px;
+      color: #f5f7ff;
+      font-size: 14px;
+      font-weight: 700;
+      background: #4d5170;
+    }
+    .planSeqCompactTakeoffHeadTitle {
+      flex: 1;
+    }
+    .planSeqCompactHeadBtn {
+      width: 24px;
+      height: 24px;
+      border-radius: 5px;
+      border: none;
+      background: rgba(88, 96, 120, 0.42);
+      color: #f5f7ff;
+      font-size: 13px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      cursor: default;
+      opacity: 0.9;
+    }
+    .planSeqCompactTakeoffBody {
+      padding: 10px 10px 8px;
+      color: #ffffff;
+      font-size: 12px;
+      line-height: 1.35;
+      display: none;
+    }
+    .planSeqCompactTakeoffCard.is-active .planSeqCompactTakeoffBody { display: block; }
+    .planSeqCompactTakeoffBody p {
+      margin: 0 0 8px;
+    }
+    .planSeqCompactDoneBtn {
+      width: 100%;
+      min-height: 34px;
+      border-radius: 6px;
+      border: 1px solid rgba(120, 128, 148, 0.65);
+      background: rgba(78, 84, 104, 0.75);
+      color: #f5f7ff;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: default;
+    }
+    .planSeqCompactGlyph {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: rgba(72, 78, 96, 0.95);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 800;
+      flex: 0 0 auto;
+    }
+    .planSeqCompactRow.is-active {
+      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.32);
+    }
+    .planSeqCompactBody {
+      display: none;
+      margin-top: 0;
+      margin-bottom: 0;
+      border: 2px solid rgba(225, 29, 72, 0.9);
+      border-radius: 6px;
+      background: rgba(18, 21, 29, 0.9);
+      color: #f5f7ff;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .planSeqCompactBody.is-active {
+      display: block;
+    }
+    #planTabPanelMission.planMissionStack #planSeqRtlBtn {
+      display: none !important;
+    }
+    /* Mission Start stack (Takeoff / Survey / RTL): edge-to-edge black band, square corners */
+    #planTabPanelMission.planMissionStack .planSectionBody {
+      padding-left: 0;
+      padding-right: 0;
+      padding-top: 10px;
+      padding-bottom: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSectionBody {
+      padding-left: 12px;
+      padding-right: 12px;
+      padding-top: 12px;
+      padding-bottom: 12px;
+      gap: 8px;
+    }
+    #planTabPanelMission.planMissionStack .planMissionSequence {
+      display: none !important;
+      margin-bottom: 0 !important;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planMissionSequence {
+      display: block !important;
+      margin-bottom: 0 !important;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSeqCard {
+      border: none;
+      background: transparent;
+      margin-bottom: 0;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSeqCardBody {
+      display: block !important;
+      padding: 0;
+      background: transparent;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen #planVehicleDetails,
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen #planLaunchDetails {
+      display: block;
+    }
+    #planTabPanelMission.planMissionStack #planMissionSectionHeader {
+      cursor: pointer;
+      user-select: none;
+    }
+    #planTabPanelMission.planMissionStack #planMissionSectionHeader:hover {
+      background: #616790;
+    }
+    #planTabPanelMission.planMissionStack #planStartMissionBtn {
+      display: block !important;
+    }
+    /* Stack tabs already label Takeoff; hide duplicate bar on the detail card */
+    #planTabPanelMission.planMissionStack .planSeqCompactTakeoffHead {
+      display: none !important;
+    }
+    #planTabPanelMission.planMissionStack .planSeqCompactGroup,
+    #planTabPanelMission.planMissionStack .planSeqCompactTab,
+    #planTabPanelMission.planMissionStack .planSeqCompactTakeoffCard,
+    #planTabPanelMission.planMissionStack .planSeqCompactBody,
+    #planTabPanelMission.planMissionStack .planSeqCompactDoneBtn,
+    #planTabPanelMission.planMissionStack .planSeqCompactHeadBtn,
+    #planTabPanelMission.planMissionStack .planSeqCompactRow {
+      border-radius: 0;
+    }
   </style>
 </head>
 <body>
@@ -765,10 +1624,11 @@ LEAFLET_HTML = """<!doctype html>
     <div id="planFlightLayer">
       <div id="planFlightTopBar">
         <span id="planExit">&lt; Exit Plan</span>
+        <button id="planBarUpload" type="button" disabled>Upload</button>
         <div class="pfGroup">
           <span class="pfLabel">Selected Waypoint</span>
           <span class="pfMetric">Alt diff: <b id="pfAltDiff">0.0 ft</b></span>
-          <span class="pfMetric">Gradient: <b id="pfGradient">--</b></span>
+          <span class="pfMetric">Gradient: <b id="pfGradient">-.-</b></span>
         </div>
         <div class="pfGroup">
           <span class="pfLabel">&nbsp;</span>
@@ -794,54 +1654,206 @@ LEAFLET_HTML = """<!doctype html>
       </div>
       <div id="planWorkspace">
         <div id="planFlightToolRail">
-          <div class="planToolBtn active" data-tool="File"><span class="planToolIcon">🗂</span><span>File</span></div>
+          <div class="planToolBtn active" data-tool="File"><span class="planToolIcon">↻</span><span>File</span></div>
           <div class="planToolBtn" data-tool="Takeoff"><span class="planToolIcon">↑</span><span>Takeoff</span></div>
           <div class="planToolBtn" data-tool="Waypoint"><span class="planToolIcon">⊕</span><span>Waypoint</span></div>
-          <div class="planToolBtn" data-tool="ROI"><span class="planToolIcon">◉</span><span>ROI</span></div>
+          <div class="planToolBtn" data-tool="ROI"><span class="planToolIcon">⊙</span><span>ROI</span></div>
           <div class="planToolBtn" data-tool="Pattern"><span class="planToolIcon">▦</span><span>Pattern</span></div>
           <div class="planToolBtn" data-tool="Return"><span class="planToolIcon">↩</span><span>Return</span></div>
           <div class="planToolBtn" data-tool="Center"><span class="planToolIcon">✦</span><span>Center</span></div>
         </div>
         <div id="planCenterPanel">
-          <div id="planCenterBanner">You have unsaved changes.</div>
-          <div id="planCenterBody">
-            <div class="title">Create Plan</div>
-            <div id="planCards">
-              <div class="planCard">
-                <div class="planCardPreview"></div>
-                <div class="planCardLabel">Empty Plan</div>
+          <div id="planFileFlyout">
+            <div class="planFileSection">
+              <div class="planFileSectionTitle">Create Plan</div>
+              <div class="planFileCardGrid">
+                <div class="planTplCard" id="planTplEmpty" role="button" tabindex="0">
+                  <div class="planTplPrev">
+                    <img class="planTplPrevImg" src="__PLAN_TPL_EMPTY_SRC__" alt="" onerror="this.style.display='none'"/>
+                  </div>
+                  <div class="planTplLabel">Empty Plan</div>
+                </div>
+                <div class="planTplCard" id="planTplSurvey" role="button" tabindex="0">
+                  <div class="planTplPrev">
+                    <img class="planTplPrevImg" src="__PLAN_TPL_SURVEY_SRC__" alt="" onerror="this.style.display='none'"/>
+                  </div>
+                  <div class="planTplLabel">Survey</div>
+                </div>
+                <div class="planTplCard" id="planTplCorridor" role="button" tabindex="0">
+                  <div class="planTplPrev">
+                    <img class="planTplPrevImg" src="__PLAN_TPL_CORRIDOR_SRC__" alt="" onerror="this.style.display='none'"/>
+                  </div>
+                  <div class="planTplLabel">Corridor Scan</div>
+                </div>
+                <div class="planTplCard" id="planTplStructure" role="button" tabindex="0">
+                  <div class="planTplPrev">
+                    <img class="planTplPrevImg" src="__PLAN_TPL_STRUCTURE_SRC__" alt="" onerror="this.style.display='none'"/>
+                  </div>
+                  <div class="planTplLabel">Structure Scan</div>
+                </div>
               </div>
-              <div class="planCard">
-                <div class="planCardPreview"></div>
-                <div class="planCardLabel">Survey</div>
+            </div>
+            <div class="planFileSection">
+              <div class="planFileSectionTitle">Storage</div>
+              <div class="planFileBtnRow">
+                <button type="button" class="planFileBtn planFileBtnPrimary" id="planStorageOpen">Open...</button>
+                <button type="button" class="planFileBtn" id="planStorageSave" disabled>Save</button>
+                <button type="button" class="planFileBtn" id="planStorageSaveAs" disabled>Save As...</button>
               </div>
-              <div class="planCard">
-                <div class="planCardPreview"></div>
-                <div class="planCardLabel">Corridor</div>
-              </div>
-              <div class="planCard">
-                <div class="planCardPreview"></div>
-                <div class="planCardLabel">Structure</div>
+              <button type="button" class="planFileBtn planFileBtnWide" id="planStorageKml" disabled>Save Mission Waypoints As KML...</button>
+            </div>
+            <div class="planFileSection">
+              <div class="planFileSectionTitle">Vehicle</div>
+              <div class="planFileBtnRow">
+                <button type="button" class="planFileBtn" id="planVehicleUpload" disabled>Upload</button>
+                <button type="button" class="planFileBtn planFileBtnSecondary" id="planVehicleDownload">Download</button>
+                <button type="button" class="planFileBtn planFileBtnSecondary" id="planVehicleClear">Clear</button>
               </div>
             </div>
           </div>
+          <div id="planOtherToolPanel" style="display:none">
+            <div id="planOtherToolHint">Select a tool from the rail.</div>
+          </div>
         </div>
         <div id="planRightPanel">
-          <div id="planTabs">
-            <button class="planTab active" type="button">Mission</button>
-            <button class="planTab" type="button">Fence</button>
-            <button class="planTab" type="button">Rally</button>
+          <div id="planTabs" role="tablist" aria-label="Plan configuration">
+            <button class="planTab active" type="button" role="tab" id="planTabBtnMission"
+              aria-selected="true" aria-controls="planTabPanelMission" tabindex="0" data-plan-tab="mission">Mission</button>
+            <button class="planTab" type="button" role="tab" id="planTabBtnFence"
+              aria-selected="false" aria-controls="planTabPanelFence" tabindex="-1" data-plan-tab="fence">Fence</button>
+            <button class="planTab" type="button" role="tab" id="planTabBtnRally"
+              aria-selected="false" aria-controls="planTabPanelRally" tabindex="-1" data-plan-tab="rally">Rally</button>
           </div>
-          <div id="planSection">
-            <div class="planSectionHeader">Mission Start</div>
-            <div class="planSectionBody">
-              <div class="planFieldLabel">All Altitudes</div>
-              <div class="planFieldValue">Relative To Launch ▼</div>
-              <div class="planFieldLabel">Initial Waypoint Alt</div>
-              <div class="planFieldValue">164.0 ft</div>
-              <button id="planStartMissionBtn" type="button">Start Mission</button>
-              <div class="planFold">Vehicle Info <span>▼</span></div>
-              <div class="planFold">Launch Position <span>▼</span></div>
+          <div id="planTabPanelMission" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnMission">
+            <div id="planSection">
+              <div class="planSectionHeader" id="planMissionSectionHeader" role="button" tabindex="0" aria-label="Mission Start">Mission</div>
+              <div class="planSectionBody">
+                <div class="planMissionSequence">
+                  <div class="planSeqCard planSeqCard--takeoff">
+                    <div class="planSeqCardHead">
+                      <button type="button" class="planSeqIconBtn" id="planSeqTakeoffTrash" disabled title="Remove (not available)">🗑</button>
+                      <span class="planSeqCardTitle">Takeoff</span>
+                      <button type="button" class="planSeqIconBtn" id="planSeqTakeoffMenu" disabled title="Options">☰</button>
+                    </div>
+                    <div class="planSeqCardBody">
+                      <p class="planSeqCardDesc">Take off from the ground and ascend to specified altitude.</p>
+                      <div class="planFieldLabel">All Altitudes</div>
+                      <select id="planAltReferenceSelect" class="planRailSelect" aria-label="Altitude reference">
+                        <option value="rel" selected>Altitude Relative To Launch</option>
+                        <option value="amsl">AMSL</option>
+                        <option value="agl">AGL</option>
+                      </select>
+                      <div class="planFieldLabel">Initial Waypoint Alt</div>
+                      <div class="planRailInput">
+                        <input id="planInitialWpAltInput" type="text" value="164.0" inputmode="decimal" autocomplete="off" />
+                        <span class="planRailUnit">ft</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div id="planSeqPatternRow" class="planSeqPatternRow" role="group" aria-label="Pattern template">
+                    <span class="planSeqPatternGlyph" aria-hidden="true">?</span>
+                    <span id="planSeqPatternLabel" class="planSeqPatternLabel">Survey</span>
+                  </div>
+                  <button type="button" id="planSeqRtlBtn" class="planSeqRtlBtn">Return To Launch</button>
+                </div>
+                <button id="planStartMissionBtn" type="button">Start Mission</button>
+                <div id="planWpDetails" class="planWpDetails" style="display:none">
+                  <div class="planWpDetailsTitle">Waypoints &amp; start</div>
+                  <div id="planWpDetailsList"></div>
+                </div>
+                <details class="planRailDetails" id="planVehicleDetails">
+                  <summary>Vehicle Info <span class="planRailChev">▼</span></summary>
+                  <div class="planRailDetailsInner">
+                    <div class="planKvRow"><span>Firmware</span><b id="planVehicleFirmwareVal">ArduPilot</b></div>
+                    <div class="planKvRow"><span>Vehicle</span><b id="planVehicleTypeVal">Quadrotor</b></div>
+                    <p class="planNoteMission">The following speed values are used to calculate total mission time. They do not affect the flight speed for the mission.</p>
+                    <div class="planFieldLabel">Hover speed</div>
+                    <div class="planRailInput">
+                      <input id="planHoverSpeedInput" type="text" value="11.18" inputmode="decimal" autocomplete="off" />
+                      <span class="planRailUnit">mph</span>
+                    </div>
+                  </div>
+                </details>
+                <details class="planRailDetails" id="planLaunchDetails">
+                  <summary>Launch Position <span class="planRailChev">▼</span></summary>
+                  <div class="planRailDetailsInner">
+                    <div class="planFieldLabel">Altitude</div>
+                    <div class="planRailInput">
+                      <input id="planLaunchAltInput" type="text" value="0.0" inputmode="decimal" autocomplete="off" />
+                      <span class="planRailUnit">ft</span>
+                    </div>
+                    <p class="planHelpMuted">Actual position set by vehicle at flight time.</p>
+                    <div class="planKvRow"><span>Lat</span><b id="planLaunchLatVal">—</b></div>
+                    <div class="planKvRow"><span>Lon</span><b id="planLaunchLonVal">—</b></div>
+                    <button id="planSetLaunchMapCenterBtn" type="button">Set To Map Center</button>
+                  </div>
+                </details>
+              </div>
+            </div>
+            <div id="planSeqCompactList" aria-hidden="true" role="group" aria-label="Mission sequence steps">
+                  <div class="planSeqCompactGroup">
+                    <div class="planSeqCompactTab" id="planSeqCompactTakeoffTab" data-stack-tab="takeoff" role="tab" tabindex="0">
+                      <span class="planSeqCompactGlyph">?</span>
+                      <span>Takeoff</span>
+                    </div>
+                    <div class="planSeqCompactTakeoffCard" id="planSeqCompactTakeoffCard">
+                      <div class="planSeqCompactTakeoffHead">
+                        <span class="planSeqCompactGlyph">?</span>
+                        <span class="planSeqCompactHeadBtn" aria-hidden="true">🗑</span>
+                        <span class="planSeqCompactTakeoffHeadTitle">Takeoff</span>
+                        <span class="planSeqCompactHeadBtn" aria-hidden="true">☰</span>
+                      </div>
+                      <div class="planSeqCompactTakeoffBody">
+                        <p>Take off from the ground and ascend to specified altitude.</p>
+                        <p>Move “T” Takeoff to the climbout location.</p>
+                        <p>Ensure clear of obstacles and into the wind.</p>
+                        <button type="button" class="planSeqCompactDoneBtn" disabled>Done</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="planSeqCompactGroup">
+                    <div class="planSeqCompactTab" id="planSeqCompactSurveyTab" data-stack-tab="survey" role="tab" tabindex="0">
+                      <span class="planSeqCompactGlyph">?</span>
+                      <span id="planSeqCompactSurveyLabel">Survey</span>
+                    </div>
+                    <div class="planSeqCompactBody" id="planSeqCompactSurveyBody">Survey pattern selected.</div>
+                  </div>
+                  <div class="planSeqCompactGroup">
+                    <div class="planSeqCompactTab" id="planSeqCompactRtlTab" data-stack-tab="rtl" role="tab" tabindex="0">Return To Launch</div>
+                    <div class="planSeqCompactBody" id="planSeqCompactRtlBody">Return leg will be appended after mission actions.</div>
+                  </div>
+            </div>
+          </div>
+          <div id="planTabPanelFence" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnFence" hidden>
+            <div class="planSectionHeader">GeoFence</div>
+            <div class="planSectionBody planSectionBody--fence">
+              <p class="planGeoLead">GeoFencing allows you to set a virtual fence around the area you want to fly in.</p>
+              <p class="planTabHint" style="margin-bottom:14px;">Draw a polygon with <b>Polygon Fence</b>, then use <b>Upload fence</b> on the dashboard to send it to the vehicle.</p>
+              <div class="planGeoBlock">
+                <div class="planGeoTitle">Insert GeoFence</div>
+                <div class="planGeoBtnStack">
+                  <button type="button" class="planGeoBtn" id="planFenceRoiBtn">Polygon Fence</button>
+                  <button type="button" class="planGeoBtn" id="planFenceCircularBtn" disabled title="Not available in this build">Circular Fence</button>
+                </div>
+              </div>
+              <div class="planGeoBlock">
+                <div class="planGeoTitle">Polygon Fences</div>
+                <div class="planGeoStatus" id="planGeoPolyStatus">None</div>
+              </div>
+              <div class="planGeoBlock">
+                <div class="planGeoTitle">Circular Fences</div>
+                <div class="planGeoStatus" id="planGeoCircleStatus">None</div>
+              </div>
+              <div class="planGeoBlock">
+                <div class="planGeoTitle">Breach Return Point</div>
+                <button type="button" class="planGeoBtn" id="planBreachReturnBtn" disabled title="Not available in this build">Add Breach Return Point</button>
+              </div>
+            </div>
+          </div>
+          <div id="planTabPanelRally" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnRally" hidden>
+            <div class="planSectionHeader">Rally Points</div>
+            <div class="planSectionBody planSectionBody--fence" style="padding:12px;">
+              <div class="planRallyInfo">Rally Points provide alternate landing points when performing a Return to Launch (RTL). Rally editing is not implemented in M2.</div>
             </div>
           </div>
         </div>
@@ -870,19 +1882,29 @@ LEAFLET_HTML = """<!doctype html>
       <img id="videoPreviewImg" alt="Video preview" />
       <div id="videoPreviewPlaceholder">Video</div>
     </div>
-    <div class="overlay" id="telemetryStrip"><div class="telemetryRow"><span class="telemetryItem"><span class="telemetryIcon">↕</span><span>0.0 ft</span></span><span class="telemetryItem"><span class="telemetryIcon">↑</span><span>0.0 mph</span></span><span class="telemetryItem"><span class="telemetryIcon">⏱</span><span>00:00:00</span></span></div><div class="telemetryRow"><span class="telemetryItem"><span class="telemetryIcon">↳</span><span>0.0 ft</span></span><span class="telemetryItem"><span class="telemetryIcon">→</span><span>0.0 mph</span></span><span class="telemetryItem"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span>0.0 ft</span></span></div></div>
-    <div class="overlay" id="compass">
-      <div id="compassInner">
-        <span class="compassCard" id="cN">N</span><span class="compassCard" id="cE">E</span><span class="compassCard" id="cS">S</span><span class="compassCard" id="cW">W</span>
-        <div id="compassDeg">0°</div>
-        <div id="needle"></div>
+    <div id="mapFooterHud" aria-hidden="false">
+      <div id="compassHud">
+        <div class="telOrbitItem" style="--oa:-90deg"><span class="telemetryIcon">↕</span><span class="telRow1Alt">0.0 ft</span></div>
+        <div class="telOrbitItem" style="--oa:-30deg"><span class="telemetryIcon">↑</span><span class="telRow1Mph">0.0 mph</span></div>
+        <div class="telOrbitItem" style="--oa:30deg"><span class="telemetryIcon">⏱</span><span class="telRow1Time">00:00:00</span></div>
+        <div class="telOrbitItem" style="--oa:90deg"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span class="telRow2Msl">0.0 ft</span></div>
+        <div class="telOrbitItem" style="--oa:150deg"><span class="telemetryIcon">→</span><span class="telRow2Mph">0.0 mph</span></div>
+        <div class="telOrbitItem" style="--oa:210deg"><span class="telemetryIcon">↳</span><span class="telRow2Alt">0.0 ft</span></div>
+        <div id="compass">
+          <div id="compassInner">
+            <span class="compassCard" id="cN">N</span><span class="compassCard" id="cE">E</span><span class="compassCard" id="cS">S</span><span class="compassCard" id="cW">W</span>
+            <div id="compassDeg">0°</div>
+            <div id="needle"></div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/cesium@1.125/Build/Cesium/Cesium.js"></script>
   <script>
-    const map = L.map('map2d', { zoomControl: false }).setView([24.7136, 46.6753], 10);
+    /* preferCanvas false: tile/img renderer composites more reliably with plan HTML overlays in Qt WebEngine. */
+    const map = L.map('map2d', { zoomControl: false, preferCanvas: false }).setView([24.7136, 46.6753], 10);
     L.control.zoom({ position: 'bottomleft' }).addTo(map);
     const linkBanner = document.getElementById('linkBanner');
     const linkBannerLogo = document.getElementById('linkBannerLogo');
@@ -922,21 +1944,31 @@ LEAFLET_HTML = """<!doctype html>
     }
     const planLayer = document.getElementById('planFlightLayer');
     const planStartMissionBtn = document.getElementById('planStartMissionBtn');
+    const planMissionSectionHeader = document.getElementById('planMissionSectionHeader');
     const hdrMapModeBtn = document.getElementById('hdrMapModeBtn');
     const planExit = document.getElementById('planExit');
     if (planExit) {
-      planExit.addEventListener('click', function() {
+      planExit.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
         setPlanFlightVisible(false);
+        document.title = 'VGCS_PLAN_EXIT:' + Date.now();
       });
     }
+    // These must be initialized before any panel binding runs (TDZ-safe).
+    let vehicleMarker = null;
+    let waypoints = [];
+    bindPlanFlyoutActions();
+    bindPlanRightTabs();
+    bindPlanMissionPanel();
+    bindPlanStackTabs();
+    setPlanSequenceTemplate('');
+    setPlanFlightChromeState(false, 0);
     if (planLayer) {
       for (const btn of planLayer.querySelectorAll('.planToolBtn')) {
         btn.addEventListener('click', function() {
-          for (const el of planLayer.querySelectorAll('.planToolBtn')) {
-            el.classList.remove('active');
-          }
-          btn.classList.add('active');
           const tool = btn.getAttribute('data-tool') || '';
+          setPlanRailTool(tool);
           document.title = 'VGCS_PLAN_TOOL_REQUEST:' + tool + ':' + Date.now();
         });
       }
@@ -946,6 +1978,41 @@ LEAFLET_HTML = """<!doctype html>
         ev.preventDefault();
         ev.stopPropagation();
         document.title = 'VGCS_MISSION_START_REQUEST:' + Date.now();
+      });
+    }
+    if (planMissionSectionHeader) {
+      const onMissionHeaderStart = function(ev) {
+        if (!window.__planMissionStartStack) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        openMissionStartDetails();
+      };
+      planMissionSectionHeader.addEventListener('click', onMissionHeaderStart);
+      planMissionSectionHeader.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') onMissionHeaderStart(ev);
+      });
+    }
+    const planSeqRtlBtn = document.getElementById('planSeqRtlBtn');
+    if (planSeqRtlBtn) {
+      planSeqRtlBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_RETURN_REQUEST:' + Date.now();
+      });
+    }
+    const planSetLaunchMapCenterBtn = document.getElementById('planSetLaunchMapCenterBtn');
+    if (planSetLaunchMapCenterBtn) {
+      planSetLaunchMapCenterBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!map) return;
+        const c = map.getCenter();
+        const latEl = document.getElementById('planLaunchLatVal');
+        const lonEl = document.getElementById('planLaunchLonVal');
+        if (latEl) latEl.textContent = c.lat.toFixed(7);
+        if (lonEl) lonEl.textContent = c.lng.toFixed(7);
+        schedulePlanMissionPanelEmit();
+        updateLaunchMarkerFromPanel();
       });
     }
     if (hdrMapModeBtn) {
@@ -982,12 +2049,19 @@ LEAFLET_HTML = """<!doctype html>
       if (camRecordBtn) camRecordBtn.classList.remove('recording');
       if (camTimer) camTimer.textContent = '00:00:00';
     }
-    function setCameraControlsVisible(enabled) {
+    let __cameraChromeLinkOk = false;
+    function syncCameraChromeVisibility() {
       if (!cameraRail) return 0;
-      cameraRail.style.display = enabled ? 'flex' : 'none';
-      if (videoPreview) videoPreview.style.display = enabled ? 'block' : 'none';
-      if (!enabled) resetCameraTimer();
+      const inPlan = isPlanFlightLayerVisible();
+      const show = __cameraChromeLinkOk && !inPlan;
+      cameraRail.style.display = show ? 'flex' : 'none';
+      if (videoPreview) videoPreview.style.display = show ? 'block' : 'none';
+      if (!show) resetCameraTimer();
       return 1;
+    }
+    function setCameraControlsVisible(enabled) {
+      __cameraChromeLinkOk = !!enabled;
+      return syncCameraChromeVisibility();
     }
     function setVideoPreviewImage(dataUrl) {
       if (!videoPreviewImg || !videoPreviewPlaceholder) return 0;
@@ -1062,11 +2136,44 @@ LEAFLET_HTML = """<!doctype html>
       19
     );
 
-    let vehicleMarker = L.circleMarker([24.7136, 46.6753], {
-      radius: 7, color: '#4ade80', fillColor: '#4ade80', fillOpacity: 0.8
+    const vehicleMarkerSvg =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">' +
+      '<path d="M15 2.5 L26.2 22.5 L17.8 19.8 L15 27.5 L12.2 19.8 L3.8 22.5 Z" ' +
+      'fill="#ff2328" stroke="#4a1222" stroke-width="1.35" stroke-linejoin="round"/>' +
+      '<path d="M15 5 L15 22" stroke="#3a0f18" stroke-width="1.05" stroke-linecap="round"/>' +
+      '</svg>';
+    vehicleMarker = L.marker([24.7136, 46.6753], {
+      icon: L.divIcon({
+        className: 'vgcs-vehicle-marker',
+        html: '<div class="vgcs-vehicle-marker-inner">' + vehicleMarkerSvg + '</div>',
+        iconSize: [30, 30],
+        iconAnchor: [15, 15]
+      }),
+      interactive: false,
+      keyboard: false
     }).addTo(map);
-    let headingLine = L.polyline([[20,0], [20,0]], { color:'#fbbf24', weight:3 }).addTo(map);
-    let waypoints = [];
+    let headingLine = L.polyline([], {
+      color: '#ff7700',
+      weight: 5,
+      opacity: 0.95,
+      lineCap: 'round',
+      lineJoin: 'round'
+    }).addTo(map);
+    let missionRoute = L.polyline([], {
+      color: '#ef4444',
+      weight: 4,
+      opacity: 0.95,
+      interactive: false,
+      pane: 'overlayPane'
+    });
+    let flightTrack = L.polyline([], {
+      color: '#f97316',
+      weight: 2,
+      opacity: 0.55,
+      interactive: false
+    });
+    let __lastTrackLat = null;
+    let __lastTrackLon = null;
     let addMode = false;
     let addFenceMode = false;
     let fencePoints = [];
@@ -1077,6 +2184,13 @@ LEAFLET_HTML = """<!doctype html>
     window.__is3d = false;
     window.__heading = 0;
     window.__3dHasInitialFocus = false;
+    window.__missionNavSeq = 0;
+    const HEADING_MIN_INTERVAL_MS = 125; // ~8 Hz max redraw
+    const VFR_HEADING_PRIORITY_MS = 1200; // ignore attitude yaw briefly after VFR_HUD
+    let __headingLastApplyMs = 0;
+    let __headingLastVfrMs = 0;
+    let __headingRafId = null;
+    let __headingPending = null;
 
     function setLinkConnected(connected) {
       if (connected) {
@@ -1144,10 +2258,242 @@ LEAFLET_HTML = """<!doctype html>
       return 1;
     }
 
-    function setPlanFlightVisible(visible) {
+    function getActivePlanTool() {
+      const layer = document.getElementById('planFlightLayer');
+      if (!layer) return 'File';
+      const act = layer.querySelector('.planToolBtn.active');
+      return (act && act.getAttribute('data-tool')) || 'File';
+    }
+    function updatePlanToolPanel(tool) {
+      const t = (tool || '').trim();
+      const fileFlyout = document.getElementById('planFileFlyout');
+      const other = document.getElementById('planOtherToolPanel');
+      const center = document.getElementById('planCenterPanel');
+      const isFile = t.toLowerCase() === 'file';
+      if (fileFlyout) fileFlyout.style.display = isFile ? 'block' : 'none';
+      // Match reference flow: selecting Survey/other tools dismisses file flyout panel.
+      if (center) center.style.display = isFile ? 'block' : 'none';
+      if (other) {
+        other.style.display = 'none';
+        const hint = document.getElementById('planOtherToolHint');
+        if (hint) {
+          const hints = {
+            Takeoff: 'Sends takeoff to the vehicle (same as dashboard) using Takeoff alt (m). Vehicle must be connected.',
+            Waypoint: 'Click on the map to place waypoints.',
+            ROI: 'Click on the map to add fence polygon vertices.',
+            Pattern: 'Pattern fills a survey grid from the current vehicle position.',
+            Return: 'Return / RTL uses the map Return control.',
+            Center: 'Centers the map on the vehicle.'
+          };
+          hint.textContent = hints[t] || 'Tool active.';
+        }
+      }
+    }
+    function setPlanRailTool(name) {
       const layer = document.getElementById('planFlightLayer');
       if (!layer) return 0;
+      const want = (name || '').trim();
+      if (want) window.__planRailTool = want;
+      if (want !== 'Waypoint') addMode = false;
+      if (want !== 'ROI') {
+        addFenceMode = false;
+        if (fencePoints && fencePoints.length > 0 && fencePoints.length < 3) {
+          fencePoints = [];
+          try {
+            if (fencePolygon) {
+              map.removeLayer(fencePolygon);
+              fencePolygon = null;
+            }
+          } catch (e) {}
+        }
+      }
+      for (const el of layer.querySelectorAll('.planToolBtn')) {
+        const t = el.getAttribute('data-tool') || '';
+        el.classList.toggle('active', t === want);
+      }
+      updatePlanToolPanel(want);
+      return 1;
+    }
+
+    function disablePlanEditModes() {
+      addMode = false;
+      addFenceMode = false;
+      if (fencePoints && fencePoints.length > 0 && fencePoints.length < 3) {
+        fencePoints = [];
+        try {
+          if (fencePolygon) {
+            map.removeLayer(fencePolygon);
+            fencePolygon = null;
+          }
+        } catch (e) {}
+      }
+    }
+    function setPlanFlightChromeState(linked, wpCount) {
+      const n = Math.max(0, Number(wpCount) || 0);
+      const has = n > 0;
+      const link = !!linked;
+      const upBar = document.getElementById('planBarUpload');
+      const vUp = document.getElementById('planVehicleUpload');
+      const vDown = document.getElementById('planVehicleDownload');
+      const sav = document.getElementById('planStorageSave');
+      const savAs = document.getElementById('planStorageSaveAs');
+      const kml = document.getElementById('planStorageKml');
+      if (vDown) vDown.disabled = !link;
+      if (vUp) vUp.disabled = !link || !has;
+      if (upBar) upBar.disabled = !link || !has;
+      if (sav) sav.disabled = !has;
+      if (savAs) savAs.disabled = !has;
+      if (kml) kml.disabled = !has;
+      return 1;
+    }
+    const PLAN_TAB_KEYS = ['mission', 'fence', 'rally'];
+    const PLAN_TAB_BTN_IDS = {
+      mission: 'planTabBtnMission',
+      fence: 'planTabBtnFence',
+      rally: 'planTabBtnRally'
+    };
+    function activatePlanTab(key) {
+      const k = PLAN_TAB_KEYS.indexOf(key) >= 0 ? key : 'mission';
+      const tabs = document.querySelectorAll('#planTabs .planTab');
+      const bodies = {
+        mission: document.getElementById('planTabPanelMission'),
+        fence: document.getElementById('planTabPanelFence'),
+        rally: document.getElementById('planTabPanelRally'),
+      };
+      for (const tab of tabs) {
+        const id = tab.getAttribute('data-plan-tab') || '';
+        const on = id === k;
+        tab.classList.toggle('active', on);
+        tab.setAttribute('aria-selected', on ? 'true' : 'false');
+        tab.setAttribute('tabindex', on ? '0' : '-1');
+      }
+      for (const name of PLAN_TAB_KEYS) {
+        const el = bodies[name];
+        if (!el) continue;
+        if (name === k) {
+          el.removeAttribute('hidden');
+        } else {
+          el.setAttribute('hidden', '');
+        }
+      }
+      return 1;
+    }
+    function bindPlanRightTabs() {
+      const tablist = document.getElementById('planTabs');
+      if (!tablist) return;
+      const tabs = tablist.querySelectorAll('.planTab');
+      for (const tab of tabs) {
+        tab.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const el = ev.currentTarget;
+          const key = el.getAttribute('data-plan-tab') || 'mission';
+          activatePlanTab(key);
+          try {
+            el.focus({ preventScroll: true });
+          } catch (e) {
+            el.focus();
+          }
+        });
+        tab.addEventListener('keydown', function(ev) {
+          const cur = ev.currentTarget.getAttribute('data-plan-tab') || 'mission';
+          let idx = PLAN_TAB_KEYS.indexOf(cur);
+          if (idx < 0) idx = 0;
+          if (ev.key === 'ArrowRight' || ev.key === 'ArrowDown') {
+            ev.preventDefault();
+            idx = (idx + 1) % PLAN_TAB_KEYS.length;
+            activatePlanTab(PLAN_TAB_KEYS[idx]);
+            const nextBtn = document.getElementById(PLAN_TAB_BTN_IDS[PLAN_TAB_KEYS[idx]]);
+            if (nextBtn) nextBtn.focus();
+          } else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            idx = (idx + PLAN_TAB_KEYS.length - 1) % PLAN_TAB_KEYS.length;
+            activatePlanTab(PLAN_TAB_KEYS[idx]);
+            const nextBtn = document.getElementById(PLAN_TAB_BTN_IDS[PLAN_TAB_KEYS[idx]]);
+            if (nextBtn) nextBtn.focus();
+          } else if (ev.key === 'Home') {
+            ev.preventDefault();
+            activatePlanTab('mission');
+            const b = document.getElementById('planTabBtnMission');
+            if (b) b.focus();
+          } else if (ev.key === 'End') {
+            ev.preventDefault();
+            activatePlanTab('rally');
+            const b = document.getElementById('planTabBtnRally');
+            if (b) b.focus();
+          }
+        });
+      }
+    }
+    function bindPlanFlyoutActions() {
+      const mapActionBtn = (id, action) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (el.disabled) return;
+          document.title = 'VGCS_PLAN_ACTION:' + action + ':' + Date.now();
+        });
+      };
+      mapActionBtn('planBarUpload', 'bar_upload');
+      mapActionBtn('planStorageOpen', 'open');
+      mapActionBtn('planStorageSave', 'save');
+      mapActionBtn('planStorageSaveAs', 'save_as');
+      mapActionBtn('planStorageKml', 'save_kml');
+      mapActionBtn('planVehicleUpload', 'vehicle_upload');
+      mapActionBtn('planVehicleDownload', 'vehicle_download');
+      mapActionBtn('planVehicleClear', 'vehicle_clear');
+      mapActionBtn('planFenceRoiBtn', 'fence_roi_tool');
+      const tpl = [
+        ['planTplEmpty', 'template_empty'],
+        ['planTplSurvey', 'template_survey'],
+        ['planTplCorridor', 'template_corridor'],
+        ['planTplStructure', 'template_structure']
+      ];
+      for (const [eid, act] of tpl) {
+        const node = document.getElementById(eid);
+        if (!node) continue;
+        node.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          document.title = 'VGCS_PLAN_ACTION:' + act + ':' + Date.now();
+        });
+      }
+    }
+    function clearLaunchMarker() {}
+
+    function isPlanFlightLayerVisible() {
+      const layer = document.getElementById('planFlightLayer');
+      if (!layer || !window.getComputedStyle) return false;
+      return window.getComputedStyle(layer).display !== 'none';
+    }
+
+    function updateLaunchMarkerFromPanel() {
+      clearLaunchMarker();
+    }
+
+    function setPlanFlightVisible(visible) {
+      const layer = document.getElementById('planFlightLayer');
+      const hud = document.getElementById('mapFooterHud');
+      if (!layer) return 0;
       layer.style.display = visible ? 'block' : 'none';
+      if (hud) {
+        hud.style.display = visible ? 'none' : '';
+        hud.setAttribute('aria-hidden', visible ? 'true' : 'false');
+      }
+      syncCameraChromeVisibility();
+      if (!visible) {
+        clearLaunchMarker();
+      } else {
+        const w = window.__planRailTool && String(window.__planRailTool).trim();
+        if (w) {
+          setPlanRailTool(w);
+        } else {
+          updatePlanToolPanel(getActivePlanTool());
+        }
+        updateLaunchMarkerFromPanel();
+      }
       return 1;
     }
 
@@ -1159,7 +2505,7 @@ LEAFLET_HTML = """<!doctype html>
         el.textContent = String(value ?? '');
       };
       setTxt('pfAltDiff', metrics.altDiffFt ?? '0.0 ft');
-      setTxt('pfGradient', metrics.gradient ?? '--');
+      setTxt('pfGradient', metrics.gradient ?? '-.-');
       setTxt('pfAzimuth', metrics.azimuth ?? '0');
       setTxt('pfHeading', metrics.heading ?? 'nan');
       setTxt('pfDistPrevWp', metrics.distPrevWpFt ?? '0.0 ft');
@@ -1167,6 +2513,421 @@ LEAFLET_HTML = """<!doctype html>
       setTxt('pfMissionTime', metrics.missionTime ?? '00:00:00');
       setTxt('pfMaxTelemDist', metrics.maxTelemDistFt ?? '0 ft');
       return 1;
+    }
+
+    let planMissionEmitTimer = null;
+    function ftToM(ft) { return (Number(ft) || 0) * 0.3048; }
+    function mToFt(m) { return (Number(m) || 0) / 0.3048; }
+    function mphToMps(mph) { return (Number(mph) || 0) * 0.44704; }
+    function mpsToMph(mps) { return (Number(mps) || 0) / 0.44704; }
+
+    function ensurePlanWpMetaLen(n) {
+      const nn = Math.max(0, Number(n) || 0);
+      if (!Array.isArray(window.__planWpMeta)) window.__planWpMeta = [];
+      const initEl = document.getElementById('planInitialWpAltInput');
+      const hoverEl = document.getElementById('planHoverSpeedInput');
+      const baseAltM = ftToM(initEl ? initEl.value : 164.0);
+      const baseSpdMps = mphToMps(hoverEl ? hoverEl.value : 11.18);
+      while (window.__planWpMeta.length < nn) {
+        window.__planWpMeta.push({ alt_m: baseAltM, speed_mps: baseSpdMps });
+      }
+      if (window.__planWpMeta.length > nn) {
+        window.__planWpMeta = window.__planWpMeta.slice(0, nn);
+      }
+    }
+
+    function renderPlanWpDetails() {
+      const host = document.getElementById('planWpDetails');
+      const list = document.getElementById('planWpDetailsList');
+      if (!host || !list) return 0;
+      const n = waypoints ? waypoints.length : 0;
+      ensurePlanWpMetaLen(n);
+      if (n <= 0) {
+        host.style.display = 'none';
+        list.innerHTML = '';
+        return 1;
+      }
+      host.style.display = '';
+      const launchAltEl = document.getElementById('planLaunchAltInput');
+      const rawLaunch = launchAltEl ? String(launchAltEl.value || '') : '';
+      const lx = parseFloat(rawLaunch.replace(',', '.'));
+      const launchFtStr = Number.isFinite(lx) ? lx.toFixed(1) : '0.0';
+      let html = '';
+      html +=
+        '<div class="planWpRow planWpRow--start" data-wp-start="1">' +
+          '<div class="planWpLabel">Start</div>' +
+          '<div class="planWpFields">' +
+            '<div class="planWpField"><input class="planWpStartAlt" type="text" inputmode="decimal" value="' + launchFtStr + '"/><span class="planWpUnit">ft</span></div>' +
+            '<div class="planWpStartHint">Takeoff / launch altitude (0 = use WP1 for takeoff).</div>' +
+          '</div>' +
+        '</div>';
+      for (let i = 0; i < n; i++) {
+        const m = window.__planWpMeta[i] || {};
+        const altFt = mToFt(m.alt_m ?? ftToM(164));
+        const spdMph = mpsToMph(m.speed_mps ?? mphToMps(11.18));
+        html +=
+          '<div class="planWpRow" data-wp-idx="' + i + '">' +
+            '<div class="planWpLabel">WP ' + (i+1) + '</div>' +
+            '<div class="planWpFields">' +
+              '<div class="planWpField"><input class="planWpAlt" type="text" inputmode="decimal" value="' + altFt.toFixed(1) + '"/><span class="planWpUnit">ft</span></div>' +
+              '<div class="planWpField"><input class="planWpSpd" type="text" inputmode="decimal" value="' + spdMph.toFixed(1) + '"/><span class="planWpUnit">mph</span></div>' +
+            '</div>' +
+          '</div>';
+      }
+      list.innerHTML = html;
+      const startAltIn = list.querySelector('.planWpStartAlt');
+      if (startAltIn && launchAltEl) {
+        const onStartAlt = () => {
+          if (window.__planPanelSuppressEmit) return;
+          const num = (v, d) => {
+            const x = parseFloat(String(v || '').replace(',', '.'));
+            return Number.isFinite(x) ? x : d;
+          };
+          const ft = num(startAltIn.value, 0);
+          launchAltEl.value = String(ft);
+          schedulePlanMissionPanelEmit();
+        };
+        startAltIn.addEventListener('input', onStartAlt);
+        startAltIn.addEventListener('change', onStartAlt);
+      }
+      for (const row of list.querySelectorAll('.planWpRow[data-wp-idx]')) {
+        const idx = Number(row.getAttribute('data-wp-idx') || '0') || 0;
+        const altIn = row.querySelector('.planWpAlt');
+        const spdIn = row.querySelector('.planWpSpd');
+        const onChange = () => {
+          if (window.__planPanelSuppressEmit) return;
+          const num = (v, d) => {
+            const x = parseFloat(String(v || '').replace(',', '.'));
+            return Number.isFinite(x) ? x : d;
+          };
+          ensurePlanWpMetaLen(waypoints.length);
+          const aFt = num(altIn && altIn.value, 164.0);
+          const sMph = num(spdIn && spdIn.value, 11.18);
+          window.__planWpMeta[idx] = {
+            alt_m: Math.max(1.0, ftToM(aFt)),
+            speed_mps: Math.max(0.1, mphToMps(sMph)),
+          };
+          schedulePlanMissionPanelEmit();
+        };
+        if (altIn) { altIn.addEventListener('input', onChange); altIn.addEventListener('change', onChange); }
+        if (spdIn) { spdIn.addEventListener('input', onChange); spdIn.addEventListener('change', onChange); }
+      }
+      return 1;
+    }
+    function schedulePlanMissionPanelEmit() {
+      if (window.__planPanelSuppressEmit) return;
+      if (planMissionEmitTimer) clearTimeout(planMissionEmitTimer);
+      planMissionEmitTimer = setTimeout(emitPlanMissionPanel, 320);
+    }
+    function emitPlanMissionPanel() {
+      if (window.__planPanelSuppressEmit) return;
+      planMissionEmitTimer = null;
+      const sel = document.getElementById('planAltReferenceSelect');
+      const initEl = document.getElementById('planInitialWpAltInput');
+      const hoverEl = document.getElementById('planHoverSpeedInput');
+      const launchAltEl = document.getElementById('planLaunchAltInput');
+      const latEl = document.getElementById('planLaunchLatVal');
+      const lonEl = document.getElementById('planLaunchLonVal');
+      const num = (v, d) => {
+        const x = parseFloat(String(v || '').replace(',', '.'));
+        return Number.isFinite(x) ? x : d;
+      };
+      const data = {
+        altRef: sel ? String(sel.value || 'rel') : 'rel',
+        initialWpAltFt: num(initEl && initEl.value, 164),
+        hoverMph: num(hoverEl && hoverEl.value, 11.18),
+        launchAltFt: num(launchAltEl && launchAltEl.value, 0),
+        launchLat: latEl ? String(latEl.textContent || '').trim() : '',
+        launchLon: lonEl ? String(lonEl.textContent || '').trim() : '',
+      };
+      if (Array.isArray(window.__planWpMeta)) {
+        data.wpMeta = window.__planWpMeta.map((m) => ({
+          alt_m: Number(m && m.alt_m) || 0,
+          speed_mps: Number(m && m.speed_mps) || 0,
+        }));
+      }
+      try {
+        const js = JSON.stringify(data);
+        document.title = 'VGCS_PLAN_MISSION_PANEL:' + btoa(unescape(encodeURIComponent(js)));
+      } catch (e) {}
+    }
+    function setPlanSequenceTemplate(templateId) {
+      const row = document.getElementById('planSeqPatternRow');
+      const label = document.getElementById('planSeqPatternLabel');
+      const missionPanel = document.getElementById('planTabPanelMission');
+      const missionHeader = document.getElementById('planMissionSectionHeader');
+      const compactList = document.getElementById('planSeqCompactList');
+      const compactSurveyLabel = document.getElementById('planSeqCompactSurveyLabel');
+      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
+      const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
+      const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
+      const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
+      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
+      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
+      const takeoffDesc = document.querySelector('#planTabPanelMission .planSeqCardDesc');
+      const startMissionBtn = document.getElementById('planStartMissionBtn');
+      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
+      if (!row || !label) return 0;
+      const t = String(templateId || '').toLowerCase().trim();
+      const labels = {
+        survey: 'Survey',
+        corridor: 'Corridor Scan',
+        structure: 'Structure Scan'
+      };
+      row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
+      const isEmpty = !t || !labels[t];
+      const isSurveyMode = t === 'survey';
+      window.__planMissionStartStack = !!isSurveyMode;
+      if (missionPanel) {
+        missionPanel.classList.toggle('planMissionEmpty', isEmpty || isSurveyMode);
+        missionPanel.classList.toggle('planMissionStack', isSurveyMode);
+      }
+      if (compactList) compactList.setAttribute('aria-hidden', isSurveyMode ? 'false' : 'true');
+      if (compactSurveyLabel && labels[t]) compactSurveyLabel.textContent = labels[t];
+      if (compactSurveyBody && labels[t]) compactSurveyBody.textContent = labels[t] + ' pattern selected.';
+      if (missionHeader) missionHeader.textContent = (isEmpty || isSurveyMode) ? 'Mission Start' : 'Mission';
+      // Hard show/hide to keep Survey state stable regardless CSS cache/state.
+      if (takeoffHead) takeoffHead.style.display = (isEmpty || isSurveyMode) ? 'none' : '';
+      if (takeoffDesc) takeoffDesc.style.display = (isEmpty || isSurveyMode) ? 'none' : '';
+      if (seqRtlBtn) seqRtlBtn.style.display = isSurveyMode ? 'none' : (isEmpty ? 'none' : '');
+      // Keep Start Mission visible regardless of template state.
+      if (startMissionBtn) startMissionBtn.style.display = '';
+      if (compactList) compactList.style.display = isSurveyMode ? 'flex' : 'none';
+      if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
+      if (compactTakeoff) compactTakeoff.classList.remove('is-active');
+      if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
+      if (compactRtlTab) compactRtlTab.classList.remove('is-active');
+      if (compactSurveyBody) compactSurveyBody.classList.remove('is-active');
+      if (compactRtlBody) compactRtlBody.classList.remove('is-active');
+      if (!t || !labels[t]) {
+        return 1;
+      }
+      label.textContent = labels[t];
+      row.classList.add('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
+      setPlanStackTab('takeoff');
+      return 1;
+    }
+    function setPlanStackTab(name) {
+      const missionPanel = document.getElementById('planTabPanelMission');
+      if (!missionPanel) return 0;
+      missionPanel.classList.remove('planMissionDetailsOpen');
+      const tab = String(name || 'takeoff').toLowerCase();
+      const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
+      const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
+      const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
+      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
+      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
+      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
+      const vehicleDetails = document.getElementById('planVehicleDetails');
+      const launchDetails = document.getElementById('planLaunchDetails');
+      if (compactTakeoffTab) compactTakeoffTab.classList.toggle('is-active', tab === 'takeoff');
+      if (compactTakeoff) compactTakeoff.classList.toggle('is-active', tab === 'takeoff');
+      if (compactSurveyTab) compactSurveyTab.classList.toggle('is-active', tab === 'survey');
+      if (compactRtlTab) compactRtlTab.classList.toggle('is-active', tab === 'rtl');
+      if (compactSurveyBody) compactSurveyBody.classList.toggle('is-active', tab === 'survey');
+      if (compactRtlBody) compactRtlBody.classList.toggle('is-active', tab === 'rtl');
+      // Keep visibility deterministic even if cached CSS state is stale.
+      if (compactTakeoff) compactTakeoff.style.display = (tab === 'takeoff') ? 'block' : 'none';
+      if (compactSurveyBody) compactSurveyBody.style.display = (tab === 'survey') ? 'block' : 'none';
+      if (compactRtlBody) compactRtlBody.style.display = (tab === 'rtl') ? 'block' : 'none';
+      if (takeoffBody) takeoffBody.style.display = 'none';
+      if (vehicleDetails) vehicleDetails.style.display = 'none';
+      if (launchDetails) launchDetails.style.display = 'none';
+      return 1;
+    }
+    function bindPlanStackTabs() {
+      const takeoff = document.getElementById('planSeqCompactTakeoffTab');
+      const survey = document.getElementById('planSeqCompactSurveyTab');
+      const rtl = document.getElementById('planSeqCompactRtlTab');
+      const bind = (el, tab) => {
+        if (!el) return;
+        const onAct = (ev) => {
+          if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+          setPlanStackTab(tab);
+        };
+        el.addEventListener('click', onAct);
+        el.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') onAct(ev);
+        });
+      };
+      bind(takeoff, 'takeoff');
+      bind(survey, 'survey');
+      bind(rtl, 'rtl');
+    }
+    function openMissionStartDetails() {
+      const missionPanel = document.getElementById('planTabPanelMission');
+      const missionHeader = document.getElementById('planMissionSectionHeader');
+      const compactList = document.getElementById('planSeqCompactList');
+      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
+      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
+      const vehicleDetails = document.getElementById('planVehicleDetails');
+      const launchDetails = document.getElementById('planLaunchDetails');
+      const row = document.getElementById('planSeqPatternRow');
+      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
+      const startMissionBtn = document.getElementById('planStartMissionBtn');
+      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
+      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
+      if (!missionPanel) return 0;
+      // Keep stack layout so Takeoff/Survey/RTL tabs preserve their existing UI.
+      missionPanel.classList.add('planMissionStack');
+      missionPanel.classList.remove('planMissionEmpty');
+      missionPanel.classList.add('planMissionDetailsOpen');
+      if (missionHeader) missionHeader.textContent = 'Mission Start';
+      if (compactList) {
+        // Keep plan step tabs visible while Mission Start details are open.
+        compactList.style.display = 'flex';
+        compactList.setAttribute('aria-hidden', 'false');
+      }
+      if (takeoffHead) takeoffHead.style.display = 'none';
+      if (takeoffBody) takeoffBody.style.display = '';
+      if (vehicleDetails) vehicleDetails.style.display = '';
+      if (launchDetails) launchDetails.style.display = '';
+      if (row) row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
+      if (seqRtlBtn) seqRtlBtn.style.display = 'none';
+      if (startMissionBtn) startMissionBtn.style.display = '';
+      // Show tabs only (no expanded compact detail card) while editing mission details.
+      if (compactTakeoff) compactTakeoff.style.display = 'none';
+      if (compactSurveyBody) compactSurveyBody.style.display = 'none';
+      if (compactRtlBody) compactRtlBody.style.display = 'none';
+      window.__planMissionStartStack = true;
+      return 1;
+    }
+    function setPlanMissionStartStack(enabled, surveyLabel) {
+      const missionPanel = document.getElementById('planTabPanelMission');
+      const missionHeader = document.getElementById('planMissionSectionHeader');
+      const compactList = document.getElementById('planSeqCompactList');
+      const compactSurveyLabel = document.getElementById('planSeqCompactSurveyLabel');
+      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
+      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
+      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
+      const takeoffDesc = document.querySelector('#planTabPanelMission .planSeqCardDesc');
+      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
+      const vehicleDetails = document.getElementById('planVehicleDetails');
+      const launchDetails = document.getElementById('planLaunchDetails');
+      const startMissionBtn = document.getElementById('planStartMissionBtn');
+      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
+      const row = document.getElementById('planSeqPatternRow');
+      const on = !!enabled;
+      window.__planMissionStartStack = on;
+      if (missionPanel) {
+        missionPanel.classList.toggle('planMissionEmpty', on);
+        missionPanel.classList.toggle('planMissionStack', on);
+        missionPanel.classList.toggle('planMissionDetailsOpen', on);
+      }
+      if (missionHeader) missionHeader.textContent = on ? 'Mission Start' : 'Mission';
+      if (takeoffHead) takeoffHead.style.display = on ? 'none' : '';
+      if (takeoffDesc) takeoffDesc.style.display = on ? 'none' : '';
+      if (seqRtlBtn) seqRtlBtn.style.display = on ? 'none' : '';
+      // Keep Start Mission visible in Mission tab for both normal and stack layouts.
+      if (startMissionBtn) startMissionBtn.style.display = '';
+      if (compactList) {
+        compactList.setAttribute('aria-hidden', on ? 'false' : 'true');
+        compactList.style.display = on ? 'flex' : 'none';
+      }
+      if (compactSurveyLabel) compactSurveyLabel.textContent = String(surveyLabel || 'Survey');
+      if (compactSurveyBody) compactSurveyBody.textContent = String(surveyLabel || 'Survey') + ' pattern selected.';
+      if (row && on) {
+        row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
+      }
+      if (on) {
+        // Mission Start keeps its original details UI; only append plan rows below.
+        const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
+        const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
+        const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
+        const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+        if (takeoffBody) takeoffBody.style.display = '';
+        if (vehicleDetails) vehicleDetails.style.display = '';
+        if (launchDetails) launchDetails.style.display = '';
+        if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
+        if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
+        if (compactRtlTab) compactRtlTab.classList.remove('is-active');
+        if (compactTakeoff) {
+          compactTakeoff.classList.remove('is-active');
+          compactTakeoff.style.display = 'none';
+        }
+        if (compactSurveyBody) {
+          compactSurveyBody.classList.remove('is-active');
+          compactSurveyBody.style.display = 'none';
+        }
+        if (compactRtlBody) {
+          compactRtlBody.classList.remove('is-active');
+          compactRtlBody.style.display = 'none';
+        }
+      } else {
+        missionPanel.classList.remove('planMissionDetailsOpen');
+        if (takeoffBody) takeoffBody.style.display = '';
+        if (vehicleDetails) vehicleDetails.style.display = '';
+        if (launchDetails) launchDetails.style.display = '';
+        if (compactSurveyBody) compactSurveyBody.classList.remove('is-active');
+        if (compactRtlBody) compactRtlBody.classList.remove('is-active');
+        const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
+        const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
+        const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
+        const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+        if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
+        if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
+        if (compactRtlTab) compactRtlTab.classList.remove('is-active');
+        if (compactTakeoff) compactTakeoff.classList.remove('is-active');
+      }
+      return 1;
+    }
+    function applyPlanMissionPanelState(s) {
+      if (!s || typeof s !== 'object') return 0;
+      window.__planPanelSuppressEmit = true;
+      try {
+        const sel = document.getElementById('planAltReferenceSelect');
+        if (sel && s.altRef) sel.value = String(s.altRef);
+        const initEl = document.getElementById('planInitialWpAltInput');
+        if (initEl && s.initialWpAltFt != null) initEl.value = String(s.initialWpAltFt);
+        const hoverEl = document.getElementById('planHoverSpeedInput');
+        if (hoverEl && s.hoverMph != null) hoverEl.value = String(s.hoverMph);
+        const launchAltEl = document.getElementById('planLaunchAltInput');
+        if (launchAltEl && s.launchAltFt != null) launchAltEl.value = String(s.launchAltFt);
+        const latEl = document.getElementById('planLaunchLatVal');
+        const lonEl = document.getElementById('planLaunchLonVal');
+        const lt = s.launchLat != null ? String(s.launchLat).trim() : '';
+        const ln = s.launchLon != null ? String(s.launchLon).trim() : '';
+        if (latEl) latEl.textContent = lt || '—';
+        if (lonEl) lonEl.textContent = ln || '—';
+        updateLaunchMarkerFromPanel();
+        if (Array.isArray(s.wpMeta)) {
+          window.__planWpMeta = s.wpMeta.map((m) => ({
+            alt_m: Number(m && m.alt_m) || 0,
+            speed_mps: Number(m && m.speed_mps) || 0,
+          }));
+        }
+        renderPlanWpDetails();
+      } finally {
+        setTimeout(function() { window.__planPanelSuppressEmit = false; }, 0);
+      }
+      return 1;
+    }
+    function setPlanVehicleInfo(fw, veh) {
+      const a = document.getElementById('planVehicleFirmwareVal');
+      const b = document.getElementById('planVehicleTypeVal');
+      if (a) a.textContent = fw || '—';
+      if (b) b.textContent = veh || '—';
+      return 1;
+    }
+    function bindPlanMissionPanel() {
+      const sel = document.getElementById('planAltReferenceSelect');
+      if (sel) sel.addEventListener('change', schedulePlanMissionPanelEmit);
+      for (const id of ['planInitialWpAltInput', 'planHoverSpeedInput', 'planLaunchAltInput']) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        el.addEventListener('input', schedulePlanMissionPanelEmit);
+        el.addEventListener('change', schedulePlanMissionPanelEmit);
+      }
+      for (const id of ['planInitialWpAltInput', 'planHoverSpeedInput', 'planLaunchAltInput']) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        el.addEventListener('input', function() { renderPlanWpDetails(); });
+        el.addEventListener('change', function() { renderPlanWpDetails(); });
+      }
+      renderPlanWpDetails();
     }
 
     function centerOnVehicle() {
@@ -1228,9 +2989,22 @@ LEAFLET_HTML = """<!doctype html>
       const ft = (Number(relAltM || 0.0) * 3.28084).toFixed(1);
       const mph = (Number(groundSpeedMps || 0.0) * 2.23694).toFixed(1);
       const mslFt = (Number(mslAltM || 0.0) * 3.28084).toFixed(1);
-      const strip = document.getElementById('telemetryStrip');
-      if (!strip) return 0;
-      strip.innerHTML = `<div class="telemetryRow"><span class="telemetryItem"><span class="telemetryIcon">↕</span><span>${ft} ft</span></span><span class="telemetryItem"><span class="telemetryIcon">↑</span><span>${mph} mph</span></span><span class="telemetryItem"><span class="telemetryIcon">⏱</span><span>${timeText || '00:00:00'}</span></span></div><div class="telemetryRow"><span class="telemetryItem"><span class="telemetryIcon">↳</span><span>${ft} ft</span></span><span class="telemetryItem"><span class="telemetryIcon">→</span><span>${mph} mph</span></span><span class="telemetryItem"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span>${mslFt} ft</span></span></div>`;
+      const ttime = timeText || '00:00:00';
+      const prev = window.__telHudSig || '';
+      const sig = ft + '|' + mph + '|' + ttime + '|' + mslFt;
+      if (sig === prev) return 1;
+      window.__telHudSig = sig;
+      const setAll = (className, text) => {
+        document.querySelectorAll('.' + className).forEach((el) => {
+          el.textContent = text;
+        });
+      };
+      setAll('telRow1Alt', `${ft} ft`);
+      setAll('telRow1Mph', `${mph} mph`);
+      setAll('telRow1Time', ttime);
+      setAll('telRow2Alt', `${ft} ft`);
+      setAll('telRow2Mph', `${mph} mph`);
+      setAll('telRow2Msl', `${mslFt} ft`);
       return 1;
     }
 
@@ -1238,7 +3012,12 @@ LEAFLET_HTML = """<!doctype html>
       if (viewer3d) return true;
       if (!window.Cesium) return false;
       try {
+        const cesiumCreditHost = document.createElement('div');
+        cesiumCreditHost.style.display = 'none';
+        cesiumCreditHost.setAttribute('aria-hidden', 'true');
+        document.body.appendChild(cesiumCreditHost);
         viewer3d = new Cesium.Viewer('map3d', {
+          creditContainer: cesiumCreditHost,
           timeline: false,
           animation: false,
           geocoder: false,
@@ -1276,10 +3055,19 @@ LEAFLET_HTML = """<!doctype html>
         }
         vehicleEntity = viewer3d.entities.add({
           position: Cesium.Cartesian3.fromDegrees(46.6753, 24.7136, 20),
-          point: { pixelSize: 10, color: Cesium.Color.LIME }
+          point: {
+            pixelSize: 12,
+            color: Cesium.Color.fromCssColorString('#ff2328'),
+            outlineColor: Cesium.Color.fromCssColorString('#4a1222'),
+            outlineWidth: 2
+          }
         });
         headingEntity = viewer3d.entities.add({
-          polyline: { positions: [], width: 2, material: Cesium.Color.ORANGE }
+          polyline: {
+            positions: [],
+            width: 0,
+            material: Cesium.Color.fromCssColorString('#00000000')
+          }
         });
         window.__3dHasInitialFocus = false;
         return true;
@@ -1312,9 +3100,106 @@ LEAFLET_HTML = """<!doctype html>
       }
     }
 
+    function syncVehicleHeadingLine() {
+      clearVehicleHeadingLine();
+    }
+
+    function clearVehicleHeadingLine() {
+      headingLine.setLatLngs([]);
+      if (headingEntity) {
+        headingEntity.polyline.positions = [];
+      }
+    }
+
+    function updateHeadingLineGeometry(lat, lon, deg) {
+      clearVehicleHeadingLine();
+    }
+
+    function haversine_m(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const toR = (x) => x * Math.PI / 180;
+      const dLat = toR(lat2 - lat1);
+      const dLon = toR(lon2 - lon1);
+      const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(toR(lat1)) * Math.cos(toR(lat2)) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+    }
+
+    function appendFlightTrack(lat, lon) {
+      try {
+        if (__lastTrackLat != null && __lastTrackLon != null) {
+          const d = haversine_m(__lastTrackLat, __lastTrackLon, lat, lon);
+          if (d < 0.3) return;
+        }
+        __lastTrackLat = lat;
+        __lastTrackLon = lon;
+        let pts = (flightTrack.getLatLngs() || []).concat([[lat, lon]]);
+        const trimM = 10;
+        while (pts.length > 1) {
+          const a = pts[0];
+          if (haversine_m(a.lat, a.lng, lat, lon) < trimM) pts = pts.slice(1);
+          else break;
+        }
+        const maxPts = 200;
+        while (pts.length > maxPts) pts = pts.slice(pts.length - maxPts);
+        flightTrack.setLatLngs(pts);
+        if (pts.length && !map.hasLayer(flightTrack)) flightTrack.addTo(map);
+      } catch (e) {}
+    }
+
+    function clearFlightTrack() {
+      __lastTrackLat = null;
+      __lastTrackLon = null;
+      try { flightTrack.setLatLngs([]); } catch (e) {}
+      try { if (map.hasLayer(flightTrack)) map.removeLayer(flightTrack); } catch (e) {}
+    }
+
+    function updateMissionRoutePolyline() {
+      try {
+        const navSeq = Number(window.__missionNavSeq) || 0;
+        let startIdx = 0;
+        // VGCS mission layout sent to ArduPilot:
+        //   seq 0: dummy (home slot / protocol placeholder)
+        //   seq 1: TAKEOFF
+        //   seq 2: DO_CHANGE_SPEED for WP1
+        //   seq 3: WP1
+        //   seq 4: DO_CHANGE_SPEED for WP2
+        //   seq 5: WP2
+        // Therefore map MISSION_CURRENT.seq -> waypoint array index:
+        //   - before seq 3: start at WP1 (index 0)
+        //   - seq>=3: floor((seq-3)/2)
+        if (navSeq >= 3) {
+          startIdx = Math.max(0, Math.min(waypoints.length, Math.floor((navSeq - 3) / 2)));
+        } else {
+          startIdx = 0;
+        }
+        const veh = vehicleMarker && vehicleMarker.getLatLng();
+        const rest = waypoints.slice(startIdx).map((w) => w.getLatLng());
+        let ll = [];
+        if (veh && rest.length >= 1) {
+          ll = [[veh.lat, veh.lng]].concat(rest);
+        } else if (rest.length >= 2) {
+          ll = rest;
+        } else if (veh && rest.length === 1) {
+          ll = [[veh.lat, veh.lng], rest[0]];
+        } else if (rest.length === 1) {
+          ll = rest;
+        }
+        if (ll.length < 2) {
+          if (map.hasLayer(missionRoute)) map.removeLayer(missionRoute);
+          return;
+        }
+        missionRoute.setLatLngs(ll);
+        if (!map.hasLayer(missionRoute)) missionRoute.addTo(map);
+        try { missionRoute.bringToFront(); } catch (e) {}
+      } catch (e) {}
+    }
+
     function setVehicle(lat, lon) {
       vehicleMarker.setLatLng([lat, lon]);
-      updateHeading(window.__heading || 0, lat, lon);
+      appendFlightTrack(lat, lon);
+      updateHeadingLineGeometry(lat, lon, window.__heading || 0);
+      updateMissionRoutePolyline();
       if (vehicleEntity) {
         vehicleEntity.position = Cesium.Cartesian3.fromDegrees(lon, lat, 20);
       }
@@ -1323,32 +3208,102 @@ LEAFLET_HTML = """<!doctype html>
       }
     }
 
-    function updateHeading(deg, latArg, lonArg) {
-      window.__heading = deg;
-      updateCompassNeedle(deg);
+    function nowMs() {
+      return (typeof performance !== 'undefined' && performance.now)
+        ? performance.now()
+        : Date.now();
+    }
+
+    function cancelHeadingSchedule() {
+      if (__headingRafId != null) {
+        clearTimeout(__headingRafId);
+        __headingRafId = null;
+      }
+      __headingPending = null;
+    }
+
+    function applyHeadingVisuals(deg, latArg, lonArg) {
+      const d = ((Number(deg) || 0) % 360 + 360) % 360;
+      window.__heading = d;
+      updateCompassNeedle(d);
       const p = vehicleMarker.getLatLng();
       const lat = latArg !== undefined ? latArg : p.lat;
       const lon = lonArg !== undefined ? lonArg : p.lng;
-      const len = 0.01;
-      const rad = deg * Math.PI / 180.0;
-      const lat2 = lat + len * Math.cos(rad);
-      const lon2 = lon + len * Math.sin(rad);
-      headingLine.setLatLngs([[lat, lon], [lat2, lon2]]);
-      if (headingEntity) {
-        headingEntity.polyline.positions = Cesium.Cartesian3.fromDegreesArray([
-          lon, lat, lon2, lat2
-        ]);
+      updateHeadingLineGeometry(lat, lon, d);
+      try {
+        const el = vehicleMarker.getElement && vehicleMarker.getElement();
+        if (el) {
+          const inner = el.querySelector('.vgcs-vehicle-marker-inner');
+          if (inner) inner.style.transform = 'rotate(' + d + 'deg)';
+        }
+      } catch (e) {}
+      __headingLastApplyMs = nowMs();
+    }
+
+    function flushHeadingPending() {
+      __headingRafId = null;
+      if (!__headingPending) return;
+      const { deg, latArg, lonArg, source } = __headingPending;
+      __headingPending = null;
+      if (source === 'att' && (__headingLastVfrMs > 0) && (nowMs() - __headingLastVfrMs < VFR_HEADING_PRIORITY_MS)) {
+        return;
       }
+      if (source === 'vfr' || source === 'gpi') {
+        __headingLastVfrMs = nowMs();
+      }
+      applyHeadingVisuals(deg, latArg, lonArg);
+    }
+
+    function scheduleHeadingUpdate(deg, latArg, lonArg, source) {
+      __headingPending = { deg, latArg, lonArg, source: source || 'mixed' };
+      const t = nowMs();
+      const wait = Math.max(0, HEADING_MIN_INTERVAL_MS - (t - __headingLastApplyMs));
+      if (__headingRafId != null) {
+        clearTimeout(__headingRafId);
+      }
+      __headingRafId = setTimeout(flushHeadingPending, wait);
+    }
+
+    function updateHeading(deg, latArg, lonArg, source) {
+      if (latArg !== undefined || lonArg !== undefined) {
+        applyHeadingVisuals(deg, latArg, lonArg);
+        return;
+      }
+      scheduleHeadingUpdate(deg, latArg, lonArg, source);
     }
 
     function enableAddWaypoint() { addMode = true; addFenceMode = false; }
     function enableFencePolygon() { addFenceMode = true; addMode = false; }
+
+    function waypointNumberIcon(n) {
+      const html =
+        '<div class="vgcs-wp-pin" aria-label="Waypoint ' + n + '">' +
+        '<span class="vgcs-wp-disc"></span>' +
+        '<span class="vgcs-wp-num">' + n + '</span></div>';
+      return L.divIcon({
+        html: html,
+        className: 'vgcs-wp-divicon',
+        iconSize: [26, 26],
+        iconAnchor: [13, 13],
+      });
+    }
+
+    function refreshWaypointLabels() {
+      waypoints.forEach((w, i) => {
+        try {
+          w.setIcon(waypointNumberIcon(i + 1));
+        } catch (e) {}
+      });
+    }
 
     function attachWaypointDeleteHandlers(marker) {
       if (!marker) return;
       const removeThis = () => {
         try { map.removeLayer(marker); } catch (e) {}
         waypoints = waypoints.filter(w => w !== marker);
+        refreshWaypointLabels();
+        syncVehicleHeadingLine();
+        updateMissionRoutePolyline();
       };
       // Fast delete gesture for planning workflows.
       marker.on('dblclick', function(ev) {
@@ -1368,15 +3323,29 @@ LEAFLET_HTML = """<!doctype html>
     }
 
     function addWaypointMarker(latlng) {
-      const m = L.marker(latlng).addTo(map);
+      const idx = waypoints.length + 1;
+      const m = L.marker(latlng, {
+        icon: waypointNumberIcon(idx),
+        interactive: true,
+        bubblingMouseEvents: false,
+        keyboard: false,
+        pane: 'overlayPane',
+      }).addTo(map);
       attachWaypointDeleteHandlers(m);
       waypoints.push(m);
+      refreshWaypointLabels();
+      syncVehicleHeadingLine();
+      renderPlanWpDetails();
       return m;
     }
 
     function clearWaypoints() {
       for (const wp of waypoints) map.removeLayer(wp);
       waypoints = [];
+      window.__missionNavSeq = 0;
+      window.__planWpMeta = [];
+      syncVehicleHeadingLine();
+      updateMissionRoutePolyline();
       return 0;
     }
 
@@ -1430,6 +3399,8 @@ LEAFLET_HTML = """<!doctype html>
       for (const p of points) {
         addWaypointMarker([p[0], p[1]]);
       }
+      updateMissionRoutePolyline();
+      renderPlanWpDetails();
     }
 
     function getWaypointCount() { return waypoints.length; }
@@ -1454,6 +3425,7 @@ LEAFLET_HTML = """<!doctype html>
     map.on('click', function(e) {
       if (addMode) {
         addWaypointMarker(e.latlng);
+        updateMissionRoutePolyline();
         return;
       }
       if (addFenceMode) {
@@ -1478,8 +3450,12 @@ class MapWidget(QWidget):
     takeoff_requested = Signal()
     return_requested = Signal()
     plan_tool_requested = Signal(str)
+    plan_action_requested = Signal(str)
+    plan_flight_exited = Signal()
+    map_page_ready = Signal()
     toggle_3d_requested = Signal()
     mission_start_requested = Signal()
+    plan_mission_panel_changed = Signal(object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1491,6 +3467,20 @@ class MapWidget(QWidget):
         self._web_ready = False
         self._is_3d_mode = False
         self._fence_radius_m = 80.0
+        self._last_plan_flight_metrics_payload: dict[str, object] | None = None
+        self._vehicle_pose_timer = QTimer(self)
+        self._vehicle_pose_timer.setSingleShot(True)
+        self._vehicle_pose_timer.setInterval(48)
+        self._vehicle_pose_timer.timeout.connect(self._flush_vehicle_pose_js)
+        self._heading_js_source = "mixed"
+        self._last_flight_telemetry_sig: str | None = None
+        self._last_link_connected: bool | None = None
+        self._last_flight_status_key: tuple[str, str] | None = None
+        self._last_header_gps_key: tuple[str, str] | None = None
+        self._last_header_battery: str | None = None
+        self._last_header_mode: str | None = None
+        self._last_plan_vehicle_info_key: tuple[str, str] | None = None
+        self._plan_rail_tool_state = "File"
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -1528,7 +3518,11 @@ class MapWidget(QWidget):
         self._btn_clear_wp = QPushButton("Clear WPs")
         self._btn_upload = QPushButton("Upload Mission")
         self._btn_download = QPushButton("Download Mission")
-        self._btn_export = QPushButton("Export Mission")
+        self._btn_export = QPushButton("Export to file…")
+        self._btn_export.setToolTip(
+            "Write a copy of waypoints to a JSON file you choose. "
+            "Does not change the Plan Flight “current mission” path."
+        )
         self._btn_import = QPushButton("Import Mission")
         self._btn_3d = QPushButton("3D Toggle")
         self._btn_3d.setCheckable(True)
@@ -1552,6 +3546,11 @@ class MapWidget(QWidget):
         self._default_alt.setDecimals(1)
         self._default_alt.setSingleStep(1.0)
         self._default_alt.setValue(20.0)
+        self._default_speed = QDoubleSpinBox()
+        self._default_speed.setRange(0.1, 50.0)
+        self._default_speed.setDecimals(1)
+        self._default_speed.setSingleStep(0.5)
+        self._default_speed.setValue(5.0)
         self._wp_selector = QComboBox()
         self._wp_selector.setMinimumWidth(90)
         self._wp_alt = QDoubleSpinBox()
@@ -1559,8 +3558,15 @@ class MapWidget(QWidget):
         self._wp_alt.setDecimals(1)
         self._wp_alt.setSingleStep(1.0)
         self._wp_alt.setValue(20.0)
+        self._wp_speed = QDoubleSpinBox()
+        self._wp_speed.setRange(0.1, 50.0)
+        self._wp_speed.setDecimals(1)
+        self._wp_speed.setSingleStep(0.5)
+        self._wp_speed.setValue(5.0)
         self._btn_apply_wp_alt = QPushButton("Set WP Alt")
         self._btn_apply_all_alt = QPushButton("Set All Alt")
+        self._btn_apply_wp_speed = QPushButton("Set WP Speed")
+        self._btn_apply_all_speed = QPushButton("Set All Speed")
         tools.addWidget(self._btn_add_wp, 0, 0)
         tools.addWidget(self._btn_clear_wp, 0, 1)
         tools.addWidget(self._btn_upload, 0, 2)
@@ -1577,14 +3583,21 @@ class MapWidget(QWidget):
         tools.addWidget(self._btn_fence_clear, 0, 13)
         tools.addWidget(QLabel("Default Alt (m)"), 1, 0)
         tools.addWidget(self._default_alt, 1, 1)
-        tools.addWidget(QLabel("WP"), 1, 2)
-        tools.addWidget(self._wp_selector, 1, 3)
-        tools.addWidget(QLabel("Alt (m)"), 1, 4)
-        tools.addWidget(self._wp_alt, 1, 5)
-        tools.addWidget(self._btn_apply_wp_alt, 1, 6)
-        tools.addWidget(self._btn_apply_all_alt, 1, 7)
-        tools.addWidget(self._btn_tiles_online, 1, 8)
-        tools.addWidget(self._btn_tiles_pick, 1, 9)
+        tools.addWidget(QLabel("Default Spd (m/s)"), 1, 2)
+        tools.addWidget(self._default_speed, 1, 3)
+        tools.addWidget(QLabel("WP"), 1, 4)
+        tools.addWidget(self._wp_selector, 1, 5)
+        tools.addWidget(QLabel("Alt (m)"), 1, 6)
+        tools.addWidget(self._wp_alt, 1, 7)
+        tools.addWidget(self._btn_apply_wp_alt, 1, 8)
+        tools.addWidget(self._btn_apply_all_alt, 1, 9)
+
+        tools.addWidget(QLabel("Spd (m/s)"), 2, 0)
+        tools.addWidget(self._wp_speed, 2, 1)
+        tools.addWidget(self._btn_apply_wp_speed, 2, 2)
+        tools.addWidget(self._btn_apply_all_speed, 2, 3)
+        tools.addWidget(self._btn_tiles_online, 2, 8)
+        tools.addWidget(self._btn_tiles_pick, 2, 9)
         toolbar.setLayout(tools)
         self._toolbar = toolbar
 
@@ -1622,6 +3635,8 @@ class MapWidget(QWidget):
         self._wp_selector.currentIndexChanged.connect(self._on_wp_selected)
         self._btn_apply_wp_alt.clicked.connect(self._apply_altitude_to_selected)
         self._btn_apply_all_alt.clicked.connect(self._apply_altitude_to_all)
+        self._btn_apply_wp_speed.clicked.connect(self._apply_speed_to_selected)
+        self._btn_apply_all_speed.clicked.connect(self._apply_speed_to_all)
 
         self._wp_poll = QTimer(self)
         self._wp_poll.setInterval(1000)
@@ -1652,31 +3667,58 @@ class MapWidget(QWidget):
             self._panel_layout.setSpacing(8)
 
     def set_link_connected(self, connected: bool) -> None:
-        self._run_js("setLinkConnected(true);" if connected else "setLinkConnected(false);")
+        c = bool(connected)
+        if self._last_link_connected == c:
+            return
+        self._last_link_connected = c
+        self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
 
     def set_flight_status(self, status: str, detail: str = "") -> None:
         st = (status or "").strip().lower()
         if st not in {"green", "yellow", "red"}:
             st = "red"
+        d = str(detail)
+        key = (st, d)
+        if self._last_flight_status_key == key:
+            return
+        self._last_flight_status_key = key
         self._run_js(f"setFlightStatus({json.dumps(st)}, {json.dumps(detail)});")
 
     def set_header_mode(self, mode_text: str) -> None:
+        t = str(mode_text)
+        if t == self._last_header_mode:
+            return
+        self._last_header_mode = t
         self._run_js(f"setHeaderMode({json.dumps(mode_text)});")
 
     def set_header_vehicle_msg(self, msg_text: str) -> None:
         self._run_js(f"setHeaderVehicleMsg({json.dumps(msg_text)});")
 
     def set_header_gps(self, satellites: int | str, hdop_text: str) -> None:
+        key = (str(satellites), str(hdop_text))
+        if self._last_header_gps_key == key:
+            return
+        self._last_header_gps_key = key
         self._run_js(f"setHeaderGps({json.dumps(str(satellites))}, {json.dumps(hdop_text)});")
 
     def set_header_battery(self, battery_text: str) -> None:
+        bt = str(battery_text)
+        if self._last_header_battery == bt:
+            return
+        self._last_header_battery = bt
         self._run_js(f"setHeaderBattery({json.dumps(battery_text)});")
 
     def set_header_remote_id(self, rid_text: str) -> None:
         self._run_js(f"setHeaderRemoteId({json.dumps(rid_text)});")
 
     def set_plan_flight_visible(self, visible: bool) -> None:
-        self._run_js("setPlanFlightVisible(true);" if visible else "setPlanFlightVisible(false);")
+        if visible:
+            t = self._plan_rail_tool_state
+            self._run_js(
+                f"window.__planRailTool = {json.dumps(t)}; setPlanFlightVisible(true);"
+            )
+        else:
+            self._run_js("setPlanFlightVisible(false);")
 
     def set_plan_flight_metrics(
         self,
@@ -1700,10 +3742,74 @@ class MapWidget(QWidget):
             "missionTime": mission_time,
             "maxTelemDistFt": max_telem_dist_ft,
         }
+        if payload == self._last_plan_flight_metrics_payload:
+            return
+        self._last_plan_flight_metrics_payload = payload
         self._run_js(f"setPlanFlightMetrics({json.dumps(payload)});")
+
+    def refresh_plan_flight_chrome(self, *, link_ok: bool, waypoint_count: int) -> None:
+        self._run_js(
+            "setPlanFlightChromeState("
+            f"{str(bool(link_ok)).lower()}, {max(0, int(waypoint_count))});"
+        )
 
     def center_on_vehicle(self) -> None:
         self._run_js("centerOnVehicle();")
+
+    def set_plan_rail_tool(self, tool: str) -> None:
+        t = (tool or "").strip()
+        if not t:
+            return
+        self._plan_rail_tool_state = t
+        self._run_js(
+            f"window.__planRailTool = {json.dumps(t)}; setPlanRailTool({json.dumps(t)});"
+        )
+
+    def apply_plan_mission_panel_state(self, state: dict[str, object]) -> None:
+        self._run_js(f"applyPlanMissionPanelState({json.dumps(state)});")
+
+    def set_plan_sequence_template(self, template_id: str | None) -> None:
+        """Show/hide Mission tab pattern row (Survey / Corridor / Structure) to match template picks."""
+        tid = (template_id or "").strip().lower()
+        self._run_js(f"setPlanSequenceTemplate({json.dumps(tid)});")
+
+    def set_plan_mission_start_stack(self, enabled: bool, survey_label: str = "Survey") -> None:
+        self._run_js(
+            "setPlanMissionStartStack("
+            f"{str(bool(enabled)).lower()}, {json.dumps(str(survey_label))}"
+            ");"
+        )
+
+    def set_plan_vehicle_info(self, firmware: str, vehicle: str) -> None:
+        key = (str(firmware), str(vehicle))
+        if key == self._last_plan_vehicle_info_key:
+            return
+        self._last_plan_vehicle_info_key = key
+        self._run_js(
+            f"setPlanVehicleInfo({json.dumps(firmware)}, {json.dumps(vehicle)});"
+        )
+
+    def get_default_waypoint_alt_m(self) -> float:
+        return float(self._default_alt.value())
+
+    def set_default_waypoint_alt_m(self, alt_m: float) -> None:
+        self._default_alt.setValue(max(1.0, float(alt_m)))
+
+    def request_mission_upload_from_map(self) -> None:
+        self._request_upload()
+
+    def request_mission_download_from_map(self) -> None:
+        self._request_download()
+
+    def clear_map_waypoints(self) -> None:
+        self._clear_waypoints()
+
+    def clear_plan_current_mission_path(self) -> None:
+        """Forget the Plan Flight JSON path (e.g. after download or generated pattern)."""
+        s = QSettings(_QS_NS, _QS_APP)
+        s.remove(_KEY_PLAN_CURRENT_MISSION_JSON)
+        if s.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
+            s.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
 
     def start_waypoint_planning(self) -> None:
         self._enable_add_waypoint_mode()
@@ -1723,7 +3829,23 @@ class MapWidget(QWidget):
         if HAS_WEBENGINE and QWebEngineView is not None:
             self._web = QWebEngineView()
             self._web.setMinimumHeight(260)
-            self._web.setHtml(self._build_leaflet_html(), QUrl("https://vgcs.local/"))
+            self._web.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+            self._map_canvas.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+            self._map_canvas.setAutoFillBackground(True)
+            if QWebEngineSettings is not None:
+                settings = self._web.settings()
+                settings.setAttribute(
+                    QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
+                )
+                settings.setAttribute(
+                    QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, False
+                )
+                settings.setAttribute(
+                    QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False
+                )
+            assets_root = (Path(__file__).resolve().parents[1] / "assets").resolve()
+            base = QUrl.fromLocalFile(str(assets_root) + "/")
+            self._web.setHtml(self._build_leaflet_html(), base)
             self._web.loadFinished.connect(self._on_map_loaded)
             self._web.titleChanged.connect(self._on_web_title_changed)
             self._map_canvas_layout.addWidget(self._web)
@@ -1740,7 +3862,17 @@ class MapWidget(QWidget):
         self._set_status("Map backend unavailable")
 
     def _build_leaflet_html(self) -> str:
+        """Build map HTML. Image refs are paths relative to the assets/ base URL (see _init_map_backend).
+
+        Large PNGs are not base64-inlined: multi-megabyte data URIs choke Qt WebEngine and yield a blank page.
+        """
         assets_dir = Path(__file__).resolve().parents[1] / "assets"
+        assets_root = assets_dir.resolve()
+
+        def src_under_assets(path: Path) -> str:
+            rel = path.resolve().relative_to(assets_root)
+            return "/".join(quote(part, safe="") for part in rel.parts)
+
         logo_candidates = [
             assets_dir / "Vama Logo.png",
             assets_dir / "vama_logo.jpg",
@@ -1748,17 +3880,22 @@ class MapWidget(QWidget):
         ]
         logo_src = ""
         for p in logo_candidates:
-            if not p.exists():
+            if not p.is_file():
                 continue
+            pr = p.resolve()
             try:
-                raw = p.read_bytes()
-            except Exception:
-                continue
-            if not raw:
-                continue
-            mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
-            logo_src = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-            break
+                logo_src = src_under_assets(pr)
+                break
+            except ValueError:
+                try:
+                    raw = pr.read_bytes()
+                except Exception:
+                    continue
+                if not raw:
+                    continue
+                mime = "image/png" if pr.suffix.lower() == ".png" else "image/jpeg"
+                logo_src = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+                break
         icon_files = {
             "__ICON_HOLD_SRC__": assets_dir / "header_icons" / "hold.svg",
             "__ICON_LINK_SRC__": assets_dir / "header_icons" / "link.svg",
@@ -1768,32 +3905,91 @@ class MapWidget(QWidget):
         }
         icon_data: dict[str, str] = {}
         for token, icon_path in icon_files.items():
-            encoded = ""
+            if not icon_path.is_file():
+                icon_data[token] = ""
+                continue
             try:
-                raw = icon_path.read_bytes()
-                if raw:
-                    encoded = f"data:image/svg+xml;base64,{base64.b64encode(raw).decode('ascii')}"
-            except Exception:
-                encoded = ""
-            icon_data[token] = encoded
+                icon_data[token] = src_under_assets(icon_path)
+            except ValueError:
+                icon_data[token] = ""
+
+        empty_plan_src = ""
+        # Prefer the corrected filename, but keep typo fallback for older local worktrees.
+        for _empty_name in ("empty plan.png", "emtpy plan.png"):
+            ep = assets_dir / _empty_name
+            if ep.is_file():
+                try:
+                    empty_plan_src = src_under_assets(ep)
+                except ValueError:
+                    empty_plan_src = quote(_empty_name, safe="")
+                break
+        survey_p = assets_dir / "survey.png"
+        corr_p = assets_dir / "Corridor Scan.png"
+        stru_p = assets_dir / "Structure Scan.png"
+        plan_tpl_images = {
+            "__PLAN_TPL_EMPTY_SRC__": empty_plan_src,
+            "__PLAN_TPL_SURVEY_SRC__": src_under_assets(survey_p) if survey_p.is_file() else "",
+            "__PLAN_TPL_CORRIDOR_SRC__": src_under_assets(corr_p) if corr_p.is_file() else "",
+            "__PLAN_TPL_STRUCTURE_SRC__": src_under_assets(stru_p) if stru_p.is_file() else "",
+        }
 
         html = LEAFLET_HTML.replace("__LOGO_SRC__", logo_src)
         for token, data_uri in icon_data.items():
+            html = html.replace(token, data_uri)
+        for token, data_uri in plan_tpl_images.items():
             html = html.replace(token, data_uri)
         return html
 
     def _on_map_loaded(self, ok: bool) -> None:
         self._web_ready = bool(ok)
         if self._web_ready:
+            self._last_plan_flight_metrics_payload = None
+            self._last_flight_telemetry_sig = None
+            self._last_link_connected = None
+            self._last_flight_status_key = None
+            self._last_header_gps_key = None
+            self._last_header_battery = None
+            self._last_header_mode = None
+            self._last_plan_vehicle_info_key = None
+            self._vehicle_pose_timer.stop()
             self._set_status("Map ready")
+            t = self._plan_rail_tool_state
+            self._run_js(
+                f"window.__planRailTool = {json.dumps(t)}; setPlanRailTool({json.dumps(t)});"
+            )
+            self.map_page_ready.emit()
         else:
             self._set_status("Map failed to load")
 
     def _on_web_title_changed(self, title: str) -> None:
+        if title.startswith("VGCS_PLAN_EXIT:"):
+            self.plan_flight_exited.emit()
+            self._run_js("disablePlanEditModes(); document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_PLAN_ACTION:"):
+            parts = title.split(":")
+            action = parts[1] if len(parts) >= 2 else ""
+            if action:
+                self.plan_action_requested.emit(action)
+            self._run_js("document.title = 'VGCS Map';")
+            return
         if title.startswith("VGCS_PLAN_TOOL_REQUEST:"):
             parts = title.split(":")
             tool = parts[1] if len(parts) >= 2 else ""
+            if tool:
+                self._plan_rail_tool_state = tool
             self.plan_tool_requested.emit(tool)
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_PLAN_MISSION_PANEL:"):
+            try:
+                raw_b64 = title.split(":", 1)[1].strip()
+                payload = base64.b64decode(raw_b64).decode("utf-8")
+                data = json.loads(payload)
+                if isinstance(data, dict):
+                    self.plan_mission_panel_changed.emit(data)
+            except Exception:
+                pass
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_MENU_REQUEST:"):
@@ -1845,7 +4041,29 @@ class MapWidget(QWidget):
     def _set_status(self, text: str) -> None:
         self._status.setText(f"Map status: {text}")
 
+    def _schedule_vehicle_pose_js(self, *, immediate: bool) -> None:
+        if immediate:
+            self._vehicle_pose_timer.stop()
+            self._flush_vehicle_pose_js()
+            return
+        if not self._vehicle_pose_timer.isActive():
+            self._vehicle_pose_timer.start()
+
+    def _flush_vehicle_pose_js(self) -> None:
+        self._vehicle_pose_timer.stop()
+        if self._lat is None or self._lon is None:
+            return
+        lat = float(self._lat)
+        lon = float(self._lon)
+        hd = float(self._heading) if self._heading is not None else 0.0
+        src = self._heading_js_source or "mixed"
+        self._run_js(
+            f"setVehicle({lat:.8f}, {lon:.8f}); "
+            f"updateHeading({hd:.2f}, undefined, undefined, {json.dumps(src)});"
+        )
+
     def set_vehicle_position(self, lat: float, lon: float, *, relative_alt_m: float | None = None) -> None:
+        first_fix = self._lat is None or self._lon is None
         self._lat = lat
         self._lon = lon
         if relative_alt_m is None:
@@ -1854,13 +4072,23 @@ class MapWidget(QWidget):
             self._coords.setText(
                 f"Lat/Lon: {lat:.7f}, {lon:.7f}  |  Rel Alt: {relative_alt_m:.1f} m"
             )
-        self._run_js(f"setVehicle({lat:.8f}, {lon:.8f});")
-        self._set_status("vehicle marker updated")
+        self._schedule_vehicle_pose_js(immediate=first_fix)
 
-    def set_vehicle_heading(self, heading_deg: float) -> None:
+    def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
         self._heading = heading_deg % 360.0
+        self._heading_js_source = source or "mixed"
         self._heading_label.setText(f"Heading: {self._heading:.1f}°")
-        self._run_js(f"updateHeading({self._heading:.2f});")
+        self._schedule_vehicle_pose_js(immediate=False)
+
+    def clear_flight_track(self) -> None:
+        """Clear the orange breadcrumb trail (e.g. on reconnect / disconnect)."""
+        self._run_js("clearFlightTrack();")
+
+    def set_mission_nav_seq(self, seq: int) -> None:
+        """MAVLink MISSION_CURRENT.seq: trim planned route / sync with vehicle progress."""
+        self._run_js(
+            f"window.__missionNavSeq = {max(0, int(seq))}; updateMissionRoutePolyline();"
+        )
 
     def set_flight_telemetry(
         self,
@@ -1870,11 +4098,19 @@ class MapWidget(QWidget):
         flight_time_text: str,
         msl_alt_m: float,
     ) -> None:
+        ft = f"{float(relative_alt_m) * 3.28084:.1f}"
+        mph = f"{float(ground_speed_mps) * 2.23694:.1f}"
+        ttime = str(flight_time_text)
+        msl_ft = f"{float(msl_alt_m) * 3.28084:.1f}"
+        sig = f"{ft}|{mph}|{ttime}|{msl_ft}"
+        if sig == self._last_flight_telemetry_sig:
+            return
+        self._last_flight_telemetry_sig = sig
         self._run_js(
             "setTelemetryOverlay("
             f"{float(relative_alt_m):.3f}, "
             f"{float(ground_speed_mps):.3f}, "
-            f"{json.dumps(str(flight_time_text))}, "
+            f"{json.dumps(ttime)}, "
             f"{float(msl_alt_m):.3f}"
             ");"
         )
@@ -1890,9 +4126,13 @@ class MapWidget(QWidget):
     def _clear_waypoints(self) -> None:
         self._run_js(
             "clearWaypoints();",
-            callback=lambda _: self._after_waypoints_mutated(),
+            callback=lambda _: self._after_clear_waypoints(),
         )
         self._set_status("waypoints cleared")
+
+    def _after_clear_waypoints(self) -> None:
+        self._after_waypoints_mutated()
+        self.clear_plan_current_mission_path()
 
     def _sync_waypoint_count_from_map(self) -> None:
         self._run_js("JSON.stringify(getWaypoints());", callback=self._on_waypoints_json)
@@ -1904,22 +4144,7 @@ class MapWidget(QWidget):
             self._rebuild_wp_selector()
             self.waypoints_changed.emit([])
             return
-        try:
-            rows = json.loads(payload)
-        except Exception:
-            return
-        waypoints: list[Waypoint] = []
-        for idx, row in enumerate(rows):
-            if not (isinstance(row, list) and len(row) >= 2):
-                continue
-            lat = float(row[0])
-            lon = float(row[1])
-            alt = (
-                self._waypoints_model[idx].alt_m
-                if idx < len(self._waypoints_model)
-                else float(self._default_alt.value())
-            )
-            waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt))
+        waypoints = self._waypoints_from_map_json(payload)
         self._waypoints_model = waypoints
         self.set_mission_waypoint_count(len(waypoints))
         self._rebuild_wp_selector()
@@ -1934,27 +4159,34 @@ class MapWidget(QWidget):
             callback=lambda payload: self._emit_upload_from_json(payload),
         )
 
-    def _emit_upload_from_json(self, payload: str | None) -> None:
+    def _waypoints_from_map_json(self, payload: str | None) -> list[Waypoint]:
         if not payload:
-            self._set_status("No waypoints to upload")
-            return
+            return []
         try:
             rows = json.loads(payload)
-            waypoints = []
-            for idx, row in enumerate(rows):
-                if not (isinstance(row, list) and len(row) >= 2):
-                    continue
-                lat = float(row[0])
-                lon = float(row[1])
-                alt = (
-                    self._waypoints_model[idx].alt_m
-                    if idx < len(self._waypoints_model)
-                    else float(self._default_alt.value())
-                )
-                waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt))
         except Exception:
-            self._set_status("Mission parse error")
-            return
+            return []
+        waypoints: list[Waypoint] = []
+        for idx, row in enumerate(rows):
+            if not (isinstance(row, list) and len(row) >= 2):
+                continue
+            lat = float(row[0])
+            lon = float(row[1])
+            alt = (
+                self._waypoints_model[idx].alt_m
+                if idx < len(self._waypoints_model)
+                else float(self._default_alt.value())
+            )
+            spd = (
+                float(getattr(self._waypoints_model[idx], "speed_mps", 5.0))
+                if idx < len(self._waypoints_model)
+                else float(self._default_speed.value())
+            )
+            waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt, speed_mps=spd))
+        return waypoints
+
+    def _emit_upload_from_json(self, payload: str | None) -> None:
+        waypoints = self._waypoints_from_map_json(payload)
         if not waypoints:
             self._set_status("No waypoints to upload")
             return
@@ -1965,38 +4197,120 @@ class MapWidget(QWidget):
         self.mission_download_requested.emit()
         self._set_status("Mission download requested")
 
+    @staticmethod
+    def _plan_current_mission_path(settings: QSettings) -> str:
+        cur = str(settings.value(_KEY_PLAN_CURRENT_MISSION_JSON, "") or "")
+        if cur:
+            return cur
+        return str(settings.value(_KEY_PLAN_LAST_MISSION_JSON_LEGACY, "") or "")
+
+    def save_plan_mission_json(self, *, save_as: bool) -> None:
+        def cb(payload: str | None) -> None:
+            wps = self._waypoints_from_map_json(payload)
+            if not wps:
+                self._set_status("No waypoints to save")
+                QMessageBox.information(
+                    self,
+                    "Plan Flight",
+                    "There are no waypoints to save. Add waypoints on the map first.",
+                )
+                return
+            settings = QSettings(_QS_NS, _QS_APP)
+            path = ""
+            if not save_as:
+                last = self._plan_current_mission_path(settings)
+                if last:
+                    parent = Path(last).expanduser().resolve().parent
+                    if parent.is_dir():
+                        path = last
+            if not path or save_as:
+                path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "Save current mission as…" if save_as else "Set current mission file…",
+                    self._plan_current_mission_path(settings) or "mission-waypoints.json",
+                    "JSON files (*.json)",
+                )
+                if not path:
+                    return
+            try:
+                save_waypoints_json(path, wps)
+            except Exception:
+                self._set_status("Save failed")
+                QMessageBox.warning(self, "Plan Flight", "Could not save the mission file.")
+                return
+            settings.setValue(_KEY_PLAN_CURRENT_MISSION_JSON, path)
+            if settings.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
+                settings.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
+            self._set_status(f"Current mission saved ({len(wps)} WPs)")
+            QMessageBox.information(
+                self,
+                "Plan saved",
+                f"Saved {len(wps)} waypoint(s) to:\n{path}",
+            )
+
+        self._run_js("JSON.stringify(getWaypoints());", callback=cb)
+
+    def save_plan_mission_kml(self) -> None:
+        def cb(payload: str | None) -> None:
+            wps = self._waypoints_from_map_json(payload)
+            if not wps:
+                self._set_status("No waypoints to export")
+                QMessageBox.information(
+                    self,
+                    "Plan Flight",
+                    "There are no waypoints to export as KML.",
+                )
+                return
+            settings = QSettings(_QS_NS, _QS_APP)
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save mission as KML",
+                str(settings.value("plan_last_mission_kml", "") or "mission-waypoints.kml"),
+                "KML files (*.kml)",
+            )
+            if not path:
+                return
+            try:
+                save_waypoints_kml(path, wps)
+            except Exception:
+                self._set_status("KML export failed")
+                QMessageBox.warning(self, "Plan Flight", "Could not save the KML file.")
+                return
+            settings.setValue("plan_last_mission_kml", path)
+            self._set_status(f"KML saved ({len(wps)} WPs)")
+            QMessageBox.information(
+                self,
+                "Export complete",
+                f"Saved {len(wps)} waypoint(s) as KML:\n{path}",
+            )
+
+        self._run_js("JSON.stringify(getWaypoints());", callback=cb)
+
+
     def _export_mission(self) -> None:
+        settings = QSettings(_QS_NS, _QS_APP)
+        last_export = str(settings.value(_KEY_TOOLBAR_EXPORT_MISSION_JSON, "") or "")
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Export mission waypoints",
-            "mission-waypoints.json",
+            "Export mission to file…",
+            last_export or "mission-waypoints.json",
             "JSON files (*.json)",
         )
         if not path:
             return
 
         def cb(payload: str | None) -> None:
-            if not payload:
+            waypoints = self._waypoints_from_map_json(payload)
+            if not waypoints:
                 self._set_status("No waypoints to export")
                 return
             try:
-                rows = json.loads(payload)
-                waypoints = []
-                for idx, row in enumerate(rows):
-                    if not (isinstance(row, list) and len(row) >= 2):
-                        continue
-                    lat = float(row[0])
-                    lon = float(row[1])
-                    alt = (
-                        self._waypoints_model[idx].alt_m
-                        if idx < len(self._waypoints_model)
-                        else float(self._default_alt.value())
-                    )
-                    waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt))
                 save_waypoints_json(path, waypoints)
-                self._set_status(f"Mission exported ({len(waypoints)} WPs)")
             except Exception:
                 self._set_status("Export failed")
+                return
+            settings.setValue(_KEY_TOOLBAR_EXPORT_MISSION_JSON, path)
+            self._set_status(f"Exported copy to file ({len(waypoints)} WPs)")
 
         self._run_js("JSON.stringify(getWaypoints());", callback=cb)
 
@@ -2018,9 +4332,17 @@ class MapWidget(QWidget):
         self._waypoints_model = list(waypoints)
         js = f"setWaypoints({json.dumps(rows)});"
         self._run_js(js, callback=lambda _: self._after_waypoints_mutated())
-        self._set_status(f"Mission imported ({len(waypoints)} WPs)")
+        s = QSettings(_QS_NS, _QS_APP)
+        s.setValue(_KEY_PLAN_CURRENT_MISSION_JSON, path)
+        if s.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
+            s.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
+        self._set_status(f"Mission opened as current file ({len(waypoints)} WPs)")
 
-    def set_waypoints(self, waypoints: list[Waypoint]) -> None:
+    def set_waypoints(
+        self, waypoints: list[Waypoint], *, clear_plan_current_file: bool = False
+    ) -> None:
+        if clear_plan_current_file:
+            self.clear_plan_current_mission_path()
         rows = [[wp.lat, wp.lon] for wp in waypoints]
         self._waypoints_model = list(waypoints)
         self._run_js(
@@ -2028,6 +4350,44 @@ class MapWidget(QWidget):
             callback=lambda _: self._after_waypoints_mutated(),
         )
         self._set_status(f"Mission loaded ({len(waypoints)} WPs)")
+
+    def get_waypoint_meta(self) -> list[dict[str, float]]:
+        """Per-waypoint meta for the Plan Flight right panel."""
+        out: list[dict[str, float]] = []
+        for wp in self._waypoints_model:
+            out.append(
+                {
+                    "alt_m": float(getattr(wp, "alt_m", 20.0)),
+                    "speed_mps": float(getattr(wp, "speed_mps", 5.0)),
+                }
+            )
+        return out
+
+    def apply_waypoint_meta(self, meta: list[object]) -> None:
+        """Apply per-waypoint alt/speed edits from Plan Flight panel."""
+        if not self._waypoints_model:
+            return
+        changed = False
+        for i, row in enumerate(meta):
+            if i >= len(self._waypoints_model):
+                break
+            if not isinstance(row, dict):
+                continue
+            try:
+                alt_m = float(row.get("alt_m", self._waypoints_model[i].alt_m))
+                spd = float(row.get("speed_mps", getattr(self._waypoints_model[i], "speed_mps", 5.0)))
+            except Exception:
+                continue
+            alt_m = max(1.0, alt_m)
+            spd = max(0.1, spd)
+            if float(self._waypoints_model[i].alt_m) != alt_m:
+                self._waypoints_model[i].alt_m = alt_m
+                changed = True
+            if float(getattr(self._waypoints_model[i], "speed_mps", 5.0)) != spd:
+                setattr(self._waypoints_model[i], "speed_mps", spd)
+                changed = True
+        if changed:
+            self.waypoints_changed.emit(list(self._waypoints_model))
 
     def _rebuild_wp_selector(self) -> None:
         current = self._wp_selector.currentIndex()
@@ -2041,10 +4401,12 @@ class MapWidget(QWidget):
             self._on_wp_selected(self._wp_selector.currentIndex())
         else:
             self._wp_alt.setValue(float(self._default_alt.value()))
+            self._wp_speed.setValue(float(self._default_speed.value()))
 
     def _on_wp_selected(self, index: int) -> None:
         if 0 <= index < len(self._waypoints_model):
             self._wp_alt.setValue(float(self._waypoints_model[index].alt_m))
+            self._wp_speed.setValue(float(getattr(self._waypoints_model[index], "speed_mps", 5.0)))
 
     def _apply_altitude_to_selected(self) -> None:
         idx = self._wp_selector.currentIndex()
@@ -2064,6 +4426,26 @@ class MapWidget(QWidget):
             wp.alt_m = alt
         self.waypoints_changed.emit(list(self._waypoints_model))
         self._set_status(f"Updated all waypoint altitudes to {alt:.1f} m")
+
+    def _apply_speed_to_selected(self) -> None:
+        idx = self._wp_selector.currentIndex()
+        if idx < 0 or idx >= len(self._waypoints_model):
+            self._set_status("No waypoint selected")
+            return
+        spd = max(0.1, float(self._wp_speed.value()))
+        setattr(self._waypoints_model[idx], "speed_mps", spd)
+        self.waypoints_changed.emit(list(self._waypoints_model))
+        self._set_status(f"Updated WP {idx + 1} speed to {spd:.1f} m/s")
+
+    def _apply_speed_to_all(self) -> None:
+        if not self._waypoints_model:
+            self._set_status("No waypoints available")
+            return
+        spd = max(0.1, float(self._wp_speed.value()))
+        for wp in self._waypoints_model:
+            setattr(wp, "speed_mps", spd)
+        self.waypoints_changed.emit(list(self._waypoints_model))
+        self._set_status(f"Updated all waypoint speeds to {spd:.1f} m/s")
 
     def _toggle_3d_mode(self, enabled: bool) -> None:
         active = self.set_3d_enabled(enabled)

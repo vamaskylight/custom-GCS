@@ -22,6 +22,13 @@ AP_COPTER_MODE_MAP = {
     19: "AVOID_ADSB",
     20: "GUIDED_NOGPS",
     21: "SMART_RTL",
+    22: "FLOWHOLD",
+    23: "FOLLOW",
+    24: "ZIGZAG",
+    25: "SYSTEMID",
+    26: "AUTOROTATE",
+    27: "AUTO_RTL",
+    28: "TURTLE",
 }
 
 AP_PLANE_MODE_MAP = {

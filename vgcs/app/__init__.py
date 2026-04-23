@@ -1,1 +1,1 @@
-"""Application shell (PyQt)."""
+"""Application shell (PySide6 / Qt)."""

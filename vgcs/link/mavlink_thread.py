@@ -6,6 +6,7 @@ Runs blocking pymavlink I/O off the GUI thread and emits decoded telemetry.
 
 from __future__ import annotations
 
+import math
 import re
 import threading
 import time
@@ -44,6 +45,8 @@ class MavlinkThread(QThread):
         self._target_compid = 1
         self._cmd_lock = threading.Lock()
         self._cmd_queue: deque[tuple[str, object]] = deque()
+        self._last_gcs_heartbeat_mono = 0.0
+        self._streams_requested = False
 
     def queue_mission_upload(self, waypoints: list[dict]) -> None:
         with self._cmd_lock:
@@ -57,6 +60,10 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("mission_start", None))
 
+    def queue_arm(self, arm: bool = True) -> None:
+        with self._cmd_lock:
+            self._cmd_queue.append(("arm", bool(arm)))
+
     def queue_mode_change(self, mode_name: str) -> None:
         with self._cmd_lock:
             self._cmd_queue.append(("mode_change", mode_name.strip()))
@@ -68,6 +75,14 @@ class MavlinkThread(QThread):
     def queue_land(self) -> None:
         with self._cmd_lock:
             self._cmd_queue.append(("land", None))
+
+    def queue_auto_takeoff(self, altitude_m: float) -> None:
+        with self._cmd_lock:
+            self._cmd_queue.append(("auto_takeoff", float(altitude_m)))
+
+    def queue_auto_land(self) -> None:
+        with self._cmd_lock:
+            self._cmd_queue.append(("auto_land", None))
 
     def queue_geofence_upload(self, cfg: dict) -> None:
         with self._cmd_lock:
@@ -160,12 +175,17 @@ class MavlinkThread(QThread):
 
         self.link_up.emit()
         self.log_line.emit("Socket open; waiting for MAVLink telemetry...")
+        try:
+            self._send_gcs_heartbeat()
+        except Exception:
+            pass
 
         last_hb = 0.0
         last_msg = time.monotonic()
         timeout_notified = False
         while self._running and self._master is not None:
             self._process_pending_commands()
+            self._maybe_send_gcs_heartbeat()
             try:
                 msg = self._master.recv_match(
                     blocking=True,
@@ -220,6 +240,17 @@ class MavlinkThread(QThread):
                         "autopilot": int(getattr(msg, "autopilot", 0) or 0),
                     },
                 )
+                if not self._streams_requested and int(self._target_sysid) > 0:
+                    self._streams_requested = True
+                    try:
+                        self._request_telemetry_streams()
+                    except Exception:
+                        pass
+            elif msg_type == "MISSION_CURRENT":
+                self.telemetry.emit(
+                    "MISSION_CURRENT",
+                    {"seq": int(getattr(msg, "seq", 0) or 0)},
+                )
             elif msg_type == "STATUSTEXT":
                 self.telemetry.emit(
                     "STATUSTEXT",
@@ -249,15 +280,27 @@ class MavlinkThread(QThread):
                     },
                 )
             elif msg_type == "GLOBAL_POSITION_INT":
-                self.telemetry.emit(
-                    "GLOBAL_POSITION_INT",
-                    {
-                        "lat": float(getattr(msg, "lat", 0) or 0) / 1e7,
-                        "lon": float(getattr(msg, "lon", 0) or 0) / 1e7,
-                        "relative_alt_m": float(getattr(msg, "relative_alt", 0) or 0) / 1000.0,
-                        "alt_msl_m": float(getattr(msg, "alt", 0) or 0) / 1000.0,
-                    },
-                )
+                vx = float(getattr(msg, "vx", 0) or 0)
+                vy = float(getattr(msg, "vy", 0) or 0)
+                spd_cm = math.hypot(vx, vy)
+                gt_deg: float | None = None
+                if spd_cm > 50.0:
+                    gt_deg = (math.degrees(math.atan2(vy, vx)) + 360.0) % 360.0
+                raw_hdg = int(getattr(msg, "hdg", 0) or 0)
+                hdg_deg: float | None = None
+                if raw_hdg != 65535:
+                    hdg_deg = (raw_hdg / 100.0) % 360.0
+                gpi: dict[str, object] = {
+                    "lat": float(getattr(msg, "lat", 0) or 0) / 1e7,
+                    "lon": float(getattr(msg, "lon", 0) or 0) / 1e7,
+                    "relative_alt_m": float(getattr(msg, "relative_alt", 0) or 0) / 1000.0,
+                    "alt_msl_m": float(getattr(msg, "alt", 0) or 0) / 1000.0,
+                }
+                if hdg_deg is not None:
+                    gpi["hdg_deg"] = hdg_deg
+                if gt_deg is not None:
+                    gpi["ground_track_deg"] = gt_deg
+                self.telemetry.emit("GLOBAL_POSITION_INT", gpi)
             elif msg_type == "GPS_RAW_INT":
                 eph_raw = int(getattr(msg, "eph", 0xFFFF) or 0xFFFF)
                 hdop = None if eph_raw >= 0xFFFF else float(eph_raw) / 100.0
@@ -344,12 +387,18 @@ class MavlinkThread(QThread):
                 self._mission_download()
             elif cmd == "mission_start":
                 self._mission_start()
+            elif cmd == "arm":
+                self._arm_disarm(bool(payload))
             elif cmd == "mode_change":
                 self._mode_change(str(payload or ""))
             elif cmd == "takeoff":
                 self._takeoff(float(payload or 0.0))
             elif cmd == "land":
                 self._land()
+            elif cmd == "auto_takeoff":
+                self._auto_takeoff(float(payload or 0.0))
+            elif cmd == "auto_land":
+                self._auto_land()
             elif cmd == "geofence_upload":
                 self._geofence_upload(payload if isinstance(payload, dict) else {})
             elif cmd == "params_fetch":
@@ -360,6 +409,128 @@ class MavlinkThread(QThread):
         except Exception as e:
             self.error.emit(f"Link command failed ({cmd}): {e}")
 
+    def _sync_link_targets(self) -> None:
+        """Align pymavlink routing with the last vehicle HEARTBEAT (sys/comp)."""
+        if self._master is None:
+            return
+        if self._target_sysid > 0:
+            self._master.target_system = self._target_sysid
+        self._master.target_component = self._target_compid
+
+    def _send_gcs_heartbeat(self) -> None:
+        if self._master is None:
+            return
+        self._master.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            0,
+            0,
+            mavutil.mavlink.MAV_STATE_ACTIVE,
+        )
+        self._last_gcs_heartbeat_mono = time.monotonic()
+
+    def _maybe_send_gcs_heartbeat(self, interval_s: float = 1.0) -> None:
+        """ArduPilot/MAVProxy expect a GCS HEARTBEAT; mission handshakes can stall without it."""
+        if self._master is None:
+            return
+        now = time.monotonic()
+        if now - self._last_gcs_heartbeat_mono < interval_s:
+            return
+        try:
+            self._send_gcs_heartbeat()
+        except Exception:
+            pass
+
+    def _request_telemetry_streams(self) -> None:
+        """Ask the vehicle for position / attitude rates (VGCS map uses GLOBAL_POSITION_INT)."""
+        if self._master is None:
+            return
+        self._sync_link_targets()
+        ts = int(self._target_sysid)
+        tc = int(self._target_compid)
+        hz = 5
+        try:
+            self._master.mav.request_data_stream_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_DATA_STREAM_POSITION,
+                hz,
+                1,
+            )
+            self._master.mav.request_data_stream_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
+                hz,
+                1,
+            )
+            self.log_line.emit(f"Requested MAV_DATA_STREAM_POSITION/EXTRA1 @ {hz} Hz")
+        except Exception as e:
+            self.log_line.emit(f"request_data_stream_send failed: {e}")
+        try:
+            interval_us = int(1_000_000 / max(1, hz))
+            self._master.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                float(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT),
+                float(interval_us),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            self._master.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                float(mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT),
+                float(interval_us),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        except Exception:
+            pass
+
+    def _mission_clear_for_upload_best_effort(self) -> None:
+        """Clear mission on vehicle before upload; avoids half-open mission sessions."""
+        if self._master is None:
+            return
+        self._sync_link_targets()
+        try:
+            self._master.mav.mission_clear_all_send(
+                self._target_sysid,
+                self._target_compid,
+                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+            )
+        except TypeError:
+            self._master.mav.mission_clear_all_send(
+                self._target_sysid,
+                self._target_compid,
+            )
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and self._running and self._master is not None:
+            self._maybe_send_gcs_heartbeat()
+            ack = self._master.recv_match(
+                type=["MISSION_ACK"],
+                blocking=True,
+                timeout=0.35,
+            )
+            if ack is None:
+                continue
+            mt = int(getattr(ack, "mission_type", 0) or 0)
+            if mt != int(mavutil.mavlink.MAV_MISSION_TYPE_MISSION):
+                continue
+            break
+
     def _mission_upload(self, waypoints: list[dict]) -> None:
         if self._master is None:
             self.error.emit("Mission upload: link not ready")
@@ -368,56 +539,120 @@ class MavlinkThread(QThread):
             self.error.emit("Mission upload: no waypoints")
             return
 
-        # Build an executable mission sequence for Copter-style workflows:
-        # NAV_TAKEOFF (seq 0) + NAV_WAYPOINT items from planned points.
+        # ArduPilot AP_Mission: MAVLink index 0 is reserved for HOME — uploads to seq 0
+        # are not stored as mission nav commands. The first real nav command is index 1
+        # (AP_MISSION_FIRST_REAL_COMMAND). Put NAV_TAKEOFF at seq 1 or AUTO reports
+        # "Missing Takeoff Cmd".
         mission_items: list[dict] = []
         first = waypoints[0]
+        first_nav_alt = max(1.0, float(first.get("alt_m", 20.0)))
+        # Optional: climb target for NAV_TAKEOFF (start / launch altitude), distinct from WP1 cruise alt.
+        to_m = first.get("takeoff_alt_m", None)
+        if to_m is None:
+            takeoff_alt_m = first_nav_alt
+        else:
+            takeoff_alt_m = max(1.0, float(to_m))
+        mission_items.append(
+            {
+                "cmd": int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT),
+                "lat": float(first.get("lat", 0.0)),
+                "lon": float(first.get("lon", 0.0)),
+                "alt_m": first_nav_alt,
+            }
+        )
         mission_items.append(
             {
                 "cmd": int(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF),
-                "lat": float(first.get("lat", 0.0)),
-                "lon": float(first.get("lon", 0.0)),
-                "alt_m": max(1.0, float(first.get("alt_m", 20.0))),
+                "lat": 0.0,
+                "lon": 0.0,
+                "alt_m": takeoff_alt_m,
             }
         )
         for wp in waypoints:
+            spd = float(wp.get("speed_mps", 5.0) or 5.0)
+            mission_items.append(
+                {
+                    "cmd": int(mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED),
+                    "lat": 0.0,
+                    "lon": 0.0,
+                    "alt_m": 0.0,
+                    # param1: 1=groundspeed, param2: speed (m/s), param3: throttle (-1 no change)
+                    "p1": 1.0,
+                    "p2": max(0.1, spd),
+                    "p3": -1.0,
+                    "p4": 0.0,
+                }
+            )
             mission_items.append(
                 {
                     "cmd": int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT),
                     "lat": float(wp.get("lat", 0.0)),
                     "lon": float(wp.get("lon", 0.0)),
                     "alt_m": max(1.0, float(wp.get("alt_m", 20.0))),
+                    "p1": 0.0,
+                    "p2": 0.0,
+                    "p3": 0.0,
+                    "p4": 0.0,
                 }
             )
 
         count = len(mission_items)
-        self.log_line.emit(f"Mission upload start: {len(waypoints)} WPs ({count} mission items)")
-        try:
-            self._master.mav.mission_count_send(
-                self._target_sysid,
-                self._target_compid,
-                count,
-                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
-            )
-        except TypeError:
-            self._master.mav.mission_count_send(
-                self._target_sysid,
-                self._target_compid,
-                count,
-            )
+        self.log_line.emit(
+            f"Mission upload start: {len(waypoints)} WPs ({count} mission items incl. home slot + takeoff)"
+        )
+        self._sync_link_targets()
+        self._mission_clear_for_upload_best_effort()
+
+        def send_mission_count() -> None:
+            try:
+                self._master.mav.mission_count_send(
+                    self._target_sysid,
+                    self._target_compid,
+                    count,
+                    mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+                )
+            except TypeError:
+                self._master.mav.mission_count_send(
+                    self._target_sysid,
+                    self._target_compid,
+                    count,
+                )
+
+        send_mission_count()
 
         sent = 0
         started = time.monotonic()
+        last_count_tx = time.monotonic()
         while sent < count and self._running and self._master is not None:
+            self._maybe_send_gcs_heartbeat()
+            now = time.monotonic()
+            if sent == 0 and (now - last_count_tx) >= 2.0:
+                send_mission_count()
+                last_count_tx = now
+                self.log_line.emit("Mission upload: resend MISSION_COUNT (waiting vehicle request)")
+
             req = self._master.recv_match(
-                type=["MISSION_REQUEST_INT", "MISSION_REQUEST"],
+                type=["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"],
                 blocking=True,
-                timeout=2.0,
+                timeout=1.0,
             )
             if req is None:
-                if time.monotonic() - started > 20.0:
+                if time.monotonic() - started > 25.0:
                     raise TimeoutError("mission upload timeout waiting request")
                 continue
+
+            if req.get_type() == "MISSION_ACK":
+                mt = int(getattr(req, "mission_type", 0) or 0)
+                if mt != int(mavutil.mavlink.MAV_MISSION_TYPE_MISSION):
+                    continue
+                ack_type = int(getattr(req, "type", mavutil.mavlink.MAV_MISSION_ERROR))
+                if ack_type != int(mavutil.mavlink.MAV_MISSION_ACCEPTED):
+                    raise RuntimeError(
+                        f"mission upload rejected (MAV_MISSION_RESULT={ack_type})"
+                    )
+                # Stray ACCEPTED (e.g. late clear ACK) — keep waiting for MISSION_REQUEST.
+                continue
+
             seq = int(getattr(req, "seq", sent) or sent)
             if seq < 0 or seq >= count:
                 continue
@@ -426,19 +661,23 @@ class MavlinkThread(QThread):
             lon = float(item.get("lon", 0.0))
             alt = float(item.get("alt_m", 20.0))
             cmd = int(item.get("cmd", int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT)))
+            p1 = float(item.get("p1", 0.0))
+            p2 = float(item.get("p2", 0.0))
+            p3 = float(item.get("p3", 0.0))
+            p4 = float(item.get("p4", 0.0))
             try:
                 self._master.mav.mission_item_int_send(
                     self._target_sysid,
                     self._target_compid,
                     seq,
-                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
                     cmd,
-                    1 if seq == 0 else 0,
+                    0,
                     1,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
+                    p1,
+                    p2,
+                    p3,
+                    p4,
                     int(lat * 1e7),
                     int(lon * 1e7),
                     alt,
@@ -449,14 +688,14 @@ class MavlinkThread(QThread):
                     self._target_sysid,
                     self._target_compid,
                     seq,
-                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
                     cmd,
-                    1 if seq == 0 else 0,
+                    0,
                     1,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
+                    p1,
+                    p2,
+                    p3,
+                    p4,
                     int(lat * 1e7),
                     int(lon * 1e7),
                     alt,
@@ -466,7 +705,7 @@ class MavlinkThread(QThread):
         ack = self._master.recv_match(
             type=["MISSION_ACK"],
             blocking=True,
-            timeout=3.0,
+            timeout=5.0,
         )
         if ack is None:
             raise TimeoutError("mission upload timeout waiting ACK")
@@ -564,18 +803,66 @@ class MavlinkThread(QThread):
             self.mode_changed.emit(mode_name, False)
             self.error.emit(f"Mode change failed: {e}")
 
+    def _ensure_armable_mode_before_arm(self) -> None:
+        """ArduCopter rejects arming in AUTO; switch to a manual mode first (SITL/GCS)."""
+        if self._master is None:
+            return
+        for mode in ("STABILIZE", "ALT_HOLD", "LOITER"):
+            try:
+                self._master.set_mode(mode)
+                self.log_line.emit(f"Pre-arm: switched to {mode} (required to arm)")
+                time.sleep(0.15)
+                return
+            except Exception:
+                continue
+
+    def _wait_vehicle_armed(self, timeout_s: float = 8.0) -> bool:
+        """Poll HEARTBEAT until vehicle reports SAFETY_ARMED or timeout."""
+        if self._master is None:
+            return False
+        deadline = time.monotonic() + timeout_s
+        while self._running and self._master is not None and time.monotonic() < deadline:
+            self._maybe_send_gcs_heartbeat()
+            msg = self._master.recv_match(
+                type=["HEARTBEAT"],
+                blocking=True,
+                timeout=0.35,
+            )
+            if msg is None:
+                continue
+            if int(msg.get_srcSystem()) != int(self._target_sysid):
+                continue
+            if bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+                return True
+        return False
+
     def _mission_start(self) -> None:
         if self._master is None:
             self.action_result.emit("mission_start", False, "Link not ready")
             self.error.emit("Mission start: link not ready")
             return
         try:
-            # ArduPilot mission navigation requires AUTO mode + mission start command.
-            # Ensure mission index starts at first item.
+            self._sync_link_targets()
+            self._ensure_armable_mode_before_arm()
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                p1=1.0,
+            )
+            if not self._wait_vehicle_armed():
+                # ArduPilot SITL: force-arm magic in param2 when pre-arm checks block normal arm.
+                self.log_line.emit("Mission start: retry ARM with force override (param2=21196)")
+                self._send_command_long(
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    p1=1.0,
+                    p2=21196.0,
+                )
+                if not self._wait_vehicle_armed(6.0):
+                    raise TimeoutError("arm timeout (still disarmed after arm command)")
+            # Start at first *stored* nav command (seq 1); seq 0 is home-only in ArduPilot.
             self._master.mav.mission_set_current_send(
                 self._target_sysid,
                 self._target_compid,
-                0,
+                1,
             )
             self._master.set_mode("AUTO")
             self._send_command_long(
@@ -588,6 +875,25 @@ class MavlinkThread(QThread):
         except Exception as e:
             self.action_result.emit("mission_start", False, str(e))
             self.error.emit(f"Mission start failed: {e}")
+
+    def _arm_disarm(self, arm: bool) -> None:
+        if self._master is None:
+            self.action_result.emit("arm", False, "Link not ready")
+            self.error.emit("Arm: link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            if arm:
+                self._ensure_armable_mode_before_arm()
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                p1=1.0 if arm else 0.0,
+            )
+            self.action_result.emit("arm", True, "ARM sent" if arm else "DISARM sent")
+            self.log_line.emit("Arm command sent" if arm else "Disarm command sent")
+        except Exception as e:
+            self.action_result.emit("arm", False, str(e))
+            self.error.emit(f"Arm failed: {e}")
 
     def _send_command_long(
         self,
@@ -617,27 +923,85 @@ class MavlinkThread(QThread):
             p7,
         )
 
+    def _send_nav_takeoff(self, altitude_m: float) -> None:
+        alt = max(1.0, float(altitude_m))
+        self._sync_link_targets()
+        self._send_command_long(
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            p7=alt,
+        )
+
     def _takeoff(self, altitude_m: float) -> None:
         alt = max(1.0, float(altitude_m))
         try:
-            self._send_command_long(
-                mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                p7=alt,
-            )
+            self._send_nav_takeoff(alt)
             self.action_result.emit("takeoff", True, f"Target alt {alt:.1f} m")
             self.log_line.emit(f"Takeoff command sent: alt={alt:.1f}m")
         except Exception as e:
             self.action_result.emit("takeoff", False, str(e))
             self.error.emit(f"Takeoff failed: {e}")
 
+    def _send_nav_land(self) -> None:
+        self._sync_link_targets()
+        self._send_command_long(mavutil.mavlink.MAV_CMD_NAV_LAND)
+
     def _land(self) -> None:
         try:
-            self._send_command_long(mavutil.mavlink.MAV_CMD_NAV_LAND)
+            self._send_nav_land()
             self.action_result.emit("land", True, "Landing command sent")
             self.log_line.emit("Land command sent")
         except Exception as e:
             self.action_result.emit("land", False, str(e))
             self.error.emit(f"Land failed: {e}")
+
+    def _auto_takeoff(self, altitude_m: float) -> None:
+        if self._master is None:
+            self.action_result.emit("auto_takeoff", False, "Link not ready")
+            self.error.emit("Auto takeoff: link not ready")
+            return
+        try:
+            self._sync_link_targets()
+            self._ensure_armable_mode_before_arm()
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                p1=1.0,
+            )
+            if not self._wait_vehicle_armed():
+                self.log_line.emit("Auto takeoff: retry ARM with force override (param2=21196)")
+                self._send_command_long(
+                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                    p1=1.0,
+                    p2=21196.0,
+                )
+                if not self._wait_vehicle_armed(6.0):
+                    raise TimeoutError("arm timeout (still disarmed after arm command)")
+            alt = max(1.0, float(altitude_m))
+            self._send_nav_takeoff(alt)
+            self.action_result.emit("auto_takeoff", True, f"Armed + takeoff {alt:.1f} m")
+            self.log_line.emit(f"Auto takeoff: armed + NAV_TAKEOFF {alt:.1f} m")
+        except Exception as e:
+            self.action_result.emit("auto_takeoff", False, str(e))
+            self.error.emit(f"Auto takeoff failed: {e}")
+
+    def _auto_land(self) -> None:
+        if self._master is None:
+            self.action_result.emit("auto_land", False, "Link not ready")
+            self.error.emit("Auto land: link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            self._master.set_mode("LAND")
+            self.action_result.emit("auto_land", True, "LAND mode engaged")
+            self.log_line.emit("Auto land: LAND mode")
+        except Exception as e:
+            self.log_line.emit(f"Auto land: LAND mode failed ({e}); sending NAV_LAND")
+            try:
+                self._send_nav_land()
+                self.action_result.emit("auto_land", True, "NAV_LAND command sent")
+                self.log_line.emit("Auto land: NAV_LAND sent")
+            except Exception as e2:
+                self.action_result.emit("auto_land", False, str(e2))
+                self.error.emit(f"Auto land failed: {e2}")
 
     def _param_set_value(self, name: str, value: float) -> None:
         if self._master is None:
