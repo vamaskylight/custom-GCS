@@ -1348,9 +1348,9 @@ class MainWindow(QMainWindow):
         action_analyze = menu.addAction("Analyze Tools")
         action_analyze.setToolTip("Post-flight and real-time data review.")
         action_analyze.setIcon(self._menu_icon("analyze_tools.svg"))
-        action_flight = menu.addAction("Flight Controls")
-        action_flight.setToolTip("Mode, takeoff/land, and assist features (AirMode, Simple, …).")
-        action_flight.setIcon(self._menu_icon("flight_mode.svg"))
+        action_vehicle = menu.addAction("Vehicle Configuration")
+        action_vehicle.setToolTip("Vehicle setup tools, including sensor calibration and quick controls.")
+        action_vehicle.setIcon(self._menu_icon("flight_mode.svg"))
         action_settings = menu.addAction("Application Settings")
         action_settings.setToolTip("GCS-specific preferences.")
         action_settings.setIcon(self._menu_icon("app_settings.svg"))
@@ -1394,9 +1394,9 @@ class MainWindow(QMainWindow):
             report = self._build_analyze_tools_report()
             QMessageBox.information(self, "Analyze Tools", report)
             self._append_log("Menu: Analyze Tools")
-        elif picked is action_flight:
+        elif picked is action_vehicle:
             self._show_flight_controls_dialog()
-            self._append_log("Menu: Flight Controls")
+            self._append_log("Menu: Vehicle Configuration")
         elif picked is action_settings:
             self._append_log("Menu: Application Setting — connection & theme")
             self._scroll_main_to(self._link_box)
@@ -1451,7 +1451,7 @@ class MainWindow(QMainWindow):
 
     def _show_flight_controls_dialog(self, *, open_advanced: bool = False) -> None:
         dlg = QDialog(self)
-        dlg.setWindowTitle("Flight Controls")
+        dlg.setWindowTitle("Vehicle Configuration")
         dlg.setModal(True)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(12, 12, 12, 12)
@@ -1460,6 +1460,53 @@ class MainWindow(QMainWindow):
         can_send = bool(self._thread is not None and self._thread.isRunning())
         if not can_send:
             lay.addWidget(QLabel("Connect vehicle to enable commands."))
+
+        # Sensor calibration
+        cal_group = QGroupBox("Sensor calibration")
+        cal_lay = QVBoxLayout()
+        cal_lay.setSpacing(6)
+        cal_hint = QLabel("Tip: keep the vehicle still unless prompted otherwise.")
+        cal_hint.setStyleSheet("color: #444444;")
+        cal_lay.addWidget(cal_hint)
+
+        cal_btn_row1 = QHBoxLayout()
+        btn_cal_accel = QPushButton("Accelerometer")
+        btn_cal_compass = QPushButton("Compass")
+        btn_cal_gyro = QPushButton("Gyro")
+        cal_btn_row1.addWidget(btn_cal_accel)
+        cal_btn_row1.addWidget(btn_cal_compass)
+        cal_btn_row1.addWidget(btn_cal_gyro)
+        cal_lay.addLayout(cal_btn_row1)
+
+        cal_btn_row2 = QHBoxLayout()
+        btn_cal_baro = QPushButton("Barometer")
+        btn_cal_rc = QPushButton("RC")
+        cal_btn_row2.addWidget(btn_cal_baro)
+        cal_btn_row2.addWidget(btn_cal_rc)
+        cal_btn_row2.addStretch()
+        cal_lay.addLayout(cal_btn_row2)
+
+        for b in (btn_cal_accel, btn_cal_compass, btn_cal_gyro, btn_cal_baro, btn_cal_rc):
+            b.setEnabled(can_send)
+
+        def _queue_cal(kind: str) -> None:
+            if self._thread is None or not self._thread.isRunning():
+                QMessageBox.warning(self, "VGCS", "Connect vehicle before calibration.")
+                return
+            try:
+                self._thread.queue_preflight_calibration(kind)
+                self._append_log(f"Calibration queued: {kind}")
+            except Exception as e:
+                QMessageBox.warning(self, "VGCS", f"Calibration failed to queue: {e}")
+
+        btn_cal_accel.clicked.connect(lambda: _queue_cal("accel"))
+        btn_cal_compass.clicked.connect(lambda: _queue_cal("compass"))
+        btn_cal_gyro.clicked.connect(lambda: _queue_cal("gyro"))
+        btn_cal_baro.clicked.connect(lambda: _queue_cal("baro"))
+        btn_cal_rc.clicked.connect(lambda: _queue_cal("rc"))
+
+        cal_group.setLayout(cal_lay)
+        lay.addWidget(cal_group)
 
         # Flight mode + commands
         title = QLabel("Flight mode")

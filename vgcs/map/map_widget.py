@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from urllib.parse import quote
 
-from PySide6.QtCore import QPoint, QSettings, QTimer, Qt, QUrl
+from PySide6.QtCore import QByteArray, QBuffer, QPoint, QSettings, QTimer, Qt, QUrl
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -29,21 +29,36 @@ from vgcs.mission import (
     save_waypoints_kml,
 )
 
+# Optional: live camera preview for map overlay.
+try:
+    from PySide6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaDevices, QVideoSink
+
+    HAS_MULTIMEDIA = True
+except Exception:  # pragma: no cover - depends on platform build
+    QCamera = None  # type: ignore[assignment]
+    QMediaCaptureSession = None  # type: ignore[assignment]
+    QMediaDevices = None  # type: ignore[assignment]
+    QVideoSink = None  # type: ignore[assignment]
+    HAS_MULTIMEDIA = False
+
 # QSettings: Plan Flight Save vs map toolbar export use different "last file" keys.
 _QS_NS = "VGCS"
 _QS_APP = "VGCS"
 _KEY_PLAN_CURRENT_MISSION_JSON = "plan_current_mission_json"
 _KEY_TOOLBAR_EXPORT_MISSION_JSON = "toolbar_export_mission_json"
 _KEY_PLAN_LAST_MISSION_JSON_LEGACY = "plan_last_mission_json"  # legacy; read fallback only
+_KEY_MAP_OFFLINE_TILE_ROOT = "map_offline_tile_root"
 
 
 try:
     from PySide6.QtWebEngineCore import QWebEngineSettings
+    from PySide6.QtWebEngineCore import QWebEngineProfile
     from PySide6.QtWebEngineWidgets import QWebEngineView
 
     HAS_WEBENGINE = True
 except Exception:  # pragma: no cover - environment-specific availability
     QWebEngineSettings = None  # type: ignore[assignment,misc]
+    QWebEngineProfile = None  # type: ignore[assignment,misc]
     QWebEngineView = None  # type: ignore[assignment]
     HAS_WEBENGINE = False
 
@@ -61,7 +76,9 @@ LEAFLET_HTML = """<!doctype html>
     #mapWrap { position: relative; overflow: hidden; z-index: 0; }
     #map2d, #map3d { position: absolute; inset: 0; }
     #map3d { display: none; }
-    .leaflet-control-attribution { background: rgba(26,29,36,0.7); color:#a8b0c4; }
+    .leaflet-control-attribution {
+      display: none !important;
+    }
     .overlay { position:absolute; z-index:1200; font-family: "Segoe UI", Arial, sans-serif; }
     #linkBanner {
       top:0; left:0; right:0; min-height:46px; padding:8px 12px; border-radius:0;
@@ -950,24 +967,78 @@ LEAFLET_HTML = """<!doctype html>
       color: currentColor;
     }
     /* Bottom HUD: compass (racchip) bottom-right; telemetry on a single orbit (no duplicate strips). */
+    /* Bottom HUD: lock compass to bottom-right; telemetry strip pinned next to it (Qt WebEngine-safe). */
     #mapFooterHud {
       position: absolute;
-      left: 0;
-      right: 0;
-      bottom: 8px;
+      right: 10px;
+      bottom: 2px;
       z-index: 1210;
-      display: flex;
-      flex-direction: row;
-      align-items: flex-end;
-      justify-content: flex-end;
-      flex-wrap: wrap;
-      gap: 0;
-      padding-right: 10px;
+      width: 312px;
+      height: 312px;
       pointer-events: none;
       font-family: "Segoe UI", Arial, sans-serif;
+      --compass-size: 176px;
+      --hud-gap: 12px; /* minimum spacing between telemetry and compass */
+    }
+    #telemetryLeftStack {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      position: absolute;
+      /* Anchor relative to the compass circle (not the whole 312px HUD box).
+         HUD box: 312px; compass: 176px centered => compass left edge is 68px from HUD left.
+         We want telemetry's RIGHT edge to sit left of compass edge by --hud-gap.
+         For a HUD box of width W and compass diameter C, this is:
+           right = (W + C) / 2 + gap
+      */
+      left: auto;
+      right: calc((100% + var(--compass-size)) / 2 + var(--hud-gap));
+      bottom: 44px;              /* move strip up */
+      transform: none;
+      pointer-events: none;
+    }
+    #telemetryStrip {
+      display: grid;
+      grid-template-columns: repeat(3, max-content);
+      gap: 6px 8px;
+      padding: 6px 10px;
+      border-radius: 12px;
+      background: rgba(26, 33, 45, 0.84);
+      border: 1px solid rgba(80, 92, 118, 0.42);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.28);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      pointer-events: none;
+    }
+    .telStackItem {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 8px;
+      padding: 2px;
+      border-radius: 0;
+      background: transparent;
+      color: #dce5f5;
+      font-size: 15px;
+      line-height: 1.25;
+      white-space: nowrap;
+      box-shadow: none;
+      border: 0;
+      min-width: 0;
+      pointer-events: none;
+    }
+    .telStackItem .telemetryIcon {
+      font-size: 15px;
+      opacity: 0.95;
+    }
+    .telStackItem .telemetryIconHuman {
+      font-size: 16px;
+      opacity: 0.95;
     }
     #compassHud {
-      position: relative;
+      position: absolute;
+      right: 0;
+      bottom: -18px; /* move only compass down more */
       width: 312px;
       height: 312px;
       flex-shrink: 0;
@@ -1007,8 +1078,8 @@ LEAFLET_HTML = """<!doctype html>
       left: 50%;
       top: 50%;
       transform: translate(-50%, -50%);
-      width: 176px;
-      height: 176px;
+      width: var(--compass-size);
+      height: var(--compass-size);
       flex-shrink: 0;
       background: transparent;
       display: flex;
@@ -1883,13 +1954,17 @@ LEAFLET_HTML = """<!doctype html>
       <div id="videoPreviewPlaceholder">Video</div>
     </div>
     <div id="mapFooterHud" aria-hidden="false">
+      <div id="telemetryLeftStack" aria-hidden="true">
+        <div id="telemetryStrip">
+          <div class="telStackItem"><span class="telemetryIcon">↕</span><span class="telRow1Alt">0.0 ft</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">↑</span><span class="telRow1Mph">0.0 mph</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">⏱</span><span class="telRow1Time">00:00:00</span></div>
+          <div class="telStackItem"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span class="telRow2Msl">0.0 ft</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">→</span><span class="telRow2Mph">0.0 mph</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">↳</span><span class="telRow2Alt">0.0 ft</span></div>
+        </div>
+      </div>
       <div id="compassHud">
-        <div class="telOrbitItem" style="--oa:-90deg"><span class="telemetryIcon">↕</span><span class="telRow1Alt">0.0 ft</span></div>
-        <div class="telOrbitItem" style="--oa:-30deg"><span class="telemetryIcon">↑</span><span class="telRow1Mph">0.0 mph</span></div>
-        <div class="telOrbitItem" style="--oa:30deg"><span class="telemetryIcon">⏱</span><span class="telRow1Time">00:00:00</span></div>
-        <div class="telOrbitItem" style="--oa:90deg"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span class="telRow2Msl">0.0 ft</span></div>
-        <div class="telOrbitItem" style="--oa:150deg"><span class="telemetryIcon">→</span><span class="telRow2Mph">0.0 mph</span></div>
-        <div class="telOrbitItem" style="--oa:210deg"><span class="telemetryIcon">↳</span><span class="telRow2Alt">0.0 ft</span></div>
         <div id="compass">
           <div id="compassInner">
             <span class="compassCard" id="cN">N</span><span class="compassCard" id="cE">E</span><span class="compassCard" id="cS">S</span><span class="compassCard" id="cW">W</span>
@@ -2121,12 +2196,35 @@ LEAFLET_HTML = """<!doctype html>
       });
     }
     let tileLayer = null;
+    let labelLayer = null;
+    const LABELS_TEMPLATE_ESRI =
+      'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
     function setTileSource(urlTemplate, attribution, maxZoom) {
       if (tileLayer) map.removeLayer(tileLayer);
+      if (labelLayer) map.removeLayer(labelLayer);
       tileLayer = L.tileLayer(urlTemplate, {
         maxZoom: maxZoom || 19,
-        attribution: attribution || ''
+        attribution: attribution || '',
+        // Performance: reduce tile churn while panning/zooming in Qt WebEngine.
+        updateWhenIdle: true,
+        updateWhenZooming: false,
+        keepBuffer: 4
       }).addTo(map);
+      // Add borders + place labels overlay (transparent tiles) to match client reference.
+      // Works best over satellite imagery; safe to keep enabled for other sources too.
+      try {
+        labelLayer = L.tileLayer(LABELS_TEMPLATE_ESRI, {
+          maxZoom: maxZoom || 19,
+          opacity: 0.95,
+          attribution: '',
+          updateWhenIdle: true,
+          updateWhenZooming: false,
+          keepBuffer: 4,
+          pane: 'overlayPane'
+        }).addTo(map);
+      } catch (e) {
+        labelLayer = null;
+      }
       return 1;
     }
     // Satellite-like default view similar to the provided reference.
@@ -2181,6 +2279,8 @@ LEAFLET_HTML = """<!doctype html>
     let viewer3d = null;
     let vehicleEntity = null;
     let headingEntity = null;
+    window.__lastVehLat = null;
+    window.__lastVehLon = null;
     window.__is3d = false;
     window.__heading = 0;
     window.__3dHasInitialFocus = false;
@@ -2931,9 +3031,48 @@ LEAFLET_HTML = """<!doctype html>
     }
 
     function centerOnVehicle() {
-      if (!map || !vehicleMarker) return 0;
+      if (!vehicleMarker) return 0;
       const p = vehicleMarker.getLatLng();
       if (!p) return 0;
+      // 3D mode: center/focus Cesium camera on the vehicle entity.
+      if (window.__is3d) {
+        try {
+          if (viewer3d && vehicleEntity) {
+            try { vehicleEntity.show = true; } catch (e) {}
+            try {
+              viewer3d.flyTo(vehicleEntity, {
+                duration: 0.65,
+                offset: new Cesium.HeadingPitchRange(
+                  Cesium.Math.toRadians(Number(window.__heading || 0)),
+                  Cesium.Math.toRadians(-40.0),
+                  1400.0
+                )
+              });
+            } catch (e) {
+              try { focus3DCamera(true); } catch (e2) {}
+            }
+            try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+            return 1;
+          }
+          // Fallback: if entity isn't ready, at least fly to lat/lon.
+          if (viewer3d && window.Cesium) {
+            viewer3d.camera.flyTo({
+              destination: Cesium.Cartesian3.fromDegrees(Number(p.lng), Number(p.lat), 1800),
+              orientation: {
+                heading: Cesium.Math.toRadians(Number(window.__heading || 0)),
+                pitch: Cesium.Math.toRadians(-35.0),
+                roll: 0.0
+              },
+              duration: 0.7
+            });
+            try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+            return 1;
+          }
+        } catch (e) {}
+        return 0;
+      }
+      // 2D mode: center Leaflet map on the vehicle marker.
+      if (!map) return 0;
       map.setView([p.lat, p.lng], Math.max(map.getZoom(), 16), { animate: true });
       return 1;
     }
@@ -3008,6 +3147,17 @@ LEAFLET_HTML = """<!doctype html>
       return 1;
     }
 
+    function preferTelemetryStrip() {
+      // Keep the original bottom telemetry strip UI (vs. orbit "bubbles").
+      const stack = document.getElementById('telemetryLeftStack');
+      if (stack) stack.style.display = '';
+      document.querySelectorAll('.telOrbitItem').forEach((el) => el.remove());
+      return 1;
+    }
+
+    // Run once at startup (safe if orbit items don't exist).
+    preferTelemetryStrip();
+
     function ensure3D() {
       if (viewer3d) return true;
       if (!window.Cesium) return false;
@@ -3033,6 +3183,44 @@ LEAFLET_HTML = """<!doctype html>
             url: 'https://tile.openstreetmap.org/'
           })
         });
+        // Make sure the vehicle marker stays visible on top of imagery/terrain.
+        try { viewer3d.scene.globe.depthTestAgainstTerrain = false; } catch (e) {}
+        // Prevent excessive zoom-in (can cause ground/imagery artifacts in Qt WebEngine builds).
+        try {
+          const ssc = viewer3d.scene && viewer3d.scene.screenSpaceCameraController
+            ? viewer3d.scene.screenSpaceCameraController
+            : null;
+          if (ssc) {
+            ssc.minimumZoomDistance = 250.0; // meters
+            ssc.enableCollisionDetection = true;
+          }
+        } catch (e) {}
+        // Hard clamp camera height too (minimumZoomDistance isn't always sufficient at shallow pitch).
+        try {
+          const MIN_CAM_H_M = 250.0;
+          let __clamping = false;
+          viewer3d.camera.changed.addEventListener(function() {
+            if (__clamping) return;
+            try {
+              const c = viewer3d.camera.positionCartographic;
+              if (!c || !Number.isFinite(c.height)) return;
+              if (c.height >= MIN_CAM_H_M) return;
+              __clamping = true;
+              viewer3d.camera.setView({
+                destination: Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, MIN_CAM_H_M),
+                orientation: {
+                  heading: viewer3d.camera.heading,
+                  pitch: viewer3d.camera.pitch,
+                  roll: viewer3d.camera.roll
+                }
+              });
+            } catch (e) {
+              // ignore
+            } finally {
+              __clamping = false;
+            }
+          });
+        } catch (e) {}
         // Force a known imagery layer for stable no-key rendering in WebEngine.
         try {
           viewer3d.imageryLayers.removeAll();
@@ -3042,6 +3230,15 @@ LEAFLET_HTML = """<!doctype html>
               credit: 'Tiles © Esri'
             })
           );
+          // Overlay: borders + place labels (transparent) to match client reference.
+          try {
+            viewer3d.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+                credit: ''
+              })
+            );
+          } catch (e2) {}
         } catch (e) {
           // Fallback to OSM if ArcGIS provider fails.
           try {
@@ -3053,13 +3250,32 @@ LEAFLET_HTML = """<!doctype html>
             );
           } catch (e2) {}
         }
+        // Vehicle marker for 3D: use the same arrow/chevron SVG as 2D, as a Cesium billboard.
+        const seed = vehicleMarker ? vehicleMarker.getLatLng() : null;
+        const seedLat = (window.__lastVehLat != null ? window.__lastVehLat : (seed ? seed.lat : 24.7136));
+        const seedLon = (window.__lastVehLon != null ? window.__lastVehLon : (seed ? seed.lng : 46.6753));
+        // Convert inline SVG to a data URL for Cesium billboard rendering.
+        const __vehSvg = (typeof vehicleMarkerSvg === 'string' && vehicleMarkerSvg.length)
+          ? vehicleMarkerSvg
+          : '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">' +
+            '<path d="M15 2.5 L26.2 22.5 L17.8 19.8 L15 27.5 L12.2 19.8 L3.8 22.5 Z" ' +
+            'fill="#ff2328" stroke="#4a1222" stroke-width="1.35" stroke-linejoin="round"/>' +
+            '<path d="M15 5 L15 22" stroke="#3a0f18" stroke-width="1.05" stroke-linecap="round"/>' +
+            '</svg>';
+        const __vehSvgUrl = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(__vehSvg);
         vehicleEntity = viewer3d.entities.add({
-          position: Cesium.Cartesian3.fromDegrees(46.6753, 24.7136, 20),
-          point: {
-            pixelSize: 12,
-            color: Cesium.Color.fromCssColorString('#ff2328'),
-            outlineColor: Cesium.Color.fromCssColorString('#4a1222'),
-            outlineWidth: 2
+          // Use a small fixed height above ellipsoid to ensure visibility even when clamping fails.
+          position: Cesium.Cartesian3.fromDegrees(Number(seedLon) || 46.6753, Number(seedLat) || 24.7136, 30),
+          billboard: {
+            image: __vehSvgUrl,
+            width: 30,
+            height: 30,
+            verticalOrigin: Cesium.VerticalOrigin.CENTER,
+            horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+            rotation: Cesium.Math.toRadians(Number(window.__heading || 0)),
+            alignedAxis: Cesium.Cartesian3.UNIT_Z,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            scaleByDistance: new Cesium.NearFarScalar(250.0, 1.15, 4500.0, 0.55)
           }
         });
         headingEntity = viewer3d.entities.add({
@@ -3197,11 +3413,27 @@ LEAFLET_HTML = """<!doctype html>
 
     function setVehicle(lat, lon) {
       vehicleMarker.setLatLng([lat, lon]);
+      window.__lastVehLat = lat;
+      window.__lastVehLon = lon;
       appendFlightTrack(lat, lon);
       updateHeadingLineGeometry(lat, lon, window.__heading || 0);
       updateMissionRoutePolyline();
       if (vehicleEntity) {
-        vehicleEntity.position = Cesium.Cartesian3.fromDegrees(lon, lat, 20);
+        // Cesium stores `entity.position` as a Property; in some Qt WebEngine builds,
+        // reassigning `entity.position = Cartesian3` doesn't reliably update the visual.
+        // Prefer `setValue()` when available.
+        const p3 = Cesium.Cartesian3.fromDegrees(lon, lat, 30);
+        try {
+          if (vehicleEntity.position && typeof vehicleEntity.position.setValue === 'function') {
+            vehicleEntity.position.setValue(p3);
+          } else {
+            vehicleEntity.position = p3;
+          }
+        } catch (e) {
+          try { vehicleEntity.position = p3; } catch (e2) {}
+        }
+        try { vehicleEntity.show = true; } catch (e) {}
+        try { viewer3d && viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
       }
       if (window.__is3d && !window.__3dHasInitialFocus) {
         focus3DCamera(false);
@@ -3230,6 +3462,11 @@ LEAFLET_HTML = """<!doctype html>
       const lat = latArg !== undefined ? latArg : p.lat;
       const lon = lonArg !== undefined ? lonArg : p.lng;
       updateHeadingLineGeometry(lat, lon, d);
+      try {
+        if (vehicleEntity && vehicleEntity.billboard) {
+          vehicleEntity.billboard.rotation = Cesium.Math.toRadians(d);
+        }
+      } catch (e) {}
       try {
         const el = vehicleMarker.getElement && vehicleMarker.getElement();
         if (el) {
@@ -3412,6 +3649,28 @@ LEAFLET_HTML = """<!doctype html>
         document.getElementById('map3d').style.display = 'block';
         window.__is3d = true;
         if (hdrMapModeBtn) hdrMapModeBtn.textContent = '2D';
+        // Ensure vehicle marker is in view and updating when switching modes.
+        try {
+          if (viewer3d && vehicleEntity) {
+            try { vehicleEntity.show = true; } catch (e) {}
+            viewer3d.trackedEntity = vehicleEntity;
+            setTimeout(() => { try { viewer3d.trackedEntity = undefined; } catch (e) {} }, 900);
+            // Hard focus: trackedEntity can be flaky in some WebEngine builds; fly/zoom as fallback.
+            try {
+              viewer3d.flyTo(vehicleEntity, {
+                duration: 0.6,
+                offset: new Cesium.HeadingPitchRange(
+                  Cesium.Math.toRadians(Number(window.__heading || 0)),
+                  Cesium.Math.toRadians(-40.0),
+                  1800.0
+                )
+              });
+            } catch (e) {
+              try { viewer3d.zoomTo(vehicleEntity); } catch (e2) {}
+            }
+            try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+          }
+        } catch (e) {}
         focus3DCamera(true);
         return true;
       }
@@ -3672,6 +3931,11 @@ class MapWidget(QWidget):
             return
         self._last_link_connected = c
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
+        # The map overlay video chrome is tied to link status; keep camera preview in sync.
+        if c:
+            self._start_video_preview()
+        else:
+            self._stop_video_preview(clear_overlay=True)
 
     def set_flight_status(self, status: str, detail: str = "") -> None:
         st = (status or "").strip().lower()
@@ -3832,11 +4096,34 @@ class MapWidget(QWidget):
             self._web.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
             self._map_canvas.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
             self._map_canvas.setAutoFillBackground(True)
+            # Enable persistent HTTP cache so 2D tiles load much faster after first view.
+            try:
+                if QWebEngineProfile is not None:
+                    prof = QWebEngineProfile.defaultProfile()
+                    cache_root = (Path.home() / ".vgcs-webengine-cache").resolve()
+                    cache_root.mkdir(parents=True, exist_ok=True)
+                    prof.setCachePath(str(cache_root))
+                    prof.setPersistentStoragePath(str(cache_root))
+                    # Disk cache; 512MB cap (tunable).
+                    try:
+                        prof.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+                        prof.setHttpCacheMaximumSize(512 * 1024 * 1024)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             if QWebEngineSettings is not None:
                 settings = self._web.settings()
                 settings.setAttribute(
                     QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
                 )
+                # Required for offline tiles (file:///.../z/x/y.png) while page baseUrl is assets/.
+                try:
+                    settings.setAttribute(
+                        QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
+                    )
+                except Exception:
+                    pass
                 settings.setAttribute(
                     QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, False
                 )
@@ -3957,9 +4244,123 @@ class MapWidget(QWidget):
             self._run_js(
                 f"window.__planRailTool = {json.dumps(t)}; setPlanRailTool({json.dumps(t)});"
             )
+            # Restore offline tiles if previously configured (client requirement: offline map).
+            try:
+                s = QSettings(_QS_NS, _QS_APP)
+                root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
+                if root and Path(root).is_dir():
+                    self.activate_offline_tiles(root)
+            except Exception:
+                pass
             self.map_page_ready.emit()
+            # If we became ready after link-up, start the preview now.
+            if bool(self._last_link_connected):
+                self._start_video_preview()
         else:
             self._set_status("Map failed to load")
+
+    def _ensure_video_preview_backend(self) -> bool:
+        if not HAS_MULTIMEDIA:
+            return False
+        if getattr(self, "_video_inited", False):
+            return bool(getattr(self, "_camera", None)) and bool(getattr(self, "_video_sink", None))
+
+        self._video_inited = True
+        self._camera = None
+        self._capture_session = None
+        self._video_sink = None
+        self._video_last_data_url = ""
+        self._video_push_timer = QTimer(self)
+        self._video_push_timer.setInterval(200)  # 5 fps push to WebEngine
+        self._video_push_timer.timeout.connect(self._push_video_preview_to_overlay)
+
+        try:
+            devices = list(QMediaDevices.videoInputs()) if QMediaDevices is not None else []
+        except Exception:
+            devices = []
+        if not devices:
+            return False
+
+        try:
+            self._video_sink = QVideoSink(self)
+            self._video_sink.videoFrameChanged.connect(self._on_video_frame_changed)
+            self._capture_session = QMediaCaptureSession(self)
+            self._capture_session.setVideoSink(self._video_sink)
+            self._camera = QCamera(devices[0])
+            self._capture_session.setCamera(self._camera)
+        except Exception:
+            self._camera = None
+            self._capture_session = None
+            self._video_sink = None
+            return False
+        return True
+
+    def _start_video_preview(self) -> None:
+        if not getattr(self, "_web_ready", False):
+            return
+        if not self._ensure_video_preview_backend():
+            # No multimedia backend / camera: keep placeholder visible.
+            self._run_js("setVideoPreviewImage('');")
+            return
+        try:
+            if self._camera is not None:
+                self._camera.start()
+            if hasattr(self, "_video_push_timer") and not self._video_push_timer.isActive():
+                self._video_push_timer.start()
+        except Exception:
+            self._run_js("setVideoPreviewImage('');")
+
+    def _stop_video_preview(self, *, clear_overlay: bool) -> None:
+        if hasattr(self, "_video_push_timer") and self._video_push_timer.isActive():
+            self._video_push_timer.stop()
+        try:
+            if getattr(self, "_camera", None) is not None:
+                self._camera.stop()
+        except Exception:
+            pass
+        if clear_overlay and getattr(self, "_web_ready", False):
+            self._run_js("setVideoPreviewImage('');")
+
+    def _on_video_frame_changed(self, frame) -> None:
+        # Called on the GUI thread; convert to a small PNG data URL.
+        try:
+            img = frame.toImage()
+        except Exception:
+            return
+        if img is None or img.isNull():
+            return
+        # Match the overlay box aspect ratio to minimize resampling work in the browser.
+        try:
+            img = img.scaled(230, 130, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+        except Exception:
+            pass
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        if not buf.open(QBuffer.OpenModeFlag.WriteOnly):
+            return
+        try:
+            img.save(buf, "PNG")
+        except Exception:
+            return
+        finally:
+            buf.close()
+        raw = bytes(ba)
+        if not raw:
+            return
+        self._video_last_data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+
+    def _push_video_preview_to_overlay(self) -> None:
+        if not getattr(self, "_web_ready", False):
+            return
+        src = str(getattr(self, "_video_last_data_url", "") or "")
+        if not src:
+            return
+        # Avoid spamming WebEngine with identical payloads.
+        last = str(getattr(self, "_last_video_pushed", "") or "")
+        if src == last:
+            return
+        self._last_video_pushed = src
+        self._run_js(f"setVideoPreviewImage({json.dumps(src)});")
 
     def _on_web_title_changed(self, title: str) -> None:
         if title.startswith("VGCS_PLAN_EXIT:"):
@@ -4479,6 +4880,15 @@ class MapWidget(QWidget):
         self._set_status("Online tiles active")
 
     def activate_offline_tiles(self, root: str) -> None:
+        root = str(root or "").strip()
+        if not root or not Path(root).is_dir():
+            self._set_status("Offline tiles: invalid folder")
+            return
+        # Remember for next launch.
+        try:
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_OFFLINE_TILE_ROOT, root)
+        except Exception:
+            pass
         url = QUrl.fromLocalFile(root).toString().rstrip("/")
         tmpl = f"{url}/{{z}}/{{x}}/{{y}}.png"
         self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Offline tile cache', 19);")

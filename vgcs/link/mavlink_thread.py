@@ -96,6 +96,11 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("param_set", {"name": name, "value": float(value)}))
 
+    def queue_preflight_calibration(self, kind: str) -> None:
+        """Queue a sensor calibration request (best-effort, autopilot-dependent)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("preflight_calibration", str(kind or "").strip().lower()))
+
     def stop(self) -> None:
         self._running = False
         if self._master is not None:
@@ -406,8 +411,60 @@ class MavlinkThread(QThread):
             elif cmd == "param_set":
                 data = payload if isinstance(payload, dict) else {}
                 self._param_set(str(data.get("name", "")), float(data.get("value", 0.0)))
+            elif cmd == "preflight_calibration":
+                self._preflight_calibration(str(payload or ""))
         except Exception as e:
             self.error.emit(f"Link command failed ({cmd}): {e}")
+
+    def _preflight_calibration(self, kind: str) -> None:
+        """
+        Trigger MAV_CMD_PREFLIGHT_CALIBRATION with a single sensor bit set.
+
+        Common ArduPilot mapping:
+        - p1 gyro, p2 mag/compass, p3 baro, p4 rc, p5 accel
+        """
+        if self._master is None:
+            self.action_result.emit("calibration", False, "Link not ready")
+            self.error.emit("Calibration: link not ready")
+            return
+        k = (kind or "").strip().lower()
+        p1 = p2 = p3 = p4 = p5 = 0.0
+        label = "calibration"
+        if k in ("gyro", "gyroscope"):
+            p1 = 1.0
+            label = "calibration_gyro"
+        elif k in ("compass", "mag", "magnetometer"):
+            p2 = 1.0
+            label = "calibration_compass"
+        elif k in ("baro", "barometer", "pressure"):
+            p3 = 1.0
+            label = "calibration_baro"
+        elif k in ("rc", "radio"):
+            p4 = 1.0
+            label = "calibration_rc"
+        elif k in ("accel", "accelerometer", "level"):
+            p5 = 1.0
+            label = "calibration_accel"
+        else:
+            self.action_result.emit("calibration", False, f"Unknown calibration: {kind}")
+            self.error.emit(f"Calibration: unknown kind '{kind}'")
+            return
+
+        self._sync_link_targets()
+        try:
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+                p1=p1,
+                p2=p2,
+                p3=p3,
+                p4=p4,
+                p5=p5,
+            )
+            self.action_result.emit(label, True, "Command sent")
+            self.log_line.emit(f"Calibration command sent: {label}")
+        except Exception as e:
+            self.action_result.emit(label, False, str(e))
+            self.error.emit(f"Calibration failed ({label}): {e}")
 
     def _sync_link_targets(self) -> None:
         """Align pymavlink routing with the last vehicle HEARTBEAT (sys/comp)."""
