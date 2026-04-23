@@ -4100,8 +4100,10 @@ class _TileProbeTask(QRunnable):
             return "decode_failed"
         mean = sum_y / n
         var_y = (sum2_y / n) - (mean * mean)
-        # Placeholder tiles tend to be flat/gray with low variance.
-        if 150.0 < mean < 235.0 and var_y < 120.0:
+        # Placeholder tiles tend to be flat/gray with very low variance and often tiny payloads.
+        # Keep thresholds strict to avoid false positives on pale/low-contrast basemaps.
+        raw_len = len(raw)
+        if 150.0 < mean < 235.0 and var_y < 50.0 and raw_len < 6000:
             return "placeholder_suspected"
         return "ok"
 
@@ -4440,6 +4442,10 @@ class MapWidget(QWidget):
     def _probe_current_tiles(self, *, reason: str) -> None:
         # Probe the *current* view tile (not just z=0), because placeholders often occur only at higher zooms.
         def _kick(payload: str | None) -> None:
+            try:
+                print(f"[VGCS:map] map_view_payload ({reason}) {str(payload or '')[:220]}")
+            except Exception:
+                pass
             try:
                 data = json.loads(payload or "{}")
             except Exception:
