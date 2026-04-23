@@ -67,12 +67,16 @@ _KEY_MAP_TILE_MODE = "map_tile_mode"  # 'esri_streets' | 'osm' | 'sat' | 'offlin
 try:
     from PySide6.QtWebEngineCore import QWebEngineSettings
     from PySide6.QtWebEngineCore import QWebEngineProfile
+    from PySide6.QtWebEngineCore import QWebEngineUrlRequestInterceptor
+    from PySide6.QtWebEngineCore import QWebEnginePage
     from PySide6.QtWebEngineWidgets import QWebEngineView
 
     HAS_WEBENGINE = True
 except Exception:  # pragma: no cover - environment-specific availability
     QWebEngineSettings = None  # type: ignore[assignment,misc]
     QWebEngineProfile = None  # type: ignore[assignment,misc]
+    QWebEngineUrlRequestInterceptor = None  # type: ignore[assignment]
+    QWebEnginePage = None  # type: ignore[assignment]
     QWebEngineView = None  # type: ignore[assignment]
     HAS_WEBENGINE = False
 
@@ -2051,6 +2055,7 @@ LEAFLET_HTML = """<!doctype html>
     }
     ensureIconFallback('hdrGpsIcon', 'hdrGpsEmoji');
     ensureIconFallback('hdrBatIcon', 'hdrBatEmoji');
+    try { console.log('[diag] map boot: baseUrl=' + String(document.baseURI || '')); } catch(e) {}
     if (linkBanner) {
       linkBanner.style.cursor = 'pointer';
       linkBanner.addEventListener('click', function(ev) {
@@ -2295,6 +2300,7 @@ LEAFLET_HTML = """<!doctype html>
         // Avoid higher-res tile fetches that can double work.
         detectRetina: false
       }).addTo(map);
+      try { console.log('[diag] tileSource=' + String(window.__tileTemplate || '') + ' mz=' + String(effectiveMz)); } catch(e) {}
       // Detect Esri "Map data not yet available" placeholder tiles (HTTP 200 with gray image).
       // These do not trigger tileerror, but make the map unusable on some client networks.
       try {
@@ -2327,7 +2333,7 @@ LEAFLET_HTML = """<!doctype html>
                 try { document.title = 'VGCS_TILE_PLACEHOLDER:' + now; } catch (e) {}
               }
               try {
-                setTileSource('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', '© OpenStreetMap', 19);
+                setTileSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', 'Tiles © Esri', 19);
               } catch (e2) {}
               return 1;
             }
@@ -2348,6 +2354,27 @@ LEAFLET_HTML = """<!doctype html>
           }
         });
       } catch (e) {}
+      // Rate-limited diagnostics to help identify "blocked" vs "offline" cases.
+      try {
+        window.__diag = window.__diag || {err:0, ok:0, last:0};
+        tileLayer.on('tileload', function() {
+          window.__diag.ok += 1;
+          const now = Date.now();
+          if (now - window.__diag.last > 5000) {
+            window.__diag.last = now;
+            try { console.log('[diag] tiles ok=' + window.__diag.ok + ' err=' + window.__diag.err); } catch(e) {}
+          }
+        });
+        tileLayer.on('tileerror', function(ev) {
+          window.__diag.err += 1;
+          if (window.__diag.err <= 3) {
+            try { console.log('[diag] tileerror url=' + String(ev && ev.tile && ev.tile.src || '')); } catch(e) {}
+          }
+          if (window.__diag.err === 3) {
+            try { console.log('[diag] many tile errors; likely blocked DNS/proxy/firewall. Consider Offline Tiles.'); } catch(e) {}
+          }
+        });
+      } catch (eDiag) {}
       if (!low) {
         // Add borders + place labels overlay (transparent tiles) to match client reference.
         // Works best over satellite imagery; safe to keep enabled for other sources too.
@@ -2437,9 +2464,10 @@ LEAFLET_HTML = """<!doctype html>
       }
     }
 
-    // Default to Esri Streets. OSM is frequently blocked for desktop apps.
+    // Default to satellite imagery to match prior VGCS behavior.
+    // If the client network blocks imagery, user can switch to Streets or Offline Tiles.
     setTileSource(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
       'Tiles © Esri',
       19
     );
@@ -2503,6 +2531,7 @@ LEAFLET_HTML = """<!doctype html>
     let __headingPending = null;
 
     function setLinkConnected(connected) {
+      try { console.log('[diag] setLinkConnected(' + String(!!connected) + ')'); } catch(e) {}
       if (connected) {
         setFlightStatus('yellow', 'Connected - Not Ready to Arm');
       } else {
@@ -3959,6 +3988,60 @@ class _VideoEncodeTask(QRunnable):
             return
 
 
+class _TileHeaderInterceptor(QWebEngineUrlRequestInterceptor):  # type: ignore[misc]
+    """Attach browser-like headers to tile requests.
+
+    Some tile providers block desktop apps when the referrer is file:// or missing.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def interceptRequest(self, info) -> None:  # pragma: no cover - runtime/Qt dependent
+        try:
+            url = info.requestUrl().toString()
+        except Exception:
+            return
+        if not url:
+            return
+        try:
+            u = url.lower()
+        except Exception:
+            u = url
+        try:
+            # OSM blocks many desktop apps unless a proper https referrer is present.
+            if "openstreetmap.org" in u:
+                info.setHttpHeader(b"Referer", b"https://www.openstreetmap.org/")
+                info.setHttpHeader(
+                    b"User-Agent",
+                    b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    b"(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                )
+                return
+            if "arcgisonline.com" in u or "arcgis.com" in u:
+                info.setHttpHeader(b"Referer", b"https://www.arcgis.com/")
+                info.setHttpHeader(
+                    b"User-Agent",
+                    b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    b"(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                )
+                return
+        except Exception:
+            return
+
+
+class _LoggingWebPage(QWebEnginePage):  # type: ignore[misc]
+    """Forward JS console messages to Python stdout for client-side diagnostics."""
+
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID) -> None:  # pragma: no cover
+        try:
+            src = str(sourceID or "")
+            msg = str(message or "")
+            print(f"[VGCS:map] {src}:{int(lineNumber)} {msg}")
+        except Exception:
+            pass
+
+
 class MapWidget(QWidget):
     """Map panel with Leaflet backend and waypoint click workflow."""
     waypoints_changed = Signal(list)  # list[Waypoint]
@@ -4226,6 +4309,10 @@ class MapWidget(QWidget):
         if self._last_link_connected == c:
             return
         self._last_link_connected = c
+        try:
+            print(f"[VGCS:map] link_connected={c}")
+        except Exception:
+            pass
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
         # Keep camera preview in sync with link status, but never auto-enable the webcam.
         if not c:
@@ -4494,6 +4581,13 @@ class MapWidget(QWidget):
             try:
                 if QWebEngineProfile is not None:
                     prof = QWebEngineProfile.defaultProfile()
+                    # Attach headers to avoid tile-provider blocks on some client networks.
+                    try:
+                        if QWebEngineUrlRequestInterceptor is not None:
+                            self._tile_interceptor = _TileHeaderInterceptor()
+                            prof.setUrlRequestInterceptor(self._tile_interceptor)
+                    except Exception:
+                        pass
                     cache_root = (Path.home() / ".vgcs-webengine-cache").resolve()
                     cache_root.mkdir(parents=True, exist_ok=True)
                     prof.setCachePath(str(cache_root))
@@ -4504,6 +4598,12 @@ class MapWidget(QWidget):
                         prof.setHttpCacheMaximumSize(512 * 1024 * 1024)
                     except Exception:
                         pass
+            except Exception:
+                pass
+            # Print JS console logs to the VGCS terminal (client diagnostics).
+            try:
+                if QWebEnginePage is not None:
+                    self._web.setPage(_LoggingWebPage(self._web))
             except Exception:
                 pass
             if QWebEngineSettings is not None:
@@ -4668,11 +4768,17 @@ class MapWidget(QWidget):
                 if root and Path(root).is_dir():
                     self.activate_offline_tiles(root)
                 else:
-                    mode = str(s.value(_KEY_MAP_TILE_MODE, "esri_streets") or "esri_streets").strip().lower()
+                    # Default to satellite imagery where available.
+                    mode = str(s.value(_KEY_MAP_TILE_MODE, "sat") or "sat").strip().lower()
                     if mode == "sat":
                         self.activate_satellite_tiles()
                     elif mode == "osm":
-                        self.activate_osm_tiles()
+                        # OSM frequently blocks desktop apps (referrer required). Migrate old setting to Esri Streets.
+                        try:
+                            s.setValue(_KEY_MAP_TILE_MODE, "esri_streets")
+                        except Exception:
+                            pass
+                        self.activate_esri_street_tiles()
                     else:
                         self.activate_esri_street_tiles()
             except Exception:
