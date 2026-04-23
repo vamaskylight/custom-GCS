@@ -59,6 +59,7 @@ _KEY_PLAN_CURRENT_MISSION_JSON = "plan_current_mission_json"
 _KEY_TOOLBAR_EXPORT_MISSION_JSON = "toolbar_export_mission_json"
 _KEY_PLAN_LAST_MISSION_JSON_LEGACY = "plan_last_mission_json"  # legacy; read fallback only
 _KEY_MAP_OFFLINE_TILE_ROOT = "map_offline_tile_root"
+_KEY_MAP_WEBCAM_ENABLED = "map_webcam_enabled"
 
 
 try:
@@ -3920,6 +3921,13 @@ class MapWidget(QWidget):
         self._btn_fence_poly = QPushButton("Fence Polygon")
         self._btn_tiles_online = QPushButton("Online Tiles")
         self._btn_tiles_pick = QPushButton("Offline Tiles…")
+        self._btn_webcam = QPushButton("Webcam")
+        self._btn_webcam.setCheckable(True)
+        try:
+            s = QSettings(_QS_NS, _QS_APP)
+            self._btn_webcam.setChecked(bool(s.value(_KEY_MAP_WEBCAM_ENABLED, False)))
+        except Exception:
+            self._btn_webcam.setChecked(False)
         self._fence_radius = QDoubleSpinBox()
         self._fence_radius.setRange(10.0, 5000.0)
         self._fence_radius.setDecimals(0)
@@ -3989,6 +3997,7 @@ class MapWidget(QWidget):
         tools.addWidget(self._btn_apply_all_speed, 2, 3)
         tools.addWidget(self._btn_tiles_online, 2, 8)
         tools.addWidget(self._btn_tiles_pick, 2, 9)
+        tools.addWidget(self._btn_webcam, 2, 10)
         toolbar.setLayout(tools)
         self._toolbar = toolbar
 
@@ -4023,6 +4032,7 @@ class MapWidget(QWidget):
         self._btn_fence_clear.clicked.connect(self._clear_geofence)
         self._btn_tiles_online.clicked.connect(self._set_online_tiles)
         self._btn_tiles_pick.clicked.connect(self._pick_offline_tiles)
+        self._btn_webcam.toggled.connect(self._set_webcam_enabled)
         self._wp_selector.currentIndexChanged.connect(self._on_wp_selected)
         self._btn_apply_wp_alt.clicked.connect(self._apply_altitude_to_selected)
         self._btn_apply_all_alt.clicked.connect(self._apply_altitude_to_all)
@@ -4063,11 +4073,29 @@ class MapWidget(QWidget):
             return
         self._last_link_connected = c
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
-        # The map overlay video chrome is tied to link status; keep camera preview in sync.
-        if c:
-            self._start_video_preview()
-        else:
+        # Keep camera preview in sync with link status, but never auto-enable the webcam.
+        if not c:
             self._stop_video_preview(clear_overlay=True)
+            return
+        if bool(getattr(self, "_btn_webcam", None)) and bool(self._btn_webcam.isChecked()):
+            self._start_video_preview()
+
+    def _set_webcam_enabled(self, enabled: bool) -> None:
+        on = bool(enabled)
+        try:
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_WEBCAM_ENABLED, on)
+        except Exception:
+            pass
+        if not on:
+            self._stop_video_preview(clear_overlay=True)
+            self._set_status("Webcam disabled")
+            return
+        # Only start if we're linked and the page is ready.
+        if bool(getattr(self, "_last_link_connected", False)) and bool(getattr(self, "_web_ready", False)):
+            self._start_video_preview()
+            self._set_status("Webcam enabled")
+        else:
+            self._set_status("Webcam enabled (will start when connected)")
 
     def set_flight_status(self, status: str, detail: str = "") -> None:
         st = (status or "").strip().lower()
@@ -4385,9 +4413,12 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             self.map_page_ready.emit()
-            # If we became ready after link-up, start the preview now.
-            if bool(self._last_link_connected):
-                self._start_video_preview()
+            # If we became ready after link-up, only start preview if user enabled it.
+            try:
+                if bool(self._last_link_connected) and bool(self._btn_webcam.isChecked()):
+                    self._start_video_preview()
+            except Exception:
+                pass
         else:
             self._set_status("Map failed to load")
 
