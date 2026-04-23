@@ -61,7 +61,7 @@ _KEY_PLAN_LAST_MISSION_JSON_LEGACY = "plan_last_mission_json"  # legacy; read fa
 _KEY_MAP_OFFLINE_TILE_ROOT = "map_offline_tile_root"
 _KEY_MAP_WEBCAM_ENABLED = "map_webcam_enabled"
 _KEY_MAP_LOW_SPEC_MODE = "map_low_spec_mode"  # 'auto' | 'on' | 'off'
-_KEY_MAP_TILE_MODE = "map_tile_mode"  # 'osm' | 'sat' | 'offline'
+_KEY_MAP_TILE_MODE = "map_tile_mode"  # 'esri_streets' | 'osm' | 'sat' | 'offline'
 
 
 try:
@@ -2437,9 +2437,12 @@ LEAFLET_HTML = """<!doctype html>
       }
     }
 
-    // Default to OSM for maximum compatibility on restricted client networks.
-    // Satellite is available via the "Satellite (Esri)" button.
-    setTileSource(OSM, '© OpenStreetMap', 19);
+    // Default to Esri Streets. OSM is frequently blocked for desktop apps.
+    setTileSource(
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+      'Tiles © Esri',
+      19
+    );
 
     const vehicleMarkerSvg =
       '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">' +
@@ -4048,7 +4051,8 @@ class MapWidget(QWidget):
         self._btn_3d = QPushButton("3D Toggle")
         self._btn_3d.setCheckable(True)
         self._btn_fence_poly = QPushButton("Fence Polygon")
-        self._btn_tiles_online = QPushButton("Online Tiles (OSM)")
+        self._btn_tiles_esri = QPushButton("Online Tiles (Esri Streets)")
+        self._btn_tiles_osm = QPushButton("Online Tiles (OSM)")
         self._btn_tiles_sat = QPushButton("Satellite (Esri)")
         self._btn_tiles_pick = QPushButton("Offline Tiles…")
         self._btn_webcam = QPushButton("Webcam")
@@ -4139,11 +4143,12 @@ class MapWidget(QWidget):
         tools.addWidget(self._wp_speed, 2, 1)
         tools.addWidget(self._btn_apply_wp_speed, 2, 2)
         tools.addWidget(self._btn_apply_all_speed, 2, 3)
-        tools.addWidget(self._btn_tiles_online, 2, 8)
-        tools.addWidget(self._btn_tiles_sat, 2, 9)
-        tools.addWidget(self._btn_tiles_pick, 2, 10)
-        tools.addWidget(self._btn_webcam, 2, 11)
-        tools.addWidget(self._perf_mode, 2, 12)
+        tools.addWidget(self._btn_tiles_esri, 2, 8)
+        tools.addWidget(self._btn_tiles_osm, 2, 9)
+        tools.addWidget(self._btn_tiles_sat, 2, 10)
+        tools.addWidget(self._btn_tiles_pick, 2, 11)
+        tools.addWidget(self._btn_webcam, 2, 12)
+        tools.addWidget(self._perf_mode, 2, 13)
         toolbar.setLayout(tools)
         self._toolbar = toolbar
 
@@ -4176,7 +4181,8 @@ class MapWidget(QWidget):
         self._btn_fence_poly.clicked.connect(self._enable_fence_polygon_mode)
         self._btn_fence_apply.clicked.connect(self._apply_geofence)
         self._btn_fence_clear.clicked.connect(self._clear_geofence)
-        self._btn_tiles_online.clicked.connect(self._set_online_tiles)
+        self._btn_tiles_esri.clicked.connect(self._set_esri_street_tiles)
+        self._btn_tiles_osm.clicked.connect(self._set_osm_tiles)
         self._btn_tiles_sat.clicked.connect(self._set_satellite_tiles)
         self._btn_tiles_pick.clicked.connect(self._pick_offline_tiles)
         self._btn_webcam.toggled.connect(self._set_webcam_enabled)
@@ -4662,11 +4668,13 @@ class MapWidget(QWidget):
                 if root and Path(root).is_dir():
                     self.activate_offline_tiles(root)
                 else:
-                    mode = str(s.value(_KEY_MAP_TILE_MODE, "osm") or "osm").strip().lower()
+                    mode = str(s.value(_KEY_MAP_TILE_MODE, "esri_streets") or "esri_streets").strip().lower()
                     if mode == "sat":
                         self.activate_satellite_tiles()
                     elif mode == "osm":
-                        self.activate_online_tiles()
+                        self.activate_osm_tiles()
+                    else:
+                        self.activate_esri_street_tiles()
             except Exception:
                 pass
             self.map_page_ready.emit()
@@ -5355,8 +5363,11 @@ class MapWidget(QWidget):
         self._run_js("enableFencePolygon();")
         self._set_status("Fence polygon mode: click map to add points")
 
-    def _set_online_tiles(self) -> None:
-        self.activate_online_tiles()
+    def _set_esri_street_tiles(self) -> None:
+        self.activate_esri_street_tiles()
+
+    def _set_osm_tiles(self) -> None:
+        self.activate_osm_tiles()
 
     def _set_satellite_tiles(self) -> None:
         self.activate_satellite_tiles()
@@ -5371,7 +5382,20 @@ class MapWidget(QWidget):
             return
         self.activate_offline_tiles(root)
 
-    def activate_online_tiles(self) -> None:
+    def activate_esri_street_tiles(self) -> None:
+        """Default online tiles: most compatible in locked-down client networks."""
+        try:
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "esri_streets")
+        except Exception:
+            pass
+        self._run_js(
+            "setTileSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', "
+            "'Tiles © Esri', 19);"
+        )
+        self._set_status("Online tiles active (Esri Streets)")
+
+    def activate_osm_tiles(self) -> None:
+        """OSM tiles are often blocked for desktop apps (referrer policy). Keep optional."""
         try:
             QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "osm")
         except Exception:
@@ -5380,7 +5404,7 @@ class MapWidget(QWidget):
             "setTileSource('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', "
             "'&copy; OpenStreetMap contributors', 19);"
         )
-        self._set_status("Online tiles active")
+        self._set_status("Online tiles active (OSM)")
 
     def activate_satellite_tiles(self) -> None:
         try:
