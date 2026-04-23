@@ -161,6 +161,19 @@ LEAFLET_HTML = """<!doctype html>
       gap:6px;
       color:#f4f7ff;
       min-width: 0;
+      flex: 0 0 auto;
+    }
+    #hdrVehiclePill {
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #hdrVehicleMsg {
+      display:inline-block;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     .hdrPillMuted {
       color: #d7deef;
@@ -1698,7 +1711,7 @@ LEAFLET_HTML = """<!doctype html>
         <span class="hdrSep"></span>
         <span class="hdrPill"><img class="hdrIcon" src="__ICON_HOLD_SRC__" alt="Hold"/><span id="hdrModeText">Hold</span></span>
         <span class="hdrSep"></span>
-        <span class="hdrPill"><img class="hdrIcon hdrIconBroadcast" src="__ICON_LINK_SRC__" alt="Vehicle Message"/><span id="hdrVehicleMsg">Vehicle Msg</span></span>
+        <span class="hdrPill" id="hdrVehiclePill"><img class="hdrIcon hdrIconBroadcast" src="__ICON_LINK_SRC__" alt="Vehicle Message"/><span id="hdrVehicleMsg">Vehicle Msg</span></span>
         <span class="hdrSep"></span>
         <span class="hdrPill" id="hdrGpsPill">
           <img id="hdrGpsIcon" class="hdrIcon hdrIconSmall" src="__ICON_GPS_SRC__" alt="GPS"
