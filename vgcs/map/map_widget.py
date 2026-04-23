@@ -3361,7 +3361,10 @@ LEAFLET_HTML = """<!doctype html>
       const el = document.getElementById('hdrVehicleMsg');
       if (!el) return 0;
       const raw = String(text || '').trim();
-      el.textContent = raw ? raw.slice(0, 20) : 'Vehicle Msg';
+      // Do not hard-truncate here; let CSS ellipsis handle tight layouts.
+      // Keep full text available via tooltip.
+      el.textContent = raw || 'Vehicle Msg';
+      try { el.title = raw || ''; } catch (e0) {}
       // Client UX: if PreArm reports bad GPS fix, keep GPS visible but visually mute it.
       try {
         const low = raw.toLowerCase();
