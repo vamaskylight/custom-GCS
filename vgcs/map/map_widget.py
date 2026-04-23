@@ -3349,15 +3349,17 @@ LEAFLET_HTML = """<!doctype html>
       if (!el) return 0;
       const raw = String(text || '').trim();
       el.textContent = raw ? raw.slice(0, 20) : 'Vehicle Msg';
-      // Client UX: hide GPS/HDOP while PreArm reports bad GPS fix (values are misleading then).
+      // Client UX: if PreArm reports bad GPS fix, keep GPS visible but visually mute it.
       try {
         const low = raw.toLowerCase();
         const badFix =
           (low.includes('prearm') && low.includes('gps') && low.includes('bad fix')) ||
           low.includes('bad fix');
-        const gpsStack = document.getElementById('hdrGpsStack');
-        // Keep the GPS icon visible, but hide sat/HDOP values when fix is bad.
-        if (gpsStack) gpsStack.style.display = badFix ? 'none' : '';
+        const gpsPill = document.getElementById('hdrGpsPill');
+        if (gpsPill && gpsPill.classList) {
+          gpsPill.classList.toggle('hdrPillMuted', !!badFix);
+          try { gpsPill.title = badFix ? 'GPS: Bad fix' : ''; } catch (e2) {}
+        }
       } catch (e) {}
       return 1;
     }
