@@ -499,7 +499,12 @@ class MavlinkThread(QThread):
             pass
 
     def _request_telemetry_streams(self) -> None:
-        """Ask the vehicle for position / attitude rates (VGCS map uses GLOBAL_POSITION_INT)."""
+        """Ask the vehicle for telemetry needed by VGCS UI.
+
+        Note: real vehicles often require MAV_CMD_SET_MESSAGE_INTERVAL to reliably stream
+        SYS_STATUS / GPS_RAW_INT / BATTERY_STATUS; relying only on request_data_stream_send
+        can yield HEARTBEAT/STATUSTEXT only on some firmwares/configs.
+        """
         if self._master is None:
             return
         self._sync_link_targets()
@@ -521,11 +526,30 @@ class MavlinkThread(QThread):
                 hz,
                 1,
             )
-            self.log_line.emit(f"Requested MAV_DATA_STREAM_POSITION/EXTRA1 @ {hz} Hz")
+            # Extended status includes SYS_STATUS on many stacks (battery remaining, etc.)
+            self._master.mav.request_data_stream_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS,
+                max(1, min(2, hz)),
+                1,
+            )
+            # EXTRA2 commonly includes GPS_RAW_INT on ArduPilot/PX4.
+            self._master.mav.request_data_stream_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_DATA_STREAM_EXTRA2,
+                max(1, min(2, hz)),
+                1,
+            )
+            self.log_line.emit(
+                f"Requested MAV_DATA_STREAM_POSITION/EXTRA1 @ {hz} Hz (+EXT_STATUS/EXTRA2 @ {max(1, min(2, hz))} Hz)"
+            )
         except Exception as e:
             self.log_line.emit(f"request_data_stream_send failed: {e}")
         try:
             interval_us = int(1_000_000 / max(1, hz))
+            slow_interval_us = int(1_000_000 / 1)  # 1 Hz for heavy/slow-changing messages
             self._master.mav.command_long_send(
                 ts,
                 tc,
@@ -547,6 +571,49 @@ class MavlinkThread(QThread):
                 0,
                 float(mavutil.mavlink.MAVLINK_MSG_ID_MISSION_CURRENT),
                 float(interval_us),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            # Battery/GPS UI depends on these; request explicitly for real vehicles.
+            self._master.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                float(mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS),
+                float(slow_interval_us),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            self._master.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                float(mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT),
+                float(slow_interval_us),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            self._master.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                float(mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS),
+                float(slow_interval_us),
                 0.0,
                 0.0,
                 0.0,
