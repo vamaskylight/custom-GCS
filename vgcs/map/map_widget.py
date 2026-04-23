@@ -4064,7 +4064,7 @@ class _LoggingWebPage(QWebEnginePage):  # type: ignore[misc]
 
 
 class _TileProbeBridge(QObject):
-    result = Signal(str, str)  # provider_label, outcome
+    result = Signal(str, str, str)  # provider_label, outcome, detail
 
 
 class _TileProbeTask(QRunnable):
@@ -4118,17 +4118,34 @@ class _TileProbeTask(QRunnable):
             )
             with urlopen(req, timeout=3.0) as resp:
                 code = getattr(resp, "status", None) or resp.getcode()
+                ctype = str(getattr(resp, "headers", {}).get("Content-Type", "") or "")
                 raw = resp.read()
             if int(code) >= 400:
-                self._bridge.result.emit(self._provider_label, f"http_{int(code)}")
+                self._bridge.result.emit(
+                    self._provider_label,
+                    f"http_{int(code)}",
+                    f"url={url} content_type={ctype}".strip(),
+                )
                 return
             if not raw:
-                self._bridge.result.emit(self._provider_label, "empty_body")
+                self._bridge.result.emit(
+                    self._provider_label,
+                    "empty_body",
+                    f"url={url} content_type={ctype}".strip(),
+                )
                 return
             outcome = self._classify_image(raw)
-            self._bridge.result.emit(self._provider_label, outcome)
+            self._bridge.result.emit(
+                self._provider_label,
+                outcome,
+                f"url={url} bytes={len(raw)} content_type={ctype}".strip(),
+            )
         except Exception as e:
-            self._bridge.result.emit(self._provider_label, f"error:{type(e).__name__}")
+            self._bridge.result.emit(
+                self._provider_label,
+                f"error:{type(e).__name__}",
+                f"url={url}",
+            )
 
 
 class MapWidget(QWidget):
@@ -4489,9 +4506,9 @@ class MapWidget(QWidget):
         except Exception:
             _kick(None)
 
-    def _on_tile_probe_result(self, provider_label: str, outcome: str) -> None:
+    def _on_tile_probe_result(self, provider_label: str, outcome: str, detail: str) -> None:
         try:
-            print(f"[VGCS:map] tile_probe {provider_label} -> {outcome}")
+            print(f"[VGCS:map] tile_probe {provider_label} -> {outcome} ({detail})")
         except Exception:
             pass
         # If the *active view* tile is a placeholder, auto-fallback to Streets and guide the user.
