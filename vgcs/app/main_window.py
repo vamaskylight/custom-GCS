@@ -198,6 +198,8 @@ class MainWindow(QMainWindow):
                 "ARMING_CHECK",
                 "ACRO_OPTIONS",
                 "ACRO_TRAINER",
+                "SIMPLE",
+                "SUPER_SIMPLE",
             ]
         )
         self._param_value_spin = QDoubleSpinBox()
@@ -222,6 +224,11 @@ class MainWindow(QMainWindow):
         )
         self._btn_apply_acro = QPushButton("Apply Acro options")
         self._btn_apply_acro.setEnabled(False)
+
+        self._simple_check = QCheckBox("Simple mode (SIMPLE bitmask)")
+        self._super_simple_check = QCheckBox("Super Simple (SUPER_SIMPLE bitmask)")
+        self._btn_apply_simple = QPushButton("Apply Simple options")
+        self._btn_apply_simple.setEnabled(False)
 
         self._btn_connect = QPushButton("Connect")
         self._btn_disconnect = QPushButton("Disconnect")
@@ -340,6 +347,7 @@ class MainWindow(QMainWindow):
         self._btn_tiles_online.clicked.connect(self._on_tiles_online)
         self._btn_tiles_offline.clicked.connect(self._on_tiles_offline)
         self._btn_apply_acro.clicked.connect(self._on_apply_acro_options)
+        self._btn_apply_simple.clicked.connect(self._on_apply_simple_options)
         self._timeout_spin.valueChanged.connect(self._on_timeout_changed)
         self._theme_combo.currentTextChanged.connect(self._on_theme_changed)
         self._map_widget.waypoints_changed.connect(self._on_map_waypoints_changed)
@@ -799,6 +807,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._airmode_check, 4, 1, 1, 2)
         lay.addWidget(self._acro_trainer_combo, 4, 3)
         lay.addWidget(self._btn_apply_acro, 4, 4, 1, 2)
+        lay.addWidget(QLabel("Simple"), 5, 0)
+        lay.addWidget(self._simple_check, 5, 1, 1, 2)
+        lay.addWidget(self._super_simple_check, 5, 3)
+        lay.addWidget(self._btn_apply_simple, 5, 4, 1, 2)
         box.setLayout(lay)
         return box
 
@@ -1561,17 +1573,56 @@ class MainWindow(QMainWindow):
 
             btn_apply_acro_dlg.clicked.connect(_apply_acro_from_dialog)
 
+            lay.addSpacing(8)
+            s_title = QLabel("Simple / Super Simple (features)")
+            s_title.setStyleSheet("font-weight: 600;")
+            lay.addWidget(s_title)
+            s_hint = QLabel(
+                "Simple and Super Simple are enabled via SIMPLE and SUPER_SIMPLE bitmasks (flight mode switch positions)."
+            )
+            s_hint.setWordWrap(True)
+            s_hint.setStyleSheet("color: #555; font-size: 11px;")
+            lay.addWidget(s_hint)
+            simple_dlg = QCheckBox("Enable Simple (all switch positions)")
+            super_simple_dlg = QCheckBox("Enable Super Simple (all switch positions)")
+            simple_dlg.setChecked(bool(int(self._last_params.get("SIMPLE", 0.0) or 0.0) != 0))
+            super_simple_dlg.setChecked(
+                bool(int(self._last_params.get("SUPER_SIMPLE", 0.0) or 0.0) != 0)
+            )
+            lay.addWidget(simple_dlg)
+            lay.addWidget(super_simple_dlg)
+            btn_apply_simple_dlg = QPushButton("Apply Simple options")
+            btn_apply_simple_dlg.setEnabled(can_send)
+            lay.addWidget(btn_apply_simple_dlg)
+
+            def _apply_simple_from_dialog() -> None:
+                self._simple_check.setChecked(simple_dlg.isChecked())
+                self._super_simple_check.setChecked(super_simple_dlg.isChecked())
+                self._on_apply_simple_options()
+
+            btn_apply_simple_dlg.clicked.connect(_apply_simple_from_dialog)
+
             # Refresh-on-open: fetch the latest ACRO_* params and keep dialog in sync.
             if can_send and self._thread is not None:
                 try:
-                    self._thread.queue_params_fetch(["ACRO_OPTIONS", "ACRO_TRAINER"])
-                    self._append_log("Param fetch queued (Acro options)")
+                    self._thread.queue_params_fetch(
+                        ["ACRO_OPTIONS", "ACRO_TRAINER", "SIMPLE", "SUPER_SIMPLE"]
+                    )
+                    self._append_log("Param fetch queued (feature options)")
                 except Exception:
                     pass
 
             def _on_params_snapshot_for_dialog(payload: object) -> None:
                 # Cache is updated in the main handler; just mirror to dialog controls.
                 _refresh_acro_dialog_from_cache()
+                simple_dlg.blockSignals(True)
+                simple_dlg.setChecked(bool(int(self._last_params.get("SIMPLE", 0.0) or 0.0) != 0))
+                simple_dlg.blockSignals(False)
+                super_simple_dlg.blockSignals(True)
+                super_simple_dlg.setChecked(
+                    bool(int(self._last_params.get("SUPER_SIMPLE", 0.0) or 0.0) != 0)
+                )
+                super_simple_dlg.blockSignals(False)
 
             if self._thread is not None:
                 self._thread.params_snapshot.connect(_on_params_snapshot_for_dialog)
@@ -1889,6 +1940,7 @@ class MainWindow(QMainWindow):
         self._btn_params_refresh.setEnabled(False)
         self._btn_param_set.setEnabled(False)
         self._btn_apply_acro.setEnabled(False)
+        self._btn_apply_simple.setEnabled(False)
         self._btn_reset.setEnabled(False)
         self._heartbeat_seen = False
         self._connect_attempt_active = True
@@ -1924,6 +1976,7 @@ class MainWindow(QMainWindow):
         self._btn_params_refresh.setEnabled(True)
         self._btn_param_set.setEnabled(True)
         self._btn_apply_acro.setEnabled(True)
+        self._btn_apply_simple.setEnabled(True)
         # Do not mark connected in map UI until HEARTBEAT is actually received.
         self._map_widget.set_link_connected(False)
         self._set_preconnect_dashboard_mode(False)
@@ -1962,6 +2015,7 @@ class MainWindow(QMainWindow):
         self._btn_params_refresh.setEnabled(False)
         self._btn_param_set.setEnabled(False)
         self._btn_apply_acro.setEnabled(False)
+        self._btn_apply_simple.setEnabled(False)
         self._reset_telemetry_fields()
         self._set_dashboard_flight_status(
             "red",
@@ -2512,6 +2566,8 @@ class MainWindow(QMainWindow):
             "ARMING_CHECK",
             "ACRO_OPTIONS",
             "ACRO_TRAINER",
+            "SIMPLE",
+            "SUPER_SIMPLE",
         ]
         self._thread.queue_params_fetch(names)
         self._append_log("Param fetch queued")
@@ -2561,6 +2617,14 @@ class MainWindow(QMainWindow):
         self._acro_trainer_combo.blockSignals(True)
         self._acro_trainer_combo.setCurrentIndex(max(0, min(2, trainer)))
         self._acro_trainer_combo.blockSignals(False)
+        simple_mask = int(self._last_params.get("SIMPLE", 0.0) or 0.0)
+        super_mask = int(self._last_params.get("SUPER_SIMPLE", 0.0) or 0.0)
+        self._simple_check.blockSignals(True)
+        self._simple_check.setChecked(simple_mask != 0)
+        self._simple_check.blockSignals(False)
+        self._super_simple_check.blockSignals(True)
+        self._super_simple_check.setChecked(super_mask != 0)
+        self._super_simple_check.blockSignals(False)
 
     def _on_apply_acro_options(self) -> None:
         if self._thread is None or not self._thread.isRunning():
@@ -2575,6 +2639,20 @@ class MainWindow(QMainWindow):
         self._append_log(
             f"Acro options queued: ACRO_OPTIONS={new_opts} (AirMode={'on' if want_airmode else 'off'}), "
             f"ACRO_TRAINER={trainer}"
+        )
+
+    def _on_apply_simple_options(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before applying Simple options.")
+            return
+        # SIMPLE and SUPER_SIMPLE are bitmasks for flight-mode switch positions (1..6).
+        # For a simple UI, we enable/disable for all switch positions at once (0x3F).
+        simple_mask = 0x3F if self._simple_check.isChecked() else 0
+        super_mask = 0x3F if self._super_simple_check.isChecked() else 0
+        self._thread.queue_param_set("SIMPLE", float(simple_mask))
+        self._thread.queue_param_set("SUPER_SIMPLE", float(super_mask))
+        self._append_log(
+            f"Simple options queued: SIMPLE={simple_mask} SUPER_SIMPLE={super_mask}"
         )
 
     def _on_param_set_result(self, name: str, ok: bool, detail: str) -> None:
