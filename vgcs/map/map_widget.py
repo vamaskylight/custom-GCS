@@ -1697,7 +1697,7 @@ LEAFLET_HTML = """<!doctype html>
           <img class="hdrIcon hdrIconSmall" src="__ICON_GPS_SRC__" alt="GPS"
                onerror="this.style.display='none'; var e=document.getElementById('hdrGpsEmoji'); if(e) e.style.display='inline';"/>
           <span id="hdrGpsEmoji" style="display:none; font-weight:700;">GPS</span>
-          <span class="hdrTinyStack"><span id="hdrGpsSat">10</span><span id="hdrGpsHdop">0.7</span></span>
+          <span class="hdrTinyStack" id="hdrGpsStack"><span id="hdrGpsSat">10</span><span id="hdrGpsHdop">0.7</span></span>
         </span>
         <span class="hdrSep"></span>
         <span class="hdrPill" id="hdrBatteryPill">
@@ -3220,8 +3220,9 @@ LEAFLET_HTML = """<!doctype html>
         const badFix =
           (low.includes('prearm') && low.includes('gps') && low.includes('bad fix')) ||
           low.includes('bad fix');
-        const gpsPill = document.getElementById('hdrGpsPill');
-        if (gpsPill) gpsPill.style.display = badFix ? 'none' : '';
+        const gpsStack = document.getElementById('hdrGpsStack');
+        // Keep the GPS icon visible, but hide sat/HDOP values when fix is bad.
+        if (gpsStack) gpsStack.style.display = badFix ? 'none' : '';
       } catch (e) {}
       return 1;
     }
