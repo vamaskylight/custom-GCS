@@ -2267,6 +2267,8 @@ LEAFLET_HTML = """<!doctype html>
     window.__tileTemplate = '';
     window.__tileAttribution = '';
     window.__tileMaxZoom = 19;
+    window.__tilePlaceholderDetected = false;
+    window.__tilePlaceholderLastSignalAt = 0;
     const LABELS_TEMPLATE_ESRI =
       'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
     function setTileSource(urlTemplate, attribution, maxZoom) {
@@ -2292,6 +2294,49 @@ LEAFLET_HTML = """<!doctype html>
         // Avoid higher-res tile fetches that can double work.
         detectRetina: false
       }).addTo(map);
+      // Detect Esri "Map data not yet available" placeholder tiles (HTTP 200 with gray image).
+      // These do not trigger tileerror, but make the map unusable on some client networks.
+      try {
+        const checkPlaceholder = (img) => {
+          try {
+            if (!img || window.__tilePlaceholderDetected) return 0;
+            const tmpl = String(window.__tileTemplate || '');
+            if (!tmpl.includes('arcgisonline.com')) return 0;
+            const c = document.createElement('canvas');
+            c.width = 32; c.height = 32;
+            const ctx = c.getContext('2d', { willReadFrequently: true });
+            if (!ctx) return 0;
+            ctx.drawImage(img, 0, 0, 32, 32);
+            const d = ctx.getImageData(0, 0, 32, 32).data;
+            let sum = 0, sum2 = 0;
+            for (let i = 0; i < d.length; i += 4 * 8) {
+              const r = d[i], g = d[i + 1], b = d[i + 2];
+              const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+              sum += y;
+              sum2 += y * y;
+            }
+            const n = (d.length / (4 * 8));
+            const mean = sum / n;
+            const varY = (sum2 / n) - (mean * mean);
+            if (mean > 150 && mean < 235 && varY < 120) {
+              window.__tilePlaceholderDetected = true;
+              const now = Date.now();
+              if ((now - window.__tilePlaceholderLastSignalAt) > 8000) {
+                window.__tilePlaceholderLastSignalAt = now;
+                try { document.title = 'VGCS_TILE_PLACEHOLDER:' + now; } catch (e) {}
+              }
+              try {
+                setTileSource('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', '© OpenStreetMap', 19);
+              } catch (e2) {}
+              return 1;
+            }
+          } catch (e) {}
+          return 0;
+        };
+        tileLayer.on('tileload', function(ev) {
+          try { checkPlaceholder(ev && ev.tile); } catch (e) {}
+        });
+      } catch (ePH) {}
       try {
         tileLayer.on('tileerror', function() {
           __tileErrorCount += 1;
@@ -4789,6 +4834,14 @@ class MapWidget(QWidget):
         if title.startswith("VGCS_TILE_FALLBACK:"):
             # Esri blocked/unreachable: we auto-fell back to OSM to keep the map usable.
             self._set_status("Tiles: Esri blocked — using OpenStreetMap")
+            try:
+                self._run_js("document.title = 'VGCS Map';")
+            except Exception:
+                pass
+            return
+        if title.startswith("VGCS_TILE_PLACEHOLDER:"):
+            # Esri returned placeholder tiles ("Map data not yet available"); switch to OSM.
+            self._set_status("Tiles: Esri returned placeholders — using OpenStreetMap")
             try:
                 self._run_js("document.title = 'VGCS Map';")
             except Exception:
