@@ -61,6 +61,7 @@ _KEY_PLAN_LAST_MISSION_JSON_LEGACY = "plan_last_mission_json"  # legacy; read fa
 _KEY_MAP_OFFLINE_TILE_ROOT = "map_offline_tile_root"
 _KEY_MAP_WEBCAM_ENABLED = "map_webcam_enabled"
 _KEY_MAP_LOW_SPEC_MODE = "map_low_spec_mode"  # 'auto' | 'on' | 'off'
+_KEY_MAP_TILE_MODE = "map_tile_mode"  # 'osm' | 'sat' | 'offline'
 
 
 try:
@@ -2436,19 +2437,9 @@ LEAFLET_HTML = """<!doctype html>
       }
     }
 
-    function selectDefaultTiles() {
-      probeTile(ESRI_SAT, 2600, (esriOk) => {
-        if (esriOk) {
-          setTileSource(ESRI_SAT, 'Tiles © Esri', 19);
-          return;
-        }
-        // Fallback when Esri is blocked/rate-limited on client networks.
-        setTileSource(OSM, '© OpenStreetMap', 19);
-        try { document.title = 'VGCS_TILE_FALLBACK:' + Date.now(); } catch(e) {}
-      });
-    }
-
-    selectDefaultTiles();
+    // Default to OSM for maximum compatibility on restricted client networks.
+    // Satellite is available via the "Satellite (Esri)" button.
+    setTileSource(OSM, '© OpenStreetMap', 19);
 
     const vehicleMarkerSvg =
       '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">' +
@@ -4057,7 +4048,8 @@ class MapWidget(QWidget):
         self._btn_3d = QPushButton("3D Toggle")
         self._btn_3d.setCheckable(True)
         self._btn_fence_poly = QPushButton("Fence Polygon")
-        self._btn_tiles_online = QPushButton("Online Tiles")
+        self._btn_tiles_online = QPushButton("Online Tiles (OSM)")
+        self._btn_tiles_sat = QPushButton("Satellite (Esri)")
         self._btn_tiles_pick = QPushButton("Offline Tiles…")
         self._btn_webcam = QPushButton("Webcam")
         self._btn_webcam.setCheckable(True)
@@ -4148,9 +4140,10 @@ class MapWidget(QWidget):
         tools.addWidget(self._btn_apply_wp_speed, 2, 2)
         tools.addWidget(self._btn_apply_all_speed, 2, 3)
         tools.addWidget(self._btn_tiles_online, 2, 8)
-        tools.addWidget(self._btn_tiles_pick, 2, 9)
-        tools.addWidget(self._btn_webcam, 2, 10)
-        tools.addWidget(self._perf_mode, 2, 11)
+        tools.addWidget(self._btn_tiles_sat, 2, 9)
+        tools.addWidget(self._btn_tiles_pick, 2, 10)
+        tools.addWidget(self._btn_webcam, 2, 11)
+        tools.addWidget(self._perf_mode, 2, 12)
         toolbar.setLayout(tools)
         self._toolbar = toolbar
 
@@ -4184,6 +4177,7 @@ class MapWidget(QWidget):
         self._btn_fence_apply.clicked.connect(self._apply_geofence)
         self._btn_fence_clear.clicked.connect(self._clear_geofence)
         self._btn_tiles_online.clicked.connect(self._set_online_tiles)
+        self._btn_tiles_sat.clicked.connect(self._set_satellite_tiles)
         self._btn_tiles_pick.clicked.connect(self._pick_offline_tiles)
         self._btn_webcam.toggled.connect(self._set_webcam_enabled)
         self._perf_mode.currentIndexChanged.connect(self._on_perf_mode_changed)
@@ -4667,6 +4661,12 @@ class MapWidget(QWidget):
                 root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
                 if root and Path(root).is_dir():
                     self.activate_offline_tiles(root)
+                else:
+                    mode = str(s.value(_KEY_MAP_TILE_MODE, "osm") or "osm").strip().lower()
+                    if mode == "sat":
+                        self.activate_satellite_tiles()
+                    elif mode == "osm":
+                        self.activate_online_tiles()
             except Exception:
                 pass
             self.map_page_ready.emit()
@@ -5358,6 +5358,9 @@ class MapWidget(QWidget):
     def _set_online_tiles(self) -> None:
         self.activate_online_tiles()
 
+    def _set_satellite_tiles(self) -> None:
+        self.activate_satellite_tiles()
+
     def _pick_offline_tiles(self) -> None:
         root = QFileDialog.getExistingDirectory(
             self,
@@ -5369,11 +5372,26 @@ class MapWidget(QWidget):
         self.activate_offline_tiles(root)
 
     def activate_online_tiles(self) -> None:
+        try:
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "osm")
+        except Exception:
+            pass
         self._run_js(
             "setTileSource('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', "
             "'&copy; OpenStreetMap contributors', 19);"
         )
         self._set_status("Online tiles active")
+
+    def activate_satellite_tiles(self) -> None:
+        try:
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "sat")
+        except Exception:
+            pass
+        self._run_js(
+            "setTileSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', "
+            "'Tiles © Esri', 19);"
+        )
+        self._set_status("Satellite tiles active")
 
     def activate_offline_tiles(self, root: str) -> None:
         root = str(root or "").strip()
@@ -5383,6 +5401,7 @@ class MapWidget(QWidget):
         # Remember for next launch.
         try:
             QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_OFFLINE_TILE_ROOT, root)
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "offline")
         except Exception:
             pass
         url = QUrl.fromLocalFile(root).toString().rstrip("/")
