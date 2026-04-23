@@ -6,6 +6,7 @@ import base64
 import json
 from pathlib import Path
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from PySide6.QtCore import (
     QByteArray,
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtGui import QImage
 from vgcs.mission import (
     Waypoint,
     load_waypoints_json,
@@ -2283,6 +2285,7 @@ LEAFLET_HTML = """<!doctype html>
       const mz = maxZoom || 19;
       __tileErrorCount = 0;
       window.__tileTemplate = urlTemplate || '';
+      try { window.__lastTileTemplate = window.__tileTemplate; } catch(e) {}
       window.__tileAttribution = attribution || '';
       window.__tileMaxZoom = mz;
       const low = !!window.__lowSpec;
@@ -4042,6 +4045,74 @@ class _LoggingWebPage(QWebEnginePage):  # type: ignore[misc]
             pass
 
 
+class _TileProbeBridge(QObject):
+    result = Signal(str, str)  # provider_label, outcome
+
+
+class _TileProbeTask(QRunnable):
+    def __init__(self, *, url: str, provider_label: str, bridge: _TileProbeBridge) -> None:
+        super().__init__()
+        self._url = url
+        self._provider_label = provider_label
+        self._bridge = bridge
+
+    @staticmethod
+    def _classify_image(raw: bytes) -> str:
+        img = QImage.fromData(raw)
+        if img.isNull():
+            return "decode_failed"
+        w = img.width()
+        h = img.height()
+        if w <= 0 or h <= 0:
+            return "decode_failed"
+        # Sample a grid of pixels for luminance variance.
+        sx = max(1, w // 16)
+        sy = max(1, h // 16)
+        n = 0
+        sum_y = 0.0
+        sum2_y = 0.0
+        for y in range(0, h, sy):
+            for x in range(0, w, sx):
+                c = img.pixelColor(x, y)
+                yy = 0.2126 * c.red() + 0.7152 * c.green() + 0.0722 * c.blue()
+                sum_y += yy
+                sum2_y += yy * yy
+                n += 1
+        if n <= 0:
+            return "decode_failed"
+        mean = sum_y / n
+        var_y = (sum2_y / n) - (mean * mean)
+        # Placeholder tiles tend to be flat/gray with low variance.
+        if 150.0 < mean < 235.0 and var_y < 120.0:
+            return "placeholder_suspected"
+        return "ok"
+
+    def run(self) -> None:  # pragma: no cover - network dependent
+        url = self._url
+        try:
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Referer": "https://www.arcgis.com/" if "arcgisonline.com" in url.lower() else "https://www.openstreetmap.org/",
+                },
+                method="GET",
+            )
+            with urlopen(req, timeout=3.0) as resp:
+                code = getattr(resp, "status", None) or resp.getcode()
+                raw = resp.read()
+            if int(code) >= 400:
+                self._bridge.result.emit(self._provider_label, f"http_{int(code)}")
+                return
+            if not raw:
+                self._bridge.result.emit(self._provider_label, "empty_body")
+                return
+            outcome = self._classify_image(raw)
+            self._bridge.result.emit(self._provider_label, outcome)
+        except Exception as e:
+            self._bridge.result.emit(self._provider_label, f"error:{type(e).__name__}")
+
+
 class MapWidget(QWidget):
     """Map panel with Leaflet backend and waypoint click workflow."""
     waypoints_changed = Signal(list)  # list[Waypoint]
@@ -4088,6 +4159,9 @@ class MapWidget(QWidget):
         self._tile_error_notified = False
         self._low_spec_effective = False
         self._low_spec_autodetected = False
+        self._tile_probe_bridge = _TileProbeBridge(self)
+        self._tile_probe_bridge.result.connect(self._on_tile_probe_result)
+        self._tile_probe_ran = False
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -4314,12 +4388,61 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
+        # Run a one-time tile probe after connect to log "blocked vs placeholder" clearly.
+        if c and not getattr(self, "_tile_probe_ran", False):
+            self._tile_probe_ran = True
+            try:
+                QTimer.singleShot(1500, lambda: self._probe_current_tiles(reason="connect"))
+            except Exception:
+                pass
         # Keep camera preview in sync with link status, but never auto-enable the webcam.
         if not c:
             self._stop_video_preview(clear_overlay=True)
             return
         if bool(getattr(self, "_btn_webcam", None)) and bool(self._btn_webcam.isChecked()):
             self._start_video_preview()
+
+    def _probe_current_tiles(self, *, reason: str) -> None:
+        try:
+            tmpl = str(getattr(self, "_last_tile_template", "") or "")
+        except Exception:
+            tmpl = ""
+        # If we don't know current template yet, probe both imagery and streets.
+        if not tmpl:
+            candidates = [
+                (
+                    "esri_imagery",
+                    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/0/0/0",
+                ),
+                (
+                    "esri_streets",
+                    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/0/0/0",
+                ),
+            ]
+        else:
+            url = (
+                tmpl.replace("{z}", "0")
+                .replace("{x}", "0")
+                .replace("{y}", "0")
+                .replace("{s}", "a")
+            )
+            candidates = [("active", url)]
+        for label, url in candidates:
+            try:
+                QThreadPool.globalInstance().start(
+                    _TileProbeTask(url=url, provider_label=f"{label}:{reason}", bridge=self._tile_probe_bridge)
+                )
+            except Exception:
+                pass
+
+    def _on_tile_probe_result(self, provider_label: str, outcome: str) -> None:
+        try:
+            print(f"[VGCS:map] tile_probe {provider_label} -> {outcome}")
+        except Exception:
+            pass
+        # If imagery is placeholder, guide user to Streets/Offline in status.
+        if "esri_imagery" in str(provider_label) and outcome == "placeholder_suspected":
+            self._set_status("Satellite tiles blocked/placeholder — switch to Streets or Offline Tiles…")
 
     def _set_webcam_enabled(self, enabled: bool) -> None:
         on = bool(enabled)
@@ -5036,6 +5159,11 @@ class MapWidget(QWidget):
             self._web.page().runJavaScript(script)
             return
         self._web.page().runJavaScript(script, callback)
+        # Best-effort: capture tile template when JS reports it.
+        try:
+            self._web.page().runJavaScript("window.__lastTileTemplate || '';", lambda v: setattr(self, "_last_tile_template", str(v or "")))
+        except Exception:
+            pass
 
     def _set_status(self, text: str) -> None:
         self._status.setText(f"Map status: {text}")
