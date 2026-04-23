@@ -1348,12 +1348,9 @@ class MainWindow(QMainWindow):
         action_analyze = menu.addAction("Analyze Tools")
         action_analyze.setToolTip("Post-flight and real-time data review.")
         action_analyze.setIcon(self._menu_icon("analyze_tools.svg"))
-        action_set_mode = menu.addAction("Set Flight Mode")
-        action_set_mode.setToolTip("Choose and send a mode command quickly.")
-        action_set_mode.setIcon(self._menu_icon("flight_mode.svg"))
-        action_vehicle = menu.addAction("Vehicle Configuration")
-        action_vehicle.setToolTip("Hardware-level settings and calibration.")
-        action_vehicle.setIcon(self._menu_icon("vehicle_config.svg"))
+        action_flight = menu.addAction("Flight Controls")
+        action_flight.setToolTip("Mode, takeoff/land, and assist features (AirMode, Simple, …).")
+        action_flight.setIcon(self._menu_icon("flight_mode.svg"))
         action_settings = menu.addAction("Application Settings")
         action_settings.setToolTip("GCS-specific preferences.")
         action_settings.setIcon(self._menu_icon("app_settings.svg"))
@@ -1397,15 +1394,9 @@ class MainWindow(QMainWindow):
             report = self._build_analyze_tools_report()
             QMessageBox.information(self, "Analyze Tools", report)
             self._append_log("Menu: Analyze Tools")
-        elif picked is action_set_mode:
-            self._show_vehicle_quick_controls_dialog(include_params=False)
-            self._append_log("Menu: Set Flight Mode")
-        elif picked is action_vehicle:
-            if self._map_only_dashboard:
-                self._show_vehicle_quick_controls_dialog(include_params=True)
-            else:
-                self._show_vehicle_configuration_help()
-            self._append_log("Menu: Vehicle Configuration")
+        elif picked is action_flight:
+            self._show_flight_controls_dialog()
+            self._append_log("Menu: Flight Controls")
         elif picked is action_settings:
             self._append_log("Menu: Application Setting — connection & theme")
             self._scroll_main_to(self._link_box)
@@ -1455,13 +1446,12 @@ class MainWindow(QMainWindow):
         )
 
     def _show_vehicle_quick_controls_dialog(self, *, include_params: bool = True) -> None:
-        """Map-only dashboard fallback.
+        """Backward compatibility shim for older callers."""
+        self._show_flight_controls_dialog(open_advanced=bool(include_params))
 
-        ``include_params=False`` — **Set Flight Mode**: mode, Set mode, Takeoff, Land.
-        ``include_params=True`` — **Vehicle Configuration**: parameter subset only (no flight mode row).
-        """
+    def _show_flight_controls_dialog(self, *, open_advanced: bool = False) -> None:
         dlg = QDialog(self)
-        dlg.setWindowTitle("Vehicle Configuration" if include_params else "Set flight mode")
+        dlg.setWindowTitle("Flight Controls")
         dlg.setModal(True)
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(12, 12, 12, 12)
@@ -1471,223 +1461,195 @@ class MainWindow(QMainWindow):
         if not can_send:
             lay.addWidget(QLabel("Connect vehicle to enable commands."))
 
-        if include_params:
-            nav_hint = QLabel(
-                "Flight mode, Takeoff, and Land: use Set Flight Mode in the logo menu."
-            )
-            nav_hint.setWordWrap(True)
-            nav_hint.setStyleSheet("color: #555; font-size: 11px;")
-            lay.addWidget(nav_hint)
-            p_title = QLabel("Parameters (autonomous / nav subset)")
-            p_title.setStyleSheet("font-weight: 600;")
-            lay.addWidget(p_title)
-            p_hint = QLabel(
-                "Same list as M2 controls: waypoint speed, RTL altitude, fence, arming checks."
-            )
-            p_hint.setWordWrap(True)
-            p_hint.setStyleSheet("color: #555; font-size: 11px;")
-            lay.addWidget(p_hint)
-            param_combo_dlg = QComboBox()
-            for i in range(self._param_name_combo.count()):
-                param_combo_dlg.addItem(self._param_name_combo.itemText(i))
-            param_combo_dlg.setCurrentText(self._param_name_combo.currentText())
-            dlg_spin = QDoubleSpinBox()
-            dlg_spin.setRange(-100000.0, 100000.0)
-            dlg_spin.setDecimals(3)
+        # Flight mode + commands
+        title = QLabel("Flight mode")
+        title.setStyleSheet("font-weight: 600;")
+        lay.addWidget(title)
+
+        combo = QComboBox()
+        combo.addItems([self._mode_combo.itemText(i) for i in range(self._mode_combo.count())])
+        current = self._mode_combo.currentText().strip()
+        if current:
+            combo.setCurrentText(current)
+        combo.setEnabled(can_send)
+        lay.addWidget(combo)
+
+        alt_row = QHBoxLayout()
+        alt_row.addWidget(QLabel("Takeoff alt (m)"))
+        alt_spin = QDoubleSpinBox()
+        alt_spin.setRange(1.0, 200.0)
+        alt_spin.setDecimals(1)
+        alt_spin.setValue(float(self._takeoff_alt_spin.value()))
+        alt_spin.setEnabled(can_send)
+        alt_row.addWidget(alt_spin, 1)
+        lay.addLayout(alt_row)
+
+        btn_row = QHBoxLayout()
+        btn_set_mode = QPushButton("Set mode")
+        btn_takeoff = QPushButton("Takeoff")
+        btn_land = QPushButton("Land")
+        btn_row.addWidget(btn_set_mode)
+        btn_row.addWidget(btn_takeoff)
+        btn_row.addWidget(btn_land)
+        lay.addLayout(btn_row)
+
+        btn_row2 = QHBoxLayout()
+        btn_auto_takeoff = QPushButton("Auto takeoff")
+        btn_auto_land = QPushButton("Auto land")
+        btn_row2.addWidget(btn_auto_takeoff)
+        btn_row2.addWidget(btn_auto_land)
+        btn_row2.addStretch()
+        lay.addLayout(btn_row2)
+
+        btn_set_mode.setEnabled(can_send)
+        btn_takeoff.setEnabled(can_send)
+        btn_land.setEnabled(can_send)
+        btn_auto_takeoff.setEnabled(can_send)
+        btn_auto_land.setEnabled(can_send)
+
+        def _sync_alt_to_main() -> None:
+            self._takeoff_alt_spin.setValue(float(alt_spin.value()))
+
+        def _set_mode_from_dialog() -> None:
+            mode_name = combo.currentText().strip()
+            if not mode_name:
+                return
+            self._mode_combo.setCurrentText(mode_name)
+            self._on_set_mode()
+
+        btn_set_mode.clicked.connect(_set_mode_from_dialog)
+        btn_takeoff.clicked.connect(lambda: (_sync_alt_to_main(), self._on_takeoff()))
+        btn_land.clicked.connect(self._on_land)
+        btn_auto_takeoff.clicked.connect(lambda: (_sync_alt_to_main(), self._on_auto_takeoff()))
+        btn_auto_land.clicked.connect(self._on_auto_land)
+
+        # Assist features
+        lay.addSpacing(6)
+        f_title = QLabel("Assist features")
+        f_title.setStyleSheet("font-weight: 600;")
+        lay.addWidget(f_title)
+
+        airmode_dlg = QCheckBox("AirMode")
+        trainer_dlg = QComboBox()
+        trainer_dlg.addItems(["Acro Trainer: Off", "Acro Trainer: Level", "Acro Trainer: Level+Limit"])
+        simple_dlg = QCheckBox("Simple")
+        super_simple_dlg = QCheckBox("Super Simple")
+
+        airmode_dlg.setEnabled(can_send)
+        trainer_dlg.setEnabled(can_send)
+        simple_dlg.setEnabled(can_send)
+        super_simple_dlg.setEnabled(can_send)
+
+        lay.addWidget(airmode_dlg)
+        lay.addWidget(trainer_dlg)
+        lay.addWidget(simple_dlg)
+        lay.addWidget(super_simple_dlg)
+
+        apply_features = QPushButton("Apply assist features")
+        apply_features.setEnabled(can_send)
+        lay.addWidget(apply_features)
+
+        # Advanced parameters (collapsed)
+        adv_box = QGroupBox("Advanced parameters")
+        adv_box.setCheckable(True)
+        adv_box.setChecked(bool(open_advanced))
+        adv_inner = QVBoxLayout()
+        adv_inner.setSpacing(8)
+
+        p_row = QHBoxLayout()
+        param_combo_dlg = QComboBox()
+        for i in range(self._param_name_combo.count()):
+            param_combo_dlg.addItem(self._param_name_combo.itemText(i))
+        param_combo_dlg.setCurrentText(self._param_name_combo.currentText())
+        dlg_spin = QDoubleSpinBox()
+        dlg_spin.setRange(-100000.0, 100000.0)
+        dlg_spin.setDecimals(3)
+        dlg_spin.setValue(float(self._param_value_spin.value()))
+        p_row.addWidget(QLabel("Param"))
+        p_row.addWidget(param_combo_dlg, 2)
+        p_row.addWidget(QLabel("Value"))
+        p_row.addWidget(dlg_spin, 1)
+        adv_inner.addLayout(p_row)
+
+        p_btns = QHBoxLayout()
+        btn_params_dlg = QPushButton("Refresh params")
+        btn_param_set_dlg = QPushButton("Set param")
+        btn_params_dlg.setEnabled(can_send)
+        btn_param_set_dlg.setEnabled(can_send)
+        p_btns.addWidget(btn_params_dlg)
+        p_btns.addWidget(btn_param_set_dlg)
+        adv_inner.addLayout(p_btns)
+
+        adv_box.setLayout(adv_inner)
+        lay.addWidget(adv_box)
+
+        def _sync_params_dlg_to_main() -> None:
+            self._param_name_combo.setCurrentText(param_combo_dlg.currentText())
+            self._param_value_spin.setValue(float(dlg_spin.value()))
+
+        def _params_refresh_from_dialog() -> None:
+            _sync_params_dlg_to_main()
+            self._on_params_refresh()
             dlg_spin.setValue(float(self._param_value_spin.value()))
-            prow = QHBoxLayout()
-            prow.addWidget(QLabel("Param"))
-            prow.addWidget(param_combo_dlg, 2)
-            prow.addWidget(QLabel("Value"))
-            prow.addWidget(dlg_spin, 1)
-            lay.addLayout(prow)
-            btn_params_dlg = QPushButton("Refresh params")
-            btn_param_set_dlg = QPushButton("Set param")
-            btn_params_dlg.setEnabled(can_send)
-            btn_param_set_dlg.setEnabled(can_send)
-            param_row = QHBoxLayout()
-            param_row.addWidget(btn_params_dlg)
-            param_row.addWidget(btn_param_set_dlg)
-            lay.addLayout(param_row)
 
-            def _sync_params_dlg_to_main() -> None:
-                self._param_name_combo.setCurrentText(param_combo_dlg.currentText())
-                self._param_value_spin.setValue(float(dlg_spin.value()))
+        def _param_set_from_dialog() -> None:
+            _sync_params_dlg_to_main()
+            self._on_param_set()
 
-            def _params_refresh_from_dialog() -> None:
-                _sync_params_dlg_to_main()
-                self._on_params_refresh()
-                dlg_spin.setValue(float(self._param_value_spin.value()))
+        btn_params_dlg.clicked.connect(_params_refresh_from_dialog)
+        btn_param_set_dlg.clicked.connect(_param_set_from_dialog)
 
-            def _param_set_from_dialog() -> None:
-                _sync_params_dlg_to_main()
-                self._on_param_set()
-
-            btn_params_dlg.clicked.connect(_params_refresh_from_dialog)
-            btn_param_set_dlg.clicked.connect(_param_set_from_dialog)
-
-            lay.addSpacing(10)
-            a_title = QLabel("Acro options (features)")
-            a_title.setStyleSheet("font-weight: 600;")
-            lay.addWidget(a_title)
-            a_hint = QLabel(
-                "AirMode and Acro Trainer are features controlled by parameters, not flight modes."
-            )
-            a_hint.setWordWrap(True)
-            a_hint.setStyleSheet("color: #555; font-size: 11px;")
-            lay.addWidget(a_hint)
-            airmode_dlg = QCheckBox("AirMode (ACRO_OPTIONS bit0)")
-            airmode_dlg.setChecked(bool(int(self._last_params.get("ACRO_OPTIONS", 0.0)) & 1))
-            trainer_dlg = QComboBox()
-            trainer_dlg.addItems(
-                [
-                    "0: Disabled",
-                    "1: Auto level",
-                    "2: Auto level + angle limit",
-                ]
-            )
+        def _refresh_feature_controls_from_cache() -> None:
+            opts = int(self._last_params.get("ACRO_OPTIONS", 0.0) or 0.0)
+            airmode_dlg.blockSignals(True)
+            airmode_dlg.setChecked(bool(opts & 1))
+            airmode_dlg.blockSignals(False)
             trainer_val = int(self._last_params.get("ACRO_TRAINER", 2.0) or 2.0)
+            trainer_dlg.blockSignals(True)
             trainer_dlg.setCurrentIndex(max(0, min(2, trainer_val)))
-            a_row = QHBoxLayout()
-            a_row.addWidget(airmode_dlg, 2)
-            a_row.addWidget(trainer_dlg, 1)
-            lay.addLayout(a_row)
-            btn_apply_acro_dlg = QPushButton("Apply Acro options")
-            btn_apply_acro_dlg.setEnabled(can_send)
-            lay.addWidget(btn_apply_acro_dlg)
-
-            def _refresh_acro_dialog_from_cache() -> None:
-                opts = int(self._last_params.get("ACRO_OPTIONS", 0.0) or 0.0)
-                airmode_dlg.blockSignals(True)
-                airmode_dlg.setChecked(bool(opts & 1))
-                airmode_dlg.blockSignals(False)
-                tval = int(self._last_params.get("ACRO_TRAINER", 2.0) or 2.0)
-                trainer_dlg.blockSignals(True)
-                trainer_dlg.setCurrentIndex(max(0, min(2, tval)))
-                trainer_dlg.blockSignals(False)
-
-            def _apply_acro_from_dialog() -> None:
-                self._airmode_check.setChecked(airmode_dlg.isChecked())
-                self._acro_trainer_combo.setCurrentIndex(trainer_dlg.currentIndex())
-                self._on_apply_acro_options()
-
-            btn_apply_acro_dlg.clicked.connect(_apply_acro_from_dialog)
-
-            lay.addSpacing(8)
-            s_title = QLabel("Simple / Super Simple (features)")
-            s_title.setStyleSheet("font-weight: 600;")
-            lay.addWidget(s_title)
-            s_hint = QLabel(
-                "Simple and Super Simple are enabled via SIMPLE and SUPER_SIMPLE bitmasks (flight mode switch positions)."
-            )
-            s_hint.setWordWrap(True)
-            s_hint.setStyleSheet("color: #555; font-size: 11px;")
-            lay.addWidget(s_hint)
-            simple_dlg = QCheckBox("Enable Simple (all switch positions)")
-            super_simple_dlg = QCheckBox("Enable Super Simple (all switch positions)")
+            trainer_dlg.blockSignals(False)
+            simple_dlg.blockSignals(True)
             simple_dlg.setChecked(bool(int(self._last_params.get("SIMPLE", 0.0) or 0.0) != 0))
+            simple_dlg.blockSignals(False)
+            super_simple_dlg.blockSignals(True)
             super_simple_dlg.setChecked(
                 bool(int(self._last_params.get("SUPER_SIMPLE", 0.0) or 0.0) != 0)
             )
-            lay.addWidget(simple_dlg)
-            lay.addWidget(super_simple_dlg)
-            btn_apply_simple_dlg = QPushButton("Apply Simple options")
-            btn_apply_simple_dlg.setEnabled(can_send)
-            lay.addWidget(btn_apply_simple_dlg)
+            super_simple_dlg.blockSignals(False)
 
-            def _apply_simple_from_dialog() -> None:
-                self._simple_check.setChecked(simple_dlg.isChecked())
-                self._super_simple_check.setChecked(super_simple_dlg.isChecked())
-                self._on_apply_simple_options()
+        def _apply_features_from_dialog() -> None:
+            self._airmode_check.setChecked(airmode_dlg.isChecked())
+            self._acro_trainer_combo.setCurrentIndex(trainer_dlg.currentIndex())
+            self._simple_check.setChecked(simple_dlg.isChecked())
+            self._super_simple_check.setChecked(super_simple_dlg.isChecked())
+            self._on_apply_acro_options()
+            self._on_apply_simple_options()
 
-            btn_apply_simple_dlg.clicked.connect(_apply_simple_from_dialog)
+        apply_features.clicked.connect(_apply_features_from_dialog)
 
-            # Refresh-on-open: fetch the latest ACRO_* params and keep dialog in sync.
-            if can_send and self._thread is not None:
+        # Refresh-on-open for assist features.
+        if can_send and self._thread is not None:
+            try:
+                self._thread.queue_params_fetch(["ACRO_OPTIONS", "ACRO_TRAINER", "SIMPLE", "SUPER_SIMPLE"])
+                self._append_log("Param fetch queued (assist features)")
+            except Exception:
+                pass
+
+        def _on_params_snapshot_for_dialog(payload: object) -> None:
+            _refresh_feature_controls_from_cache()
+
+        if self._thread is not None:
+            self._thread.params_snapshot.connect(_on_params_snapshot_for_dialog)
+
+            def _disconnect_dialog_param_hook() -> None:
                 try:
-                    self._thread.queue_params_fetch(
-                        ["ACRO_OPTIONS", "ACRO_TRAINER", "SIMPLE", "SUPER_SIMPLE"]
-                    )
-                    self._append_log("Param fetch queued (feature options)")
+                    self._thread.params_snapshot.disconnect(_on_params_snapshot_for_dialog)
                 except Exception:
                     pass
 
-            def _on_params_snapshot_for_dialog(payload: object) -> None:
-                # Cache is updated in the main handler; just mirror to dialog controls.
-                _refresh_acro_dialog_from_cache()
-                simple_dlg.blockSignals(True)
-                simple_dlg.setChecked(bool(int(self._last_params.get("SIMPLE", 0.0) or 0.0) != 0))
-                simple_dlg.blockSignals(False)
-                super_simple_dlg.blockSignals(True)
-                super_simple_dlg.setChecked(
-                    bool(int(self._last_params.get("SUPER_SIMPLE", 0.0) or 0.0) != 0)
-                )
-                super_simple_dlg.blockSignals(False)
+            dlg.finished.connect(_disconnect_dialog_param_hook)
 
-            if self._thread is not None:
-                self._thread.params_snapshot.connect(_on_params_snapshot_for_dialog)
-
-                def _disconnect_dialog_param_hook() -> None:
-                    try:
-                        self._thread.params_snapshot.disconnect(_on_params_snapshot_for_dialog)
-                    except Exception:
-                        pass
-
-                dlg.finished.connect(_disconnect_dialog_param_hook)
-        else:
-            lab = QLabel("Flight mode")
-            combo = QComboBox()
-            combo.addItems([self._mode_combo.itemText(i) for i in range(self._mode_combo.count())])
-            current = self._mode_combo.currentText().strip()
-            if current:
-                combo.setCurrentText(current)
-
-            row = QHBoxLayout()
-            btn_set_mode = QPushButton("Set mode")
-            btn_takeoff = QPushButton("Takeoff")
-            btn_land = QPushButton("Land")
-            row.addWidget(btn_set_mode)
-            row.addWidget(btn_takeoff)
-            row.addWidget(btn_land)
-            row2 = QHBoxLayout()
-            btn_auto_takeoff = QPushButton("Auto takeoff")
-            btn_auto_land = QPushButton("Auto land")
-            row2.addWidget(btn_auto_takeoff)
-            row2.addWidget(btn_auto_land)
-            row2.addStretch()
-
-            combo.setEnabled(can_send)
-            btn_set_mode.setEnabled(can_send)
-            btn_takeoff.setEnabled(can_send)
-            btn_land.setEnabled(can_send)
-            btn_auto_takeoff.setEnabled(can_send)
-            btn_auto_land.setEnabled(can_send)
-
-            lay.addWidget(lab)
-            lay.addWidget(combo)
-            lay.addLayout(row)
-            lay.addLayout(row2)
-            hint_mode = QLabel(
-                "For parameters (WPNAV_SPEED, RTL_ALT, fence, …), open Vehicle Configuration from the menu."
-            )
-            hint_mode.setWordWrap(True)
-            hint_mode.setStyleSheet("color: #555; font-size: 11px;")
-            lay.addWidget(hint_mode)
-
-            def _set_mode_from_dialog() -> None:
-                mode_name = combo.currentText().strip()
-                if not mode_name:
-                    return
-                self._mode_combo.setCurrentText(mode_name)
-                self._on_set_mode()
-                dlg.accept()
-
-            btn_set_mode.clicked.connect(_set_mode_from_dialog)
-            btn_takeoff.clicked.connect(self._on_takeoff)
-            btn_land.clicked.connect(self._on_land)
-            btn_auto_takeoff.clicked.connect(self._on_auto_takeoff)
-            btn_auto_land.clicked.connect(self._on_auto_land)
-
+        _refresh_feature_controls_from_cache()
         dlg.exec()
         self._scroll_main_to(self._m2_controls_panel)
 
