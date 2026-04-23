@@ -2204,6 +2204,30 @@ class MainWindow(QMainWindow):
             else:
                 self._fields["failsafe_rc"].setText("N/A")
                 self._apply_state_style(self._fields["failsafe_rc"], "na")
+        elif msg_type == "BATTERY_STATUS":
+            # Real vehicles often report pack voltage here (Mission Planner simulator may not).
+            # MAVLink: voltages[] in mV, battery_remaining in % (or -1).
+            pct = int(data.get("battery_remaining", -1))
+            pct_text = "N/A" if pct < 0 else f"{pct}%"
+            v_mv = None
+            try:
+                v_arr = data.get("voltages")
+                if isinstance(v_arr, (list, tuple)) and v_arr:
+                    v0 = int(v_arr[0] or 0)
+                    if v0 > 0:
+                        v_mv = v0
+            except Exception:
+                v_mv = None
+            voltage_v = float(data.get("voltage_v", 0.0) or 0.0)
+            if (not voltage_v or voltage_v <= 0.1) and v_mv is not None:
+                voltage_v = float(v_mv) / 1000.0
+            if voltage_v <= 0.1:
+                return
+            bat_header = (
+                f"{voltage_v:.1f}V ({pct_text})" if pct_text != "N/A" else f"{voltage_v:.1f}V"
+            )
+            self._top_battery.setText(bat_header)
+            self._map_widget.set_header_battery(bat_header)
         elif msg_type == "RADIO_STATUS":
             self._fields["rc_link"].setText(
                 f"rssi={int(data.get('rssi', 0))} remrssi={int(data.get('remrssi', 0))}"
