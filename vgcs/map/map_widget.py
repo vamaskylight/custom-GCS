@@ -1693,9 +1693,9 @@ LEAFLET_HTML = """<!doctype html>
         <span class="hdrSep"></span>
         <span class="hdrPill"><img class="hdrIcon hdrIconBroadcast" src="__ICON_LINK_SRC__" alt="Vehicle Message"/><span id="hdrVehicleMsg">Vehicle Msg</span></span>
         <span class="hdrSep"></span>
-        <span class="hdrPill"><img class="hdrIcon hdrIconSmall" src="__ICON_GPS_SRC__" alt="GPS"/><span class="hdrTinyStack"><span id="hdrGpsSat">10</span><span id="hdrGpsHdop">0.7</span></span></span>
+        <span class="hdrPill" id="hdrGpsPill"><img class="hdrIcon hdrIconSmall" src="__ICON_GPS_SRC__" alt="GPS"/><span class="hdrTinyStack"><span id="hdrGpsSat">10</span><span id="hdrGpsHdop">0.7</span></span></span>
         <span class="hdrSep"></span>
-        <span class="hdrPill"><img class="hdrIcon" src="__ICON_BATTERY_SRC__" alt="Battery"/><span id="hdrBatteryText">100%</span></span>
+        <span class="hdrPill" id="hdrBatteryPill"><img class="hdrIcon" src="__ICON_BATTERY_SRC__" alt="Battery"/><span id="hdrBatteryText">100%</span></span>
         <span class="hdrSep"></span>
         <span class="hdrPill"><img class="hdrIcon" src="__ICON_REMOTE_ID_SRC__" alt="Remote ID"/><span id="hdrRemoteIdText">ID</span></span>
       </div>
@@ -3204,6 +3204,15 @@ LEAFLET_HTML = """<!doctype html>
       if (!el) return 0;
       const raw = String(text || '').trim();
       el.textContent = raw ? raw.slice(0, 20) : 'Vehicle Msg';
+      // Client UX: hide GPS/HDOP while PreArm reports bad GPS fix (values are misleading then).
+      try {
+        const low = raw.toLowerCase();
+        const badFix =
+          (low.includes('prearm') && low.includes('gps') && low.includes('bad fix')) ||
+          low.includes('bad fix');
+        const gpsPill = document.getElementById('hdrGpsPill');
+        if (gpsPill) gpsPill.style.display = badFix ? 'none' : '';
+      } catch (e) {}
       return 1;
     }
 

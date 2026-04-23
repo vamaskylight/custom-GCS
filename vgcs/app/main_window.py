@@ -2182,10 +2182,12 @@ class MainWindow(QMainWindow):
             self._fields["battery"].setText(
                 f"{voltage:.2f} V, {current_text}, {pct_text}"
             )
-            self._top_battery.setText(pct_text if pct_text != "N/A" else f"{voltage:.1f}V")
-            self._map_widget.set_header_battery(
-                pct_text if pct_text != "N/A" else f"{voltage:.1f}V"
+            # Always show voltage in the header; percent alone is not actionable for operators.
+            bat_header = (
+                f"{voltage:.1f}V ({pct_text})" if pct_text != "N/A" else f"{voltage:.1f}V"
             )
+            self._top_battery.setText(bat_header)
+            self._map_widget.set_header_battery(bat_header)
             sensors_present = int(data.get("sensors_present", 0))
             sensors_enabled = int(data.get("sensors_enabled", 0))
             sensors_health = int(data.get("sensors_health", 0))
