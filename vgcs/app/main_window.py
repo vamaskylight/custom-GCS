@@ -2099,6 +2099,10 @@ class MainWindow(QMainWindow):
         elif msg_type == "GLOBAL_POSITION_INT":
             lat = float(data.get("lat", 0.0))
             lon = float(data.get("lon", 0.0))
+            # Some vehicles output 0,0 before GPS has a valid fix. Never push that into the map,
+            # otherwise the UI recenters to the Gulf of Guinea and loads misleading/placeholder tiles.
+            if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+                return
             self._map_rel_alt_m = float(data.get("relative_alt_m", 0.0))
             self._map_msl_alt_m = float(data.get("alt_msl_m", 0.0))
             self._home_amsl_m = float(self._map_msl_alt_m) - float(self._map_rel_alt_m)
