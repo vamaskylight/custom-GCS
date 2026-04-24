@@ -174,10 +174,29 @@ class MainWindow(QMainWindow):
         self._btn_land = QPushButton("Land")
         self._btn_auto_takeoff = QPushButton("Auto takeoff")
         self._btn_auto_land = QPushButton("Auto land")
+        self._btn_emergency_stop = QPushButton("EMERGENCY STOP")
+        self._btn_emergency_stop.setToolTip(
+            "Immediate motor stop (forced disarm). Use only if the drone is runaway/flyaway."
+        )
+        self._btn_emergency_stop.setEnabled(False)
+        self._btn_emergency_stop.setStyleSheet(
+            "QPushButton { background: #b91c1c; color: white; font-weight: 800; }"
+            "QPushButton:hover { background: #dc2626; }"
+            "QPushButton:disabled { background: #5b5b5b; color: #e5e7eb; }"
+        )
         self._btn_takeoff.setEnabled(False)
         self._btn_land.setEnabled(False)
         self._btn_auto_takeoff.setEnabled(False)
         self._btn_auto_land.setEnabled(False)
+        self._btn_apply_failsafe_preset = QPushButton("Apply M1 failsafes")
+        self._btn_apply_failsafe_preset.setToolTip(
+            "Configure basic M1 failsafes on ArduPilot:\n"
+            "- GCS disconnect -> RTL\n"
+            "- RC failsafe -> RTL\n"
+            "- Battery failsafe (LOW) -> RTL, (CRIT) -> Land\n\n"
+            "Note: battery failsafe requires BATT_LOW_VOLT or BATT_LOW_MAH to be set on the vehicle."
+        )
+        self._btn_apply_failsafe_preset.setEnabled(False)
         self._geofence_radius_spin = QDoubleSpinBox()
         self._geofence_radius_spin.setRange(10.0, 5000.0)
         self._geofence_radius_spin.setDecimals(0)
@@ -186,6 +205,10 @@ class MainWindow(QMainWindow):
         self._geofence_alt_max_spin.setRange(5.0, 2000.0)
         self._geofence_alt_max_spin.setDecimals(0)
         self._geofence_alt_max_spin.setValue(120.0)
+        self._geofence_action_combo = QComboBox()
+        self._geofence_action_combo.addItem("RTL (default)", 1.0)
+        self._geofence_action_combo.addItem("Land", 2.0)
+        self._geofence_action_combo.addItem("None (warn only)", 0.0)
         self._btn_apply_fence = QPushButton("Upload fence")
         self._btn_apply_fence.setEnabled(False)
         self._param_name_combo = QComboBox()
@@ -341,6 +364,8 @@ class MainWindow(QMainWindow):
         self._btn_land.clicked.connect(self._on_land)
         self._btn_auto_takeoff.clicked.connect(self._on_auto_takeoff)
         self._btn_auto_land.clicked.connect(self._on_auto_land)
+        self._btn_emergency_stop.clicked.connect(self._on_emergency_motor_stop)
+        self._btn_apply_failsafe_preset.clicked.connect(self._on_apply_m1_failsafes)
         self._btn_apply_fence.clicked.connect(self._on_upload_fence)
         self._btn_params_refresh.clicked.connect(self._on_params_refresh)
         self._btn_param_set.clicked.connect(self._on_param_set)
@@ -788,12 +813,16 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._btn_land, 0, 3)
         lay.addWidget(self._btn_auto_takeoff, 0, 4)
         lay.addWidget(self._btn_auto_land, 0, 5)
+        lay.addWidget(self._btn_emergency_stop, 0, 6, 1, 2)
+        lay.addWidget(self._btn_apply_failsafe_preset, 0, 8, 1, 2)
 
         lay.addWidget(QLabel("Fence radius (m)"), 1, 0)
         lay.addWidget(self._geofence_radius_spin, 1, 1)
         lay.addWidget(QLabel("Fence alt max"), 1, 2)
         lay.addWidget(self._geofence_alt_max_spin, 1, 3)
-        lay.addWidget(self._btn_apply_fence, 1, 4)
+        lay.addWidget(QLabel("Fence action"), 1, 4)
+        lay.addWidget(self._geofence_action_combo, 1, 5)
+        lay.addWidget(self._btn_apply_fence, 1, 6)
 
         lay.addWidget(QLabel("Param"), 2, 0)
         lay.addWidget(self._param_name_combo, 2, 1)
@@ -1945,6 +1974,8 @@ class MainWindow(QMainWindow):
         self._btn_land.setEnabled(False)
         self._btn_auto_takeoff.setEnabled(False)
         self._btn_auto_land.setEnabled(False)
+        self._btn_emergency_stop.setEnabled(False)
+        self._btn_apply_failsafe_preset.setEnabled(False)
         self._btn_apply_fence.setEnabled(False)
         self._btn_params_refresh.setEnabled(False)
         self._btn_param_set.setEnabled(False)
@@ -1981,6 +2012,8 @@ class MainWindow(QMainWindow):
         self._btn_land.setEnabled(True)
         self._btn_auto_takeoff.setEnabled(True)
         self._btn_auto_land.setEnabled(True)
+        self._btn_emergency_stop.setEnabled(True)
+        self._btn_apply_failsafe_preset.setEnabled(True)
         self._btn_apply_fence.setEnabled(True)
         self._btn_params_refresh.setEnabled(True)
         self._btn_param_set.setEnabled(True)
@@ -2020,6 +2053,8 @@ class MainWindow(QMainWindow):
         self._btn_land.setEnabled(False)
         self._btn_auto_takeoff.setEnabled(False)
         self._btn_auto_land.setEnabled(False)
+        self._btn_emergency_stop.setEnabled(False)
+        self._btn_apply_failsafe_preset.setEnabled(False)
         self._btn_apply_fence.setEnabled(False)
         self._btn_params_refresh.setEnabled(False)
         self._btn_param_set.setEnabled(False)
@@ -2302,6 +2337,51 @@ class MainWindow(QMainWindow):
         self._thread.queue_auto_land()
         self._append_log("Auto land queued (LAND mode or NAV_LAND)")
 
+    def _on_emergency_motor_stop(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before emergency stop.")
+            return
+        value, ok = QInputDialog.getText(
+            self,
+            "Emergency motor stop",
+            "This will STOP MOTORS immediately (forced disarm).\n"
+            "This may crash the drone and cause injury/damage.\n\n"
+            "Type STOP to confirm:",
+            QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if not ok:
+            return
+        if str(value).strip().upper() != "STOP":
+            QMessageBox.information(self, "VGCS", "Emergency stop cancelled.")
+            return
+        self._thread.queue_emergency_motor_stop()
+        self._append_log("EMERGENCY STOP queued: forced motor stop")
+
+    def _on_apply_m1_failsafes(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before applying failsafes.")
+            return
+        # M1 baseline:
+        # - GCS disconnect: RTL (FS_GCS_ENABLE=1)
+        # - RC failsafe: RTL (FS_THR_ENABLE=1)
+        # - Battery failsafe: LOW -> RTL (BATT_FS_LOW_ACT=2), CRIT -> Land (BATT_FS_CRT_ACT=1)
+        self._thread.queue_param_set("FS_GCS_ENABLE", 1.0)
+        self._thread.queue_param_set("FS_THR_ENABLE", 1.0)
+        self._thread.queue_param_set("BATT_FS_LOW_ACT", 2.0)
+        self._thread.queue_param_set("BATT_FS_CRT_ACT", 1.0)
+        self._append_log("Failsafe preset queued: GCS=RTL, RC=RTL, BATT low=RTL, batt crit=Land")
+        try:
+            low_v = float(self._last_params.get("BATT_LOW_VOLT", 0.0) or 0.0)
+            low_mah = float(self._last_params.get("BATT_LOW_MAH", 0.0) or 0.0)
+            if low_v <= 0.0 and low_mah <= 0.0:
+                self._append_log(
+                    "Note: Battery failsafe trigger is disabled (BATT_LOW_VOLT and BATT_LOW_MAH are 0). "
+                    "Set a threshold on the vehicle to activate battery failsafe."
+                )
+        except Exception:
+            pass
+
     def _on_upload_fence(self) -> None:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before fence upload.")
@@ -2309,10 +2389,11 @@ class MainWindow(QMainWindow):
         cfg = {
             "radius_m": float(self._geofence_radius_spin.value()),
             "alt_max_m": float(self._geofence_alt_max_spin.value()),
+            "action": float(self._geofence_action_combo.currentData() or 1.0),
         }
         self._thread.queue_geofence_upload(cfg)
         self._append_log(
-            f"Fence upload queued: r={cfg['radius_m']:.0f}m alt={cfg['alt_max_m']:.0f}m"
+            f"Fence upload queued: r={cfg['radius_m']:.0f}m alt={cfg['alt_max_m']:.0f}m action={int(cfg['action'])}"
         )
 
     def _on_map_geofence_requested(self, cfg: object) -> None:

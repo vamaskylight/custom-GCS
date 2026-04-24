@@ -4300,6 +4300,11 @@ class MapWidget(QWidget):
         self._fence_alt_max.setDecimals(0)
         self._fence_alt_max.setSingleStep(5.0)
         self._fence_alt_max.setValue(120.0)
+        self._fence_action = QComboBox()
+        self._fence_action.setMinimumWidth(110)
+        self._fence_action.addItem("RTL (default)", 1.0)
+        self._fence_action.addItem("Land", 2.0)
+        self._fence_action.addItem("None", 0.0)
         self._btn_fence_apply = QPushButton("Apply Fence")
         self._btn_fence_clear = QPushButton("Clear Fence")
         self._default_alt = QDoubleSpinBox()
@@ -4340,8 +4345,10 @@ class MapWidget(QWidget):
         tools.addWidget(self._fence_radius, 0, 9)
         tools.addWidget(QLabel("Fence Alt"), 0, 10)
         tools.addWidget(self._fence_alt_max, 0, 11)
-        tools.addWidget(self._btn_fence_apply, 0, 12)
-        tools.addWidget(self._btn_fence_clear, 0, 13)
+        tools.addWidget(QLabel("Fence action"), 0, 12)
+        tools.addWidget(self._fence_action, 0, 13)
+        tools.addWidget(self._btn_fence_apply, 0, 14)
+        tools.addWidget(self._btn_fence_clear, 0, 15)
         tools.addWidget(QLabel("Default Alt (m)"), 1, 0)
         tools.addWidget(self._default_alt, 1, 1)
         tools.addWidget(QLabel("Default Spd (m/s)"), 1, 2)
@@ -5768,6 +5775,36 @@ class MapWidget(QWidget):
         self._set_status("Offline tiles active")
 
     def _apply_geofence(self) -> None:
+        def _circle_polygon_points(
+            center_lat: float,
+            center_lon: float,
+            radius_m: float,
+            *,
+            segments: int = 24,
+        ) -> list[list[float]]:
+            import math
+
+            r = max(10.0, float(radius_m))
+            n = max(8, min(96, int(segments)))
+            lat0 = math.radians(center_lat)
+            lon0 = math.radians(center_lon)
+            earth_r = 6_371_000.0
+            ang = r / earth_r
+            out: list[list[float]] = []
+            for i in range(n):
+                theta = 2.0 * math.pi * (i / n)
+                # Destination point from (lat0,lon0) given distance/heading on a sphere.
+                lat = math.asin(
+                    math.sin(lat0) * math.cos(ang)
+                    + math.cos(lat0) * math.sin(ang) * math.cos(theta)
+                )
+                lon = lon0 + math.atan2(
+                    math.sin(theta) * math.sin(ang) * math.cos(lat0),
+                    math.cos(ang) - math.sin(lat0) * math.sin(lat),
+                )
+                out.append([math.degrees(lat), math.degrees(lon)])
+            return out
+
         def _after_fence_points(payload: str | None) -> None:
             points: list[list[float]] = []
             if payload:
@@ -5783,6 +5820,7 @@ class MapWidget(QWidget):
                     {
                         "points": points,
                         "alt_max_m": float(self._fence_alt_max.value()),
+                        "action": float(self._fence_action.currentData() or 1.0),
                     }
                 )
                 self._set_status(f"Fence polygon requested ({len(points)} pts)")
@@ -5793,15 +5831,18 @@ class MapWidget(QWidget):
             radius = float(self._fence_radius.value())
             self._fence_radius_m = radius
             self._run_js(f"setFence({self._lat:.8f}, {self._lon:.8f}, {radius:.1f});")
+            # ArduPilot "circular" fence is centered on HOME, not an arbitrary lat/lon.
+            # To match what the operator sees on the map, upload a polygon approximation
+            # centered on the current vehicle position.
+            poly = _circle_polygon_points(self._lat, self._lon, radius, segments=28)
             self.geofence_upload_requested.emit(
                 {
-                    "radius_m": radius,
+                    "points": poly,
                     "alt_max_m": float(self._fence_alt_max.value()),
-                    "center_lat": self._lat,
-                    "center_lon": self._lon,
+                    "action": float(self._fence_action.currentData() or 1.0),
                 }
             )
-            self._set_status(f"Fence requested (r={radius:.0f}m)")
+            self._set_status(f"Fence requested (circle→polygon, r={radius:.0f}m)")
 
         self._run_js("JSON.stringify(getFencePoints());", callback=_after_fence_points)
 

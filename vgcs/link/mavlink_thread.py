@@ -64,6 +64,11 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("arm", bool(arm)))
 
+    def queue_emergency_motor_stop(self) -> None:
+        """Emergency: stop motors immediately (forced disarm)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("emergency_motor_stop", None))
+
     def queue_mode_change(self, mode_name: str) -> None:
         with self._cmd_lock:
             self._cmd_queue.append(("mode_change", mode_name.strip()))
@@ -394,6 +399,8 @@ class MavlinkThread(QThread):
                 self._mission_start()
             elif cmd == "arm":
                 self._arm_disarm(bool(payload))
+            elif cmd == "emergency_motor_stop":
+                self._emergency_motor_stop()
             elif cmd == "mode_change":
                 self._mode_change(str(payload or ""))
             elif cmd == "takeoff":
@@ -1020,6 +1027,30 @@ class MavlinkThread(QThread):
             self.action_result.emit("arm", False, str(e))
             self.error.emit(f"Arm failed: {e}")
 
+    def _emergency_motor_stop(self) -> None:
+        """
+        Emergency motor stop for runaway situations.
+
+        Uses MAV_CMD_COMPONENT_ARM_DISARM with ArduPilot's force override (param2=21196)
+        to disarm immediately even in-air.
+        """
+        if self._master is None:
+            self.action_result.emit("emergency_stop", False, "Link not ready")
+            self.error.emit("Emergency stop: link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                p1=0.0,
+                p2=21196.0,
+            )
+            self.action_result.emit("emergency_stop", True, "FORCED DISARM sent (motor stop)")
+            self.log_line.emit("Emergency motor stop: forced DISARM sent (param2=21196)")
+        except Exception as e:
+            self.action_result.emit("emergency_stop", False, str(e))
+            self.error.emit(f"Emergency stop failed: {e}")
+
     def _send_command_long(
         self,
         command: int,
@@ -1164,6 +1195,9 @@ class MavlinkThread(QThread):
         alt_max_m = max(5.0, float(cfg.get("alt_max_m", 120.0)))
         try:
             self._param_set_value("FENCE_ENABLE", 1.0)
+            # Ensure there is an actual restriction on breach.
+            # Common ArduPilot meanings: 0=None, 1=RTL, 2=Land. Default to RTL.
+            self._param_set_value("FENCE_ACTION", float(cfg.get("action", 1.0)))
             self._param_set_value("FENCE_TYPE", 2.0)  # circular fence
             self._param_set_value("FENCE_RADIUS", radius_m)
             self._param_set_value("FENCE_ALT_MAX", alt_max_m)
@@ -1191,6 +1225,8 @@ class MavlinkThread(QThread):
         if len(norm) < 3:
             raise RuntimeError("Polygon requires >=3 points")
         self._param_set_value("FENCE_ENABLE", 1.0)
+        # Ensure there is an actual restriction on breach (default RTL).
+        self._param_set_value("FENCE_ACTION", 1.0)
         self._param_set_value("FENCE_TYPE", 4.0)  # polygon fence
         self._param_set_value("FENCE_TOTAL", float(len(norm)))
         for idx, (lat, lon) in enumerate(norm):
