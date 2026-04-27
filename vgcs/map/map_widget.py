@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import shutil
+import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -42,17 +46,9 @@ from vgcs.mission import (
     save_waypoints_kml,
 )
 
-# Optional: live camera preview for map overlay.
-try:
-    from PySide6.QtMultimedia import QCamera, QMediaCaptureSession, QMediaDevices, QVideoSink
-
-    HAS_MULTIMEDIA = True
-except Exception:  # pragma: no cover - depends on platform build
-    QCamera = None  # type: ignore[assignment]
-    QMediaCaptureSession = None  # type: ignore[assignment]
-    QMediaDevices = None  # type: ignore[assignment]
-    QVideoSink = None  # type: ignore[assignment]
-    HAS_MULTIMEDIA = False
+# Optional: live camera preview for map overlay (M3 video pipeline).
+from vgcs.video.pipeline import HAS_MULTIMEDIA, VideoFrame, VideoPipeline
+from vgcs.video.camera_control import NoopCameraControl
 
 # QSettings: Plan Flight Save vs map toolbar export use different "last file" keys.
 _QS_NS = "VGCS"
@@ -64,6 +60,13 @@ _KEY_MAP_OFFLINE_TILE_ROOT = "map_offline_tile_root"
 _KEY_MAP_WEBCAM_ENABLED = "map_webcam_enabled"
 _KEY_MAP_LOW_SPEC_MODE = "map_low_spec_mode"  # 'auto' | 'on' | 'off'
 _KEY_MAP_TILE_MODE = "map_tile_mode"  # 'esri_streets' | 'osm' | 'sat' | 'offline'
+
+# M3 video settings (QSettings keys, written by Application Settings → Video).
+_KEY_VIDEO_ENABLED = "video/enabled"
+_KEY_VIDEO_SOURCE = "video/source"  # 'disabled' | 'rtsp'
+_KEY_VIDEO_RTSP_DAY = "video/rtsp_day"
+_KEY_VIDEO_RTSP_THERMAL = "video/rtsp_thermal"
+_KEY_VIDEO_DEFAULT_VIEW = "video/default_view"  # 'Single' | 'Split'
 
 
 try:
@@ -856,6 +859,73 @@ LEAFLET_HTML = """<!doctype html>
       object-fit: cover;
       display: block;
     }
+    #aiOverlaySingle, #aiOverlayGrid {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 1212;
+    }
+    #aiOverlaySingle { display: none; }
+    #aiOverlayGrid {
+      display: none;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      gap: 1px;
+    }
+    .aiGridCell { position: relative; }
+    .aiBox {
+      position: absolute;
+      border: 2px solid rgba(0, 255, 150, 0.9);
+      border-radius: 6px;
+      background: rgba(0, 255, 150, 0.08);
+      box-shadow: 0 0 0 1px rgba(0,0,0,0.25) inset;
+    }
+    .aiBoxLabel {
+      position: absolute;
+      left: 0;
+      top: -18px;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-size: 10px;
+      font-weight: 700;
+      color: rgba(240, 246, 255, 0.96);
+      background: rgba(10, 16, 28, 0.72);
+      border: 1px solid rgba(210, 220, 240, 0.22);
+      white-space: nowrap;
+    }
+    #videoPreviewGrid {
+      position: absolute;
+      inset: 0;
+      display: none;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      gap: 1px;
+      background: rgba(255,255,255,0.08);
+    }
+    #videoPreviewGrid .videoGridImg {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      background: #0b1120;
+    }
+    #videoPreviewGrid .videoGridImg::after {
+      content: attr(data-label);
+      position: absolute;
+      left: 6px;
+      top: 6px;
+      padding: 3px 6px;
+      border-radius: 6px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: rgba(240, 246, 255, 0.96);
+      background: rgba(10, 16, 28, 0.62);
+      border: 1px solid rgba(210, 220, 240, 0.22);
+      pointer-events: none;
+      text-transform: uppercase;
+    }
     #videoPreviewPlaceholder {
       position: absolute;
       inset: 0;
@@ -878,6 +948,23 @@ LEAFLET_HTML = """<!doctype html>
       border-radius: 22px;
       background: rgba(73, 83, 102, 0.9);
       border: 1px solid rgba(190, 202, 224, 0.35);
+    }
+    #camZoomRow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #camFocusRow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #camGimbalRow {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: center;
     }
     .camSmallBtn {
       width: 48px;
@@ -1989,13 +2076,46 @@ LEAFLET_HTML = """<!doctype html>
             <circle cx="12" cy="13.5" r="3.2" fill="rgba(39,47,61,0.95)"></circle>
           </svg>
         </div>
+        <div class="camSmallBtn" id="camSplitBtn" title="Split view (1/4)">
+          <span class="camLabel">▦</span>
+        </div>
+        <div class="camSmallBtn" id="camFollowBtn" title="Follow vehicle (center map)">
+          <span class="camLabel">◎</span>
+        </div>
       </div>
       <div id="camRecordBtn" title="Start/Stop recording"><div id="camRecordDot"></div></div>
       <div id="camTimer">00:00:00</div>
+      <div id="camZoomRow">
+        <div class="camSmallBtn" id="camZoomOutBtn" title="Zoom out"><span class="camLabel">−</span></div>
+        <div class="camSmallBtn" id="camZoomInBtn" title="Zoom in"><span class="camLabel">＋</span></div>
+      </div>
+      <div id="camFocusRow">
+        <div class="camSmallBtn" id="camFocusOutBtn" title="Focus out"><span class="camLabel">F−</span></div>
+        <div class="camSmallBtn" id="camFocusInBtn" title="Focus in"><span class="camLabel">F＋</span></div>
+      </div>
+      <div id="camGimbalRow">
+        <div class="camSmallBtn" id="camGimbalUpBtn" title="Gimbal up"><span class="camLabel">↑</span></div>
+        <div class="camSmallBtn" id="camGimbalDownBtn" title="Gimbal down"><span class="camLabel">↓</span></div>
+        <div class="camSmallBtn" id="camGimbalLeftBtn" title="Gimbal left"><span class="camLabel">←</span></div>
+        <div class="camSmallBtn" id="camGimbalRightBtn" title="Gimbal right"><span class="camLabel">→</span></div>
+      </div>
       <div class="camSmallBtn" id="camSettingsBtn" title="Camera settings"><span class="camLabel">⚙</span></div>
     </div>
     <div class="overlay" id="videoPreview">
       <img id="videoPreviewImg" alt="Video preview" />
+      <div id="videoPreviewGrid" aria-hidden="true">
+        <img class="videoGridImg" id="videoGridImg1" alt="Video preview 1" />
+        <img class="videoGridImg" id="videoGridImg2" alt="Video preview 2" />
+        <img class="videoGridImg" id="videoGridImg3" alt="Video preview 3" />
+        <img class="videoGridImg" id="videoGridImg4" alt="Video preview 4" />
+      </div>
+      <div id="aiOverlaySingle" aria-hidden="true"></div>
+      <div id="aiOverlayGrid" aria-hidden="true">
+        <div class="aiGridCell" id="aiGrid1"></div>
+        <div class="aiGridCell" id="aiGrid2"></div>
+        <div class="aiGridCell" id="aiGrid3"></div>
+        <div class="aiGridCell" id="aiGrid4"></div>
+      </div>
       <div id="videoPreviewPlaceholder">Video</div>
     </div>
     <div id="mapFooterHud" aria-hidden="false">
@@ -2187,14 +2307,36 @@ LEAFLET_HTML = """<!doctype html>
     const cameraRail = document.getElementById('cameraRail');
     const camVideoBtn = document.getElementById('camVideoBtn');
     const camPhotoBtn = document.getElementById('camPhotoBtn');
+    const camSplitBtn = document.getElementById('camSplitBtn');
+    const camFollowBtn = document.getElementById('camFollowBtn');
+    const camZoomOutBtn = document.getElementById('camZoomOutBtn');
+    const camZoomInBtn = document.getElementById('camZoomInBtn');
     const camRecordBtn = document.getElementById('camRecordBtn');
     const camSettingsBtn = document.getElementById('camSettingsBtn');
     const camTimer = document.getElementById('camTimer');
+    const camFocusOutBtn = document.getElementById('camFocusOutBtn');
+    const camFocusInBtn = document.getElementById('camFocusInBtn');
+    const camGimbalUpBtn = document.getElementById('camGimbalUpBtn');
+    const camGimbalDownBtn = document.getElementById('camGimbalDownBtn');
+    const camGimbalLeftBtn = document.getElementById('camGimbalLeftBtn');
+    const camGimbalRightBtn = document.getElementById('camGimbalRightBtn');
     const videoPreview = document.getElementById('videoPreview');
     const videoPreviewImg = document.getElementById('videoPreviewImg');
+    const videoPreviewGrid = document.getElementById('videoPreviewGrid');
+    const videoGridImg1 = document.getElementById('videoGridImg1');
+    const videoGridImg2 = document.getElementById('videoGridImg2');
+    const videoGridImg3 = document.getElementById('videoGridImg3');
+    const videoGridImg4 = document.getElementById('videoGridImg4');
     const videoPreviewPlaceholder = document.getElementById('videoPreviewPlaceholder');
+    const aiOverlaySingle = document.getElementById('aiOverlaySingle');
+    const aiOverlayGrid = document.getElementById('aiOverlayGrid');
+    const aiGrid1 = document.getElementById('aiGrid1');
+    const aiGrid2 = document.getElementById('aiGrid2');
+    const aiGrid3 = document.getElementById('aiGrid3');
+    const aiGrid4 = document.getElementById('aiGrid4');
     let camTimerId = null;
     let camRecordStartedAt = 0;
+    let __camSplitEnabled = false;
     function formatRecordTime(seconds) {
       const s = Math.max(0, Number(seconds) || 0);
       const hh = String(Math.floor(s / 3600)).padStart(2, '0');
@@ -2237,6 +2379,109 @@ LEAFLET_HTML = """<!doctype html>
       videoPreviewPlaceholder.style.display = 'none';
       return 1;
     }
+    function setVideoPreviewMode(mode) {
+      const m = String(mode || 'single').toLowerCase();
+      const grid = m === 'grid';
+      if (videoPreviewGrid) videoPreviewGrid.style.display = grid ? 'grid' : 'none';
+      if (videoPreviewImg) videoPreviewImg.style.display = grid ? 'none' : 'block';
+      if (aiOverlaySingle) aiOverlaySingle.style.display = grid ? 'none' : 'block';
+      if (aiOverlayGrid) aiOverlayGrid.style.display = grid ? 'grid' : 'none';
+      return 1;
+    }
+    function setVideoPreviewGrid(images) {
+      if (!videoPreviewGrid) return 0;
+      setVideoPreviewMode('grid');
+      const arr = Array.isArray(images) ? images : [];
+      const els = [videoGridImg1, videoGridImg2, videoGridImg3, videoGridImg4];
+      for (let i = 0; i < els.length; i++) {
+        const el = els[i];
+        if (!el) continue;
+        const src = String(arr[i] || '').trim();
+        if (!src) {
+          el.removeAttribute('src');
+        } else {
+          el.src = src;
+        }
+      }
+      if (videoPreviewPlaceholder) {
+        const any = els.some((el, i) => el && String(arr[i] || '').trim());
+        videoPreviewPlaceholder.style.display = any ? 'none' : 'flex';
+      }
+      return 1;
+    }
+
+    function clearVideoPreviewGrid() {
+      const els = [videoGridImg1, videoGridImg2, videoGridImg3, videoGridImg4];
+      for (const el of els) {
+        if (!el) continue;
+        try { el.removeAttribute('src'); } catch (e) {}
+        try { el.setAttribute('data-label', ''); } catch (e) {}
+      }
+      return 1;
+    }
+
+    function clearAiOverlays() {
+      try { if (aiOverlaySingle) aiOverlaySingle.innerHTML = ''; } catch (e) {}
+      for (const cell of [aiGrid1, aiGrid2, aiGrid3, aiGrid4]) {
+        try { if (cell) cell.innerHTML = ''; } catch (e) {}
+      }
+      return 1;
+    }
+
+    function _renderAiBoxes(container, dets) {
+      if (!container) return 0;
+      container.innerHTML = '';
+      const arr = Array.isArray(dets) ? dets : [];
+      for (const d of arr) {
+        const x = Math.max(0, Math.min(1, Number(d && d.x) || 0));
+        const y = Math.max(0, Math.min(1, Number(d && d.y) || 0));
+        const w = Math.max(0, Math.min(1, Number(d && d.w) || 0));
+        const h = Math.max(0, Math.min(1, Number(d && d.h) || 0));
+        const label = String((d && d.label) || '').trim();
+        const score = Number(d && d.score);
+        const box = document.createElement('div');
+        box.className = 'aiBox';
+        box.style.left = (x * 100).toFixed(3) + '%';
+        box.style.top = (y * 100).toFixed(3) + '%';
+        box.style.width = (w * 100).toFixed(3) + '%';
+        box.style.height = (h * 100).toFixed(3) + '%';
+        if (label || Number.isFinite(score)) {
+          const lab = document.createElement('div');
+          lab.className = 'aiBoxLabel';
+          const s = Number.isFinite(score) ? ` ${(score * 100).toFixed(0)}%` : '';
+          lab.textContent = (label || 'det') + s;
+          box.appendChild(lab);
+        }
+        container.appendChild(box);
+      }
+      return 1;
+    }
+
+    function setAiOverlaySingle(dets) {
+      if (!aiOverlaySingle) return 0;
+      return _renderAiBoxes(aiOverlaySingle, dets);
+    }
+
+    function setAiOverlayGrid(detsByCell) {
+      const arr = Array.isArray(detsByCell) ? detsByCell : [];
+      const cells = [aiGrid1, aiGrid2, aiGrid3, aiGrid4];
+      for (let i = 0; i < cells.length; i++) {
+        _renderAiBoxes(cells[i], arr[i] || []);
+      }
+      return 1;
+    }
+
+    function setVideoPreviewLabels(labels) {
+      const arr = Array.isArray(labels) ? labels : [];
+      const els = [videoGridImg1, videoGridImg2, videoGridImg3, videoGridImg4];
+      for (let i = 0; i < els.length; i++) {
+        const el = els[i];
+        if (!el) continue;
+        const txt = String(arr[i] || '').trim();
+        el.setAttribute('data-label', txt);
+      }
+      return 1;
+    }
     if (camVideoBtn) {
       camVideoBtn.classList.add('active');
       camVideoBtn.addEventListener('click', function(ev) {
@@ -2244,6 +2489,8 @@ LEAFLET_HTML = """<!doctype html>
         ev.stopPropagation();
         camVideoBtn.classList.add('active');
         if (camPhotoBtn) camPhotoBtn.classList.remove('active');
+        // Toggle live preview (Python backend decides).
+        document.title = 'VGCS_CAM_VIDEO_TOGGLE:' + Date.now();
       });
     }
     if (camPhotoBtn) {
@@ -2252,6 +2499,8 @@ LEAFLET_HTML = """<!doctype html>
         ev.stopPropagation();
         camPhotoBtn.classList.add('active');
         if (camVideoBtn) camVideoBtn.classList.remove('active');
+        // Request a photo capture (handled in Python).
+        document.title = 'VGCS_CAM_PHOTO_REQUEST:' + Date.now();
       });
     }
     if (camRecordBtn) {
@@ -2261,6 +2510,7 @@ LEAFLET_HTML = """<!doctype html>
         const now = Date.now();
         if (camRecordBtn.classList.contains('recording')) {
           resetCameraTimer();
+          document.title = 'VGCS_CAM_RECORD_TOGGLE:0:' + Date.now();
           return;
         }
         camRecordBtn.classList.add('recording');
@@ -2272,6 +2522,7 @@ LEAFLET_HTML = """<!doctype html>
           const elapsedSec = Math.floor((Date.now() - camRecordStartedAt) / 1000);
           camTimer.textContent = formatRecordTime(elapsedSec);
         }, 250);
+        document.title = 'VGCS_CAM_RECORD_TOGGLE:1:' + Date.now();
       });
     }
     if (camSettingsBtn) {
@@ -2280,8 +2531,63 @@ LEAFLET_HTML = """<!doctype html>
         ev.stopPropagation();
         camSettingsBtn.classList.add('active');
         setTimeout(() => camSettingsBtn.classList.remove('active'), 200);
+        // For now: cycle vision mode day/night on each press.
+        document.title = 'VGCS_CAM_VISION_TOGGLE:' + Date.now();
       });
     }
+    if (camSplitBtn) {
+      camSplitBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        __camSplitEnabled = !__camSplitEnabled;
+        camSplitBtn.classList.toggle('active', !!__camSplitEnabled);
+        document.title = 'VGCS_CAM_SPLIT_TOGGLE:' + (__camSplitEnabled ? '1' : '0') + ':' + Date.now();
+      });
+    }
+    if (camFollowBtn) {
+      camFollowBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const en = !camFollowBtn.classList.contains('active');
+        camFollowBtn.classList.toggle('active', en);
+        document.title = 'VGCS_CAM_FOLLOW_TOGGLE:' + (en ? '1' : '0') + ':' + Date.now();
+      });
+    }
+    if (camZoomOutBtn) {
+      camZoomOutBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_CAM_ZOOM_STEP:-1:' + Date.now();
+      });
+    }
+    if (camZoomInBtn) {
+      camZoomInBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_CAM_ZOOM_STEP:1:' + Date.now();
+      });
+    }
+    if (camFocusOutBtn) {
+      camFocusOutBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_CAM_FOCUS_STEP:-1:' + Date.now();
+      });
+    }
+    if (camFocusInBtn) {
+      camFocusInBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_CAM_FOCUS_STEP:1:' + Date.now();
+      });
+    }
+    function sendGimbal(dx, dy) {
+      document.title = 'VGCS_CAM_GIMBAL_NUDGE:' + String(dx || 0) + ':' + String(dy || 0) + ':' + Date.now();
+    }
+    if (camGimbalUpBtn) camGimbalUpBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(0, -1); });
+    if (camGimbalDownBtn) camGimbalDownBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(0, 1); });
+    if (camGimbalLeftBtn) camGimbalLeftBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(-1, 0); });
+    if (camGimbalRightBtn) camGimbalRightBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(1, 0); });
     let tileLayer = null;
     let labelLayer = null;
     let __tileErrorCount = 0;
@@ -4220,6 +4526,13 @@ class MapWidget(QWidget):
         self._tile_probe_bridge.result.connect(self._on_tile_probe_result)
         self._tile_probe_ran = False
 
+        # M3 video settings snapshot (applied lazily when video backend initializes).
+        self._video_settings_enabled = False
+        self._video_settings_day = ""
+        self._video_settings_thermal = ""
+        self._video_settings_default_view = "Single"
+        self._camera_control = NoopCameraControl()
+
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -5014,6 +5327,10 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             self.map_page_ready.emit()
+            try:
+                self.apply_video_settings()
+            except Exception:
+                pass
             # If we became ready after link-up, only start preview if user enabled it.
             try:
                 if bool(self._last_link_connected) and bool(self._btn_webcam.isChecked()):
@@ -5032,13 +5349,24 @@ class MapWidget(QWidget):
         if not HAS_MULTIMEDIA:
             return False
         if getattr(self, "_video_inited", False):
-            return bool(getattr(self, "_camera", None)) and bool(getattr(self, "_video_sink", None))
+            return bool(getattr(self, "_video", None)) and bool(getattr(self, "_video_active_source", None))
 
         self._video_inited = True
-        self._camera = None
-        self._capture_session = None
-        self._video_sink = None
+        self._video: VideoPipeline | None = None
+        self._video_active_source = None
+        self._video_preview_enabled = False
+        self._video_split_enabled = False
+        self._video_recording = False
+        self._video_recording_tmp_path = ""
+        self._video_vision_mode = "day"  # 'day' | 'night'
+        self._video_zoom = 1.0  # 1.0x .. 4.0x
+        self._video_follow_enabled = False
+        self._video_follow_last_center_mono = 0.0
         self._video_last_data_url = ""
+        self._video_last_data_urls: dict[str, str] = {}
+        self._video_encode_inflight_by_id: dict[str, bool] = {}
+        self._video_encode_pending_by_id: dict[str, QImage | None] = {}
+        self._video_encode_bridge_by_id: dict[str, _VideoEncodeBridge] = {}
         self._video_encode_bridge = _VideoEncodeBridge(self)
         self._video_encode_bridge.encoded.connect(self._on_video_frame_encoded)
         self._video_encode_inflight = False
@@ -5046,28 +5374,99 @@ class MapWidget(QWidget):
         self._video_pool = QThreadPool.globalInstance()
         self._video_push_timer = QTimer(self)
         self._video_push_timer.setInterval(200)  # 5 fps push to WebEngine
-        self._video_push_timer.timeout.connect(self._push_video_preview_to_overlay)
+        self._video_push_timer.timeout.connect(self._push_video_preview_any_to_overlay)
+        self._ai_timer = QTimer(self)
+        self._ai_timer.setInterval(250)  # 4 Hz dummy overlay
+        self._ai_timer.timeout.connect(self._push_dummy_ai_overlay)
+        self._ai_phase = 0.0
 
         try:
-            devices = list(QMediaDevices.videoInputs()) if QMediaDevices is not None else []
+            self._video = VideoPipeline(self)
+            # Apply RTSP settings before enumerating sources.
+            try:
+                self._read_video_settings()
+                if bool(self._video_settings_enabled):
+                    self._video.set_rtsp_sources(
+                        day_url=str(self._video_settings_day),
+                        thermal_url=str(self._video_settings_thermal),
+                    )
+            except Exception:
+                pass
+            sources = self._video.sources()
         except Exception:
-            devices = []
-        if not devices:
+            self._video = None
+            sources = {}
+        if not sources:
             return False
 
         try:
-            self._video_sink = QVideoSink(self)
-            self._video_sink.videoFrameChanged.connect(self._on_video_frame_changed)
-            self._capture_session = QMediaCaptureSession(self)
-            self._capture_session.setVideoSink(self._video_sink)
-            self._camera = QCamera(devices[0])
-            self._capture_session.setCamera(self._camera)
+            self._video_active_source = self._video.active_source() if self._video is not None else None
+            if self._video_active_source is not None:
+                self._video_active_source.frame.connect(self._on_pipeline_frame)
+            # Prep split handlers for up to 4 sources.
+            for sid, src in list(sources.items())[:4]:
+                bridge = _VideoEncodeBridge(self)
+                bridge.encoded.connect(lambda data_url, sid=sid: self._on_video_frame_encoded_for(sid, data_url))
+                self._video_encode_bridge_by_id[sid] = bridge
+                self._video_encode_inflight_by_id[sid] = False
+                self._video_encode_pending_by_id[sid] = None
+                self._video_last_data_urls[sid] = ""
+                src.frame.connect(lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf))
         except Exception:
-            self._camera = None
-            self._capture_session = None
-            self._video_sink = None
+            self._video_active_source = None
             return False
         return True
+
+    def _read_video_settings(self) -> None:
+        s = QSettings(_QS_NS, _QS_APP)
+        source = str(s.value(_KEY_VIDEO_SOURCE, "rtsp") or "rtsp").strip().lower()
+        self._video_settings_enabled = bool(s.value(_KEY_VIDEO_ENABLED, False)) and source != "disabled"
+        self._video_settings_day = str(s.value(_KEY_VIDEO_RTSP_DAY, "") or "").strip()
+        self._video_settings_thermal = str(s.value(_KEY_VIDEO_RTSP_THERMAL, "") or "").strip()
+        self._video_settings_default_view = str(s.value(_KEY_VIDEO_DEFAULT_VIEW, "Single") or "Single")
+
+    def apply_video_settings(self) -> None:
+        """
+        Called by MainWindow after Application Settings → Video is applied.
+        Reconfigures the video pipeline (RTSP Day/Thermal) and updates defaults.
+        """
+        self._read_video_settings()
+        # Mirror enable state into legacy toolbar toggle for visibility.
+        try:
+            self._btn_webcam.blockSignals(True)
+            self._btn_webcam.setChecked(bool(self._video_settings_enabled))
+        finally:
+            try:
+                self._btn_webcam.blockSignals(False)
+            except Exception:
+                pass
+
+        # Reset pipeline so next start uses fresh sources.
+        try:
+            if bool(getattr(self, "_video_preview_enabled", False)):
+                self._stop_video_preview(clear_overlay=True)
+        except Exception:
+            pass
+
+    def set_camera_control(self, control) -> None:
+        """Inject a camera control backend (MAVLink/SDK)."""
+        try:
+            self._camera_control = control
+        except Exception:
+            pass
+        self._video_inited = False
+
+        # Default split mode comes from settings.
+        self._video_split_enabled = str(self._video_settings_default_view).strip().lower() == "split"
+
+        try:
+            if getattr(self, "_web_ready", False):
+                if self._video_split_enabled:
+                    self._run_js("setVideoPreviewMode('grid');")
+                else:
+                    self._run_js("setVideoPreviewMode('single');")
+        except Exception:
+            pass
 
     def _start_video_preview(self) -> None:
         if not getattr(self, "_web_ready", False):
@@ -5077,32 +5476,63 @@ class MapWidget(QWidget):
             self._run_js("setVideoPreviewImage('');")
             return
         try:
-            if self._camera is not None:
-                self._camera.start()
+            self._video_preview_enabled = True
+            src = getattr(self, "_video_active_source", None)
+            if src is not None:
+                src.start()
+            if bool(getattr(self, "_video_split_enabled", False)) and getattr(self, "_video", None) is not None:
+                for _, s in list(self._video.sources().items())[:4]:
+                    try:
+                        s.start()
+                    except Exception:
+                        pass
             if hasattr(self, "_video_push_timer") and not self._video_push_timer.isActive():
                 self._video_push_timer.start()
+            if hasattr(self, "_ai_timer") and not self._ai_timer.isActive():
+                self._ai_timer.start()
         except Exception:
             self._run_js("setVideoPreviewImage('');")
 
     def _stop_video_preview(self, *, clear_overlay: bool) -> None:
+        self._video_preview_enabled = False
         if hasattr(self, "_video_push_timer") and self._video_push_timer.isActive():
             self._video_push_timer.stop()
+        if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
+            self._ai_timer.stop()
         try:
-            if getattr(self, "_camera", None) is not None:
-                self._camera.stop()
+            src = getattr(self, "_video_active_source", None)
+            if src is not None:
+                src.stop()
+            if getattr(self, "_video", None) is not None:
+                for _, s in list(self._video.sources().items())[:4]:
+                    try:
+                        s.stop()
+                    except Exception:
+                        pass
         except Exception:
             pass
         if clear_overlay and getattr(self, "_web_ready", False):
             self._run_js("setVideoPreviewImage('');")
+            self._run_js("setVideoPreviewMode('single');")
+            self._run_js("clearAiOverlays();")
 
-    def _on_video_frame_changed(self, frame) -> None:
+    def _on_pipeline_frame(self, vf: VideoFrame) -> None:
         # Called on the GUI thread; offload encoding to a worker to avoid UI freezes on low-end devices.
+        if not bool(getattr(self, "_video_preview_enabled", False)):
+            return
         try:
-            img = frame.toImage()
+            img = vf.image
         except Exception:
             return
         if img is None or img.isNull():
             return
+        # Day/Night preview: night = grayscale.
+        try:
+            if str(getattr(self, "_video_vision_mode", "day") or "day").lower() == "night":
+                img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+        except Exception:
+            pass
+        img = self._apply_digital_zoom(img, float(getattr(self, "_video_zoom", 1.0)))
         try:
             img2 = img.copy()
         except Exception:
@@ -5121,6 +5551,60 @@ class MapWidget(QWidget):
             self._video_encode_inflight = False
             return
 
+    def _on_pipeline_frame_for(self, source_id: str, vf: VideoFrame) -> None:
+        if not bool(getattr(self, "_video_preview_enabled", False)):
+            return
+        if not bool(getattr(self, "_video_split_enabled", False)):
+            return
+        try:
+            img = vf.image
+        except Exception:
+            return
+        if img is None or img.isNull():
+            return
+        try:
+            if str(getattr(self, "_video_vision_mode", "day") or "day").lower() == "night":
+                img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+        except Exception:
+            pass
+        img = self._apply_digital_zoom(img, float(getattr(self, "_video_zoom", 1.0)))
+        try:
+            img2 = img.copy()
+        except Exception:
+            img2 = img
+
+        if bool(self._video_encode_inflight_by_id.get(source_id, False)):
+            self._video_encode_pending_by_id[source_id] = img2
+            return
+        self._video_encode_inflight_by_id[source_id] = True
+        bridge = self._video_encode_bridge_by_id.get(source_id)
+        if bridge is None:
+            self._video_encode_inflight_by_id[source_id] = False
+            return
+        task = _VideoEncodeTask(img2, bridge)
+        try:
+            self._video_pool.start(task)
+        except Exception:
+            self._video_encode_inflight_by_id[source_id] = False
+
+    def _on_video_frame_encoded_for(self, source_id: str, data_url: str) -> None:
+        self._video_last_data_urls[source_id] = str(data_url or "")
+        self._video_encode_inflight_by_id[source_id] = False
+        pending = self._video_encode_pending_by_id.get(source_id)
+        if pending is None:
+            return
+        self._video_encode_pending_by_id[source_id] = None
+        self._video_encode_inflight_by_id[source_id] = True
+        bridge = self._video_encode_bridge_by_id.get(source_id)
+        if bridge is None:
+            self._video_encode_inflight_by_id[source_id] = False
+            return
+        task = _VideoEncodeTask(pending, bridge)
+        try:
+            self._video_pool.start(task)
+        except Exception:
+            self._video_encode_inflight_by_id[source_id] = False
+
     def _on_video_frame_encoded(self, data_url: str) -> None:
         self._video_last_data_url = str(data_url or "")
         self._video_encode_inflight = False
@@ -5136,20 +5620,314 @@ class MapWidget(QWidget):
             self._video_encode_inflight = False
             return
 
-    def _push_video_preview_to_overlay(self) -> None:
+    def _push_video_preview_any_to_overlay(self) -> None:
         if not getattr(self, "_web_ready", False):
+            return
+        if bool(getattr(self, "_video_split_enabled", False)) and getattr(self, "_video", None) is not None:
+            keys = list(self._video.sources().keys())
+            # Prefer RTSP Day/Thermal ordering when available.
+            ids: list[str] = []
+            for k in ("day", "thermal"):
+                if k in keys:
+                    ids.append(k)
+            for k in keys:
+                if k not in ids:
+                    ids.append(k)
+            ids = ids[:4]
+            imgs = [str(self._video_last_data_urls.get(i, "") or "") for i in ids]
+            # Ensure we always have a valid single-view fallback image when toggling split off.
+            # Use the first available cell (Day, then Thermal, then others).
+            try:
+                first = next((s for s in imgs if str(s).strip()), "")
+            except Exception:
+                first = ""
+            if first:
+                self._video_last_data_url = str(first)
+            payload = json.dumps(imgs)
+            self._run_js(f"setVideoPreviewGrid({payload});")
+            labels = []
+            for sid in ids:
+                if sid == "day":
+                    labels.append("Day")
+                elif sid == "thermal":
+                    labels.append("Thermal")
+                else:
+                    labels.append(str(sid))
+            self._run_js(f"setVideoPreviewLabels({json.dumps(labels)});")
             return
         src = str(getattr(self, "_video_last_data_url", "") or "")
         if not src:
             return
-        # Avoid spamming WebEngine with identical payloads.
         last = str(getattr(self, "_last_video_pushed", "") or "")
         if src == last:
             return
         self._last_video_pushed = src
+        self._run_js("setVideoPreviewMode('single');")
         self._run_js(f"setVideoPreviewImage({json.dumps(src)});")
 
+    def _push_dummy_ai_overlay(self) -> None:
+        if not getattr(self, "_web_ready", False):
+            return
+        if not bool(getattr(self, "_video_preview_enabled", False)):
+            return
+        # Simple moving box in normalized coordinates.
+        try:
+            self._ai_phase = float(getattr(self, "_ai_phase", 0.0)) + 0.06
+        except Exception:
+            self._ai_phase = 0.0
+        p = float(getattr(self, "_ai_phase", 0.0))
+        x = (0.1 + (0.6 * (0.5 + 0.5 * math.sin(p))))  # 0.1..0.7
+        y = 0.18
+        w = 0.22
+        h = 0.22
+        det = [{"x": x, "y": y, "w": w, "h": h, "label": "demo", "score": 0.86}]
+        if bool(getattr(self, "_video_split_enabled", False)):
+            # Send to first two cells (Day/Thermal) and empty for others.
+            payload = json.dumps([det, det, [], []])
+            self._run_js(f"setAiOverlayGrid({payload});")
+        else:
+            self._run_js(f"setAiOverlaySingle({json.dumps(det)});")
+
+    def _apply_digital_zoom(self, img: QImage, zoom: float) -> QImage:
+        try:
+            z = float(zoom)
+        except Exception:
+            z = 1.0
+        if z <= 1.001:
+            return img
+        w = img.width()
+        h = img.height()
+        if w <= 0 or h <= 0:
+            return img
+        cw = max(1, int(w / z))
+        ch = max(1, int(h / z))
+        x = max(0, (w - cw) // 2)
+        y = max(0, (h - ch) // 2)
+        try:
+            cropped = img.copy(x, y, cw, ch)
+            return cropped.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        except Exception:
+            return img
+
     def _on_web_title_changed(self, title: str) -> None:
+        if title.startswith("VGCS_CAM_VIDEO_TOGGLE:"):
+            try:
+                enabled = bool(getattr(self, "_video_preview_enabled", False))
+                if enabled:
+                    self._stop_video_preview(clear_overlay=True)
+                else:
+                    self._start_video_preview()
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_VISION_TOGGLE:"):
+            try:
+                cur = str(getattr(self, "_video_vision_mode", "day") or "day").lower()
+                self._video_vision_mode = "night" if cur != "night" else "day"
+            except Exception:
+                self._video_vision_mode = "day"
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_PHOTO_REQUEST:"):
+            try:
+                # Ensure backend exists and source is started.
+                self._ensure_video_preview_backend()
+                src = getattr(self, "_video_active_source", None)
+                if src is not None:
+                    # Save dialog on the Qt side.
+                    path, _ = QFileDialog.getSaveFileName(
+                        self,
+                        "Save photo",
+                        str(Path.cwd() / "photo.jpg"),
+                        "Images (*.jpg *.png)",
+                    )
+                    if path:
+                        src.take_photo(path)
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_RECORD_TOGGLE:"):
+            # Format: VGCS_CAM_RECORD_TOGGLE:<0|1>:<ts>
+            try:
+                parts = title.split(":")
+                want_on = bool(int(parts[1])) if len(parts) >= 2 else False
+            except Exception:
+                want_on = False
+            try:
+                self._ensure_video_preview_backend()
+                src = getattr(self, "_video_active_source", None)
+                rec = src.recorder() if src is not None and hasattr(src, "recorder") else None
+                # RTSP sources use ffmpeg recording.
+                if src is not None and hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
+                    if want_on and not bool(getattr(self, "_video_recording", False)):
+                        tmp = Path(tempfile.gettempdir()) / f"vgcs_recording_{int(time.time())}.mp4"
+                        ok = bool(src.start_recording(str(tmp)))
+                        self._video_recording = bool(ok)
+                        self._video_recording_tmp_path = str(tmp) if ok else ""
+                    if (not want_on) and bool(getattr(self, "_video_recording", False)):
+                        try:
+                            src.stop_recording()
+                        except Exception:
+                            pass
+                        self._video_recording = False
+                        tmp_path = str(getattr(self, "_video_recording_tmp_path", "") or "")
+                        self._video_recording_tmp_path = ""
+                        if tmp_path:
+                            save_to, _ = QFileDialog.getSaveFileName(
+                                self,
+                                "Save recording",
+                                str(Path.cwd() / "recording.mp4"),
+                                "Video (*.mp4 *.mov *.mkv)",
+                            )
+                            if save_to:
+                                try:
+                                    shutil.move(tmp_path, str(save_to))
+                                except Exception:
+                                    pass
+                    self._run_js("document.title = 'VGCS Map';")
+                    return
+                if rec is None:
+                    self._video_recording = False
+                    self._run_js("document.title = 'VGCS Map';")
+                    return
+                if want_on and not bool(getattr(self, "_video_recording", False)):
+                    tmp = Path(tempfile.gettempdir()) / f"vgcs_recording_{int(time.time())}.mp4"
+                    try:
+                        rec.setOutputLocation(QUrl.fromLocalFile(str(tmp)))
+                    except Exception:
+                        pass
+                    try:
+                        rec.record()
+                        self._video_recording = True
+                        self._video_recording_tmp_path = str(tmp)
+                    except Exception:
+                        self._video_recording = False
+                        self._video_recording_tmp_path = ""
+                if (not want_on) and bool(getattr(self, "_video_recording", False)):
+                    try:
+                        rec.stop()
+                    except Exception:
+                        pass
+                    self._video_recording = False
+                    tmp_path = str(getattr(self, "_video_recording_tmp_path", "") or "")
+                    self._video_recording_tmp_path = ""
+                    if tmp_path:
+                        save_to, _ = QFileDialog.getSaveFileName(
+                            self,
+                            "Save recording",
+                            str(Path.cwd() / "recording.mp4"),
+                            "Video (*.mp4 *.mov *.mkv)",
+                        )
+                        if save_to:
+                            try:
+                                shutil.move(tmp_path, str(save_to))
+                            except Exception:
+                                pass
+            except Exception:
+                self._video_recording = False
+                self._video_recording_tmp_path = ""
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_SPLIT_TOGGLE:"):
+            # Format: VGCS_CAM_SPLIT_TOGGLE:<0|1>:<ts>
+            try:
+                parts = title.split(":")
+                self._video_split_enabled = bool(int(parts[1])) if len(parts) >= 2 else False
+            except Exception:
+                self._video_split_enabled = False
+            try:
+                if bool(getattr(self, "_video_split_enabled", False)):
+                    self._ensure_video_preview_backend()
+                    self._start_video_preview()
+                else:
+                    # Force UI to re-render in single mode even if the underlying frame hasn't changed.
+                    self._last_video_pushed = ""
+                    self._run_js("clearVideoPreviewGrid();")
+                    self._run_js("setVideoPreviewMode('single');")
+                    # Immediately repaint a single frame (don't wait for next timer tick).
+                    try:
+                        self._push_video_preview_any_to_overlay()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_ZOOM_STEP:"):
+            # Format: VGCS_CAM_ZOOM_STEP:<-1|1>:<ts>
+            try:
+                parts = title.split(":")
+                step = int(parts[1]) if len(parts) >= 2 else 0
+            except Exception:
+                step = 0
+            try:
+                cur = float(getattr(self, "_video_zoom", 1.0))
+            except Exception:
+                cur = 1.0
+            cur += 0.25 * float(step)
+            cur = max(1.0, min(4.0, cur))
+            self._video_zoom = cur
+            try:
+                # Stage 1 hook for real payload zoom.
+                self._camera_control.set_zoom(float(cur))
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_FOLLOW_TOGGLE:"):
+            # Format: VGCS_CAM_FOLLOW_TOGGLE:<0|1>:<ts>
+            try:
+                parts = title.split(":")
+                self._video_follow_enabled = bool(int(parts[1])) if len(parts) >= 2 else False
+                self._video_follow_last_center_mono = 0.0
+            except Exception:
+                self._video_follow_enabled = False
+                self._video_follow_last_center_mono = 0.0
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_FOCUS_STEP:"):
+            # Format: VGCS_CAM_FOCUS_STEP:<-1|1>:<ts>
+            try:
+                parts = title.split(":")
+                step = int(parts[1]) if len(parts) >= 2 else 0
+            except Exception:
+                step = 0
+            try:
+                cur = float(getattr(self, "_video_focus", 0.0))
+            except Exception:
+                cur = 0.0
+            cur += 0.25 * float(step)
+            cur = max(-5.0, min(5.0, cur))
+            self._video_focus = cur
+            try:
+                self._camera_control.set_focus(float(cur))
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_GIMBAL_NUDGE:"):
+            # Format: VGCS_CAM_GIMBAL_NUDGE:<dx>:<dy>:<ts>
+            try:
+                parts = title.split(":")
+                dx = int(parts[1]) if len(parts) >= 2 else 0
+                dy = int(parts[2]) if len(parts) >= 3 else 0
+            except Exception:
+                dx = 0
+                dy = 0
+            # Small nudge steps in degrees.
+            pitch = float(dy) * 2.0
+            yaw = float(dx) * 3.0
+            try:
+                from vgcs.video.camera_control import GimbalCommand
+
+                self._camera_control.set_gimbal(GimbalCommand(pitch_deg=pitch, yaw_deg=yaw))
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+
         if title.startswith("VGCS_ASSET_ERROR:"):
             reason = title.split(":", 2)[1] if ":" in title else "asset"
             if "cesium" in reason:
@@ -5295,6 +6073,16 @@ class MapWidget(QWidget):
             f"setVehicle({lat:.8f}, {lon:.8f}); "
             f"updateHeading({hd:.2f}, undefined, undefined, {json.dumps(src)});"
         )
+        if bool(getattr(self, "_video_follow_enabled", False)):
+            try:
+                now = time.monotonic()
+                last = float(getattr(self, "_video_follow_last_center_mono", 0.0))
+                # Throttle map recentering for usability.
+                if now - last >= 0.6:
+                    self._video_follow_last_center_mono = now
+                    self._run_js("centerOnVehicle();")
+            except Exception:
+                pass
 
     def set_vehicle_position(self, lat: float, lon: float, *, relative_alt_m: float | None = None) -> None:
         first_fix = self._lat is None or self._lon is None

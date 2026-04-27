@@ -41,9 +41,14 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QDoubleSpinBox,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QListWidget,
+    QListWidgetItem,
+    QStackedWidget,
+    QSpinBox,
 )
 from pymavlink import mavutil
 
@@ -54,6 +59,9 @@ from vgcs.mission import Waypoint
 from vgcs.map import MapWidget
 from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
+from vgcs.video.pipeline import VideoPipeline
+from vgcs.video.widgets import CameraControlPanel, SplitVideoPanel
+from vgcs.video.camera_control import MavlinkCameraControl, NoopCameraControl
 
 
 def _settings_truthy(val: object, default: bool = False) -> bool:
@@ -145,6 +153,9 @@ class MainWindow(QMainWindow):
         # WebEngine overlay refresh budget (~10 Hz) — avoids full-map flicker from 25–50 Hz MAVLink.
         self._last_map_overlay_refresh_s: float | None = None
         self._mission_upload_pending = False
+
+        # M3 video pipeline (camera sources + frame distribution).
+        self._video = VideoPipeline(self)
 
         self._conn_label = QLabel("MAVLink connection string")
         self._conn_edit = QLineEdit()
@@ -750,29 +761,20 @@ class MainWindow(QMainWindow):
         return root
 
     def _build_camera_control_panel(self) -> QGroupBox:
-        box = QGroupBox("Camera Control")
-        lay = QVBoxLayout()
-        lay.addWidget(QLabel("Zoom + / -"))
-        lay.addWidget(QLabel("Recording"))
-        lay.addWidget(QLabel("Joystick enable"))
+        panel = CameraControlPanel(self._video, self)
+        # Keep existing 3D map toggle here (matches current layout expectations).
+        row = QHBoxLayout()
         self._btn_map_3d = QPushButton("3D View")
         self._btn_map_3d.setCheckable(True)
         self._btn_map_3d.clicked.connect(self._on_toggle_map_3d)
-        lay.addWidget(self._btn_map_3d)
-        lay.addStretch()
-        box.setLayout(lay)
-        box.setMinimumWidth(190)
-        return box
+        row.addWidget(self._btn_map_3d)
+        row.addStretch(1)
+        panel.layout().addItem(row)  # type: ignore[union-attr]
+        return panel
 
     def _build_split_camera_panel(self) -> QGroupBox:
-        box = QGroupBox("Split camera video")
-        lay = QVBoxLayout()
-        self._split_video_note = QLabel("Live preview available on map overlay")
-        self._split_video_note.setObjectName("telemetryValue")
-        lay.addWidget(self._split_video_note)
-        lay.addStretch()
-        box.setLayout(lay)
-        return box
+        # 2x2 split preview for up to 4 cameras.
+        return SplitVideoPanel(self._video, self._camera_panel, self)
 
     def _build_primary_flight_footer(self) -> QGroupBox:
         box = QGroupBox("Primary Flight Data")
@@ -1427,13 +1429,8 @@ class MainWindow(QMainWindow):
             self._show_flight_controls_dialog()
             self._append_log("Menu: Vehicle Configuration")
         elif picked is action_settings:
-            self._append_log("Menu: Application Setting — connection & theme")
-            self._scroll_main_to(self._link_box)
-
-            def _focus_settings() -> None:
-                self._theme_combo.setFocus()
-
-            QTimer.singleShot(80, _focus_settings)
+            self._append_log("Menu: Application Settings")
+            self._show_application_settings_dialog()
         elif picked is action_toggle_3d:
             current = bool(getattr(self._map_widget, "_is_3d_mode", False))
             self._on_toggle_map_3d(not current)
@@ -1460,6 +1457,164 @@ class MainWindow(QMainWindow):
             "Use Plan Flight to edit/upload waypoints and use M2 controls for "
             "mode, takeoff/land, geofence, params, and tile source."
         )
+
+    def _show_application_settings_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Application Settings")
+        dlg.setModal(True)
+        dlg.resize(860, 520)
+        root = QHBoxLayout(dlg)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        nav = QListWidget()
+        nav.setFixedWidth(190)
+        nav.setSpacing(2)
+        nav.addItem(QListWidgetItem("General"))
+        nav.addItem(QListWidgetItem("Video"))
+        root.addWidget(nav, 0)
+
+        stack = QStackedWidget()
+        root.addWidget(stack, 1)
+
+        # General page (keep as pointer to main UI, matching our app architecture).
+        general = QWidget()
+        g = QVBoxLayout(general)
+        g.setContentsMargins(12, 12, 12, 12)
+        g.setSpacing(10)
+        g.addWidget(QLabel("General settings are available in the main window (Connection + Theme)."))
+        g.addStretch(1)
+        stack.addWidget(general)
+
+        # Video page (QGC-like structure).
+        video = QWidget()
+        v = QVBoxLayout(video)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(10)
+
+        enabled = QCheckBox("Enable video streaming")
+        v.addWidget(enabled)
+
+        source_group = QGroupBox("Video Source")
+        sg = QGridLayout()
+        sg.addWidget(QLabel("Source"), 0, 0)
+        source_combo = QComboBox()
+        source_combo.addItem("Video Stream Disabled", "disabled")
+        source_combo.addItem("RTSP Video Stream", "rtsp")
+        # Placeholders to match Fig2; not implemented in M3 backend yet.
+        source_combo.addItem("UDP h.264 Video Stream (not implemented)", "udp_h264")
+        source_combo.addItem("UDP h.265 Video Stream (not implemented)", "udp_h265")
+        sg.addWidget(source_combo, 0, 1)
+        source_group.setLayout(sg)
+        v.addWidget(source_group)
+
+        conn_group = QGroupBox("Connection")
+        cg = QGridLayout()
+        cg.addWidget(QLabel("RTSP URL 1 (Day)"), 0, 0)
+        rtsp_day = QLineEdit()
+        cg.addWidget(rtsp_day, 0, 1)
+        cg.addWidget(QLabel("RTSP URL 2 (Thermal)"), 1, 0)
+        rtsp_th = QLineEdit()
+        cg.addWidget(rtsp_th, 1, 1)
+        conn_group.setLayout(cg)
+        v.addWidget(conn_group)
+
+        settings_group = QGroupBox("Settings")
+        stg = QGridLayout()
+        stg.addWidget(QLabel("Aspect ratio"), 0, 0)
+        aspect = QComboBox()
+        aspect.addItems(["Auto", "16:9", "4:3", "1:1"])
+        stg.addWidget(aspect, 0, 1)
+        low_latency = QCheckBox("Low latency mode")
+        stg.addWidget(low_latency, 1, 0, 1, 2)
+        stg.addWidget(QLabel("Video decode priority"), 2, 0)
+        decode_prio = QComboBox()
+        decode_prio.addItems(["Normal", "Prefer Hardware", "Prefer Software"])
+        stg.addWidget(decode_prio, 2, 1)
+        settings_group.setLayout(stg)
+        v.addWidget(settings_group)
+
+        storage_group = QGroupBox("Local Video Storage")
+        lg = QGridLayout()
+        lg.addWidget(QLabel("Record file format"), 0, 0)
+        record_fmt = QComboBox()
+        record_fmt.addItems(["mp4", "mkv"])
+        lg.addWidget(record_fmt, 0, 1)
+        auto_del = QCheckBox("Auto-delete saved recordings")
+        lg.addWidget(auto_del, 1, 0, 1, 2)
+        lg.addWidget(QLabel("Max storage usage (MB)"), 2, 0)
+        max_mb = QSpinBox()
+        max_mb.setRange(0, 200000)
+        max_mb.setValue(10240)
+        lg.addWidget(max_mb, 2, 1)
+        storage_group.setLayout(lg)
+        v.addWidget(storage_group)
+
+        split_default = QComboBox()
+        split_default.addItems(["Single", "Split"])
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Default view"))
+        row3.addWidget(split_default)
+        row3.addStretch(1)
+        v.addLayout(row3)
+
+        btn_row = QHBoxLayout()
+        btn_apply = QPushButton("Apply")
+        btn_close = QPushButton("Close")
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_apply)
+        btn_row.addWidget(btn_close)
+        v.addLayout(btn_row)
+
+        v.addStretch(1)
+        stack.addWidget(video)
+
+        def _on_nav_changed(idx: int) -> None:
+            stack.setCurrentIndex(max(0, min(idx, stack.count() - 1)))
+
+        nav.currentRowChanged.connect(_on_nav_changed)
+        nav.setCurrentRow(1)  # open Video by default (matches client flow)
+
+        # Load existing settings.
+        s = self._settings
+        enabled.setChecked(_settings_truthy(s.value("video/enabled", False), default=False))
+        source_combo.setCurrentIndex(max(0, source_combo.findData(str(s.value("video/source", "rtsp") or "rtsp"))))
+        rtsp_day.setText(str(s.value("video/rtsp_day", "") or ""))
+        rtsp_th.setText(str(s.value("video/rtsp_thermal", "") or ""))
+        split_default.setCurrentText(str(s.value("video/default_view", "Single") or "Single"))
+        aspect.setCurrentText(str(s.value("video/aspect", "Auto") or "Auto"))
+        low_latency.setChecked(_settings_truthy(s.value("video/low_latency", False), default=False))
+        decode_prio.setCurrentText(str(s.value("video/decode_priority", "Normal") or "Normal"))
+        record_fmt.setCurrentText(str(s.value("video/record_format", "mp4") or "mp4"))
+        auto_del.setChecked(_settings_truthy(s.value("video/auto_delete", False), default=False))
+        try:
+            max_mb.setValue(int(s.value("video/max_storage_mb", 10240) or 10240))
+        except Exception:
+            max_mb.setValue(10240)
+
+        def _apply() -> None:
+            s.setValue("video/enabled", bool(enabled.isChecked()))
+            s.setValue("video/source", str(source_combo.currentData() or "rtsp"))
+            s.setValue("video/rtsp_day", str(rtsp_day.text()).strip())
+            s.setValue("video/rtsp_thermal", str(rtsp_th.text()).strip())
+            s.setValue("video/default_view", str(split_default.currentText()))
+            s.setValue("video/aspect", str(aspect.currentText()))
+            s.setValue("video/low_latency", bool(low_latency.isChecked()))
+            s.setValue("video/decode_priority", str(decode_prio.currentText()))
+            s.setValue("video/record_format", str(record_fmt.currentText()))
+            s.setValue("video/auto_delete", bool(auto_del.isChecked()))
+            s.setValue("video/max_storage_mb", int(max_mb.value()))
+            try:
+                # Notify map to reload video config.
+                self._map_widget.apply_video_settings()
+            except Exception:
+                pass
+            QMessageBox.information(dlg, "VGCS", "Video settings applied.")
+
+        btn_apply.clicked.connect(_apply)
+        btn_close.clicked.connect(dlg.accept)
+
+        dlg.exec()
 
     def _show_vehicle_configuration_help(self) -> None:
         QMessageBox.information(
@@ -1963,6 +2118,13 @@ class MainWindow(QMainWindow):
         self._thread.params_snapshot.connect(self._on_params_snapshot)
         self._thread.param_set_result.connect(self._on_param_set_result)
         self._thread.finished.connect(self._on_thread_finished)
+        try:
+            self._map_widget.set_camera_control(MavlinkCameraControl(self._thread))
+        except Exception:
+            try:
+                self._map_widget.set_camera_control(NoopCameraControl())
+            except Exception:
+                pass
 
         self._btn_connect.setEnabled(False)
         self._conn_edit.setEnabled(False)
@@ -1995,6 +2157,10 @@ class MainWindow(QMainWindow):
             self._thread.stop()
             if self._thread.isRunning():
                 self._thread.wait(8000)
+        try:
+            self._map_widget.set_camera_control(NoopCameraControl())
+        except Exception:
+            pass
 
     def _on_link_up(self) -> None:
         self._map_widget.clear_flight_track()

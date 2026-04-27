@@ -106,6 +106,21 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("preflight_calibration", str(kind or "").strip().lower()))
 
+    def queue_camera_zoom(self, level: float) -> None:
+        """Queue camera zoom control (best-effort)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("camera_zoom", float(level)))
+
+    def queue_camera_focus(self, level: float) -> None:
+        """Queue camera focus control (best-effort)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("camera_focus", float(level)))
+
+    def queue_gimbal_nudge(self, *, pitch_deg: float = 0.0, yaw_deg: float = 0.0) -> None:
+        """Queue a small gimbal nudge (best-effort)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("gimbal_nudge", {"pitch": float(pitch_deg), "yaw": float(yaw_deg)}))
+
     def stop(self) -> None:
         self._running = False
         if self._master is not None:
@@ -420,8 +435,66 @@ class MavlinkThread(QThread):
                 self._param_set(str(data.get("name", "")), float(data.get("value", 0.0)))
             elif cmd == "preflight_calibration":
                 self._preflight_calibration(str(payload or ""))
+            elif cmd == "camera_zoom":
+                self._camera_zoom(float(payload or 1.0))
+            elif cmd == "camera_focus":
+                self._camera_focus(float(payload or 0.0))
+            elif cmd == "gimbal_nudge":
+                data = payload if isinstance(payload, dict) else {}
+                self._gimbal_nudge(float(data.get("pitch", 0.0)), float(data.get("yaw", 0.0)))
         except Exception as e:
             self.error.emit(f"Link command failed ({cmd}): {e}")
+
+    def _camera_zoom(self, level: float) -> None:
+        if self._master is None:
+            self.action_result.emit("camera_zoom", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        # MAV_CMD_SET_CAMERA_ZOOM: param1=zoom type, param2=zoom value
+        # We use type=1 (range/absolute) best-effort; payloads may interpret differently.
+        try:
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_SET_CAMERA_ZOOM,
+                p1=1.0,
+                p2=float(level),
+            )
+            self.action_result.emit("camera_zoom", True, f"zoom={level:.2f}")
+        except Exception as e:
+            self.action_result.emit("camera_zoom", False, str(e))
+
+    def _camera_focus(self, level: float) -> None:
+        if self._master is None:
+            self.action_result.emit("camera_focus", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        # MAV_CMD_SET_CAMERA_FOCUS: param1=focus type, param2=value
+        try:
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_SET_CAMERA_FOCUS,
+                p1=1.0,
+                p2=float(level),
+            )
+            self.action_result.emit("camera_focus", True, f"focus={level:.2f}")
+        except Exception as e:
+            self.action_result.emit("camera_focus", False, str(e))
+
+    def _gimbal_nudge(self, pitch_deg: float, yaw_deg: float) -> None:
+        if self._master is None:
+            self.action_result.emit("gimbal", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        # MAV_CMD_DO_MOUNT_CONTROL: p1=pitch, p2=roll, p3=yaw, p7=mount mode
+        try:
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_DO_MOUNT_CONTROL,
+                p1=float(pitch_deg),
+                p2=0.0,
+                p3=float(yaw_deg),
+                p7=float(getattr(mavutil.mavlink, "MAV_MOUNT_MODE_MAVLINK_TARGETING", 2)),
+            )
+            self.action_result.emit("gimbal", True, f"pitch={pitch_deg:.1f} yaw={yaw_deg:.1f}")
+        except Exception as e:
+            self.action_result.emit("gimbal", False, str(e))
 
     def _preflight_calibration(self, kind: str) -> None:
         """

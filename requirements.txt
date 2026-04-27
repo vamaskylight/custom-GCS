@@ -5,3 +5,7 @@ pymavlink>=2.4.40,<3
 pyserial>=3.5,<4
 PySide6>=6.6.0,<7
 watchdog>=4,<7
+
+# M3 RTSP fallback decode (QtMultimedia may lack RTSP/H.264 support on Windows).
+# We use an FFmpeg subprocess (no compiler needed). Numpy is used for fast frame handling.
+numpy>=1.26,<3
