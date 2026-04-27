@@ -1463,12 +1463,39 @@ class MainWindow(QMainWindow):
         dlg.setWindowTitle("Application Settings")
         dlg.setModal(True)
         dlg.resize(860, 520)
+        dlg.setObjectName("appSettingsDialog")
         # Ensure consistent styling even if launched in a context where the
         # application stylesheet wasn't applied (e.g. external launcher/tests).
         try:
             app = QApplication.instance()
             qss = str(app.styleSheet() if app is not None else "").strip()
-            dlg.setStyleSheet(qss if qss else gcs_stylesheet())
+            base = qss if qss else gcs_stylesheet()
+            # The global theme targets the main window roots; dialogs on some machines
+            # (e.g. default light palette) need an explicit background.
+            dlg.setStyleSheet(
+                base
+                + """
+                QDialog#appSettingsDialog, QDialog#appSettingsDialog QWidget {
+                    background-color: #1a1d24;
+                    color: #e8eaef;
+                }
+                QDialog#appSettingsDialog QListWidget {
+                    background-color: #12151c;
+                    border: 1px solid #252d3d;
+                    border-radius: 8px;
+                    padding: 6px;
+                }
+                QDialog#appSettingsDialog QListWidget::item {
+                    padding: 8px 10px;
+                    border-radius: 6px;
+                    color: #dbe1ee;
+                }
+                QDialog#appSettingsDialog QListWidget::item:selected {
+                    background-color: #2d3a52;
+                    color: #f0f4ff;
+                }
+                """
+            )
         except Exception:
             pass
         root = QHBoxLayout(dlg)
