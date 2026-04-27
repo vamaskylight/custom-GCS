@@ -1463,6 +1463,14 @@ class MainWindow(QMainWindow):
         dlg.setWindowTitle("Application Settings")
         dlg.setModal(True)
         dlg.resize(860, 520)
+        # Ensure consistent styling even if launched in a context where the
+        # application stylesheet wasn't applied (e.g. external launcher/tests).
+        try:
+            app = QApplication.instance()
+            qss = str(app.styleSheet() if app is not None else "").strip()
+            dlg.setStyleSheet(qss if qss else gcs_stylesheet())
+        except Exception:
+            pass
         root = QHBoxLayout(dlg)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
