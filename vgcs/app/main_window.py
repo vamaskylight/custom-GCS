@@ -1527,8 +1527,20 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(10)
 
+        # Put settings in a scroll area so Apply/Close remain visible on small/high-DPI screens.
+        video_scroll = QScrollArea()
+        video_scroll.setWidgetResizable(True)
+        video_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        v.addWidget(video_scroll, 1)
+
+        video_body = QWidget()
+        video_scroll.setWidget(video_body)
+        vb = QVBoxLayout(video_body)
+        vb.setContentsMargins(0, 0, 0, 0)
+        vb.setSpacing(10)
+
         enabled = QCheckBox("Enable video streaming")
-        v.addWidget(enabled)
+        vb.addWidget(enabled)
 
         source_group = QGroupBox("Video Source")
         sg = QGridLayout()
@@ -1541,7 +1553,7 @@ class MainWindow(QMainWindow):
         source_combo.addItem("UDP h.265 Video Stream (not implemented)", "udp_h265")
         sg.addWidget(source_combo, 0, 1)
         source_group.setLayout(sg)
-        v.addWidget(source_group)
+        vb.addWidget(source_group)
 
         conn_group = QGroupBox("Connection")
         cg = QGridLayout()
@@ -1552,7 +1564,7 @@ class MainWindow(QMainWindow):
         rtsp_th = QLineEdit()
         cg.addWidget(rtsp_th, 1, 1)
         conn_group.setLayout(cg)
-        v.addWidget(conn_group)
+        vb.addWidget(conn_group)
 
         settings_group = QGroupBox("Settings")
         stg = QGridLayout()
@@ -1567,7 +1579,7 @@ class MainWindow(QMainWindow):
         decode_prio.addItems(["Normal", "Prefer Hardware", "Prefer Software"])
         stg.addWidget(decode_prio, 2, 1)
         settings_group.setLayout(stg)
-        v.addWidget(settings_group)
+        vb.addWidget(settings_group)
 
         storage_group = QGroupBox("Local Video Storage")
         lg = QGridLayout()
@@ -1583,7 +1595,7 @@ class MainWindow(QMainWindow):
         max_mb.setValue(10240)
         lg.addWidget(max_mb, 2, 1)
         storage_group.setLayout(lg)
-        v.addWidget(storage_group)
+        vb.addWidget(storage_group)
 
         split_default = QComboBox()
         split_default.addItems(["Single", "Split"])
@@ -1591,7 +1603,8 @@ class MainWindow(QMainWindow):
         row3.addWidget(QLabel("Default view"))
         row3.addWidget(split_default)
         row3.addStretch(1)
-        v.addLayout(row3)
+        vb.addLayout(row3)
+        vb.addStretch(1)
 
         btn_row = QHBoxLayout()
         btn_apply = QPushButton("Apply")
@@ -1600,8 +1613,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(btn_apply)
         btn_row.addWidget(btn_close)
         v.addLayout(btn_row)
-
-        v.addStretch(1)
         stack.addWidget(video)
 
         def _on_nav_changed(idx: int) -> None:
