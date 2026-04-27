@@ -1683,20 +1683,42 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("Vehicle Configuration")
         dlg.setModal(True)
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(8)
+        dlg.resize(720, 760)
+
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        header = QLabel("Vehicle Configuration")
+        header.setObjectName("headerTitle")
+        sub = QLabel("Calibration, flight mode, assist features, and advanced parameters.")
+        sub.setObjectName("headerSubtitle")
+        root.addWidget(header)
+        root.addWidget(sub)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        root.addWidget(scroll, 1)
+
+        body = QWidget()
+        scroll.setWidget(body)
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
 
         can_send = bool(self._thread is not None and self._thread.isRunning())
         if not can_send:
-            lay.addWidget(QLabel("Connect vehicle to enable commands."))
+            warn = QLabel("Connect vehicle to enable commands.")
+            warn.setStyleSheet("color: #a8b0c4;")
+            lay.addWidget(warn)
 
         # Sensor calibration
         cal_group = QGroupBox("Sensor calibration")
         cal_lay = QVBoxLayout()
         cal_lay.setSpacing(6)
         cal_hint = QLabel("Tip: keep the vehicle still unless prompted otherwise.")
-        cal_hint.setStyleSheet("color: #444444;")
+        cal_hint.setStyleSheet("color: #7d869c; font-weight: 400;")
         cal_lay.addWidget(cal_hint)
 
         cal_btn_row1 = QHBoxLayout()
@@ -1739,9 +1761,9 @@ class MainWindow(QMainWindow):
         lay.addWidget(cal_group)
 
         # Flight mode + commands
-        title = QLabel("Flight mode")
-        title.setStyleSheet("font-weight: 600;")
-        lay.addWidget(title)
+        flight_group = QGroupBox("Flight mode")
+        flight_lay = QVBoxLayout()
+        flight_lay.setSpacing(8)
 
         combo = QComboBox()
         combo.addItems([self._mode_combo.itemText(i) for i in range(self._mode_combo.count())])
@@ -1749,7 +1771,7 @@ class MainWindow(QMainWindow):
         if current:
             combo.setCurrentText(current)
         combo.setEnabled(can_send)
-        lay.addWidget(combo)
+        flight_lay.addWidget(combo)
 
         alt_row = QHBoxLayout()
         alt_row.addWidget(QLabel("Takeoff alt (m)"))
@@ -1759,7 +1781,7 @@ class MainWindow(QMainWindow):
         alt_spin.setValue(float(self._takeoff_alt_spin.value()))
         alt_spin.setEnabled(can_send)
         alt_row.addWidget(alt_spin, 1)
-        lay.addLayout(alt_row)
+        flight_lay.addLayout(alt_row)
 
         btn_row = QHBoxLayout()
         btn_set_mode = QPushButton("Set mode")
@@ -1768,7 +1790,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(btn_set_mode)
         btn_row.addWidget(btn_takeoff)
         btn_row.addWidget(btn_land)
-        lay.addLayout(btn_row)
+        flight_lay.addLayout(btn_row)
 
         btn_row2 = QHBoxLayout()
         btn_auto_takeoff = QPushButton("Auto takeoff")
@@ -1776,7 +1798,10 @@ class MainWindow(QMainWindow):
         btn_row2.addWidget(btn_auto_takeoff)
         btn_row2.addWidget(btn_auto_land)
         btn_row2.addStretch()
-        lay.addLayout(btn_row2)
+        flight_lay.addLayout(btn_row2)
+
+        flight_group.setLayout(flight_lay)
+        lay.addWidget(flight_group)
 
         btn_set_mode.setEnabled(can_send)
         btn_takeoff.setEnabled(can_send)
@@ -1801,10 +1826,9 @@ class MainWindow(QMainWindow):
         btn_auto_land.clicked.connect(self._on_auto_land)
 
         # Assist features
-        lay.addSpacing(6)
-        f_title = QLabel("Assist features")
-        f_title.setStyleSheet("font-weight: 600;")
-        lay.addWidget(f_title)
+        assist_group = QGroupBox("Assist features")
+        assist_lay = QVBoxLayout()
+        assist_lay.setSpacing(8)
 
         airmode_dlg = QCheckBox("AirMode")
         trainer_dlg = QComboBox()
@@ -1817,14 +1841,17 @@ class MainWindow(QMainWindow):
         simple_dlg.setEnabled(can_send)
         super_simple_dlg.setEnabled(can_send)
 
-        lay.addWidget(airmode_dlg)
-        lay.addWidget(trainer_dlg)
-        lay.addWidget(simple_dlg)
-        lay.addWidget(super_simple_dlg)
+        assist_lay.addWidget(airmode_dlg)
+        assist_lay.addWidget(trainer_dlg)
+        assist_lay.addWidget(simple_dlg)
+        assist_lay.addWidget(super_simple_dlg)
 
         apply_features = QPushButton("Apply assist features")
         apply_features.setEnabled(can_send)
-        lay.addWidget(apply_features)
+        assist_lay.addWidget(apply_features)
+
+        assist_group.setLayout(assist_lay)
+        lay.addWidget(assist_group)
 
         # Advanced parameters (collapsed)
         adv_box = QGroupBox("Advanced parameters")
@@ -1927,6 +1954,15 @@ class MainWindow(QMainWindow):
             dlg.finished.connect(_disconnect_dialog_param_hook)
 
         _refresh_feature_controls_from_cache()
+
+        # Footer
+        lay.addStretch(1)
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        btn_close = QPushButton("Close")
+        footer.addWidget(btn_close)
+        root.addLayout(footer)
+        btn_close.clicked.connect(dlg.accept)
         dlg.exec()
         self._scroll_main_to(self._m2_controls_panel)
 
