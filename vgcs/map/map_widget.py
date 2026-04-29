@@ -853,6 +853,8 @@ LEAFLET_HTML = """<!doctype html>
       background: #0f1623;
       box-shadow: 0 8px 20px rgba(0, 0, 0, 0.32);
       z-index: 1210;
+      cursor: zoom-in;
+      transition: left 180ms ease, right 180ms ease, top 180ms ease, bottom 180ms ease, width 180ms ease, height 180ms ease, border-radius 180ms ease;
     }
     #videoPreview img {
       width: 100%;
@@ -941,6 +943,33 @@ LEAFLET_HTML = """<!doctype html>
       text-shadow: 0 1px 2px rgba(0,0,0,0.45);
       pointer-events: none;
     }
+    #mapWrap.video-swapped #videoPreview {
+      left: 0;
+      right: 0;
+      top: 0;
+      bottom: 0;
+      width: auto;
+      height: auto;
+      border-radius: 0;
+      border: 0;
+      box-shadow: none;
+      z-index: 1180;
+      cursor: zoom-out;
+    }
+    #mapWrap.video-swapped #map2d,
+    #mapWrap.video-swapped #map3d {
+      inset: auto;
+      left: 14px;
+      bottom: 14px;
+      width: 230px;
+      height: 130px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid rgba(206, 220, 242, 0.45);
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
+      z-index: 1260;
+    }
+    #mapWrap.video-swapped #cameraRail { z-index: 1270; }
     #cameraTopRow {
       display: flex;
       align-items: center;
@@ -2306,6 +2335,7 @@ LEAFLET_HTML = """<!doctype html>
       });
     }
     const cameraRail = document.getElementById('cameraRail');
+    const mapWrap = document.getElementById('mapWrap');
     const camVideoBtn = document.getElementById('camVideoBtn');
     const camPhotoBtn = document.getElementById('camPhotoBtn');
     const camSplitBtn = document.getElementById('camSplitBtn');
@@ -2338,6 +2368,7 @@ LEAFLET_HTML = """<!doctype html>
     let camTimerId = null;
     let camRecordStartedAt = 0;
     let __camSplitEnabled = false;
+    let __videoSwapped = false;
     function formatRecordTime(seconds) {
       const s = Math.max(0, Number(seconds) || 0);
       const hh = String(Math.floor(s / 3600)).padStart(2, '0');
@@ -2388,6 +2419,16 @@ LEAFLET_HTML = """<!doctype html>
       if (aiOverlaySingle) aiOverlaySingle.style.display = grid ? 'none' : 'block';
       if (aiOverlayGrid) aiOverlayGrid.style.display = grid ? 'grid' : 'none';
       return 1;
+    }
+    function setVideoSwapMode(enabled) {
+      __videoSwapped = !!enabled;
+      if (mapWrap) mapWrap.classList.toggle('video-swapped', __videoSwapped);
+      // Leaflet/Cesium need a resize tick after container geometry changes.
+      setTimeout(function() {
+        try { if (map) map.invalidateSize(); } catch (e) {}
+        try { if (viewer3d && viewer3d.resize) viewer3d.resize(); } catch (e) {}
+      }, 40);
+      return __videoSwapped ? 1 : 0;
     }
     function setVideoPreviewGrid(images) {
       if (!videoPreviewGrid) return 0;
@@ -2492,6 +2533,14 @@ LEAFLET_HTML = """<!doctype html>
         if (camPhotoBtn) camPhotoBtn.classList.remove('active');
         // Toggle live preview (Python backend decides).
         document.title = 'VGCS_CAM_VIDEO_TOGGLE:' + Date.now();
+      });
+    }
+    if (videoPreview) {
+      videoPreview.title = 'Click to swap video/map';
+      videoPreview.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        setVideoSwapMode(!__videoSwapped);
       });
     }
     if (camPhotoBtn) {
