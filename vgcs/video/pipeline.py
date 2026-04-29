@@ -525,8 +525,6 @@ class RtspSource(QObject):
                 "info",
                 "-rtsp_transport",
                 transport,
-                "-rw_timeout",
-                "20000000",  # 20s in microseconds
                 "-fflags",
                 "+genpts",
                 "-i",
@@ -611,8 +609,6 @@ class RtspSource(QObject):
                 "warning",
                 "-rtsp_transport",
                 transport,
-                "-rw_timeout",
-                "20000000",  # 20s in microseconds
                 "-fflags",
                 "+genpts",
                 "-i",
