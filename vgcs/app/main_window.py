@@ -1578,6 +1578,12 @@ class MainWindow(QMainWindow):
         decode_prio = QComboBox()
         decode_prio.addItems(["Normal", "Prefer Hardware", "Prefer Software"])
         stg.addWidget(decode_prio, 2, 1)
+        stg.addWidget(QLabel("RTSP transport"), 3, 0)
+        rtsp_transport = QComboBox()
+        rtsp_transport.addItem("Auto (UDP then TCP)", "auto")
+        rtsp_transport.addItem("UDP", "udp")
+        rtsp_transport.addItem("TCP", "tcp")
+        stg.addWidget(rtsp_transport, 3, 1)
         settings_group.setLayout(stg)
         vb.addWidget(settings_group)
 
@@ -1631,6 +1637,7 @@ class MainWindow(QMainWindow):
         aspect.setCurrentText(str(s.value("video/aspect", "Auto") or "Auto"))
         low_latency.setChecked(_settings_truthy(s.value("video/low_latency", False), default=False))
         decode_prio.setCurrentText(str(s.value("video/decode_priority", "Normal") or "Normal"))
+        rtsp_transport.setCurrentIndex(max(0, rtsp_transport.findData(str(s.value("video/rtsp_transport", "auto") or "auto"))))
         record_fmt.setCurrentText(str(s.value("video/record_format", "mp4") or "mp4"))
         auto_del.setChecked(_settings_truthy(s.value("video/auto_delete", False), default=False))
         try:
@@ -1647,6 +1654,7 @@ class MainWindow(QMainWindow):
             s.setValue("video/aspect", str(aspect.currentText()))
             s.setValue("video/low_latency", bool(low_latency.isChecked()))
             s.setValue("video/decode_priority", str(decode_prio.currentText()))
+            s.setValue("video/rtsp_transport", str(rtsp_transport.currentData() or "auto"))
             s.setValue("video/record_format", str(record_fmt.currentText()))
             s.setValue("video/auto_delete", bool(auto_del.isChecked()))
             s.setValue("video/max_storage_mb", int(max_mb.value()))

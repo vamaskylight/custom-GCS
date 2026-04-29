@@ -66,6 +66,7 @@ _KEY_VIDEO_ENABLED = "video/enabled"
 _KEY_VIDEO_SOURCE = "video/source"  # 'disabled' | 'rtsp'
 _KEY_VIDEO_RTSP_DAY = "video/rtsp_day"
 _KEY_VIDEO_RTSP_THERMAL = "video/rtsp_thermal"
+_KEY_VIDEO_RTSP_TRANSPORT = "video/rtsp_transport"  # 'auto' | 'udp' | 'tcp'
 _KEY_VIDEO_DEFAULT_VIEW = "video/default_view"  # 'Single' | 'Split'
 
 
@@ -4530,6 +4531,7 @@ class MapWidget(QWidget):
         self._video_settings_enabled = False
         self._video_settings_day = ""
         self._video_settings_thermal = ""
+        self._video_settings_rtsp_transport = "auto"
         self._video_settings_default_view = "Single"
         self._camera_control = NoopCameraControl()
 
@@ -4772,11 +4774,17 @@ class MapWidget(QWidget):
                 QTimer.singleShot(1500, lambda: self._probe_current_tiles(reason="connect"))
             except Exception:
                 pass
-        # Keep camera preview in sync with link status, but never auto-enable the webcam.
+        webcam_enabled = bool(getattr(self, "_btn_webcam", None)) and bool(self._btn_webcam.isChecked())
+        # Do not stop video preview purely because telemetry link is down.
+        # This matches QGC behavior and avoids blank video when the vehicle is in
+        # pre-arm/GPS-failure states.
         if not c:
-            self._stop_video_preview(clear_overlay=True)
+            if webcam_enabled and bool(getattr(self, "_web_ready", False)):
+                self._start_video_preview()
+            else:
+                self._stop_video_preview(clear_overlay=True)
             return
-        if bool(getattr(self, "_btn_webcam", None)) and bool(self._btn_webcam.isChecked()):
+        if webcam_enabled:
             self._start_video_preview()
 
     def _probe_current_tiles(self, *, reason: str) -> None:
@@ -4877,12 +4885,12 @@ class MapWidget(QWidget):
             self._stop_video_preview(clear_overlay=True)
             self._set_status("Webcam disabled")
             return
-        # Only start if we're linked and the page is ready.
-        if bool(getattr(self, "_last_link_connected", False)) and bool(getattr(self, "_web_ready", False)):
+        # Start if the page is ready; do not require telemetry link.
+        if bool(getattr(self, "_web_ready", False)):
             self._start_video_preview()
             self._set_status("Webcam enabled")
         else:
-            self._set_status("Webcam enabled (will start when connected)")
+            self._set_status("Webcam enabled (will start when map is ready)")
 
     def _on_perf_mode_changed(self, idx: int) -> None:
         # 0=Auto, 1=Low, 2=High
@@ -5331,9 +5339,9 @@ class MapWidget(QWidget):
                 self.apply_video_settings()
             except Exception:
                 pass
-            # If we became ready after link-up, only start preview if user enabled it.
+            # Start preview if user enabled it (do not require telemetry link).
             try:
-                if bool(self._last_link_connected) and bool(self._btn_webcam.isChecked()):
+                if bool(getattr(self, "_btn_webcam", None)) and bool(self._btn_webcam.isChecked()):
                     self._start_video_preview()
             except Exception:
                 pass
@@ -5389,6 +5397,7 @@ class MapWidget(QWidget):
                     self._video.set_rtsp_sources(
                         day_url=str(self._video_settings_day),
                         thermal_url=str(self._video_settings_thermal),
+                        transport=str(getattr(self, "_video_settings_rtsp_transport", "auto") or "auto"),
                     )
             except Exception:
                 pass
@@ -5411,6 +5420,17 @@ class MapWidget(QWidget):
                 self._video_encode_inflight_by_id[sid] = False
                 self._video_encode_pending_by_id[sid] = None
                 self._video_last_data_urls[sid] = ""
+                try:
+                    # Show backend errors (RTSP decode / FFmpeg missing, etc.) on the UI.
+                    if hasattr(src, "error") and hasattr(src.error, "connect"):
+                        src.error.connect(
+                            lambda msg, sid=sid: (
+                                print(f"[VGCS:video] Video({sid}) error: {str(msg)}"),
+                                self._set_status(f"Video({sid}) error: {str(msg)}"),
+                            )[1]
+                        )
+                except Exception:
+                    pass
                 src.frame.connect(lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf))
         except Exception:
             self._video_active_source = None
@@ -5423,7 +5443,16 @@ class MapWidget(QWidget):
         self._video_settings_enabled = bool(s.value(_KEY_VIDEO_ENABLED, False)) and source != "disabled"
         self._video_settings_day = str(s.value(_KEY_VIDEO_RTSP_DAY, "") or "").strip()
         self._video_settings_thermal = str(s.value(_KEY_VIDEO_RTSP_THERMAL, "") or "").strip()
+        self._video_settings_rtsp_transport = str(s.value(_KEY_VIDEO_RTSP_TRANSPORT, "auto") or "auto").strip().lower()
         self._video_settings_default_view = str(s.value(_KEY_VIDEO_DEFAULT_VIEW, "Single") or "Single")
+        try:
+            print(
+                f"[VGCS:video] settings enabled={self._video_settings_enabled} source={source} "
+                f"day={self._video_settings_day!r} thermal={self._video_settings_thermal!r} "
+                f"transport={self._video_settings_rtsp_transport!r}"
+            )
+        except Exception:
+            pass
 
     def apply_video_settings(self) -> None:
         """
@@ -5684,9 +5713,9 @@ class MapWidget(QWidget):
         if bool(getattr(self, "_video_split_enabled", False)):
             # Send to first two cells (Day/Thermal) and empty for others.
             payload = json.dumps([det, det, [], []])
-            self._run_js(f"setAiOverlayGrid({payload});")
+            self._run_js(f"if (window.setAiOverlayGrid) setAiOverlayGrid({payload});")
         else:
-            self._run_js(f"setAiOverlaySingle({json.dumps(det)});")
+            self._run_js(f"if (window.setAiOverlaySingle) setAiOverlaySingle({json.dumps(det)});")
 
     def _apply_digital_zoom(self, img: QImage, zoom: float) -> QImage:
         try:

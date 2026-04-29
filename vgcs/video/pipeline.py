@@ -87,6 +87,7 @@ class CameraSource(QObject):
         self._session: Optional[QMediaCaptureSession] = None
         self._recorder: Optional[QMediaRecorder] = None
         self._image_capture: Optional[QImageCapture] = None
+        self._running = False
 
     @property
     def device_name(self) -> str:
@@ -127,17 +128,23 @@ class CameraSource(QObject):
             return False
 
     def start(self) -> None:
+        if self._running:
+            return
         if not self.ensure_backend():
             self.error.emit("Multimedia backend unavailable")
             return
         try:
             assert self._camera is not None
             self._camera.start()
+            self._running = True
             self.started.emit()
         except Exception as e:
             self.error.emit(str(e))
 
     def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
         try:
             if self._camera is not None:
                 self._camera.stop()
@@ -189,11 +196,20 @@ class RtspSource(QObject):
     stopped = Signal()
     error = Signal(str)
 
-    def __init__(self, *, url: str, source_id: str, label: str, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        url: str,
+        source_id: str,
+        label: str,
+        transport: str = "auto",
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self.source_id = str(source_id)
         self._url = str(url or "").strip()
         self._label = str(label or source_id)
+        self._transport = str(transport or "auto").strip().lower()
         self._player: Optional[QMediaPlayer] = None
         self._sink: Optional[QVideoSink] = None
         self._audio: Optional[QAudioOutput] = None
@@ -205,7 +221,9 @@ class RtspSource(QObject):
         self._ffmpeg_thread: Optional[threading.Thread] = None
         self._ffmpeg_stop = threading.Event()
         self._ffmpeg_dims: tuple[int, int] | None = None
+        self._ffmpeg_last_frame_mono: float = 0.0
         self._rec_proc: subprocess.Popen[bytes] | None = None
+        self._running = False
 
     @property
     def device_name(self) -> str:
@@ -263,15 +281,19 @@ class RtspSource(QObject):
             return False
 
     def start(self) -> None:
+        if self._running:
+            return
         # Prefer QtMultimedia first; if it doesn't produce frames shortly, fall back to FFmpeg.
         if not self.ensure_backend():
             self._start_ffmpeg()
+            self._running = True
             return
         try:
             assert self._player is not None
             self._using_pyav = False
             self._last_frame_mono = 0.0
             self._player.play()
+            self._running = True
             self.started.emit()
             # If no frames arrive soon, try FFmpeg.
             threading.Thread(target=self._maybe_fallback_to_ffmpeg, daemon=True).start()
@@ -279,6 +301,9 @@ class RtspSource(QObject):
             self.error.emit(str(e))
 
     def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
         try:
             if self._player is not None:
                 self._player.stop()
@@ -381,6 +406,12 @@ class RtspSource(QObject):
                 return
             time.sleep(0.05)
         # No frames: fall back.
+        print(f"[VGCS:video] QtMultimedia produced no frames; switching to FFmpeg fallback url={self._url}")
+        try:
+            if self._player is not None:
+                self._player.stop()
+        except Exception:
+            pass
         self._start_ffmpeg()
 
     def _start_ffmpeg(self) -> None:
@@ -389,6 +420,13 @@ class RtspSource(QObject):
             return
         if self._ffmpeg_thread is not None and self._ffmpeg_thread.is_alive():
             return
+        # Ensure QtMultimedia RTSP session is not still holding the stream.
+        # Some RTSP servers reject/limit concurrent sessions per client.
+        try:
+            if self._player is not None:
+                self._player.stop()
+        except Exception:
+            pass
         url = str(self._url or "").strip()
         if not url:
             self.error.emit("RTSP URL is empty")
@@ -457,64 +495,183 @@ class RtspSource(QObject):
 
     def _ffmpeg_loop(self) -> None:
         url = str(self._url or "").strip()
-        dims = self._ffprobe_dims(url) or (640, 360)
-        self._ffmpeg_dims = dims
+        # For preview we don't need full-resolution decoding. Smaller raw frames
+        # dramatically speed up "first frame" availability and reduce pipe size.
+        dims = self._ffprobe_dims(url) or (320, 180)
         w, h = dims
+        # Cap decode size to keep the raw pipe responsive.
+        w = max(160, min(int(w), 640))
+        h = max(90, min(int(h), 360))
+        self._ffmpeg_dims = (w, h)
         frame_bytes = int(w) * int(h) * 3
-        cmd = [
-            "ffmpeg",
-            "-loglevel",
-            "error",
-            "-rtsp_transport",
-            "tcp",
-            "-i",
-            url,
-            "-an",
-            "-vf",
-            f"scale={w}:{h}",
-            "-pix_fmt",
-            "rgb24",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ]
-        try:
-            self._ffmpeg_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                bufsize=0,
-            )
-        except Exception as e:
-            self.error.emit(f"FFmpeg start failed: {e}")
-            return
-        assert self._ffmpeg_proc.stdout is not None
-        while not self._ffmpeg_stop.is_set():
-            raw = self._read_exact(self._ffmpeg_proc.stdout, frame_bytes)
-            if raw is None:
+        transports = ("udp", "tcp") if self._transport not in ("udp", "tcp") else (self._transport,)
+        # Try UDP first, then TCP.
+        # Many RTSP servers (and QGC-style clients) work over RTP/UDP even
+        # when TCP is blocked/unavailable.
+        for transport in transports:
+            if self._ffmpeg_stop.is_set():
                 break
+            self._ffmpeg_last_frame_mono = 0.0
+            print(f"[VGCS:video] FFmpeg fallback start transport={transport} url={url}")
+
+            # Probe stage: decode exactly ONE frame first so we can capture
+            # the real failure reason (codec support, RTP/transport, etc.)
+            # instead of only "no frames produced".
+            probe_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-loglevel",
+                "info",
+                "-rtsp_transport",
+                transport,
+                "-rw_timeout",
+                "20000000",  # 20s in microseconds
+                "-fflags",
+                "+genpts",
+                "-i",
+                url,
+                "-an",
+                "-vf",
+                f"scale={w}:{h}",
+                "-pix_fmt",
+                "rgb24",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]
+
+            probe_proc: subprocess.Popen[bytes] | None = None
             try:
-                assert np is not None
-                arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
+                probe_proc = subprocess.Popen(
+                    probe_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+                assert probe_proc.stdout is not None
+                assert probe_proc.stderr is not None
+                out, err = probe_proc.communicate(timeout=25.0)
+            except subprocess.TimeoutExpired:
+                if probe_proc is not None:
+                    try:
+                        probe_proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        out, err = probe_proc.communicate(timeout=2.0)
+                    except Exception:
+                        out, err = b"", b""
+                else:
+                    out, err = b"", b""
+            except Exception as e:
+                try:
+                    if probe_proc is not None and probe_proc.stderr is not None:
+                        err = probe_proc.stderr.read()[:2000]
+                    else:
+                        err = b""
+                except Exception:
+                    err = b""
+                self.error.emit(f"FFmpeg probe failed ({transport}): {e} " + err.decode(errors="ignore"))
+                continue
+
+            out_len = len(out or b"")
+            # ffmpeg prints a lot of config/banner output; prefer the tail
+            # which usually contains the actual RTSP/decoder failure line.
+            err_bytes = err or b""
+            err_tail = err_bytes[-2200:] if len(err_bytes) > 2200 else err_bytes
+            err_str = err_tail.decode(errors="ignore").strip()
+            if out_len < frame_bytes:
+                # If stderr is empty, still provide the length as a hint.
+                hint = err_str if err_str else f"no frames decoded (stdout_bytes={out_len}, expected={frame_bytes})"
+                self.error.emit(f"FFmpeg RTSP error ({transport}): {hint}")
+                continue
+
+            try:
+                # Decode the probed single frame.
+                arr = np.frombuffer(out[:frame_bytes], dtype=np.uint8).reshape((h, w, 3))  # type: ignore[union-attr]
                 qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
                 meta = FrameMeta(source_id=self.source_id, device_name=self.device_name, timestamp_ms=0)
                 self.frame.emit(VideoFrame(qimg, meta))
-            except Exception:
+                self._ffmpeg_last_frame_mono = time.monotonic()
+            except Exception as e:
+                self.error.emit(f"FFmpeg probe decode failed ({transport}): {e}")
                 continue
-        # If process ended with stderr, surface it.
-        try:
-            if self._ffmpeg_proc is not None:
-                err = b""
+
+            # Continuous stage: now that we know the transport+codec works,
+            # start streaming frames to the pipe.
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-loglevel",
+                "warning",
+                "-rtsp_transport",
+                transport,
+                "-rw_timeout",
+                "20000000",  # 20s in microseconds
+                "-fflags",
+                "+genpts",
+                "-i",
+                url,
+                "-an",
+                "-vf",
+                f"scale={w}:{h}",
+                "-pix_fmt",
+                "rgb24",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]
+            try:
+                self._ffmpeg_proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+            except Exception as e:
+                self.error.emit(f"FFmpeg start (continuous) failed: {e}")
+                self._ffmpeg_proc = None
+                continue
+
+            if self._ffmpeg_proc.stdout is None:
+                self._stop_ffmpeg()
+                continue
+
+            while not self._ffmpeg_stop.is_set():
+                raw = self._read_exact(self._ffmpeg_proc.stdout, frame_bytes)
+                if raw is None:
+                    break
                 try:
-                    if self._ffmpeg_proc.stderr is not None:
-                        err = self._ffmpeg_proc.stderr.read()[:4000]
+                    assert np is not None
+                    arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
+                    qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+                    meta = FrameMeta(source_id=self.source_id, device_name=self.device_name, timestamp_ms=0)
+                    self.frame.emit(VideoFrame(qimg, meta))
+                    self._ffmpeg_last_frame_mono = time.monotonic()
                 except Exception:
-                    err = b""
-                if err:
-                    self.error.emit(f"FFmpeg RTSP error: {err.decode(errors='ignore')}")
-        except Exception:
-            pass
+                    continue
+
+            # If process ended without any frames, try next transport.
+            if self._ffmpeg_last_frame_mono > 0.0:
+                break
+
+            # Surface any remaining stderr.
+            try:
+                if self._ffmpeg_proc is not None and self._ffmpeg_proc.stderr is not None:
+                    err_rem = self._ffmpeg_proc.stderr.read()[:4000]
+                    decoded = err_rem.decode(errors="ignore") if err_rem else ""
+                    if decoded.strip():
+                        self.error.emit(f"FFmpeg RTSP error ({transport}): {decoded}")
+            except Exception:
+                pass
+            self._ffmpeg_proc = None
+
         self._stop_ffmpeg()
 
 
@@ -534,6 +691,7 @@ class VideoPipeline(QObject):
         self._hooks: list[AiVideoHook] = []
         self._rtsp_day_url: str = ""
         self._rtsp_thermal_url: str = ""
+        self._rtsp_transport: str = "auto"
 
         self.refresh_sources()
 
@@ -542,12 +700,22 @@ class VideoPipeline(QObject):
         # RTSP sources take precedence if configured.
         if HAS_MULTIMEDIA and (self._rtsp_day_url or self._rtsp_thermal_url):
             if self._rtsp_day_url:
-                day = RtspSource(url=self._rtsp_day_url, source_id="day", label="Day (RTSP)", parent=self)
+                day = RtspSource(
+                    url=self._rtsp_day_url,
+                    source_id="day",
+                    label="Day (RTSP)",
+                    transport=self._rtsp_transport,
+                    parent=self,
+                )
                 day.frame.connect(self._on_source_frame)
                 self._sources["day"] = day
             if self._rtsp_thermal_url:
                 th = RtspSource(
-                    url=self._rtsp_thermal_url, source_id="thermal", label="Thermal (RTSP)", parent=self
+                    url=self._rtsp_thermal_url,
+                    source_id="thermal",
+                    label="Thermal (RTSP)",
+                    transport=self._rtsp_transport,
+                    parent=self,
                 )
                 th.frame.connect(self._on_source_frame)
                 self._sources["thermal"] = th
@@ -566,9 +734,10 @@ class VideoPipeline(QObject):
             self._active_source_id = next(iter(self._sources.keys()))
         self.sources_changed.emit()
 
-    def set_rtsp_sources(self, *, day_url: str = "", thermal_url: str = "") -> None:
+    def set_rtsp_sources(self, *, day_url: str = "", thermal_url: str = "", transport: str = "auto") -> None:
         self._rtsp_day_url = str(day_url or "").strip()
         self._rtsp_thermal_url = str(thermal_url or "").strip()
+        self._rtsp_transport = str(transport or "auto").strip().lower()
         # Reset active source if it no longer exists.
         if self._active_source_id and self._active_source_id not in self._sources:
             self._active_source_id = ""
