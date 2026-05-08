@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import csv
 import json
 import math
 import shutil
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -827,18 +829,20 @@ LEAFLET_HTML = """<!doctype html>
       background:#4a4f5e;
     }
     #cameraRail {
-      top: 78px;
-      right: 18px;
+      top: 74px;
+      right: 16px;
       display: none;
       flex-direction: column;
       align-items: center;
-      gap: 12px;
-      padding: 12px 12px 14px;
-      border-radius: 14px;
-      background: linear-gradient(180deg, rgba(39, 47, 61, 0.96), rgba(30, 38, 52, 0.96));
-      border: 1px solid rgba(188, 202, 224, 0.42);
-      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.34);
-      min-width: 108px;
+      gap: 6px;
+      width: clamp(188px, 22vw, 220px);
+      padding: 8px 9px 8px;
+      border-radius: 16px;
+      background: linear-gradient(180deg, rgba(30, 40, 56, 0.96), rgba(22, 30, 44, 0.97));
+      border: 1px solid rgba(180, 198, 226, 0.28);
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.36);
+      backdrop-filter: blur(3px);
+      transition: transform 140ms ease, box-shadow 140ms ease;
       z-index: 1215;
     }
     #videoPreview {
@@ -973,37 +977,46 @@ LEAFLET_HTML = """<!doctype html>
     #cameraTopRow {
       display: flex;
       align-items: center;
-      gap: 0;
-      padding: 3px;
-      border-radius: 22px;
-      background: rgba(73, 83, 102, 0.9);
-      border: 1px solid rgba(190, 202, 224, 0.35);
+      gap: 4px;
+      width: 100%;
+      padding: 4px;
+      border-radius: 11px;
+      background: rgba(72, 84, 108, 0.52);
+      border: 1px solid rgba(190, 202, 224, 0.24);
     }
-    #camZoomRow {
+    #camZoomRow, #camObserveRow1 {
       display: flex;
       align-items: center;
-      gap: 10px;
-    }
-    #camFocusRow {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    #camGimbalRow {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
+      gap: 6px;
+      width: 100%;
       justify-content: center;
     }
+    #camFocusRow, #camObserveRow2 {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+      justify-content: center;
+    }
+    #camGimbalRow {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(2, 1fr);
+      gap: 6px;
+      width: 100%;
+    }
+    .camGimbalSpacer {
+      width: 100%;
+      height: 36px;
+    }
     .camSmallBtn {
-      width: 48px;
-      height: 38px;
+      width: 100%;
+      height: 36px;
       border-radius: 10px;
       border: 1px solid rgba(196, 209, 230, 0.22);
-      background: transparent;
+      background: rgba(22, 30, 42, 0.32);
       color: #e8edf8;
-      font-size: 18px;
+      font-size: 16px;
       font-weight: 600;
       letter-spacing: 0;
       display: inline-flex;
@@ -1011,11 +1024,18 @@ LEAFLET_HTML = """<!doctype html>
       justify-content: center;
       cursor: pointer;
       user-select: none;
-      transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+      transition: background 70ms linear, border-color 70ms linear, box-shadow 70ms linear;
+      -webkit-tap-highlight-color: transparent;
     }
     .camSmallBtn:hover {
-      background: rgba(110, 123, 148, 0.24);
+      background: rgba(110, 123, 148, 0.3);
       border-color: rgba(229, 237, 251, 0.4);
+    }
+    .camSmallBtn:active,
+    .camSmallBtn.pressing {
+      background: rgba(140, 160, 188, 0.36);
+      border-color: rgba(234, 242, 255, 0.62);
+      box-shadow: 0 0 0 1px rgba(240, 246, 255, 0.22) inset;
     }
     .camSmallBtn.active {
       border-color: rgba(214, 224, 241, 0.9);
@@ -1024,16 +1044,23 @@ LEAFLET_HTML = """<!doctype html>
       color: #69e86f;
     }
     #camVideoBtn {
-      width: 38px;
-      height: 38px;
+      width: 36px;
+      height: 36px;
       border-radius: 50%;
-      margin-right: 4px;
       border-color: transparent;
       box-shadow: none;
+      flex: 0 0 36px;
     }
     #camVideoBtn:hover {
       border-color: transparent;
       background: rgba(110, 123, 148, 0.2);
+      transform: none;
+    }
+    #camVideoBtn:active, #camPhotoBtn:active, #camSplitBtn:active, #camFollowBtn:active,
+    #camZoomOutBtn:active, #camZoomInBtn:active, #camFocusOutBtn:active, #camFocusInBtn:active,
+    #camGimbalUpBtn:active, #camGimbalDownBtn:active, #camGimbalLeftBtn:active, #camGimbalRightBtn:active,
+    #camObsMarkBtn:active, #camObsClipBtn:active, #camObsExportBtn:active, #camObsClearBtn:active,
+    #camSettingsBtn:active {
       transform: none;
     }
     #camVideoBtn.active {
@@ -1042,12 +1069,13 @@ LEAFLET_HTML = """<!doctype html>
       box-shadow: 0 0 0 1px rgba(230, 238, 252, 0.18) inset;
     }
     #camPhotoBtn {
-      width: 48px;
-      height: 38px;
+      width: 36px;
+      height: 36px;
       border-radius: 9px;
       border-color: transparent;
       box-shadow: none;
       color: #e8edf8;
+      flex: 0 0 36px;
     }
     #camPhotoBtn:hover {
       border-color: transparent;
@@ -1055,15 +1083,18 @@ LEAFLET_HTML = """<!doctype html>
       transform: none;
     }
     #camPhotoBtn.active {
-      width: 38px;
-      height: 38px;
+      width: 36px;
+      height: 36px;
       border-radius: 50%;
-      margin-left: 5px;
-      margin-right: 5px;
       border-color: rgba(214, 224, 241, 0.9);
       background: rgba(27, 33, 45, 0.96);
       box-shadow: 0 0 0 1px rgba(230, 238, 252, 0.18) inset;
       color: #f2f6ff;
+    }
+    #camSplitBtn, #camFollowBtn {
+      flex: 1 1 auto;
+      min-width: 0;
+      font-size: 15px;
     }
     #camRecordBtn {
       width: 50px;
@@ -1083,21 +1114,21 @@ LEAFLET_HTML = """<!doctype html>
       box-shadow: 0 3px 8px rgba(0,0,0,0.35);
     }
     #camRecordDot {
-      width: 28px;
-      height: 28px;
+      width: 26px;
+      height: 26px;
       border-radius: 50%;
       background: linear-gradient(180deg, #ff4b4b, #f62d2d);
       box-shadow: 0 1px 2px rgba(0,0,0,0.4);
     }
     #camRecordBtn.recording #camRecordDot {
       border-radius: 8px;
-      width: 22px;
-      height: 22px;
+      width: 18px;
+      height: 18px;
       background: linear-gradient(180deg, #ff5555, #ff3939);
     }
     #camTimer {
       font-weight: 700;
-      font-size: 15px;
+      font-size: 13px;
       color: #ffffff;
       background: rgba(255, 65, 65, 0.92);
       border-radius: 10px;
@@ -1108,6 +1139,49 @@ LEAFLET_HTML = """<!doctype html>
       font-family: "Consolas", "Courier New", monospace;
       border: 1px solid rgba(255, 205, 205, 0.5);
       box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+      min-width: 84px;
+      text-align: center;
+    }
+    .camSectionLabel {
+      width: 100%;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(201, 214, 236, 0.82);
+      padding: 0 2px;
+      margin-top: 2px;
+      user-select: none;
+    }
+    #camSettingsBtn {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      align-self: center;
+    }
+    @media (max-height: 820px) {
+      #cameraRail {
+        gap: 4px;
+        padding: 6px 8px;
+      }
+      .camSmallBtn {
+        height: 32px;
+        font-size: 14px;
+      }
+      .camGimbalSpacer {
+        height: 32px;
+      }
+      #camRecordBtn {
+        width: 44px;
+        height: 44px;
+      }
+      #camTimer {
+        font-size: 12px;
+        min-width: 76px;
+      }
+      .camSectionLabel {
+        font-size: 9px;
+      }
     }
     .camLabel {
       opacity: 0.95;
@@ -2115,19 +2189,33 @@ LEAFLET_HTML = """<!doctype html>
       </div>
       <div id="camRecordBtn" title="Start/Stop recording"><div id="camRecordDot"></div></div>
       <div id="camTimer">00:00:00</div>
+      <div class="camSectionLabel">Zoom</div>
       <div id="camZoomRow">
         <div class="camSmallBtn" id="camZoomOutBtn" title="Zoom out"><span class="camLabel">−</span></div>
-        <div class="camSmallBtn" id="camZoomInBtn" title="Zoom in"><span class="camLabel">＋</span></div>
+        <div class="camSmallBtn" id="camZoomInBtn" title="Zoom in"><span class="camLabel">+</span></div>
       </div>
+      <div class="camSectionLabel">Focus</div>
       <div id="camFocusRow">
         <div class="camSmallBtn" id="camFocusOutBtn" title="Focus out"><span class="camLabel">F−</span></div>
-        <div class="camSmallBtn" id="camFocusInBtn" title="Focus in"><span class="camLabel">F＋</span></div>
+        <div class="camSmallBtn" id="camFocusInBtn" title="Focus in"><span class="camLabel">F+</span></div>
       </div>
+      <div class="camSectionLabel">Gimbal</div>
       <div id="camGimbalRow">
+        <div class="camGimbalSpacer"></div>
         <div class="camSmallBtn" id="camGimbalUpBtn" title="Gimbal up"><span class="camLabel">↑</span></div>
-        <div class="camSmallBtn" id="camGimbalDownBtn" title="Gimbal down"><span class="camLabel">↓</span></div>
+        <div class="camGimbalSpacer"></div>
         <div class="camSmallBtn" id="camGimbalLeftBtn" title="Gimbal left"><span class="camLabel">←</span></div>
+        <div class="camSmallBtn" id="camGimbalDownBtn" title="Gimbal down"><span class="camLabel">↓</span></div>
         <div class="camSmallBtn" id="camGimbalRightBtn" title="Gimbal right"><span class="camLabel">→</span></div>
+      </div>
+      <div class="camSectionLabel">OBSERVE</div>
+      <div id="camObserveRow1">
+        <div class="camSmallBtn" id="camObsMarkBtn" title="Target marking mode"><span class="camLabel">Target</span></div>
+        <div class="camSmallBtn" id="camObsClipBtn" title="Capture short video clip"><span class="camLabel">Clip</span></div>
+      </div>
+      <div id="camObserveRow2">
+        <div class="camSmallBtn" id="camObsExportBtn" title="Export observation report"><span class="camLabel">Report</span></div>
+        <div class="camSmallBtn" id="camObsClearBtn" title="Clear observed targets"><span class="camLabel">Reset</span></div>
       </div>
       <div class="camSmallBtn" id="camSettingsBtn" title="Camera settings"><span class="camLabel">⚙</span></div>
     </div>
@@ -2351,6 +2439,10 @@ LEAFLET_HTML = """<!doctype html>
     const camGimbalDownBtn = document.getElementById('camGimbalDownBtn');
     const camGimbalLeftBtn = document.getElementById('camGimbalLeftBtn');
     const camGimbalRightBtn = document.getElementById('camGimbalRightBtn');
+    const camObsMarkBtn = document.getElementById('camObsMarkBtn');
+    const camObsClipBtn = document.getElementById('camObsClipBtn');
+    const camObsExportBtn = document.getElementById('camObsExportBtn');
+    const camObsClearBtn = document.getElementById('camObsClearBtn');
     const videoPreview = document.getElementById('videoPreview');
     const videoPreviewImg = document.getElementById('videoPreviewImg');
     const videoPreviewGrid = document.getElementById('videoPreviewGrid');
@@ -2369,6 +2461,9 @@ LEAFLET_HTML = """<!doctype html>
     let camRecordStartedAt = 0;
     let __camSplitEnabled = false;
     let __videoSwapped = false;
+    let __obsMarkMode = false;
+    let __obsMarkers = [];
+    let __obsVideoMarkers = [];
     function formatRecordTime(seconds) {
       const s = Math.max(0, Number(seconds) || 0);
       const hh = String(Math.floor(s / 3600)).padStart(2, '0');
@@ -2429,6 +2524,64 @@ LEAFLET_HTML = """<!doctype html>
         try { if (viewer3d && viewer3d.resize) viewer3d.resize(); } catch (e) {}
       }, 40);
       return __videoSwapped ? 1 : 0;
+    }
+    function setObservationMarkMode(enabled) {
+      __obsMarkMode = !!enabled;
+      if (camObsMarkBtn) camObsMarkBtn.classList.toggle('active', __obsMarkMode);
+      if (videoPreview) {
+        videoPreview.style.outline = __obsMarkMode ? '2px solid rgba(255,215,0,0.95)' : 'none';
+      }
+      return __obsMarkMode ? 1 : 0;
+    }
+    function clearObservationMarks() {
+      try {
+        for (const m of __obsMarkers) {
+          try { if (m && map && map.hasLayer(m)) map.removeLayer(m); } catch (e) {}
+        }
+      } catch (e) {}
+      __obsMarkers = [];
+      try {
+        for (const m of __obsVideoMarkers) {
+          try { if (m && m.parentNode) m.parentNode.removeChild(m); } catch (e) {}
+        }
+      } catch (e) {}
+      __obsVideoMarkers = [];
+      return 1;
+    }
+    function addObservationMapMarker(lat, lon) {
+      try {
+        const m = L.circleMarker([lat, lon], {
+          radius: 6,
+          color: '#ffd84d',
+          weight: 2,
+          fillColor: '#ff4729',
+          fillOpacity: 0.85
+        }).addTo(map);
+        __obsMarkers.push(m);
+      } catch (e) {}
+      return 1;
+    }
+    function addObservationVideoMarker(xNorm, yNorm) {
+      if (!videoPreview) return 0;
+      try {
+        const host = aiOverlaySingle || videoPreview;
+        const dot = document.createElement('div');
+        dot.style.position = 'absolute';
+        dot.style.left = (Math.max(0, Math.min(1, xNorm)) * 100).toFixed(2) + '%';
+        dot.style.top = (Math.max(0, Math.min(1, yNorm)) * 100).toFixed(2) + '%';
+        dot.style.width = '12px';
+        dot.style.height = '12px';
+        dot.style.marginLeft = '-6px';
+        dot.style.marginTop = '-6px';
+        dot.style.borderRadius = '50%';
+        dot.style.border = '2px solid #ffd84d';
+        dot.style.background = 'rgba(255,71,41,0.95)';
+        dot.style.pointerEvents = 'none';
+        dot.style.zIndex = '5';
+        host.appendChild(dot);
+        __obsVideoMarkers.push(dot);
+      } catch (e) {}
+      return 1;
     }
     function setVideoPreviewGrid(images) {
       if (!videoPreviewGrid) return 0;
@@ -2540,6 +2693,16 @@ LEAFLET_HTML = """<!doctype html>
       videoPreview.addEventListener('click', function(ev) {
         ev.preventDefault();
         ev.stopPropagation();
+        if (__obsMarkMode) {
+          try {
+            const r = videoPreview.getBoundingClientRect();
+            const x = (ev.clientX - r.left) / Math.max(1, r.width);
+            const y = (ev.clientY - r.top) / Math.max(1, r.height);
+            addObservationVideoMarker(x, y);
+            document.title = 'VGCS_OBS_VIDEO_MARK:' + String(x) + ':' + String(y) + ':' + Date.now();
+            return;
+          } catch (e) {}
+        }
         setVideoSwapMode(!__videoSwapped);
       });
     }
@@ -2638,6 +2801,50 @@ LEAFLET_HTML = """<!doctype html>
     if (camGimbalDownBtn) camGimbalDownBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(0, 1); });
     if (camGimbalLeftBtn) camGimbalLeftBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(-1, 0); });
     if (camGimbalRightBtn) camGimbalRightBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(1, 0); });
+    if (camObsMarkBtn) {
+      camObsMarkBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        setObservationMarkMode(!__obsMarkMode);
+      });
+    }
+    if (camObsClipBtn) {
+      camObsClipBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_OBS_CLIP_REQUEST:' + Date.now();
+      });
+    }
+    if (camObsExportBtn) {
+      camObsExportBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_OBS_EXPORT_REQUEST:' + Date.now();
+      });
+    }
+    if (camObsClearBtn) {
+      camObsClearBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_OBS_CLEAR_REQUEST:' + Date.now();
+      });
+    }
+    function _bindPressFeedback(el) {
+      if (!el) return;
+      const onDown = function() { try { el.classList.add('pressing'); } catch (e) {} };
+      const onUp = function() { try { el.classList.remove('pressing'); } catch (e) {} };
+      el.addEventListener('pointerdown', onDown);
+      el.addEventListener('pointerup', onUp);
+      el.addEventListener('pointercancel', onUp);
+      el.addEventListener('mouseleave', onUp);
+      el.addEventListener('blur', onUp);
+    }
+    [
+      camVideoBtn, camPhotoBtn, camSplitBtn, camFollowBtn,
+      camZoomOutBtn, camZoomInBtn, camFocusOutBtn, camFocusInBtn,
+      camGimbalUpBtn, camGimbalDownBtn, camGimbalLeftBtn, camGimbalRightBtn,
+      camObsMarkBtn, camObsClipBtn, camObsExportBtn, camObsClearBtn, camSettingsBtn
+    ].forEach(_bindPressFeedback);
     let tileLayer = null;
     let labelLayer = null;
     let __tileErrorCount = 0;
@@ -4336,6 +4543,11 @@ LEAFLET_HTML = """<!doctype html>
       if (addFenceMode) {
         fencePoints.push([e.latlng.lat, e.latlng.lng]);
         setFencePolygon(fencePoints);
+        return;
+      }
+      if (__obsMarkMode) {
+        addObservationMapMarker(e.latlng.lat, e.latlng.lng);
+        document.title = 'VGCS_OBS_MAP_MARK:' + String(e.latlng.lat) + ':' + String(e.latlng.lng) + ':' + Date.now();
       }
     });
   </script>
@@ -4583,6 +4795,9 @@ class MapWidget(QWidget):
         self._video_settings_rtsp_transport = "auto"
         self._video_settings_default_view = "Single"
         self._camera_control = NoopCameraControl()
+        self._obs_mark_mode = False
+        self._observations: list[dict[str, object]] = []
+        self._vehicle_rel_alt_m: float | None = None
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -4635,6 +4850,11 @@ class MapWidget(QWidget):
         self._btn_tiles_pick = QPushButton("Offline Tiles…")
         self._btn_webcam = QPushButton("Webcam")
         self._btn_webcam.setCheckable(True)
+        self._btn_obs_mode = QPushButton("Mark Target")
+        self._btn_obs_mode.setCheckable(True)
+        self._btn_obs_clip = QPushButton("Short Clip")
+        self._btn_obs_export = QPushButton("Export Obs")
+        self._btn_obs_clear = QPushButton("Clear Obs")
         self._perf_mode = QComboBox()
         self._perf_mode.setMinimumWidth(92)
         self._perf_mode.addItems(["Perf: Auto", "Perf: Low", "Perf: High"])
@@ -4734,6 +4954,10 @@ class MapWidget(QWidget):
         tools.addWidget(self._btn_tiles_pick, 2, 11)
         tools.addWidget(self._btn_webcam, 2, 12)
         tools.addWidget(self._perf_mode, 2, 13)
+        tools.addWidget(self._btn_obs_mode, 2, 14)
+        tools.addWidget(self._btn_obs_clip, 2, 15)
+        tools.addWidget(self._btn_obs_export, 2, 16)
+        tools.addWidget(self._btn_obs_clear, 2, 17)
         toolbar.setLayout(tools)
         self._toolbar = toolbar
 
@@ -4771,6 +4995,10 @@ class MapWidget(QWidget):
         self._btn_tiles_sat.clicked.connect(self._set_satellite_tiles)
         self._btn_tiles_pick.clicked.connect(self._pick_offline_tiles)
         self._btn_webcam.toggled.connect(self._set_webcam_enabled)
+        self._btn_obs_mode.toggled.connect(self._set_observation_mark_mode)
+        self._btn_obs_clip.clicked.connect(self._capture_observation_clip)
+        self._btn_obs_export.clicked.connect(self._export_observations)
+        self._btn_obs_clear.clicked.connect(self._clear_observations)
         self._perf_mode.currentIndexChanged.connect(self._on_perf_mode_changed)
         self._wp_selector.currentIndexChanged.connect(self._on_wp_selected)
         self._btn_apply_wp_alt.clicked.connect(self._apply_altitude_to_selected)
@@ -5787,7 +6015,260 @@ class MapWidget(QWidget):
         except Exception:
             return img
 
+    def _capture_photo_quick(self) -> str | None:
+        """
+        Save a photo immediately without opening a pre-save dialog.
+        Returns the saved path on success, else None.
+        """
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        photos_dir = Path.cwd() / "captures"
+        try:
+            photos_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None
+
+        # Prefer backend-native capture when available.
+        try:
+            self._ensure_video_preview_backend()
+            src = getattr(self, "_video_active_source", None)
+            if src is not None and hasattr(src, "take_photo"):
+                out = photos_dir / f"photo_{stamp}.jpg"
+                ok = bool(src.take_photo(str(out)))
+                if ok:
+                    return str(out)
+        except Exception:
+            pass
+
+        # Fallback: decode the currently displayed data URL frame.
+        try:
+            data_url = str(getattr(self, "_video_last_data_url", "") or "").strip()
+            if not data_url.startswith("data:image/"):
+                return None
+            head, b64 = data_url.split(",", 1)
+            ext = "jpg"
+            if "image/png" in head.lower():
+                ext = "png"
+            out = photos_dir / f"photo_{stamp}.{ext}"
+            raw = base64.b64decode(b64)
+            out.write_bytes(raw)
+            return str(out)
+        except Exception:
+            return None
+
+    def _set_observation_mark_mode(self, enabled: bool) -> None:
+        self._obs_mark_mode = bool(enabled)
+        self._run_js(f"if (window.setObservationMarkMode) setObservationMarkMode({1 if enabled else 0});")
+        if enabled:
+            self._set_status("Observation mark mode ON: click map or video preview")
+        else:
+            self._set_status("Observation mark mode OFF")
+
+    def _observation_context(self) -> dict[str, object]:
+        gimbal_yaw = None
+        gimbal_pitch = None
+        try:
+            st = self._camera_control.get_gimbal_status()
+            if st is not None:
+                gimbal_yaw = getattr(st, "yaw_deg", None)
+                gimbal_pitch = getattr(st, "pitch_deg", None)
+        except Exception:
+            pass
+        return {
+            "vehicle_lat": self._lat,
+            "vehicle_lon": self._lon,
+            "vehicle_heading_deg": self._heading,
+            "vehicle_rel_alt_m": self._vehicle_rel_alt_m,
+            "gimbal_yaw_deg": gimbal_yaw,
+            "gimbal_pitch_deg": gimbal_pitch,
+        }
+
+    def _log_observation(self, kind: str, *, map_lat: float | None = None, map_lon: float | None = None, video_x: float | None = None, video_y: float | None = None) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        snap = self._capture_photo_quick()
+        row: dict[str, object] = {
+            "timestamp_utc": ts,
+            "kind": str(kind),
+            "map_lat": map_lat,
+            "map_lon": map_lon,
+            "video_x_norm": video_x,
+            "video_y_norm": video_y,
+            "snapshot_path": snap or "",
+        }
+        row.update(self._observation_context())
+        self._observations.append(row)
+        self._set_status(f"Observation logged ({len(self._observations)}): {kind}")
+
+    def _capture_observation_clip(self) -> None:
+        self._ensure_video_preview_backend()
+        src = getattr(self, "_video_active_source", None)
+        if src is None:
+            self._set_status("Observation clip failed: no active video source")
+            return
+        out_dir = Path.cwd() / "captures" / "clips"
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self._set_status("Observation clip failed: cannot create captures folder")
+            return
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"obs_clip_{stamp}.mp4"
+        started = False
+        try:
+            if hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
+                started = bool(src.start_recording(str(out_path)))
+                if started:
+                    QTimer.singleShot(8000, lambda: self._stop_observation_clip_rtsp(src, str(out_path)))
+            else:
+                rec = src.recorder() if hasattr(src, "recorder") else None
+                if rec is not None:
+                    rec.setOutputLocation(QUrl.fromLocalFile(str(out_path)))
+                    rec.record()
+                    started = True
+                    QTimer.singleShot(8000, lambda: self._stop_observation_clip_rec(rec, str(out_path)))
+        except Exception:
+            started = False
+        if started:
+            self._set_status("Capturing short clip (8s)…")
+        else:
+            self._set_status("Observation clip unsupported on this backend")
+
+    def _stop_observation_clip_rtsp(self, src: object, out_path: str) -> None:
+        try:
+            src.stop_recording()
+        except Exception:
+            pass
+        self._set_status(f"Short clip saved: {Path(out_path).name}")
+
+    def _stop_observation_clip_rec(self, rec: object, out_path: str) -> None:
+        try:
+            rec.stop()
+        except Exception:
+            pass
+        self._set_status(f"Short clip saved: {Path(out_path).name}")
+
+    def _clear_observations(self) -> None:
+        n = len(self._observations)
+        self._observations.clear()
+        self._run_js("if (window.clearObservationMarks) clearObservationMarks();")
+        self._set_status(f"Cleared observations: {n}")
+
+    def _export_observations(self) -> None:
+        if not self._observations:
+            self._set_status("No observations to export")
+            return
+        suggested = f"observations_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_path, _ = QFileDialog.getSaveFileName(self, "Export observations CSV", str(Path.cwd() / suggested), "CSV files (*.csv)")
+        if not csv_path:
+            return
+        fields = [
+            "timestamp_utc",
+            "kind",
+            "map_lat",
+            "map_lon",
+            "video_x_norm",
+            "video_y_norm",
+            "vehicle_lat",
+            "vehicle_lon",
+            "vehicle_heading_deg",
+            "vehicle_rel_alt_m",
+            "gimbal_yaw_deg",
+            "gimbal_pitch_deg",
+            "snapshot_path",
+        ]
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                for row in self._observations:
+                    w.writerow({k: row.get(k) for k in fields})
+        except Exception:
+            self._set_status("Observation CSV export failed")
+            return
+        html_path = str(Path(csv_path).with_suffix(".html"))
+        try:
+            self._write_observation_html_summary(html_path)
+        except Exception:
+            html_path = ""
+        if html_path:
+            self._set_status(f"Observations exported: {csv_path} | {html_path}")
+        else:
+            self._set_status(f"Observations exported: {csv_path}")
+
+    def _write_observation_html_summary(self, path: str) -> None:
+        rows = []
+        for idx, row in enumerate(self._observations, start=1):
+            rows.append(
+                "<tr>"
+                f"<td>{idx}</td>"
+                f"<td>{row.get('timestamp_utc','')}</td>"
+                f"<td>{row.get('kind','')}</td>"
+                f"<td>{row.get('map_lat','')}</td>"
+                f"<td>{row.get('map_lon','')}</td>"
+                f"<td>{row.get('vehicle_lat','')}</td>"
+                f"<td>{row.get('vehicle_lon','')}</td>"
+                f"<td>{row.get('gimbal_yaw_deg','')}</td>"
+                f"<td>{row.get('gimbal_pitch_deg','')}</td>"
+                f"<td>{row.get('snapshot_path','')}</td>"
+                "</tr>"
+            )
+        html = (
+            "<!doctype html><html><head><meta charset='utf-8'/>"
+            "<title>Observation Summary</title>"
+            "<style>body{font-family:Segoe UI,Arial,sans-serif;padding:20px;} table{border-collapse:collapse;width:100%;}"
+            "th,td{border:1px solid #ccc;padding:6px;font-size:12px;} th{background:#f3f6fb;text-align:left;}</style>"
+            "</head><body>"
+            f"<h2>Observation Report ({len(self._observations)} entries)</h2>"
+            "<table><thead><tr>"
+            "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th>"
+            "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th><th>Snapshot</th>"
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table></body></html>"
+        )
+        Path(path).write_text(html, encoding="utf-8")
+
     def _on_web_title_changed(self, title: str) -> None:
+        if title.startswith("VGCS_OBS_MAP_MARK:"):
+            try:
+                parts = title.split(":")
+                lat = float(parts[1]) if len(parts) >= 2 else None
+                lon = float(parts[2]) if len(parts) >= 3 else None
+                self._log_observation("map_mark", map_lat=lat, map_lon=lon)
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_OBS_VIDEO_MARK:"):
+            try:
+                parts = title.split(":")
+                x = float(parts[1]) if len(parts) >= 2 else None
+                y = float(parts[2]) if len(parts) >= 3 else None
+                self._log_observation("video_mark", video_x=x, video_y=y)
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_OBS_CLIP_REQUEST:"):
+            try:
+                self._capture_observation_clip()
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_OBS_EXPORT_REQUEST:"):
+            try:
+                self._export_observations()
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_OBS_CLEAR_REQUEST:"):
+            try:
+                self._clear_observations()
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
         if title.startswith("VGCS_CAM_VIDEO_TOGGLE:"):
             try:
                 enabled = bool(getattr(self, "_video_preview_enabled", False))
@@ -5809,19 +6290,11 @@ class MapWidget(QWidget):
             return
         if title.startswith("VGCS_CAM_PHOTO_REQUEST:"):
             try:
-                # Ensure backend exists and source is started.
-                self._ensure_video_preview_backend()
-                src = getattr(self, "_video_active_source", None)
-                if src is not None:
-                    # Save dialog on the Qt side.
-                    path, _ = QFileDialog.getSaveFileName(
-                        self,
-                        "Save photo",
-                        str(Path.cwd() / "photo.jpg"),
-                        "Images (*.jpg *.png)",
-                    )
-                    if path:
-                        src.take_photo(path)
+                path = self._capture_photo_quick()
+                if path:
+                    self._set_status(f"Photo saved: {Path(path).name}")
+                else:
+                    self._set_status("Photo capture failed (no active frame)")
             except Exception:
                 pass
             self._run_js("document.title = 'VGCS Map';")
@@ -6000,6 +6473,19 @@ class MapWidget(QWidget):
             try:
                 from vgcs.video.camera_control import GimbalCommand
 
+                # Prefer discrete PTZ commands for one-axis nudges when available.
+                if dx > 0 and dy == 0:
+                    self._camera_control.ptz("right")
+                elif dx < 0 and dy == 0:
+                    self._camera_control.ptz("left")
+                elif dy > 0 and dx == 0:
+                    self._camera_control.ptz("up")
+                elif dy < 0 and dx == 0:
+                    self._camera_control.ptz("down")
+                elif dx == 0 and dy == 0:
+                    self._camera_control.ptz("stop")
+                # Send explicit angle/speed hooks for integrations that support them.
+                self._camera_control.set_gimbal_speed(yaw=float(dx), pitch=float(dy))
                 self._camera_control.set_gimbal(GimbalCommand(pitch_deg=pitch, yaw_deg=yaw))
             except Exception:
                 pass
@@ -6166,6 +6652,7 @@ class MapWidget(QWidget):
         first_fix = self._lat is None or self._lon is None
         self._lat = lat
         self._lon = lon
+        self._vehicle_rel_alt_m = relative_alt_m
         if relative_alt_m is None:
             self._coords.setText(f"Lat/Lon: {lat:.7f}, {lon:.7f}")
         else:
