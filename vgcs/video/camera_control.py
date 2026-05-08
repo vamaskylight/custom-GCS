@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from vgcs.skydroid import GimbalStatus, SkydroidTopUdpAdapter
+
 
 @dataclass(frozen=True)
 class GimbalCommand:
@@ -25,6 +27,16 @@ class CameraControl(Protocol):
 
     def set_gimbal(self, cmd: GimbalCommand) -> None: ...
 
+    def ptz(self, action: str) -> None: ...
+
+    def set_gimbal_speed(self, yaw: float, pitch: float) -> None: ...
+
+    def camera_trigger_photo(self) -> None: ...
+
+    def camera_toggle_record(self) -> None: ...
+
+    def get_gimbal_status(self) -> GimbalStatus | None: ...
+
 
 class NoopCameraControl:
     """Default safe implementation: does nothing (keeps UI responsive)."""
@@ -37,6 +49,21 @@ class NoopCameraControl:
 
     def set_gimbal(self, cmd: GimbalCommand) -> None:
         return
+
+    def ptz(self, action: str) -> None:
+        return
+
+    def set_gimbal_speed(self, yaw: float, pitch: float) -> None:
+        return
+
+    def camera_trigger_photo(self) -> None:
+        return
+
+    def camera_toggle_record(self) -> None:
+        return
+
+    def get_gimbal_status(self) -> GimbalStatus | None:
+        return None
 
 
 class MavlinkCameraControl:
@@ -66,4 +93,96 @@ class MavlinkCameraControl:
             self._t.queue_gimbal_nudge(pitch_deg=pitch, yaw_deg=yaw)
         except Exception:
             return
+
+    def ptz(self, action: str) -> None:
+        # MAVLink path has no discrete PTZ semantic in M3; keep no-op.
+        return
+
+    def set_gimbal_speed(self, yaw: float, pitch: float) -> None:
+        try:
+            self._t.queue_gimbal_nudge(pitch_deg=float(pitch), yaw_deg=float(yaw))
+        except Exception:
+            return
+
+    def camera_trigger_photo(self) -> None:
+        return
+
+    def camera_toggle_record(self) -> None:
+        return
+
+    def get_gimbal_status(self) -> GimbalStatus | None:
+        return None
+
+
+class SkydroidCameraControl:
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int = 5000,
+        timeout_s: float = 0.25,
+        retries: int = 1,
+        log_path: str = "",
+        profile_id: str = "c13_default",
+    ) -> None:
+        self._adapter = SkydroidTopUdpAdapter(
+            host=host,
+            port=port,
+            timeout_s=timeout_s,
+            retries=retries,
+            log_path=log_path,
+            profile_id=profile_id,
+        )
+        self._adapter.start()
+
+    def close(self) -> None:
+        self._adapter.stop()
+
+    def set_zoom(self, level: float) -> None:
+        try:
+            self._adapter.camera_zoom(float(level))
+        except Exception:
+            return
+
+    def set_focus(self, level: float) -> None:
+        # TOP focus command is not guaranteed for all firmware; use no-op.
+        return
+
+    def set_gimbal(self, cmd: GimbalCommand) -> None:
+        yaw = float(cmd.yaw_deg) if cmd.yaw_deg is not None else 0.0
+        pitch = float(cmd.pitch_deg) if cmd.pitch_deg is not None else 0.0
+        try:
+            self._adapter.set_angle(yaw=yaw, pitch=pitch)
+        except Exception:
+            return
+
+    def ptz(self, action: str) -> None:
+        try:
+            self._adapter.ptz(str(action or ""))
+        except Exception:
+            return
+
+    def set_gimbal_speed(self, yaw: float, pitch: float) -> None:
+        try:
+            self._adapter.set_speed(yaw=float(yaw), pitch=float(pitch))
+        except Exception:
+            return
+
+    def camera_trigger_photo(self) -> None:
+        try:
+            self._adapter.camera_photo()
+        except Exception:
+            return
+
+    def camera_toggle_record(self) -> None:
+        try:
+            self._adapter.camera_record_toggle()
+        except Exception:
+            return
+
+    def get_gimbal_status(self) -> GimbalStatus | None:
+        try:
+            return self._adapter.get_status()
+        except Exception:
+            return None
 

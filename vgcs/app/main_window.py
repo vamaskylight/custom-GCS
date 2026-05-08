@@ -61,7 +61,7 @@ from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
 from vgcs.video.pipeline import VideoPipeline
 from vgcs.video.widgets import CameraControlPanel, SplitVideoPanel
-from vgcs.video.camera_control import MavlinkCameraControl, NoopCameraControl
+from vgcs.video.camera_control import MavlinkCameraControl, NoopCameraControl, SkydroidCameraControl
 
 
 def _settings_truthy(val: object, default: bool = False) -> bool:
@@ -130,6 +130,7 @@ class MainWindow(QMainWindow):
 
         self._settings = QSettings("VGCS", "VGCS")
         self._thread: MavlinkThread | None = None
+        self._camera_control_backend: object | None = None
         self._timeout_s = float(self._settings.value("watchdog_timeout_s", 2.0))
         self._armed_since: float | None = None
         self._heartbeat_seen = False
@@ -1566,6 +1567,34 @@ class MainWindow(QMainWindow):
         conn_group.setLayout(cg)
         vb.addWidget(conn_group)
 
+        skydroid_group = QGroupBox("Skydroid C13 (M4 TOP UDP)")
+        sdg = QGridLayout()
+        sdg.addWidget(QLabel("Camera control provider"), 0, 0)
+        camera_provider = QComboBox()
+        camera_provider.addItem("MAVLink (default)", "mavlink")
+        camera_provider.addItem("Skydroid TOP UDP", "skydroid")
+        sdg.addWidget(camera_provider, 0, 1)
+        sdg.addWidget(QLabel("Skydroid host/IP"), 1, 0)
+        skydroid_host = QLineEdit()
+        sdg.addWidget(skydroid_host, 1, 1)
+        sdg.addWidget(QLabel("Skydroid UDP port"), 2, 0)
+        skydroid_port = QSpinBox()
+        skydroid_port.setRange(1, 65535)
+        skydroid_port.setValue(5000)
+        sdg.addWidget(skydroid_port, 2, 1)
+        sdg.addWidget(QLabel("TOP timeout (ms)"), 3, 0)
+        skydroid_timeout = QSpinBox()
+        skydroid_timeout.setRange(50, 5000)
+        skydroid_timeout.setValue(250)
+        sdg.addWidget(skydroid_timeout, 3, 1)
+        sdg.addWidget(QLabel("Firmware command profile"), 4, 0)
+        skydroid_profile = QComboBox()
+        skydroid_profile.addItem("C13 Default (GAA/GSY/GAY)", "c13_default")
+        skydroid_profile.addItem("C13 Alternate (GAC/GSP/GAP)", "c13_alt")
+        sdg.addWidget(skydroid_profile, 4, 1)
+        skydroid_group.setLayout(sdg)
+        vb.addWidget(skydroid_group)
+
         settings_group = QGroupBox("Settings")
         stg = QGridLayout()
         stg.addWidget(QLabel("Aspect ratio"), 0, 0)
@@ -1644,6 +1673,21 @@ class MainWindow(QMainWindow):
             max_mb.setValue(int(s.value("video/max_storage_mb", 10240) or 10240))
         except Exception:
             max_mb.setValue(10240)
+        camera_provider.setCurrentIndex(
+            max(0, camera_provider.findData(str(s.value("camera/provider", "mavlink") or "mavlink")))
+        )
+        skydroid_host.setText(str(s.value("camera/skydroid_host", "") or ""))
+        try:
+            skydroid_port.setValue(int(s.value("camera/skydroid_port", 5000) or 5000))
+        except Exception:
+            skydroid_port.setValue(5000)
+        try:
+            skydroid_timeout.setValue(int(s.value("camera/skydroid_timeout_ms", 250) or 250))
+        except Exception:
+            skydroid_timeout.setValue(250)
+        skydroid_profile.setCurrentIndex(
+            max(0, skydroid_profile.findData(str(s.value("camera/skydroid_profile", "c13_default") or "c13_default")))
+        )
 
         def _apply() -> None:
             s.setValue("video/enabled", bool(enabled.isChecked()))
@@ -1658,9 +1702,20 @@ class MainWindow(QMainWindow):
             s.setValue("video/record_format", str(record_fmt.currentText()))
             s.setValue("video/auto_delete", bool(auto_del.isChecked()))
             s.setValue("video/max_storage_mb", int(max_mb.value()))
+            s.setValue("camera/provider", str(camera_provider.currentData() or "mavlink"))
+            s.setValue("camera/skydroid_host", str(skydroid_host.text()).strip())
+            s.setValue("camera/skydroid_port", int(skydroid_port.value()))
+            s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
+            s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
             try:
                 # Notify map to reload video config.
                 self._map_widget.apply_video_settings()
+            except Exception:
+                pass
+            # Hot-apply camera backend settings while connected (no app restart required).
+            try:
+                if self._thread is not None and self._thread.isRunning():
+                    self._set_runtime_camera_control()
             except Exception:
                 pass
             QMessageBox.information(dlg, "VGCS", "Video settings applied.")
@@ -2209,7 +2264,7 @@ class MainWindow(QMainWindow):
         self._thread.param_set_result.connect(self._on_param_set_result)
         self._thread.finished.connect(self._on_thread_finished)
         try:
-            self._map_widget.set_camera_control(MavlinkCameraControl(self._thread))
+            self._set_runtime_camera_control()
         except Exception:
             try:
                 self._map_widget.set_camera_control(NoopCameraControl())
@@ -2243,6 +2298,7 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def _on_disconnect(self) -> None:
+        self._stop_camera_control_backend()
         if self._thread is not None:
             self._thread.stop()
             if self._thread.isRunning():
@@ -2251,6 +2307,43 @@ class MainWindow(QMainWindow):
             self._map_widget.set_camera_control(NoopCameraControl())
         except Exception:
             pass
+
+    def _stop_camera_control_backend(self) -> None:
+        cc = self._camera_control_backend
+        self._camera_control_backend = None
+        if cc is None:
+            return
+        try:
+            close = getattr(cc, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            return
+
+    def _set_runtime_camera_control(self) -> None:
+        self._stop_camera_control_backend()
+        provider = str(self._settings.value("camera/provider", "mavlink") or "mavlink").strip().lower()
+        if provider == "skydroid":
+            host = str(self._settings.value("camera/skydroid_host", "") or "").strip()
+            port = int(self._settings.value("camera/skydroid_port", 5000) or 5000)
+            timeout_ms = int(self._settings.value("camera/skydroid_timeout_ms", 250) or 250)
+            profile_id = str(self._settings.value("camera/skydroid_profile", "c13_default") or "c13_default")
+            if host:
+                cc = SkydroidCameraControl(
+                    host=host,
+                    port=port,
+                    timeout_s=max(0.05, float(timeout_ms) / 1000.0),
+                    log_path=str(Path.cwd() / "logs" / "skydroid_top_udp.log"),
+                    profile_id=profile_id,
+                )
+                self._camera_control_backend = cc
+                self._map_widget.set_camera_control(cc)
+                self._append_log(f"Camera control: Skydroid TOP UDP {host}:{port} profile={profile_id}")
+                return
+            self._append_log("Camera control: Skydroid selected but host is empty, fallback to MAVLink")
+        cc = MavlinkCameraControl(self._thread)
+        self._camera_control_backend = cc
+        self._map_widget.set_camera_control(cc)
 
     def _on_link_up(self) -> None:
         self._map_widget.clear_flight_track()
@@ -3151,6 +3244,20 @@ class MainWindow(QMainWindow):
         self._append_log("UI defaults restored.")
 
     def _on_flight_timer_tick(self) -> None:
+        try:
+            cc = self._camera_control_backend
+            if cc is not None:
+                get_status = getattr(cc, "get_gimbal_status", None)
+                if callable(get_status):
+                    st = get_status()
+                    if st is not None and bool(getattr(st, "supported", False)):
+                        yaw = getattr(st, "yaw_deg", None)
+                        pitch = getattr(st, "pitch_deg", None)
+                        ys = "?" if yaw is None else f"{float(yaw):.1f}"
+                        ps = "?" if pitch is None else f"{float(pitch):.1f}"
+                        self._map_widget.set_header_vehicle_msg(f"Gimbal Y/P: {ys}/{ps}")
+        except Exception:
+            pass
         if self._armed_since is None:
             self._sync_visible_map_overlay_metrics()
             return
