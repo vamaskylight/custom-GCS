@@ -5706,6 +5706,24 @@ class MapWidget(QWidget):
 
         try:
             self._video_active_source = self._video.active_source() if self._video is not None else None
+            # Prefer Day feed for primary preview quality/comparison with VLC.
+            # If day is unavailable, fall back to thermal, then pipeline default.
+            if self._video is not None:
+                src_ids = set(sources.keys())
+                preferred_id = ""
+                if "day" in src_ids:
+                    preferred_id = "day"
+                elif "thermal" in src_ids:
+                    preferred_id = "thermal"
+                if preferred_id:
+                    try:
+                        self._video.set_active_source(preferred_id)
+                    except Exception:
+                        pass
+                    try:
+                        self._video_active_source = self._video.active_source()
+                    except Exception:
+                        pass
             if self._video_active_source is not None:
                 self._video_active_source.frame.connect(self._on_pipeline_frame)
             # Prep split handlers for up to 4 sources.
@@ -5808,7 +5826,7 @@ class MapWidget(QWidget):
                 try:
                     sid = str(getattr(src, "source_id", "") or "")
                     dname = str(getattr(src, "device_name", "") or sid or "video")
-                    self._set_status(f"Video preview: {dname}")
+                    self._set_status(f"Video preview: {dname} [{sid}]")
                 except Exception:
                     pass
             if bool(getattr(self, "_video_split_enabled", False)) and getattr(self, "_video", None) is not None:
