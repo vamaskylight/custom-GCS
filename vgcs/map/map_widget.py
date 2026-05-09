@@ -2506,6 +2506,17 @@ LEAFLET_HTML = """<!doctype html>
       }
       return on ? 1 : 0;
     }
+    function setNativeHudMode(enabled) {
+      const on = !!enabled;
+      try {
+        if (cameraRail) cameraRail.style.display = on ? 'none' : '';
+        const compassHud = document.getElementById('compassHud');
+        if (compassHud) compassHud.style.display = on ? 'none' : '';
+        const mapFooterHud = document.getElementById('mapFooterHud');
+        if (mapFooterHud) mapFooterHud.style.display = on ? 'none' : '';
+      } catch (e) {}
+      return on ? 1 : 0;
+    }
     function setVideoPreviewImage(dataUrl) {
       if (!videoPreviewImg || !videoPreviewPlaceholder) return 0;
       const src = String(dataUrl || '').trim();
@@ -4911,6 +4922,122 @@ class MapWidget(QWidget):
         self._video_swapped = False
         self._native_overlay_insets = {"left": 170, "top": 58, "right": 220, "bottom": 130}
         self._native_video_preview.mousePressEvent = self._on_native_video_click  # type: ignore[assignment]
+        self._native_hud_right = QFrame(self._map_canvas)
+        self._native_hud_right.setStyleSheet(
+            "QFrame { background: rgba(12, 16, 40, 0.95); border: 1px solid rgba(140, 160, 196, 0.35); border-radius: 14px; }"
+            "QPushButton { background: rgba(20, 26, 56, 0.96); color: #ecf2ff; border: 1px solid rgba(132, 152, 190, 0.35); border-radius: 8px; min-height: 26px; font-size: 11px; font-weight: 600; }"
+            "QPushButton:checked { background: rgba(199, 44, 62, 0.96); border-color: rgba(255, 200, 205, 0.5); }"
+            "QLabel { color: rgba(206, 220, 244, 0.72); font-size: 9px; font-weight: 700; letter-spacing: 0.08em; }"
+        )
+        self._native_hud_right_layout = QVBoxLayout(self._native_hud_right)
+        self._native_hud_right_layout.setContentsMargins(8, 8, 8, 8)
+        self._native_hud_right_layout.setSpacing(5)
+        self._btn_native_video = QPushButton("🎥")
+        self._btn_native_photo = QPushButton("📷")
+        self._btn_native_record = QPushButton("●")
+        self._btn_native_record.setCheckable(True)
+        self._btn_native_zoom_minus = QPushButton("−")
+        self._btn_native_zoom_plus = QPushButton("+")
+        self._btn_native_focus_minus = QPushButton("F−")
+        self._btn_native_focus_plus = QPushButton("F+")
+        self._btn_native_gimbal_up = QPushButton("↑")
+        self._btn_native_gimbal_down = QPushButton("↓")
+        self._btn_native_gimbal_left = QPushButton("←")
+        self._btn_native_gimbal_right = QPushButton("→")
+        self._btn_native_target = QPushButton("Target")
+        self._btn_native_target.setCheckable(True)
+        self._btn_native_clip = QPushButton("Clip")
+        self._btn_native_report = QPushButton("Report")
+        self._btn_native_reset = QPushButton("Reset")
+        for b in (self._btn_native_video, self._btn_native_photo, self._btn_native_record):
+            b.setFixedHeight(24)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(5)
+        top_row.addWidget(self._btn_native_video)
+        top_row.addWidget(self._btn_native_photo)
+        top_row.addWidget(self._btn_native_record)
+        self._native_hud_right_layout.addLayout(top_row)
+
+        zoom_lab = QLabel("ZOOM")
+        self._native_hud_right_layout.addWidget(zoom_lab)
+        zoom_row = QHBoxLayout()
+        zoom_row.setSpacing(5)
+        zoom_row.addWidget(self._btn_native_zoom_minus)
+        zoom_row.addWidget(self._btn_native_zoom_plus)
+        self._native_hud_right_layout.addLayout(zoom_row)
+
+        focus_lab = QLabel("FOCUS")
+        self._native_hud_right_layout.addWidget(focus_lab)
+        focus_row = QHBoxLayout()
+        focus_row.setSpacing(5)
+        focus_row.addWidget(self._btn_native_focus_minus)
+        focus_row.addWidget(self._btn_native_focus_plus)
+        self._native_hud_right_layout.addLayout(focus_row)
+
+        gimbal_lab = QLabel("GIMBAL")
+        self._native_hud_right_layout.addWidget(gimbal_lab)
+        gimbal_up = QHBoxLayout()
+        gimbal_up.setSpacing(5)
+        gimbal_up.addStretch(1)
+        gimbal_up.addWidget(self._btn_native_gimbal_up)
+        gimbal_up.addStretch(1)
+        self._native_hud_right_layout.addLayout(gimbal_up)
+        gimbal_row = QHBoxLayout()
+        gimbal_row.setSpacing(5)
+        gimbal_row.addWidget(self._btn_native_gimbal_left)
+        gimbal_row.addWidget(self._btn_native_gimbal_down)
+        gimbal_row.addWidget(self._btn_native_gimbal_right)
+        self._native_hud_right_layout.addLayout(gimbal_row)
+
+        obs_lab = QLabel("OBSERVE")
+        self._native_hud_right_layout.addWidget(obs_lab)
+        obs_row1 = QHBoxLayout()
+        obs_row1.setSpacing(5)
+        obs_row1.addWidget(self._btn_native_target)
+        obs_row1.addWidget(self._btn_native_clip)
+        self._native_hud_right_layout.addLayout(obs_row1)
+        obs_row2 = QHBoxLayout()
+        obs_row2.setSpacing(5)
+        obs_row2.addWidget(self._btn_native_report)
+        obs_row2.addWidget(self._btn_native_reset)
+        self._native_hud_right_layout.addLayout(obs_row2)
+        self._native_hud_right.hide()
+        self._native_hud_right.raise_()
+
+        self._native_compass = QLabel(self._map_canvas)
+        self._native_compass.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._native_compass.setStyleSheet(
+            "QLabel { background: rgba(20, 24, 52, 0.94); color: #f1f5ff; border: 1px solid rgba(132,152,190,0.35); border-radius: 46px; font-size: 12px; font-weight: 700; }"
+        )
+        self._native_compass.hide()
+        self._native_compass.raise_()
+
+        self._native_telemetry = QLabel(self._map_canvas)
+        self._native_telemetry.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._native_telemetry.setStyleSheet(
+            "QLabel { background: rgba(20, 24, 52, 0.94); color: #e7efff; border: 1px solid rgba(132,152,190,0.35); border-radius: 10px; padding: 6px; font-size: 11px; font-weight: 600; }"
+        )
+        self._native_telemetry.setText("Alt -- | Spd -- | Time --")
+        self._native_telemetry.hide()
+        self._native_telemetry.raise_()
+
+        self._btn_native_video.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_VIDEO_MODE_REQUEST:0"))
+        self._btn_native_photo.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_PHOTO_REQUEST:0"))
+        self._btn_native_record.toggled.connect(
+            lambda on: self._on_web_title_changed(f"VGCS_CAM_RECORD_TOGGLE:{1 if on else 0}:0")
+        )
+        self._btn_native_zoom_minus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_ZOOM_STEP:-1:0"))
+        self._btn_native_zoom_plus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_ZOOM_STEP:1:0"))
+        self._btn_native_focus_minus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_FOCUS_STEP:-1:0"))
+        self._btn_native_focus_plus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_FOCUS_STEP:1:0"))
+        self._btn_native_gimbal_up.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:0:-1:0"))
+        self._btn_native_gimbal_down.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:0:1:0"))
+        self._btn_native_gimbal_left.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:-1:0:0"))
+        self._btn_native_gimbal_right.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:1:0:0"))
+        self._btn_native_target.toggled.connect(self._set_observation_mark_mode)
+        self._btn_native_clip.clicked.connect(self._capture_observation_clip)
+        self._btn_native_report.clicked.connect(self._export_observations)
+        self._btn_native_reset.clicked.connect(self._clear_observations)
 
         self._status = QLabel("Map status: waiting for telemetry")
         self._status.setObjectName("telemetryValue")
@@ -5134,6 +5261,7 @@ class MapWidget(QWidget):
         if bool(getattr(self, "_video_swapped", False)):
             self._refresh_native_overlay_insets()
         self._layout_native_video_preview()
+        self._layout_native_hud()
 
     def _on_native_video_click(self, event) -> None:
         try:
@@ -5225,6 +5353,23 @@ class MapWidget(QWidget):
             self._native_video_preview.raise_()
             if not self._native_video_last.isNull():
                 self._render_native_video_preview(self._native_video_last)
+        except Exception:
+            return
+
+    def _layout_native_hud(self) -> None:
+        try:
+            w = max(1, self._map_canvas.width())
+            h = max(1, self._map_canvas.height())
+            panel_w = 168
+            panel_h = min(max(320, int(h * 0.56)), 520)
+            panel_x = max(0, w - panel_w - 12)
+            panel_y = 64
+            self._native_hud_right.setGeometry(panel_x, panel_y, panel_w, panel_h)
+            comp_sz = 96
+            self._native_compass.setGeometry(max(0, panel_x + (panel_w - comp_sz) // 2), panel_y + panel_h + 10, comp_sz, comp_sz)
+            tel_w = 220
+            tel_h = 54
+            self._native_telemetry.setGeometry(max(0, w - tel_w - 160), max(0, h - tel_h - 18), tel_w, tel_h)
         except Exception:
             return
 
@@ -6038,8 +6183,13 @@ class MapWidget(QWidget):
             self._video_swapped = False
             self._native_video_preview.show()
             self._layout_native_video_preview()
+            self._native_hud_right.show()
+            self._native_compass.show()
+            self._native_telemetry.show()
+            self._layout_native_hud()
             # Native mode: hide Web preview layer to avoid double-render fragmentation.
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
+            self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
             src = getattr(self, "_video_active_source", None)
             if src is not None:
                 src.start()
@@ -6059,20 +6209,28 @@ class MapWidget(QWidget):
             if bool(getattr(self, "_video_split_enabled", False)):
                 if hasattr(self, "_video_push_timer") and not self._video_push_timer.isActive():
                     self._video_push_timer.start()
-            if hasattr(self, "_ai_timer") and not self._ai_timer.isActive():
-                self._ai_timer.start()
+                if hasattr(self, "_ai_timer") and not self._ai_timer.isActive():
+                    self._ai_timer.start()
+            else:
+                if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
+                    self._ai_timer.stop()
+                self._run_js("if (window.clearAiOverlays) clearAiOverlays();")
         except Exception:
             self._run_js("setVideoPreviewImage('');")
 
     def _stop_video_preview(self, *, clear_overlay: bool) -> None:
         self._video_preview_enabled = False
         self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(false);")
+        self._run_js("if (window.setNativeHudMode) setNativeHudMode(false);")
         if hasattr(self, "_video_push_timer") and self._video_push_timer.isActive():
             self._video_push_timer.stop()
         if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
             self._ai_timer.stop()
         try:
             self._native_video_preview.hide()
+            self._native_hud_right.hide()
+            self._native_compass.hide()
+            self._native_telemetry.hide()
             self._native_video_preview.setPixmap(QPixmap())
             self._native_video_last = QImage()
             self._video_swapped = False
@@ -6365,6 +6523,14 @@ class MapWidget(QWidget):
     def _set_observation_mark_mode(self, enabled: bool) -> None:
         self._obs_mark_mode = bool(enabled)
         self._run_js(f"if (window.setObservationMarkMode) setObservationMarkMode({1 if enabled else 0});")
+        try:
+            self._btn_native_target.blockSignals(True)
+            self._btn_native_target.setChecked(bool(enabled))
+        finally:
+            try:
+                self._btn_native_target.blockSignals(False)
+            except Exception:
+                pass
         if enabled:
             self._set_status("Observation mark mode ON: click map or video preview")
         else:
@@ -6684,6 +6850,14 @@ class MapWidget(QWidget):
             except Exception:
                 self._video_recording = False
                 self._video_recording_tmp_path = ""
+            try:
+                self._btn_native_record.blockSignals(True)
+                self._btn_native_record.setChecked(bool(getattr(self, "_video_recording", False)))
+            finally:
+                try:
+                    self._btn_native_record.blockSignals(False)
+                except Exception:
+                    pass
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_SPLIT_TOGGLE:"):
@@ -6697,9 +6871,11 @@ class MapWidget(QWidget):
                 if bool(getattr(self, "_video_split_enabled", False)):
                     self._ensure_video_preview_backend()
                     self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(false);")
+                    self._run_js("if (window.setNativeHudMode) setNativeHudMode(false);")
                     self._start_video_preview()
                 else:
                     self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
+                    self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
                     # Force UI to re-render in single mode even if the underlying frame hasn't changed.
                     self._last_video_pushed = ""
                     self._run_js("clearVideoPreviewGrid();")
@@ -6984,6 +7160,10 @@ class MapWidget(QWidget):
         self._heading = heading_deg % 360.0
         self._heading_js_source = source or "mixed"
         self._heading_label.setText(f"Heading: {self._heading:.1f}°")
+        try:
+            self._native_compass.setText(f"N\n{self._heading:.0f}°")
+        except Exception:
+            pass
         self._schedule_vehicle_pose_js(immediate=False)
 
     def clear_flight_track(self) -> None:
@@ -7012,6 +7192,10 @@ class MapWidget(QWidget):
         if sig == self._last_flight_telemetry_sig:
             return
         self._last_flight_telemetry_sig = sig
+        try:
+            self._native_telemetry.setText(f"Alt {ft} ft  |  Spd {mph} mph  |  {ttime}")
+        except Exception:
+            pass
         self._run_js(
             "setTelemetryOverlay("
             f"{float(relative_alt_m):.3f}, "
