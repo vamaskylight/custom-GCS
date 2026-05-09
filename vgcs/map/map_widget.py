@@ -5182,17 +5182,11 @@ class MapWidget(QWidget):
             w = max(1, host.width())
             h = max(1, host.height())
             if bool(getattr(self, "_video_swapped", False)):
-                # Keep native high-quality rendering in swapped mode, but leave space
-                # for Web overlays (header/camera HUD/telemetry) around the edges.
-                ins = dict(getattr(self, "_native_overlay_insets", {}) or {})
-                left = max(0, int(ins.get("left", 170)))
-                top = max(0, int(ins.get("top", 58)))
-                right = max(0, int(ins.get("right", 220)))
-                bottom = max(0, int(ins.get("bottom", 130)))
-                avail_x = left
-                avail_y = top
-                avail_w = max(120, w - left - right)
-                avail_h = max(120, h - top - bottom)
+                # Fullscreen camera mode: fill map canvas under header.
+                avail_x = 0
+                avail_y = 46
+                avail_w = max(120, w)
+                avail_h = max(120, h - avail_y)
                 # In full camera mode, maximize visible video while preserving
                 # camera aspect ratio inside the HUD-safe area.
                 img = getattr(self, "_native_video_last", QImage())
