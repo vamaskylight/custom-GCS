@@ -3034,6 +3034,48 @@ LEAFLET_HTML = """<!doctype html>
         }
       };
     } catch (e) {}
+    try {
+      window.__vgcsGetOverlayInsets = function() {
+        try {
+          const wrap = document.getElementById('mapWrap');
+          if (!wrap) return JSON.stringify({ left: 170, top: 58, right: 220, bottom: 130 });
+          const wr = wrap.getBoundingClientRect();
+          const leftEls = [document.getElementById('actionRail')];
+          const topEls = [document.getElementById('linkBanner')];
+          const rightEls = [document.getElementById('cameraRail'), document.getElementById('compassHud')];
+          const bottomEls = [document.getElementById('mapFooterHud')];
+          let left = 0, top = 0, right = 0, bottom = 0;
+          for (const el of leftEls) {
+            if (!el) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width > 2 && r.height > 2) left = Math.max(left, Math.max(0, r.right - wr.left));
+          }
+          for (const el of topEls) {
+            if (!el) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width > 2 && r.height > 2) top = Math.max(top, Math.max(0, r.bottom - wr.top));
+          }
+          for (const el of rightEls) {
+            if (!el) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width > 2 && r.height > 2) right = Math.max(right, Math.max(0, wr.right - r.left));
+          }
+          for (const el of bottomEls) {
+            if (!el) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width > 2 && r.height > 2) bottom = Math.max(bottom, Math.max(0, wr.bottom - r.top));
+          }
+          return JSON.stringify({
+            left: Math.max(0, Math.round(left + 10)),
+            top: Math.max(0, Math.round(top + 8)),
+            right: Math.max(0, Math.round(right + 10)),
+            bottom: Math.max(0, Math.round(bottom + 10))
+          });
+        } catch (e) {
+          return JSON.stringify({ left: 170, top: 58, right: 220, bottom: 130 });
+        }
+      };
+    } catch (e) {}
 
     function setLowSpecMode(enabled) {
       window.__lowSpec = !!enabled;
@@ -4856,6 +4898,7 @@ class MapWidget(QWidget):
         self._native_video_preview.raise_()
         self._native_video_last = QImage()
         self._video_swapped = False
+        self._native_overlay_insets = {"left": 170, "top": 58, "right": 220, "bottom": 130}
         self._native_video_preview.mousePressEvent = self._on_native_video_click  # type: ignore[assignment]
 
         self._status = QLabel("Map status: waiting for telemetry")
@@ -5077,6 +5120,8 @@ class MapWidget(QWidget):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().resizeEvent(event)
+        if bool(getattr(self, "_video_swapped", False)):
+            self._refresh_native_overlay_insets()
         self._layout_native_video_preview()
 
     def _on_native_video_click(self, event) -> None:
@@ -5088,11 +5133,35 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._video_swapped = not bool(getattr(self, "_video_swapped", False))
+        if self._video_swapped:
+            self._refresh_native_overlay_insets()
         self._layout_native_video_preview()
         try:
             self._run_js(f"setVideoSwapMode({'true' if self._video_swapped else 'false'});")
         except Exception:
             pass
+
+    def _refresh_native_overlay_insets(self) -> None:
+        if not bool(getattr(self, "_web_ready", False)):
+            return
+        def _apply(payload: object) -> None:
+            try:
+                txt = str(payload or "").strip()
+                if not txt:
+                    return
+                data = json.loads(txt)
+                if not isinstance(data, dict):
+                    return
+                self._native_overlay_insets = {
+                    "left": int(float(data.get("left", 170) or 170)),
+                    "top": int(float(data.get("top", 58) or 58)),
+                    "right": int(float(data.get("right", 220) or 220)),
+                    "bottom": int(float(data.get("bottom", 130) or 130)),
+                }
+            except Exception:
+                return
+            self._layout_native_video_preview()
+        self._run_js("window.__vgcsGetOverlayInsets ? window.__vgcsGetOverlayInsets() : '';", callback=_apply)
 
     def _layout_native_video_preview(self) -> None:
         try:
@@ -5104,10 +5173,11 @@ class MapWidget(QWidget):
             if bool(getattr(self, "_video_swapped", False)):
                 # Keep native high-quality rendering in swapped mode, but leave space
                 # for Web overlays (header/camera HUD/telemetry) around the edges.
-                left = 170   # action rail + safe gutter
-                top = 58     # header bar
-                right = 220  # camera panel + compass gutter
-                bottom = 130 # telemetry/minimap strip
+                ins = dict(getattr(self, "_native_overlay_insets", {}) or {})
+                left = max(0, int(ins.get("left", 170)))
+                top = max(0, int(ins.get("top", 58)))
+                right = max(0, int(ins.get("right", 220)))
+                bottom = max(0, int(ins.get("bottom", 130)))
                 vw = max(120, w - left - right)
                 vh = max(120, h - top - bottom)
                 self._native_video_preview.setGeometry(left, top, vw, vh)
@@ -6657,6 +6727,8 @@ class MapWidget(QWidget):
                 self._video_swapped = bool(int(parts[1])) if len(parts) >= 2 else False
             except Exception:
                 self._video_swapped = False
+            if self._video_swapped:
+                self._refresh_native_overlay_insets()
             self._layout_native_video_preview()
             self._run_js("document.title = 'VGCS Map';")
             return
