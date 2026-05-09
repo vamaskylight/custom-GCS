@@ -4562,13 +4562,28 @@ class _VideoEncodeBridge(QObject):
 
 
 class _VideoEncodeTask(QRunnable):
-    def __init__(self, img, bridge: _VideoEncodeBridge, *, max_w: int = 1280, max_h: int = 720, jpg_quality: int = 90) -> None:
+    def __init__(
+        self,
+        img,
+        bridge: _VideoEncodeBridge,
+        *,
+        max_w: int = 1280,
+        max_h: int = 720,
+        encode_format: str = "PNG",
+        encode_quality: int = 3,
+    ) -> None:
         super().__init__()
         self._img = img
         self._bridge = bridge
         self._max_w = max(160, int(max_w))
         self._max_h = max(90, int(max_h))
-        self._jpg_quality = max(50, min(95, int(jpg_quality)))
+        fmt = str(encode_format or "PNG").strip().upper()
+        self._encode_format = "PNG" if fmt not in ("PNG", "JPG", "JPEG") else ("JPG" if fmt == "JPEG" else fmt)
+        # PNG: 0..9 compression level (0 fastest). JPG: 1..100 quality.
+        if self._encode_format == "PNG":
+            self._encode_quality = max(0, min(9, int(encode_quality)))
+        else:
+            self._encode_quality = max(1, min(100, int(encode_quality)))
 
     def run(self) -> None:
         try:
@@ -4593,13 +4608,14 @@ class _VideoEncodeTask(QRunnable):
             if not buf.open(QBuffer.OpenModeFlag.WriteOnly):
                 return
             try:
-                img.save(buf, "JPG", self._jpg_quality)
+                img.save(buf, self._encode_format, self._encode_quality)
             finally:
                 buf.close()
             raw = bytes(ba)
             if not raw:
                 return
-            data_url = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+            mime = "image/png" if self._encode_format == "PNG" else "image/jpeg"
+            data_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
             self._bridge.encoded.emit(data_url)
         except Exception:
             return
@@ -5214,7 +5230,8 @@ class MapWidget(QWidget):
         try:
             self._video_encode_max_w = 1280
             self._video_encode_max_h = 720
-            self._video_encode_jpg_quality = 90
+            self._video_encode_format = "PNG"
+            self._video_encode_quality = 3
         except Exception:
             pass
         # JS-side tile/label adjustments.
@@ -5674,7 +5691,8 @@ class MapWidget(QWidget):
         self._video_encode_pending = None
         self._video_encode_max_w = 1280
         self._video_encode_max_h = 720
-        self._video_encode_jpg_quality = 90
+        self._video_encode_format = "PNG"
+        self._video_encode_quality = 3
         self._video_pool = QThreadPool.globalInstance()
         self._video_push_timer = QTimer(self)
         self._video_push_timer.setInterval(66)  # ~15 fps push to WebEngine
@@ -5903,7 +5921,8 @@ class MapWidget(QWidget):
             self._video_encode_bridge,
             max_w=int(getattr(self, "_video_encode_max_w", 1280)),
             max_h=int(getattr(self, "_video_encode_max_h", 720)),
-            jpg_quality=int(getattr(self, "_video_encode_jpg_quality", 90)),
+            encode_format=str(getattr(self, "_video_encode_format", "PNG")),
+            encode_quality=int(getattr(self, "_video_encode_quality", 3)),
         )
         try:
             self._video_pool.start(task)
@@ -5947,7 +5966,8 @@ class MapWidget(QWidget):
             bridge,
             max_w=int(getattr(self, "_video_encode_max_w", 1280)),
             max_h=int(getattr(self, "_video_encode_max_h", 720)),
-            jpg_quality=int(getattr(self, "_video_encode_jpg_quality", 90)),
+            encode_format=str(getattr(self, "_video_encode_format", "PNG")),
+            encode_quality=int(getattr(self, "_video_encode_quality", 3)),
         )
         try:
             self._video_pool.start(task)
@@ -5971,7 +5991,8 @@ class MapWidget(QWidget):
             bridge,
             max_w=int(getattr(self, "_video_encode_max_w", 1280)),
             max_h=int(getattr(self, "_video_encode_max_h", 720)),
-            jpg_quality=int(getattr(self, "_video_encode_jpg_quality", 90)),
+            encode_format=str(getattr(self, "_video_encode_format", "PNG")),
+            encode_quality=int(getattr(self, "_video_encode_quality", 3)),
         )
         try:
             self._video_pool.start(task)
@@ -5991,7 +6012,8 @@ class MapWidget(QWidget):
             self._video_encode_bridge,
             max_w=int(getattr(self, "_video_encode_max_w", 1280)),
             max_h=int(getattr(self, "_video_encode_max_h", 720)),
-            jpg_quality=int(getattr(self, "_video_encode_jpg_quality", 90)),
+            encode_format=str(getattr(self, "_video_encode_format", "PNG")),
+            encode_quality=int(getattr(self, "_video_encode_quality", 3)),
         )
         try:
             self._video_pool.start(task)
