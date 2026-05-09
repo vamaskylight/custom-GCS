@@ -4573,8 +4573,8 @@ class _VideoEncodeTask(QRunnable):
                 return
             try:
                 img = img.scaled(
-                    230,
-                    130,
+                    640,
+                    360,
                     Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                     Qt.TransformationMode.SmoothTransformation,
                 )
@@ -4585,13 +4585,13 @@ class _VideoEncodeTask(QRunnable):
             if not buf.open(QBuffer.OpenModeFlag.WriteOnly):
                 return
             try:
-                img.save(buf, "PNG")
+                img.save(buf, "JPG", 78)
             finally:
                 buf.close()
             raw = bytes(ba)
             if not raw:
                 return
-            data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+            data_url = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
             self._bridge.encoded.emit(data_url)
         except Exception:
             return
@@ -5198,7 +5198,7 @@ class MapWidget(QWidget):
             pass
         try:
             if hasattr(self, "_video_push_timer"):
-                self._video_push_timer.setInterval(400 if on else 200)
+                self._video_push_timer.setInterval(125 if on else 66)
         except Exception:
             pass
         # JS-side tile/label adjustments.
@@ -5658,10 +5658,10 @@ class MapWidget(QWidget):
         self._video_encode_pending = None
         self._video_pool = QThreadPool.globalInstance()
         self._video_push_timer = QTimer(self)
-        self._video_push_timer.setInterval(200)  # 5 fps push to WebEngine
+        self._video_push_timer.setInterval(66)  # ~15 fps push to WebEngine
         self._video_push_timer.timeout.connect(self._push_video_preview_any_to_overlay)
         self._ai_timer = QTimer(self)
-        self._ai_timer.setInterval(250)  # 4 Hz dummy overlay
+        self._ai_timer.setInterval(125)  # 8 Hz dummy overlay
         self._ai_timer.timeout.connect(self._push_dummy_ai_overlay)
         self._ai_phase = 0.0
 
