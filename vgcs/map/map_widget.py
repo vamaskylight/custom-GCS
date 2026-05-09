@@ -5206,19 +5206,15 @@ class MapWidget(QWidget):
             pass
         try:
             if hasattr(self, "_video_push_timer"):
-                self._video_push_timer.setInterval(125 if on else 66)
+                self._video_push_timer.setInterval(66)
         except Exception:
             pass
-        # Encode profile tuning: low-spec reduces pixel throughput/quality a bit.
+        # Keep video quality stable even in low-spec mode.
+        # Low-spec still reduces map/tile workload, but stream fidelity is preserved.
         try:
-            if on:
-                self._video_encode_max_w = 640
-                self._video_encode_max_h = 360
-                self._video_encode_jpg_quality = 74
-            else:
-                self._video_encode_max_w = 1280
-                self._video_encode_max_h = 720
-                self._video_encode_jpg_quality = 90
+            self._video_encode_max_w = 1280
+            self._video_encode_max_h = 720
+            self._video_encode_jpg_quality = 90
         except Exception:
             pass
         # JS-side tile/label adjustments.
@@ -5809,6 +5805,12 @@ class MapWidget(QWidget):
             src = getattr(self, "_video_active_source", None)
             if src is not None:
                 src.start()
+                try:
+                    sid = str(getattr(src, "source_id", "") or "")
+                    dname = str(getattr(src, "device_name", "") or sid or "video")
+                    self._set_status(f"Video preview: {dname}")
+                except Exception:
+                    pass
             if bool(getattr(self, "_video_split_enabled", False)) and getattr(self, "_video", None) is not None:
                 for _, s in list(self._video.sources().items())[:4]:
                     try:
