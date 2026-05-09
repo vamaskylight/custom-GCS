@@ -501,8 +501,8 @@ class RtspSource(QObject):
         src_w, src_h = dims
         src_w = max(1, int(src_w))
         src_h = max(1, int(src_h))
-        cap_w = 1280
-        cap_h = 720
+        cap_w = 1920
+        cap_h = 1080
         # Preserve source aspect ratio while capping decode size.
         scale = min(float(cap_w) / float(src_w), float(cap_h) / float(src_h), 1.0)
         w = max(2, int(round(src_w * scale)))
