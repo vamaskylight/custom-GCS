@@ -2495,6 +2495,17 @@ LEAFLET_HTML = """<!doctype html>
       __cameraChromeLinkOk = !!enabled;
       return syncCameraChromeVisibility();
     }
+    function setNativeVideoOverlayMode(enabled) {
+      const on = !!enabled;
+      if (videoPreview) {
+        if (on) {
+          videoPreview.style.display = 'none';
+        } else {
+          syncCameraChromeVisibility();
+        }
+      }
+      return on ? 1 : 0;
+    }
     function setVideoPreviewImage(dataUrl) {
       if (!videoPreviewImg || !videoPreviewPlaceholder) return 0;
       const src = String(dataUrl || '').trim();
@@ -6033,6 +6044,8 @@ class MapWidget(QWidget):
             self._video_swapped = False
             self._native_video_preview.show()
             self._layout_native_video_preview()
+            # Native mode: hide Web preview layer to avoid double-render fragmentation.
+            self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             src = getattr(self, "_video_active_source", None)
             if src is not None:
                 src.start()
@@ -6059,6 +6072,7 @@ class MapWidget(QWidget):
 
     def _stop_video_preview(self, *, clear_overlay: bool) -> None:
         self._video_preview_enabled = False
+        self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(false);")
         if hasattr(self, "_video_push_timer") and self._video_push_timer.isActive():
             self._video_push_timer.stop()
         if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
@@ -6688,8 +6702,10 @@ class MapWidget(QWidget):
             try:
                 if bool(getattr(self, "_video_split_enabled", False)):
                     self._ensure_video_preview_backend()
+                    self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(false);")
                     self._start_video_preview()
                 else:
+                    self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
                     # Force UI to re-render in single mode even if the underlying frame hasn't changed.
                     self._last_video_pushed = ""
                     self._run_js("clearVideoPreviewGrid();")
