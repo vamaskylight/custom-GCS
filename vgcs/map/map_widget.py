@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QPixmap
 from vgcs.mission import (
     Waypoint,
     load_waypoints_json,
@@ -2704,7 +2704,9 @@ LEAFLET_HTML = """<!doctype html>
             return;
           } catch (e) {}
         }
-        setVideoSwapMode(!__videoSwapped);
+        __videoSwapped = !__videoSwapped;
+        setVideoSwapMode(__videoSwapped);
+        document.title = 'VGCS_CAM_SWAP_TOGGLE:' + (__videoSwapped ? '1' : '0') + ':' + Date.now();
       });
     }
     if (camPhotoBtn) {
@@ -4599,7 +4601,7 @@ class _VideoEncodeTask(QRunnable):
                         self._max_w,
                         self._max_h,
                         Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
+                        Qt.TransformationMode.FastTransformation,
                     )
             except Exception:
                 pass
@@ -4840,6 +4842,21 @@ class MapWidget(QWidget):
         self._map_canvas_layout.setContentsMargins(0, 0, 0, 0)
         self._map_canvas_layout.setSpacing(0)
         self._map_canvas.setLayout(self._map_canvas_layout)
+        self._native_video_preview = QLabel(self._map_canvas)
+        self._native_video_preview.setObjectName("nativeVideoPreview")
+        self._native_video_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._native_video_preview.setStyleSheet(
+            "QLabel#nativeVideoPreview {"
+            "background: #000;"
+            "border: 1px solid rgba(206, 220, 242, 0.35);"
+            "border-radius: 8px;"
+            "}"
+        )
+        self._native_video_preview.hide()
+        self._native_video_preview.raise_()
+        self._native_video_last = QImage()
+        self._video_swapped = False
+        self._native_video_preview.mousePressEvent = self._on_native_video_click  # type: ignore[assignment]
 
         self._status = QLabel("Map status: waiting for telemetry")
         self._status.setObjectName("telemetryValue")
@@ -5058,6 +5075,77 @@ class MapWidget(QWidget):
             self._panel_layout.setContentsMargins(0, 0, 0, 0)
             self._panel_layout.setSpacing(8)
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().resizeEvent(event)
+        self._layout_native_video_preview()
+
+    def _on_native_video_click(self, event) -> None:
+        try:
+            if event is not None and hasattr(event, "button"):
+                btn = event.button()
+                if btn != Qt.MouseButton.LeftButton:
+                    return
+        except Exception:
+            pass
+        self._video_swapped = not bool(getattr(self, "_video_swapped", False))
+        self._layout_native_video_preview()
+        try:
+            self._run_js(f"setVideoSwapMode({'true' if self._video_swapped else 'false'});")
+        except Exception:
+            pass
+
+    def _layout_native_video_preview(self) -> None:
+        try:
+            host = self._map_canvas
+            if host is None:
+                return
+            w = max(1, host.width())
+            h = max(1, host.height())
+            if bool(getattr(self, "_video_swapped", False)):
+                self._native_video_preview.setGeometry(0, 0, w, h)
+                self._native_video_preview.setStyleSheet(
+                    "QLabel#nativeVideoPreview { background: #000; border: 0px; border-radius: 0px; }"
+                )
+            else:
+                pw = min(230, max(180, int(w * 0.28)))
+                ph = min(130, max(100, int(h * 0.24)))
+                x = 14
+                y = max(0, h - ph - 14)
+                self._native_video_preview.setGeometry(x, y, pw, ph)
+                self._native_video_preview.setStyleSheet(
+                    "QLabel#nativeVideoPreview {"
+                    "background: #000;"
+                    "border: 1px solid rgba(206, 220, 242, 0.35);"
+                    "border-radius: 8px;"
+                    "}"
+                )
+            self._native_video_preview.raise_()
+            if not self._native_video_last.isNull():
+                self._render_native_video_preview(self._native_video_last)
+        except Exception:
+            return
+
+    def _render_native_video_preview(self, img: QImage) -> None:
+        if img is None or img.isNull():
+            return
+        self._native_video_last = img
+        try:
+            pm = QPixmap.fromImage(img)
+            if pm.isNull():
+                return
+            size = self._native_video_preview.size()
+            if size.width() <= 0 or size.height() <= 0:
+                return
+            self._native_video_preview.setPixmap(
+                pm.scaled(
+                    size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        except Exception:
+            return
+
     def set_link_connected(self, connected: bool) -> None:
         c = bool(connected)
         if self._last_link_connected == c:
@@ -5228,10 +5316,10 @@ class MapWidget(QWidget):
         # Keep video quality stable even in low-spec mode.
         # Low-spec still reduces map/tile workload, but stream fidelity is preserved.
         try:
-            self._video_encode_max_w = 1280
-            self._video_encode_max_h = 720
+            self._video_encode_max_w = 1920
+            self._video_encode_max_h = 1080
             self._video_encode_format = "PNG"
-            self._video_encode_quality = 3
+            self._video_encode_quality = 1
         except Exception:
             pass
         # JS-side tile/label adjustments.
@@ -5689,10 +5777,10 @@ class MapWidget(QWidget):
         self._video_encode_bridge.encoded.connect(self._on_video_frame_encoded)
         self._video_encode_inflight = False
         self._video_encode_pending = None
-        self._video_encode_max_w = 1280
-        self._video_encode_max_h = 720
+        self._video_encode_max_w = 1920
+        self._video_encode_max_h = 1080
         self._video_encode_format = "PNG"
-        self._video_encode_quality = 3
+        self._video_encode_quality = 1
         self._video_pool = QThreadPool.globalInstance()
         self._video_push_timer = QTimer(self)
         self._video_push_timer.setInterval(66)  # ~15 fps push to WebEngine
@@ -5844,6 +5932,9 @@ class MapWidget(QWidget):
             self._video_preview_enabled = True
             # Always start in day preview unless explicitly toggled by operator.
             self._video_vision_mode = "day"
+            self._video_swapped = False
+            self._native_video_preview.show()
+            self._layout_native_video_preview()
             src = getattr(self, "_video_active_source", None)
             if src is not None:
                 src.start()
@@ -5859,8 +5950,10 @@ class MapWidget(QWidget):
                         s.start()
                     except Exception:
                         pass
-            if hasattr(self, "_video_push_timer") and not self._video_push_timer.isActive():
-                self._video_push_timer.start()
+            # Keep WebEngine overlay pipeline only for split mode fallback.
+            if bool(getattr(self, "_video_split_enabled", False)):
+                if hasattr(self, "_video_push_timer") and not self._video_push_timer.isActive():
+                    self._video_push_timer.start()
             if hasattr(self, "_ai_timer") and not self._ai_timer.isActive():
                 self._ai_timer.start()
         except Exception:
@@ -5872,6 +5965,13 @@ class MapWidget(QWidget):
             self._video_push_timer.stop()
         if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
             self._ai_timer.stop()
+        try:
+            self._native_video_preview.hide()
+            self._native_video_preview.setPixmap(QPixmap())
+            self._native_video_last = QImage()
+            self._video_swapped = False
+        except Exception:
+            pass
         try:
             src = getattr(self, "_video_active_source", None)
             if src is not None:
@@ -5890,7 +5990,7 @@ class MapWidget(QWidget):
             self._run_js("clearAiOverlays();")
 
     def _on_pipeline_frame(self, vf: VideoFrame) -> None:
-        # Called on the GUI thread; offload encoding to a worker to avoid UI freezes on low-end devices.
+        # Called on the GUI thread.
         if not bool(getattr(self, "_video_preview_enabled", False)):
             return
         try:
@@ -5911,6 +6011,12 @@ class MapWidget(QWidget):
         except Exception:
             img2 = img
 
+        # Main single-view path: render natively in Qt (no WebEngine bridge encode).
+        if not bool(getattr(self, "_video_split_enabled", False)):
+            self._render_native_video_preview(img2)
+            return
+
+        # Split-mode fallback path: keep existing WebEngine bridge behavior.
         if bool(getattr(self, "_video_encode_inflight", False)):
             self._video_encode_pending = img2
             return
@@ -5919,10 +6025,10 @@ class MapWidget(QWidget):
         task = _VideoEncodeTask(
             img2,
             self._video_encode_bridge,
-            max_w=int(getattr(self, "_video_encode_max_w", 1280)),
-            max_h=int(getattr(self, "_video_encode_max_h", 720)),
+            max_w=int(getattr(self, "_video_encode_max_w", 1920)),
+            max_h=int(getattr(self, "_video_encode_max_h", 1080)),
             encode_format=str(getattr(self, "_video_encode_format", "PNG")),
-            encode_quality=int(getattr(self, "_video_encode_quality", 3)),
+            encode_quality=int(getattr(self, "_video_encode_quality", 1)),
         )
         try:
             self._video_pool.start(task)
@@ -5964,10 +6070,10 @@ class MapWidget(QWidget):
         task = _VideoEncodeTask(
             img2,
             bridge,
-            max_w=int(getattr(self, "_video_encode_max_w", 1280)),
-            max_h=int(getattr(self, "_video_encode_max_h", 720)),
+            max_w=int(getattr(self, "_video_encode_max_w", 1920)),
+            max_h=int(getattr(self, "_video_encode_max_h", 1080)),
             encode_format=str(getattr(self, "_video_encode_format", "PNG")),
-            encode_quality=int(getattr(self, "_video_encode_quality", 3)),
+            encode_quality=int(getattr(self, "_video_encode_quality", 1)),
         )
         try:
             self._video_pool.start(task)
@@ -5989,10 +6095,10 @@ class MapWidget(QWidget):
         task = _VideoEncodeTask(
             pending,
             bridge,
-            max_w=int(getattr(self, "_video_encode_max_w", 1280)),
-            max_h=int(getattr(self, "_video_encode_max_h", 720)),
+            max_w=int(getattr(self, "_video_encode_max_w", 1920)),
+            max_h=int(getattr(self, "_video_encode_max_h", 1080)),
             encode_format=str(getattr(self, "_video_encode_format", "PNG")),
-            encode_quality=int(getattr(self, "_video_encode_quality", 3)),
+            encode_quality=int(getattr(self, "_video_encode_quality", 1)),
         )
         try:
             self._video_pool.start(task)
@@ -6010,10 +6116,10 @@ class MapWidget(QWidget):
         task = _VideoEncodeTask(
             pending,
             self._video_encode_bridge,
-            max_w=int(getattr(self, "_video_encode_max_w", 1280)),
-            max_h=int(getattr(self, "_video_encode_max_h", 720)),
+            max_w=int(getattr(self, "_video_encode_max_w", 1920)),
+            max_h=int(getattr(self, "_video_encode_max_h", 1080)),
             encode_format=str(getattr(self, "_video_encode_format", "PNG")),
-            encode_quality=int(getattr(self, "_video_encode_quality", 3)),
+            encode_quality=int(getattr(self, "_video_encode_quality", 1)),
         )
         try:
             self._video_pool.start(task)
@@ -6529,6 +6635,16 @@ class MapWidget(QWidget):
             except Exception:
                 self._video_follow_enabled = False
                 self._video_follow_last_center_mono = 0.0
+            self._run_js("document.title = 'VGCS Map';")
+            return
+        if title.startswith("VGCS_CAM_SWAP_TOGGLE:"):
+            # Format: VGCS_CAM_SWAP_TOGGLE:<0|1>:<ts>
+            try:
+                parts = title.split(":")
+                self._video_swapped = bool(int(parts[1])) if len(parts) >= 2 else False
+            except Exception:
+                self._video_swapped = False
+            self._layout_native_video_preview()
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_FOCUS_STEP:"):
