@@ -4561,10 +4561,13 @@ class _VideoEncodeBridge(QObject):
 
 
 class _VideoEncodeTask(QRunnable):
-    def __init__(self, img, bridge: _VideoEncodeBridge) -> None:
+    def __init__(self, img, bridge: _VideoEncodeBridge, *, max_w: int = 1280, max_h: int = 720, jpg_quality: int = 90) -> None:
         super().__init__()
         self._img = img
         self._bridge = bridge
+        self._max_w = max(160, int(max_w))
+        self._max_h = max(90, int(max_h))
+        self._jpg_quality = max(50, min(95, int(jpg_quality)))
 
     def run(self) -> None:
         try:
@@ -4573,9 +4576,9 @@ class _VideoEncodeTask(QRunnable):
                 return
             try:
                 img = img.scaled(
-                    640,
-                    360,
-                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    self._max_w,
+                    self._max_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
             except Exception:
@@ -4585,7 +4588,7 @@ class _VideoEncodeTask(QRunnable):
             if not buf.open(QBuffer.OpenModeFlag.WriteOnly):
                 return
             try:
-                img.save(buf, "JPG", 78)
+                img.save(buf, "JPG", self._jpg_quality)
             finally:
                 buf.close()
             raw = bytes(ba)
@@ -5201,6 +5204,18 @@ class MapWidget(QWidget):
                 self._video_push_timer.setInterval(125 if on else 66)
         except Exception:
             pass
+        # Encode profile tuning: low-spec reduces pixel throughput/quality a bit.
+        try:
+            if on:
+                self._video_encode_max_w = 640
+                self._video_encode_max_h = 360
+                self._video_encode_jpg_quality = 74
+            else:
+                self._video_encode_max_w = 1280
+                self._video_encode_max_h = 720
+                self._video_encode_jpg_quality = 90
+        except Exception:
+            pass
         # JS-side tile/label adjustments.
         try:
             self._run_js("setLowSpecMode(true);" if on else "setLowSpecMode(false);")
@@ -5656,6 +5671,9 @@ class MapWidget(QWidget):
         self._video_encode_bridge.encoded.connect(self._on_video_frame_encoded)
         self._video_encode_inflight = False
         self._video_encode_pending = None
+        self._video_encode_max_w = 1280
+        self._video_encode_max_h = 720
+        self._video_encode_jpg_quality = 90
         self._video_pool = QThreadPool.globalInstance()
         self._video_push_timer = QTimer(self)
         self._video_push_timer.setInterval(66)  # ~15 fps push to WebEngine
@@ -5849,7 +5867,13 @@ class MapWidget(QWidget):
             return
 
         self._video_encode_inflight = True
-        task = _VideoEncodeTask(img2, self._video_encode_bridge)
+        task = _VideoEncodeTask(
+            img2,
+            self._video_encode_bridge,
+            max_w=int(getattr(self, "_video_encode_max_w", 1280)),
+            max_h=int(getattr(self, "_video_encode_max_h", 720)),
+            jpg_quality=int(getattr(self, "_video_encode_jpg_quality", 90)),
+        )
         try:
             self._video_pool.start(task)
         except Exception:
@@ -5887,7 +5911,13 @@ class MapWidget(QWidget):
         if bridge is None:
             self._video_encode_inflight_by_id[source_id] = False
             return
-        task = _VideoEncodeTask(img2, bridge)
+        task = _VideoEncodeTask(
+            img2,
+            bridge,
+            max_w=int(getattr(self, "_video_encode_max_w", 1280)),
+            max_h=int(getattr(self, "_video_encode_max_h", 720)),
+            jpg_quality=int(getattr(self, "_video_encode_jpg_quality", 90)),
+        )
         try:
             self._video_pool.start(task)
         except Exception:
@@ -5905,7 +5935,13 @@ class MapWidget(QWidget):
         if bridge is None:
             self._video_encode_inflight_by_id[source_id] = False
             return
-        task = _VideoEncodeTask(pending, bridge)
+        task = _VideoEncodeTask(
+            pending,
+            bridge,
+            max_w=int(getattr(self, "_video_encode_max_w", 1280)),
+            max_h=int(getattr(self, "_video_encode_max_h", 720)),
+            jpg_quality=int(getattr(self, "_video_encode_jpg_quality", 90)),
+        )
         try:
             self._video_pool.start(task)
         except Exception:
@@ -5919,7 +5955,13 @@ class MapWidget(QWidget):
             return
         self._video_encode_pending = None
         self._video_encode_inflight = True
-        task = _VideoEncodeTask(pending, self._video_encode_bridge)
+        task = _VideoEncodeTask(
+            pending,
+            self._video_encode_bridge,
+            max_w=int(getattr(self, "_video_encode_max_w", 1280)),
+            max_h=int(getattr(self, "_video_encode_max_h", 720)),
+            jpg_quality=int(getattr(self, "_video_encode_jpg_quality", 90)),
+        )
         try:
             self._video_pool.start(task)
         except Exception:
