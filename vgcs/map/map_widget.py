@@ -5104,15 +5104,19 @@ class MapWidget(QWidget):
             if bool(getattr(self, "_video_swapped", False)):
                 # Keep native high-quality rendering in swapped mode, but leave space
                 # for Web overlays (header/camera HUD/telemetry) around the edges.
-                left = 0
-                top = 46
-                right = 190
-                bottom = 110
+                left = 170   # action rail + safe gutter
+                top = 58     # header bar
+                right = 220  # camera panel + compass gutter
+                bottom = 130 # telemetry/minimap strip
                 vw = max(120, w - left - right)
                 vh = max(120, h - top - bottom)
                 self._native_video_preview.setGeometry(left, top, vw, vh)
                 self._native_video_preview.setStyleSheet(
-                    "QLabel#nativeVideoPreview { background: #000; border: 0px; border-radius: 0px; }"
+                    "QLabel#nativeVideoPreview {"
+                    "background: #000;"
+                    "border: 1px solid rgba(206, 220, 242, 0.35);"
+                    "border-radius: 8px;"
+                    "}"
                 )
             else:
                 pw = min(230, max(180, int(w * 0.28)))
