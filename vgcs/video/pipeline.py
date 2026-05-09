@@ -498,10 +498,22 @@ class RtspSource(QObject):
         # Prefer a higher decode cap so fullscreen preview preserves detail.
         # Keep a cap to avoid overwhelming low-end systems with raw pipe traffic.
         dims = self._ffprobe_dims(url) or (1280, 720)
-        w, h = dims
-        # Cap decode size to keep the raw pipe responsive while preserving quality.
-        w = max(320, min(int(w), 1280))
-        h = max(180, min(int(h), 720))
+        src_w, src_h = dims
+        src_w = max(1, int(src_w))
+        src_h = max(1, int(src_h))
+        cap_w = 1280
+        cap_h = 720
+        # Preserve source aspect ratio while capping decode size.
+        scale = min(float(cap_w) / float(src_w), float(cap_h) / float(src_h), 1.0)
+        w = max(2, int(round(src_w * scale)))
+        h = max(2, int(round(src_h * scale)))
+        # Raw RGB decode needs even dims in some ffmpeg builds/codecs.
+        if (w % 2) != 0:
+            w -= 1
+        if (h % 2) != 0:
+            h -= 1
+        w = max(2, w)
+        h = max(2, h)
         self._ffmpeg_dims = (w, h)
         frame_bytes = int(w) * int(h) * 3
         transports = ("udp", "tcp") if self._transport not in ("udp", "tcp") else (self._transport,)
@@ -531,7 +543,7 @@ class RtspSource(QObject):
                 url,
                 "-an",
                 "-vf",
-                f"scale={w}:{h}",
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease",
                 "-pix_fmt",
                 "rgb24",
                 "-frames:v",
@@ -615,7 +627,7 @@ class RtspSource(QObject):
                 url,
                 "-an",
                 "-vf",
-                f"scale={w}:{h}",
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease",
                 "-pix_fmt",
                 "rgb24",
                 "-f",
