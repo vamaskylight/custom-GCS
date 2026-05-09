@@ -5099,26 +5099,24 @@ class MapWidget(QWidget):
             host = self._map_canvas
             if host is None:
                 return
+            if bool(getattr(self, "_video_swapped", False)):
+                self._native_video_preview.hide()
+                return
             w = max(1, host.width())
             h = max(1, host.height())
-            if bool(getattr(self, "_video_swapped", False)):
-                self._native_video_preview.setGeometry(0, 0, w, h)
-                self._native_video_preview.setStyleSheet(
-                    "QLabel#nativeVideoPreview { background: #000; border: 0px; border-radius: 0px; }"
-                )
-            else:
-                pw = min(230, max(180, int(w * 0.28)))
-                ph = min(130, max(100, int(h * 0.24)))
-                x = 14
-                y = max(0, h - ph - 14)
-                self._native_video_preview.setGeometry(x, y, pw, ph)
-                self._native_video_preview.setStyleSheet(
-                    "QLabel#nativeVideoPreview {"
-                    "background: #000;"
-                    "border: 1px solid rgba(206, 220, 242, 0.35);"
-                    "border-radius: 8px;"
-                    "}"
-                )
+            pw = min(230, max(180, int(w * 0.28)))
+            ph = min(130, max(100, int(h * 0.24)))
+            x = 14
+            y = max(0, h - ph - 14)
+            self._native_video_preview.setGeometry(x, y, pw, ph)
+            self._native_video_preview.setStyleSheet(
+                "QLabel#nativeVideoPreview {"
+                "background: #000;"
+                "border: 1px solid rgba(206, 220, 242, 0.35);"
+                "border-radius: 8px;"
+                "}"
+            )
+            self._native_video_preview.show()
             self._native_video_preview.raise_()
             if not self._native_video_last.isNull():
                 self._render_native_video_preview(self._native_video_last)
@@ -6011,8 +6009,10 @@ class MapWidget(QWidget):
         except Exception:
             img2 = img
 
-        # Main single-view path: render natively in Qt (no WebEngine bridge encode).
-        if not bool(getattr(self, "_video_split_enabled", False)):
+        # Main single-view path:
+        # - not swapped: render natively in Qt (best quality)
+        # - swapped: use legacy WebEngine fullscreen swap so map/header/camera UI stays visible
+        if (not bool(getattr(self, "_video_split_enabled", False))) and (not bool(getattr(self, "_video_swapped", False))):
             self._render_native_video_preview(img2)
             return
 
@@ -6645,6 +6645,17 @@ class MapWidget(QWidget):
             except Exception:
                 self._video_swapped = False
             self._layout_native_video_preview()
+            try:
+                # When swapped in single-view mode, feed WebEngine overlay frames.
+                # When unswapped, stop bridge timer and return to native mini-preview.
+                if (not bool(getattr(self, "_video_split_enabled", False))) and bool(getattr(self, "_video_swapped", False)):
+                    if hasattr(self, "_video_push_timer") and not self._video_push_timer.isActive():
+                        self._video_push_timer.start()
+                elif not bool(getattr(self, "_video_split_enabled", False)):
+                    if hasattr(self, "_video_push_timer") and self._video_push_timer.isActive():
+                        self._video_push_timer.stop()
+            except Exception:
+                pass
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_FOCUS_STEP:"):
