@@ -5090,6 +5090,22 @@ class MapWidget(QWidget):
         self._video_swapped = not bool(getattr(self, "_video_swapped", False))
         self._layout_native_video_preview()
         try:
+            # Keep renderer state in sync when swap is triggered from native preview.
+            if (not bool(getattr(self, "_video_split_enabled", False))) and bool(getattr(self, "_video_swapped", False)):
+                if hasattr(self, "_video_push_timer") and not self._video_push_timer.isActive():
+                    self._video_push_timer.start()
+                # Force immediate repaint of WebEngine overlay after swap.
+                self._last_video_pushed = ""
+                try:
+                    self._push_video_preview_any_to_overlay()
+                except Exception:
+                    pass
+            elif not bool(getattr(self, "_video_split_enabled", False)):
+                if hasattr(self, "_video_push_timer") and self._video_push_timer.isActive():
+                    self._video_push_timer.stop()
+        except Exception:
+            pass
+        try:
             self._run_js(f"setVideoSwapMode({'true' if self._video_swapped else 'false'});")
         except Exception:
             pass
