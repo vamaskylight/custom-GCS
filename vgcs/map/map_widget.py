@@ -2684,8 +2684,8 @@ LEAFLET_HTML = """<!doctype html>
         ev.stopPropagation();
         camVideoBtn.classList.add('active');
         if (camPhotoBtn) camPhotoBtn.classList.remove('active');
-        // Toggle live preview (Python backend decides).
-        document.title = 'VGCS_CAM_VIDEO_TOGGLE:' + Date.now();
+        // Force video mode without toggling stream off.
+        document.title = 'VGCS_CAM_VIDEO_MODE_REQUEST:' + Date.now();
       });
     }
     if (videoPreview) {
@@ -6269,13 +6269,11 @@ class MapWidget(QWidget):
                 pass
             self._run_js("document.title = 'VGCS Map';")
             return
-        if title.startswith("VGCS_CAM_VIDEO_TOGGLE:"):
+        if title.startswith("VGCS_CAM_VIDEO_MODE_REQUEST:") or title.startswith("VGCS_CAM_VIDEO_TOGGLE:"):
             try:
-                enabled = bool(getattr(self, "_video_preview_enabled", False))
-                if enabled:
-                    self._stop_video_preview(clear_overlay=True)
-                else:
-                    self._start_video_preview()
+                # "Video mode" should be idempotent and never tear down a healthy stream.
+                # Keep legacy TOGGLE event compatibility, but treat it as a mode request.
+                self._start_video_preview()
             except Exception:
                 pass
             self._run_js("document.title = 'VGCS Map';")
