@@ -5178,9 +5178,24 @@ class MapWidget(QWidget):
                 top = max(0, int(ins.get("top", 58)))
                 right = max(0, int(ins.get("right", 220)))
                 bottom = max(0, int(ins.get("bottom", 130)))
-                vw = max(120, w - left - right)
-                vh = max(120, h - top - bottom)
-                self._native_video_preview.setGeometry(left, top, vw, vh)
+                avail_x = left
+                avail_y = top
+                avail_w = max(120, w - left - right)
+                avail_h = max(120, h - top - bottom)
+                # In full camera mode, maximize visible video while preserving
+                # camera aspect ratio inside the HUD-safe area.
+                img = getattr(self, "_native_video_last", QImage())
+                if img is not None and not img.isNull() and img.width() > 0 and img.height() > 0:
+                    iw = float(img.width())
+                    ih = float(img.height())
+                    scale = min(float(avail_w) / iw, float(avail_h) / ih)
+                    vw = max(120, int(iw * scale))
+                    vh = max(120, int(ih * scale))
+                    x = avail_x + max(0, (avail_w - vw) // 2)
+                    y = avail_y + max(0, (avail_h - vh) // 2)
+                else:
+                    x, y, vw, vh = avail_x, avail_y, avail_w, avail_h
+                self._native_video_preview.setGeometry(x, y, vw, vh)
                 self._native_video_preview.setStyleSheet(
                     "QLabel#nativeVideoPreview {"
                     "background: #000;"
