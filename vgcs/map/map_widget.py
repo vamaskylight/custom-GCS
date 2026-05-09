@@ -4576,12 +4576,16 @@ class _VideoEncodeTask(QRunnable):
             if img is None or img.isNull():
                 return
             try:
-                img = img.scaled(
-                    self._max_w,
-                    self._max_h,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
+                # Avoid upscaling small frames; only downscale when above cap.
+                iw = int(img.width())
+                ih = int(img.height())
+                if iw > 0 and ih > 0 and (iw > self._max_w or ih > self._max_h):
+                    img = img.scaled(
+                        self._max_w,
+                        self._max_h,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
             except Exception:
                 pass
             ba = QByteArray()
