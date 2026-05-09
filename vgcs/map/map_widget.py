@@ -5690,9 +5690,13 @@ class MapWidget(QWidget):
             try:
                 self._read_video_settings()
                 if bool(self._video_settings_enabled):
+                    default_view = str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
+                    # In single-view mode, force Day feed only to avoid accidental
+                    # thermal/alternate channel mismatches against VLC comparisons.
+                    thermal_for_pipeline = str(self._video_settings_thermal) if default_view == "split" else ""
                     self._video.set_rtsp_sources(
                         day_url=str(self._video_settings_day),
-                        thermal_url=str(self._video_settings_thermal),
+                        thermal_url=thermal_for_pipeline,
                         transport=str(getattr(self, "_video_settings_rtsp_transport", "auto") or "auto"),
                     )
             except Exception:
@@ -5820,6 +5824,8 @@ class MapWidget(QWidget):
             return
         try:
             self._video_preview_enabled = True
+            # Always start in day preview unless explicitly toggled by operator.
+            self._video_vision_mode = "day"
             src = getattr(self, "_video_active_source", None)
             if src is not None:
                 src.start()
