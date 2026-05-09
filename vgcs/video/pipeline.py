@@ -495,13 +495,13 @@ class RtspSource(QObject):
 
     def _ffmpeg_loop(self) -> None:
         url = str(self._url or "").strip()
-        # For preview we don't need full-resolution decoding. Smaller raw frames
-        # dramatically speed up "first frame" availability and reduce pipe size.
-        dims = self._ffprobe_dims(url) or (320, 180)
+        # Prefer a higher decode cap so fullscreen preview preserves detail.
+        # Keep a cap to avoid overwhelming low-end systems with raw pipe traffic.
+        dims = self._ffprobe_dims(url) or (1280, 720)
         w, h = dims
-        # Cap decode size to keep the raw pipe responsive.
-        w = max(160, min(int(w), 640))
-        h = max(90, min(int(h), 360))
+        # Cap decode size to keep the raw pipe responsive while preserving quality.
+        w = max(320, min(int(w), 1280))
+        h = max(180, min(int(h), 720))
         self._ffmpeg_dims = (w, h)
         frame_bytes = int(w) * int(h) * 3
         transports = ("udp", "tcp") if self._transport not in ("udp", "tcp") else (self._transport,)
