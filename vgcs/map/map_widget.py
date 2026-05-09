@@ -863,8 +863,9 @@ LEAFLET_HTML = """<!doctype html>
     #videoPreview img {
       width: 100%;
       height: 100%;
-      object-fit: cover;
+      object-fit: contain;
       display: block;
+      background: #000;
     }
     #aiOverlaySingle, #aiOverlayGrid {
       position: absolute;
@@ -913,7 +914,7 @@ LEAFLET_HTML = """<!doctype html>
       position: relative;
       width: 100%;
       height: 100%;
-      object-fit: cover;
+      object-fit: contain;
       display: block;
       background: #0b1120;
     }
