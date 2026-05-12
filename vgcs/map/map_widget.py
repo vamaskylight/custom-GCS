@@ -148,7 +148,7 @@ _KEY_MAP_TILE_MODE = "map_tile_mode"  # 'esri_streets' | 'osm' | 'sat' | 'offlin
 
 # M3 video settings (QSettings keys, written by Application Settings → Video).
 _KEY_VIDEO_ENABLED = "video/enabled"
-_KEY_VIDEO_SOURCE = "video/source"  # 'disabled' | 'rtsp'
+_KEY_VIDEO_SOURCE = "video/source"  # 'disabled' | 'rtsp' | 'udp_h264' | 'udp_h265'
 _KEY_VIDEO_RTSP_DAY = "video/rtsp_day"
 _KEY_VIDEO_RTSP_THERMAL = "video/rtsp_thermal"
 _KEY_VIDEO_RTSP_TRANSPORT = "video/rtsp_transport"  # 'auto' | 'udp' | 'tcp'
@@ -3015,19 +3015,9 @@ class MapWidget(QWidget):
                 self._video = shared
             else:
                 self._video = VideoPipeline(self)
-            # Apply RTSP settings before enumerating sources.
+            # Apply stream URLs / mode before enumerating sources (shared + local pipeline).
             try:
-                self._read_video_settings()
-                if bool(self._video_settings_enabled):
-                    default_view = str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
-                    # In single-view mode, force Day feed only to avoid accidental
-                    # thermal/alternate channel mismatches against VLC comparisons.
-                    thermal_for_pipeline = str(self._video_settings_thermal) if default_view == "split" else ""
-                    self._video.set_rtsp_sources(
-                        day_url=str(self._video_settings_day),
-                        thermal_url=thermal_for_pipeline,
-                        transport=str(getattr(self, "_video_settings_rtsp_transport", "auto") or "auto"),
-                    )
+                self._configure_video_pipeline(self._video)
             except Exception:
                 pass
             sources = self._video.sources()
@@ -3086,6 +3076,26 @@ class MapWidget(QWidget):
             return False
         return True
 
+    def _configure_video_pipeline(self, vp: VideoPipeline | None) -> None:
+        """Apply Application Settings → Video URLs and mode to the shared (or local) pipeline."""
+        if vp is None:
+            return
+        self._read_video_settings()
+        if not bool(getattr(self, "_video_settings_enabled", False)):
+            vp.set_rtsp_sources(day_url="", thermal_url="", transport="auto", stream_kind="rtsp")
+            return
+        default_view = str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
+        thermal_for_pipeline = str(self._video_settings_thermal) if default_view == "split" else ""
+        kind = str(getattr(self, "_video_settings_source", "rtsp") or "rtsp").strip().lower()
+        if kind == "disabled":
+            kind = "rtsp"
+        vp.set_rtsp_sources(
+            day_url=str(self._video_settings_day),
+            thermal_url=thermal_for_pipeline,
+            transport=str(getattr(self, "_video_settings_rtsp_transport", "auto") or "auto"),
+            stream_kind=kind,
+        )
+
     def _read_video_settings(self) -> None:
         s = QSettings(_QS_NS, _QS_APP)
         source = str(s.value(_KEY_VIDEO_SOURCE, "rtsp") or "rtsp").strip().lower()
@@ -3099,8 +3109,9 @@ class MapWidget(QWidget):
     def apply_video_settings(self) -> None:
         """
         Called by MainWindow after Application Settings → Video is applied.
-        Reconfigures the video pipeline (RTSP Day/Thermal) and updates defaults.
+        Reconfigures the video pipeline (network + local cameras) and updates defaults.
         """
+        was_preview_on = bool(getattr(self, "_video_preview_enabled", False))
         self._read_video_settings()
         try:
             print(
@@ -3121,12 +3132,24 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
-        # Reset pipeline so next start uses fresh sources.
         try:
             if bool(getattr(self, "_video_preview_enabled", False)):
                 self._stop_video_preview(clear_overlay=True)
         except Exception:
             pass
+
+        vp = getattr(self, "_video_pipeline_shared", None)
+        if vp is None:
+            vp = getattr(self, "_video", None)
+        try:
+            self._configure_video_pipeline(vp)
+        except Exception:
+            pass
+
+        # Force pipeline + signal hooks to rebind to new RtspSource instances.
+        self._video_inited = False
+        self._shared_vp_hooks_connected = False
+
         # Default split view from Application Settings → Video (matches web `__camSplitEnabled` seed).
         try:
             self._video_split_enabled = (
@@ -3135,6 +3158,30 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._sync_native_camera_rail_toggles()
+
+        if (
+            was_preview_on
+            and bool(self._video_settings_enabled)
+            and bool(getattr(self, "_btn_webcam", None))
+            and bool(self._btn_webcam.isChecked())
+            and bool(getattr(self, "_web_ready", False))
+        ):
+            try:
+                QTimer.singleShot(80, self._restart_video_preview_after_settings)
+            except Exception:
+                pass
+
+    def _restart_video_preview_after_settings(self) -> None:
+        try:
+            if not bool(getattr(self, "_video_settings_enabled", False)):
+                return
+            if not bool(getattr(self, "_btn_webcam", None)) or not self._btn_webcam.isChecked():
+                return
+            if not bool(getattr(self, "_web_ready", False)):
+                return
+            self._start_video_preview(reset_swapped=True)
+        except Exception:
+            pass
 
     def set_camera_control(self, control) -> None:
         """Inject a camera control backend (MAVLink/SDK)."""

@@ -1854,19 +1854,27 @@ class MainWindow(QMainWindow):
         source_combo = QComboBox()
         source_combo.addItem("Video Stream Disabled", "disabled")
         source_combo.addItem("RTSP Video Stream", "rtsp")
-        # Placeholders to match Fig2; not implemented in M3 backend yet.
-        source_combo.addItem("UDP h.264 Video Stream (not implemented)", "udp_h264")
-        source_combo.addItem("UDP h.265 Video Stream (not implemented)", "udp_h265")
+        source_combo.addItem("UDP h.264 stream", "udp_h264")
+        source_combo.addItem("UDP h.265 / HEVC stream", "udp_h265")
         sg.addWidget(source_combo, 0, 1)
+        sg.addWidget(QLabel("URL hints"), 1, 0)
+        url_hint = QLabel(
+            "Examples:\n"
+            "• RTSP — rtsp://192.168.x.x/stream (works on local radio/Wi‑Fi without internet).\n"
+            "• UDP — udp://0.0.0.0:5600; pick h.264/h.265 for raw Annex B, or RTSP mode for MPEG‑TS UDP (auto-detect)."
+        )
+        url_hint.setWordWrap(True)
+        url_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        sg.addWidget(url_hint, 1, 1)
         source_group.setLayout(sg)
         vb.addWidget(source_group)
 
         conn_group = QGroupBox("Connection")
         cg = QGridLayout()
-        cg.addWidget(QLabel("RTSP URL 1 (Day)"), 0, 0)
+        cg.addWidget(QLabel("Stream URL 1 (Day / primary)"), 0, 0)
         rtsp_day = QLineEdit()
         cg.addWidget(rtsp_day, 0, 1)
-        cg.addWidget(QLabel("RTSP URL 2 (Thermal)"), 1, 0)
+        cg.addWidget(QLabel("Stream URL 2 (Thermal / secondary)"), 1, 0)
         rtsp_th = QLineEdit()
         cg.addWidget(rtsp_th, 1, 1)
         conn_group.setLayout(cg)
@@ -1914,7 +1922,7 @@ class MainWindow(QMainWindow):
         stg.addWidget(decode_prio, 2, 1)
         stg.addWidget(QLabel("RTSP transport"), 3, 0)
         rtsp_transport = QComboBox()
-        rtsp_transport.addItem("Auto (UDP then TCP)", "auto")
+        rtsp_transport.addItem("Auto (LAN: TCP first · WAN: UDP first)", "auto")
         rtsp_transport.addItem("UDP", "udp")
         rtsp_transport.addItem("TCP", "tcp")
         stg.addWidget(rtsp_transport, 3, 1)
