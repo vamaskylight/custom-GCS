@@ -1,4 +1,4 @@
-"""M2 map scaffold with live position API and WebEngine/Leaflet integration."""
+"""M2 map scaffold with live position API and native Qt map (slippy tiles)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from PySide6.QtCore import (
@@ -19,6 +18,8 @@ from PySide6.QtCore import (
     QBuffer,
     QObject,
     QPoint,
+    QPointF,
+    QSize,
     QRunnable,
     QSettings,
     QThreadPool,
@@ -28,6 +29,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
@@ -38,10 +41,24 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QMessageBox,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
 )
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import (
+    QBrush,
+    QFont,
+    QIcon,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QColor,
+    QRadialGradient,
+)
 from vgcs.mission import (
     Waypoint,
     load_waypoints_json,
@@ -52,6 +69,71 @@ from vgcs.mission import (
 # Optional: live camera preview for map overlay (M3 video pipeline).
 from vgcs.video.pipeline import HAS_MULTIMEDIA, VideoFrame, VideoPipeline
 from vgcs.video.camera_control import NoopCameraControl
+from vgcs.map.native_tile_map import NativeTileMapView
+from vgcs.map.legacy_leaflet_build import build_leaflet_html
+from vgcs.map.map_footer_hud import (
+    MapFooterCompass,
+    MapFooterTelemetryStrip,
+    TelemetryStripIcon,
+)
+from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_url, create_map_3d_web_view
+from vgcs.map.cam_rail_widgets import CamObserveSegment, CamRecordArch
+from vgcs.map.plan_flight_panel import PlanFlightPanel
+
+try:
+    from PySide6.QtSvg import QSvgRenderer
+except Exception:  # optional component on some Qt builds
+    QSvgRenderer = None  # type: ignore[misc, assignment]
+
+# Git `e48c1a7` `#cameraTopRow` SVG icons (`camIcon` classes).
+_GIT_CAM_VIDEO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<rect x="3" y="7" width="12" height="10" rx="2" fill="#e8edf8"/>'
+    '<polygon points="16,10 21,8 21,16 16,14" fill="#e8edf8"/>'
+    "</svg>"
+)
+_GIT_CAM_PHOTO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<path d="M8 6h8l1.2 2H20a2 2 0 0 1 2 2v7a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3v-7a2 2 0 0 1 2-2h2.8L8 6z" fill="#e8edf8"/>'
+    '<circle cx="12" cy="13.5" r="3.2" fill="rgba(39,47,61,242)"/>'
+    "</svg>"
+)
+# git `25970f0` `#camSplitBtn` (4-up) / `#camFollowBtn` — match `camIcon` stroke/fill.
+_GIT_CAM_SPLIT_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<rect x="3" y="3" width="8" height="8" rx="1.5" fill="#e8edf8"/>'
+    '<rect x="13" y="3" width="8" height="8" rx="1.5" fill="#e8edf8"/>'
+    '<rect x="3" y="13" width="8" height="8" rx="1.5" fill="#e8edf8"/>'
+    '<rect x="13" y="13" width="8" height="8" rx="1.5" fill="#e8edf8"/>'
+    "</svg>"
+)
+_GIT_CAM_FOLLOW_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<circle cx="12" cy="12" r="6.5" fill="none" stroke="#e8edf8" stroke-width="1.75"/>'
+    '<path d="M12 4.5v3.2M12 16.3v3.2M4.5 12h3.2M16.3 12h3.2" stroke="#e8edf8" stroke-width="2" stroke-linecap="round"/>'
+    '<circle cx="12" cy="12" r="2.2" fill="#e8edf8"/>'
+    "</svg>"
+)
+
+
+def _git_cam_icon_from_svg(svg_xml: str, logical_px: int = 22) -> QIcon:
+    """Rasterize embedded SVG for toolbar-sized icons (falls back to empty QIcon if Svg unavailable)."""
+    if QSvgRenderer is None:
+        return QIcon()
+    r = QSvgRenderer(QByteArray(svg_xml.encode("utf-8")))
+    if not r.isValid():
+        return QIcon()
+    d = max(16, int(logical_px))
+    pm = QPixmap(d, d)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    r.render(p)
+    p.end()
+    return QIcon(pm)
+
+
+# Map action rail: icon size (logical px) — same line-art style as ``TelemetryStripIcon`` (footer HUD).
+_MAP_ACTION_ICON_LOGICAL_PX = 26
 
 # QSettings: Plan Flight Save vs map toolbar export use different "last file" keys.
 _QS_NS = "VGCS"
@@ -72,4556 +154,302 @@ _KEY_VIDEO_RTSP_THERMAL = "video/rtsp_thermal"
 _KEY_VIDEO_RTSP_TRANSPORT = "video/rtsp_transport"  # 'auto' | 'udp' | 'tcp'
 _KEY_VIDEO_DEFAULT_VIEW = "video/default_view"  # 'Single' | 'Split'
 
-
-try:
-    from PySide6.QtWebEngineCore import QWebEngineSettings
-    from PySide6.QtWebEngineCore import QWebEngineProfile
-    from PySide6.QtWebEngineCore import QWebEngineUrlRequestInterceptor
-    from PySide6.QtWebEngineCore import QWebEnginePage
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-
-    HAS_WEBENGINE = True
-except Exception:  # pragma: no cover - environment-specific availability
-    QWebEngineSettings = None  # type: ignore[assignment,misc]
-    QWebEngineProfile = None  # type: ignore[assignment,misc]
-    QWebEngineUrlRequestInterceptor = None  # type: ignore[assignment]
-    QWebEnginePage = None  # type: ignore[assignment]
-    QWebEngineView = None  # type: ignore[assignment]
-    HAS_WEBENGINE = False
-
-
-LEAFLET_HTML = """<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" onerror="document.title='VGCS_ASSET_ERROR:leaflet_css:'+Date.now()"/>
-  <link rel="stylesheet" href="https://unpkg.com/cesium@1.125/Build/Cesium/Widgets/widgets.css" onerror="document.title='VGCS_ASSET_ERROR:cesium_css:'+Date.now()"/>
-  <style>
-    html, body, #mapWrap, #map2d, #map3d { height:100%; margin:0; background:#1a1d24; }
-    /* Single scroll/compositor root; avoid promoted layers that confuse WebEngine on Windows. */
-    #mapWrap { position: relative; overflow: hidden; z-index: 0; }
-    #map2d, #map3d { position: absolute; inset: 0; }
-    #map3d { display: none; }
-    .leaflet-control-attribution {
-      display: none !important;
-    }
-    .overlay { position:absolute; z-index:1200; font-family: "Segoe UI", Arial, sans-serif; }
-    #linkBanner {
-      top:0; left:0; right:0; min-height:46px; padding:8px 12px; border-radius:0;
-      background: rgba(24, 30, 40, 0.95); color:#dbe3f3; font-size:17px; font-weight:600;
-      border:0;
-      border-bottom:1px solid rgba(72, 86, 110, 0.9);
-      display:flex; align-items:center; gap:8px;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.18);
-    }
-    #linkBannerLogo {
-      height:28px;
-      width:auto;
-      display:none;
-      object-fit:contain;
-      flex:0 0 auto;
-    }
-    #linkBannerDisconnected {
-      display:flex;
-      align-items:center;
-      gap:8px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      min-width: 0;
-      flex: 1 1 auto;
-    }
-    #linkBannerConnected {
-      display:none;
-      align-items:center;
-      gap:12px;
-      color: #f4f7ff;
-      font-size: 14px;
-      font-weight: 600;
-      white-space: nowrap;
-      overflow: hidden;
-      min-width: 0;
-      flex: 1 1 auto;
-    }
-    #hdrMapModeBtn {
-      margin-left:8px;
-      min-width:62px;
-      height:26px;
-      border-radius:13px;
-      border:1px solid rgba(210, 220, 240, 0.65);
-      background: rgba(20, 30, 42, 0.7);
-      color:#f1f6ff;
-      font-size:11px;
-      font-weight:700;
-      letter-spacing:0.02em;
-      cursor:pointer;
-      padding:0 10px;
-      flex:0 0 auto;
-    }
-    #hdrMapModeBtn:hover {
-      background: rgba(36, 50, 69, 0.9);
-    }
-    .hdrPill {
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
-      color:#f4f7ff;
-      min-width: 0;
-      flex: 0 0 auto;
-    }
-    #hdrVehiclePill {
-      /* Don't consume all remaining width (creates a large blank gap). */
-      flex: 0 1 auto;
-      max-width: 52vw;
-      min-width: 0;
-      overflow: hidden;
-    }
-    #hdrVehicleMsg {
-      display:inline-block;
-      min-width: 0;
-      max-width: 100%;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .hdrPillMuted {
-      color: #d7deef;
-      font-weight: 500;
-    }
-    .hdrSep {
-      width:1px;
-      height:24px;
-      background: rgba(210, 220, 240, 0.55);
-      flex: 0 0 auto;
-    }
-    .hdrIcon {
-      width:22px;
-      height:22px;
-      object-fit:contain;
-      flex:0 0 auto;
-    }
-    .hdrIconBroadcast {
-      width:26px;
-      height:26px;
-    }
-    .hdrIconSmall {
-      width:20px;
-      height:20px;
-    }
-    .hdrReadyText {
-      color:#d5ff9b;
-    }
-    .hdrTinyStack {
-      display:inline-flex;
-      flex-direction:column;
-      line-height:1.05;
-      font-size:12px;
-      color:#f4f7ff;
-    }
-    #actionRail { top:78px; left:10px; display:flex; flex-direction:column; gap:8px; }
-    .actionBtn {
-      width:54px; height:54px; border-radius:8px; border:1px solid rgba(255,255,255,0.35);
-      background: rgba(34, 42, 56, 0.92); color:#c8d3ea; font-size:11px; text-align:center;
-      display:flex; flex-direction:column; justify-content:center; align-items:center;
-      cursor:pointer;
-      user-select:none;
-    }
-    .actionBtn:hover {
-      background: rgba(46, 58, 78, 0.95);
-      border-color: rgba(136, 164, 205, 0.7);
-    }
-    .actionBtn.disabled {
-      opacity: 0.45;
-      cursor: not-allowed;
-      pointer-events: none;
-      border-color: rgba(120, 130, 150, 0.35);
-      background: rgba(30, 38, 52, 0.75);
-    }
-    #planFlightLayer {
-      position:absolute;
-      inset:0;
-      z-index:1250;
-      display:none;
-      pointer-events:none;
-      font-family: "Segoe UI", Arial, sans-serif;
-    }
-    #planFlightTopBar {
-      position:absolute;
-      top:0;
-      left:0;
-      right:0;
-      min-height:64px;
-      background: rgba(32, 34, 40, 0.97);
-      color:#e8eaef;
-      display:flex;
-      align-items:stretch;
-      gap:14px;
-      padding: 6px 14px 8px;
-      font-size:15px;
-      border-bottom:1px solid rgba(70, 76, 88, 0.85);
-      pointer-events:auto;
-      flex-wrap: nowrap;
-    }
-    #planBarUpload {
-      align-self:center;
-      height:32px;
-      padding:0 18px;
-      border-radius:6px;
-      border:1px solid rgba(110, 118, 135, 0.85);
-      background: rgba(58, 62, 74, 0.95);
-      color:#e8eaef;
-      font-size:13px;
-      font-weight:600;
-      cursor:pointer;
-      flex:0 0 auto;
-    }
-    #planBarUpload:hover {
-      background: rgba(72, 78, 92, 0.98);
-    }
-    #planBarUpload:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
-    #planFlightTopBar .pfGroup {
-      display:flex;
-      flex-direction:column;
-      justify-content:center;
-      gap:3px;
-      min-width: 108px;
-      padding: 0 2px;
-    }
-    #planFlightTopBar .pfLabel {
-      font-size:11px;
-      color:#9ca3b0;
-      font-weight:600;
-      line-height:1.1;
-      white-space: nowrap;
-      letter-spacing: 0.01em;
-    }
-    #planFlightTopBar .pfMetric {
-      font-size:13px;
-      color:#f3f4f6;
-      line-height:1.2;
-      white-space:nowrap;
-      font-weight: 400;
-    }
-    #planFlightTopBar .pfMetric b {
-      font-weight: 700;
-      color:#ffffff;
-    }
-    #planFlightTopBar .pfMetricGhost {
-      visibility: hidden;
-    }
-    #planFlightTopBar .pfSpacer {
-      flex: 0 0 10px;
-      min-width: 10px;
-    }
-    #planExit {
-      font-size: 34px;
-      display:inline-flex;
-      align-items:flex-start;
-      padding-top: 6px;
-      color:#f3f4f6;
-      white-space: nowrap;
-      min-width: 92px;
-      cursor:pointer;
-    }
-    #planWorkspace {
-      position:absolute;
-      top:64px;
-      left:0;
-      right:0;
-      bottom:0;
-      display:flex;
-      gap:10px;
-      padding:10px;
-      align-items:flex-start;
-      pointer-events:none;
-    }
-    #planFlightToolRail {
-      width:78px;
-      border-radius:8px;
-      background: rgba(28, 30, 36, 0.96);
-      border:1px solid rgba(65, 70, 82, 0.9);
-      box-shadow: 0 2px 8px rgba(0,0,0,0.16);
-      padding:5px 0;
-      display:flex;
-      flex-direction:column;
-      gap:4px;
-      pointer-events:auto;
-    }
-    .planToolBtn {
-      position: relative;
-      margin:0 5px;
-      min-height:52px;
-      border-radius:6px;
-      border:1px solid rgba(70, 76, 88, 0.85);
-      background: rgba(40, 44, 52, 0.95);
-      color:#e8eaef;
-      font-size:11px;
-      font-weight:600;
-      display:flex;
-      flex-direction:column;
-      align-items:center;
-      justify-content:center;
-      gap:2px;
-      cursor:pointer;
-      user-select:none;
-      text-align:center;
-      padding: 3px 2px;
-      letter-spacing: 0.01em;
-      pointer-events:auto;
-    }
-    .planToolIcon {
-      width:17px;
-      height:17px;
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      font-size:15px;
-      line-height:1;
-      opacity:0.98;
-      flex:0 0 auto;
-    }
-    .planToolBtn.active {
-      background:#facc15;
-      color:#111827;
-      border-color:#ca8a04;
-      margin-right: 10px;
-    }
-    .planToolBtn.active .planToolIcon {
-      color:#111827;
-    }
-    .planToolBtn.active::after {
-      content: "";
-      position: absolute;
-      right: -7px;
-      top: 50%;
-      transform: translateY(-50%);
-      border-width: 9px 0 9px 9px;
-      border-style: solid;
-      border-color: transparent transparent transparent #facc15;
-      filter: drop-shadow(1px 0 0 rgba(0,0,0,0.12));
-    }
-    .planToolBtn:hover { background: rgba(55, 60, 72, 0.98); }
-    .planToolBtn.active:hover { background:#eab308; }
-    #planCenterPanel {
-      min-width: 540px;
-      max-width: 620px;
-      border-radius:8px;
-      overflow:hidden;
-      background: rgba(36, 39, 48, 0.98);
-      border:1px solid rgba(70, 76, 88, 0.9);
-      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-      pointer-events:auto;
-    }
-    #planFileFlyout {
-      padding: 12px 14px 14px;
-      color:#e8eaef;
-      font-size:12px;
-    }
-    .planFileSection {
-      margin-bottom: 16px;
-    }
-    .planFileSection:last-child {
-      margin-bottom: 0;
-    }
-    .planFileSectionTitle {
-      font-size: 13px;
-      font-weight: 700;
-      color: #f9fafb;
-      margin-bottom: 10px;
-      letter-spacing: 0.02em;
-    }
-    .planFileCardGrid {
-      display:grid;
-      grid-template-columns: 1fr 1fr;
-      gap:8px;
-    }
-    .planTplCard {
-      border-radius:6px;
-      overflow:hidden;
-      border:1px solid rgba(90, 96, 110, 0.85);
-      cursor:pointer;
-      display:flex;
-      flex-direction:column;
-      background: rgba(28, 30, 36, 0.98);
-    }
-    .planTplCard:hover {
-      border-color: rgba(250, 204, 21, 0.65);
-      box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.25);
-    }
-    .planTplPrev {
-      flex: 1 1 82px;
-      min-height: 82px;
-      position: relative;
-      overflow: hidden;
-      background: linear-gradient(145deg, #2d3748, #4a5568);
-    }
-    .planTplPrevImg {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-      object-position: center;
-      display: block;
-    }
-    .planTplLabel {
-      background: rgba(24, 26, 32, 0.98);
-      border-top:1px solid rgba(70, 76, 88, 0.85);
-      text-align:center;
-      font-size:11px;
-      font-weight:600;
-      padding:6px 4px 7px;
-      color:#e8eaef;
-    }
-    .planFileBtnRow {
-      display:flex;
-      flex-wrap: wrap;
-      gap:8px;
-      margin-bottom:8px;
-    }
-    .planFileBtn {
-      flex: 1 1 auto;
-      min-height:30px;
-      padding: 0 12px;
-      border-radius:5px;
-      border:1px solid rgba(90, 96, 110, 0.9);
-      background: rgba(48, 52, 62, 0.95);
-      color:#e8eaef;
-      font-size:12px;
-      font-weight:600;
-      cursor:pointer;
-    }
-    .planFileBtn:hover:not(:disabled) {
-      background: rgba(62, 68, 82, 0.98);
-    }
-    .planFileBtn:disabled {
-      opacity:0.38;
-      cursor:not-allowed;
-    }
-    .planFileBtnPrimary {
-      background: rgba(88, 82, 118, 0.95);
-      border-color: rgba(120, 110, 160, 0.85);
-    }
-    .planFileBtnPrimary:hover:not(:disabled) {
-      background: rgba(100, 94, 132, 0.98);
-    }
-    .planFileBtnSecondary {
-      background: rgba(52, 56, 66, 0.95);
-    }
-    .planFileBtnWide {
-      width:100%;
-      display:block;
-    }
-    #planOtherToolPanel {
-      padding: 20px 16px;
-      color:#e8eaef;
-      font-size: 13px;
-      line-height: 1.45;
-      min-height: 120px;
-    }
-    #planRightPanel {
-      margin-left:auto;
-      width: 340px;
-      max-width: min(340px, calc(100vw - 24px));
-      max-height: calc(100vh - 120px);
-      border-radius:6px;
-      background: rgba(36, 38, 46, 0.94);
-      border:1px solid rgba(92, 96, 120, 0.85);
-      box-shadow: 0 8px 28px rgba(0,0,0,0.35);
-      overflow-x: visible;
-      overflow-y: auto;
-      pointer-events:auto;
-      display:flex;
-      flex-direction:column;
-      font-family: "Segoe UI", Arial, sans-serif;
-    }
-    #planTabs {
-      display:flex;
-      flex-shrink:0;
-      min-height:38px;
-      background:#3a3d4a;
-      border-bottom:1px solid rgba(0,0,0,0.35);
-    }
-    #planTabs:focus-within {
-      outline: none;
-    }
-    .planTab {
-      flex: 1 1 0;
-      min-width: 0;
-      border:none;
-      border-right:1px solid rgba(0,0,0,0.28);
-      background:#3a3d4a;
-      color:#e8eaef;
-      font-size:12px;
-      font-weight:600;
-      cursor:pointer;
-      padding:8px 4px;
-      position: relative;
-    }
-    .planTab:focus-visible {
-      outline: 2px solid rgba(250, 204, 21, 0.85);
-      outline-offset: -2px;
-      z-index: 1;
-    }
-    .planTab:last-child { border-right:none; }
-    .planTab:hover:not(.active) {
-      background:#45485a;
-    }
-    .planTab.active {
-      background:#f5e6a0;
-      color:#111827;
-      font-weight:700;
-    }
-    #planSection {
-      padding:0;
-    }
-    .planTabBody {
-      padding: 0;
-      flex:1;
-      min-height:0;
-    }
-    .planTabBody[hidden] {
-      display: none !important;
-    }
-    .planTabHint {
-      font-size: 12px;
-      color: rgba(232, 234, 239, 0.92);
-      line-height: 1.5;
-      margin: 0 0 12px;
-    }
-    .planSectionHeader {
-      background:#4d5170;
-      color:#f9fafb;
-      font-size:13px;
-      font-weight:600;
-      padding:9px 12px;
-      letter-spacing:0.02em;
-    }
-    .planSectionBody {
-      padding:12px;
-      background:#0c0c0e;
-      color:#e8eaef;
-      font-size:12px;
-    }
-    .planSectionBody--fence {
-      background:#14151a;
-    }
-    .planFieldLabel {
-      color:rgba(248, 250, 252, 0.88);
-      font-size:11px;
-      font-weight:600;
-      margin:10px 0 5px;
-    }
-    .planFieldLabel:first-child { margin-top:0; }
-    .planRailSelect {
-      width:100%;
-      box-sizing:border-box;
-      min-height:32px;
-      padding:6px 28px 6px 10px;
-      border-radius:5px;
-      border:1px solid rgba(100, 106, 124, 0.65);
-      background:#ffffff;
-      color:#111827;
-      font-size:12px;
-      font-weight:500;
-      cursor:pointer;
-      appearance:none;
-      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23374151' d='M3 4.5L6 8l3-3.5z'/%3E%3C/svg%3E");
-      background-repeat:no-repeat;
-      background-position:right 10px center;
-    }
-    .planRailInput {
-      display:flex;
-      align-items:center;
-      box-sizing:border-box;
-      min-height:32px;
-      padding:0 10px;
-      border-radius:5px;
-      border:1px solid rgba(100, 106, 124, 0.65);
-      background:#ffffff;
-      color:#111827;
-    }
-    .planRailInput input {
-      flex:1;
-      min-width:0;
-      border:none;
-      background:transparent;
-      color:#111827;
-      font-size:13px;
-      font-weight:500;
-      padding:6px 0;
-      outline:none;
-    }
-    .planRailUnit {
-      flex:0 0 auto;
-      margin-left:8px;
-      font-size:12px;
-      font-weight:600;
-      color:#374151;
-    }
-    .planKvRow {
-      display:flex;
-      justify-content:space-between;
-      align-items:baseline;
-      gap:10px;
-      font-size:12px;
-      margin:8px 0;
-      color:#e8eaef;
-    }
-    .planKvRow span:first-child { color:rgba(210, 214, 222, 0.88); }
-    .planKvRow b { font-weight:700; color:#fff; }
-    .planNoteMission {
-      font-size:11px;
-      line-height:1.5;
-      color:rgba(218, 220, 228, 0.88);
-      font-weight:400;
-      margin:12px 0 14px;
-    }
-    #planVehicleDetails.planRailDetails summary {
-      font-weight:700;
-      font-size:13px;
-      color:#fff;
-      padding:12px 0 10px;
-      margin:0;
-      border-bottom:1px solid rgba(255,255,255,0.92);
-    }
-    #planVehicleDetails.planRailDetails .planRailDetailsInner {
-      padding-top:12px;
-      padding-bottom:4px;
-    }
-    #planVehicleDetails.planRailDetails .planRailDetailsInner > .planFieldLabel {
-      margin-top:2px;
-    }
-    .planHelpMuted {
-      font-size:11px;
-      line-height:1.45;
-      color:rgba(232,234,239,0.72);
-      margin:8px 0 10px;
-    }
-    .planRailDetails {
-      margin-top:4px;
-      border-top:1px solid rgba(255,255,255,0.28);
-    }
-    .planRailDetails + .planRailDetails { margin-top:0; }
-    .planRailDetails summary {
-      list-style:none;
-      cursor:pointer;
-      color:#f9fafb;
-      display:flex;
-      justify-content:space-between;
-      align-items:center;
-      font-size:13px;
-      font-weight:600;
-      padding:12px 0 10px;
-    }
-    .planRailDetails summary::-webkit-details-marker { display:none; }
-    .planRailDetails .planRailChev {
-      display:inline-block;
-      font-size:10px;
-      opacity:0.85;
-      transition: transform 0.15s ease;
-    }
-    .planRailDetails[open] .planRailChev { transform: rotate(180deg); }
-    .planRailDetailsInner {
-      padding-bottom:12px;
-    }
-    .planGeoLead {
-      font-size:11px;
-      color:rgba(232,234,239,0.8);
-      line-height:1.45;
-      margin:0 0 14px;
-    }
-    .planGeoBlock {
-      margin-bottom:14px;
-      padding-bottom:12px;
-      border-bottom:1px solid rgba(255,255,255,0.22);
-    }
-    .planGeoBlock:last-child {
-      border-bottom:none;
-      margin-bottom:0;
-      padding-bottom:0;
-    }
-    .planGeoTitle {
-      font-size:12px;
-      font-weight:700;
-      color:#fff;
-      margin:0 0 10px;
-    }
-    .planGeoStatus {
-      font-size:12px;
-      color:rgba(232,234,239,0.78);
-    }
-    .planGeoBtnStack {
-      display:flex;
-      flex-direction:column;
-      gap:8px;
-    }
-    .planGeoBtn {
-      width:100%;
-      box-sizing:border-box;
-      min-height:34px;
-      padding:8px 12px;
-      border-radius:6px;
-      border:1px solid rgba(80, 86, 102, 0.9);
-      background:#3d414d;
-      color:#f3f4f6;
-      font-size:12px;
-      font-weight:600;
-      cursor:pointer;
-    }
-    .planGeoBtn:hover:not(:disabled) {
-      background:#4a4f5e;
-    }
-    .planGeoBtn:disabled {
-      opacity:0.45;
-      cursor:not-allowed;
-    }
-    .planRallyInfo {
-      margin:0;
-      padding:14px 14px 16px;
-      border-radius:8px;
-      background:#121318;
-      border:1px solid rgba(80, 86, 102, 0.55);
-      color:#e8eaef;
-      font-size:12px;
-      line-height:1.5;
-    }
-    .planFold {
-      margin-top:12px;
-      border-top:1px solid rgba(94, 99, 109, 0.55);
-      padding-top:8px;
-      font-size:13px;
-      color:#1f2937;
-      display:flex;
-      justify-content:space-between;
-      align-items:center;
-    }
-    #planStartMissionBtn {
-      margin-top:14px;
-      width:100%;
-      min-height:36px;
-      border-radius:6px;
-      border:1px solid rgba(120, 90, 40, 0.85);
-      background:#9a6b2d;
-      color:#ffffff;
-      font-size:13px;
-      font-weight:700;
-      cursor:pointer;
-    }
-    #planStartMissionBtn:hover {
-      background:#b07a34;
-    }
-    #planSetLaunchMapCenterBtn {
-      width:100%;
-      margin-top:10px;
-      min-height:34px;
-      border-radius:6px;
-      border:1px solid rgba(80, 86, 102, 0.9);
-      background:#3d414d;
-      color:#f3f4f6;
-      font-size:12px;
-      font-weight:600;
-      cursor:pointer;
-    }
-    #planSetLaunchMapCenterBtn:hover {
-      background:#4a4f5e;
-    }
-    #cameraRail {
-      top: 74px;
-      right: 16px;
-      display: none;
-      flex-direction: column;
-      align-items: center;
-      gap: 6px;
-      width: clamp(188px, 22vw, 220px);
-      padding: 8px 9px 8px;
-      border-radius: 16px;
-      background: linear-gradient(180deg, rgba(30, 40, 56, 0.96), rgba(22, 30, 44, 0.97));
-      border: 1px solid rgba(180, 198, 226, 0.28);
-      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.36);
-      backdrop-filter: blur(3px);
-      transition: transform 140ms ease, box-shadow 140ms ease;
-      z-index: 1215;
-    }
-    #videoPreview {
-      left: 14px;
-      bottom: 14px;
-      width: 230px;
-      height: 130px;
-      display: none;
-      border-radius: 8px;
-      overflow: hidden;
-      border: 1px solid rgba(206, 220, 242, 0.35);
-      background: #0f1623;
-      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.32);
-      z-index: 1210;
-      cursor: zoom-in;
-      transition: left 180ms ease, right 180ms ease, top 180ms ease, bottom 180ms ease, width 180ms ease, height 180ms ease, border-radius 180ms ease;
-    }
-    #videoPreview img {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      display: block;
-      background: #000;
-    }
-    #aiOverlaySingle, #aiOverlayGrid {
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      z-index: 1212;
-    }
-    #aiOverlaySingle { display: none; }
-    #aiOverlayGrid {
-      display: none;
-      grid-template-columns: 1fr 1fr;
-      grid-template-rows: 1fr 1fr;
-      gap: 1px;
-    }
-    .aiGridCell { position: relative; }
-    .aiBox {
-      position: absolute;
-      border: 2px solid rgba(0, 255, 150, 0.9);
-      border-radius: 6px;
-      background: rgba(0, 255, 150, 0.08);
-      box-shadow: 0 0 0 1px rgba(0,0,0,0.25) inset;
-    }
-    .aiBoxLabel {
-      position: absolute;
-      left: 0;
-      top: -18px;
-      padding: 2px 6px;
-      border-radius: 6px;
-      font-size: 10px;
-      font-weight: 700;
-      color: rgba(240, 246, 255, 0.96);
-      background: rgba(10, 16, 28, 0.72);
-      border: 1px solid rgba(210, 220, 240, 0.22);
-      white-space: nowrap;
-    }
-    #videoPreviewGrid {
-      position: absolute;
-      inset: 0;
-      display: none;
-      grid-template-columns: 1fr 1fr;
-      grid-template-rows: 1fr 1fr;
-      gap: 1px;
-      background: rgba(255,255,255,0.08);
-    }
-    #videoPreviewGrid .videoGridImg {
-      position: relative;
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-      display: block;
-      background: #0b1120;
-    }
-    #videoPreviewGrid .videoGridImg::after {
-      content: attr(data-label);
-      position: absolute;
-      left: 6px;
-      top: 6px;
-      padding: 3px 6px;
-      border-radius: 6px;
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
-      color: rgba(240, 246, 255, 0.96);
-      background: rgba(10, 16, 28, 0.62);
-      border: 1px solid rgba(210, 220, 240, 0.22);
-      pointer-events: none;
-      text-transform: uppercase;
-    }
-    #videoPreviewPlaceholder {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: #eef3ff;
-      font-size: 20px;
-      font-weight: 600;
-      letter-spacing: 0.03em;
-      background: linear-gradient(180deg, rgba(18, 27, 42, 0.9), rgba(10, 16, 28, 0.92));
-      text-shadow: 0 1px 2px rgba(0,0,0,0.45);
-      pointer-events: none;
-    }
-    #mapWrap.video-swapped #videoPreview {
-      left: 0;
-      right: 0;
-      top: 0;
-      bottom: 0;
-      width: auto;
-      height: auto;
-      border-radius: 0;
-      border: 0;
-      box-shadow: none;
-      z-index: 1180;
-      cursor: zoom-out;
-    }
-    #mapWrap.video-swapped #map2d,
-    #mapWrap.video-swapped #map3d {
-      inset: auto;
-      left: 14px;
-      bottom: 14px;
-      width: 230px;
-      height: 130px;
-      border-radius: 8px;
-      overflow: hidden;
-      border: 1px solid rgba(206, 220, 242, 0.45);
-      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
-      z-index: 1260;
-    }
-    #mapWrap.video-swapped #cameraRail { z-index: 1270; }
-    #cameraTopRow {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      width: 100%;
-      padding: 4px;
-      border-radius: 11px;
-      background: rgba(72, 84, 108, 0.52);
-      border: 1px solid rgba(190, 202, 224, 0.24);
-    }
-    #camZoomRow, #camObserveRow1 {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      width: 100%;
-      justify-content: center;
-    }
-    #camFocusRow, #camObserveRow2 {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      width: 100%;
-      justify-content: center;
-    }
-    #camGimbalRow {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      grid-template-rows: repeat(2, 1fr);
-      gap: 6px;
-      width: 100%;
-    }
-    .camGimbalSpacer {
-      width: 100%;
-      height: 36px;
-    }
-    .camSmallBtn {
-      width: 100%;
-      height: 36px;
-      border-radius: 10px;
-      border: 1px solid rgba(196, 209, 230, 0.22);
-      background: rgba(22, 30, 42, 0.32);
-      color: #e8edf8;
-      font-size: 16px;
-      font-weight: 600;
-      letter-spacing: 0;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      user-select: none;
-      transition: background 70ms linear, border-color 70ms linear, box-shadow 70ms linear;
-      -webkit-tap-highlight-color: transparent;
-    }
-    .camSmallBtn:hover {
-      background: rgba(110, 123, 148, 0.3);
-      border-color: rgba(229, 237, 251, 0.4);
-    }
-    .camSmallBtn:active,
-    .camSmallBtn.pressing {
-      background: rgba(140, 160, 188, 0.36);
-      border-color: rgba(234, 242, 255, 0.62);
-      box-shadow: 0 0 0 1px rgba(240, 246, 255, 0.22) inset;
-    }
-    .camSmallBtn.active {
-      border-color: rgba(214, 224, 241, 0.9);
-      background: rgba(27, 33, 45, 0.96);
-      box-shadow: 0 0 0 1px rgba(230, 238, 252, 0.18) inset;
-      color: #69e86f;
-    }
-    #camVideoBtn {
-      width: 36px;
-      height: 36px;
-      border-radius: 50%;
-      border-color: transparent;
-      box-shadow: none;
-      flex: 0 0 36px;
-    }
-    #camVideoBtn:hover {
-      border-color: transparent;
-      background: rgba(110, 123, 148, 0.2);
-      transform: none;
-    }
-    #camVideoBtn:active, #camPhotoBtn:active, #camSplitBtn:active, #camFollowBtn:active,
-    #camZoomOutBtn:active, #camZoomInBtn:active, #camFocusOutBtn:active, #camFocusInBtn:active,
-    #camGimbalUpBtn:active, #camGimbalDownBtn:active, #camGimbalLeftBtn:active, #camGimbalRightBtn:active,
-    #camObsMarkBtn:active, #camObsClipBtn:active, #camObsExportBtn:active, #camObsClearBtn:active,
-    #camSettingsBtn:active {
-      transform: none;
-    }
-    #camVideoBtn.active {
-      border-color: rgba(214, 224, 241, 0.9);
-      background: rgba(27, 33, 45, 0.96);
-      box-shadow: 0 0 0 1px rgba(230, 238, 252, 0.18) inset;
-    }
-    #camPhotoBtn {
-      width: 36px;
-      height: 36px;
-      border-radius: 9px;
-      border-color: transparent;
-      box-shadow: none;
-      color: #e8edf8;
-      flex: 0 0 36px;
-    }
-    #camPhotoBtn:hover {
-      border-color: transparent;
-      background: rgba(110, 123, 148, 0.2);
-      transform: none;
-    }
-    #camPhotoBtn.active {
-      width: 36px;
-      height: 36px;
-      border-radius: 50%;
-      border-color: rgba(214, 224, 241, 0.9);
-      background: rgba(27, 33, 45, 0.96);
-      box-shadow: 0 0 0 1px rgba(230, 238, 252, 0.18) inset;
-      color: #f2f6ff;
-    }
-    #camSplitBtn, #camFollowBtn {
-      flex: 1 1 auto;
-      min-width: 0;
-      font-size: 15px;
-    }
-    #camRecordBtn {
-      width: 50px;
-      height: 50px;
-      border-radius: 50%;
-      border: 2px solid rgba(231, 239, 255, 0.9);
-      background: radial-gradient(circle at 50% 35%, rgba(35, 43, 57, 0.96), rgba(20, 26, 36, 0.96));
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      user-select: none;
-      transition: transform 120ms ease, box-shadow 120ms ease;
-    }
-    #camRecordBtn:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 3px 8px rgba(0,0,0,0.35);
-    }
-    #camRecordDot {
-      width: 26px;
-      height: 26px;
-      border-radius: 50%;
-      background: linear-gradient(180deg, #ff4b4b, #f62d2d);
-      box-shadow: 0 1px 2px rgba(0,0,0,0.4);
-    }
-    #camRecordBtn.recording #camRecordDot {
-      border-radius: 8px;
-      width: 18px;
-      height: 18px;
-      background: linear-gradient(180deg, #ff5555, #ff3939);
-    }
-    #camTimer {
-      font-weight: 700;
-      font-size: 13px;
-      color: #ffffff;
-      background: rgba(255, 65, 65, 0.92);
-      border-radius: 10px;
-      padding: 4px 10px;
-      line-height: 1.2;
-      letter-spacing: 0.02em;
-      font-variant-numeric: tabular-nums;
-      font-family: "Consolas", "Courier New", monospace;
-      border: 1px solid rgba(255, 205, 205, 0.5);
-      box-shadow: 0 2px 6px rgba(0,0,0,0.25);
-      min-width: 84px;
-      text-align: center;
-    }
-    .camSectionLabel {
-      width: 100%;
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: rgba(201, 214, 236, 0.82);
-      padding: 0 2px;
-      margin-top: 2px;
-      user-select: none;
-    }
-    #camSettingsBtn {
-      width: 36px;
-      height: 36px;
-      border-radius: 10px;
-      align-self: center;
-    }
-    @media (max-height: 820px) {
-      #cameraRail {
-        gap: 4px;
-        padding: 6px 8px;
-      }
-      .camSmallBtn {
-        height: 32px;
-        font-size: 14px;
-      }
-      .camGimbalSpacer {
-        height: 32px;
-      }
-      #camRecordBtn {
-        width: 44px;
-        height: 44px;
-      }
-      #camTimer {
-        font-size: 12px;
-        min-width: 76px;
-      }
-      .camSectionLabel {
-        font-size: 9px;
-      }
-    }
-    .camLabel {
-      opacity: 0.95;
-    }
-    .camIcon {
-      width: 20px;
-      height: 20px;
-      display: block;
-      color: currentColor;
-    }
-    /* Bottom HUD: compass (racchip) bottom-right; telemetry on a single orbit (no duplicate strips). */
-    /* Bottom HUD: lock compass to bottom-right; telemetry strip pinned next to it (Qt WebEngine-safe). */
-    #mapFooterHud {
-      position: absolute;
-      right: 10px;
-      bottom: 2px;
-      z-index: 1210;
-      width: 312px;
-      height: 312px;
-      pointer-events: none;
-      font-family: "Segoe UI", Arial, sans-serif;
-      --compass-size: 176px;
-      --hud-gap: 12px; /* minimum spacing between telemetry and compass */
-    }
-    #telemetryLeftStack {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      position: absolute;
-      /* Anchor relative to the compass circle (not the whole 312px HUD box).
-         HUD box: 312px; compass: 176px centered => compass left edge is 68px from HUD left.
-         We want telemetry's RIGHT edge to sit left of compass edge by --hud-gap.
-         For a HUD box of width W and compass diameter C, this is:
-           right = (W + C) / 2 + gap
-      */
-      left: auto;
-      right: calc((100% + var(--compass-size)) / 2 + var(--hud-gap));
-      bottom: 44px;              /* move strip up */
-      transform: none;
-      pointer-events: none;
-    }
-    #telemetryStrip {
-      display: grid;
-      grid-template-columns: repeat(3, max-content);
-      gap: 6px 8px;
-      padding: 6px 10px;
-      border-radius: 12px;
-      background: rgba(26, 33, 45, 0.84);
-      border: 1px solid rgba(80, 92, 118, 0.42);
-      box-shadow: 0 1px 4px rgba(0,0,0,0.28);
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
-      pointer-events: none;
-    }
-    .telStackItem {
-      display: inline-flex;
-      align-items: center;
-      justify-content: flex-start;
-      gap: 8px;
-      padding: 2px;
-      border-radius: 0;
-      background: transparent;
-      color: #dce5f5;
-      font-size: 15px;
-      line-height: 1.25;
-      white-space: nowrap;
-      box-shadow: none;
-      border: 0;
-      min-width: 0;
-      pointer-events: none;
-    }
-    .telStackItem .telemetryIcon {
-      font-size: 15px;
-      opacity: 0.95;
-    }
-    .telStackItem .telemetryIconHuman {
-      font-size: 16px;
-      opacity: 0.95;
-    }
-    #compassHud {
-      position: absolute;
-      right: 0;
-      bottom: -18px; /* move only compass down more */
-      width: 312px;
-      height: 312px;
-      flex-shrink: 0;
-      pointer-events: none;
-      --orbit-r: 122px;
-    }
-    .telOrbitItem {
-      position: absolute;
-      left: 50%;
-      top: 50%;
-      z-index: 5;
-      transform: translate(-50%, -50%) rotate(var(--oa, 0deg)) translateY(calc(-1 * var(--orbit-r))) rotate(calc(-1 * var(--oa, 0deg)));
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 4px 9px;
-      border-radius: 8px;
-      background: rgba(26, 33, 45, 0.94);
-      color: #dce5f5;
-      font-size: 13px;
-      line-height: 1.25;
-      white-space: nowrap;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.35);
-      border: 1px solid rgba(80, 92, 118, 0.45);
-      pointer-events: none;
-    }
-    .telemetryIcon {
-      font-size: 16px;
-      line-height: 1;
-    }
-    .telemetryIconHuman {
-      font-size: 19px;
-      line-height: 1;
-    }
-    #compassHud #compass {
-      position: absolute;
-      left: 50%;
-      top: 50%;
-      transform: translate(-50%, -50%);
-      width: var(--compass-size);
-      height: var(--compass-size);
-      flex-shrink: 0;
-      background: transparent;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      pointer-events: none;
-      z-index: 3;
-    }
-    #compass::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      border-radius: 50%;
-      background:
-        conic-gradient(
-          from -90deg,
-          rgba(255,255,255,0.97) 0deg 28deg, transparent 28deg 45deg,
-          rgba(255,255,255,0.97) 45deg 73deg, transparent 73deg 90deg,
-          rgba(255,255,255,0.97) 90deg 118deg, transparent 118deg 135deg,
-          rgba(255,255,255,0.97) 135deg 163deg, transparent 163deg 180deg,
-          rgba(255,255,255,0.97) 180deg 208deg, transparent 208deg 225deg,
-          rgba(255,255,255,0.97) 225deg 253deg, transparent 253deg 270deg,
-          rgba(255,255,255,0.97) 270deg 298deg, transparent 298deg 315deg,
-          rgba(255,255,255,0.97) 315deg 343deg, transparent 343deg 360deg
-        );
-      -webkit-mask: radial-gradient(circle, transparent 0 68px, #000 68px 85px, transparent 85px);
-      mask: radial-gradient(circle, transparent 0 68px, #000 68px 85px, transparent 85px);
-      pointer-events: none;
-      opacity: 0.98;
-    }
-    #compassInner {
-      position:relative; width:152px; height:152px; border-radius:76px;
-      background: rgba(22, 26, 34, 0.96);
-      border: 2px solid rgba(148, 160, 180, 0.32);
-      box-shadow: 0 2px 8px rgba(0,0,0,0.35);
-      overflow: hidden;
-    }
-    #compassInner::before {
-      content: "";
-      position: absolute;
-      inset: 4px;
-      border-radius: 50%;
-      background:
-        repeating-conic-gradient(
-          from 0deg,
-          rgba(240, 245, 255, 0.88) 0deg 2deg,
-          transparent 2deg 30deg
-        );
-      -webkit-mask: radial-gradient(circle, transparent 0 52px, #000 52px 56px, transparent 56px);
-      mask: radial-gradient(circle, transparent 0 52px, #000 52px 56px, transparent 56px);
-      pointer-events: none;
-    }
-    .compassCard {
-      position:absolute;
-      font-size:16px;
-      line-height:1;
-      color:#f1f5ff;
-      font-weight:600;
-      text-shadow:0 1px 0 rgba(0,0,0,0.35);
-      z-index: 3;
-    }
-    #cN { top:11px; left:71px; }
-    #cE { top:69px; right:12px; }
-    #cS { bottom:12px; left:71px; font-size:15px; }
-    #cW { top:69px; left:12px; }
-    #compassDeg {
-      position:absolute;
-      left:0; right:0; bottom:30px;
-      text-align:center;
-      font-size:13px;
-      font-weight:600;
-      color:#f4f7ff;
-      letter-spacing:0.02em;
-      z-index: 3;
-    }
-    #needle {
-      position:absolute;
-      left:50px;
-      top:46px;
-      width:52px;
-      height:52px;
-      transform-origin: 26px 26px;
-      filter: drop-shadow(0 1px 1px rgba(0,0,0,0.45));
-      z-index: 2;
-    }
-    #needle::before {
-      content:"";
-      position:absolute;
-      left:7px;
-      top:2px;
-      width:38px;
-      height:48px;
-      background: linear-gradient(180deg, #ff5b4e, #f04336);
-      border:2px solid rgba(244,248,255,0.92);
-      clip-path: polygon(50% 0%, 100% 58%, 67% 56%, 50% 100%, 33% 56%, 0% 58%);
-    }
-    /* Vehicle on map: high-contrast heading chevron (matches product reference). */
-    .vgcs-vehicle-marker {
-      background: transparent !important;
-      border: none !important;
-    }
-    .vgcs-vehicle-marker-inner {
-      width: 30px;
-      height: 30px;
-      margin: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transform-origin: 50% 50%;
-      filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35));
-    }
-    .vgcs-vehicle-marker-inner svg {
-      display: block;
-    }
-    .vgcs-wp-divicon {
-      background: transparent !important;
-      border: none !important;
-    }
-    .vgcs-wp-pin {
-      position: relative;
-      width: 26px;
-      height: 26px;
-    }
-    .vgcs-wp-disc {
-      position: absolute;
-      left: 0;
-      top: 0;
-      width: 26px;
-      height: 26px;
-      border-radius: 50%;
-      background: #facc15;
-      border: 2px solid #111827;
-      box-sizing: border-box;
-    }
-    .vgcs-wp-num {
-      position: absolute;
-      left: 0;
-      top: 0;
-      width: 26px;
-      height: 26px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font: 700 12px/1 system-ui, sans-serif;
-      color: #111827;
-      pointer-events: none;
-    }
-    .planWpDetails {
-      margin: 10px 0 12px 0;
-      padding: 10px;
-      border-radius: 10px;
-      background: rgba(18, 20, 26, 0.96);
-      border: 1px solid rgba(70, 76, 92, 0.85);
-      overflow: visible;
-    }
-    .planWpDetailsTitle {
-      font-weight: 800;
-      color: #e5e7eb;
-      margin: 0 0 8px 0;
-      font-size: 12px;
-      letter-spacing: 0.02em;
-      text-transform: uppercase;
-    }
-    .planWpRow {
-      display: grid;
-      grid-template-columns: 56px 1fr;
-      gap: 8px;
-      align-items: center;
-      padding: 6px 0;
-      border-bottom: 1px solid rgba(70, 76, 92, 0.55);
-    }
-    .planWpRow:last-child { border-bottom: none; }
-    .planWpRow--start .planWpLabel { color: #e7d494; }
-    .planWpStartHint {
-      font-size: 11px;
-      color: #94a3b8;
-      line-height: 1.35;
-      padding: 0 2px;
-    }
-    .planWpLabel {
-      color: #cbd5e1;
-      font-weight: 800;
-      font-size: 12px;
-    }
-    .planWpFields {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 6px;
-    }
-    .planWpField {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      background: rgba(26, 28, 36, 0.85);
-      border: 1px solid rgba(70, 76, 92, 0.8);
-      border-radius: 10px;
-      padding: 7px 10px;
-      min-width: 0;
-      width: 100%;
-      box-sizing: border-box;
-    }
-    .planWpField input {
-      flex: 1;
-      background: transparent;
-      border: none;
-      outline: none;
-      color: #f8fafc;
-      font-weight: 700;
-      font-size: 13px;
-      min-width: 0;
-    }
-    .planWpUnit {
-      color: #94a3b8;
-      font-weight: 800;
-      font-size: 12px;
-      flex-shrink: 0;
-      white-space: nowrap;
-    }
-    /* Mission tab: sequence list (Takeoff card + pattern template row), reference UI */
-    .planMissionSequence {
-      margin-bottom: 14px;
-      max-height: 42vh;
-      overflow-y: auto;
-      padding-right: 2px;
-    }
-    .planSeqCard {
-      border-radius: 6px;
-      overflow: hidden;
-      border: 1px solid rgba(70, 76, 92, 0.95);
-      background: rgba(22, 24, 30, 0.98);
-      margin-bottom: 10px;
-    }
-    .planSeqCardHead {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      min-height: 40px;
-      padding: 0 8px 0 6px;
-      background: linear-gradient(180deg, #6a5cb8 0%, #4d5696 100%);
-      color: #f8fafc;
-      font-size: 13px;
-      font-weight: 700;
-      letter-spacing: 0.02em;
-    }
-    .planSeqCardTitle {
-      flex: 1;
-      text-align: center;
-    }
-    .planSeqIconBtn {
-      width: 32px;
-      height: 32px;
-      border: none;
-      border-radius: 6px;
-      background: rgba(255,255,255,0.12);
-      color: #f1f5ff;
-      font-size: 14px;
-      line-height: 1;
-      cursor: pointer;
-      flex-shrink: 0;
-    }
-    .planSeqIconBtn:disabled {
-      opacity: 0.35;
-      cursor: default;
-    }
-    .planSeqIconBtn:not(:disabled):hover {
-      background: rgba(255,255,255,0.22);
-    }
-    .planSeqCardBody {
-      padding: 12px;
-      background: #0c0c0e;
-    }
-    .planSeqCardDesc {
-      font-size: 12px;
-      line-height: 1.45;
-      color: rgba(220, 224, 235, 0.9);
-      margin: 0 0 12px;
-    }
-    #planSeqPatternRow {
-      display: none;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 10px;
-      padding: 11px 12px;
-      border-radius: 6px;
-      background: rgba(36, 38, 48, 0.96);
-      border: 2px solid rgba(80, 86, 102, 0.75);
-      box-sizing: border-box;
-    }
-    #planSeqPatternRow.planSeqPatternRow--visible {
-      display: flex;
-    }
-    #planSeqPatternRow.planSeqPatternRow--focus {
-      border-color: #e11d48;
-      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.35);
-    }
-    .planSeqPatternGlyph {
-      width: 30px;
-      height: 30px;
-      border-radius: 50%;
-      background: rgba(72, 78, 96, 0.95);
-      color: #f9fafb;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 15px;
-      font-weight: 800;
-      flex-shrink: 0;
-    }
-    .planSeqPatternLabel {
-      font-size: 13px;
-      font-weight: 600;
-      color: #f3f4f6;
-    }
-    .planSeqRtlBtn {
-      width: 100%;
-      box-sizing: border-box;
-      min-height: 38px;
-      margin-top: 2px;
-      border-radius: 6px;
-      border: 1px solid rgba(90, 96, 118, 0.85);
-      background: rgba(52, 56, 68, 0.96);
-      color: #e8eaef;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .planSeqRtlBtn:hover {
-      background: rgba(64, 68, 82, 0.98);
-    }
-    /* Empty plan mission style (compact "Mission Start" panel). */
-    #planTabPanelMission.planMissionEmpty .planMissionSequence {
-      margin-bottom: 8px;
-      max-height: none;
-      overflow: visible;
-      padding-right: 0;
-    }
-    #planTabPanelMission.planMissionEmpty .planSeqCard {
-      border: none;
-      background: transparent;
-      margin-bottom: 0;
-    }
-    #planTabPanelMission.planMissionEmpty .planSeqCardHead,
-    #planTabPanelMission.planMissionEmpty .planSeqCardDesc,
-    #planTabPanelMission.planMissionEmpty #planSeqPatternRow,
-    #planTabPanelMission.planMissionEmpty #planSeqRtlBtn {
-      display: none !important;
-    }
-    #planTabPanelMission.planMissionEmpty .planSeqCardBody {
-      padding: 0;
-      background: transparent;
-    }
-    #planTabPanelMission.planMissionEmpty .planFieldLabel {
-      margin-top: 6px;
-      margin-bottom: 4px;
-    }
-    #planTabPanelMission.planMissionEmpty .planRailSelect,
-    #planTabPanelMission.planMissionEmpty .planRailInput {
-      min-height: 30px;
-    }
-    #planSeqCompactList {
-      display: none;
-      margin-top: 0;
-      flex-direction: column;
-      gap: 10px;
-    }
-    #planTabPanelMission.planMissionStack #planSeqCompactList {
-      display: flex;
-      margin-top: 10px;
-    }
-    /* Survey stack uses independent mission tabs. Bodies are toggled by JS. */
-    #planTabPanelMission.planMissionStack .planSeqCardBody,
-    #planTabPanelMission.planMissionStack #planVehicleDetails,
-    #planTabPanelMission.planMissionStack #planLaunchDetails {
-      display: none;
-    }
-    /* Each step: title row + detail stacked; groups are spaced in #planSeqCompactList */
-    .planSeqCompactGroup {
-      display: flex;
-      flex-direction: column;
-      gap: 0;
-      width: 100%;
-    }
-    .planSeqCompactTab {
-      min-height: 34px;
-      border-radius: 6px;
-      border: 1px solid rgba(86, 93, 116, 0.9);
-      background: #4d5170;
-      color: #f5f7ff;
-      display: inline-flex;
-      align-items: center;
-      justify-content: flex-start;
-      gap: 8px;
-      padding: 0 10px;
-      font-size: 14px;
-      font-weight: 600;
-      box-sizing: border-box;
-      width: 100%;
-      cursor: pointer;
-      user-select: none;
-      text-align: left;
-    }
-    .planSeqCompactTab.is-active {
-      background: #616790;
-      border-color: rgba(120, 132, 170, 0.95);
-      box-shadow: 0 0 0 1px rgba(146, 160, 201, 0.24) inset;
-    }
-    .planSeqCompactRow {
-      min-height: 34px;
-      border-radius: 6px;
-      border: 2px solid rgba(225, 29, 72, 0.9);
-      background: rgba(32, 35, 44, 0.9);
-      color: #e8eaef;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 0 10px;
-      font-size: 14px;
-      font-weight: 600;
-      box-sizing: border-box;
-    }
-    .planSeqCompactTakeoffCard {
-      border-radius: 6px;
-      border: 2px solid rgba(225, 29, 72, 0.9);
-      background: rgba(18, 21, 29, 0.9);
-      overflow: hidden;
-      display: none;
-    }
-    .planSeqCompactTakeoffCard.is-active {
-      display: block;
-      width: 100%;
-      box-sizing: border-box;
-      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.32);
-    }
-    .planSeqCompactTakeoffHead {
-      min-height: 34px;
-      border-bottom: 1px solid rgba(99, 108, 136, 0.62);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 0 8px;
-      color: #f5f7ff;
-      font-size: 14px;
-      font-weight: 700;
-      background: #4d5170;
-    }
-    .planSeqCompactTakeoffHeadTitle {
-      flex: 1;
-    }
-    .planSeqCompactHeadBtn {
-      width: 24px;
-      height: 24px;
-      border-radius: 5px;
-      border: none;
-      background: rgba(88, 96, 120, 0.42);
-      color: #f5f7ff;
-      font-size: 13px;
-      font-weight: 700;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 0;
-      cursor: default;
-      opacity: 0.9;
-    }
-    .planSeqCompactTakeoffBody {
-      padding: 10px 10px 8px;
-      color: #ffffff;
-      font-size: 12px;
-      line-height: 1.35;
-      display: none;
-    }
-    .planSeqCompactTakeoffCard.is-active .planSeqCompactTakeoffBody { display: block; }
-    .planSeqCompactTakeoffBody p {
-      margin: 0 0 8px;
-    }
-    .planSeqCompactDoneBtn {
-      width: 100%;
-      min-height: 34px;
-      border-radius: 6px;
-      border: 1px solid rgba(120, 128, 148, 0.65);
-      background: rgba(78, 84, 104, 0.75);
-      color: #f5f7ff;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: default;
-    }
-    .planSeqCompactGlyph {
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: rgba(72, 78, 96, 0.95);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 12px;
-      font-weight: 800;
-      flex: 0 0 auto;
-    }
-    .planSeqCompactRow.is-active {
-      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.32);
-    }
-    .planSeqCompactBody {
-      display: none;
-      margin-top: 0;
-      margin-bottom: 0;
-      border: 2px solid rgba(225, 29, 72, 0.9);
-      border-radius: 6px;
-      background: rgba(18, 21, 29, 0.9);
-      color: #f5f7ff;
-      padding: 8px 10px;
-      font-size: 12px;
-      line-height: 1.35;
-    }
-    .planSeqCompactBody.is-active {
-      display: block;
-    }
-    #planTabPanelMission.planMissionStack #planSeqRtlBtn {
-      display: none !important;
-    }
-    /* Mission Start stack (Takeoff / Survey / RTL): edge-to-edge black band, square corners */
-    #planTabPanelMission.planMissionStack .planSectionBody {
-      padding-left: 0;
-      padding-right: 0;
-      padding-top: 10px;
-      padding-bottom: 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSectionBody {
-      padding-left: 12px;
-      padding-right: 12px;
-      padding-top: 12px;
-      padding-bottom: 12px;
-      gap: 8px;
-    }
-    #planTabPanelMission.planMissionStack .planMissionSequence {
-      display: none !important;
-      margin-bottom: 0 !important;
-    }
-    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planMissionSequence {
-      display: block !important;
-      margin-bottom: 0 !important;
-    }
-    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSeqCard {
-      border: none;
-      background: transparent;
-      margin-bottom: 0;
-    }
-    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSeqCardBody {
-      display: block !important;
-      padding: 0;
-      background: transparent;
-    }
-    #planTabPanelMission.planMissionStack.planMissionDetailsOpen #planVehicleDetails,
-    #planTabPanelMission.planMissionStack.planMissionDetailsOpen #planLaunchDetails {
-      display: block;
-    }
-    #planTabPanelMission.planMissionStack #planMissionSectionHeader {
-      cursor: pointer;
-      user-select: none;
-    }
-    #planTabPanelMission.planMissionStack #planMissionSectionHeader:hover {
-      background: #616790;
-    }
-    #planTabPanelMission.planMissionStack #planStartMissionBtn {
-      display: block !important;
-    }
-    /* Stack tabs already label Takeoff; hide duplicate bar on the detail card */
-    #planTabPanelMission.planMissionStack .planSeqCompactTakeoffHead {
-      display: none !important;
-    }
-    #planTabPanelMission.planMissionStack .planSeqCompactGroup,
-    #planTabPanelMission.planMissionStack .planSeqCompactTab,
-    #planTabPanelMission.planMissionStack .planSeqCompactTakeoffCard,
-    #planTabPanelMission.planMissionStack .planSeqCompactBody,
-    #planTabPanelMission.planMissionStack .planSeqCompactDoneBtn,
-    #planTabPanelMission.planMissionStack .planSeqCompactHeadBtn,
-    #planTabPanelMission.planMissionStack .planSeqCompactRow {
-      border-radius: 0;
-    }
-  </style>
-</head>
-<body>
-  <div id="mapWrap">
-    <div id="map2d"></div>
-    <div id="map3d"></div>
-    <div class="overlay" id="linkBanner">
-      <img id="linkBannerLogo" src="__LOGO_SRC__" alt="Vama logo"/>
-      <div id="linkBannerDisconnected">
-        <span id="linkBannerText">Disconnected - Click to manually connect 💬</span>
-      </div>
-      <div id="linkBannerConnected">
-        <span class="hdrPill"><span class="hdrReadyText" id="hdrReadyText">Ready To Fly</span></span>
-        <span class="hdrSep"></span>
-        <span class="hdrPill"><img class="hdrIcon" src="__ICON_HOLD_SRC__" alt="Hold"/><span id="hdrModeText">Hold</span></span>
-        <span class="hdrSep"></span>
-        <span class="hdrPill" id="hdrVehiclePill"><img class="hdrIcon hdrIconBroadcast" src="__ICON_LINK_SRC__" alt="Vehicle Message"/><span id="hdrVehicleMsg">Vehicle Msg</span></span>
-        <span class="hdrSep"></span>
-        <span class="hdrPill" id="hdrGpsPill">
-          <img id="hdrGpsIcon" class="hdrIcon hdrIconSmall" src="__ICON_GPS_SRC__" alt="GPS"
-               onerror="this.style.display='none'; var e=document.getElementById('hdrGpsEmoji'); if(e) e.style.display='inline';"/>
-          <span id="hdrGpsEmoji" style="display:none; font-weight:700;">GPS</span>
-          <span class="hdrTinyStack" id="hdrGpsStack"><span id="hdrGpsSat">10</span><span id="hdrGpsHdop">0.7</span></span>
-        </span>
-        <span class="hdrSep"></span>
-        <span class="hdrPill" id="hdrBatteryPill">
-          <img id="hdrBatIcon" class="hdrIcon" src="__ICON_BATTERY_SRC__" alt="Battery"
-               onerror="this.style.display='none'; var e=document.getElementById('hdrBatEmoji'); if(e) e.style.display='inline';"/>
-          <span id="hdrBatEmoji" style="display:none; font-weight:700;">BAT</span>
-          <span id="hdrBatteryText">100%</span>
-        </span>
-        <span class="hdrSep"></span>
-        <span class="hdrPill"><img class="hdrIcon" src="__ICON_REMOTE_ID_SRC__" alt="Remote ID"/><span id="hdrRemoteIdText">ID</span></span>
-      </div>
-      <button id="hdrMapModeBtn" type="button">3D</button>
-    </div>
-    <div class="overlay" id="actionRail">
-      <div class="actionBtn" id="actionTakeoff">⬆<div>Takeoff</div></div>
-      <div class="actionBtn" id="actionReturn">↩<div>Return</div></div>
-    </div>
-    <div id="planFlightLayer">
-      <div id="planFlightTopBar">
-        <span id="planExit">&lt; Exit Plan</span>
-        <button id="planBarUpload" type="button" disabled>Upload</button>
-        <div class="pfGroup">
-          <span class="pfLabel">Selected Waypoint</span>
-          <span class="pfMetric">Alt diff: <b id="pfAltDiff">0.0 ft</b></span>
-          <span class="pfMetric">Gradient: <b id="pfGradient">-.-</b></span>
-        </div>
-        <div class="pfGroup">
-          <span class="pfLabel">&nbsp;</span>
-          <span class="pfMetric">Azimuth: <b id="pfAzimuth">0</b></span>
-          <span class="pfMetric">Heading: <b id="pfHeading">nan</b></span>
-        </div>
-        <div class="pfGroup">
-          <span class="pfLabel">&nbsp;</span>
-          <span class="pfMetric">Dist prev WP: <b id="pfDistPrevWp">0.0 ft</b></span>
-          <span class="pfMetric pfMetricGhost">Heading: <b>nan</b></span>
-        </div>
-        <span class="pfSpacer"></span>
-        <div class="pfGroup">
-          <span class="pfLabel">Total Mission</span>
-          <span class="pfMetric">Distance: <b id="pfMissionDistance">0 ft</b></span>
-          <span class="pfMetric">Time: <b id="pfMissionTime">00:00:00</b></span>
-        </div>
-        <div class="pfGroup">
-          <span class="pfLabel">&nbsp;</span>
-          <span class="pfMetric">Max telem dist: <b id="pfMaxTelemDist">0 ft</b></span>
-          <span class="pfMetric pfMetricGhost">Time: <b>00:00:00</b></span>
-        </div>
-      </div>
-      <div id="planWorkspace">
-        <div id="planFlightToolRail">
-          <div class="planToolBtn active" data-tool="File"><span class="planToolIcon">↻</span><span>File</span></div>
-          <div class="planToolBtn" data-tool="Takeoff"><span class="planToolIcon">↑</span><span>Takeoff</span></div>
-          <div class="planToolBtn" data-tool="Waypoint"><span class="planToolIcon">⊕</span><span>Waypoint</span></div>
-          <div class="planToolBtn" data-tool="ROI"><span class="planToolIcon">⊙</span><span>ROI</span></div>
-          <div class="planToolBtn" data-tool="Pattern"><span class="planToolIcon">▦</span><span>Pattern</span></div>
-          <div class="planToolBtn" data-tool="Return"><span class="planToolIcon">↩</span><span>Return</span></div>
-          <div class="planToolBtn" data-tool="Center"><span class="planToolIcon">✦</span><span>Center</span></div>
-        </div>
-        <div id="planCenterPanel">
-          <div id="planFileFlyout">
-            <div class="planFileSection">
-              <div class="planFileSectionTitle">Create Plan</div>
-              <div class="planFileCardGrid">
-                <div class="planTplCard" id="planTplEmpty" role="button" tabindex="0">
-                  <div class="planTplPrev">
-                    <img class="planTplPrevImg" src="__PLAN_TPL_EMPTY_SRC__" alt="" onerror="this.style.display='none'"/>
-                  </div>
-                  <div class="planTplLabel">Empty Plan</div>
-                </div>
-                <div class="planTplCard" id="planTplSurvey" role="button" tabindex="0">
-                  <div class="planTplPrev">
-                    <img class="planTplPrevImg" src="__PLAN_TPL_SURVEY_SRC__" alt="" onerror="this.style.display='none'"/>
-                  </div>
-                  <div class="planTplLabel">Survey</div>
-                </div>
-                <div class="planTplCard" id="planTplCorridor" role="button" tabindex="0">
-                  <div class="planTplPrev">
-                    <img class="planTplPrevImg" src="__PLAN_TPL_CORRIDOR_SRC__" alt="" onerror="this.style.display='none'"/>
-                  </div>
-                  <div class="planTplLabel">Corridor Scan</div>
-                </div>
-                <div class="planTplCard" id="planTplStructure" role="button" tabindex="0">
-                  <div class="planTplPrev">
-                    <img class="planTplPrevImg" src="__PLAN_TPL_STRUCTURE_SRC__" alt="" onerror="this.style.display='none'"/>
-                  </div>
-                  <div class="planTplLabel">Structure Scan</div>
-                </div>
-              </div>
-            </div>
-            <div class="planFileSection">
-              <div class="planFileSectionTitle">Storage</div>
-              <div class="planFileBtnRow">
-                <button type="button" class="planFileBtn planFileBtnPrimary" id="planStorageOpen">Open...</button>
-                <button type="button" class="planFileBtn" id="planStorageSave" disabled>Save</button>
-                <button type="button" class="planFileBtn" id="planStorageSaveAs" disabled>Save As...</button>
-              </div>
-              <button type="button" class="planFileBtn planFileBtnWide" id="planStorageKml" disabled>Save Mission Waypoints As KML...</button>
-            </div>
-            <div class="planFileSection">
-              <div class="planFileSectionTitle">Vehicle</div>
-              <div class="planFileBtnRow">
-                <button type="button" class="planFileBtn" id="planVehicleUpload" disabled>Upload</button>
-                <button type="button" class="planFileBtn planFileBtnSecondary" id="planVehicleDownload">Download</button>
-                <button type="button" class="planFileBtn planFileBtnSecondary" id="planVehicleClear">Clear</button>
-              </div>
-            </div>
-          </div>
-          <div id="planOtherToolPanel" style="display:none">
-            <div id="planOtherToolHint">Select a tool from the rail.</div>
-          </div>
-        </div>
-        <div id="planRightPanel">
-          <div id="planTabs" role="tablist" aria-label="Plan configuration">
-            <button class="planTab active" type="button" role="tab" id="planTabBtnMission"
-              aria-selected="true" aria-controls="planTabPanelMission" tabindex="0" data-plan-tab="mission">Mission</button>
-            <button class="planTab" type="button" role="tab" id="planTabBtnFence"
-              aria-selected="false" aria-controls="planTabPanelFence" tabindex="-1" data-plan-tab="fence">Fence</button>
-            <button class="planTab" type="button" role="tab" id="planTabBtnRally"
-              aria-selected="false" aria-controls="planTabPanelRally" tabindex="-1" data-plan-tab="rally">Rally</button>
-          </div>
-          <div id="planTabPanelMission" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnMission">
-            <div id="planSection">
-              <div class="planSectionHeader" id="planMissionSectionHeader" role="button" tabindex="0" aria-label="Mission Start">Mission</div>
-              <div class="planSectionBody">
-                <div class="planMissionSequence">
-                  <div class="planSeqCard planSeqCard--takeoff">
-                    <div class="planSeqCardHead">
-                      <button type="button" class="planSeqIconBtn" id="planSeqTakeoffTrash" disabled title="Remove (not available)">🗑</button>
-                      <span class="planSeqCardTitle">Takeoff</span>
-                      <button type="button" class="planSeqIconBtn" id="planSeqTakeoffMenu" disabled title="Options">☰</button>
-                    </div>
-                    <div class="planSeqCardBody">
-                      <p class="planSeqCardDesc">Take off from the ground and ascend to specified altitude.</p>
-                      <div class="planFieldLabel">All Altitudes</div>
-                      <select id="planAltReferenceSelect" class="planRailSelect" aria-label="Altitude reference">
-                        <option value="rel" selected>Altitude Relative To Launch</option>
-                        <option value="amsl">AMSL</option>
-                        <option value="agl">AGL</option>
-                      </select>
-                      <div class="planFieldLabel">Initial Waypoint Alt</div>
-                      <div class="planRailInput">
-                        <input id="planInitialWpAltInput" type="text" value="164.0" inputmode="decimal" autocomplete="off" />
-                        <span class="planRailUnit">ft</span>
-                      </div>
-                    </div>
-                  </div>
-                  <div id="planSeqPatternRow" class="planSeqPatternRow" role="group" aria-label="Pattern template">
-                    <span class="planSeqPatternGlyph" aria-hidden="true">?</span>
-                    <span id="planSeqPatternLabel" class="planSeqPatternLabel">Survey</span>
-                  </div>
-                  <button type="button" id="planSeqRtlBtn" class="planSeqRtlBtn">Return To Launch</button>
-                </div>
-                <button id="planStartMissionBtn" type="button">Start Mission</button>
-                <div id="planWpDetails" class="planWpDetails" style="display:none">
-                  <div class="planWpDetailsTitle">Waypoints &amp; start</div>
-                  <div id="planWpDetailsList"></div>
-                </div>
-                <details class="planRailDetails" id="planVehicleDetails">
-                  <summary>Vehicle Info <span class="planRailChev">▼</span></summary>
-                  <div class="planRailDetailsInner">
-                    <div class="planKvRow"><span>Firmware</span><b id="planVehicleFirmwareVal">ArduPilot</b></div>
-                    <div class="planKvRow"><span>Vehicle</span><b id="planVehicleTypeVal">Quadrotor</b></div>
-                    <p class="planNoteMission">The following speed values are used to calculate total mission time. They do not affect the flight speed for the mission.</p>
-                    <div class="planFieldLabel">Hover speed</div>
-                    <div class="planRailInput">
-                      <input id="planHoverSpeedInput" type="text" value="11.18" inputmode="decimal" autocomplete="off" />
-                      <span class="planRailUnit">mph</span>
-                    </div>
-                  </div>
-                </details>
-                <details class="planRailDetails" id="planLaunchDetails">
-                  <summary>Launch Position <span class="planRailChev">▼</span></summary>
-                  <div class="planRailDetailsInner">
-                    <div class="planFieldLabel">Altitude</div>
-                    <div class="planRailInput">
-                      <input id="planLaunchAltInput" type="text" value="0.0" inputmode="decimal" autocomplete="off" />
-                      <span class="planRailUnit">ft</span>
-                    </div>
-                    <p class="planHelpMuted">Actual position set by vehicle at flight time.</p>
-                    <div class="planKvRow"><span>Lat</span><b id="planLaunchLatVal">—</b></div>
-                    <div class="planKvRow"><span>Lon</span><b id="planLaunchLonVal">—</b></div>
-                    <button id="planSetLaunchMapCenterBtn" type="button">Set To Map Center</button>
-                  </div>
-                </details>
-              </div>
-            </div>
-            <div id="planSeqCompactList" aria-hidden="true" role="group" aria-label="Mission sequence steps">
-                  <div class="planSeqCompactGroup">
-                    <div class="planSeqCompactTab" id="planSeqCompactTakeoffTab" data-stack-tab="takeoff" role="tab" tabindex="0">
-                      <span class="planSeqCompactGlyph">?</span>
-                      <span>Takeoff</span>
-                    </div>
-                    <div class="planSeqCompactTakeoffCard" id="planSeqCompactTakeoffCard">
-                      <div class="planSeqCompactTakeoffHead">
-                        <span class="planSeqCompactGlyph">?</span>
-                        <span class="planSeqCompactHeadBtn" aria-hidden="true">🗑</span>
-                        <span class="planSeqCompactTakeoffHeadTitle">Takeoff</span>
-                        <span class="planSeqCompactHeadBtn" aria-hidden="true">☰</span>
-                      </div>
-                      <div class="planSeqCompactTakeoffBody">
-                        <p>Take off from the ground and ascend to specified altitude.</p>
-                        <p>Move “T” Takeoff to the climbout location.</p>
-                        <p>Ensure clear of obstacles and into the wind.</p>
-                        <button type="button" class="planSeqCompactDoneBtn" disabled>Done</button>
-                      </div>
-                    </div>
-                  </div>
-                  <div class="planSeqCompactGroup">
-                    <div class="planSeqCompactTab" id="planSeqCompactSurveyTab" data-stack-tab="survey" role="tab" tabindex="0">
-                      <span class="planSeqCompactGlyph">?</span>
-                      <span id="planSeqCompactSurveyLabel">Survey</span>
-                    </div>
-                    <div class="planSeqCompactBody" id="planSeqCompactSurveyBody">Survey pattern selected.</div>
-                  </div>
-                  <div class="planSeqCompactGroup">
-                    <div class="planSeqCompactTab" id="planSeqCompactRtlTab" data-stack-tab="rtl" role="tab" tabindex="0">Return To Launch</div>
-                    <div class="planSeqCompactBody" id="planSeqCompactRtlBody">Return leg will be appended after mission actions.</div>
-                  </div>
-            </div>
-          </div>
-          <div id="planTabPanelFence" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnFence" hidden>
-            <div class="planSectionHeader">GeoFence</div>
-            <div class="planSectionBody planSectionBody--fence">
-              <p class="planGeoLead">GeoFencing allows you to set a virtual fence around the area you want to fly in.</p>
-              <p class="planTabHint" style="margin-bottom:14px;">Draw a polygon with <b>Polygon Fence</b>, then use <b>Upload fence</b> on the dashboard to send it to the vehicle.</p>
-              <div class="planGeoBlock">
-                <div class="planGeoTitle">Insert GeoFence</div>
-                <div class="planGeoBtnStack">
-                  <button type="button" class="planGeoBtn" id="planFenceRoiBtn">Polygon Fence</button>
-                  <button type="button" class="planGeoBtn" id="planFenceCircularBtn" disabled title="Not available in this build">Circular Fence</button>
-                </div>
-              </div>
-              <div class="planGeoBlock">
-                <div class="planGeoTitle">Polygon Fences</div>
-                <div class="planGeoStatus" id="planGeoPolyStatus">None</div>
-              </div>
-              <div class="planGeoBlock">
-                <div class="planGeoTitle">Circular Fences</div>
-                <div class="planGeoStatus" id="planGeoCircleStatus">None</div>
-              </div>
-              <div class="planGeoBlock">
-                <div class="planGeoTitle">Breach Return Point</div>
-                <button type="button" class="planGeoBtn" id="planBreachReturnBtn" disabled title="Not available in this build">Add Breach Return Point</button>
-              </div>
-            </div>
-          </div>
-          <div id="planTabPanelRally" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnRally" hidden>
-            <div class="planSectionHeader">Rally Points</div>
-            <div class="planSectionBody planSectionBody--fence" style="padding:12px;">
-              <div class="planRallyInfo">Rally Points provide alternate landing points when performing a Return to Launch (RTL). Rally editing is not implemented in M2.</div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div class="overlay" id="cameraRail">
-      <div id="cameraTopRow">
-        <div class="camSmallBtn active" id="camVideoBtn" title="Video mode">
-          <svg class="camIcon" viewBox="0 0 24 24" aria-hidden="true">
-            <rect x="3" y="7" width="12" height="10" rx="2" fill="currentColor"></rect>
-            <polygon points="16,10 21,8 21,16 16,14" fill="currentColor"></polygon>
-          </svg>
-        </div>
-        <div class="camSmallBtn" id="camPhotoBtn" title="Take photo">
-          <svg class="camIcon" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M8 6h8l1.2 2H20a2 2 0 0 1 2 2v7a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3v-7a2 2 0 0 1 2-2h2.8L8 6z" fill="currentColor"></path>
-            <circle cx="12" cy="13.5" r="3.2" fill="rgba(39,47,61,0.95)"></circle>
-          </svg>
-        </div>
-        <div class="camSmallBtn" id="camSplitBtn" title="Split view (1/4)">
-          <span class="camLabel">▦</span>
-        </div>
-        <div class="camSmallBtn" id="camFollowBtn" title="Follow vehicle (center map)">
-          <span class="camLabel">◎</span>
-        </div>
-      </div>
-      <div id="camRecordBtn" title="Start/Stop recording"><div id="camRecordDot"></div></div>
-      <div id="camTimer">00:00:00</div>
-      <div class="camSectionLabel">Zoom</div>
-      <div id="camZoomRow">
-        <div class="camSmallBtn" id="camZoomOutBtn" title="Zoom out"><span class="camLabel">−</span></div>
-        <div class="camSmallBtn" id="camZoomInBtn" title="Zoom in"><span class="camLabel">+</span></div>
-      </div>
-      <div class="camSectionLabel">Focus</div>
-      <div id="camFocusRow">
-        <div class="camSmallBtn" id="camFocusOutBtn" title="Focus out"><span class="camLabel">F−</span></div>
-        <div class="camSmallBtn" id="camFocusInBtn" title="Focus in"><span class="camLabel">F+</span></div>
-      </div>
-      <div class="camSectionLabel">Gimbal</div>
-      <div id="camGimbalRow">
-        <div class="camGimbalSpacer"></div>
-        <div class="camSmallBtn" id="camGimbalUpBtn" title="Gimbal up"><span class="camLabel">↑</span></div>
-        <div class="camGimbalSpacer"></div>
-        <div class="camSmallBtn" id="camGimbalLeftBtn" title="Gimbal left"><span class="camLabel">←</span></div>
-        <div class="camSmallBtn" id="camGimbalDownBtn" title="Gimbal down"><span class="camLabel">↓</span></div>
-        <div class="camSmallBtn" id="camGimbalRightBtn" title="Gimbal right"><span class="camLabel">→</span></div>
-      </div>
-      <div class="camSectionLabel">OBSERVE</div>
-      <div id="camObserveRow1">
-        <div class="camSmallBtn" id="camObsMarkBtn" title="Target marking mode"><span class="camLabel">Target</span></div>
-        <div class="camSmallBtn" id="camObsClipBtn" title="Capture short video clip"><span class="camLabel">Clip</span></div>
-      </div>
-      <div id="camObserveRow2">
-        <div class="camSmallBtn" id="camObsExportBtn" title="Export observation report"><span class="camLabel">Report</span></div>
-        <div class="camSmallBtn" id="camObsClearBtn" title="Clear observed targets"><span class="camLabel">Reset</span></div>
-      </div>
-      <div class="camSmallBtn" id="camSettingsBtn" title="Camera settings"><span class="camLabel">⚙</span></div>
-    </div>
-    <div class="overlay" id="videoPreview">
-      <img id="videoPreviewImg" alt="Video preview" />
-      <div id="videoPreviewGrid" aria-hidden="true">
-        <img class="videoGridImg" id="videoGridImg1" alt="Video preview 1" />
-        <img class="videoGridImg" id="videoGridImg2" alt="Video preview 2" />
-        <img class="videoGridImg" id="videoGridImg3" alt="Video preview 3" />
-        <img class="videoGridImg" id="videoGridImg4" alt="Video preview 4" />
-      </div>
-      <div id="aiOverlaySingle" aria-hidden="true"></div>
-      <div id="aiOverlayGrid" aria-hidden="true">
-        <div class="aiGridCell" id="aiGrid1"></div>
-        <div class="aiGridCell" id="aiGrid2"></div>
-        <div class="aiGridCell" id="aiGrid3"></div>
-        <div class="aiGridCell" id="aiGrid4"></div>
-      </div>
-      <div id="videoPreviewPlaceholder">Video</div>
-    </div>
-    <div id="mapFooterHud" aria-hidden="false">
-      <div id="telemetryLeftStack" aria-hidden="true">
-        <div id="telemetryStrip">
-          <div class="telStackItem"><span class="telemetryIcon">↕</span><span class="telRow1Alt">0.0 ft</span></div>
-          <div class="telStackItem"><span class="telemetryIcon">↑</span><span class="telRow1Mph">0.0 mph</span></div>
-          <div class="telStackItem"><span class="telemetryIcon">⏱</span><span class="telRow1Time">00:00:00</span></div>
-          <div class="telStackItem"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span class="telRow2Msl">0.0 ft</span></div>
-          <div class="telStackItem"><span class="telemetryIcon">→</span><span class="telRow2Mph">0.0 mph</span></div>
-          <div class="telStackItem"><span class="telemetryIcon">↳</span><span class="telRow2Alt">0.0 ft</span></div>
-        </div>
-      </div>
-      <div id="compassHud">
-        <div id="compass">
-          <div id="compassInner">
-            <span class="compassCard" id="cN">N</span><span class="compassCard" id="cE">E</span><span class="compassCard" id="cS">S</span><span class="compassCard" id="cW">W</span>
-            <div id="compassDeg">0°</div>
-            <div id="needle"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" onerror="document.title='VGCS_ASSET_ERROR:leaflet_js:'+Date.now()"></script>
-  <script src="https://unpkg.com/cesium@1.125/Build/Cesium/Cesium.js" onerror="document.title='VGCS_ASSET_ERROR:cesium_js:'+Date.now()"></script>
-  <script>
-    // Fail fast with a clear signal if core assets are blocked/unreachable.
-    setTimeout(() => {
-      try {
-        if (typeof L === 'undefined') {
-          document.title = 'VGCS_ASSET_ERROR:leaflet_missing:' + Date.now();
-        }
-        if (typeof Cesium === 'undefined') {
-          // 3D is optional; this just lets Python disable the toggle on restricted clients.
-          document.title = 'VGCS_ASSET_ERROR:cesium_missing:' + Date.now();
-        }
-      } catch (e) {}
-    }, 2500);
-
-    /* preferCanvas false: tile/img renderer composites more reliably with plan HTML overlays in Qt WebEngine. */
-    if (typeof L === 'undefined') {
-      document.title = 'VGCS_ASSET_ERROR:leaflet_missing:' + Date.now();
-      throw new Error('Leaflet missing');
-    }
-    const map = L.map('map2d', {
-      zoomControl: false,
-      preferCanvas: false,
-      // Qt WebEngine: disabling these animations significantly improves pan smoothness.
-      fadeAnimation: false,
-      zoomAnimation: false,
-      markerZoomAnimation: false,
-    }).setView([24.7136, 46.6753], 10);
-    L.control.zoom({ position: 'bottomleft' }).addTo(map);
-    const linkBanner = document.getElementById('linkBanner');
-    const linkBannerLogo = document.getElementById('linkBannerLogo');
-    if (linkBannerLogo && linkBannerLogo.getAttribute('src')) {
-      linkBannerLogo.style.display = 'block';
-    }
-    // If header icon assets are missing (src empty), force deterministic text fallbacks.
-    function ensureIconFallback(imgId, fallbackId) {
-      try {
-        const img = document.getElementById(imgId);
-        const fb = document.getElementById(fallbackId);
-        if (!img || !fb) return 0;
-        const src = String(img.getAttribute('src') || '').trim();
-        if (!src) {
-          img.style.display = 'none';
-          fb.style.display = 'inline';
-          return 1;
-        }
-      } catch (e) {}
-      return 0;
-    }
-    ensureIconFallback('hdrGpsIcon', 'hdrGpsEmoji');
-    ensureIconFallback('hdrBatIcon', 'hdrBatEmoji');
-    try { console.log('[diag] map boot: baseUrl=' + String(document.baseURI || '')); } catch(e) {}
-    if (linkBanner) {
-      linkBanner.style.cursor = 'pointer';
-      linkBanner.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const target = ev.target;
-        if (target && target.id === 'linkBannerLogo') {
-          document.title = 'VGCS_MENU_REQUEST:' + ev.clientX + ':' + ev.clientY + ':' + Date.now();
-        } else {
-          document.title = 'VGCS_CONNECT_REQUEST:' + Date.now();
-        }
-      });
-    }
-    const actionTakeoff = document.getElementById('actionTakeoff');
-    if (actionTakeoff) {
-      actionTakeoff.classList.add('disabled');
-      actionTakeoff.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_TAKEOFF_REQUEST:' + Date.now();
-      });
-    }
-    const actionReturn = document.getElementById('actionReturn');
-    if (actionReturn) {
-      actionReturn.classList.add('disabled');
-      actionReturn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_RETURN_REQUEST:' + Date.now();
-      });
-    }
-    const planLayer = document.getElementById('planFlightLayer');
-    const planStartMissionBtn = document.getElementById('planStartMissionBtn');
-    const planMissionSectionHeader = document.getElementById('planMissionSectionHeader');
-    const hdrMapModeBtn = document.getElementById('hdrMapModeBtn');
-    const planExit = document.getElementById('planExit');
-    if (planExit) {
-      planExit.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        setPlanFlightVisible(false);
-        document.title = 'VGCS_PLAN_EXIT:' + Date.now();
-      });
-    }
-    // These must be initialized before any panel binding runs (TDZ-safe).
-    let vehicleMarker = null;
-    let waypoints = [];
-    bindPlanFlyoutActions();
-    bindPlanRightTabs();
-    bindPlanMissionPanel();
-    bindPlanStackTabs();
-    setPlanSequenceTemplate('');
-    setPlanFlightChromeState(false, 0);
-    if (planLayer) {
-      for (const btn of planLayer.querySelectorAll('.planToolBtn')) {
-        btn.addEventListener('click', function() {
-          const tool = btn.getAttribute('data-tool') || '';
-          setPlanRailTool(tool);
-          document.title = 'VGCS_PLAN_TOOL_REQUEST:' + tool + ':' + Date.now();
-        });
-      }
-    }
-    if (planStartMissionBtn) {
-      planStartMissionBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_MISSION_START_REQUEST:' + Date.now();
-      });
-    }
-    if (planMissionSectionHeader) {
-      const onMissionHeaderStart = function(ev) {
-        if (!window.__planMissionStartStack) return;
-        ev.preventDefault();
-        ev.stopPropagation();
-        openMissionStartDetails();
-      };
-      planMissionSectionHeader.addEventListener('click', onMissionHeaderStart);
-      planMissionSectionHeader.addEventListener('keydown', function(ev) {
-        if (ev.key === 'Enter' || ev.key === ' ') onMissionHeaderStart(ev);
-      });
-    }
-    const planSeqRtlBtn = document.getElementById('planSeqRtlBtn');
-    if (planSeqRtlBtn) {
-      planSeqRtlBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_RETURN_REQUEST:' + Date.now();
-      });
-    }
-    const planSetLaunchMapCenterBtn = document.getElementById('planSetLaunchMapCenterBtn');
-    if (planSetLaunchMapCenterBtn) {
-      planSetLaunchMapCenterBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        if (!map) return;
-        const c = map.getCenter();
-        const latEl = document.getElementById('planLaunchLatVal');
-        const lonEl = document.getElementById('planLaunchLonVal');
-        if (latEl) latEl.textContent = c.lat.toFixed(7);
-        if (lonEl) lonEl.textContent = c.lng.toFixed(7);
-        schedulePlanMissionPanelEmit();
-        updateLaunchMarkerFromPanel();
-      });
-    }
-    if (hdrMapModeBtn) {
-      hdrMapModeBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_TOGGLE_3D_REQUEST:' + Date.now();
-      });
-    }
-    const cameraRail = document.getElementById('cameraRail');
-    const mapWrap = document.getElementById('mapWrap');
-    const camVideoBtn = document.getElementById('camVideoBtn');
-    const camPhotoBtn = document.getElementById('camPhotoBtn');
-    const camSplitBtn = document.getElementById('camSplitBtn');
-    const camFollowBtn = document.getElementById('camFollowBtn');
-    const camZoomOutBtn = document.getElementById('camZoomOutBtn');
-    const camZoomInBtn = document.getElementById('camZoomInBtn');
-    const camRecordBtn = document.getElementById('camRecordBtn');
-    const camSettingsBtn = document.getElementById('camSettingsBtn');
-    const camTimer = document.getElementById('camTimer');
-    const camFocusOutBtn = document.getElementById('camFocusOutBtn');
-    const camFocusInBtn = document.getElementById('camFocusInBtn');
-    const camGimbalUpBtn = document.getElementById('camGimbalUpBtn');
-    const camGimbalDownBtn = document.getElementById('camGimbalDownBtn');
-    const camGimbalLeftBtn = document.getElementById('camGimbalLeftBtn');
-    const camGimbalRightBtn = document.getElementById('camGimbalRightBtn');
-    const camObsMarkBtn = document.getElementById('camObsMarkBtn');
-    const camObsClipBtn = document.getElementById('camObsClipBtn');
-    const camObsExportBtn = document.getElementById('camObsExportBtn');
-    const camObsClearBtn = document.getElementById('camObsClearBtn');
-    const videoPreview = document.getElementById('videoPreview');
-    const videoPreviewImg = document.getElementById('videoPreviewImg');
-    const videoPreviewGrid = document.getElementById('videoPreviewGrid');
-    const videoGridImg1 = document.getElementById('videoGridImg1');
-    const videoGridImg2 = document.getElementById('videoGridImg2');
-    const videoGridImg3 = document.getElementById('videoGridImg3');
-    const videoGridImg4 = document.getElementById('videoGridImg4');
-    const videoPreviewPlaceholder = document.getElementById('videoPreviewPlaceholder');
-    const aiOverlaySingle = document.getElementById('aiOverlaySingle');
-    const aiOverlayGrid = document.getElementById('aiOverlayGrid');
-    const aiGrid1 = document.getElementById('aiGrid1');
-    const aiGrid2 = document.getElementById('aiGrid2');
-    const aiGrid3 = document.getElementById('aiGrid3');
-    const aiGrid4 = document.getElementById('aiGrid4');
-    let camTimerId = null;
-    let camRecordStartedAt = 0;
-    let __camSplitEnabled = false;
-    let __videoSwapped = false;
-    let __obsMarkMode = false;
-    let __obsMarkers = [];
-    let __obsVideoMarkers = [];
-    function formatRecordTime(seconds) {
-      const s = Math.max(0, Number(seconds) || 0);
-      const hh = String(Math.floor(s / 3600)).padStart(2, '0');
-      const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
-      const ss = String(Math.floor(s % 60)).padStart(2, '0');
-      return `${hh}:${mm}:${ss}`;
-    }
-    function resetCameraTimer() {
-      if (camTimerId) {
-        clearInterval(camTimerId);
-        camTimerId = null;
-      }
-      camRecordStartedAt = 0;
-      if (camRecordBtn) camRecordBtn.classList.remove('recording');
-      if (camTimer) camTimer.textContent = '00:00:00';
-    }
-    let __cameraChromeLinkOk = false;
-    function syncCameraChromeVisibility() {
-      if (!cameraRail) return 0;
-      const inPlan = isPlanFlightLayerVisible();
-      const show = __cameraChromeLinkOk && !inPlan;
-      cameraRail.style.display = show ? 'flex' : 'none';
-      if (videoPreview) videoPreview.style.display = show ? 'block' : 'none';
-      if (!show) resetCameraTimer();
-      return 1;
-    }
-    function setCameraControlsVisible(enabled) {
-      __cameraChromeLinkOk = !!enabled;
-      return syncCameraChromeVisibility();
-    }
-    function setNativeVideoOverlayMode(enabled) {
-      const on = !!enabled;
-      if (videoPreview) {
-        if (on) {
-          videoPreview.style.display = 'none';
-        } else {
-          syncCameraChromeVisibility();
-        }
-      }
-      return on ? 1 : 0;
-    }
-    function setNativeHudMode(enabled) {
-      const on = !!enabled;
-      try {
-        if (cameraRail) cameraRail.style.display = on ? 'none' : '';
-        const compassHud = document.getElementById('compassHud');
-        if (compassHud) compassHud.style.display = on ? 'none' : '';
-        const mapFooterHud = document.getElementById('mapFooterHud');
-        if (mapFooterHud) mapFooterHud.style.display = on ? 'none' : '';
-      } catch (e) {}
-      return on ? 1 : 0;
-    }
-    function setVideoPreviewImage(dataUrl) {
-      if (!videoPreviewImg || !videoPreviewPlaceholder) return 0;
-      const src = String(dataUrl || '').trim();
-      if (!src) {
-        videoPreviewImg.removeAttribute('src');
-        videoPreviewPlaceholder.style.display = 'flex';
-        return 1;
-      }
-      videoPreviewImg.src = src;
-      videoPreviewPlaceholder.style.display = 'none';
-      return 1;
-    }
-    function setVideoPreviewMode(mode) {
-      const m = String(mode || 'single').toLowerCase();
-      const grid = m === 'grid';
-      if (videoPreviewGrid) videoPreviewGrid.style.display = grid ? 'grid' : 'none';
-      if (videoPreviewImg) videoPreviewImg.style.display = grid ? 'none' : 'block';
-      if (aiOverlaySingle) aiOverlaySingle.style.display = grid ? 'none' : 'block';
-      if (aiOverlayGrid) aiOverlayGrid.style.display = grid ? 'grid' : 'none';
-      return 1;
-    }
-    function setVideoSwapMode(enabled) {
-      __videoSwapped = !!enabled;
-      if (mapWrap) mapWrap.classList.toggle('video-swapped', __videoSwapped);
-      // Leaflet/Cesium need a resize tick after container geometry changes.
-      setTimeout(function() {
-        try { if (map) map.invalidateSize(); } catch (e) {}
-        try { if (viewer3d && viewer3d.resize) viewer3d.resize(); } catch (e) {}
-      }, 40);
-      return __videoSwapped ? 1 : 0;
-    }
-    function setObservationMarkMode(enabled) {
-      __obsMarkMode = !!enabled;
-      if (camObsMarkBtn) camObsMarkBtn.classList.toggle('active', __obsMarkMode);
-      if (videoPreview) {
-        videoPreview.style.outline = __obsMarkMode ? '2px solid rgba(255,215,0,0.95)' : 'none';
-      }
-      return __obsMarkMode ? 1 : 0;
-    }
-    function clearObservationMarks() {
-      try {
-        for (const m of __obsMarkers) {
-          try { if (m && map && map.hasLayer(m)) map.removeLayer(m); } catch (e) {}
-        }
-      } catch (e) {}
-      __obsMarkers = [];
-      try {
-        for (const m of __obsVideoMarkers) {
-          try { if (m && m.parentNode) m.parentNode.removeChild(m); } catch (e) {}
-        }
-      } catch (e) {}
-      __obsVideoMarkers = [];
-      return 1;
-    }
-    function addObservationMapMarker(lat, lon) {
-      try {
-        const m = L.circleMarker([lat, lon], {
-          radius: 6,
-          color: '#ffd84d',
-          weight: 2,
-          fillColor: '#ff4729',
-          fillOpacity: 0.85
-        }).addTo(map);
-        __obsMarkers.push(m);
-      } catch (e) {}
-      return 1;
-    }
-    function addObservationVideoMarker(xNorm, yNorm) {
-      if (!videoPreview) return 0;
-      try {
-        const host = aiOverlaySingle || videoPreview;
-        const dot = document.createElement('div');
-        dot.style.position = 'absolute';
-        dot.style.left = (Math.max(0, Math.min(1, xNorm)) * 100).toFixed(2) + '%';
-        dot.style.top = (Math.max(0, Math.min(1, yNorm)) * 100).toFixed(2) + '%';
-        dot.style.width = '12px';
-        dot.style.height = '12px';
-        dot.style.marginLeft = '-6px';
-        dot.style.marginTop = '-6px';
-        dot.style.borderRadius = '50%';
-        dot.style.border = '2px solid #ffd84d';
-        dot.style.background = 'rgba(255,71,41,0.95)';
-        dot.style.pointerEvents = 'none';
-        dot.style.zIndex = '5';
-        host.appendChild(dot);
-        __obsVideoMarkers.push(dot);
-      } catch (e) {}
-      return 1;
-    }
-    function setVideoPreviewGrid(images) {
-      if (!videoPreviewGrid) return 0;
-      setVideoPreviewMode('grid');
-      const arr = Array.isArray(images) ? images : [];
-      const els = [videoGridImg1, videoGridImg2, videoGridImg3, videoGridImg4];
-      for (let i = 0; i < els.length; i++) {
-        const el = els[i];
-        if (!el) continue;
-        const src = String(arr[i] || '').trim();
-        if (!src) {
-          el.removeAttribute('src');
-        } else {
-          el.src = src;
-        }
-      }
-      if (videoPreviewPlaceholder) {
-        const any = els.some((el, i) => el && String(arr[i] || '').trim());
-        videoPreviewPlaceholder.style.display = any ? 'none' : 'flex';
-      }
-      return 1;
-    }
-
-    function clearVideoPreviewGrid() {
-      const els = [videoGridImg1, videoGridImg2, videoGridImg3, videoGridImg4];
-      for (const el of els) {
-        if (!el) continue;
-        try { el.removeAttribute('src'); } catch (e) {}
-        try { el.setAttribute('data-label', ''); } catch (e) {}
-      }
-      return 1;
-    }
-
-    function clearAiOverlays() {
-      try { if (aiOverlaySingle) aiOverlaySingle.innerHTML = ''; } catch (e) {}
-      for (const cell of [aiGrid1, aiGrid2, aiGrid3, aiGrid4]) {
-        try { if (cell) cell.innerHTML = ''; } catch (e) {}
-      }
-      return 1;
-    }
-
-    function _renderAiBoxes(container, dets) {
-      if (!container) return 0;
-      container.innerHTML = '';
-      const arr = Array.isArray(dets) ? dets : [];
-      for (const d of arr) {
-        const x = Math.max(0, Math.min(1, Number(d && d.x) || 0));
-        const y = Math.max(0, Math.min(1, Number(d && d.y) || 0));
-        const w = Math.max(0, Math.min(1, Number(d && d.w) || 0));
-        const h = Math.max(0, Math.min(1, Number(d && d.h) || 0));
-        const label = String((d && d.label) || '').trim();
-        const score = Number(d && d.score);
-        const box = document.createElement('div');
-        box.className = 'aiBox';
-        box.style.left = (x * 100).toFixed(3) + '%';
-        box.style.top = (y * 100).toFixed(3) + '%';
-        box.style.width = (w * 100).toFixed(3) + '%';
-        box.style.height = (h * 100).toFixed(3) + '%';
-        if (label || Number.isFinite(score)) {
-          const lab = document.createElement('div');
-          lab.className = 'aiBoxLabel';
-          const s = Number.isFinite(score) ? ` ${(score * 100).toFixed(0)}%` : '';
-          lab.textContent = (label || 'det') + s;
-          box.appendChild(lab);
-        }
-        container.appendChild(box);
-      }
-      return 1;
-    }
-
-    function setAiOverlaySingle(dets) {
-      if (!aiOverlaySingle) return 0;
-      return _renderAiBoxes(aiOverlaySingle, dets);
-    }
-
-    function setAiOverlayGrid(detsByCell) {
-      const arr = Array.isArray(detsByCell) ? detsByCell : [];
-      const cells = [aiGrid1, aiGrid2, aiGrid3, aiGrid4];
-      for (let i = 0; i < cells.length; i++) {
-        _renderAiBoxes(cells[i], arr[i] || []);
-      }
-      return 1;
-    }
-
-    function setVideoPreviewLabels(labels) {
-      const arr = Array.isArray(labels) ? labels : [];
-      const els = [videoGridImg1, videoGridImg2, videoGridImg3, videoGridImg4];
-      for (let i = 0; i < els.length; i++) {
-        const el = els[i];
-        if (!el) continue;
-        const txt = String(arr[i] || '').trim();
-        el.setAttribute('data-label', txt);
-      }
-      return 1;
-    }
-    if (camVideoBtn) {
-      camVideoBtn.classList.add('active');
-      camVideoBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        camVideoBtn.classList.add('active');
-        if (camPhotoBtn) camPhotoBtn.classList.remove('active');
-        // Force video mode without toggling stream off.
-        document.title = 'VGCS_CAM_VIDEO_MODE_REQUEST:' + Date.now();
-      });
-    }
-    if (videoPreview) {
-      videoPreview.title = 'Click to swap video/map';
-      videoPreview.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        if (__obsMarkMode) {
-          try {
-            const r = videoPreview.getBoundingClientRect();
-            const x = (ev.clientX - r.left) / Math.max(1, r.width);
-            const y = (ev.clientY - r.top) / Math.max(1, r.height);
-            addObservationVideoMarker(x, y);
-            document.title = 'VGCS_OBS_VIDEO_MARK:' + String(x) + ':' + String(y) + ':' + Date.now();
-            return;
-          } catch (e) {}
-        }
-        __videoSwapped = !__videoSwapped;
-        setVideoSwapMode(__videoSwapped);
-        document.title = 'VGCS_CAM_SWAP_TOGGLE:' + (__videoSwapped ? '1' : '0') + ':' + Date.now();
-      });
-    }
-    if (camPhotoBtn) {
-      camPhotoBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        camPhotoBtn.classList.add('active');
-        if (camVideoBtn) camVideoBtn.classList.remove('active');
-        // Request a photo capture (handled in Python).
-        document.title = 'VGCS_CAM_PHOTO_REQUEST:' + Date.now();
-      });
-    }
-    if (camRecordBtn) {
-      camRecordBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const now = Date.now();
-        if (camRecordBtn.classList.contains('recording')) {
-          resetCameraTimer();
-          document.title = 'VGCS_CAM_RECORD_TOGGLE:0:' + Date.now();
-          return;
-        }
-        camRecordBtn.classList.add('recording');
-        camRecordStartedAt = now;
-        if (camTimer) camTimer.textContent = '00:00:00';
-        if (camTimerId) clearInterval(camTimerId);
-        camTimerId = setInterval(() => {
-          if (!camTimer || !camRecordStartedAt) return;
-          const elapsedSec = Math.floor((Date.now() - camRecordStartedAt) / 1000);
-          camTimer.textContent = formatRecordTime(elapsedSec);
-        }, 250);
-        document.title = 'VGCS_CAM_RECORD_TOGGLE:1:' + Date.now();
-      });
-    }
-    if (camSettingsBtn) {
-      camSettingsBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        camSettingsBtn.classList.add('active');
-        setTimeout(() => camSettingsBtn.classList.remove('active'), 200);
-        // For now: cycle vision mode day/night on each press.
-        document.title = 'VGCS_CAM_VISION_TOGGLE:' + Date.now();
-      });
-    }
-    if (camSplitBtn) {
-      camSplitBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        __camSplitEnabled = !__camSplitEnabled;
-        camSplitBtn.classList.toggle('active', !!__camSplitEnabled);
-        document.title = 'VGCS_CAM_SPLIT_TOGGLE:' + (__camSplitEnabled ? '1' : '0') + ':' + Date.now();
-      });
-    }
-    if (camFollowBtn) {
-      camFollowBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const en = !camFollowBtn.classList.contains('active');
-        camFollowBtn.classList.toggle('active', en);
-        document.title = 'VGCS_CAM_FOLLOW_TOGGLE:' + (en ? '1' : '0') + ':' + Date.now();
-      });
-    }
-    if (camZoomOutBtn) {
-      camZoomOutBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_CAM_ZOOM_STEP:-1:' + Date.now();
-      });
-    }
-    if (camZoomInBtn) {
-      camZoomInBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_CAM_ZOOM_STEP:1:' + Date.now();
-      });
-    }
-    if (camFocusOutBtn) {
-      camFocusOutBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_CAM_FOCUS_STEP:-1:' + Date.now();
-      });
-    }
-    if (camFocusInBtn) {
-      camFocusInBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_CAM_FOCUS_STEP:1:' + Date.now();
-      });
-    }
-    function sendGimbal(dx, dy) {
-      document.title = 'VGCS_CAM_GIMBAL_NUDGE:' + String(dx || 0) + ':' + String(dy || 0) + ':' + Date.now();
-    }
-    if (camGimbalUpBtn) camGimbalUpBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(0, -1); });
-    if (camGimbalDownBtn) camGimbalDownBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(0, 1); });
-    if (camGimbalLeftBtn) camGimbalLeftBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(-1, 0); });
-    if (camGimbalRightBtn) camGimbalRightBtn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); sendGimbal(1, 0); });
-    if (camObsMarkBtn) {
-      camObsMarkBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        setObservationMarkMode(!__obsMarkMode);
-      });
-    }
-    if (camObsClipBtn) {
-      camObsClipBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_OBS_CLIP_REQUEST:' + Date.now();
-      });
-    }
-    if (camObsExportBtn) {
-      camObsExportBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_OBS_EXPORT_REQUEST:' + Date.now();
-      });
-    }
-    if (camObsClearBtn) {
-      camObsClearBtn.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        document.title = 'VGCS_OBS_CLEAR_REQUEST:' + Date.now();
-      });
-    }
-    function _bindPressFeedback(el) {
-      if (!el) return;
-      const onDown = function() { try { el.classList.add('pressing'); } catch (e) {} };
-      const onUp = function() { try { el.classList.remove('pressing'); } catch (e) {} };
-      el.addEventListener('pointerdown', onDown);
-      el.addEventListener('pointerup', onUp);
-      el.addEventListener('pointercancel', onUp);
-      el.addEventListener('mouseleave', onUp);
-      el.addEventListener('blur', onUp);
-    }
-    [
-      camVideoBtn, camPhotoBtn, camSplitBtn, camFollowBtn,
-      camZoomOutBtn, camZoomInBtn, camFocusOutBtn, camFocusInBtn,
-      camGimbalUpBtn, camGimbalDownBtn, camGimbalLeftBtn, camGimbalRightBtn,
-      camObsMarkBtn, camObsClipBtn, camObsExportBtn, camObsClearBtn, camSettingsBtn
-    ].forEach(_bindPressFeedback);
-    let tileLayer = null;
-    let labelLayer = null;
-    let __tileErrorCount = 0;
-    let __tileErrorLastSignalAt = 0;
-    window.__lowSpec = false;
-    window.__tileTemplate = '';
-    window.__tileAttribution = '';
-    window.__tileMaxZoom = 19;
-    window.__tilePlaceholderDetected = false;
-    window.__tilePlaceholderLastSignalAt = 0;
-    const LABELS_TEMPLATE_ESRI =
-      'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
-    function setTileSource(urlTemplate, attribution, maxZoom) {
-      if (tileLayer) map.removeLayer(tileLayer);
-      if (labelLayer) map.removeLayer(labelLayer);
-      const mz = maxZoom || 19;
-      __tileErrorCount = 0;
-      window.__tileTemplate = urlTemplate || '';
-      try { window.__lastTileTemplate = window.__tileTemplate; } catch(e) {}
-      window.__tileAttribution = attribution || '';
-      window.__tileMaxZoom = mz;
-      const low = !!window.__lowSpec;
-      const effectiveMz = low ? Math.min(mz, 17) : mz;
-      tileLayer = L.tileLayer(urlTemplate, {
-        maxZoom: effectiveMz,
-        attribution: attribution || '',
-        // Performance: reduce tile churn while panning/zooming in Qt WebEngine.
-        updateWhenIdle: true,
-        updateWhenZooming: false,
-        // Smaller buffer = fewer tiles kept/decoded during pans.
-        keepBuffer: low ? 1 : 2,
-        // Throttle tile updates a bit to keep panning responsive.
-        updateInterval: low ? 260 : 140,
-        // Avoid higher-res tile fetches that can double work.
-        detectRetina: false
-      }).addTo(map);
-      try { console.log('[diag] tileSource=' + String(window.__tileTemplate || '') + ' mz=' + String(effectiveMz)); } catch(e) {}
-      // Detect Esri "Map data not yet available" placeholder tiles (HTTP 200 with gray image).
-      // These do not trigger tileerror, but make the map unusable on some client networks.
-      try {
-        const checkPlaceholder = (img) => {
-          try {
-            if (!img || window.__tilePlaceholderDetected) return 0;
-            const tmpl = String(window.__tileTemplate || '');
-            if (!tmpl.includes('arcgisonline.com')) return 0;
-            const c = document.createElement('canvas');
-            c.width = 32; c.height = 32;
-            const ctx = c.getContext('2d', { willReadFrequently: true });
-            if (!ctx) return 0;
-            ctx.drawImage(img, 0, 0, 32, 32);
-            const d = ctx.getImageData(0, 0, 32, 32).data;
-            let sum = 0, sum2 = 0;
-            for (let i = 0; i < d.length; i += 4 * 8) {
-              const r = d[i], g = d[i + 1], b = d[i + 2];
-              const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-              sum += y;
-              sum2 += y * y;
-            }
-            const n = (d.length / (4 * 8));
-            const mean = sum / n;
-            const varY = (sum2 / n) - (mean * mean);
-            if (mean > 150 && mean < 235 && varY < 120) {
-              window.__tilePlaceholderDetected = true;
-              const now = Date.now();
-              if ((now - window.__tilePlaceholderLastSignalAt) > 8000) {
-                window.__tilePlaceholderLastSignalAt = now;
-                try { document.title = 'VGCS_TILE_PLACEHOLDER:' + now; } catch (e) {}
-              }
-              try {
-                setTileSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', 'Tiles © Esri', 19);
-              } catch (e2) {}
-              return 1;
-            }
-          } catch (e) {}
-          return 0;
-        };
-        tileLayer.on('tileload', function(ev) {
-          try { checkPlaceholder(ev && ev.tile); } catch (e) {}
-        });
-      } catch (ePH) {}
-      try {
-        tileLayer.on('tileerror', function() {
-          __tileErrorCount += 1;
-          const now = Date.now();
-          if (__tileErrorCount >= 10 && (now - __tileErrorLastSignalAt) > 8000) {
-            __tileErrorLastSignalAt = now;
-            document.title = 'VGCS_TILE_ERROR:' + now;
-          }
-        });
-      } catch (e) {}
-      // Rate-limited diagnostics to help identify "blocked" vs "offline" cases.
-      try {
-        window.__diag = window.__diag || {err:0, ok:0, last:0};
-        tileLayer.on('tileload', function() {
-          window.__diag.ok += 1;
-          const now = Date.now();
-          if (now - window.__diag.last > 5000) {
-            window.__diag.last = now;
-            try { console.log('[diag] tiles ok=' + window.__diag.ok + ' err=' + window.__diag.err); } catch(e) {}
-          }
-        });
-        tileLayer.on('tileerror', function(ev) {
-          window.__diag.err += 1;
-          if (window.__diag.err <= 3) {
-            try { console.log('[diag] tileerror url=' + String(ev && ev.tile && ev.tile.src || '')); } catch(e) {}
-          }
-          if (window.__diag.err === 3) {
-            try { console.log('[diag] many tile errors; likely blocked DNS/proxy/firewall. Consider Offline Tiles.'); } catch(e) {}
-          }
-        });
-      } catch (eDiag) {}
-      if (!low) {
-        // Add borders + place labels overlay (transparent tiles) to match client reference.
-        // Works best over satellite imagery; safe to keep enabled for other sources too.
-        try {
-          labelLayer = L.tileLayer(LABELS_TEMPLATE_ESRI, {
-            maxZoom: effectiveMz,
-            // Avoid fetching labels at very low zooms (saves a lot of requests).
-            minZoom: 3,
-            opacity: 0.9,
-            attribution: '',
-            updateWhenIdle: true,
-            updateWhenZooming: false,
-            keepBuffer: 1,
-            updateInterval: 180,
-            detectRetina: false,
-            pane: 'overlayPane'
-          }).addTo(map);
-          try {
-            labelLayer.on('tileerror', function() {
-              __tileErrorCount += 1;
-              const now = Date.now();
-              if (__tileErrorCount >= 10 && (now - __tileErrorLastSignalAt) > 8000) {
-                __tileErrorLastSignalAt = now;
-                document.title = 'VGCS_TILE_ERROR:' + now;
-              }
-            });
-          } catch (e2) {}
-        } catch (e) {
-          labelLayer = null;
-        }
-        // Performance: hide labels while interacting, restore when idle.
-        // This avoids expensive compositing of semi-transparent tiles during drag.
-        try {
-          if (!window.__labelsPanHooked) {
-            window.__labelsPanHooked = true;
-            let __labelsRestoreT = null;
-            const hide = () => { try { if (labelLayer) labelLayer.setOpacity(0.0); } catch (e) {} };
-            const restoreSoon = () => {
-              try {
-                if (__labelsRestoreT) clearTimeout(__labelsRestoreT);
-                __labelsRestoreT = setTimeout(() => {
-                  try { if (labelLayer) labelLayer.setOpacity(0.9); } catch (e) {}
-                }, 140);
-              } catch (e) {}
-            };
-            map.on('movestart', hide);
-            map.on('zoomstart', hide);
-            map.on('moveend', restoreSoon);
-            map.on('zoomend', restoreSoon);
-          }
-          if (labelLayer) labelLayer.setOpacity(0.9);
-        } catch (e) {}
-      } else {
-        labelLayer = null;
-      }
-      return 1;
-    }
-
-    // Provide current map view + active tile template for Python-side probes.
-    try {
-      window.__vgcsGetMapView = function() {
-        try {
-          const c = map && map.getCenter ? map.getCenter() : { lat: 0, lng: 0 };
-          const z = map && map.getZoom ? map.getZoom() : 0;
-          return JSON.stringify({
-            z: Number(z) || 0,
-            lat: Number(c.lat) || 0,
-            lng: Number(c.lng) || 0,
-            template: String(window.__tileTemplate || '')
-          });
-        } catch (e) {
-          return JSON.stringify({ z: 0, lat: 0, lng: 0, template: String(window.__tileTemplate || '') });
-        }
-      };
-    } catch (e) {}
-    try {
-      window.__vgcsGetOverlayInsets = function() {
-        try {
-          const wrap = document.getElementById('mapWrap');
-          if (!wrap) return JSON.stringify({ left: 170, top: 58, right: 220, bottom: 130 });
-          const wr = wrap.getBoundingClientRect();
-          const leftEls = [document.getElementById('actionRail')];
-          const topEls = [document.getElementById('linkBanner')];
-          const rightEls = [document.getElementById('cameraRail'), document.getElementById('compassHud')];
-          const bottomEls = [document.getElementById('mapFooterHud')];
-          let left = 0, top = 0, right = 0, bottom = 0;
-          for (const el of leftEls) {
-            if (!el) continue;
-            const r = el.getBoundingClientRect();
-            if (r.width > 2 && r.height > 2) left = Math.max(left, Math.max(0, r.right - wr.left));
-          }
-          for (const el of topEls) {
-            if (!el) continue;
-            const r = el.getBoundingClientRect();
-            if (r.width > 2 && r.height > 2) top = Math.max(top, Math.max(0, r.bottom - wr.top));
-          }
-          for (const el of rightEls) {
-            if (!el) continue;
-            const r = el.getBoundingClientRect();
-            if (r.width > 2 && r.height > 2) right = Math.max(right, Math.max(0, wr.right - r.left));
-          }
-          for (const el of bottomEls) {
-            if (!el) continue;
-            const r = el.getBoundingClientRect();
-            if (r.width > 2 && r.height > 2) bottom = Math.max(bottom, Math.max(0, wr.bottom - r.top));
-          }
-          return JSON.stringify({
-            left: Math.max(0, Math.round(left + 10)),
-            top: Math.max(0, Math.round(top + 8)),
-            right: Math.max(0, Math.round(right + 10)),
-            bottom: Math.max(0, Math.round(bottom + 10))
-          });
-        } catch (e) {
-          return JSON.stringify({ left: 170, top: 58, right: 220, bottom: 130 });
-        }
-      };
-    } catch (e) {}
-
-    function setLowSpecMode(enabled) {
-      window.__lowSpec = !!enabled;
-      try {
-        if (window.__tileTemplate) {
-          setTileSource(window.__tileTemplate, window.__tileAttribution || '', window.__tileMaxZoom || 19);
-        }
-      } catch (e) {}
-      return window.__lowSpec ? 1 : 0;
-    }
-    // Choose a reliable default tile source for the current network.
-    const ESRI_SAT =
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
-    const OSM =
-      'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-
-    function probeTile(urlTemplate, timeoutMs, cb) {
-      try {
-        const img = new Image();
-        let done = false;
-        const finish = (ok) => { if (done) return; done = true; try { cb(!!ok); } catch(e) {} };
-        const t = setTimeout(() => finish(false), Math.max(400, Number(timeoutMs) || 2200));
-        img.onload = () => { try { clearTimeout(t); } catch(e) {} finish(true); };
-        img.onerror = () => { try { clearTimeout(t); } catch(e) {} finish(false); };
-        // Use a low zoom tile that should exist everywhere.
-        const url = String(urlTemplate || '').replace('{z}','0').replace('{x}','0').replace('{y}','0').replace('{s}','a');
-        img.src = url;
-      } catch (e) {
-        try { cb(false); } catch(e2) {}
-      }
-    }
-
-    // Default to satellite imagery to match prior VGCS behavior.
-    // If the client network blocks imagery, user can switch to Streets or Offline Tiles.
-    setTileSource(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-      'Tiles © Esri',
-      19
-    );
-
-    const vehicleMarkerSvg =
-      '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">' +
-      '<path d="M15 2.5 L26.2 22.5 L17.8 19.8 L15 27.5 L12.2 19.8 L3.8 22.5 Z" ' +
-      'fill="#ff2328" stroke="#4a1222" stroke-width="1.35" stroke-linejoin="round"/>' +
-      '<path d="M15 5 L15 22" stroke="#3a0f18" stroke-width="1.05" stroke-linecap="round"/>' +
-      '</svg>';
-    vehicleMarker = L.marker([24.7136, 46.6753], {
-      icon: L.divIcon({
-        className: 'vgcs-vehicle-marker',
-        html: '<div class="vgcs-vehicle-marker-inner">' + vehicleMarkerSvg + '</div>',
-        iconSize: [30, 30],
-        iconAnchor: [15, 15]
-      }),
-      interactive: false,
-      keyboard: false
-    }).addTo(map);
-    let headingLine = L.polyline([], {
-      color: '#ff7700',
-      weight: 5,
-      opacity: 0.95,
-      lineCap: 'round',
-      lineJoin: 'round'
-    }).addTo(map);
-    let missionRoute = L.polyline([], {
-      color: '#ef4444',
-      weight: 4,
-      opacity: 0.95,
-      interactive: false,
-      pane: 'overlayPane'
-    });
-    let flightTrack = L.polyline([], {
-      color: '#f97316',
-      weight: 2,
-      opacity: 0.55,
-      interactive: false
-    });
-    let __lastTrackLat = null;
-    let __lastTrackLon = null;
-    let addMode = false;
-    let addFenceMode = false;
-    let fencePoints = [];
-    let fencePolygon = null;
-    let viewer3d = null;
-    let vehicleEntity = null;
-    let headingEntity = null;
-    window.__lastVehLat = null;
-    window.__lastVehLon = null;
-    window.__is3d = false;
-    window.__heading = 0;
-    window.__3dHasInitialFocus = false;
-    window.__missionNavSeq = 0;
-    const HEADING_MIN_INTERVAL_MS = 125; // ~8 Hz max redraw
-    const VFR_HEADING_PRIORITY_MS = 1200; // ignore attitude yaw briefly after VFR_HUD
-    let __headingLastApplyMs = 0;
-    let __headingLastVfrMs = 0;
-    let __headingRafId = null;
-    let __headingPending = null;
-
-    function setLinkConnected(connected) {
-      try { console.log('[diag] setLinkConnected(' + String(!!connected) + ')'); } catch(e) {}
-      if (connected) {
-        setFlightStatus('yellow', 'Connected - Not Ready to Arm');
-      } else {
-        setFlightStatus('red', 'Communication lost - Not Ready to Arm');
-      }
-      return 1;
-    }
-
-    function setFlightStatus(state, detailText) {
-      const banner = document.getElementById('linkBanner');
-      const bannerText = document.getElementById('linkBannerText');
-      const disconnected = document.getElementById('linkBannerDisconnected');
-      const connectedRow = document.getElementById('linkBannerConnected');
-      if (!banner || !bannerText || !disconnected || !connectedRow) return 0;
-
-      const stateText = (state || '').toLowerCase();
-      const detail = detailText || '';
-      const isGreen = stateText === 'green';
-      const isYellow = stateText === 'yellow';
-      const isRed = stateText === 'red';
-      const connected = isGreen || isYellow;
-      setActionButtonsEnabled(connected);
-
-      if (connected) {
-        disconnected.style.display = 'none';
-        connectedRow.style.display = 'flex';
-      } else {
-        connectedRow.style.display = 'none';
-        disconnected.style.display = 'flex';
-      }
-
-      if (isGreen) {
-        bannerText.textContent = detail || 'Parameter downloading... Ready to Arm';
-        banner.style.background = 'rgba(24, 82, 38, 0.96)';
-        banner.style.borderColor = 'rgba(94, 214, 119, 0.95)';
-        banner.style.color = '#e8ffe8';
-      } else if (isYellow) {
-        bannerText.textContent = detail || 'Connected - Not Ready to Arm';
-        banner.style.background = 'rgba(120, 95, 24, 0.96)';
-        banner.style.borderColor = 'rgba(247, 211, 92, 0.95)';
-        banner.style.color = '#fff7dd';
-      } else {
-        bannerText.textContent = detail || 'Communication lost - Not Ready to Arm';
-        banner.style.background = 'rgba(124, 24, 24, 0.96)';
-        banner.style.borderColor = 'rgba(245, 99, 99, 0.95)';
-        banner.style.color = '#ffe8e8';
-      }
-      return 1;
-    }
-
-    function setActionButtonsEnabled(enabled) {
-      const takeoff = document.getElementById('actionTakeoff');
-      const ret = document.getElementById('actionReturn');
-      setCameraControlsVisible(enabled);
-      for (const el of [takeoff, ret]) {
-        if (!el) continue;
-        if (enabled) {
-          el.classList.remove('disabled');
-        } else {
-          el.classList.add('disabled');
-        }
-      }
-      return 1;
-    }
-
-    function getActivePlanTool() {
-      const layer = document.getElementById('planFlightLayer');
-      if (!layer) return 'File';
-      const act = layer.querySelector('.planToolBtn.active');
-      return (act && act.getAttribute('data-tool')) || 'File';
-    }
-    function updatePlanToolPanel(tool) {
-      const t = (tool || '').trim();
-      const fileFlyout = document.getElementById('planFileFlyout');
-      const other = document.getElementById('planOtherToolPanel');
-      const center = document.getElementById('planCenterPanel');
-      const isFile = t.toLowerCase() === 'file';
-      if (fileFlyout) fileFlyout.style.display = isFile ? 'block' : 'none';
-      // Match reference flow: selecting Survey/other tools dismisses file flyout panel.
-      if (center) center.style.display = isFile ? 'block' : 'none';
-      if (other) {
-        other.style.display = 'none';
-        const hint = document.getElementById('planOtherToolHint');
-        if (hint) {
-          const hints = {
-            Takeoff: 'Sends takeoff to the vehicle (same as dashboard) using Takeoff alt (m). Vehicle must be connected.',
-            Waypoint: 'Click on the map to place waypoints.',
-            ROI: 'Click on the map to add fence polygon vertices.',
-            Pattern: 'Pattern fills a survey grid from the current vehicle position.',
-            Return: 'Return / RTL uses the map Return control.',
-            Center: 'Centers the map on the vehicle.'
-          };
-          hint.textContent = hints[t] || 'Tool active.';
-        }
-      }
-    }
-    function setPlanRailTool(name) {
-      const layer = document.getElementById('planFlightLayer');
-      if (!layer) return 0;
-      const want = (name || '').trim();
-      if (want) window.__planRailTool = want;
-      if (want !== 'Waypoint') addMode = false;
-      if (want !== 'ROI') {
-        addFenceMode = false;
-        if (fencePoints && fencePoints.length > 0 && fencePoints.length < 3) {
-          fencePoints = [];
-          try {
-            if (fencePolygon) {
-              map.removeLayer(fencePolygon);
-              fencePolygon = null;
-            }
-          } catch (e) {}
-        }
-      }
-      for (const el of layer.querySelectorAll('.planToolBtn')) {
-        const t = el.getAttribute('data-tool') || '';
-        el.classList.toggle('active', t === want);
-      }
-      updatePlanToolPanel(want);
-      return 1;
-    }
-
-    function disablePlanEditModes() {
-      addMode = false;
-      addFenceMode = false;
-      if (fencePoints && fencePoints.length > 0 && fencePoints.length < 3) {
-        fencePoints = [];
-        try {
-          if (fencePolygon) {
-            map.removeLayer(fencePolygon);
-            fencePolygon = null;
-          }
-        } catch (e) {}
-      }
-    }
-    function setPlanFlightChromeState(linked, wpCount) {
-      const n = Math.max(0, Number(wpCount) || 0);
-      const has = n > 0;
-      const link = !!linked;
-      const upBar = document.getElementById('planBarUpload');
-      const vUp = document.getElementById('planVehicleUpload');
-      const vDown = document.getElementById('planVehicleDownload');
-      const sav = document.getElementById('planStorageSave');
-      const savAs = document.getElementById('planStorageSaveAs');
-      const kml = document.getElementById('planStorageKml');
-      if (vDown) vDown.disabled = !link;
-      if (vUp) vUp.disabled = !link || !has;
-      if (upBar) upBar.disabled = !link || !has;
-      if (sav) sav.disabled = !has;
-      if (savAs) savAs.disabled = !has;
-      if (kml) kml.disabled = !has;
-      return 1;
-    }
-    const PLAN_TAB_KEYS = ['mission', 'fence', 'rally'];
-    const PLAN_TAB_BTN_IDS = {
-      mission: 'planTabBtnMission',
-      fence: 'planTabBtnFence',
-      rally: 'planTabBtnRally'
-    };
-    function activatePlanTab(key) {
-      const k = PLAN_TAB_KEYS.indexOf(key) >= 0 ? key : 'mission';
-      const tabs = document.querySelectorAll('#planTabs .planTab');
-      const bodies = {
-        mission: document.getElementById('planTabPanelMission'),
-        fence: document.getElementById('planTabPanelFence'),
-        rally: document.getElementById('planTabPanelRally'),
-      };
-      for (const tab of tabs) {
-        const id = tab.getAttribute('data-plan-tab') || '';
-        const on = id === k;
-        tab.classList.toggle('active', on);
-        tab.setAttribute('aria-selected', on ? 'true' : 'false');
-        tab.setAttribute('tabindex', on ? '0' : '-1');
-      }
-      for (const name of PLAN_TAB_KEYS) {
-        const el = bodies[name];
-        if (!el) continue;
-        if (name === k) {
-          el.removeAttribute('hidden');
-        } else {
-          el.setAttribute('hidden', '');
-        }
-      }
-      return 1;
-    }
-    function bindPlanRightTabs() {
-      const tablist = document.getElementById('planTabs');
-      if (!tablist) return;
-      const tabs = tablist.querySelectorAll('.planTab');
-      for (const tab of tabs) {
-        tab.addEventListener('click', function(ev) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          const el = ev.currentTarget;
-          const key = el.getAttribute('data-plan-tab') || 'mission';
-          activatePlanTab(key);
-          try {
-            el.focus({ preventScroll: true });
-          } catch (e) {
-            el.focus();
-          }
-        });
-        tab.addEventListener('keydown', function(ev) {
-          const cur = ev.currentTarget.getAttribute('data-plan-tab') || 'mission';
-          let idx = PLAN_TAB_KEYS.indexOf(cur);
-          if (idx < 0) idx = 0;
-          if (ev.key === 'ArrowRight' || ev.key === 'ArrowDown') {
-            ev.preventDefault();
-            idx = (idx + 1) % PLAN_TAB_KEYS.length;
-            activatePlanTab(PLAN_TAB_KEYS[idx]);
-            const nextBtn = document.getElementById(PLAN_TAB_BTN_IDS[PLAN_TAB_KEYS[idx]]);
-            if (nextBtn) nextBtn.focus();
-          } else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowUp') {
-            ev.preventDefault();
-            idx = (idx + PLAN_TAB_KEYS.length - 1) % PLAN_TAB_KEYS.length;
-            activatePlanTab(PLAN_TAB_KEYS[idx]);
-            const nextBtn = document.getElementById(PLAN_TAB_BTN_IDS[PLAN_TAB_KEYS[idx]]);
-            if (nextBtn) nextBtn.focus();
-          } else if (ev.key === 'Home') {
-            ev.preventDefault();
-            activatePlanTab('mission');
-            const b = document.getElementById('planTabBtnMission');
-            if (b) b.focus();
-          } else if (ev.key === 'End') {
-            ev.preventDefault();
-            activatePlanTab('rally');
-            const b = document.getElementById('planTabBtnRally');
-            if (b) b.focus();
-          }
-        });
-      }
-    }
-    function bindPlanFlyoutActions() {
-      const mapActionBtn = (id, action) => {
-        const el = document.getElementById(id);
-        if (!el) return;
-        el.addEventListener('click', function(ev) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          if (el.disabled) return;
-          document.title = 'VGCS_PLAN_ACTION:' + action + ':' + Date.now();
-        });
-      };
-      mapActionBtn('planBarUpload', 'bar_upload');
-      mapActionBtn('planStorageOpen', 'open');
-      mapActionBtn('planStorageSave', 'save');
-      mapActionBtn('planStorageSaveAs', 'save_as');
-      mapActionBtn('planStorageKml', 'save_kml');
-      mapActionBtn('planVehicleUpload', 'vehicle_upload');
-      mapActionBtn('planVehicleDownload', 'vehicle_download');
-      mapActionBtn('planVehicleClear', 'vehicle_clear');
-      mapActionBtn('planFenceRoiBtn', 'fence_roi_tool');
-      const tpl = [
-        ['planTplEmpty', 'template_empty'],
-        ['planTplSurvey', 'template_survey'],
-        ['planTplCorridor', 'template_corridor'],
-        ['planTplStructure', 'template_structure']
-      ];
-      for (const [eid, act] of tpl) {
-        const node = document.getElementById(eid);
-        if (!node) continue;
-        node.addEventListener('click', function(ev) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          document.title = 'VGCS_PLAN_ACTION:' + act + ':' + Date.now();
-        });
-      }
-    }
-    function clearLaunchMarker() {}
-
-    function isPlanFlightLayerVisible() {
-      const layer = document.getElementById('planFlightLayer');
-      if (!layer || !window.getComputedStyle) return false;
-      return window.getComputedStyle(layer).display !== 'none';
-    }
-
-    function updateLaunchMarkerFromPanel() {
-      clearLaunchMarker();
-    }
-
-    function setPlanFlightVisible(visible) {
-      const layer = document.getElementById('planFlightLayer');
-      const hud = document.getElementById('mapFooterHud');
-      if (!layer) return 0;
-      layer.style.display = visible ? 'block' : 'none';
-      if (hud) {
-        hud.style.display = visible ? 'none' : '';
-        hud.setAttribute('aria-hidden', visible ? 'true' : 'false');
-      }
-      syncCameraChromeVisibility();
-      if (!visible) {
-        clearLaunchMarker();
-      } else {
-        const w = window.__planRailTool && String(window.__planRailTool).trim();
-        if (w) {
-          setPlanRailTool(w);
-        } else {
-          updatePlanToolPanel(getActivePlanTool());
-        }
-        updateLaunchMarkerFromPanel();
-      }
-      return 1;
-    }
-
-    function setPlanFlightMetrics(metrics) {
-      if (!metrics || typeof metrics !== 'object') return 0;
-      const setTxt = (id, value) => {
-        const el = document.getElementById(id);
-        if (!el) return;
-        el.textContent = String(value ?? '');
-      };
-      setTxt('pfAltDiff', metrics.altDiffFt ?? '0.0 ft');
-      setTxt('pfGradient', metrics.gradient ?? '-.-');
-      setTxt('pfAzimuth', metrics.azimuth ?? '0');
-      setTxt('pfHeading', metrics.heading ?? 'nan');
-      setTxt('pfDistPrevWp', metrics.distPrevWpFt ?? '0.0 ft');
-      setTxt('pfMissionDistance', metrics.missionDistanceFt ?? '0 ft');
-      setTxt('pfMissionTime', metrics.missionTime ?? '00:00:00');
-      setTxt('pfMaxTelemDist', metrics.maxTelemDistFt ?? '0 ft');
-      return 1;
-    }
-
-    let planMissionEmitTimer = null;
-    function ftToM(ft) { return (Number(ft) || 0) * 0.3048; }
-    function mToFt(m) { return (Number(m) || 0) / 0.3048; }
-    function mphToMps(mph) { return (Number(mph) || 0) * 0.44704; }
-    function mpsToMph(mps) { return (Number(mps) || 0) / 0.44704; }
-
-    function ensurePlanWpMetaLen(n) {
-      const nn = Math.max(0, Number(n) || 0);
-      if (!Array.isArray(window.__planWpMeta)) window.__planWpMeta = [];
-      const initEl = document.getElementById('planInitialWpAltInput');
-      const hoverEl = document.getElementById('planHoverSpeedInput');
-      const baseAltM = ftToM(initEl ? initEl.value : 164.0);
-      const baseSpdMps = mphToMps(hoverEl ? hoverEl.value : 11.18);
-      while (window.__planWpMeta.length < nn) {
-        window.__planWpMeta.push({ alt_m: baseAltM, speed_mps: baseSpdMps });
-      }
-      if (window.__planWpMeta.length > nn) {
-        window.__planWpMeta = window.__planWpMeta.slice(0, nn);
-      }
-    }
-
-    function renderPlanWpDetails() {
-      const host = document.getElementById('planWpDetails');
-      const list = document.getElementById('planWpDetailsList');
-      if (!host || !list) return 0;
-      const n = waypoints ? waypoints.length : 0;
-      ensurePlanWpMetaLen(n);
-      if (n <= 0) {
-        host.style.display = 'none';
-        list.innerHTML = '';
-        return 1;
-      }
-      host.style.display = '';
-      const launchAltEl = document.getElementById('planLaunchAltInput');
-      const rawLaunch = launchAltEl ? String(launchAltEl.value || '') : '';
-      const lx = parseFloat(rawLaunch.replace(',', '.'));
-      const launchFtStr = Number.isFinite(lx) ? lx.toFixed(1) : '0.0';
-      let html = '';
-      html +=
-        '<div class="planWpRow planWpRow--start" data-wp-start="1">' +
-          '<div class="planWpLabel">Start</div>' +
-          '<div class="planWpFields">' +
-            '<div class="planWpField"><input class="planWpStartAlt" type="text" inputmode="decimal" value="' + launchFtStr + '"/><span class="planWpUnit">ft</span></div>' +
-            '<div class="planWpStartHint">Takeoff / launch altitude (0 = use WP1 for takeoff).</div>' +
-          '</div>' +
-        '</div>';
-      for (let i = 0; i < n; i++) {
-        const m = window.__planWpMeta[i] || {};
-        const altFt = mToFt(m.alt_m ?? ftToM(164));
-        const spdMph = mpsToMph(m.speed_mps ?? mphToMps(11.18));
-        html +=
-          '<div class="planWpRow" data-wp-idx="' + i + '">' +
-            '<div class="planWpLabel">WP ' + (i+1) + '</div>' +
-            '<div class="planWpFields">' +
-              '<div class="planWpField"><input class="planWpAlt" type="text" inputmode="decimal" value="' + altFt.toFixed(1) + '"/><span class="planWpUnit">ft</span></div>' +
-              '<div class="planWpField"><input class="planWpSpd" type="text" inputmode="decimal" value="' + spdMph.toFixed(1) + '"/><span class="planWpUnit">mph</span></div>' +
-            '</div>' +
-          '</div>';
-      }
-      list.innerHTML = html;
-      const startAltIn = list.querySelector('.planWpStartAlt');
-      if (startAltIn && launchAltEl) {
-        const onStartAlt = () => {
-          if (window.__planPanelSuppressEmit) return;
-          const num = (v, d) => {
-            const x = parseFloat(String(v || '').replace(',', '.'));
-            return Number.isFinite(x) ? x : d;
-          };
-          const ft = num(startAltIn.value, 0);
-          launchAltEl.value = String(ft);
-          schedulePlanMissionPanelEmit();
-        };
-        startAltIn.addEventListener('input', onStartAlt);
-        startAltIn.addEventListener('change', onStartAlt);
-      }
-      for (const row of list.querySelectorAll('.planWpRow[data-wp-idx]')) {
-        const idx = Number(row.getAttribute('data-wp-idx') || '0') || 0;
-        const altIn = row.querySelector('.planWpAlt');
-        const spdIn = row.querySelector('.planWpSpd');
-        const onChange = () => {
-          if (window.__planPanelSuppressEmit) return;
-          const num = (v, d) => {
-            const x = parseFloat(String(v || '').replace(',', '.'));
-            return Number.isFinite(x) ? x : d;
-          };
-          ensurePlanWpMetaLen(waypoints.length);
-          const aFt = num(altIn && altIn.value, 164.0);
-          const sMph = num(spdIn && spdIn.value, 11.18);
-          window.__planWpMeta[idx] = {
-            alt_m: Math.max(1.0, ftToM(aFt)),
-            speed_mps: Math.max(0.1, mphToMps(sMph)),
-          };
-          schedulePlanMissionPanelEmit();
-        };
-        if (altIn) { altIn.addEventListener('input', onChange); altIn.addEventListener('change', onChange); }
-        if (spdIn) { spdIn.addEventListener('input', onChange); spdIn.addEventListener('change', onChange); }
-      }
-      return 1;
-    }
-    function schedulePlanMissionPanelEmit() {
-      if (window.__planPanelSuppressEmit) return;
-      if (planMissionEmitTimer) clearTimeout(planMissionEmitTimer);
-      planMissionEmitTimer = setTimeout(emitPlanMissionPanel, 320);
-    }
-    function emitPlanMissionPanel() {
-      if (window.__planPanelSuppressEmit) return;
-      planMissionEmitTimer = null;
-      const sel = document.getElementById('planAltReferenceSelect');
-      const initEl = document.getElementById('planInitialWpAltInput');
-      const hoverEl = document.getElementById('planHoverSpeedInput');
-      const launchAltEl = document.getElementById('planLaunchAltInput');
-      const latEl = document.getElementById('planLaunchLatVal');
-      const lonEl = document.getElementById('planLaunchLonVal');
-      const num = (v, d) => {
-        const x = parseFloat(String(v || '').replace(',', '.'));
-        return Number.isFinite(x) ? x : d;
-      };
-      const data = {
-        altRef: sel ? String(sel.value || 'rel') : 'rel',
-        initialWpAltFt: num(initEl && initEl.value, 164),
-        hoverMph: num(hoverEl && hoverEl.value, 11.18),
-        launchAltFt: num(launchAltEl && launchAltEl.value, 0),
-        launchLat: latEl ? String(latEl.textContent || '').trim() : '',
-        launchLon: lonEl ? String(lonEl.textContent || '').trim() : '',
-      };
-      if (Array.isArray(window.__planWpMeta)) {
-        data.wpMeta = window.__planWpMeta.map((m) => ({
-          alt_m: Number(m && m.alt_m) || 0,
-          speed_mps: Number(m && m.speed_mps) || 0,
-        }));
-      }
-      try {
-        const js = JSON.stringify(data);
-        document.title = 'VGCS_PLAN_MISSION_PANEL:' + btoa(unescape(encodeURIComponent(js)));
-      } catch (e) {}
-    }
-    function setPlanSequenceTemplate(templateId) {
-      const row = document.getElementById('planSeqPatternRow');
-      const label = document.getElementById('planSeqPatternLabel');
-      const missionPanel = document.getElementById('planTabPanelMission');
-      const missionHeader = document.getElementById('planMissionSectionHeader');
-      const compactList = document.getElementById('planSeqCompactList');
-      const compactSurveyLabel = document.getElementById('planSeqCompactSurveyLabel');
-      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
-      const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
-      const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
-      const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
-      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
-      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
-      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
-      const takeoffDesc = document.querySelector('#planTabPanelMission .planSeqCardDesc');
-      const startMissionBtn = document.getElementById('planStartMissionBtn');
-      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
-      if (!row || !label) return 0;
-      const t = String(templateId || '').toLowerCase().trim();
-      const labels = {
-        survey: 'Survey',
-        corridor: 'Corridor Scan',
-        structure: 'Structure Scan'
-      };
-      row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
-      const isEmpty = !t || !labels[t];
-      const isSurveyMode = t === 'survey';
-      window.__planMissionStartStack = !!isSurveyMode;
-      if (missionPanel) {
-        missionPanel.classList.toggle('planMissionEmpty', isEmpty || isSurveyMode);
-        missionPanel.classList.toggle('planMissionStack', isSurveyMode);
-      }
-      if (compactList) compactList.setAttribute('aria-hidden', isSurveyMode ? 'false' : 'true');
-      if (compactSurveyLabel && labels[t]) compactSurveyLabel.textContent = labels[t];
-      if (compactSurveyBody && labels[t]) compactSurveyBody.textContent = labels[t] + ' pattern selected.';
-      if (missionHeader) missionHeader.textContent = (isEmpty || isSurveyMode) ? 'Mission Start' : 'Mission';
-      // Hard show/hide to keep Survey state stable regardless CSS cache/state.
-      if (takeoffHead) takeoffHead.style.display = (isEmpty || isSurveyMode) ? 'none' : '';
-      if (takeoffDesc) takeoffDesc.style.display = (isEmpty || isSurveyMode) ? 'none' : '';
-      if (seqRtlBtn) seqRtlBtn.style.display = isSurveyMode ? 'none' : (isEmpty ? 'none' : '');
-      // Keep Start Mission visible regardless of template state.
-      if (startMissionBtn) startMissionBtn.style.display = '';
-      if (compactList) compactList.style.display = isSurveyMode ? 'flex' : 'none';
-      if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
-      if (compactTakeoff) compactTakeoff.classList.remove('is-active');
-      if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
-      if (compactRtlTab) compactRtlTab.classList.remove('is-active');
-      if (compactSurveyBody) compactSurveyBody.classList.remove('is-active');
-      if (compactRtlBody) compactRtlBody.classList.remove('is-active');
-      if (!t || !labels[t]) {
-        return 1;
-      }
-      label.textContent = labels[t];
-      row.classList.add('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
-      setPlanStackTab('takeoff');
-      return 1;
-    }
-    function setPlanStackTab(name) {
-      const missionPanel = document.getElementById('planTabPanelMission');
-      if (!missionPanel) return 0;
-      missionPanel.classList.remove('planMissionDetailsOpen');
-      const tab = String(name || 'takeoff').toLowerCase();
-      const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
-      const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
-      const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
-      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
-      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
-      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
-      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
-      const vehicleDetails = document.getElementById('planVehicleDetails');
-      const launchDetails = document.getElementById('planLaunchDetails');
-      if (compactTakeoffTab) compactTakeoffTab.classList.toggle('is-active', tab === 'takeoff');
-      if (compactTakeoff) compactTakeoff.classList.toggle('is-active', tab === 'takeoff');
-      if (compactSurveyTab) compactSurveyTab.classList.toggle('is-active', tab === 'survey');
-      if (compactRtlTab) compactRtlTab.classList.toggle('is-active', tab === 'rtl');
-      if (compactSurveyBody) compactSurveyBody.classList.toggle('is-active', tab === 'survey');
-      if (compactRtlBody) compactRtlBody.classList.toggle('is-active', tab === 'rtl');
-      // Keep visibility deterministic even if cached CSS state is stale.
-      if (compactTakeoff) compactTakeoff.style.display = (tab === 'takeoff') ? 'block' : 'none';
-      if (compactSurveyBody) compactSurveyBody.style.display = (tab === 'survey') ? 'block' : 'none';
-      if (compactRtlBody) compactRtlBody.style.display = (tab === 'rtl') ? 'block' : 'none';
-      if (takeoffBody) takeoffBody.style.display = 'none';
-      if (vehicleDetails) vehicleDetails.style.display = 'none';
-      if (launchDetails) launchDetails.style.display = 'none';
-      return 1;
-    }
-    function bindPlanStackTabs() {
-      const takeoff = document.getElementById('planSeqCompactTakeoffTab');
-      const survey = document.getElementById('planSeqCompactSurveyTab');
-      const rtl = document.getElementById('planSeqCompactRtlTab');
-      const bind = (el, tab) => {
-        if (!el) return;
-        const onAct = (ev) => {
-          if (ev) { ev.preventDefault(); ev.stopPropagation(); }
-          setPlanStackTab(tab);
-        };
-        el.addEventListener('click', onAct);
-        el.addEventListener('keydown', (ev) => {
-          if (ev.key === 'Enter' || ev.key === ' ') onAct(ev);
-        });
-      };
-      bind(takeoff, 'takeoff');
-      bind(survey, 'survey');
-      bind(rtl, 'rtl');
-    }
-    function openMissionStartDetails() {
-      const missionPanel = document.getElementById('planTabPanelMission');
-      const missionHeader = document.getElementById('planMissionSectionHeader');
-      const compactList = document.getElementById('planSeqCompactList');
-      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
-      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
-      const vehicleDetails = document.getElementById('planVehicleDetails');
-      const launchDetails = document.getElementById('planLaunchDetails');
-      const row = document.getElementById('planSeqPatternRow');
-      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
-      const startMissionBtn = document.getElementById('planStartMissionBtn');
-      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
-      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
-      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
-      if (!missionPanel) return 0;
-      // Keep stack layout so Takeoff/Survey/RTL tabs preserve their existing UI.
-      missionPanel.classList.add('planMissionStack');
-      missionPanel.classList.remove('planMissionEmpty');
-      missionPanel.classList.add('planMissionDetailsOpen');
-      if (missionHeader) missionHeader.textContent = 'Mission Start';
-      if (compactList) {
-        // Keep plan step tabs visible while Mission Start details are open.
-        compactList.style.display = 'flex';
-        compactList.setAttribute('aria-hidden', 'false');
-      }
-      if (takeoffHead) takeoffHead.style.display = 'none';
-      if (takeoffBody) takeoffBody.style.display = '';
-      if (vehicleDetails) vehicleDetails.style.display = '';
-      if (launchDetails) launchDetails.style.display = '';
-      if (row) row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
-      if (seqRtlBtn) seqRtlBtn.style.display = 'none';
-      if (startMissionBtn) startMissionBtn.style.display = '';
-      // Show tabs only (no expanded compact detail card) while editing mission details.
-      if (compactTakeoff) compactTakeoff.style.display = 'none';
-      if (compactSurveyBody) compactSurveyBody.style.display = 'none';
-      if (compactRtlBody) compactRtlBody.style.display = 'none';
-      window.__planMissionStartStack = true;
-      return 1;
-    }
-    function setPlanMissionStartStack(enabled, surveyLabel) {
-      const missionPanel = document.getElementById('planTabPanelMission');
-      const missionHeader = document.getElementById('planMissionSectionHeader');
-      const compactList = document.getElementById('planSeqCompactList');
-      const compactSurveyLabel = document.getElementById('planSeqCompactSurveyLabel');
-      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
-      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
-      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
-      const takeoffDesc = document.querySelector('#planTabPanelMission .planSeqCardDesc');
-      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
-      const vehicleDetails = document.getElementById('planVehicleDetails');
-      const launchDetails = document.getElementById('planLaunchDetails');
-      const startMissionBtn = document.getElementById('planStartMissionBtn');
-      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
-      const row = document.getElementById('planSeqPatternRow');
-      const on = !!enabled;
-      window.__planMissionStartStack = on;
-      if (missionPanel) {
-        missionPanel.classList.toggle('planMissionEmpty', on);
-        missionPanel.classList.toggle('planMissionStack', on);
-        missionPanel.classList.toggle('planMissionDetailsOpen', on);
-      }
-      if (missionHeader) missionHeader.textContent = on ? 'Mission Start' : 'Mission';
-      if (takeoffHead) takeoffHead.style.display = on ? 'none' : '';
-      if (takeoffDesc) takeoffDesc.style.display = on ? 'none' : '';
-      if (seqRtlBtn) seqRtlBtn.style.display = on ? 'none' : '';
-      // Keep Start Mission visible in Mission tab for both normal and stack layouts.
-      if (startMissionBtn) startMissionBtn.style.display = '';
-      if (compactList) {
-        compactList.setAttribute('aria-hidden', on ? 'false' : 'true');
-        compactList.style.display = on ? 'flex' : 'none';
-      }
-      if (compactSurveyLabel) compactSurveyLabel.textContent = String(surveyLabel || 'Survey');
-      if (compactSurveyBody) compactSurveyBody.textContent = String(surveyLabel || 'Survey') + ' pattern selected.';
-      if (row && on) {
-        row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
-      }
-      if (on) {
-        // Mission Start keeps its original details UI; only append plan rows below.
-        const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
-        const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
-        const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
-        const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
-        if (takeoffBody) takeoffBody.style.display = '';
-        if (vehicleDetails) vehicleDetails.style.display = '';
-        if (launchDetails) launchDetails.style.display = '';
-        if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
-        if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
-        if (compactRtlTab) compactRtlTab.classList.remove('is-active');
-        if (compactTakeoff) {
-          compactTakeoff.classList.remove('is-active');
-          compactTakeoff.style.display = 'none';
-        }
-        if (compactSurveyBody) {
-          compactSurveyBody.classList.remove('is-active');
-          compactSurveyBody.style.display = 'none';
-        }
-        if (compactRtlBody) {
-          compactRtlBody.classList.remove('is-active');
-          compactRtlBody.style.display = 'none';
-        }
-      } else {
-        missionPanel.classList.remove('planMissionDetailsOpen');
-        if (takeoffBody) takeoffBody.style.display = '';
-        if (vehicleDetails) vehicleDetails.style.display = '';
-        if (launchDetails) launchDetails.style.display = '';
-        if (compactSurveyBody) compactSurveyBody.classList.remove('is-active');
-        if (compactRtlBody) compactRtlBody.classList.remove('is-active');
-        const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
-        const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
-        const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
-        const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
-        if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
-        if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
-        if (compactRtlTab) compactRtlTab.classList.remove('is-active');
-        if (compactTakeoff) compactTakeoff.classList.remove('is-active');
-      }
-      return 1;
-    }
-    function applyPlanMissionPanelState(s) {
-      if (!s || typeof s !== 'object') return 0;
-      window.__planPanelSuppressEmit = true;
-      try {
-        const sel = document.getElementById('planAltReferenceSelect');
-        if (sel && s.altRef) sel.value = String(s.altRef);
-        const initEl = document.getElementById('planInitialWpAltInput');
-        if (initEl && s.initialWpAltFt != null) initEl.value = String(s.initialWpAltFt);
-        const hoverEl = document.getElementById('planHoverSpeedInput');
-        if (hoverEl && s.hoverMph != null) hoverEl.value = String(s.hoverMph);
-        const launchAltEl = document.getElementById('planLaunchAltInput');
-        if (launchAltEl && s.launchAltFt != null) launchAltEl.value = String(s.launchAltFt);
-        const latEl = document.getElementById('planLaunchLatVal');
-        const lonEl = document.getElementById('planLaunchLonVal');
-        const lt = s.launchLat != null ? String(s.launchLat).trim() : '';
-        const ln = s.launchLon != null ? String(s.launchLon).trim() : '';
-        if (latEl) latEl.textContent = lt || '—';
-        if (lonEl) lonEl.textContent = ln || '—';
-        updateLaunchMarkerFromPanel();
-        if (Array.isArray(s.wpMeta)) {
-          window.__planWpMeta = s.wpMeta.map((m) => ({
-            alt_m: Number(m && m.alt_m) || 0,
-            speed_mps: Number(m && m.speed_mps) || 0,
-          }));
-        }
-        renderPlanWpDetails();
-      } finally {
-        setTimeout(function() { window.__planPanelSuppressEmit = false; }, 0);
-      }
-      return 1;
-    }
-    function setPlanVehicleInfo(fw, veh) {
-      const a = document.getElementById('planVehicleFirmwareVal');
-      const b = document.getElementById('planVehicleTypeVal');
-      if (a) a.textContent = fw || '—';
-      if (b) b.textContent = veh || '—';
-      return 1;
-    }
-    function bindPlanMissionPanel() {
-      const sel = document.getElementById('planAltReferenceSelect');
-      if (sel) sel.addEventListener('change', schedulePlanMissionPanelEmit);
-      for (const id of ['planInitialWpAltInput', 'planHoverSpeedInput', 'planLaunchAltInput']) {
-        const el = document.getElementById(id);
-        if (!el) continue;
-        el.addEventListener('input', schedulePlanMissionPanelEmit);
-        el.addEventListener('change', schedulePlanMissionPanelEmit);
-      }
-      for (const id of ['planInitialWpAltInput', 'planHoverSpeedInput', 'planLaunchAltInput']) {
-        const el = document.getElementById(id);
-        if (!el) continue;
-        el.addEventListener('input', function() { renderPlanWpDetails(); });
-        el.addEventListener('change', function() { renderPlanWpDetails(); });
-      }
-      renderPlanWpDetails();
-    }
-
-    function centerOnVehicle() {
-      if (!vehicleMarker) return 0;
-      const p = vehicleMarker.getLatLng();
-      if (!p) return 0;
-      // 3D mode: center/focus Cesium camera on the vehicle entity.
-      if (window.__is3d) {
-        try {
-          if (viewer3d && vehicleEntity) {
-            try { vehicleEntity.show = true; } catch (e) {}
-            try {
-              viewer3d.flyTo(vehicleEntity, {
-                duration: 0.65,
-                offset: new Cesium.HeadingPitchRange(
-                  Cesium.Math.toRadians(Number(window.__heading || 0)),
-                  Cesium.Math.toRadians(-40.0),
-                  1400.0
-                )
-              });
-            } catch (e) {
-              try { focus3DCamera(true); } catch (e2) {}
-            }
-            try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
-            return 1;
-          }
-          // Fallback: if entity isn't ready, at least fly to lat/lon.
-          if (viewer3d && window.Cesium) {
-            viewer3d.camera.flyTo({
-              destination: Cesium.Cartesian3.fromDegrees(Number(p.lng), Number(p.lat), 1800),
-              orientation: {
-                heading: Cesium.Math.toRadians(Number(window.__heading || 0)),
-                pitch: Cesium.Math.toRadians(-35.0),
-                roll: 0.0
-              },
-              duration: 0.7
-            });
-            try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
-            return 1;
-          }
-        } catch (e) {}
-        return 0;
-      }
-      // 2D mode: center Leaflet map on the vehicle marker.
-      if (!map) return 0;
-      map.setView([p.lat, p.lng], Math.max(map.getZoom(), 16), { animate: true });
-      return 1;
-    }
-
-    function setHeaderMode(text) {
-      const el = document.getElementById('hdrModeText');
-      if (!el) return 0;
-      el.textContent = text || 'Hold';
-      return 1;
-    }
-
-    function setHeaderVehicleMsg(text) {
-      const el = document.getElementById('hdrVehicleMsg');
-      if (!el) return 0;
-      const raw = String(text || '').trim();
-      // Do not hard-truncate here; let CSS ellipsis handle tight layouts.
-      // Keep full text available via tooltip.
-      el.textContent = raw || 'Vehicle Msg';
-      try { el.title = raw || ''; } catch (e0) {}
-      // Client UX: if PreArm reports bad GPS fix, keep GPS visible but visually mute it.
-      try {
-        const low = raw.toLowerCase();
-        const badFix =
-          (low.includes('prearm') && low.includes('gps') && low.includes('bad fix')) ||
-          low.includes('bad fix');
-        const gpsPill = document.getElementById('hdrGpsPill');
-        if (gpsPill && gpsPill.classList) {
-          gpsPill.classList.toggle('hdrPillMuted', !!badFix);
-          try { gpsPill.title = badFix ? 'GPS: Bad fix' : ''; } catch (e2) {}
-        }
-      } catch (e) {}
-      return 1;
-    }
-
-    function setHeaderGps(sat, hdop) {
-      const satEl = document.getElementById('hdrGpsSat');
-      const hdopEl = document.getElementById('hdrGpsHdop');
-      if (!satEl || !hdopEl) return 0;
-      satEl.textContent = String(sat || '0');
-      hdopEl.textContent = String(hdop || 'N/A');
-      return 1;
-    }
-
-    function setHeaderBattery(text) {
-      const el = document.getElementById('hdrBatteryText');
-      if (!el) return 0;
-      el.textContent = text || 'N/A';
-      return 1;
-    }
-
-    function setHeaderRemoteId(text) {
-      const el = document.getElementById('hdrRemoteIdText');
-      if (!el) return 0;
-      el.textContent = text || 'ID';
-      return 1;
-    }
-
-    function updateCompassNeedle(deg) {
-      const needle = document.getElementById('needle');
-      const degLabel = document.getElementById('compassDeg');
-      if (!needle || !degLabel) return;
-      const normalized = ((Number(deg) || 0) % 360 + 360) % 360;
-      needle.style.transform = `rotate(${normalized}deg)`;
-      degLabel.textContent = `${Math.round(normalized)}°`;
-    }
-
-    function setTelemetryOverlay(relAltM, groundSpeedMps, timeText, mslAltM) {
-      const ft = (Number(relAltM || 0.0) * 3.28084).toFixed(1);
-      const mph = (Number(groundSpeedMps || 0.0) * 2.23694).toFixed(1);
-      const mslFt = (Number(mslAltM || 0.0) * 3.28084).toFixed(1);
-      const ttime = timeText || '00:00:00';
-      const prev = window.__telHudSig || '';
-      const sig = ft + '|' + mph + '|' + ttime + '|' + mslFt;
-      if (sig === prev) return 1;
-      window.__telHudSig = sig;
-      const setAll = (className, text) => {
-        document.querySelectorAll('.' + className).forEach((el) => {
-          el.textContent = text;
-        });
-      };
-      setAll('telRow1Alt', `${ft} ft`);
-      setAll('telRow1Mph', `${mph} mph`);
-      setAll('telRow1Time', ttime);
-      setAll('telRow2Alt', `${ft} ft`);
-      setAll('telRow2Mph', `${mph} mph`);
-      setAll('telRow2Msl', `${mslFt} ft`);
-      return 1;
-    }
-
-    function preferTelemetryStrip() {
-      // Keep the original bottom telemetry strip UI (vs. orbit "bubbles").
-      const stack = document.getElementById('telemetryLeftStack');
-      if (stack) stack.style.display = '';
-      document.querySelectorAll('.telOrbitItem').forEach((el) => el.remove());
-      return 1;
-    }
-
-    // Run once at startup (safe if orbit items don't exist).
-    preferTelemetryStrip();
-
-    function ensure3D() {
-      if (viewer3d) return true;
-      if (!window.Cesium) return false;
-      try {
-        const cesiumCreditHost = document.createElement('div');
-        cesiumCreditHost.style.display = 'none';
-        cesiumCreditHost.setAttribute('aria-hidden', 'true');
-        document.body.appendChild(cesiumCreditHost);
-        viewer3d = new Cesium.Viewer('map3d', {
-          creditContainer: cesiumCreditHost,
-          timeline: false,
-          animation: false,
-          geocoder: false,
-          baseLayerPicker: false,
-          homeButton: false,
-          sceneModePicker: true,
-          navigationHelpButton: false,
-          fullscreenButton: false,
-          infoBox: false,
-          selectionIndicator: false,
-          terrainProvider: new Cesium.EllipsoidTerrainProvider(),
-          imageryProvider: new Cesium.OpenStreetMapImageryProvider({
-            url: 'https://tile.openstreetmap.org/'
-          })
-        });
-        // Make sure the vehicle marker stays visible on top of imagery/terrain.
-        try { viewer3d.scene.globe.depthTestAgainstTerrain = false; } catch (e) {}
-        // Prevent excessive zoom-in (can cause ground/imagery artifacts in Qt WebEngine builds).
-        try {
-          const ssc = viewer3d.scene && viewer3d.scene.screenSpaceCameraController
-            ? viewer3d.scene.screenSpaceCameraController
-            : null;
-          if (ssc) {
-            ssc.minimumZoomDistance = 250.0; // meters
-            ssc.enableCollisionDetection = true;
-          }
-        } catch (e) {}
-        // Hard clamp camera height too (minimumZoomDistance isn't always sufficient at shallow pitch).
-        try {
-          const MIN_CAM_H_M = 250.0;
-          let __clamping = false;
-          viewer3d.camera.changed.addEventListener(function() {
-            if (__clamping) return;
-            try {
-              const c = viewer3d.camera.positionCartographic;
-              if (!c || !Number.isFinite(c.height)) return;
-              if (c.height >= MIN_CAM_H_M) return;
-              __clamping = true;
-              viewer3d.camera.setView({
-                destination: Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, MIN_CAM_H_M),
-                orientation: {
-                  heading: viewer3d.camera.heading,
-                  pitch: viewer3d.camera.pitch,
-                  roll: viewer3d.camera.roll
-                }
-              });
-            } catch (e) {
-              // ignore
-            } finally {
-              __clamping = false;
-            }
-          });
-        } catch (e) {}
-        // Force a known imagery layer for stable no-key rendering in WebEngine.
-        try {
-          viewer3d.imageryLayers.removeAll();
-          viewer3d.imageryLayers.addImageryProvider(
-            new Cesium.UrlTemplateImageryProvider({
-              url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-              credit: 'Tiles © Esri'
-            })
-          );
-          // Overlay: borders + place labels (transparent) to match client reference.
-          try {
-            viewer3d.imageryLayers.addImageryProvider(
-              new Cesium.UrlTemplateImageryProvider({
-                url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
-                credit: ''
-              })
-            );
-          } catch (e2) {}
-        } catch (e) {
-          // Fallback to OSM if ArcGIS provider fails.
-          try {
-            viewer3d.imageryLayers.removeAll();
-            viewer3d.imageryLayers.addImageryProvider(
-              new Cesium.OpenStreetMapImageryProvider({
-                url: 'https://tile.openstreetmap.org/'
-              })
-            );
-          } catch (e2) {}
-        }
-        // Vehicle marker for 3D: use the same arrow/chevron SVG as 2D, as a Cesium billboard.
-        const seed = vehicleMarker ? vehicleMarker.getLatLng() : null;
-        const seedLat = (window.__lastVehLat != null ? window.__lastVehLat : (seed ? seed.lat : 24.7136));
-        const seedLon = (window.__lastVehLon != null ? window.__lastVehLon : (seed ? seed.lng : 46.6753));
-        // Convert inline SVG to a data URL for Cesium billboard rendering.
-        const __vehSvg = (typeof vehicleMarkerSvg === 'string' && vehicleMarkerSvg.length)
-          ? vehicleMarkerSvg
-          : '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">' +
-            '<path d="M15 2.5 L26.2 22.5 L17.8 19.8 L15 27.5 L12.2 19.8 L3.8 22.5 Z" ' +
-            'fill="#ff2328" stroke="#4a1222" stroke-width="1.35" stroke-linejoin="round"/>' +
-            '<path d="M15 5 L15 22" stroke="#3a0f18" stroke-width="1.05" stroke-linecap="round"/>' +
-            '</svg>';
-        const __vehSvgUrl = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(__vehSvg);
-        vehicleEntity = viewer3d.entities.add({
-          // Use a small fixed height above ellipsoid to ensure visibility even when clamping fails.
-          position: Cesium.Cartesian3.fromDegrees(Number(seedLon) || 46.6753, Number(seedLat) || 24.7136, 30),
-          billboard: {
-            image: __vehSvgUrl,
-            width: 30,
-            height: 30,
-            verticalOrigin: Cesium.VerticalOrigin.CENTER,
-            horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
-            rotation: Cesium.Math.toRadians(Number(window.__heading || 0)),
-            alignedAxis: Cesium.Cartesian3.UNIT_Z,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
-            scaleByDistance: new Cesium.NearFarScalar(250.0, 1.15, 4500.0, 0.55)
-          }
-        });
-        headingEntity = viewer3d.entities.add({
-          polyline: {
-            positions: [],
-            width: 0,
-            material: Cesium.Color.fromCssColorString('#00000000')
-          }
-        });
-        window.__3dHasInitialFocus = false;
-        return true;
-      } catch (e) {
-        return false;
-      }
-    }
-
-    function focus3DCamera(force) {
-      if (!viewer3d || !window.Cesium) return 0;
-      if (!force && window.__3dHasInitialFocus) return 0;
-      const p = vehicleMarker ? vehicleMarker.getLatLng() : null;
-      const lat = p ? Number(p.lat) : 24.7136;
-      const lon = p ? Number(p.lng) : 46.6753;
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return 0;
-      try {
-        viewer3d.camera.flyTo({
-          destination: Cesium.Cartesian3.fromDegrees(lon, lat, 1800),
-          orientation: {
-            heading: Cesium.Math.toRadians(Number(window.__heading || 0)),
-            pitch: Cesium.Math.toRadians(-35.0),
-            roll: 0.0
-          },
-          duration: 0.9
-        });
-        window.__3dHasInitialFocus = true;
-        return 1;
-      } catch (e) {
-        return 0;
-      }
-    }
-
-    function syncVehicleHeadingLine() {
-      clearVehicleHeadingLine();
-    }
-
-    function clearVehicleHeadingLine() {
-      headingLine.setLatLngs([]);
-      if (headingEntity) {
-        headingEntity.polyline.positions = [];
-      }
-    }
-
-    function updateHeadingLineGeometry(lat, lon, deg) {
-      clearVehicleHeadingLine();
-    }
-
-    function haversine_m(lat1, lon1, lat2, lon2) {
-      const R = 6371000;
-      const toR = (x) => x * Math.PI / 180;
-      const dLat = toR(lat2 - lat1);
-      const dLon = toR(lon2 - lon1);
-      const a = Math.sin(dLat / 2) ** 2 +
-        Math.cos(toR(lat1)) * Math.cos(toR(lat2)) * Math.sin(dLon / 2) ** 2;
-      return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
-    }
-
-    function appendFlightTrack(lat, lon) {
-      try {
-        if (__lastTrackLat != null && __lastTrackLon != null) {
-          const d = haversine_m(__lastTrackLat, __lastTrackLon, lat, lon);
-          if (d < 0.3) return;
-        }
-        __lastTrackLat = lat;
-        __lastTrackLon = lon;
-        let pts = (flightTrack.getLatLngs() || []).concat([[lat, lon]]);
-        const trimM = 10;
-        while (pts.length > 1) {
-          const a = pts[0];
-          if (haversine_m(a.lat, a.lng, lat, lon) < trimM) pts = pts.slice(1);
-          else break;
-        }
-        const maxPts = 200;
-        while (pts.length > maxPts) pts = pts.slice(pts.length - maxPts);
-        flightTrack.setLatLngs(pts);
-        if (pts.length && !map.hasLayer(flightTrack)) flightTrack.addTo(map);
-      } catch (e) {}
-    }
-
-    function clearFlightTrack() {
-      __lastTrackLat = null;
-      __lastTrackLon = null;
-      try { flightTrack.setLatLngs([]); } catch (e) {}
-      try { if (map.hasLayer(flightTrack)) map.removeLayer(flightTrack); } catch (e) {}
-    }
-
-    function updateMissionRoutePolyline() {
-      try {
-        const navSeq = Number(window.__missionNavSeq) || 0;
-        let startIdx = 0;
-        // VGCS mission layout sent to ArduPilot:
-        //   seq 0: dummy (home slot / protocol placeholder)
-        //   seq 1: TAKEOFF
-        //   seq 2: DO_CHANGE_SPEED for WP1
-        //   seq 3: WP1
-        //   seq 4: DO_CHANGE_SPEED for WP2
-        //   seq 5: WP2
-        // Therefore map MISSION_CURRENT.seq -> waypoint array index:
-        //   - before seq 3: start at WP1 (index 0)
-        //   - seq>=3: floor((seq-3)/2)
-        if (navSeq >= 3) {
-          startIdx = Math.max(0, Math.min(waypoints.length, Math.floor((navSeq - 3) / 2)));
-        } else {
-          startIdx = 0;
-        }
-        const veh = vehicleMarker && vehicleMarker.getLatLng();
-        const rest = waypoints.slice(startIdx).map((w) => w.getLatLng());
-        let ll = [];
-        if (veh && rest.length >= 1) {
-          ll = [[veh.lat, veh.lng]].concat(rest);
-        } else if (rest.length >= 2) {
-          ll = rest;
-        } else if (veh && rest.length === 1) {
-          ll = [[veh.lat, veh.lng], rest[0]];
-        } else if (rest.length === 1) {
-          ll = rest;
-        }
-        if (ll.length < 2) {
-          if (map.hasLayer(missionRoute)) map.removeLayer(missionRoute);
-          return;
-        }
-        missionRoute.setLatLngs(ll);
-        if (!map.hasLayer(missionRoute)) missionRoute.addTo(map);
-        try { missionRoute.bringToFront(); } catch (e) {}
-      } catch (e) {}
-    }
-
-    function setVehicle(lat, lon) {
-      vehicleMarker.setLatLng([lat, lon]);
-      window.__lastVehLat = lat;
-      window.__lastVehLon = lon;
-      appendFlightTrack(lat, lon);
-      updateHeadingLineGeometry(lat, lon, window.__heading || 0);
-      updateMissionRoutePolyline();
-      if (vehicleEntity) {
-        // Cesium stores `entity.position` as a Property; in some Qt WebEngine builds,
-        // reassigning `entity.position = Cartesian3` doesn't reliably update the visual.
-        // Prefer `setValue()` when available.
-        const p3 = Cesium.Cartesian3.fromDegrees(lon, lat, 30);
-        try {
-          if (vehicleEntity.position && typeof vehicleEntity.position.setValue === 'function') {
-            vehicleEntity.position.setValue(p3);
-          } else {
-            vehicleEntity.position = p3;
-          }
-        } catch (e) {
-          try { vehicleEntity.position = p3; } catch (e2) {}
-        }
-        try { vehicleEntity.show = true; } catch (e) {}
-        try { viewer3d && viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
-      }
-      if (window.__is3d && !window.__3dHasInitialFocus) {
-        focus3DCamera(false);
-      }
-    }
-
-    function nowMs() {
-      return (typeof performance !== 'undefined' && performance.now)
-        ? performance.now()
-        : Date.now();
-    }
-
-    function cancelHeadingSchedule() {
-      if (__headingRafId != null) {
-        clearTimeout(__headingRafId);
-        __headingRafId = null;
-      }
-      __headingPending = null;
-    }
-
-    function applyHeadingVisuals(deg, latArg, lonArg) {
-      const d = ((Number(deg) || 0) % 360 + 360) % 360;
-      window.__heading = d;
-      updateCompassNeedle(d);
-      const p = vehicleMarker.getLatLng();
-      const lat = latArg !== undefined ? latArg : p.lat;
-      const lon = lonArg !== undefined ? lonArg : p.lng;
-      updateHeadingLineGeometry(lat, lon, d);
-      try {
-        if (vehicleEntity && vehicleEntity.billboard) {
-          vehicleEntity.billboard.rotation = Cesium.Math.toRadians(d);
-        }
-      } catch (e) {}
-      try {
-        const el = vehicleMarker.getElement && vehicleMarker.getElement();
-        if (el) {
-          const inner = el.querySelector('.vgcs-vehicle-marker-inner');
-          if (inner) inner.style.transform = 'rotate(' + d + 'deg)';
-        }
-      } catch (e) {}
-      __headingLastApplyMs = nowMs();
-    }
-
-    function flushHeadingPending() {
-      __headingRafId = null;
-      if (!__headingPending) return;
-      const { deg, latArg, lonArg, source } = __headingPending;
-      __headingPending = null;
-      if (source === 'att' && (__headingLastVfrMs > 0) && (nowMs() - __headingLastVfrMs < VFR_HEADING_PRIORITY_MS)) {
-        return;
-      }
-      if (source === 'vfr' || source === 'gpi') {
-        __headingLastVfrMs = nowMs();
-      }
-      applyHeadingVisuals(deg, latArg, lonArg);
-    }
-
-    function scheduleHeadingUpdate(deg, latArg, lonArg, source) {
-      __headingPending = { deg, latArg, lonArg, source: source || 'mixed' };
-      const t = nowMs();
-      const wait = Math.max(0, HEADING_MIN_INTERVAL_MS - (t - __headingLastApplyMs));
-      if (__headingRafId != null) {
-        clearTimeout(__headingRafId);
-      }
-      __headingRafId = setTimeout(flushHeadingPending, wait);
-    }
-
-    function updateHeading(deg, latArg, lonArg, source) {
-      if (latArg !== undefined || lonArg !== undefined) {
-        applyHeadingVisuals(deg, latArg, lonArg);
-        return;
-      }
-      scheduleHeadingUpdate(deg, latArg, lonArg, source);
-    }
-
-    function enableAddWaypoint() { addMode = true; addFenceMode = false; }
-    function enableFencePolygon() { addFenceMode = true; addMode = false; }
-
-    function waypointNumberIcon(n) {
-      const html =
-        '<div class="vgcs-wp-pin" aria-label="Waypoint ' + n + '">' +
-        '<span class="vgcs-wp-disc"></span>' +
-        '<span class="vgcs-wp-num">' + n + '</span></div>';
-      return L.divIcon({
-        html: html,
-        className: 'vgcs-wp-divicon',
-        iconSize: [26, 26],
-        iconAnchor: [13, 13],
-      });
-    }
-
-    function refreshWaypointLabels() {
-      waypoints.forEach((w, i) => {
-        try {
-          w.setIcon(waypointNumberIcon(i + 1));
-        } catch (e) {}
-      });
-    }
-
-    function attachWaypointDeleteHandlers(marker) {
-      if (!marker) return;
-      const removeThis = () => {
-        try { map.removeLayer(marker); } catch (e) {}
-        waypoints = waypoints.filter(w => w !== marker);
-        refreshWaypointLabels();
-        syncVehicleHeadingLine();
-        updateMissionRoutePolyline();
-      };
-      // Fast delete gesture for planning workflows.
-      marker.on('dblclick', function(ev) {
-        if (ev) {
-          ev.originalEvent?.preventDefault?.();
-          ev.originalEvent?.stopPropagation?.();
-        }
-        removeThis();
-      });
-      marker.on('contextmenu', function(ev) {
-        if (ev) {
-          ev.originalEvent?.preventDefault?.();
-          ev.originalEvent?.stopPropagation?.();
-        }
-        removeThis();
-      });
-    }
-
-    function addWaypointMarker(latlng) {
-      const idx = waypoints.length + 1;
-      const m = L.marker(latlng, {
-        icon: waypointNumberIcon(idx),
-        interactive: true,
-        bubblingMouseEvents: false,
-        keyboard: false,
-        pane: 'overlayPane',
-      }).addTo(map);
-      attachWaypointDeleteHandlers(m);
-      waypoints.push(m);
-      refreshWaypointLabels();
-      syncVehicleHeadingLine();
-      renderPlanWpDetails();
-      return m;
-    }
-
-    function clearWaypoints() {
-      for (const wp of waypoints) map.removeLayer(wp);
-      waypoints = [];
-      window.__missionNavSeq = 0;
-      window.__planWpMeta = [];
-      syncVehicleHeadingLine();
-      updateMissionRoutePolyline();
-      return 0;
-    }
-
-    let fenceCircle = null;
-    function setFence(lat, lon, radiusM) {
-      if (fenceCircle) map.removeLayer(fenceCircle);
-      fenceCircle = L.circle([lat, lon], {
-        radius: radiusM,
-        color: '#f87171',
-        fillColor: '#f87171',
-        fillOpacity: 0.08,
-        weight: 2
-      }).addTo(map);
-    }
-
-    function clearFence() {
-      if (fenceCircle) {
-        map.removeLayer(fenceCircle);
-        fenceCircle = null;
-      }
-      if (fencePolygon) {
-        map.removeLayer(fencePolygon);
-        fencePolygon = null;
-      }
-      fencePoints = [];
-      return 1;
-    }
-
-    function getFencePoints() { return fencePoints.slice(); }
-
-    function setFencePolygon(points) {
-      if (fencePolygon) map.removeLayer(fencePolygon);
-      fencePoints = points || [];
-      if (fencePoints.length >= 3) {
-        fencePolygon = L.polygon(fencePoints, {
-          color: '#f97316',
-          fillColor: '#f97316',
-          fillOpacity: 0.08,
-          weight: 2
-        }).addTo(map);
-      }
-      return fencePoints.length;
-    }
-
-    function getWaypoints() {
-      return waypoints.map(w => [w.getLatLng().lat, w.getLatLng().lng]);
-    }
-
-    function setWaypoints(points) {
-      clearWaypoints();
-      for (const p of points) {
-        addWaypointMarker([p[0], p[1]]);
-      }
-      updateMissionRoutePolyline();
-      renderPlanWpDetails();
-    }
-
-    function getWaypointCount() { return waypoints.length; }
-
-    function set3DEnabled(enabled) {
-      if (enabled) {
-        if (!ensure3D()) return false;
-        document.getElementById('map2d').style.display = 'none';
-        document.getElementById('map3d').style.display = 'block';
-        window.__is3d = true;
-        if (hdrMapModeBtn) hdrMapModeBtn.textContent = '2D';
-        // Ensure vehicle marker is in view and updating when switching modes.
-        try {
-          if (viewer3d && vehicleEntity) {
-            try { vehicleEntity.show = true; } catch (e) {}
-            viewer3d.trackedEntity = vehicleEntity;
-            setTimeout(() => { try { viewer3d.trackedEntity = undefined; } catch (e) {} }, 900);
-            // Hard focus: trackedEntity can be flaky in some WebEngine builds; fly/zoom as fallback.
-            try {
-              viewer3d.flyTo(vehicleEntity, {
-                duration: 0.6,
-                offset: new Cesium.HeadingPitchRange(
-                  Cesium.Math.toRadians(Number(window.__heading || 0)),
-                  Cesium.Math.toRadians(-40.0),
-                  1800.0
-                )
-              });
-            } catch (e) {
-              try { viewer3d.zoomTo(vehicleEntity); } catch (e2) {}
-            }
-            try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
-          }
-        } catch (e) {}
-        focus3DCamera(true);
-        return true;
-      }
-      document.getElementById('map3d').style.display = 'none';
-      document.getElementById('map2d').style.display = 'block';
-      window.__is3d = false;
-      if (hdrMapModeBtn) hdrMapModeBtn.textContent = '3D';
-      return false;
-    }
-
-    map.on('click', function(e) {
-      if (addMode) {
-        addWaypointMarker(e.latlng);
-        updateMissionRoutePolyline();
-        return;
-      }
-      if (addFenceMode) {
-        fencePoints.push([e.latlng.lat, e.latlng.lng]);
-        setFencePolygon(fencePoints);
-        return;
-      }
-      if (__obsMarkMode) {
-        addObservationMapMarker(e.latlng.lat, e.latlng.lng);
-        document.title = 'VGCS_OBS_MAP_MARK:' + String(e.latlng.lat) + ':' + String(e.latlng.lng) + ':' + Date.now();
-      }
-    });
-  </script>
-</body>
-</html>
+# Native camera rail / fullscreen video: offset from the **top of the map canvas** (px).
+# Smaller = tighter gap below the app header and the floating rail.
+_NATIVE_CAM_RAIL_TOP_PX = 44
+
+# Legacy Web `#actionRail { top: 78px; left: 10px }` sat below the in-map `#linkBanner`. The native map
+# has no in-map banner, so a large Y offset only adds empty gap under the app header — use a tight margin.
+_MAP_ACTION_RAIL_LEFT_PX = 10
+_MAP_ACTION_RAIL_TOP_PX = 10
+
+# Primary map: NativeTileMapView. Optional 3D: lazy Qt WebEngine + vendored Leaflet/Cesium (see map_web_3d).
+HAS_WEBENGINE = HAS_WEBENGINE_3D
+
+# Legacy placeholder (HTML lives in legacy_leaflet_map.html + legacy_leaflet_build).
+LEAFLET_HTML = ""
+
+
+def _native_cam_record_dot_pixmap(size: int = 14) -> QPixmap:
+    """Inner red dot raster for `#camRecordBtn` (`size` px, matches button scale)."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    rg = QRadialGradient(float(size) * 0.5, float(size) * 0.35, float(size) * 0.48)
+    rg.setColorAt(0.0, QColor("#ff4b4b"))
+    rg.setColorAt(1.0, QColor("#f62d2d"))
+    p.setBrush(QBrush(rg))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawEllipse(0, 0, size, size)
+    p.end()
+    return pm
+
+
+# Native `#cameraRail` — label/button text matches `TELEMETRY_STRIP_VALUE_STYLE` in map_footer_hud.py
+# (`color: #dce5f5; font-size: 15px; font-weight: 600`).
+_NATIVE_CAMERA_RAIL_QSS = """
+#nativeCameraRail {
+  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+    stop:0 rgba(36, 44, 58, 250), stop:1 rgba(28, 34, 46, 252));
+  border: 1px solid rgba(180, 198, 224, 55);
+  border-radius: 12px;
+  min-width: 220px;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  color: #dce5f5;
+  font-size: 15px;
+  font-weight: 600;
+}
+#cameraTopRow {
+  background: rgba(72, 84, 108, 118);
+  border: 1px solid rgba(190, 202, 224, 45);
+  border-radius: 7px;
+}
+QPushButton#camVideoBtn {
+  width: 28px;
+  height: 28px;
+  max-width: 28px;
+  max-height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  border-radius: 14px;
+  padding: 0px;
+  margin: 0px;
+  margin-right: 2px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #dce5f5;
+  font-size: 15px;
+  font-weight: 600;
+}
+QPushButton#camVideoBtn:hover {
+  background: rgba(110, 123, 148, 51);
+}
+QPushButton#camVideoBtn:checked {
+  border: 1px solid rgba(214, 224, 241, 230);
+  background: rgba(27, 33, 45, 245);
+}
+QPushButton#camPhotoBtn {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  max-width: 28px;
+  min-height: 28px;
+  max-height: 28px;
+  border-radius: 14px;
+  padding: 0px;
+  margin: 0px;
+  margin-right: 2px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #dce5f5;
+  font-size: 15px;
+  font-weight: 600;
+}
+QPushButton#camPhotoBtn:hover {
+  background: rgba(110, 123, 148, 51);
+}
+QPushButton#camPhotoBtn:checked {
+  border: 1px solid rgba(214, 224, 241, 230);
+  background: rgba(27, 33, 45, 245);
+}
+/* Split / Follow: icon-only — same 28px footprint as `#camPhotoBtn` (git `camSplitBtn` / `camFollowBtn`). */
+QPushButton#camSplitBtn, QPushButton#camFollowBtn {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  max-width: 28px;
+  min-height: 28px;
+  max-height: 28px;
+  padding: 0px;
+  margin: 0px;
+  border-radius: 7px;
+  border: 1px solid rgba(196, 209, 230, 55);
+  background-color: rgba(22, 27, 38, 235);
+  color: #e8edf8;
+}
+QPushButton#camSplitBtn:hover, QPushButton#camFollowBtn:hover {
+  background-color: rgba(40, 48, 62, 245);
+  border-color: rgba(229, 237, 251, 85);
+}
+QPushButton#camSplitBtn:checked, QPushButton#camFollowBtn:checked {
+  border: 1px solid rgba(105, 232, 111, 220);
+  background-color: rgba(24, 52, 34, 250);
+  color: #c8ffc8;
+}
+QPushButton#camRecordBtn {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  max-width: 34px;
+  min-height: 34px;
+  max-height: 34px;
+  padding: 0px;
+  border-radius: 17px;
+  border: 1px solid rgba(231, 239, 255, 180);
+  background: qradialgradient(cx:0.5, cy:0.35, radius:0.7, fx:0.5, fy:0.35,
+    stop:0 rgba(35, 43, 57, 250), stop:1 rgba(20, 26, 36, 250));
+}
+QPushButton#camRecordBtn:checked {
+  border: 1px solid rgba(255, 130, 130, 220);
+}
+QLabel#camTimer {
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  color: #dce5f5;
+  background: rgba(255, 65, 65, 220);
+  border-radius: 6px;
+  padding: 3px 10px;
+  min-width: 82px;
+  border: none;
+}
+QLabel#camSectionHeader {
+  color: #dce5f5;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 0px 1px 2px 1px;
+  margin-top: 0px;
+  border: none;
+  background: transparent;
+  min-height: 18px;
+}
+QFrame#camRecordArch {
+  margin-top: 0px;
+  border: none;
+  background: transparent;
+}
+QFrame#camRailSep {
+  background: rgba(188, 202, 224, 45);
+  max-height: 1px;
+  min-height: 1px;
+  border: none;
+  margin-top: 2px;
+  margin-bottom: 2px;
+}
+QFrame#camObserveSegment {
+  border: 1px solid rgba(196, 209, 230, 38);
+  border-radius: 7px;
+  background: rgba(14, 17, 26, 140);
+}
+QPushButton#observeTarget {
+  border: none;
+  border-right: 1px solid rgba(196, 209, 230, 35);
+  border-top-left-radius: 6px;
+  border-bottom-left-radius: 6px;
+  min-height: 30px;
+  padding: 2px 4px;
+  background: transparent;
+  color: #dce5f5;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+}
+QPushButton#observeClip {
+  border: none;
+  border-top-right-radius: 6px;
+  border-bottom-right-radius: 6px;
+  min-height: 30px;
+  padding: 2px 4px;
+  background: transparent;
+  color: #dce5f5;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+}
+QPushButton#observeTarget:checked, QPushButton#observeClip:checked {
+  background: rgba(27, 33, 45, 235);
+}
+QPushButton#observeReport, QPushButton#observeReset {
+  min-height: 30px;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  border-radius: 6px;
+  border: 1px solid rgba(196, 209, 230, 38);
+  background: rgba(18, 22, 32, 75);
+  color: #dce5f5;
+  padding: 2px 6px;
+}
+QPushButton[camPadBtn=true] {
+  min-width: 40px;
+  min-height: 30px;
+  border-radius: 6px;
+  border: 1px solid rgba(196, 209, 230, 38);
+  background: rgba(18, 22, 32, 75);
+  color: #dce5f5;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  padding: 1px 4px;
+}
+QPushButton[camPadBtn=true]:hover {
+  background: rgba(110, 123, 148, 45);
+  border-color: rgba(229, 237, 251, 70);
+}
+QPushButton[camPadBtn=true]:checked {
+  border-color: rgba(214, 224, 241, 230);
+  background: rgba(27, 33, 45, 245);
+}
 """
+
+
+def _cam_rail_sep() -> QFrame:
+    """Divider between git `#cameraRail` core (video…settings) and MAVLink pad extras."""
+    f = QFrame()
+    f.setObjectName("camRailSep")
+    f.setFixedHeight(1)
+    return f
+
+
+def _cam_rail_section(title: str, *body: object) -> QWidget:
+    """Section title (`#camSectionHeader`) then `QHBoxLayout`(s) or `QWidget` (e.g. zoom track)."""
+    box = QWidget()
+    vl = QVBoxLayout(box)
+    vl.setContentsMargins(0, 0, 0, 0)
+    vl.setSpacing(2)
+    lab = QLabel(title)
+    lab.setObjectName("camSectionHeader")
+    lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    lab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    vl.addWidget(lab)
+    for item in body:
+        if isinstance(item, QWidget):
+            vl.addWidget(item)
+        elif isinstance(item, QHBoxLayout):
+            vl.addLayout(item)
+        else:
+            raise TypeError(item)
+    return box
+
+
+def _cam_rail_plus_minus_pair(left: QWidget, right: QWidget) -> QWidget:
+    """Discrete − / + row (replaces range-style sliders for zoom / focus)."""
+    w = QWidget()
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(0, 2, 0, 2)
+    lay.setSpacing(12)
+    lay.addStretch(1)
+    lay.addWidget(left, 0, Qt.AlignmentFlag.AlignVCenter)
+    lay.addWidget(right, 0, Qt.AlignmentFlag.AlignVCenter)
+    lay.addStretch(1)
+    return w
+
+
+def _cam_rail_gimbal_horizontal_row(left: QWidget, up: QWidget, right: QWidget) -> QWidget:
+    """Yaw L / pitch up / yaw R — discrete buttons (no range track)."""
+    w = QWidget()
+    lay = QHBoxLayout(w)
+    lay.setContentsMargins(0, 2, 0, 2)
+    lay.setSpacing(8)
+    lay.addStretch(1)
+    lay.addWidget(left, 0, Qt.AlignmentFlag.AlignVCenter)
+    lay.addWidget(up, 0, Qt.AlignmentFlag.AlignVCenter)
+    lay.addWidget(right, 0, Qt.AlignmentFlag.AlignVCenter)
+    lay.addStretch(1)
+    return w
 
 
 class _VideoEncodeBridge(QObject):
@@ -4686,60 +514,6 @@ class _VideoEncodeTask(QRunnable):
             self._bridge.encoded.emit(data_url)
         except Exception:
             return
-
-
-class _TileHeaderInterceptor(QWebEngineUrlRequestInterceptor):  # type: ignore[misc]
-    """Attach browser-like headers to tile requests.
-
-    Some tile providers block desktop apps when the referrer is file:// or missing.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def interceptRequest(self, info) -> None:  # pragma: no cover - runtime/Qt dependent
-        try:
-            url = info.requestUrl().toString()
-        except Exception:
-            return
-        if not url:
-            return
-        try:
-            u = url.lower()
-        except Exception:
-            u = url
-        try:
-            # OSM blocks many desktop apps unless a proper https referrer is present.
-            if "openstreetmap.org" in u:
-                info.setHttpHeader(b"Referer", b"https://www.openstreetmap.org/")
-                info.setHttpHeader(
-                    b"User-Agent",
-                    b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    b"(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                )
-                return
-            if "arcgisonline.com" in u or "arcgis.com" in u:
-                info.setHttpHeader(b"Referer", b"https://www.arcgis.com/")
-                info.setHttpHeader(
-                    b"User-Agent",
-                    b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    b"(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                )
-                return
-        except Exception:
-            return
-
-
-class _LoggingWebPage(QWebEnginePage):  # type: ignore[misc]
-    """Forward JS console messages to Python stdout for client-side diagnostics."""
-
-    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID) -> None:  # pragma: no cover
-        try:
-            src = str(sourceID or "")
-            msg = str(message or "")
-            print(f"[VGCS:map] {src}:{int(lineNumber)} {msg}")
-        except Exception:
-            pass
 
 
 class _TileProbeBridge(QObject):
@@ -4844,11 +618,15 @@ class MapWidget(QWidget):
     plan_flight_exited = Signal()
     map_page_ready = Signal()
     toggle_3d_requested = Signal()
+    map_3d_mode_changed = Signal()  # _is_3d_mode updated (async load / JS / back to 2D)
     mission_start_requested = Signal()
     plan_mission_panel_changed = Signal(object)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, video_pipeline: VideoPipeline | None = None) -> None:
         super().__init__(parent)
+        # When embedded in MainWindow, share its VideoPipeline so RTSP is decoded once.
+        # Without this, map PiP + footer "Split camera video" each ran a separate pipeline (duplicate UI).
+        self._video_pipeline_shared: VideoPipeline | None = video_pipeline
         self._lat: float | None = None
         self._lon: float | None = None
         self._heading: float | None = None
@@ -4856,6 +634,9 @@ class MapWidget(QWidget):
         self._waypoints_model: list[Waypoint] = []
         self._web_ready = False
         self._is_3d_mode = False
+        self._web_3d_view = None
+        self._web_3d_ready = False
+        self._pending_3d_activate = False
         self._fence_radius_m = 80.0
         self._last_plan_flight_metrics_payload: dict[str, object] | None = None
         self._vehicle_pose_timer = QTimer(self)
@@ -4881,6 +662,7 @@ class MapWidget(QWidget):
 
         # M3 video settings snapshot (applied lazily when video backend initializes).
         self._video_settings_enabled = False
+        self._video_settings_source = "rtsp"
         self._video_settings_day = ""
         self._video_settings_thermal = ""
         self._video_settings_rtsp_transport = "auto"
@@ -4889,6 +671,8 @@ class MapWidget(QWidget):
         self._obs_mark_mode = False
         self._observations: list[dict[str, object]] = []
         self._vehicle_rel_alt_m: float | None = None
+        # Camera rail: "video" = live/shooting (record toggles); "photo" = still mode (center = shutter).
+        self._camera_rail_ui_mode: str = "video"
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -4910,6 +694,7 @@ class MapWidget(QWidget):
         self._native_video_preview = QLabel(self._map_canvas)
         self._native_video_preview.setObjectName("nativeVideoPreview")
         self._native_video_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._native_video_preview.setAutoFillBackground(True)
         self._native_video_preview.setStyleSheet(
             "QLabel#nativeVideoPreview {"
             "background: #000;"
@@ -4921,26 +706,141 @@ class MapWidget(QWidget):
         self._native_video_preview.raise_()
         self._native_video_last = QImage()
         self._video_swapped = False
-        self._native_overlay_insets = {"left": 170, "top": 58, "right": 220, "bottom": 130}
+        self._native_overlay_insets = {
+            "left": 170,
+            "top": _NATIVE_CAM_RAIL_TOP_PX,
+            "right": 192,
+            "bottom": 130,
+        }
         self._native_video_preview.mousePressEvent = self._on_native_video_click  # type: ignore[assignment]
-        self._native_hud_right = QFrame(self._map_canvas)
-        self._native_hud_right.setStyleSheet(
-            "QFrame { background: rgba(12, 16, 40, 0.95); border: 1px solid rgba(140, 160, 196, 0.35); border-radius: 14px; }"
-            "QPushButton { background: rgba(20, 26, 56, 0.96); color: #ecf2ff; border: 1px solid rgba(132, 152, 190, 0.35); border-radius: 8px; min-height: 26px; font-size: 11px; font-weight: 600; }"
-            "QPushButton:checked { background: rgba(199, 44, 62, 0.96); border-color: rgba(255, 200, 205, 0.5); }"
-            "QLabel { color: rgba(206, 220, 244, 0.72); font-size: 9px; font-weight: 700; letter-spacing: 0.08em; }"
+        # Rail is a **sibling** of `_map_canvas` under the map panel (not a child of `_map_canvas`).
+        # PiP `QLabel` + tile map live inside `_map_canvas`; keeping the rail on the same surface made
+        # `setPixmap`/stacking reorder the PiP above the rail on some platforms (photo / rail unclickable).
+        # Opaque `QFrame` host: on Windows a bare `QWidget` can be hit-transparent; clicks fall through to the map.
+        self._native_rail_layer = QFrame(panel)
+        self._native_rail_layer.setObjectName("nativeCameraRailLayer")
+        self._native_rail_layer.setFrameShape(QFrame.Shape.NoFrame)
+        self._native_rail_layer.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._native_rail_layer.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self._native_rail_layer.setAutoFillBackground(True)
+        self._native_rail_layer.setStyleSheet(
+            "QFrame#nativeCameraRailLayer { background-color: rgb(28, 34, 46); border: none; }"
         )
+        self._native_rail_layer.hide()
+        # Native `#cameraRail`: single `QFrame` — height follows layout (no `QScrollArea` scrollbar).
+        self._native_hud_right = QFrame(self._native_rail_layer)
+        self._native_hud_right.setObjectName("nativeCameraRail")
+        self._native_hud_right.setStyleSheet(_NATIVE_CAMERA_RAIL_QSS)
         self._native_hud_right_layout = QVBoxLayout(self._native_hud_right)
-        self._native_hud_right_layout.setContentsMargins(8, 8, 8, 8)
-        self._native_hud_right_layout.setSpacing(5)
-        self._btn_native_video = QPushButton("🎥")
-        self._btn_native_photo = QPushButton("📷")
-        self._btn_native_record = QPushButton("●")
+        self._native_hud_right_layout.setContentsMargins(6, 5, 7, 7)
+        self._native_hud_right_layout.setSpacing(2)
+
+        self._camera_top_row = QFrame(self._native_hud_right)
+        self._camera_top_row.setObjectName("cameraTopRow")
+        ctr_layout = QHBoxLayout(self._camera_top_row)
+        ctr_layout.setContentsMargins(2, 2, 2, 2)
+        ctr_layout.setSpacing(2)
+
+        self._btn_native_video = QPushButton()
+        self._btn_native_video.setObjectName("camVideoBtn")
+        self._btn_native_video.setCheckable(True)
+        self._btn_native_video.setChecked(True)
+        self._btn_native_video.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        _ico_main = 20
+        _iv = _git_cam_icon_from_svg(_GIT_CAM_VIDEO_SVG, _ico_main)
+        if _iv.isNull():
+            self._btn_native_video.setText("🎥")
+        else:
+            self._btn_native_video.setIcon(_iv)
+            self._btn_native_video.setIconSize(QSize(_ico_main, _ico_main))
+
+        self._btn_native_photo = QPushButton()
+        self._btn_native_photo.setObjectName("camPhotoBtn")
+        self._btn_native_photo.setCheckable(True)
+        self._btn_native_photo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_photo.setToolTip("Photo mode — use the red shutter below to capture")
+        self._btn_native_video.setToolTip("Video / live mode — red button records")
+        _ip = _git_cam_icon_from_svg(_GIT_CAM_PHOTO_SVG, _ico_main)
+        if _ip.isNull():
+            self._btn_native_photo.setText("📷")
+        else:
+            self._btn_native_photo.setIcon(_ip)
+            self._btn_native_photo.setIconSize(QSize(_ico_main, _ico_main))
+
+        ctr_layout.addWidget(self._btn_native_video)
+        ctr_layout.addWidget(self._btn_native_photo)
+
+        # git `25970f0` `#cameraTopRow`: Split (4-up) + Follow — same embedded SVGs as legacy `camIcon` row.
+        self._btn_native_split = QPushButton()
+        self._btn_native_split.setObjectName("camSplitBtn")
+        self._btn_native_split.setCheckable(True)
+        self._btn_native_split.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_split.setToolTip("Split view (4-up)")
+        self._btn_native_split.setFixedSize(28, 28)
+        self._btn_native_split.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        _is = _git_cam_icon_from_svg(_GIT_CAM_SPLIT_SVG, _ico_main)
+        if _is.isNull():
+            self._btn_native_split.setText("▦")
+        else:
+            self._btn_native_split.setIcon(_is)
+            self._btn_native_split.setIconSize(QSize(_ico_main, _ico_main))
+
+        self._btn_native_follow = QPushButton()
+        self._btn_native_follow.setObjectName("camFollowBtn")
+        self._btn_native_follow.setCheckable(True)
+        self._btn_native_follow.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_follow.setToolTip("Follow vehicle (center map)")
+        self._btn_native_follow.setFixedSize(28, 28)
+        self._btn_native_follow.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        _ifw = _git_cam_icon_from_svg(_GIT_CAM_FOLLOW_SVG, _ico_main)
+        if _ifw.isNull():
+            self._btn_native_follow.setText("◎")
+        else:
+            self._btn_native_follow.setIcon(_ifw)
+            self._btn_native_follow.setIconSize(QSize(_ico_main, _ico_main))
+
+        ctr_layout.addWidget(self._btn_native_split, 0)
+        ctr_layout.addWidget(self._btn_native_follow, 0)
+        ctr_layout.addStretch(1)
+
+        self._btn_native_record = QPushButton()
+        self._btn_native_record.setObjectName("camRecordBtn")
         self._btn_native_record.setCheckable(True)
+        self._btn_native_record.setFixedSize(34, 34)
+        self._btn_native_record.setText("")
+        self._btn_native_record.setIcon(QIcon(_native_cam_record_dot_pixmap(14)))
+        self._btn_native_record.setIconSize(QSize(14, 14))
+        self._btn_native_record.setToolTip("Record video")
+
+        self._lbl_native_cam_timer = QLabel("00:00:00")
+        self._lbl_native_cam_timer.setObjectName("camTimer")
+        self._lbl_native_cam_timer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_native_cam_timer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+        self._cam_timer_settings_row = QWidget()
+        _tsl = QHBoxLayout(self._cam_timer_settings_row)
+        _tsl.setContentsMargins(0, 0, 0, 0)
+        _tsl.setSpacing(8)
+        _tsl.addStretch(1)
+        _tsl.addWidget(self._lbl_native_cam_timer)
+        _tsl.addStretch(1)
+
+        self._native_hud_right_layout.addWidget(self._camera_top_row)
+        self._native_hud_right_layout.addWidget(CamRecordArch(self._btn_native_record, self._native_hud_right))
+        self._native_hud_right_layout.addWidget(self._cam_timer_settings_row)
+
         self._btn_native_zoom_minus = QPushButton("−")
         self._btn_native_zoom_plus = QPushButton("+")
-        self._btn_native_focus_minus = QPushButton("F−")
-        self._btn_native_focus_plus = QPushButton("F+")
+        self._btn_native_zoom_minus.setToolTip("Zoom out")
+        self._btn_native_zoom_plus.setToolTip("Zoom in")
+        self._btn_native_focus_minus = QPushButton("−")
+        self._btn_native_focus_plus = QPushButton("+")
+        self._btn_native_focus_minus.setToolTip("Focus nearer")
+        self._btn_native_focus_plus.setToolTip("Focus farther")
         self._btn_native_gimbal_up = QPushButton("↑")
         self._btn_native_gimbal_down = QPushButton("↓")
         self._btn_native_gimbal_left = QPushButton("←")
@@ -4949,96 +849,306 @@ class MapWidget(QWidget):
         self._btn_native_target.setCheckable(True)
         self._btn_native_clip = QPushButton("Clip")
         self._btn_native_report = QPushButton("Report")
+        self._btn_native_report.setObjectName("observeReport")
         self._btn_native_reset = QPushButton("Reset")
-        for b in (self._btn_native_video, self._btn_native_photo, self._btn_native_record):
-            b.setFixedHeight(24)
-        top_row = QHBoxLayout()
-        top_row.setSpacing(5)
-        top_row.addWidget(self._btn_native_video)
-        top_row.addWidget(self._btn_native_photo)
-        top_row.addWidget(self._btn_native_record)
-        self._native_hud_right_layout.addLayout(top_row)
+        self._btn_native_reset.setObjectName("observeReset")
+        for b in (
+            self._btn_native_zoom_minus,
+            self._btn_native_zoom_plus,
+            self._btn_native_focus_minus,
+            self._btn_native_focus_plus,
+            self._btn_native_gimbal_up,
+            self._btn_native_gimbal_down,
+            self._btn_native_gimbal_left,
+            self._btn_native_gimbal_right,
+            self._btn_native_report,
+            self._btn_native_reset,
+        ):
+            b.setProperty("camPadBtn", True)
 
-        zoom_lab = QLabel("ZOOM")
-        self._native_hud_right_layout.addWidget(zoom_lab)
-        zoom_row = QHBoxLayout()
-        zoom_row.setSpacing(5)
-        zoom_row.addWidget(self._btn_native_zoom_minus)
-        zoom_row.addWidget(self._btn_native_zoom_plus)
-        self._native_hud_right_layout.addLayout(zoom_row)
+        self._btn_native_gimbal_left.setToolTip("Gimbal yaw left")
+        self._btn_native_gimbal_up.setToolTip("Gimbal pitch up")
+        self._btn_native_gimbal_right.setToolTip("Gimbal yaw right")
+        self._btn_native_gimbal_down.setToolTip("Gimbal pitch down")
 
-        focus_lab = QLabel("FOCUS")
-        self._native_hud_right_layout.addWidget(focus_lab)
-        focus_row = QHBoxLayout()
-        focus_row.setSpacing(5)
-        focus_row.addWidget(self._btn_native_focus_minus)
-        focus_row.addWidget(self._btn_native_focus_plus)
-        self._native_hud_right_layout.addLayout(focus_row)
-
-        gimbal_lab = QLabel("GIMBAL")
-        self._native_hud_right_layout.addWidget(gimbal_lab)
-        gimbal_up = QHBoxLayout()
-        gimbal_up.setSpacing(5)
-        gimbal_up.addStretch(1)
-        gimbal_up.addWidget(self._btn_native_gimbal_up)
-        gimbal_up.addStretch(1)
-        self._native_hud_right_layout.addLayout(gimbal_up)
-        gimbal_row = QHBoxLayout()
-        gimbal_row.setSpacing(5)
-        gimbal_row.addWidget(self._btn_native_gimbal_left)
-        gimbal_row.addWidget(self._btn_native_gimbal_down)
-        gimbal_row.addWidget(self._btn_native_gimbal_right)
-        self._native_hud_right_layout.addLayout(gimbal_row)
-
-        obs_lab = QLabel("OBSERVE")
-        self._native_hud_right_layout.addWidget(obs_lab)
-        obs_row1 = QHBoxLayout()
-        obs_row1.setSpacing(5)
-        obs_row1.addWidget(self._btn_native_target)
-        obs_row1.addWidget(self._btn_native_clip)
-        self._native_hud_right_layout.addLayout(obs_row1)
-        obs_row2 = QHBoxLayout()
-        obs_row2.setSpacing(5)
-        obs_row2.addWidget(self._btn_native_report)
-        obs_row2.addWidget(self._btn_native_reset)
-        self._native_hud_right_layout.addLayout(obs_row2)
-        self._native_hud_right.hide()
-        self._native_hud_right.raise_()
-
-        self._native_compass = QLabel(self._map_canvas)
-        self._native_compass.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._native_compass.setStyleSheet(
-            "QLabel { background: rgba(20, 24, 52, 0.94); color: #f1f5ff; border: 1px solid rgba(132,152,190,0.35); border-radius: 46px; font-size: 12px; font-weight: 700; }"
+        zoom_row = _cam_rail_plus_minus_pair(self._btn_native_zoom_minus, self._btn_native_zoom_plus)
+        focus_row = _cam_rail_plus_minus_pair(self._btn_native_focus_minus, self._btn_native_focus_plus)
+        gimbal_h_row = _cam_rail_gimbal_horizontal_row(
+            self._btn_native_gimbal_left, self._btn_native_gimbal_up, self._btn_native_gimbal_right
         )
+        gimbal_down_wrap = QWidget()
+        gimbal_down_lay = QHBoxLayout(gimbal_down_wrap)
+        gimbal_down_lay.setContentsMargins(0, 0, 0, 0)
+        gimbal_down_lay.setSpacing(0)
+        gimbal_down_lay.addStretch(1)
+        self._btn_native_gimbal_down.setFixedSize(48, 30)
+        gimbal_down_lay.addWidget(self._btn_native_gimbal_down)
+        gimbal_down_lay.addStretch(1)
+        gimbal_body = QWidget()
+        gimbal_v = QVBoxLayout(gimbal_body)
+        gimbal_v.setContentsMargins(0, 0, 0, 0)
+        gimbal_v.setSpacing(4)
+        gimbal_v.addWidget(gimbal_h_row)
+        gimbal_v.addWidget(gimbal_down_wrap)
+
+        obs_seg = CamObserveSegment(self._btn_native_target, self._btn_native_clip)
+        obs_body = QWidget()
+        obs_v = QVBoxLayout(obs_body)
+        obs_v.setContentsMargins(0, 0, 0, 0)
+        obs_v.setSpacing(2)
+        obs_v.addWidget(obs_seg)
+        obs_sec = QHBoxLayout()
+        obs_sec.setSpacing(5)
+        obs_sec.addWidget(self._btn_native_report)
+        obs_sec.addWidget(self._btn_native_reset)
+        obs_v.addLayout(obs_sec)
+
+        self._native_hud_right_layout.addWidget(_cam_rail_sep())
+        self._native_hud_right_layout.addWidget(_cam_rail_section("ZOOM", zoom_row))
+        self._native_hud_right_layout.addWidget(_cam_rail_section("FOCUS", focus_row))
+        self._native_hud_right_layout.addWidget(_cam_rail_section("GIMBAL", gimbal_body))
+        self._native_hud_right_layout.addWidget(_cam_rail_section("OBSERVE", obs_body))
+
+        self._native_hud_right.setMinimumWidth(220)
+        self._native_hud_right.hide()
+        self._native_rail_layer.hide()
+
+        # Native tile map ignores `setTelemetryOverlay` / compass DOM (see native_tile_map._eval_one skips).
+        # Mirror git e48c1a7 bottom HUD: painted compass + 3-cell telemetry strip (Web CSS parity).
+        self._native_compass = MapFooterCompass(self._map_canvas)
+        # Display-only HUD: must not sit above the WebEngine 3D canvas and eat drag/rotate gestures.
+        self._native_compass.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._native_compass.hide()
         self._native_compass.raise_()
 
-        self._native_telemetry = QLabel(self._map_canvas)
-        self._native_telemetry.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._native_telemetry.setStyleSheet(
-            "QLabel { background: rgba(20, 24, 52, 0.94); color: #e7efff; border: 1px solid rgba(132,152,190,0.35); border-radius: 10px; padding: 6px; font-size: 11px; font-weight: 600; }"
-        )
-        self._native_telemetry.setText("Alt -- | Spd -- | Time --")
+        self._native_telemetry = MapFooterTelemetryStrip(self._map_canvas)
+        self._native_telemetry.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._native_telemetry.hide()
         self._native_telemetry.raise_()
 
-        self._btn_native_video.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_VIDEO_MODE_REQUEST:0"))
-        self._btn_native_photo.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_PHOTO_REQUEST:0"))
-        self._btn_native_record.toggled.connect(
-            lambda on: self._on_web_title_changed(f"VGCS_CAM_RECORD_TOGGLE:{1 if on else 0}:0")
+        # Legacy Web `#actionRail` / `.actionBtn` — line-art icons match bottom ``TelemetryStripIcon`` style.
+        self._map_action_rail = QFrame(self._map_canvas)
+        self._map_action_rail.setObjectName("mapActionRail")
+        self._map_action_rail.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        ar_l = QVBoxLayout(self._map_action_rail)
+        ar_l.setContentsMargins(0, 0, 0, 0)
+        ar_l.setSpacing(8)
+        _map_action_btn_base_ss = (
+            "QPushButton#mapActionTakeoffBtn, QPushButton#mapActionReturnBtn {"
+            "min-width:54px; max-width:54px; min-height:54px; max-height:54px;"
+            "border:1px solid rgba(255,255,255,0.35);"
+            "background:rgba(34,42,56,0.92);"
+            "color:#c8d3ea;"
+            "font:600 11px \"Segoe UI\", Arial, sans-serif;"
+            "padding:0px;"
+            "outline:none;"
+            "}"
+            "QPushButton#mapActionTakeoffBtn:hover:enabled, QPushButton#mapActionReturnBtn:hover:enabled {"
+            "background:rgba(46,58,78,0.95);"
+            "border-color:rgba(136,164,205,0.7);"
+            "}"
+            "QPushButton#mapActionTakeoffBtn:disabled, QPushButton#mapActionReturnBtn:disabled { opacity:0.45; }"
         )
+        _takeoff_ss = (
+            _map_action_btn_base_ss
+            + "QPushButton#mapActionTakeoffBtn {"
+            "border-top-left-radius:8px; border-bottom-left-radius:0px;"
+            "border-top-right-radius:0px; border-bottom-right-radius:0px;"
+            "}"
+        )
+        _return_ss = (
+            _map_action_btn_base_ss
+            + "QPushButton#mapActionReturnBtn {"
+            "border-top-left-radius:0px; border-bottom-left-radius:8px;"
+            "border-top-right-radius:0px; border-bottom-right-radius:0px;"
+            "}"
+        )
+        self._map_action_takeoff_btn = QPushButton(self._map_action_rail)
+        self._map_action_takeoff_btn.setObjectName("mapActionTakeoffBtn")
+        self._map_action_takeoff_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._map_action_takeoff_btn.setFlat(True)
+        self._map_action_takeoff_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._map_action_takeoff_btn.setToolTip(
+            "NAV_TAKEOFF at main Takeoff alt (m). Connect vehicle first (same as dashboard Takeoff)."
+        )
+        _to_lay = QVBoxLayout()
+        _to_lay.setContentsMargins(3, 5, 3, 5)
+        _to_lay.setSpacing(1)
+        _to_ic = TelemetryStripIcon("up", self._map_action_takeoff_btn, icon_size=_MAP_ACTION_ICON_LOGICAL_PX)
+        _to_lbl = QLabel("Takeoff", self._map_action_takeoff_btn)
+        _to_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        _to_lbl.setStyleSheet(
+            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
+        )
+        _to_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        _to_lay.addWidget(_to_ic, 0, Qt.AlignmentFlag.AlignHCenter)
+        _to_lay.addWidget(_to_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._map_action_takeoff_btn.setLayout(_to_lay)
+        self._map_action_takeoff_btn.setStyleSheet(_takeoff_ss)
+
+        self._map_action_return_btn = QPushButton(self._map_action_rail)
+        self._map_action_return_btn.setObjectName("mapActionReturnBtn")
+        self._map_action_return_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._map_action_return_btn.setFlat(True)
+        self._map_action_return_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._map_action_return_btn.setToolTip("Return to launch / RTL (same as dashboard Return).")
+        _re_lay = QVBoxLayout()
+        _re_lay.setContentsMargins(3, 5, 3, 5)
+        _re_lay.setSpacing(1)
+        _re_ic = TelemetryStripIcon("return_home", self._map_action_return_btn, icon_size=_MAP_ACTION_ICON_LOGICAL_PX)
+        _re_lbl = QLabel("Return", self._map_action_return_btn)
+        _re_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        _re_lbl.setStyleSheet(
+            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
+        )
+        _re_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        _re_lay.addWidget(_re_ic, 0, Qt.AlignmentFlag.AlignHCenter)
+        _re_lay.addWidget(_re_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._map_action_return_btn.setLayout(_re_lay)
+        self._map_action_return_btn.setStyleSheet(_return_ss)
+        ar_l.addWidget(self._map_action_takeoff_btn)
+        ar_l.addWidget(self._map_action_return_btn)
+        self._map_action_takeoff_btn.setEnabled(False)
+        self._map_action_return_btn.setEnabled(False)
+        self._map_action_takeoff_btn.clicked.connect(lambda: self.takeoff_requested.emit())
+        self._map_action_return_btn.clicked.connect(lambda: self.return_requested.emit())
+        self._map_action_rail.setFixedSize(54, 54 + 8 + 54)
+        self._map_action_rail.show()
+        self._map_action_rail.raise_()
+
+        self._plan_flight_panel = PlanFlightPanel(panel)
+        self._plan_flight_panel.hide()
+        self._plan_flight_panel.exit_requested.connect(self._on_plan_panel_exit)
+        self._plan_flight_panel.action_requested.connect(self.plan_action_requested.emit)
+        self._plan_flight_panel.tool_requested.connect(self._on_plan_panel_tool)
+        self._plan_flight_panel.mission_panel_changed.connect(self._on_plan_panel_mission_changed)
+        self._plan_flight_panel.mission_start_requested.connect(self.mission_start_requested.emit)
+        self._plan_flight_panel.return_requested.connect(self.return_requested.emit)
+        self._plan_flight_panel.set_launch_to_map_center_requested.connect(
+            self._on_plan_panel_set_launch_to_map_center
+        )
+        self.waypoints_changed.connect(self._on_plan_panel_waypoints_changed)
+
+        # Wrapper + inner image: pixmap must not live on the same QLabel as +/- children — Qt paints
+        # the pixmap over child widgets, so clicks never reached the zoom buttons.
+        self._native_minimap_wrap = QFrame(self._map_canvas)
+        self._native_minimap_wrap.setObjectName("nativeMinimapWrap")
+        self._native_minimap_wrap.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._native_minimap_wrap.setAutoFillBackground(False)
+        self._native_minimap_wrap.setStyleSheet(
+            "QFrame#nativeMinimapWrap { background: transparent; border: 1px solid rgba(132,152,190,0.45); border-radius: 8px; }"
+        )
+        self._native_minimap_wrap.hide()
+
+        self._native_minimap = QLabel(self._native_minimap_wrap)
+        self._native_minimap.setObjectName("nativeMinimapImage")
+        self._native_minimap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._native_minimap.setStyleSheet("QLabel#nativeMinimapImage { background: transparent; border: none; }")
+        self._native_minimap.setCursor(Qt.CursorShape.OpenHandCursor)
+        self._native_minimap.setToolTip("Drag to pan map · click (no drag) to swap back")
+        # QLabel does not get move events without mouse tracking unless a button is held; tracking is
+        # cheap here and lets us update the cursor + still works fine when the user drags.
+        self._native_minimap.setMouseTracking(True)
+        self._native_minimap.mousePressEvent = self._on_native_minimap_image_press  # type: ignore[assignment]
+        self._native_minimap.mouseMoveEvent = self._on_native_minimap_image_move  # type: ignore[assignment]
+        self._native_minimap.mouseReleaseEvent = self._on_native_minimap_image_release  # type: ignore[assignment]
+        # Wheel pans zoom on the live map — feels natural since the card *is* the map.
+        self._native_minimap.wheelEvent = self._on_native_minimap_image_wheel  # type: ignore[assignment]
+        self._native_minimap.hide()
+        self._minimap_img_dragging = False
+        self._minimap_img_drag_last: QPointF | None = None
+        self._minimap_img_press: QPointF | None = None
+        self._minimap_grab_refresh_timer = QTimer(self)
+        self._minimap_grab_refresh_timer.setSingleShot(True)
+        self._minimap_grab_refresh_timer.setInterval(75)
+        self._minimap_grab_refresh_timer.timeout.connect(self._update_native_minimap)
+
+        self._native_minimap_zoom = 16
+        self._native_minimap_tile_key: tuple[int, int, int] | None = None
+        self._native_minimap_tile_img = QImage()
+        # Larger, high-contrast controls so +/− stay readable over satellite tiles when swap shows the map PiP.
+        self._native_minimap_btn_side = 32
+        self._native_minimap_btn_pad = 8
+        self._btn_native_minimap_plus = QPushButton("+", self._native_minimap_wrap)
+        self._btn_native_minimap_minus = QPushButton("-", self._native_minimap_wrap)
+        _mini_f = QFont()
+        _mini_f.setPointSize(16)
+        _mini_f.setWeight(QFont.Weight.Black)
+        _mini_ss = (
+            "QPushButton {"
+            "background-color: rgba(18, 26, 40, 0.88);"
+            "color: #f5f8ff;"
+            "border: 2px solid rgba(200, 218, 255, 0.95);"
+            "border-radius: 6px;"
+            "padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: rgba(32, 46, 68, 0.92); border-color: #ffffff; color: #ffffff; }"
+            "QPushButton:pressed { background-color: rgba(12, 18, 28, 0.95); border-color: #9eb6e8; }"
+        )
+        for b in (self._btn_native_minimap_plus, self._btn_native_minimap_minus):
+            b.setFont(_mini_f)
+            b.setFixedSize(self._native_minimap_btn_side, self._native_minimap_btn_side)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setAutoDefault(False)
+            b.setDefault(False)
+            b.setStyleSheet(_mini_ss)
+            b.hide()
+            b.raise_()
+        self._btn_native_minimap_plus.clicked.connect(self._on_native_minimap_plus_clicked)
+        self._btn_native_minimap_minus.clicked.connect(self._on_native_minimap_minus_clicked)
+
+        self._cam_rail_mode_group = QButtonGroup(self)
+        self._cam_rail_mode_group.setExclusive(True)
+        self._cam_rail_mode_group.addButton(self._btn_native_video, 0)
+        self._cam_rail_mode_group.addButton(self._btn_native_photo, 1)
+        self._btn_native_video.setChecked(True)
+        self._btn_native_photo.setChecked(False)
+        self._cam_rail_mode_group.idClicked.connect(self._on_camera_rail_mode_id_clicked)
+
+        # Debounced commit: some platforms deliver several `toggled` edges per physical click while
+        # the rail relayouts / video moves; reading `isChecked()` once after a short quiet window fixes 1/0/1/0 churn.
+        self._split_rail_debounce = QTimer(self)
+        self._split_rail_debounce.setSingleShot(True)
+        self._split_rail_debounce.setInterval(50)
+        self._split_rail_debounce.timeout.connect(self._commit_native_split_rail_toggle)
+        self._follow_rail_debounce = QTimer(self)
+        self._follow_rail_debounce.setSingleShot(True)
+        self._follow_rail_debounce.setInterval(50)
+        self._follow_rail_debounce.timeout.connect(self._commit_native_follow_rail_toggle)
+        self._btn_native_split.toggled.connect(self._on_native_split_rail_toggled)
+        self._btn_native_follow.toggled.connect(self._on_native_follow_rail_toggled)
+        self._btn_native_record.clicked.connect(self._on_native_record_center_clicked)
+        self._btn_native_record.toggled.connect(self._on_native_record_toggled)
+        self._sync_native_record_button_for_rail_mode()
         self._btn_native_zoom_minus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_ZOOM_STEP:-1:0"))
         self._btn_native_zoom_plus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_ZOOM_STEP:1:0"))
         self._btn_native_focus_minus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_FOCUS_STEP:-1:0"))
         self._btn_native_focus_plus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_FOCUS_STEP:1:0"))
-        self._btn_native_gimbal_up.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:0:-1:0"))
-        self._btn_native_gimbal_down.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:0:1:0"))
+        # dy>0 → ptz("up") / positive pitch nudge; dy<0 → down (see VGCS_CAM_GIMBAL_NUDGE handler).
+        self._btn_native_gimbal_up.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:0:1:0"))
+        self._btn_native_gimbal_down.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:0:-1:0"))
         self._btn_native_gimbal_left.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:-1:0:0"))
         self._btn_native_gimbal_right.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:1:0:0"))
-        self._btn_native_target.toggled.connect(self._set_observation_mark_mode)
-        self._btn_native_clip.clicked.connect(self._capture_observation_clip)
-        self._btn_native_report.clicked.connect(self._export_observations)
-        self._btn_native_reset.clicked.connect(self._clear_observations)
+        def _obs_target(on: bool) -> None:
+            print(f"[VGCS:cam_rail] OBSERVE Target toggled={bool(on)}")
+            self._set_observation_mark_mode(on)
+
+        def _obs_clip() -> None:
+            print("[VGCS:cam_rail] OBSERVE Clip clicked")
+            self._capture_observation_clip()
+
+        def _obs_report() -> None:
+            print("[VGCS:cam_rail] OBSERVE Report clicked")
+            self._export_observations()
+
+        def _obs_reset() -> None:
+            print("[VGCS:cam_rail] OBSERVE Reset clicked")
+            self._clear_observations()
+
+        self._btn_native_target.toggled.connect(_obs_target)
+        self._btn_native_clip.clicked.connect(_obs_clip)
+        self._btn_native_report.clicked.connect(_obs_report)
+        self._btn_native_reset.clicked.connect(_obs_reset)
 
         self._status = QLabel("Map status: waiting for telemetry")
         self._status.setObjectName("telemetryValue")
@@ -5196,12 +1306,16 @@ class MapWidget(QWidget):
         status_box.setLayout(status_layout)
         self._status_box = status_box
 
-        panel_layout.addWidget(self._map_canvas)
+        panel_layout.addWidget(self._map_canvas, 1)
         panel_layout.addWidget(toolbar)
         panel_layout.addWidget(status_box)
         panel.setLayout(panel_layout)
-        root.addWidget(panel)
+        root.addWidget(panel, 1)
         self.setLayout(root)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._map_canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
 
         self._btn_add_wp.clicked.connect(self._enable_add_waypoint_mode)
         self._btn_clear_wp.clicked.connect(self._clear_waypoints)
@@ -5261,8 +1375,24 @@ class MapWidget(QWidget):
         super().resizeEvent(event)
         if bool(getattr(self, "_video_swapped", False)):
             self._refresh_native_overlay_insets()
+        # Always relayout native HUD (camera rail, compass, telemetry) on resize — independent of video PiP.
         self._layout_native_video_preview()
-        self._layout_native_hud()
+        try:
+            self._layout_native_hud()
+        except Exception:
+            pass
+        try:
+            self._layout_plan_flight_panel()
+        except Exception:
+            pass
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().showEvent(event)
+        # First frame / platform quirks: layout can restore map above HUD siblings; fix Z-order after show.
+        try:
+            QTimer.singleShot(0, self._stack_native_overlays_above_tile_map)
+        except Exception:
+            pass
 
     def _on_native_video_click(self, event) -> None:
         try:
@@ -5272,72 +1402,214 @@ class MapWidget(QWidget):
                     return
         except Exception:
             pass
+        if bool(getattr(self, "_obs_mark_mode", False)):
+            try:
+                w = max(1, int(self._native_video_preview.width()))
+                h = max(1, int(self._native_video_preview.height()))
+                pos = event.position()
+                xn = float(pos.x()) / float(w)
+                yn = float(pos.y()) / float(h)
+                self._log_observation("video_mark", video_x=xn, video_y=yn)
+            except Exception:
+                pass
+            return
         self._video_swapped = not bool(getattr(self, "_video_swapped", False))
         if self._video_swapped:
             self._refresh_native_overlay_insets()
         self._layout_native_video_preview()
+        # Native fullscreen toggle is fully handled in Qt. Keep Web map in map mode
+        # to avoid duplicating/fragmenting video content in Web overlays/minimap grabs.
         try:
-            self._run_js(f"setVideoSwapMode({'true' if self._video_swapped else 'false'});")
+            self._run_js("setVideoSwapMode(false);")
+        except Exception:
+            pass
+
+    def _schedule_minimap_grab_refresh(self) -> None:
+        try:
+            t = getattr(self, "_minimap_grab_refresh_timer", None)
+            if t is None:
+                return
+            t.stop()
+            t.start()
+        except Exception:
+            pass
+
+    def _on_native_minimap_image_press(self, event) -> None:
+        try:
+            if event.button() != Qt.MouseButton.LeftButton:
+                return
+        except Exception:
+            return
+        if not bool(getattr(self, "_video_swapped", False)):
+            return
+        self._minimap_img_dragging = False
+        self._minimap_img_press = QPointF(event.position())
+        self._minimap_img_drag_last = QPointF(event.position())
+        try:
+            self._native_minimap.setCursor(Qt.CursorShape.ClosedHandCursor)
+        except Exception:
+            pass
+        try:
+            event.accept()
+        except Exception:
+            pass
+
+    def _on_native_minimap_image_wheel(self, event) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        try:
+            delta = float(event.angleDelta().y())
+        except Exception:
+            delta = 0.0
+        if delta == 0.0:
+            return
+        try:
+            cur_z = float(getattr(nm, "_zoom", 16.0))
+        except Exception:
+            cur_z = 16.0
+        step = (delta / 120.0) * 1.0
+        try:
+            zmax = float(getattr(nm, "_max_zoom", 19))
+        except Exception:
+            zmax = 19.0
+        new_z = max(3.0, min(zmax, cur_z + step))
+        try:
+            nm.set_zoom(new_z)
+        except Exception:
+            pass
+        self._schedule_minimap_grab_refresh()
+        try:
+            event.accept()
+        except Exception:
+            pass
+
+    def _on_native_minimap_image_move(self, event) -> None:
+        try:
+            held = bool(event.buttons() & Qt.MouseButton.LeftButton)
+        except Exception:
+            held = False
+        if not held:
+            return
+        if not bool(getattr(self, "_video_swapped", False)):
+            return
+        last = getattr(self, "_minimap_img_drag_last", None)
+        press = getattr(self, "_minimap_img_press", None)
+        if last is None or press is None:
+            return
+        cur = QPointF(event.position())
+        if (cur - press).manhattanLength() > 5.0:
+            self._minimap_img_dragging = True
+        dx = float(cur.x() - last.x())
+        dy = float(cur.y() - last.y())
+        self._minimap_img_drag_last = cur
+        if dx == 0.0 and dy == 0.0:
+            return
+        nm = getattr(self, "_native_map", None)
+        # Drag in the card pans the underlying map. Scale pixel deltas because the card image is
+        # a scaled-down view of the real map; otherwise a small drag in the card causes a tiny pan.
+        if nm is not None and hasattr(nm, "nudge_center_by_pixels"):
+            try:
+                lbl_w = max(1.0, float(self._native_minimap.width()))
+                lbl_h = max(1.0, float(self._native_minimap.height()))
+                nm_w = max(1.0, float(nm.width()))
+                nm_h = max(1.0, float(nm.height()))
+                sx = nm_w / lbl_w
+                sy = nm_h / lbl_h
+                nm.nudge_center_by_pixels(dx * sx, dy * sy)
+            except Exception:
+                pass
+        self._schedule_minimap_grab_refresh()
+        try:
+            event.accept()
+        except Exception:
+            pass
+
+    def _on_native_minimap_image_release(self, event) -> None:
+        try:
+            if event.button() != Qt.MouseButton.LeftButton:
+                return
+        except Exception:
+            return
+        try:
+            self._native_minimap.setCursor(Qt.CursorShape.OpenHandCursor)
+        except Exception:
+            pass
+        was_drag = bool(getattr(self, "_minimap_img_dragging", False))
+        press = getattr(self, "_minimap_img_press", None)
+        self._minimap_img_drag_last = None
+        self._minimap_img_press = None
+        self._minimap_img_dragging = False
+        try:
+            self._minimap_grab_refresh_timer.stop()
+        except Exception:
+            pass
+        try:
+            event.accept()
+        except Exception:
+            pass
+        if was_drag:
+            self._update_native_minimap()
+            return
+        # Short click (no meaningful drag) → swap back to map-main / video-PiP.
+        if press is not None:
+            try:
+                cur = QPointF(event.position())
+                if (cur - press).manhattanLength() > 8.0:
+                    self._update_native_minimap()
+                    return
+            except Exception:
+                pass
+        if not bool(getattr(self, "_video_swapped", False)):
+            return
+        self._video_swapped = False
+        self._layout_native_video_preview()
+        try:
+            self._run_js("setVideoSwapMode(false);")
         except Exception:
             pass
 
     def _refresh_native_overlay_insets(self) -> None:
         if not bool(getattr(self, "_web_ready", False)):
             return
-        def _apply(payload: object) -> None:
-            try:
-                txt = str(payload or "").strip()
-                if not txt:
-                    return
-                data = json.loads(txt)
-                if not isinstance(data, dict):
-                    return
-                self._native_overlay_insets = {
-                    "left": int(float(data.get("left", 170) or 170)),
-                    "top": int(float(data.get("top", 58) or 58)),
-                    "right": int(float(data.get("right", 220) or 220)),
-                    "bottom": int(float(data.get("bottom", 130) or 130)),
-                }
-            except Exception:
-                return
-            self._layout_native_video_preview()
-        self._run_js("window.__vgcsGetOverlayInsets ? window.__vgcsGetOverlayInsets() : '';", callback=_apply)
+        self._native_overlay_insets = {
+            "left": 170,
+            "top": _NATIVE_CAM_RAIL_TOP_PX,
+            "right": 192,
+            "bottom": 130,
+        }
+        self._layout_native_video_preview()
 
     def _layout_native_video_preview(self) -> None:
         try:
+            if not bool(getattr(self, "_video_preview_enabled", False)):
+                return
+            if self._plan_flight_layer_obscures_native_camera_ui():
+                try:
+                    self._native_video_preview.hide()
+                except Exception:
+                    pass
+                return
             host = self._map_canvas
             if host is None:
                 return
             w = max(1, host.width())
             h = max(1, host.height())
             if bool(getattr(self, "_video_swapped", False)):
-                # Fullscreen camera mode: fill map canvas under header.
-                avail_x = 0
-                avail_y = 46
-                avail_w = max(120, w)
-                avail_h = max(120, h - avail_y)
-                # In full camera mode, maximize visible video while preserving
-                # camera aspect ratio inside the HUD-safe area.
-                img = getattr(self, "_native_video_last", QImage())
-                if img is not None and not img.isNull() and img.width() > 0 and img.height() > 0:
-                    iw = float(img.width())
-                    ih = float(img.height())
-                    scale = min(float(avail_w) / iw, float(avail_h) / ih)
-                    vw = max(120, int(iw * scale))
-                    vh = max(120, int(ih * scale))
-                    x = avail_x + max(0, (avail_w - vw) // 2)
-                    y = avail_y + max(0, (avail_h - vh) // 2)
-                else:
-                    x, y, vw, vh = avail_x, avail_y, avail_w, avail_h
-                self._native_video_preview.setGeometry(x, y, vw, vh)
+                # Full-bleed video over the tile map. Compass / telemetry / minimap / camera rail are
+                # separate widgets stacked above this label, so we still cover the entire canvas here
+                # (no top/side insets — the rail is a sibling of `_map_canvas`, not inside it).
+                self._native_video_preview.setGeometry(0, 0, w, h)
                 self._native_video_preview.setStyleSheet(
                     "QLabel#nativeVideoPreview {"
                     "background: #000;"
-                    "border: 1px solid rgba(206, 220, 242, 0.35);"
-                    "border-radius: 8px;"
+                    "border: none;"
+                    "border-radius: 0px;"
                     "}"
                 )
             else:
+                # PiP / map mode: same geometry for single and split (git webview: split toggles grid only,
+                # not overlay size). Fullscreen split uses the `_video_swapped` branch above.
                 pw = min(230, max(180, int(w * 0.28)))
                 ph = min(130, max(100, int(h * 0.24)))
                 x = 14
@@ -5351,49 +1623,616 @@ class MapWidget(QWidget):
                     "}"
                 )
             self._native_video_preview.show()
-            self._native_video_preview.raise_()
-            if not self._native_video_last.isNull():
-                self._render_native_video_preview(self._native_video_last)
+            # Split mode must repaint from `_split_last_images`; `_native_video_last` may still be the
+            # last single-view frame and would undo the 2×2 composite after every resize.
+            if bool(getattr(self, "_video_split_enabled", False)):
+                # Do not use QLabel `scaledContents` for split: it can hide grid/labels; we scale in
+                # `_render_native_video_preview` so the full 2×2 composite is always visible.
+                try:
+                    self._native_video_preview.setScaledContents(False)
+                except Exception:
+                    pass
+                self._render_native_split_preview()
+            else:
+                try:
+                    self._native_video_preview.setScaledContents(False)
+                except Exception:
+                    pass
+                if not self._native_video_last.isNull():
+                    self._render_native_video_preview(self._native_video_last)
+            # Reposition HUD (minimap vs PiP) after video geometry is known.
+            self._layout_native_hud()
         except Exception:
             return
 
+    def _stack_native_overlays_above_tile_map(self) -> None:
+        """
+        Lower the tile map, then stack video / footer HUD / minimap / camera rail so hit-testing matches intent:
+        PiP mode keeps video above compass+telemetry so the small preview is clickable; swapped fullscreen
+        puts compass+telemetry above the video so the HUD matches the normal map view.
+        """
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        try:
+            nm.lower()
+        except Exception:
+            pass
+        try:
+            preview_on = bool(getattr(self, "_video_preview_enabled", False))
+            swapped = bool(getattr(self, "_video_swapped", False))
+            video_vis = bool(preview_on and self._native_video_preview.isVisible())
+
+            if video_vis and not swapped:
+                # PiP: footer HUD under video so bottom-left preview receives swap clicks.
+                self._native_compass.raise_()
+                self._native_telemetry.raise_()
+                self._native_video_preview.raise_()
+            elif video_vis and swapped:
+                # Fullscreen video: video over map, then compass + strip on top (parity with map mode).
+                self._native_video_preview.raise_()
+                self._native_compass.raise_()
+                self._native_telemetry.raise_()
+            else:
+                self._native_compass.raise_()
+                self._native_telemetry.raise_()
+
+            mar = getattr(self, "_map_action_rail", None)
+            if mar is not None:
+                mar.raise_()
+
+            if preview_on and swapped and self._native_minimap_wrap.isVisible():
+                self._native_minimap_wrap.raise_()
+                self._btn_native_minimap_plus.raise_()
+                self._btn_native_minimap_minus.raise_()
+            ly = getattr(self, "_native_rail_layer", None)
+            if ly is not None:
+                ly.raise_()
+        except Exception:
+            pass
+
+    def _sync_native_map_vehicle_arrow_scale(self) -> None:
+        """Larger vehicle chevron while map is shown in the swap PiP (grab scales the view down)."""
+        nm = getattr(self, "_native_map", None)
+        if nm is None or not hasattr(nm, "set_vehicle_arrow_scale"):
+            return
+        swapped = bool(getattr(self, "_video_swapped", False))
+        preview_on = bool(getattr(self, "_video_preview_enabled", False))
+        plan_on = self._plan_flight_layer_obscures_native_camera_ui()
+        boost = 1.85 if (preview_on and swapped and not plan_on) else 1.0
+        try:
+            nm.set_vehicle_arrow_scale(boost)
+        except Exception:
+            pass
+
     def _layout_native_hud(self) -> None:
         try:
+            plan_on = self._plan_flight_layer_obscures_native_camera_ui()
+            if plan_on:
+                try:
+                    self._native_rail_layer.hide()
+                    self._native_hud_right.hide()
+                    self._native_video_preview.hide()
+                    self._native_minimap_wrap.hide()
+                    self._btn_native_minimap_plus.hide()
+                    self._btn_native_minimap_minus.hide()
+                except Exception:
+                    pass
+            else:
+                try:
+                    if bool(getattr(self, "_last_link_connected", False)) and bool(
+                        getattr(self, "_web_ready", False)
+                    ):
+                        self._native_hud_right.show()
+                        self._native_rail_layer.show()
+                    else:
+                        self._native_hud_right.hide()
+                        self._native_rail_layer.hide()
+                except Exception:
+                    pass
             w = max(1, self._map_canvas.width())
             h = max(1, self._map_canvas.height())
-            panel_w = 168
-            panel_h = min(max(320, int(h * 0.56)), 520)
-            panel_x = max(0, w - panel_w - 12)
-            panel_y = 64
-            self._native_hud_right.setGeometry(panel_x, panel_y, panel_w, panel_h)
-            comp_sz = 96
-            self._native_compass.setGeometry(max(0, panel_x + (panel_w - comp_sz) // 2), panel_y + panel_h + 10, comp_sz, comp_sz)
-            tel_w = 220
-            tel_h = 54
-            self._native_telemetry.setGeometry(max(0, w - tel_w - 160), max(0, h - tel_h - 18), tel_w, tel_h)
+            rail = self._native_hud_right
+            ly = getattr(self, "_native_rail_layer", None)
+            panel_w = max(228, 220)
+            panel_y = int(_NATIVE_CAM_RAIL_TOP_PX)
+            bottom_margin = 12
+            available_h = max(120, h - panel_y - bottom_margin)
+            panel_x = max(0, w - panel_w - 18)  # git `#cameraRail { right: 18px }`
+            rail.setFixedWidth(panel_w)
+            rl = rail.layout()
+            if rl is not None:
+                rl.activate()
+            rail.updateGeometry()
+            need_h = max(120, rail.sizeHint().height())
+            # One fixed-height panel: no internal scroll; shrink only if taller than usable map height.
+            panel_h = min(need_h, available_h)
+            if ly is not None:
+                pt = self._map_canvas.mapTo(self._panel, QPoint(panel_x, panel_y))
+                ly.setGeometry(pt.x(), pt.y(), panel_w, panel_h)
+            rail.setGeometry(0, 0, panel_w, panel_h)
+            # Git `#mapFooterHud`: compass 176px from bottom-right; telemetry strip left of compass.
+            comp_w, comp_h = 176, 176
+            margin_r, margin_b = 10, 2
+            cx = max(0, w - margin_r - comp_w)
+            cy = max(0, h - margin_b - comp_h)
+            self._native_compass.setGeometry(cx, cy, comp_w, comp_h)
+            self._native_telemetry.updateGeometry()
+            mw = self._native_telemetry.minimumSizeHint().width()
+            mh = self._native_telemetry.minimumSizeHint().height()
+            sw = self._native_telemetry.sizeHint().width()
+            sh = self._native_telemetry.sizeHint().height()
+            # Avoid clipping mph / ft / time: never cap width to a small constant; pad for border + font metrics.
+            tel_w = max(mw, sw) + 20
+            tel_h = max(40, max(mh, sh) + 4)
+            tel_x = cx - 12 - tel_w
+            if tel_x < 8:
+                tel_x = 8
+            tel_y = cy + (comp_h - tel_h) // 2
+            self._native_telemetry.setGeometry(tel_x, tel_y, tel_w, tel_h)
+            mar = getattr(self, "_map_action_rail", None)
+            if mar is not None:
+                mar.move(_MAP_ACTION_RAIL_LEFT_PX, _MAP_ACTION_RAIL_TOP_PX)
+            swapped = bool(getattr(self, "_video_swapped", False))
+            preview_on = bool(getattr(self, "_video_preview_enabled", False))
+            preview_maps = preview_on and not plan_on
+            # PiP mode: show video only (no second minimap card — main map is the overview).
+            # Fullscreen camera swap: minimap takes the **same PiP slot as the video** (bottom-left)
+            # so the swap is symmetric — clicking the corner card swaps back.
+            # When preview is off, keep minimap hidden (do not resurrect on resize after _stop_video_preview).
+            if not preview_maps or (preview_maps and not swapped):
+                self._native_minimap_wrap.hide()
+            else:
+                # Mirror the PiP geometry used in non-swapped mode (see `_layout_native_video_preview`).
+                mini_w = min(230, max(180, int(w * 0.28)))
+                mini_h = min(130, max(100, int(h * 0.24)))
+                mini_x = 14
+                mini_y = max(0, h - mini_h - 14)
+                _side = int(getattr(self, "_native_minimap_btn_side", 32))
+                _pad = int(getattr(self, "_native_minimap_btn_pad", 8))
+                self._native_minimap_wrap.setGeometry(mini_x, mini_y, mini_w, mini_h)
+                try:
+                    nmz = getattr(self, "_native_map", None)
+                    if nmz is not None:
+                        zmx = int(getattr(nmz, "_max_zoom", 19))
+                        self._native_minimap_zoom = int(
+                            max(3, min(zmx, round(float(getattr(nmz, "_zoom", 16.0))))))
+                except Exception:
+                    self._native_minimap_zoom = 16
+                # Map fills the entire card (video-style); +/- float on top — no left gutter / strip.
+                self._native_minimap.setGeometry(0, 0, mini_w, mini_h)
+                self._btn_native_minimap_plus.move(_pad, _pad)
+                self._btn_native_minimap_minus.move(_pad, _pad + _side + 4)
+                try:
+                    self._native_minimap.lower()
+                except Exception:
+                    pass
+                self._btn_native_minimap_plus.raise_()
+                self._btn_native_minimap_minus.raise_()
+                self._native_minimap_wrap.show()
+                self._native_minimap.show()
+                self._btn_native_minimap_plus.show()
+                self._btn_native_minimap_minus.show()
+                try:
+                    QTimer.singleShot(0, self._update_native_minimap)
+                except Exception:
+                    pass
+            self._sync_native_map_vehicle_arrow_scale()
+            self._stack_native_overlays_above_tile_map()
         except Exception:
             return
+
+    def _on_native_minimap_plus_clicked(self) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        cur = int(round(float(getattr(nm, "_zoom", 16.0))))
+        zmax = int(getattr(nm, "_max_zoom", 19))
+        self._native_minimap_set_zoom(min(zmax, cur + 1))
+
+    def _on_native_minimap_minus_clicked(self) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        cur = int(round(float(getattr(nm, "_zoom", 16.0))))
+        self._native_minimap_set_zoom(max(3, cur - 1))
+
+    def _native_minimap_set_zoom(self, z: int) -> None:
+        nm = getattr(self, "_native_map", None)
+        zmax = int(getattr(nm, "_max_zoom", 19)) if nm is not None else 19
+        self._native_minimap_zoom = max(3, min(zmax, int(z)))
+        self._native_minimap_tile_key = None
+        if nm is not None:
+            try:
+                nm.set_zoom(float(self._native_minimap_zoom))
+            except Exception:
+                pass
+        self._update_native_minimap()
+        try:
+            QTimer.singleShot(220, self._update_native_minimap)
+        except Exception:
+            pass
+
+    def _raise_native_minimap_zoom_buttons(self) -> None:
+        """Pixmap refresh can restack the image label above the buttons — keep controls on top."""
+        try:
+            if not bool(getattr(self, "_video_swapped", False)):
+                return
+            if not self._native_minimap_wrap.isVisible():
+                return
+            self._btn_native_minimap_plus.raise_()
+            self._btn_native_minimap_minus.raise_()
+        except Exception:
+            pass
+
+    def _update_native_minimap_from_web_grab(self) -> bool:
+        """
+        Render the **full** map view into the swap mini-card so it doubles as a pan thumbnail.
+
+        Earlier this only mirrored the lower-left 24%×20% of the map (legacy Web overlay shape),
+        which made the card look like a blank tile if the user had panned away from that corner.
+        """
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is None:
+                return False
+            tw = max(1, int(self._native_minimap.width()))
+            th = max(1, int(self._native_minimap.height()))
+            if tw <= 4 or th <= 4:
+                return False
+            try:
+                nm.update()
+                nm.repaint()
+            except Exception:
+                pass
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+            shot = nm.grab()
+            if shot.isNull():
+                return False
+            sw = shot.width()
+            sh = shot.height()
+            if sw <= 8 or sh <= 8:
+                return False
+            # HiDPI: QLabel is sized in logical px; grab pixmap may be device pixels — match DPR so the
+            # preview fills the card instead of a small corner slice.
+            dpr = max(1.0, float(self._native_minimap.devicePixelRatioF()))
+            tw_px = max(1, int(round(float(tw) * dpr)))
+            th_px = max(1, int(round(float(th) * dpr)))
+            scaled = shot.scaled(
+                tw_px,
+                th_px,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            if scaled.isNull():
+                return False
+            try:
+                scaled.setDevicePixelRatio(dpr)
+            except Exception:
+                pass
+            self._native_minimap.setPixmap(scaled)
+            return True
+        except Exception:
+            return False
+
+    def _render_native_minimap_fallback(self) -> None:
+        """Render a clean neutral minimap card without external tile artifacts."""
+        try:
+            w = max(8, int(self._native_minimap.width()))
+            h = max(8, int(self._native_minimap.height()))
+            dpr = max(1.0, float(self._native_minimap.devicePixelRatioF()))
+            wi = max(8, int(round(float(w) * dpr)))
+            hi = max(8, int(round(float(h) * dpr)))
+            img = QImage(wi, hi, QImage.Format.Format_RGB32)
+            img.fill(QColor(24, 34, 54))
+            p = QPainter(img)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            # Simple grid look
+            p.setPen(QPen(QColor(52, 72, 104), 1))
+            step = int(round(18 * dpr))
+            step = max(8, step)
+            for x in range(0, wi, step):
+                p.drawLine(x, 0, x, hi)
+            for y in range(0, hi, step):
+                p.drawLine(0, y, wi, y)
+            # Center marker
+            cx = wi // 2
+            cy = hi // 2
+            pr = max(4, int(round(5 * dpr)))
+            p.setPen(QPen(QColor(35, 0, 0), 2))
+            p.setBrush(QColor(240, 40, 44))
+            p.drawEllipse(QPoint(cx, cy), pr, pr)
+            p.end()
+            pm = QPixmap.fromImage(img)
+            try:
+                pm.setDevicePixelRatio(dpr)
+            except Exception:
+                pass
+            self._native_minimap.setPixmap(pm)
+        except Exception:
+            return
+
+    def _native_minimap_tile_bad(self, img: QImage) -> bool:
+        try:
+            if img.isNull() or img.width() <= 0 or img.height() <= 0:
+                return True
+            step_x = max(1, img.width() // 24)
+            step_y = max(1, img.height() // 24)
+            colors: set[tuple[int, int, int]] = set()
+            for y in range(0, img.height(), step_y):
+                for x in range(0, img.width(), step_x):
+                    c = img.pixelColor(x, y)
+                    colors.add((c.red() // 16, c.green() // 16, c.blue() // 16))
+                    if len(colors) > 64:
+                        return False
+            # Color bars/placeholders usually have very low color diversity.
+            return len(colors) <= 24
+        except Exception:
+            return False
+
+    def _fetch_tile_image(self, url: str) -> QImage:
+        try:
+            req = Request(
+                str(url),
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": "https://www.arcgis.com/",
+                },
+                method="GET",
+            )
+            with urlopen(req, timeout=2.2) as resp:
+                raw = resp.read()
+            return QImage.fromData(raw)
+        except Exception:
+            return QImage()
+
+    def _update_native_minimap(self) -> None:
+        try:
+            if not self._native_minimap_wrap.isVisible():
+                return
+        except Exception:
+            return
+        # Best path: mirror current in-app map rendering.
+        if not self._update_native_minimap_from_web_grab():
+            # Never display external placeholder/test-pattern tiles again.
+            self._render_native_minimap_fallback()
+        self._raise_native_minimap_zoom_buttons()
+
+    def _retry_native_video_pixmap(self) -> None:
+        """Re-run paint after layout; avoids stale single-view pixmap when split is on."""
+        try:
+            if bool(getattr(self, "_video_split_enabled", False)):
+                self._render_native_split_preview()
+                return
+            im = getattr(self, "_native_video_last", None)
+            if isinstance(im, QImage) and not im.isNull():
+                self._render_native_video_preview(im)
+        except Exception:
+            pass
 
     def _render_native_video_preview(self, img: QImage) -> None:
         if img is None or img.isNull():
             return
         self._native_video_last = img
+        split_on = bool(getattr(self, "_video_split_enabled", False))
+        try:
+            if not split_on:
+                self._native_video_preview.setScaledContents(False)
+        except Exception:
+            pass
         try:
             pm = QPixmap.fromImage(img)
             if pm.isNull():
                 return
             size = self._native_video_preview.size()
             if size.width() <= 0 or size.height() <= 0:
+                QTimer.singleShot(0, self._retry_native_video_pixmap)
                 return
+            # Swapped fullscreen: stretch like the map (no letterboxing). PiP keeps aspect ratio.
+            swap_on = bool(getattr(self, "_video_swapped", False))
+            ar_mode = (
+                Qt.AspectRatioMode.IgnoreAspectRatio
+                if swap_on
+                else Qt.AspectRatioMode.KeepAspectRatio
+            )
             self._native_video_preview.setPixmap(
-                pm.scaled(
-                    size,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
+                pm.scaled(size, ar_mode, Qt.TransformationMode.SmoothTransformation)
             )
         except Exception:
             return
+
+    def _render_native_split_preview(self) -> None:
+        """
+        Git `setVideoPreviewGrid` parity: 4 cells in id order (day, thermal, …); empty cells stay dark.
+
+        Single-source (typical `thermal=''`) shows the live feed in **cell 1 only**; cells 2–4 are
+        dark placeholders labeled `Empty`. The earlier code duplicated the same frame four times,
+        which looked identical to single mode on the SMPTE test pattern.
+        """
+        if not bool(getattr(self, "_video_split_enabled", False)):
+            return
+        cache = getattr(self, "_split_last_images", None) or {}
+        keys: list[str] = []
+        try:
+            vp = getattr(self, "_video", None)
+            if vp is not None:
+                src_keys = list(vp.sources().keys())
+            else:
+                src_keys = list(cache.keys())
+        except Exception:
+            src_keys = list(cache.keys())
+        for k in ("day", "thermal"):
+            if k in src_keys and k not in keys:
+                keys.append(k)
+        for k in src_keys:
+            if k not in keys:
+                keys.append(k)
+        if not keys:
+            keys = list(cache.keys())
+        keys = keys[:4]
+
+        ordered: list[tuple[str | None, QImage | None]] = []
+        for sid in keys:
+            im = cache.get(sid)
+            if isinstance(im, QImage) and not im.isNull() and im.width() > 0:
+                ordered.append((sid, im))
+            else:
+                ordered.append((sid, None))
+        # Fallback: if there is no cached frame yet for the active source, fill cell 1 with the latest single-view frame.
+        if all(im is None for _, im in ordered):
+            lf = getattr(self, "_native_pip_last_source_frame", None)
+            if isinstance(lf, QImage) and not lf.isNull() and lf.width() > 0:
+                if ordered:
+                    ordered[0] = (ordered[0][0] or "day", lf)
+                else:
+                    ordered.append(("day", lf))
+        while len(ordered) < 4:
+            ordered.append((None, None))
+        self._render_native_split_grid_4(ordered)
+
+    @staticmethod
+    def _split_cell_label(source_id: str | None) -> str:
+        if not source_id:
+            return ""
+        sid = str(source_id).strip().lower()
+        if sid == "day":
+            return "Day"
+        if sid == "thermal":
+            return "Thermal"
+        return str(source_id)
+
+    def _render_native_split_grid_4(self, cells: list[tuple[str | None, QImage | None]]) -> None:
+        """Draw a clear 2×2 grid; filled cells show the feed + label, empty cells show 'Empty'."""
+        try:
+            gap = 6
+            heights = [im.height() for _, im in cells if isinstance(im, QImage) and not im.isNull() and im.height() > 0]
+            ref_h = max(heights) if heights else 360
+            ch_target = max(120, min(540, ref_h)) // 2
+            widths = [im.width() for _, im in cells if isinstance(im, QImage) and not im.isNull() and im.width() > 0]
+            ref_w = max(widths) if widths else 640
+            cw_target = max(160, min(960, ref_w)) // 2
+
+            cw = int(cw_target)
+            ch = int(ch_target)
+            out_w = cw * 2 + gap
+            out_h = ch * 2 + gap
+            out = QImage(out_w, out_h, QImage.Format.Format_RGB32)
+            out.fill(QColor(10, 13, 20))
+            p = QPainter(out)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            positions = ((0, 0), (cw + gap, 0), (0, ch + gap), (cw + gap, ch + gap))
+            slot_numbers = ("1", "2", "3", "4")
+
+            for slot, (dx, dy), (sid, im) in zip(slot_numbers, positions, cells):
+                p.fillRect(int(dx), int(dy), int(cw), int(ch), QColor(8, 10, 16))
+                if isinstance(im, QImage) and not im.isNull() and im.width() > 0 and im.height() > 0:
+                    scaled = im.scaled(
+                        cw,
+                        ch,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    x0 = dx + max(0, (cw - scaled.width()) // 2)
+                    y0 = dy + max(0, (ch - scaled.height()) // 2)
+                    p.drawImage(x0, y0, scaled)
+                    label = self._split_cell_label(sid)
+                    tag = f"{slot} · {label}" if label else slot
+                    self._draw_split_cell_label(p, int(dx), int(dy), int(cw), tag, filled=True)
+                else:
+                    try:
+                        p.setPen(QPen(QColor(80, 96, 124, 160), 1, Qt.PenStyle.DashLine))
+                        p.drawRect(int(dx) + 2, int(dy) + 2, int(cw) - 4, int(ch) - 4)
+                    except Exception:
+                        pass
+                    try:
+                        font_e = QFont("Segoe UI", 14, QFont.Weight.DemiBold)
+                        p.setFont(font_e)
+                        p.setPen(QColor(140, 156, 188))
+                        p.drawText(
+                            int(dx),
+                            int(dy),
+                            int(cw),
+                            int(ch),
+                            Qt.AlignmentFlag.AlignCenter,
+                            f"Cell {slot}\nEmpty",
+                        )
+                    except Exception:
+                        pass
+                    self._draw_split_cell_label(p, int(dx), int(dy), int(cw), slot, filled=False)
+
+            try:
+                p.setPen(QPen(QColor(232, 240, 255), 3))
+                gx = cw + gap // 2
+                gy = ch + gap // 2
+                p.drawLine(gx, 0, gx, out_h)
+                p.drawLine(0, gy, out_w, gy)
+            except Exception:
+                pass
+            p.end()
+            self._render_native_video_preview(out)
+        except Exception:
+            return
+
+    @staticmethod
+    def _draw_split_cell_label(p: QPainter, x: int, y: int, cw: int, text: str, *, filled: bool) -> None:
+        try:
+            font = QFont("Segoe UI", 11, QFont.Weight.Bold)
+            p.setFont(font)
+            pad_x = 8
+            pad_y = 4
+            metrics = p.fontMetrics()
+            tw = min(cw - 12, metrics.horizontalAdvance(text) + pad_x * 2)
+            th = metrics.height() + pad_y
+            bx = x + 6
+            by = y + 6
+            p.fillRect(bx, by, tw, th, QColor(0, 0, 0, 200))
+            p.setPen(QColor(140, 230, 175) if filled else QColor(180, 200, 230))
+            p.drawText(bx + pad_x, by + metrics.ascent() + pad_y // 2, text)
+        except Exception:
+            pass
+
+    def _seed_split_cache_from_last_frame(self) -> None:
+        """After enabling split, paint immediately from the last single-view frame (avoids blank until next tick)."""
+        if not bool(getattr(self, "_video_split_enabled", False)):
+            return
+        try:
+            im = getattr(self, "_native_video_last", None)
+            if not isinstance(im, QImage) or im.isNull():
+                return
+            c = getattr(self, "_split_last_images", None)
+            if c is None:
+                return
+            vp = getattr(self, "_video", None)
+            if vp is not None:
+                keys = list(vp.sources().keys())
+                if "day" in keys:
+                    c["day"] = im.copy()
+                elif "thermal" in keys:
+                    c["thermal"] = im.copy()
+                elif keys:
+                    c[str(keys[0])] = im.copy()
+                else:
+                    c["day"] = im.copy()
+            else:
+                c["day"] = im.copy()
+        except Exception:
+            pass
+
+    def _sync_map_action_rail_enabled(self) -> None:
+        """Match legacy `setActionButtonsEnabled`: Takeoff/Return on map when MAVLink link is up."""
+        ok = bool(getattr(self, "_last_link_connected", False))
+        for b in (
+            getattr(self, "_map_action_takeoff_btn", None),
+            getattr(self, "_map_action_return_btn", None),
+        ):
+            if b is not None:
+                b.setEnabled(ok)
 
     def set_link_connected(self, connected: bool) -> None:
         c = bool(connected)
@@ -5404,6 +2243,7 @@ class MapWidget(QWidget):
             print(f"[VGCS:map] link_connected={c}")
         except Exception:
             pass
+        self._sync_map_action_rail_enabled()
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
         # Run a one-time tile probe after connect to log "blocked vs placeholder" clearly.
         if c and not getattr(self, "_tile_probe_ran", False):
@@ -5417,11 +2257,34 @@ class MapWidget(QWidget):
         # This matches QGC behavior and avoids blank video when the vehicle is in
         # pre-arm/GPS-failure states.
         if not c:
+            # Keep camera controls hidden until MAVLink link-up (heartbeat).
+            try:
+                self._native_hud_right.hide()
+            except Exception:
+                pass
+            try:
+                self._native_rail_layer.hide()
+            except Exception:
+                pass
             if webcam_enabled and bool(getattr(self, "_web_ready", False)):
                 self._start_video_preview()
             else:
                 self._stop_video_preview(clear_overlay=True)
             return
+        # MAVLink connected: refresh HUD geometry (rail stays visible whenever map is ready; see `_on_map_loaded`).
+        try:
+            if self._plan_flight_layer_obscures_native_camera_ui():
+                self._native_hud_right.hide()
+                self._native_rail_layer.hide()
+            else:
+                self._native_hud_right.show()
+                try:
+                    self._native_rail_layer.show()
+                except Exception:
+                    pass
+            QTimer.singleShot(0, self._layout_native_hud)
+        except Exception:
+            pass
         if webcam_enabled:
             self._start_video_preview()
 
@@ -5621,13 +2484,16 @@ class MapWidget(QWidget):
 
     def set_flight_status(self, status: str, detail: str = "") -> None:
         st = (status or "").strip().lower()
-        if st not in {"green", "yellow", "red"}:
+        if st not in {"green", "yellow", "red", "idle"}:
             st = "red"
         d = str(detail)
         key = (st, d)
         if self._last_flight_status_key == key:
             return
         self._last_flight_status_key = key
+        # Idle/neutral is owned by Qt `#linkBanner` styling; skip legacy JS tint when offline maps only.
+        if st == "idle":
+            return
         self._run_js(f"setFlightStatus({json.dumps(st)}, {json.dumps(detail)});")
 
     def set_header_mode(self, mode_text: str) -> None:
@@ -5657,14 +2523,127 @@ class MapWidget(QWidget):
     def set_header_remote_id(self, rid_text: str) -> None:
         self._run_js(f"setHeaderRemoteId({json.dumps(rid_text)});")
 
+    def _layout_plan_flight_panel(self) -> None:
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is None:
+            return
+        try:
+            w = max(1, self._map_canvas.width())
+            h = max(1, self._map_canvas.height())
+            origin = self._map_canvas.mapTo(self._panel, QPoint(0, 0))
+            panel.setGeometry(origin.x(), origin.y(), w, h)
+        except Exception:
+            pass
+
+    def _plan_flight_layer_obscures_native_camera_ui(self) -> bool:
+        """True while Plan Flight covers the map — hide PiP / camera rail so planning stays uncluttered."""
+        panel = getattr(self, "_plan_flight_panel", None)
+        try:
+            return panel is not None and panel.isVisible()
+        except Exception:
+            return False
+
+    def _set_map_footer_hud_visible(self, visible: bool) -> None:
+        """Mirror legacy `setPlanFlightVisible(...)` which hid the bottom compass/telemetry while planning."""
+        show = bool(visible) and bool(getattr(self, "_web_ready", False))
+        try:
+            if hasattr(self, "_native_telemetry"):
+                self._native_telemetry.setVisible(show)
+            if hasattr(self, "_native_compass"):
+                self._native_compass.setVisible(show)
+        except Exception:
+            pass
+
+    def _on_plan_panel_exit(self) -> None:
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm.disable_plan_edit_modes()
+        except Exception:
+            pass
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.hide()
+        self._set_map_footer_hud_visible(True)
+        try:
+            self._layout_native_hud()
+            self._stack_native_overlays_above_tile_map()
+        except Exception:
+            pass
+        self.plan_flight_exited.emit()
+
+    def _sync_native_plan_edit_mode_for_rail_tool(self, tool: str) -> None:
+        """When the plan rail tool is not Waypoint/ROI, clear native map placement modes."""
+        tl = (tool or "").strip().lower()
+        if tl in ("waypoint", "roi"):
+            return
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm.disable_plan_edit_modes()
+        except Exception:
+            pass
+
+    def _on_plan_panel_tool(self, tool: str) -> None:
+        t = (tool or "").strip()
+        if not t:
+            return
+        self._plan_rail_tool_state = t
+        self._sync_native_plan_edit_mode_for_rail_tool(t)
+        self.plan_tool_requested.emit(t)
+
+    def _on_plan_panel_mission_changed(self, payload: object) -> None:
+        data = dict(payload) if isinstance(payload, dict) else {}
+        self.plan_mission_panel_changed.emit(data)
+
+    def _on_plan_panel_waypoints_changed(self, waypoints: object) -> None:
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is None:
+            return
+        try:
+            n = len(waypoints) if hasattr(waypoints, "__len__") else 0
+        except Exception:
+            n = 0
+        panel.set_waypoint_count(int(n))
+
+    def _on_plan_panel_set_launch_to_map_center(self) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        try:
+            lat = float(getattr(nm, "_center_lat", 0.0) or 0.0)
+            lon = float(getattr(nm, "_center_lon", 0.0) or 0.0)
+        except Exception:
+            return
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_launch_position(lat, lon)
+
     def set_plan_flight_visible(self, visible: bool) -> None:
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is None:
+            return
         if visible:
-            t = self._plan_rail_tool_state
-            self._run_js(
-                f"window.__planRailTool = {json.dumps(t)}; setPlanFlightVisible(true);"
-            )
+            self._layout_plan_flight_panel()
+            panel.set_rail_tool(self._plan_rail_tool_state or "File")
+            panel.set_waypoint_count(len(self._waypoints_model))
+            panel.show()
+            panel.raise_()
+            self._set_map_footer_hud_visible(False)
         else:
-            self._run_js("setPlanFlightVisible(false);")
+            try:
+                nm = getattr(self, "_native_map", None)
+                if nm is not None:
+                    nm.disable_plan_edit_modes()
+            except Exception:
+                pass
+            panel.hide()
+            self._set_map_footer_hud_visible(True)
+        try:
+            self._layout_native_hud()
+            self._stack_native_overlays_above_tile_map()
+        except Exception:
+            pass
 
     def set_plan_flight_metrics(
         self,
@@ -5691,15 +2670,34 @@ class MapWidget(QWidget):
         if payload == self._last_plan_flight_metrics_payload:
             return
         self._last_plan_flight_metrics_payload = payload
-        self._run_js(f"setPlanFlightMetrics({json.dumps(payload)});")
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_metrics(payload)
 
     def refresh_plan_flight_chrome(self, *, link_ok: bool, waypoint_count: int) -> None:
-        self._run_js(
-            "setPlanFlightChromeState("
-            f"{str(bool(link_ok)).lower()}, {max(0, int(waypoint_count))});"
-        )
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_chrome_state(bool(link_ok), max(0, int(waypoint_count)))
 
     def center_on_vehicle(self) -> None:
+        """Recenter the map on the vehicle (native: `set_center` from widget coords, else native vehicle)."""
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                la = getattr(self, "_lat", None)
+                lo = getattr(self, "_lon", None)
+                if la is not None and lo is not None:
+                    nm.set_center(float(la), float(lo))
+                else:
+                    nm.center_on_vehicle()
+                try:
+                    if self._native_minimap_wrap.isVisible():
+                        self._update_native_minimap()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
         self._run_js("centerOnVehicle();")
 
     def set_plan_rail_tool(self, tool: str) -> None:
@@ -5707,33 +2705,36 @@ class MapWidget(QWidget):
         if not t:
             return
         self._plan_rail_tool_state = t
-        self._run_js(
-            f"window.__planRailTool = {json.dumps(t)}; setPlanRailTool({json.dumps(t)});"
-        )
+        self._sync_native_plan_edit_mode_for_rail_tool(t)
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_rail_tool(t)
 
     def apply_plan_mission_panel_state(self, state: dict[str, object]) -> None:
-        self._run_js(f"applyPlanMissionPanelState({json.dumps(state)});")
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.apply_panel_state(dict(state) if isinstance(state, dict) else {})
 
     def set_plan_sequence_template(self, template_id: str | None) -> None:
         """Show/hide Mission tab pattern row (Survey / Corridor / Structure) to match template picks."""
         tid = (template_id or "").strip().lower()
-        self._run_js(f"setPlanSequenceTemplate({json.dumps(tid)});")
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_sequence_template(tid)
 
     def set_plan_mission_start_stack(self, enabled: bool, survey_label: str = "Survey") -> None:
-        self._run_js(
-            "setPlanMissionStartStack("
-            f"{str(bool(enabled)).lower()}, {json.dumps(str(survey_label))}"
-            ");"
-        )
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_mission_start_stack(bool(enabled), str(survey_label or "Survey"))
 
     def set_plan_vehicle_info(self, firmware: str, vehicle: str) -> None:
         key = (str(firmware), str(vehicle))
         if key == self._last_plan_vehicle_info_key:
             return
         self._last_plan_vehicle_info_key = key
-        self._run_js(
-            f"setPlanVehicleInfo({json.dumps(firmware)}, {json.dumps(vehicle)});"
-        )
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_vehicle_info(str(firmware or ""), str(vehicle or ""))
 
     def get_default_waypoint_alt_m(self) -> float:
         return float(self._default_alt.value())
@@ -5772,67 +2773,32 @@ class MapWidget(QWidget):
         return float(self._lat), float(self._lon)
 
     def _init_map_backend(self) -> None:
-        if HAS_WEBENGINE and QWebEngineView is not None:
-            self._web = QWebEngineView()
-            self._web.setMinimumHeight(260)
-            self._web.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-            self._map_canvas.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-            self._map_canvas.setAutoFillBackground(True)
-            # Enable persistent HTTP cache so 2D tiles load much faster after first view.
-            try:
-                if QWebEngineProfile is not None:
-                    prof = QWebEngineProfile.defaultProfile()
-                    # Attach headers to avoid tile-provider blocks on some client networks.
-                    try:
-                        if QWebEngineUrlRequestInterceptor is not None:
-                            self._tile_interceptor = _TileHeaderInterceptor()
-                            prof.setUrlRequestInterceptor(self._tile_interceptor)
-                    except Exception:
-                        pass
-                    cache_root = (Path.home() / ".vgcs-webengine-cache").resolve()
-                    cache_root.mkdir(parents=True, exist_ok=True)
-                    prof.setCachePath(str(cache_root))
-                    prof.setPersistentStoragePath(str(cache_root))
-                    # Disk cache; 512MB cap (tunable).
-                    try:
-                        prof.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
-                        prof.setHttpCacheMaximumSize(512 * 1024 * 1024)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            # Print JS console logs to the VGCS terminal (client diagnostics).
-            try:
-                if QWebEnginePage is not None:
-                    self._web.setPage(_LoggingWebPage(self._web))
-            except Exception:
-                pass
-            if QWebEngineSettings is not None:
-                settings = self._web.settings()
-                settings.setAttribute(
-                    QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
-                )
-                # Required for offline tiles (file:///.../z/x/y.png) while page baseUrl is assets/.
-                try:
-                    settings.setAttribute(
-                        QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True
-                    )
-                except Exception:
-                    pass
-                settings.setAttribute(
-                    QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, False
-                )
-                settings.setAttribute(
-                    QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False
-                )
-            assets_root = (Path(__file__).resolve().parents[1] / "assets").resolve()
-            base = QUrl.fromLocalFile(str(assets_root) + "/")
-            self._web.setHtml(self._build_leaflet_html(), base)
-            self._web.loadFinished.connect(self._on_map_loaded)
-            self._web.titleChanged.connect(self._on_web_title_changed)
-            self._map_canvas_layout.addWidget(self._web)
-            self._set_status("Map backend: Leaflet (WebEngine)")
-        # Apply saved performance preference immediately; Auto detection will run after load.
+        self._map_canvas.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self._map_canvas.setAutoFillBackground(True)
+        self._map_stack = QStackedWidget(self._map_canvas)
+        self._map_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self._native_map = NativeTileMapView()
+        self._native_map.setMinimumHeight(260)
+        self._native_map.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self._map_stack.addWidget(self._native_map)
+        self._map_canvas_layout.addWidget(self._map_stack, 1)
+        # PiP / compass / rail layer stay on `_map_canvas`; keep the map stack below those siblings.
+        try:
+            self._map_stack.lower()
+        except Exception:
+            pass
+        self._native_map.user_waypoints_changed.connect(self._on_native_user_waypoints_changed)
+        self._native_map.observation_map_click.connect(
+            lambda la, lo: self._log_observation("map_mark", map_lat=float(la), map_lon=float(lo))
+        )
+        self._web_ready = True
+        self._set_status("Map backend: Native Qt tiles")
+        self._on_map_loaded(True)
+
         try:
             s = QSettings(_QS_NS, _QS_APP)
             mode = str(s.value(_KEY_MAP_LOW_SPEC_MODE, "auto") or "auto").strip().lower()
@@ -5855,95 +2821,29 @@ class MapWidget(QWidget):
                 self._perf_mode.setCurrentIndex(0)
             except Exception:
                 pass
-            return
 
-        backend_notice = QLabel(
-            "Qt WebEngine is not available. Install PySide6 WebEngine modules to enable the interactive map."
-        )
-        backend_notice.setWordWrap(True)
-        backend_notice.setAlignment(Qt.AlignCenter)
-        backend_notice.setStyleSheet("color: #a8b0c4; padding: 20px;")
-        self._map_canvas_layout.addWidget(backend_notice)
-        self._set_status("Map backend unavailable")
+        # Pre-warm WebEngine 3D in the background. Without this, the first 3D button press
+        # creates the QWebEngineView, spawns the WebEngine helper process, loads 146KB of HTML
+        # and boots Cesium synchronously from the user's POV — the window can flash blank and
+        # feels like the app restarted before the globe appears.
+        if HAS_WEBENGINE_3D:
+            QTimer.singleShot(900, self._preload_web_3d_view)
 
-    def _build_leaflet_html(self) -> str:
-        """Build map HTML. Image refs are paths relative to the assets/ base URL (see _init_map_backend).
+    def _preload_web_3d_view(self) -> None:
+        """Lazy-load the 3D WebEngine page in the background after the main UI is up."""
+        try:
+            self._ensure_web_3d_view()
+        except Exception:
+            pass
 
-        Large PNGs are not base64-inlined: multi-megabyte data URIs choke Qt WebEngine and yield a blank page.
-        """
-        assets_dir = Path(__file__).resolve().parents[1] / "assets"
-        assets_root = assets_dir.resolve()
-
-        def src_under_assets(path: Path) -> str:
-            rel = path.resolve().relative_to(assets_root)
-            return "/".join(quote(part, safe="") for part in rel.parts)
-
-        logo_candidates = [
-            assets_dir / "Vama Logo.png",
-            assets_dir / "vama_logo.jpg",
-            Path(__file__).resolve().parents[2] / "Vama Logo New.png",
-        ]
-        logo_src = ""
-        for p in logo_candidates:
-            if not p.is_file():
-                continue
-            pr = p.resolve()
-            try:
-                logo_src = src_under_assets(pr)
-                break
-            except ValueError:
-                try:
-                    raw = pr.read_bytes()
-                except Exception:
-                    continue
-                if not raw:
-                    continue
-                mime = "image/png" if pr.suffix.lower() == ".png" else "image/jpeg"
-                logo_src = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-                break
-        icon_files = {
-            "__ICON_HOLD_SRC__": assets_dir / "header_icons" / "hold.svg",
-            "__ICON_LINK_SRC__": assets_dir / "header_icons" / "link.svg",
-            "__ICON_GPS_SRC__": assets_dir / "header_icons" / "gps.svg",
-            "__ICON_BATTERY_SRC__": assets_dir / "header_icons" / "battery.svg",
-            "__ICON_REMOTE_ID_SRC__": assets_dir / "header_icons" / "remote_id.svg",
-        }
-        icon_data: dict[str, str] = {}
-        for token, icon_path in icon_files.items():
-            if not icon_path.is_file():
-                icon_data[token] = ""
-                continue
-            try:
-                icon_data[token] = src_under_assets(icon_path)
-            except ValueError:
-                icon_data[token] = ""
-
-        empty_plan_src = ""
-        # Prefer the corrected filename, but keep typo fallback for older local worktrees.
-        for _empty_name in ("empty plan.png", "emtpy plan.png"):
-            ep = assets_dir / _empty_name
-            if ep.is_file():
-                try:
-                    empty_plan_src = src_under_assets(ep)
-                except ValueError:
-                    empty_plan_src = quote(_empty_name, safe="")
-                break
-        survey_p = assets_dir / "survey.png"
-        corr_p = assets_dir / "Corridor Scan.png"
-        stru_p = assets_dir / "Structure Scan.png"
-        plan_tpl_images = {
-            "__PLAN_TPL_EMPTY_SRC__": empty_plan_src,
-            "__PLAN_TPL_SURVEY_SRC__": src_under_assets(survey_p) if survey_p.is_file() else "",
-            "__PLAN_TPL_CORRIDOR_SRC__": src_under_assets(corr_p) if corr_p.is_file() else "",
-            "__PLAN_TPL_STRUCTURE_SRC__": src_under_assets(stru_p) if stru_p.is_file() else "",
-        }
-
-        html = LEAFLET_HTML.replace("__LOGO_SRC__", logo_src)
-        for token, data_uri in icon_data.items():
-            html = html.replace(token, data_uri)
-        for token, data_uri in plan_tpl_images.items():
-            html = html.replace(token, data_uri)
-        return html
+    def _on_native_user_waypoints_changed(self) -> None:
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is None:
+                return
+            self._on_waypoints_json(nm.waypoints_json())
+        except Exception:
+            pass
 
     def _on_map_loaded(self, ok: bool) -> None:
         self._web_ready = bool(ok)
@@ -5986,6 +2886,43 @@ class MapWidget(QWidget):
                 self.apply_video_settings()
             except Exception:
                 pass
+            try:
+                self._native_compass.show()
+                self._native_telemetry.show()
+                # Keep camera rail (ZOOM/FOCUS/GIMBAL/OBSERVE) hidden until MAVLink is connected.
+                # This ensures the UI follows the desired flow: "Disconnected" -> no camera controls.
+                if bool(getattr(self, "_last_link_connected", False)):
+                    if self._plan_flight_layer_obscures_native_camera_ui():
+                        try:
+                            self._native_hud_right.hide()
+                            self._native_rail_layer.hide()
+                        except Exception:
+                            pass
+                    else:
+                        self._native_hud_right.show()
+                        try:
+                            self._native_rail_layer.show()
+                        except Exception:
+                            pass
+                    # Layout + Z-order immediately: `resizeEvent` can run while the layer is still hidden,
+                    # which skipped `ly.raise_()` when gated on `isVisible()` — map then stayed above the rail.
+                    try:
+                        self._layout_native_hud()
+                        self._stack_native_overlays_above_tile_map()
+                    except Exception:
+                        pass
+                    QTimer.singleShot(0, self._layout_native_hud)
+                else:
+                    try:
+                        self._native_hud_right.hide()
+                    except Exception:
+                        pass
+                    try:
+                        self._native_rail_layer.hide()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             # Start preview if user enabled it (do not require telemetry link).
             try:
                 if bool(getattr(self, "_btn_webcam", None)) and bool(self._btn_webcam.isChecked()):
@@ -6006,16 +2943,48 @@ class MapWidget(QWidget):
         if getattr(self, "_video_inited", False):
             return bool(getattr(self, "_video", None)) and bool(getattr(self, "_video_active_source", None))
 
+        shared = getattr(self, "_video_pipeline_shared", None)
+        # After set_camera_control(), _video_inited is cleared but the shared pipeline + signal hooks stay valid.
+        if shared is not None and getattr(self, "_shared_vp_hooks_connected", False):
+            self._video_inited = True
+            self._video = shared
+            try:
+                self._video_active_source = shared.active_source()
+            except Exception:
+                self._video_active_source = None
+            # `active_source()` can be None if `_active_source_id` was cleared; refresh like full init.
+            if self._video_active_source is None and shared is not None:
+                try:
+                    src_ids = set(shared.sources().keys())
+                    preferred_id = ""
+                    if "day" in src_ids:
+                        preferred_id = "day"
+                    elif "thermal" in src_ids:
+                        preferred_id = "thermal"
+                    elif src_ids:
+                        preferred_id = str(next(iter(src_ids)))
+                    if preferred_id:
+                        shared.set_active_source(preferred_id)
+                        self._video_active_source = shared.active_source()
+                except Exception:
+                    pass
+            if not isinstance(getattr(self, "_split_last_images", None), dict):
+                self._split_last_images = {}
+            if not isinstance(getattr(self, "_native_pip_last_source_frame", None), QImage):
+                self._native_pip_last_source_frame = QImage()
+            return bool(self._video_active_source)
+
         self._video_inited = True
         self._video: VideoPipeline | None = None
         self._video_active_source = None
         self._video_preview_enabled = False
-        self._video_split_enabled = False
+        # Do not clear `_video_split_enabled` / `_video_follow_enabled` here: the native rail
+        # may set them just before this call (`VGCS_CAM_*_TOGGLE`); resetting would undo the click.
         self._video_recording = False
         self._video_recording_tmp_path = ""
+        self._stop_native_cam_recording_tick_timer(reset_label=True)
         self._video_vision_mode = "day"  # 'day' | 'night'
         self._video_zoom = 1.0  # 1.0x .. 4.0x
-        self._video_follow_enabled = False
         self._video_follow_last_center_mono = 0.0
         self._video_last_data_url = ""
         self._video_last_data_urls: dict[str, str] = {}
@@ -6031,6 +3000,8 @@ class MapWidget(QWidget):
         self._video_encode_format = "PNG"
         self._video_encode_quality = 1
         self._video_pool = QThreadPool.globalInstance()
+        self._split_last_images: dict[str, QImage] = {}
+        self._native_pip_last_source_frame = QImage()
         self._video_push_timer = QTimer(self)
         self._video_push_timer.setInterval(66)  # ~15 fps push to WebEngine
         self._video_push_timer.timeout.connect(self._push_video_preview_any_to_overlay)
@@ -6040,7 +3011,10 @@ class MapWidget(QWidget):
         self._ai_phase = 0.0
 
         try:
-            self._video = VideoPipeline(self)
+            if shared is not None:
+                self._video = shared
+            else:
+                self._video = VideoPipeline(self)
             # Apply RTSP settings before enumerating sources.
             try:
                 self._read_video_settings()
@@ -6105,6 +3079,8 @@ class MapWidget(QWidget):
                 except Exception:
                     pass
                 src.frame.connect(lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf))
+            if shared is not None:
+                self._shared_vp_hooks_connected = True
         except Exception:
             self._video_active_source = None
             return False
@@ -6113,19 +3089,12 @@ class MapWidget(QWidget):
     def _read_video_settings(self) -> None:
         s = QSettings(_QS_NS, _QS_APP)
         source = str(s.value(_KEY_VIDEO_SOURCE, "rtsp") or "rtsp").strip().lower()
+        self._video_settings_source = source
         self._video_settings_enabled = bool(s.value(_KEY_VIDEO_ENABLED, False)) and source != "disabled"
         self._video_settings_day = str(s.value(_KEY_VIDEO_RTSP_DAY, "") or "").strip()
         self._video_settings_thermal = str(s.value(_KEY_VIDEO_RTSP_THERMAL, "") or "").strip()
         self._video_settings_rtsp_transport = str(s.value(_KEY_VIDEO_RTSP_TRANSPORT, "auto") or "auto").strip().lower()
         self._video_settings_default_view = str(s.value(_KEY_VIDEO_DEFAULT_VIEW, "Single") or "Single")
-        try:
-            print(
-                f"[VGCS:video] settings enabled={self._video_settings_enabled} source={source} "
-                f"day={self._video_settings_day!r} thermal={self._video_settings_thermal!r} "
-                f"transport={self._video_settings_rtsp_transport!r}"
-            )
-        except Exception:
-            pass
 
     def apply_video_settings(self) -> None:
         """
@@ -6133,6 +3102,15 @@ class MapWidget(QWidget):
         Reconfigures the video pipeline (RTSP Day/Thermal) and updates defaults.
         """
         self._read_video_settings()
+        try:
+            print(
+                f"[VGCS:video] settings enabled={self._video_settings_enabled} "
+                f"source={self._video_settings_source} "
+                f"day={self._video_settings_day!r} thermal={self._video_settings_thermal!r} "
+                f"transport={self._video_settings_rtsp_transport!r}"
+            )
+        except Exception:
+            pass
         # Mirror enable state into legacy toolbar toggle for visibility.
         try:
             self._btn_webcam.blockSignals(True)
@@ -6149,6 +3127,14 @@ class MapWidget(QWidget):
                 self._stop_video_preview(clear_overlay=True)
         except Exception:
             pass
+        # Default split view from Application Settings → Video (matches web `__camSplitEnabled` seed).
+        try:
+            self._video_split_enabled = (
+                str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower() == "split"
+            )
+        except Exception:
+            pass
+        self._sync_native_camera_rail_toggles()
 
     def set_camera_control(self, control) -> None:
         """Inject a camera control backend (MAVLink/SDK)."""
@@ -6158,19 +3144,20 @@ class MapWidget(QWidget):
             pass
         self._video_inited = False
 
-        # Default split mode comes from settings.
-        self._video_split_enabled = str(self._video_settings_default_view).strip().lower() == "split"
-
+        # Do not reset `_video_split_enabled` here: this runs on every connect/disconnect and on
+        # camera-backend hot-swap; the operator's SPLIT choice must persist (apply_video_settings
+        # still seeds from Application Settings → Video when the user saves there).
         try:
             if getattr(self, "_web_ready", False):
-                if self._video_split_enabled:
+                if bool(getattr(self, "_video_split_enabled", False)):
                     self._run_js("setVideoPreviewMode('grid');")
                 else:
                     self._run_js("setVideoPreviewMode('single');")
         except Exception:
             pass
+        self._sync_native_camera_rail_toggles()
 
-    def _start_video_preview(self) -> None:
+    def _start_video_preview(self, *, reset_swapped: bool = True) -> None:
         if not getattr(self, "_web_ready", False):
             return
         if not self._ensure_video_preview_backend():
@@ -6181,13 +3168,18 @@ class MapWidget(QWidget):
             self._video_preview_enabled = True
             # Always start in day preview unless explicitly toggled by operator.
             self._video_vision_mode = "day"
-            self._video_swapped = False
-            self._native_video_preview.show()
-            self._layout_native_video_preview()
-            self._native_hud_right.show()
-            self._native_compass.show()
-            self._native_telemetry.show()
-            self._layout_native_hud()
+            if reset_swapped:
+                self._video_swapped = False
+            # Keep Web layer in map mode; native side handles fullscreen camera.
+            self._run_js("setVideoSwapMode(false);")
+            if self._plan_flight_layer_obscures_native_camera_ui():
+                self._native_video_preview.hide()
+                self._layout_native_hud()
+            else:
+                self._native_video_preview.show()
+                self._layout_native_video_preview()
+            # Native minimap position follows PiP; camera rail is shown from `_on_map_loaded`.
+            self._update_native_minimap()
             # Native mode: hide Web preview layer to avoid double-render fragmentation.
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
@@ -6206,16 +3198,8 @@ class MapWidget(QWidget):
                         s.start()
                     except Exception:
                         pass
-            # Keep WebEngine overlay pipeline only for split mode fallback.
-            if bool(getattr(self, "_video_split_enabled", False)):
-                if hasattr(self, "_video_push_timer") and not self._video_push_timer.isActive():
-                    self._video_push_timer.start()
-                if hasattr(self, "_ai_timer") and not self._ai_timer.isActive():
-                    self._ai_timer.start()
-            else:
-                if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
-                    self._ai_timer.stop()
-                self._run_js("if (window.clearAiOverlays) clearAiOverlays();")
+            if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
+                self._ai_timer.stop()
         except Exception:
             self._run_js("setVideoPreviewImage('');")
 
@@ -6229,12 +3213,16 @@ class MapWidget(QWidget):
             self._ai_timer.stop()
         try:
             self._native_video_preview.hide()
-            self._native_hud_right.hide()
-            self._native_compass.hide()
-            self._native_telemetry.hide()
+            self._native_minimap_wrap.hide()
             self._native_video_preview.setPixmap(QPixmap())
             self._native_video_last = QImage()
+            self._native_pip_last_source_frame = QImage()
             self._video_swapped = False
+            try:
+                if hasattr(self, "_split_last_images"):
+                    self._split_last_images.clear()
+            except Exception:
+                pass
         except Exception:
             pass
         try:
@@ -6247,6 +3235,10 @@ class MapWidget(QWidget):
                         s.stop()
                     except Exception:
                         pass
+        except Exception:
+            pass
+        try:
+            self._sync_native_map_vehicle_arrow_scale()
         except Exception:
             pass
         if clear_overlay and getattr(self, "_web_ready", False):
@@ -6275,32 +3267,30 @@ class MapWidget(QWidget):
             img2 = img.copy()
         except Exception:
             img2 = img
-
-        # Main single-view path: always render natively in Qt for best quality.
-        if not bool(getattr(self, "_video_split_enabled", False)):
-            self._render_native_video_preview(img2)
-            return
-
-        # Split-mode fallback path: keep existing WebEngine bridge behavior.
-        if bool(getattr(self, "_video_encode_inflight", False)):
-            self._video_encode_pending = img2
-            return
-
-        self._video_encode_inflight = True
-        task = _VideoEncodeTask(
-            img2,
-            self._video_encode_bridge,
-            max_w=int(getattr(self, "_video_encode_max_w", 1920)),
-            max_h=int(getattr(self, "_video_encode_max_h", 1080)),
-            encode_format=str(getattr(self, "_video_encode_format", "PNG")),
-            encode_quality=int(getattr(self, "_video_encode_quality", 1)),
-        )
         try:
-            self._video_pool.start(task)
+            self._native_pip_last_source_frame = img2
         except Exception:
-            # If threadpool is unavailable, drop rather than blocking the GUI.
-            self._video_encode_inflight = False
+            pass
+
+        # Split views read `_split_last_images` (see `_on_pipeline_frame_for`). The active source
+        # is also connected here; on some stacks the per-source slot does not run reliably for
+        # that same object, so the split cache never filled and the PiP stayed single-frame.
+        if bool(getattr(self, "_video_split_enabled", False)):
+            try:
+                sid = "day"
+                src = getattr(self, "_video_active_source", None)
+                if src is not None:
+                    raw = str(getattr(src, "source_id", "") or "").strip()
+                    if raw:
+                        sid = raw
+                c = getattr(self, "_split_last_images", None)
+                if isinstance(c, dict):
+                    c[str(sid)] = img2
+                self._render_native_split_preview()
+            except Exception:
+                pass
             return
+        self._render_native_video_preview(img2)
 
     def _on_pipeline_frame_for(self, source_id: str, vf: VideoFrame) -> None:
         if not bool(getattr(self, "_video_preview_enabled", False)):
@@ -6324,26 +3314,11 @@ class MapWidget(QWidget):
         except Exception:
             img2 = img
 
-        if bool(self._video_encode_inflight_by_id.get(source_id, False)):
-            self._video_encode_pending_by_id[source_id] = img2
-            return
-        self._video_encode_inflight_by_id[source_id] = True
-        bridge = self._video_encode_bridge_by_id.get(source_id)
-        if bridge is None:
-            self._video_encode_inflight_by_id[source_id] = False
-            return
-        task = _VideoEncodeTask(
-            img2,
-            bridge,
-            max_w=int(getattr(self, "_video_encode_max_w", 1920)),
-            max_h=int(getattr(self, "_video_encode_max_h", 1080)),
-            encode_format=str(getattr(self, "_video_encode_format", "PNG")),
-            encode_quality=int(getattr(self, "_video_encode_quality", 1)),
-        )
         try:
-            self._video_pool.start(task)
+            self._split_last_images[str(source_id)] = img2
         except Exception:
-            self._video_encode_inflight_by_id[source_id] = False
+            pass
+        self._render_native_split_preview()
 
     def _on_video_frame_encoded_for(self, source_id: str, data_url: str) -> None:
         self._video_last_data_urls[source_id] = str(data_url or "")
@@ -6485,6 +3460,13 @@ class MapWidget(QWidget):
         """
         Save a photo immediately without opening a pre-save dialog.
         Returns the saved path on success, else None.
+
+        Fallback order (matches what the user actually sees on screen):
+          1. Backend `take_photo` (QtMultimedia camera). RTSP sources do not implement this.
+          2. Cached native PiP frame (`_native_pip_last_source_frame`) — populated by
+             `_on_pipeline_frame` for the native renderer.
+          3. Split cache (`_split_last_images`) — populated in split mode.
+          4. Legacy data-URL fallback (only set by the old WebEngine overlay).
         """
         stamp = time.strftime("%Y%m%d_%H%M%S")
         photos_dir = Path.cwd() / "captures"
@@ -6493,7 +3475,6 @@ class MapWidget(QWidget):
         except Exception:
             return None
 
-        # Prefer backend-native capture when available.
         try:
             self._ensure_video_preview_backend()
             src = getattr(self, "_video_active_source", None)
@@ -6505,24 +3486,88 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-        # Fallback: decode the currently displayed data URL frame.
+        try:
+            img = getattr(self, "_native_pip_last_source_frame", None)
+            if isinstance(img, QImage) and not img.isNull() and img.width() > 0 and img.height() > 0:
+                out = photos_dir / f"photo_{stamp}.jpg"
+                if img.save(str(out), "JPG", 92):
+                    return str(out)
+        except Exception:
+            pass
+
+        try:
+            cache = getattr(self, "_split_last_images", None) or {}
+            ordered = [
+                cache.get("day"),
+                cache.get("thermal"),
+                *[v for k, v in cache.items() if k not in ("day", "thermal")],
+            ]
+            for im in ordered:
+                if isinstance(im, QImage) and not im.isNull() and im.width() > 0 and im.height() > 0:
+                    out = photos_dir / f"photo_{stamp}.jpg"
+                    if im.save(str(out), "JPG", 92):
+                        return str(out)
+                    break
+        except Exception:
+            pass
+
         try:
             data_url = str(getattr(self, "_video_last_data_url", "") or "").strip()
-            if not data_url.startswith("data:image/"):
-                return None
-            head, b64 = data_url.split(",", 1)
-            ext = "jpg"
-            if "image/png" in head.lower():
-                ext = "png"
-            out = photos_dir / f"photo_{stamp}.{ext}"
-            raw = base64.b64decode(b64)
-            out.write_bytes(raw)
-            return str(out)
+            if data_url.startswith("data:image/"):
+                head, b64 = data_url.split(",", 1)
+                ext = "png" if "image/png" in head.lower() else "jpg"
+                out = photos_dir / f"photo_{stamp}.{ext}"
+                raw = base64.b64decode(b64)
+                out.write_bytes(raw)
+                return str(out)
         except Exception:
-            return None
+            pass
+        return None
+
+    def _flash_photo_feedback(self, *, ok: bool, name: str = "") -> None:
+        """Briefly replace the cam timer text with `Saved` / `No frame` so the operator sees feedback."""
+        try:
+            lbl = getattr(self, "_lbl_native_cam_timer", None)
+            if lbl is None:
+                return
+            if not hasattr(self, "_photo_flash_timer"):
+                self._photo_flash_timer = QTimer(self)
+                self._photo_flash_timer.setSingleShot(True)
+                self._photo_flash_timer.timeout.connect(self._clear_photo_flash)
+            prev = getattr(self, "_photo_flash_prev_text", None)
+            if prev is None:
+                self._photo_flash_prev_text = str(lbl.text() or "")
+            lbl.show()
+            if ok:
+                short = name[:14] if name else "Photo saved"
+                lbl.setText(f"✓ {short}")
+            else:
+                lbl.setText("No frame")
+            self._photo_flash_timer.start(1400)
+        except Exception:
+            pass
+
+    def _clear_photo_flash(self) -> None:
+        try:
+            lbl = getattr(self, "_lbl_native_cam_timer", None)
+            if lbl is None:
+                return
+            prev = getattr(self, "_photo_flash_prev_text", None)
+            if prev is not None:
+                lbl.setText(str(prev))
+            self._photo_flash_prev_text = None
+            self._sync_native_cam_timer_visibility()
+        except Exception:
+            pass
 
     def _set_observation_mark_mode(self, enabled: bool) -> None:
         self._obs_mark_mode = bool(enabled)
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm.set_observation_mark_mode(bool(enabled))
+        except Exception:
+            pass
         self._run_js(f"if (window.setObservationMarkMode) setObservationMarkMode({1 if enabled else 0});")
         try:
             self._btn_native_target.blockSignals(True)
@@ -6572,8 +3617,22 @@ class MapWidget(QWidget):
         self._observations.append(row)
         self._set_status(f"Observation logged ({len(self._observations)}): {kind}")
 
+        # Native OBSERVE -> Target needs a visible marker on the Qt map.
+        if kind == "map_mark" and map_lat is not None and map_lon is not None:
+            try:
+                nm = getattr(self, "_native_map", None)
+                if nm is not None and hasattr(nm, "add_observation_map_marker"):
+                    nm.add_observation_map_marker(float(map_lat), float(map_lon))
+            except Exception:
+                pass
+
     def _capture_observation_clip(self) -> None:
-        self._ensure_video_preview_backend()
+        ok = self._ensure_video_preview_backend()
+        if not ok:
+            self._set_status(
+                "Observation clip failed: video backend unavailable (enable video streaming + set RTSP URL)"
+            )
+            return
         src = getattr(self, "_video_active_source", None)
         if src is None:
             self._set_status("Observation clip failed: no active video source")
@@ -6589,6 +3648,24 @@ class MapWidget(QWidget):
         started = False
         try:
             if hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
+                # Surface backend errors (RTSP decode / ffmpeg missing / empty URL).
+                # Best-effort: connect only once per source instance.
+                try:
+                    src_id = id(src)
+                    if not bool(getattr(self, "_obs_clip_error_hooked_for", None)) or getattr(
+                        self, "_obs_clip_error_hooked_for", None
+                    ) != src_id:
+                        setattr(self, "_obs_clip_error_hooked_for", src_id)
+                        if hasattr(src, "error") and hasattr(src.error, "connect"):
+                            src.error.connect(lambda msg: self._set_status(f"Observation clip error: {msg}"))
+                except Exception:
+                    pass
+                # Some backends require a running player; start() is harmless for recording backends.
+                try:
+                    if hasattr(src, "start"):
+                        src.start()
+                except Exception:
+                    pass
                 started = bool(src.start_recording(str(out_path)))
                 if started:
                     QTimer.singleShot(8000, lambda: self._stop_observation_clip_rtsp(src, str(out_path)))
@@ -6604,7 +3681,21 @@ class MapWidget(QWidget):
         if started:
             self._set_status("Capturing short clip (8s)…")
         else:
-            self._set_status("Observation clip unsupported on this backend")
+            # Provide actionable hints for common RTSP/ffmpeg cases.
+            try:
+                if shutil.which("ffmpeg") is None:
+                    self._set_status("Observation clip failed: ffmpeg not found in PATH")
+                    return
+            except Exception:
+                pass
+            try:
+                url = str(getattr(src, "_url", "") or "").strip()
+                if not url:
+                    self._set_status("Observation clip failed: RTSP URL is empty")
+                    return
+            except Exception:
+                pass
+            self._set_status("Observation clip failed to start recording (check status/log)")
 
     def _stop_observation_clip_rtsp(self, src: object, out_path: str) -> None:
         try:
@@ -6623,6 +3714,13 @@ class MapWidget(QWidget):
     def _clear_observations(self) -> None:
         n = len(self._observations)
         self._observations.clear()
+        # Clear native markers (Qt) + web markers (if any).
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "clear_observation_marks"):
+                nm.clear_observation_marks()
+        except Exception:
+            pass
         self._run_js("if (window.clearObservationMarks) clearObservationMarks();")
         self._set_status(f"Cleared observations: {n}")
 
@@ -6701,7 +3799,201 @@ class MapWidget(QWidget):
         )
         Path(path).write_text(html, encoding="utf-8")
 
+    def _on_native_split_rail_toggled(self, _checked: bool) -> None:
+        try:
+            self._split_rail_debounce.start()
+        except Exception:
+            pass
+
+    def _commit_native_split_rail_toggle(self) -> None:
+        try:
+            on = bool(self._btn_native_split.isChecked())
+        except Exception:
+            on = False
+        print(f"[VGCS:cam_rail] SPLIT commit checked={on}")
+        self._on_web_title_changed(f"VGCS_CAM_SPLIT_TOGGLE:{1 if on else 0}:0")
+        self._sync_native_camera_rail_toggles()
+
+    def _on_camera_rail_mode_id_clicked(self, bid: int) -> None:
+        """Exclusive Video vs Photo row — photo is mode only; shutter is the center record button."""
+        self._camera_rail_ui_mode = "photo" if int(bid) == 1 else "video"
+        try:
+            print(f"[VGCS:cam_rail] rail UI mode -> {self._camera_rail_ui_mode}")
+        except Exception:
+            pass
+        self._sync_native_record_button_for_rail_mode()
+        if self._camera_rail_ui_mode == "video":
+            self._on_web_title_changed("VGCS_CAM_VIDEO_MODE_REQUEST:0")
+
+    def _sync_native_record_button_for_rail_mode(self) -> None:
+        """Photo mode: center button is a non-checkable shutter. Video mode: checkable record."""
+        btn = getattr(self, "_btn_native_record", None)
+        if btn is None:
+            return
+        btn.blockSignals(True)
+        try:
+            if getattr(self, "_camera_rail_ui_mode", "video") == "photo":
+                btn.setCheckable(False)
+                btn.setChecked(False)
+                btn.setToolTip("Take photo (shutter)")
+            else:
+                btn.setCheckable(True)
+                btn.setChecked(bool(getattr(self, "_video_recording", False)))
+                btn.setToolTip("Record video")
+        finally:
+            btn.blockSignals(False)
+        self._sync_native_cam_timer_visibility()
+
+    @staticmethod
+    def _format_native_cam_recording_duration(total_secs: int) -> str:
+        total_secs = max(0, int(total_secs))
+        h = total_secs // 3600
+        m = (total_secs % 3600) // 60
+        s = total_secs % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def _ensure_native_cam_recording_tick_timer(self) -> QTimer:
+        t = getattr(self, "_native_cam_recording_tick_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setInterval(250)
+            t.timeout.connect(self._on_native_cam_recording_tick)
+            self._native_cam_recording_tick_timer = t
+        return t
+
+    def _on_native_cam_recording_tick(self) -> None:
+        if not bool(getattr(self, "_video_recording", False)):
+            self._stop_native_cam_recording_tick_timer(reset_label=True)
+            return
+        t0 = float(getattr(self, "_native_cam_recording_started_mono", 0.0) or 0.0)
+        elapsed = int(time.monotonic() - t0)
+        lbl = getattr(self, "_lbl_native_cam_timer", None)
+        if lbl is None:
+            return
+        try:
+            lbl.setText(self._format_native_cam_recording_duration(elapsed))
+        except Exception:
+            pass
+
+    def _start_native_cam_recording_tick_timer(self) -> None:
+        self._native_cam_recording_started_mono = time.monotonic()
+        lbl = getattr(self, "_lbl_native_cam_timer", None)
+        if lbl is not None:
+            try:
+                lbl.setText("00:00:00")
+            except Exception:
+                pass
+        try:
+            self._ensure_native_cam_recording_tick_timer().start()
+        except Exception:
+            pass
+
+    def _stop_native_cam_recording_tick_timer(self, *, reset_label: bool = True) -> None:
+        t = getattr(self, "_native_cam_recording_tick_timer", None)
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                pass
+        if reset_label:
+            lbl = getattr(self, "_lbl_native_cam_timer", None)
+            if lbl is not None:
+                try:
+                    lbl.setText("00:00:00")
+                except Exception:
+                    pass
+        self._native_cam_recording_started_mono = 0.0
+
+    def _sync_native_cam_timer_visibility(self) -> None:
+        """Recording timer is video-only; hide in photo mode (shutter feedback briefly shows the label)."""
+        lbl = getattr(self, "_lbl_native_cam_timer", None)
+        if lbl is None:
+            return
+        mode = getattr(self, "_camera_rail_ui_mode", "video")
+        if mode == "video":
+            t = getattr(self, "_photo_flash_timer", None)
+            if t is not None and t.isActive():
+                try:
+                    t.stop()
+                except Exception:
+                    pass
+                try:
+                    self._clear_photo_flash()
+                except Exception:
+                    pass
+            try:
+                lbl.show()
+            except Exception:
+                pass
+            return
+        flash_on = bool(
+            getattr(self, "_photo_flash_timer", None) is not None
+            and self._photo_flash_timer.isActive()
+        )
+        try:
+            if flash_on:
+                lbl.show()
+            else:
+                lbl.hide()
+        except Exception:
+            pass
+
+    def _on_native_record_center_clicked(self) -> None:
+        if getattr(self, "_camera_rail_ui_mode", "video") != "photo":
+            return
+        try:
+            print("[VGCS:cam_rail] SHUTTER click (photo mode)")
+        except Exception:
+            pass
+        self._on_web_title_changed("VGCS_CAM_PHOTO_REQUEST:0")
+
+    def _on_native_record_toggled(self, on: bool) -> None:
+        if getattr(self, "_camera_rail_ui_mode", "video") != "video":
+            return
+        self._on_web_title_changed(f"VGCS_CAM_RECORD_TOGGLE:{1 if on else 0}:0")
+
+    def _on_native_follow_rail_toggled(self, _checked: bool) -> None:
+        try:
+            self._follow_rail_debounce.start()
+        except Exception:
+            pass
+
+    def _commit_native_follow_rail_toggle(self) -> None:
+        try:
+            on = bool(self._btn_native_follow.isChecked())
+        except Exception:
+            on = False
+        print(f"[VGCS:cam_rail] FOLLOW commit checked={on}")
+        self._on_web_title_changed(f"VGCS_CAM_FOLLOW_TOGGLE:{1 if on else 0}:0")
+        self._sync_native_camera_rail_toggles()
+
+    def _sync_native_camera_rail_toggles(self) -> None:
+        """Keep Split / Follow checkboxes aligned with `_video_split_enabled` / `_video_follow_enabled`."""
+        try:
+            if hasattr(self, "_btn_native_split"):
+                en = bool(getattr(self, "_video_split_enabled", False))
+                self._btn_native_split.blockSignals(True)
+                self._btn_native_split.setChecked(en)
+                self._btn_native_split.blockSignals(False)
+            if hasattr(self, "_btn_native_follow"):
+                fen = bool(getattr(self, "_video_follow_enabled", False))
+                self._btn_native_follow.blockSignals(True)
+                self._btn_native_follow.setChecked(fen)
+                self._btn_native_follow.blockSignals(False)
+        except Exception:
+            pass
+
     def _on_web_title_changed(self, title: str) -> None:
+        if title.startswith("VGCS_3D_MAP_BEARING:"):
+            try:
+                parts = title.split(":")
+                b = float(parts[1]) if len(parts) >= 2 else 0.0
+                if bool(getattr(self, "_is_3d_mode", False)):
+                    self._native_compass.set_map_bearing_deg(b)
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
         if title.startswith("VGCS_OBS_MAP_MARK:"):
             try:
                 parts = title.split(":")
@@ -6762,13 +4054,26 @@ class MapWidget(QWidget):
             return
         if title.startswith("VGCS_CAM_PHOTO_REQUEST:"):
             try:
-                path = self._capture_photo_quick()
-                if path:
-                    self._set_status(f"Photo saved: {Path(path).name}")
-                else:
-                    self._set_status("Photo capture failed (no active frame)")
+                print("[VGCS:cam_rail] PHOTO capture (shutter / legacy request)")
             except Exception:
                 pass
+            try:
+                path = self._capture_photo_quick()
+                if path:
+                    name = Path(path).name
+                    print(f"[VGCS:cam_rail] PHOTO saved -> {path}")
+                    self._set_status(f"Photo saved: {name}")
+                    self._flash_photo_feedback(ok=True, name=name)
+                else:
+                    print("[VGCS:cam_rail] PHOTO capture failed: no active frame")
+                    self._set_status("Photo capture failed (no active frame)")
+                    self._flash_photo_feedback(ok=False)
+            except Exception as exc:
+                try:
+                    print(f"[VGCS:cam_rail] PHOTO exception: {exc!r}")
+                except Exception:
+                    pass
+                self._flash_photo_feedback(ok=False)
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_RECORD_TOGGLE:"):
@@ -6789,12 +4094,17 @@ class MapWidget(QWidget):
                         ok = bool(src.start_recording(str(tmp)))
                         self._video_recording = bool(ok)
                         self._video_recording_tmp_path = str(tmp) if ok else ""
+                        if ok:
+                            self._start_native_cam_recording_tick_timer()
+                        else:
+                            self._stop_native_cam_recording_tick_timer()
                     if (not want_on) and bool(getattr(self, "_video_recording", False)):
                         try:
                             src.stop_recording()
                         except Exception:
                             pass
                         self._video_recording = False
+                        self._stop_native_cam_recording_tick_timer()
                         tmp_path = str(getattr(self, "_video_recording_tmp_path", "") or "")
                         self._video_recording_tmp_path = ""
                         if tmp_path:
@@ -6813,6 +4123,7 @@ class MapWidget(QWidget):
                     return
                 if rec is None:
                     self._video_recording = False
+                    self._stop_native_cam_recording_tick_timer()
                     self._run_js("document.title = 'VGCS Map';")
                     return
                 if want_on and not bool(getattr(self, "_video_recording", False)):
@@ -6825,15 +4136,18 @@ class MapWidget(QWidget):
                         rec.record()
                         self._video_recording = True
                         self._video_recording_tmp_path = str(tmp)
+                        self._start_native_cam_recording_tick_timer()
                     except Exception:
                         self._video_recording = False
                         self._video_recording_tmp_path = ""
+                        self._stop_native_cam_recording_tick_timer()
                 if (not want_on) and bool(getattr(self, "_video_recording", False)):
                     try:
                         rec.stop()
                     except Exception:
                         pass
                     self._video_recording = False
+                    self._stop_native_cam_recording_tick_timer()
                     tmp_path = str(getattr(self, "_video_recording_tmp_path", "") or "")
                     self._video_recording_tmp_path = ""
                     if tmp_path:
@@ -6851,18 +4165,23 @@ class MapWidget(QWidget):
             except Exception:
                 self._video_recording = False
                 self._video_recording_tmp_path = ""
-            try:
-                self._btn_native_record.blockSignals(True)
-                self._btn_native_record.setChecked(bool(getattr(self, "_video_recording", False)))
-            finally:
+                self._stop_native_cam_recording_tick_timer()
+            if getattr(self, "_camera_rail_ui_mode", "video") == "video":
                 try:
-                    self._btn_native_record.blockSignals(False)
-                except Exception:
-                    pass
+                    self._btn_native_record.blockSignals(True)
+                    self._btn_native_record.setChecked(bool(getattr(self, "_video_recording", False)))
+                finally:
+                    try:
+                        self._btn_native_record.blockSignals(False)
+                    except Exception:
+                        pass
+            else:
+                self._sync_native_record_button_for_rail_mode()
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_SPLIT_TOGGLE:"):
             # Format: VGCS_CAM_SPLIT_TOGGLE:<0|1>:<ts>
+            print(f"[VGCS:cam_rail] handler SPLIT {title!r}")
             try:
                 parts = title.split(":")
                 self._video_split_enabled = bool(int(parts[1])) if len(parts) >= 2 else False
@@ -6873,7 +4192,16 @@ class MapWidget(QWidget):
                     self._ensure_video_preview_backend()
                     self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(false);")
                     self._run_js("if (window.setNativeHudMode) setNativeHudMode(false);")
-                    self._start_video_preview()
+                    # Do not clear fullscreen swap: split in PiP stays PiP; split in fullscreen stays fullscreen.
+                    self._start_video_preview(reset_swapped=False)
+                    try:
+                        self._seed_split_cache_from_last_frame()
+                        self._layout_native_video_preview()
+                        self._push_video_preview_any_to_overlay()
+                        self._render_native_split_preview()
+                        QTimer.singleShot(0, self._retry_native_video_pixmap)
+                    except Exception:
+                        pass
                 else:
                     self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
                     self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
@@ -6913,6 +4241,7 @@ class MapWidget(QWidget):
             return
         if title.startswith("VGCS_CAM_FOLLOW_TOGGLE:"):
             # Format: VGCS_CAM_FOLLOW_TOGGLE:<0|1>:<ts>
+            print(f"[VGCS:cam_rail] handler FOLLOW {title!r}")
             try:
                 parts = title.split(":")
                 self._video_follow_enabled = bool(int(parts[1])) if len(parts) >= 2 else False
@@ -6920,6 +4249,15 @@ class MapWidget(QWidget):
             except Exception:
                 self._video_follow_enabled = False
                 self._video_follow_last_center_mono = 0.0
+            # Match webview: recenter as soon as follow is enabled (not only on the next throttled pose tick).
+            if bool(getattr(self, "_video_follow_enabled", False)):
+                try:
+                    self._schedule_vehicle_pose_js(immediate=True)
+                    self.center_on_vehicle()
+                    if getattr(self, "_lat", None) is None or getattr(self, "_lon", None) is None:
+                        self._set_status("Follow on (waiting for vehicle position)")
+                except Exception:
+                    pass
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_SWAP_TOGGLE:"):
@@ -6929,6 +4267,11 @@ class MapWidget(QWidget):
                 self._video_swapped = bool(int(parts[1])) if len(parts) >= 2 else False
             except Exception:
                 self._video_swapped = False
+            # Ignore Web swap state for rendering; native layer controls camera fullscreen.
+            try:
+                self._run_js("setVideoSwapMode(false);")
+            except Exception:
+                pass
             if self._video_swapped:
                 self._refresh_native_overlay_insets()
             self._layout_native_video_preview()
@@ -7067,8 +4410,8 @@ class MapWidget(QWidget):
                 try:
                     vx = int(parts[1])
                     vy = int(parts[2])
-                    if hasattr(self, "_web"):
-                        gp = self._web.mapToGlobal(QPoint(vx, vy))
+                    if hasattr(self, "_native_map"):
+                        gp = self._native_map.mapToGlobal(QPoint(vx, vy))
                         gx, gy = int(gp.x()), int(gp.y())
                 except Exception:
                     gx, gy = -1, -1
@@ -7098,15 +4441,38 @@ class MapWidget(QWidget):
     def _run_js(self, script: str, callback=None) -> None:
         if not getattr(self, "_web_ready", False):
             return
-        if not hasattr(self, "_web"):
+        w3 = getattr(self, "_web_3d_view", None)
+        if w3 is not None and bool(getattr(self, "_is_3d_mode", False)):
+            try:
+                if callback is None:
+                    w3.page().runJavaScript(script)
+                else:
+                    w3.page().runJavaScript(script, callback)
+                try:
+                    w3.page().runJavaScript(
+                        "window.__lastTileTemplate || '';",
+                        lambda v: setattr(self, "_last_tile_template", str(v or "")),
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
             return
-        if callback is None:
-            self._web.page().runJavaScript(script)
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
             return
-        self._web.page().runJavaScript(script, callback)
-        # Best-effort: capture tile template when JS reports it.
         try:
-            self._web.page().runJavaScript("window.__lastTileTemplate || '';", lambda v: setattr(self, "_last_tile_template", str(v or "")))
+            self._last_tile_template = str(getattr(nm, "_tile_template", "") or "")
+        except Exception:
+            pass
+        if callback is None:
+            nm.eval_script(script)
+            return
+        if nm.eval_script_with_callback(script, callback):
+            return
+        nm.eval_script(script)
+        try:
+            callback(None)
         except Exception:
             pass
 
@@ -7140,6 +4506,7 @@ class MapWidget(QWidget):
                 # Throttle map recentering for usability.
                 if now - last >= 0.6:
                     self._video_follow_last_center_mono = now
+                    # Match legacy web: second bridge call after setVehicle so native uses _vehicle_lat/_lon.
                     self._run_js("centerOnVehicle();")
             except Exception:
                 pass
@@ -7155,6 +4522,18 @@ class MapWidget(QWidget):
             self._coords.setText(
                 f"Lat/Lon: {lat:.7f}, {lon:.7f}  |  Rel Alt: {relative_alt_m:.1f} m"
             )
+        try:
+            if self._native_minimap_wrap.isVisible():
+                self._update_native_minimap()
+        except Exception:
+            pass
+        if first_fix:
+            try:
+                nm = getattr(self, "_native_map", None)
+                if nm is not None:
+                    nm.set_center(float(lat), float(lon))
+            except Exception:
+                pass
         self._schedule_vehicle_pose_js(immediate=first_fix)
 
     def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
@@ -7162,7 +4541,7 @@ class MapWidget(QWidget):
         self._heading_js_source = source or "mixed"
         self._heading_label.setText(f"Heading: {self._heading:.1f}°")
         try:
-            self._native_compass.setText(f"N\n{self._heading:.0f}°")
+            self._native_compass.set_heading_deg(self._heading)
         except Exception:
             pass
         self._schedule_vehicle_pose_js(immediate=False)
@@ -7194,7 +4573,13 @@ class MapWidget(QWidget):
             return
         self._last_flight_telemetry_sig = sig
         try:
-            self._native_telemetry.setText(f"Alt {ft} ft  |  Spd {mph} mph  |  {ttime}")
+            self._native_telemetry.set_values(
+                f"{ft} ft",
+                f"{mph} mph",
+                ttime,
+                f"{msl_ft} ft",
+            )
+            QTimer.singleShot(0, self._layout_native_hud)
         except Exception:
             pass
         self._run_js(
@@ -7212,7 +4597,9 @@ class MapWidget(QWidget):
 
     def _enable_add_waypoint_mode(self) -> None:
         self._run_js("enableAddWaypoint();")
-        self._set_status("click on map to add waypoint")
+        self._set_status(
+            "Click map to add waypoint · right-click or double-click a waypoint to remove"
+        )
 
     def _clear_waypoints(self) -> None:
         self._run_js(
@@ -7256,11 +4643,26 @@ class MapWidget(QWidget):
     def _after_waypoints_mutated(self) -> None:
         self._sync_waypoint_count_from_map()
 
+    def _plan_waypoints_snapshot(self) -> list[Waypoint]:
+        """Current plan waypoints for upload/save/export (native map + in-memory model).
+
+        Avoids relying on the legacy JS ``getWaypoints()`` callback path, which can
+        never fire if the bridge is not ready or the script is not recognized.
+        """
+        if self._waypoints_model:
+            return list(self._waypoints_model)
+        nm = getattr(self, "_native_map", None)
+        if nm is not None and nm.waypoint_count() > 0:
+            return self._waypoints_from_map_json(nm.waypoints_json())
+        return []
+
     def _request_upload(self) -> None:
-        self._run_js(
-            "JSON.stringify(getWaypoints());",
-            callback=lambda payload: self._emit_upload_from_json(payload),
-        )
+        wps = self._plan_waypoints_snapshot()
+        if not wps:
+            self._set_status("No waypoints to upload")
+            return
+        self.mission_upload_requested.emit(wps)
+        self._set_status(f"Mission upload requested ({len(wps)} WPs)")
 
     def _waypoints_from_map_json(self, payload: str | None) -> list[Waypoint]:
         if not payload:
@@ -7288,14 +4690,6 @@ class MapWidget(QWidget):
             waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt, speed_mps=spd))
         return waypoints
 
-    def _emit_upload_from_json(self, payload: str | None) -> None:
-        waypoints = self._waypoints_from_map_json(payload)
-        if not waypoints:
-            self._set_status("No waypoints to upload")
-            return
-        self.mission_upload_requested.emit(waypoints)
-        self._set_status(f"Mission upload requested ({len(waypoints)} WPs)")
-
     def _request_download(self) -> None:
         self.mission_download_requested.emit()
         self._set_status("Mission download requested")
@@ -7308,86 +4702,80 @@ class MapWidget(QWidget):
         return str(settings.value(_KEY_PLAN_LAST_MISSION_JSON_LEGACY, "") or "")
 
     def save_plan_mission_json(self, *, save_as: bool) -> None:
-        def cb(payload: str | None) -> None:
-            wps = self._waypoints_from_map_json(payload)
-            if not wps:
-                self._set_status("No waypoints to save")
-                QMessageBox.information(
-                    self,
-                    "Plan Flight",
-                    "There are no waypoints to save. Add waypoints on the map first.",
-                )
-                return
-            settings = QSettings(_QS_NS, _QS_APP)
-            path = ""
-            if not save_as:
-                last = self._plan_current_mission_path(settings)
-                if last:
-                    parent = Path(last).expanduser().resolve().parent
-                    if parent.is_dir():
-                        path = last
-            if not path or save_as:
-                path, _ = QFileDialog.getSaveFileName(
-                    self,
-                    "Save current mission as…" if save_as else "Set current mission file…",
-                    self._plan_current_mission_path(settings) or "mission-waypoints.json",
-                    "JSON files (*.json)",
-                )
-                if not path:
-                    return
-            try:
-                save_waypoints_json(path, wps)
-            except Exception:
-                self._set_status("Save failed")
-                QMessageBox.warning(self, "Plan Flight", "Could not save the mission file.")
-                return
-            settings.setValue(_KEY_PLAN_CURRENT_MISSION_JSON, path)
-            if settings.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
-                settings.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
-            self._set_status(f"Current mission saved ({len(wps)} WPs)")
+        wps = self._plan_waypoints_snapshot()
+        if not wps:
+            self._set_status("No waypoints to save")
             QMessageBox.information(
                 self,
-                "Plan saved",
-                f"Saved {len(wps)} waypoint(s) to:\n{path}",
+                "Plan Flight",
+                "There are no waypoints to save. Add waypoints on the map first.",
             )
-
-        self._run_js("JSON.stringify(getWaypoints());", callback=cb)
-
-    def save_plan_mission_kml(self) -> None:
-        def cb(payload: str | None) -> None:
-            wps = self._waypoints_from_map_json(payload)
-            if not wps:
-                self._set_status("No waypoints to export")
-                QMessageBox.information(
-                    self,
-                    "Plan Flight",
-                    "There are no waypoints to export as KML.",
-                )
-                return
-            settings = QSettings(_QS_NS, _QS_APP)
+            return
+        settings = QSettings(_QS_NS, _QS_APP)
+        path = ""
+        if not save_as:
+            last = self._plan_current_mission_path(settings)
+            if last:
+                parent = Path(last).expanduser().resolve().parent
+                if parent.is_dir():
+                    path = last
+        if not path or save_as:
             path, _ = QFileDialog.getSaveFileName(
                 self,
-                "Save mission as KML",
-                str(settings.value("plan_last_mission_kml", "") or "mission-waypoints.kml"),
-                "KML files (*.kml)",
+                "Save current mission as…" if save_as else "Set current mission file…",
+                self._plan_current_mission_path(settings) or "mission-waypoints.json",
+                "JSON files (*.json)",
             )
             if not path:
                 return
-            try:
-                save_waypoints_kml(path, wps)
-            except Exception:
-                self._set_status("KML export failed")
-                QMessageBox.warning(self, "Plan Flight", "Could not save the KML file.")
-                return
-            settings.setValue("plan_last_mission_kml", path)
-            self._set_status(f"KML saved ({len(wps)} WPs)")
+        try:
+            save_waypoints_json(path, wps)
+        except Exception:
+            self._set_status("Save failed")
+            QMessageBox.warning(self, "Plan Flight", "Could not save the mission file.")
+            return
+        settings.setValue(_KEY_PLAN_CURRENT_MISSION_JSON, path)
+        if settings.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
+            settings.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
+        self._set_status(f"Current mission saved ({len(wps)} WPs)")
+        QMessageBox.information(
+            self,
+            "Plan saved",
+            f"Saved {len(wps)} waypoint(s) to:\n{path}",
+        )
+
+    def save_plan_mission_kml(self) -> None:
+        wps = self._plan_waypoints_snapshot()
+        if not wps:
+            self._set_status("No waypoints to export")
             QMessageBox.information(
                 self,
-                "Export complete",
-                f"Saved {len(wps)} waypoint(s) as KML:\n{path}",
+                "Plan Flight",
+                "There are no waypoints to export as KML.",
             )
-
-        self._run_js("JSON.stringify(getWaypoints());", callback=cb)
+            return
+        settings = QSettings(_QS_NS, _QS_APP)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save mission as KML",
+            str(settings.value("plan_last_mission_kml", "") or "mission-waypoints.kml"),
+            "KML files (*.kml)",
+        )
+        if not path:
+            return
+        try:
+            save_waypoints_kml(path, wps)
+        except Exception:
+            self._set_status("KML export failed")
+            QMessageBox.warning(self, "Plan Flight", "Could not save the KML file.")
+            return
+        settings.setValue("plan_last_mission_kml", path)
+        self._set_status(f"KML saved ({len(wps)} WPs)")
+        QMessageBox.information(
+            self,
+            "Export complete",
+            f"Saved {len(wps)} waypoint(s) as KML:\n{path}",
+        )
 
 
     def _export_mission(self) -> None:
@@ -7402,20 +4790,17 @@ class MapWidget(QWidget):
         if not path:
             return
 
-        def cb(payload: str | None) -> None:
-            waypoints = self._waypoints_from_map_json(payload)
-            if not waypoints:
-                self._set_status("No waypoints to export")
-                return
-            try:
-                save_waypoints_json(path, waypoints)
-            except Exception:
-                self._set_status("Export failed")
-                return
-            settings.setValue(_KEY_TOOLBAR_EXPORT_MISSION_JSON, path)
-            self._set_status(f"Exported copy to file ({len(waypoints)} WPs)")
-
-        self._run_js("JSON.stringify(getWaypoints());", callback=cb)
+        waypoints = self._plan_waypoints_snapshot()
+        if not waypoints:
+            self._set_status("No waypoints to export")
+            return
+        try:
+            save_waypoints_json(path, waypoints)
+        except Exception:
+            self._set_status("Export failed")
+            return
+        settings.setValue(_KEY_TOOLBAR_EXPORT_MISSION_JSON, path)
+        self._set_status(f"Exported copy to file ({len(waypoints)} WPs)")
 
     def _import_mission(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -7586,10 +4971,16 @@ class MapWidget(QWidget):
             QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "esri_streets")
         except Exception:
             pass
-        self._run_js(
-            "setTileSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', "
-            "'Tiles © Esri', 19);"
+        tmpl = (
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"
         )
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm.set_tile_source(tmpl, "", 19)
+        except Exception:
+            pass
+        self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Tiles © Esri', 19);")
         self._set_status("Online tiles active (Esri Streets)")
 
     def activate_osm_tiles(self) -> None:
@@ -7598,10 +4989,14 @@ class MapWidget(QWidget):
             QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "osm")
         except Exception:
             pass
-        self._run_js(
-            "setTileSource('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', "
-            "'&copy; OpenStreetMap contributors', 19);"
-        )
+        tmpl = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm.set_tile_source(tmpl, "", 19)
+        except Exception:
+            pass
+        self._run_js(f"setTileSource({json.dumps(tmpl)}, '&copy; OpenStreetMap contributors', 19);")
         self._set_status("Online tiles active (OSM)")
 
     def activate_satellite_tiles(self) -> None:
@@ -7609,10 +5004,16 @@ class MapWidget(QWidget):
             QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "sat")
         except Exception:
             pass
-        self._run_js(
-            "setTileSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', "
-            "'Tiles © Esri', 19);"
+        tmpl = (
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
         )
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm.set_tile_source(tmpl, "", 19)
+        except Exception:
+            pass
+        self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Tiles © Esri', 19);")
         self._set_status("Satellite tiles active")
 
     def activate_offline_tiles(self, root: str) -> None:
@@ -7628,6 +5029,12 @@ class MapWidget(QWidget):
             pass
         url = QUrl.fromLocalFile(root).toString().rstrip("/")
         tmpl = f"{url}/{{z}}/{{x}}/{{y}}.png"
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm.set_tile_source(tmpl, "", 19)
+        except Exception:
+            pass
         self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Offline tile cache', 19);")
         self._set_status("Offline tiles active")
 
@@ -7708,24 +5115,195 @@ class MapWidget(QWidget):
         self.geofence_upload_requested.emit({"disable": True})
         self._set_status("Fence cleared")
 
-    def set_3d_enabled(self, enabled: bool) -> bool:
-        self._is_3d_mode = bool(enabled and HAS_WEBENGINE)
-        if not self._web_ready:
-            if enabled:
-                self._set_status("3D view unavailable: map backend not ready")
-            else:
-                self._set_status("2D mode active")
+    def _emit_map_3d_mode_changed(self) -> None:
+        try:
+            self.map_3d_mode_changed.emit()
+        except Exception:
+            pass
+
+    def _ensure_web_3d_view(self) -> bool:
+        """Lazily create the legacy WebEngine map used only for 3D (Cesium)."""
+        if not HAS_WEBENGINE_3D:
             return False
-        desired = "true" if enabled else "false"
-        self._run_js(
-            f"set3DEnabled({desired});",
-            callback=lambda ok: self._on_3d_toggle_result(enabled, ok),
-        )
-        return bool(enabled)
+        if getattr(self, "_web_3d_view", None) is not None:
+            return True
+        w = create_map_3d_web_view(self._map_stack)
+        if w is None:
+            return False
+        try:
+            html = build_leaflet_html()
+            w.loadFinished.connect(self._on_web_3d_load_finished)
+            w.titleChanged.connect(self._on_web_title_changed)
+            w.setHtml(html, assets_base_url())
+        except Exception as e:
+            self._set_status(f"3D HTML build failed: {e}")
+            try:
+                w.deleteLater()
+            except Exception:
+                pass
+            return False
+        self._web_3d_view = w
+        self._web_3d_ready = False
+        self._map_stack.addWidget(w)
+        return True
+
+    # Native Qt overlays (#linkBanner, telemetry, compass, camera rail, etc.) live on top of `_map_canvas`.
+    # The legacy Leaflet/Cesium HTML embeds duplicates of these inside the page — hide them when 3D
+    # is active so the native overlays are the only HUD, and we just see the Cesium globe underneath.
+    _HIDE_LEGACY_HTML_HUD_JS = (
+        "(function(){"
+        "var s=document.getElementById('vgcs_3d_hide_overlays_style');"
+        "if(!s){s=document.createElement('style');s.id='vgcs_3d_hide_overlays_style';"
+        "document.head.appendChild(s);}"
+        "s.textContent='#linkBanner,#actionRail,#planFlightLayer,#cameraRail,"
+        "#mapFooterHud,#telemetryStrip,#compass,#hdrMapModeBtn{display:none !important;}';"
+        "})();"
+    )
+
+    def _inject_legacy_html_hud_hide(self) -> None:
+        w3 = getattr(self, "_web_3d_view", None)
+        if w3 is None:
+            return
+        try:
+            w3.page().runJavaScript(self._HIDE_LEGACY_HTML_HUD_JS)
+        except Exception:
+            pass
+
+    def _on_web_3d_load_finished(self, ok: bool) -> None:
+        self._web_3d_ready = bool(ok)
+        if not ok:
+            self._pending_3d_activate = False
+            self._set_status("3D map page failed to load (check network / WebEngine)")
+            return
+        self._inject_legacy_html_hud_hide()
+        # Only the explicit "user pressed 3D" path may swap the stack. Background preload
+        # leaves the user on the native 2D map so they never see a flash to the WebEngine page.
+        if not getattr(self, "_pending_3d_activate", False):
+            self._schedule_vehicle_pose_js(immediate=True)
+            return
+        self._pending_3d_activate = False
+        try:
+            self._map_stack.setCurrentIndex(1)
+            self._is_3d_mode = True
+            self._emit_map_3d_mode_changed()
+            self._web_3d_view.page().runJavaScript(
+                "set3DEnabled(true);",
+                lambda res: self._on_3d_toggle_result(True, res),
+            )
+            try:
+                QTimer.singleShot(0, self._web_3d_view.setFocus)
+            except Exception:
+                pass
+        except Exception:
+            self._is_3d_mode = False
+            try:
+                self._map_stack.setCurrentIndex(0)
+            except Exception:
+                pass
+            self._on_3d_toggle_result(True, False)
+        try:
+            s = QSettings(_QS_NS, _QS_APP)
+            root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
+            if root and Path(root).is_dir():
+                self.activate_offline_tiles(root)
+            else:
+                self.activate_satellite_tiles()
+                QTimer.singleShot(1200, lambda: self._probe_current_tiles(reason="3d_startup"))
+        except Exception:
+            pass
+        self._schedule_vehicle_pose_js(immediate=True)
+
+    def set_3d_enabled(self, enabled: bool) -> bool:
+        if not enabled:
+            self._is_3d_mode = False
+            self._pending_3d_activate = False
+            w3 = getattr(self, "_web_3d_view", None)
+            if w3 is not None and self._web_3d_ready:
+                try:
+                    w3.page().runJavaScript("set3DEnabled(false);")
+                except Exception:
+                    pass
+            try:
+                self._map_stack.setCurrentIndex(0)
+            except Exception:
+                pass
+            self._btn_3d.blockSignals(True)
+            self._btn_3d.setChecked(False)
+            self._btn_3d.blockSignals(False)
+            self._set_status("2D mode active")
+            self._schedule_vehicle_pose_js(immediate=True)
+            try:
+                self._native_compass.set_map_bearing_deg(0.0)
+            except Exception:
+                pass
+            self._emit_map_3d_mode_changed()
+            return True
+
+        if not HAS_WEBENGINE_3D:
+            self._btn_3d.blockSignals(True)
+            self._btn_3d.setChecked(False)
+            self._btn_3d.blockSignals(False)
+            self._set_status("3D requires Qt WebEngine (install PySide6 WebEngine)")
+            return False
+        if not self._web_ready:
+            self._set_status("3D view unavailable: map backend not ready")
+            return False
+        if not self._ensure_web_3d_view():
+            self._set_status("3D view could not start WebEngine")
+            return False
+        w3 = self._web_3d_view
+        assert w3 is not None
+
+        def _apply_3d_js() -> None:
+            try:
+                self._map_stack.setCurrentIndex(1)
+                self._is_3d_mode = True
+                self._inject_legacy_html_hud_hide()
+                self._emit_map_3d_mode_changed()
+                w3.page().runJavaScript(
+                    "set3DEnabled(true);",
+                    lambda ok: self._on_3d_toggle_result(True, ok),
+                )
+                try:
+                    QTimer.singleShot(0, w3.setFocus)
+                except Exception:
+                    pass
+            except Exception:
+                self._is_3d_mode = False
+                try:
+                    self._map_stack.setCurrentIndex(0)
+                except Exception:
+                    pass
+                self._on_3d_toggle_result(True, False)
+
+        if self._web_3d_ready:
+            self._pending_3d_activate = False
+            _apply_3d_js()
+            try:
+                s = QSettings(_QS_NS, _QS_APP)
+                root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
+                if root and Path(root).is_dir():
+                    self.activate_offline_tiles(root)
+                else:
+                    self.activate_satellite_tiles()
+            except Exception:
+                pass
+            return True
+        self._pending_3d_activate = True
+        return True
 
     def _on_3d_toggle_result(self, requested: bool, result: object) -> None:
         active = bool(result)
         self._is_3d_mode = active
+        if not active:
+            try:
+                self._map_stack.setCurrentIndex(0)
+            except Exception:
+                pass
+            try:
+                self._native_compass.set_map_bearing_deg(0.0)
+            except Exception:
+                pass
         self._btn_3d.blockSignals(True)
         self._btn_3d.setChecked(active)
         self._btn_3d.blockSignals(False)
@@ -7735,4 +5313,5 @@ class MapWidget(QWidget):
             self._set_status("3D mode unavailable; using 2D")
         else:
             self._set_status("2D mode active")
+        self._emit_map_3d_mode_changed()
 

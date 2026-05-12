@@ -218,7 +218,16 @@ class MavlinkThread(QThread):
                 )
             except Exception as e:
                 if self._running:
-                    self.error.emit(str(e))
+                    detail = str(e)
+                    # Windows: UDP recv can raise WSAECONNRESET (10054) when ICMP "port unreachable"
+                    # is returned — typically nothing is listening / sending MAVLink on that host:port.
+                    low = detail.lower()
+                    if "10054" in detail or "forcibly closed" in low:
+                        detail += (
+                            " — No MAVLink peer on that endpoint yet (start SITL or the vehicle stack; "
+                            "confirm serial vs UDP; for listen-first links try udpin:0.0.0.0:14550)."
+                        )
+                    self.error.emit(detail)
                 break
 
             if not self._running:

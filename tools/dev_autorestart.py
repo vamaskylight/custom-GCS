@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -16,23 +16,67 @@ from watchdog.observers import Observer
 ROOT = Path(__file__).resolve().parents[1]
 WATCH_DIRS = [ROOT / "vgcs"]
 
+# Coalesce rapid saves (IDE auto-save, format-on-save, multi-file refactors). Without this, switching
+# focus to the running app can save several open buffers and the watcher restarts the process many
+# times in a row — operators often mistake that for "the 3D button restarted the app."
+_DEBOUNCE_S = float(os.environ.get("VGCS_DEV_RESTART_DEBOUNCE_S", "1.8"))
+
 
 class RestartHandler(FileSystemEventHandler):
     def __init__(self, restart_cb) -> None:
         super().__init__()
         self._restart_cb = restart_cb
-        self._last = 0.0
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+        self._pending_path: str | None = None
+
+    @staticmethod
+    def _should_ignore(path_lower: str) -> bool:
+        if "__pycache__" in path_lower:
+            return True
+        if ".venv" in path_lower or "venv\\" in path_lower or "venv/" in path_lower:
+            return True
+        if "site-packages" in path_lower:
+            return True
+        return False
+
+    def cancel_pending(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._pending_path = None
+
+    def _fire_restart(self) -> None:
+        with self._lock:
+            self._timer = None
+            pending = self._pending_path
+            self._pending_path = None
+        if pending:
+            print(f"[dev] restarting after file change (debounced {_DEBOUNCE_S:.1f}s): {pending}")
+        else:
+            print(f"[dev] restarting after file change (debounced {_DEBOUNCE_S:.1f}s)")
+        self._restart_cb()
 
     def on_any_event(self, event: FileSystemEvent) -> None:
-        path = event.src_path.lower()
-        if not path.endswith(".py"):
+        try:
+            path = str(event.src_path)
+        except Exception:
             return
-        now = time.monotonic()
-        if now - self._last < 0.4:
+        pl = path.lower()
+        # Reload on .py (app code) and .html (vendored Leaflet/Cesium page); HTML is read once at
+        # page load, so editing legacy_leaflet_map.html requires a full restart to take effect.
+        if not (pl.endswith(".py") or pl.endswith(".html")):
             return
-        self._last = now
-        print(f"[dev] change detected: {event.src_path}")
-        self._restart_cb()
+        if self._should_ignore(pl):
+            return
+        with self._lock:
+            self._pending_path = path
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(_DEBOUNCE_S, self._fire_restart)
+            self._timer.daemon = True
+            self._timer.start()
 
 
 class Runner:
@@ -72,6 +116,7 @@ def main() -> int:
         observer.schedule(handler, str(d), recursive=True)
     observer.start()
     print("[dev] watching:", ", ".join(str(d) for d in WATCH_DIRS))
+    print(f"[dev] restart debounce: {_DEBOUNCE_S:.1f}s (set VGCS_DEV_RESTART_DEBOUNCE_S to override)")
     print("[dev] press Ctrl+C to stop")
 
     try:
@@ -80,6 +125,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        handler.cancel_pending()
         observer.stop()
         observer.join()
         runner.stop()
@@ -88,4 +134,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

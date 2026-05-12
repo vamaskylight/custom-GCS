@@ -1,0 +1,3959 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" onerror="document.title='VGCS_ASSET_ERROR:leaflet_css:'+Date.now()"/>
+  <link rel="stylesheet" href="https://unpkg.com/cesium@1.125/Build/Cesium/Widgets/widgets.css" onerror="document.title='VGCS_ASSET_ERROR:cesium_css:'+Date.now()"/>
+  <style>
+    html, body, #mapWrap, #map2d, #map3d { height:100%; margin:0; background:#1a1d24; }
+    /* Single scroll/compositor root; avoid promoted layers that confuse WebEngine on Windows. */
+    #mapWrap { position: relative; overflow: hidden; z-index: 0; }
+    #map2d, #map3d { position: absolute; inset: 0; }
+    #map3d { display: none; }
+    .leaflet-control-attribution {
+      display: none !important;
+    }
+    .overlay { position:absolute; z-index:1200; font-family: "Segoe UI", Arial, sans-serif; }
+    #linkBanner {
+      top:0; left:0; right:0; min-height:46px; padding:8px 12px; border-radius:0;
+      background: rgba(24, 30, 40, 0.95); color:#dbe3f3; font-size:17px; font-weight:600;
+      border:0;
+      border-bottom:1px solid rgba(72, 86, 110, 0.9);
+      display:flex; align-items:center; gap:8px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+    }
+    #linkBannerLogo {
+      height:28px;
+      width:auto;
+      display:none;
+      object-fit:contain;
+      flex:0 0 auto;
+    }
+    #linkBannerDisconnected {
+      display:flex;
+      align-items:center;
+      gap:8px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    #linkBannerConnected {
+      display:none;
+      align-items:center;
+      gap:12px;
+      color: #f4f7ff;
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    #hdrMapModeBtn {
+      margin-left:8px;
+      min-width:62px;
+      height:26px;
+      border-radius:13px;
+      border:1px solid rgba(210, 220, 240, 0.65);
+      background: rgba(20, 30, 42, 0.7);
+      color:#f1f6ff;
+      font-size:11px;
+      font-weight:700;
+      letter-spacing:0.02em;
+      cursor:pointer;
+      padding:0 10px;
+      flex:0 0 auto;
+    }
+    #hdrMapModeBtn:hover {
+      background: rgba(36, 50, 69, 0.9);
+    }
+    .hdrPill {
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+      color:#f4f7ff;
+      min-width: 0;
+      flex: 0 0 auto;
+    }
+    #hdrVehiclePill {
+      /* Don't consume all remaining width (creates a large blank gap). */
+      flex: 0 1 auto;
+      max-width: 52vw;
+      min-width: 0;
+      overflow: hidden;
+    }
+    #hdrVehicleMsg {
+      display:inline-block;
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .hdrPillMuted {
+      color: #d7deef;
+      font-weight: 500;
+    }
+    .hdrSep {
+      width:1px;
+      height:24px;
+      background: rgba(210, 220, 240, 0.55);
+      flex: 0 0 auto;
+    }
+    .hdrIcon {
+      width:22px;
+      height:22px;
+      object-fit:contain;
+      flex:0 0 auto;
+    }
+    .hdrIconBroadcast {
+      width:26px;
+      height:26px;
+    }
+    .hdrIconSmall {
+      width:20px;
+      height:20px;
+    }
+    .hdrReadyText {
+      color:#d5ff9b;
+    }
+    .hdrTinyStack {
+      display:inline-flex;
+      flex-direction:column;
+      line-height:1.05;
+      font-size:12px;
+      color:#f4f7ff;
+    }
+    #actionRail { top:78px; left:10px; display:flex; flex-direction:column; gap:8px; }
+    .actionBtn {
+      width:54px; height:54px; border-radius:8px; border:1px solid rgba(255,255,255,0.35);
+      background: rgba(34, 42, 56, 0.92); color:#c8d3ea; font-size:11px; text-align:center;
+      display:flex; flex-direction:column; justify-content:center; align-items:center;
+      cursor:pointer;
+      user-select:none;
+    }
+    .actionBtn:hover {
+      background: rgba(46, 58, 78, 0.95);
+      border-color: rgba(136, 164, 205, 0.7);
+    }
+    .actionBtn.disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
+      border-color: rgba(120, 130, 150, 0.35);
+      background: rgba(30, 38, 52, 0.75);
+    }
+    #planFlightLayer {
+      position:absolute;
+      inset:0;
+      z-index:1250;
+      display:none;
+      pointer-events:none;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    #planFlightTopBar {
+      position:absolute;
+      top:0;
+      left:0;
+      right:0;
+      min-height:64px;
+      background: rgba(32, 34, 40, 0.97);
+      color:#e8eaef;
+      display:flex;
+      align-items:stretch;
+      gap:14px;
+      padding: 6px 14px 8px;
+      font-size:15px;
+      border-bottom:1px solid rgba(70, 76, 88, 0.85);
+      pointer-events:auto;
+      flex-wrap: nowrap;
+    }
+    #planBarUpload {
+      align-self:center;
+      height:32px;
+      padding:0 18px;
+      margin-right:22px;
+      border-radius:6px;
+      border:1px solid rgba(110, 118, 135, 0.85);
+      background: rgba(58, 62, 74, 0.95);
+      color:#e8eaef;
+      font-size:13px;
+      font-weight:600;
+      cursor:pointer;
+      flex:0 0 auto;
+    }
+    #planBarUpload:hover {
+      background: rgba(72, 78, 92, 0.98);
+    }
+    #planBarUpload:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    #planFlightTopBar .pfGroup {
+      display:flex;
+      flex-direction:column;
+      justify-content:center;
+      gap:3px;
+      min-width: 108px;
+      padding: 0 2px;
+    }
+    #planFlightTopBar .pfLabel {
+      font-size:11px;
+      color:#9ca3b0;
+      font-weight:600;
+      line-height:1.1;
+      white-space: nowrap;
+      letter-spacing: 0.01em;
+    }
+    #planFlightTopBar .pfMetric {
+      font-size:13px;
+      color:#f3f4f6;
+      line-height:1.2;
+      white-space:nowrap;
+      font-weight: 400;
+    }
+    #planFlightTopBar .pfMetric b {
+      font-weight: 700;
+      color:#ffffff;
+    }
+    #planFlightTopBar .pfMetricGhost {
+      visibility: hidden;
+    }
+    #planFlightTopBar .pfSpacer {
+      flex: 0 0 10px;
+      min-width: 10px;
+    }
+    #planExit {
+      font-size: 34px;
+      display:inline-flex;
+      align-items:flex-start;
+      padding-top: 6px;
+      color:#f3f4f6;
+      white-space: nowrap;
+      min-width: 92px;
+      cursor:pointer;
+    }
+    #planWorkspace {
+      position:absolute;
+      top:64px;
+      left:0;
+      right:0;
+      bottom:0;
+      display:flex;
+      gap:10px;
+      padding:10px;
+      align-items:flex-start;
+      pointer-events:none;
+    }
+    #planFlightToolRail {
+      width:78px;
+      border-radius:8px;
+      background: rgba(28, 30, 36, 0.96);
+      border:1px solid rgba(65, 70, 82, 0.9);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.16);
+      padding:5px 0;
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      pointer-events:auto;
+    }
+    .planToolBtn {
+      position: relative;
+      margin:0 5px;
+      min-height:52px;
+      border-radius:6px;
+      border:1px solid rgba(70, 76, 88, 0.85);
+      background: rgba(40, 44, 52, 0.95);
+      color:#e8eaef;
+      font-size:11px;
+      font-weight:600;
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+      justify-content:center;
+      gap:2px;
+      cursor:pointer;
+      user-select:none;
+      text-align:center;
+      padding: 3px 2px;
+      letter-spacing: 0.01em;
+      pointer-events:auto;
+    }
+    .planToolIcon {
+      width:17px;
+      height:17px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      font-size:15px;
+      line-height:1;
+      opacity:0.98;
+      flex:0 0 auto;
+    }
+    .planToolBtn.active {
+      background:#facc15;
+      color:#111827;
+      border-color:#ca8a04;
+      margin-right: 10px;
+    }
+    .planToolBtn.active .planToolIcon {
+      color:#111827;
+    }
+    .planToolBtn.active::after {
+      content: "";
+      position: absolute;
+      right: -7px;
+      top: 50%;
+      transform: translateY(-50%);
+      border-width: 9px 0 9px 9px;
+      border-style: solid;
+      border-color: transparent transparent transparent #facc15;
+      filter: drop-shadow(1px 0 0 rgba(0,0,0,0.12));
+    }
+    .planToolBtn:hover { background: rgba(55, 60, 72, 0.98); }
+    .planToolBtn.active:hover { background:#eab308; }
+    #planCenterPanel {
+      min-width: 540px;
+      max-width: 620px;
+      border-radius:8px;
+      overflow:hidden;
+      background: rgba(36, 39, 48, 0.98);
+      border:1px solid rgba(70, 76, 88, 0.9);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+      pointer-events:auto;
+    }
+    #planFileFlyout {
+      padding: 12px 14px 14px;
+      color:#e8eaef;
+      font-size:12px;
+    }
+    .planFileSection {
+      margin-bottom: 16px;
+    }
+    .planFileSection:last-child {
+      margin-bottom: 0;
+    }
+    .planFileSectionTitle {
+      font-size: 13px;
+      font-weight: 700;
+      color: #f9fafb;
+      margin-bottom: 10px;
+      letter-spacing: 0.02em;
+    }
+    .planFileCardGrid {
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:8px;
+    }
+    .planTplCard {
+      border-radius:6px;
+      overflow:hidden;
+      border:1px solid rgba(90, 96, 110, 0.85);
+      cursor:pointer;
+      display:flex;
+      flex-direction:column;
+      background: rgba(28, 30, 36, 0.98);
+    }
+    .planTplCard:hover {
+      border-color: rgba(250, 204, 21, 0.65);
+      box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.25);
+    }
+    .planTplPrev {
+      flex: 1 1 82px;
+      min-height: 82px;
+      position: relative;
+      overflow: hidden;
+      background: linear-gradient(145deg, #2d3748, #4a5568);
+    }
+    .planTplPrevImg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center;
+      display: block;
+    }
+    .planTplLabel {
+      background: rgba(24, 26, 32, 0.98);
+      border-top:1px solid rgba(70, 76, 88, 0.85);
+      text-align:center;
+      font-size:11px;
+      font-weight:600;
+      padding:6px 4px 7px;
+      color:#e8eaef;
+    }
+    .planFileBtnRow {
+      display:flex;
+      flex-wrap: wrap;
+      gap:8px;
+      margin-bottom:8px;
+    }
+    .planFileBtn {
+      flex: 1 1 auto;
+      min-height:30px;
+      padding: 0 12px;
+      border-radius:5px;
+      border:1px solid rgba(90, 96, 110, 0.9);
+      background: rgba(48, 52, 62, 0.95);
+      color:#e8eaef;
+      font-size:12px;
+      font-weight:600;
+      cursor:pointer;
+    }
+    .planFileBtn:hover:not(:disabled) {
+      background: rgba(62, 68, 82, 0.98);
+    }
+    .planFileBtn:disabled {
+      opacity:0.38;
+      cursor:not-allowed;
+    }
+    .planFileBtnPrimary {
+      background: rgba(88, 82, 118, 0.95);
+      border-color: rgba(120, 110, 160, 0.85);
+    }
+    .planFileBtnPrimary:hover:not(:disabled) {
+      background: rgba(100, 94, 132, 0.98);
+    }
+    .planFileBtnSecondary {
+      background: rgba(52, 56, 66, 0.95);
+    }
+    .planFileBtnWide {
+      width:100%;
+      display:block;
+    }
+    #planOtherToolPanel {
+      padding: 20px 16px;
+      color:#e8eaef;
+      font-size: 13px;
+      line-height: 1.45;
+      min-height: 120px;
+    }
+    #planRightPanel {
+      margin-left:auto;
+      width: 340px;
+      max-width: min(340px, calc(100vw - 24px));
+      max-height: calc(100vh - 120px);
+      border-radius:6px;
+      background: rgba(36, 38, 46, 0.94);
+      border:1px solid rgba(92, 96, 120, 0.85);
+      box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+      overflow-x: visible;
+      overflow-y: auto;
+      pointer-events:auto;
+      display:flex;
+      flex-direction:column;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    #planTabs {
+      display:flex;
+      flex-shrink:0;
+      min-height:38px;
+      background:#3a3d4a;
+      border-bottom:1px solid rgba(0,0,0,0.35);
+    }
+    #planTabs:focus-within {
+      outline: none;
+    }
+    .planTab {
+      flex: 1 1 0;
+      min-width: 0;
+      border:none;
+      border-right:1px solid rgba(0,0,0,0.28);
+      background:#3a3d4a;
+      color:#e8eaef;
+      font-size:12px;
+      font-weight:600;
+      cursor:pointer;
+      padding:8px 4px;
+      position: relative;
+    }
+    .planTab:focus-visible {
+      outline: 2px solid rgba(250, 204, 21, 0.85);
+      outline-offset: -2px;
+      z-index: 1;
+    }
+    .planTab:last-child { border-right:none; }
+    .planTab:hover:not(.active) {
+      background:#45485a;
+    }
+    .planTab.active {
+      background:#f5e6a0;
+      color:#111827;
+      font-weight:700;
+    }
+    #planSection {
+      padding:0;
+    }
+    .planTabBody {
+      padding: 0;
+      flex:1;
+      min-height:0;
+    }
+    .planTabBody[hidden] {
+      display: none !important;
+    }
+    .planTabHint {
+      font-size: 12px;
+      color: rgba(232, 234, 239, 0.92);
+      line-height: 1.5;
+      margin: 0 0 12px;
+    }
+    .planSectionHeader {
+      background:#4d5170;
+      color:#f9fafb;
+      font-size:13px;
+      font-weight:600;
+      padding:9px 12px;
+      letter-spacing:0.02em;
+    }
+    .planSectionBody {
+      padding:12px;
+      background:#0c0c0e;
+      color:#e8eaef;
+      font-size:12px;
+    }
+    .planSectionBody--fence {
+      background:#14151a;
+    }
+    .planFieldLabel {
+      color:rgba(248, 250, 252, 0.88);
+      font-size:11px;
+      font-weight:600;
+      margin:10px 0 5px;
+    }
+    .planFieldLabel:first-child { margin-top:0; }
+    .planRailSelect {
+      width:100%;
+      box-sizing:border-box;
+      min-height:32px;
+      padding:6px 28px 6px 10px;
+      border-radius:5px;
+      border:1px solid rgba(100, 106, 124, 0.65);
+      background:#ffffff;
+      color:#111827;
+      font-size:12px;
+      font-weight:500;
+      cursor:pointer;
+      appearance:none;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23374151' d='M3 4.5L6 8l3-3.5z'/%3E%3C/svg%3E");
+      background-repeat:no-repeat;
+      background-position:right 10px center;
+    }
+    .planRailInput {
+      display:flex;
+      align-items:center;
+      box-sizing:border-box;
+      min-height:32px;
+      padding:0 10px;
+      border-radius:5px;
+      border:1px solid rgba(100, 106, 124, 0.65);
+      background:#ffffff;
+      color:#111827;
+    }
+    .planRailInput input {
+      flex:1;
+      min-width:0;
+      border:none;
+      background:transparent;
+      color:#111827;
+      font-size:13px;
+      font-weight:500;
+      padding:6px 0;
+      outline:none;
+    }
+    .planRailUnit {
+      flex:0 0 auto;
+      margin-left:8px;
+      font-size:12px;
+      font-weight:600;
+      color:#374151;
+    }
+    .planKvRow {
+      display:flex;
+      justify-content:space-between;
+      align-items:baseline;
+      gap:10px;
+      font-size:12px;
+      margin:8px 0;
+      color:#e8eaef;
+    }
+    .planKvRow span:first-child { color:rgba(210, 214, 222, 0.88); }
+    .planKvRow b { font-weight:700; color:#fff; }
+    .planNoteMission {
+      font-size:11px;
+      line-height:1.5;
+      color:rgba(218, 220, 228, 0.88);
+      font-weight:400;
+      margin:12px 0 14px;
+    }
+    #planVehicleDetails.planRailDetails summary {
+      font-weight:700;
+      font-size:13px;
+      color:#fff;
+      padding:12px 0 10px;
+      margin:0;
+      border-bottom:1px solid rgba(255,255,255,0.92);
+    }
+    #planVehicleDetails.planRailDetails .planRailDetailsInner {
+      padding-top:12px;
+      padding-bottom:4px;
+    }
+    #planVehicleDetails.planRailDetails .planRailDetailsInner > .planFieldLabel {
+      margin-top:2px;
+    }
+    .planHelpMuted {
+      font-size:11px;
+      line-height:1.45;
+      color:rgba(232,234,239,0.72);
+      margin:8px 0 10px;
+    }
+    .planRailDetails {
+      margin-top:4px;
+      border-top:1px solid rgba(255,255,255,0.28);
+    }
+    .planRailDetails + .planRailDetails { margin-top:0; }
+    .planRailDetails summary {
+      list-style:none;
+      cursor:pointer;
+      color:#f9fafb;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      font-size:13px;
+      font-weight:600;
+      padding:12px 0 10px;
+    }
+    .planRailDetails summary::-webkit-details-marker { display:none; }
+    .planRailDetails .planRailChev {
+      display:inline-block;
+      font-size:10px;
+      opacity:0.85;
+      transition: transform 0.15s ease;
+    }
+    .planRailDetails[open] .planRailChev { transform: rotate(180deg); }
+    .planRailDetailsInner {
+      padding-bottom:12px;
+    }
+    .planGeoLead {
+      font-size:11px;
+      color:rgba(232,234,239,0.8);
+      line-height:1.45;
+      margin:0 0 14px;
+    }
+    .planGeoBlock {
+      margin-bottom:14px;
+      padding-bottom:12px;
+      border-bottom:1px solid rgba(255,255,255,0.22);
+    }
+    .planGeoBlock:last-child {
+      border-bottom:none;
+      margin-bottom:0;
+      padding-bottom:0;
+    }
+    .planGeoTitle {
+      font-size:12px;
+      font-weight:700;
+      color:#fff;
+      margin:0 0 10px;
+    }
+    .planGeoStatus {
+      font-size:12px;
+      color:rgba(232,234,239,0.78);
+    }
+    .planGeoBtnStack {
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .planGeoBtn {
+      width:100%;
+      box-sizing:border-box;
+      min-height:34px;
+      padding:8px 12px;
+      border-radius:6px;
+      border:1px solid rgba(80, 86, 102, 0.9);
+      background:#3d414d;
+      color:#f3f4f6;
+      font-size:12px;
+      font-weight:600;
+      cursor:pointer;
+    }
+    .planGeoBtn:hover:not(:disabled) {
+      background:#4a4f5e;
+    }
+    .planGeoBtn:disabled {
+      opacity:0.45;
+      cursor:not-allowed;
+    }
+    .planRallyInfo {
+      margin:0;
+      padding:14px 14px 16px;
+      border-radius:8px;
+      background:#121318;
+      border:1px solid rgba(80, 86, 102, 0.55);
+      color:#e8eaef;
+      font-size:12px;
+      line-height:1.5;
+    }
+    .planFold {
+      margin-top:12px;
+      border-top:1px solid rgba(94, 99, 109, 0.55);
+      padding-top:8px;
+      font-size:13px;
+      color:#1f2937;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+    }
+    #planStartMissionBtn {
+      margin-top:14px;
+      width:100%;
+      min-height:36px;
+      border-radius:6px;
+      border:1px solid rgba(120, 90, 40, 0.85);
+      background:#9a6b2d;
+      color:#ffffff;
+      font-size:13px;
+      font-weight:700;
+      cursor:pointer;
+    }
+    #planStartMissionBtn:hover {
+      background:#b07a34;
+    }
+    #planSetLaunchMapCenterBtn {
+      width:100%;
+      margin-top:10px;
+      min-height:34px;
+      border-radius:6px;
+      border:1px solid rgba(80, 86, 102, 0.9);
+      background:#3d414d;
+      color:#f3f4f6;
+      font-size:12px;
+      font-weight:600;
+      cursor:pointer;
+    }
+    #planSetLaunchMapCenterBtn:hover {
+      background:#4a4f5e;
+    }
+    #cameraRail {
+      top: 78px;
+      right: 18px;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 12px 14px;
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(39, 47, 61, 0.96), rgba(30, 38, 52, 0.96));
+      border: 1px solid rgba(188, 202, 224, 0.42);
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.34);
+      min-width: 108px;
+      z-index: 1215;
+    }
+    #videoPreview {
+      left: 14px;
+      bottom: 14px;
+      width: 230px;
+      height: 130px;
+      display: none;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid rgba(206, 220, 242, 0.35);
+      background: #0f1623;
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.32);
+      z-index: 1210;
+    }
+    #videoPreview img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    #videoPreviewPlaceholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #eef3ff;
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      background: linear-gradient(180deg, rgba(18, 27, 42, 0.9), rgba(10, 16, 28, 0.92));
+      text-shadow: 0 1px 2px rgba(0,0,0,0.45);
+      pointer-events: none;
+    }
+    #cameraTopRow {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      padding: 3px;
+      border-radius: 22px;
+      background: rgba(73, 83, 102, 0.9);
+      border: 1px solid rgba(190, 202, 224, 0.35);
+    }
+    .camSmallBtn {
+      width: 48px;
+      height: 38px;
+      border-radius: 10px;
+      border: 1px solid rgba(196, 209, 230, 0.22);
+      background: transparent;
+      color: #e8edf8;
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      user-select: none;
+      transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+    }
+    .camSmallBtn:hover {
+      background: rgba(110, 123, 148, 0.24);
+      border-color: rgba(229, 237, 251, 0.4);
+    }
+    .camSmallBtn.active {
+      border-color: rgba(214, 224, 241, 0.9);
+      background: rgba(27, 33, 45, 0.96);
+      box-shadow: 0 0 0 1px rgba(230, 238, 252, 0.18) inset;
+      color: #69e86f;
+    }
+    #camVideoBtn {
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      margin-right: 4px;
+      border-color: transparent;
+      box-shadow: none;
+    }
+    #camVideoBtn:hover {
+      border-color: transparent;
+      background: rgba(110, 123, 148, 0.2);
+      transform: none;
+    }
+    #camVideoBtn.active {
+      border-color: rgba(214, 224, 241, 0.9);
+      background: rgba(27, 33, 45, 0.96);
+      box-shadow: 0 0 0 1px rgba(230, 238, 252, 0.18) inset;
+    }
+    #camPhotoBtn {
+      width: 48px;
+      height: 38px;
+      border-radius: 9px;
+      border-color: transparent;
+      box-shadow: none;
+      color: #e8edf8;
+    }
+    #camPhotoBtn:hover {
+      border-color: transparent;
+      background: rgba(110, 123, 148, 0.2);
+      transform: none;
+    }
+    #camPhotoBtn.active {
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      margin-left: 5px;
+      margin-right: 5px;
+      border-color: rgba(214, 224, 241, 0.9);
+      background: rgba(27, 33, 45, 0.96);
+      box-shadow: 0 0 0 1px rgba(230, 238, 252, 0.18) inset;
+      color: #f2f6ff;
+    }
+    #camRecordBtn {
+      width: 50px;
+      height: 50px;
+      border-radius: 50%;
+      border: 2px solid rgba(231, 239, 255, 0.9);
+      background: radial-gradient(circle at 50% 35%, rgba(35, 43, 57, 0.96), rgba(20, 26, 36, 0.96));
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      user-select: none;
+      transition: transform 120ms ease, box-shadow 120ms ease;
+    }
+    #camRecordBtn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 3px 8px rgba(0,0,0,0.35);
+    }
+    #camRecordDot {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: linear-gradient(180deg, #ff4b4b, #f62d2d);
+      box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+    }
+    #camRecordBtn.recording #camRecordDot {
+      border-radius: 8px;
+      width: 22px;
+      height: 22px;
+      background: linear-gradient(180deg, #ff5555, #ff3939);
+    }
+    #camTimer {
+      font-weight: 700;
+      font-size: 15px;
+      color: #ffffff;
+      background: rgba(255, 65, 65, 0.92);
+      border-radius: 10px;
+      padding: 4px 10px;
+      line-height: 1.2;
+      letter-spacing: 0.02em;
+      font-variant-numeric: tabular-nums;
+      font-family: "Consolas", "Courier New", monospace;
+      border: 1px solid rgba(255, 205, 205, 0.5);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+    }
+    .camLabel {
+      opacity: 0.95;
+    }
+    .camIcon {
+      width: 20px;
+      height: 20px;
+      display: block;
+      color: currentColor;
+    }
+    /* Bottom HUD: compass (racchip) bottom-right; telemetry on a single orbit (no duplicate strips). */
+    /* Bottom HUD: lock compass to bottom-right; telemetry strip pinned next to it (Qt WebEngine-safe). */
+    #mapFooterHud {
+      position: absolute;
+      right: 10px;
+      bottom: 2px;
+      z-index: 1210;
+      width: 312px;
+      height: 312px;
+      pointer-events: none;
+      font-family: "Segoe UI", Arial, sans-serif;
+      --compass-size: 176px;
+      --hud-gap: 12px; /* minimum spacing between telemetry and compass */
+    }
+    #telemetryLeftStack {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      position: absolute;
+      /* Anchor relative to the compass circle (not the whole 312px HUD box).
+         HUD box: 312px; compass: 176px centered => compass left edge is 68px from HUD left.
+         We want telemetry's RIGHT edge to sit left of compass edge by --hud-gap.
+         For a HUD box of width W and compass diameter C, this is:
+           right = (W + C) / 2 + gap
+      */
+      left: auto;
+      right: calc((100% + var(--compass-size)) / 2 + var(--hud-gap));
+      bottom: 44px;              /* move strip up */
+      transform: none;
+      pointer-events: none;
+    }
+    #telemetryStrip {
+      display: grid;
+      grid-template-columns: repeat(3, max-content);
+      gap: 6px 8px;
+      padding: 6px 10px;
+      border-radius: 12px;
+      background: rgba(26, 33, 45, 0.84);
+      border: 1px solid rgba(80, 92, 118, 0.42);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.28);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      pointer-events: none;
+    }
+    .telStackItem {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 8px;
+      padding: 2px;
+      border-radius: 0;
+      background: transparent;
+      color: #dce5f5;
+      font-size: 15px;
+      line-height: 1.25;
+      white-space: nowrap;
+      box-shadow: none;
+      border: 0;
+      min-width: 0;
+      pointer-events: none;
+    }
+    .telStackItem .telemetryIcon {
+      font-size: 15px;
+      opacity: 0.95;
+    }
+    .telStackItem .telemetryIconHuman {
+      font-size: 16px;
+      opacity: 0.95;
+    }
+    #compassHud {
+      position: absolute;
+      right: 0;
+      bottom: -18px; /* move only compass down more */
+      width: 312px;
+      height: 312px;
+      flex-shrink: 0;
+      pointer-events: none;
+      --orbit-r: 122px;
+    }
+    .telOrbitItem {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      z-index: 5;
+      transform: translate(-50%, -50%) rotate(var(--oa, 0deg)) translateY(calc(-1 * var(--orbit-r))) rotate(calc(-1 * var(--oa, 0deg)));
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 9px;
+      border-radius: 8px;
+      background: rgba(26, 33, 45, 0.94);
+      color: #dce5f5;
+      font-size: 13px;
+      line-height: 1.25;
+      white-space: nowrap;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+      border: 1px solid rgba(80, 92, 118, 0.45);
+      pointer-events: none;
+    }
+    .telemetryIcon {
+      font-size: 16px;
+      line-height: 1;
+    }
+    .telemetryIconHuman {
+      font-size: 19px;
+      line-height: 1;
+    }
+    #compassHud #compass {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: var(--compass-size);
+      height: var(--compass-size);
+      flex-shrink: 0;
+      background: transparent;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      pointer-events: none;
+      z-index: 3;
+    }
+    #compass::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background:
+        conic-gradient(
+          from -90deg,
+          rgba(255,255,255,0.97) 0deg 28deg, transparent 28deg 45deg,
+          rgba(255,255,255,0.97) 45deg 73deg, transparent 73deg 90deg,
+          rgba(255,255,255,0.97) 90deg 118deg, transparent 118deg 135deg,
+          rgba(255,255,255,0.97) 135deg 163deg, transparent 163deg 180deg,
+          rgba(255,255,255,0.97) 180deg 208deg, transparent 208deg 225deg,
+          rgba(255,255,255,0.97) 225deg 253deg, transparent 253deg 270deg,
+          rgba(255,255,255,0.97) 270deg 298deg, transparent 298deg 315deg,
+          rgba(255,255,255,0.97) 315deg 343deg, transparent 343deg 360deg
+        );
+      -webkit-mask: radial-gradient(circle, transparent 0 68px, #000 68px 85px, transparent 85px);
+      mask: radial-gradient(circle, transparent 0 68px, #000 68px 85px, transparent 85px);
+      pointer-events: none;
+      opacity: 0.98;
+    }
+    #compassInner {
+      position:relative; width:152px; height:152px; border-radius:76px;
+      background: rgba(22, 26, 34, 0.96);
+      border: 2px solid rgba(148, 160, 180, 0.32);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+      overflow: hidden;
+    }
+    #compassInner::before {
+      content: "";
+      position: absolute;
+      inset: 4px;
+      border-radius: 50%;
+      background:
+        repeating-conic-gradient(
+          from 0deg,
+          rgba(240, 245, 255, 0.88) 0deg 2deg,
+          transparent 2deg 30deg
+        );
+      -webkit-mask: radial-gradient(circle, transparent 0 52px, #000 52px 56px, transparent 56px);
+      mask: radial-gradient(circle, transparent 0 52px, #000 52px 56px, transparent 56px);
+      pointer-events: none;
+    }
+    .compassCard {
+      position:absolute;
+      font-size:16px;
+      line-height:1;
+      color:#f1f5ff;
+      font-weight:600;
+      text-shadow:0 1px 0 rgba(0,0,0,0.35);
+      z-index: 3;
+    }
+    #cN { top:11px; left:71px; }
+    #cE { top:69px; right:12px; }
+    #cS { bottom:12px; left:71px; font-size:15px; }
+    #cW { top:69px; left:12px; }
+    #compassDeg {
+      position:absolute;
+      left:0; right:0; bottom:30px;
+      text-align:center;
+      font-size:13px;
+      font-weight:600;
+      color:#f4f7ff;
+      letter-spacing:0.02em;
+      z-index: 3;
+    }
+    #needle {
+      position:absolute;
+      left:50px;
+      top:46px;
+      width:52px;
+      height:52px;
+      transform-origin: 26px 26px;
+      filter: drop-shadow(0 1px 1px rgba(0,0,0,0.45));
+      z-index: 2;
+    }
+    #needle::before {
+      content:"";
+      position:absolute;
+      left:7px;
+      top:2px;
+      width:38px;
+      height:48px;
+      background: linear-gradient(180deg, #ff5b4e, #f04336);
+      border:2px solid rgba(244,248,255,0.92);
+      clip-path: polygon(50% 0%, 100% 58%, 67% 56%, 50% 100%, 33% 56%, 0% 58%);
+    }
+    /* Vehicle on map: high-contrast heading chevron (matches product reference). */
+    .vgcs-vehicle-marker {
+      background: transparent !important;
+      border: none !important;
+    }
+    .vgcs-vehicle-marker-inner {
+      width: 30px;
+      height: 30px;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transform-origin: 50% 50%;
+    }
+    .vgcs-vehicle-marker-inner svg {
+      display: block;
+    }
+    .vgcs-wp-divicon {
+      background: transparent !important;
+      border: none !important;
+    }
+    .vgcs-wp-pin {
+      position: relative;
+      width: 26px;
+      height: 26px;
+    }
+    .vgcs-wp-disc {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: #facc15;
+      border: 2px solid #111827;
+      box-sizing: border-box;
+    }
+    .vgcs-wp-num {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 26px;
+      height: 26px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font: 700 12px/1 system-ui, sans-serif;
+      color: #111827;
+      pointer-events: none;
+    }
+    .planWpDetails {
+      margin: 10px 0 12px 0;
+      padding: 10px;
+      border-radius: 10px;
+      background: rgba(18, 20, 26, 0.96);
+      border: 1px solid rgba(70, 76, 92, 0.85);
+      overflow: visible;
+    }
+    .planWpDetailsTitle {
+      font-weight: 800;
+      color: #e5e7eb;
+      margin: 0 0 8px 0;
+      font-size: 12px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .planWpRow {
+      display: grid;
+      grid-template-columns: 56px 1fr;
+      gap: 8px;
+      align-items: center;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(70, 76, 92, 0.55);
+    }
+    .planWpRow:last-child { border-bottom: none; }
+    .planWpRow--start .planWpLabel { color: #e7d494; }
+    .planWpStartHint {
+      font-size: 11px;
+      color: #94a3b8;
+      line-height: 1.35;
+      padding: 0 2px;
+    }
+    .planWpLabel {
+      color: #cbd5e1;
+      font-weight: 800;
+      font-size: 12px;
+    }
+    .planWpFields {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 6px;
+    }
+    .planWpField {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(26, 28, 36, 0.85);
+      border: 1px solid rgba(70, 76, 92, 0.8);
+      border-radius: 10px;
+      padding: 7px 10px;
+      min-width: 0;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .planWpField input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: #f8fafc;
+      font-weight: 700;
+      font-size: 13px;
+      min-width: 0;
+    }
+    .planWpUnit {
+      color: #94a3b8;
+      font-weight: 800;
+      font-size: 12px;
+      flex-shrink: 0;
+      white-space: nowrap;
+    }
+    /* Mission tab: sequence list (Takeoff card + pattern template row), reference UI */
+    .planMissionSequence {
+      margin-bottom: 14px;
+      max-height: 42vh;
+      overflow-y: auto;
+      padding-right: 2px;
+    }
+    .planSeqCard {
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid rgba(70, 76, 92, 0.95);
+      background: rgba(22, 24, 30, 0.98);
+      margin-bottom: 10px;
+    }
+    .planSeqCardHead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 40px;
+      padding: 0 8px 0 6px;
+      background: linear-gradient(180deg, #6a5cb8 0%, #4d5696 100%);
+      color: #f8fafc;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .planSeqCardTitle {
+      flex: 1;
+      text-align: center;
+    }
+    .planSeqIconBtn {
+      width: 32px;
+      height: 32px;
+      border: none;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.12);
+      color: #f1f5ff;
+      font-size: 14px;
+      line-height: 1;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .planSeqIconBtn:disabled {
+      opacity: 0.35;
+      cursor: default;
+    }
+    .planSeqIconBtn:not(:disabled):hover {
+      background: rgba(255,255,255,0.22);
+    }
+    .planSeqCardBody {
+      padding: 12px;
+      background: #0c0c0e;
+    }
+    .planSeqCardDesc {
+      font-size: 12px;
+      line-height: 1.45;
+      color: rgba(220, 224, 235, 0.9);
+      margin: 0 0 12px;
+    }
+    #planSeqPatternRow {
+      display: none;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+      padding: 11px 12px;
+      border-radius: 6px;
+      background: rgba(36, 38, 48, 0.96);
+      border: 2px solid rgba(80, 86, 102, 0.75);
+      box-sizing: border-box;
+    }
+    #planSeqPatternRow.planSeqPatternRow--visible {
+      display: flex;
+    }
+    #planSeqPatternRow.planSeqPatternRow--focus {
+      border-color: #e11d48;
+      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.35);
+    }
+    .planSeqPatternGlyph {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: rgba(72, 78, 96, 0.95);
+      color: #f9fafb;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      font-weight: 800;
+      flex-shrink: 0;
+    }
+    .planSeqPatternLabel {
+      font-size: 13px;
+      font-weight: 600;
+      color: #f3f4f6;
+    }
+    .planSeqRtlBtn {
+      width: 100%;
+      box-sizing: border-box;
+      min-height: 38px;
+      margin-top: 2px;
+      border-radius: 6px;
+      border: 1px solid rgba(90, 96, 118, 0.85);
+      background: rgba(52, 56, 68, 0.96);
+      color: #e8eaef;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .planSeqRtlBtn:hover {
+      background: rgba(64, 68, 82, 0.98);
+    }
+    /* Empty plan mission style (compact "Mission Start" panel). */
+    #planTabPanelMission.planMissionEmpty .planMissionSequence {
+      margin-bottom: 8px;
+      max-height: none;
+      overflow: visible;
+      padding-right: 0;
+    }
+    #planTabPanelMission.planMissionEmpty .planSeqCard {
+      border: none;
+      background: transparent;
+      margin-bottom: 0;
+    }
+    #planTabPanelMission.planMissionEmpty .planSeqCardHead,
+    #planTabPanelMission.planMissionEmpty .planSeqCardDesc,
+    #planTabPanelMission.planMissionEmpty #planSeqPatternRow,
+    #planTabPanelMission.planMissionEmpty #planSeqRtlBtn {
+      display: none !important;
+    }
+    #planTabPanelMission.planMissionEmpty .planSeqCardBody {
+      padding: 0;
+      background: transparent;
+    }
+    #planTabPanelMission.planMissionEmpty .planFieldLabel {
+      margin-top: 6px;
+      margin-bottom: 4px;
+    }
+    #planTabPanelMission.planMissionEmpty .planRailSelect,
+    #planTabPanelMission.planMissionEmpty .planRailInput {
+      min-height: 30px;
+    }
+    #planSeqCompactList {
+      display: none;
+      margin-top: 0;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #planTabPanelMission.planMissionStack #planSeqCompactList {
+      display: flex;
+      margin-top: 10px;
+    }
+    /* Survey stack uses independent mission tabs. Bodies are toggled by JS. */
+    #planTabPanelMission.planMissionStack .planSeqCardBody,
+    #planTabPanelMission.planMissionStack #planVehicleDetails,
+    #planTabPanelMission.planMissionStack #planLaunchDetails {
+      display: none;
+    }
+    /* Each step: title row + detail stacked; groups are spaced in #planSeqCompactList */
+    .planSeqCompactGroup {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      width: 100%;
+    }
+    .planSeqCompactTab {
+      min-height: 34px;
+      border-radius: 6px;
+      border: 1px solid rgba(86, 93, 116, 0.9);
+      background: #4d5170;
+      color: #f5f7ff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 8px;
+      padding: 0 10px;
+      font-size: 14px;
+      font-weight: 600;
+      box-sizing: border-box;
+      width: 100%;
+      cursor: pointer;
+      user-select: none;
+      text-align: left;
+    }
+    .planSeqCompactTab.is-active {
+      background: #616790;
+      border-color: rgba(120, 132, 170, 0.95);
+      box-shadow: 0 0 0 1px rgba(146, 160, 201, 0.24) inset;
+    }
+    .planSeqCompactRow {
+      min-height: 34px;
+      border-radius: 6px;
+      border: 2px solid rgba(225, 29, 72, 0.9);
+      background: rgba(32, 35, 44, 0.9);
+      color: #e8eaef;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 10px;
+      font-size: 14px;
+      font-weight: 600;
+      box-sizing: border-box;
+    }
+    .planSeqCompactTakeoffCard {
+      border-radius: 6px;
+      border: 2px solid rgba(225, 29, 72, 0.9);
+      background: rgba(18, 21, 29, 0.9);
+      overflow: hidden;
+      display: none;
+    }
+    .planSeqCompactTakeoffCard.is-active {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.32);
+    }
+    .planSeqCompactTakeoffHead {
+      min-height: 34px;
+      border-bottom: 1px solid rgba(99, 108, 136, 0.62);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 8px;
+      color: #f5f7ff;
+      font-size: 14px;
+      font-weight: 700;
+      background: #4d5170;
+    }
+    .planSeqCompactTakeoffHeadTitle {
+      flex: 1;
+    }
+    .planSeqCompactHeadBtn {
+      width: 24px;
+      height: 24px;
+      border-radius: 5px;
+      border: none;
+      background: rgba(88, 96, 120, 0.42);
+      color: #f5f7ff;
+      font-size: 13px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      cursor: default;
+      opacity: 0.9;
+    }
+    .planSeqCompactTakeoffBody {
+      padding: 10px 10px 8px;
+      color: #ffffff;
+      font-size: 12px;
+      line-height: 1.35;
+      display: none;
+    }
+    .planSeqCompactTakeoffCard.is-active .planSeqCompactTakeoffBody { display: block; }
+    .planSeqCompactTakeoffBody p {
+      margin: 0 0 8px;
+    }
+    .planSeqCompactDoneBtn {
+      width: 100%;
+      min-height: 34px;
+      border-radius: 6px;
+      border: 1px solid rgba(120, 128, 148, 0.65);
+      background: rgba(78, 84, 104, 0.75);
+      color: #f5f7ff;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: default;
+    }
+    .planSeqCompactGlyph {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: rgba(72, 78, 96, 0.95);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 800;
+      flex: 0 0 auto;
+    }
+    .planSeqCompactRow.is-active {
+      box-shadow: 0 0 0 1px rgba(225, 29, 72, 0.32);
+    }
+    .planSeqCompactBody {
+      display: none;
+      margin-top: 0;
+      margin-bottom: 0;
+      border: 2px solid rgba(225, 29, 72, 0.9);
+      border-radius: 6px;
+      background: rgba(18, 21, 29, 0.9);
+      color: #f5f7ff;
+      padding: 8px 10px;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .planSeqCompactBody.is-active {
+      display: block;
+    }
+    #planTabPanelMission.planMissionStack #planSeqRtlBtn {
+      display: none !important;
+    }
+    /* Mission Start stack (Takeoff / Survey / RTL): edge-to-edge black band, square corners */
+    #planTabPanelMission.planMissionStack .planSectionBody {
+      padding-left: 0;
+      padding-right: 0;
+      padding-top: 10px;
+      padding-bottom: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSectionBody {
+      padding-left: 12px;
+      padding-right: 12px;
+      padding-top: 12px;
+      padding-bottom: 12px;
+      gap: 8px;
+    }
+    #planTabPanelMission.planMissionStack .planMissionSequence {
+      display: none !important;
+      margin-bottom: 0 !important;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planMissionSequence {
+      display: block !important;
+      margin-bottom: 0 !important;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSeqCard {
+      border: none;
+      background: transparent;
+      margin-bottom: 0;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen .planSeqCardBody {
+      display: block !important;
+      padding: 0;
+      background: transparent;
+    }
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen #planVehicleDetails,
+    #planTabPanelMission.planMissionStack.planMissionDetailsOpen #planLaunchDetails {
+      display: block;
+    }
+    #planTabPanelMission.planMissionStack #planMissionSectionHeader {
+      cursor: pointer;
+      user-select: none;
+    }
+    #planTabPanelMission.planMissionStack #planMissionSectionHeader:hover {
+      background: #616790;
+    }
+    #planTabPanelMission.planMissionStack #planStartMissionBtn {
+      display: block !important;
+    }
+    /* Stack tabs already label Takeoff; hide duplicate bar on the detail card */
+    #planTabPanelMission.planMissionStack .planSeqCompactTakeoffHead {
+      display: none !important;
+    }
+    #planTabPanelMission.planMissionStack .planSeqCompactGroup,
+    #planTabPanelMission.planMissionStack .planSeqCompactTab,
+    #planTabPanelMission.planMissionStack .planSeqCompactTakeoffCard,
+    #planTabPanelMission.planMissionStack .planSeqCompactBody,
+    #planTabPanelMission.planMissionStack .planSeqCompactDoneBtn,
+    #planTabPanelMission.planMissionStack .planSeqCompactHeadBtn,
+    #planTabPanelMission.planMissionStack .planSeqCompactRow {
+      border-radius: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="mapWrap">
+    <div id="map2d"></div>
+    <div id="map3d"></div>
+    <div class="overlay" id="linkBanner">
+      <img id="linkBannerLogo" src="__LOGO_SRC__" alt="Vama logo"/>
+      <div id="linkBannerDisconnected">
+        <span id="linkBannerText">Disconnected - Click to manually connect 💬</span>
+      </div>
+      <div id="linkBannerConnected">
+        <span class="hdrPill"><span class="hdrReadyText" id="hdrReadyText">Ready To Fly</span></span>
+        <span class="hdrSep"></span>
+        <span class="hdrPill"><img class="hdrIcon" src="__ICON_HOLD_SRC__" alt="Hold"/><span id="hdrModeText">Hold</span></span>
+        <span class="hdrSep"></span>
+        <span class="hdrPill" id="hdrVehiclePill"><img class="hdrIcon hdrIconBroadcast" src="__ICON_LINK_SRC__" alt="Vehicle Message"/><span id="hdrVehicleMsg">Vehicle Msg</span></span>
+        <span class="hdrSep"></span>
+        <span class="hdrPill" id="hdrGpsPill">
+          <img id="hdrGpsIcon" class="hdrIcon hdrIconSmall" src="__ICON_GPS_SRC__" alt="GPS"
+               onerror="this.style.display='none'; var e=document.getElementById('hdrGpsEmoji'); if(e) e.style.display='inline';"/>
+          <span id="hdrGpsEmoji" style="display:none; font-weight:700;">GPS</span>
+          <span class="hdrTinyStack" id="hdrGpsStack"><span id="hdrGpsSat">10</span><span id="hdrGpsHdop">0.7</span></span>
+        </span>
+        <span class="hdrSep"></span>
+        <span class="hdrPill" id="hdrBatteryPill">
+          <img id="hdrBatIcon" class="hdrIcon" src="__ICON_BATTERY_SRC__" alt="Battery"
+               onerror="this.style.display='none'; var e=document.getElementById('hdrBatEmoji'); if(e) e.style.display='inline';"/>
+          <span id="hdrBatEmoji" style="display:none; font-weight:700;">BAT</span>
+          <span id="hdrBatteryText">100%</span>
+        </span>
+        <span class="hdrSep"></span>
+        <span class="hdrPill"><img class="hdrIcon" src="__ICON_REMOTE_ID_SRC__" alt="Remote ID"/><span id="hdrRemoteIdText">ID</span></span>
+      </div>
+      <button id="hdrMapModeBtn" type="button">3D</button>
+    </div>
+    <div class="overlay" id="actionRail">
+      <div class="actionBtn" id="actionTakeoff">⬆<div>Takeoff</div></div>
+      <div class="actionBtn" id="actionReturn">↩<div>Return</div></div>
+    </div>
+    <div id="planFlightLayer">
+      <div id="planFlightTopBar">
+        <span id="planExit">&lt; Exit Plan</span>
+        <button id="planBarUpload" type="button" disabled>Upload</button>
+        <div class="pfGroup">
+          <span class="pfLabel">Selected Waypoint</span>
+          <span class="pfMetric">Alt diff: <b id="pfAltDiff">0.0 ft</b></span>
+          <span class="pfMetric">Gradient: <b id="pfGradient">-.-</b></span>
+        </div>
+        <div class="pfGroup">
+          <span class="pfLabel">&nbsp;</span>
+          <span class="pfMetric">Azimuth: <b id="pfAzimuth">0</b></span>
+          <span class="pfMetric">Heading: <b id="pfHeading">nan</b></span>
+        </div>
+        <div class="pfGroup">
+          <span class="pfLabel">&nbsp;</span>
+          <span class="pfMetric">Dist prev WP: <b id="pfDistPrevWp">0.0 ft</b></span>
+          <span class="pfMetric pfMetricGhost">Heading: <b>nan</b></span>
+        </div>
+        <span class="pfSpacer"></span>
+        <div class="pfGroup">
+          <span class="pfLabel">Total Mission</span>
+          <span class="pfMetric">Distance: <b id="pfMissionDistance">0 ft</b></span>
+          <span class="pfMetric">Time: <b id="pfMissionTime">00:00:00</b></span>
+        </div>
+        <div class="pfGroup">
+          <span class="pfLabel">&nbsp;</span>
+          <span class="pfMetric">Max telem dist: <b id="pfMaxTelemDist">0 ft</b></span>
+          <span class="pfMetric pfMetricGhost">Time: <b>00:00:00</b></span>
+        </div>
+      </div>
+      <div id="planWorkspace">
+        <div id="planFlightToolRail">
+          <div class="planToolBtn active" data-tool="File"><span class="planToolIcon">↻</span><span>File</span></div>
+          <div class="planToolBtn" data-tool="Takeoff"><span class="planToolIcon">↑</span><span>Takeoff</span></div>
+          <div class="planToolBtn" data-tool="Waypoint"><span class="planToolIcon">⊕</span><span>Waypoint</span></div>
+          <div class="planToolBtn" data-tool="ROI"><span class="planToolIcon">⊙</span><span>ROI</span></div>
+          <div class="planToolBtn" data-tool="Pattern"><span class="planToolIcon">▦</span><span>Pattern</span></div>
+          <div class="planToolBtn" data-tool="Return"><span class="planToolIcon">↩</span><span>Return</span></div>
+          <div class="planToolBtn" data-tool="Center"><span class="planToolIcon">✦</span><span>Center</span></div>
+        </div>
+        <div id="planCenterPanel">
+          <div id="planFileFlyout">
+            <div class="planFileSection">
+              <div class="planFileSectionTitle">Create Plan</div>
+              <div class="planFileCardGrid">
+                <div class="planTplCard" id="planTplEmpty" role="button" tabindex="0">
+                  <div class="planTplPrev">
+                    <img class="planTplPrevImg" src="__PLAN_TPL_EMPTY_SRC__" alt="" onerror="this.style.display='none'"/>
+                  </div>
+                  <div class="planTplLabel">Empty Plan</div>
+                </div>
+                <div class="planTplCard" id="planTplSurvey" role="button" tabindex="0">
+                  <div class="planTplPrev">
+                    <img class="planTplPrevImg" src="__PLAN_TPL_SURVEY_SRC__" alt="" onerror="this.style.display='none'"/>
+                  </div>
+                  <div class="planTplLabel">Survey</div>
+                </div>
+                <div class="planTplCard" id="planTplCorridor" role="button" tabindex="0">
+                  <div class="planTplPrev">
+                    <img class="planTplPrevImg" src="__PLAN_TPL_CORRIDOR_SRC__" alt="" onerror="this.style.display='none'"/>
+                  </div>
+                  <div class="planTplLabel">Corridor Scan</div>
+                </div>
+                <div class="planTplCard" id="planTplStructure" role="button" tabindex="0">
+                  <div class="planTplPrev">
+                    <img class="planTplPrevImg" src="__PLAN_TPL_STRUCTURE_SRC__" alt="" onerror="this.style.display='none'"/>
+                  </div>
+                  <div class="planTplLabel">Structure Scan</div>
+                </div>
+              </div>
+            </div>
+            <div class="planFileSection">
+              <div class="planFileSectionTitle">Storage</div>
+              <div class="planFileBtnRow">
+                <button type="button" class="planFileBtn planFileBtnPrimary" id="planStorageOpen">Open...</button>
+                <button type="button" class="planFileBtn" id="planStorageSave" disabled>Save</button>
+                <button type="button" class="planFileBtn" id="planStorageSaveAs" disabled>Save As...</button>
+              </div>
+              <button type="button" class="planFileBtn planFileBtnWide" id="planStorageKml" disabled>Save Mission Waypoints As KML...</button>
+            </div>
+            <div class="planFileSection">
+              <div class="planFileSectionTitle">Vehicle</div>
+              <div class="planFileBtnRow">
+                <button type="button" class="planFileBtn" id="planVehicleUpload" disabled>Upload</button>
+                <button type="button" class="planFileBtn planFileBtnSecondary" id="planVehicleDownload">Download</button>
+                <button type="button" class="planFileBtn planFileBtnSecondary" id="planVehicleClear">Clear</button>
+              </div>
+            </div>
+          </div>
+          <div id="planOtherToolPanel" style="display:none">
+            <div id="planOtherToolHint">Select a tool from the rail.</div>
+          </div>
+        </div>
+        <div id="planRightPanel">
+          <div id="planTabs" role="tablist" aria-label="Plan configuration">
+            <button class="planTab active" type="button" role="tab" id="planTabBtnMission"
+              aria-selected="true" aria-controls="planTabPanelMission" tabindex="0" data-plan-tab="mission">Mission</button>
+            <button class="planTab" type="button" role="tab" id="planTabBtnFence"
+              aria-selected="false" aria-controls="planTabPanelFence" tabindex="-1" data-plan-tab="fence">Fence</button>
+            <button class="planTab" type="button" role="tab" id="planTabBtnRally"
+              aria-selected="false" aria-controls="planTabPanelRally" tabindex="-1" data-plan-tab="rally">Rally</button>
+          </div>
+          <div id="planTabPanelMission" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnMission">
+            <div id="planSection">
+              <div class="planSectionHeader" id="planMissionSectionHeader" role="button" tabindex="0" aria-label="Mission Start">Mission</div>
+              <div class="planSectionBody">
+                <div class="planMissionSequence">
+                  <div class="planSeqCard planSeqCard--takeoff">
+                    <div class="planSeqCardHead">
+                      <button type="button" class="planSeqIconBtn" id="planSeqTakeoffTrash" disabled title="Remove (not available)">🗑</button>
+                      <span class="planSeqCardTitle">Takeoff</span>
+                      <button type="button" class="planSeqIconBtn" id="planSeqTakeoffMenu" disabled title="Options">☰</button>
+                    </div>
+                    <div class="planSeqCardBody">
+                      <p class="planSeqCardDesc">Take off from the ground and ascend to specified altitude.</p>
+                      <div class="planFieldLabel">All Altitudes</div>
+                      <select id="planAltReferenceSelect" class="planRailSelect" aria-label="Altitude reference">
+                        <option value="rel" selected>Altitude Relative To Launch</option>
+                        <option value="amsl">AMSL</option>
+                        <option value="agl">AGL</option>
+                      </select>
+                      <div class="planFieldLabel">Initial Waypoint Alt</div>
+                      <div class="planRailInput">
+                        <input id="planInitialWpAltInput" type="text" value="164.0" inputmode="decimal" autocomplete="off" />
+                        <span class="planRailUnit">ft</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div id="planSeqPatternRow" class="planSeqPatternRow" role="group" aria-label="Pattern template">
+                    <span class="planSeqPatternGlyph" aria-hidden="true">?</span>
+                    <span id="planSeqPatternLabel" class="planSeqPatternLabel">Survey</span>
+                  </div>
+                  <button type="button" id="planSeqRtlBtn" class="planSeqRtlBtn">Return To Launch</button>
+                </div>
+                <button id="planStartMissionBtn" type="button">Start Mission</button>
+                <div id="planWpDetails" class="planWpDetails" style="display:none">
+                  <div class="planWpDetailsTitle">Waypoints &amp; start</div>
+                  <div id="planWpDetailsList"></div>
+                </div>
+                <details class="planRailDetails" id="planVehicleDetails">
+                  <summary>Vehicle Info <span class="planRailChev">▼</span></summary>
+                  <div class="planRailDetailsInner">
+                    <div class="planKvRow"><span>Firmware</span><b id="planVehicleFirmwareVal">ArduPilot</b></div>
+                    <div class="planKvRow"><span>Vehicle</span><b id="planVehicleTypeVal">Quadrotor</b></div>
+                    <p class="planNoteMission">The following speed values are used to calculate total mission time. They do not affect the flight speed for the mission.</p>
+                    <div class="planFieldLabel">Hover speed</div>
+                    <div class="planRailInput">
+                      <input id="planHoverSpeedInput" type="text" value="11.18" inputmode="decimal" autocomplete="off" />
+                      <span class="planRailUnit">mph</span>
+                    </div>
+                  </div>
+                </details>
+                <details class="planRailDetails" id="planLaunchDetails">
+                  <summary>Launch Position <span class="planRailChev">▼</span></summary>
+                  <div class="planRailDetailsInner">
+                    <div class="planFieldLabel">Altitude</div>
+                    <div class="planRailInput">
+                      <input id="planLaunchAltInput" type="text" value="0.0" inputmode="decimal" autocomplete="off" />
+                      <span class="planRailUnit">ft</span>
+                    </div>
+                    <p class="planHelpMuted">Actual position set by vehicle at flight time.</p>
+                    <div class="planKvRow"><span>Lat</span><b id="planLaunchLatVal">—</b></div>
+                    <div class="planKvRow"><span>Lon</span><b id="planLaunchLonVal">—</b></div>
+                    <button id="planSetLaunchMapCenterBtn" type="button">Set To Map Center</button>
+                  </div>
+                </details>
+              </div>
+            </div>
+            <div id="planSeqCompactList" aria-hidden="true" role="group" aria-label="Mission sequence steps">
+                  <div class="planSeqCompactGroup">
+                    <div class="planSeqCompactTab" id="planSeqCompactTakeoffTab" data-stack-tab="takeoff" role="tab" tabindex="0">
+                      <span class="planSeqCompactGlyph">?</span>
+                      <span>Takeoff</span>
+                    </div>
+                    <div class="planSeqCompactTakeoffCard" id="planSeqCompactTakeoffCard">
+                      <div class="planSeqCompactTakeoffHead">
+                        <span class="planSeqCompactGlyph">?</span>
+                        <span class="planSeqCompactHeadBtn" aria-hidden="true">🗑</span>
+                        <span class="planSeqCompactTakeoffHeadTitle">Takeoff</span>
+                        <span class="planSeqCompactHeadBtn" aria-hidden="true">☰</span>
+                      </div>
+                      <div class="planSeqCompactTakeoffBody">
+                        <p>Take off from the ground and ascend to specified altitude.</p>
+                        <p>Move “T” Takeoff to the climbout location.</p>
+                        <p>Ensure clear of obstacles and into the wind.</p>
+                        <button type="button" class="planSeqCompactDoneBtn" disabled>Done</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="planSeqCompactGroup">
+                    <div class="planSeqCompactTab" id="planSeqCompactSurveyTab" data-stack-tab="survey" role="tab" tabindex="0">
+                      <span class="planSeqCompactGlyph">?</span>
+                      <span id="planSeqCompactSurveyLabel">Survey</span>
+                    </div>
+                    <div class="planSeqCompactBody" id="planSeqCompactSurveyBody">Survey pattern selected.</div>
+                  </div>
+                  <div class="planSeqCompactGroup">
+                    <div class="planSeqCompactTab" id="planSeqCompactRtlTab" data-stack-tab="rtl" role="tab" tabindex="0">Return To Launch</div>
+                    <div class="planSeqCompactBody" id="planSeqCompactRtlBody">Return leg will be appended after mission actions.</div>
+                  </div>
+            </div>
+          </div>
+          <div id="planTabPanelFence" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnFence" hidden>
+            <div class="planSectionHeader">GeoFence</div>
+            <div class="planSectionBody planSectionBody--fence">
+              <p class="planGeoLead">GeoFencing allows you to set a virtual fence around the area you want to fly in.</p>
+              <p class="planTabHint" style="margin-bottom:14px;">Draw a polygon with <b>Polygon Fence</b>, then use <b>Upload fence</b> on the dashboard to send it to the vehicle.</p>
+              <div class="planGeoBlock">
+                <div class="planGeoTitle">Insert GeoFence</div>
+                <div class="planGeoBtnStack">
+                  <button type="button" class="planGeoBtn" id="planFenceRoiBtn">Polygon Fence</button>
+                  <button type="button" class="planGeoBtn" id="planFenceCircularBtn" disabled title="Not available in this build">Circular Fence</button>
+                </div>
+              </div>
+              <div class="planGeoBlock">
+                <div class="planGeoTitle">Polygon Fences</div>
+                <div class="planGeoStatus" id="planGeoPolyStatus">None</div>
+              </div>
+              <div class="planGeoBlock">
+                <div class="planGeoTitle">Circular Fences</div>
+                <div class="planGeoStatus" id="planGeoCircleStatus">None</div>
+              </div>
+              <div class="planGeoBlock">
+                <div class="planGeoTitle">Breach Return Point</div>
+                <button type="button" class="planGeoBtn" id="planBreachReturnBtn" disabled title="Not available in this build">Add Breach Return Point</button>
+              </div>
+            </div>
+          </div>
+          <div id="planTabPanelRally" class="planTabBody" role="tabpanel" aria-labelledby="planTabBtnRally" hidden>
+            <div class="planSectionHeader">Rally Points</div>
+            <div class="planSectionBody planSectionBody--fence" style="padding:12px;">
+              <div class="planRallyInfo">Rally Points provide alternate landing points when performing a Return to Launch (RTL). Rally editing is not implemented in M2.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="overlay" id="cameraRail">
+      <div id="cameraTopRow">
+        <div class="camSmallBtn active" id="camVideoBtn" title="Video mode">
+          <svg class="camIcon" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3" y="7" width="12" height="10" rx="2" fill="currentColor"></rect>
+            <polygon points="16,10 21,8 21,16 16,14" fill="currentColor"></polygon>
+          </svg>
+        </div>
+        <div class="camSmallBtn" id="camPhotoBtn" title="Take photo">
+          <svg class="camIcon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 6h8l1.2 2H20a2 2 0 0 1 2 2v7a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3v-7a2 2 0 0 1 2-2h2.8L8 6z" fill="currentColor"></path>
+            <circle cx="12" cy="13.5" r="3.2" fill="rgba(39,47,61,0.95)"></circle>
+          </svg>
+        </div>
+      </div>
+      <div id="camRecordBtn" title="Start/Stop recording"><div id="camRecordDot"></div></div>
+      <div id="camTimer">00:00:00</div>
+      <div class="camSmallBtn" id="camSettingsBtn" title="Camera settings"><span class="camLabel">⚙</span></div>
+    </div>
+    <div class="overlay" id="videoPreview">
+      <img id="videoPreviewImg" alt="Video preview" />
+      <div id="videoPreviewPlaceholder">Video</div>
+    </div>
+    <div id="mapFooterHud" aria-hidden="false">
+      <div id="telemetryLeftStack" aria-hidden="true">
+        <div id="telemetryStrip">
+          <div class="telStackItem"><span class="telemetryIcon">↕</span><span class="telRow1Alt">0.0 ft</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">↑</span><span class="telRow1Mph">0.0 mph</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">⏱</span><span class="telRow1Time">00:00:00</span></div>
+          <div class="telStackItem"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span class="telRow2Msl">0.0 ft</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">→</span><span class="telRow2Mph">0.0 mph</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">↳</span><span class="telRow2Alt">0.0 ft</span></div>
+        </div>
+      </div>
+      <div id="compassHud">
+        <div id="compass">
+          <div id="compassInner">
+            <span class="compassCard" id="cN">N</span><span class="compassCard" id="cE">E</span><span class="compassCard" id="cS">S</span><span class="compassCard" id="cW">W</span>
+            <div id="compassDeg">0°</div>
+            <div id="needle"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" onerror="document.title='VGCS_ASSET_ERROR:leaflet_js:'+Date.now()"></script>
+  <script src="https://unpkg.com/cesium@1.125/Build/Cesium/Cesium.js" onerror="document.title='VGCS_ASSET_ERROR:cesium_js:'+Date.now()"></script>
+  <script>
+    // Fail fast with a clear signal if core assets are blocked/unreachable.
+    setTimeout(() => {
+      try {
+        if (typeof L === 'undefined') {
+          document.title = 'VGCS_ASSET_ERROR:leaflet_missing:' + Date.now();
+        }
+        if (typeof Cesium === 'undefined') {
+          // 3D is optional; this just lets Python disable the toggle on restricted clients.
+          document.title = 'VGCS_ASSET_ERROR:cesium_missing:' + Date.now();
+        }
+      } catch (e) {}
+    }, 2500);
+
+    /* preferCanvas false: tile/img renderer composites more reliably with plan HTML overlays in Qt WebEngine. */
+    if (typeof L === 'undefined') {
+      document.title = 'VGCS_ASSET_ERROR:leaflet_missing:' + Date.now();
+      throw new Error('Leaflet missing');
+    }
+    const map = L.map('map2d', {
+      zoomControl: false,
+      preferCanvas: false,
+      // Qt WebEngine: disabling these animations significantly improves pan smoothness.
+      fadeAnimation: false,
+      zoomAnimation: false,
+      markerZoomAnimation: false,
+    }).setView([24.7136, 46.6753], 10);
+    L.control.zoom({ position: 'bottomleft' }).addTo(map);
+    const linkBanner = document.getElementById('linkBanner');
+    const linkBannerLogo = document.getElementById('linkBannerLogo');
+    if (linkBannerLogo && linkBannerLogo.getAttribute('src')) {
+      linkBannerLogo.style.display = 'block';
+    }
+    // If header icon assets are missing (src empty), force deterministic text fallbacks.
+    function ensureIconFallback(imgId, fallbackId) {
+      try {
+        const img = document.getElementById(imgId);
+        const fb = document.getElementById(fallbackId);
+        if (!img || !fb) return 0;
+        const src = String(img.getAttribute('src') || '').trim();
+        if (!src) {
+          img.style.display = 'none';
+          fb.style.display = 'inline';
+          return 1;
+        }
+      } catch (e) {}
+      return 0;
+    }
+    ensureIconFallback('hdrGpsIcon', 'hdrGpsEmoji');
+    ensureIconFallback('hdrBatIcon', 'hdrBatEmoji');
+    try { console.log('[diag] map boot: baseUrl=' + String(document.baseURI || '')); } catch(e) {}
+    if (linkBanner) {
+      linkBanner.style.cursor = 'pointer';
+      linkBanner.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const target = ev.target;
+        if (target && target.id === 'linkBannerLogo') {
+          document.title = 'VGCS_MENU_REQUEST:' + ev.clientX + ':' + ev.clientY + ':' + Date.now();
+        } else {
+          document.title = 'VGCS_CONNECT_REQUEST:' + Date.now();
+        }
+      });
+    }
+    const actionTakeoff = document.getElementById('actionTakeoff');
+    if (actionTakeoff) {
+      actionTakeoff.classList.add('disabled');
+      actionTakeoff.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_TAKEOFF_REQUEST:' + Date.now();
+      });
+    }
+    const actionReturn = document.getElementById('actionReturn');
+    if (actionReturn) {
+      actionReturn.classList.add('disabled');
+      actionReturn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_RETURN_REQUEST:' + Date.now();
+      });
+    }
+    const planLayer = document.getElementById('planFlightLayer');
+    const planStartMissionBtn = document.getElementById('planStartMissionBtn');
+    const planMissionSectionHeader = document.getElementById('planMissionSectionHeader');
+    const hdrMapModeBtn = document.getElementById('hdrMapModeBtn');
+    const planExit = document.getElementById('planExit');
+    if (planExit) {
+      planExit.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        setPlanFlightVisible(false);
+        document.title = 'VGCS_PLAN_EXIT:' + Date.now();
+      });
+    }
+    // These must be initialized before any panel binding runs (TDZ-safe).
+    let vehicleMarker = null;
+    let waypoints = [];
+    bindPlanFlyoutActions();
+    bindPlanRightTabs();
+    bindPlanMissionPanel();
+    bindPlanStackTabs();
+    setPlanSequenceTemplate('');
+    setPlanFlightChromeState(false, 0);
+    if (planLayer) {
+      for (const btn of planLayer.querySelectorAll('.planToolBtn')) {
+        btn.addEventListener('click', function() {
+          const tool = btn.getAttribute('data-tool') || '';
+          setPlanRailTool(tool);
+          document.title = 'VGCS_PLAN_TOOL_REQUEST:' + tool + ':' + Date.now();
+        });
+      }
+    }
+    if (planStartMissionBtn) {
+      planStartMissionBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_MISSION_START_REQUEST:' + Date.now();
+      });
+    }
+    if (planMissionSectionHeader) {
+      const onMissionHeaderStart = function(ev) {
+        if (!window.__planMissionStartStack) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        openMissionStartDetails();
+      };
+      planMissionSectionHeader.addEventListener('click', onMissionHeaderStart);
+      planMissionSectionHeader.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') onMissionHeaderStart(ev);
+      });
+    }
+    const planSeqRtlBtn = document.getElementById('planSeqRtlBtn');
+    if (planSeqRtlBtn) {
+      planSeqRtlBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_RETURN_REQUEST:' + Date.now();
+      });
+    }
+    const planSetLaunchMapCenterBtn = document.getElementById('planSetLaunchMapCenterBtn');
+    if (planSetLaunchMapCenterBtn) {
+      planSetLaunchMapCenterBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!map) return;
+        const c = map.getCenter();
+        const latEl = document.getElementById('planLaunchLatVal');
+        const lonEl = document.getElementById('planLaunchLonVal');
+        if (latEl) latEl.textContent = c.lat.toFixed(7);
+        if (lonEl) lonEl.textContent = c.lng.toFixed(7);
+        schedulePlanMissionPanelEmit();
+        updateLaunchMarkerFromPanel();
+      });
+    }
+    if (hdrMapModeBtn) {
+      hdrMapModeBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        document.title = 'VGCS_TOGGLE_3D_REQUEST:' + Date.now();
+      });
+    }
+    const cameraRail = document.getElementById('cameraRail');
+    const camVideoBtn = document.getElementById('camVideoBtn');
+    const camPhotoBtn = document.getElementById('camPhotoBtn');
+    const camRecordBtn = document.getElementById('camRecordBtn');
+    const camSettingsBtn = document.getElementById('camSettingsBtn');
+    const camTimer = document.getElementById('camTimer');
+    const videoPreview = document.getElementById('videoPreview');
+    const videoPreviewImg = document.getElementById('videoPreviewImg');
+    const videoPreviewPlaceholder = document.getElementById('videoPreviewPlaceholder');
+    let camTimerId = null;
+    let camRecordStartedAt = 0;
+    function formatRecordTime(seconds) {
+      const s = Math.max(0, Number(seconds) || 0);
+      const hh = String(Math.floor(s / 3600)).padStart(2, '0');
+      const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+      const ss = String(Math.floor(s % 60)).padStart(2, '0');
+      return `${hh}:${mm}:${ss}`;
+    }
+    function resetCameraTimer() {
+      if (camTimerId) {
+        clearInterval(camTimerId);
+        camTimerId = null;
+      }
+      camRecordStartedAt = 0;
+      if (camRecordBtn) camRecordBtn.classList.remove('recording');
+      if (camTimer) camTimer.textContent = '00:00:00';
+    }
+    let __cameraChromeLinkOk = false;
+    function syncCameraChromeVisibility() {
+      if (!cameraRail) return 0;
+      const inPlan = isPlanFlightLayerVisible();
+      const show = __cameraChromeLinkOk && !inPlan;
+      cameraRail.style.display = show ? 'flex' : 'none';
+      if (videoPreview) videoPreview.style.display = show ? 'block' : 'none';
+      if (!show) resetCameraTimer();
+      return 1;
+    }
+    function setCameraControlsVisible(enabled) {
+      __cameraChromeLinkOk = !!enabled;
+      return syncCameraChromeVisibility();
+    }
+    function setVideoPreviewImage(dataUrl) {
+      if (!videoPreviewImg || !videoPreviewPlaceholder) return 0;
+      const src = String(dataUrl || '').trim();
+      if (!src) {
+        videoPreviewImg.removeAttribute('src');
+        videoPreviewPlaceholder.style.display = 'flex';
+        return 1;
+      }
+      videoPreviewImg.src = src;
+      videoPreviewPlaceholder.style.display = 'none';
+      return 1;
+    }
+    if (camVideoBtn) {
+      camVideoBtn.classList.add('active');
+      camVideoBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        camVideoBtn.classList.add('active');
+        if (camPhotoBtn) camPhotoBtn.classList.remove('active');
+      });
+    }
+    if (camPhotoBtn) {
+      camPhotoBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        camPhotoBtn.classList.add('active');
+        if (camVideoBtn) camVideoBtn.classList.remove('active');
+      });
+    }
+    if (camRecordBtn) {
+      camRecordBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const now = Date.now();
+        if (camRecordBtn.classList.contains('recording')) {
+          resetCameraTimer();
+          return;
+        }
+        camRecordBtn.classList.add('recording');
+        camRecordStartedAt = now;
+        if (camTimer) camTimer.textContent = '00:00:00';
+        if (camTimerId) clearInterval(camTimerId);
+        camTimerId = setInterval(() => {
+          if (!camTimer || !camRecordStartedAt) return;
+          const elapsedSec = Math.floor((Date.now() - camRecordStartedAt) / 1000);
+          camTimer.textContent = formatRecordTime(elapsedSec);
+        }, 250);
+      });
+    }
+    if (camSettingsBtn) {
+      camSettingsBtn.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        camSettingsBtn.classList.add('active');
+        setTimeout(() => camSettingsBtn.classList.remove('active'), 200);
+      });
+    }
+    let tileLayer = null;
+    let labelLayer = null;
+    let __tileErrorCount = 0;
+    let __tileErrorLastSignalAt = 0;
+    window.__lowSpec = false;
+    window.__tileTemplate = '';
+    window.__tileAttribution = '';
+    window.__tileMaxZoom = 19;
+    window.__tilePlaceholderDetected = false;
+    window.__tilePlaceholderLastSignalAt = 0;
+    const LABELS_TEMPLATE_ESRI =
+      'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}';
+    function setTileSource(urlTemplate, attribution, maxZoom) {
+      if (tileLayer) map.removeLayer(tileLayer);
+      if (labelLayer) map.removeLayer(labelLayer);
+      const mz = maxZoom || 19;
+      __tileErrorCount = 0;
+      window.__tileTemplate = urlTemplate || '';
+      try { window.__lastTileTemplate = window.__tileTemplate; } catch(e) {}
+      window.__tileAttribution = attribution || '';
+      window.__tileMaxZoom = mz;
+      const low = !!window.__lowSpec;
+      const effectiveMz = low ? Math.min(mz, 17) : mz;
+      tileLayer = L.tileLayer(urlTemplate, {
+        maxZoom: effectiveMz,
+        attribution: attribution || '',
+        // Performance: reduce tile churn while panning/zooming in Qt WebEngine.
+        updateWhenIdle: true,
+        updateWhenZooming: false,
+        // Smaller buffer = fewer tiles kept/decoded during pans.
+        keepBuffer: low ? 1 : 2,
+        // Throttle tile updates a bit to keep panning responsive.
+        updateInterval: low ? 260 : 140,
+        // Avoid higher-res tile fetches that can double work.
+        detectRetina: false
+      }).addTo(map);
+      try { console.log('[diag] tileSource=' + String(window.__tileTemplate || '') + ' mz=' + String(effectiveMz)); } catch(e) {}
+      // Detect Esri "Map data not yet available" placeholder tiles (HTTP 200 with gray image).
+      // These do not trigger tileerror, but make the map unusable on some client networks.
+      try {
+        const checkPlaceholder = (img) => {
+          try {
+            if (!img || window.__tilePlaceholderDetected) return 0;
+            const tmpl = String(window.__tileTemplate || '');
+            if (!tmpl.includes('arcgisonline.com')) return 0;
+            const c = document.createElement('canvas');
+            c.width = 32; c.height = 32;
+            const ctx = c.getContext('2d', { willReadFrequently: true });
+            if (!ctx) return 0;
+            ctx.drawImage(img, 0, 0, 32, 32);
+            const d = ctx.getImageData(0, 0, 32, 32).data;
+            let sum = 0, sum2 = 0;
+            for (let i = 0; i < d.length; i += 4 * 8) {
+              const r = d[i], g = d[i + 1], b = d[i + 2];
+              const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+              sum += y;
+              sum2 += y * y;
+            }
+            const n = (d.length / (4 * 8));
+            const mean = sum / n;
+            const varY = (sum2 / n) - (mean * mean);
+            if (mean > 150 && mean < 235 && varY < 120) {
+              window.__tilePlaceholderDetected = true;
+              const now = Date.now();
+              if ((now - window.__tilePlaceholderLastSignalAt) > 8000) {
+                window.__tilePlaceholderLastSignalAt = now;
+                try { document.title = 'VGCS_TILE_PLACEHOLDER:' + now; } catch (e) {}
+              }
+              try {
+                setTileSource('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}', 'Tiles © Esri', 19);
+              } catch (e2) {}
+              return 1;
+            }
+          } catch (e) {}
+          return 0;
+        };
+        tileLayer.on('tileload', function(ev) {
+          try { checkPlaceholder(ev && ev.tile); } catch (e) {}
+        });
+      } catch (ePH) {}
+      try {
+        tileLayer.on('tileerror', function() {
+          __tileErrorCount += 1;
+          const now = Date.now();
+          if (__tileErrorCount >= 10 && (now - __tileErrorLastSignalAt) > 8000) {
+            __tileErrorLastSignalAt = now;
+            document.title = 'VGCS_TILE_ERROR:' + now;
+          }
+        });
+      } catch (e) {}
+      // Rate-limited diagnostics to help identify "blocked" vs "offline" cases.
+      try {
+        window.__diag = window.__diag || {err:0, ok:0, last:0};
+        tileLayer.on('tileload', function() {
+          window.__diag.ok += 1;
+          const now = Date.now();
+          if (now - window.__diag.last > 5000) {
+            window.__diag.last = now;
+            try { console.log('[diag] tiles ok=' + window.__diag.ok + ' err=' + window.__diag.err); } catch(e) {}
+          }
+        });
+        tileLayer.on('tileerror', function(ev) {
+          window.__diag.err += 1;
+          if (window.__diag.err <= 3) {
+            try { console.log('[diag] tileerror url=' + String(ev && ev.tile && ev.tile.src || '')); } catch(e) {}
+          }
+          if (window.__diag.err === 3) {
+            try { console.log('[diag] many tile errors; likely blocked DNS/proxy/firewall. Consider Offline Tiles.'); } catch(e) {}
+          }
+        });
+      } catch (eDiag) {}
+      if (!low) {
+        // Add borders + place labels overlay (transparent tiles) to match client reference.
+        // Works best over satellite imagery; safe to keep enabled for other sources too.
+        try {
+          labelLayer = L.tileLayer(LABELS_TEMPLATE_ESRI, {
+            maxZoom: effectiveMz,
+            // Avoid fetching labels at very low zooms (saves a lot of requests).
+            minZoom: 3,
+            opacity: 0.9,
+            attribution: '',
+            updateWhenIdle: true,
+            updateWhenZooming: false,
+            keepBuffer: 1,
+            updateInterval: 180,
+            detectRetina: false,
+            pane: 'overlayPane'
+          }).addTo(map);
+          try {
+            labelLayer.on('tileerror', function() {
+              __tileErrorCount += 1;
+              const now = Date.now();
+              if (__tileErrorCount >= 10 && (now - __tileErrorLastSignalAt) > 8000) {
+                __tileErrorLastSignalAt = now;
+                document.title = 'VGCS_TILE_ERROR:' + now;
+              }
+            });
+          } catch (e2) {}
+        } catch (e) {
+          labelLayer = null;
+        }
+        // Performance: hide labels while interacting, restore when idle.
+        // This avoids expensive compositing of semi-transparent tiles during drag.
+        try {
+          if (!window.__labelsPanHooked) {
+            window.__labelsPanHooked = true;
+            let __labelsRestoreT = null;
+            const hide = () => { try { if (labelLayer) labelLayer.setOpacity(0.0); } catch (e) {} };
+            const restoreSoon = () => {
+              try {
+                if (__labelsRestoreT) clearTimeout(__labelsRestoreT);
+                __labelsRestoreT = setTimeout(() => {
+                  try { if (labelLayer) labelLayer.setOpacity(0.9); } catch (e) {}
+                }, 140);
+              } catch (e) {}
+            };
+            map.on('movestart', hide);
+            map.on('zoomstart', hide);
+            map.on('moveend', restoreSoon);
+            map.on('zoomend', restoreSoon);
+          }
+          if (labelLayer) labelLayer.setOpacity(0.9);
+        } catch (e) {}
+      } else {
+        labelLayer = null;
+      }
+      return 1;
+    }
+
+    // Provide current map view + active tile template for Python-side probes.
+    try {
+      window.__vgcsGetMapView = function() {
+        try {
+          const c = map && map.getCenter ? map.getCenter() : { lat: 0, lng: 0 };
+          const z = map && map.getZoom ? map.getZoom() : 0;
+          return JSON.stringify({
+            z: Number(z) || 0,
+            lat: Number(c.lat) || 0,
+            lng: Number(c.lng) || 0,
+            template: String(window.__tileTemplate || '')
+          });
+        } catch (e) {
+          return JSON.stringify({ z: 0, lat: 0, lng: 0, template: String(window.__tileTemplate || '') });
+        }
+      };
+    } catch (e) {}
+
+    function setLowSpecMode(enabled) {
+      window.__lowSpec = !!enabled;
+      try {
+        if (window.__tileTemplate) {
+          setTileSource(window.__tileTemplate, window.__tileAttribution || '', window.__tileMaxZoom || 19);
+        }
+      } catch (e) {}
+      return window.__lowSpec ? 1 : 0;
+    }
+    // Choose a reliable default tile source for the current network.
+    const ESRI_SAT =
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+    const OSM =
+      'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+
+    function probeTile(urlTemplate, timeoutMs, cb) {
+      try {
+        const img = new Image();
+        let done = false;
+        const finish = (ok) => { if (done) return; done = true; try { cb(!!ok); } catch(e) {} };
+        const t = setTimeout(() => finish(false), Math.max(400, Number(timeoutMs) || 2200));
+        img.onload = () => { try { clearTimeout(t); } catch(e) {} finish(true); };
+        img.onerror = () => { try { clearTimeout(t); } catch(e) {} finish(false); };
+        // Use a low zoom tile that should exist everywhere.
+        const url = String(urlTemplate || '').replace('{z}','0').replace('{x}','0').replace('{y}','0').replace('{s}','a');
+        img.src = url;
+      } catch (e) {
+        try { cb(false); } catch(e2) {}
+      }
+    }
+
+    // Default to satellite imagery to match prior VGCS behavior.
+    // If the client network blocks imagery, user can switch to Streets or Offline Tiles.
+    setTileSource(
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      'Tiles © Esri',
+      19
+    );
+
+    // Same path as NativeTileMapView: tip (0,-28), base corners (±12,15), quad control (0,5);
+    // white stroke + #f02c34 fill + center dot; scale so pivot (0,0) sits at icon center for Leaflet/Cesium.
+    const VGCS_VEHICLE_MARKER_SVG =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">' +
+      '<g transform="translate(15,15) scale(0.53571429)">' +
+      '<path d="M 0 -28 L -12 15 Q 0 5 12 15 Z" fill="#f02c34" stroke="#ffffff" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>' +
+      '<circle cx="0" cy="1" r="2.4" fill="#ffffff"/>' +
+      '</g></svg>';
+    const vehicleMarkerSvg = VGCS_VEHICLE_MARKER_SVG;
+    vehicleMarker = L.marker([24.7136, 46.6753], {
+      icon: L.divIcon({
+        className: 'vgcs-vehicle-marker',
+        html: '<div class="vgcs-vehicle-marker-inner">' + vehicleMarkerSvg + '</div>',
+        iconSize: [30, 30],
+        iconAnchor: [15, 15]
+      }),
+      interactive: false,
+      keyboard: false
+    }).addTo(map);
+    let headingLine = L.polyline([], {
+      color: '#ff7700',
+      weight: 5,
+      opacity: 0.95,
+      lineCap: 'round',
+      lineJoin: 'round'
+    }).addTo(map);
+    let missionRoute = L.polyline([], {
+      color: '#ef4444',
+      weight: 4,
+      opacity: 0.95,
+      interactive: false,
+      pane: 'overlayPane'
+    });
+    let flightTrack = L.polyline([], {
+      color: '#f97316',
+      weight: 2,
+      opacity: 0.55,
+      interactive: false
+    });
+    let __lastTrackLat = null;
+    let __lastTrackLon = null;
+    let addMode = false;
+    let addFenceMode = false;
+    let fencePoints = [];
+    let fencePolygon = null;
+    let viewer3d = null;
+    let vehicleEntity = null;
+    let headingEntity = null;
+    window.__lastVehLat = null;
+    window.__lastVehLon = null;
+    window.__is3d = false;
+    window.__heading = 0;
+    window.__3dHasInitialFocus = false;
+    window.__missionNavSeq = 0;
+    const HEADING_MIN_INTERVAL_MS = 125; // ~8 Hz max redraw
+    const VFR_HEADING_PRIORITY_MS = 1200; // ignore attitude yaw briefly after VFR_HUD
+    let __headingLastApplyMs = 0;
+    let __headingLastVfrMs = 0;
+    let __headingRafId = null;
+    let __headingPending = null;
+
+    function setLinkConnected(connected) {
+      try { console.log('[diag] setLinkConnected(' + String(!!connected) + ')'); } catch(e) {}
+      if (connected) {
+        setFlightStatus('yellow', 'Connected - Not Ready to Arm');
+      } else {
+        setFlightStatus('red', 'Communication lost - Not Ready to Arm');
+      }
+      return 1;
+    }
+
+    function setFlightStatus(state, detailText) {
+      const banner = document.getElementById('linkBanner');
+      const bannerText = document.getElementById('linkBannerText');
+      const disconnected = document.getElementById('linkBannerDisconnected');
+      const connectedRow = document.getElementById('linkBannerConnected');
+      if (!banner || !bannerText || !disconnected || !connectedRow) return 0;
+
+      const stateText = (state || '').toLowerCase();
+      const detail = detailText || '';
+      const isGreen = stateText === 'green';
+      const isYellow = stateText === 'yellow';
+      const isRed = stateText === 'red';
+      const connected = isGreen || isYellow;
+      setActionButtonsEnabled(connected);
+
+      if (connected) {
+        disconnected.style.display = 'none';
+        connectedRow.style.display = 'flex';
+      } else {
+        connectedRow.style.display = 'none';
+        disconnected.style.display = 'flex';
+      }
+
+      if (isGreen) {
+        bannerText.textContent = detail || 'Parameter downloading... Ready to Arm';
+        banner.style.background = 'rgba(24, 82, 38, 0.96)';
+        banner.style.borderColor = 'rgba(94, 214, 119, 0.95)';
+        banner.style.color = '#e8ffe8';
+      } else if (isYellow) {
+        bannerText.textContent = detail || 'Connected - Not Ready to Arm';
+        banner.style.background = 'rgba(120, 95, 24, 0.96)';
+        banner.style.borderColor = 'rgba(247, 211, 92, 0.95)';
+        banner.style.color = '#fff7dd';
+      } else {
+        bannerText.textContent = detail || 'Communication lost - Not Ready to Arm';
+        banner.style.background = 'rgba(124, 24, 24, 0.96)';
+        banner.style.borderColor = 'rgba(245, 99, 99, 0.95)';
+        banner.style.color = '#ffe8e8';
+      }
+      return 1;
+    }
+
+    function setActionButtonsEnabled(enabled) {
+      const takeoff = document.getElementById('actionTakeoff');
+      const ret = document.getElementById('actionReturn');
+      setCameraControlsVisible(enabled);
+      for (const el of [takeoff, ret]) {
+        if (!el) continue;
+        if (enabled) {
+          el.classList.remove('disabled');
+        } else {
+          el.classList.add('disabled');
+        }
+      }
+      return 1;
+    }
+
+    function getActivePlanTool() {
+      const layer = document.getElementById('planFlightLayer');
+      if (!layer) return 'File';
+      const act = layer.querySelector('.planToolBtn.active');
+      return (act && act.getAttribute('data-tool')) || 'File';
+    }
+    function updatePlanToolPanel(tool) {
+      const t = (tool || '').trim();
+      const fileFlyout = document.getElementById('planFileFlyout');
+      const other = document.getElementById('planOtherToolPanel');
+      const center = document.getElementById('planCenterPanel');
+      const isFile = t.toLowerCase() === 'file';
+      if (fileFlyout) fileFlyout.style.display = isFile ? 'block' : 'none';
+      // Match reference flow: selecting Survey/other tools dismisses file flyout panel.
+      if (center) center.style.display = isFile ? 'block' : 'none';
+      if (other) {
+        other.style.display = 'none';
+        const hint = document.getElementById('planOtherToolHint');
+        if (hint) {
+          const hints = {
+            Takeoff: 'Sends takeoff to the vehicle (same as dashboard) using Takeoff alt (m). Vehicle must be connected.',
+            Waypoint: 'Click on the map to place waypoints.',
+            ROI: 'Click on the map to add fence polygon vertices.',
+            Pattern: 'Pattern fills a survey grid from the current vehicle position.',
+            Return: 'Return / RTL uses the map Return control.',
+            Center: 'Centers the map on the vehicle.'
+          };
+          hint.textContent = hints[t] || 'Tool active.';
+        }
+      }
+    }
+    function setPlanRailTool(name) {
+      const layer = document.getElementById('planFlightLayer');
+      if (!layer) return 0;
+      const want = (name || '').trim();
+      if (want) window.__planRailTool = want;
+      if (want !== 'Waypoint') addMode = false;
+      if (want !== 'ROI') {
+        addFenceMode = false;
+        if (fencePoints && fencePoints.length > 0 && fencePoints.length < 3) {
+          fencePoints = [];
+          try {
+            if (fencePolygon) {
+              map.removeLayer(fencePolygon);
+              fencePolygon = null;
+            }
+          } catch (e) {}
+        }
+      }
+      for (const el of layer.querySelectorAll('.planToolBtn')) {
+        const t = el.getAttribute('data-tool') || '';
+        el.classList.toggle('active', t === want);
+      }
+      updatePlanToolPanel(want);
+      return 1;
+    }
+
+    function disablePlanEditModes() {
+      addMode = false;
+      addFenceMode = false;
+      if (fencePoints && fencePoints.length > 0 && fencePoints.length < 3) {
+        fencePoints = [];
+        try {
+          if (fencePolygon) {
+            map.removeLayer(fencePolygon);
+            fencePolygon = null;
+          }
+        } catch (e) {}
+      }
+    }
+    function setPlanFlightChromeState(linked, wpCount) {
+      const n = Math.max(0, Number(wpCount) || 0);
+      const has = n > 0;
+      const link = !!linked;
+      const upBar = document.getElementById('planBarUpload');
+      const vUp = document.getElementById('planVehicleUpload');
+      const vDown = document.getElementById('planVehicleDownload');
+      const sav = document.getElementById('planStorageSave');
+      const savAs = document.getElementById('planStorageSaveAs');
+      const kml = document.getElementById('planStorageKml');
+      if (vDown) vDown.disabled = !link;
+      if (vUp) vUp.disabled = !link || !has;
+      if (upBar) upBar.disabled = !link || !has;
+      if (sav) sav.disabled = !has;
+      if (savAs) savAs.disabled = !has;
+      if (kml) kml.disabled = !has;
+      return 1;
+    }
+    const PLAN_TAB_KEYS = ['mission', 'fence', 'rally'];
+    const PLAN_TAB_BTN_IDS = {
+      mission: 'planTabBtnMission',
+      fence: 'planTabBtnFence',
+      rally: 'planTabBtnRally'
+    };
+    function activatePlanTab(key) {
+      const k = PLAN_TAB_KEYS.indexOf(key) >= 0 ? key : 'mission';
+      const tabs = document.querySelectorAll('#planTabs .planTab');
+      const bodies = {
+        mission: document.getElementById('planTabPanelMission'),
+        fence: document.getElementById('planTabPanelFence'),
+        rally: document.getElementById('planTabPanelRally'),
+      };
+      for (const tab of tabs) {
+        const id = tab.getAttribute('data-plan-tab') || '';
+        const on = id === k;
+        tab.classList.toggle('active', on);
+        tab.setAttribute('aria-selected', on ? 'true' : 'false');
+        tab.setAttribute('tabindex', on ? '0' : '-1');
+      }
+      for (const name of PLAN_TAB_KEYS) {
+        const el = bodies[name];
+        if (!el) continue;
+        if (name === k) {
+          el.removeAttribute('hidden');
+        } else {
+          el.setAttribute('hidden', '');
+        }
+      }
+      return 1;
+    }
+    function bindPlanRightTabs() {
+      const tablist = document.getElementById('planTabs');
+      if (!tablist) return;
+      const tabs = tablist.querySelectorAll('.planTab');
+      for (const tab of tabs) {
+        tab.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const el = ev.currentTarget;
+          const key = el.getAttribute('data-plan-tab') || 'mission';
+          activatePlanTab(key);
+          try {
+            el.focus({ preventScroll: true });
+          } catch (e) {
+            el.focus();
+          }
+        });
+        tab.addEventListener('keydown', function(ev) {
+          const cur = ev.currentTarget.getAttribute('data-plan-tab') || 'mission';
+          let idx = PLAN_TAB_KEYS.indexOf(cur);
+          if (idx < 0) idx = 0;
+          if (ev.key === 'ArrowRight' || ev.key === 'ArrowDown') {
+            ev.preventDefault();
+            idx = (idx + 1) % PLAN_TAB_KEYS.length;
+            activatePlanTab(PLAN_TAB_KEYS[idx]);
+            const nextBtn = document.getElementById(PLAN_TAB_BTN_IDS[PLAN_TAB_KEYS[idx]]);
+            if (nextBtn) nextBtn.focus();
+          } else if (ev.key === 'ArrowLeft' || ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            idx = (idx + PLAN_TAB_KEYS.length - 1) % PLAN_TAB_KEYS.length;
+            activatePlanTab(PLAN_TAB_KEYS[idx]);
+            const nextBtn = document.getElementById(PLAN_TAB_BTN_IDS[PLAN_TAB_KEYS[idx]]);
+            if (nextBtn) nextBtn.focus();
+          } else if (ev.key === 'Home') {
+            ev.preventDefault();
+            activatePlanTab('mission');
+            const b = document.getElementById('planTabBtnMission');
+            if (b) b.focus();
+          } else if (ev.key === 'End') {
+            ev.preventDefault();
+            activatePlanTab('rally');
+            const b = document.getElementById('planTabBtnRally');
+            if (b) b.focus();
+          }
+        });
+      }
+    }
+    function bindPlanFlyoutActions() {
+      const mapActionBtn = (id, action) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (el.disabled) return;
+          document.title = 'VGCS_PLAN_ACTION:' + action + ':' + Date.now();
+        });
+      };
+      mapActionBtn('planBarUpload', 'bar_upload');
+      mapActionBtn('planStorageOpen', 'open');
+      mapActionBtn('planStorageSave', 'save');
+      mapActionBtn('planStorageSaveAs', 'save_as');
+      mapActionBtn('planStorageKml', 'save_kml');
+      mapActionBtn('planVehicleUpload', 'vehicle_upload');
+      mapActionBtn('planVehicleDownload', 'vehicle_download');
+      mapActionBtn('planVehicleClear', 'vehicle_clear');
+      mapActionBtn('planFenceRoiBtn', 'fence_roi_tool');
+      const tpl = [
+        ['planTplEmpty', 'template_empty'],
+        ['planTplSurvey', 'template_survey'],
+        ['planTplCorridor', 'template_corridor'],
+        ['planTplStructure', 'template_structure']
+      ];
+      for (const [eid, act] of tpl) {
+        const node = document.getElementById(eid);
+        if (!node) continue;
+        node.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          document.title = 'VGCS_PLAN_ACTION:' + act + ':' + Date.now();
+        });
+      }
+    }
+    function clearLaunchMarker() {}
+
+    function isPlanFlightLayerVisible() {
+      const layer = document.getElementById('planFlightLayer');
+      if (!layer || !window.getComputedStyle) return false;
+      return window.getComputedStyle(layer).display !== 'none';
+    }
+
+    function updateLaunchMarkerFromPanel() {
+      clearLaunchMarker();
+    }
+
+    function setPlanFlightVisible(visible) {
+      const layer = document.getElementById('planFlightLayer');
+      const hud = document.getElementById('mapFooterHud');
+      if (!layer) return 0;
+      layer.style.display = visible ? 'block' : 'none';
+      if (hud) {
+        hud.style.display = visible ? 'none' : '';
+        hud.setAttribute('aria-hidden', visible ? 'true' : 'false');
+      }
+      syncCameraChromeVisibility();
+      if (!visible) {
+        clearLaunchMarker();
+      } else {
+        const w = window.__planRailTool && String(window.__planRailTool).trim();
+        if (w) {
+          setPlanRailTool(w);
+        } else {
+          updatePlanToolPanel(getActivePlanTool());
+        }
+        updateLaunchMarkerFromPanel();
+      }
+      return 1;
+    }
+
+    function setPlanFlightMetrics(metrics) {
+      if (!metrics || typeof metrics !== 'object') return 0;
+      const setTxt = (id, value) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = String(value ?? '');
+      };
+      setTxt('pfAltDiff', metrics.altDiffFt ?? '0.0 ft');
+      setTxt('pfGradient', metrics.gradient ?? '-.-');
+      setTxt('pfAzimuth', metrics.azimuth ?? '0');
+      setTxt('pfHeading', metrics.heading ?? 'nan');
+      setTxt('pfDistPrevWp', metrics.distPrevWpFt ?? '0.0 ft');
+      setTxt('pfMissionDistance', metrics.missionDistanceFt ?? '0 ft');
+      setTxt('pfMissionTime', metrics.missionTime ?? '00:00:00');
+      setTxt('pfMaxTelemDist', metrics.maxTelemDistFt ?? '0 ft');
+      return 1;
+    }
+
+    let planMissionEmitTimer = null;
+    function ftToM(ft) { return (Number(ft) || 0) * 0.3048; }
+    function mToFt(m) { return (Number(m) || 0) / 0.3048; }
+    function mphToMps(mph) { return (Number(mph) || 0) * 0.44704; }
+    function mpsToMph(mps) { return (Number(mps) || 0) / 0.44704; }
+
+    function ensurePlanWpMetaLen(n) {
+      const nn = Math.max(0, Number(n) || 0);
+      if (!Array.isArray(window.__planWpMeta)) window.__planWpMeta = [];
+      const initEl = document.getElementById('planInitialWpAltInput');
+      const hoverEl = document.getElementById('planHoverSpeedInput');
+      const baseAltM = ftToM(initEl ? initEl.value : 164.0);
+      const baseSpdMps = mphToMps(hoverEl ? hoverEl.value : 11.18);
+      while (window.__planWpMeta.length < nn) {
+        window.__planWpMeta.push({ alt_m: baseAltM, speed_mps: baseSpdMps });
+      }
+      if (window.__planWpMeta.length > nn) {
+        window.__planWpMeta = window.__planWpMeta.slice(0, nn);
+      }
+    }
+
+    function renderPlanWpDetails() {
+      const host = document.getElementById('planWpDetails');
+      const list = document.getElementById('planWpDetailsList');
+      if (!host || !list) return 0;
+      const n = waypoints ? waypoints.length : 0;
+      ensurePlanWpMetaLen(n);
+      if (n <= 0) {
+        host.style.display = 'none';
+        list.innerHTML = '';
+        return 1;
+      }
+      host.style.display = '';
+      const launchAltEl = document.getElementById('planLaunchAltInput');
+      const rawLaunch = launchAltEl ? String(launchAltEl.value || '') : '';
+      const lx = parseFloat(rawLaunch.replace(',', '.'));
+      const launchFtStr = Number.isFinite(lx) ? lx.toFixed(1) : '0.0';
+      let html = '';
+      html +=
+        '<div class="planWpRow planWpRow--start" data-wp-start="1">' +
+          '<div class="planWpLabel">Start</div>' +
+          '<div class="planWpFields">' +
+            '<div class="planWpField"><input class="planWpStartAlt" type="text" inputmode="decimal" value="' + launchFtStr + '"/><span class="planWpUnit">ft</span></div>' +
+            '<div class="planWpStartHint">Takeoff / launch altitude (0 = use WP1 for takeoff).</div>' +
+          '</div>' +
+        '</div>';
+      for (let i = 0; i < n; i++) {
+        const m = window.__planWpMeta[i] || {};
+        const altFt = mToFt(m.alt_m ?? ftToM(164));
+        const spdMph = mpsToMph(m.speed_mps ?? mphToMps(11.18));
+        html +=
+          '<div class="planWpRow" data-wp-idx="' + i + '">' +
+            '<div class="planWpLabel">WP ' + (i+1) + '</div>' +
+            '<div class="planWpFields">' +
+              '<div class="planWpField"><input class="planWpAlt" type="text" inputmode="decimal" value="' + altFt.toFixed(1) + '"/><span class="planWpUnit">ft</span></div>' +
+              '<div class="planWpField"><input class="planWpSpd" type="text" inputmode="decimal" value="' + spdMph.toFixed(1) + '"/><span class="planWpUnit">mph</span></div>' +
+            '</div>' +
+          '</div>';
+      }
+      list.innerHTML = html;
+      const startAltIn = list.querySelector('.planWpStartAlt');
+      if (startAltIn && launchAltEl) {
+        const onStartAlt = () => {
+          if (window.__planPanelSuppressEmit) return;
+          const num = (v, d) => {
+            const x = parseFloat(String(v || '').replace(',', '.'));
+            return Number.isFinite(x) ? x : d;
+          };
+          const ft = num(startAltIn.value, 0);
+          launchAltEl.value = String(ft);
+          schedulePlanMissionPanelEmit();
+        };
+        startAltIn.addEventListener('input', onStartAlt);
+        startAltIn.addEventListener('change', onStartAlt);
+      }
+      for (const row of list.querySelectorAll('.planWpRow[data-wp-idx]')) {
+        const idx = Number(row.getAttribute('data-wp-idx') || '0') || 0;
+        const altIn = row.querySelector('.planWpAlt');
+        const spdIn = row.querySelector('.planWpSpd');
+        const onChange = () => {
+          if (window.__planPanelSuppressEmit) return;
+          const num = (v, d) => {
+            const x = parseFloat(String(v || '').replace(',', '.'));
+            return Number.isFinite(x) ? x : d;
+          };
+          ensurePlanWpMetaLen(waypoints.length);
+          const aFt = num(altIn && altIn.value, 164.0);
+          const sMph = num(spdIn && spdIn.value, 11.18);
+          window.__planWpMeta[idx] = {
+            alt_m: Math.max(1.0, ftToM(aFt)),
+            speed_mps: Math.max(0.1, mphToMps(sMph)),
+          };
+          schedulePlanMissionPanelEmit();
+        };
+        if (altIn) { altIn.addEventListener('input', onChange); altIn.addEventListener('change', onChange); }
+        if (spdIn) { spdIn.addEventListener('input', onChange); spdIn.addEventListener('change', onChange); }
+      }
+      return 1;
+    }
+    function schedulePlanMissionPanelEmit() {
+      if (window.__planPanelSuppressEmit) return;
+      if (planMissionEmitTimer) clearTimeout(planMissionEmitTimer);
+      planMissionEmitTimer = setTimeout(emitPlanMissionPanel, 320);
+    }
+    function emitPlanMissionPanel() {
+      if (window.__planPanelSuppressEmit) return;
+      planMissionEmitTimer = null;
+      const sel = document.getElementById('planAltReferenceSelect');
+      const initEl = document.getElementById('planInitialWpAltInput');
+      const hoverEl = document.getElementById('planHoverSpeedInput');
+      const launchAltEl = document.getElementById('planLaunchAltInput');
+      const latEl = document.getElementById('planLaunchLatVal');
+      const lonEl = document.getElementById('planLaunchLonVal');
+      const num = (v, d) => {
+        const x = parseFloat(String(v || '').replace(',', '.'));
+        return Number.isFinite(x) ? x : d;
+      };
+      const data = {
+        altRef: sel ? String(sel.value || 'rel') : 'rel',
+        initialWpAltFt: num(initEl && initEl.value, 164),
+        hoverMph: num(hoverEl && hoverEl.value, 11.18),
+        launchAltFt: num(launchAltEl && launchAltEl.value, 0),
+        launchLat: latEl ? String(latEl.textContent || '').trim() : '',
+        launchLon: lonEl ? String(lonEl.textContent || '').trim() : '',
+      };
+      if (Array.isArray(window.__planWpMeta)) {
+        data.wpMeta = window.__planWpMeta.map((m) => ({
+          alt_m: Number(m && m.alt_m) || 0,
+          speed_mps: Number(m && m.speed_mps) || 0,
+        }));
+      }
+      try {
+        const js = JSON.stringify(data);
+        document.title = 'VGCS_PLAN_MISSION_PANEL:' + btoa(unescape(encodeURIComponent(js)));
+      } catch (e) {}
+    }
+    function setPlanSequenceTemplate(templateId) {
+      const row = document.getElementById('planSeqPatternRow');
+      const label = document.getElementById('planSeqPatternLabel');
+      const missionPanel = document.getElementById('planTabPanelMission');
+      const missionHeader = document.getElementById('planMissionSectionHeader');
+      const compactList = document.getElementById('planSeqCompactList');
+      const compactSurveyLabel = document.getElementById('planSeqCompactSurveyLabel');
+      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
+      const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
+      const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
+      const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
+      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
+      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
+      const takeoffDesc = document.querySelector('#planTabPanelMission .planSeqCardDesc');
+      const startMissionBtn = document.getElementById('planStartMissionBtn');
+      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
+      if (!row || !label) return 0;
+      const t = String(templateId || '').toLowerCase().trim();
+      const labels = {
+        survey: 'Survey',
+        corridor: 'Corridor Scan',
+        structure: 'Structure Scan'
+      };
+      row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
+      const isEmpty = !t || !labels[t];
+      const isSurveyMode = t === 'survey';
+      window.__planMissionStartStack = !!isSurveyMode;
+      if (missionPanel) {
+        missionPanel.classList.toggle('planMissionEmpty', isEmpty || isSurveyMode);
+        missionPanel.classList.toggle('planMissionStack', isSurveyMode);
+      }
+      if (compactList) compactList.setAttribute('aria-hidden', isSurveyMode ? 'false' : 'true');
+      if (compactSurveyLabel && labels[t]) compactSurveyLabel.textContent = labels[t];
+      if (compactSurveyBody && labels[t]) compactSurveyBody.textContent = labels[t] + ' pattern selected.';
+      if (missionHeader) missionHeader.textContent = (isEmpty || isSurveyMode) ? 'Mission Start' : 'Mission';
+      // Hard show/hide to keep Survey state stable regardless CSS cache/state.
+      if (takeoffHead) takeoffHead.style.display = (isEmpty || isSurveyMode) ? 'none' : '';
+      if (takeoffDesc) takeoffDesc.style.display = (isEmpty || isSurveyMode) ? 'none' : '';
+      if (seqRtlBtn) seqRtlBtn.style.display = isSurveyMode ? 'none' : (isEmpty ? 'none' : '');
+      // Keep Start Mission visible regardless of template state.
+      if (startMissionBtn) startMissionBtn.style.display = '';
+      if (compactList) compactList.style.display = isSurveyMode ? 'flex' : 'none';
+      if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
+      if (compactTakeoff) compactTakeoff.classList.remove('is-active');
+      if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
+      if (compactRtlTab) compactRtlTab.classList.remove('is-active');
+      if (compactSurveyBody) compactSurveyBody.classList.remove('is-active');
+      if (compactRtlBody) compactRtlBody.classList.remove('is-active');
+      if (!t || !labels[t]) {
+        return 1;
+      }
+      label.textContent = labels[t];
+      row.classList.add('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
+      setPlanStackTab('takeoff');
+      return 1;
+    }
+    function setPlanStackTab(name) {
+      const missionPanel = document.getElementById('planTabPanelMission');
+      if (!missionPanel) return 0;
+      missionPanel.classList.remove('planMissionDetailsOpen');
+      const tab = String(name || 'takeoff').toLowerCase();
+      const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
+      const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
+      const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
+      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
+      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
+      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
+      const vehicleDetails = document.getElementById('planVehicleDetails');
+      const launchDetails = document.getElementById('planLaunchDetails');
+      if (compactTakeoffTab) compactTakeoffTab.classList.toggle('is-active', tab === 'takeoff');
+      if (compactTakeoff) compactTakeoff.classList.toggle('is-active', tab === 'takeoff');
+      if (compactSurveyTab) compactSurveyTab.classList.toggle('is-active', tab === 'survey');
+      if (compactRtlTab) compactRtlTab.classList.toggle('is-active', tab === 'rtl');
+      if (compactSurveyBody) compactSurveyBody.classList.toggle('is-active', tab === 'survey');
+      if (compactRtlBody) compactRtlBody.classList.toggle('is-active', tab === 'rtl');
+      // Keep visibility deterministic even if cached CSS state is stale.
+      if (compactTakeoff) compactTakeoff.style.display = (tab === 'takeoff') ? 'block' : 'none';
+      if (compactSurveyBody) compactSurveyBody.style.display = (tab === 'survey') ? 'block' : 'none';
+      if (compactRtlBody) compactRtlBody.style.display = (tab === 'rtl') ? 'block' : 'none';
+      if (takeoffBody) takeoffBody.style.display = 'none';
+      if (vehicleDetails) vehicleDetails.style.display = 'none';
+      if (launchDetails) launchDetails.style.display = 'none';
+      return 1;
+    }
+    function bindPlanStackTabs() {
+      const takeoff = document.getElementById('planSeqCompactTakeoffTab');
+      const survey = document.getElementById('planSeqCompactSurveyTab');
+      const rtl = document.getElementById('planSeqCompactRtlTab');
+      const bind = (el, tab) => {
+        if (!el) return;
+        const onAct = (ev) => {
+          if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+          setPlanStackTab(tab);
+        };
+        el.addEventListener('click', onAct);
+        el.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') onAct(ev);
+        });
+      };
+      bind(takeoff, 'takeoff');
+      bind(survey, 'survey');
+      bind(rtl, 'rtl');
+    }
+    function openMissionStartDetails() {
+      const missionPanel = document.getElementById('planTabPanelMission');
+      const missionHeader = document.getElementById('planMissionSectionHeader');
+      const compactList = document.getElementById('planSeqCompactList');
+      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
+      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
+      const vehicleDetails = document.getElementById('planVehicleDetails');
+      const launchDetails = document.getElementById('planLaunchDetails');
+      const row = document.getElementById('planSeqPatternRow');
+      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
+      const startMissionBtn = document.getElementById('planStartMissionBtn');
+      const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
+      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
+      if (!missionPanel) return 0;
+      // Keep stack layout so Takeoff/Survey/RTL tabs preserve their existing UI.
+      missionPanel.classList.add('planMissionStack');
+      missionPanel.classList.remove('planMissionEmpty');
+      missionPanel.classList.add('planMissionDetailsOpen');
+      if (missionHeader) missionHeader.textContent = 'Mission Start';
+      if (compactList) {
+        // Keep plan step tabs visible while Mission Start details are open.
+        compactList.style.display = 'flex';
+        compactList.setAttribute('aria-hidden', 'false');
+      }
+      if (takeoffHead) takeoffHead.style.display = 'none';
+      if (takeoffBody) takeoffBody.style.display = '';
+      if (vehicleDetails) vehicleDetails.style.display = '';
+      if (launchDetails) launchDetails.style.display = '';
+      if (row) row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
+      if (seqRtlBtn) seqRtlBtn.style.display = 'none';
+      if (startMissionBtn) startMissionBtn.style.display = '';
+      // Show tabs only (no expanded compact detail card) while editing mission details.
+      if (compactTakeoff) compactTakeoff.style.display = 'none';
+      if (compactSurveyBody) compactSurveyBody.style.display = 'none';
+      if (compactRtlBody) compactRtlBody.style.display = 'none';
+      window.__planMissionStartStack = true;
+      return 1;
+    }
+    function setPlanMissionStartStack(enabled, surveyLabel) {
+      const missionPanel = document.getElementById('planTabPanelMission');
+      const missionHeader = document.getElementById('planMissionSectionHeader');
+      const compactList = document.getElementById('planSeqCompactList');
+      const compactSurveyLabel = document.getElementById('planSeqCompactSurveyLabel');
+      const compactSurveyBody = document.getElementById('planSeqCompactSurveyBody');
+      const compactRtlBody = document.getElementById('planSeqCompactRtlBody');
+      const takeoffHead = document.querySelector('#planTabPanelMission .planSeqCardHead');
+      const takeoffDesc = document.querySelector('#planTabPanelMission .planSeqCardDesc');
+      const takeoffBody = document.querySelector('#planTabPanelMission .planSeqCardBody');
+      const vehicleDetails = document.getElementById('planVehicleDetails');
+      const launchDetails = document.getElementById('planLaunchDetails');
+      const startMissionBtn = document.getElementById('planStartMissionBtn');
+      const seqRtlBtn = document.getElementById('planSeqRtlBtn');
+      const row = document.getElementById('planSeqPatternRow');
+      const on = !!enabled;
+      window.__planMissionStartStack = on;
+      if (missionPanel) {
+        missionPanel.classList.toggle('planMissionEmpty', on);
+        missionPanel.classList.toggle('planMissionStack', on);
+        missionPanel.classList.toggle('planMissionDetailsOpen', on);
+      }
+      if (missionHeader) missionHeader.textContent = on ? 'Mission Start' : 'Mission';
+      if (takeoffHead) takeoffHead.style.display = on ? 'none' : '';
+      if (takeoffDesc) takeoffDesc.style.display = on ? 'none' : '';
+      if (seqRtlBtn) seqRtlBtn.style.display = on ? 'none' : '';
+      // Keep Start Mission visible in Mission tab for both normal and stack layouts.
+      if (startMissionBtn) startMissionBtn.style.display = '';
+      if (compactList) {
+        compactList.setAttribute('aria-hidden', on ? 'false' : 'true');
+        compactList.style.display = on ? 'flex' : 'none';
+      }
+      if (compactSurveyLabel) compactSurveyLabel.textContent = String(surveyLabel || 'Survey');
+      if (compactSurveyBody) compactSurveyBody.textContent = String(surveyLabel || 'Survey') + ' pattern selected.';
+      if (row && on) {
+        row.classList.remove('planSeqPatternRow--visible', 'planSeqPatternRow--focus');
+      }
+      if (on) {
+        // Mission Start keeps its original details UI; only append plan rows below.
+        const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
+        const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
+        const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
+        const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+        if (takeoffBody) takeoffBody.style.display = '';
+        if (vehicleDetails) vehicleDetails.style.display = '';
+        if (launchDetails) launchDetails.style.display = '';
+        if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
+        if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
+        if (compactRtlTab) compactRtlTab.classList.remove('is-active');
+        if (compactTakeoff) {
+          compactTakeoff.classList.remove('is-active');
+          compactTakeoff.style.display = 'none';
+        }
+        if (compactSurveyBody) {
+          compactSurveyBody.classList.remove('is-active');
+          compactSurveyBody.style.display = 'none';
+        }
+        if (compactRtlBody) {
+          compactRtlBody.classList.remove('is-active');
+          compactRtlBody.style.display = 'none';
+        }
+      } else {
+        missionPanel.classList.remove('planMissionDetailsOpen');
+        if (takeoffBody) takeoffBody.style.display = '';
+        if (vehicleDetails) vehicleDetails.style.display = '';
+        if (launchDetails) launchDetails.style.display = '';
+        if (compactSurveyBody) compactSurveyBody.classList.remove('is-active');
+        if (compactRtlBody) compactRtlBody.classList.remove('is-active');
+        const compactTakeoffTab = document.getElementById('planSeqCompactTakeoffTab');
+        const compactSurveyTab = document.getElementById('planSeqCompactSurveyTab');
+        const compactRtlTab = document.getElementById('planSeqCompactRtlTab');
+        const compactTakeoff = document.getElementById('planSeqCompactTakeoffCard');
+        if (compactTakeoffTab) compactTakeoffTab.classList.remove('is-active');
+        if (compactSurveyTab) compactSurveyTab.classList.remove('is-active');
+        if (compactRtlTab) compactRtlTab.classList.remove('is-active');
+        if (compactTakeoff) compactTakeoff.classList.remove('is-active');
+      }
+      return 1;
+    }
+    function applyPlanMissionPanelState(s) {
+      if (!s || typeof s !== 'object') return 0;
+      window.__planPanelSuppressEmit = true;
+      try {
+        const sel = document.getElementById('planAltReferenceSelect');
+        if (sel && s.altRef) sel.value = String(s.altRef);
+        const initEl = document.getElementById('planInitialWpAltInput');
+        if (initEl && s.initialWpAltFt != null) initEl.value = String(s.initialWpAltFt);
+        const hoverEl = document.getElementById('planHoverSpeedInput');
+        if (hoverEl && s.hoverMph != null) hoverEl.value = String(s.hoverMph);
+        const launchAltEl = document.getElementById('planLaunchAltInput');
+        if (launchAltEl && s.launchAltFt != null) launchAltEl.value = String(s.launchAltFt);
+        const latEl = document.getElementById('planLaunchLatVal');
+        const lonEl = document.getElementById('planLaunchLonVal');
+        const lt = s.launchLat != null ? String(s.launchLat).trim() : '';
+        const ln = s.launchLon != null ? String(s.launchLon).trim() : '';
+        if (latEl) latEl.textContent = lt || '—';
+        if (lonEl) lonEl.textContent = ln || '—';
+        updateLaunchMarkerFromPanel();
+        if (Array.isArray(s.wpMeta)) {
+          window.__planWpMeta = s.wpMeta.map((m) => ({
+            alt_m: Number(m && m.alt_m) || 0,
+            speed_mps: Number(m && m.speed_mps) || 0,
+          }));
+        }
+        renderPlanWpDetails();
+      } finally {
+        setTimeout(function() { window.__planPanelSuppressEmit = false; }, 0);
+      }
+      return 1;
+    }
+    function setPlanVehicleInfo(fw, veh) {
+      const a = document.getElementById('planVehicleFirmwareVal');
+      const b = document.getElementById('planVehicleTypeVal');
+      if (a) a.textContent = fw || '—';
+      if (b) b.textContent = veh || '—';
+      return 1;
+    }
+    function bindPlanMissionPanel() {
+      const sel = document.getElementById('planAltReferenceSelect');
+      if (sel) sel.addEventListener('change', schedulePlanMissionPanelEmit);
+      for (const id of ['planInitialWpAltInput', 'planHoverSpeedInput', 'planLaunchAltInput']) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        el.addEventListener('input', schedulePlanMissionPanelEmit);
+        el.addEventListener('change', schedulePlanMissionPanelEmit);
+      }
+      for (const id of ['planInitialWpAltInput', 'planHoverSpeedInput', 'planLaunchAltInput']) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        el.addEventListener('input', function() { renderPlanWpDetails(); });
+        el.addEventListener('change', function() { renderPlanWpDetails(); });
+      }
+      renderPlanWpDetails();
+    }
+
+    function centerOnVehicle() {
+      if (!vehicleMarker) return 0;
+      const p = vehicleMarker.getLatLng();
+      if (!p) return 0;
+      // 3D mode: SOFT follow — translate the camera by the vehicle's lon/lat delta and keep the
+      // user's current heading/pitch/range. We avoid `flyTo` here because it animates over ~0.6s
+      // and resets orientation every tick, which makes manual rotation impossible while the
+      // "Follow" toggle is on. We also pause entirely for AUTO_FOLLOW_USER_HOLD_MS after any
+      // real user input on the Cesium canvas so drags / wheel / touch aren't fought.
+      if (window.__is3d) {
+        try {
+          if (!viewer3d || !window.Cesium) return 0;
+          const holdMs = Number(window.__AUTO_FOLLOW_USER_HOLD_MS || 5000);
+          const lastIn = Number(window.__vgcs3dUserInputMs || 0);
+          if (lastIn > 0 && (Date.now() - lastIn) < holdMs) return 0;
+
+          if (window.__lastFollowVehLat == null || window.__lastFollowVehLon == null) {
+            window.__lastFollowVehLat = Number(p.lat);
+            window.__lastFollowVehLon = Number(p.lng);
+            return 0;
+          }
+          const dLatDeg = Number(p.lat) - Number(window.__lastFollowVehLat);
+          const dLonDeg = Number(p.lng) - Number(window.__lastFollowVehLon);
+          window.__lastFollowVehLat = Number(p.lat);
+          window.__lastFollowVehLon = Number(p.lng);
+          if (Math.abs(dLatDeg) < 1e-7 && Math.abs(dLonDeg) < 1e-7) return 0;
+
+          const cam = viewer3d.camera;
+          const cur = cam.positionCartographic;
+          if (!cur) return 0;
+          const TO_RAD = Math.PI / 180;
+          const newLatRad = cur.latitude + (dLatDeg * TO_RAD);
+          const newLonRad = cur.longitude + (dLonDeg * TO_RAD);
+          cam.setView({
+            destination: Cesium.Cartesian3.fromRadians(newLonRad, newLatRad, cur.height),
+            orientation: { heading: cam.heading, pitch: cam.pitch, roll: cam.roll }
+          });
+          try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+          return 1;
+        } catch (e) {}
+        return 0;
+      }
+      // 2D mode: center Leaflet map on the vehicle marker.
+      if (!map) return 0;
+      map.setView([p.lat, p.lng], Math.max(map.getZoom(), 16), { animate: true });
+      return 1;
+    }
+
+    function setHeaderMode(text) {
+      const el = document.getElementById('hdrModeText');
+      if (!el) return 0;
+      el.textContent = text || 'Hold';
+      return 1;
+    }
+
+    function setHeaderVehicleMsg(text) {
+      const el = document.getElementById('hdrVehicleMsg');
+      if (!el) return 0;
+      const raw = String(text || '').trim();
+      // Do not hard-truncate here; let CSS ellipsis handle tight layouts.
+      // Keep full text available via tooltip.
+      el.textContent = raw || 'Vehicle Msg';
+      try { el.title = raw || ''; } catch (e0) {}
+      // Client UX: if PreArm reports bad GPS fix, keep GPS visible but visually mute it.
+      try {
+        const low = raw.toLowerCase();
+        const badFix =
+          (low.includes('prearm') && low.includes('gps') && low.includes('bad fix')) ||
+          low.includes('bad fix');
+        const gpsPill = document.getElementById('hdrGpsPill');
+        if (gpsPill && gpsPill.classList) {
+          gpsPill.classList.toggle('hdrPillMuted', !!badFix);
+          try { gpsPill.title = badFix ? 'GPS: Bad fix' : ''; } catch (e2) {}
+        }
+      } catch (e) {}
+      return 1;
+    }
+
+    function setHeaderGps(sat, hdop) {
+      const satEl = document.getElementById('hdrGpsSat');
+      const hdopEl = document.getElementById('hdrGpsHdop');
+      if (!satEl || !hdopEl) return 0;
+      satEl.textContent = String(sat || '0');
+      hdopEl.textContent = String(hdop || 'N/A');
+      return 1;
+    }
+
+    function setHeaderBattery(text) {
+      const el = document.getElementById('hdrBatteryText');
+      if (!el) return 0;
+      el.textContent = text || 'N/A';
+      return 1;
+    }
+
+    function setHeaderRemoteId(text) {
+      const el = document.getElementById('hdrRemoteIdText');
+      if (!el) return 0;
+      el.textContent = text || 'ID';
+      return 1;
+    }
+
+    function updateCompassNeedle(deg) {
+      const needle = document.getElementById('needle');
+      const degLabel = document.getElementById('compassDeg');
+      if (!needle || !degLabel) return;
+      const normalized = ((Number(deg) || 0) % 360 + 360) % 360;
+      needle.style.transform = `rotate(${normalized}deg)`;
+      degLabel.textContent = `${Math.round(normalized)}°`;
+    }
+
+    function setTelemetryOverlay(relAltM, groundSpeedMps, timeText, mslAltM) {
+      const ft = (Number(relAltM || 0.0) * 3.28084).toFixed(1);
+      const mph = (Number(groundSpeedMps || 0.0) * 2.23694).toFixed(1);
+      const mslFt = (Number(mslAltM || 0.0) * 3.28084).toFixed(1);
+      const ttime = timeText || '00:00:00';
+      const prev = window.__telHudSig || '';
+      const sig = ft + '|' + mph + '|' + ttime + '|' + mslFt;
+      if (sig === prev) return 1;
+      window.__telHudSig = sig;
+      const setAll = (className, text) => {
+        document.querySelectorAll('.' + className).forEach((el) => {
+          el.textContent = text;
+        });
+      };
+      setAll('telRow1Alt', `${ft} ft`);
+      setAll('telRow1Mph', `${mph} mph`);
+      setAll('telRow1Time', ttime);
+      setAll('telRow2Alt', `${ft} ft`);
+      setAll('telRow2Mph', `${mph} mph`);
+      setAll('telRow2Msl', `${mslFt} ft`);
+      return 1;
+    }
+
+    function preferTelemetryStrip() {
+      // Keep the original bottom telemetry strip UI (vs. orbit "bubbles").
+      const stack = document.getElementById('telemetryLeftStack');
+      if (stack) stack.style.display = '';
+      document.querySelectorAll('.telOrbitItem').forEach((el) => el.remove());
+      return 1;
+    }
+
+    // Run once at startup (safe if orbit items don't exist).
+    preferTelemetryStrip();
+
+    function ensure3D() {
+      if (viewer3d) return true;
+      if (!window.Cesium) return false;
+      try {
+        const cesiumCreditHost = document.createElement('div');
+        cesiumCreditHost.style.display = 'none';
+        cesiumCreditHost.setAttribute('aria-hidden', 'true');
+        document.body.appendChild(cesiumCreditHost);
+        viewer3d = new Cesium.Viewer('map3d', {
+          creditContainer: cesiumCreditHost,
+          timeline: false,
+          animation: false,
+          geocoder: false,
+          baseLayerPicker: false,
+          homeButton: false,
+          sceneModePicker: true,
+          navigationHelpButton: false,
+          fullscreenButton: false,
+          infoBox: false,
+          selectionIndicator: false,
+          terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+          imageryProvider: new Cesium.OpenStreetMapImageryProvider({
+            url: 'https://tile.openstreetmap.org/'
+          })
+        });
+        // Make sure the vehicle marker stays visible on top of imagery/terrain.
+        try { viewer3d.scene.globe.depthTestAgainstTerrain = false; } catch (e) {}
+        // Prevent excessive zoom-in (can cause ground/imagery artifacts in Qt WebEngine builds).
+        try {
+          const ssc = viewer3d.scene && viewer3d.scene.screenSpaceCameraController
+            ? viewer3d.scene.screenSpaceCameraController
+            : null;
+          if (ssc) {
+            ssc.minimumZoomDistance = 250.0;
+            // Collision + imagery can fight the camera in WebEngine; keep zoom floor, relax collision for orbit.
+            ssc.enableCollisionDetection = false;
+            try {
+              ssc.enableRotate = true;
+              ssc.enableTilt = true;
+              ssc.enableTranslate = true;
+              ssc.enableZoom = true;
+              ssc.enableLook = true;
+            } catch (eSsc0) {}
+          }
+        } catch (e) {}
+        try {
+          const cv = viewer3d.cesiumWidget && viewer3d.cesiumWidget.canvas;
+          if (cv) {
+            cv.style.touchAction = 'none';
+            // Track real user input so the auto-follow logic stops fighting drags / wheel / touch.
+            // Any flyTo-style recentering that fires while the user is gesturing will cancel the
+            // gesture; we hold off for AUTO_FOLLOW_USER_HOLD_MS after each input.
+            window.__vgcs3dUserInputMs = 0;
+            const __noteUser3dInput = function() {
+              window.__vgcs3dUserInputMs = Date.now();
+            };
+            ['mousedown', 'wheel', 'touchstart', 'pointerdown'].forEach(function(ev) {
+              try { cv.addEventListener(ev, __noteUser3dInput, { passive: true }); } catch (eEv) {}
+            });
+          }
+        } catch (eCv) {}
+        window.__AUTO_FOLLOW_USER_HOLD_MS = 5000;
+        // Hard clamp camera height too (minimumZoomDistance isn't always sufficient at shallow pitch).
+        try {
+          const MIN_CAM_H_M = 250.0;
+          let __clamping = false;
+          viewer3d.camera.changed.addEventListener(function() {
+            if (__clamping) return;
+            try {
+              const c = viewer3d.camera.positionCartographic;
+              if (!c || !Number.isFinite(c.height)) return;
+              if (c.height >= MIN_CAM_H_M) return;
+              __clamping = true;
+              viewer3d.camera.setView({
+                destination: Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, MIN_CAM_H_M),
+                orientation: {
+                  heading: viewer3d.camera.heading,
+                  pitch: viewer3d.camera.pitch,
+                  roll: viewer3d.camera.roll
+                }
+              });
+            } catch (e) {
+              // ignore
+            } finally {
+              __clamping = false;
+            }
+            });
+        } catch (e) {}
+        // Native Qt HUD compass: rotate cardinals/ticks with Cesium camera yaw so N stays on geographic north.
+        try {
+          let __hud3dLastBearing = null;
+          let __hud3dBearingRaf = null;
+          const __emit3dMapBearingForHud = function() {
+            if (!window.__is3d || !viewer3d || !window.Cesium) return;
+            let deg = 0;
+            try {
+              deg = Cesium.Math.toDegrees(Number(viewer3d.camera.heading) || 0);
+            } catch (e0) { return; }
+            const n = ((deg % 360) + 360) % 360;
+            if (__hud3dLastBearing != null && Math.abs(__hud3dLastBearing - n) < 0.35) return;
+            __hud3dLastBearing = n;
+            try {
+              document.title = 'VGCS_3D_MAP_BEARING:' + n.toFixed(2) + ':0';
+            } catch (e1) {}
+          };
+          window.__vgcsEmit3dMapBearingHud = __emit3dMapBearingForHud;
+          viewer3d.camera.changed.addEventListener(function() {
+            if (!window.__is3d) return;
+            if (__hud3dBearingRaf != null) return;
+            __hud3dBearingRaf = window.requestAnimationFrame(function() {
+              __hud3dBearingRaf = null;
+              __emit3dMapBearingForHud();
+            });
+          });
+        } catch (eHud3d) {}
+        // Force a known imagery layer for stable no-key rendering in WebEngine.
+        try {
+          viewer3d.imageryLayers.removeAll();
+          viewer3d.imageryLayers.addImageryProvider(
+            new Cesium.UrlTemplateImageryProvider({
+              url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+              credit: 'Tiles © Esri'
+            })
+          );
+          // Overlay: borders + place labels (transparent) to match client reference.
+          try {
+            viewer3d.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+                credit: ''
+              })
+            );
+          } catch (e2) {}
+        } catch (e) {
+          // Fallback to OSM if ArcGIS provider fails.
+          try {
+            viewer3d.imageryLayers.removeAll();
+            viewer3d.imageryLayers.addImageryProvider(
+              new Cesium.OpenStreetMapImageryProvider({
+                url: 'https://tile.openstreetmap.org/'
+              })
+            );
+          } catch (e2) {}
+        }
+        // Vehicle marker for 3D: use the same arrow/chevron SVG as 2D, as a Cesium billboard.
+        const seed = vehicleMarker ? vehicleMarker.getLatLng() : null;
+        const seedLat = (window.__lastVehLat != null ? window.__lastVehLat : (seed ? seed.lat : 24.7136));
+        const seedLon = (window.__lastVehLon != null ? window.__lastVehLon : (seed ? seed.lng : 46.6753));
+        // Convert inline SVG to a data URL for Cesium billboard rendering.
+        const __vehSvg = (typeof vehicleMarkerSvg === 'string' && vehicleMarkerSvg.length)
+          ? vehicleMarkerSvg
+          : VGCS_VEHICLE_MARKER_SVG;
+        const __vehSvgUrl = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(__vehSvg);
+        vehicleEntity = viewer3d.entities.add({
+          // Use a small fixed height above ellipsoid to ensure visibility even when clamping fails.
+          position: Cesium.Cartesian3.fromDegrees(Number(seedLon) || 46.6753, Number(seedLat) || 24.7136, 30),
+          billboard: {
+            image: __vehSvgUrl,
+            width: 30,
+            height: 30,
+            verticalOrigin: Cesium.VerticalOrigin.CENTER,
+            horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+            // Cesium billboard rotation around `alignedAxis` is CCW positive; vehicle heading is CW
+            // from geographic north (MAVLink convention). Negate to match the 2D Leaflet marker and
+            // the compass needle.
+            rotation: Cesium.Math.toRadians(-Number(window.__heading || 0)),
+            alignedAxis: Cesium.Cartesian3.UNIT_Z,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            scaleByDistance: new Cesium.NearFarScalar(250.0, 1.15, 4500.0, 0.55)
+          }
+        });
+        headingEntity = viewer3d.entities.add({
+          polyline: {
+            positions: [],
+            width: 0,
+            material: Cesium.Color.fromCssColorString('#00000000')
+          }
+        });
+        window.__3dHasInitialFocus = false;
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    function focus3DCamera(force) {
+      if (!viewer3d || !window.Cesium) return 0;
+      if (!force && window.__3dHasInitialFocus) return 0;
+      const p = vehicleMarker ? vehicleMarker.getLatLng() : null;
+      const lat = p ? Number(p.lat) : 24.7136;
+      const lon = p ? Number(p.lng) : 46.6753;
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return 0;
+      try {
+        viewer3d.camera.flyTo({
+          destination: Cesium.Cartesian3.fromDegrees(lon, lat, 1800),
+          orientation: {
+            heading: Cesium.Math.toRadians(Number(window.__heading || 0)),
+            pitch: Cesium.Math.toRadians(-35.0),
+            roll: 0.0
+          },
+          duration: 0.9
+        });
+        window.__3dHasInitialFocus = true;
+        return 1;
+      } catch (e) {
+        return 0;
+      }
+    }
+
+    function syncVehicleHeadingLine() {
+      clearVehicleHeadingLine();
+    }
+
+    function clearVehicleHeadingLine() {
+      headingLine.setLatLngs([]);
+      if (headingEntity) {
+        headingEntity.polyline.positions = [];
+      }
+    }
+
+    function updateHeadingLineGeometry(lat, lon, deg) {
+      clearVehicleHeadingLine();
+    }
+
+    function haversine_m(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const toR = (x) => x * Math.PI / 180;
+      const dLat = toR(lat2 - lat1);
+      const dLon = toR(lon2 - lon1);
+      const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(toR(lat1)) * Math.cos(toR(lat2)) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+    }
+
+    function appendFlightTrack(lat, lon) {
+      try {
+        if (__lastTrackLat != null && __lastTrackLon != null) {
+          const d = haversine_m(__lastTrackLat, __lastTrackLon, lat, lon);
+          if (d < 0.3) return;
+        }
+        __lastTrackLat = lat;
+        __lastTrackLon = lon;
+        let pts = (flightTrack.getLatLngs() || []).concat([[lat, lon]]);
+        const trimM = 10;
+        while (pts.length > 1) {
+          const a = pts[0];
+          if (haversine_m(a.lat, a.lng, lat, lon) < trimM) pts = pts.slice(1);
+          else break;
+        }
+        const maxPts = 200;
+        while (pts.length > maxPts) pts = pts.slice(pts.length - maxPts);
+        flightTrack.setLatLngs(pts);
+        if (pts.length && !map.hasLayer(flightTrack)) flightTrack.addTo(map);
+      } catch (e) {}
+    }
+
+    function clearFlightTrack() {
+      __lastTrackLat = null;
+      __lastTrackLon = null;
+      try { flightTrack.setLatLngs([]); } catch (e) {}
+      try { if (map.hasLayer(flightTrack)) map.removeLayer(flightTrack); } catch (e) {}
+    }
+
+    function updateMissionRoutePolyline() {
+      try {
+        const navSeq = Number(window.__missionNavSeq) || 0;
+        let startIdx = 0;
+        // VGCS mission layout sent to ArduPilot:
+        //   seq 0: dummy (home slot / protocol placeholder)
+        //   seq 1: TAKEOFF
+        //   seq 2: DO_CHANGE_SPEED for WP1
+        //   seq 3: WP1
+        //   seq 4: DO_CHANGE_SPEED for WP2
+        //   seq 5: WP2
+        // Therefore map MISSION_CURRENT.seq -> waypoint array index:
+        //   - before seq 3: start at WP1 (index 0)
+        //   - seq>=3: floor((seq-3)/2)
+        if (navSeq >= 3) {
+          startIdx = Math.max(0, Math.min(waypoints.length, Math.floor((navSeq - 3) / 2)));
+        } else {
+          startIdx = 0;
+        }
+        const veh = vehicleMarker && vehicleMarker.getLatLng();
+        const rest = waypoints.slice(startIdx).map((w) => w.getLatLng());
+        let ll = [];
+        if (veh && rest.length >= 1) {
+          ll = [[veh.lat, veh.lng]].concat(rest);
+        } else if (rest.length >= 2) {
+          ll = rest;
+        } else if (veh && rest.length === 1) {
+          ll = [[veh.lat, veh.lng], rest[0]];
+        } else if (rest.length === 1) {
+          ll = rest;
+        }
+        if (ll.length < 2) {
+          if (map.hasLayer(missionRoute)) map.removeLayer(missionRoute);
+          return;
+        }
+        missionRoute.setLatLngs(ll);
+        if (!map.hasLayer(missionRoute)) missionRoute.addTo(map);
+        try { missionRoute.bringToFront(); } catch (e) {}
+      } catch (e) {}
+    }
+
+    function setVehicle(lat, lon) {
+      vehicleMarker.setLatLng([lat, lon]);
+      window.__lastVehLat = lat;
+      window.__lastVehLon = lon;
+      appendFlightTrack(lat, lon);
+      updateHeadingLineGeometry(lat, lon, window.__heading || 0);
+      updateMissionRoutePolyline();
+      if (vehicleEntity) {
+        // Cesium stores `entity.position` as a Property; in some Qt WebEngine builds,
+        // reassigning `entity.position = Cartesian3` doesn't reliably update the visual.
+        // Prefer `setValue()` when available.
+        const p3 = Cesium.Cartesian3.fromDegrees(lon, lat, 30);
+        try {
+          if (vehicleEntity.position && typeof vehicleEntity.position.setValue === 'function') {
+            vehicleEntity.position.setValue(p3);
+          } else {
+            vehicleEntity.position = p3;
+          }
+        } catch (e) {
+          try { vehicleEntity.position = p3; } catch (e2) {}
+        }
+        try { vehicleEntity.show = true; } catch (e) {}
+        try { viewer3d && viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+      }
+      if (window.__is3d && !window.__3dHasInitialFocus) {
+        focus3DCamera(false);
+      }
+    }
+
+    function nowMs() {
+      return (typeof performance !== 'undefined' && performance.now)
+        ? performance.now()
+        : Date.now();
+    }
+
+    function cancelHeadingSchedule() {
+      if (__headingRafId != null) {
+        clearTimeout(__headingRafId);
+        __headingRafId = null;
+      }
+      __headingPending = null;
+    }
+
+    function applyHeadingVisuals(deg, latArg, lonArg) {
+      const d = ((Number(deg) || 0) % 360 + 360) % 360;
+      window.__heading = d;
+      updateCompassNeedle(d);
+      const p = vehicleMarker.getLatLng();
+      const lat = latArg !== undefined ? latArg : p.lat;
+      const lon = lonArg !== undefined ? lonArg : p.lng;
+      updateHeadingLineGeometry(lat, lon, d);
+      try {
+        if (vehicleEntity && vehicleEntity.billboard) {
+          // Negate: Cesium billboard rotation is CCW around alignedAxis; heading is CW from N.
+          vehicleEntity.billboard.rotation = Cesium.Math.toRadians(-d);
+        }
+      } catch (e) {}
+      try {
+        const el = vehicleMarker.getElement && vehicleMarker.getElement();
+        if (el) {
+          const inner = el.querySelector('.vgcs-vehicle-marker-inner');
+          if (inner) inner.style.transform = 'rotate(' + d + 'deg)';
+        }
+      } catch (e) {}
+      __headingLastApplyMs = nowMs();
+    }
+
+    function flushHeadingPending() {
+      __headingRafId = null;
+      if (!__headingPending) return;
+      const { deg, latArg, lonArg, source } = __headingPending;
+      __headingPending = null;
+      if (source === 'att' && (__headingLastVfrMs > 0) && (nowMs() - __headingLastVfrMs < VFR_HEADING_PRIORITY_MS)) {
+        return;
+      }
+      if (source === 'vfr' || source === 'gpi') {
+        __headingLastVfrMs = nowMs();
+      }
+      applyHeadingVisuals(deg, latArg, lonArg);
+    }
+
+    function scheduleHeadingUpdate(deg, latArg, lonArg, source) {
+      __headingPending = { deg, latArg, lonArg, source: source || 'mixed' };
+      const t = nowMs();
+      const wait = Math.max(0, HEADING_MIN_INTERVAL_MS - (t - __headingLastApplyMs));
+      if (__headingRafId != null) {
+        clearTimeout(__headingRafId);
+      }
+      __headingRafId = setTimeout(flushHeadingPending, wait);
+    }
+
+    function updateHeading(deg, latArg, lonArg, source) {
+      if (latArg !== undefined || lonArg !== undefined) {
+        applyHeadingVisuals(deg, latArg, lonArg);
+        return;
+      }
+      scheduleHeadingUpdate(deg, latArg, lonArg, source);
+    }
+
+    function enableAddWaypoint() { addMode = true; addFenceMode = false; }
+    function enableFencePolygon() { addFenceMode = true; addMode = false; }
+
+    function waypointNumberIcon(n) {
+      const html =
+        '<div class="vgcs-wp-pin" aria-label="Waypoint ' + n + '">' +
+        '<span class="vgcs-wp-disc"></span>' +
+        '<span class="vgcs-wp-num">' + n + '</span></div>';
+      return L.divIcon({
+        html: html,
+        className: 'vgcs-wp-divicon',
+        iconSize: [26, 26],
+        iconAnchor: [13, 13],
+      });
+    }
+
+    function refreshWaypointLabels() {
+      waypoints.forEach((w, i) => {
+        try {
+          w.setIcon(waypointNumberIcon(i + 1));
+        } catch (e) {}
+      });
+    }
+
+    function attachWaypointDeleteHandlers(marker) {
+      if (!marker) return;
+      const removeThis = () => {
+        try { map.removeLayer(marker); } catch (e) {}
+        waypoints = waypoints.filter(w => w !== marker);
+        refreshWaypointLabels();
+        syncVehicleHeadingLine();
+        updateMissionRoutePolyline();
+      };
+      // Fast delete gesture for planning workflows.
+      marker.on('dblclick', function(ev) {
+        if (ev) {
+          ev.originalEvent?.preventDefault?.();
+          ev.originalEvent?.stopPropagation?.();
+        }
+        removeThis();
+      });
+      marker.on('contextmenu', function(ev) {
+        if (ev) {
+          ev.originalEvent?.preventDefault?.();
+          ev.originalEvent?.stopPropagation?.();
+        }
+        removeThis();
+      });
+    }
+
+    function addWaypointMarker(latlng) {
+      const idx = waypoints.length + 1;
+      const m = L.marker(latlng, {
+        icon: waypointNumberIcon(idx),
+        interactive: true,
+        bubblingMouseEvents: false,
+        keyboard: false,
+        pane: 'overlayPane',
+      }).addTo(map);
+      attachWaypointDeleteHandlers(m);
+      waypoints.push(m);
+      refreshWaypointLabels();
+      syncVehicleHeadingLine();
+      renderPlanWpDetails();
+      return m;
+    }
+
+    function clearWaypoints() {
+      for (const wp of waypoints) map.removeLayer(wp);
+      waypoints = [];
+      window.__missionNavSeq = 0;
+      window.__planWpMeta = [];
+      syncVehicleHeadingLine();
+      updateMissionRoutePolyline();
+      return 0;
+    }
+
+    let fenceCircle = null;
+    function setFence(lat, lon, radiusM) {
+      if (fenceCircle) map.removeLayer(fenceCircle);
+      fenceCircle = L.circle([lat, lon], {
+        radius: radiusM,
+        color: '#f87171',
+        fillColor: '#f87171',
+        fillOpacity: 0.08,
+        weight: 2
+      }).addTo(map);
+    }
+
+    function clearFence() {
+      if (fenceCircle) {
+        map.removeLayer(fenceCircle);
+        fenceCircle = null;
+      }
+      if (fencePolygon) {
+        map.removeLayer(fencePolygon);
+        fencePolygon = null;
+      }
+      fencePoints = [];
+      return 1;
+    }
+
+    function getFencePoints() { return fencePoints.slice(); }
+
+    function setFencePolygon(points) {
+      if (fencePolygon) map.removeLayer(fencePolygon);
+      fencePoints = points || [];
+      if (fencePoints.length >= 3) {
+        fencePolygon = L.polygon(fencePoints, {
+          color: '#f97316',
+          fillColor: '#f97316',
+          fillOpacity: 0.08,
+          weight: 2
+        }).addTo(map);
+      }
+      return fencePoints.length;
+    }
+
+    function getWaypoints() {
+      return waypoints.map(w => [w.getLatLng().lat, w.getLatLng().lng]);
+    }
+
+    function setWaypoints(points) {
+      clearWaypoints();
+      for (const p of points) {
+        addWaypointMarker([p[0], p[1]]);
+      }
+      updateMissionRoutePolyline();
+      renderPlanWpDetails();
+    }
+
+    function getWaypointCount() { return waypoints.length; }
+
+    function set3DEnabled(enabled) {
+      if (enabled) {
+        if (!ensure3D()) return false;
+        document.getElementById('map2d').style.display = 'none';
+        document.getElementById('map3d').style.display = 'block';
+        window.__is3d = true;
+        if (hdrMapModeBtn) hdrMapModeBtn.textContent = '2D';
+        // Reset soft-follow baseline so the first follow tick after entering 3D doesn't translate
+        // the camera by a stale delta (and "pre-arm" the user-hold to give Cesium a clean first frame).
+        window.__lastFollowVehLat = null;
+        window.__lastFollowVehLon = null;
+        window.__vgcs3dUserInputMs = Date.now();
+        // Make sure the vehicle billboard is visible, but DO NOT use trackedEntity or auto-flyTo
+        // here: trackedEntity locks the camera to the entity and blocks the user from freely
+        // rotating / panning the globe (Cesium left-drag becomes a no-op while tracking).
+        try {
+          if (viewer3d && vehicleEntity) {
+            try { vehicleEntity.show = true; } catch (e) {}
+            try { viewer3d.trackedEntity = undefined; } catch (e) {}
+            try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+          }
+        } catch (e) {}
+        // One-shot focus on the drone (no continuous follow). After this the user is in full control.
+        focus3DCamera(true);
+        try {
+          if (window.__vgcsEmit3dMapBearingHud) {
+            window.requestAnimationFrame(function() {
+              try { window.__vgcsEmit3dMapBearingHud(); } catch (eB) {}
+            });
+          }
+        } catch (eBr) {}
+        return true;
+      }
+      document.getElementById('map3d').style.display = 'none';
+      document.getElementById('map2d').style.display = 'block';
+      window.__is3d = false;
+      if (hdrMapModeBtn) hdrMapModeBtn.textContent = '3D';
+      return false;
+    }
+
+    map.on('click', function(e) {
+      if (addMode) {
+        addWaypointMarker(e.latlng);
+        updateMissionRoutePolyline();
+        return;
+      }
+      if (addFenceMode) {
+        fencePoints.push([e.latlng.lat, e.latlng.lng]);
+        setFencePolygon(fencePoints);
+      }
+    });
+  </script>
+</body>
+</html>
