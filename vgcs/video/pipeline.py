@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import threading
 import time
 import json
@@ -8,7 +9,7 @@ import shutil
 import subprocess
 from typing import Optional, Protocol
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
 try:
     import numpy as np  # type: ignore[import-not-found]
@@ -280,8 +281,34 @@ class RtspSource(QObject):
             self._audio = None
             return False
 
+    def _prefer_ffmpeg_immediately(self) -> bool:
+        """
+        Use FFmpeg for RTSP directly when tools exist.
+
+        QtMultimedia often fails to emit frames for RTSP on Windows (FFmpeg backend)
+        while still opening the stream — leading to a useless 2s wait, duplicate RTSP
+        sessions, and libav h264 noise. Skip unless VGCS_FORCE_QTMULTIMEDIA_RTSP=1.
+        """
+        if os.environ.get("VGCS_FORCE_QTMULTIMEDIA_RTSP", "").strip() == "1":
+            return False
+        if not HAS_NUMPY:
+            return False
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            return False
+        u = (self._url or "").strip().lower()
+        return u.startswith("rtsp://")
+
     def start(self) -> None:
         if self._running:
+            return
+        if self._prefer_ffmpeg_immediately():
+            print(
+                f"[VGCS:video] RTSP: FFmpeg decoder (skip Qt Multimedia probe) url={self._url}"
+            )
+            self._last_frame_mono = 0.0
+            self._using_pyav = False
+            self._running = True
+            self._start_ffmpeg()
             return
         # Prefer QtMultimedia first; if it doesn't produce frames shortly, fall back to FFmpeg.
         if not self.ensure_backend():
@@ -399,14 +426,32 @@ class RtspSource(QObject):
         self.frame.emit(VideoFrame(img, meta))
 
     def _maybe_fallback_to_ffmpeg(self) -> None:
-        # Wait briefly for QtMultimedia to deliver frames.
+        # Wait briefly for QtMultimedia to deliver frames (no Qt API calls here — this runs
+        # on a plain Python thread started in start()).
         t0 = time.monotonic()
         while time.monotonic() - t0 < 2.0:
             if self._last_frame_mono > 0:
                 return
             time.sleep(0.05)
-        # No frames: fall back.
-        print(f"[VGCS:video] QtMultimedia produced no frames; switching to FFmpeg fallback url={self._url}")
+        # Stopping QMediaPlayer from this worker thread triggers
+        # "QObject::killTimer: Timers cannot be stopped from another thread".
+        # Marshal stop + FFmpeg handoff onto the thread that owns this QObject.
+        QMetaObject.invokeMethod(
+            self,
+            "_qt_apply_ffmpeg_fallback",
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+    @Slot()
+    def _qt_apply_ffmpeg_fallback(self) -> None:
+        if not self._running:
+            return
+        # Frames may have started arriving before this slot runs.
+        if self._last_frame_mono > 0:
+            return
+        print(
+            f"[VGCS:video] QtMultimedia produced no frames; switching to FFmpeg fallback url={self._url}"
+        )
         try:
             if self._player is not None:
                 self._player.stop()
@@ -535,10 +580,12 @@ class RtspSource(QObject):
                 "-nostats",
                 "-loglevel",
                 "info",
+                "-err_detect",
+                "ignore_err",
                 "-rtsp_transport",
                 transport,
                 "-fflags",
-                "+genpts",
+                "+genpts+discardcorrupt",
                 "-i",
                 url,
                 "-an",
@@ -618,11 +665,13 @@ class RtspSource(QObject):
                 "-hide_banner",
                 "-nostats",
                 "-loglevel",
-                "warning",
+                "error",
+                "-err_detect",
+                "ignore_err",
                 "-rtsp_transport",
                 transport,
                 "-fflags",
-                "+genpts",
+                "+genpts+discardcorrupt",
                 "-i",
                 url,
                 "-an",

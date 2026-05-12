@@ -64,36 +64,91 @@ def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> s
         font-size: 13px;
         color: #dce1ef;
     }
+    /*
+     * Legacy Web map #linkBanner + .hdrPill + .hdrSep (git e48c1a7 map_widget.py):
+     *   #linkBanner: rgba(24,30,40,0.95); border-bottom rgba(72,86,110,0.9); padding 8px 12px
+     *   #linkBannerConnected: gap 12px; font 14px weight 600; color #f4f7ff
+     *   .hdrPill: inline-flex, NO boxed background (flat on the tinted banner)
+     *   .hdrSep: 1x24px rgba(210,220,240,0.55)
+     *   setFlightStatus tints the FULL banner rgba + text color (green/yellow/red)
+     * Non-map panels still use statusChip below.
+     */
     QLabel#statusChipTitle {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 600;
-        color: #b8c2d9;
+        color: #9ca3b0;
         text-transform: uppercase;
         letter-spacing: 0.08em;
     }
     QLabel#statusChipValue {
-        font-size: 14px;
+        font-size: 13px;
         font-weight: 600;
-        color: #f2f4fa;
+        color: #f3f4f6;
     }
     QFrame#statusChip {
-        background-color: #1e2430;
-        border: 1px solid #323a4d;
-        border-radius: 10px;
+        background-color: rgba(45, 45, 58, 0.96);
+        border: 1px solid rgba(72, 86, 110, 0.75);
+        border-radius: 8px;
         padding: 0px;
     }
     QFrame#statusChip:hover {
-        border-color: #4f5d78;
-        background-color: #232a38;
+        border-color: rgba(92, 106, 130, 0.9);
+        background-color: rgba(52, 52, 64, 0.96);
     }
     QFrame#vehicleMsgPanel {
-        background-color: #1e2430;
-        border: 1px solid #323a4d;
-        border-radius: 10px;
+        background-color: rgba(45, 45, 58, 0.96);
+        border: 1px solid rgba(72, 86, 110, 0.75);
+        border-radius: 8px;
+    }
+    QWidget#hdrPill {
+        background-color: transparent;
+        border: none;
+    }
+    QLabel#hdrPillTitle {
+        font-size: 10px;
+        font-weight: 600;
+        color: rgba(244, 247, 255, 0.55);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+    }
+    QLabel#hdrPillValue {
+        font-size: 14px;
+        font-weight: 600;
+        color: #f4f7ff;
+    }
+    QLabel#hdrGpsStackLine {
+        font-size: 12px;
+        font-weight: 600;
+        color: #f4f7ff;
+        line-height: 1.05;
+    }
+    QPushButton#hdrMapModeBtn {
+        margin-left: 8px;
+        min-width: 62px;
+        height: 26px;
+        border-radius: 13px;
+        border: 1px solid rgba(210, 220, 240, 0.65);
+        background-color: rgba(20, 30, 42, 0.7);
+        color: #f1f6ff;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        padding: 0 10px;
+    }
+    QPushButton#hdrMapModeBtn:hover {
+        background-color: rgba(36, 50, 69, 0.9);
+    }
+    QFrame#hdrSep {
+        background-color: rgba(210, 220, 240, 0.55);
+        border: none;
+        max-width: 1px;
+        min-width: 1px;
+        min-height: 24px;
+        max-height: 28px;
     }
     QFrame#headerBar {
-        background-color: #12151c;
-        border-bottom: 1px solid #252d3d;
+        background-color: rgba(24, 30, 40, 0.96);
+        border-bottom: 1px solid rgba(72, 86, 110, 0.9);
         border-radius: 0px;
     }
     QScrollArea#headerChipScroll {
@@ -114,22 +169,22 @@ def gcs_stylesheet(*, mono_family: str = "Consolas", ui_scale: float = 1.0) -> s
         min-width: 24px;
         border-radius: 3px;
     }
+    /* Flight/arm control: flat text on tinted banner (Web setFlightStatus — no separate red box). */
     QPushButton#headerFlightChipBtn {
-        background-color: #2a3344;
-        color: #f0f3fa;
-        border: 1px solid #3d4a63;
-        border-radius: 8px;
-        padding: 6px 12px;
-        font-weight: 600;
-        font-size: 13px;
-        min-height: 18px;
+        background-color: transparent;
+        color: #dbe3f3;
+        border: none;
+        border-radius: 0px;
+        padding: 2px 4px;
+        font-weight: 700;
+        font-size: 14px;
+        min-height: 22px;
     }
     QPushButton#headerFlightChipBtn:hover {
-        background-color: #344056;
-        border-color: #5c6a8a;
+        background-color: rgba(255, 255, 255, 0.06);
     }
     QPushButton#headerFlightChipBtn:pressed {
-        background-color: #232b3a;
+        background-color: rgba(255, 255, 255, 0.1);
     }
     QMenu {
         background-color: #1e2430;

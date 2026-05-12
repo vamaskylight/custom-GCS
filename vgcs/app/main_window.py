@@ -7,7 +7,7 @@ import time
 import math
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, Qt, QSettings, QTimer
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QSettings, QTimer
 from PySide6.QtGui import (
     QColor,
     QGuiApplication,
@@ -15,9 +15,12 @@ from PySide6.QtGui import (
     QImage,
     QImageReader,
     QKeySequence,
+    QMouseEvent,
+    QPainter,
     QPixmap,
     QShortcut,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -37,6 +40,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QScrollBar,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -57,6 +61,7 @@ from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
 from vgcs.map import MapWidget
+from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
 from vgcs.video.pipeline import VideoPipeline
@@ -154,6 +159,8 @@ class MainWindow(QMainWindow):
         # WebEngine overlay refresh budget (~10 Hz) — avoids full-map flicker from 25–50 Hz MAVLink.
         self._last_map_overlay_refresh_s: float | None = None
         self._mission_upload_pending = False
+        # After QInputDialog closes, the same click can “fall through” to the header and reopen Connect.
+        self._suppress_header_connect_after_dialog = False
 
         # M3 video pipeline (camera sources + frame distribution).
         self._video = VideoPipeline(self)
@@ -213,6 +220,11 @@ class MainWindow(QMainWindow):
         self._geofence_radius_spin.setRange(10.0, 5000.0)
         self._geofence_radius_spin.setDecimals(0)
         self._geofence_radius_spin.setValue(80.0)
+        self._geofence_radius_spin.setToolTip(
+            "Circular geofence radius on the vehicle (meters).\n\n"
+            "Plan Flight: Survey / Pattern / Corridor / Structure templates place their "
+            "pattern this far north of the vehicle so the grid does not spawn on top of home."
+        )
         self._geofence_alt_max_spin = QDoubleSpinBox()
         self._geofence_alt_max_spin.setRange(5.0, 2000.0)
         self._geofence_alt_max_spin.setDecimals(0)
@@ -281,7 +293,7 @@ class MainWindow(QMainWindow):
         self._apply_state_style(self._watchdog, "warn")
 
         self._compass = CompassWidget()
-        self._map_widget = MapWidget()
+        self._map_widget = MapWidget(video_pipeline=self._video)
         self._map_widget.set_dashboard_mode(True)
         self._telemetry_body = self._build_telemetry_panel()
         self._mission_table_updating = False
@@ -339,7 +351,8 @@ class MainWindow(QMainWindow):
         self._content_layout = QVBoxLayout()
         self._content_layout.setSpacing(8 if self._compact_ui else 12)
         self._content_layout.addWidget(self._top_dashboard)
-        self._content_layout.addWidget(operations_widget)
+        # Stretch so the map/operations row consumes all space below the header (scroll content fills viewport).
+        self._content_layout.addWidget(operations_widget, 1)
         self._content_layout.addWidget(link_box)
         self._m2_controls_panel = self._build_m2_controls_panel()
         self._content_layout.addWidget(self._m2_controls_panel)
@@ -402,6 +415,7 @@ class MainWindow(QMainWindow):
         self._map_widget.map_page_ready.connect(self._on_map_page_ready)
         self._map_widget.plan_mission_panel_changed.connect(self._on_plan_mission_panel_changed)
         self._map_widget.toggle_3d_requested.connect(self._on_map_toggle_3d_requested)
+        self._map_widget.map_3d_mode_changed.connect(self._on_map_3d_mode_changed)
         self._map_widget.mission_start_requested.connect(self._on_map_mission_start_requested)
 
         self._flight_timer = QTimer(self)
@@ -417,9 +431,10 @@ class MainWindow(QMainWindow):
         self._apply_responsive_layout(self.width())
         self._set_preconnect_dashboard_mode(True)
         self._set_map_only_dashboard_mode(self._map_only_dashboard)
+        # Default `#linkBanner` CSS tint (git e48c1a7) — not the red “communication lost” palette.
         self._set_dashboard_flight_status(
-            "red",
-            "Communication lost - Not Ready to Arm",
+            "",
+            "Disconnected - Click to manually connect 💬",
         )
 
     def _detect_compact_ui(self) -> bool:
@@ -532,6 +547,142 @@ class MainWindow(QMainWindow):
         frame.setLayout(lay)
         return v, frame
 
+    def _hdr_sep_widget(self) -> QFrame:
+        """Legacy Web `.hdrSep`: 1×~24px vertical rule between `.hdrPill` items (e48c1a7)."""
+        sep = QFrame()
+        sep.setObjectName("hdrSep")
+        sep.setFixedSize(1, 26)
+        sep.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        return sep
+
+    def _header_icons_dir(self) -> Path:
+        return Path(__file__).resolve().parents[1] / "assets" / "header_icons"
+
+    def _header_icon_pixmap(self, filename: str, size: int = 22) -> QPixmap:
+        """Rasterize SVG from git `vgcs/assets/header_icons/` (same paths as Web template)."""
+        path = self._header_icons_dir() / filename
+        if not path.exists():
+            return QPixmap()
+        try:
+            renderer = QSvgRenderer(str(path))
+            img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(img)
+            renderer.render(painter)
+            painter.end()
+            return QPixmap.fromImage(img)
+        except Exception:
+            return QPixmap()
+
+    def _make_hdr_icon_pill(
+        self,
+        icon_filename: str,
+        value: QLabel,
+        *,
+        icon_size: int = 22,
+        min_w: int = 72,
+    ) -> QWidget:
+        """Legacy `.hdrPill`: icon + text row (git e48c1a7 map_widget HTML)."""
+        wrap = QWidget()
+        wrap.setObjectName("hdrPill")
+        # Floor: icon + spacing so an empty label never collapses the pill; content sets real width.
+        wrap.setMinimumWidth(max(min_w, icon_size + 6 + 4))
+        wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        row = QHBoxLayout(wrap)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        ic = QLabel()
+        ic.setFixedSize(icon_size, icon_size)
+        pm = self._header_icon_pixmap(icon_filename, icon_size)
+        if not pm.isNull():
+            ic.setPixmap(pm)
+        value.setObjectName("hdrPillValue")
+        value.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        value.setWordWrap(False)
+        row.addWidget(ic, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(value, 1, Qt.AlignmentFlag.AlignVCenter)
+        return wrap
+
+    def _make_hdr_gps_pill_widget(self) -> QWidget:
+        """GPS pill: `gps.svg` + `.hdrTinyStack` two-line column (Web map_widget)."""
+        wrap = QWidget()
+        wrap.setObjectName("hdrPill")
+        wrap.setMinimumWidth(96 if self._compact_ui else 104)
+        wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        row = QHBoxLayout(wrap)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        ic = QLabel()
+        ic.setFixedSize(22, 22)
+        pm = self._header_icon_pixmap("gps.svg", 22)
+        if not pm.isNull():
+            ic.setPixmap(pm)
+        self._top_gps_sat = QLabel("—")
+        self._top_gps_sat.setObjectName("hdrGpsStackLine")
+        self._top_gps_hdop = QLabel("—")
+        self._top_gps_hdop.setObjectName("hdrGpsStackLine")
+        self._top_gps_sat.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._top_gps_hdop.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        stack = QVBoxLayout()
+        stack.setContentsMargins(0, 0, 0, 0)
+        stack.setSpacing(0)
+        stack.addWidget(self._top_gps_sat)
+        stack.addWidget(self._top_gps_hdop)
+        row.addWidget(ic, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addLayout(stack, 1)
+        return wrap
+
+    def _top_gps_status_line(self) -> str:
+        """One-line GPS summary for popups/exports (sat line + HDOP line)."""
+        return f"{self._top_gps_sat.text()} / {self._top_gps_hdop.text()}"
+
+    def _apply_link_banner_palette(self, state: str) -> None:
+        """Tint full `#linkBanner` like Web `setFlightStatus()` — not a separate arm rectangle.
+
+        Empty ``state`` matches shipped CSS `#linkBanner { background: rgba(24,30,40,0.95); … }`
+        (idle disconnected). Use ``red`` only for the JS ``else`` branch (communication lost).
+        """
+        st = (state or "").strip().lower()
+        if st == "green":
+            bg = "rgba(24, 82, 38, 0.96)"
+            bd = "rgba(94, 214, 119, 0.95)"
+            fg = "#e8ffe8"
+            muted = "rgba(232, 255, 232, 0.58)"
+        elif st == "yellow":
+            bg = "rgba(120, 95, 24, 0.96)"
+            bd = "rgba(247, 211, 92, 0.95)"
+            fg = "#fff7dd"
+            muted = "rgba(255, 247, 221, 0.58)"
+        elif st == "red":
+            bg = "rgba(124, 24, 24, 0.96)"
+            bd = "rgba(245, 99, 99, 0.95)"
+            fg = "#ffe8e8"
+            muted = "rgba(255, 232, 232, 0.58)"
+        else:
+            bg = "rgba(24, 30, 40, 0.96)"
+            bd = "rgba(72, 86, 110, 0.9)"
+            fg = "#dbe3f3"
+            muted = "rgba(244, 247, 255, 0.52)"
+
+        qss = "\n".join(
+            (
+                f"QFrame#headerBar {{ background-color: {bg}; border-bottom: 1px solid {bd}; }}",
+                f"QLabel#hdrPillTitle {{ color: {muted}; }}",
+                f"QLabel#hdrPillValue {{ color: {fg}; }}",
+                f"QLabel#hdrGpsStackLine {{ color: {fg}; }}",
+                "QPushButton#headerFlightChipBtn { background: transparent; border: none; "
+                f"color: {fg}; font-weight: 700; font-size: 14px; padding: 2px 4px; }}",
+                "QPushButton#headerFlightChipBtn:hover { background-color: rgba(255,255,255,0.08); }",
+                f"QLabel#linkBannerText {{ color: {fg}; font-size: 14px; font-weight: 600; }}",
+            )
+        )
+        self._top_dashboard.setStyleSheet(qss)
+        self._logo_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; padding: 0; color: {fg}; "
+            f"font-size: 15px; font-weight: 600; }}"
+            f"QPushButton:hover {{ background-color: rgba(255,255,255,0.06); }}"
+        )
+
     def _build_m2_top_dashboard(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("headerBar")
@@ -542,35 +693,39 @@ class MainWindow(QMainWindow):
         header_outer = QHBoxLayout()
         header_outer.setContentsMargins(0, 0, 0, 0)
         header_outer.setSpacing(12 if self._compact_ui else 16)
-        chip_spacing = 8 if self._compact_ui else 10
-        # Logo: never decode with a square QSize — that can force 1:1 distortion.
+        # Logo: match legacy Web #linkBannerLogo (height ~28px); scale slightly up for HiDPI.
         # We read intrinsic WxH from the file, then setScaledSize to a proportional
         # box (max edge capped). Final display scale uses scaledToHeight (uniform).
-        logo_target_h = 120 if self._compact_ui else 152
+        logo_target_h = 28 if self._compact_ui else 32
         logo_decode_max = 2400  # longest edge for initial decode (memory bound)
-        chip_row_h = 54
+        # Two-line hdr pills; Web banner min-height 46px — stack needs slightly more row pixels.
+        chip_row_h = 52
 
         self._logo_btn = QPushButton("VGCS Logo")
+        self._logo_btn.setObjectName("linkBannerLogo")
         self._logo_btn.clicked.connect(self._on_logo_menu)
         self._logo_btn.setFlat(True)
         self._logo_btn.setCursor(Qt.PointingHandCursor)
         self._logo_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: none; padding: 0; }"
-            "QPushButton:hover { background: transparent; border: none; }"
+            "QPushButton { background: transparent; border: none; padding: 0; "
+            "color: #dbe3f3; font-size: 15px; font-weight: 600; }"
+            "QPushButton:hover { background: transparent; border: none; color: #f4f7ff; }"
             "QPushButton:pressed { background: transparent; border: none; }"
         )
-        logo_primary = Path(__file__).resolve().parents[2] / "Vama Logo New.png"
-        logo_fallback = Path(__file__).resolve().parents[1] / "assets" / "vama_logo.jpg"
-        for logo_path in (logo_primary, logo_fallback):
+        # Legacy Web `__LOGO_SRC__` → shipped asset (see git e48c1a7 map_widget template).
+        logo_paths = (
+            Path(__file__).resolve().parents[1] / "assets" / "Vama Logo.png",
+            Path(__file__).resolve().parents[2] / "Vama Logo New.png",
+            Path(__file__).resolve().parents[1] / "assets" / "vama_logo.jpg",
+        )
+        for logo_path in logo_paths:
             if not logo_path.exists():
                 continue
-            is_huge_png = False
-            if logo_path.suffix.lower() == ".png":
-                dims = self._read_png_dimensions(logo_path)
-                is_huge_png = dims is not None and (dims[0] * dims[1]) > 10_000_000
-            if is_huge_png:
-                continue
             reader = QImageReader(str(logo_path))
+            # Qt 6 defaults ~256MB allocation guard on IHDR × bpp before scaled decode.
+            # Shipped `Vama Logo.png` has a very large declared canvas (~15k×6k) but small IDAT;
+            # without this, read() returns null and the UI falls back to "VGCS Logo" text.
+            reader.setAllocationLimit(512)
             reader.setAutoTransform(True)
             sz = reader.size()
             if sz.isValid():
@@ -607,69 +762,101 @@ class MainWindow(QMainWindow):
             self._logo_btn.setIconSize(pix.size())
             self._logo_btn.setFixedSize(pix.size())
             self._logo_btn.setText("")
-            chip_row_h = max(chip_row_h, pix.height())
             break
-        # Header: logo (left); status chips (right). Vehicle Msg lives beside the map, not here.
-        self._top_gps_hdop, gps_frame = self._make_top_chip("GPS / HDOP", "—")
-        self._top_flight_mode, mode_frame = self._make_top_chip("Flight mode", "—")
-        self._top_battery, bat_frame = self._make_top_chip("Battery", "—")
-        self._top_remote_id, rid_frame = self._make_top_chip("Remote ID", "N/A")
-        self._top_vehicle_msg, self._vehicle_msg_frame = self._make_top_chip(
-            "Vehicle Msg", "—"
+        # Placeholder for layouts that still reference `_vehicle_msg_frame` — Web showed vehicle in `#linkBanner` only.
+        self._vehicle_msg_frame = QWidget()
+        self._vehicle_msg_frame.setFixedSize(0, 0)
+
+        flight_wrap = QWidget()
+        flight_wrap.setObjectName("hdrPill")
+        # Content-sized: avoid MinimumExpanding + wide mins (left empty space in the banner).
+        flight_wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        fw_lay = QVBoxLayout(flight_wrap)
+        fw_lay.setContentsMargins(0, 0, 4, 0)
+        fw_lay.setSpacing(0)
+        self._flight_status_btn = QPushButton("NOT READY TO ARM")
+        self._flight_status_btn.setObjectName("headerFlightChipBtn")
+        self._flight_status_btn.setCursor(Qt.PointingHandCursor)
+        self._flight_status_btn.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
         )
-        self._vehicle_msg_frame.setObjectName("vehicleMsgPanel")
-        self._vehicle_msg_frame.setMinimumWidth(140 if self._compact_ui else 160)
-        self._vehicle_msg_frame.setMaximumWidth(220)
-        self._vehicle_msg_frame.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+        # Legacy Web `#linkBanner`: any header click except logo → VGCS_CONNECT_REQUEST (git e48c1a7).
+        self._flight_status_btn.clicked.connect(self._on_map_connect_requested)
+        fw_lay.addWidget(self._flight_status_btn)
+
+        # git e48c1a7 map_widget: hold.svg → mode, link.svg → vehicle msg, gps.svg → stack, battery, remote_id, hdrMapModeBtn
+        self._top_flight_mode = QLabel("—")
+        mode_frame = self._make_hdr_icon_pill(
+            "hold.svg", self._top_flight_mode, min_w=72 if self._compact_ui else 80
         )
-        msg_ly = self._vehicle_msg_frame.layout()
-        if isinstance(msg_ly, QVBoxLayout):
-            msg_ly.setContentsMargins(10, 10, 10, 10)
-            msg_ly.setSpacing(6)
-        self._top_vehicle_msg.setWordWrap(True)
+
+        self._top_vehicle_msg = QLabel("—")
+        self._top_vehicle_msg.setWordWrap(False)
+        # No max width — long status (e.g. parameter download) was clipped; row scrolls if needed.
+        self._top_vehicle_msg.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
+        vehicle_pill = self._make_hdr_icon_pill(
+            "link.svg",
+            self._top_vehicle_msg,
+            icon_size=26,
+            min_w=40 if self._compact_ui else 48,
+        )
+
+        gps_frame = self._make_hdr_gps_pill_widget()
+
+        self._top_battery = QLabel("—")
+        bat_frame = self._make_hdr_icon_pill(
+            "battery.svg", self._top_battery, min_w=88 if self._compact_ui else 96
+        )
+
+        self._top_remote_id = QLabel("N/A")
+        rid_frame = self._make_hdr_icon_pill(
+            "remote_id.svg", self._top_remote_id, min_w=88 if self._compact_ui else 96
+        )
+
+        self._hdr_map_mode_btn = QPushButton("3D")
+        self._hdr_map_mode_btn.setObjectName("hdrMapModeBtn")
+        self._hdr_map_mode_btn.setFixedHeight(26)
+        self._hdr_map_mode_btn.setCursor(Qt.PointingHandCursor)
+        self._hdr_map_mode_btn.clicked.connect(self._on_map_toggle_3d_requested)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(8)
-        left_layout.addWidget(self._logo_btn, 0, Qt.AlignLeft | Qt.AlignTop)
-        left_layout.addStretch(1)
+        left_layout.setSpacing(0)
+        left_layout.addWidget(self._logo_btn, 0, Qt.AlignLeft | Qt.AlignVCenter)
 
         chip_strip = QWidget()
         chip_strip.setFixedHeight(chip_row_h)
         chip_lay = QHBoxLayout(chip_strip)
         chip_lay.setContentsMargins(0, 0, 0, 0)
-        chip_lay.setSpacing(chip_spacing)
+        chip_lay.setSpacing(12)
 
-        status_frame = QFrame()
-        status_frame.setObjectName("statusChip")
-        status_frame.setMinimumWidth(158 if self._compact_ui else 184)
-        status_frame.setFixedHeight(chip_row_h)
-        status_layout = QVBoxLayout()
-        status_layout.setContentsMargins(10, 8, 10, 8)
-        status_layout.setSpacing(0)
-        self._flight_status_btn = QPushButton("FLIGHT STATUS")
-        self._flight_status_btn.setObjectName("headerFlightChipBtn")
-        self._flight_status_btn.setSizePolicy(
-            QSizePolicy.MinimumExpanding, QSizePolicy.Fixed
-        )
-        self._flight_status_btn.setMinimumHeight(32)
-        self._flight_status_btn.clicked.connect(self._on_flight_status_popup)
-        status_layout.addStretch(1)
-        status_layout.addWidget(self._flight_status_btn)
-        status_layout.addStretch(1)
-        status_frame.setLayout(status_layout)
-        chip_lay.addWidget(status_frame, 0, Qt.AlignVCenter)
+        chip_lay.addWidget(flight_wrap, 0, Qt.AlignVCenter)
+        chip_lay.addWidget(self._hdr_sep_widget(), 0, Qt.AlignVCenter)
+        chip_lay.addWidget(mode_frame, 0, Qt.AlignVCenter)
+        chip_lay.addWidget(self._hdr_sep_widget(), 0, Qt.AlignVCenter)
+        chip_lay.addWidget(vehicle_pill, 0, Qt.AlignVCenter)
+        chip_lay.addWidget(self._hdr_sep_widget(), 0, Qt.AlignVCenter)
+        chip_lay.addWidget(gps_frame, 0, Qt.AlignVCenter)
+        chip_lay.addWidget(self._hdr_sep_widget(), 0, Qt.AlignVCenter)
+        chip_lay.addWidget(bat_frame, 0, Qt.AlignVCenter)
+        chip_lay.addWidget(self._hdr_sep_widget(), 0, Qt.AlignVCenter)
+        chip_lay.addWidget(rid_frame, 0, Qt.AlignVCenter)
+        chip_lay.addStretch(1)
 
-        for frame in (gps_frame, mode_frame, bat_frame, rid_frame):
-            frame.setFixedHeight(chip_row_h)
-            chip_lay.addWidget(frame, 0, Qt.AlignVCenter)
+        for w in (flight_wrap, mode_frame, vehicle_pill, gps_frame, bat_frame, rid_frame):
+            w.setFixedHeight(chip_row_h)
+
+        self._chip_strip = chip_strip
 
         header_scroll = QScrollArea()
+        self._header_chip_scroll = header_scroll
         header_scroll.setObjectName("headerChipScroll")
         header_scroll.setWidget(chip_strip)
-        header_scroll.setWidgetResizable(False)
+        # Let the chip row use the viewport width: trailing stretch absorbs slack; scroll if content overflows.
+        header_scroll.setWidgetResizable(True)
         header_scroll.setFrameShape(QFrame.NoFrame)
         header_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
@@ -680,20 +867,81 @@ class MainWindow(QMainWindow):
         header_scroll.setMinimumHeight(chip_row_h)
         header_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        right_stack = QWidget()
-        right_layout = QVBoxLayout(right_stack)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addStretch(1)
-        right_layout.addWidget(header_scroll, 0, Qt.AlignVCenter)
-        right_layout.addStretch(1)
+        # Legacy Web: `#linkBannerDisconnected` vs `#linkBannerConnected` (git e48c1a7 — only yellow/green show pills).
+        self._banner_disconnected_wrap = QWidget()
+        self._banner_disconnected_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._banner_disconnected_wrap.setMinimumHeight(chip_row_h)
+        dd_lay = QHBoxLayout(self._banner_disconnected_wrap)
+        dd_lay.setContentsMargins(0, 0, 0, 0)
+        dd_lay.setSpacing(0)
+        self._link_banner_text = QLabel("Disconnected - Click to manually connect 💬")
+        self._link_banner_text.setObjectName("linkBannerText")
+        self._link_banner_text.setWordWrap(False)
+        self._link_banner_text.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        dd_lay.addWidget(self._link_banner_text, 1, Qt.AlignmentFlag.AlignVCenter)
 
-        header_outer.addWidget(left_panel, 0, Qt.AlignTop)
-        header_outer.addWidget(right_stack, 1, Qt.AlignTop)
+        self._banner_connected_wrap = QWidget()
+        self._banner_connected_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._banner_connected_wrap.setMinimumHeight(chip_row_h)
+        cc_lay = QHBoxLayout(self._banner_connected_wrap)
+        cc_lay.setContentsMargins(0, 0, 0, 0)
+        cc_lay.setSpacing(0)
+        cc_lay.addWidget(header_scroll, 1)
 
-        bar.setMinimumHeight(max(chip_row_h, self._logo_btn.height()) + 20)
+        self._header_banner_stack = QStackedWidget()
+        self._header_banner_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._header_banner_stack.addWidget(self._banner_disconnected_wrap)
+        self._header_banner_stack.addWidget(self._banner_connected_wrap)
+
+        header_outer.addWidget(left_panel, 0, Qt.AlignVCenter)
+        header_outer.addWidget(self._header_banner_stack, 1, Qt.AlignVCenter)
+        header_outer.addWidget(self._hdr_map_mode_btn, 0, Qt.AlignVCenter)
+
+        # Web padding 8+8px; inner row chip_row_h — fixed total bar height.
+        _hdr_pad_v = shell.contentsMargins().top() + shell.contentsMargins().bottom()
+        bar.setFixedHeight(chip_row_h + _hdr_pad_v)
         shell.addLayout(header_outer)
         bar.setLayout(shell)
+        self._install_header_connect_click_filters(bar)
         return bar
+
+    def _install_header_connect_click_filters(self, header_bar: QFrame) -> None:
+        """Web `#linkBanner` click: open connect dialog except `#linkBannerLogo` / `#hdrMapModeBtn`."""
+        hdr_btn = getattr(self, "_hdr_map_mode_btn", None)
+        logo_btn = getattr(self, "_logo_btn", None)
+        arm_btn = getattr(self, "_flight_status_btn", None)
+        for w in list(header_bar.findChildren(QWidget)) + [header_bar]:
+            if hdr_btn is not None and (w is hdr_btn or hdr_btn.isAncestorOf(w)):
+                continue
+            if logo_btn is not None and (w is logo_btn or logo_btn.isAncestorOf(w)):
+                continue
+            if arm_btn is not None and (w is arm_btn or arm_btn.isAncestorOf(w)):
+                continue
+            w.installEventFilter(self)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() != QEvent.Type.MouseButtonPress:
+            return super().eventFilter(obj, event)
+        if not isinstance(event, QMouseEvent):
+            return super().eventFilter(obj, event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().eventFilter(obj, event)
+
+        header_bar = getattr(self, "_top_dashboard", None)
+        if header_bar is None or not isinstance(obj, QWidget):
+            return super().eventFilter(obj, event)
+        if obj is not header_bar and not header_bar.isAncestorOf(obj):
+            return super().eventFilter(obj, event)
+        hdr_btn = getattr(self, "_hdr_map_mode_btn", None)
+        if hdr_btn is not None and (obj is hdr_btn or hdr_btn.isAncestorOf(obj)):
+            return super().eventFilter(obj, event)
+        logo_btn = getattr(self, "_logo_btn", None)
+        if logo_btn is not None and (obj is logo_btn or logo_btn.isAncestorOf(obj)):
+            return super().eventFilter(obj, event)
+        if isinstance(obj, QScrollBar):
+            return super().eventFilter(obj, event)
+        self._on_map_connect_requested()
+        return super().eventFilter(obj, event)
 
     @staticmethod
     def _logo_scaled_decode_size(ow: int, oh: int, max_edge: int) -> QSize:
@@ -735,6 +983,7 @@ class MainWindow(QMainWindow):
 
     def _build_m2_operations_layout(self) -> QWidget:
         root = QWidget()
+        root.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         v = QVBoxLayout()
         self._operations_layout = v
         v.setSpacing(8 if self._compact_ui else 12)
@@ -742,21 +991,28 @@ class MainWindow(QMainWindow):
 
         self._center_row = QBoxLayout(QBoxLayout.LeftToRight)
         self._center_row.setSpacing(8 if self._compact_ui else 12)
+        # Vehicle message lives in Web-style `#linkBanner` only (git e48c1a7); keep zero-width stub for compat.
         self._center_row.addWidget(self._vehicle_msg_frame, 0, Qt.AlignTop)
         self._center_row.addWidget(self._map_widget, 1)
         self._camera_panel = self._build_camera_control_panel()
-        self._center_row.addWidget(self._camera_panel, 0)
+        # Create the camera control backend used by split/video transforms,
+        # but do not add it to the visible layout (removes the "Camera Control" UI panel).
+        try:
+            self._camera_panel.setVisible(False)
+        except Exception:
+            pass
 
         self._footer_row = QBoxLayout(QBoxLayout.LeftToRight)
         self._footer_row.setSpacing(8 if self._compact_ui else 12)
-        self._footer_row.addWidget(self._build_split_camera_panel(), 1)
+        self._split_camera_panel = self._build_split_camera_panel()
+        self._footer_row.addWidget(self._split_camera_panel, 1)
         self._footer_row.addWidget(self._build_primary_flight_footer(), 1)
         self._footer_row.addWidget(self._build_compass_footer(), 1)
         self._footer_row.addWidget(self._build_nav_system_footer(), 1)
         self._footer_widget = QWidget()
         self._footer_widget.setLayout(self._footer_row)
 
-        v.addLayout(self._center_row)
+        v.addLayout(self._center_row, 1)
         v.addWidget(self._footer_widget)
         root.setLayout(v)
         return root
@@ -861,16 +1117,16 @@ class MainWindow(QMainWindow):
         self._watchdog_frame.setVisible(not enabled)
 
     def _set_map_only_dashboard_mode(self, enabled: bool) -> None:
-        """Hard map-only dashboard mode requested by UI direction."""
+        """Map-centric layout: keep operator clutter hidden but retain native header (logo + flight chips)."""
         if not enabled:
             return
         self._central_layout.setContentsMargins(0, 0, 0, 0)
         self._content_layout.setContentsMargins(0, 0, 0, 0)
-        self._content_layout.setSpacing(0)
+        self._content_layout.setSpacing(2)
         self._operations_layout.setContentsMargins(0, 0, 0, 0)
         self._operations_layout.setSpacing(0)
         self._center_row.setSpacing(0)
-        self._top_dashboard.setVisible(False)
+        self._top_dashboard.setVisible(True)
         self._link_box.setVisible(False)
         self._m2_controls_panel.setVisible(False)
         self._status_frame.setVisible(False)
@@ -879,6 +1135,10 @@ class MainWindow(QMainWindow):
         self._mission_list_panel.setVisible(False)
         self._log.setVisible(False)
         self._footer_widget.setVisible(False)
+        try:
+            self._split_camera_panel.setVisible(False)
+        except Exception:
+            pass
         self._vehicle_msg_frame.setVisible(False)
         self._camera_panel.setVisible(False)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1216,13 +1476,11 @@ class MainWindow(QMainWindow):
         self._map_widget.set_plan_mission_start_stack(False)
         self._map_widget.set_plan_sequence_template("")
         self._sync_plan_flight_chrome()
-        wp_line = f"{n} waypoint(s) remain on the map." if n else "No waypoints on the map."
-        QMessageBox.information(
-            self,
-            "Plan Flight complete",
-            f"You left Plan Flight mode.\n\n{wp_line}\n"
-            "Mission options (altitudes, speeds, launch) are stored in application settings.\n"
-            "Use Upload from Plan or the map toolbar when you are ready to send the mission to the vehicle.",
+        wp_line = f"{n} waypoint(s) on the map." if n else "No waypoints on the map."
+        # Avoid a blocking dialog on every exit — that was easy to mistake for a fault.
+        self._append_log(
+            f"Plan Flight closed. {wp_line} "
+            "Mission options stay in application settings; use Plan Upload or the map toolbar to send to the vehicle."
         )
 
     def _on_map_page_ready(self) -> None:
@@ -1230,6 +1488,22 @@ class MainWindow(QMainWindow):
         if self._plan_flight_layer_wanted:
             self._map_widget.set_plan_flight_visible(True)
         self._sync_plan_flight_chrome()
+        # Native 2D is default; 3D uses optional lazy-loaded WebEngine (see map_web_3d / legacy_leaflet_map.html).
+        if getattr(self._map_widget, "_native_map", None) is not None:
+            if not HAS_MAP_WEBENGINE:
+                tip = (
+                    "2D native map only — install PySide6 WebEngine to enable the 3D globe (Cesium) toggle."
+                )
+            else:
+                tip = "Toggle 3D globe (WebEngine) or 2D native tiles."
+            self._hdr_map_mode_btn.setEnabled(True)
+            self._hdr_map_mode_btn.setToolTip(tip)
+            self._btn_map_3d.setEnabled(True)
+            self._btn_map_3d.setToolTip(tip)
+            self._btn_map_3d.blockSignals(True)
+            self._btn_map_3d.setChecked(False)
+            self._btn_map_3d.blockSignals(False)
+            self._sync_hdr_map_mode_btn_label()
 
     def _restore_plan_mission_panel_to_map(self) -> None:
         s = self._settings
@@ -1241,6 +1515,9 @@ class MainWindow(QMainWindow):
             "launchLat": str(s.value("plan_launch_lat_str", "") or ""),
             "launchLon": str(s.value("plan_launch_lon_str", "") or ""),
             "wpMeta": self._map_widget.get_waypoint_meta(),
+            "patternRowSpacingM": float(s.value("plan_pattern_row_spacing_m", 20.0) or 20.0),
+            "patternPassWidthM": float(s.value("plan_pattern_pass_width_m", 80.0) or 80.0),
+            "patternPassDepthM": float(s.value("plan_pattern_pass_depth_m", 60.0) or 60.0),
         }
         self._map_widget.apply_plan_mission_panel_state(state)
         self._apply_plan_mission_panel_to_model(state)
@@ -1280,6 +1557,18 @@ class MainWindow(QMainWindow):
         wp_meta = data.get("wpMeta")
         if isinstance(wp_meta, list):
             self._map_widget.apply_waypoint_meta(wp_meta)
+        s.setValue(
+            "plan_pattern_row_spacing_m",
+            float(data.get("patternRowSpacingM", 20.0) or 20.0),
+        )
+        s.setValue(
+            "plan_pattern_pass_width_m",
+            float(data.get("patternPassWidthM", 80.0) or 80.0),
+        )
+        s.setValue(
+            "plan_pattern_pass_depth_m",
+            float(data.get("patternPassDepthM", 60.0) or 60.0),
+        )
         self._apply_plan_mission_panel_to_model(data)
 
     def _default_wp_alt_m_for_plan_state(self, state: dict[str, object]) -> float:
@@ -1308,21 +1597,31 @@ class MainWindow(QMainWindow):
         self._plan_hover_speed_mps = max(0.5, mph * 0.44704)
         self._maybe_refresh_map_web_overlays()
 
+    def _sync_hdr_map_mode_btn_label(self) -> None:
+        """Match Web `hdrMapModeBtn`: label shows target mode (3D when in 2D, 2D when in 3D)."""
+        real = bool(getattr(self._map_widget, "_is_3d_mode", False))
+        self._hdr_map_mode_btn.setText("2D" if real else "3D")
+
+    def _on_map_3d_mode_changed(self) -> None:
+        """Native 3D flag updates asynchronously after WebEngine load / Cesium JS — keep header + M2 in sync."""
+        self._sync_hdr_map_mode_btn_label()
+        try:
+            real = bool(getattr(self._map_widget, "_is_3d_mode", False))
+            self._btn_map_3d.blockSignals(True)
+            self._btn_map_3d.setChecked(real)
+            self._btn_map_3d.blockSignals(False)
+        except Exception:
+            pass
+
     def _on_toggle_map_3d(self, enabled: bool) -> None:
         active = self._map_widget.set_3d_enabled(enabled)
+        self._sync_hdr_map_mode_btn_label()
         if active != enabled:
             self._btn_map_3d.blockSignals(True)
             self._btn_map_3d.setChecked(active)
             self._btn_map_3d.blockSignals(False)
             return
-
-        def _sync_btn() -> None:
-            real = bool(getattr(self._map_widget, "_is_3d_mode", False))
-            self._btn_map_3d.blockSignals(True)
-            self._btn_map_3d.setChecked(real)
-            self._btn_map_3d.blockSignals(False)
-
-        QTimer.singleShot(180, _sync_btn)
+        self._on_map_3d_mode_changed()
 
     def _on_map_toggle_3d_requested(self) -> None:
         current = bool(getattr(self._map_widget, "_is_3d_mode", False))
@@ -1346,6 +1645,9 @@ class MainWindow(QMainWindow):
         self._append_log("Shortcut: toggle map 3D view (Ctrl+3)")
 
     def _on_logo_menu(self, anchor_pos: QPoint | None = None) -> None:
+        # Wired to ``QPushButton.clicked`` → Qt invokes ``clicked(bool)``; ignore that payload.
+        if anchor_pos is not None and not isinstance(anchor_pos, QPoint):
+            anchor_pos = None
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
         menu.setStyleSheet(
@@ -1393,14 +1695,17 @@ class MainWindow(QMainWindow):
         action_close.setToolTip("Exit the application.")
         action_close.setIcon(self._menu_icon("close_vgcs.svg"))
 
-        if anchor_pos is not None:
+        if anchor_pos is not None and isinstance(anchor_pos, QPoint):
             pos = anchor_pos
-        elif self._map_only_dashboard:
-            # In map-only mode, anchor under the map header logo strip.
-            pos = self._map_widget.mapToGlobal(QPoint(10, 56))
         else:
-            pos = self._logo_btn.mapToGlobal(self._logo_btn.rect().bottomLeft())
-        pos = QPoint(pos.x(), pos.y() + 6)
+            hdr = getattr(self, "_top_dashboard", None)
+            if hdr is not None:
+                # Flush under `#headerBar` (no gap); was logo bottom + 6px which showed map between bar and menu.
+                pos = hdr.mapToGlobal(QPoint(0, hdr.height()))
+            elif self._map_only_dashboard:
+                pos = self._map_widget.mapToGlobal(QPoint(10, 56))
+            else:
+                pos = self._logo_btn.mapToGlobal(self._logo_btn.rect().bottomLeft())
         picked = menu.exec(pos)
         if picked is action_close:
             self.close()
@@ -1444,7 +1749,7 @@ class MainWindow(QMainWindow):
         hb = self._hb.text()
         mode = self._top_flight_mode.text()
         battery = self._top_battery.text()
-        gps = self._top_gps_hdop.text()
+        gps = self._top_gps_status_line()
         mission_distance_ft = f"{self._max_telem_dist_m * 3.28084:.0f}"
         return (
             "Live Analysis Snapshot\n\n"
@@ -2018,63 +2323,87 @@ class MainWindow(QMainWindow):
 
         _refresh_feature_controls_from_cache()
 
+        def _apply_all_from_dialog() -> bool:
+            """Push flight mode, takeoff altitude, assist params, and optional advanced param to the vehicle."""
+            if self._thread is None or not self._thread.isRunning():
+                QMessageBox.warning(self, "VGCS", "Connect vehicle before applying configuration.")
+                return False
+            _sync_alt_to_main()
+            _set_mode_from_dialog()
+            _apply_features_from_dialog()
+            if adv_box.isChecked():
+                _param_set_from_dialog()
+            extra = " + param" if adv_box.isChecked() else ""
+            self._append_log(f"Vehicle configuration applied (OK): mode, takeoff alt, assist{extra}")
+            return True
+
+        def _on_dialog_ok() -> None:
+            if _apply_all_from_dialog():
+                dlg.accept()
+
         # Footer
         lay.addStretch(1)
         footer = QHBoxLayout()
         footer.addStretch(1)
+        btn_ok = QPushButton("OK")
+        btn_ok.setEnabled(can_send)
+        btn_ok.setDefault(True)
+        btn_ok.setAutoDefault(True)
+        btn_ok.setToolTip(
+            "Apply flight mode, takeoff altitude (for takeoff commands), assist features, "
+            "and—if Advanced parameters is expanded—the selected parameter."
+        )
         btn_close = QPushButton("Close")
+        btn_close.setToolTip("Close without applying the above as one batch (per-section buttons still work).")
+        footer.addWidget(btn_ok)
         footer.addWidget(btn_close)
         root.addLayout(footer)
-        btn_close.clicked.connect(dlg.accept)
+        btn_ok.clicked.connect(_on_dialog_ok)
+        btn_close.clicked.connect(dlg.reject)
         dlg.exec()
         self._scroll_main_to(self._m2_controls_panel)
 
-    def _on_flight_status_popup(self) -> None:
-        msg = (
-            f"Link: {self._status.text()}\n"
-            f"Flight mode: {self._top_flight_mode.text()}\n"
-            f"GPS/HDOP: {self._top_gps_hdop.text()}\n"
-            f"Battery: {self._top_battery.text()}\n"
-            f"Remote ID: {self._top_remote_id.text()}\n"
-            f"Vehicle Msg: {self._top_vehicle_msg.text()}\n"
-            f"Heartbeat: {self._hb.text()}\n"
-        )
-        QMessageBox.information(self, "Flight Status", msg)
-
     def _set_dashboard_flight_status(self, state: str, message: str) -> None:
+        """Mirror legacy Web `setFlightStatus()` — full `#linkBanner` tint (git e48c1a7 map_widget)."""
         state_norm = (state or "").strip().lower()
+        self._apply_link_banner_palette(state_norm)
+        lb = getattr(self, "_link_banner_text", None)
+        if lb is not None:
+            lb.setText(message)
+        stack = getattr(self, "_header_banner_stack", None)
+        if stack is not None:
+            # Web: `#linkBannerConnected` only when green/yellow; else `#linkBannerDisconnected`.
+            stack.setCurrentIndex(1 if state_norm in ("green", "yellow") else 0)
+
         if state_norm == "green":
-            self._flight_status_btn.setStyleSheet(
-                "background-color: #2f8f42; color: #ffffff; border: 1px solid #8ee7a1;"
-                "border-radius: 4px; font-weight: 700;"
-            )
             self._flight_status_btn.setText("READY TO ARM")
             self._top_vehicle_msg.setText(message)
             self._map_widget.set_flight_status("green", message)
             return
         if state_norm == "yellow":
-            self._flight_status_btn.setStyleSheet(
-                "background-color: #b58917; color: #141414; border: 1px solid #f7d85e;"
-                "border-radius: 4px; font-weight: 700;"
-            )
             self._flight_status_btn.setText("NOT READY TO ARM")
             self._top_vehicle_msg.setText(message)
             self._map_widget.set_flight_status("yellow", message)
             return
-        self._flight_status_btn.setStyleSheet(
-            "background-color: #a42424; color: #ffffff; border: 1px solid #ff8d8d;"
-            "border-radius: 4px; font-weight: 700;"
-        )
+        if state_norm == "red":
+            self._flight_status_btn.setText("NOT READY TO ARM")
+            self._top_vehicle_msg.setText(message)
+            self._map_widget.set_flight_status("red", message)
+            return
+        # Cold-start / idle disconnected: Web stylesheet `#linkBanner` neutral background — not maroon.
         self._flight_status_btn.setText("NOT READY TO ARM")
         self._top_vehicle_msg.setText(message)
-        self._map_widget.set_flight_status("red", message)
+        self._map_widget.set_flight_status("idle", message)
 
     def _push_map_flight_overlay(self) -> None:
         if self._armed_since is None:
-            flight_time_text = "00:00"
+            flight_time_text = "00:00:00"
         else:
             elapsed = int(time.monotonic() - self._armed_since)
-            flight_time_text = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+            h = elapsed // 3600
+            m = (elapsed % 3600) // 60
+            s = elapsed % 60
+            flight_time_text = f"{h:02d}:{m:02d}:{s:02d}"
         self._map_widget.set_flight_telemetry(
             relative_alt_m=float(self._map_rel_alt_m),
             ground_speed_mps=float(self._map_groundspeed_mps),
@@ -2215,6 +2544,7 @@ class MainWindow(QMainWindow):
         self._apply_state_style(self._fields["arm_ready"], "")
         self._apply_state_style(self._fields["rc_link"], "")
         self._map_widget.set_mission_waypoint_count(0)
+        self._top_gps_sat.setText("—")
         self._top_gps_hdop.setText("—")
         self._top_flight_mode.setText("—")
         self._top_battery.setText("—")
@@ -2474,6 +2804,11 @@ class MainWindow(QMainWindow):
             self._sync_mode_options_for_vehicle(int(data.get("vehicle_type", 0) or 0))
             self._top_flight_mode.setText(mode_text)
             self._map_widget.set_header_mode(mode_text)
+            # Keep mode dropdown aligned with the vehicle (dialog copies this combo at open).
+            if mode_text and self._mode_combo.findText(mode_text) >= 0:
+                self._mode_combo.blockSignals(True)
+                self._mode_combo.setCurrentText(mode_text)
+                self._mode_combo.blockSignals(False)
             ap = int(data.get("autopilot", 0) or 0)
             vt = int(data.get("vehicle_type", 0) or 0)
             self._map_widget.set_plan_vehicle_info(
@@ -2557,9 +2892,8 @@ class MainWindow(QMainWindow):
             self._fields["gps"].setText(
                 f"fix={int(data.get('fix_type', 0))} sat={sat} hdop={hdop_text}"
             )
-            self._top_gps_hdop.setText(
-                f"fix {int(data.get('fix_type', 0))} / {hdop_text}"
-            )
+            self._top_gps_sat.setText(str(sat))
+            self._top_gps_hdop.setText(hdop_text)
             self._map_widget.set_header_gps(sat, hdop_text)
         elif msg_type == "SYS_STATUS":
             pct = int(data.get("battery_remaining", -1))
@@ -2656,13 +2990,24 @@ class MainWindow(QMainWindow):
             self._append_log(f"Mode change failed: {mode_name}")
             self._top_vehicle_msg.setText("Mode change failed")
 
-    def _on_takeoff(self) -> None:
+    def _takeoff_altitude_m(self, *, from_plan_rail: bool) -> float:
+        """Target climb (m) for NAV_TAKEOFF: plan launch alt when set on rail; else dashboard spin."""
+        if from_plan_rail:
+            plan_alt = self._plan_takeoff_alt_m_from_launch_settings()
+            if plan_alt is not None:
+                return max(1.0, float(plan_alt))
+        return max(1.0, float(self._takeoff_alt_spin.value()))
+
+    def _queue_nav_takeoff(self, alt_m: float) -> None:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before takeoff command.")
             return
-        alt = float(self._takeoff_alt_spin.value())
+        alt = max(1.0, float(alt_m))
         self._thread.queue_takeoff(alt)
         self._append_log(f"Takeoff queued: {alt:.1f}m")
+
+    def _on_takeoff(self) -> None:
+        self._queue_nav_takeoff(self._takeoff_altitude_m(from_plan_rail=False))
 
     def _on_land(self) -> None:
         if self._thread is None or not self._thread.isRunning():
@@ -2751,8 +3096,18 @@ class MainWindow(QMainWindow):
         if isinstance(cfg, dict):
             self._thread.queue_geofence_upload(cfg)
 
+    def _suppress_header_connect_spurious_reopen(self) -> None:
+        """Eat stray mouse-ups delivered to the banner right after a modal closes (Cancel/OK)."""
+        self._suppress_header_connect_after_dialog = True
+        QTimer.singleShot(450, self._clear_header_connect_suppression)
+
+    def _clear_header_connect_suppression(self) -> None:
+        self._suppress_header_connect_after_dialog = False
+
     def _on_map_connect_requested(self) -> None:
         # Header click must always request an explicit connection string.
+        if self._suppress_header_connect_after_dialog:
+            return
         current = self._conn_edit.text().strip()
         if not current:
             current = str(self._settings.value("last_connection_string", "udp:127.0.0.1:14550"))
@@ -2764,6 +3119,7 @@ class MainWindow(QMainWindow):
             QLineEdit.EchoMode.Normal,
             current,
         )
+        self._suppress_header_connect_spurious_reopen()
         if not ok:
             return
         connection_string = value.strip()
@@ -2820,15 +3176,36 @@ class MainWindow(QMainWindow):
         d_lon = east_m / (111_320.0 * max(0.1, cos_lat))
         return lat_deg + d_lat, lon_deg + d_lon
 
-    def _build_m2_grid_pattern(self) -> list[Waypoint]:
+    def _pattern_anchor_lat_lon(self) -> tuple[float, float] | None:
+        """Centroid for M2 auto-generated patterns: vehicle + Mission fence radius (m) north.
+
+        Keeps survey/corridor/structure grids from stacking on the home position; larger
+        fence radius pushes the pattern farther away (same control as geofence upload).
+        """
         ref = self._map_widget.get_vehicle_position()
         if ref is None:
-            return []
+            return None
         lat0, lon0 = ref
-        # M2 default: compact lawnmower around vehicle position.
-        width_m = 80.0
-        height_m = 60.0
-        line_spacing_m = 20.0
+        spawn_m = max(0.0, float(self._geofence_radius_spin.value()))
+        return self._offset_lat_lon_m(lat0, lon0, 0.0, spawn_m)
+
+    def _plan_pattern_geometry_m(self) -> tuple[float, float, float]:
+        """Row spacing, pass width, pass depth (m) from Mission panel / QSettings."""
+        s = self._settings
+        row = float(s.value("plan_pattern_row_spacing_m", 20.0) or 20.0)
+        w_m = float(s.value("plan_pattern_pass_width_m", 80.0) or 80.0)
+        h_m = float(s.value("plan_pattern_pass_depth_m", 60.0) or 60.0)
+        row = max(3.0, min(300.0, row))
+        w_m = max(15.0, min(2000.0, w_m))
+        h_m = max(15.0, min(2000.0, h_m))
+        return row, w_m, h_m
+
+    def _build_m2_grid_pattern(self) -> list[Waypoint]:
+        anchor = self._pattern_anchor_lat_lon()
+        if anchor is None:
+            return []
+        lat0, lon0 = anchor
+        line_spacing_m, width_m, height_m = self._plan_pattern_geometry_m()
         half_w = width_m / 2.0
         half_h = height_m / 2.0
         rows = max(2, int(round(height_m / line_spacing_m)) + 1)
@@ -2847,17 +3224,19 @@ class MainWindow(QMainWindow):
         return waypoints
 
     def _build_m2_corridor_pattern(self) -> list[Waypoint]:
-        ref = self._map_widget.get_vehicle_position()
-        if ref is None:
+        anchor = self._pattern_anchor_lat_lon()
+        if anchor is None:
             return []
-        lat0, lon0 = ref
-        length_m = 100.0
-        line_spacing_m = 22.0
+        lat0, lon0 = anchor
+        line_spacing_m, length_m, depth_m = self._plan_pattern_geometry_m()
+        line_spacing_m = max(3.0, line_spacing_m)
         half_len = length_m / 2.0
+        n_rows = max(2, int(round(depth_m / line_spacing_m)) + 1)
+        half_span = (n_rows - 1) * line_spacing_m / 2.0
         waypoints: list[Waypoint] = []
         alt_m = float(self._map_widget.get_default_waypoint_alt_m())
-        for row in range(3):
-            north = (row - 1) * line_spacing_m
+        for row in range(n_rows):
+            north = -half_span + row * line_spacing_m
             left = self._offset_lat_lon_m(lat0, lon0, -half_len, north)
             right = self._offset_lat_lon_m(lat0, lon0, half_len, north)
             if row % 2 == 0:
@@ -2869,11 +3248,11 @@ class MainWindow(QMainWindow):
         return waypoints
 
     def _build_m2_structure_pattern(self) -> list[Waypoint]:
-        ref = self._map_widget.get_vehicle_position()
-        if ref is None:
+        anchor = self._pattern_anchor_lat_lon()
+        if anchor is None:
             return []
-        lat0, lon0 = ref
-        w_m, h_m = 40.0, 30.0
+        lat0, lon0 = anchor
+        _row, w_m, h_m = self._plan_pattern_geometry_m()
         hw, hh = w_m / 2.0, h_m / 2.0
         corners = [
             self._offset_lat_lon_m(lat0, lon0, -hw, hh),
@@ -2939,9 +3318,19 @@ class MainWindow(QMainWindow):
             self._map_widget.set_plan_sequence_template("survey")
             self._append_log("Plan template: Survey")
             self._ensure_plan_launch_from_vehicle_if_empty()
-            # Keep Survey selected without auto-generating a grid immediately.
+            wps = self._build_m2_grid_pattern()
+            if not wps:
+                self._map_widget.set_plan_sequence_template("")
+                QMessageBox.warning(
+                    self,
+                    "Plan Flight",
+                    "Survey template needs a vehicle GPS position.\nConnect and wait for position first.",
+                )
+                return
+            self._map_widget.set_waypoints(wps, clear_plan_current_file=True)
             self._map_widget.set_plan_mission_start_stack(True, "Survey")
             self._map_widget.set_plan_rail_tool("Pattern")
+            self._append_log(f"Survey template: {len(wps)} waypoints (M2 grid)")
             return
         if a == "template_corridor":
             self._map_widget.set_plan_mission_start_stack(False)
@@ -2991,7 +3380,7 @@ class MainWindow(QMainWindow):
             return
         if tool == "takeoff":
             self._append_log("Plan tool: Takeoff")
-            self._on_takeoff()
+            self._queue_nav_takeoff(self._takeoff_altitude_m(from_plan_rail=True))
             return
         if tool == "waypoint":
             self._append_log("Plan tool: Waypoint mode")
@@ -3128,6 +3517,21 @@ class MainWindow(QMainWindow):
     def _on_param_set_result(self, name: str, ok: bool, detail: str) -> None:
         msg = f"Param {'OK' if ok else 'FAIL'}: {name} {detail}"
         self._append_log(msg)
+        if ok:
+            try:
+                v = float(str(detail).strip())
+            except Exception:
+                v = None
+            if v is not None:
+                key = str(name).strip().upper()
+                self._last_params[key] = v
+                cur = self._param_name_combo.currentText().strip().upper()
+                if cur == key:
+                    self._param_value_spin.setValue(v)
+                self._refresh_acro_options_ui()
+            self._top_vehicle_msg.setText(msg[:80])
+        else:
+            self._top_vehicle_msg.setText(msg[:80])
 
     def _on_tiles_online(self) -> None:
         self._map_widget.activate_online_tiles()
@@ -3269,6 +3673,9 @@ class MainWindow(QMainWindow):
 
     def _on_link_error(self, text: str) -> None:
         self._append_log(f"Error: {text}")
+        t = str(text or "")
+        if "mission_upload" in t or "Mission upload" in t or "mission upload" in t.lower():
+            self._mission_upload_pending = False
         self._set_dashboard_flight_status("red", "Communication lost - Not Ready to Arm")
         if self._connect_attempt_active and not self._heartbeat_seen:
             self._connect_attempt_active = False
