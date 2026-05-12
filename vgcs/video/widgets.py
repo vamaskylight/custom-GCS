@@ -338,5 +338,5 @@ class SplitVideoPanel(QGroupBox):
 
                 return _on_frame
 
-            src.frame.connect(_mk_handler(sid))
+            src.frame.connect(_mk_handler(sid), Qt.ConnectionType.QueuedConnection)
 

@@ -3048,7 +3048,10 @@ class MapWidget(QWidget):
                     except Exception:
                         pass
             if self._video_active_source is not None:
-                self._video_active_source.frame.connect(self._on_pipeline_frame)
+                self._video_active_source.frame.connect(
+                    self._on_pipeline_frame,
+                    Qt.ConnectionType.QueuedConnection,
+                )
             # Prep split handlers for up to 4 sources.
             for sid, src in list(sources.items())[:4]:
                 bridge = _VideoEncodeBridge(self)
@@ -3064,11 +3067,15 @@ class MapWidget(QWidget):
                             lambda msg, sid=sid: (
                                 print(f"[VGCS:video] Video({sid}) error: {str(msg)}"),
                                 self._set_status(f"Video({sid}) error: {str(msg)}"),
-                            )[1]
+                            )[1],
+                            Qt.ConnectionType.QueuedConnection,
                         )
                 except Exception:
                     pass
-                src.frame.connect(lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf))
+                src.frame.connect(
+                    lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf),
+                    Qt.ConnectionType.QueuedConnection,
+                )
             if shared is not None:
                 self._shared_vp_hooks_connected = True
         except Exception:
@@ -3704,7 +3711,10 @@ class MapWidget(QWidget):
                     ) != src_id:
                         setattr(self, "_obs_clip_error_hooked_for", src_id)
                         if hasattr(src, "error") and hasattr(src.error, "connect"):
-                            src.error.connect(lambda msg: self._set_status(f"Observation clip error: {msg}"))
+                            src.error.connect(
+                                lambda msg: self._set_status(f"Observation clip error: {msg}"),
+                                Qt.ConnectionType.QueuedConnection,
+                            )
                 except Exception:
                     pass
                 # Some backends require a running player; start() is harmless for recording backends.

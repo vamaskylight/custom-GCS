@@ -508,10 +508,11 @@ class RtspSource(QObject):
             path,
         ]
         try:
+            # stderr=DEVNULL: see continuous decode Popen (pipe deadlock on Windows).
             self._rec_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
             )
             return True
@@ -798,7 +799,6 @@ class RtspSource(QObject):
                 qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
                 meta = FrameMeta(source_id=self.source_id, device_name=self.device_name, timestamp_ms=0)
                 self.frame.emit(VideoFrame(qimg, meta))
-                self._ffmpeg_last_frame_mono = time.monotonic()
             except Exception as e:
                 self.error.emit(f"FFmpeg probe decode failed ({tr_label}): {e}")
                 continue
@@ -825,10 +825,12 @@ class RtspSource(QObject):
                 "pipe:1",
             ]
             try:
+                # Never use stderr=PIPE for long-running decode: on Windows the buffer fills,
+                # FFmpeg blocks on logging, and stdout stops (feed looks "frozen" after 1 frame).
                 self._ffmpeg_proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
                     bufsize=0,
                 )
@@ -859,15 +861,6 @@ class RtspSource(QObject):
             if self._ffmpeg_last_frame_mono > 0.0:
                 break
 
-            # Surface any remaining stderr.
-            try:
-                if self._ffmpeg_proc is not None and self._ffmpeg_proc.stderr is not None:
-                    err_rem = self._ffmpeg_proc.stderr.read()[:4000]
-                    decoded = err_rem.decode(errors="ignore") if err_rem else ""
-                    if decoded.strip():
-                        self.error.emit(f"FFmpeg stream error ({tr_label}): {decoded}")
-            except Exception:
-                pass
             self._ffmpeg_proc = None
 
         self._stop_ffmpeg()
@@ -917,7 +910,7 @@ class VideoPipeline(QObject):
                     udp_input_format=udp_demux,
                     parent=self,
                 )
-                day.frame.connect(self._on_source_frame)
+                day.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
                 self._sources["day"] = day
             if self._rtsp_thermal_url:
                 th = RtspSource(
@@ -928,7 +921,7 @@ class VideoPipeline(QObject):
                     udp_input_format=udp_demux,
                     parent=self,
                 )
-                th.frame.connect(self._on_source_frame)
+                th.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
                 self._sources["thermal"] = th
         # Local cameras (optional, still useful for development).
         if HAS_MULTIMEDIA and QMediaDevices is not None:
@@ -939,7 +932,7 @@ class VideoPipeline(QObject):
             for i, dev in enumerate(devices):
                 src_id = f"cam{i}"
                 src = CameraSource(dev, source_id=src_id, parent=self)
-                src.frame.connect(self._on_source_frame)
+                src.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
                 self._sources[src_id] = src
         if not self._active_source_id and self._sources:
             self._active_source_id = next(iter(self._sources.keys()))
