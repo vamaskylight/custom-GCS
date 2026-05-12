@@ -618,12 +618,35 @@ class RtspSource(QObject):
             self._ffmpeg_stop.set()
         except Exception:
             pass
+        self._close_ffmpeg_decode_proc()
+
+    def _close_ffmpeg_decode_proc(self) -> None:
+        """Terminate the continuous decode child only (does not set `_ffmpeg_stop`)."""
+        p = self._ffmpeg_proc
+        self._ffmpeg_proc = None
+        if p is None:
+            return
         try:
-            if self._ffmpeg_proc is not None and self._ffmpeg_proc.poll() is None:
-                self._ffmpeg_proc.kill()
+            out = p.stdout
+            if out is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
         except Exception:
             pass
-        self._ffmpeg_proc = None
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _ffprobe_dims(
         self, url: str, *, rtsp_transport: str | None = None, udp_input_format: str = ""
@@ -684,27 +707,24 @@ class RtspSource(QObject):
     def _ffmpeg_loop(self) -> None:
         url = str(self._url or "").strip()
         transport_seq = _rtsp_transport_sequence(url, self._transport)
+        # One ffprobe only: extra RTSP sessions often make cheap encoders drop the stream
+        # after a few seconds (looks like "works then freezes").
         dims: tuple[int, int] | None = None
-        for tr_try in transport_seq:
-            if self._ffmpeg_stop.is_set():
-                break
-            d = self._ffprobe_dims(url, rtsp_transport=tr_try, udp_input_format=self._udp_input_format)
-            if d:
-                dims = d
-                break
-        # Prefer a higher decode cap so fullscreen preview preserves detail.
-        # Keep a cap to avoid overwhelming low-end systems with raw pipe traffic.
+        if transport_seq:
+            dims = self._ffprobe_dims(
+                url,
+                rtsp_transport=transport_seq[0],
+                udp_input_format=self._udp_input_format,
+            )
         dims = dims or (1280, 720)
         src_w, src_h = dims
         src_w = max(1, int(src_w))
         src_h = max(1, int(src_h))
         cap_w = 1920
         cap_h = 1080
-        # Preserve source aspect ratio while capping decode size.
         scale = min(float(cap_w) / float(src_w), float(cap_h) / float(src_h), 1.0)
         w = max(2, int(round(src_w * scale)))
         h = max(2, int(round(src_h * scale)))
-        # Raw RGB decode needs even dims in some ffmpeg builds/codecs.
         if (w % 2) != 0:
             w -= 1
         if (h % 2) != 0:
@@ -714,12 +734,9 @@ class RtspSource(QObject):
         self._ffmpeg_dims = (w, h)
         frame_bytes = int(w) * int(h) * 3
 
-        # RTSP auto: LAN / radio prefers TCP then UDP; public hostname tries UDP then TCP.
-        # Non-RTSP: transport_seq is a single pass with no `-rtsp_transport`.
         for transport in transport_seq:
             if self._ffmpeg_stop.is_set():
                 break
-            self._ffmpeg_last_frame_mono = 0.0
             demux = _ffmpeg_udp_raw_demux(url, self._udp_input_format)
             tr_label = str(transport) if transport is not None else "n/a"
             print(f"[VGCS:video] FFmpeg decode try rtsp_transport={tr_label} url={url}")
@@ -729,7 +746,7 @@ class RtspSource(QObject):
                 "-hide_banner",
                 "-nostats",
                 "-loglevel",
-                "info",
+                "error",
                 *demux,
                 *_ffmpeg_preflags_before_input(url, rtsp_transport=transport),
                 "-i",
@@ -751,13 +768,12 @@ class RtspSource(QObject):
                 probe_proc = subprocess.Popen(
                     probe_cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
                     bufsize=0,
                 )
                 assert probe_proc.stdout is not None
-                assert probe_proc.stderr is not None
-                out, err = probe_proc.communicate(timeout=25.0)
+                out, _err = probe_proc.communicate(timeout=25.0)
             except subprocess.TimeoutExpired:
                 if probe_proc is not None:
                     try:
@@ -765,36 +781,22 @@ class RtspSource(QObject):
                     except Exception:
                         pass
                     try:
-                        out, err = probe_proc.communicate(timeout=2.0)
+                        out, _err = probe_proc.communicate(timeout=2.0)
                     except Exception:
-                        out, err = b"", b""
+                        out = b""
                 else:
-                    out, err = b"", b""
+                    out = b""
             except Exception as e:
-                try:
-                    if probe_proc is not None and probe_proc.stderr is not None:
-                        err = probe_proc.stderr.read()[:2000]
-                    else:
-                        err = b""
-                except Exception:
-                    err = b""
-                self.error.emit(f"FFmpeg probe failed ({tr_label}): {e} " + err.decode(errors="ignore"))
+                self.error.emit(f"FFmpeg probe failed ({tr_label}): {e}")
                 continue
 
             out_len = len(out or b"")
-            # ffmpeg prints a lot of config/banner output; prefer the tail
-            # which usually contains the actual RTSP/decoder failure line.
-            err_bytes = err or b""
-            err_tail = err_bytes[-2200:] if len(err_bytes) > 2200 else err_bytes
-            err_str = err_tail.decode(errors="ignore").strip()
             if out_len < frame_bytes:
-                # If stderr is empty, still provide the length as a hint.
-                hint = err_str if err_str else f"no frames decoded (stdout_bytes={out_len}, expected={frame_bytes})"
+                hint = f"no frames decoded (stdout_bytes={out_len}, expected={frame_bytes})"
                 self.error.emit(f"FFmpeg stream error ({tr_label}): {hint}")
                 continue
 
             try:
-                # Decode the probed single frame.
                 arr = np.frombuffer(out[:frame_bytes], dtype=np.uint8).reshape((h, w, 3))  # type: ignore[union-attr]
                 qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
                 meta = FrameMeta(source_id=self.source_id, device_name=self.device_name, timestamp_ms=0)
@@ -803,9 +805,7 @@ class RtspSource(QObject):
                 self.error.emit(f"FFmpeg probe decode failed ({tr_label}): {e}")
                 continue
 
-            # Continuous stage: now that we know the transport+codec works,
-            # start streaming frames to the pipe.
-            cmd = [
+            cmd_base = [
                 "ffmpeg",
                 "-hide_banner",
                 "-nostats",
@@ -824,44 +824,91 @@ class RtspSource(QObject):
                 "rawvideo",
                 "pipe:1",
             ]
-            try:
-                # Never use stderr=PIPE for long-running decode: on Windows the buffer fills,
-                # FFmpeg blocks on logging, and stdout stops (feed looks "frozen" after 1 frame).
-                self._ffmpeg_proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    bufsize=0,
-                )
-            except Exception as e:
-                self.error.emit(f"FFmpeg start (continuous) failed: {e}")
-                self._ffmpeg_proc = None
-                continue
 
-            if self._ffmpeg_proc.stdout is None:
-                self._stop_ffmpeg()
-                continue
+            reconnect_delay = 0.35
+            empty_session_limit = 4
+            empty_sessions = 0
 
-            while not self._ffmpeg_stop.is_set():
-                raw = self._read_exact(self._ffmpeg_proc.stdout, frame_bytes)
-                if raw is None:
-                    break
+            while self._running and not self._ffmpeg_stop.is_set():
                 try:
-                    assert np is not None
-                    arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
-                    qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
-                    meta = FrameMeta(source_id=self.source_id, device_name=self.device_name, timestamp_ms=0)
-                    self.frame.emit(VideoFrame(qimg, meta))
-                    self._ffmpeg_last_frame_mono = time.monotonic()
-                except Exception:
+                    self._ffmpeg_proc = subprocess.Popen(
+                        cmd_base,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
+                        bufsize=0,
+                    )
+                except Exception as e:
+                    self.error.emit(f"FFmpeg start (continuous) failed: {e}")
+                    self._ffmpeg_proc = None
+                    empty_sessions += 1
+                    if empty_sessions >= empty_session_limit:
+                        break
+                    time.sleep(reconnect_delay)
                     continue
 
-            # If process ended without any frames, try next transport.
-            if self._ffmpeg_last_frame_mono > 0.0:
-                break
+                if self._ffmpeg_proc.stdout is None:
+                    self._close_ffmpeg_decode_proc()
+                    empty_sessions += 1
+                    if empty_sessions >= empty_session_limit:
+                        break
+                    time.sleep(reconnect_delay)
+                    continue
 
-            self._ffmpeg_proc = None
+                frames_this_session = 0
+                while self._running and not self._ffmpeg_stop.is_set():
+                    raw = self._read_exact(self._ffmpeg_proc.stdout, frame_bytes)
+                    if raw is None:
+                        break
+                    try:
+                        assert np is not None
+                        arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
+                        qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+                        meta = FrameMeta(
+                            source_id=self.source_id,
+                            device_name=self.device_name,
+                            timestamp_ms=0,
+                        )
+                        self.frame.emit(VideoFrame(qimg, meta))
+                        self._ffmpeg_last_frame_mono = time.monotonic()
+                        frames_this_session += 1
+                    except Exception:
+                        continue
+
+                proc = self._ffmpeg_proc
+                rc: int | None = None
+                try:
+                    if proc is not None:
+                        rc = proc.poll()
+                except Exception:
+                    rc = None
+                self._close_ffmpeg_decode_proc()
+
+                if self._ffmpeg_stop.is_set() or not self._running:
+                    break
+
+                if frames_this_session > 0:
+                    ever_worked = True
+                    empty_sessions = 0
+                    print(
+                        f"[VGCS:video] decode session ended (frames={frames_this_session}), "
+                        f"reconnecting same transport={tr_label} rc={rc!r}"
+                    )
+                    time.sleep(reconnect_delay)
+                    continue
+
+                empty_sessions += 1
+                if empty_sessions >= empty_session_limit:
+                    print(
+                        f"[VGCS:video] decode: no frames after {empty_session_limit} attempts "
+                        f"on transport={tr_label}, trying next"
+                    )
+                    break
+                time.sleep(reconnect_delay)
+
+            if self._ffmpeg_stop.is_set() or not self._running:
+                break
+            continue
 
         self._stop_ffmpeg()
 
