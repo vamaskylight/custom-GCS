@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import os
 import threading
 import time
 import json
+from urllib.parse import urlparse
 import shutil
 import subprocess
 from typing import Optional, Protocol
@@ -55,6 +57,119 @@ class FrameMeta:
 class VideoFrame:
     image: QImage
     meta: FrameMeta
+
+
+def _rtsp_transport_order_auto(url: str) -> tuple[str, ...]:
+    """
+    Offline / local-radio links often break RTP/UDP (NAT, flaky Wi‑Fi) but work with
+    RTSP-over-TCP (interleaved). Prefer TCP first on RFC1918 / link-local / loopback hosts.
+
+    For public / unknown hostnames (typical cloud RTSP relays), try UDP first — many
+    servers expect RTP/UDP when the path is reachable on the open internet.
+    """
+    default: tuple[str, ...] = ("udp", "tcp")
+    raw = str(url or "").strip()
+    if not raw.lower().startswith("rtsp://"):
+        return default
+    try:
+        pu = urlparse(raw)
+        host_raw = pu.hostname or ""
+    except Exception:
+        return default
+    if not host_raw:
+        return default
+    hn = host_raw.strip().lower()
+    if hn in ("localhost", "127.0.0.1", "::1"):
+        return ("tcp", "udp")
+    try:
+        ip = ipaddress.ip_address(host_raw.strip("[]"))
+        if ip.is_loopback or ip.is_link_local or ip.is_private:
+            return ("tcp", "udp")
+    except ValueError:
+        pass
+    return default
+
+
+def _rtsp_transport_sequence(url: str, mode: str) -> tuple[str | None, ...]:
+    """
+    Transports to try when opening FFmpeg. Returns a single `(None,)` entry for inputs
+    that are not RTSP (FFmpeg ignores `-rtsp_transport` anyway, but avoids confusing logs).
+    """
+    raw = str(url or "").strip()
+    if _url_scheme(raw) != "rtsp":
+        return (None,)
+    m = str(mode or "auto").strip().lower()
+    if m == "udp":
+        return ("udp",)
+    if m == "tcp":
+        return ("tcp",)
+    return _rtsp_transport_order_auto(raw)
+
+
+def _ffmpeg_udp_raw_demux(url: str, udp_input_format: str) -> list[str]:
+    """
+    FFmpeg demuxer hints for bare UDP (-- h264/hevc Annex B); omitted for MPEG-TS (auto).
+    """
+    if _url_scheme(str(url or "").strip()) != "udp":
+        return []
+    fmt = str(udp_input_format or "").strip().lower()
+    if fmt in ("h264", "264", "avc"):
+        return ["-f", "h264"]
+    if fmt in ("hevc", "265", "h265"):
+        return ["-f", "hevc"]
+    if fmt == "mpegts":
+        return ["-f", "mpegts"]
+    return []
+
+
+def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> list[str]:
+    """Flags immediately before `-i` (after optional `-f`)."""
+    sc = _url_scheme(str(url or "").strip())
+    out: list[str] = []
+    if sc == "rtsp" and rtsp_transport in ("udp", "tcp"):
+        out.extend(["-rtsp_transport", rtsp_transport])
+    out.extend(["-err_detect", "ignore_err"])
+    if sc == "udp":
+        out.extend(
+            [
+                "-fflags",
+                "nobuffer+genpts+discardcorrupt",
+                "-analyzeduration",
+                "2500000",
+                "-probesize",
+                "131072",
+            ]
+        )
+    else:
+        out.extend(["-fflags", "+genpts+discardcorrupt"])
+    return out
+
+
+def _url_scheme(url: str) -> str:
+    try:
+        s = urlparse(str(url or "").strip()).scheme
+        return str(s or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _demux_preflags_for_url(url: str, *, rtsp_transport: str | None) -> list[str]:
+    """Input-side demux flags for FFmpeg/ffprobe before the source URL."""
+    sc = _url_scheme(url)
+    base = ["-err_detect", "ignore_err"]
+    if sc == "rtsp" and rtsp_transport in ("tcp", "udp"):
+        return ["-rtsp_transport", rtsp_transport, "-fflags", "+genpts+discardcorrupt", *base]
+    if sc == "udp":
+        return [
+            "-fflags",
+            "nobuffer+genpts+discardcorrupt",
+            "-analyzeduration",
+            "2500000",
+            "-probesize",
+            "131072",
+            *base,
+        ]
+    return ["-fflags", "+genpts+discardcorrupt", *base]
 
 
 class AiVideoHook(Protocol):
@@ -187,9 +302,9 @@ class CameraSource(QObject):
 
 class RtspSource(QObject):
     """
-    RTSP video stream source (Day/Thermal) using QtMultimedia.
+    Network video stream decoded with FFmpeg when possible (RTSP, UDP MPEG-TS/h264).
 
-    Note: RTSP support depends on the underlying Qt multimedia backend/codecs.
+    QtMultimedia is optionally used only for URLs where FFmpeg-first is disabled.
     """
 
     frame = Signal(object)  # VideoFrame
@@ -204,6 +319,7 @@ class RtspSource(QObject):
         source_id: str,
         label: str,
         transport: str = "auto",
+        udp_input_format: str = "",
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -211,6 +327,7 @@ class RtspSource(QObject):
         self._url = str(url or "").strip()
         self._label = str(label or source_id)
         self._transport = str(transport or "auto").strip().lower()
+        self._udp_input_format = str(udp_input_format or "").strip().lower()
         self._player: Optional[QMediaPlayer] = None
         self._sink: Optional[QVideoSink] = None
         self._audio: Optional[QAudioOutput] = None
@@ -288,6 +405,7 @@ class RtspSource(QObject):
         QtMultimedia often fails to emit frames for RTSP on Windows (FFmpeg backend)
         while still opening the stream — leading to a useless 2s wait, duplicate RTSP
         sessions, and libav h264 noise. Skip unless VGCS_FORCE_QTMULTIMEDIA_RTSP=1.
+        UDP / TCP bare streams are almost never handled well by Qt; always use FFmpeg.
         """
         if os.environ.get("VGCS_FORCE_QTMULTIMEDIA_RTSP", "").strip() == "1":
             return False
@@ -296,6 +414,8 @@ class RtspSource(QObject):
         if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
             return False
         u = (self._url or "").strip().lower()
+        if u.startswith("udp://") or u.startswith("tcp://"):
+            return True
         return u.startswith("rtsp://")
 
     def start(self) -> None:
@@ -303,7 +423,7 @@ class RtspSource(QObject):
             return
         if self._prefer_ffmpeg_immediately():
             print(
-                f"[VGCS:video] RTSP: FFmpeg decoder (skip Qt Multimedia probe) url={self._url}"
+                f"[VGCS:video] Stream: FFmpeg decoder (skip Qt Multimedia probe) url={self._url}"
             )
             self._last_frame_mono = 0.0
             self._using_pyav = False
@@ -349,21 +469,29 @@ class RtspSource(QObject):
         if not path:
             return False
         if shutil.which("ffmpeg") is None:
-            self.error.emit("ffmpeg not found in PATH (required for RTSP recording)")
+            self.error.emit("ffmpeg not found in PATH (required for recording)")
             return False
         if self._rec_proc is not None and self._rec_proc.poll() is None:
             return True
         url = str(self._url or "").strip()
         if not url:
-            self.error.emit("RTSP URL is empty")
+            self.error.emit("Stream URL is empty")
             return False
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-rtsp_transport",
-            "tcp",
+        sc = _url_scheme(url)
+        cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+        cmd.extend(_ffmpeg_udp_raw_demux(url, self._udp_input_format))
+        if sc == "rtsp":
+            cmd += ["-rtsp_transport", "tcp"]
+        elif sc == "udp":
+            cmd += [
+                "-fflags",
+                "nobuffer+genpts+discardcorrupt",
+                "-analyzeduration",
+                "1500000",
+                "-probesize",
+                "65536",
+            ]
+        cmd += [
             "-i",
             url,
             "-an",
@@ -474,10 +602,10 @@ class RtspSource(QObject):
             pass
         url = str(self._url or "").strip()
         if not url:
-            self.error.emit("RTSP URL is empty")
+            self.error.emit("Stream URL is empty")
             return
         if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-            self.error.emit("ffmpeg/ffprobe not found in PATH (required for RTSP fallback)")
+            self.error.emit("ffmpeg/ffprobe not found in PATH (required for network video decode)")
             return
         self._ffmpeg_stop.clear()
         self._ffmpeg_thread = threading.Thread(target=self._ffmpeg_loop, daemon=True)
@@ -496,24 +624,38 @@ class RtspSource(QObject):
             pass
         self._ffmpeg_proc = None
 
-    def _ffprobe_dims(self, url: str) -> tuple[int, int] | None:
+    def _ffprobe_dims(
+        self, url: str, *, rtsp_transport: str | None = None, udp_input_format: str = ""
+    ) -> tuple[int, int] | None:
+        u = str(url or "").strip()
+        if not u:
+            return None
+        sc = _url_scheme(u)
+        is_rtsp = sc == "rtsp"
+        tr = rtsp_transport if is_rtsp else None
+        timeout_s = 12.0 if sc == "udp" else 8.5
         try:
+            demux_hint = _ffmpeg_udp_raw_demux(u, udp_input_format or self._udp_input_format)
+            probe_opts = _demux_preflags_for_url(u, rtsp_transport=tr)
+            cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                *demux_hint,
+                *probe_opts,
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                u,
+            ]
             p = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=width,height",
-                    "-of",
-                    "json",
-                    url,
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
-                timeout=3.5,
+                timeout=timeout_s,
             )
             if p.returncode != 0:
                 return None
@@ -540,9 +682,18 @@ class RtspSource(QObject):
 
     def _ffmpeg_loop(self) -> None:
         url = str(self._url or "").strip()
+        transport_seq = _rtsp_transport_sequence(url, self._transport)
+        dims: tuple[int, int] | None = None
+        for tr_try in transport_seq:
+            if self._ffmpeg_stop.is_set():
+                break
+            d = self._ffprobe_dims(url, rtsp_transport=tr_try, udp_input_format=self._udp_input_format)
+            if d:
+                dims = d
+                break
         # Prefer a higher decode cap so fullscreen preview preserves detail.
         # Keep a cap to avoid overwhelming low-end systems with raw pipe traffic.
-        dims = self._ffprobe_dims(url) or (1280, 720)
+        dims = dims or (1280, 720)
         src_w, src_h = dims
         src_w = max(1, int(src_w))
         src_h = max(1, int(src_h))
@@ -561,31 +712,25 @@ class RtspSource(QObject):
         h = max(2, h)
         self._ffmpeg_dims = (w, h)
         frame_bytes = int(w) * int(h) * 3
-        transports = ("udp", "tcp") if self._transport not in ("udp", "tcp") else (self._transport,)
-        # Try UDP first, then TCP.
-        # Many RTSP servers (and QGC-style clients) work over RTP/UDP even
-        # when TCP is blocked/unavailable.
-        for transport in transports:
+
+        # RTSP auto: LAN / radio prefers TCP then UDP; public hostname tries UDP then TCP.
+        # Non-RTSP: transport_seq is a single pass with no `-rtsp_transport`.
+        for transport in transport_seq:
             if self._ffmpeg_stop.is_set():
                 break
             self._ffmpeg_last_frame_mono = 0.0
-            print(f"[VGCS:video] FFmpeg fallback start transport={transport} url={url}")
+            demux = _ffmpeg_udp_raw_demux(url, self._udp_input_format)
+            tr_label = str(transport) if transport is not None else "n/a"
+            print(f"[VGCS:video] FFmpeg decode try rtsp_transport={tr_label} url={url}")
 
-            # Probe stage: decode exactly ONE frame first so we can capture
-            # the real failure reason (codec support, RTP/transport, etc.)
-            # instead of only "no frames produced".
             probe_cmd = [
                 "ffmpeg",
                 "-hide_banner",
                 "-nostats",
                 "-loglevel",
                 "info",
-                "-err_detect",
-                "ignore_err",
-                "-rtsp_transport",
-                transport,
-                "-fflags",
-                "+genpts+discardcorrupt",
+                *demux,
+                *_ffmpeg_preflags_before_input(url, rtsp_transport=transport),
                 "-i",
                 url,
                 "-an",
@@ -632,7 +777,7 @@ class RtspSource(QObject):
                         err = b""
                 except Exception:
                     err = b""
-                self.error.emit(f"FFmpeg probe failed ({transport}): {e} " + err.decode(errors="ignore"))
+                self.error.emit(f"FFmpeg probe failed ({tr_label}): {e} " + err.decode(errors="ignore"))
                 continue
 
             out_len = len(out or b"")
@@ -644,7 +789,7 @@ class RtspSource(QObject):
             if out_len < frame_bytes:
                 # If stderr is empty, still provide the length as a hint.
                 hint = err_str if err_str else f"no frames decoded (stdout_bytes={out_len}, expected={frame_bytes})"
-                self.error.emit(f"FFmpeg RTSP error ({transport}): {hint}")
+                self.error.emit(f"FFmpeg stream error ({tr_label}): {hint}")
                 continue
 
             try:
@@ -655,7 +800,7 @@ class RtspSource(QObject):
                 self.frame.emit(VideoFrame(qimg, meta))
                 self._ffmpeg_last_frame_mono = time.monotonic()
             except Exception as e:
-                self.error.emit(f"FFmpeg probe decode failed ({transport}): {e}")
+                self.error.emit(f"FFmpeg probe decode failed ({tr_label}): {e}")
                 continue
 
             # Continuous stage: now that we know the transport+codec works,
@@ -666,12 +811,8 @@ class RtspSource(QObject):
                 "-nostats",
                 "-loglevel",
                 "error",
-                "-err_detect",
-                "ignore_err",
-                "-rtsp_transport",
-                transport,
-                "-fflags",
-                "+genpts+discardcorrupt",
+                *demux,
+                *_ffmpeg_preflags_before_input(url, rtsp_transport=transport),
                 "-i",
                 url,
                 "-an",
@@ -724,7 +865,7 @@ class RtspSource(QObject):
                     err_rem = self._ffmpeg_proc.stderr.read()[:4000]
                     decoded = err_rem.decode(errors="ignore") if err_rem else ""
                     if decoded.strip():
-                        self.error.emit(f"FFmpeg RTSP error ({transport}): {decoded}")
+                        self.error.emit(f"FFmpeg stream error ({tr_label}): {decoded}")
             except Exception:
                 pass
             self._ffmpeg_proc = None
@@ -749,19 +890,31 @@ class VideoPipeline(QObject):
         self._rtsp_day_url: str = ""
         self._rtsp_thermal_url: str = ""
         self._rtsp_transport: str = "auto"
+        # Application Settings → Video → Source (`rtsp` | `udp_h264` | `udp_h265`).
+        self._stream_kind: str = "rtsp"
 
         self.refresh_sources()
 
     def refresh_sources(self) -> None:
         self._sources = {}
-        # RTSP sources take precedence if configured.
+        kind = str(self._stream_kind or "rtsp").strip().lower()
+        udp_demux = ""
+        day_lbl_base = "RTSP"
+        if kind == "udp_h264":
+            udp_demux = "h264"
+            day_lbl_base = "UDP h.264"
+        elif kind == "udp_h265":
+            udp_demux = "hevc"
+            day_lbl_base = "UDP h.265"
+        # Network sources take precedence if configured.
         if HAS_MULTIMEDIA and (self._rtsp_day_url or self._rtsp_thermal_url):
             if self._rtsp_day_url:
                 day = RtspSource(
                     url=self._rtsp_day_url,
                     source_id="day",
-                    label="Day (RTSP)",
+                    label=f"Day ({day_lbl_base})",
                     transport=self._rtsp_transport,
+                    udp_input_format=udp_demux,
                     parent=self,
                 )
                 day.frame.connect(self._on_source_frame)
@@ -770,8 +923,9 @@ class VideoPipeline(QObject):
                 th = RtspSource(
                     url=self._rtsp_thermal_url,
                     source_id="thermal",
-                    label="Thermal (RTSP)",
+                    label=f"Thermal ({day_lbl_base})",
                     transport=self._rtsp_transport,
+                    udp_input_format=udp_demux,
                     parent=self,
                 )
                 th.frame.connect(self._on_source_frame)
@@ -791,10 +945,19 @@ class VideoPipeline(QObject):
             self._active_source_id = next(iter(self._sources.keys()))
         self.sources_changed.emit()
 
-    def set_rtsp_sources(self, *, day_url: str = "", thermal_url: str = "", transport: str = "auto") -> None:
+    def set_rtsp_sources(
+        self,
+        *,
+        day_url: str = "",
+        thermal_url: str = "",
+        transport: str = "auto",
+        stream_kind: str = "rtsp",
+    ) -> None:
         self._rtsp_day_url = str(day_url or "").strip()
         self._rtsp_thermal_url = str(thermal_url or "").strip()
         self._rtsp_transport = str(transport or "auto").strip().lower()
+        sk = str(stream_kind or "rtsp").strip().lower()
+        self._stream_kind = sk if sk in ("rtsp", "udp_h264", "udp_h265") else "rtsp"
         # Reset active source if it no longer exists.
         if self._active_source_id and self._active_source_id not in self._sources:
             self._active_source_id = ""
