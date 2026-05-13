@@ -128,10 +128,22 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
     out: list[str] = []
     if sc == "rtsp" and rtsp_transport in ("udp", "tcp"):
         out.extend(["-rtsp_transport", rtsp_transport])
-        # If the encoder stops sending (many UAV links do ~20s bursts / session quirks),
-        # default libav waits can look like a frozen preview. Bound stall time so the
-        # decode proc exits and our reconnect loop can open a fresh session.
-        out.extend(["-rw_timeout", "12000000"])  # 12s no I/O → fail read → reconnect
+        # Optional I/O stall limit (microseconds). Some Windows FFmpeg builds or cameras
+        # mis-handle -rw_timeout and never output a frame — leave off unless set explicitly.
+        rw = str(os.environ.get("VGCS_FFMPEG_RW_TIMEOUT_MS", "") or "").strip()
+        if rw.isdigit() and int(rw) > 0:
+            out.extend(["-rw_timeout", rw])
+        # Companion / Herelink RTSP often needs time for first IDR after connect.
+        out.extend(
+            [
+                "-fflags",
+                "+genpts+discardcorrupt",
+                "-analyzeduration",
+                "10000000",
+                "-probesize",
+                "10000000",
+            ]
+        )
     out.extend(["-err_detect", "ignore_err"])
     if sc == "udp":
         out.extend(
@@ -144,7 +156,7 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
                 "131072",
             ]
         )
-    else:
+    elif sc != "rtsp":
         out.extend(["-fflags", "+genpts+discardcorrupt"])
     return out
 
@@ -727,10 +739,15 @@ class RtspSource(QObject):
 
     def _ffmpeg_loop(self) -> None:
         url = str(self._url or "").strip()
-        # Probe geometry once (extra RTSP sessions to the same URL can upset encoders).
         transport_for_probe = _rtsp_transport_sequence(url, self._transport)
         dims: tuple[int, int] | None = None
-        if transport_for_probe:
+        # ffprobe opens its own RTSP session. Many companion cameras (e.g. 192.168.144.x)
+        # accept only one client or stall the *next* decoder — preview stays black. Skip
+        # by default; use 1280x720 canvas (scale+pad still matches the real frame).
+        # Set VGCS_RTSP_FFPROBE=1 to restore probing for exotic URLs.
+        if _url_scheme(url) == "rtsp" and str(os.environ.get("VGCS_RTSP_FFPROBE", "") or "").strip() != "1":
+            print("[VGCS:video] RTSP: skip ffprobe (set VGCS_RTSP_FFPROBE=1 to enable size probe)")
+        elif transport_for_probe:
             dims = self._ffprobe_dims(
                 url,
                 rtsp_transport=transport_for_probe[0],
@@ -775,7 +792,12 @@ class RtspSource(QObject):
                 print(f"[VGCS:video] FFmpeg decode try rtsp_transport={tr_label} url={url}")
 
                 if _url_scheme(url) == "rtsp":
-                    time.sleep(0.2)
+                    # Cooldown only needed when ffprobe ran (second session). Skip long wait
+                    # when we go straight to decode (VGCS_RTSP_FFPROBE unset).
+                    if str(os.environ.get("VGCS_RTSP_FFPROBE", "") or "").strip() == "1":
+                        time.sleep(0.2)
+                    else:
+                        time.sleep(0.05)
 
                 cmd_base = [
                     "ffmpeg",
