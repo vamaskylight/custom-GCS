@@ -759,69 +759,14 @@ class RtspSource(QObject):
             print(f"[VGCS:video] FFmpeg decode try rtsp_transport={tr_label} url={url}")
 
             vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h)
-            probe_cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-nostats",
-                "-loglevel",
-                "error",
-                *demux,
-                *_ffmpeg_preflags_before_input(url, rtsp_transport=transport),
-                "-i",
-                url,
-                "-an",
-                "-vf",
-                vf_rgb,
-                "-pix_fmt",
-                "rgb24",
-                "-frames:v",
-                "1",
-                "-f",
-                "rawvideo",
-                "pipe:1",
-            ]
+            # Do not run a separate one-frame FFmpeg decode before the main session.
+            # That opens a second full RTSP (or UDP) reader; many UAV/box cameras allow
+            # only one client or drop follow-up sessions → UI shows the probe frame then
+            # appears frozen. Dimensions already come from ffprobe above.
 
-            probe_proc: subprocess.Popen[bytes] | None = None
-            try:
-                probe_proc = subprocess.Popen(
-                    probe_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    bufsize=0,
-                )
-                assert probe_proc.stdout is not None
-                out, _err = probe_proc.communicate(timeout=25.0)
-            except subprocess.TimeoutExpired:
-                if probe_proc is not None:
-                    try:
-                        probe_proc.kill()
-                    except Exception:
-                        pass
-                    try:
-                        out, _err = probe_proc.communicate(timeout=2.0)
-                    except Exception:
-                        out = b""
-                else:
-                    out = b""
-            except Exception as e:
-                self.error.emit(f"FFmpeg probe failed ({tr_label}): {e}")
-                continue
-
-            out_len = len(out or b"")
-            if out_len < frame_bytes:
-                hint = f"no frames decoded (stdout_bytes={out_len}, expected={frame_bytes})"
-                self.error.emit(f"FFmpeg stream error ({tr_label}): {hint}")
-                continue
-
-            try:
-                arr = np.frombuffer(out[:frame_bytes], dtype=np.uint8).reshape((h, w, 3))  # type: ignore[union-attr]
-                qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
-                meta = FrameMeta(source_id=self.source_id, device_name=self.device_name, timestamp_ms=0)
-                self.frame.emit(VideoFrame(qimg, meta))
-            except Exception as e:
-                self.error.emit(f"FFmpeg probe decode failed ({tr_label}): {e}")
-                continue
+            if _url_scheme(url) == "rtsp":
+                # Brief pause after ffprobe so encoders that serialize sessions can accept decode.
+                time.sleep(0.2)
 
             cmd_base = [
                 "ffmpeg",
@@ -906,7 +851,6 @@ class RtspSource(QObject):
                     break
 
                 if frames_this_session > 0:
-                    ever_worked = True
                     empty_sessions = 0
                     print(
                         f"[VGCS:video] decode session ended (frames={frames_this_session}), "
