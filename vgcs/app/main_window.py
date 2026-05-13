@@ -2027,18 +2027,32 @@ class MainWindow(QMainWindow):
             s.setValue("camera/skydroid_port", int(skydroid_port.value()))
             s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
             s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
-            try:
-                # Notify map to reload video config.
-                self._map_widget.apply_video_settings()
-            except Exception:
-                pass
-            # Hot-apply camera backend settings while connected (no app restart required).
-            try:
-                if self._thread is not None and self._thread.isRunning():
-                    self._set_runtime_camera_control()
-            except Exception:
-                pass
-            QMessageBox.information(dlg, "VGCS", "Video settings applied.")
+            # Reconfiguring video (stop RTSP, WebEngine JS, pipeline rebuild) must not run
+            # inside this click slot: it blocks the modal dialog's event loop and Windows
+            # reports "Application Settings (Not Responding)" while ffprobe/ffmpeg settle.
+            btn_apply.setEnabled(False)
+
+            def _finish_apply_video() -> None:
+                try:
+                    self._map_widget.apply_video_settings()
+                except Exception:
+                    pass
+                try:
+                    if self._thread is not None and self._thread.isRunning():
+                        self._set_runtime_camera_control()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        btn_apply.setEnabled(True)
+                    except Exception:
+                        pass
+                try:
+                    QMessageBox.information(self, "VGCS", "Video settings applied.")
+                except Exception:
+                    pass
+
+            QTimer.singleShot(0, _finish_apply_video)
 
         btn_apply.clicked.connect(_apply)
         btn_close.clicked.connect(dlg.accept)
