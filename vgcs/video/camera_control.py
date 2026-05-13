@@ -23,6 +23,8 @@ class CameraControl(Protocol):
 
     def set_zoom(self, level: float) -> None: ...
 
+    def handle_zoom_step(self, step: int, ui_level: float) -> None: ...
+
     def set_focus(self, level: float) -> None: ...
 
     def set_gimbal(self, cmd: GimbalCommand) -> None: ...
@@ -42,6 +44,10 @@ class NoopCameraControl:
     """Default safe implementation: does nothing (keeps UI responsive)."""
 
     def set_zoom(self, level: float) -> None:
+        return
+
+    def handle_zoom_step(self, step: int, ui_level: float) -> None:
+        del step, ui_level
         return
 
     def set_focus(self, level: float) -> None:
@@ -77,6 +83,13 @@ class MavlinkCameraControl:
     def set_zoom(self, level: float) -> None:
         try:
             self._t.queue_camera_zoom(float(level))
+        except Exception:
+            return
+
+    def handle_zoom_step(self, step: int, ui_level: float) -> None:
+        del ui_level
+        try:
+            self._t.queue_camera_zoom_step(int(step))
         except Exception:
             return
 
@@ -141,6 +154,13 @@ class SkydroidCameraControl:
     def set_zoom(self, level: float) -> None:
         try:
             self._adapter.camera_zoom(float(level))
+        except Exception:
+            return
+
+    def handle_zoom_step(self, step: int, ui_level: float) -> None:
+        del step
+        try:
+            self._adapter.camera_zoom(float(ui_level))
         except Exception:
             return
 

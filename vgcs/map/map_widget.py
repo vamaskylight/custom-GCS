@@ -4290,8 +4290,8 @@ class MapWidget(QWidget):
             cur = max(1.0, min(4.0, cur))
             self._video_zoom = cur
             try:
-                # Stage 1 hook for real payload zoom.
-                self._camera_control.set_zoom(float(cur))
+                # Rail +/- : MAVLink uses ZOOM_TYPE_STEP (real payloads); Skydroid uses absolute TOP level.
+                self._camera_control.handle_zoom_step(int(step), float(cur))
             except Exception:
                 pass
             self._run_js("document.title = 'VGCS Map';")
