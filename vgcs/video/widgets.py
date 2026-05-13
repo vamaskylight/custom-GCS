@@ -298,6 +298,10 @@ class SplitVideoPanel(QGroupBox):
         self._pipeline = pipeline
         self._controls = controls
         self._labels: dict[str, VideoPreviewLabel] = {}
+        # Per-source frame slots so `sources_changed` can disconnect before reconnect
+        # (avoids duplicate handlers and multi-second lag / stuck frames).
+        self._split_frame_slots: dict[str, object] = {}
+        self._split_frame_sources: dict[str, object] = {}
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
@@ -313,7 +317,15 @@ class SplitVideoPanel(QGroupBox):
         self._rebuild()
 
     def _rebuild(self) -> None:
-        # Disconnect old sources by clearing mapping; Qt auto-disconnects when objects destroyed.
+        for _sid, old_src in list(self._split_frame_sources.items()):
+            slot = self._split_frame_slots.get(_sid)
+            if slot is not None:
+                try:
+                    old_src.frame.disconnect(slot)
+                except Exception:
+                    pass
+        self._split_frame_sources.clear()
+        self._split_frame_slots.clear()
         self._labels = {}
         sources = list(self._pipeline.sources().items())[:4]
         for idx in range(4):
@@ -327,16 +339,19 @@ class SplitVideoPanel(QGroupBox):
                 continue
             self._labels[sid] = w
 
-            def _mk_handler(source_id: str):
+            def _mk_handler(panel: SplitVideoPanel, source_id: str):
                 def _on_frame(vf: VideoFrame) -> None:
                     if vf.meta.source_id != source_id:
                         return
-                    img = self._controls.transform_frame(vf.image)
-                    lab = self._labels.get(source_id)
+                    img = panel._controls.transform_frame(vf.image)
+                    lab = panel._labels.get(source_id)
                     if lab is not None:
                         lab.set_frame(img)
 
                 return _on_frame
 
-            src.frame.connect(_mk_handler(sid), Qt.ConnectionType.QueuedConnection)
+            slot = _mk_handler(self, sid)
+            self._split_frame_slots[sid] = slot
+            self._split_frame_sources[sid] = src
+            src.frame.connect(slot, Qt.ConnectionType.QueuedConnection)
 

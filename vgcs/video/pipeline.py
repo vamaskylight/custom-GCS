@@ -153,6 +153,23 @@ def _url_scheme(url: str) -> str:
         return ""
 
 
+def _ffmpeg_vf_rgb_fixed_size(w: int, h: int) -> str:
+    """
+    Scale to fit inside WxH, then pad to exactly WxH.
+
+    `force_original_aspect_ratio=decrease` alone can emit smaller frames when the
+    stream aspect does not match the target box; our rawvideo reader assumes
+    every packet is exactly w*h*3 bytes. Padding avoids silent decode drops
+    (symptom: first frame OK, then frozen preview).
+    """
+    w = max(2, int(w))
+    h = max(2, int(h))
+    return (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
+    )
+
+
 def _demux_preflags_for_url(url: str, *, rtsp_transport: str | None) -> list[str]:
     """Input-side demux flags for FFmpeg/ffprobe before the source URL."""
     sc = _url_scheme(url)
@@ -741,6 +758,7 @@ class RtspSource(QObject):
             tr_label = str(transport) if transport is not None else "n/a"
             print(f"[VGCS:video] FFmpeg decode try rtsp_transport={tr_label} url={url}")
 
+            vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h)
             probe_cmd = [
                 "ffmpeg",
                 "-hide_banner",
@@ -753,7 +771,7 @@ class RtspSource(QObject):
                 url,
                 "-an",
                 "-vf",
-                f"scale={w}:{h}:force_original_aspect_ratio=decrease",
+                vf_rgb,
                 "-pix_fmt",
                 "rgb24",
                 "-frames:v",
@@ -817,7 +835,7 @@ class RtspSource(QObject):
                 url,
                 "-an",
                 "-vf",
-                f"scale={w}:{h}:force_original_aspect_ratio=decrease",
+                vf_rgb,
                 "-pix_fmt",
                 "rgb24",
                 "-f",

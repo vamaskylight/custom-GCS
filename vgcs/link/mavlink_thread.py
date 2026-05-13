@@ -111,6 +111,11 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("camera_zoom", float(level)))
 
+    def queue_camera_zoom_step(self, direction: int) -> None:
+        """Discrete zoom step for +/- controls: -1 = wider, +1 = tighter (MAVLink ZOOM_TYPE_STEP)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("camera_zoom_step", -1 if int(direction) < 0 else 1))
+
     def queue_camera_focus(self, level: float) -> None:
         """Queue camera focus control (best-effort)."""
         with self._cmd_lock:
@@ -446,6 +451,8 @@ class MavlinkThread(QThread):
                 self._preflight_calibration(str(payload or ""))
             elif cmd == "camera_zoom":
                 self._camera_zoom(float(payload or 1.0))
+            elif cmd == "camera_zoom_step":
+                self._camera_zoom_step(int(payload or 0))
             elif cmd == "camera_focus":
                 self._camera_focus(float(payload or 0.0))
             elif cmd == "gimbal_nudge":
@@ -459,15 +466,38 @@ class MavlinkThread(QThread):
             self.action_result.emit("camera_zoom", False, "Link not ready")
             return
         self._sync_link_targets()
-        # MAV_CMD_SET_CAMERA_ZOOM: param1=zoom type, param2=zoom value
-        # We use type=1 (range/absolute) best-effort; payloads may interpret differently.
+        # MAV_CMD_SET_CAMERA_ZOOM: param1=ZOOM_TYPE, param2=zoom value (meaning depends on type).
+        # We previously used ZOOM_TYPE_CONTINUOUS (1) with UI levels 1..4 — on real cameras that
+        # param is a zoom *rate*, so positive values drive zoom-in until tele max (emulators often ignore).
+        # Map absolute UI level 1.0..4.0 → 0..100% for ZOOM_TYPE_RANGE.
         try:
+            m = mavutil.mavlink
+            lvl = max(1.0, min(4.0, float(level)))
+            pct = (lvl - 1.0) / 3.0 * 100.0
             self._send_command_long(
-                mavutil.mavlink.MAV_CMD_SET_CAMERA_ZOOM,
-                p1=1.0,
-                p2=float(level),
+                m.MAV_CMD_SET_CAMERA_ZOOM,
+                p1=float(m.ZOOM_TYPE_RANGE),
+                p2=float(pct),
             )
-            self.action_result.emit("camera_zoom", True, f"zoom={level:.2f}")
+            self.action_result.emit("camera_zoom", True, f"zoom_range={pct:.1f}%")
+        except Exception as e:
+            self.action_result.emit("camera_zoom", False, str(e))
+
+    def _camera_zoom_step(self, direction: int) -> None:
+        """One discrete zoom step (rail +/-): -1 wide, +1 tele."""
+        if self._master is None:
+            self.action_result.emit("camera_zoom", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            m = mavutil.mavlink
+            step = -1.0 if int(direction) < 0 else 1.0
+            self._send_command_long(
+                m.MAV_CMD_SET_CAMERA_ZOOM,
+                p1=float(m.ZOOM_TYPE_STEP),
+                p2=step,
+            )
+            self.action_result.emit("camera_zoom", True, f"zoom_step={int(step):+d}")
         except Exception as e:
             self.action_result.emit("camera_zoom", False, str(e))
 
