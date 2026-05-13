@@ -5,6 +5,7 @@ from __future__ import annotations
 import struct
 import time
 import math
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QSettings, QTimer
@@ -144,7 +145,13 @@ class MainWindow(QMainWindow):
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
         self._last_vehicle_type: int | None = None
+        # Shown at most once per link session: resetting on every STANDBY heartbeat caused
+        # system_status flicker to re-open the modal right after the user dismissed it.
         self._arm_not_ready_alert_shown = False
+        # Heartbeat system_status often stays BOOT/CALIBRATING for a few seconds after link-up;
+        # avoid a blocking modal until it persists (reduces false alarms on SITL/real vehicles).
+        self._arm_not_ready_since_mono: float | None = None
+        self._recent_statustext: deque[str] = deque(maxlen=16)
         self._rid_live_available = False
         self._map_rel_alt_m = 0.0
         self._map_msl_alt_m = 0.0
@@ -2630,6 +2637,8 @@ class MainWindow(QMainWindow):
         self._heartbeat_seen = False
         self._connect_attempt_active = True
         self._arm_not_ready_alert_shown = False
+        self._arm_not_ready_since_mono = None
+        self._recent_statustext.clear()
         self._status.setText("Connecting…")
         self._apply_state_style(self._status, "warn")
         self._set_dashboard_flight_status("yellow", "Connecting to vehicle...")
@@ -2718,6 +2727,7 @@ class MainWindow(QMainWindow):
         self._auto_center_pending = True
         self._connect_attempt_active = False
         self._arm_not_ready_alert_shown = False
+        self._arm_not_ready_since_mono = None
         self._rid_live_available = False
         self._mission_upload_pending = False
         self._status.setText("Disconnected")
@@ -2757,6 +2767,37 @@ class MainWindow(QMainWindow):
         self._set_map_only_dashboard_mode(self._map_only_dashboard)
         self._sync_plan_flight_chrome()
 
+    def _format_recent_vehicle_msgs_for_alert(self) -> str:
+        """Summarize recent STATUSTEXT lines for the not-ready dialog."""
+        if not self._recent_statustext:
+            return ""
+        keys = (
+            "prearm",
+            "pre-arm",
+            "arm:",
+            "disarm",
+            "fence",
+            "rangefinder",
+            "gps",
+            "ekf",
+            "compass",
+            "failsafe",
+            "rc not",
+            "throttle",
+            "calib",
+            "error",
+            "fail",
+        )
+        picked: list[str] = []
+        for line in self._recent_statustext:
+            low = line.lower()
+            if any(k in low for k in keys):
+                picked.append(line)
+        show = picked[-5:] if picked else list(self._recent_statustext)[-5:]
+        if not show:
+            return ""
+        return "Recent vehicle messages:\n" + "\n".join(f"• {s}" for s in show)
+
     def _on_heartbeat(self, sysid: int, compid: int, mav_ver: int) -> None:
         if not self._heartbeat_seen:
             self._heartbeat_seen = True
@@ -2783,11 +2824,14 @@ class MainWindow(QMainWindow):
                 self._armed_since = None
                 self._fields["flight_time"].setText("00:00")
             system_status = int(data.get("system_status", 0))
-            arm_ready = system_status >= 3
+            standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
+            arm_ready = system_status >= standby
             self._fields["arm_ready"].setText("Likely ready" if arm_ready else f"System status {system_status}")
             self._apply_state_style(self._fields["arm_ready"], "ok" if arm_ready else "warn")
             if arm_ready:
-                self._arm_not_ready_alert_shown = False
+                # Do not clear _arm_not_ready_alert_shown here: brief STANDBY in a flickering
+                # HEARTBEAT would re-arm the popup and make OK / title-bar close feel ignored.
+                self._arm_not_ready_since_mono = None
                 self._set_dashboard_flight_status(
                     "green",
                     "Parameter downloading... Ready to Arm",
@@ -2797,14 +2841,24 @@ class MainWindow(QMainWindow):
                     "yellow",
                     "Connected - Not Ready to Arm",
                 )
-                if not self._arm_not_ready_alert_shown:
+                now = time.monotonic()
+                if self._arm_not_ready_since_mono is None:
+                    self._arm_not_ready_since_mono = now
+                if (
+                    not self._arm_not_ready_alert_shown
+                    and (now - self._arm_not_ready_since_mono) >= 5.0
+                ):
                     self._arm_not_ready_alert_shown = True
-                    QMessageBox.warning(
-                        self,
-                        "Vehicle Msg",
-                        "Vehicle connected, but not ready to arm.\n"
-                        "Please check pre-arm errors in vehicle messages.",
+                    extra = self._format_recent_vehicle_msgs_for_alert()
+                    body = (
+                        "Vehicle connected, but the autopilot heartbeat still reports "
+                        f"system_status={system_status} (not STANDBY / ready yet).\n\n"
+                        "This often clears within a few seconds while the vehicle boots. "
+                        "If it does not clear, check calibration, GPS/EKF, and other PreArm messages."
                     )
+                    if extra:
+                        body = f"{body}\n\n{extra}"
+                    QMessageBox.warning(self, "Vehicle Msg", body)
             mode_text = human_mode_name(
                 vehicle_type=int(data.get("vehicle_type", 0) or 0),
                 custom_mode=int(data.get("custom_mode", 0) or 0),
@@ -2967,6 +3021,7 @@ class MainWindow(QMainWindow):
         elif msg_type == "STATUSTEXT":
             text = str(data.get("text", "")).strip()
             if text:
+                self._recent_statustext.append(text)
                 self._top_vehicle_msg.setText(text)
                 self._map_widget.set_header_vehicle_msg(text)
                 self._append_log(f"STATUSTEXT: {text}")
@@ -3602,6 +3657,7 @@ class MainWindow(QMainWindow):
         self._compass.clear()
         self._reset_telemetry_fields()
         self._arm_not_ready_alert_shown = False
+        self._arm_not_ready_since_mono = None
         self._set_dashboard_flight_status("red", "Communication lost - Not Ready to Arm")
         self._append_log("Telemetry fields reset.")
 
