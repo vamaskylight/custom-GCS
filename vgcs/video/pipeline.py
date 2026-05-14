@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 import ipaddress
 import os
 import threading
@@ -12,7 +11,7 @@ import shutil
 import subprocess
 from typing import Optional, Protocol
 
-from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
+from PySide6.QtCore import QObject, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
 try:
     import numpy as np  # type: ignore[import-not-found]
@@ -964,11 +963,6 @@ class VideoPipeline(QObject):
         self._rtsp_transport: str = "auto"
         # Application Settings → Video → Source (`rtsp` | `udp_h264` | `udp_h265`).
         self._stream_kind: str = "rtsp"
-        # Chunk async teardown so each RtspSource.stop() runs in its own event-loop slice.
-        # Synchronous stop() on a real Wi‑Fi RTSP link can block briefly; chaining many stops
-        # in one slot is what freezes Application Settings → Apply on the client laptop.
-        self._refresh_run: int = 0
-        self._refresh_pending: list[tuple[str, object]] = []
 
         self.refresh_sources()
 
@@ -976,7 +970,9 @@ class VideoPipeline(QObject):
         # Always stop + drop old sources. Replacing the dict alone leaves QObject children
         # and FFmpeg threads alive → duplicate RTSP sessions, CPU spikes, and "Python is not
         # responding" when saving Video settings while connected.
-        for _sid, src in list(self._refresh_pending):
+        old_items = list(self._sources.items())
+        self._sources = {}
+        for _sid, src in old_items:
             try:
                 if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
                     try:
@@ -994,48 +990,6 @@ class VideoPipeline(QObject):
                 src.deleteLater()
             except Exception:
                 pass
-        self._refresh_pending.clear()
-
-        old_items = list(self._sources.items())
-        self._sources = {}
-        self._refresh_pending = list(old_items)
-        self._refresh_run += 1
-        token = int(self._refresh_run)
-        if not self._refresh_pending:
-            self._refresh_sources_finish_build()
-            return
-        QTimer.singleShot(0, partial(self._refresh_sources_tick, token))
-
-    def _refresh_sources_tick(self, token: int) -> None:
-        if token != self._refresh_run:
-            return
-        if not self._refresh_pending:
-            self._refresh_sources_finish_build()
-            return
-        _sid, src = self._refresh_pending.pop(0)
-        try:
-            if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
-                try:
-                    src.frame.disconnect()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if hasattr(src, "stop"):
-                src.stop()
-        except Exception:
-            pass
-        try:
-            src.deleteLater()
-        except Exception:
-            pass
-        if self._refresh_pending:
-            QTimer.singleShot(0, partial(self._refresh_sources_tick, token))
-        else:
-            self._refresh_sources_finish_build()
-
-    def _refresh_sources_finish_build(self) -> None:
         kind = str(self._stream_kind or "rtsp").strip().lower()
         udp_demux = ""
         day_lbl_base = "RTSP"
