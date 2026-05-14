@@ -3198,12 +3198,16 @@ class MapWidget(QWidget):
                 self._stop_video_preview_begin()
             except Exception:
                 pass
+            try:
+                self._silence_pipeline_video_sources()
+            except Exception:
+                pass
 
             def sources_end_and_configure() -> None:
-                try:
-                    self._stop_video_preview_stop_sources()
-                except Exception:
-                    pass
+                # Do not call `_stop_video_preview_stop_sources()` here: it runs FFmpeg/Qt `stop()`
+                # on the GUI thread, and `VideoPipeline.refresh_sources()` will stop the same
+                # objects again — double teardown was a major source of "(Not Responding)" on Apply.
+                # `_stop_video_preview_begin` already blocked `frame` emissions from those sources.
                 try:
                     self._stop_video_preview_end(clear_overlay=True)
                 except Exception:
@@ -3359,6 +3363,19 @@ class MapWidget(QWidget):
                     self._split_last_images.clear()
             except Exception:
                 pass
+        except Exception:
+            pass
+
+    def _silence_pipeline_video_sources(self) -> None:
+        """Block `frame` signals from shared pipeline sources (Apply path only — see apply_video_settings_for_settings_dialog)."""
+        try:
+            if getattr(self, "_video", None) is not None:
+                for _, s in list(self._video.sources().items())[:4]:
+                    try:
+                        if hasattr(s, "blockSignals"):
+                            s.blockSignals(True)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
