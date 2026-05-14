@@ -2677,7 +2677,7 @@ class MainWindow(QMainWindow):
         while a modal dialog is still in ``exec()`` makes Windows report the app as hung.
         """
         try:
-            self._map_widget.apply_video_settings()
+            self._map_widget.apply_video_settings_for_settings_dialog()
         except Exception:
             pass
         QTimer.singleShot(0, self._deferred_apply_saved_video_settings_camera)
