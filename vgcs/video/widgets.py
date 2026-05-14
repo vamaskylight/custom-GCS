@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -161,7 +161,7 @@ class CameraControlPanel(QGroupBox):
         self._pipeline.active_source_changed.connect(
             self._sync_active_source, Qt.ConnectionType.QueuedConnection
         )
-        self._btn_refresh.clicked.connect(self._pipeline.refresh_sources)
+        self._btn_refresh.clicked.connect(lambda: QTimer.singleShot(0, self._pipeline.refresh_sources))
         self._camera_combo.currentIndexChanged.connect(self._on_camera_selected)
         self._btn_start.clicked.connect(self._start_active)
         self._btn_stop.clicked.connect(self._stop_active)

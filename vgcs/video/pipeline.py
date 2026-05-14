@@ -975,15 +975,17 @@ class VideoPipeline(QObject):
         self._defer_refresh_timer.timeout.connect(self.refresh_sources)
         self._refresh_sources_active = False
 
-        self.refresh_sources()
+        # Never run the first `refresh_sources()` synchronously from `__init__`: on Windows,
+        # USB camera enumeration / teardown can block the GUI before the event loop is ready.
+        QTimer.singleShot(0, self.refresh_sources)
 
     def refresh_sources(self) -> None:
         # Always stop + drop old sources. Replacing the dict alone leaves QObject children
         # and FFmpeg threads alive → duplicate RTSP sessions, CPU spikes, and "Python is not
         # responding" when saving Video settings while connected.
         #
-        # Do NOT call QApplication.processEvents() from inside this method: a deferred
-        # refresh (defer_refresh=True) can re-enter here mid-loop and corrupt `_sources`.
+        # Do NOT call QApplication.processEvents() from inside this method: a scheduled
+        # refresh can re-enter here mid-loop and corrupt `_sources`.
         if getattr(self, "_refresh_sources_active", False):
             try:
                 self._defer_refresh_timer.start(1)
@@ -999,6 +1001,11 @@ class VideoPipeline(QObject):
             old_items = list(self._sources.items())
             self._sources = {}
             for _sid, src in old_items:
+                try:
+                    if hasattr(src, "blockSignals"):
+                        src.blockSignals(True)
+                except Exception:
+                    pass
                 try:
                     if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
                         try:
@@ -1072,9 +1079,25 @@ class VideoPipeline(QObject):
                     self._sources[src_id] = src
             if not self._active_source_id and self._sources:
                 self._active_source_id = next(iter(self._sources.keys()))
-            self.sources_changed.emit()
+            # Defer so callers return before `SplitVideoPanel` / `CameraControlPanel` rebuild
+            # (still heavy even with QueuedConnection if the queue is already backed up).
+            def _emit_sources_changed() -> None:
+                try:
+                    self.sources_changed.emit()
+                except Exception:
+                    pass
+
+            QTimer.singleShot(0, _emit_sources_changed)
         finally:
             self._refresh_sources_active = False
+
+    def schedule_refresh_sources(self) -> None:
+        """Coalesce `refresh_sources()` on the next event-loop tick (never blocks the caller)."""
+        try:
+            self._defer_refresh_timer.stop()
+        except Exception:
+            pass
+        self._defer_refresh_timer.start(0)
 
     def set_rtsp_sources(
         self,
@@ -1085,6 +1108,7 @@ class VideoPipeline(QObject):
         stream_kind: str = "rtsp",
         defer_refresh: bool = False,
     ) -> None:
+        _ = defer_refresh
         self._rtsp_day_url = str(day_url or "").strip()
         self._rtsp_thermal_url = str(thermal_url or "").strip()
         self._rtsp_transport = str(transport or "auto").strip().lower()
@@ -1093,12 +1117,9 @@ class VideoPipeline(QObject):
         # Reset active source if it no longer exists.
         if self._active_source_id and self._active_source_id not in self._sources:
             self._active_source_id = ""
-        if defer_refresh:
-            # Let the GUI thread paint / process Windows messages before synchronous
-            # stop()+rebuild in refresh_sources() (slow on real Wi‑Fi RTSP).
-            self._defer_refresh_timer.start(0)
-        else:
-            self.refresh_sources()
+        # Always schedule: synchronous `refresh_sources()` from map load / settings Apply
+        # blocks the GUI thread on FFmpeg RTSP teardown (wrong Wi‑Fi, unreachable host).
+        self.schedule_refresh_sources()
 
     def sources(self) -> dict[str, object]:
         return dict(self._sources)
