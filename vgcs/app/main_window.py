@@ -2676,13 +2676,15 @@ class MainWindow(QMainWindow):
         RTSP teardown and WebEngine updates can take noticeable time; running that work
         while a modal dialog is still in ``exec()`` makes Windows report the app as hung.
         """
-        try:
-            self._map_widget.apply_video_settings_for_settings_dialog()
-        except Exception:
-            pass
-        # Do not stack camera-backend swap on the same 0 ms tick as MapWidget's staged
-        # preview stop / deferred `refresh_sources()` — Windows still paints "Not Responding".
-        QTimer.singleShot(180, self._deferred_apply_saved_video_settings_camera)
+        def _apply_body() -> None:
+            try:
+                self._map_widget.apply_video_settings_for_settings_dialog()
+            except Exception:
+                pass
+            QTimer.singleShot(180, self._deferred_apply_saved_video_settings_camera)
+
+        # Yield one event-loop turn so the dialog teardown / WM_PAINT can finish before heavy work.
+        QTimer.singleShot(0, _apply_body)
 
     def _deferred_apply_saved_video_settings_camera(self) -> None:
         try:
@@ -2691,7 +2693,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self._append_log("Video settings applied.")
+            QTimer.singleShot(0, lambda: self._append_log("Video settings applied."))
         except Exception:
             pass
 
