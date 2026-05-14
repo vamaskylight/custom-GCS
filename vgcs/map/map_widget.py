@@ -3083,13 +3083,21 @@ class MapWidget(QWidget):
             return False
         return True
 
-    def _configure_video_pipeline(self, vp: VideoPipeline | None) -> None:
+    def _configure_video_pipeline(
+        self, vp: VideoPipeline | None, *, defer_rtsp_refresh: bool = False
+    ) -> None:
         """Apply Application Settings → Video URLs and mode to the shared (or local) pipeline."""
         if vp is None:
             return
         self._read_video_settings()
         if not bool(getattr(self, "_video_settings_enabled", False)):
-            vp.set_rtsp_sources(day_url="", thermal_url="", transport="auto", stream_kind="rtsp")
+            vp.set_rtsp_sources(
+                day_url="",
+                thermal_url="",
+                transport="auto",
+                stream_kind="rtsp",
+                defer_refresh=bool(defer_rtsp_refresh),
+            )
             return
         default_view = str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
         thermal_for_pipeline = str(self._video_settings_thermal) if default_view == "split" else ""
@@ -3101,6 +3109,7 @@ class MapWidget(QWidget):
             thermal_url=thermal_for_pipeline,
             transport=str(getattr(self, "_video_settings_rtsp_transport", "auto") or "auto"),
             stream_kind=kind,
+            defer_refresh=bool(defer_rtsp_refresh),
         )
 
     def _read_video_settings(self) -> None:
@@ -3113,11 +3122,8 @@ class MapWidget(QWidget):
         self._video_settings_rtsp_transport = str(s.value(_KEY_VIDEO_RTSP_TRANSPORT, "auto") or "auto").strip().lower()
         self._video_settings_default_view = str(s.value(_KEY_VIDEO_DEFAULT_VIEW, "Single") or "Single")
 
-    def apply_video_settings(self) -> None:
-        """
-        Called by MainWindow after Application Settings → Video is applied.
-        Reconfigures the video pipeline (network + local cameras) and updates defaults.
-        """
+    def _apply_video_settings_read_toolbar(self) -> bool:
+        """Reload QSettings-backed video fields, log, and mirror the webcam toolbar toggle."""
         was_preview_on = bool(getattr(self, "_video_preview_enabled", False))
         self._read_video_settings()
         try:
@@ -3129,7 +3135,6 @@ class MapWidget(QWidget):
             )
         except Exception:
             pass
-        # Mirror enable state into legacy toolbar toggle for visibility.
         try:
             self._btn_webcam.blockSignals(True)
             self._btn_webcam.setChecked(bool(self._video_settings_enabled))
@@ -3138,6 +3143,63 @@ class MapWidget(QWidget):
                 self._btn_webcam.blockSignals(False)
             except Exception:
                 pass
+        return was_preview_on
+
+    def apply_video_settings_for_settings_dialog(self) -> None:
+        """Apply path used only after Application Settings → Video → Apply (see MainWindow).
+
+        Chains stop / pipeline / hook work across event-loop ticks and defers ``refresh_sources``
+        so Windows can process WM_PAINT between RTSP teardown and rebuild (reduces Not Responding).
+        """
+        was_preview_on = self._apply_video_settings_read_toolbar()
+
+        def phase_configure_and_tail() -> None:
+            vp = getattr(self, "_video_pipeline_shared", None)
+            if vp is None:
+                vp = getattr(self, "_video", None)
+            try:
+                self._configure_video_pipeline(vp, defer_rtsp_refresh=True)
+            except Exception:
+                pass
+            self._video_inited = False
+            self._shared_vp_hooks_connected = False
+            try:
+                self._video_split_enabled = (
+                    str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
+                    == "split"
+                )
+            except Exception:
+                pass
+            self._sync_native_camera_rail_toggles()
+            if (
+                was_preview_on
+                and bool(self._video_settings_enabled)
+                and bool(getattr(self, "_btn_webcam", None))
+                and bool(self._btn_webcam.isChecked())
+                and bool(getattr(self, "_web_ready", False))
+            ):
+                try:
+                    QTimer.singleShot(150, self._restart_video_preview_after_settings)
+                except Exception:
+                    pass
+
+        def phase_stop_preview() -> None:
+            try:
+                if bool(getattr(self, "_video_preview_enabled", False)):
+                    self._stop_video_preview(clear_overlay=True)
+            except Exception:
+                pass
+            QTimer.singleShot(0, phase_configure_and_tail)
+
+        QTimer.singleShot(0, phase_stop_preview)
+
+    def apply_video_settings(self) -> None:
+        """Reconfigure the video pipeline from QSettings (map load, reconnect, etc.).
+
+        For Application Settings → Video → Apply, MainWindow uses
+        :meth:`apply_video_settings_for_settings_dialog` instead (staged RTSP teardown).
+        """
+        was_preview_on = self._apply_video_settings_read_toolbar()
 
         try:
             if bool(getattr(self, "_video_preview_enabled", False)):

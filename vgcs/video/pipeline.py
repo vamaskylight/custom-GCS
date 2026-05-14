@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from typing import Optional, Protocol
 
-from PySide6.QtCore import QObject, Signal, QMetaObject, Qt, Slot
+from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
 try:
     import numpy as np  # type: ignore[import-not-found]
@@ -1043,6 +1043,7 @@ class VideoPipeline(QObject):
         thermal_url: str = "",
         transport: str = "auto",
         stream_kind: str = "rtsp",
+        defer_refresh: bool = False,
     ) -> None:
         self._rtsp_day_url = str(day_url or "").strip()
         self._rtsp_thermal_url = str(thermal_url or "").strip()
@@ -1052,7 +1053,12 @@ class VideoPipeline(QObject):
         # Reset active source if it no longer exists.
         if self._active_source_id and self._active_source_id not in self._sources:
             self._active_source_id = ""
-        self.refresh_sources()
+        if defer_refresh:
+            # Let the GUI thread paint / process Windows messages before synchronous
+            # stop()+rebuild in refresh_sources() (slow on real Wi‑Fi RTSP).
+            QTimer.singleShot(0, self.refresh_sources)
+        else:
+            self.refresh_sources()
 
     def sources(self) -> dict[str, object]:
         return dict(self._sources)
