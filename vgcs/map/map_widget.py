@@ -3205,8 +3205,11 @@ class MapWidget(QWidget):
                 stream_kind="rtsp",
             )
             return
-        default_view = str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
-        thermal_for_pipeline = str(self._video_settings_thermal) if default_view == "split" else ""
+        # Always register a non-empty thermal URL with the pipeline. Gating on default_view
+        # == "split" broke the common case: operator sets day + thermal URLs but leaves Default
+        # view on Single, then uses the camera rail ▦ split — the UI shows 4-up while only the
+        # "day" RtspSource existed, so cells 2–4 stayed black.
+        thermal_for_pipeline = str(self._video_settings_thermal or "").strip()
         kind = str(getattr(self, "_video_settings_source", "rtsp") or "rtsp").strip().lower()
         if kind == "disabled":
             kind = "rtsp"
