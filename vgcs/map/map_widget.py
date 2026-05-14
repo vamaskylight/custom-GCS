@@ -3189,13 +3189,28 @@ class MapWidget(QWidget):
                     pass
 
         def phase_stop_preview() -> None:
+            # `_stop_video_preview` used to do WebEngine `runJavaScript` + FFmpeg `stop()` in one
+            # slot; both can block the GUI for many seconds (wrong Wi‑Fi RTSP) → "(Not Responding)".
+            if not bool(getattr(self, "_video_preview_enabled", False)):
+                QTimer.singleShot(48, phase_configure_and_tail)
+                return
             try:
-                if bool(getattr(self, "_video_preview_enabled", False)):
-                    self._stop_video_preview(clear_overlay=True)
+                self._stop_video_preview_begin()
             except Exception:
                 pass
-            # Brief gap so Windows can paint after preview teardown before pipeline rebuild.
-            QTimer.singleShot(48, phase_configure_and_tail)
+
+            def sources_end_and_configure() -> None:
+                try:
+                    self._stop_video_preview_stop_sources()
+                except Exception:
+                    pass
+                try:
+                    self._stop_video_preview_end(clear_overlay=True)
+                except Exception:
+                    pass
+                QTimer.singleShot(48, phase_configure_and_tail)
+
+            QTimer.singleShot(45, sources_end_and_configure)
 
         QTimer.singleShot(0, phase_stop_preview)
 
@@ -3323,7 +3338,8 @@ class MapWidget(QWidget):
         except Exception:
             self._run_js("setVideoPreviewImage('');")
 
-    def _stop_video_preview(self, *, clear_overlay: bool) -> None:
+    def _stop_video_preview_begin(self) -> None:
+        """First teardown slice: drop preview flag, JS overlay hints, timers, native pixmap state."""
         self._video_preview_enabled = False
         self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(false);")
         self._run_js("if (window.setNativeHudMode) setNativeHudMode(false);")
@@ -3345,6 +3361,9 @@ class MapWidget(QWidget):
                 pass
         except Exception:
             pass
+
+    def _stop_video_preview_stop_sources(self) -> None:
+        """Stop FFmpeg/Qt video sources (can block on Windows — call from a delayed timer slot)."""
         try:
             src = getattr(self, "_video_active_source", None)
             if src is not None:
@@ -3357,6 +3376,9 @@ class MapWidget(QWidget):
                         pass
         except Exception:
             pass
+
+    def _stop_video_preview_end(self, *, clear_overlay: bool) -> None:
+        """Final slice: map arrow scale + optional Web overlay reset."""
         try:
             self._sync_native_map_vehicle_arrow_scale()
         except Exception:
@@ -3365,6 +3387,11 @@ class MapWidget(QWidget):
             self._run_js("setVideoPreviewImage('');")
             self._run_js("setVideoPreviewMode('single');")
             self._run_js("clearAiOverlays();")
+
+    def _stop_video_preview(self, *, clear_overlay: bool) -> None:
+        self._stop_video_preview_begin()
+        self._stop_video_preview_stop_sources()
+        self._stop_video_preview_end(clear_overlay=clear_overlay)
 
     def _on_pipeline_frame(self, vf: VideoFrame) -> None:
         # Called on the GUI thread.
