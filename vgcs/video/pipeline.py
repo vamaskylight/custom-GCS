@@ -181,16 +181,9 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
             out.extend(["-rw_timeout", str(int(rw_ms) * 1000)])
         elif not _rtsp_url_is_loopback(u):
             out.extend(["-rw_timeout", "5000000"])  # default 5s; omit on loopback RTSP
-        # RTSP socket-level stall (µs). Without this, FFmpeg can sit on UDP RTP forever with no
-        # packets while Python blocks on stdout — the alternate transport is never tried.
-        if not _rtsp_url_is_loopback(u):
-            st = str(os.environ.get("VGCS_FFMPEG_RTSP_STIMEOUT_US", "") or "").strip()
-            if st == "0":
-                pass
-            elif st.isdigit() and int(st) > 0:
-                out.extend(["-stimeout", st])
-            else:
-                out.extend(["-stimeout", "12000000"])  # 12s; override via env if needed
+        # Note: do not pass `-stimeout` here — many Windows FFmpeg builds (e.g. gyan.dev)
+        # reject it as a global flag ("Unrecognized option 'stimeout'") and exit before decode.
+        # `-rw_timeout` above is the supported way to cap stalled RTSP I/O for this pipeline.
         # Local RTSP (mediamtx, ffmpeg publish) often needs a slightly longer demux window;
         # `-rw_timeout` + `nobuffer` can yield zero frames while ffplay still works.
         # Same for 192.168.144.x companion cameras: aggressive nobuffer can miss the first GOP.
