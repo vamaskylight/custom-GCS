@@ -562,14 +562,17 @@ class RtspSource(QObject):
             if self._rec_proc is None:
                 return
             if self._rec_proc.poll() is None:
-                self._rec_proc.terminate()
                 try:
-                    self._rec_proc.wait(timeout=2.0)
+                    self._rec_proc.kill()
                 except Exception:
                     try:
-                        self._rec_proc.kill()
+                        self._rec_proc.terminate()
                     except Exception:
                         pass
+                try:
+                    self._rec_proc.wait(timeout=0.2)
+                except Exception:
+                    pass
         finally:
             self._rec_proc = None
 
