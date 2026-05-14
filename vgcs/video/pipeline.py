@@ -958,7 +958,29 @@ class VideoPipeline(QObject):
         self.refresh_sources()
 
     def refresh_sources(self) -> None:
+        # Always stop + drop old sources. Replacing the dict alone leaves QObject children
+        # and FFmpeg threads alive → duplicate RTSP sessions, CPU spikes, and "Python is not
+        # responding" when saving Video settings while connected.
+        old_items = list(self._sources.items())
         self._sources = {}
+        for _sid, src in old_items:
+            try:
+                if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
+                    try:
+                        src.frame.disconnect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if hasattr(src, "stop"):
+                    src.stop()
+            except Exception:
+                pass
+            try:
+                src.deleteLater()
+            except Exception:
+                pass
         kind = str(self._stream_kind or "rtsp").strip().lower()
         udp_demux = ""
         day_lbl_base = "RTSP"
