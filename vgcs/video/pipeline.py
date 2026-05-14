@@ -128,11 +128,18 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
     out: list[str] = []
     if sc == "rtsp" and rtsp_transport in ("udp", "tcp"):
         out.extend(["-rtsp_transport", rtsp_transport])
-        # Optional I/O stall limit (microseconds). Some Windows FFmpeg builds or cameras
-        # mis-handle -rw_timeout and never output a frame — leave off unless set explicitly.
-        rw = str(os.environ.get("VGCS_FFMPEG_RW_TIMEOUT_MS", "") or "").strip()
-        if rw.isdigit() and int(rw) > 0:
-            out.extend(["-rw_timeout", rw])
+        # FFmpeg `-rw_timeout` is in **microseconds** and caps stalled RTSP I/O (wrong Wi‑Fi,
+        # host down, etc.). Without it, TCP connect / demux can block the decoder thread for
+        # many Windows default TCP timeouts while still starving the app in practice (heavy
+        # reconnect loops + GUI work). `VGCS_FFMPEG_RW_TIMEOUT_MS` is interpreted as
+        # milliseconds; set to `0` to omit `-rw_timeout` (legacy cameras that mis-handle it).
+        rw_ms = str(os.environ.get("VGCS_FFMPEG_RW_TIMEOUT_MS", "") or "").strip()
+        if rw_ms == "0":
+            pass
+        elif rw_ms.isdigit() and int(rw_ms) > 0:
+            out.extend(["-rw_timeout", str(int(rw_ms) * 1000)])
+        else:
+            out.extend(["-rw_timeout", "5000000"])  # default 5s
         # Low-latency RTSP: avoid large analyze windows (adds seconds of demux delay and
         # makes motion look like it "lags behind" then catches up). nobuffer matches UDP path.
         out.extend(

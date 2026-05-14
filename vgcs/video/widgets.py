@@ -155,8 +155,12 @@ class CameraControlPanel(QGroupBox):
         self.setLayout(root)
         self.setMinimumWidth(260)
 
-        self._pipeline.sources_changed.connect(self._rebuild_sources)
-        self._pipeline.active_source_changed.connect(self._sync_active_source)
+        self._pipeline.sources_changed.connect(
+            self._rebuild_sources, Qt.ConnectionType.QueuedConnection
+        )
+        self._pipeline.active_source_changed.connect(
+            self._sync_active_source, Qt.ConnectionType.QueuedConnection
+        )
         self._btn_refresh.clicked.connect(self._pipeline.refresh_sources)
         self._camera_combo.currentIndexChanged.connect(self._on_camera_selected)
         self._btn_start.clicked.connect(self._start_active)
@@ -308,7 +312,7 @@ class SplitVideoPanel(QGroupBox):
         grid.setVerticalSpacing(8)
         self.setLayout(grid)
 
-        self._pipeline.sources_changed.connect(self._rebuild)
+        self._pipeline.sources_changed.connect(self._rebuild, Qt.ConnectionType.QueuedConnection)
         for i in range(4):
             lab = VideoPreviewLabel(self)
             lab.setText("No video")
