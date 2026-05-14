@@ -515,8 +515,7 @@ class RtspSource(QObject):
             return
         if self._prefer_ffmpeg_immediately():
             print(
-                f"[VGCS:video] Stream({self.source_id}): FFmpeg decoder "
-                f"(skip Qt Multimedia probe) url={self._url}"
+                f"[VGCS:video] Stream: FFmpeg decoder (skip Qt Multimedia probe) url={self._url}"
             )
             self._last_frame_mono = 0.0
             self._using_pyav = False
@@ -996,12 +995,7 @@ class RtspSource(QObject):
                                 device_name=self.device_name,
                                 timestamp_ms=0,
                             )
-                            try:
-                                self.frame.emit(VideoFrame(qimg, meta))
-                            except RuntimeError:
-                                # Teardown race: `deleteLater()` / QObject destroyed while the
-                                # decode thread still has a frame ready — stop quietly.
-                                break
+                            self.frame.emit(VideoFrame(qimg, meta))
                             self._ffmpeg_last_frame_mono = last_emit_mono
                             frames_this_session += 1
                             round_ok = True

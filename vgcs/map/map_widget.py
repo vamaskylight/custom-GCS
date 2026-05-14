@@ -26,7 +26,6 @@ from PySide6.QtCore import (
     QTimer,
     Qt,
     QUrl,
-    Slot,
 )
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -3037,6 +3036,8 @@ class MapWidget(QWidget):
                 self._native_pip_last_source_frame = QImage()
             return bool(self._video_active_source)
 
+            return bool(self._video_active_source)
+
         _skip_pv_reset = bool(getattr(self, "_video_skip_preview_flag_reset_in_ensure", False))
         try:
             delattr(self, "_video_skip_preview_flag_reset_in_ensure")
@@ -3178,10 +3179,8 @@ class MapWidget(QWidget):
                         src.frame.disconnect(self)
                 except Exception:
                     pass
-                # One bound slot for all sources so `disconnect(self)` reliably clears reconnects
-                # (lambdas are not always removed by `disconnect(self)` on some PySide builds).
                 src.frame.connect(
-                    self._on_pipeline_split_source_frame,
+                    lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf),
                     Qt.ConnectionType.QueuedConnection,
                 )
             if shared is not None:
@@ -3391,9 +3390,6 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._video_inited = False
-        # Force a full preview hook-up on next `_ensure_video_preview_backend()` so per-source
-        # `frame` slots are rebound after pipeline refresh (shortcut path skips reconnect).
-        self._shared_vp_hooks_connected = False
 
         # Do not reset `_video_split_enabled` here: this runs on every connect/disconnect and on
         # camera-backend hot-swap; the operator's SPLIT choice must persist (apply_video_settings
@@ -3434,21 +3430,24 @@ class MapWidget(QWidget):
             # Native mode: hide Web preview layer to avoid double-render fragmentation.
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
-            src = getattr(self, "_video_active_source", None)
-            if src is not None:
-                src.start()
-                try:
-                    sid = str(getattr(src, "source_id", "") or "")
-                    dname = str(getattr(src, "device_name", "") or sid or "video")
-                    self._set_status(f"Video preview: {dname} [{sid}]")
-                except Exception:
-                    pass
-            if bool(getattr(self, "_video_split_enabled", False)) and getattr(self, "_video", None) is not None:
-                for _, s in list(self._video.sources().items())[:4]:
+            # Start every registered source (day + thermal + …). Previously only the active
+            # source ran unless split was on, so thermal never decoded until split — and toggling
+            # split later still missed `start()` on thermal if the branch was skipped earlier.
+            vp = getattr(self, "_video", None)
+            if vp is not None:
+                for _, s in list(vp.sources().items())[:4]:
                     try:
                         s.start()
                     except Exception:
                         pass
+                try:
+                    src0 = vp.active_source()
+                    if src0 is not None:
+                        sid = str(getattr(src0, "source_id", "") or "")
+                        dname = str(getattr(src0, "device_name", "") or sid or "video")
+                        self._set_status(f"Video preview: {dname} [{sid}]")
+                except Exception:
+                    pass
             if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
                 self._ai_timer.stop()
         except Exception:
@@ -3528,6 +3527,8 @@ class MapWidget(QWidget):
             return
         try:
             img = vf.image
+        except RuntimeError:
+            return
         except Exception:
             return
         if img is None or img.isNull():
@@ -3563,10 +3564,15 @@ class MapWidget(QWidget):
                 if isinstance(c, dict):
                     c[str(sid)] = img2
                 self._render_native_split_preview()
+            except RuntimeError:
+                pass
             except Exception:
                 pass
             return
-        self._render_native_video_preview(img2)
+        try:
+            self._render_native_video_preview(img2)
+        except RuntimeError:
+            pass
 
     def _on_pipeline_frame_for(self, source_id: str, vf: VideoFrame) -> None:
         if not bool(getattr(self, "_video_preview_enabled", False)):
@@ -3575,6 +3581,8 @@ class MapWidget(QWidget):
             return
         try:
             img = vf.image
+        except RuntimeError:
+            return
         except Exception:
             return
         if img is None or img.isNull():
@@ -3594,7 +3602,10 @@ class MapWidget(QWidget):
             self._split_last_images[str(source_id)] = img2
         except Exception:
             pass
-        self._render_native_split_preview()
+        try:
+            self._render_native_split_preview()
+        except RuntimeError:
+            pass
 
     def _on_video_frame_encoded_for(self, source_id: str, data_url: str) -> None:
         self._video_last_data_urls[source_id] = str(data_url or "")
