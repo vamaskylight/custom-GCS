@@ -2680,7 +2680,9 @@ class MainWindow(QMainWindow):
             self._map_widget.apply_video_settings_for_settings_dialog()
         except Exception:
             pass
-        QTimer.singleShot(0, self._deferred_apply_saved_video_settings_camera)
+        # Do not stack camera-backend swap on the same 0 ms tick as MapWidget's staged
+        # preview stop / deferred `refresh_sources()` — Windows still paints "Not Responding".
+        QTimer.singleShot(180, self._deferred_apply_saved_video_settings_camera)
 
     def _deferred_apply_saved_video_settings_camera(self) -> None:
         try:

@@ -3189,8 +3189,8 @@ class MapWidget(QWidget):
                     self._stop_video_preview(clear_overlay=True)
             except Exception:
                 pass
-            # One ~frame interval so Windows can paint after preview teardown before pipeline rebuild.
-            QTimer.singleShot(16, phase_configure_and_tail)
+            # Brief gap so Windows can paint after preview teardown before pipeline rebuild.
+            QTimer.singleShot(48, phase_configure_and_tail)
 
         QTimer.singleShot(0, phase_stop_preview)
 
