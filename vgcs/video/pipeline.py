@@ -786,13 +786,13 @@ class RtspSource(QObject):
         vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h)
 
         # UI emit cap: avoid unbounded QueuedConnection backlog on the GUI thread.
-        # Default ~45 Hz — smoother than 32 Hz on 30 fps drone cameras; override with
-        # VGCS_VIDEO_PREVIEW_MAX_FPS (e.g. 60 or 24).
+        # Default 20 Hz — preview still looks smooth; higher rates + map work freeze Windows
+        # ("Not Responding") on typical laptops. Override with VGCS_VIDEO_PREVIEW_MAX_FPS.
         try:
-            max_fps = float(str(os.environ.get("VGCS_VIDEO_PREVIEW_MAX_FPS", "45") or "45").strip())
+            max_fps = float(str(os.environ.get("VGCS_VIDEO_PREVIEW_MAX_FPS", "20") or "20").strip())
         except Exception:
-            max_fps = 45.0
-        max_fps = max(12.0, min(90.0, max_fps))
+            max_fps = 20.0
+        max_fps = max(8.0, min(60.0, max_fps))
         min_emit_dt = 1.0 / max_fps
         last_emit_mono = 0.0
 
@@ -872,23 +872,24 @@ class RtspSource(QObject):
                         raw = self._read_exact(self._ffmpeg_proc.stdout, frame_bytes)
                         if raw is None:
                             break
+                        # Drop frames *before* QImage/numpy decode. Previously we built a full QImage
+                        # copy for every FFmpeg output frame then throttled emit — the CPU cost alone
+                        # could starve the GUI thread (QueuedConnection backlog + map MAVLink work).
+                        now = time.monotonic()
+                        if (now - last_emit_mono) < min_emit_dt:
+                            continue
                         try:
                             assert np is not None
                             arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
                             qimg = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
-                            now = time.monotonic()
-                            if (now - last_emit_mono) < min_emit_dt:
-                                frames_this_session += 1
-                                self._ffmpeg_last_frame_mono = now
-                                continue
-                            last_emit_mono = now
+                            last_emit_mono = time.monotonic()
                             meta = FrameMeta(
                                 source_id=self.source_id,
                                 device_name=self.device_name,
                                 timestamp_ms=0,
                             )
                             self.frame.emit(VideoFrame(qimg, meta))
-                            self._ffmpeg_last_frame_mono = now
+                            self._ffmpeg_last_frame_mono = last_emit_mono
                             frames_this_session += 1
                             round_ok = True
                         except Exception:

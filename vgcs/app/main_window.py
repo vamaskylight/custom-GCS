@@ -3045,7 +3045,12 @@ class MainWindow(QMainWindow):
                 self._recent_statustext.append(text)
                 self._top_vehicle_msg.setText(text)
                 self._map_widget.set_header_vehicle_msg(text)
-                self._append_log(f"STATUSTEXT: {text}")
+                # STATUSTEXT can burst during param download; logging each line hammers QTextEdit.
+                now = time.monotonic()
+                last_log = float(getattr(self, "_last_statustext_log_mono", 0.0))
+                if now - last_log >= 0.12:
+                    self._last_statustext_log_mono = now
+                    self._append_log(f"STATUSTEXT: {text}")
         elif msg_type.startswith("OPEN_DRONE_ID_"):
             rid_text = self._extract_remote_id_text(data)
             if rid_text:
