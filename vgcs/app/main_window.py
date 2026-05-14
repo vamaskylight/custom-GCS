@@ -3558,8 +3558,13 @@ class MainWindow(QMainWindow):
         if cur in data:
             self._param_value_spin.setValue(float(data[cur]))
         self._refresh_acro_options_ui()
-        joined = ", ".join(f"{k}={v:.3f}" for k, v in sorted(data.items()))
-        self._append_log(f"Params: {joined}")
+        n = len(data)
+        if n <= 48:
+            joined = ", ".join(f"{k}={v:.3f}" for k, v in sorted(data.items()))
+            self._append_log(f"Params: {joined}")
+        else:
+            sample = ", ".join(f"{k}={v:.3f}" for k, v in list(sorted(data.items()))[:24])
+            self._append_log(f"Params ({n} values, log truncated): {sample}, …")
 
     def _refresh_acro_options_ui(self) -> None:
         opts = int(self._last_params.get("ACRO_OPTIONS", 0.0) or 0.0)
