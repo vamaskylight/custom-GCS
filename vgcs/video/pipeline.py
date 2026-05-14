@@ -494,14 +494,21 @@ class RtspSource(QObject):
         if not self._running:
             return
         self._running = False
+        # Wake the decode thread immediately; never block the GUI thread on
+        # `QMediaPlayer.stop()`, pipe teardown, or subprocess cleanup — those
+        # routinely stall for seconds on Windows when RTSP is unreachable.
         try:
-            if self._player is not None:
-                self._player.stop()
+            self._ffmpeg_stop.set()
         except Exception:
             pass
-        self._stop_ffmpeg()
-        self.stop_recording()
-        self.stopped.emit()
+        try:
+            QMetaObject.invokeMethod(
+                self,
+                "_qt_stop_teardown",
+                Qt.ConnectionType.QueuedConnection,
+            )
+        except Exception:
+            self._qt_stop_teardown()
 
     def start_recording(self, filename: str) -> bool:
         """
@@ -576,10 +583,6 @@ class RtspSource(QObject):
                         self._rec_proc.terminate()
                     except Exception:
                         pass
-                try:
-                    self._rec_proc.wait(timeout=0.2)
-                except Exception:
-                    pass
         finally:
             self._rec_proc = None
 
@@ -659,11 +662,37 @@ class RtspSource(QObject):
         self._ffmpeg_thread.start()
         self.started.emit()
 
-    def _stop_ffmpeg(self) -> None:
+    @Slot()
+    def _qt_stop_teardown(self) -> None:
+        """Finish teardown on the QObject's thread (GUI): player, FFmpeg child, recording."""
         try:
-            self._ffmpeg_stop.set()
+            if self._player is not None:
+                self._player.stop()
         except Exception:
             pass
+        self._stop_ffmpeg_decode_proc_deferred()
+        try:
+            self.stop_recording()
+        except Exception:
+            pass
+        try:
+            self.stopped.emit()
+        except Exception:
+            pass
+
+    def _stop_ffmpeg_decode_proc_deferred(self) -> None:
+        """Queue `_close_ffmpeg_decode_proc` on this object's thread (safe from `stop()`)."""
+        try:
+            QMetaObject.invokeMethod(
+                self,
+                "_qt_close_ffmpeg_decode_proc",
+                Qt.ConnectionType.QueuedConnection,
+            )
+        except Exception:
+            self._close_ffmpeg_decode_proc()
+
+    @Slot()
+    def _qt_close_ffmpeg_decode_proc(self) -> None:
         self._close_ffmpeg_decode_proc()
 
     def _close_ffmpeg_decode_proc(self) -> None:
@@ -672,19 +701,10 @@ class RtspSource(QObject):
         self._ffmpeg_proc = None
         if p is None:
             return
-        try:
-            out = p.stdout
-            if out is not None:
-                try:
-                    out.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # On Windows, closing the pipe before the child exits can block the calling thread.
+        # Kill first so the reader thread wakes, then close the handle.
         try:
             if p.poll() is None:
-                # Never block the GUI thread on `wait()`: on Windows, FFmpeg can take seconds
-                # to exit after RTSP teardown even after `kill()`, which freezes the whole GCS.
                 try:
                     p.kill()
                 except Exception:
@@ -692,6 +712,15 @@ class RtspSource(QObject):
                         p.terminate()
                     except Exception:
                         pass
+        except Exception:
+            pass
+        try:
+            out = p.stdout
+            if out is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1030,12 +1059,25 @@ class VideoPipeline(QObject):
                     src.stop()
             except Exception:
                 pass
+            # `RtspSource.stop()` queues teardown on the GUI thread; an immediate
+            # `deleteLater()` can destroy the object before those slots run.
             try:
-                src.deleteLater()
+                _o = src
+
+                def _deferred_delete() -> None:
+                    try:
+                        _o.deleteLater()
+                    except Exception:
+                        pass
+
+                QTimer.singleShot(100, _deferred_delete)
             except Exception:
-                pass
+                try:
+                    src.deleteLater()
+                except Exception:
+                    pass
             if self._pending_teardown:
-                QTimer.singleShot(30, self._refresh_sources_teardown_one)
+                QTimer.singleShot(50, self._refresh_sources_teardown_one)
             else:
                 self._refresh_sources_build_and_finish()
         except Exception:
