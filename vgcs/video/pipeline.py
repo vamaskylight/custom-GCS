@@ -169,23 +169,13 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
     if sc == "rtsp" and rtsp_transport in ("udp", "tcp"):
         out.extend(["-rtsp_transport", rtsp_transport])
         u = str(url or "").strip()
-        # FFmpeg `-rw_timeout` is in **microseconds** and caps stalled RTSP I/O (wrong Wi‑Fi,
-        # host down, etc.). Without it, TCP connect / demux can block the decoder thread for
-        # many Windows default TCP timeouts while still starving the app in practice (heavy
-        # reconnect loops + GUI work). `VGCS_FFMPEG_RW_TIMEOUT_MS` is interpreted as
-        # milliseconds; set to `0` to omit `-rw_timeout` (legacy cameras that mis-handle it).
-        rw_ms = str(os.environ.get("VGCS_FFMPEG_RW_TIMEOUT_MS", "") or "").strip()
-        if rw_ms == "0":
-            pass
-        elif rw_ms.isdigit() and int(rw_ms) > 0:
-            out.extend(["-rw_timeout", str(int(rw_ms) * 1000)])
-        elif not _rtsp_url_is_loopback(u):
-            out.extend(["-rw_timeout", "5000000"])  # default 5s; omit on loopback RTSP
-        # Note: do not pass `-stimeout` here — many Windows FFmpeg builds (e.g. gyan.dev)
-        # reject it as a global flag ("Unrecognized option 'stimeout'") and exit before decode.
-        # `-rw_timeout` above is the supported way to cap stalled RTSP I/O for this pipeline.
+        # Do not pass `-rw_timeout` / `-stimeout` here: several Windows FFmpeg builds (gyan.dev,
+        # some conda builds) reject them as global CLI flags ("Option rw_timeout not found") and
+        # exit before opening RTSP. VLC uses libav internally with different option wiring.
+        # Trade-off: a dead RTSP host may block longer on the decode thread; use Application
+        # Settings → transport / URL checks, or close the preview if a stream hangs.
         # Local RTSP (mediamtx, ffmpeg publish) often needs a slightly longer demux window;
-        # `-rw_timeout` + `nobuffer` can yield zero frames while ffplay still works.
+        # aggressive `nobuffer` can yield zero frames while ffplay still works.
         # Same for 192.168.144.x companion cameras: aggressive nobuffer can miss the first GOP.
         if _rtsp_url_is_loopback(u) or _rtsp_url_is_companion_link_subnet(u):
             out.extend(
