@@ -68,9 +68,10 @@ def _rtsp_transport_order_auto(url: str) -> tuple[str, ...]:
 
     Many cloud / generic RTSP relays work best with UDP RTP first, then TCP interleaved.
 
-    RFC1918 *generally* prefers TCP first (NAT / flaky Wi‑Fi), **except** the well-known
-    companion link ``192.168.144.0/24`` (Herelink, Skydroid TOP, many IRCams): those stacks
-    often emit RTP/UDP only and stall on TCP interleaved — match that with UDP first.
+    RFC1918 *generally* prefers TCP first (NAT / flaky Wi‑Fi). The companion subnet
+    ``192.168.144.0/24`` matches **VLC/ffplay defaults** for many drone cameras: **TCP
+    interleaved first**, then UDP RTP as a fallback (UDP-first used to stall forever on
+    hosts that only answer TCP, so the second transport never ran).
 
     Loopback stays TCP-first (local mediamtx / ffmpeg publishers).
     """
@@ -93,7 +94,7 @@ def _rtsp_transport_order_auto(url: str) -> tuple[str, ...]:
         if ip.is_loopback or ip.is_link_local:
             return ("tcp", "udp")
         if ip.version == 4 and ip in _COMPANION_RTSP_IPV4:
-            return ("udp", "tcp")
+            return ("tcp", "udp")
         if ip.is_private:
             return ("tcp", "udp")
     except ValueError:
@@ -180,6 +181,16 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
             out.extend(["-rw_timeout", str(int(rw_ms) * 1000)])
         elif not _rtsp_url_is_loopback(u):
             out.extend(["-rw_timeout", "5000000"])  # default 5s; omit on loopback RTSP
+        # RTSP socket-level stall (µs). Without this, FFmpeg can sit on UDP RTP forever with no
+        # packets while Python blocks on stdout — the alternate transport is never tried.
+        if not _rtsp_url_is_loopback(u):
+            st = str(os.environ.get("VGCS_FFMPEG_RTSP_STIMEOUT_US", "") or "").strip()
+            if st == "0":
+                pass
+            elif st.isdigit() and int(st) > 0:
+                out.extend(["-stimeout", st])
+            else:
+                out.extend(["-stimeout", "12000000"])  # 12s; override via env if needed
         # Local RTSP (mediamtx, ffmpeg publish) often needs a slightly longer demux window;
         # `-rw_timeout` + `nobuffer` can yield zero frames while ffplay still works.
         # Same for 192.168.144.x companion cameras: aggressive nobuffer can miss the first GOP.
@@ -890,7 +901,7 @@ class RtspSource(QObject):
         if _rtsp_url_is_companion_link_subnet(url):
             print(
                 f"[VGCS:video] RTSP companion link (192.168.144.x): transport order="
-                f"{_rtsp_transport_sequence(url, self._transport)!r} (UDP RTP first)"
+                f"{_rtsp_transport_sequence(url, self._transport)!r} (TCP interleaved first)"
             )
 
         while self._running and not self._ffmpeg_stop.is_set():
@@ -936,13 +947,32 @@ class RtspSource(QObject):
                 empty_sessions = 0
 
                 while self._running and not self._ffmpeg_stop.is_set():
+                    stderr_buf: list[bytes] = []
+                    p: subprocess.Popen[bytes] | None = None
                     try:
-                        self._ffmpeg_proc = subprocess.Popen(
+                        p = subprocess.Popen(
                             cmd_base,
                             stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
                             stdin=subprocess.DEVNULL,
                         )
+                        self._ffmpeg_proc = p
+
+                        def _drain_stderr(proc: subprocess.Popen[bytes], buf: list[bytes]) -> None:
+                            try:
+                                ep = proc.stderr
+                                if ep is None:
+                                    return
+                                for _ in range(8000):
+                                    line = ep.readline()
+                                    if not line:
+                                        break
+                                    if len(buf) < 200:
+                                        buf.append(line)
+                            except Exception:
+                                pass
+
+                        threading.Thread(target=_drain_stderr, args=(p, stderr_buf), daemon=True).start()
                     except Exception as e:
                         self.error.emit(f"FFmpeg start (continuous) failed: {e}")
                         self._ffmpeg_proc = None
@@ -952,7 +982,7 @@ class RtspSource(QObject):
                         time.sleep(reconnect_delay)
                         continue
 
-                    if self._ffmpeg_proc.stdout is None:
+                    if p.stdout is None:
                         self._close_ffmpeg_decode_proc()
                         empty_sessions += 1
                         if empty_sessions >= empty_session_limit:
@@ -961,8 +991,9 @@ class RtspSource(QObject):
                         continue
 
                     frames_this_session = 0
+                    decode_warned = False
                     while self._running and not self._ffmpeg_stop.is_set():
-                        raw = self._read_exact(self._ffmpeg_proc.stdout, frame_bytes)
+                        raw = self._read_exact(p.stdout, frame_bytes)
                         if raw is None:
                             break
                         # Drop frames *before* QImage/numpy decode. Previously we built a full QImage
@@ -985,7 +1016,13 @@ class RtspSource(QObject):
                             self._ffmpeg_last_frame_mono = last_emit_mono
                             frames_this_session += 1
                             round_ok = True
-                        except Exception:
+                        except Exception as ex:
+                            if not decode_warned:
+                                decode_warned = True
+                                try:
+                                    print(f"[VGCS:video] rawvideo frame decode error (first): {ex!r}")
+                                except Exception:
+                                    pass
                             continue
 
                     proc = self._ffmpeg_proc
@@ -995,6 +1032,18 @@ class RtspSource(QObject):
                             rc = proc.poll()
                     except Exception:
                         rc = None
+                    if frames_this_session == 0:
+                        try:
+                            tail = b"".join(stderr_buf)[-4000:]
+                            if tail.strip():
+                                print(
+                                    "[VGCS:video] ffmpeg stderr (session, no frames):\n"
+                                    + tail.decode("utf-8", errors="replace")
+                                )
+                            elif rc not in (0, None):
+                                print(f"[VGCS:video] ffmpeg exited rc={rc!r} (no stderr lines captured)")
+                        except Exception:
+                            pass
                     self._close_ffmpeg_decode_proc()
 
                     if self._ffmpeg_stop.is_set() or not self._running:
