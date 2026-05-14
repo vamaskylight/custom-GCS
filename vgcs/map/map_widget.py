@@ -4595,7 +4595,10 @@ class MapWidget(QWidget):
         if w3 is not None and bool(getattr(self, "_is_3d_mode", False)):
             try:
                 if callback is None:
-                    w3.page().runJavaScript(script)
+                    # Single-arg `runJavaScript(script)` blocks the Qt GUI thread until the
+                    # render process returns — with 3D + video overlay toggles this freezes the
+                    # whole app ("Not Responding") on Application Settings → Apply.
+                    w3.page().runJavaScript(script, lambda *_: None)
                 else:
                     w3.page().runJavaScript(script, callback)
                 try:
@@ -5315,7 +5318,7 @@ class MapWidget(QWidget):
         if w3 is None:
             return
         try:
-            w3.page().runJavaScript(self._HIDE_LEGACY_HTML_HUD_JS)
+            w3.page().runJavaScript(self._HIDE_LEGACY_HTML_HUD_JS, lambda *_: None)
         except Exception:
             pass
 
@@ -5370,7 +5373,7 @@ class MapWidget(QWidget):
             w3 = getattr(self, "_web_3d_view", None)
             if w3 is not None and self._web_3d_ready:
                 try:
-                    w3.page().runJavaScript("set3DEnabled(false);")
+                    w3.page().runJavaScript("set3DEnabled(false);", lambda *_: None)
                 except Exception:
                     pass
             try:
