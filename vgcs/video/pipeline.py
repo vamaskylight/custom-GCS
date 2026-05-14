@@ -1041,7 +1041,19 @@ class VideoPipeline(QObject):
                     )
                     th.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
                     self._sources["thermal"] = th
-            if HAS_MULTIMEDIA and QMediaDevices is not None:
+            # Enumerating every `QMediaDevices.videoInputs()` entry and constructing `QCamera`
+            # backends here runs on the GUI thread. On Windows this routinely takes multiple
+            # seconds (camera stack / virtual cameras), which freezes the whole app after
+            # Application Settings → Apply while RTSP is also being torn down/rebuilt.
+            # Companion / drone video uses RTSP or UDP — skip local cameras in that case.
+            # Set `VGCS_VIDEO_ENUM_LOCAL_CAMERAS=1` to force legacy behavior (USB-only preview).
+            _force_usb = str(os.environ.get("VGCS_VIDEO_ENUM_LOCAL_CAMERAS", "") or "").strip() == "1"
+            _urls_present = bool(
+                str(self._rtsp_day_url or "").strip() or str(self._rtsp_thermal_url or "").strip()
+            )
+            _net_kind = kind in ("rtsp", "udp_h264", "udp_h265")
+            _skip_usb_enum = _net_kind and _urls_present and not _force_usb
+            if HAS_MULTIMEDIA and QMediaDevices is not None and not _skip_usb_enum:
                 try:
                     devices = list(QMediaDevices.videoInputs())
                 except Exception:
