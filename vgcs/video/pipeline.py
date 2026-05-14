@@ -974,6 +974,7 @@ class VideoPipeline(QObject):
         self._defer_refresh_timer.setSingleShot(True)
         self._defer_refresh_timer.timeout.connect(self.refresh_sources)
         self._refresh_sources_active = False
+        self._pending_teardown: list[tuple[str, object]] = []
 
         # Never run the first `refresh_sources()` synchronously from `__init__`: on Windows,
         # USB camera enumeration / teardown can block the GUI before the event loop is ready.
@@ -998,31 +999,58 @@ class VideoPipeline(QObject):
                 self._defer_refresh_timer.stop()
             except Exception:
                 pass
-            old_items = list(self._sources.items())
+            self._pending_teardown = list(self._sources.items())
             self._sources = {}
-            for _sid, src in old_items:
-                try:
-                    if hasattr(src, "blockSignals"):
-                        src.blockSignals(True)
-                except Exception:
-                    pass
-                try:
-                    if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
-                        try:
-                            src.frame.disconnect()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                try:
-                    if hasattr(src, "stop"):
-                        src.stop()
-                except Exception:
-                    pass
-                try:
-                    src.deleteLater()
-                except Exception:
-                    pass
+            if self._pending_teardown:
+                QTimer.singleShot(0, self._refresh_sources_teardown_one)
+            else:
+                self._refresh_sources_build_and_finish()
+        except Exception:
+            self._refresh_sources_active = False
+
+    @Slot()
+    def _refresh_sources_teardown_one(self) -> None:
+        """Tear down at most one old source per event-loop slice (FFmpeg stop can block)."""
+        try:
+            if not self._pending_teardown:
+                self._refresh_sources_build_and_finish()
+                return
+            _sid, src = self._pending_teardown.pop(0)
+            try:
+                if hasattr(src, "blockSignals"):
+                    src.blockSignals(True)
+            except Exception:
+                pass
+            try:
+                if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
+                    try:
+                        src.frame.disconnect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if hasattr(src, "stop"):
+                    src.stop()
+            except Exception:
+                pass
+            try:
+                src.deleteLater()
+            except Exception:
+                pass
+            if self._pending_teardown:
+                QTimer.singleShot(30, self._refresh_sources_teardown_one)
+            else:
+                self._refresh_sources_build_and_finish()
+        except Exception:
+            try:
+                self._refresh_sources_active = False
+            except Exception:
+                pass
+
+    def _refresh_sources_build_and_finish(self) -> None:
+        """Recreate sources from current URL settings; clears `_refresh_sources_active` when done."""
+        try:
             kind = str(self._stream_kind or "rtsp").strip().lower()
             udp_demux = ""
             day_lbl_base = "RTSP"
@@ -1079,16 +1107,19 @@ class VideoPipeline(QObject):
                     self._sources[src_id] = src
             if not self._active_source_id and self._sources:
                 self._active_source_id = next(iter(self._sources.keys()))
-            # Defer so callers return before `SplitVideoPanel` / `CameraControlPanel` rebuild
-            # (still heavy even with QueuedConnection if the queue is already backed up).
-            def _emit_sources_changed() -> None:
+
+            def _emit_done() -> None:
                 try:
                     self.sources_changed.emit()
                 except Exception:
                     pass
+                try:
+                    self._refresh_sources_active = False
+                except Exception:
+                    pass
 
-            QTimer.singleShot(0, _emit_sources_changed)
-        finally:
+            QTimer.singleShot(0, _emit_done)
+        except Exception:
             self._refresh_sources_active = False
 
     def schedule_refresh_sources(self) -> None:
