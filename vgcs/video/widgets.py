@@ -62,7 +62,7 @@ def _apply_digital_zoom(img: QImage, zoom: float) -> QImage:
     y = max(0, (h - ch) // 2)
     try:
         cropped = img.copy(x, y, cw, ch)
-        return cropped.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        return cropped.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
     except Exception:
         return img
 
@@ -85,7 +85,7 @@ class VideoPreviewLabel(QLabel):
             return
         pm = QPixmap.fromImage(img)
         if not pm.isNull():
-            self.setPixmap(pm.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            self.setPixmap(pm.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
 
     def resizeEvent(self, e) -> None:  # noqa: N802 (Qt naming)
         super().resizeEvent(e)

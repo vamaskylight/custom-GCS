@@ -2042,7 +2042,7 @@ class MapWidget(QWidget):
                 else Qt.AspectRatioMode.KeepAspectRatio
             )
             self._native_video_preview.setPixmap(
-                pm.scaled(size, ar_mode, Qt.TransformationMode.SmoothTransformation)
+                pm.scaled(size, ar_mode, Qt.TransformationMode.FastTransformation)
             )
         except Exception:
             return
@@ -2136,7 +2136,7 @@ class MapWidget(QWidget):
                         cw,
                         ch,
                         Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
+                        Qt.TransformationMode.FastTransformation,
                     )
                     x0 = dx + max(0, (cw - scaled.width()) // 2)
                     y0 = dy + max(0, (ch - scaled.height()) // 2)
@@ -3506,7 +3506,7 @@ class MapWidget(QWidget):
         y = max(0, (h - ch) // 2)
         try:
             cropped = img.copy(x, y, cw, ch)
-            return cropped.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            return cropped.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
         except Exception:
             return img
 

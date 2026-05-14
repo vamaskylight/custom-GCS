@@ -133,15 +133,18 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
         rw = str(os.environ.get("VGCS_FFMPEG_RW_TIMEOUT_MS", "") or "").strip()
         if rw.isdigit() and int(rw) > 0:
             out.extend(["-rw_timeout", rw])
-        # Companion / Herelink RTSP often needs time for first IDR after connect.
+        # Low-latency RTSP: avoid large analyze windows (adds seconds of demux delay and
+        # makes motion look like it "lags behind" then catches up). nobuffer matches UDP path.
         out.extend(
             [
                 "-fflags",
-                "+genpts+discardcorrupt",
+                "nobuffer+discardcorrupt+genpts",
                 "-analyzeduration",
-                "10000000",
+                "1500000",
                 "-probesize",
-                "10000000",
+                "1000000",
+                "-flags",
+                "low_delay",
             ]
         )
     out.extend(["-err_detect", "ignore_err"])
@@ -181,7 +184,7 @@ def _ffmpeg_vf_rgb_fixed_size(w: int, h: int) -> str:
     w = max(2, int(w))
     h = max(2, int(h))
     return (
-        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
     )
 
@@ -757,8 +760,10 @@ class RtspSource(QObject):
         src_w, src_h = dims
         src_w = max(1, int(src_w))
         src_h = max(1, int(src_h))
-        cap_w = 1920
-        cap_h = 1080
+        cap_w = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_W", "1920") or 1920)
+        cap_h = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_H", "1080") or 1080)
+        cap_w = max(640, min(1920, cap_w))
+        cap_h = max(360, min(1080, cap_h))
         scale = min(float(cap_w) / float(src_w), float(cap_h) / float(src_h), 1.0)
         w = max(2, int(round(src_w * scale)))
         h = max(2, int(round(src_h * scale)))
@@ -772,9 +777,15 @@ class RtspSource(QObject):
         frame_bytes = int(w) * int(h) * 3
         vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h)
 
-        # Cap UI emit rate so the Qt queued slot queue does not grow without bound on
-        # fast streams (looks like a freeze after tens of seconds on weaker tablets).
-        min_emit_dt = 1.0 / 32.0
+        # UI emit cap: avoid unbounded QueuedConnection backlog on the GUI thread.
+        # Default ~45 Hz — smoother than 32 Hz on 30 fps drone cameras; override with
+        # VGCS_VIDEO_PREVIEW_MAX_FPS (e.g. 60 or 24).
+        try:
+            max_fps = float(str(os.environ.get("VGCS_VIDEO_PREVIEW_MAX_FPS", "45") or "45").strip())
+        except Exception:
+            max_fps = 45.0
+        max_fps = max(12.0, min(90.0, max_fps))
+        min_emit_dt = 1.0 / max_fps
         last_emit_mono = 0.0
 
         # If every transport fails once, wait before another full pass (encoder cooldown).
