@@ -26,6 +26,7 @@ from PySide6.QtCore import (
     QTimer,
     Qt,
     QUrl,
+    Slot,
 )
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -3036,8 +3037,6 @@ class MapWidget(QWidget):
                 self._native_pip_last_source_frame = QImage()
             return bool(self._video_active_source)
 
-            return bool(self._video_active_source)
-
         _skip_pv_reset = bool(getattr(self, "_video_skip_preview_flag_reset_in_ensure", False))
         try:
             delattr(self, "_video_skip_preview_flag_reset_in_ensure")
@@ -3179,8 +3178,10 @@ class MapWidget(QWidget):
                         src.frame.disconnect(self)
                 except Exception:
                     pass
+                # One bound slot for all sources so `disconnect(self)` reliably clears reconnects
+                # (lambdas are not always removed by `disconnect(self)` on some PySide builds).
                 src.frame.connect(
-                    lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf),
+                    self._on_pipeline_split_source_frame,
                     Qt.ConnectionType.QueuedConnection,
                 )
             if shared is not None:
@@ -3390,6 +3391,9 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._video_inited = False
+        # Force a full preview hook-up on next `_ensure_video_preview_backend()` so per-source
+        # `frame` slots are rebound after pipeline refresh (shortcut path skips reconnect).
+        self._shared_vp_hooks_connected = False
 
         # Do not reset `_video_split_enabled` here: this runs on every connect/disconnect and on
         # camera-backend hot-swap; the operator's SPLIT choice must persist (apply_video_settings
