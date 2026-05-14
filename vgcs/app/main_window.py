@@ -2681,21 +2681,26 @@ class MainWindow(QMainWindow):
                 self._map_widget.apply_video_settings_for_settings_dialog()
             except Exception:
                 pass
-            QTimer.singleShot(180, self._deferred_apply_saved_video_settings_camera)
+            QTimer.singleShot(600, self._deferred_apply_saved_video_settings_camera)
 
         # Yield one event-loop turn so the dialog teardown / WM_PAINT can finish before heavy work.
         QTimer.singleShot(0, _apply_body)
 
     def _deferred_apply_saved_video_settings_camera(self) -> None:
-        try:
-            if self._thread is not None and self._thread.isRunning():
-                self._set_runtime_camera_control()
-        except Exception:
-            pass
-        try:
-            QTimer.singleShot(0, lambda: self._append_log("Video settings applied."))
-        except Exception:
-            pass
+        """Run after staged video pipeline work so camera hot-swap does not pile on the same burst."""
+
+        def _do() -> None:
+            try:
+                if self._thread is not None and self._thread.isRunning():
+                    self._set_runtime_camera_control()
+            except Exception:
+                pass
+            try:
+                self._append_log("Video settings applied.")
+            except Exception:
+                pass
+
+        QTimer.singleShot(0, _do)
 
     def _set_runtime_camera_control(self) -> None:
         self._stop_camera_control_backend()
@@ -3549,7 +3554,14 @@ class MainWindow(QMainWindow):
         self._top_vehicle_msg.setText(msg[:80])
 
     def _on_params_snapshot(self, payload: object) -> None:
-        data = payload if isinstance(payload, dict) else {}
+        data = dict(payload) if isinstance(payload, dict) else {}
+
+        def _apply() -> None:
+            self._apply_params_snapshot_payload(data)
+
+        QTimer.singleShot(0, _apply)
+
+    def _apply_params_snapshot_payload(self, data: dict) -> None:
         if not data:
             self._append_log("Param fetch: no values")
             return
