@@ -11,6 +11,9 @@ import shutil
 import subprocess
 from typing import Optional, Protocol
 
+# Common Herelink / Skydroid / IRCam companion Wi‑Fi video subnet (RTSP host lives here).
+_COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
+
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
 try:
@@ -61,11 +64,15 @@ class VideoFrame:
 
 def _rtsp_transport_order_auto(url: str) -> tuple[str, ...]:
     """
-    Offline / local-radio links often break RTP/UDP (NAT, flaky Wi‑Fi) but work with
-    RTSP-over-TCP (interleaved). Prefer TCP first on RFC1918 / link-local / loopback hosts.
+    Pick RTSP RTP transport order for FFmpeg.
 
-    For public / unknown hostnames (typical cloud RTSP relays), try UDP first — many
-    servers expect RTP/UDP when the path is reachable on the open internet.
+    Many cloud / generic RTSP relays work best with UDP RTP first, then TCP interleaved.
+
+    RFC1918 *generally* prefers TCP first (NAT / flaky Wi‑Fi), **except** the well-known
+    companion link ``192.168.144.0/24`` (Herelink, Skydroid TOP, many IRCams): those stacks
+    often emit RTP/UDP only and stall on TCP interleaved — match that with UDP first.
+
+    Loopback stays TCP-first (local mediamtx / ffmpeg publishers).
     """
     default: tuple[str, ...] = ("udp", "tcp")
     raw = str(url or "").strip()
@@ -83,7 +90,11 @@ def _rtsp_transport_order_auto(url: str) -> tuple[str, ...]:
         return ("tcp", "udp")
     try:
         ip = ipaddress.ip_address(host_raw.strip("[]"))
-        if ip.is_loopback or ip.is_link_local or ip.is_private:
+        if ip.is_loopback or ip.is_link_local:
+            return ("tcp", "udp")
+        if ip.version == 4 and ip in _COMPANION_RTSP_IPV4:
+            return ("udp", "tcp")
+        if ip.is_private:
             return ("tcp", "udp")
     except ValueError:
         pass
@@ -123,6 +134,18 @@ def _ffmpeg_udp_raw_demux(url: str, udp_input_format: str) -> list[str]:
     return []
 
 
+def _rtsp_url_is_companion_link_subnet(url: str) -> bool:
+    """True for rtsp://192.168.144.x/... on the usual drone companion Wi‑Fi."""
+    try:
+        pu = urlparse(str(url or "").strip())
+        if str(pu.scheme or "").strip().lower() != "rtsp":
+            return False
+        ip = ipaddress.ip_address((pu.hostname or "").strip("[]"))
+        return ip.version == 4 and ip in _COMPANION_RTSP_IPV4
+    except Exception:
+        return False
+
+
 def _rtsp_url_is_loopback(url: str) -> bool:
     """True for rtsp://127.0.0.1/... etc. Local publishers often misbehave with aggressive RTSP flags."""
     try:
@@ -159,7 +182,8 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
             out.extend(["-rw_timeout", "5000000"])  # default 5s; omit on loopback RTSP
         # Local RTSP (mediamtx, ffmpeg publish) often needs a slightly longer demux window;
         # `-rw_timeout` + `nobuffer` can yield zero frames while ffplay still works.
-        if _rtsp_url_is_loopback(u):
+        # Same for 192.168.144.x companion cameras: aggressive nobuffer can miss the first GOP.
+        if _rtsp_url_is_loopback(u) or _rtsp_url_is_companion_link_subnet(u):
             out.extend(
                 [
                     "-fflags",
@@ -862,6 +886,12 @@ class RtspSource(QObject):
         # If every transport fails once, wait before another full pass (encoder cooldown).
         round_backoff_s = 0.6
         max_round_backoff_s = 4.0
+
+        if _rtsp_url_is_companion_link_subnet(url):
+            print(
+                f"[VGCS:video] RTSP companion link (192.168.144.x): transport order="
+                f"{_rtsp_transport_sequence(url, self._transport)!r} (UDP RTP first)"
+            )
 
         while self._running and not self._ffmpeg_stop.is_set():
             transport_seq = _rtsp_transport_sequence(url, self._transport)
