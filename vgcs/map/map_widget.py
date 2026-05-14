@@ -627,6 +627,11 @@ class MapWidget(QWidget):
         # When embedded in MainWindow, share its VideoPipeline so RTSP is decoded once.
         # Without this, map PiP + footer "Split camera video" each ran a separate pipeline (duplicate UI).
         self._video_pipeline_shared: VideoPipeline | None = video_pipeline
+        # When `VideoPipeline.refresh_sources()` finishes, `RtspSource` instances are replaced;
+        # reconnect preview + frame slots (see `_on_video_pipeline_sources_changed`).
+        self._video_sources_changed_conn_id: int | None = None
+        if self._video_pipeline_shared is not None:
+            self._hook_video_pipeline_sources_changed(self._video_pipeline_shared)
         self._lat: float | None = None
         self._lon: float | None = None
         self._heading: float | None = None
@@ -2937,6 +2942,63 @@ class MapWidget(QWidget):
         else:
             self._set_status("Map failed to load")
 
+    def _hook_video_pipeline_sources_changed(self, vp: VideoPipeline | None) -> None:
+        if vp is None:
+            return
+        vid = id(vp)
+        if getattr(self, "_video_sources_changed_conn_id", None) == vid:
+            return
+        try:
+            vp.sources_changed.connect(
+                self._on_video_pipeline_sources_changed,
+                Qt.ConnectionType.QueuedConnection,
+            )
+        except Exception:
+            return
+        self._video_sources_changed_conn_id = vid
+
+    def _detach_video_pipeline_frame_slots(self, vp: VideoPipeline | None) -> None:
+        """Remove MapWidget as a receiver on every source `frame` signal (safe before re-bind)."""
+        if vp is None:
+            return
+        try:
+            for _sid, src in list(vp.sources().items())[:12]:
+                try:
+                    if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
+                        src.frame.disconnect(self)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_video_pipeline_sources_changed(self) -> None:
+        """`refresh_sources()` swapped in new `RtspSource` objects — re-run preview hook-up."""
+        if not HAS_MULTIMEDIA:
+            return
+        if not bool(getattr(self, "_web_ready", False)):
+            return
+        want_preview = bool(getattr(self, "_video_preview_enabled", False))
+        want_toolbar = (
+            bool(getattr(self, "_btn_webcam", None))
+            and bool(self._btn_webcam.isChecked())
+            and bool(getattr(self, "_video_settings_enabled", False))
+        )
+        if not want_preview and not want_toolbar:
+            return
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is None:
+            return
+        try:
+            if not vp.sources():
+                return
+        except Exception:
+            return
+        self._detach_video_pipeline_frame_slots(vp)
+        self._video_inited = False
+        self._shared_vp_hooks_connected = False
+        setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
+        QTimer.singleShot(0, self._restart_video_preview_after_settings)
+
     def _ensure_video_preview_backend(self) -> bool:
         if not HAS_MULTIMEDIA:
             return False
@@ -2974,10 +3036,18 @@ class MapWidget(QWidget):
                 self._native_pip_last_source_frame = QImage()
             return bool(self._video_active_source)
 
-        self._video_inited = True
+            return bool(self._video_active_source)
+
+        _skip_pv_reset = bool(getattr(self, "_video_skip_preview_flag_reset_in_ensure", False))
+        try:
+            delattr(self, "_video_skip_preview_flag_reset_in_ensure")
+        except Exception:
+            pass
+        if not _skip_pv_reset:
+            self._video_preview_enabled = False
+
         self._video: VideoPipeline | None = None
         self._video_active_source = None
-        self._video_preview_enabled = False
         # Do not clear `_video_split_enabled` / `_video_follow_enabled` here: the native rail
         # may set them just before this call (`VGCS_CAM_*_TOGGLE`); resetting would undo the click.
         self._video_recording = False
@@ -2987,12 +3057,10 @@ class MapWidget(QWidget):
         self._video_zoom = 1.0  # 1.0x .. 4.0x
         self._video_follow_last_center_mono = 0.0
         self._video_last_data_url = ""
-        self._video_last_data_urls: dict[str, str] = {}
-        self._video_encode_inflight_by_id: dict[str, bool] = {}
-        self._video_encode_pending_by_id: dict[str, QImage | None] = {}
-        self._video_encode_bridge_by_id: dict[str, _VideoEncodeBridge] = {}
-        self._video_encode_bridge = _VideoEncodeBridge(self)
-        self._video_encode_bridge.encoded.connect(self._on_video_frame_encoded)
+        self._video_last_data_urls = {}
+        self._video_encode_inflight_by_id = {}
+        self._video_encode_pending_by_id = {}
+        self._video_encode_bridge_by_id = {}
         self._video_encode_inflight = False
         self._video_encode_pending = None
         self._video_encode_max_w = 1920
@@ -3000,14 +3068,8 @@ class MapWidget(QWidget):
         self._video_encode_format = "PNG"
         self._video_encode_quality = 1
         self._video_pool = QThreadPool.globalInstance()
-        self._split_last_images: dict[str, QImage] = {}
+        self._split_last_images = {}
         self._native_pip_last_source_frame = QImage()
-        self._video_push_timer = QTimer(self)
-        self._video_push_timer.setInterval(66)  # ~15 fps push to WebEngine
-        self._video_push_timer.timeout.connect(self._push_video_preview_any_to_overlay)
-        self._ai_timer = QTimer(self)
-        self._ai_timer.setInterval(125)  # 8 Hz dummy overlay
-        self._ai_timer.timeout.connect(self._push_dummy_ai_overlay)
         self._ai_phase = 0.0
 
         try:
@@ -3015,6 +3077,7 @@ class MapWidget(QWidget):
                 self._video = shared
             else:
                 self._video = VideoPipeline(self)
+            self._hook_video_pipeline_sources_changed(self._video)
             # Re-fetch sources after optional configure below.
             # When MainWindow's shared `VideoPipeline` already has RTSP sources (e.g. right after
             # `apply_video_settings_for_settings_dialog` scheduled a refresh), calling
@@ -3035,6 +3098,27 @@ class MapWidget(QWidget):
             sources = {}
         if not sources:
             return False
+
+        if not hasattr(self, "_video_push_timer") or self._video_push_timer is None:
+            self._video_push_timer = QTimer(self)
+            self._video_push_timer.setInterval(66)  # ~15 fps push to WebEngine
+            self._video_push_timer.timeout.connect(self._push_video_preview_any_to_overlay)
+        if not hasattr(self, "_ai_timer") or self._ai_timer is None:
+            self._ai_timer = QTimer(self)
+            self._ai_timer.setInterval(125)  # 8 Hz dummy overlay
+            self._ai_timer.timeout.connect(self._push_dummy_ai_overlay)
+
+        try:
+            old_br = getattr(self, "_video_encode_bridge", None)
+            if old_br is not None:
+                try:
+                    old_br.encoded.disconnect(self)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._video_encode_bridge = _VideoEncodeBridge(self)
+        self._video_encode_bridge.encoded.connect(self._on_video_frame_encoded)
 
         try:
             self._video_active_source = self._video.active_source() if self._video is not None else None
@@ -3057,6 +3141,10 @@ class MapWidget(QWidget):
                     except Exception:
                         pass
             if self._video_active_source is not None:
+                try:
+                    self._video_active_source.frame.disconnect(self)
+                except Exception:
+                    pass
                 self._video_active_source.frame.connect(
                     self._on_pipeline_frame,
                     Qt.ConnectionType.QueuedConnection,
@@ -3070,6 +3158,11 @@ class MapWidget(QWidget):
                 self._video_encode_pending_by_id[sid] = None
                 self._video_last_data_urls[sid] = ""
                 try:
+                    if hasattr(src, "error") and hasattr(src.error, "disconnect"):
+                        src.error.disconnect(self)
+                except Exception:
+                    pass
+                try:
                     # Show backend errors (RTSP decode / FFmpeg missing, etc.) on the UI.
                     if hasattr(src, "error") and hasattr(src.error, "connect"):
                         src.error.connect(
@@ -3081,14 +3174,21 @@ class MapWidget(QWidget):
                         )
                 except Exception:
                     pass
+                try:
+                    if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
+                        src.frame.disconnect(self)
+                except Exception:
+                    pass
                 src.frame.connect(
                     lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf),
                     Qt.ConnectionType.QueuedConnection,
                 )
             if shared is not None:
                 self._shared_vp_hooks_connected = True
+            self._video_inited = True
         except Exception:
             self._video_active_source = None
+            self._video_inited = False
             return False
         return True
 
@@ -3156,7 +3256,7 @@ class MapWidget(QWidget):
         Stages preview teardown across timers; `VideoPipeline.set_rtsp_sources` schedules
         `refresh_sources()` asynchronously so the GUI thread never blocks on FFmpeg RTSP stop.
         """
-        was_preview_on = self._apply_video_settings_read_toolbar()
+        self._apply_video_settings_read_toolbar()
 
         def phase_configure_and_tail() -> None:
             vp = getattr(self, "_video_pipeline_shared", None)
@@ -3176,15 +3276,17 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             self._sync_native_camera_rail_toggles()
+            # Start (or restart) preview whenever streaming is enabled and the toolbar wants it —
+            # not only when preview was already running. First-time enable after Apply used to skip
+            # `_restart_video_preview_after_settings` because `was_preview_on` stayed False.
             if (
-                was_preview_on
-                and bool(self._video_settings_enabled)
+                bool(self._video_settings_enabled)
                 and bool(getattr(self, "_btn_webcam", None))
                 and bool(self._btn_webcam.isChecked())
                 and bool(getattr(self, "_web_ready", False))
             ):
                 try:
-                    QTimer.singleShot(150, self._restart_video_preview_after_settings)
+                    QTimer.singleShot(400, self._restart_video_preview_after_settings)
                 except Exception:
                     pass
 
@@ -3224,7 +3326,7 @@ class MapWidget(QWidget):
         For Application Settings → Video → Apply, MainWindow uses
         :meth:`apply_video_settings_for_settings_dialog` instead (staged RTSP teardown).
         """
-        was_preview_on = self._apply_video_settings_read_toolbar()
+        self._apply_video_settings_read_toolbar()
 
         try:
             if bool(getattr(self, "_video_preview_enabled", False)):
@@ -3252,8 +3354,7 @@ class MapWidget(QWidget):
         self._sync_native_camera_rail_toggles()
 
         if (
-            was_preview_on
-            and bool(self._video_settings_enabled)
+            bool(self._video_settings_enabled)
             and bool(getattr(self, "_btn_webcam", None))
             and bool(self._btn_webcam.isChecked())
             and bool(getattr(self, "_web_ready", False))
@@ -3271,6 +3372,10 @@ class MapWidget(QWidget):
                 return
             if not bool(getattr(self, "_web_ready", False)):
                 return
+            # `refresh_sources()` replaces source objects; force full hook-up (not the stale
+            # `_video_inited` fast-path) so `src.start()` targets the new `RtspSource`.
+            self._video_inited = False
+            self._shared_vp_hooks_connected = False
             self._start_video_preview(reset_swapped=True)
         except Exception:
             pass

@@ -100,9 +100,10 @@ def _rtsp_transport_sequence(url: str, mode: str) -> tuple[str | None, ...]:
         return (None,)
     m = str(mode or "auto").strip().lower()
     if m == "udp":
-        return ("udp",)
+        # Prefer operator choice, then the other RTP mode (many stacks differ).
+        return ("udp", "tcp")
     if m == "tcp":
-        return ("tcp",)
+        return ("tcp", "udp")
     return _rtsp_transport_order_auto(raw)
 
 
@@ -122,12 +123,28 @@ def _ffmpeg_udp_raw_demux(url: str, udp_input_format: str) -> list[str]:
     return []
 
 
+def _rtsp_url_is_loopback(url: str) -> bool:
+    """True for rtsp://127.0.0.1/... etc. Local publishers often misbehave with aggressive RTSP flags."""
+    try:
+        pu = urlparse(str(url or "").strip())
+        if str(pu.scheme or "").strip().lower() != "rtsp":
+            return False
+        hn = (pu.hostname or "").strip().lower()
+        if hn in ("localhost", "127.0.0.1", "::1"):
+            return True
+        ip = ipaddress.ip_address(hn.strip("[]"))
+        return bool(ip.is_loopback)
+    except Exception:
+        return False
+
+
 def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> list[str]:
     """Flags immediately before `-i` (after optional `-f`)."""
     sc = _url_scheme(str(url or "").strip())
     out: list[str] = []
     if sc == "rtsp" and rtsp_transport in ("udp", "tcp"):
         out.extend(["-rtsp_transport", rtsp_transport])
+        u = str(url or "").strip()
         # FFmpeg `-rw_timeout` is in **microseconds** and caps stalled RTSP I/O (wrong Wi‑Fi,
         # host down, etc.). Without it, TCP connect / demux can block the decoder thread for
         # many Windows default TCP timeouts while still starving the app in practice (heavy
@@ -138,22 +155,36 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
             pass
         elif rw_ms.isdigit() and int(rw_ms) > 0:
             out.extend(["-rw_timeout", str(int(rw_ms) * 1000)])
+        elif not _rtsp_url_is_loopback(u):
+            out.extend(["-rw_timeout", "5000000"])  # default 5s; omit on loopback RTSP
+        # Local RTSP (mediamtx, ffmpeg publish) often needs a slightly longer demux window;
+        # `-rw_timeout` + `nobuffer` can yield zero frames while ffplay still works.
+        if _rtsp_url_is_loopback(u):
+            out.extend(
+                [
+                    "-fflags",
+                    "+genpts+discardcorrupt",
+                    "-analyzeduration",
+                    "8000000",
+                    "-probesize",
+                    "8000000",
+                    "-flags",
+                    "low_delay",
+                ]
+            )
         else:
-            out.extend(["-rw_timeout", "5000000"])  # default 5s
-        # Low-latency RTSP: avoid large analyze windows (adds seconds of demux delay and
-        # makes motion look like it "lags behind" then catches up). nobuffer matches UDP path.
-        out.extend(
-            [
-                "-fflags",
-                "nobuffer+discardcorrupt+genpts",
-                "-analyzeduration",
-                "1500000",
-                "-probesize",
-                "1000000",
-                "-flags",
-                "low_delay",
-            ]
-        )
+            out.extend(
+                [
+                    "-fflags",
+                    "nobuffer+discardcorrupt+genpts",
+                    "-analyzeduration",
+                    "1500000",
+                    "-probesize",
+                    "1000000",
+                    "-flags",
+                    "low_delay",
+                ]
+            )
     out.extend(["-err_detect", "ignore_err"])
     if sc == "udp":
         out.extend(

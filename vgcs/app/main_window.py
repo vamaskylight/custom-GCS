@@ -1854,6 +1854,13 @@ class MainWindow(QMainWindow):
 
         enabled = QCheckBox("Enable video streaming")
         vb.addWidget(enabled)
+        video_enable_hint = QLabel(
+            "When this is unchecked, stream URLs are saved but VGCS does not open or decode video — "
+            "the map preview stays black. Check the box to actually connect to RTSP/UDP."
+        )
+        video_enable_hint.setWordWrap(True)
+        video_enable_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        vb.addWidget(video_enable_hint)
 
         source_group = QGroupBox("Video Source")
         sg = QGridLayout()
@@ -2012,6 +2019,28 @@ class MainWindow(QMainWindow):
         def _apply() -> None:
             # Return immediately from the click handler so Windows gets a repainted frame.
             def _commit_and_close() -> None:
+                day_u = str(rtsp_day.text()).strip()
+                th_u = str(rtsp_th.text()).strip()
+                src_kind = str(source_combo.currentData() or "rtsp")
+                if (
+                    src_kind != "disabled"
+                    and not bool(enabled.isChecked())
+                    and (day_u or th_u)
+                ):
+                    try:
+                        r = QMessageBox.question(
+                            dlg,
+                            "Enable video streaming?",
+                            "You entered a stream URL, but 'Enable video streaming' is unchecked, so VGCS will "
+                            "not open RTSP/UDP and the map preview will stay black.\n\n"
+                            "Turn streaming on and save these settings?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.Yes,
+                        )
+                        if r == QMessageBox.StandardButton.Yes:
+                            enabled.setChecked(True)
+                    except Exception:
+                        pass
                 s.setValue("video/enabled", bool(enabled.isChecked()))
                 s.setValue("video/source", str(source_combo.currentData() or "rtsp"))
                 s.setValue("video/rtsp_day", str(rtsp_day.text()).strip())
