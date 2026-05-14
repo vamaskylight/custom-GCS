@@ -673,14 +673,19 @@ class RtspSource(QObject):
             pass
         try:
             if p.poll() is None:
-                p.terminate()
+                # Do not block the GUI thread on wait(): Windows FFmpeg can take seconds to
+                # exit cleanly after RTSP teardown, which freezes Application Settings → Apply.
                 try:
-                    p.wait(timeout=1.5)
+                    p.kill()
                 except Exception:
                     try:
-                        p.kill()
+                        p.terminate()
                     except Exception:
                         pass
+                try:
+                    p.wait(timeout=0.15)
+                except Exception:
+                    pass
         except Exception:
             pass
 

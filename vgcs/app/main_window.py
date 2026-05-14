@@ -2027,40 +2027,10 @@ class MainWindow(QMainWindow):
             s.setValue("camera/skydroid_port", int(skydroid_port.value()))
             s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
             s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
-            # Reconfiguring video (stop RTSP, WebEngine JS, pipeline rebuild) must not run
-            # inside this click slot: it blocks the modal dialog's event loop and Windows
-            # reports "Application Settings (Not Responding)" while ffprobe/ffmpeg settle.
-            btn_apply.setEnabled(False)
-
-            def _finish_apply_video() -> None:
-                try:
-                    self._map_widget.apply_video_settings()
-                except Exception:
-                    pass
-
-                def _apply_camera_settings() -> None:
-                    try:
-                        if self._thread is not None and self._thread.isRunning():
-                            self._set_runtime_camera_control()
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            btn_apply.setEnabled(True)
-                        except Exception:
-                            pass
-                    try:
-                        QTimer.singleShot(
-                            0,
-                            lambda: QMessageBox.information(self, "VGCS", "Video settings applied."),
-                        )
-                    except Exception:
-                        pass
-
-                QTimer.singleShot(0, _apply_camera_settings)
-
-            # >0 ms: let the modal dialog process paint/WM_PING before heavy RTSP teardown.
-            QTimer.singleShot(150, _finish_apply_video)
+            # Close the modal *before* touching RTSP/WebEngine: heavy work inside a nested
+            # exec() keeps Windows marking both "Application Settings" and "Python" as hung.
+            dlg.accept()
+            QTimer.singleShot(0, self._deferred_apply_saved_video_settings)
 
         btn_apply.clicked.connect(_apply)
         btn_close.clicked.connect(dlg.accept)
@@ -2688,6 +2658,26 @@ class MainWindow(QMainWindow):
                 close()
         except Exception:
             return
+
+    def _deferred_apply_saved_video_settings(self) -> None:
+        """Apply saved video + camera settings after the settings dialog has closed.
+
+        RTSP teardown and WebEngine updates can take noticeable time; running that work
+        while a modal dialog is still in ``exec()`` makes Windows report the app as hung.
+        """
+        try:
+            self._map_widget.apply_video_settings()
+        except Exception:
+            pass
+        try:
+            if self._thread is not None and self._thread.isRunning():
+                self._set_runtime_camera_control()
+        except Exception:
+            pass
+        try:
+            self._append_log("Video settings applied.")
+        except Exception:
+            pass
 
     def _set_runtime_camera_control(self) -> None:
         self._stop_camera_control_backend()
