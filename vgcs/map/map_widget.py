@@ -3017,20 +3017,16 @@ class MapWidget(QWidget):
                 self._video = VideoPipeline(self)
             # Re-fetch sources after optional configure below.
             # When MainWindow's shared `VideoPipeline` already has RTSP sources (e.g. right after
-            # `apply_video_settings_for_settings_dialog` refreshed it), calling
-            # `_configure_video_pipeline` here without `defer_rtsp_refresh=True` runs
-            # `refresh_sources()` synchronously on the GUI thread again — FFmpeg RTSP teardown
-            # blocks the event loop and Windows shows "(Not Responding)".
+            # `apply_video_settings_for_settings_dialog` scheduled a refresh), calling
+            # `_configure_video_pipeline` again only re-schedules coalesced work — avoid doing it
+            # when `sources()` is already populated so preview hook-up stays cheap.
             try:
                 have_sources = bool(self._video.sources()) if self._video is not None else False
             except Exception:
                 have_sources = False
             if not have_sources:
                 try:
-                    self._configure_video_pipeline(
-                        self._video,
-                        defer_rtsp_refresh=(shared is not None),
-                    )
+                    self._configure_video_pipeline(self._video)
                 except Exception:
                     pass
             sources = self._video.sources()
@@ -3096,9 +3092,7 @@ class MapWidget(QWidget):
             return False
         return True
 
-    def _configure_video_pipeline(
-        self, vp: VideoPipeline | None, *, defer_rtsp_refresh: bool = False
-    ) -> None:
+    def _configure_video_pipeline(self, vp: VideoPipeline | None) -> None:
         """Apply Application Settings → Video URLs and mode to the shared (or local) pipeline."""
         if vp is None:
             return
@@ -3109,7 +3103,6 @@ class MapWidget(QWidget):
                 thermal_url="",
                 transport="auto",
                 stream_kind="rtsp",
-                defer_refresh=bool(defer_rtsp_refresh),
             )
             return
         default_view = str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
@@ -3122,7 +3115,6 @@ class MapWidget(QWidget):
             thermal_url=thermal_for_pipeline,
             transport=str(getattr(self, "_video_settings_rtsp_transport", "auto") or "auto"),
             stream_kind=kind,
-            defer_refresh=bool(defer_rtsp_refresh),
         )
 
     def _read_video_settings(self) -> None:
@@ -3161,8 +3153,8 @@ class MapWidget(QWidget):
     def apply_video_settings_for_settings_dialog(self) -> None:
         """Apply path used only after Application Settings → Video → Apply (see MainWindow).
 
-        Chains stop / pipeline / hook work across event-loop ticks and defers ``refresh_sources``
-        so Windows can process WM_PAINT between RTSP teardown and rebuild (reduces Not Responding).
+        Stages preview teardown across timers; `VideoPipeline.set_rtsp_sources` schedules
+        `refresh_sources()` asynchronously so the GUI thread never blocks on FFmpeg RTSP stop.
         """
         was_preview_on = self._apply_video_settings_read_toolbar()
 
@@ -3171,7 +3163,7 @@ class MapWidget(QWidget):
             if vp is None:
                 vp = getattr(self, "_video", None)
             try:
-                self._configure_video_pipeline(vp, defer_rtsp_refresh=True)
+                self._configure_video_pipeline(vp)
             except Exception:
                 pass
             self._video_inited = False
