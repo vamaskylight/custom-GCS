@@ -3145,38 +3145,40 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-        vp = getattr(self, "_video_pipeline_shared", None)
-        if vp is None:
-            vp = getattr(self, "_video", None)
-        try:
-            self._configure_video_pipeline(vp)
-        except Exception:
-            pass
-
-        # Force pipeline + signal hooks to rebind to new RtspSource instances.
-        self._video_inited = False
-        self._shared_vp_hooks_connected = False
-
-        # Default split view from Application Settings → Video (matches web `__camSplitEnabled` seed).
-        try:
-            self._video_split_enabled = (
-                str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower() == "split"
-            )
-        except Exception:
-            pass
-        self._sync_native_camera_rail_toggles()
-
-        if (
-            was_preview_on
-            and bool(self._video_settings_enabled)
-            and bool(getattr(self, "_btn_webcam", None))
-            and bool(self._btn_webcam.isChecked())
-            and bool(getattr(self, "_web_ready", False))
-        ):
+        def _configure_and_tail() -> None:
+            vp = getattr(self, "_video_pipeline_shared", None)
+            if vp is None:
+                vp = getattr(self, "_video", None)
             try:
-                QTimer.singleShot(80, self._restart_video_preview_after_settings)
+                self._configure_video_pipeline(vp)
             except Exception:
                 pass
+            self._video_inited = False
+            self._shared_vp_hooks_connected = False
+            try:
+                self._video_split_enabled = (
+                    str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
+                    == "split"
+                )
+            except Exception:
+                pass
+            self._sync_native_camera_rail_toggles()
+            if (
+                was_preview_on
+                and bool(self._video_settings_enabled)
+                and bool(getattr(self, "_btn_webcam", None))
+                and bool(self._btn_webcam.isChecked())
+                and bool(getattr(self, "_web_ready", False))
+            ):
+                try:
+                    QTimer.singleShot(80, self._restart_video_preview_after_settings)
+                except Exception:
+                    pass
+
+        try:
+            QTimer.singleShot(0, _configure_and_tail)
+        except Exception:
+            _configure_and_tail()
 
     def _restart_video_preview_after_settings(self) -> None:
         try:

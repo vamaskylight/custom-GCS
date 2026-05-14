@@ -2033,7 +2033,9 @@ class MainWindow(QMainWindow):
                 # QDialog::accept() may process a nested event loop; a 0-ms timer can fire
                 # *during* that teardown and run FFmpeg/WebEngine work while the dialog is
                 # still closing → "Application Settings (Not Responding)". Defer past it.
-                QTimer.singleShot(120, self._deferred_apply_saved_video_settings)
+                # Real companion RTSP often needs longer than localhost before the main window
+                # should begin synchronous teardown of the old session.
+                QTimer.singleShot(400, self._deferred_apply_saved_video_settings)
 
             QTimer.singleShot(0, _commit_and_close)
 
@@ -2678,6 +2680,9 @@ class MainWindow(QMainWindow):
             self._map_widget.apply_video_settings()
         except Exception:
             pass
+        QTimer.singleShot(0, self._deferred_apply_saved_video_settings_camera)
+
+    def _deferred_apply_saved_video_settings_camera(self) -> None:
         try:
             if self._thread is not None and self._thread.isRunning():
                 self._set_runtime_camera_control()
