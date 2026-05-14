@@ -2010,27 +2010,32 @@ class MainWindow(QMainWindow):
         )
 
         def _apply() -> None:
-            s.setValue("video/enabled", bool(enabled.isChecked()))
-            s.setValue("video/source", str(source_combo.currentData() or "rtsp"))
-            s.setValue("video/rtsp_day", str(rtsp_day.text()).strip())
-            s.setValue("video/rtsp_thermal", str(rtsp_th.text()).strip())
-            s.setValue("video/default_view", str(split_default.currentText()))
-            s.setValue("video/aspect", str(aspect.currentText()))
-            s.setValue("video/low_latency", bool(low_latency.isChecked()))
-            s.setValue("video/decode_priority", str(decode_prio.currentText()))
-            s.setValue("video/rtsp_transport", str(rtsp_transport.currentData() or "auto"))
-            s.setValue("video/record_format", str(record_fmt.currentText()))
-            s.setValue("video/auto_delete", bool(auto_del.isChecked()))
-            s.setValue("video/max_storage_mb", int(max_mb.value()))
-            s.setValue("camera/provider", str(camera_provider.currentData() or "mavlink"))
-            s.setValue("camera/skydroid_host", str(skydroid_host.text()).strip())
-            s.setValue("camera/skydroid_port", int(skydroid_port.value()))
-            s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
-            s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
-            # Close the modal *before* touching RTSP/WebEngine: heavy work inside a nested
-            # exec() keeps Windows marking both "Application Settings" and "Python" as hung.
-            dlg.accept()
-            QTimer.singleShot(0, self._deferred_apply_saved_video_settings)
+            # Return immediately from the click handler so Windows gets a repainted frame.
+            def _commit_and_close() -> None:
+                s.setValue("video/enabled", bool(enabled.isChecked()))
+                s.setValue("video/source", str(source_combo.currentData() or "rtsp"))
+                s.setValue("video/rtsp_day", str(rtsp_day.text()).strip())
+                s.setValue("video/rtsp_thermal", str(rtsp_th.text()).strip())
+                s.setValue("video/default_view", str(split_default.currentText()))
+                s.setValue("video/aspect", str(aspect.currentText()))
+                s.setValue("video/low_latency", bool(low_latency.isChecked()))
+                s.setValue("video/decode_priority", str(decode_prio.currentText()))
+                s.setValue("video/rtsp_transport", str(rtsp_transport.currentData() or "auto"))
+                s.setValue("video/record_format", str(record_fmt.currentText()))
+                s.setValue("video/auto_delete", bool(auto_del.isChecked()))
+                s.setValue("video/max_storage_mb", int(max_mb.value()))
+                s.setValue("camera/provider", str(camera_provider.currentData() or "mavlink"))
+                s.setValue("camera/skydroid_host", str(skydroid_host.text()).strip())
+                s.setValue("camera/skydroid_port", int(skydroid_port.value()))
+                s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
+                s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
+                dlg.accept()
+                # QDialog::accept() may process a nested event loop; a 0-ms timer can fire
+                # *during* that teardown and run FFmpeg/WebEngine work while the dialog is
+                # still closing → "Application Settings (Not Responding)". Defer past it.
+                QTimer.singleShot(120, self._deferred_apply_saved_video_settings)
+
+            QTimer.singleShot(0, _commit_and_close)
 
         btn_apply.clicked.connect(_apply)
         btn_close.clicked.connect(dlg.accept)
