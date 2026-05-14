@@ -2037,22 +2037,30 @@ class MainWindow(QMainWindow):
                     self._map_widget.apply_video_settings()
                 except Exception:
                     pass
-                try:
-                    if self._thread is not None and self._thread.isRunning():
-                        self._set_runtime_camera_control()
-                except Exception:
-                    pass
-                finally:
+
+                def _apply_camera_settings() -> None:
                     try:
-                        btn_apply.setEnabled(True)
+                        if self._thread is not None and self._thread.isRunning():
+                            self._set_runtime_camera_control()
                     except Exception:
                         pass
-                try:
-                    QMessageBox.information(self, "VGCS", "Video settings applied.")
-                except Exception:
-                    pass
+                    finally:
+                        try:
+                            btn_apply.setEnabled(True)
+                        except Exception:
+                            pass
+                    try:
+                        QTimer.singleShot(
+                            0,
+                            lambda: QMessageBox.information(self, "VGCS", "Video settings applied."),
+                        )
+                    except Exception:
+                        pass
 
-            QTimer.singleShot(0, _finish_apply_video)
+                QTimer.singleShot(0, _apply_camera_settings)
+
+            # >0 ms: let the modal dialog process paint/WM_PING before heavy RTSP teardown.
+            QTimer.singleShot(150, _finish_apply_video)
 
         btn_apply.clicked.connect(_apply)
         btn_close.clicked.connect(dlg.accept)
