@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from typing import Optional, Protocol
 
-from PySide6.QtCore import QObject, QEventLoop, QTimer, Signal, QMetaObject, Qt, Slot
+from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
 try:
     import numpy as np  # type: ignore[import-not-found]
@@ -44,18 +44,6 @@ except Exception:  # pragma: no cover - depends on platform build
     QImageCapture = None  # type: ignore[assignment]
     QVideoSink = None  # type: ignore[assignment]
     HAS_MULTIMEDIA = False
-
-
-def pump_gui_events_exclude_user_input() -> None:
-    """Yield one pass of posted events (no user input) so Windows can repaint during long RTSP work."""
-    try:
-        from PySide6.QtWidgets import QApplication
-
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-    except Exception:
-        pass
 
 
 @dataclass(frozen=True)
@@ -978,6 +966,7 @@ class VideoPipeline(QObject):
         self._defer_refresh_timer = QTimer(self)
         self._defer_refresh_timer.setSingleShot(True)
         self._defer_refresh_timer.timeout.connect(self.refresh_sources)
+        self._refresh_sources_active = False
 
         self.refresh_sources()
 
@@ -985,77 +974,88 @@ class VideoPipeline(QObject):
         # Always stop + drop old sources. Replacing the dict alone leaves QObject children
         # and FFmpeg threads alive → duplicate RTSP sessions, CPU spikes, and "Python is not
         # responding" when saving Video settings while connected.
+        #
+        # Do NOT call QApplication.processEvents() from inside this method: a deferred
+        # refresh (defer_refresh=True) can re-enter here mid-loop and corrupt `_sources`.
+        if getattr(self, "_refresh_sources_active", False):
+            try:
+                self._defer_refresh_timer.start(1)
+            except Exception:
+                pass
+            return
+        self._refresh_sources_active = True
         try:
-            self._defer_refresh_timer.stop()
-        except Exception:
-            pass
-        old_items = list(self._sources.items())
-        self._sources = {}
-        for _sid, src in old_items:
             try:
-                if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
-                    try:
-                        src.frame.disconnect()
-                    except Exception:
-                        pass
+                self._defer_refresh_timer.stop()
             except Exception:
                 pass
-            try:
-                if hasattr(src, "stop"):
-                    src.stop()
-            except Exception:
-                pass
-            try:
-                src.deleteLater()
-            except Exception:
-                pass
-            pump_gui_events_exclude_user_input()
-        kind = str(self._stream_kind or "rtsp").strip().lower()
-        udp_demux = ""
-        day_lbl_base = "RTSP"
-        if kind == "udp_h264":
-            udp_demux = "h264"
-            day_lbl_base = "UDP h.264"
-        elif kind == "udp_h265":
-            udp_demux = "hevc"
-            day_lbl_base = "UDP h.265"
-        if HAS_MULTIMEDIA and (self._rtsp_day_url or self._rtsp_thermal_url):
-            if self._rtsp_day_url:
-                day = RtspSource(
-                    url=self._rtsp_day_url,
-                    source_id="day",
-                    label=f"Day ({day_lbl_base})",
-                    transport=self._rtsp_transport,
-                    udp_input_format=udp_demux,
-                    parent=self,
-                )
-                day.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
-                self._sources["day"] = day
-            if self._rtsp_thermal_url:
-                th = RtspSource(
-                    url=self._rtsp_thermal_url,
-                    source_id="thermal",
-                    label=f"Thermal ({day_lbl_base})",
-                    transport=self._rtsp_transport,
-                    udp_input_format=udp_demux,
-                    parent=self,
-                )
-                th.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
-                self._sources["thermal"] = th
-        if HAS_MULTIMEDIA and QMediaDevices is not None:
-            pump_gui_events_exclude_user_input()
-            try:
-                devices = list(QMediaDevices.videoInputs())
-            except Exception:
-                devices = []
-            for i, dev in enumerate(devices):
-                src_id = f"cam{i}"
-                src = CameraSource(dev, source_id=src_id, parent=self)
-                src.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
-                self._sources[src_id] = src
-        if not self._active_source_id and self._sources:
-            self._active_source_id = next(iter(self._sources.keys()))
-        self.sources_changed.emit()
+            old_items = list(self._sources.items())
+            self._sources = {}
+            for _sid, src in old_items:
+                try:
+                    if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
+                        try:
+                            src.frame.disconnect()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    if hasattr(src, "stop"):
+                        src.stop()
+                except Exception:
+                    pass
+                try:
+                    src.deleteLater()
+                except Exception:
+                    pass
+            kind = str(self._stream_kind or "rtsp").strip().lower()
+            udp_demux = ""
+            day_lbl_base = "RTSP"
+            if kind == "udp_h264":
+                udp_demux = "h264"
+                day_lbl_base = "UDP h.264"
+            elif kind == "udp_h265":
+                udp_demux = "hevc"
+                day_lbl_base = "UDP h.265"
+            if HAS_MULTIMEDIA and (self._rtsp_day_url or self._rtsp_thermal_url):
+                if self._rtsp_day_url:
+                    day = RtspSource(
+                        url=self._rtsp_day_url,
+                        source_id="day",
+                        label=f"Day ({day_lbl_base})",
+                        transport=self._rtsp_transport,
+                        udp_input_format=udp_demux,
+                        parent=self,
+                    )
+                    day.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
+                    self._sources["day"] = day
+                if self._rtsp_thermal_url:
+                    th = RtspSource(
+                        url=self._rtsp_thermal_url,
+                        source_id="thermal",
+                        label=f"Thermal ({day_lbl_base})",
+                        transport=self._rtsp_transport,
+                        udp_input_format=udp_demux,
+                        parent=self,
+                    )
+                    th.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
+                    self._sources["thermal"] = th
+            if HAS_MULTIMEDIA and QMediaDevices is not None:
+                try:
+                    devices = list(QMediaDevices.videoInputs())
+                except Exception:
+                    devices = []
+                for i, dev in enumerate(devices):
+                    src_id = f"cam{i}"
+                    src = CameraSource(dev, source_id=src_id, parent=self)
+                    src.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
+                    self._sources[src_id] = src
+            if not self._active_source_id and self._sources:
+                self._active_source_id = next(iter(self._sources.keys()))
+            self.sources_changed.emit()
+        finally:
+            self._refresh_sources_active = False
 
     def set_rtsp_sources(
         self,
