@@ -2605,13 +2605,17 @@ class MainWindow(QMainWindow):
         self._thread.params_snapshot.connect(self._on_params_snapshot)
         self._thread.param_set_result.connect(self._on_param_set_result)
         self._thread.finished.connect(self._on_thread_finished)
-        try:
-            self._set_runtime_camera_control()
-        except Exception:
+        # Keep the click handler light: Skydroid / map camera wiring can touch sockets and QSettings.
+        def _deferred_camera_after_connect() -> None:
             try:
-                self._map_widget.set_camera_control(NoopCameraControl())
+                self._set_runtime_camera_control()
             except Exception:
-                pass
+                try:
+                    self._map_widget.set_camera_control(NoopCameraControl())
+                except Exception:
+                    pass
+
+        QTimer.singleShot(0, _deferred_camera_after_connect)
 
         self._btn_connect.setEnabled(False)
         self._conn_edit.setEnabled(False)
