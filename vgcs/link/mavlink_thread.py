@@ -47,6 +47,36 @@ class MavlinkThread(QThread):
         self._cmd_queue: deque[tuple[str, object]] = deque()
         self._last_gcs_heartbeat_mono = 0.0
         self._streams_requested = False
+        # High-rate MAVLink messages must not each queue a GUI slot; dozens/sec stalls the
+        # main thread on Windows ("VGCS … Not Responding") while the vehicle streams pose data.
+        self._telemetry_last_emit_mono: dict[str, float] = {}
+        self._telemetry_emit_interval: dict[str, float] = {
+            "HEARTBEAT": 0.05,
+            "GLOBAL_POSITION_INT": 0.05,
+            "ATTITUDE": 0.05,
+            "VFR_HUD": 0.1,
+            "SYS_STATUS": 0.12,
+            "GPS_RAW_INT": 0.2,
+            "MISSION_CURRENT": 0.15,
+            "STATUSTEXT": 0.05,
+            "RADIO_STATUS": 0.2,
+            "OPEN_DRONE_ID": 0.25,
+        }
+        self._last_hb_log_mono = 0.0
+
+    def _emit_telemetry_payload(self, msg_type: str, payload: dict) -> None:
+        """Emit telemetry to the GUI at a capped rate for known high-frequency message types."""
+        throttle_key = "OPEN_DRONE_ID" if str(msg_type).startswith("OPEN_DRONE_ID_") else str(msg_type)
+        interval = self._telemetry_emit_interval.get(throttle_key)
+        if interval is None:
+            self.telemetry.emit(msg_type, payload)
+            return
+        now = time.monotonic()
+        last = self._telemetry_last_emit_mono.get(throttle_key, 0.0)
+        if now - last < float(interval):
+            return
+        self._telemetry_last_emit_mono[throttle_key] = now
+        self.telemetry.emit(msg_type, payload)
 
     def queue_mission_upload(self, waypoints: list[dict]) -> None:
         with self._cmd_lock:
@@ -264,11 +294,14 @@ class MavlinkThread(QThread):
                         int(msg.get_srcComponent()),
                         int(getattr(msg, "mavlink_version", 0) or 0),
                     )
-                self.log_line.emit(
-                    f"HEARTBEAT sys={msg.get_srcSystem()} comp={msg.get_srcComponent()}"
-                )
+                hb_now = time.monotonic()
+                if hb_now - self._last_hb_log_mono >= 1.0:
+                    self._last_hb_log_mono = hb_now
+                    self.log_line.emit(
+                        f"HEARTBEAT sys={msg.get_srcSystem()} comp={msg.get_srcComponent()}"
+                    )
                 armed = bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                self.telemetry.emit(
+                self._emit_telemetry_payload(
                     "HEARTBEAT",
                     {
                         "armed": armed,
@@ -286,12 +319,12 @@ class MavlinkThread(QThread):
                     except Exception:
                         pass
             elif msg_type == "MISSION_CURRENT":
-                self.telemetry.emit(
+                self._emit_telemetry_payload(
                     "MISSION_CURRENT",
                     {"seq": int(getattr(msg, "seq", 0) or 0)},
                 )
             elif msg_type == "STATUSTEXT":
-                self.telemetry.emit(
+                self._emit_telemetry_payload(
                     "STATUSTEXT",
                     {
                         "severity": int(getattr(msg, "severity", 0) or 0),
@@ -299,7 +332,7 @@ class MavlinkThread(QThread):
                     },
                 )
             elif msg_type == "VFR_HUD":
-                self.telemetry.emit(
+                self._emit_telemetry_payload(
                     "VFR_HUD",
                     {
                         "airspeed": float(getattr(msg, "airspeed", 0.0) or 0.0),
@@ -310,7 +343,7 @@ class MavlinkThread(QThread):
                     },
                 )
             elif msg_type == "ATTITUDE":
-                self.telemetry.emit(
+                self._emit_telemetry_payload(
                     "ATTITUDE",
                     {
                         "roll_deg": float(getattr(msg, "roll", 0.0) or 0.0) * 57.2958,
@@ -339,11 +372,11 @@ class MavlinkThread(QThread):
                     gpi["hdg_deg"] = hdg_deg
                 if gt_deg is not None:
                     gpi["ground_track_deg"] = gt_deg
-                self.telemetry.emit("GLOBAL_POSITION_INT", gpi)
+                self._emit_telemetry_payload("GLOBAL_POSITION_INT", gpi)
             elif msg_type == "GPS_RAW_INT":
                 eph_raw = int(getattr(msg, "eph", 0xFFFF) or 0xFFFF)
                 hdop = None if eph_raw >= 0xFFFF else float(eph_raw) / 100.0
-                self.telemetry.emit(
+                self._emit_telemetry_payload(
                     "GPS_RAW_INT",
                     {
                         "satellites_visible": int(getattr(msg, "satellites_visible", 0) or 0),
@@ -352,7 +385,7 @@ class MavlinkThread(QThread):
                     },
                 )
             elif msg_type == "SYS_STATUS":
-                self.telemetry.emit(
+                self._emit_telemetry_payload(
                     "SYS_STATUS",
                     {
                         "voltage_v": float(getattr(msg, "voltage_battery", 0) or 0) / 1000.0,
@@ -370,7 +403,7 @@ class MavlinkThread(QThread):
                     },
                 )
             elif msg_type == "RADIO_STATUS":
-                self.telemetry.emit(
+                self._emit_telemetry_payload(
                     "RADIO_STATUS",
                     {
                         "rssi": int(getattr(msg, "rssi", 0) or 0),
@@ -401,7 +434,7 @@ class MavlinkThread(QThread):
                             ).strip("\x00 ").strip()
                         except Exception:
                             pass
-                self.telemetry.emit(msg_type, payload)
+                self._emit_telemetry_payload(msg_type, payload)
 
         try:
             if self._master is not None:
