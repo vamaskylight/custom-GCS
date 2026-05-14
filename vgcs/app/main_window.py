@@ -2035,7 +2035,7 @@ class MainWindow(QMainWindow):
                 # still closing → "Application Settings (Not Responding)". Defer past it.
                 # Real companion RTSP often needs longer than localhost before the main window
                 # should begin synchronous teardown of the old session.
-                QTimer.singleShot(400, self._deferred_apply_saved_video_settings)
+                QTimer.singleShot(550, self._deferred_apply_saved_video_settings)
 
             QTimer.singleShot(0, _commit_and_close)
 

@@ -67,7 +67,7 @@ from vgcs.mission import (
 )
 
 # Optional: live camera preview for map overlay (M3 video pipeline).
-from vgcs.video.pipeline import HAS_MULTIMEDIA, VideoFrame, VideoPipeline
+from vgcs.video.pipeline import HAS_MULTIMEDIA, VideoFrame, VideoPipeline, pump_gui_events_exclude_user_input
 from vgcs.video.camera_control import NoopCameraControl
 from vgcs.map.native_tile_map import NativeTileMapView
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
@@ -3154,6 +3154,7 @@ class MapWidget(QWidget):
         was_preview_on = self._apply_video_settings_read_toolbar()
 
         def phase_configure_and_tail() -> None:
+            pump_gui_events_exclude_user_input()
             vp = getattr(self, "_video_pipeline_shared", None)
             if vp is None:
                 vp = getattr(self, "_video", None)
@@ -3161,6 +3162,7 @@ class MapWidget(QWidget):
                 self._configure_video_pipeline(vp, defer_rtsp_refresh=True)
             except Exception:
                 pass
+            pump_gui_events_exclude_user_input()
             self._video_inited = False
             self._shared_vp_hooks_connected = False
             try:
@@ -3186,10 +3188,11 @@ class MapWidget(QWidget):
         def phase_stop_preview() -> None:
             try:
                 if bool(getattr(self, "_video_preview_enabled", False)):
-                    self._stop_video_preview(clear_overlay=True)
+                    self._stop_video_preview(clear_overlay=True, pump_between_stops=True)
             except Exception:
                 pass
-            QTimer.singleShot(0, phase_configure_and_tail)
+            # One ~frame interval so Windows can paint after preview teardown before pipeline rebuild.
+            QTimer.singleShot(16, phase_configure_and_tail)
 
         QTimer.singleShot(0, phase_stop_preview)
 
@@ -3203,7 +3206,7 @@ class MapWidget(QWidget):
 
         try:
             if bool(getattr(self, "_video_preview_enabled", False)):
-                self._stop_video_preview(clear_overlay=True)
+                self._stop_video_preview(clear_overlay=True, pump_between_stops=True)
         except Exception:
             pass
 
@@ -3317,7 +3320,7 @@ class MapWidget(QWidget):
         except Exception:
             self._run_js("setVideoPreviewImage('');")
 
-    def _stop_video_preview(self, *, clear_overlay: bool) -> None:
+    def _stop_video_preview(self, *, clear_overlay: bool, pump_between_stops: bool = False) -> None:
         self._video_preview_enabled = False
         self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(false);")
         self._run_js("if (window.setNativeHudMode) setNativeHudMode(false);")
@@ -3343,12 +3346,16 @@ class MapWidget(QWidget):
             src = getattr(self, "_video_active_source", None)
             if src is not None:
                 src.stop()
+                if pump_between_stops:
+                    pump_gui_events_exclude_user_input()
             if getattr(self, "_video", None) is not None:
                 for _, s in list(self._video.sources().items())[:4]:
                     try:
                         s.stop()
                     except Exception:
                         pass
+                    if pump_between_stops:
+                        pump_gui_events_exclude_user_input()
         except Exception:
             pass
         try:

@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from typing import Optional, Protocol
 
-from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
+from PySide6.QtCore import QObject, QEventLoop, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
 try:
     import numpy as np  # type: ignore[import-not-found]
@@ -44,6 +44,18 @@ except Exception:  # pragma: no cover - depends on platform build
     QImageCapture = None  # type: ignore[assignment]
     QVideoSink = None  # type: ignore[assignment]
     HAS_MULTIMEDIA = False
+
+
+def pump_gui_events_exclude_user_input() -> None:
+    """Yield one pass of posted events (no user input) so Windows can repaint during long RTSP work."""
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+    except Exception:
+        pass
 
 
 @dataclass(frozen=True)
@@ -963,6 +975,9 @@ class VideoPipeline(QObject):
         self._rtsp_transport: str = "auto"
         # Application Settings → Video → Source (`rtsp` | `udp_h264` | `udp_h265`).
         self._stream_kind: str = "rtsp"
+        self._defer_refresh_timer = QTimer(self)
+        self._defer_refresh_timer.setSingleShot(True)
+        self._defer_refresh_timer.timeout.connect(self.refresh_sources)
 
         self.refresh_sources()
 
@@ -970,6 +985,10 @@ class VideoPipeline(QObject):
         # Always stop + drop old sources. Replacing the dict alone leaves QObject children
         # and FFmpeg threads alive → duplicate RTSP sessions, CPU spikes, and "Python is not
         # responding" when saving Video settings while connected.
+        try:
+            self._defer_refresh_timer.stop()
+        except Exception:
+            pass
         old_items = list(self._sources.items())
         self._sources = {}
         for _sid, src in old_items:
@@ -990,6 +1009,7 @@ class VideoPipeline(QObject):
                 src.deleteLater()
             except Exception:
                 pass
+            pump_gui_events_exclude_user_input()
         kind = str(self._stream_kind or "rtsp").strip().lower()
         udp_demux = ""
         day_lbl_base = "RTSP"
@@ -1023,6 +1043,7 @@ class VideoPipeline(QObject):
                 th.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
                 self._sources["thermal"] = th
         if HAS_MULTIMEDIA and QMediaDevices is not None:
+            pump_gui_events_exclude_user_input()
             try:
                 devices = list(QMediaDevices.videoInputs())
             except Exception:
@@ -1056,7 +1077,7 @@ class VideoPipeline(QObject):
         if defer_refresh:
             # Let the GUI thread paint / process Windows messages before synchronous
             # stop()+rebuild in refresh_sources() (slow on real Wi‑Fi RTSP).
-            QTimer.singleShot(0, self.refresh_sources)
+            self._defer_refresh_timer.start(0)
         else:
             self.refresh_sources()
 
