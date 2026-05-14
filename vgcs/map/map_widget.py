@@ -3015,11 +3015,24 @@ class MapWidget(QWidget):
                 self._video = shared
             else:
                 self._video = VideoPipeline(self)
-            # Apply stream URLs / mode before enumerating sources (shared + local pipeline).
+            # Re-fetch sources after optional configure below.
+            # When MainWindow's shared `VideoPipeline` already has RTSP sources (e.g. right after
+            # `apply_video_settings_for_settings_dialog` refreshed it), calling
+            # `_configure_video_pipeline` here without `defer_rtsp_refresh=True` runs
+            # `refresh_sources()` synchronously on the GUI thread again — FFmpeg RTSP teardown
+            # blocks the event loop and Windows shows "(Not Responding)".
             try:
-                self._configure_video_pipeline(self._video)
+                have_sources = bool(self._video.sources()) if self._video is not None else False
             except Exception:
-                pass
+                have_sources = False
+            if not have_sources:
+                try:
+                    self._configure_video_pipeline(
+                        self._video,
+                        defer_rtsp_refresh=(shared is not None),
+                    )
+                except Exception:
+                    pass
             sources = self._video.sources()
         except Exception:
             self._video = None
