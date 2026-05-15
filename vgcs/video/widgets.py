@@ -102,7 +102,7 @@ class VideoPreviewLabel(QLabel):
 
 
 class CameraControlPanel(QGroupBox):
-    follow_triggered = Signal()
+    follow_triggered = Signal(bool)
 
     def __init__(self, pipeline: VideoPipeline, parent: QWidget | None = None) -> None:
         super().__init__("Camera Control", parent)
@@ -154,7 +154,9 @@ class CameraControlPanel(QGroupBox):
         self._btn_photo = QPushButton("Photo…")
         self._btn_record = QPushButton("Record…")
         self._btn_record.setCheckable(True)
-        self._btn_follow = QPushButton("Follow trigger")
+        self._btn_follow = QPushButton("Follow map")
+        self._btn_follow.setCheckable(True)
+        self._btn_follow.setToolTip("Center the map on the vehicle while enabled (same as map camera-rail Follow).")
         act_row.addWidget(self._btn_photo)
         act_row.addWidget(self._btn_record)
         act_row.addWidget(self._btn_follow)
@@ -178,9 +180,15 @@ class CameraControlPanel(QGroupBox):
         self._zoom_slider.valueChanged.connect(self._on_zoom_changed)
         self._btn_photo.clicked.connect(self._take_photo)
         self._btn_record.toggled.connect(self._toggle_recording)
-        self._btn_follow.clicked.connect(self.follow_triggered.emit)
+        self._btn_follow.toggled.connect(self.follow_triggered.emit)
 
         self._rebuild_sources()
+
+    def sync_video_follow_toggle(self, enabled: bool) -> None:
+        """Keep the Follow control aligned when the map rail (or code) changes follow mode."""
+        self._btn_follow.blockSignals(True)
+        self._btn_follow.setChecked(bool(enabled))
+        self._btn_follow.blockSignals(False)
 
     def vision_mode(self) -> str:
         return str(self._mode)
