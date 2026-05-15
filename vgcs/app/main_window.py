@@ -1890,7 +1890,7 @@ class MainWindow(QMainWindow):
         cg.addWidget(QLabel("Stream URL 1 (Day / primary)"), 0, 0)
         rtsp_day = QLineEdit()
         rtsp_day.setPlaceholderText(
-            "SIYI ZR10: rtsp://192.168.144.25:8554/video2  (sub stream, smoother than main.264)"
+            "SIYI ZR10: rtsp://192.168.144.25:8554/main.264  (video2 not on all firmware)"
         )
         cg.addWidget(rtsp_day, 0, 1)
         cg.addWidget(QLabel("Stream URL 2 (Thermal / secondary)"), 1, 0)
