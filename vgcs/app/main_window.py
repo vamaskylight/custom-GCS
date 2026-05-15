@@ -1002,6 +1002,8 @@ class MainWindow(QMainWindow):
         self._center_row.addWidget(self._vehicle_msg_frame, 0, Qt.AlignTop)
         self._center_row.addWidget(self._map_widget, 1)
         self._camera_panel = self._build_camera_control_panel()
+        self._camera_panel.follow_triggered.connect(self._map_widget.set_video_follow_enabled)
+        self._map_widget.video_follow_enabled_changed.connect(self._camera_panel.sync_video_follow_toggle)
         # Create the camera control backend used by split/video transforms,
         # but do not add it to the visible layout (removes the "Camera Control" UI panel).
         try:

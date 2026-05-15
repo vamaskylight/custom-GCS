@@ -648,6 +648,7 @@ class MapWidget(QWidget):
     map_3d_mode_changed = Signal()  # _is_3d_mode updated (async load / JS / back to 2D)
     mission_start_requested = Signal()
     plan_mission_panel_changed = Signal(object)
+    video_follow_enabled_changed = Signal(bool)
 
     def __init__(self, parent=None, *, video_pipeline: VideoPipeline | None = None) -> None:
         super().__init__(parent)
@@ -4499,6 +4500,11 @@ class MapWidget(QWidget):
         self._on_web_title_changed(f"VGCS_CAM_FOLLOW_TOGGLE:{1 if on else 0}:0")
         self._sync_native_camera_rail_toggles()
 
+    def set_video_follow_enabled(self, enabled: bool) -> None:
+        """Same Follow behavior as the map camera rail (center map on vehicle while on)."""
+        self._on_web_title_changed(f"VGCS_CAM_FOLLOW_TOGGLE:{1 if bool(enabled) else 0}:0")
+        self._sync_native_camera_rail_toggles()
+
     def _sync_native_camera_rail_toggles(self) -> None:
         """Keep Split / Follow aligned with pipeline flags; Split green when 4-up is meaningful (not single-channel fullscreen)."""
         try:
@@ -4822,6 +4828,7 @@ class MapWidget(QWidget):
         if title.startswith("VGCS_CAM_FOLLOW_TOGGLE:"):
             # Format: VGCS_CAM_FOLLOW_TOGGLE:<0|1>:<ts>
             print(f"[VGCS:cam_rail] handler FOLLOW {title!r}")
+            prev = bool(getattr(self, "_video_follow_enabled", False))
             try:
                 parts = title.split(":")
                 self._video_follow_enabled = bool(int(parts[1])) if len(parts) >= 2 else False
@@ -4829,6 +4836,9 @@ class MapWidget(QWidget):
             except Exception:
                 self._video_follow_enabled = False
                 self._video_follow_last_center_mono = 0.0
+            now_en = bool(getattr(self, "_video_follow_enabled", False))
+            if now_en != prev:
+                self.video_follow_enabled_changed.emit(now_en)
             # Match webview: recenter as soon as follow is enabled (not only on the next throttled pose tick).
             if bool(getattr(self, "_video_follow_enabled", False)):
                 try:
