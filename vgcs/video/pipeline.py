@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi10"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi12"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -1382,6 +1382,14 @@ class RtspSource(QObject):
                     empty_sessions = 0
 
                     while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
+                        if _rtsp_url_is_siyi_style(url) and round_ok:
+                            try:
+                                print(
+                                    "[VGCS:video] SIYI: opening new RTSP decode session "
+                                    f"(transport={tr_label})"
+                                )
+                            except Exception:
+                                pass
                         vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h, hwaccel=siyi_hw)
                         cmd_base = [
                             "ffmpeg",
@@ -1668,8 +1676,15 @@ class RtspSource(QObject):
                                         or b"error number -10054" in tl
                                         or b"could not find ref" in tl
                                     ):
-                                        cooldown = max(cooldown, 4.0)
+                                        cooldown = max(cooldown, 6.0)
                                         siyi_hw = False
+                                        try:
+                                            print(
+                                                f"[VGCS:video] SIYI: cooldown {cooldown:.0f}s "
+                                                "before reconnect (wait for HEVC IDR)"
+                                            )
+                                        except Exception:
+                                            pass
                             except Exception:
                                 pass
                             time.sleep(cooldown)
