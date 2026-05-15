@@ -3210,13 +3210,7 @@ class MapWidget(QWidget):
             return
         if not bool(getattr(self, "_web_ready", False)):
             return
-        want_preview = bool(getattr(self, "_video_preview_enabled", False))
-        want_toolbar = (
-            bool(getattr(self, "_btn_webcam", None))
-            and bool(self._btn_webcam.isChecked())
-            and bool(getattr(self, "_video_settings_enabled", False))
-        )
-        if not want_preview and not want_toolbar:
+        if not self._video_preview_should_run():
             return
         vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
         if vp is None:
@@ -3232,7 +3226,7 @@ class MapWidget(QWidget):
         setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
         QTimer.singleShot(0, self._restart_video_preview_after_settings)
 
-    def _ensure_video_preview_backend(self) -> bool:
+    def _ensure_video_preview_backend(self, *, from_start: bool = False) -> bool:
         if not HAS_MULTIMEDIA:
             return False
         if getattr(self, "_video_inited", False):
@@ -3276,7 +3270,7 @@ class MapWidget(QWidget):
             delattr(self, "_video_skip_preview_flag_reset_in_ensure")
         except Exception:
             pass
-        if not _skip_pv_reset:
+        if not _skip_pv_reset and not from_start:
             self._video_preview_enabled = False
 
         self._video: VideoPipeline | None = None
@@ -3330,6 +3324,13 @@ class MapWidget(QWidget):
             self._video = None
             sources = {}
         if not sources:
+            try:
+                print(
+                    "[VGCS:video] preview backend: no pipeline sources yet "
+                    "(waiting for refresh_sources)"
+                )
+            except Exception:
+                pass
             return False
 
         if not hasattr(self, "_video_push_timer") or self._video_push_timer is None:
@@ -3554,11 +3555,7 @@ class MapWidget(QWidget):
             # Start (or restart) preview whenever streaming is enabled and the toolbar wants it —
             # not only when preview was already running. First-time enable after Apply used to skip
             # `_restart_video_preview_after_settings` because `was_preview_on` stayed False.
-            if self._video_preview_should_run():
-                try:
-                    QTimer.singleShot(400, self._restart_video_preview_after_settings)
-                except Exception:
-                    pass
+            self._schedule_video_preview_after_settings()
 
         def phase_stop_preview() -> None:
             # `_stop_video_preview` used to do WebEngine `runJavaScript` + FFmpeg `stop()` in one
@@ -3624,10 +3621,43 @@ class MapWidget(QWidget):
         self._sync_native_camera_rail_toggles()
 
         if self._video_preview_should_run():
+            self._schedule_video_preview_after_settings()
+
+    def _schedule_video_preview_after_settings(self, *, _retry: int = 0) -> None:
+        """Start preview when RTSP sources exist (now or after async refresh_sources)."""
+        if not self._video_preview_should_run():
+            return
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is None:
             try:
-                QTimer.singleShot(80, self._restart_video_preview_after_settings)
+                print("[VGCS:video] preview schedule: no VideoPipeline")
             except Exception:
                 pass
+            return
+        try:
+            if vp.sources():
+                self._restart_video_preview_after_settings()
+                return
+        except Exception:
+            pass
+        if int(_retry) >= 3:
+            try:
+                print("[VGCS:video] preview schedule: gave up (no pipeline sources after retries)")
+            except Exception:
+                pass
+            return
+        if int(_retry) == 0:
+            try:
+                print(
+                    "[VGCS:video] preview schedule: waiting for pipeline sources "
+                    "(sources_changed will start decode)"
+                )
+            except Exception:
+                pass
+        nxt = int(_retry) + 1
+        QTimer.singleShot(
+            1200, lambda r=nxt: self._schedule_video_preview_after_settings(_retry=r)
+        )
 
     def _restart_video_preview_after_settings(self) -> None:
         try:
@@ -3662,6 +3692,11 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._sync_native_camera_rail_toggles()
+        try:
+            if bool(getattr(self, "_web_ready", False)) and self._video_preview_should_run():
+                QTimer.singleShot(150, self._schedule_video_preview_after_settings)
+        except Exception:
+            pass
 
     def _video_preview_source_ids_to_run(self, vp) -> list[str]:
         """Source ids that should decode while preview is on (split = all, single = active only)."""
@@ -3768,9 +3803,25 @@ class MapWidget(QWidget):
 
     def _start_video_preview(self, *, reset_swapped: bool = True) -> None:
         if not getattr(self, "_web_ready", False):
+            try:
+                print("[VGCS:video] preview start skipped: map not ready")
+            except Exception:
+                pass
             return
-        if not self._ensure_video_preview_backend():
-            # No multimedia backend / camera: keep placeholder visible.
+        if not self._ensure_video_preview_backend(from_start=True):
+            try:
+                vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+                nsrc = 0
+                try:
+                    nsrc = len(vp.sources()) if vp is not None else 0
+                except Exception:
+                    nsrc = -1
+                print(
+                    f"[VGCS:video] preview start blocked "
+                    f"(HAS_MULTIMEDIA={HAS_MULTIMEDIA} pipeline_sources={nsrc})"
+                )
+            except Exception:
+                pass
             self._run_js("setVideoPreviewImage('');")
             return
         try:
