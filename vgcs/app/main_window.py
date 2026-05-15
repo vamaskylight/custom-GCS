@@ -2048,7 +2048,16 @@ class MainWindow(QMainWindow):
                         pass
                 s.setValue("video/enabled", bool(enabled.isChecked()))
                 s.setValue("video/source", str(source_combo.currentData() or "rtsp"))
-                s.setValue("video/rtsp_day", str(rtsp_day.text()).strip())
+                _day_rtsp = str(rtsp_day.text()).strip()
+                try:
+                    from vgcs.video.pipeline import _normalize_companion_rtsp_url
+
+                    _day_rtsp = _normalize_companion_rtsp_url(_day_rtsp)
+                    if _day_rtsp != str(rtsp_day.text()).strip():
+                        rtsp_day.setText(_day_rtsp)
+                except Exception:
+                    pass
+                s.setValue("video/rtsp_day", _day_rtsp)
                 s.setValue("video/rtsp_thermal", str(rtsp_th.text()).strip())
                 s.setValue("video/default_view", str(split_default.currentText()))
                 s.setValue("video/aspect", str(aspect.currentText()))
