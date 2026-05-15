@@ -3629,6 +3629,55 @@ class MapWidget(QWidget):
             pass
         self._sync_native_camera_rail_toggles()
 
+    def _video_preview_source_ids_to_run(self, vp) -> list[str]:
+        """Source ids that should decode while preview is on (split = all, single = active only)."""
+        try:
+            sources = vp.sources()
+        except Exception:
+            return []
+        keys = list(sources.keys())
+        if not keys:
+            return []
+        if bool(getattr(self, "_video_split_enabled", False)):
+            ordered: list[str] = []
+            for k in ("day", "thermal"):
+                if k in keys:
+                    ordered.append(k)
+            for k in keys:
+                if k not in ordered:
+                    ordered.append(k)
+            return ordered[:4]
+        active = ""
+        try:
+            active = str(vp.active_source_id() or "").strip()
+        except Exception:
+            active = ""
+        if active in keys:
+            return [active]
+        if "day" in keys:
+            return ["day"]
+        return [keys[0]]
+
+    def _start_video_decode_sources(self, vp) -> None:
+        """Start only the decoders needed for the current preview mode."""
+        want = set(self._video_preview_source_ids_to_run(vp))
+        for sid, src in vp.sources().items():
+            if sid in want:
+                try:
+                    src.start()
+                except Exception:
+                    pass
+
+    def _stop_idle_video_decode_sources(self, vp) -> None:
+        """Stop decoders that are not needed (e.g. thermal when leaving split view)."""
+        want = set(self._video_preview_source_ids_to_run(vp))
+        for sid, src in vp.sources().items():
+            if sid not in want:
+                try:
+                    src.stop()
+                except Exception:
+                    pass
+
     def _start_video_preview(self, *, reset_swapped: bool = True) -> None:
         if not getattr(self, "_web_ready", False):
             return
@@ -3656,16 +3705,11 @@ class MapWidget(QWidget):
             # Native mode: hide Web preview layer to avoid double-render fragmentation.
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
-            # Start every registered source (day + thermal + …). Previously only the active
-            # source ran unless split was on, so thermal never decoded until split — and toggling
-            # split later still missed `start()` on thermal if the branch was skipped earlier.
+            # Split: decode every registered source (day + thermal + …). Single view: only the
+            # active source — avoids a second RTSP session on the same URL (SIYI ZR10 stall risk).
             vp = getattr(self, "_video", None)
             if vp is not None:
-                for _, s in list(vp.sources().items())[:4]:
-                    try:
-                        s.start()
-                    except Exception:
-                        pass
+                self._start_video_decode_sources(vp)
                 try:
                     src0 = vp.active_source()
                     if src0 is not None:
@@ -4789,6 +4833,12 @@ class MapWidget(QWidget):
                     self._split_fullscreen_source_id = None
                     self._split_layout_snapshot = None
                     self._split_pip_hit = None
+                    try:
+                        vp0 = getattr(self, "_video", None)
+                        if vp0 is not None:
+                            self._stop_idle_video_decode_sources(vp0)
+                    except Exception:
+                        pass
                     self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
                     self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
                     # Force UI to re-render in single mode even if the underlying frame hasn't changed.
