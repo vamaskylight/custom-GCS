@@ -3938,6 +3938,7 @@ class MapWidget(QWidget):
     def _stop_video_preview_begin(self) -> None:
         """First teardown slice: drop preview flag, JS overlay hints, timers, native pixmap state."""
         self._video_preview_enabled = False
+        self._video_gui_logged_frame = False
         self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(false);")
         self._run_js("if (window.setNativeHudMode) setNativeHudMode(false);")
         if hasattr(self, "_video_push_timer") and self._video_push_timer.isActive():
@@ -4018,6 +4019,15 @@ class MapWidget(QWidget):
             return
         self._native_video_last_frame_mono = time.monotonic()
         self._video_preview_got_frame = True
+        if not bool(getattr(self, "_video_gui_logged_frame", False)):
+            self._video_gui_logged_frame = True
+            try:
+                print(
+                    "[VGCS:video] GUI preview receiving frames "
+                    f"(swapped={bool(getattr(self, '_video_swapped', False))})"
+                )
+            except Exception:
+                pass
         try:
             img = vf.image
         except RuntimeError:
@@ -4885,9 +4895,8 @@ class MapWidget(QWidget):
             return
         if title.startswith("VGCS_CAM_VIDEO_MODE_REQUEST:") or title.startswith("VGCS_CAM_VIDEO_TOGGLE:"):
             try:
-                # "Video mode" should be idempotent and never tear down a healthy stream.
-                # Keep legacy TOGGLE event compatibility, but treat it as a mode request.
-                self._start_video_preview()
+                # Keep fullscreen/swap state; refresh decode without resetting layout to map PiP.
+                self._start_video_preview(reset_swapped=False, force_decode=True)
             except Exception:
                 pass
             self._run_js("document.title = 'VGCS Map';")
