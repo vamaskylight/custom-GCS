@@ -2526,7 +2526,7 @@ class MapWidget(QWidget):
         if self._video_preview_should_run():
             QTimer.singleShot(
                 800,
-                lambda: self._restart_video_preview_after_settings(force_decode=True),
+                lambda: self._request_companion_video_restart(reason="mavlink_link"),
             )
 
     def _uses_companion_rtsp(self) -> bool:
@@ -2538,6 +2538,23 @@ class MapWidget(QWidget):
         if not self._uses_companion_rtsp():
             return False
         return not bool(getattr(self, "_last_link_connected", False))
+
+    def _request_companion_video_restart(self, *, reason: str = "") -> None:
+        """One debounced RTSP reconnect (avoids -10054 from overlapping SIYI sessions)."""
+        if not self._video_preview_should_run():
+            return
+        if self._should_defer_companion_rtsp_decode():
+            return
+        now = time.monotonic()
+        last = float(getattr(self, "_companion_video_restart_mono", 0.0) or 0.0)
+        if now - last < 4.5:
+            return
+        self._companion_video_restart_mono = now
+        try:
+            print(f"[VGCS:video] companion video restart ({reason})")
+        except Exception:
+            pass
+        self._restart_video_preview_after_settings(force_decode=True)
 
     def _probe_current_tiles(self, *, reason: str) -> None:
         # Probe the *current* view tile (not just z=0), because placeholders often occur only at higher zooms.
@@ -3237,11 +3254,11 @@ class MapWidget(QWidget):
         self._video_inited = False
         self._shared_vp_hooks_connected = False
         setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
-        force = bool(getattr(self, "_last_link_connected", False))
-        QTimer.singleShot(
-            0,
-            lambda: self._restart_video_preview_after_settings(force_decode=force),
-        )
+        if bool(getattr(self, "_last_link_connected", False)):
+            QTimer.singleShot(
+                0,
+                lambda: self._request_companion_video_restart(reason="sources_changed"),
+            )
 
     def _ensure_video_preview_backend(self, *, from_start: bool = False) -> bool:
         if not HAS_MULTIMEDIA:
@@ -3573,8 +3590,8 @@ class MapWidget(QWidget):
             # not only when preview was already running. First-time enable after Apply used to skip
             # `_restart_video_preview_after_settings` because `was_preview_on` stayed False.
             QTimer.singleShot(
-                120,
-                lambda: self._restart_video_preview_after_settings(force_decode=True),
+                200,
+                lambda: self._request_companion_video_restart(reason="settings_apply"),
             )
 
         def phase_stop_preview() -> None:
@@ -3656,8 +3673,10 @@ class MapWidget(QWidget):
             return
         try:
             if vp.sources():
-                force = bool(getattr(self, "_last_link_connected", False))
-                self._restart_video_preview_after_settings(force_decode=force)
+                if bool(getattr(self, "_last_link_connected", False)):
+                    self._request_companion_video_restart(reason="schedule")
+                else:
+                    self._restart_video_preview_after_settings(force_decode=False)
                 return
         except Exception:
             pass
@@ -3725,8 +3744,8 @@ class MapWidget(QWidget):
         try:
             if bool(getattr(self, "_web_ready", False)) and self._video_preview_should_run():
                 QTimer.singleShot(
-                    150,
-                    lambda: self._restart_video_preview_after_settings(force_decode=True),
+                    200,
+                    lambda: self._request_companion_video_restart(reason="camera_control"),
                 )
         except Exception:
             pass
