@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from vgcs.skydroid import GimbalStatus, SkydroidTopUdpAdapter
+from vgcs.skydroid.transport import begin_skydroid_session_log
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,10 @@ class SkydroidCameraControl:
         log_path: str = "",
         profile_id: str = "c13_default",
     ) -> None:
+        if log_path:
+            begin_skydroid_session_log(
+                log_path, host=host, port=int(port), profile_id=profile_id
+            )
         self._adapter = SkydroidTopUdpAdapter(
             host=host,
             port=port,

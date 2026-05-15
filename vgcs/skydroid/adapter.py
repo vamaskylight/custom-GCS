@@ -123,7 +123,9 @@ class SkydroidTopUdpAdapter:
             for command in commands:
                 frame = build_top_frame(command, params)
                 try:
-                    reply = self._transport.send_and_receive(frame, expect_reply=expect_reply)
+                    reply = self._transport.send_and_receive(
+                        frame, expect_reply=expect_reply, log=True
+                    )
                     self._maybe_update_status(reply)
                     break
                 except Exception:
@@ -134,7 +136,9 @@ class SkydroidTopUdpAdapter:
             for status_cmd in self._profile.status_commands:
                 try:
                     frame = build_top_frame(status_cmd, {})
-                    reply = self._transport.send_and_receive(frame, expect_reply=True)
+                    reply = self._transport.send_and_receive(
+                        frame, expect_reply=True, log=False
+                    )
                     self._maybe_update_status(reply)
                     break
                 except Exception:

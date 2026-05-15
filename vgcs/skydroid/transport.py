@@ -3,7 +3,31 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def begin_skydroid_session_log(
+    log_path: str,
+    *,
+    host: str,
+    port: int,
+    profile_id: str,
+) -> None:
+    """Start a fresh Skydroid TOP UDP log (truncates previous file)."""
+    path = Path(str(log_path or "").strip())
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("w", encoding="utf-8") as f:
+            f.write(f"# VGCS Skydroid TOP UDP — session started {stamp}\n")
+            f.write(f"# target={host}:{int(port)} profile={profile_id}\n")
+            f.write("# Lines: TX/RX = gimbal/camera commands; STATUS = attitude poll (hidden by default)\n")
+            f.write("# ERR = send/receive failure\n\n")
+    except Exception:
+        return
 
 
 class TopUdpTransport:
@@ -42,22 +66,31 @@ class TopUdpTransport:
                 pass
             self._sock = None
 
-    def send_and_receive(self, payload: bytes, expect_reply: bool = True) -> bytes:
+    def send_and_receive(
+        self,
+        payload: bytes,
+        expect_reply: bool = True,
+        *,
+        log: bool = True,
+    ) -> bytes:
         self.open()
         last_error: Exception | None = None
         for _attempt in range(self._retries + 1):
             try:
                 assert self._sock is not None
                 self._sock.sendto(payload, (self._host, self._port))
-                self._append_log("TX", payload)
+                if log:
+                    self._append_log("TX", payload)
                 if not expect_reply:
                     return b""
                 data, _addr = self._sock.recvfrom(4096)
-                self._append_log("RX", data)
+                if log:
+                    self._append_log("RX", data)
                 return data
             except Exception as e:
                 last_error = e
                 continue
+        self._append_log("ERR", str(last_error or "unknown").encode("ascii", errors="ignore"))
         raise RuntimeError(f"TOP UDP request failed: {last_error}")
 
     def _append_log(self, direction: str, payload: bytes) -> None:
@@ -67,8 +100,10 @@ class TopUdpTransport:
             path = Path(self._log_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             text = (payload or b"").decode("ascii", errors="ignore").strip()
-            line = f"{int(time.time() * 1000)} {direction} {text}\n"
-            path.open("a", encoding="utf-8").write(line)
+            ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            target = f"{self._host}:{self._port}"
+            line = f"{ts}  {direction:5}  {target}  {text}\n"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
         except Exception:
             return
-
