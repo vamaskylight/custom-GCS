@@ -15,6 +15,9 @@ from typing import Optional, Protocol
 # Common Herelink / Skydroid / IRCam companion Wi‑Fi video subnet (RTSP host lives here).
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
+# Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi4"
+
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
 try:
@@ -209,6 +212,26 @@ def _rtsp_url_is_companion_link_subnet(url: str) -> bool:
         return False
 
 
+def _normalize_companion_rtsp_url(url: str) -> str:
+    """Map known-bad SIYI paths (e.g. /video2 → 404 on many ZR10 units) to main.264."""
+    import re
+
+    u = str(url or "").strip()
+    if not u or _url_scheme(u) != "rtsp":
+        return u
+    if "192.168.144." not in u.lower():
+        return u
+    if not re.search(r"/video2/?(?:\?|$)", u, flags=re.IGNORECASE):
+        return u
+    fixed = re.sub(r"/video2(?=/?(?:\?|$))", "/main.264", u, count=1, flags=re.IGNORECASE)
+    if fixed != u:
+        try:
+            print(f"[VGCS:video] SIYI URL remap (video2 → 404 on this firmware): {u!r} -> {fixed!r}")
+        except Exception:
+            pass
+    return fixed
+
+
 def _rtsp_url_is_siyi_style(url: str) -> bool:
     """SIYI ZR10 / ZT30 style paths on the companion link (main.264, video0–3)."""
     u = str(url or "").strip()
@@ -366,7 +389,6 @@ def _ffmpeg_preflags_before_input(
                 )
         if _rtsp_url_is_siyi_style(u):
             out.extend(["-thread_queue_size", "512"])
-            out.extend(["-ec", "guess_mvs+deblock"])
     out.extend(["-err_detect", "ignore_err"])
     if sc == "udp":
         out.extend(
@@ -1170,7 +1192,11 @@ class RtspSource(QObject):
         return t
 
     def _ffmpeg_loop(self) -> None:
-        url = str(self._url or "").strip()
+        try:
+            print(f"[VGCS:video] pipeline rev={_VIDEO_PIPELINE_REV}")
+        except Exception:
+            pass
+        url = _normalize_companion_rtsp_url(str(self._url or "").strip())
         transport_for_probe = _rtsp_transport_sequence(url, self._transport)
         dims: tuple[int, int] | None = None
         # ffprobe opens its own RTSP session. Skipped for generic companion URLs; enabled
@@ -1247,6 +1273,7 @@ class RtspSource(QObject):
         while self._running and not self._ffmpeg_stop.is_set():
             transport_seq = _rtsp_transport_sequence(url, self._transport)
             round_ok = False
+            url_fatal = False
             for transport in transport_seq:
                 if self._ffmpeg_stop.is_set() or not self._running:
                     break
@@ -1297,7 +1324,7 @@ class RtspSource(QObject):
                     empty_session_limit = 20
                     empty_sessions = 0
 
-                    while self._running and not self._ffmpeg_stop.is_set():
+                    while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
                         stderr_buf: list[bytes] = []
                         p: subprocess.Popen[bytes] | None = None
                         try:
@@ -1465,15 +1492,20 @@ class RtspSource(QObject):
                                     print(
                                         "[VGCS:video] ffmpeg stderr (session, no frames):\n" + txt
                                     )
-                                    if b"404" in tail and b"video2" in url.lower().encode():
-                                        print(
-                                            "[VGCS:video] hint: this ZR10 has no /video2 stream — "
-                                            "use rtsp://192.168.144.25:8554/main.264 in Video settings"
+                                    if b"404" in tail or b"Not Found" in tail:
+                                        url_fatal = True
+                                        msg = (
+                                            "RTSP stream not found (404). "
+                                            "ZR10: use rtsp://192.168.144.25:8554/main.264 only."
                                         )
+                                        try:
+                                            self.error.emit(msg)
+                                        except Exception:
+                                            pass
                                     if b"Codec AVOption ec" in tail or b"Invalid argument" in tail:
                                         print(
-                                            "[VGCS:video] hint: update GCS to latest build "
-                                            "(FFmpeg SIYI flags were mis-placed; fixed in pipeline.py)"
+                                            "[VGCS:video] hint: copy latest vgcs/video/pipeline.py "
+                                            f"(rev {_VIDEO_PIPELINE_REV}) — old build had bad FFmpeg flags"
                                         )
                                 elif rc not in (0, None):
                                     print(
@@ -1484,6 +1516,13 @@ class RtspSource(QObject):
                         self._close_ffmpeg_decode_proc()
 
                         if self._ffmpeg_stop.is_set() or not self._running:
+                            break
+
+                        if url_fatal:
+                            print(
+                                "[VGCS:video] stopping RTSP retries for this URL (404 / not found)"
+                            )
+                            time.sleep(15.0)
                             break
 
                         if frames_this_session > 0:
@@ -1522,6 +1561,8 @@ class RtspSource(QObject):
                         break
 
                 if self._ffmpeg_stop.is_set() or not self._running:
+                    break
+                if url_fatal:
                     break
                 if round_ok:
                     break
@@ -1748,8 +1789,8 @@ class VideoPipeline(QObject):
         defer_refresh: bool = False,
     ) -> None:
         _ = defer_refresh
-        day_u = str(day_url or "").strip()
-        th_u = str(thermal_url or "").strip()
+        day_u = _normalize_companion_rtsp_url(str(day_url or "").strip())
+        th_u = _normalize_companion_rtsp_url(str(thermal_url or "").strip())
         # Same URL on day + thermal (common mis-config) opens two FFmpeg sessions; many
         # companion cameras tolerate only one client. SIYI ZR10 allows four, but one decode
         # path is enough for single-view and reduces load / stall risk.
