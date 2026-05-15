@@ -357,6 +357,9 @@ def _ffmpeg_preflags_before_input(
                         "low_delay",
                     ]
                 )
+        if _rtsp_url_is_siyi_style(u):
+            # Decoder-side error concealment (must be before ``-i``; invalid after ``-i`` on rawvideo out).
+            out.extend(["-ec", "guess_mvs+deblock"])
     out.extend(["-err_detect", "ignore_err"])
     if sc == "udp":
         out.extend(
@@ -1266,28 +1269,14 @@ class RtspSource(QObject):
                         "-i",
                         url,
                         "-an",
+                        "-vf",
+                        vf_rgb,
+                        "-pix_fmt",
+                        "rgb24",
+                        "-f",
+                        "rawvideo",
+                        "pipe:1",
                     ]
-                    if _rtsp_url_is_siyi_style(url):
-                        # ZR10 often ships HEVC on main.264; conceal GOP join errors, drop late frames.
-                        cmd_base.extend(
-                            [
-                                "-ec",
-                                "guess_mvs+deblock",
-                                "-fps_mode",
-                                "drop",
-                            ]
-                        )
-                    cmd_base.extend(
-                        [
-                            "-vf",
-                            vf_rgb,
-                            "-pix_fmt",
-                            "rgb24",
-                            "-f",
-                            "rawvideo",
-                            "pipe:1",
-                        ]
-                    )
 
                     reconnect_delay = 1.2 if _rtsp_url_is_siyi_style(url) else 0.6
                     empty_session_limit = 20
@@ -1456,10 +1445,20 @@ class RtspSource(QObject):
                             try:
                                 tail = b"".join(stderr_buf)[-4000:]
                                 if tail.strip():
+                                    txt = tail.decode("utf-8", errors="replace")
                                     print(
-                                        "[VGCS:video] ffmpeg stderr (session, no frames):\n"
-                                        + tail.decode("utf-8", errors="replace")
+                                        "[VGCS:video] ffmpeg stderr (session, no frames):\n" + txt
                                     )
+                                    if b"404" in tail and b"video2" in url.lower().encode():
+                                        print(
+                                            "[VGCS:video] hint: this ZR10 has no /video2 stream — "
+                                            "use rtsp://192.168.144.25:8554/main.264 in Video settings"
+                                        )
+                                    if b"Codec AVOption ec" in tail or b"Invalid argument" in tail:
+                                        print(
+                                            "[VGCS:video] hint: update GCS to latest build "
+                                            "(FFmpeg SIYI flags were mis-placed; fixed in pipeline.py)"
+                                        )
                                 elif rc not in (0, None):
                                     print(
                                         f"[VGCS:video] ffmpeg exited rc={rc!r} (no stderr lines captured)"
