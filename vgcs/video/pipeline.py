@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi7"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi8"
 
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
@@ -329,8 +329,27 @@ def _rtsp_url_is_loopback(url: str) -> bool:
         return False
 
 
+def _siyi_hwaccel_enabled(url: str) -> bool:
+    """Windows D3D11VA/QSV often decodes SIYI HEVC without POC/RPS spam (set VGCS_SIYI_HWACCEL=0 to disable)."""
+    if not _rtsp_url_is_siyi_style(url):
+        return False
+    raw = str(os.environ.get("VGCS_SIYI_HWACCEL", "1") or "1").strip().lower()
+    return raw not in ("0", "off", "false", "no")
+
+
+def _ffmpeg_decode_opts_after_input(url: str, *, siyi_hwaccel: bool) -> list[str]:
+    """Software HEVC error concealment when hwaccel is off or failed."""
+    if not _rtsp_url_is_siyi_style(url) or siyi_hwaccel:
+        return []
+    return ["-c:v", "hevc", "-ec", "1", "-flags2", "+showall"]
+
+
 def _ffmpeg_preflags_before_input(
-    url: str, *, rtsp_transport: str | None, low_latency: bool = False
+    url: str,
+    *,
+    rtsp_transport: str | None,
+    low_latency: bool = False,
+    siyi_hwaccel: bool = False,
 ) -> list[str]:
     """Flags immediately before `-i` (after optional `-f`)."""
     sc = _url_scheme(str(url or "").strip())
@@ -392,6 +411,8 @@ def _ffmpeg_preflags_before_input(
                 )
         if _rtsp_url_is_siyi_style(u):
             out.extend(["-thread_queue_size", "512"])
+        if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
+            out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     out.extend(["-err_detect", "ignore_err"])
     if sc == "udp":
         out.extend(
@@ -417,7 +438,7 @@ def _url_scheme(url: str) -> str:
         return ""
 
 
-def _ffmpeg_vf_rgb_fixed_size(w: int, h: int) -> str:
+def _ffmpeg_vf_rgb_fixed_size(w: int, h: int, *, hwaccel: bool = False) -> str:
     """
     Scale to fit inside WxH, then pad to exactly WxH.
 
@@ -428,10 +449,13 @@ def _ffmpeg_vf_rgb_fixed_size(w: int, h: int) -> str:
     """
     w = max(2, int(w))
     h = max(2, int(h))
-    return (
+    core = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
     )
+    if hwaccel:
+        return f"hwdownload,format=nv12,{core}"
+    return core
 
 
 def _demux_preflags_for_url(url: str, *, rtsp_transport: str | None) -> list[str]:
@@ -628,6 +652,8 @@ class RtspSource(QObject):
         self._ffmpeg_last_raw_change_mono: float = 0.0
         self._ffmpeg_session_started_mono: float = 0.0
         self._ffmpeg_had_frame: bool = False
+        self._restart_decode_last_mono: float = 0.0
+        self._restart_decode_timer: QTimer | None = None
         self._rec_proc: subprocess.Popen[bytes] | None = None
         self._rec_lock = threading.Lock()
         self._running = False
@@ -707,15 +733,31 @@ class RtspSource(QObject):
             return True
         return u.startswith("rtsp://")
 
-    def restart_decode(self, *, delay_ms: int = 450) -> None:
+    def restart_decode(self, *, delay_ms: int = 0) -> None:
         """Stop FFmpeg and open a fresh RTSP session (companion link-up / settings Apply)."""
+        now = time.monotonic()
+        if now - float(self._restart_decode_last_mono or 0.0) < 4.0:
+            return
+        self._restart_decode_last_mono = now
+        u = str(self._url or "").strip()
+        if delay_ms <= 0:
+            delay_ms = 1200 if _rtsp_url_is_companion_link_subnet(u) else 450
         try:
-            print(f"[VGCS:video] restart_decode scheduled url={self._url}")
+            print(f"[VGCS:video] restart_decode scheduled ({delay_ms}ms) url={u}")
+        except Exception:
+            pass
+        try:
+            t = self._restart_decode_timer
+            if t is not None:
+                t.stop()
         except Exception:
             pass
         self.stop()
-        ms = max(100, int(delay_ms))
-        QTimer.singleShot(ms, self._deferred_start_after_restart)
+        ms = max(200, int(delay_ms))
+        self._restart_decode_timer = QTimer(self)
+        self._restart_decode_timer.setSingleShot(True)
+        self._restart_decode_timer.timeout.connect(self._deferred_start_after_restart)
+        self._restart_decode_timer.start(ms)
 
     @Slot()
     def _deferred_start_after_restart(self) -> None:
@@ -733,10 +775,6 @@ class RtspSource(QObject):
                 th = self._ffmpeg_thread
                 if th is None or not th.is_alive():
                     self._start_ffmpeg()
-                elif _rtsp_url_is_companion_link_subnet(self._url):
-                    last = float(self._ffmpeg_last_frame_mono or 0.0)
-                    if last <= 0.0 or (time.monotonic() - last) > 12.0:
-                        self.restart_decode()
             return
         if self._prefer_ffmpeg_immediately():
             print(
@@ -1272,7 +1310,7 @@ class RtspSource(QObject):
         h = max(2, h)
         self._ffmpeg_dims = (w, h)
         frame_bytes = int(w) * int(h) * 3
-        vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h)
+        siyi_hw = _siyi_hwaccel_enabled(url)
 
         # UI emit cap: avoid unbounded QueuedConnection backlog on the GUI thread.
         # Default 20 Hz — preview still looks smooth; higher rates + map work freeze Windows
@@ -1303,6 +1341,9 @@ class RtspSource(QObject):
                     "[VGCS:video] SIYI ZR10: stall watchdog disabled "
                     "(HEVC decode gaps are normal; set VGCS_SIYI_STALL_WATCHDOG=1 to enable)"
                 )
+            if _rtsp_url_is_siyi_style(url):
+                mode = "hwaccel=auto" if siyi_hw else "sw hevc+ec"
+                print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
 
         while self._running and not self._ffmpeg_stop.is_set():
             transport_seq = _rtsp_transport_sequence(url, self._transport)
@@ -1332,33 +1373,37 @@ class RtspSource(QObject):
                         else:
                             time.sleep(0.05)
 
-                    cmd_base = [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-nostats",
-                        "-loglevel",
-                        "error",
-                        *demux,
-                        *_ffmpeg_preflags_before_input(
-                            url, rtsp_transport=transport, low_latency=self._low_latency
-                        ),
-                        "-i",
-                        url,
-                        "-an",
-                        "-vf",
-                        vf_rgb,
-                        "-pix_fmt",
-                        "rgb24",
-                        "-f",
-                        "rawvideo",
-                        "pipe:1",
-                    ]
-
                     reconnect_delay = 2.0 if _rtsp_url_is_siyi_style(url) else 0.6
                     empty_session_limit = 20
                     empty_sessions = 0
 
                     while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
+                        vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h, hwaccel=siyi_hw)
+                        cmd_base = [
+                            "ffmpeg",
+                            "-hide_banner",
+                            "-nostats",
+                            "-loglevel",
+                            "error",
+                            *demux,
+                            *_ffmpeg_preflags_before_input(
+                                url,
+                                rtsp_transport=transport,
+                                low_latency=self._low_latency,
+                                siyi_hwaccel=siyi_hw,
+                            ),
+                            "-i",
+                            url,
+                            *_ffmpeg_decode_opts_after_input(url, siyi_hwaccel=siyi_hw),
+                            "-an",
+                            "-vf",
+                            vf_rgb,
+                            "-pix_fmt",
+                            "rgb24",
+                            "-f",
+                            "rawvideo",
+                            "pipe:1",
+                        ]
                         stderr_buf: list[bytes] = []
                         p: subprocess.Popen[bytes] | None = None
                         try:
@@ -1532,6 +1577,27 @@ class RtspSource(QObject):
                                     print(
                                         "[VGCS:video] ffmpeg stderr (session, no frames):\n" + txt
                                     )
+                                    if _rtsp_url_is_siyi_style(url):
+                                        tl = tail.lower()
+                                        if siyi_hw and (
+                                            b"hwaccel" in tl
+                                            or b"invalid data" in tl
+                                            or b"d3d11" in tl
+                                            or b"dxva" in tl
+                                        ):
+                                            siyi_hw = False
+                                            print(
+                                                "[VGCS:video] SIYI: hwaccel failed, "
+                                                "retrying software HEVC decode"
+                                            )
+                                        elif b"could not find ref" in tl or b"-10054" in tl:
+                                            if siyi_hw:
+                                                siyi_hw = False
+                                                print(
+                                                    "[VGCS:video] SIYI: HEVC POC errors, "
+                                                    "retrying software HEVC decode"
+                                                )
+                                            reconnect_delay = max(reconnect_delay, 4.0)
                                     if b"404" in tail or b"Not Found" in tail:
                                         url_fatal = True
                                         msg = (
