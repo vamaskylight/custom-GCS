@@ -6,6 +6,7 @@ import base64
 import csv
 import json
 import math
+import os
 import shutil
 import tempfile
 import time
@@ -163,6 +164,8 @@ _KEY_VIDEO_SOURCE = "video/source"  # 'disabled' | 'rtsp' | 'udp_h264' | 'udp_h2
 _KEY_VIDEO_RTSP_DAY = "video/rtsp_day"
 _KEY_VIDEO_RTSP_THERMAL = "video/rtsp_thermal"
 _KEY_VIDEO_RTSP_TRANSPORT = "video/rtsp_transport"  # 'auto' | 'udp' | 'tcp'
+_KEY_VIDEO_LOW_LATENCY = "video/low_latency"
+_KEY_VIDEO_RECORD_FORMAT = "video/record_format"  # 'mp4' | 'mkv'
 _KEY_VIDEO_DEFAULT_VIEW = "video/default_view"  # 'Single' | 'Split'
 
 # Native camera rail / fullscreen video: offset from the **top of the map canvas** (px).
@@ -700,9 +703,12 @@ class MapWidget(QWidget):
         self._video_settings_thermal = ""
         self._video_settings_rtsp_transport = "auto"
         self._video_settings_default_view = "Single"
+        self._native_video_last_frame_mono = 0.0
+        self._video_preview_stall_recovery_active = False
         self._camera_control = NoopCameraControl()
         self._obs_mark_mode = False
         self._observations: list[dict[str, object]] = []
+        self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
         # Camera rail: "video" = live/shooting (record toggles); "photo" = still mode (center = shutter).
         self._camera_rail_ui_mode: str = "video"
@@ -3155,7 +3161,7 @@ class MapWidget(QWidget):
                 pass
             # Start preview if user enabled it (do not require telemetry link).
             try:
-                if bool(getattr(self, "_btn_webcam", None)) and bool(self._btn_webcam.isChecked()):
+                if self._video_preview_should_run():
                     self._start_video_preview()
             except Exception:
                 pass
@@ -3328,6 +3334,10 @@ class MapWidget(QWidget):
             self._video_push_timer = QTimer(self)
             self._video_push_timer.setInterval(66)  # ~15 fps push to WebEngine
             self._video_push_timer.timeout.connect(self._push_video_preview_any_to_overlay)
+        if not hasattr(self, "_video_preview_stall_timer") or self._video_preview_stall_timer is None:
+            self._video_preview_stall_timer = QTimer(self)
+            self._video_preview_stall_timer.setInterval(1000)
+            self._video_preview_stall_timer.timeout.connect(self._on_video_preview_stall_check)
         if not hasattr(self, "_ai_timer") or self._ai_timer is None:
             self._ai_timer = QTimer(self)
             self._ai_timer.setInterval(125)  # 8 Hz dummy overlay
@@ -3443,6 +3453,7 @@ class MapWidget(QWidget):
             thermal_url=thermal_for_pipeline,
             transport=str(getattr(self, "_video_settings_rtsp_transport", "auto") or "auto"),
             stream_kind=kind,
+            low_latency=bool(getattr(self, "_video_settings_low_latency", False)),
         )
 
     def _read_video_settings(self) -> None:
@@ -3453,7 +3464,41 @@ class MapWidget(QWidget):
         self._video_settings_day = str(s.value(_KEY_VIDEO_RTSP_DAY, "") or "").strip()
         self._video_settings_thermal = str(s.value(_KEY_VIDEO_RTSP_THERMAL, "") or "").strip()
         self._video_settings_rtsp_transport = str(s.value(_KEY_VIDEO_RTSP_TRANSPORT, "auto") or "auto").strip().lower()
+        self._video_settings_low_latency = bool(s.value(_KEY_VIDEO_LOW_LATENCY, False))
+        rec_fmt = str(s.value(_KEY_VIDEO_RECORD_FORMAT, "mp4") or "mp4").strip().lower()
+        self._video_settings_record_format = rec_fmt if rec_fmt in ("mp4", "mkv") else "mp4"
         self._video_settings_default_view = str(s.value(_KEY_VIDEO_DEFAULT_VIEW, "Single") or "Single")
+
+    def _video_record_suffix(self) -> str:
+        return str(getattr(self, "_video_settings_record_format", "mp4") or "mp4")
+
+    def _video_preview_should_run(self) -> bool:
+        """True when Application Settings enabled streaming (not only hidden toolbar)."""
+        return bool(getattr(self, "_video_settings_enabled", False)) and bool(
+            getattr(self, "_web_ready", False)
+        )
+
+    def _trigger_hardware_photo(self) -> None:
+        cc = getattr(self, "_camera_control", None)
+        if cc is None or isinstance(cc, NoopCameraControl):
+            return
+        try:
+            cc.camera_trigger_photo()
+        except Exception:
+            pass
+
+    def _sync_payload_hardware_recording(self, want_on: bool) -> None:
+        want = bool(want_on)
+        if bool(getattr(self, "_payload_hardware_recording", False)) == want:
+            return
+        cc = getattr(self, "_camera_control", None)
+        if cc is None or isinstance(cc, NoopCameraControl):
+            return
+        try:
+            cc.camera_toggle_record()
+            self._payload_hardware_recording = want
+        except Exception:
+            pass
 
     def _apply_video_settings_read_toolbar(self) -> bool:
         """Reload QSettings-backed video fields, log, and mirror the webcam toolbar toggle."""
@@ -3507,12 +3552,7 @@ class MapWidget(QWidget):
             # Start (or restart) preview whenever streaming is enabled and the toolbar wants it —
             # not only when preview was already running. First-time enable after Apply used to skip
             # `_restart_video_preview_after_settings` because `was_preview_on` stayed False.
-            if (
-                bool(self._video_settings_enabled)
-                and bool(getattr(self, "_btn_webcam", None))
-                and bool(self._btn_webcam.isChecked())
-                and bool(getattr(self, "_web_ready", False))
-            ):
+            if self._video_preview_should_run():
                 try:
                     QTimer.singleShot(400, self._restart_video_preview_after_settings)
                 except Exception:
@@ -3581,12 +3621,7 @@ class MapWidget(QWidget):
             pass
         self._sync_native_camera_rail_toggles()
 
-        if (
-            bool(self._video_settings_enabled)
-            and bool(getattr(self, "_btn_webcam", None))
-            and bool(self._btn_webcam.isChecked())
-            and bool(getattr(self, "_web_ready", False))
-        ):
+        if self._video_preview_should_run():
             try:
                 QTimer.singleShot(80, self._restart_video_preview_after_settings)
             except Exception:
@@ -3594,11 +3629,7 @@ class MapWidget(QWidget):
 
     def _restart_video_preview_after_settings(self) -> None:
         try:
-            if not bool(getattr(self, "_video_settings_enabled", False)):
-                return
-            if not bool(getattr(self, "_btn_webcam", None)) or not self._btn_webcam.isChecked():
-                return
-            if not bool(getattr(self, "_web_ready", False)):
+            if not self._video_preview_should_run():
                 return
             # `refresh_sources()` replaces source objects; force full hook-up (not the stale
             # `_video_inited` fast-path) so `src.start()` targets the new `RtspSource`.
@@ -3614,6 +3645,7 @@ class MapWidget(QWidget):
             self._camera_control = control
         except Exception:
             pass
+        self._payload_hardware_recording = False
         self._video_inited = False
 
         # Do not reset `_video_split_enabled` here: this runs on every connect/disconnect and on
@@ -3678,6 +3710,53 @@ class MapWidget(QWidget):
                 except Exception:
                     pass
 
+    def _on_video_preview_stall_check(self) -> None:
+        """Restart decode if the native preview has not updated (SIYI ZR10 frozen-frame case)."""
+        if not bool(getattr(self, "_video_preview_enabled", False)):
+            return
+        if bool(getattr(self, "_video_preview_stall_recovery_active", False)):
+            return
+        last = float(getattr(self, "_native_video_last_frame_mono", 0.0) or 0.0)
+        if last <= 0.0:
+            return
+        try:
+            stall_s = float(str(os.environ.get("VGCS_VIDEO_GUI_STALL_S", "4.0") or "4.0").strip())
+        except ValueError:
+            stall_s = 4.0
+        stall_s = max(2.5, min(15.0, stall_s))
+        if time.monotonic() - last < stall_s:
+            return
+        vp = getattr(self, "_video", None)
+        if vp is None:
+            return
+        want_ids = self._video_preview_source_ids_to_run(vp)
+        if not want_ids:
+            return
+        self._video_preview_stall_recovery_active = True
+        try:
+            print(
+                f"[VGCS:video] GUI preview stall (no paint for {stall_s:.1f}s), "
+                f"restarting decode for {want_ids!r}"
+            )
+        except Exception:
+            pass
+        for sid in want_ids:
+            try:
+                src = vp.sources().get(sid)
+                if src is not None:
+                    src.stop()
+            except Exception:
+                pass
+
+        def _restart() -> None:
+            try:
+                self._start_video_decode_sources(vp)
+            finally:
+                self._video_preview_stall_recovery_active = False
+                self._native_video_last_frame_mono = time.monotonic()
+
+        QTimer.singleShot(350, _restart)
+
     def _start_video_preview(self, *, reset_swapped: bool = True) -> None:
         if not getattr(self, "_web_ready", False):
             return
@@ -3711,6 +3790,13 @@ class MapWidget(QWidget):
             if vp is not None:
                 self._start_video_decode_sources(vp)
                 try:
+                    t_stall = getattr(self, "_video_preview_stall_timer", None)
+                    if t_stall is not None:
+                        self._native_video_last_frame_mono = time.monotonic()
+                        t_stall.start()
+                except Exception:
+                    pass
+                try:
                     src0 = vp.active_source()
                     if src0 is not None:
                         sid = str(getattr(src0, "source_id", "") or "")
@@ -3732,6 +3818,12 @@ class MapWidget(QWidget):
             self._video_push_timer.stop()
         if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
             self._ai_timer.stop()
+        try:
+            t_stall = getattr(self, "_video_preview_stall_timer", None)
+            if t_stall is not None and t_stall.isActive():
+                t_stall.stop()
+        except Exception:
+            pass
         try:
             self._native_video_preview.hide()
             self._native_minimap_wrap.hide()
@@ -3798,6 +3890,7 @@ class MapWidget(QWidget):
         # Called on the GUI thread.
         if not bool(getattr(self, "_video_preview_enabled", False)):
             return
+        self._native_video_last_frame_mono = time.monotonic()
         try:
             img = vf.image
         except RuntimeError:
@@ -4171,9 +4264,19 @@ class MapWidget(QWidget):
             "gimbal_pitch_deg": gimbal_pitch,
         }
 
-    def _log_observation(self, kind: str, *, map_lat: float | None = None, map_lon: float | None = None, video_x: float | None = None, video_y: float | None = None) -> None:
+    def _log_observation(
+        self,
+        kind: str,
+        *,
+        map_lat: float | None = None,
+        map_lon: float | None = None,
+        video_x: float | None = None,
+        video_y: float | None = None,
+        clip_path: str | None = None,
+        capture_snapshot: bool = True,
+    ) -> None:
         ts = datetime.now(timezone.utc).isoformat()
-        snap = self._capture_photo_quick()
+        snap = self._capture_photo_quick() if capture_snapshot else ""
         row: dict[str, object] = {
             "timestamp_utc": ts,
             "kind": str(kind),
@@ -4182,6 +4285,7 @@ class MapWidget(QWidget):
             "video_x_norm": video_x,
             "video_y_norm": video_y,
             "snapshot_path": snap or "",
+            "clip_path": str(clip_path or "").strip(),
         }
         row.update(self._observation_context())
         self._observations.append(row)
@@ -4214,7 +4318,7 @@ class MapWidget(QWidget):
             self._set_status("Observation clip failed: cannot create captures folder")
             return
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"obs_clip_{stamp}.mp4"
+        out_path = out_dir / f"obs_clip_{stamp}.{self._video_record_suffix()}"
         started = False
         try:
             if hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
@@ -4275,7 +4379,7 @@ class MapWidget(QWidget):
             src.stop_recording()
         except Exception:
             pass
-        self._set_status(f"Short clip saved: {Path(out_path).name}")
+        self._finish_observation_clip(out_path)
 
     def _stop_observation_clip_rec(self, rec: object, out_path: str) -> None:
         try:
@@ -4286,7 +4390,19 @@ class MapWidget(QWidget):
             wait_qmedia_recorder_stopped(rec, timeout_s=25.0)
         except Exception:
             pass
-        self._set_status(f"Short clip saved: {Path(out_path).name}")
+        self._finish_observation_clip(out_path)
+
+    def _finish_observation_clip(self, out_path: str) -> None:
+        p = Path(str(out_path or "").strip())
+        name = p.name
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                self._log_observation("clip", clip_path=str(p), capture_snapshot=True)
+                self._set_status(f"Short clip saved & logged: {name}")
+                return
+        except Exception:
+            pass
+        self._set_status(f"Short clip failed or empty: {name}")
 
     def _clear_observations(self) -> None:
         n = len(self._observations)
@@ -4323,6 +4439,7 @@ class MapWidget(QWidget):
             "gimbal_yaw_deg",
             "gimbal_pitch_deg",
             "snapshot_path",
+            "clip_path",
         ]
         try:
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -4357,7 +4474,11 @@ class MapWidget(QWidget):
                 f"<td>{row.get('vehicle_lon','')}</td>"
                 f"<td>{row.get('gimbal_yaw_deg','')}</td>"
                 f"<td>{row.get('gimbal_pitch_deg','')}</td>"
+                f"<td>{row.get('video_x_norm','')}</td>"
+                f"<td>{row.get('video_y_norm','')}</td>"
+                f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
                 f"<td>{row.get('snapshot_path','')}</td>"
+                f"<td>{row.get('clip_path','')}</td>"
                 "</tr>"
             )
         html = (
@@ -4369,7 +4490,8 @@ class MapWidget(QWidget):
             f"<h2>Observation Report ({len(self._observations)} entries)</h2>"
             "<table><thead><tr>"
             "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th>"
-            "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th><th>Snapshot</th>"
+            "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
+            "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Snapshot</th><th>Clip</th>"
             "</tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table></body></html>"
@@ -4656,6 +4778,7 @@ class MapWidget(QWidget):
                 print("[VGCS:cam_rail] PHOTO capture (shutter / legacy request)")
             except Exception:
                 pass
+            self._trigger_hardware_photo()
             try:
                 sdir = None
                 try:
@@ -4713,15 +4836,20 @@ class MapWidget(QWidget):
                 # RTSP sources use ffmpeg recording.
                 if src is not None and hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
                     if want_on and not bool(getattr(self, "_video_recording", False)):
-                        tmp = Path(tempfile.gettempdir()) / f"vgcs_recording_{int(time.time())}.mp4"
+                        tmp = Path(tempfile.gettempdir()) / (
+                            f"vgcs_recording_{int(time.time())}.{self._video_record_suffix()}"
+                        )
+                        self._sync_payload_hardware_recording(True)
                         ok = bool(src.start_recording(str(tmp)))
                         self._video_recording = bool(ok)
                         self._video_recording_tmp_path = str(tmp) if ok else ""
                         if ok:
                             self._start_native_cam_recording_tick_timer()
                         else:
+                            self._sync_payload_hardware_recording(False)
                             self._stop_native_cam_recording_tick_timer()
                     if (not want_on) and bool(getattr(self, "_video_recording", False)):
+                        self._sync_payload_hardware_recording(False)
                         try:
                             src.stop_recording()
                         except Exception:
@@ -4750,7 +4878,10 @@ class MapWidget(QWidget):
                     self._run_js("document.title = 'VGCS Map';")
                     return
                 if want_on and not bool(getattr(self, "_video_recording", False)):
-                    tmp = Path(tempfile.gettempdir()) / f"vgcs_recording_{int(time.time())}.mp4"
+                    tmp = Path(tempfile.gettempdir()) / (
+                        f"vgcs_recording_{int(time.time())}.{self._video_record_suffix()}"
+                    )
+                    self._sync_payload_hardware_recording(True)
                     try:
                         rec.setOutputLocation(QUrl.fromLocalFile(str(tmp)))
                     except Exception:
@@ -4763,8 +4894,10 @@ class MapWidget(QWidget):
                     except Exception:
                         self._video_recording = False
                         self._video_recording_tmp_path = ""
+                        self._sync_payload_hardware_recording(False)
                         self._stop_native_cam_recording_tick_timer()
                 if (not want_on) and bool(getattr(self, "_video_recording", False)):
+                    self._sync_payload_hardware_recording(False)
                     try:
                         rec.stop()
                     except Exception:

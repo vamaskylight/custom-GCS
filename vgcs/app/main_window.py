@@ -1889,6 +1889,9 @@ class MainWindow(QMainWindow):
         cg = QGridLayout()
         cg.addWidget(QLabel("Stream URL 1 (Day / primary)"), 0, 0)
         rtsp_day = QLineEdit()
+        rtsp_day.setPlaceholderText(
+            "SIYI ZR10: rtsp://192.168.144.25:8554/video2  (sub stream, smoother than main.264)"
+        )
         cg.addWidget(rtsp_day, 0, 1)
         cg.addWidget(QLabel("Stream URL 2 (Thermal / secondary)"), 1, 0)
         rtsp_th = QLineEdit()
@@ -2751,12 +2754,20 @@ class MainWindow(QMainWindow):
                 )
                 self._camera_control_backend = cc
                 self._map_widget.set_camera_control(cc)
+                try:
+                    self._camera_panel.set_camera_control(cc)
+                except Exception:
+                    pass
                 self._append_log(f"Camera control: Skydroid TOP UDP {host}:{port} profile={profile_id}")
                 return
             self._append_log("Camera control: Skydroid selected but host is empty, fallback to MAVLink")
         cc = MavlinkCameraControl(self._thread)
         self._camera_control_backend = cc
         self._map_widget.set_camera_control(cc)
+        try:
+            self._camera_panel.set_camera_control(cc)
+        except Exception:
+            pass
 
     def _on_link_up(self) -> None:
         self._map_widget.clear_flight_track()

@@ -104,9 +104,15 @@ class VideoPreviewLabel(QLabel):
 class CameraControlPanel(QGroupBox):
     follow_triggered = Signal(bool)
 
-    def __init__(self, pipeline: VideoPipeline, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        pipeline: VideoPipeline,
+        parent: QWidget | None = None,
+        camera_control=None,
+    ) -> None:
         super().__init__("Camera Control", parent)
         self._pipeline = pipeline
+        self._camera_control = camera_control
         self._zoom = 1.0
         self._mode = "day"
         self._record_tmp_path: Optional[str] = None
@@ -184,6 +190,9 @@ class CameraControlPanel(QGroupBox):
 
         self._rebuild_sources()
 
+    def set_camera_control(self, control) -> None:
+        self._camera_control = control
+
     def sync_video_follow_toggle(self, enabled: bool) -> None:
         """Keep the Follow control aligned when the map rail (or code) changes follow mode."""
         self._btn_follow.blockSignals(True)
@@ -244,6 +253,12 @@ class CameraControlPanel(QGroupBox):
         src.stop()
 
     def _take_photo(self) -> None:
+        cc = getattr(self, "_camera_control", None)
+        if cc is not None:
+            try:
+                cc.camera_trigger_photo()
+            except Exception:
+                pass
         src = self._pipeline.active_source()
         if src is None:
             return

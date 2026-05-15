@@ -209,6 +209,32 @@ def _rtsp_url_is_companion_link_subnet(url: str) -> bool:
         return False
 
 
+def _rtsp_url_is_siyi_style(url: str) -> bool:
+    """SIYI ZR10 / ZT30 style paths on the companion link (main.264, video0–3)."""
+    u = str(url or "").strip()
+    if _url_scheme(u) != "rtsp" or not _rtsp_url_is_companion_link_subnet(u):
+        return False
+    try:
+        path = (urlparse(u).path or "").lower()
+    except Exception:
+        return False
+    return any(
+        token in path
+        for token in ("main.264", "video0", "video1", "video2", "video3")
+    )
+
+
+def _rtsp_should_ffprobe(url: str) -> bool:
+    """Whether to open a short ffprobe session before decode."""
+    flag = str(os.environ.get("VGCS_RTSP_FFPROBE", "") or "").strip().lower()
+    if flag in ("0", "false", "no"):
+        return False
+    if flag in ("1", "true", "yes"):
+        return True
+    # SIYI main stream dimensions vary (720p–4K); wrong canvas → choppy then frozen preview.
+    return _rtsp_url_is_siyi_style(url)
+
+
 def _rtsp_socket_timeout_us(url: str) -> int:
     """
     FFmpeg RTSP demuxer ``-timeout`` (microseconds) for socket I/O.
@@ -242,8 +268,10 @@ def _video_stall_reconnect_s(url: str) -> float:
             return max(0.8, min(30.0, float(raw)))
         except ValueError:
             pass
+    if _rtsp_url_is_siyi_style(url):
+        return 1.5
     if _rtsp_url_is_companion_link_subnet(url):
-        return 2.5
+        return 2.0
     return 3.0
 
 
@@ -262,7 +290,9 @@ def _rtsp_url_is_loopback(url: str) -> bool:
         return False
 
 
-def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> list[str]:
+def _ffmpeg_preflags_before_input(
+    url: str, *, rtsp_transport: str | None, low_latency: bool = False
+) -> list[str]:
     """Flags immediately before `-i` (after optional `-f`)."""
     sc = _url_scheme(str(url or "").strip())
     out: list[str] = []
@@ -277,7 +307,10 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
         # Local RTSP (mediamtx, ffmpeg publish) often needs a slightly longer demux window;
         # aggressive `nobuffer` can yield zero frames while ffplay still works.
         # Same for 192.168.144.x companion cameras: aggressive nobuffer can miss the first GOP.
-        if _rtsp_url_is_loopback(u) or _rtsp_url_is_companion_link_subnet(u):
+        # Application Settings → Video → Low latency forces the aggressive path everywhere.
+        if low_latency or not (
+            _rtsp_url_is_loopback(u) or _rtsp_url_is_companion_link_subnet(u)
+        ):
             out.extend(
                 [
                     "-fflags",
@@ -291,18 +324,33 @@ def _ffmpeg_preflags_before_input(url: str, *, rtsp_transport: str | None) -> li
                 ]
             )
         else:
-            out.extend(
-                [
-                    "-fflags",
-                    "nobuffer+discardcorrupt+genpts",
-                    "-analyzeduration",
-                    "1500000",
-                    "-probesize",
-                    "1000000",
-                    "-flags",
-                    "low_delay",
-                ]
-            )
+            if _rtsp_url_is_siyi_style(u):
+                # SIYI ZR10: gentler demux + igndts (nobuffer alone can stutter then freeze).
+                out.extend(
+                    [
+                        "-fflags",
+                        "+genpts+discardcorrupt+igndts",
+                        "-analyzeduration",
+                        "8000000",
+                        "-probesize",
+                        "8000000",
+                        "-flags",
+                        "low_delay",
+                    ]
+                )
+            else:
+                out.extend(
+                    [
+                        "-fflags",
+                        "nobuffer+discardcorrupt+genpts",
+                        "-analyzeduration",
+                        "1500000",
+                        "-probesize",
+                        "1000000",
+                        "-flags",
+                        "low_delay",
+                    ]
+                )
     out.extend(["-err_detect", "ignore_err"])
     if sc == "udp":
         out.extend(
@@ -512,6 +560,7 @@ class RtspSource(QObject):
         label: str,
         transport: str = "auto",
         udp_input_format: str = "",
+        low_latency: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -520,6 +569,7 @@ class RtspSource(QObject):
         self._label = str(label or source_id)
         self._transport = str(transport or "auto").strip().lower()
         self._udp_input_format = str(udp_input_format or "").strip().lower()
+        self._low_latency = bool(low_latency)
         self._player: Optional[QMediaPlayer] = None
         self._sink: Optional[QVideoSink] = None
         self._audio: Optional[QAudioOutput] = None
@@ -532,6 +582,9 @@ class RtspSource(QObject):
         self._ffmpeg_stop = threading.Event()
         self._ffmpeg_dims: tuple[int, int] | None = None
         self._ffmpeg_last_frame_mono: float = 0.0
+        self._ffmpeg_last_decode_mono: float = 0.0
+        self._ffmpeg_last_raw_sig: bytes | None = None
+        self._ffmpeg_last_raw_change_mono: float = 0.0
         self._rec_proc: subprocess.Popen[bytes] | None = None
         self._rec_lock = threading.Lock()
         self._running = False
@@ -988,6 +1041,17 @@ class RtspSource(QObject):
         except Exception:
             return None
 
+    def _udp_demux_try_sequence(self, url: str) -> list[str]:
+        """UDP demux candidates: raw Annex B first, then MPEG-TS (common on companion links)."""
+        if _url_scheme(str(url or "").strip()) != "udp":
+            return [""]
+        fmt = str(self._udp_input_format or "").strip().lower()
+        if fmt in ("hevc", "265", "h265"):
+            return ["hevc", "mpegts", ""]
+        if fmt in ("h264", "264", "avc"):
+            return ["h264", "mpegts", ""]
+        return [fmt] if fmt else [""]
+
     def _read_exact(self, stream, n: int) -> bytes | None:
         buf = bytearray()
         while len(buf) < n and not self._ffmpeg_stop.is_set():
@@ -1029,14 +1093,14 @@ class RtspSource(QObject):
                     if time.monotonic() - session_t0 < grace * 2.0:
                         continue
                     return
-                last = float(self._ffmpeg_last_frame_mono or 0.0)
+                last = float(self._ffmpeg_last_decode_mono or self._ffmpeg_last_frame_mono or 0.0)
                 if last <= 0.0:
                     continue
                 if time.monotonic() - last < grace:
                     continue
                 try:
                     print(
-                        f"[VGCS:video] decode stall (no frame for {grace:.1f}s), "
+                        f"[VGCS:video] decode stall (no decoded frame for {grace:.1f}s), "
                         f"reconnecting transport={transport_label}"
                     )
                 except Exception:
@@ -1057,13 +1121,17 @@ class RtspSource(QObject):
         url = str(self._url or "").strip()
         transport_for_probe = _rtsp_transport_sequence(url, self._transport)
         dims: tuple[int, int] | None = None
-        # ffprobe opens its own RTSP session. Many companion cameras (e.g. 192.168.144.x)
-        # accept only one client or stall the *next* decoder — preview stays black. Skip
-        # by default; use 1280x720 canvas (scale+pad still matches the real frame).
-        # Set VGCS_RTSP_FFPROBE=1 to restore probing for exotic URLs.
-        if _url_scheme(url) == "rtsp" and str(os.environ.get("VGCS_RTSP_FFPROBE", "") or "").strip() != "1":
-            print("[VGCS:video] RTSP: skip ffprobe (set VGCS_RTSP_FFPROBE=1 to enable size probe)")
+        # ffprobe opens its own RTSP session. Skipped for generic companion URLs; enabled
+        # automatically for SIYI ZR10-style paths (main.264 / video0–3). Override with
+        # VGCS_RTSP_FFPROBE=0|1.
+        if _url_scheme(url) == "rtsp" and not _rtsp_should_ffprobe(url):
+            print(
+                "[VGCS:video] RTSP: skip ffprobe "
+                "(set VGCS_RTSP_FFPROBE=1 to force, auto for SIYI main.264/videoN)"
+            )
         elif transport_for_probe:
+            if _rtsp_url_is_siyi_style(url):
+                print("[VGCS:video] RTSP: SIYI stream — probing video dimensions")
             dims = self._ffprobe_dims(
                 url,
                 rtsp_transport=transport_for_probe[0],
@@ -1075,6 +1143,10 @@ class RtspSource(QObject):
         src_h = max(1, int(src_h))
         cap_w = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_W", "1920") or 1920)
         cap_h = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_H", "1080") or 1080)
+        if _rtsp_url_is_siyi_style(url):
+            # ZR10 main stream can be 4K; cap preview decode to reduce CPU stutter on laptops.
+            cap_w = min(cap_w, int(os.environ.get("VGCS_SIYI_DECODE_MAX_W", "1280") or 1280))
+            cap_h = min(cap_h, int(os.environ.get("VGCS_SIYI_DECODE_MAX_H", "720") or 720))
         cap_w = max(640, min(1920, cap_w))
         cap_h = max(360, min(1080, cap_h))
         scale = min(float(cap_w) / float(src_w), float(cap_h) / float(src_h), 1.0)
@@ -1118,195 +1190,244 @@ class RtspSource(QObject):
             for transport in transport_seq:
                 if self._ffmpeg_stop.is_set() or not self._running:
                     break
-                demux = _ffmpeg_udp_raw_demux(url, self._udp_input_format)
-                tr_label = str(transport) if transport is not None else "n/a"
-                print(f"[VGCS:video] FFmpeg decode try rtsp_transport={tr_label} url={url}")
-
-                if _url_scheme(url) == "rtsp":
-                    # Cooldown only needed when ffprobe ran (second session). Skip long wait
-                    # when we go straight to decode (VGCS_RTSP_FFPROBE unset).
-                    if str(os.environ.get("VGCS_RTSP_FFPROBE", "") or "").strip() == "1":
-                        time.sleep(0.2)
-                    else:
-                        time.sleep(0.05)
-
-                cmd_base = [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-nostats",
-                    "-loglevel",
-                    "error",
-                    *demux,
-                    *_ffmpeg_preflags_before_input(url, rtsp_transport=transport),
-                    "-i",
-                    url,
-                    "-an",
-                    "-vf",
-                    vf_rgb,
-                    "-pix_fmt",
-                    "rgb24",
-                    "-f",
-                    "rawvideo",
-                    "pipe:1",
-                ]
-
-                reconnect_delay = 0.6
-                empty_session_limit = 20
-                empty_sessions = 0
-
-                while self._running and not self._ffmpeg_stop.is_set():
-                    stderr_buf: list[bytes] = []
-                    p: subprocess.Popen[bytes] | None = None
-                    try:
-                        p = subprocess.Popen(
-                            cmd_base,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            stdin=subprocess.DEVNULL,
-                        )
-                        self._ffmpeg_proc = p
-
-                        def _drain_stderr(proc: subprocess.Popen[bytes], buf: list[bytes]) -> None:
-                            try:
-                                ep = proc.stderr
-                                if ep is None:
-                                    return
-                                for _ in range(8000):
-                                    line = ep.readline()
-                                    if not line:
-                                        break
-                                    if len(buf) < 200:
-                                        buf.append(line)
-                            except Exception:
-                                pass
-
-                        threading.Thread(target=_drain_stderr, args=(p, stderr_buf), daemon=True).start()
-                    except Exception as e:
-                        self.error.emit(f"FFmpeg start (continuous) failed: {e}")
-                        self._ffmpeg_proc = None
-                        empty_sessions += 1
-                        if empty_sessions >= empty_session_limit:
-                            break
-                        time.sleep(reconnect_delay)
-                        continue
-
-                    if p.stdout is None:
-                        self._close_ffmpeg_decode_proc()
-                        empty_sessions += 1
-                        if empty_sessions >= empty_session_limit:
-                            break
-                        time.sleep(reconnect_delay)
-                        continue
-
-                    frames_this_session = 0
-                    frame_count_box = [0]
-                    decode_warned = False
-                    session_stop = threading.Event()
-                    _stall_wd = self._start_ffmpeg_stall_watchdog(
-                        p,
-                        stall_s=stall_reconnect_s,
-                        transport_label=tr_label,
-                        session_stop=session_stop,
-                        frames_counter=frame_count_box,
-                    )
-                    try:
-                        while self._running and not self._ffmpeg_stop.is_set():
-                            raw = self._read_exact(p.stdout, frame_bytes)
-                            if raw is None:
-                                break
-                            # File recording reuses this RGB stream (single RTSP session).
-                            with self._rec_lock:
-                                recp = self._rec_proc
-                                if (
-                                    recp is not None
-                                    and recp.poll() is None
-                                    and recp.stdin is not None
-                                ):
-                                    try:
-                                        recp.stdin.write(raw)
-                                    except BrokenPipeError:
-                                        pass
-                                    except Exception:
-                                        pass
-                            # Drop frames *before* QImage/numpy decode. Previously we built a full QImage
-                            # copy for every FFmpeg output frame then throttled emit — the CPU cost alone
-                            # could starve the GUI thread (QueuedConnection backlog + map MAVLink work).
-                            now = time.monotonic()
-                            if (now - last_emit_mono) < min_emit_dt:
-                                continue
-                            try:
-                                assert np is not None
-                                arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
-                                qimg = QImage(
-                                    arr.data, w, h, 3 * w, QImage.Format.Format_RGB888
-                                ).copy()
-                                last_emit_mono = time.monotonic()
-                                meta = FrameMeta(
-                                    source_id=self.source_id,
-                                    device_name=self.device_name,
-                                    timestamp_ms=0,
-                                )
-                                self.frame.emit(VideoFrame(qimg, meta))
-                                self._ffmpeg_last_frame_mono = last_emit_mono
-                                frames_this_session += 1
-                                frame_count_box[0] = frames_this_session
-                                round_ok = True
-                            except Exception as ex:
-                                if not decode_warned:
-                                    decode_warned = True
-                                    try:
-                                        print(
-                                            f"[VGCS:video] rawvideo frame decode error (first): {ex!r}"
-                                        )
-                                    except Exception:
-                                        pass
-                                continue
-                    finally:
-                        session_stop.set()
-
-                    proc = self._ffmpeg_proc
-                    rc: int | None = None
-                    try:
-                        if proc is not None:
-                            rc = proc.poll()
-                    except Exception:
-                        rc = None
-                    if frames_this_session == 0:
-                        try:
-                            tail = b"".join(stderr_buf)[-4000:]
-                            if tail.strip():
-                                print(
-                                    "[VGCS:video] ffmpeg stderr (session, no frames):\n"
-                                    + tail.decode("utf-8", errors="replace")
-                                )
-                            elif rc not in (0, None):
-                                print(f"[VGCS:video] ffmpeg exited rc={rc!r} (no stderr lines captured)")
-                        except Exception:
-                            pass
-                    self._close_ffmpeg_decode_proc()
-
+                demux_try = self._udp_demux_try_sequence(url)
+                for demux_fmt in demux_try:
                     if self._ffmpeg_stop.is_set() or not self._running:
                         break
-
-                    if frames_this_session > 0:
-                        empty_sessions = 0
-                        print(
-                            f"[VGCS:video] decode session ended (frames={frames_this_session}), "
-                            f"reconnecting same transport={tr_label} rc={rc!r}"
-                        )
-                        time.sleep(reconnect_delay)
-                        continue
-
-                    empty_sessions += 1
-                    if empty_sessions >= empty_session_limit:
-                        print(
-                            f"[VGCS:video] decode: no frames after {empty_session_limit} attempts "
-                            f"on transport={tr_label}, trying next"
-                        )
+                    if round_ok:
                         break
-                    time.sleep(reconnect_delay)
+                    demux = _ffmpeg_udp_raw_demux(url, demux_fmt)
+                    tr_label = str(transport) if transport is not None else "n/a"
+                    demux_label = demux_fmt or "auto"
+                    print(
+                        f"[VGCS:video] FFmpeg decode try rtsp_transport={tr_label} "
+                        f"udp_demux={demux_label} url={url}"
+                    )
+
+                    if _url_scheme(url) == "rtsp":
+                        # Brief cooldown when ffprobe ran (second RTSP session).
+                        if _rtsp_should_ffprobe(url):
+                            time.sleep(0.25)
+                        else:
+                            time.sleep(0.05)
+
+                    cmd_base = [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-nostats",
+                        "-loglevel",
+                        "error",
+                        *demux,
+                        *_ffmpeg_preflags_before_input(
+                            url, rtsp_transport=transport, low_latency=self._low_latency
+                        ),
+                        "-i",
+                        url,
+                        "-an",
+                        "-vf",
+                        vf_rgb,
+                        "-pix_fmt",
+                        "rgb24",
+                        "-f",
+                        "rawvideo",
+                        "pipe:1",
+                    ]
+
+                    reconnect_delay = 0.6
+                    empty_session_limit = 20
+                    empty_sessions = 0
+
+                    while self._running and not self._ffmpeg_stop.is_set():
+                        stderr_buf: list[bytes] = []
+                        p: subprocess.Popen[bytes] | None = None
+                        try:
+                            p = subprocess.Popen(
+                                cmd_base,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL,
+                            )
+                            self._ffmpeg_proc = p
+
+                            def _drain_stderr(proc: subprocess.Popen[bytes], buf: list[bytes]) -> None:
+                                try:
+                                    ep = proc.stderr
+                                    if ep is None:
+                                        return
+                                    for _ in range(8000):
+                                        line = ep.readline()
+                                        if not line:
+                                            break
+                                        if len(buf) < 200:
+                                            buf.append(line)
+                                except Exception:
+                                    pass
+
+                            threading.Thread(target=_drain_stderr, args=(p, stderr_buf), daemon=True).start()
+                        except Exception as e:
+                            self.error.emit(f"FFmpeg start (continuous) failed: {e}")
+                            self._ffmpeg_proc = None
+                            empty_sessions += 1
+                            if empty_sessions >= empty_session_limit:
+                                break
+                            time.sleep(reconnect_delay)
+                            continue
+
+                        if p.stdout is None:
+                            self._close_ffmpeg_decode_proc()
+                            empty_sessions += 1
+                            if empty_sessions >= empty_session_limit:
+                                break
+                            time.sleep(reconnect_delay)
+                            continue
+
+                        frames_this_session = 0
+                        frame_count_box = [0]
+                        decode_warned = False
+                        frozen_logged = False
+                        self._ffmpeg_last_raw_sig = None
+                        self._ffmpeg_last_raw_change_mono = time.monotonic()
+                        session_stop = threading.Event()
+                        _stall_wd = self._start_ffmpeg_stall_watchdog(
+                            p,
+                            stall_s=stall_reconnect_s,
+                            transport_label=tr_label,
+                            session_stop=session_stop,
+                            frames_counter=frame_count_box,
+                        )
+                        try:
+                            while self._running and not self._ffmpeg_stop.is_set():
+                                raw = self._read_exact(p.stdout, frame_bytes)
+                                if raw is None:
+                                    break
+                                now_decode = time.monotonic()
+                                self._ffmpeg_last_decode_mono = now_decode
+                                try:
+                                    import hashlib
+
+                                    raw_sig = hashlib.blake2b(raw, digest_size=8).digest()
+                                except Exception:
+                                    raw_sig = raw[:64]
+                                if raw_sig != self._ffmpeg_last_raw_sig:
+                                    self._ffmpeg_last_raw_sig = raw_sig
+                                    self._ffmpeg_last_raw_change_mono = now_decode
+                                elif now_decode - self._ffmpeg_last_raw_change_mono >= stall_reconnect_s:
+                                    if not frozen_logged:
+                                        frozen_logged = True
+                                        try:
+                                            print(
+                                                f"[VGCS:video] frozen duplicate frames "
+                                                f"(>{stall_reconnect_s:.1f}s), reconnecting "
+                                                f"transport={tr_label}"
+                                            )
+                                        except Exception:
+                                            pass
+                                    try:
+                                        if p.poll() is None:
+                                            p.kill()
+                                    except Exception:
+                                        pass
+                                    break
+                                # File recording reuses this RGB stream (single RTSP session).
+                                with self._rec_lock:
+                                    recp = self._rec_proc
+                                    if (
+                                        recp is not None
+                                        and recp.poll() is None
+                                        and recp.stdin is not None
+                                    ):
+                                        try:
+                                            recp.stdin.write(raw)
+                                        except BrokenPipeError:
+                                            pass
+                                        except Exception:
+                                            pass
+                                # Drop frames *before* QImage/numpy decode. Previously we built a full QImage
+                                # copy for every FFmpeg output frame then throttled emit — the CPU cost alone
+                                # could starve the GUI thread (QueuedConnection backlog + map MAVLink work).
+                                now = time.monotonic()
+                                if (now - last_emit_mono) < min_emit_dt:
+                                    continue
+                                try:
+                                    assert np is not None
+                                    arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
+                                    qimg = QImage(
+                                        arr.data, w, h, 3 * w, QImage.Format.Format_RGB888
+                                    ).copy()
+                                    last_emit_mono = time.monotonic()
+                                    meta = FrameMeta(
+                                        source_id=self.source_id,
+                                        device_name=self.device_name,
+                                        timestamp_ms=0,
+                                    )
+                                    self.frame.emit(VideoFrame(qimg, meta))
+                                    self._ffmpeg_last_frame_mono = last_emit_mono
+                                    frames_this_session += 1
+                                    frame_count_box[0] = frames_this_session
+                                    round_ok = True
+                                except Exception as ex:
+                                    if not decode_warned:
+                                        decode_warned = True
+                                        try:
+                                            print(
+                                                f"[VGCS:video] rawvideo frame decode error (first): {ex!r}"
+                                            )
+                                        except Exception:
+                                            pass
+                                    continue
+                        finally:
+                            session_stop.set()
+
+                        proc = self._ffmpeg_proc
+                        rc: int | None = None
+                        try:
+                            if proc is not None:
+                                rc = proc.poll()
+                        except Exception:
+                            rc = None
+                        if frames_this_session == 0:
+                            try:
+                                tail = b"".join(stderr_buf)[-4000:]
+                                if tail.strip():
+                                    print(
+                                        "[VGCS:video] ffmpeg stderr (session, no frames):\n"
+                                        + tail.decode("utf-8", errors="replace")
+                                    )
+                                elif rc not in (0, None):
+                                    print(
+                                        f"[VGCS:video] ffmpeg exited rc={rc!r} (no stderr lines captured)"
+                                    )
+                            except Exception:
+                                pass
+                        self._close_ffmpeg_decode_proc()
+
+                        if self._ffmpeg_stop.is_set() or not self._running:
+                            break
+
+                        if frames_this_session > 0:
+                            empty_sessions = 0
+                            print(
+                                f"[VGCS:video] decode session ended (frames={frames_this_session}), "
+                                f"reconnecting same transport={tr_label} rc={rc!r}"
+                            )
+                            time.sleep(reconnect_delay)
+                            continue
+
+                        empty_sessions += 1
+                        if empty_sessions >= empty_session_limit:
+                            print(
+                                f"[VGCS:video] decode: no frames after {empty_session_limit} attempts "
+                                f"on transport={tr_label} demux={demux_label}, trying next"
+                            )
+                            break
+                        time.sleep(reconnect_delay)
+
+                    if round_ok:
+                        break
 
                 if self._ffmpeg_stop.is_set() or not self._running:
+                    break
+                if round_ok:
                     break
 
             if self._ffmpeg_stop.is_set() or not self._running:
@@ -1342,6 +1463,7 @@ class VideoPipeline(QObject):
         self._rtsp_day_url: str = ""
         self._rtsp_thermal_url: str = ""
         self._rtsp_transport: str = "auto"
+        self._low_latency: bool = False
         # Application Settings → Video → Source (`rtsp` | `udp_h264` | `udp_h265`).
         self._stream_kind: str = "rtsp"
         self._defer_refresh_timer = QTimer(self)
@@ -1455,6 +1577,7 @@ class VideoPipeline(QObject):
                         label=f"Day ({day_lbl_base})",
                         transport=self._rtsp_transport,
                         udp_input_format=udp_demux,
+                        low_latency=self._low_latency,
                         parent=self,
                     )
                     day.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
@@ -1466,6 +1589,7 @@ class VideoPipeline(QObject):
                         label=f"Thermal ({day_lbl_base})",
                         transport=self._rtsp_transport,
                         udp_input_format=udp_demux,
+                        low_latency=self._low_latency,
                         parent=self,
                     )
                     th.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
@@ -1524,6 +1648,7 @@ class VideoPipeline(QObject):
         thermal_url: str = "",
         transport: str = "auto",
         stream_kind: str = "rtsp",
+        low_latency: bool = False,
         defer_refresh: bool = False,
     ) -> None:
         _ = defer_refresh
@@ -1537,6 +1662,7 @@ class VideoPipeline(QObject):
         self._rtsp_day_url = day_u
         self._rtsp_thermal_url = th_u
         self._rtsp_transport = str(transport or "auto").strip().lower()
+        self._low_latency = bool(low_latency)
         sk = str(stream_kind or "rtsp").strip().lower()
         self._stream_kind = sk if sk in ("rtsp", "udp_h264", "udp_h265") else "rtsp"
         # Reset active source if it no longer exists.
@@ -1585,4 +1711,3 @@ class VideoPipeline(QObject):
             except Exception:
                 # Hooks are best-effort; never crash the UI.
                 pass
-
