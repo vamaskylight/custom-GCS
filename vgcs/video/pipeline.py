@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi8"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi9"
 
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
@@ -283,10 +283,10 @@ def _rtsp_socket_timeout_us(url: str) -> int:
             pass
     if _url_scheme(str(url or "").strip()) != "rtsp":
         return 0
-    # SIYI ZR10: use a longer timeout than the old 4s default (-138 on quick reconnect).
-    # Zero timeout lets FFmpeg block forever when the laptop is not on 192.168.144.x yet.
+    # SIYI ZR10: no demuxer -timeout (VLC default). Short timeouts caused -138 while the
+    # camera was still releasing the previous TCP session.
     if _rtsp_url_is_siyi_style(url):
-        return 10_000_000
+        return 0
     if _rtsp_url_is_companion_link_subnet(url):
         return 8_000_000
     return 5_000_000
@@ -335,13 +335,6 @@ def _siyi_hwaccel_enabled(url: str) -> bool:
         return False
     raw = str(os.environ.get("VGCS_SIYI_HWACCEL", "1") or "1").strip().lower()
     return raw not in ("0", "off", "false", "no")
-
-
-def _ffmpeg_decode_opts_after_input(url: str, *, siyi_hwaccel: bool) -> list[str]:
-    """Software HEVC error concealment when hwaccel is off or failed."""
-    if not _rtsp_url_is_siyi_style(url) or siyi_hwaccel:
-        return []
-    return ["-c:v", "hevc", "-ec", "1", "-flags2", "+showall"]
 
 
 def _ffmpeg_preflags_before_input(
@@ -1342,7 +1335,7 @@ class RtspSource(QObject):
                     "(HEVC decode gaps are normal; set VGCS_SIYI_STALL_WATCHDOG=1 to enable)"
                 )
             if _rtsp_url_is_siyi_style(url):
-                mode = "hwaccel=auto" if siyi_hw else "sw hevc+ec"
+                mode = "hwaccel=auto" if siyi_hw else "sw (auto codec)"
                 print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
 
         while self._running and not self._ffmpeg_stop.is_set():
@@ -1373,8 +1366,8 @@ class RtspSource(QObject):
                         else:
                             time.sleep(0.05)
 
-                    reconnect_delay = 2.0 if _rtsp_url_is_siyi_style(url) else 0.6
-                    empty_session_limit = 20
+                    reconnect_delay = 2.5 if _rtsp_url_is_siyi_style(url) else 0.6
+                    empty_session_limit = 8 if _rtsp_url_is_siyi_style(url) else 20
                     empty_sessions = 0
 
                     while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
@@ -1394,7 +1387,6 @@ class RtspSource(QObject):
                             ),
                             "-i",
                             url,
-                            *_ffmpeg_decode_opts_after_input(url, siyi_hwaccel=siyi_hw),
                             "-an",
                             "-vf",
                             vf_rgb,
@@ -1579,25 +1571,32 @@ class RtspSource(QObject):
                                     )
                                     if _rtsp_url_is_siyi_style(url):
                                         tl = tail.lower()
-                                        if siyi_hw and (
+                                        if b"codec avoption ec" in tl:
+                                            reconnect_delay = max(reconnect_delay, 3.0)
+                                        elif siyi_hw and (
                                             b"hwaccel" in tl
                                             or b"invalid data" in tl
                                             or b"d3d11" in tl
                                             or b"dxva" in tl
+                                            or b"no device" in tl
                                         ):
                                             siyi_hw = False
                                             print(
                                                 "[VGCS:video] SIYI: hwaccel failed, "
-                                                "retrying software HEVC decode"
+                                                "retrying software decode (no -ec flags)"
                                             )
-                                        elif b"could not find ref" in tl or b"-10054" in tl:
+                                        elif (
+                                            b"could not find ref" in tl
+                                            or b"-10054" in tl
+                                            or b"-138" in tl
+                                            or b"error number -138" in tl
+                                        ):
                                             if siyi_hw:
                                                 siyi_hw = False
                                                 print(
-                                                    "[VGCS:video] SIYI: HEVC POC errors, "
-                                                    "retrying software HEVC decode"
+                                                    "[VGCS:video] SIYI: retrying software decode"
                                                 )
-                                            reconnect_delay = max(reconnect_delay, 4.0)
+                                            reconnect_delay = max(reconnect_delay, 5.0)
                                     if b"404" in tail or b"Not Found" in tail:
                                         url_fatal = True
                                         msg = (
@@ -1608,10 +1607,10 @@ class RtspSource(QObject):
                                             self.error.emit(msg)
                                         except Exception:
                                             pass
-                                    if b"Codec AVOption ec" in tail or b"Invalid argument" in tail:
+                                    if b"Codec AVOption ec" in tail:
                                         print(
-                                            "[VGCS:video] hint: copy latest vgcs/video/pipeline.py "
-                                            f"(rev {_VIDEO_PIPELINE_REV}) — old build had bad FFmpeg flags"
+                                            "[VGCS:video] hint: remove -ec from FFmpeg cmd "
+                                            f"(use pipeline rev {_VIDEO_PIPELINE_REV} or newer)"
                                         )
                                 elif rc not in (0, None):
                                     print(
