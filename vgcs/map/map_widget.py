@@ -2504,6 +2504,10 @@ class MapWidget(QWidget):
                 self._native_rail_layer.hide()
             except Exception:
                 pass
+            # Companion RTSP (192.168.144.x) is independent of the serial MAVLink link — do not
+            # tear down FFmpeg or clear the preview pixmap on COM disconnect/reconnect.
+            if self._uses_companion_rtsp() and self._video_preview_should_run():
+                return
             if webcam_enabled and bool(getattr(self, "_web_ready", False)):
                 self._start_video_preview()
             else:
@@ -3810,27 +3814,47 @@ class MapWidget(QWidget):
                 except Exception:
                     pass
 
+    def _video_gui_stall_recovery_enabled(self) -> bool:
+        raw = str(os.environ.get("VGCS_VIDEO_GUI_STALL", "") or "").strip()
+        if raw == "0":
+            return False
+        if raw == "1":
+            return True
+        # SIYI companion: on by default (HEVC sessions drop every ~10–20 s without GUI recovery).
+        return bool(self._uses_companion_rtsp())
+
     def _on_video_preview_stall_check(self) -> None:
-        """Optional last-resort restart — off by default (was killing SIYI decode during startup)."""
-        if str(os.environ.get("VGCS_VIDEO_GUI_STALL", "") or "").strip() != "1":
+        """Restart decode when preview paint stalls (SIYI on by default)."""
+        if not self._video_gui_stall_recovery_enabled():
             return
         if not bool(getattr(self, "_video_preview_enabled", False)):
             return
         if bool(getattr(self, "_video_preview_stall_recovery_active", False)):
             return
         started = float(getattr(self, "_video_preview_started_mono", 0.0) or 0.0)
-        if started > 0.0 and time.monotonic() - started < 25.0:
-            return
-        if not bool(getattr(self, "_video_preview_got_frame", False)):
+        got = bool(getattr(self, "_video_preview_got_frame", False))
+        # Default: long startup grace (USB / slow RTSP). Companion SIYI: once we have painted
+        # frames, do NOT block stall recovery for 25s — HEVC often drops at ~10–20s and FFmpeg
+        # reconnect can hang without GUI recovery.
+        if self._uses_companion_rtsp():
+            if not got and started > 0.0 and time.monotonic() - started < 12.0:
+                return
+        else:
+            if started > 0.0 and time.monotonic() - started < 25.0:
+                return
+        if not got:
             return
         last = float(getattr(self, "_native_video_last_frame_mono", 0.0) or 0.0)
         if last <= 0.0:
             return
+        default_stall = "8.0" if self._uses_companion_rtsp() else "12.0"
         try:
-            stall_s = float(str(os.environ.get("VGCS_VIDEO_GUI_STALL_S", "12.0") or "12.0").strip())
+            stall_s = float(
+                str(os.environ.get("VGCS_VIDEO_GUI_STALL_S", default_stall) or default_stall).strip()
+            )
         except ValueError:
-            stall_s = 12.0
-        stall_s = max(8.0, min(30.0, stall_s))
+            stall_s = 8.0 if self._uses_companion_rtsp() else 12.0
+        stall_s = max(6.0, min(30.0, stall_s))
         if time.monotonic() - last < stall_s:
             return
         vp = getattr(self, "_video", None)
@@ -3850,15 +3874,15 @@ class MapWidget(QWidget):
         for sid in want_ids:
             try:
                 src = vp.sources().get(sid)
-                if src is not None:
-                    src.stop()
+                if src is not None and hasattr(src, "restart_decode"):
+                    src.restart_decode(delay_ms=1500)
             except Exception:
                 pass
 
         def _restart() -> None:
             try:
                 self._video_preview_started_mono = time.monotonic()
-                self._start_video_decode_sources(vp)
+                self._native_video_last_frame_mono = 0.0
             finally:
                 self._video_preview_stall_recovery_active = False
 
@@ -3916,9 +3940,7 @@ class MapWidget(QWidget):
                     self._video_preview_got_frame = False
                     self._video_preview_started_mono = time.monotonic()
                     t_stall = getattr(self, "_video_preview_stall_timer", None)
-                    if t_stall is not None and str(
-                        os.environ.get("VGCS_VIDEO_GUI_STALL", "") or ""
-                    ).strip() == "1":
+                    if t_stall is not None and self._video_gui_stall_recovery_enabled():
                         t_stall.start()
                 except Exception:
                     pass
@@ -4028,6 +4050,15 @@ class MapWidget(QWidget):
                 )
             except Exception:
                 pass
+            if self._uses_companion_rtsp() and not bool(getattr(self, "_video_swapped", False)):
+                if str(os.environ.get("VGCS_VIDEO_AUTO_FULLSCREEN", "1") or "1").strip() != "0":
+                    try:
+                        self._video_swapped = True
+                        self._layout_native_video_preview()
+                        self._stack_native_overlays_above_tile_map()
+                        print("[VGCS:video] companion RTSP: fullscreen video overlay enabled")
+                    except Exception:
+                        pass
         try:
             img = vf.image
         except RuntimeError:
