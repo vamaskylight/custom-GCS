@@ -2523,8 +2523,21 @@ class MapWidget(QWidget):
             QTimer.singleShot(0, self._layout_native_hud)
         except Exception:
             pass
-        if webcam_enabled:
-            self._start_video_preview()
+        if self._video_preview_should_run():
+            QTimer.singleShot(
+                800,
+                lambda: self._restart_video_preview_after_settings(force_decode=True),
+            )
+
+    def _uses_companion_rtsp(self) -> bool:
+        day = str(getattr(self, "_video_settings_day", "") or "").strip().lower()
+        return "192.168.144." in day
+
+    def _should_defer_companion_rtsp_decode(self) -> bool:
+        """Wait for MAVLink link before opening RTSP on 192.168.144.x (often unreachable at boot)."""
+        if not self._uses_companion_rtsp():
+            return False
+        return not bool(getattr(self, "_last_link_connected", False))
 
     def _probe_current_tiles(self, *, reason: str) -> None:
         # Probe the *current* view tile (not just z=0), because placeholders often occur only at higher zooms.
@@ -3224,7 +3237,11 @@ class MapWidget(QWidget):
         self._video_inited = False
         self._shared_vp_hooks_connected = False
         setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
-        QTimer.singleShot(0, self._restart_video_preview_after_settings)
+        force = bool(getattr(self, "_last_link_connected", False))
+        QTimer.singleShot(
+            0,
+            lambda: self._restart_video_preview_after_settings(force_decode=force),
+        )
 
     def _ensure_video_preview_backend(self, *, from_start: bool = False) -> bool:
         if not HAS_MULTIMEDIA:
@@ -3555,7 +3572,10 @@ class MapWidget(QWidget):
             # Start (or restart) preview whenever streaming is enabled and the toolbar wants it —
             # not only when preview was already running. First-time enable after Apply used to skip
             # `_restart_video_preview_after_settings` because `was_preview_on` stayed False.
-            self._schedule_video_preview_after_settings()
+            QTimer.singleShot(
+                120,
+                lambda: self._restart_video_preview_after_settings(force_decode=True),
+            )
 
         def phase_stop_preview() -> None:
             # `_stop_video_preview` used to do WebEngine `runJavaScript` + FFmpeg `stop()` in one
@@ -3636,7 +3656,8 @@ class MapWidget(QWidget):
             return
         try:
             if vp.sources():
-                self._restart_video_preview_after_settings()
+                force = bool(getattr(self, "_last_link_connected", False))
+                self._restart_video_preview_after_settings(force_decode=force)
                 return
         except Exception:
             pass
@@ -3659,15 +3680,24 @@ class MapWidget(QWidget):
             1200, lambda r=nxt: self._schedule_video_preview_after_settings(_retry=r)
         )
 
-    def _restart_video_preview_after_settings(self) -> None:
+    def _restart_video_preview_after_settings(self, *, force_decode: bool = False) -> None:
         try:
             if not self._video_preview_should_run():
+                return
+            if self._should_defer_companion_rtsp_decode() and not force_decode:
+                try:
+                    print(
+                        "[VGCS:video] companion RTSP deferred until MAVLink link "
+                        "(connect radio, then open video or Apply settings)"
+                    )
+                except Exception:
+                    pass
                 return
             # `refresh_sources()` replaces source objects; force full hook-up (not the stale
             # `_video_inited` fast-path) so `src.start()` targets the new `RtspSource`.
             self._video_inited = False
             self._shared_vp_hooks_connected = False
-            self._start_video_preview(reset_swapped=True)
+            self._start_video_preview(reset_swapped=True, force_decode=force_decode)
         except Exception:
             pass
 
@@ -3694,7 +3724,10 @@ class MapWidget(QWidget):
         self._sync_native_camera_rail_toggles()
         try:
             if bool(getattr(self, "_web_ready", False)) and self._video_preview_should_run():
-                QTimer.singleShot(150, self._schedule_video_preview_after_settings)
+                QTimer.singleShot(
+                    150,
+                    lambda: self._restart_video_preview_after_settings(force_decode=True),
+                )
         except Exception:
             pass
 
@@ -3727,13 +3760,24 @@ class MapWidget(QWidget):
             return ["day"]
         return [keys[0]]
 
-    def _start_video_decode_sources(self, vp) -> None:
+    def _start_video_decode_sources(self, vp, *, force: bool = False) -> None:
         """Start only the decoders needed for the current preview mode."""
+        if self._should_defer_companion_rtsp_decode() and not force:
+            try:
+                print(
+                    "[VGCS:video] decode start skipped: companion RTSP deferred until MAVLink link"
+                )
+            except Exception:
+                pass
+            return
         want = set(self._video_preview_source_ids_to_run(vp))
         for sid, src in vp.sources().items():
             if sid in want:
                 try:
-                    src.start()
+                    if force and hasattr(src, "restart_decode"):
+                        src.restart_decode()
+                    else:
+                        src.start()
                 except Exception:
                     pass
 
@@ -3801,7 +3845,7 @@ class MapWidget(QWidget):
 
         QTimer.singleShot(500, _restart)
 
-    def _start_video_preview(self, *, reset_swapped: bool = True) -> None:
+    def _start_video_preview(self, *, reset_swapped: bool = True, force_decode: bool = False) -> None:
         if not getattr(self, "_web_ready", False):
             try:
                 print("[VGCS:video] preview start skipped: map not ready")
@@ -3848,7 +3892,7 @@ class MapWidget(QWidget):
             # active source — avoids a second RTSP session on the same URL (SIYI ZR10 stall risk).
             vp = getattr(self, "_video", None)
             if vp is not None:
-                self._start_video_decode_sources(vp)
+                self._start_video_decode_sources(vp, force=force_decode)
                 try:
                     self._video_preview_got_frame = False
                     self._video_preview_started_mono = time.monotonic()
