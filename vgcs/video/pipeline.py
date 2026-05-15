@@ -266,8 +266,15 @@ def _rtsp_socket_timeout_us(url: str) -> int:
     return 5_000_000
 
 
+def _stall_watchdog_enabled(url: str) -> bool:
+    """SIYI HEVC often blocks inside FFmpeg for >6s while healthy; killing causes freeze loops."""
+    if _rtsp_url_is_siyi_style(url):
+        return str(os.environ.get("VGCS_SIYI_STALL_WATCHDOG", "0") or "0").strip() == "1"
+    return True
+
+
 def _video_stall_reconnect_s(url: str) -> float:
-    """Max seconds without a full raw frame before killing FFmpeg and reconnecting."""
+    """Max seconds without a full raw frame (frozen-duplicate path; watchdog uses same value)."""
     raw = str(os.environ.get("VGCS_VIDEO_STALL_RECONNECT_S", "") or "").strip()
     if raw:
         try:
@@ -275,7 +282,7 @@ def _video_stall_reconnect_s(url: str) -> float:
         except ValueError:
             pass
     if _rtsp_url_is_siyi_style(url):
-        return 6.0
+        return 12.0
     if _rtsp_url_is_companion_link_subnet(url):
         return 3.0
     return 3.0
@@ -358,7 +365,7 @@ def _ffmpeg_preflags_before_input(
                     ]
                 )
         if _rtsp_url_is_siyi_style(u):
-            # Decoder-side error concealment (must be before ``-i``; invalid after ``-i`` on rawvideo out).
+            out.extend(["-thread_queue_size", "512"])
             out.extend(["-ec", "guess_mvs+deblock"])
     out.extend(["-err_detect", "ignore_err"])
     if sc == "udp":
@@ -1189,9 +1196,9 @@ class RtspSource(QObject):
         cap_w = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_W", "1920") or 1920)
         cap_h = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_H", "1080") or 1080)
         if _rtsp_url_is_siyi_style(url):
-            # ZR10 main stream can be 4K; cap preview decode to reduce CPU stutter on laptops.
-            cap_w = min(cap_w, int(os.environ.get("VGCS_SIYI_DECODE_MAX_W", "1280") or 1280))
-            cap_h = min(cap_h, int(os.environ.get("VGCS_SIYI_DECODE_MAX_H", "720") or 720))
+            # ZR10 main.264 is often HEVC 1080p+; lighter preview decode = smoother pan on laptops.
+            cap_w = min(cap_w, int(os.environ.get("VGCS_SIYI_DECODE_MAX_W", "960") or 960))
+            cap_h = min(cap_h, int(os.environ.get("VGCS_SIYI_DECODE_MAX_H", "540") or 540))
         cap_w = max(640, min(1920, cap_w))
         cap_h = max(360, min(1080, cap_h))
         scale = min(float(cap_w) / float(src_w), float(cap_h) / float(src_h), 1.0)
@@ -1211,9 +1218,12 @@ class RtspSource(QObject):
         # Default 20 Hz — preview still looks smooth; higher rates + map work freeze Windows
         # ("Not Responding") on typical laptops. Override with VGCS_VIDEO_PREVIEW_MAX_FPS.
         try:
-            max_fps = float(str(os.environ.get("VGCS_VIDEO_PREVIEW_MAX_FPS", "20") or "20").strip())
+            default_fps = "25" if _rtsp_url_is_siyi_style(url) else "20"
+            max_fps = float(
+                str(os.environ.get("VGCS_VIDEO_PREVIEW_MAX_FPS", default_fps) or default_fps).strip()
+            )
         except Exception:
-            max_fps = 20.0
+            max_fps = 25.0 if _rtsp_url_is_siyi_style(url) else 20.0
         max_fps = max(8.0, min(60.0, max_fps))
         min_emit_dt = 1.0 / max_fps
         last_emit_mono = 0.0
@@ -1228,6 +1238,11 @@ class RtspSource(QObject):
                 f"[VGCS:video] RTSP companion link (192.168.144.x): transport order="
                 f"{_rtsp_transport_sequence(url, self._transport)!r} (TCP interleaved first)"
             )
+            if _rtsp_url_is_siyi_style(url) and not _stall_watchdog_enabled(url):
+                print(
+                    "[VGCS:video] SIYI ZR10: stall watchdog disabled "
+                    "(HEVC decode gaps are normal; set VGCS_SIYI_STALL_WATCHDOG=1 to enable)"
+                )
 
         while self._running and not self._ffmpeg_stop.is_set():
             transport_seq = _rtsp_transport_sequence(url, self._transport)
@@ -1278,7 +1293,7 @@ class RtspSource(QObject):
                         "pipe:1",
                     ]
 
-                    reconnect_delay = 1.2 if _rtsp_url_is_siyi_style(url) else 0.6
+                    reconnect_delay = 2.0 if _rtsp_url_is_siyi_style(url) else 0.6
                     empty_session_limit = 20
                     empty_sessions = 0
 
@@ -1333,13 +1348,14 @@ class RtspSource(QObject):
                         self._ffmpeg_last_raw_sig = None
                         self._ffmpeg_last_raw_change_mono = time.monotonic()
                         session_stop = threading.Event()
-                        _stall_wd = self._start_ffmpeg_stall_watchdog(
-                            p,
-                            stall_s=stall_reconnect_s,
-                            transport_label=tr_label,
-                            session_stop=session_stop,
-                            frames_counter=frame_count_box,
-                        )
+                        if _stall_watchdog_enabled(url):
+                            self._start_ffmpeg_stall_watchdog(
+                                p,
+                                stall_s=stall_reconnect_s,
+                                transport_label=tr_label,
+                                session_stop=session_stop,
+                                frames_counter=frame_count_box,
+                            )
                         try:
                             while self._running and not self._ffmpeg_stop.is_set():
                                 raw = self._read_exact(p.stdout, frame_bytes)
@@ -1358,8 +1374,8 @@ class RtspSource(QObject):
                                     self._ffmpeg_last_raw_change_mono = now_decode
                                 else:
                                     frozen_s = max(
-                                        stall_reconnect_s * 3.0,
-                                        8.0 if _rtsp_url_is_siyi_style(url) else 6.0,
+                                        stall_reconnect_s * 2.0,
+                                        15.0 if _rtsp_url_is_siyi_style(url) else 6.0,
                                     )
                                     if now_decode - self._ffmpeg_last_raw_change_mono >= frozen_s:
                                         if not frozen_logged:
@@ -1479,11 +1495,15 @@ class RtspSource(QObject):
                             cooldown = reconnect_delay
                             try:
                                 tail_b = b"".join(stderr_buf)
-                                if _rtsp_url_is_siyi_style(url) and (
-                                    b"-138" in tail_b
-                                    or b"Error number -138" in tail_b
-                                ):
-                                    cooldown = max(cooldown, 2.0)
+                                if _rtsp_url_is_siyi_style(url):
+                                    if (
+                                        b"-138" in tail_b
+                                        or b"-10054" in tail_b
+                                        or b"Error number -138" in tail_b
+                                        or b"Error number -10054" in tail_b
+                                        or b"hevc" in tail_b.lower()
+                                    ):
+                                        cooldown = max(cooldown, 2.5)
                             except Exception:
                                 pass
                             time.sleep(cooldown)
