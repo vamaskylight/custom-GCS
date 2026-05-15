@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi4"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi5"
 
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
@@ -181,6 +181,9 @@ def _rtsp_transport_sequence(url: str, mode: str) -> tuple[str | None, ...]:
         return ("udp", "tcp")
     if m == "tcp":
         return ("tcp", "udp")
+    if m == "auto" and _rtsp_url_is_siyi_style(raw):
+        # ZR10: TCP-only — flipping to UDP after a long TCP session often fails to reconnect.
+        return ("tcp",)
     return _rtsp_transport_order_auto(raw)
 
 
@@ -624,6 +627,7 @@ class RtspSource(QObject):
         self._ffmpeg_last_raw_sig: bytes | None = None
         self._ffmpeg_last_raw_change_mono: float = 0.0
         self._ffmpeg_session_started_mono: float = 0.0
+        self._ffmpeg_had_frame: bool = False
         self._rec_proc: subprocess.Popen[bytes] | None = None
         self._rec_lock = threading.Lock()
         self._running = False
@@ -1456,9 +1460,15 @@ class RtspSource(QObject):
                                     frame_count_box[0] = frames_this_session
                                     if frames_this_session == 1:
                                         self._ffmpeg_session_started_mono = time.monotonic()
+                                        tag = (
+                                            "reconnected"
+                                            if self._ffmpeg_had_frame
+                                            else "first"
+                                        )
+                                        self._ffmpeg_had_frame = True
                                         try:
                                             print(
-                                                f"[VGCS:video] first frame ok "
+                                                f"[VGCS:video] {tag} frame ok "
                                                 f"{w}x{h} transport={tr_label} url={url}"
                                             )
                                         except Exception:
@@ -1527,13 +1537,23 @@ class RtspSource(QObject):
 
                         if frames_this_session > 0:
                             empty_sessions = 0
+                            try:
+                                tail_b = b"".join(stderr_buf)
+                                tail_txt = (
+                                    tail_b[-500:].decode("utf-8", errors="replace").strip()
+                                    if tail_b
+                                    else ""
+                                )
+                            except Exception:
+                                tail_b = b""
+                                tail_txt = ""
                             print(
                                 f"[VGCS:video] decode session ended (frames={frames_this_session}), "
                                 f"reconnecting same transport={tr_label} rc={rc!r}"
+                                + (f" — {tail_txt[:200]}" if tail_txt else "")
                             )
                             cooldown = reconnect_delay
                             try:
-                                tail_b = b"".join(stderr_buf)
                                 if _rtsp_url_is_siyi_style(url):
                                     if (
                                         b"-138" in tail_b
@@ -1542,13 +1562,17 @@ class RtspSource(QObject):
                                         or b"Error number -10054" in tail_b
                                         or b"hevc" in tail_b.lower()
                                     ):
-                                        cooldown = max(cooldown, 2.5)
+                                        cooldown = max(cooldown, 3.5)
                             except Exception:
                                 pass
                             time.sleep(cooldown)
                             continue
 
                         empty_sessions += 1
+                        if round_ok and empty_sessions < 5:
+                            # SIYI often drops RTSP after ~60s; keep retrying same transport.
+                            time.sleep(max(reconnect_delay, 2.0))
+                            continue
                         if empty_sessions >= empty_session_limit:
                             print(
                                 f"[VGCS:video] decode: no frames after {empty_session_limit} attempts "
@@ -1557,14 +1581,9 @@ class RtspSource(QObject):
                             break
                         time.sleep(reconnect_delay)
 
-                    if round_ok:
-                        break
-
                 if self._ffmpeg_stop.is_set() or not self._running:
                     break
                 if url_fatal:
-                    break
-                if round_ok:
                     break
 
             if self._ffmpeg_stop.is_set() or not self._running:
@@ -1791,17 +1810,27 @@ class VideoPipeline(QObject):
         _ = defer_refresh
         day_u = _normalize_companion_rtsp_url(str(day_url or "").strip())
         th_u = _normalize_companion_rtsp_url(str(thermal_url or "").strip())
-        # Same URL on day + thermal (common mis-config) opens two FFmpeg sessions; many
-        # companion cameras tolerate only one client. SIYI ZR10 allows four, but one decode
-        # path is enough for single-view and reduces load / stall risk.
+        tr = str(transport or "auto").strip().lower()
+        sk = str(stream_kind or "rtsp").strip().lower()
+        sk = sk if sk in ("rtsp", "udp_h264", "udp_h265") else "rtsp"
+        ll = bool(low_latency)
         if day_u and th_u and day_u == th_u:
             th_u = ""
+        unchanged = (
+            day_u == self._rtsp_day_url
+            and th_u == self._rtsp_thermal_url
+            and tr == self._rtsp_transport
+            and sk == self._stream_kind
+            and ll == self._low_latency
+            and bool(self._sources)
+        )
         self._rtsp_day_url = day_u
         self._rtsp_thermal_url = th_u
-        self._rtsp_transport = str(transport or "auto").strip().lower()
-        self._low_latency = bool(low_latency)
-        sk = str(stream_kind or "rtsp").strip().lower()
-        self._stream_kind = sk if sk in ("rtsp", "udp_h264", "udp_h265") else "rtsp"
+        self._rtsp_transport = tr
+        self._low_latency = ll
+        self._stream_kind = sk
+        if unchanged:
+            return
         # Reset active source if it no longer exists.
         if self._active_source_id and self._active_source_id not in self._sources:
             self._active_source_id = ""
