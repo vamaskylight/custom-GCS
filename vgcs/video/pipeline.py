@@ -257,9 +257,12 @@ def _rtsp_socket_timeout_us(url: str) -> int:
             pass
     if _url_scheme(str(url or "").strip()) != "rtsp":
         return 0
-    # Companion link (Skydroid / SIYI ZR10 @ 192.168.144.x): slightly tighter recovery.
+    # SIYI ZR10: do not pass demuxer -timeout — 4s caused Windows error -138 on reconnect
+    # while the camera was still releasing the prior TCP session.
+    if _rtsp_url_is_siyi_style(url):
+        return 0
     if _rtsp_url_is_companion_link_subnet(url):
-        return 4_000_000
+        return 8_000_000
     return 5_000_000
 
 
@@ -272,9 +275,9 @@ def _video_stall_reconnect_s(url: str) -> float:
         except ValueError:
             pass
     if _rtsp_url_is_siyi_style(url):
-        return 1.5
+        return 6.0
     if _rtsp_url_is_companion_link_subnet(url):
-        return 2.0
+        return 3.0
     return 3.0
 
 
@@ -588,6 +591,7 @@ class RtspSource(QObject):
         self._ffmpeg_last_decode_mono: float = 0.0
         self._ffmpeg_last_raw_sig: bytes | None = None
         self._ffmpeg_last_raw_change_mono: float = 0.0
+        self._ffmpeg_session_started_mono: float = 0.0
         self._rec_proc: subprocess.Popen[bytes] | None = None
         self._rec_lock = threading.Lock()
         self._running = False
@@ -1077,6 +1081,16 @@ class RtspSource(QObject):
             return ["h264", "mpegts", ""]
         return [fmt] if fmt else [""]
 
+    def _emit_video_frame_safe(self, qimg: QImage, meta: FrameMeta) -> bool:
+        """Emit on the decode thread; RtspSource may be deleted during settings Apply."""
+        if not self._running or self._ffmpeg_stop.is_set():
+            return False
+        try:
+            self.frame.emit(VideoFrame(qimg, meta))
+            return True
+        except RuntimeError:
+            return False
+
     def _read_exact(self, stream, n: int) -> bytes | None:
         buf = bytearray()
         while len(buf) < n and not self._ffmpeg_stop.is_set():
@@ -1114,10 +1128,13 @@ class RtspSource(QObject):
                 and proc.poll() is None
             ):
                 time.sleep(0.2)
-                if int(frames_counter[0]) <= 0:
-                    if time.monotonic() - session_t0 < grace * 2.0:
+                if int(frames_counter[0]) < 30:
+                    if time.monotonic() - session_t0 < grace * 4.0:
                         continue
                     return
+                sess0 = float(self._ffmpeg_session_started_mono or 0.0)
+                if sess0 > 0.0 and time.monotonic() - sess0 < 8.0:
+                    continue
                 last = float(self._ffmpeg_last_decode_mono or self._ffmpeg_last_frame_mono or 0.0)
                 if last <= 0.0:
                     continue
@@ -1249,16 +1266,30 @@ class RtspSource(QObject):
                         "-i",
                         url,
                         "-an",
-                        "-vf",
-                        vf_rgb,
-                        "-pix_fmt",
-                        "rgb24",
-                        "-f",
-                        "rawvideo",
-                        "pipe:1",
                     ]
+                    if _rtsp_url_is_siyi_style(url):
+                        # ZR10 often ships HEVC on main.264; conceal GOP join errors, drop late frames.
+                        cmd_base.extend(
+                            [
+                                "-ec",
+                                "guess_mvs+deblock",
+                                "-fps_mode",
+                                "drop",
+                            ]
+                        )
+                    cmd_base.extend(
+                        [
+                            "-vf",
+                            vf_rgb,
+                            "-pix_fmt",
+                            "rgb24",
+                            "-f",
+                            "rawvideo",
+                            "pipe:1",
+                        ]
+                    )
 
-                    reconnect_delay = 0.6
+                    reconnect_delay = 1.2 if _rtsp_url_is_siyi_style(url) else 0.6
                     empty_session_limit = 20
                     empty_sessions = 0
 
@@ -1386,11 +1417,13 @@ class RtspSource(QObject):
                                         device_name=self.device_name,
                                         timestamp_ms=0,
                                     )
-                                    self.frame.emit(VideoFrame(qimg, meta))
+                                    if not self._emit_video_frame_safe(qimg, meta):
+                                        break
                                     self._ffmpeg_last_frame_mono = last_emit_mono
                                     frames_this_session += 1
                                     frame_count_box[0] = frames_this_session
                                     if frames_this_session == 1:
+                                        self._ffmpeg_session_started_mono = time.monotonic()
                                         try:
                                             print(
                                                 f"[VGCS:video] first frame ok "
@@ -1444,7 +1477,17 @@ class RtspSource(QObject):
                                 f"[VGCS:video] decode session ended (frames={frames_this_session}), "
                                 f"reconnecting same transport={tr_label} rc={rc!r}"
                             )
-                            time.sleep(reconnect_delay)
+                            cooldown = reconnect_delay
+                            try:
+                                tail_b = b"".join(stderr_buf)
+                                if _rtsp_url_is_siyi_style(url) and (
+                                    b"-138" in tail_b
+                                    or b"Error number -138" in tail_b
+                                ):
+                                    cooldown = max(cooldown, 2.0)
+                            except Exception:
+                                pass
+                            time.sleep(cooldown)
                             continue
 
                         empty_sessions += 1
