@@ -2549,6 +2549,13 @@ class MapWidget(QWidget):
             return
         if self._should_defer_companion_rtsp_decode():
             return
+        setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
+        if not self._ensure_video_preview_backend(from_start=True):
+            return
+        try:
+            self._video_preview_enabled = True
+        except Exception:
+            pass
         now = time.monotonic()
         last = float(getattr(self, "_companion_video_restart_mono", 0.0) or 0.0)
         if now - last < 4.5:
@@ -3258,11 +3265,26 @@ class MapWidget(QWidget):
         self._video_inited = False
         self._shared_vp_hooks_connected = False
         setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
-        if bool(getattr(self, "_last_link_connected", False)):
-            QTimer.singleShot(
-                0,
-                lambda: self._request_companion_video_restart(reason="sources_changed"),
-            )
+        if not self._ensure_video_preview_backend(from_start=True):
+            try:
+                print("[VGCS:video] sources_changed: preview hook-up failed (no sources?)")
+            except Exception:
+                pass
+            return
+        try:
+            self._video_preview_enabled = True
+            self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
+            self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
+            if self._uses_companion_rtsp() and not self._plan_flight_layer_obscures_native_camera_ui():
+                self._video_swapped = True
+                self._native_video_preview.show()
+                self._layout_native_video_preview()
+                self._stack_native_overlays_above_tile_map()
+        except Exception:
+            pass
+        if self._should_defer_companion_rtsp_decode():
+            return
+        self._request_companion_video_restart(reason="sources_changed")
 
     def _ensure_video_preview_backend(self, *, from_start: bool = False) -> bool:
         if not HAS_MULTIMEDIA:
