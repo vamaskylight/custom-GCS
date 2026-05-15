@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ipaddress
 import os
+from pathlib import Path
 import threading
 import time
 import json
@@ -47,6 +48,67 @@ except Exception:  # pragma: no cover - depends on platform build
     QImageCapture = None  # type: ignore[assignment]
     QVideoSink = None  # type: ignore[assignment]
     HAS_MULTIMEDIA = False
+
+
+def wait_qmedia_recorder_stopped(rec, *, timeout_s: float = 20.0) -> bool:
+    """
+    ``QMediaRecorder.stop()`` is asynchronous; the output file may be incomplete
+    until the recorder returns to ``StoppedState`` (symptom: tiny / unplayable MP4).
+    """
+    if not HAS_MULTIMEDIA or rec is None:
+        return True
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        stopped = QMediaRecorder.RecorderState.StoppedState
+    except Exception:
+        return True
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        try:
+            if rec.recorderState() == stopped:
+                return True
+        except Exception:
+            return True
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+        time.sleep(0.02)
+    return False
+
+
+def suggested_recording_filename(extension: str = "mp4") -> str:
+    """Default basename for saved screen/RTSP recordings (aligned with ``photo_YYYYMMDD_HHMMSS``)."""
+    ext = str(extension or "mp4").strip().lower().lstrip(".")
+    if ext not in ("mp4", "mov", "mkv"):
+        ext = "mp4"
+    return f"recording_{time.strftime('%Y%m%d_%H%M%S')}.{ext}"
+
+
+def suggested_recording_save_path(directory: str | Path | None = None) -> str:
+    """Full path for QFileDialog default when saving a recording."""
+    d = Path.cwd() if directory is None else Path(directory)
+    return str(d / suggested_recording_filename())
+
+
+def suggested_photo_filename(extension: str = "jpg") -> str:
+    ext = str(extension or "jpg").strip().lower().lstrip(".")
+    if ext in ("jpeg",):
+        ext = "jpg"
+    if ext not in ("jpg", "png"):
+        ext = "jpg"
+    return f"photo_{time.strftime('%Y%m%d_%H%M%S')}.{ext}"
+
+
+def suggested_photo_save_path(directory: str | Path | None = None, *, extension: str = "jpg") -> str:
+    """Full path for QFileDialog default when saving a still photo."""
+    d = Path.cwd() if directory is None else Path(directory)
+    return str(d / suggested_photo_filename(extension=extension))
+
+
+# QSettings key (VGCS / VGCS): last directory used in the photo Save dialog.
+QS_KEY_LAST_PHOTO_SAVE_DIR = "media/last_photo_save_dir"
 
 
 @dataclass(frozen=True)
@@ -433,6 +495,7 @@ class RtspSource(QObject):
         self._ffmpeg_dims: tuple[int, int] | None = None
         self._ffmpeg_last_frame_mono: float = 0.0
         self._rec_proc: subprocess.Popen[bytes] | None = None
+        self._rec_lock = threading.Lock()
         self._running = False
 
     @property
@@ -561,8 +624,10 @@ class RtspSource(QObject):
 
     def start_recording(self, filename: str) -> bool:
         """
-        Record this RTSP stream to a file using ffmpeg.
-        Re-encodes to H.264 yuv420p for broad compatibility.
+        Record the **same** decoded RGB stream used for preview.
+
+        A second FFmpeg pulling the RTSP URL directly often fails on companion cameras
+        that only allow **one** RTSP client (symptom: a tiny broken ``.mp4``).
         """
         path = str(filename or "").strip()
         if not path:
@@ -570,29 +635,49 @@ class RtspSource(QObject):
         if shutil.which("ffmpeg") is None:
             self.error.emit("ffmpeg not found in PATH (required for recording)")
             return False
-        if self._rec_proc is not None and self._rec_proc.poll() is None:
-            return True
-        url = str(self._url or "").strip()
-        if not url:
-            self.error.emit("Stream URL is empty")
+        with self._rec_lock:
+            if self._rec_proc is not None and self._rec_proc.poll() is None:
+                return True
+
+        dec = self._ffmpeg_proc
+        if dec is None or dec.poll() is not None:
+            self.error.emit(
+                "Recording needs an active live preview first (many cameras allow only one RTSP session)"
+            )
             return False
-        sc = _url_scheme(url)
-        cmd = ["ffmpeg", "-y", "-loglevel", "error"]
-        cmd.extend(_ffmpeg_udp_raw_demux(url, self._udp_input_format))
-        if sc == "rtsp":
-            cmd += ["-rtsp_transport", "tcp"]
-        elif sc == "udp":
-            cmd += [
-                "-fflags",
-                "nobuffer+genpts+discardcorrupt",
-                "-analyzeduration",
-                "1500000",
-                "-probesize",
-                "65536",
-            ]
-        cmd += [
+
+        w, h = self._ffmpeg_dims or (1280, 720)
+        w = max(2, int(w))
+        h = max(2, int(h))
+        if (w % 2) != 0:
+            w -= 1
+        if (h % 2) != 0:
+            h -= 1
+        w = max(2, w)
+        h = max(2, h)
+
+        try:
+            fps = float(str(os.environ.get("VGCS_RECORD_RAW_FRAMERATE", "30") or "30").strip())
+        except Exception:
+            fps = 30.0
+        fps = max(10.0, min(120.0, fps))
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-video_size",
+            f"{w}x{h}",
+            "-framerate",
+            str(fps),
             "-i",
-            url,
+            "pipe:0",
             "-an",
             "-c:v",
             "libx264",
@@ -607,33 +692,78 @@ class RtspSource(QObject):
             path,
         ]
         try:
-            # stderr=DEVNULL: see continuous decode Popen (pipe deadlock on Windows).
-            self._rec_proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
-            return True
         except Exception as e:
             self.error.emit(f"Record start failed: {e}")
-            self._rec_proc = None
             return False
 
+        time.sleep(0.12)
+        if proc.poll() is not None:
+            err = ""
+            try:
+                if proc.stderr is not None:
+                    err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-800:]
+            except Exception:
+                pass
+            self.error.emit(
+                "Recording encoder exited immediately. "
+                + (err.strip() or f"(ffmpeg exit code {proc.returncode})")
+            )
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
+            return False
+
+        with self._rec_lock:
+            self._rec_proc = proc
+        return True
+
     def stop_recording(self) -> None:
-        try:
-            if self._rec_proc is None:
-                return
-            if self._rec_proc.poll() is None:
-                try:
-                    self._rec_proc.kill()
-                except Exception:
-                    try:
-                        self._rec_proc.terminate()
-                    except Exception:
-                        pass
-        finally:
+        with self._rec_lock:
+            p = self._rec_proc
             self._rec_proc = None
+        if p is None:
+            return
+        try:
+            sin = p.stdin
+            if sin is not None:
+                try:
+                    sin.close()
+                except Exception:
+                    pass
+            deadline = time.monotonic() + 45.0
+            while p.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+                deadline2 = time.monotonic() + 3.0
+                while p.poll() is None and time.monotonic() < deadline2:
+                    time.sleep(0.05)
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                pass
+            try:
+                if p.stderr is not None:
+                    p.stderr.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _on_video_frame_changed(self, frame) -> None:
         try:
@@ -979,6 +1109,20 @@ class RtspSource(QObject):
                         raw = self._read_exact(p.stdout, frame_bytes)
                         if raw is None:
                             break
+                        # File recording reuses this RGB stream (single RTSP session).
+                        with self._rec_lock:
+                            recp = self._rec_proc
+                            if (
+                                recp is not None
+                                and recp.poll() is None
+                                and recp.stdin is not None
+                            ):
+                                try:
+                                    recp.stdin.write(raw)
+                                except BrokenPipeError:
+                                    pass
+                                except Exception:
+                                    pass
                         # Drop frames *before* QImage/numpy decode. Previously we built a full QImage
                         # copy for every FFmpeg output frame then throttled emit — the CPU cost alone
                         # could starve the GUI thread (QueuedConnection backlog + map MAVLink work).

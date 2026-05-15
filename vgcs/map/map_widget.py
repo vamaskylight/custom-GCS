@@ -67,7 +67,15 @@ from vgcs.mission import (
 )
 
 # Optional: live camera preview for map overlay (M3 video pipeline).
-from vgcs.video.pipeline import HAS_MULTIMEDIA, VideoFrame, VideoPipeline
+from vgcs.video.pipeline import (
+    HAS_MULTIMEDIA,
+    VideoFrame,
+    VideoPipeline,
+    QS_KEY_LAST_PHOTO_SAVE_DIR,
+    suggested_photo_save_path,
+    suggested_recording_save_path,
+    wait_qmedia_recorder_stopped,
+)
 from vgcs.video.camera_control import NoopCameraControl
 from vgcs.map.native_tile_map import NativeTileMapView
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
@@ -146,6 +154,9 @@ _KEY_MAP_WEBCAM_ENABLED = "map_webcam_enabled"
 _KEY_MAP_LOW_SPEC_MODE = "map_low_spec_mode"  # 'auto' | 'on' | 'off'
 _KEY_MAP_TILE_MODE = "map_tile_mode"  # 'esri_streets' | 'osm' | 'sat' | 'offline'
 
+# Last directory for camera-rail photo Save dialog (same key as ``QS_KEY_LAST_PHOTO_SAVE_DIR``).
+_KEY_MEDIA_LAST_PHOTO_DIR = QS_KEY_LAST_PHOTO_SAVE_DIR
+
 # M3 video settings (QSettings keys, written by Application Settings → Video).
 _KEY_VIDEO_ENABLED = "video/enabled"
 _KEY_VIDEO_SOURCE = "video/source"  # 'disabled' | 'rtsp' | 'udp_h264' | 'udp_h265'
@@ -168,6 +179,16 @@ HAS_WEBENGINE = HAS_WEBENGINE_3D
 
 # Legacy placeholder (HTML lives in legacy_leaflet_map.html + legacy_leaflet_build).
 LEAFLET_HTML = ""
+
+
+def _save_qimage_to_path(img: QImage, path: Path) -> bool:
+    """Write ``QImage`` using extension: ``.png`` → PNG, else JPEG."""
+    try:
+        if path.suffix.lower() == ".png":
+            return bool(img.save(str(path), "PNG"))
+        return bool(img.save(str(path), "JPG", 92))
+    except Exception:
+        return False
 
 
 def _native_cam_record_dot_pixmap(size: int = 14) -> QPixmap:
@@ -3950,42 +3971,48 @@ class MapWidget(QWidget):
         except Exception:
             return img
 
-    def _capture_photo_quick(self) -> str | None:
+    def _capture_photo_quick(self, output_path: str | None = None) -> str | None:
         """
-        Save a photo immediately without opening a pre-save dialog.
-        Returns the saved path on success, else None.
+        Save a still image from the best available live preview source.
 
-        Fallback order (matches what the user actually sees on screen):
-          1. Backend `take_photo` (QtMultimedia camera). RTSP sources do not implement this.
-          2. Cached native PiP frame (`_native_pip_last_source_frame`) — populated by
-             `_on_pipeline_frame` for the native renderer.
-          3. Split cache (`_split_last_images`) — populated in split mode.
-          4. Legacy data-URL fallback (only set by the old WebEngine overlay).
+        If ``output_path`` is set, the file is written there (after creating parent
+        folders). If ``None``, writes ``captures/photo_YYYYMMDD_HHMMSS.*`` for
+        silent snapshots (e.g. observation logging).
         """
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        photos_dir = Path.cwd() / "captures"
-        try:
-            photos_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            return None
+        explicit = str(output_path or "").strip()
+        photos_dir: Path | None = None
+        if explicit:
+            dest = Path(explicit).expanduser()
+            suf = dest.suffix.lower()
+            if suf not in (".jpg", ".jpeg", ".png"):
+                dest = dest.with_suffix(".jpg")
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                return None
+        else:
+            photos_dir = Path.cwd() / "captures"
+            try:
+                photos_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                return None
+            dest = photos_dir / f"photo_{stamp}.jpg"
 
         try:
             self._ensure_video_preview_backend()
             src = getattr(self, "_video_active_source", None)
             if src is not None and hasattr(src, "take_photo"):
-                out = photos_dir / f"photo_{stamp}.jpg"
-                ok = bool(src.take_photo(str(out)))
-                if ok:
-                    return str(out)
+                if bool(src.take_photo(str(dest))):
+                    return str(dest)
         except Exception:
             pass
 
         try:
             img = getattr(self, "_native_pip_last_source_frame", None)
             if isinstance(img, QImage) and not img.isNull() and img.width() > 0 and img.height() > 0:
-                out = photos_dir / f"photo_{stamp}.jpg"
-                if img.save(str(out), "JPG", 92):
-                    return str(out)
+                if _save_qimage_to_path(img, dest):
+                    return str(dest)
         except Exception:
             pass
 
@@ -3998,22 +4025,26 @@ class MapWidget(QWidget):
             ]
             for im in ordered:
                 if isinstance(im, QImage) and not im.isNull() and im.width() > 0 and im.height() > 0:
-                    out = photos_dir / f"photo_{stamp}.jpg"
-                    if im.save(str(out), "JPG", 92):
-                        return str(out)
+                    if _save_qimage_to_path(im, dest):
+                        return str(dest)
                     break
         except Exception:
             pass
 
         try:
             data_url = str(getattr(self, "_video_last_data_url", "") or "").strip()
-            if data_url.startswith("data:image/"):
+            if data_url.startswith("data:image/") and photos_dir is not None:
                 head, b64 = data_url.split(",", 1)
                 ext = "png" if "image/png" in head.lower() else "jpg"
                 out = photos_dir / f"photo_{stamp}.{ext}"
                 raw = base64.b64decode(b64)
                 out.write_bytes(raw)
                 return str(out)
+            if data_url.startswith("data:image/") and explicit:
+                head, b64 = data_url.split(",", 1)
+                raw = base64.b64decode(b64)
+                dest.write_bytes(raw)
+                return str(dest)
         except Exception:
             pass
         return None
@@ -4204,6 +4235,10 @@ class MapWidget(QWidget):
     def _stop_observation_clip_rec(self, rec: object, out_path: str) -> None:
         try:
             rec.stop()
+        except Exception:
+            pass
+        try:
+            wait_qmedia_recorder_stopped(rec, timeout_s=25.0)
         except Exception:
             pass
         self._set_status(f"Short clip saved: {Path(out_path).name}")
@@ -4572,8 +4607,32 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             try:
-                path = self._capture_photo_quick()
+                sdir = None
+                try:
+                    raw = str(QSettings(_QS_NS, _QS_APP).value(_KEY_MEDIA_LAST_PHOTO_DIR, "") or "").strip()
+                    if raw:
+                        p = Path(raw)
+                        if p.is_dir():
+                            sdir = p
+                except Exception:
+                    sdir = None
+                chosen, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "Save photo",
+                    suggested_photo_save_path(directory=sdir),
+                    "Images (*.jpg *.png)",
+                )
+                if not chosen:
+                    self._run_js("document.title = 'VGCS Map';")
+                    return
+                path = self._capture_photo_quick(chosen)
                 if path:
+                    try:
+                        QSettings(_QS_NS, _QS_APP).setValue(
+                            _KEY_MEDIA_LAST_PHOTO_DIR, str(Path(path).parent)
+                        )
+                    except Exception:
+                        pass
                     name = Path(path).name
                     print(f"[VGCS:cam_rail] PHOTO saved -> {path}")
                     self._set_status(f"Photo saved: {name}")
@@ -4625,7 +4684,7 @@ class MapWidget(QWidget):
                             save_to, _ = QFileDialog.getSaveFileName(
                                 self,
                                 "Save recording",
-                                str(Path.cwd() / "recording.mp4"),
+                                suggested_recording_save_path(),
                                 "Video (*.mp4 *.mov *.mkv)",
                             )
                             if save_to:
@@ -4660,6 +4719,10 @@ class MapWidget(QWidget):
                         rec.stop()
                     except Exception:
                         pass
+                    try:
+                        wait_qmedia_recorder_stopped(rec, timeout_s=25.0)
+                    except Exception:
+                        pass
                     self._video_recording = False
                     self._stop_native_cam_recording_tick_timer()
                     tmp_path = str(getattr(self, "_video_recording_tmp_path", "") or "")
@@ -4668,7 +4731,7 @@ class MapWidget(QWidget):
                         save_to, _ = QFileDialog.getSaveFileName(
                             self,
                             "Save recording",
-                            str(Path.cwd() / "recording.mp4"),
+                            suggested_recording_save_path(),
                             "Video (*.mp4 *.mov *.mkv)",
                         )
                         if save_to:

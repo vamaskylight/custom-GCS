@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QSettings, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -21,7 +21,15 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 
-from vgcs.video.pipeline import HAS_MULTIMEDIA, VideoFrame, VideoPipeline
+from vgcs.video.pipeline import (
+    HAS_MULTIMEDIA,
+    VideoFrame,
+    VideoPipeline,
+    QS_KEY_LAST_PHOTO_SAVE_DIR,
+    suggested_photo_save_path,
+    suggested_recording_save_path,
+    wait_qmedia_recorder_stopped,
+)
 
 
 def _apply_day_night(img: QImage, mode: str) -> QImage:
@@ -231,10 +239,23 @@ class CameraControlPanel(QGroupBox):
         src = self._pipeline.active_source()
         if src is None:
             return
-        filename, _ = QFileDialog.getSaveFileName(self, "Save photo", str(Path.cwd() / "photo.jpg"), "Images (*.jpg *.png)")
+        st = QSettings("VGCS", "VGCS")
+        last = str(st.value(QS_KEY_LAST_PHOTO_SAVE_DIR, "") or "").strip()
+        start_dir = Path(last) if last and Path(last).is_dir() else None
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save photo",
+            suggested_photo_save_path(directory=start_dir),
+            "Images (*.jpg *.png)",
+        )
         if not filename:
             return
         ok = src.take_photo(filename)
+        if ok:
+            try:
+                st.setValue(QS_KEY_LAST_PHOTO_SAVE_DIR, str(Path(filename).parent))
+            except Exception:
+                pass
         if not ok:
             self._status.setText("Photo capture unsupported on this backend")
 
@@ -272,13 +293,17 @@ class CameraControlPanel(QGroupBox):
         else:
             try:
                 rec.stop()
+                try:
+                    wait_qmedia_recorder_stopped(rec, timeout_s=25.0)
+                except Exception:
+                    pass
                 tmp_path = str(self._record_tmp_path or "")
                 self._record_tmp_path = None
                 if tmp_path:
                     filename, _ = QFileDialog.getSaveFileName(
                         self,
                         "Save recording",
-                        str(Path.cwd() / "recording.mp4"),
+                        suggested_recording_save_path(),
                         "Video (*.mp4 *.mov *.mkv)",
                     )
                     if filename:
