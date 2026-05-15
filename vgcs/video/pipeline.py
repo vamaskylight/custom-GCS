@@ -16,7 +16,10 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi9"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi10"
+
+# Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
+_SIYI_HWACCEL_UNAVAILABLE = False
 
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
@@ -330,11 +333,19 @@ def _rtsp_url_is_loopback(url: str) -> bool:
 
 
 def _siyi_hwaccel_enabled(url: str) -> bool:
-    """Windows D3D11VA/QSV often decodes SIYI HEVC without POC/RPS spam (set VGCS_SIYI_HWACCEL=0 to disable)."""
+    """Off by default — software decode matches VLC on SIYI ZR10; set VGCS_SIYI_HWACCEL=1 to try GPU."""
+    global _SIYI_HWACCEL_UNAVAILABLE
     if not _rtsp_url_is_siyi_style(url):
         return False
-    raw = str(os.environ.get("VGCS_SIYI_HWACCEL", "1") or "1").strip().lower()
-    return raw not in ("0", "off", "false", "no")
+    if _SIYI_HWACCEL_UNAVAILABLE:
+        return False
+    raw = str(os.environ.get("VGCS_SIYI_HWACCEL", "0") or "0").strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
+def _siyi_mark_hwaccel_unavailable() -> None:
+    global _SIYI_HWACCEL_UNAVAILABLE
+    _SIYI_HWACCEL_UNAVAILABLE = True
 
 
 def _ffmpeg_preflags_before_input(
@@ -1575,15 +1586,18 @@ class RtspSource(QObject):
                                             reconnect_delay = max(reconnect_delay, 3.0)
                                         elif siyi_hw and (
                                             b"hwaccel" in tl
+                                            or b"hwdownload" in tl
+                                            or b"impossible to convert" in tl
                                             or b"invalid data" in tl
                                             or b"d3d11" in tl
                                             or b"dxva" in tl
                                             or b"no device" in tl
                                         ):
                                             siyi_hw = False
+                                            _siyi_mark_hwaccel_unavailable()
                                             print(
                                                 "[VGCS:video] SIYI: hwaccel failed, "
-                                                "retrying software decode (no -ec flags)"
+                                                "using software decode (VLC-style)"
                                             )
                                         elif (
                                             b"could not find ref" in tl
@@ -1591,11 +1605,7 @@ class RtspSource(QObject):
                                             or b"-138" in tl
                                             or b"error number -138" in tl
                                         ):
-                                            if siyi_hw:
-                                                siyi_hw = False
-                                                print(
-                                                    "[VGCS:video] SIYI: retrying software decode"
-                                                )
+                                            siyi_hw = False
                                             reconnect_delay = max(reconnect_delay, 5.0)
                                     if b"404" in tail or b"Not Found" in tail:
                                         url_fatal = True
@@ -1650,14 +1660,16 @@ class RtspSource(QObject):
                             cooldown = reconnect_delay
                             try:
                                 if _rtsp_url_is_siyi_style(url):
+                                    tl = tail_b.lower()
                                     if (
-                                        b"-138" in tail_b
-                                        or b"-10054" in tail_b
-                                        or b"Error number -138" in tail_b
-                                        or b"Error number -10054" in tail_b
-                                        or b"hevc" in tail_b.lower()
+                                        b"-138" in tl
+                                        or b"-10054" in tl
+                                        or b"error number -138" in tl
+                                        or b"error number -10054" in tl
+                                        or b"could not find ref" in tl
                                     ):
-                                        cooldown = max(cooldown, 3.5)
+                                        cooldown = max(cooldown, 4.0)
+                                        siyi_hw = False
                             except Exception:
                                 pass
                             time.sleep(cooldown)
