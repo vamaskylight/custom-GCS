@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi12"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi13"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -293,6 +293,13 @@ def _rtsp_socket_timeout_us(url: str) -> int:
     if _rtsp_url_is_companion_link_subnet(url):
         return 8_000_000
     return 5_000_000
+
+
+def _frozen_duplicate_kill_enabled(url: str) -> bool:
+    """SIYI HEVC often repeats identical buffers while healthy — do not kill the session."""
+    if _rtsp_url_is_siyi_style(url):
+        return str(os.environ.get("VGCS_SIYI_FROZEN_RECONNECT", "0") or "0").strip() == "1"
+    return True
 
 
 def _stall_watchdog_enabled(url: str) -> bool:
@@ -1489,11 +1496,8 @@ class RtspSource(QObject):
                                 if raw_sig != self._ffmpeg_last_raw_sig:
                                     self._ffmpeg_last_raw_sig = raw_sig
                                     self._ffmpeg_last_raw_change_mono = now_decode
-                                else:
-                                    frozen_s = max(
-                                        stall_reconnect_s * 2.0,
-                                        15.0 if _rtsp_url_is_siyi_style(url) else 6.0,
-                                    )
+                                elif _frozen_duplicate_kill_enabled(url):
+                                    frozen_s = max(stall_reconnect_s * 2.0, 6.0)
                                     if now_decode - self._ffmpeg_last_raw_change_mono >= frozen_s:
                                         if not frozen_logged:
                                             frozen_logged = True
