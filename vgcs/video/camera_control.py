@@ -86,6 +86,7 @@ class MavlinkCameraControl:
 
     def __init__(self, mavlink_thread) -> None:
         self._t = mavlink_thread
+        self._recording = False
 
     def set_zoom(self, level: float) -> None:
         try:
@@ -131,10 +132,21 @@ class MavlinkCameraControl:
             return
 
     def camera_trigger_photo(self) -> None:
-        return
+        try:
+            self._t.queue_camera_trigger_photo()
+        except Exception:
+            return
 
     def camera_toggle_record(self) -> None:
-        return
+        try:
+            if self._recording:
+                self._t.queue_camera_video_stop()
+                self._recording = False
+            else:
+                self._t.queue_camera_video_start()
+                self._recording = True
+        except Exception:
+            return
 
     def get_gimbal_status(self) -> GimbalStatus | None:
         return None

@@ -161,6 +161,19 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("gimbal_nudge", {"pitch": float(pitch_deg), "yaw": float(yaw_deg)}))
 
+    def queue_camera_trigger_photo(self) -> None:
+        """Queue a single still capture on the camera payload (best-effort)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("camera_photo", None))
+
+    def queue_camera_video_start(self) -> None:
+        with self._cmd_lock:
+            self._cmd_queue.append(("camera_video_start", None))
+
+    def queue_camera_video_stop(self) -> None:
+        with self._cmd_lock:
+            self._cmd_queue.append(("camera_video_stop", None))
+
     def stop(self) -> None:
         self._running = False
         if self._master is not None:
@@ -498,6 +511,12 @@ class MavlinkThread(QThread):
             elif cmd == "gimbal_nudge":
                 data = payload if isinstance(payload, dict) else {}
                 self._gimbal_nudge(float(data.get("pitch", 0.0)), float(data.get("yaw", 0.0)))
+            elif cmd == "camera_photo":
+                self._camera_trigger_photo()
+            elif cmd == "camera_video_start":
+                self._camera_video_start()
+            elif cmd == "camera_video_stop":
+                self._camera_video_stop()
         except Exception as e:
             self.error.emit(f"Link command failed ({cmd}): {e}")
 
@@ -577,6 +596,47 @@ class MavlinkThread(QThread):
             self.action_result.emit("camera_focus", True, f"focus_step={int(step):+d}")
         except Exception as e:
             self.action_result.emit("camera_focus", False, str(e))
+
+    def _camera_trigger_photo(self) -> None:
+        if self._master is None:
+            self.action_result.emit("camera_photo", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            m = mavutil.mavlink
+            self._send_command_long(
+                m.MAV_CMD_IMAGE_START_CAPTURE,
+                p1=0.0,
+                p2=1.0,
+                p3=0.0,
+            )
+            self.action_result.emit("camera_photo", True, "image_capture")
+        except Exception as e:
+            self.action_result.emit("camera_photo", False, str(e))
+
+    def _camera_video_start(self) -> None:
+        if self._master is None:
+            self.action_result.emit("camera_video", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            m = mavutil.mavlink
+            self._send_command_long(m.MAV_CMD_VIDEO_START_CAPTURE)
+            self.action_result.emit("camera_video", True, "video_start")
+        except Exception as e:
+            self.action_result.emit("camera_video", False, str(e))
+
+    def _camera_video_stop(self) -> None:
+        if self._master is None:
+            self.action_result.emit("camera_video", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            m = mavutil.mavlink
+            self._send_command_long(m.MAV_CMD_VIDEO_STOP_CAPTURE)
+            self.action_result.emit("camera_video", True, "video_stop")
+        except Exception as e:
+            self.action_result.emit("camera_video", False, str(e))
 
     def _gimbal_nudge(self, pitch_deg: float, yaw_deg: float) -> None:
         if self._master is None:
