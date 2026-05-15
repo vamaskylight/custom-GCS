@@ -225,14 +225,17 @@ def _rtsp_url_is_siyi_style(url: str) -> bool:
 
 
 def _rtsp_should_ffprobe(url: str) -> bool:
-    """Whether to open a short ffprobe session before decode."""
+    """Whether to open a short ffprobe session before decode (opt-in only).
+
+    Auto ffprobe on SIYI URLs was disabled: it opens a second RTSP session and takes
+    several seconds — combined with preview restarts that prevented any frame from arriving.
+    Decode uses a 1280×720 canvas with scale+pad (``_ffmpeg_vf_rgb_fixed_size``).
+    Set ``VGCS_RTSP_FFPROBE=1`` to probe dimensions explicitly.
+    """
     flag = str(os.environ.get("VGCS_RTSP_FFPROBE", "") or "").strip().lower()
     if flag in ("0", "false", "no"):
         return False
-    if flag in ("1", "true", "yes"):
-        return True
-    # SIYI main stream dimensions vary (720p–4K); wrong canvas → choppy then frozen preview.
-    return _rtsp_url_is_siyi_style(url)
+    return flag in ("1", "true", "yes")
 
 
 def _rtsp_socket_timeout_us(url: str) -> int:
@@ -666,6 +669,11 @@ class RtspSource(QObject):
 
     def start(self) -> None:
         if self._running:
+            # Recover after a partial stop (decode thread exited but preview still "on").
+            if self._prefer_ffmpeg_immediately():
+                th = self._ffmpeg_thread
+                if th is None or not th.is_alive():
+                    self._start_ffmpeg()
             return
         if self._prefer_ffmpeg_immediately():
             print(
@@ -912,7 +920,24 @@ class RtspSource(QObject):
             self.error.emit("numpy missing; FFmpeg RTSP fallback unavailable")
             return
         if self._ffmpeg_thread is not None and self._ffmpeg_thread.is_alive():
-            return
+            # Prior stop() may still be in ffprobe/teardown; end it before a new session.
+            try:
+                self._ffmpeg_stop.set()
+            except Exception:
+                pass
+            try:
+                self._close_ffmpeg_decode_proc()
+            except Exception:
+                pass
+            try:
+                self._ffmpeg_thread.join(timeout=3.0)
+            except Exception:
+                pass
+            self._ffmpeg_thread = None
+            try:
+                self._ffmpeg_stop.clear()
+            except Exception:
+                pass
         # Ensure QtMultimedia RTSP session is not still holding the stream.
         # Some RTSP servers reject/limit concurrent sessions per client.
         try:
@@ -1311,24 +1336,28 @@ class RtspSource(QObject):
                                 if raw_sig != self._ffmpeg_last_raw_sig:
                                     self._ffmpeg_last_raw_sig = raw_sig
                                     self._ffmpeg_last_raw_change_mono = now_decode
-                                elif now_decode - self._ffmpeg_last_raw_change_mono >= stall_reconnect_s:
-                                    if not frozen_logged:
-                                        frozen_logged = True
+                                else:
+                                    frozen_s = max(
+                                        stall_reconnect_s * 3.0,
+                                        8.0 if _rtsp_url_is_siyi_style(url) else 6.0,
+                                    )
+                                    if now_decode - self._ffmpeg_last_raw_change_mono >= frozen_s:
+                                        if not frozen_logged:
+                                            frozen_logged = True
+                                            try:
+                                                print(
+                                                    f"[VGCS:video] frozen duplicate frames "
+                                                    f"(>{frozen_s:.1f}s), reconnecting "
+                                                    f"transport={tr_label}"
+                                                )
+                                            except Exception:
+                                                pass
                                         try:
-                                            print(
-                                                f"[VGCS:video] frozen duplicate frames "
-                                                f"(>{stall_reconnect_s:.1f}s), reconnecting "
-                                                f"transport={tr_label}"
-                                            )
+                                            if p.poll() is None:
+                                                p.kill()
                                         except Exception:
                                             pass
-                                    try:
-                                        if p.poll() is None:
-                                            p.kill()
-                                    except Exception:
-                                        pass
-                                    break
-                                # File recording reuses this RGB stream (single RTSP session).
+                                        break
                                 with self._rec_lock:
                                     recp = self._rec_proc
                                     if (
@@ -1342,9 +1371,6 @@ class RtspSource(QObject):
                                             pass
                                         except Exception:
                                             pass
-                                # Drop frames *before* QImage/numpy decode. Previously we built a full QImage
-                                # copy for every FFmpeg output frame then throttled emit — the CPU cost alone
-                                # could starve the GUI thread (QueuedConnection backlog + map MAVLink work).
                                 now = time.monotonic()
                                 if (now - last_emit_mono) < min_emit_dt:
                                     continue
@@ -1364,6 +1390,14 @@ class RtspSource(QObject):
                                     self._ffmpeg_last_frame_mono = last_emit_mono
                                     frames_this_session += 1
                                     frame_count_box[0] = frames_this_session
+                                    if frames_this_session == 1:
+                                        try:
+                                            print(
+                                                f"[VGCS:video] first frame ok "
+                                                f"{w}x{h} transport={tr_label} url={url}"
+                                            )
+                                        except Exception:
+                                            pass
                                     round_ok = True
                                 except Exception as ex:
                                     if not decode_warned:
