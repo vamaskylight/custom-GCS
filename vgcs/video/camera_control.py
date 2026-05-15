@@ -25,6 +25,8 @@ class CameraControl(Protocol):
 
     def handle_zoom_step(self, step: int, ui_level: float) -> None: ...
 
+    def handle_focus_step(self, step: int) -> None: ...
+
     def set_focus(self, level: float) -> None: ...
 
     def set_gimbal(self, cmd: GimbalCommand) -> None: ...
@@ -48,6 +50,10 @@ class NoopCameraControl:
 
     def handle_zoom_step(self, step: int, ui_level: float) -> None:
         del step, ui_level
+        return
+
+    def handle_focus_step(self, step: int) -> None:
+        del step
         return
 
     def set_focus(self, level: float) -> None:
@@ -90,6 +96,12 @@ class MavlinkCameraControl:
         del ui_level
         try:
             self._t.queue_camera_zoom_step(int(step))
+        except Exception:
+            return
+
+    def handle_focus_step(self, step: int) -> None:
+        try:
+            self._t.queue_camera_focus_step(int(step))
         except Exception:
             return
 
@@ -161,6 +173,12 @@ class SkydroidCameraControl:
         del step
         try:
             self._adapter.camera_zoom(float(ui_level))
+        except Exception:
+            return
+
+    def handle_focus_step(self, step: int) -> None:
+        try:
+            self._adapter.camera_focus_step(int(step))
         except Exception:
             return
 

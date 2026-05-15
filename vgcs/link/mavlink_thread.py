@@ -147,9 +147,14 @@ class MavlinkThread(QThread):
             self._cmd_queue.append(("camera_zoom_step", -1 if int(direction) < 0 else 1))
 
     def queue_camera_focus(self, level: float) -> None:
-        """Queue camera focus control (best-effort)."""
+        """Queue absolute focus as proportion of range (best-effort; see FOCUS_TYPE_RANGE)."""
         with self._cmd_lock:
             self._cmd_queue.append(("camera_focus", float(level)))
+
+    def queue_camera_focus_step(self, direction: int) -> None:
+        """Discrete focus step for rail +/-: -1 = near, +1 = toward infinity (MAVLink FOCUS_TYPE_STEP)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("camera_focus_step", -1 if int(direction) < 0 else 1))
 
     def queue_gimbal_nudge(self, *, pitch_deg: float = 0.0, yaw_deg: float = 0.0) -> None:
         """Queue a small gimbal nudge (best-effort)."""
@@ -488,6 +493,8 @@ class MavlinkThread(QThread):
                 self._camera_zoom_step(int(payload or 0))
             elif cmd == "camera_focus":
                 self._camera_focus(float(payload or 0.0))
+            elif cmd == "camera_focus_step":
+                self._camera_focus_step(int(payload or 0))
             elif cmd == "gimbal_nudge":
                 data = payload if isinstance(payload, dict) else {}
                 self._gimbal_nudge(float(data.get("pitch", 0.0)), float(data.get("yaw", 0.0)))
@@ -535,18 +542,39 @@ class MavlinkThread(QThread):
             self.action_result.emit("camera_zoom", False, str(e))
 
     def _camera_focus(self, level: float) -> None:
+        """Absolute UI focus level (e.g. -5..5) mapped to FOCUS_TYPE_RANGE 0..100%."""
         if self._master is None:
             self.action_result.emit("camera_focus", False, "Link not ready")
             return
         self._sync_link_targets()
-        # MAV_CMD_SET_CAMERA_FOCUS: param1=focus type, param2=value
         try:
+            m = mavutil.mavlink
+            lvl = max(-5.0, min(5.0, float(level)))
+            pct = (lvl + 5.0) / 10.0 * 100.0
             self._send_command_long(
-                mavutil.mavlink.MAV_CMD_SET_CAMERA_FOCUS,
-                p1=1.0,
-                p2=float(level),
+                m.MAV_CMD_SET_CAMERA_FOCUS,
+                p1=float(m.FOCUS_TYPE_RANGE),
+                p2=float(pct),
             )
-            self.action_result.emit("camera_focus", True, f"focus={level:.2f}")
+            self.action_result.emit("camera_focus", True, f"focus_range={pct:.1f}%")
+        except Exception as e:
+            self.action_result.emit("camera_focus", False, str(e))
+
+    def _camera_focus_step(self, direction: int) -> None:
+        """One discrete focus step (rail +/-): -1 near, +1 toward infinity (MAVLink FOCUS_TYPE_STEP)."""
+        if self._master is None:
+            self.action_result.emit("camera_focus", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            m = mavutil.mavlink
+            step = -1.0 if int(direction) < 0 else 1.0
+            self._send_command_long(
+                m.MAV_CMD_SET_CAMERA_FOCUS,
+                p1=float(m.FOCUS_TYPE_STEP),
+                p2=step,
+            )
+            self.action_result.emit("camera_focus", True, f"focus_step={int(step):+d}")
         except Exception as e:
             self.action_result.emit("camera_focus", False, str(e))
 

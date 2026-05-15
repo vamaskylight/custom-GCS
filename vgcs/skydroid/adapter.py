@@ -79,6 +79,10 @@ class SkydroidTopUdpAdapter:
     def camera_zoom(self, level: float) -> None:
         self._enqueue(self._profile.camera_commands.get("zoom", []), {"level": float(level)}, True)
 
+    def camera_focus_step(self, direction: int) -> None:
+        key = "focus_in" if int(direction) < 0 else "focus_out"
+        self._enqueue(self._profile.camera_commands.get(key, []), {}, True)
+
     def get_status(self) -> GimbalStatus:
         with self._status_lock:
             return self._status

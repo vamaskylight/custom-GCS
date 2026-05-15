@@ -33,6 +33,8 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
             "record_toggle": ["CAM_REC", "CAM_RECORD"],
             "photo": ["CAM_SNAP", "CAM_PHOTO"],
             "zoom": ["CAM_ZOOM", "CAM_Z"],
+            "focus_in": ["CAM_FOCUS_NEAR", "CAM_FN", "FOCUS_NEAR"],
+            "focus_out": ["CAM_FOCUS_FAR", "CAM_FF", "FOCUS_FAR"],
         },
     ),
     "c13_alt": SkydroidCommandProfile(
@@ -53,6 +55,8 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
             "record_toggle": ["CAM_RECORD", "CAM_REC"],
             "photo": ["CAM_PHOTO", "CAM_SNAP"],
             "zoom": ["CAM_Z", "CAM_ZOOM"],
+            "focus_in": ["CAM_FOCUS_NEAR", "CAM_FN", "FOCUS_NEAR"],
+            "focus_out": ["CAM_FOCUS_FAR", "CAM_FF", "FOCUS_FAR"],
         },
     ),
 }

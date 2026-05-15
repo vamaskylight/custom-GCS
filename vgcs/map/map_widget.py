@@ -277,6 +277,12 @@ QPushButton#camSplitBtn:checked, QPushButton#camFollowBtn:checked {
   background-color: rgba(24, 52, 34, 250);
   color: #c8ffc8;
 }
+/* Split is logically on but main canvas is a single zoomed channel (not the 2×2 composite): neutral chrome. */
+QPushButton#camSplitBtn:checked[splitHidden="true"] {
+  border: 1px solid rgba(196, 209, 230, 55);
+  background-color: rgba(22, 27, 38, 235);
+  color: #e8edf8;
+}
 QPushButton#camRecordBtn {
   width: 34px;
   height: 34px;
@@ -1762,6 +1768,11 @@ class MapWidget(QWidget):
             self._layout_native_hud()
         except Exception:
             return
+        finally:
+            try:
+                self._sync_native_camera_rail_toggles()
+            except Exception:
+                pass
 
     def _stack_native_overlays_above_tile_map(self) -> None:
         """
@@ -4454,13 +4465,30 @@ class MapWidget(QWidget):
         self._sync_native_camera_rail_toggles()
 
     def _sync_native_camera_rail_toggles(self) -> None:
-        """Keep Split / Follow checkboxes aligned with `_video_split_enabled` / `_video_follow_enabled`."""
+        """Keep Split / Follow aligned with pipeline flags; Split green when 4-up is meaningful (not single-channel fullscreen)."""
         try:
             if hasattr(self, "_btn_native_split"):
                 en = bool(getattr(self, "_video_split_enabled", False))
                 self._btn_native_split.blockSignals(True)
                 self._btn_native_split.setChecked(en)
+                # Green split highlight: on whenever split mode is on, except when the main canvas
+                # is full-bleed video showing a single zoomed channel (PiP 4-up and full 2×2 composite
+                # both keep the highlight; map-main + corner split does too).
+                hide_split_chrome = en and bool(getattr(self, "_video_swapped", False)) and bool(
+                    getattr(self, "_split_fullscreen_source_id", None)
+                )
+                try:
+                    self._btn_native_split.setProperty("splitHidden", hide_split_chrome)
+                except Exception:
+                    pass
                 self._btn_native_split.blockSignals(False)
+                try:
+                    st = self._btn_native_split.style()
+                    if st is not None:
+                        st.unpolish(self._btn_native_split)
+                        st.polish(self._btn_native_split)
+                except Exception:
+                    pass
             if hasattr(self, "_btn_native_follow"):
                 fen = bool(getattr(self, "_video_follow_enabled", False))
                 self._btn_native_follow.blockSignals(True)
@@ -4783,7 +4811,7 @@ class MapWidget(QWidget):
             cur = max(-5.0, min(5.0, cur))
             self._video_focus = cur
             try:
-                self._camera_control.set_focus(float(cur))
+                self._camera_control.handle_focus_step(int(step))
             except Exception:
                 pass
             self._run_js("document.title = 'VGCS Map';")
