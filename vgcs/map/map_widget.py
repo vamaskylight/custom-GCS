@@ -704,6 +704,8 @@ class MapWidget(QWidget):
         self._video_settings_rtsp_transport = "auto"
         self._video_settings_default_view = "Single"
         self._native_video_last_frame_mono = 0.0
+        self._video_preview_got_frame = False
+        self._video_preview_started_mono = 0.0
         self._video_preview_stall_recovery_active = False
         self._camera_control = NoopCameraControl()
         self._obs_mark_mode = False
@@ -3711,19 +3713,26 @@ class MapWidget(QWidget):
                     pass
 
     def _on_video_preview_stall_check(self) -> None:
-        """Restart decode if the native preview has not updated (SIYI ZR10 frozen-frame case)."""
+        """Optional last-resort restart — off by default (was killing SIYI decode during startup)."""
+        if str(os.environ.get("VGCS_VIDEO_GUI_STALL", "") or "").strip() != "1":
+            return
         if not bool(getattr(self, "_video_preview_enabled", False)):
             return
         if bool(getattr(self, "_video_preview_stall_recovery_active", False)):
+            return
+        started = float(getattr(self, "_video_preview_started_mono", 0.0) or 0.0)
+        if started > 0.0 and time.monotonic() - started < 25.0:
+            return
+        if not bool(getattr(self, "_video_preview_got_frame", False)):
             return
         last = float(getattr(self, "_native_video_last_frame_mono", 0.0) or 0.0)
         if last <= 0.0:
             return
         try:
-            stall_s = float(str(os.environ.get("VGCS_VIDEO_GUI_STALL_S", "4.0") or "4.0").strip())
+            stall_s = float(str(os.environ.get("VGCS_VIDEO_GUI_STALL_S", "12.0") or "12.0").strip())
         except ValueError:
-            stall_s = 4.0
-        stall_s = max(2.5, min(15.0, stall_s))
+            stall_s = 12.0
+        stall_s = max(8.0, min(30.0, stall_s))
         if time.monotonic() - last < stall_s:
             return
         vp = getattr(self, "_video", None)
@@ -3750,12 +3759,12 @@ class MapWidget(QWidget):
 
         def _restart() -> None:
             try:
+                self._video_preview_started_mono = time.monotonic()
                 self._start_video_decode_sources(vp)
             finally:
                 self._video_preview_stall_recovery_active = False
-                self._native_video_last_frame_mono = time.monotonic()
 
-        QTimer.singleShot(350, _restart)
+        QTimer.singleShot(500, _restart)
 
     def _start_video_preview(self, *, reset_swapped: bool = True) -> None:
         if not getattr(self, "_web_ready", False):
@@ -3790,9 +3799,12 @@ class MapWidget(QWidget):
             if vp is not None:
                 self._start_video_decode_sources(vp)
                 try:
+                    self._video_preview_got_frame = False
+                    self._video_preview_started_mono = time.monotonic()
                     t_stall = getattr(self, "_video_preview_stall_timer", None)
-                    if t_stall is not None:
-                        self._native_video_last_frame_mono = time.monotonic()
+                    if t_stall is not None and str(
+                        os.environ.get("VGCS_VIDEO_GUI_STALL", "") or ""
+                    ).strip() == "1":
                         t_stall.start()
                 except Exception:
                     pass
@@ -3891,6 +3903,7 @@ class MapWidget(QWidget):
         if not bool(getattr(self, "_video_preview_enabled", False)):
             return
         self._native_video_last_frame_mono = time.monotonic()
+        self._video_preview_got_frame = True
         try:
             img = vf.image
         except RuntimeError:
