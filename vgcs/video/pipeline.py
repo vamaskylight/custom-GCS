@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi5"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi6"
 
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
@@ -700,7 +700,7 @@ class RtspSource(QObject):
             return False
         if not HAS_NUMPY:
             return False
-        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        if shutil.which("ffmpeg") is None:
             return False
         u = (self._url or "").strip().lower()
         if u.startswith("udp://") or u.startswith("tcp://"):
@@ -989,9 +989,16 @@ class RtspSource(QObject):
         if not url:
             self.error.emit("Stream URL is empty")
             return
-        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-            self.error.emit("ffmpeg/ffprobe not found in PATH (required for network video decode)")
+        if shutil.which("ffmpeg") is None:
+            self.error.emit("ffmpeg not found in PATH (required for network video decode)")
             return
+        if shutil.which("ffprobe") is None:
+            try:
+                print(
+                    "[VGCS:video] ffprobe not in PATH — using default 1280x720 decode canvas"
+                )
+            except Exception:
+                pass
         self._ffmpeg_stop.clear()
         self._ffmpeg_thread = threading.Thread(target=self._ffmpeg_loop, daemon=True)
         self._ffmpeg_thread.start()
@@ -1830,6 +1837,14 @@ class VideoPipeline(QObject):
         self._low_latency = ll
         self._stream_kind = sk
         if unchanged:
+            if self._sources:
+                def _notify() -> None:
+                    try:
+                        self.sources_changed.emit()
+                    except Exception:
+                        pass
+
+                QTimer.singleShot(0, _notify)
             return
         # Reset active source if it no longer exists.
         if self._active_source_id and self._active_source_id not in self._sources:
