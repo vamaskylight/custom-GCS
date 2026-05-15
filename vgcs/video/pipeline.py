@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi6"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi7"
 
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
@@ -283,10 +283,10 @@ def _rtsp_socket_timeout_us(url: str) -> int:
             pass
     if _url_scheme(str(url or "").strip()) != "rtsp":
         return 0
-    # SIYI ZR10: do not pass demuxer -timeout — 4s caused Windows error -138 on reconnect
-    # while the camera was still releasing the prior TCP session.
+    # SIYI ZR10: use a longer timeout than the old 4s default (-138 on quick reconnect).
+    # Zero timeout lets FFmpeg block forever when the laptop is not on 192.168.144.x yet.
     if _rtsp_url_is_siyi_style(url):
-        return 0
+        return 10_000_000
     if _rtsp_url_is_companion_link_subnet(url):
         return 8_000_000
     return 5_000_000
@@ -707,6 +707,25 @@ class RtspSource(QObject):
             return True
         return u.startswith("rtsp://")
 
+    def restart_decode(self, *, delay_ms: int = 450) -> None:
+        """Stop FFmpeg and open a fresh RTSP session (companion link-up / settings Apply)."""
+        try:
+            print(f"[VGCS:video] restart_decode scheduled url={self._url}")
+        except Exception:
+            pass
+        self.stop()
+        ms = max(100, int(delay_ms))
+        QTimer.singleShot(ms, self._deferred_start_after_restart)
+
+    @Slot()
+    def _deferred_start_after_restart(self) -> None:
+        if self._ffmpeg_stop.is_set():
+            try:
+                self._ffmpeg_stop.clear()
+            except Exception:
+                pass
+        self.start()
+
     def start(self) -> None:
         if self._running:
             # Recover after a partial stop (decode thread exited but preview still "on").
@@ -714,6 +733,10 @@ class RtspSource(QObject):
                 th = self._ffmpeg_thread
                 if th is None or not th.is_alive():
                     self._start_ffmpeg()
+                elif _rtsp_url_is_companion_link_subnet(self._url):
+                    last = float(self._ffmpeg_last_frame_mono or 0.0)
+                    if last <= 0.0 or (time.monotonic() - last) > 12.0:
+                        self.restart_decode()
             return
         if self._prefer_ffmpeg_immediately():
             print(
