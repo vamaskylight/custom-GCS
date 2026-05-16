@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi14"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi15"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -742,6 +742,22 @@ class RtspSource(QObject):
         if u.startswith("udp://") or u.startswith("tcp://"):
             return True
         return u.startswith("rtsp://")
+
+    def decode_recently_active(self, max_age_s: float = 10.0) -> bool:
+        """True when FFmpeg is running and produced frames recently (or still connecting)."""
+        if not self._running:
+            return False
+        thr = max(1.0, float(max_age_s))
+        now = time.monotonic()
+        last = float(self._ffmpeg_last_decode_mono or self._ffmpeg_last_frame_mono or 0.0)
+        if last > 0.0 and (now - last) < thr:
+            return True
+        th = self._ffmpeg_thread
+        if th is not None and th.is_alive() and not bool(self._ffmpeg_had_frame):
+            sess = float(self._ffmpeg_session_started_mono or 0.0)
+            if sess > 0.0 and (now - sess) < min(30.0, thr + 15.0):
+                return True
+        return False
 
     def restart_decode(self, *, delay_ms: int = 0) -> None:
         """Stop FFmpeg and open a fresh RTSP session (companion link-up / settings Apply)."""
