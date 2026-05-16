@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi15"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi16"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -185,8 +185,11 @@ def _rtsp_transport_sequence(url: str, mode: str) -> tuple[str | None, ...]:
     if m == "tcp":
         return ("tcp", "udp")
     if m == "auto" and _rtsp_url_is_siyi_style(raw):
-        # ZR10: TCP-only — flipping to UDP after a long TCP session often fails to reconnect.
-        return ("tcp",)
+        # ZR10: TCP first (VLC default on 192.168.144.x), then UDP if TCP never connects.
+        # TCP-only caused permanent -138 when the camera only accepted UDP RTP.
+        if str(os.environ.get("VGCS_SIYI_RTSP_TCP_ONLY", "0") or "0").strip() == "1":
+            return ("tcp",)
+        return ("tcp", "udp")
     return _rtsp_transport_order_auto(raw)
 
 
@@ -767,7 +770,7 @@ class RtspSource(QObject):
         self._restart_decode_last_mono = now
         u = str(self._url or "").strip()
         if delay_ms <= 0:
-            delay_ms = 1200 if _rtsp_url_is_companion_link_subnet(u) else 450
+            delay_ms = 2800 if _rtsp_url_is_companion_link_subnet(u) else 450
         try:
             print(f"[VGCS:video] restart_decode scheduled ({delay_ms}ms) url={u}")
         except Exception:
@@ -778,12 +781,46 @@ class RtspSource(QObject):
                 t.stop()
         except Exception:
             pass
-        self.stop()
         ms = max(200, int(delay_ms))
         self._restart_decode_timer = QTimer(self)
         self._restart_decode_timer.setSingleShot(True)
-        self._restart_decode_timer.timeout.connect(self._deferred_start_after_restart)
+        if _rtsp_url_is_companion_link_subnet(u):
+            # Soft restart: keep preview "running", join old FFmpeg before a new RTSP open
+            # (ZR10 allows one client — overlapping connect → Error -138).
+            self._restart_decode_timer.timeout.connect(self._deferred_companion_ffmpeg_restart)
+        else:
+            self.stop()
+            self._restart_decode_timer.timeout.connect(self._deferred_start_after_restart)
         self._restart_decode_timer.start(ms)
+
+    @Slot()
+    def _deferred_companion_ffmpeg_restart(self) -> None:
+        """Companion/SIYI: restart FFmpeg without stop()/start() tearing down preview state."""
+        try:
+            self._ffmpeg_stop.set()
+        except Exception:
+            pass
+        try:
+            self._close_ffmpeg_decode_proc()
+        except Exception:
+            pass
+        th = self._ffmpeg_thread
+        if th is not None and th.is_alive():
+            try:
+                th.join(timeout=12.0)
+            except Exception:
+                pass
+        self._ffmpeg_thread = None
+        try:
+            self._ffmpeg_stop.clear()
+        except Exception:
+            pass
+        if not self._running:
+            self._running = True
+        if self._prefer_ffmpeg_immediately():
+            self._start_ffmpeg()
+        else:
+            self.start()
 
     @Slot()
     def _deferred_start_after_restart(self) -> None:
@@ -1648,7 +1685,19 @@ class RtspSource(QObject):
                                             or b"error number -138" in tl
                                         ):
                                             siyi_hw = False
-                                            reconnect_delay = max(reconnect_delay, 5.0)
+                                            reconnect_delay = max(
+                                                reconnect_delay,
+                                                10.0 + min(8.0, float(empty_sessions) * 2.0),
+                                            )
+                                            if empty_sessions >= 3 and empty_sessions % 3 == 0:
+                                                try:
+                                                    print(
+                                                        "[VGCS:video] SIYI RTSP connect timeout (-138): "
+                                                        "close VLC/other viewers on this camera, confirm "
+                                                        "192.168.144.25 is reachable; will try UDP if TCP fails"
+                                                    )
+                                                except Exception:
+                                                    pass
                                     if b"404" in tail or b"Not Found" in tail:
                                         url_fatal = True
                                         msg = (

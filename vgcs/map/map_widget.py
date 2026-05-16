@@ -2530,7 +2530,7 @@ class MapWidget(QWidget):
         if self._video_preview_should_run():
             QTimer.singleShot(
                 800,
-                lambda: self._request_companion_video_restart(reason="mavlink_link"),
+                lambda: self._companion_start_decode_if_needed(reason="mavlink_link"),
             )
 
     def _uses_companion_rtsp(self) -> bool:
@@ -2588,6 +2588,8 @@ class MapWidget(QWidget):
 
     def _companion_start_decode_if_needed(self, *, reason: str = "") -> None:
         """Start RTSP decode once; never tear down a session that is already connecting."""
+        if not self._video_preview_should_run():
+            return
         if self._should_defer_companion_rtsp_decode():
             return
         if not self._companion_wire_preview_ui():
@@ -2599,20 +2601,10 @@ class MapWidget(QWidget):
             try:
                 print(
                     f"[VGCS:video] decode already active ({reason}), "
-                    "skipping restart (Apply must not kill ZR10 RTSP)"
+                    "skipping restart (ZR10 allows one RTSP client)"
                 )
             except Exception:
                 pass
-            return
-        self._request_companion_video_restart(reason=reason)
-
-    def _request_companion_video_restart(self, *, reason: str = "") -> None:
-        """One debounced RTSP reconnect (avoids -10054 from overlapping SIYI sessions)."""
-        if not self._video_preview_should_run():
-            return
-        if self._should_defer_companion_rtsp_decode():
-            return
-        if not self._companion_wire_preview_ui():
             return
         now = time.monotonic()
         last = float(getattr(self, "_companion_video_restart_mono", 0.0) or 0.0)
@@ -2620,10 +2612,14 @@ class MapWidget(QWidget):
             return
         self._companion_video_restart_mono = now
         try:
-            print(f"[VGCS:video] companion video restart ({reason})")
+            print(f"[VGCS:video] companion decode start ({reason})")
         except Exception:
             pass
-        self._restart_video_preview_after_settings(force_decode=True)
+        self._restart_video_preview_after_settings(force_decode=False)
+
+    def _request_companion_video_restart(self, *, reason: str = "") -> None:
+        """Alias: start decode if needed (no forced restart_decode)."""
+        self._companion_start_decode_if_needed(reason=reason)
 
     def _probe_current_tiles(self, *, reason: str) -> None:
         # Probe the *current* view tile (not just z=0), because placeholders often occur only at higher zooms.
@@ -3753,7 +3749,7 @@ class MapWidget(QWidget):
         try:
             if vp.sources():
                 if bool(getattr(self, "_last_link_connected", False)):
-                    self._request_companion_video_restart(reason="schedule")
+                    self._companion_start_decode_if_needed(reason="schedule")
                 else:
                     self._restart_video_preview_after_settings(force_decode=False)
                 return
@@ -3823,8 +3819,8 @@ class MapWidget(QWidget):
         try:
             if bool(getattr(self, "_web_ready", False)) and self._video_preview_should_run():
                 QTimer.singleShot(
-                    200,
-                    lambda: self._request_companion_video_restart(reason="camera_control"),
+                    400,
+                    lambda: self._companion_start_decode_if_needed(reason="camera_control"),
                 )
         except Exception:
             pass
