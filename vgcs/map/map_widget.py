@@ -3895,11 +3895,11 @@ class MapWidget(QWidget):
             return False
         if raw == "1":
             return True
-        # SIYI companion: on by default (HEVC sessions drop every ~10–20 s without GUI recovery).
-        return bool(self._uses_companion_rtsp())
+        # SIYI companion: off by default — killing a live FFmpeg session causes RTSP -138 freezes.
+        return False
 
     def _on_video_preview_stall_check(self) -> None:
-        """Restart decode when preview paint stalls (SIYI on by default)."""
+        """Restart decode when preview paint stalls (opt-in via VGCS_VIDEO_GUI_STALL=1)."""
         if not self._video_gui_stall_recovery_enabled():
             return
         if not bool(getattr(self, "_video_preview_enabled", False)):
@@ -3922,13 +3922,13 @@ class MapWidget(QWidget):
         last = float(getattr(self, "_native_video_last_frame_mono", 0.0) or 0.0)
         if last <= 0.0:
             return
-        default_stall = "8.0" if self._uses_companion_rtsp() else "12.0"
+        default_stall = "20.0" if self._uses_companion_rtsp() else "12.0"
         try:
             stall_s = float(
                 str(os.environ.get("VGCS_VIDEO_GUI_STALL_S", default_stall) or default_stall).strip()
             )
         except ValueError:
-            stall_s = 8.0 if self._uses_companion_rtsp() else 12.0
+            stall_s = 20.0 if self._uses_companion_rtsp() else 12.0
         stall_s = max(6.0, min(30.0, stall_s))
         if time.monotonic() - last < stall_s:
             return
@@ -3938,6 +3938,26 @@ class MapWidget(QWidget):
         want_ids = self._video_preview_source_ids_to_run(vp)
         if not want_ids:
             return
+        # Do not tear down RTSP when FFmpeg is still decoding (GUI paint can lag HEVC gaps).
+        decode_grace = stall_s + 6.0
+        for sid in want_ids:
+            try:
+                src = vp.sources().get(sid)
+                if src is not None and hasattr(src, "decode_recently_active"):
+                    if src.decode_recently_active(decode_grace):
+                        if not bool(getattr(self, "_video_gui_stall_skip_logged", False)):
+                            self._video_gui_stall_skip_logged = True
+                            try:
+                                print(
+                                    "[VGCS:video] GUI stall recovery skipped: "
+                                    f"FFmpeg decode active (within {decode_grace:.0f}s)"
+                                )
+                            except Exception:
+                                pass
+                        return
+            except Exception:
+                pass
+        self._video_gui_stall_skip_logged = False
         self._video_preview_stall_recovery_active = True
         try:
             print(
