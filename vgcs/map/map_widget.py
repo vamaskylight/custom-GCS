@@ -2543,22 +2543,80 @@ class MapWidget(QWidget):
             return False
         return not bool(getattr(self, "_last_link_connected", False))
 
+    def _companion_decode_running(self, vp) -> bool:
+        try:
+            for sid in self._video_preview_source_ids_to_run(vp):
+                src = vp.sources().get(sid)
+                if src is None:
+                    continue
+                if not getattr(src, "_running", False):
+                    continue
+                th = getattr(src, "_ffmpeg_thread", None)
+                if th is not None and th.is_alive():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _companion_wire_preview_ui(self) -> bool:
+        """Connect frame slots and show the native video overlay (no FFmpeg stop/start)."""
+        if not self._video_preview_should_run():
+            return False
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is None:
+            return False
+        try:
+            if not vp.sources():
+                return False
+        except Exception:
+            return False
+        setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
+        if not self._ensure_video_preview_backend(from_start=True):
+            return False
+        try:
+            self._video_preview_enabled = True
+            self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
+            self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
+            if self._uses_companion_rtsp() and not self._plan_flight_layer_obscures_native_camera_ui():
+                self._video_swapped = True
+                self._native_video_preview.show()
+                self._layout_native_video_preview()
+                self._stack_native_overlays_above_tile_map()
+        except Exception:
+            pass
+        return True
+
+    def _companion_start_decode_if_needed(self, *, reason: str = "") -> None:
+        """Start RTSP decode once; never tear down a session that is already connecting."""
+        if self._should_defer_companion_rtsp_decode():
+            return
+        if not self._companion_wire_preview_ui():
+            return
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is None:
+            return
+        if self._companion_decode_running(vp):
+            try:
+                print(
+                    f"[VGCS:video] decode already active ({reason}), "
+                    "skipping restart (Apply must not kill ZR10 RTSP)"
+                )
+            except Exception:
+                pass
+            return
+        self._request_companion_video_restart(reason=reason)
+
     def _request_companion_video_restart(self, *, reason: str = "") -> None:
         """One debounced RTSP reconnect (avoids -10054 from overlapping SIYI sessions)."""
         if not self._video_preview_should_run():
             return
         if self._should_defer_companion_rtsp_decode():
             return
-        setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
-        if not self._ensure_video_preview_backend(from_start=True):
+        if not self._companion_wire_preview_ui():
             return
-        try:
-            self._video_preview_enabled = True
-        except Exception:
-            pass
         now = time.monotonic()
         last = float(getattr(self, "_companion_video_restart_mono", 0.0) or 0.0)
-        if now - last < 4.5:
+        if now - last < 8.0:
             return
         self._companion_video_restart_mono = now
         try:
@@ -3284,7 +3342,7 @@ class MapWidget(QWidget):
             pass
         if self._should_defer_companion_rtsp_decode():
             return
-        self._request_companion_video_restart(reason="sources_changed")
+        self._companion_start_decode_if_needed(reason="sources_changed")
 
     def _ensure_video_preview_backend(self, *, from_start: bool = False) -> bool:
         if not HAS_MULTIMEDIA:
@@ -3602,8 +3660,6 @@ class MapWidget(QWidget):
                 self._configure_video_pipeline(vp)
             except Exception:
                 pass
-            self._video_inited = False
-            self._shared_vp_hooks_connected = False
             try:
                 self._video_split_enabled = (
                     str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
@@ -3612,12 +3668,9 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             self._sync_native_camera_rail_toggles()
-            # Start (or restart) preview whenever streaming is enabled and the toolbar wants it —
-            # not only when preview was already running. First-time enable after Apply used to skip
-            # `_restart_video_preview_after_settings` because `was_preview_on` stayed False.
             QTimer.singleShot(
                 200,
-                lambda: self._request_companion_video_restart(reason="settings_apply"),
+                lambda: self._companion_start_decode_if_needed(reason="settings_apply"),
             )
 
         def phase_stop_preview() -> None:

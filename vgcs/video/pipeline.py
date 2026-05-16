@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi13"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi14"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -286,10 +286,9 @@ def _rtsp_socket_timeout_us(url: str) -> int:
             pass
     if _url_scheme(str(url or "").strip()) != "rtsp":
         return 0
-    # SIYI ZR10: no demuxer -timeout (VLC default). Short timeouts caused -138 while the
-    # camera was still releasing the previous TCP session.
+    # SIYI ZR10: 15s connect/read cap — logs -138 instead of hanging with no "first frame ok".
     if _rtsp_url_is_siyi_style(url):
-        return 0
+        return 15_000_000
     if _rtsp_url_is_companion_link_subnet(url):
         return 8_000_000
     return 5_000_000
@@ -1468,6 +1467,8 @@ class RtspSource(QObject):
                         frames_this_session = 0
                         frame_count_box = [0]
                         decode_warned = False
+                        waiting_logged = False
+                        session_t0 = time.monotonic()
                         frozen_logged = False
                         self._ffmpeg_last_raw_sig = None
                         self._ffmpeg_last_raw_change_mono = time.monotonic()
@@ -1482,6 +1483,19 @@ class RtspSource(QObject):
                             )
                         try:
                             while self._running and not self._ffmpeg_stop.is_set():
+                                if (
+                                    frames_this_session == 0
+                                    and not waiting_logged
+                                    and time.monotonic() - session_t0 > 12.0
+                                ):
+                                    waiting_logged = True
+                                    try:
+                                        print(
+                                            "[VGCS:video] still waiting for first RTSP frame "
+                                            f"(>{12:.0f}s, transport={tr_label})"
+                                        )
+                                    except Exception:
+                                        pass
                                 raw = self._read_exact(p.stdout, frame_bytes)
                                 if raw is None:
                                     break
@@ -1956,14 +1970,6 @@ class VideoPipeline(QObject):
         self._low_latency = ll
         self._stream_kind = sk
         if unchanged:
-            if self._sources:
-                def _notify() -> None:
-                    try:
-                        self.sources_changed.emit()
-                    except Exception:
-                        pass
-
-                QTimer.singleShot(0, _notify)
             return
         # Reset active source if it no longer exists.
         if self._active_source_id and self._active_source_id not in self._sources:
