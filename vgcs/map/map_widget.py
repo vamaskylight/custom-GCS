@@ -2574,6 +2574,10 @@ class MapWidget(QWidget):
         if not self._ensure_video_preview_backend(from_start=True):
             return False
         try:
+            self._connect_video_pipeline_frame_slots(vp)
+        except Exception:
+            pass
+        try:
             self._video_preview_enabled = True
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
@@ -3299,6 +3303,85 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _connect_video_pipeline_frame_slots(self, vp: VideoPipeline | None) -> bool:
+        """Bind RtspSource.frame → native preview handlers (required after refresh_sources)."""
+        if vp is None:
+            return False
+        try:
+            sources = vp.sources()
+        except Exception:
+            return False
+        if not sources:
+            return False
+        self._detach_video_pipeline_frame_slots(vp)
+        try:
+            self._video = vp
+            self._video_active_source = vp.active_source()
+            src_ids = set(sources.keys())
+            preferred_id = ""
+            if "day" in src_ids:
+                preferred_id = "day"
+            elif "thermal" in src_ids:
+                preferred_id = "thermal"
+            elif src_ids:
+                preferred_id = str(next(iter(src_ids)))
+            if preferred_id:
+                try:
+                    vp.set_active_source(preferred_id)
+                    self._video_active_source = vp.active_source()
+                except Exception:
+                    pass
+            active = self._video_active_source
+            if active is not None:
+                try:
+                    active.frame.disconnect(self)
+                except Exception:
+                    pass
+                active.frame.connect(
+                    self._on_pipeline_frame,
+                    Qt.ConnectionType.QueuedConnection,
+                )
+            for sid, src in list(sources.items())[:4]:
+                if not isinstance(getattr(self, "_video_encode_bridge_by_id", None), dict):
+                    self._video_encode_bridge_by_id = {}
+                if sid not in self._video_encode_bridge_by_id:
+                    bridge = _VideoEncodeBridge(self)
+                    bridge.encoded.connect(
+                        lambda data_url, sid=sid: self._on_video_frame_encoded_for(sid, data_url)
+                    )
+                    self._video_encode_bridge_by_id[sid] = bridge
+                try:
+                    if hasattr(src, "error") and hasattr(src.error, "disconnect"):
+                        src.error.disconnect(self)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(src, "error") and hasattr(src.error, "connect"):
+                        src.error.connect(
+                            lambda msg, sid=sid: (
+                                print(f"[VGCS:video] Video({sid}) error: {str(msg)}"),
+                                self._set_status(f"Video({sid}) error: {str(msg)}"),
+                            )[1],
+                            Qt.ConnectionType.QueuedConnection,
+                        )
+                except Exception:
+                    pass
+                try:
+                    if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
+                        src.frame.disconnect(self)
+                except Exception:
+                    pass
+                src.frame.connect(
+                    lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf),
+                    Qt.ConnectionType.QueuedConnection,
+                )
+            shared = getattr(self, "_video_pipeline_shared", None)
+            if shared is not None and vp is shared:
+                self._shared_vp_hooks_connected = True
+            return active is not None
+        except Exception:
+            return False
+
     def _on_video_pipeline_sources_changed(self) -> None:
         """`refresh_sources()` swapped in new `RtspSource` objects — re-run preview hook-up."""
         if not HAS_MULTIMEDIA:
@@ -3315,7 +3398,6 @@ class MapWidget(QWidget):
                 return
         except Exception:
             return
-        self._detach_video_pipeline_frame_slots(vp)
         self._video_inited = False
         self._shared_vp_hooks_connected = False
         setattr(self, "_video_skip_preview_flag_reset_in_ensure", True)
@@ -3351,33 +3433,15 @@ class MapWidget(QWidget):
         if shared is not None and getattr(self, "_shared_vp_hooks_connected", False):
             self._video_inited = True
             self._video = shared
-            try:
-                self._video_active_source = shared.active_source()
-            except Exception:
-                self._video_active_source = None
-            # `active_source()` can be None if `_active_source_id` was cleared; refresh like full init.
-            if self._video_active_source is None and shared is not None:
-                try:
-                    src_ids = set(shared.sources().keys())
-                    preferred_id = ""
-                    if "day" in src_ids:
-                        preferred_id = "day"
-                    elif "thermal" in src_ids:
-                        preferred_id = "thermal"
-                    elif src_ids:
-                        preferred_id = str(next(iter(src_ids)))
-                    if preferred_id:
-                        shared.set_active_source(preferred_id)
-                        self._video_active_source = shared.active_source()
-                except Exception:
-                    pass
             if not isinstance(getattr(self, "_split_last_images", None), dict):
                 self._split_last_images = {}
             if not isinstance(getattr(self, "_native_pip_last_source_frame", None), QImage):
                 self._native_pip_last_source_frame = QImage()
-            return bool(self._video_active_source)
-
-            return bool(self._video_active_source)
+            if not self._connect_video_pipeline_frame_slots(shared):
+                self._shared_vp_hooks_connected = False
+                self._video_inited = False
+            else:
+                return bool(self._video_active_source)
 
         _skip_pv_reset = bool(getattr(self, "_video_skip_preview_flag_reset_in_ensure", False))
         try:
@@ -3473,70 +3537,15 @@ class MapWidget(QWidget):
         self._video_encode_bridge.encoded.connect(self._on_video_frame_encoded)
 
         try:
-            self._video_active_source = self._video.active_source() if self._video is not None else None
-            # Prefer Day feed for primary preview quality/comparison with VLC.
-            # If day is unavailable, fall back to thermal, then pipeline default.
-            if self._video is not None:
-                src_ids = set(sources.keys())
-                preferred_id = ""
-                if "day" in src_ids:
-                    preferred_id = "day"
-                elif "thermal" in src_ids:
-                    preferred_id = "thermal"
-                if preferred_id:
-                    try:
-                        self._video.set_active_source(preferred_id)
-                    except Exception:
-                        pass
-                    try:
-                        self._video_active_source = self._video.active_source()
-                    except Exception:
-                        pass
-            if self._video_active_source is not None:
-                try:
-                    self._video_active_source.frame.disconnect(self)
-                except Exception:
-                    pass
-                self._video_active_source.frame.connect(
-                    self._on_pipeline_frame,
-                    Qt.ConnectionType.QueuedConnection,
-                )
-            # Prep split handlers for up to 4 sources.
-            for sid, src in list(sources.items())[:4]:
-                bridge = _VideoEncodeBridge(self)
-                bridge.encoded.connect(lambda data_url, sid=sid: self._on_video_frame_encoded_for(sid, data_url))
-                self._video_encode_bridge_by_id[sid] = bridge
-                self._video_encode_inflight_by_id[sid] = False
-                self._video_encode_pending_by_id[sid] = None
-                self._video_last_data_urls[sid] = ""
-                try:
-                    if hasattr(src, "error") and hasattr(src.error, "disconnect"):
-                        src.error.disconnect(self)
-                except Exception:
-                    pass
-                try:
-                    # Show backend errors (RTSP decode / FFmpeg missing, etc.) on the UI.
-                    if hasattr(src, "error") and hasattr(src.error, "connect"):
-                        src.error.connect(
-                            lambda msg, sid=sid: (
-                                print(f"[VGCS:video] Video({sid}) error: {str(msg)}"),
-                                self._set_status(f"Video({sid}) error: {str(msg)}"),
-                            )[1],
-                            Qt.ConnectionType.QueuedConnection,
-                        )
-                except Exception:
-                    pass
-                try:
-                    if hasattr(src, "frame") and hasattr(src.frame, "disconnect"):
-                        src.frame.disconnect(self)
-                except Exception:
-                    pass
-                src.frame.connect(
-                    lambda vf, sid=sid: self._on_pipeline_frame_for(sid, vf),
-                    Qt.ConnectionType.QueuedConnection,
-                )
-            if shared is not None:
-                self._shared_vp_hooks_connected = True
+            if not isinstance(getattr(self, "_video_encode_bridge_by_id", None), dict):
+                self._video_encode_bridge_by_id = {}
+            self._video_encode_inflight_by_id = {}
+            self._video_encode_pending_by_id = {}
+            self._video_last_data_urls = {}
+            if not self._connect_video_pipeline_frame_slots(self._video):
+                self._video_active_source = None
+                self._video_inited = False
+                return False
             self._video_inited = True
         except Exception:
             self._video_active_source = None
@@ -3803,6 +3812,7 @@ class MapWidget(QWidget):
             pass
         self._payload_hardware_recording = False
         self._video_inited = False
+        self._shared_vp_hooks_connected = False
 
         # Do not reset `_video_split_enabled` here: this runs on every connect/disconnect and on
         # camera-backend hot-swap; the operator's SPLIT choice must persist (apply_video_settings
@@ -3986,6 +3996,10 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             return
+        try:
+            self._video_preview_enabled = True
+        except Exception:
+            pass
         if not self._ensure_video_preview_backend(from_start=True):
             try:
                 vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
@@ -4003,7 +4017,12 @@ class MapWidget(QWidget):
             self._run_js("setVideoPreviewImage('');")
             return
         try:
-            self._video_preview_enabled = True
+            vp_hook = getattr(self, "_video", None)
+            if vp_hook is not None:
+                self._connect_video_pipeline_frame_slots(vp_hook)
+        except Exception:
+            pass
+        try:
             # Always start in day preview unless explicitly toggled by operator.
             self._video_vision_mode = "day"
             if reset_swapped:
@@ -4129,7 +4148,27 @@ class MapWidget(QWidget):
     def _on_pipeline_frame(self, vf: VideoFrame) -> None:
         # Called on the GUI thread.
         if not bool(getattr(self, "_video_preview_enabled", False)):
-            return
+            if self._uses_companion_rtsp():
+                self._video_preview_enabled = True
+                if not bool(getattr(self, "_video_swapped", False)):
+                    self._video_swapped = True
+                try:
+                    self._native_video_preview.show()
+                    self._layout_native_video_preview()
+                    self._stack_native_overlays_above_tile_map()
+                except Exception:
+                    pass
+                if not bool(getattr(self, "_video_preview_recover_logged", False)):
+                    self._video_preview_recover_logged = True
+                    try:
+                        print(
+                            "[VGCS:video] preview auto-enabled on first decoded frame "
+                            "(frame slots were late)"
+                        )
+                    except Exception:
+                        pass
+            else:
+                return
         self._native_video_last_frame_mono = time.monotonic()
         self._video_preview_got_frame = True
         if not bool(getattr(self, "_video_gui_logged_frame", False)):
