@@ -277,6 +277,7 @@ class NativeTileMapView(QWidget):
         self._http_tile_failures = 0
         self._tiles_inflight.clear()
         self._tiles.clear()
+        self._preload_local_tiles_around_center()
         self.update()
 
     def set_tile_source(self, template: str, _attribution: str, max_z: int) -> None:
@@ -892,13 +893,30 @@ class NativeTileMapView(QWidget):
             return None
         return img
 
+    def _preload_local_tiles_around_center(self, *, radius: int = 4) -> int:
+        """Load offline tiles around map center (works before the widget has a final size)."""
+        z = int(max(3, min(self._max_zoom, round(self._zoom))))
+        cx, cy = _tile_xy(self._center_lat, self._center_lon, z)
+        hits = 0
+        r = max(1, int(radius))
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                img = self._read_local_tile_sync(z, cx + dx, cy + dy)
+                if img is None:
+                    continue
+                self._tiles[(z, cx + dx, cy + dy)] = img
+                hits += 1
+        if hits:
+            self.update()
+        return hits
+
     def _reload_visible_local_tiles(self) -> int:
         root = self._offline_root
         if not root:
             return 0
         vf = self._view_frame()
         if vf is None:
-            return 0
+            return self._preload_local_tiles_around_center()
         z, fx, fy, w, h = vf
         tile_size = 256
         x0 = int(math.floor(fx / tile_size)) - 1
@@ -906,7 +924,6 @@ class NativeTileMapView(QWidget):
         x1 = int(math.ceil((fx + w) / tile_size)) + 1
         y1 = int(math.ceil((fy + h) / tile_size)) + 1
         hits = 0
-        base = Path(root)
         for tx in range(x0, x1 + 1):
             for ty in range(y0, y1 + 1):
                 img = self._read_local_tile_sync(z, tx, ty)
@@ -958,11 +975,17 @@ class NativeTileMapView(QWidget):
                 self._tiles_inflight.discard(key)
         return None
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self._tile_template == "{local}" and self._offline_root:
+            QTimer.singleShot(0, self._reload_visible_local_tiles)
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._tiles_inflight.clear()
         if self._tile_template == "{local}" and self._offline_root:
-            self._reload_visible_local_tiles()
+            if self.width() > 1 and self.height() > 1:
+                self._reload_visible_local_tiles()
         else:
             self._tiles.clear()
 

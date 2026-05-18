@@ -664,6 +664,8 @@ class MapWidget(QWidget):
         self._video_sources_changed_conn_id: int | None = None
         if self._video_pipeline_shared is not None:
             self._hook_video_pipeline_sources_changed(self._video_pipeline_shared)
+        self._companion_bundled_seed_applied = False
+        self._offline_map_refresh_attempts = 0
         self._lat: float | None = None
         self._lon: float | None = None
         self._heading: float | None = None
@@ -2705,8 +2707,6 @@ class MapWidget(QWidget):
             print(f"[VGCS:video] companion decode start ({reason})")
         except Exception:
             pass
-        if self._uses_companion_rtsp() and not self._map_using_offline_tiles():
-            self._try_companion_bundled_seed_tiles()
         self._restart_video_preview_after_settings(force_decode=False)
 
     def _request_companion_video_restart(self, *, reason: str = "") -> None:
@@ -3278,16 +3278,18 @@ class MapWidget(QWidget):
         return None
 
     def _try_companion_bundled_seed_tiles(self) -> bool:
+        if bool(getattr(self, "_companion_bundled_seed_applied", False)):
+            return self._map_using_offline_tiles()
         root = self._companion_bundled_seed_dir()
         if root is None:
             return False
+        self._companion_bundled_seed_applied = True
         try:
-            print(f"[VGCS:map] bundled companion map tiles: {root}")
+            png_n = len(list(root.glob("**/*.png")))
+            print(f"[VGCS:map] bundled companion map tiles: {root} ({png_n} png)")
         except Exception:
-            pass
+            print(f"[VGCS:map] bundled companion map tiles: {root}")
         self.activate_offline_tiles(str(root))
-        QTimer.singleShot(150, lambda: self._refresh_offline_map_tiles(reason="bundled_seed"))
-        QTimer.singleShot(600, lambda: self._refresh_offline_map_tiles(reason="bundled_seed_retry"))
         return True
 
     def _companion_offline_tile_paths(self) -> list[str]:
@@ -3350,22 +3352,41 @@ class MapWidget(QWidget):
         except Exception:
             pass
         if hits > 0:
+            self._offline_map_refresh_attempts = 0
             self._set_status(f"Offline map: {hits} cached tiles visible")
+        elif self._map_using_offline_tiles():
+            attempts = int(getattr(self, "_offline_map_refresh_attempts", 0) or 0)
+            if attempts < 4:
+                self._offline_map_refresh_attempts = attempts + 1
+                delay = 250 * (attempts + 1)
+                QTimer.singleShot(
+                    delay,
+                    lambda: self._refresh_offline_map_tiles(reason=f"offline_layout_{attempts}"),
+                )
+            elif attempts == 4:
+                self._offline_map_refresh_attempts = 5
+                self._set_status(
+                    "Offline map active — pan/zoom near drone; verify companion_tile_seed has PNG files"
+                )
         elif near > 0:
             self._set_status(
                 f"Offline map: {near} tiles cached near GPS — pan slightly if view is empty"
             )
-        elif self._try_companion_bundled_seed_tiles():
-            try:
-                nm.update()
-            except Exception:
-                pass
-            self._set_status("Companion offline map loaded (bundled seed area)")
-        elif self._try_companion_offline_tiles():
-            self._set_status("Offline map folder loaded")
+        elif not bool(getattr(self, "_companion_bundled_seed_applied", False)):
+            if self._try_companion_bundled_seed_tiles():
+                QTimer.singleShot(
+                    300, lambda: self._refresh_offline_map_tiles(reason="bundled_seed_once")
+                )
+                self._set_status("Companion offline map loaded (bundled seed area)")
+            elif self._try_companion_offline_tiles():
+                self._set_status("Offline map folder loaded")
+            else:
+                self._set_status(
+                    "No offline map tiles — copy custom-GCS with companion_tile_seed or use Offline tiles…"
+                )
         else:
             self._set_status(
-                "No offline map tiles — copy custom-GCS with companion_tile_seed or use Offline tiles…"
+                "Offline map folder set but no tiles at current view — check companion_tile_seed PNGs"
             )
         try:
             self._update_native_minimap()
@@ -6421,10 +6442,17 @@ class MapWidget(QWidget):
                 lo = getattr(self, "_lon", None)
                 if la is not None and lo is not None:
                     nm.set_center(float(la), float(lo))
+                elif "companion_tile_seed" in str(resolved).replace("\\", "/").lower():
+                    # Bench seed is centered on India (~20.446°N, 72.863°E).
+                    nm.set_center(20.4459339, 72.8632009)
                 try:
+                    png_n = len(list(resolved.glob("**/*.png")))
+                    sample = resolved / "16" / "46032" / "28964.png"
                     hits = int(nm.reload_visible_tiles_from_cache() or 0)
                     print(
-                        f"[VGCS:map] offline tiles root={resolved} visible_loaded={hits}"
+                        f"[VGCS:map] offline tiles root={resolved} png={png_n} "
+                        f"sample_ok={sample.is_file()} visible_loaded={hits} "
+                        f"map_size={nm.width()}x{nm.height()}"
                     )
                 except Exception:
                     pass
