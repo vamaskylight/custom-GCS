@@ -177,15 +177,22 @@ _NATIVE_CAM_RAIL_TOP_PX = 44
 _MAP_ACTION_RAIL_LEFT_PX = 10
 _MAP_ACTION_RAIL_TOP_PX = 10
 
-# Primary map: NativeTileMapView. Optional 3D: lazy Qt WebEngine + vendored Leaflet/Cesium (see map_web_3d).
+# Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-web2d-v3"
+MAP_BACKEND_BUILD = "2026-05-18-native2d-only"
+
+def _web_2d_fallback_allowed() -> bool:
+    """2D map is NativeTileMapView only; WebEngine Leaflet is opt-in for debugging."""
+    return str(os.environ.get("VGCS_ALLOW_WEB_2D_FALLBACK", "0") or "0").strip() == "1"
 
 _WEB_MAP_RELAYOUT_JS = """
 (function(){
   try {
-    if (typeof set3DEnabled === 'function') set3DEnabled(false);
+    if (typeof window.__vgcsRelayoutMap2d === 'function') {
+      window.__vgcsRelayoutMap2d();
+      return;
+    }
     var m2 = document.getElementById('map2d');
     var m3 = document.getElementById('map3d');
     if (m2) m2.style.display = 'block';
@@ -765,6 +772,8 @@ class MapWidget(QWidget):
         self._native_video_preview.raise_()
         self._native_video_last = QImage()
         self._video_swapped = False
+        # Operator chose map-main (PiP video); do not auto-force fullscreen video on gaps/first frame.
+        self._video_swap_user_map_main = False
         # Split PiP → fullscreen: which source to fill the canvas (None = entire 2×2 grid).
         self._split_fullscreen_source_id: str | None = None
         # Last 2×2 composite geometry + per-slot source ids (for hit-testing PiP clicks).
@@ -1454,9 +1463,9 @@ class MapWidget(QWidget):
             self._layout_plan_flight_panel()
         except Exception:
             pass
-        if getattr(self, "_web_2d_fallback_active", False):
+        if not getattr(self, "_is_3d_mode", False):
             try:
-                QTimer.singleShot(0, self._relayout_web_map_view)
+                QTimer.singleShot(0, self._ensure_native_map_visible)
             except Exception:
                 pass
 
@@ -1511,8 +1520,13 @@ class MapWidget(QWidget):
 
         self._video_swapped = not was_swapped
         if self._video_swapped:
+            self._video_swap_user_map_main = False
             self._refresh_native_overlay_insets()
+        else:
+            self._video_swap_user_map_main = True
         self._layout_native_video_preview()
+        if not self._video_swapped:
+            self._show_map_main_surface()
         # Native fullscreen toggle is fully handled in Qt. Keep Web map in map mode
         # to avoid duplicating/fragmenting video content in Web overlays/minimap grabs.
         try:
@@ -1742,11 +1756,53 @@ class MapWidget(QWidget):
                 pass
         if not bool(getattr(self, "_video_swapped", False)):
             return
+        self._video_swap_user_map_main = True
         self._video_swapped = False
         self._split_fullscreen_source_id = None
         self._layout_native_video_preview()
+        self._show_map_main_surface()
         try:
             self._run_js("setVideoSwapMode(false);")
+        except Exception:
+            pass
+
+    def _native_map_tile_count(self) -> int:
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return 0
+        try:
+            return int(nm.loaded_tile_count())
+        except Exception:
+            return 0
+
+    def _promote_native_map_if_ready(self) -> bool:
+        """Use Qt tiles for the main map when they are available (swap PiP can still grab native)."""
+        if getattr(self, "_is_3d_mode", False):
+            return False
+        if self._native_map_tile_count() < 4:
+            return False
+        try:
+            self._map_stack.setCurrentIndex(0)
+        except Exception:
+            pass
+        if getattr(self, "_web_2d_fallback_active", False):
+            self._web_2d_fallback_active = False
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            try:
+                nm.show()
+                nm.update()
+                nm.repaint()
+            except Exception:
+                pass
+        return True
+
+    def _show_map_main_surface(self) -> None:
+        """After swap-to-map: native Qt tiles only (never WebEngine for 2D)."""
+        self._ensure_native_map_visible()
+        self._promote_native_map_if_ready()
+        try:
+            QTimer.singleShot(0, self._stack_native_overlays_above_tile_map)
         except Exception:
             pass
 
@@ -2721,9 +2777,14 @@ class MapWidget(QWidget):
                 "Map: using bundled offline tiles (internet/proxy may be blocking Esri/OSM)"
             )
             return
-        # WebEngine preload often succeeds when native urllib/Qt worker fetch fails (client PCs).
-        if self._activate_web_2d_fallback():
-            return
+        try:
+            print("[VGCS:map] native Qt tiles still missing — retrying Esri Streets")
+        except Exception:
+            pass
+        try:
+            self.activate_esri_street_tiles()
+        except Exception:
+            pass
         self._native_tile_fallback_done = True
         self._set_status(
             "Map tiles failed to load — check internet/firewall or use Offline Tiles in the toolbar"
@@ -2762,37 +2823,41 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-    def _ensure_map_tiles_visible(self) -> None:
-        """Prefer native Qt tiles; if they never load, show the WebEngine Leaflet map (preload often works)."""
+    def _ensure_native_map_visible(self) -> None:
+        """Keep 2D map on NativeTileMapView (no WebEngine Leaflet layer)."""
         if getattr(self, "_is_3d_mode", False):
             return
-        nm = getattr(self, "_native_map", None)
         try:
-            native_n = int(nm.loaded_tile_count()) if nm is not None else 0
+            self._map_stack.setCurrentIndex(0)
         except Exception:
-            native_n = 0
-        if native_n >= 6 and not getattr(self, "_web_2d_fallback_active", False):
-            try:
-                self._map_stack.setCurrentIndex(0)
-            except Exception:
-                pass
-            return
+            pass
         if getattr(self, "_web_2d_fallback_active", False):
-            self._relayout_web_map_view()
+            self._web_2d_fallback_active = False
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
             return
-        if not HAS_WEBENGINE_3D:
-            return
-        if not bool(getattr(self, "_web_3d_ready", False)):
-            self._pending_web_2d_fallback = True
+        try:
+            if int(nm.loaded_tile_count()) >= 4:
+                nm.update()
+                nm.repaint()
+                return
+        except Exception:
+            pass
+        if not getattr(self, "_native_tile_fallback_done", False):
             try:
-                self._ensure_web_3d_view()
+                QTimer.singleShot(0, self._native_tile_startup_check)
             except Exception:
                 pass
-            return
-        self._activate_web_2d_fallback()
+
+    def _ensure_map_tiles_visible(self) -> None:
+        """Alias: 2D map is always native Qt (see ``_ensure_native_map_visible``)."""
+        self._ensure_native_map_visible()
 
     def _activate_web_2d_fallback(self) -> bool:
-        """Show the preloaded Leaflet 2D page when native Qt tiles never appear."""
+        """Optional Leaflet 2D via WebEngine (off by default; set VGCS_ALLOW_WEB_2D_FALLBACK=1)."""
+        if not _web_2d_fallback_allowed():
+            self._ensure_native_map_visible()
+            return False
         if getattr(self, "_web_2d_fallback_active", False):
             self._relayout_web_map_view()
             return True
@@ -3382,6 +3447,10 @@ class MapWidget(QWidget):
         )
         self._map_stack.addWidget(self._native_map)
         self._map_canvas_layout.addWidget(self._map_stack, 1)
+        try:
+            self._map_stack.setCurrentIndex(0)
+        except Exception:
+            pass
         # PiP / compass / rail layer stay on `_map_canvas`; keep the map stack below those siblings.
         try:
             self._map_stack.lower()
@@ -3426,17 +3495,9 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
-        # Pre-warm WebEngine 3D in the background. Without this, the first 3D button press
-        # creates the QWebEngineView, spawns the WebEngine helper process, loads 146KB of HTML
-        # and boots Cesium synchronously from the user's POV — the window can flash blank and
-        # feels like the app restarted before the globe appears.
-        if HAS_WEBENGINE_3D:
-            QTimer.singleShot(900, self._preload_web_3d_view)
-
-    def _preload_web_3d_view(self) -> None:
-        """Lazy-load the 3D WebEngine page in the background after the main UI is up."""
+        # 2D map stays on NativeTileMapView. WebEngine loads only when the operator enables 3D.
         try:
-            self._ensure_web_3d_view()
+            QTimer.singleShot(0, self._ensure_native_map_visible)
         except Exception:
             pass
 
@@ -4303,6 +4364,7 @@ class MapWidget(QWidget):
             self._video_vision_mode = "day"
             if reset_swapped:
                 self._video_swapped = False
+                self._video_swap_user_map_main = False
                 self._split_fullscreen_source_id = None
             # Keep Web layer in map mode; native side handles fullscreen camera.
             self._run_js("setVideoSwapMode(false);")
@@ -4366,6 +4428,7 @@ class MapWidget(QWidget):
             self._native_video_last = QImage()
             self._native_pip_last_source_frame = QImage()
             self._video_swapped = False
+            self._video_swap_user_map_main = False
             try:
                 if hasattr(self, "_split_last_images"):
                     self._split_last_images.clear()
@@ -4455,6 +4518,7 @@ class MapWidget(QWidget):
             last_mono > 0.0
             and (now_frame - last_mono) > 2.5
             and self._uses_companion_rtsp()
+            and not bool(getattr(self, "_video_swap_user_map_main", False))
         ):
             try:
                 self._video_swapped = True
@@ -4479,7 +4543,11 @@ class MapWidget(QWidget):
                 )
             except Exception:
                 pass
-            if self._uses_companion_rtsp() and not bool(getattr(self, "_video_swapped", False)):
+            if (
+                self._uses_companion_rtsp()
+                and not bool(getattr(self, "_video_swapped", False))
+                and not bool(getattr(self, "_video_swap_user_map_main", False))
+            ):
                 if str(os.environ.get("VGCS_VIDEO_AUTO_FULLSCREEN", "1") or "1").strip() != "0":
                     try:
                         self._video_swapped = True
@@ -5304,7 +5372,7 @@ class MapWidget(QWidget):
     def _on_web_title_changed(self, title: str) -> None:
         if title.startswith("VGCS_MAP_TILES_READY:"):
             try:
-                QTimer.singleShot(0, self._ensure_map_tiles_visible)
+                QTimer.singleShot(0, self._ensure_native_map_visible)
             except Exception:
                 pass
             self._run_js("document.title = 'VGCS Map';")
@@ -5645,6 +5713,9 @@ class MapWidget(QWidget):
                 self._video_swapped = False
             if not bool(getattr(self, "_video_swapped", False)):
                 self._split_fullscreen_source_id = None
+                self._video_swap_user_map_main = True
+            else:
+                self._video_swap_user_map_main = False
             # Ignore Web swap state for rendering; native layer controls camera fullscreen.
             try:
                 self._run_js("setVideoSwapMode(false);")
@@ -5652,6 +5723,8 @@ class MapWidget(QWidget):
                 pass
             if self._video_swapped:
                 self._refresh_native_overlay_insets()
+            else:
+                self._show_map_main_surface()
             self._layout_native_video_preview()
             self._run_js("document.title = 'VGCS Map';")
             return
@@ -6558,19 +6631,17 @@ class MapWidget(QWidget):
             return
         self._inject_legacy_html_hud_hide()
         if getattr(self, "_pending_web_2d_fallback", False):
-            try:
-                self._activate_web_2d_fallback()
-            except Exception:
-                pass
+            self._pending_web_2d_fallback = False
+            if _web_2d_fallback_allowed():
+                try:
+                    self._activate_web_2d_fallback()
+                except Exception:
+                    pass
+            else:
+                self._ensure_native_map_visible()
             return
-        # Preload finished: if native Qt tiles are still empty, promote the Leaflet page (tiles ok=1 in console).
         if not getattr(self, "_pending_3d_activate", False):
-            self._schedule_vehicle_pose_js(immediate=True)
-            try:
-                QTimer.singleShot(150, self._ensure_map_tiles_visible)
-                QTimer.singleShot(600, self._ensure_map_tiles_visible)
-            except Exception:
-                pass
+            self._ensure_native_map_visible()
             return
         self._pending_3d_activate = False
         try:
@@ -6609,22 +6680,7 @@ class MapWidget(QWidget):
             self._is_3d_mode = False
             self._pending_3d_activate = False
             if getattr(self, "_web_2d_fallback_active", False):
-                w3 = getattr(self, "_web_3d_view", None)
-                if w3 is not None and self._web_3d_ready:
-                    try:
-                        w3.page().runJavaScript("set3DEnabled(false);", lambda *_: None)
-                    except Exception:
-                        pass
-                    try:
-                        self._map_stack.setCurrentIndex(1)
-                    except Exception:
-                        pass
-                    self._btn_3d.blockSignals(True)
-                    self._btn_3d.setChecked(False)
-                    self._btn_3d.blockSignals(False)
-                    self._set_status("Map: web view active (native tiles blocked on this PC)")
-                    self._schedule_vehicle_pose_js(immediate=True)
-                    return True
+                self._web_2d_fallback_active = False
             w3 = getattr(self, "_web_3d_view", None)
             if w3 is not None and self._web_3d_ready:
                 try:
