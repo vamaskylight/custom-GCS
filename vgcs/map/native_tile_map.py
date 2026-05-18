@@ -7,6 +7,7 @@ import json
 import math
 import random
 import re
+import time
 from pathlib import Path
 from urllib.request import Request, build_opener
 
@@ -174,6 +175,59 @@ def _prepare_tile_image(img: QImage) -> QImage:
     )
 
 
+def _tile_image_is_placeholder(img: QImage, *, raw_byte_len: int = 0) -> bool:
+    """
+    Esri World Imagery often returns HTTP 200 gray tiles labeled
+    "Map data not yet available" (especially right after zoom-in).
+  """
+    if img.isNull() or img.width() < 16 or img.height() < 16:
+        return True
+    w = img.width()
+    h = img.height()
+    sx = max(1, w // 16)
+    sy = max(1, h // 16)
+    n = 0
+    sum_y = 0.0
+    sum2_y = 0.0
+    light_gray = 0
+    colors: set[tuple[int, int, int]] = set()
+    for y in range(0, h, sy):
+        for x in range(0, w, sx):
+            c = img.pixelColor(x, y)
+            colors.add((c.red() // 16, c.green() // 16, c.blue() // 16))
+            yy = 0.2126 * c.red() + 0.7152 * c.green() + 0.0722 * c.blue()
+            sum_y += yy
+            sum2_y += yy * yy
+            if 175 <= c.red() <= 245 and 175 <= c.green() <= 245 and 175 <= c.blue() <= 245:
+                light_gray += 1
+            n += 1
+    if n <= 0:
+        return True
+    mean = sum_y / n
+    var_y = (sum2_y / n) - (mean * mean)
+    # Flat gray Esri placeholder (see map_widget._TileProbeTask._classify_image).
+    if 150.0 < mean < 245.0 and var_y < 180.0 and (light_gray / n) > 0.52:
+        return True
+    if raw_byte_len > 0 and 150.0 < mean < 235.0 and var_y < 50.0 and raw_byte_len < 8000:
+        return True
+    # SMPTE / color-bar test patterns and other low-diversity tiles.
+    if len(colors) <= 24:
+        return True
+    return False
+
+
+def _accept_map_tile(
+    img: QImage, *, raw_byte_len: int = 0
+) -> QImage | None:
+    """Return prepared tile, or None if missing / Esri placeholder (never paint placeholders)."""
+    if img.isNull():
+        return None
+    prepared = _prepare_tile_image(img)
+    if prepared.isNull() or _tile_image_is_placeholder(prepared, raw_byte_len=raw_byte_len):
+        return None
+    return prepared
+
+
 class _TileFetchSignals(QObject):
     loaded = Signal(int, int, int, object)  # z, x, y, QImage or None
 
@@ -238,16 +292,18 @@ class _NativeTileLoader(QObject):
                         raw = bytes(r.readAll())
                         img = QImage.fromData(raw)
                         if not img.isNull():
-                            if udc and sid and raw:
-                                try:
-                                    cp = _disk_cache_path(sid, zz, xx, yy)
-                                    cp.parent.mkdir(parents=True, exist_ok=True)
-                                    cp.write_bytes(raw)
-                                except Exception:
-                                    pass
-                            self.loaded.emit(zz, xx, yy, _prepare_tile_image(img))
-                            self._drain()
-                            return
+                            accepted = _accept_map_tile(img, raw_byte_len=len(raw))
+                            if accepted is not None:
+                                if udc and sid and raw:
+                                    try:
+                                        cp = _disk_cache_path(sid, zz, xx, yy)
+                                        cp.parent.mkdir(parents=True, exist_ok=True)
+                                        cp.write_bytes(raw)
+                                    except Exception:
+                                        pass
+                                self.loaded.emit(zz, xx, yy, accepted)
+                                self._drain()
+                                return
                 except Exception:
                     pass
                 img = _fetch_tile_http_or_file(
@@ -324,9 +380,9 @@ class _DiskTileWarmTask(QRunnable):
             seed = bundled_seed_tile_path(z, x, y)
             if seed is not None:
                 try:
-                    img = _prepare_tile_image(QImage(str(seed)))
-                    if not img.isNull():
-                        self._bridge.loaded.emit(z, x, y, img)
+                    accepted = _accept_map_tile(QImage(str(seed)))
+                    if accepted is not None:
+                        self._bridge.loaded.emit(z, x, y, accepted)
                         continue
                 except Exception:
                     pass
@@ -334,9 +390,14 @@ class _DiskTileWarmTask(QRunnable):
                 try:
                     cp = _disk_cache_path(source_id, z, x, y)
                     if cp.is_file():
-                        img = _prepare_tile_image(QImage(str(cp)))
-                        if not img.isNull():
-                            self._bridge.loaded.emit(z, x, y, img)
+                        accepted = _accept_map_tile(QImage(str(cp)))
+                        if accepted is not None:
+                            self._bridge.loaded.emit(z, x, y, accepted)
+                        else:
+                            try:
+                                cp.unlink(missing_ok=True)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -377,6 +438,7 @@ class NativeTileMapView(QWidget):
         self._offline_root: str | None = None
         self._tiles: dict[tuple[int, int, int], QImage] = {}
         self._tiles_inflight: set[tuple[int, int, int]] = set()
+        self._tile_retry_after: dict[tuple[int, int, int], float] = {}
         self._tile_loader = _NativeTileLoader(self)
         self._tile_loader.loaded.connect(self._on_tile_loaded)
         self._tile_source_id = _tile_source_id(self._tile_template)
@@ -1023,29 +1085,61 @@ class NativeTileMapView(QWidget):
         return tmpl.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
 
     def _on_tile_loaded(self, z: int, x: int, y: int, img: object) -> None:
-        if int(z) != int(self._view_z):
-            key = (z, x, y)
-            try:
-                self._tiles_inflight.discard(key)
-            except Exception:
-                pass
-            return
         key = (z, x, y)
         try:
             self._tiles_inflight.discard(key)
         except Exception:
             pass
+        if int(z) != int(self._view_z):
+            return
         if img is None or not isinstance(img, QImage) or img.isNull():
-            self._tiles[key] = QImage()
-        else:
-            self._tiles[key] = _prepare_tile_image(img)
+            self._schedule_placeholder_retry(z, x, y)
+            return
+        if _tile_image_is_placeholder(img):
+            self._schedule_placeholder_retry(z, x, y)
+            return
+        self._tiles[key] = _prepare_tile_image(img)
+        self._tile_retry_after.pop(key, None)
         self._schedule_repaint()
+
+    def _schedule_placeholder_retry(self, z: int, x: int, y: int) -> None:
+        """Esri placeholder or miss — keep parent upscale visible and retry later."""
+        key = (int(z), int(x), int(y))
+        self._tiles.pop(key, None)
+        now = time.monotonic()
+        wait = float(self._tile_retry_after.get(key, 0.0) or 0.0)
+        if now < wait:
+            self._schedule_repaint()
+            return
+        self._tile_retry_after[key] = now + 2.0
+        try:
+            cp = _disk_cache_path(self._tile_source_id, key[0], key[1], key[2])
+            cp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        self._schedule_repaint()
+
+        def _retry() -> None:
+            if int(z) != int(self._view_z):
+                return
+            self._tile_retry_after.pop(key, None)
+            self._queue_tile_fetch(int(z), int(x), int(y))
+
+        QTimer.singleShot(2000, _retry)
+
+    def _valid_cached_tile(self, key: tuple[int, int, int]) -> QImage | None:
+        im = self._tiles.get(key)
+        if im is None or im.isNull() or _tile_image_is_placeholder(im):
+            if key in self._tiles:
+                self._tiles.pop(key, None)
+            return None
+        return im
 
     def _tile_for_paint(self, z: int, x: int, y: int) -> QImage | None:
         key = (z, x, y)
-        if key in self._tiles:
-            im = self._tiles[key]
-            return im if not im.isNull() else None
+        cached = self._valid_cached_tile(key)
+        if cached is not None:
+            return cached
         parent = self._parent_tile_child(z, x, y)
         if parent is not None and not parent.isNull():
             return parent
@@ -1054,31 +1148,37 @@ class NativeTileMapView(QWidget):
 
     def _parent_tile_child(self, z: int, x: int, y: int) -> QImage | None:
         """Upscale a parent tile quadrant so zoom feels instant while HTTP tiles arrive."""
-        pz = z - 1
-        if pz < 3:
-            return None
-        pkey = (pz, x // 2, y // 2)
-        parent = self._tiles.get(pkey)
-        if parent is None or parent.isNull():
-            return None
-        half = _TILE_SIZE // 2
-        ox = (x % 2) * half
-        oy = (y % 2) * half
-        try:
-            child = parent.copy(ox, oy, half, half)
-            if child.isNull():
-                return None
-            return child.scaled(
-                _TILE_SIZE,
-                _TILE_SIZE,
-                Qt.AspectRatioMode.IgnoreAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
-        except Exception:
-            return None
+        for depth in range(1, 4):
+            pz = z - depth
+            if pz < 3:
+                break
+            shift = depth
+            pkey = (pz, int(x) >> shift, int(y) >> shift)
+            parent = self._valid_cached_tile(pkey)
+            if parent is None:
+                continue
+            span = 1 << depth
+            half = _TILE_SIZE // span
+            ox = (x % span) * half
+            oy = (y % span) * half
+            try:
+                child = parent.copy(ox, oy, half, half)
+                if child.isNull():
+                    continue
+                return child.scaled(
+                    _TILE_SIZE,
+                    _TILE_SIZE,
+                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+            except Exception:
+                continue
+        return None
 
     def _queue_tile_fetch(self, z: int, x: int, y: int) -> None:
         key = (z, x, y)
+        if time.monotonic() < float(self._tile_retry_after.get(key, 0.0) or 0.0):
+            return
         if key in self._tiles_inflight:
             return
         self._tiles_inflight.add(key)
@@ -1340,9 +1440,9 @@ def _fetch_tile_http_or_file(
     seed = bundled_seed_tile_path(z, x, y)
     if seed is not None:
         try:
-            img = _prepare_tile_image(QImage(str(seed)))
-            if not img.isNull():
-                return img
+            accepted = _accept_map_tile(QImage(str(seed)))
+            if accepted is not None:
+                return accepted
         except Exception:
             pass
     cache_path: Path | None = None
@@ -1350,9 +1450,13 @@ def _fetch_tile_http_or_file(
         cache_path = _disk_cache_path(source_id, z, x, y)
         try:
             if cache_path.is_file():
-                img = QImage(str(cache_path))
-                if not img.isNull():
-                    return _prepare_tile_image(img)
+                accepted = _accept_map_tile(QImage(str(cache_path)))
+                if accepted is not None:
+                    return accepted
+                try:
+                    cache_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
         except Exception:
             pass
     try:
@@ -1361,16 +1465,20 @@ def _fetch_tile_http_or_file(
             img = QImage.fromData(raw)
             if img.isNull():
                 return QImage()
+            accepted = _accept_map_tile(img, raw_byte_len=len(raw))
+            if accepted is None:
+                return QImage()
             if cache_path is not None and raw:
                 try:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
                     cache_path.write_bytes(raw)
                 except Exception:
                     pass
-            return _prepare_tile_image(img)
+            return accepted
         p = Path(url)
         if p.is_file():
-            return _prepare_tile_image(QImage(str(p)))
+            accepted = _accept_map_tile(QImage(str(p)))
+            return accepted if accepted is not None else QImage()
     except Exception as e:
         _log_tile_fetch_error(url, f"{type(e).__name__}: {e}")
     return QImage()
