@@ -156,8 +156,10 @@ class MainWindow(QMainWindow):
         self._map_rel_alt_m = 0.0
         self._map_msl_alt_m = 0.0
         self._map_groundspeed_mps = 0.0
+        self._map_climb_mps = 0.0
         self._heading = 0.0
         self._max_telem_dist_m = 0.0
+        self._home_rel_alt_baseline_m: float | None = None
         self._home_lat: float | None = None
         self._home_lon: float | None = None
         self._home_amsl_m: float | None = None
@@ -2461,11 +2463,30 @@ class MainWindow(QMainWindow):
             m = (elapsed % 3600) // 60
             s = elapsed % 60
             flight_time_text = f"{h:02d}:{m:02d}:{s:02d}"
+        rel_display_m = float(self._map_rel_alt_m)
+        if self._home_rel_alt_baseline_m is not None:
+            rel_display_m -= float(self._home_rel_alt_baseline_m)
+        if self._armed_since is None and float(self._map_groundspeed_mps) < 0.5:
+            if abs(rel_display_m) < 1.5:
+                rel_display_m = 0.0
+        dist_home_m = 0.0
+        try:
+            pos = self._map_widget.get_vehicle_display_position()
+            if pos is not None and self._home_lat is not None and self._home_lon is not None:
+                dist_home_m = self._haversine_m(
+                    float(self._home_lat), float(self._home_lon), pos[0], pos[1]
+                )
+            if self._armed_since is None and float(self._map_groundspeed_mps) < 0.5:
+                if dist_home_m < 2.0:
+                    dist_home_m = 0.0
+        except Exception:
+            dist_home_m = 0.0
         self._map_widget.set_flight_telemetry(
-            relative_alt_m=float(self._map_rel_alt_m),
+            relative_alt_m=rel_display_m,
             ground_speed_mps=float(self._map_groundspeed_mps),
+            vertical_speed_mps=float(self._map_climb_mps),
             flight_time_text=flight_time_text,
-            msl_alt_m=float(self._map_msl_alt_m),
+            distance_from_home_m=dist_home_m,
         )
 
     def _sync_visible_map_overlay_metrics(self) -> None:
@@ -2573,11 +2594,13 @@ class MainWindow(QMainWindow):
         self._map_rel_alt_m = 0.0
         self._map_msl_alt_m = 0.0
         self._map_groundspeed_mps = 0.0
+        self._map_climb_mps = 0.0
         self._heading = 0.0
         self._max_telem_dist_m = 0.0
         self._home_lat = None
         self._home_lon = None
         self._home_amsl_m = None
+        self._home_rel_alt_baseline_m = None
         self._fields["armed"].setText("No")
         self._apply_state_style(self._fields["armed"], "warn")
         self._fields["flight_time"].setText("00:00")
@@ -2985,9 +3008,18 @@ class MainWindow(QMainWindow):
             if self._home_lat is None or self._home_lon is None:
                 self._home_lat = lat
                 self._home_lon = lon
+                self._home_rel_alt_baseline_m = float(data.get("relative_alt_m", 0.0))
             if self._home_lat is not None and self._home_lon is not None:
-                d = self._haversine_m(self._home_lat, self._home_lon, lat, lon)
-                self._max_telem_dist_m = max(self._max_telem_dist_m, d)
+                try:
+                    if self._map_widget.is_map_motion_armed():
+                        pos = self._map_widget.get_vehicle_display_position()
+                        if pos is not None:
+                            d = self._haversine_m(
+                                self._home_lat, self._home_lon, pos[0], pos[1]
+                            )
+                            self._max_telem_dist_m = max(self._max_telem_dist_m, d)
+                except Exception:
+                    pass
             self._fields["lat_lon"].setText(
                 f"{data.get('lat', 0.0):.7f}, {data.get('lon', 0.0):.7f}"
             )
@@ -3021,6 +3053,7 @@ class MainWindow(QMainWindow):
             self._map_widget.set_mission_nav_seq(int(data.get("seq", 0) or 0))
         elif msg_type == "VFR_HUD":
             self._map_groundspeed_mps = float(data.get("groundspeed", 0.0))
+            self._map_climb_mps = float(data.get("climb", 0.0))
             try:
                 self._map_widget._update_map_motion_state(self._map_groundspeed_mps)
             except Exception:

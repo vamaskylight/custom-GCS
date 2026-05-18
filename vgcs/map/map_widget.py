@@ -180,7 +180,7 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-gpsfix3"
+MAP_BACKEND_BUILD = "2026-05-18-native2d-telemetry"
 # Map icon/track only move after sustained GPS speed (avoids ground jitter + false vx/vy).
 _MAP_MOVE_ARM_SPEED_MPS = 1.0
 _MAP_MOVE_DISARM_SPEED_MPS = 0.35
@@ -6171,28 +6171,46 @@ class MapWidget(QWidget):
             f"window.__missionNavSeq = {max(0, int(seq))}; updateMissionRoutePolyline();"
         )
 
+    def is_map_motion_armed(self) -> bool:
+        return bool(getattr(self, "_map_motion_armed", False))
+
+    def get_vehicle_display_position(self) -> tuple[float, float] | None:
+        la = getattr(self, "_map_display_lat", None)
+        lo = getattr(self, "_map_display_lon", None)
+        if la is not None and lo is not None:
+            return float(la), float(lo)
+        if self._lat is not None and self._lon is not None:
+            return float(self._lat), float(self._lon)
+        return None
+
     def set_flight_telemetry(
         self,
         *,
         relative_alt_m: float,
         ground_speed_mps: float,
+        vertical_speed_mps: float = 0.0,
         flight_time_text: str,
-        msl_alt_m: float,
+        msl_alt_m: float = 0.0,
+        distance_from_home_m: float = 0.0,
     ) -> None:
+        del msl_alt_m
         ft = f"{float(relative_alt_m) * 3.28084:.1f}"
-        mph = f"{float(ground_speed_mps) * 2.23694:.1f}"
+        gs_mph = f"{float(ground_speed_mps) * 2.23694:.1f}"
+        vs_mph = f"{float(vertical_speed_mps) * 2.23694:.1f}"
+        dist_ft = f"{float(distance_from_home_m) * 3.28084:.1f}"
         ttime = str(flight_time_text)
-        msl_ft = f"{float(msl_alt_m) * 3.28084:.1f}"
-        sig = f"{ft}|{mph}|{ttime}|{msl_ft}"
+        sig = f"{ft}|{gs_mph}|{vs_mph}|{dist_ft}|{ttime}"
         if sig == self._last_flight_telemetry_sig:
             return
         self._last_flight_telemetry_sig = sig
         try:
             self._native_telemetry.set_values(
                 f"{ft} ft",
-                f"{mph} mph",
+                f"{vs_mph} mph",
                 ttime,
-                f"{msl_ft} ft",
+                f"{dist_ft} ft",
+                f"{gs_mph} mph",
+                f"{ft} ft",
             )
             QTimer.singleShot(0, self._layout_native_hud)
         except Exception:
@@ -6202,7 +6220,8 @@ class MapWidget(QWidget):
             f"{float(relative_alt_m):.3f}, "
             f"{float(ground_speed_mps):.3f}, "
             f"{json.dumps(ttime)}, "
-            f"{float(msl_alt_m):.3f}"
+            f"{float(distance_from_home_m):.3f}, "
+            f"{float(vertical_speed_mps):.3f}"
             ");"
         )
 

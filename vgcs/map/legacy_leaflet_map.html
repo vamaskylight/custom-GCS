@@ -3336,13 +3336,14 @@
       degLabel.textContent = `${Math.round(normalized)}°`;
     }
 
-    function setTelemetryOverlay(relAltM, groundSpeedMps, timeText, mslAltM) {
+    function setTelemetryOverlay(relAltM, groundSpeedMps, timeText, distHomeM, climbMps) {
       const ft = (Number(relAltM || 0.0) * 3.28084).toFixed(1);
-      const mph = (Number(groundSpeedMps || 0.0) * 2.23694).toFixed(1);
-      const mslFt = (Number(mslAltM || 0.0) * 3.28084).toFixed(1);
+      const gsMph = (Number(groundSpeedMps || 0.0) * 2.23694).toFixed(1);
+      const vsMph = (Number(climbMps || 0.0) * 2.23694).toFixed(1);
+      const distFt = (Number(distHomeM || 0.0) * 3.28084).toFixed(1);
       const ttime = timeText || '00:00:00';
       const prev = window.__telHudSig || '';
-      const sig = ft + '|' + mph + '|' + ttime + '|' + mslFt;
+      const sig = ft + '|' + gsMph + '|' + vsMph + '|' + distFt + '|' + ttime;
       if (sig === prev) return 1;
       window.__telHudSig = sig;
       const setAll = (className, text) => {
@@ -3351,11 +3352,11 @@
         });
       };
       setAll('telRow1Alt', `${ft} ft`);
-      setAll('telRow1Mph', `${mph} mph`);
+      setAll('telRow1Mph', `${vsMph} mph`);
       setAll('telRow1Time', ttime);
       setAll('telRow2Alt', `${ft} ft`);
-      setAll('telRow2Mph', `${mph} mph`);
-      setAll('telRow2Msl', `${mslFt} ft`);
+      setAll('telRow2Mph', `${gsMph} mph`);
+      setAll('telRow2Msl', `${distFt} ft`);
       return 1;
     }
 
