@@ -3932,7 +3932,8 @@
         document.getElementById('map2d').style.display = 'none';
         document.getElementById('map3d').style.display = 'block';
         window.__is3d = true;
-        if (hdrMapModeBtn) hdrMapModeBtn.textContent = '2D';
+        var _hdrBtn = document.getElementById('hdrMapModeBtn');
+        if (_hdrBtn) _hdrBtn.textContent = '2D';
         // Reset soft-follow baseline so the first follow tick after entering 3D doesn't translate
         // the camera by a stale delta (and "pre-arm" the user-hold to give Cesium a clean first frame).
         window.__lastFollowVehLat = null;
@@ -3962,7 +3963,8 @@
       document.getElementById('map3d').style.display = 'none';
       document.getElementById('map2d').style.display = 'block';
       window.__is3d = false;
-      if (hdrMapModeBtn) hdrMapModeBtn.textContent = '3D';
+      var _hdrBtn2 = document.getElementById('hdrMapModeBtn');
+      if (_hdrBtn2) _hdrBtn2.textContent = '3D';
       return false;
     }
 
