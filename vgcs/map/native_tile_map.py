@@ -565,11 +565,23 @@ class NativeTileMapView(QWidget):
         self._tiles = pruned
 
     def set_vehicle(self, lat: float, lon: float) -> None:
-        self._vehicle_lat = float(lat)
-        self._vehicle_lon = float(lon)
-        self._track.append((self._vehicle_lat, self._vehicle_lon))
-        if len(self._track) > 900:
-            self._track = self._track[-600:]
+        self.set_vehicle_filtered(lat, lon, append_track=True)
+
+    def set_vehicle_filtered(self, lat: float, lon: float, *, append_track: bool = True) -> None:
+        lat_f, lon_f = float(lat), float(lon)
+        self._vehicle_lat = lat_f
+        self._vehicle_lon = lon_f
+        if append_track:
+            if self._track:
+                last_lat, last_lon = self._track[-1]
+                dy_m = (lat_f - last_lat) * 111_320.0
+                dx_m = (lon_f - last_lon) * 111_320.0 * math.cos(math.radians(lat_f))
+                if math.hypot(dx_m, dy_m) < 3.0:
+                    append_track = False
+            if append_track:
+                self._track.append((lat_f, lon_f))
+                if len(self._track) > 900:
+                    self._track = self._track[-600:]
         self.update()
 
     def set_heading(self, deg: float) -> None:

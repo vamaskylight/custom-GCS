@@ -385,6 +385,7 @@ class MavlinkThread(QThread):
                     "lon": float(getattr(msg, "lon", 0) or 0) / 1e7,
                     "relative_alt_m": float(getattr(msg, "relative_alt", 0) or 0) / 1000.0,
                     "alt_msl_m": float(getattr(msg, "alt", 0) or 0) / 1000.0,
+                    "groundspeed_mps": spd_cm / 100.0,
                 }
                 if hdg_deg is not None:
                     gpi["hdg_deg"] = hdg_deg

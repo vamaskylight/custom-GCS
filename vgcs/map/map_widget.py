@@ -180,7 +180,12 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-tilesfix"
+MAP_BACKEND_BUILD = "2026-05-18-native2d-gpsfix"
+# Ignore GPS/heading jitter on the map when the vehicle is stationary (common pre-arm on the ground).
+_MAP_STATIONARY_SPEED_MPS = 0.4
+_MAP_POSITION_MIN_MOVE_M = 2.5
+_MAP_HEADING_MIN_DELTA_DEG = 12.0
+_MAP_TRACK_MIN_MOVE_M = 3.0
 
 def _web_2d_fallback_allowed() -> bool:
     """2D map is NativeTileMapView only; WebEngine Leaflet is opt-in for debugging."""
@@ -687,6 +692,9 @@ class MapWidget(QWidget):
             self._hook_video_pipeline_sources_changed(self._video_pipeline_shared)
         self._lat: float | None = None
         self._lon: float | None = None
+        self._map_display_lat: float | None = None
+        self._map_display_lon: float | None = None
+        self._last_groundspeed_mps = 0.0
         self._heading: float | None = None
         self._waypoint_count = 0
         self._waypoints_model: list[Waypoint] = []
@@ -6014,10 +6022,30 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
-    def set_vehicle_position(self, lat: float, lon: float, *, relative_alt_m: float | None = None) -> None:
+    @staticmethod
+    def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        r = 6_371_000.0
+        p1 = math.radians(lat1)
+        p2 = math.radians(lat2)
+        dp = math.radians(lat2 - lat1)
+        dl = math.radians(lon2 - lon1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * r * math.asin(min(1.0, math.sqrt(max(0.0, a))))
+
+    def set_vehicle_position(
+        self,
+        lat: float,
+        lon: float,
+        *,
+        relative_alt_m: float | None = None,
+        groundspeed_mps: float | None = None,
+    ) -> None:
         first_fix = self._lat is None or self._lon is None
         self._lat = lat
         self._lon = lon
+        if groundspeed_mps is not None:
+            self._last_groundspeed_mps = max(0.0, float(groundspeed_mps))
+        gs = float(self._last_groundspeed_mps)
         self._vehicle_rel_alt_m = relative_alt_m
         if relative_alt_m is None:
             self._coords.setText(f"Lat/Lon: {lat:.7f}, {lon:.7f}")
@@ -6025,13 +6053,34 @@ class MapWidget(QWidget):
             self._coords.setText(
                 f"Lat/Lon: {lat:.7f}, {lon:.7f}  |  Rel Alt: {relative_alt_m:.1f} m"
             )
+        display_lat, display_lon = float(lat), float(lon)
+        map_moved = first_fix
+        if self._map_display_lat is not None and self._map_display_lon is not None:
+            shift_m = self._haversine_m(
+                self._map_display_lat, self._map_display_lon, display_lat, display_lon
+            )
+            if gs < _MAP_STATIONARY_SPEED_MPS and shift_m < _MAP_POSITION_MIN_MOVE_M:
+                display_lat = self._map_display_lat
+                display_lon = self._map_display_lon
+            else:
+                self._map_display_lat = display_lat
+                self._map_display_lon = display_lon
+                map_moved = shift_m >= _MAP_POSITION_MIN_MOVE_M
+        else:
+            self._map_display_lat = display_lat
+            self._map_display_lon = display_lon
+            map_moved = True
         nm = getattr(self, "_native_map", None)
-        if nm is not None:
+        if nm is not None and (map_moved or first_fix):
             try:
-                nm.set_vehicle(float(lat), float(lon))
+                nm.set_vehicle_filtered(
+                    display_lat,
+                    display_lon,
+                    append_track=bool(map_moved and not first_fix),
+                )
             except Exception:
                 pass
-            if bool(getattr(self, "_video_follow_enabled", False)):
+            if bool(getattr(self, "_video_follow_enabled", False)) and map_moved:
                 try:
                     now = time.monotonic()
                     last = float(getattr(self, "_video_follow_last_center_mono", 0.0))
@@ -6050,11 +6099,20 @@ class MapWidget(QWidget):
                 self._update_native_minimap()
         except Exception:
             pass
-        self._schedule_vehicle_pose_js(immediate=first_fix)
+        if map_moved or first_fix:
+            self._schedule_vehicle_pose_js(immediate=first_fix)
 
     def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
+        gs = float(getattr(self, "_last_groundspeed_mps", 0.0))
+        src = str(source or "mixed")
+        if gs < _MAP_STATIONARY_SPEED_MPS and src in ("vfr", "att"):
+            return
+        if self._heading is not None and gs < _MAP_STATIONARY_SPEED_MPS:
+            delta = (float(heading_deg) - float(self._heading) + 180.0) % 360.0 - 180.0
+            if abs(delta) < _MAP_HEADING_MIN_DELTA_DEG:
+                return
         self._heading = heading_deg % 360.0
-        self._heading_js_source = source or "mixed"
+        self._heading_js_source = src
         self._heading_label.setText(f"Heading: {self._heading:.1f}°")
         try:
             self._native_compass.set_heading_deg(self._heading)
@@ -6070,6 +6128,15 @@ class MapWidget(QWidget):
 
     def clear_flight_track(self) -> None:
         """Clear the orange breadcrumb trail (e.g. on reconnect / disconnect)."""
+        self._map_display_lat = None
+        self._map_display_lon = None
+        self._last_groundspeed_mps = 0.0
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            try:
+                nm.clear_track()
+            except Exception:
+                pass
         self._run_js("clearFlightTrack();")
 
     def set_mission_nav_seq(self, seq: int) -> None:
