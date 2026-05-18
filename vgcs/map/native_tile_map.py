@@ -268,18 +268,20 @@ class NativeTileMapView(QWidget):
         t = str(template or "").strip()
         if not t:
             return
-        if t != "{local}":
-            self._remote_tiles_enabled = True
-            self._http_tile_failures = 0
         self._offline_root = None
         if t.startswith("file:"):
             path = QUrl(t).toLocalFile()
             if path:
                 self._offline_root = str(Path(path).resolve())
                 self._tile_template = "{local}"
+                self._remote_tiles_enabled = False
+                self._http_tile_failures = 0
             else:
                 self._tile_template = t
         else:
+            if t != "{local}":
+                self._remote_tiles_enabled = True
+                self._http_tile_failures = 0
             self._tile_template = t
         try:
             self._max_zoom = max(3, min(22, int(max_z)))
@@ -839,10 +841,12 @@ class NativeTileMapView(QWidget):
         return img
 
     def reload_visible_tiles_from_cache(self) -> int:
-        """Drop in-memory tiles and repaint from disk cache (offline / HTTP disabled)."""
+        """Drop in-memory tiles and repaint from disk cache or offline folder."""
         self._tiles_inflight.clear()
         self._tiles.clear()
         self.update()
+        if self._tile_template == "{local}" and self._offline_root:
+            return self._reload_visible_local_tiles()
         if not tile_disk_cache.is_enabled():
             return 0
         vf = self._view_frame()
@@ -859,6 +863,35 @@ class NativeTileMapView(QWidget):
             for ty in range(y0, y1 + 1):
                 if self._read_disk_cache_sync(z, tx, ty) is not None:
                     hits += 1
+        if hits:
+            self.update()
+        return hits
+
+    def _reload_visible_local_tiles(self) -> int:
+        root = self._offline_root
+        if not root:
+            return 0
+        vf = self._view_frame()
+        if vf is None:
+            return 0
+        z, fx, fy, w, h = vf
+        tile_size = 256
+        x0 = int(math.floor(fx / tile_size)) - 1
+        y0 = int(math.floor(fy / tile_size)) - 1
+        x1 = int(math.ceil((fx + w) / tile_size)) + 1
+        y1 = int(math.ceil((fy + h) / tile_size)) + 1
+        hits = 0
+        base = Path(root)
+        for tx in range(x0, x1 + 1):
+            for ty in range(y0, y1 + 1):
+                p = base / str(z) / str(tx) / f"{ty}.png"
+                if not p.is_file():
+                    continue
+                img = QImage(str(p))
+                if img.isNull():
+                    continue
+                self._tiles[(z, tx, ty)] = img
+                hits += 1
         if hits:
             self.update()
         return hits
