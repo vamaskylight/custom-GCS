@@ -2997,6 +2997,9 @@ class MainWindow(QMainWindow):
                 lat,
                 lon,
                 relative_alt_m=float(data.get("relative_alt_m", 0.0)),
+                groundspeed_mps=float(
+                    data.get("groundspeed_mps", self._map_groundspeed_mps) or 0.0
+                ),
             )
             if self._auto_center_pending:
                 self._auto_center_pending = False
@@ -3019,10 +3022,11 @@ class MainWindow(QMainWindow):
             self._fields["groundspeed"].setText(f"{data.get('groundspeed', 0.0):.1f} m/s")
             self._fields["airspeed"].setText(f"{data.get('airspeed', 0.0):.1f} m/s")
             hd = float(data.get("heading", 0.0))
-            self._heading = hd
             self._fields["heading"].setText(f"{int(hd)}°")
-            self._compass.set_heading_deg(hd)
-            self._map_widget.set_vehicle_heading(hd, source="vfr")
+            if self._map_groundspeed_mps >= 0.4:
+                self._heading = hd
+                self._compass.set_heading_deg(hd)
+                self._map_widget.set_vehicle_heading(hd, source="vfr")
         elif msg_type == "ATTITUDE":
             self._fields["attitude"].setText(
                 f"{data.get('roll_deg', 0.0):.1f} / "
@@ -3030,9 +3034,10 @@ class MainWindow(QMainWindow):
                 f"{data.get('yaw_deg', 0.0):.1f} deg"
             )
             yaw_deg = float(data.get("yaw_deg", 0.0))
-            self._heading = (yaw_deg + 360.0) % 360.0
-            self._compass.set_heading_deg((yaw_deg + 360.0) % 360.0)
-            self._map_widget.set_vehicle_heading((yaw_deg + 360.0) % 360.0, source="att")
+            if self._map_groundspeed_mps >= 0.4:
+                self._heading = (yaw_deg + 360.0) % 360.0
+                self._compass.set_heading_deg((yaw_deg + 360.0) % 360.0)
+                self._map_widget.set_vehicle_heading((yaw_deg + 360.0) % 360.0, source="att")
         elif msg_type == "GPS_RAW_INT":
             hdop = data.get("hdop")
             hdop_text = "N/A" if hdop is None else f"{hdop:.2f}"
