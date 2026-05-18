@@ -226,8 +226,8 @@ class MapFooterTelemetryStrip(QFrame):
     """
     2×3 grid matching git `#telemetryStrip` (`setTelemetryOverlay` updates six spans).
 
-    Row 1: ↕ rel alt | ↑ ground spd | ⏱ time
-    Row 2: 👤 MSL | → spd | ↳ rel alt   (git duplicates spd/rel alt on row 2)
+    Row 1: ↕ rel alt (AGL) | ↑ vertical spd | ⏱ time
+    Row 2: 👤 distance from home | → ground spd | ↳ rel alt
     """
 
     def __init__(self, parent=None) -> None:
@@ -293,17 +293,18 @@ class MapFooterTelemetryStrip(QFrame):
     def set_values(
         self,
         row1_alt_ft: str,
-        row1_mph: str,
+        row1_vspeed_mph: str,
         time_text: str,
-        msl_ft: str,
+        distance_home_ft: str,
+        ground_speed_mph: str,
+        row2_alt_ft: str | None = None,
     ) -> None:
-        """Match git `setTelemetryOverlay`: row 2 spd/alt mirror row 1."""
         self._row1_alt.setText(row1_alt_ft)
-        self._row1_mph.setText(row1_mph)
+        self._row1_mph.setText(row1_vspeed_mph)
         self._row1_time.setText(time_text)
-        self._row2_msl.setText(msl_ft)
-        self._row2_mph.setText(row1_mph)
-        self._row2_alt.setText(row1_alt_ft)
+        self._row2_msl.setText(distance_home_ft)
+        self._row2_mph.setText(ground_speed_mph)
+        self._row2_alt.setText(row2_alt_ft if row2_alt_ft is not None else row1_alt_ft)
 
 
 def telemetry_strip_icon_as_qicon(kind: str, size: int = 24) -> QIcon:
