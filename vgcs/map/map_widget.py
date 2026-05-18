@@ -180,7 +180,7 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-followfix"
+MAP_BACKEND_BUILD = "2026-05-18-native2d-tilesfix"
 
 def _web_2d_fallback_allowed() -> bool:
     """2D map is NativeTileMapView only; WebEngine Leaflet is opt-in for debugging."""
@@ -2731,8 +2731,33 @@ class MapWidget(QWidget):
         """Alias: start decode if needed (no forced restart_decode)."""
         self._companion_start_decode_if_needed(reason=reason)
 
+    def _activate_startup_tile_source(self) -> None:
+        """Default to Esri satellite; use offline only when explicitly configured and tiles exist."""
+        try:
+            s = QSettings(_QS_NS, _QS_APP)
+            mode = str(s.value(_KEY_MAP_TILE_MODE, "sat") or "sat").strip().lower()
+            root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
+        except Exception:
+            mode, root = "sat", ""
+        use_offline = mode == "offline" and bool(root) and Path(root).is_dir()
+        if use_offline:
+            self.activate_offline_tiles(root)
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "local_viewport_has_tiles"):
+                try:
+                    if not nm.local_viewport_has_tiles():
+                        use_offline = False
+                        print(
+                            "[VGCS:map] offline folder has no tiles for this location — "
+                            "using Esri World Imagery"
+                        )
+                except Exception:
+                    use_offline = False
+        if not use_offline:
+            self.activate_satellite_tiles()
+
     def _native_tile_startup_check(self) -> None:
-        """If the native 2D map still has no tiles, nudge Esri once (do not wipe the tile cache)."""
+        """If the native 2D map still has no tiles, switch to Esri or nudge fetch (no cache wipe loop)."""
         if getattr(self, "_native_tile_fallback_done", False):
             return
         nm = getattr(self, "_native_map", None)
@@ -2756,12 +2781,17 @@ class MapWidget(QWidget):
         self._native_tile_startup_retries = retries + 1
         try:
             print(
-                f"[VGCS:map] native satellite tiles still loading (loaded={n}) — "
-                f"nudge {'Esri' if 'world_imagery' in tmpl else 'tile fetch'}"
+                f"[VGCS:map] native tiles still loading (loaded={n}) — "
+                f"{'switching to Esri' if '{local}' in tmpl else 'nudge fetch'}"
             )
         except Exception:
             pass
-        if "world_imagery" in tmpl or "{local}" in tmpl:
+        if "{local}" in tmpl:
+            try:
+                self.activate_satellite_tiles()
+            except Exception:
+                pass
+        elif "world_imagery" in tmpl:
             try:
                 nm.prefetch_viewport_tiles()
                 nm._warm_disk_tiles_for_viewport()
@@ -2793,12 +2823,16 @@ class MapWidget(QWidget):
             self._native_tile_fallback_done = True
             return
         self._native_tile_fallback_done = True
-        try:
-            print("[VGCS:map] native satellite still sparse — keep Esri (use Offline Tiles in toolbar if needed)")
-        except Exception:
-            pass
+        tmpl = str(getattr(nm, "_tile_template", "") or "").lower()
+        if "{local}" in tmpl or n <= 0:
+            try:
+                print("[VGCS:map] tiles still missing — activating Esri World Imagery")
+                self.activate_satellite_tiles()
+            except Exception:
+                pass
         try:
             nm.prefetch_viewport_tiles()
+            nm._warm_disk_tiles_for_viewport()
         except Exception:
             pass
         self._set_status(
@@ -2978,13 +3012,20 @@ class MapWidget(QWidget):
         candidates: list[tuple[str, str]] = []
         if tmpl:
             x, y = slippy_xy(lat, lng, max(0, min(19, z)))
-            url = (
-                tmpl.replace("{z}", str(z))
-                .replace("{x}", str(x))
-                .replace("{y}", str(y))
-                .replace("{s}", "a")
-            )
-            candidates.append(("active_view", url))
+            if tmpl == "{local}":
+                nm = getattr(self, "_native_map", None)
+                root = getattr(nm, "_offline_root", None) if nm is not None else None
+                if root:
+                    p = Path(str(root)) / str(z) / str(x) / f"{y}.png"
+                    candidates.append(("active_view", p.as_uri()))
+            else:
+                url = (
+                    tmpl.replace("{z}", str(z))
+                    .replace("{x}", str(x))
+                    .replace("{y}", str(y))
+                    .replace("{s}", "a")
+                )
+                candidates.append(("active_view", url))
         else:
             candidates.extend(
                 [
@@ -2999,7 +3040,7 @@ class MapWidget(QWidget):
                 ]
             )
 
-        if tmpl:
+        if tmpl and tmpl != "{local}":
             z0 = (
                 tmpl.replace("{z}", "0")
                 .replace("{x}", "0")
@@ -3541,15 +3582,9 @@ class MapWidget(QWidget):
             self._run_js(
                 f"window.__planRailTool = {json.dumps(t)}; setPlanRailTool({json.dumps(t)});"
             )
-            # Tile selection: offline folder if configured; else Esri World Imagery (satellite).
-            # Streets/OSM are toolbar-only — never auto-selected at startup.
+            # Tile selection: Esri satellite by default; offline only if mode=offline and tiles exist.
             try:
-                s = QSettings(_QS_NS, _QS_APP)
-                root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
-                if root and Path(root).is_dir():
-                    self.activate_offline_tiles(root)
-                else:
-                    self.activate_satellite_tiles()
+                self._activate_startup_tile_source()
                 try:
                     QTimer.singleShot(1200, lambda: self._probe_current_tiles(reason="startup"))
                 except Exception:
@@ -6701,13 +6736,8 @@ class MapWidget(QWidget):
                 pass
             self._on_3d_toggle_result(True, False)
         try:
-            s = QSettings(_QS_NS, _QS_APP)
-            root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
-            if root and Path(root).is_dir():
-                self.activate_offline_tiles(root)
-            else:
-                self.activate_satellite_tiles()
-                QTimer.singleShot(1200, lambda: self._probe_current_tiles(reason="3d_startup"))
+            self._activate_startup_tile_source()
+            QTimer.singleShot(1200, lambda: self._probe_current_tiles(reason="3d_startup"))
         except Exception:
             pass
         self._schedule_vehicle_pose_js(immediate=True)
@@ -6781,12 +6811,7 @@ class MapWidget(QWidget):
             self._pending_3d_activate = False
             _apply_3d_js()
             try:
-                s = QSettings(_QS_NS, _QS_APP)
-                root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
-                if root and Path(root).is_dir():
-                    self.activate_offline_tiles(root)
-                else:
-                    self.activate_satellite_tiles()
+                self._activate_startup_tile_source()
             except Exception:
                 pass
             return True

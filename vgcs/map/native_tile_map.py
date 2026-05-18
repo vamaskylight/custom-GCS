@@ -502,6 +502,21 @@ class NativeTileMapView(QWidget):
         except Exception:
             return 0
 
+    def local_viewport_has_tiles(self) -> bool:
+        """True if the offline folder contains at least one tile for the current map center."""
+        if self._tile_template != "{local}" or not self._offline_root:
+            return False
+        root = Path(self._offline_root)
+        z = int(self._view_z)
+        x, y = _tile_xy(self._center_lat, self._center_lon, z)
+        if (root / str(z) / str(x) / f"{y}.png").is_file():
+            return True
+        if z != 16:
+            x16, y16 = _tile_xy(self._center_lat, self._center_lon, 16)
+            if (root / "16" / str(x16) / f"{y16}.png").is_file():
+                return True
+        return False
+
     # --- map state ---
     def set_center(self, lat: float, lon: float) -> None:
         self._center_lat = float(lat)
@@ -1095,7 +1110,8 @@ class NativeTileMapView(QWidget):
     def _tile_url(self, z: int, x: int, y: int) -> str:
         tmpl = self._tile_template
         if tmpl == "{local}" and self._offline_root:
-            return str(Path(self._offline_root) / str(z) / str(x) / f"{y}.png")
+            p = Path(self._offline_root) / str(z) / str(x) / f"{y}.png"
+            return QUrl.fromLocalFile(str(p.resolve())).toString()
         if "{s}" in tmpl:
             s = random.choice(self._tile_subdomains)
             return (
@@ -1551,7 +1567,8 @@ def _fetch_tile_http_or_file(
                 except Exception:
                     pass
             return accepted
-        p = Path(url)
+        local_path = QUrl(url).toLocalFile() if "://" in str(url) else str(url)
+        p = Path(local_path)
         if p.is_file():
             accepted = _accept_map_tile(QImage(str(p)), zoom=z)
             return accepted if accepted is not None else QImage()
