@@ -179,6 +179,30 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 
 # Primary map: NativeTileMapView. Optional 3D: lazy Qt WebEngine + vendored Leaflet/Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
+# Bumped when map loading / fallback behaviour changes (visible in client console).
+MAP_BACKEND_BUILD = "2026-05-18-web2d-v3"
+
+_WEB_MAP_RELAYOUT_JS = """
+(function(){
+  try {
+    if (typeof set3DEnabled === 'function') set3DEnabled(false);
+    var m2 = document.getElementById('map2d');
+    var m3 = document.getElementById('map3d');
+    if (m2) m2.style.display = 'block';
+    if (m3) m3.style.display = 'none';
+    if (typeof map !== 'undefined' && map) {
+      map.invalidateSize(true);
+      if (window.__vgcsPendingCenter && window.__vgcsPendingCenter.length === 2) {
+        var zz = window.__vgcsPendingZoom;
+        if (typeof zz !== 'number' || !isFinite(zz)) zz = map.getZoom();
+        map.setView(window.__vgcsPendingCenter, zz, {animate: false});
+      }
+    }
+  } catch (e) {
+    try { console.log('[diag] relayout err=' + String(e)); } catch (e2) {}
+  }
+})();
+"""
 
 # Legacy placeholder (HTML lives in legacy_leaflet_map.html + legacy_leaflet_build).
 LEAFLET_HTML = ""
@@ -1430,6 +1454,11 @@ class MapWidget(QWidget):
             self._layout_plan_flight_panel()
         except Exception:
             pass
+        if getattr(self, "_web_2d_fallback_active", False):
+            try:
+                QTimer.singleShot(0, self._relayout_web_map_view)
+            except Exception:
+                pass
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().showEvent(event)
@@ -2702,9 +2731,72 @@ class MapWidget(QWidget):
             "Map tiles failed to load — check internet/firewall or use Offline Tiles in the toolbar"
         )
 
+    def _sync_web_map_center_from_native(self) -> None:
+        """Push native map center/zoom into Leaflet before showing the WebEngine view."""
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        try:
+            lat = float(getattr(nm, "_center_lat", 37.7749))
+            lon = float(getattr(nm, "_center_lon", -122.4194))
+            zoom = float(getattr(nm, "_zoom", 16.0))
+        except Exception:
+            return
+        try:
+            self._run_js(
+                f"window.__vgcsPendingCenter=[{lat},{lon}];"
+                f"window.__vgcsPendingZoom={zoom};"
+            )
+        except Exception:
+            pass
+
+    def _relayout_web_map_view(self) -> None:
+        w3 = getattr(self, "_web_3d_view", None)
+        if w3 is None:
+            return
+        try:
+            host = getattr(self, "_map_stack", None) or self._map_canvas
+            w3.resize(max(1, host.width()), max(1, host.height()))
+        except Exception:
+            pass
+        try:
+            w3.page().runJavaScript(_WEB_MAP_RELAYOUT_JS, lambda *_: None)
+        except Exception:
+            pass
+
+    def _ensure_map_tiles_visible(self) -> None:
+        """Prefer native Qt tiles; if they never load, show the WebEngine Leaflet map (preload often works)."""
+        if getattr(self, "_is_3d_mode", False):
+            return
+        nm = getattr(self, "_native_map", None)
+        try:
+            native_n = int(nm.loaded_tile_count()) if nm is not None else 0
+        except Exception:
+            native_n = 0
+        if native_n >= 6 and not getattr(self, "_web_2d_fallback_active", False):
+            try:
+                self._map_stack.setCurrentIndex(0)
+            except Exception:
+                pass
+            return
+        if getattr(self, "_web_2d_fallback_active", False):
+            self._relayout_web_map_view()
+            return
+        if not HAS_WEBENGINE_3D:
+            return
+        if not bool(getattr(self, "_web_3d_ready", False)):
+            self._pending_web_2d_fallback = True
+            try:
+                self._ensure_web_3d_view()
+            except Exception:
+                pass
+            return
+        self._activate_web_2d_fallback()
+
     def _activate_web_2d_fallback(self) -> bool:
         """Show the preloaded Leaflet 2D page when native Qt tiles never appear."""
         if getattr(self, "_web_2d_fallback_active", False):
+            self._relayout_web_map_view()
             return True
         if not HAS_WEBENGINE_3D:
             try:
@@ -2720,15 +2812,20 @@ class MapWidget(QWidget):
             self._native_tile_fallback_done = True
             self._pending_web_2d_fallback = False
             self._is_3d_mode = False
+            self._sync_web_map_center_from_native()
             try:
-                self._map_stack.setCurrentIndex(1)
+                self._map_stack.setCurrentWidget(self._web_3d_view)
             except Exception:
-                pass
+                try:
+                    self._map_stack.setCurrentIndex(1)
+                except Exception:
+                    pass
             self._inject_legacy_html_hud_hide()
             w3 = getattr(self, "_web_3d_view", None)
             if w3 is not None:
                 try:
-                    w3.page().runJavaScript("set3DEnabled(false);", lambda *_: None)
+                    w3.show()
+                    w3.raise_()
                 except Exception:
                     pass
             try:
@@ -2739,6 +2836,9 @@ class MapWidget(QWidget):
             self._btn_3d.setChecked(False)
             self._btn_3d.blockSignals(False)
             self._schedule_vehicle_pose_js(immediate=True)
+            self._relayout_web_map_view()
+            for ms in (0, 80, 250, 600):
+                QTimer.singleShot(ms, self._relayout_web_map_view)
             try:
                 print("[VGCS:map] activated WebEngine 2D fallback (native tiles did not load)")
             except Exception:
@@ -3296,8 +3396,8 @@ class MapWidget(QWidget):
         try:
             seed_ok = bundled_seed_root().is_dir()
             print(
-                f"[VGCS:map-native] NativeTileMapView ready "
-                f"(bundled_seed={'yes' if seed_ok else 'no'})"
+                f"[VGCS:map] backend build {MAP_BACKEND_BUILD} | "
+                f"[VGCS:map-native] ready bundled_seed={'yes' if seed_ok else 'no'}"
             )
         except Exception:
             pass
@@ -3386,9 +3486,14 @@ class MapWidget(QWidget):
                     except Exception:
                         pass
                     try:
-                        QTimer.singleShot(2500, self._native_tile_startup_check)
+                        QTimer.singleShot(2000, self._native_tile_startup_check)
                     except Exception:
                         pass
+                    for delay_ms in (900, 1800, 3500):
+                        try:
+                            QTimer.singleShot(delay_ms, self._ensure_map_tiles_visible)
+                        except Exception:
+                            pass
             except Exception:
                 pass
             self.map_page_ready.emit()
@@ -5199,6 +5304,13 @@ class MapWidget(QWidget):
             pass
 
     def _on_web_title_changed(self, title: str) -> None:
+        if title.startswith("VGCS_MAP_TILES_READY:"):
+            try:
+                QTimer.singleShot(0, self._ensure_map_tiles_visible)
+            except Exception:
+                pass
+            self._run_js("document.title = 'VGCS Map';")
+            return
         if title.startswith("VGCS_3D_MAP_BEARING:"):
             try:
                 parts = title.split(":")
@@ -6453,10 +6565,14 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             return
-        # Only the explicit "user pressed 3D" path may swap the stack. Background preload
-        # leaves the user on the native 2D map so they never see a flash to the WebEngine page.
+        # Preload finished: if native Qt tiles are still empty, promote the Leaflet page (tiles ok=1 in console).
         if not getattr(self, "_pending_3d_activate", False):
             self._schedule_vehicle_pose_js(immediate=True)
+            try:
+                QTimer.singleShot(150, self._ensure_map_tiles_visible)
+                QTimer.singleShot(600, self._ensure_map_tiles_visible)
+            except Exception:
+                pass
             return
         self._pending_3d_activate = False
         try:

@@ -2297,6 +2297,9 @@
             window.__diag.last = now;
             try { console.log('[diag] tiles ok=' + window.__diag.ok + ' err=' + window.__diag.err); } catch(e) {}
           }
+          if (window.__diag.ok === 1) {
+            try { document.title = 'VGCS_MAP_TILES_READY:' + now; } catch (eReady) {}
+          }
         });
         tileLayer.on('tileerror', function(ev) {
           window.__diag.err += 1;
@@ -3902,6 +3905,26 @@
     }
 
     function getWaypointCount() { return waypoints.length; }
+
+    function __vgcsRelayoutMap2d() {
+      try {
+        var m2 = document.getElementById('map2d');
+        var m3 = document.getElementById('map3d');
+        if (m2) m2.style.display = 'block';
+        if (m3) m3.style.display = 'none';
+        if (typeof map !== 'undefined' && map) {
+          map.invalidateSize(true);
+          if (window.__vgcsPendingCenter && window.__vgcsPendingCenter.length === 2) {
+            var zz = window.__vgcsPendingZoom;
+            if (typeof zz !== 'number' || !isFinite(zz)) zz = map.getZoom();
+            map.setView(window.__vgcsPendingCenter, zz, { animate: false });
+          }
+        }
+      } catch (e) {
+        try { console.log('[diag] relayout err=' + String(e)); } catch (e2) {}
+      }
+    }
+    window.__vgcsRelayoutMap2d = __vgcsRelayoutMap2d;
 
     function set3DEnabled(enabled) {
       if (enabled) {
