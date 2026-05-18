@@ -151,6 +151,7 @@ _KEY_PLAN_CURRENT_MISSION_JSON = "plan_current_mission_json"
 _KEY_TOOLBAR_EXPORT_MISSION_JSON = "toolbar_export_mission_json"
 _KEY_PLAN_LAST_MISSION_JSON_LEGACY = "plan_last_mission_json"  # legacy; read fallback only
 _KEY_MAP_OFFLINE_TILE_ROOT = "map_offline_tile_root"
+_KEY_MAP_TILE_CACHE_DIR = "map_tile_cache_dir"
 _KEY_MAP_WEBCAM_ENABLED = "map_webcam_enabled"
 _KEY_MAP_LOW_SPEC_MODE = "map_low_spec_mode"  # 'auto' | 'on' | 'off'
 _KEY_MAP_TILE_MODE = "map_tile_mode"  # 'esri_streets' | 'osm' | 'sat' | 'offline'
@@ -975,27 +976,33 @@ class MapWidget(QWidget):
         self._native_telemetry.raise_()
 
         # Legacy Web `#actionRail` / `.actionBtn` — line-art icons match bottom ``TelemetryStripIcon`` style.
-        self._map_action_rail = QFrame(self._map_canvas)
+        # Parent = `_panel` so fullscreen video on `_map_canvas` cannot cover Takeoff/Return.
+        self._map_action_rail = QFrame(self._panel)
         self._map_action_rail.setObjectName("mapActionRail")
-        self._map_action_rail.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._map_action_rail.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._map_action_rail.setStyleSheet(
+            "QFrame#mapActionRail { background: transparent; border: none; }"
+        )
         ar_l = QVBoxLayout(self._map_action_rail)
         ar_l.setContentsMargins(0, 0, 0, 0)
         ar_l.setSpacing(8)
         _map_action_btn_base_ss = (
             "QPushButton#mapActionTakeoffBtn, QPushButton#mapActionReturnBtn {"
             "min-width:54px; max-width:54px; min-height:54px; max-height:54px;"
-            "border:1px solid rgba(255,255,255,0.35);"
-            "background:rgba(34,42,56,0.92);"
-            "color:#c8d3ea;"
+            "border:1px solid rgba(210,220,240,0.65);"
+            "background:rgba(24,30,42,0.97);"
+            "color:#e8edf8;"
             "font:600 11px \"Segoe UI\", Arial, sans-serif;"
             "padding:0px;"
             "outline:none;"
             "}"
             "QPushButton#mapActionTakeoffBtn:hover:enabled, QPushButton#mapActionReturnBtn:hover:enabled {"
-            "background:rgba(46,58,78,0.95);"
-            "border-color:rgba(136,164,205,0.7);"
+            "background:rgba(40,50,68,0.98);"
+            "border-color:rgba(160,185,230,0.85);"
             "}"
-            "QPushButton#mapActionTakeoffBtn:disabled, QPushButton#mapActionReturnBtn:disabled { opacity:0.45; }"
+            "QPushButton#mapActionTakeoffBtn:disabled, QPushButton#mapActionReturnBtn:disabled {"
+            "background:rgba(24,30,42,0.75); color:#8892a8; border-color:rgba(120,130,150,0.4);"
+            "}"
         )
         _takeoff_ss = (
             _map_action_btn_base_ss
@@ -1091,7 +1098,9 @@ class MapWidget(QWidget):
         self._native_minimap = QLabel(self._native_minimap_wrap)
         self._native_minimap.setObjectName("nativeMinimapImage")
         self._native_minimap.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._native_minimap.setStyleSheet("QLabel#nativeMinimapImage { background: transparent; border: none; }")
+        self._native_minimap.setStyleSheet(
+            "QLabel#nativeMinimapImage { background-color: #18222e; border: none; }"
+        )
         self._native_minimap.setCursor(Qt.CursorShape.OpenHandCursor)
         self._native_minimap.setToolTip("Drag to pan map · click (no drag) to swap back")
         # QLabel does not get move events without mouse tracking unless a button is held; tracking is
@@ -1829,10 +1838,6 @@ class MapWidget(QWidget):
             elif video_vis and swapped:
                 self._native_video_preview.raise_()
 
-            mar = getattr(self, "_map_action_rail", None)
-            if mar is not None:
-                mar.raise_()
-
             ly = getattr(self, "_native_rail_layer", None)
             if ly is not None and ly.isVisible():
                 ly.raise_()
@@ -1846,6 +1851,9 @@ class MapWidget(QWidget):
                 self._native_minimap_wrap.raise_()
                 self._btn_native_minimap_plus.raise_()
                 self._btn_native_minimap_minus.raise_()
+            mar = getattr(self, "_map_action_rail", None)
+            if mar is not None and mar.isVisible():
+                mar.raise_()
         except Exception:
             pass
 
@@ -1874,6 +1882,7 @@ class MapWidget(QWidget):
                     self._native_minimap_wrap.hide()
                     self._btn_native_minimap_plus.hide()
                     self._btn_native_minimap_minus.hide()
+                    self._map_action_rail.hide()
                 except Exception:
                     pass
             else:
@@ -1938,7 +1947,15 @@ class MapWidget(QWidget):
             )
             mar = getattr(self, "_map_action_rail", None)
             if mar is not None:
-                mar.move(_MAP_ACTION_RAIL_LEFT_PX, _MAP_ACTION_RAIL_TOP_PX)
+                po_act = self._map_canvas.mapTo(
+                    self._panel, QPoint(_MAP_ACTION_RAIL_LEFT_PX, _MAP_ACTION_RAIL_TOP_PX)
+                )
+                mar_w = int(mar.width()) if mar.width() > 0 else 54
+                mar_h = int(mar.height()) if mar.height() > 0 else 116
+                mar.setGeometry(po_act.x(), po_act.y(), mar_w, mar_h)
+                if not plan_on:
+                    mar.show()
+                    mar.raise_()
             swapped = bool(getattr(self, "_video_swapped", False))
             preview_on = bool(getattr(self, "_video_preview_enabled", False))
             preview_maps = preview_on and not plan_on
@@ -2033,7 +2050,15 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-    def _update_native_minimap_from_web_grab(self) -> bool:
+    def _minimap_pixmap_is_blank(self, pm: QPixmap) -> bool:
+        try:
+            if pm is None or pm.isNull():
+                return True
+            return self._native_minimap_tile_bad(pm.toImage())
+        except Exception:
+            return True
+
+    def _update_native_minimap_from_web_grab(self, *, allow_offline: bool = False) -> bool:
         """
         Render the **full** map view into the swap mini-card so it doubles as a pan thumbnail.
 
@@ -2043,6 +2068,8 @@ class MapWidget(QWidget):
         try:
             nm = getattr(self, "_native_map", None)
             if nm is None:
+                return False
+            if not allow_offline and not bool(getattr(nm, "_remote_tiles_enabled", True)):
                 return False
             tw = max(1, int(self._native_minimap.width()))
             th = max(1, int(self._native_minimap.height()))
@@ -2081,6 +2108,8 @@ class MapWidget(QWidget):
                 scaled.setDevicePixelRatio(dpr)
             except Exception:
                 pass
+            if self._minimap_pixmap_is_blank(scaled):
+                return False
             self._native_minimap.setPixmap(scaled)
             return True
         except Exception:
@@ -2110,9 +2139,24 @@ class MapWidget(QWidget):
             cx = wi // 2
             cy = hi // 2
             pr = max(4, int(round(5 * dpr)))
-            p.setPen(QPen(QColor(35, 0, 0), 2))
-            p.setBrush(QColor(240, 40, 44))
-            p.drawEllipse(QPoint(cx, cy), pr, pr)
+            # Vehicle at map center when GPS is available (minimap mirrors main map center).
+            try:
+                if self._lat is not None and self._lon is not None:
+                    p.setPen(QPen(QColor(255, 255, 255), 2))
+                    p.setBrush(QColor(240, 44, 52))
+                    p.drawEllipse(QPoint(cx, cy), pr + 2, pr + 2)
+            except Exception:
+                p.setPen(QPen(QColor(35, 0, 0), 2))
+                p.setBrush(QColor(240, 40, 44))
+                p.drawEllipse(QPoint(cx, cy), pr, pr)
+            p.setPen(QColor(160, 175, 200))
+            font = p.font()
+            font.setPointSize(8)
+            p.setFont(font)
+            if self._lat is not None and self._lon is not None:
+                p.drawText(6, hi - 8, f"{float(self._lat):.5f}, {float(self._lon):.5f}")
+            else:
+                p.drawText(6, hi - 8, "No GPS fix")
             p.end()
             pm = QPixmap.fromImage(img)
             try:
@@ -2166,10 +2210,16 @@ class MapWidget(QWidget):
                 return
         except Exception:
             return
-        # Best path: mirror current in-app map rendering.
-        if not self._update_native_minimap_from_web_grab():
-            # Never display external placeholder/test-pattern tiles again.
+        nm = getattr(self, "_native_map", None)
+        if nm is not None and not bool(getattr(nm, "_remote_tiles_enabled", True)):
+            if not self._update_native_minimap_from_web_grab(allow_offline=True):
+                self._render_native_minimap_fallback()
+        elif not self._update_native_minimap_from_web_grab():
             self._render_native_minimap_fallback()
+        else:
+            pm = self._native_minimap.pixmap()
+            if pm is not None and self._minimap_pixmap_is_blank(pm):
+                self._render_native_minimap_fallback()
         self._raise_native_minimap_zoom_buttons()
 
     def _retry_native_video_pixmap(self) -> None:
@@ -2493,6 +2543,14 @@ class MapWidget(QWidget):
         self._sync_map_action_rail_enabled()
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
         # Run a one-time tile probe after connect to log "blocked vs placeholder" clearly.
+        if c:
+            self._tile_network_fallback_tier = 0
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "set_remote_tiles_enabled"):
+                try:
+                    nm.set_remote_tiles_enabled(True)
+                except Exception:
+                    pass
         if c and not getattr(self, "_tile_probe_ran", False):
             self._tile_probe_ran = True
             try:
@@ -2536,6 +2594,10 @@ class MapWidget(QWidget):
             if bool(getattr(self, "_web_ready", False)):
                 self._native_compass.show()
                 self._native_telemetry.show()
+                try:
+                    self._map_action_rail.show()
+                except Exception:
+                    pass
             QTimer.singleShot(0, self._layout_native_hud)
             QTimer.singleShot(0, self._stack_native_overlays_above_tile_map)
         except Exception:
@@ -2739,14 +2801,27 @@ class MapWidget(QWidget):
             "URLError" in detail_s or "urlopen error" in detail_s.lower()
         )
         if "active_view" in label and network_fail:
-            if not getattr(self, "_tile_network_fallback_done", False):
-                self._tile_network_fallback_done = True
+            tier = int(getattr(self, "_tile_network_fallback_tier", 0) or 0)
+            nm = getattr(self, "_native_map", None)
+            if tier == 0:
+                self._tile_network_fallback_tier = 1
                 self._set_status(
-                    "Map tiles unreachable (no internet?) — trying OpenStreetMap; "
-                    "or use Offline Tiles in the map toolbar"
+                    "Map tiles unreachable — trying OpenStreetMap (or use Offline Tiles…)"
                 )
                 try:
                     self.activate_osm_tiles()
+                except Exception:
+                    pass
+            elif tier == 1:
+                self._tile_network_fallback_tier = 2
+                if nm is not None and hasattr(nm, "set_remote_tiles_enabled"):
+                    nm.set_remote_tiles_enabled(False)
+                self._set_status(
+                    "No internet for HTTP tiles — disk cache + grid. "
+                    "Fly once online to fill ~/.vgcs/tile-cache (or Offline Tiles…)."
+                )
+                try:
+                    QTimer.singleShot(0, self._update_native_minimap)
                 except Exception:
                     pass
             return
@@ -3156,6 +3231,31 @@ class MapWidget(QWidget):
             return None
         return float(self._lat), float(self._lon)
 
+    def _apply_map_tile_disk_cache(self) -> None:
+        """Wire HTTP tile disk cache path (``~/.vgcs/tile-cache``) into the native map."""
+        try:
+            from vgcs.map import tile_disk_cache
+
+            if not tile_disk_cache.is_enabled():
+                return
+            try:
+                s = QSettings(_QS_NS, _QS_APP)
+                custom = str(s.value(_KEY_MAP_TILE_CACHE_DIR, "") or "").strip()
+                if custom:
+                    tile_disk_cache.set_cache_root(custom)
+            except Exception:
+                pass
+            root = tile_disk_cache.default_cache_root()
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm._tile_cache_root = root
+            try:
+                print(f"[VGCS:map] HTTP tile disk cache: {root}")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _init_map_backend(self) -> None:
         self._map_canvas.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._map_canvas.setAutoFillBackground(True)
@@ -3179,6 +3279,7 @@ class MapWidget(QWidget):
         self._native_map.observation_map_click.connect(
             lambda la, lo: self._log_observation("map_mark", map_lat=float(la), map_lon=float(lo))
         )
+        self._apply_map_tile_disk_cache()
         self._web_ready = True
         self._set_status("Map backend: Native Qt tiles")
         self._on_map_loaded(True)
@@ -4307,7 +4408,7 @@ class MapWidget(QWidget):
             self._render_native_video_preview(img2)
             if self._uses_companion_rtsp():
                 try:
-                    self._native_video_preview.raise_()
+                    self._stack_native_overlays_above_tile_map()
                 except Exception:
                     pass
         except RuntimeError:
