@@ -3286,6 +3286,8 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self.activate_offline_tiles(str(root))
+        QTimer.singleShot(150, lambda: self._refresh_offline_map_tiles(reason="bundled_seed"))
+        QTimer.singleShot(600, lambda: self._refresh_offline_map_tiles(reason="bundled_seed_retry"))
         return True
 
     def _companion_offline_tile_paths(self) -> list[str]:
@@ -5901,12 +5903,12 @@ class MapWidget(QWidget):
                 nm = getattr(self, "_native_map", None)
                 if nm is not None:
                     nm.set_center(float(lat), float(lon))
-                    try:
-                        QTimer.singleShot(
-                            0, lambda: self._refresh_offline_map_tiles(reason="gps_fix")
-                        )
-                    except Exception:
-                        pass
+                    if self._map_using_offline_tiles():
+                        for delay_ms, tag in ((120, "gps_fix"), (450, "gps_fix_retry")):
+                            QTimer.singleShot(
+                                delay_ms,
+                                lambda t=tag: self._refresh_offline_map_tiles(reason=t),
+                            )
             except Exception:
                 pass
         self._schedule_vehicle_pose_js(immediate=first_fix)
@@ -6407,18 +6409,28 @@ class MapWidget(QWidget):
             QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "offline")
         except Exception:
             pass
-        # Native map expects a file: URL to the tile *root* (z/x/y.png); not a template path.
-        url = QUrl.fromLocalFile(str(resolved)).toString()
         try:
             nm = getattr(self, "_native_map", None)
             if nm is not None:
-                nm.set_tile_source(url, "", 19)
+                if hasattr(nm, "set_offline_tile_root"):
+                    nm.set_offline_tile_root(resolved)
+                else:
+                    url = QUrl.fromLocalFile(str(resolved)).toString()
+                    nm.set_tile_source(url, "", 19)
+                la = getattr(self, "_lat", None)
+                lo = getattr(self, "_lon", None)
+                if la is not None and lo is not None:
+                    nm.set_center(float(la), float(lo))
                 try:
-                    nm.update()
+                    hits = int(nm.reload_visible_tiles_from_cache() or 0)
+                    print(
+                        f"[VGCS:map] offline tiles root={resolved} visible_loaded={hits}"
+                    )
                 except Exception:
                     pass
         except Exception:
             pass
+        url = QUrl.fromLocalFile(str(resolved)).toString()
         self._run_js(
             f"setTileSource({json.dumps(url + '/{z}/{x}/{y}.png')}, 'Offline tile cache', 19);"
         )
