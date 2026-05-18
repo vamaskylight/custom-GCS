@@ -687,6 +687,8 @@ class MapWidget(QWidget):
         self._tile_probe_bridge.result.connect(self._on_tile_probe_result)
         self._tile_probe_ran = False
         self._native_tile_fallback_done = False
+        self._web_2d_fallback_active = False
+        self._pending_web_2d_fallback = False
 
         # M3 video settings snapshot (applied lazily when video backend initializes).
         self._video_settings_enabled = False
@@ -2659,12 +2661,14 @@ class MapWidget(QWidget):
         except Exception:
             pass
         try:
-            QTimer.singleShot(3500, self._native_tile_startup_check_final)
+            QTimer.singleShot(2500, self._native_tile_startup_check_final)
         except Exception:
             pass
 
     def _native_tile_startup_check_final(self) -> None:
         if getattr(self, "_native_tile_fallback_done", False):
+            return
+        if getattr(self, "_web_2d_fallback_active", False):
             return
         nm = getattr(self, "_native_map", None)
         if nm is None:
@@ -2690,10 +2694,63 @@ class MapWidget(QWidget):
                 "Map: using bundled offline tiles (internet/proxy may be blocking Esri/OSM)"
             )
             return
+        # WebEngine preload often succeeds when native urllib/Qt worker fetch fails (client PCs).
+        if self._activate_web_2d_fallback():
+            return
         self._native_tile_fallback_done = True
         self._set_status(
             "Map tiles failed to load — check internet/firewall or use Offline Tiles in the toolbar"
         )
+
+    def _activate_web_2d_fallback(self) -> bool:
+        """Show the preloaded Leaflet 2D page when native Qt tiles never appear."""
+        if getattr(self, "_web_2d_fallback_active", False):
+            return True
+        if not HAS_WEBENGINE_3D:
+            try:
+                print("[VGCS:map] web 2D fallback unavailable (Qt WebEngine not installed)")
+            except Exception:
+                pass
+            return False
+        if not self._ensure_web_3d_view():
+            return False
+
+        def _apply() -> None:
+            self._web_2d_fallback_active = True
+            self._native_tile_fallback_done = True
+            self._pending_web_2d_fallback = False
+            self._is_3d_mode = False
+            try:
+                self._map_stack.setCurrentIndex(1)
+            except Exception:
+                pass
+            self._inject_legacy_html_hud_hide()
+            w3 = getattr(self, "_web_3d_view", None)
+            if w3 is not None:
+                try:
+                    w3.page().runJavaScript("set3DEnabled(false);", lambda *_: None)
+                except Exception:
+                    pass
+            try:
+                self.activate_satellite_tiles()
+            except Exception:
+                pass
+            self._btn_3d.blockSignals(True)
+            self._btn_3d.setChecked(False)
+            self._btn_3d.blockSignals(False)
+            self._schedule_vehicle_pose_js(immediate=True)
+            try:
+                print("[VGCS:map] activated WebEngine 2D fallback (native tiles did not load)")
+            except Exception:
+                pass
+            self._set_status("Map: web view active (native tiles blocked on this PC)")
+
+        w3 = getattr(self, "_web_3d_view", None)
+        if w3 is not None and bool(getattr(self, "_web_3d_ready", False)):
+            _apply()
+            return True
+        self._pending_web_2d_fallback = True
+        return True
 
     def _probe_current_tiles(self, *, reason: str) -> None:
         # Probe the *current* view tile (not just z=0), because placeholders often occur only at higher zooms.
@@ -3236,6 +3293,14 @@ class MapWidget(QWidget):
         self._native_map.observation_map_click.connect(
             lambda la, lo: self._log_observation("map_mark", map_lat=float(la), map_lon=float(lo))
         )
+        try:
+            seed_ok = bundled_seed_root().is_dir()
+            print(
+                f"[VGCS:map-native] NativeTileMapView ready "
+                f"(bundled_seed={'yes' if seed_ok else 'no'})"
+            )
+        except Exception:
+            pass
         self._web_ready = True
         self._set_status("Map backend: Native Qt tiles")
         self._on_map_loaded(True)
@@ -3321,7 +3386,7 @@ class MapWidget(QWidget):
                     except Exception:
                         pass
                     try:
-                        QTimer.singleShot(3500, self._native_tile_startup_check)
+                        QTimer.singleShot(2500, self._native_tile_startup_check)
                     except Exception:
                         pass
             except Exception:
@@ -6382,6 +6447,12 @@ class MapWidget(QWidget):
             self._set_status("3D map page failed to load (check network / WebEngine)")
             return
         self._inject_legacy_html_hud_hide()
+        if getattr(self, "_pending_web_2d_fallback", False):
+            try:
+                self._activate_web_2d_fallback()
+            except Exception:
+                pass
+            return
         # Only the explicit "user pressed 3D" path may swap the stack. Background preload
         # leaves the user on the native 2D map so they never see a flash to the WebEngine page.
         if not getattr(self, "_pending_3d_activate", False):
@@ -6423,6 +6494,23 @@ class MapWidget(QWidget):
         if not enabled:
             self._is_3d_mode = False
             self._pending_3d_activate = False
+            if getattr(self, "_web_2d_fallback_active", False):
+                w3 = getattr(self, "_web_3d_view", None)
+                if w3 is not None and self._web_3d_ready:
+                    try:
+                        w3.page().runJavaScript("set3DEnabled(false);", lambda *_: None)
+                    except Exception:
+                        pass
+                    try:
+                        self._map_stack.setCurrentIndex(1)
+                    except Exception:
+                        pass
+                    self._btn_3d.blockSignals(True)
+                    self._btn_3d.setChecked(False)
+                    self._btn_3d.blockSignals(False)
+                    self._set_status("Map: web view active (native tiles blocked on this PC)")
+                    self._schedule_vehicle_pose_js(immediate=True)
+                    return True
             w3 = getattr(self, "_web_3d_view", None)
             if w3 is not None and self._web_3d_ready:
                 try:
