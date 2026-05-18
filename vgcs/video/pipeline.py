@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi19"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi20"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -329,7 +329,29 @@ def _siyi_rtsp_camera_busy(tail_b: bytes) -> bool:
     if not tail_b:
         return False
     tl = tail_b.lower()
-    return b"-138" in tl or b"error number -138" in tl or b"-10054" in tl
+    return (
+        b"-138" in tl
+        or b"error number -138" in tl
+        or b"-10054" in tl
+        or b"operation not permitted" in tl
+    )
+
+
+def _siyi_hevc_glitch_release_sleep() -> None:
+    """Pause before reopening RTSP after HEVC POC/RPS loss (avoids -138 on immediate reconnect)."""
+    raw = str(os.environ.get("VGCS_SIYI_HEVC_RELEASE_S", "3.5") or "3.5").strip()
+    try:
+        delay = max(1.0, min(8.0, float(raw)))
+    except ValueError:
+        delay = 3.5
+    try:
+        print(
+            f"[VGCS:video] SIYI HEVC: waiting {delay:.1f}s for camera after glitch "
+            "(do not open RC/VLC video)"
+        )
+    except Exception:
+        pass
+    time.sleep(delay)
 
 
 def _siyi_camera_release_sleep(tail_b: bytes, empty_sessions: int) -> None:
@@ -460,7 +482,7 @@ def _ffmpeg_preflags_before_input(
             )
         else:
             if _rtsp_url_is_siyi_style(u):
-                # SIYI ZR10: gentler demux + igndts (nobuffer alone can stutter then freeze).
+                # SIYI ZR10: gentler demux + igndts; demuxer auto-reconnect survives brief HEVC loss.
                 out.extend(
                     [
                         "-fflags",
@@ -471,6 +493,14 @@ def _ffmpeg_preflags_before_input(
                         "8000000",
                         "-flags",
                         "low_delay",
+                        "-reconnect",
+                        "1",
+                        "-reconnect_at_eof",
+                        "1",
+                        "-reconnect_streamed",
+                        "1",
+                        "-reconnect_delay_max",
+                        "2",
                     ]
                 )
             else:
@@ -1605,6 +1635,7 @@ class RtspSource(QObject):
                                 session_stop=session_stop,
                                 frames_counter=frame_count_box,
                             )
+                        read_fail_streak = 0
                         try:
                             while self._running and not self._ffmpeg_stop.is_set():
                                 if (
@@ -1622,7 +1653,12 @@ class RtspSource(QObject):
                                         pass
                                 raw = self._read_exact(p.stdout, frame_bytes)
                                 if raw is None:
+                                    if p.poll() is None and read_fail_streak < 40:
+                                        read_fail_streak += 1
+                                        time.sleep(0.05)
+                                        continue
                                     break
+                                read_fail_streak = 0
                                 now_decode = time.monotonic()
                                 self._ffmpeg_last_decode_mono = now_decode
                                 try:
@@ -1774,6 +1810,14 @@ class RtspSource(QObject):
                                                     )
                                                 except Exception:
                                                     pass
+                                    if b"operation not permitted" in tail.lower():
+                                        try:
+                                            self.error.emit(
+                                                "RTSP blocked (Operation not permitted). "
+                                                "Wait 5s, close other viewers, retry."
+                                            )
+                                        except Exception:
+                                            pass
                                     if b"404" in tail or b"Not Found" in tail:
                                         url_fatal = True
                                         msg = (
@@ -1846,8 +1890,8 @@ class RtspSource(QObject):
                                 try:
                                     if hevc_glitch:
                                         print(
-                                            f"[VGCS:video] SIYI HEVC glitch: reconnect in "
-                                            f"{cooldown:.1f}s (hold last frame in preview)"
+                                            "[VGCS:video] SIYI HEVC glitch: reopening RTSP "
+                                            "(hold last frame in preview)"
                                         )
                                         reconnect_delay = 2.5
                                     elif cooldown >= 6.0:
@@ -1857,7 +1901,14 @@ class RtspSource(QObject):
                                         )
                                 except Exception:
                                     pass
-                            time.sleep(cooldown)
+                                if hevc_glitch:
+                                    _siyi_hevc_glitch_release_sleep()
+                                elif _siyi_rtsp_camera_busy(tail_b):
+                                    _siyi_camera_release_sleep(tail_b, 1)
+                                else:
+                                    time.sleep(cooldown)
+                            else:
+                                time.sleep(cooldown)
                             continue
 
                         empty_sessions += 1
