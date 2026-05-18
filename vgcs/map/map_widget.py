@@ -974,10 +974,12 @@ class MapWidget(QWidget):
         self._native_telemetry.hide()
         self._native_telemetry.raise_()
 
-        # Legacy Web `#actionRail` / `.actionBtn` — line-art icons match bottom ``TelemetryStripIcon`` style.
-        self._map_action_rail = QFrame(self._map_canvas)
+        # Legacy Web `#actionRail` — on `_panel` (not `_map_canvas`) so fullscreen video cannot
+        # cover Takeoff/Return when companion RTSP re-stacks the preview label every frame.
+        self._map_action_rail = QFrame(self._panel)
         self._map_action_rail.setObjectName("mapActionRail")
-        self._map_action_rail.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._map_action_rail.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._map_action_rail.setStyleSheet("QFrame#mapActionRail { background: transparent; border: none; }")
         ar_l = QVBoxLayout(self._map_action_rail)
         ar_l.setContentsMargins(0, 0, 0, 0)
         ar_l.setSpacing(8)
@@ -1062,7 +1064,6 @@ class MapWidget(QWidget):
         self._map_action_return_btn.clicked.connect(lambda: self.return_requested.emit())
         self._map_action_rail.setFixedSize(54, 54 + 8 + 54)
         self._map_action_rail.show()
-        self._map_action_rail.raise_()
 
         self._plan_flight_panel = PlanFlightPanel(panel)
         self._plan_flight_panel.hide()
@@ -1805,11 +1806,20 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
+    def _raise_map_action_rail(self) -> None:
+        """Keep Takeoff/Return above map canvas + fullscreen video (panel-level overlay)."""
+        mar = getattr(self, "_map_action_rail", None)
+        if mar is not None and mar.isVisible():
+            try:
+                mar.raise_()
+            except Exception:
+                pass
+
     def _stack_native_overlays_above_tile_map(self) -> None:
         """
         Lower the tile map, then stack video / footer HUD / minimap / camera rail so hit-testing matches intent.
-        Compass, telemetry, and minimap live on `_panel` (siblings of the camera rail) so they are never
-        covered by `#nativeCameraRailLayer`. Video stays on `_map_canvas`.
+        Compass, telemetry, Takeoff/Return, and minimap live on `_panel` so they are never covered by
+        fullscreen `#nativeVideoPreview` on `_map_canvas`. Video stays on `_map_canvas` only.
         """
         nm = getattr(self, "_native_map", None)
         if nm is None:
@@ -1823,15 +1833,8 @@ class MapWidget(QWidget):
             swapped = bool(getattr(self, "_video_swapped", False))
             video_vis = bool(preview_on and self._native_video_preview.isVisible())
 
-            if video_vis and not swapped:
-                # PiP: video above map stack; footer HUD on `_panel` stays above the PiP corner.
+            if video_vis:
                 self._native_video_preview.raise_()
-            elif video_vis and swapped:
-                self._native_video_preview.raise_()
-
-            mar = getattr(self, "_map_action_rail", None)
-            if mar is not None:
-                mar.raise_()
 
             ly = getattr(self, "_native_rail_layer", None)
             if ly is not None and ly.isVisible():
@@ -1846,6 +1849,7 @@ class MapWidget(QWidget):
                 self._native_minimap_wrap.raise_()
                 self._btn_native_minimap_plus.raise_()
                 self._btn_native_minimap_minus.raise_()
+            self._raise_map_action_rail()
         except Exception:
             pass
 
@@ -1938,7 +1942,12 @@ class MapWidget(QWidget):
             )
             mar = getattr(self, "_map_action_rail", None)
             if mar is not None:
-                mar.move(_MAP_ACTION_RAIL_LEFT_PX, _MAP_ACTION_RAIL_TOP_PX)
+                po = self._map_canvas.mapTo(self._panel, QPoint(0, 0))
+                mar.move(
+                    po.x() + int(_MAP_ACTION_RAIL_LEFT_PX),
+                    po.y() + int(_MAP_ACTION_RAIL_TOP_PX),
+                )
+                self._raise_map_action_rail()
             swapped = bool(getattr(self, "_video_swapped", False))
             preview_on = bool(getattr(self, "_video_preview_enabled", False))
             preview_maps = preview_on and not plan_on
@@ -4305,11 +4314,6 @@ class MapWidget(QWidget):
             return
         try:
             self._render_native_video_preview(img2)
-            if self._uses_companion_rtsp():
-                try:
-                    self._native_video_preview.raise_()
-                except Exception:
-                    pass
         except RuntimeError:
             pass
 
