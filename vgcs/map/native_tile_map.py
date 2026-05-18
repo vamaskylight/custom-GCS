@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
 import re
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
@@ -37,21 +38,67 @@ def _tile_xy(lat: float, lon: float, z: int) -> tuple[int, int]:
     return max(0, min(n - 1, x)), max(0, min(n - 1, y))
 
 
+_TILE_SIZE = 256
+_TILE_CACHE_ROOT = (Path.home() / ".vgcs" / "tile-cache").resolve()
+_HTTP_OPENER = build_opener()
+
+
+def _tile_source_id(template: str) -> str:
+    return hashlib.sha256(str(template or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _disk_cache_path(source_id: str, z: int, x: int, y: int) -> Path:
+    return _TILE_CACHE_ROOT / source_id / str(z) / str(x) / f"{y}.png"
+
+
+def _prepare_tile_image(img: QImage) -> QImage:
+    """Normalize to map tile size once (avoid per-frame scaling in paintEvent)."""
+    if img.isNull():
+        return QImage()
+    if img.width() == _TILE_SIZE and img.height() == _TILE_SIZE:
+        return img
+    return img.scaled(
+        _TILE_SIZE,
+        _TILE_SIZE,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.FastTransformation,
+    )
+
+
 class _TileFetchSignals(QObject):
     loaded = Signal(int, int, int, object)  # z, x, y, QImage or None
 
 
 class _TileFetchTask(QRunnable):
-    def __init__(self, z: int, x: int, y: int, url: str, bridge: _TileFetchSignals) -> None:
+    def __init__(
+        self,
+        z: int,
+        x: int,
+        y: int,
+        url: str,
+        bridge: _TileFetchSignals,
+        *,
+        source_id: str = "",
+        use_disk_cache: bool = True,
+    ) -> None:
         super().__init__()
         self._z = z
         self._x = x
         self._y = y
         self._url = url
         self._bridge = bridge
+        self._source_id = str(source_id or "")
+        self._use_disk_cache = bool(use_disk_cache)
 
     def run(self) -> None:
-        img = _fetch_tile_http_or_file(self._url)
+        img = _fetch_tile_http_or_file(
+            self._url,
+            source_id=self._source_id,
+            z=self._z,
+            x=self._x,
+            y=self._y,
+            use_disk_cache=self._use_disk_cache,
+        )
         self._bridge.loaded.emit(self._z, self._x, self._y, img)
 
 
@@ -92,7 +139,9 @@ class NativeTileMapView(QWidget):
         self._tiles_inflight: set[tuple[int, int, int]] = set()
         self._tile_bridge = _TileFetchSignals(self)
         self._tile_bridge.loaded.connect(self._on_tile_loaded)
-        self._pool = QThreadPool.globalInstance()
+        self._tile_source_id = _tile_source_id(self._tile_template)
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(12)
         self._dragging = False
         self._drag_last: QPointF | None = None
         # Waypoint / fence: add only on release if the gesture was a tap (not a map pan drag).
@@ -223,11 +272,13 @@ class NativeTileMapView(QWidget):
                 self._tile_template = t
         else:
             self._tile_template = t
+        self._tile_source_id = _tile_source_id(self._tile_template)
         try:
             self._max_zoom = max(3, min(22, int(max_z)))
         except Exception:
             self._max_zoom = 19
         self._tiles.clear()
+        self._tiles_inflight.clear()
         self.update()
 
     def set_low_spec(self, _on: bool) -> None:
@@ -473,7 +524,7 @@ class NativeTileMapView(QWidget):
             painter.end()
             return
         z = int(max(3, min(self._max_zoom, round(self._zoom))))
-        tile_size = 256
+        tile_size = _TILE_SIZE
         center_x = _lon_to_x(self._center_lon, z)
         center_y = _lat_to_y(self._center_lat, z)
         fx = center_x * tile_size - w / 2.0
@@ -492,7 +543,7 @@ class NativeTileMapView(QWidget):
                     continue
                 px = int(tx * tile_size - fx)
                 py = int(ty * tile_size - fy)
-                painter.drawImage(px, py, img.scaled(tile_size, tile_size))
+                painter.drawImage(px, py, img)
 
         # Route polyline — full planned path on the map: vehicle → WP1 → WP2 → …
         # We intentionally do **not** trim from MISSION_CURRENT here: real missions vary
@@ -698,7 +749,7 @@ class NativeTileMapView(QWidget):
         if img is None or not isinstance(img, QImage) or img.isNull():
             self._tiles[key] = QImage()
         else:
-            self._tiles[key] = img
+            self._tiles[key] = _prepare_tile_image(img)
         self.update()
 
     def _tile_image(self, z: int, x: int, y: int) -> QImage | None:
@@ -706,19 +757,40 @@ class NativeTileMapView(QWidget):
         if key in self._tiles:
             im = self._tiles[key]
             return im if not im.isNull() else None
+        if self._tile_template != "{local}":
+            try:
+                cache_path = _disk_cache_path(self._tile_source_id, z, x, y)
+                if cache_path.is_file():
+                    cached = _prepare_tile_image(QImage(str(cache_path)))
+                    if not cached.isNull():
+                        self._tiles[key] = cached
+                        return cached
+            except Exception:
+                pass
         if key not in self._tiles_inflight:
             self._tiles_inflight.add(key)
             url = self._tile_url(z, x, y)
+            use_disk_cache = self._tile_template != "{local}"
             try:
-                self._pool.start(_TileFetchTask(z, x, y, url, self._tile_bridge))
+                self._pool.start(
+                    _TileFetchTask(
+                        z,
+                        x,
+                        y,
+                        url,
+                        self._tile_bridge,
+                        source_id=self._tile_source_id,
+                        use_disk_cache=use_disk_cache,
+                    )
+                )
             except Exception:
                 self._tiles_inflight.discard(key)
         return None
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._tiles.clear()
-        self._tiles_inflight.clear()
+        # Keep the in-memory tile cache on resize — clearing forced a full re-download.
+        self.update()
 
     # --- input ---
     def nudge_center_by_pixels(self, dx: float, dy: float) -> None:
@@ -914,7 +986,25 @@ def _circle_ring_points(center_lat: float, center_lon: float, radius_m: float, *
     return out
 
 
-def _fetch_tile_http_or_file(url: str) -> QImage:
+def _fetch_tile_http_or_file(
+    url: str,
+    *,
+    source_id: str = "",
+    z: int = 0,
+    x: int = 0,
+    y: int = 0,
+    use_disk_cache: bool = True,
+) -> QImage:
+    cache_path: Path | None = None
+    if use_disk_cache and source_id:
+        cache_path = _disk_cache_path(source_id, z, x, y)
+        try:
+            if cache_path.is_file():
+                img = QImage(str(cache_path))
+                if not img.isNull():
+                    return _prepare_tile_image(img)
+        except Exception:
+            pass
     try:
         if url.startswith("http://") or url.startswith("https://"):
             req = Request(
@@ -932,12 +1022,21 @@ def _fetch_tile_http_or_file(url: str) -> QImage:
                 },
                 method="GET",
             )
-            with urlopen(req, timeout=2.5) as resp:
+            with _HTTP_OPENER.open(req, timeout=4.0) as resp:
                 raw = resp.read()
-            return QImage.fromData(raw)
+            img = QImage.fromData(raw)
+            if img.isNull():
+                return QImage()
+            if cache_path is not None and raw:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_path.write_bytes(raw)
+                except Exception:
+                    pass
+            return _prepare_tile_image(img)
         p = Path(url)
         if p.is_file():
-            return QImage(str(p))
+            return _prepare_tile_image(QImage(str(p)))
     except Exception:
         pass
     return QImage()
