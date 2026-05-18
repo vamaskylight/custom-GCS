@@ -1834,12 +1834,13 @@ class MapWidget(QWidget):
     def _raise_panel_flight_overlays(self) -> None:
         """Panel-level HUD (Takeoff/Return, camera rail, compass) above fullscreen video on `_map_canvas`."""
         try:
-            ly = getattr(self, "_native_rail_layer", None)
-            if ly is not None and ly.isVisible():
-                ly.raise_()
             mar = getattr(self, "_map_action_rail", None)
             if mar is not None and mar.isVisible():
                 mar.raise_()
+            ly = getattr(self, "_native_rail_layer", None)
+            if ly is not None and ly.isVisible():
+                ly.raise_()
+            # Compass / telemetry above camera rail when they overlap at the bottom-right.
             for hud in (self._native_compass, self._native_telemetry):
                 try:
                     if hud.isVisible():
@@ -1932,15 +1933,12 @@ class MapWidget(QWidget):
                 pt = self._map_canvas.mapTo(self._panel, QPoint(panel_x, panel_y))
                 ly.setGeometry(pt.x(), pt.y(), panel_w, panel_h)
             rail.setGeometry(0, 0, panel_w, panel_h)
-            # Git `#mapFooterHud`: compass 176px from bottom-right; telemetry strip left of compass.
+            # Git `#mapFooterHud { right: 10px; bottom: 2px }` — compass stays bottom-right of the
+            # map even when `#cameraRail` is shown after MAVLink connect (rail is top-right; z-order
+            # keeps HUD above the map tiles, not shoved left).
             comp_w, comp_h = 176, 176
             margin_r, margin_b = 10, 2
-            rail_visible = ly is not None and ly.isVisible()
-            if rail_visible:
-                # Keep compass/telemetry left of `#nativeCameraRailLayer` (same panel, higher z-order).
-                cx = max(8, panel_x - 12 - comp_w)
-            else:
-                cx = max(0, w - margin_r - comp_w)
+            cx = max(0, w - margin_r - comp_w)
             cy = max(0, h - margin_b - comp_h)
             po = self._map_canvas.mapTo(self._panel, QPoint(0, 0))
             self._native_compass.setGeometry(po.x() + cx, po.y() + cy, comp_w, comp_h)
