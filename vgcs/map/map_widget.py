@@ -4169,7 +4169,26 @@ class MapWidget(QWidget):
                         pass
             else:
                 return
-        self._native_video_last_frame_mono = time.monotonic()
+        now_frame = time.monotonic()
+        last_mono = float(getattr(self, "_native_video_last_frame_mono", 0.0) or 0.0)
+        if (
+            last_mono > 0.0
+            and (now_frame - last_mono) > 2.5
+            and self._uses_companion_rtsp()
+        ):
+            try:
+                self._video_swapped = True
+                self._layout_native_video_preview()
+                self._stack_native_overlays_above_tile_map()
+                if not bool(getattr(self, "_video_gap_relayout_logged", False)):
+                    self._video_gap_relayout_logged = True
+                    print(
+                        "[VGCS:video] companion preview relayout after stream gap "
+                        f"({now_frame - last_mono:.1f}s)"
+                    )
+            except Exception:
+                pass
+        self._native_video_last_frame_mono = now_frame
         self._video_preview_got_frame = True
         if not bool(getattr(self, "_video_gui_logged_frame", False)):
             self._video_gui_logged_frame = True
@@ -4235,6 +4254,11 @@ class MapWidget(QWidget):
             return
         try:
             self._render_native_video_preview(img2)
+            if self._uses_companion_rtsp():
+                try:
+                    self._native_video_preview.raise_()
+                except Exception:
+                    pass
         except RuntimeError:
             pass
 

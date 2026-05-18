@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi17"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi18"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -311,6 +311,42 @@ def _stall_watchdog_enabled(url: str) -> bool:
     return True
 
 
+def _siyi_hevc_glitch_tail(tail_b: bytes) -> bool:
+    """True when FFmpeg stderr shows HEVC reference/RPS loss (common on ZR10 during pan/zoom)."""
+    if not tail_b:
+        return False
+    tl = tail_b.lower()
+    return (
+        b"could not find ref" in tl
+        or b"error constructing the frame rps" in tl
+        or b"constructing the frame rps" in tl
+        or b"poc " in tl
+    )
+
+
+def _siyi_session_cooldown_s(tail_b: bytes, reconnect_delay: float) -> float:
+    """
+  Cooldown before reopening RTSP after a decode session ends.
+
+  HEVC POC/RPS glitches need a *short* reconnect (new IDR). Network errors need longer.
+    """
+    if _siyi_hevc_glitch_tail(tail_b):
+        raw = str(os.environ.get("VGCS_SIYI_HEVC_RECONNECT_S", "2.0") or "2.0").strip()
+        try:
+            return max(0.8, min(5.0, float(raw)))
+        except ValueError:
+            return 2.0
+    tl = tail_b.lower() if tail_b else b""
+    if (
+        b"-138" in tl
+        or b"-10054" in tl
+        or b"error number -138" in tl
+        or b"error number -10054" in tl
+    ):
+        return max(8.0, float(reconnect_delay))
+    return min(3.0, max(1.0, float(reconnect_delay)))
+
+
 def _video_stall_reconnect_s(url: str) -> float:
     """Max seconds without a full raw frame (frozen-duplicate path; watchdog uses same value)."""
     raw = str(os.environ.get("VGCS_VIDEO_STALL_RECONNECT_S", "") or "").strip()
@@ -427,6 +463,9 @@ def _ffmpeg_preflags_before_input(
         if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
             out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     out.extend(["-err_detect", "ignore_err"])
+    if sc == "rtsp" and _rtsp_url_is_siyi_style(str(url or "").strip()):
+        # Show frames even when HEVC refs are briefly missing (ZR10 pan/zoom).
+        out.extend(["-flags2", "+showall"])
     if sc == "udp":
         out.extend(
             [
@@ -1743,33 +1782,31 @@ class RtspSource(QObject):
                             except Exception:
                                 tail_b = b""
                                 tail_txt = ""
+                            hevc_glitch = _rtsp_url_is_siyi_style(url) and _siyi_hevc_glitch_tail(
+                                tail_b
+                            )
                             print(
                                 f"[VGCS:video] decode session ended (frames={frames_this_session}), "
                                 f"reconnecting same transport={tr_label} rc={rc!r}"
                                 + (f" — {tail_txt[:200]}" if tail_txt else "")
                             )
-                            cooldown = reconnect_delay
-                            try:
-                                if _rtsp_url_is_siyi_style(url):
-                                    tl = tail_b.lower()
-                                    if (
-                                        b"-138" in tl
-                                        or b"-10054" in tl
-                                        or b"error number -138" in tl
-                                        or b"error number -10054" in tl
-                                        or b"could not find ref" in tl
-                                    ):
-                                        cooldown = max(cooldown, 6.0)
-                                        siyi_hw = False
-                                        try:
-                                            print(
-                                                f"[VGCS:video] SIYI: cooldown {cooldown:.0f}s "
-                                                "before reconnect (wait for HEVC IDR)"
-                                            )
-                                        except Exception:
-                                            pass
-                            except Exception:
-                                pass
+                            cooldown = _siyi_session_cooldown_s(tail_b, reconnect_delay)
+                            if _rtsp_url_is_siyi_style(url):
+                                siyi_hw = False
+                                try:
+                                    if hevc_glitch:
+                                        print(
+                                            f"[VGCS:video] SIYI HEVC glitch: reconnect in "
+                                            f"{cooldown:.1f}s (hold last frame in preview)"
+                                        )
+                                        reconnect_delay = 2.5
+                                    elif cooldown >= 6.0:
+                                        print(
+                                            f"[VGCS:video] SIYI: cooldown {cooldown:.0f}s "
+                                            "before reconnect (network / RTSP)"
+                                        )
+                                except Exception:
+                                    pass
                             time.sleep(cooldown)
                             continue
 
