@@ -180,7 +180,7 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-zoomfix"
+MAP_BACKEND_BUILD = "2026-05-18-native2d-followfix"
 
 def _web_2d_fallback_allowed() -> bool:
     """2D map is NativeTileMapView only; WebEngine Leaflet is opt-in for debugging."""
@@ -718,6 +718,8 @@ class MapWidget(QWidget):
         self._tile_probe_bridge.result.connect(self._on_tile_probe_result)
         self._tile_probe_ran = False
         self._native_tile_fallback_done = False
+        self._native_tile_startup_retries = 0
+        self._video_follow_enabled = True
         self._web_2d_fallback_active = False
         self._pending_web_2d_fallback = False
 
@@ -2576,6 +2578,13 @@ class MapWidget(QWidget):
             pass
         self._sync_map_action_rail_enabled()
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
+        if c:
+            try:
+                self.set_video_follow_enabled(True)
+                if getattr(self, "_lat", None) is not None and getattr(self, "_lon", None) is not None:
+                    self.center_on_vehicle()
+            except Exception:
+                pass
         # Run a one-time tile probe after connect to log "blocked vs placeholder" clearly.
         if c and not getattr(self, "_tile_probe_ran", False):
             self._tile_probe_ran = True
@@ -2723,7 +2732,7 @@ class MapWidget(QWidget):
         self._companion_start_decode_if_needed(reason=reason)
 
     def _native_tile_startup_check(self) -> None:
-        """If the native 2D map still has no tiles, try alternate sources (client networks often block urllib)."""
+        """If the native 2D map still has no tiles, nudge Esri once (do not wipe the tile cache)."""
         if getattr(self, "_native_tile_fallback_done", False):
             return
         nm = getattr(self, "_native_map", None)
@@ -2734,19 +2743,37 @@ class MapWidget(QWidget):
         except Exception:
             n = 0
         if n > 2:
+            self._native_tile_fallback_done = True
             return
+        tmpl = str(getattr(nm, "_tile_template", "") or "").lower()
+        retries = int(getattr(self, "_native_tile_startup_retries", 0) or 0)
+        if retries >= 2:
+            try:
+                QTimer.singleShot(1500, self._native_tile_startup_check_final)
+            except Exception:
+                pass
+            return
+        self._native_tile_startup_retries = retries + 1
         try:
             print(
-                f"[VGCS:map] native satellite tiles still loading (loaded={n}) — retrying World Imagery"
+                f"[VGCS:map] native satellite tiles still loading (loaded={n}) — "
+                f"nudge {'Esri' if 'world_imagery' in tmpl else 'tile fetch'}"
             )
         except Exception:
             pass
+        if "world_imagery" in tmpl or "{local}" in tmpl:
+            try:
+                nm.prefetch_viewport_tiles()
+                nm._warm_disk_tiles_for_viewport()
+            except Exception:
+                pass
+        else:
+            try:
+                self.activate_satellite_tiles()
+            except Exception:
+                pass
         try:
-            self.activate_satellite_tiles()
-        except Exception:
-            pass
-        try:
-            QTimer.singleShot(2500, self._native_tile_startup_check_final)
+            QTimer.singleShot(2500, self._native_tile_startup_check)
         except Exception:
             pass
 
@@ -2763,31 +2790,17 @@ class MapWidget(QWidget):
         except Exception:
             n = 0
         if n > 2:
-            return
-        root = bundled_seed_root()
-        if root.is_dir():
             self._native_tile_fallback_done = True
-            try:
-                print("[VGCS:map] online tiles still failing — switching to bundled companion_tile_seed")
-            except Exception:
-                pass
-            try:
-                self.activate_offline_tiles(str(root))
-            except Exception:
-                pass
-            self._set_status(
-                "Map: using bundled offline tiles (internet/proxy may be blocking Esri/OSM)"
-            )
             return
-        try:
-            print("[VGCS:map] native satellite still sparse — final retry World Imagery")
-        except Exception:
-            pass
-        try:
-            self.activate_satellite_tiles()
-        except Exception:
-            pass
         self._native_tile_fallback_done = True
+        try:
+            print("[VGCS:map] native satellite still sparse — keep Esri (use Offline Tiles in toolbar if needed)")
+        except Exception:
+            pass
+        try:
+            nm.prefetch_viewport_tiles()
+        except Exception:
+            pass
         self._set_status(
             "Satellite tiles loading slowly — check internet/firewall or pick Offline Tiles in the toolbar"
         )
@@ -3553,6 +3566,10 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             self.map_page_ready.emit()
+            try:
+                self._sync_native_camera_rail_toggles()
+            except Exception:
+                pass
             try:
                 self.apply_video_settings()
             except Exception:
@@ -5973,18 +5990,31 @@ class MapWidget(QWidget):
             self._coords.setText(
                 f"Lat/Lon: {lat:.7f}, {lon:.7f}  |  Rel Alt: {relative_alt_m:.1f} m"
             )
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            try:
+                nm.set_vehicle(float(lat), float(lon))
+            except Exception:
+                pass
+            if bool(getattr(self, "_video_follow_enabled", False)):
+                try:
+                    now = time.monotonic()
+                    last = float(getattr(self, "_video_follow_last_center_mono", 0.0))
+                    if first_fix or now - last >= 0.25:
+                        self._video_follow_last_center_mono = now
+                        nm.center_on_vehicle()
+                except Exception:
+                    pass
+            elif first_fix:
+                try:
+                    nm.set_center(float(lat), float(lon))
+                except Exception:
+                    pass
         try:
             if self._native_minimap_wrap.isVisible():
                 self._update_native_minimap()
         except Exception:
             pass
-        if first_fix:
-            try:
-                nm = getattr(self, "_native_map", None)
-                if nm is not None:
-                    nm.set_center(float(lat), float(lon))
-            except Exception:
-                pass
         self._schedule_vehicle_pose_js(immediate=first_fix)
 
     def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
@@ -5995,6 +6025,12 @@ class MapWidget(QWidget):
             self._native_compass.set_heading_deg(self._heading)
         except Exception:
             pass
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            try:
+                nm.set_heading(self._heading)
+            except Exception:
+                pass
         self._schedule_vehicle_pose_js(immediate=False)
 
     def clear_flight_track(self) -> None:
