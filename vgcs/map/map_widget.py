@@ -2546,12 +2546,16 @@ class MapWidget(QWidget):
         if c:
             self._tile_network_fallback_tier = 0
             nm = getattr(self, "_native_map", None)
-            if nm is not None and hasattr(nm, "set_remote_tiles_enabled"):
+            if (
+                nm is not None
+                and hasattr(nm, "set_remote_tiles_enabled")
+                and not self._map_using_offline_tiles()
+            ):
                 try:
                     nm.set_remote_tiles_enabled(True)
                 except Exception:
                     pass
-        if c and not getattr(self, "_tile_probe_ran", False):
+        if c and not getattr(self, "_tile_probe_ran", False) and not self._map_using_offline_tiles():
             self._tile_probe_ran = True
             try:
                 QTimer.singleShot(1500, lambda: self._probe_current_tiles(reason="connect"))
@@ -2610,7 +2614,14 @@ class MapWidget(QWidget):
 
     def _uses_companion_rtsp(self) -> bool:
         day = str(getattr(self, "_video_settings_day", "") or "").strip().lower()
-        return "192.168.144." in day
+        if "192.168.144." in day:
+            return True
+        try:
+            s = QSettings(_QS_NS, _QS_APP)
+            day2 = str(s.value(_KEY_VIDEO_RTSP_DAY, "") or "").strip().lower()
+            return "192.168.144." in day2
+        except Exception:
+            return False
 
     def _should_defer_companion_rtsp_decode(self) -> bool:
         """Wait for MAVLink link before opening RTSP on 192.168.144.x (often unreachable at boot)."""
@@ -2694,6 +2705,8 @@ class MapWidget(QWidget):
             print(f"[VGCS:video] companion decode start ({reason})")
         except Exception:
             pass
+        if self._uses_companion_rtsp() and not self._map_using_offline_tiles():
+            self._try_companion_bundled_seed_tiles()
         self._restart_video_preview_after_settings(force_decode=False)
 
     def _request_companion_video_restart(self, *, reason: str = "") -> None:
@@ -2800,6 +2813,8 @@ class MapWidget(QWidget):
         network_fail = outcome.startswith("error:") and (
             "URLError" in detail_s or "urlopen error" in detail_s.lower()
         )
+        if self._map_using_offline_tiles():
+            return
         if "active_view" in label and network_fail:
             tier = int(getattr(self, "_tile_network_fallback_tier", 0) or 0)
             nm = getattr(self, "_native_map", None)
@@ -3252,6 +3267,27 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _companion_bundled_seed_dir(self) -> Path | None:
+        """Shipped ``vgcs/assets/companion_tile_seed`` (z/x/y.png) for 192.168.144.x benches without WAN."""
+        try:
+            p = (Path(__file__).resolve().parents[1] / "assets" / "companion_tile_seed").resolve()
+            if (p / "16").is_dir() and any((p / "16").glob("*/*.png")):
+                return p
+        except Exception:
+            pass
+        return None
+
+    def _try_companion_bundled_seed_tiles(self) -> bool:
+        root = self._companion_bundled_seed_dir()
+        if root is None:
+            return False
+        try:
+            print(f"[VGCS:map] bundled companion map tiles: {root}")
+        except Exception:
+            pass
+        self.activate_offline_tiles(str(root))
+        return True
+
     def _companion_offline_tile_paths(self) -> list[str]:
         """Folders with ``z/x/y.png`` tiles (no internet required)."""
         paths: list[str] = []
@@ -3317,11 +3353,17 @@ class MapWidget(QWidget):
             self._set_status(
                 f"Offline map: {near} tiles cached near GPS — pan slightly if view is empty"
             )
+        elif self._try_companion_bundled_seed_tiles():
+            try:
+                nm.update()
+            except Exception:
+                pass
+            self._set_status("Companion offline map loaded (bundled seed area)")
         elif self._try_companion_offline_tiles():
             self._set_status("Offline map folder loaded")
         else:
             self._set_status(
-                "No offline map tiles — use internet once (fills tile-cache) or Offline tiles…"
+                "No offline map tiles — copy custom-GCS with companion_tile_seed or use Offline tiles…"
             )
         try:
             self._update_native_minimap()
@@ -3426,7 +3468,9 @@ class MapWidget(QWidget):
             try:
                 s = QSettings(_QS_NS, _QS_APP)
                 root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
-                if root and Path(root).is_dir():
+                if self._uses_companion_rtsp() and self._try_companion_bundled_seed_tiles():
+                    pass
+                elif root and Path(root).is_dir():
                     self.activate_offline_tiles(root)
                 elif self._try_companion_offline_tiles():
                     pass
@@ -6347,26 +6391,37 @@ class MapWidget(QWidget):
         self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Tiles © Esri', 19);")
         self._set_status("Satellite tiles active")
 
+    def _map_using_offline_tiles(self) -> bool:
+        nm = getattr(self, "_native_map", None)
+        return nm is not None and getattr(nm, "_tile_template", "") == "{local}"
+
     def activate_offline_tiles(self, root: str) -> None:
         root = str(root or "").strip()
-        if not root or not Path(root).is_dir():
+        resolved = Path(root).resolve()
+        if not root or not resolved.is_dir():
             self._set_status("Offline tiles: invalid folder")
             return
         # Remember for next launch.
         try:
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_OFFLINE_TILE_ROOT, root)
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_OFFLINE_TILE_ROOT, str(resolved))
             QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "offline")
         except Exception:
             pass
-        url = QUrl.fromLocalFile(root).toString().rstrip("/")
-        tmpl = f"{url}/{{z}}/{{x}}/{{y}}.png"
+        # Native map expects a file: URL to the tile *root* (z/x/y.png); not a template path.
+        url = QUrl.fromLocalFile(str(resolved)).toString()
         try:
             nm = getattr(self, "_native_map", None)
             if nm is not None:
-                nm.set_tile_source(tmpl, "", 19)
+                nm.set_tile_source(url, "", 19)
+                try:
+                    nm.update()
+                except Exception:
+                    pass
         except Exception:
             pass
-        self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Offline tile cache', 19);")
+        self._run_js(
+            f"setTileSource({json.dumps(url + '/{z}/{x}/{y}.png')}, 'Offline tile cache', 19);"
+        )
         self._set_status("Offline tiles active")
 
     def _apply_geofence(self) -> None:
