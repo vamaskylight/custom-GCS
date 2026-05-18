@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi18"
+_VIDEO_PIPELINE_REV = "2026-05-15-siyi19"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -289,9 +289,9 @@ def _rtsp_socket_timeout_us(url: str) -> int:
             pass
     if _url_scheme(str(url or "").strip()) != "rtsp":
         return 0
-    # SIYI ZR10: 15s connect/read cap — logs -138 instead of hanging with no "first frame ok".
+    # SIYI ZR10: 8s connect/read cap — fail faster, try UDP sooner (15s × 8 retries blocked UI).
     if _rtsp_url_is_siyi_style(url):
-        return 15_000_000
+        return 8_000_000
     if _rtsp_url_is_companion_link_subnet(url):
         return 8_000_000
     return 5_000_000
@@ -322,6 +322,34 @@ def _siyi_hevc_glitch_tail(tail_b: bytes) -> bool:
         or b"constructing the frame rps" in tl
         or b"poc " in tl
     )
+
+
+def _siyi_rtsp_camera_busy(tail_b: bytes) -> bool:
+    """True when stderr indicates the camera refused or timed out RTSP (-138 / winsock)."""
+    if not tail_b:
+        return False
+    tl = tail_b.lower()
+    return b"-138" in tl or b"error number -138" in tl or b"-10054" in tl
+
+
+def _siyi_camera_release_sleep(tail_b: bytes, empty_sessions: int) -> None:
+    """ZR10 often needs a few seconds to release the single RTSP client slot."""
+    if not _siyi_rtsp_camera_busy(tail_b):
+        return
+    base = 3.0
+    try:
+        base = float(str(os.environ.get("VGCS_SIYI_RTSP_RELEASE_S", "3.0") or "3.0").strip())
+    except ValueError:
+        base = 3.0
+    delay = min(12.0, base + 0.5 * max(0, int(empty_sessions) - 1))
+    try:
+        print(
+            f"[VGCS:video] SIYI: waiting {delay:.1f}s for camera RTSP slot "
+            "(close VLC/handheld viewer first)"
+        )
+    except Exception:
+        pass
+    time.sleep(delay)
 
 
 def _siyi_session_cooldown_s(tail_b: bytes, reconnect_delay: float) -> float:
@@ -1454,11 +1482,14 @@ class RtspSource(QObject):
             for transport in transport_seq:
                 if self._ffmpeg_stop.is_set() or not self._running:
                     break
+                transport_got_frames = False
                 demux_try = self._udp_demux_try_sequence(url)
                 for demux_fmt in demux_try:
                     if self._ffmpeg_stop.is_set() or not self._running:
                         break
-                    if round_ok:
+                    # Only skip extra demux variants on this transport — never skip UDP
+                    # because TCP worked earlier in the same round (fixes -138 stuck on TCP).
+                    if transport_got_frames:
                         break
                     demux = _ffmpeg_udp_raw_demux(url, demux_fmt)
                     tr_label = str(transport) if transport is not None else "n/a"
@@ -1476,11 +1507,12 @@ class RtspSource(QObject):
                             time.sleep(0.05)
 
                     reconnect_delay = 2.5 if _rtsp_url_is_siyi_style(url) else 0.6
-                    empty_session_limit = 8 if _rtsp_url_is_siyi_style(url) else 20
+                    empty_session_limit = 4 if _rtsp_url_is_siyi_style(url) else 20
                     empty_sessions = 0
+                    tcp_138_streak = 0
 
                     while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
-                        if _rtsp_url_is_siyi_style(url) and round_ok:
+                        if _rtsp_url_is_siyi_style(url) and transport_got_frames:
                             try:
                                 print(
                                     "[VGCS:video] SIYI: opening new RTSP decode session "
@@ -1669,7 +1701,9 @@ class RtspSource(QObject):
                                             )
                                         except Exception:
                                             pass
+                                    transport_got_frames = True
                                     round_ok = True
+                                    tcp_138_streak = 0
                                 except Exception as ex:
                                     if not decode_warned:
                                         decode_warned = True
@@ -1691,6 +1725,7 @@ class RtspSource(QObject):
                         except Exception:
                             rc = None
                         if frames_this_session == 0:
+                            tail = b""
                             try:
                                 tail = b"".join(stderr_buf)[-4000:]
                                 if tail.strip():
@@ -1724,10 +1759,12 @@ class RtspSource(QObject):
                                             or b"error number -138" in tl
                                         ):
                                             siyi_hw = False
-                                            reconnect_delay = max(
-                                                reconnect_delay,
-                                                10.0 + min(8.0, float(empty_sessions) * 2.0),
-                                            )
+                                            if not _siyi_rtsp_camera_busy(tail):
+                                                reconnect_delay = max(
+                                                    reconnect_delay,
+                                                    10.0
+                                                    + min(8.0, float(empty_sessions) * 2.0),
+                                                )
                                             if empty_sessions >= 3 and empty_sessions % 3 == 0:
                                                 try:
                                                     print(
@@ -1758,6 +1795,19 @@ class RtspSource(QObject):
                                     )
                             except Exception:
                                 pass
+                            if _rtsp_url_is_siyi_style(url) and _siyi_rtsp_camera_busy(tail):
+                                tcp_138_streak += 1
+                                if str(transport or "").lower() == "tcp" and tcp_138_streak >= 3:
+                                    try:
+                                        print(
+                                            "[VGCS:video] SIYI: TCP connect failed 3× (-138), "
+                                            "switching to UDP transport"
+                                        )
+                                    except Exception:
+                                        pass
+                                    break
+                            else:
+                                tcp_138_streak = 0
                         self._close_ffmpeg_decode_proc()
 
                         if self._ffmpeg_stop.is_set() or not self._running:
@@ -1811,7 +1861,12 @@ class RtspSource(QObject):
                             continue
 
                         empty_sessions += 1
-                        if round_ok and empty_sessions < 5:
+                        tail_empty = b""
+                        try:
+                            tail_empty = b"".join(stderr_buf)[-4000:]
+                        except Exception:
+                            pass
+                        if transport_got_frames and empty_sessions < 5:
                             # SIYI often drops RTSP after ~60s; keep retrying same transport.
                             time.sleep(max(reconnect_delay, 2.0))
                             continue
@@ -1821,7 +1876,10 @@ class RtspSource(QObject):
                                 f"on transport={tr_label} demux={demux_label}, trying next"
                             )
                             break
-                        time.sleep(reconnect_delay)
+                        if _rtsp_url_is_siyi_style(url) and _siyi_rtsp_camera_busy(tail_empty):
+                            _siyi_camera_release_sleep(tail_empty, empty_sessions)
+                        else:
+                            time.sleep(reconnect_delay)
 
                 if self._ffmpeg_stop.is_set() or not self._running:
                     break
