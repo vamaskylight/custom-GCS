@@ -3012,7 +3012,7 @@ class MainWindow(QMainWindow):
                 course = float(data["ground_track_deg"])
             if course is not None and float(
                 data.get("groundspeed_mps", self._map_groundspeed_mps) or 0.0
-            ) >= 0.8:
+            ) >= 1.0:
                 self._heading = course
                 self._fields["heading"].setText(f"{int(round(course))}°")
                 self._compass.set_heading_deg(course)
@@ -3021,11 +3021,15 @@ class MainWindow(QMainWindow):
             self._map_widget.set_mission_nav_seq(int(data.get("seq", 0) or 0))
         elif msg_type == "VFR_HUD":
             self._map_groundspeed_mps = float(data.get("groundspeed", 0.0))
+            try:
+                self._map_widget._update_map_motion_state(self._map_groundspeed_mps)
+            except Exception:
+                pass
             self._fields["groundspeed"].setText(f"{data.get('groundspeed', 0.0):.1f} m/s")
             self._fields["airspeed"].setText(f"{data.get('airspeed', 0.0):.1f} m/s")
             hd = float(data.get("heading", 0.0))
             self._fields["heading"].setText(f"{int(hd)}°")
-            if self._map_groundspeed_mps >= 0.8:
+            if self._map_groundspeed_mps >= 1.0:
                 self._heading = hd
                 self._compass.set_heading_deg(hd)
                 self._map_widget.set_vehicle_heading(hd, source="vfr")
@@ -3036,7 +3040,7 @@ class MainWindow(QMainWindow):
                 f"{data.get('yaw_deg', 0.0):.1f} deg"
             )
             yaw_deg = float(data.get("yaw_deg", 0.0))
-            if self._map_groundspeed_mps >= 0.8:
+            if self._map_groundspeed_mps >= 1.0:
                 self._heading = (yaw_deg + 360.0) % 360.0
                 self._compass.set_heading_deg((yaw_deg + 360.0) % 360.0)
                 self._map_widget.set_vehicle_heading((yaw_deg + 360.0) % 360.0, source="att")
