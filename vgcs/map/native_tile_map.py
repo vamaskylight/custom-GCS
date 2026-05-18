@@ -506,6 +506,8 @@ class NativeTileMapView(QWidget):
     def set_center(self, lat: float, lon: float) -> None:
         self._center_lat = float(lat)
         self._center_lon = float(lon)
+        self._warm_disk_tiles_for_viewport()
+        self.prefetch_viewport_tiles()
         self.update()
 
     def center_on_vehicle(self) -> None:
@@ -1237,6 +1239,27 @@ class NativeTileMapView(QWidget):
             )
         except Exception:
             self._tiles_inflight.discard(key)
+
+    def prefetch_viewport_tiles(self) -> None:
+        """Queue HTTP/disk fetches for visible tiles (call after pan/recenter/follow)."""
+        vf = self._view_frame()
+        if vf is None:
+            return
+        z, fx, fy, w, h = vf
+        tile_size = _TILE_SIZE
+        x0 = int(math.floor(fx / tile_size)) - 1
+        y0 = int(math.floor(fy / tile_size)) - 1
+        x1 = int(math.ceil((fx + w) / tile_size)) + 1
+        y1 = int(math.ceil((fy + h) / tile_size)) + 1
+        n = 1 << z
+        for tx in range(x0, x1 + 1):
+            for ty in range(y0, y1 + 1):
+                if tx < 0 or ty < 0 or tx >= n or ty >= n:
+                    continue
+                key = (z, tx, ty)
+                if key in self._tiles or key in self._tiles_inflight:
+                    continue
+                self._queue_tile_fetch(z, tx, ty)
 
     def _warm_disk_tiles_for_viewport(self) -> None:
         """Prefetch disk/bundled tiles for the current view without blocking paint."""
