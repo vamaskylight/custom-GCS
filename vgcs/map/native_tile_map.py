@@ -9,8 +9,6 @@ import re
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from vgcs.map import tile_disk_cache
-
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import QWidget
@@ -44,48 +42,16 @@ class _TileFetchSignals(QObject):
 
 
 class _TileFetchTask(QRunnable):
-    def __init__(
-        self,
-        z: int,
-        x: int,
-        y: int,
-        url: str,
-        template: str,
-        bridge: _TileFetchSignals,
-        *,
-        http_enabled: bool = True,
-        cache_root: Path | None = None,
-    ) -> None:
+    def __init__(self, z: int, x: int, y: int, url: str, bridge: _TileFetchSignals) -> None:
         super().__init__()
         self._z = z
         self._x = x
         self._y = y
         self._url = url
-        self._template = str(template or "")
         self._bridge = bridge
-        self._http_enabled = bool(http_enabled)
-        self._cache_root = cache_root
 
     def run(self) -> None:
-        img = QImage()
-        is_local = self._template == "{local}"
-        if tile_disk_cache.is_enabled() and self._template and not is_local:
-            img = tile_disk_cache.read_cached_tile_any(
-                self._template, self._z, self._x, self._y, root=self._cache_root
-            )
-        # Offline folders use file paths — must load even when HTTP is disabled.
-        if img.isNull() and (self._http_enabled or is_local or not self._url.startswith(("http://", "https://"))):
-            img, raw = _fetch_tile_http_or_file(self._url)
-            if (
-                not img.isNull()
-                and raw
-                and tile_disk_cache.is_enabled()
-                and self._template
-                and not is_local
-            ):
-                tile_disk_cache.write_cached_tile_bytes(
-                    self._template, self._z, self._x, self._y, raw, root=self._cache_root
-                )
+        img = _fetch_tile_http_or_file(self._url)
         self._bridge.loaded.emit(self._z, self._x, self._y, img)
 
 
@@ -141,13 +107,6 @@ class NativeTileMapView(QWidget):
         self._press_for_obs: QPointF | None = None
         # Stores lat/lon pairs for OBSERVE -> Target marks (native rendering).
         self._observation_marks: list[tuple[float, float]] = []
-        # When HTTP tiles fail (no internet / firewall), draw slippy grid + HUD instead of empty gray.
-        self._remote_tiles_enabled = True
-        self._http_tile_failures = 0
-        self._tile_cache_hits = 0
-        self._tile_cache_root: Path | None = (
-            tile_disk_cache.default_cache_root() if tile_disk_cache.is_enabled() else None
-        )
         self._pending_timer = QTimer(self)
         self._pending_timer.setSingleShot(True)
         self._pending_timer.setInterval(80)
@@ -250,36 +209,6 @@ class NativeTileMapView(QWidget):
             self._mission_nav_seq = 0
         self.update()
 
-    def set_remote_tiles_enabled(self, enabled: bool) -> None:
-        """Stop HTTP tile fetches when the network cannot reach tile servers (URLError).
-
-        Disk cache reads continue so previously viewed areas still show imagery offline.
-        """
-        on = bool(enabled)
-        if on == bool(getattr(self, "_remote_tiles_enabled", True)):
-            return
-        self._remote_tiles_enabled = on
-        if on:
-            self._http_tile_failures = 0
-        else:
-            self._tiles_inflight.clear()
-        self._tiles.clear()
-        self.update()
-
-    def set_offline_tile_root(self, root: str | Path) -> None:
-        """Load tiles from ``root/z/x/y.png`` (no HTTP)."""
-        p = Path(root).expanduser().resolve()
-        if not p.is_dir():
-            return
-        self._offline_root = str(p)
-        self._tile_template = "{local}"
-        self._remote_tiles_enabled = False
-        self._http_tile_failures = 0
-        self._tiles_inflight.clear()
-        self._tiles.clear()
-        self._preload_local_tiles_around_center()
-        self.update()
-
     def set_tile_source(self, template: str, _attribution: str, max_z: int) -> None:
         t = str(template or "").strip()
         if not t:
@@ -288,21 +217,18 @@ class NativeTileMapView(QWidget):
         if t.startswith("file:"):
             path = QUrl(t).toLocalFile()
             if path:
-                self.set_offline_tile_root(path)
+                self._offline_root = str(Path(path).resolve())
+                self._tile_template = "{local}"
             else:
                 self._tile_template = t
         else:
-            if t != "{local}":
-                self._remote_tiles_enabled = True
-                self._http_tile_failures = 0
             self._tile_template = t
         try:
             self._max_zoom = max(3, min(22, int(max_z)))
         except Exception:
             self._max_zoom = 19
-        if self._tile_template != "{local}":
-            self._tiles.clear()
-            self.update()
+        self._tiles.clear()
+        self.update()
 
     def set_low_spec(self, _on: bool) -> None:
         self.update()
@@ -557,8 +483,6 @@ class NativeTileMapView(QWidget):
         x1 = int(math.ceil((fx + w) / tile_size)) + 1
         y1 = int(math.ceil((fy + h) / tile_size)) + 1
         n = 1 << z
-        self._paint_slippy_grid(painter, z, fx, fy, w, h, x0, y0, x1, y1)
-        tiles_drawn = 0
         for tx in range(x0, x1 + 1):
             for ty in range(y0, y1 + 1):
                 if tx < 0 or ty < 0 or tx >= n or ty >= n:
@@ -569,15 +493,6 @@ class NativeTileMapView(QWidget):
                 px = int(tx * tile_size - fx)
                 py = int(ty * tile_size - fy)
                 painter.drawImage(px, py, img.scaled(tile_size, tile_size))
-                tiles_drawn += 1
-
-        if tiles_drawn == 0 and not self._remote_tiles_enabled:
-            self._paint_offline_map_hint(
-                painter,
-                w,
-                h,
-                cache_enabled=tile_disk_cache.is_enabled(),
-            )
 
         # Route polyline — full planned path on the map: vehicle → WP1 → WP2 → …
         # We intentionally do **not** trim from MISSION_CURRENT here: real missions vary
@@ -716,49 +631,6 @@ class NativeTileMapView(QWidget):
 
         painter.end()
 
-    def _paint_slippy_grid(
-        self,
-        painter: QPainter,
-        z: int,
-        fx: float,
-        fy: float,
-        w: int,
-        h: int,
-        x0: int,
-        y0: int,
-        x1: int,
-        y1: int,
-    ) -> None:
-        """Tile-boundary grid visible when satellite/OSM tiles are missing (companion Wi‑Fi, no WAN)."""
-        tile_size = 256
-        pen = QPen(QColor(52, 72, 104, 200), 1)
-        painter.setPen(pen)
-        for tx in range(x0, x1 + 2):
-            px = int(tx * tile_size - fx)
-            if -tile_size <= px <= w + tile_size:
-                painter.drawLine(px, 0, px, h)
-        for ty in range(y0, y1 + 2):
-            py = int(ty * tile_size - fy)
-            if -tile_size <= py <= h + tile_size:
-                painter.drawLine(0, py, w, py)
-
-    def _paint_offline_map_hint(
-        self, painter: QPainter, w: int, h: int, *, cache_enabled: bool = False
-    ) -> None:
-        painter.setPen(QColor(180, 195, 220, 220))
-        font = painter.font()
-        font.setPointSize(10)
-        painter.setFont(font)
-        painter.drawText(12, 22, "Map tiles offline — grid + GPS")
-        if cache_enabled:
-            painter.drawText(
-                12,
-                40,
-                "Pan over a cached area or fly once online to fill ~/.vgcs/tile-cache",
-            )
-        else:
-            painter.drawText(12, 40, "Use Offline Tiles… or set VGCS_MAP_TILE_CACHE=1")
-
     def _project(self, lat: float, lon: float, z: int, fx: float, fy: float, w: int, h: int) -> QPointF:
         px = _lon_to_x(lon, z) * 256.0 - fx
         py = _lat_to_y(lat, z) * 256.0 - fy
@@ -824,170 +696,29 @@ class NativeTileMapView(QWidget):
         except Exception:
             pass
         if img is None or not isinstance(img, QImage) or img.isNull():
-            self._tiles.pop(key, None)
-            if self._remote_tiles_enabled and self._tile_template != "{local}":
-                self._http_tile_failures += 1
-                if self._http_tile_failures >= 6:
-                    self.set_remote_tiles_enabled(False)
+            self._tiles[key] = QImage()
         else:
             self._tiles[key] = img
-            if self._http_tile_failures > 0:
-                self._http_tile_failures = max(0, self._http_tile_failures - 1)
         self.update()
-
-    def _read_disk_cache_sync(self, z: int, x: int, y: int) -> QImage | None:
-        if not tile_disk_cache.is_enabled() or self._tile_template in ("", "{local}"):
-            return None
-        img = tile_disk_cache.read_cached_tile_any(
-            self._tile_template, z, x, y, root=self._tile_cache_root
-        )
-        if img.isNull():
-            return None
-        self._tile_cache_hits += 1
-        if self._tile_cache_hits == 1:
-            try:
-                print(
-                    f"[VGCS:map] tile disk cache active "
-                    f"({tile_disk_cache.default_cache_root()})"
-                )
-            except Exception:
-                pass
-        return img
-
-    def reload_visible_tiles_from_cache(self) -> int:
-        """Drop in-memory tiles and repaint from disk cache or offline folder."""
-        self._tiles_inflight.clear()
-        self._tiles.clear()
-        self.update()
-        if self._tile_template == "{local}" and self._offline_root:
-            return self._reload_visible_local_tiles()
-        if not tile_disk_cache.is_enabled():
-            return 0
-        vf = self._view_frame()
-        if vf is None:
-            return 0
-        z, fx, fy, w, h = vf
-        tile_size = 256
-        x0 = int(math.floor(fx / tile_size)) - 1
-        y0 = int(math.floor(fy / tile_size)) - 1
-        x1 = int(math.ceil((fx + w) / tile_size)) + 1
-        y1 = int(math.ceil((fy + h) / tile_size)) + 1
-        hits = 0
-        for tx in range(x0, x1 + 1):
-            for ty in range(y0, y1 + 1):
-                if self._read_disk_cache_sync(z, tx, ty) is not None:
-                    hits += 1
-        if hits:
-            self.update()
-        return hits
-
-    def _read_local_tile_sync(self, z: int, x: int, y: int) -> QImage | None:
-        root = self._offline_root
-        if not root or self._tile_template != "{local}":
-            return None
-        p = Path(root) / str(z) / str(x) / f"{y}.png"
-        if not p.is_file():
-            return None
-        img = QImage(str(p))
-        if img.isNull():
-            return None
-        return img
-
-    def _preload_local_tiles_around_center(self, *, radius: int = 4) -> int:
-        """Load offline tiles around map center (works before the widget has a final size)."""
-        z = int(max(3, min(self._max_zoom, round(self._zoom))))
-        cx, cy = _tile_xy(self._center_lat, self._center_lon, z)
-        hits = 0
-        r = max(1, int(radius))
-        for dx in range(-r, r + 1):
-            for dy in range(-r, r + 1):
-                img = self._read_local_tile_sync(z, cx + dx, cy + dy)
-                if img is None:
-                    continue
-                self._tiles[(z, cx + dx, cy + dy)] = img
-                hits += 1
-        if hits:
-            self.update()
-        return hits
-
-    def _reload_visible_local_tiles(self) -> int:
-        root = self._offline_root
-        if not root:
-            return 0
-        vf = self._view_frame()
-        if vf is None:
-            return self._preload_local_tiles_around_center()
-        z, fx, fy, w, h = vf
-        tile_size = 256
-        x0 = int(math.floor(fx / tile_size)) - 1
-        y0 = int(math.floor(fy / tile_size)) - 1
-        x1 = int(math.ceil((fx + w) / tile_size)) + 1
-        y1 = int(math.ceil((fy + h) / tile_size)) + 1
-        hits = 0
-        for tx in range(x0, x1 + 1):
-            for ty in range(y0, y1 + 1):
-                img = self._read_local_tile_sync(z, tx, ty)
-                if img is None:
-                    continue
-                self._tiles[(z, tx, ty)] = img
-                hits += 1
-        if hits:
-            self.update()
-        return hits
 
     def _tile_image(self, z: int, x: int, y: int) -> QImage | None:
         key = (z, x, y)
         if key in self._tiles:
             im = self._tiles[key]
-            if not im.isNull():
-                return im
-            self._tiles.pop(key, None)
-        cached = self._read_disk_cache_sync(z, x, y)
-        if cached is not None:
-            self._tiles[key] = cached
-            return cached
-        is_local = self._tile_template == "{local}"
-        if is_local:
-            local = self._read_local_tile_sync(z, x, y)
-            if local is not None:
-                self._tiles[key] = local
-                return local
-        http_on = bool(self._remote_tiles_enabled)
-        if not http_on and not is_local and not tile_disk_cache.is_enabled():
-            return None
+            return im if not im.isNull() else None
         if key not in self._tiles_inflight:
             self._tiles_inflight.add(key)
             url = self._tile_url(z, x, y)
             try:
-                self._pool.start(
-                    _TileFetchTask(
-                        z,
-                        x,
-                        y,
-                        url,
-                        self._tile_template,
-                        self._tile_bridge,
-                        http_enabled=http_on,
-                        cache_root=self._tile_cache_root,
-                    )
-                )
+                self._pool.start(_TileFetchTask(z, x, y, url, self._tile_bridge))
             except Exception:
                 self._tiles_inflight.discard(key)
         return None
 
-    def showEvent(self, event) -> None:  # noqa: N802
-        super().showEvent(event)
-        if self._tile_template == "{local}" and self._offline_root:
-            QTimer.singleShot(0, self._reload_visible_local_tiles)
-
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        self._tiles.clear()
         self._tiles_inflight.clear()
-        if self._tile_template == "{local}" and self._offline_root:
-            if self.width() > 1 and self.height() > 1:
-                self._reload_visible_local_tiles()
-        else:
-            self._tiles.clear()
 
     # --- input ---
     def nudge_center_by_pixels(self, dx: float, dy: float) -> None:
@@ -1183,7 +914,7 @@ def _circle_ring_points(center_lat: float, center_lon: float, radius_m: float, *
     return out
 
 
-def _fetch_tile_http_or_file(url: str) -> tuple[QImage, bytes | None]:
+def _fetch_tile_http_or_file(url: str) -> QImage:
     try:
         if url.startswith("http://") or url.startswith("https://"):
             req = Request(
@@ -1203,17 +934,13 @@ def _fetch_tile_http_or_file(url: str) -> tuple[QImage, bytes | None]:
             )
             with urlopen(req, timeout=2.5) as resp:
                 raw = resp.read()
-            img = QImage.fromData(raw)
-            if img.isNull():
-                return QImage(), None
-            return img, raw
+            return QImage.fromData(raw)
         p = Path(url)
         if p.is_file():
-            img = QImage(str(p))
-            return img, None
+            return QImage(str(p))
     except Exception:
         pass
-    return QImage(), None
+    return QImage()
 
 
 def _extract_paren_payload(src: str, fn: str) -> str | None:
