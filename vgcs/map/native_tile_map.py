@@ -14,6 +14,14 @@ from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QRunnable, QThreadPool,
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
+try:
+    from PySide6.QtCore import QEventLoop
+    from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+
+    _HAS_QT_NETWORK = True
+except Exception:
+    _HAS_QT_NETWORK = False
+
 
 def _clamp_lat(lat: float) -> float:
     return max(-85.05112878, min(85.05112878, lat))
@@ -41,6 +49,104 @@ def _tile_xy(lat: float, lon: float, z: int) -> tuple[int, int]:
 _TILE_SIZE = 256
 _TILE_CACHE_ROOT = (Path.home() / ".vgcs" / "tile-cache").resolve()
 _HTTP_OPENER = build_opener()
+_BUNDLED_SEED_ROOT = (Path(__file__).resolve().parents[1] / "assets" / "companion_tile_seed").resolve()
+_TILE_FETCH_ERRORS_LOGGED = 0
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
+
+def bundled_seed_root() -> Path:
+    return _BUNDLED_SEED_ROOT
+
+
+def bundled_seed_tile_path(z: int, x: int, y: int) -> Path | None:
+    p = _BUNDLED_SEED_ROOT / str(z) / str(x) / f"{y}.png"
+    return p if p.is_file() else None
+
+
+def _referer_for_url(url: str) -> str:
+    u = url.lower()
+    if "arcgisonline.com" in u or "arcgis.com" in u:
+        return "https://www.arcgis.com/"
+    if "openstreetmap.org" in u:
+        return "https://www.openstreetmap.org/"
+    return "https://www.arcgis.com/"
+
+
+def _fetch_http_bytes_urllib(url: str, *, timeout_s: float = 5.0) -> bytes:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": _UA,
+            "Referer": _referer_for_url(url),
+        },
+        method="GET",
+    )
+    with _HTTP_OPENER.open(req, timeout=timeout_s) as resp:
+        code = getattr(resp, "status", None) or resp.getcode()
+        if int(code) >= 400:
+            raise OSError(f"HTTP {code}")
+        return resp.read()
+
+
+def _fetch_http_bytes_qt(url: str, *, timeout_s: float = 5.0) -> bytes:
+    if not _HAS_QT_NETWORK:
+        raise RuntimeError("QtNetwork unavailable")
+    loop = QEventLoop()
+    out: list[bytes] = []
+    err: list[str] = []
+    nam = QNetworkAccessManager()
+    req = QNetworkRequest(QUrl(url))
+    req.setRawHeader(b"User-Agent", _UA.encode("ascii"))
+    req.setRawHeader(b"Referer", _referer_for_url(url).encode("ascii"))
+    reply = nam.get(req)
+
+    def _done() -> None:
+        try:
+            if reply.error() == QNetworkReply.NetworkError.NoError:
+                data = bytes(reply.readAll())
+                if data:
+                    out.append(data)
+                else:
+                    err.append("empty_body")
+            else:
+                err.append(str(reply.errorString() or reply.error()))
+        finally:
+            if loop.isRunning():
+                loop.quit()
+
+    reply.finished.connect(_done)
+    QTimer.singleShot(int(max(500, timeout_s * 1000)), loop.quit)
+    loop.exec()
+    reply.deleteLater()
+    if out:
+        return out[0]
+    raise OSError(err[0] if err else "timeout")
+
+
+def fetch_tile_http_bytes(url: str, *, timeout_s: float = 5.0) -> bytes:
+    """Fetch tile bytes using Qt network (proxy/SSL) with urllib fallback."""
+    if url.startswith("http://") or url.startswith("https://"):
+        if _HAS_QT_NETWORK:
+            try:
+                return _fetch_http_bytes_qt(url, timeout_s=timeout_s)
+            except Exception:
+                pass
+        return _fetch_http_bytes_urllib(url, timeout_s=timeout_s)
+    raise ValueError("not an http url")
+
+
+def _log_tile_fetch_error(url: str, detail: str) -> None:
+    global _TILE_FETCH_ERRORS_LOGGED
+    if _TILE_FETCH_ERRORS_LOGGED >= 6:
+        return
+    _TILE_FETCH_ERRORS_LOGGED += 1
+    try:
+        print(f"[VGCS:map-native] tile fetch failed ({detail}): {url[:160]}")
+    except Exception:
+        pass
 
 
 def _tile_source_id(template: str) -> str:
@@ -171,6 +277,13 @@ class NativeTileMapView(QWidget):
         except Exception:
             self._vehicle_arrow_scale = 1.0
         self.update()
+
+    def loaded_tile_count(self) -> int:
+        """Count in-memory tiles that decoded successfully (for startup health checks)."""
+        try:
+            return sum(1 for im in self._tiles.values() if not im.isNull())
+        except Exception:
+            return 0
 
     # --- map state ---
     def set_center(self, lat: float, lon: float) -> None:
@@ -1007,23 +1120,7 @@ def _fetch_tile_http_or_file(
             pass
     try:
         if url.startswith("http://") or url.startswith("https://"):
-            req = Request(
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                    ),
-                    "Referer": (
-                        "https://www.arcgis.com/"
-                        if "arcgisonline.com" in url.lower()
-                        else "https://www.openstreetmap.org/"
-                    ),
-                },
-                method="GET",
-            )
-            with _HTTP_OPENER.open(req, timeout=4.0) as resp:
-                raw = resp.read()
+            raw = fetch_tile_http_bytes(url, timeout_s=5.0)
             img = QImage.fromData(raw)
             if img.isNull():
                 return QImage()
@@ -1037,8 +1134,16 @@ def _fetch_tile_http_or_file(
         p = Path(url)
         if p.is_file():
             return _prepare_tile_image(QImage(str(p)))
-    except Exception:
-        pass
+    except Exception as e:
+        _log_tile_fetch_error(url, f"{type(e).__name__}: {e}")
+    seed = bundled_seed_tile_path(z, x, y)
+    if seed is not None:
+        try:
+            img = _prepare_tile_image(QImage(str(seed)))
+            if not img.isNull():
+                return img
+        except Exception:
+            pass
     return QImage()
 
 
