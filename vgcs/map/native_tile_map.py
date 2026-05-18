@@ -47,6 +47,8 @@ def _tile_xy(lat: float, lon: float, z: int) -> tuple[int, int]:
 
 
 _TILE_SIZE = 256
+_TILE_MAX_ACTIVE_HTTP = 24
+_TILE_MEMORY_CAP = 640
 _TILE_CACHE_ROOT = (Path.home() / ".vgcs" / "tile-cache").resolve()
 _HTTP_OPENER = build_opener()
 _BUNDLED_SEED_ROOT = (Path(__file__).resolve().parents[1] / "assets" / "companion_tile_seed").resolve()
@@ -184,10 +186,21 @@ class _NativeTileLoader(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._nam = QNetworkAccessManager(self) if _HAS_QT_NETWORK else None
-        self._queue: list[tuple[int, int, int, str, str, bool]] = []
+        # (distance_from_center, z, x, y, url, source_id, use_disk_cache)
+        self._queue: list[tuple[float, int, int, int, str, str, bool]] = []
         self._active = 0
-        self._max_active = 10
+        self._max_active = _TILE_MAX_ACTIVE_HTTP
         self._pool = QThreadPool.globalInstance()
+        self._priority_z: int | None = None
+        self._center_tx = 0
+        self._center_ty = 0
+
+    def set_view_zoom(self, z: int, center_tx: int, center_ty: int) -> None:
+        """Drop queued fetches from other zoom levels (wheel zoom should not wait on stale tiles)."""
+        self._priority_z = int(z)
+        self._center_tx = int(center_tx)
+        self._center_ty = int(center_ty)
+        self._queue = [e for e in self._queue if e[1] == self._priority_z]
 
     def request(
         self,
@@ -198,8 +211,12 @@ class _NativeTileLoader(QObject):
         *,
         source_id: str,
         use_disk_cache: bool,
+        distance: float = 0.0,
     ) -> None:
-        self._queue.append((z, x, y, url, source_id, use_disk_cache))
+        if self._priority_z is not None and int(z) != self._priority_z:
+            return
+        self._queue.append((float(distance), z, x, y, url, source_id, use_disk_cache))
+        self._queue.sort(key=lambda e: e[0])
         self._drain()
 
     def _drain(self) -> None:
@@ -207,7 +224,7 @@ class _NativeTileLoader(QObject):
             self._start_worker_fallback()
             return
         while self._active < self._max_active and self._queue:
-            z, x, y, url, source_id, use_disk_cache = self._queue.pop(0)
+            _dist, z, x, y, url, source_id, use_disk_cache = self._queue.pop(0)
             req = QNetworkRequest(QUrl(url))
             req.setRawHeader(b"User-Agent", _UA.encode("ascii"))
             req.setRawHeader(b"Referer", _referer_for_url(url).encode("ascii"))
@@ -244,7 +261,7 @@ class _NativeTileLoader(QObject):
     def _start_worker_fallback(self) -> None:
         if not self._queue:
             return
-        z, x, y, url, source_id, use_disk_cache = self._queue.pop(0)
+        _dist, z, x, y, url, source_id, use_disk_cache = self._queue.pop(0)
         bridge = _TileFetchSignals()
         bridge.loaded.connect(
             lambda az, ax, ay, im, tgt=self.loaded: tgt.emit(az, ax, ay, im),
@@ -290,6 +307,40 @@ class _TileFetchTask(QRunnable):
         self._bridge.loaded.emit(self._z, self._x, self._y, img)
 
 
+class _DiskTileWarmTask(QRunnable):
+    """Load disk/bundled tiles off the GUI thread (paint must never block on I/O)."""
+
+    def __init__(
+        self,
+        items: list[tuple[int, int, int, str, bool]],
+        bridge: _TileFetchSignals,
+    ) -> None:
+        super().__init__()
+        self._items = items
+        self._bridge = bridge
+
+    def run(self) -> None:
+        for z, x, y, source_id, use_disk_cache in self._items:
+            seed = bundled_seed_tile_path(z, x, y)
+            if seed is not None:
+                try:
+                    img = _prepare_tile_image(QImage(str(seed)))
+                    if not img.isNull():
+                        self._bridge.loaded.emit(z, x, y, img)
+                        continue
+                except Exception:
+                    pass
+            if use_disk_cache and source_id:
+                try:
+                    cp = _disk_cache_path(source_id, z, x, y)
+                    if cp.is_file():
+                        img = _prepare_tile_image(QImage(str(cp)))
+                        if not img.isNull():
+                            self._bridge.loaded.emit(z, x, y, img)
+                except Exception:
+                    pass
+
+
 class NativeTileMapView(QWidget):
     """Minimal interactive map: HTTP tiles, drag pan, wheel zoom, markers."""
 
@@ -305,6 +356,7 @@ class NativeTileMapView(QWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.setMinimumHeight(200)
         self._zoom = 16.0
+        self._view_z = 16
         self._max_zoom = 19
         self._center_lat = 37.7749
         self._center_lon = -122.4194
@@ -344,11 +396,16 @@ class NativeTileMapView(QWidget):
         self._observation_marks: list[tuple[float, float]] = []
         self._pending_timer = QTimer(self)
         self._pending_timer.setSingleShot(True)
-        self._pending_timer.setInterval(80)
+        self._pending_timer.setInterval(32)
         self._pending_timer.timeout.connect(self.update)
+        self._disk_warm_bridge = _TileFetchSignals()
+        self._disk_warm_bridge.loaded.connect(self._on_tile_loaded)
+        self._pool = QThreadPool.globalInstance()
         self.setStyleSheet("background-color: #1a1d24;")
         # >1.0 enlarges the vehicle chevron (used when the map is mirrored into the small video-swap card).
         self._vehicle_arrow_scale = 1.0
+        self._sync_view_zoom()
+        QTimer.singleShot(0, self._warm_disk_tiles_for_viewport)
 
     def set_vehicle_arrow_scale(self, factor: float) -> None:
         """Scale the on-map vehicle icon (1.0 = default). Clamped for sane line widths."""
@@ -380,7 +437,33 @@ class NativeTileMapView(QWidget):
             self._zoom = max(3.0, min(float(self._max_zoom), float(z)))
         except Exception:
             pass
-        self.update()
+        self._sync_view_zoom()
+        self._schedule_repaint()
+
+    def _sync_view_zoom(self) -> None:
+        nz = int(max(3, min(self._max_zoom, round(self._zoom))))
+        if nz == self._view_z:
+            return
+        self._view_z = nz
+        cx, cy = _tile_xy(self._center_lat, self._center_lon, nz)
+        self._tile_loader.set_view_zoom(nz, cx, cy)
+        self._tiles_inflight = {k for k in self._tiles_inflight if k[0] == nz}
+        self._prune_tile_memory()
+        self._warm_disk_tiles_for_viewport()
+
+    def _schedule_repaint(self) -> None:
+        if not self._pending_timer.isActive():
+            self._pending_timer.start()
+
+    def _prune_tile_memory(self) -> None:
+        if len(self._tiles) <= _TILE_MEMORY_CAP:
+            return
+        keep = {self._view_z, self._view_z - 1, self._view_z + 1}
+        pruned: dict[tuple[int, int, int], QImage] = {}
+        for key, im in self._tiles.items():
+            if key[0] in keep:
+                pruned[key] = im
+        self._tiles = pruned
 
     def set_vehicle(self, lat: float, lon: float) -> None:
         self._vehicle_lat = float(lat)
@@ -472,10 +555,16 @@ class NativeTileMapView(QWidget):
             self._max_zoom = 19
         self._tiles.clear()
         self._tiles_inflight.clear()
-        self.update()
+        self._sync_view_zoom()
+        self._warm_disk_tiles_for_viewport()
+        self._schedule_repaint()
 
-    def set_low_spec(self, _on: bool) -> None:
-        self.update()
+    def set_low_spec(self, on: bool) -> None:
+        try:
+            self._tile_loader._max_active = 12 if bool(on) else _TILE_MAX_ACTIVE_HTTP
+        except Exception:
+            pass
+        self._schedule_repaint()
 
     def set_observation_mark_mode(self, on: bool) -> None:
         """When True, a short click (no drag) on the map emits ``observation_map_click``."""
@@ -716,7 +805,7 @@ class NativeTileMapView(QWidget):
         if w <= 1 or h <= 1:
             painter.end()
             return
-        z = int(max(3, min(self._max_zoom, round(self._zoom))))
+        z = int(self._view_z)
         tile_size = _TILE_SIZE
         center_x = _lon_to_x(self._center_lon, z)
         center_y = _lat_to_y(self._center_lat, z)
@@ -731,7 +820,7 @@ class NativeTileMapView(QWidget):
             for ty in range(y0, y1 + 1):
                 if tx < 0 or ty < 0 or tx >= n or ty >= n:
                     continue
-                img = self._tile_image(z, tx, ty)
+                img = self._tile_for_paint(z, tx, ty)
                 if img is None or img.isNull():
                     continue
                 px = int(tx * tile_size - fx)
@@ -884,7 +973,7 @@ class NativeTileMapView(QWidget):
         w, h = self.width(), self.height()
         if w <= 1 or h <= 1:
             return None
-        z = int(max(3, min(self._max_zoom, round(self._zoom))))
+        z = int(self._view_z)
         tile_size = 256
         center_x = _lon_to_x(self._center_lon, z)
         center_y = _lat_to_y(self._center_lat, z)
@@ -934,6 +1023,13 @@ class NativeTileMapView(QWidget):
         return tmpl.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
 
     def _on_tile_loaded(self, z: int, x: int, y: int, img: object) -> None:
+        if int(z) != int(self._view_z):
+            key = (z, x, y)
+            try:
+                self._tiles_inflight.discard(key)
+            except Exception:
+                pass
+            return
         key = (z, x, y)
         try:
             self._tiles_inflight.discard(key)
@@ -943,60 +1039,107 @@ class NativeTileMapView(QWidget):
             self._tiles[key] = QImage()
         else:
             self._tiles[key] = _prepare_tile_image(img)
-        self.update()
+        self._schedule_repaint()
 
-    def _tile_image(self, z: int, x: int, y: int) -> QImage | None:
+    def _tile_for_paint(self, z: int, x: int, y: int) -> QImage | None:
         key = (z, x, y)
         if key in self._tiles:
             im = self._tiles[key]
             return im if not im.isNull() else None
-        seed = bundled_seed_tile_path(z, x, y)
-        if seed is not None:
-            try:
-                cached = _prepare_tile_image(QImage(str(seed)))
-                if not cached.isNull():
-                    self._tiles[key] = cached
-                    return cached
-            except Exception:
-                pass
-        if self._tile_template != "{local}":
-            try:
-                cache_path = _disk_cache_path(self._tile_source_id, z, x, y)
-                if cache_path.is_file():
-                    cached = _prepare_tile_image(QImage(str(cache_path)))
-                    if not cached.isNull():
-                        self._tiles[key] = cached
-                        return cached
-            except Exception:
-                pass
-        if key not in self._tiles_inflight:
-            self._tiles_inflight.add(key)
-            url = self._tile_url(z, x, y)
-            use_disk_cache = self._tile_template != "{local}"
-            try:
-                self._tile_loader.request(
-                    z,
-                    x,
-                    y,
-                    url,
-                    source_id=self._tile_source_id,
-                    use_disk_cache=use_disk_cache,
-                )
-            except Exception:
-                self._tiles_inflight.discard(key)
+        parent = self._parent_tile_child(z, x, y)
+        if parent is not None and not parent.isNull():
+            return parent
+        self._queue_tile_fetch(z, x, y)
         return None
+
+    def _parent_tile_child(self, z: int, x: int, y: int) -> QImage | None:
+        """Upscale a parent tile quadrant so zoom feels instant while HTTP tiles arrive."""
+        pz = z - 1
+        if pz < 3:
+            return None
+        pkey = (pz, x // 2, y // 2)
+        parent = self._tiles.get(pkey)
+        if parent is None or parent.isNull():
+            return None
+        half = _TILE_SIZE // 2
+        ox = (x % 2) * half
+        oy = (y % 2) * half
+        try:
+            child = parent.copy(ox, oy, half, half)
+            if child.isNull():
+                return None
+            return child.scaled(
+                _TILE_SIZE,
+                _TILE_SIZE,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+        except Exception:
+            return None
+
+    def _queue_tile_fetch(self, z: int, x: int, y: int) -> None:
+        key = (z, x, y)
+        if key in self._tiles_inflight:
+            return
+        self._tiles_inflight.add(key)
+        url = self._tile_url(z, x, y)
+        use_disk_cache = self._tile_template != "{local}"
+        cx, cy = _tile_xy(self._center_lat, self._center_lon, z)
+        dist = abs(x - cx) + abs(y - cy)
+        try:
+            self._tile_loader.request(
+                z,
+                x,
+                y,
+                url,
+                source_id=self._tile_source_id,
+                use_disk_cache=use_disk_cache,
+                distance=float(dist),
+            )
+        except Exception:
+            self._tiles_inflight.discard(key)
+
+    def _warm_disk_tiles_for_viewport(self) -> None:
+        """Prefetch disk/bundled tiles for the current view without blocking paint."""
+        vf = self._view_frame()
+        if vf is None:
+            return
+        z, fx, fy, w, h = vf
+        tile_size = _TILE_SIZE
+        x0 = int(math.floor(fx / tile_size)) - 1
+        y0 = int(math.floor(fy / tile_size)) - 1
+        x1 = int(math.ceil((fx + w) / tile_size)) + 1
+        y1 = int(math.ceil((fy + h) / tile_size)) + 1
+        n = 1 << z
+        use_disk_cache = self._tile_template != "{local}"
+        items: list[tuple[int, int, int, str, bool]] = []
+        for tx in range(x0, x1 + 1):
+            for ty in range(y0, y1 + 1):
+                if tx < 0 or ty < 0 or tx >= n or ty >= n:
+                    continue
+                key = (z, tx, ty)
+                if key in self._tiles or key in self._tiles_inflight:
+                    continue
+                items.append((z, tx, ty, self._tile_source_id, use_disk_cache))
+        if not items:
+            return
+        try:
+            self._pool.start(_DiskTileWarmTask(items, self._disk_warm_bridge))
+        except Exception:
+            pass
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         # Keep the in-memory tile cache on resize — clearing forced a full re-download.
-        self.update()
+        self._warm_disk_tiles_for_viewport()
+        self._schedule_repaint()
 
     # --- input ---
     def nudge_center_by_pixels(self, dx: float, dy: float) -> None:
         """Pan the map by ``(dx, dy)`` screen pixels (same math as drag-pan in ``mouseMoveEvent``)."""
         if dx == 0.0 and dy == 0.0:
             return
-        z = int(max(3, min(self._max_zoom, round(self._zoom))))
+        z = int(self._view_z)
         wx = _lon_to_x(self._center_lon, z) * 256.0 - dx
         wy = _lat_to_y(self._center_lat, z) * 256.0 - dy
         n = 256.0 * (2.0**z)
@@ -1009,11 +1152,11 @@ class NativeTileMapView(QWidget):
         delta = float(event.angleDelta().y())
         if delta == 0.0:
             return
-        # ~1 zoom level per standard wheel detent (120°). The map paints at ``round(_zoom)`` tile z,
-        # so the old fixed 0.45 step often left several notches with no visible change.
+        # ~1 zoom level per standard wheel detent (120°).
         step = (delta / 120.0) * 1.0
         self._zoom = max(3.0, min(float(self._max_zoom), self._zoom + step))
-        self.update()
+        self._sync_view_zoom()
+        self._schedule_repaint()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1148,7 +1291,7 @@ class NativeTileMapView(QWidget):
         w, h = self.width(), self.height()
         if w <= 1 or h <= 1:
             return None
-        z = int(max(3, min(self._max_zoom, round(self._zoom))))
+        z = int(self._view_z)
         tile_size = 256
         center_x = _lon_to_x(self._center_lon, z)
         center_y = _lat_to_y(self._center_lat, z)

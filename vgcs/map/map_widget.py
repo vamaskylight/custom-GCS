@@ -180,7 +180,7 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-only"
+MAP_BACKEND_BUILD = "2026-05-18-native2d-turbo"
 
 def _web_2d_fallback_allowed() -> bool:
     """2D map is NativeTileMapView only; WebEngine Leaflet is opt-in for debugging."""
@@ -2736,11 +2736,13 @@ class MapWidget(QWidget):
         if n > 2:
             return
         try:
-            print(f"[VGCS:map] native 2D tiles missing after startup (loaded={n}) — trying Esri Streets")
+            print(
+                f"[VGCS:map] native satellite tiles still loading (loaded={n}) — retrying World Imagery"
+            )
         except Exception:
             pass
         try:
-            self.activate_esri_street_tiles()
+            self.activate_satellite_tiles()
         except Exception:
             pass
         try:
@@ -2778,16 +2780,16 @@ class MapWidget(QWidget):
             )
             return
         try:
-            print("[VGCS:map] native Qt tiles still missing — retrying Esri Streets")
+            print("[VGCS:map] native satellite still sparse — final retry World Imagery")
         except Exception:
             pass
         try:
-            self.activate_esri_street_tiles()
+            self.activate_satellite_tiles()
         except Exception:
             pass
         self._native_tile_fallback_done = True
         self._set_status(
-            "Map tiles failed to load — check internet/firewall or use Offline Tiles in the toolbar"
+            "Satellite tiles loading slowly — check internet/firewall or pick Offline Tiles in the toolbar"
         )
 
     def _sync_web_map_center_from_native(self) -> None:
@@ -3019,23 +3021,22 @@ class MapWidget(QWidget):
             if not getattr(self, "_tile_network_fallback_done", False):
                 self._tile_network_fallback_done = True
                 self._set_status(
-                    "Map tiles unreachable (no internet?) — trying OpenStreetMap; "
-                    "or use Offline Tiles in the map toolbar"
+                    "Satellite tiles unreachable — check internet or use Offline Tiles in the toolbar"
                 )
                 try:
-                    self.activate_osm_tiles()
+                    QTimer.singleShot(800, self.activate_satellite_tiles)
                 except Exception:
                     pass
             return
-        # If the *active view* tile is a placeholder, auto-fallback to Streets and guide the user.
+        # Do not auto-switch map type (product default is Esri World Imagery satellite).
         if "active_view" in label and outcome == "placeholder_suspected":
-            self._set_status("Satellite tiles are placeholders — auto-switching to Streets")
-            try:
-                self.activate_esri_street_tiles()
-            except Exception:
-                pass
+            self._set_status(
+                "Satellite tile looks blocked/placeholder — use Offline Tiles or Esri Streets in the toolbar"
+            )
         if "esri_imagery" in label and outcome == "placeholder_suspected":
-            self._set_status("Satellite tiles blocked/placeholder — switch to Streets or Offline Tiles…")
+            self._set_status(
+                "Satellite imagery blocked on this network — use Offline Tiles or Esri Streets in the toolbar"
+            )
 
     def _set_webcam_enabled(self, enabled: bool) -> None:
         on = bool(enabled)
@@ -3527,32 +3528,28 @@ class MapWidget(QWidget):
             self._run_js(
                 f"window.__planRailTool = {json.dumps(t)}; setPlanRailTool({json.dumps(t)});"
             )
-            # Tile selection strategy:
-            # - If offline tiles are configured, always prefer them (guaranteed).
-            # - Otherwise, always TRY satellite first on every launch (matches desired default),
-            #   then allow fallback (probe) to Streets if the client network returns placeholders.
+            # Tile selection: offline folder if configured; else Esri World Imagery (satellite).
+            # Streets/OSM are toolbar-only — never auto-selected at startup.
             try:
                 s = QSettings(_QS_NS, _QS_APP)
                 root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
                 if root and Path(root).is_dir():
                     self.activate_offline_tiles(root)
                 else:
-                    # Always try Satellite first (even if a client previously used Streets).
                     self.activate_satellite_tiles()
-                    # Run a quick probe to detect placeholders and fallback automatically if needed.
+                try:
+                    QTimer.singleShot(1200, lambda: self._probe_current_tiles(reason="startup"))
+                except Exception:
+                    pass
+                try:
+                    QTimer.singleShot(2000, self._native_tile_startup_check)
+                except Exception:
+                    pass
+                for delay_ms in (900, 1800, 3500):
                     try:
-                        QTimer.singleShot(1200, lambda: self._probe_current_tiles(reason="startup"))
+                        QTimer.singleShot(delay_ms, self._ensure_native_map_visible)
                     except Exception:
                         pass
-                    try:
-                        QTimer.singleShot(2000, self._native_tile_startup_check)
-                    except Exception:
-                        pass
-                    for delay_ms in (900, 1800, 3500):
-                        try:
-                            QTimer.singleShot(delay_ms, self._ensure_map_tiles_visible)
-                        except Exception:
-                            pass
             except Exception:
                 pass
             self.map_page_ready.emit()
@@ -6465,10 +6462,14 @@ class MapWidget(QWidget):
             nm = getattr(self, "_native_map", None)
             if nm is not None:
                 nm.set_tile_source(tmpl, "", 19)
+                try:
+                    nm._warm_disk_tiles_for_viewport()
+                except Exception:
+                    pass
         except Exception:
             pass
         self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Tiles © Esri', 19);")
-        self._set_status("Satellite tiles active")
+        self._set_status("Satellite imagery active (Esri World Imagery)")
 
     def activate_offline_tiles(self, root: str) -> None:
         root = str(root or "").strip()
