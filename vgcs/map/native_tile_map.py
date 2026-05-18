@@ -127,14 +127,15 @@ def _fetch_http_bytes_qt(url: str, *, timeout_s: float = 5.0) -> bytes:
 
 
 def fetch_tile_http_bytes(url: str, *, timeout_s: float = 5.0) -> bytes:
-    """Fetch tile bytes using Qt network (proxy/SSL) with urllib fallback."""
+    """Fetch tile bytes — urllib first (worker-safe), then Qt network on the main thread path."""
     if url.startswith("http://") or url.startswith("https://"):
+        try:
+            return _fetch_http_bytes_urllib(url, timeout_s=timeout_s)
+        except Exception:
+            pass
         if _HAS_QT_NETWORK:
-            try:
-                return _fetch_http_bytes_qt(url, timeout_s=timeout_s)
-            except Exception:
-                pass
-        return _fetch_http_bytes_urllib(url, timeout_s=timeout_s)
+            return _fetch_http_bytes_qt(url, timeout_s=timeout_s)
+        raise OSError("http fetch failed")
     raise ValueError("not an http url")
 
 
@@ -173,6 +174,87 @@ def _prepare_tile_image(img: QImage) -> QImage:
 
 class _TileFetchSignals(QObject):
     loaded = Signal(int, int, int, object)  # z, x, y, QImage or None
+
+
+class _NativeTileLoader(QObject):
+    """Main-thread QNetworkAccessManager tile fetcher (proxy/SSL match Qt WebEngine)."""
+
+    loaded = Signal(int, int, int, object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._nam = QNetworkAccessManager(self) if _HAS_QT_NETWORK else None
+        self._queue: list[tuple[int, int, int, str, str, bool]] = []
+        self._active = 0
+        self._max_active = 10
+        self._pool = QThreadPool.globalInstance()
+
+    def request(
+        self,
+        z: int,
+        x: int,
+        y: int,
+        url: str,
+        *,
+        source_id: str,
+        use_disk_cache: bool,
+    ) -> None:
+        self._queue.append((z, x, y, url, source_id, use_disk_cache))
+        self._drain()
+
+    def _drain(self) -> None:
+        if self._nam is None:
+            self._start_worker_fallback()
+            return
+        while self._active < self._max_active and self._queue:
+            z, x, y, url, source_id, use_disk_cache = self._queue.pop(0)
+            req = QNetworkRequest(QUrl(url))
+            req.setRawHeader(b"User-Agent", _UA.encode("ascii"))
+            req.setRawHeader(b"Referer", _referer_for_url(url).encode("ascii"))
+            reply = self._nam.get(req)
+            self._active += 1
+
+            def _done(r=reply, zz=z, xx=x, yy=y, u=url, sid=source_id, udc=use_disk_cache) -> None:
+                self._active = max(0, self._active - 1)
+                try:
+                    if r.error() == QNetworkReply.NetworkError.NoError:
+                        raw = bytes(r.readAll())
+                        img = QImage.fromData(raw)
+                        if not img.isNull():
+                            if udc and sid and raw:
+                                try:
+                                    cp = _disk_cache_path(sid, zz, xx, yy)
+                                    cp.parent.mkdir(parents=True, exist_ok=True)
+                                    cp.write_bytes(raw)
+                                except Exception:
+                                    pass
+                            self.loaded.emit(zz, xx, yy, _prepare_tile_image(img))
+                            self._drain()
+                            return
+                except Exception:
+                    pass
+                img = _fetch_tile_http_or_file(
+                    u, source_id=sid, z=zz, x=xx, y=yy, use_disk_cache=udc
+                )
+                self.loaded.emit(zz, xx, yy, img)
+                self._drain()
+
+            reply.finished.connect(_done)
+
+    def _start_worker_fallback(self) -> None:
+        if not self._queue:
+            return
+        z, x, y, url, source_id, use_disk_cache = self._queue.pop(0)
+        bridge = _TileFetchSignals()
+        bridge.loaded.connect(
+            lambda az, ax, ay, im, tgt=self.loaded: tgt.emit(az, ax, ay, im),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._pool.start(
+            _TileFetchTask(z, x, y, url, bridge, source_id=source_id, use_disk_cache=use_disk_cache)
+        )
+        if self._queue:
+            QTimer.singleShot(0, self._start_worker_fallback)
 
 
 class _TileFetchTask(QRunnable):
@@ -243,11 +325,9 @@ class NativeTileMapView(QWidget):
         self._offline_root: str | None = None
         self._tiles: dict[tuple[int, int, int], QImage] = {}
         self._tiles_inflight: set[tuple[int, int, int]] = set()
-        self._tile_bridge = _TileFetchSignals(self)
-        self._tile_bridge.loaded.connect(self._on_tile_loaded)
+        self._tile_loader = _NativeTileLoader(self)
+        self._tile_loader.loaded.connect(self._on_tile_loaded)
         self._tile_source_id = _tile_source_id(self._tile_template)
-        self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(12)
         self._dragging = False
         self._drag_last: QPointF | None = None
         # Waypoint / fence: add only on release if the gesture was a tap (not a map pan drag).
@@ -870,6 +950,15 @@ class NativeTileMapView(QWidget):
         if key in self._tiles:
             im = self._tiles[key]
             return im if not im.isNull() else None
+        seed = bundled_seed_tile_path(z, x, y)
+        if seed is not None:
+            try:
+                cached = _prepare_tile_image(QImage(str(seed)))
+                if not cached.isNull():
+                    self._tiles[key] = cached
+                    return cached
+            except Exception:
+                pass
         if self._tile_template != "{local}":
             try:
                 cache_path = _disk_cache_path(self._tile_source_id, z, x, y)
@@ -885,16 +974,13 @@ class NativeTileMapView(QWidget):
             url = self._tile_url(z, x, y)
             use_disk_cache = self._tile_template != "{local}"
             try:
-                self._pool.start(
-                    _TileFetchTask(
-                        z,
-                        x,
-                        y,
-                        url,
-                        self._tile_bridge,
-                        source_id=self._tile_source_id,
-                        use_disk_cache=use_disk_cache,
-                    )
+                self._tile_loader.request(
+                    z,
+                    x,
+                    y,
+                    url,
+                    source_id=self._tile_source_id,
+                    use_disk_cache=use_disk_cache,
                 )
             except Exception:
                 self._tiles_inflight.discard(key)
@@ -1108,6 +1194,14 @@ def _fetch_tile_http_or_file(
     y: int = 0,
     use_disk_cache: bool = True,
 ) -> QImage:
+    seed = bundled_seed_tile_path(z, x, y)
+    if seed is not None:
+        try:
+            img = _prepare_tile_image(QImage(str(seed)))
+            if not img.isNull():
+                return img
+        except Exception:
+            pass
     cache_path: Path | None = None
     if use_disk_cache and source_id:
         cache_path = _disk_cache_path(source_id, z, x, y)
@@ -1136,14 +1230,6 @@ def _fetch_tile_http_or_file(
             return _prepare_tile_image(QImage(str(p)))
     except Exception as e:
         _log_tile_fetch_error(url, f"{type(e).__name__}: {e}")
-    seed = bundled_seed_tile_path(z, x, y)
-    if seed is not None:
-        try:
-            img = _prepare_tile_image(QImage(str(seed)))
-            if not img.isNull():
-                return img
-        except Exception:
-            pass
     return QImage()
 
 
