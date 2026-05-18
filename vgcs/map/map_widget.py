@@ -180,12 +180,13 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-gpsfix"
+MAP_BACKEND_BUILD = "2026-05-18-native2d-gpsfix2"
 # Ignore GPS/heading jitter on the map when the vehicle is stationary (common pre-arm on the ground).
-_MAP_STATIONARY_SPEED_MPS = 0.4
-_MAP_POSITION_MIN_MOVE_M = 2.5
-_MAP_HEADING_MIN_DELTA_DEG = 12.0
-_MAP_TRACK_MIN_MOVE_M = 3.0
+_MAP_STATIONARY_SPEED_MPS = 0.8
+_MAP_POSITION_MIN_MOVE_M = 2.0
+_MAP_POSITION_STATIONARY_MOVE_M = 8.0
+_MAP_HEADING_MIN_DELTA_DEG = 15.0
+_MAP_TRACK_MIN_MOVE_M = 5.0
 
 def _web_2d_fallback_allowed() -> bool:
     """2D map is NativeTileMapView only; WebEngine Leaflet is opt-in for debugging."""
@@ -2588,6 +2589,7 @@ class MapWidget(QWidget):
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
         if c:
             try:
+                self.clear_flight_track()
                 self.set_video_follow_enabled(True)
                 if getattr(self, "_lat", None) is not None and getattr(self, "_lon", None) is not None:
                     self.center_on_vehicle()
@@ -6002,25 +6004,18 @@ class MapWidget(QWidget):
         self._vehicle_pose_timer.stop()
         if self._lat is None or self._lon is None:
             return
-        lat = float(self._lat)
-        lon = float(self._lon)
+        # Native map position is set directly in set_vehicle_position (filtered). JS is for
+        # legacy WebEngine only — never push raw GPS back into NativeTileMapView via setVehicle().
         hd = float(self._heading) if self._heading is not None else 0.0
         src = self._heading_js_source or "mixed"
-        self._run_js(
-            f"setVehicle({lat:.8f}, {lon:.8f}); "
-            f"updateHeading({hd:.2f}, undefined, undefined, {json.dumps(src)});"
-        )
-        if bool(getattr(self, "_video_follow_enabled", False)):
-            try:
-                now = time.monotonic()
-                last = float(getattr(self, "_video_follow_last_center_mono", 0.0))
-                # Throttle map recentering for usability.
-                if now - last >= 0.6:
-                    self._video_follow_last_center_mono = now
-                    # Match legacy web: second bridge call after setVehicle so native uses _vehicle_lat/_lon.
-                    self._run_js("centerOnVehicle();")
-            except Exception:
-                pass
+        w3 = getattr(self, "_web_3d_view", None)
+        if w3 is not None and bool(getattr(self, "_is_3d_mode", False)):
+            lat = float(self._map_display_lat if self._map_display_lat is not None else self._lat)
+            lon = float(self._map_display_lon if self._map_display_lon is not None else self._lon)
+            self._run_js(
+                f"setVehicle({lat:.8f}, {lon:.8f}); "
+                f"updateHeading({hd:.2f}, undefined, undefined, {json.dumps(src)});"
+            )
 
     @staticmethod
     def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -6059,13 +6054,19 @@ class MapWidget(QWidget):
             shift_m = self._haversine_m(
                 self._map_display_lat, self._map_display_lon, display_lat, display_lon
             )
-            if gs < _MAP_STATIONARY_SPEED_MPS and shift_m < _MAP_POSITION_MIN_MOVE_M:
+            min_move = (
+                _MAP_POSITION_STATIONARY_MOVE_M
+                if gs < _MAP_STATIONARY_SPEED_MPS
+                else _MAP_POSITION_MIN_MOVE_M
+            )
+            if shift_m < min_move:
                 display_lat = self._map_display_lat
                 display_lon = self._map_display_lon
+                map_moved = False
             else:
                 self._map_display_lat = display_lat
                 self._map_display_lon = display_lon
-                map_moved = shift_m >= _MAP_POSITION_MIN_MOVE_M
+                map_moved = True
         else:
             self._map_display_lat = display_lat
             self._map_display_lon = display_lon
@@ -6105,12 +6106,8 @@ class MapWidget(QWidget):
     def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
         gs = float(getattr(self, "_last_groundspeed_mps", 0.0))
         src = str(source or "mixed")
-        if gs < _MAP_STATIONARY_SPEED_MPS and src in ("vfr", "att"):
+        if gs < _MAP_STATIONARY_SPEED_MPS:
             return
-        if self._heading is not None and gs < _MAP_STATIONARY_SPEED_MPS:
-            delta = (float(heading_deg) - float(self._heading) + 180.0) % 360.0 - 180.0
-            if abs(delta) < _MAP_HEADING_MIN_DELTA_DEG:
-                return
         self._heading = heading_deg % 360.0
         self._heading_js_source = src
         self._heading_label.setText(f"Heading: {self._heading:.1f}°")

@@ -576,7 +576,7 @@ class NativeTileMapView(QWidget):
                 last_lat, last_lon = self._track[-1]
                 dy_m = (lat_f - last_lat) * 111_320.0
                 dx_m = (lon_f - last_lon) * 111_320.0 * math.cos(math.radians(lat_f))
-                if math.hypot(dx_m, dy_m) < 3.0:
+                if math.hypot(dx_m, dy_m) < 5.0:
                     append_track = False
             if append_track:
                 self._track.append((lat_f, lon_f))
@@ -821,9 +821,7 @@ class NativeTileMapView(QWidget):
         if any(tok in p for tok in _skip_if):
             return
         if p.startswith("setVehicle("):
-            m = re.match(r"setVehicle\(\s*([+-]?\d+\.?\d*)\s*,\s*([+-]?\d+\.?\d*)\s*\)", p)
-            if m:
-                self.set_vehicle(float(m.group(1)), float(m.group(2)))
+            # Position is applied by MapWidget.set_vehicle_position (GPS filtered). Ignore JS echo.
             return
         if p.startswith("updateHeading("):
             m = re.match(r"updateHeading\(\s*([+-]?\d+\.?\d*)", p)
@@ -831,7 +829,7 @@ class NativeTileMapView(QWidget):
                 self.set_heading(float(m.group(1)))
             return
         if p.strip() == "centerOnVehicle()" or p.startswith("centerOnVehicle("):
-            self.center_on_vehicle()
+            # Follow/recenter is driven from MapWidget (filtered GPS); ignore JS echo.
             return
         if "clearFlightTrack()" in p:
             self.clear_track()
