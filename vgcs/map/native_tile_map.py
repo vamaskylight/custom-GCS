@@ -49,6 +49,9 @@ def _tile_xy(lat: float, lon: float, z: int) -> tuple[int, int]:
 
 _TILE_SIZE = 256
 _TILE_MAX_ACTIVE_HTTP = 24
+# Esri World Imagery is reliable through 19; higher LODs often return placeholders and stall the UI.
+_ESRI_WORLD_IMAGERY_MAX_ZOOM = 19
+_TILE_PLACEHOLDER_MAX_RETRIES = 3
 _TILE_MEMORY_CAP = 640
 _TILE_CACHE_ROOT = (Path.home() / ".vgcs" / "tile-cache").resolve()
 _HTTP_OPENER = build_opener()
@@ -157,6 +160,18 @@ def _tile_source_id(template: str) -> str:
     return hashlib.sha256(str(template or "").encode("utf-8")).hexdigest()[:16]
 
 
+def _max_zoom_for_template(template: str, requested: int) -> int:
+    """Pick a safe max zoom for the tile URL (Esri imagery has more LODs than streets/OSM)."""
+    t = str(template or "").lower()
+    try:
+        z = int(requested)
+    except Exception:
+        z = 19
+    if "world_imagery" in t:
+        return max(3, min(_ESRI_WORLD_IMAGERY_MAX_ZOOM, z))
+    return max(3, min(22, z))
+
+
 def _disk_cache_path(source_id: str, z: int, x: int, y: int) -> Path:
     return _TILE_CACHE_ROOT / source_id / str(z) / str(x) / f"{y}.png"
 
@@ -175,11 +190,12 @@ def _prepare_tile_image(img: QImage) -> QImage:
     )
 
 
-def _tile_image_is_placeholder(img: QImage, *, raw_byte_len: int = 0) -> bool:
+def _tile_image_is_placeholder(img: QImage, *, raw_byte_len: int = 0, zoom: int | None = None) -> bool:
     """
     Esri World Imagery often returns HTTP 200 gray tiles labeled
     "Map data not yet available" (especially right after zoom-in).
   """
+    z = int(zoom) if zoom is not None else -1
     if img.isNull() or img.width() < 16 or img.height() < 16:
         return True
     w = img.width()
@@ -210,20 +226,22 @@ def _tile_image_is_placeholder(img: QImage, *, raw_byte_len: int = 0) -> bool:
         return True
     if raw_byte_len > 0 and 150.0 < mean < 235.0 and var_y < 50.0 and raw_byte_len < 8000:
         return True
-    # SMPTE / color-bar test patterns and other low-diversity tiles.
-    if len(colors) <= 24:
+    # SMPTE / color-bar test patterns — skip at high zoom (roofs/pavement look low-diversity).
+    if z < 17 and len(colors) <= 24:
         return True
     return False
 
 
 def _accept_map_tile(
-    img: QImage, *, raw_byte_len: int = 0
+    img: QImage, *, raw_byte_len: int = 0, zoom: int | None = None
 ) -> QImage | None:
     """Return prepared tile, or None if missing / Esri placeholder (never paint placeholders)."""
     if img.isNull():
         return None
     prepared = _prepare_tile_image(img)
-    if prepared.isNull() or _tile_image_is_placeholder(prepared, raw_byte_len=raw_byte_len):
+    if prepared.isNull() or _tile_image_is_placeholder(
+        prepared, raw_byte_len=raw_byte_len, zoom=zoom
+    ):
         return None
     return prepared
 
@@ -292,7 +310,7 @@ class _NativeTileLoader(QObject):
                         raw = bytes(r.readAll())
                         img = QImage.fromData(raw)
                         if not img.isNull():
-                            accepted = _accept_map_tile(img, raw_byte_len=len(raw))
+                            accepted = _accept_map_tile(img, raw_byte_len=len(raw), zoom=zz)
                             if accepted is not None:
                                 if udc and sid and raw:
                                     try:
@@ -306,10 +324,8 @@ class _NativeTileLoader(QObject):
                                 return
                 except Exception:
                     pass
-                img = _fetch_tile_http_or_file(
-                    u, source_id=sid, z=zz, x=xx, y=yy, use_disk_cache=udc
-                )
-                self.loaded.emit(zz, xx, yy, img)
+                # Never block the GUI thread with a synchronous urllib/Qt refetch here.
+                self.loaded.emit(zz, xx, yy, QImage())
                 self._drain()
 
             reply.finished.connect(_done)
@@ -380,7 +396,7 @@ class _DiskTileWarmTask(QRunnable):
             seed = bundled_seed_tile_path(z, x, y)
             if seed is not None:
                 try:
-                    accepted = _accept_map_tile(QImage(str(seed)))
+                    accepted = _accept_map_tile(QImage(str(seed)), zoom=z)
                     if accepted is not None:
                         self._bridge.loaded.emit(z, x, y, accepted)
                         continue
@@ -390,7 +406,7 @@ class _DiskTileWarmTask(QRunnable):
                 try:
                     cp = _disk_cache_path(source_id, z, x, y)
                     if cp.is_file():
-                        accepted = _accept_map_tile(QImage(str(cp)))
+                        accepted = _accept_map_tile(QImage(str(cp)), zoom=z)
                         if accepted is not None:
                             self._bridge.loaded.emit(z, x, y, accepted)
                         else:
@@ -418,7 +434,7 @@ class NativeTileMapView(QWidget):
         self.setMinimumHeight(200)
         self._zoom = 16.0
         self._view_z = 16
-        self._max_zoom = 19
+        self._max_zoom = _ESRI_WORLD_IMAGERY_MAX_ZOOM
         self._center_lat = 37.7749
         self._center_lon = -122.4194
         self._vehicle_lat: float | None = None
@@ -437,8 +453,10 @@ class NativeTileMapView(QWidget):
         self._tile_subdomains = "abc"
         self._offline_root: str | None = None
         self._tiles: dict[tuple[int, int, int], QImage] = {}
+        self._preview_tiles: dict[tuple[int, int, int], QImage] = {}
         self._tiles_inflight: set[tuple[int, int, int]] = set()
         self._tile_retry_after: dict[tuple[int, int, int], float] = {}
+        self._tile_retry_count: dict[tuple[int, int, int], int] = {}
         self._tile_loader = _NativeTileLoader(self)
         self._tile_loader.loaded.connect(self._on_tile_loaded)
         self._tile_source_id = _tile_source_id(self._tile_template)
@@ -510,6 +528,8 @@ class NativeTileMapView(QWidget):
         cx, cy = _tile_xy(self._center_lat, self._center_lon, nz)
         self._tile_loader.set_view_zoom(nz, cx, cy)
         self._tiles_inflight = {k for k in self._tiles_inflight if k[0] == nz}
+        self._preview_tiles.clear()
+        self._tile_retry_count.clear()
         self._prune_tile_memory()
         self._warm_disk_tiles_for_viewport()
 
@@ -611,12 +631,12 @@ class NativeTileMapView(QWidget):
         else:
             self._tile_template = t
         self._tile_source_id = _tile_source_id(self._tile_template)
-        try:
-            self._max_zoom = max(3, min(22, int(max_z)))
-        except Exception:
-            self._max_zoom = 19
+        self._max_zoom = _max_zoom_for_template(self._tile_template, max_z)
         self._tiles.clear()
+        self._preview_tiles.clear()
         self._tiles_inflight.clear()
+        self._tile_retry_after.clear()
+        self._tile_retry_count.clear()
         self._sync_view_zoom()
         self._warm_disk_tiles_for_viewport()
         self._schedule_repaint()
@@ -1102,21 +1122,27 @@ class NativeTileMapView(QWidget):
         if img is None or not isinstance(img, QImage) or img.isNull():
             self._schedule_placeholder_retry(z, x, y)
             return
-        if _tile_image_is_placeholder(img):
+        if _tile_image_is_placeholder(img, zoom=z):
             self._schedule_placeholder_retry(z, x, y)
             return
         self._tiles[key] = _prepare_tile_image(img)
+        self._preview_tiles.pop(key, None)
         self._tile_retry_after.pop(key, None)
+        self._tile_retry_count.pop(key, None)
         self._schedule_repaint()
 
     def _schedule_placeholder_retry(self, z: int, x: int, y: int) -> None:
         """Esri placeholder or miss — keep parent upscale visible and retry later."""
         key = (int(z), int(x), int(y))
         self._tiles.pop(key, None)
+        self._preview_tiles.pop(key, None)
+        retries = int(self._tile_retry_count.get(key, 0) or 0) + 1
+        self._tile_retry_count[key] = retries
+        if retries > _TILE_PLACEHOLDER_MAX_RETRIES:
+            return
         now = time.monotonic()
         wait = float(self._tile_retry_after.get(key, 0.0) or 0.0)
         if now < wait:
-            self._schedule_repaint()
             return
         self._tile_retry_after[key] = now + 2.0
         try:
@@ -1124,7 +1150,6 @@ class NativeTileMapView(QWidget):
             cp.unlink(missing_ok=True)
         except Exception:
             pass
-        self._schedule_repaint()
 
         def _retry() -> None:
             if int(z) != int(self._view_z):
@@ -1136,9 +1161,7 @@ class NativeTileMapView(QWidget):
 
     def _valid_cached_tile(self, key: tuple[int, int, int]) -> QImage | None:
         im = self._tiles.get(key)
-        if im is None or im.isNull() or _tile_image_is_placeholder(im):
-            if key in self._tiles:
-                self._tiles.pop(key, None)
+        if im is None or im.isNull():
             return None
         return im
 
@@ -1155,7 +1178,13 @@ class NativeTileMapView(QWidget):
 
     def _parent_tile_child(self, z: int, x: int, y: int) -> QImage | None:
         """Upscale a parent tile quadrant so zoom feels instant while HTTP tiles arrive."""
-        for depth in range(1, 4):
+        key = (z, x, y)
+        preview = self._preview_tiles.get(key)
+        if preview is not None and not preview.isNull():
+            return preview
+        # At high zoom, only 1 parent level (2×) — deeper upscales look blocky and stay visible too long.
+        max_depth = 1 if z >= 17 or z >= int(self._max_zoom) - 1 else 3
+        for depth in range(1, max_depth + 1):
             pz = z - depth
             if pz < 3:
                 break
@@ -1172,12 +1201,15 @@ class NativeTileMapView(QWidget):
                 child = parent.copy(ox, oy, half, half)
                 if child.isNull():
                     continue
-                return child.scaled(
+                scaled = child.scaled(
                     _TILE_SIZE,
                     _TILE_SIZE,
                     Qt.AspectRatioMode.IgnoreAspectRatio,
                     Qt.TransformationMode.FastTransformation,
                 )
+                if not scaled.isNull():
+                    self._preview_tiles[key] = scaled
+                return scaled
             except Exception:
                 continue
         return None
@@ -1220,14 +1252,28 @@ class NativeTileMapView(QWidget):
         n = 1 << z
         use_disk_cache = self._tile_template != "{local}"
         items: list[tuple[int, int, int, str, bool]] = []
+        seen: set[tuple[int, int, int]] = set()
         for tx in range(x0, x1 + 1):
             for ty in range(y0, y1 + 1):
                 if tx < 0 or ty < 0 or tx >= n or ty >= n:
                     continue
                 key = (z, tx, ty)
-                if key in self._tiles or key in self._tiles_inflight:
+                if key in self._tiles or key in self._tiles_inflight or key in seen:
                     continue
+                seen.add(key)
                 items.append((z, tx, ty, self._tile_source_id, use_disk_cache))
+        if z > 3:
+            pn = 1 << (z - 1)
+            for tx in range(x0, x1 + 1):
+                for ty in range(y0, y1 + 1):
+                    ptx, pty = tx >> 1, ty >> 1
+                    pkey = (z - 1, ptx, pty)
+                    if ptx < 0 or pty < 0 or ptx >= pn or pty >= pn:
+                        continue
+                    if pkey in self._tiles or pkey in self._tiles_inflight or pkey in seen:
+                        continue
+                    seen.add(pkey)
+                    items.append((z - 1, ptx, pty, self._tile_source_id, use_disk_cache))
         if not items:
             return
         try:
@@ -1447,7 +1493,7 @@ def _fetch_tile_http_or_file(
     seed = bundled_seed_tile_path(z, x, y)
     if seed is not None:
         try:
-            accepted = _accept_map_tile(QImage(str(seed)))
+            accepted = _accept_map_tile(QImage(str(seed)), zoom=z)
             if accepted is not None:
                 return accepted
         except Exception:
@@ -1457,7 +1503,7 @@ def _fetch_tile_http_or_file(
         cache_path = _disk_cache_path(source_id, z, x, y)
         try:
             if cache_path.is_file():
-                accepted = _accept_map_tile(QImage(str(cache_path)))
+                accepted = _accept_map_tile(QImage(str(cache_path)), zoom=z)
                 if accepted is not None:
                     return accepted
                 try:
@@ -1472,7 +1518,7 @@ def _fetch_tile_http_or_file(
             img = QImage.fromData(raw)
             if img.isNull():
                 return QImage()
-            accepted = _accept_map_tile(img, raw_byte_len=len(raw))
+            accepted = _accept_map_tile(img, raw_byte_len=len(raw), zoom=z)
             if accepted is None:
                 return QImage()
             if cache_path is not None and raw:
@@ -1484,7 +1530,7 @@ def _fetch_tile_http_or_file(
             return accepted
         p = Path(url)
         if p.is_file():
-            accepted = _accept_map_tile(QImage(str(p)))
+            accepted = _accept_map_tile(QImage(str(p)), zoom=z)
             return accepted if accepted is not None else QImage()
     except Exception as e:
         _log_tile_fetch_error(url, f"{type(e).__name__}: {e}")

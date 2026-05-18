@@ -180,7 +180,7 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-noplaceholder"
+MAP_BACKEND_BUILD = "2026-05-18-native2d-zoomfix"
 
 def _web_2d_fallback_allowed() -> bool:
     """2D map is NativeTileMapView only; WebEngine Leaflet is opt-in for debugging."""
