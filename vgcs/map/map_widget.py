@@ -974,12 +974,13 @@ class MapWidget(QWidget):
         self._native_telemetry.hide()
         self._native_telemetry.raise_()
 
-        # Legacy Web `#actionRail` — on `_panel` (not `_map_canvas`) so fullscreen video cannot
-        # cover Takeoff/Return when companion RTSP re-stacks the preview label every frame.
+        # Legacy Web `#actionRail` / `.actionBtn` — parent `_panel` (not `_map_canvas`) so Takeoff/Return
+        # stay above fullscreen RTSP video; raising the video label every frame no longer covers them.
         self._map_action_rail = QFrame(self._panel)
         self._map_action_rail.setObjectName("mapActionRail")
-        self._map_action_rail.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self._map_action_rail.setStyleSheet("QFrame#mapActionRail { background: transparent; border: none; }")
+        self._map_action_rail.setStyleSheet(
+            "QFrame#mapActionRail { background: transparent; border: none; }"
+        )
         ar_l = QVBoxLayout(self._map_action_rail)
         ar_l.setContentsMargins(0, 0, 0, 0)
         ar_l.setSpacing(8)
@@ -1064,6 +1065,7 @@ class MapWidget(QWidget):
         self._map_action_return_btn.clicked.connect(lambda: self.return_requested.emit())
         self._map_action_rail.setFixedSize(54, 54 + 8 + 54)
         self._map_action_rail.show()
+        self._map_action_rail.raise_()
 
         self._plan_flight_panel = PlanFlightPanel(panel)
         self._plan_flight_panel.hide()
@@ -1806,52 +1808,46 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
-    def _raise_map_action_rail(self) -> None:
-        """Keep Takeoff/Return above map canvas + fullscreen video (panel-level overlay)."""
-        mar = getattr(self, "_map_action_rail", None)
-        if mar is not None and mar.isVisible():
-            try:
-                mar.raise_()
-            except Exception:
-                pass
-
-    def _stack_native_overlays_above_tile_map(self) -> None:
-        """
-        Lower the tile map, then stack video / footer HUD / minimap / camera rail so hit-testing matches intent.
-        Compass, telemetry, Takeoff/Return, and minimap live on `_panel` so they are never covered by
-        fullscreen `#nativeVideoPreview` on `_map_canvas`. Video stays on `_map_canvas` only.
-        """
-        nm = getattr(self, "_native_map", None)
-        if nm is None:
-            return
+    def _raise_panel_flight_overlays(self) -> None:
+        """Panel-level HUD (Takeoff/Return, camera rail, compass) above fullscreen video on `_map_canvas`."""
         try:
-            nm.lower()
-        except Exception:
-            pass
-        try:
-            preview_on = bool(getattr(self, "_video_preview_enabled", False))
-            swapped = bool(getattr(self, "_video_swapped", False))
-            video_vis = bool(preview_on and self._native_video_preview.isVisible())
-
-            if video_vis:
-                self._native_video_preview.raise_()
-
             ly = getattr(self, "_native_rail_layer", None)
             if ly is not None and ly.isVisible():
                 ly.raise_()
+            mar = getattr(self, "_map_action_rail", None)
+            if mar is not None and mar.isVisible():
+                mar.raise_()
             for hud in (self._native_compass, self._native_telemetry):
                 try:
                     if hud.isVisible():
                         hud.raise_()
                 except Exception:
                     pass
+            preview_on = bool(getattr(self, "_video_preview_enabled", False))
+            swapped = bool(getattr(self, "_video_swapped", False))
             if preview_on and swapped and self._native_minimap_wrap.isVisible():
                 self._native_minimap_wrap.raise_()
                 self._btn_native_minimap_plus.raise_()
                 self._btn_native_minimap_minus.raise_()
-            self._raise_map_action_rail()
         except Exception:
             pass
+
+    def _stack_native_overlays_above_tile_map(self) -> None:
+        """
+        Lower the tile map, raise video inside `_map_canvas`, then raise panel siblings (Takeoff/Return, rail).
+        """
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            try:
+                nm.lower()
+            except Exception:
+                pass
+        try:
+            if self._native_video_preview.isVisible():
+                self._native_video_preview.raise_()
+        except Exception:
+            pass
+        self._raise_panel_flight_overlays()
 
     def _sync_native_map_vehicle_arrow_scale(self) -> None:
         """Larger vehicle chevron while map is shown in the swap PiP (grab scales the view down)."""
@@ -1942,12 +1938,14 @@ class MapWidget(QWidget):
             )
             mar = getattr(self, "_map_action_rail", None)
             if mar is not None:
-                po = self._map_canvas.mapTo(self._panel, QPoint(0, 0))
-                mar.move(
-                    po.x() + int(_MAP_ACTION_RAIL_LEFT_PX),
-                    po.y() + int(_MAP_ACTION_RAIL_TOP_PX),
+                mar_w = max(54, mar.width())
+                mar_h = max(116, mar.height())
+                mar.setGeometry(
+                    po.x() + _MAP_ACTION_RAIL_LEFT_PX,
+                    po.y() + _MAP_ACTION_RAIL_TOP_PX,
+                    mar_w,
+                    mar_h,
                 )
-                self._raise_map_action_rail()
             swapped = bool(getattr(self, "_video_swapped", False))
             preview_on = bool(getattr(self, "_video_preview_enabled", False))
             preview_maps = preview_on and not plan_on
