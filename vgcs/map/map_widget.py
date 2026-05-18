@@ -962,13 +962,14 @@ class MapWidget(QWidget):
 
         # Native tile map ignores `setTelemetryOverlay` / compass DOM (see native_tile_map._eval_one skips).
         # Mirror git e48c1a7 bottom HUD: painted compass + 3-cell telemetry strip (Web CSS parity).
-        self._native_compass = MapFooterCompass(self._map_canvas)
-        # Display-only HUD: must not sit above the WebEngine 3D canvas and eat drag/rotate gestures.
+        # Parent = `_panel` (not `_map_canvas`) so the HUD stacks above `#nativeCameraRailLayer`,
+        # which is also a floating child of `_panel` and otherwise covered the bottom-right compass.
+        self._native_compass = MapFooterCompass(self._panel)
         self._native_compass.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._native_compass.hide()
         self._native_compass.raise_()
 
-        self._native_telemetry = MapFooterTelemetryStrip(self._map_canvas)
+        self._native_telemetry = MapFooterTelemetryStrip(self._panel)
         self._native_telemetry.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._native_telemetry.hide()
         self._native_telemetry.raise_()
@@ -1078,7 +1079,7 @@ class MapWidget(QWidget):
 
         # Wrapper + inner image: pixmap must not live on the same QLabel as +/- children — Qt paints
         # the pixmap over child widgets, so clicks never reached the zoom buttons.
-        self._native_minimap_wrap = QFrame(self._map_canvas)
+        self._native_minimap_wrap = QFrame(self._panel)
         self._native_minimap_wrap.setObjectName("nativeMinimapWrap")
         self._native_minimap_wrap.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self._native_minimap_wrap.setAutoFillBackground(False)
@@ -1806,9 +1807,9 @@ class MapWidget(QWidget):
 
     def _stack_native_overlays_above_tile_map(self) -> None:
         """
-        Lower the tile map, then stack video / footer HUD / minimap / camera rail so hit-testing matches intent:
-        PiP mode keeps video above compass+telemetry so the small preview is clickable; swapped fullscreen
-        puts compass+telemetry above the video so the HUD matches the normal map view.
+        Lower the tile map, then stack video / footer HUD / minimap / camera rail so hit-testing matches intent.
+        Compass, telemetry, and minimap live on `_panel` (siblings of the camera rail) so they are never
+        covered by `#nativeCameraRailLayer`. Video stays on `_map_canvas`.
         """
         nm = getattr(self, "_native_map", None)
         if nm is None:
@@ -1823,30 +1824,28 @@ class MapWidget(QWidget):
             video_vis = bool(preview_on and self._native_video_preview.isVisible())
 
             if video_vis and not swapped:
-                # PiP: footer HUD under video so bottom-left preview receives swap clicks.
-                self._native_compass.raise_()
-                self._native_telemetry.raise_()
+                # PiP: video above map stack; footer HUD on `_panel` stays above the PiP corner.
                 self._native_video_preview.raise_()
             elif video_vis and swapped:
-                # Fullscreen video: video over map, then compass + strip on top (parity with map mode).
                 self._native_video_preview.raise_()
-                self._native_compass.raise_()
-                self._native_telemetry.raise_()
-            else:
-                self._native_compass.raise_()
-                self._native_telemetry.raise_()
 
             mar = getattr(self, "_map_action_rail", None)
             if mar is not None:
                 mar.raise_()
 
+            ly = getattr(self, "_native_rail_layer", None)
+            if ly is not None and ly.isVisible():
+                ly.raise_()
+            for hud in (self._native_compass, self._native_telemetry):
+                try:
+                    if hud.isVisible():
+                        hud.raise_()
+                except Exception:
+                    pass
             if preview_on and swapped and self._native_minimap_wrap.isVisible():
                 self._native_minimap_wrap.raise_()
                 self._btn_native_minimap_plus.raise_()
                 self._btn_native_minimap_minus.raise_()
-            ly = getattr(self, "_native_rail_layer", None)
-            if ly is not None:
-                ly.raise_()
         except Exception:
             pass
 
@@ -1913,9 +1912,15 @@ class MapWidget(QWidget):
             # Git `#mapFooterHud`: compass 176px from bottom-right; telemetry strip left of compass.
             comp_w, comp_h = 176, 176
             margin_r, margin_b = 10, 2
-            cx = max(0, w - margin_r - comp_w)
+            rail_visible = ly is not None and ly.isVisible()
+            if rail_visible:
+                # Keep compass/telemetry left of `#nativeCameraRailLayer` (same panel, higher z-order).
+                cx = max(8, panel_x - 12 - comp_w)
+            else:
+                cx = max(0, w - margin_r - comp_w)
             cy = max(0, h - margin_b - comp_h)
-            self._native_compass.setGeometry(cx, cy, comp_w, comp_h)
+            po = self._map_canvas.mapTo(self._panel, QPoint(0, 0))
+            self._native_compass.setGeometry(po.x() + cx, po.y() + cy, comp_w, comp_h)
             self._native_telemetry.updateGeometry()
             mw = self._native_telemetry.minimumSizeHint().width()
             mh = self._native_telemetry.minimumSizeHint().height()
@@ -1928,7 +1933,9 @@ class MapWidget(QWidget):
             if tel_x < 8:
                 tel_x = 8
             tel_y = cy + (comp_h - tel_h) // 2
-            self._native_telemetry.setGeometry(tel_x, tel_y, tel_w, tel_h)
+            self._native_telemetry.setGeometry(
+                po.x() + tel_x, po.y() + tel_y, tel_w, tel_h
+            )
             mar = getattr(self, "_map_action_rail", None)
             if mar is not None:
                 mar.move(_MAP_ACTION_RAIL_LEFT_PX, _MAP_ACTION_RAIL_TOP_PX)
@@ -1949,7 +1956,9 @@ class MapWidget(QWidget):
                 mini_y = max(0, h - mini_h - 14)
                 _side = int(getattr(self, "_native_minimap_btn_side", 32))
                 _pad = int(getattr(self, "_native_minimap_btn_pad", 8))
-                self._native_minimap_wrap.setGeometry(mini_x, mini_y, mini_w, mini_h)
+                self._native_minimap_wrap.setGeometry(
+                    po.x() + mini_x, po.y() + mini_y, mini_w, mini_h
+                )
                 try:
                     nmz = getattr(self, "_native_map", None)
                     if nmz is not None:
@@ -2524,7 +2533,11 @@ class MapWidget(QWidget):
                     self._native_rail_layer.show()
                 except Exception:
                     pass
+            if bool(getattr(self, "_web_ready", False)):
+                self._native_compass.show()
+                self._native_telemetry.show()
             QTimer.singleShot(0, self._layout_native_hud)
+            QTimer.singleShot(0, self._stack_native_overlays_above_tile_map)
         except Exception:
             pass
         if self._video_preview_should_run():
@@ -2627,90 +2640,124 @@ class MapWidget(QWidget):
 
     def _probe_current_tiles(self, *, reason: str) -> None:
         # Probe the *current* view tile (not just z=0), because placeholders often occur only at higher zooms.
-        def _kick(payload: str | None) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is not None and hasattr(nm, "get_map_view_dict"):
             try:
-                print(f"[VGCS:map] map_view_payload ({reason}) {str(payload or '')[:220]}")
+                payload = json.dumps(nm.get_map_view_dict())
+                self._probe_current_tiles_from_payload(payload, reason=reason)
+                return
             except Exception:
                 pass
-            try:
-                data = json.loads(payload or "{}")
-            except Exception:
-                data = {}
-            try:
-                z = int(data.get("z", 0) or 0)
-                lat = float(data.get("lat", 0.0) or 0.0)
-                lng = float(data.get("lng", 0.0) or 0.0)
-                tmpl = str(data.get("template", "") or "")
-            except Exception:
-                z, lat, lng, tmpl = 0, 0.0, 0.0, ""
 
-            def slippy_xy(lat_deg: float, lon_deg: float, zoom: int) -> tuple[int, int]:
-                import math
-
-                lat_rad = math.radians(max(-85.0511, min(85.0511, lat_deg)))
-                n = 2.0**zoom
-                xt = int((lon_deg + 180.0) / 360.0 * n)
-                yt = int((1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
-                return max(0, xt), max(0, yt)
-
-            candidates: list[tuple[str, str]] = []
-            if tmpl:
-                x, y = slippy_xy(lat, lng, max(0, min(19, z)))
-                url = (
-                    tmpl.replace("{z}", str(z))
-                    .replace("{x}", str(x))
-                    .replace("{y}", str(y))
-                    .replace("{s}", "a")
-                )
-                candidates.append(("active_view", url))
-            else:
-                candidates.extend(
-                    [
-                        ("esri_imagery_view", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/10/0/0"),
-                        ("esri_streets_view", "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/10/0/0"),
-                    ]
-                )
-
-            # Always also probe z=0 as a baseline.
-            if tmpl:
-                z0 = (
-                    tmpl.replace("{z}", "0")
-                    .replace("{x}", "0")
-                    .replace("{y}", "0")
-                    .replace("{s}", "a")
-                )
-                candidates.append(("active_world", z0))
-
-            for label, url in candidates:
-                try:
-                    QThreadPool.globalInstance().start(
-                        _TileProbeTask(
-                            url=url,
-                            provider_label=f"{label}:{reason}",
-                            bridge=self._tile_probe_bridge,
-                        )
-                    )
-                except Exception:
-                    pass
+        def _kick(payload: str | None) -> None:
+            self._probe_current_tiles_from_payload(payload, reason=reason)
 
         try:
             self._run_js("window.__vgcsGetMapView ? window.__vgcsGetMapView() : '';", callback=_kick)
         except Exception:
             _kick(None)
 
+    def _probe_current_tiles_from_payload(self, payload: str | None, *, reason: str) -> None:
+        try:
+            print(f"[VGCS:map] map_view_payload ({reason}) {str(payload or '')[:220]}")
+        except Exception:
+            pass
+        try:
+            data = json.loads(payload or "{}")
+        except Exception:
+            data = {}
+        try:
+            z = int(data.get("z", 0) or 0)
+            lat = float(data.get("lat", 0.0) or 0.0)
+            lng = float(data.get("lng", 0.0) or 0.0)
+            tmpl = str(data.get("template", "") or "")
+        except Exception:
+            z, lat, lng, tmpl = 0, 0.0, 0.0, ""
+
+        def slippy_xy(lat_deg: float, lon_deg: float, zoom: int) -> tuple[int, int]:
+            import math
+
+            lat_rad = math.radians(max(-85.0511, min(85.0511, lat_deg)))
+            n = 2.0**zoom
+            xt = int((lon_deg + 180.0) / 360.0 * n)
+            yt = int((1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+            return max(0, xt), max(0, yt)
+
+        candidates: list[tuple[str, str]] = []
+        if tmpl:
+            x, y = slippy_xy(lat, lng, max(0, min(19, z)))
+            url = (
+                tmpl.replace("{z}", str(z))
+                .replace("{x}", str(x))
+                .replace("{y}", str(y))
+                .replace("{s}", "a")
+            )
+            candidates.append(("active_view", url))
+        else:
+            candidates.extend(
+                [
+                    (
+                        "esri_imagery_view",
+                        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/10/0/0",
+                    ),
+                    (
+                        "esri_streets_view",
+                        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/10/0/0",
+                    ),
+                ]
+            )
+
+        if tmpl:
+            z0 = (
+                tmpl.replace("{z}", "0")
+                .replace("{x}", "0")
+                .replace("{y}", "0")
+                .replace("{s}", "a")
+            )
+            candidates.append(("active_world", z0))
+
+        for label, url in candidates:
+            try:
+                QThreadPool.globalInstance().start(
+                    _TileProbeTask(
+                        url=url,
+                        provider_label=f"{label}:{reason}",
+                        bridge=self._tile_probe_bridge,
+                    )
+                )
+            except Exception:
+                pass
+
     def _on_tile_probe_result(self, provider_label: str, outcome: str, detail: str) -> None:
         try:
             print(f"[VGCS:map] tile_probe {provider_label} -> {outcome} ({detail})")
         except Exception:
             pass
+        label = str(provider_label)
+        detail_s = str(detail)
+        network_fail = outcome.startswith("error:") and (
+            "URLError" in detail_s or "urlopen error" in detail_s.lower()
+        )
+        if "active_view" in label and network_fail:
+            if not getattr(self, "_tile_network_fallback_done", False):
+                self._tile_network_fallback_done = True
+                self._set_status(
+                    "Map tiles unreachable (no internet?) — trying OpenStreetMap; "
+                    "or use Offline Tiles in the map toolbar"
+                )
+                try:
+                    self.activate_osm_tiles()
+                except Exception:
+                    pass
+            return
         # If the *active view* tile is a placeholder, auto-fallback to Streets and guide the user.
-        if "active_view" in str(provider_label) and outcome == "placeholder_suspected":
+        if "active_view" in label and outcome == "placeholder_suspected":
             self._set_status("Satellite tiles are placeholders — auto-switching to Streets")
             try:
                 self.activate_esri_street_tiles()
             except Exception:
                 pass
-        if "esri_imagery" in str(provider_label) and outcome == "placeholder_suspected":
+        if "esri_imagery" in label and outcome == "placeholder_suspected":
             self._set_status("Satellite tiles blocked/placeholder — switch to Streets or Offline Tiles…")
 
     def _set_webcam_enabled(self, enabled: bool) -> None:
@@ -4154,7 +4201,11 @@ class MapWidget(QWidget):
                     self._video_swapped = True
                 try:
                     self._native_video_preview.show()
+                    if bool(getattr(self, "_web_ready", False)):
+                        self._native_compass.show()
+                        self._native_telemetry.show()
                     self._layout_native_video_preview()
+                    self._layout_native_hud()
                     self._stack_native_overlays_above_tile_map()
                 except Exception:
                     pass
