@@ -1085,6 +1085,13 @@ class NativeTileMapView(QWidget):
         return tmpl.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
 
     def _on_tile_loaded(self, z: int, x: int, y: int, img: object) -> None:
+        if int(z) != int(self._view_z):
+            key = (z, x, y)
+            try:
+                self._tiles_inflight.discard(key)
+            except Exception:
+                pass
+            return
         key = (z, x, y)
         try:
             self._tiles_inflight.discard(key)
