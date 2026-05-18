@@ -180,13 +180,13 @@ _MAP_ACTION_RAIL_TOP_PX = 10
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
 # Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-gpsfix2"
-# Ignore GPS/heading jitter on the map when the vehicle is stationary (common pre-arm on the ground).
-_MAP_STATIONARY_SPEED_MPS = 0.8
+MAP_BACKEND_BUILD = "2026-05-18-native2d-gpsfix3"
+# Map icon/track only move after sustained GPS speed (avoids ground jitter + false vx/vy).
+_MAP_MOVE_ARM_SPEED_MPS = 1.0
+_MAP_MOVE_DISARM_SPEED_MPS = 0.35
+_MAP_MOVE_ARM_SAMPLES = 5
+_MAP_MOVE_DISARM_SAMPLES = 15
 _MAP_POSITION_MIN_MOVE_M = 2.0
-_MAP_POSITION_STATIONARY_MOVE_M = 8.0
-_MAP_HEADING_MIN_DELTA_DEG = 15.0
-_MAP_TRACK_MIN_MOVE_M = 5.0
 
 def _web_2d_fallback_allowed() -> bool:
     """2D map is NativeTileMapView only; WebEngine Leaflet is opt-in for debugging."""
@@ -696,6 +696,9 @@ class MapWidget(QWidget):
         self._map_display_lat: float | None = None
         self._map_display_lon: float | None = None
         self._last_groundspeed_mps = 0.0
+        self._map_motion_armed = False
+        self._map_speed_hi_streak = 0
+        self._map_speed_lo_streak = 0
         self._heading: float | None = None
         self._waypoint_count = 0
         self._waypoints_model: list[Waypoint] = []
@@ -6027,6 +6030,22 @@ class MapWidget(QWidget):
         a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
         return 2 * r * math.asin(min(1.0, math.sqrt(max(0.0, a))))
 
+    def _update_map_motion_state(self, groundspeed_mps: float) -> None:
+        gs = max(0.0, float(groundspeed_mps))
+        self._last_groundspeed_mps = gs
+        if gs >= _MAP_MOVE_ARM_SPEED_MPS:
+            self._map_speed_hi_streak = int(getattr(self, "_map_speed_hi_streak", 0)) + 1
+            self._map_speed_lo_streak = 0
+        elif gs < _MAP_MOVE_DISARM_SPEED_MPS:
+            self._map_speed_lo_streak = int(getattr(self, "_map_speed_lo_streak", 0)) + 1
+            self._map_speed_hi_streak = 0
+        if not bool(getattr(self, "_map_motion_armed", False)):
+            if self._map_speed_hi_streak >= _MAP_MOVE_ARM_SAMPLES:
+                self._map_motion_armed = True
+        elif self._map_speed_lo_streak >= _MAP_MOVE_DISARM_SAMPLES:
+            self._map_motion_armed = False
+            self._map_speed_hi_streak = 0
+
     def set_vehicle_position(
         self,
         lat: float,
@@ -6039,7 +6058,7 @@ class MapWidget(QWidget):
         self._lat = lat
         self._lon = lon
         if groundspeed_mps is not None:
-            self._last_groundspeed_mps = max(0.0, float(groundspeed_mps))
+            self._update_map_motion_state(float(groundspeed_mps))
         gs = float(self._last_groundspeed_mps)
         self._vehicle_rel_alt_m = relative_alt_m
         if relative_alt_m is None:
@@ -6048,36 +6067,44 @@ class MapWidget(QWidget):
             self._coords.setText(
                 f"Lat/Lon: {lat:.7f}, {lon:.7f}  |  Rel Alt: {relative_alt_m:.1f} m"
             )
-        display_lat, display_lon = float(lat), float(lon)
-        map_moved = first_fix
-        if self._map_display_lat is not None and self._map_display_lon is not None:
-            shift_m = self._haversine_m(
-                self._map_display_lat, self._map_display_lon, display_lat, display_lon
-            )
-            min_move = (
-                _MAP_POSITION_STATIONARY_MOVE_M
-                if gs < _MAP_STATIONARY_SPEED_MPS
-                else _MAP_POSITION_MIN_MOVE_M
-            )
-            if shift_m < min_move:
-                display_lat = self._map_display_lat
-                display_lon = self._map_display_lon
-                map_moved = False
-            else:
-                self._map_display_lat = display_lat
-                self._map_display_lon = display_lon
-                map_moved = True
-        else:
-            self._map_display_lat = display_lat
-            self._map_display_lon = display_lon
+        raw_lat, raw_lon = float(lat), float(lon)
+        map_moved = False
+        append_track = False
+        if first_fix:
+            self._map_display_lat = raw_lat
+            self._map_display_lon = raw_lon
+            self._map_motion_armed = False
+            self._map_speed_hi_streak = 0
+            self._map_speed_lo_streak = 0
             map_moved = True
+        elif not bool(getattr(self, "_map_motion_armed", False)):
+            # Hard lock while parked: ignore all GPS drift until sustained real movement.
+            if self._map_display_lat is None or self._map_display_lon is None:
+                self._map_display_lat = raw_lat
+                self._map_display_lon = raw_lon
+                map_moved = True
+        elif self._map_display_lat is not None and self._map_display_lon is not None:
+            shift_m = self._haversine_m(
+                self._map_display_lat, self._map_display_lon, raw_lat, raw_lon
+            )
+            if shift_m >= _MAP_POSITION_MIN_MOVE_M:
+                self._map_display_lat = raw_lat
+                self._map_display_lon = raw_lon
+                map_moved = True
+                append_track = True
+        else:
+            self._map_display_lat = raw_lat
+            self._map_display_lon = raw_lon
+            map_moved = True
+        display_lat = float(self._map_display_lat if self._map_display_lat is not None else raw_lat)
+        display_lon = float(self._map_display_lon if self._map_display_lon is not None else raw_lon)
         nm = getattr(self, "_native_map", None)
         if nm is not None and (map_moved or first_fix):
             try:
                 nm.set_vehicle_filtered(
                     display_lat,
                     display_lon,
-                    append_track=bool(map_moved and not first_fix),
+                    append_track=bool(append_track and not first_fix),
                 )
             except Exception:
                 pass
@@ -6104,10 +6131,9 @@ class MapWidget(QWidget):
             self._schedule_vehicle_pose_js(immediate=first_fix)
 
     def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
-        gs = float(getattr(self, "_last_groundspeed_mps", 0.0))
-        src = str(source or "mixed")
-        if gs < _MAP_STATIONARY_SPEED_MPS:
+        if not bool(getattr(self, "_map_motion_armed", False)):
             return
+        src = str(source or "mixed")
         self._heading = heading_deg % 360.0
         self._heading_js_source = src
         self._heading_label.setText(f"Heading: {self._heading:.1f}°")
@@ -6128,6 +6154,9 @@ class MapWidget(QWidget):
         self._map_display_lat = None
         self._map_display_lon = None
         self._last_groundspeed_mps = 0.0
+        self._map_motion_armed = False
+        self._map_speed_hi_streak = 0
+        self._map_speed_lo_streak = 0
         nm = getattr(self, "_native_map", None)
         if nm is not None:
             try:
