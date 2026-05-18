@@ -78,7 +78,7 @@ from vgcs.video.pipeline import (
     wait_qmedia_recorder_stopped,
 )
 from vgcs.video.camera_control import NoopCameraControl
-from vgcs.map.native_tile_map import NativeTileMapView
+from vgcs.map.native_tile_map import NativeTileMapView, bundled_seed_root, fetch_tile_http_bytes
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_footer_hud import (
     MapFooterCompass,
@@ -593,18 +593,9 @@ class _TileProbeTask(QRunnable):
     def run(self) -> None:  # pragma: no cover - network dependent
         url = self._url
         try:
-            req = Request(
-                url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                    "Referer": "https://www.arcgis.com/" if "arcgisonline.com" in url.lower() else "https://www.openstreetmap.org/",
-                },
-                method="GET",
-            )
-            with urlopen(req, timeout=3.0) as resp:
-                code = getattr(resp, "status", None) or resp.getcode()
-                ctype = str(getattr(resp, "headers", {}).get("Content-Type", "") or "")
-                raw = resp.read()
+            raw = fetch_tile_http_bytes(url, timeout_s=5.0)
+            code = 200
+            ctype = "image"
             if int(code) >= 400:
                 self._bridge.result.emit(
                     self._provider_label,
@@ -695,6 +686,7 @@ class MapWidget(QWidget):
         self._tile_probe_bridge = _TileProbeBridge(self)
         self._tile_probe_bridge.result.connect(self._on_tile_probe_result)
         self._tile_probe_ran = False
+        self._native_tile_fallback_done = False
 
         # M3 video settings snapshot (applied lazily when video backend initializes).
         self._video_settings_enabled = False
@@ -2645,6 +2637,64 @@ class MapWidget(QWidget):
         """Alias: start decode if needed (no forced restart_decode)."""
         self._companion_start_decode_if_needed(reason=reason)
 
+    def _native_tile_startup_check(self) -> None:
+        """If the native 2D map still has no tiles, try alternate sources (client networks often block urllib)."""
+        if getattr(self, "_native_tile_fallback_done", False):
+            return
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        try:
+            n = int(nm.loaded_tile_count())
+        except Exception:
+            n = 0
+        if n > 2:
+            return
+        try:
+            print(f"[VGCS:map] native 2D tiles missing after startup (loaded={n}) — trying Esri Streets")
+        except Exception:
+            pass
+        try:
+            self.activate_esri_street_tiles()
+        except Exception:
+            pass
+        try:
+            QTimer.singleShot(3500, self._native_tile_startup_check_final)
+        except Exception:
+            pass
+
+    def _native_tile_startup_check_final(self) -> None:
+        if getattr(self, "_native_tile_fallback_done", False):
+            return
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        try:
+            n = int(nm.loaded_tile_count())
+        except Exception:
+            n = 0
+        if n > 2:
+            return
+        root = bundled_seed_root()
+        if root.is_dir():
+            self._native_tile_fallback_done = True
+            try:
+                print("[VGCS:map] online tiles still failing — switching to bundled companion_tile_seed")
+            except Exception:
+                pass
+            try:
+                self.activate_offline_tiles(str(root))
+            except Exception:
+                pass
+            self._set_status(
+                "Map: using bundled offline tiles (internet/proxy may be blocking Esri/OSM)"
+            )
+            return
+        self._native_tile_fallback_done = True
+        self._set_status(
+            "Map tiles failed to load — check internet/firewall or use Offline Tiles in the toolbar"
+        )
+
     def _probe_current_tiles(self, *, reason: str) -> None:
         # Probe the *current* view tile (not just z=0), because placeholders often occur only at higher zooms.
         nm = getattr(self, "_native_map", None)
@@ -3268,6 +3318,10 @@ class MapWidget(QWidget):
                     # Run a quick probe to detect placeholders and fallback automatically if needed.
                     try:
                         QTimer.singleShot(1200, lambda: self._probe_current_tiles(reason="startup"))
+                    except Exception:
+                        pass
+                    try:
+                        QTimer.singleShot(3500, self._native_tile_startup_check)
                     except Exception:
                         pass
             except Exception:
