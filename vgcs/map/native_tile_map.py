@@ -69,7 +69,7 @@ class _TileFetchTask(QRunnable):
     def run(self) -> None:
         img = QImage()
         if tile_disk_cache.is_enabled() and self._template and self._template != "{local}":
-            img = tile_disk_cache.read_cached_tile(
+            img = tile_disk_cache.read_cached_tile_any(
                 self._template, self._z, self._x, self._y, root=self._cache_root
             )
         if img.isNull() and self._http_enabled:
@@ -808,7 +808,7 @@ class NativeTileMapView(QWidget):
         except Exception:
             pass
         if img is None or not isinstance(img, QImage) or img.isNull():
-            self._tiles[key] = QImage()
+            self._tiles.pop(key, None)
             if self._remote_tiles_enabled and self._tile_template != "{local}":
                 self._http_tile_failures += 1
                 if self._http_tile_failures >= 6:
@@ -822,7 +822,7 @@ class NativeTileMapView(QWidget):
     def _read_disk_cache_sync(self, z: int, x: int, y: int) -> QImage | None:
         if not tile_disk_cache.is_enabled() or self._tile_template in ("", "{local}"):
             return None
-        img = tile_disk_cache.read_cached_tile(
+        img = tile_disk_cache.read_cached_tile_any(
             self._tile_template, z, x, y, root=self._tile_cache_root
         )
         if img.isNull():
@@ -838,11 +838,38 @@ class NativeTileMapView(QWidget):
                 pass
         return img
 
+    def reload_visible_tiles_from_cache(self) -> int:
+        """Drop in-memory tiles and repaint from disk cache (offline / HTTP disabled)."""
+        self._tiles_inflight.clear()
+        self._tiles.clear()
+        self.update()
+        if not tile_disk_cache.is_enabled():
+            return 0
+        vf = self._view_frame()
+        if vf is None:
+            return 0
+        z, fx, fy, w, h = vf
+        tile_size = 256
+        x0 = int(math.floor(fx / tile_size)) - 1
+        y0 = int(math.floor(fy / tile_size)) - 1
+        x1 = int(math.ceil((fx + w) / tile_size)) + 1
+        y1 = int(math.ceil((fy + h) / tile_size)) + 1
+        hits = 0
+        for tx in range(x0, x1 + 1):
+            for ty in range(y0, y1 + 1):
+                if self._read_disk_cache_sync(z, tx, ty) is not None:
+                    hits += 1
+        if hits:
+            self.update()
+        return hits
+
     def _tile_image(self, z: int, x: int, y: int) -> QImage | None:
         key = (z, x, y)
         if key in self._tiles:
             im = self._tiles[key]
-            return im if not im.isNull() else None
+            if not im.isNull():
+                return im
+            self._tiles.pop(key, None)
         cached = self._read_disk_cache_sync(z, x, y)
         if cached is not None:
             self._tiles[key] = cached

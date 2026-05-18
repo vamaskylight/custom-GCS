@@ -2816,12 +2816,8 @@ class MapWidget(QWidget):
                 self._tile_network_fallback_tier = 2
                 if nm is not None and hasattr(nm, "set_remote_tiles_enabled"):
                     nm.set_remote_tiles_enabled(False)
-                self._set_status(
-                    "No internet for HTTP tiles — disk cache + grid. "
-                    "Fly once online to fill ~/.vgcs/tile-cache (or Offline Tiles…)."
-                )
                 try:
-                    QTimer.singleShot(0, self._update_native_minimap)
+                    QTimer.singleShot(0, lambda: self._refresh_offline_map_tiles(reason="no_wan"))
                 except Exception:
                     pass
             return
@@ -3256,6 +3252,82 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _companion_offline_tile_paths(self) -> list[str]:
+        """Folders with ``z/x/y.png`` tiles (no internet required)."""
+        paths: list[str] = []
+        try:
+            s = QSettings(_QS_NS, _QS_APP)
+            root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
+            if root and Path(root).is_dir():
+                paths.append(str(Path(root).resolve()))
+        except Exception:
+            pass
+        default = (Path.home() / ".vgcs" / "companion-tiles").resolve()
+        if default.is_dir():
+            p = str(default)
+            if p not in paths:
+                paths.append(p)
+        return paths
+
+    def _try_companion_offline_tiles(self) -> bool:
+        for root in self._companion_offline_tile_paths():
+            try:
+                print(f"[VGCS:map] offline tile folder: {root}")
+            except Exception:
+                pass
+            self.activate_offline_tiles(root)
+            return True
+        return False
+
+    def _refresh_offline_map_tiles(self, *, reason: str = "") -> None:
+        """Reload map from disk cache / offline folder (companion Wi‑Fi, no WAN)."""
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        near = 0
+        try:
+            from vgcs.map import tile_disk_cache
+
+            if tile_disk_cache.is_enabled():
+                lat = getattr(self, "_lat", None)
+                lon = getattr(self, "_lon", None)
+                if lat is not None and lon is not None:
+                    z = int(round(float(getattr(nm, "_zoom", 16.0))))
+                    near = tile_disk_cache.count_cached_tiles_near(
+                        float(lat), float(lon), z, root=getattr(nm, "_tile_cache_root", None)
+                    )
+        except Exception:
+            pass
+        hits = 0
+        try:
+            if hasattr(nm, "reload_visible_tiles_from_cache"):
+                hits = int(nm.reload_visible_tiles_from_cache() or 0)
+        except Exception:
+            pass
+        try:
+            print(
+                f"[VGCS:map] offline map refresh ({reason}): "
+                f"cached_near_gps={near} visible_loaded={hits}"
+            )
+        except Exception:
+            pass
+        if hits > 0:
+            self._set_status(f"Offline map: {hits} cached tiles visible")
+        elif near > 0:
+            self._set_status(
+                f"Offline map: {near} tiles cached near GPS — pan slightly if view is empty"
+            )
+        elif self._try_companion_offline_tiles():
+            self._set_status("Offline map folder loaded")
+        else:
+            self._set_status(
+                "No offline map tiles — use internet once (fills tile-cache) or Offline tiles…"
+            )
+        try:
+            self._update_native_minimap()
+        except Exception:
+            pass
+
     def _init_map_backend(self) -> None:
         self._map_canvas.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._map_canvas.setAutoFillBackground(True)
@@ -3356,6 +3428,8 @@ class MapWidget(QWidget):
                 root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
                 if root and Path(root).is_dir():
                     self.activate_offline_tiles(root)
+                elif self._try_companion_offline_tiles():
+                    pass
                 else:
                     # Always try Satellite first (even if a client previously used Streets).
                     self.activate_satellite_tiles()
@@ -5783,6 +5857,12 @@ class MapWidget(QWidget):
                 nm = getattr(self, "_native_map", None)
                 if nm is not None:
                     nm.set_center(float(lat), float(lon))
+                    try:
+                        QTimer.singleShot(
+                            0, lambda: self._refresh_offline_map_tiles(reason="gps_fix")
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
         self._schedule_vehicle_pose_js(immediate=first_fix)
