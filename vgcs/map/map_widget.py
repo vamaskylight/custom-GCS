@@ -1142,7 +1142,7 @@ class MapWidget(QWidget):
         self._native_minimap.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._native_minimap.setStyleSheet("QLabel#nativeMinimapImage { background: transparent; border: none; }")
         self._native_minimap.setCursor(Qt.CursorShape.OpenHandCursor)
-        self._native_minimap.setToolTip("Drag to pan map · click (no drag) to swap back")
+        self._native_minimap.setToolTip("Drag to pan map · click (no drag) to swap back to map")
         # QLabel does not get move events without mouse tracking unless a button is held; tracking is
         # cheap here and lets us update the cursor + still works fine when the user drags.
         self._native_minimap.setMouseTracking(True)
@@ -1506,11 +1506,8 @@ class MapWidget(QWidget):
             pass
         if bool(getattr(self, "_obs_mark_mode", False)):
             try:
-                w = max(1, int(self._native_video_preview.width()))
-                h = max(1, int(self._native_video_preview.height()))
                 pos = event.position()
-                xn = float(pos.x()) / float(w)
-                yn = float(pos.y()) / float(h)
+                xn, yn = self._native_video_click_norm(pos)
                 self._log_observation("video_mark", video_x=xn, video_y=yn)
             except Exception:
                 pass
@@ -1764,7 +1761,7 @@ class MapWidget(QWidget):
         if was_drag:
             self._update_native_minimap()
             return
-        # Short click (no meaningful drag) → swap back to map-main / video-PiP.
+        # Short click (no meaningful drag).
         if press is not None:
             try:
                 cur = QPointF(event.position())
@@ -1775,6 +1772,15 @@ class MapWidget(QWidget):
                 pass
         if not bool(getattr(self, "_video_swapped", False)):
             return
+        # Target mode: click minimap to mark on map (do not swap layout).
+        if bool(getattr(self, "_obs_mark_mode", False)):
+            try:
+                latlon = self._minimap_click_to_lat_lon(QPointF(event.position()))
+                if latlon is not None:
+                    self._log_observation("map_mark", map_lat=float(latlon[0]), map_lon=float(latlon[1]))
+                    return
+            except Exception:
+                pass
         self._video_swap_user_map_main = True
         self._video_swapped = False
         self._split_fullscreen_source_id = None
@@ -2294,6 +2300,65 @@ class MapWidget(QWidget):
                 self._render_native_video_preview(im)
         except Exception:
             pass
+
+    def _native_video_click_norm(self, pos: QPointF) -> tuple[float, float]:
+        """Normalized click (0..1) on the visible video pixmap; falls back to full label size."""
+        try:
+            cr = self._native_video_content_rect()
+            if cr:
+                left = float(cr.get("cr_left", 0.0)) + float(cr.get("ox", 0.0))
+                top = float(cr.get("cr_top", 0.0)) + float(cr.get("oy", 0.0))
+                pw = max(1.0, float(cr.get("pw", 1.0)))
+                ph = max(1.0, float(cr.get("ph", 1.0)))
+                xn = (float(pos.x()) - left) / pw
+                yn = (float(pos.y()) - top) / ph
+                return (
+                    max(0.0, min(1.0, xn)),
+                    max(0.0, min(1.0, yn)),
+                )
+        except Exception:
+            pass
+        w = max(1, int(self._native_video_preview.width()))
+        h = max(1, int(self._native_video_preview.height()))
+        return (
+            max(0.0, min(1.0, float(pos.x()) / float(w))),
+            max(0.0, min(1.0, float(pos.y()) / float(h))),
+        )
+
+    def _minimap_click_to_lat_lon(self, pos: QPointF) -> tuple[float, float] | None:
+        """Map a click on the swap minimap thumbnail to lat/lon on the native map."""
+        nm = getattr(self, "_native_map", None)
+        if nm is None or not hasattr(nm, "_screen_to_lat_lon"):
+            return None
+        try:
+            lbl = self._native_minimap
+            pm = lbl.pixmap()
+            if pm is None or pm.isNull():
+                return None
+            cr = lbl.contentsRect()
+            Wc = float(max(1, cr.width()))
+            Hc = float(max(1, cr.height()))
+            spw = float(max(1, pm.width()))
+            sph = float(max(1, pm.height()))
+            try:
+                dpr = max(1.0, float(pm.devicePixelRatio()))
+            except Exception:
+                dpr = 1.0
+            spw /= dpr
+            sph /= dpr
+            ox = (Wc - spw) / 2.0
+            oy = (Hc - sph) / 2.0
+            lx = float(pos.x()) - float(cr.left())
+            ly = float(pos.y()) - float(cr.top())
+            if lx < ox or ly < oy or lx > ox + spw or ly > oy + sph:
+                return None
+            u = (lx - ox) / spw
+            v = (ly - oy) / sph
+            nm_w = float(max(1, nm.width()))
+            nm_h = float(max(1, nm.height()))
+            return nm._screen_to_lat_lon(QPointF(u * nm_w, v * nm_h))
+        except Exception:
+            return None
 
     def _native_video_content_rect(self) -> dict[str, float] | None:
         """Logical rect of the scaled video pixmap inside ``_native_video_preview`` (for overlays)."""
@@ -5040,8 +5105,25 @@ class MapWidget(QWidget):
                 self._btn_native_target.blockSignals(False)
             except Exception:
                 pass
+        try:
+            if enabled:
+                self._native_minimap.setToolTip(
+                    "Target ON: click here to mark on map · drag to pan"
+                )
+                self._native_minimap.setCursor(Qt.CursorShape.CrossCursor)
+                self._native_video_preview.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self._native_minimap.setToolTip(
+                    "Drag to pan map · click (no drag) to swap back to map"
+                )
+                self._native_minimap.setCursor(Qt.CursorShape.OpenHandCursor)
+                self._native_video_preview.setCursor(Qt.CursorShape.ArrowCursor)
+        except Exception:
+            pass
         if enabled:
-            self._set_status("Observation mark mode ON: click map or video preview")
+            self._set_status(
+                "Observation mark mode ON: click map, minimap, or video (no layout swap)"
+            )
         else:
             self._set_status("Observation mark mode OFF")
 
