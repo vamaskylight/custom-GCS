@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from urllib.parse import urlparse
+
 from vgcs.skydroid import GimbalStatus, SkydroidTopUdpAdapter
 from vgcs.skydroid.transport import begin_skydroid_session_log
+from vgcs.siyi import SiyiGimbalUdpAdapter
 
 
 @dataclass(frozen=True)
@@ -238,6 +241,110 @@ class SkydroidCameraControl:
     def get_gimbal_status(self) -> GimbalStatus | None:
         try:
             return self._adapter.get_status()
+        except Exception:
+            return None
+
+
+def resolve_siyi_host(settings, *, default: str = "192.168.144.25") -> str:
+    """SIYI companion IP from settings or RTSP stream URL hostname."""
+    host = str(settings.value("camera/siyi_host", "") or "").strip()
+    if host:
+        return host
+    for key in ("video/rtsp_day", "video/rtsp_thermal"):
+        url = str(settings.value(key, "") or "").strip()
+        if url.lower().startswith("rtsp://"):
+            parsed = urlparse(url)
+            if parsed.hostname:
+                return str(parsed.hostname)
+    return str(default)
+
+
+class SiyiCameraControl:
+    """SIYI Gimbal SDK over UDP (ZR10 / ZT6 / A8 mini — port 37260)."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int = 37260,
+        timeout_s: float = 0.25,
+        retries: int = 1,
+    ) -> None:
+        self._adapter = SiyiGimbalUdpAdapter(
+            host=host,
+            port=port,
+            timeout_s=timeout_s,
+            retries=retries,
+        )
+        self._adapter.start()
+
+    def close(self) -> None:
+        self._adapter.stop()
+
+    def set_zoom(self, level: float) -> None:
+        del level
+        return
+
+    def handle_zoom_step(self, step: int, ui_level: float) -> None:
+        del step, ui_level
+        return
+
+    def handle_focus_step(self, step: int) -> None:
+        del step
+        return
+
+    def set_focus(self, level: float) -> None:
+        del level
+        return
+
+    def set_gimbal(self, cmd: GimbalCommand) -> None:
+        yaw = float(cmd.yaw_deg) if cmd.yaw_deg is not None else 0.0
+        pitch = float(cmd.pitch_deg) if cmd.pitch_deg is not None else 0.0
+        try:
+            self._adapter.set_angle(yaw=yaw, pitch=pitch)
+        except Exception:
+            return
+
+    def ptz(self, action: str) -> None:
+        action_l = str(action or "").strip().lower()
+        try:
+            if action_l in ("up", "pitch_up"):
+                self._adapter.set_rotation_speed(0.0, 30.0)
+            elif action_l in ("down", "pitch_down"):
+                self._adapter.set_rotation_speed(0.0, -30.0)
+            elif action_l in ("left", "yaw_left"):
+                self._adapter.set_rotation_speed(-30.0, 0.0)
+            elif action_l in ("right", "yaw_right"):
+                self._adapter.set_rotation_speed(30.0, 0.0)
+            elif action_l in ("stop", "center", "home"):
+                self._adapter.set_rotation_speed(0.0, 0.0)
+        except Exception:
+            return
+
+    def set_gimbal_speed(self, yaw: float, pitch: float) -> None:
+        try:
+            self._adapter.set_rotation_speed(yaw=float(yaw), pitch=float(pitch))
+        except Exception:
+            return
+
+    def camera_trigger_photo(self) -> None:
+        try:
+            self._adapter.camera_photo()
+        except Exception:
+            return
+
+    def camera_toggle_record(self) -> None:
+        try:
+            self._adapter.camera_record_toggle()
+        except Exception:
+            return
+
+    def get_gimbal_status(self) -> GimbalStatus | None:
+        try:
+            st = self._adapter.get_status()
+            if st.supported:
+                return st
+            return self._adapter.request_attitude()
         except Exception:
             return None
 

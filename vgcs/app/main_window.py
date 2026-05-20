@@ -67,7 +67,13 @@ from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
 from vgcs.video.pipeline import VideoPipeline
 from vgcs.video.widgets import CameraControlPanel, SplitVideoPanel
-from vgcs.video.camera_control import MavlinkCameraControl, NoopCameraControl, SkydroidCameraControl
+from vgcs.video.camera_control import (
+    MavlinkCameraControl,
+    NoopCameraControl,
+    SiyiCameraControl,
+    SkydroidCameraControl,
+    resolve_siyi_host,
+)
 
 
 def _settings_truthy(val: object, default: bool = False) -> bool:
@@ -1901,33 +1907,55 @@ class MainWindow(QMainWindow):
         conn_group.setLayout(cg)
         vb.addWidget(conn_group)
 
-        skydroid_group = QGroupBox("Skydroid C13 (M4 TOP UDP)")
+        camera_group = QGroupBox("Camera / gimbal control")
         sdg = QGridLayout()
-        sdg.addWidget(QLabel("Camera control provider"), 0, 0)
+        sdg.addWidget(QLabel("Control provider"), 0, 0)
         camera_provider = QComboBox()
-        camera_provider.addItem("MAVLink (default)", "mavlink")
-        camera_provider.addItem("Skydroid TOP UDP", "skydroid")
+        camera_provider.addItem("MAVLink (ArduPilot mount)", "mavlink")
+        camera_provider.addItem("SIYI SDK UDP (ZR10, ZT6, …)", "siyi")
+        camera_provider.addItem("Skydroid TOP UDP (C13)", "skydroid")
         sdg.addWidget(camera_provider, 0, 1)
-        sdg.addWidget(QLabel("Skydroid host/IP"), 1, 0)
+        camera_hint = QLabel(
+            "ZR10: use SIYI SDK on UDP port 37260 (same IP as RTSP, usually 192.168.144.25). "
+            "Skydroid C13 uses TOP UDP port 5000 — not the ZR10 gimbal protocol."
+        )
+        camera_hint.setWordWrap(True)
+        camera_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        sdg.addWidget(camera_hint, 1, 0, 1, 2)
+        sdg.addWidget(QLabel("SIYI host/IP"), 2, 0)
+        siyi_host = QLineEdit()
+        siyi_host.setPlaceholderText("Empty = use RTSP hostname or 192.168.144.25")
+        sdg.addWidget(siyi_host, 2, 1)
+        sdg.addWidget(QLabel("SIYI UDP port"), 3, 0)
+        siyi_port = QSpinBox()
+        siyi_port.setRange(1, 65535)
+        siyi_port.setValue(37260)
+        sdg.addWidget(siyi_port, 3, 1)
+        sdg.addWidget(QLabel("SIYI timeout (ms)"), 4, 0)
+        siyi_timeout = QSpinBox()
+        siyi_timeout.setRange(50, 5000)
+        siyi_timeout.setValue(250)
+        sdg.addWidget(siyi_timeout, 4, 1)
+        sdg.addWidget(QLabel("Skydroid host/IP"), 5, 0)
         skydroid_host = QLineEdit()
-        sdg.addWidget(skydroid_host, 1, 1)
-        sdg.addWidget(QLabel("Skydroid UDP port"), 2, 0)
+        sdg.addWidget(skydroid_host, 5, 1)
+        sdg.addWidget(QLabel("Skydroid UDP port"), 6, 0)
         skydroid_port = QSpinBox()
         skydroid_port.setRange(1, 65535)
         skydroid_port.setValue(5000)
-        sdg.addWidget(skydroid_port, 2, 1)
-        sdg.addWidget(QLabel("TOP timeout (ms)"), 3, 0)
+        sdg.addWidget(skydroid_port, 6, 1)
+        sdg.addWidget(QLabel("Skydroid timeout (ms)"), 7, 0)
         skydroid_timeout = QSpinBox()
         skydroid_timeout.setRange(50, 5000)
         skydroid_timeout.setValue(250)
-        sdg.addWidget(skydroid_timeout, 3, 1)
-        sdg.addWidget(QLabel("Firmware command profile"), 4, 0)
+        sdg.addWidget(skydroid_timeout, 7, 1)
+        sdg.addWidget(QLabel("Skydroid firmware profile"), 8, 0)
         skydroid_profile = QComboBox()
         skydroid_profile.addItem("C13 Default (GAA/GSY/GAY)", "c13_default")
         skydroid_profile.addItem("C13 Alternate (GAC/GSP/GAP)", "c13_alt")
-        sdg.addWidget(skydroid_profile, 4, 1)
-        skydroid_group.setLayout(sdg)
-        vb.addWidget(skydroid_group)
+        sdg.addWidget(skydroid_profile, 8, 1)
+        camera_group.setLayout(sdg)
+        vb.addWidget(camera_group)
 
         settings_group = QGroupBox("Settings")
         stg = QGridLayout()
@@ -2022,6 +2050,15 @@ class MainWindow(QMainWindow):
         skydroid_profile.setCurrentIndex(
             max(0, skydroid_profile.findData(str(s.value("camera/skydroid_profile", "c13_default") or "c13_default")))
         )
+        siyi_host.setText(str(s.value("camera/siyi_host", "") or ""))
+        try:
+            siyi_port.setValue(int(s.value("camera/siyi_port", 37260) or 37260))
+        except Exception:
+            siyi_port.setValue(37260)
+        try:
+            siyi_timeout.setValue(int(s.value("camera/siyi_timeout_ms", 250) or 250))
+        except Exception:
+            siyi_timeout.setValue(250)
 
         def _apply() -> None:
             # Return immediately from the click handler so Windows gets a repainted frame.
@@ -2070,6 +2107,9 @@ class MainWindow(QMainWindow):
                 s.setValue("video/auto_delete", bool(auto_del.isChecked()))
                 s.setValue("video/max_storage_mb", int(max_mb.value()))
                 s.setValue("camera/provider", str(camera_provider.currentData() or "mavlink"))
+                s.setValue("camera/siyi_host", str(siyi_host.text()).strip())
+                s.setValue("camera/siyi_port", int(siyi_port.value()))
+                s.setValue("camera/siyi_timeout_ms", int(siyi_timeout.value()))
                 s.setValue("camera/skydroid_host", str(skydroid_host.text()).strip())
                 s.setValue("camera/skydroid_port", int(skydroid_port.value()))
                 s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
@@ -2771,6 +2811,23 @@ class MainWindow(QMainWindow):
     def _set_runtime_camera_control(self) -> None:
         self._stop_camera_control_backend()
         provider = str(self._settings.value("camera/provider", "mavlink") or "mavlink").strip().lower()
+        if provider == "siyi":
+            host = resolve_siyi_host(self._settings)
+            port = int(self._settings.value("camera/siyi_port", 37260) or 37260)
+            timeout_ms = int(self._settings.value("camera/siyi_timeout_ms", 250) or 250)
+            cc = SiyiCameraControl(
+                host=host,
+                port=port,
+                timeout_s=max(0.05, float(timeout_ms) / 1000.0),
+            )
+            self._camera_control_backend = cc
+            self._map_widget.set_camera_control(cc)
+            try:
+                self._camera_panel.set_camera_control(cc)
+            except Exception:
+                pass
+            self._append_log(f"Camera control: SIYI SDK UDP {host}:{port} (gimbal attitude 0x0D)")
+            return
         if provider == "skydroid":
             host = str(self._settings.value("camera/skydroid_host", "") or "").strip()
             port = int(self._settings.value("camera/skydroid_port", 5000) or 5000)
