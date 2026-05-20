@@ -3042,9 +3042,7 @@ class MainWindow(QMainWindow):
                 course = float(data["hdg_deg"])
             elif data.get("ground_track_deg") is not None:
                 course = float(data["ground_track_deg"])
-            if course is not None and float(
-                data.get("groundspeed_mps", self._map_groundspeed_mps) or 0.0
-            ) >= 1.0:
+            if course is not None:
                 self._heading = course
                 self._fields["heading"].setText(f"{int(round(course))}°")
                 self._compass.set_heading_deg(course)
@@ -3062,10 +3060,9 @@ class MainWindow(QMainWindow):
             self._fields["airspeed"].setText(f"{data.get('airspeed', 0.0):.1f} m/s")
             hd = float(data.get("heading", 0.0))
             self._fields["heading"].setText(f"{int(hd)}°")
-            if self._map_groundspeed_mps >= 1.0:
-                self._heading = hd
-                self._compass.set_heading_deg(hd)
-                self._map_widget.set_vehicle_heading(hd, source="vfr")
+            self._heading = hd
+            self._compass.set_heading_deg(hd)
+            self._map_widget.set_vehicle_heading(hd, source="vfr")
         elif msg_type == "ATTITUDE":
             self._fields["attitude"].setText(
                 f"{data.get('roll_deg', 0.0):.1f} / "
@@ -3073,10 +3070,10 @@ class MainWindow(QMainWindow):
                 f"{data.get('yaw_deg', 0.0):.1f} deg"
             )
             yaw_deg = float(data.get("yaw_deg", 0.0))
-            if self._map_groundspeed_mps >= 1.0:
-                self._heading = (yaw_deg + 360.0) % 360.0
-                self._compass.set_heading_deg((yaw_deg + 360.0) % 360.0)
-                self._map_widget.set_vehicle_heading((yaw_deg + 360.0) % 360.0, source="att")
+            hd_att = (yaw_deg + 360.0) % 360.0
+            self._heading = hd_att
+            self._compass.set_heading_deg(hd_att)
+            self._map_widget.set_vehicle_heading(hd_att, source="att")
         elif msg_type == "GPS_RAW_INT":
             hdop = data.get("hdop")
             hdop_text = "N/A" if hdop is None else f"{hdop:.2f}"
