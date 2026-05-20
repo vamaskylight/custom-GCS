@@ -3078,12 +3078,29 @@ class MainWindow(QMainWindow):
             hdop = data.get("hdop")
             hdop_text = "N/A" if hdop is None else f"{hdop:.2f}"
             sat = int(data.get("satellites_visible", 0))
+            fix_type = int(data.get("fix_type", 0) or 0)
             self._fields["gps"].setText(
-                f"fix={int(data.get('fix_type', 0))} sat={sat} hdop={hdop_text}"
+                f"fix={fix_type} sat={sat} hdop={hdop_text}"
             )
             self._top_gps_sat.setText(str(sat))
             self._top_gps_hdop.setText(hdop_text)
-            self._map_widget.set_header_gps(sat, hdop_text)
+            self._map_widget.set_header_gps(sat, hdop_text, fix_type=fix_type)
+            # Fallback when GLOBAL_POSITION_INT is 0,0 / missing but GPS_RAW has a fix.
+            raw_lat = data.get("lat")
+            raw_lon = data.get("lon")
+            if raw_lat is not None and raw_lon is not None:
+                lat = float(raw_lat)
+                lon = float(raw_lon)
+                if fix_type >= 2 and (abs(lat) > 1e-9 or abs(lon) > 1e-9):
+                    alt_msl = float(data.get("alt_msl_m", 0.0) or 0.0)
+                    self._map_widget.set_vehicle_position(
+                        lat,
+                        lon,
+                        relative_alt_m=None,
+                        groundspeed_mps=float(self._map_groundspeed_mps),
+                    )
+                    if alt_msl:
+                        self._map_msl_alt_m = alt_msl
         elif msg_type == "SYS_STATUS":
             pct = int(data.get("battery_remaining", -1))
             pct_text = "N/A" if pct < 0 else f"{pct}%"

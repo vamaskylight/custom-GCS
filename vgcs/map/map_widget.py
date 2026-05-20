@@ -754,6 +754,8 @@ class MapWidget(QWidget):
         self._ai_phase = 0.0
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
+        self._gps_fix_type: int = 0
+        self._gps_satellites: int = 0
         # Camera rail: "video" = live/shooting (record toggles); "photo" = still mode (center = shutter).
         self._camera_rail_ui_mode: str = "video"
 
@@ -3368,8 +3370,23 @@ class MapWidget(QWidget):
     def set_header_vehicle_msg(self, msg_text: str) -> None:
         self._run_js(f"setHeaderVehicleMsg({json.dumps(msg_text)});")
 
-    def set_header_gps(self, satellites: int | str, hdop_text: str) -> None:
-        key = (str(satellites), str(hdop_text))
+    def set_header_gps(
+        self,
+        satellites: int | str,
+        hdop_text: str,
+        *,
+        fix_type: int | None = None,
+    ) -> None:
+        try:
+            self._gps_satellites = int(satellites)
+        except Exception:
+            pass
+        if fix_type is not None:
+            try:
+                self._gps_fix_type = int(fix_type)
+            except Exception:
+                pass
+        key = (str(satellites), str(hdop_text), str(fix_type))
         if self._last_header_gps_key == key:
             return
         self._last_header_gps_key = key
@@ -5130,9 +5147,10 @@ class MapWidget(QWidget):
     def _observation_context(self) -> dict[str, object]:
         gimbal_yaw = None
         gimbal_pitch = None
+        st = None
         try:
             st = self._camera_control.get_gimbal_status()
-            if st is not None:
+            if st is not None and bool(getattr(st, "supported", False)):
                 gimbal_yaw = getattr(st, "yaw_deg", None)
                 gimbal_pitch = getattr(st, "pitch_deg", None)
         except Exception:
@@ -5153,6 +5171,8 @@ class MapWidget(QWidget):
             "vehicle_rel_alt_m": self._vehicle_rel_alt_m,
             "gimbal_yaw_deg": gimbal_yaw,
             "gimbal_pitch_deg": gimbal_pitch,
+            "gps_fix_type": int(getattr(self, "_gps_fix_type", 0) or 0),
+            "gps_satellites": int(getattr(self, "_gps_satellites", 0) or 0),
         }
 
     def _log_observation(
@@ -5182,9 +5202,14 @@ class MapWidget(QWidget):
         self._observations.append(row)
         msg = f"Observation logged ({len(self._observations)}): {kind}"
         if row.get("vehicle_lat") is None or row.get("vehicle_lon") is None:
-            msg += " — no drone GPS in GCS (connect MAVLink + wait for GPS fix)"
+            fix = int(row.get("gps_fix_type") or 0)
+            sat = int(row.get("gps_satellites") or 0)
+            if fix < 2:
+                msg += f" — no GPS fix yet (fix={fix} sats={sat}; wait for 3D GPS / clear PreArm)"
+            else:
+                msg += " — GPS fix ok but position not in map state (retry mark)"
         elif row.get("gimbal_yaw_deg") is None and row.get("gimbal_pitch_deg") is None:
-            msg += " — gimbal angles N/A (Skydroid TOP UDP or future SIYI telemetry)"
+            msg += " — gimbal N/A (check Skydroid host/port 5000, not 14551 unless your manual says so)"
         self._set_status(msg)
 
         # Native OBSERVE -> Target needs a visible marker on the Qt map.
@@ -5345,6 +5370,8 @@ class MapWidget(QWidget):
             "vehicle_rel_alt_m",
             "gimbal_yaw_deg",
             "gimbal_pitch_deg",
+            "gps_fix_type",
+            "gps_satellites",
             "snapshot_path",
             "clip_path",
         ]
@@ -5384,6 +5411,8 @@ class MapWidget(QWidget):
                 f"<td>{row.get('video_x_norm','')}</td>"
                 f"<td>{row.get('video_y_norm','')}</td>"
                 f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
+                f"<td>{row.get('gps_fix_type','')}</td>"
+                f"<td>{row.get('gps_satellites','')}</td>"
                 f"<td>{row.get('snapshot_path','')}</td>"
                 f"<td>{row.get('clip_path','')}</td>"
                 "</tr>"
@@ -5398,7 +5427,8 @@ class MapWidget(QWidget):
             "<table><thead><tr>"
             "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th>"
             "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
-            "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Snapshot</th><th>Clip</th>"
+            "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th>"
+            "<th>GPS Fix</th><th>GPS Sats</th><th>Snapshot</th><th>Clip</th>"
             "</tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table></body></html>"
