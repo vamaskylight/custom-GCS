@@ -395,14 +395,21 @@ class MavlinkThread(QThread):
             elif msg_type == "GPS_RAW_INT":
                 eph_raw = int(getattr(msg, "eph", 0xFFFF) or 0xFFFF)
                 hdop = None if eph_raw >= 0xFFFF else float(eph_raw) / 100.0
-                self._emit_telemetry_payload(
-                    "GPS_RAW_INT",
-                    {
-                        "satellites_visible": int(getattr(msg, "satellites_visible", 0) or 0),
-                        "fix_type": int(getattr(msg, "fix_type", 0) or 0),
-                        "hdop": hdop,
-                    },
-                )
+                fix_type = int(getattr(msg, "fix_type", 0) or 0)
+                raw_lat = float(getattr(msg, "lat", 0) or 0) / 1e7
+                raw_lon = float(getattr(msg, "lon", 0) or 0) / 1e7
+                raw_alt_mm = int(getattr(msg, "alt", 0) or 0)
+                gps_payload: dict[str, object] = {
+                    "satellites_visible": int(getattr(msg, "satellites_visible", 0) or 0),
+                    "fix_type": fix_type,
+                    "hdop": hdop,
+                }
+                # 2=2D fix, 3=3D fix, 4=DGPS, 5=RTK, etc. — use when EKF position not ready yet.
+                if fix_type >= 2 and (abs(raw_lat) > 1e-9 or abs(raw_lon) > 1e-9):
+                    gps_payload["lat"] = raw_lat
+                    gps_payload["lon"] = raw_lon
+                    gps_payload["alt_msl_m"] = float(raw_alt_mm) / 1000.0
+                self._emit_telemetry_payload("GPS_RAW_INT", gps_payload)
             elif msg_type == "SYS_STATUS":
                 self._emit_telemetry_payload(
                     "SYS_STATUS",
