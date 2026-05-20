@@ -60,6 +60,7 @@ from PySide6.QtGui import (
     QColor,
     QRadialGradient,
 )
+from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayDetection
 from vgcs.mission import (
     Waypoint,
     load_waypoints_json,
@@ -749,6 +750,8 @@ class MapWidget(QWidget):
         self._camera_control = NoopCameraControl()
         self._obs_mark_mode = False
         self._observations: list[dict[str, object]] = []
+        self._video_obs_marks: list[tuple[float, float]] = []
+        self._ai_phase = 0.0
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
         # Camera rail: "video" = live/shooting (record toggles); "photo" = still mode (center = shutter).
@@ -784,6 +787,8 @@ class MapWidget(QWidget):
         )
         self._native_video_preview.hide()
         self._native_video_preview.raise_()
+        self._native_video_overlay = NativeVideoOverlayLayer(self._native_video_preview)
+        self._native_video_overlay.hide()
         self._native_video_last = QImage()
         self._video_swapped = False
         # Operator chose map-main (PiP video); do not auto-force fullscreen video on gaps/first frame.
@@ -1900,6 +1905,10 @@ class MapWidget(QWidget):
                 self._sync_native_camera_rail_toggles()
             except Exception:
                 pass
+            try:
+                self._sync_native_video_overlay()
+            except Exception:
+                pass
 
     def _raise_panel_flight_overlays(self) -> None:
         """Panel-level HUD (Takeoff/Return, camera rail, compass) above fullscreen video on `_map_canvas`."""
@@ -1939,6 +1948,10 @@ class MapWidget(QWidget):
         try:
             if self._native_video_preview.isVisible():
                 self._native_video_preview.raise_()
+                try:
+                    self._sync_native_video_overlay()
+                except Exception:
+                    pass
         except Exception:
             pass
         self._raise_panel_flight_overlays()
@@ -2282,6 +2295,56 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _native_video_content_rect(self) -> dict[str, float] | None:
+        """Logical rect of the scaled video pixmap inside ``_native_video_preview`` (for overlays)."""
+        hit = getattr(self, "_split_pip_hit", None)
+        if isinstance(hit, dict) and hit:
+            return dict(hit)
+        try:
+            pv = self._native_video_preview
+            pm = pv.pixmap()
+            if pm is None or pm.isNull():
+                return None
+            cr = pv.contentsRect()
+            Wc = float(max(1, cr.width()))
+            Hc = float(max(1, cr.height()))
+            spw = float(max(1, pm.width()))
+            sph = float(max(1, pm.height()))
+            try:
+                dpr = max(1.0, float(pm.devicePixelRatio()))
+            except Exception:
+                dpr = 1.0
+            spw /= dpr
+            sph /= dpr
+            return {
+                "cr_left": float(cr.left()),
+                "cr_top": float(cr.top()),
+                "ox": (Wc - spw) / 2.0,
+                "oy": (Hc - sph) / 2.0,
+                "pw": spw,
+                "ph": sph,
+            }
+        except Exception:
+            return None
+
+    def _sync_native_video_overlay(self) -> None:
+        """Match overlay layer to video preview geometry and refresh content rect."""
+        try:
+            pv = self._native_video_preview
+            ly = self._native_video_overlay
+        except AttributeError:
+            return
+        try:
+            ly.setGeometry(0, 0, max(1, pv.width()), max(1, pv.height()))
+            ly.set_content_rect(self._native_video_content_rect())
+            if pv.isVisible() and bool(getattr(self, "_video_preview_enabled", False)):
+                ly.show()
+                ly.raise_()
+            else:
+                ly.hide()
+        except Exception:
+            pass
+
     def _render_native_video_preview(self, img: QImage) -> None:
         if img is None or img.isNull():
             return
@@ -2366,6 +2429,11 @@ class MapWidget(QWidget):
                 self._split_pip_hit = None
         except Exception:
             return
+        finally:
+            try:
+                self._sync_native_video_overlay()
+            except Exception:
+                pass
 
     def _render_native_split_preview(self) -> None:
         """
@@ -4462,8 +4530,10 @@ class MapWidget(QWidget):
                         self._set_status(f"Video preview: {dname} [{sid}]")
                 except Exception:
                     pass
-            if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
-                self._ai_timer.stop()
+            t_ai = getattr(self, "_ai_timer", None)
+            if t_ai is not None and not t_ai.isActive():
+                t_ai.start()
+            self._tick_native_ai_overlay()
         except Exception:
             self._run_js("setVideoPreviewImage('');")
 
@@ -4477,6 +4547,11 @@ class MapWidget(QWidget):
             self._video_push_timer.stop()
         if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
             self._ai_timer.stop()
+        try:
+            self._native_video_overlay.clear_all()
+            self._native_video_overlay.hide()
+        except Exception:
+            pass
         try:
             t_stall = getattr(self, "_video_preview_stall_timer", None)
             if t_stall is not None and t_stall.isActive():
@@ -4792,28 +4867,26 @@ class MapWidget(QWidget):
         self._run_js("setVideoPreviewMode('single');")
         self._run_js(f"setVideoPreviewImage({json.dumps(src)});")
 
-    def _push_dummy_ai_overlay(self) -> None:
-        if not getattr(self, "_web_ready", False):
-            return
+    def _tick_native_ai_overlay(self) -> None:
+        """M7 demo detection box on native video preview (replaces inactive WebEngine-only path)."""
         if not bool(getattr(self, "_video_preview_enabled", False)):
             return
-        # Simple moving box in normalized coordinates.
         try:
             self._ai_phase = float(getattr(self, "_ai_phase", 0.0)) + 0.06
         except Exception:
             self._ai_phase = 0.0
         p = float(getattr(self, "_ai_phase", 0.0))
-        x = (0.1 + (0.6 * (0.5 + 0.5 * math.sin(p))))  # 0.1..0.7
-        y = 0.18
-        w = 0.22
-        h = 0.22
-        det = [{"x": x, "y": y, "w": w, "h": h, "label": "demo", "score": 0.86}]
-        if bool(getattr(self, "_video_split_enabled", False)):
-            # Send to first two cells (Day/Thermal) and empty for others.
-            payload = json.dumps([det, det, [], []])
-            self._run_js(f"if (window.setAiOverlayGrid) setAiOverlayGrid({payload});")
-        else:
-            self._run_js(f"if (window.setAiOverlaySingle) setAiOverlaySingle({json.dumps(det)});")
+        x = 0.1 + (0.6 * (0.5 + 0.5 * math.sin(p)))  # 0.1..0.7
+        det = [
+            VideoOverlayDetection(x=x, y=0.18, w=0.22, h=0.22, label="demo", score=0.86),
+        ]
+        try:
+            self._native_video_overlay.set_detections(det)
+        except Exception:
+            pass
+
+    def _push_dummy_ai_overlay(self) -> None:
+        self._tick_native_ai_overlay()
 
     def _apply_digital_zoom(self, img: QImage, zoom: float) -> QImage:
         try:
@@ -5026,6 +5099,12 @@ class MapWidget(QWidget):
                     nm.add_observation_map_marker(float(map_lat), float(map_lon))
             except Exception:
                 pass
+        if kind == "video_mark" and video_x is not None and video_y is not None:
+            try:
+                self._video_obs_marks.append((float(video_x), float(video_y)))
+                self._native_video_overlay.set_video_marks(self._video_obs_marks)
+            except Exception:
+                pass
 
     def _capture_observation_clip(self) -> None:
         ok = self._ensure_video_preview_backend()
@@ -5134,11 +5213,16 @@ class MapWidget(QWidget):
     def _clear_observations(self) -> None:
         n = len(self._observations)
         self._observations.clear()
+        self._video_obs_marks.clear()
         # Clear native markers (Qt) + web markers (if any).
         try:
             nm = getattr(self, "_native_map", None)
             if nm is not None and hasattr(nm, "clear_observation_marks"):
                 nm.clear_observation_marks()
+        except Exception:
+            pass
+        try:
+            self._native_video_overlay.clear_all()
         except Exception:
             pass
         self._run_js("if (window.clearObservationMarks) clearObservationMarks();")
