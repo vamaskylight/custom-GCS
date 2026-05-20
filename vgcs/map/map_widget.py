@@ -5137,9 +5137,18 @@ class MapWidget(QWidget):
                 gimbal_pitch = getattr(st, "pitch_deg", None)
         except Exception:
             pass
+        v_lat = self._lat
+        v_lon = self._lon
+        if v_lat is None or v_lon is None:
+            try:
+                pos = self.get_vehicle_display_position()
+                if pos is not None:
+                    v_lat, v_lon = float(pos[0]), float(pos[1])
+            except Exception:
+                pass
         return {
-            "vehicle_lat": self._lat,
-            "vehicle_lon": self._lon,
+            "vehicle_lat": v_lat,
+            "vehicle_lon": v_lon,
             "vehicle_heading_deg": self._heading,
             "vehicle_rel_alt_m": self._vehicle_rel_alt_m,
             "gimbal_yaw_deg": gimbal_yaw,
@@ -5171,7 +5180,12 @@ class MapWidget(QWidget):
         }
         row.update(self._observation_context())
         self._observations.append(row)
-        self._set_status(f"Observation logged ({len(self._observations)}): {kind}")
+        msg = f"Observation logged ({len(self._observations)}): {kind}"
+        if row.get("vehicle_lat") is None or row.get("vehicle_lon") is None:
+            msg += " — no drone GPS in GCS (connect MAVLink + wait for GPS fix)"
+        elif row.get("gimbal_yaw_deg") is None and row.get("gimbal_pitch_deg") is None:
+            msg += " — gimbal angles N/A (Skydroid TOP UDP or future SIYI telemetry)"
+        self._set_status(msg)
 
         # Native OBSERVE -> Target needs a visible marker on the Qt map.
         if kind == "map_mark" and map_lat is not None and map_lon is not None:
@@ -6297,16 +6311,17 @@ class MapWidget(QWidget):
             self._schedule_vehicle_pose_js(immediate=first_fix)
 
     def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
-        if not bool(getattr(self, "_map_motion_armed", False)):
-            return
+        """Store heading for HUD/observations always; map chevron only when vehicle is moving."""
         src = str(source or "mixed")
-        self._heading = heading_deg % 360.0
+        self._heading = float(heading_deg) % 360.0
         self._heading_js_source = src
         self._heading_label.setText(f"Heading: {self._heading:.1f}°")
         try:
             self._native_compass.set_heading_deg(self._heading)
         except Exception:
             pass
+        if not bool(getattr(self, "_map_motion_armed", False)):
+            return
         nm = getattr(self, "_native_map", None)
         if nm is not None:
             try:
@@ -6369,6 +6384,10 @@ class MapWidget(QWidget):
         if sig == self._last_flight_telemetry_sig:
             return
         self._last_flight_telemetry_sig = sig
+        try:
+            self._vehicle_rel_alt_m = float(relative_alt_m)
+        except Exception:
+            pass
         try:
             self._native_telemetry.set_values(
                 f"{ft} ft",
