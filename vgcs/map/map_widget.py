@@ -5209,7 +5209,10 @@ class MapWidget(QWidget):
             else:
                 msg += " — GPS fix ok but position not in map state (retry mark)"
         elif row.get("gimbal_yaw_deg") is None and row.get("gimbal_pitch_deg") is None:
-            msg += " — gimbal N/A (check Skydroid host/port 5000, not 14551 unless your manual says so)"
+            msg += (
+                " — gimbal N/A (ZR10: Application Settings → SIYI SDK UDP port 37260; "
+                "Skydroid C13: TOP UDP port 5000)"
+            )
         self._set_status(msg)
 
         # Native OBSERVE -> Target needs a visible marker on the Qt map.
