@@ -6,10 +6,9 @@ import sys
 from urllib.parse import urlparse
 
 
-def _wifi_ipv4_gateway() -> str | None:
-    """Best-effort default gateway for the active Wi-Fi adapter (RC hotspot path)."""
+def _ipv4_gateways_from_ipconfig() -> list[str]:
     if sys.platform != "win32":
-        return None
+        return []
     try:
         out = subprocess.check_output(
             ["ipconfig"],
@@ -19,32 +18,40 @@ def _wifi_ipv4_gateway() -> str | None:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
-        return None
-    blocks = re.split(r"\r?\n\r?\n", out)
-    for block in blocks:
-        low = block.lower()
-        if "wireless lan adapter wi-fi" not in low and "wireless lan adapter wlan" not in low:
-            if "wi-fi" not in low and "wlan" not in low:
-                continue
-        m = re.search(
-            r"Default Gateway[^:\r\n]*:\s*(\d{1,3}(?:\.\d{1,3}){3})",
-            block,
-            re.IGNORECASE,
-        )
-        if not m:
-            continue
+        return []
+    found: list[str] = []
+    for m in re.finditer(
+        r"Default Gateway[^:\r\n]*:\s*(\d{1,3}(?:\.\d{1,3}){3})",
+        out,
+        re.IGNORECASE,
+    ):
         gw = m.group(1).strip()
-        if gw and gw != "0.0.0.0":
+        if gw and gw != "0.0.0.0" and gw not in found:
+            found.append(gw)
+    return found
+
+
+def _pick_rc_gateway(gateways: list[str]) -> str | None:
+    """Prefer typical RC hotspot gateways (192.168.43.1, etc.)."""
+    for gw in gateways:
+        if gw.startswith("192.168.43."):
             return gw
-    return None
+    for gw in gateways:
+        parts = gw.split(".")
+        if len(parts) == 4 and gw.startswith("192.168.") and gw != "192.168.144.1":
+            return gw
+    return gateways[0] if gateways else None
+
+
+def _wifi_ipv4_gateway() -> str | None:
+    return _pick_rc_gateway(_ipv4_gateways_from_ipconfig())
 
 
 def resolve_skydroid_control_hosts(settings, *, default: str = "192.168.144.108") -> list[str]:
     """
     Hosts to try for Skydroid TOP UDP (attitude poll).
 
-    Order: explicit setting, RTSP hostname, Wi-Fi gateway (RC forwards TOP when PC is on
-    192.168.43.x hotspot), then C13 default IP.
+    Order: explicit setting, RTSP hostname, default gateway (RC hotspot), then C13 IP.
     """
     out: list[str] = []
 

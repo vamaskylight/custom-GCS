@@ -50,6 +50,7 @@ class TopUdpTransport:
         self._listener_running = False
         self._listener: threading.Thread | None = None
         self._on_datagram = None
+        self._listener_paused = False
 
     def set_datagram_handler(self, handler) -> None:
         self._on_datagram = handler
@@ -95,11 +96,14 @@ class TopUdpTransport:
         while self._listener_running:
             try:
                 with self._lock:
-                    sock = self._sock
+                    if self._listener_paused:
+                        sock = None
+                    else:
+                        sock = self._sock
                 if sock is None:
-                    time.sleep(0.1)
+                    time.sleep(0.02)
                     continue
-                sock.settimeout(0.35)
+                sock.settimeout(0.2)
                 data, _addr = sock.recvfrom(4096)
                 if data and self._on_datagram is not None:
                     self._on_datagram(data)
@@ -116,24 +120,40 @@ class TopUdpTransport:
         expect_reply: bool = True,
         *,
         log: bool = True,
+        timeout_s: float | None = None,
     ) -> bytes:
         self.open()
         last_error: Exception | None = None
-        for _attempt in range(self._retries + 1):
+        attempts = self._retries + 1
+        with self._lock:
+            self._listener_paused = True
             try:
                 assert self._sock is not None
-                self._sock.sendto(payload, (self._host, self._port))
-                if log:
-                    self._append_log("TX", payload)
-                if not expect_reply:
-                    return b""
-                data, _addr = self._sock.recvfrom(4096)
-                if log:
-                    self._append_log("RX", data)
-                return data
-            except Exception as e:
-                last_error = e
-                continue
+                prev_timeout = self._sock.gettimeout()
+                use_timeout = self._timeout_s if timeout_s is None else max(0.05, float(timeout_s))
+                self._sock.settimeout(use_timeout)
+                try:
+                    for _attempt in range(attempts):
+                        try:
+                            self._sock.sendto(payload, (self._host, self._port))
+                            if log:
+                                self._append_log("TX", payload)
+                            if not expect_reply:
+                                return b""
+                            data, _addr = self._sock.recvfrom(4096)
+                            if log:
+                                self._append_log("RX", data)
+                            return data
+                        except Exception as e:
+                            last_error = e
+                            continue
+                finally:
+                    try:
+                        self._sock.settimeout(prev_timeout)
+                    except Exception:
+                        pass
+            finally:
+                self._listener_paused = False
         self._append_log("ERR", str(last_error or "unknown").encode("ascii", errors="ignore"))
         raise RuntimeError(f"TOP UDP request failed: {last_error}")
 

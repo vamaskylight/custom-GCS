@@ -1238,7 +1238,7 @@ class MapWidget(QWidget):
 
         def _obs_report() -> None:
             print("[VGCS:cam_rail] OBSERVE Report clicked")
-            self._export_observations()
+            QTimer.singleShot(0, lambda: self._export_observations(quick=True))
 
         def _obs_reset() -> None:
             print("[VGCS:cam_rail] OBSERVE Reset clicked")
@@ -5352,14 +5352,33 @@ class MapWidget(QWidget):
         self._run_js("if (window.clearObservationMarks) clearObservationMarks();")
         self._set_status(f"Cleared observations: {n}")
 
-    def _export_observations(self) -> None:
+    def _export_observations(self, *, quick: bool = False) -> None:
         if not self._observations:
             self._set_status("No observations to export")
             return
         suggested = f"observations_{time.strftime('%Y%m%d_%H%M%S')}.csv"
-        csv_path, _ = QFileDialog.getSaveFileName(self, "Export observations CSV", str(Path.cwd() / suggested), "CSV files (*.csv)")
-        if not csv_path:
-            return
+        csv_path = ""
+        if quick:
+            out_dir = Path.cwd() / "captures" / "observations"
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                self._set_status(f"Observation export failed: {e}")
+                return
+            csv_path = str(out_dir / suggested)
+        else:
+            try:
+                csv_path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "Export observations CSV",
+                    str(Path.cwd() / suggested),
+                    "CSV files (*.csv)",
+                )
+            except Exception as e:
+                self._set_status(f"Observation export dialog failed: {e}")
+                return
+            if not csv_path:
+                return
         fields = [
             "timestamp_utc",
             "kind",
@@ -5384,14 +5403,16 @@ class MapWidget(QWidget):
                 w.writeheader()
                 for row in self._observations:
                     w.writerow({k: row.get(k) for k in fields})
-        except Exception:
-            self._set_status("Observation CSV export failed")
+        except Exception as e:
+            self._set_status(f"Observation CSV export failed: {e}")
             return
         html_path = str(Path(csv_path).with_suffix(".html"))
         try:
             self._write_observation_html_summary(html_path)
-        except Exception:
+        except Exception as e:
             html_path = ""
+            self._set_status(f"Observations exported (CSV only): {csv_path} — HTML failed: {e}")
+            return
         if html_path:
             self._set_status(f"Observations exported: {csv_path} | {html_path}")
         else:

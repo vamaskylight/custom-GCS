@@ -302,11 +302,10 @@ class SkydroidCameraControl:
 
     def get_gimbal_status(self) -> GimbalStatus | None:
         try:
-            st = self._adapter.get_status()
+            st = self._adapter.get_status_cached()
             if st is not None and bool(getattr(st, "supported", False)):
                 return st
-            polled = self._adapter.poll_attitude_now()
-            return polled if polled is not None else st
+            return st
         except Exception:
             return None
 
