@@ -52,10 +52,67 @@ def parse_top_frame(raw: bytes) -> DecodedTopFrame | None:
         return None
     command = parts[1].upper()
     params: dict[str, str] = {}
+    bare_nums: list[str] = []
     for part in parts[2:]:
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        params[k.strip().lower()] = v.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            params[k.strip().lower()] = v.strip()
+        else:
+            bare_nums.append(part)
+    if bare_nums:
+        if "yaw" not in params and len(bare_nums) >= 1:
+            params["yaw"] = bare_nums[0]
+        if "pitch" not in params and len(bare_nums) >= 2:
+            params["pitch"] = bare_nums[1]
+        if "roll" not in params and len(bare_nums) >= 3:
+            params["roll"] = bare_nums[2]
     return DecodedTopFrame(command=command, params=params, raw=(raw or b"").decode("ascii", errors="ignore"))
+
+
+_ATTITUDE_KEYS: tuple[tuple[str, str], ...] = (
+    ("yaw", "yaw"),
+    ("yaw_deg", "yaw"),
+    ("pan", "yaw"),
+    ("y", "yaw"),
+    ("pitch", "pitch"),
+    ("pitch_deg", "pitch"),
+    ("tilt", "pitch"),
+    ("p", "pitch"),
+)
+
+
+def extract_attitude_deg(dec: DecodedTopFrame | None) -> tuple[float | None, float | None]:
+    """Parse yaw/pitch from a TOP frame (GAA/GAC/GAY replies and async telemetry)."""
+    if dec is None:
+        return None, None
+    yaw_v: float | None = None
+    pitch_v: float | None = None
+    for src, dst in _ATTITUDE_KEYS:
+        if dst == "yaw" and yaw_v is not None:
+            continue
+        if dst == "pitch" and pitch_v is not None:
+            continue
+        raw = dec.params.get(src)
+        if raw is None:
+            continue
+        val = _to_float(raw)
+        if val is None:
+            continue
+        if dst == "yaw":
+            yaw_v = val
+        else:
+            pitch_v = val
+    return yaw_v, pitch_v
+
+
+def _to_float(v: object) -> float | None:
+    try:
+        if v is None:
+            return None
+        s = str(v).strip().replace("°", "")
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
 

@@ -16,6 +16,8 @@ from typing import Optional
 from PySide6.QtCore import QThread, Signal
 from pymavlink import mavutil
 
+from vgcs.skydroid.adapter import GimbalStatus
+
 
 class MavlinkThread(QThread):
     """Connect to a MAVLink stream and report link/heartbeat/telemetry state."""
@@ -63,6 +65,28 @@ class MavlinkThread(QThread):
             "OPEN_DRONE_ID": 0.25,
         }
         self._last_hb_log_mono = 0.0
+        self._gimbal_lock = threading.Lock()
+        self._gimbal_status = GimbalStatus()
+
+    def get_cached_gimbal_status(self) -> GimbalStatus | None:
+        with self._gimbal_lock:
+            st = self._gimbal_status
+        if not bool(getattr(st, "supported", False)):
+            return None
+        if (time.monotonic() - float(getattr(st, "updated_mono", 0.0) or 0.0)) > 5.0:
+            return None
+        return st
+
+    def _update_gimbal_cache(self, yaw_deg: float | None, pitch_deg: float | None) -> None:
+        if yaw_deg is None and pitch_deg is None:
+            return
+        with self._gimbal_lock:
+            self._gimbal_status = GimbalStatus(
+                yaw_deg=yaw_deg,
+                pitch_deg=pitch_deg,
+                supported=True,
+                updated_mono=time.monotonic(),
+            )
 
     def _emit_telemetry_payload(self, msg_type: str, payload: dict) -> None:
         """Emit telemetry to the GUI at a capped rate for known high-frequency message types."""
@@ -392,6 +416,37 @@ class MavlinkThread(QThread):
                 if gt_deg is not None:
                     gpi["ground_track_deg"] = gt_deg
                 self._emit_telemetry_payload("GLOBAL_POSITION_INT", gpi)
+            elif msg_type == "MOUNT_ORIENTATION":
+                yaw = float(getattr(msg, "yaw", float("nan")) or float("nan"))
+                pitch = float(getattr(msg, "pitch", float("nan")) or float("nan"))
+                yaw_v = None if math.isnan(yaw) else yaw
+                pitch_v = None if math.isnan(pitch) else pitch
+                self._update_gimbal_cache(yaw_v, pitch_v)
+            elif msg_type == "GIMBAL_DEVICE_ATTITUDE_STATUS":
+                q = getattr(msg, "q", None) or []
+                if len(q) >= 4:
+                    try:
+                        w, x, y, z = (
+                            float(q[0]),
+                            float(q[1]),
+                            float(q[2]),
+                            float(q[3]),
+                        )
+                        sinr_cosp = 2.0 * (w * x + y * z)
+                        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+                        roll = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
+                        sinp = 2.0 * (w * y - z * x)
+                        pitch = (
+                            math.copysign(90.0, sinp)
+                            if abs(sinp) >= 1.0
+                            else math.degrees(math.asin(sinp))
+                        )
+                        siny_cosp = 2.0 * (w * z + x * y)
+                        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+                        yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+                        self._update_gimbal_cache(yaw, pitch)
+                    except Exception:
+                        pass
             elif msg_type == "GPS_RAW_INT":
                 eph_raw = int(getattr(msg, "eph", 0xFFFF) or 0xFFFF)
                 hdop = None if eph_raw >= 0xFFFF else float(eph_raw) / 100.0

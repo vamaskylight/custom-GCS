@@ -47,6 +47,12 @@ class TopUdpTransport:
         self._log_path = str(log_path or "").strip()
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
+        self._listener_running = False
+        self._listener: threading.Thread | None = None
+        self._on_datagram = None
+
+    def set_datagram_handler(self, handler) -> None:
+        self._on_datagram = handler
 
     def open(self) -> None:
         with self._lock:
@@ -57,6 +63,13 @@ class TopUdpTransport:
             self._sock = sock
 
     def close(self) -> None:
+        self._listener_running = False
+        if self._listener is not None:
+            try:
+                self._listener.join(timeout=0.5)
+            except Exception:
+                pass
+            self._listener = None
         with self._lock:
             if self._sock is None:
                 return
@@ -65,6 +78,33 @@ class TopUdpTransport:
             except Exception:
                 pass
             self._sock = None
+
+    def start_listener(self) -> None:
+        if self._listener_running:
+            return
+        self.open()
+        self._listener_running = True
+        self._listener = threading.Thread(target=self._listen_loop, daemon=True)
+        self._listener.start()
+
+    def _listen_loop(self) -> None:
+        while self._listener_running:
+            try:
+                with self._lock:
+                    sock = self._sock
+                if sock is None:
+                    time.sleep(0.1)
+                    continue
+                sock.settimeout(0.35)
+                data, _addr = sock.recvfrom(4096)
+                if data and self._on_datagram is not None:
+                    self._on_datagram(data)
+            except socket.timeout:
+                continue
+            except Exception:
+                if self._listener_running:
+                    time.sleep(0.2)
+                continue
 
     def send_and_receive(
         self,

@@ -6,8 +6,14 @@ import time
 from dataclasses import dataclass
 
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
-from vgcs.skydroid.protocol import build_top_frame, parse_top_frame
+from vgcs.skydroid.protocol import (
+    build_top_frame,
+    extract_attitude_deg,
+    parse_top_frame,
+)
 from vgcs.skydroid.transport import TopUdpTransport
+
+_C13_PROBE_PORTS = (5000, 14550, 14551)
 
 
 @dataclass(frozen=True)
@@ -40,11 +46,15 @@ class SkydroidTopUdpAdapter:
         self._status_poller: threading.Thread | None = None
         self._min_dt = 1.0 / max(1.0, float(rate_limit_hz))
         self._last_send_mono = 0.0
+        self._active_port = int(port)
+        self._transport.set_datagram_handler(self._maybe_update_status)
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
+        self._transport.start_listener()
+        self._probe_ports()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
         self._status_poller = threading.Thread(target=self._status_loop, daemon=True)
@@ -85,7 +95,44 @@ class SkydroidTopUdpAdapter:
 
     def get_status(self) -> GimbalStatus:
         with self._status_lock:
-            return self._status
+            st = self._status
+        if not st.supported or (time.monotonic() - float(st.updated_mono or 0.0)) > 2.0:
+            self.poll_attitude_now()
+            with self._status_lock:
+                return self._status
+        return st
+
+    def poll_attitude_now(self) -> GimbalStatus | None:
+        for status_cmd in self._profile.status_commands:
+            try:
+                frame = build_top_frame(status_cmd, {})
+                reply = self._transport.send_and_receive(
+                    frame, expect_reply=True, log=False
+                )
+                self._maybe_update_status(reply)
+                with self._status_lock:
+                    if self._status.supported:
+                        return self._status
+            except Exception:
+                continue
+        return None
+
+    def _probe_ports(self) -> None:
+        """Pick a UDP port that answers GAA/GAC (C13 may use 5000; radio forwards vary)."""
+        host = self._transport._host
+        if not host:
+            return
+        configured = int(self._transport._port)
+        candidates: list[int] = []
+        for p in (configured, *_C13_PROBE_PORTS):
+            if p not in candidates:
+                candidates.append(int(p))
+        for port in candidates:
+            self._transport._port = int(port)
+            if self.poll_attitude_now() is not None:
+                self._active_port = int(port)
+                return
+        self._transport._port = configured
 
     def _enqueue(self, commands: list[str], params: dict[str, object], expect_reply: bool) -> None:
         if not commands:
@@ -133,26 +180,17 @@ class SkydroidTopUdpAdapter:
 
     def _status_loop(self) -> None:
         while self._running:
-            for status_cmd in self._profile.status_commands:
-                try:
-                    frame = build_top_frame(status_cmd, {})
-                    reply = self._transport.send_and_receive(
-                        frame, expect_reply=True, log=False
-                    )
-                    self._maybe_update_status(reply)
-                    break
-                except Exception:
-                    continue
-            time.sleep(1.0)
+            self.poll_attitude_now()
+            time.sleep(0.5)
 
     def _maybe_update_status(self, payload: bytes) -> None:
         dec = parse_top_frame(payload)
         if dec is None:
             return
-        if dec.command not in self._profile.status_response_commands:
-            return
-        yaw = _to_float(dec.params.get("yaw"))
-        pitch = _to_float(dec.params.get("pitch"))
+        yaw, pitch = extract_attitude_deg(dec)
+        if yaw is None and pitch is None:
+            if dec.command not in self._profile.status_response_commands:
+                return
         with self._status_lock:
             self._status = GimbalStatus(
                 yaw_deg=yaw,
@@ -160,13 +198,4 @@ class SkydroidTopUdpAdapter:
                 supported=(yaw is not None or pitch is not None),
                 updated_mono=time.monotonic(),
             )
-
-
-def _to_float(v: object) -> float | None:
-    try:
-        if v is None:
-            return None
-        return float(v)
-    except Exception:
-        return None
 
