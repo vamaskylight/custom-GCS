@@ -13,7 +13,8 @@ from vgcs.skydroid.protocol import (
 )
 from vgcs.skydroid.transport import TopUdpTransport
 
-_C13_PROBE_PORTS = (5000, 14550, 14551)
+# C13 manual / field: gimbal UDP often 192.168.144.12:19856; RTSP stays 192.168.144.108:554
+_C13_PROBE_PORTS = (19856, 5000, 14550, 14551)
 _PROBE_TIMEOUT_S = 0.12
 
 
