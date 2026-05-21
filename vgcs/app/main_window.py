@@ -2927,11 +2927,20 @@ class MainWindow(QMainWindow):
                 f"Camera control: Skydroid TOP UDP {ah}:{ap} profile={pid} "
                 f"(probe hosts: {tried}; MAVLink mount fallback)"
             )
-            if not cc._adapter.gimbal_telemetry_ok():
+            def _skydroid_gimbal_hint() -> None:
+                try:
+                    if cc._adapter.gimbal_telemetry_ok():
+                        ah2, ap2, pid2 = cc._adapter.active_endpoint()
+                        self._append_log(f"Skydroid gimbal OK: TOP UDP {ah2}:{ap2} profile={pid2}")
+                        return
+                except Exception:
+                    pass
                 self._append_log(
                     "Skydroid gimbal: no TOP attitude yet — if RTSP works on RC Wi-Fi hotspot, "
                     "set Host to the RC gateway (e.g. 192.168.43.1) or connect PC Ethernet to the camera"
                 )
+
+            QTimer.singleShot(4000, _skydroid_gimbal_hint)
             return
         cc = MavlinkCameraControl(self._thread)
         self._wire_camera_control(cc)

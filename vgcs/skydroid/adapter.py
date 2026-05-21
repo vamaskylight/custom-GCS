@@ -14,6 +14,7 @@ from vgcs.skydroid.protocol import (
 from vgcs.skydroid.transport import TopUdpTransport
 
 _C13_PROBE_PORTS = (5000, 14550, 14551)
+_PROBE_TIMEOUT_S = 0.12
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,9 @@ class SkydroidTopUdpAdapter:
         self._running = False
         self._worker: threading.Thread | None = None
         self._status_poller: threading.Thread | None = None
+        self._probe_thread: threading.Thread | None = None
+        self._probe_finished = threading.Event()
+        self._probe_finished.set()
         self._min_dt = 1.0 / max(1.0, float(rate_limit_hz))
         self._last_send_mono = 0.0
         self._active_port = int(port)
@@ -72,16 +76,26 @@ class SkydroidTopUdpAdapter:
         with self._status_lock:
             return bool(self._status.supported)
 
+    def get_status_cached(self) -> GimbalStatus:
+        with self._status_lock:
+            return self._status
+
+    def get_status(self) -> GimbalStatus:
+        """Non-blocking: returns last background poll result (safe on UI thread)."""
+        return self.get_status_cached()
+
     def start(self) -> None:
         if self._running:
             return
         self._running = True
+        self._probe_finished.clear()
         self._transport.start_listener()
-        self._probe_endpoints()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
         self._status_poller = threading.Thread(target=self._status_loop, daemon=True)
         self._status_poller.start()
+        self._probe_thread = threading.Thread(target=self._probe_endpoints_bg, daemon=True)
+        self._probe_thread.start()
 
     def stop(self) -> None:
         self._running = False
@@ -116,32 +130,45 @@ class SkydroidTopUdpAdapter:
         key = "focus_in" if int(direction) < 0 else "focus_out"
         self._enqueue(self._profile.camera_commands.get(key, []), {}, True)
 
-    def get_status(self) -> GimbalStatus:
-        with self._status_lock:
-            st = self._status
-        if not st.supported or (time.monotonic() - float(st.updated_mono or 0.0)) > 2.0:
-            self.poll_attitude_now()
-            with self._status_lock:
-                return self._status
-        return st
-
     def poll_attitude_now(self) -> GimbalStatus | None:
+        """Blocking poll — background threads only (never call from UI thread)."""
         for host in self._hosts:
             self._transport._host = host
-            for status_cmd in self._profile.status_commands:
-                try:
-                    frame = build_top_frame(status_cmd, {})
-                    reply = self._transport.send_and_receive(
-                        frame, expect_reply=True, log=False
-                    )
-                    self._maybe_update_status(reply)
-                    with self._status_lock:
-                        if self._status.supported:
-                            self._active_host = host
-                            return self._status
-                except Exception:
-                    continue
+            if self._poll_host_once(host):
+                with self._status_lock:
+                    if self._status.supported:
+                        self._active_host = host
+                        return self._status
         return None
+
+    def _poll_host_once(self, host: str) -> bool:
+        self._transport._host = host
+        for status_cmd in self._profile.status_commands:
+            try:
+                frame = build_top_frame(status_cmd, {})
+                reply = self._transport.send_and_receive(
+                    frame,
+                    expect_reply=True,
+                    log=False,
+                    timeout_s=_PROBE_TIMEOUT_S,
+                )
+                self._maybe_update_status(reply)
+                with self._status_lock:
+                    return bool(self._status.supported)
+            except Exception:
+                continue
+        return False
+
+    def _poll_active_endpoint_once(self) -> None:
+        self._transport._host = self._active_host
+        self._transport._port = self._active_port
+        self._poll_host_once(self._active_host)
+
+    def _probe_endpoints_bg(self) -> None:
+        try:
+            self._probe_endpoints()
+        finally:
+            self._probe_finished.set()
 
     def _probe_endpoints(self) -> None:
         """Find host/port/profile that returns GAA/GAC/GAY attitude (C13 + RC gateway paths)."""
@@ -160,7 +187,7 @@ class SkydroidTopUdpAdapter:
                 self._transport._host = host
                 for port in ports:
                     self._transport._port = int(port)
-                    if self.poll_attitude_now() is not None:
+                    if self._poll_host_once(host):
                         self._active_host = host
                         self._active_port = int(port)
                         self._profile_id = profile.profile_id
@@ -214,8 +241,11 @@ class SkydroidTopUdpAdapter:
 
     def _status_loop(self) -> None:
         while self._running:
-            self.poll_attitude_now()
-            time.sleep(0.5)
+            if not self._probe_finished.wait(timeout=0.25):
+                continue
+            self._poll_active_endpoint_once()
+            interval = 1.0 if not self.gimbal_telemetry_ok() else 0.5
+            time.sleep(interval)
 
     def _maybe_update_status(self, payload: bytes) -> None:
         dec = parse_top_frame(payload)
