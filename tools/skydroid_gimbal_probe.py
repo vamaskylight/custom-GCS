@@ -17,7 +17,8 @@ from vgcs.skydroid.command_map import SKYDROID_PROFILES
 from vgcs.skydroid.protocol import build_top_frame, extract_attitude_deg, parse_top_frame
 from vgcs.skydroid.targets import local_ipv4_for_target
 
-_PORTS = (5000, 14550, 14551)
+_DEFAULT_PORTS = (19856, 5000, 14550, 14551)
+_DEFAULT_HOSTS = "192.168.144.12,192.168.144.108,192.168.43.1"
 
 
 def _print_network_context(hosts: list[str]) -> None:
@@ -92,8 +93,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Skydroid C13 TOP UDP gimbal probe")
     ap.add_argument(
         "--hosts",
-        default="192.168.43.1,192.168.144.108",
+        default=_DEFAULT_HOSTS,
         help="Comma-separated IPs to try",
+    )
+    ap.add_argument(
+        "--ports",
+        default="",
+        help="Comma-separated UDP ports (default: 19856,5000,14550,14551)",
     )
     ap.add_argument("--profile", default="c13_default", choices=sorted(SKYDROID_PROFILES))
     ap.add_argument("--timeout", type=float, default=0.35)
@@ -111,17 +117,23 @@ def main() -> int:
     )
     args = ap.parse_args()
     hosts = [h.strip() for h in str(args.hosts).split(",") if h.strip()]
+    ports_raw = str(args.ports or "").strip()
+    ports = (
+        tuple(int(p.strip()) for p in ports_raw.split(",") if p.strip())
+        if ports_raw
+        else _DEFAULT_PORTS
+    )
     profiles = [str(args.profile)]
     if bool(args.try_alt_profile) and "c13_alt" not in profiles:
         profiles.append("c13_alt")
-    print(f"[probe] hosts={hosts} ports={_PORTS} profiles={profiles}")
+    print(f"[probe] hosts={hosts} ports={ports} profiles={profiles}")
     _print_network_context(hosts)
     for profile_id in profiles:
         if len(profiles) > 1:
             print(f"\n--- profile {profile_id} ---")
         for host in hosts:
             print(f"\n=== {host} ===")
-            for port in _PORTS:
+            for port in ports:
                 print(f"port {port}:")
                 if _probe(host, int(port), profile_id, float(args.timeout)):
                     print(
