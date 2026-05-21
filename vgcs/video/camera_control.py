@@ -152,7 +152,62 @@ class MavlinkCameraControl:
             return
 
     def get_gimbal_status(self) -> GimbalStatus | None:
+        try:
+            getter = getattr(self._t, "get_cached_gimbal_status", None)
+            if callable(getter):
+                return getter()
+        except Exception:
+            pass
         return None
+
+
+def resolve_skydroid_host(settings, *, default: str = "192.168.144.108") -> str:
+    """Skydroid C13 companion IP from settings or RTSP URL (manual §5.3: 192.168.144.108)."""
+    host = str(settings.value("camera/skydroid_host", "") or "").strip()
+    if host:
+        return host
+    for key in ("video/rtsp_day", "video/rtsp_thermal"):
+        url = str(settings.value(key, "") or "").strip()
+        if url.lower().startswith("rtsp://"):
+            parsed = urlparse(url)
+            if parsed.hostname:
+                return str(parsed.hostname)
+    return str(default)
+
+
+class CompositeGimbalCameraControl:
+    """Primary camera backend with optional MAVLink gimbal attitude fallback for M7 reports."""
+
+    def __init__(self, primary: CameraControl, mavlink_thread=None) -> None:
+        self._primary = primary
+        self._mavlink = mavlink_thread
+
+    def close(self) -> None:
+        close = getattr(self._primary, "close", None)
+        if callable(close):
+            close()
+
+    def get_gimbal_status(self) -> GimbalStatus | None:
+        st: GimbalStatus | None = None
+        try:
+            st = self._primary.get_gimbal_status()
+        except Exception:
+            st = None
+        if st is not None and bool(getattr(st, "supported", False)):
+            return st
+        if self._mavlink is not None:
+            try:
+                getter = getattr(self._mavlink, "get_cached_gimbal_status", None)
+                if callable(getter):
+                    st2 = getter()
+                    if st2 is not None and bool(getattr(st2, "supported", False)):
+                        return st2
+            except Exception:
+                pass
+        return st
+
+    def __getattr__(self, name: str):
+        return getattr(self._primary, name)
 
 
 class SkydroidCameraControl:
@@ -240,7 +295,11 @@ class SkydroidCameraControl:
 
     def get_gimbal_status(self) -> GimbalStatus | None:
         try:
-            return self._adapter.get_status()
+            st = self._adapter.get_status()
+            if st is not None and bool(getattr(st, "supported", False)):
+                return st
+            polled = self._adapter.poll_attitude_now()
+            return polled if polled is not None else st
         except Exception:
             return None
 

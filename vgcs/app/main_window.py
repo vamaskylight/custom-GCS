@@ -68,11 +68,13 @@ from vgcs.link.mavlink_thread import MavlinkThread
 from vgcs.video.pipeline import VideoPipeline
 from vgcs.video.widgets import CameraControlPanel, SplitVideoPanel
 from vgcs.video.camera_control import (
+    CompositeGimbalCameraControl,
     MavlinkCameraControl,
     NoopCameraControl,
     SiyiCameraControl,
     SkydroidCameraControl,
     resolve_siyi_host,
+    resolve_skydroid_host,
 )
 
 
@@ -451,6 +453,17 @@ class MainWindow(QMainWindow):
             "",
             "Disconnected - Click to manually connect 💬",
         )
+        # Skydroid/SIYI gimbal polling must run before MAVLink connect (M7 Target reports).
+        QTimer.singleShot(800, self._set_runtime_camera_control)
+
+    def _wire_camera_control(self, cc: object) -> None:
+        wrapped = CompositeGimbalCameraControl(cc, self._thread)
+        self._camera_control_backend = wrapped
+        self._map_widget.set_camera_control(wrapped)
+        try:
+            self._camera_panel.set_camera_control(wrapped)
+        except Exception:
+            pass
 
     def _detect_compact_ui(self) -> bool:
         screen = QGuiApplication.primaryScreen()
@@ -1908,53 +1921,119 @@ class MainWindow(QMainWindow):
         vb.addWidget(conn_group)
 
         camera_group = QGroupBox("Camera / gimbal control")
-        sdg = QGridLayout()
-        sdg.addWidget(QLabel("Control provider"), 0, 0)
+        cam_outer = QVBoxLayout()
+        cam_outer.setSpacing(10)
+        cam_row = QHBoxLayout()
+        cam_row.addWidget(QLabel("Control provider"))
         camera_provider = QComboBox()
         camera_provider.addItem("MAVLink (ArduPilot mount)", "mavlink")
         camera_provider.addItem("SIYI SDK UDP (ZR10, ZT6, …)", "siyi")
         camera_provider.addItem("Skydroid TOP UDP (C13)", "skydroid")
-        sdg.addWidget(camera_provider, 0, 1)
-        camera_hint = QLabel(
-            "ZR10: use SIYI SDK on UDP port 37260 (same IP as RTSP, usually 192.168.144.25). "
-            "Skydroid C13 uses TOP UDP port 5000 — not the ZR10 gimbal protocol."
-        )
+        camera_provider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        cam_row.addWidget(camera_provider, 1)
+        cam_outer.addLayout(cam_row)
+
+        camera_hint = QLabel()
         camera_hint.setWordWrap(True)
         camera_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
-        sdg.addWidget(camera_hint, 1, 0, 1, 2)
-        sdg.addWidget(QLabel("SIYI host/IP"), 2, 0)
+        cam_outer.addWidget(camera_hint)
+
+        _hint_style = "color: #c8d0e0; font-size: 12px;"
+
+        mavlink_panel = QWidget()
+        mavlink_lay = QVBoxLayout(mavlink_panel)
+        mavlink_lay.setContentsMargins(0, 4, 0, 0)
+        mavlink_info = QLabel(
+            "Gimbal and camera commands go through the flight controller (ArduPilot mount / MAV_CMD).\n"
+            "M7 observation reports use MAVLink gimbal attitude when the FC publishes it.\n"
+            "No extra camera IP or UDP settings are required."
+        )
+        mavlink_info.setWordWrap(True)
+        mavlink_info.setStyleSheet(_hint_style)
+        mavlink_lay.addWidget(mavlink_info)
+
+        siyi_panel = QWidget()
+        siyi_grid = QGridLayout(siyi_panel)
+        siyi_grid.setContentsMargins(0, 4, 0, 0)
+        siyi_grid.setHorizontalSpacing(12)
+        siyi_grid.setVerticalSpacing(8)
         siyi_host = QLineEdit()
-        siyi_host.setPlaceholderText("Empty = use RTSP hostname or 192.168.144.25")
-        sdg.addWidget(siyi_host, 2, 1)
-        sdg.addWidget(QLabel("SIYI UDP port"), 3, 0)
+        siyi_host.setPlaceholderText("Empty = RTSP hostname or 192.168.144.25")
         siyi_port = QSpinBox()
         siyi_port.setRange(1, 65535)
         siyi_port.setValue(37260)
-        sdg.addWidget(siyi_port, 3, 1)
-        sdg.addWidget(QLabel("SIYI timeout (ms)"), 4, 0)
         siyi_timeout = QSpinBox()
         siyi_timeout.setRange(50, 5000)
         siyi_timeout.setValue(250)
-        sdg.addWidget(siyi_timeout, 4, 1)
-        sdg.addWidget(QLabel("Skydroid host/IP"), 5, 0)
+        siyi_grid.addWidget(QLabel("Host / IP"), 0, 0)
+        siyi_grid.addWidget(siyi_host, 0, 1)
+        siyi_grid.addWidget(QLabel("UDP port"), 1, 0)
+        siyi_grid.addWidget(siyi_port, 1, 1)
+        siyi_grid.addWidget(QLabel("Timeout (ms)"), 2, 0)
+        siyi_grid.addWidget(siyi_timeout, 2, 1)
+        siyi_grid.setColumnStretch(1, 1)
+
+        skydroid_panel = QWidget()
+        skydroid_grid = QGridLayout(skydroid_panel)
+        skydroid_grid.setContentsMargins(0, 4, 0, 0)
+        skydroid_grid.setHorizontalSpacing(12)
+        skydroid_grid.setVerticalSpacing(8)
         skydroid_host = QLineEdit()
-        sdg.addWidget(skydroid_host, 5, 1)
-        sdg.addWidget(QLabel("Skydroid UDP port"), 6, 0)
+        skydroid_host.setPlaceholderText("Empty = RTSP host or 192.168.144.108")
         skydroid_port = QSpinBox()
         skydroid_port.setRange(1, 65535)
         skydroid_port.setValue(5000)
-        sdg.addWidget(skydroid_port, 6, 1)
-        sdg.addWidget(QLabel("Skydroid timeout (ms)"), 7, 0)
         skydroid_timeout = QSpinBox()
         skydroid_timeout.setRange(50, 5000)
         skydroid_timeout.setValue(250)
-        sdg.addWidget(skydroid_timeout, 7, 1)
-        sdg.addWidget(QLabel("Skydroid firmware profile"), 8, 0)
         skydroid_profile = QComboBox()
         skydroid_profile.addItem("C13 Default (GAA/GSY/GAY)", "c13_default")
         skydroid_profile.addItem("C13 Alternate (GAC/GSP/GAP)", "c13_alt")
-        sdg.addWidget(skydroid_profile, 8, 1)
-        camera_group.setLayout(sdg)
+        skydroid_grid.addWidget(QLabel("Host / IP"), 0, 0)
+        skydroid_grid.addWidget(skydroid_host, 0, 1)
+        skydroid_grid.addWidget(QLabel("UDP port"), 1, 0)
+        skydroid_grid.addWidget(skydroid_port, 1, 1)
+        skydroid_grid.addWidget(QLabel("Timeout (ms)"), 2, 0)
+        skydroid_grid.addWidget(skydroid_timeout, 2, 1)
+        skydroid_grid.addWidget(QLabel("Firmware profile"), 3, 0)
+        skydroid_grid.addWidget(skydroid_profile, 3, 1)
+        skydroid_grid.setColumnStretch(1, 1)
+
+        camera_stack = QStackedWidget()
+        camera_stack.addWidget(mavlink_panel)
+        camera_stack.addWidget(siyi_panel)
+        camera_stack.addWidget(skydroid_panel)
+        cam_outer.addWidget(camera_stack)
+
+        _CAMERA_PROVIDER_HINTS: dict[str, str] = {
+            "mavlink": (
+                "ArduPilot mount control over MAVLink. Connect the FC link before using gimbal buttons or M7 gimbal columns."
+            ),
+            "siyi": (
+                "SIYI gimbal SDK (ZR10, ZT6, A8 mini): UDP port 37260 on the camera IP — usually the same host as your RTSP URL."
+            ),
+            "skydroid": (
+                "Skydroid C13: TOP UDP port 5000 on 192.168.144.108 (manual). RTSP :554 / :555. "
+                "Port 14551 is often radio MAVLink, not TOP attitude."
+            ),
+        }
+        _CAMERA_STACK_INDEX = {"mavlink": 0, "siyi": 1, "skydroid": 2}
+        _RTSP_PLACEHOLDER = {
+            "mavlink": "rtsp://host/stream or udp://0.0.0.0:5600",
+            "siyi": "SIYI ZR10: rtsp://192.168.144.25:8554/main.264",
+            "skydroid": "Skydroid C13: rtsp://192.168.144.108:554/stream=1",
+        }
+
+        def _sync_camera_provider_ui() -> None:
+            pid = str(camera_provider.currentData() or "mavlink")
+            camera_stack.setCurrentIndex(_CAMERA_STACK_INDEX.get(pid, 0))
+            camera_hint.setText(_CAMERA_PROVIDER_HINTS.get(pid, ""))
+            rtsp_day.setPlaceholderText(_RTSP_PLACEHOLDER.get(pid, _RTSP_PLACEHOLDER["mavlink"]))
+
+        camera_provider.currentIndexChanged.connect(lambda _idx: _sync_camera_provider_ui())
+        _sync_camera_provider_ui()
+
+        camera_group.setLayout(cam_outer)
         vb.addWidget(camera_group)
 
         settings_group = QGroupBox("Settings")
@@ -2059,6 +2138,7 @@ class MainWindow(QMainWindow):
             siyi_timeout.setValue(int(s.value("camera/siyi_timeout_ms", 250) or 250))
         except Exception:
             siyi_timeout.setValue(250)
+        _sync_camera_provider_ui()
 
         def _apply() -> None:
             # Return immediately from the click handler so Windows gets a repainted frame.
@@ -2820,43 +2900,31 @@ class MainWindow(QMainWindow):
                 port=port,
                 timeout_s=max(0.05, float(timeout_ms) / 1000.0),
             )
-            self._camera_control_backend = cc
-            self._map_widget.set_camera_control(cc)
-            try:
-                self._camera_panel.set_camera_control(cc)
-            except Exception:
-                pass
+            self._wire_camera_control(cc)
             self._append_log(f"Camera control: SIYI SDK UDP {host}:{port} (gimbal attitude 0x0D)")
             return
         if provider == "skydroid":
-            host = str(self._settings.value("camera/skydroid_host", "") or "").strip()
+            host = resolve_skydroid_host(self._settings)
             port = int(self._settings.value("camera/skydroid_port", 5000) or 5000)
             timeout_ms = int(self._settings.value("camera/skydroid_timeout_ms", 250) or 250)
             profile_id = str(self._settings.value("camera/skydroid_profile", "c13_default") or "c13_default")
-            if host:
-                cc = SkydroidCameraControl(
-                    host=host,
-                    port=port,
-                    timeout_s=max(0.05, float(timeout_ms) / 1000.0),
-                    log_path=str(Path.cwd() / "logs" / "skydroid_top_udp.log"),
-                    profile_id=profile_id,
-                )
-                self._camera_control_backend = cc
-                self._map_widget.set_camera_control(cc)
-                try:
-                    self._camera_panel.set_camera_control(cc)
-                except Exception:
-                    pass
-                self._append_log(f"Camera control: Skydroid TOP UDP {host}:{port} profile={profile_id}")
-                return
-            self._append_log("Camera control: Skydroid selected but host is empty, fallback to MAVLink")
+            cc = SkydroidCameraControl(
+                host=host,
+                port=port,
+                timeout_s=max(0.05, float(timeout_ms) / 1000.0),
+                log_path=str(Path.cwd() / "logs" / "skydroid_top_udp.log"),
+                profile_id=profile_id,
+            )
+            self._wire_camera_control(cc)
+            active_port = int(getattr(cc._adapter, "_active_port", port) or port)
+            self._append_log(
+                f"Camera control: Skydroid TOP UDP {host}:{active_port} profile={profile_id} "
+                f"(poll GAA/GAC; MAVLink mount used as fallback)"
+            )
+            return
         cc = MavlinkCameraControl(self._thread)
-        self._camera_control_backend = cc
-        self._map_widget.set_camera_control(cc)
-        try:
-            self._camera_panel.set_camera_control(cc)
-        except Exception:
-            pass
+        self._wire_camera_control(cc)
+        self._append_log("Camera control: MAVLink mount / gimbal attitude")
 
     def _on_link_up(self) -> None:
         self._map_widget.clear_flight_track()
