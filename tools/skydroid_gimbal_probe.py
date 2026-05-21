@@ -143,7 +143,8 @@ def main() -> int:
                     return 0
                 time.sleep(0.05)
     if float(args.listen) > 0:
-        _listen_udp(5000, float(args.listen))
+        listen_port = int(ports[0]) if ports else 19856
+        _listen_udp(listen_port, float(args.listen))
     print("\nFAILED: no TOP attitude on any host/port. Video RTSP can still work.")
     print("Conclusion: this PC path cannot reach C13 gimbal UDP (not a VGCS bug).")
     print("Next steps:")
