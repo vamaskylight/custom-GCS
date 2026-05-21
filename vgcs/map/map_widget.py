@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import (
     QBrush,
+    QDesktopServices,
     QFont,
     QIcon,
     QImage,
@@ -1511,8 +1512,9 @@ class MapWidget(QWidget):
                 pos = event.position()
                 xn, yn = self._native_video_click_norm(pos)
                 self._log_observation("video_mark", video_x=xn, video_y=yn)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[VGCS:observe] video mark failed: {e}")
+                self._set_status(f"Video mark failed: {e}")
             return
         was_swapped = bool(getattr(self, "_video_swapped", False))
         split_on = bool(getattr(self, "_video_split_enabled", False))
@@ -5139,7 +5141,7 @@ class MapWidget(QWidget):
             pass
         if enabled:
             self._set_status(
-                "Observation mark mode ON: click map, minimap, or video (no layout swap)"
+                "Target ON: click video feed (or map) to add marks, then Report to export"
             )
         else:
             self._set_status("Observation mark mode OFF")
@@ -5187,7 +5189,6 @@ class MapWidget(QWidget):
         capture_snapshot: bool = True,
     ) -> None:
         ts = datetime.now(timezone.utc).isoformat()
-        snap = self._capture_photo_quick() if capture_snapshot else ""
         row: dict[str, object] = {
             "timestamp_utc": ts,
             "kind": str(kind),
@@ -5195,11 +5196,21 @@ class MapWidget(QWidget):
             "map_lon": map_lon,
             "video_x_norm": video_x,
             "video_y_norm": video_y,
-            "snapshot_path": snap or "",
+            "snapshot_path": "",
             "clip_path": str(clip_path or "").strip(),
         }
         row.update(self._observation_context())
         self._observations.append(row)
+        idx = len(self._observations) - 1
+        if capture_snapshot:
+            QTimer.singleShot(0, lambda i=idx: self._fill_observation_snapshot(i))
+        try:
+            print(
+                f"[VGCS:observe] logged {kind} count={len(self._observations)} "
+                f"video=({video_x},{video_y}) map=({map_lat},{map_lon})"
+            )
+        except Exception:
+            pass
         msg = f"Observation logged ({len(self._observations)}): {kind}"
         if row.get("vehicle_lat") is None or row.get("vehicle_lon") is None:
             fix = int(row.get("gps_fix_type") or 0)
@@ -5229,6 +5240,26 @@ class MapWidget(QWidget):
                 self._native_video_overlay.set_video_marks(self._video_obs_marks)
             except Exception:
                 pass
+
+    def _fill_observation_snapshot(self, idx: int) -> None:
+        """Deferred still capture so Target clicks register immediately (RTSP/ffmpeg can block)."""
+        if idx < 0 or idx >= len(self._observations):
+            return
+        try:
+            snap = self._capture_photo_quick()
+            if snap:
+                self._observations[idx]["snapshot_path"] = str(snap)
+        except Exception:
+            pass
+
+    def _observation_export_dir(self) -> Path:
+        base = Path.cwd()
+        try:
+            if not base.exists():
+                base = Path.home()
+        except Exception:
+            base = Path.home()
+        return (base / "captures" / "observations").resolve()
 
     def _capture_observation_clip(self) -> None:
         ok = self._ensure_video_preview_backend()
@@ -5353,17 +5384,27 @@ class MapWidget(QWidget):
         self._set_status(f"Cleared observations: {n}")
 
     def _export_observations(self, *, quick: bool = False) -> None:
-        if not self._observations:
-            self._set_status("No observations to export")
+        n = len(self._observations)
+        if n == 0:
+            msg = (
+                "No observation marks yet. Turn Target ON, then click the video (or map) "
+                "to place at least one mark before Report."
+            )
+            self._set_status(msg)
+            print(f"[VGCS:observe] export skipped: {msg}")
+            if quick:
+                QMessageBox.warning(self, "Observation Report", msg)
             return
         suggested = f"observations_{time.strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = ""
         if quick:
-            out_dir = Path.cwd() / "captures" / "observations"
+            out_dir = self._observation_export_dir()
             try:
                 out_dir.mkdir(parents=True, exist_ok=True)
             except Exception as e:
                 self._set_status(f"Observation export failed: {e}")
+                print(f"[VGCS:observe] export failed: {e}")
+                QMessageBox.warning(self, "Observation Report", f"Could not create folder:\n{e}")
                 return
             csv_path = str(out_dir / suggested)
         else:
@@ -5413,10 +5454,19 @@ class MapWidget(QWidget):
             html_path = ""
             self._set_status(f"Observations exported (CSV only): {csv_path} — HTML failed: {e}")
             return
-        if html_path:
-            self._set_status(f"Observations exported: {csv_path} | {html_path}")
-        else:
-            self._set_status(f"Observations exported: {csv_path}")
+        csv_abs = str(Path(csv_path).resolve())
+        html_abs = str(Path(html_path).resolve()) if html_path else ""
+        summary = f"Exported {n} observation(s):\n{csv_abs}"
+        if html_abs:
+            summary += f"\n{html_abs}"
+        self._set_status(f"Observations exported: {csv_abs}" + (f" | {html_abs}" if html_abs else ""))
+        print(f"[VGCS:observe] export ok entries={n} csv={csv_abs} html={html_abs or '-'}")
+        if quick:
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(csv_abs).parent)))
+            except Exception:
+                pass
+            QMessageBox.information(self, "Observation Report", summary)
 
     def _write_observation_html_summary(self, path: str) -> None:
         rows = []
