@@ -142,6 +142,7 @@ class SkydroidTopUdpAdapter:
         return None
 
     def _poll_host_once(self, host: str) -> bool:
+        self._transport.set_route_host(host)
         self._transport._host = host
         for status_cmd in self._profile.status_commands:
             try:
@@ -180,22 +181,32 @@ class SkydroidTopUdpAdapter:
         profiles: list[SkydroidCommandProfile] = [self._profile]
         if self._profile.profile_id != "c13_alt":
             profiles.append(get_profile("c13_alt"))
+        tried: list[str] = []
         for profile in profiles:
             prev = self._profile
             self._profile = profile
             for host in self._hosts:
+                self._transport.set_route_host(host)
                 self._transport._host = host
                 for port in ports:
                     self._transport._port = int(port)
+                    tried.append(f"{host}:{port}")
                     if self._poll_host_once(host):
                         self._active_host = host
                         self._active_port = int(port)
                         self._profile_id = profile.profile_id
+                        print(
+                            f"[VGCS:skydroid] gimbal OK via {host}:{port} profile={profile.profile_id}"
+                        )
                         return
             self._profile = prev
         self._profile_id = self._profile.profile_id
         self._transport._host = self._active_host
         self._transport._port = configured
+        print(
+            f"[VGCS:skydroid] gimbal probe failed ({len(tried)} tries). "
+            f"See logs/skydroid_top_udp.log — RTSP can work without TOP UDP from this PC."
+        )
 
     def _enqueue(self, commands: list[str], params: dict[str, object], expect_reply: bool) -> None:
         if not commands:

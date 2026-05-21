@@ -6,6 +6,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from vgcs.skydroid.targets import local_ipv4_for_target
+
 
 def begin_skydroid_session_log(
     log_path: str,
@@ -51,21 +53,59 @@ class TopUdpTransport:
         self._listener: threading.Thread | None = None
         self._on_datagram = None
         self._listener_paused = False
+        self._bind_ip = ""
 
     def set_datagram_handler(self, handler) -> None:
         self._on_datagram = handler
 
-    def open(self) -> None:
+    def _reopen_socket(self) -> None:
         with self._lock:
             if self._sock is not None:
-                return
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(self._timeout_s)
+            lip = str(self._bind_ip or "").strip()
             try:
-                sock.bind(("", 0))
+                if lip:
+                    sock.bind((lip, 0))
+                else:
+                    sock.bind(("", 0))
             except Exception:
-                pass
+                try:
+                    sock.bind(("", 0))
+                except Exception:
+                    pass
             self._sock = sock
+
+    def set_route_host(self, host: str) -> None:
+        """Re-bind UDP socket on the NIC used to reach ``host`` (hotspot + camera LAN)."""
+        lip = local_ipv4_for_target(host) or ""
+        if lip == self._bind_ip and self._sock is not None:
+            return
+        self._bind_ip = lip
+        was_listening = self._listener_running
+        if was_listening:
+            self._listener_running = False
+            if self._listener is not None:
+                try:
+                    self._listener.join(timeout=0.5)
+                except Exception:
+                    pass
+                self._listener = None
+        self._reopen_socket()
+        if was_listening:
+            self.start_listener()
+
+    def open(self) -> None:
+        if self._sock is not None:
+            return
+        self.set_route_host(self._host)
+        if self._sock is None:
+            self._reopen_socket()
 
     def close(self) -> None:
         self._listener_running = False
