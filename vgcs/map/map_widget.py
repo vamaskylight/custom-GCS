@@ -5153,8 +5153,14 @@ class MapWidget(QWidget):
         try:
             st = self._camera_control.get_gimbal_status()
             if st is not None and bool(getattr(st, "supported", False)):
-                gimbal_yaw = getattr(st, "yaw_deg", None)
-                gimbal_pitch = getattr(st, "pitch_deg", None)
+                yaw = getattr(st, "yaw_deg", None)
+                pitch = getattr(st, "pitch_deg", None)
+                if yaw is not None or pitch is not None:
+                    if not (
+                        abs(float(yaw or 0.0)) < 0.05 and abs(float(pitch or 0.0)) < 0.05
+                    ):
+                        gimbal_yaw = yaw
+                        gimbal_pitch = pitch
         except Exception:
             pass
         v_lat = self._lat
@@ -5468,6 +5474,14 @@ class MapWidget(QWidget):
                 pass
             QMessageBox.information(self, "Observation Report", summary)
 
+    def _obs_cell(self, val: object) -> str:
+        if val is None:
+            return "N/A"
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return "N/A"
+        s = str(val).strip()
+        return s if s else "N/A"
+
     def _write_observation_html_summary(self, path: str) -> None:
         rows = []
         for idx, row in enumerate(self._observations, start=1):
@@ -5480,8 +5494,8 @@ class MapWidget(QWidget):
                 f"<td>{row.get('map_lon','')}</td>"
                 f"<td>{row.get('vehicle_lat','')}</td>"
                 f"<td>{row.get('vehicle_lon','')}</td>"
-                f"<td>{row.get('gimbal_yaw_deg','')}</td>"
-                f"<td>{row.get('gimbal_pitch_deg','')}</td>"
+                f"<td>{self._obs_cell(row.get('gimbal_yaw_deg'))}</td>"
+                f"<td>{self._obs_cell(row.get('gimbal_pitch_deg'))}</td>"
                 f"<td>{row.get('video_x_norm','')}</td>"
                 f"<td>{row.get('video_y_norm','')}</td>"
                 f"<td>{row.get('vehicle_rel_alt_m','')}</td>"

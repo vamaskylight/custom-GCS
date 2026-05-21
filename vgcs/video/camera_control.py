@@ -200,7 +200,14 @@ class CompositeGimbalCameraControl:
                 if callable(getter):
                     st2 = getter()
                     if st2 is not None and bool(getattr(st2, "supported", False)):
-                        return st2
+                        yaw = getattr(st2, "yaw_deg", None)
+                        pitch = getattr(st2, "pitch_deg", None)
+                        if yaw is not None or pitch is not None:
+                            if not (
+                                abs(float(yaw or 0.0)) < 0.05
+                                and abs(float(pitch or 0.0)) < 0.05
+                            ):
+                                return st2
             except Exception:
                 pass
         return st

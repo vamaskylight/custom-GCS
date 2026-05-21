@@ -80,6 +80,9 @@ class MavlinkThread(QThread):
     def _update_gimbal_cache(self, yaw_deg: float | None, pitch_deg: float | None) -> None:
         if yaw_deg is None and pitch_deg is None:
             return
+        # Many stacks publish 0/0 when no gimbal is connected — do not treat as real attitude.
+        if abs(float(yaw_deg or 0.0)) < 0.05 and abs(float(pitch_deg or 0.0)) < 0.05:
+            return
         with self._gimbal_lock:
             self._gimbal_status = GimbalStatus(
                 yaw_deg=yaw_deg,
@@ -977,6 +980,27 @@ class MavlinkThread(QThread):
                     0.0,
                     0.0,
                 )
+            # Skydroid / companion camera (sys=250 comp=190) may publish mount attitude separately.
+            for cam_sys, cam_comp in ((250, 190),):
+                if (cam_sys, cam_comp) == (ts, tc):
+                    continue
+                try:
+                    self._master.mav.command_long_send(
+                        cam_sys,
+                        cam_comp,
+                        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                        0,
+                        float(mavutil.mavlink.MAVLINK_MSG_ID_MOUNT_ORIENTATION),
+                        float(mount_interval_us),
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 
