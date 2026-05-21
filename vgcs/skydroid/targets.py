@@ -1,9 +1,31 @@
 from __future__ import annotations
 
 import re
+import socket
 import subprocess
 import sys
 from urllib.parse import urlparse
+
+
+def local_ipv4_for_target(host: str) -> str | None:
+    """Pick the local IPv4 the OS would use to reach ``host`` (multi-NIC laptops)."""
+    h = str(host or "").strip()
+    if not h:
+        return None
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((h, 9))
+        ip = str(probe.getsockname()[0] or "").strip()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        return None
+    finally:
+        try:
+            probe.close()
+        except Exception:
+            pass
+    return None
 
 
 def _ipv4_gateways_from_ipconfig() -> list[str]:
