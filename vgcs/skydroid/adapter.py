@@ -28,7 +28,8 @@ class SkydroidTopUdpAdapter:
     def __init__(
         self,
         *,
-        host: str,
+        host: str = "",
+        hosts: list[str] | None = None,
         port: int = 5000,
         timeout_s: float = 0.25,
         retries: int = 1,
@@ -36,11 +37,26 @@ class SkydroidTopUdpAdapter:
         log_path: str = "",
         profile_id: str = "c13_default",
     ) -> None:
-        self._transport = TopUdpTransport(host, port, timeout_s=timeout_s, retries=retries, log_path=log_path)
+        merged: list[str] = []
+        for h in [str(host or "").strip(), *(hosts or [])]:
+            if h and h not in merged:
+                merged.append(h)
+        if not merged:
+            merged.append("192.168.144.108")
+        self._hosts = merged
+        self._active_host = merged[0]
+        self._transport = TopUdpTransport(
+            self._active_host,
+            port,
+            timeout_s=timeout_s,
+            retries=retries,
+            log_path=log_path,
+        )
         self._queue: queue.Queue[tuple[list[str], dict[str, object], bool]] = queue.Queue(maxsize=128)
         self._status = GimbalStatus()
         self._status_lock = threading.Lock()
         self._profile: SkydroidCommandProfile = get_profile(profile_id)
+        self._profile_id = str(profile_id or "c13_default")
         self._running = False
         self._worker: threading.Thread | None = None
         self._status_poller: threading.Thread | None = None
@@ -49,12 +65,19 @@ class SkydroidTopUdpAdapter:
         self._active_port = int(port)
         self._transport.set_datagram_handler(self._maybe_update_status)
 
+    def active_endpoint(self) -> tuple[str, int, str]:
+        return (str(self._active_host), int(self._active_port), str(self._profile_id))
+
+    def gimbal_telemetry_ok(self) -> bool:
+        with self._status_lock:
+            return bool(self._status.supported)
+
     def start(self) -> None:
         if self._running:
             return
         self._running = True
         self._transport.start_listener()
-        self._probe_ports()
+        self._probe_endpoints()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
         self._status_poller = threading.Thread(target=self._status_loop, daemon=True)
@@ -103,35 +126,48 @@ class SkydroidTopUdpAdapter:
         return st
 
     def poll_attitude_now(self) -> GimbalStatus | None:
-        for status_cmd in self._profile.status_commands:
-            try:
-                frame = build_top_frame(status_cmd, {})
-                reply = self._transport.send_and_receive(
-                    frame, expect_reply=True, log=False
-                )
-                self._maybe_update_status(reply)
-                with self._status_lock:
-                    if self._status.supported:
-                        return self._status
-            except Exception:
-                continue
+        for host in self._hosts:
+            self._transport._host = host
+            for status_cmd in self._profile.status_commands:
+                try:
+                    frame = build_top_frame(status_cmd, {})
+                    reply = self._transport.send_and_receive(
+                        frame, expect_reply=True, log=False
+                    )
+                    self._maybe_update_status(reply)
+                    with self._status_lock:
+                        if self._status.supported:
+                            self._active_host = host
+                            return self._status
+                except Exception:
+                    continue
         return None
 
-    def _probe_ports(self) -> None:
-        """Pick a UDP port that answers GAA/GAC (C13 may use 5000; radio forwards vary)."""
-        host = self._transport._host
-        if not host:
-            return
+    def _probe_endpoints(self) -> None:
+        """Find host/port/profile that returns GAA/GAC/GAY attitude (C13 + RC gateway paths)."""
         configured = int(self._transport._port)
-        candidates: list[int] = []
+        ports: list[int] = []
         for p in (configured, *_C13_PROBE_PORTS):
-            if p not in candidates:
-                candidates.append(int(p))
-        for port in candidates:
-            self._transport._port = int(port)
-            if self.poll_attitude_now() is not None:
-                self._active_port = int(port)
-                return
+            if int(p) not in ports:
+                ports.append(int(p))
+        profiles: list[SkydroidCommandProfile] = [self._profile]
+        if self._profile.profile_id != "c13_alt":
+            profiles.append(get_profile("c13_alt"))
+        for profile in profiles:
+            prev = self._profile
+            self._profile = profile
+            for host in self._hosts:
+                self._transport._host = host
+                for port in ports:
+                    self._transport._port = int(port)
+                    if self.poll_attitude_now() is not None:
+                        self._active_host = host
+                        self._active_port = int(port)
+                        self._profile_id = profile.profile_id
+                        return
+            self._profile = prev
+        self._profile_id = self._profile.profile_id
+        self._transport._host = self._active_host
         self._transport._port = configured
 
     def _enqueue(self, commands: list[str], params: dict[str, object], expect_reply: bool) -> None:
@@ -142,7 +178,6 @@ class SkydroidTopUdpAdapter:
         try:
             self._queue.put_nowait((list(commands), params, expect_reply))
         except queue.Full:
-            # Drop oldest pressure by consuming one, then requeue.
             try:
                 _ = self._queue.get_nowait()
             except Exception:
@@ -160,7 +195,6 @@ class SkydroidTopUdpAdapter:
                 continue
             if not self._running:
                 break
-            # Rate limit send path for continuous control.
             wait_s = self._min_dt - (time.monotonic() - self._last_send_mono)
             if wait_s > 0:
                 time.sleep(wait_s)
@@ -198,4 +232,3 @@ class SkydroidTopUdpAdapter:
                 supported=(yaw is not None or pitch is not None),
                 updated_mono=time.monotonic(),
             )
-

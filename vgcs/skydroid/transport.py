@@ -60,6 +60,10 @@ class TopUdpTransport:
                 return
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(self._timeout_s)
+            try:
+                sock.bind(("", 0))
+            except Exception:
+                pass
             self._sock = sock
 
     def close(self) -> None:

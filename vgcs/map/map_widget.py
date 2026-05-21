@@ -5210,8 +5210,8 @@ class MapWidget(QWidget):
                 msg += " — GPS fix ok but position not in map state (retry mark)"
         elif row.get("gimbal_yaw_deg") is None and row.get("gimbal_pitch_deg") is None:
             msg += (
-                " — gimbal N/A (ZR10: Application Settings → SIYI SDK UDP port 37260; "
-                "Skydroid C13: TOP UDP port 5000)"
+                " — gimbal N/A (Skydroid C13: TOP UDP port 5000; on RC hotspot try Host=RC gateway "
+                "e.g. 192.168.43.1; ZR10: SIYI SDK UDP 37260)"
             )
         self._set_status(msg)
 

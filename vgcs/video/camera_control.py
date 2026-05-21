@@ -162,17 +162,16 @@ class MavlinkCameraControl:
 
 
 def resolve_skydroid_host(settings, *, default: str = "192.168.144.108") -> str:
-    """Skydroid C13 companion IP from settings or RTSP URL (manual §5.3: 192.168.144.108)."""
-    host = str(settings.value("camera/skydroid_host", "") or "").strip()
-    if host:
-        return host
-    for key in ("video/rtsp_day", "video/rtsp_thermal"):
-        url = str(settings.value(key, "") or "").strip()
-        if url.lower().startswith("rtsp://"):
-            parsed = urlparse(url)
-            if parsed.hostname:
-                return str(parsed.hostname)
-    return str(default)
+    """Primary Skydroid TOP UDP host (first entry from resolve_skydroid_control_hosts)."""
+    hosts = resolve_skydroid_control_hosts(settings, default=default)
+    return hosts[0] if hosts else str(default)
+
+
+def resolve_skydroid_control_hosts(settings, *, default: str = "192.168.144.108") -> list[str]:
+    """Hosts to probe for C13 TOP attitude (camera IP, RTSP host, RC Wi-Fi gateway)."""
+    from vgcs.skydroid.targets import resolve_skydroid_control_hosts as _resolve
+
+    return _resolve(settings, default=default)
 
 
 class CompositeGimbalCameraControl:
@@ -215,18 +214,26 @@ class SkydroidCameraControl:
         self,
         *,
         host: str,
+        hosts: list[str] | None = None,
         port: int = 5000,
         timeout_s: float = 0.25,
-        retries: int = 1,
+        retries: int = 2,
         log_path: str = "",
         profile_id: str = "c13_default",
     ) -> None:
+        probe_hosts = list(hosts or [])
+        if host and host not in probe_hosts:
+            probe_hosts.insert(0, host)
         if log_path:
             begin_skydroid_session_log(
-                log_path, host=host, port=int(port), profile_id=profile_id
+                log_path,
+                host=probe_hosts[0] if probe_hosts else host,
+                port=int(port),
+                profile_id=profile_id,
             )
         self._adapter = SkydroidTopUdpAdapter(
-            host=host,
+            host=probe_hosts[0] if probe_hosts else host,
+            hosts=probe_hosts[1:] if len(probe_hosts) > 1 else None,
             port=port,
             timeout_s=timeout_s,
             retries=retries,
