@@ -74,6 +74,7 @@ from vgcs.video.camera_control import (
     SiyiCameraControl,
     SkydroidCameraControl,
     resolve_siyi_host,
+    resolve_skydroid_control_hosts,
     resolve_skydroid_host,
 )
 
@@ -1979,7 +1980,9 @@ class MainWindow(QMainWindow):
         skydroid_grid.setHorizontalSpacing(12)
         skydroid_grid.setVerticalSpacing(8)
         skydroid_host = QLineEdit()
-        skydroid_host.setPlaceholderText("Empty = RTSP host or 192.168.144.108")
+        skydroid_host.setPlaceholderText(
+            "Empty = RTSP host + RC Wi-Fi gateway + 192.168.144.108"
+        )
         skydroid_port = QSpinBox()
         skydroid_port.setRange(1, 65535)
         skydroid_port.setValue(5000)
@@ -2904,23 +2907,31 @@ class MainWindow(QMainWindow):
             self._append_log(f"Camera control: SIYI SDK UDP {host}:{port} (gimbal attitude 0x0D)")
             return
         if provider == "skydroid":
-            host = resolve_skydroid_host(self._settings)
+            hosts = resolve_skydroid_control_hosts(self._settings)
+            host = hosts[0] if hosts else resolve_skydroid_host(self._settings)
             port = int(self._settings.value("camera/skydroid_port", 5000) or 5000)
             timeout_ms = int(self._settings.value("camera/skydroid_timeout_ms", 250) or 250)
             profile_id = str(self._settings.value("camera/skydroid_profile", "c13_default") or "c13_default")
             cc = SkydroidCameraControl(
                 host=host,
+                hosts=hosts,
                 port=port,
                 timeout_s=max(0.05, float(timeout_ms) / 1000.0),
                 log_path=str(Path.cwd() / "logs" / "skydroid_top_udp.log"),
                 profile_id=profile_id,
             )
             self._wire_camera_control(cc)
-            active_port = int(getattr(cc._adapter, "_active_port", port) or port)
+            ah, ap, pid = cc._adapter.active_endpoint()
+            tried = ", ".join(getattr(cc._adapter, "_hosts", [])[:5])
             self._append_log(
-                f"Camera control: Skydroid TOP UDP {host}:{active_port} profile={profile_id} "
-                f"(poll GAA/GAC; MAVLink mount used as fallback)"
+                f"Camera control: Skydroid TOP UDP {ah}:{ap} profile={pid} "
+                f"(probe hosts: {tried}; MAVLink mount fallback)"
             )
+            if not cc._adapter.gimbal_telemetry_ok():
+                self._append_log(
+                    "Skydroid gimbal: no TOP attitude yet — if RTSP works on RC Wi-Fi hotspot, "
+                    "set Host to the RC gateway (e.g. 192.168.43.1) or connect PC Ethernet to the camera"
+                )
             return
         cc = MavlinkCameraControl(self._thread)
         self._wire_camera_control(cc)

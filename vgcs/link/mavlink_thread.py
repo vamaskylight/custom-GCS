@@ -325,8 +325,11 @@ class MavlinkThread(QThread):
 
             msg_type = msg.get_type()
             if msg_type == "HEARTBEAT":
-                self._target_sysid = int(msg.get_srcSystem())
-                self._target_compid = int(msg.get_srcComponent())
+                src_sys = int(msg.get_srcSystem())
+                src_comp = int(msg.get_srcComponent())
+                if self._heartbeat_updates_link_target(msg):
+                    self._target_sysid = src_sys
+                    self._target_compid = src_comp
                 now = time.monotonic()
                 # Avoid flooding UI if vehicle sends HB fast
                 if now - last_hb >= 0.5:
@@ -769,6 +772,20 @@ class MavlinkThread(QThread):
             self.action_result.emit(label, False, str(e))
             self.error.emit(f"Calibration failed ({label}): {e}")
 
+    def _heartbeat_updates_link_target(self, msg) -> bool:
+        """Ignore camera/peripheral heartbeats (e.g. sys=250) so commands stay on the FC."""
+        src_sys = int(msg.get_srcSystem())
+        src_comp = int(msg.get_srcComponent())
+        if src_sys <= 0 or src_sys >= 240:
+            return False
+        autopilot = int(getattr(msg, "autopilot", 0) or 0)
+        if autopilot in (
+            0,
+            int(getattr(mavutil.mavlink, "MAV_AUTOPILOT_INVALID", 8)),
+        ):
+            return src_comp in (0, 1)
+        return True
+
     def _sync_link_targets(self) -> None:
         """Align pymavlink routing with the last vehicle HEARTBEAT (sys/comp)."""
         if self._master is None:
@@ -925,6 +942,41 @@ class MavlinkThread(QThread):
                 0.0,
                 0.0,
             )
+            mount_interval_us = int(1_000_000 / max(1, hz))
+            self._master.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                float(mavutil.mavlink.MAVLINK_MSG_ID_MOUNT_ORIENTATION),
+                float(mount_interval_us),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            gimbal_att_id = getattr(
+                mavutil.mavlink,
+                "MAVLINK_MSG_ID_GIMBAL_DEVICE_ATTITUDE_STATUS",
+                None,
+            )
+            if gimbal_att_id is not None:
+                self._master.mav.command_long_send(
+                    ts,
+                    tc,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    float(gimbal_att_id),
+                    float(mount_interval_us),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
         except Exception:
             pass
 
