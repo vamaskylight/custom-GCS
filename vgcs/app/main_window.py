@@ -1256,6 +1256,7 @@ class MainWindow(QMainWindow):
 
         row_sys("GPS", "gps", "Battery", "battery")
         row_sys("RC link", "rc_link", "Video link", "video_link")
+        row_sys("Obstacle (prox)", "obstacle_prox", "Rangefinder", "rangefinder")
         row_sys("Battery failsafe", "failsafe_battery", "RC failsafe", "failsafe_rc")
         la = QLabel("Arm readiness")
         la.setStyleSheet("color: #7d869c;")
@@ -1264,8 +1265,12 @@ class MainWindow(QMainWindow):
         systems.setLayout(sg)
 
         self._fields["video_link"].setText("N/A")
+        self._fields["obstacle_prox"].setText("N/A")
+        self._fields["rangefinder"].setText("N/A")
         self._fields["arm_ready"].setText("Best-effort from telemetry")
         self._apply_state_style(self._fields["video_link"], "na")
+        self._apply_state_style(self._fields["obstacle_prox"], "na")
+        self._apply_state_style(self._fields["rangefinder"], "na")
 
         col = QWidget()
         v = QVBoxLayout()
@@ -2741,7 +2746,11 @@ class MainWindow(QMainWindow):
         self._fields["failsafe_rc"].setText("—")
         self._fields["arm_ready"].setText("Best-effort from telemetry")
         self._fields["video_link"].setText("N/A")
+        self._fields["obstacle_prox"].setText("N/A")
+        self._fields["rangefinder"].setText("N/A")
         self._apply_state_style(self._fields["video_link"], "na")
+        self._apply_state_style(self._fields["obstacle_prox"], "na")
+        self._apply_state_style(self._fields["rangefinder"], "na")
         self._apply_state_style(self._fields["failsafe_battery"], "")
         self._apply_state_style(self._fields["failsafe_rc"], "")
         self._apply_state_style(self._fields["arm_ready"], "")
@@ -3302,6 +3311,22 @@ class MainWindow(QMainWindow):
             )
             self._top_battery.setText(bat_header)
             self._map_widget.set_header_battery(bat_header)
+        elif msg_type == "OBSTACLE_DISTANCE":
+            self._map_widget.set_obstacle_distance(data)
+            prox, _ = self._map_widget.get_obstacle_sensor_summary()
+            self._fields["obstacle_prox"].setText(prox)
+            self._apply_state_style(
+                self._fields["obstacle_prox"],
+                "ok" if prox != "N/A" else "na",
+            )
+        elif msg_type == "DISTANCE_SENSOR":
+            self._map_widget.set_distance_sensor(data)
+            _, rf = self._map_widget.get_obstacle_sensor_summary()
+            self._fields["rangefinder"].setText(rf)
+            self._apply_state_style(
+                self._fields["rangefinder"],
+                "ok" if rf != "N/A" else "na",
+            )
         elif msg_type == "RADIO_STATUS":
             self._fields["rc_link"].setText(
                 f"rssi={int(data.get('rssi', 0))} remrssi={int(data.get('remrssi', 0))}"

@@ -87,6 +87,7 @@ from vgcs.map.map_footer_hud import (
     MapFooterTelemetryStrip,
     TelemetryStripIcon,
 )
+from vgcs.map.sensor_obstacle_widget import ObstacleRadarPanel
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_url, create_map_3d_web_view
 from vgcs.map.cam_rail_widgets import CamObserveSegment, CamRecordArch
 from vgcs.map.plan_flight_panel import PlanFlightPanel
@@ -170,14 +171,21 @@ _KEY_VIDEO_LOW_LATENCY = "video/low_latency"
 _KEY_VIDEO_RECORD_FORMAT = "video/record_format"  # 'mp4' | 'mkv'
 _KEY_VIDEO_DEFAULT_VIEW = "video/default_view"  # 'Single' | 'Split'
 
-# Native camera rail / fullscreen video: offset from the **top of the map canvas** (px).
-# Smaller = tighter gap below the app header and the floating rail.
-_NATIVE_CAM_RAIL_TOP_PX = 44
-
-# Legacy Web `#actionRail { top: 78px; left: 10px }` sat below the in-map `#linkBanner`. The native map
-# has no in-map banner, so a large Y offset only adds empty gap under the app header — use a tight margin.
+# Native HUD top inset from the map canvas (px) — Takeoff/Return and camera rail share the same gap below the app header.
+# Legacy Web used ~78px to clear an in-map `#linkBanner`; native 2D has no banner, so keep this tight.
+_MAP_HUD_TOP_PX = 10
 _MAP_ACTION_RAIL_LEFT_PX = 10
-_MAP_ACTION_RAIL_TOP_PX = 10
+_MAP_ACTION_RAIL_TOP_PX = _MAP_HUD_TOP_PX
+_NATIVE_CAM_RAIL_TOP_PX = _MAP_HUD_TOP_PX
+# Native HUD margins (mini-video bottom-left; obstacle top-left under Takeoff/Return).
+_MAP_HUD_MARGIN_PX = 12
+_MAP_ACTION_RAIL_HEIGHT_PX = 54 + 8 + 54
+_OBSTACLE_PANEL_TOP_PX = _MAP_ACTION_RAIL_TOP_PX + _MAP_ACTION_RAIL_HEIGHT_PX + 8
+# Must fit ObstacleRadarPanel.sizeHint() — do not clamp below panel minimum or widgets overlap.
+_OBSTACLE_PANEL_MAX_H_PX = 360
+# Fixed mini-video PiP (bottom-left) — do not scale to a large % of the map.
+_MINI_VIDEO_PIP_W_PX = 236
+_MINI_VIDEO_PIP_H_PX = 132
 
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
@@ -249,25 +257,28 @@ def _native_cam_record_dot_pixmap(size: int = 14) -> QPixmap:
     return pm
 
 
+# Native HUD glass — same opacity as ``MapFooterTelemetryStrip`` (`map_footer_hud.py`).
+_MAP_HUD_GLASS_BG = "rgba(26, 33, 45, 215)"
+_MAP_HUD_GLASS_BORDER = "rgba(80, 92, 118, 107)"
+
 # Native `#cameraRail` — label/button text matches `TELEMETRY_STRIP_VALUE_STYLE` in map_footer_hud.py
 # (`color: #dce5f5; font-size: 15px; font-weight: 600`).
-_NATIVE_CAMERA_RAIL_QSS = """
-#nativeCameraRail {
-  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-    stop:0 rgba(36, 44, 58, 250), stop:1 rgba(28, 34, 46, 252));
-  border: 1px solid rgba(180, 198, 224, 55);
-  border-radius: 12px;
-  min-width: 220px;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  color: #dce5f5;
-  font-size: 15px;
-  font-weight: 600;
-}
-#cameraTopRow {
-  background: rgba(72, 84, 108, 118);
-  border: 1px solid rgba(190, 202, 224, 45);
-  border-radius: 7px;
-}
+# Inner rail: transparent (glass is on ``#nativeCameraRailLayer``); control chrome below.
+_NATIVE_CAMERA_RAIL_QSS = (
+    "QFrame#nativeCameraRail {\n"
+    "  background: transparent;\n"
+    "  border: none;\n"
+    "  min-width: 220px;\n"
+    '  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;\n'
+    "  color: #dce5f5;\n"
+    "  font-size: 15px;\n"
+    "  font-weight: 600;\n"
+    "}\n"
+    "#cameraTopRow {\n"
+    "  background: transparent;\n"
+    "  border: none;\n"
+    "}\n"
+) + """
 QPushButton#camVideoBtn {
   width: 28px;
   height: 28px;
@@ -777,7 +788,8 @@ class MapWidget(QWidget):
         self._map_canvas_layout.setContentsMargins(0, 0, 0, 0)
         self._map_canvas_layout.setSpacing(0)
         self._map_canvas.setLayout(self._map_canvas_layout)
-        self._native_video_preview = QLabel(self._map_canvas)
+        # Parent `_panel` (not `_map_canvas`) so PiP stacks above the tile map like compass/rail.
+        self._native_video_preview = QLabel(self._panel)
         self._native_video_preview.setObjectName("nativeVideoPreview")
         self._native_video_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._native_video_preview.setAutoFillBackground(True)
@@ -817,15 +829,22 @@ class MapWidget(QWidget):
         self._native_rail_layer.setObjectName("nativeCameraRailLayer")
         self._native_rail_layer.setFrameShape(QFrame.Shape.NoFrame)
         self._native_rail_layer.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._native_rail_layer.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self._native_rail_layer.setAutoFillBackground(True)
+        # One continuous glass panel (same as ``MapFooterTelemetryStrip``) — rgba in QSS, not WA_TranslucentBackground.
+        self._native_rail_layer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._native_rail_layer.setAutoFillBackground(False)
         self._native_rail_layer.setStyleSheet(
-            "QFrame#nativeCameraRailLayer { background-color: rgb(28, 34, 46); border: none; }"
+            "QFrame#nativeCameraRailLayer {"
+            " background: " + _MAP_HUD_GLASS_BG + ";"
+            " border: 1px solid " + _MAP_HUD_GLASS_BORDER + ";"
+            " border-radius: 12px;"
+            "}"
         )
         self._native_rail_layer.hide()
         # Native `#cameraRail`: single `QFrame` — height follows layout (no `QScrollArea` scrollbar).
         self._native_hud_right = QFrame(self._native_rail_layer)
         self._native_hud_right.setObjectName("nativeCameraRail")
+        self._native_hud_right.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._native_hud_right.setAutoFillBackground(False)
         self._native_hud_right.setStyleSheet(_NATIVE_CAMERA_RAIL_QSS)
         self._native_hud_right_layout = QVBoxLayout(self._native_hud_right)
         self._native_hud_right_layout.setContentsMargins(6, 5, 7, 7)
@@ -1022,6 +1041,11 @@ class MapWidget(QWidget):
         self._native_telemetry.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._native_telemetry.hide()
         self._native_telemetry.raise_()
+
+        # M9 — obstacle radar on `_panel` (same stacking layer as PiP / compass).
+        self._obstacle_radar = ObstacleRadarPanel(self._panel)
+        self._obstacle_radar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._obstacle_radar.hide()
 
         # Legacy Web `#actionRail` / `.actionBtn` — parent `_panel` (not `_map_canvas`) so Takeoff/Return
         # stay above fullscreen RTSP video; raising the video label every frame no longer covers them.
@@ -1495,6 +1519,8 @@ class MapWidget(QWidget):
         super().showEvent(event)
         # First frame / platform quirks: layout can restore map above HUD siblings; fix Z-order after show.
         try:
+            if bool(getattr(self, "_last_link_connected", False)):
+                QTimer.singleShot(0, self._on_mavlink_link_show_mini_video)
             QTimer.singleShot(0, self._stack_native_overlays_above_tile_map)
         except Exception:
             pass
@@ -1545,7 +1571,9 @@ class MapWidget(QWidget):
         else:
             self._video_swap_user_map_main = True
         self._layout_native_video_preview()
-        if not self._video_swapped:
+        if self._video_swapped:
+            self._ensure_video_pro_hud_visible()
+        else:
             self._show_map_main_surface()
         # Native fullscreen toggle is fully handled in Qt. Keep Web map in map mode
         # to avoid duplicating/fragmenting video content in Web overlays/minimap grabs.
@@ -1846,6 +1874,93 @@ class MapWidget(QWidget):
         }
         self._layout_native_video_preview()
 
+    def _mini_video_pip_rect(self, w: int, h: int) -> tuple[int, int, int, int]:
+        """Bottom-left PiP size in `_map_canvas` coordinates."""
+        pw = min(_MINI_VIDEO_PIP_W_PX, max(200, int(w * 0.22)))
+        ph = min(_MINI_VIDEO_PIP_H_PX, max(112, int(h * 0.17)))
+        x = _MAP_HUD_MARGIN_PX
+        y = max(0, h - ph - _MAP_HUD_MARGIN_PX)
+        return x, y, pw, ph
+
+    def _map_canvas_rect_on_panel(self, x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
+        """Map a `_map_canvas` child rect to `_panel` coordinates."""
+        host = getattr(self, "_map_canvas", None)
+        panel = getattr(self, "_panel", None)
+        if host is None or panel is None:
+            return x, y, w, h
+        try:
+            pt = host.mapTo(panel, QPoint(int(x), int(y)))
+            return int(pt.x()), int(pt.y()), int(w), int(h)
+        except Exception:
+            return x, y, w, h
+
+    def _video_stream_configured(self) -> bool:
+        src = str(getattr(self, "_video_settings_source", "rtsp") or "rtsp").strip().lower()
+        if src == "disabled":
+            return False
+        day = str(getattr(self, "_video_settings_day", "") or "").strip()
+        thermal = str(getattr(self, "_video_settings_thermal", "") or "").strip()
+        return bool(day or thermal) or src in ("udp_h264", "udp_h265")
+
+    def _show_mini_video_pip_shell(self) -> None:
+        """Always paint the bottom-left PiP frame (even before FFmpeg / pipeline sources exist)."""
+        if not bool(getattr(self, "_web_ready", False)):
+            return
+        if self._plan_flight_layer_obscures_native_camera_ui():
+            return
+        try:
+            self._read_video_settings()
+        except Exception:
+            pass
+        self._video_preview_enabled = True
+        if not bool(getattr(self, "_video_swap_user_map_main", False)):
+            self._video_swapped = False
+        host = self._map_canvas
+        if host is None:
+            return
+        cw = max(1, host.width())
+        ch = max(1, host.height())
+        if bool(getattr(self, "_video_swapped", False)):
+            px, py, pw, ph = 0, 0, cw, ch
+        else:
+            px, py, pw, ph = self._mini_video_pip_rect(cw, ch)
+        gx, gy, gw, gh = self._map_canvas_rect_on_panel(px, py, pw, ph)
+        self._native_video_preview.setGeometry(gx, gy, gw, gh)
+        if self._video_stream_configured():
+            hint = "Live video\n(connecting…)"
+        else:
+            hint = "Live video\n(Settings → Video)"
+        self._set_native_video_pip_placeholder(True, message=hint)
+        self._native_video_preview.show()
+        self._native_video_preview.raise_()
+        try:
+            self._sync_native_video_overlay()
+        except Exception:
+            pass
+        self._stack_native_overlays_above_tile_map()
+
+    def _set_native_video_pip_placeholder(self, on: bool, *, message: str = "") -> None:
+        """Hint in the PiP when preview is on but no decoded frame yet."""
+        lab = getattr(self, "_native_video_preview", None)
+        if lab is None:
+            return
+        if on and not bool(getattr(self, "_video_swapped", False)):
+            lab.clear()
+            lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            txt = str(message or "").strip() or "Live video\n(connecting…)"
+            lab.setText(txt)
+            lab.setStyleSheet(
+                "QLabel#nativeVideoPreview {"
+                "background: #0c1018;"
+                "color: #9fb0cc;"
+                "font: 600 11px \"Segoe UI\", Arial, sans-serif;"
+                "border: 1px solid rgba(206, 220, 242, 0.45);"
+                "border-radius: 8px;"
+                "}"
+            )
+        elif not on:
+            lab.setText("")
+
     def _layout_native_video_preview(self) -> None:
         try:
             if not bool(getattr(self, "_video_preview_enabled", False)):
@@ -1859,13 +1974,10 @@ class MapWidget(QWidget):
             host = self._map_canvas
             if host is None:
                 return
-            w = max(1, host.width())
-            h = max(1, host.height())
+            cw = max(1, host.width())
+            ch = max(1, host.height())
             if bool(getattr(self, "_video_swapped", False)):
-                # Full-bleed video over the tile map. Compass / telemetry / minimap / camera rail are
-                # separate widgets stacked above this label, so we still cover the entire canvas here
-                # (no top/side insets — the rail is a sibling of `_map_canvas`, not inside it).
-                self._native_video_preview.setGeometry(0, 0, w, h)
+                px, py, pw, ph = 0, 0, cw, ch
                 self._native_video_preview.setStyleSheet(
                     "QLabel#nativeVideoPreview {"
                     "background: #000;"
@@ -1874,21 +1986,22 @@ class MapWidget(QWidget):
                     "}"
                 )
             else:
-                # PiP / map mode: same geometry for single and split (git webview: split toggles grid only,
-                # not overlay size). Fullscreen split uses the `_video_swapped` branch above.
-                pw = min(230, max(180, int(w * 0.28)))
-                ph = min(130, max(100, int(h * 0.24)))
-                x = 14
-                y = max(0, h - ph - 14)
-                self._native_video_preview.setGeometry(x, y, pw, ph)
-                self._native_video_preview.setStyleSheet(
-                    "QLabel#nativeVideoPreview {"
-                    "background: #000;"
-                    "border: 1px solid rgba(206, 220, 242, 0.35);"
-                    "border-radius: 8px;"
-                    "}"
-                )
+                px, py, pw, ph = self._mini_video_pip_rect(cw, ch)
+                if self._native_video_last.isNull():
+                    self._set_native_video_pip_placeholder(True)
+                else:
+                    self._set_native_video_pip_placeholder(False)
+                    self._native_video_preview.setStyleSheet(
+                        "QLabel#nativeVideoPreview {"
+                        "background: #000;"
+                        "border: 1px solid rgba(206, 220, 242, 0.55);"
+                        "border-radius: 8px;"
+                        "}"
+                    )
+            gx, gy, gw, gh = self._map_canvas_rect_on_panel(px, py, pw, ph)
+            self._native_video_preview.setGeometry(gx, gy, gw, gh)
             self._native_video_preview.show()
+            self._native_video_preview.raise_()
             # Split mode must repaint from `_split_last_images`; `_native_video_last` may still be the
             # last single-view frame and would undo the 2×2 composite after every resize.
             if bool(getattr(self, "_video_split_enabled", False)):
@@ -1908,6 +2021,10 @@ class MapWidget(QWidget):
                     self._render_native_video_preview(self._native_video_last)
             # Reposition HUD (minimap vs PiP) after video geometry is known.
             self._layout_native_hud()
+            if bool(getattr(self, "_video_swapped", False)):
+                self._ensure_video_pro_hud_visible()
+            else:
+                self._raise_flight_hud_above_video()
         except Exception:
             return
         finally:
@@ -1920,34 +2037,76 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
-    def _raise_panel_flight_overlays(self) -> None:
-        """Panel-level HUD (Takeoff/Return, camera rail, compass) above fullscreen video on `_map_canvas`."""
+    def _ensure_video_pro_hud_visible(self) -> None:
+        """Video Pro (fullscreen video): keep camera rail, compass, telemetry, and action buttons visible."""
+        if not bool(getattr(self, "_web_ready", False)):
+            return
+        if self._plan_flight_layer_obscures_native_camera_ui():
+            return
         try:
-            mar = getattr(self, "_map_action_rail", None)
-            if mar is not None and mar.isVisible():
-                mar.raise_()
+            self._native_compass.show()
+            self._native_telemetry.show()
+        except Exception:
+            pass
+        if bool(getattr(self, "_last_link_connected", False)):
+            try:
+                self._native_hud_right.show()
+                self._native_rail_layer.show()
+                self._obstacle_radar.show()
+            except Exception:
+                pass
+        mar = getattr(self, "_map_action_rail", None)
+        if mar is not None:
+            try:
+                mar.show()
+            except Exception:
+                pass
+        self._raise_flight_hud_above_video()
+
+    def _raise_flight_hud_above_video(self) -> None:
+        """Stack Takeoff/Return, camera rail, compass, telemetry, obstacle, minimap above fullscreen video."""
+        try:
+            for w in (
+                getattr(self, "_map_action_rail", None),
+                getattr(self, "_map_action_takeoff_btn", None),
+                getattr(self, "_map_action_return_btn", None),
+            ):
+                if w is not None and w.isVisible():
+                    w.raise_()
             ly = getattr(self, "_native_rail_layer", None)
             if ly is not None and ly.isVisible():
                 ly.raise_()
-            # Compass / telemetry above camera rail when they overlap at the bottom-right.
-            for hud in (self._native_compass, self._native_telemetry):
                 try:
-                    if hud.isVisible():
-                        hud.raise_()
+                    self._native_hud_right.raise_()
                 except Exception:
                     pass
+            obr = getattr(self, "_obstacle_radar", None)
+            if obr is not None and obr.isVisible():
+                obr.raise_()
+            for hud in (self._native_compass, self._native_telemetry):
+                if hud is not None and hud.isVisible():
+                    hud.raise_()
             preview_on = bool(getattr(self, "_video_preview_enabled", False))
             swapped = bool(getattr(self, "_video_swapped", False))
-            if preview_on and swapped and self._native_minimap_wrap.isVisible():
-                self._native_minimap_wrap.raise_()
-                self._btn_native_minimap_plus.raise_()
-                self._btn_native_minimap_minus.raise_()
+            if preview_on and swapped:
+                wrap = getattr(self, "_native_minimap_wrap", None)
+                if wrap is not None and wrap.isVisible():
+                    wrap.raise_()
+                    self._btn_native_minimap_plus.raise_()
+                    self._btn_native_minimap_minus.raise_()
+            ov = getattr(self, "_native_video_overlay", None)
+            if ov is not None and ov.isVisible():
+                ov.raise_()
         except Exception:
             pass
 
+    def _raise_panel_flight_overlays(self) -> None:
+        """Panel-level HUD above fullscreen video (legacy alias)."""
+        self._raise_flight_hud_above_video()
+
     def _stack_native_overlays_above_tile_map(self) -> None:
         """
-        Lower the tile map, raise video inside `_map_canvas`, then raise panel siblings (Takeoff/Return, rail).
+        Lower the tile map, raise video, then raise all flight HUD above the video layer.
         """
         nm = getattr(self, "_native_map", None)
         if nm is not None:
@@ -1956,15 +2115,16 @@ class MapWidget(QWidget):
             except Exception:
                 pass
         try:
-            if self._native_video_preview.isVisible():
-                self._native_video_preview.raise_()
+            pv = getattr(self, "_native_video_preview", None)
+            if pv is not None and pv.isVisible():
+                pv.raise_()
                 try:
                     self._sync_native_video_overlay()
                 except Exception:
                     pass
         except Exception:
             pass
-        self._raise_panel_flight_overlays()
+        self._raise_flight_hud_above_video()
 
     def _sync_native_map_vehicle_arrow_scale(self) -> None:
         """Larger vehicle chevron while map is shown in the swap PiP (grab scales the view down)."""
@@ -1991,6 +2151,7 @@ class MapWidget(QWidget):
                     self._native_minimap_wrap.hide()
                     self._btn_native_minimap_plus.hide()
                     self._btn_native_minimap_minus.hide()
+                    self._obstacle_radar.hide()
                 except Exception:
                     pass
             else:
@@ -2063,6 +2224,28 @@ class MapWidget(QWidget):
             swapped = bool(getattr(self, "_video_swapped", False))
             preview_on = bool(getattr(self, "_video_preview_enabled", False))
             preview_maps = preview_on and not plan_on
+            _pip_x, _pip_y, _pip_w, pip_h = self._mini_video_pip_rect(w, h)
+            margin = _MAP_HUD_MARGIN_PX
+            # M9 obstacle radar — compact card top-left; mini-video is a small fixed PiP bottom-left.
+            obr = getattr(self, "_obstacle_radar", None)
+            if obr is not None and bool(getattr(self, "_last_link_connected", False)):
+                obr_w = int(obr.sizeHint().width())
+                obr_h = min(_OBSTACLE_PANEL_MAX_H_PX, int(obr.sizeHint().height()))
+                obr_x = margin
+                obr_y = _OBSTACLE_PANEL_TOP_PX
+                # Keep the card above the bottom-left video PiP when both are visible.
+                if preview_maps and not swapped:
+                    _px, pip_y, _pw, pip_h = self._mini_video_pip_rect(w, h)
+                    pip_top = int(po.y() + pip_y)
+                    canvas_bottom = int(po.y() + h)
+                    max_h = max(150, pip_top - int(po.y() + obr_y) - 10)
+                    obr_h = min(obr_h, max_h)
+                gx, gy, gw, gh = self._map_canvas_rect_on_panel(obr_x, obr_y, obr_w, obr_h)
+                obr.setGeometry(gx, gy, gw, obr_h)
+                if not plan_on:
+                    obr.show()
+            elif obr is not None:
+                obr.hide()
             # PiP mode: show video only (no second minimap card — main map is the overview).
             # Fullscreen camera swap: minimap takes the **same PiP slot as the video** (bottom-left)
             # so the swap is symmetric — clicking the corner card swaps back.
@@ -2070,16 +2253,12 @@ class MapWidget(QWidget):
             if not preview_maps or (preview_maps and not swapped):
                 self._native_minimap_wrap.hide()
             else:
-                # Mirror the PiP geometry used in non-swapped mode (see `_layout_native_video_preview`).
-                mini_w = min(230, max(180, int(w * 0.28)))
-                mini_h = min(130, max(100, int(h * 0.24)))
-                mini_x = 14
-                mini_y = max(0, h - mini_h - 14)
+                mini_x, mini_y, mini_w, mini_h = self._mini_video_pip_rect(w, h)
+                mini_x = int(po.x() + mini_x)
+                mini_y = int(po.y() + mini_y)
                 _side = int(getattr(self, "_native_minimap_btn_side", 32))
                 _pad = int(getattr(self, "_native_minimap_btn_pad", 8))
-                self._native_minimap_wrap.setGeometry(
-                    po.x() + mini_x, po.y() + mini_y, mini_w, mini_h
-                )
+                self._native_minimap_wrap.setGeometry(mini_x, mini_y, mini_w, mini_h)
                 try:
                     nmz = getattr(self, "_native_map", None)
                     if nmz is not None:
@@ -2108,6 +2287,8 @@ class MapWidget(QWidget):
                     pass
             self._sync_native_map_vehicle_arrow_scale()
             self._stack_native_overlays_above_tile_map()
+            if bool(getattr(self, "_video_swapped", False)):
+                self._ensure_video_pro_hud_visible()
         except Exception:
             return
 
@@ -2417,6 +2598,7 @@ class MapWidget(QWidget):
     def _render_native_video_preview(self, img: QImage) -> None:
         if img is None or img.isNull():
             return
+        self._set_native_video_pip_placeholder(False)
         self._native_video_last = img
         split_on = bool(getattr(self, "_video_split_enabled", False))
         try:
@@ -2728,6 +2910,10 @@ class MapWidget(QWidget):
         self._sync_map_action_rail_enabled()
         self._run_js("setLinkConnected(true);" if c else "setLinkConnected(false);")
         if c:
+            if self._video_preview_should_run() and not bool(
+                getattr(self, "_video_swap_user_map_main", False)
+            ):
+                self._video_swapped = False
             try:
                 self.clear_flight_track()
                 self.set_video_follow_enabled(True)
@@ -2756,6 +2942,10 @@ class MapWidget(QWidget):
                 self._native_rail_layer.hide()
             except Exception:
                 pass
+            try:
+                self._obstacle_radar.hide()
+            except Exception:
+                pass
             # Companion RTSP (192.168.144.x) is independent of the serial MAVLink link — do not
             # tear down FFmpeg or clear the preview pixmap on COM disconnect/reconnect.
             if self._uses_companion_rtsp() and self._video_preview_should_run():
@@ -2779,11 +2969,23 @@ class MapWidget(QWidget):
             if bool(getattr(self, "_web_ready", False)):
                 self._native_compass.show()
                 self._native_telemetry.show()
+                try:
+                    self._obstacle_radar.show()
+                except Exception:
+                    pass
             QTimer.singleShot(0, self._layout_native_hud)
+            QTimer.singleShot(0, self._on_mavlink_link_show_mini_video)
             QTimer.singleShot(0, self._stack_native_overlays_above_tile_map)
         except Exception:
             pass
+
+    def _on_mavlink_link_show_mini_video(self) -> None:
+        """MAVLink connected: show PiP shell immediately, then start decode when possible."""
+        if not bool(getattr(self, "_last_link_connected", False)):
+            return
+        self._show_mini_video_pip_shell()
         if self._video_preview_should_run():
+            self._auto_start_mini_video_pip(force_decode=True, preserve_layout=True)
             QTimer.singleShot(
                 800,
                 lambda: self._companion_start_decode_if_needed(reason="mavlink_link"),
@@ -2837,8 +3039,9 @@ class MapWidget(QWidget):
             self._video_preview_enabled = True
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
-            if self._uses_companion_rtsp() and not self._plan_flight_layer_obscures_native_camera_ui():
-                self._video_swapped = True
+            if not self._plan_flight_layer_obscures_native_camera_ui():
+                if not bool(getattr(self, "_video_swap_user_map_main", False)):
+                    self._video_swapped = False
                 self._native_video_preview.show()
                 self._layout_native_video_preview()
                 self._stack_native_overlays_above_tile_map()
@@ -3432,6 +3635,8 @@ class MapWidget(QWidget):
                 self._native_telemetry.setVisible(show)
             if hasattr(self, "_native_compass"):
                 self._native_compass.setVisible(show)
+            if hasattr(self, "_obstacle_radar") and bool(getattr(self, "_last_link_connected", False)):
+                self._obstacle_radar.setVisible(show)
         except Exception:
             pass
 
@@ -3777,6 +3982,11 @@ class MapWidget(QWidget):
             try:
                 self._native_compass.show()
                 self._native_telemetry.show()
+                if bool(getattr(self, "_last_link_connected", False)):
+                    try:
+                        self._obstacle_radar.show()
+                    except Exception:
+                        pass
                 # Keep camera rail (ZOOM/FOCUS/GIMBAL/OBSERVE) hidden until MAVLink is connected.
                 # This ensures the UI follows the desired flow: "Disconnected" -> no camera controls.
                 if bool(getattr(self, "_last_link_connected", False)):
@@ -3813,8 +4023,11 @@ class MapWidget(QWidget):
                 pass
             # Start preview if user enabled it (do not require telemetry link).
             try:
-                if self._video_preview_should_run():
-                    self._start_video_preview()
+                if bool(getattr(self, "_last_link_connected", False)):
+                    QTimer.singleShot(0, self._on_mavlink_link_show_mini_video)
+                elif self._video_preview_should_run():
+                    self._show_mini_video_pip_shell()
+                    self._auto_start_mini_video_pip(force_decode=False)
             except Exception:
                 pass
             # Auto-detect low-spec devices and reduce map workload if needed.
@@ -3962,8 +4175,9 @@ class MapWidget(QWidget):
             self._video_preview_enabled = True
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
-            if self._uses_companion_rtsp() and not self._plan_flight_layer_obscures_native_camera_ui():
-                self._video_swapped = True
+            if not self._plan_flight_layer_obscures_native_camera_ui():
+                if not bool(getattr(self, "_video_swap_user_map_main", False)):
+                    self._video_swapped = False
                 self._native_video_preview.show()
                 self._layout_native_video_preview()
                 self._stack_native_overlays_above_tile_map()
@@ -4137,9 +4351,14 @@ class MapWidget(QWidget):
         s = QSettings(_QS_NS, _QS_APP)
         source = str(s.value(_KEY_VIDEO_SOURCE, "rtsp") or "rtsp").strip().lower()
         self._video_settings_source = source
-        self._video_settings_enabled = bool(s.value(_KEY_VIDEO_ENABLED, False)) and source != "disabled"
         self._video_settings_day = str(s.value(_KEY_VIDEO_RTSP_DAY, "") or "").strip()
         self._video_settings_thermal = str(s.value(_KEY_VIDEO_RTSP_THERMAL, "") or "").strip()
+        has_stream = bool(self._video_settings_day or self._video_settings_thermal) or source in (
+            "udp_h264",
+            "udp_h265",
+        )
+        explicit_on = bool(s.value(_KEY_VIDEO_ENABLED, False))
+        self._video_settings_enabled = (explicit_on or has_stream) and source != "disabled"
         self._video_settings_rtsp_transport = str(s.value(_KEY_VIDEO_RTSP_TRANSPORT, "auto") or "auto").strip().lower()
         self._video_settings_low_latency = bool(s.value(_KEY_VIDEO_LOW_LATENCY, False))
         rec_fmt = str(s.value(_KEY_VIDEO_RECORD_FORMAT, "mp4") or "mp4").strip().lower()
@@ -4150,10 +4369,28 @@ class MapWidget(QWidget):
         return str(getattr(self, "_video_settings_record_format", "mp4") or "mp4")
 
     def _video_preview_should_run(self) -> bool:
-        """True when Application Settings enabled streaming (not only hidden toolbar)."""
+        """True when a stream is configured and the map is ready (no toolbar toggle required)."""
         return bool(getattr(self, "_video_settings_enabled", False)) and bool(
             getattr(self, "_web_ready", False)
         )
+
+    def _auto_start_mini_video_pip(
+        self,
+        *,
+        force_decode: bool = False,
+        preserve_layout: bool = False,
+    ) -> None:
+        """Show bottom-left mini-video automatically when RTSP/UDP is configured."""
+        if not bool(getattr(self, "_last_link_connected", False)) and not self._video_preview_should_run():
+            return
+        self._show_mini_video_pip_shell()
+        if not self._video_preview_should_run():
+            return
+        if preserve_layout:
+            reset_swapped = False
+        else:
+            reset_swapped = not bool(getattr(self, "_video_swap_user_map_main", False))
+        self._start_video_preview(reset_swapped=reset_swapped, force_decode=force_decode)
 
     def _trigger_hardware_photo(self) -> None:
         cc = getattr(self, "_camera_control", None)
@@ -4308,10 +4545,11 @@ class MapWidget(QWidget):
             return
         try:
             if vp.sources():
+                self._auto_start_mini_video_pip(
+                    force_decode=bool(getattr(self, "_last_link_connected", False)),
+                )
                 if bool(getattr(self, "_last_link_connected", False)):
                     self._companion_start_decode_if_needed(reason="schedule")
-                else:
-                    self._restart_video_preview_after_settings(force_decode=False)
                 return
         except Exception:
             pass
@@ -4351,7 +4589,7 @@ class MapWidget(QWidget):
             # `_video_inited` fast-path) so `src.start()` targets the new `RtspSource`.
             self._video_inited = False
             self._shared_vp_hooks_connected = False
-            self._start_video_preview(reset_swapped=True, force_decode=force_decode)
+            self._auto_start_mini_video_pip(force_decode=force_decode)
         except Exception:
             pass
 
@@ -4547,6 +4785,7 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             return
+        self._show_mini_video_pip_shell()
         try:
             self._video_preview_enabled = True
         except Exception:
@@ -4560,11 +4799,12 @@ class MapWidget(QWidget):
                 except Exception:
                     nsrc = -1
                 print(
-                    f"[VGCS:video] preview start blocked "
+                    f"[VGCS:video] preview shell visible; decode waiting for pipeline "
                     f"(HAS_MULTIMEDIA={HAS_MULTIMEDIA} pipeline_sources={nsrc})"
                 )
             except Exception:
                 pass
+            self._schedule_video_preview_after_settings()
             self._run_js("setVideoPreviewImage('');")
             return
         try:
@@ -4588,6 +4828,8 @@ class MapWidget(QWidget):
             else:
                 self._native_video_preview.show()
                 self._layout_native_video_preview()
+                if self._native_video_last.isNull():
+                    self._set_native_video_pip_placeholder(True)
             # Native minimap position follows PiP; camera rail is shown from `_on_map_loaded`.
             self._update_native_minimap()
             # Native mode: hide Web preview layer to avoid double-render fragmentation.
@@ -4618,6 +4860,9 @@ class MapWidget(QWidget):
             if t_ai is not None and not t_ai.isActive():
                 t_ai.start()
             self._tick_native_ai_overlay()
+            if self._should_defer_companion_rtsp_decode() and not force_decode:
+                self._set_status("Mini-video ready — stream starts when vehicle connects")
+                return
         except Exception:
             self._run_js("setVideoPreviewImage('');")
 
@@ -4710,13 +4955,18 @@ class MapWidget(QWidget):
         if not bool(getattr(self, "_video_preview_enabled", False)):
             if self._uses_companion_rtsp():
                 self._video_preview_enabled = True
-                if not bool(getattr(self, "_video_swapped", False)):
-                    self._video_swapped = True
+                if not bool(getattr(self, "_video_swap_user_map_main", False)):
+                    self._video_swapped = False
                 try:
                     self._native_video_preview.show()
                     if bool(getattr(self, "_web_ready", False)):
                         self._native_compass.show()
                         self._native_telemetry.show()
+                        if bool(getattr(self, "_last_link_connected", False)):
+                            try:
+                                self._obstacle_radar.show()
+                            except Exception:
+                                pass
                     self._layout_native_video_preview()
                     self._layout_native_hud()
                     self._stack_native_overlays_above_tile_map()
@@ -4727,32 +4977,13 @@ class MapWidget(QWidget):
                     try:
                         print(
                             "[VGCS:video] preview auto-enabled on first decoded frame "
-                            "(frame slots were late)"
+                            "(mini PiP, frame slots were late)"
                         )
                     except Exception:
                         pass
             else:
                 return
         now_frame = time.monotonic()
-        last_mono = float(getattr(self, "_native_video_last_frame_mono", 0.0) or 0.0)
-        if (
-            last_mono > 0.0
-            and (now_frame - last_mono) > 2.5
-            and self._uses_companion_rtsp()
-            and not bool(getattr(self, "_video_swap_user_map_main", False))
-        ):
-            try:
-                self._video_swapped = True
-                self._layout_native_video_preview()
-                self._stack_native_overlays_above_tile_map()
-                if not bool(getattr(self, "_video_gap_relayout_logged", False)):
-                    self._video_gap_relayout_logged = True
-                    print(
-                        "[VGCS:video] companion preview relayout after stream gap "
-                        f"({now_frame - last_mono:.1f}s)"
-                    )
-            except Exception:
-                pass
         self._native_video_last_frame_mono = now_frame
         self._video_preview_got_frame = True
         if not bool(getattr(self, "_video_gui_logged_frame", False)):
@@ -4764,19 +4995,6 @@ class MapWidget(QWidget):
                 )
             except Exception:
                 pass
-            if (
-                self._uses_companion_rtsp()
-                and not bool(getattr(self, "_video_swapped", False))
-                and not bool(getattr(self, "_video_swap_user_map_main", False))
-            ):
-                if str(os.environ.get("VGCS_VIDEO_AUTO_FULLSCREEN", "1") or "1").strip() != "0":
-                    try:
-                        self._video_swapped = True
-                        self._layout_native_video_preview()
-                        self._stack_native_overlays_above_tile_map()
-                        print("[VGCS:video] companion RTSP: fullscreen video overlay enabled")
-                    except Exception:
-                        pass
         try:
             img = vf.image
         except RuntimeError:
@@ -6086,6 +6304,8 @@ class MapWidget(QWidget):
             else:
                 self._show_map_main_surface()
             self._layout_native_video_preview()
+            if self._video_swapped:
+                self._ensure_video_pro_hud_visible()
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_FOCUS_STEP:"):
@@ -6341,8 +6561,23 @@ class MapWidget(QWidget):
             if self._map_speed_hi_streak >= _MAP_MOVE_ARM_SAMPLES:
                 self._map_motion_armed = True
         elif self._map_speed_lo_streak >= _MAP_MOVE_DISARM_SAMPLES:
+            was_armed = bool(getattr(self, "_map_motion_armed", False))
             self._map_motion_armed = False
             self._map_speed_hi_streak = 0
+            if was_armed:
+                self._apply_map_vehicle_heading()
+
+    def _apply_map_vehicle_heading(self) -> None:
+        """Push stored heading to native map / legacy 3D JS (independent of GPS motion lock)."""
+        if self._heading is None:
+            return
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            try:
+                nm.set_heading(self._heading)
+            except Exception:
+                pass
+        self._schedule_vehicle_pose_js(immediate=False)
 
     def set_vehicle_position(
         self,
@@ -6429,7 +6664,7 @@ class MapWidget(QWidget):
             self._schedule_vehicle_pose_js(immediate=first_fix)
 
     def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
-        """Store heading for HUD/observations always; map chevron only when vehicle is moving."""
+        """Store heading for HUD/observations and rotate the map vehicle icon."""
         src = str(source or "mixed")
         self._heading = float(heading_deg) % 360.0
         self._heading_js_source = src
@@ -6438,15 +6673,11 @@ class MapWidget(QWidget):
             self._native_compass.set_heading_deg(self._heading)
         except Exception:
             pass
-        if not bool(getattr(self, "_map_motion_armed", False)):
-            return
-        nm = getattr(self, "_native_map", None)
-        if nm is not None:
-            try:
-                nm.set_heading(self._heading)
-            except Exception:
-                pass
-        self._schedule_vehicle_pose_js(immediate=False)
+        try:
+            self._obstacle_radar.set_vehicle_heading_deg(self._heading)
+        except Exception:
+            pass
+        self._apply_map_vehicle_heading()
 
     def clear_flight_track(self) -> None:
         """Clear the orange breadcrumb trail (e.g. on reconnect / disconnect)."""
@@ -6463,6 +6694,37 @@ class MapWidget(QWidget):
             except Exception:
                 pass
         self._run_js("clearFlightTrack();")
+
+    def set_obstacle_distance(self, payload: dict) -> None:
+        """M9 — forward OBSTACLE_DISTANCE (LiDAR / proximity radar bins) to the radar panel."""
+        try:
+            self._obstacle_radar.set_obstacle_distance(payload)
+            if bool(getattr(self, "_last_link_connected", False)) and bool(
+                getattr(self, "_web_ready", False)
+            ):
+                self._obstacle_radar.show()
+                QTimer.singleShot(0, self._layout_native_hud)
+        except Exception:
+            pass
+
+    def set_distance_sensor(self, payload: dict) -> None:
+        """M9 — forward DISTANCE_SENSOR (rangefinder) to the radar panel."""
+        try:
+            self._obstacle_radar.set_distance_sensor(payload)
+            if bool(getattr(self, "_last_link_connected", False)) and bool(
+                getattr(self, "_web_ready", False)
+            ):
+                self._obstacle_radar.show()
+                QTimer.singleShot(0, self._layout_native_hud)
+        except Exception:
+            pass
+
+    def get_obstacle_sensor_summary(self) -> tuple[str, str]:
+        """Nearest obstacle + rangefinder text for dashboard telemetry panel."""
+        try:
+            return self._obstacle_radar.summary_text()
+        except Exception:
+            return "N/A", "N/A"
 
     def set_mission_nav_seq(self, seq: int) -> None:
         """MAVLink MISSION_CURRENT.seq: trim planned route / sync with vehicle progress."""
