@@ -63,6 +63,8 @@ class MavlinkThread(QThread):
             "STATUSTEXT": 0.05,
             "RADIO_STATUS": 0.2,
             "OPEN_DRONE_ID": 0.25,
+            "OBSTACLE_DISTANCE": 0.1,
+            "DISTANCE_SENSOR": 0.15,
         }
         self._last_hb_log_mono = 0.0
         self._gimbal_lock = threading.Lock()
@@ -497,6 +499,44 @@ class MavlinkThread(QThread):
                         "remrssi": int(getattr(msg, "remrssi", 0) or 0),
                         "noise": int(getattr(msg, "noise", 0) or 0),
                         "remnoise": int(getattr(msg, "remnoise", 0) or 0),
+                    },
+                )
+            elif msg_type == "OBSTACLE_DISTANCE":
+                raw_dists = getattr(msg, "distances", None) or []
+                distances_cm: list[int] = []
+                for i in range(72):
+                    try:
+                        distances_cm.append(int(raw_dists[i]))
+                    except (IndexError, TypeError, ValueError):
+                        distances_cm.append(0xFFFF)
+                increment = float(getattr(msg, "increment", 0) or 0)
+                angle_off = float(getattr(msg, "angle_offset", 0) or 0) / 100.0
+                self._emit_telemetry_payload(
+                    "OBSTACLE_DISTANCE",
+                    {
+                        "sensor_type": int(getattr(msg, "type", 0) or 0),
+                        "distances_cm": distances_cm,
+                        "increment_deg": increment if increment > 0 else 5.0,
+                        "angle_offset_deg": angle_off,
+                        "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
+                        "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
+                        "frame": int(getattr(msg, "frame", 0) or 0),
+                    },
+                )
+            elif msg_type == "DISTANCE_SENSOR":
+                cur_cm = int(getattr(msg, "current_distance", 0xFFFF) or 0xFFFF)
+                cur_m: float | None = None
+                if 0 < cur_cm < 0xFFFF:
+                    cur_m = float(cur_cm) / 100.0
+                self._emit_telemetry_payload(
+                    "DISTANCE_SENSOR",
+                    {
+                        "sensor_type": int(getattr(msg, "type", 0) or 0),
+                        "orientation": int(getattr(msg, "orientation", 0) or 0),
+                        "current_distance_m": cur_m,
+                        "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
+                        "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
+                        "id": int(getattr(msg, "id", 0) or 0),
                     },
                 )
             elif msg_type.startswith("OPEN_DRONE_ID_"):
@@ -992,6 +1032,31 @@ class MavlinkThread(QThread):
                         0,
                         float(mavutil.mavlink.MAVLINK_MSG_ID_MOUNT_ORIENTATION),
                         float(mount_interval_us),
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    )
+                except Exception:
+                    pass
+            prox_interval_us = int(1_000_000 / max(1, hz))
+            for msg_id_name in (
+                "MAVLINK_MSG_ID_OBSTACLE_DISTANCE",
+                "MAVLINK_MSG_ID_DISTANCE_SENSOR",
+            ):
+                msg_id = getattr(mavutil.mavlink, msg_id_name, None)
+                if msg_id is None:
+                    continue
+                try:
+                    self._master.mav.command_long_send(
+                        ts,
+                        tc,
+                        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                        0,
+                        float(msg_id),
+                        float(prox_interval_us),
                         0.0,
                         0.0,
                         0.0,
