@@ -151,6 +151,7 @@ class MainWindow(QMainWindow):
         self._heartbeat_seen = False
         self._connect_attempt_active = False
         self._theme_name = str(self._settings.value("ui_theme", "Default"))
+        self._last_hb_ui_key: tuple[object, ...] | None = None
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
         self._last_vehicle_type: int | None = None
@@ -1338,8 +1339,28 @@ class MainWindow(QMainWindow):
     def _append_log(self, line: str) -> None:
         # Dashboard log panel can be hidden in map-only mode; always mirror to console.
         print(line, flush=True)
-        self._log.append(line)
-        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+        s = str(line or "")
+        if s.startswith("HEARTBEAT"):
+            # Serial link + companion HB lines flood QTextEdit and stall the GUI thread.
+            return
+        try:
+            self._log.append(s)
+            bar = self._log.verticalScrollBar()
+            if bar is not None:
+                bar.setValue(bar.maximum())
+            # Cap widget size so Apply / Target never walk an unbounded document.
+            doc = self._log.document()
+            if doc is not None and doc.blockCount() > 400:
+                cursor = self._log.textCursor()
+                cursor.movePosition(cursor.MoveOperation.Start)
+                cursor.movePosition(
+                    cursor.MoveOperation.Down,
+                    cursor.MoveMode.KeepAnchor,
+                    doc.blockCount() - 300,
+                )
+                cursor.removeSelectedText()
+        except Exception:
+            pass
 
     def _refresh_footer_summary(self) -> None:
         self._footer_primary.setText(
@@ -3077,6 +3098,15 @@ class MainWindow(QMainWindow):
         data = payload if isinstance(payload, dict) else {}
         if msg_type == "HEARTBEAT":
             armed = bool(data.get("armed", False))
+            system_status = int(data.get("system_status", 0))
+            mode_text = human_mode_name(
+                vehicle_type=int(data.get("vehicle_type", 0) or 0),
+                custom_mode=int(data.get("custom_mode", 0) or 0),
+            )
+            hb_key = (armed, system_status, mode_text)
+            if hb_key == getattr(self, "_last_hb_ui_key", None):
+                return
+            self._last_hb_ui_key = hb_key
             self._fields["armed"].setText("Yes" if armed else "No")
             self._apply_state_style(self._fields["armed"], "ok" if armed else "warn")
             if armed and self._armed_since is None:
@@ -3084,7 +3114,6 @@ class MainWindow(QMainWindow):
             if not armed:
                 self._armed_since = None
                 self._fields["flight_time"].setText("00:00")
-            system_status = int(data.get("system_status", 0))
             standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
             arm_ready = system_status >= standby
             self._fields["arm_ready"].setText("Likely ready" if arm_ready else f"System status {system_status}")
@@ -3120,10 +3149,6 @@ class MainWindow(QMainWindow):
                     if extra:
                         body = f"{body}\n\n{extra}"
                     QMessageBox.warning(self, "Vehicle Msg", body)
-            mode_text = human_mode_name(
-                vehicle_type=int(data.get("vehicle_type", 0) or 0),
-                custom_mode=int(data.get("custom_mode", 0) or 0),
-            )
             self._sync_mode_options_for_vehicle(int(data.get("vehicle_type", 0) or 0))
             self._top_flight_mode.setText(mode_text)
             self._map_widget.set_header_mode(mode_text)
