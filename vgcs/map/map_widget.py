@@ -4441,6 +4441,7 @@ class MapWidget(QWidget):
         # may set them just before this call (`VGCS_CAM_*_TOGGLE`); resetting would undo the click.
         self._video_recording = False
         self._video_recording_tmp_path = ""
+        self._video_recording_source_id = ""
         self._stop_native_cam_recording_tick_timer(reset_label=True)
         self._video_vision_mode = "day"  # 'day' | 'night'
         self._video_zoom = 1.0  # 1.0x .. 4.0x
@@ -4846,6 +4847,52 @@ class MapWidget(QWidget):
                 )
         except Exception:
             pass
+
+    def _operator_preview_source_id(self) -> str:
+        """
+        Pipeline source id for the feed the operator is viewing (record / photo / clip).
+
+        Split fullscreen after clicking a quadrant uses ``_split_fullscreen_source_id``; the
+        pipeline ``active_source`` often stays ``day``.
+        """
+        focus = getattr(self, "_split_fullscreen_source_id", None)
+        if focus and bool(getattr(self, "_video_swapped", False)):
+            sid = str(focus).strip()
+            if sid:
+                return sid
+        vp = getattr(self, "_video", None)
+        if vp is not None:
+            try:
+                sid = str(vp.active_source_id() or "").strip()
+                if sid:
+                    return sid
+            except Exception:
+                pass
+        src = getattr(self, "_video_active_source", None)
+        if src is not None:
+            return str(getattr(src, "source_id", "") or "").strip()
+        return ""
+
+    def _video_source_by_id(self, source_id: str):
+        sid = str(source_id or "").strip()
+        if not sid:
+            return None
+        vp = getattr(self, "_video", None)
+        if vp is None:
+            return None
+        try:
+            return vp.sources().get(sid)
+        except Exception:
+            return None
+
+    def _operator_preview_video_source(self):
+        """RtspSource (or backend) matching the on-screen preview for capture/record."""
+        sid = self._operator_preview_source_id()
+        if sid:
+            src = self._video_source_by_id(sid)
+            if src is not None:
+                return src
+        return getattr(self, "_video_active_source", None)
 
     def _video_preview_source_ids_to_run(self, vp) -> list[str]:
         """Source ids that should decode while preview is on (split = all, single = active only)."""
@@ -5444,6 +5491,15 @@ class MapWidget(QWidget):
 
     def _preview_image_copy_for_snapshot(self) -> QImage | None:
         """Return a deep copy of the latest preview frame (GUI thread only, no RTSP init)."""
+        sid = self._operator_preview_source_id()
+        if sid:
+            try:
+                cache = getattr(self, "_split_last_images", None) or {}
+                im = cache.get(sid)
+                if isinstance(im, QImage) and not im.isNull() and im.width() > 0 and im.height() > 0:
+                    return im.copy()
+            except Exception:
+                pass
         try:
             img = getattr(self, "_native_pip_last_source_frame", None)
             if isinstance(img, QImage) and not img.isNull() and img.width() > 0 and img.height() > 0:
@@ -5509,7 +5565,7 @@ class MapWidget(QWidget):
         # Last resort: QtMultimedia capture (can block; avoid on observation hot path).
         try:
             self._ensure_video_preview_backend()
-            src = getattr(self, "_video_active_source", None)
+            src = self._operator_preview_video_source()
             if src is not None and hasattr(src, "take_photo"):
                 if bool(src.take_photo(str(dest))):
                     return str(dest)
@@ -5965,13 +6021,14 @@ class MapWidget(QWidget):
                 "rtsp://192.168.144.108:554/stream=1 is playing on screen."
             )
             return
-        src = getattr(self, "_video_active_source", None)
+        src = self._operator_preview_video_source()
         if src is None:
             self._obs_clip_ui_failed(
                 "Observation clip failed: no active video source.\n\n"
                 "Wait until the live camera preview is visible, then press Clip again."
             )
             return
+        clip_sid = self._operator_preview_source_id()
         out_dir = Path.cwd() / "captures" / "clips"
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -5979,7 +6036,8 @@ class MapWidget(QWidget):
             self._obs_clip_ui_failed("Observation clip failed: cannot create captures/clips folder.")
             return
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"obs_clip_{stamp}.{self._video_record_suffix()}"
+        clip_tag = f"_{clip_sid}" if clip_sid else ""
+        out_path = out_dir / f"obs_clip{clip_tag}_{stamp}.{self._video_record_suffix()}"
         started = False
         try:
             if hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
@@ -6647,30 +6705,44 @@ class MapWidget(QWidget):
                 want_on = False
             try:
                 self._ensure_video_preview_backend()
-                src = getattr(self, "_video_active_source", None)
+                rec_sid = self._operator_preview_source_id()
+                src = self._operator_preview_video_source()
                 rec = src.recorder() if src is not None and hasattr(src, "recorder") else None
                 # RTSP sources use ffmpeg recording.
                 if src is not None and hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
                     if want_on and not bool(getattr(self, "_video_recording", False)):
+                        tag = f"_{rec_sid}" if rec_sid else ""
                         tmp = Path(tempfile.gettempdir()) / (
-                            f"vgcs_recording_{int(time.time())}.{self._video_record_suffix()}"
+                            f"vgcs_recording{tag}_{int(time.time())}.{self._video_record_suffix()}"
                         )
                         self._sync_payload_hardware_recording(True)
                         ok = bool(src.start_recording(str(tmp)))
                         self._video_recording = bool(ok)
                         self._video_recording_tmp_path = str(tmp) if ok else ""
+                        self._video_recording_source_id = rec_sid if ok else ""
+                        if ok and rec_sid:
+                            try:
+                                print(f"[VGCS:cam_rail] RECORD start source={rec_sid!r}")
+                            except Exception:
+                                pass
                         if ok:
                             self._start_native_cam_recording_tick_timer()
                         else:
                             self._sync_payload_hardware_recording(False)
                             self._stop_native_cam_recording_tick_timer()
                     if (not want_on) and bool(getattr(self, "_video_recording", False)):
+                        stop_sid = str(getattr(self, "_video_recording_source_id", "") or "").strip()
+                        stop_src = self._video_source_by_id(stop_sid) if stop_sid else src
+                        if stop_src is None:
+                            stop_src = src
                         self._sync_payload_hardware_recording(False)
                         try:
-                            src.stop_recording()
+                            if stop_src is not None:
+                                stop_src.stop_recording()
                         except Exception:
                             pass
                         self._video_recording = False
+                        self._video_recording_source_id = ""
                         self._stop_native_cam_recording_tick_timer()
                         tmp_path = str(getattr(self, "_video_recording_tmp_path", "") or "")
                         self._video_recording_tmp_path = ""
@@ -6741,6 +6813,7 @@ class MapWidget(QWidget):
             except Exception:
                 self._video_recording = False
                 self._video_recording_tmp_path = ""
+                self._video_recording_source_id = ""
                 self._stop_native_cam_recording_tick_timer()
             if getattr(self, "_camera_rail_ui_mode", "video") == "video":
                 try:
