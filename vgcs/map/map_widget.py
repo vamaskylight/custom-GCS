@@ -895,6 +895,10 @@ class MapWidget(QWidget):
         self._obs_export_bridge = _ObservationExportBridge(self)
         self._obs_export_bridge.finished.connect(self._on_observation_export_finished)
         self._obs_export_busy = False
+        self._obs_export_quick = False
+        self._obs_marks_overlay_timer: QTimer | None = None
+        self._video_ui_render_mono = 0.0
+        self._video_cache_mono = 0.0
         self._ai_phase = 0.0
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
@@ -4418,7 +4422,7 @@ class MapWidget(QWidget):
             self._video_preview_stall_timer.timeout.connect(self._on_video_preview_stall_check)
         if not hasattr(self, "_ai_timer") or self._ai_timer is None:
             self._ai_timer = QTimer(self)
-            self._ai_timer.setInterval(125)  # 8 Hz dummy overlay
+            self._ai_timer.setInterval(250)  # 4 Hz — lower paint load during Target / RTSP
             self._ai_timer.timeout.connect(self._push_dummy_ai_overlay)
 
         try:
@@ -5117,6 +5121,8 @@ class MapWidget(QWidget):
                 return
         now_frame = time.monotonic()
         self._native_video_last_frame_mono = now_frame
+        last_render = float(getattr(self, "_video_ui_render_mono", 0.0) or 0.0)
+        render_ui = (now_frame - last_render) >= 0.04  # ~25 Hz paint cap (RTSP may be 30 Hz)
         self._video_preview_got_frame = True
         if not bool(getattr(self, "_video_gui_logged_frame", False)):
             self._video_gui_logged_frame = True
@@ -5141,6 +5147,11 @@ class MapWidget(QWidget):
                 img = img.convertToFormat(QImage.Format.Format_Grayscale8)
         except Exception:
             pass
+        last_cache = float(getattr(self, "_video_cache_mono", 0.0) or 0.0)
+        refresh_cache = render_ui or (now_frame - last_cache) >= 0.15
+        if not refresh_cache:
+            return
+
         img = self._apply_digital_zoom(img, float(getattr(self, "_video_zoom", 1.0)))
         try:
             img2 = img.copy()
@@ -5148,8 +5159,14 @@ class MapWidget(QWidget):
             img2 = img
         try:
             self._native_pip_last_source_frame = img2
+            self._video_cache_mono = now_frame
         except Exception:
             pass
+
+        if not render_ui:
+            return
+
+        self._video_ui_render_mono = now_frame
 
         # Split views read `_split_last_images` (see `_on_pipeline_frame_for`). The active source
         # is also connected here; on some stacks the per-source slot does not run reliably for
@@ -5620,9 +5637,25 @@ class MapWidget(QWidget):
         if kind == "video_mark" and video_x is not None and video_y is not None:
             try:
                 self._video_obs_marks.append((float(video_x), float(video_y)))
-                self._native_video_overlay.set_video_marks(self._video_obs_marks)
+                self._schedule_video_marks_overlay_refresh()
             except Exception:
                 pass
+
+    def _schedule_video_marks_overlay_refresh(self) -> None:
+        """Coalesce overlay repaints when the operator places several Target marks quickly."""
+        t = getattr(self, "_obs_marks_overlay_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._flush_video_marks_overlay)
+            self._obs_marks_overlay_timer = t
+        t.start(32)
+
+    def _flush_video_marks_overlay(self) -> None:
+        try:
+            self._native_video_overlay.set_video_marks(list(self._video_obs_marks))
+        except Exception:
+            pass
 
     def _schedule_observation_snapshot(self, idx: int) -> None:
         """Queue JPEG write on a worker thread so Target / map clicks stay responsive."""
@@ -5848,16 +5881,25 @@ class MapWidget(QWidget):
             if quick:
                 QMessageBox.warning(self, "Observation Report", str(summary or "Export failed"))
             return
-        self._set_status(str(summary).replace("\n", " | "))
+        short = str(summary).replace("\n", " | ")
+        self._set_status(short)
         print(f"[VGCS:observe] export ok {summary}")
         if quick:
-            try:
-                first_line = str(summary).splitlines()[1] if "\n" in str(summary) else ""
-                if first_line:
-                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(first_line).parent)))
-            except Exception:
-                pass
-            QMessageBox.information(self, "Observation Report", str(summary))
+            # Modal QMessageBox + shell-open while RTSP/ffmpeg run on the GUI thread freezes Windows.
+            def _open_folder() -> None:
+                try:
+                    lines = [ln.strip() for ln in str(summary).splitlines() if ln.strip()]
+                    folder = ""
+                    for ln in lines[1:]:
+                        p = Path(ln)
+                        folder = str(p.parent if p.suffix else p)
+                        break
+                    if folder:
+                        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+                except Exception:
+                    pass
+
+            QTimer.singleShot(400, _open_folder)
 
     def _obs_cell(self, val: object) -> str:
         if val is None:

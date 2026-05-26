@@ -53,7 +53,7 @@ class MavlinkThread(QThread):
         # main thread on Windows ("VGCS … Not Responding") while the vehicle streams pose data.
         self._telemetry_last_emit_mono: dict[str, float] = {}
         self._telemetry_emit_interval: dict[str, float] = {
-            "HEARTBEAT": 0.05,
+            "HEARTBEAT": 0.25,
             "GLOBAL_POSITION_INT": 0.05,
             "ATTITUDE": 0.05,
             "VFR_HUD": 0.1,
@@ -345,23 +345,25 @@ class MavlinkThread(QThread):
                         int(getattr(msg, "mavlink_version", 0) or 0),
                     )
                 hb_now = time.monotonic()
-                if hb_now - self._last_hb_log_mono >= 1.0:
+                primary = int(self._target_sysid) <= 0 or src_sys == int(self._target_sysid)
+                if primary and hb_now - self._last_hb_log_mono >= 5.0:
                     self._last_hb_log_mono = hb_now
                     self.log_line.emit(
                         f"HEARTBEAT sys={msg.get_srcSystem()} comp={msg.get_srcComponent()}"
                     )
                 armed = bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                self._emit_telemetry_payload(
-                    "HEARTBEAT",
-                    {
-                        "armed": armed,
-                        "system_status": int(getattr(msg, "system_status", 0) or 0),
-                        "custom_mode": int(getattr(msg, "custom_mode", 0) or 0),
-                        "base_mode": int(getattr(msg, "base_mode", 0) or 0),
-                        "vehicle_type": int(getattr(msg, "type", 0) or 0),
-                        "autopilot": int(getattr(msg, "autopilot", 0) or 0),
-                    },
-                )
+                if primary:
+                    self._emit_telemetry_payload(
+                        "HEARTBEAT",
+                        {
+                            "armed": armed,
+                            "system_status": int(getattr(msg, "system_status", 0) or 0),
+                            "custom_mode": int(getattr(msg, "custom_mode", 0) or 0),
+                            "base_mode": int(getattr(msg, "base_mode", 0) or 0),
+                            "vehicle_type": int(getattr(msg, "type", 0) or 0),
+                            "autopilot": int(getattr(msg, "autopilot", 0) or 0),
+                        },
+                    )
                 if not self._streams_requested and int(self._target_sysid) > 0:
                     self._streams_requested = True
                     try:
