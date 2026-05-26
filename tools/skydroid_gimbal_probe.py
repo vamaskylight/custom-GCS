@@ -17,8 +17,8 @@ from vgcs.skydroid.command_map import SKYDROID_PROFILES
 from vgcs.skydroid.protocol import build_top_frame, extract_attitude_deg, parse_top_frame
 from vgcs.skydroid.targets import local_ipv4_for_target
 
-_DEFAULT_PORTS = (19856, 5000, 14550, 14551)
-_DEFAULT_HOSTS = "192.168.144.12,192.168.144.108,192.168.43.1"
+_DEFAULT_PORTS = (5000, 19856)
+_DEFAULT_HOSTS = "192.168.144.108,192.168.144.11,192.168.144.12"
 
 
 def _print_network_context(hosts: list[str]) -> None:
@@ -72,10 +72,24 @@ def _probe(host: str, port: int, profile_id: str, timeout_s: float) -> bool:
     except Exception as e:
         print(f"  bind failed: {e}")
         return False
+    try:
+        gaa = build_top_frame("GAA", {"hz": 5})
+        sock.sendto(gaa, (host, port))
+        print(f"  TX enable GAA: {gaa.decode('ascii', errors='replace')}")
+        try:
+            data, addr = sock.recvfrom(4096)
+            dec = parse_top_frame(data)
+            yaw, pitch = extract_attitude_deg(dec)
+            print(f"  RX GAA ack from {addr[0]}:{addr[1]} tag={dec.command if dec else '?'} yaw={yaw} pitch={pitch}")
+        except socket.timeout:
+            pass
+    except Exception as e:
+        print(f"  -- GAA enable error: {e}")
     for cmd in profile.status_commands:
         frame = build_top_frame(cmd, {})
         try:
             sock.sendto(frame, (host, port))
+            print(f"  TX {cmd}: {frame.decode('ascii', errors='replace')}")
             data, addr = sock.recvfrom(4096)
             dec = parse_top_frame(data)
             yaw, pitch = extract_attitude_deg(dec)
@@ -99,7 +113,7 @@ def main() -> int:
     ap.add_argument(
         "--ports",
         default="",
-        help="Comma-separated UDP ports (default: 19856,5000,14550,14551)",
+        help="Comma-separated UDP ports (default: 5000,19856)",
     )
     ap.add_argument("--profile", default="c13_default", choices=sorted(SKYDROID_PROFILES))
     ap.add_argument("--timeout", type=float, default=0.35)
@@ -137,13 +151,13 @@ def main() -> int:
                 print(f"port {port}:")
                 if _probe(host, int(port), profile_id, float(args.timeout)):
                     print(
-                        f"\nSUCCESS: VGCS Settings → Host={host}, UDP port={port}, "
+                        f"\nSUCCESS: VGCS Settings -> Host={host}, UDP port={port}, "
                         f"profile={profile_id}"
                     )
                     return 0
                 time.sleep(0.05)
     if float(args.listen) > 0:
-        listen_port = int(ports[0]) if ports else 19856
+        listen_port = 5000
         _listen_udp(listen_port, float(args.listen))
     print("\nFAILED: no TOP attitude on any host/port. Video RTSP can still work.")
     print("Conclusion: this PC path cannot reach C13 gimbal UDP (not a VGCS bug).")

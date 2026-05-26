@@ -1,7 +1,147 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Mapping
+
+
+# --- Yunzhuo / Skydroid TOP (#TP) per PROTOCAL.doc (UDP port 5000) ---
+
+
+def tp_checksum(body_without_crc: str) -> str:
+    """ASCII sum of all bytes before checksum, as two uppercase hex digits."""
+    total = sum(ord(ch) for ch in body_without_crc) & 0xFF
+    return f"{total:02X}"
+
+
+def build_tp_frame(
+    *,
+    dest: str,
+    control: str,
+    tag: str,
+    data: str = "",
+    src: str = "U",
+    variable: bool | None = None,
+) -> bytes:
+    """
+    Build a TOP frame (#TP fixed or #tp variable).
+
+    Example: build_tp_frame(dest="G", control="w", tag="GAA", data="01")
+             -> b"#TPUG2wGAA0136"
+    """
+    dest_c = str(dest or "G").strip().upper()[:1]
+    src_c = str(src or "U").strip().upper()[:1]
+    addr = f"{src_c}{dest_c}"
+    ctrl = str(control or "w").strip().lower()[:1]
+    tag_s = str(tag or "").strip().upper()
+    if len(tag_s) != 3:
+        raise ValueError(f"tag must be 3 characters, got {tag_s!r}")
+    data_s = str(data or "")
+    use_var = variable if variable is not None else len(data_s) > 2
+    if use_var:
+        header = "#tp"
+        if len(data_s) > 0x0F:
+            raise ValueError("variable #tp data length max 15 chars")
+        length_ch = format(len(data_s), "X")[:1].upper()
+    else:
+        header = "#TP"
+        if len(data_s) != 2:
+            raise ValueError(f"fixed #TP frame requires 2 data chars, got {len(data_s)}")
+        length_ch = "2"
+    body = f"{header}{addr}{length_ch}{ctrl}{tag_s}{data_s}"
+    return f"{body}{tp_checksum(body)}".encode("ascii", errors="ignore")
+
+
+def encode_speed_2char(deg_per_s: float) -> str:
+    """Gimbal speed field: signed byte in 0.5 deg/s units, as two hex ASCII chars."""
+    units = int(round(float(deg_per_s) / 0.5))
+    units = max(-127, min(127, units))
+    return f"{units & 0xFF:02X}"
+
+
+def encode_angle_4char(deg: float) -> str:
+    """Gimbal angle field: int16 in 0.5 deg units, four hex ASCII chars (big-endian)."""
+    units = int(round(float(deg) / 0.5))
+    units = max(-32768, min(32767, units))
+    if units < 0:
+        units = (units + 0x10000) & 0xFFFF
+    return f"{units:04X}"
+
+
+def encode_attitude_field_4char(deg: float) -> str:
+    """Telemetry / GAC fields: int16 in 0.01 deg units (four hex ASCII chars)."""
+    units = int(round(float(deg) * 100.0))
+    units = max(-32768, min(32767, units))
+    if units < 0:
+        units = (units + 0x10000) & 0xFFFF
+    return f"{units:04X}"
+
+
+def decode_attitude_field_4char(field: str) -> float | None:
+    """Decode four hex ASCII chars (0.01 deg) to degrees."""
+    s = str(field or "").strip().upper()
+    if len(s) != 4 or not re.fullmatch(r"[0-9A-F]{4}", s):
+        return None
+    raw = int(s, 16)
+    if raw >= 0x8000:
+        raw -= 0x10000
+    return raw / 100.0
+
+
+def build_gaa_enable(hz: int = 5) -> bytes:
+    """Enable active gimbal attitude push (GAA); hz 1–100."""
+    rate = max(1, min(100, int(hz)))
+    return build_tp_frame(dest="G", control="w", tag="GAA", data=f"{rate:02X}")
+
+
+def build_gac_query() -> bytes:
+    """Query gimbal attitude once (GAC read)."""
+    return build_tp_frame(dest="G", control="r", tag="GAC", data="00")
+
+
+def build_ptz(action: str) -> bytes | None:
+    codes = {
+        "stop": "00",
+        "up": "01",
+        "down": "02",
+        "left": "03",
+        "right": "04",
+        "center": "05",
+    }
+    code = codes.get(str(action or "").strip().lower())
+    if code is None:
+        return None
+    return build_tp_frame(dest="G", control="w", tag="PTZ", data=code)
+
+
+def build_gimbal_speed(yaw_deg_s: float, pitch_deg_s: float) -> bytes:
+    y = encode_speed_2char(yaw_deg_s)
+    p = encode_speed_2char(pitch_deg_s)
+    return build_tp_frame(dest="G", control="w", tag="GSM", data=f"{y}{p}")
+
+
+def build_gimbal_angle_axis(axis_tag: str, deg: float, speed: float = 16.0) -> bytes:
+    """Single-axis angle command (GAY yaw / GAP pitch). speed in 0.5 deg/s units (0–99)."""
+    tag = str(axis_tag or "").strip().upper()
+    if tag not in ("GAY", "GAP", "GAR"):
+        raise ValueError(f"unsupported angle tag {tag!r}")
+    ang = encode_angle_4char(deg)
+    spd = encode_speed_2char(speed)
+    return build_tp_frame(dest="G", control="w", tag=tag, data=f"{ang}{spd}", variable=True)
+
+
+def build_system_command(tag: str, data: str, *, write: bool = True) -> bytes:
+    """D-class system command (record, photo, etc.) U -> D."""
+    return build_tp_frame(
+        dest="D",
+        control="w" if write else "r",
+        tag=str(tag).upper()[:3],
+        data=data,
+        variable=len(str(data)) != 2,
+    )
+
+
+# --- Legacy $TOP,...*XOR (kept for simulators / old captures) ---
 
 
 def _xor_checksum(data: str) -> int:
@@ -11,13 +151,7 @@ def _xor_checksum(data: str) -> int:
     return value & 0xFF
 
 
-def build_top_frame(command: str, params: Mapping[str, object] | None = None) -> bytes:
-    """
-    Build a lightweight TOP-style ASCII UDP frame with checksum.
-
-    Format:
-      $TOP,<COMMAND>[,<key>=<value>...]*<XOR2>\r\n
-    """
+def build_legacy_top_frame(command: str, params: Mapping[str, object] | None = None) -> bytes:
     cmd = str(command or "").strip().upper()
     if not cmd:
         raise ValueError("command is required")
@@ -32,14 +166,142 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
     return f"${body}*{checksum:02X}\r\n".encode("ascii", errors="ignore")
 
 
+def build_top_frame(command: str, params: Mapping[str, object] | None = None) -> bytes:
+    """
+    Build a TOP command frame.
+
+    Maps high-level command names to official #TP frames when recognized;
+    otherwise falls back to legacy $TOP,... format.
+    """
+    cmd = str(command or "").strip().upper()
+    if not cmd:
+        raise ValueError("command is required")
+    p = params or {}
+
+    if cmd == "GAA":
+        hz = int(p.get("hz", p.get("rate", 5)) or 5)
+        return build_gaa_enable(hz)
+    if cmd == "GAC":
+        return build_gac_query()
+
+    # PTZ aliases
+    ptz_alias = {
+        "PT_UP": "up",
+        "PT_DOWN": "down",
+        "PT_LEFT": "left",
+        "PT_RIGHT": "right",
+        "PT_CENTER": "center",
+        "PT_STOP": "stop",
+        "PTZ_UP": "up",
+        "PTZ_DOWN": "down",
+        "PTZ_LEFT": "left",
+        "PTZ_RIGHT": "right",
+        "PTZ_CENTER": "center",
+        "PTZ_STOP": "stop",
+    }
+    if cmd in ptz_alias:
+        frame = build_ptz(ptz_alias[cmd])
+        if frame is not None:
+            return frame
+    if cmd == "PTZ":
+        act = str(p.get("action", "stop"))
+        frame = build_ptz(act)
+        if frame is not None:
+            return frame
+
+    # Speed
+    if cmd in ("GSY", "GSP", "GSR"):
+        spd = float(p.get("speed", p.get("yaw", p.get("pitch", 0.0)) or 0.0))
+        if cmd == "GSP":
+            spd = float(p.get("pitch", p.get("speed", 0.0)) or 0.0)
+        elif cmd == "GSR":
+            spd = float(p.get("roll", p.get("speed", 0.0)) or 0.0)
+        else:
+            spd = float(p.get("yaw", p.get("speed", 0.0)) or 0.0)
+        return build_tp_frame(dest="G", control="w", tag=cmd, data=encode_speed_2char(spd))
+
+    if cmd == "GSM":
+        yaw = float(p.get("yaw", 0.0) or 0.0)
+        pitch = float(p.get("pitch", 0.0) or 0.0)
+        return build_gimbal_speed(yaw, pitch)
+
+    # Angle
+    if cmd in ("GAY", "GAP", "GAR", "GAM"):
+        if cmd == "GAM":
+            yaw = float(p.get("yaw", 0.0) or 0.0)
+            pitch = float(p.get("pitch", 0.0) or 0.0)
+            return build_tp_frame(
+                dest="G",
+                control="w",
+                tag="GAM",
+                data=f"{encode_angle_4char(yaw)}{encode_angle_4char(pitch)}",
+                variable=True,
+            )
+        deg = float(
+            p.get(
+                "yaw" if cmd == "GAY" else "pitch" if cmd == "GAP" else "roll",
+                p.get("angle", 0.0),
+            )
+            or 0.0
+        )
+        spd = float(p.get("speed", 16.0) or 16.0)
+        return build_gimbal_angle_axis(cmd, deg, spd)
+
+    # Camera / system (best-effort fixed 2-byte data)
+    cam_map = {
+        "CAM_REC": ("REC", "01"),
+        "CAM_RECORD": ("REC", "01"),
+        "CAM_SNAP": ("CAP", "01"),
+        "CAM_PHOTO": ("CAP", "01"),
+    }
+    if cmd in cam_map:
+        tag, data = cam_map[cmd]
+        return build_system_command(tag, data)
+
+    return build_legacy_top_frame(cmd, p)
+
+
 @dataclass(frozen=True)
 class DecodedTopFrame:
     command: str
     params: dict[str, str]
     raw: str
+    protocol: str = "tp"  # "tp" | "legacy"
 
 
-def parse_top_frame(raw: bytes) -> DecodedTopFrame | None:
+_TP_RE = re.compile(
+    r"^#tp([UMDEG]{2})([0-9A-F])([wr])([A-Z]{3})(.*?)([0-9A-F]{2})$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_tp_frame(raw: bytes) -> DecodedTopFrame | None:
+    text = (raw or b"").decode("ascii", errors="ignore").strip()
+    if not text.upper().startswith("#TP"):
+        return None
+    m = _TP_RE.match(text)
+    if not m:
+        return None
+    _addr, _length, _ctrl, tag, data, _crc = m.groups()
+    tag_u = tag.upper()
+    params: dict[str, str] = {"tag": tag_u}
+    if tag_u == "GAC" and len(data) >= 12:
+        params["yaw_hex"] = data[0:4]
+        params["pitch_hex"] = data[4:8]
+        params["roll_hex"] = data[8:12]
+        yaw = decode_attitude_field_4char(data[0:4])
+        pitch = decode_attitude_field_4char(data[4:8])
+        roll = decode_attitude_field_4char(data[8:12])
+        if yaw is not None:
+            params["yaw"] = f"{yaw:.4f}"
+        if pitch is not None:
+            params["pitch"] = f"{pitch:.4f}"
+        if roll is not None:
+            params["roll"] = f"{roll:.4f}"
+    return DecodedTopFrame(command=tag_u, params=params, raw=text, protocol="tp")
+
+
+def parse_legacy_top_frame(raw: bytes) -> DecodedTopFrame | None:
     text = (raw or b"").decode("ascii", errors="ignore").strip()
     if not text:
         return None
@@ -66,7 +328,14 @@ def parse_top_frame(raw: bytes) -> DecodedTopFrame | None:
             params["pitch"] = bare_nums[1]
         if "roll" not in params and len(bare_nums) >= 3:
             params["roll"] = bare_nums[2]
-    return DecodedTopFrame(command=command, params=params, raw=(raw or b"").decode("ascii", errors="ignore"))
+    return DecodedTopFrame(command=command, params=params, raw=(raw or b"").decode("ascii", errors="ignore"), protocol="legacy")
+
+
+def parse_top_frame(raw: bytes) -> DecodedTopFrame | None:
+    dec = parse_tp_frame(raw)
+    if dec is not None:
+        return dec
+    return parse_legacy_top_frame(raw)
 
 
 _ATTITUDE_KEYS: tuple[tuple[str, str], ...] = (
@@ -82,7 +351,7 @@ _ATTITUDE_KEYS: tuple[tuple[str, str], ...] = (
 
 
 def extract_attitude_deg(dec: DecodedTopFrame | None) -> tuple[float | None, float | None]:
-    """Parse yaw/pitch from a TOP frame (GAA/GAC/GAY replies and async telemetry)."""
+    """Parse yaw/pitch from a TOP frame (GAC/GAA replies and async telemetry)."""
     if dec is None:
         return None, None
     yaw_v: float | None = None
@@ -115,4 +384,3 @@ def _to_float(v: object) -> float | None:
         return float(s)
     except Exception:
         return None
-

@@ -1990,7 +1990,7 @@ class MainWindow(QMainWindow):
         )
         skydroid_port = QSpinBox()
         skydroid_port.setRange(1, 65535)
-        skydroid_port.setValue(19856)
+        skydroid_port.setValue(5000)
         skydroid_timeout = QSpinBox()
         skydroid_timeout.setRange(50, 5000)
         skydroid_timeout.setValue(250)
@@ -2021,8 +2021,8 @@ class MainWindow(QMainWindow):
                 "SIYI gimbal SDK (ZR10, ZT6, A8 mini): UDP port 37260 on the camera IP — usually the same host as your RTSP URL."
             ),
             "skydroid": (
-                "Skydroid C13: gimbal UDP 192.168.144.12 port 19856 (field manual). RTSP stays 192.168.144.108 :554. "
-                "VGCS also probes 5000/14550 if needed. PC should be on 192.168.144.x when possible."
+                "Skydroid C13 TOP (PROTOCAL): UDP 192.168.144.108 port 5000 (#TP frames). "
+                "RTSP: rtsp://192.168.144.108:554/stream=1. PC Ethernet 192.168.144.10/24."
             ),
         }
         _CAMERA_STACK_INDEX = {"mavlink": 0, "siyi": 1, "skydroid": 2}
@@ -2127,9 +2127,9 @@ class MainWindow(QMainWindow):
         )
         skydroid_host.setText(str(s.value("camera/skydroid_host", "") or ""))
         try:
-            skydroid_port.setValue(int(s.value("camera/skydroid_port", 19856) or 19856))
+            skydroid_port.setValue(int(s.value("camera/skydroid_port", 5000) or 5000))
         except Exception:
-            skydroid_port.setValue(19856)
+            skydroid_port.setValue(5000)
         try:
             skydroid_timeout.setValue(int(s.value("camera/skydroid_timeout_ms", 250) or 250))
         except Exception:
@@ -2918,7 +2918,7 @@ class MainWindow(QMainWindow):
         if provider == "skydroid":
             hosts = resolve_skydroid_control_hosts(self._settings)
             host = hosts[0] if hosts else resolve_skydroid_host(self._settings)
-            port = int(self._settings.value("camera/skydroid_port", 19856) or 19856)
+            port = int(self._settings.value("camera/skydroid_port", 5000) or 5000)
             timeout_ms = int(self._settings.value("camera/skydroid_timeout_ms", 250) or 250)
             profile_id = str(self._settings.value("camera/skydroid_profile", "c13_default") or "c13_default")
             cc = SkydroidCameraControl(

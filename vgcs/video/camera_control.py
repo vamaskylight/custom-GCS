@@ -222,7 +222,7 @@ class SkydroidCameraControl:
         *,
         host: str,
         hosts: list[str] | None = None,
-        port: int = 19856,
+        port: int = 5000,
         timeout_s: float = 0.25,
         retries: int = 2,
         log_path: str = "",
