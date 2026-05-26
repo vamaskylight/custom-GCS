@@ -596,6 +596,133 @@ class _VideoEncodeTask(QRunnable):
             return
 
 
+class _ObservationSnapshotBridge(QObject):
+    finished = Signal(int, str)  # observation index, snapshot path (may be empty)
+
+
+class _ObservationSnapshotTask(QRunnable):
+    """Save a preview still off the GUI thread (Target / Report must not freeze the app)."""
+
+    def __init__(self, img: QImage, dest: Path, idx: int, bridge: _ObservationSnapshotBridge) -> None:
+        super().__init__()
+        self._img = img
+        self._dest = dest
+        self._idx = int(idx)
+        self._bridge = bridge
+
+    def run(self) -> None:
+        path = ""
+        try:
+            if _save_qimage_to_path(self._img, self._dest):
+                path = str(self._dest)
+        except Exception:
+            path = ""
+        try:
+            self._bridge.finished.emit(self._idx, path)
+        except Exception:
+            pass
+
+
+class _ObservationExportBridge(QObject):
+    finished = Signal(bool, str)  # ok, summary message
+
+
+class _ObservationExportTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        rows: list[dict[str, object]],
+        csv_path: str,
+        html_path: str,
+        obs_cell_fn,
+        bridge: _ObservationExportBridge,
+    ) -> None:
+        super().__init__()
+        self._rows = list(rows)
+        self._csv_path = str(csv_path)
+        self._html_path = str(html_path)
+        self._obs_cell_fn = obs_cell_fn
+        self._bridge = bridge
+
+    def run(self) -> None:
+        fields = [
+            "timestamp_utc",
+            "kind",
+            "map_lat",
+            "map_lon",
+            "video_x_norm",
+            "video_y_norm",
+            "vehicle_lat",
+            "vehicle_lon",
+            "vehicle_heading_deg",
+            "vehicle_rel_alt_m",
+            "gimbal_yaw_deg",
+            "gimbal_pitch_deg",
+            "gps_fix_type",
+            "gps_satellites",
+            "snapshot_path",
+            "clip_path",
+        ]
+        ok = False
+        summary = ""
+        try:
+            with open(self._csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                for row in self._rows:
+                    w.writerow({k: row.get(k) for k in fields})
+            html_rows = []
+            for idx, row in enumerate(self._rows, start=1):
+                html_rows.append(
+                    "<tr>"
+                    f"<td>{idx}</td>"
+                    f"<td>{row.get('timestamp_utc','')}</td>"
+                    f"<td>{row.get('kind','')}</td>"
+                    f"<td>{row.get('map_lat','')}</td>"
+                    f"<td>{row.get('map_lon','')}</td>"
+                    f"<td>{row.get('vehicle_lat','')}</td>"
+                    f"<td>{row.get('vehicle_lon','')}</td>"
+                    f"<td>{self._obs_cell_fn(row.get('gimbal_yaw_deg'))}</td>"
+                    f"<td>{self._obs_cell_fn(row.get('gimbal_pitch_deg'))}</td>"
+                    f"<td>{row.get('video_x_norm','')}</td>"
+                    f"<td>{row.get('video_y_norm','')}</td>"
+                    f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
+                    f"<td>{row.get('gps_fix_type','')}</td>"
+                    f"<td>{row.get('gps_satellites','')}</td>"
+                    f"<td>{row.get('snapshot_path','')}</td>"
+                    f"<td>{row.get('clip_path','')}</td>"
+                    "</tr>"
+                )
+            html = (
+                "<!doctype html><html><head><meta charset='utf-8'/>"
+                "<title>Observation Summary</title>"
+                "<style>body{font-family:Segoe UI,Arial,sans-serif;padding:20px;} table{border-collapse:collapse;width:100%;}"
+                "th,td{border:1px solid #ccc;padding:6px;font-size:12px;} th{background:#f3f6fb;text-align:left;}</style>"
+                "</head><body>"
+                f"<h2>Observation Report ({len(self._rows)} entries)</h2>"
+                "<table><thead><tr>"
+                "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th>"
+                "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
+                "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th>"
+                "<th>GPS Fix</th><th>GPS Sats</th><th>Snapshot</th><th>Clip</th>"
+                "</tr></thead><tbody>"
+                + "".join(html_rows)
+                + "</tbody></table></body></html>"
+            )
+            Path(self._html_path).write_text(html, encoding="utf-8")
+            csv_abs = str(Path(self._csv_path).resolve())
+            html_abs = str(Path(self._html_path).resolve())
+            summary = f"Exported {len(self._rows)} observation(s):\n{csv_abs}\n{html_abs}"
+            ok = True
+        except Exception as e:
+            summary = f"Observation export failed: {e}"
+            ok = False
+        try:
+            self._bridge.finished.emit(bool(ok), summary)
+        except Exception:
+            pass
+
+
 class _TileProbeBridge(QObject):
     result = Signal(str, str, str)  # provider_label, outcome, detail
 
@@ -763,6 +890,11 @@ class MapWidget(QWidget):
         self._obs_mark_mode = False
         self._observations: list[dict[str, object]] = []
         self._video_obs_marks: list[tuple[float, float]] = []
+        self._obs_snapshot_bridge = _ObservationSnapshotBridge(self)
+        self._obs_snapshot_bridge.finished.connect(self._on_observation_snapshot_saved)
+        self._obs_export_bridge = _ObservationExportBridge(self)
+        self._obs_export_bridge.finished.connect(self._on_observation_export_finished)
+        self._obs_export_busy = False
         self._ai_phase = 0.0
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
@@ -5211,6 +5343,38 @@ class MapWidget(QWidget):
         except Exception:
             return img
 
+    def _preview_image_copy_for_snapshot(self) -> QImage | None:
+        """Return a deep copy of the latest preview frame (GUI thread only, no RTSP init)."""
+        try:
+            img = getattr(self, "_native_pip_last_source_frame", None)
+            if isinstance(img, QImage) and not img.isNull() and img.width() > 0 and img.height() > 0:
+                return img.copy()
+        except Exception:
+            pass
+        try:
+            cache = getattr(self, "_split_last_images", None) or {}
+            ordered = [
+                cache.get("day"),
+                cache.get("thermal"),
+                *[v for k, v in cache.items() if k not in ("day", "thermal")],
+            ]
+            for im in ordered:
+                if isinstance(im, QImage) and not im.isNull() and im.width() > 0 and im.height() > 0:
+                    return im.copy()
+        except Exception:
+            pass
+        try:
+            data_url = str(getattr(self, "_video_last_data_url", "") or "").strip()
+            if data_url.startswith("data:image/") and "," in data_url:
+                head, b64 = data_url.split(",", 1)
+                raw = base64.b64decode(b64)
+                im = QImage.fromData(raw)
+                if not im.isNull():
+                    return im.copy()
+        except Exception:
+            pass
+        return None
+
     def _capture_photo_quick(self, output_path: str | None = None) -> str | None:
         """
         Save a still image from the best available live preview source.
@@ -5239,52 +5403,17 @@ class MapWidget(QWidget):
                 return None
             dest = photos_dir / f"photo_{stamp}.jpg"
 
+        img = self._preview_image_copy_for_snapshot()
+        if img is not None and _save_qimage_to_path(img, dest):
+            return str(dest)
+
+        # Last resort: QtMultimedia capture (can block; avoid on observation hot path).
         try:
             self._ensure_video_preview_backend()
             src = getattr(self, "_video_active_source", None)
             if src is not None and hasattr(src, "take_photo"):
                 if bool(src.take_photo(str(dest))):
                     return str(dest)
-        except Exception:
-            pass
-
-        try:
-            img = getattr(self, "_native_pip_last_source_frame", None)
-            if isinstance(img, QImage) and not img.isNull() and img.width() > 0 and img.height() > 0:
-                if _save_qimage_to_path(img, dest):
-                    return str(dest)
-        except Exception:
-            pass
-
-        try:
-            cache = getattr(self, "_split_last_images", None) or {}
-            ordered = [
-                cache.get("day"),
-                cache.get("thermal"),
-                *[v for k, v in cache.items() if k not in ("day", "thermal")],
-            ]
-            for im in ordered:
-                if isinstance(im, QImage) and not im.isNull() and im.width() > 0 and im.height() > 0:
-                    if _save_qimage_to_path(im, dest):
-                        return str(dest)
-                    break
-        except Exception:
-            pass
-
-        try:
-            data_url = str(getattr(self, "_video_last_data_url", "") or "").strip()
-            if data_url.startswith("data:image/") and photos_dir is not None:
-                head, b64 = data_url.split(",", 1)
-                ext = "png" if "image/png" in head.lower() else "jpg"
-                out = photos_dir / f"photo_{stamp}.{ext}"
-                raw = base64.b64decode(b64)
-                out.write_bytes(raw)
-                return str(out)
-            if data_url.startswith("data:image/") and explicit:
-                head, b64 = data_url.split(",", 1)
-                raw = base64.b64decode(b64)
-                dest.write_bytes(raw)
-                return str(dest)
         except Exception:
             pass
         return None
@@ -5333,7 +5462,12 @@ class MapWidget(QWidget):
                 nm.set_observation_mark_mode(bool(enabled))
         except Exception:
             pass
-        self._run_js(f"if (window.setObservationMarkMode) setObservationMarkMode({1 if enabled else 0});")
+        if not self._map_uses_legacy_web_bridge():
+            pass
+        else:
+            self._run_js(
+                f"if (window.setObservationMarkMode) setObservationMarkMode({1 if enabled else 0});"
+            )
         try:
             self._btn_native_target.blockSignals(True)
             self._btn_native_target.setChecked(bool(enabled))
@@ -5412,6 +5546,31 @@ class MapWidget(QWidget):
         clip_path: str | None = None,
         capture_snapshot: bool = True,
     ) -> None:
+        """Return quickly from UI handlers; heavy snapshot I/O runs on a worker thread."""
+        QTimer.singleShot(
+            0,
+            lambda: self._log_observation_impl(
+                kind,
+                map_lat=map_lat,
+                map_lon=map_lon,
+                video_x=video_x,
+                video_y=video_y,
+                clip_path=clip_path,
+                capture_snapshot=capture_snapshot,
+            ),
+        )
+
+    def _log_observation_impl(
+        self,
+        kind: str,
+        *,
+        map_lat: float | None = None,
+        map_lon: float | None = None,
+        video_x: float | None = None,
+        video_y: float | None = None,
+        clip_path: str | None = None,
+        capture_snapshot: bool = True,
+    ) -> None:
         ts = datetime.now(timezone.utc).isoformat()
         row: dict[str, object] = {
             "timestamp_utc": ts,
@@ -5427,7 +5586,7 @@ class MapWidget(QWidget):
         self._observations.append(row)
         idx = len(self._observations) - 1
         if capture_snapshot:
-            QTimer.singleShot(0, lambda i=idx: self._fill_observation_snapshot(i))
+            self._schedule_observation_snapshot(idx)
         try:
             print(
                 f"[VGCS:observe] logged {kind} count={len(self._observations)} "
@@ -5465,16 +5624,33 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
-    def _fill_observation_snapshot(self, idx: int) -> None:
-        """Deferred still capture so Target clicks register immediately (RTSP/ffmpeg can block)."""
+    def _schedule_observation_snapshot(self, idx: int) -> None:
+        """Queue JPEG write on a worker thread so Target / map clicks stay responsive."""
         if idx < 0 or idx >= len(self._observations):
             return
+        img = self._preview_image_copy_for_snapshot()
+        if img is None or img.isNull():
+            return
+        photos_dir = Path.cwd() / "captures" / "observations"
         try:
-            snap = self._capture_photo_quick()
-            if snap:
-                self._observations[idx]["snapshot_path"] = str(snap)
+            photos_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
-            pass
+            return
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        dest = photos_dir / f"obs_snap_{stamp}_{idx}.jpg"
+        pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
+        pool.start(_ObservationSnapshotTask(img, dest, idx, self._obs_snapshot_bridge))
+
+    def _on_observation_snapshot_saved(self, idx: int, path: str) -> None:
+        if idx < 0 or idx >= len(self._observations):
+            return
+        p = str(path or "").strip()
+        if p:
+            self._observations[idx]["snapshot_path"] = p
+
+    def _fill_observation_snapshot(self, idx: int) -> None:
+        """Backward-compatible entry: async snapshot only."""
+        self._schedule_observation_snapshot(idx)
 
     def _observation_export_dir(self) -> Path:
         base = Path.cwd()
@@ -5619,6 +5795,9 @@ class MapWidget(QWidget):
             if quick:
                 QMessageBox.warning(self, "Observation Report", msg)
             return
+        if bool(getattr(self, "_obs_export_busy", False)):
+            self._set_status("Observation export already in progress…")
+            return
         suggested = f"observations_{time.strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = ""
         if quick:
@@ -5644,53 +5823,41 @@ class MapWidget(QWidget):
                 return
             if not csv_path:
                 return
-        fields = [
-            "timestamp_utc",
-            "kind",
-            "map_lat",
-            "map_lon",
-            "video_x_norm",
-            "video_y_norm",
-            "vehicle_lat",
-            "vehicle_lon",
-            "vehicle_heading_deg",
-            "vehicle_rel_alt_m",
-            "gimbal_yaw_deg",
-            "gimbal_pitch_deg",
-            "gps_fix_type",
-            "gps_satellites",
-            "snapshot_path",
-            "clip_path",
-        ]
-        try:
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=fields)
-                w.writeheader()
-                for row in self._observations:
-                    w.writerow({k: row.get(k) for k in fields})
-        except Exception as e:
-            self._set_status(f"Observation CSV export failed: {e}")
-            return
         html_path = str(Path(csv_path).with_suffix(".html"))
-        try:
-            self._write_observation_html_summary(html_path)
-        except Exception as e:
-            html_path = ""
-            self._set_status(f"Observations exported (CSV only): {csv_path} — HTML failed: {e}")
+        self._obs_export_busy = True
+        self._obs_export_quick = bool(quick)
+        self._set_status("Exporting observation report…")
+        rows = [dict(r) for r in self._observations]
+        pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
+        pool.start(
+            _ObservationExportTask(
+                rows=rows,
+                csv_path=csv_path,
+                html_path=html_path,
+                obs_cell_fn=self._obs_cell,
+                bridge=self._obs_export_bridge,
+            )
+        )
+
+    def _on_observation_export_finished(self, ok: bool, summary: str) -> None:
+        self._obs_export_busy = False
+        quick = bool(getattr(self, "_obs_export_quick", False))
+        self._obs_export_quick = False
+        if not ok:
+            self._set_status(str(summary or "Observation export failed"))
+            if quick:
+                QMessageBox.warning(self, "Observation Report", str(summary or "Export failed"))
             return
-        csv_abs = str(Path(csv_path).resolve())
-        html_abs = str(Path(html_path).resolve()) if html_path else ""
-        summary = f"Exported {n} observation(s):\n{csv_abs}"
-        if html_abs:
-            summary += f"\n{html_abs}"
-        self._set_status(f"Observations exported: {csv_abs}" + (f" | {html_abs}" if html_abs else ""))
-        print(f"[VGCS:observe] export ok entries={n} csv={csv_abs} html={html_abs or '-'}")
+        self._set_status(str(summary).replace("\n", " | "))
+        print(f"[VGCS:observe] export ok {summary}")
         if quick:
             try:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(csv_abs).parent)))
+                first_line = str(summary).splitlines()[1] if "\n" in str(summary) else ""
+                if first_line:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(first_line).parent)))
             except Exception:
                 pass
-            QMessageBox.information(self, "Observation Report", summary)
+            QMessageBox.information(self, "Observation Report", str(summary))
 
     def _obs_cell(self, val: object) -> str:
         if val is None:
@@ -6469,7 +6636,20 @@ class MapWidget(QWidget):
             self.mission_start_requested.emit()
             self._run_js("document.title = 'VGCS Map';")
 
+    def _map_uses_legacy_web_bridge(self) -> bool:
+        """Native Qt map is default; legacy Leaflet/WebEngine JS is optional (3D / old path)."""
+        if bool(getattr(self, "_is_3d_mode", False)):
+            return bool(getattr(self, "_web_ready", False))
+        return getattr(self, "_native_map", None) is None and bool(getattr(self, "_web_ready", False))
+
     def _run_js(self, script: str, callback=None) -> None:
+        if not self._map_uses_legacy_web_bridge():
+            if callback is not None:
+                try:
+                    callback(None)
+                except Exception:
+                    pass
+            return
         if not getattr(self, "_web_ready", False):
             return
         w3 = getattr(self, "_web_3d_view", None)

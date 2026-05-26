@@ -2888,15 +2888,13 @@ class MainWindow(QMainWindow):
         """Run after staged video pipeline work so camera hot-swap does not pile on the same burst."""
 
         def _do() -> None:
-            # Skydroid/SIYI do not require MAVLink; always hot-swap camera control after Apply.
-            try:
-                self._set_runtime_camera_control()
-            except Exception:
-                pass
             try:
                 self._append_log("Video settings applied.")
             except Exception:
                 pass
+            # Skydroid probe / socket setup off the tail of RTSP teardown (still on GUI thread but
+            # after the dialog and decode restart have yielded).
+            QTimer.singleShot(80, self._set_runtime_camera_control)
 
         QTimer.singleShot(0, _do)
 
