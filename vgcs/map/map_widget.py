@@ -903,6 +903,9 @@ class MapWidget(QWidget):
         self._obs_export_quick = False
         self._obs_marks_overlay_timer: QTimer | None = None
         self._video_ui_render_mono = 0.0
+        self._split_ui_render_mono = 0.0
+        self._split_cache_mono: dict[str, float] = {}
+        self._split_render_timer: QTimer | None = None
         self._video_cache_mono = 0.0
         self._obs_clip_active = False
         self._obs_clip_secs_left = 0
@@ -1700,7 +1703,7 @@ class MapWidget(QWidget):
         # Use the small map PiP (same corner) to swap back to map-main, unchanged.
         if was_swapped and split_on and preview_on:
             self._pick_split_fullscreen_source_from_click(event)
-            self._layout_native_video_preview()
+            QTimer.singleShot(0, self._apply_native_video_click_layout)
             try:
                 self._run_js("setVideoSwapMode(false);")
             except Exception:
@@ -1720,15 +1723,22 @@ class MapWidget(QWidget):
             self._refresh_native_overlay_insets()
         else:
             self._video_swap_user_map_main = True
-        self._layout_native_video_preview()
-        if self._video_swapped:
-            self._ensure_video_pro_hud_visible()
-        else:
-            self._show_map_main_surface()
+        QTimer.singleShot(0, self._apply_native_video_click_layout)
         # Native fullscreen toggle is fully handled in Qt. Keep Web map in map mode
         # to avoid duplicating/fragmenting video content in Web overlays/minimap grabs.
         try:
             self._run_js("setVideoSwapMode(false);")
+        except Exception:
+            pass
+
+    def _apply_native_video_click_layout(self) -> None:
+        """Deferred layout after video click so the GUI thread stays responsive under dual RTSP."""
+        try:
+            self._layout_native_video_preview()
+            if bool(getattr(self, "_video_swapped", False)):
+                self._ensure_video_pro_hud_visible()
+            else:
+                self._show_map_main_surface()
         except Exception:
             pass
 
@@ -1809,12 +1819,8 @@ class MapWidget(QWidget):
         if not sid:
             self._split_fullscreen_source_id = None
             return
-        cache = getattr(self, "_split_last_images", None) or {}
-        im = cache.get(str(sid))
-        if isinstance(im, QImage) and not im.isNull() and im.width() > 0:
-            self._split_fullscreen_source_id = str(sid)
-        else:
-            self._split_fullscreen_source_id = None
+        # Remember operator intent even before the first thermal frame (avoid fullscreen 2×2 composite).
+        self._split_fullscreen_source_id = str(sid)
 
     def _schedule_minimap_grab_refresh(self) -> None:
         try:
@@ -2841,6 +2847,59 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
+    def _schedule_split_preview_render(self) -> None:
+        """Coalesce 2×2 composite paints (~25 Hz) so dual RTSP does not freeze the GUI."""
+        if not bool(getattr(self, "_video_split_enabled", False)):
+            return
+        if not bool(getattr(self, "_video_preview_enabled", False)):
+            return
+        now = time.monotonic()
+        gap = 0.04
+        last = float(getattr(self, "_split_ui_render_mono", 0.0) or 0.0)
+        t = getattr(self, "_split_render_timer", None)
+        if t is None:
+            self._split_ui_render_mono = now
+            self._render_native_split_preview()
+            return
+        if now - last >= gap:
+            t.stop()
+            self._split_ui_render_mono = now
+            self._render_native_split_preview()
+            return
+        if not t.isActive():
+            t.start(max(1, int((gap - (now - last)) * 1000)))
+
+    def _flush_split_preview_render(self) -> None:
+        self._split_ui_render_mono = time.monotonic()
+        try:
+            self._render_native_split_preview()
+        except Exception:
+            pass
+
+    def _render_split_fullscreen_waiting(self, source_id: str) -> None:
+        """Fullscreen single channel before the first decoded frame (avoid painting a 2×2 grid)."""
+        label = self._split_cell_label(source_id) or str(source_id)
+        try:
+            w = max(320, int(self._native_video_preview.width() or 640))
+            h = max(180, int(self._native_video_preview.height() or 360))
+        except Exception:
+            w, h = 640, 360
+        try:
+            out = QImage(w, h, QImage.Format.Format_RGB32)
+            out.fill(QColor(10, 13, 20))
+            p = QPainter(out)
+            p.setPen(QColor(180, 200, 230))
+            p.setFont(QFont("Segoe UI", 14, QFont.Weight.DemiBold))
+            p.drawText(
+                out.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                f"{label}\nWaiting for stream…",
+            )
+            p.end()
+            self._render_native_video_preview(out)
+        except Exception:
+            pass
+
     def _render_native_split_preview(self) -> None:
         """
         Git `setVideoPreviewGrid` parity: 4 cells in id order (day, thermal, …); empty cells stay dark.
@@ -2863,6 +2922,11 @@ class MapWidget(QWidget):
                     except Exception:
                         pass
                     return
+                try:
+                    self._render_split_fullscreen_waiting(str(focus))
+                except Exception:
+                    pass
+                return
         cache = getattr(self, "_split_last_images", None) or {}
         keys: list[str] = []
         try:
@@ -4439,6 +4503,10 @@ class MapWidget(QWidget):
             self._video_preview_stall_timer = QTimer(self)
             self._video_preview_stall_timer.setInterval(1000)
             self._video_preview_stall_timer.timeout.connect(self._on_video_preview_stall_check)
+        if not hasattr(self, "_split_render_timer") or self._split_render_timer is None:
+            self._split_render_timer = QTimer(self)
+            self._split_render_timer.setSingleShot(True)
+            self._split_render_timer.timeout.connect(self._flush_split_preview_render)
         if not hasattr(self, "_ai_timer") or self._ai_timer is None:
             self._ai_timer = QTimer(self)
             self._ai_timer.setInterval(250)  # 4 Hz — lower paint load during Target / RTSP
@@ -5107,6 +5175,9 @@ class MapWidget(QWidget):
 
     def _on_pipeline_frame(self, vf: VideoFrame) -> None:
         # Called on the GUI thread.
+        if bool(getattr(self, "_video_split_enabled", False)):
+            # Per-source `_on_pipeline_frame_for` owns split cache + paint (active is also in sources()).
+            return
         if not bool(getattr(self, "_video_preview_enabled", False)):
             if self._uses_companion_rtsp():
                 self._video_preview_enabled = True
@@ -5187,26 +5258,6 @@ class MapWidget(QWidget):
 
         self._video_ui_render_mono = now_frame
 
-        # Split views read `_split_last_images` (see `_on_pipeline_frame_for`). The active source
-        # is also connected here; on some stacks the per-source slot does not run reliably for
-        # that same object, so the split cache never filled and the PiP stayed single-frame.
-        if bool(getattr(self, "_video_split_enabled", False)):
-            try:
-                sid = "day"
-                src = getattr(self, "_video_active_source", None)
-                if src is not None:
-                    raw = str(getattr(src, "source_id", "") or "").strip()
-                    if raw:
-                        sid = raw
-                c = getattr(self, "_split_last_images", None)
-                if isinstance(c, dict):
-                    c[str(sid)] = img2
-                self._render_native_split_preview()
-            except RuntimeError:
-                pass
-            except Exception:
-                pass
-            return
         try:
             self._render_native_video_preview(img2)
         except RuntimeError:
@@ -5217,6 +5268,18 @@ class MapWidget(QWidget):
             return
         if not bool(getattr(self, "_video_split_enabled", False)):
             return
+        now_frame = time.monotonic()
+        sid = str(source_id or "").strip()
+        cache_times = getattr(self, "_split_cache_mono", None)
+        if not isinstance(cache_times, dict):
+            cache_times = {}
+            self._split_cache_mono = cache_times
+        last_sid = float(cache_times.get(sid, 0.0) or 0.0)
+        if now_frame - last_sid < 0.04:
+            return
+        cache_times[sid] = now_frame
+        self._native_video_last_frame_mono = now_frame
+        self._video_preview_got_frame = True
         try:
             img = vf.image
         except RuntimeError:
@@ -5241,7 +5304,7 @@ class MapWidget(QWidget):
         except Exception:
             pass
         try:
-            self._render_native_split_preview()
+            self._schedule_split_preview_render()
         except RuntimeError:
             pass
 
