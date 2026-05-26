@@ -27,7 +27,7 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         },
         speed_commands=["GSY", "GSP", "GSM"],
         angle_commands=["GAY", "GAP", "GAM"],
-        status_commands=["GAA", "GAC", "GAY"],
+        status_commands=["GAC", "GAA"],
         status_response_commands=["GAA", "GAC", "GAY", "GAP", "ACK"],
         camera_commands={
             "record_toggle": ["CAM_REC", "CAM_RECORD"],
@@ -49,7 +49,7 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         },
         speed_commands=["GSP", "GSY", "GSM"],
         angle_commands=["GAP", "GAY", "GAM"],
-        status_commands=["GAC", "GAA", "GAY"],
+        status_commands=["GAC", "GAA"],
         status_response_commands=["GAC", "GAA", "GAY", "GAP", "ACK"],
         camera_commands={
             "record_toggle": ["CAM_RECORD", "CAM_REC"],

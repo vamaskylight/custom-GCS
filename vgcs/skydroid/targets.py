@@ -90,6 +90,6 @@ def resolve_skydroid_control_hosts(settings, *, default: str = "192.168.144.108"
             if parsed.hostname:
                 _add(str(parsed.hostname))
     _add(_wifi_ipv4_gateway() or "")
-    _add("192.168.144.12")  # C13 gimbal control IP (RTSP is often .108)
     _add(str(default))
+    _add("192.168.144.12")  # legacy field note; PROTOCAL uses camera IP (.108) on UDP 5000
     return out

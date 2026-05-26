@@ -13,8 +13,8 @@ from vgcs.skydroid.protocol import (
 )
 from vgcs.skydroid.transport import TopUdpTransport
 
-# C13 manual / field: gimbal UDP often 192.168.144.12:19856; RTSP stays 192.168.144.108:554
-_C13_PROBE_PORTS = (19856, 5000, 14550, 14551)
+# PROTOCAL.doc: TOP UDP port 5000; legacy field notes may mention 19856
+_C13_PROBE_PORTS = (5000, 19856)
 _PROBE_TIMEOUT_S = 0.12
 
 
@@ -65,6 +65,7 @@ class SkydroidTopUdpAdapter:
         self._probe_thread: threading.Thread | None = None
         self._probe_finished = threading.Event()
         self._probe_finished.set()
+        self._gaa_enabled = False
         self._min_dt = 1.0 / max(1.0, float(rate_limit_hz))
         self._last_send_mono = 0.0
         self._active_port = int(port)
@@ -145,6 +146,17 @@ class SkydroidTopUdpAdapter:
     def _poll_host_once(self, host: str) -> bool:
         self._transport.set_route_host(host)
         self._transport._host = host
+        if not self._gaa_enabled:
+            try:
+                self._transport.send_and_receive(
+                    build_top_frame("GAA", {"hz": 5}),
+                    expect_reply=True,
+                    log=False,
+                    timeout_s=_PROBE_TIMEOUT_S,
+                )
+                self._gaa_enabled = True
+            except Exception:
+                pass
         for status_cmd in self._profile.status_commands:
             try:
                 frame = build_top_frame(status_cmd, {})
@@ -156,10 +168,12 @@ class SkydroidTopUdpAdapter:
                 )
                 self._maybe_update_status(reply)
                 with self._status_lock:
-                    return bool(self._status.supported)
+                    if self._status.supported:
+                        return True
             except Exception:
                 continue
-        return False
+        with self._status_lock:
+            return bool(self._status.supported)
 
     def _poll_active_endpoint_once(self) -> None:
         self._transport._host = self._active_host
