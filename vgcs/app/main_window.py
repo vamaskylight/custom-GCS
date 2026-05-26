@@ -2888,9 +2888,9 @@ class MainWindow(QMainWindow):
         """Run after staged video pipeline work so camera hot-swap does not pile on the same burst."""
 
         def _do() -> None:
+            # Skydroid/SIYI do not require MAVLink; always hot-swap camera control after Apply.
             try:
-                if self._thread is not None and self._thread.isRunning():
-                    self._set_runtime_camera_control()
+                self._set_runtime_camera_control()
             except Exception:
                 pass
             try:
