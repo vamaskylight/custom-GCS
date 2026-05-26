@@ -1381,6 +1381,10 @@ class MapWidget(QWidget):
         self._split_rail_debounce.setInterval(50)
         self._split_rail_debounce.timeout.connect(self._commit_native_split_rail_toggle)
         self._follow_rail_debounce = QTimer(self)
+        self._gimbal_hold_timer = QTimer(self)
+        self._gimbal_hold_timer.setInterval(100)
+        self._gimbal_hold_timer.timeout.connect(self._on_gimbal_hold_tick)
+        self._gimbal_hold_axis: tuple[int, int] | None = None
         self._follow_rail_debounce.setSingleShot(True)
         self._follow_rail_debounce.setInterval(50)
         self._follow_rail_debounce.timeout.connect(self._commit_native_follow_rail_toggle)
@@ -6381,28 +6385,70 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-    # Skydroid TOP: 0.1 deg/s per unit, ±99 max (~±9.9 deg/s). Same speed mode for yaw and pitch.
-    _GIMBAL_HOLD_SPEED_DPS = 40.0
+    # Skydroid TOP speed: 0.1 deg/s per unit (±99 ≈ ±9.9 deg/s). Hold = slow slew; tap = angle step.
+    _GIMBAL_HOLD_SPEED_YAW_DPS = 1.8
+    _GIMBAL_HOLD_SPEED_PITCH_DPS = 1.8
+    _GIMBAL_TAP_ANGLE_DEG = 1.5
+    _GIMBAL_TAP_MAX_S = 0.22
+
+    def _gimbal_hold_speeds(self, dx: int, dy: int) -> tuple[float, float]:
+        s = QSettings("VGCS", "VGCS")
+        try:
+            sy = float(s.value("camera/skydroid_gimbal_speed_yaw", self._GIMBAL_HOLD_SPEED_YAW_DPS) or self._GIMBAL_HOLD_SPEED_YAW_DPS)
+        except Exception:
+            sy = float(self._GIMBAL_HOLD_SPEED_YAW_DPS)
+        try:
+            sp = float(
+                s.value("camera/skydroid_gimbal_speed_pitch", self._GIMBAL_HOLD_SPEED_PITCH_DPS)
+                or self._GIMBAL_HOLD_SPEED_PITCH_DPS
+            )
+        except Exception:
+            sp = float(self._GIMBAL_HOLD_SPEED_PITCH_DPS)
+        return (float(dx) * sy, float(dy) * sp)
+
+    def _gimbal_tap_angle_deg(self) -> float:
+        s = QSettings("VGCS", "VGCS")
+        try:
+            return float(s.value("camera/skydroid_gimbal_tap_deg", self._GIMBAL_TAP_ANGLE_DEG) or self._GIMBAL_TAP_ANGLE_DEG)
+        except Exception:
+            return float(self._GIMBAL_TAP_ANGLE_DEG)
 
     def _wire_native_gimbal_hold_button(self, btn: QPushButton, dx: int, dy: int) -> None:
-        """Press/hold = continuous GSY/GSP; release = GSM stop (avoids jerky PTZ pitch steps)."""
+        """Hold = low-rate GSY/GSP; quick tap = GAY/GAP step; release = GSM stop."""
+
+        state = {"t0": 0.0}
 
         def _start() -> None:
+            state["t0"] = time.monotonic()
+            self._gimbal_hold_axis = (int(dx), int(dy))
             self._native_gimbal_speed_start(dx, dy)
+            if not self._gimbal_hold_timer.isActive():
+                self._gimbal_hold_timer.start()
 
         def _stop() -> None:
+            elapsed = time.monotonic() - float(state["t0"])
+            self._gimbal_hold_axis = None
+            self._gimbal_hold_timer.stop()
             self._native_gimbal_speed_stop()
+            if elapsed < float(self._GIMBAL_TAP_MAX_S):
+                self._native_gimbal_angle_nudge(dx, dy)
 
         btn.pressed.connect(_start)
         btn.released.connect(_stop)
+
+    def _on_gimbal_hold_tick(self) -> None:
+        axis = self._gimbal_hold_axis
+        if axis is None:
+            return
+        self._native_gimbal_speed_start(axis[0], axis[1])
 
     def _native_gimbal_speed_start(self, dx: int, dy: int) -> None:
         cc = getattr(self, "_camera_control", None)
         if cc is None:
             return
-        spd = float(self._GIMBAL_HOLD_SPEED_DPS)
+        yaw_s, pitch_s = self._gimbal_hold_speeds(dx, dy)
         try:
-            cc.set_gimbal_speed(float(dx) * spd, float(dy) * spd)
+            cc.set_gimbal_speed(yaw_s, pitch_s)
         except Exception:
             pass
 
@@ -6412,6 +6458,25 @@ class MapWidget(QWidget):
             return
         try:
             cc.set_gimbal_speed(0.0, 0.0)
+            QTimer.singleShot(60, lambda: cc.set_gimbal_speed(0.0, 0.0) if cc else None)
+        except Exception:
+            pass
+
+    def _native_gimbal_angle_nudge(self, dx: int, dy: int) -> None:
+        """Small absolute-angle step on quick tap (better yaw/pitch pointing accuracy)."""
+        cc = getattr(self, "_camera_control", None)
+        if cc is None:
+            return
+        step = float(self._gimbal_tap_angle_deg())
+        try:
+            from vgcs.video.camera_control import GimbalCommand
+
+            cc.set_gimbal(
+                GimbalCommand(
+                    yaw_deg=step * float(dx) if dx else None,
+                    pitch_deg=step * float(dy) if dy else None,
+                )
+            )
         except Exception:
             pass
 

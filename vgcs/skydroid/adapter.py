@@ -122,7 +122,27 @@ class SkydroidTopUdpAdapter:
         self._enqueue(commands, {"yaw": y, "pitch": p}, True)
 
     def set_angle(self, yaw: float, pitch: float) -> None:
-        self._enqueue(["GAM"], {"yaw": float(yaw), "pitch": float(pitch)}, True)
+        self.set_angle_axes(yaw_deg=float(yaw), pitch_deg=float(pitch))
+
+    def set_angle_axes(
+        self,
+        *,
+        yaw_deg: float | None = None,
+        pitch_deg: float | None = None,
+        approach_speed_dps: float = 12.0,
+    ) -> None:
+        """Absolute angle on one or both axes (GAY/GAP/GAM) with slow approach for accuracy."""
+        params: dict[str, object] = {"speed": float(approach_speed_dps)}
+        if yaw_deg is not None and pitch_deg is not None:
+            self._enqueue(
+                ["GAM"],
+                {**params, "yaw": float(yaw_deg), "pitch": float(pitch_deg)},
+                True,
+            )
+        elif yaw_deg is not None:
+            self._enqueue(["GAY"], {**params, "yaw": float(yaw_deg)}, True)
+        elif pitch_deg is not None:
+            self._enqueue(["GAP"], {**params, "pitch": float(pitch_deg)}, True)
 
     @staticmethod
     def _speed_commands_for(yaw: float, pitch: float) -> list[str]:

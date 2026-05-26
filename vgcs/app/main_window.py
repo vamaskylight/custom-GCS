@@ -2026,6 +2026,22 @@ class MainWindow(QMainWindow):
         skydroid_grid.addWidget(skydroid_timeout, 2, 1)
         skydroid_grid.addWidget(QLabel("Firmware profile"), 3, 0)
         skydroid_grid.addWidget(skydroid_profile, 3, 1)
+        skydroid_gimbal_speed_yaw = QDoubleSpinBox()
+        skydroid_gimbal_speed_yaw.setRange(0.5, 9.9)
+        skydroid_gimbal_speed_yaw.setDecimals(1)
+        skydroid_gimbal_speed_yaw.setSingleStep(0.5)
+        skydroid_gimbal_speed_yaw.setSuffix(" deg/s")
+        skydroid_gimbal_speed_yaw.setToolTip("Hold ←/→ or ↑/↓: continuous slew rate (TOP GSY/GSP).")
+        skydroid_gimbal_tap_deg = QDoubleSpinBox()
+        skydroid_gimbal_tap_deg.setRange(0.5, 15.0)
+        skydroid_gimbal_tap_deg.setDecimals(1)
+        skydroid_gimbal_tap_deg.setSingleStep(0.5)
+        skydroid_gimbal_tap_deg.setSuffix(" deg")
+        skydroid_gimbal_tap_deg.setToolTip("Quick tap: precise angle step (TOP GAY/GAP).")
+        skydroid_grid.addWidget(QLabel("Hold slew (yaw)"), 4, 0)
+        skydroid_grid.addWidget(skydroid_gimbal_speed_yaw, 4, 1)
+        skydroid_grid.addWidget(QLabel("Tap step"), 5, 0)
+        skydroid_grid.addWidget(skydroid_gimbal_tap_deg, 5, 1)
         skydroid_grid.setColumnStretch(1, 1)
 
         camera_stack = QStackedWidget()
@@ -2158,6 +2174,16 @@ class MainWindow(QMainWindow):
         skydroid_profile.setCurrentIndex(
             max(0, skydroid_profile.findData(str(s.value("camera/skydroid_profile", "c13_default") or "c13_default")))
         )
+        try:
+            skydroid_gimbal_speed_yaw.setValue(
+                float(s.value("camera/skydroid_gimbal_speed_yaw", 1.8) or 1.8)
+            )
+        except Exception:
+            skydroid_gimbal_speed_yaw.setValue(1.8)
+        try:
+            skydroid_gimbal_tap_deg.setValue(float(s.value("camera/skydroid_gimbal_tap_deg", 1.5) or 1.5))
+        except Exception:
+            skydroid_gimbal_tap_deg.setValue(1.5)
         siyi_host.setText(str(s.value("camera/siyi_host", "") or ""))
         try:
             siyi_port.setValue(int(s.value("camera/siyi_port", 37260) or 37260))
@@ -2223,6 +2249,8 @@ class MainWindow(QMainWindow):
                 s.setValue("camera/skydroid_port", int(skydroid_port.value()))
                 s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
                 s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
+                s.setValue("camera/skydroid_gimbal_speed_yaw", float(skydroid_gimbal_speed_yaw.value()))
+                s.setValue("camera/skydroid_gimbal_tap_deg", float(skydroid_gimbal_tap_deg.value()))
                 dlg.accept()
                 # QDialog::accept() may process a nested event loop; a 0-ms timer can fire
                 # *during* that teardown and run FFmpeg/WebEngine work while the dialog is
