@@ -17,6 +17,31 @@ from vgcs.skydroid.transport import TopUdpTransport
 _C13_PROBE_PORTS = (5000, 19856)
 _PROBE_TIMEOUT_S = 0.12
 
+# Motion commands: no UDP reply wait (C13 often has no timely ACK for GSY/GSP/GSM).
+_MOTION_COMMANDS = frozenset(
+    {
+        "GSY",
+        "GSP",
+        "GSM",
+        "GAY",
+        "GAP",
+        "GAM",
+        "PTZ",
+        "PT_UP",
+        "PT_DOWN",
+        "PT_LEFT",
+        "PT_RIGHT",
+        "PT_CENTER",
+        "PT_STOP",
+        "PTZ_UP",
+        "PTZ_DOWN",
+        "PTZ_LEFT",
+        "PTZ_RIGHT",
+        "PTZ_CENTER",
+        "PTZ_STOP",
+    }
+)
+
 
 @dataclass(frozen=True)
 class GimbalStatus:
@@ -111,7 +136,7 @@ class SkydroidTopUdpAdapter:
         commands = self._profile.ptz_commands.get(str(action or "").strip().lower(), [])
         if not commands:
             return
-        self._enqueue(commands, {}, True)
+        self._enqueue(commands, {}, False)
 
     def set_speed(self, yaw: float, pitch: float) -> None:
         y = float(yaw)
@@ -119,7 +144,7 @@ class SkydroidTopUdpAdapter:
         commands = self._speed_commands_for(y, p)
         if not commands:
             return
-        self._enqueue(commands, {"yaw": y, "pitch": p}, True)
+        self._enqueue(commands, {"yaw": y, "pitch": p}, False)
 
     def set_angle(self, yaw: float, pitch: float) -> None:
         self.set_angle_axes(yaw_deg=float(yaw), pitch_deg=float(pitch))
@@ -129,20 +154,20 @@ class SkydroidTopUdpAdapter:
         *,
         yaw_deg: float | None = None,
         pitch_deg: float | None = None,
-        approach_speed_dps: float = 12.0,
+        approach_speed_dps: float = 25.0,
     ) -> None:
-        """Absolute angle on one or both axes (GAY/GAP/GAM) with slow approach for accuracy."""
+        """Absolute angle on one or both axes (GAY/GAP/GAM)."""
         params: dict[str, object] = {"speed": float(approach_speed_dps)}
         if yaw_deg is not None and pitch_deg is not None:
             self._enqueue(
                 ["GAM"],
                 {**params, "yaw": float(yaw_deg), "pitch": float(pitch_deg)},
-                True,
+                False,
             )
         elif yaw_deg is not None:
-            self._enqueue(["GAY"], {**params, "yaw": float(yaw_deg)}, True)
+            self._enqueue(["GAY"], {**params, "yaw": float(yaw_deg)}, False)
         elif pitch_deg is not None:
-            self._enqueue(["GAP"], {**params, "pitch": float(pitch_deg)}, True)
+            self._enqueue(["GAP"], {**params, "pitch": float(pitch_deg)}, False)
 
     @staticmethod
     def _speed_commands_for(yaw: float, pitch: float) -> list[str]:
@@ -263,11 +288,34 @@ class SkydroidTopUdpAdapter:
             f"See logs/skydroid_top_udp.log — RTSP can work without TOP UDP from this PC."
         )
 
+    @staticmethod
+    def _is_motion_command(commands: list[str]) -> bool:
+        return bool(commands) and str(commands[0]).upper() in _MOTION_COMMANDS
+
+    def _drop_pending_motion_commands(self) -> None:
+        """Keep only the latest motion command — avoids queue backlog and UI lag."""
+        pending: list[tuple[list[str], dict[str, object], bool]] = []
+        while True:
+            try:
+                pending.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        for item in pending:
+            cmds, params, expect_reply = item
+            if self._is_motion_command(cmds):
+                continue
+            try:
+                self._queue.put_nowait((cmds, params, expect_reply))
+            except queue.Full:
+                pass
+
     def _enqueue(self, commands: list[str], params: dict[str, object], expect_reply: bool) -> None:
         if not commands:
             return
         if not self._running:
             self.start()
+        if not expect_reply and self._is_motion_command(commands):
+            self._drop_pending_motion_commands()
         try:
             self._queue.put_nowait((list(commands), params, expect_reply))
         except queue.Full:
@@ -289,6 +337,8 @@ class SkydroidTopUdpAdapter:
             if not self._running:
                 break
             wait_s = self._min_dt - (time.monotonic() - self._last_send_mono)
+            if not expect_reply:
+                wait_s = min(wait_s, 0.03)
             if wait_s > 0:
                 time.sleep(wait_s)
             self._last_send_mono = time.monotonic()
@@ -298,11 +348,17 @@ class SkydroidTopUdpAdapter:
                 frame = build_top_frame(command, params)
                 try:
                     reply = self._transport.send_and_receive(
-                        frame, expect_reply=expect_reply, log=True
+                        frame,
+                        expect_reply=expect_reply,
+                        log=True,
+                        timeout_s=0.08 if not expect_reply else None,
                     )
-                    self._maybe_update_status(reply)
+                    if expect_reply and reply:
+                        self._maybe_update_status(reply)
                     break
                 except Exception:
+                    if not expect_reply:
+                        break
                     continue
 
     def _status_loop(self) -> None:
