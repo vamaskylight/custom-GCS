@@ -276,15 +276,21 @@ class SkydroidCameraControl:
         return
 
     def set_gimbal(self, cmd: GimbalCommand) -> None:
-        dy = float(cmd.yaw_deg) if cmd.yaw_deg is not None else 0.0
-        dp = float(cmd.pitch_deg) if cmd.pitch_deg is not None else 0.0
-        if abs(dy) < 1e-6 and abs(dp) < 1e-6:
+        has_yaw = cmd.yaw_deg is not None and abs(float(cmd.yaw_deg)) >= 1e-6
+        has_pitch = cmd.pitch_deg is not None and abs(float(cmd.pitch_deg)) >= 1e-6
+        if not has_yaw and not has_pitch:
             return
         try:
             st = self._adapter.get_status_cached()
             base_yaw = float(st.yaw_deg) if st is not None and st.yaw_deg is not None else 0.0
             base_pitch = float(st.pitch_deg) if st is not None and st.pitch_deg is not None else 0.0
-            self._adapter.set_angle(yaw=base_yaw + dy, pitch=base_pitch + dp)
+            yaw_tgt = (base_yaw + float(cmd.yaw_deg)) if has_yaw else None
+            pitch_tgt = (base_pitch + float(cmd.pitch_deg)) if has_pitch else None
+            self._adapter.set_angle_axes(
+                yaw_deg=yaw_tgt,
+                pitch_deg=pitch_tgt,
+                approach_speed_dps=12.0,
+            )
         except Exception:
             return
 
