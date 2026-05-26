@@ -289,7 +289,7 @@ class SkydroidCameraControl:
             self._adapter.set_angle_axes(
                 yaw_deg=yaw_tgt,
                 pitch_deg=pitch_tgt,
-                approach_speed_dps=12.0,
+                approach_speed_dps=25.0,
             )
         except Exception:
             return
