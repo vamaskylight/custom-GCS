@@ -1126,10 +1126,10 @@ class MapWidget(QWidget):
         ):
             b.setProperty("camPadBtn", True)
 
-        self._btn_native_gimbal_left.setToolTip("Gimbal yaw left")
-        self._btn_native_gimbal_up.setToolTip("Gimbal pitch up")
-        self._btn_native_gimbal_right.setToolTip("Gimbal yaw right")
-        self._btn_native_gimbal_down.setToolTip("Gimbal pitch down")
+        self._btn_native_gimbal_left.setToolTip("Gimbal yaw left (hold)")
+        self._btn_native_gimbal_up.setToolTip("Gimbal pitch up (hold)")
+        self._btn_native_gimbal_right.setToolTip("Gimbal yaw right (hold)")
+        self._btn_native_gimbal_down.setToolTip("Gimbal pitch down (hold)")
 
         zoom_row = _cam_rail_plus_minus_pair(self._btn_native_zoom_minus, self._btn_native_zoom_plus)
         focus_row = _cam_rail_plus_minus_pair(self._btn_native_focus_minus, self._btn_native_focus_plus)
@@ -1393,11 +1393,11 @@ class MapWidget(QWidget):
         self._btn_native_zoom_plus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_ZOOM_STEP:1:0"))
         self._btn_native_focus_minus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_FOCUS_STEP:-1:0"))
         self._btn_native_focus_plus.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_FOCUS_STEP:1:0"))
-        # dy>0 → ptz("up") / positive pitch nudge; dy<0 → down (see VGCS_CAM_GIMBAL_NUDGE handler).
-        self._btn_native_gimbal_up.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:0:1:0"))
-        self._btn_native_gimbal_down.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:0:-1:0"))
-        self._btn_native_gimbal_left.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:-1:0:0"))
-        self._btn_native_gimbal_right.clicked.connect(lambda: self._on_web_title_changed("VGCS_CAM_GIMBAL_NUDGE:1:0:0"))
+        # Hold = continuous GSY/GSP speed (smooth); release = GSM stop. No PTZ steps on pitch.
+        self._wire_native_gimbal_hold_button(self._btn_native_gimbal_up, 0, 1)
+        self._wire_native_gimbal_hold_button(self._btn_native_gimbal_down, 0, -1)
+        self._wire_native_gimbal_hold_button(self._btn_native_gimbal_left, -1, 0)
+        self._wire_native_gimbal_hold_button(self._btn_native_gimbal_right, 1, 0)
         def _obs_target(on: bool) -> None:
             print(f"[VGCS:cam_rail] OBSERVE Target toggled={bool(on)}")
             self._set_observation_mark_mode(on)
@@ -6381,6 +6381,40 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    # Skydroid TOP: 0.1 deg/s per unit, ±99 max (~±9.9 deg/s). Same speed mode for yaw and pitch.
+    _GIMBAL_HOLD_SPEED_DPS = 40.0
+
+    def _wire_native_gimbal_hold_button(self, btn: QPushButton, dx: int, dy: int) -> None:
+        """Press/hold = continuous GSY/GSP; release = GSM stop (avoids jerky PTZ pitch steps)."""
+
+        def _start() -> None:
+            self._native_gimbal_speed_start(dx, dy)
+
+        def _stop() -> None:
+            self._native_gimbal_speed_stop()
+
+        btn.pressed.connect(_start)
+        btn.released.connect(_stop)
+
+    def _native_gimbal_speed_start(self, dx: int, dy: int) -> None:
+        cc = getattr(self, "_camera_control", None)
+        if cc is None:
+            return
+        spd = float(self._GIMBAL_HOLD_SPEED_DPS)
+        try:
+            cc.set_gimbal_speed(float(dx) * spd, float(dy) * spd)
+        except Exception:
+            pass
+
+    def _native_gimbal_speed_stop(self) -> None:
+        cc = getattr(self, "_camera_control", None)
+        if cc is None:
+            return
+        try:
+            cc.set_gimbal_speed(0.0, 0.0)
+        except Exception:
+            pass
+
     def _on_web_title_changed(self, title: str) -> None:
         if title.startswith("VGCS_MAP_TILES_READY:"):
             try:
@@ -6763,7 +6797,7 @@ class MapWidget(QWidget):
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_GIMBAL_NUDGE:"):
-            # Format: VGCS_CAM_GIMBAL_NUDGE:<dx>:<dy>:<ts>
+            # Format: VGCS_CAM_GIMBAL_NUDGE:<dx>:<dy>:<ts> — short pulse for legacy web bridge.
             try:
                 parts = title.split(":")
                 dx = int(parts[1]) if len(parts) >= 2 else 0
@@ -6771,26 +6805,11 @@ class MapWidget(QWidget):
             except Exception:
                 dx = 0
                 dy = 0
-            # Yunzhuo TOP speed field: 0.1 deg/s per unit, range ±99 (≈ ±9.9 deg/s).
-            _nudge_speed_dps = 50.0
-            try:
-                if dx > 0 and dy == 0:
-                    self._camera_control.ptz("right")
-                    self._camera_control.set_gimbal_speed(_nudge_speed_dps, 0.0)
-                elif dx < 0 and dy == 0:
-                    self._camera_control.ptz("left")
-                    self._camera_control.set_gimbal_speed(-_nudge_speed_dps, 0.0)
-                elif dy > 0 and dx == 0:
-                    self._camera_control.ptz("up")
-                    self._camera_control.set_gimbal_speed(0.0, _nudge_speed_dps)
-                elif dy < 0 and dx == 0:
-                    self._camera_control.ptz("down")
-                    self._camera_control.set_gimbal_speed(0.0, -_nudge_speed_dps)
-                elif dx == 0 and dy == 0:
-                    self._camera_control.ptz("stop")
-                    self._camera_control.set_gimbal_speed(0.0, 0.0)
-            except Exception:
-                pass
+            if dx == 0 and dy == 0:
+                self._native_gimbal_speed_stop()
+            else:
+                self._native_gimbal_speed_start(dx, dy)
+                QTimer.singleShot(250, self._native_gimbal_speed_stop)
             self._run_js("document.title = 'VGCS Map';")
             return
 

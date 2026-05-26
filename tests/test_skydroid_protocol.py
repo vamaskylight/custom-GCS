@@ -59,6 +59,11 @@ def test_gsy_frame_5_deg_per_s() -> None:
     assert frame == b"#TPUG2wGSY3264"
 
 
+def test_gsm_stop_both_axes() -> None:
+    frame = build_top_frame("GSM", {"yaw": 0.0, "pitch": 0.0})
+    assert frame == b"#tpUG4wGSM0000F5"
+
+
 def test_build_gac_query() -> None:
     frame = build_gac_query()
     assert frame.startswith(b"#TPUG2rGAC")

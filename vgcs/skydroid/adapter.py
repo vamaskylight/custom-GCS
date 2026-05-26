@@ -129,6 +129,8 @@ class SkydroidTopUdpAdapter:
         """Pick GSY / GSP / GSM so a zero axis does not mask the other (TOP spec)."""
         ay = abs(float(yaw)) >= 1e-6
         ap = abs(float(pitch)) >= 1e-6
+        if not ay and not ap:
+            return ["GSM"]
         if ay and ap:
             return ["GSM"]
         if ay:
