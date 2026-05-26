@@ -53,9 +53,9 @@ def build_tp_frame(
 
 
 def encode_speed_2char(deg_per_s: float) -> str:
-    """Gimbal speed field: signed byte in 0.5 deg/s units, as two hex ASCII chars."""
-    units = int(round(float(deg_per_s) / 0.5))
-    units = max(-127, min(127, units))
+    """Gimbal speed field: signed byte in 0.1 deg/s units (Yunzhuo TOP / Topotek), two hex ASCII chars."""
+    units = int(round(float(deg_per_s) / 0.1))
+    units = max(-99, min(99, units))
     return f"{units & 0xFF:02X}"
 
 
@@ -121,7 +121,7 @@ def build_gimbal_speed(yaw_deg_s: float, pitch_deg_s: float) -> bytes:
 
 
 def build_gimbal_angle_axis(axis_tag: str, deg: float, speed: float = 16.0) -> bytes:
-    """Single-axis angle command (GAY yaw / GAP pitch). speed in 0.5 deg/s units (0–99)."""
+    """Single-axis angle command (GAY yaw / GAP pitch). trailing speed in 0.1 deg/s units (0–99)."""
     tag = str(axis_tag or "").strip().upper()
     if tag not in ("GAY", "GAP", "GAR"):
         raise ValueError(f"unsupported angle tag {tag!r}")

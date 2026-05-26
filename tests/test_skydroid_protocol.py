@@ -45,6 +45,20 @@ def test_build_top_frame_ptz() -> None:
     assert frame == b"#TPUG2wPTZ016B"
 
 
+def test_encode_speed_uses_0_1_deg_per_s_units() -> None:
+    from vgcs.skydroid.protocol import encode_speed_2char
+
+    # 5.0 deg/s -> 50 -> 0x32
+    assert encode_speed_2char(5.0) == "32"
+    # -5.0 deg/s -> -50 -> 0xCE
+    assert encode_speed_2char(-5.0) == "CE"
+
+
+def test_gsy_frame_5_deg_per_s() -> None:
+    frame = build_top_frame("GSY", {"yaw": 5.0})
+    assert frame == b"#TPUG2wGSY3264"
+
+
 def test_build_gac_query() -> None:
     frame = build_gac_query()
     assert frame.startswith(b"#TPUG2rGAC")
