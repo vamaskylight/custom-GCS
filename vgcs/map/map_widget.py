@@ -6771,26 +6771,24 @@ class MapWidget(QWidget):
             except Exception:
                 dx = 0
                 dy = 0
-            # Small nudge steps in degrees.
-            pitch = float(dy) * 2.0
-            yaw = float(dx) * 3.0
+            # Yunzhuo TOP speed field: 0.1 deg/s per unit, range ±99 (≈ ±9.9 deg/s).
+            _nudge_speed_dps = 50.0
             try:
-                from vgcs.video.camera_control import GimbalCommand
-
-                # Prefer discrete PTZ commands for one-axis nudges when available.
                 if dx > 0 and dy == 0:
                     self._camera_control.ptz("right")
+                    self._camera_control.set_gimbal_speed(_nudge_speed_dps, 0.0)
                 elif dx < 0 and dy == 0:
                     self._camera_control.ptz("left")
+                    self._camera_control.set_gimbal_speed(-_nudge_speed_dps, 0.0)
                 elif dy > 0 and dx == 0:
                     self._camera_control.ptz("up")
+                    self._camera_control.set_gimbal_speed(0.0, _nudge_speed_dps)
                 elif dy < 0 and dx == 0:
                     self._camera_control.ptz("down")
+                    self._camera_control.set_gimbal_speed(0.0, -_nudge_speed_dps)
                 elif dx == 0 and dy == 0:
                     self._camera_control.ptz("stop")
-                # Send explicit angle/speed hooks for integrations that support them.
-                self._camera_control.set_gimbal_speed(yaw=float(dx), pitch=float(dy))
-                self._camera_control.set_gimbal(GimbalCommand(pitch_deg=pitch, yaw_deg=yaw))
+                    self._camera_control.set_gimbal_speed(0.0, 0.0)
             except Exception:
                 pass
             self._run_js("document.title = 'VGCS Map';")

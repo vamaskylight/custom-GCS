@@ -114,10 +114,28 @@ class SkydroidTopUdpAdapter:
         self._enqueue(commands, {}, True)
 
     def set_speed(self, yaw: float, pitch: float) -> None:
-        self._enqueue(self._profile.speed_commands, {"yaw": float(yaw), "pitch": float(pitch)}, True)
+        y = float(yaw)
+        p = float(pitch)
+        commands = self._speed_commands_for(y, p)
+        if not commands:
+            return
+        self._enqueue(commands, {"yaw": y, "pitch": p}, True)
 
     def set_angle(self, yaw: float, pitch: float) -> None:
-        self._enqueue(self._profile.angle_commands, {"yaw": float(yaw), "pitch": float(pitch)}, True)
+        self._enqueue(["GAM"], {"yaw": float(yaw), "pitch": float(pitch)}, True)
+
+    @staticmethod
+    def _speed_commands_for(yaw: float, pitch: float) -> list[str]:
+        """Pick GSY / GSP / GSM so a zero axis does not mask the other (TOP spec)."""
+        ay = abs(float(yaw)) >= 1e-6
+        ap = abs(float(pitch)) >= 1e-6
+        if ay and ap:
+            return ["GSM"]
+        if ay:
+            return ["GSY"]
+        if ap:
+            return ["GSP"]
+        return []
 
     def camera_record_toggle(self) -> None:
         self._enqueue(self._profile.camera_commands.get("record_toggle", []), {}, True)
