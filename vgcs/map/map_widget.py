@@ -442,6 +442,11 @@ QPushButton#observeClip {
 QPushButton#observeTarget:checked, QPushButton#observeClip:checked {
   background: rgba(27, 33, 45, 235);
 }
+QPushButton#observeClip[recording="true"] {
+  background: rgba(200, 45, 45, 240);
+  color: #ffffff;
+  font-weight: 700;
+}
 QPushButton#observeReport, QPushButton#observeReset {
   min-height: 30px;
   font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
@@ -899,6 +904,10 @@ class MapWidget(QWidget):
         self._obs_marks_overlay_timer: QTimer | None = None
         self._video_ui_render_mono = 0.0
         self._video_cache_mono = 0.0
+        self._obs_clip_active = False
+        self._obs_clip_secs_left = 0
+        self._obs_clip_countdown_timer: QTimer | None = None
+        self._obs_clip_banner: QLabel | None = None
         self._ai_phase = 0.0
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
@@ -1395,7 +1404,8 @@ class MapWidget(QWidget):
 
         def _obs_clip() -> None:
             print("[VGCS:cam_rail] OBSERVE Clip clicked")
-            self._capture_observation_clip()
+            self._obs_clip_ui_preparing()
+            QTimer.singleShot(0, self._capture_observation_clip)
 
         def _obs_report() -> None:
             print("[VGCS:cam_rail] OBSERVE Report clicked")
@@ -2138,6 +2148,11 @@ class MapWidget(QWidget):
             self._native_video_preview.setGeometry(gx, gy, gw, gh)
             self._native_video_preview.show()
             self._native_video_preview.raise_()
+            if bool(getattr(self, "_obs_clip_active", False)):
+                try:
+                    self._position_obs_clip_banner()
+                except Exception:
+                    pass
             # Split mode must repaint from `_split_last_images`; `_native_video_last` may still be the
             # last single-view frame and would undo the 2×2 composite after every resize.
             if bool(getattr(self, "_video_split_enabled", False)):
@@ -5460,6 +5475,8 @@ class MapWidget(QWidget):
 
     def _clear_photo_flash(self) -> None:
         try:
+            if bool(getattr(self, "_obs_clip_active", False)):
+                return
             lbl = getattr(self, "_lbl_native_cam_timer", None)
             if lbl is None:
                 return
@@ -5470,6 +5487,181 @@ class MapWidget(QWidget):
             self._sync_native_cam_timer_visibility()
         except Exception:
             pass
+
+    def _ensure_obs_clip_banner(self) -> QLabel:
+        lbl = getattr(self, "_obs_clip_banner", None)
+        if lbl is not None:
+            return lbl
+        parent = getattr(self, "_native_video_preview", None)
+        lbl = QLabel("", parent)
+        lbl.setObjectName("obsClipBanner")
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet(
+            "QLabel#obsClipBanner {"
+            "  background: rgba(185, 28, 28, 230);"
+            "  color: #ffffff;"
+            "  padding: 10px 18px;"
+            "  border-radius: 8px;"
+            "  font-size: 15px;"
+            "  font-weight: 700;"
+            "}"
+        )
+        lbl.hide()
+        self._obs_clip_banner = lbl
+        return lbl
+
+    def _position_obs_clip_banner(self) -> None:
+        lbl = getattr(self, "_obs_clip_banner", None)
+        parent = getattr(self, "_native_video_preview", None)
+        if lbl is None or parent is None:
+            return
+        try:
+            lbl.adjustSize()
+            pw = max(1, int(parent.width()))
+            lw = max(80, int(lbl.width()))
+            lbl.move(max(8, (pw - lw) // 2), 14)
+            lbl.raise_()
+        except Exception:
+            pass
+
+    def _obs_clip_ui_preparing(self) -> None:
+        """Immediate feedback when Clip is pressed (before RTSP/ffmpeg work)."""
+        self._set_status("Observation clip: starting…")
+        try:
+            self._ensure_obs_clip_banner()
+            self._show_obs_clip_banner("Observation clip — starting…")
+        except Exception:
+            pass
+        try:
+            lbl = getattr(self, "_lbl_native_cam_timer", None)
+            if lbl is not None:
+                lbl.show()
+                lbl.setText("CLIP…")
+                lbl.setStyleSheet("color: #fca5a5; font-weight: 700;")
+        except Exception:
+            pass
+
+    def _obs_clip_ui_recording_started(self, *, seconds: int = 8) -> None:
+        self._obs_clip_active = True
+        self._obs_clip_secs_left = max(1, int(seconds))
+        try:
+            btn = getattr(self, "_btn_native_clip", None)
+            if btn is not None:
+                btn.setText("REC")
+                btn.setProperty("recording", True)
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+                btn.setEnabled(False)
+        except Exception:
+            pass
+        self._obs_clip_update_countdown_labels()
+        t = getattr(self, "_obs_clip_countdown_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.timeout.connect(self._obs_clip_countdown_tick)
+            self._obs_clip_countdown_timer = t
+        try:
+            t.start(1000)
+        except Exception:
+            pass
+        self._set_status(
+            f"Observation clip recording — {self._obs_clip_secs_left}s (do not press Clip again)"
+        )
+
+    def _obs_clip_update_countdown_labels(self) -> None:
+        left = max(0, int(getattr(self, "_obs_clip_secs_left", 0) or 0))
+        text = f"● REC {left}s" if left > 0 else "● REC"
+        try:
+            self._show_obs_clip_banner(f"Clip recording… {left}s remaining")
+        except Exception:
+            pass
+        try:
+            lbl = getattr(self, "_lbl_native_cam_timer", None)
+            if lbl is not None:
+                lbl.show()
+                lbl.setText(text)
+                lbl.setStyleSheet("color: #f87171; font-weight: 700;")
+        except Exception:
+            pass
+
+    def _show_obs_clip_banner(self, text: str) -> None:
+        lbl = self._ensure_obs_clip_banner()
+        lbl.setText(str(text or "").strip())
+        self._position_obs_clip_banner()
+        lbl.show()
+        lbl.raise_()
+
+    def _hide_obs_clip_banner(self) -> None:
+        lbl = getattr(self, "_obs_clip_banner", None)
+        if lbl is not None:
+            try:
+                lbl.hide()
+            except Exception:
+                pass
+
+    def _obs_clip_countdown_tick(self) -> None:
+        if not bool(getattr(self, "_obs_clip_active", False)):
+            return
+        self._obs_clip_secs_left = max(0, int(self._obs_clip_secs_left or 0) - 1)
+        if self._obs_clip_secs_left > 0:
+            self._obs_clip_update_countdown_labels()
+            return
+        t = getattr(self, "_obs_clip_countdown_timer", None)
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                pass
+
+    def _obs_clip_ui_finished(self, *, ok: bool, detail: str = "") -> None:
+        self._obs_clip_active = False
+        t = getattr(self, "_obs_clip_countdown_timer", None)
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                pass
+        self._hide_obs_clip_banner()
+        try:
+            btn = getattr(self, "_btn_native_clip", None)
+            if btn is not None:
+                btn.setText("Clip")
+                btn.setProperty("recording", False)
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+                btn.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            lbl = getattr(self, "_lbl_native_cam_timer", None)
+            if lbl is not None:
+                if ok:
+                    short = str(detail or "Clip saved")[:22]
+                    lbl.setText(f"✓ {short}")
+                    lbl.setStyleSheet("color: #86efac; font-weight: 700;")
+                else:
+                    lbl.setText("Clip failed")
+                    lbl.setStyleSheet("color: #fca5a5; font-weight: 700;")
+                if not hasattr(self, "_photo_flash_timer"):
+                    self._photo_flash_timer = QTimer(self)
+                    self._photo_flash_timer.setSingleShot(True)
+                    self._photo_flash_timer.timeout.connect(self._clear_photo_flash)
+                self._photo_flash_prev_text = "00:00:00"
+                self._photo_flash_timer.start(2200)
+        except Exception:
+            pass
+        self._sync_native_cam_timer_visibility()
+
+    def _obs_clip_ui_failed(self, message: str, *, popup: bool = True) -> None:
+        msg = str(message or "Observation clip failed").strip()
+        self._obs_clip_ui_finished(ok=False, detail="")
+        self._set_status(msg)
+        print(f"[VGCS:observe] clip failed: {msg}")
+        if popup:
+            try:
+                QMessageBox.warning(self, "Observation Clip", msg)
+            except Exception:
+                pass
 
     def _set_observation_mark_mode(self, enabled: bool) -> None:
         self._obs_mark_mode = bool(enabled)
@@ -5695,21 +5887,29 @@ class MapWidget(QWidget):
         return (base / "captures" / "observations").resolve()
 
     def _capture_observation_clip(self) -> None:
+        if bool(getattr(self, "_obs_clip_active", False)):
+            self._set_status("Observation clip already recording — please wait")
+            return
         ok = self._ensure_video_preview_backend()
         if not ok:
-            self._set_status(
-                "Observation clip failed: video backend unavailable (enable video streaming + set RTSP URL)"
+            self._obs_clip_ui_failed(
+                "Observation clip failed: video is not ready.\n\n"
+                "Enable video streaming in Application Settings and confirm RTSP "
+                "rtsp://192.168.144.108:554/stream=1 is playing on screen."
             )
             return
         src = getattr(self, "_video_active_source", None)
         if src is None:
-            self._set_status("Observation clip failed: no active video source")
+            self._obs_clip_ui_failed(
+                "Observation clip failed: no active video source.\n\n"
+                "Wait until the live camera preview is visible, then press Clip again."
+            )
             return
         out_dir = Path.cwd() / "captures" / "clips"
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
-            self._set_status("Observation clip failed: cannot create captures folder")
+            self._obs_clip_ui_failed("Observation clip failed: cannot create captures/clips folder.")
             return
         stamp = time.strftime("%Y%m%d_%H%M%S")
         out_path = out_dir / f"obs_clip_{stamp}.{self._video_record_suffix()}"
@@ -5750,23 +5950,28 @@ class MapWidget(QWidget):
         except Exception:
             started = False
         if started:
-            self._set_status("Capturing short clip (8s)…")
+            self._obs_clip_ui_recording_started(seconds=8)
         else:
-            # Provide actionable hints for common RTSP/ffmpeg cases.
             try:
                 if shutil.which("ffmpeg") is None:
-                    self._set_status("Observation clip failed: ffmpeg not found in PATH")
+                    self._obs_clip_ui_failed(
+                        "Observation clip could not start: ffmpeg was not found.\n\n"
+                        "Install ffmpeg, add it to PATH, restart VGCS, then press Clip again."
+                    )
                     return
             except Exception:
                 pass
             try:
                 url = str(getattr(src, "_url", "") or "").strip()
                 if not url:
-                    self._set_status("Observation clip failed: RTSP URL is empty")
+                    self._obs_clip_ui_failed("Observation clip failed: RTSP URL is empty in settings.")
                     return
             except Exception:
                 pass
-            self._set_status("Observation clip failed to start recording (check status/log)")
+            self._obs_clip_ui_failed(
+                "Observation clip failed to start recording.\n\n"
+                "Check that video is playing and see the log for RTSP/ffmpeg errors."
+            )
 
     def _stop_observation_clip_rtsp(self, src: object, out_path: str) -> None:
         try:
@@ -5792,13 +5997,27 @@ class MapWidget(QWidget):
         try:
             if p.is_file() and p.stat().st_size > 0:
                 self._log_observation("clip", clip_path=str(p), capture_snapshot=True)
-                self._set_status(f"Short clip saved & logged: {name}")
+                self._obs_clip_ui_finished(ok=True, detail=name)
+                self._set_status(
+                    f"Observation clip saved: {name} — press Report to export CSV/HTML"
+                )
+                try:
+                    self._show_obs_clip_banner(f"Clip saved: {name}")
+                    QTimer.singleShot(2500, self._hide_obs_clip_banner)
+                except Exception:
+                    pass
                 return
         except Exception:
             pass
-        self._set_status(f"Short clip failed or empty: {name}")
+        self._obs_clip_ui_failed(
+            f"Observation clip failed or file is empty: {name}",
+            popup=True,
+        )
 
     def _clear_observations(self) -> None:
+        if bool(getattr(self, "_obs_clip_active", False)):
+            self._set_status("Cannot reset while observation clip is recording")
+            return
         n = len(self._observations)
         self._observations.clear()
         self._video_obs_marks.clear()
@@ -6062,6 +6281,12 @@ class MapWidget(QWidget):
             return
         mode = getattr(self, "_camera_rail_ui_mode", "video")
         if mode == "video":
+            if bool(getattr(self, "_obs_clip_active", False)):
+                try:
+                    lbl.show()
+                except Exception:
+                    pass
+                return
             t = getattr(self, "_photo_flash_timer", None)
             if t is not None and t.isActive():
                 try:
