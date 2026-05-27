@@ -13,6 +13,9 @@ CMD_GIMBAL_ATTITUDE = 0x0D
 CMD_GIMBAL_ANGLE = 0x0E
 CMD_PHOTO_RECORD = 0x0C
 CMD_GIMBAL_ROTATION = 0x07
+CMD_AUTO_FOCUS = 0x04       # Trigger one-shot autofocus (optical zoom cameras: ZR10, ZT6, ZR30, ZT30)
+CMD_MANUAL_ZOOM = 0x05      # Manual zoom: int8 1=in, -1=out, 0=stop
+CMD_MANUAL_FOCUS = 0x06     # Manual focus: int8 1=far (long shot), -1=near (close shot), 0=stop
 
 # CRC16 table from SIYI SDK manual (G(X) = X^16 + X^12 + X^5 + 1).
 _CRC16_TAB: tuple[int, ...] = (
@@ -350,3 +353,20 @@ def encode_rotation_speed(yaw_rate: float, pitch_rate: float) -> bytes:
         return max(-100, min(100, v))
 
     return struct.pack("<bb", _axis(yaw_rate), _axis(pitch_rate))
+
+
+def encode_manual_zoom(direction: int) -> bytes:
+    """CMD 0x05 — manual zoom: int8 1=zoom in, -1=zoom out, 0=stop."""
+    v = 1 if int(direction) > 0 else (-1 if int(direction) < 0 else 0)
+    return struct.pack("<b", v)
+
+
+def encode_manual_focus(direction: int) -> bytes:
+    """CMD 0x06 — manual focus: int8 1=far (long shot), -1=near (close shot), 0=stop."""
+    v = 1 if int(direction) > 0 else (-1 if int(direction) < 0 else 0)
+    return struct.pack("<b", v)
+
+
+def encode_auto_focus(touch_x: int = 0, touch_y: int = 0) -> bytes:
+    """CMD 0x04 — trigger one-shot autofocus; touch_x/touch_y in stream-resolution pixels."""
+    return struct.pack("<BHH", 1, int(touch_x) & 0xFFFF, int(touch_y) & 0xFFFF)

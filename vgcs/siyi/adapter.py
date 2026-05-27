@@ -5,13 +5,19 @@ import time
 
 from vgcs.skydroid.adapter import GimbalStatus
 from vgcs.siyi.protocol import (
+    CMD_AUTO_FOCUS,
     CMD_GIMBAL_ANGLE,
     CMD_GIMBAL_ATTITUDE,
     CMD_GIMBAL_ROTATION,
+    CMD_MANUAL_FOCUS,
+    CMD_MANUAL_ZOOM,
     CMD_PHOTO_RECORD,
     build_request,
     decode_attitude_deg,
     encode_angle_deg,
+    encode_auto_focus,
+    encode_manual_focus,
+    encode_manual_zoom,
     encode_rotation_speed,
     parse_frame,
 )
@@ -87,6 +93,20 @@ class SiyiGimbalUdpAdapter:
 
     def camera_record_toggle(self) -> None:
         self._request(CMD_PHOTO_RECORD, bytes([2]), expect_reply=False)
+
+    def camera_zoom(self, direction: int) -> None:
+        """Manual zoom step: direction > 0 = zoom in, < 0 = zoom out, 0 = stop."""
+        self._request(CMD_MANUAL_ZOOM, encode_manual_zoom(direction), expect_reply=False)
+
+    def camera_focus_step(self, direction: int) -> None:
+        """Manual focus step: direction > 0 = far (long shot), < 0 = near (close shot)."""
+        self._request(CMD_MANUAL_FOCUS, encode_manual_focus(direction), expect_reply=False)
+        # Send a stop command immediately after the step so the lens doesn't keep moving.
+        self._request(CMD_MANUAL_FOCUS, encode_manual_focus(0), expect_reply=False)
+
+    def camera_auto_focus(self, touch_x: int = 0, touch_y: int = 0) -> None:
+        """Trigger one-shot autofocus (ZR10/ZT6/ZR30/ZT30 only)."""
+        self._request(CMD_AUTO_FOCUS, encode_auto_focus(touch_x, touch_y), expect_reply=False)
 
     def _next_seq(self) -> int:
         with self._seq_lock:
