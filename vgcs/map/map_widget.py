@@ -6612,6 +6612,24 @@ class MapWidget(QWidget):
             cc.set_gimbal_speed(0.0, 0.0)
         except Exception:
             pass
+        # Trigger auto-focus shortly after gimbal stops so the image sharpens immediately
+        # instead of waiting for the camera's internal AF timer (can take 3-5s on ZR10).
+        QTimer.singleShot(400, self._trigger_gimbal_stop_autofocus)
+
+    def _trigger_gimbal_stop_autofocus(self) -> None:
+        cc = getattr(self, "_camera_control", None)
+        if cc is None or isinstance(cc, NoopCameraControl):
+            return
+        try:
+            adapter = getattr(cc, "_adapter", None)
+            if adapter is None:
+                # CompositeGimbalCameraControl wraps a primary
+                primary = getattr(cc, "_primary", None)
+                adapter = getattr(primary, "_adapter", None) if primary is not None else None
+            if adapter is not None and hasattr(adapter, "camera_auto_focus"):
+                adapter.camera_auto_focus()
+        except Exception:
+            pass
 
     def _on_web_title_changed(self, title: str) -> None:
         if title.startswith("VGCS_MAP_TILES_READY:"):
