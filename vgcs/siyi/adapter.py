@@ -118,6 +118,12 @@ class SiyiGimbalUdpAdapter:
         # ignores the move; keep a short pulse and then send stop.
         self._request(CMD_MANUAL_FOCUS, encode_manual_focus(d), expect_reply=False)
 
+        def _resend_start() -> None:
+            try:
+                self._request(CMD_MANUAL_FOCUS, encode_manual_focus(d), expect_reply=False)
+            except Exception:
+                pass
+
         def _send_stop() -> None:
             try:
                 self._request(CMD_MANUAL_FOCUS, encode_manual_focus(0), expect_reply=False)
@@ -132,11 +138,17 @@ class SiyiGimbalUdpAdapter:
                 old.cancel()
         except Exception:
             pass
-        t = threading.Timer(0.18, _send_stop)
+        # Best-effort reliability on lossy UDP links:
+        # - resend "press" once
+        # - then send "release"
+        t_start = threading.Timer(0.07, _resend_start)
+        t_start.daemon = True
+        t = threading.Timer(0.24, _send_stop)
         t.daemon = True
         try:
             with self._focus_timer_lock:
                 self._focus_stop_timer = t
+            t_start.start()
             t.start()
         except Exception:
             try:

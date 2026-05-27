@@ -7007,6 +7007,7 @@ class MapWidget(QWidget):
             if cc is None or isinstance(cc, NoopCameraControl):
                 self._set_status("Focus disabled: camera control not connected")
             else:
+                self._set_status("Focus: near" if int(step) < 0 else "Focus: far")
                 try:
                     self._camera_control.handle_focus_step(int(step))
                 except Exception:
