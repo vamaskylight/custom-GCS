@@ -156,9 +156,15 @@ class SiyiGimbalUdpAdapter:
             except Exception:
                 pass
 
-    def camera_auto_focus(self, touch_x: int = 0, touch_y: int = 0) -> None:
-        """Trigger one-shot autofocus (ZR10/ZT6/ZR30/ZT30 only)."""
-        self._request(CMD_AUTO_FOCUS, encode_auto_focus(touch_x, touch_y), expect_reply=False)
+    def camera_auto_focus(self, touch_x: int | None = None, touch_y: int | None = None) -> None:
+        """Trigger one-shot autofocus (ZR10/ZT6/ZR30/ZT30 only).
+
+        SIYI expects tap coordinates in stream pixel space; (0,0) is top-left corner and
+        often fails to refocus the scene center — default to 960×540 center.
+        """
+        tx = 480 if touch_x is None else int(touch_x)
+        ty = 270 if touch_y is None else int(touch_y)
+        self._request(CMD_AUTO_FOCUS, encode_auto_focus(tx, ty), expect_reply=False)
 
     def _next_seq(self) -> int:
         with self._seq_lock:
