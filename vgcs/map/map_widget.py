@@ -79,7 +79,7 @@ from vgcs.video.pipeline import (
     suggested_recording_save_path,
     wait_qmedia_recorder_stopped,
 )
-from vgcs.video.camera_control import NoopCameraControl
+from vgcs.video.camera_control import NoopCameraControl, SiyiCameraControl
 from vgcs.map.native_tile_map import NativeTileMapView, bundled_seed_root, fetch_tile_http_bytes
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_footer_hud import (
@@ -6029,15 +6029,20 @@ class MapWidget(QWidget):
             )
             return
         clip_sid = self._operator_preview_source_id()
-        out_dir = Path.cwd() / "captures" / "clips"
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            self._obs_clip_ui_failed("Observation clip failed: cannot create captures/clips folder.")
-            return
         stamp = time.strftime("%Y%m%d_%H%M%S")
         clip_tag = f"_{clip_sid}" if clip_sid else ""
-        out_path = out_dir / f"obs_clip{clip_tag}_{stamp}.{self._video_record_suffix()}"
+        ext = self._video_record_suffix()
+        try:
+            tmp_fd, tmp_str = tempfile.mkstemp(
+                suffix=f".{ext}",
+                prefix=f"vgcs_clip{clip_tag}_{stamp}_",
+            )
+            os.close(tmp_fd)
+            out_path = Path(tmp_str)
+        except Exception:
+            self._obs_clip_ui_failed("Observation clip failed: cannot create temporary file.")
+            return
+        self._obs_clip_suggested_name = f"obs_clip{clip_tag}_{stamp}.{ext}"
         started = False
         try:
             if hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
@@ -6118,26 +6123,62 @@ class MapWidget(QWidget):
 
     def _finish_observation_clip(self, out_path: str) -> None:
         p = Path(str(out_path or "").strip())
-        name = p.name
         try:
-            if p.is_file() and p.stat().st_size > 0:
-                self._log_observation("clip", clip_path=str(p), capture_snapshot=True)
-                self._obs_clip_ui_finished(ok=True, detail=name)
-                self._set_status(
-                    f"Observation clip saved: {name} — press Report to export CSV/HTML"
+            if not (p.is_file() and p.stat().st_size > 0):
+                self._obs_clip_ui_failed(
+                    f"Observation clip failed or file is empty: {p.name}",
+                    popup=True,
                 )
-                try:
-                    self._show_obs_clip_banner(f"Clip saved: {name}")
-                    QTimer.singleShot(2500, self._hide_obs_clip_banner)
-                except Exception:
-                    pass
                 return
         except Exception:
-            pass
-        self._obs_clip_ui_failed(
-            f"Observation clip failed or file is empty: {name}",
-            popup=True,
+            self._obs_clip_ui_failed("Observation clip failed: could not read temp file.")
+            return
+
+        # Ask user where to save the clip (mirrors the Record button behaviour).
+        ext = p.suffix.lstrip(".") or "mp4"
+        suggested_name = str(getattr(self, "_obs_clip_suggested_name", None) or p.name)
+        s = QSettings(_QS_NS, _QS_APP)
+        last_dir = str(s.value("media/last_clip_save_dir", "") or "").strip()
+        start_dir = Path(last_dir) if last_dir and Path(last_dir).is_dir() else Path.home() / "Downloads"
+        if not start_dir.is_dir():
+            start_dir = Path.home()
+        suggested_path = str(start_dir / suggested_name)
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save observation clip",
+            suggested_path,
+            f"Video (*.{ext} *.mp4 *.mov *.mkv)",
         )
+        if not filename:
+            # User cancelled — clean up temp file silently.
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._obs_clip_ui_finished(ok=False, detail="")
+            self._set_status("Observation clip save cancelled")
+            return
+
+        try:
+            shutil.move(str(p), filename)
+        except Exception as exc:
+            self._obs_clip_ui_failed(f"Observation clip: could not move file — {exc}")
+            return
+
+        try:
+            s.setValue("media/last_clip_save_dir", str(Path(filename).parent))
+        except Exception:
+            pass
+
+        name = Path(filename).name
+        self._log_observation("clip", clip_path=filename, capture_snapshot=True)
+        self._obs_clip_ui_finished(ok=True, detail=name)
+        self._set_status(f"Observation clip saved: {name} — press Report to export CSV/HTML")
+        try:
+            self._show_obs_clip_banner(f"Clip saved: {name}")
+            QTimer.singleShot(2500, self._hide_obs_clip_banner)
+        except Exception:
+            pass
 
     def _clear_observations(self) -> None:
         if bool(getattr(self, "_obs_clip_active", False)):
@@ -6962,10 +7003,18 @@ class MapWidget(QWidget):
             cur += 0.25 * float(step)
             cur = max(-5.0, min(5.0, cur))
             self._video_focus = cur
-            try:
-                self._camera_control.handle_focus_step(int(step))
-            except Exception:
-                pass
+            cc = getattr(self, "_camera_control", None)
+            if cc is None or isinstance(cc, NoopCameraControl):
+                # No-op backend: keep UI responsive but explain why nothing happens.
+                self._set_status("Focus disabled: camera control not connected")
+            elif isinstance(cc, SiyiCameraControl):
+                # Current SIYI SDK adapter in this project does not implement focus.
+                self._set_status("Focus not supported on SIYI provider (switch to MAVLink/Skydroid)")
+            else:
+                try:
+                    self._camera_control.handle_focus_step(int(step))
+                except Exception:
+                    self._set_status("Focus command failed (check camera control backend)")
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_GIMBAL_NUDGE:"):
