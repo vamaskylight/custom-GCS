@@ -6616,18 +6616,26 @@ class MapWidget(QWidget):
         # instead of waiting for the camera's internal AF timer (can take 3-5s on ZR10).
         QTimer.singleShot(400, self._trigger_gimbal_stop_autofocus)
 
-    def _trigger_gimbal_stop_autofocus(self) -> None:
+    def _siyi_autofocus_adapter(self) -> object | None:
         cc = getattr(self, "_camera_control", None)
         if cc is None or isinstance(cc, NoopCameraControl):
+            return None
+        adapter = getattr(cc, "_adapter", None)
+        if adapter is None:
+            primary = getattr(cc, "_primary", None)
+            adapter = getattr(primary, "_adapter", None) if primary is not None else None
+        if adapter is not None and hasattr(adapter, "camera_auto_focus"):
+            return adapter
+        return None
+
+    def _trigger_gimbal_stop_autofocus(self) -> None:
+        adapter = self._siyi_autofocus_adapter()
+        if adapter is None:
             return
         try:
-            adapter = getattr(cc, "_adapter", None)
-            if adapter is None:
-                # CompositeGimbalCameraControl wraps a primary
-                primary = getattr(cc, "_primary", None)
-                adapter = getattr(primary, "_adapter", None) if primary is not None else None
-            if adapter is not None and hasattr(adapter, "camera_auto_focus"):
-                adapter.camera_auto_focus()
+            # First pulse after settle; second pulse catches slow ZR10 AF hunts.
+            adapter.camera_auto_focus()
+            QTimer.singleShot(550, lambda: adapter.camera_auto_focus())
         except Exception:
             pass
 
