@@ -373,8 +373,10 @@ class SiyiCameraControl:
         return
 
     def handle_focus_step(self, step: int) -> None:
-        del step
-        return
+        try:
+            self._adapter.camera_focus_step(int(step))
+        except Exception:
+            return
 
     def set_focus(self, level: float) -> None:
         del level

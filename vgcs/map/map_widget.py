@@ -79,7 +79,7 @@ from vgcs.video.pipeline import (
     suggested_recording_save_path,
     wait_qmedia_recorder_stopped,
 )
-from vgcs.video.camera_control import NoopCameraControl, SiyiCameraControl
+from vgcs.video.camera_control import NoopCameraControl
 from vgcs.map.native_tile_map import NativeTileMapView, bundled_seed_root, fetch_tile_http_bytes
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_footer_hud import (
@@ -7005,11 +7005,7 @@ class MapWidget(QWidget):
             self._video_focus = cur
             cc = getattr(self, "_camera_control", None)
             if cc is None or isinstance(cc, NoopCameraControl):
-                # No-op backend: keep UI responsive but explain why nothing happens.
                 self._set_status("Focus disabled: camera control not connected")
-            elif isinstance(cc, SiyiCameraControl):
-                # Current SIYI SDK adapter in this project does not implement focus.
-                self._set_status("Focus not supported on SIYI provider (switch to MAVLink/Skydroid)")
             else:
                 try:
                     self._camera_control.handle_focus_step(int(step))
