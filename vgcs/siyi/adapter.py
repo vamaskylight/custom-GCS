@@ -46,6 +46,8 @@ class SiyiGimbalUdpAdapter:
         self._running = False
         self._poller: threading.Thread | None = None
         self._poll_dt = 1.0 / max(0.5, float(poll_hz))
+        self._focus_stop_timer: threading.Timer | None = None
+        self._focus_timer_lock = threading.Lock()
 
     def start(self) -> None:
         if self._running:
@@ -56,6 +58,14 @@ class SiyiGimbalUdpAdapter:
 
     def stop(self) -> None:
         self._running = False
+        try:
+            with self._focus_timer_lock:
+                t = self._focus_stop_timer
+                self._focus_stop_timer = None
+            if t is not None:
+                t.cancel()
+        except Exception:
+            pass
         self._transport.close()
 
     def get_status(self) -> GimbalStatus:
@@ -100,9 +110,39 @@ class SiyiGimbalUdpAdapter:
 
     def camera_focus_step(self, direction: int) -> None:
         """Manual focus step: direction > 0 = far (long shot), < 0 = near (close shot)."""
-        self._request(CMD_MANUAL_FOCUS, encode_manual_focus(direction), expect_reply=False)
-        # Send a stop command immediately after the step so the lens doesn't keep moving.
-        self._request(CMD_MANUAL_FOCUS, encode_manual_focus(0), expect_reply=False)
+        d = int(direction)
+        if d == 0:
+            self._request(CMD_MANUAL_FOCUS, encode_manual_focus(0), expect_reply=False)
+            return
+        # SIYI focus expects "press" then "release". If stop is sent immediately, some firmware
+        # ignores the move; keep a short pulse and then send stop.
+        self._request(CMD_MANUAL_FOCUS, encode_manual_focus(d), expect_reply=False)
+
+        def _send_stop() -> None:
+            try:
+                self._request(CMD_MANUAL_FOCUS, encode_manual_focus(0), expect_reply=False)
+            except Exception:
+                pass
+
+        try:
+            with self._focus_timer_lock:
+                old = self._focus_stop_timer
+                self._focus_stop_timer = None
+            if old is not None:
+                old.cancel()
+        except Exception:
+            pass
+        t = threading.Timer(0.18, _send_stop)
+        t.daemon = True
+        try:
+            with self._focus_timer_lock:
+                self._focus_stop_timer = t
+            t.start()
+        except Exception:
+            try:
+                self._request(CMD_MANUAL_FOCUS, encode_manual_focus(0), expect_reply=False)
+            except Exception:
+                pass
 
     def camera_auto_focus(self, touch_x: int = 0, touch_y: int = 0) -> None:
         """Trigger one-shot autofocus (ZR10/ZT6/ZR30/ZT30 only)."""
