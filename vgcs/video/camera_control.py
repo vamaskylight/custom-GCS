@@ -381,10 +381,17 @@ class SiyiCameraControl:
         return
 
     def set_gimbal(self, cmd: GimbalCommand) -> None:
-        yaw = float(cmd.yaw_deg) if cmd.yaw_deg is not None else 0.0
-        pitch = float(cmd.pitch_deg) if cmd.pitch_deg is not None else 0.0
+        has_yaw = cmd.yaw_deg is not None and abs(float(cmd.yaw_deg)) >= 1e-6
+        has_pitch = cmd.pitch_deg is not None and abs(float(cmd.pitch_deg)) >= 1e-6
+        if not has_yaw and not has_pitch:
+            return
         try:
-            self._adapter.set_angle(yaw=yaw, pitch=pitch)
+            st = self._adapter.get_status()
+            base_yaw = float(st.yaw_deg) if st.yaw_deg is not None else 0.0
+            base_pitch = float(st.pitch_deg) if st.pitch_deg is not None else 0.0
+            yaw_tgt = base_yaw + (float(cmd.yaw_deg) if has_yaw else 0.0)
+            pitch_tgt = base_pitch + (float(cmd.pitch_deg) if has_pitch else 0.0)
+            self._adapter.set_angle(yaw=yaw_tgt, pitch=pitch_tgt)
         except Exception:
             return
 
@@ -392,13 +399,13 @@ class SiyiCameraControl:
         action_l = str(action or "").strip().lower()
         try:
             if action_l in ("up", "pitch_up"):
-                self._adapter.set_rotation_speed(0.0, 30.0)
+                self._adapter.set_rotation_speed(0.0, 5.0)
             elif action_l in ("down", "pitch_down"):
-                self._adapter.set_rotation_speed(0.0, -30.0)
+                self._adapter.set_rotation_speed(0.0, -5.0)
             elif action_l in ("left", "yaw_left"):
-                self._adapter.set_rotation_speed(-30.0, 0.0)
+                self._adapter.set_rotation_speed(-5.0, 0.0)
             elif action_l in ("right", "yaw_right"):
-                self._adapter.set_rotation_speed(30.0, 0.0)
+                self._adapter.set_rotation_speed(5.0, 0.0)
             elif action_l in ("stop", "center", "home"):
                 self._adapter.set_rotation_speed(0.0, 0.0)
         except Exception:

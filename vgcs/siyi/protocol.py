@@ -334,6 +334,19 @@ def decode_attitude_deg(data: bytes) -> tuple[float | None, float | None, float 
 
 
 def encode_angle_deg(yaw_deg: float, pitch_deg: float) -> bytes:
+    """CMD 0x0E — target angles as int16 × 0.1°."""
     yaw_i = int(round(float(yaw_deg) * 10.0))
     pitch_i = int(round(float(pitch_deg) * 10.0))
     return struct.pack("<hh", yaw_i, pitch_i)
+
+
+def encode_rotation_speed(yaw_rate: float, pitch_rate: float) -> bytes:
+    """
+    CMD 0x07 — gimbal rotation: int8 turn_yaw, int8 turn_pitch (-100…100).
+    UI passes approximate deg/s (e.g. 5.0); scale to SIYI speed units (×10).
+    """
+    def _axis(rate: float) -> int:
+        v = int(round(float(rate) * 10.0))
+        return max(-100, min(100, v))
+
+    return struct.pack("<bb", _axis(yaw_rate), _axis(pitch_rate))
