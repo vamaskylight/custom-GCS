@@ -12,6 +12,7 @@ from vgcs.siyi.protocol import (
     build_request,
     decode_attitude_deg,
     encode_angle_deg,
+    encode_rotation_speed,
     parse_frame,
 )
 from vgcs.siyi.transport import SiyiUdpTransport
@@ -78,7 +79,7 @@ class SiyiGimbalUdpAdapter:
         self._request(CMD_GIMBAL_ANGLE, data, expect_reply=False)
 
     def set_rotation_speed(self, yaw: float, pitch: float) -> None:
-        data = encode_angle_deg(yaw, pitch)
+        data = encode_rotation_speed(yaw, pitch)
         self._request(CMD_GIMBAL_ROTATION, data, expect_reply=False)
 
     def camera_photo(self) -> None:
