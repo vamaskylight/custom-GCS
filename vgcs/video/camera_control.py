@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
+import time
 from typing import Protocol
 
 from PySide6.QtCore import QSettings
@@ -382,23 +384,57 @@ class SkydroidCameraControl:
         return [90.0, -90.0]
 
     def gimbal_point_down(self) -> None:
+        # Run on a worker so retries/telemetry checks never block UI.
+        threading.Thread(target=self._run_skydroid_nadir_sequence, daemon=True).start()
+
+    def _run_skydroid_nadir_sequence(self) -> None:
         """
-        Straight down preset with robust fallback:
-        1) PTZ one-key down (0x0A) for C13 profiles.
-        2) Absolute pitch target(s) for mixed firmware sign conventions.
+        C13 field behavior varies by firmware:
+        - some accept PTZ 0x0A one-key down;
+        - some only react to angle mode (+90 / -90 sign conventions differ);
+        - some react better to short PTZ down pulse + stop.
+        This sequence tries all safely until pitch moves.
         """
+        def _status_pitch() -> float | None:
+            try:
+                st = self._adapter.get_status_cached()
+                if st is not None and st.pitch_deg is not None:
+                    return float(st.pitch_deg)
+            except Exception:
+                return None
+            return None
+
+        def _status_yaw() -> float:
+            try:
+                st = self._adapter.get_status_cached()
+                if st is not None and st.yaw_deg is not None:
+                    return float(st.yaw_deg)
+            except Exception:
+                return 0.0
+            return 0.0
+
+        def _moved_from(base: float | None, threshold_deg: float = 2.0) -> bool:
+            if base is None:
+                return False
+            cur = _status_pitch()
+            if cur is None:
+                return False
+            return abs(cur - base) >= float(threshold_deg)
+
+        base_pitch = _status_pitch()
+        yaw_hold = _status_yaw()
+
+        # 1) One-click down preset (C13 docs: PTZ 0x0A)
         if self._adapter._profile.ptz_commands.get("nadir"):
             try:
                 self.ptz("nadir")
+                time.sleep(0.35)
+                if _moved_from(base_pitch):
+                    return
             except Exception:
                 pass
-        yaw_hold = 0.0
-        try:
-            st = self._adapter.get_status_cached()
-            if st is not None and st.yaw_deg is not None:
-                yaw_hold = float(st.yaw_deg)
-        except Exception:
-            pass
+
+        # 2) Absolute angle fallback (+90 then -90 unless user forced a setting).
         for pitch in self._skydroid_nadir_pitch_candidates():
             try:
                 self._adapter.set_angle_axes(
@@ -406,8 +442,18 @@ class SkydroidCameraControl:
                     pitch_deg=float(pitch),
                     approach_speed_dps=25.0,
                 )
+                time.sleep(0.4)
+                if _moved_from(base_pitch):
+                    return
             except Exception:
                 continue
+
+        # 3) Final pulse fallback: PT_DOWN then PT_STOP.
+        try:
+            self.ptz("down")
+            time.sleep(0.35)
+            self.ptz("stop")
+        except Exception:
             return
 
 
