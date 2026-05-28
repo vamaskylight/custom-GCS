@@ -155,6 +155,8 @@ class MainWindow(QMainWindow):
         self._hb_armed = False
         self._hb_arm_ready = False
         self._hb_mode_text = "—"
+        self._prearm_block_reason = ""
+        self._prearm_block_until_mono = 0.0
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
         self._last_vehicle_type: int | None = None
@@ -2658,7 +2660,9 @@ class MainWindow(QMainWindow):
     def _refresh_dashboard_flight_state(self) -> None:
         """Keep banner/button state aligned with latest heartbeat + motion cues."""
         if not self._hb_arm_ready:
-            self._set_dashboard_flight_status("yellow", "Connected - Not Ready to Arm")
+            reason = str(self._prearm_block_reason or "").strip()
+            msg = f"Connected - Not Ready to Arm ({reason})" if reason else "Connected - Not Ready to Arm"
+            self._set_dashboard_flight_status("yellow", msg)
             return
         mode_disp = str(self._hb_mode_text or "Unknown").strip()
         if self._hb_armed:
@@ -2671,6 +2675,26 @@ class MainWindow(QMainWindow):
             return
         self._set_dashboard_flight_status("green", "Ready to Arm")
         self._flight_status_btn.setText("READY TO ARM")
+
+    def _update_prearm_gate_from_statustext(self, text: str) -> None:
+        t = str(text or "").strip()
+        if not t:
+            return
+        low = t.lower()
+        is_prearm_block = (
+            ("prearm" in low or low.startswith("arm:"))
+            and any(k in low for k in ("wait", "fail", "not", "deny", "check", "error"))
+        )
+        if is_prearm_block:
+            reason = t.split(":", 1)[-1].strip() if ":" in t else t
+            self._prearm_block_reason = reason or t
+            # Keep the gate active briefly so READY does not flicker between heartbeats.
+            self._prearm_block_until_mono = time.monotonic() + 4.0
+            return
+        # Clear sticky gate when firmware reports healthy arm/ready messages.
+        if any(k in low for k in ("armed", "armable", "ready to arm", "prearm: checks passed")):
+            self._prearm_block_reason = ""
+            self._prearm_block_until_mono = 0.0
 
     def _push_map_flight_overlay(self) -> None:
         if self._armed_since is None:
@@ -3216,10 +3240,17 @@ class MainWindow(QMainWindow):
                 self._fields["flight_time"].setText("00:00")
             standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
             arm_ready = system_status >= standby
+            if time.monotonic() < float(self._prearm_block_until_mono):
+                arm_ready = False
             self._hb_armed = armed
             self._hb_arm_ready = arm_ready
             self._hb_mode_text = mode_text
-            self._fields["arm_ready"].setText("Likely ready" if arm_ready else f"System status {system_status}")
+            if arm_ready:
+                self._fields["arm_ready"].setText("Likely ready")
+            elif self._prearm_block_reason:
+                self._fields["arm_ready"].setText(f"PreArm: {self._prearm_block_reason}")
+            else:
+                self._fields["arm_ready"].setText(f"System status {system_status}")
             self._apply_state_style(self._fields["arm_ready"], "ok" if arm_ready else "warn")
             if arm_ready:
                 # Do not clear _arm_not_ready_alert_shown here: brief STANDBY in a flickering
@@ -3465,8 +3496,10 @@ class MainWindow(QMainWindow):
             text = str(data.get("text", "")).strip()
             if text:
                 self._recent_statustext.append(text)
+                self._update_prearm_gate_from_statustext(text)
                 self._set_top_vehicle_msg(text)
                 self._map_widget.set_header_vehicle_msg(text)
+                self._refresh_dashboard_flight_state()
                 # STATUSTEXT can burst during param download; logging each line hammers QTextEdit.
                 now = time.monotonic()
                 last_log = float(getattr(self, "_last_statustext_log_mono", 0.0))
