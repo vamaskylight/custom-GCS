@@ -152,6 +152,9 @@ class MainWindow(QMainWindow):
         self._connect_attempt_active = False
         self._theme_name = str(self._settings.value("ui_theme", "Default"))
         self._last_hb_ui_key: tuple[object, ...] | None = None
+        self._hb_armed = False
+        self._hb_arm_ready = False
+        self._hb_mode_text = "—"
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
         self._last_vehicle_type: int | None = None
@@ -2652,6 +2655,23 @@ class MainWindow(QMainWindow):
             rel_display_m -= float(self._home_rel_alt_baseline_m)
         return abs(rel_display_m) >= 1.5 or float(self._map_groundspeed_mps) >= 1.2
 
+    def _refresh_dashboard_flight_state(self) -> None:
+        """Keep banner/button state aligned with latest heartbeat + motion cues."""
+        if not self._hb_arm_ready:
+            self._set_dashboard_flight_status("yellow", "Connected - Not Ready to Arm")
+            return
+        mode_disp = str(self._hb_mode_text or "Unknown").strip()
+        if self._hb_armed:
+            if self._is_probably_flying():
+                self._set_dashboard_flight_status("green", f"In Flight - {mode_disp}")
+                self._flight_status_btn.setText("IN FLIGHT")
+            else:
+                self._set_dashboard_flight_status("green", f"Armed - {mode_disp}")
+                self._flight_status_btn.setText("ARMED")
+            return
+        self._set_dashboard_flight_status("green", "Ready to Arm")
+        self._flight_status_btn.setText("READY TO ARM")
+
     def _push_map_flight_overlay(self) -> None:
         if self._armed_since is None:
             flight_time_text = "00:00:00"
@@ -3171,10 +3191,12 @@ class MainWindow(QMainWindow):
         if msg_type == "HEARTBEAT":
             armed = bool(data.get("armed", False))
             system_status = int(data.get("system_status", 0))
-            mode_text = human_mode_name(
-                vehicle_type=int(data.get("vehicle_type", 0) or 0),
-                custom_mode=int(data.get("custom_mode", 0) or 0),
-            )
+            mode_text = str(data.get("mode_text", "") or "").strip()
+            if not mode_text:
+                mode_text = human_mode_name(
+                    vehicle_type=int(data.get("vehicle_type", 0) or 0),
+                    custom_mode=int(data.get("custom_mode", 0) or 0),
+                )
             hb_key = (armed, system_status, mode_text)
             if hb_key == getattr(self, "_last_hb_ui_key", None):
                 return
@@ -3194,20 +3216,16 @@ class MainWindow(QMainWindow):
                 self._fields["flight_time"].setText("00:00")
             standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
             arm_ready = system_status >= standby
+            self._hb_armed = armed
+            self._hb_arm_ready = arm_ready
+            self._hb_mode_text = mode_text
             self._fields["arm_ready"].setText("Likely ready" if arm_ready else f"System status {system_status}")
             self._apply_state_style(self._fields["arm_ready"], "ok" if arm_ready else "warn")
             if arm_ready:
                 # Do not clear _arm_not_ready_alert_shown here: brief STANDBY in a flickering
                 # HEARTBEAT would re-arm the popup and make OK / title-bar close feel ignored.
                 self._arm_not_ready_since_mono = None
-                if armed:
-                    mode_disp = str(mode_text or "Unknown").strip()
-                    if self._is_probably_flying():
-                        self._set_dashboard_flight_status("green", f"In Flight - {mode_disp}")
-                    else:
-                        self._set_dashboard_flight_status("green", f"Armed - {mode_disp}")
-                else:
-                    self._set_dashboard_flight_status("green", "Ready to Arm")
+                self._refresh_dashboard_flight_state()
             else:
                 self._set_dashboard_flight_status(
                     "yellow",
@@ -3310,6 +3328,7 @@ class MainWindow(QMainWindow):
                 self._fields["heading"].setText(f"{int(round(course))}°")
                 self._compass.set_heading_deg(course)
                 self._map_widget.set_vehicle_heading(course, source="gpi")
+            self._refresh_dashboard_flight_state()
         elif msg_type == "MISSION_CURRENT":
             self._map_widget.set_mission_nav_seq(int(data.get("seq", 0) or 0))
         elif msg_type == "VFR_HUD":
@@ -3326,6 +3345,7 @@ class MainWindow(QMainWindow):
             self._heading = hd
             self._compass.set_heading_deg(hd)
             self._map_widget.set_vehicle_heading(hd, source="vfr")
+            self._refresh_dashboard_flight_state()
         elif msg_type == "ATTITUDE":
             self._fields["attitude"].setText(
                 f"{data.get('roll_deg', 0.0):.1f} / "

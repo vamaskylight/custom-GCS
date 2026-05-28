@@ -352,6 +352,13 @@ class MavlinkThread(QThread):
                         f"HEARTBEAT sys={msg.get_srcSystem()} comp={msg.get_srcComponent()}"
                     )
                 armed = bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                mode_text = ""
+                try:
+                    # Uses pymavlink's autopilot-aware decoder (PX4/ArduPilot/etc.) instead of
+                    # relying only on raw custom_mode integer mappings.
+                    mode_text = str(mavutil.mode_string_v10(msg) or "").strip()
+                except Exception:
+                    mode_text = ""
                 if primary:
                     self._emit_telemetry_payload(
                         "HEARTBEAT",
@@ -362,6 +369,7 @@ class MavlinkThread(QThread):
                             "base_mode": int(getattr(msg, "base_mode", 0) or 0),
                             "vehicle_type": int(getattr(msg, "type", 0) or 0),
                             "autopilot": int(getattr(msg, "autopilot", 0) or 0),
+                            "mode_text": mode_text,
                         },
                     )
                 if not self._streams_requested and int(self._target_sysid) > 0:
