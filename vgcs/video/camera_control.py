@@ -367,8 +367,15 @@ class SkydroidCameraControl:
             return
 
     def gimbal_point_down(self) -> None:
+        """Straight down: PTZ one-key down (0x0A) when available, else absolute GAM/GAP."""
+        if self._adapter._profile.ptz_commands.get("nadir"):
+            try:
+                self.ptz("nadir")
+                return
+            except Exception:
+                pass
         pitch = gimbal_nadir_pitch_deg()
-        yaw_hold: float | None = None
+        yaw_hold = 0.0
         try:
             st = self._adapter.get_status_cached()
             if st is not None and st.yaw_deg is not None:

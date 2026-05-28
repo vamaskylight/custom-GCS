@@ -67,3 +67,24 @@ def test_gsm_stop_both_axes() -> None:
 def test_build_gac_query() -> None:
     frame = build_gac_query()
     assert frame.startswith(b"#TPUG2rGAC")
+
+
+def test_build_ptz_nadir_one_click_down() -> None:
+    """Topotek PTZ 0x0A = one-key downward (C13 manual)."""
+    assert build_top_frame("PTZ_NADIR", {}) == b"#TPUG2wPTZ0A7B"
+
+
+def test_gap_pitch_uses_0_01_degree_units() -> None:
+    """-90° must be 0xDCD8 (0.01° units), not 0xFF4C (wrong 0.5° encoding)."""
+    frame = build_top_frame("GAP", {"pitch": -90.0, "speed": 25.0})
+    assert b"DCD8" in frame
+    assert b"FF4C" not in frame
+
+
+def test_gam_includes_pitch_and_yaw_speed() -> None:
+    frame = build_top_frame("GAM", {"yaw": 0.0, "pitch": -90.0, "speed": 25.0})
+    assert frame.startswith(b"#tpUG")
+    assert b"GAM" in frame
+    # yaw 0 + yaw spd + pitch -90 (DCD8) + pitch spd
+    assert b"0000" in frame
+    assert b"DCD8" in frame

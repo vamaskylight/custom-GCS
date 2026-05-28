@@ -60,12 +60,8 @@ def encode_speed_2char(deg_per_s: float) -> str:
 
 
 def encode_angle_4char(deg: float) -> str:
-    """Gimbal angle field: int16 in 0.5 deg units, four hex ASCII chars (big-endian)."""
-    units = int(round(float(deg) / 0.5))
-    units = max(-32768, min(32767, units))
-    if units < 0:
-        units = (units + 0x10000) & 0xFFFF
-    return f"{units:04X}"
+    """Gimbal angle command field: int16 in 0.01° units (Topotek GAY/GAP/GAM)."""
+    return encode_attitude_field_4char(deg)
 
 
 def encode_attitude_field_4char(deg: float) -> str:
@@ -107,6 +103,9 @@ def build_ptz(action: str) -> bytes | None:
         "left": "03",
         "right": "04",
         "center": "05",
+        "nadir": "0A",
+        "down_once": "0A",
+        "point_down": "0A",
     }
     code = codes.get(str(action or "").strip().lower())
     if code is None:
@@ -198,6 +197,8 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
         "PTZ_RIGHT": "right",
         "PTZ_CENTER": "center",
         "PTZ_STOP": "stop",
+        "PTZ_NADIR": "nadir",
+        "PT_NADIR": "nadir",
     }
     if cmd in ptz_alias:
         frame = build_ptz(ptz_alias[cmd])
@@ -230,11 +231,19 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
         if cmd == "GAM":
             yaw = float(p.get("yaw", 0.0) or 0.0)
             pitch = float(p.get("pitch", 0.0) or 0.0)
+            spd = float(p.get("speed", 25.0) or 25.0)
+            yaw_spd = float(p.get("yaw_speed", spd) or spd)
+            pitch_spd = float(p.get("pitch_speed", spd) or spd)
             return build_tp_frame(
                 dest="G",
                 control="w",
                 tag="GAM",
-                data=f"{encode_angle_4char(yaw)}{encode_angle_4char(pitch)}",
+                data=(
+                    f"{encode_angle_4char(yaw)}"
+                    f"{encode_speed_2char(yaw_spd)}"
+                    f"{encode_angle_4char(pitch)}"
+                    f"{encode_speed_2char(pitch_spd)}"
+                ),
                 variable=True,
             )
         deg = float(

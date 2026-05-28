@@ -28,6 +28,17 @@ def test_skydroid_gimbal_center_calls_ptz() -> None:
     cc.ptz.assert_called_once_with("center")
 
 
+def test_skydroid_gimbal_point_down_calls_ptz_nadir() -> None:
+    cc = SkydroidCameraControl.__new__(SkydroidCameraControl)
+    profile = MagicMock()
+    profile.ptz_commands = {"nadir": ["PTZ_NADIR"]}
+    cc._adapter = MagicMock()
+    cc._adapter._profile = profile
+    cc.ptz = MagicMock()
+    cc.gimbal_point_down()
+    cc.ptz.assert_called_once_with("nadir")
+
+
 def test_mavlink_gimbal_center_queues_zero() -> None:
     t = MagicMock()
     cc = MavlinkCameraControl(t)

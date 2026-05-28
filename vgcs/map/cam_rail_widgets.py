@@ -53,20 +53,28 @@ class CamRecordTimerRow(QWidget):
 class CamRailGimbalPad(QWidget):
     """2×3 gimbal pad: [← ↑ →] / [⌂ ↓ 90°]."""
 
-    def __init__(self, buttons: list[list[QWidget]], parent=None) -> None:
+    def __init__(
+        self,
+        buttons: list[list[QWidget]],
+        parent=None,
+        *,
+        btn_height: int = 30,
+        grid_gap: int = 4,
+    ) -> None:
         super().__init__(parent)
         from PySide6.QtWidgets import QGridLayout
 
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         lay = QGridLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setHorizontalSpacing(4)
-        lay.setVerticalSpacing(4)
+        lay.setHorizontalSpacing(int(grid_gap))
+        lay.setVerticalSpacing(int(grid_gap))
         for row, row_btns in enumerate(buttons):
             for col, btn in enumerate(row_btns):
                 lay.addWidget(btn, row, col, Qt.AlignmentFlag.AlignCenter)
-        # Two 30px-tall button rows + spacing — stable size hint for camera rail height.
-        self.setFixedHeight(30 * len(buttons) + 4 * max(0, len(buttons) - 1))
+        # Two button rows + one gap — stable size hint for camera rail height.
+        rows = len(buttons)
+        self.setFixedHeight(int(btn_height) * rows + int(grid_gap) * max(0, rows - 1))
 
 
 class CamObserveBlock(QWidget):
