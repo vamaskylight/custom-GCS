@@ -89,7 +89,11 @@ from vgcs.map.map_footer_hud import (
 )
 from vgcs.map.sensor_obstacle_widget import ObstacleRadarPanel
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_url, create_map_3d_web_view
-from vgcs.map.cam_rail_widgets import CamObserveSegment, CamRecordArch
+from vgcs.map.cam_rail_widgets import (
+    CamObserveBlock,
+    CamRailGimbalPad,
+    CamRecordTimerRow,
+)
 from vgcs.map.plan_flight_panel import PlanFlightPanel
 
 try:
@@ -177,6 +181,8 @@ _MAP_HUD_TOP_PX = 10
 _MAP_ACTION_RAIL_LEFT_PX = 10
 _MAP_ACTION_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _NATIVE_CAM_RAIL_TOP_PX = _MAP_HUD_TOP_PX
+# LENS row: 42 + 6 + (16+34+34)*2 + 6 + ~11 layout margins.
+_NATIVE_CAM_RAIL_MIN_WIDTH_PX = 258
 # Native HUD margins (mini-video bottom-left; obstacle top-left under Takeoff/Return).
 _MAP_HUD_MARGIN_PX = 12
 _MAP_ACTION_RAIL_HEIGHT_PX = 54 + 8 + 54
@@ -268,7 +274,7 @@ _NATIVE_CAMERA_RAIL_QSS = (
     "QFrame#nativeCameraRail {\n"
     "  background: transparent;\n"
     "  border: none;\n"
-    "  min-width: 220px;\n"
+    f"  min-width: {_NATIVE_CAM_RAIL_MIN_WIDTH_PX}px;\n"
     '  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;\n'
     "  color: #dce5f5;\n"
     "  font-size: 15px;\n"
@@ -396,6 +402,68 @@ QLabel#camSectionHeader {
   background: transparent;
   min-height: 18px;
 }
+QLabel#camSectionHeaderInline {
+  color: #dce5f5;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 0px 4px 0px 0px;
+  border: none;
+  background: transparent;
+  min-width: 58px;
+  max-width: 58px;
+}
+QLabel#camAxisLabel {
+  color: #c8d3ea;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  padding: 0px;
+  margin: 0px;
+  border: none;
+  background: transparent;
+  min-width: 16px;
+  max-width: 16px;
+}
+QLabel#camSectionHeaderLens {
+  color: #dce5f5;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 0px 2px 0px 0px;
+  border: none;
+  background: transparent;
+  min-width: 42px;
+  max-width: 42px;
+}
+QPushButton[camLensPadBtn=true] {
+  min-width: 34px;
+  max-width: 34px;
+  min-height: 30px;
+  max-height: 30px;
+  border-radius: 6px;
+  border: 1px solid rgba(196, 209, 230, 38);
+  background: rgba(18, 22, 32, 75);
+  color: #dce5f5;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  padding: 0px;
+}
+QPushButton[camLensPadBtn=true]:hover {
+  background: rgba(110, 123, 148, 45);
+  border-color: rgba(229, 237, 251, 70);
+}
+QWidget#camLensRow {
+  background: transparent;
+  min-height: 36px;
+  max-height: 36px;
+}
+QWidget#camLensControls, QWidget#camInlineRowBody {
+  background: transparent;
+}
 QFrame#camRecordArch {
   margin-top: 0px;
   border: none;
@@ -406,47 +474,10 @@ QFrame#camRailSep {
   max-height: 1px;
   min-height: 1px;
   border: none;
-  margin-top: 2px;
-  margin-bottom: 2px;
+  margin-top: 1px;
+  margin-bottom: 1px;
 }
-QFrame#camObserveSegment {
-  border: 1px solid rgba(196, 209, 230, 38);
-  border-radius: 7px;
-  background: rgba(14, 17, 26, 140);
-}
-QPushButton#observeTarget {
-  border: none;
-  border-right: 1px solid rgba(196, 209, 230, 35);
-  border-top-left-radius: 6px;
-  border-bottom-left-radius: 6px;
-  min-height: 30px;
-  padding: 2px 4px;
-  background: transparent;
-  color: #dce5f5;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-}
-QPushButton#observeClip {
-  border: none;
-  border-top-right-radius: 6px;
-  border-bottom-right-radius: 6px;
-  min-height: 30px;
-  padding: 2px 4px;
-  background: transparent;
-  color: #dce5f5;
-  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
-  font-weight: 600;
-}
-QPushButton#observeTarget:checked, QPushButton#observeClip:checked {
-  background: rgba(27, 33, 45, 235);
-}
-QPushButton#observeClip[recording="true"] {
-  background: rgba(200, 45, 45, 240);
-  color: #ffffff;
-  font-weight: 700;
-}
+QPushButton#observeTarget, QPushButton#observeClip,
 QPushButton#observeReport, QPushButton#observeReset {
   min-height: 30px;
   font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
@@ -457,6 +488,21 @@ QPushButton#observeReport, QPushButton#observeReset {
   background: rgba(18, 22, 32, 75);
   color: #dce5f5;
   padding: 2px 6px;
+}
+QPushButton#observeTarget:hover, QPushButton#observeClip:hover,
+QPushButton#observeReport:hover, QPushButton#observeReset:hover {
+  background: rgba(110, 123, 148, 45);
+  border-color: rgba(229, 237, 251, 70);
+}
+QPushButton#observeTarget:checked, QPushButton#observeClip:checked {
+  border-color: rgba(214, 224, 241, 230);
+  background: rgba(27, 33, 45, 245);
+}
+QPushButton#observeClip[recording="true"] {
+  background: rgba(200, 45, 45, 240);
+  border-color: rgba(255, 130, 130, 220);
+  color: #ffffff;
+  font-weight: 700;
 }
 QPushButton[camPadBtn=true] {
   min-width: 40px;
@@ -489,52 +535,76 @@ def _cam_rail_sep() -> QFrame:
     return f
 
 
-def _cam_rail_section(title: str, *body: object) -> QWidget:
-    """Section title (`#camSectionHeader`) then `QHBoxLayout`(s) or `QWidget` (e.g. zoom track)."""
-    box = QWidget()
-    vl = QVBoxLayout(box)
-    vl.setContentsMargins(0, 0, 0, 0)
-    vl.setSpacing(2)
-    lab = QLabel(title)
-    lab.setObjectName("camSectionHeader")
-    lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    lab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    vl.addWidget(lab)
-    for item in body:
-        if isinstance(item, QWidget):
-            vl.addWidget(item)
-        elif isinstance(item, QHBoxLayout):
-            vl.addLayout(item)
-        else:
-            raise TypeError(item)
-    return box
-
-
-def _cam_rail_plus_minus_pair(left: QWidget, right: QWidget) -> QWidget:
-    """Discrete − / + row (replaces range-style sliders for zoom / focus)."""
+def _cam_rail_inline_row(label: str, body: QWidget) -> QWidget:
+    """Compact row: section label + controls (one line, no extra header row)."""
     w = QWidget()
-    lay = QHBoxLayout(w)
-    lay.setContentsMargins(0, 2, 0, 2)
-    lay.setSpacing(12)
-    lay.addStretch(1)
-    lay.addWidget(left, 0, Qt.AlignmentFlag.AlignVCenter)
-    lay.addWidget(right, 0, Qt.AlignmentFlag.AlignVCenter)
-    lay.addStretch(1)
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(6)
+    lab = QLabel(label)
+    lab.setObjectName("camSectionHeaderInline")
+    lab.setAlignment(
+        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    )
+    body.setObjectName("camInlineRowBody")
+    body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    h.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
+    h.addWidget(body, 1, Qt.AlignmentFlag.AlignVCenter)
     return w
 
 
-def _cam_rail_gimbal_horizontal_row(left: QWidget, up: QWidget, right: QWidget) -> QWidget:
-    """Yaw L / pitch up / yaw R — discrete buttons (no range track)."""
-    w = QWidget()
-    lay = QHBoxLayout(w)
-    lay.setContentsMargins(0, 2, 0, 2)
-    lay.setSpacing(8)
+def _cam_lens_pad_btn(btn: QPushButton) -> QPushButton:
+    """Lens −/+ only — QSS min/max must match fixed size or Qt overlaps widgets."""
+    btn.setProperty("camLensPadBtn", True)
+    btn.setFixedSize(34, 30)
+    btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    return btn
+
+
+def _cam_rail_lens_row(
+    zoom_minus: QPushButton,
+    zoom_plus: QPushButton,
+    focus_minus: QPushButton,
+    focus_plus: QPushButton,
+) -> QWidget:
+    """Single flat row: LENS · Z − + · F − + (fixed height so buttons are not vertically clipped)."""
+    row = QWidget()
+    row.setObjectName("camLensRow")
+    row.setFixedHeight(36)
+    row.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 3, 0, 3)
+    lay.setSpacing(6)
+    lab = QLabel("LENS")
+    lab.setObjectName("camSectionHeaderLens")
+    lab.setFixedWidth(42)
+    lab.setAlignment(
+        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    )
+    lay.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def _add_axis(cap: str, minus_btn: QPushButton, plus_btn: QPushButton) -> None:
+        cap_lbl = QLabel(cap)
+        cap_lbl.setObjectName("camAxisLabel")
+        cap_lbl.setFixedWidth(16)
+        cap_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _cam_lens_pad_btn(minus_btn)
+        _cam_lens_pad_btn(plus_btn)
+        lay.addWidget(cap_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(minus_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(plus_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    _add_axis("Z", zoom_minus, zoom_plus)
+    lay.addSpacing(6)
+    _add_axis("F", focus_minus, focus_plus)
     lay.addStretch(1)
-    lay.addWidget(left, 0, Qt.AlignmentFlag.AlignVCenter)
-    lay.addWidget(up, 0, Qt.AlignmentFlag.AlignVCenter)
-    lay.addWidget(right, 0, Qt.AlignmentFlag.AlignVCenter)
-    lay.addStretch(1)
-    return w
+    return row
+
+
+def _cam_pad_btn(btn: QPushButton, *, width: int = 40, height: int = 30) -> QPushButton:
+    btn.setProperty("camPadBtn", True)
+    btn.setFixedSize(int(width), int(height))
+    return btn
 
 
 class _VideoEncodeBridge(QObject):
@@ -995,7 +1065,7 @@ class MapWidget(QWidget):
         self._native_hud_right.setAutoFillBackground(False)
         self._native_hud_right.setStyleSheet(_NATIVE_CAMERA_RAIL_QSS)
         self._native_hud_right_layout = QVBoxLayout(self._native_hud_right)
-        self._native_hud_right_layout.setContentsMargins(6, 5, 7, 7)
+        self._native_hud_right_layout.setContentsMargins(5, 4, 6, 5)
         self._native_hud_right_layout.setSpacing(2)
 
         self._camera_top_row = QFrame(self._native_hud_right)
@@ -1084,17 +1154,14 @@ class MapWidget(QWidget):
         self._lbl_native_cam_timer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._lbl_native_cam_timer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
-        self._cam_timer_settings_row = QWidget()
-        _tsl = QHBoxLayout(self._cam_timer_settings_row)
-        _tsl.setContentsMargins(0, 0, 0, 0)
-        _tsl.setSpacing(8)
-        _tsl.addStretch(1)
-        _tsl.addWidget(self._lbl_native_cam_timer)
-        _tsl.addStretch(1)
-
         self._native_hud_right_layout.addWidget(self._camera_top_row)
-        self._native_hud_right_layout.addWidget(CamRecordArch(self._btn_native_record, self._native_hud_right))
-        self._native_hud_right_layout.addWidget(self._cam_timer_settings_row)
+        self._native_hud_right_layout.addWidget(
+            CamRecordTimerRow(
+                self._btn_native_record,
+                self._lbl_native_cam_timer,
+                self._native_hud_right,
+            )
+        )
 
         self._btn_native_zoom_minus = QPushButton("−")
         self._btn_native_zoom_plus = QPushButton("+")
@@ -1108,6 +1175,8 @@ class MapWidget(QWidget):
         self._btn_native_gimbal_down = QPushButton("↓")
         self._btn_native_gimbal_left = QPushButton("←")
         self._btn_native_gimbal_right = QPushButton("→")
+        self._btn_native_gimbal_center = QPushButton("⌂")
+        self._btn_native_gimbal_nadir = QPushButton("90°")
         self._btn_native_target = QPushButton("Target")
         self._btn_native_target.setCheckable(True)
         self._btn_native_clip = QPushButton("Clip")
@@ -1116,63 +1185,62 @@ class MapWidget(QWidget):
         self._btn_native_reset = QPushButton("Reset")
         self._btn_native_reset.setObjectName("observeReset")
         for b in (
-            self._btn_native_zoom_minus,
-            self._btn_native_zoom_plus,
-            self._btn_native_focus_minus,
-            self._btn_native_focus_plus,
             self._btn_native_gimbal_up,
             self._btn_native_gimbal_down,
             self._btn_native_gimbal_left,
             self._btn_native_gimbal_right,
-            self._btn_native_report,
-            self._btn_native_reset,
+            self._btn_native_gimbal_center,
+            self._btn_native_gimbal_nadir,
         ):
-            b.setProperty("camPadBtn", True)
+            _cam_pad_btn(b)
 
         self._btn_native_gimbal_left.setToolTip("Gimbal yaw left — press and hold")
         self._btn_native_gimbal_up.setToolTip("Gimbal pitch up — press and hold")
         self._btn_native_gimbal_right.setToolTip("Gimbal yaw right — press and hold")
         self._btn_native_gimbal_down.setToolTip("Gimbal pitch down — press and hold")
-
-        zoom_row = _cam_rail_plus_minus_pair(self._btn_native_zoom_minus, self._btn_native_zoom_plus)
-        focus_row = _cam_rail_plus_minus_pair(self._btn_native_focus_minus, self._btn_native_focus_plus)
-        gimbal_h_row = _cam_rail_gimbal_horizontal_row(
-            self._btn_native_gimbal_left, self._btn_native_gimbal_up, self._btn_native_gimbal_right
+        self._btn_native_gimbal_center.setToolTip("Recenter gimbal (yaw and pitch to 0°)")
+        self._btn_native_gimbal_nadir.setToolTip(
+            "Point gimbal straight down (default −90° pitch; set camera/gimbal_nadir_pitch_deg to 90 if needed)"
         )
-        gimbal_down_wrap = QWidget()
-        gimbal_down_lay = QHBoxLayout(gimbal_down_wrap)
-        gimbal_down_lay.setContentsMargins(0, 0, 0, 0)
-        gimbal_down_lay.setSpacing(0)
-        gimbal_down_lay.addStretch(1)
-        self._btn_native_gimbal_down.setFixedSize(48, 30)
-        gimbal_down_lay.addWidget(self._btn_native_gimbal_down)
-        gimbal_down_lay.addStretch(1)
-        gimbal_body = QWidget()
-        gimbal_v = QVBoxLayout(gimbal_body)
-        gimbal_v.setContentsMargins(0, 0, 0, 0)
-        gimbal_v.setSpacing(4)
-        gimbal_v.addWidget(gimbal_h_row)
-        gimbal_v.addWidget(gimbal_down_wrap)
 
-        obs_seg = CamObserveSegment(self._btn_native_target, self._btn_native_clip)
-        obs_body = QWidget()
-        obs_v = QVBoxLayout(obs_body)
-        obs_v.setContentsMargins(0, 0, 0, 0)
-        obs_v.setSpacing(2)
-        obs_v.addWidget(obs_seg)
-        obs_sec = QHBoxLayout()
-        obs_sec.setSpacing(5)
-        obs_sec.addWidget(self._btn_native_report)
-        obs_sec.addWidget(self._btn_native_reset)
-        obs_v.addLayout(obs_sec)
+        gimbal_pad = CamRailGimbalPad(
+            [
+                [
+                    self._btn_native_gimbal_left,
+                    self._btn_native_gimbal_up,
+                    self._btn_native_gimbal_right,
+                ],
+                [
+                    self._btn_native_gimbal_center,
+                    self._btn_native_gimbal_down,
+                    self._btn_native_gimbal_nadir,
+                ],
+            ]
+        )
+        observe_body = CamObserveBlock(
+            self._btn_native_target,
+            self._btn_native_clip,
+            self._btn_native_report,
+            self._btn_native_reset,
+        )
 
         self._native_hud_right_layout.addWidget(_cam_rail_sep())
-        self._native_hud_right_layout.addWidget(_cam_rail_section("ZOOM", zoom_row))
-        self._native_hud_right_layout.addWidget(_cam_rail_section("FOCUS", focus_row))
-        self._native_hud_right_layout.addWidget(_cam_rail_section("GIMBAL", gimbal_body))
-        self._native_hud_right_layout.addWidget(_cam_rail_section("OBSERVE", obs_body))
+        self._native_hud_right_layout.addWidget(
+            _cam_rail_lens_row(
+                self._btn_native_zoom_minus,
+                self._btn_native_zoom_plus,
+                self._btn_native_focus_minus,
+                self._btn_native_focus_plus,
+            )
+        )
+        self._native_hud_right_layout.addWidget(
+            _cam_rail_inline_row("GIMBAL", gimbal_pad)
+        )
+        self._native_hud_right_layout.addWidget(
+            _cam_rail_inline_row("OBSERVE", observe_body)
+        )
 
-        self._native_hud_right.setMinimumWidth(220)
+        self._native_hud_right.setMinimumWidth(_NATIVE_CAM_RAIL_MIN_WIDTH_PX)
         self._native_hud_right.hide()
         self._native_rail_layer.hide()
 
@@ -1405,6 +1473,8 @@ class MapWidget(QWidget):
         self._wire_native_gimbal_hold_button(self._btn_native_gimbal_down, 0, -1)
         self._wire_native_gimbal_hold_button(self._btn_native_gimbal_left, -1, 0)
         self._wire_native_gimbal_hold_button(self._btn_native_gimbal_right, 1, 0)
+        self._btn_native_gimbal_center.clicked.connect(self._native_gimbal_center)
+        self._btn_native_gimbal_nadir.clicked.connect(self._native_gimbal_point_down)
         def _obs_target(on: bool) -> None:
             print(f"[VGCS:cam_rail] OBSERVE Target toggled={bool(on)}")
             self._set_observation_mark_mode(on)
@@ -2331,19 +2401,26 @@ class MapWidget(QWidget):
             h = max(1, self._map_canvas.height())
             rail = self._native_hud_right
             ly = getattr(self, "_native_rail_layer", None)
-            panel_w = max(228, 220)
             panel_y = int(_NATIVE_CAM_RAIL_TOP_PX)
             bottom_margin = 12
             available_h = max(120, h - panel_y - bottom_margin)
-            panel_x = max(0, w - panel_w - 18)  # git `#cameraRail { right: 18px }`
-            rail.setFixedWidth(panel_w)
+            rail.setMinimumWidth(_NATIVE_CAM_RAIL_MIN_WIDTH_PX)
             rl = rail.layout()
             if rl is not None:
                 rl.activate()
             rail.updateGeometry()
-            need_h = max(120, rail.sizeHint().height())
-            # One fixed-height panel: no internal scroll; shrink only if taller than usable map height.
-            panel_h = min(need_h, available_h)
+            panel_w = max(
+                _NATIVE_CAM_RAIL_MIN_WIDTH_PX,
+                int(rail.sizeHint().width()),
+                int(rail.minimumSizeHint().width()),
+            )
+            panel_x = max(0, w - panel_w - 18)  # git `#cameraRail { right: 18px }`
+            rail.setFixedWidth(panel_w)
+            need_h = max(120, int(rail.sizeHint().height()))
+            # Never shrink below content height (that clips LENS / gimbal buttons). Shift up instead.
+            panel_h = need_h
+            if panel_y + panel_h > h - bottom_margin:
+                panel_y = max(0, h - bottom_margin - panel_h)
             if ly is not None:
                 pt = self._map_canvas.mapTo(self._panel, QPoint(panel_x, panel_y))
                 ly.setGeometry(pt.x(), pt.y(), panel_w, panel_h)
@@ -2362,7 +2439,7 @@ class MapWidget(QWidget):
             mh = self._native_telemetry.minimumSizeHint().height()
             sw = self._native_telemetry.sizeHint().width()
             sh = self._native_telemetry.sizeHint().height()
-            # Avoid clipping mph / ft / time: never cap width to a small constant; pad for border + font metrics.
+            # Avoid clipping m/s / m / time: never cap width to a small constant; pad for border + font metrics.
             tel_w = max(mw, sw) + 20
             tel_h = max(40, max(mh, sh) + 4)
             tel_x = cx - 12 - tel_w
@@ -3869,6 +3946,12 @@ class MapWidget(QWidget):
         panel = getattr(self, "_plan_flight_panel", None)
         if panel is not None:
             panel.hide()
+        try:
+            mar = getattr(self, "_map_action_rail", None)
+            if mar is not None:
+                mar.show()
+        except Exception:
+            pass
         self._set_map_footer_hud_visible(True)
         try:
             self._layout_native_hud()
@@ -3878,9 +3961,13 @@ class MapWidget(QWidget):
         self.plan_flight_exited.emit()
 
     def _sync_native_plan_edit_mode_for_rail_tool(self, tool: str) -> None:
-        """When the plan rail tool is not Waypoint/ROI, clear native map placement modes."""
+        """Keep native map placement modes aligned with the active plan rail tool."""
         tl = (tool or "").strip().lower()
-        if tl in ("waypoint", "roi"):
+        if tl == "waypoint":
+            self._enable_add_waypoint_mode()
+            return
+        if tl == "roi":
+            self._enable_fence_polygon_mode()
             return
         try:
             nm = getattr(self, "_native_map", None)
@@ -3934,6 +4021,12 @@ class MapWidget(QWidget):
             panel.set_waypoint_count(len(self._waypoints_model))
             panel.show()
             panel.raise_()
+            try:
+                mar = getattr(self, "_map_action_rail", None)
+                if mar is not None:
+                    mar.hide()
+            except Exception:
+                pass
             self._set_map_footer_hud_visible(False)
         else:
             try:
@@ -3943,6 +4036,12 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             panel.hide()
+            try:
+                mar = getattr(self, "_map_action_rail", None)
+                if mar is not None:
+                    mar.show()
+            except Exception:
+                pass
             self._set_map_footer_hud_visible(True)
         try:
             self._layout_native_hud()
@@ -3953,24 +4052,24 @@ class MapWidget(QWidget):
     def set_plan_flight_metrics(
         self,
         *,
-        alt_diff_ft: str,
+        alt_diff_m: str,
         gradient: str,
         azimuth: str,
         heading: str,
-        dist_prev_wp_ft: str,
-        mission_distance_ft: str,
+        dist_prev_wp_m: str,
+        mission_distance_m: str,
         mission_time: str,
-        max_telem_dist_ft: str,
+        max_telem_dist_m: str,
     ) -> None:
         payload = {
-            "altDiffFt": alt_diff_ft,
+            "altDiffM": alt_diff_m,
             "gradient": gradient,
             "azimuth": azimuth,
             "heading": heading,
-            "distPrevWpFt": dist_prev_wp_ft,
-            "missionDistanceFt": mission_distance_ft,
+            "distPrevWpM": dist_prev_wp_m,
+            "missionDistanceM": mission_distance_m,
             "missionTime": mission_time,
-            "maxTelemDistFt": max_telem_dist_ft,
+            "maxTelemDistM": max_telem_dist_m,
         }
         if payload == self._last_plan_flight_metrics_payload:
             return
@@ -6616,6 +6715,41 @@ class MapWidget(QWidget):
         # instead of waiting for the camera's internal AF timer (can take 3-5s on ZR10).
         QTimer.singleShot(400, self._trigger_gimbal_stop_autofocus)
 
+    def _native_gimbal_center(self) -> None:
+        self._gimbal_hold_axis = None
+        if self._gimbal_hold_timer.isActive():
+            self._gimbal_hold_timer.stop()
+        self._native_gimbal_speed_stop()
+        cc = getattr(self, "_camera_control", None)
+        if cc is None or isinstance(cc, NoopCameraControl):
+            self._set_status("Gimbal center — connect camera control first")
+            return
+        try:
+            cc.gimbal_center()
+            self._set_status("Gimbal recentered")
+            QTimer.singleShot(400, self._trigger_gimbal_stop_autofocus)
+        except Exception:
+            self._set_status("Gimbal center failed")
+
+    def _native_gimbal_point_down(self) -> None:
+        self._gimbal_hold_axis = None
+        if self._gimbal_hold_timer.isActive():
+            self._gimbal_hold_timer.stop()
+        self._native_gimbal_speed_stop()
+        cc = getattr(self, "_camera_control", None)
+        if cc is None or isinstance(cc, NoopCameraControl):
+            self._set_status("Gimbal 90° — connect camera control first")
+            return
+        try:
+            from vgcs.video.camera_control import gimbal_nadir_pitch_deg  # noqa: PLC0415
+
+            pitch = gimbal_nadir_pitch_deg()
+            cc.gimbal_point_down()
+            self._set_status(f"Gimbal pitch → {pitch:.0f}°")
+            QTimer.singleShot(400, self._trigger_gimbal_stop_autofocus)
+        except Exception:
+            self._set_status("Gimbal pitch-down failed")
+
     def _siyi_autofocus_adapter(self) -> object | None:
         cc = getattr(self, "_camera_control", None)
         if cc is None or isinstance(cc, NoopCameraControl):
@@ -7040,6 +7174,12 @@ class MapWidget(QWidget):
                     self._set_status("Focus command failed (check camera control backend)")
             self._run_js("document.title = 'VGCS Map';")
             return
+        if title.startswith("VGCS_CAM_GIMBAL_CENTER:"):
+            self._native_gimbal_center()
+            return
+        if title.startswith("VGCS_CAM_GIMBAL_NADIR:"):
+            self._native_gimbal_point_down()
+            return
         if title.startswith("VGCS_CAM_GIMBAL_NUDGE:"):
             # Format: VGCS_CAM_GIMBAL_NUDGE:<dx>:<dy>:<ts> — short pulse for legacy web bridge.
             try:
@@ -7171,6 +7311,25 @@ class MapWidget(QWidget):
         return getattr(self, "_native_map", None) is None and bool(getattr(self, "_web_ready", False))
 
     def _run_js(self, script: str, callback=None) -> None:
+        # Native Qt 2D map: dispatch JS-compat commands to NativeTileMapView (default path).
+        nm = getattr(self, "_native_map", None)
+        if nm is not None and not bool(getattr(self, "_is_3d_mode", False)):
+            try:
+                self._last_tile_template = str(getattr(nm, "_tile_template", "") or "")
+            except Exception:
+                pass
+            if callback is None:
+                nm.eval_script(script)
+                return
+            if nm.eval_script_with_callback(script, callback):
+                return
+            nm.eval_script(script)
+            try:
+                callback(None)
+            except Exception:
+                pass
+            return
+
         if not self._map_uses_legacy_web_bridge():
             if callback is not None:
                 try:
@@ -7463,12 +7622,12 @@ class MapWidget(QWidget):
         distance_from_home_m: float = 0.0,
     ) -> None:
         del msl_alt_m
-        ft = f"{float(relative_alt_m) * 3.28084:.1f}"
-        gs_mph = f"{float(ground_speed_mps) * 2.23694:.1f}"
-        vs_mph = f"{float(vertical_speed_mps) * 2.23694:.1f}"
-        dist_ft = f"{float(distance_from_home_m) * 3.28084:.1f}"
+        rel_alt_m = f"{float(relative_alt_m):.1f}"
+        gs_mps = f"{float(ground_speed_mps):.1f}"
+        vs_mps = f"{float(vertical_speed_mps):.1f}"
+        dist_m = f"{float(distance_from_home_m):.1f}"
         ttime = str(flight_time_text)
-        sig = f"{ft}|{gs_mph}|{vs_mph}|{dist_ft}|{ttime}"
+        sig = f"{rel_alt_m}|{gs_mps}|{vs_mps}|{dist_m}|{ttime}"
         if sig == self._last_flight_telemetry_sig:
             return
         self._last_flight_telemetry_sig = sig
@@ -7478,12 +7637,12 @@ class MapWidget(QWidget):
             pass
         try:
             self._native_telemetry.set_values(
-                f"{ft} ft",
-                f"{vs_mph} mph",
+                f"{rel_alt_m} m",
+                f"{vs_mps} m/s",
                 ttime,
-                f"{dist_ft} ft",
-                f"{gs_mph} mph",
-                f"{ft} ft",
+                f"{dist_m} m",
+                f"{gs_mps} m/s",
+                f"{rel_alt_m} m",
             )
             QTimer.singleShot(0, self._layout_native_hud)
         except Exception:
@@ -7740,10 +7899,20 @@ class MapWidget(QWidget):
             self.clear_plan_current_mission_path()
         rows = [[wp.lat, wp.lon] for wp in waypoints]
         self._waypoints_model = list(waypoints)
-        self._run_js(
-            f"setWaypoints({json.dumps(rows)});",
-            callback=lambda _: self._after_waypoints_mutated(),
-        )
+        nm = getattr(self, "_native_map", None)
+        if nm is not None and not bool(getattr(self, "_is_3d_mode", False)):
+            nm.set_waypoint_rows(rows)
+            self.set_mission_waypoint_count(len(waypoints))
+            self._rebuild_wp_selector()
+            self.waypoints_changed.emit(list(waypoints))
+            panel = getattr(self, "_plan_flight_panel", None)
+            if panel is not None:
+                panel.set_waypoint_count(len(waypoints))
+        else:
+            self._run_js(
+                f"setWaypoints({json.dumps(rows)});",
+                callback=lambda _: self._after_waypoints_mutated(),
+            )
         self._set_status(f"Mission loaded ({len(waypoints)} WPs)")
 
     def get_waypoint_meta(self) -> list[dict[str, float]]:

@@ -281,12 +281,12 @@ class MapFooterTelemetryStrip(QFrame):
         for c in range(3):
             grid.setColumnStretch(c, 1)
 
-        self._row1_alt.setText("0.0 ft")
-        self._row1_mph.setText("0.0 mph")
+        self._row1_alt.setText("0.0 m")
+        self._row1_mph.setText("0.0 m/s")
         self._row1_time.setText("00:00:00")
-        self._row2_msl.setText("0.0 ft")
-        self._row2_mph.setText("0.0 mph")
-        self._row2_alt.setText("0.0 ft")
+        self._row2_msl.setText("0.0 m")
+        self._row2_mph.setText("0.0 m/s")
+        self._row2_alt.setText("0.0 m")
 
         self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum)
 

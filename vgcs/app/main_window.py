@@ -8,7 +8,7 @@ import math
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QSettings, QTimer
+from PySide6.QtCore import QPoint, QSize, Qt, QSettings, QTimer
 from PySide6.QtGui import (
     QColor,
     QGuiApplication,
@@ -16,7 +16,6 @@ from PySide6.QtGui import (
     QImage,
     QImageReader,
     QKeySequence,
-    QMouseEvent,
     QPainter,
     QPixmap,
     QShortcut,
@@ -54,6 +53,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QStackedWidget,
     QSpinBox,
+    QStyle,
 )
 from pymavlink import mavutil
 
@@ -174,7 +174,9 @@ class MainWindow(QMainWindow):
         self._home_lon: float | None = None
         self._home_amsl_m: float | None = None
         self._auto_center_pending = True
-        self._plan_hover_speed_mps = 11.18 * 0.44704
+        self._plan_hover_speed_mps = 11.18
+        self._last_gps_lat: float | None = None
+        self._last_gps_lon: float | None = None
         # WebEngine overlay refresh budget (~10 Hz) — avoids full-map flicker from 25–50 Hz MAVLink.
         self._last_map_overlay_refresh_s: float | None = None
         self._mission_upload_pending = False
@@ -610,13 +612,13 @@ class MainWindow(QMainWindow):
         value: QLabel,
         *,
         icon_size: int = 22,
-        min_w: int = 72,
+        min_w: int = 0,
     ) -> QWidget:
         """Legacy `.hdrPill`: icon + text row (git e48c1a7 map_widget HTML)."""
         wrap = QWidget()
         wrap.setObjectName("hdrPill")
-        # Floor: icon + spacing so an empty label never collapses the pill; content sets real width.
-        wrap.setMinimumWidth(max(min_w, icon_size + 6 + 4))
+        # Content-driven sizing with an optional floor for always-visible critical cells.
+        wrap.setMinimumWidth(max(min_w, icon_size + 8))
         wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         row = QHBoxLayout(wrap)
         row.setContentsMargins(0, 0, 0, 0)
@@ -629,6 +631,7 @@ class MainWindow(QMainWindow):
         value.setObjectName("hdrPillValue")
         value.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         value.setWordWrap(False)
+        value.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         row.addWidget(ic, 0, Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(value, 1, Qt.AlignmentFlag.AlignVCenter)
         return wrap
@@ -637,7 +640,7 @@ class MainWindow(QMainWindow):
         """GPS pill: `gps.svg` + `.hdrTinyStack` two-line column (Web map_widget)."""
         wrap = QWidget()
         wrap.setObjectName("hdrPill")
-        wrap.setMinimumWidth(96 if self._compact_ui else 104)
+        wrap.setMinimumWidth(56 if self._compact_ui else 64)
         wrap.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         row = QHBoxLayout(wrap)
         row.setContentsMargins(0, 0, 0, 0)
@@ -653,6 +656,8 @@ class MainWindow(QMainWindow):
         self._top_gps_hdop.setObjectName("hdrGpsStackLine")
         self._top_gps_sat.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._top_gps_hdop.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._top_gps_sat.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._top_gps_hdop.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         stack = QVBoxLayout()
         stack.setContentsMargins(0, 0, 0, 0)
         stack.setSpacing(0)
@@ -665,6 +670,15 @@ class MainWindow(QMainWindow):
     def _top_gps_status_line(self) -> str:
         """One-line GPS summary for popups/exports (sat line + HDOP line)."""
         return f"{self._top_gps_sat.text()} / {self._top_gps_hdop.text()}"
+
+    def _set_top_vehicle_msg(self, message: object) -> None:
+        """Allow truncation only for MESSAGE cell; keep full text in tooltip."""
+        txt = str(message or "—")
+        lbl = self._top_vehicle_msg
+        max_px = 170 if self._compact_ui else 240
+        elided = lbl.fontMetrics().elidedText(txt, Qt.TextElideMode.ElideRight, max_px)
+        lbl.setText(elided)
+        lbl.setToolTip(txt if elided != txt else "")
 
     def _apply_link_banner_palette(self, state: str) -> None:
         """Tint full `#linkBanner` like Web `setFlightStatus()` — not a separate arm rectangle.
@@ -704,6 +718,16 @@ class MainWindow(QMainWindow):
                 f"color: {fg}; font-weight: 700; font-size: 14px; padding: 2px 4px; }}",
                 "QPushButton#headerFlightChipBtn:hover { background-color: rgba(255,255,255,0.08); }",
                 f"QLabel#linkBannerText {{ color: {fg}; font-size: 14px; font-weight: 600; }}",
+                "QPushButton#hdrConnectBtn, QPushButton#hdrDisconnectBtn {"
+                f" color: {fg}; font-size: 13px; font-weight: 700; padding: 4px 12px; "
+                " border-radius: 8px; border: 1px solid rgba(255,255,255,0.22); }",
+                "QPushButton#hdrConnectBtn { background-color: rgba(62, 126, 232, 0.20); }",
+                "QPushButton#hdrConnectBtn:hover { background-color: rgba(62, 126, 232, 0.34); }",
+                "QPushButton#hdrDisconnectBtn { background-color: rgba(210, 60, 60, 0.18); }",
+                "QPushButton#hdrDisconnectBtn:hover { background-color: rgba(210, 60, 60, 0.30); }",
+                "QPushButton#hdrConnectBtn:disabled, QPushButton#hdrDisconnectBtn:disabled {"
+                " background-color: rgba(255,255,255,0.08); color: rgba(240,245,255,0.55);"
+                " border: 1px solid rgba(255,255,255,0.14); }",
             )
         )
         self._top_dashboard.setStyleSheet(qss)
@@ -811,13 +835,13 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
         )
         # Legacy Web `#linkBanner`: any header click except logo → VGCS_CONNECT_REQUEST (git e48c1a7).
-        self._flight_status_btn.clicked.connect(self._on_map_connect_requested)
+        self._flight_status_btn.setCursor(Qt.ArrowCursor)
         fw_lay.addWidget(self._flight_status_btn)
 
         # git e48c1a7 map_widget: hold.svg → mode, link.svg → vehicle msg, gps.svg → stack, battery, remote_id, hdrMapModeBtn
         self._top_flight_mode = QLabel("—")
         mode_frame = self._make_hdr_icon_pill(
-            "hold.svg", self._top_flight_mode, min_w=72 if self._compact_ui else 80
+            "hold.svg", self._top_flight_mode, min_w=112 if self._compact_ui else 124
         )
 
         self._top_vehicle_msg = QLabel("—")
@@ -830,14 +854,14 @@ class MainWindow(QMainWindow):
             "link.svg",
             self._top_vehicle_msg,
             icon_size=26,
-            min_w=40 if self._compact_ui else 48,
+            min_w=76 if self._compact_ui else 88,
         )
 
         gps_frame = self._make_hdr_gps_pill_widget()
 
         self._top_battery = QLabel("—")
         bat_frame = self._make_hdr_icon_pill(
-            "battery.svg", self._top_battery, min_w=88 if self._compact_ui else 96
+            "battery.svg", self._top_battery, min_w=126 if self._compact_ui else 140
         )
 
         self._top_remote_id = QLabel("N/A")
@@ -903,20 +927,39 @@ class MainWindow(QMainWindow):
         self._banner_disconnected_wrap.setMinimumHeight(chip_row_h)
         dd_lay = QHBoxLayout(self._banner_disconnected_wrap)
         dd_lay.setContentsMargins(0, 0, 0, 0)
-        dd_lay.setSpacing(0)
+        dd_lay.setSpacing(10)
         self._link_banner_text = QLabel("Disconnected - Click to manually connect 💬")
         self._link_banner_text.setObjectName("linkBannerText")
         self._link_banner_text.setWordWrap(False)
         self._link_banner_text.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         dd_lay.addWidget(self._link_banner_text, 1, Qt.AlignmentFlag.AlignVCenter)
+        self._hdr_connect_btn = QPushButton("Connect")
+        self._hdr_connect_btn.setObjectName("hdrConnectBtn")
+        self._hdr_connect_btn.setCursor(Qt.PointingHandCursor)
+        self._hdr_connect_btn.setFixedHeight(28)
+        self._hdr_connect_btn.setMinimumWidth(112 if self._compact_ui else 124)
+        self._hdr_connect_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+        self._hdr_connect_btn.setIconSize(QSize(14, 14))
+        self._hdr_connect_btn.clicked.connect(self._on_map_connect_requested)
+        dd_lay.addWidget(self._hdr_connect_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._banner_connected_wrap = QWidget()
         self._banner_connected_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._banner_connected_wrap.setMinimumHeight(chip_row_h)
         cc_lay = QHBoxLayout(self._banner_connected_wrap)
         cc_lay.setContentsMargins(0, 0, 0, 0)
-        cc_lay.setSpacing(0)
+        cc_lay.setSpacing(10)
         cc_lay.addWidget(header_scroll, 1)
+        self._hdr_disconnect_btn = QPushButton("Disconnect")
+        self._hdr_disconnect_btn.setObjectName("hdrDisconnectBtn")
+        self._hdr_disconnect_btn.setCursor(Qt.PointingHandCursor)
+        self._hdr_disconnect_btn.setFixedHeight(28)
+        self._hdr_disconnect_btn.setMinimumWidth(112 if self._compact_ui else 124)
+        self._hdr_disconnect_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton))
+        self._hdr_disconnect_btn.setIconSize(QSize(14, 14))
+        self._hdr_disconnect_btn.setEnabled(False)
+        self._hdr_disconnect_btn.clicked.connect(self._on_disconnect)
+        cc_lay.addWidget(self._hdr_disconnect_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._header_banner_stack = QStackedWidget()
         self._header_banner_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -932,46 +975,7 @@ class MainWindow(QMainWindow):
         bar.setFixedHeight(chip_row_h + _hdr_pad_v)
         shell.addLayout(header_outer)
         bar.setLayout(shell)
-        self._install_header_connect_click_filters(bar)
         return bar
-
-    def _install_header_connect_click_filters(self, header_bar: QFrame) -> None:
-        """Web `#linkBanner` click: open connect dialog except `#linkBannerLogo` / `#hdrMapModeBtn`."""
-        hdr_btn = getattr(self, "_hdr_map_mode_btn", None)
-        logo_btn = getattr(self, "_logo_btn", None)
-        arm_btn = getattr(self, "_flight_status_btn", None)
-        for w in list(header_bar.findChildren(QWidget)) + [header_bar]:
-            if hdr_btn is not None and (w is hdr_btn or hdr_btn.isAncestorOf(w)):
-                continue
-            if logo_btn is not None and (w is logo_btn or logo_btn.isAncestorOf(w)):
-                continue
-            if arm_btn is not None and (w is arm_btn or arm_btn.isAncestorOf(w)):
-                continue
-            w.installEventFilter(self)
-
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        if event.type() != QEvent.Type.MouseButtonPress:
-            return super().eventFilter(obj, event)
-        if not isinstance(event, QMouseEvent):
-            return super().eventFilter(obj, event)
-        if event.button() != Qt.MouseButton.LeftButton:
-            return super().eventFilter(obj, event)
-
-        header_bar = getattr(self, "_top_dashboard", None)
-        if header_bar is None or not isinstance(obj, QWidget):
-            return super().eventFilter(obj, event)
-        if obj is not header_bar and not header_bar.isAncestorOf(obj):
-            return super().eventFilter(obj, event)
-        hdr_btn = getattr(self, "_hdr_map_mode_btn", None)
-        if hdr_btn is not None and (obj is hdr_btn or hdr_btn.isAncestorOf(obj)):
-            return super().eventFilter(obj, event)
-        logo_btn = getattr(self, "_logo_btn", None)
-        if logo_btn is not None and (obj is logo_btn or logo_btn.isAncestorOf(obj)):
-            return super().eventFilter(obj, event)
-        if isinstance(obj, QScrollBar):
-            return super().eventFilter(obj, event)
-        self._on_map_connect_requested()
-        return super().eventFilter(obj, event)
 
     @staticmethod
     def _logo_scaled_decode_size(ow: int, oh: int, max_edge: int) -> QSize:
@@ -1480,7 +1484,7 @@ class MainWindow(QMainWindow):
         self._mission_upload_pending = True
         self._thread.queue_mission_upload(payload)
         self._append_log(f"Mission upload queued: {len(payload)} WPs")
-        self._top_vehicle_msg.setText(f"Uploading mission ({len(payload)} WPs)…")
+        self._set_top_vehicle_msg(f"Uploading mission ({len(payload)} WPs)…")
 
     def _on_mission_download_requested(self) -> None:
         if self._thread is None or not self._thread.isRunning():
@@ -1492,7 +1496,7 @@ class MainWindow(QMainWindow):
     def _on_mission_uploaded(self, count: int) -> None:
         self._mission_upload_pending = False
         self._append_log(f"Mission upload success: {count} WPs")
-        self._top_vehicle_msg.setText(f"Mission uploaded ({count})")
+        self._set_top_vehicle_msg(f"Mission uploaded ({count})")
         QMessageBox.information(
             self, "Mission Upload", f"Mission uploaded successfully ({count} waypoints)."
         )
@@ -1512,7 +1516,7 @@ class MainWindow(QMainWindow):
             if isinstance(row, dict)
         ]
         self._map_widget.set_waypoints(wps, clear_plan_current_file=True)
-        self._top_vehicle_msg.setText(f"Mission downloaded ({len(wps)})")
+        self._set_top_vehicle_msg(f"Mission downloaded ({len(wps)})")
 
     def _sync_plan_flight_chrome(self) -> None:
         """Enable/disable Plan Flight upload/save buttons from link + waypoint state."""
@@ -1564,11 +1568,18 @@ class MainWindow(QMainWindow):
 
     def _restore_plan_mission_panel_to_map(self) -> None:
         s = self._settings
+        initial_wp_alt_m = float(
+            s.value("plan_initial_wp_alt_m", s.value("plan_initial_wp_alt_ft", 164.0)) or 164.0
+        )
+        hover_mps = float(
+            s.value("plan_hover_speed_mps", s.value("plan_hover_speed_mph", 11.18)) or 11.18
+        )
+        launch_alt_m = float(s.value("plan_launch_alt_m", s.value("plan_launch_alt_ft", 0.0)) or 0.0)
         state = {
             "altRef": str(s.value("plan_alt_ref", "rel") or "rel"),
-            "initialWpAltFt": float(s.value("plan_initial_wp_alt_ft", 164.0) or 164.0),
-            "hoverMph": float(s.value("plan_hover_speed_mph", 11.18) or 11.18),
-            "launchAltFt": float(s.value("plan_launch_alt_ft", 0.0) or 0.0),
+            "initialWpAltM": initial_wp_alt_m,
+            "hoverMps": hover_mps,
+            "launchAltM": launch_alt_m,
             "launchLat": str(s.value("plan_launch_lat_str", "") or ""),
             "launchLon": str(s.value("plan_launch_lon_str", "") or ""),
             "wpMeta": self._map_widget.get_waypoint_meta(),
@@ -1598,9 +1609,16 @@ class MainWindow(QMainWindow):
             return
         s = self._settings
         s.setValue("plan_alt_ref", str(data.get("altRef", "rel") or "rel"))
-        s.setValue("plan_initial_wp_alt_ft", float(data.get("initialWpAltFt", 164.0) or 164.0))
-        s.setValue("plan_hover_speed_mph", float(data.get("hoverMph", 11.18) or 11.18))
-        s.setValue("plan_launch_alt_ft", float(data.get("launchAltFt", 0.0) or 0.0))
+        initial_wp_alt_m = float(data.get("initialWpAltM", data.get("initialWpAltFt", 164.0)) or 164.0)
+        hover_mps = float(data.get("hoverMps", data.get("hoverMph", 11.18)) or 11.18)
+        launch_alt_m = float(data.get("launchAltM", data.get("launchAltFt", 0.0)) or 0.0)
+        s.setValue("plan_initial_wp_alt_m", initial_wp_alt_m)
+        s.setValue("plan_hover_speed_mps", hover_mps)
+        s.setValue("plan_launch_alt_m", launch_alt_m)
+        # Legacy keys kept in sync for compatibility with older builds/config.
+        s.setValue("plan_initial_wp_alt_ft", initial_wp_alt_m)
+        s.setValue("plan_hover_speed_mph", hover_mps)
+        s.setValue("plan_launch_alt_ft", launch_alt_m)
         lat = str(data.get("launchLat", "") or "").strip()
         lon = str(data.get("launchLon", "") or "").strip()
         if lat and lat != "—":
@@ -1630,8 +1648,8 @@ class MainWindow(QMainWindow):
 
     def _default_wp_alt_m_for_plan_state(self, state: dict[str, object]) -> float:
         ref = str(state.get("altRef", "rel") or "rel").strip().lower()
-        ft = float(state.get("initialWpAltFt", 164.0) or 164.0)
-        target_m = ft * 0.3048
+        meters = float(state.get("initialWpAltM", state.get("initialWpAltFt", 164.0)) or 164.0)
+        target_m = meters
         home_amsl = self._home_amsl_m
         if ref == "amsl" and home_amsl is not None:
             return max(1.0, target_m - float(home_amsl))
@@ -1639,19 +1657,22 @@ class MainWindow(QMainWindow):
 
     def _plan_takeoff_alt_m_from_launch_settings(self) -> float | None:
         """Relative altitude (m) for NAV_TAKEOFF when Launch Position alt is set; else None (use WP1 alt)."""
-        ft = float(self._settings.value("plan_launch_alt_ft", 0.0) or 0.0)
-        if ft <= 0.01:
+        meters = float(
+            self._settings.value("plan_launch_alt_m", self._settings.value("plan_launch_alt_ft", 0.0))
+            or 0.0
+        )
+        if meters <= 0.01:
             return None
         state = {
             "altRef": str(self._settings.value("plan_alt_ref", "rel") or "rel"),
-            "initialWpAltFt": ft,
+            "initialWpAltM": meters,
         }
         return self._default_wp_alt_m_for_plan_state(state)
 
     def _apply_plan_mission_panel_to_model(self, state: dict[str, object]) -> None:
         self._map_widget.set_default_waypoint_alt_m(self._default_wp_alt_m_for_plan_state(state))
-        mph = float(state.get("hoverMph", 11.18) or 11.18)
-        self._plan_hover_speed_mps = max(0.5, mph * 0.44704)
+        speed_mps = float(state.get("hoverMps", state.get("hoverMph", 11.18)) or 11.18)
+        self._plan_hover_speed_mps = max(0.5, speed_mps)
         self._maybe_refresh_map_web_overlays()
 
     def _sync_hdr_map_mode_btn_label(self) -> None:
@@ -1807,7 +1828,7 @@ class MainWindow(QMainWindow):
         mode = self._top_flight_mode.text()
         battery = self._top_battery.text()
         gps = self._top_gps_status_line()
-        mission_distance_ft = f"{self._max_telem_dist_m * 3.28084:.0f}"
+        mission_distance_m = f"{self._max_telem_dist_m:.0f}"
         return (
             "Live Analysis Snapshot\n\n"
             f"Link: {status}\n"
@@ -1816,7 +1837,7 @@ class MainWindow(QMainWindow):
             f"Battery: {battery}\n"
             f"GPS/HDOP: {gps}\n"
             f"Mission waypoints: {wp_count}\n"
-            f"Max telemetry distance: {mission_distance_ft} ft\n\n"
+            f"Max telemetry distance: {mission_distance_m} m\n\n"
             "Use Plan Flight to edit/upload waypoints and use M2 controls for "
             "mode, takeoff/land, geofence, params, and tile source."
         )
@@ -2603,24 +2624,33 @@ class MainWindow(QMainWindow):
             stack.setCurrentIndex(1 if state_norm in ("green", "yellow") else 0)
 
         if state_norm == "green":
-            self._flight_status_btn.setText("READY TO ARM")
-            self._top_vehicle_msg.setText(message)
+            self._flight_status_btn.setText("ARMED" if self._armed_since is not None else "READY TO ARM")
+            self._set_top_vehicle_msg(message)
             self._map_widget.set_flight_status("green", message)
             return
         if state_norm == "yellow":
             self._flight_status_btn.setText("NOT READY TO ARM")
-            self._top_vehicle_msg.setText(message)
+            self._set_top_vehicle_msg(message)
             self._map_widget.set_flight_status("yellow", message)
             return
         if state_norm == "red":
             self._flight_status_btn.setText("NOT READY TO ARM")
-            self._top_vehicle_msg.setText(message)
+            self._set_top_vehicle_msg(message)
             self._map_widget.set_flight_status("red", message)
             return
         # Cold-start / idle disconnected: Web stylesheet `#linkBanner` neutral background — not maroon.
         self._flight_status_btn.setText("NOT READY TO ARM")
-        self._top_vehicle_msg.setText(message)
+        self._set_top_vehicle_msg(message)
         self._map_widget.set_flight_status("idle", message)
+
+    def _is_probably_flying(self) -> bool:
+        """Best-effort airborne detector for header text."""
+        if self._armed_since is None:
+            return False
+        rel_display_m = float(self._map_rel_alt_m)
+        if self._home_rel_alt_baseline_m is not None:
+            rel_display_m -= float(self._home_rel_alt_baseline_m)
+        return abs(rel_display_m) >= 1.5 or float(self._map_groundspeed_mps) >= 1.2
 
     def _push_map_flight_overlay(self) -> None:
         if self._armed_since is None:
@@ -2639,10 +2669,17 @@ class MainWindow(QMainWindow):
                 rel_display_m = 0.0
         dist_home_m = 0.0
         try:
-            pos = self._map_widget.get_vehicle_display_position()
-            if pos is not None and self._home_lat is not None and self._home_lon is not None:
+            if (
+                self._last_gps_lat is not None
+                and self._last_gps_lon is not None
+                and self._home_lat is not None
+                and self._home_lon is not None
+            ):
                 dist_home_m = self._haversine_m(
-                    float(self._home_lat), float(self._home_lon), pos[0], pos[1]
+                    float(self._home_lat),
+                    float(self._home_lon),
+                    float(self._last_gps_lat),
+                    float(self._last_gps_lon),
                 )
             if self._armed_since is None and float(self._map_groundspeed_mps) < 0.5:
                 if dist_home_m < 2.0:
@@ -2677,11 +2714,11 @@ class MainWindow(QMainWindow):
     def _refresh_plan_flight_metrics(self) -> None:
         # M2 plan bar live values (best-effort from real telemetry).
         heading_val = float(getattr(self, "_heading", 0.0) or 0.0)
-        alt_diff_ft = f"{self._map_rel_alt_m * 3.28084:.1f} ft"
+        alt_diff_m = f"{self._map_rel_alt_m:.1f} m"
         gradient = "-.-"
         azimuth = f"{int(round(heading_val))}"
         heading = f"{int(round(heading_val))}"
-        dist_prev_wp_ft = "0.0 ft"
+        dist_prev_wp_m = "0.0 m"
 
         mission_distance_m = 0.0
         model = list(getattr(self._map_widget, "_waypoints_model", []))
@@ -2689,7 +2726,7 @@ class MainWindow(QMainWindow):
             a = model[i - 1]
             b = model[i]
             mission_distance_m += self._haversine_m(float(a.lat), float(a.lon), float(b.lat), float(b.lon))
-        mission_distance_ft = f"{mission_distance_m * 3.28084:.0f} ft"
+        mission_distance_text = f"{mission_distance_m:.0f} m"
 
         if self._armed_since is not None:
             elapsed = int(time.monotonic() - self._armed_since)
@@ -2700,16 +2737,16 @@ class MainWindow(QMainWindow):
         else:
             mission_time = "00:00:00"
 
-        max_telem_dist_ft = f"{self._max_telem_dist_m * 3.28084:.0f} ft"
+        max_telem_dist_m = f"{self._max_telem_dist_m:.0f} m"
         self._map_widget.set_plan_flight_metrics(
-            alt_diff_ft=alt_diff_ft,
+            alt_diff_m=alt_diff_m,
             gradient=gradient,
             azimuth=azimuth,
             heading=heading,
-            dist_prev_wp_ft=dist_prev_wp_ft,
-            mission_distance_ft=mission_distance_ft,
+            dist_prev_wp_m=dist_prev_wp_m,
+            mission_distance_m=mission_distance_text,
             mission_time=mission_time,
-            max_telem_dist_ft=max_telem_dist_ft,
+            max_telem_dist_m=max_telem_dist_m,
         )
 
     def _maybe_refresh_map_web_overlays(self) -> None:
@@ -2769,6 +2806,8 @@ class MainWindow(QMainWindow):
         self._home_lon = None
         self._home_amsl_m = None
         self._home_rel_alt_baseline_m = None
+        self._last_gps_lat = None
+        self._last_gps_lon = None
         self._fields["armed"].setText("No")
         self._apply_state_style(self._fields["armed"], "warn")
         self._fields["flight_time"].setText("00:00")
@@ -2801,7 +2840,7 @@ class MainWindow(QMainWindow):
         self._top_flight_mode.setText("—")
         self._top_battery.setText("—")
         self._top_remote_id.setText("N/A")
-        self._top_vehicle_msg.setText("—")
+        self._set_top_vehicle_msg("—")
         self._map_widget.set_header_mode("—")
         self._map_widget.set_header_vehicle_msg("—")
         self._map_widget.set_header_gps(0, "N/A")
@@ -2858,6 +2897,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, _deferred_camera_after_connect)
 
         self._btn_connect.setEnabled(False)
+        if hasattr(self, "_hdr_connect_btn"):
+            self._hdr_connect_btn.setEnabled(False)
+        if hasattr(self, "_hdr_disconnect_btn"):
+            self._hdr_disconnect_btn.setEnabled(False)
         self._conn_edit.setEnabled(False)
         self._timeout_spin.setEnabled(False)
         self._theme_combo.setEnabled(False)
@@ -2886,6 +2929,8 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def _on_disconnect(self) -> None:
+        if hasattr(self, "_hdr_disconnect_btn"):
+            self._hdr_disconnect_btn.setEnabled(False)
         self._stop_camera_control_backend()
         if self._thread is not None:
             self._thread.stop()
@@ -3000,6 +3045,10 @@ class MainWindow(QMainWindow):
         self._status.setText("Port open, waiting for heartbeat…")
         self._apply_state_style(self._status, "warn")
         self._btn_disconnect.setEnabled(True)
+        if hasattr(self, "_hdr_connect_btn"):
+            self._hdr_connect_btn.setEnabled(False)
+        if hasattr(self, "_hdr_disconnect_btn"):
+            self._hdr_disconnect_btn.setEnabled(True)
         self._watchdog.setText(f"OK · {self._timeout_s:.1f}s")
         self._apply_state_style(self._watchdog, "ok")
         self._set_dashboard_flight_status("yellow", "Link open - waiting for heartbeat")
@@ -3040,6 +3089,10 @@ class MainWindow(QMainWindow):
         self._apply_state_style(self._watchdog, "warn")
         self._compass.clear()
         self._btn_connect.setEnabled(True)
+        if hasattr(self, "_hdr_connect_btn"):
+            self._hdr_connect_btn.setEnabled(True)
+        if hasattr(self, "_hdr_disconnect_btn"):
+            self._hdr_disconnect_btn.setEnabled(False)
         self._conn_edit.setEnabled(True)
         self._timeout_spin.setEnabled(True)
         self._theme_combo.setEnabled(True)
@@ -3130,6 +3183,12 @@ class MainWindow(QMainWindow):
             self._apply_state_style(self._fields["armed"], "ok" if armed else "warn")
             if armed and self._armed_since is None:
                 self._armed_since = time.monotonic()
+                # Anchor HOME at arm transition using latest raw GPS sample.
+                if self._last_gps_lat is not None and self._last_gps_lon is not None:
+                    self._home_lat = float(self._last_gps_lat)
+                    self._home_lon = float(self._last_gps_lon)
+                self._home_rel_alt_baseline_m = float(self._map_rel_alt_m)
+                self._max_telem_dist_m = 0.0
             if not armed:
                 self._armed_since = None
                 self._fields["flight_time"].setText("00:00")
@@ -3141,10 +3200,14 @@ class MainWindow(QMainWindow):
                 # Do not clear _arm_not_ready_alert_shown here: brief STANDBY in a flickering
                 # HEARTBEAT would re-arm the popup and make OK / title-bar close feel ignored.
                 self._arm_not_ready_since_mono = None
-                self._set_dashboard_flight_status(
-                    "green",
-                    "Parameter downloading... Ready to Arm",
-                )
+                if armed:
+                    mode_disp = str(mode_text or "Unknown").strip()
+                    if self._is_probably_flying():
+                        self._set_dashboard_flight_status("green", f"In Flight - {mode_disp}")
+                    else:
+                        self._set_dashboard_flight_status("green", f"Armed - {mode_disp}")
+                else:
+                    self._set_dashboard_flight_status("green", "Ready to Arm")
             else:
                 self._set_dashboard_flight_status(
                     "yellow",
@@ -3189,6 +3252,8 @@ class MainWindow(QMainWindow):
             # otherwise the UI recenters to the Gulf of Guinea and loads misleading/placeholder tiles.
             if abs(lat) < 1e-9 and abs(lon) < 1e-9:
                 return
+            self._last_gps_lat = lat
+            self._last_gps_lon = lon
             self._map_rel_alt_m = float(data.get("relative_alt_m", 0.0))
             self._map_msl_alt_m = float(data.get("alt_msl_m", 0.0))
             self._home_amsl_m = float(self._map_msl_alt_m) - float(self._map_rel_alt_m)
@@ -3196,7 +3261,10 @@ class MainWindow(QMainWindow):
                 s = self._settings
                 st = {
                     "altRef": str(s.value("plan_alt_ref", "rel") or "rel"),
-                    "initialWpAltFt": float(s.value("plan_initial_wp_alt_ft", 164.0) or 164.0),
+                    "initialWpAltM": float(
+                        s.value("plan_initial_wp_alt_m", s.value("plan_initial_wp_alt_ft", 164.0))
+                        or 164.0
+                    ),
                 }
                 self._map_widget.set_default_waypoint_alt_m(
                     self._default_wp_alt_m_for_plan_state(st)
@@ -3205,15 +3273,14 @@ class MainWindow(QMainWindow):
                 self._home_lat = lat
                 self._home_lon = lon
                 self._home_rel_alt_baseline_m = float(data.get("relative_alt_m", 0.0))
-            if self._home_lat is not None and self._home_lon is not None:
+            if (
+                self._armed_since is not None
+                and self._home_lat is not None
+                and self._home_lon is not None
+            ):
                 try:
-                    if self._map_widget.is_map_motion_armed():
-                        pos = self._map_widget.get_vehicle_display_position()
-                        if pos is not None:
-                            d = self._haversine_m(
-                                self._home_lat, self._home_lon, pos[0], pos[1]
-                            )
-                            self._max_telem_dist_m = max(self._max_telem_dist_m, d)
+                    d = self._haversine_m(self._home_lat, self._home_lon, lat, lon)
+                    self._max_telem_dist_m = max(self._max_telem_dist_m, d)
                 except Exception:
                     pass
             self._fields["lat_lon"].setText(
@@ -3378,7 +3445,7 @@ class MainWindow(QMainWindow):
             text = str(data.get("text", "")).strip()
             if text:
                 self._recent_statustext.append(text)
-                self._top_vehicle_msg.setText(text)
+                self._set_top_vehicle_msg(text)
                 self._map_widget.set_header_vehicle_msg(text)
                 # STATUSTEXT can burst during param download; logging each line hammers QTextEdit.
                 now = time.monotonic()
@@ -3409,10 +3476,10 @@ class MainWindow(QMainWindow):
     def _on_mode_change_result(self, mode_name: str, ok: bool) -> None:
         if ok:
             self._append_log(f"Mode change requested: {mode_name}")
-            self._top_vehicle_msg.setText(f"Mode cmd: {mode_name}")
+            self._set_top_vehicle_msg(f"Mode cmd: {mode_name}")
         else:
             self._append_log(f"Mode change failed: {mode_name}")
-            self._top_vehicle_msg.setText("Mode change failed")
+            self._set_top_vehicle_msg("Mode change failed")
 
     def _takeoff_altitude_m(self, *, from_plan_rail: bool) -> float:
         """Target climb (m) for NAV_TAKEOFF: plan launch alt when set on rail; else dashboard spin."""
@@ -3867,12 +3934,12 @@ class MainWindow(QMainWindow):
     def _on_action_result(self, action: str, ok: bool, detail: str) -> None:
         msg = f"{action.upper()} {'OK' if ok else 'FAIL'}: {detail}"
         self._append_log(msg)
-        self._top_vehicle_msg.setText(msg[:80])
+        self._set_top_vehicle_msg(msg[:80])
 
     def _on_geofence_result(self, ok: bool, detail: str) -> None:
         msg = f"Fence {'OK' if ok else 'FAIL'}: {detail}"
         self._append_log(msg)
-        self._top_vehicle_msg.setText(msg[:80])
+        self._set_top_vehicle_msg(msg[:80])
 
     def _on_params_snapshot(self, payload: object) -> None:
         data = dict(payload) if isinstance(payload, dict) else {}
@@ -3965,9 +4032,9 @@ class MainWindow(QMainWindow):
                 if cur == key:
                     self._param_value_spin.setValue(v)
                 self._refresh_acro_options_ui()
-            self._top_vehicle_msg.setText(msg[:80])
+            self._set_top_vehicle_msg(msg[:80])
         else:
-            self._top_vehicle_msg.setText(msg[:80])
+            self._set_top_vehicle_msg(msg[:80])
 
     def _on_tiles_online(self) -> None:
         self._map_widget.activate_online_tiles()

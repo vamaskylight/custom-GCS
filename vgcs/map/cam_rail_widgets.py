@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 
 class CamRecordArch(QWidget):
-    """Record control under arched top border (`#camRecordArch` in map_widget QSS)."""
+    """Legacy arched record mount — prefer ``CamRecordTimerRow`` for compact rail."""
 
     def __init__(self, record_btn: QWidget, parent=None) -> None:
         super().__init__(parent)
@@ -33,6 +33,71 @@ class CamRecordArch(QWidget):
         inner.setSpacing(0)
         inner.addWidget(record_btn, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addWidget(self._arch)
+
+
+class CamRecordTimerRow(QWidget):
+    """Shutter + elapsed timer on one row (saves vertical space vs stacked arch + timer)."""
+
+    def __init__(self, record_btn: QWidget, timer_lbl: QWidget, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("camRecordTimerRow")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+        lay.setSpacing(8)
+        lay.addStretch(1)
+        lay.addWidget(record_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(timer_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addStretch(1)
+
+
+class CamRailGimbalPad(QWidget):
+    """2×3 gimbal pad: [← ↑ →] / [⌂ ↓ 90°]."""
+
+    def __init__(self, buttons: list[list[QWidget]], parent=None) -> None:
+        super().__init__(parent)
+        from PySide6.QtWidgets import QGridLayout
+
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        lay = QGridLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setHorizontalSpacing(4)
+        lay.setVerticalSpacing(4)
+        for row, row_btns in enumerate(buttons):
+            for col, btn in enumerate(row_btns):
+                lay.addWidget(btn, row, col, Qt.AlignmentFlag.AlignCenter)
+        # Two 30px-tall button rows + spacing — stable size hint for camera rail height.
+        self.setFixedHeight(30 * len(buttons) + 4 * max(0, len(buttons) - 1))
+
+
+class CamObserveBlock(QWidget):
+    """Target / Clip and Report / Reset — two rows with matching button gaps."""
+
+    def __init__(
+        self,
+        target_btn: QWidget,
+        clip_btn: QWidget,
+        report_btn: QWidget,
+        reset_btn: QWidget,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        target_btn.setObjectName("observeTarget")
+        clip_btn.setObjectName("observeClip")
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(4)
+        row1.addWidget(target_btn, 1)
+        row1.addWidget(clip_btn, 1)
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(4)
+        row2.addWidget(report_btn, 1)
+        row2.addWidget(reset_btn, 1)
+        v.addLayout(row1)
+        v.addLayout(row2)
 
 
 class CamRailBiSlider(QWidget):
@@ -122,18 +187,3 @@ class CamRailBiSlider(QWidget):
     def sizeHint(self) -> QSize:
         return QSize(158, 28)
 
-
-class CamObserveSegment(QFrame):
-    """Segmented control: Target | Clip (reference OBSERVE primary row)."""
-
-    def __init__(self, target_btn: QWidget, clip_btn: QWidget, parent=None) -> None:
-        super().__init__(parent)
-        self.setObjectName("camObserveSegment")
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        hl = QHBoxLayout(self)
-        hl.setContentsMargins(0, 0, 0, 0)
-        hl.setSpacing(0)
-        target_btn.setObjectName("observeTarget")
-        clip_btn.setObjectName("observeClip")
-        hl.addWidget(target_btn, 1)
-        hl.addWidget(clip_btn, 1)

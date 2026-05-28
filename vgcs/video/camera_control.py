@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from PySide6.QtCore import QSettings
 from urllib.parse import urlparse
 
 from vgcs.skydroid import GimbalStatus, SkydroidTopUdpAdapter
@@ -15,6 +16,15 @@ class GimbalCommand:
     yaw_deg: float | None = None
     pitch_deg: float | None = None
     roll_deg: float | None = None
+
+
+def gimbal_nadir_pitch_deg(settings: QSettings | None = None) -> float:
+    """Straight-down pitch for ``gimbal_point_down`` (SIYI/Skydroid often use −90°)."""
+    st = settings if settings is not None else QSettings("VGCS", "VGCS")
+    try:
+        return float(st.value("camera/gimbal_nadir_pitch_deg", -90.0) or -90.0)
+    except Exception:
+        return -90.0
 
 
 class CameraControl(Protocol):
@@ -44,6 +54,10 @@ class CameraControl(Protocol):
     def camera_toggle_record(self) -> None: ...
 
     def get_gimbal_status(self) -> GimbalStatus | None: ...
+
+    def gimbal_center(self) -> None: ...
+
+    def gimbal_point_down(self) -> None: ...
 
 
 class NoopCameraControl:
@@ -80,6 +94,12 @@ class NoopCameraControl:
 
     def get_gimbal_status(self) -> GimbalStatus | None:
         return None
+
+    def gimbal_center(self) -> None:
+        return
+
+    def gimbal_point_down(self) -> None:
+        return
 
 
 class MavlinkCameraControl:
@@ -159,6 +179,19 @@ class MavlinkCameraControl:
         except Exception:
             pass
         return None
+
+    def gimbal_center(self) -> None:
+        try:
+            self._t.queue_gimbal_nudge(pitch_deg=0.0, yaw_deg=0.0)
+        except Exception:
+            return
+
+    def gimbal_point_down(self) -> None:
+        pitch = gimbal_nadir_pitch_deg()
+        try:
+            self._t.queue_gimbal_nudge(pitch_deg=float(pitch), yaw_deg=0.0)
+        except Exception:
+            return
 
 
 def resolve_skydroid_host(settings, *, default: str = "192.168.144.108") -> str:
@@ -327,6 +360,30 @@ class SkydroidCameraControl:
         except Exception:
             return None
 
+    def gimbal_center(self) -> None:
+        try:
+            self.ptz("center")
+        except Exception:
+            return
+
+    def gimbal_point_down(self) -> None:
+        pitch = gimbal_nadir_pitch_deg()
+        yaw_hold: float | None = None
+        try:
+            st = self._adapter.get_status_cached()
+            if st is not None and st.yaw_deg is not None:
+                yaw_hold = float(st.yaw_deg)
+        except Exception:
+            pass
+        try:
+            self._adapter.set_angle_axes(
+                yaw_deg=yaw_hold,
+                pitch_deg=float(pitch),
+                approach_speed_dps=25.0,
+            )
+        except Exception:
+            return
+
 
 def resolve_siyi_host(settings, *, default: str = "192.168.144.25") -> str:
     """SIYI companion IP from settings or RTSP stream URL hostname."""
@@ -408,8 +465,32 @@ class SiyiCameraControl:
                 self._adapter.set_rotation_speed(-5.0, 0.0)
             elif action_l in ("right", "yaw_right"):
                 self._adapter.set_rotation_speed(5.0, 0.0)
-            elif action_l in ("stop", "center", "home"):
+            elif action_l in ("stop",):
                 self._adapter.set_rotation_speed(0.0, 0.0)
+            elif action_l in ("center", "home"):
+                self._adapter.set_angle(0.0, 0.0)
+                self._adapter.set_rotation_speed(0.0, 0.0)
+        except Exception:
+            return
+
+    def gimbal_center(self) -> None:
+        try:
+            self._adapter.set_angle(0.0, 0.0)
+            self._adapter.set_rotation_speed(0.0, 0.0)
+        except Exception:
+            return
+
+    def gimbal_point_down(self) -> None:
+        pitch = gimbal_nadir_pitch_deg()
+        yaw_hold = 0.0
+        try:
+            st = self._adapter.get_status()
+            if st.yaw_deg is not None:
+                yaw_hold = float(st.yaw_deg)
+        except Exception:
+            pass
+        try:
+            self._adapter.set_angle(yaw=float(yaw_hold), pitch=float(pitch))
         except Exception:
             return
 
