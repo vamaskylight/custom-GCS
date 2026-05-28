@@ -39,13 +39,12 @@ _TOOLS: tuple[tuple[str, str], ...] = (
     ("Waypoint", "\u2295"),
     ("ROI", "\u25C7"),
     ("Pattern", "\u25A6"),
-    ("Return", "\u21A9"),
     ("Center", "\u2726"),
 )
 _TOOL_HINTS: dict[str, str] = {
     "Takeoff": (
         "Sends NAV_TAKEOFF like the main Takeoff button. If Mission Start sets a "
-        "Takeoff / launch altitude (ft), that climb target is used; otherwise the "
+        "Takeoff / launch altitude (m), that climb target is used; otherwise the "
         "dashboard Takeoff alt (m) applies. Vehicle must be connected."
     ),
     "Waypoint": (
@@ -53,7 +52,6 @@ _TOOL_HINTS: dict[str, str] = {
     ),
     "ROI": "Click on the map to add fence polygon vertices.",
     "Pattern": "Pattern templates use Mission → Pattern size (m). Pick Survey / Corridor / Structure again after changing spacing.",
-    "Return": "Return / RTL uses the map Return control.",
     "Center": "Centers the map on the vehicle.",
 }
 
@@ -329,20 +327,20 @@ QPushButton.planDetailsToggle:hover { color: #facc15; }
 """
 
 
-def _ft_to_m(ft: float) -> float:
-    return float(ft) * 0.3048
+def _unit_to_m(v: float) -> float:
+    return float(v)
 
 
-def _m_to_ft(m: float) -> float:
-    return float(m) / 0.3048 if m else 0.0
+def _m_to_unit(m: float) -> float:
+    return float(m) if m else 0.0
 
 
-def _mph_to_mps(mph: float) -> float:
-    return float(mph) * 0.44704
+def _unit_speed_to_mps(v: float) -> float:
+    return float(v)
 
 
-def _mps_to_mph(mps: float) -> float:
-    return float(mps) / 0.44704 if mps else 0.0
+def _mps_to_unit_speed(mps: float) -> float:
+    return float(mps) if mps else 0.0
 
 
 def _vgcs_assets_dir() -> Path:
@@ -508,24 +506,24 @@ class PlanFlightPanel(QWidget):
         h.addWidget(self._bar_upload, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._pf_alt_diff = self._add_metric_group(
-            h, "Selected Waypoint", [("Alt diff:", "0.0 ft"), ("Gradient:", "-.-")]
+            h, "Selected Waypoint", [("Alt diff:", "0.0 m"), ("Gradient:", "-.-")]
         )
         self._pf_azimuth = self._add_metric_group(
             h, "", [("Azimuth:", "0"), ("Heading:", "nan")]
         )
         self._pf_dist = self._add_metric_group(
-            h, "", [("Dist prev WP:", "0.0 ft"), ("", "")]
+            h, "", [("Dist prev WP:", "0.0 m"), ("", "")]
         )
         # Breathing room: selected-WP metrics vs mission totals.
         h.addSpacing(32)
         self._pf_mission = self._add_metric_group(
             h,
             "Total Mission",
-            [("Distance:", "0 ft"), ("Time:", "00:00:00")],
+            [("Distance:", "0 m"), ("Time:", "00:00:00")],
         )
         h.addSpacing(24)
         self._pf_max_telem = self._add_metric_group(
-            h, "", [("Max telem dist:", "0 ft"), ("", "")]
+            h, "", [("Max telem dist:", "0 m"), ("", "")]
         )
 
         # One trailing stretch: keep all metrics packed to the left; spare bar width stays on the right.
@@ -927,7 +925,7 @@ class PlanFlightPanel(QWidget):
         self._alt_ref_combo.currentIndexChanged.connect(lambda _i: self._schedule_emit())
         tbv.addWidget(self._alt_ref_combo)
         tbv.addWidget(self._field_label("Initial Waypoint Alt"))
-        self._initial_wp_alt = self._unit_input("164.0", "ft")
+        self._initial_wp_alt = self._unit_input("164.0", "m")
         self._initial_wp_alt.textChanged.connect(lambda _t: self._schedule_emit())
         tbv.addWidget(self._initial_wp_alt)
         tc.addWidget(self._takeoff_body)
@@ -1007,12 +1005,9 @@ class PlanFlightPanel(QWidget):
         body_v.addWidget(self._pattern_geometry_frame)
         self._pattern_geometry_frame.setVisible(False)
 
-        # RTL button
+        # Removed from Flight Plan page per UX request.
         self._seq_rtl_btn = QPushButton("Return To Launch")
-        self._seq_rtl_btn.setProperty("class", "planSeqRtlBtn")
-        self._seq_rtl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._seq_rtl_btn.clicked.connect(self.return_requested.emit)
-        body_v.addWidget(self._seq_rtl_btn)
+        self._seq_rtl_btn.hide()
 
         # Start Mission
         self._start_mission_btn = QPushButton("Start Mission")
@@ -1070,7 +1065,7 @@ class PlanFlightPanel(QWidget):
         note.setWordWrap(True)
         vbody.addWidget(note)
         vbody.addWidget(self._field_label("Hover speed"))
-        self._hover_input = self._unit_input("11.18", "mph")
+        self._hover_input = self._unit_input("11.18", "m/s")
         self._hover_input.textChanged.connect(lambda _t: self._schedule_emit())
         vbody.addWidget(self._hover_input)
         body_v.addWidget(self._vehicle_section)
@@ -1079,7 +1074,7 @@ class PlanFlightPanel(QWidget):
         self._launch_section = _CollapsibleSection("Launch Position")
         lbody = self._launch_section.body_layout()
         lbody.addWidget(self._field_label("Altitude"))
-        self._launch_alt = self._unit_input("0.0", "ft")
+        self._launch_alt = self._unit_input("0.0", "m")
         self._launch_alt.textChanged.connect(lambda _t: self._schedule_emit())
         lbody.addWidget(self._launch_alt)
         help_lbl = QLabel("Actual position set by vehicle at flight time.")
@@ -1252,15 +1247,19 @@ class PlanFlightPanel(QWidget):
         if not isinstance(payload, dict):
             return
         p = {str(k): str(v) for k, v in payload.items()}
-        self._set_metric(self._pf_alt_diff, "alt diff", p.get("altDiffFt", "0.0 ft"))
+        self._set_metric(self._pf_alt_diff, "alt diff", p.get("altDiffM", p.get("altDiffFt", "0.0 m")))
         self._set_metric(self._pf_alt_diff, "gradient", p.get("gradient", "-.-"))
         self._set_metric(self._pf_azimuth, "azimuth", p.get("azimuth", "0"))
         self._set_metric(self._pf_azimuth, "heading", p.get("heading", "nan"))
-        self._set_metric(self._pf_dist, "dist prev wp", p.get("distPrevWpFt", "0.0 ft"))
-        self._set_metric(self._pf_mission, "distance", p.get("missionDistanceFt", "0 ft"))
+        self._set_metric(
+            self._pf_dist, "dist prev wp", p.get("distPrevWpM", p.get("distPrevWpFt", "0.0 m"))
+        )
+        self._set_metric(
+            self._pf_mission, "distance", p.get("missionDistanceM", p.get("missionDistanceFt", "0 m"))
+        )
         self._set_metric(self._pf_mission, "time", p.get("missionTime", "00:00:00"))
         self._set_metric(
-            self._pf_max_telem, "max telem dist", p.get("maxTelemDistFt", "0 ft")
+            self._pf_max_telem, "max telem dist", p.get("maxTelemDistM", p.get("maxTelemDistFt", "0 m"))
         )
 
     def _set_metric(self, group: dict[str, QLabel], key: str, value: str) -> None:
@@ -1320,12 +1319,14 @@ class PlanFlightPanel(QWidget):
                 if str(self._alt_ref_combo.itemData(i)) == alt_ref:
                     self._alt_ref_combo.setCurrentIndex(i)
                     break
-            if "initialWpAltFt" in state:
-                self._initial_wp_alt.setText(str(state.get("initialWpAltFt") or "164.0"))
-            if "hoverMph" in state:
-                self._hover_input.setText(str(state.get("hoverMph") or "11.18"))
-            if "launchAltFt" in state:
-                self._launch_alt.setText(str(state.get("launchAltFt") or "0.0"))
+            if "initialWpAltM" in state or "initialWpAltFt" in state:
+                self._initial_wp_alt.setText(
+                    str(state.get("initialWpAltM", state.get("initialWpAltFt")) or "164.0")
+                )
+            if "hoverMps" in state or "hoverMph" in state:
+                self._hover_input.setText(str(state.get("hoverMps", state.get("hoverMph")) or "11.18"))
+            if "launchAltM" in state or "launchAltFt" in state:
+                self._launch_alt.setText(str(state.get("launchAltM", state.get("launchAltFt")) or "0.0"))
             lat = str(state.get("launchLat", "") or "").strip()
             lon = str(state.get("launchLon", "") or "").strip()
             self._launch_lat_value.setText(lat or "\u2014")
@@ -1363,8 +1364,8 @@ class PlanFlightPanel(QWidget):
             return
         self._waypoint_count = n
         self._refresh_chrome()
-        base_alt_m = _ft_to_m(self._float(self._initial_wp_alt.text(), 164.0))
-        base_spd_mps = _mph_to_mps(self._float(self._hover_input.text(), 11.18))
+        base_alt_m = _unit_to_m(self._float(self._initial_wp_alt.text(), 164.0))
+        base_spd_mps = _unit_speed_to_mps(self._float(self._hover_input.text(), 11.18))
         while len(self._wp_meta) < n:
             self._wp_meta.append({"alt_m": base_alt_m, "speed_mps": base_spd_mps})
         if len(self._wp_meta) > n:
@@ -1415,8 +1416,8 @@ class PlanFlightPanel(QWidget):
         self._wp_rows_layout.addWidget(self._build_wp_row(-1, launch_ft, None, is_start=True))
         for i in range(n):
             meta = self._wp_meta[i] if i < len(self._wp_meta) else {"alt_m": 0.0, "speed_mps": 0.0}
-            alt_ft = _m_to_ft(meta.get("alt_m", 0.0))
-            spd_mph = _mps_to_mph(meta.get("speed_mps", 0.0))
+            alt_ft = _m_to_unit(meta.get("alt_m", 0.0))
+            spd_mph = _mps_to_unit_speed(meta.get("speed_mps", 0.0))
             self._wp_rows_layout.addWidget(self._build_wp_row(i, alt_ft, spd_mph))
 
     def _build_wp_row(
@@ -1441,7 +1442,7 @@ class PlanFlightPanel(QWidget):
         alt_in.setText(f"{alt_ft:.1f}")
         alt_in.setFixedWidth(76)
         h.addWidget(alt_in)
-        unit_alt = QLabel("ft")
+        unit_alt = QLabel("m")
         unit_alt.setProperty("class", "planWpUnit")
         h.addWidget(unit_alt)
         if not is_start:
@@ -1450,7 +1451,7 @@ class PlanFlightPanel(QWidget):
             spd_in.setText(f"{(speed_mph or 0.0):.1f}")
             spd_in.setFixedWidth(76)
             h.addWidget(spd_in)
-            unit_spd = QLabel("mph")
+            unit_spd = QLabel("m/s")
             unit_spd.setProperty("class", "planWpUnit")
             h.addWidget(unit_spd)
             spd_in.textChanged.connect(
@@ -1486,9 +1487,9 @@ class PlanFlightPanel(QWidget):
             return
         value = self._float(raw, 0.0)
         if key == "alt_m":
-            self._wp_meta[idx]["alt_m"] = max(0.3, _ft_to_m(value))
+            self._wp_meta[idx]["alt_m"] = max(0.3, _unit_to_m(value))
         elif key == "speed_mps":
-            self._wp_meta[idx]["speed_mps"] = max(0.1, _mph_to_mps(value))
+            self._wp_meta[idx]["speed_mps"] = max(0.1, _unit_speed_to_mps(value))
         self._schedule_emit()
 
     # ------------------------------------------------------------------ Emit
@@ -1502,9 +1503,9 @@ class PlanFlightPanel(QWidget):
             return
         payload: dict[str, Any] = {
             "altRef": str(self._alt_ref_combo.currentData() or "rel"),
-            "initialWpAltFt": self._float(self._initial_wp_alt.text(), 164.0),
-            "hoverMph": self._float(self._hover_input.text(), 11.18),
-            "launchAltFt": self._float(self._launch_alt.text(), 0.0),
+            "initialWpAltM": self._float(self._initial_wp_alt.text(), 164.0),
+            "hoverMps": self._float(self._hover_input.text(), 11.18),
+            "launchAltM": self._float(self._launch_alt.text(), 0.0),
             "launchLat": self._launch_lat_value.text().strip().replace("\u2014", ""),
             "launchLon": self._launch_lon_value.text().strip().replace("\u2014", ""),
             "wpMeta": [dict(m) for m in self._wp_meta],

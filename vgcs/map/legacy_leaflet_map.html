@@ -1649,8 +1649,6 @@
       <button id="hdrMapModeBtn" type="button">3D</button>
     </div>
     <div class="overlay" id="actionRail">
-      <div class="actionBtn" id="actionTakeoff">⬆<div>Takeoff</div></div>
-      <div class="actionBtn" id="actionReturn">↩<div>Return</div></div>
     </div>
     <div id="planFlightLayer">
       <div id="planFlightTopBar">
@@ -1658,7 +1656,7 @@
         <button id="planBarUpload" type="button" disabled>Upload</button>
         <div class="pfGroup">
           <span class="pfLabel">Selected Waypoint</span>
-          <span class="pfMetric">Alt diff: <b id="pfAltDiff">0.0 ft</b></span>
+          <span class="pfMetric">Alt diff: <b id="pfAltDiff">0.0 m</b></span>
           <span class="pfMetric">Gradient: <b id="pfGradient">-.-</b></span>
         </div>
         <div class="pfGroup">
@@ -1668,18 +1666,18 @@
         </div>
         <div class="pfGroup">
           <span class="pfLabel">&nbsp;</span>
-          <span class="pfMetric">Dist prev WP: <b id="pfDistPrevWp">0.0 ft</b></span>
+          <span class="pfMetric">Dist prev WP: <b id="pfDistPrevWp">0.0 m</b></span>
           <span class="pfMetric pfMetricGhost">Heading: <b>nan</b></span>
         </div>
         <span class="pfSpacer"></span>
         <div class="pfGroup">
           <span class="pfLabel">Total Mission</span>
-          <span class="pfMetric">Distance: <b id="pfMissionDistance">0 ft</b></span>
+          <span class="pfMetric">Distance: <b id="pfMissionDistance">0 m</b></span>
           <span class="pfMetric">Time: <b id="pfMissionTime">00:00:00</b></span>
         </div>
         <div class="pfGroup">
           <span class="pfLabel">&nbsp;</span>
-          <span class="pfMetric">Max telem dist: <b id="pfMaxTelemDist">0 ft</b></span>
+          <span class="pfMetric">Max telem dist: <b id="pfMaxTelemDist">0 m</b></span>
           <span class="pfMetric pfMetricGhost">Time: <b>00:00:00</b></span>
         </div>
       </div>
@@ -1690,7 +1688,6 @@
           <div class="planToolBtn" data-tool="Waypoint"><span class="planToolIcon">⊕</span><span>Waypoint</span></div>
           <div class="planToolBtn" data-tool="ROI"><span class="planToolIcon">⊙</span><span>ROI</span></div>
           <div class="planToolBtn" data-tool="Pattern"><span class="planToolIcon">▦</span><span>Pattern</span></div>
-          <div class="planToolBtn" data-tool="Return"><span class="planToolIcon">↩</span><span>Return</span></div>
           <div class="planToolBtn" data-tool="Center"><span class="planToolIcon">✦</span><span>Center</span></div>
         </div>
         <div id="planCenterPanel">
@@ -1777,7 +1774,7 @@
                       <div class="planFieldLabel">Initial Waypoint Alt</div>
                       <div class="planRailInput">
                         <input id="planInitialWpAltInput" type="text" value="164.0" inputmode="decimal" autocomplete="off" />
-                        <span class="planRailUnit">ft</span>
+                        <span class="planRailUnit">m</span>
                       </div>
                     </div>
                   </div>
@@ -1785,7 +1782,6 @@
                     <span class="planSeqPatternGlyph" aria-hidden="true">?</span>
                     <span id="planSeqPatternLabel" class="planSeqPatternLabel">Survey</span>
                   </div>
-                  <button type="button" id="planSeqRtlBtn" class="planSeqRtlBtn">Return To Launch</button>
                 </div>
                 <button id="planStartMissionBtn" type="button">Start Mission</button>
                 <div id="planWpDetails" class="planWpDetails" style="display:none">
@@ -1801,7 +1797,7 @@
                     <div class="planFieldLabel">Hover speed</div>
                     <div class="planRailInput">
                       <input id="planHoverSpeedInput" type="text" value="11.18" inputmode="decimal" autocomplete="off" />
-                      <span class="planRailUnit">mph</span>
+                      <span class="planRailUnit">m/s</span>
                     </div>
                   </div>
                 </details>
@@ -1811,7 +1807,7 @@
                     <div class="planFieldLabel">Altitude</div>
                     <div class="planRailInput">
                       <input id="planLaunchAltInput" type="text" value="0.0" inputmode="decimal" autocomplete="off" />
-                      <span class="planRailUnit">ft</span>
+                      <span class="planRailUnit">m</span>
                     </div>
                     <p class="planHelpMuted">Actual position set by vehicle at flight time.</p>
                     <div class="planKvRow"><span>Lat</span><b id="planLaunchLatVal">—</b></div>
@@ -1916,12 +1912,12 @@
     <div id="mapFooterHud" aria-hidden="false">
       <div id="telemetryLeftStack" aria-hidden="true">
         <div id="telemetryStrip">
-          <div class="telStackItem"><span class="telemetryIcon">↕</span><span class="telRow1Alt">0.0 ft</span></div>
-          <div class="telStackItem"><span class="telemetryIcon">↑</span><span class="telRow1Mph">0.0 mph</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">↕</span><span class="telRow1Alt">0.0 m</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">↑</span><span class="telRow1Mph">0.0 m/s</span></div>
           <div class="telStackItem"><span class="telemetryIcon">⏱</span><span class="telRow1Time">00:00:00</span></div>
-          <div class="telStackItem"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span class="telRow2Msl">0.0 ft</span></div>
-          <div class="telStackItem"><span class="telemetryIcon">→</span><span class="telRow2Mph">0.0 mph</span></div>
-          <div class="telStackItem"><span class="telemetryIcon">↳</span><span class="telRow2Alt">0.0 ft</span></div>
+          <div class="telStackItem"><span class="telemetryIcon telemetryIconHuman">&#128100;&#65038;</span><span class="telRow2Msl">0.0 m</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">→</span><span class="telRow2Mph">0.0 m/s</span></div>
+          <div class="telStackItem"><span class="telemetryIcon">↳</span><span class="telRow2Alt">0.0 m</span></div>
         </div>
       </div>
       <div id="compassHud">
@@ -2800,30 +2796,30 @@
         if (!el) return;
         el.textContent = String(value ?? '');
       };
-      setTxt('pfAltDiff', metrics.altDiffFt ?? '0.0 ft');
+      setTxt('pfAltDiff', metrics.altDiffM ?? metrics.altDiffFt ?? '0.0 m');
       setTxt('pfGradient', metrics.gradient ?? '-.-');
       setTxt('pfAzimuth', metrics.azimuth ?? '0');
       setTxt('pfHeading', metrics.heading ?? 'nan');
-      setTxt('pfDistPrevWp', metrics.distPrevWpFt ?? '0.0 ft');
-      setTxt('pfMissionDistance', metrics.missionDistanceFt ?? '0 ft');
+      setTxt('pfDistPrevWp', metrics.distPrevWpM ?? metrics.distPrevWpFt ?? '0.0 m');
+      setTxt('pfMissionDistance', metrics.missionDistanceM ?? metrics.missionDistanceFt ?? '0 m');
       setTxt('pfMissionTime', metrics.missionTime ?? '00:00:00');
-      setTxt('pfMaxTelemDist', metrics.maxTelemDistFt ?? '0 ft');
+      setTxt('pfMaxTelemDist', metrics.maxTelemDistM ?? metrics.maxTelemDistFt ?? '0 m');
       return 1;
     }
 
     let planMissionEmitTimer = null;
-    function ftToM(ft) { return (Number(ft) || 0) * 0.3048; }
-    function mToFt(m) { return (Number(m) || 0) / 0.3048; }
-    function mphToMps(mph) { return (Number(mph) || 0) * 0.44704; }
-    function mpsToMph(mps) { return (Number(mps) || 0) / 0.44704; }
+    function uiAltToM(m) { return (Number(m) || 0); }
+    function mToUiAlt(m) { return (Number(m) || 0); }
+    function uiSpeedToMps(mps) { return (Number(mps) || 0); }
+    function mpsToUiSpeed(mps) { return (Number(mps) || 0); }
 
     function ensurePlanWpMetaLen(n) {
       const nn = Math.max(0, Number(n) || 0);
       if (!Array.isArray(window.__planWpMeta)) window.__planWpMeta = [];
       const initEl = document.getElementById('planInitialWpAltInput');
       const hoverEl = document.getElementById('planHoverSpeedInput');
-      const baseAltM = ftToM(initEl ? initEl.value : 164.0);
-      const baseSpdMps = mphToMps(hoverEl ? hoverEl.value : 11.18);
+      const baseAltM = uiAltToM(initEl ? initEl.value : 164.0);
+      const baseSpdMps = uiSpeedToMps(hoverEl ? hoverEl.value : 11.18);
       while (window.__planWpMeta.length < nn) {
         window.__planWpMeta.push({ alt_m: baseAltM, speed_mps: baseSpdMps });
       }
@@ -2847,26 +2843,26 @@
       const launchAltEl = document.getElementById('planLaunchAltInput');
       const rawLaunch = launchAltEl ? String(launchAltEl.value || '') : '';
       const lx = parseFloat(rawLaunch.replace(',', '.'));
-      const launchFtStr = Number.isFinite(lx) ? lx.toFixed(1) : '0.0';
+      const launchAltStr = Number.isFinite(lx) ? lx.toFixed(1) : '0.0';
       let html = '';
       html +=
         '<div class="planWpRow planWpRow--start" data-wp-start="1">' +
           '<div class="planWpLabel">Start</div>' +
           '<div class="planWpFields">' +
-            '<div class="planWpField"><input class="planWpStartAlt" type="text" inputmode="decimal" value="' + launchFtStr + '"/><span class="planWpUnit">ft</span></div>' +
+            '<div class="planWpField"><input class="planWpStartAlt" type="text" inputmode="decimal" value="' + launchAltStr + '"/><span class="planWpUnit">m</span></div>' +
             '<div class="planWpStartHint">Takeoff / launch altitude (0 = use WP1 for takeoff).</div>' +
           '</div>' +
         '</div>';
       for (let i = 0; i < n; i++) {
         const m = window.__planWpMeta[i] || {};
-        const altFt = mToFt(m.alt_m ?? ftToM(164));
-        const spdMph = mpsToMph(m.speed_mps ?? mphToMps(11.18));
+        const altM = mToUiAlt(m.alt_m ?? uiAltToM(164));
+        const spdMps = mpsToUiSpeed(m.speed_mps ?? uiSpeedToMps(11.18));
         html +=
           '<div class="planWpRow" data-wp-idx="' + i + '">' +
             '<div class="planWpLabel">WP ' + (i+1) + '</div>' +
             '<div class="planWpFields">' +
-              '<div class="planWpField"><input class="planWpAlt" type="text" inputmode="decimal" value="' + altFt.toFixed(1) + '"/><span class="planWpUnit">ft</span></div>' +
-              '<div class="planWpField"><input class="planWpSpd" type="text" inputmode="decimal" value="' + spdMph.toFixed(1) + '"/><span class="planWpUnit">mph</span></div>' +
+              '<div class="planWpField"><input class="planWpAlt" type="text" inputmode="decimal" value="' + altM.toFixed(1) + '"/><span class="planWpUnit">m</span></div>' +
+              '<div class="planWpField"><input class="planWpSpd" type="text" inputmode="decimal" value="' + spdMps.toFixed(1) + '"/><span class="planWpUnit">m/s</span></div>' +
             '</div>' +
           '</div>';
       }
@@ -2879,8 +2875,8 @@
             const x = parseFloat(String(v || '').replace(',', '.'));
             return Number.isFinite(x) ? x : d;
           };
-          const ft = num(startAltIn.value, 0);
-          launchAltEl.value = String(ft);
+          const altM = num(startAltIn.value, 0);
+          launchAltEl.value = String(altM);
           schedulePlanMissionPanelEmit();
         };
         startAltIn.addEventListener('input', onStartAlt);
@@ -2897,11 +2893,11 @@
             return Number.isFinite(x) ? x : d;
           };
           ensurePlanWpMetaLen(waypoints.length);
-          const aFt = num(altIn && altIn.value, 164.0);
-          const sMph = num(spdIn && spdIn.value, 11.18);
+          const altM = num(altIn && altIn.value, 164.0);
+          const speedMps = num(spdIn && spdIn.value, 11.18);
           window.__planWpMeta[idx] = {
-            alt_m: Math.max(1.0, ftToM(aFt)),
-            speed_mps: Math.max(0.1, mphToMps(sMph)),
+            alt_m: Math.max(1.0, uiAltToM(altM)),
+            speed_mps: Math.max(0.1, uiSpeedToMps(speedMps)),
           };
           schedulePlanMissionPanelEmit();
         };
@@ -2930,9 +2926,9 @@
       };
       const data = {
         altRef: sel ? String(sel.value || 'rel') : 'rel',
-        initialWpAltFt: num(initEl && initEl.value, 164),
-        hoverMph: num(hoverEl && hoverEl.value, 11.18),
-        launchAltFt: num(launchAltEl && launchAltEl.value, 0),
+        initialWpAltM: num(initEl && initEl.value, 164),
+        hoverMps: num(hoverEl && hoverEl.value, 11.18),
+        launchAltM: num(launchAltEl && launchAltEl.value, 0),
         launchLat: latEl ? String(latEl.textContent || '').trim() : '',
         launchLon: lonEl ? String(lonEl.textContent || '').trim() : '',
       };
@@ -3177,11 +3173,11 @@
         const sel = document.getElementById('planAltReferenceSelect');
         if (sel && s.altRef) sel.value = String(s.altRef);
         const initEl = document.getElementById('planInitialWpAltInput');
-        if (initEl && s.initialWpAltFt != null) initEl.value = String(s.initialWpAltFt);
+        if (initEl && (s.initialWpAltM != null || s.initialWpAltFt != null)) initEl.value = String(s.initialWpAltM != null ? s.initialWpAltM : s.initialWpAltFt);
         const hoverEl = document.getElementById('planHoverSpeedInput');
-        if (hoverEl && s.hoverMph != null) hoverEl.value = String(s.hoverMph);
+        if (hoverEl && (s.hoverMps != null || s.hoverMph != null)) hoverEl.value = String(s.hoverMps != null ? s.hoverMps : s.hoverMph);
         const launchAltEl = document.getElementById('planLaunchAltInput');
-        if (launchAltEl && s.launchAltFt != null) launchAltEl.value = String(s.launchAltFt);
+        if (launchAltEl && (s.launchAltM != null || s.launchAltFt != null)) launchAltEl.value = String(s.launchAltM != null ? s.launchAltM : s.launchAltFt);
         const latEl = document.getElementById('planLaunchLatVal');
         const lonEl = document.getElementById('planLaunchLonVal');
         const lt = s.launchLat != null ? String(s.launchLat).trim() : '';
@@ -3337,10 +3333,10 @@
     }
 
     function setTelemetryOverlay(relAltM, groundSpeedMps, timeText, distHomeM, climbMps) {
-      const ft = (Number(relAltM || 0.0) * 3.28084).toFixed(1);
-      const gsMph = (Number(groundSpeedMps || 0.0) * 2.23694).toFixed(1);
-      const vsMph = (Number(climbMps || 0.0) * 2.23694).toFixed(1);
-      const distFt = (Number(distHomeM || 0.0) * 3.28084).toFixed(1);
+      const ft = (Number(relAltM || 0.0)).toFixed(1);
+      const gsMph = (Number(groundSpeedMps || 0.0)).toFixed(1);
+      const vsMph = (Number(climbMps || 0.0)).toFixed(1);
+      const distFt = (Number(distHomeM || 0.0)).toFixed(1);
       const ttime = timeText || '00:00:00';
       const prev = window.__telHudSig || '';
       const sig = ft + '|' + gsMph + '|' + vsMph + '|' + distFt + '|' + ttime;
@@ -3351,12 +3347,12 @@
           el.textContent = text;
         });
       };
-      setAll('telRow1Alt', `${ft} ft`);
-      setAll('telRow1Mph', `${vsMph} mph`);
+      setAll('telRow1Alt', `${ft} m`);
+      setAll('telRow1Mph', `${vsMph} m/s`);
       setAll('telRow1Time', ttime);
-      setAll('telRow2Alt', `${ft} ft`);
-      setAll('telRow2Mph', `${gsMph} mph`);
-      setAll('telRow2Msl', `${distFt} ft`);
+      setAll('telRow2Alt', `${ft} m`);
+      setAll('telRow2Mph', `${gsMph} m/s`);
+      setAll('telRow2Msl', `${distFt} m`);
       return 1;
     }
 
