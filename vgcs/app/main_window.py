@@ -2686,6 +2686,14 @@ class MainWindow(QMainWindow):
         self._set_dashboard_flight_status("green", "Ready to Arm")
         self._flight_status_btn.setText("READY TO ARM")
 
+    def _is_home_wait_prearm_reason(self) -> bool:
+        reason = str(self._prearm_block_reason or "").strip().lower()
+        return ("waiting for home" in reason) or ("ahrs" in reason and "home" in reason)
+
+    def _is_non_gps_mode(self, mode_text: str) -> bool:
+        mode = str(mode_text or "").strip().upper()
+        return mode in {"ALT_HOLD", "STABILIZE", "ACRO"}
+
     def _update_prearm_gate_from_statustext(self, text: str) -> None:
         t = str(text or "").strip()
         if not t:
@@ -3261,9 +3269,11 @@ class MainWindow(QMainWindow):
                 self._fields["flight_time"].setText("00:00")
             standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
             arm_ready = system_status >= standby
-            if not armed and not self._arm_ready_confirmed:
+            mode_non_gps = self._is_non_gps_mode(mode_text)
+            home_wait_non_gps_ok = mode_non_gps and self._is_home_wait_prearm_reason()
+            if not armed and not self._arm_ready_confirmed and not home_wait_non_gps_ok:
                 arm_ready = False
-            if time.monotonic() < float(self._prearm_block_until_mono):
+            if time.monotonic() < float(self._prearm_block_until_mono) and not home_wait_non_gps_ok:
                 arm_ready = False
             self._hb_armed = armed
             self._hb_arm_ready = arm_ready
