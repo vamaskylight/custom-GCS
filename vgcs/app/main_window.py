@@ -157,6 +157,9 @@ class MainWindow(QMainWindow):
         self._hb_mode_text = "—"
         self._prearm_block_reason = ""
         self._prearm_block_until_mono = 0.0
+        self._arm_denied_reason = ""
+        self._arm_denied_until_mono = 0.0
+        self._arm_ready_confirmed = False
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
         self._last_vehicle_type: int | None = None
@@ -2659,19 +2662,26 @@ class MainWindow(QMainWindow):
 
     def _refresh_dashboard_flight_state(self) -> None:
         """Keep banner/button state aligned with latest heartbeat + motion cues."""
-        if not self._hb_arm_ready:
-            reason = str(self._prearm_block_reason or "").strip()
-            msg = f"Connected - Not Ready to Arm ({reason})" if reason else "Connected - Not Ready to Arm"
+        now = time.monotonic()
+        if now < float(self._arm_denied_until_mono):
+            reason = str(self._arm_denied_reason or self._prearm_block_reason or "").strip()
+            msg = f"Arm denied - {reason}" if reason else "Arm denied"
             self._set_dashboard_flight_status("yellow", msg)
+            self._flight_status_btn.setText("NOT READY TO ARM")
             return
-        mode_disp = str(self._hb_mode_text or "Unknown").strip()
         if self._hb_armed:
+            mode_disp = str(self._hb_mode_text or "Unknown").strip()
             if self._is_probably_flying():
                 self._set_dashboard_flight_status("green", f"In Flight - {mode_disp}")
                 self._flight_status_btn.setText("IN FLIGHT")
             else:
                 self._set_dashboard_flight_status("green", f"Armed - {mode_disp}")
                 self._flight_status_btn.setText("ARMED")
+            return
+        if not self._hb_arm_ready:
+            reason = str(self._prearm_block_reason or "").strip()
+            msg = f"Connected - Not Ready to Arm ({reason})" if reason else "Connected - Not Ready to Arm"
+            self._set_dashboard_flight_status("yellow", msg)
             return
         self._set_dashboard_flight_status("green", "Ready to Arm")
         self._flight_status_btn.setText("READY TO ARM")
@@ -2688,13 +2698,22 @@ class MainWindow(QMainWindow):
         if is_prearm_block:
             reason = t.split(":", 1)[-1].strip() if ":" in t else t
             self._prearm_block_reason = reason or t
-            # Keep the gate active briefly so READY does not flicker between heartbeats.
-            self._prearm_block_until_mono = time.monotonic() + 4.0
+            self._arm_ready_confirmed = False
+            now = time.monotonic()
+            # Keep gate sticky long enough to avoid "Ready to Arm" bounce between sparse STATUSTEXT.
+            self._prearm_block_until_mono = max(float(self._prearm_block_until_mono), now + 30.0)
+            if low.startswith("arm:"):
+                self._arm_denied_reason = reason or t
+                # Strong immediate feedback after an actual arm attempt is denied.
+                self._arm_denied_until_mono = now + 8.0
             return
         # Clear sticky gate when firmware reports healthy arm/ready messages.
-        if any(k in low for k in ("armed", "armable", "ready to arm", "prearm: checks passed")):
+        if any(k in low for k in ("armed", "armable", "ready to arm", "prearm: checks passed", "prearm checks passed")):
             self._prearm_block_reason = ""
             self._prearm_block_until_mono = 0.0
+            self._arm_denied_reason = ""
+            self._arm_denied_until_mono = 0.0
+            self._arm_ready_confirmed = True
 
     def _push_map_flight_overlay(self) -> None:
         if self._armed_since is None:
@@ -2967,6 +2986,7 @@ class MainWindow(QMainWindow):
         self._arm_not_ready_alert_shown = False
         self._arm_not_ready_since_mono = None
         self._recent_statustext.clear()
+        self._arm_ready_confirmed = False
         self._status.setText("Connecting…")
         self._apply_state_style(self._status, "warn")
         self._set_dashboard_flight_status("yellow", "Connecting to vehicle...")
@@ -3122,6 +3142,7 @@ class MainWindow(QMainWindow):
         self._connect_attempt_active = False
         self._arm_not_ready_alert_shown = False
         self._arm_not_ready_since_mono = None
+        self._arm_ready_confirmed = False
         self._rid_live_available = False
         self._mission_upload_pending = False
         self._status.setText("Disconnected")
@@ -3240,6 +3261,8 @@ class MainWindow(QMainWindow):
                 self._fields["flight_time"].setText("00:00")
             standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
             arm_ready = system_status >= standby
+            if not armed and not self._arm_ready_confirmed:
+                arm_ready = False
             if time.monotonic() < float(self._prearm_block_until_mono):
                 arm_ready = False
             self._hb_armed = armed
