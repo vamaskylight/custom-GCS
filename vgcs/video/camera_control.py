@@ -389,11 +389,9 @@ class SkydroidCameraControl:
 
     def _run_skydroid_nadir_sequence(self) -> None:
         """
-        C13 field behavior varies by firmware:
-        - some accept PTZ 0x0A one-key down;
-        - some only react to angle mode (+90 / -90 sign conventions differ);
-        - some react better to short PTZ down pulse + stop.
-        This sequence tries all safely until pitch moves.
+        C13 field behavior varies by firmware, so do a hybrid:
+        1) trigger vendor one-key-down preset (fast reaction),
+        2) then converge with absolute angle commands for repeatable accuracy.
         """
         def _status_pitch() -> float | None:
             try:
@@ -413,14 +411,6 @@ class SkydroidCameraControl:
                 return 0.0
             return 0.0
 
-        def _moved_from(base: float | None, threshold_deg: float = 2.0) -> bool:
-            if base is None:
-                return False
-            cur = _status_pitch()
-            if cur is None:
-                return False
-            return abs(cur - base) >= float(threshold_deg)
-
         base_pitch = _status_pitch()
         yaw_hold = _status_yaw()
 
@@ -428,33 +418,45 @@ class SkydroidCameraControl:
         if self._adapter._profile.ptz_commands.get("nadir"):
             try:
                 self.ptz("nadir")
-                time.sleep(0.35)
-                if _moved_from(base_pitch):
-                    return
+                time.sleep(0.28)
             except Exception:
                 pass
 
-        # 2) Absolute angle fallback (+90 then -90 unless user forced a setting).
-        for pitch in self._skydroid_nadir_pitch_candidates():
+        # 2) Absolute-angle convergence for precision like center/home behavior.
+        candidates = self._skydroid_nadir_pitch_candidates()
+        # If sign is unknown (default path), pick the target closer to the current telemetry.
+        if len(candidates) > 1:
+            cur_pitch = _status_pitch()
+            if cur_pitch is not None:
+                candidates = sorted(
+                    candidates,
+                    key=lambda p: abs(float(cur_pitch) - float(p)),
+                )
+        target_pitch = float(candidates[0]) if candidates else -90.0
+        for speed_dps in (25.0, 18.0, 12.0):
             try:
                 self._adapter.set_angle_axes(
                     yaw_deg=yaw_hold,
-                    pitch_deg=float(pitch),
-                    approach_speed_dps=25.0,
+                    pitch_deg=target_pitch,
+                    approach_speed_dps=speed_dps,
                 )
-                time.sleep(0.4)
-                if _moved_from(base_pitch):
+                time.sleep(0.34)
+                cur_pitch = _status_pitch()
+                if cur_pitch is None:
+                    continue
+                if abs(float(cur_pitch) - target_pitch) <= 1.5:
                     return
             except Exception:
                 continue
 
-        # 3) Final pulse fallback: PT_DOWN then PT_STOP.
-        try:
-            self.ptz("down")
-            time.sleep(0.35)
-            self.ptz("stop")
-        except Exception:
-            return
+        # 3) If telemetry is absent, keep a conservative fallback pulse.
+        if _status_pitch() is None:
+            try:
+                self.ptz("down")
+                time.sleep(0.25)
+                self.ptz("stop")
+            except Exception:
+                return
 
 
 def resolve_siyi_host(settings, *, default: str = "192.168.144.25") -> str:
