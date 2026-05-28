@@ -334,7 +334,14 @@ class MavlinkThread(QThread):
                 src_comp = int(msg.get_srcComponent())
                 if self._heartbeat_updates_link_target(msg):
                     self._target_sysid = src_sys
-                    self._target_compid = src_comp
+                    # Prefer autopilot component (1) over generic component (0) so
+                    # mode/status come from a stable source and do not flicker/swap.
+                    if int(self._target_compid) <= 0:
+                        self._target_compid = src_comp
+                    elif src_comp == 1:
+                        self._target_compid = 1
+                    elif int(self._target_compid) != 1:
+                        self._target_compid = src_comp
                 now = time.monotonic()
                 # Avoid flooding UI if vehicle sends HB fast
                 if now - last_hb >= 0.5:
@@ -345,7 +352,10 @@ class MavlinkThread(QThread):
                         int(getattr(msg, "mavlink_version", 0) or 0),
                     )
                 hb_now = time.monotonic()
-                primary = int(self._target_sysid) <= 0 or src_sys == int(self._target_sysid)
+                primary = (
+                    (int(self._target_sysid) <= 0 or src_sys == int(self._target_sysid))
+                    and (int(self._target_compid) <= 0 or src_comp == int(self._target_compid))
+                )
                 if primary and hb_now - self._last_hb_log_mono >= 5.0:
                     self._last_hb_log_mono = hb_now
                     self.log_line.emit(
