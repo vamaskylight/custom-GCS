@@ -373,7 +373,7 @@ class SkydroidCameraControl:
         """
         C13 firmware/sign conventions vary in the field.
         - If user set `camera/gimbal_nadir_pitch_deg`, trust it and use only that value.
-        - Otherwise try +90 first (Topotek magnetic-angle docs), then -90 fallback.
+        - Otherwise keep VGCS legacy default first (−90), then +90 fallback.
         """
         st = QSettings("VGCS", "VGCS")
         try:
@@ -381,7 +381,7 @@ class SkydroidCameraControl:
                 return [gimbal_nadir_pitch_deg(st)]
         except Exception:
             pass
-        return [90.0, -90.0]
+        return [-90.0, 90.0]
 
     def gimbal_point_down(self) -> None:
         # Run on a worker so retries/telemetry checks never block UI.
@@ -422,41 +422,36 @@ class SkydroidCameraControl:
             except Exception:
                 pass
 
-        # 2) Absolute-angle convergence for precision like center/home behavior.
+        # 2) Absolute-angle convergence for precision; try both signs deterministically.
         candidates = self._skydroid_nadir_pitch_candidates()
-        # If sign is unknown (default path), pick the target closer to the current telemetry.
-        if len(candidates) > 1:
-            cur_pitch = _status_pitch()
-            if cur_pitch is not None:
-                candidates = sorted(
-                    candidates,
-                    key=lambda p: abs(float(cur_pitch) - float(p)),
-                )
-        target_pitch = float(candidates[0]) if candidates else -90.0
-        for speed_dps in (25.0, 18.0, 12.0):
-            try:
-                self._adapter.set_angle_axes(
-                    yaw_deg=yaw_hold,
-                    pitch_deg=target_pitch,
-                    approach_speed_dps=speed_dps,
-                )
-                time.sleep(0.34)
-                cur_pitch = _status_pitch()
-                if cur_pitch is None:
+        for target_pitch in [float(v) for v in candidates]:
+            for speed_dps in (25.0, 18.0, 12.0):
+                try:
+                    self._adapter.set_angle_axes(
+                        yaw_deg=yaw_hold,
+                        pitch_deg=target_pitch,
+                        approach_speed_dps=speed_dps,
+                    )
+                    time.sleep(0.42)
+                    cur_pitch = _status_pitch()
+                    if cur_pitch is None:
+                        continue
+                    if abs(float(cur_pitch) - target_pitch) <= 2.0:
+                        return
+                except Exception:
                     continue
-                if abs(float(cur_pitch) - target_pitch) <= 1.5:
-                    return
-            except Exception:
-                continue
 
-        # 3) If telemetry is absent, keep a conservative fallback pulse.
-        if _status_pitch() is None:
+        # 3) Final movement fallback (same behavior users reported as "it moves").
+        # Keep this even with telemetry, because some C13 firmwares reply attitude but
+        # still ignore absolute-angle commands intermittently.
+        for _ in range(2):
             try:
                 self.ptz("down")
-                time.sleep(0.25)
+                time.sleep(0.28)
                 self.ptz("stop")
+                time.sleep(0.15)
             except Exception:
-                return
+                pass
 
 
 def resolve_siyi_host(settings, *, default: str = "192.168.144.25") -> str:
