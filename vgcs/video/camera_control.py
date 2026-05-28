@@ -366,15 +366,32 @@ class SkydroidCameraControl:
         except Exception:
             return
 
+    @staticmethod
+    def _skydroid_nadir_pitch_candidates() -> list[float]:
+        """
+        C13 firmware/sign conventions vary in the field.
+        - If user set `camera/gimbal_nadir_pitch_deg`, trust it and use only that value.
+        - Otherwise try +90 first (Topotek magnetic-angle docs), then -90 fallback.
+        """
+        st = QSettings("VGCS", "VGCS")
+        try:
+            if st.contains("camera/gimbal_nadir_pitch_deg"):
+                return [gimbal_nadir_pitch_deg(st)]
+        except Exception:
+            pass
+        return [90.0, -90.0]
+
     def gimbal_point_down(self) -> None:
-        """Straight down: PTZ one-key down (0x0A) when available, else absolute GAM/GAP."""
+        """
+        Straight down preset with robust fallback:
+        1) PTZ one-key down (0x0A) for C13 profiles.
+        2) Absolute pitch target(s) for mixed firmware sign conventions.
+        """
         if self._adapter._profile.ptz_commands.get("nadir"):
             try:
                 self.ptz("nadir")
-                return
             except Exception:
                 pass
-        pitch = gimbal_nadir_pitch_deg()
         yaw_hold = 0.0
         try:
             st = self._adapter.get_status_cached()
@@ -382,13 +399,15 @@ class SkydroidCameraControl:
                 yaw_hold = float(st.yaw_deg)
         except Exception:
             pass
-        try:
-            self._adapter.set_angle_axes(
-                yaw_deg=yaw_hold,
-                pitch_deg=float(pitch),
-                approach_speed_dps=25.0,
-            )
-        except Exception:
+        for pitch in self._skydroid_nadir_pitch_candidates():
+            try:
+                self._adapter.set_angle_axes(
+                    yaw_deg=yaw_hold,
+                    pitch_deg=float(pitch),
+                    approach_speed_dps=25.0,
+                )
+            except Exception:
+                continue
             return
 
 
