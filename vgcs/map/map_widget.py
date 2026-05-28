@@ -183,6 +183,13 @@ _MAP_ACTION_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _NATIVE_CAM_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 # LENS row: 42 + 6 + (16+34+34)*2 + 6 + ~11 layout margins.
 _NATIVE_CAM_RAIL_MIN_WIDTH_PX = 258
+# Camera rail vertical rhythm (touch targets / gaps — do not change font-size in QSS below).
+_CAM_RAIL_PAD_BTN_H = 34
+_CAM_RAIL_PAD_BTN_W = 40
+_CAM_RAIL_LENS_ROW_H = 40
+_CAM_RAIL_LENS_BTN_H = 34
+_CAM_RAIL_LAYOUT_SPACING = 5
+_CAM_RAIL_GIMBAL_GRID_GAP = 5
 # Native HUD margins (mini-video bottom-left; obstacle top-left under Takeoff/Return).
 _MAP_HUD_MARGIN_PX = 12
 _MAP_ACTION_RAIL_HEIGHT_PX = 54 + 8 + 54
@@ -441,8 +448,8 @@ QLabel#camSectionHeaderLens {
 QPushButton[camLensPadBtn=true] {
   min-width: 34px;
   max-width: 34px;
-  min-height: 30px;
-  max-height: 30px;
+  min-height: 34px;
+  max-height: 34px;
   border-radius: 6px;
   border: 1px solid rgba(196, 209, 230, 38);
   background: rgba(18, 22, 32, 75);
@@ -458,8 +465,8 @@ QPushButton[camLensPadBtn=true]:hover {
 }
 QWidget#camLensRow {
   background: transparent;
-  min-height: 36px;
-  max-height: 36px;
+  min-height: 40px;
+  max-height: 40px;
 }
 QWidget#camLensControls, QWidget#camInlineRowBody {
   background: transparent;
@@ -474,12 +481,12 @@ QFrame#camRailSep {
   max-height: 1px;
   min-height: 1px;
   border: none;
-  margin-top: 1px;
-  margin-bottom: 1px;
+  margin-top: 3px;
+  margin-bottom: 3px;
 }
 QPushButton#observeTarget, QPushButton#observeClip,
 QPushButton#observeReport, QPushButton#observeReset {
-  min-height: 30px;
+  min-height: 34px;
   font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
   font-size: 15px;
   font-weight: 600;
@@ -506,7 +513,7 @@ QPushButton#observeClip[recording="true"] {
 }
 QPushButton[camPadBtn=true] {
   min-width: 40px;
-  min-height: 30px;
+  min-height: 34px;
   border-radius: 6px;
   border: 1px solid rgba(196, 209, 230, 38);
   background: rgba(18, 22, 32, 75);
@@ -538,9 +545,11 @@ def _cam_rail_sep() -> QFrame:
 def _cam_rail_inline_row(label: str, body: QWidget) -> QWidget:
     """Compact row: section label + controls (one line, no extra header row)."""
     w = QWidget()
+    w.setObjectName("camInlineRow")
+    w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
     h = QHBoxLayout(w)
-    h.setContentsMargins(0, 0, 0, 0)
-    h.setSpacing(6)
+    h.setContentsMargins(0, 2, 0, 2)
+    h.setSpacing(8)
     lab = QLabel(label)
     lab.setObjectName("camSectionHeaderInline")
     lab.setAlignment(
@@ -556,7 +565,7 @@ def _cam_rail_inline_row(label: str, body: QWidget) -> QWidget:
 def _cam_lens_pad_btn(btn: QPushButton) -> QPushButton:
     """Lens −/+ only — QSS min/max must match fixed size or Qt overlaps widgets."""
     btn.setProperty("camLensPadBtn", True)
-    btn.setFixedSize(34, 30)
+    btn.setFixedSize(34, _CAM_RAIL_LENS_BTN_H)
     btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     return btn
 
@@ -570,11 +579,11 @@ def _cam_rail_lens_row(
     """Single flat row: LENS · Z − + · F − + (fixed height so buttons are not vertically clipped)."""
     row = QWidget()
     row.setObjectName("camLensRow")
-    row.setFixedHeight(36)
+    row.setFixedHeight(_CAM_RAIL_LENS_ROW_H)
     row.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
     lay = QHBoxLayout(row)
-    lay.setContentsMargins(0, 3, 0, 3)
-    lay.setSpacing(6)
+    lay.setContentsMargins(0, 4, 0, 4)
+    lay.setSpacing(8)
     lab = QLabel("LENS")
     lab.setObjectName("camSectionHeaderLens")
     lab.setFixedWidth(42)
@@ -601,7 +610,12 @@ def _cam_rail_lens_row(
     return row
 
 
-def _cam_pad_btn(btn: QPushButton, *, width: int = 40, height: int = 30) -> QPushButton:
+def _cam_pad_btn(
+    btn: QPushButton,
+    *,
+    width: int = _CAM_RAIL_PAD_BTN_W,
+    height: int = _CAM_RAIL_PAD_BTN_H,
+) -> QPushButton:
     btn.setProperty("camPadBtn", True)
     btn.setFixedSize(int(width), int(height))
     return btn
@@ -1054,7 +1068,7 @@ class MapWidget(QWidget):
             "QFrame#nativeCameraRailLayer {"
             " background: " + _MAP_HUD_GLASS_BG + ";"
             " border: 1px solid " + _MAP_HUD_GLASS_BORDER + ";"
-            " border-radius: 12px;"
+            " border-radius: 14px;"
             "}"
         )
         self._native_rail_layer.hide()
@@ -1065,14 +1079,14 @@ class MapWidget(QWidget):
         self._native_hud_right.setAutoFillBackground(False)
         self._native_hud_right.setStyleSheet(_NATIVE_CAMERA_RAIL_QSS)
         self._native_hud_right_layout = QVBoxLayout(self._native_hud_right)
-        self._native_hud_right_layout.setContentsMargins(5, 4, 6, 5)
-        self._native_hud_right_layout.setSpacing(2)
+        self._native_hud_right_layout.setContentsMargins(8, 7, 8, 8)
+        self._native_hud_right_layout.setSpacing(_CAM_RAIL_LAYOUT_SPACING)
 
         self._camera_top_row = QFrame(self._native_hud_right)
         self._camera_top_row.setObjectName("cameraTopRow")
         ctr_layout = QHBoxLayout(self._camera_top_row)
-        ctr_layout.setContentsMargins(2, 2, 2, 2)
-        ctr_layout.setSpacing(2)
+        ctr_layout.setContentsMargins(3, 3, 3, 3)
+        ctr_layout.setSpacing(4)
 
         self._btn_native_video = QPushButton()
         self._btn_native_video.setObjectName("camVideoBtn")
@@ -1215,7 +1229,9 @@ class MapWidget(QWidget):
                     self._btn_native_gimbal_down,
                     self._btn_native_gimbal_nadir,
                 ],
-            ]
+            ],
+            btn_height=_CAM_RAIL_PAD_BTN_H,
+            grid_gap=_CAM_RAIL_GIMBAL_GRID_GAP,
         )
         observe_body = CamObserveBlock(
             self._btn_native_target,
