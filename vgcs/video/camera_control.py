@@ -411,6 +411,17 @@ class SkydroidCameraControl:
                 return 0.0
             return 0.0
 
+        def _wait_for_pitch_update(timeout_s: float) -> float | None:
+            deadline = time.monotonic() + max(0.02, float(timeout_s))
+            last = _status_pitch()
+            while time.monotonic() < deadline:
+                time.sleep(0.05)
+                cur = _status_pitch()
+                if cur is not None:
+                    last = cur
+                    return cur
+            return last
+
         base_pitch = _status_pitch()
         yaw_hold = _status_yaw()
 
@@ -418,22 +429,37 @@ class SkydroidCameraControl:
         if self._adapter._profile.ptz_commands.get("nadir"):
             try:
                 self.ptz("nadir")
-                time.sleep(0.28)
             except Exception:
                 pass
 
         # 2) Absolute-angle convergence for precision; try both signs deterministically.
         candidates = self._skydroid_nadir_pitch_candidates()
-        for target_pitch in [float(v) for v in candidates]:
-            for speed_dps in (25.0, 18.0, 12.0):
+        targets = [float(v) for v in candidates] if candidates else [-90.0]
+
+        # Fast pass: issue immediate command(s) with minimal waiting.
+        for target_pitch in targets:
+            try:
+                self._adapter.set_angle_axes(
+                    yaw_deg=yaw_hold,
+                    pitch_deg=target_pitch,
+                    approach_speed_dps=30.0,
+                )
+            except Exception:
+                continue
+            cur_pitch = _wait_for_pitch_update(0.22)
+            if cur_pitch is not None and abs(float(cur_pitch) - target_pitch) <= 2.0:
+                return
+
+        # Fine pass: 1-2 quick refinements.
+        for target_pitch in targets:
+            for speed_dps in (20.0, 14.0):
                 try:
                     self._adapter.set_angle_axes(
                         yaw_deg=yaw_hold,
                         pitch_deg=target_pitch,
                         approach_speed_dps=speed_dps,
                     )
-                    time.sleep(0.42)
-                    cur_pitch = _status_pitch()
+                    cur_pitch = _wait_for_pitch_update(0.16)
                     if cur_pitch is None:
                         continue
                     if abs(float(cur_pitch) - target_pitch) <= 2.0:
@@ -444,14 +470,12 @@ class SkydroidCameraControl:
         # 3) Final movement fallback (same behavior users reported as "it moves").
         # Keep this even with telemetry, because some C13 firmwares reply attitude but
         # still ignore absolute-angle commands intermittently.
-        for _ in range(2):
-            try:
-                self.ptz("down")
-                time.sleep(0.28)
-                self.ptz("stop")
-                time.sleep(0.15)
-            except Exception:
-                pass
+        try:
+            self.ptz("down")
+            time.sleep(0.12)
+            self.ptz("stop")
+        except Exception:
+            pass
 
 
 def resolve_siyi_host(settings, *, default: str = "192.168.144.25") -> str:
