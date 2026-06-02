@@ -154,6 +154,7 @@ class MainWindow(QMainWindow):
         self._last_hb_ui_key: tuple[object, ...] | None = None
         self._hb_armed = False
         self._hb_arm_ready = False
+        self._hb_system_status = 0
         self._hb_mode_text = "—"
         self._prearm_block_reason = ""
         self._prearm_block_until_mono = 0.0
@@ -2662,6 +2663,20 @@ class MainWindow(QMainWindow):
 
     def _refresh_dashboard_flight_state(self) -> None:
         """Keep banner/button state aligned with latest heartbeat + motion cues."""
+        self._hb_arm_ready = self._compute_hb_arm_ready(
+            armed=bool(self._hb_armed),
+            system_status=int(self._hb_system_status),
+            mode_text=str(self._hb_mode_text or ""),
+        )
+        if self._hb_arm_ready:
+            self._fields["arm_ready"].setText("Likely ready")
+            self._apply_state_style(self._fields["arm_ready"], "ok")
+        elif self._prearm_block_reason:
+            self._fields["arm_ready"].setText(f"PreArm: {self._prearm_block_reason}")
+            self._apply_state_style(self._fields["arm_ready"], "warn")
+        elif self._heartbeat_seen:
+            self._fields["arm_ready"].setText(f"System status {self._hb_system_status}")
+            self._apply_state_style(self._fields["arm_ready"], "warn")
         now = time.monotonic()
         if now < float(self._arm_denied_until_mono):
             reason = str(self._arm_denied_reason or self._prearm_block_reason or "").strip()
@@ -2683,25 +2698,77 @@ class MainWindow(QMainWindow):
             msg = f"Connected - Not Ready to Arm ({reason})" if reason else "Connected - Not Ready to Arm"
             self._set_dashboard_flight_status("yellow", msg)
             return
-        self._set_dashboard_flight_status("green", "Ready to Arm")
+        mode_disp = str(self._hb_mode_text or "").strip()
+        ready_msg = f"Ready to Arm - {mode_disp}" if mode_disp and mode_disp != "—" else "Ready to Arm"
+        self._set_dashboard_flight_status("green", ready_msg)
         self._flight_status_btn.setText("READY TO ARM")
+
+    def _normalize_mode_token(self, mode_text: str) -> str:
+        return str(mode_text or "").strip().upper().replace(" ", "_").replace("-", "_")
 
     def _is_home_wait_prearm_reason(self) -> bool:
         reason = str(self._prearm_block_reason or "").strip().lower()
         return ("waiting for home" in reason) or ("ahrs" in reason and "home" in reason)
 
     def _is_non_gps_mode(self, mode_text: str) -> bool:
-        mode = str(mode_text or "").strip().upper()
-        return mode in {"ALT_HOLD", "STABILIZE", "ACRO"}
+        mode = self._normalize_mode_token(mode_text)
+        return mode in {"ALT_HOLD", "STABILIZE", "ACRO", "DRIFT", "SPORT"}
+
+    def _prearm_block_active(self) -> bool:
+        if time.monotonic() >= float(self._prearm_block_until_mono):
+            return False
+        return bool(str(self._prearm_block_reason or "").strip())
+
+    def _compute_hb_arm_ready(self, *, armed: bool, system_status: int, mode_text: str) -> bool:
+        """Whether the link banner should show green (ready / armed / in flight)."""
+        standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
+        if system_status < standby:
+            return False
+
+        mode_non_gps = self._is_non_gps_mode(mode_text)
+        home_wait_ok = mode_non_gps and self._is_home_wait_prearm_reason()
+        if self._prearm_block_active() and not home_wait_ok:
+            return False
+
+        if armed:
+            return True
+
+        # ALT_HOLD / STABILIZE / ACRO: no GPS PreArm — STANDBY without a PreArm fault is enough.
+        if mode_non_gps:
+            return True
+
+        if self._arm_ready_confirmed or home_wait_ok:
+            return True
+
+        # GPS modes: wait for explicit PreArm pass STATUSTEXT to avoid boot flicker.
+        return False
 
     def _update_prearm_gate_from_statustext(self, text: str) -> None:
         t = str(text or "").strip()
         if not t:
             return
         low = t.lower()
+        if any(
+            k in low
+            for k in (
+                "armed",
+                "armable",
+                "ready to arm",
+                "prearm: checks passed",
+                "prearm checks passed",
+                "checks passed",
+            )
+        ):
+            self._prearm_block_reason = ""
+            self._prearm_block_until_mono = 0.0
+            self._arm_denied_reason = ""
+            self._arm_denied_until_mono = 0.0
+            self._arm_ready_confirmed = True
+            return
         is_prearm_block = (
             ("prearm" in low or low.startswith("arm:"))
-            and any(k in low for k in ("wait", "fail", "not", "deny", "check", "error"))
+            and any(k in low for k in ("wait", "fail", "not", "deny", "error"))
+            and "passed" not in low
         )
         if is_prearm_block:
             reason = t.split(":", 1)[-1].strip() if ":" in t else t
@@ -2715,13 +2782,6 @@ class MainWindow(QMainWindow):
                 # Strong immediate feedback after an actual arm attempt is denied.
                 self._arm_denied_until_mono = now + 8.0
             return
-        # Clear sticky gate when firmware reports healthy arm/ready messages.
-        if any(k in low for k in ("armed", "armable", "ready to arm", "prearm: checks passed", "prearm checks passed")):
-            self._prearm_block_reason = ""
-            self._prearm_block_until_mono = 0.0
-            self._arm_denied_reason = ""
-            self._arm_denied_until_mono = 0.0
-            self._arm_ready_confirmed = True
 
     def _push_map_flight_overlay(self) -> None:
         if self._armed_since is None:
@@ -3151,6 +3211,11 @@ class MainWindow(QMainWindow):
         self._arm_not_ready_alert_shown = False
         self._arm_not_ready_since_mono = None
         self._arm_ready_confirmed = False
+        self._last_hb_ui_key = None
+        self._hb_armed = False
+        self._hb_arm_ready = False
+        self._hb_system_status = 0
+        self._hb_mode_text = "—"
         self._rid_live_available = False
         self._mission_upload_pending = False
         self._status.setText("Disconnected")
@@ -3251,9 +3316,21 @@ class MainWindow(QMainWindow):
                     custom_mode=int(data.get("custom_mode", 0) or 0),
                 )
             hb_key = (armed, system_status, mode_text)
-            if hb_key == getattr(self, "_last_hb_ui_key", None):
+            arm_ready = self._compute_hb_arm_ready(
+                armed=armed,
+                system_status=system_status,
+                mode_text=mode_text,
+            )
+            ui_key = (
+                hb_key,
+                arm_ready,
+                str(self._prearm_block_reason or ""),
+                int(self._prearm_block_until_mono),
+                bool(self._arm_ready_confirmed),
+            )
+            if ui_key == getattr(self, "_last_hb_ui_key", None):
                 return
-            self._last_hb_ui_key = hb_key
+            self._last_hb_ui_key = ui_key
             self._fields["armed"].setText("Yes" if armed else "No")
             self._apply_state_style(self._fields["armed"], "ok" if armed else "warn")
             if armed and self._armed_since is None:
@@ -3267,15 +3344,8 @@ class MainWindow(QMainWindow):
             if not armed:
                 self._armed_since = None
                 self._fields["flight_time"].setText("00:00")
-            standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
-            arm_ready = system_status >= standby
-            mode_non_gps = self._is_non_gps_mode(mode_text)
-            home_wait_non_gps_ok = mode_non_gps and self._is_home_wait_prearm_reason()
-            if not armed and not self._arm_ready_confirmed and not home_wait_non_gps_ok:
-                arm_ready = False
-            if time.monotonic() < float(self._prearm_block_until_mono) and not home_wait_non_gps_ok:
-                arm_ready = False
             self._hb_armed = armed
+            self._hb_system_status = system_status
             self._hb_arm_ready = arm_ready
             self._hb_mode_text = mode_text
             if arm_ready:
@@ -3289,12 +3359,7 @@ class MainWindow(QMainWindow):
                 # Do not clear _arm_not_ready_alert_shown here: brief STANDBY in a flickering
                 # HEARTBEAT would re-arm the popup and make OK / title-bar close feel ignored.
                 self._arm_not_ready_since_mono = None
-                self._refresh_dashboard_flight_state()
             else:
-                self._set_dashboard_flight_status(
-                    "yellow",
-                    "Connected - Not Ready to Arm",
-                )
                 now = time.monotonic()
                 if self._arm_not_ready_since_mono is None:
                     self._arm_not_ready_since_mono = now
@@ -3313,6 +3378,7 @@ class MainWindow(QMainWindow):
                     if extra:
                         body = f"{body}\n\n{extra}"
                     QMessageBox.warning(self, "Vehicle Msg", body)
+            self._refresh_dashboard_flight_state()
             self._sync_mode_options_for_vehicle(int(data.get("vehicle_type", 0) or 0))
             self._top_flight_mode.setText(mode_text)
             self._map_widget.set_header_mode(mode_text)

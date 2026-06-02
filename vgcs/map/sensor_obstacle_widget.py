@@ -1,7 +1,7 @@
 """
 M9 — Sensor visualization & obstacle detection display (AeroGCS-style radar).
 
-Native Qt (PySide6): hero polar plot + compact telemetry strip on a map HUD card.
+Native Qt (PySide6): unified map HUD card — polar plot + labeled metrics + sensor pills.
 """
 
 from __future__ import annotations
@@ -24,14 +24,13 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
-
-from vgcs.map.map_footer_hud import TELEMETRY_STRIP_VALUE_STYLE, TelemetryStripIcon
 
 _SENSOR_LASER = 0
 _SENSOR_ULTRASOUND = 1
@@ -40,10 +39,9 @@ _SENSOR_RADAR = 3
 _OBSTACLE_BIN_COUNT = 72
 _NO_READING_CM = 0xFFFF
 
-_RADAR_PLOT_PX = 192
-# Strip slightly wider than radar so sensor labels + status are not clipped.
-_STRIP_WIDTH_PX = 216
-_PANEL_WIDTH_PX = _STRIP_WIDTH_PX
+_CARD_WIDTH_PX = 200
+_RADAR_PLOT_PX = 184
+_PANEL_WIDTH_PX = _CARD_WIDTH_PX
 
 _HUD_TEXT = QColor(230, 238, 252)
 _HUD_TEXT_DIM = QColor(130, 142, 168)
@@ -53,13 +51,38 @@ _HUD_SAFE = QColor(52, 211, 153)
 _HUD_WARN = QColor(251, 191, 36)
 _HUD_DANGER = QColor(248, 113, 113)
 
-# Match ``MapFooterTelemetryStrip`` in ``map_footer_hud.py``.
-_TELEMETRY_STRIP_QSS = (
-    "QFrame#obstacleTelemetryStrip {"
+_CARD_QSS = (
+    "QFrame#obstacleHudCard {"
     " background: rgba(26, 33, 45, 215);"
     " border: 1px solid rgba(80, 92, 118, 107);"
     " border-radius: 12px;"
     "}"
+)
+
+_LABEL_QSS = (
+    "color: #8b95a8; font-size: 9px; font-weight: 600;"
+    " letter-spacing: 0.6px; background: transparent; border: none;"
+)
+_VALUE_QSS = "color: #dce5f5; font-size: 15px; font-weight: 600; background: transparent; border: none;"
+_VALUE_ALERT_QSS = "color: #f87171; font-size: 15px; font-weight: 600; background: transparent; border: none;"
+_SUB_QSS = "color: #6b7280; font-size: 10px; font-weight: 600; background: transparent; border: none;"
+_DIVIDER_QSS = "background: rgba(80, 92, 118, 80); border: none; max-height: 1px; min-height: 1px;"
+_PILL_TRACK_QSS = (
+    "QWidget#sensorPillTrack {"
+    " background: rgba(18, 22, 30, 160);"
+    " border: 1px solid rgba(80, 92, 118, 70);"
+    " border-radius: 8px;"
+    "}"
+)
+_PILL_IDLE = (
+    "color: #8b95a8; font-size: 10px; font-weight: 600;"
+    " background: transparent; border: none; border-radius: 6px; padding: 4px 0;"
+)
+_PILL_ON = (
+    "color: #ecfdf5; font-size: 10px; font-weight: 600;"
+    " background: rgba(52, 211, 153, 0.22);"
+    " border: 1px solid rgba(52, 211, 153, 0.35);"
+    " border-radius: 6px; padding: 3px 0;"
 )
 
 
@@ -141,7 +164,7 @@ class DistanceSensorState:
 
 
 class ObstacleRadarCanvas(QWidget):
-    """Hero polar plot — fills the bezel; vehicle forward = top."""
+    """Hero polar plot — vehicle forward = top."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -208,8 +231,7 @@ class ObstacleRadarCanvas(QWidget):
         cx, cy = w / 2.0, h / 2.0
         radius = min(w, h) * 0.46
 
-        # Compass-style: faint outer ring + opaque inner disc (no square panel behind).
-        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setPen(QPen(QColor(255, 255, 255, 35), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(QPointF(cx, cy), radius * 1.02, radius * 1.02)
 
@@ -242,7 +264,6 @@ class ObstacleRadarCanvas(QWidget):
                 f"{dist_lbl:.0f}",
             )
 
-        # Bearing ticks
         p.setPen(QPen(QColor(140, 160, 190, 90), 1.0))
         for deg in range(0, 360, 30):
             rad = math.radians(deg - 90.0)
@@ -257,7 +278,6 @@ class ObstacleRadarCanvas(QWidget):
         p.drawLine(int(cx - radius * 0.9), int(cy), int(cx + radius * 0.9), int(cy))
         p.drawLine(int(cx), int(cy - radius * 0.9), int(cx), int(cy + radius * 0.9))
 
-        # Idle sweep
         if not self._has_proximity:
             sweep_rad = math.radians(self._sweep_deg - 90.0)
             sweep_grad = QConicalGradient(cx, cy, self._sweep_deg - 90.0)
@@ -301,14 +321,12 @@ class ObstacleRadarCanvas(QWidget):
             p.setBrush(glow)
             p.drawEllipse(QRectF(hx - 5, hy - 5, 10, 10))
 
-        # North
         p.setPen(QColor(248, 113, 113, 230))
         f_n = QFont("Segoe UI", 9)
         f_n.setWeight(QFont.Weight.Bold)
         p.setFont(f_n)
         p.drawText(int(cx - 8), int(cy - radius + 8), 16, 14, int(Qt.AlignmentFlag.AlignCenter), "N")
 
-        # Vehicle
         tri_r = max(8.0, radius * 0.1)
         tri = QPolygonF(
             [
@@ -336,74 +354,81 @@ class ObstacleRadarCanvas(QWidget):
         )
 
 
-class _StripMetricCell(QWidget):
-    """Icon + value — same layout and typography as ``MapFooterTelemetryStrip`` cells."""
+class _MetricBlock(QWidget):
+    """Label + primary value + optional subtitle — one proximity readout column."""
 
-    def __init__(self, icon_kind: str, parent=None) -> None:
+    def __init__(self, title: str, *, subtitle: str = "", parent=None) -> None:
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(8)
-        self._icon = TelemetryStripIcon(icon_kind, self)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(1)
+
+        self._title = QLabel(title.upper())
+        self._title.setStyleSheet(_LABEL_QSS)
+        self._title.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
         self._val = QLabel("—")
-        self._val.setStyleSheet(TELEMETRY_STRIP_VALUE_STYLE)
-        self._val.setWordWrap(False)
-        self._val.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        )
-        lay.addWidget(self._icon, 0, Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(self._val, 1, Qt.AlignmentFlag.AlignVCenter)
+        self._val.setStyleSheet(_VALUE_QSS)
+        self._val.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
-    def set_value(self, text: str, *, alert: bool = False) -> None:
-        self._val.setText(text)
-        if alert:
-            self._val.setStyleSheet("color: #f87171; font-size: 15px; font-weight: 600;")
+        self._sub = QLabel(subtitle)
+        self._sub.setStyleSheet(_SUB_QSS)
+        self._sub.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self._sub.setVisible(bool(subtitle))
+
+        lay.addWidget(self._title)
+        lay.addWidget(self._val)
+        lay.addWidget(self._sub)
+
+    def set_reading(self, value: str, *, subtitle: str = "", alert: bool = False) -> None:
+        self._val.setText(value)
+        self._val.setStyleSheet(_VALUE_ALERT_QSS if alert else _VALUE_QSS)
+        if subtitle:
+            self._sub.setText(subtitle)
+            self._sub.setVisible(True)
         else:
-            self._val.setStyleSheet(TELEMETRY_STRIP_VALUE_STYLE)
+            self._sub.clear()
+            self._sub.setVisible(False)
 
 
-class _SensorSegment(QWidget):
-    """LiDAR / Radar / RF indicators — one equal-width column each."""
-
-    _FONT = QFont("Segoe UI", 11)
-    _FONT.setWeight(QFont.Weight.DemiBold)
-
-    _SEG_STYLE_IDLE = "color: #dce5f5; background: transparent; border: none;"
-    _SEG_STYLE_ON = (
-        "color: #ecfdf5; background: rgba(255, 255, 255, 0.08);"
-        " border: none; border-radius: 6px;"
-    )
+class _SensorPills(QWidget):
+    """Segmented LiDAR / Radar / RF selector — active source highlighted."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setStyleSheet("background: transparent; border: none;")
+        self.setObjectName("sensorPillTrack")
+        self.setStyleSheet(_PILL_TRACK_QSS)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(2)
+
         self._lidar = QLabel("LiDAR")
         self._radar = QLabel("Radar")
         self._rf = QLabel("RF")
         self._rf.setToolTip("Rangefinder")
-        text_h = int(QFontMetrics(self._FONT).height()) + 2
-        self.setMinimumHeight(text_h + 4)
+
+        pill_font = QFont("Segoe UI", 10)
+        pill_font.setWeight(QFont.Weight.DemiBold)
+        row_h = int(QFontMetrics(pill_font).height()) + 10
+        self.setFixedHeight(row_h + 6)
+
         for lb in (self._lidar, self._radar, self._rf):
-            lb.setFont(self._FONT)
+            lb.setFont(pill_font)
             lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lb.setMinimumHeight(text_h)
             lb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            lb.setMinimumHeight(row_h)
             lay.addWidget(lb, 1)
+
         self.set_active(None)
 
     def set_active(self, which: str | None) -> None:
         for key, lb in (("lidar", self._lidar), ("radar", self._radar), ("rf", self._rf)):
-            on = which == key
-            lb.setStyleSheet(self._SEG_STYLE_ON if on else self._SEG_STYLE_IDLE)
+            lb.setStyleSheet(_PILL_ON if which == key else _PILL_IDLE)
 
 
 class ObstacleRadarPanel(QFrame):
-    """Top-left map HUD — floating radar + labels (no card chrome; parity with compass / telemetry)."""
+    """Top-left map HUD — single card: radar + metrics + sensor pills + status."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -412,60 +437,85 @@ class ObstacleRadarPanel(QFrame):
         self.setAutoFillBackground(False)
         self.setStyleSheet("QFrame#obstacleRadarPanel { background: transparent; border: none; }")
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(8)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        self._radar = ObstacleRadarCanvas(self)
-        root.addWidget(self._radar, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        card = QFrame()
+        card.setObjectName("obstacleHudCard")
+        card.setStyleSheet(_CARD_QSS)
+        card.setFixedWidth(_CARD_WIDTH_PX)
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(8, 8, 8, 8)
+        card_lay.setSpacing(8)
 
-        metrics_strip = QFrame()
-        metrics_strip.setObjectName("obstacleTelemetryStrip")
-        metrics_strip.setStyleSheet(_TELEMETRY_STRIP_QSS)
-        metrics_strip.setFixedWidth(_STRIP_WIDTH_PX)
-        strip_lay = QVBoxLayout(metrics_strip)
-        strip_lay.setContentsMargins(10, 6, 10, 6)
-        strip_lay.setSpacing(6)
+        header = QLabel("PROXIMITY")
+        header_font = QFont("Segoe UI", 9)
+        header_font.setWeight(QFont.Weight.DemiBold)
+        header.setFont(header_font)
+        header.setStyleSheet(
+            "color: #9fb0cc; letter-spacing: 1px; background: transparent; border: none;"
+        )
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        card_lay.addWidget(header)
 
-        row_metrics = QHBoxLayout()
-        row_metrics.setSpacing(8)
-        self._cell_nearest = _StripMetricCell("corner")
-        self._cell_nearest.setToolTip("Nearest obstacle (LiDAR / Radar bins)")
-        self._cell_range = _StripMetricCell("alt")
-        self._cell_range.setToolTip("Rangefinder distance")
-        row_metrics.addWidget(self._cell_nearest, 1)
-        row_metrics.addWidget(self._cell_range, 1)
-        strip_lay.addLayout(row_metrics)
+        self._radar = ObstacleRadarCanvas(card)
+        radar_wrap = QWidget()
+        radar_wrap.setStyleSheet("background: transparent; border: none;")
+        radar_lay = QHBoxLayout(radar_wrap)
+        radar_lay.setContentsMargins(0, 0, 0, 0)
+        radar_lay.addStretch(1)
+        radar_lay.addWidget(self._radar)
+        radar_lay.addStretch(1)
+        card_lay.addWidget(radar_wrap)
 
-        # Sensor chips on their own row — do not share a row with status (216px caused overlap).
-        self._sensor_segment = _SensorSegment()
-        strip_lay.addWidget(self._sensor_segment)
+        divider = QFrame()
+        divider.setStyleSheet(_DIVIDER_QSS)
+        divider.setFixedHeight(1)
+        card_lay.addWidget(divider)
 
-        status_wrap = QWidget()
-        status_lay = QHBoxLayout(status_wrap)
-        status_lay.setContentsMargins(0, 0, 0, 0)
+        metrics = QGridLayout()
+        metrics.setHorizontalSpacing(12)
+        metrics.setVerticalSpacing(0)
+        self._metric_nearest = _MetricBlock("Nearest", subtitle="LiDAR / Radar")
+        self._metric_nearest.setToolTip("Shortest distance from proximity scan bins")
+        self._metric_range = _MetricBlock("Range", subtitle="Rangefinder")
+        self._metric_range.setToolTip("Single-beam rangefinder distance")
+        metrics.addWidget(self._metric_nearest, 0, 0)
+        metrics.addWidget(self._metric_range, 0, 1)
+        metrics.setColumnStretch(0, 1)
+        metrics.setColumnStretch(1, 1)
+        card_lay.addLayout(metrics)
+
+        self._sensor_pills = _SensorPills()
+        card_lay.addWidget(self._sensor_pills)
+
+        status_row = QWidget()
+        status_row.setStyleSheet("background: transparent; border: none;")
+        status_lay = QHBoxLayout(status_row)
+        status_lay.setContentsMargins(2, 0, 2, 0)
         status_lay.setSpacing(6)
         self._status_dot = QLabel()
-        self._status_dot.setFixedSize(7, 7)
+        self._status_dot.setFixedSize(8, 8)
         self._status_dot.setStyleSheet("background: #6b7280; border-radius: 4px;")
-        self._lbl_status = QLabel("Waiting")
-        status_font = QFont("Segoe UI", 11)
+        self._lbl_status = QLabel("Waiting for sensors")
+        status_font = QFont("Segoe UI", 10)
         status_font.setWeight(QFont.Weight.DemiBold)
         self._lbl_status.setFont(status_font)
         self._lbl_status.setStyleSheet("color: #9fb0cc; background: transparent; border: none;")
-        self._lbl_status.setMinimumHeight(int(QFontMetrics(status_font).height()) + 2)
         self._lbl_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._lbl_status.setMinimumWidth(0)
         status_lay.addWidget(self._status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
         status_lay.addWidget(self._lbl_status, 1, Qt.AlignmentFlag.AlignVCenter)
-        strip_lay.addWidget(status_wrap)
+        card_lay.addWidget(status_row)
 
-        root.addWidget(metrics_strip, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        outer.addWidget(card)
 
         self._obstacle = ObstacleDistanceState()
         self._rangefinder = DistanceSensorState()
         self._proximity_stream_seen = False
         self._rangefinder_stream_seen = False
+        self._active_sensor: str | None = None
 
         self._stale_timer = QTimer(self)
         self._stale_timer.setInterval(500)
@@ -476,9 +526,8 @@ class ObstacleRadarPanel(QFrame):
 
     @staticmethod
     def _panel_height_px() -> int:
-        # Radar + 3-row telemetry strip (metrics, sensor chips, status).
-        strip_h = 6 + 6 + 32 + 4 + 22 + 4 + 20  # margins + row1 + gaps + row2 + row3
-        return _RADAR_PLOT_PX + 8 + strip_h
+        # Card: header(16) + radar(184) + divider + metrics(~48) + pills(~32) + status(~20) + margins/spacing
+        return 8 + 16 + 8 + _RADAR_PLOT_PX + 8 + 1 + 8 + 48 + 8 + 32 + 8 + 20 + 8
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(_PANEL_WIDTH_PX, self._panel_height_px())
@@ -491,12 +540,75 @@ class ObstacleRadarPanel(QFrame):
             "idle": "#6b7280",
             "live": "#34d399",
             "stale": "#fbbf24",
+            "alert": "#f87171",
         }
         c = colors.get(mode, colors["idle"])
-        self._status_dot.setStyleSheet(f"background: {c}; border-radius: 4px; min-width:8px; max-width:8px;")
+        self._status_dot.setStyleSheet(
+            f"background: {c}; border-radius: 4px; min-width:8px; max-width:8px;"
+        )
+
+    def _sync_status_line(self) -> None:
+        now = time.monotonic()
+        obs_age = now - float(self._obstacle.updated_mono or 0.0)
+        rf_age = now - float(self._rangefinder.updated_mono or 0.0)
+        obs_fresh = self._obstacle.updated_mono > 0 and obs_age <= 2.5
+        rf_fresh = self._rangefinder.updated_mono > 0 and rf_age <= 2.5
+
+        if not self._proximity_stream_seen and not self._rangefinder_stream_seen:
+            self._lbl_status.setText("Waiting for sensors")
+            self._set_status_mode("idle")
+            return
+
+        if self._obstacle.updated_mono > 0 and self._rangefinder.updated_mono > 0:
+            if obs_age > 2.5 and rf_age > 2.5:
+                self._lbl_status.setText("Sensor data stale")
+                self._set_status_mode("stale")
+                return
+
+        nearest = self._obstacle.nearest_m() if obs_fresh else None
+        rf = self._rangefinder.current_distance_m if rf_fresh else None
+        bins = self._obstacle.active_bin_count() if obs_fresh else 0
+
+        if nearest is not None and rf is not None:
+            if nearest <= rf:
+                fam = _sensor_family_label(self._obstacle.sensor_type)
+                self._lbl_status.setText(f"{fam} · {bins} hit{'s' if bins != 1 else ''}")
+            else:
+                ori = _orientation_label(self._rangefinder.orientation)
+                self._lbl_status.setText(f"Rangefinder · {ori}")
+            close = min(nearest, rf) < 2.0
+            self._set_status_mode("alert" if close else "live")
+            return
+
+        if nearest is not None:
+            fam = _sensor_family_label(self._obstacle.sensor_type)
+            if bins > 0:
+                self._lbl_status.setText(f"{fam} · {bins} hit{'s' if bins != 1 else ''}")
+                close = nearest < max(2.0, self._obstacle.max_distance_m * 0.2)
+                self._set_status_mode("alert" if close else "live")
+            else:
+                self._lbl_status.setText("Path clear")
+                self._set_status_mode("live")
+            return
+
+        if rf is not None and rf >= 0:
+            ori = _orientation_label(self._rangefinder.orientation)
+            self._lbl_status.setText(f"Rangefinder · {ori}")
+            close = rf < 2.0
+            self._set_status_mode("alert" if close else "live")
+            return
+
+        if (self._obstacle.updated_mono > 0 and obs_age > 2.5) or (
+            self._rangefinder.updated_mono > 0 and rf_age > 2.5
+        ):
+            self._lbl_status.setText("Sensor data stale")
+            self._set_status_mode("stale")
+            return
+
+        self._lbl_status.setText("Listening")
+        self._set_status_mode("live")
 
     def set_vehicle_heading_deg(self, heading_deg: float) -> None:
-        # Reserved for map-heading sync on the polar plot.
         del heading_deg
 
     def set_obstacle_distance(self, payload: dict) -> None:
@@ -523,22 +635,21 @@ class ObstacleRadarPanel(QFrame):
         self._radar.set_obstacle_state(st)
 
         nearest = st.nearest_m()
+        fam = _sensor_family_label(st.sensor_type)
         if nearest is not None:
             close = nearest < max(2.0, st.max_distance_m * 0.2)
-            self._cell_nearest.set_value(f"{nearest:.1f} m", alert=close)
+            self._metric_nearest.set_reading(f"{nearest:.1f} m", subtitle=fam, alert=close)
         else:
-            self._cell_nearest.set_value("—")
+            self._metric_nearest.set_reading("—", subtitle=fam)
 
-        bins = st.active_bin_count()
-        fam = _sensor_family_label(st.sensor_type)
-        if bins > 0:
-            self._set_status_mode("live")
-            self._lbl_status.setText(f"{bins} sectors")
+        if st.sensor_type == _SENSOR_RADAR:
+            self._set_sensor_active("radar")
+        elif st.sensor_type == _SENSOR_LASER:
+            self._set_sensor_active("lidar")
         else:
-            self._set_status_mode("live")
-            self._lbl_status.setText("Clear")
+            self._set_sensor_active("lidar")
 
-        self._set_sensor_active(st.sensor_type)
+        self._sync_status_line()
 
     def set_distance_sensor(self, payload: dict) -> None:
         cur = payload.get("current_distance_m")
@@ -558,45 +669,31 @@ class ObstacleRadarPanel(QFrame):
         self._rangefinder = st
         self._rangefinder_stream_seen = True
 
+        ori = _orientation_label(st.orientation)
         if cur_m is not None and cur_m >= 0:
-            ori = _orientation_label(st.orientation)
-            self._cell_range.set_value(f"{cur_m:.1f} m")
-            self._cell_range.setToolTip(f"Rangefinder · {ori}")
-            # Status is short — numeric distance is already in the range cell above.
-            self._lbl_status.setText(ori)
-            self._set_status_mode("live")
+            close = cur_m < 2.0
+            self._metric_range.set_reading(f"{cur_m:.1f} m", subtitle=ori, alert=close)
         else:
-            self._cell_range.set_value("—")
+            self._metric_range.set_reading("—", subtitle="Rangefinder")
 
-        self._set_sensor_active(st.sensor_type, rangefinder=True)
+        self._set_sensor_active("rf")
+        self._sync_status_line()
 
-    def _set_sensor_active(self, sensor_type: int, *, rangefinder: bool = False) -> None:
-        if rangefinder:
-            self._sensor_segment.set_active("rf")
-        elif sensor_type == _SENSOR_RADAR:
-            self._sensor_segment.set_active("radar")
-        elif sensor_type == _SENSOR_LASER:
-            self._sensor_segment.set_active("lidar")
-        else:
-            self._sensor_segment.set_active("rf")
+    def _set_sensor_active(self, which: str | None) -> None:
+        self._active_sensor = which
+        self._sensor_pills.set_active(which)
 
     def _refresh_stale_ui(self) -> None:
         now = time.monotonic()
         obs_age = now - float(self._obstacle.updated_mono or 0.0)
         rf_age = now - float(self._rangefinder.updated_mono or 0.0)
         if self._obstacle.updated_mono <= 0 and self._rangefinder.updated_mono <= 0:
-            self._set_status_mode("idle")
-            if not self._proximity_stream_seen and not self._rangefinder_stream_seen:
-                self._lbl_status.setText("Waiting")
             return
-        if obs_age > 2.5 and rf_age > 2.5:
-            self._lbl_status.setText("Stale")
-            self._set_status_mode("stale")
+        if obs_age > 2.5:
             self._radar.set_obstacle_state(self._obstacle)
         elif obs_age <= 2.5:
             self._radar.set_obstacle_state(self._obstacle)
-            if self._obstacle.active_bin_count() > 0:
-                self._set_status_mode("live")
+        self._sync_status_line()
 
     def summary_text(self) -> tuple[str, str]:
         nearest = self._obstacle.nearest_m()
