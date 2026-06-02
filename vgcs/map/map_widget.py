@@ -3256,6 +3256,7 @@ class MapWidget(QWidget):
                 pass
             try:
                 self._obstacle_radar.hide()
+                self._obstacle_radar.notify_link_connected(False)
             except Exception:
                 pass
             # Companion RTSP (192.168.144.x) is independent of the serial MAVLink link — do not
@@ -3283,6 +3284,7 @@ class MapWidget(QWidget):
                 self._native_telemetry.show()
                 try:
                     self._obstacle_radar.show()
+                    self._obstacle_radar.notify_link_connected(True)
                 except Exception:
                     pass
             QTimer.singleShot(0, self._layout_native_hud)
