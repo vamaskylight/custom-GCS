@@ -364,9 +364,9 @@ class _StripMetricCell(QWidget):
 
 
 class _SensorSegment(QWidget):
-    """Unified segmented sensor indicators — no chrome (matches map footer HUD)."""
+    """LiDAR / Radar / RF indicators — one equal-width column each."""
 
-    _FONT = QFont("Segoe UI", 12)
+    _FONT = QFont("Segoe UI", 11)
     _FONT.setWeight(QFont.Weight.DemiBold)
 
     _SEG_STYLE_IDLE = "color: #dce5f5; background: transparent; border: none;"
@@ -380,20 +380,20 @@ class _SensorSegment(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet("background: transparent; border: none;")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 2, 0, 2)
-        lay.setSpacing(6)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
         self._lidar = QLabel("LiDAR")
         self._radar = QLabel("Radar")
         self._rf = QLabel("RF")
         self._rf.setToolTip("Rangefinder")
-        text_h = int(QFontMetrics(self._FONT).height()) + 4
+        text_h = int(QFontMetrics(self._FONT).height()) + 2
         self.setMinimumHeight(text_h + 4)
         for lb in (self._lidar, self._radar, self._rf):
             lb.setFont(self._FONT)
             lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lb.setMinimumHeight(text_h)
-            lb.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum)
-            lay.addWidget(lb)
+            lb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            lay.addWidget(lb, 1)
         self.set_active(None)
 
     def set_active(self, which: str | None) -> None:
@@ -430,18 +430,17 @@ class ObstacleRadarPanel(QFrame):
         row_metrics = QHBoxLayout()
         row_metrics.setSpacing(8)
         self._cell_nearest = _StripMetricCell("corner")
-        self._cell_nearest.setToolTip("Nearest obstacle")
+        self._cell_nearest.setToolTip("Nearest obstacle (LiDAR / Radar bins)")
         self._cell_range = _StripMetricCell("alt")
         self._cell_range.setToolTip("Rangefinder distance")
         row_metrics.addWidget(self._cell_nearest, 1)
         row_metrics.addWidget(self._cell_range, 1)
         strip_lay.addLayout(row_metrics)
 
-        row_sensors = QHBoxLayout()
-        row_sensors.setSpacing(8)
-        row_sensors.setContentsMargins(0, 0, 0, 0)
+        # Sensor chips on their own row — do not share a row with status (216px caused overlap).
         self._sensor_segment = _SensorSegment()
-        row_sensors.addWidget(self._sensor_segment, 1)
+        strip_lay.addWidget(self._sensor_segment)
+
         status_wrap = QWidget()
         status_lay = QHBoxLayout(status_wrap)
         status_lay.setContentsMargins(0, 0, 0, 0)
@@ -450,15 +449,16 @@ class ObstacleRadarPanel(QFrame):
         self._status_dot.setFixedSize(7, 7)
         self._status_dot.setStyleSheet("background: #6b7280; border-radius: 4px;")
         self._lbl_status = QLabel("Waiting")
-        status_font = QFont("Segoe UI", 12)
+        status_font = QFont("Segoe UI", 11)
         status_font.setWeight(QFont.Weight.DemiBold)
         self._lbl_status.setFont(status_font)
-        self._lbl_status.setStyleSheet("color: #dce5f5; background: transparent; border: none;")
+        self._lbl_status.setStyleSheet("color: #9fb0cc; background: transparent; border: none;")
         self._lbl_status.setMinimumHeight(int(QFontMetrics(status_font).height()) + 2)
+        self._lbl_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._lbl_status.setMinimumWidth(0)
         status_lay.addWidget(self._status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
-        status_lay.addWidget(self._lbl_status, 0, Qt.AlignmentFlag.AlignVCenter)
-        row_sensors.addWidget(status_wrap, 0, Qt.AlignmentFlag.AlignVCenter)
-        strip_lay.addLayout(row_sensors)
+        status_lay.addWidget(self._lbl_status, 1, Qt.AlignmentFlag.AlignVCenter)
+        strip_lay.addWidget(status_wrap)
 
         root.addWidget(metrics_strip, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
 
@@ -476,8 +476,8 @@ class ObstacleRadarPanel(QFrame):
 
     @staticmethod
     def _panel_height_px() -> int:
-        # Radar + 2-row telemetry strip (metrics, then sensors + status).
-        strip_h = 6 + 6 + 32 + 6 + 30  # margins + row1 + gap + row2 (tall enough for 12px glyphs)
+        # Radar + 3-row telemetry strip (metrics, sensor chips, status).
+        strip_h = 6 + 6 + 32 + 4 + 22 + 4 + 20  # margins + row1 + gaps + row2 + row3
         return _RADAR_PLOT_PX + 8 + strip_h
 
     def sizeHint(self) -> QSize:  # noqa: N802
@@ -561,7 +561,9 @@ class ObstacleRadarPanel(QFrame):
         if cur_m is not None and cur_m >= 0:
             ori = _orientation_label(st.orientation)
             self._cell_range.set_value(f"{cur_m:.1f} m")
-            self._lbl_status.setText(f"RF {ori} {cur_m:.1f}m")
+            self._cell_range.setToolTip(f"Rangefinder · {ori}")
+            # Status is short — numeric distance is already in the range cell above.
+            self._lbl_status.setText(ori)
             self._set_status_mode("live")
         else:
             self._cell_range.set_value("—")
