@@ -371,6 +371,7 @@ class _MetricBlock(QWidget):
         self._val = QLabel("—")
         self._val.setStyleSheet(_VALUE_QSS)
         self._val.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self._val.setMinimumHeight(20)
 
         self._sub = QLabel(subtitle)
         self._sub.setStyleSheet(_SUB_QSS)
@@ -445,6 +446,10 @@ class ObstacleRadarPanel(QFrame):
         card.setObjectName("obstacleHudCard")
         card.setStyleSheet(_CARD_QSS)
         card.setFixedWidth(_CARD_WIDTH_PX)
+        card.setToolTip(
+            "MAVLink OBSTACLE_DISTANCE (LiDAR/Radar) and DISTANCE_SENSOR (rangefinder). "
+            "Values appear when the autopilot publishes sensor messages."
+        )
         card_lay = QVBoxLayout(card)
         card_lay.setContentsMargins(8, 8, 8, 8)
         card_lay.setSpacing(8)
@@ -516,6 +521,7 @@ class ObstacleRadarPanel(QFrame):
         self._proximity_stream_seen = False
         self._rangefinder_stream_seen = False
         self._active_sensor: str | None = None
+        self._panel_connected_mono = 0.0
 
         self._stale_timer = QTimer(self)
         self._stale_timer.setInterval(500)
@@ -555,7 +561,12 @@ class ObstacleRadarPanel(QFrame):
         rf_fresh = self._rangefinder.updated_mono > 0 and rf_age <= 2.5
 
         if not self._proximity_stream_seen and not self._rangefinder_stream_seen:
-            self._lbl_status.setText("Waiting for sensors")
+            if self._panel_connected_mono <= 0:
+                self._lbl_status.setText("Waiting for sensors")
+            elif time.monotonic() - self._panel_connected_mono > 8.0:
+                self._lbl_status.setText("No sensor MAVLink yet")
+            else:
+                self._lbl_status.setText("Listening…")
             self._set_status_mode("idle")
             return
 
@@ -607,6 +618,18 @@ class ObstacleRadarPanel(QFrame):
 
         self._lbl_status.setText("Listening")
         self._set_status_mode("live")
+
+    def notify_link_connected(self, connected: bool) -> None:
+        if connected:
+            self._panel_connected_mono = time.monotonic()
+        else:
+            self._panel_connected_mono = 0.0
+            self._proximity_stream_seen = False
+            self._rangefinder_stream_seen = False
+            self._metric_nearest.set_reading("—", subtitle="LiDAR / Radar")
+            self._metric_range.set_reading("—", subtitle="Rangefinder")
+            self._sensor_pills.set_active(None)
+            self._sync_status_line()
 
     def set_vehicle_heading_deg(self, heading_deg: float) -> None:
         del heading_deg

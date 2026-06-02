@@ -15,8 +15,15 @@ from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 from pymavlink import mavutil
+from pymavlink.dialects.v20 import ardupilotmega as mav_apm
 
 from vgcs.skydroid.adapter import GimbalStatus
+
+# ArduPilot dialect IDs (default pymavlink dialect omits OBSTACLE_DISTANCE).
+_MAV_MSG_ID_OBSTACLE_DISTANCE = int(mav_apm.MAVLINK_MSG_ID_OBSTACLE_DISTANCE)
+_MAV_MSG_ID_DISTANCE_SENSOR = int(mav_apm.MAVLINK_MSG_ID_DISTANCE_SENSOR)
+_MAV_MSG_ID_RANGEFINDER = int(mav_apm.MAVLINK_MSG_ID_RANGEFINDER)
+_PROX_STREAM_RESEND_S = 20.0
 
 
 class MavlinkThread(QThread):
@@ -65,8 +72,11 @@ class MavlinkThread(QThread):
             "OPEN_DRONE_ID": 0.25,
             "OBSTACLE_DISTANCE": 0.1,
             "DISTANCE_SENSOR": 0.15,
+            "RANGEFINDER": 0.15,
         }
         self._last_hb_log_mono = 0.0
+        self._prox_streams_last_request_mono = 0.0
+        self._proximity_log_once: set[str] = set()
         self._gimbal_lock = threading.Lock()
         self._gimbal_status = GimbalStatus()
 
@@ -214,6 +224,8 @@ class MavlinkThread(QThread):
 
     def run(self) -> None:
         self._running = True
+        self._proximity_log_once.clear()
+        self._prox_streams_last_request_mono = 0.0
         raw = self._connection_string.strip()
 
         # PyMAVLink often expects Windows serial as:
@@ -253,7 +265,7 @@ class MavlinkThread(QThread):
                 self.log_line.emit(f"Using: {conn}")
 
             try:
-                kwargs = {"autoreconnect": True}
+                kwargs = {"autoreconnect": True, "dialect": "ardupilotmega"}
                 if baud is not None:
                     kwargs["baud"] = baud
                 self._master = mavutil.mavlink_connection(conn, **kwargs)
@@ -382,12 +394,21 @@ class MavlinkThread(QThread):
                             "mode_text": mode_text,
                         },
                     )
-                if not self._streams_requested and int(self._target_sysid) > 0:
-                    self._streams_requested = True
-                    try:
-                        self._request_telemetry_streams()
-                    except Exception:
-                        pass
+                if int(self._target_sysid) > 0:
+                    now_req = time.monotonic()
+                    if not self._streams_requested:
+                        self._streams_requested = True
+                        try:
+                            self._request_telemetry_streams()
+                        except Exception:
+                            pass
+                        self._prox_streams_last_request_mono = now_req
+                    elif now_req - float(self._prox_streams_last_request_mono) >= _PROX_STREAM_RESEND_S:
+                        try:
+                            self._request_proximity_streams()
+                        except Exception:
+                            pass
+                        self._prox_streams_last_request_mono = now_req
             elif msg_type == "MISSION_CURRENT":
                 self._emit_telemetry_payload(
                     "MISSION_CURRENT",
@@ -530,35 +551,52 @@ class MavlinkThread(QThread):
                     except (IndexError, TypeError, ValueError):
                         distances_cm.append(0xFFFF)
                 increment = float(getattr(msg, "increment", 0) or 0)
-                angle_off = float(getattr(msg, "angle_offset", 0) or 0) / 100.0
-                self._emit_telemetry_payload(
-                    "OBSTACLE_DISTANCE",
-                    {
-                        "sensor_type": int(getattr(msg, "type", 0) or 0),
-                        "distances_cm": distances_cm,
-                        "increment_deg": increment if increment > 0 else 5.0,
-                        "angle_offset_deg": angle_off,
-                        "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
-                        "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
-                        "frame": int(getattr(msg, "frame", 0) or 0),
-                    },
-                )
+                increment_f = float(getattr(msg, "increment_f", 0) or 0)
+                increment_deg = increment_f if increment_f > 0 else (increment if increment > 0 else 5.0)
+                angle_raw = float(getattr(msg, "angle_offset", 0) or 0)
+                # ArduPilot v2: degrees; legacy builds used centidegrees.
+                angle_off = angle_raw / 100.0 if abs(angle_raw) > 360.0 else angle_raw
+                sensor_type = int(getattr(msg, "sensor_type", getattr(msg, "type", 0)) or 0)
+                payload = {
+                    "sensor_type": sensor_type,
+                    "distances_cm": distances_cm,
+                    "increment_deg": increment_deg,
+                    "angle_offset_deg": angle_off,
+                    "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
+                    "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
+                    "frame": int(getattr(msg, "frame", 0) or 0),
+                }
+                self._log_proximity_once(msg_type, payload)
+                self._emit_telemetry_payload("OBSTACLE_DISTANCE", payload)
             elif msg_type == "DISTANCE_SENSOR":
                 cur_cm = int(getattr(msg, "current_distance", 0xFFFF) or 0xFFFF)
                 cur_m: float | None = None
                 if 0 < cur_cm < 0xFFFF:
                     cur_m = float(cur_cm) / 100.0
-                self._emit_telemetry_payload(
-                    "DISTANCE_SENSOR",
-                    {
-                        "sensor_type": int(getattr(msg, "type", 0) or 0),
-                        "orientation": int(getattr(msg, "orientation", 0) or 0),
-                        "current_distance_m": cur_m,
-                        "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
-                        "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
-                        "id": int(getattr(msg, "id", 0) or 0),
-                    },
-                )
+                payload = {
+                    "sensor_type": int(getattr(msg, "type", 0) or 0),
+                    "orientation": int(getattr(msg, "orientation", 0) or 0),
+                    "current_distance_m": cur_m,
+                    "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
+                    "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
+                    "id": int(getattr(msg, "id", 0) or 0),
+                }
+                self._log_proximity_once(msg_type, payload)
+                self._emit_telemetry_payload("DISTANCE_SENSOR", payload)
+            elif msg_type == "RANGEFINDER":
+                dist_raw = float(getattr(msg, "distance", 0.0) or 0.0)
+                cur_m = dist_raw if dist_raw > 0 else None
+                payload = {
+                    "sensor_type": int(mav_apm.MAV_DISTANCE_SENSOR_LASER),
+                    "orientation": int(mav_apm.MAV_SENSOR_ROTATION_PITCH_270),
+                    "current_distance_m": cur_m,
+                    "min_distance_m": 0.0,
+                    "max_distance_m": 30.0,
+                    "id": 0,
+                    "legacy_rangefinder": True,
+                }
+                self._log_proximity_once(msg_type, payload)
+                self._emit_telemetry_payload("DISTANCE_SENSOR", payload)
             elif msg_type.startswith("OPEN_DRONE_ID_"):
                 payload: dict[str, object] = {}
                 try:
@@ -881,6 +919,58 @@ class MavlinkThread(QThread):
         except Exception:
             pass
 
+    def _log_proximity_once(self, msg_type: str, payload: dict) -> None:
+        key = str(msg_type)
+        if key in self._proximity_log_once:
+            return
+        self._proximity_log_once.add(key)
+        if key == "OBSTACLE_DISTANCE":
+            bins = sum(
+                1
+                for d in payload.get("distances_cm") or []
+                if isinstance(d, int) and 0 < d < 0xFFFF
+            )
+            self.log_line.emit(f"Proximity: {key} ({bins} active bins)")
+        elif key in ("DISTANCE_SENSOR", "RANGEFINDER"):
+            cur = payload.get("current_distance_m")
+            self.log_line.emit(
+                f"Proximity: {key} range={cur if cur is not None else '—'} m"
+            )
+        else:
+            self.log_line.emit(f"Proximity: {key} active")
+
+    def _request_proximity_streams(self) -> None:
+        """Re-request LiDAR / rangefinder MAVLink (safe to call periodically)."""
+        if self._master is None:
+            return
+        self._sync_link_targets()
+        ts = int(self._target_sysid)
+        tc = int(self._target_compid)
+        hz = 5
+        prox_interval_us = int(1_000_000 / max(1, hz))
+        for msg_id in (
+            _MAV_MSG_ID_OBSTACLE_DISTANCE,
+            _MAV_MSG_ID_DISTANCE_SENSOR,
+            _MAV_MSG_ID_RANGEFINDER,
+        ):
+            try:
+                self._master.mav.command_long_send(
+                    ts,
+                    tc,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    float(msg_id),
+                    float(prox_interval_us),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+            except Exception:
+                pass
+
     def _request_telemetry_streams(self) -> None:
         """Ask the vehicle for telemetry needed by VGCS UI.
 
@@ -925,8 +1015,19 @@ class MavlinkThread(QThread):
                 max(1, min(2, hz)),
                 1,
             )
+            # Rangefinder / raw sensors (DISTANCE_SENSOR, legacy RANGEFINDER on ArduPilot).
+            try:
+                self._master.mav.request_data_stream_send(
+                    ts,
+                    tc,
+                    mavutil.mavlink.MAV_DATA_STREAM_RAW_SENSORS,
+                    hz,
+                    1,
+                )
+            except Exception:
+                pass
             self.log_line.emit(
-                f"Requested MAV_DATA_STREAM_POSITION/EXTRA1 @ {hz} Hz (+EXT_STATUS/EXTRA2 @ {max(1, min(2, hz))} Hz)"
+                f"Requested MAV_DATA_STREAM_POSITION/EXTRA1 @ {hz} Hz (+EXT_STATUS/EXTRA2/RAW_SENSORS @ {max(1, min(2, hz))} Hz)"
             )
         except Exception as e:
             self.log_line.emit(f"request_data_stream_send failed: {e}")
@@ -1061,31 +1162,10 @@ class MavlinkThread(QThread):
                     )
                 except Exception:
                     pass
-            prox_interval_us = int(1_000_000 / max(1, hz))
-            for msg_id_name in (
-                "MAVLINK_MSG_ID_OBSTACLE_DISTANCE",
-                "MAVLINK_MSG_ID_DISTANCE_SENSOR",
-            ):
-                msg_id = getattr(mavutil.mavlink, msg_id_name, None)
-                if msg_id is None:
-                    continue
-                try:
-                    self._master.mav.command_long_send(
-                        ts,
-                        tc,
-                        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                        0,
-                        float(msg_id),
-                        float(prox_interval_us),
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                    )
-                except Exception:
-                    pass
+            self._request_proximity_streams()
+            self.log_line.emit(
+                "Requested proximity streams: OBSTACLE_DISTANCE, DISTANCE_SENSOR, RANGEFINDER @ 5 Hz"
+            )
         except Exception:
             pass
 
