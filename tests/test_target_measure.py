@@ -191,6 +191,39 @@ def test_multi_height_pillar_rows_match_bottom_width():
     assert abs(d_top - d_bottom) < 1.5
 
 
+def test_vikas_log_pair_near_four_metres():
+    """Field log: map ~2.8 m chord; tape on opening ~4 m."""
+    rows = [
+        {
+            "video_x_norm": 0.16928721174004194,
+            "video_y_norm": 0.27884615384615385,
+            "geo_range_m": 37.0,
+            "geo_bearing_deg": 333.0,
+            "geo_depression_deg": 39.0,
+            "target_lat": 20.4457752219297,
+            "target_lon": 72.86313429502887,
+            "rangefinder_down_m": 31.0,
+            "kind": "video_mark",
+        },
+        {
+            "video_x_norm": 0.690251572327044,
+            "video_y_norm": 0.2724358974358974,
+            "geo_range_m": 34.6,
+            "geo_bearing_deg": 16.0,
+            "geo_depression_deg": 42.0,
+            "target_lat": 20.44575501266942,
+            "target_lon": 72.86315040488074,
+            "rangefinder_down_m": 31.0,
+            "kind": "video_mark",
+        },
+    ]
+    from vgcs.observe.target_measure import video_facade_width_m
+
+    d = video_facade_width_m(rows[0], rows[1], hfov_deg=62.0)
+    assert d is not None
+    assert 3.6 <= d <= 4.6
+
+
 def test_video_fallback_when_geo_insufficient():
     rows = [
         {
