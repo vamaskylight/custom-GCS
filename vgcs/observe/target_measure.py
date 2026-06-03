@@ -113,6 +113,197 @@ def video_mark_span_norm(x1: float, y1: float, x2: float, y2: float) -> float:
     return math.hypot(float(x2) - float(x1), float(y2) - float(y1))
 
 
+def marks_same_height_band(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    max_dy_norm: float = 0.20,
+) -> bool:
+    """True when two video clicks are on the same horizontal band (e.g. pillar L/R)."""
+    ya = row_a.get("video_y_norm")
+    yb = row_b.get("video_y_norm")
+    if ya is None or yb is None:
+        return True
+    try:
+        return abs(float(yb) - float(ya)) <= float(max_dy_norm)
+    except (TypeError, ValueError):
+        return True
+
+
+def session_peak_geo_range_m(rows: list[dict[str, Any]]) -> float:
+    """Largest drone→target ground range in this OBSERVE session (reference for facade width)."""
+    peak = 0.0
+    for row in rows:
+        try:
+            r = float(row.get("geo_range_m") or 0)
+        except (TypeError, ValueError):
+            continue
+        if r > peak:
+            peak = r
+    return peak
+
+
+def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:
+    vx = row.get("video_x_norm")
+    vy = row.get("video_y_norm")
+    if vx is None or vy is None:
+        return None
+    try:
+        return float(vx), float(vy)
+    except (TypeError, ValueError):
+        return None
+
+
+def cluster_observations_by_video_y(
+    rows: list[dict[str, Any]],
+    *,
+    max_dy_norm: float = 0.18,
+) -> list[list[dict[str, Any]]]:
+    """Group video marks into horizontal bands (same pillar height)."""
+    clusters: list[list[dict[str, Any]]] = []
+    for row in rows:
+        if observation_target_latlon(row) is None:
+            continue
+        xy = _video_xy(row)
+        if xy is None:
+            continue
+        _, y = xy
+        placed = False
+        for cluster in clusters:
+            ref = _video_xy(cluster[0])
+            if ref is None:
+                continue
+            if abs(y - ref[1]) <= float(max_dy_norm):
+                cluster.append(row)
+                placed = True
+                break
+        if not placed:
+            clusters.append([row])
+    return clusters
+
+
+def session_facade_reference_range_m(
+    rows: list[dict[str, Any]],
+    *,
+    hfov_deg: float = 62.0,
+    max_dy_norm: float = 0.18,
+) -> float:
+    """
+    Best horizontal range for facade width from any good L–R pair in the session.
+
+    When the lower row measured ~4.2 m correctly, upper rows reuse this implied range
+    instead of underestimated per-click geo_range_m.
+    """
+    hfov_rad = math.radians(float(hfov_deg))
+    ref = session_peak_geo_range_m(rows)
+    peak = ref
+    for cluster in cluster_observations_by_video_y(rows, max_dy_norm=max_dy_norm):
+        if len(cluster) < 2:
+            continue
+        ordered = sorted(
+            cluster,
+            key=lambda r: float((_video_xy(r) or (0.0, 0.0))[0]),
+        )
+        left, right = ordered[0], ordered[-1]
+        if left is right:
+            continue
+        xy_l, xy_r = _video_xy(left), _video_xy(right)
+        if xy_l is None or xy_r is None:
+            continue
+        dx = abs(xy_r[0] - xy_l[0])
+        if dx < 0.03:
+            continue
+        angle_h = dx * hfov_rad
+        d = segment_distance_between_rows(
+            left,
+            right,
+            hfov_deg=hfov_deg,
+            session_peak_range_m=peak,
+            facade_reference_range_m=ref,
+            require_same_height_band=False,
+            calibrating_range_only=True,
+        )
+        if d is not None and angle_h > 1e-4 and d > 0.5:
+            ref = max(ref, float(d) / angle_h)
+    return ref
+
+
+def band_width_partner_row(
+    rows: list[dict[str, Any]],
+    row: dict[str, Any],
+    *,
+    max_dy_norm: float = 0.18,
+    min_dx_norm: float = 0.04,
+) -> dict[str, Any] | None:
+    """Other edge on the same horizontal band (pillar L↔R), not merely the previous click."""
+    xy = _video_xy(row)
+    if xy is None:
+        return None
+    x, y = xy
+    best: dict[str, Any] | None = None
+    best_dx = 0.0
+    for other in rows:
+        if other is row:
+            continue
+        if observation_target_latlon(other) is None:
+            continue
+        oxy = _video_xy(other)
+        if oxy is None:
+            continue
+        ox, oy = oxy
+        if abs(oy - y) > float(max_dy_norm):
+            continue
+        dx = abs(ox - x)
+        if dx < float(min_dx_norm):
+            continue
+        if dx > best_dx:
+            best_dx = dx
+            best = other
+    return best
+
+
+def observation_facade_video_segments(
+    rows: list[dict[str, Any]],
+    *,
+    hfov_deg: float = 62.0,
+    max_dy_norm: float = 0.18,
+) -> list[tuple[float, float, float, float, str]]:
+    """One measure line per height band: leftmost ↔ rightmost mark (pillar gap width)."""
+    out: list[tuple[float, float, float, float, str]] = []
+    peak = session_peak_geo_range_m(rows)
+    facade_ref = session_facade_reference_range_m(
+        rows, hfov_deg=hfov_deg, max_dy_norm=max_dy_norm
+    )
+    for cluster in cluster_observations_by_video_y(rows, max_dy_norm=max_dy_norm):
+        if len(cluster) < 2:
+            continue
+        ordered = sorted(
+            cluster,
+            key=lambda r: float((_video_xy(r) or (0.0, 0.0))[0]),
+        )
+        left, right = ordered[0], ordered[-1]
+        if left is right:
+            continue
+        xy_l, xy_r = _video_xy(left), _video_xy(right)
+        if xy_l is None or xy_r is None:
+            continue
+        d = segment_distance_between_rows(
+            left,
+            right,
+            hfov_deg=hfov_deg,
+            session_peak_range_m=peak,
+            facade_reference_range_m=facade_ref,
+            require_same_height_band=False,
+        )
+        if d is None:
+            continue
+        pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
+        label = format_target_segment_label(d, video_span_norm=pix)
+        if label:
+            out.append((xy_l[0], xy_l[1], xy_r[0], xy_r[1], label))
+    return out
+
+
 def _segment_scale_short() -> float:
     try:
         from PySide6.QtCore import QSettings
@@ -129,14 +320,22 @@ def segment_distance_between_rows(
     *,
     hfov_deg: float = 62.0,
     vfov_deg: float | None = None,
+    session_peak_range_m: float | None = None,
+    facade_reference_range_m: float | None = None,
+    require_same_height_band: bool = True,
+    calibrating_range_only: bool = False,
 ) -> float | None:
     """
     Ground separation between two observation marks.
 
     Prefer range+bearing from the vehicle (stable for short spans); fall back to
-    target lat/lon haversine. Optional video-angular check reduces underestimate
-    when both clicks share similar height in the frame (e.g. doorway width).
+    target lat/lon haversine. For facade width (two pillars), uses horizontal
+    video angle × a stable range; reuses session peak range when elevated clicks
+    underestimate distance.
     """
+    if require_same_height_band and not marks_same_height_band(row_a, row_b):
+        return None
+
     vfov = float(vfov_deg) if vfov_deg is not None else float(hfov_deg) * 0.5625
     hfov_rad = math.radians(float(hfov_deg))
     vfov_rad = math.radians(vfov)
@@ -169,30 +368,45 @@ def segment_distance_between_rows(
         dx = abs(float(xb) - float(xa))
         dy = abs(float(yb) - float(ya))
         pix_span = video_mark_span_norm(float(xa), float(ya), float(xb), float(yb))
-        angle = math.hypot(dx * hfov_rad, dy * vfov_rad)
+        angle_h = dx * hfov_rad
+        angle = math.hypot(angle_h, dy * vfov_rad)
+        try:
+            r1 = float(row_a.get("geo_range_m") or 0)
+            r2 = float(row_b.get("geo_range_m") or 0)
+        except (TypeError, ValueError):
+            r1 = r2 = 0.0
+        r_local = max(r1, r2)
+        peak = float(session_peak_range_m or 0)
+        facade_ref = float(facade_reference_range_m or 0)
+        if angle_h > 1e-4 and dx > 0.03:
+            r_ref = r_local
+            if not calibrating_range_only:
+                if facade_ref > r_ref * 1.08:
+                    r_ref = facade_ref
+                elif peak > r_local * 1.25:
+                    blend = min(0.38, (peak / max(r_local, 1.0) - 1.0) * 0.14)
+                    r_ref = r_local + (peak - r_local) * blend
+            d_facade = r_ref * angle_h
+            d = max(d, d_facade)
+        if calibrating_range_only:
+            if d < 15.0:
+                d *= _segment_scale_short()
+            return max(0.0, d)
         if angle > 1e-4 and pix_span < 0.55 and dy < 0.2:
-            r1 = row_a.get("geo_range_m")
-            r2 = row_b.get("geo_range_m")
-            try:
-                r_avg = (float(r1 or 0) + float(r2 or 0)) * 0.5
-            except Exception:
-                r_avg = 0.0
+            r_avg = (r1 + r2) * 0.5
             if r_avg > 1.0:
                 d_vid = r_avg * angle
                 d = max(d, d_vid)
-            try:
-                ra = float(row_a.get("geo_range_m") or 0)
-                rb = float(row_b.get("geo_range_m") or 0)
-                if ra > 1.0 and rb > 1.0 and d > 0.3:
-                    cos_d = (ra * ra + rb * rb - d * d) / (2.0 * ra * rb)
+            if r1 > 1.0 and r2 > 1.0 and d > 0.3:
+                try:
+                    cos_d = (r1 * r1 + r2 * r2 - d * d) / (2.0 * r1 * r2)
                     cos_d = max(-1.0, min(1.0, cos_d))
                     angle_bearing = math.acos(cos_d)
                     if angle_bearing > 1e-4 and angle > angle_bearing * 1.08:
                         d = max(d, d * (angle / angle_bearing) * 0.95)
-            except Exception:
-                pass
-            # Tape on door/window width is often horizontal; ground chord is shorter.
-            if dy < 0.2 and pix_span < 0.55 and d < 10.0:
+                except Exception:
+                    pass
+            if dy < 0.12 and pix_span < 0.55 and d < 10.0 and peak <= r_local * 1.12:
                 d *= 1.12
 
     if d < 15.0:
