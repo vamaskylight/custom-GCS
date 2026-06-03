@@ -25,6 +25,7 @@ class GeoReferenceResult:
     target_lon: float | None = None
     target_alt_m: float | None = None
     horizontal_range_m: float | None = None
+    depression_deg: float | None = None
     quality: str = "insufficient"
     warning: str = ""
     method: str = "none"
@@ -279,6 +280,7 @@ def compute_geo_reference(
         target_lon=tgt_lon,
         target_alt_m=tgt_alt,
         horizontal_range_m=range_m,
+        depression_deg=depression,
         quality=quality,
         warning=warn,
         method=method,

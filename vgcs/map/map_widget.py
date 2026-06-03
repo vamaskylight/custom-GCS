@@ -69,7 +69,7 @@ from vgcs.observe.target_measure import (
     is_downward_sensor_orientation,
     observation_target_latlon,
     resolve_vehicle_agl_m,
-    segment_distances_m,
+    segment_distance_between_rows,
     target_track_from_observations,
     video_mark_span_norm,
 )
@@ -6092,6 +6092,7 @@ class MapWidget(QWidget):
         row["geo_method"] = geo.method
         row["geo_range_m"] = geo.horizontal_range_m
         row["geo_bearing_deg"] = geo.bearing_deg
+        row["geo_depression_deg"] = geo.depression_deg
         if geo.ok and geo.target_lat is not None and geo.target_lon is not None:
             try:
                 nm = getattr(self, "_native_map", None)
@@ -6153,7 +6154,13 @@ class MapWidget(QWidget):
         seg_m = None
         pt = observation_target_latlon(row)
         if pt is not None and track_before:
-            seg_m = haversine_m(track_before[-1][0], track_before[-1][1], pt[0], pt[1])
+            prev_row = self._observations[-1]
+            hfov, _ = self._m8_geo_settings()
+            seg_m = segment_distance_between_rows(prev_row, row, hfov_deg=hfov)
+            if seg_m is None:
+                seg_m = haversine_m(
+                    track_before[-1][0], track_before[-1][1], pt[0], pt[1]
+                )
             row["segment_distance_m"] = seg_m
         else:
             row["segment_distance_m"] = None
@@ -6234,59 +6241,59 @@ class MapWidget(QWidget):
 
     def _observation_video_measure_segments(self) -> list[tuple[float, float, float, float, str]]:
         """Dashed lines on video between consecutive marks that have ground coords."""
-        from vgcs.observe.target_measure import haversine_m
-
         segs: list[tuple[float, float, float, float, str]] = []
+        hfov, _ = self._m8_geo_settings()
+        prev_row: dict[str, object] | None = None
         prev_xy: tuple[float, float] | None = None
-        prev_geo: tuple[float, float] | None = None
         for row in self._observations:
             vx = row.get("video_x_norm")
             vy = row.get("video_y_norm")
             if vx is None or vy is None:
                 continue
-            geo = observation_target_latlon(row)
-            if geo is None:
+            if observation_target_latlon(row) is None:
                 continue
             xy = (float(vx), float(vy))
-            if prev_xy is not None and prev_geo is not None:
-                d = haversine_m(prev_geo[0], prev_geo[1], geo[0], geo[1])
-                pix = video_mark_span_norm(prev_xy[0], prev_xy[1], xy[0], xy[1])
-                label = format_target_segment_label(d, video_span_norm=pix)
-                segs.append((prev_xy[0], prev_xy[1], xy[0], xy[1], label))
+            if prev_row is not None and prev_xy is not None:
+                d = segment_distance_between_rows(prev_row, row, hfov_deg=hfov)
+                if d is None:
+                    pa = observation_target_latlon(prev_row)
+                    pb = observation_target_latlon(row)
+                    if pa and pb:
+                        d = haversine_m(pa[0], pa[1], pb[0], pb[1])
+                if d is not None:
+                    pix = video_mark_span_norm(prev_xy[0], prev_xy[1], xy[0], xy[1])
+                    label = format_target_segment_label(d, video_span_norm=pix)
+                    segs.append((prev_xy[0], prev_xy[1], xy[0], xy[1], label))
+            prev_row = row
             prev_xy = xy
-            prev_geo = geo
         return segs
 
     def _refresh_observation_measure_overlays(self) -> None:
         """Sync map measure lines + video segment labels from logged observations."""
-        track = target_track_from_observations(self._observations)
-        dists = segment_distances_m(track)
         labels: list[str] = []
-        geo_idx = 0
-        prev_row_xy: tuple[float, float] | None = None
+        hfov, _ = self._m8_geo_settings()
+        prev_row: dict[str, object] | None = None
+        prev_xy: tuple[float, float] | None = None
         for row in self._observations:
             if observation_target_latlon(row) is None:
                 continue
-            if geo_idx > 0 and geo_idx - 1 < len(dists):
-                vx = row.get("video_x_norm")
-                vy = row.get("video_y_norm")
-                pix = None
-                if (
-                    prev_row_xy is not None
-                    and vx is not None
-                    and vy is not None
-                ):
-                    pix = video_mark_span_norm(
-                        prev_row_xy[0], prev_row_xy[1], float(vx), float(vy)
-                    )
-                labels.append(
-                    format_target_segment_label(dists[geo_idx - 1], video_span_norm=pix)
-                )
-            geo_idx += 1
             vx = row.get("video_x_norm")
             vy = row.get("video_y_norm")
+            if prev_row is not None and vx is not None and vy is not None:
+                d = segment_distance_between_rows(prev_row, row, hfov_deg=hfov)
+                if d is not None:
+                    pix = None
+                    if prev_xy is not None:
+                        pix = video_mark_span_norm(
+                            prev_xy[0], prev_xy[1], float(vx), float(vy)
+                        )
+                    labels.append(
+                        format_target_segment_label(d, video_span_norm=pix)
+                    )
+            prev_row = row
             if vx is not None and vy is not None:
-                prev_row_xy = (float(vx), float(vy))
+                prev_xy = (float(vx), float(vy))
+        track = target_track_from_observations(self._observations)
         try:
             nm = getattr(self, "_native_map", None)
             if nm is not None and hasattr(nm, "set_observation_target_track"):
