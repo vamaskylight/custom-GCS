@@ -186,17 +186,24 @@ def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:
 
 
 def session_rangefinder_reference_m(rows: list[dict[str, Any]]) -> float | None:
-    """Downward rangefinder (m) logged with marks — fallback range for video-only width."""
-    best = 0.0
+    """
+    Best downward AGL (m) for facade width in this session.
+
+    Uses the **minimum** plausible rangefinder in the log so a single RF spike
+    (e.g. 45 m) does not inflate wall width.
+    """
+    vals: list[float] = []
     for row in rows:
         for key in ("rangefinder_down_m", "vehicle_rel_alt_m"):
             try:
                 v = float(row.get(key) or 0)
             except (TypeError, ValueError):
                 continue
-            if 1.0 < v < 500.0 and v > best:
-                best = v
-    return best if best > 1.0 else None
+            if 0.5 < v < 35.0:
+                vals.append(v)
+    if not vals:
+        return None
+    return min(vals)
 
 
 def _observation_agl_m(row: dict[str, Any]) -> float | None:
@@ -300,6 +307,7 @@ def video_facade_width_m(
     calibrating_range_only: bool = False,
     allow_off_level: bool = False,
     apply_user_scale: bool = True,
+    session_rf_floor_m: float | None = None,
 ) -> float | None:
     """
     Horizontal gap between two marks on a facade (same video height).
@@ -324,7 +332,10 @@ def video_facade_width_m(
     level_pair = dy <= SAME_LEVEL_DY_NORM
     agl = _observation_agl_m(row_a) or _observation_agl_m(row_b)
 
-    d_facade = facade_plane_width_between_marks(row_a, row_b, hfov_deg=hfov_deg)
+    rf_floor = session_rangefinder_reference_m([row_a, row_b])
+    d_facade = facade_plane_width_between_marks(
+        row_a, row_b, hfov_deg=hfov_deg, session_rf_floor_m=rf_floor
+    )
     if d_facade is not None and level_pair and (agl is None or agl < 80.0):
         if apply_user_scale:
             d_facade *= _segment_scale_short()
@@ -620,13 +631,80 @@ def _format_segment_label(
     return base
 
 
+def _one_pair_video_segment(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    hfov_deg: float,
+) -> tuple[float, float, float, float, str] | None:
+    xy_l, xy_r = _video_xy(left), _video_xy(right)
+    if xy_l is None or xy_r is None:
+        return None
+    if left is not right and xy_l[0] > xy_r[0]:
+        left, right, xy_l, xy_r = right, left, xy_r, xy_l
+    peak = session_peak_geo_range_m(rows)
+    facade_ref = session_facade_reference_range_m(rows, hfov_deg=hfov_deg)
+    rf_ref = session_rangefinder_reference_m(rows)
+    dy_lr = abs(xy_r[1] - xy_l[1])
+    off_level = dy_lr > SAME_LEVEL_DY_NORM
+    d = segment_distance_between_rows(
+        left,
+        right,
+        hfov_deg=hfov_deg,
+        session_peak_range_m=peak,
+        facade_reference_range_m=facade_ref,
+        require_same_height_band=not off_level,
+        allow_off_level=off_level,
+        session_rf_floor_m=rf_ref,
+    )
+    if d is None and off_level:
+        d = segment_distance_video_fallback(
+            left, right, hfov_deg=hfov_deg, range_m=rf_ref
+        )
+    tape_m = _tape_pair_matches(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
+    if tape_m is not None:
+        label = f"{tape_m:.1f} m (wall, tape)"
+    elif d is None:
+        if not marks_need_level_warning(left, right):
+            return None
+        label = MARKS_NOT_LEVEL_HINT
+    else:
+        pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
+        est = _geo_lon_jump_deg(left, right) > 0.00035 or bool(
+            left.get("geo_quality") == "insufficient"
+            or right.get("geo_quality") == "insufficient"
+        )
+        label = _format_segment_label(
+            d,
+            video_only=est,
+            video_span_norm=pix,
+            estimate=est,
+            level_ok=dy_lr <= SAME_LEVEL_DY_NORM,
+            facade_plane=bool(
+                left.get("geo_depression_deg") is not None
+                and right.get("geo_depression_deg") is not None
+            ),
+        )
+        label = append_marks_level_hint(label, left, right)
+    if label:
+        return (xy_l[0], xy_l[1], xy_r[0], xy_r[1], label)
+    return None
+
+
 def observation_facade_video_segments(
     rows: list[dict[str, Any]],
     *,
     hfov_deg: float = 62.0,
     max_dy_norm: float = SAME_LEVEL_DY_NORM,
+    latest_pair_only: bool = True,
 ) -> list[tuple[float, float, float, float, str]]:
-    """One measure line per height band: leftmost ↔ rightmost mark (pillar gap width)."""
+    """Measure line for video marks; default = only the last two Target clicks."""
+    pair = _last_two_video_marks(rows)
+    if latest_pair_only and pair is not None:
+        seg = _one_pair_video_segment(pair[0], pair[1], rows, hfov_deg=hfov_deg)
+        return [seg] if seg else []
+
     out: list[tuple[float, float, float, float, str]] = []
     peak = session_peak_geo_range_m(rows)
     facade_ref = session_facade_reference_range_m(
@@ -732,8 +810,12 @@ def observation_facade_video_segments(
     return out
 
 
-_SEGMENT_SCALE_MIN = 0.70
-_SEGMENT_SCALE_MAX = 1.50
+_SEGMENT_SCALE_MIN = 0.15
+_SEGMENT_SCALE_MAX = 3.00
+
+# After tape Cal: force this distance on the calibrated mark pair (endpoints, 0..1 video).
+_tape_pair_override: dict[str, float] | None = None
+_TAPE_XY_TOL = 0.03
 
 
 def _segment_scale_short() -> float:
@@ -762,29 +844,66 @@ def set_segment_distance_scale(scale: float) -> float:
     return v
 
 
+def _video_marks_ordered(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [r for r in rows if str(r.get("kind") or "") == "video_mark" and _video_xy(r)]
+
+
+def _last_two_video_marks(
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    marks = _video_marks_ordered(rows)
+    if len(marks) < 2:
+        return None
+    a, b = marks[-2], marks[-1]
+    if a is b:
+        return None
+    return a, b
+
+
+def clear_tape_pair_override() -> None:
+    global _tape_pair_override
+    _tape_pair_override = None
+
+
+def _tape_pair_key(x1: float, y1: float, x2: float, y2: float) -> tuple[float, float, float, float]:
+    if x1 > x2 or (abs(x1 - x2) < 1e-6 and y1 > y2):
+        x1, y1, x2, y2 = x2, y2, x1, y1
+    return (x1, y1, x2, y2)
+
+
+def _tape_pair_matches(x1: float, y1: float, x2: float, y2: float) -> float | None:
+    o = _tape_pair_override
+    if not o:
+        return None
+    k = _tape_pair_key(x1, y1, x2, y2)
+    ok = _tape_pair_key(
+        float(o["x1"]), float(o["y1"]), float(o["x2"]), float(o["y2"])
+    )
+    if all(abs(k[i] - ok[i]) <= _TAPE_XY_TOL for i in range(4)):
+        return float(o["known_m"])
+    return None
+
+
 def last_band_measure_width_m(
     rows: list[dict[str, Any]],
     *,
     hfov_deg: float = 62.0,
     apply_user_scale: bool = False,
 ) -> float | None:
-    """Latest left↔right width from video marks (for tape calibration)."""
-    marks = [r for r in rows if str(r.get("kind") or "") == "video_mark" and _video_xy(r)]
-    if len(marks) < 2:
+    """Width between the last two Target clicks (for tape calibration)."""
+    pair = _last_two_video_marks(rows)
+    if pair is None:
         return None
-    last = marks[-1]
-    partner = band_width_partner_row(rows, last)
-    if partner is None:
-        partner = marks[-2]
-    if partner is None or partner is last:
-        return None
+    a, b = pair
+    rf_floor = session_rangefinder_reference_m(rows)
     return segment_distance_between_rows(
-        partner,
-        last,
+        a,
+        b,
         hfov_deg=hfov_deg,
         require_same_height_band=False,
         allow_off_level=True,
         apply_user_scale=apply_user_scale,
+        session_rf_floor_m=rf_floor,
     )
 
 
@@ -805,11 +924,36 @@ def calibrate_segment_scale_from_tape(
         return None
     if known < 0.05 or known > 200.0:
         return None
+    pair = _last_two_video_marks(rows)
+    if pair is None:
+        return None
+    a, b = pair
     raw = last_band_measure_width_m(rows, hfov_deg=hfov_deg, apply_user_scale=False)
     if raw is None or raw < 0.05:
         return None
-    scale = set_segment_distance_scale(known / raw)
-    return {"scale": scale, "raw_m": float(raw), "known_m": known}
+    requested_scale = known / raw
+    scale = set_segment_distance_scale(requested_scale)
+    clamped = abs(scale - requested_scale) > 0.02
+    xy_a, xy_b = _video_xy(a), _video_xy(b)
+    global _tape_pair_override
+    if xy_a and xy_b:
+        x1, y1 = xy_a
+        x2, y2 = xy_b
+        _tape_pair_override = {
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "known_m": known,
+            "scale": scale,
+        }
+    return {
+        "scale": scale,
+        "raw_m": float(raw),
+        "known_m": known,
+        "scale_clamped": float(clamped),
+        "requested_scale": float(requested_scale),
+    }
 
 
 def segment_distance_between_rows(
@@ -824,6 +968,7 @@ def segment_distance_between_rows(
     calibrating_range_only: bool = False,
     allow_off_level: bool = False,
     apply_user_scale: bool = True,
+    session_rf_floor_m: float | None = None,
 ) -> float | None:
     """Ground/facade separation between two observation marks (see ``video_facade_width_m``)."""
     if require_same_height_band and not marks_same_height_band(row_a, row_b):
@@ -840,6 +985,7 @@ def segment_distance_between_rows(
             calibrating_range_only=calibrating_range_only,
             allow_off_level=allow_off_level,
             apply_user_scale=apply_user_scale,
+            session_rf_floor_m=session_rf_floor_m,
         )
     pa = observation_target_latlon(row_a)
     pb = observation_target_latlon(row_b)

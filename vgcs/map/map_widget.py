@@ -66,6 +66,7 @@ from vgcs.observe.geo_reference import compute_geo_reference
 from vgcs.observe.target_measure import (
     band_width_partner_row,
     calibrate_segment_scale_from_tape,
+    clear_tape_pair_override,
     format_target_segment_label,
     haversine_m,
     is_downward_sensor_orientation,
@@ -6641,16 +6642,18 @@ class MapWidget(QWidget):
         scale = float(result["scale"])
         raw_m = float(result["raw_m"])
         self._refresh_observation_measure_overlays()
-        shown = known_m
         msg = (
-            f"OBSERVE calibrated: tape {known_m:.2f} m (was {raw_m:.2f} m) — "
-            f"scale {scale:.3f} (saved for this PC)"
+            f"OBSERVE calibrated: line shows {known_m:.1f} m (was {raw_m:.1f} m) — "
+            f"scale {scale:.3f}"
         )
+        if result.get("scale_clamped"):
+            req = float(result.get("requested_scale") or 0)
+            msg += f" (scale clamped; requested {req:.2f})"
         self._set_status(msg)
         try:
             print(
                 f"[VGCS:observe] tape_calibrate known={known_m:.3f} raw={raw_m:.3f} "
-                f"scale={scale:.3f}"
+                f"scale={scale:.3f} clamped={result.get('scale_clamped')}"
             )
         except Exception:
             pass
@@ -6662,6 +6665,10 @@ class MapWidget(QWidget):
         n = len(self._observations)
         self._observations.clear()
         self._video_obs_marks.clear()
+        try:
+            clear_tape_pair_override()
+        except Exception:
+            pass
         # Clear native markers (Qt) + web markers (if any).
         try:
             nm = getattr(self, "_native_map", None)
