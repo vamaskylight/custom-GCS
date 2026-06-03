@@ -9,6 +9,9 @@ _EARTH_RADIUS_M = 6_371_000.0
 
 # Max |Δy| in normalized video coords for "same horizontal" width (door/post L–R).
 SAME_LEVEL_DY_NORM = 0.08
+# Show on-video hint when |Δy| exceeds this (marks visibly not on one horizontal line).
+LEVEL_WARN_DY_NORM = 0.04
+MARKS_NOT_LEVEL_HINT = "Marks not level — distance may read high."
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -114,6 +117,29 @@ def is_plausible_ground_range(
 
 def video_mark_span_norm(x1: float, y1: float, x2: float, y2: float) -> float:
     return math.hypot(float(x2) - float(x1), float(y2) - float(y1))
+
+
+def marks_level_dy_norm(row_a: dict[str, Any], row_b: dict[str, Any]) -> float | None:
+    """Absolute Δy between two video marks, or None if not comparable."""
+    xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+    if xy_a is None or xy_b is None:
+        return None
+    return abs(xy_b[1] - xy_a[1])
+
+
+def marks_need_level_warning(row_a: dict[str, Any], row_b: dict[str, Any]) -> bool:
+    dy = marks_level_dy_norm(row_a, row_b)
+    return dy is not None and dy > LEVEL_WARN_DY_NORM
+
+
+def append_marks_level_hint(label: str, row_a: dict[str, Any], row_b: dict[str, Any]) -> str:
+    if not marks_need_level_warning(row_a, row_b):
+        return label
+    if not str(label or "").strip():
+        return MARKS_NOT_LEVEL_HINT
+    if MARKS_NOT_LEVEL_HINT in label:
+        return label
+    return f"{label} — {MARKS_NOT_LEVEL_HINT}"
 
 
 def marks_same_height_band(
@@ -249,6 +275,7 @@ def video_facade_width_m(
     session_peak_range_m: float | None = None,
     facade_reference_range_m: float | None = None,
     calibrating_range_only: bool = False,
+    allow_off_level: bool = False,
 ) -> float | None:
     """
     Horizontal gap between two marks on a facade (same video height).
@@ -263,7 +290,7 @@ def video_facade_width_m(
     dy = abs(xy_b[1] - xy_a[1])
     if dx < 0.03:
         return None
-    if dy > SAME_LEVEL_DY_NORM:
+    if dy > SAME_LEVEL_DY_NORM and not allow_off_level:
         return None
     hfov_rad = math.radians(float(hfov_deg))
     angle_h = dx * hfov_rad
@@ -540,7 +567,7 @@ def _format_segment_label(
     if not base:
         return ""
     if not level_ok:
-        return "not level — use same height"
+        return MARKS_NOT_LEVEL_HINT
     if (video_only or estimate) and not base.startswith("distance unreliable"):
         return f"~{base}"
     return base
@@ -574,31 +601,38 @@ def observation_facade_video_segments(
         xy_l, xy_r = _video_xy(left), _video_xy(right)
         if xy_l is None or xy_r is None:
             continue
-        if abs(xy_r[1] - xy_l[1]) > SAME_LEVEL_DY_NORM:
-            continue
+        dy_lr = abs(xy_r[1] - xy_l[1])
+        off_level = dy_lr > SAME_LEVEL_DY_NORM
         d = segment_distance_between_rows(
             left,
             right,
             hfov_deg=hfov_deg,
             session_peak_range_m=peak,
             facade_reference_range_m=facade_ref,
-            require_same_height_band=False,
+            require_same_height_band=not off_level,
+            allow_off_level=off_level,
         )
-        if d is None:
+        if d is None and off_level:
+            d = segment_distance_video_fallback(
+                left, right, hfov_deg=hfov_deg, range_m=rf_ref
+            )
+        if d is None and not marks_need_level_warning(left, right):
             continue
         pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
-        dy_lr = abs(xy_r[1] - xy_l[1])
         est = _geo_lon_jump_deg(left, right) > 0.00035 or bool(
             left.get("geo_quality") == "insufficient"
             or right.get("geo_quality") == "insufficient"
         )
-        label = _format_segment_label(
-            d,
-            video_only=False,
-            video_span_norm=pix,
-            estimate=est,
-            level_ok=dy_lr <= SAME_LEVEL_DY_NORM,
-        )
+        label = ""
+        if d is not None:
+            label = _format_segment_label(
+                d,
+                video_only=False,
+                video_span_norm=pix,
+                estimate=est,
+                level_ok=dy_lr <= SAME_LEVEL_DY_NORM,
+            )
+        label = append_marks_level_hint(label, left, right)
         if label:
             out.append((xy_l[0], xy_l[1], xy_r[0], xy_r[1], label))
     if out:
@@ -618,8 +652,8 @@ def observation_facade_video_segments(
         xy_l, xy_r = _video_xy(left), _video_xy(right)
         if xy_l is None or xy_r is None:
             continue
-        if abs(xy_r[1] - xy_l[1]) > SAME_LEVEL_DY_NORM:
-            continue
+        dy_lr = abs(xy_r[1] - xy_l[1])
+        off_level = dy_lr > SAME_LEVEL_DY_NORM
         d = segment_distance_video_fallback(
             left, right, hfov_deg=hfov_deg, range_m=rf_ref
         )
@@ -629,13 +663,19 @@ def observation_facade_video_segments(
                 right,
                 hfov_deg=hfov_deg,
                 session_peak_range_m=peak,
+                allow_off_level=off_level,
             )
-        if d is None:
+        if d is None and not marks_need_level_warning(left, right):
             continue
         pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
-        label = _format_segment_label(
-            d, video_only=True, video_span_norm=pix, estimate=True
-        )
+        label = ""
+        if d is not None:
+            label = _format_segment_label(
+                d, video_only=True, video_span_norm=pix, estimate=True
+            )
+            label = append_marks_level_hint(label, left, right)
+        else:
+            label = MARKS_NOT_LEVEL_HINT
         if label:
             out.append((xy_l[0], xy_l[1], xy_r[0], xy_r[1], label))
     return out
@@ -661,6 +701,7 @@ def segment_distance_between_rows(
     facade_reference_range_m: float | None = None,
     require_same_height_band: bool = True,
     calibrating_range_only: bool = False,
+    allow_off_level: bool = False,
 ) -> float | None:
     """Ground/facade separation between two observation marks (see ``video_facade_width_m``)."""
     if require_same_height_band and not marks_same_height_band(row_a, row_b):
@@ -675,6 +716,7 @@ def segment_distance_between_rows(
             session_peak_range_m=session_peak_range_m,
             facade_reference_range_m=facade_reference_range_m,
             calibrating_range_only=calibrating_range_only,
+            allow_off_level=allow_off_level,
         )
     pa = observation_target_latlon(row_a)
     pb = observation_target_latlon(row_b)

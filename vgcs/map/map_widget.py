@@ -68,7 +68,9 @@ from vgcs.observe.target_measure import (
     format_target_segment_label,
     haversine_m,
     is_downward_sensor_orientation,
+    marks_need_level_warning,
     marks_same_height_band,
+    MARKS_NOT_LEVEL_HINT,
     observation_facade_video_segments,
     observation_target_latlon,
     resolve_vehicle_agl_m,
@@ -6249,8 +6251,13 @@ class MapWidget(QWidget):
                         else ""
                     )
                     msg += f" — targets {float(seg_m):.1f} m apart{est}"
+                    warn_row = partner if partner is not None else (
+                        self._observations[-1] if self._observations else None
+                    )
+                    if warn_row is not None and marks_need_level_warning(warn_row, row):
+                        msg += f" — {MARKS_NOT_LEVEL_HINT}"
                 elif cross_band:
-                    msg += " — click left & right on the same height (max 8% of frame)"
+                    msg += f" — {MARKS_NOT_LEVEL_HINT}"
             elif kind == "video_mark":
                 warn = str(row.get("geo_warning") or "geo insufficient")
                 msg += f" — {warn}"
