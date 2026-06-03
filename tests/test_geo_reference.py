@@ -53,6 +53,24 @@ def test_forward_oblique_increases_range():
     assert r.target_lat > 37.0
 
 
+def test_rejects_absurd_range_at_low_agl():
+    # Level gimbal + low click: flat-earth hit hundreds of metres away.
+    r = compute_geo_reference(
+        vehicle_lat=20.4458,
+        vehicle_lon=72.8630,
+        vehicle_heading_deg=0.0,
+        vehicle_rel_alt_m=1.5,
+        rangefinder_down_m=None,
+        gimbal_yaw_deg=0.0,
+        gimbal_pitch_deg=0.0,
+        video_x_norm=0.5,
+        video_y_norm=0.48,
+        gps_fix_type=3,
+    )
+    assert not r.ok
+    assert "unrealistic" in (r.warning or "").lower()
+
+
 def test_rangefinder_agl_fallback():
     r = compute_geo_reference(
         vehicle_lat=20.4458,

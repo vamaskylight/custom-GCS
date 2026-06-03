@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from vgcs.observe.target_measure import resolve_vehicle_agl_m
+from vgcs.observe.target_measure import is_plausible_ground_range, resolve_vehicle_agl_m
 
 _EARTH_RADIUS_M = 6_371_000.0
 
@@ -192,9 +192,9 @@ def compute_geo_reference(
     g_yaw = _deg2rad(float(gimbal_yaw_deg))
     g_pitch_deg = float(gimbal_pitch_deg)
     pitch_assumed = False
-    # C13/Skydroid often reports ~0° when the lens is already oblique; use a sane
-    # default when downward rangefinder proves we are near the ground.
-    if abs(g_pitch_deg) < 3.0 and agl_src == "rangefinder_down":
+    # C13/Skydroid often reports ~0° (level) while the scene is oblique; rangefinder
+    # DOWN confirms we are low — use a typical downward look for geo.
+    if agl_src == "rangefinder_down" and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0):
         g_pitch_deg = -35.0
         pitch_assumed = True
     g_pitch = _deg2rad(g_pitch_deg)
@@ -239,6 +239,18 @@ def compute_geo_reference(
     range_m = math.hypot(north_m, east_m)
     bearing = (math.degrees(math.atan2(east_m, north_m)) + 360.0) % 360.0
     depression = math.degrees(math.atan2(dz, math.hypot(dir_ned[0], dir_ned[1])))
+
+    if not is_plausible_ground_range(agl_m, range_m, depression):
+        return GeoReferenceResult(
+            ok=False,
+            warning=(
+                f"computed ground range {range_m:.0f} m is unrealistic for {agl_m:.1f} m height "
+                "(click on ground in lower video, pitch gimbal down; wall/horizon marks are not accurate)"
+            ),
+            method=method,
+            horizontal_range_m=range_m,
+            bearing_deg=bearing,
+        )
 
     tgt_lat, tgt_lon = _offset_lat_lon(float(vehicle_lat), float(vehicle_lon), north_m, east_m)
     tgt_alt: float | None = None
