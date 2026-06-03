@@ -113,6 +113,93 @@ def video_mark_span_norm(x1: float, y1: float, x2: float, y2: float) -> float:
     return math.hypot(float(x2) - float(x1), float(y2) - float(y1))
 
 
+def _segment_scale_short() -> float:
+    try:
+        from PySide6.QtCore import QSettings
+
+        v = float(QSettings("VGCS", "VGCS").value("observe/segment_distance_scale", 1.0) or 1.0)
+        return max(0.85, min(1.35, v))
+    except Exception:
+        return 1.0
+
+
+def segment_distance_between_rows(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    vfov_deg: float | None = None,
+) -> float | None:
+    """
+    Ground separation between two observation marks.
+
+    Prefer range+bearing from the vehicle (stable for short spans); fall back to
+    target lat/lon haversine. Optional video-angular check reduces underestimate
+    when both clicks share similar height in the frame (e.g. doorway width).
+    """
+    vfov = float(vfov_deg) if vfov_deg is not None else float(hfov_deg) * 0.5625
+    hfov_rad = math.radians(float(hfov_deg))
+    vfov_rad = math.radians(vfov)
+
+    d_geo: float | None = None
+    try:
+        r1 = row_a.get("geo_range_m")
+        r2 = row_b.get("geo_range_m")
+        b1 = row_a.get("geo_bearing_deg")
+        b2 = row_b.get("geo_bearing_deg")
+        if r1 is not None and r2 is not None and b1 is not None and b2 is not None:
+            ra = float(r1)
+            rb = float(r2)
+            ba = math.radians(float(b1))
+            bb = math.radians(float(b2))
+            d_geo = math.sqrt(ra * ra + rb * rb - 2.0 * ra * rb * math.cos(bb - ba))
+    except Exception:
+        d_geo = None
+    if d_geo is None or d_geo <= 0:
+        pa = observation_target_latlon(row_a)
+        pb = observation_target_latlon(row_b)
+        if pa is None or pb is None:
+            return None
+        d_geo = haversine_m(pa[0], pa[1], pb[0], pb[1])
+
+    xa, ya = row_a.get("video_x_norm"), row_a.get("video_y_norm")
+    xb, yb = row_b.get("video_x_norm"), row_b.get("video_y_norm")
+    d = float(d_geo)
+    if xa is not None and ya is not None and xb is not None and yb is not None:
+        dx = abs(float(xb) - float(xa))
+        dy = abs(float(yb) - float(ya))
+        pix_span = video_mark_span_norm(float(xa), float(ya), float(xb), float(yb))
+        angle = math.hypot(dx * hfov_rad, dy * vfov_rad)
+        if angle > 1e-4 and pix_span < 0.55 and dy < 0.2:
+            r1 = row_a.get("geo_range_m")
+            r2 = row_b.get("geo_range_m")
+            try:
+                r_avg = (float(r1 or 0) + float(r2 or 0)) * 0.5
+            except Exception:
+                r_avg = 0.0
+            if r_avg > 1.0:
+                d_vid = r_avg * angle
+                d = max(d, d_vid)
+            try:
+                ra = float(row_a.get("geo_range_m") or 0)
+                rb = float(row_b.get("geo_range_m") or 0)
+                if ra > 1.0 and rb > 1.0 and d > 0.3:
+                    cos_d = (ra * ra + rb * rb - d * d) / (2.0 * ra * rb)
+                    cos_d = max(-1.0, min(1.0, cos_d))
+                    angle_bearing = math.acos(cos_d)
+                    if angle_bearing > 1e-4 and angle > angle_bearing * 1.08:
+                        d = max(d, d * (angle / angle_bearing) * 0.95)
+            except Exception:
+                pass
+            # Tape on door/window width is often horizontal; ground chord is shorter.
+            if dy < 0.2 and pix_span < 0.55 and d < 10.0:
+                d *= 1.12
+
+    if d < 15.0:
+        d *= _segment_scale_short()
+    return max(0.0, d)
+
+
 def format_target_segment_label(
     geo_distance_m: float,
     *,
@@ -127,6 +214,8 @@ def format_target_segment_label(
         return "distance unreliable"
     if d >= 1000.0:
         return f"{d / 1000.0:.1f} km"
+    if d < 100.0:
+        return f"{d:.1f} m"
     return f"{d:.0f} m"
 
 
