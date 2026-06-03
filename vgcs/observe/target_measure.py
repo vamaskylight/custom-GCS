@@ -85,6 +85,51 @@ def resolve_vehicle_agl_m(
     return None, ""
 
 
+def is_plausible_ground_range(
+    agl_m: float,
+    range_m: float,
+    depression_deg: float,
+    *,
+    slack: float = 2.5,
+) -> bool:
+    """Reject flat-earth hits impossibly far for current height and look angle."""
+    if range_m <= 0 or agl_m <= 0:
+        return False
+    agl = float(agl_m)
+    rng = float(range_m)
+    dep = float(depression_deg)
+    # Bench / indoor: rangefinder ~1–2 m but shallow look projects kilometres away.
+    if agl < 8.0 and rng > max(12.0, agl * 10.0):
+        return False
+    if dep < 8.0 and rng > 20.0:
+        return False
+    dep_use = max(dep, 8.0)
+    expected = agl / math.tan(math.radians(dep_use))
+    limit = max(15.0, expected * float(slack))
+    return rng <= limit
+
+
+def video_mark_span_norm(x1: float, y1: float, x2: float, y2: float) -> float:
+    return math.hypot(float(x2) - float(x1), float(y2) - float(y1))
+
+
+def format_target_segment_label(
+    geo_distance_m: float,
+    *,
+    video_span_norm: float | None = None,
+) -> str:
+    """
+    Label for map/video measure line. Flags when geo distance disagrees with
+    how close the two clicks are on the video (common indoors / wall marks).
+    """
+    d = float(geo_distance_m)
+    if video_span_norm is not None and video_span_norm < 0.4 and d > 25.0:
+        return "distance unreliable"
+    if d >= 1000.0:
+        return f"{d / 1000.0:.1f} km"
+    return f"{d:.0f} m"
+
+
 def segment_distances_m(track: list[tuple[float, float]]) -> list[float]:
     """Ground distance (m) for each consecutive pair in ``track``."""
     segs: list[float] = []

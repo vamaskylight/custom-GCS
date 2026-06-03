@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from vgcs.observe.target_measure import (
+    format_target_segment_label,
+    is_plausible_ground_range,
     observation_target_latlon,
     resolve_vehicle_agl_m,
     segment_distances_m,
@@ -26,6 +28,15 @@ def test_resolve_agl_from_rangefinder():
     agl, src = resolve_vehicle_agl_m(relative_alt_m=0.0, rangefinder_down_m=1.2)
     assert agl == 1.2
     assert src == "rangefinder_down"
+
+
+def test_reject_unrealistic_range():
+    assert not is_plausible_ground_range(1.5, 107.0, 0.8)
+    assert is_plausible_ground_range(1.5, 5.0, 25.0)
+
+
+def test_segment_label_unreliable():
+    assert format_target_segment_label(107.0, video_span_norm=0.15) == "distance unreliable"
 
 
 def test_map_mark_uses_map_latlon():

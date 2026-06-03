@@ -64,12 +64,14 @@ from PySide6.QtGui import (
 from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayDetection
 from vgcs.observe.geo_reference import compute_geo_reference
 from vgcs.observe.target_measure import (
+    format_target_segment_label,
     haversine_m,
     is_downward_sensor_orientation,
     observation_target_latlon,
     resolve_vehicle_agl_m,
     segment_distances_m,
     target_track_from_observations,
+    video_mark_span_norm,
 )
 from vgcs.mission import (
     Waypoint,
@@ -6248,7 +6250,9 @@ class MapWidget(QWidget):
             xy = (float(vx), float(vy))
             if prev_xy is not None and prev_geo is not None:
                 d = haversine_m(prev_geo[0], prev_geo[1], geo[0], geo[1])
-                segs.append((prev_xy[0], prev_xy[1], xy[0], xy[1], f"{d:.0f} m"))
+                pix = video_mark_span_norm(prev_xy[0], prev_xy[1], xy[0], xy[1])
+                label = format_target_segment_label(d, video_span_norm=pix)
+                segs.append((prev_xy[0], prev_xy[1], xy[0], xy[1], label))
             prev_xy = xy
             prev_geo = geo
         return segs
@@ -6257,7 +6261,32 @@ class MapWidget(QWidget):
         """Sync map measure lines + video segment labels from logged observations."""
         track = target_track_from_observations(self._observations)
         dists = segment_distances_m(track)
-        labels = [f"{d:.0f} m" for d in dists]
+        labels: list[str] = []
+        geo_idx = 0
+        prev_row_xy: tuple[float, float] | None = None
+        for row in self._observations:
+            if observation_target_latlon(row) is None:
+                continue
+            if geo_idx > 0 and geo_idx - 1 < len(dists):
+                vx = row.get("video_x_norm")
+                vy = row.get("video_y_norm")
+                pix = None
+                if (
+                    prev_row_xy is not None
+                    and vx is not None
+                    and vy is not None
+                ):
+                    pix = video_mark_span_norm(
+                        prev_row_xy[0], prev_row_xy[1], float(vx), float(vy)
+                    )
+                labels.append(
+                    format_target_segment_label(dists[geo_idx - 1], video_span_norm=pix)
+                )
+            geo_idx += 1
+            vx = row.get("video_x_norm")
+            vy = row.get("video_y_norm")
+            if vx is not None and vy is not None:
+                prev_row_xy = (float(vx), float(vy))
         try:
             nm = getattr(self, "_native_map", None)
             if nm is not None and hasattr(nm, "set_observation_target_track"):
