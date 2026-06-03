@@ -204,6 +204,40 @@ def _law_of_cosines_m(
         return None
 
 
+def _geo_lon_jump_deg(row_a: dict[str, Any], row_b: dict[str, Any]) -> float:
+    pa = observation_target_latlon(row_a)
+    pb = observation_target_latlon(row_b)
+    if pa is None or pb is None:
+        return 0.0
+    return abs(float(pb[1]) - float(pa[1]))
+
+
+def _facade_range_cap_m(
+    agl_m: float | None,
+    r1: float,
+    r2: float,
+    *,
+    dx_norm: float,
+) -> float | None:
+    """
+    Cap horizontal range for wide L–R spans (posts/walls).
+
+    Downward RF AGL is not slant range to the opening; using full geo_range_m
+    over-estimates width (20+ m). Typical opening measurement uses much shorter range.
+    """
+    if dx_norm < 0.32:
+        return None
+    try:
+        agl = float(agl_m) if agl_m is not None else 0.0
+    except (TypeError, ValueError):
+        agl = 0.0
+    r_geo = max(r1, r2)
+    if r_geo <= 0:
+        return None
+    cap = max(5.5, min(r_geo, agl * 0.30 if agl > 1.0 else r_geo))
+    return cap
+
+
 def video_facade_width_m(
     row_a: dict[str, Any],
     row_b: dict[str, Any],
@@ -271,13 +305,17 @@ def video_facade_width_m(
     if pa is not None and pb is not None:
         d_hav = haversine_m(pa[0], pa[1], pb[0], pb[1])
 
+    lon_jump = _geo_lon_jump_deg(row_a, row_b)
+    bad_ground_haversine = (
+        d_hav is not None
+        and (d_hav > 12.0 or lon_jump > 0.00035 or d_hav > d * 2.5)
+    )
+
     trust_haversine = False
-    if d_hav is not None and 0.0 < d_hav < 50.0:
+    if d_hav is not None and 0.0 < d_hav < 50.0 and not bad_ground_haversine:
         if d_hav < d * 0.75:
             d = d_hav
             trust_haversine = True
-            # Facade / posts: video L–R span is wider than ground bearing implies → scale up
-            # haversine (tape ~4 m while map chord ~3 m is typical).
             if (
                 r1 > 0
                 and r2 > 0
@@ -294,9 +332,6 @@ def video_facade_width_m(
                         d = d * scale
                 except (TypeError, ValueError, ZeroDivisionError):
                     pass
-        elif d_hav > d * 2.5:
-            # Far-apart ground projection (classic wall/pillar bug) — ignore haversine.
-            pass
         else:
             d = min(d, d_hav)
 
@@ -305,7 +340,7 @@ def video_facade_width_m(
         facade_ref = float(facade_reference_range_m or 0)
         r_local = max(r1, r2)
         d_angle_ref = 0.5 * (r1 + r2) * angle_h
-        if d < d_angle_ref * 0.65:
+        if d < d_angle_ref * 0.65 and not trust_haversine:
             uplift = d_angle_ref
             if facade_ref > r_local * 1.08:
                 uplift = max(uplift, min(facade_ref * angle_h * 1.08, d_angle_ref * 1.35))
@@ -314,6 +349,14 @@ def video_facade_width_m(
                 r_ref = r_local + (peak - r_local) * blend
                 uplift = max(uplift, min(r_ref * angle_h * 1.05, d_angle_ref * 1.35))
             d = max(d, uplift)
+
+    r_cap = _facade_range_cap_m(agl, r1, r2, dx_norm=dx)
+    if r_cap is not None:
+        d_capped = r_cap * angle_h
+        if trust_haversine and d > d_capped * 1.35:
+            d = max(d * 0.92, d_capped)
+        elif not trust_haversine or bad_ground_haversine:
+            d = min(d, d_capped)
 
     if d < 15.0:
         d *= _segment_scale_short()
@@ -466,9 +509,19 @@ def band_width_partner_row(
     return best
 
 
-def _format_segment_label(d: float, *, video_only: bool, video_span_norm: float | None) -> str:
-    base = format_target_segment_label(d, video_span_norm=video_span_norm)
-    if video_only and base and base != "distance unreliable":
+def _format_segment_label(
+    d: float,
+    *,
+    video_only: bool,
+    video_span_norm: float | None,
+    estimate: bool = False,
+) -> str:
+    base = format_target_segment_label(
+        d, video_span_norm=video_span_norm, force_show_meters=True
+    )
+    if not base:
+        return ""
+    if (video_only or estimate) and not base.startswith("distance unreliable"):
         return f"~{base}"
     return base
 
@@ -512,7 +565,13 @@ def observation_facade_video_segments(
         if d is None:
             continue
         pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
-        label = _format_segment_label(d, video_only=False, video_span_norm=pix)
+        est = _geo_lon_jump_deg(left, right) > 0.00035 or bool(
+            left.get("geo_quality") == "insufficient"
+            or right.get("geo_quality") == "insufficient"
+        )
+        label = _format_segment_label(
+            d, video_only=False, video_span_norm=pix, estimate=est
+        )
         if label:
             out.append((xy_l[0], xy_l[1], xy_r[0], xy_r[1], label))
     if out:
@@ -536,9 +595,18 @@ def observation_facade_video_segments(
             left, right, hfov_deg=hfov_deg, range_m=rf_ref
         )
         if d is None:
+            d = video_facade_width_m(
+                left,
+                right,
+                hfov_deg=hfov_deg,
+                session_peak_range_m=peak,
+            )
+        if d is None:
             continue
         pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
-        label = _format_segment_label(d, video_only=True, video_span_norm=pix)
+        label = _format_segment_label(
+            d, video_only=True, video_span_norm=pix, estimate=True
+        )
         if label:
             out.append((xy_l[0], xy_l[1], xy_r[0], xy_r[1], label))
     return out
@@ -593,13 +661,19 @@ def format_target_segment_label(
     geo_distance_m: float,
     *,
     video_span_norm: float | None = None,
+    force_show_meters: bool = False,
 ) -> str:
     """
-    Label for map/video measure line. Flags when geo distance disagrees with
-    how close the two clicks are on the video (common indoors / wall marks).
+    Label for map/video measure line. Prefer a numeric estimate; avoid blank
+    warnings when we already computed a capped facade width.
     """
     d = float(geo_distance_m)
-    if video_span_norm is not None and video_span_norm < 0.55 and d > 30.0:
+    if (
+        not force_show_meters
+        and video_span_norm is not None
+        and video_span_norm < 0.55
+        and d > 45.0
+    ):
         return "distance unreliable (~use ground marks)"
     if d >= 1000.0:
         return f"{d / 1000.0:.1f} km"
