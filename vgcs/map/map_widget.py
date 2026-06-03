@@ -73,8 +73,10 @@ from vgcs.observe.target_measure import (
     observation_target_latlon,
     resolve_vehicle_agl_m,
     segment_distance_between_rows,
+    segment_distance_video_fallback,
     session_facade_reference_range_m,
     session_peak_geo_range_m,
+    session_rangefinder_reference_m,
     target_track_from_observations,
     video_mark_span_norm,
 )
@@ -6000,12 +6002,14 @@ class MapWidget(QWidget):
             if st is not None and bool(getattr(st, "supported", False)):
                 yaw = getattr(st, "yaw_deg", None)
                 pitch = getattr(st, "pitch_deg", None)
-                if yaw is not None or pitch is not None:
-                    if not (
-                        abs(float(yaw or 0.0)) < 0.05 and abs(float(pitch or 0.0)) < 0.05
-                    ):
-                        gimbal_yaw = yaw
-                        gimbal_pitch = pitch
+                # C13/Skydroid often reports 0,0 when level — still pass through; geo
+                # layer applies downward pitch when rangefinder AGL is available.
+                if yaw is not None:
+                    gimbal_yaw = float(yaw)
+                if pitch is not None:
+                    gimbal_pitch = float(pitch)
+                elif yaw is not None:
+                    gimbal_pitch = 0.0
         except Exception:
             pass
         v_lat = self._lat
@@ -6034,6 +6038,7 @@ class MapWidget(QWidget):
             "gps_fix_type": int(getattr(self, "_gps_fix_type", 0) or 0),
             "gps_satellites": int(getattr(self, "_gps_satellites", 0) or 0),
             "gps_hdop": self._gps_hdop,
+            "rangefinder_down_m": self._rangefinder_down_m,
             "target_lat": None,
             "target_lon": None,
             "target_alt_m": None,
@@ -6174,6 +6179,13 @@ class MapWidget(QWidget):
                     session_peak_range_m=peak,
                     facade_reference_range_m=facade_ref,
                 )
+                if seg_m is None:
+                    rf = session_rangefinder_reference_m(
+                        self._observations + [row]
+                    )
+                    seg_m = segment_distance_video_fallback(
+                        partner, row, hfov_deg=hfov, range_m=rf
+                    )
             else:
                 prev_row = self._observations[-1]
                 if marks_same_height_band(prev_row, row):
@@ -6231,7 +6243,12 @@ class MapWidget(QWidget):
                 if row.get("target_lat") is not None:
                     msg += f" @ {float(row['target_lat']):.6f},{float(row['target_lon']):.6f}"
                 if seg_m is not None:
-                    msg += f" — targets {float(seg_m):.1f} m apart"
+                    est = (
+                        " (RF est)"
+                        if str(row.get("geo_quality") or "") == "insufficient"
+                        else ""
+                    )
+                    msg += f" — targets {float(seg_m):.1f} m apart{est}"
                 elif cross_band:
                     msg += " — click both edges at the same height (or Reset first)"
             elif kind == "video_mark":

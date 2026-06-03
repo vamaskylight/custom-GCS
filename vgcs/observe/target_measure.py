@@ -154,15 +154,59 @@ def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:
         return None
 
 
+def session_rangefinder_reference_m(rows: list[dict[str, Any]]) -> float | None:
+    """Downward rangefinder (m) logged with marks — fallback range for video-only width."""
+    best = 0.0
+    for row in rows:
+        for key in ("rangefinder_down_m", "vehicle_rel_alt_m"):
+            try:
+                v = float(row.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if 1.0 < v < 500.0 and v > best:
+                best = v
+    return best if best > 1.0 else None
+
+
+def segment_distance_video_fallback(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    range_m: float | None = None,
+) -> float | None:
+    """Width estimate from horizontal video angle × rangefinder (no GPS geo)."""
+    xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+    if xy_a is None or xy_b is None:
+        return None
+    dx = abs(xy_b[0] - xy_a[0])
+    if dx < 0.03:
+        return None
+    r = range_m
+    if r is None:
+        rf = session_rangefinder_reference_m([row_a, row_b])
+        r = rf
+    if r is None or r < 1.0:
+        return None
+    angle_h = dx * math.radians(float(hfov_deg))
+    d = float(r) * angle_h
+    if d < 15.0:
+        d *= _segment_scale_short()
+    return max(0.0, d)
+
+
 def cluster_observations_by_video_y(
     rows: list[dict[str, Any]],
     *,
     max_dy_norm: float = 0.18,
+    require_geo: bool = False,
 ) -> list[list[dict[str, Any]]]:
     """Group video marks into horizontal bands (same pillar height)."""
     clusters: list[list[dict[str, Any]]] = []
     for row in rows:
-        if observation_target_latlon(row) is None:
+        if require_geo and observation_target_latlon(row) is None:
+            continue
+        if str(row.get("kind") or "") != "video_mark" and _video_xy(row) is None:
             continue
         xy = _video_xy(row)
         if xy is None:
@@ -245,8 +289,9 @@ def band_width_partner_row(
     for other in rows:
         if other is row:
             continue
-        if observation_target_latlon(other) is None:
-            continue
+        if str(other.get("kind") or "") != "video_mark":
+            if observation_target_latlon(other) is None:
+                continue
         oxy = _video_xy(other)
         if oxy is None:
             continue
@@ -262,6 +307,13 @@ def band_width_partner_row(
     return best
 
 
+def _format_segment_label(d: float, *, video_only: bool, video_span_norm: float | None) -> str:
+    base = format_target_segment_label(d, video_span_norm=video_span_norm)
+    if video_only and base and base != "distance unreliable":
+        return f"~{base}"
+    return base
+
+
 def observation_facade_video_segments(
     rows: list[dict[str, Any]],
     *,
@@ -274,7 +326,10 @@ def observation_facade_video_segments(
     facade_ref = session_facade_reference_range_m(
         rows, hfov_deg=hfov_deg, max_dy_norm=max_dy_norm
     )
-    for cluster in cluster_observations_by_video_y(rows, max_dy_norm=max_dy_norm):
+    rf_ref = session_rangefinder_reference_m(rows)
+    for cluster in cluster_observations_by_video_y(
+        rows, max_dy_norm=max_dy_norm, require_geo=True
+    ):
         if len(cluster) < 2:
             continue
         ordered = sorted(
@@ -298,7 +353,33 @@ def observation_facade_video_segments(
         if d is None:
             continue
         pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
-        label = format_target_segment_label(d, video_span_norm=pix)
+        label = _format_segment_label(d, video_only=False, video_span_norm=pix)
+        if label:
+            out.append((xy_l[0], xy_l[1], xy_r[0], xy_r[1], label))
+    if out:
+        return out
+    for cluster in cluster_observations_by_video_y(
+        rows, max_dy_norm=max_dy_norm, require_geo=False
+    ):
+        if len(cluster) < 2:
+            continue
+        ordered = sorted(
+            cluster,
+            key=lambda r: float((_video_xy(r) or (0.0, 0.0))[0]),
+        )
+        left, right = ordered[0], ordered[-1]
+        if left is right:
+            continue
+        xy_l, xy_r = _video_xy(left), _video_xy(right)
+        if xy_l is None or xy_r is None:
+            continue
+        d = segment_distance_video_fallback(
+            left, right, hfov_deg=hfov_deg, range_m=rf_ref
+        )
+        if d is None:
+            continue
+        pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
+        label = _format_segment_label(d, video_only=True, video_span_norm=pix)
         if label:
             out.append((xy_l[0], xy_l[1], xy_r[0], xy_r[1], label))
     return out
