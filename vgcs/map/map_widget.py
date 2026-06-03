@@ -63,6 +63,12 @@ from PySide6.QtGui import (
 )
 from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayDetection
 from vgcs.observe.geo_reference import compute_geo_reference
+from vgcs.observe.target_measure import (
+    haversine_m,
+    observation_target_latlon,
+    segment_distances_m,
+    target_track_from_observations,
+)
 from vgcs.mission import (
     Waypoint,
     load_waypoints_json,
@@ -761,6 +767,7 @@ class _ObservationExportTask(QRunnable):
             "geo_method",
             "geo_range_m",
             "geo_bearing_deg",
+            "segment_distance_m",
             "snapshot_path",
             "clip_path",
         ]
@@ -792,6 +799,7 @@ class _ObservationExportTask(QRunnable):
                     f"<td>{row.get('video_y_norm','')}</td>"
                     f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
                     f"<td>{row.get('geo_range_m','')}</td>"
+                    f"<td>{row.get('segment_distance_m','')}</td>"
                     f"<td>{row.get('gps_fix_type','')}</td>"
                     f"<td>{row.get('gps_satellites','')}</td>"
                     f"<td>{row.get('gps_hdop','')}</td>"
@@ -812,6 +820,7 @@ class _ObservationExportTask(QRunnable):
                 "<th>Target Lat</th><th>Target Lon</th><th>Geo Quality</th>"
                 "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
                 "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
+                "<th>Target Sep (m)</th>"
                 "<th>GPS Fix</th><th>GPS Sats</th><th>HDOP</th><th>Geo Warning</th>"
                 "<th>Snapshot</th><th>Clip</th>"
                 "</tr></thead><tbody>"
@@ -6128,6 +6137,14 @@ class MapWidget(QWidget):
         }
         row.update(self._observation_context())
         self._enrich_observation_geo_reference(row)
+        track_before = target_track_from_observations(self._observations)
+        seg_m = None
+        pt = observation_target_latlon(row)
+        if pt is not None and track_before:
+            seg_m = haversine_m(track_before[-1][0], track_before[-1][1], pt[0], pt[1])
+            row["segment_distance_m"] = seg_m
+        else:
+            row["segment_distance_m"] = None
         self._observations.append(row)
         idx = len(self._observations) - 1
         if capture_snapshot:
@@ -6153,18 +6170,21 @@ class MapWidget(QWidget):
                 " — gimbal N/A (Skydroid C13: TOP UDP port 5000; on RC hotspot try Host=RC gateway "
                 "e.g. 192.168.43.1; ZR10: SIYI SDK UDP 37260)"
             )
-        elif kind == "video_mark":
+        elif kind in ("video_mark", "map_mark"):
             gq = str(row.get("geo_quality") or "")
             if gq in ("good", "fair", "map_direct"):
                 rng = row.get("geo_range_m")
-                rng_s = f"{float(rng):.0f} m" if rng is not None else "—"
-                msg += f" — geo {gq}, range {rng_s}"
+                if rng is not None:
+                    msg += f" — drone→target {float(rng):.0f} m"
                 if row.get("target_lat") is not None:
                     msg += f" @ {float(row['target_lat']):.6f},{float(row['target_lon']):.6f}"
-            else:
+                if seg_m is not None:
+                    msg += f" — targets {float(seg_m):.0f} m apart"
+            elif kind == "video_mark":
                 warn = str(row.get("geo_warning") or "geo insufficient")
                 msg += f" — {warn}"
         self._set_status(msg)
+        self._refresh_observation_measure_overlays()
 
         # Native OBSERVE -> Target needs a visible marker on the Qt map.
         if kind == "map_mark" and map_lat is not None and map_lon is not None:
@@ -6194,8 +6214,47 @@ class MapWidget(QWidget):
     def _flush_video_marks_overlay(self) -> None:
         try:
             self._native_video_overlay.set_video_marks(list(self._video_obs_marks))
+            self._native_video_overlay.set_target_measure_segments(
+                self._observation_video_measure_segments()
+            )
         except Exception:
             pass
+
+    def _observation_video_measure_segments(self) -> list[tuple[float, float, float, float, str]]:
+        """Dashed lines on video between consecutive marks that have ground coords."""
+        from vgcs.observe.target_measure import haversine_m
+
+        segs: list[tuple[float, float, float, float, str]] = []
+        prev_xy: tuple[float, float] | None = None
+        prev_geo: tuple[float, float] | None = None
+        for row in self._observations:
+            vx = row.get("video_x_norm")
+            vy = row.get("video_y_norm")
+            if vx is None or vy is None:
+                continue
+            geo = observation_target_latlon(row)
+            if geo is None:
+                continue
+            xy = (float(vx), float(vy))
+            if prev_xy is not None and prev_geo is not None:
+                d = haversine_m(prev_geo[0], prev_geo[1], geo[0], geo[1])
+                segs.append((prev_xy[0], prev_xy[1], xy[0], xy[1], f"{d:.0f} m"))
+            prev_xy = xy
+            prev_geo = geo
+        return segs
+
+    def _refresh_observation_measure_overlays(self) -> None:
+        """Sync map measure lines + video segment labels from logged observations."""
+        track = target_track_from_observations(self._observations)
+        dists = segment_distances_m(track)
+        labels = [f"{d:.0f} m" for d in dists]
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "set_observation_target_track"):
+                nm.set_observation_target_track(track, segment_labels=labels)
+        except Exception:
+            pass
+        self._schedule_video_marks_overlay_refresh()
 
     def _schedule_observation_snapshot(self, idx: int) -> None:
         """Queue JPEG write on a worker thread so Target / map clicks stay responsive."""
@@ -6424,6 +6483,7 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._run_js("if (window.clearObservationMarks) clearObservationMarks();")
+        self._refresh_observation_measure_overlays()
         self._set_status(f"Cleared observations: {n}")
 
     def _export_observations(self, *, quick: bool = False) -> None:
@@ -6540,6 +6600,7 @@ class MapWidget(QWidget):
                 f"<td>{row.get('video_y_norm','')}</td>"
                 f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
                 f"<td>{row.get('geo_range_m','')}</td>"
+                f"<td>{row.get('segment_distance_m','')}</td>"
                 f"<td>{row.get('gps_fix_type','')}</td>"
                 f"<td>{row.get('gps_satellites','')}</td>"
                 f"<td>{row.get('gps_hdop','')}</td>"
@@ -6560,6 +6621,7 @@ class MapWidget(QWidget):
             "<th>Target Lat</th><th>Target Lon</th><th>Geo Quality</th>"
             "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
             "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
+            "<th>Target Sep (m)</th>"
             "<th>GPS Fix</th><th>GPS Sats</th><th>HDOP</th><th>Geo Warning</th>"
             "<th>Snapshot</th><th>Clip</th>"
             "</tr></thead><tbody>"
