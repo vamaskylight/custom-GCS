@@ -187,3 +187,26 @@ def test_multi_height_pillar_rows_match_bottom_width():
     d_top = float(segs[1][4].split()[0])
     assert 3.5 <= d_bottom <= 6.5
     assert abs(d_top - d_bottom) < 1.0
+
+
+def test_video_fallback_when_geo_insufficient():
+    rows = [
+        {
+            "kind": "video_mark",
+            "video_x_norm": 0.318,
+            "video_y_norm": 0.517,
+            "geo_quality": "insufficient",
+            "rangefinder_down_m": 27.38,
+        },
+        {
+            "kind": "video_mark",
+            "video_x_norm": 0.834,
+            "video_y_norm": 0.484,
+            "geo_quality": "insufficient",
+            "rangefinder_down_m": 27.38,
+        },
+    ]
+    segs = observation_facade_video_segments(rows, hfov_deg=62.0)
+    assert len(segs) == 1
+    assert segs[0][4].startswith("~")
+    assert float(segs[0][4].lstrip("~").split()[0]) > 5.0
