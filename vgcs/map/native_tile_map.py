@@ -1094,16 +1094,16 @@ class NativeTileMapView(QWidget):
             painter.setFont(font)
             metrics = painter.fontMetrics()
             for i in range(1, len(self._target_track)):
-                la, lo = self._target_track[i - 1]
-                lb, lob = self._target_track[i]
-                c0 = self._project(la, lo, z, fx, fy, w, h)
-                c1 = self._project(lb, lob, z, fx, fy, w, h)
-                painter.drawLine(c0, c1)
                 label = ""
                 if i - 1 < len(self._target_track_labels):
                     label = str(self._target_track_labels[i - 1] or "").strip()
                 if not label:
                     continue
+                la, lo = self._target_track[i - 1]
+                lb, lob = self._target_track[i]
+                c0 = self._project(la, lo, z, fx, fy, w, h)
+                c1 = self._project(lb, lob, z, fx, fy, w, h)
+                painter.drawLine(c0, c1)
                 mx = (c0.x() + c1.x()) / 2.0
                 my = (c0.y() + c1.y()) / 2.0
                 tw = metrics.horizontalAdvance(label) + 10

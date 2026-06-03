@@ -64,12 +64,17 @@ from PySide6.QtGui import (
 from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayDetection
 from vgcs.observe.geo_reference import compute_geo_reference
 from vgcs.observe.target_measure import (
+    band_width_partner_row,
     format_target_segment_label,
     haversine_m,
     is_downward_sensor_orientation,
+    marks_same_height_band,
+    observation_facade_video_segments,
     observation_target_latlon,
     resolve_vehicle_agl_m,
     segment_distance_between_rows,
+    session_facade_reference_range_m,
+    session_peak_geo_range_m,
     target_track_from_observations,
     video_mark_span_norm,
 )
@@ -6153,14 +6158,42 @@ class MapWidget(QWidget):
         track_before = target_track_from_observations(self._observations)
         seg_m = None
         pt = observation_target_latlon(row)
+        cross_band = False
         if pt is not None and track_before:
-            prev_row = self._observations[-1]
             hfov, _ = self._m8_geo_settings()
-            seg_m = segment_distance_between_rows(prev_row, row, hfov_deg=hfov)
-            if seg_m is None:
-                seg_m = haversine_m(
-                    track_before[-1][0], track_before[-1][1], pt[0], pt[1]
+            peak = session_peak_geo_range_m(self._observations)
+            facade_ref = session_facade_reference_range_m(
+                self._observations, hfov_deg=hfov
+            )
+            partner = band_width_partner_row(self._observations, row)
+            if partner is not None:
+                seg_m = segment_distance_between_rows(
+                    partner,
+                    row,
+                    hfov_deg=hfov,
+                    session_peak_range_m=peak,
+                    facade_reference_range_m=facade_ref,
                 )
+            else:
+                prev_row = self._observations[-1]
+                if marks_same_height_band(prev_row, row):
+                    seg_m = segment_distance_between_rows(
+                        prev_row,
+                        row,
+                        hfov_deg=hfov,
+                        session_peak_range_m=peak,
+                        facade_reference_range_m=facade_ref,
+                    )
+                    if seg_m is None:
+                        seg_m = haversine_m(
+                            track_before[-1][0],
+                            track_before[-1][1],
+                            pt[0],
+                            pt[1],
+                        )
+                else:
+                    cross_band = True
+                    seg_m = None
             row["segment_distance_m"] = seg_m
         else:
             row["segment_distance_m"] = None
@@ -6198,7 +6231,9 @@ class MapWidget(QWidget):
                 if row.get("target_lat") is not None:
                     msg += f" @ {float(row['target_lat']):.6f},{float(row['target_lon']):.6f}"
                 if seg_m is not None:
-                    msg += f" — targets {float(seg_m):.0f} m apart"
+                    msg += f" — targets {float(seg_m):.1f} m apart"
+                elif cross_band:
+                    msg += " — click both edges at the same height (or Reset first)"
             elif kind == "video_mark":
                 warn = str(row.get("geo_warning") or "geo insufficient")
                 msg += f" — {warn}"
@@ -6239,39 +6274,17 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-    def _observation_video_measure_segments(self) -> list[tuple[float, float, float, float, str]]:
-        """Dashed lines on video between consecutive marks that have ground coords."""
+    def _observation_measure_labels_and_segments(
+        self,
+    ) -> tuple[list[str], list[tuple[float, float, float, float, str]]]:
+        """Map labels (one per track edge) and video measure lines (same-height pairs only)."""
+        labels: list[str] = []
         segs: list[tuple[float, float, float, float, str]] = []
         hfov, _ = self._m8_geo_settings()
-        prev_row: dict[str, object] | None = None
-        prev_xy: tuple[float, float] | None = None
-        for row in self._observations:
-            vx = row.get("video_x_norm")
-            vy = row.get("video_y_norm")
-            if vx is None or vy is None:
-                continue
-            if observation_target_latlon(row) is None:
-                continue
-            xy = (float(vx), float(vy))
-            if prev_row is not None and prev_xy is not None:
-                d = segment_distance_between_rows(prev_row, row, hfov_deg=hfov)
-                if d is None:
-                    pa = observation_target_latlon(prev_row)
-                    pb = observation_target_latlon(row)
-                    if pa and pb:
-                        d = haversine_m(pa[0], pa[1], pb[0], pb[1])
-                if d is not None:
-                    pix = video_mark_span_norm(prev_xy[0], prev_xy[1], xy[0], xy[1])
-                    label = format_target_segment_label(d, video_span_norm=pix)
-                    segs.append((prev_xy[0], prev_xy[1], xy[0], xy[1], label))
-            prev_row = row
-            prev_xy = xy
-        return segs
-
-    def _refresh_observation_measure_overlays(self) -> None:
-        """Sync map measure lines + video segment labels from logged observations."""
-        labels: list[str] = []
-        hfov, _ = self._m8_geo_settings()
+        peak = session_peak_geo_range_m(self._observations)
+        facade_ref = session_facade_reference_range_m(
+            self._observations, hfov_deg=hfov
+        )
         prev_row: dict[str, object] | None = None
         prev_xy: tuple[float, float] | None = None
         for row in self._observations:
@@ -6279,20 +6292,49 @@ class MapWidget(QWidget):
                 continue
             vx = row.get("video_x_norm")
             vy = row.get("video_y_norm")
-            if prev_row is not None and vx is not None and vy is not None:
-                d = segment_distance_between_rows(prev_row, row, hfov_deg=hfov)
-                if d is not None:
+            if prev_row is not None:
+                if marks_same_height_band(prev_row, row):
+                    d = segment_distance_between_rows(
+                        prev_row,
+                        row,
+                        hfov_deg=hfov,
+                        session_peak_range_m=peak,
+                        facade_reference_range_m=facade_ref,
+                    )
                     pix = None
-                    if prev_xy is not None:
+                    if (
+                        prev_xy is not None
+                        and vx is not None
+                        and vy is not None
+                    ):
                         pix = video_mark_span_norm(
                             prev_xy[0], prev_xy[1], float(vx), float(vy)
                         )
-                    labels.append(
+                    label = (
                         format_target_segment_label(d, video_span_norm=pix)
+                        if d is not None
+                        else ""
                     )
+                    labels.append(label)
+                    if label and prev_xy is not None and vx is not None and vy is not None:
+                        segs.append(
+                            (prev_xy[0], prev_xy[1], float(vx), float(vy), label)
+                        )
+                else:
+                    labels.append("")
             prev_row = row
             if vx is not None and vy is not None:
                 prev_xy = (float(vx), float(vy))
+        return labels, segs
+
+    def _observation_video_measure_segments(self) -> list[tuple[float, float, float, float, str]]:
+        """Dashed lines: one width per height band (left↔right), stable across pillar rows."""
+        hfov, _ = self._m8_geo_settings()
+        return observation_facade_video_segments(self._observations, hfov_deg=hfov)
+
+    def _refresh_observation_measure_overlays(self) -> None:
+        """Sync map measure lines + video segment labels from logged observations."""
+        labels, _ = self._observation_measure_labels_and_segments()
         track = target_track_from_observations(self._observations)
         try:
             nm = getattr(self, "_native_map", None)
