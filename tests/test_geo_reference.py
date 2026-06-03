@@ -53,6 +53,24 @@ def test_forward_oblique_increases_range():
     assert r.target_lat > 37.0
 
 
+def test_rangefinder_agl_fallback():
+    r = compute_geo_reference(
+        vehicle_lat=20.4458,
+        vehicle_lon=72.8630,
+        vehicle_heading_deg=0.0,
+        vehicle_rel_alt_m=0.0,
+        rangefinder_down_m=1.2,
+        gimbal_yaw_deg=0.5,
+        gimbal_pitch_deg=0.0,
+        video_x_norm=0.4,
+        video_y_norm=0.35,
+        gps_fix_type=3,
+    )
+    assert r.ok
+    assert r.target_lat is not None
+    assert r.method in ("ray_ground_rangefinder_agl", "ray_ground_flat", "ray_ground_dem")
+
+
 def test_insufficient_without_gimbal():
     r = compute_geo_reference(
         vehicle_lat=37.0,
