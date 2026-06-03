@@ -39,6 +39,8 @@ class NativeVideoOverlayLayer(QWidget):
         self._detections: list[VideoOverlayDetection] = []
         # Normalized 0..1 relative to this widget (matches click handling on the QLabel).
         self._video_marks: list[tuple[float, float]] = []
+        # Normalized segments (x1,y1,x2,y2) in widget coords + ground distance label.
+        self._measure_segments: list[tuple[float, float, float, float, str]] = []
 
     def set_content_rect(self, rect: dict[str, float] | None) -> None:
         self._content_rect = dict(rect) if rect else None
@@ -74,6 +76,27 @@ class NativeVideoOverlayLayer(QWidget):
         self._video_marks = [(float(x), float(y)) for x, y in marks]
         self.update()
 
+    def set_target_measure_segments(
+        self, segments: list[tuple[float, float, float, float, str]]
+    ) -> None:
+        """Draw dashed lines between video marks; label is ground distance (m)."""
+        out: list[tuple[float, float, float, float, str]] = []
+        for raw in segments:
+            try:
+                out.append(
+                    (
+                        float(raw[0]),
+                        float(raw[1]),
+                        float(raw[2]),
+                        float(raw[3]),
+                        str(raw[4] or ""),
+                    )
+                )
+            except (IndexError, TypeError, ValueError):
+                continue
+        self._measure_segments = out
+        self.update()
+
     def clear_detections(self) -> None:
         self._detections.clear()
         self.update()
@@ -85,6 +108,7 @@ class NativeVideoOverlayLayer(QWidget):
     def clear_all(self) -> None:
         self._detections.clear()
         self._video_marks.clear()
+        self._measure_segments.clear()
         self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -106,7 +130,7 @@ class NativeVideoOverlayLayer(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
-        if not self._detections and not self._video_marks:
+        if not self._detections and not self._video_marks and not self._measure_segments:
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -137,9 +161,30 @@ class NativeVideoOverlayLayer(QWidget):
 
         ww = float(max(1, self.width()))
         wh = float(max(1, self.height()))
+        for x1, y1, x2, y2, label in self._measure_segments:
+            ax = cl + x1 * cw
+            ay = ct + y1 * ch
+            bx = cl + x2 * cw
+            by = ct + y2 * ch
+            p.setPen(QPen(QColor(255, 120, 200, 230), 2, Qt.PenStyle.DashLine))
+            p.drawLine(int(ax), int(ay), int(bx), int(by))
+            if label:
+                mx = (ax + bx) / 2.0
+                my = (ay + by) / 2.0
+                font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+                p.setFont(font)
+                metrics = p.fontMetrics()
+                tw = metrics.horizontalAdvance(label) + 12
+                th = metrics.height() + 8
+                tx = int(mx - tw / 2)
+                ty = int(my - th / 2)
+                p.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
+                p.setPen(QColor(255, 200, 240))
+                p.drawText(tx + 6, ty + metrics.ascent() + 4, label)
+
         for xn, yn in self._video_marks:
-            cx = xn * ww
-            cy = yn * wh
+            cx = cl + xn * cw
+            cy = ct + yn * ch
             p.setPen(QPen(QColor(255, 210, 70, 240), 2))
             p.setBrush(QColor(255, 80, 60, 220))
             p.drawEllipse(int(cx) - 5, int(cy) - 5, 10, 10)

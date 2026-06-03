@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.request import Request, build_opener
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
+from PySide6.QtGui import QColor, QFont, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
 try:
@@ -475,6 +475,9 @@ class NativeTileMapView(QWidget):
         # Stores lat/lon pairs for OBSERVE -> Target marks (native rendering).
         self._observation_marks: list[tuple[float, float]] = []
         self._geo_referenced_marks: list[tuple[float, float]] = []
+        # Consecutive ground targets (lat, lon) for measure lines + distance labels.
+        self._target_track: list[tuple[float, float]] = []
+        self._target_track_labels: list[str] = []
         self._pending_timer = QTimer(self)
         self._pending_timer.setSingleShot(True)
         self._pending_timer.setInterval(32)
@@ -706,11 +709,30 @@ class NativeTileMapView(QWidget):
             self._geo_referenced_marks = self._geo_referenced_marks[-2000:]
         self.update()
 
+    def set_observation_target_track(
+        self,
+        points: list[tuple[float, float]],
+        *,
+        segment_labels: list[str] | None = None,
+    ) -> None:
+        """M8 measure — draw lines and distance (m) between consecutive geo targets."""
+        try:
+            self._target_track = [(float(a), float(b)) for a, b in points]
+        except Exception:
+            self._target_track = []
+        if segment_labels is not None:
+            self._target_track_labels = [str(s) for s in segment_labels]
+        else:
+            self._target_track_labels = []
+        self.update()
+
     def clear_observation_marks(self) -> None:
         """Clear all visible OBSERVE -> Target markers."""
         try:
             self._observation_marks.clear()
             self._geo_referenced_marks.clear()
+            self._target_track.clear()
+            self._target_track_labels.clear()
         except Exception:
             pass
         self.update()
@@ -1045,6 +1067,52 @@ class NativeTileMapView(QWidget):
                 painter.drawEllipse(c, 6, 6)
                 painter.drawLine(int(c.x() - 12), int(c.y()), int(c.x() + 12), int(c.y()))
                 painter.drawLine(int(c.x()), int(c.y() - 12), int(c.x()), int(c.y() + 12))
+            # Coordinate label on latest geo target.
+            try:
+                lat, lon = self._geo_referenced_marks[-1]
+                c = self._project(lat, lon, z, fx, fy, w, h)
+                caption = f"{float(lat):.6f}, {float(lon):.6f}"
+                font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+                painter.setFont(font)
+                metrics = painter.fontMetrics()
+                tw = metrics.horizontalAdvance(caption) + 8
+                th = metrics.height() + 4
+                tx = int(c.x()) + 10
+                ty = int(c.y()) - th - 6
+                painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
+                painter.setPen(QColor(120, 235, 255))
+                painter.drawText(tx + 4, ty + metrics.ascent() + 2, caption)
+            except Exception:
+                pass
+
+        # Measure lines between consecutive targets (ground distance).
+        if len(self._target_track) >= 2:
+            pen = QPen(QColor(255, 120, 200, 220), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            for i in range(1, len(self._target_track)):
+                la, lo = self._target_track[i - 1]
+                lb, lob = self._target_track[i]
+                c0 = self._project(la, lo, z, fx, fy, w, h)
+                c1 = self._project(lb, lob, z, fx, fy, w, h)
+                painter.drawLine(c0, c1)
+                label = ""
+                if i - 1 < len(self._target_track_labels):
+                    label = str(self._target_track_labels[i - 1] or "").strip()
+                if not label:
+                    continue
+                mx = (c0.x() + c1.x()) / 2.0
+                my = (c0.y() + c1.y()) / 2.0
+                tw = metrics.horizontalAdvance(label) + 10
+                th = metrics.height() + 6
+                tx = int(mx - tw / 2)
+                ty = int(my - th / 2)
+                painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 210))
+                painter.setPen(QColor(255, 200, 240))
+                painter.drawText(tx + 5, ty + metrics.ascent() + 3, label)
 
         # Vehicle — navigation-style arrow (matches compass HUD: sharp tip, concave base,
         # thick white outline, red fill, center dot). Heading=0 points toward -Y.
