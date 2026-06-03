@@ -43,11 +43,36 @@ def _horizontal_range_from_depression(agl_m: float, depression_deg: float) -> fl
     return float(agl_m) / math.tan(math.radians(dep))
 
 
+def _facade_agl_m(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    session_rf_floor_m: float | None = None,
+) -> float | None:
+    """AGL for facade width; ignore bogus high downward RF spikes (e.g. 45 m glitch)."""
+    vals: list[float] = []
+    for row in (row_a, row_b):
+        v = _observation_agl_m(row)
+        if v is not None and v > 0.5:
+            vals.append(v)
+    if not vals:
+        return None
+    agl = min(vals)
+    floor = session_rf_floor_m
+    if floor is not None and floor > 0.5:
+        if agl > floor * 1.25:
+            agl = floor
+    if agl > 18.0:
+        agl = 18.0
+    return agl
+
+
 def facade_plane_width_between_marks(
     row_a: dict[str, Any],
     row_b: dict[str, Any],
     *,
     hfov_deg: float = 62.0,
+    session_rf_floor_m: float | None = None,
 ) -> float | None:
     """
     Width (m) on a vertical facade between two video clicks at similar height.
@@ -61,7 +86,7 @@ def facade_plane_width_between_marks(
     if dx < 0.03:
         return None
 
-    agl = _observation_agl_m(row_a) or _observation_agl_m(row_b)
+    agl = _facade_agl_m(row_a, row_b, session_rf_floor_m=session_rf_floor_m)
     if agl is None:
         return None
 

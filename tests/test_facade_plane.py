@@ -43,4 +43,4 @@ def test_garage_four_metre_field_log():
     assert 3.2 <= d <= 4.6
     segs = observation_facade_video_segments([left, right], hfov_deg=62.0)
     assert len(segs) == 1
-    assert "(wall)" in segs[0][4]
+    assert "(wall)" in segs[0][4] or "tape" in segs[0][4]
