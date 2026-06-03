@@ -115,6 +115,64 @@ class NativeVideoOverlayLayer(QWidget):
         super().resizeEvent(event)
         self.update()
 
+    @staticmethod
+    def _split_measure_label(label: str) -> tuple[str, str]:
+        sep = " — "
+        if sep in label:
+            a, b = label.split(sep, 1)
+            return a.strip(), b.strip()
+        return label.strip(), ""
+
+    def _draw_measure_label(
+        self,
+        p: QPainter,
+        ax: float,
+        ay: float,
+        bx: float,
+        by: float,
+        label: str,
+    ) -> None:
+        mx = (ax + bx) / 2.0
+        my = (ay + by) / 2.0
+        line1, line2 = self._split_measure_label(label)
+        warn = "not level" in line2.lower() or "may read high" in line2.lower()
+        lines = [line1] if line1 else []
+        if line2:
+            lines.append(line2)
+        if not lines:
+            return
+        font_main = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        font_warn = QFont("Segoe UI", 8, QFont.Weight.DemiBold)
+        pad_x, pad_y = 8, 6
+        line_gap = 2
+        p.setFont(font_main)
+        m_main = p.fontMetrics()
+        p.setFont(font_warn)
+        m_warn = p.fontMetrics()
+        tw = max(
+            m_main.horizontalAdvance(lines[0]) if lines else 0,
+            m_warn.horizontalAdvance(lines[1]) if len(lines) > 1 else 0,
+        ) + pad_x * 2
+        th = (
+            (m_main.height() if lines else 0)
+            + (m_warn.height() + line_gap if len(lines) > 1 else 0)
+            + pad_y * 2
+        )
+        tx = int(mx - tw / 2)
+        ty = int(my - th / 2)
+        bg = QColor(80, 45, 10, 220) if warn and len(lines) > 1 else QColor(0, 0, 0, 200)
+        p.fillRect(tx, ty, int(tw), int(th), bg)
+        y_text = ty + pad_y + m_main.ascent()
+        if lines[0]:
+            p.setFont(font_main)
+            p.setPen(QColor(255, 220, 120) if warn else QColor(255, 200, 240))
+            p.drawText(tx + pad_x, y_text, lines[0])
+        if len(lines) > 1:
+            p.setFont(font_warn)
+            p.setPen(QColor(255, 200, 100))
+            y_text += m_main.height() + line_gap
+            p.drawText(tx + pad_x, y_text + m_warn.ascent() - m_main.ascent(), lines[1])
+
     def _content_qrect(self) -> tuple[float, float, float, float]:
         """Return (left, top, width, height) in widget coordinates for the video pixmap area."""
         w = float(max(1, self.width()))
@@ -169,18 +227,7 @@ class NativeVideoOverlayLayer(QWidget):
             p.setPen(QPen(QColor(255, 120, 200, 230), 2, Qt.PenStyle.DashLine))
             p.drawLine(int(ax), int(ay), int(bx), int(by))
             if label:
-                mx = (ax + bx) / 2.0
-                my = (ay + by) / 2.0
-                font = QFont("Segoe UI", 10, QFont.Weight.Bold)
-                p.setFont(font)
-                metrics = p.fontMetrics()
-                tw = metrics.horizontalAdvance(label) + 12
-                th = metrics.height() + 8
-                tx = int(mx - tw / 2)
-                ty = int(my - th / 2)
-                p.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
-                p.setPen(QColor(255, 200, 240))
-                p.drawText(tx + 6, ty + metrics.ascent() + 4, label)
+                self._draw_measure_label(p, ax, ay, bx, by, label)
 
         for xn, yn in self._video_marks:
             cx = cl + xn * cw
