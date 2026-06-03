@@ -161,6 +161,9 @@ class MainWindow(QMainWindow):
         self._arm_denied_reason = ""
         self._arm_denied_until_mono = 0.0
         self._arm_ready_confirmed = False
+        self._hb_connected_since_mono: float | None = None
+        self._last_gps_fix_type: int = 0
+        self._last_gps_sats: int = 0
         self._theme_colors = self._build_theme_colors(self._theme_name)
         self._compact_ui = self._detect_compact_ui()
         self._last_vehicle_type: int | None = None
@@ -2634,23 +2637,48 @@ class MainWindow(QMainWindow):
 
         if state_norm == "green":
             self._flight_status_btn.setText("ARMED" if self._armed_since is not None else "READY TO ARM")
+            self._flight_status_btn.setToolTip(
+                "Flight mode and arm readiness are separate. "
+                f"Current mode: {self._hb_mode_text or '—'}"
+            )
             self._set_top_vehicle_msg(message)
             self._map_widget.set_flight_status("green", message)
             return
         if state_norm == "yellow":
-            self._flight_status_btn.setText("NOT READY TO ARM")
+            self._flight_status_btn.setText(self._flight_status_not_ready_label())
+            self._flight_status_btn.setToolTip(str(message or ""))
             self._set_top_vehicle_msg(message)
             self._map_widget.set_flight_status("yellow", message)
             return
         if state_norm == "red":
-            self._flight_status_btn.setText("NOT READY TO ARM")
+            self._flight_status_btn.setText(self._flight_status_not_ready_label())
+            self._flight_status_btn.setToolTip(str(message or ""))
             self._set_top_vehicle_msg(message)
             self._map_widget.set_flight_status("red", message)
             return
         # Cold-start / idle disconnected: Web stylesheet `#linkBanner` neutral background — not maroon.
         self._flight_status_btn.setText("NOT READY TO ARM")
+        self._flight_status_btn.setToolTip("")
         self._set_top_vehicle_msg(message)
         self._map_widget.set_flight_status("idle", message)
+
+    def _flight_status_not_ready_label(self) -> str:
+        """Short header chip when the vehicle is connected but not armable."""
+        reason = str(self._prearm_block_reason or self._arm_denied_reason or "").strip()
+        if reason:
+            short = reason.replace("\n", " ")
+            if len(short) > 34:
+                short = short[:31] + "…"
+            return f"NOT READY · {short}"
+        standby = int(mavutil.mavlink.MAV_STATE_STANDBY)
+        if int(self._hb_system_status) < standby:
+            return "NOT READY · Booting"
+        if int(self._last_gps_fix_type or 0) < 3:
+            return "NOT READY · Need 3D GPS"
+        mode = str(self._hb_mode_text or "").strip()
+        if mode:
+            return f"NOT READY · {mode} OK, PreArm pending"
+        return "NOT READY TO ARM"
 
     def _is_probably_flying(self) -> bool:
         """Best-effort airborne detector for header text."""
@@ -2682,7 +2710,6 @@ class MainWindow(QMainWindow):
             reason = str(self._arm_denied_reason or self._prearm_block_reason or "").strip()
             msg = f"Arm denied - {reason}" if reason else "Arm denied"
             self._set_dashboard_flight_status("yellow", msg)
-            self._flight_status_btn.setText("NOT READY TO ARM")
             return
         if self._hb_armed:
             mode_disp = str(self._hb_mode_text or "Unknown").strip()
@@ -2695,7 +2722,16 @@ class MainWindow(QMainWindow):
             return
         if not self._hb_arm_ready:
             reason = str(self._prearm_block_reason or "").strip()
-            msg = f"Connected - Not Ready to Arm ({reason})" if reason else "Connected - Not Ready to Arm"
+            mode_disp = str(self._hb_mode_text or "").strip()
+            if reason:
+                msg = f"Connected - Not Ready to Arm ({reason})"
+            elif mode_disp:
+                msg = (
+                    f"Connected - {mode_disp} mode (not arm status). "
+                    "Waiting for vehicle PreArm checks to pass."
+                )
+            else:
+                msg = "Connected - Not Ready to Arm (waiting for PreArm OK)"
             self._set_dashboard_flight_status("yellow", msg)
             return
         mode_disp = str(self._hb_mode_text or "").strip()
@@ -2740,7 +2776,16 @@ class MainWindow(QMainWindow):
         if self._arm_ready_confirmed or home_wait_ok:
             return True
 
-        # GPS modes: wait for explicit PreArm pass STATUSTEXT to avoid boot flicker.
+        # GPS modes (LOITER, etc.): STANDBY + 3D GPS + no PreArm fault, after link settles.
+        if (
+            system_status >= standby
+            and int(getattr(self, "_last_gps_fix_type", 0) or 0) >= 3
+            and not self._prearm_block_active()
+        ):
+            since = getattr(self, "_hb_connected_since_mono", None)
+            if since is not None and (time.monotonic() - float(since)) >= 12.0:
+                return True
+
         return False
 
     def _update_prearm_gate_from_statustext(self, text: str) -> None:
@@ -3055,6 +3100,7 @@ class MainWindow(QMainWindow):
         self._arm_not_ready_since_mono = None
         self._recent_statustext.clear()
         self._arm_ready_confirmed = False
+        self._hb_connected_since_mono = None
         self._status.setText("Connecting…")
         self._apply_state_style(self._status, "warn")
         self._set_dashboard_flight_status("yellow", "Connecting to vehicle...")
@@ -3211,6 +3257,7 @@ class MainWindow(QMainWindow):
         self._arm_not_ready_alert_shown = False
         self._arm_not_ready_since_mono = None
         self._arm_ready_confirmed = False
+        self._hb_connected_since_mono = None
         self._last_hb_ui_key = None
         self._hb_armed = False
         self._hb_arm_ready = False
@@ -3293,6 +3340,7 @@ class MainWindow(QMainWindow):
     def _on_heartbeat(self, sysid: int, compid: int, mav_ver: int) -> None:
         if not self._heartbeat_seen:
             self._heartbeat_seen = True
+            self._hb_connected_since_mono = time.monotonic()
             self._connect_attempt_active = False
             self._status.setText("Connected")
             self._apply_state_style(self._status, "ok")
@@ -3503,6 +3551,8 @@ class MainWindow(QMainWindow):
             hdop_text = "N/A" if hdop is None else f"{hdop:.2f}"
             sat = int(data.get("satellites_visible", 0))
             fix_type = int(data.get("fix_type", 0) or 0)
+            self._last_gps_fix_type = fix_type
+            self._last_gps_sats = sat
             self._fields["gps"].setText(
                 f"fix={fix_type} sat={sat} hdop={hdop_text}"
             )

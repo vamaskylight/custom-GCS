@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from vgcs.observe.target_measure import (
     observation_target_latlon,
+    resolve_vehicle_agl_m,
     segment_distances_m,
     target_track_from_observations,
 )
@@ -19,6 +20,12 @@ def test_track_and_segment():
     segs = segment_distances_m(track)
     assert len(segs) == 1
     assert segs[0] > 100.0
+
+
+def test_resolve_agl_from_rangefinder():
+    agl, src = resolve_vehicle_agl_m(relative_alt_m=0.0, rangefinder_down_m=1.2)
+    assert agl == 1.2
+    assert src == "rangefinder_down"
 
 
 def test_map_mark_uses_map_latlon():

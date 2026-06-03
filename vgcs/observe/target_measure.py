@@ -48,6 +48,43 @@ def target_track_from_observations(rows: list[dict[str, Any]]) -> list[tuple[flo
     return out
 
 
+# MAV_SENSOR_ROTATION_PITCH_270 — downward rangefinder on ArduPilot.
+_MAV_ORIENTATION_PITCH_270 = 25
+
+
+def is_downward_sensor_orientation(orientation: int) -> bool:
+    o = int(orientation)
+    return o in (_MAV_ORIENTATION_PITCH_270, 24, 26)
+
+
+def resolve_vehicle_agl_m(
+    *,
+    relative_alt_m: float | None,
+    rangefinder_down_m: float | None = None,
+) -> tuple[float | None, str]:
+    """
+    Best-effort height above ground for M8 ray intersection.
+
+    EKF ``relative_alt`` is often 0 on the bench; downward rangefinder (common on logs)
+    is used as fallback when present.
+    """
+    try:
+        rel = float(relative_alt_m) if relative_alt_m is not None else None
+    except (TypeError, ValueError):
+        rel = None
+    if rel is not None and rel > 0.5:
+        return rel, "ekf_relative"
+    try:
+        rf = float(rangefinder_down_m) if rangefinder_down_m is not None else None
+    except (TypeError, ValueError):
+        rf = None
+    if rf is not None and 0.15 < rf < 200.0:
+        return rf, "rangefinder_down"
+    if rel is not None and rel > 0.05:
+        return max(rel, 0.5), "ekf_relative_low"
+    return None, ""
+
+
 def segment_distances_m(track: list[tuple[float, float]]) -> list[float]:
     """Ground distance (m) for each consecutive pair in ``track``."""
     segs: list[float] = []

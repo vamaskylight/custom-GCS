@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from vgcs.observe.target_measure import resolve_vehicle_agl_m
+
 _EARTH_RADIUS_M = 6_371_000.0
 
 
@@ -142,6 +144,7 @@ def compute_geo_reference(
     vehicle_pitch_deg: float | None = None,
     vehicle_rel_alt_m: float | None,
     vehicle_alt_msl_m: float | None = None,
+    rangefinder_down_m: float | None = None,
     gimbal_yaw_deg: float | None,
     gimbal_pitch_deg: float | None,
     video_x_norm: float,
@@ -161,10 +164,14 @@ def compute_geo_reference(
     """
     if vehicle_lat is None or vehicle_lon is None:
         return GeoReferenceResult(ok=False, warning="vehicle position missing", method="none")
-    if vehicle_rel_alt_m is None or float(vehicle_rel_alt_m) <= 0.5:
+    agl_m, agl_src = resolve_vehicle_agl_m(
+        relative_alt_m=vehicle_rel_alt_m,
+        rangefinder_down_m=rangefinder_down_m,
+    )
+    if agl_m is None:
         return GeoReferenceResult(
             ok=False,
-            warning="vehicle altitude AGL unknown or too low",
+            warning="vehicle altitude AGL unknown (need EKF rel alt or downward rangefinder)",
             method="none",
         )
     if gimbal_yaw_deg is None or gimbal_pitch_deg is None:
@@ -183,7 +190,14 @@ def compute_geo_reference(
     pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
     hdg = _deg2rad(float(vehicle_heading_deg or 0.0))
     g_yaw = _deg2rad(float(gimbal_yaw_deg))
-    g_pitch = _deg2rad(float(gimbal_pitch_deg))
+    g_pitch_deg = float(gimbal_pitch_deg)
+    pitch_assumed = False
+    # C13/Skydroid often reports ~0° when the lens is already oblique; use a sane
+    # default when downward rangefinder proves we are near the ground.
+    if abs(g_pitch_deg) < 3.0 and agl_src == "rangefinder_down":
+        g_pitch_deg = -35.0
+        pitch_assumed = True
+    g_pitch = _deg2rad(g_pitch_deg)
 
     r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
     r_body_gimbal = _mat_mul(_rot_z(g_yaw), _rot_y(g_pitch))
@@ -199,7 +213,10 @@ def compute_geo_reference(
             method="ray_ground",
         )
 
-    agl_m = float(vehicle_rel_alt_m)
+    agl_m = float(agl_m)
+    method = "ray_ground_flat"
+    if agl_src == "rangefinder_down":
+        method = "ray_ground_rangefinder_agl"
     lookup = dem_lookup
     if lookup is None and dem_path:
         dem = _DemLookup(dem_path)
@@ -207,7 +224,6 @@ def compute_geo_reference(
             lookup = dem.elevation_m
 
     ground_z_ned = agl_m
-    method = "ray_ground_flat"
     if lookup is not None and vehicle_alt_msl_m is not None:
         try:
             elev = lookup(float(vehicle_lat), float(vehicle_lon))
@@ -241,6 +257,9 @@ def compute_geo_reference(
         depression_deg=depression,
         range_m=range_m,
     )
+    if pitch_assumed:
+        extra = "gimbal pitch assumed -35° (sensor read ~0°)"
+        warn = f"{warn}; {extra}" if warn else extra
     ok = quality != "insufficient"
     return GeoReferenceResult(
         ok=ok,

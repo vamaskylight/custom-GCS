@@ -65,7 +65,9 @@ from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayD
 from vgcs.observe.geo_reference import compute_geo_reference
 from vgcs.observe.target_measure import (
     haversine_m,
+    is_downward_sensor_orientation,
     observation_target_latlon,
+    resolve_vehicle_agl_m,
     segment_distances_m,
     target_track_from_observations,
 )
@@ -768,6 +770,7 @@ class _ObservationExportTask(QRunnable):
             "geo_range_m",
             "geo_bearing_deg",
             "segment_distance_m",
+            "agl_source",
             "snapshot_path",
             "clip_path",
         ]
@@ -1027,6 +1030,7 @@ class MapWidget(QWidget):
         self._ai_phase = 0.0
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
+        self._rangefinder_down_m: float | None = None
         self._vehicle_alt_msl_m: float | None = None
         self._vehicle_roll_deg: float | None = None
         self._vehicle_pitch_deg: float | None = None
@@ -6006,13 +6010,18 @@ class MapWidget(QWidget):
                     v_lat, v_lon = float(pos[0]), float(pos[1])
             except Exception:
                 pass
+        agl_m, agl_src = resolve_vehicle_agl_m(
+            relative_alt_m=self._vehicle_rel_alt_m,
+            rangefinder_down_m=self._rangefinder_down_m,
+        )
         return {
             "vehicle_lat": v_lat,
             "vehicle_lon": v_lon,
             "vehicle_heading_deg": self._heading,
             "vehicle_roll_deg": self._vehicle_roll_deg,
             "vehicle_pitch_deg": self._vehicle_pitch_deg,
-            "vehicle_rel_alt_m": self._vehicle_rel_alt_m,
+            "vehicle_rel_alt_m": agl_m,
+            "agl_source": agl_src,
             "gimbal_yaw_deg": gimbal_yaw,
             "gimbal_pitch_deg": gimbal_pitch,
             "gps_fix_type": int(getattr(self, "_gps_fix_type", 0) or 0),
@@ -6063,6 +6072,7 @@ class MapWidget(QWidget):
             vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
             vehicle_rel_alt_m=row.get("vehicle_rel_alt_m"),  # type: ignore[arg-type]
             vehicle_alt_msl_m=self._vehicle_alt_msl_m,
+            rangefinder_down_m=self._rangefinder_down_m,
             gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
             gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             video_x_norm=float(vx),
@@ -7656,7 +7666,11 @@ class MapWidget(QWidget):
         if groundspeed_mps is not None:
             self._update_map_motion_state(float(groundspeed_mps))
         gs = float(self._last_groundspeed_mps)
-        self._vehicle_rel_alt_m = relative_alt_m
+        if relative_alt_m is not None:
+            try:
+                self._vehicle_rel_alt_m = float(relative_alt_m)
+            except Exception:
+                pass
         if relative_alt_m is None:
             self._coords.setText(f"Lat/Lon: {lat:.7f}, {lon:.7f}")
         else:
@@ -7810,6 +7824,13 @@ class MapWidget(QWidget):
 
     def set_distance_sensor(self, payload: dict) -> None:
         """M9 — forward DISTANCE_SENSOR (rangefinder) to the radar panel."""
+        try:
+            ori = int(payload.get("orientation", 0) or 0)
+            cur = payload.get("current_distance_m")
+            if cur is not None and is_downward_sensor_orientation(ori):
+                self._rangefinder_down_m = float(cur)
+        except Exception:
+            pass
         try:
             self._obstacle_radar.set_distance_sensor(payload)
             if bool(getattr(self, "_last_link_connected", False)) and bool(
