@@ -265,16 +265,25 @@ def video_facade_width_m(
 
     d = min(candidates)
 
-    # Never use target lat/lon haversine for facade width (wall clicks project far apart on ground).
     pa = observation_target_latlon(row_a)
     pb = observation_target_latlon(row_b)
+    d_hav: float | None = None
     if pa is not None and pb is not None:
         d_hav = haversine_m(pa[0], pa[1], pb[0], pb[1])
-        if d_hav < 50.0 and d_hav < d * 1.35:
-            candidates.append(d_hav)
-            d = min(candidates)
 
-    if not calibrating_range_only and r1 > 0 and r2 > 0:
+    trust_haversine = False
+    if d_hav is not None and 0.0 < d_hav < 50.0:
+        if d_hav < d * 0.75:
+            # Ground geo points agree on a short span — trust over FOV×range (wall clicks).
+            d = d_hav
+            trust_haversine = True
+        elif d_hav > d * 2.5:
+            # Far-apart ground projection (classic wall/pillar bug) — ignore haversine.
+            pass
+        else:
+            d = min(d, d_hav)
+
+    if not calibrating_range_only and r1 > 0 and r2 > 0 and not trust_haversine:
         peak = float(session_peak_range_m or 0)
         facade_ref = float(facade_reference_range_m or 0)
         r_local = max(r1, r2)
@@ -574,7 +583,7 @@ def format_target_segment_label(
     """
     d = float(geo_distance_m)
     if video_span_norm is not None and video_span_norm < 0.55 and d > 30.0:
-        return "distance unreliable"
+        return "distance unreliable (~use ground marks)"
     if d >= 1000.0:
         return f"{d / 1000.0:.1f} km"
     if d < 100.0:

@@ -42,7 +42,9 @@ def test_reject_unrealistic_range():
 
 
 def test_segment_label_unreliable():
-    assert format_target_segment_label(107.0, video_span_norm=0.15) == "distance unreliable"
+    assert format_target_segment_label(107.0, video_span_norm=0.15).startswith(
+        "distance unreliable"
+    )
 
 
 def test_segment_label_one_decimal():
