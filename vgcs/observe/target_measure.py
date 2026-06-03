@@ -274,9 +274,26 @@ def video_facade_width_m(
     trust_haversine = False
     if d_hav is not None and 0.0 < d_hav < 50.0:
         if d_hav < d * 0.75:
-            # Ground geo points agree on a short span — trust over FOV×range (wall clicks).
             d = d_hav
             trust_haversine = True
+            # Facade / posts: video L–R span is wider than ground bearing implies → scale up
+            # haversine (tape ~4 m while map chord ~3 m is typical).
+            if (
+                r1 > 0
+                and r2 > 0
+                and b1 is not None
+                and b2 is not None
+                and angle_h > 0.08
+            ):
+                try:
+                    cos_d = (r1 * r1 + r2 * r2 - d * d) / (2.0 * r1 * r2)
+                    cos_d = max(-1.0, min(1.0, cos_d))
+                    angle_bearing = math.acos(cos_d)
+                    if angle_h > angle_bearing * 1.35 and angle_bearing > 0.008:
+                        scale = min(1.55, (angle_h / angle_bearing) * 0.78)
+                        d = d * scale
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
         elif d_hav > d * 2.5:
             # Far-apart ground projection (classic wall/pillar bug) — ignore haversine.
             pass
