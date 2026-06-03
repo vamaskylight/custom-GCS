@@ -7,6 +7,9 @@ from typing import Any
 
 _EARTH_RADIUS_M = 6_371_000.0
 
+# Max |Δy| in normalized video coords for "same horizontal" width (door/post L–R).
+SAME_LEVEL_DY_NORM = 0.08
+
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = _EARTH_RADIUS_M
@@ -117,7 +120,7 @@ def marks_same_height_band(
     row_a: dict[str, Any],
     row_b: dict[str, Any],
     *,
-    max_dy_norm: float = 0.20,
+    max_dy_norm: float = SAME_LEVEL_DY_NORM,
 ) -> bool:
     """True when two video clicks are on the same horizontal band (e.g. pillar L/R)."""
     ya = row_a.get("video_y_norm")
@@ -260,6 +263,8 @@ def video_facade_width_m(
     dy = abs(xy_b[1] - xy_a[1])
     if dx < 0.03:
         return None
+    if dy > SAME_LEVEL_DY_NORM:
+        return None
     hfov_rad = math.radians(float(hfov_deg))
     angle_h = dx * hfov_rad
     if angle_h <= 1e-5:
@@ -308,20 +313,32 @@ def video_facade_width_m(
     lon_jump = _geo_lon_jump_deg(row_a, row_b)
     bad_ground_haversine = (
         d_hav is not None
-        and (d_hav > 12.0 or lon_jump > 0.00035 or d_hav > d * 2.5)
+        and (
+            d_hav > 12.0
+            or lon_jump > 0.00035
+            or (d_hav > 12.0 and d_hav > d * 2.5)
+        )
     )
 
     trust_haversine = False
-    if d_hav is not None and 0.0 < d_hav < 50.0 and not bad_ground_haversine:
-        if d_hav < d * 0.75:
+    level_pair = dy <= SAME_LEVEL_DY_NORM
+    if (
+        level_pair
+        and d_hav is not None
+        and 0.0 < d_hav < 50.0
+        and not bad_ground_haversine
+    ):
+        if d_hav < 12.0 and (d_hav < d * 0.85 or d_hav < 8.0):
             d = d_hav
             trust_haversine = True
+            d_angle_ref = 0.5 * (r1 + r2) * angle_h
             if (
                 r1 > 0
                 and r2 > 0
                 and b1 is not None
                 and b2 is not None
                 and angle_h > 0.08
+                and d_hav < d_angle_ref * 0.55
             ):
                 try:
                     cos_d = (r1 * r1 + r2 * r2 - d * d) / (2.0 * r1 * r2)
@@ -401,7 +418,7 @@ def segment_distance_video_fallback(
 def cluster_observations_by_video_y(
     rows: list[dict[str, Any]],
     *,
-    max_dy_norm: float = 0.18,
+    max_dy_norm: float = SAME_LEVEL_DY_NORM,
     require_geo: bool = False,
 ) -> list[list[dict[str, Any]]]:
     """Group video marks into horizontal bands (same pillar height)."""
@@ -478,7 +495,7 @@ def band_width_partner_row(
     rows: list[dict[str, Any]],
     row: dict[str, Any],
     *,
-    max_dy_norm: float = 0.18,
+    max_dy_norm: float = SAME_LEVEL_DY_NORM,
     min_dx_norm: float = 0.04,
 ) -> dict[str, Any] | None:
     """Other edge on the same horizontal band (pillar L↔R), not merely the previous click."""
@@ -515,12 +532,15 @@ def _format_segment_label(
     video_only: bool,
     video_span_norm: float | None,
     estimate: bool = False,
+    level_ok: bool = True,
 ) -> str:
     base = format_target_segment_label(
         d, video_span_norm=video_span_norm, force_show_meters=True
     )
     if not base:
         return ""
+    if not level_ok:
+        return "not level — use same height"
     if (video_only or estimate) and not base.startswith("distance unreliable"):
         return f"~{base}"
     return base
@@ -530,7 +550,7 @@ def observation_facade_video_segments(
     rows: list[dict[str, Any]],
     *,
     hfov_deg: float = 62.0,
-    max_dy_norm: float = 0.18,
+    max_dy_norm: float = SAME_LEVEL_DY_NORM,
 ) -> list[tuple[float, float, float, float, str]]:
     """One measure line per height band: leftmost ↔ rightmost mark (pillar gap width)."""
     out: list[tuple[float, float, float, float, str]] = []
@@ -554,6 +574,8 @@ def observation_facade_video_segments(
         xy_l, xy_r = _video_xy(left), _video_xy(right)
         if xy_l is None or xy_r is None:
             continue
+        if abs(xy_r[1] - xy_l[1]) > SAME_LEVEL_DY_NORM:
+            continue
         d = segment_distance_between_rows(
             left,
             right,
@@ -565,12 +587,17 @@ def observation_facade_video_segments(
         if d is None:
             continue
         pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
+        dy_lr = abs(xy_r[1] - xy_l[1])
         est = _geo_lon_jump_deg(left, right) > 0.00035 or bool(
             left.get("geo_quality") == "insufficient"
             or right.get("geo_quality") == "insufficient"
         )
         label = _format_segment_label(
-            d, video_only=False, video_span_norm=pix, estimate=est
+            d,
+            video_only=False,
+            video_span_norm=pix,
+            estimate=est,
+            level_ok=dy_lr <= SAME_LEVEL_DY_NORM,
         )
         if label:
             out.append((xy_l[0], xy_l[1], xy_r[0], xy_r[1], label))
@@ -590,6 +617,8 @@ def observation_facade_video_segments(
             continue
         xy_l, xy_r = _video_xy(left), _video_xy(right)
         if xy_l is None or xy_r is None:
+            continue
+        if abs(xy_r[1] - xy_l[1]) > SAME_LEVEL_DY_NORM:
             continue
         d = segment_distance_video_fallback(
             left, right, hfov_deg=hfov_deg, range_m=rf_ref
