@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from vgcs.observe.facade_plane import facade_plane_width_between_marks
+
 _EARTH_RADIUS_M = 6_371_000.0
 
 # Max |Δy| in normalized video coords for "same horizontal" width (door/post L–R).
@@ -247,12 +249,15 @@ def _facade_range_cap_m(
     r2: float,
     *,
     dx_norm: float,
+    row_a: dict[str, Any] | None = None,
+    row_b: dict[str, Any] | None = None,
 ) -> float | None:
     """
     Cap horizontal range for wide L–R spans (posts/walls).
 
     Downward RF AGL is not slant range to the opening; using full geo_range_m
-    over-estimates width (20+ m). Typical opening measurement uses much shorter range.
+    over-estimates width (20+ m) at altitude. Near the ground (RF ~5 m), the old
+    ``agl * 0.30`` cap crushed valid ~4 m openings to ~2.5 m.
     """
     if dx_norm < 0.32:
         return None
@@ -263,6 +268,24 @@ def _facade_range_cap_m(
     r_geo = max(r1, r2)
     if r_geo <= 0:
         return None
+    if agl < 12.0:
+        deps: list[float] = []
+        for row in (row_a, row_b):
+            if not row:
+                continue
+            dep = row.get("geo_depression_deg")
+            if dep is None:
+                continue
+            try:
+                deps.append(float(dep))
+            except (TypeError, ValueError):
+                continue
+        if deps:
+            dep_avg = max(18.0, min(75.0, sum(deps) / len(deps)))
+            rh = _horizontal_range_from_depression(agl, dep_avg)
+            if rh is not None and rh > 0.5:
+                return min(r_geo, max(rh, agl * 1.05))
+        return min(r_geo, max(6.0, agl * 1.2))
     cap = max(5.5, min(r_geo, agl * 0.30 if agl > 1.0 else r_geo))
     return cap
 
@@ -276,6 +299,7 @@ def video_facade_width_m(
     facade_reference_range_m: float | None = None,
     calibrating_range_only: bool = False,
     allow_off_level: bool = False,
+    apply_user_scale: bool = True,
 ) -> float | None:
     """
     Horizontal gap between two marks on a facade (same video height).
@@ -297,6 +321,15 @@ def video_facade_width_m(
     if angle_h <= 1e-5:
         return None
 
+    level_pair = dy <= SAME_LEVEL_DY_NORM
+    agl = _observation_agl_m(row_a) or _observation_agl_m(row_b)
+
+    d_facade = facade_plane_width_between_marks(row_a, row_b, hfov_deg=hfov_deg)
+    if d_facade is not None and level_pair and (agl is None or agl < 80.0):
+        if apply_user_scale:
+            d_facade *= _segment_scale_short()
+        return max(0.0, d_facade)
+
     candidates: list[float] = []
 
     try:
@@ -316,7 +349,6 @@ def video_facade_width_m(
         if d_ang > 0:
             candidates.append(d_ang)
 
-    agl = _observation_agl_m(row_a) or _observation_agl_m(row_b)
     if agl is not None:
         for row in (row_a, row_b):
             dep = row.get("geo_depression_deg")
@@ -338,17 +370,29 @@ def video_facade_width_m(
         d_hav = haversine_m(pa[0], pa[1], pb[0], pb[1])
 
     lon_jump = _geo_lon_jump_deg(row_a, row_b)
-    bad_ground_haversine = (
+    agl_low = agl is not None and agl < 12.0
+    wide_span = dx >= 0.32
+    d_angle_ref = 0.5 * (r1 + r2) * angle_h if r1 > 0 and r2 > 0 else 0.0
+    if (
         d_hav is not None
-        and (
-            d_hav > 12.0
-            or lon_jump > 0.00035
-            or (d_hav > 12.0 and d_hav > d * 2.5)
+        and agl_low
+        and wide_span
+        and level_pair
+        and lon_jump < 0.0003
+    ):
+        # Low-altitude facade: ground chord often >> tape width; do not treat as bad.
+        bad_ground_haversine = d_hav > 50.0 or lon_jump > 0.00035
+    else:
+        bad_ground_haversine = (
+            d_hav is not None
+            and (
+                d_hav > 12.0
+                or lon_jump > 0.00035
+                or (d_hav > 12.0 and d_hav > d * 2.5)
+            )
         )
-    )
 
     trust_haversine = False
-    level_pair = dy <= SAME_LEVEL_DY_NORM
     if (
         level_pair
         and d_hav is not None
@@ -358,7 +402,6 @@ def video_facade_width_m(
         if d_hav < 12.0 and (d_hav < d * 0.85 or d_hav < 8.0):
             d = d_hav
             trust_haversine = True
-            d_angle_ref = 0.5 * (r1 + r2) * angle_h
             if (
                 r1 > 0
                 and r2 > 0
@@ -376,14 +419,13 @@ def video_facade_width_m(
                         d = d * scale
                 except (TypeError, ValueError, ZeroDivisionError):
                     pass
-        else:
+        elif not (agl_low and wide_span and d_hav > 12.0):
             d = min(d, d_hav)
 
     if not calibrating_range_only and r1 > 0 and r2 > 0 and not trust_haversine:
         peak = float(session_peak_range_m or 0)
         facade_ref = float(facade_reference_range_m or 0)
         r_local = max(r1, r2)
-        d_angle_ref = 0.5 * (r1 + r2) * angle_h
         if d < d_angle_ref * 0.65 and not trust_haversine:
             uplift = d_angle_ref
             if facade_ref > r_local * 1.08:
@@ -394,15 +436,17 @@ def video_facade_width_m(
                 uplift = max(uplift, min(r_ref * angle_h * 1.05, d_angle_ref * 1.35))
             d = max(d, uplift)
 
-    r_cap = _facade_range_cap_m(agl, r1, r2, dx_norm=dx)
+    r_cap = _facade_range_cap_m(agl, r1, r2, dx_norm=dx, row_a=row_a, row_b=row_b)
     if r_cap is not None:
         d_capped = r_cap * angle_h
         if trust_haversine and d > d_capped * 1.35:
             d = max(d * 0.92, d_capped)
-        elif not trust_haversine or bad_ground_haversine:
+        elif bad_ground_haversine or (not agl_low and not trust_haversine):
             d = min(d, d_capped)
+        elif agl_low and d < d_capped * 0.92:
+            d = max(d, min(d_capped, d_angle_ref or d_capped))
 
-    if d < 15.0:
+    if apply_user_scale and d < 15.0:
         d *= _segment_scale_short()
     return max(0.0, d)
 
@@ -560,6 +604,7 @@ def _format_segment_label(
     video_span_norm: float | None,
     estimate: bool = False,
     level_ok: bool = True,
+    facade_plane: bool = False,
 ) -> str:
     base = format_target_segment_label(
         d, video_span_norm=video_span_norm, force_show_meters=True
@@ -568,6 +613,8 @@ def _format_segment_label(
         return ""
     if not level_ok:
         return MARKS_NOT_LEVEL_HINT
+    if facade_plane and not base.startswith("distance unreliable"):
+        base = f"{base} (wall)"
     if (video_only or estimate) and not base.startswith("distance unreliable"):
         return f"~{base}"
     return base
@@ -631,6 +678,10 @@ def observation_facade_video_segments(
                 video_span_norm=pix,
                 estimate=est,
                 level_ok=dy_lr <= SAME_LEVEL_DY_NORM,
+                facade_plane=bool(
+                    left.get("geo_depression_deg") is not None
+                    and right.get("geo_depression_deg") is not None
+                ),
             )
         label = append_marks_level_hint(label, left, right)
         if label:
@@ -681,14 +732,84 @@ def observation_facade_video_segments(
     return out
 
 
+_SEGMENT_SCALE_MIN = 0.70
+_SEGMENT_SCALE_MAX = 1.50
+
+
 def _segment_scale_short() -> float:
+    return get_segment_distance_scale()
+
+
+def get_segment_distance_scale() -> float:
     try:
         from PySide6.QtCore import QSettings
 
         v = float(QSettings("VGCS", "VGCS").value("observe/segment_distance_scale", 1.0) or 1.0)
-        return max(0.85, min(1.35, v))
+        return max(_SEGMENT_SCALE_MIN, min(_SEGMENT_SCALE_MAX, v))
     except Exception:
         return 1.0
+
+
+def set_segment_distance_scale(scale: float) -> float:
+    """Persist tape calibration multiplier (applied to all short facade widths)."""
+    v = max(_SEGMENT_SCALE_MIN, min(_SEGMENT_SCALE_MAX, float(scale)))
+    try:
+        from PySide6.QtCore import QSettings
+
+        QSettings("VGCS", "VGCS").setValue("observe/segment_distance_scale", v)
+    except Exception:
+        pass
+    return v
+
+
+def last_band_measure_width_m(
+    rows: list[dict[str, Any]],
+    *,
+    hfov_deg: float = 62.0,
+    apply_user_scale: bool = False,
+) -> float | None:
+    """Latest left↔right width from video marks (for tape calibration)."""
+    marks = [r for r in rows if str(r.get("kind") or "") == "video_mark" and _video_xy(r)]
+    if len(marks) < 2:
+        return None
+    last = marks[-1]
+    partner = band_width_partner_row(rows, last)
+    if partner is None:
+        partner = marks[-2]
+    if partner is None or partner is last:
+        return None
+    return segment_distance_between_rows(
+        partner,
+        last,
+        hfov_deg=hfov_deg,
+        require_same_height_band=False,
+        allow_off_level=True,
+        apply_user_scale=apply_user_scale,
+    )
+
+
+def calibrate_segment_scale_from_tape(
+    known_m: float,
+    rows: list[dict[str, Any]],
+    *,
+    hfov_deg: float = 62.0,
+) -> dict[str, float] | None:
+    """
+    Set ``observe/segment_distance_scale`` so the last measured band matches tape.
+
+    Returns scale, raw_m, known_m or None if no valid last measure.
+    """
+    try:
+        known = float(known_m)
+    except (TypeError, ValueError):
+        return None
+    if known < 0.05 or known > 200.0:
+        return None
+    raw = last_band_measure_width_m(rows, hfov_deg=hfov_deg, apply_user_scale=False)
+    if raw is None or raw < 0.05:
+        return None
+    scale = set_segment_distance_scale(known / raw)
+    return {"scale": scale, "raw_m": float(raw), "known_m": known}
 
 
 def segment_distance_between_rows(
@@ -702,6 +823,7 @@ def segment_distance_between_rows(
     require_same_height_band: bool = True,
     calibrating_range_only: bool = False,
     allow_off_level: bool = False,
+    apply_user_scale: bool = True,
 ) -> float | None:
     """Ground/facade separation between two observation marks (see ``video_facade_width_m``)."""
     if require_same_height_band and not marks_same_height_band(row_a, row_b):
@@ -717,13 +839,14 @@ def segment_distance_between_rows(
             facade_reference_range_m=facade_reference_range_m,
             calibrating_range_only=calibrating_range_only,
             allow_off_level=allow_off_level,
+            apply_user_scale=apply_user_scale,
         )
     pa = observation_target_latlon(row_a)
     pb = observation_target_latlon(row_b)
     if pa is None or pb is None:
         return None
     d = haversine_m(pa[0], pa[1], pb[0], pb[1])
-    if d < 15.0:
+    if apply_user_scale and d < 15.0:
         d *= _segment_scale_short()
     return max(0.0, d)
 

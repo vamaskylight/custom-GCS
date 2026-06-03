@@ -65,6 +65,7 @@ from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayD
 from vgcs.observe.geo_reference import compute_geo_reference
 from vgcs.observe.target_measure import (
     band_width_partner_row,
+    calibrate_segment_scale_from_tape,
     format_target_segment_label,
     haversine_m,
     is_downward_sensor_orientation,
@@ -524,6 +525,35 @@ QPushButton#observeReport:hover, QPushButton#observeReset:hover {
 QPushButton#observeTarget:checked, QPushButton#observeClip:checked {
   border-color: rgba(214, 224, 241, 230);
   background: rgba(27, 33, 45, 245);
+}
+QLabel#observeTapeLabel {
+  color: #a8b8d4;
+  font-size: 12px;
+  font-weight: 600;
+}
+QLineEdit#observeTapeEdit {
+  min-height: 28px;
+  max-height: 28px;
+  border-radius: 5px;
+  border: 1px solid rgba(196, 209, 230, 38);
+  background: rgba(18, 22, 32, 90);
+  color: #e8eef8;
+  font-size: 13px;
+  padding: 2px 6px;
+}
+QPushButton#observeCalibrate {
+  min-width: 36px;
+  min-height: 28px;
+  max-height: 28px;
+  font-size: 13px;
+  font-weight: 700;
+  border-radius: 5px;
+  border: 1px solid rgba(196, 209, 230, 50);
+  background: rgba(46, 72, 110, 200);
+  color: #e8f0ff;
+}
+QPushButton#observeCalibrate:hover {
+  background: rgba(62, 98, 148, 230);
 }
 QPushButton#observeClip[recording="true"] {
   background: rgba(200, 45, 45, 240);
@@ -1287,6 +1317,7 @@ class MapWidget(QWidget):
             self._btn_native_report,
             self._btn_native_reset,
         )
+        self._native_observe_tape_edit = observe_body.tape_edit
 
         self._native_hud_right_layout.addWidget(_cam_rail_sep())
         self._native_hud_right_layout.addWidget(
@@ -1556,10 +1587,16 @@ class MapWidget(QWidget):
             print("[VGCS:cam_rail] OBSERVE Reset clicked")
             self._clear_observations()
 
+        def _obs_calibrate() -> None:
+            print("[VGCS:cam_rail] OBSERVE Calibrate clicked")
+            QTimer.singleShot(0, self._observe_calibrate_from_tape)
+
         self._btn_native_target.toggled.connect(_obs_target)
         self._btn_native_clip.clicked.connect(_obs_clip)
         self._btn_native_report.clicked.connect(_obs_report)
         self._btn_native_reset.clicked.connect(_obs_reset)
+        observe_body.calibrate_btn.clicked.connect(_obs_calibrate)
+        observe_body.tape_edit.returnPressed.connect(_obs_calibrate)
 
         self._status = QLabel("Map status: waiting for telemetry")
         self._status.setObjectName("telemetryValue")
@@ -6573,6 +6610,48 @@ class MapWidget(QWidget):
         try:
             self._show_obs_clip_banner(f"Clip saved: {name}")
             QTimer.singleShot(2500, self._hide_obs_clip_banner)
+        except Exception:
+            pass
+
+    def _observe_calibrate_from_tape(self) -> None:
+        """Apply tape width to scale the last L–R video measure (session + saved setting)."""
+        edit = getattr(self, "_native_observe_tape_edit", None)
+        if edit is None:
+            return
+        raw_text = str(edit.text() or "").strip().replace(",", ".")
+        if not raw_text:
+            self._set_status(
+                "OBSERVE Cal: enter tape width in metres (e.g. 4.0), then press Cal"
+            )
+            return
+        try:
+            known_m = float(raw_text)
+        except ValueError:
+            self._set_status("OBSERVE Cal: invalid number — use metres, e.g. 4.0")
+            return
+        hfov, _ = self._m8_geo_settings()
+        result = calibrate_segment_scale_from_tape(
+            known_m, self._observations, hfov_deg=hfov
+        )
+        if result is None:
+            self._set_status(
+                "OBSERVE Cal: place two Target marks (left & right, same height) first"
+            )
+            return
+        scale = float(result["scale"])
+        raw_m = float(result["raw_m"])
+        self._refresh_observation_measure_overlays()
+        shown = known_m
+        msg = (
+            f"OBSERVE calibrated: tape {known_m:.2f} m (was {raw_m:.2f} m) — "
+            f"scale {scale:.3f} (saved for this PC)"
+        )
+        self._set_status(msg)
+        try:
+            print(
+                f"[VGCS:observe] tape_calibrate known={known_m:.3f} raw={raw_m:.3f} "
+                f"scale={scale:.3f}"
+            )
         except Exception:
             pass
 

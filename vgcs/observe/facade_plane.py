@@ -1,0 +1,93 @@
+"""
+Vertical facade-plane width between two video marks (M8 measure).
+
+Width on a wall = (slant range to the facade) × (horizontal angle between clicks in the video).
+Ground lat/lon / bearing chord is not used (it measures the wrong plane).
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+
+def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        x = row.get("video_x_norm")
+        y = row.get("video_y_norm")
+        if x is None or y is None:
+            return None
+        return float(x), float(y)
+    except (TypeError, ValueError):
+        return None
+
+
+def _observation_agl_m(row: dict[str, Any]) -> float | None:
+    for key in ("rangefinder_down_m", "vehicle_rel_alt_m"):
+        try:
+            v = float(row.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if v > 0.5:
+            return v
+    return None
+
+
+def _horizontal_range_from_depression(agl_m: float, depression_deg: float) -> float | None:
+    try:
+        dep = float(depression_deg)
+    except (TypeError, ValueError):
+        return None
+    if dep < 5.0 or dep > 89.0:
+        return None
+    return float(agl_m) / math.tan(math.radians(dep))
+
+
+def facade_plane_width_between_marks(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+) -> float | None:
+    """
+    Width (m) on a vertical facade between two video clicks at similar height.
+
+    Uses horizontal pixel span × HFOV and per-mark slant range from AGL + depression.
+    """
+    xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+    if xy_a is None or xy_b is None:
+        return None
+    dx = abs(xy_b[0] - xy_a[0])
+    if dx < 0.03:
+        return None
+
+    agl = _observation_agl_m(row_a) or _observation_agl_m(row_b)
+    if agl is None:
+        return None
+
+    angle_h = dx * math.radians(float(hfov_deg))
+    if angle_h <= 1e-5:
+        return None
+
+    rh_vals: list[float] = []
+    for row in (row_a, row_b):
+        dep = row.get("geo_depression_deg")
+        if dep is not None:
+            rh = _horizontal_range_from_depression(agl, float(dep))
+            if rh is not None and rh > 0.5:
+                rh_vals.append(rh)
+        try:
+            rg = float(row.get("geo_range_m") or 0)
+        except (TypeError, ValueError):
+            rg = 0.0
+        if rg > 0.5:
+            rh_vals.append(rg)
+
+    if not rh_vals:
+        return None
+
+    rh = sum(rh_vals) / len(rh_vals)
+    # Chord on the wall plane; rh * angle_h for small angles.
+    if angle_h < 0.35:
+        return rh * angle_h
+    return 2.0 * rh * math.sin(angle_h / 2.0)
