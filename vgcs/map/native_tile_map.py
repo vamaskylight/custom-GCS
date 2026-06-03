@@ -474,6 +474,7 @@ class NativeTileMapView(QWidget):
         self._press_for_obs: QPointF | None = None
         # Stores lat/lon pairs for OBSERVE -> Target marks (native rendering).
         self._observation_marks: list[tuple[float, float]] = []
+        self._geo_referenced_marks: list[tuple[float, float]] = []
         self._pending_timer = QTimer(self)
         self._pending_timer.setSingleShot(True)
         self._pending_timer.setInterval(32)
@@ -695,10 +696,21 @@ class NativeTileMapView(QWidget):
             self._observation_marks = self._observation_marks[-2000:]
         self.update()
 
+    def add_geo_referenced_marker(self, lat: float, lon: float) -> None:
+        """M8 — cyan marker for video-derived ground intersection."""
+        try:
+            self._geo_referenced_marks.append((float(lat), float(lon)))
+        except Exception:
+            return
+        if len(self._geo_referenced_marks) > 2000:
+            self._geo_referenced_marks = self._geo_referenced_marks[-2000:]
+        self.update()
+
     def clear_observation_marks(self) -> None:
         """Clear all visible OBSERVE -> Target markers."""
         try:
             self._observation_marks.clear()
+            self._geo_referenced_marks.clear()
         except Exception:
             pass
         self.update()
@@ -1023,6 +1035,16 @@ class NativeTileMapView(QWidget):
                 painter.drawEllipse(c, 5, 5)
                 painter.drawLine(int(c.x() - 10), int(c.y()), int(c.x() + 10), int(c.y()))
                 painter.drawLine(int(c.x()), int(c.y() - 10), int(c.x()), int(c.y() + 10))
+
+        # M8 geo-referenced targets (video ray → ground)
+        if self._geo_referenced_marks:
+            for lat, lon in self._geo_referenced_marks:
+                c = self._project(lat, lon, z, fx, fy, w, h)
+                painter.setPen(QPen(QColor(60, 220, 255, 240), 2))
+                painter.setBrush(QColor(40, 200, 255, 200))
+                painter.drawEllipse(c, 6, 6)
+                painter.drawLine(int(c.x() - 12), int(c.y()), int(c.x() + 12), int(c.y()))
+                painter.drawLine(int(c.x()), int(c.y() - 12), int(c.x()), int(c.y() + 12))
 
         # Vehicle — navigation-style arrow (matches compass HUD: sharp tip, concave base,
         # thick white outline, red fill, center dot). Heading=0 points toward -Y.

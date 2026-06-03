@@ -62,6 +62,7 @@ from PySide6.QtGui import (
     QRadialGradient,
 )
 from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayDetection
+from vgcs.observe.geo_reference import compute_geo_reference
 from vgcs.mission import (
     Waypoint,
     load_waypoints_json,
@@ -744,11 +745,22 @@ class _ObservationExportTask(QRunnable):
             "vehicle_lat",
             "vehicle_lon",
             "vehicle_heading_deg",
+            "vehicle_roll_deg",
+            "vehicle_pitch_deg",
             "vehicle_rel_alt_m",
             "gimbal_yaw_deg",
             "gimbal_pitch_deg",
             "gps_fix_type",
             "gps_satellites",
+            "gps_hdop",
+            "target_lat",
+            "target_lon",
+            "target_alt_m",
+            "geo_quality",
+            "geo_warning",
+            "geo_method",
+            "geo_range_m",
+            "geo_bearing_deg",
             "snapshot_path",
             "clip_path",
         ]
@@ -769,6 +781,9 @@ class _ObservationExportTask(QRunnable):
                     f"<td>{row.get('kind','')}</td>"
                     f"<td>{row.get('map_lat','')}</td>"
                     f"<td>{row.get('map_lon','')}</td>"
+                    f"<td>{self._obs_cell_fn(row.get('target_lat'))}</td>"
+                    f"<td>{self._obs_cell_fn(row.get('target_lon'))}</td>"
+                    f"<td>{row.get('geo_quality','')}</td>"
                     f"<td>{row.get('vehicle_lat','')}</td>"
                     f"<td>{row.get('vehicle_lon','')}</td>"
                     f"<td>{self._obs_cell_fn(row.get('gimbal_yaw_deg'))}</td>"
@@ -776,8 +791,11 @@ class _ObservationExportTask(QRunnable):
                     f"<td>{row.get('video_x_norm','')}</td>"
                     f"<td>{row.get('video_y_norm','')}</td>"
                     f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
+                    f"<td>{row.get('geo_range_m','')}</td>"
                     f"<td>{row.get('gps_fix_type','')}</td>"
                     f"<td>{row.get('gps_satellites','')}</td>"
+                    f"<td>{row.get('gps_hdop','')}</td>"
+                    f"<td>{row.get('geo_warning','')}</td>"
                     f"<td>{row.get('snapshot_path','')}</td>"
                     f"<td>{row.get('clip_path','')}</td>"
                     "</tr>"
@@ -791,9 +809,11 @@ class _ObservationExportTask(QRunnable):
                 f"<h2>Observation Report ({len(self._rows)} entries)</h2>"
                 "<table><thead><tr>"
                 "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th>"
+                "<th>Target Lat</th><th>Target Lon</th><th>Geo Quality</th>"
                 "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
-                "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th>"
-                "<th>GPS Fix</th><th>GPS Sats</th><th>Snapshot</th><th>Clip</th>"
+                "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
+                "<th>GPS Fix</th><th>GPS Sats</th><th>HDOP</th><th>Geo Warning</th>"
+                "<th>Snapshot</th><th>Clip</th>"
                 "</tr></thead><tbody>"
                 + "".join(html_rows)
                 + "</tbody></table></body></html>"
@@ -998,8 +1018,12 @@ class MapWidget(QWidget):
         self._ai_phase = 0.0
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
+        self._vehicle_alt_msl_m: float | None = None
+        self._vehicle_roll_deg: float | None = None
+        self._vehicle_pitch_deg: float | None = None
         self._gps_fix_type: int = 0
         self._gps_satellites: int = 0
+        self._gps_hdop: float | None = None
         # Camera rail: "video" = live/shooting (record toggles); "photo" = still mode (center = shutter).
         self._camera_rail_ui_mode: str = "video"
 
@@ -5977,12 +6001,83 @@ class MapWidget(QWidget):
             "vehicle_lat": v_lat,
             "vehicle_lon": v_lon,
             "vehicle_heading_deg": self._heading,
+            "vehicle_roll_deg": self._vehicle_roll_deg,
+            "vehicle_pitch_deg": self._vehicle_pitch_deg,
             "vehicle_rel_alt_m": self._vehicle_rel_alt_m,
             "gimbal_yaw_deg": gimbal_yaw,
             "gimbal_pitch_deg": gimbal_pitch,
             "gps_fix_type": int(getattr(self, "_gps_fix_type", 0) or 0),
             "gps_satellites": int(getattr(self, "_gps_satellites", 0) or 0),
+            "gps_hdop": self._gps_hdop,
+            "target_lat": None,
+            "target_lon": None,
+            "target_alt_m": None,
+            "geo_quality": "",
+            "geo_warning": "",
+            "geo_method": "",
+            "geo_range_m": None,
+            "geo_bearing_deg": None,
         }
+
+    def _m8_geo_settings(self) -> tuple[float, str | None]:
+        st = QSettings(_QS_NS, _QS_APP)
+        try:
+            hfov = float(st.value("observe/camera_hfov_deg", 62.0) or 62.0)
+        except Exception:
+            hfov = 62.0
+        dem = str(st.value("observe/dem_csv", "") or "").strip() or None
+        return hfov, dem
+
+    def _enrich_observation_geo_reference(self, row: dict[str, object]) -> None:
+        """M8 — compute ground lat/lon for video marks; copy map coords for map marks."""
+        kind = str(row.get("kind") or "")
+        if kind == "map_mark":
+            row["target_lat"] = row.get("map_lat")
+            row["target_lon"] = row.get("map_lon")
+            row["geo_quality"] = "map_direct"
+            row["geo_method"] = "map_click"
+            return
+        if kind != "video_mark":
+            return
+        vx = row.get("video_x_norm")
+        vy = row.get("video_y_norm")
+        if vx is None or vy is None:
+            row["geo_quality"] = "insufficient"
+            row["geo_warning"] = "video click missing"
+            return
+        hfov, dem_path = self._m8_geo_settings()
+        geo = compute_geo_reference(
+            vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
+            vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
+            vehicle_heading_deg=row.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+            vehicle_roll_deg=row.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+            vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+            vehicle_rel_alt_m=row.get("vehicle_rel_alt_m"),  # type: ignore[arg-type]
+            vehicle_alt_msl_m=self._vehicle_alt_msl_m,
+            gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+            video_x_norm=float(vx),
+            video_y_norm=float(vy),
+            gps_fix_type=int(row.get("gps_fix_type") or 0),
+            gps_hdop=row.get("gps_hdop"),  # type: ignore[arg-type]
+            camera_hfov_deg=hfov,
+            dem_path=dem_path,
+        )
+        row["target_lat"] = geo.target_lat
+        row["target_lon"] = geo.target_lon
+        row["target_alt_m"] = geo.target_alt_m
+        row["geo_quality"] = geo.quality
+        row["geo_warning"] = geo.warning
+        row["geo_method"] = geo.method
+        row["geo_range_m"] = geo.horizontal_range_m
+        row["geo_bearing_deg"] = geo.bearing_deg
+        if geo.ok and geo.target_lat is not None and geo.target_lon is not None:
+            try:
+                nm = getattr(self, "_native_map", None)
+                if nm is not None and hasattr(nm, "add_geo_referenced_marker"):
+                    nm.add_geo_referenced_marker(float(geo.target_lat), float(geo.target_lon))
+            except Exception:
+                pass
 
     def _log_observation(
         self,
@@ -6032,6 +6127,7 @@ class MapWidget(QWidget):
             "clip_path": str(clip_path or "").strip(),
         }
         row.update(self._observation_context())
+        self._enrich_observation_geo_reference(row)
         self._observations.append(row)
         idx = len(self._observations) - 1
         if capture_snapshot:
@@ -6039,7 +6135,8 @@ class MapWidget(QWidget):
         try:
             print(
                 f"[VGCS:observe] logged {kind} count={len(self._observations)} "
-                f"video=({video_x},{video_y}) map=({map_lat},{map_lon})"
+                f"video=({video_x},{video_y}) map=({map_lat},{map_lon}) "
+                f"geo=({row.get('target_lat')},{row.get('target_lon')}) q={row.get('geo_quality')}"
             )
         except Exception:
             pass
@@ -6056,6 +6153,17 @@ class MapWidget(QWidget):
                 " — gimbal N/A (Skydroid C13: TOP UDP port 5000; on RC hotspot try Host=RC gateway "
                 "e.g. 192.168.43.1; ZR10: SIYI SDK UDP 37260)"
             )
+        elif kind == "video_mark":
+            gq = str(row.get("geo_quality") or "")
+            if gq in ("good", "fair", "map_direct"):
+                rng = row.get("geo_range_m")
+                rng_s = f"{float(rng):.0f} m" if rng is not None else "—"
+                msg += f" — geo {gq}, range {rng_s}"
+                if row.get("target_lat") is not None:
+                    msg += f" @ {float(row['target_lat']):.6f},{float(row['target_lon']):.6f}"
+            else:
+                warn = str(row.get("geo_warning") or "geo insufficient")
+                msg += f" — {warn}"
         self._set_status(msg)
 
         # Native OBSERVE -> Target needs a visible marker on the Qt map.
@@ -6421,6 +6529,9 @@ class MapWidget(QWidget):
                 f"<td>{row.get('kind','')}</td>"
                 f"<td>{row.get('map_lat','')}</td>"
                 f"<td>{row.get('map_lon','')}</td>"
+                f"<td>{self._obs_cell(row.get('target_lat'))}</td>"
+                f"<td>{self._obs_cell(row.get('target_lon'))}</td>"
+                f"<td>{row.get('geo_quality','')}</td>"
                 f"<td>{row.get('vehicle_lat','')}</td>"
                 f"<td>{row.get('vehicle_lon','')}</td>"
                 f"<td>{self._obs_cell(row.get('gimbal_yaw_deg'))}</td>"
@@ -6428,8 +6539,11 @@ class MapWidget(QWidget):
                 f"<td>{row.get('video_x_norm','')}</td>"
                 f"<td>{row.get('video_y_norm','')}</td>"
                 f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
+                f"<td>{row.get('geo_range_m','')}</td>"
                 f"<td>{row.get('gps_fix_type','')}</td>"
                 f"<td>{row.get('gps_satellites','')}</td>"
+                f"<td>{row.get('gps_hdop','')}</td>"
+                f"<td>{row.get('geo_warning','')}</td>"
                 f"<td>{row.get('snapshot_path','')}</td>"
                 f"<td>{row.get('clip_path','')}</td>"
                 "</tr>"
@@ -6443,9 +6557,11 @@ class MapWidget(QWidget):
             f"<h2>Observation Report ({len(self._observations)} entries)</h2>"
             "<table><thead><tr>"
             "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th>"
+            "<th>Target Lat</th><th>Target Lon</th><th>Geo Quality</th>"
             "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
-            "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th>"
-            "<th>GPS Fix</th><th>GPS Sats</th><th>Snapshot</th><th>Clip</th>"
+            "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
+            "<th>GPS Fix</th><th>GPS Sats</th><th>HDOP</th><th>Geo Warning</th>"
+            "<th>Snapshot</th><th>Clip</th>"
             "</tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table></body></html>"
@@ -7547,6 +7663,44 @@ class MapWidget(QWidget):
             pass
         if map_moved or first_fix:
             self._schedule_vehicle_pose_js(immediate=first_fix)
+
+    def set_vehicle_attitude(
+        self,
+        roll_deg: float | None = None,
+        pitch_deg: float | None = None,
+        *,
+        yaw_deg: float | None = None,
+    ) -> None:
+        """M8 — body roll/pitch from MAVLink ATTITUDE (optional yaw override)."""
+        if roll_deg is not None:
+            try:
+                self._vehicle_roll_deg = float(roll_deg)
+            except Exception:
+                pass
+        if pitch_deg is not None:
+            try:
+                self._vehicle_pitch_deg = float(pitch_deg)
+            except Exception:
+                pass
+        if yaw_deg is not None:
+            self.set_vehicle_heading(float(yaw_deg), source="att")
+
+    def set_vehicle_alt_msl(self, alt_msl_m: float | None) -> None:
+        if alt_msl_m is None:
+            return
+        try:
+            self._vehicle_alt_msl_m = float(alt_msl_m)
+        except Exception:
+            pass
+
+    def set_gps_hdop(self, hdop: float | None) -> None:
+        if hdop is None:
+            self._gps_hdop = None
+            return
+        try:
+            self._gps_hdop = float(hdop)
+        except Exception:
+            self._gps_hdop = None
 
     def set_vehicle_heading(self, heading_deg: float, *, source: str = "mixed") -> None:
         """Store heading for HUD/observations and rotate the map vehicle icon."""

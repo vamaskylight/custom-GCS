@@ -3436,6 +3436,10 @@ class MainWindow(QMainWindow):
             )
             self._fields["alt_rel"].setText(f"{data.get('relative_alt_m', 0.0):.1f} m")
             self._fields["alt_msl"].setText(f"{data.get('alt_msl_m', 0.0):.1f} m")
+            try:
+                self._map_widget.set_vehicle_alt_msl(float(data.get("alt_msl_m", 0.0) or 0.0))
+            except Exception:
+                pass
             self._map_widget.set_vehicle_position(
                 lat,
                 lon,
@@ -3482,6 +3486,13 @@ class MainWindow(QMainWindow):
                 f"{data.get('pitch_deg', 0.0):.1f} / "
                 f"{data.get('yaw_deg', 0.0):.1f} deg"
             )
+            try:
+                self._map_widget.set_vehicle_attitude(
+                    float(data.get("roll_deg", 0.0)),
+                    float(data.get("pitch_deg", 0.0)),
+                )
+            except Exception:
+                pass
             yaw_deg = float(data.get("yaw_deg", 0.0))
             hd_att = (yaw_deg + 360.0) % 360.0
             self._heading = hd_att
@@ -3498,6 +3509,11 @@ class MainWindow(QMainWindow):
             self._top_gps_sat.setText(str(sat))
             self._top_gps_hdop.setText(hdop_text)
             self._map_widget.set_header_gps(sat, hdop_text, fix_type=fix_type)
+            if hdop is not None:
+                try:
+                    self._map_widget.set_gps_hdop(float(hdop))
+                except Exception:
+                    pass
             # Fallback when GLOBAL_POSITION_INT is 0,0 / missing but GPS_RAW has a fix.
             raw_lat = data.get("lat")
             raw_lon = data.get("lon")
