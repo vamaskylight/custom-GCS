@@ -12,6 +12,9 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -104,8 +107,29 @@ class CamObserveBlock(QWidget):
         row2.setSpacing(4)
         row2.addWidget(report_btn, 1)
         row2.addWidget(reset_btn, 1)
+        tape_lbl = QLabel("Tape (m)")
+        tape_lbl.setObjectName("observeTapeLabel")
+        self.tape_edit = QLineEdit()
+        self.tape_edit.setObjectName("observeTapeEdit")
+        self.tape_edit.setPlaceholderText("4.0")
+        self.tape_edit.setClearButtonEnabled(True)
+        self.tape_edit.setToolTip(
+            "Measured width on site (tape). After two Target marks, press Cal to match the last line."
+        )
+        self.calibrate_btn = QPushButton("Cal")
+        self.calibrate_btn.setObjectName("observeCalibrate")
+        self.calibrate_btn.setToolTip(
+            "Calibrate distance scale from the last L–R measure and this tape value."
+        )
+        row3 = QHBoxLayout()
+        row3.setContentsMargins(0, 0, 0, 0)
+        row3.setSpacing(4)
+        row3.addWidget(tape_lbl)
+        row3.addWidget(self.tape_edit, 1)
+        row3.addWidget(self.calibrate_btn, 0)
         v.addLayout(row1)
         v.addLayout(row2)
+        v.addLayout(row3)
 
 
 class CamRailBiSlider(QWidget):
