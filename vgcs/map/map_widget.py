@@ -6250,7 +6250,7 @@ class MapWidget(QWidget):
                     )
                     msg += f" — targets {float(seg_m):.1f} m apart{est}"
                 elif cross_band:
-                    msg += " — click both edges at the same height (or Reset first)"
+                    msg += " — click left & right on the same height (max 8% of frame)"
             elif kind == "video_mark":
                 warn = str(row.get("geo_warning") or "geo insufficient")
                 msg += f" — {warn}"
