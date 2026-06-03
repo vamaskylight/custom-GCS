@@ -168,6 +168,132 @@ def session_rangefinder_reference_m(rows: list[dict[str, Any]]) -> float | None:
     return best if best > 1.0 else None
 
 
+def _observation_agl_m(row: dict[str, Any]) -> float | None:
+    for key in ("rangefinder_down_m", "vehicle_rel_alt_m"):
+        try:
+            v = float(row.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if v > 0.5:
+            return v
+    return None
+
+
+def _horizontal_range_from_depression(agl_m: float, depression_deg: float) -> float | None:
+    try:
+        dep = float(depression_deg)
+    except (TypeError, ValueError):
+        return None
+    if dep < 5.0 or dep > 89.0:
+        return None
+    return float(agl_m) / math.tan(math.radians(dep))
+
+
+def _law_of_cosines_m(
+    r1: float, r2: float, bearing_a_deg: float, bearing_b_deg: float
+) -> float | None:
+    try:
+        ba = math.radians(float(bearing_a_deg))
+        bb = math.radians(float(bearing_b_deg))
+        ra = float(r1)
+        rb = float(r2)
+        if ra <= 0 or rb <= 0:
+            return None
+        return math.sqrt(ra * ra + rb * rb - 2.0 * ra * rb * math.cos(bb - ba))
+    except (TypeError, ValueError):
+        return None
+
+
+def video_facade_width_m(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    session_peak_range_m: float | None = None,
+    facade_reference_range_m: float | None = None,
+    calibrating_range_only: bool = False,
+) -> float | None:
+    """
+    Horizontal gap between two marks on a facade (same video height).
+
+    Ground lat/lon separation is wrong for wall/pillar clicks (often 80+ m).
+    Uses min of: law-of-cosines(range+bearing), video-angle × range, depression-based range.
+    """
+    xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+    if xy_a is None or xy_b is None:
+        return None
+    dx = abs(xy_b[0] - xy_a[0])
+    dy = abs(xy_b[1] - xy_a[1])
+    if dx < 0.03:
+        return None
+    hfov_rad = math.radians(float(hfov_deg))
+    angle_h = dx * hfov_rad
+    if angle_h <= 1e-5:
+        return None
+
+    candidates: list[float] = []
+
+    try:
+        r1 = float(row_a.get("geo_range_m") or 0)
+        r2 = float(row_b.get("geo_range_m") or 0)
+        b1 = row_a.get("geo_bearing_deg")
+        b2 = row_b.get("geo_bearing_deg")
+    except (TypeError, ValueError):
+        r1 = r2 = 0.0
+        b1 = b2 = None
+
+    if r1 > 0 and r2 > 0 and b1 is not None and b2 is not None:
+        d_law = _law_of_cosines_m(r1, r2, float(b1), float(b2))
+        if d_law is not None and d_law > 0:
+            candidates.append(d_law)
+        d_ang = 0.5 * (r1 + r2) * angle_h
+        if d_ang > 0:
+            candidates.append(d_ang)
+
+    agl = _observation_agl_m(row_a) or _observation_agl_m(row_b)
+    if agl is not None:
+        for row in (row_a, row_b):
+            dep = row.get("geo_depression_deg")
+            if dep is None:
+                continue
+            rh = _horizontal_range_from_depression(agl, float(dep))
+            if rh is not None and rh > 0.5:
+                candidates.append(rh * angle_h)
+
+    if not candidates:
+        return None
+
+    d = min(candidates)
+
+    # Never use target lat/lon haversine for facade width (wall clicks project far apart on ground).
+    pa = observation_target_latlon(row_a)
+    pb = observation_target_latlon(row_b)
+    if pa is not None and pb is not None:
+        d_hav = haversine_m(pa[0], pa[1], pb[0], pb[1])
+        if d_hav < 50.0 and d_hav < d * 1.35:
+            candidates.append(d_hav)
+            d = min(candidates)
+
+    if not calibrating_range_only and r1 > 0 and r2 > 0:
+        peak = float(session_peak_range_m or 0)
+        facade_ref = float(facade_reference_range_m or 0)
+        r_local = max(r1, r2)
+        d_angle_ref = 0.5 * (r1 + r2) * angle_h
+        if d < d_angle_ref * 0.65:
+            uplift = d_angle_ref
+            if facade_ref > r_local * 1.08:
+                uplift = max(uplift, min(facade_ref * angle_h * 1.08, d_angle_ref * 1.35))
+            elif peak > r_local * 1.25:
+                blend = min(0.32, (peak / max(r_local, 1.0) - 1.0) * 0.12)
+                r_ref = r_local + (peak - r_local) * blend
+                uplift = max(uplift, min(r_ref * angle_h * 1.05, d_angle_ref * 1.35))
+            d = max(d, uplift)
+
+    if d < 15.0:
+        d *= _segment_scale_short()
+    return max(0.0, d)
+
+
 def segment_distance_video_fallback(
     row_a: dict[str, Any],
     row_b: dict[str, Any],
@@ -175,21 +301,29 @@ def segment_distance_video_fallback(
     hfov_deg: float = 62.0,
     range_m: float | None = None,
 ) -> float | None:
-    """Width estimate from horizontal video angle × rangefinder (no GPS geo)."""
+    """Width when geo lock failed — depression-based range, not raw downward RF × angle."""
     xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
     if xy_a is None or xy_b is None:
         return None
     dx = abs(xy_b[0] - xy_a[0])
     if dx < 0.03:
         return None
-    r = range_m
-    if r is None:
-        rf = session_rangefinder_reference_m([row_a, row_b])
-        r = rf
-    if r is None or r < 1.0:
-        return None
     angle_h = dx * math.radians(float(hfov_deg))
-    d = float(r) * angle_h
+    agl = range_m or session_rangefinder_reference_m([row_a, row_b])
+    if agl is None or agl < 1.0:
+        return None
+    candidates: list[float] = []
+    for row in (row_a, row_b):
+        dep = row.get("geo_depression_deg")
+        if dep is not None:
+            rh = _horizontal_range_from_depression(float(agl), float(dep))
+            if rh is not None:
+                candidates.append(rh * angle_h)
+    if not candidates:
+        # Last resort: assume ~40° look so RF AGL is not used as horizontal range (was ~82 m).
+        rh = float(agl) / math.tan(math.radians(40.0))
+        candidates.append(rh * angle_h)
+    d = min(candidates)
     if d < 15.0:
         d *= _segment_scale_short()
     return max(0.0, d)
@@ -258,13 +392,12 @@ def session_facade_reference_range_m(
         if dx < 0.03:
             continue
         angle_h = dx * hfov_rad
-        d = segment_distance_between_rows(
+        d = video_facade_width_m(
             left,
             right,
             hfov_deg=hfov_deg,
             session_peak_range_m=peak,
             facade_reference_range_m=ref,
-            require_same_height_band=False,
             calibrating_range_only=True,
         )
         if d is not None and angle_h > 1e-4 and d > 0.5:
@@ -406,90 +539,25 @@ def segment_distance_between_rows(
     require_same_height_band: bool = True,
     calibrating_range_only: bool = False,
 ) -> float | None:
-    """
-    Ground separation between two observation marks.
-
-    Prefer range+bearing from the vehicle (stable for short spans); fall back to
-    target lat/lon haversine. For facade width (two pillars), uses horizontal
-    video angle × a stable range; reuses session peak range when elevated clicks
-    underestimate distance.
-    """
+    """Ground/facade separation between two observation marks (see ``video_facade_width_m``)."""
     if require_same_height_band and not marks_same_height_band(row_a, row_b):
         return None
-
-    vfov = float(vfov_deg) if vfov_deg is not None else float(hfov_deg) * 0.5625
-    hfov_rad = math.radians(float(hfov_deg))
-    vfov_rad = math.radians(vfov)
-
-    d_geo: float | None = None
-    try:
-        r1 = row_a.get("geo_range_m")
-        r2 = row_b.get("geo_range_m")
-        b1 = row_a.get("geo_bearing_deg")
-        b2 = row_b.get("geo_bearing_deg")
-        if r1 is not None and r2 is not None and b1 is not None and b2 is not None:
-            ra = float(r1)
-            rb = float(r2)
-            ba = math.radians(float(b1))
-            bb = math.radians(float(b2))
-            d_geo = math.sqrt(ra * ra + rb * rb - 2.0 * ra * rb * math.cos(bb - ba))
-    except Exception:
-        d_geo = None
-    if d_geo is None or d_geo <= 0:
-        pa = observation_target_latlon(row_a)
-        pb = observation_target_latlon(row_b)
-        if pa is None or pb is None:
-            return None
-        d_geo = haversine_m(pa[0], pa[1], pb[0], pb[1])
-
     xa, ya = row_a.get("video_x_norm"), row_a.get("video_y_norm")
     xb, yb = row_b.get("video_x_norm"), row_b.get("video_y_norm")
-    d = float(d_geo)
-    if xa is not None and ya is not None and xb is not None and yb is not None:
-        dx = abs(float(xb) - float(xa))
-        dy = abs(float(yb) - float(ya))
-        pix_span = video_mark_span_norm(float(xa), float(ya), float(xb), float(yb))
-        angle_h = dx * hfov_rad
-        angle = math.hypot(angle_h, dy * vfov_rad)
-        try:
-            r1 = float(row_a.get("geo_range_m") or 0)
-            r2 = float(row_b.get("geo_range_m") or 0)
-        except (TypeError, ValueError):
-            r1 = r2 = 0.0
-        r_local = max(r1, r2)
-        peak = float(session_peak_range_m or 0)
-        facade_ref = float(facade_reference_range_m or 0)
-        if angle_h > 1e-4 and dx > 0.03:
-            r_ref = r_local
-            if not calibrating_range_only:
-                if facade_ref > r_ref * 1.08:
-                    r_ref = facade_ref
-                elif peak > r_local * 1.25:
-                    blend = min(0.38, (peak / max(r_local, 1.0) - 1.0) * 0.14)
-                    r_ref = r_local + (peak - r_local) * blend
-            d_facade = r_ref * angle_h
-            d = max(d, d_facade)
-        if calibrating_range_only:
-            if d < 15.0:
-                d *= _segment_scale_short()
-            return max(0.0, d)
-        if angle > 1e-4 and pix_span < 0.55 and dy < 0.2:
-            r_avg = (r1 + r2) * 0.5
-            if r_avg > 1.0:
-                d_vid = r_avg * angle
-                d = max(d, d_vid)
-            if r1 > 1.0 and r2 > 1.0 and d > 0.3:
-                try:
-                    cos_d = (r1 * r1 + r2 * r2 - d * d) / (2.0 * r1 * r2)
-                    cos_d = max(-1.0, min(1.0, cos_d))
-                    angle_bearing = math.acos(cos_d)
-                    if angle_bearing > 1e-4 and angle > angle_bearing * 1.08:
-                        d = max(d, d * (angle / angle_bearing) * 0.95)
-                except Exception:
-                    pass
-            if dy < 0.12 and pix_span < 0.55 and d < 10.0 and peak <= r_local * 1.12:
-                d *= 1.12
-
+    if xa is not None and xb is not None:
+        return video_facade_width_m(
+            row_a,
+            row_b,
+            hfov_deg=hfov_deg,
+            session_peak_range_m=session_peak_range_m,
+            facade_reference_range_m=facade_reference_range_m,
+            calibrating_range_only=calibrating_range_only,
+        )
+    pa = observation_target_latlon(row_a)
+    pb = observation_target_latlon(row_b)
+    if pa is None or pb is None:
+        return None
+    d = haversine_m(pa[0], pa[1], pb[0], pb[1])
     if d < 15.0:
         d *= _segment_scale_short()
     return max(0.0, d)
@@ -505,7 +573,7 @@ def format_target_segment_label(
     how close the two clicks are on the video (common indoors / wall marks).
     """
     d = float(geo_distance_m)
-    if video_span_norm is not None and video_span_norm < 0.4 and d > 25.0:
+    if video_span_norm is not None and video_span_norm < 0.55 and d > 30.0:
         return "distance unreliable"
     if d >= 1000.0:
         return f"{d / 1000.0:.1f} km"

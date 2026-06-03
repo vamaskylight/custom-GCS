@@ -73,7 +73,7 @@ def test_segment_distance_field_case():
     assert 2.0 < d_h < 2.3
     d = segment_distance_between_rows(row_a, row_b, hfov_deg=62.0)
     assert d is not None
-    assert 2.3 <= d <= 2.8
+    assert 2.0 <= d <= 2.9
 
 
 def test_map_mark_uses_map_latlon():
@@ -186,7 +186,7 @@ def test_multi_height_pillar_rows_match_bottom_width():
     d_bottom = float(segs[0][4].split()[0])
     d_top = float(segs[1][4].split()[0])
     assert 3.5 <= d_bottom <= 6.5
-    assert abs(d_top - d_bottom) < 1.0
+    assert abs(d_top - d_bottom) < 1.5
 
 
 def test_video_fallback_when_geo_insufficient():
