@@ -6139,9 +6139,9 @@ class MapWidget(QWidget):
             vehicle_heading_deg=row.get("vehicle_heading_deg"),  # type: ignore[arg-type]
             vehicle_roll_deg=row.get("vehicle_roll_deg"),  # type: ignore[arg-type]
             vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
-            vehicle_rel_alt_m=ray_agl,
+            vehicle_rel_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
             vehicle_alt_msl_m=self._vehicle_alt_msl_m,
-            rangefinder_down_m=self._rangefinder_down_m,
+            rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
             gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
             gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             video_x_norm=float(vx),
@@ -6157,8 +6157,21 @@ class MapWidget(QWidget):
         row["geo_quality"] = geo.quality
         row["geo_warning"] = geo.warning
         row["geo_method"] = geo.method
+        from vgcs.observe.target_measure import is_plausible_ground_range
+
         q = str(geo.quality or "")
-        if geo.ok or q in ("good", "fair"):
+        ray_for_plaus = ray_agl
+        if (
+            geo.horizontal_range_m is not None
+            and geo.bearing_deg is not None
+            and geo.depression_deg is not None
+            and ray_for_plaus is not None
+            and is_plausible_ground_range(
+                float(ray_for_plaus),
+                float(geo.horizontal_range_m),
+                float(geo.depression_deg),
+            )
+        ):
             row["geo_range_m"] = geo.horizontal_range_m
             row["geo_bearing_deg"] = geo.bearing_deg
             row["geo_depression_deg"] = geo.depression_deg
