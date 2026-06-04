@@ -15,7 +15,9 @@ HEADING = 310.0
 
 
 def _mark(vx: float, vy: float, ekf: float) -> dict:
-    agl, src = resolve_facade_ray_agl_m(relative_alt_m=ekf, rangefinder_down_m=RF)
+    agl, src = resolve_facade_ray_agl_m(
+        relative_alt_m=ekf, rangefinder_down_m=RF, video_y_norm=vy
+    )
     assert src == "rangefinder_clamped_facade"
     assert agl == 14.0
     g = compute_geo_reference(

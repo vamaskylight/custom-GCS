@@ -22,42 +22,76 @@ FACADE_MIN_VIDEO_Y_NORM = 0.55
 FACADE_DISTANT_TARGET_HINT = (
     "Distant/horizon marks — place targets on a near wall (lower video)"
 )
+LONG_RANGE_MAX_WIDTH_M = 200.0
+_FACADE_LONG_RANGE_VIDEO_Y = 0.62
 
 
 def _row_agl_source(row: dict[str, Any]) -> str:
     return str(row.get("geo_agl_source") or row.get("agl_source") or "")
 
 
+def is_long_range_video_click(
+    video_y_norm: float | None,
+    rangefinder_down_m: float | None,
+    relative_alt_m: float | None = None,
+) -> bool:
+    """Skyline / distant towers: clamped downward RF, upper frame, low EKF."""
+    try:
+        y = float(video_y_norm) if video_y_norm is not None else 1.0
+    except (TypeError, ValueError):
+        y = 1.0
+    try:
+        rf = float(rangefinder_down_m) if rangefinder_down_m is not None else 0.0
+    except (TypeError, ValueError):
+        rf = 0.0
+    try:
+        rel = float(relative_alt_m) if relative_alt_m is not None else 0.0
+    except (TypeError, ValueError):
+        rel = 0.0
+    return rf >= 40.0 and y < _FACADE_LONG_RANGE_VIDEO_Y and rel < 3.0
+
+
+def facade_measure_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> str:
+    """``near_wall`` (tape opening) vs ``long_range`` (distant towers, RF clamped)."""
+    for row in (row_a, row_b):
+        if is_long_range_video_click(
+            row.get("video_y_norm"),
+            row.get("rangefinder_down_m"),
+            row.get("ekf_rel_alt_m"),
+        ):
+            return "long_range"
+    return "near_wall"
+
+
 def marks_suitable_for_facade_tape_measure(
     row_a: dict[str, Any],
     row_b: dict[str, Any],
 ) -> tuple[bool, str]:
-    """
-    Facade tape width is only valid for a nearby vertical wall in the lower frame.
-
-    Upper-video clicks (skyline, distant roof towers) with clamped RF≈45 m were
-    still producing ~4 m "(wall)" labels — wrong scene for courtyard geometry.
-    """
+    """Near-wall tape only; long-range pairs use ``facade_measure_context`` instead."""
+    if facade_measure_context(row_a, row_b) == "long_range":
+        return True, ""
     xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
     if xy_a is None or xy_b is None:
         return True, ""
     y_avg = 0.5 * (xy_a[1] + xy_b[1])
     clamped = any("clamped" in _row_agl_source(r) for r in (row_a, row_b))
-    if not clamped:
-        return True, ""
-    # Clamped RF≈45 m + upper video: distant skyline/roofline, not a ~4 m wall opening.
-    if y_avg < FACADE_MIN_VIDEO_Y_NORM:
-        return False, FACADE_DISTANT_TARGET_HINT
-    try:
-        rf_max = max(
-            float(row_a.get("rangefinder_down_m") or 0),
-            float(row_b.get("rangefinder_down_m") or 0),
-        )
-    except (TypeError, ValueError):
-        rf_max = 0.0
-    if rf_max >= 40.0 and y_avg < 0.62:
+    if clamped and y_avg < FACADE_MIN_VIDEO_Y_NORM:
         return False, FACADE_DISTANT_TARGET_HINT
     return True, ""
+
+
+def slant_horizontal_range_m(agl_m: float, depression_deg: float) -> float | None:
+    """Horizontal range proxy for shallow skyline rays (not ground GPS)."""
+    try:
+        agl = float(agl_m)
+        dep = float(depression_deg)
+    except (TypeError, ValueError):
+        return None
+    if agl <= 0 or dep < 4.0:
+        return None
+    dep_use = max(6.0, min(75.0, dep))
+    rh = agl / math.tan(math.radians(dep_use))
+    return min(280.0, max(agl * 1.5, rh))
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -214,6 +248,7 @@ def resolve_facade_ray_agl_m(
     *,
     relative_alt_m: float | None,
     rangefinder_down_m: float | None = None,
+    video_y_norm: float | None = None,
 ) -> tuple[float | None, str]:
     """
     AGL for geo-referencing facade/wall clicks.
@@ -238,6 +273,8 @@ def resolve_facade_ray_agl_m(
         return rf, "rangefinder_down"
     if rf_raw is not None and rf is None and (rf_raw >= 40.0 or rf_raw in _RF_CLAMP_SUSPECT_M):
         if rel is None or rel < 3.0:
+            if is_long_range_video_click(video_y_norm, rf_raw, rel):
+                return rf_raw, "rangefinder_clamped_long"
             return _FACADE_RF_CLAMPED_FALLBACK_M, "rangefinder_clamped_facade"
     return resolve_vehicle_agl_m(
         relative_alt_m=relative_alt_m,
@@ -365,6 +402,18 @@ def session_facade_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | No
             rf_vals.append(rf)
     ekf_max = max(ekf_vals) if ekf_vals else None
     rf_min = min(rf_vals) if rf_vals else None
+    for row in rows:
+        if is_long_range_video_click(
+            row.get("video_y_norm"),
+            row.get("rangefinder_down_m"),
+            row.get("ekf_rel_alt_m"),
+        ):
+            try:
+                raw = float(row.get("rangefinder_down_m") or 0)
+                if raw >= 40.0:
+                    return min(80.0, raw), "rangefinder_clamped_long"
+            except (TypeError, ValueError):
+                pass
     if prefer_facade_rangefinder_agl(ekf_max, rf_min):
         return rf_min, "rangefinder_down_facade"
     if ekf_max is not None and ekf_max >= MIN_FACADE_AGL_M:
@@ -683,6 +732,65 @@ def _geo_lon_jump_deg(row_a: dict[str, Any], row_b: dict[str, Any]) -> float:
     return abs(float(pb[1]) - float(pa[1]))
 
 
+def _video_long_range_width_m(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    apply_user_scale: bool = True,
+) -> float | None:
+    """
+    Width between distant skyline / tower clicks (RF clamped, shallow depression).
+
+    Uses slant horizontal range × video angle; not the 14 m near-wall fallback.
+    """
+    xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+    if xy_a is None or xy_b is None:
+        return None
+    dx = abs(xy_b[0] - xy_a[0])
+    if dx < 0.03:
+        return None
+    angle_h = dx * math.radians(float(hfov_deg))
+    if angle_h <= 1e-5:
+        return None
+
+    agl, _ = session_facade_measure_agl_m([row_a, row_b])
+    candidates: list[float] = []
+
+    filled = _fill_pair_geo_ranges(row_a, row_b, hfov_deg=hfov_deg)
+    if filled is not None:
+        r1, r2, b1, b2 = filled
+        d_law = _law_of_cosines_m(r1, r2, float(b1), float(b2))
+        if d_law is not None and d_law > 0:
+            candidates.append(d_law)
+        mean_r = 0.5 * (r1 + r2)
+        candidates.append(mean_r * angle_h)
+        candidates.append(2.0 * mean_r * math.sin(angle_h / 2.0))
+
+    for row in (row_a, row_b):
+        dep = row.get("geo_depression_deg")
+        rg = row.get("geo_range_m")
+        if dep is not None and agl is not None:
+            rh = slant_horizontal_range_m(float(agl), float(dep))
+            if rh is not None:
+                candidates.append(rh * angle_h)
+        if rg is not None and dep is not None:
+            try:
+                rh = slant_horizontal_range_m(
+                    float(agl or 0), float(dep)
+                ) or float(rg)
+                candidates.append(float(rg) * angle_h)
+            except (TypeError, ValueError):
+                pass
+
+    if not candidates:
+        return None
+    d = max(candidates)
+    if apply_user_scale and d < LONG_RANGE_MAX_WIDTH_M:
+        d *= _segment_scale_short()
+    return max(0.0, min(d, LONG_RANGE_MAX_WIDTH_M))
+
+
 def _facade_range_cap_m(
     agl_m: float | None,
     r1: float,
@@ -751,6 +859,11 @@ def video_facade_width_m(
     xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
     if xy_a is None or xy_b is None:
         return None
+    measure_ctx = facade_measure_context(row_a, row_b)
+    if measure_ctx == "long_range":
+        return _video_long_range_width_m(
+            row_a, row_b, hfov_deg=hfov_deg, apply_user_scale=apply_user_scale
+        )
     if not marks_suitable_for_facade_tape_measure(row_a, row_b)[0]:
         return None
     dx = abs(xy_b[0] - xy_a[0])
@@ -1195,15 +1308,21 @@ def _format_segment_label(
     estimate: bool = False,
     level_ok: bool = True,
     facade_plane: bool = False,
+    long_range: bool = False,
 ) -> str:
     base = format_target_segment_label(
-        d, video_span_norm=video_span_norm, force_show_meters=True
+        d,
+        video_span_norm=video_span_norm,
+        force_show_meters=True,
+        long_range=long_range,
     )
     if not base:
         return ""
     if not level_ok:
         return MARKS_NOT_LEVEL_HINT
-    if facade_plane and not base.startswith("distance unreliable"):
+    if long_range and not base.startswith("distance unreliable"):
+        base = f"~{base} (distant)"
+    elif facade_plane and not base.startswith("distance unreliable"):
         base = f"{base} (wall)"
     if (video_only or estimate) and not base.startswith("distance unreliable"):
         return f"~{base}"
@@ -1233,6 +1352,7 @@ def _one_pair_video_segment(
         return (xy_l[0], xy_l[1], xy_r[0], xy_r[1], agl_msg)
     dy_lr = abs(xy_r[1] - xy_l[1])
     off_level = dy_lr > SAME_LEVEL_DY_NORM
+    measure_ctx = facade_measure_context(left, right)
     suitable, dist_hint = marks_suitable_for_facade_tape_measure(left, right)
     if not suitable:
         return (xy_l[0], xy_l[1], xy_r[0], xy_r[1], dist_hint)
@@ -1262,18 +1382,20 @@ def _one_pair_video_segment(
         )
         label = _format_segment_label(
             d,
-            video_only=est,
+            video_only=est or measure_ctx == "long_range",
             video_span_norm=pix,
-            estimate=est,
+            estimate=est or measure_ctx == "long_range",
             level_ok=dy_lr <= SAME_LEVEL_DY_NORM,
             facade_plane=bool(
-                suitable
+                measure_ctx == "near_wall"
+                and suitable
                 and left.get("geo_depression_deg") is not None
                 and right.get("geo_depression_deg") is not None
             ),
+            long_range=measure_ctx == "long_range",
         )
         label = append_marks_level_hint(label, left, right)
-        if d is not None:
+        if d is not None and measure_ctx == "near_wall":
             pa = observation_target_latlon(left)
             pb = observation_target_latlon(right)
             if pa is not None and pb is not None:
@@ -1615,6 +1737,7 @@ def format_target_segment_label(
     *,
     video_span_norm: float | None = None,
     force_show_meters: bool = False,
+    long_range: bool = False,
 ) -> str:
     """
     Label for map/video measure line. Prefer a numeric estimate; avoid blank
@@ -1623,13 +1746,16 @@ def format_target_segment_label(
     d = float(geo_distance_m)
     if (
         not force_show_meters
+        and not long_range
         and video_span_norm is not None
         and video_span_norm < 0.55
         and d > 45.0
     ):
         return "distance unreliable (~use ground marks)"
-    if d >= 50.0:
+    if not long_range and d >= 50.0:
         return "distance unreliable (check GPS/height)"
+    if d >= LONG_RANGE_MAX_WIDTH_M:
+        return f">{LONG_RANGE_MAX_WIDTH_M:.0f} m"
     if d < 100.0:
         return f"{d:.1f} m"
     return f"{d:.0f} m"

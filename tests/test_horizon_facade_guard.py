@@ -18,7 +18,9 @@ HEADING = 325.0
 
 
 def _mark(vx: float, vy: float, *, ekf: float, rf: float) -> dict:
-    agl, src = resolve_facade_ray_agl_m(relative_alt_m=ekf, rangefinder_down_m=rf)
+    agl, src = resolve_facade_ray_agl_m(
+        relative_alt_m=ekf, rangefinder_down_m=rf, video_y_norm=vy
+    )
     g = compute_geo_reference(
         vehicle_lat=LAT,
         vehicle_lon=LON,
@@ -61,13 +63,17 @@ def test_near_wall_low_video_still_measures():
     assert 3.0 <= d <= 5.5
 
 
-def test_skyline_rf45_not_four_metre_wall():
-    """Bad case (image 2): upper frame rooftop towers, RF clamped 45 m."""
-    left = _mark(0.42, 0.32, ekf=0.5, rf=RF_CLAMP)
-    right = _mark(0.52, 0.34, ekf=0.6, rf=RF_CLAMP)
-    assert not marks_suitable_for_facade_tape_measure(left, right)[0]
-    assert segment_distance_between_rows(left, right, hfov_deg=62.0) is None
+def test_skyline_rf45_long_range_at_least_forty_metres():
+    """Distant towers (image): RF 45 m clamped, upper video — not ~10 m (wall)."""
+    left = _mark(0.36, 0.38, ekf=0.5, rf=RF_CLAMP)
+    right = _mark(0.54, 0.40, ekf=0.6, rf=RF_CLAMP)
+    assert left["geo_range_m"] is not None
+    assert right["geo_range_m"] is not None
+    d = segment_distance_between_rows(left, right, hfov_deg=62.0)
+    assert d is not None
+    assert d >= 50.0
     segs = observation_facade_video_segments([left, right], hfov_deg=62.0)
     assert len(segs) == 1
-    assert FACADE_DISTANT_TARGET_HINT in segs[0][4]
+    assert "(distant)" in segs[0][4]
     assert "(wall)" not in segs[0][4]
+    assert FACADE_DISTANT_TARGET_HINT not in segs[0][4]

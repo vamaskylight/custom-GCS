@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Callable
 
 from vgcs.observe.target_measure import (
+    is_long_range_video_click,
     is_plausible_ground_range,
     resolve_facade_ray_agl_m,
+    slant_horizontal_range_m,
 )
 
 _EARTH_RADIUS_M = 6_371_000.0
@@ -171,6 +173,7 @@ def compute_geo_reference(
     agl_m, agl_src = resolve_facade_ray_agl_m(
         relative_alt_m=vehicle_rel_alt_m,
         rangefinder_down_m=rangefinder_down_m,
+        video_y_norm=video_y_norm,
     )
     if agl_m is None:
         return GeoReferenceResult(
@@ -178,14 +181,9 @@ def compute_geo_reference(
             warning="vehicle altitude AGL unknown (need EKF rel alt or downward rangefinder)",
             method="none",
         )
-    if agl_src == "rangefinder_clamped_facade" and float(video_y_norm) < 0.55:
-        return GeoReferenceResult(
-            ok=False,
-            warning=(
-                "click in upper video (distant/horizon); use lower frame for wall tape measure"
-            ),
-            method="none",
-        )
+    long_range = is_long_range_video_click(
+        video_y_norm, rangefinder_down_m, vehicle_rel_alt_m
+    )
     if gimbal_yaw_deg is None or gimbal_pitch_deg is None:
         return GeoReferenceResult(ok=False, warning="gimbal yaw/pitch missing", method="none")
 
@@ -205,8 +203,12 @@ def compute_geo_reference(
     g_pitch_deg = float(gimbal_pitch_deg)
     pitch_assumed = False
     # C13/Skydroid often reports ~0° (level) while the scene is oblique; rangefinder
-    # DOWN confirms we are low — use a typical downward look for geo.
-    if "rangefinder" in agl_src and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0):
+    # DOWN confirms we are low — use a typical downward look for near-wall geo only.
+    if (
+        not long_range
+        and "rangefinder" in agl_src
+        and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0)
+    ):
         g_pitch_deg = -35.0
         pitch_assumed = True
     g_pitch = _deg2rad(g_pitch_deg)
@@ -253,6 +255,31 @@ def compute_geo_reference(
     depression = math.degrees(math.atan2(dz, math.hypot(dir_ned[0], dir_ned[1])))
 
     if not is_plausible_ground_range(agl_m, range_m, depression):
+        if long_range:
+            range_use = slant_horizontal_range_m(agl_m, depression) or min(
+                280.0, max(float(agl_m) * 2.0, range_m * 0.15)
+            )
+            quality, warn = _quality_label(
+                gps_fix_type=int(gps_fix_type or 0),
+                gps_hdop=gps_hdop,
+                has_gimbal=True,
+                depression_deg=depression,
+                range_m=range_use,
+            )
+            extra = "distant target — slant range estimate (not ground GPS)"
+            warn = f"{warn}; {extra}" if warn else extra
+            if pitch_assumed:
+                extra2 = "gimbal pitch assumed -35° (sensor read ~0°)"
+                warn = f"{warn}; {extra2}" if warn else extra2
+            return GeoReferenceResult(
+                ok=True,
+                quality=quality if quality != "insufficient" else "fair",
+                warning=warn,
+                method="ray_slant_long_range",
+                horizontal_range_m=range_use,
+                bearing_deg=bearing,
+                depression_deg=depression,
+            )
         return GeoReferenceResult(
             ok=False,
             warning=(

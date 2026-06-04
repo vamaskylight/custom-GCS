@@ -6132,6 +6132,7 @@ class MapWidget(QWidget):
         ray_agl, ray_src = resolve_facade_ray_agl_m(
             relative_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
             rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
+            video_y_norm=row.get("video_y_norm"),  # type: ignore[arg-type]
         )
         row["measure_agl_m"] = ray_agl
         row["geo_agl_source"] = ray_src
@@ -6164,15 +6165,21 @@ class MapWidget(QWidget):
 
         q = str(geo.quality or "")
         ray_for_plaus = ray_agl
+        long_range_ray = ray_src == "rangefinder_clamped_long" or str(
+            geo.method or ""
+        ).startswith("ray_slant_long")
         if (
             geo.horizontal_range_m is not None
             and geo.bearing_deg is not None
             and geo.depression_deg is not None
             and ray_for_plaus is not None
-            and is_plausible_ground_range(
-                float(ray_for_plaus),
-                float(geo.horizontal_range_m),
-                float(geo.depression_deg),
+            and (
+                long_range_ray
+                or is_plausible_ground_range(
+                    float(ray_for_plaus),
+                    float(geo.horizontal_range_m),
+                    float(geo.depression_deg),
+                )
             )
         ):
             row["geo_range_m"] = geo.horizontal_range_m
