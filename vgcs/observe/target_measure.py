@@ -96,6 +96,41 @@ def resolve_vehicle_agl_m(
     return None, ""
 
 
+# Below this EKF rel-alt (m), prefer downward RF for wall/facade rays when RF is present.
+# Field logs: ekf=0 + rf≈26 → good ~3.5 m; ekf≈2.3 + rf≈26 → geo fails → ~2.1 m / km glitch.
+_FACADE_EKF_TRUST_MIN_M = 3.0
+
+
+def resolve_facade_ray_agl_m(
+    *,
+    relative_alt_m: float | None,
+    rangefinder_down_m: float | None = None,
+) -> tuple[float | None, str]:
+    """
+    AGL for geo-referencing facade/wall clicks.
+
+    EKF rel-alt often reads 0–2 m on a roof/bench while downward RF (~25 m) matches the
+    courtyard ground used successfully for ~3.5 m building openings.
+    """
+    try:
+        rel = float(relative_alt_m) if relative_alt_m is not None else None
+    except (TypeError, ValueError):
+        rel = None
+    try:
+        rf = float(rangefinder_down_m) if rangefinder_down_m is not None else None
+    except (TypeError, ValueError):
+        rf = None
+    if rf is not None and rf >= MIN_FACADE_AGL_M:
+        if rel is None or rel < _FACADE_EKF_TRUST_MIN_M:
+            return rf, "rangefinder_down_facade"
+    if rel is not None and rel >= _FACADE_EKF_TRUST_MIN_M:
+        return rel, "ekf_relative"
+    return resolve_vehicle_agl_m(
+        relative_alt_m=relative_alt_m,
+        rangefinder_down_m=rangefinder_down_m,
+    )
+
+
 def observation_ekf_rel_alt_m(row: dict[str, Any]) -> float | None:
     """
     EKF relative altitude at mark time (not downward rangefinder).
@@ -130,12 +165,16 @@ def observation_ekf_rel_alt_m(row: dict[str, Any]) -> float | None:
 
 
 def is_oblique_roof_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> bool:
-    """Flight height from EKF while downward RF reads open ground far below."""
+    """
+    Low aerial oblique view: trust EKF height, not downward RF.
+
+    Not set when EKF is below ``_FACADE_EKF_TRUST_MIN_M`` (bench/roof with RF to courtyard).
+    """
     ekf_vals: list[float] = []
     rf_vals: list[float] = []
     for row in (row_a, row_b):
         e = observation_ekf_rel_alt_m(row)
-        if e is not None and e >= MIN_FACADE_AGL_M:
+        if e is not None and e >= _FACADE_EKF_TRUST_MIN_M:
             ekf_vals.append(e)
         try:
             rf = float(row.get("rangefinder_down_m") or 0)
@@ -148,6 +187,32 @@ def is_oblique_roof_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> boo
     rel = max(ekf_vals)
     rf = min(rf_vals) if rf_vals else None
     return rf is not None and rf > rel * 1.6
+
+
+def session_facade_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | None, str]:
+    """Stable facade height for a mark pair (Reset-safe)."""
+    ekf_vals: list[float] = []
+    rf_vals: list[float] = []
+    for row in rows:
+        e = observation_ekf_rel_alt_m(row)
+        if e is not None and e > 0.05:
+            ekf_vals.append(e)
+        try:
+            rf = float(row.get("rangefinder_down_m") or 0)
+            if rf > 0.05:
+                rf_vals.append(rf)
+        except (TypeError, ValueError):
+            pass
+    ekf_max = max(ekf_vals) if ekf_vals else None
+    rf_min = min(rf_vals) if rf_vals else None
+    if rf_min is not None and rf_min >= MIN_FACADE_AGL_M:
+        if ekf_max is None or ekf_max < _FACADE_EKF_TRUST_MIN_M:
+            return rf_min, "rangefinder_down_facade"
+    if ekf_max is not None and ekf_max >= _FACADE_EKF_TRUST_MIN_M:
+        return ekf_max, "ekf_relative"
+    if rf_min is not None and rf_min >= MIN_FACADE_AGL_M:
+        return rf_min, "rangefinder_down"
+    return session_measure_agl_m(rows)
 
 
 def is_plausible_ground_range(
@@ -275,7 +340,7 @@ def session_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | None, str
 
 
 def measure_agl_ok(rows: list[dict[str, Any]]) -> tuple[bool, str]:
-    agl, src = session_measure_agl_m(rows)
+    agl, src = session_facade_measure_agl_m(rows)
     if agl is not None and agl >= MIN_FACADE_AGL_M:
         return True, src
     if src.startswith("rangefinder_down_"):
@@ -433,7 +498,9 @@ def video_facade_width_m(
         return None
 
     level_pair = dy <= SAME_LEVEL_DY_NORM
-    agl = _observation_agl_m(row_a) or _observation_agl_m(row_b)
+    agl, _facade_src = session_facade_measure_agl_m([row_a, row_b])
+    if agl is None:
+        agl = _observation_agl_m(row_a) or _observation_agl_m(row_b)
 
     rf_floor = session_rangefinder_reference_m([row_a, row_b])
     d_facade = facade_plane_width_between_marks(
@@ -482,6 +549,9 @@ def video_facade_width_m(
         r1 = r2 = 0.0
         b1 = b2 = None
 
+    filled = _fill_pair_geo_ranges(row_a, row_b)
+    if filled is not None:
+        r1, r2, b1, b2 = filled
     if r1 > 0 and r2 > 0 and b1 is not None and b2 is not None:
         d_law = _law_of_cosines_m(r1, r2, float(b1), float(b2))
         if d_law is not None and d_law > 0:
@@ -527,9 +597,15 @@ def video_facade_width_m(
             )
         )
 
+    geo_ok_pair = (
+        str(row_a.get("geo_quality") or "") not in ("", "insufficient")
+        and str(row_b.get("geo_quality") or "") not in ("", "insufficient")
+    )
+
     trust_haversine = False
     if (
         level_pair
+        and geo_ok_pair
         and d_hav is not None
         and 0.0 < d_hav < 50.0
         and not bad_ground_haversine
@@ -583,7 +659,29 @@ def video_facade_width_m(
 
     if apply_user_scale and d < 15.0:
         d *= _segment_scale_short()
+    if d > 45.0:
+        return None
     return max(0.0, d)
+
+
+def _fill_pair_geo_ranges(
+    row_a: dict[str, Any], row_b: dict[str, Any]
+) -> tuple[float, float, float, float] | None:
+    """Use good mark range on wall when the partner geo failed (Reset / EKF glitch)."""
+    try:
+        r1 = float(row_a.get("geo_range_m") or 0)
+        r2 = float(row_b.get("geo_range_m") or 0)
+        b1 = row_a.get("geo_bearing_deg")
+        b2 = row_b.get("geo_bearing_deg")
+    except (TypeError, ValueError):
+        return None
+    if r1 > 0.5 and r2 > 0.5 and b1 is not None and b2 is not None:
+        return r1, r2, float(b1), float(b2)
+    if r1 > 0.5 and b1 is not None:
+        return r1, r1, float(b1), float(b1)
+    if r2 > 0.5 and b2 is not None:
+        return r2, r2, float(b2), float(b2)
+    return None
 
 
 def segment_distance_video_fallback(
@@ -601,7 +699,9 @@ def segment_distance_video_fallback(
     if dx < 0.03:
         return None
     angle_h = dx * math.radians(float(hfov_deg))
-    agl = range_m or session_rangefinder_reference_m([row_a, row_b])
+    agl, _ = session_facade_measure_agl_m([row_a, row_b])
+    if agl is None:
+        agl = range_m or session_rangefinder_reference_m([row_a, row_b])
     if agl is None or agl < 1.0:
         return None
     candidates: list[float] = []
@@ -1169,8 +1269,8 @@ def format_target_segment_label(
         and d > 45.0
     ):
         return "distance unreliable (~use ground marks)"
-    if d >= 1000.0:
-        return f"{d / 1000.0:.1f} km"
+    if d >= 50.0:
+        return "distance unreliable (check GPS/height)"
     if d < 100.0:
         return f"{d:.1f} m"
     return f"{d:.0f} m"

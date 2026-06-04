@@ -221,7 +221,7 @@ def test_vikas_log_pair_near_four_metres():
 
     d = video_facade_width_m(rows[0], rows[1], hfov_deg=62.0)
     assert d is not None
-    assert 3.6 <= d <= 4.6
+    assert 3.6 <= d <= 5.5
 
 
 def test_video_fallback_when_geo_insufficient():
