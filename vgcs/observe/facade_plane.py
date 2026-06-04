@@ -121,7 +121,7 @@ def facade_plane_width_between_marks(
 
     from vgcs.observe.target_measure import _fill_pair_geo_ranges
 
-    filled = _fill_pair_geo_ranges(row_a, row_b)
+    filled = _fill_pair_geo_ranges(row_a, row_b, hfov_deg=hfov_deg)
     if filled is not None:
         rg1, rg2, b1, b2 = filled
         r1 = _sanitized_click_range_m(
