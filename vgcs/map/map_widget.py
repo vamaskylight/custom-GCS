@@ -6063,7 +6063,9 @@ class MapWidget(QWidget):
                     v_lat, v_lon = float(pos[0]), float(pos[1])
             except Exception:
                 pass
-        agl_m, agl_src = resolve_vehicle_agl_m(
+        from vgcs.observe.target_measure import resolve_facade_ray_agl_m
+
+        agl_m, agl_src = resolve_facade_ray_agl_m(
             relative_alt_m=self._vehicle_rel_alt_m,
             rangefinder_down_m=self._rangefinder_down_m,
         )
@@ -6133,6 +6135,7 @@ class MapWidget(QWidget):
         )
         row["measure_agl_m"] = ray_agl
         row["geo_agl_source"] = ray_src
+        row["agl_source"] = ray_src
         geo = compute_geo_reference(
             vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
             vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
