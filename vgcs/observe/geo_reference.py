@@ -13,7 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from vgcs.observe.target_measure import is_plausible_ground_range, resolve_vehicle_agl_m
+from vgcs.observe.target_measure import (
+    is_plausible_ground_range,
+    resolve_facade_ray_agl_m,
+)
 
 _EARTH_RADIUS_M = 6_371_000.0
 
@@ -165,7 +168,7 @@ def compute_geo_reference(
     """
     if vehicle_lat is None or vehicle_lon is None:
         return GeoReferenceResult(ok=False, warning="vehicle position missing", method="none")
-    agl_m, agl_src = resolve_vehicle_agl_m(
+    agl_m, agl_src = resolve_facade_ray_agl_m(
         relative_alt_m=vehicle_rel_alt_m,
         rangefinder_down_m=rangefinder_down_m,
     )
@@ -195,7 +198,7 @@ def compute_geo_reference(
     pitch_assumed = False
     # C13/Skydroid often reports ~0° (level) while the scene is oblique; rangefinder
     # DOWN confirms we are low — use a typical downward look for geo.
-    if agl_src == "rangefinder_down" and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0):
+    if "rangefinder" in agl_src and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0):
         g_pitch_deg = -35.0
         pitch_assumed = True
     g_pitch = _deg2rad(g_pitch_deg)

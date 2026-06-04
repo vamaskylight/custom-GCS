@@ -189,6 +189,31 @@ def is_oblique_roof_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> boo
     return rf is not None and rf > rel * 1.6
 
 
+# Field: ~3.5 m openings at RF≈26 m; same clicks read ~2 m at RF≈14 m (courtyard below).
+_LOW_RF_FACADE_REFERENCE_M = 26.0
+
+
+def _low_rf_facade_width_boost(rows: list[dict[str, Any]], d_m: float) -> float:
+    """Scale width when drone moved closer (downward RF drops but opening width unchanged)."""
+    if d_m <= 0.5:
+        return d_m
+    rf_vals: list[float] = []
+    for row in rows:
+        try:
+            v = float(row.get("rangefinder_down_m") or 0)
+            if v > 0.5:
+                rf_vals.append(v)
+        except (TypeError, ValueError):
+            pass
+    if not rf_vals:
+        return d_m
+    rf = min(rf_vals)
+    if rf >= 20.0 or rf < 8.0:
+        return d_m
+    boost = max(1.0, min(2.35, _LOW_RF_FACADE_REFERENCE_M / rf))
+    return d_m * boost
+
+
 def session_facade_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | None, str]:
     """Stable facade height for a mark pair (Reset-safe)."""
     ekf_vals: list[float] = []
@@ -536,6 +561,7 @@ def video_facade_width_m(
         if trust_facade_only or (not needs_uplift and not implausible):
             if apply_user_scale:
                 d_facade *= _segment_scale_short()
+            d_facade = _low_rf_facade_width_boost([row_a, row_b], d_facade)
             return max(0.0, d_facade)
 
     candidates: list[float] = []
@@ -659,6 +685,7 @@ def video_facade_width_m(
 
     if apply_user_scale and d < 15.0:
         d *= _segment_scale_short()
+    d = _low_rf_facade_width_boost([row_a, row_b], d)
     if d > 45.0:
         return None
     return max(0.0, d)
@@ -704,6 +731,17 @@ def segment_distance_video_fallback(
         agl = range_m or session_rangefinder_reference_m([row_a, row_b])
     if agl is None or agl < 1.0:
         return None
+    filled = _fill_pair_geo_ranges(row_a, row_b)
+    if filled is not None:
+        r1, r2, b1, b2 = filled
+        d_law = _law_of_cosines_m(r1, r2, b1, b2)
+        if d_law is not None and d_law > 0:
+            d = d_law
+            if d < 15.0:
+                d *= _segment_scale_short()
+            d = _low_rf_facade_width_boost([row_a, row_b], d)
+            return max(0.0, d)
+
     candidates: list[float] = []
     for row in (row_a, row_b):
         dep = row.get("geo_depression_deg")
@@ -712,12 +750,13 @@ def segment_distance_video_fallback(
             if rh is not None:
                 candidates.append(rh * angle_h)
     if not candidates:
-        # Last resort: assume ~40° look so RF AGL is not used as horizontal range (was ~82 m).
-        rh = float(agl) / math.tan(math.radians(40.0))
+        dep_guess = 27.0
+        rh = float(agl) / math.tan(math.radians(dep_guess))
         candidates.append(rh * angle_h)
     d = min(candidates)
     if d < 15.0:
         d *= _segment_scale_short()
+    d = _low_rf_facade_width_boost([row_a, row_b], d)
     return max(0.0, d)
 
 
@@ -898,9 +937,9 @@ def _one_pair_video_segment(
         label = MARKS_NOT_LEVEL_HINT
     else:
         pix = video_mark_span_norm(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
-        est = _geo_lon_jump_deg(left, right) > 0.00035 or bool(
-            left.get("geo_quality") == "insufficient"
-            or right.get("geo_quality") == "insufficient"
+        est = _geo_lon_jump_deg(left, right) > 0.00035 or (
+            str(left.get("geo_quality") or "") == "insufficient"
+            and str(right.get("geo_quality") or "") == "insufficient"
         )
         label = _format_segment_label(
             d,
