@@ -67,14 +67,12 @@ def _pair_facade_agl_m(row_a: dict[str, Any], row_b: dict[str, Any]) -> float | 
     Uses the best EKF rel-alt seen on either mark, not per-click resolved AGL
     (which could flip between EKF and downward RF and change the line by 2×).
     """
-    from vgcs.observe.target_measure import is_oblique_roof_context, session_measure_agl_m
+    from vgcs.observe.target_measure import session_facade_measure_agl_m
 
-    agl, _src = session_measure_agl_m([row_a, row_b])
+    agl, _src = session_facade_measure_agl_m([row_a, row_b])
     if agl is None:
         return None
-    if is_oblique_roof_context(row_a, row_b):
-        return agl
-    return min(float(agl), 35.0)
+    return min(float(agl), 80.0)
 
 
 def _sanitized_click_range_m(row: dict[str, Any], agl_eff: float) -> float | None:
@@ -121,10 +119,23 @@ def facade_plane_width_between_marks(
     if agl_eff is None or agl_eff < _MIN_FACADE_AGL_M:
         return None
 
-    b1 = row_a.get("geo_bearing_deg")
-    b2 = row_b.get("geo_bearing_deg")
-    r1 = _sanitized_click_range_m(row_a, agl_eff)
-    r2 = _sanitized_click_range_m(row_b, agl_eff)
+    from vgcs.observe.target_measure import _fill_pair_geo_ranges
+
+    filled = _fill_pair_geo_ranges(row_a, row_b)
+    if filled is not None:
+        rg1, rg2, b1, b2 = filled
+        r1 = _sanitized_click_range_m(
+            {**row_a, "geo_range_m": rg1, "geo_bearing_deg": b1}, agl_eff
+        )
+        r2 = _sanitized_click_range_m(
+            {**row_b, "geo_range_m": rg2, "geo_bearing_deg": b2}, agl_eff
+        )
+        b1, b2 = b1, b2
+    else:
+        b1 = row_a.get("geo_bearing_deg")
+        b2 = row_b.get("geo_bearing_deg")
+        r1 = _sanitized_click_range_m(row_a, agl_eff)
+        r2 = _sanitized_click_range_m(row_b, agl_eff)
     angle_h = dx * math.radians(float(hfov_deg))
 
     if (

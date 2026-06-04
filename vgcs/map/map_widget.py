@@ -6125,13 +6125,21 @@ class MapWidget(QWidget):
             row["geo_warning"] = "video click missing"
             return
         hfov, dem_path = self._m8_geo_settings()
+        from vgcs.observe.target_measure import resolve_facade_ray_agl_m
+
+        ray_agl, ray_src = resolve_facade_ray_agl_m(
+            relative_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
+            rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
+        )
+        row["measure_agl_m"] = ray_agl
+        row["geo_agl_source"] = ray_src
         geo = compute_geo_reference(
             vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
             vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
             vehicle_heading_deg=row.get("vehicle_heading_deg"),  # type: ignore[arg-type]
             vehicle_roll_deg=row.get("vehicle_roll_deg"),  # type: ignore[arg-type]
             vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
-            vehicle_rel_alt_m=row.get("vehicle_rel_alt_m"),  # type: ignore[arg-type]
+            vehicle_rel_alt_m=ray_agl,
             vehicle_alt_msl_m=self._vehicle_alt_msl_m,
             rangefinder_down_m=self._rangefinder_down_m,
             gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
@@ -6149,9 +6157,18 @@ class MapWidget(QWidget):
         row["geo_quality"] = geo.quality
         row["geo_warning"] = geo.warning
         row["geo_method"] = geo.method
-        row["geo_range_m"] = geo.horizontal_range_m
-        row["geo_bearing_deg"] = geo.bearing_deg
-        row["geo_depression_deg"] = geo.depression_deg
+        q = str(geo.quality or "")
+        if geo.ok or q in ("good", "fair"):
+            row["geo_range_m"] = geo.horizontal_range_m
+            row["geo_bearing_deg"] = geo.bearing_deg
+            row["geo_depression_deg"] = geo.depression_deg
+        else:
+            row["geo_range_m"] = None
+            row["geo_bearing_deg"] = None
+            row["geo_depression_deg"] = None
+        if not geo.ok:
+            row["target_lat"] = None
+            row["target_lon"] = None
         if geo.ok and geo.target_lat is not None and geo.target_lon is not None:
             try:
                 nm = getattr(self, "_native_map", None)
