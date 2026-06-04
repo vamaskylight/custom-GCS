@@ -89,8 +89,9 @@ def resolve_vehicle_agl_m(
         rf = float(rangefinder_down_m) if rangefinder_down_m is not None else None
     except (TypeError, ValueError):
         rf = None
-    if rf is not None and 0.15 < rf < 200.0:
-        return rf, "rangefinder_down"
+    rf_use = sanitize_downward_rangefinder_m(rangefinder_down_m, rel)
+    if rf_use is not None:
+        return rf_use, "rangefinder_down"
     if rel is not None and rel > 0.05:
         return max(rel, 0.5), "ekf_relative_low"
     return None, ""
@@ -99,6 +100,47 @@ def resolve_vehicle_agl_m(
 # Use downward RF for facade rays when EKF is low or RF is clearly the courtyard below.
 _FACADE_RF_OVER_EKF_RATIO = 1.75
 _FACADE_EKF_FLIGHT_MIN_M = 8.0
+# When downward RF is clamped (often 45 m) on a roof/bench, use typical courtyard depth.
+_FACADE_RF_CLAMPED_FALLBACK_M = 14.0
+_RF_CLAMP_SUSPECT_M = {40.0, 45.0, 60.0, 120.0, 200.0}
+
+
+def downward_rangefinder_plausible_m(
+    rangefinder_down_m: float | None,
+    relative_alt_m: float | None = None,
+) -> bool:
+    """
+    False for maxed/clamped downward RF while EKF says the vehicle is near the roof.
+
+    Logs often show RF stuck at 45 m with rel-alt 0–1 m — using that AGL yields 6–8 m
+    facade widths instead of ~4 m tape openings.
+    """
+    try:
+        rf = float(rangefinder_down_m) if rangefinder_down_m is not None else None
+    except (TypeError, ValueError):
+        return False
+    if rf is None or rf < 0.15:
+        return False
+    if rf >= 40.0 or rf in _RF_CLAMP_SUSPECT_M:
+        return False
+    try:
+        rel = float(relative_alt_m) if relative_alt_m is not None else None
+    except (TypeError, ValueError):
+        rel = None
+    if rel is not None and rel < 2.0 and rf > 35.0:
+        return False
+    if rel is not None and rel < 0.5 and rf > 30.0:
+        return False
+    return True
+
+
+def sanitize_downward_rangefinder_m(
+    rangefinder_down_m: float | None,
+    relative_alt_m: float | None = None,
+) -> float | None:
+    if not downward_rangefinder_plausible_m(rangefinder_down_m, relative_alt_m):
+        return None
+    return float(rangefinder_down_m)  # type: ignore[arg-type]
 
 
 def prefer_facade_rangefinder_agl(
@@ -110,11 +152,8 @@ def prefer_facade_rangefinder_agl(
 
     Not used for true low aerial oblique (see ``is_oblique_roof_context``).
     """
-    try:
-        rf = float(rangefinder_down_m) if rangefinder_down_m is not None else None
-    except (TypeError, ValueError):
-        rf = None
-    if rf is None or rf < MIN_FACADE_AGL_M:
+    rf = sanitize_downward_rangefinder_m(rangefinder_down_m, relative_alt_m)
+    if rf is None:
         return False
     try:
         rel = float(relative_alt_m) if relative_alt_m is not None else None
@@ -146,18 +185,22 @@ def resolve_facade_ray_agl_m(
     except (TypeError, ValueError):
         rel = None
     try:
-        rf = float(rangefinder_down_m) if rangefinder_down_m is not None else None
+        rf_raw = float(rangefinder_down_m) if rangefinder_down_m is not None else None
     except (TypeError, ValueError):
-        rf = None
+        rf_raw = None
+    rf = sanitize_downward_rangefinder_m(rf_raw, rel)
     if prefer_facade_rangefinder_agl(rel, rf):
         return rf, "rangefinder_down_facade"
     if rel is not None and rel >= MIN_FACADE_AGL_M:
         return rel, "ekf_relative"
     if rf is not None and rf >= MIN_FACADE_AGL_M:
         return rf, "rangefinder_down"
+    if rf_raw is not None and rf is None and (rf_raw >= 40.0 or rf_raw in _RF_CLAMP_SUSPECT_M):
+        if rel is None or rel < 3.0:
+            return _FACADE_RF_CLAMPED_FALLBACK_M, "rangefinder_clamped_facade"
     return resolve_vehicle_agl_m(
         relative_alt_m=relative_alt_m,
-        rangefinder_down_m=rangefinder_down_m,
+        rangefinder_down_m=rf,
     )
 
 
@@ -207,11 +250,12 @@ def is_oblique_roof_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> boo
         if e is not None and e >= MIN_FACADE_AGL_M:
             ekf_vals.append(e)
         try:
-            rf = float(row.get("rangefinder_down_m") or 0)
-            if rf > 0.5:
-                rf_vals.append(rf)
+            raw = float(row.get("rangefinder_down_m") or 0)
         except (TypeError, ValueError):
-            pass
+            continue
+        rf = sanitize_downward_rangefinder_m(raw, observation_ekf_rel_alt_m(row))
+        if rf is not None and rf > 0.5:
+            rf_vals.append(rf)
     if not ekf_vals:
         return False
     rel = max(ekf_vals)
@@ -236,11 +280,15 @@ def _facade_opening_rf_scale(rows: list[dict[str, Any]], d_m: float) -> float:
     rf_vals: list[float] = []
     for row in rows:
         try:
-            v = float(row.get("rangefinder_down_m") or 0)
-            if v > 0.5:
-                rf_vals.append(v)
+            raw = float(row.get("rangefinder_down_m") or 0)
         except (TypeError, ValueError):
-            pass
+            continue
+        ekf = observation_ekf_rel_alt_m(row)
+        rf = sanitize_downward_rangefinder_m(raw, ekf)
+        if rf is None and (raw >= 40.0 or raw in _RF_CLAMP_SUSPECT_M):
+            rf = _FACADE_RF_CLAMPED_FALLBACK_M
+        if rf is not None and rf > 0.5:
+            rf_vals.append(rf)
     if not rf_vals:
         return d_m
     rf = min(rf_vals)
@@ -265,11 +313,15 @@ def session_facade_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | No
         if e is not None and e > 0.05:
             ekf_vals.append(e)
         try:
-            rf = float(row.get("rangefinder_down_m") or 0)
-            if rf > 0.05:
-                rf_vals.append(rf)
+            raw = float(row.get("rangefinder_down_m") or 0)
         except (TypeError, ValueError):
-            pass
+            continue
+        ekf = observation_ekf_rel_alt_m(row)
+        rf = sanitize_downward_rangefinder_m(raw, ekf)
+        if rf is None and (raw >= 40.0 or raw in _RF_CLAMP_SUSPECT_M):
+            rf = _FACADE_RF_CLAMPED_FALLBACK_M
+        if rf is not None and rf > 0.05:
+            rf_vals.append(rf)
     ekf_max = max(ekf_vals) if ekf_vals else None
     rf_min = min(rf_vals) if rf_vals else None
     if prefer_facade_rangefinder_agl(ekf_max, rf_min):
@@ -278,6 +330,8 @@ def session_facade_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | No
         return ekf_max, "ekf_relative"
     if rf_min is not None and rf_min >= MIN_FACADE_AGL_M:
         return rf_min, "rangefinder_down"
+    if rf_min is not None:
+        return rf_min, "rangefinder_clamped_facade"
     return session_measure_agl_m(rows)
 
 
@@ -427,10 +481,14 @@ def session_rangefinder_reference_m(rows: list[dict[str, Any]]) -> float | None:
     vals: list[float] = []
     for row in rows:
         try:
-            v = float(row.get("rangefinder_down_m") or 0)
+            raw = float(row.get("rangefinder_down_m") or 0)
         except (TypeError, ValueError):
             continue
-        if MIN_FACADE_AGL_M <= v < 35.0:
+        ekf = observation_ekf_rel_alt_m(row)
+        v = sanitize_downward_rangefinder_m(raw, ekf)
+        if v is None and (raw >= 40.0 or raw in _RF_CLAMP_SUSPECT_M):
+            v = _FACADE_RF_CLAMPED_FALLBACK_M
+        if v is not None and MIN_FACADE_AGL_M <= v < 35.0:
             vals.append(v)
     if not vals:
         agl, _ = session_measure_agl_m(rows)
@@ -534,12 +592,25 @@ def _trust_ground_chord_over_inflated_geo(
         return d_geo
     d_hav = haversine_m(pa[0], pa[1], pb[0], pb[1])
     geo_ok = _geo_pair_ok_for_ground_chord(row_a, row_b)
+    try:
+        r_geo = max(
+            float(row_a.get("geo_range_m") or 0),
+            float(row_b.get("geo_range_m") or 0),
+        )
+    except (TypeError, ValueError):
+        r_geo = 0.0
+    ekf_max = max(
+        (v for v in (observation_ekf_rel_alt_m(row_a), observation_ekf_rel_alt_m(row_b)) if v),
+        default=0.0,
+    )
+    bad_geo_from_clamped_rf = ekf_max < 3.0 and r_geo > 40.0
     if (
         not geo_ok
         or not (2.0 <= d_hav <= 8.0)
         or d_geo <= d_hav * 1.8
         or dx_norm < 0.30
         or oblique_low
+        or bad_geo_from_clamped_rf
     ):
         return d_geo
     d = d_hav
