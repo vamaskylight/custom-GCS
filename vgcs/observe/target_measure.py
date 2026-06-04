@@ -11,6 +11,9 @@ _EARTH_RADIUS_M = 6_371_000.0
 
 # Max |Δy| in normalized video coords for "same horizontal" width (door/post L–R).
 SAME_LEVEL_DY_NORM = 0.08
+# Facade width needs real flight height; bench/on-ground RF ~0.2–1 m is invalid.
+MIN_FACADE_AGL_M = 2.5
+MEASURE_AGL_TOO_LOW_MSG = "Take off — height too low for measure"
 # Show on-video hint when |Δy| exceeds this (marks visibly not on one horizontal line).
 LEVEL_WARN_DY_NORM = 0.04
 MARKS_NOT_LEVEL_HINT = "Marks not level — distance may read high."
@@ -185,6 +188,53 @@ def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:
         return None
 
 
+def session_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | None, str]:
+    """
+    Height (m) used for facade width. Prefer EKF rel alt when rangefinder is on the ground.
+    """
+    rel_vals: list[float] = []
+    rf_vals: list[float] = []
+    for row in rows:
+        try:
+            rel = float(row.get("vehicle_rel_alt_m") or 0)
+            if rel > 0.5:
+                rel_vals.append(rel)
+        except (TypeError, ValueError):
+            pass
+        try:
+            rf = float(row.get("rangefinder_down_m") or 0)
+            if rf > 0.05:
+                rf_vals.append(rf)
+        except (TypeError, ValueError):
+            pass
+    rel = max(rel_vals) if rel_vals else None
+    rf = min(rf_vals) if rf_vals else None
+    if rel is not None and rel >= MIN_FACADE_AGL_M:
+        return rel, "ekf_relative"
+    if rf is not None and rf >= MIN_FACADE_AGL_M:
+        return rf, "rangefinder_down"
+    if rel is not None and rel > rf_vals[0] if rf_vals else 0:
+        if rel >= MIN_FACADE_AGL_M:
+            return rel, "ekf_relative"
+    if rf is not None:
+        return None, f"rangefinder_down_{rf:.1f}m"
+    if rel is not None:
+        return None, f"relative_alt_{rel:.1f}m"
+    return None, "missing"
+
+
+def measure_agl_ok(rows: list[dict[str, Any]]) -> tuple[bool, str]:
+    agl, src = session_measure_agl_m(rows)
+    if agl is not None and agl >= MIN_FACADE_AGL_M:
+        return True, src
+    if src.startswith("rangefinder_down_"):
+        rf = src.replace("rangefinder_down_", "").replace("m", "")
+        return False, f"{MEASURE_AGL_TOO_LOW_MSG} (RF {rf} m)"
+    if src.startswith("relative_alt_"):
+        return False, f"{MEASURE_AGL_TOO_LOW_MSG} ({src.replace('_', ' ')})"
+    return False, MEASURE_AGL_TOO_LOW_MSG
+
+
 def session_rangefinder_reference_m(rows: list[dict[str, Any]]) -> float | None:
     """
     Best downward AGL (m) for facade width in this session.
@@ -199,10 +249,11 @@ def session_rangefinder_reference_m(rows: list[dict[str, Any]]) -> float | None:
                 v = float(row.get(key) or 0)
             except (TypeError, ValueError):
                 continue
-            if 0.5 < v < 35.0:
+            if MIN_FACADE_AGL_M <= v < 35.0:
                 vals.append(v)
     if not vals:
-        return None
+        agl, _ = session_measure_agl_m(rows)
+        return agl if agl is not None and agl >= MIN_FACADE_AGL_M else None
     return min(vals)
 
 
@@ -646,6 +697,12 @@ def _one_pair_video_segment(
     peak = session_peak_geo_range_m(rows)
     facade_ref = session_facade_reference_range_m(rows, hfov_deg=hfov_deg)
     rf_ref = session_rangefinder_reference_m(rows)
+    tape_m = _tape_pair_matches(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
+    if tape_m is not None:
+        return (xy_l[0], xy_l[1], xy_r[0], xy_r[1], f"{tape_m:.1f} m (wall, tape)")
+    agl_ok, agl_msg = measure_agl_ok(rows)
+    if not agl_ok:
+        return (xy_l[0], xy_l[1], xy_r[0], xy_r[1], agl_msg)
     dy_lr = abs(xy_r[1] - xy_l[1])
     off_level = dy_lr > SAME_LEVEL_DY_NORM
     d = segment_distance_between_rows(
@@ -662,10 +719,7 @@ def _one_pair_video_segment(
         d = segment_distance_video_fallback(
             left, right, hfov_deg=hfov_deg, range_m=rf_ref
         )
-    tape_m = _tape_pair_matches(xy_l[0], xy_l[1], xy_r[0], xy_r[1])
-    if tape_m is not None:
-        label = f"{tape_m:.1f} m (wall, tape)"
-    elif d is None:
+    if d is None:
         if not marks_need_level_warning(left, right):
             return None
         label = MARKS_NOT_LEVEL_HINT
@@ -918,6 +972,7 @@ def calibrate_segment_scale_from_tape(
 
     Returns scale, raw_m, known_m or None if no valid last measure.
     """
+    global _tape_pair_override
     try:
         known = float(known_m)
     except (TypeError, ValueError):
@@ -928,14 +983,33 @@ def calibrate_segment_scale_from_tape(
     if pair is None:
         return None
     a, b = pair
+    agl_ok, _ = measure_agl_ok(rows)
     raw = last_band_measure_width_m(rows, hfov_deg=hfov_deg, apply_user_scale=False)
+    if not agl_ok:
+        xy_a, xy_b = _video_xy(a), _video_xy(b)
+        if xy_a and xy_b:
+            _tape_pair_override = {
+                "x1": xy_a[0],
+                "y1": xy_a[1],
+                "x2": xy_b[0],
+                "y2": xy_b[1],
+                "known_m": known,
+                "scale": 1.0,
+            }
+        return {
+            "scale": 1.0,
+            "raw_m": 0.0,
+            "known_m": known,
+            "scale_clamped": 0.0,
+            "requested_scale": 1.0,
+            "agl_blocked": 1.0,
+        }
     if raw is None or raw < 0.05:
         return None
     requested_scale = known / raw
     scale = set_segment_distance_scale(requested_scale)
     clamped = abs(scale - requested_scale) > 0.02
     xy_a, xy_b = _video_xy(a), _video_xy(b)
-    global _tape_pair_override
     if xy_a and xy_b:
         x1, y1 = xy_a
         x2, y2 = xy_b
