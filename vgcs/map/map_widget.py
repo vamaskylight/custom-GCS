@@ -6067,13 +6067,20 @@ class MapWidget(QWidget):
             relative_alt_m=self._vehicle_rel_alt_m,
             rangefinder_down_m=self._rangefinder_down_m,
         )
+        ekf_raw = self._vehicle_rel_alt_m
+        try:
+            ekf_stored = float(ekf_raw) if ekf_raw is not None else None
+        except (TypeError, ValueError):
+            ekf_stored = None
         return {
             "vehicle_lat": v_lat,
             "vehicle_lon": v_lon,
             "vehicle_heading_deg": self._heading,
             "vehicle_roll_deg": self._vehicle_roll_deg,
             "vehicle_pitch_deg": self._vehicle_pitch_deg,
-            "vehicle_rel_alt_m": agl_m,
+            "ekf_rel_alt_m": ekf_stored,
+            "vehicle_rel_alt_m": ekf_stored,
+            "measure_agl_m": agl_m,
             "agl_source": agl_src,
             "gimbal_yaw_deg": gimbal_yaw,
             "gimbal_pitch_deg": gimbal_pitch,
@@ -6259,7 +6266,9 @@ class MapWidget(QWidget):
             print(
                 f"[VGCS:observe] logged {kind} count={len(self._observations)} "
                 f"video=({video_x},{video_y}) map=({map_lat},{map_lon}) "
-                f"geo=({row.get('target_lat')},{row.get('target_lon')}) q={row.get('geo_quality')}"
+                f"geo=({row.get('target_lat')},{row.get('target_lon')}) q={row.get('geo_quality')} "
+                f"ekf={row.get('ekf_rel_alt_m')} rf={row.get('rangefinder_down_m')} "
+                f"agl={row.get('measure_agl_m')}({row.get('agl_source')})"
             )
         except Exception:
             pass

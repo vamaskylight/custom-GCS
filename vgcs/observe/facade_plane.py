@@ -1,8 +1,8 @@
 """
 Vertical facade-plane width between two video marks (M8 measure).
 
-Width on a wall = (slant range to the facade) × (horizontal angle between clicks in the video).
-Ground lat/lon / bearing chord is not used (it measures the wrong plane).
+Uses per-click horizontal range + bearing (camera ray), NOT haversine between
+ground lat/lon (often 10–50 m wrong when clicks are on roofs/walls).
 """
 
 from __future__ import annotations
@@ -45,28 +45,55 @@ def _horizontal_range_from_depression(agl_m: float, depression_deg: float) -> fl
     return float(agl_m) / math.tan(math.radians(dep))
 
 
-def _facade_agl_m(
-    row_a: dict[str, Any],
-    row_b: dict[str, Any],
-    *,
-    session_rf_floor_m: float | None = None,
+def _law_of_cosines_m(
+    r1: float, r2: float, bearing_a_deg: float, bearing_b_deg: float
 ) -> float | None:
-    """AGL for facade width; ignore bogus high downward RF spikes (e.g. 45 m glitch)."""
-    vals: list[float] = []
-    for row in (row_a, row_b):
-        v = _observation_agl_m(row)
-        if v is not None and v > 0.5:
-            vals.append(v)
-    if not vals:
+    try:
+        ba = math.radians(float(bearing_a_deg))
+        bb = math.radians(float(bearing_b_deg))
+        ra = float(r1)
+        rb = float(r2)
+        if ra <= 0 or rb <= 0:
+            return None
+        return math.sqrt(ra * ra + rb * rb - 2.0 * ra * rb * math.cos(bb - ba))
+    except (TypeError, ValueError):
         return None
-    agl = min(vals)
-    floor = session_rf_floor_m
-    if floor is not None and floor > 0.5:
-        if agl > floor * 1.25:
-            agl = floor
-    if agl > 18.0:
-        agl = 18.0
-    return agl
+
+
+def _pair_facade_agl_m(row_a: dict[str, Any], row_b: dict[str, Any]) -> float | None:
+    """
+    Session-stable height for facade width (same pair after OBSERVE Reset).
+
+    Uses the best EKF rel-alt seen on either mark, not per-click resolved AGL
+    (which could flip between EKF and downward RF and change the line by 2×).
+    """
+    from vgcs.observe.target_measure import is_oblique_roof_context, session_measure_agl_m
+
+    agl, _src = session_measure_agl_m([row_a, row_b])
+    if agl is None:
+        return None
+    if is_oblique_roof_context(row_a, row_b):
+        return agl
+    return min(float(agl), 35.0)
+
+
+def _sanitized_click_range_m(row: dict[str, Any], agl_eff: float) -> float | None:
+    """Per-click horizontal range; drop bad ground hits."""
+    try:
+        rg = float(row.get("geo_range_m") or 0)
+    except (TypeError, ValueError):
+        rg = 0.0
+    dep = row.get("geo_depression_deg")
+    rh_dep: float | None = None
+    if dep is not None:
+        rh_dep = _horizontal_range_from_depression(agl_eff, float(dep))
+    if rg > 0.5 and rh_dep is not None and rh_dep > 0.5:
+        if rg > rh_dep * 2.8 or rg > rh_dep + 20.0:
+            return rh_dep
+        return 0.5 * (rg + rh_dep)
+    if rg > 0.5:
+        return rg
+    return rh_dep
 
 
 def facade_plane_width_between_marks(
@@ -77,10 +104,12 @@ def facade_plane_width_between_marks(
     session_rf_floor_m: float | None = None,
 ) -> float | None:
     """
-    Width (m) on a vertical facade between two video clicks at similar height.
+    Width (m) on a vertical/oblique facade from two video clicks.
 
-    Uses horizontal pixel span × HFOV and per-mark slant range from AGL + depression.
+    Primary: law-of-cosines on per-click range + bearing (same as geo_reference rays).
+    Fallback: pixel angle × mean depression range.
     """
+    del session_rf_floor_m
     xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
     if xy_a is None or xy_b is None:
         return None
@@ -88,33 +117,51 @@ def facade_plane_width_between_marks(
     if dx < 0.03:
         return None
 
-    agl = _facade_agl_m(row_a, row_b, session_rf_floor_m=session_rf_floor_m)
-    if agl is None or agl < _MIN_FACADE_AGL_M:
+    agl_eff = _pair_facade_agl_m(row_a, row_b)
+    if agl_eff is None or agl_eff < _MIN_FACADE_AGL_M:
         return None
 
+    b1 = row_a.get("geo_bearing_deg")
+    b2 = row_b.get("geo_bearing_deg")
+    r1 = _sanitized_click_range_m(row_a, agl_eff)
+    r2 = _sanitized_click_range_m(row_b, agl_eff)
     angle_h = dx * math.radians(float(hfov_deg))
+
+    if (
+        r1 is not None
+        and r2 is not None
+        and b1 is not None
+        and b2 is not None
+    ):
+        d_law = _law_of_cosines_m(r1, r2, float(b1), float(b2))
+        if d_law is not None and d_law > 0:
+            rh_vals_law: list[float] = []
+            for row in (row_a, row_b):
+                dep = row.get("geo_depression_deg")
+                if dep is None:
+                    continue
+                rh = _horizontal_range_from_depression(agl_eff, float(dep))
+                if rh is not None and rh > 0.5:
+                    rh_vals_law.append(rh)
+            if dx >= 0.32 and rh_vals_law:
+                rh_m = sum(rh_vals_law) / len(rh_vals_law)
+                d_chord = 2.0 * rh_m * math.sin(angle_h / 2.0)
+                return max(d_law, d_chord)
+            return d_law
+
     if angle_h <= 1e-5:
         return None
-
     rh_vals: list[float] = []
     for row in (row_a, row_b):
         dep = row.get("geo_depression_deg")
-        if dep is not None:
-            rh = _horizontal_range_from_depression(agl, float(dep))
-            if rh is not None and rh > 0.5:
-                rh_vals.append(rh)
-        try:
-            rg = float(row.get("geo_range_m") or 0)
-        except (TypeError, ValueError):
-            rg = 0.0
-        if rg > 0.5:
-            rh_vals.append(rg)
-
+        if dep is None:
+            continue
+        rh = _horizontal_range_from_depression(agl_eff, float(dep))
+        if rh is not None and rh > 0.5:
+            rh_vals.append(rh)
     if not rh_vals:
         return None
-
     rh = sum(rh_vals) / len(rh_vals)
-    # Chord on the wall plane; rh * angle_h for small angles.
     if angle_h < 0.35:
         return rh * angle_h
     return 2.0 * rh * math.sin(angle_h / 2.0)
