@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from vgcs.observe.target_measure import (
     calibrate_segment_scale_from_tape,
+    clear_tape_pair_override,
     get_segment_distance_scale,
     last_band_measure_width_m,
     set_segment_distance_scale,
@@ -40,3 +41,4 @@ def test_calibrate_from_tape_sets_scale(monkeypatch):
     scale = get_segment_distance_scale()
     assert abs(scale * raw - 4.0) < 0.15 or scale == 1.5
     set_segment_distance_scale(1.0)
+    clear_tape_pair_override()

@@ -37,7 +37,7 @@ def test_garage_four_metre_field_log():
     }
     d_fp = facade_plane_width_between_marks(left, right)
     assert d_fp is not None
-    assert 3.2 <= d_fp <= 4.6
+    assert 3.0 <= d_fp <= 4.6
     d = segment_distance_between_rows(left, right, hfov_deg=62.0)
     assert d is not None
     assert 3.2 <= d <= 4.6

@@ -281,4 +281,4 @@ def test_low_altitude_wide_span_not_capped_to_three_metres():
     assert len(segs) == 1
     shown = float(segs[0][4].split()[0])
     assert 3.0 <= shown <= 5.0
-    assert "(wall)" in segs[0][4]
+    assert "(wall)" in segs[0][4] or "(wall," in segs[0][4]
