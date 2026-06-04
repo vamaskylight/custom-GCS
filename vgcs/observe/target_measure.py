@@ -96,9 +96,38 @@ def resolve_vehicle_agl_m(
     return None, ""
 
 
-# Below this EKF rel-alt (m), prefer downward RF for wall/facade rays when RF is present.
-# Field logs: ekf=0 + rf≈26 → good ~3.5 m; ekf≈2.3 + rf≈26 → geo fails → ~2.1 m / km glitch.
-_FACADE_EKF_TRUST_MIN_M = 3.0
+# Use downward RF for facade rays when EKF is low or RF is clearly the courtyard below.
+_FACADE_RF_OVER_EKF_RATIO = 1.75
+_FACADE_EKF_FLIGHT_MIN_M = 8.0
+
+
+def prefer_facade_rangefinder_agl(
+    relative_alt_m: float | None,
+    rangefinder_down_m: float | None,
+) -> bool:
+    """
+    True when downward RF should drive wall geo rays (courtyard below, EKF 0–5 m).
+
+    Not used for true low aerial oblique (see ``is_oblique_roof_context``).
+    """
+    try:
+        rf = float(rangefinder_down_m) if rangefinder_down_m is not None else None
+    except (TypeError, ValueError):
+        rf = None
+    if rf is None or rf < MIN_FACADE_AGL_M:
+        return False
+    try:
+        rel = float(relative_alt_m) if relative_alt_m is not None else None
+    except (TypeError, ValueError):
+        rel = None
+    if rel is None or rel < 0.5:
+        return True
+    # Low aerial: EKF is height; downward RF is open ground far below.
+    if rel < 6.0 and rf > 18.0 and rf > rel * 2.0:
+        return False
+    if rel < 5.0 and rf > rel * _FACADE_RF_OVER_EKF_RATIO:
+        return True
+    return rf > 12.0 and rf > rel * 3.0
 
 
 def resolve_facade_ray_agl_m(
@@ -109,8 +138,8 @@ def resolve_facade_ray_agl_m(
     """
     AGL for geo-referencing facade/wall clicks.
 
-    EKF rel-alt often reads 0–2 m on a roof/bench while downward RF (~25 m) matches the
-    courtyard ground used successfully for ~3.5 m building openings.
+    Downward RF is distance to open ground; EKF rel-alt on a roof/bench is often 0–5 m
+    while RF is 14–26 m. Use RF whenever it clearly dominates so Reset stays stable.
     """
     try:
         rel = float(relative_alt_m) if relative_alt_m is not None else None
@@ -120,11 +149,12 @@ def resolve_facade_ray_agl_m(
         rf = float(rangefinder_down_m) if rangefinder_down_m is not None else None
     except (TypeError, ValueError):
         rf = None
-    if rf is not None and rf >= MIN_FACADE_AGL_M:
-        if rel is None or rel < _FACADE_EKF_TRUST_MIN_M:
-            return rf, "rangefinder_down_facade"
-    if rel is not None and rel >= _FACADE_EKF_TRUST_MIN_M:
+    if prefer_facade_rangefinder_agl(rel, rf):
+        return rf, "rangefinder_down_facade"
+    if rel is not None and rel >= MIN_FACADE_AGL_M:
         return rel, "ekf_relative"
+    if rf is not None and rf >= MIN_FACADE_AGL_M:
+        return rf, "rangefinder_down"
     return resolve_vehicle_agl_m(
         relative_alt_m=relative_alt_m,
         rangefinder_down_m=rangefinder_down_m,
@@ -168,13 +198,13 @@ def is_oblique_roof_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> boo
     """
     Low aerial oblique view: trust EKF height, not downward RF.
 
-    Not set when EKF is below ``_FACADE_EKF_TRUST_MIN_M`` (bench/roof with RF to courtyard).
+    Not set when RF should drive facade geometry (roof/bench over courtyard).
     """
     ekf_vals: list[float] = []
     rf_vals: list[float] = []
     for row in (row_a, row_b):
         e = observation_ekf_rel_alt_m(row)
-        if e is not None and e >= _FACADE_EKF_TRUST_MIN_M:
+        if e is not None and e >= MIN_FACADE_AGL_M:
             ekf_vals.append(e)
         try:
             rf = float(row.get("rangefinder_down_m") or 0)
@@ -185,17 +215,23 @@ def is_oblique_roof_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> boo
     if not ekf_vals:
         return False
     rel = max(ekf_vals)
+    if rel >= 6.0:
+        return False
     rf = min(rf_vals) if rf_vals else None
-    return rf is not None and rf > rel * 1.6
+    return rf is not None and rf > 18.0 and rf > rel * 1.6
 
 
-# Field: ~3.5 m openings at RF≈26 m; same clicks read ~2 m at RF≈14 m (courtyard below).
-_LOW_RF_FACADE_REFERENCE_M = 26.0
+# Courtyard RF reference (m) for scaling width when drone hovers lower (RF≈14 vs RF≈26).
+_FACADE_RF_CALIB_REFERENCE_M = 26.0
 
 
-def _low_rf_facade_width_boost(rows: list[dict[str, Any]], d_m: float) -> float:
-    """Scale width when drone moved closer (downward RF drops but opening width unchanged)."""
-    if d_m <= 0.5:
+def _facade_opening_rf_scale(rows: list[dict[str, Any]], d_m: float) -> float:
+    """
+    Scale narrow-span width when downward RF is below reference (same wall, lower hover).
+
+    Only when facade geometry uses rangefinder AGL — avoids inflating bad EKF paths (26 m bug).
+    """
+    if d_m <= 0.5 or d_m > 8.0:
         return d_m
     rf_vals: list[float] = []
     for row in rows:
@@ -208,14 +244,20 @@ def _low_rf_facade_width_boost(rows: list[dict[str, Any]], d_m: float) -> float:
     if not rf_vals:
         return d_m
     rf = min(rf_vals)
-    if rf >= 20.0 or rf < 8.0:
+    if rf < 10.0 or rf >= 21.0:
         return d_m
-    boost = max(1.0, min(2.35, _LOW_RF_FACADE_REFERENCE_M / rf))
-    return d_m * boost
+    if is_oblique_roof_context(rows[0], rows[1]):
+        return d_m
+    ekf_samples = [observation_ekf_rel_alt_m(r) for r in rows]
+    ekf_max = max((v for v in ekf_samples if v is not None), default=None)
+    if not prefer_facade_rangefinder_agl(ekf_max, rf):
+        return d_m
+    scale = max(1.0, min(2.25, _FACADE_RF_CALIB_REFERENCE_M / rf))
+    return d_m * scale
 
 
 def session_facade_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | None, str]:
-    """Stable facade height for a mark pair (Reset-safe)."""
+    """Stable facade height for a mark pair (Reset-safe, prefers RF when RF >> EKF)."""
     ekf_vals: list[float] = []
     rf_vals: list[float] = []
     for row in rows:
@@ -230,10 +272,9 @@ def session_facade_measure_agl_m(rows: list[dict[str, Any]]) -> tuple[float | No
             pass
     ekf_max = max(ekf_vals) if ekf_vals else None
     rf_min = min(rf_vals) if rf_vals else None
-    if rf_min is not None and rf_min >= MIN_FACADE_AGL_M:
-        if ekf_max is None or ekf_max < _FACADE_EKF_TRUST_MIN_M:
-            return rf_min, "rangefinder_down_facade"
-    if ekf_max is not None and ekf_max >= _FACADE_EKF_TRUST_MIN_M:
+    if prefer_facade_rangefinder_agl(ekf_max, rf_min):
+        return rf_min, "rangefinder_down_facade"
+    if ekf_max is not None and ekf_max >= MIN_FACADE_AGL_M:
         return ekf_max, "ekf_relative"
     if rf_min is not None and rf_min >= MIN_FACADE_AGL_M:
         return rf_min, "rangefinder_down"
@@ -420,6 +461,93 @@ def _horizontal_range_from_depression(agl_m: float, depression_deg: float) -> fl
     return float(agl_m) / math.tan(math.radians(dep))
 
 
+def _widen_facade_by_video_bearing(
+    d_m: float,
+    *,
+    r1: float,
+    r2: float,
+    b1: float,
+    b2: float,
+    angle_h: float,
+) -> float:
+    """When video span exceeds geo bearing spread, scale chord toward tape width."""
+    if angle_h <= 0.08 or r1 <= 0 or r2 <= 0:
+        return d_m
+    try:
+        cos_d = (r1 * r1 + r2 * r2 - d_m * d_m) / (2.0 * r1 * r2)
+        cos_d = max(-1.0, min(1.0, cos_d))
+        angle_bearing = math.acos(cos_d)
+        if angle_h > angle_bearing * 1.35 and angle_bearing > 0.008:
+            scale = min(1.55, (angle_h / angle_bearing) * 0.78)
+            return d_m * scale
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return d_m
+
+
+def _geo_pair_ok_for_ground_chord(row_a: dict[str, Any], row_b: dict[str, Any]) -> bool:
+    if observation_target_latlon(row_a) is None or observation_target_latlon(row_b) is None:
+        return False
+    for row in (row_a, row_b):
+        if str(row.get("geo_quality") or "") == "insufficient":
+            return False
+    return True
+
+
+def _apply_facade_reference_uplift(
+    d_m: float,
+    *,
+    angle_h: float,
+    r1: float,
+    r2: float,
+    facade_reference_range_m: float | None,
+    calibrating_range_only: bool,
+) -> float:
+    if calibrating_range_only:
+        return d_m
+    facade_ref = float(facade_reference_range_m or 0)
+    r_local = max(r1, r2)
+    if facade_ref > r_local * 1.08:
+        target_w = facade_ref * angle_h * 1.05
+        if d_m < target_w * 0.9:
+            return max(d_m, target_w)
+    return d_m
+
+
+def _trust_ground_chord_over_inflated_geo(
+    d_geo: float,
+    *,
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    r1: float,
+    r2: float,
+    b1: float,
+    b2: float,
+    angle_h: float,
+    dx_norm: float,
+    oblique_low: bool,
+) -> float:
+    """Use GPS ground chord when law-of-cosines at high RF AGL explodes (wide facade clicks)."""
+    pa = observation_target_latlon(row_a)
+    pb = observation_target_latlon(row_b)
+    if pa is None or pb is None:
+        return d_geo
+    d_hav = haversine_m(pa[0], pa[1], pb[0], pb[1])
+    geo_ok = _geo_pair_ok_for_ground_chord(row_a, row_b)
+    if (
+        not geo_ok
+        or not (2.0 <= d_hav <= 8.0)
+        or d_geo <= d_hav * 1.8
+        or dx_norm < 0.30
+        or oblique_low
+    ):
+        return d_geo
+    d = d_hav
+    return _widen_facade_by_video_bearing(
+        d, r1=r1, r2=r2, b1=float(b1), b2=float(b2), angle_h=angle_h
+    )
+
+
 def _law_of_cosines_m(
     r1: float, r2: float, bearing_a_deg: float, bearing_b_deg: float
 ) -> float | None:
@@ -561,8 +689,8 @@ def video_facade_width_m(
         if trust_facade_only or (not needs_uplift and not implausible):
             if apply_user_scale:
                 d_facade *= _segment_scale_short()
-            d_facade = _low_rf_facade_width_boost([row_a, row_b], d_facade)
-            return max(0.0, d_facade)
+            d_facade = _facade_opening_rf_scale([row_a, row_b], d_facade)
+            return max(0.0, min(d_facade, 15.0))
 
     candidates: list[float] = []
 
@@ -575,9 +703,39 @@ def video_facade_width_m(
         r1 = r2 = 0.0
         b1 = b2 = None
 
-    filled = _fill_pair_geo_ranges(row_a, row_b)
+    filled = _fill_pair_geo_ranges(row_a, row_b, hfov_deg=hfov_deg)
     if filled is not None:
         r1, r2, b1, b2 = filled
+        d_law_fill = _law_of_cosines_m(r1, r2, b1, b2)
+        if d_law_fill is not None and d_law_fill > 0:
+            mean_r = 0.5 * (r1 + r2)
+            d_vid = mean_r * angle_h
+            d_chord = 2.0 * mean_r * math.sin(angle_h / 2.0)
+            d_geo = max(d_law_fill, d_vid, d_chord)
+            d_geo = _trust_ground_chord_over_inflated_geo(
+                d_geo,
+                row_a=row_a,
+                row_b=row_b,
+                r1=r1,
+                r2=r2,
+                b1=float(b1),
+                b2=float(b2),
+                angle_h=angle_h,
+                dx_norm=dx,
+                oblique_low=oblique_low,
+            )
+            d_geo = _apply_facade_reference_uplift(
+                d_geo,
+                angle_h=angle_h,
+                r1=r1,
+                r2=r2,
+                facade_reference_range_m=facade_reference_range_m,
+                calibrating_range_only=calibrating_range_only,
+            )
+            if apply_user_scale and d_geo < 15.0:
+                d_geo *= _segment_scale_short()
+            d_geo = _facade_opening_rf_scale([row_a, row_b], d_geo)
+            return max(0.0, min(d_geo, 15.0))
     if r1 > 0 and r2 > 0 and b1 is not None and b2 is not None:
         d_law = _law_of_cosines_m(r1, r2, float(b1), float(b2))
         if d_law is not None and d_law > 0:
@@ -623,10 +781,7 @@ def video_facade_width_m(
             )
         )
 
-    geo_ok_pair = (
-        str(row_a.get("geo_quality") or "") not in ("", "insufficient")
-        and str(row_b.get("geo_quality") or "") not in ("", "insufficient")
-    )
+    geo_ok_pair = _geo_pair_ok_for_ground_chord(row_a, row_b)
 
     trust_haversine = False
     if (
@@ -659,6 +814,37 @@ def video_facade_width_m(
         elif not (agl_low and wide_span and d_hav > 12.0):
             d = min(d, d_hav)
 
+    if (
+        level_pair
+        and geo_ok_pair
+        and d_hav is not None
+        and 2.0 <= d_hav <= 8.0
+        and d > d_hav * 1.8
+        and dx >= 0.30
+        and not oblique_low
+    ):
+        d = d_hav
+        trust_haversine = True
+        if r1 > 0 and r2 > 0 and b1 is not None and b2 is not None:
+            d = _widen_facade_by_video_bearing(
+                d,
+                r1=r1,
+                r2=r2,
+                b1=float(b1),
+                b2=float(b2),
+                angle_h=angle_h,
+            )
+
+    if not trust_haversine:
+        d = _apply_facade_reference_uplift(
+            d,
+            angle_h=angle_h,
+            r1=r1,
+            r2=r2,
+            facade_reference_range_m=facade_reference_range_m,
+            calibrating_range_only=calibrating_range_only,
+        )
+
     if not calibrating_range_only and r1 > 0 and r2 > 0 and not trust_haversine:
         peak = float(session_peak_range_m or 0)
         facade_ref = float(facade_reference_range_m or 0)
@@ -666,12 +852,14 @@ def video_facade_width_m(
         if d < d_angle_ref * 0.65 and not trust_haversine:
             uplift = d_angle_ref
             if facade_ref > r_local * 1.08:
-                uplift = max(uplift, min(facade_ref * angle_h * 1.08, d_angle_ref * 1.35))
+                uplift = max(uplift, facade_ref * angle_h * 1.05)
             elif peak > r_local * 1.25:
                 blend = min(0.32, (peak / max(r_local, 1.0) - 1.0) * 0.12)
                 r_ref = r_local + (peak - r_local) * blend
                 uplift = max(uplift, min(r_ref * angle_h * 1.05, d_angle_ref * 1.35))
             d = max(d, uplift)
+    if d_angle_ref > 0.5 and dx < 0.14:
+        d = min(d, d_angle_ref * 1.25)
 
     r_cap = _facade_range_cap_m(agl, r1, r2, dx_norm=dx, row_a=row_a, row_b=row_b)
     if r_cap is not None:
@@ -685,16 +873,19 @@ def video_facade_width_m(
 
     if apply_user_scale and d < 15.0:
         d *= _segment_scale_short()
-    d = _low_rf_facade_width_boost([row_a, row_b], d)
+    d = _facade_opening_rf_scale([row_a, row_b], d)
     if d > 45.0:
         return None
-    return max(0.0, d)
+    return max(0.0, min(d, 15.0))
 
 
 def _fill_pair_geo_ranges(
-    row_a: dict[str, Any], row_b: dict[str, Any]
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
 ) -> tuple[float, float, float, float] | None:
-    """Use good mark range on wall when the partner geo failed (Reset / EKF glitch)."""
+    """Use good mark range; estimate partner bearing from video span (not duplicate bearing)."""
     try:
         r1 = float(row_a.get("geo_range_m") or 0)
         r2 = float(row_b.get("geo_range_m") or 0)
@@ -704,10 +895,20 @@ def _fill_pair_geo_ranges(
         return None
     if r1 > 0.5 and r2 > 0.5 and b1 is not None and b2 is not None:
         return r1, r2, float(b1), float(b2)
+    xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+    if xy_a is None or xy_b is None:
+        return None
+    dx_deg = (xy_b[0] - xy_a[0]) * float(hfov_deg)
     if r1 > 0.5 and b1 is not None:
-        return r1, r1, float(b1), float(b1)
+        b1f = float(b1)
+        b2f = (b1f + dx_deg) % 360.0
+        r2use = r2 if r2 > 0.5 else r1
+        return r1, r2use, b1f, b2f
     if r2 > 0.5 and b2 is not None:
-        return r2, r2, float(b2), float(b2)
+        b2f = float(b2)
+        b1f = (b2f - dx_deg) % 360.0
+        r1use = r1 if r1 > 0.5 else r2
+        return r1use, r2, b1f, b2f
     return None
 
 
@@ -731,16 +932,17 @@ def segment_distance_video_fallback(
         agl = range_m or session_rangefinder_reference_m([row_a, row_b])
     if agl is None or agl < 1.0:
         return None
-    filled = _fill_pair_geo_ranges(row_a, row_b)
+    filled = _fill_pair_geo_ranges(row_a, row_b, hfov_deg=hfov_deg)
     if filled is not None:
         r1, r2, b1, b2 = filled
         d_law = _law_of_cosines_m(r1, r2, b1, b2)
         if d_law is not None and d_law > 0:
-            d = d_law
+            mean_r = 0.5 * (r1 + r2)
+            d = max(d_law, mean_r * angle_h)
             if d < 15.0:
                 d *= _segment_scale_short()
-            d = _low_rf_facade_width_boost([row_a, row_b], d)
-            return max(0.0, d)
+            d = _facade_opening_rf_scale([row_a, row_b], d)
+            return max(0.0, min(d, 15.0))
 
     candidates: list[float] = []
     for row in (row_a, row_b):
@@ -756,8 +958,8 @@ def segment_distance_video_fallback(
     d = min(candidates)
     if d < 15.0:
         d *= _segment_scale_short()
-    d = _low_rf_facade_width_boost([row_a, row_b], d)
-    return max(0.0, d)
+    d = _facade_opening_rf_scale([row_a, row_b], d)
+    return max(0.0, min(d, 15.0))
 
 
 def cluster_observations_by_video_y(
