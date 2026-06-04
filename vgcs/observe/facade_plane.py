@@ -10,6 +10,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+_MIN_FACADE_AGL_M = 2.5
+
 
 def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:
     try:
@@ -87,7 +89,7 @@ def facade_plane_width_between_marks(
         return None
 
     agl = _facade_agl_m(row_a, row_b, session_rf_floor_m=session_rf_floor_m)
-    if agl is None:
+    if agl is None or agl < _MIN_FACADE_AGL_M:
         return None
 
     angle_h = dx * math.radians(float(hfov_deg))

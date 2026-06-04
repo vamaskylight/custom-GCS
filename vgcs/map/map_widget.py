@@ -67,6 +67,8 @@ from vgcs.observe.target_measure import (
     band_width_partner_row,
     calibrate_segment_scale_from_tape,
     clear_tape_pair_override,
+    measure_agl_ok,
+    MEASURE_AGL_TOO_LOW_MSG,
     format_target_segment_label,
     haversine_m,
     is_downward_sensor_orientation,
@@ -6282,7 +6284,10 @@ class MapWidget(QWidget):
                     msg += f" — drone→target {float(rng):.0f} m"
                 if row.get("target_lat") is not None:
                     msg += f" @ {float(row['target_lat']):.6f},{float(row['target_lon']):.6f}"
-                if seg_m is not None:
+                agl_ok, agl_msg = measure_agl_ok(self._observations + [row])
+                if not agl_ok and kind == "video_mark":
+                    msg += f" — {agl_msg}"
+                elif seg_m is not None:
                     est = (
                         " (RF est)"
                         if str(row.get("geo_quality") or "") == "insufficient"
@@ -6635,9 +6640,13 @@ class MapWidget(QWidget):
             known_m, self._observations, hfov_deg=hfov
         )
         if result is None:
-            self._set_status(
-                "OBSERVE Cal: place two Target marks (left & right, same height) first"
-            )
+            agl_ok, agl_msg = measure_agl_ok(self._observations)
+            if not agl_ok:
+                self._set_status(f"OBSERVE Cal: {agl_msg}")
+            else:
+                self._set_status(
+                    "OBSERVE Cal: place two Target marks (left & right, same height) first"
+                )
             return
         scale = float(result["scale"])
         raw_m = float(result["raw_m"])
@@ -6649,6 +6658,11 @@ class MapWidget(QWidget):
         if result.get("scale_clamped"):
             req = float(result.get("requested_scale") or 0)
             msg += f" (scale clamped; requested {req:.2f})"
+        if result.get("agl_blocked"):
+            msg = (
+                f"OBSERVE: tape {known_m:.1f} m shown on line only — "
+                f"{MEASURE_AGL_TOO_LOW_MSG} (need RF ≥ 2.5 m)"
+            )
         self._set_status(msg)
         try:
             print(
