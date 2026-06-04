@@ -178,6 +178,14 @@ def compute_geo_reference(
             warning="vehicle altitude AGL unknown (need EKF rel alt or downward rangefinder)",
             method="none",
         )
+    if agl_src == "rangefinder_clamped_facade" and float(video_y_norm) < 0.55:
+        return GeoReferenceResult(
+            ok=False,
+            warning=(
+                "click in upper video (distant/horizon); use lower frame for wall tape measure"
+            ),
+            method="none",
+        )
     if gimbal_yaw_deg is None or gimbal_pitch_deg is None:
         return GeoReferenceResult(ok=False, warning="gimbal yaw/pitch missing", method="none")
 

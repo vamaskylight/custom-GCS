@@ -17,6 +17,47 @@ MEASURE_AGL_TOO_LOW_MSG = "Take off — height too low for measure"
 # Show on-video hint when |Δy| exceeds this (marks visibly not on one horizontal line).
 LEVEL_WARN_DY_NORM = 0.04
 MARKS_NOT_LEVEL_HINT = "Marks not level — distance may read high."
+# Tape/wall measure: clicks must be on a nearby facade in the lower video (not skyline/roofline).
+FACADE_MIN_VIDEO_Y_NORM = 0.55
+FACADE_DISTANT_TARGET_HINT = (
+    "Distant/horizon marks — place targets on a near wall (lower video)"
+)
+
+
+def _row_agl_source(row: dict[str, Any]) -> str:
+    return str(row.get("geo_agl_source") or row.get("agl_source") or "")
+
+
+def marks_suitable_for_facade_tape_measure(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+) -> tuple[bool, str]:
+    """
+    Facade tape width is only valid for a nearby vertical wall in the lower frame.
+
+    Upper-video clicks (skyline, distant roof towers) with clamped RF≈45 m were
+    still producing ~4 m "(wall)" labels — wrong scene for courtyard geometry.
+    """
+    xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+    if xy_a is None or xy_b is None:
+        return True, ""
+    y_avg = 0.5 * (xy_a[1] + xy_b[1])
+    clamped = any("clamped" in _row_agl_source(r) for r in (row_a, row_b))
+    if not clamped:
+        return True, ""
+    # Clamped RF≈45 m + upper video: distant skyline/roofline, not a ~4 m wall opening.
+    if y_avg < FACADE_MIN_VIDEO_Y_NORM:
+        return False, FACADE_DISTANT_TARGET_HINT
+    try:
+        rf_max = max(
+            float(row_a.get("rangefinder_down_m") or 0),
+            float(row_b.get("rangefinder_down_m") or 0),
+        )
+    except (TypeError, ValueError):
+        rf_max = 0.0
+    if rf_max >= 40.0 and y_avg < 0.62:
+        return False, FACADE_DISTANT_TARGET_HINT
+    return True, ""
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -710,6 +751,8 @@ def video_facade_width_m(
     xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
     if xy_a is None or xy_b is None:
         return None
+    if not marks_suitable_for_facade_tape_measure(row_a, row_b)[0]:
+        return None
     dx = abs(xy_b[0] - xy_a[0])
     dy = abs(xy_b[1] - xy_a[1])
     if dx < 0.03:
@@ -1190,6 +1233,9 @@ def _one_pair_video_segment(
         return (xy_l[0], xy_l[1], xy_r[0], xy_r[1], agl_msg)
     dy_lr = abs(xy_r[1] - xy_l[1])
     off_level = dy_lr > SAME_LEVEL_DY_NORM
+    suitable, dist_hint = marks_suitable_for_facade_tape_measure(left, right)
+    if not suitable:
+        return (xy_l[0], xy_l[1], xy_r[0], xy_r[1], dist_hint)
     d = segment_distance_between_rows(
         left,
         right,
@@ -1221,7 +1267,8 @@ def _one_pair_video_segment(
             estimate=est,
             level_ok=dy_lr <= SAME_LEVEL_DY_NORM,
             facade_plane=bool(
-                left.get("geo_depression_deg") is not None
+                suitable
+                and left.get("geo_depression_deg") is not None
                 and right.get("geo_depression_deg") is not None
             ),
         )
