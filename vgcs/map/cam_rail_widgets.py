@@ -10,25 +10,16 @@ from __future__ import annotations
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from vgcs.observe.dooaf import (
-    DOOAF_ROLE_DISPLAY,
-    DOOAF_ROLE_GUN,
-    DOOAF_ROLE_IMPACT,
-    DOOAF_ROLE_INTENDED,
-    DOOAF_ROLE_SURVEY,
-    DOOAF_ROLE_TOOLTIPS,
-)
+from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT
 
 
 class CamRecordArch(QWidget):
@@ -94,7 +85,7 @@ class CamRailGimbalPad(QWidget):
 
 
 class CamObserveBlock(QWidget):
-    """Target / Clip and Report / Reset — two rows with matching button gaps."""
+    """DOOAF observe: Target / Clip / Report / Reset + Setup."""
 
     setup_clicked = Signal()
 
@@ -132,67 +123,20 @@ class CamObserveBlock(QWidget):
         row_setup.setContentsMargins(0, 0, 0, 0)
         row_setup.setSpacing(4)
         row_setup.addWidget(self.setup_btn, 1)
-        role_lbl = QLabel("Mark")
-        role_lbl.setObjectName("observeRoleLabel")
-        self.role_combo = QComboBox()
-        self.role_combo.setObjectName("observeRoleCombo")
-        for role in (
-            DOOAF_ROLE_INTENDED,
-            DOOAF_ROLE_IMPACT,
-            DOOAF_ROLE_GUN,
-            DOOAF_ROLE_SURVEY,
-        ):
-            self.role_combo.addItem(DOOAF_ROLE_DISPLAY[role], role)
-        self.role_combo.currentIndexChanged.connect(self._sync_role_tooltip)
-        self._sync_role_tooltip()
-        row_role = QHBoxLayout()
-        row_role.setContentsMargins(0, 0, 0, 0)
-        row_role.setSpacing(4)
-        row_role.addWidget(role_lbl)
-        row_role.addWidget(self.role_combo, 1)
-        tape_lbl = QLabel("Tape (m)")
-        tape_lbl.setObjectName("observeTapeLabel")
-        self.tape_edit = QLineEdit()
-        self.tape_edit.setObjectName("observeTapeEdit")
-        self.tape_edit.setPlaceholderText("4.0")
-        self.tape_edit.setClearButtonEnabled(True)
-        self.tape_edit.setToolTip(
-            "Measured width on site (tape). After two Target marks, press Cal to match the last line."
+        hint = QLabel("After fire: Target ON → mark fall of shot on video")
+        hint.setObjectName("observeDooafHint")
+        hint.setWordWrap(True)
+        hint.setToolTip(
+            "Set gun and actual target in DOOAF Setup first. "
+            "Then turn Target ON and click burst or smoke on the video feed."
         )
-        self.calibrate_btn = QPushButton("Cal")
-        self.calibrate_btn.setObjectName("observeCalibrate")
-        self.calibrate_btn.setToolTip(
-            "Calibrate distance scale from the last L–R measure and this tape value."
-        )
-        self._tape_lbl = tape_lbl
-        row3 = QHBoxLayout()
-        row3.setContentsMargins(0, 0, 0, 0)
-        row3.setSpacing(4)
-        row3.addWidget(tape_lbl)
-        row3.addWidget(self.tape_edit, 1)
-        row3.addWidget(self.calibrate_btn, 0)
         v.addLayout(row1)
         v.addLayout(row2)
         v.addLayout(row_setup)
-        v.addLayout(row_role)
-        v.addLayout(row3)
-        self.role_combo.currentIndexChanged.connect(self._sync_tape_visibility)
-        self._sync_tape_visibility()
+        v.addWidget(hint)
 
     def current_dooaf_role(self) -> str:
-        data = self.role_combo.currentData()
-        return str(data or DOOAF_ROLE_SURVEY)
-
-    def _sync_tape_visibility(self) -> None:
-        survey = self.current_dooaf_role() == DOOAF_ROLE_SURVEY
-        self._tape_lbl.setVisible(survey)
-        self.tape_edit.setVisible(survey)
-        self.calibrate_btn.setVisible(survey)
-
-    def _sync_role_tooltip(self) -> None:
-        role = self.current_dooaf_role()
-        tip = DOOAF_ROLE_TOOLTIPS.get(role, "")
-        self.role_combo.setToolTip(tip)
+        return DOOAF_ROLE_IMPACT
 
 
 class CamRailBiSlider(QWidget):
@@ -231,13 +175,11 @@ class CamRailBiSlider(QWidget):
         p.setBrush(QColor(22, 27, 38, 220))
         p.drawRoundedRect(outer, 7.0, 7.0)
 
-        # Inner groove (darker channel)
         groove = outer.adjusted(6.0, 6.0, -6.0, -6.0)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(10, 12, 20, 252))
         p.drawRoundedRect(groove, 4.0, 4.0)
 
-        # Thumb travels along groove horizontal span
         gx0, gx1 = groove.left(), groove.right()
         span = max(1.0, gx1 - gx0)
         tx = gx0 + self._thumb_t * span
@@ -281,4 +223,3 @@ class CamRailBiSlider(QWidget):
 
     def sizeHint(self) -> QSize:
         return QSize(158, 28)
-
