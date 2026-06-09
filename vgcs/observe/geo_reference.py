@@ -221,6 +221,28 @@ def compute_geo_reference(
 
     dz = dir_ned[2]
     if dz <= 1e-4:
+        if long_range:
+            horiz = math.hypot(dir_ned[0], dir_ned[1])
+            if horiz < 1e-4:
+                return GeoReferenceResult(
+                    ok=False,
+                    warning="look ray parallel to horizon",
+                    method="ray_ground",
+                )
+            bearing = (math.degrees(math.atan2(dir_ned[1], dir_ned[0])) + 360.0) % 360.0
+            dep_est = max(5.0, abs(float(el_off)) + 3.0)
+            range_use = slant_horizontal_range_m(float(agl_m), dep_est)
+            if range_use is None:
+                range_use = min(350.0, float(agl_m) * 6.0)
+            return GeoReferenceResult(
+                ok=True,
+                quality="fair",
+                warning="distant target — horizon slant range (not ground GPS)",
+                method="ray_slant_long_range",
+                horizontal_range_m=range_use,
+                bearing_deg=bearing,
+                depression_deg=dep_est,
+            )
         return GeoReferenceResult(
             ok=False,
             warning="look ray does not intersect ground (near horizon)",

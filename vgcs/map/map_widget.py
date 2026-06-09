@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QFileDialog,
     QMessageBox,
+    QDialog,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -62,6 +63,30 @@ from PySide6.QtGui import (
     QRadialGradient,
 )
 from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayDetection
+from vgcs.map.dooaf_setup_dialog import (
+    DOOAF_PICK_GUN,
+    DOOAF_PICK_TARGET,
+    DooafSetupDialog,
+)
+from vgcs.observe.dooaf import (
+    DOOAF_ROLE_GUN,
+    DOOAF_ROLE_IMPACT,
+    DOOAF_ROLE_INTENDED,
+    DOOAF_ROLE_SURVEY,
+    build_dooaf_session,
+    dooaf_intended_impact_video_segment,
+    format_dooaf_html_summary,
+    format_dooaf_status,
+    latest_mark,
+    DooafSettings,
+    apply_map_pick_to_settings,
+    dooaf_role_display,
+    dooaf_settings_kwargs,
+    merge_dooaf_settings,
+    read_dooaf_settings,
+    resolved_dooaf_settings,
+    write_dooaf_settings,
+)
 from vgcs.observe.geo_reference import compute_geo_reference
 from vgcs.observe.target_measure import (
     band_width_partner_row,
@@ -206,10 +231,10 @@ _MAP_ACTION_RAIL_LEFT_PX = 10
 _MAP_ACTION_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _NATIVE_CAM_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 # LENS row: 42 + 6 + (16+34+34)*2 + 6 + ~11 layout margins.
-_NATIVE_CAM_RAIL_MIN_WIDTH_PX = 258
+_NATIVE_CAM_RAIL_MIN_WIDTH_PX = 272
 # Camera rail vertical rhythm (touch targets / gaps — do not change font-size in QSS below).
 _CAM_RAIL_PAD_BTN_H = 34
-_CAM_RAIL_PAD_BTN_W = 40
+_CAM_RAIL_PAD_BTN_W = 42
 _CAM_RAIL_LENS_ROW_H = 40
 _CAM_RAIL_LENS_BTN_H = 34
 _CAM_RAIL_LAYOUT_SPACING = 5
@@ -565,16 +590,18 @@ QPushButton#observeClip[recording="true"] {
   font-weight: 700;
 }
 QPushButton[camPadBtn=true] {
-  min-width: 40px;
+  min-width: 42px;
+  max-width: 42px;
   min-height: 34px;
+  max-height: 34px;
   border-radius: 6px;
   border: 1px solid rgba(196, 209, 230, 38);
   background: rgba(18, 22, 32, 75);
   color: #dce5f5;
   font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
-  padding: 1px 4px;
+  padding: 0px;
 }
 QPushButton[camPadBtn=true]:hover {
   background: rgba(110, 123, 148, 45);
@@ -595,13 +622,37 @@ def _cam_rail_sep() -> QFrame:
     return f
 
 
-def _cam_rail_inline_row(label: str, body: QWidget) -> QWidget:
+def _cam_rail_gimbal_row(label: str, pad: QWidget) -> QWidget:
+    """Gimbal pad needs explicit width; keep inset from the glass panel's right edge."""
+    w = QWidget()
+    w.setObjectName("camInlineRow")
+    w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 2, 4, 2)
+    h.setSpacing(8)
+    lab = QLabel(label)
+    lab.setObjectName("camSectionHeaderInline")
+    lab.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    pad.setObjectName("camInlineRowBody")
+    pad.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    h.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
+    h.addWidget(pad, 0, Qt.AlignmentFlag.AlignVCenter)
+    h.addStretch(1)
+    return w
+
+
+def _cam_rail_inline_row(
+    label: str,
+    body: QWidget,
+    *,
+    align_body_right: bool = False,
+) -> QWidget:
     """Compact row: section label + controls (one line, no extra header row)."""
     w = QWidget()
     w.setObjectName("camInlineRow")
     w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
     h = QHBoxLayout(w)
-    h.setContentsMargins(0, 2, 0, 2)
+    h.setContentsMargins(0, 2, 2 if align_body_right else 0, 2)
     h.setSpacing(8)
     lab = QLabel(label)
     lab.setObjectName("camSectionHeaderInline")
@@ -609,9 +660,15 @@ def _cam_rail_inline_row(label: str, body: QWidget) -> QWidget:
         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
     )
     body.setObjectName("camInlineRowBody")
-    body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    h.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
-    h.addWidget(body, 1, Qt.AlignmentFlag.AlignVCenter)
+    if align_body_right:
+        body.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        h.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
+        h.addStretch(1)
+        h.addWidget(body, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    else:
+        body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        h.addWidget(lab, 0, Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(body, 1, Qt.AlignmentFlag.AlignVCenter)
     return w
 
 
@@ -778,6 +835,12 @@ class _ObservationExportTask(QRunnable):
         html_path: str,
         obs_cell_fn,
         bridge: _ObservationExportBridge,
+        gun_lat: float | None = None,
+        gun_lon: float | None = None,
+        gun_alt_m: float | None = None,
+        target_lat: float | None = None,
+        target_lon: float | None = None,
+        target_alt_m: float | None = None,
     ) -> None:
         super().__init__()
         self._rows = list(rows)
@@ -785,11 +848,18 @@ class _ObservationExportTask(QRunnable):
         self._html_path = str(html_path)
         self._obs_cell_fn = obs_cell_fn
         self._bridge = bridge
+        self._gun_lat = gun_lat
+        self._gun_lon = gun_lon
+        self._gun_alt_m = gun_alt_m
+        self._target_lat = target_lat
+        self._target_lon = target_lon
+        self._target_alt_m = target_alt_m
 
     def run(self) -> None:
         fields = [
             "timestamp_utc",
             "kind",
+            "dooaf_role",
             "map_lat",
             "map_lon",
             "video_x_norm",
@@ -817,22 +887,44 @@ class _ObservationExportTask(QRunnable):
             "agl_source",
             "snapshot_path",
             "clip_path",
+            "dooaf_range_correction_m",
+            "dooaf_deflection_correction_m",
+            "dooaf_miss_m",
         ]
+        session = build_dooaf_session(
+            self._rows,
+            gun_lat=self._gun_lat,
+            gun_lon=self._gun_lon,
+            gun_alt_m=self._gun_alt_m,
+            target_lat=self._target_lat,
+            target_lon=self._target_lon,
+            target_alt_m=self._target_alt_m,
+        )
+        corr = session.correction
+        export_rows: list[dict[str, object]] = []
+        for row in self._rows:
+            out = dict(row)
+            if corr is not None:
+                out["dooaf_range_correction_m"] = corr.range_correction_m
+                out["dooaf_deflection_correction_m"] = corr.deflection_correction_m
+                out["dooaf_miss_m"] = corr.impact_to_intended_m
+            export_rows.append(out)
         ok = False
         summary = ""
         try:
             with open(self._csv_path, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fields)
                 w.writeheader()
-                for row in self._rows:
+                for row in export_rows:
                     w.writerow({k: row.get(k) for k in fields})
             html_rows = []
-            for idx, row in enumerate(self._rows, start=1):
+            for idx, row in enumerate(export_rows, start=1):
                 html_rows.append(
                     "<tr>"
                     f"<td>{idx}</td>"
                     f"<td>{row.get('timestamp_utc','')}</td>"
                     f"<td>{row.get('kind','')}</td>"
+                    f"<td>{row.get('dooaf_role','')}</td>"
                     f"<td>{row.get('map_lat','')}</td>"
                     f"<td>{row.get('map_lon','')}</td>"
                     f"<td>{self._obs_cell_fn(row.get('target_lat'))}</td>"
@@ -862,8 +954,9 @@ class _ObservationExportTask(QRunnable):
                 "th,td{border:1px solid #ccc;padding:6px;font-size:12px;} th{background:#f3f6fb;text-align:left;}</style>"
                 "</head><body>"
                 f"<h2>Observation Report ({len(self._rows)} entries)</h2>"
-                "<table><thead><tr>"
-                "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th>"
+                + format_dooaf_html_summary(session)
+                + "<table><thead><tr>"
+                "<th>#</th><th>UTC Time</th><th>Kind</th><th>DOOAF role</th><th>Map Lat</th><th>Map Lon</th>"
                 "<th>Target Lat</th><th>Target Lon</th><th>Geo Quality</th>"
                 "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
                 "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
@@ -1054,6 +1147,8 @@ class MapWidget(QWidget):
         self._camera_control = NoopCameraControl()
         self._obs_mark_mode = False
         self._observations: list[dict[str, object]] = []
+        self._dooaf_pick_complete = None
+        self._dooaf_pick_dialog: DooafSetupDialog | None = None
         self._video_obs_marks: list[tuple[float, float]] = []
         self._obs_snapshot_bridge = _ObservationSnapshotBridge(self)
         self._obs_snapshot_bridge.finished.connect(self._on_observation_snapshot_saved)
@@ -1160,7 +1255,7 @@ class MapWidget(QWidget):
         self._native_hud_right.setAutoFillBackground(False)
         self._native_hud_right.setStyleSheet(_NATIVE_CAMERA_RAIL_QSS)
         self._native_hud_right_layout = QVBoxLayout(self._native_hud_right)
-        self._native_hud_right_layout.setContentsMargins(8, 7, 8, 8)
+        self._native_hud_right_layout.setContentsMargins(8, 7, 12, 8)
         self._native_hud_right_layout.setSpacing(_CAM_RAIL_LAYOUT_SPACING)
 
         self._camera_top_row = QFrame(self._native_hud_right)
@@ -1312,6 +1407,7 @@ class MapWidget(QWidget):
                 ],
             ],
             btn_height=_CAM_RAIL_PAD_BTN_H,
+            btn_width=_CAM_RAIL_PAD_BTN_W,
             grid_gap=_CAM_RAIL_GIMBAL_GRID_GAP,
         )
         observe_body = CamObserveBlock(
@@ -1321,6 +1417,7 @@ class MapWidget(QWidget):
             self._btn_native_reset,
         )
         self._native_observe_tape_edit = observe_body.tape_edit
+        self._native_observe_body = observe_body
 
         self._native_hud_right_layout.addWidget(_cam_rail_sep())
         self._native_hud_right_layout.addWidget(
@@ -1332,7 +1429,7 @@ class MapWidget(QWidget):
             )
         )
         self._native_hud_right_layout.addWidget(
-            _cam_rail_inline_row("GIMBAL", gimbal_pad)
+            _cam_rail_gimbal_row("GIMBAL", gimbal_pad)
         )
         self._native_hud_right_layout.addWidget(
             _cam_rail_inline_row("OBSERVE", observe_body)
@@ -1594,12 +1691,17 @@ class MapWidget(QWidget):
             print("[VGCS:cam_rail] OBSERVE Calibrate clicked")
             QTimer.singleShot(0, self._observe_calibrate_from_tape)
 
+        def _obs_dooaf_setup() -> None:
+            print("[VGCS:cam_rail] OBSERVE DOOAF Setup clicked")
+            QTimer.singleShot(0, self._show_dooaf_setup_dialog)
+
         self._btn_native_target.toggled.connect(_obs_target)
         self._btn_native_clip.clicked.connect(_obs_clip)
         self._btn_native_report.clicked.connect(_obs_report)
         self._btn_native_reset.clicked.connect(_obs_reset)
         observe_body.calibrate_btn.clicked.connect(_obs_calibrate)
         observe_body.tape_edit.returnPressed.connect(_obs_calibrate)
+        observe_body.setup_clicked.connect(_obs_dooaf_setup)
 
         self._status = QLabel("Map status: waiting for telemetry")
         self._status.setObjectName("telemetryValue")
@@ -4306,9 +4408,7 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._native_map.user_waypoints_changed.connect(self._on_native_user_waypoints_changed)
-        self._native_map.observation_map_click.connect(
-            lambda la, lo: self._log_observation("map_mark", map_lat=float(la), map_lon=float(lo))
-        )
+        self._native_map.observation_map_click.connect(self._on_native_observation_map_click)
         try:
             seed_ok = bundled_seed_root().is_dir()
             print(
@@ -4320,6 +4420,7 @@ class MapWidget(QWidget):
         self._web_ready = True
         self._set_status("Map backend: Native Qt tiles")
         self._on_map_loaded(True)
+        QTimer.singleShot(0, self._refresh_dooaf_map_overlay)
 
         try:
             s = QSettings(_QS_NS, _QS_APP)
@@ -6030,7 +6131,8 @@ class MapWidget(QWidget):
             pass
         if enabled:
             self._set_status(
-                "Target ON: click video feed (or map) to add marks, then Report to export"
+                "Target ON: Mark = Fall of shot on video after fire; "
+                "or use DOOAF Setup for gun + actual target, then Report"
             )
         else:
             self._set_status("Observation mark mode OFF")
@@ -6099,6 +6201,276 @@ class MapWidget(QWidget):
             "geo_range_m": None,
             "geo_bearing_deg": None,
         }
+
+    def _current_observe_dooaf_role(self) -> str:
+        body = getattr(self, "_native_observe_body", None)
+        if body is not None and hasattr(body, "current_dooaf_role"):
+            return str(body.current_dooaf_role())
+        return DOOAF_ROLE_SURVEY
+
+    def _dooaf_settings_store(self) -> QSettings:
+        return QSettings(_QS_NS, _QS_APP)
+
+    def _dooaf_session_kwargs(self) -> dict[str, float | None]:
+        s = resolved_dooaf_settings(
+            self._dooaf_settings_store(), self._observations
+        )
+        return dooaf_settings_kwargs(s)
+
+    def _resolved_dooaf_settings(self) -> DooafSettings:
+        return resolved_dooaf_settings(
+            self._dooaf_settings_store(), self._observations
+        )
+
+    def _persist_dooaf_coords(
+        self,
+        row: dict[str, object],
+        *,
+        role: str,
+    ) -> None:
+        lat = row.get("target_lat")
+        lon = row.get("target_lon")
+        if lat is None or lon is None:
+            return
+        try:
+            plat = float(lat)
+            plon = float(lon)
+        except (TypeError, ValueError):
+            return
+        alt = row.get("target_alt_m")
+        palt: float | None
+        try:
+            palt = float(alt) if alt is not None else None
+        except (TypeError, ValueError):
+            palt = None
+        cur = read_dooaf_settings(self._dooaf_settings_store())
+        if role == DOOAF_ROLE_GUN:
+            write_dooaf_settings(
+                self._dooaf_settings_store(),
+                DooafSettings(
+                    gun_lat=plat,
+                    gun_lon=plon,
+                    gun_alt_m=palt,
+                    target_lat=cur.target_lat,
+                    target_lon=cur.target_lon,
+                    target_alt_m=cur.target_alt_m,
+                ),
+            )
+        elif role == DOOAF_ROLE_INTENDED:
+            write_dooaf_settings(
+                self._dooaf_settings_store(),
+                DooafSettings(
+                    gun_lat=cur.gun_lat,
+                    gun_lon=cur.gun_lon,
+                    gun_alt_m=cur.gun_alt_m,
+                    target_lat=plat,
+                    target_lon=plon,
+                    target_alt_m=palt,
+                ),
+            )
+
+    def _persist_dooaf_gun(self, row: dict[str, object]) -> None:
+        self._persist_dooaf_coords(row, role=DOOAF_ROLE_GUN)
+
+    def _refresh_dooaf_map_overlay(self) -> None:
+        s = self._resolved_dooaf_settings()
+        gun = (
+            (float(s.gun_lat), float(s.gun_lon))
+            if s.gun_lat is not None and s.gun_lon is not None
+            else None
+        )
+        intended = (
+            (float(s.target_lat), float(s.target_lon))
+            if s.target_lat is not None and s.target_lon is not None
+            else None
+        )
+        impact_mark = latest_mark(self._observations, DOOAF_ROLE_IMPACT)
+        impact = (
+            (impact_mark.lat, impact_mark.lon) if impact_mark is not None else None
+        )
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "set_dooaf_overlay"):
+                nm.set_dooaf_overlay(gun=gun, intended=intended, impact=impact)
+        except Exception:
+            pass
+
+    def _on_native_observation_map_click(self, lat: float, lon: float) -> None:
+        if self._dooaf_pick_complete is not None:
+            cb = self._dooaf_pick_complete
+            self._end_dooaf_map_pick(restore_target_mode=True)
+            cb(float(lat), float(lon))
+            return
+        self._log_observation("map_mark", map_lat=float(lat), map_lon=float(lon))
+
+    def _end_dooaf_map_pick(self, *, restore_target_mode: bool = True) -> None:
+        self._dooaf_pick_complete = None
+        self._dooaf_pick_dialog = None
+        if not restore_target_mode:
+            return
+        try:
+            nm = getattr(self, "_native_map", None)
+            on = bool(self._btn_native_target.isChecked())
+            if nm is not None and hasattr(nm, "set_observation_mark_mode"):
+                nm.set_observation_mark_mode(on)
+        except Exception:
+            pass
+
+    def _preview_dooaf_overlay(self, settings: DooafSettings) -> None:
+        gun = (
+            (float(settings.gun_lat), float(settings.gun_lon))
+            if settings.gun_lat is not None and settings.gun_lon is not None
+            else None
+        )
+        intended = (
+            (float(settings.target_lat), float(settings.target_lon))
+            if settings.target_lat is not None and settings.target_lon is not None
+            else None
+        )
+        impact_mark = latest_mark(self._observations, DOOAF_ROLE_IMPACT)
+        impact = (
+            (impact_mark.lat, impact_mark.lon) if impact_mark is not None else None
+        )
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "set_dooaf_overlay"):
+                nm.set_dooaf_overlay(gun=gun, intended=intended, impact=impact)
+        except Exception:
+            pass
+
+    def _begin_dooaf_map_pick(self, role: str, dlg: DooafSetupDialog) -> None:
+        self._end_dooaf_map_pick(restore_target_mode=True)
+        self._dooaf_pick_dialog = dlg
+
+        def on_picked(lat: float, lon: float) -> None:
+            dlg.set_point_coords(role, lat, lon)
+            st = self._dooaf_settings_store()
+            pick_role = (
+                DOOAF_ROLE_GUN if role == DOOAF_PICK_GUN else DOOAF_ROLE_INTENDED
+            )
+            merged = apply_map_pick_to_settings(
+                self._resolved_dooaf_settings(),
+                pick_role,
+                float(lat),
+                float(lon),
+            )
+            write_dooaf_settings(st, merged)
+            self._refresh_dooaf_map_overlay()
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            label = dooaf_role_display(pick_role)
+            self._set_status(
+                f"DOOAF {label} saved from map — OK to confirm or pick again"
+            )
+
+        self._dooaf_pick_complete = on_picked
+        dlg.hide()
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "set_observation_mark_mode"):
+                nm.set_observation_mark_mode(True)
+        except Exception:
+            pass
+        pick_role = DOOAF_ROLE_GUN if role == DOOAF_PICK_GUN else DOOAF_ROLE_INTENDED
+        label = dooaf_role_display(pick_role)
+        self._set_status(f"Click the map to set {label}")
+
+    def _rebuild_observation_map_markers(self) -> None:
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "clear_observation_marks"):
+                nm.clear_observation_marks()
+            if nm is not None:
+                for row in self._observations:
+                    if str(row.get("kind") or "") != "map_mark":
+                        continue
+                    la = row.get("map_lat")
+                    lo = row.get("map_lon")
+                    if la is None or lo is None:
+                        continue
+                    if hasattr(nm, "add_observation_map_marker"):
+                        nm.add_observation_map_marker(float(la), float(lo))
+        except Exception:
+            pass
+        self._refresh_observation_measure_overlays()
+
+    def _sync_dooaf_settings_from_dialog(
+        self,
+        dlg: DooafSetupDialog,
+        *,
+        gun: bool = True,
+        target: bool = True,
+    ) -> None:
+        partial = dlg.result_settings()
+        cur = read_dooaf_settings(self._dooaf_settings_store())
+        write_dooaf_settings(
+            self._dooaf_settings_store(),
+            DooafSettings(
+                gun_lat=partial.gun_lat if gun else cur.gun_lat,
+                gun_lon=partial.gun_lon if gun else cur.gun_lon,
+                gun_alt_m=partial.gun_alt_m if gun else cur.gun_alt_m,
+                target_lat=partial.target_lat if target else cur.target_lat,
+                target_lon=partial.target_lon if target else cur.target_lon,
+                target_alt_m=partial.target_alt_m if target else cur.target_alt_m,
+            ),
+        )
+
+    def _on_dooaf_setup_coordinates_changed(
+        self, scope: str, dlg: DooafSetupDialog
+    ) -> None:
+        clear_gun = scope in ("gun", "all")
+        clear_target = scope in ("target", "all")
+        roles_remove: set[str] = set()
+        if clear_gun:
+            roles_remove.add(DOOAF_ROLE_GUN)
+        if clear_target:
+            roles_remove.add(DOOAF_ROLE_INTENDED)
+        if roles_remove:
+            self._observations = [
+                r
+                for r in self._observations
+                if str(r.get("dooaf_role") or DOOAF_ROLE_SURVEY) not in roles_remove
+            ]
+            self._rebuild_observation_map_markers()
+        self._sync_dooaf_settings_from_dialog(
+            dlg, gun=clear_gun, target=clear_target
+        )
+        self._refresh_dooaf_map_overlay()
+
+    def _show_dooaf_setup_dialog(self) -> None:
+        st = self._dooaf_settings_store()
+        dlg = DooafSetupDialog(self, settings=self._resolved_dooaf_settings())
+        dlg.pick_point_requested.connect(
+            lambda role: self._begin_dooaf_map_pick(role, dlg)
+        )
+        dlg.coordinates_changed.connect(
+            lambda scope: self._on_dooaf_setup_coordinates_changed(scope, dlg)
+        )
+        dlg.finished.connect(lambda _code: self._end_dooaf_map_pick())
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_settings = merge_dooaf_settings(
+            self._resolved_dooaf_settings(), dlg.result_settings()
+        )
+        write_dooaf_settings(st, new_settings)
+        self._refresh_dooaf_map_overlay()
+        session = build_dooaf_session(self._observations, **self._dooaf_session_kwargs())
+        self._set_status(f"DOOAF setup saved — {format_dooaf_status(session)}")
+        try:
+            pts: list[tuple[float, float]] = []
+            if session.gun is not None:
+                pts.append((session.gun.lat, session.gun.lon))
+            if session.intended is not None:
+                pts.append((session.intended.lat, session.intended.lon))
+            if pts:
+                nm = getattr(self, "_native_map", None)
+                if nm is not None and hasattr(nm, "set_center"):
+                    la = sum(p[0] for p in pts) / len(pts)
+                    lo = sum(p[1] for p in pts) / len(pts)
+                    nm.set_center(la, lo)
+        except Exception:
+            pass
 
     def _m8_geo_settings(self) -> tuple[float, str | None]:
         st = QSettings(_QS_NS, _QS_APP)
@@ -6248,12 +6620,20 @@ class MapWidget(QWidget):
             "clip_path": str(clip_path or "").strip(),
         }
         row.update(self._observation_context())
+        dooaf_role = self._current_observe_dooaf_role()
+        row["dooaf_role"] = dooaf_role
         self._enrich_observation_geo_reference(row)
         track_before = target_track_from_observations(self._observations)
         seg_m = None
         pt = observation_target_latlon(row)
         cross_band = False
-        if pt is not None and track_before:
+        if dooaf_role == DOOAF_ROLE_IMPACT and pt is not None:
+            intended = latest_mark(self._observations, DOOAF_ROLE_INTENDED)
+            if intended is not None:
+                seg_m = haversine_m(
+                    intended.lat, intended.lon, pt[0], pt[1]
+                )
+        elif dooaf_role == DOOAF_ROLE_SURVEY and pt is not None and track_before:
             hfov, _ = self._m8_geo_settings()
             peak = session_peak_geo_range_m(self._observations)
             facade_ref = session_facade_reference_range_m(
@@ -6299,6 +6679,10 @@ class MapWidget(QWidget):
         else:
             row["segment_distance_m"] = None
         self._observations.append(row)
+        if dooaf_role == DOOAF_ROLE_GUN:
+            self._persist_dooaf_gun(row)
+        elif dooaf_role == DOOAF_ROLE_INTENDED:
+            self._persist_dooaf_coords(row, role=DOOAF_ROLE_INTENDED)
         idx = len(self._observations) - 1
         if capture_snapshot:
             self._schedule_observation_snapshot(idx)
@@ -6325,6 +6709,13 @@ class MapWidget(QWidget):
                 " — gimbal N/A (Skydroid C13: TOP UDP port 5000; on RC hotspot try Host=RC gateway "
                 "e.g. 192.168.43.1; ZR10: SIYI SDK UDP 37260)"
             )
+        elif dooaf_role != DOOAF_ROLE_SURVEY:
+            session = build_dooaf_session(
+                self._observations, **self._dooaf_session_kwargs()
+            )
+            msg += f" — {format_dooaf_status(session)}"
+            if dooaf_role == DOOAF_ROLE_IMPACT and seg_m is not None:
+                msg += f" (miss {float(seg_m):.0f} m)"
         elif kind in ("video_mark", "map_mark"):
             gq = str(row.get("geo_quality") or "")
             if gq in ("good", "fair", "map_direct"):
@@ -6355,6 +6746,7 @@ class MapWidget(QWidget):
                 msg += f" — {warn}"
         self._set_status(msg)
         self._refresh_observation_measure_overlays()
+        self._refresh_dooaf_map_overlay()
 
         # Native OBSERVE -> Target needs a visible marker on the Qt map.
         if kind == "map_mark" and map_lat is not None and map_lon is not None:
@@ -6444,9 +6836,15 @@ class MapWidget(QWidget):
         return labels, segs
 
     def _observation_video_measure_segments(self) -> list[tuple[float, float, float, float, str]]:
-        """Dashed lines: one width per height band (left↔right), stable across pillar rows."""
+        """Dashed lines: facade tape widths, or intended→impact for DOOAF."""
         hfov, _ = self._m8_geo_settings()
-        return observation_facade_video_segments(self._observations, hfov_deg=hfov)
+        segs = list(
+            observation_facade_video_segments(self._observations, hfov_deg=hfov)
+        )
+        dooaf_seg = dooaf_intended_impact_video_segment(self._observations)
+        if dooaf_seg is not None:
+            segs.append(dooaf_seg)
+        return segs
 
     def _refresh_observation_measure_overlays(self) -> None:
         """Sync map measure lines + video segment labels from logged observations."""
@@ -6745,6 +7143,7 @@ class MapWidget(QWidget):
             pass
         self._run_js("if (window.clearObservationMarks) clearObservationMarks();")
         self._refresh_observation_measure_overlays()
+        self._refresh_dooaf_map_overlay()
         self._set_status(f"Cleared observations: {n}")
 
     def _export_observations(self, *, quick: bool = False) -> None:
@@ -6792,6 +7191,7 @@ class MapWidget(QWidget):
         self._obs_export_quick = bool(quick)
         self._set_status("Exporting observation report…")
         rows = [dict(r) for r in self._observations]
+        dooaf = self._dooaf_session_kwargs()
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(
             _ObservationExportTask(
@@ -6800,6 +7200,12 @@ class MapWidget(QWidget):
                 html_path=html_path,
                 obs_cell_fn=self._obs_cell,
                 bridge=self._obs_export_bridge,
+                gun_lat=dooaf.get("gun_lat"),
+                gun_lon=dooaf.get("gun_lon"),
+                gun_alt_m=dooaf.get("gun_alt_m"),
+                target_lat=dooaf.get("target_lat"),
+                target_lon=dooaf.get("target_lon"),
+                target_alt_m=dooaf.get("target_alt_m"),
             )
         )
 

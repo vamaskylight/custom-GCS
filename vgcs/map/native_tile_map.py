@@ -475,6 +475,9 @@ class NativeTileMapView(QWidget):
         # Stores lat/lon pairs for OBSERVE -> Target marks (native rendering).
         self._observation_marks: list[tuple[float, float]] = []
         self._geo_referenced_marks: list[tuple[float, float]] = []
+        self._dooaf_gun: tuple[float, float] | None = None
+        self._dooaf_intended: tuple[float, float] | None = None
+        self._dooaf_impact: tuple[float, float] | None = None
         # Consecutive ground targets (lat, lon) for measure lines + distance labels.
         self._target_track: list[tuple[float, float]] = []
         self._target_track_labels: list[str] = []
@@ -726,6 +729,28 @@ class NativeTileMapView(QWidget):
             self._target_track_labels = []
         self.update()
 
+    def set_dooaf_overlay(
+        self,
+        *,
+        gun: tuple[float, float] | None = None,
+        intended: tuple[float, float] | None = None,
+        impact: tuple[float, float] | None = None,
+    ) -> None:
+        """Fixed DOOAF points: gun origin, actual target, fall of shot."""
+        try:
+            self._dooaf_gun = (float(gun[0]), float(gun[1])) if gun is not None else None
+            self._dooaf_intended = (
+                (float(intended[0]), float(intended[1])) if intended is not None else None
+            )
+            self._dooaf_impact = (
+                (float(impact[0]), float(impact[1])) if impact is not None else None
+            )
+        except Exception:
+            self._dooaf_gun = None
+            self._dooaf_intended = None
+            self._dooaf_impact = None
+        self.update()
+
     def clear_observation_marks(self) -> None:
         """Clear all visible OBSERVE -> Target markers."""
         try:
@@ -733,6 +758,7 @@ class NativeTileMapView(QWidget):
             self._geo_referenced_marks.clear()
             self._target_track.clear()
             self._target_track_labels.clear()
+            self._dooaf_impact = None
         except Exception:
             pass
         self.update()
@@ -1046,6 +1072,82 @@ class NativeTileMapView(QWidget):
             painter.drawEllipse(c, 7, 7)
             painter.setPen(QPen(QColor(255, 255, 255)))
             painter.drawText(QRectF(c.x() - 16, c.y() - 8, 32, 16), Qt.AlignmentFlag.AlignCenter, str(i + 1))
+
+        # DOOAF fixed points (military gun / target / impact)
+        def _dooaf_labeled_point(
+            lat: float,
+            lon: float,
+            *,
+            radius: int,
+            fill: QColor,
+            outline: QColor,
+            label: str,
+        ) -> None:
+            c = self._project(lat, lon, z, fx, fy, w, h)
+            painter.setPen(QPen(outline, 2))
+            painter.setBrush(fill)
+            painter.drawEllipse(c, radius, radius)
+            font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            tw = metrics.horizontalAdvance(label) + 8
+            th = metrics.height() + 4
+            tx = int(c.x()) - tw // 2
+            ty = int(c.y()) - radius - th - 4
+            painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 210))
+            painter.setPen(QColor(240, 245, 255))
+            painter.drawText(tx + 4, ty + metrics.ascent() + 2, label)
+
+        if self._dooaf_gun is not None:
+            gla, glo = self._dooaf_gun
+            _dooaf_labeled_point(
+                gla,
+                glo,
+                radius=9,
+                fill=QColor(30, 70, 160, 230),
+                outline=QColor(180, 210, 255, 240),
+                label="GUN",
+            )
+        if self._dooaf_intended is not None:
+            tla, tlo = self._dooaf_intended
+            _dooaf_labeled_point(
+                tla,
+                tlo,
+                radius=7,
+                fill=QColor(40, 170, 80, 220),
+                outline=QColor(180, 255, 200, 240),
+                label="TARGET",
+            )
+        if self._dooaf_impact is not None:
+            ila, ilo = self._dooaf_impact
+            _dooaf_labeled_point(
+                ila,
+                ilo,
+                radius=7,
+                fill=QColor(220, 90, 40, 220),
+                outline=QColor(255, 200, 140, 240),
+                label="HIT",
+            )
+        if self._dooaf_gun is not None and self._dooaf_intended is not None:
+            c0 = self._project(
+                self._dooaf_gun[0], self._dooaf_gun[1], z, fx, fy, w, h
+            )
+            c1 = self._project(
+                self._dooaf_intended[0], self._dooaf_intended[1], z, fx, fy, w, h
+            )
+            painter.setPen(QPen(QColor(80, 140, 255, 230), 3, Qt.PenStyle.SolidLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawLine(c0, c1)
+        if self._dooaf_gun is not None and self._dooaf_impact is not None:
+            c0 = self._project(
+                self._dooaf_gun[0], self._dooaf_gun[1], z, fx, fy, w, h
+            )
+            c1 = self._project(
+                self._dooaf_impact[0], self._dooaf_impact[1], z, fx, fy, w, h
+            )
+            painter.setPen(QPen(QColor(120, 200, 255, 210), 2, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawLine(c0, c1)
 
         # Observation marks (OBSERVE -> Target)
         if self._observation_marks:
