@@ -38,7 +38,8 @@ DOOAF_ROLE_TOOLTIPS: dict[str, str] = {
         "Planned impact point from military staff — where the round should land."
     ),
     DOOAF_ROLE_IMPACT: (
-        "Where the round actually landed — click burst or smoke on the video feed."
+        "Mark fall of shot after firing — click burst or smoke on video. "
+        "Set gun and actual target in DOOAF Setup first."
     ),
     DOOAF_ROLE_GUN: (
         "Artillery position — gun origin (use DOOAF Setup or click the map)."
@@ -428,10 +429,7 @@ def format_dooaf_status(session: DooafSession) -> str:
     if session.correction is not None:
         parts.append(format_fire_correction(session.correction))
     if not parts:
-        return (
-            "DOOAF: set Mark role (Artillery / Actual target / Fall of shot) "
-            "or use DOOAF Setup"
-        )
+        return "DOOAF: use DOOAF Setup for gun + target, then mark fall of shot"
     return "DOOAF: " + "; ".join(parts)
 
 

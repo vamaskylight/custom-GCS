@@ -90,10 +90,8 @@ from vgcs.observe.dooaf import (
 from vgcs.observe.geo_reference import compute_geo_reference
 from vgcs.observe.target_measure import (
     band_width_partner_row,
-    calibrate_segment_scale_from_tape,
     clear_tape_pair_override,
     measure_agl_ok,
-    MEASURE_AGL_TOO_LOW_MSG,
     format_target_segment_label,
     haversine_m,
     is_downward_sensor_orientation,
@@ -554,34 +552,26 @@ QPushButton#observeTarget:checked, QPushButton#observeClip:checked {
   border-color: rgba(214, 224, 241, 230);
   background: rgba(27, 33, 45, 245);
 }
-QLabel#observeTapeLabel {
-  color: #a8b8d4;
-  font-size: 12px;
+QPushButton#observeDooafSetup {
+  min-height: 34px;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 14px;
   font-weight: 600;
-}
-QLineEdit#observeTapeEdit {
-  min-height: 28px;
-  max-height: 28px;
-  border-radius: 5px;
-  border: 1px solid rgba(196, 209, 230, 38);
-  background: rgba(18, 22, 32, 90);
-  color: #e8eef8;
-  font-size: 13px;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 168, 230, 90);
+  background: rgba(36, 58, 92, 210);
+  color: #e8f0ff;
   padding: 2px 6px;
 }
-QPushButton#observeCalibrate {
-  min-width: 36px;
-  min-height: 28px;
-  max-height: 28px;
-  font-size: 13px;
-  font-weight: 700;
-  border-radius: 5px;
-  border: 1px solid rgba(196, 209, 230, 50);
-  background: rgba(46, 72, 110, 200);
-  color: #e8f0ff;
+QPushButton#observeDooafSetup:hover {
+  background: rgba(52, 82, 128, 235);
+  border-color: rgba(180, 210, 255, 120);
 }
-QPushButton#observeCalibrate:hover {
-  background: rgba(62, 98, 148, 230);
+QLabel#observeDooafHint {
+  color: #8fa4c4;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.25;
 }
 QPushButton#observeClip[recording="true"] {
   background: rgba(200, 45, 45, 240);
@@ -1416,7 +1406,6 @@ class MapWidget(QWidget):
             self._btn_native_report,
             self._btn_native_reset,
         )
-        self._native_observe_tape_edit = observe_body.tape_edit
         self._native_observe_body = observe_body
 
         self._native_hud_right_layout.addWidget(_cam_rail_sep())
@@ -1687,10 +1676,6 @@ class MapWidget(QWidget):
             print("[VGCS:cam_rail] OBSERVE Reset clicked")
             self._clear_observations()
 
-        def _obs_calibrate() -> None:
-            print("[VGCS:cam_rail] OBSERVE Calibrate clicked")
-            QTimer.singleShot(0, self._observe_calibrate_from_tape)
-
         def _obs_dooaf_setup() -> None:
             print("[VGCS:cam_rail] OBSERVE DOOAF Setup clicked")
             QTimer.singleShot(0, self._show_dooaf_setup_dialog)
@@ -1699,8 +1684,6 @@ class MapWidget(QWidget):
         self._btn_native_clip.clicked.connect(_obs_clip)
         self._btn_native_report.clicked.connect(_obs_report)
         self._btn_native_reset.clicked.connect(_obs_reset)
-        observe_body.calibrate_btn.clicked.connect(_obs_calibrate)
-        observe_body.tape_edit.returnPressed.connect(_obs_calibrate)
         observe_body.setup_clicked.connect(_obs_dooaf_setup)
 
         self._status = QLabel("Map status: waiting for telemetry")
@@ -6131,8 +6114,8 @@ class MapWidget(QWidget):
             pass
         if enabled:
             self._set_status(
-                "Target ON: Mark = Fall of shot on video after fire; "
-                "or use DOOAF Setup for gun + actual target, then Report"
+                "Target ON: mark fall of shot on video "
+                "(set gun + target in DOOAF Setup first)"
             )
         else:
             self._set_status("Observation mark mode OFF")
@@ -6203,10 +6186,7 @@ class MapWidget(QWidget):
         }
 
     def _current_observe_dooaf_role(self) -> str:
-        body = getattr(self, "_native_observe_body", None)
-        if body is not None and hasattr(body, "current_dooaf_role"):
-            return str(body.current_dooaf_role())
-        return DOOAF_ROLE_SURVEY
+        return DOOAF_ROLE_IMPACT
 
     def _dooaf_settings_store(self) -> QSettings:
         return QSettings(_QS_NS, _QS_APP)
@@ -6221,56 +6201,6 @@ class MapWidget(QWidget):
         return resolved_dooaf_settings(
             self._dooaf_settings_store(), self._observations
         )
-
-    def _persist_dooaf_coords(
-        self,
-        row: dict[str, object],
-        *,
-        role: str,
-    ) -> None:
-        lat = row.get("target_lat")
-        lon = row.get("target_lon")
-        if lat is None or lon is None:
-            return
-        try:
-            plat = float(lat)
-            plon = float(lon)
-        except (TypeError, ValueError):
-            return
-        alt = row.get("target_alt_m")
-        palt: float | None
-        try:
-            palt = float(alt) if alt is not None else None
-        except (TypeError, ValueError):
-            palt = None
-        cur = read_dooaf_settings(self._dooaf_settings_store())
-        if role == DOOAF_ROLE_GUN:
-            write_dooaf_settings(
-                self._dooaf_settings_store(),
-                DooafSettings(
-                    gun_lat=plat,
-                    gun_lon=plon,
-                    gun_alt_m=palt,
-                    target_lat=cur.target_lat,
-                    target_lon=cur.target_lon,
-                    target_alt_m=cur.target_alt_m,
-                ),
-            )
-        elif role == DOOAF_ROLE_INTENDED:
-            write_dooaf_settings(
-                self._dooaf_settings_store(),
-                DooafSettings(
-                    gun_lat=cur.gun_lat,
-                    gun_lon=cur.gun_lon,
-                    gun_alt_m=cur.gun_alt_m,
-                    target_lat=plat,
-                    target_lon=plon,
-                    target_alt_m=palt,
-                ),
-            )
-
-    def _persist_dooaf_gun(self, row: dict[str, object]) -> None:
-        self._persist_dooaf_coords(row, role=DOOAF_ROLE_GUN)
 
     def _refresh_dooaf_map_overlay(self) -> None:
         s = self._resolved_dooaf_settings()
@@ -6633,6 +6563,16 @@ class MapWidget(QWidget):
                 seg_m = haversine_m(
                     intended.lat, intended.lon, pt[0], pt[1]
                 )
+            else:
+                rs = self._resolved_dooaf_settings()
+                if rs.target_lat is not None and rs.target_lon is not None:
+                    seg_m = haversine_m(
+                        float(rs.target_lat),
+                        float(rs.target_lon),
+                        pt[0],
+                        pt[1],
+                    )
+            row["segment_distance_m"] = seg_m
         elif dooaf_role == DOOAF_ROLE_SURVEY and pt is not None and track_before:
             hfov, _ = self._m8_geo_settings()
             peak = session_peak_geo_range_m(self._observations)
@@ -6679,10 +6619,6 @@ class MapWidget(QWidget):
         else:
             row["segment_distance_m"] = None
         self._observations.append(row)
-        if dooaf_role == DOOAF_ROLE_GUN:
-            self._persist_dooaf_gun(row)
-        elif dooaf_role == DOOAF_ROLE_INTENDED:
-            self._persist_dooaf_coords(row, role=DOOAF_ROLE_INTENDED)
         idx = len(self._observations) - 1
         if capture_snapshot:
             self._schedule_observation_snapshot(idx)
@@ -6714,8 +6650,12 @@ class MapWidget(QWidget):
                 self._observations, **self._dooaf_session_kwargs()
             )
             msg += f" — {format_dooaf_status(session)}"
-            if dooaf_role == DOOAF_ROLE_IMPACT and seg_m is not None:
-                msg += f" (miss {float(seg_m):.0f} m)"
+            if dooaf_role == DOOAF_ROLE_IMPACT:
+                rs = self._resolved_dooaf_settings()
+                if rs.gun_lat is None or rs.target_lat is None:
+                    msg += " — complete DOOAF Setup (gun + target) for correction"
+                elif seg_m is not None:
+                    msg += f" (miss {float(seg_m):.0f} m)"
         elif kind in ("video_mark", "map_mark"):
             gq = str(row.get("geo_quality") or "")
             if gq in ("good", "fair", "map_direct"):
@@ -7063,59 +7003,6 @@ class MapWidget(QWidget):
         try:
             self._show_obs_clip_banner(f"Clip saved: {name}")
             QTimer.singleShot(2500, self._hide_obs_clip_banner)
-        except Exception:
-            pass
-
-    def _observe_calibrate_from_tape(self) -> None:
-        """Apply tape width to scale the last L–R video measure (session + saved setting)."""
-        edit = getattr(self, "_native_observe_tape_edit", None)
-        if edit is None:
-            return
-        raw_text = str(edit.text() or "").strip().replace(",", ".")
-        if not raw_text:
-            self._set_status(
-                "OBSERVE Cal: enter tape width in metres (e.g. 4.0), then press Cal"
-            )
-            return
-        try:
-            known_m = float(raw_text)
-        except ValueError:
-            self._set_status("OBSERVE Cal: invalid number — use metres, e.g. 4.0")
-            return
-        hfov, _ = self._m8_geo_settings()
-        result = calibrate_segment_scale_from_tape(
-            known_m, self._observations, hfov_deg=hfov
-        )
-        if result is None:
-            agl_ok, agl_msg = measure_agl_ok(self._observations)
-            if not agl_ok:
-                self._set_status(f"OBSERVE Cal: {agl_msg}")
-            else:
-                self._set_status(
-                    "OBSERVE Cal: place two Target marks (left & right, same height) first"
-                )
-            return
-        scale = float(result["scale"])
-        raw_m = float(result["raw_m"])
-        self._refresh_observation_measure_overlays()
-        msg = (
-            f"OBSERVE calibrated: line shows {known_m:.1f} m (was {raw_m:.1f} m) — "
-            f"scale {scale:.3f}"
-        )
-        if result.get("scale_clamped"):
-            req = float(result.get("requested_scale") or 0)
-            msg += f" (scale clamped; requested {req:.2f})"
-        if result.get("agl_blocked"):
-            msg = (
-                f"OBSERVE: tape {known_m:.1f} m shown on line only — "
-                f"{MEASURE_AGL_TOO_LOW_MSG} (need RF ≥ 2.5 m)"
-            )
-        self._set_status(msg)
-        try:
-            print(
-                f"[VGCS:observe] tape_calibrate known={known_m:.3f} raw={raw_m:.3f} "
-                f"scale={scale:.3f} clamped={result.get('scale_clamped')}"
-            )
         except Exception:
             pass
 
