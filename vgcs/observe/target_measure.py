@@ -23,7 +23,8 @@ FACADE_DISTANT_TARGET_HINT = (
     "Distant/horizon marks — place targets on a near wall (lower video)"
 )
 LONG_RANGE_MAX_WIDTH_M = 200.0
-_FACADE_LONG_RANGE_VIDEO_Y = 0.62
+# Video Y increases downward: near-wall tape is lower frame (y >= this).
+_FACADE_NEAR_WALL_TAPE_Y_MIN = 0.68
 
 
 def _row_agl_source(row: dict[str, Any]) -> str:
@@ -48,7 +49,7 @@ def is_long_range_video_click(
         rel = float(relative_alt_m) if relative_alt_m is not None else 0.0
     except (TypeError, ValueError):
         rel = 0.0
-    return rf >= 40.0 and y < _FACADE_LONG_RANGE_VIDEO_Y and rel < 3.0
+    return rf >= 40.0 and y < _FACADE_NEAR_WALL_TAPE_Y_MIN and rel < 5.0
 
 
 def facade_measure_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> str:
@@ -91,7 +92,7 @@ def slant_horizontal_range_m(agl_m: float, depression_deg: float) -> float | Non
         return None
     dep_use = max(6.0, min(75.0, dep))
     rh = agl / math.tan(math.radians(dep_use))
-    return min(280.0, max(agl * 1.5, rh))
+    return min(350.0, max(agl * 1.5, rh))
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -272,7 +273,7 @@ def resolve_facade_ray_agl_m(
     if rf is not None and rf >= MIN_FACADE_AGL_M:
         return rf, "rangefinder_down"
     if rf_raw is not None and rf is None and (rf_raw >= 40.0 or rf_raw in _RF_CLAMP_SUSPECT_M):
-        if rel is None or rel < 3.0:
+        if rel is None or rel < 5.0:
             if is_long_range_video_click(video_y_norm, rf_raw, rel):
                 return rf_raw, "rangefinder_clamped_long"
             return _FACADE_RF_CLAMPED_FALLBACK_M, "rangefinder_clamped_facade"

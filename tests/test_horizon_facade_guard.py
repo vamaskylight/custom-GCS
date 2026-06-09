@@ -64,9 +64,9 @@ def test_near_wall_low_video_still_measures():
 
 
 def test_skyline_rf45_long_range_at_least_forty_metres():
-    """Distant towers (image): RF 45 m clamped, upper video — not ~10 m (wall)."""
-    left = _mark(0.36, 0.38, ekf=0.5, rf=RF_CLAMP)
-    right = _mark(0.54, 0.40, ekf=0.6, rf=RF_CLAMP)
+    """Distant towers: RF 45 m, mid-upper video (y<0.72) — not ~8 m (wall)."""
+    left = _mark(0.36, 0.58, ekf=0.5, rf=RF_CLAMP)
+    right = _mark(0.54, 0.60, ekf=0.6, rf=RF_CLAMP)
     assert left["geo_range_m"] is not None
     assert right["geo_range_m"] is not None
     d = segment_distance_between_rows(left, right, hfov_deg=62.0)

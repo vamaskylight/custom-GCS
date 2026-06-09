@@ -10,6 +10,7 @@ from __future__ import annotations
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -18,6 +19,15 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QVBoxLayout,
     QWidget,
+)
+
+from vgcs.observe.dooaf import (
+    DOOAF_ROLE_DISPLAY,
+    DOOAF_ROLE_GUN,
+    DOOAF_ROLE_IMPACT,
+    DOOAF_ROLE_INTENDED,
+    DOOAF_ROLE_SURVEY,
+    DOOAF_ROLE_TOOLTIPS,
 )
 
 
@@ -62,6 +72,7 @@ class CamRailGimbalPad(QWidget):
         parent=None,
         *,
         btn_height: int = 30,
+        btn_width: int = 40,
         grid_gap: int = 4,
     ) -> None:
         super().__init__(parent)
@@ -72,16 +83,20 @@ class CamRailGimbalPad(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setHorizontalSpacing(int(grid_gap))
         lay.setVerticalSpacing(int(grid_gap))
+        cols = max((len(row) for row in buttons), default=0)
+        rows = len(buttons)
         for row, row_btns in enumerate(buttons):
             for col, btn in enumerate(row_btns):
                 lay.addWidget(btn, row, col, Qt.AlignmentFlag.AlignCenter)
-        # Two button rows + one gap — stable size hint for camera rail height.
-        rows = len(buttons)
-        self.setFixedHeight(int(btn_height) * rows + int(grid_gap) * max(0, rows - 1))
+        pad_w = int(cols) * int(btn_width) + max(0, int(cols) - 1) * int(grid_gap)
+        pad_h = int(btn_height) * rows + int(grid_gap) * max(0, rows - 1)
+        self.setFixedSize(max(1, pad_w), max(1, pad_h))
 
 
 class CamObserveBlock(QWidget):
     """Target / Clip and Report / Reset — two rows with matching button gaps."""
+
+    setup_clicked = Signal()
 
     def __init__(
         self,
@@ -107,6 +122,34 @@ class CamObserveBlock(QWidget):
         row2.setSpacing(4)
         row2.addWidget(report_btn, 1)
         row2.addWidget(reset_btn, 1)
+        self.setup_btn = QPushButton("DOOAF Setup")
+        self.setup_btn.setObjectName("observeDooafSetup")
+        self.setup_btn.setToolTip(
+            "Enter artillery position and actual target lat/lon from military grid."
+        )
+        self.setup_btn.clicked.connect(self.setup_clicked.emit)
+        row_setup = QHBoxLayout()
+        row_setup.setContentsMargins(0, 0, 0, 0)
+        row_setup.setSpacing(4)
+        row_setup.addWidget(self.setup_btn, 1)
+        role_lbl = QLabel("Mark")
+        role_lbl.setObjectName("observeRoleLabel")
+        self.role_combo = QComboBox()
+        self.role_combo.setObjectName("observeRoleCombo")
+        for role in (
+            DOOAF_ROLE_INTENDED,
+            DOOAF_ROLE_IMPACT,
+            DOOAF_ROLE_GUN,
+            DOOAF_ROLE_SURVEY,
+        ):
+            self.role_combo.addItem(DOOAF_ROLE_DISPLAY[role], role)
+        self.role_combo.currentIndexChanged.connect(self._sync_role_tooltip)
+        self._sync_role_tooltip()
+        row_role = QHBoxLayout()
+        row_role.setContentsMargins(0, 0, 0, 0)
+        row_role.setSpacing(4)
+        row_role.addWidget(role_lbl)
+        row_role.addWidget(self.role_combo, 1)
         tape_lbl = QLabel("Tape (m)")
         tape_lbl.setObjectName("observeTapeLabel")
         self.tape_edit = QLineEdit()
@@ -121,6 +164,7 @@ class CamObserveBlock(QWidget):
         self.calibrate_btn.setToolTip(
             "Calibrate distance scale from the last L–R measure and this tape value."
         )
+        self._tape_lbl = tape_lbl
         row3 = QHBoxLayout()
         row3.setContentsMargins(0, 0, 0, 0)
         row3.setSpacing(4)
@@ -129,7 +173,26 @@ class CamObserveBlock(QWidget):
         row3.addWidget(self.calibrate_btn, 0)
         v.addLayout(row1)
         v.addLayout(row2)
+        v.addLayout(row_setup)
+        v.addLayout(row_role)
         v.addLayout(row3)
+        self.role_combo.currentIndexChanged.connect(self._sync_tape_visibility)
+        self._sync_tape_visibility()
+
+    def current_dooaf_role(self) -> str:
+        data = self.role_combo.currentData()
+        return str(data or DOOAF_ROLE_SURVEY)
+
+    def _sync_tape_visibility(self) -> None:
+        survey = self.current_dooaf_role() == DOOAF_ROLE_SURVEY
+        self._tape_lbl.setVisible(survey)
+        self.tape_edit.setVisible(survey)
+        self.calibrate_btn.setVisible(survey)
+
+    def _sync_role_tooltip(self) -> None:
+        role = self.current_dooaf_role()
+        tip = DOOAF_ROLE_TOOLTIPS.get(role, "")
+        self.role_combo.setToolTip(tip)
 
 
 class CamRailBiSlider(QWidget):
