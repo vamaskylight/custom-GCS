@@ -228,8 +228,15 @@ _MAP_HUD_TOP_PX = 10
 _MAP_ACTION_RAIL_LEFT_PX = 10
 _MAP_ACTION_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _NATIVE_CAM_RAIL_TOP_PX = _MAP_HUD_TOP_PX
-# LENS row: 42 + 6 + (16+34+34)*2 + 6 + ~11 layout margins.
-_NATIVE_CAM_RAIL_MIN_WIDTH_PX = 272
+# Content width inside glass inset (see ``_CAM_RAIL_LAYER_INSET``).
+_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX = 286
+# Inset ``native_hud_right`` inside rounded ``nativeCameraRailLayer`` (extra right for radius).
+_CAM_RAIL_LAYER_INSET = (5, 5, 14, 5)
+_NATIVE_CAM_RAIL_MIN_WIDTH_PX = (
+    _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX
+    + _CAM_RAIL_LAYER_INSET[0]
+    + _CAM_RAIL_LAYER_INSET[2]
+)
 # Camera rail vertical rhythm (touch targets / gaps — do not change font-size in QSS below).
 _CAM_RAIL_PAD_BTN_H = 34
 _CAM_RAIL_PAD_BTN_W = 42
@@ -618,7 +625,7 @@ def _cam_rail_gimbal_row(label: str, pad: QWidget) -> QWidget:
     w.setObjectName("camInlineRow")
     w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
     h = QHBoxLayout(w)
-    h.setContentsMargins(0, 2, 4, 2)
+    h.setContentsMargins(0, 2, 2, 2)
     h.setSpacing(8)
     lab = QLabel(label)
     lab.setObjectName("camSectionHeaderInline")
@@ -718,6 +725,7 @@ def _cam_pad_btn(
 ) -> QPushButton:
     btn.setProperty("camPadBtn", True)
     btn.setFixedSize(int(width), int(height))
+    btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     return btn
 
 
@@ -1245,7 +1253,7 @@ class MapWidget(QWidget):
         self._native_hud_right.setAutoFillBackground(False)
         self._native_hud_right.setStyleSheet(_NATIVE_CAMERA_RAIL_QSS)
         self._native_hud_right_layout = QVBoxLayout(self._native_hud_right)
-        self._native_hud_right_layout.setContentsMargins(8, 7, 12, 8)
+        self._native_hud_right_layout.setContentsMargins(8, 7, 16, 8)
         self._native_hud_right_layout.setSpacing(_CAM_RAIL_LAYOUT_SPACING)
 
         self._camera_top_row = QFrame(self._native_hud_right)
@@ -1424,7 +1432,7 @@ class MapWidget(QWidget):
             _cam_rail_inline_row("OBSERVE", observe_body)
         )
 
-        self._native_hud_right.setMinimumWidth(_NATIVE_CAM_RAIL_MIN_WIDTH_PX)
+        self._native_hud_right.setMinimumWidth(_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX)
         self._native_hud_right.hide()
         self._native_rail_layer.hide()
 
@@ -2593,27 +2601,39 @@ class MapWidget(QWidget):
             panel_y = int(_NATIVE_CAM_RAIL_TOP_PX)
             bottom_margin = 12
             available_h = max(120, h - panel_y - bottom_margin)
-            rail.setMinimumWidth(_NATIVE_CAM_RAIL_MIN_WIDTH_PX)
+            rail.setMinimumWidth(_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX)
             rl = rail.layout()
             if rl is not None:
                 rl.activate()
             rail.updateGeometry()
-            panel_w = max(
-                _NATIVE_CAM_RAIL_MIN_WIDTH_PX,
+            gimbal_pad_w = (
+                58
+                + 8
+                + 3 * _CAM_RAIL_PAD_BTN_W
+                + 2 * _CAM_RAIL_GIMBAL_GRID_GAP
+                + 8  # pad border / grid padding
+            )
+            rail_margins_h = 8 + 16
+            content_w = max(
+                _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX,
                 int(rail.sizeHint().width()),
                 int(rail.minimumSizeHint().width()),
+                gimbal_pad_w + rail_margins_h,
             )
+            inl, intop, inr, inb = _CAM_RAIL_LAYER_INSET
+            panel_w = content_w + inl + inr
             panel_x = max(0, w - panel_w - 18)  # git `#cameraRail { right: 18px }`
-            rail.setFixedWidth(panel_w)
+            rail.setFixedWidth(content_w)
             need_h = max(120, int(rail.sizeHint().height()))
             # Never shrink below content height (that clips LENS / gimbal buttons). Shift up instead.
-            panel_h = need_h
+            content_h = need_h
+            panel_h = content_h + intop + inb
             if panel_y + panel_h > h - bottom_margin:
                 panel_y = max(0, h - bottom_margin - panel_h)
             if ly is not None:
                 pt = self._map_canvas.mapTo(self._panel, QPoint(panel_x, panel_y))
                 ly.setGeometry(pt.x(), pt.y(), panel_w, panel_h)
-            rail.setGeometry(0, 0, panel_w, panel_h)
+            rail.setGeometry(inl, intop, content_w, content_h)
             # Git `#mapFooterHud { right: 10px; bottom: 2px }` — compass stays bottom-right of the
             # map even when `#cameraRail` is shown after MAVLink connect (rail is top-right; z-order
             # keeps HUD above the map tiles, not shoved left).

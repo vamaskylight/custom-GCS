@@ -71,7 +71,8 @@ class CamRailGimbalPad(QWidget):
 
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         lay = QGridLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
+        # Right padding keeps 1px borders inside the widget (avoids → / 90° clip).
+        lay.setContentsMargins(0, 0, 4, 2)
         lay.setHorizontalSpacing(int(grid_gap))
         lay.setVerticalSpacing(int(grid_gap))
         cols = max((len(row) for row in buttons), default=0)
@@ -79,9 +80,25 @@ class CamRailGimbalPad(QWidget):
         for row, row_btns in enumerate(buttons):
             for col, btn in enumerate(row_btns):
                 lay.addWidget(btn, row, col, Qt.AlignmentFlag.AlignCenter)
-        pad_w = int(cols) * int(btn_width) + max(0, int(cols) - 1) * int(grid_gap)
-        pad_h = int(btn_height) * rows + int(grid_gap) * max(0, rows - 1)
-        self.setFixedSize(max(1, pad_w), max(1, pad_h))
+        lay.activate()
+        # Explicit size from button geometry + padding — layout minimumSize can be too small.
+        pad_w = (
+            int(cols) * int(btn_width)
+            + max(0, int(cols) - 1) * int(grid_gap)
+            + lay.contentsMargins().left()
+            + lay.contentsMargins().right()
+        )
+        pad_h = (
+            int(rows) * int(btn_height)
+            + max(0, int(rows) - 1) * int(grid_gap)
+            + lay.contentsMargins().top()
+            + lay.contentsMargins().bottom()
+        )
+        sh = lay.sizeHint()
+        self.setFixedSize(
+            max(pad_w, sh.width()),
+            max(pad_h, sh.height()),
+        )
 
 
 class CamObserveBlock(QWidget):
