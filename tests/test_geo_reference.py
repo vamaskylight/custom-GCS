@@ -89,19 +89,26 @@ def test_rangefinder_agl_fallback():
     assert r.method in ("ray_ground_rangefinder_agl", "ray_ground_flat", "ray_ground_dem")
 
 
-def test_insufficient_without_gimbal():
+def test_assumed_gimbal_low_video_click():
+    """Skydroid TOP UDP missing: still place a near HIT from click + low AGL."""
     r = compute_geo_reference(
-        vehicle_lat=37.0,
-        vehicle_lon=-122.0,
-        vehicle_heading_deg=0.0,
-        vehicle_rel_alt_m=100.0,
+        vehicle_lat=20.4458,
+        vehicle_lon=72.8630,
+        vehicle_heading_deg=45.0,
+        vehicle_rel_alt_m=0.6,
         gimbal_yaw_deg=None,
         gimbal_pitch_deg=None,
-        video_x_norm=0.5,
-        video_y_norm=0.5,
+        video_x_norm=0.2,
+        video_y_norm=0.75,
+        gps_fix_type=3,
+        gps_hdop=1.0,
     )
-    assert not r.ok
-    assert r.quality == "insufficient"
+    assert r.target_lat is not None
+    assert r.target_lon is not None
+    assert r.horizontal_range_m is not None
+    assert r.horizontal_range_m < 25.0
+    warn = (r.warning or "").lower()
+    assert "assumed" in warn or "estimated" in warn
 
 
 def test_horizon_ray_fails():

@@ -170,6 +170,9 @@ def resolve_vehicle_agl_m(
         return rf_use, "rangefinder_down"
     if rel is not None and rel > 0.05:
         return max(rel, 0.5), "ekf_relative_low"
+    # Bench / disarmed: EKF rel alt often reads 0.0 — still allow a low geo ray.
+    if rel is not None and rel >= 0.0:
+        return 0.5, "ekf_bench_assumed"
     return None, ""
 
 
