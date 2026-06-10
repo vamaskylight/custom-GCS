@@ -13,6 +13,9 @@ from vgcs.observe.dooaf import (
     apply_map_pick_to_settings,
     build_dooaf_session,
     compute_fire_correction,
+    format_dooaf_html_summary,
+    format_gimbal_pitch_direction,
+    format_gimbal_yaw_direction,
     initial_bearing_deg,
     latlon_delta_to_ne_m,
     resolved_dooaf_settings,
@@ -166,3 +169,34 @@ def test_settings_from_edits_empty():
     )
     assert s.gun_lat is None
     assert s.target_lat is None
+
+
+def test_gimbal_direction_labels():
+    assert format_gimbal_yaw_direction(28.3) == "Yaw right 28.3°"
+    assert format_gimbal_yaw_direction(-5.0) == "Yaw left 5.0°"
+    assert format_gimbal_pitch_direction(-10.1) == "Pitch down 10.1°"
+    assert format_gimbal_pitch_direction(12.0) == "Pitch up 12.0°"
+
+
+def test_dooaf_html_summary_highlights_and_camera():
+    gun = GeoPoint(12.0, 77.0)
+    intended = GeoPoint(12.01, 77.0)
+    impact = GeoPoint(12.01, 77.001)
+    session = build_dooaf_session(
+        [
+            _row(DOOAF_ROLE_GUN, gun.lat, gun.lon),
+            _row(DOOAF_ROLE_INTENDED, intended.lat, intended.lon),
+            _row(DOOAF_ROLE_IMPACT, impact.lat, impact.lon),
+        ],
+    )
+    obs = {
+        "gimbal_yaw_deg": 28.28,
+        "gimbal_pitch_deg": -10.07,
+        "dooaf_role": DOOAF_ROLE_IMPACT,
+    }
+    html = format_dooaf_html_summary(session, observation_row=obs)
+    assert "dooaf-fire-corr" in html
+    assert "dooaf-target-coords" in html
+    assert "dooaf-impact-coords" in html
+    assert "Yaw right 28.3°" in html
+    assert "Pitch down 10.1°" in html

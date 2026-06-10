@@ -77,6 +77,10 @@ from vgcs.observe.dooaf import (
     dooaf_intended_impact_video_segment,
     format_dooaf_html_summary,
     format_dooaf_status,
+    format_gimbal_pitch_direction,
+    format_gimbal_yaw_direction,
+    latest_mark_row,
+    observation_report_html_head,
     latest_mark,
     DooafSettings,
     apply_map_pick_to_settings,
@@ -870,6 +874,8 @@ class _ObservationExportTask(QRunnable):
             "vehicle_rel_alt_m",
             "gimbal_yaw_deg",
             "gimbal_pitch_deg",
+            "gimbal_yaw_direction",
+            "gimbal_pitch_direction",
             "gps_fix_type",
             "gps_satellites",
             "gps_hdop",
@@ -902,11 +908,28 @@ class _ObservationExportTask(QRunnable):
         export_rows: list[dict[str, object]] = []
         for row in self._rows:
             out = dict(row)
+            yaw = out.get("gimbal_yaw_deg")
+            pitch = out.get("gimbal_pitch_deg")
+            try:
+                out["gimbal_yaw_direction"] = format_gimbal_yaw_direction(
+                    float(yaw) if yaw is not None else None
+                )
+            except (TypeError, ValueError):
+                out["gimbal_yaw_direction"] = "N/A"
+            try:
+                out["gimbal_pitch_direction"] = format_gimbal_pitch_direction(
+                    float(pitch) if pitch is not None else None
+                )
+            except (TypeError, ValueError):
+                out["gimbal_pitch_direction"] = "N/A"
             if corr is not None:
                 out["dooaf_range_correction_m"] = corr.range_correction_m
                 out["dooaf_deflection_correction_m"] = corr.deflection_correction_m
                 out["dooaf_miss_m"] = corr.impact_to_intended_m
             export_rows.append(out)
+        obs_row = latest_mark_row(self._rows, DOOAF_ROLE_IMPACT)
+        if obs_row is None and self._rows:
+            obs_row = self._rows[-1]
         ok = False
         summary = ""
         try:
@@ -917,6 +940,9 @@ class _ObservationExportTask(QRunnable):
                     w.writerow({k: row.get(k) for k in fields})
             html_rows = []
             for idx, row in enumerate(export_rows, start=1):
+                is_impact = str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
+                tgt_lat_cls = " class='dooaf-impact-coords'" if is_impact else ""
+                tgt_lon_cls = tgt_lat_cls
                 html_rows.append(
                     "<tr>"
                     f"<td>{idx}</td>"
@@ -925,13 +951,15 @@ class _ObservationExportTask(QRunnable):
                     f"<td>{row.get('dooaf_role','')}</td>"
                     f"<td>{row.get('map_lat','')}</td>"
                     f"<td>{row.get('map_lon','')}</td>"
-                    f"<td>{self._obs_cell_fn(row.get('target_lat'))}</td>"
-                    f"<td>{self._obs_cell_fn(row.get('target_lon'))}</td>"
+                    f"<td{tgt_lat_cls}>{self._obs_cell_fn(row.get('target_lat'))}</td>"
+                    f"<td{tgt_lon_cls}>{self._obs_cell_fn(row.get('target_lon'))}</td>"
                     f"<td>{row.get('geo_quality','')}</td>"
                     f"<td>{row.get('vehicle_lat','')}</td>"
                     f"<td>{row.get('vehicle_lon','')}</td>"
                     f"<td>{self._obs_cell_fn(row.get('gimbal_yaw_deg'))}</td>"
                     f"<td>{self._obs_cell_fn(row.get('gimbal_pitch_deg'))}</td>"
+                    f"<td>{row.get('gimbal_yaw_direction','')}</td>"
+                    f"<td>{row.get('gimbal_pitch_direction','')}</td>"
                     f"<td>{row.get('video_x_norm','')}</td>"
                     f"<td>{row.get('video_y_norm','')}</td>"
                     f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
@@ -946,17 +974,14 @@ class _ObservationExportTask(QRunnable):
                     "</tr>"
                 )
             html = (
-                "<!doctype html><html><head><meta charset='utf-8'/>"
-                "<title>Observation Summary</title>"
-                "<style>body{font-family:Segoe UI,Arial,sans-serif;padding:20px;} table{border-collapse:collapse;width:100%;}"
-                "th,td{border:1px solid #ccc;padding:6px;font-size:12px;} th{background:#f3f6fb;text-align:left;}</style>"
-                "</head><body>"
-                f"<h2>Observation Report ({len(self._rows)} entries)</h2>"
-                + format_dooaf_html_summary(session)
+                observation_report_html_head()
+                + f"<h2>Observation Report ({len(self._rows)} entries)</h2>"
+                + format_dooaf_html_summary(session, observation_row=obs_row)
                 + "<table><thead><tr>"
                 "<th>#</th><th>UTC Time</th><th>Kind</th><th>DOOAF role</th><th>Map Lat</th><th>Map Lon</th>"
                 "<th>Target Lat</th><th>Target Lon</th><th>Geo Quality</th>"
-                "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
+                "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw (°)</th><th>Gimbal Pitch (°)</th>"
+                "<th>Yaw direction</th><th>Pitch direction</th>"
                 "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
                 "<th>Target Sep (m)</th>"
                 "<th>GPS Fix</th><th>GPS Sats</th><th>HDOP</th><th>Geo Warning</th>"
