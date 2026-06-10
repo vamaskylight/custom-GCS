@@ -2550,6 +2550,19 @@ class MapWidget(QWidget):
             ov = getattr(self, "_native_video_overlay", None)
             if ov is not None and ov.isVisible():
                 ov.raise_()
+            # Target ON: video must stay above HUD so PiP / fullscreen clicks reach the preview.
+            if bool(getattr(self, "_obs_mark_mode", False)) and preview_on:
+                pv = getattr(self, "_native_video_preview", None)
+                if pv is not None and pv.isVisible():
+                    pv.raise_()
+                    if ov is not None and ov.isVisible():
+                        ov.raise_()
+                if swapped:
+                    wrap = getattr(self, "_native_minimap_wrap", None)
+                    if wrap is not None and wrap.isVisible():
+                        wrap.raise_()
+                        self._btn_native_minimap_plus.raise_()
+                        self._btn_native_minimap_minus.raise_()
         except Exception:
             pass
 
@@ -6162,6 +6175,10 @@ class MapWidget(QWidget):
                 "Target ON: mark fall of shot on video "
                 "(set gun + target in DOOAF Setup first)"
             )
+            try:
+                self._raise_flight_hud_above_video()
+            except Exception:
+                pass
         else:
             self._set_status("Observation mark mode OFF")
 
@@ -6246,6 +6263,26 @@ class MapWidget(QWidget):
         return resolved_dooaf_settings(
             self._dooaf_settings_store(), self._observations
         )
+
+    def _ensure_dooaf_impact_visible_on_map(self, row: dict[str, object]) -> None:
+        """Pan the map toward a new fall-of-shot when geo placed it off-screen."""
+        lat = row.get("target_lat")
+        lon = row.get("target_lon")
+        if lat is None or lon is None:
+            return
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is None or not hasattr(nm, "set_center"):
+                return
+            la = float(lat)
+            lo = float(lon)
+            cla = float(getattr(nm, "_center_lat", la))
+            clo = float(getattr(nm, "_center_lon", lo))
+            dist = haversine_m(cla, clo, la, lo)
+            if dist > 120.0:
+                nm.set_center(la, lo)
+        except Exception:
+            pass
 
     def _refresh_dooaf_map_overlay(self) -> None:
         s = self._resolved_dooaf_settings()
@@ -6358,17 +6395,25 @@ class MapWidget(QWidget):
                 nm.clear_observation_marks()
             if nm is not None:
                 for row in self._observations:
-                    if str(row.get("kind") or "") != "map_mark":
-                        continue
-                    la = row.get("map_lat")
-                    lo = row.get("map_lon")
-                    if la is None or lo is None:
-                        continue
-                    if hasattr(nm, "add_observation_map_marker"):
-                        nm.add_observation_map_marker(float(la), float(lo))
+                    kind = str(row.get("kind") or "")
+                    if kind == "map_mark":
+                        la = row.get("map_lat")
+                        lo = row.get("map_lon")
+                        if la is None or lo is None:
+                            continue
+                        if hasattr(nm, "add_observation_map_marker"):
+                            nm.add_observation_map_marker(float(la), float(lo))
+                    elif kind == "video_mark":
+                        la = row.get("target_lat")
+                        lo = row.get("target_lon")
+                        if la is None or lo is None:
+                            continue
+                        if hasattr(nm, "add_geo_referenced_marker"):
+                            nm.add_geo_referenced_marker(float(la), float(lo))
         except Exception:
             pass
         self._refresh_observation_measure_overlays()
+        self._refresh_dooaf_map_overlay()
 
     def _sync_dooaf_settings_from_dialog(
         self,
@@ -6536,14 +6581,16 @@ class MapWidget(QWidget):
             row["geo_range_m"] = None
             row["geo_bearing_deg"] = None
             row["geo_depression_deg"] = None
-        if not geo.ok:
+        if row.get("target_lat") is None or row.get("target_lon") is None:
             row["target_lat"] = None
             row["target_lon"] = None
-        if geo.ok and geo.target_lat is not None and geo.target_lon is not None:
+        elif row.get("target_lat") is not None and row.get("target_lon") is not None:
             try:
                 nm = getattr(self, "_native_map", None)
                 if nm is not None and hasattr(nm, "add_geo_referenced_marker"):
-                    nm.add_geo_referenced_marker(float(geo.target_lat), float(geo.target_lon))
+                    nm.add_geo_referenced_marker(
+                        float(row["target_lat"]), float(row["target_lon"])
+                    )
             except Exception:
                 pass
 
@@ -6729,9 +6776,13 @@ class MapWidget(QWidget):
             elif kind == "video_mark":
                 warn = str(row.get("geo_warning") or "geo insufficient")
                 msg += f" — {warn}"
+                if dooaf_role == DOOAF_ROLE_IMPACT and row.get("target_lat") is None:
+                    msg += " — no HIT on map (click ground in lower video, not sky/horizon)"
         self._set_status(msg)
         self._refresh_observation_measure_overlays()
         self._refresh_dooaf_map_overlay()
+        if dooaf_role == DOOAF_ROLE_IMPACT:
+            self._ensure_dooaf_impact_visible_on_map(row)
 
         # Native OBSERVE -> Target needs a visible marker on the Qt map.
         if kind == "map_mark" and map_lat is not None and map_lon is not None:

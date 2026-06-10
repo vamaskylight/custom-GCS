@@ -752,13 +752,12 @@ class NativeTileMapView(QWidget):
         self.update()
 
     def clear_observation_marks(self) -> None:
-        """Clear all visible OBSERVE -> Target markers."""
+        """Clear OBSERVE map/video markers (not DOOAF gun/target/HIT overlay)."""
         try:
             self._observation_marks.clear()
             self._geo_referenced_marks.clear()
             self._target_track.clear()
             self._target_track_labels.clear()
-            self._dooaf_impact = None
         except Exception:
             pass
         self.update()
