@@ -6220,6 +6220,9 @@ class MapWidget(QWidget):
                     gimbal_pitch = 0.0
         except Exception:
             pass
+        if gimbal_yaw is None and gimbal_pitch is None:
+            gimbal_yaw = 0.0
+            gimbal_pitch = 0.0
         v_lat = self._lat
         v_lon = self._lon
         if v_lat is None or v_lon is None:
@@ -6323,6 +6326,15 @@ class MapWidget(QWidget):
             nm = getattr(self, "_native_map", None)
             if nm is not None and hasattr(nm, "set_dooaf_overlay"):
                 nm.set_dooaf_overlay(gun=gun, intended=intended, impact=impact)
+                try:
+                    nm.update()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if bool(getattr(self, "_video_swapped", False)):
+                QTimer.singleShot(0, self._update_native_minimap)
         except Exception:
             pass
 

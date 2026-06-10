@@ -184,8 +184,17 @@ def compute_geo_reference(
     long_range = is_long_range_video_click(
         video_y_norm, rangefinder_down_m, vehicle_rel_alt_m
     )
-    if gimbal_yaw_deg is None or gimbal_pitch_deg is None:
-        return GeoReferenceResult(ok=False, warning="gimbal yaw/pitch missing", method="none")
+    gimbal_assumed = False
+    if gimbal_yaw_deg is None and gimbal_pitch_deg is None:
+        gimbal_yaw_deg = 0.0
+        gimbal_pitch_deg = 0.0
+        gimbal_assumed = True
+    elif gimbal_yaw_deg is None:
+        gimbal_yaw_deg = 0.0
+        gimbal_assumed = True
+    elif gimbal_pitch_deg is None:
+        gimbal_pitch_deg = 0.0
+        gimbal_assumed = True
 
     hfov = max(5.0, min(120.0, float(camera_hfov_deg)))
     vfov = float(camera_vfov_deg) if camera_vfov_deg is not None else hfov * 0.5625
@@ -210,6 +219,16 @@ def compute_geo_reference(
         and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0)
     ):
         g_pitch_deg = -35.0
+        pitch_assumed = True
+    # No gimbal UDP / MAVLink mount: infer downward look from click when low and oblique.
+    if (
+        gimbal_assumed
+        and not long_range
+        and float(agl_m) < 3.0
+        and float(video_y_norm) > 0.55
+    ):
+        el_click = (float(video_y_norm) - 0.5) * vfov
+        g_pitch_deg = -min(55.0, max(12.0, el_click + 18.0))
         pitch_assumed = True
     g_pitch = _deg2rad(g_pitch_deg)
 
@@ -326,12 +345,15 @@ def compute_geo_reference(
     quality, warn = _quality_label(
         gps_fix_type=int(gps_fix_type or 0),
         gps_hdop=gps_hdop,
-        has_gimbal=True,
+        has_gimbal=not gimbal_assumed or pitch_assumed,
         depression_deg=depression,
         range_m=range_m,
     )
+    if gimbal_assumed and not pitch_assumed:
+        extra = "gimbal attitude assumed level (0°, 0°)"
+        warn = f"{warn}; {extra}" if warn else extra
     if pitch_assumed:
-        extra = "gimbal pitch assumed -35° (sensor read ~0°)"
+        extra = "gimbal pitch estimated from video click (sensor missing or ~0°)"
         warn = f"{warn}; {extra}" if warn else extra
     ok = quality != "insufficient"
     return GeoReferenceResult(
