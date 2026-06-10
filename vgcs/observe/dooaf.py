@@ -418,6 +418,71 @@ def format_fire_correction(corr: FireCorrection) -> str:
     )
 
 
+def format_gimbal_yaw_direction(yaw_deg: float | None) -> str:
+    """Human label for gimbal yaw (+ right, − left)."""
+    if yaw_deg is None:
+        return "N/A"
+    y = float(yaw_deg)
+    if abs(y) < 0.05:
+        return "Yaw centre (0°)"
+    if y > 0:
+        return f"Yaw right {abs(y):.1f}°"
+    return f"Yaw left {abs(y):.1f}°"
+
+
+def format_gimbal_pitch_direction(pitch_deg: float | None) -> str:
+    """Human label for gimbal pitch (+ up, − down)."""
+    if pitch_deg is None:
+        return "N/A"
+    p = float(pitch_deg)
+    if abs(p) < 0.05:
+        return "Pitch level (0°)"
+    if p > 0:
+        return f"Pitch up {abs(p):.1f}°"
+    return f"Pitch down {abs(p):.1f}°"
+
+
+def observation_report_html_style() -> str:
+    return (
+        "body{font-family:Segoe UI,Arial,sans-serif;padding:20px;}"
+        "table{border-collapse:collapse;width:100%;margin-bottom:14px;}"
+        "th,td{border:1px solid #ccc;padding:6px;font-size:12px;}"
+        "th{background:#f3f6fb;text-align:left;}"
+        "h3{margin:16px 0 8px 0;font-size:15px;}"
+        ".dooaf-fire-corr th,.dooaf-fire-corr td{color:#b71c1c;font-weight:600;"
+        "background:#ffebee;}"
+        ".dooaf-fire-corr h3{color:#b71c1c;}"
+        ".dooaf-target-coords td{color:#0d47a1;font-weight:600;background:#e3f2fd;}"
+        ".dooaf-impact-coords td{color:#1b5e20;font-weight:600;background:#e8f5e9;}"
+        ".dooaf-camera td:last-child{font-weight:600;}"
+    )
+
+
+def observation_report_html_head(title: str = "Observation Summary") -> str:
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'/>"
+        f"<title>{title}</title>"
+        f"<style>{observation_report_html_style()}</style>"
+        "</head><body>"
+    )
+
+
+def format_camera_orientation_html(row: dict[str, Any] | None) -> str:
+    if row is None:
+        return ""
+    yaw = _float_or_none(row.get("gimbal_yaw_deg"))
+    pitch = _float_or_none(row.get("gimbal_pitch_deg"))
+    yaw_raw = f"{yaw:.2f}°" if yaw is not None else "N/A"
+    pitch_raw = f"{pitch:.2f}°" if pitch is not None else "N/A"
+    return (
+        "<h3>Camera / gimbal at observation</h3>"
+        "<table class='dooaf-camera'><tbody>"
+        f"<tr><td>Gimbal yaw</td><td>{yaw_raw} — {format_gimbal_yaw_direction(yaw)}</td></tr>"
+        f"<tr><td>Gimbal pitch</td><td>{pitch_raw} — {format_gimbal_pitch_direction(pitch)}</td></tr>"
+        "</tbody></table>"
+    )
+
+
 def format_dooaf_status(session: DooafSession) -> str:
     parts: list[str] = []
     if session.gun is not None:
@@ -433,13 +498,24 @@ def format_dooaf_status(session: DooafSession) -> str:
     return "DOOAF: " + "; ".join(parts)
 
 
-def format_dooaf_html_summary(session: DooafSession) -> str:
-    def _pt(label: str, pt: GeoPoint | None) -> str:
+def format_dooaf_html_summary(
+    session: DooafSession,
+    *,
+    observation_row: dict[str, Any] | None = None,
+) -> str:
+    def _pt(
+        label: str,
+        pt: GeoPoint | None,
+        *,
+        row_class: str = "",
+    ) -> str:
         if pt is None:
-            return f"<tr><td>{label}</td><td colspan='2'>—</td></tr>"
+            cls = f" class='{row_class}'" if row_class else ""
+            return f"<tr{cls}><td>{label}</td><td colspan='2'>—</td></tr>"
         alt = f", alt {pt.alt_m:.1f} m" if pt.alt_m is not None else ""
+        cls = f" class='{row_class}'" if row_class else ""
         return (
-            f"<tr><td>{label}</td>"
+            f"<tr{cls}><td>{label}</td>"
             f"<td>{pt.lat:.7f}</td><td>{pt.lon:.7f}{alt}</td></tr>"
         )
 
@@ -447,7 +523,9 @@ def format_dooaf_html_summary(session: DooafSession) -> str:
     c = session.correction
     if c is not None:
         corr_rows = (
-            "<h3>Fire correction</h3><table>"
+            "<div class='dooaf-fire-corr'>"
+            "<h3>Fire correction</h3>"
+            "<table>"
             f"<tr><td>Range correction (add)</td><td>{c.range_correction_m:+.1f} m</td></tr>"
             f"<tr><td>Deflection correction (add, R+)</td><td>{c.deflection_correction_m:+.1f} m</td></tr>"
             f"<tr><td>Miss along line</td><td>{c.miss_along_m:+.1f} m</td></tr>"
@@ -456,17 +534,28 @@ def format_dooaf_html_summary(session: DooafSession) -> str:
             f"<tr><td>Miss north / east</td><td>{c.miss_north_m:+.1f} / {c.miss_east_m:+.1f} m</td></tr>"
             f"<tr><td>Gun → target range</td><td>{c.range_gun_to_intended_m:.1f} m</td></tr>"
             f"<tr><td>Gun → impact range</td><td>{c.range_gun_to_impact_m:.1f} m</td></tr>"
-            f"<tr><td>Gun → target bearing</td><td>{c.bearing_gun_to_intended_deg:.1f}°</td></tr>"
-            "</table>"
+            f"<tr><td>Gun → target bearing</td><td>{c.bearing_gun_to_intended_deg:.1f}° "
+            "(compass from gun to target, not gimbal)</td></tr>"
+            "</table></div>"
         )
+    obs_row = observation_row or None
     return (
         "<h3>DOOAF session</h3>"
         "<table><thead><tr><th>Variable</th><th>Lat</th><th>Lon</th></tr></thead><tbody>"
         + _pt(dooaf_role_display(DOOAF_ROLE_GUN), session.gun)
-        + _pt(dooaf_role_display(DOOAF_ROLE_INTENDED), session.intended)
+        + _pt(
+            dooaf_role_display(DOOAF_ROLE_INTENDED),
+            session.intended,
+            row_class="dooaf-target-coords",
+        )
         + _pt("Drone (last obs)", session.drone)
-        + _pt(dooaf_role_display(DOOAF_ROLE_IMPACT), session.impact)
+        + _pt(
+            dooaf_role_display(DOOAF_ROLE_IMPACT),
+            session.impact,
+            row_class="dooaf-impact-coords",
+        )
         + "</tbody></table>"
+        + format_camera_orientation_html(obs_row)
         + corr_rows
     )
 
