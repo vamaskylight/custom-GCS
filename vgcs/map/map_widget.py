@@ -1970,6 +1970,18 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _observation_mark_active(self) -> bool:
+        """Target ON — video/minimap clicks mark fall of shot; never toggle map/video swap."""
+        if bool(getattr(self, "_obs_mark_mode", False)):
+            return True
+        try:
+            btn = getattr(self, "_btn_native_target", None)
+            if btn is not None and btn.isChecked():
+                return True
+        except Exception:
+            pass
+        return False
+
     def _on_native_video_click(self, event) -> None:
         try:
             if event is not None and hasattr(event, "button"):
@@ -1978,8 +1990,10 @@ class MapWidget(QWidget):
                     return
         except Exception:
             pass
-        if bool(getattr(self, "_obs_mark_mode", False)):
+        if self._observation_mark_active():
             try:
+                if event is not None:
+                    event.accept()
                 pos = event.position()
                 xn, yn = self._native_video_click_norm(pos)
                 self._log_observation("video_mark", video_x=xn, video_y=yn)
@@ -2253,7 +2267,7 @@ class MapWidget(QWidget):
         if not bool(getattr(self, "_video_swapped", False)):
             return
         # Target mode: click minimap to mark on map (do not swap layout).
-        if bool(getattr(self, "_obs_mark_mode", False)):
+        if self._observation_mark_active():
             try:
                 latlon = self._minimap_click_to_lat_lon(QPointF(event.position()))
                 if latlon is not None:
@@ -2433,6 +2447,11 @@ class MapWidget(QWidget):
                     "border-radius: 0px;"
                     "}"
                 )
+                # PiP placeholder text must not persist when stretched to fullscreen.
+                try:
+                    self._native_video_preview.setText("")
+                except Exception:
+                    pass
             else:
                 px, py, pw, ph = self._mini_video_pip_rect(cw, ch)
                 if self._native_video_last.isNull():
@@ -2475,6 +2494,7 @@ class MapWidget(QWidget):
             # Reposition HUD (minimap vs PiP) after video geometry is known.
             self._layout_native_hud()
             if bool(getattr(self, "_video_swapped", False)):
+                # Fullscreen: camera rail must stay above video (never hide under obs marks).
                 self._ensure_video_pro_hud_visible()
             else:
                 self._raise_flight_hud_above_video()
@@ -2550,19 +2570,14 @@ class MapWidget(QWidget):
             ov = getattr(self, "_native_video_overlay", None)
             if ov is not None and ov.isVisible():
                 ov.raise_()
-            # Target ON: video must stay above HUD so PiP / fullscreen clicks reach the preview.
-            if bool(getattr(self, "_obs_mark_mode", False)) and preview_on:
+            # Target ON (map-main PiP only): lift video above the map so PiP clicks reach the preview.
+            # Fullscreen swap keeps the camera rail above video — do not raise video over the rail.
+            if self._observation_mark_active() and preview_on and not swapped:
                 pv = getattr(self, "_native_video_preview", None)
                 if pv is not None and pv.isVisible():
                     pv.raise_()
                     if ov is not None and ov.isVisible():
                         ov.raise_()
-                if swapped:
-                    wrap = getattr(self, "_native_minimap_wrap", None)
-                    if wrap is not None and wrap.isVisible():
-                        wrap.raise_()
-                        self._btn_native_minimap_plus.raise_()
-                        self._btn_native_minimap_minus.raise_()
         except Exception:
             pass
 
@@ -6134,7 +6149,8 @@ class MapWidget(QWidget):
                 pass
 
     def _set_observation_mark_mode(self, enabled: bool) -> None:
-        self._obs_mark_mode = bool(enabled)
+        enabled = bool(enabled)
+        self._obs_mark_mode = enabled
         try:
             nm = getattr(self, "_native_map", None)
             if nm is not None:
@@ -6176,7 +6192,10 @@ class MapWidget(QWidget):
                 "(set gun + target in DOOAF Setup first)"
             )
             try:
-                self._raise_flight_hud_above_video()
+                if bool(getattr(self, "_video_swapped", False)):
+                    self._ensure_video_pro_hud_visible()
+                else:
+                    self._raise_flight_hud_above_video()
             except Exception:
                 pass
         else:
@@ -6822,6 +6841,8 @@ class MapWidget(QWidget):
         self,
     ) -> tuple[list[str], list[tuple[float, float, float, float, str]]]:
         """Map labels (one per track edge) and video measure lines (same-height pairs only)."""
+        if self._current_observe_dooaf_role() == DOOAF_ROLE_IMPACT:
+            return [], []
         labels: list[str] = []
         segs: list[tuple[float, float, float, float, str]] = []
         hfov, _ = self._m8_geo_settings()
@@ -6872,12 +6893,14 @@ class MapWidget(QWidget):
         return labels, segs
 
     def _observation_video_measure_segments(self) -> list[tuple[float, float, float, float, str]]:
-        """Dashed lines: facade tape widths, or intended→impact for DOOAF."""
+        """Dashed lines: DOOAF intended→impact, or facade tape widths (legacy measure)."""
+        dooaf_seg = dooaf_intended_impact_video_segment(self._observations)
+        if self._current_observe_dooaf_role() == DOOAF_ROLE_IMPACT:
+            return [dooaf_seg] if dooaf_seg is not None else []
         hfov, _ = self._m8_geo_settings()
         segs = list(
             observation_facade_video_segments(self._observations, hfov_deg=hfov)
         )
-        dooaf_seg = dooaf_intended_impact_video_segment(self._observations)
         if dooaf_seg is not None:
             segs.append(dooaf_seg)
         return segs
