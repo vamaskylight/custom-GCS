@@ -10,7 +10,22 @@
     /* Single scroll/compositor root; avoid promoted layers that confuse WebEngine on Windows. */
     #mapWrap { position: relative; overflow: hidden; z-index: 0; }
     #map2d, #map3d { position: absolute; inset: 0; }
-    #map3d { display: none; }
+    #map3d { display: none; z-index: 1; }
+    #map3d .cesium-widget,
+    #map3d .cesium-widget canvas {
+      pointer-events: auto !important;
+    }
+    #map3dMarkerCanvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none !important;
+      touch-action: none;
+      z-index: 2;
+      display: none;
+    }
     .leaflet-control-attribution {
       display: none !important;
     }
@@ -1618,6 +1633,7 @@
   <div id="mapWrap">
     <div id="map2d"></div>
     <div id="map3d"></div>
+    <canvas id="map3dMarkerCanvas" aria-hidden="true"></canvas>
     <div class="overlay" id="linkBanner">
       <img id="linkBannerLogo" src="__LOGO_SRC__" alt="Vama logo"/>
       <div id="linkBannerDisconnected">
@@ -2470,6 +2486,10 @@
     let viewer3d = null;
     let vehicleEntity = null;
     let headingEntity = null;
+    let __3dOverlayEntities = [];
+    let __3dWpEntities = [];
+    window.__vgcsObsMarkMode = false;
+    window.__pending3dOverlay = null;
     window.__lastVehLat = null;
     window.__lastVehLon = null;
     window.__is3d = false;
@@ -3222,44 +3242,104 @@
       renderPlanWpDetails();
     }
 
+    function __cesiumRangeToTarget(target) {
+      const DEFAULT = 1800;
+      const MAX = 50000;
+      const cam = viewer3d && viewer3d.camera;
+      if (!cam || !target || !window.Cesium) return DEFAULT;
+      try {
+        const d = Cesium.Cartesian3.distance(cam.position, target);
+        if (Number.isFinite(d) && d >= 250 && d <= MAX) return d;
+      } catch (e0) {}
+      try {
+        const h = cam.positionCartographic && cam.positionCartographic.height;
+        if (Number.isFinite(h) && h >= 250 && h <= MAX) return h;
+      } catch (e1) {}
+      return DEFAULT;
+    }
+
+    function __unlock3dCameraTransform() {
+      if (!viewer3d || !window.Cesium) return;
+      try { viewer3d.camera.lookAtTransform(Cesium.Matrix4.IDENTITY); } catch (e) {}
+    }
+
+    function __lookAtVehicleCenter(lat, lon, rangeOverride) {
+      if (!viewer3d || !window.Cesium) return 0;
+      const target = Cesium.Cartesian3.fromDegrees(Number(lon), Number(lat), 0);
+      const cam = viewer3d.camera;
+      let range = Number.isFinite(Number(rangeOverride))
+        ? Math.max(250, Math.min(50000, Number(rangeOverride)))
+        : __cesiumRangeToTarget(target);
+      const transform = Cesium.Transforms.eastNorthUpToFixedFrame(target);
+      cam.lookAtTransform(
+        transform,
+        new Cesium.HeadingPitchRange(cam.heading, cam.pitch, range)
+      );
+      __unlock3dCameraTransform();
+      try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+      try { if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint(); } catch (e2) {}
+      return 1;
+    }
+
+    function __nudgeCameraVehicleToScreenCenter(lat, lon) {
+      if (!viewer3d || !window.Cesium) return 0;
+      const scene = viewer3d.scene;
+      const canvas = viewer3d.canvas || (viewer3d.cesiumWidget && viewer3d.cesiumWidget.canvas);
+      if (!scene || !canvas) return 0;
+      const target = Cesium.Cartesian3.fromDegrees(Number(lon), Number(lat), 0);
+      let win = null;
+      try {
+        if (scene.cartesianToCanvasCoordinates) {
+          win = scene.cartesianToCanvasCoordinates(target);
+        }
+      } catch (e0) {}
+      if (!win) {
+        try {
+          if (Cesium.SceneTransforms.wgs84ToWindowCoordinates) {
+            win = Cesium.SceneTransforms.wgs84ToWindowCoordinates(scene, target);
+          }
+        } catch (e1) {}
+      }
+      if (!win || !Number.isFinite(win.x) || !Number.isFinite(win.y)) return 0;
+      let sx = Number(win.x);
+      let sy = Number(win.y);
+      if (canvas.clientWidth > 0 && canvas.width > canvas.clientWidth) {
+        sx *= canvas.clientWidth / canvas.width;
+        sy *= canvas.clientHeight / canvas.height;
+      }
+      const cx = canvas.clientWidth * 0.5;
+      const cy = canvas.clientHeight * 0.5;
+      const dx = sx - cx;
+      const dy = sy - cy;
+      if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return 1;
+      __pan3dCameraByScreenDelta(-dx, -dy, cx, cy);
+      return 1;
+    }
+
     function centerOnVehicle() {
       if (!vehicleMarker) return 0;
       const p = vehicleMarker.getLatLng();
       if (!p) return 0;
-      // 3D mode: SOFT follow — translate the camera by the vehicle's lon/lat delta and keep the
-      // user's current heading/pitch/range. We avoid `flyTo` here because it animates over ~0.6s
-      // and resets orientation every tick, which makes manual rotation impossible while the
-      // "Follow" toggle is on. We also pause entirely for AUTO_FOLLOW_USER_HOLD_MS after any
-      // real user input on the Cesium canvas so drags / wheel / touch aren't fought.
+      // 3D: center vehicle on screen without locking the camera (lookAt alone blocks pan).
       if (window.__is3d) {
         try {
           if (!viewer3d || !window.Cesium) return 0;
+          const forceSnap = (
+            window.__lastFollowVehLat == null || window.__lastFollowVehLon == null
+          );
           const holdMs = Number(window.__AUTO_FOLLOW_USER_HOLD_MS || 5000);
           const lastIn = Number(window.__vgcs3dUserInputMs || 0);
-          if (lastIn > 0 && (Date.now() - lastIn) < holdMs) return 0;
+          if (!forceSnap && lastIn > 0 && (Date.now() - lastIn) < holdMs) return 0;
 
-          if (window.__lastFollowVehLat == null || window.__lastFollowVehLon == null) {
-            window.__lastFollowVehLat = Number(p.lat);
-            window.__lastFollowVehLon = Number(p.lng);
-            return 0;
+          const lat = Number(p.lat);
+          const lon = Number(p.lng);
+          if (forceSnap) {
+            __lookAtVehicleCenter(lat, lon, 1800);
+          } else if (!__nudgeCameraVehicleToScreenCenter(lat, lon)) {
+            __lookAtVehicleCenter(lat, lon);
           }
-          const dLatDeg = Number(p.lat) - Number(window.__lastFollowVehLat);
-          const dLonDeg = Number(p.lng) - Number(window.__lastFollowVehLon);
-          window.__lastFollowVehLat = Number(p.lat);
-          window.__lastFollowVehLon = Number(p.lng);
-          if (Math.abs(dLatDeg) < 1e-7 && Math.abs(dLonDeg) < 1e-7) return 0;
-
-          const cam = viewer3d.camera;
-          const cur = cam.positionCartographic;
-          if (!cur) return 0;
-          const TO_RAD = Math.PI / 180;
-          const newLatRad = cur.latitude + (dLatDeg * TO_RAD);
-          const newLonRad = cur.longitude + (dLonDeg * TO_RAD);
-          cam.setView({
-            destination: Cesium.Cartesian3.fromRadians(newLonRad, newLatRad, cur.height),
-            orientation: { heading: cam.heading, pitch: cam.pitch, roll: cam.roll }
-          });
-          try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+          window.__lastFollowVehLat = lat;
+          window.__lastFollowVehLon = lon;
           return 1;
         } catch (e) {}
         return 0;
@@ -3367,8 +3447,743 @@
     // Run once at startup (safe if orbit items don't exist).
     preferTelemetryStrip();
 
+    function vgcsVehicleIconDataUrl() {
+      try {
+        const c = document.createElement('canvas');
+        c.width = 30;
+        c.height = 30;
+        const ctx = c.getContext('2d');
+        if (!ctx) return '';
+        ctx.translate(15, 15);
+        ctx.scale(0.53571429, 0.53571429);
+        ctx.beginPath();
+        ctx.moveTo(0, -28);
+        ctx.lineTo(-12, 15);
+        ctx.quadraticCurveTo(0, 5, 12, 15);
+        ctx.closePath();
+        ctx.fillStyle = '#f02c34';
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.fill();
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(0, 1, 2.4, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        return c.toDataURL('image/png');
+      } catch (e) {
+        return '';
+      }
+    }
+
+    function ensure3dVehicleEntity(latArg, lonArg) {
+      if (!viewer3d || !window.Cesium) return null;
+      const seed = vehicleMarker ? vehicleMarker.getLatLng() : null;
+      const lat = Number(
+        latArg != null ? latArg :
+        (window.__lastVehLat != null ? window.__lastVehLat : (seed ? seed.lat : 24.7136))
+      );
+      const lon = Number(
+        lonArg != null ? lonArg :
+        (window.__lastVehLon != null ? window.__lastVehLon : (seed ? seed.lng : 46.6753))
+      );
+      if (vehicleEntity) return vehicleEntity;
+      const img = vgcsVehicleIconDataUrl();
+      if (!img) return null;
+      vehicleEntity = viewer3d.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(lon, lat, 30),
+        show: false,
+        billboard: {
+          image: img,
+          width: 30,
+          height: 30,
+          verticalOrigin: Cesium.VerticalOrigin.CENTER,
+          horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+          rotation: Cesium.Math.toRadians(-Number(window.__heading || 0)),
+          alignedAxis: Cesium.Cartesian3.UNIT_Z,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          scaleByDistance: new Cesium.NearFarScalar(250.0, 1.15, 4500.0, 0.55)
+        }
+      });
+      return vehicleEntity;
+    }
+
+    function __clear3dEntityList(list) {
+      if (!viewer3d || !list) return;
+      for (let i = 0; i < list.length; i++) {
+        try { viewer3d.entities.remove(list[i]); } catch (e) {}
+      }
+      list.length = 0;
+    }
+
+    function __add3dLabeledPoint(lat, lon, label, fillCss, outlineCss) {
+      if (!viewer3d || !window.Cesium) return null;
+      const ent = viewer3d.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(Number(lon), Number(lat), 8),
+        point: {
+          pixelSize: 12,
+          color: Cesium.Color.fromCssColorString(fillCss),
+          outlineColor: Cesium.Color.fromCssColorString(outlineCss || '#ffffff'),
+          outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        },
+        label: {
+          text: String(label || ''),
+          font: 'bold 11px Segoe UI, sans-serif',
+          fillColor: Cesium.Color.fromCssColorString('#f0f5ff'),
+          showBackground: true,
+          backgroundColor: Cesium.Color.fromCssColorString('rgba(0,0,0,0.82)'),
+          backgroundPadding: new Cesium.Cartesian2(6, 4),
+          pixelOffset: new Cesium.Cartesian2(0, -20),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        }
+      });
+      __3dOverlayEntities.push(ent);
+      return ent;
+    }
+
+    function __add3dObsMark(lat, lon, cssFill, cssOutline) {
+      if (!viewer3d || !window.Cesium) return null;
+      const ent = viewer3d.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(Number(lon), Number(lat), 6),
+        point: {
+          pixelSize: 10,
+          color: Cesium.Color.fromCssColorString(cssFill),
+          outlineColor: Cesium.Color.fromCssColorString(cssOutline),
+          outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        }
+      });
+      __3dOverlayEntities.push(ent);
+      return ent;
+    }
+
+    function sync3dWaypoints(points) {
+      if (!window.__is3d || !viewer3d || !window.Cesium) return 0;
+      __clear3dEntityList(__3dWpEntities);
+      const rows = Array.isArray(points) ? points : [];
+      for (let i = 0; i < rows.length; i++) {
+        const p = rows[i];
+        if (!p || p.length < 2) continue;
+        const lat = Number(p[0]);
+        const lon = Number(p[1]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        const ent = viewer3d.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(lon, lat, 8),
+          point: {
+            pixelSize: 14,
+            color: Cesium.Color.fromCssColorString('rgba(40,130,255,0.92)'),
+            outlineColor: Cesium.Color.WHITE,
+            outlineWidth: 2,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY
+          },
+          label: {
+            text: String(i + 1),
+            font: 'bold 11px Segoe UI, sans-serif',
+            fillColor: Cesium.Color.WHITE,
+            showBackground: false,
+            pixelOffset: new Cesium.Cartesian2(0, -1),
+            disableDepthTestDistance: Number.POSITIVE_INFINITY
+          }
+        });
+        __3dWpEntities.push(ent);
+      }
+      try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+      return __3dWpEntities.length;
+    }
+
+    function sync3dMapOverlays(payload) {
+      window.__vgcs3dOverlayData = payload || {};
+      if (!window.__is3d) {
+        window.__pending3dOverlay = payload || null;
+        return 0;
+      }
+      window.__pending3dOverlay = null;
+      try { if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint(); } catch (e0) {}
+      try { if (viewer3d && viewer3d.scene) viewer3d.scene.requestRender(); } catch (e) {}
+      return 1;
+    }
+
+    function __cesiumLatLonToCanvasXY(lat, lon) {
+      if (!viewer3d || !window.Cesium) return null;
+      const scene = viewer3d.scene;
+      const canvas = viewer3d.canvas || (viewer3d.cesiumWidget && viewer3d.cesiumWidget.canvas);
+      const pos = Cesium.Cartesian3.fromDegrees(Number(lon), Number(lat), 2);
+      let win = null;
+      try {
+        if (scene.cartesianToCanvasCoordinates) {
+          win = scene.cartesianToCanvasCoordinates(pos);
+        }
+      } catch (e0) {}
+      if (!win) {
+        try {
+          if (Cesium.SceneTransforms.worldToWindowCoordinates) {
+            win = Cesium.SceneTransforms.worldToWindowCoordinates(scene, pos);
+          }
+        } catch (e1) {}
+      }
+      if (!win) {
+        try { win = Cesium.SceneTransforms.wgs84ToWindowCoordinates(scene, pos); } catch (e2) {}
+      }
+      if (!win || !Number.isFinite(win.x) || !Number.isFinite(win.y)) return null;
+      let x = Number(win.x);
+      let y = Number(win.y);
+      if (canvas && canvas.clientWidth > 0 && canvas.width > canvas.clientWidth) {
+        x *= canvas.clientWidth / canvas.width;
+        y *= canvas.clientHeight / canvas.height;
+      }
+      return { x: x, y: y };
+    }
+
+    let __3dMarkerPaintRaf = null;
+    window.__schedule3dMarkerPaint = function() {
+      if (__3dMarkerPaintRaf != null) return;
+      __3dMarkerPaintRaf = window.requestAnimationFrame(function() {
+        __3dMarkerPaintRaf = null;
+        try { paint3dMarkerCanvas(); } catch (e0) {}
+      });
+    };
+
+    function __size3dMarkerCanvas() {
+      const overlay = document.getElementById('map3dMarkerCanvas');
+      const cesiumCanvas = viewer3d && (
+        viewer3d.canvas || (viewer3d.cesiumWidget && viewer3d.cesiumWidget.canvas)
+      );
+      if (!overlay || !cesiumCanvas) return null;
+      const w = Math.max(1, cesiumCanvas.clientWidth || cesiumCanvas.width || 1);
+      const h = Math.max(1, cesiumCanvas.clientHeight || cesiumCanvas.height || 1);
+      const dpr = window.devicePixelRatio || 1;
+      overlay.style.width = w + 'px';
+      overlay.style.height = h + 'px';
+      const pw = Math.max(1, Math.round(w * dpr));
+      const ph = Math.max(1, Math.round(h * dpr));
+      if (overlay.width !== pw || overlay.height !== ph) {
+        overlay.width = pw;
+        overlay.height = ph;
+      }
+      return { ctx: overlay.getContext('2d'), w: w, h: h, dpr: dpr };
+    }
+
+    function __vehicleScreenHeadingDeg(headingDeg) {
+      let hd = Number(headingDeg) || 0;
+      if (window.__is3d && viewer3d && window.Cesium) {
+        try {
+          const camHd = Cesium.Math.toDegrees(Number(viewer3d.camera.heading) || 0);
+          hd = hd - camHd;
+        } catch (e0) {}
+      }
+      return hd;
+    }
+
+    function __draw3dVehicleArrow(ctx, x, y, headingDeg) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate((Number(headingDeg) || 0) * Math.PI / 180);
+      ctx.beginPath();
+      ctx.moveTo(0, -28);
+      ctx.lineTo(-12, 15);
+      ctx.quadraticCurveTo(0, 5, 12, 15);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(240, 44, 52, 1)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 1)';
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(0, 1, 2.4, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255, 255, 255, 1)';
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function __draw3dDooafMark(ctx, x, y, role) {
+      const styles = {
+        gun: { r: 9, fill: 'rgba(30, 70, 160, 0.9)', stroke: 'rgba(180, 210, 255, 0.94)', label: 'GUN' },
+        target: { r: 7, fill: 'rgba(40, 170, 80, 0.86)', stroke: 'rgba(180, 255, 200, 0.94)', label: 'TARGET' },
+        hit: { r: 7, fill: 'rgba(220, 90, 40, 0.86)', stroke: 'rgba(255, 200, 140, 0.94)', label: 'HIT' }
+      };
+      const st = styles[role] || styles.gun;
+      ctx.beginPath();
+      ctx.arc(x, y, st.r, 0, Math.PI * 2);
+      ctx.fillStyle = st.fill;
+      ctx.fill();
+      ctx.strokeStyle = st.stroke;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.font = 'bold 8px "Segoe UI", sans-serif';
+      const tw = ctx.measureText(st.label).width + 8;
+      const th = 14;
+      const tx = x - tw / 2;
+      const ty = y - st.r - th - 4;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.82)';
+      ctx.fillRect(tx, ty, tw, th);
+      ctx.fillStyle = 'rgba(240, 245, 255, 1)';
+      ctx.fillText(st.label, tx + 4, ty + 11);
+    }
+
+    function __draw3dObsMark(ctx, x, y, color) {
+      const cyan = color === 'cyan';
+      ctx.beginPath();
+      ctx.arc(x, y, cyan ? 6 : 5, 0, Math.PI * 2);
+      ctx.fillStyle = cyan ? 'rgba(40, 200, 255, 0.78)' : 'rgba(255, 210, 70, 0.82)';
+      ctx.fill();
+      ctx.strokeStyle = cyan ? 'rgba(60, 220, 255, 0.94)' : 'rgba(255, 210, 70, 0.9)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      const arm = cyan ? 12 : 10;
+      ctx.beginPath();
+      ctx.moveTo(x - arm, y);
+      ctx.lineTo(x + arm, y);
+      ctx.moveTo(x, y - arm);
+      ctx.lineTo(x, y + arm);
+      ctx.stroke();
+    }
+
+    function __draw3dLine(ctx, x0, y0, x1, y1, style, label) {
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      if (style === 'gun_target') {
+        ctx.strokeStyle = 'rgba(80, 140, 255, 0.9)';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([]);
+      } else if (style === 'gun_impact') {
+        ctx.strokeStyle = 'rgba(120, 200, 255, 0.82)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 6]);
+      } else {
+        ctx.strokeStyle = 'rgba(255, 120, 200, 0.86)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 6]);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (label) {
+        const mx = (x0 + x1) / 2;
+        const my = (y0 + y1) / 2;
+        ctx.font = 'bold 9px "Segoe UI", sans-serif';
+        const tw = ctx.measureText(label).width + 10;
+        const th = 16;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.82)';
+        ctx.fillRect(mx - tw / 2, my - th / 2, tw, th);
+        ctx.fillStyle = 'rgba(255, 200, 240, 1)';
+        ctx.fillText(label, mx - tw / 2 + 5, my + 4);
+      }
+    }
+
+    function paint3dMarkerCanvas() {
+      if (!window.__is3d || !viewer3d || !window.Cesium) return;
+      const sized = __size3dMarkerCanvas();
+      if (!sized || !sized.ctx) return;
+      const ctx = sized.ctx;
+      const w = sized.w;
+      const h = sized.h;
+      const dpr = sized.dpr;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, sized.ctx.canvas.width, sized.ctx.canvas.height);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const p = window.__vgcs3dOverlayData || {};
+      const dooaf = p.dooaf || {};
+
+      function lineLatLon(lat0, lon0, lat1, lon1, style, label) {
+        const a = __cesiumLatLonToCanvasXY(lat0, lon0);
+        const b = __cesiumLatLonToCanvasXY(lat1, lon1);
+        if (!a || !b) return;
+        __draw3dLine(ctx, a.x, a.y, b.x, b.y, style, label || '');
+      }
+
+      if (dooaf.gun && dooaf.intended && dooaf.gun.length >= 2 && dooaf.intended.length >= 2) {
+        lineLatLon(
+          dooaf.gun[0], dooaf.gun[1],
+          dooaf.intended[0], dooaf.intended[1],
+          'gun_target', ''
+        );
+      }
+      if (dooaf.gun && dooaf.impact && dooaf.gun.length >= 2 && dooaf.impact.length >= 2) {
+        lineLatLon(
+          dooaf.gun[0], dooaf.gun[1],
+          dooaf.impact[0], dooaf.impact[1],
+          'gun_impact', ''
+        );
+      }
+      const track = Array.isArray(p.targetTrack) ? p.targetTrack : [];
+      const labels = Array.isArray(p.targetLabels) ? p.targetLabels : [];
+      for (let ti = 1; ti < track.length; ti++) {
+        const lbl = labels[ti - 1];
+        if (!lbl) continue;
+        const a = track[ti - 1];
+        const b = track[ti];
+        if (!a || !b || a.length < 2 || b.length < 2) continue;
+        lineLatLon(a[0], a[1], b[0], b[1], 'target_track', String(lbl));
+      }
+
+      const obs = Array.isArray(p.obsMarks) ? p.obsMarks : [];
+      for (let i = 0; i < obs.length; i++) {
+        if (!obs[i] || obs[i].length < 2) continue;
+        const wpt = __cesiumLatLonToCanvasXY(obs[i][0], obs[i][1]);
+        if (wpt) __draw3dObsMark(ctx, wpt.x, wpt.y, 'yellow');
+      }
+      const geo = Array.isArray(p.geoMarks) ? p.geoMarks : [];
+      for (let j = 0; j < geo.length; j++) {
+        if (!geo[j] || geo[j].length < 2) continue;
+        const wpt = __cesiumLatLonToCanvasXY(geo[j][0], geo[j][1]);
+        if (wpt) __draw3dObsMark(ctx, wpt.x, wpt.y, 'cyan');
+      }
+      if (dooaf.gun && dooaf.gun.length >= 2) {
+        const wpt = __cesiumLatLonToCanvasXY(dooaf.gun[0], dooaf.gun[1]);
+        if (wpt) __draw3dDooafMark(ctx, wpt.x, wpt.y, 'gun');
+      }
+      if (dooaf.intended && dooaf.intended.length >= 2) {
+        const wpt = __cesiumLatLonToCanvasXY(dooaf.intended[0], dooaf.intended[1]);
+        if (wpt) __draw3dDooafMark(ctx, wpt.x, wpt.y, 'target');
+      }
+      if (dooaf.impact && dooaf.impact.length >= 2) {
+        const wpt = __cesiumLatLonToCanvasXY(dooaf.impact[0], dooaf.impact[1]);
+        if (wpt) __draw3dDooafMark(ctx, wpt.x, wpt.y, 'hit');
+      }
+      const wps = Array.isArray(p.waypoints) ? p.waypoints : [];
+      for (let wi = 0; wi < wps.length; wi++) {
+        if (!wps[wi] || wps[wi].length < 2) continue;
+        const wpt = __cesiumLatLonToCanvasXY(wps[wi][0], wps[wi][1]);
+        if (!wpt) continue;
+        ctx.beginPath();
+        ctx.arc(wpt.x, wpt.y, 7, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(40, 130, 255, 0.86)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 1)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.font = '10px "Segoe UI", sans-serif';
+        ctx.fillStyle = 'rgba(255, 255, 255, 1)';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(wi + 1), wpt.x, wpt.y);
+        ctx.textAlign = 'start';
+        ctx.textBaseline = 'alphabetic';
+      }
+
+      let vehLat = null;
+      let vehLon = null;
+      if (p.vehicle && p.vehicle.length >= 2) {
+        vehLat = p.vehicle[0];
+        vehLon = p.vehicle[1];
+      } else if (window.__lastVehLat != null && window.__lastVehLon != null) {
+        vehLat = window.__lastVehLat;
+        vehLon = window.__lastVehLon;
+      }
+      if (vehLat != null && vehLon != null) {
+        const wpt = __cesiumLatLonToCanvasXY(vehLat, vehLon);
+        if (wpt) {
+          const hd = __vehicleScreenHeadingDeg(
+            p.heading != null ? p.heading : (window.__heading || 0)
+          );
+          __draw3dVehicleArrow(ctx, wpt.x, wpt.y, hd);
+        }
+      }
+    }
+
+    function export3dOverlayScreenPositions() {
+      try {
+        if (!window.__is3d || !viewer3d || !window.Cesium) return '[]';
+        const out = [];
+        function push(kind, lat, lon, extra) {
+          const w = __cesiumLatLonToCanvasXY(lat, lon);
+          if (!w) return;
+          const item = { kind: kind, x: w.x, y: w.y, visible: true };
+          if (extra) {
+            for (const k in extra) item[k] = extra[k];
+          }
+          out.push(item);
+        }
+        const p = window.__vgcs3dOverlayData || {};
+        if (p.vehicle && p.vehicle.length >= 2) {
+          push('vehicle', p.vehicle[0], p.vehicle[1], {
+            heading: __vehicleScreenHeadingDeg(
+              Number(p.heading != null ? p.heading : (window.__heading || 0))
+            )
+          });
+        } else if (window.__lastVehLat != null && window.__lastVehLon != null) {
+          push('vehicle', window.__lastVehLat, window.__lastVehLon, {
+            heading: __vehicleScreenHeadingDeg(Number(window.__heading || 0))
+          });
+        }
+        const obs = Array.isArray(p.obsMarks) ? p.obsMarks : [];
+        for (let i = 0; i < obs.length; i++) {
+          if (obs[i] && obs[i].length >= 2) push('obs', obs[i][0], obs[i][1], { color: 'yellow' });
+        }
+        const geo = Array.isArray(p.geoMarks) ? p.geoMarks : [];
+        for (let j = 0; j < geo.length; j++) {
+          if (geo[j] && geo[j].length >= 2) push('obs', geo[j][0], geo[j][1], { color: 'cyan' });
+        }
+        function pushLineLatLon(lat0, lon0, lat1, lon1, style, label) {
+          const a = __cesiumLatLonToCanvasXY(lat0, lon0);
+          const b = __cesiumLatLonToCanvasXY(lat1, lon1);
+          if (!a || !b) return;
+          out.push({
+            kind: 'line',
+            x0: a.x, y0: a.y, x1: b.x, y1: b.y,
+            style: style,
+            label: label || '',
+            visible: true
+          });
+        }
+        const dooaf = p.dooaf || {};
+        if (dooaf.gun && dooaf.gun.length >= 2) {
+          push('dooaf', dooaf.gun[0], dooaf.gun[1], { role: 'gun' });
+        }
+        if (dooaf.intended && dooaf.intended.length >= 2) {
+          push('dooaf', dooaf.intended[0], dooaf.intended[1], { role: 'target' });
+        }
+        if (dooaf.impact && dooaf.impact.length >= 2) {
+          push('dooaf', dooaf.impact[0], dooaf.impact[1], { role: 'hit' });
+        }
+        if (dooaf.gun && dooaf.gun.length >= 2 && dooaf.intended && dooaf.intended.length >= 2) {
+          pushLineLatLon(
+            dooaf.gun[0], dooaf.gun[1],
+            dooaf.intended[0], dooaf.intended[1],
+            'gun_target', ''
+          );
+        }
+        if (dooaf.gun && dooaf.gun.length >= 2 && dooaf.impact && dooaf.impact.length >= 2) {
+          pushLineLatLon(
+            dooaf.gun[0], dooaf.gun[1],
+            dooaf.impact[0], dooaf.impact[1],
+            'gun_impact', ''
+          );
+        }
+        const track = Array.isArray(p.targetTrack) ? p.targetTrack : [];
+        const labels = Array.isArray(p.targetLabels) ? p.targetLabels : [];
+        for (let ti = 1; ti < track.length; ti++) {
+          const lbl = labels[ti - 1];
+          if (!lbl) continue;
+          const a = track[ti - 1];
+          const b = track[ti];
+          if (!a || !b || a.length < 2 || b.length < 2) continue;
+          pushLineLatLon(a[0], a[1], b[0], b[1], 'target_track', String(lbl));
+        }
+        const wps = Array.isArray(p.waypoints) ? p.waypoints : [];
+        for (let wi = 0; wi < wps.length; wi++) {
+          if (wps[wi] && wps[wi].length >= 2) {
+            push('waypoint', wps[wi][0], wps[wi][1], { index: wi + 1 });
+          }
+        }
+        return JSON.stringify(out);
+      } catch (e) {
+        return '[]';
+      }
+    }
+
+    function emit3dOverlayToHost() {
+      try {
+        const raw = export3dOverlayScreenPositions();
+        const b64 = btoa(unescape(encodeURIComponent(raw)));
+        document.title = 'VGCS_3D_OVERLAY:' + b64 + ':0';
+      } catch (e) {
+        try { document.title = 'VGCS_3D_OVERLAY:' + btoa('W10=') + ':0'; } catch (e2) {}
+      }
+    }
+
+    function __canvasCssToPickXY(canvas, cssX, cssY) {
+      let x = Number(cssX);
+      let y = Number(cssY);
+      if (canvas && canvas.clientWidth > 0 && canvas.width > canvas.clientWidth) {
+        x *= canvas.width / canvas.clientWidth;
+        y *= canvas.height / canvas.clientHeight;
+      }
+      return new Cesium.Cartesian2(x, y);
+    }
+
+    function __pan3dCameraByScreenDelta(dx, dy, anchorX, anchorY) {
+      if (!viewer3d || !window.Cesium) return 0;
+      const camera = viewer3d.camera;
+      const scene = viewer3d.scene;
+      const canvas = viewer3d.scene.canvas || viewer3d.canvas ||
+        (viewer3d.cesiumWidget && viewer3d.cesiumWidget.canvas);
+      if (!camera || !scene || !canvas) return 0;
+      const ellipsoid = scene.globe.ellipsoid;
+      const w = Math.max(1, canvas.clientWidth || canvas.width || 1);
+      const h = Math.max(1, canvas.clientHeight || canvas.height || 1);
+      const ax = Number.isFinite(Number(anchorX)) ? Number(anchorX) : (w * 0.5);
+      const ay = Number.isFinite(Number(anchorY)) ? Number(anchorY) : (h * 0.5);
+      const pick0 = __canvasCssToPickXY(canvas, ax, ay);
+      const pick1 = __canvasCssToPickXY(canvas, ax + dx, ay + dy);
+      const p0 = camera.pickEllipsoid(pick0, ellipsoid);
+      const p1 = camera.pickEllipsoid(pick1, ellipsoid);
+      if (p0 && p1) {
+        const offset = Cesium.Cartesian3.subtract(p0, p1, new Cesium.Cartesian3());
+        camera.position = Cesium.Cartesian3.add(camera.position, offset, new Cesium.Cartesian3());
+      } else {
+        let scale = 1.0;
+        try {
+          const carto = camera.positionCartographic;
+          if (carto && Number.isFinite(carto.height)) {
+            scale = Math.max(0.5, carto.height * 0.0012);
+          }
+        } catch (e0) {}
+        camera.moveRight(-dx * scale);
+        camera.moveUp(-dy * scale);
+      }
+      try { scene.requestRender && scene.requestRender(); } catch (e1) {}
+      try { if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint(); } catch (e2) {}
+      return 1;
+    }
+
+    function __apply3dCameraControls() {
+      if (!viewer3d || !window.Cesium) return;
+      __unlock3dCameraTransform();
+      try { viewer3d.trackedEntity = undefined; } catch (e0) {}
+      const ssc = viewer3d.scene && viewer3d.scene.screenSpaceCameraController;
+      if (!ssc) return;
+      ssc.enableCollisionDetection = false;
+      ssc.minimumZoomDistance = 250.0;
+      ssc.enableRotate = true;
+      ssc.enableTilt = true;
+      ssc.enableTranslate = false;
+      ssc.enableZoom = true;
+      ssc.enableLook = false;
+      ssc.inertiaSpin = 0.0;
+      ssc.inertiaTranslate = 0.0;
+      // Left-drag pan uses DOM handlers (__wire3dMapPanHandler). Right-drag rotates.
+      ssc.rotateEventTypes = [Cesium.CameraEventType.RIGHT_DRAG];
+      ssc.translateEventTypes = [];
+      ssc.tiltEventTypes = [
+        Cesium.CameraEventType.MIDDLE_DRAG,
+        Cesium.CameraEventType.PINCH
+      ];
+      ssc.zoomEventTypes = [
+        Cesium.CameraEventType.WHEEL,
+        Cesium.CameraEventType.PINCH
+      ];
+      ssc.lookEventTypes = [];
+    }
+
+    function __wire3dMapPanHandler() {
+      if (!viewer3d || !window.Cesium) return;
+      const canvas = viewer3d.scene.canvas || viewer3d.canvas ||
+        (viewer3d.cesiumWidget && viewer3d.cesiumWidget.canvas);
+      if (!canvas) return;
+      if (canvas.__vgcsDomPanWired) return;
+      canvas.__vgcsDomPanWired = true;
+
+      let dragging = false;
+      let lastX = 0;
+      let lastY = 0;
+
+      function cssXY(ev) {
+        const rect = canvas.getBoundingClientRect();
+        const rw = Math.max(1, rect.width);
+        const rh = Math.max(1, rect.height);
+        const sx = (canvas.clientWidth || rw) / rw;
+        const sy = (canvas.clientHeight || rh) / rh;
+        return {
+          x: (ev.clientX - rect.left) * sx,
+          y: (ev.clientY - rect.top) * sy
+        };
+      }
+
+      function onDown(ev) {
+        if (!window.__is3d) return;
+        if (ev.button !== 0) return;
+        dragging = true;
+        const p = cssXY(ev);
+        lastX = p.x;
+        lastY = p.y;
+        window.__vgcs3dUserInputMs = Date.now();
+        try { canvas.setPointerCapture(ev.pointerId); } catch (e0) {}
+        try { ev.preventDefault(); } catch (e1) {}
+        try { ev.stopImmediatePropagation(); } catch (e2) {}
+      }
+
+      function onMove(ev) {
+        if (!window.__is3d || !dragging) return;
+        if (ev.buttons !== undefined && (ev.buttons & 1) === 0) return;
+        const p = cssXY(ev);
+        const dx = p.x - lastX;
+        const dy = p.y - lastY;
+        if (Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01) {
+          __pan3dCameraByScreenDelta(dx, dy, lastX, lastY);
+          window.__vgcs3dUserInputMs = Date.now();
+        }
+        lastX = p.x;
+        lastY = p.y;
+        try { ev.preventDefault(); } catch (e3) {}
+        try { ev.stopImmediatePropagation(); } catch (e4) {}
+      }
+
+      function onUp(ev) {
+        if (ev.button !== 0 && ev.type !== 'pointercancel') return;
+        dragging = false;
+        try { canvas.releasePointerCapture(ev.pointerId); } catch (e5) {}
+      }
+
+      const opts = { capture: true, passive: false };
+      if (window.PointerEvent) {
+        canvas.addEventListener('pointerdown', onDown, opts);
+        canvas.addEventListener('pointermove', onMove, opts);
+        canvas.addEventListener('pointerup', onUp, opts);
+        canvas.addEventListener('pointercancel', onUp, opts);
+      } else {
+        canvas.addEventListener('mousedown', onDown, opts);
+        canvas.addEventListener('mousemove', onMove, opts);
+        window.addEventListener('mouseup', onUp, opts);
+      }
+    }
+
+    function setObservationMarkMode(on) {
+      window.__vgcsObsMarkMode = !!on;
+      return window.__vgcsObsMarkMode ? 1 : 0;
+    }
+
+    function __wire3dObservationPick() {
+      if (!viewer3d || !window.Cesium || viewer3d.__vgcsObsPickWired) return;
+      viewer3d.__vgcsObsPickWired = true;
+      const handler = new Cesium.ScreenSpaceEventHandler(viewer3d.scene.canvas);
+      handler.setInputAction(function(click) {
+        if (!window.__is3d || !window.__vgcsObsMarkMode) return;
+        let cartesian = viewer3d.camera.pickEllipsoid(
+          click.position, viewer3d.scene.globe.ellipsoid
+        );
+        if (!cartesian) {
+          try { cartesian = viewer3d.scene.pickPosition(click.position); } catch (e0) {}
+        }
+        if (!cartesian) return;
+        const carto = Cesium.Cartographic.fromCartesian(cartesian);
+        const lat = Cesium.Math.toDegrees(carto.latitude);
+        const lon = Cesium.Math.toDegrees(carto.longitude);
+        try {
+          document.title = 'VGCS_OBS_MAP_MARK:' + lat.toFixed(7) + ':' + lon.toFixed(7) + ':0';
+        } catch (e1) {}
+      }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    }
+
+    function __wire3dMarkerPaint() {
+      if (!viewer3d || viewer3d.__vgcsMarkerPaintWired) return;
+      viewer3d.__vgcsMarkerPaintWired = true;
+      try {
+        viewer3d.scene.postRender.addEventListener(function() {
+          if (!window.__is3d) return;
+          if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint();
+        });
+      } catch (e0) {}
+      try {
+        viewer3d.camera.changed.addEventListener(function() {
+          if (!window.__is3d) return;
+          if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint();
+        });
+      } catch (e1) {}
+    }
+
     function ensure3D() {
-      if (viewer3d) return true;
+      if (viewer3d) {
+        __apply3dCameraControls();
+        __wire3dMapPanHandler();
+        return true;
+      }
       if (!window.Cesium) return false;
       try {
         const cesiumCreditHost = document.createElement('div');
@@ -3382,7 +4197,7 @@
           geocoder: false,
           baseLayerPicker: false,
           homeButton: false,
-          sceneModePicker: true,
+          sceneModePicker: false,
           navigationHelpButton: false,
           fullscreenButton: false,
           infoBox: false,
@@ -3394,24 +4209,7 @@
         });
         // Make sure the vehicle marker stays visible on top of imagery/terrain.
         try { viewer3d.scene.globe.depthTestAgainstTerrain = false; } catch (e) {}
-        // Prevent excessive zoom-in (can cause ground/imagery artifacts in Qt WebEngine builds).
-        try {
-          const ssc = viewer3d.scene && viewer3d.scene.screenSpaceCameraController
-            ? viewer3d.scene.screenSpaceCameraController
-            : null;
-          if (ssc) {
-            ssc.minimumZoomDistance = 250.0;
-            // Collision + imagery can fight the camera in WebEngine; keep zoom floor, relax collision for orbit.
-            ssc.enableCollisionDetection = false;
-            try {
-              ssc.enableRotate = true;
-              ssc.enableTilt = true;
-              ssc.enableTranslate = true;
-              ssc.enableZoom = true;
-              ssc.enableLook = true;
-            } catch (eSsc0) {}
-          }
-        } catch (e) {}
+        __apply3dCameraControls();
         try {
           const cv = viewer3d.cesiumWidget && viewer3d.cesiumWidget.canvas;
           if (cv) {
@@ -3511,33 +4309,12 @@
             );
           } catch (e2) {}
         }
-        // Vehicle marker for 3D: use the same arrow/chevron SVG as 2D, as a Cesium billboard.
-        const seed = vehicleMarker ? vehicleMarker.getLatLng() : null;
-        const seedLat = (window.__lastVehLat != null ? window.__lastVehLat : (seed ? seed.lat : 24.7136));
-        const seedLon = (window.__lastVehLon != null ? window.__lastVehLon : (seed ? seed.lng : 46.6753));
-        // Convert inline SVG to a data URL for Cesium billboard rendering.
-        const __vehSvg = (typeof vehicleMarkerSvg === 'string' && vehicleMarkerSvg.length)
-          ? vehicleMarkerSvg
-          : VGCS_VEHICLE_MARKER_SVG;
-        const __vehSvgUrl = 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(__vehSvg);
-        vehicleEntity = viewer3d.entities.add({
-          // Use a small fixed height above ellipsoid to ensure visibility even when clamping fails.
-          position: Cesium.Cartesian3.fromDegrees(Number(seedLon) || 46.6753, Number(seedLat) || 24.7136, 30),
-          billboard: {
-            image: __vehSvgUrl,
-            width: 30,
-            height: 30,
-            verticalOrigin: Cesium.VerticalOrigin.CENTER,
-            horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
-            // Cesium billboard rotation around `alignedAxis` is CCW positive; vehicle heading is CW
-            // from geographic north (MAVLink convention). Negate to match the 2D Leaflet marker and
-            // the compass needle.
-            rotation: Cesium.Math.toRadians(-Number(window.__heading || 0)),
-            alignedAxis: Cesium.Cartesian3.UNIT_Z,
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
-            scaleByDistance: new Cesium.NearFarScalar(250.0, 1.15, 4500.0, 0.55)
+        // Vehicle icon in 3D is painted on map3dMarkerCanvas (same shape as 2D). Hide Cesium billboard.
+        try {
+          if (viewer3d && vehicleEntity) {
+            try { vehicleEntity.show = false; } catch (e) {}
           }
-        });
+        } catch (e) {}
         headingEntity = viewer3d.entities.add({
           polyline: {
             positions: [],
@@ -3545,6 +4322,9 @@
             material: Cesium.Color.fromCssColorString('#00000000')
           }
         });
+        __wire3dObservationPick();
+        __wire3dMapPanHandler();
+        __wire3dMarkerPaint();
         window.__3dHasInitialFocus = false;
         return true;
       } catch (e) {
@@ -3552,28 +4332,54 @@
       }
     }
 
+    function __resolveVehicleLatLon() {
+      if (window.__lastVehLat != null && window.__lastVehLon != null) {
+        const lat = Number(window.__lastVehLat);
+        const lon = Number(window.__lastVehLon);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat: lat, lon: lon };
+      }
+      const p = vehicleMarker ? vehicleMarker.getLatLng() : null;
+      if (p) {
+        const lat = Number(p.lat);
+        const lon = Number(p.lng);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat: lat, lon: lon };
+      }
+      return { lat: 24.7136, lon: 46.6753 };
+    }
+
+    function __relayoutMap3d() {
+      if (!window.__is3d || !viewer3d) return 0;
+      try {
+        if (typeof viewer3d.resize === 'function') viewer3d.resize();
+        else if (viewer3d.cesiumWidget && typeof viewer3d.cesiumWidget.resize === 'function') {
+          viewer3d.cesiumWidget.resize();
+        }
+      } catch (e0) {}
+      try {
+        if (viewer3d.scene && viewer3d.scene.requestRender) viewer3d.scene.requestRender();
+      } catch (e1) {}
+      return 1;
+    }
+    window.__relayoutMap3d = __relayoutMap3d;
+
+    function __snap3dCameraToVehicle(force) {
+      if (!viewer3d || !window.Cesium) return 0;
+      const o = __resolveVehicleLatLon();
+      if (!Number.isFinite(o.lat) || !Number.isFinite(o.lon)) return 0;
+      const ok = __lookAtVehicleCenter(o.lat, o.lon, 1800);
+      if (ok) {
+        window.__lastFollowVehLat = o.lat;
+        window.__lastFollowVehLon = o.lon;
+        window.__3dHasInitialFocus = true;
+      }
+      return ok;
+    }
+    window.__snap3dCameraToVehicle = __snap3dCameraToVehicle;
+
     function focus3DCamera(force) {
       if (!viewer3d || !window.Cesium) return 0;
       if (!force && window.__3dHasInitialFocus) return 0;
-      const p = vehicleMarker ? vehicleMarker.getLatLng() : null;
-      const lat = p ? Number(p.lat) : 24.7136;
-      const lon = p ? Number(p.lng) : 46.6753;
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return 0;
-      try {
-        viewer3d.camera.flyTo({
-          destination: Cesium.Cartesian3.fromDegrees(lon, lat, 1800),
-          orientation: {
-            heading: Cesium.Math.toRadians(Number(window.__heading || 0)),
-            pitch: Cesium.Math.toRadians(-35.0),
-            roll: 0.0
-          },
-          duration: 0.9
-        });
-        window.__3dHasInitialFocus = true;
-        return 1;
-      } catch (e) {
-        return 0;
-      }
+      return __snap3dCameraToVehicle(force);
     }
 
     function syncVehicleHeadingLine() {
@@ -3678,10 +4484,14 @@
       appendFlightTrack(lat, lon);
       updateHeadingLineGeometry(lat, lon, window.__heading || 0);
       updateMissionRoutePolyline();
-      if (vehicleEntity) {
-        // Cesium stores `entity.position` as a Property; in some Qt WebEngine builds,
-        // reassigning `entity.position = Cartesian3` doesn't reliably update the visual.
-        // Prefer `setValue()` when available.
+      if (window.__is3d) {
+        if (vehicleEntity) {
+          try { vehicleEntity.show = false; } catch (eHide) {}
+        }
+        try {
+          if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint();
+        } catch (ePaint) {}
+      } else if (vehicleEntity) {
         const p3 = Cesium.Cartesian3.fromDegrees(lon, lat, 30);
         try {
           if (vehicleEntity.position && typeof vehicleEntity.position.setValue === 'function') {
@@ -3735,6 +4545,11 @@
           if (inner) inner.style.transform = 'rotate(' + d + 'deg)';
         }
       } catch (e) {}
+      if (window.__is3d) {
+        try {
+          if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint();
+        } catch (e3d) {}
+      }
       __headingLastApplyMs = nowMs();
     }
 
@@ -3899,12 +4714,20 @@
       }
       updateMissionRoutePolyline();
       renderPlanWpDetails();
+      if (window.__is3d) {
+        sync3dWaypoints(points);
+      }
     }
 
     function getWaypointCount() { return waypoints.length; }
 
     function __vgcsRelayoutMap2d() {
       try {
+        if (window.__is3d) {
+          __relayoutMap3d();
+          if (typeof __snap3dCameraToVehicle === 'function') __snap3dCameraToVehicle(true);
+          return;
+        }
         var m2 = document.getElementById('map2d');
         var m3 = document.getElementById('map3d');
         if (m2) m2.style.display = 'block';
@@ -3924,30 +4747,62 @@
     window.__vgcsRelayoutMap2d = __vgcsRelayoutMap2d;
 
     function set3DEnabled(enabled) {
+      const markerCanvas = document.getElementById('map3dMarkerCanvas');
       if (enabled) {
         if (!ensure3D()) return false;
         document.getElementById('map2d').style.display = 'none';
         document.getElementById('map3d').style.display = 'block';
+        if (markerCanvas) {
+          markerCanvas.style.display = 'block';
+          markerCanvas.style.pointerEvents = 'none';
+        }
         window.__is3d = true;
         var _hdrBtn = document.getElementById('hdrMapModeBtn');
         if (_hdrBtn) _hdrBtn.textContent = '2D';
-        // Reset soft-follow baseline so the first follow tick after entering 3D doesn't translate
-        // the camera by a stale delta (and "pre-arm" the user-hold to give Cesium a clean first frame).
+        // Reset soft-follow baseline; do not block the initial snap with the user-input hold.
         window.__lastFollowVehLat = null;
         window.__lastFollowVehLon = null;
-        window.__vgcs3dUserInputMs = Date.now();
-        // Make sure the vehicle billboard is visible, but DO NOT use trackedEntity or auto-flyTo
-        // here: trackedEntity locks the camera to the entity and blocks the user from freely
-        // rotating / panning the globe (Cesium left-drag becomes a no-op while tracking).
+        window.__vgcs3dUserInputMs = 0;
+        window.__3dHasInitialFocus = false;
+        __unlock3dCameraTransform();
+        __apply3dCameraControls();
+        __wire3dMapPanHandler();
         try {
           if (viewer3d && vehicleEntity) {
-            try { vehicleEntity.show = true; } catch (e) {}
-            try { viewer3d.trackedEntity = undefined; } catch (e) {}
-            try { viewer3d.scene && viewer3d.scene.requestRender && viewer3d.scene.requestRender(); } catch (e) {}
+            try { vehicleEntity.show = false; } catch (e) {}
+            try { viewer3d.trackedEntity = undefined; } catch (e2) {}
           }
         } catch (e) {}
-        // One-shot focus on the drone (no continuous follow). After this the user is in full control.
-        focus3DCamera(true);
+        try {
+          sync3dMapOverlays(window.__pending3dOverlay || window.__vgcs3dOverlayData || null);
+          if (window.__lastVehLat != null && window.__lastVehLon != null) {
+            window.__3dHasInitialFocus = true;
+            setVehicle(Number(window.__lastVehLat), Number(window.__lastVehLon));
+            window.__3dHasInitialFocus = false;
+          }
+        } catch (eSync) {}
+        __relayoutMap3d();
+        __snap3dCameraToVehicle(true);
+        try {
+          if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint();
+        } catch (ePaint0) {}
+        // Cesium may still have a zero-size canvas on the first frame after display:block.
+        window.requestAnimationFrame(function() {
+          __relayoutMap3d();
+          __snap3dCameraToVehicle(true);
+          try {
+            if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint();
+          } catch (ePaint1) {}
+        });
+        window.requestAnimationFrame(function() {
+          window.requestAnimationFrame(function() {
+            __relayoutMap3d();
+            __snap3dCameraToVehicle(true);
+            try {
+              if (typeof __schedule3dMarkerPaint === 'function') __schedule3dMarkerPaint();
+            } catch (ePaint2) {}
+          });
+        });
         try {
           if (window.__vgcsEmit3dMapBearingHud) {
             window.requestAnimationFrame(function() {
@@ -3959,10 +4814,16 @@
       }
       document.getElementById('map3d').style.display = 'none';
       document.getElementById('map2d').style.display = 'block';
+      if (markerCanvas) markerCanvas.style.display = 'none';
       window.__is3d = false;
+      __unlock3dCameraTransform();
       var _hdrBtn2 = document.getElementById('hdrMapModeBtn');
       if (_hdrBtn2) _hdrBtn2.textContent = '3D';
       return false;
+    }
+
+    function setVideoPreviewMode(mode) {
+      return 0;
     }
 
     map.on('click', function(e) {
