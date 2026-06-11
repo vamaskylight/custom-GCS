@@ -3649,14 +3649,17 @@ class MapWidget(QWidget):
         if vp is None:
             return
         if self._companion_decode_running(vp):
-            try:
-                print(
-                    f"[VGCS:video] decode already active ({reason}), "
-                    "skipping restart (ZR10 allows one RTSP client)"
-                )
-            except Exception:
-                pass
-            return
+            # Settings → Apply stops preview UI without stopping FFmpeg (avoids double teardown).
+            # If preview is off but decode is still running, we must re-wire the overlay — not skip.
+            if bool(getattr(self, "_video_preview_enabled", False)):
+                try:
+                    print(
+                        f"[VGCS:video] decode already active ({reason}), "
+                        "skipping restart (ZR10 allows one RTSP client)"
+                    )
+                except Exception:
+                    pass
+                return
         now = time.monotonic()
         last = float(getattr(self, "_companion_video_restart_mono", 0.0) or 0.0)
         if now - last < 8.0:
