@@ -111,6 +111,28 @@ def test_assumed_gimbal_low_video_click():
     assert "assumed" in warn or "estimated" in warn
 
 
+def test_c13_level_gimbal_reading_low_video_click():
+    """C13 reports 0,0 while oblique — same field log as bench/low EKF rel alt."""
+    r = compute_geo_reference(
+        vehicle_lat=20.4458136,
+        vehicle_lon=72.8632475,
+        vehicle_heading_deg=331.0,
+        vehicle_rel_alt_m=0.316,
+        gimbal_yaw_deg=0.0,
+        gimbal_pitch_deg=0.0,
+        video_x_norm=0.240041928721174,
+        video_y_norm=0.719017094017094,
+        gps_fix_type=3,
+        gps_hdop=1.24,
+    )
+    assert r.ok
+    assert r.target_lat is not None
+    assert r.target_lon is not None
+    assert r.horizontal_range_m is not None
+    assert r.horizontal_range_m < 25.0
+    assert "estimated" in (r.warning or "").lower()
+
+
 def test_horizon_ray_fails():
     r = compute_geo_reference(
         vehicle_lat=37.0,
