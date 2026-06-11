@@ -9,3 +9,6 @@ watchdog>=4,<7
 # M3 RTSP fallback decode (QtMultimedia may lack RTSP/H.264 support on Windows).
 # We use an FFmpeg subprocess (no compiler needed). Numpy is used for fast frame handling.
 numpy>=1.26,<3
+
+# M8 observation reports — lat/lon to NATO grid reference (MGRS).
+mgrs>=1.4,<2

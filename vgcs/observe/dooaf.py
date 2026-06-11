@@ -11,6 +11,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from vgcs.observe.grid_reference import format_grid_reference
 from vgcs.observe.target_measure import haversine_m, observation_target_latlon
 
 DOOAF_ROLE_SURVEY = "survey"
@@ -511,12 +512,14 @@ def format_dooaf_html_summary(
     ) -> str:
         if pt is None:
             cls = f" class='{row_class}'" if row_class else ""
-            return f"<tr{cls}><td>{label}</td><td colspan='2'>—</td></tr>"
+            return f"<tr{cls}><td>{label}</td><td colspan='3'>—</td></tr>"
         alt = f", alt {pt.alt_m:.1f} m" if pt.alt_m is not None else ""
+        gr = format_grid_reference(pt.lat, pt.lon) or "—"
         cls = f" class='{row_class}'" if row_class else ""
         return (
             f"<tr{cls}><td>{label}</td>"
-            f"<td>{pt.lat:.7f}</td><td>{pt.lon:.7f}{alt}</td></tr>"
+            f"<td>{pt.lat:.7f}</td><td>{pt.lon:.7f}</td>"
+            f"<td>{gr}{alt}</td></tr>"
         )
 
     corr_rows = ""
@@ -541,7 +544,8 @@ def format_dooaf_html_summary(
     obs_row = observation_row or None
     return (
         "<h3>DOOAF session</h3>"
-        "<table><thead><tr><th>Variable</th><th>Lat</th><th>Lon</th></tr></thead><tbody>"
+        "<table><thead><tr><th>Variable</th><th>Lat</th><th>Lon</th>"
+        "<th>Grid ref (MGRS)</th></tr></thead><tbody>"
         + _pt(dooaf_role_display(DOOAF_ROLE_GUN), session.gun)
         + _pt(
             dooaf_role_display(DOOAF_ROLE_INTENDED),
