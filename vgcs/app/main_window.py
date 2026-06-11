@@ -1894,9 +1894,11 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             pass
-        root = QHBoxLayout(dlg)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(12)
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+        content_row = QHBoxLayout()
+        content_row.setSpacing(12)
 
         nav = QListWidget()
         nav.setFixedWidth(190)
@@ -1904,10 +1906,11 @@ class MainWindow(QMainWindow):
         nav.addItem(QListWidgetItem("General"))
         nav.addItem(QListWidgetItem("Video"))
         nav.addItem(QListWidgetItem("Observation"))
-        root.addWidget(nav, 0)
+        content_row.addWidget(nav, 0)
 
         stack = QStackedWidget()
-        root.addWidget(stack, 1)
+        content_row.addWidget(stack, 1)
+        outer.addLayout(content_row, 1)
 
         # General page (keep as pointer to main UI, matching our app architecture).
         general = QWidget()
@@ -2155,14 +2158,6 @@ class MainWindow(QMainWindow):
         row3.addStretch(1)
         vb.addLayout(row3)
         vb.addStretch(1)
-
-        btn_row = QHBoxLayout()
-        btn_apply = QPushButton("Apply")
-        btn_close = QPushButton("Close")
-        btn_row.addStretch(1)
-        btn_row.addWidget(btn_apply)
-        btn_row.addWidget(btn_close)
-        v.addLayout(btn_row)
         stack.addWidget(video)
 
         observe = QWidget()
@@ -2211,11 +2206,15 @@ class MainWindow(QMainWindow):
         cam_group.setLayout(cg_ob)
         ob_l.addWidget(cam_group)
         ob_l.addStretch(1)
-
-        ob_btn_row = QHBoxLayout()
-        ob_btn_row.addStretch(1)
-        ob.addLayout(ob_btn_row)
         stack.addWidget(observe)
+
+        btn_row = QHBoxLayout()
+        btn_apply = QPushButton("Apply")
+        btn_close = QPushButton("Close")
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_apply)
+        btn_row.addWidget(btn_close)
+        outer.addLayout(btn_row)
 
         def _browse_dem_file() -> None:
             path, _ = QFileDialog.getOpenFileName(
