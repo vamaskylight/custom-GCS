@@ -6299,9 +6299,6 @@ class MapWidget(QWidget):
                     gimbal_pitch = 0.0
         except Exception:
             pass
-        if gimbal_yaw is None and gimbal_pitch is None:
-            gimbal_yaw = 0.0
-            gimbal_pitch = 0.0
         v_lat = self._lat
         v_lon = self._lon
         if v_lat is None or v_lon is None:
@@ -6738,14 +6735,28 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-    def _m8_geo_settings(self) -> tuple[float, str | None]:
+    def _m8_geo_settings(self) -> tuple[float, str | None, bool]:
         st = QSettings(_QS_NS, _QS_APP)
         try:
             hfov = float(st.value("observe/camera_hfov_deg", 62.0) or 62.0)
         except Exception:
             hfov = 62.0
-        dem = str(st.value("observe/dem_csv", "") or "").strip() or None
-        return hfov, dem
+        dem = (
+            str(st.value("observe/dem_path", "") or st.value("observe/dem_csv", "") or "")
+            .strip()
+            or None
+        )
+        raw_t = st.value("observe/dem_terrain_enabled", True)
+        if isinstance(raw_t, bool):
+            dem_terrain = raw_t
+        else:
+            dem_terrain = str(raw_t or "true").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        return hfov, dem, dem_terrain
 
     def _enrich_observation_geo_reference(self, row: dict[str, object]) -> None:
         """M8 — compute ground lat/lon for video marks; copy map coords for map marks."""
@@ -6764,7 +6775,7 @@ class MapWidget(QWidget):
             row["geo_quality"] = "insufficient"
             row["geo_warning"] = "video click missing"
             return
-        hfov, dem_path = self._m8_geo_settings()
+        hfov, dem_path, dem_terrain = self._m8_geo_settings()
         from vgcs.observe.target_measure import resolve_facade_ray_agl_m
 
         ray_agl, ray_src = resolve_facade_ray_agl_m(
@@ -6792,6 +6803,7 @@ class MapWidget(QWidget):
             gps_hdop=row.get("gps_hdop"),  # type: ignore[arg-type]
             camera_hfov_deg=hfov,
             dem_path=dem_path,
+            dem_terrain=dem_terrain,
         )
         row["target_lat"] = geo.target_lat
         row["target_lon"] = geo.target_lon

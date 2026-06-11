@@ -7,12 +7,17 @@ video click using a flat-earth ray–ground intersection (optional DEM offset).
 
 from __future__ import annotations
 
-import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from vgcs.observe.dem import (
+    DemElevationModel,
+    get_shared_dem_model,
+    load_dem_model,
+    ray_intersect_terrain_msl,
+)
 from vgcs.observe.target_measure import (
     is_long_range_video_click,
     is_plausible_ground_range,
@@ -109,36 +114,18 @@ def _quality_label(
     return "fair", "; ".join(warnings)
 
 
-class _DemLookup:
-    """Optional nearest-neighbour DEM samples from a simple CSV (lat, lon, elev_m)."""
-
-    def __init__(self, path: str | Path | None) -> None:
-        self._points: list[tuple[float, float, float]] = []
-        p = Path(path) if path else None
-        if p is None or not p.is_file():
-            return
-        try:
-            with p.open(newline="", encoding="utf-8") as f:
-                r = csv.DictReader(f)
-                for row in r:
-                    lat = float(row.get("lat") or row.get("latitude") or "")
-                    lon = float(row.get("lon") or row.get("longitude") or "")
-                    elev = float(row.get("elev_m") or row.get("elevation_m") or row.get("elev") or "")
-                    self._points.append((lat, lon, elev))
-        except Exception:
-            self._points.clear()
-
-    def elevation_m(self, lat: float, lon: float) -> float | None:
-        if not self._points:
-            return None
-        best = None
-        best_d = 1e30
-        for plat, plon, pelev in self._points:
-            d = (lat - plat) ** 2 + (lon - plon) ** 2
-            if d < best_d:
-                best_d = d
-                best = pelev
-        return best
+def _resolve_dem_lookup(
+    dem_path: str | Path | None,
+    dem_lookup: Callable[[float, float], float | None] | None,
+) -> DemElevationModel | None:
+    if dem_lookup is not None:
+        return DemElevationModel(kind="callback", path="", _fn=dem_lookup)
+    if dem_path is None or not str(dem_path).strip():
+        return None
+    model = get_shared_dem_model(dem_path)
+    if model is not None:
+        return model
+    return load_dem_model(dem_path)
 
 
 def compute_geo_reference(
@@ -161,6 +148,7 @@ def compute_geo_reference(
     camera_vfov_deg: float | None = None,
     dem_path: str | Path | None = None,
     dem_lookup: Callable[[float, float], float | None] | None = None,
+    dem_terrain: bool = True,
 ) -> GeoReferenceResult:
     """
     Estimate ground intersection for a normalized video click (0..1, top-left origin).
@@ -220,9 +208,10 @@ def compute_geo_reference(
     ):
         g_pitch_deg = -35.0
         pitch_assumed = True
-    # No gimbal UDP / MAVLink mount: infer downward look from click when low and oblique.
+    # Missing gimbal or C13/Skydroid ~0° while scene is oblique: infer look from click.
+    gimbal_pitch_unreliable = gimbal_assumed or abs(g_pitch_deg) < 15.0
     if (
-        gimbal_assumed
+        gimbal_pitch_unreliable
         and not long_range
         and float(agl_m) < 3.0
         and float(video_y_norm) > 0.55
@@ -272,26 +261,54 @@ def compute_geo_reference(
     method = "ray_ground_flat"
     if agl_src == "rangefinder_down":
         method = "ray_ground_rangefinder_agl"
-    lookup = dem_lookup
-    if lookup is None and dem_path:
-        dem = _DemLookup(dem_path)
-        if dem._points:
-            lookup = dem.elevation_m
+    dem_model = _resolve_dem_lookup(dem_path, dem_lookup)
+    lookup = dem_model.elevation_m if dem_model is not None else None
 
-    ground_z_ned = agl_m
-    if lookup is not None and vehicle_alt_msl_m is not None:
-        try:
-            elev = lookup(float(vehicle_lat), float(vehicle_lon))
-            if elev is not None:
-                ground_z_ned = max(0.5, float(vehicle_alt_msl_m) - float(elev))
-                method = "ray_ground_dem"
-        except Exception:
-            pass
+    mag = math.hypot(dir_ned[0], dir_ned[1], dir_ned[2])
+    dir_unit = (
+        (dir_ned[0] / mag, dir_ned[1] / mag, dir_ned[2] / mag) if mag > 1e-9 else dir_ned
+    )
 
-    t = ground_z_ned / dz
-    north_m = t * dir_ned[0]
-    east_m = t * dir_ned[1]
-    range_m = math.hypot(north_m, east_m)
+    north_m: float | None = None
+    east_m: float | None = None
+    range_m: float | None = None
+    tgt_alt: float | None = None
+    terrain_hit = False
+
+    if (
+        bool(dem_terrain)
+        and lookup is not None
+        and vehicle_alt_msl_m is not None
+    ):
+        hit = ray_intersect_terrain_msl(
+            vehicle_lat=float(vehicle_lat),
+            vehicle_lon=float(vehicle_lon),
+            vehicle_alt_msl_m=float(vehicle_alt_msl_m),
+            dir_ned=dir_unit,
+            elevation_m=lookup,
+            max_range_m=min(5000.0, max(80.0, float(agl_m) * 400.0)),
+            step_m=max(1.0, min(8.0, float(agl_m) / 4.0)),
+        )
+        if hit is not None:
+            north_m, east_m, range_m, tgt_alt = hit
+            terrain_hit = True
+            method = "ray_terrain_dem"
+
+    if not terrain_hit:
+        ground_z_ned = agl_m
+        if lookup is not None and vehicle_alt_msl_m is not None:
+            try:
+                elev = lookup(float(vehicle_lat), float(vehicle_lon))
+                if elev is not None:
+                    ground_z_ned = max(0.5, float(vehicle_alt_msl_m) - float(elev))
+                    method = "ray_ground_dem"
+            except Exception:
+                pass
+        t = ground_z_ned / dz
+        north_m = t * dir_ned[0]
+        east_m = t * dir_ned[1]
+        range_m = math.hypot(north_m, east_m)
+
     bearing = (math.degrees(math.atan2(east_m, north_m)) + 360.0) % 360.0
     depression = math.degrees(math.atan2(dz, math.hypot(dir_ned[0], dir_ned[1])))
 
@@ -333,8 +350,7 @@ def compute_geo_reference(
         )
 
     tgt_lat, tgt_lon = _offset_lat_lon(float(vehicle_lat), float(vehicle_lon), north_m, east_m)
-    tgt_alt: float | None = None
-    if lookup is not None:
+    if tgt_alt is None and lookup is not None:
         try:
             tgt_alt = lookup(tgt_lat, tgt_lon)
         except Exception:
@@ -354,6 +370,9 @@ def compute_geo_reference(
         warn = f"{warn}; {extra}" if warn else extra
     if pitch_assumed:
         extra = "gimbal pitch estimated from video click (sensor missing or ~0°)"
+        warn = f"{warn}; {extra}" if warn else extra
+    if terrain_hit and dem_model is not None:
+        extra = f"terrain DEM ({dem_model.kind})"
         warn = f"{warn}; {extra}" if warn else extra
     ok = quality != "insufficient"
     return GeoReferenceResult(

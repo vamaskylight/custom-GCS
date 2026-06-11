@@ -1903,6 +1903,7 @@ class MainWindow(QMainWindow):
         nav.setSpacing(2)
         nav.addItem(QListWidgetItem("General"))
         nav.addItem(QListWidgetItem("Video"))
+        nav.addItem(QListWidgetItem("Observation"))
         root.addWidget(nav, 0)
 
         stack = QStackedWidget()
@@ -2164,6 +2165,70 @@ class MainWindow(QMainWindow):
         v.addLayout(btn_row)
         stack.addWidget(video)
 
+        observe = QWidget()
+        ob = QVBoxLayout(observe)
+        ob.setContentsMargins(12, 12, 12, 12)
+        ob.setSpacing(10)
+        observe_scroll = QScrollArea()
+        observe_scroll.setWidgetResizable(True)
+        observe_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        ob.addWidget(observe_scroll, 1)
+        observe_body = QWidget()
+        observe_scroll.setWidget(observe_body)
+        ob_l = QVBoxLayout(observe_body)
+        ob_l.setContentsMargins(0, 0, 0, 0)
+        ob_l.setSpacing(10)
+
+        dem_group = QGroupBox("Digital elevation (M8 geo)")
+        dg = QGridLayout()
+        dem_enabled = QCheckBox("Use DEM terrain intersection (hilly ground)")
+        dem_enabled.setChecked(True)
+        dg.addWidget(dem_enabled, 0, 0, 1, 2)
+        dg.addWidget(QLabel("DEM file"), 1, 0)
+        dem_path_edit = QLineEdit()
+        dem_path_edit.setPlaceholderText("CSV, ESRI .asc, or GeoTIFF (.tif) — export from QGIS/SRTM")
+        dg.addWidget(dem_path_edit, 1, 1)
+        dem_browse = QPushButton("Browse…")
+        dg.addWidget(dem_browse, 2, 1, Qt.AlignmentFlag.AlignLeft)
+        dem_hint = QLabel(
+            "Improves video→map HIT on slopes. CSV columns: lat, lon, elev_m. "
+            "GeoTIFF needs pip install rasterio. Without DEM, flat-ground + drone height is used."
+        )
+        dem_hint.setWordWrap(True)
+        dem_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        dg.addWidget(dem_hint, 3, 0, 1, 2)
+        dem_group.setLayout(dg)
+        ob_l.addWidget(dem_group)
+
+        cam_group = QGroupBox("Camera geo")
+        cg_ob = QGridLayout()
+        cg_ob.addWidget(QLabel("Horizontal FOV (°)"), 0, 0)
+        observe_hfov = QDoubleSpinBox()
+        observe_hfov.setRange(20.0, 120.0)
+        observe_hfov.setValue(62.0)
+        observe_hfov.setDecimals(1)
+        cg_ob.addWidget(observe_hfov, 0, 1)
+        cam_group.setLayout(cg_ob)
+        ob_l.addWidget(cam_group)
+        ob_l.addStretch(1)
+
+        ob_btn_row = QHBoxLayout()
+        ob_btn_row.addStretch(1)
+        ob.addLayout(ob_btn_row)
+        stack.addWidget(observe)
+
+        def _browse_dem_file() -> None:
+            path, _ = QFileDialog.getOpenFileName(
+                dlg,
+                "Select DEM file",
+                str(dem_path_edit.text() or "").strip() or str(Path.home()),
+                "Elevation (*.csv *.asc *.tif *.tiff);;All files (*.*)",
+            )
+            if path:
+                dem_path_edit.setText(str(path))
+
+        dem_browse.clicked.connect(_browse_dem_file)
+
         def _on_nav_changed(idx: int) -> None:
             stack.setCurrentIndex(max(0, min(idx, stack.count() - 1)))
 
@@ -2218,6 +2283,20 @@ class MainWindow(QMainWindow):
         except Exception:
             siyi_timeout.setValue(250)
         _sync_camera_provider_ui()
+        dem_path_edit.setText(
+            str(
+                s.value("observe/dem_path", "") or s.value("observe/dem_csv", "") or ""
+            ).strip()
+        )
+        dem_enabled.setChecked(
+            _settings_truthy(s.value("observe/dem_terrain_enabled", True), default=True)
+        )
+        try:
+            observe_hfov.setValue(
+                float(s.value("observe/camera_hfov_deg", 62.0) or 62.0)
+            )
+        except Exception:
+            observe_hfov.setValue(62.0)
 
         def _apply() -> None:
             # Return immediately from the click handler so Windows gets a repainted frame.
@@ -2275,6 +2354,17 @@ class MainWindow(QMainWindow):
                 s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
                 s.setValue("camera/skydroid_gimbal_speed_yaw", float(skydroid_gimbal_speed_yaw.value()))
                 s.setValue("camera/skydroid_gimbal_speed_pitch", float(skydroid_gimbal_speed_yaw.value()))
+                dem_p = str(dem_path_edit.text()).strip()
+                s.setValue("observe/dem_path", dem_p)
+                s.setValue("observe/dem_csv", dem_p)
+                s.setValue("observe/dem_terrain_enabled", bool(dem_enabled.isChecked()))
+                s.setValue("observe/camera_hfov_deg", float(observe_hfov.value()))
+                try:
+                    from vgcs.observe.dem import clear_dem_cache
+
+                    clear_dem_cache()
+                except Exception:
+                    pass
                 dlg.accept()
                 # QDialog::accept() may process a nested event loop; a 0-ms timer can fire
                 # *during* that teardown and run FFmpeg/WebEngine work while the dialog is
