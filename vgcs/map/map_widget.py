@@ -92,6 +92,7 @@ from vgcs.observe.dooaf import (
     write_dooaf_settings,
 )
 from vgcs.observe.geo_reference import compute_geo_reference
+from vgcs.observe.grid_reference import format_grid_reference
 from vgcs.observe.target_measure import (
     band_width_partner_row,
     clear_tape_pair_override,
@@ -865,10 +866,12 @@ class _ObservationExportTask(QRunnable):
             "dooaf_role",
             "map_lat",
             "map_lon",
+            "map_grid_ref",
             "video_x_norm",
             "video_y_norm",
             "vehicle_lat",
             "vehicle_lon",
+            "vehicle_grid_ref",
             "vehicle_heading_deg",
             "vehicle_roll_deg",
             "vehicle_pitch_deg",
@@ -882,6 +885,7 @@ class _ObservationExportTask(QRunnable):
             "gps_hdop",
             "target_lat",
             "target_lon",
+            "target_grid_ref",
             "target_alt_m",
             "geo_quality",
             "geo_warning",
@@ -923,6 +927,15 @@ class _ObservationExportTask(QRunnable):
                 )
             except (TypeError, ValueError):
                 out["gimbal_pitch_direction"] = "N/A"
+            out["map_grid_ref"] = format_grid_reference(
+                out.get("map_lat"), out.get("map_lon")
+            )
+            out["vehicle_grid_ref"] = format_grid_reference(
+                out.get("vehicle_lat"), out.get("vehicle_lon")
+            )
+            out["target_grid_ref"] = format_grid_reference(
+                out.get("target_lat"), out.get("target_lon")
+            )
             if corr is not None:
                 out["dooaf_range_correction_m"] = corr.range_correction_m
                 out["dooaf_deflection_correction_m"] = corr.deflection_correction_m
@@ -952,11 +965,14 @@ class _ObservationExportTask(QRunnable):
                     f"<td>{row.get('dooaf_role','')}</td>"
                     f"<td>{row.get('map_lat','')}</td>"
                     f"<td>{row.get('map_lon','')}</td>"
+                    f"<td>{row.get('map_grid_ref','')}</td>"
                     f"<td{tgt_lat_cls}>{self._obs_cell_fn(row.get('target_lat'))}</td>"
                     f"<td{tgt_lon_cls}>{self._obs_cell_fn(row.get('target_lon'))}</td>"
+                    f"<td{tgt_lat_cls}>{row.get('target_grid_ref','')}</td>"
                     f"<td>{row.get('geo_quality','')}</td>"
                     f"<td>{row.get('vehicle_lat','')}</td>"
                     f"<td>{row.get('vehicle_lon','')}</td>"
+                    f"<td>{row.get('vehicle_grid_ref','')}</td>"
                     f"<td>{self._obs_cell_fn(row.get('gimbal_yaw_deg'))}</td>"
                     f"<td>{self._obs_cell_fn(row.get('gimbal_pitch_deg'))}</td>"
                     f"<td>{row.get('gimbal_yaw_direction','')}</td>"
@@ -980,8 +996,9 @@ class _ObservationExportTask(QRunnable):
                 + format_dooaf_html_summary(session, observation_row=obs_row)
                 + "<table><thead><tr>"
                 "<th>#</th><th>UTC Time</th><th>Kind</th><th>DOOAF role</th><th>Map Lat</th><th>Map Lon</th>"
-                "<th>Target Lat</th><th>Target Lon</th><th>Geo Quality</th>"
-                "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw (°)</th><th>Gimbal Pitch (°)</th>"
+                "<th>Map GR</th><th>Target Lat</th><th>Target Lon</th><th>Target GR</th><th>Geo Quality</th>"
+                "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Vehicle GR</th>"
+                "<th>Gimbal Yaw (°)</th><th>Gimbal Pitch (°)</th>"
                 "<th>Yaw direction</th><th>Pitch direction</th>"
                 "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
                 "<th>Target Sep (m)</th>"
@@ -7473,11 +7490,14 @@ class MapWidget(QWidget):
                 f"<td>{row.get('kind','')}</td>"
                 f"<td>{row.get('map_lat','')}</td>"
                 f"<td>{row.get('map_lon','')}</td>"
+                f"<td>{format_grid_reference(row.get('map_lat'), row.get('map_lon'))}</td>"
                 f"<td>{self._obs_cell(row.get('target_lat'))}</td>"
                 f"<td>{self._obs_cell(row.get('target_lon'))}</td>"
+                f"<td>{format_grid_reference(row.get('target_lat'), row.get('target_lon'))}</td>"
                 f"<td>{row.get('geo_quality','')}</td>"
                 f"<td>{row.get('vehicle_lat','')}</td>"
                 f"<td>{row.get('vehicle_lon','')}</td>"
+                f"<td>{format_grid_reference(row.get('vehicle_lat'), row.get('vehicle_lon'))}</td>"
                 f"<td>{self._obs_cell(row.get('gimbal_yaw_deg'))}</td>"
                 f"<td>{self._obs_cell(row.get('gimbal_pitch_deg'))}</td>"
                 f"<td>{row.get('video_x_norm','')}</td>"
@@ -7501,9 +7521,10 @@ class MapWidget(QWidget):
             "</head><body>"
             f"<h2>Observation Report ({len(self._observations)} entries)</h2>"
             "<table><thead><tr>"
-            "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th>"
-            "<th>Target Lat</th><th>Target Lon</th><th>Geo Quality</th>"
-            "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
+            "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th><th>Map GR</th>"
+            "<th>Target Lat</th><th>Target Lon</th><th>Target GR</th><th>Geo Quality</th>"
+            "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Vehicle GR</th>"
+            "<th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
             "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
             "<th>Target Sep (m)</th>"
             "<th>GPS Fix</th><th>GPS Sats</th><th>HDOP</th><th>Geo Warning</th>"
