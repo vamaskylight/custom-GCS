@@ -213,11 +213,19 @@ def compute_geo_reference(
     if (
         gimbal_pitch_unreliable
         and not long_range
-        and float(agl_m) < 3.0
         and float(video_y_norm) > 0.55
     ):
         el_click = (float(video_y_norm) - 0.5) * vfov
         g_pitch_deg = -min(55.0, max(12.0, el_click + 18.0))
+        pitch_assumed = True
+    elif (
+        gimbal_pitch_unreliable
+        and not long_range
+        and float(agl_m) < 25.0
+        and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0)
+    ):
+        # EKF-only AGL (no rangefinder): level gimbal read still needs downward look.
+        g_pitch_deg = -35.0
         pitch_assumed = True
     g_pitch = _deg2rad(g_pitch_deg)
 

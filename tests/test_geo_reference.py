@@ -53,8 +53,8 @@ def test_forward_oblique_increases_range():
     assert r.target_lat > 37.0
 
 
-def test_rejects_absurd_range_at_low_agl():
-    # Level gimbal + low click: flat-earth hit hundreds of metres away.
+def test_low_agl_level_gimbal_center_click_uses_estimated_pitch():
+    # Level gimbal at bench height: infer downward look instead of km-flat-earth hit.
     r = compute_geo_reference(
         vehicle_lat=20.4458,
         vehicle_lon=72.8630,
@@ -67,8 +67,10 @@ def test_rejects_absurd_range_at_low_agl():
         video_y_norm=0.48,
         gps_fix_type=3,
     )
-    assert not r.ok
-    assert "unrealistic" in (r.warning or "").lower()
+    assert r.ok
+    assert r.horizontal_range_m is not None
+    assert r.horizontal_range_m < 10.0
+    assert "estimated" in (r.warning or "").lower()
 
 
 def test_rangefinder_agl_fallback():
@@ -109,6 +111,28 @@ def test_assumed_gimbal_low_video_click():
     assert r.horizontal_range_m < 25.0
     warn = (r.warning or "").lower()
     assert "assumed" in warn or "estimated" in warn
+
+
+def test_ekf_5m_level_gimbal_low_video_click():
+    """Field case: ~5 m EKF rel alt, C13 0° pitch, click near bottom of frame."""
+    r = compute_geo_reference(
+        vehicle_lat=20.4458747,
+        vehicle_lon=72.8632482,
+        vehicle_heading_deg=331.0,
+        vehicle_rel_alt_m=5.065,
+        gimbal_yaw_deg=0.0,
+        gimbal_pitch_deg=0.0,
+        video_x_norm=0.23532494758909853,
+        video_y_norm=0.8728632478632479,
+        gps_fix_type=3,
+        gps_hdop=5.384,
+    )
+    assert r.target_lat is not None
+    assert r.target_lon is not None
+    assert r.horizontal_range_m is not None
+    assert r.horizontal_range_m < 80.0
+    warn = (r.warning or "").lower()
+    assert "estimated" in warn or "assumed" in warn or r.ok
 
 
 def test_c13_level_gimbal_reading_low_video_click():
