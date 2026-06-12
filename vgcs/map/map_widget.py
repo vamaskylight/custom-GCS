@@ -75,12 +75,13 @@ from vgcs.observe.dooaf import (
     DOOAF_ROLE_SURVEY,
     build_dooaf_session,
     dooaf_intended_impact_video_segment,
+    assemble_observation_report_html,
     format_dooaf_html_summary,
     format_dooaf_status,
     format_gimbal_pitch_direction,
     format_gimbal_yaw_direction,
+    format_observation_detailed_log_html,
     latest_mark_row,
-    observation_report_html_head,
     latest_mark,
     DooafSettings,
     apply_map_pick_to_settings,
@@ -892,8 +893,11 @@ class _ObservationExportTask(QRunnable):
             "geo_method",
             "geo_range_m",
             "geo_bearing_deg",
+            "geo_depression_deg",
             "segment_distance_m",
+            "measure_agl_m",
             "agl_source",
+            "geo_agl_source",
             "snapshot_path",
             "clip_path",
             "dooaf_range_correction_m",
@@ -952,61 +956,14 @@ class _ObservationExportTask(QRunnable):
                 w.writeheader()
                 for row in export_rows:
                     w.writerow({k: row.get(k) for k in fields})
-            html_rows = []
-            for idx, row in enumerate(export_rows, start=1):
-                is_impact = str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
-                tgt_lat_cls = " class='dooaf-impact-coords'" if is_impact else ""
-                tgt_lon_cls = tgt_lat_cls
-                html_rows.append(
-                    "<tr>"
-                    f"<td>{idx}</td>"
-                    f"<td>{row.get('timestamp_utc','')}</td>"
-                    f"<td>{row.get('kind','')}</td>"
-                    f"<td>{row.get('dooaf_role','')}</td>"
-                    f"<td>{row.get('map_lat','')}</td>"
-                    f"<td>{row.get('map_lon','')}</td>"
-                    f"<td>{row.get('map_grid_ref','')}</td>"
-                    f"<td{tgt_lat_cls}>{self._obs_cell_fn(row.get('target_lat'))}</td>"
-                    f"<td{tgt_lon_cls}>{self._obs_cell_fn(row.get('target_lon'))}</td>"
-                    f"<td{tgt_lat_cls}>{row.get('target_grid_ref','')}</td>"
-                    f"<td>{row.get('geo_quality','')}</td>"
-                    f"<td>{row.get('vehicle_lat','')}</td>"
-                    f"<td>{row.get('vehicle_lon','')}</td>"
-                    f"<td>{row.get('vehicle_grid_ref','')}</td>"
-                    f"<td>{self._obs_cell_fn(row.get('gimbal_yaw_deg'))}</td>"
-                    f"<td>{self._obs_cell_fn(row.get('gimbal_pitch_deg'))}</td>"
-                    f"<td>{row.get('gimbal_yaw_direction','')}</td>"
-                    f"<td>{row.get('gimbal_pitch_direction','')}</td>"
-                    f"<td>{row.get('video_x_norm','')}</td>"
-                    f"<td>{row.get('video_y_norm','')}</td>"
-                    f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
-                    f"<td>{row.get('geo_range_m','')}</td>"
-                    f"<td>{row.get('segment_distance_m','')}</td>"
-                    f"<td>{row.get('gps_fix_type','')}</td>"
-                    f"<td>{row.get('gps_satellites','')}</td>"
-                    f"<td>{row.get('gps_hdop','')}</td>"
-                    f"<td>{row.get('geo_warning','')}</td>"
-                    f"<td>{row.get('snapshot_path','')}</td>"
-                    f"<td>{row.get('clip_path','')}</td>"
-                    "</tr>"
-                )
-            html = (
-                observation_report_html_head()
-                + f"<h2>Observation Report ({len(self._rows)} entries)</h2>"
-                + format_dooaf_html_summary(session, observation_row=obs_row)
-                + "<table><thead><tr>"
-                "<th>#</th><th>UTC Time</th><th>Kind</th><th>DOOAF role</th><th>Map Lat</th><th>Map Lon</th>"
-                "<th>Map GR</th><th>Target Lat</th><th>Target Lon</th><th>Target GR</th><th>Geo Quality</th>"
-                "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Vehicle GR</th>"
-                "<th>Gimbal Yaw (°)</th><th>Gimbal Pitch (°)</th>"
-                "<th>Yaw direction</th><th>Pitch direction</th>"
-                "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
-                "<th>Target Sep (m)</th>"
-                "<th>GPS Fix</th><th>GPS Sats</th><th>HDOP</th><th>Geo Warning</th>"
-                "<th>Snapshot</th><th>Clip</th>"
-                "</tr></thead><tbody>"
-                + "".join(html_rows)
-                + "</tbody></table></body></html>"
+            detailed_log = format_observation_detailed_log_html(
+                export_rows, self._obs_cell_fn
+            )
+            dooaf_summary = format_dooaf_html_summary(session, observation_row=obs_row)
+            html = assemble_observation_report_html(
+                len(self._rows),
+                dooaf_summary,
+                detailed_log,
             )
             Path(self._html_path).write_text(html, encoding="utf-8")
             csv_abs = str(Path(self._csv_path).resolve())
@@ -7496,57 +7453,27 @@ class MapWidget(QWidget):
         return s if s else "N/A"
 
     def _write_observation_html_summary(self, path: str) -> None:
-        rows = []
-        for idx, row in enumerate(self._observations, start=1):
-            rows.append(
-                "<tr>"
-                f"<td>{idx}</td>"
-                f"<td>{row.get('timestamp_utc','')}</td>"
-                f"<td>{row.get('kind','')}</td>"
-                f"<td>{row.get('map_lat','')}</td>"
-                f"<td>{row.get('map_lon','')}</td>"
-                f"<td>{format_grid_reference(row.get('map_lat'), row.get('map_lon'))}</td>"
-                f"<td>{self._obs_cell(row.get('target_lat'))}</td>"
-                f"<td>{self._obs_cell(row.get('target_lon'))}</td>"
-                f"<td>{format_grid_reference(row.get('target_lat'), row.get('target_lon'))}</td>"
-                f"<td>{row.get('geo_quality','')}</td>"
-                f"<td>{row.get('vehicle_lat','')}</td>"
-                f"<td>{row.get('vehicle_lon','')}</td>"
-                f"<td>{format_grid_reference(row.get('vehicle_lat'), row.get('vehicle_lon'))}</td>"
-                f"<td>{self._obs_cell(row.get('gimbal_yaw_deg'))}</td>"
-                f"<td>{self._obs_cell(row.get('gimbal_pitch_deg'))}</td>"
-                f"<td>{row.get('video_x_norm','')}</td>"
-                f"<td>{row.get('video_y_norm','')}</td>"
-                f"<td>{row.get('vehicle_rel_alt_m','')}</td>"
-                f"<td>{row.get('geo_range_m','')}</td>"
-                f"<td>{row.get('segment_distance_m','')}</td>"
-                f"<td>{row.get('gps_fix_type','')}</td>"
-                f"<td>{row.get('gps_satellites','')}</td>"
-                f"<td>{row.get('gps_hdop','')}</td>"
-                f"<td>{row.get('geo_warning','')}</td>"
-                f"<td>{row.get('snapshot_path','')}</td>"
-                f"<td>{row.get('clip_path','')}</td>"
-                "</tr>"
+        export_rows: list[dict[str, object]] = []
+        for row in self._observations:
+            out = dict(row)
+            out["map_grid_ref"] = format_grid_reference(
+                out.get("map_lat"), out.get("map_lon")
             )
-        html = (
-            "<!doctype html><html><head><meta charset='utf-8'/>"
-            "<title>Observation Summary</title>"
-            "<style>body{font-family:Segoe UI,Arial,sans-serif;padding:20px;} table{border-collapse:collapse;width:100%;}"
-            "th,td{border:1px solid #ccc;padding:6px;font-size:12px;} th{background:#f3f6fb;text-align:left;}</style>"
-            "</head><body>"
-            f"<h2>Observation Report ({len(self._observations)} entries)</h2>"
-            "<table><thead><tr>"
-            "<th>#</th><th>UTC Time</th><th>Kind</th><th>Map Lat</th><th>Map Lon</th><th>Map GR</th>"
-            "<th>Target Lat</th><th>Target Lon</th><th>Target GR</th><th>Geo Quality</th>"
-            "<th>Vehicle Lat</th><th>Vehicle Lon</th><th>Vehicle GR</th>"
-            "<th>Gimbal Yaw</th><th>Gimbal Pitch</th>"
-            "<th>Video X</th><th>Video Y</th><th>Rel Alt (m)</th><th>Geo Range (m)</th>"
-            "<th>Target Sep (m)</th>"
-            "<th>GPS Fix</th><th>GPS Sats</th><th>HDOP</th><th>Geo Warning</th>"
-            "<th>Snapshot</th><th>Clip</th>"
-            "</tr></thead><tbody>"
-            + "".join(rows)
-            + "</tbody></table></body></html>"
+            out["vehicle_grid_ref"] = format_grid_reference(
+                out.get("vehicle_lat"), out.get("vehicle_lon")
+            )
+            out["target_grid_ref"] = format_grid_reference(
+                out.get("target_lat"), out.get("target_lon")
+            )
+            export_rows.append(out)
+        session = build_dooaf_session(list(self._observations))
+        obs_row = latest_mark_row(self._observations, DOOAF_ROLE_IMPACT)
+        if obs_row is None and self._observations:
+            obs_row = self._observations[-1]
+        html = assemble_observation_report_html(
+            len(self._observations),
+            format_dooaf_html_summary(session, observation_row=obs_row),
+            format_observation_detailed_log_html(export_rows, self._obs_cell),
         )
         Path(path).write_text(html, encoding="utf-8")
 
