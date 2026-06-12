@@ -19,8 +19,10 @@ from vgcs.observe.dem import (
     ray_intersect_terrain_msl,
 )
 from vgcs.observe.target_measure import (
+    dem_ground_agl_m,
     is_long_range_video_click,
     is_plausible_ground_range,
+    prefer_dem_ground_agl_over_ekf,
     resolve_facade_ray_agl_m,
     slant_horizontal_range_m,
 )
@@ -162,6 +164,19 @@ def compute_geo_reference(
         relative_alt_m=vehicle_rel_alt_m,
         rangefinder_down_m=rangefinder_down_m,
         video_y_norm=video_y_norm,
+    )
+    dem_agl, dem_src = dem_ground_agl_m(
+        vehicle_alt_msl_m=vehicle_alt_msl_m,
+        vehicle_lat=vehicle_lat,
+        vehicle_lon=vehicle_lon,
+        dem_path=str(dem_path or "") if dem_path else None,
+    )
+    agl_m, agl_src = prefer_dem_ground_agl_over_ekf(
+        relative_alt_m=vehicle_rel_alt_m,
+        facade_agl_m=agl_m,
+        facade_src=agl_src,
+        dem_ground_agl_m=dem_agl,
+        dem_ground_src=dem_src,
     )
     if agl_m is None:
         return GeoReferenceResult(

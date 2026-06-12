@@ -286,6 +286,99 @@ def resolve_facade_ray_agl_m(
     )
 
 
+def dem_ground_agl_m(
+    *,
+    vehicle_alt_msl_m: float | None,
+    vehicle_lat: float | None,
+    vehicle_lon: float | None,
+    dem_path: str | None,
+) -> tuple[float | None, str]:
+    """Physical height above local terrain from MSL altitude and DEM."""
+    if vehicle_alt_msl_m is None or vehicle_lat is None or vehicle_lon is None:
+        return None, ""
+    path = str(dem_path or "").strip()
+    if not path:
+        return None, ""
+    try:
+        from vgcs.observe.dem import elevation_at_wgs84
+
+        elev = elevation_at_wgs84(float(vehicle_lat), float(vehicle_lon), path)
+        if elev is None:
+            return None, ""
+        agl = float(vehicle_alt_msl_m) - float(elev)
+        if agl < -8.0 or agl > 800.0:
+            return None, ""
+        return max(0.0, agl), "dem_terrain"
+    except Exception:
+        return None, ""
+
+
+def prefer_dem_ground_agl_over_ekf(
+    *,
+    relative_alt_m: float | None,
+    facade_agl_m: float | None,
+    facade_src: str,
+    dem_ground_agl_m: float | None,
+    dem_ground_src: str = "",
+) -> tuple[float | None, str]:
+    """
+    EKF relative altitude is height above the home/arming point, not ground.
+
+    When parked on the field, home can be tens of metres below current MSL — EKF rel
+    reads ~7 m while DEM ground height is ~2 m. Prefer DEM for ray geometry in that case.
+    """
+    if dem_ground_agl_m is None:
+        return facade_agl_m, facade_src
+    try:
+        dem = float(dem_ground_agl_m)
+    except (TypeError, ValueError):
+        return facade_agl_m, facade_src
+    if dem < 0.25:
+        return facade_agl_m, facade_src
+    try:
+        ekf = float(relative_alt_m) if relative_alt_m is not None else None
+    except (TypeError, ValueError):
+        ekf = None
+    src = str(dem_ground_src or "dem_terrain")
+    if ekf is None or ekf < 1.0:
+        return dem, src
+    if ekf > dem + 3.0:
+        return dem, src
+    if dem < ekf - 2.0:
+        return dem, src
+    return facade_agl_m, facade_src
+
+
+def resolve_ray_agl_for_geo(
+    *,
+    relative_alt_m: float | None,
+    rangefinder_down_m: float | None = None,
+    video_y_norm: float | None = None,
+    vehicle_alt_msl_m: float | None = None,
+    vehicle_lat: float | None = None,
+    vehicle_lon: float | None = None,
+    dem_path: str | None = None,
+) -> tuple[float | None, str]:
+    facade_agl, facade_src = resolve_facade_ray_agl_m(
+        relative_alt_m=relative_alt_m,
+        rangefinder_down_m=rangefinder_down_m,
+        video_y_norm=video_y_norm,
+    )
+    dem_agl, dem_src = dem_ground_agl_m(
+        vehicle_alt_msl_m=vehicle_alt_msl_m,
+        vehicle_lat=vehicle_lat,
+        vehicle_lon=vehicle_lon,
+        dem_path=dem_path,
+    )
+    return prefer_dem_ground_agl_over_ekf(
+        relative_alt_m=relative_alt_m,
+        facade_agl_m=facade_agl,
+        facade_src=facade_src,
+        dem_ground_agl_m=dem_agl,
+        dem_ground_src=dem_src,
+    )
+
+
 def observation_ekf_rel_alt_m(row: dict[str, Any]) -> float | None:
     """
     EKF relative altitude at mark time (not downward rangefinder).

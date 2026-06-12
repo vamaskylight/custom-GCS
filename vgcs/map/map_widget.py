@@ -6287,11 +6287,22 @@ class MapWidget(QWidget):
                     v_lat, v_lon = float(pos[0]), float(pos[1])
             except Exception:
                 pass
-        from vgcs.observe.target_measure import resolve_facade_ray_agl_m
+        from vgcs.observe.target_measure import dem_ground_agl_m, resolve_ray_agl_for_geo
 
-        agl_m, agl_src = resolve_facade_ray_agl_m(
+        dem_path = self._observe_dem_path()
+        dem_ground, dem_ground_src = dem_ground_agl_m(
+            vehicle_alt_msl_m=self._vehicle_alt_msl_m,
+            vehicle_lat=v_lat,
+            vehicle_lon=v_lon,
+            dem_path=dem_path,
+        )
+        agl_m, agl_src = resolve_ray_agl_for_geo(
             relative_alt_m=self._vehicle_rel_alt_m,
             rangefinder_down_m=self._rangefinder_down_m,
+            vehicle_alt_msl_m=self._vehicle_alt_msl_m,
+            vehicle_lat=v_lat,
+            vehicle_lon=v_lon,
+            dem_path=dem_path,
         )
         ekf_raw = self._vehicle_rel_alt_m
         try:
@@ -6306,6 +6317,9 @@ class MapWidget(QWidget):
             "vehicle_pitch_deg": self._vehicle_pitch_deg,
             "ekf_rel_alt_m": ekf_stored,
             "vehicle_rel_alt_m": ekf_stored,
+            "vehicle_alt_msl_m": self._vehicle_alt_msl_m,
+            "dem_ground_agl_m": dem_ground,
+            "dem_ground_agl_source": dem_ground_src,
             "measure_agl_m": agl_m,
             "agl_source": agl_src,
             "gimbal_yaw_deg": gimbal_yaw,
@@ -6982,12 +6996,16 @@ class MapWidget(QWidget):
             row["geo_warning"] = "video click missing"
             return
         hfov, dem_path, dem_terrain = self._m8_geo_settings()
-        from vgcs.observe.target_measure import resolve_facade_ray_agl_m
+        from vgcs.observe.target_measure import resolve_ray_agl_for_geo
 
-        ray_agl, ray_src = resolve_facade_ray_agl_m(
+        ray_agl, ray_src = resolve_ray_agl_for_geo(
             relative_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
             rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
             video_y_norm=row.get("video_y_norm"),  # type: ignore[arg-type]
+            vehicle_alt_msl_m=row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+            vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
+            vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
+            dem_path=dem_path,
         )
         row["measure_agl_m"] = ray_agl
         row["geo_agl_source"] = ray_src
