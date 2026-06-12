@@ -105,6 +105,7 @@ class DooafSetupDialog(QDialog):
     """Popup for fixed artillery position and actual target lat/lon (military grid)."""
 
     pick_point_requested = Signal(str)
+    pick_video_requested = Signal(str)
     coordinates_changed = Signal(str)
 
     def __init__(
@@ -124,8 +125,9 @@ class DooafSetupDialog(QDialog):
         root.setSpacing(10)
 
         intro = QLabel(
-            "Enter coordinates supplied by military staff, pick on the map, or both. "
-            "The drone marks impact on video; VGCS computes range and deflection correction."
+            "Enter coordinates from military staff, pick on the map, or pick on the live "
+            "video (geo from GPS + gimbal + DEM). The drone marks fall of shot on video for "
+            "range and deflection correction."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
@@ -149,9 +151,18 @@ class DooafSetupDialog(QDialog):
         btn_pick_gun.clicked.connect(
             lambda: self.pick_point_requested.emit(DOOAF_PICK_GUN)
         )
+        btn_pick_gun_vid = QPushButton("Pick on video")
+        btn_pick_gun_vid.setToolTip(
+            "Hide this dialog and click the ground in the live video feed "
+            "(uses GPS + gimbal + DEM like a video mark)."
+        )
+        btn_pick_gun_vid.clicked.connect(
+            lambda: self.pick_video_requested.emit(DOOAF_PICK_GUN)
+        )
         btn_clear_gun = QPushButton("Clear")
         btn_clear_gun.clicked.connect(self._clear_gun)
         gun_actions.addWidget(btn_pick_gun)
+        gun_actions.addWidget(btn_pick_gun_vid)
         gun_actions.addWidget(btn_clear_gun)
         gun_actions.addStretch(1)
         gun_form.addRow("", gun_actions)
@@ -174,9 +185,17 @@ class DooafSetupDialog(QDialog):
         btn_pick_tgt.clicked.connect(
             lambda: self.pick_point_requested.emit(DOOAF_PICK_TARGET)
         )
+        btn_pick_tgt_vid = QPushButton("Pick on video")
+        btn_pick_tgt_vid.setToolTip(
+            "Hide this dialog and click the intended target on the live video feed."
+        )
+        btn_pick_tgt_vid.clicked.connect(
+            lambda: self.pick_video_requested.emit(DOOAF_PICK_TARGET)
+        )
         btn_clear_tgt = QPushButton("Clear")
         btn_clear_tgt.clicked.connect(self._clear_target)
         tgt_actions.addWidget(btn_pick_tgt)
+        tgt_actions.addWidget(btn_pick_tgt_vid)
         tgt_actions.addWidget(btn_clear_tgt)
         tgt_actions.addStretch(1)
         tgt_form.addRow("", tgt_actions)
@@ -214,15 +233,26 @@ class DooafSetupDialog(QDialog):
         _set_optional_alt(self._tgt_alt, None)
         self.coordinates_changed.emit("all")
 
-    def set_point_coords(self, role: str, lat: float, lon: float) -> None:
+    def set_point_coords(
+        self,
+        role: str,
+        lat: float,
+        lon: float,
+        *,
+        alt_m: float | None = None,
+    ) -> None:
         text_lat = f"{float(lat):.7f}"
         text_lon = f"{float(lon):.7f}"
         if role == DOOAF_PICK_GUN:
             self._gun_lat.setText(text_lat)
             self._gun_lon.setText(text_lon)
+            if alt_m is not None:
+                _set_optional_alt(self._gun_alt, float(alt_m))
         elif role == DOOAF_PICK_TARGET:
             self._tgt_lat.setText(text_lat)
             self._tgt_lon.setText(text_lon)
+            if alt_m is not None:
+                _set_optional_alt(self._tgt_alt, float(alt_m))
 
     def _on_accept(self) -> None:
         err = validate_dooaf_settings(self.result_settings())

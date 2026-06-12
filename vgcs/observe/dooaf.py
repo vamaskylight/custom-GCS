@@ -288,24 +288,28 @@ def apply_map_pick_to_settings(
     role: str,
     lat: float,
     lon: float,
+    *,
+    alt_m: float | None = None,
 ) -> DooafSettings:
     if role == DOOAF_ROLE_GUN:
+        gun_alt = float(alt_m) if alt_m is not None else base.gun_alt_m
         return DooafSettings(
             gun_lat=float(lat),
             gun_lon=float(lon),
-            gun_alt_m=base.gun_alt_m,
+            gun_alt_m=gun_alt,
             target_lat=base.target_lat,
             target_lon=base.target_lon,
             target_alt_m=base.target_alt_m,
         )
     if role == DOOAF_ROLE_INTENDED:
+        tgt_alt = float(alt_m) if alt_m is not None else base.target_alt_m
         return DooafSettings(
             gun_lat=base.gun_lat,
             gun_lon=base.gun_lon,
             gun_alt_m=base.gun_alt_m,
             target_lat=float(lat),
             target_lon=float(lon),
-            target_alt_m=base.target_alt_m,
+            target_alt_m=tgt_alt,
         )
     return base
 
