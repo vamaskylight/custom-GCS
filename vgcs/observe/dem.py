@@ -256,6 +256,21 @@ def load_dem_model(path: str | Path | None) -> DemElevationModel | None:
     return None
 
 
+def elevation_at_wgs84(
+    lat: float,
+    lon: float,
+    dem_path: str | Path | None,
+) -> float | None:
+    """Ground elevation (m MSL) at WGS84 lat/lon from the configured DEM file."""
+    model = get_shared_dem_model(dem_path)
+    if model is None or not model.active:
+        return None
+    try:
+        return model.elevation_m(float(lat), float(lon))
+    except Exception:
+        return None
+
+
 def get_shared_dem_model(path: str | Path | None) -> DemElevationModel | None:
     if path is None or not str(path).strip():
         return None

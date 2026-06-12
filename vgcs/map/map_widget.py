@@ -85,6 +85,7 @@ from vgcs.observe.dooaf import (
     latest_mark,
     DooafSettings,
     apply_map_pick_to_settings,
+    enrich_dooaf_settings_elevation_from_dem,
     dooaf_role_display,
     dooaf_settings_kwargs,
     merge_dooaf_settings,
@@ -6652,21 +6653,47 @@ class MapWidget(QWidget):
             lon: float,
             alt_m: float | None = None,
         ) -> None:
-            dlg.set_point_coords(role, lat, lon, alt_m=alt_m)
+            pick_alt = alt_m
+            if pick_alt is None:
+                pick_alt = self._dem_elevation_at(float(lat), float(lon))
             st = self._dooaf_settings_store()
             merged = apply_map_pick_to_settings(
                 self._resolved_dooaf_settings(),
                 pick_role,
                 float(lat),
                 float(lon),
-                alt_m=alt_m,
+                alt_m=pick_alt,
+            )
+            merged = enrich_dooaf_settings_elevation_from_dem(
+                merged, self._observe_dem_path()
             )
             write_dooaf_settings(st, merged)
+            if merged.gun_lat is not None and merged.gun_lon is not None:
+                dlg.set_point_coords(
+                    DOOAF_PICK_GUN,
+                    float(merged.gun_lat),
+                    float(merged.gun_lon),
+                    alt_m=merged.gun_alt_m,
+                )
+            if merged.target_lat is not None and merged.target_lon is not None:
+                dlg.set_point_coords(
+                    DOOAF_PICK_TARGET,
+                    float(merged.target_lat),
+                    float(merged.target_lon),
+                    alt_m=merged.target_alt_m,
+                )
             self._refresh_dooaf_map_overlay()
             dlg.show()
             dlg.raise_()
             dlg.activateWindow()
-            alt_note = f", alt {alt_m:.1f} m" if alt_m is not None else ""
+            show_alt = (
+                merged.target_alt_m
+                if pick_role == DOOAF_ROLE_INTENDED
+                else merged.gun_alt_m
+            )
+            if show_alt is None:
+                show_alt = pick_alt
+            alt_note = f", alt {show_alt:.1f} m (DEM)" if show_alt is not None else ""
             self._set_status(
                 f"DOOAF {label} saved from {source}{alt_note} — OK to confirm or pick again"
             )
@@ -6782,6 +6809,9 @@ class MapWidget(QWidget):
         new_settings = merge_dooaf_settings(
             self._resolved_dooaf_settings(), dlg.result_settings()
         )
+        new_settings = enrich_dooaf_settings_elevation_from_dem(
+            new_settings, self._observe_dem_path()
+        )
         write_dooaf_settings(st, new_settings)
         self._refresh_dooaf_map_overlay()
         session = build_dooaf_session(self._observations, **self._dooaf_session_kwargs())
@@ -6800,6 +6830,21 @@ class MapWidget(QWidget):
                     nm.set_center(la, lo)
         except Exception:
             pass
+
+    def _observe_dem_path(self) -> str | None:
+        _, dem_path, _ = self._m8_geo_settings()
+        return dem_path
+
+    def _dem_elevation_at(self, lat: float, lon: float) -> float | None:
+        path = self._observe_dem_path()
+        if not path:
+            return None
+        try:
+            from vgcs.observe.dem import elevation_at_wgs84
+
+            return elevation_at_wgs84(float(lat), float(lon), path)
+        except Exception:
+            return None
 
     def _m8_geo_settings(self) -> tuple[float, str | None, bool]:
         st = QSettings(_QS_NS, _QS_APP)
