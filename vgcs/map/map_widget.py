@@ -1150,6 +1150,7 @@ class MapWidget(QWidget):
         self._dooaf_pick_complete = None
         self._dooaf_pick_dialog: DooafSetupDialog | None = None
         self._dooaf_pick_from_video = False
+        self._dooaf_restore_target_after_pick = False
         self._video_obs_marks: list[tuple[float, float]] = []
         self._obs_snapshot_bridge = _ObservationSnapshotBridge(self)
         self._obs_snapshot_bridge.finished.connect(self._on_observation_snapshot_saved)
@@ -1954,6 +1955,10 @@ class MapWidget(QWidget):
 
     def _observation_mark_active(self) -> bool:
         """Target ON — video/minimap clicks mark fall of shot; never toggle map/video swap."""
+        if self._dooaf_pick_complete is not None and bool(
+            getattr(self, "_dooaf_pick_from_video", False)
+        ):
+            return False
         if bool(getattr(self, "_obs_mark_mode", False)):
             return True
         try:
@@ -6536,6 +6541,23 @@ class MapWidget(QWidget):
         self._dooaf_pick_complete = None
         self._dooaf_pick_dialog = None
         self._dooaf_pick_from_video = False
+        try:
+            if bool(getattr(self, "_dooaf_restore_target_after_pick", False)):
+                self._dooaf_restore_target_after_pick = False
+                restore_target_mode = True
+                self._set_observation_mark_mode(True)
+            elif restore_target_mode:
+                on = bool(self._btn_native_target.isChecked())
+                try:
+                    self._native_video_preview.setCursor(
+                        Qt.CursorShape.CrossCursor
+                        if on
+                        else Qt.CursorShape.ArrowCursor
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
         if not restore_target_mode:
             return
         try:
@@ -6592,6 +6614,35 @@ class MapWidget(QWidget):
                 alt_m = None
         return float(lat), float(lon), alt_m
 
+    def _dooaf_video_pick_failed(self, reason: str) -> None:
+        dlg = self._dooaf_pick_dialog
+        self._end_dooaf_map_pick(restore_target_mode=True)
+        detail = (reason or "").strip() or "Could not compute a ground position."
+        print(f"[VGCS:observe] dooaf video pick failed: {detail}")
+        self._set_status(f"Video pick failed — {detail}")
+        if dlg is not None:
+            try:
+                dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+            except Exception:
+                pass
+            try:
+                QMessageBox.warning(
+                    dlg,
+                    "Pick on video",
+                    (
+                        f"{detail}\n\n"
+                        "Tips:\n"
+                        "• Click the ground in the lower part of the video (not sky).\n"
+                        "• Wait for mavlink GPS fix (3D GPS helps).\n"
+                        "• Pitch gimbal down if the scene is oblique.\n"
+                        "• Pick on map if video geo is unreliable."
+                    ),
+                )
+            except Exception:
+                pass
+
     def _handle_dooaf_video_pick(self, video_x: float, video_y: float) -> bool:
         if self._dooaf_pick_complete is None or not bool(
             getattr(self, "_dooaf_pick_from_video", False)
@@ -6599,13 +6650,23 @@ class MapWidget(QWidget):
             return False
         geo = self._compute_video_pick_geo(video_x, video_y)
         if geo is None:
-            self._set_status(
-                "Video pick failed — connect mavlink, wait for GPS, click ground in video"
-            )
+            row: dict[str, object] = {
+                "kind": "video_mark",
+                "video_x_norm": float(video_x),
+                "video_y_norm": float(video_y),
+            }
+            row.update(self._observation_context())
+            self._enrich_observation_geo_reference(row)
+            reason = str(row.get("geo_warning") or row.get("geo_quality") or "")
+            self._dooaf_video_pick_failed(reason)
             return True
         cb = self._dooaf_pick_complete
-        self._end_dooaf_map_pick(restore_target_mode=True)
         lat, lon, alt_m = geo
+        self._end_dooaf_map_pick(restore_target_mode=True)
+        print(
+            f"[VGCS:observe] dooaf video pick ok lat={lat:.7f} lon={lon:.7f} "
+            f"alt={alt_m} video=({video_x:.3f},{video_y:.3f})"
+        )
         try:
             cb(float(lat), float(lon), alt_m)
         except TypeError:
@@ -6622,6 +6683,14 @@ class MapWidget(QWidget):
         if not bool(getattr(self, "_web_ready", False)):
             return
         if bool(getattr(self, "_video_preview_enabled", False)):
+            if not bool(getattr(self, "_video_swapped", False)):
+                self._video_swapped = True
+                self._video_swap_user_map_main = False
+                self._refresh_native_overlay_insets()
+            try:
+                self._native_video_preview.setCursor(Qt.CursorShape.CrossCursor)
+            except Exception:
+                pass
             # Keep fullscreen / swapped preview — do not restart PiP (that shrinks video).
             try:
                 self._layout_native_video_preview()
@@ -6700,9 +6769,25 @@ class MapWidget(QWidget):
 
         self._dooaf_pick_complete = on_picked
         self._dooaf_pick_from_video = from_video
+        if from_video:
+            self._dooaf_restore_target_after_pick = False
+            try:
+                btn = getattr(self, "_btn_native_target", None)
+                if btn is not None and btn.isChecked():
+                    self._dooaf_restore_target_after_pick = True
+                    btn.blockSignals(True)
+                    btn.setChecked(False)
+                    btn.blockSignals(False)
+                    self._obs_mark_mode = False
+            except Exception:
+                pass
         dlg.hide()
         if from_video:
             self._prepare_dooaf_video_pick()
+            print(
+                f"[VGCS:observe] dooaf video pick started role={role} "
+                f"(Target paused={self._dooaf_restore_target_after_pick})"
+            )
             self._set_status(
                 f"Click the ground in the video to set {label} (GPS + DEM geo)"
             )
@@ -6792,6 +6877,16 @@ class MapWidget(QWidget):
         self._refresh_dooaf_map_overlay()
 
     def _show_dooaf_setup_dialog(self) -> None:
+        pending = self._dooaf_pick_dialog
+        if pending is not None:
+            self._end_dooaf_map_pick(restore_target_mode=True)
+            try:
+                pending.show()
+                pending.raise_()
+                pending.activateWindow()
+            except Exception:
+                pass
+            return
         st = self._dooaf_settings_store()
         dlg = DooafSetupDialog(self, settings=self._resolved_dooaf_settings())
         dlg.pick_point_requested.connect(
