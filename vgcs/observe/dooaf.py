@@ -598,6 +598,9 @@ def observation_report_html_style() -> str:
         ".mgrs-badge{display:inline-block;font-family:Consolas,Monaco,ui-monospace,monospace;"
         "font-size:12px;padding:4px 10px;background:#e2e8f0;border-radius:6px;"
         "white-space:nowrap;color:#334155;}"
+        ".elev-badge{display:inline-block;font-family:Consolas,Monaco,ui-monospace,monospace;"
+        "font-size:12px;padding:4px 10px;background:#fef3c7;border-radius:6px;"
+        "white-space:nowrap;color:#92400e;border:1px solid #fcd34d;}"
         ".coord-pair{cursor:help;border-bottom:1px dotted #94a3b8;}"
         ".kind-badge{background:#e0e7ff;color:#3730a3;}"
         ".role-badge{background:#f1f5f9;color:#475569;}"
@@ -687,6 +690,15 @@ def format_dooaf_status(session: DooafSession) -> str:
     return "DOOAF: " + "; ".join(parts)
 
 
+def _format_elev_msl_html(alt_m: float | None) -> str:
+    if alt_m is None:
+        return "<span class='muted'>—</span>"
+    try:
+        return f"<span class='elev-badge'>{float(alt_m):.1f} m MSL</span>"
+    except (TypeError, ValueError):
+        return "<span class='muted'>—</span>"
+
+
 def format_dooaf_html_summary(
     session: DooafSession,
     *,
@@ -700,18 +712,35 @@ def format_dooaf_html_summary(
     ) -> str:
         if pt is None:
             cls = f" class='{row_class}'" if row_class else ""
-            return f"<tr{cls}><td>{label}</td><td colspan='3'>—</td></tr>"
-        alt = f", alt {pt.alt_m:.1f} m" if pt.alt_m is not None else ""
+            return f"<tr{cls}><td>{label}</td><td colspan='4'>—</td></tr>"
         gr = format_grid_reference(pt.lat, pt.lon) or "—"
         cls = f" class='{row_class}'" if row_class else ""
         return (
             f"<tr{cls}><td>{label}</td>"
             f"<td>{pt.lat:.7f}</td><td>{pt.lon:.7f}</td>"
-            f"<td>{gr}{alt}</td></tr>"
+            f"<td><span class='mgrs-badge'>{_html_esc(gr)}</span></td>"
+            f"<td>{_format_elev_msl_html(pt.alt_m)}</td></tr>"
         )
 
     corr_rows = ""
     c = session.correction
+    elev_delta_row = ""
+    if (
+        session.intended is not None
+        and session.impact is not None
+        and session.intended.alt_m is not None
+        and session.impact.alt_m is not None
+    ):
+        try:
+            elev_delta = float(session.intended.alt_m) - float(session.impact.alt_m)
+            elev_delta_row = (
+                f"<tr><td class='label-col'>Target − impact elevation</td>"
+                f"<td>{elev_delta:+.1f} m MSL "
+                f"(target {_format_elev_msl_html(session.intended.alt_m)}, "
+                f"impact {_format_elev_msl_html(session.impact.alt_m)})</td></tr>"
+            )
+        except (TypeError, ValueError):
+            elev_delta_row = ""
     if c is not None:
         corr_rows = _report_section_card(
             "Fire correction",
@@ -744,14 +773,16 @@ def format_dooaf_html_summary(
                 f"<tr><td class='label-col'>Gun → target bearing</td>"
                 f"<td>{c.bearing_gun_to_intended_deg:.1f}° "
                 "<span class='muted'>(compass from gun to target, not gimbal)</span></td></tr>"
-                "</tbody></table>"
+                + elev_delta_row
+                + "</tbody></table>"
             ),
             extra_class="dooaf-fire-corr",
         )
     obs_row = observation_row or None
     session_body = (
         "<table class='data-table'>"
-        "<thead><tr><th>Variable</th><th>Lat</th><th>Lon</th><th>Grid ref (MGRS)</th></tr></thead>"
+        "<thead><tr><th>Variable</th><th>Lat</th><th>Lon</th>"
+        "<th>Grid ref (MGRS)</th><th>Elevation (MSL)</th></tr></thead>"
         "<tbody>"
         + _pt(dooaf_role_display(DOOAF_ROLE_GUN), session.gun)
         + _pt(
