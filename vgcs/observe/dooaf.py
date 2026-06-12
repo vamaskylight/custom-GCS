@@ -1047,7 +1047,22 @@ def _format_log_metrics_row(row: dict[str, object], cell_fn: Any) -> str:
     )
     sep_html = _format_distance_m_html(row.get("segment_distance_m"), cell_fn)
     range_html = _format_distance_m_html(row.get("geo_range_m"), cell_fn)
-    alt_html = _format_alt_m_html(row.get("vehicle_rel_alt_m"), cell_fn)
+    ekf_html = _format_alt_m_html(row.get("ekf_rel_alt_m"), cell_fn)
+    if ekf_html == "<span class='muted'>—</span>":
+        ekf_html = _format_alt_m_html(row.get("vehicle_rel_alt_m"), cell_fn)
+    dem_ground = row.get("dem_ground_agl_m")
+    ray_agl = row.get("measure_agl_m")
+    height_sub = ""
+    if not _is_missing_cell(dem_ground, cell_fn):
+        height_sub = (
+            f"<div class='log-metric-sub'>Ground ~"
+            f"{_format_alt_m_html(dem_ground, cell_fn)} (DEM)</div>"
+        )
+    elif not _is_missing_cell(ray_agl, cell_fn):
+        height_sub = (
+            f"<div class='log-metric-sub'>Ray height "
+            f"{_format_alt_m_html(ray_agl, cell_fn)}</div>"
+        )
     return (
         "<div class='log-metrics'>"
         "<div class='log-metric'>"
@@ -1064,8 +1079,9 @@ def _format_log_metrics_row(row: dict[str, object], cell_fn: Any) -> str:
         f"<div class='log-metric-sub'>Geo range {range_html}</div>"
         "</div>"
         "<div class='log-metric'>"
-        "<div class='log-metric-label'>Drone rel. altitude</div>"
-        f"<div class='log-metric-value'>{alt_html}</div>"
+        "<div class='log-metric-label'>EKF rel (above home)</div>"
+        f"<div class='log-metric-value'>{ekf_html}</div>"
+        f"{height_sub}"
         "</div>"
         "</div>"
     )
@@ -1205,11 +1221,21 @@ def _format_observation_log_entry(
         detail_rows.append(
             _log_detail_row("Grid ref (MGRS)", _format_mgrs_badge(row.get("vehicle_grid_ref")))
         )
-        if not _is_missing_cell(row.get("vehicle_rel_alt_m"), cell_fn):
+        ekf_alt = row.get("ekf_rel_alt_m")
+        if _is_missing_cell(ekf_alt, cell_fn):
+            ekf_alt = row.get("vehicle_rel_alt_m")
+        if not _is_missing_cell(ekf_alt, cell_fn):
             detail_rows.append(
                 _log_detail_row(
-                    "Rel. altitude",
-                    _format_alt_m_html(row.get("vehicle_rel_alt_m"), cell_fn),
+                    "EKF rel (above home)",
+                    _format_alt_m_html(ekf_alt, cell_fn),
+                )
+            )
+        if not _is_missing_cell(row.get("dem_ground_agl_m"), cell_fn):
+            detail_rows.append(
+                _log_detail_row(
+                    "Ground height (DEM)",
+                    _format_alt_m_html(row.get("dem_ground_agl_m"), cell_fn),
                 )
             )
 

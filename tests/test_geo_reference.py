@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from vgcs.observe.geo_reference import compute_geo_reference
+from vgcs.observe.target_measure import prefer_dem_ground_agl_over_ekf
 
 
 def _nadir_result():
@@ -20,6 +21,19 @@ def _nadir_result():
         gps_fix_type=3,
         gps_hdop=1.0,
     )
+
+
+def test_dem_ground_agl_when_ekf_home_offset():
+    """EKF rel above home can read ~7 m on the ground; DEM ground height is physical AGL."""
+    agl, src = prefer_dem_ground_agl_over_ekf(
+        relative_alt_m=6.87,
+        facade_agl_m=6.87,
+        facade_src="ekf_relative",
+        dem_ground_agl_m=2.4,
+        dem_ground_src="dem_terrain",
+    )
+    assert agl == 2.4
+    assert src == "dem_terrain"
 
 
 def test_nadir_mark_near_vehicle():
