@@ -126,8 +126,9 @@ class DooafSetupDialog(QDialog):
 
         intro = QLabel(
             "Enter coordinates from military staff, pick on the map, or pick on the live "
-            "video (geo from GPS + gimbal + DEM). The drone marks fall of shot on video for "
-            "range and deflection correction."
+            "video (geo from GPS + gimbal + DEM). Altitude (MSL) is auto-filled from your "
+            "DEM file when omitted. The drone marks fall of shot on video for range and "
+            "deflection correction."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)

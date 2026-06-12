@@ -283,6 +283,42 @@ def merge_dooaf_settings(
     )
 
 
+def enrich_dooaf_settings_elevation_from_dem(
+    settings: DooafSettings,
+    dem_path: str | None,
+) -> DooafSettings:
+    """Fill missing gun/target MSL altitude from DEM at each stored lat/lon."""
+    path = str(dem_path or "").strip() or None
+    if path is None:
+        return settings
+    from vgcs.observe.dem import elevation_at_wgs84
+
+    gun_alt = settings.gun_alt_m
+    tgt_alt = settings.target_alt_m
+    if settings.gun_lat is not None and settings.gun_lon is not None and gun_alt is None:
+        gun_alt = elevation_at_wgs84(
+            float(settings.gun_lat), float(settings.gun_lon), path
+        )
+    if (
+        settings.target_lat is not None
+        and settings.target_lon is not None
+        and tgt_alt is None
+    ):
+        tgt_alt = elevation_at_wgs84(
+            float(settings.target_lat), float(settings.target_lon), path
+        )
+    if gun_alt == settings.gun_alt_m and tgt_alt == settings.target_alt_m:
+        return settings
+    return DooafSettings(
+        gun_lat=settings.gun_lat,
+        gun_lon=settings.gun_lon,
+        gun_alt_m=gun_alt,
+        target_lat=settings.target_lat,
+        target_lon=settings.target_lon,
+        target_alt_m=tgt_alt,
+    )
+
+
 def apply_map_pick_to_settings(
     base: DooafSettings,
     role: str,
