@@ -133,7 +133,7 @@ from vgcs.video.pipeline import (
     suggested_recording_save_path,
     wait_qmedia_recorder_stopped,
 )
-from vgcs.video.camera_control import NoopCameraControl
+from vgcs.video.camera_control import NoopCameraControl, camera_preview_applies_digital_zoom, camera_zoom_limits
 from vgcs.map.native_tile_map import NativeTileMapView, bundled_seed_root, fetch_tile_http_bytes
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_footer_hud import (
@@ -2655,6 +2655,17 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _video_zoom_limits(self) -> tuple[float, float, float]:
+        return camera_zoom_limits(getattr(self, "_camera_control", None))
+
+    def _effective_preview_digital_zoom(self) -> float:
+        if not camera_preview_applies_digital_zoom(getattr(self, "_camera_control", None)):
+            return 1.0
+        try:
+            return float(getattr(self, "_video_zoom", 1.0))
+        except Exception:
+            return 1.0
+
     def _sync_native_video_zoom_label(self) -> None:
         lbl = getattr(self, "_lbl_camera_top_zoom", None)
         if lbl is None:
@@ -4964,7 +4975,7 @@ class MapWidget(QWidget):
         self._video_recording_source_id = ""
         self._stop_native_cam_recording_tick_timer(reset_label=True)
         self._video_vision_mode = "day"  # 'day' | 'night'
-        self._video_zoom = 1.0  # 1.0x .. 4.0x
+        self._video_zoom = 1.0
         try:
             self._sync_native_video_zoom_label()
         except Exception:
@@ -5345,6 +5356,14 @@ class MapWidget(QWidget):
         """Inject a camera control backend (MAVLink/SDK)."""
         try:
             self._camera_control = control
+        except Exception:
+            pass
+        try:
+            zmin, zmax, _ = camera_zoom_limits(control)
+            cur = float(getattr(self, "_video_zoom", 1.0))
+            if cur < zmin or cur > zmax:
+                self._video_zoom = max(zmin, min(zmax, cur))
+                self._sync_native_video_zoom_label()
         except Exception:
             pass
         self._payload_hardware_recording = False
@@ -5816,7 +5835,7 @@ class MapWidget(QWidget):
         if not refresh_cache:
             return
 
-        img = self._apply_digital_zoom(img, float(getattr(self, "_video_zoom", 1.0)))
+        img = self._apply_digital_zoom(img, self._effective_preview_digital_zoom())
         try:
             img2 = img.copy()
         except Exception:
@@ -5867,7 +5886,7 @@ class MapWidget(QWidget):
                 img = img.convertToFormat(QImage.Format.Format_Grayscale8)
         except Exception:
             pass
-        img = self._apply_digital_zoom(img, float(getattr(self, "_video_zoom", 1.0)))
+        img = self._apply_digital_zoom(img, self._effective_preview_digital_zoom())
         try:
             img2 = img.copy()
         except Exception:
@@ -8521,8 +8540,9 @@ class MapWidget(QWidget):
                 cur = float(getattr(self, "_video_zoom", 1.0))
             except Exception:
                 cur = 1.0
-            cur += 0.25 * float(step)
-            cur = max(1.0, min(4.0, cur))
+            zmin, zmax, zstep = self._video_zoom_limits()
+            cur += zstep * float(step)
+            cur = max(zmin, min(zmax, cur))
             self._video_zoom = cur
             try:
                 self._sync_native_video_zoom_label()

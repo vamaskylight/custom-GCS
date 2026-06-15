@@ -1,0 +1,32 @@
+from __future__ import annotations
+
+from vgcs.video.camera_control import (
+    NoopCameraControl,
+    SkydroidCameraControl,
+    ZOOM_MAX_PREVIEW,
+    ZOOM_MAX_SKYDROID,
+    ZOOM_STEP_PREVIEW,
+    ZOOM_STEP_SKYDROID,
+    camera_preview_applies_digital_zoom,
+    camera_zoom_limits,
+)
+
+
+def test_skydroid_zoom_limits_allow_30x() -> None:
+    control = object.__new__(SkydroidCameraControl)
+    zmin, zmax, zstep = camera_zoom_limits(control)
+    assert zmin == 1.0
+    assert zmax == ZOOM_MAX_SKYDROID == 30.0
+    assert zstep == ZOOM_STEP_SKYDROID == 1.0
+
+
+def test_preview_zoom_limits_stay_at_4x() -> None:
+    zmin, zmax, zstep = camera_zoom_limits(NoopCameraControl())
+    assert zmax == ZOOM_MAX_PREVIEW == 4.0
+    assert zstep == ZOOM_STEP_PREVIEW == 0.25
+
+
+def test_skydroid_skips_ui_digital_zoom() -> None:
+    control = object.__new__(SkydroidCameraControl)
+    assert camera_preview_applies_digital_zoom(control) is False
+    assert camera_preview_applies_digital_zoom(NoopCameraControl()) is True
