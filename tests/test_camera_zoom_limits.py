@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from vgcs.video.camera_control import (
+    CompositeGimbalCameraControl,
     NoopCameraControl,
     SkydroidCameraControl,
     ZOOM_MAX_PREVIEW,
@@ -30,3 +31,12 @@ def test_skydroid_skips_ui_digital_zoom() -> None:
     control = object.__new__(SkydroidCameraControl)
     assert camera_preview_applies_digital_zoom(control) is False
     assert camera_preview_applies_digital_zoom(NoopCameraControl()) is True
+
+
+def test_composite_wrapper_uses_skydroid_zoom_limits() -> None:
+    inner = object.__new__(SkydroidCameraControl)
+    wrapped = CompositeGimbalCameraControl(inner, None)
+    zmin, zmax, zstep = camera_zoom_limits(wrapped)
+    assert zmax == ZOOM_MAX_SKYDROID == 30.0
+    assert zstep == ZOOM_STEP_SKYDROID == 1.0
+    assert camera_preview_applies_digital_zoom(wrapped) is False

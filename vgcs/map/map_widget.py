@@ -8537,12 +8537,14 @@ class MapWidget(QWidget):
             except Exception:
                 step = 0
             try:
-                cur = float(getattr(self, "_video_zoom", 1.0))
+                prev = float(getattr(self, "_video_zoom", 1.0))
             except Exception:
-                cur = 1.0
+                prev = 1.0
             zmin, zmax, zstep = self._video_zoom_limits()
-            cur += zstep * float(step)
-            cur = max(zmin, min(zmax, cur))
+            cur = max(zmin, min(zmax, prev + zstep * float(step)))
+            if abs(cur - prev) < 1e-6:
+                self._run_js("document.title = 'VGCS Map';")
+                return
             self._video_zoom = cur
             try:
                 self._sync_native_video_zoom_label()
