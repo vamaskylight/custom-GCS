@@ -40,6 +40,8 @@ _MOTION_COMMANDS = frozenset(
         "PTZ_CENTER",
         "PTZ_STOP",
         "ZMC",
+        "DZM_STEP",
+        "FCC",
     }
 )
 
@@ -195,12 +197,18 @@ class SkydroidTopUdpAdapter:
         self._enqueue(self._profile.camera_commands.get("zoom", []), {"level": float(level)}, False)
 
     def camera_zoom_step(self, direction: int) -> None:
+        """Digital zoom step for rail +/- (DZM 0C/0D + stop); absolute level sent separately."""
+        if int(direction) == 0:
+            return
         action = "in" if int(direction) > 0 else "out"
-        self._enqueue(["ZMC"], {"action": action}, False)
+        self._enqueue(["DZM_STEP"], {"action": action}, False)
+        self._enqueue(["DZM_STEP"], {"action": "stop"}, False)
 
     def camera_focus_step(self, direction: int) -> None:
         key = "focus_in" if int(direction) < 0 else "focus_out"
-        self._enqueue(self._profile.camera_commands.get(key, []), {}, True)
+        cmds = self._profile.camera_commands.get(key, [])
+        self._enqueue(cmds, {}, False)
+        self._enqueue(["FCC"], {"action": "stop"}, False)
 
     def poll_attitude_now(self) -> GimbalStatus | None:
         """Blocking poll — background threads only (never call from UI thread)."""
