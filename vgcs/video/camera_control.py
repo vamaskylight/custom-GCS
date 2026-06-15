@@ -296,16 +296,17 @@ class SkydroidCameraControl:
 
     def set_zoom(self, level: float) -> None:
         try:
-            lvl = int(round(max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(level)))))
-            self._adapter.camera_zoom(float(lvl))
+            lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(level)))
+            self._adapter.camera_zoom(lvl)
         except Exception:
             return
 
     def handle_zoom_step(self, step: int, ui_level: float) -> None:
-        del step
+        del ui_level
         try:
-            lvl = int(round(max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))))
-            self._adapter.camera_zoom(float(lvl))
+            if int(step) == 0:
+                return
+            self._adapter.camera_zoom_step(int(step))
         except Exception:
             return
 

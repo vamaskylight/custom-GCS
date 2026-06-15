@@ -39,6 +39,7 @@ _MOTION_COMMANDS = frozenset(
         "PTZ_RIGHT",
         "PTZ_CENTER",
         "PTZ_STOP",
+        "ZMC",
     }
 )
 
@@ -191,7 +192,11 @@ class SkydroidTopUdpAdapter:
         self._enqueue(self._profile.camera_commands.get("photo", []), {}, True)
 
     def camera_zoom(self, level: float) -> None:
-        self._enqueue(self._profile.camera_commands.get("zoom", []), {"level": float(level)}, True)
+        self._enqueue(self._profile.camera_commands.get("zoom", []), {"level": float(level)}, False)
+
+    def camera_zoom_step(self, direction: int) -> None:
+        action = "in" if int(direction) > 0 else "out"
+        self._enqueue(["ZMC"], {"action": action}, False)
 
     def camera_focus_step(self, direction: int) -> None:
         key = "focus_in" if int(direction) < 0 else "focus_out"
