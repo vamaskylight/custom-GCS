@@ -424,6 +424,7 @@ class NativeTileMapView(QWidget):
     user_waypoints_changed = Signal()
     user_fence_changed = Signal()
     observation_map_click = Signal(float, float)
+    zoom_changed = Signal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -536,13 +537,23 @@ class NativeTileMapView(QWidget):
         if self._vehicle_lat is not None and self._vehicle_lon is not None:
             self.set_center(self._vehicle_lat, self._vehicle_lon)
 
+    def zoom_level(self) -> float:
+        return float(self._zoom)
+
     def set_zoom(self, z: float) -> None:
         try:
-            self._zoom = max(3.0, min(float(self._max_zoom), float(z)))
+            new_z = max(3.0, min(float(self._max_zoom), float(z)))
         except Exception:
-            pass
+            return
+        if abs(new_z - self._zoom) < 1e-6:
+            return
+        self._zoom = new_z
         self._sync_view_zoom()
         self._schedule_repaint()
+        try:
+            self.zoom_changed.emit(self._zoom)
+        except Exception:
+            pass
 
     def _sync_view_zoom(self) -> None:
         nz = int(max(3, min(self._max_zoom, round(self._zoom))))
@@ -1547,9 +1558,7 @@ class NativeTileMapView(QWidget):
             return
         # ~1 zoom level per standard wheel detent (120°).
         step = (delta / 120.0) * 1.0
-        self._zoom = max(3.0, min(float(self._max_zoom), self._zoom + step))
-        self._sync_view_zoom()
-        self._schedule_repaint()
+        self.set_zoom(self._zoom + step)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
         if event.button() == Qt.MouseButton.LeftButton:

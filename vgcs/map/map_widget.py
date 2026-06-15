@@ -139,6 +139,7 @@ from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_footer_hud import (
     MapFooterCompass,
     MapFooterTelemetryStrip,
+    MapZoomControlPanel,
     TelemetryStripIcon,
 )
 from vgcs.map.sensor_obstacle_widget import ObstacleRadarPanel
@@ -432,6 +433,18 @@ QPushButton#camSplitBtn:checked[splitHidden="true"] {
   background-color: rgba(22, 27, 38, 235);
   color: #e8edf8;
 }
+QLabel#camMagnificationLabel {
+  color: #dce5f5;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 4px 8px;
+  margin-left: 2px;
+  border-radius: 6px;
+  border: 1px solid rgba(80, 92, 118, 107);
+  background: rgba(26, 33, 45, 215);
+  min-width: 44px;
+}
 QPushButton#camRecordBtn {
   width: 34px;
   height: 34px;
@@ -617,6 +630,10 @@ QPushButton[camPadBtn=true]:checked {
   background: rgba(27, 33, 45, 245);
 }
 """
+
+
+def _format_video_zoom_label(z: float) -> str:
+    return f"{max(1.0, float(z)):.1f}x"
 
 
 def _cam_rail_sep() -> QFrame:
@@ -1330,6 +1347,11 @@ class MapWidget(QWidget):
 
         ctr_layout.addWidget(self._btn_native_split, 0)
         ctr_layout.addWidget(self._btn_native_follow, 0)
+        self._lbl_camera_top_zoom = QLabel(_format_video_zoom_label(1.0))
+        self._lbl_camera_top_zoom.setObjectName("camMagnificationLabel")
+        self._lbl_camera_top_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_camera_top_zoom.setToolTip("Camera magnification")
+        ctr_layout.addWidget(self._lbl_camera_top_zoom, 0, Qt.AlignmentFlag.AlignVCenter)
         ctr_layout.addStretch(1)
 
         self._btn_native_record = QPushButton()
@@ -1453,6 +1475,11 @@ class MapWidget(QWidget):
         self._native_telemetry.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._native_telemetry.hide()
         self._native_telemetry.raise_()
+
+        self._native_map_zoom_ctrl = MapZoomControlPanel(self._panel)
+        self._native_map_zoom_ctrl.zoom_step_requested.connect(self._on_main_map_zoom_step)
+        self._native_map_zoom_ctrl.hide()
+        self._native_map_zoom_ctrl.raise_()
 
         # M9 — obstacle radar on `_panel` (same stacking layer as PiP / compass).
         self._obstacle_radar = ObstacleRadarPanel(self._panel)
@@ -2518,6 +2545,9 @@ class MapWidget(QWidget):
         try:
             self._native_compass.show()
             self._native_telemetry.show()
+            mz = getattr(self, "_native_map_zoom_ctrl", None)
+            if mz is not None:
+                mz.show()
         except Exception:
             pass
         if bool(getattr(self, "_last_link_connected", False)):
@@ -2555,7 +2585,7 @@ class MapWidget(QWidget):
             obr = getattr(self, "_obstacle_radar", None)
             if obr is not None and obr.isVisible():
                 obr.raise_()
-            for hud in (self._native_compass, self._native_telemetry):
+            for hud in (self._native_compass, self._native_telemetry, getattr(self, "_native_map_zoom_ctrl", None)):
                 if hud is not None and hud.isVisible():
                     hud.raise_()
             preview_on = bool(getattr(self, "_video_preview_enabled", False))
@@ -2625,6 +2655,47 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _sync_native_video_zoom_label(self) -> None:
+        lbl = getattr(self, "_lbl_camera_top_zoom", None)
+        if lbl is None:
+            return
+        try:
+            z = float(getattr(self, "_video_zoom", 1.0))
+        except Exception:
+            z = 1.0
+        try:
+            lbl.setText(_format_video_zoom_label(z))
+        except Exception:
+            pass
+
+    def _on_main_map_zoom_step(self, step: int) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        try:
+            cur = float(getattr(nm, "_zoom", 16.0))
+        except Exception:
+            cur = 16.0
+        try:
+            nm.set_zoom(cur + float(step))
+        except Exception:
+            pass
+
+    def _sync_native_map_zoom_label(self, z: float | None = None) -> None:
+        ctrl = getattr(self, "_native_map_zoom_ctrl", None)
+        if ctrl is None:
+            return
+        if z is None:
+            nm = getattr(self, "_native_map", None)
+            try:
+                z = float(getattr(nm, "_zoom", 16.0)) if nm is not None else 16.0
+            except Exception:
+                z = 16.0
+        try:
+            ctrl.set_zoom_level(float(z))
+        except Exception:
+            pass
+
     def _layout_native_hud(self) -> None:
         try:
             plan_on = self._plan_flight_layer_obscures_native_camera_ui()
@@ -2636,6 +2707,7 @@ class MapWidget(QWidget):
                     self._native_minimap_wrap.hide()
                     self._btn_native_minimap_plus.hide()
                     self._btn_native_minimap_minus.hide()
+                    self._native_map_zoom_ctrl.hide()
                     self._obstacle_radar.hide()
                 except Exception:
                     pass
@@ -2728,6 +2800,24 @@ class MapWidget(QWidget):
             swapped = bool(getattr(self, "_video_swapped", False))
             preview_on = bool(getattr(self, "_video_preview_enabled", False))
             preview_maps = preview_on and not plan_on
+            mz_ctrl = getattr(self, "_native_map_zoom_ctrl", None)
+            if mz_ctrl is not None:
+                try:
+                    self._sync_native_map_zoom_label()
+                except Exception:
+                    pass
+                ctrl_w = int(mz_ctrl.width()) if mz_ctrl.width() > 0 else 32
+                ctrl_h = int(mz_ctrl.height()) if mz_ctrl.height() > 0 else 104
+                ctrl_x = 10
+                ctrl_y = max(0, h - 2 - ctrl_h)
+                if preview_maps and not swapped:
+                    _px, pip_y, _pw, pip_h = self._mini_video_pip_rect(w, h)
+                    ctrl_y = min(ctrl_y, max(8, int(pip_y) - ctrl_h - 8))
+                mz_ctrl.setGeometry(po.x() + ctrl_x, po.y() + ctrl_y, ctrl_w, ctrl_h)
+                if plan_on or not bool(getattr(self, "_web_ready", False)):
+                    mz_ctrl.hide()
+                else:
+                    mz_ctrl.show()
             _pip_x, _pip_y, _pip_w, pip_h = self._mini_video_pip_rect(w, h)
             margin = _MAP_HUD_MARGIN_PX
             # M9 obstacle radar — compact card top-left; mini-video is a small fixed PiP bottom-left.
@@ -3532,6 +3622,9 @@ class MapWidget(QWidget):
             if bool(getattr(self, "_web_ready", False)):
                 self._native_compass.show()
                 self._native_telemetry.show()
+                mz = getattr(self, "_native_map_zoom_ctrl", None)
+                if mz is not None:
+                    mz.show()
                 try:
                     self._obstacle_radar.show()
                     self._obstacle_radar.notify_link_connected(True)
@@ -4202,6 +4295,8 @@ class MapWidget(QWidget):
                 self._native_telemetry.setVisible(show)
             if hasattr(self, "_native_compass"):
                 self._native_compass.setVisible(show)
+            if hasattr(self, "_native_map_zoom_ctrl"):
+                self._native_map_zoom_ctrl.setVisible(show)
             if hasattr(self, "_obstacle_radar") and bool(getattr(self, "_last_link_connected", False)):
                 self._obstacle_radar.setVisible(show)
         except Exception:
@@ -4520,6 +4615,11 @@ class MapWidget(QWidget):
             pass
         self._native_map.user_waypoints_changed.connect(self._on_native_user_waypoints_changed)
         self._native_map.observation_map_click.connect(self._on_native_observation_map_click)
+        self._native_map.zoom_changed.connect(self._sync_native_map_zoom_label)
+        try:
+            self._sync_native_map_zoom_label(float(getattr(self._native_map, "_zoom", 16.0)))
+        except Exception:
+            pass
         try:
             seed_ok = bundled_seed_root().is_dir()
             print(
@@ -4618,6 +4718,9 @@ class MapWidget(QWidget):
             try:
                 self._native_compass.show()
                 self._native_telemetry.show()
+                mz = getattr(self, "_native_map_zoom_ctrl", None)
+                if mz is not None:
+                    mz.show()
                 if bool(getattr(self, "_last_link_connected", False)):
                     try:
                         self._obstacle_radar.show()
@@ -4862,6 +4965,10 @@ class MapWidget(QWidget):
         self._stop_native_cam_recording_tick_timer(reset_label=True)
         self._video_vision_mode = "day"  # 'day' | 'night'
         self._video_zoom = 1.0  # 1.0x .. 4.0x
+        try:
+            self._sync_native_video_zoom_label()
+        except Exception:
+            pass
         self._video_follow_last_center_mono = 0.0
         self._video_last_data_url = ""
         self._video_last_data_urls = {}
@@ -5652,6 +5759,9 @@ class MapWidget(QWidget):
                     if bool(getattr(self, "_web_ready", False)):
                         self._native_compass.show()
                         self._native_telemetry.show()
+                        mz = getattr(self, "_native_map_zoom_ctrl", None)
+                        if mz is not None:
+                            mz.show()
                         if bool(getattr(self, "_last_link_connected", False)):
                             try:
                                 self._obstacle_radar.show()
@@ -8414,6 +8524,10 @@ class MapWidget(QWidget):
             cur += 0.25 * float(step)
             cur = max(1.0, min(4.0, cur))
             self._video_zoom = cur
+            try:
+                self._sync_native_video_zoom_label()
+            except Exception:
+                pass
             try:
                 # Rail +/- : MAVLink uses ZOOM_TYPE_STEP (real payloads); Skydroid uses absolute TOP level.
                 self._camera_control.handle_zoom_step(int(step), float(cur))

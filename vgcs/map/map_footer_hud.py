@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QVBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
     QWidget,
 )
@@ -305,6 +307,116 @@ class MapFooterTelemetryStrip(QFrame):
         self._row2_msl.setText(distance_home_ft)
         self._row2_mph.setText(ground_speed_mph)
         self._row2_alt.setText(row2_alt_ft if row2_alt_ft is not None else row1_alt_ft)
+
+
+def format_map_zoom_level(z: float) -> str:
+    zf = float(z)
+    if abs(zf - round(zf)) < 0.05:
+        return f"z{int(round(zf))}"
+    return f"z{zf:.1f}"
+
+
+_MAP_ZOOM_BTN_SIDE = 32
+_MAP_ZOOM_BTN_GAP = 4
+_MAP_ZOOM_BTN_QSS = (
+    "QPushButton#mapZoomPlusBtn, QPushButton#mapZoomMinusBtn {"
+    "background-color: rgba(18, 26, 40, 0.88);"
+    "color: #f5f8ff;"
+    "border: 2px solid rgba(200, 218, 255, 0.95);"
+    "border-radius: 6px;"
+    "padding: 0px;"
+    "}"
+    "QPushButton#mapZoomPlusBtn:hover, QPushButton#mapZoomMinusBtn:hover {"
+    "background-color: rgba(32, 46, 68, 0.92);"
+    "border-color: #ffffff;"
+    "color: #ffffff;"
+    "}"
+    "QPushButton#mapZoomPlusBtn:pressed, QPushButton#mapZoomMinusBtn:pressed {"
+    "background-color: rgba(12, 18, 28, 0.95);"
+    "border-color: #9eb6e8;"
+    "}"
+    "QLabel#mapZoomLevelLabel {"
+    "background-color: rgba(18, 26, 40, 0.88);"
+    "color: #f5f8ff;"
+    "border: 2px solid rgba(200, 218, 255, 0.95);"
+    "border-radius: 6px;"
+    "padding: 0px;"
+    "font-family: \"Segoe UI\", \"Roboto\", \"Helvetica Neue\", sans-serif;"
+    "font-size: 13px;"
+    "font-weight: 600;"
+    "}"
+)
+
+
+def format_map_zoom_level_display(z: float) -> str:
+    """Compact level for the stacked map zoom control (fits 32×32 chrome)."""
+    zf = float(z)
+    if abs(zf - round(zf)) < 0.05:
+        return str(int(round(zf)))
+    return f"{zf:.1f}"
+
+
+class MapZoomControlPanel(QWidget):
+    """Bottom-left map zoom: stacked + / level / − (matches minimap PiP control chrome)."""
+
+    zoom_step_requested = Signal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("mapZoomControl")
+        self.setStyleSheet("QWidget#mapZoomControl { background: transparent; border: none; }")
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(_MAP_ZOOM_BTN_GAP)
+        btn_font = QFont()
+        btn_font.setPointSize(16)
+        btn_font.setWeight(QFont.Weight.Black)
+        side = _MAP_ZOOM_BTN_SIDE
+        self._btn_plus = QPushButton("+")
+        self._btn_plus.setObjectName("mapZoomPlusBtn")
+        self._btn_plus.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_plus.setToolTip("Zoom in")
+        self._btn_plus.clicked.connect(lambda: self.zoom_step_requested.emit(1))
+        self._btn_minus = QPushButton("-")
+        self._btn_minus.setObjectName("mapZoomMinusBtn")
+        self._btn_minus.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_minus.setToolTip("Zoom out")
+        self._btn_minus.clicked.connect(lambda: self.zoom_step_requested.emit(-1))
+        self._level = QLabel(format_map_zoom_level_display(16.0))
+        self._level.setObjectName("mapZoomLevelLabel")
+        self._level.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._level.setFixedSize(side, side)
+        self._level.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._level.setStyleSheet(_MAP_ZOOM_BTN_QSS)
+        for btn in (self._btn_plus, self._btn_minus):
+            btn.setFont(btn_font)
+            btn.setFixedSize(side, side)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            btn.setStyleSheet(_MAP_ZOOM_BTN_QSS)
+        lay.addWidget(self._btn_plus, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(self._level, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(self._btn_minus, 0, Qt.AlignmentFlag.AlignHCenter)
+        panel_h = side * 3 + _MAP_ZOOM_BTN_GAP * 2
+        self.setFixedSize(side, panel_h)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.set_zoom_level(16.0)
+
+    def set_zoom_level(self, z: float) -> None:
+        level = format_map_zoom_level(z)
+        display = format_map_zoom_level_display(z)
+        try:
+            self._level.setText(display)
+        except Exception:
+            pass
+        tip = f"Map zoom {level}"
+        self.setToolTip(tip)
+        try:
+            self._level.setToolTip(tip)
+            self._btn_plus.setToolTip(f"Zoom in ({level})")
+            self._btn_minus.setToolTip(f"Zoom out ({level})")
+        except Exception:
+            pass
 
 
 def telemetry_strip_icon_as_qicon(kind: str, size: int = 24) -> QIcon:
