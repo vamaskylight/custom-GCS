@@ -90,24 +90,28 @@ def test_gam_includes_pitch_and_yaw_speed() -> None:
     assert b"DCD8" in frame
 
 
-def test_build_dzm_14x_uses_user_device_addressing() -> None:
+def test_build_dzm_14x_matches_protocal_doc() -> None:
     from vgcs.skydroid.protocol import build_dzm_absolute_zoom
 
     frame = build_dzm_absolute_zoom(14.0)
     text = frame.decode("ascii")
-    assert text.startswith("#tpUD6wDZM00F08C")
-    assert tp_checksum(text[:-2]) == text[-2:].upper()
+    assert text == "#tpPD6wDZM00F08C84"
 
 
 def test_cam_zoom_maps_to_dzm_not_legacy() -> None:
     frame = build_top_frame("CAM_ZOOM", {"level": 30.0})
-    assert frame.startswith(b"#tpUD")
+    assert frame.startswith(b"#tpPD")
     assert b"DZM" in frame
     assert b"00F12C" in frame
     assert not frame.startswith(b"$TOP")
 
 
-def test_zmc_zoom_in() -> None:
+def test_zmc_zoom_in_udp_pm_format() -> None:
     frame = build_top_frame("ZMC", {"action": "in"})
-    assert frame.startswith(b"#TPUM")
-    assert b"ZMC02" in frame
+    assert frame.decode("ascii") == "#tpPM2wZMC0299"
+
+
+def test_dzm_step_zoom_in() -> None:
+    frame = build_top_frame("DZM_STEP", {"action": "in"})
+    assert b"DZM" in frame
+    assert b"000C" in frame

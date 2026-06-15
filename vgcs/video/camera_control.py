@@ -302,11 +302,13 @@ class SkydroidCameraControl:
             return
 
     def handle_zoom_step(self, step: int, ui_level: float) -> None:
-        del ui_level
         try:
             if int(step) == 0:
                 return
+            lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))
+            # C13 30× is digital zoom (DZM absolute); step pulse helps some firmware.
             self._adapter.camera_zoom_step(int(step))
+            self._adapter.camera_zoom(lvl)
         except Exception:
             return
 
