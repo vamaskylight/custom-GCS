@@ -250,6 +250,30 @@ class CompositeGimbalCameraControl:
     def __getattr__(self, name: str):
         return getattr(self._primary, name)
 
+    def set_zoom(self, level: float) -> None:
+        setter = getattr(self._primary, "set_zoom", None)
+        if callable(setter):
+            setter(float(level))
+        self._queue_mavlink_zoom_level(float(level))
+
+    def handle_zoom_step(self, step: int, ui_level: float) -> None:
+        handler = getattr(self._primary, "handle_zoom_step", None)
+        if callable(handler):
+            handler(int(step), float(ui_level))
+        if self._mavlink is not None and int(step) != 0:
+            try:
+                self._mavlink.queue_camera_zoom_step(int(step))
+            except Exception:
+                pass
+
+    def _queue_mavlink_zoom_level(self, level: float) -> None:
+        if self._mavlink is None:
+            return
+        try:
+            self._mavlink.queue_camera_zoom(float(level))
+        except Exception:
+            pass
+
 
 ZOOM_MIN = 1.0
 ZOOM_MAX_PREVIEW = 4.0
@@ -306,8 +330,6 @@ class SkydroidCameraControl:
             if int(step) == 0:
                 return
             lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))
-            # C13 30× is digital zoom (DZM absolute); step pulse helps some firmware.
-            self._adapter.camera_zoom_step(int(step))
             self._adapter.camera_zoom(lvl)
         except Exception:
             return
@@ -644,7 +666,6 @@ def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:
 
 
 def camera_preview_applies_digital_zoom(control: object | None) -> bool:
-    """UI crop-zoom only when the RTSP feed is not zoomed by TOP commands (C13 handles zoom)."""
-    primary = resolve_camera_control_primary(control)
-    return not isinstance(primary, SkydroidCameraControl)
+    """Apply VGCS preview crop-zoom so magnification matches the rail (TOP UDP is best-effort)."""
+    return True
 

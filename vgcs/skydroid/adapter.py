@@ -8,13 +8,15 @@ from dataclasses import dataclass
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
 from vgcs.skydroid.protocol import (
     build_top_frame,
+    build_zoom_command_burst,
     extract_attitude_deg,
     parse_top_frame,
 )
 from vgcs.skydroid.transport import TopUdpTransport
 
-# PROTOCAL.doc: TOP UDP port 5000; legacy field notes may mention 19856
-_C13_PROBE_PORTS = (5000, 19856)
+# PROTOCAL.doc: TOP UDP port 5000; lens/system also on 9003 on some C13 builds.
+_C13_PROBE_PORTS = (5000, 9003, 19856)
+_ZOOM_EXTRA_PORTS = (9003, 19853)
 _PROBE_TIMEOUT_S = 0.12
 
 # Motion commands: no UDP reply wait (C13 often has no timely ACK for GSY/GSP/GSM).
@@ -40,7 +42,6 @@ _MOTION_COMMANDS = frozenset(
         "PTZ_CENTER",
         "PTZ_STOP",
         "ZMC",
-        "DZM_STEP",
         "FCC",
     }
 )
@@ -194,15 +195,7 @@ class SkydroidTopUdpAdapter:
         self._enqueue(self._profile.camera_commands.get("photo", []), {}, True)
 
     def camera_zoom(self, level: float) -> None:
-        self._enqueue(self._profile.camera_commands.get("zoom", []), {"level": float(level)}, False)
-
-    def camera_zoom_step(self, direction: int) -> None:
-        """Digital zoom step for rail +/- (DZM 0C/0D + stop); absolute level sent separately."""
-        if int(direction) == 0:
-            return
-        action = "in" if int(direction) > 0 else "out"
-        self._enqueue(["DZM_STEP"], {"action": action}, False)
-        self._enqueue(["DZM_STEP"], {"action": "stop"}, False)
+        self._enqueue(["ZOOM_BURST"], {"level": float(level)}, False)
 
     def camera_focus_step(self, direction: int) -> None:
         key = "focus_in" if int(direction) < 0 else "focus_out"
@@ -357,6 +350,13 @@ class SkydroidTopUdpAdapter:
             self._last_send_mono = time.monotonic()
             if commands and commands[0] == "NOOP":
                 continue
+            if commands and commands[0] == "ZOOM_BURST":
+                try:
+                    level = float(params.get("level", 1.0) or 1.0)
+                    self._send_zoom_burst(level)
+                except Exception:
+                    pass
+                continue
             for command in commands:
                 frame = build_top_frame(command, params)
                 try:
@@ -373,6 +373,30 @@ class SkydroidTopUdpAdapter:
                     if not expect_reply:
                         break
                     continue
+
+    def _send_zoom_burst(self, level: float) -> None:
+        """Fire every known zoom frame on active + alternate TOP UDP ports (no reply wait)."""
+        frames = build_zoom_command_burst(level)
+        if not frames:
+            return
+        active_port = int(self._transport._port)
+        ports: list[int] = []
+        for p in (active_port, *_ZOOM_EXTRA_PORTS):
+            if int(p) not in ports:
+                ports.append(int(p))
+        for port in ports:
+            self._transport._port = int(port)
+            for frame in frames:
+                try:
+                    self._transport.send_and_receive(
+                        frame,
+                        expect_reply=False,
+                        log=True,
+                        timeout_s=0.05,
+                    )
+                except Exception:
+                    continue
+        self._transport._port = active_port
 
     def _status_loop(self) -> None:
         while self._running:

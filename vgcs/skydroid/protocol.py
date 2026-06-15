@@ -171,6 +171,32 @@ def build_dzm_absolute_zoom(zoom_x: float, *, camera_x0: int = 0) -> bytes:
     return build_pod_camera_command("DZM", data, dest="D")
 
 
+def build_dzm_absolute_zoom_ud(zoom_x: float, *, camera_x0: int = 0) -> bytes:
+    """DZM with User→Device addressing (UART / some UDP firmware paths)."""
+    units = int(round(max(0.0, min(300.0, float(zoom_x) * 10.0))))
+    mult_hex = f"{units:03X}"
+    data = f"{int(camera_x0) & 0xFF:02X}F{mult_hex}"
+    return build_tp_frame(dest="D", src="U", control="w", tag="DZM", data=data, variable=True)
+
+
+def build_mul_optical_zoom(zoom_x: float) -> bytes:
+    """Optical magnification (PROTOCAL §9.1, MUL). 24.0× → ``#tpPM4wMUL0240…``."""
+    units = int(round(max(1.0, min(300.0, float(zoom_x) * 10.0))))
+    return build_pod_camera_command("MUL", f"{units:04d}", dest="M")
+
+
+def build_zoom_command_burst(zoom_x: float) -> list[bytes]:
+    """
+    All known C13 zoom frames for one UI level (field firmware varies by port/addressing).
+    """
+    lvl = max(1.0, min(30.0, float(zoom_x)))
+    return [
+        build_dzm_absolute_zoom(lvl),
+        build_dzm_absolute_zoom_ud(lvl),
+        build_mul_optical_zoom(lvl),
+    ]
+
+
 def build_dzm_step_zoom(action: str) -> bytes:
     """Digital zoom step in/out/stop (PROTOCAL §14.1: 0C/0D with 0E stop)."""
     act = str(action or "").strip().lower()
@@ -334,6 +360,11 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
 
     if cmd in ("CAM_ZOOM", "CAM_Z"):
         level = float(p.get("level", p.get("zoom", 1.0)) or 1.0)
+        return build_dzm_absolute_zoom(level)
+
+    if cmd == "ZOOM_BURST":
+        # Expanded in adapter worker — placeholder frame.
+        level = float(p.get("level", 1.0) or 1.0)
         return build_dzm_absolute_zoom(level)
 
     if cmd == "ZMC":

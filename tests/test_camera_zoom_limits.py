@@ -27,9 +27,9 @@ def test_preview_zoom_limits_stay_at_4x() -> None:
     assert zstep == ZOOM_STEP_PREVIEW == 0.25
 
 
-def test_skydroid_skips_ui_digital_zoom() -> None:
+def test_preview_digital_zoom_always_applied() -> None:
     control = object.__new__(SkydroidCameraControl)
-    assert camera_preview_applies_digital_zoom(control) is False
+    assert camera_preview_applies_digital_zoom(control) is True
     assert camera_preview_applies_digital_zoom(NoopCameraControl()) is True
 
 
@@ -39,4 +39,4 @@ def test_composite_wrapper_uses_skydroid_zoom_limits() -> None:
     zmin, zmax, zstep = camera_zoom_limits(wrapped)
     assert zmax == ZOOM_MAX_SKYDROID == 30.0
     assert zstep == ZOOM_STEP_SKYDROID == 1.0
-    assert camera_preview_applies_digital_zoom(wrapped) is False
+    assert camera_preview_applies_digital_zoom(wrapped) is True

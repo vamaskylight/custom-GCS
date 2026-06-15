@@ -698,8 +698,12 @@ class MavlinkThread(QThread):
         # Map absolute UI level 1.0..4.0 → 0..100% for ZOOM_TYPE_RANGE.
         try:
             m = mavutil.mavlink
-            lvl = max(1.0, min(4.0, float(level)))
-            pct = (lvl - 1.0) / 3.0 * 100.0
+            lvl = max(1.0, float(level))
+            if lvl > 4.0:
+                pct = (lvl - 1.0) / 29.0 * 100.0
+            else:
+                pct = (lvl - 1.0) / 3.0 * 100.0
+            pct = max(0.0, min(100.0, float(pct)))
             self._send_command_long(
                 m.MAV_CMD_SET_CAMERA_ZOOM,
                 p1=float(m.ZOOM_TYPE_RANGE),
