@@ -296,16 +296,16 @@ class SkydroidCameraControl:
 
     def set_zoom(self, level: float) -> None:
         try:
-            lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(level)))
-            self._adapter.camera_zoom(lvl)
+            lvl = int(round(max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(level)))))
+            self._adapter.camera_zoom(float(lvl))
         except Exception:
             return
 
     def handle_zoom_step(self, step: int, ui_level: float) -> None:
         del step
         try:
-            lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))
-            self._adapter.camera_zoom(lvl)
+            lvl = int(round(max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))))
+            self._adapter.camera_zoom(float(lvl))
         except Exception:
             return
 
@@ -624,14 +624,24 @@ class SiyiCameraControl:
             return None
 
 
+def resolve_camera_control_primary(control: object | None) -> object | None:
+    """Unwrap ``CompositeGimbalCameraControl`` (and similar) to the real payload backend."""
+    if control is None:
+        return None
+    primary = getattr(control, "_primary", None)
+    return primary if primary is not None else control
+
+
 def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:
     """Return ``(min, max, step)`` for the camera rail zoom UI."""
-    if isinstance(control, SkydroidCameraControl):
+    primary = resolve_camera_control_primary(control)
+    if isinstance(primary, SkydroidCameraControl):
         return (ZOOM_MIN, ZOOM_MAX_SKYDROID, ZOOM_STEP_SKYDROID)
     return (ZOOM_MIN, ZOOM_MAX_PREVIEW, ZOOM_STEP_PREVIEW)
 
 
 def camera_preview_applies_digital_zoom(control: object | None) -> bool:
     """UI crop-zoom only when the RTSP feed is not zoomed by TOP commands (C13 handles zoom)."""
-    return not isinstance(control, SkydroidCameraControl)
+    primary = resolve_camera_control_primary(control)
+    return not isinstance(primary, SkydroidCameraControl)
 
