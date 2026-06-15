@@ -136,8 +136,65 @@ def build_system_command(tag: str, data: str, *, write: bool = True) -> bytes:
         control="w" if write else "r",
         tag=str(tag).upper()[:3],
         data=data,
+        src="U",
         variable=len(str(data)) != 2,
     )
+
+
+def build_pod_camera_command(
+    tag: str,
+    data: str,
+    *,
+    dest: str = "M",
+    write: bool = True,
+) -> bytes:
+    """UDP camera commands (ZMC/ZOM/FCC/…) use Pod->Module addressing per PROTOCAL.doc."""
+    return build_tp_frame(
+        dest=str(dest or "M").strip().upper()[:1],
+        src="P",
+        control="w" if write else "r",
+        tag=str(tag).upper()[:3],
+        data=str(data),
+        variable=len(str(data)) != 2,
+    )
+
+
+def build_dzm_absolute_zoom(zoom_x: float, *, camera_x0: int = 0) -> bytes:
+    """
+    C13 digital zoom absolute set (PROTOCAL §14.1, DZM tag).
+
+    ``zoom_x`` is visible-light multiplier (0.1× steps). External GCS uses User→Device
+    addressing (``#tpUD6wDZM…``); the doc's ``#tpPD6wDZM00F08C84`` example is pod-internal.
+    """
+    units = int(round(max(0.0, min(300.0, float(zoom_x) * 10.0))))
+    mult_hex = f"{units:03X}"
+    data = f"{int(camera_x0) & 0xFF:02X}F{mult_hex}"
+    return build_tp_frame(dest="D", src="U", control="w", tag="DZM", data=data, variable=True)
+
+
+def build_zmc_zoom(action: str) -> bytes:
+    """Step zoom in/out/stop (PROTOCAL §1.1, ZMC tag) — pair in/out with stop on some firmware."""
+    act = str(action or "").strip().lower()
+    code = {"stop": "00", "out": "01", "in": "02", "wide": "01", "tele": "02"}.get(act)
+    if code is None:
+        raise ValueError(f"unsupported ZMC action {action!r}")
+    return build_tp_frame(dest="M", src="U", control="w", tag="ZMC", data=code)
+
+
+def build_fcc_focus(action: str) -> bytes:
+    """Focus control (PROTOCAL §2.1, FCC tag)."""
+    act = str(action or "").strip().lower()
+    code = {
+        "stop": "00",
+        "near": "02",
+        "far": "01",
+        "in": "02",
+        "out": "01",
+        "auto": "10",
+    }.get(act)
+    if code is None:
+        raise ValueError(f"unsupported FCC action {action!r}")
+    return build_tp_frame(dest="M", src="U", control="w", tag="FCC", data=code)
 
 
 # --- Legacy $TOP,...*XOR (kept for simulators / old captures) ---
@@ -266,6 +323,18 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
     if cmd in cam_map:
         tag, data = cam_map[cmd]
         return build_system_command(tag, data)
+
+    if cmd in ("CAM_ZOOM", "CAM_Z"):
+        level = float(p.get("level", p.get("zoom", 1.0)) or 1.0)
+        return build_dzm_absolute_zoom(level)
+
+    if cmd == "ZMC":
+        return build_zmc_zoom(str(p.get("action", "stop")))
+
+    if cmd in ("CAM_FOCUS_NEAR", "CAM_FN", "FOCUS_NEAR"):
+        return build_fcc_focus("near")
+    if cmd in ("CAM_FOCUS_FAR", "CAM_FF", "FOCUS_FAR"):
+        return build_fcc_focus("far")
 
     return build_legacy_top_frame(cmd, p)
 
