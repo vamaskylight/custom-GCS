@@ -251,6 +251,13 @@ class CompositeGimbalCameraControl:
         return getattr(self._primary, name)
 
 
+ZOOM_MIN = 1.0
+ZOOM_MAX_PREVIEW = 4.0
+ZOOM_MAX_SKYDROID = 30.0
+ZOOM_STEP_PREVIEW = 0.25
+ZOOM_STEP_SKYDROID = 1.0
+
+
 class SkydroidCameraControl:
     def __init__(
         self,
@@ -289,14 +296,16 @@ class SkydroidCameraControl:
 
     def set_zoom(self, level: float) -> None:
         try:
-            self._adapter.camera_zoom(float(level))
+            lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(level)))
+            self._adapter.camera_zoom(lvl)
         except Exception:
             return
 
     def handle_zoom_step(self, step: int, ui_level: float) -> None:
         del step
         try:
-            self._adapter.camera_zoom(float(ui_level))
+            lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))
+            self._adapter.camera_zoom(lvl)
         except Exception:
             return
 
@@ -613,4 +622,16 @@ class SiyiCameraControl:
             return self._adapter.request_attitude()
         except Exception:
             return None
+
+
+def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:
+    """Return ``(min, max, step)`` for the camera rail zoom UI."""
+    if isinstance(control, SkydroidCameraControl):
+        return (ZOOM_MIN, ZOOM_MAX_SKYDROID, ZOOM_STEP_SKYDROID)
+    return (ZOOM_MIN, ZOOM_MAX_PREVIEW, ZOOM_STEP_PREVIEW)
+
+
+def camera_preview_applies_digital_zoom(control: object | None) -> bool:
+    """UI crop-zoom only when the RTSP feed is not zoomed by TOP commands (C13 handles zoom)."""
+    return not isinstance(control, SkydroidCameraControl)
 
