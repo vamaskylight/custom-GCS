@@ -106,6 +106,7 @@ from vgcs.observe.target_measure import (
     marks_same_height_band,
     MARKS_NOT_LEVEL_HINT,
     observation_facade_video_segments,
+    observation_building_height_segments,
     observation_target_latlon,
     resolve_vehicle_agl_m,
     segment_distance_between_rows,
@@ -864,6 +865,7 @@ class _ObservationExportTask(QRunnable):
         target_lat: float | None = None,
         target_lon: float | None = None,
         target_alt_m: float | None = None,
+        dem_path: str | None = None,
     ) -> None:
         super().__init__()
         self._rows = list(rows)
@@ -877,6 +879,7 @@ class _ObservationExportTask(QRunnable):
         self._target_lat = target_lat
         self._target_lon = target_lon
         self._target_alt_m = target_alt_m
+        self._dem_path = dem_path
 
     def run(self) -> None:
         fields = [
@@ -921,6 +924,15 @@ class _ObservationExportTask(QRunnable):
             "dooaf_range_correction_m",
             "dooaf_deflection_correction_m",
             "dooaf_miss_m",
+            "dooaf_miss_east_m",
+            "dooaf_miss_north_m",
+            "dooaf_miss_vertical_m",
+            "dooaf_east_correction_m",
+            "dooaf_north_correction_m",
+            "dooaf_elevation_correction_m",
+            "dooaf_target_dem_alt_m",
+            "dooaf_impact_dem_alt_m",
+            "dooaf_height_correction_m",
         ]
         session = build_dooaf_session(
             self._rows,
@@ -930,6 +942,7 @@ class _ObservationExportTask(QRunnable):
             target_lat=self._target_lat,
             target_lon=self._target_lon,
             target_alt_m=self._target_alt_m,
+            dem_path=self._dem_path,
         )
         corr = session.correction
         export_rows: list[dict[str, object]] = []
@@ -962,6 +975,15 @@ class _ObservationExportTask(QRunnable):
                 out["dooaf_range_correction_m"] = corr.range_correction_m
                 out["dooaf_deflection_correction_m"] = corr.deflection_correction_m
                 out["dooaf_miss_m"] = corr.impact_to_intended_m
+                out["dooaf_miss_east_m"] = corr.miss_east_m
+                out["dooaf_miss_north_m"] = corr.miss_north_m
+                out["dooaf_miss_vertical_m"] = corr.miss_vertical_m
+                out["dooaf_east_correction_m"] = -corr.miss_east_m
+                out["dooaf_north_correction_m"] = -corr.miss_north_m
+                out["dooaf_elevation_correction_m"] = corr.elevation_correction_m
+                out["dooaf_target_dem_alt_m"] = session.intended_dem_alt_m
+                out["dooaf_impact_dem_alt_m"] = session.impact_dem_alt_m
+                out["dooaf_height_correction_m"] = session.height_correction_m
             export_rows.append(out)
         obs_row = latest_mark_row(self._rows, DOOAF_ROLE_IMPACT)
         if obs_row is None and self._rows:
@@ -6473,11 +6495,13 @@ class MapWidget(QWidget):
     def _dooaf_settings_store(self) -> QSettings:
         return QSettings(_QS_NS, _QS_APP)
 
-    def _dooaf_session_kwargs(self) -> dict[str, float | None]:
+    def _dooaf_session_kwargs(self) -> dict[str, object]:
         s = resolved_dooaf_settings(
             self._dooaf_settings_store(), self._observations
         )
-        return dooaf_settings_kwargs(s)
+        kw = dooaf_settings_kwargs(s)
+        kw["dem_path"] = self._observe_dem_path()
+        return kw
 
     def _resolved_dooaf_settings(self) -> DooafSettings:
         return resolved_dooaf_settings(
@@ -7192,6 +7216,9 @@ class MapWidget(QWidget):
             row["geo_range_m"] = None
             row["geo_bearing_deg"] = None
             row["geo_depression_deg"] = None
+        from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
+
+        enrich_video_mark_target_altitude(row)
         if row.get("target_lat") is None or row.get("target_lon") is None:
             row["target_lat"] = None
             row["target_lon"] = None
@@ -7492,6 +7519,9 @@ class MapWidget(QWidget):
         hfov, _ = self._m8_geo_settings()
         segs = list(
             observation_facade_video_segments(self._observations, hfov_deg=hfov)
+        )
+        segs.extend(
+            observation_building_height_segments(self._observations, hfov_deg=hfov)
         )
         if dooaf_seg is not None:
             segs.append(dooaf_seg)
@@ -7805,6 +7835,7 @@ class MapWidget(QWidget):
                 target_lat=dooaf.get("target_lat"),
                 target_lon=dooaf.get("target_lon"),
                 target_alt_m=dooaf.get("target_alt_m"),
+                dem_path=dooaf.get("dem_path"),
             )
         )
 
@@ -7859,7 +7890,7 @@ class MapWidget(QWidget):
                 out.get("target_lat"), out.get("target_lon")
             )
             export_rows.append(out)
-        session = build_dooaf_session(list(self._observations))
+        session = build_dooaf_session(list(self._observations), dem_path=self._observe_dem_path())
         obs_row = latest_mark_row(self._observations, DOOAF_ROLE_IMPACT)
         if obs_row is None and self._observations:
             obs_row = self._observations[-1]

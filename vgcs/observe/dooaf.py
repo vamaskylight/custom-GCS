@@ -76,6 +76,8 @@ class FireCorrection:
     impact_to_intended_m: float
     miss_east_m: float
     miss_north_m: float
+    miss_vertical_m: float | None = None
+    elevation_correction_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,10 @@ class DooafSession:
     impact: GeoPoint | None
     drone: GeoPoint | None
     correction: FireCorrection | None
+    building_height_m: float | None = None
+    intended_dem_alt_m: float | None = None
+    impact_dem_alt_m: float | None = None
+    height_correction_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,7 @@ def compute_fire_correction(
     ``miss_along`` > 0 when impact is beyond intended along gun→target line.
     ``miss_right`` > 0 when impact is to the right of gun→target line.
     Corrections are the negation (what to add to firing data).
+    Horizontal miss is ground distance; vertical miss uses MSL altitudes when set.
     """
     range_gt = haversine_m(gun.lat, gun.lon, intended.lat, intended.lon)
     range_gi = haversine_m(gun.lat, gun.lon, impact.lat, impact.lon)
@@ -148,6 +155,11 @@ def compute_fire_correction(
     miss_n, miss_e = latlon_delta_to_ne_m(
         intended.lat, intended.lon, impact.lat, impact.lon
     )
+    miss_vertical: float | None = None
+    elev_correction: float | None = None
+    if intended.alt_m is not None and impact.alt_m is not None:
+        miss_vertical = float(intended.alt_m) - float(impact.alt_m)
+        elev_correction = miss_vertical
     return FireCorrection(
         range_correction_m=-along,
         deflection_correction_m=-right,
@@ -161,7 +173,115 @@ def compute_fire_correction(
         ),
         miss_east_m=miss_e,
         miss_north_m=miss_n,
+        miss_vertical_m=miss_vertical,
+        elevation_correction_m=elev_correction,
     )
+
+
+def _dem_alt_from_row(row: dict[str, Any]) -> float | None:
+    raw = row.get("target_alt_m_dem")
+    if raw is None:
+        raw = row.get("target_alt_m")
+    return _float_or_none(raw)
+
+
+def _default_observe_dem_path() -> str | None:
+    try:
+        from PySide6.QtCore import QSettings
+
+        st = QSettings("VGCS", "VGCS")
+        raw = st.value("observe/dem_path", "") or st.value("observe/dem_csv", "")
+        p = str(raw or "").strip()
+        return p or None
+    except Exception:
+        return None
+
+
+def dem_alt_msl_at_mark(
+    row: dict[str, Any] | None,
+    pt: GeoPoint | None,
+    *,
+    dem_path: str | Path | None = None,
+) -> float | None:
+    """DEM terrain elevation (MSL) at a mark's footprint."""
+    if row is not None:
+        dem = _dem_alt_from_row(row)
+        if dem is not None:
+            return dem
+    if pt is None:
+        return None
+    path = str(dem_path or "").strip() or _default_observe_dem_path()
+    if not path:
+        return None
+    from vgcs.observe.dem import elevation_at_wgs84
+
+    return elevation_at_wgs84(float(pt.lat), float(pt.lon), path)
+
+
+def resolve_dooaf_mark_elevations(
+    intended_row: dict[str, Any] | None,
+    impact_row: dict[str, Any] | None,
+    intended: GeoPoint | None,
+    impact: GeoPoint | None,
+    *,
+    hfov_deg: float = 62.0,
+) -> tuple[GeoPoint | None, GeoPoint | None, float | None]:
+    """
+    Apply roof+base pair height to DOOAF intended/impact MSL altitudes.
+
+    When intended is picked on the roof and impact at the base (video), building
+    height from facade geometry sets target roof MSL = base DEM + height.
+    """
+    from vgcs.observe.facade_plane import facade_vertical_height_between_marks
+
+    building_h: float | None = None
+    new_intended = intended
+    new_impact = impact
+
+    if (
+        intended_row is None
+        or impact_row is None
+        or intended is None
+        or impact is None
+    ):
+        return new_intended, new_impact, building_h
+
+    pair_h = facade_vertical_height_between_marks(
+        intended_row, impact_row, hfov_deg=hfov_deg
+    )
+    if pair_h is None or pair_h < 1.0:
+        return new_intended, new_impact, building_h
+
+    uy_i = intended_row.get("video_y_norm")
+    uy_p = impact_row.get("video_y_norm")
+    if uy_i is None or uy_p is None:
+        return new_intended, new_impact, building_h
+
+    try:
+        y_intended = float(uy_i)
+        y_impact = float(uy_p)
+    except (TypeError, ValueError):
+        return new_intended, new_impact, building_h
+
+    if y_intended < y_impact:
+        base_dem = _dem_alt_from_row(impact_row) or impact.alt_m
+        if base_dem is not None:
+            roof_alt = base_dem + pair_h
+            new_intended = GeoPoint(intended.lat, intended.lon, roof_alt)
+            new_impact = GeoPoint(impact.lat, impact.lon, base_dem)
+            building_h = pair_h
+            intended_row["building_height_m"] = pair_h
+            intended_row["target_alt_method"] = "pair_facade_vertical"
+            impact_row["target_alt_method"] = "terrain_dem"
+    elif y_impact < y_intended:
+        base_dem = _dem_alt_from_row(intended_row) or intended.alt_m
+        if base_dem is not None:
+            roof_alt = base_dem + pair_h
+            new_impact = GeoPoint(impact.lat, impact.lon, roof_alt)
+            new_intended = GeoPoint(intended.lat, intended.lon, base_dem)
+            building_h = pair_h
+
+    return new_intended, new_impact, building_h
 
 
 def _float_or_none(value: object) -> float | None:
@@ -430,6 +550,7 @@ def build_dooaf_session(
     target_lat: float | None = None,
     target_lon: float | None = None,
     target_alt_m: float | None = None,
+    dem_path: str | Path | None = None,
 ) -> DooafSession:
     gun = latest_mark(rows, DOOAF_ROLE_GUN) or gun_from_settings(
         gun_lat=gun_lat, gun_lon=gun_lon, gun_alt_m=gun_alt_m
@@ -439,15 +560,35 @@ def build_dooaf_session(
     )
     impact = latest_mark(rows, DOOAF_ROLE_IMPACT)
     drone = drone_from_row(rows[-1] if rows else None)
+    intended_row = latest_mark_row(rows, DOOAF_ROLE_INTENDED)
+    impact_row = latest_mark_row(rows, DOOAF_ROLE_IMPACT)
+    building_height_m: float | None = None
+    if intended is not None and impact is not None:
+        intended, impact, building_height_m = resolve_dooaf_mark_elevations(
+            intended_row,
+            impact_row,
+            intended,
+            impact,
+        )
     correction = None
     if gun is not None and intended is not None and impact is not None:
         correction = compute_fire_correction(gun, intended, impact)
+    intended_dem = dem_alt_msl_at_mark(intended_row, intended, dem_path=dem_path)
+    impact_dem = dem_alt_msl_at_mark(impact_row, impact, dem_path=dem_path)
+    height_correction_m: float | None = building_height_m
+    if height_correction_m is None and intended is not None and impact is not None:
+        if intended.alt_m is not None and impact.alt_m is not None:
+            height_correction_m = float(intended.alt_m) - float(impact.alt_m)
     return DooafSession(
         gun=gun,
         intended=intended,
         impact=impact,
         drone=drone,
         correction=correction,
+        building_height_m=building_height_m,
+        intended_dem_alt_m=intended_dem,
+        impact_dem_alt_m=impact_dem,
+        height_correction_m=height_correction_m,
     )
 
 
@@ -735,6 +876,151 @@ def _format_elev_msl_html(alt_m: float | None) -> str:
         return "<span class='muted'>—</span>"
 
 
+def _format_signed_correction_dir(
+    value_m: float,
+    *,
+    pos_label: str,
+    neg_label: str,
+) -> str:
+    """Format correction as e.g. ``East +3.2 m`` or ``West +1.0 m``."""
+    v = float(value_m)
+    if abs(v) < 0.05:
+        return "<span class='muted'>0.0 m</span>"
+    if v > 0:
+        return f"{_html_esc(pos_label)} +{v:.1f} m"
+    return f"{_html_esc(neg_label)} +{abs(v):.1f} m"
+
+
+def _format_miss_dir(value_m: float, pos_label: str, neg_label: str) -> str:
+    """Impact offset from target (+ = impact in positive direction)."""
+    v = float(value_m)
+    if abs(v) < 0.05:
+        return "0.0 m"
+    if v > 0:
+        return f"{v:.1f} m ({pos_label})"
+    return f"{abs(v):.1f} m ({neg_label})"
+
+
+def format_elevation_summary_html(session: DooafSession) -> str:
+    """DEM elevation and height correction between target (green) and impact (red)."""
+    tgt = session.intended
+    imp = session.impact
+    if tgt is None and imp is None:
+        return ""
+    rows: list[str] = []
+    if session.intended_dem_alt_m is not None:
+        rows.append(
+            f"<tr><td class='label-col'>Target DEM elevation</td>"
+            f"<td>{_format_elev_msl_html(session.intended_dem_alt_m)} "
+            "<span class='muted'>(terrain at target footprint)</span></td></tr>"
+        )
+    if tgt is not None and tgt.alt_m is not None:
+        rows.append(
+            f"<tr><td class='label-col'>Target elevation (corrected)</td>"
+            f"<td>{_format_elev_msl_html(tgt.alt_m)} "
+            "<span class='muted'>(ridge / roof / ray geometry)</span></td></tr>"
+        )
+    if session.impact_dem_alt_m is not None:
+        rows.append(
+            f"<tr><td class='label-col'>Impact DEM elevation</td>"
+            f"<td>{_format_elev_msl_html(session.impact_dem_alt_m)} "
+            "<span class='muted'>(terrain at impact footprint)</span></td></tr>"
+        )
+    if imp is not None and imp.alt_m is not None:
+        rows.append(
+            f"<tr><td class='label-col'>Impact elevation (corrected)</td>"
+            f"<td>{_format_elev_msl_html(imp.alt_m)}</td></tr>"
+        )
+    if session.height_correction_m is not None:
+        h = float(session.height_correction_m)
+        rows.append(
+            f"<tr><td class='label-col'>Height correction (target − impact)</td>"
+            f"<td><strong>{h:+.1f} m</strong> "
+            "<span class='muted'>(+ = target above impact)</span></td></tr>"
+        )
+    if not rows:
+        return ""
+    return _report_section_card(
+        "Elevation & height (DEM)",
+        (
+            "<p class='log-hint'>Green target vs red impact: DEM ground at each "
+            "footprint, corrected elevations for elevated points, and vertical "
+            "separation between the two marks.</p>"
+            "<table class='data-table dooaf-elevation-summary'><tbody>"
+            + "".join(rows)
+            + "</tbody></table>"
+        ),
+        extra_class="dooaf-elevation-summary",
+    )
+
+
+def format_client_fire_correction_html(session: DooafSession) -> str:
+    """Client summary: East/West, North/South, Left/Right, Up/Down corrections."""
+    c = session.correction
+    if c is None:
+        return ""
+    corr_east = -c.miss_east_m
+    corr_north = -c.miss_north_m
+    corr_left_right = c.deflection_correction_m
+    up_down = c.elevation_correction_m
+
+    miss_rows = (
+        f"<tr><td class='label-col'>East / West miss</td>"
+        f"<td>{_format_miss_dir(c.miss_east_m, 'impact east', 'impact west')}</td></tr>"
+        f"<tr><td class='label-col'>North / South miss</td>"
+        f"<td>{_format_miss_dir(c.miss_north_m, 'impact north', 'impact south')}</td></tr>"
+        f"<tr><td class='label-col'>Left / Right miss (gun line)</td>"
+        f"<td>{_format_miss_dir(c.miss_right_m, 'impact right', 'impact left')}</td></tr>"
+    )
+    if c.miss_vertical_m is not None:
+        mv = float(c.miss_vertical_m)
+        if abs(mv) < 0.05:
+            up_down_miss = "0.0 m"
+        elif mv > 0:
+            up_down_miss = f"{mv:.1f} m (target above impact)"
+        else:
+            up_down_miss = f"{abs(mv):.1f} m (target below impact)"
+        miss_rows += (
+            f"<tr><td class='label-col'>Up / Down miss</td><td>{up_down_miss}</td></tr>"
+        )
+
+    corr_rows = (
+        f"<tr><td class='label-col'><strong>East / West (add)</strong></td>"
+        f"<td>{_format_signed_correction_dir(corr_east, pos_label='East', neg_label='West')}</td></tr>"
+        f"<tr><td class='label-col'><strong>North / South (add)</strong></td>"
+        f"<td>{_format_signed_correction_dir(corr_north, pos_label='North', neg_label='South')}</td></tr>"
+        f"<tr><td class='label-col'><strong>Left / Right (add, R+)</strong></td>"
+        f"<td>{_format_signed_correction_dir(corr_left_right, pos_label='Right', neg_label='Left')}</td></tr>"
+        f"<tr><td class='label-col'><strong>Range along line (add)</strong></td>"
+        f"<td>{c.range_correction_m:+.1f} m</td></tr>"
+    )
+    if up_down is not None:
+        corr_rows += (
+            f"<tr><td class='label-col'><strong>Up / Down (add)</strong></td>"
+            f"<td>{_format_signed_correction_dir(up_down, pos_label='Up', neg_label='Down')}</td></tr>"
+        )
+
+    return _report_section_card(
+        "Fire correction summary (client)",
+        (
+            "<p class='log-hint'>Corrections to <strong>add</strong> on the next round. "
+            "East/West and North/South are map axes; Left/Right is relative to the "
+            "gun→target line; Up/Down is elevation (MSL).</p>"
+            "<table class='data-table dooaf-client-corr'>"
+            "<thead><tr><th colspan='2'>Miss — impact relative to target</th></tr></thead>"
+            "<tbody>"
+            + miss_rows
+            + "</tbody></table>"
+            "<table class='data-table dooaf-client-corr' style='margin-top:12px'>"
+            "<thead><tr><th colspan='2'>Correction — add for next round</th></tr></thead>"
+            "<tbody>"
+            + corr_rows
+            + "</tbody></table>"
+        ),
+        extra_class="dooaf-client-corr",
+    )
+
+
 def format_dooaf_html_summary(
     session: DooafSession,
     *,
@@ -778,6 +1064,27 @@ def format_dooaf_html_summary(
         except (TypeError, ValueError):
             elev_delta_row = ""
     if c is not None:
+        vert_card = ""
+        if c.miss_vertical_m is not None:
+            vert_card = (
+                "<div class='metric-card'>"
+                "<div class='metric-label'>Vertical miss (target − impact)</div>"
+                f"<div class='metric-value'>{c.miss_vertical_m:+.1f} m</div>"
+                "<div class='metric-sub'>MSL elevation difference</div>"
+                "</div>"
+            )
+        elev_corr_row = ""
+        if c.elevation_correction_m is not None:
+            elev_corr_row = (
+                f"<tr><td class='label-col'>Elevation correction (add, Up/Down)</td>"
+                f"<td>{_format_signed_correction_dir(c.elevation_correction_m, pos_label='Up', neg_label='Down')}</td></tr>"
+            )
+        building_row = ""
+        if session.height_correction_m is not None:
+            building_row = (
+                f"<tr><td class='label-col'>Height correction (target − impact)</td>"
+                f"<td>{session.height_correction_m:+.1f} m</td></tr>"
+            )
         corr_rows = _report_section_card(
             "Fire correction",
             (
@@ -791,11 +1098,12 @@ def format_dooaf_html_summary(
                 f"<div class='metric-value'>{c.deflection_correction_m:+.1f} m</div>"
                 "</div>"
                 "<div class='metric-card'>"
-                "<div class='metric-label'>Impact ↔ intended</div>"
+                "<div class='metric-label'>Horizontal miss</div>"
                 f"<div class='metric-value'>{c.impact_to_intended_m:.1f} m</div>"
-                "<div class='metric-sub'>Total miss distance</div>"
+                "<div class='metric-sub'>Ground distance intended ↔ impact</div>"
                 "</div>"
-                "</div>"
+                + vert_card
+                + "</div>"
                 "<table class='data-table dooaf-fire-corr'>"
                 "<tbody>"
                 f"<tr><td class='label-col'>Miss along line</td><td>{c.miss_along_m:+.1f} m</td></tr>"
@@ -809,6 +1117,8 @@ def format_dooaf_html_summary(
                 f"<tr><td class='label-col'>Gun → target bearing</td>"
                 f"<td>{c.bearing_gun_to_intended_deg:.1f}° "
                 "<span class='muted'>(compass from gun to target, not gimbal)</span></td></tr>"
+                + building_row
+                + elev_corr_row
                 + elev_delta_row
                 + "</tbody></table>"
             ),
@@ -836,6 +1146,8 @@ def format_dooaf_html_summary(
     )
     return (
         _report_section_card("DOOAF session", session_body)
+        + format_elevation_summary_html(session)
+        + format_client_fire_correction_html(session)
         + format_camera_orientation_html(obs_row)
         + corr_rows
     )
@@ -1016,6 +1328,8 @@ def _row_has_fire_correction(row: dict[str, object], cell_fn: Any) -> bool:
             "dooaf_range_correction_m",
             "dooaf_deflection_correction_m",
             "dooaf_miss_m",
+            "dooaf_east_correction_m",
+            "dooaf_elevation_correction_m",
         )
     )
 
@@ -1265,6 +1579,48 @@ def _format_observation_log_entry(
 
     if _row_has_fire_correction(row, cell_fn):
         detail_rows.append(_log_detail_section("Fire correction (this mark)"))
+        if not _is_missing_cell(row.get("dooaf_target_dem_alt_m"), cell_fn):
+            detail_rows.append(
+                _log_detail_row(
+                    "Target DEM elevation",
+                    _format_alt_m_html(row.get("dooaf_target_dem_alt_m"), cell_fn),
+                )
+            )
+        if not _is_missing_cell(row.get("dooaf_impact_dem_alt_m"), cell_fn):
+            detail_rows.append(
+                _log_detail_row(
+                    "Impact DEM elevation",
+                    _format_alt_m_html(row.get("dooaf_impact_dem_alt_m"), cell_fn),
+                )
+            )
+        if not _is_missing_cell(row.get("dooaf_height_correction_m"), cell_fn):
+            detail_rows.append(
+                _log_detail_row(
+                    "Height correction (target − impact)",
+                    _format_distance_m_html(row.get("dooaf_height_correction_m"), cell_fn),
+                )
+            )
+        if not _is_missing_cell(row.get("dooaf_east_correction_m"), cell_fn):
+            detail_rows.append(
+                _log_detail_row(
+                    "East / West correction (add)",
+                    _format_distance_m_html(row.get("dooaf_east_correction_m"), cell_fn),
+                )
+            )
+        if not _is_missing_cell(row.get("dooaf_north_correction_m"), cell_fn):
+            detail_rows.append(
+                _log_detail_row(
+                    "North / South correction (add)",
+                    _format_distance_m_html(row.get("dooaf_north_correction_m"), cell_fn),
+                )
+            )
+        if not _is_missing_cell(row.get("dooaf_elevation_correction_m"), cell_fn):
+            detail_rows.append(
+                _log_detail_row(
+                    "Up / Down correction (add)",
+                    _format_distance_m_html(row.get("dooaf_elevation_correction_m"), cell_fn),
+                )
+            )
         if not _is_missing_cell(row.get("dooaf_range_correction_m"), cell_fn):
             detail_rows.append(
                 _log_detail_row(
@@ -1275,14 +1631,14 @@ def _format_observation_log_entry(
         if not _is_missing_cell(row.get("dooaf_deflection_correction_m"), cell_fn):
             detail_rows.append(
                 _log_detail_row(
-                    "Deflection (add, R+)",
+                    "Left / Right correction (add, R+)",
                     _format_distance_m_html(row.get("dooaf_deflection_correction_m"), cell_fn),
                 )
             )
         if not _is_missing_cell(row.get("dooaf_miss_m"), cell_fn):
             detail_rows.append(
                 _log_detail_row(
-                    "Impact ↔ intended",
+                    "Horizontal miss",
                     _format_distance_m_html(row.get("dooaf_miss_m"), cell_fn),
                 )
             )
