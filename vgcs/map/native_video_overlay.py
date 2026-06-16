@@ -22,6 +22,16 @@ class VideoOverlayDetection:
     score: float | None = None
 
 
+@dataclass(frozen=True)
+class VideoOverlayMark:
+    """Normalized video observation click (0..1) with optional DOOAF role."""
+
+    x: float
+    y: float
+    role: str = ""
+    index: int = 0
+
+
 class NativeVideoOverlayLayer(QWidget):
     """
     Child of ``QLabel`` video preview — draws detection boxes/labels and manual video marks.
@@ -37,8 +47,7 @@ class NativeVideoOverlayLayer(QWidget):
         self.setStyleSheet("background: transparent;")
         self._content_rect: dict[str, float] | None = None
         self._detections: list[VideoOverlayDetection] = []
-        # Normalized 0..1 relative to this widget (matches click handling on the QLabel).
-        self._video_marks: list[tuple[float, float]] = []
+        self._video_marks: list[VideoOverlayMark] = []
         # Normalized segments (x1,y1,x2,y2) in widget coords + ground distance label.
         self._measure_segments: list[tuple[float, float, float, float, str]] = []
 
@@ -72,8 +81,34 @@ class NativeVideoOverlayLayer(QWidget):
         self._detections = out
         self.update()
 
-    def set_video_marks(self, marks: list[tuple[float, float]]) -> None:
-        self._video_marks = [(float(x), float(y)) for x, y in marks]
+    def set_video_marks(
+        self,
+        marks: list[VideoOverlayMark | tuple[float, float] | dict[str, object]],
+    ) -> None:
+        out: list[VideoOverlayMark] = []
+        for raw in marks:
+            if isinstance(raw, VideoOverlayMark):
+                out.append(raw)
+                continue
+            if isinstance(raw, tuple) and len(raw) >= 2:
+                out.append(
+                    VideoOverlayMark(float(raw[0]), float(raw[1]), str(raw[2] or ""), 0)
+                    if len(raw) >= 3
+                    else VideoOverlayMark(float(raw[0]), float(raw[1]))
+                )
+                continue
+            try:
+                out.append(
+                    VideoOverlayMark(
+                        x=float(raw.get("x", 0)),
+                        y=float(raw.get("y", 0)),
+                        role=str(raw.get("role", "") or ""),
+                        index=int(raw.get("index", 0) or 0),
+                    )
+                )
+            except (TypeError, ValueError, AttributeError):
+                continue
+        self._video_marks = out
         self.update()
 
     def set_target_measure_segments(
@@ -229,11 +264,36 @@ class NativeVideoOverlayLayer(QWidget):
             if label:
                 self._draw_measure_label(p, ax, ay, bx, by, label)
 
-        for xn, yn in self._video_marks:
+        for mark in self._video_marks:
+            xn, yn = float(mark.x), float(mark.y)
             cx = cl + xn * cw
             cy = ct + yn * ch
-            p.setPen(QPen(QColor(255, 210, 70, 240), 2))
-            p.setBrush(QColor(255, 80, 60, 220))
-            p.drawEllipse(int(cx) - 5, int(cy) - 5, 10, 10)
-            p.drawLine(int(cx - 12), int(cy), int(cx + 12), int(cy))
-            p.drawLine(int(cx), int(cy - 12), int(cx), int(cy + 12))
+            role = str(mark.role or "").strip().lower()
+            if role == "intended_target":
+                fill = QColor(34, 197, 94, 235)
+                ring = QColor(187, 247, 208, 255)
+            elif role == "impact":
+                fill = QColor(239, 68, 68, 235)
+                ring = QColor(254, 202, 202, 255)
+            else:
+                fill = QColor(255, 120, 60, 230)
+                ring = QColor(255, 220, 120, 255)
+            radius = 7
+            p.setPen(QPen(ring, 3))
+            p.setBrush(fill)
+            p.drawEllipse(int(cx) - radius, int(cy) - radius, radius * 2, radius * 2)
+            p.setPen(QPen(ring, 2))
+            p.drawLine(int(cx - 14), int(cy), int(cx + 14), int(cy))
+            p.drawLine(int(cx), int(cy - 14), int(cx), int(cy + 14))
+            if mark.index > 0:
+                label = str(mark.index)
+                font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+                p.setFont(font)
+                metrics = p.fontMetrics()
+                tw = metrics.horizontalAdvance(label) + 8
+                th = metrics.height() + 4
+                tx = int(cx + 10)
+                ty = int(cy - th - 8)
+                p.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
+                p.setPen(QColor(255, 255, 255))
+                p.drawText(tx + 4, ty + metrics.ascent() + 2, label)
