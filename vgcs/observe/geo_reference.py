@@ -410,3 +410,48 @@ def compute_geo_reference(
         method=method,
         bearing_deg=bearing,
     )
+
+
+def enrich_video_mark_target_altitude(row: dict[str, object]) -> None:
+    """
+    Resolve ``target_alt_m`` for video marks: DEM ground vs ray-derived facade height.
+
+    Stores ``target_alt_m_dem``, ``target_alt_m_ray``, and ``target_alt_method``.
+    """
+    from vgcs.observe.facade_plane import infer_ray_target_msl_from_row
+
+    dem_alt = row.get("target_alt_m")
+    try:
+        dem_val = float(dem_alt) if dem_alt is not None else None
+    except (TypeError, ValueError):
+        dem_val = None
+    row["target_alt_m_dem"] = dem_val
+
+    ray_alt = infer_ray_target_msl_from_row(row)  # type: ignore[arg-type]
+    row["target_alt_m_ray"] = ray_alt
+
+    method = "terrain_dem"
+    resolved: float | None = dem_val
+
+    try:
+        y_norm = float(row.get("video_y_norm")) if row.get("video_y_norm") is not None else 0.55
+    except (TypeError, ValueError):
+        y_norm = 0.55
+
+    if ray_alt is not None and dem_val is not None:
+        delta = ray_alt - dem_val
+        if delta > 1.0 and y_norm < 0.52:
+            resolved = ray_alt
+            method = "ray_elevated"
+        elif delta > 1.5:
+            resolved = ray_alt
+            method = "ray_facade"
+        elif abs(delta) <= 1.5 and y_norm >= 0.48:
+            resolved = dem_val
+            method = "terrain_dem"
+    elif ray_alt is not None and dem_val is None:
+        resolved = ray_alt
+        method = "ray_slant"
+
+    row["target_alt_m"] = resolved
+    row["target_alt_method"] = method

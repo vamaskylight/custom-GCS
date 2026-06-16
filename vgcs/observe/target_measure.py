@@ -1622,6 +1622,83 @@ def observation_facade_video_segments(
     return out
 
 
+def cluster_observations_by_video_x(
+    rows: list[dict[str, Any]],
+    *,
+    max_dx_norm: float = 0.10,
+    require_geo: bool = False,
+) -> list[list[dict[str, Any]]]:
+    """Group video marks on the same vertical pillar (roof + base)."""
+    clusters: list[list[dict[str, Any]]] = []
+    for row in rows:
+        if str(row.get("kind") or "") != "video_mark":
+            continue
+        if require_geo and observation_target_latlon(row) is None:
+            continue
+        xy = _video_xy(row)
+        if xy is None:
+            continue
+        x = xy[0]
+        placed = False
+        for cluster in clusters:
+            ref = _video_xy(cluster[0])
+            if ref is None:
+                continue
+            if abs(x - ref[0]) <= float(max_dx_norm):
+                cluster.append(row)
+                placed = True
+                break
+        if not placed:
+            clusters.append([row])
+    return clusters
+
+
+def observation_building_height_segments(
+    rows: list[dict[str, Any]],
+    *,
+    hfov_deg: float = 62.0,
+    latest_pair_only: bool = True,
+) -> list[tuple[float, float, float, float, str]]:
+    """Vertical dashed lines: building height from roof + base video marks."""
+    from vgcs.observe.facade_plane import facade_vertical_height_between_marks
+
+    def _height_segment(
+        row_a: dict[str, Any], row_b: dict[str, Any]
+    ) -> tuple[float, float, float, float, str] | None:
+        xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+        if xy_a is None or xy_b is None:
+            return None
+        if abs(xy_b[1] - xy_a[1]) < 0.04:
+            return None
+        h = facade_vertical_height_between_marks(row_a, row_b, hfov_deg=hfov_deg)
+        if h is None or h < 0.5:
+            return None
+        upper_y = min(xy_a[1], xy_b[1])
+        lower_y = max(xy_a[1], xy_b[1])
+        x_mid = 0.5 * (xy_a[0] + xy_b[0])
+        return (x_mid, upper_y, x_mid, lower_y, f"{h:.1f} m (building height)")
+
+    pair = _last_two_video_marks(rows)
+    if latest_pair_only and pair is not None:
+        seg = _height_segment(pair[0], pair[1])
+        return [seg] if seg else []
+
+    out: list[tuple[float, float, float, float, str]] = []
+    for cluster in cluster_observations_by_video_x(rows, require_geo=True):
+        if len(cluster) < 2:
+            continue
+        ordered = sorted(
+            cluster, key=lambda r: float((_video_xy(r) or (0.0, 0.0))[1])
+        )
+        upper, lower = ordered[0], ordered[-1]
+        if upper is lower:
+            continue
+        seg = _height_segment(upper, lower)
+        if seg:
+            out.append(seg)
+    return out
+
+
 _SEGMENT_SCALE_MIN = 0.15
 _SEGMENT_SCALE_MAX = 3.00
 

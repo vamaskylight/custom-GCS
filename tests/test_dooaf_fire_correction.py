@@ -180,13 +180,13 @@ def test_gimbal_direction_labels():
 
 def test_dooaf_html_summary_highlights_and_camera():
     gun = GeoPoint(12.0, 77.0)
-    intended = GeoPoint(12.01, 77.0)
-    impact = GeoPoint(12.01, 77.001)
+    intended = GeoPoint(12.01, 77.0, 100.0)
+    impact = GeoPoint(12.01, 77.001, 95.0)
     session = build_dooaf_session(
         [
             _row(DOOAF_ROLE_GUN, gun.lat, gun.lon),
-            _row(DOOAF_ROLE_INTENDED, intended.lat, intended.lon),
-            _row(DOOAF_ROLE_IMPACT, impact.lat, impact.lon),
+            _row(DOOAF_ROLE_INTENDED, intended.lat, intended.lon, target_alt_m=100.0),
+            _row(DOOAF_ROLE_IMPACT, impact.lat, impact.lon, target_alt_m=95.0),
         ],
     )
     obs = {
@@ -196,6 +196,9 @@ def test_dooaf_html_summary_highlights_and_camera():
     }
     html = format_dooaf_html_summary(session, observation_row=obs)
     assert "dooaf-fire-corr" in html
+    assert "dooaf-client-corr" in html
+    assert "dooaf-elevation-summary" in html
+    assert "East / West (add)" in html
     assert "dooaf-target-coords" in html
     assert "dooaf-impact-coords" in html
     assert "Yaw right 28.3°" in html
