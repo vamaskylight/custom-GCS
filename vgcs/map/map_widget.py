@@ -62,7 +62,11 @@ from PySide6.QtGui import (
     QColor,
     QRadialGradient,
 )
-from vgcs.map.native_video_overlay import NativeVideoOverlayLayer, VideoOverlayDetection
+from vgcs.map.native_video_overlay import (
+    NativeVideoOverlayLayer,
+    VideoOverlayDetection,
+    VideoOverlayMark,
+)
 from vgcs.map.dooaf_setup_dialog import (
     DOOAF_PICK_GUN,
     DOOAF_PICK_TARGET,
@@ -6396,10 +6400,17 @@ class MapWidget(QWidget):
         except Exception:
             pass
         if enabled:
-            self._set_status(
-                "Target ON: mark fall of shot on video "
-                "(set gun + target in DOOAF Setup first)"
-            )
+            rs = self._resolved_dooaf_settings()
+            if rs.target_lat is not None and rs.target_lon is not None:
+                self._set_status(
+                    "Target ON: mark fall of shot on video (red) — "
+                    "target already set in DOOAF Setup"
+                )
+            else:
+                self._set_status(
+                    "Target ON: 1st click = actual target (green), "
+                    "2nd = fall of shot (red) on same building line"
+                )
             try:
                 if bool(getattr(self, "_video_swapped", False)):
                     self._ensure_video_pro_hud_visible()
@@ -6490,7 +6501,48 @@ class MapWidget(QWidget):
         }
 
     def _current_observe_dooaf_role(self) -> str:
-        return DOOAF_ROLE_IMPACT
+        """
+        Role for the next observation video/map mark.
+
+        If actual target is already set (DOOAF Setup or a prior green mark),
+        further video clicks are fall of shot. Otherwise the first video click
+        is the actual target (roof / ridge).
+        """
+        override = getattr(self, "_observe_mark_role_override", None)
+        if override in (DOOAF_ROLE_INTENDED, DOOAF_ROLE_IMPACT, DOOAF_ROLE_SURVEY):
+            return str(override)
+        for row in self._observations:
+            if str(row.get("kind") or "") != "video_mark":
+                continue
+            if str(row.get("dooaf_role") or "") == DOOAF_ROLE_INTENDED:
+                return DOOAF_ROLE_IMPACT
+        rs = self._resolved_dooaf_settings()
+        if rs.target_lat is not None and rs.target_lon is not None:
+            return DOOAF_ROLE_IMPACT
+        return DOOAF_ROLE_INTENDED
+
+    def _video_overlay_marks(self) -> list[VideoOverlayMark]:
+        """All video clicks for the on-video overlay (synced from observations)."""
+        out: list[VideoOverlayMark] = []
+        for idx, row in enumerate(self._observations):
+            if str(row.get("kind") or "") != "video_mark":
+                continue
+            vx = row.get("video_x_norm")
+            vy = row.get("video_y_norm")
+            if vx is None or vy is None:
+                continue
+            try:
+                out.append(
+                    VideoOverlayMark(
+                        x=float(vx),
+                        y=float(vy),
+                        role=str(row.get("dooaf_role") or ""),
+                        index=idx + 1,
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def _dooaf_settings_store(self) -> QSettings:
         return QSettings(_QS_NS, _QS_APP)
@@ -7350,6 +7402,11 @@ class MapWidget(QWidget):
             row["segment_distance_m"] = None
         self._observations.append(row)
         idx = len(self._observations) - 1
+        if kind == "video_mark" and video_x is not None and video_y is not None:
+            try:
+                self._video_obs_marks.append((float(video_x), float(video_y)))
+            except Exception:
+                pass
         if capture_snapshot:
             self._schedule_observation_snapshot(idx)
         try:
@@ -7416,6 +7473,10 @@ class MapWidget(QWidget):
                 msg += f" — {warn}"
                 if dooaf_role == DOOAF_ROLE_IMPACT and row.get("target_lat") is None:
                     msg += " — no HIT on map (click ground in lower video, not sky/horizon)"
+        if dooaf_role == DOOAF_ROLE_INTENDED:
+            msg += " — actual target (green) marked"
+        elif dooaf_role == DOOAF_ROLE_IMPACT:
+            msg += " — fall of shot (red) marked"
         self._set_status(msg)
         self._refresh_observation_measure_overlays()
         self._refresh_dooaf_map_overlay()
@@ -7430,12 +7491,6 @@ class MapWidget(QWidget):
                     nm.add_observation_map_marker(float(map_lat), float(map_lon))
             except Exception:
                 pass
-        if kind == "video_mark" and video_x is not None and video_y is not None:
-            try:
-                self._video_obs_marks.append((float(video_x), float(video_y)))
-                self._schedule_video_marks_overlay_refresh()
-            except Exception:
-                pass
 
     def _schedule_video_marks_overlay_refresh(self) -> None:
         """Coalesce overlay repaints when the operator places several Target marks quickly."""
@@ -7446,22 +7501,29 @@ class MapWidget(QWidget):
             t.timeout.connect(self._flush_video_marks_overlay)
             self._obs_marks_overlay_timer = t
         t.start(32)
+        try:
+            self._flush_video_marks_overlay()
+        except Exception:
+            pass
 
     def _flush_video_marks_overlay(self) -> None:
         try:
-            self._native_video_overlay.set_video_marks(list(self._video_obs_marks))
-            self._native_video_overlay.set_target_measure_segments(
-                self._observation_video_measure_segments()
-            )
+            marks = self._video_overlay_marks()
+            self._video_obs_marks = [(m.x, m.y) for m in marks]
+            ly = self._native_video_overlay
+            ly.set_video_marks(marks)
+            ly.set_target_measure_segments(self._observation_video_measure_segments())
+            if bool(getattr(self, "_video_preview_enabled", False)):
+                ly.show()
+                ly.raise_()
+            self._sync_native_video_overlay()
         except Exception:
             pass
 
     def _observation_measure_labels_and_segments(
         self,
     ) -> tuple[list[str], list[tuple[float, float, float, float, str]]]:
-        """Map labels (one per track edge) and video measure lines (same-height pairs only)."""
-        if self._current_observe_dooaf_role() == DOOAF_ROLE_IMPACT:
-            return [], []
+        """Map labels (one per track edge) and video measure lines."""
         labels: list[str] = []
         segs: list[tuple[float, float, float, float, str]] = []
         hfov, _ = self._m8_geo_settings()
@@ -7512,10 +7574,8 @@ class MapWidget(QWidget):
         return labels, segs
 
     def _observation_video_measure_segments(self) -> list[tuple[float, float, float, float, str]]:
-        """Dashed lines: DOOAF intended→impact, or facade tape widths (legacy measure)."""
+        """Dashed lines: building height, facade width, intended→impact."""
         dooaf_seg = dooaf_intended_impact_video_segment(self._observations)
-        if self._current_observe_dooaf_role() == DOOAF_ROLE_IMPACT:
-            return [dooaf_seg] if dooaf_seg is not None else []
         hfov, _ = self._m8_geo_settings()
         segs = list(
             observation_facade_video_segments(self._observations, hfov_deg=hfov)
@@ -7755,6 +7815,7 @@ class MapWidget(QWidget):
         n = len(self._observations)
         self._observations.clear()
         self._video_obs_marks.clear()
+        self._observe_mark_role_override = None
         try:
             clear_tape_pair_override()
         except Exception:
