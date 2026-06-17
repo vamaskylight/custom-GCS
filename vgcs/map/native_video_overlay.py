@@ -275,6 +275,9 @@ class NativeVideoOverlayLayer(QWidget):
             elif role == "impact":
                 fill = QColor(239, 68, 68, 235)
                 ring = QColor(254, 202, 202, 255)
+            elif role == "gun_origin":
+                fill = QColor(59, 130, 246, 235)
+                ring = QColor(191, 219, 254, 255)
             else:
                 fill = QColor(255, 120, 60, 230)
                 ring = QColor(255, 220, 120, 255)
