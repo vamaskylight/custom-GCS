@@ -36,6 +36,19 @@ def test_dem_ground_agl_when_ekf_home_offset():
     assert src == "dem_terrain"
 
 
+def test_dem_ground_agl_when_dem_above_ekf_at_altitude():
+    """High hover: terrain AGL from DEM can exceed EKF-by-home by >1 m."""
+    agl, src = prefer_dem_ground_agl_over_ekf(
+        relative_alt_m=99.43,
+        facade_agl_m=99.43,
+        facade_src="ekf_relative",
+        dem_ground_agl_m=100.99,
+        dem_ground_src="dem_terrain",
+    )
+    assert agl == 100.99
+    assert src == "dem_terrain"
+
+
 def test_nadir_mark_near_vehicle():
     r = _nadir_result()
     assert r.ok

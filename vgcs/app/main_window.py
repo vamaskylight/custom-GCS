@@ -2774,8 +2774,6 @@ class MainWindow(QMainWindow):
         if self._armed_since is None:
             return False
         rel_display_m = float(self._map_rel_alt_m)
-        if self._home_rel_alt_baseline_m is not None:
-            rel_display_m -= float(self._home_rel_alt_baseline_m)
         return abs(rel_display_m) >= 1.5 or float(self._map_groundspeed_mps) >= 1.2
 
     def _refresh_dashboard_flight_state(self) -> None:
@@ -2927,8 +2925,8 @@ class MainWindow(QMainWindow):
             s = elapsed % 60
             flight_time_text = f"{h:02d}:{m:02d}:{s:02d}"
         rel_display_m = float(self._map_rel_alt_m)
-        if self._home_rel_alt_baseline_m is not None:
-            rel_display_m -= float(self._home_rel_alt_baseline_m)
+        # Match FlyGCS / MAVLink: GLOBAL_POSITION_INT.relative_alt is already above home.
+        # Do not subtract arm baseline again (that caused ~2–3 m low vs other GCS at 100 m).
         if self._armed_since is None and float(self._map_groundspeed_mps) < 0.5:
             if abs(rel_display_m) < 1.5:
                 rel_display_m = 0.0
