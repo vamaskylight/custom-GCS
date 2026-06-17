@@ -140,13 +140,12 @@ class CamObserveBlock(QWidget):
         row_setup.setContentsMargins(0, 0, 0, 0)
         row_setup.setSpacing(4)
         row_setup.addWidget(self.setup_btn, 1)
-        hint = QLabel("Target ON: 1st click = actual target (green), 2nd = fall of shot (red)")
+        hint = QLabel("DOOAF Setup: Pick on video for target · Target ON = fall of shot (red)")
         hint.setObjectName("observeDooafHint")
         hint.setWordWrap(True)
         hint.setToolTip(
-            "First video click marks the actual target on the building (roof/ridge). "
-            "Second click marks fall of shot (floor/base) on the same vertical line. "
-            "Set gun position in DOOAF Setup; target can be set on video or in Setup."
+            "Set gun and actual target in DOOAF Setup (Pick on map or Pick on video). "
+            "Then turn Target ON and click fall of shot on the video feed."
         )
         v.addLayout(row1)
         v.addLayout(row2)

@@ -1193,6 +1193,8 @@ class MapWidget(QWidget):
         self._dooaf_pick_complete = None
         self._dooaf_pick_dialog: DooafSetupDialog | None = None
         self._dooaf_pick_from_video = False
+        self._dooaf_pick_role: str = ""
+        self._dooaf_setup_video_marks: dict[str, tuple[float, float]] = {}
         self._dooaf_restore_target_after_pick = False
         self._video_obs_marks: list[tuple[float, float]] = []
         self._obs_snapshot_bridge = _ObservationSnapshotBridge(self)
@@ -6400,17 +6402,10 @@ class MapWidget(QWidget):
         except Exception:
             pass
         if enabled:
-            rs = self._resolved_dooaf_settings()
-            if rs.target_lat is not None and rs.target_lon is not None:
-                self._set_status(
-                    "Target ON: mark fall of shot on video (red) — "
-                    "target already set in DOOAF Setup"
-                )
-            else:
-                self._set_status(
-                    "Target ON: 1st click = actual target (green), "
-                    "2nd = fall of shot (red) on same building line"
-                )
+            self._set_status(
+                "Target ON: mark fall of shot on video (red) — "
+                "set actual target in DOOAF Setup (Pick on map / Pick on video)"
+            )
             try:
                 if bool(getattr(self, "_video_swapped", False)):
                     self._ensure_video_pro_hud_visible()
@@ -6501,29 +6496,29 @@ class MapWidget(QWidget):
         }
 
     def _current_observe_dooaf_role(self) -> str:
-        """
-        Role for the next observation video/map mark.
-
-        If actual target is already set (DOOAF Setup or a prior green mark),
-        further video clicks are fall of shot. Otherwise the first video click
-        is the actual target (roof / ridge).
-        """
-        override = getattr(self, "_observe_mark_role_override", None)
-        if override in (DOOAF_ROLE_INTENDED, DOOAF_ROLE_IMPACT, DOOAF_ROLE_SURVEY):
-            return str(override)
-        for row in self._observations:
-            if str(row.get("kind") or "") != "video_mark":
-                continue
-            if str(row.get("dooaf_role") or "") == DOOAF_ROLE_INTENDED:
-                return DOOAF_ROLE_IMPACT
-        rs = self._resolved_dooaf_settings()
-        if rs.target_lat is not None and rs.target_lon is not None:
-            return DOOAF_ROLE_IMPACT
-        return DOOAF_ROLE_INTENDED
+        """Observation Target clicks are always fall of shot (use DOOAF Setup → Pick on video for actual target)."""
+        return DOOAF_ROLE_IMPACT
 
     def _video_overlay_marks(self) -> list[VideoOverlayMark]:
-        """All video clicks for the on-video overlay (synced from observations)."""
+        """Video clicks: DOOAF Setup picks (green target) + observation fall-of-shot (red)."""
         out: list[VideoOverlayMark] = []
+        seen: set[tuple[float, float]] = set()
+        for role, pt in self._dooaf_setup_video_marks.items():
+            try:
+                key = (round(float(pt[0]), 4), round(float(pt[1]), 4))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(
+                    VideoOverlayMark(
+                        x=float(pt[0]),
+                        y=float(pt[1]),
+                        role=str(role),
+                        index=0,
+                    )
+                )
+            except (TypeError, ValueError, IndexError):
+                continue
         for idx, row in enumerate(self._observations):
             if str(row.get("kind") or "") != "video_mark":
                 continue
@@ -6540,6 +6535,7 @@ class MapWidget(QWidget):
                         index=idx + 1,
                     )
                 )
+                seen.add((round(float(vx), 4), round(float(vy), 4)))
             except (TypeError, ValueError):
                 continue
         return out
@@ -6820,6 +6816,12 @@ class MapWidget(QWidget):
         }
         row.update(self._observation_context())
         self._enrich_observation_geo_reference(row)
+        from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
+
+        enrich_video_mark_target_altitude(row)
+        from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
+
+        enrich_video_mark_target_altitude(row)
         lat = row.get("target_lat")
         lon = row.get("target_lon")
         if lat is None or lon is None:
@@ -6853,7 +6855,8 @@ class MapWidget(QWidget):
                     (
                         f"{detail}\n\n"
                         "Tips:\n"
-                        "• Click the ground in the lower part of the video (not sky).\n"
+                        "• Actual target: click roof / aim point on the building.\n"
+                        "• Fall of shot: click ground in the lower part of the video (not sky).\n"
                         "• Wait for mavlink GPS fix (3D GPS helps).\n"
                         "• Pitch gimbal down if the scene is oblique.\n"
                         "• Pick on map if video geo is unreliable."
@@ -6881,6 +6884,9 @@ class MapWidget(QWidget):
             return True
         cb = self._dooaf_pick_complete
         lat, lon, alt_m = geo
+        pick_role = str(getattr(self, "_dooaf_pick_role", "") or DOOAF_ROLE_INTENDED)
+        self._dooaf_setup_video_marks[pick_role] = (float(video_x), float(video_y))
+        self._schedule_video_marks_overlay_refresh()
         self._end_dooaf_map_pick(restore_target_mode=True)
         print(
             f"[VGCS:observe] dooaf video pick ok lat={lat:.7f} lon={lon:.7f} "
@@ -6933,6 +6939,7 @@ class MapWidget(QWidget):
         self._end_dooaf_map_pick(restore_target_mode=True)
         self._dooaf_pick_dialog = dlg
         pick_role = DOOAF_ROLE_GUN if role == DOOAF_PICK_GUN else DOOAF_ROLE_INTENDED
+        self._dooaf_pick_role = pick_role
         label = dooaf_role_display(pick_role)
         source = "video" if from_video else "map"
 
@@ -7008,7 +7015,9 @@ class MapWidget(QWidget):
                 f"(Target paused={self._dooaf_restore_target_after_pick})"
             )
             self._set_status(
-                f"Click the ground in the video to set {label} (GPS + DEM geo)"
+                f"Click actual target on video ({label}) — roof / aim point on building"
+                if pick_role == DOOAF_ROLE_INTENDED
+                else f"Click the ground in the video to set {label} (GPS + DEM geo)"
             )
         else:
             try:
@@ -7473,10 +7482,6 @@ class MapWidget(QWidget):
                 msg += f" — {warn}"
                 if dooaf_role == DOOAF_ROLE_IMPACT and row.get("target_lat") is None:
                     msg += " — no HIT on map (click ground in lower video, not sky/horizon)"
-        if dooaf_role == DOOAF_ROLE_INTENDED:
-            msg += " — actual target (green) marked"
-        elif dooaf_role == DOOAF_ROLE_IMPACT:
-            msg += " — fall of shot (red) marked"
         self._set_status(msg)
         self._refresh_observation_measure_overlays()
         self._refresh_dooaf_map_overlay()
@@ -7815,7 +7820,6 @@ class MapWidget(QWidget):
         n = len(self._observations)
         self._observations.clear()
         self._video_obs_marks.clear()
-        self._observe_mark_role_override = None
         try:
             clear_tape_pair_override()
         except Exception:
