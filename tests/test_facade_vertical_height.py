@@ -12,6 +12,7 @@ from vgcs.observe.dooaf import (
 )
 from vgcs.observe.facade_plane import (
     facade_vertical_height_between_marks,
+    infer_elevated_click_target_msl_from_row,
     infer_ray_target_msl_m,
     marks_suitable_for_facade_height,
 )
@@ -121,3 +122,40 @@ def test_enrich_video_mark_keeps_ground_for_base_click():
     enrich_video_mark_target_altitude(row)
     assert row.get("target_alt_m_dem") == 11.28
     assert row.get("target_alt_method") == "terrain_dem"
+
+
+def _client_distant_target_row() -> dict:
+    """Field log: ~788 m gun→target, ~102 m AGL, DEM ~11.3 m, click on structure."""
+    return {
+        "video_x_norm": 0.540,
+        "video_y_norm": 0.467,
+        "target_lat": 20.4091622,
+        "target_lon": 72.8804531,
+        "geo_range_m": 788.4,
+        "geo_bearing_deg": 200.0,
+        "geo_depression_deg": 7.37,
+        "vehicle_alt_msl_m": 113.0,
+        "target_alt_m": 11.29,
+        "target_alt_m_dem": 11.29,
+        "measure_agl_m": 102.0,
+        "ekf_rel_alt_m": 100.4,
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_INTENDED,
+    }
+
+
+def test_infer_elevated_click_msl_distant_field_target():
+    row = _client_distant_target_row()
+    msl = infer_elevated_click_target_msl_from_row(row)
+    assert msl is not None
+    assert msl > 20.0
+    assert msl < 35.0
+    assert msl - 11.29 > 10.0
+
+
+def test_enrich_video_mark_elevates_distant_facade_click():
+    row = _client_distant_target_row()
+    enrich_video_mark_target_altitude(row)
+    assert row.get("target_alt_method") == "video_facade_elevated"
+    assert row.get("target_alt_m") is not None
+    assert float(row["target_alt_m"]) > 20.0

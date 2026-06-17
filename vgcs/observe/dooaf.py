@@ -2535,7 +2535,7 @@ def format_elevation_summary_html(session: DooafSession) -> str:
         rows.append(
             f"<tr><td class='label-col'>Target elevation (corrected)</td>"
             f"<td>{_format_elev_msl_html(tgt.alt_m)} "
-            "<span class='muted'>(ridge / roof / ray geometry)</span></td></tr>"
+            "<span class='muted'>(aim point on structure / facade geometry)</span></td></tr>"
         )
     if session.impact_dem_alt_m is not None:
         rows.append(
