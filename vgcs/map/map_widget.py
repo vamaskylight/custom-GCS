@@ -7090,8 +7090,10 @@ class MapWidget(QWidget):
         roles_remove: set[str] = set()
         if clear_gun:
             roles_remove.add(DOOAF_ROLE_GUN)
+            self._dooaf_setup_video_marks.pop(DOOAF_ROLE_GUN, None)
         if clear_target:
             roles_remove.add(DOOAF_ROLE_INTENDED)
+            self._dooaf_setup_video_marks.pop(DOOAF_ROLE_INTENDED, None)
         if roles_remove:
             self._observations = [
                 r
@@ -7103,6 +7105,8 @@ class MapWidget(QWidget):
             dlg, gun=clear_gun, target=clear_target
         )
         self._refresh_dooaf_map_overlay()
+        if clear_gun or clear_target:
+            self._flush_video_marks_overlay()
 
     def _show_dooaf_setup_dialog(self) -> None:
         pending = self._dooaf_pick_dialog
