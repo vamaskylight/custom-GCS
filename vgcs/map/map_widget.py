@@ -1008,6 +1008,7 @@ class _ObservationExportTask(QRunnable):
                 len(self._rows),
                 dooaf_summary,
                 detailed_log,
+                session=session,
             )
             Path(self._html_path).write_text(html, encoding="utf-8")
             csv_abs = str(Path(self._csv_path).resolve())
@@ -2633,8 +2634,8 @@ class MapWidget(QWidget):
                 pv = getattr(self, "_native_video_preview", None)
                 if pv is not None and pv.isVisible():
                     pv.raise_()
-                    if ov is not None and ov.isVisible():
-                        ov.raise_()
+            if ov is not None and ov.isVisible():
+                ov.raise_()
         except Exception:
             pass
 
@@ -7967,6 +7968,7 @@ class MapWidget(QWidget):
             len(self._observations),
             format_dooaf_html_summary(session, observation_row=obs_row),
             format_observation_detailed_log_html(export_rows, self._obs_cell),
+            session=session,
         )
         Path(path).write_text(html, encoding="utf-8")
 
@@ -9984,33 +9986,33 @@ class MapWidget(QWidget):
                     except Exception:
                         pass
                     return
+            try:
+                self._map_stack.setCurrentIndex(1)
+                self._is_3d_mode = True
+                self._inject_legacy_html_hud_hide()
+                self._emit_map_3d_mode_changed()
+                self._prime_3d_vehicle_coords_js()
+                w3.page().runJavaScript(
+                    "set3DEnabled(true);",
+                    lambda ok: self._on_3d_toggle_result(True, ok),
+                )
                 try:
-                    self._map_stack.setCurrentIndex(1)
-                    self._is_3d_mode = True
-                    self._inject_legacy_html_hud_hide()
-                    self._emit_map_3d_mode_changed()
-                    self._prime_3d_vehicle_coords_js()
-                    w3.page().runJavaScript(
-                        "set3DEnabled(true);",
-                        lambda ok: self._on_3d_toggle_result(True, ok),
-                    )
-                    try:
-                        QTimer.singleShot(0, w3.setFocus)
-                    except Exception:
-                        pass
-                    self._schedule_vehicle_pose_js(immediate=True)
-                    QTimer.singleShot(0, self._recenter_3d_after_enable)
-                    QTimer.singleShot(100, self._recenter_3d_after_enable)
-                    QTimer.singleShot(300, self._recenter_3d_after_enable)
-                    QTimer.singleShot(150, self._sync_3d_map_overlays)
-                    self._set_3d_marker_overlay_active(True)
+                    QTimer.singleShot(0, w3.setFocus)
                 except Exception:
-                    self._is_3d_mode = False
-                    try:
-                        self._map_stack.setCurrentIndex(0)
-                    except Exception:
-                        pass
-                    self._on_3d_toggle_result(True, False)
+                    pass
+                self._schedule_vehicle_pose_js(immediate=True)
+                QTimer.singleShot(0, self._recenter_3d_after_enable)
+                QTimer.singleShot(100, self._recenter_3d_after_enable)
+                QTimer.singleShot(300, self._recenter_3d_after_enable)
+                QTimer.singleShot(150, self._sync_3d_map_overlays)
+                self._set_3d_marker_overlay_active(True)
+            except Exception:
+                self._is_3d_mode = False
+                try:
+                    self._map_stack.setCurrentIndex(0)
+                except Exception:
+                    pass
+                self._on_3d_toggle_result(True, False)
 
             if self._web_3d_ready:
                 try:

@@ -203,3 +203,21 @@ def test_dooaf_html_summary_highlights_and_camera():
     assert "dooaf-impact-coords" in html
     assert "Yaw right 28.3°" in html
     assert "Pitch down 10.1°" in html
+    assert "fc-plan-svg" in html
+    assert "fc-gunline-svg" in html
+    assert "Plan view (North up)" in html
+    assert "Start here" in html
+    assert "How to read this report" in html
+    assert "guide-flow" in html
+    assert "guide-card" in html
+    assert "Jump to section" in html
+    assert "exec-split" in html
+    assert "Where the round landed" in html
+    assert "What to add on the next round" in html
+    assert "fc-compass-svg" in html
+    assert "fc-story-svg" in html
+    assert "Apply correction" in html
+    assert "Aim here" in html
+    assert "fc-positions-svg" in html
+    assert "fc-action-cards" in html
+    assert "Exact miss & correction numbers" in html
