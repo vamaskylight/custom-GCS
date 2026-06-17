@@ -426,7 +426,10 @@ def enrich_video_mark_target_altitude(row: dict[str, object]) -> None:
 
     Stores ``target_alt_m_dem``, ``target_alt_m_ray``, and ``target_alt_method``.
     """
-    from vgcs.observe.facade_plane import infer_ray_target_msl_from_row
+    from vgcs.observe.facade_plane import (
+        infer_elevated_click_target_msl_from_row,
+        infer_ray_target_msl_from_row,
+    )
 
     dem_alt = row.get("target_alt_m")
     try:
@@ -438,6 +441,18 @@ def enrich_video_mark_target_altitude(row: dict[str, object]) -> None:
     ray_alt = infer_ray_target_msl_from_row(row)  # type: ignore[arg-type]
     row["target_alt_m_ray"] = ray_alt
 
+    hfov = 62.0
+    try:
+        if row.get("camera_hfov_deg") is not None:
+            hfov = float(row.get("camera_hfov_deg"))
+    except (TypeError, ValueError):
+        pass
+    elevated_alt = infer_elevated_click_target_msl_from_row(
+        row,  # type: ignore[arg-type]
+        hfov_deg=hfov,
+    )
+    row["target_alt_m_elevated"] = elevated_alt
+
     method = "terrain_dem"
     resolved: float | None = dem_val
 
@@ -446,7 +461,10 @@ def enrich_video_mark_target_altitude(row: dict[str, object]) -> None:
     except (TypeError, ValueError):
         y_norm = 0.55
 
-    if ray_alt is not None and dem_val is not None:
+    if elevated_alt is not None and dem_val is not None and y_norm < 0.54:
+        resolved = elevated_alt
+        method = "video_facade_elevated"
+    elif ray_alt is not None and dem_val is not None:
         delta = ray_alt - dem_val
         if delta > 1.0 and y_norm < 0.52:
             resolved = ray_alt

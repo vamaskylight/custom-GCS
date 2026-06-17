@@ -207,6 +207,106 @@ def infer_ray_target_msl_from_row(row: dict[str, Any]) -> float | None:
     return infer_ray_target_msl_m(float(vmsl), float(rh), float(dep))
 
 
+def _row_measure_agl_m(row: dict[str, Any]) -> float | None:
+    for key in ("measure_agl_m", "ekf_rel_alt_m", "vehicle_rel_alt_m"):
+        try:
+            v = float(row.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if v > 0.5:
+            return v
+    return _observation_agl_m(row)
+
+
+def _row_horizontal_range_m(row: dict[str, Any], agl_m: float) -> float | None:
+    try:
+        rg = float(row.get("geo_range_m") or 0)
+    except (TypeError, ValueError):
+        rg = 0.0
+    if rg > 0.5:
+        return _sanitized_click_range_m(row, agl_m) or rg
+    dep = row.get("geo_depression_deg")
+    if dep is not None:
+        return _horizontal_range_from_depression(agl_m, float(dep))
+    return None
+
+
+def infer_elevated_click_target_msl_from_row(
+    row: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    camera_vfov_deg: float | None = None,
+) -> float | None:
+    """
+    MSL for a single facade click above terrain at the same map footprint.
+
+    DEM gives ground elevation; video Y and drone AGL/range give height above that
+  footprint (roof/window aim point). Works when roof+base pair marks are not available.
+    """
+    xy = _video_xy(row)
+    if xy is None:
+        return None
+    y_norm = xy[1]
+    if y_norm >= 0.54:
+        return None
+
+    dem_raw = row.get("target_alt_m_dem")
+    if dem_raw is None:
+        dem_raw = row.get("target_alt_m")
+    try:
+        dem_val = float(dem_raw) if dem_raw is not None else None
+    except (TypeError, ValueError):
+        dem_val = None
+    if dem_val is None:
+        return None
+
+    agl_m = _row_measure_agl_m(row)
+    if agl_m is None or agl_m < _MIN_FACADE_AGL_M:
+        return None
+
+    rh = _row_horizontal_range_m(row, float(agl_m))
+    if rh is None or rh < 1.0:
+        return None
+
+    dep_ground = math.degrees(math.atan(float(agl_m) / float(rh)))
+    vfov = (
+        float(camera_vfov_deg)
+        if camera_vfov_deg is not None
+        else float(hfov_deg) * 0.5625
+    )
+    el_off = (y_norm - 0.5) * vfov
+    dep_from_video = dep_ground + el_off
+
+    dep_geo = row.get("geo_depression_deg")
+    if dep_geo is not None:
+        dep_click = float(dep_geo)
+        # Geo depression often matches footprint ground (DEM ray hit), not the click.
+        if abs(dep_click - dep_ground) < 0.4 and el_off < -0.25:
+            dep_click = dep_from_video
+    else:
+        dep_click = dep_from_video
+
+    if dep_click >= dep_ground - 0.15:
+        return None
+
+    height = float(rh) * (
+        math.tan(math.radians(dep_ground)) - math.tan(math.radians(dep_click))
+    )
+    if height < 0.8:
+        return None
+
+    vmsl = row.get("vehicle_alt_msl_m")
+    msl_ray = (
+        infer_ray_target_msl_m(float(vmsl), float(rh), dep_click)
+        if vmsl is not None
+        else None
+    )
+    msl_dem = dem_val + height
+    if msl_ray is not None:
+        return max(msl_dem, msl_ray)
+    return msl_dem
+
+
 def marks_suitable_for_facade_height(
     row_a: dict[str, Any],
     row_b: dict[str, Any],

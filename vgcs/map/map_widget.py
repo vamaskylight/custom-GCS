@@ -6817,12 +6817,6 @@ class MapWidget(QWidget):
         }
         row.update(self._observation_context())
         self._enrich_observation_geo_reference(row)
-        from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
-
-        enrich_video_mark_target_altitude(row)
-        from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
-
-        enrich_video_mark_target_altitude(row)
         lat = row.get("target_lat")
         lon = row.get("target_lon")
         if lat is None or lon is None:
@@ -7261,6 +7255,10 @@ class MapWidget(QWidget):
         long_range_ray = ray_src == "rangefinder_clamped_long" or str(
             geo.method or ""
         ).startswith("ray_slant_long")
+        if geo.depression_deg is not None:
+            row["geo_depression_deg"] = geo.depression_deg
+        else:
+            row["geo_depression_deg"] = None
         if (
             geo.horizontal_range_m is not None
             and geo.bearing_deg is not None
@@ -7277,11 +7275,9 @@ class MapWidget(QWidget):
         ):
             row["geo_range_m"] = geo.horizontal_range_m
             row["geo_bearing_deg"] = geo.bearing_deg
-            row["geo_depression_deg"] = geo.depression_deg
         else:
             row["geo_range_m"] = None
             row["geo_bearing_deg"] = None
-            row["geo_depression_deg"] = None
         from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
 
         enrich_video_mark_target_altitude(row)
