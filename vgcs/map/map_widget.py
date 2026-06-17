@@ -138,7 +138,12 @@ from vgcs.video.pipeline import (
     suggested_recording_save_path,
     wait_qmedia_recorder_stopped,
 )
-from vgcs.video.camera_control import NoopCameraControl, camera_preview_applies_digital_zoom, camera_zoom_limits
+from vgcs.video.camera_control import (
+    NoopCameraControl,
+    camera_preview_applies_digital_zoom,
+    camera_recording_applies_digital_zoom,
+    camera_zoom_limits,
+)
 from vgcs.map.native_tile_map import NativeTileMapView, bundled_seed_root, fetch_tile_http_bytes
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_footer_hud import (
@@ -2694,6 +2699,33 @@ class MapWidget(QWidget):
             return float(getattr(self, "_video_zoom", 1.0))
         except Exception:
             return 1.0
+
+    def _apply_video_recording_preview_transform(self, source_id: str) -> None:
+        sid = str(source_id or "").strip()
+        if not sid:
+            return
+        src = self._video_source_by_id(sid)
+        if src is None or not hasattr(src, "set_recording_preview_transform"):
+            return
+        try:
+            src.set_recording_preview_transform(
+                digital_zoom=self._effective_preview_digital_zoom(),
+                apply_digital_zoom=camera_recording_applies_digital_zoom(
+                    sid,
+                    getattr(self, "_camera_control", None),
+                ),
+            )
+        except Exception:
+            pass
+
+    def _sync_video_recording_preview_transform(self, source_id: str | None = None) -> None:
+        """Keep RTSP recording frames aligned with on-screen preview (thermal software zoom)."""
+        if not bool(getattr(self, "_video_recording", False)):
+            return
+        sid = str(source_id or getattr(self, "_video_recording_source_id", "") or "").strip()
+        if not sid:
+            sid = self._operator_preview_source_id()
+        self._apply_video_recording_preview_transform(sid)
 
     def _sync_native_video_zoom_label(self) -> None:
         lbl = getattr(self, "_lbl_camera_top_zoom", None)
@@ -7701,6 +7733,7 @@ class MapWidget(QWidget):
                         src.start()
                 except Exception:
                     pass
+                self._apply_video_recording_preview_transform(clip_sid)
                 started = bool(src.start_recording(str(out_path)))
                 if started:
                     QTimer.singleShot(8000, lambda: self._stop_observation_clip_rtsp(src, str(out_path)))
@@ -8477,6 +8510,7 @@ class MapWidget(QWidget):
                             except Exception:
                                 pass
                         if ok:
+                            self._sync_video_recording_preview_transform(rec_sid)
                             self._start_native_cam_recording_tick_timer()
                         else:
                             self._sync_payload_hardware_recording(False)
@@ -8646,6 +8680,10 @@ class MapWidget(QWidget):
             self._video_zoom = cur
             try:
                 self._sync_native_video_zoom_label()
+            except Exception:
+                pass
+            try:
+                self._sync_video_recording_preview_transform()
             except Exception:
                 pass
             try:

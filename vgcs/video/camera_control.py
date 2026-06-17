@@ -669,3 +669,14 @@ def camera_preview_applies_digital_zoom(control: object | None) -> bool:
     """Apply VGCS preview crop-zoom so magnification matches the rail (TOP UDP is best-effort)."""
     return True
 
+
+def camera_recording_applies_digital_zoom(source_id: str, control: object | None = None) -> bool:
+    """
+    Bake preview digital zoom into saved RTSP video when the feed does not carry hardware zoom.
+
+    Visible-light / day streams usually reflect TOP/MAVLink zoom in the RTSP encoder output;
+    thermal RTSP stays wide while the UI magnifies via software crop-zoom.
+    """
+    _ = control
+    return str(source_id or "").strip().lower() == "thermal"
+
