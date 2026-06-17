@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-05-15-siyi21"
+_VIDEO_PIPELINE_REV = "2026-06-02-companion-hevc"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -222,6 +222,11 @@ def _rtsp_url_is_companion_link_subnet(url: str) -> bool:
         return False
 
 
+def _rtsp_url_is_companion_rtsp(url: str) -> bool:
+    """Companion-link RTSP (SIYI ZR10, Skydroid C13 stream=1, etc.)."""
+    return _url_scheme(str(url or "").strip()) == "rtsp" and _rtsp_url_is_companion_link_subnet(url)
+
+
 def _normalize_companion_rtsp_url(url: str) -> str:
     """Map known-bad SIYI paths (e.g. /video2 → 404 on many ZR10 units) to main.264."""
     import re
@@ -299,16 +304,22 @@ def _rtsp_socket_timeout_us(url: str) -> int:
 
 
 def _frozen_duplicate_kill_enabled(url: str) -> bool:
-    """SIYI HEVC often repeats identical buffers while healthy — do not kill the session."""
-    if _rtsp_url_is_siyi_style(url):
-        return str(os.environ.get("VGCS_SIYI_FROZEN_RECONNECT", "0") or "0").strip() == "1"
+    """Companion HEVC often repeats identical buffers while healthy — do not kill the session."""
+    if _rtsp_url_is_companion_rtsp(url):
+        frozen = str(os.environ.get("VGCS_COMPANION_FROZEN_RECONNECT", "") or "").strip()
+        if not frozen:
+            frozen = str(os.environ.get("VGCS_SIYI_FROZEN_RECONNECT", "0") or "0").strip()
+        return frozen == "1"
     return True
 
 
 def _stall_watchdog_enabled(url: str) -> bool:
-    """SIYI HEVC often blocks inside FFmpeg for >6s while healthy; killing causes freeze loops."""
-    if _rtsp_url_is_siyi_style(url):
-        return str(os.environ.get("VGCS_SIYI_STALL_WATCHDOG", "0") or "0").strip() == "1"
+    """Companion HEVC often blocks inside FFmpeg for >6s while healthy; killing causes freeze loops."""
+    if _rtsp_url_is_companion_rtsp(url):
+        stall = str(os.environ.get("VGCS_COMPANION_STALL_WATCHDOG", "") or "").strip()
+        if not stall:
+            stall = str(os.environ.get("VGCS_SIYI_STALL_WATCHDOG", "0") or "0").strip()
+        return stall == "1"
     return True
 
 
@@ -355,7 +366,7 @@ def _siyi_hevc_glitch_release_sleep(*, brief_session: bool = False) -> None:
         delay = min(12.0, delay + max(0.0, extra))
     try:
         msg = (
-            f"[VGCS:video] SIYI HEVC: waiting {delay:.1f}s for camera after glitch "
+            f"[VGCS:video] companion HEVC: waiting {delay:.1f}s for camera after glitch "
             "(do not open RC/VLC video)"
         )
         if brief_session:
@@ -383,7 +394,7 @@ def _siyi_camera_release_sleep(
     )
     try:
         print(
-            f"[VGCS:video] SIYI: waiting {delay:.1f}s for camera RTSP slot "
+            f"[VGCS:video] companion RTSP: waiting {delay:.1f}s for camera RTSP slot "
             "(close VLC/handheld viewer first)"
         )
     except Exception:
@@ -422,10 +433,8 @@ def _video_stall_reconnect_s(url: str) -> float:
             return max(0.8, min(30.0, float(raw)))
         except ValueError:
             pass
-    if _rtsp_url_is_siyi_style(url):
+    if _rtsp_url_is_companion_rtsp(url):
         return 12.0
-    if _rtsp_url_is_companion_link_subnet(url):
-        return 3.0
     return 3.0
 
 
@@ -498,8 +507,9 @@ def _ffmpeg_preflags_before_input(
                 ]
             )
         else:
-            if _rtsp_url_is_siyi_style(u):
-                # SIYI ZR10: gentler demux + igndts; demuxer auto-reconnect survives brief HEVC loss.
+            if _rtsp_url_is_companion_rtsp(u):
+                # Companion HEVC (SIYI ZR10, Skydroid C13): gentler demux + igndts;
+                # demuxer auto-reconnect survives brief HEVC POC/RPS loss.
                 out.extend(
                     [
                         "-fflags",
@@ -533,13 +543,13 @@ def _ffmpeg_preflags_before_input(
                         "low_delay",
                     ]
                 )
-        if _rtsp_url_is_siyi_style(u):
+        if _rtsp_url_is_companion_rtsp(u):
             out.extend(["-thread_queue_size", "512"])
         if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
             out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     out.extend(["-err_detect", "ignore_err"])
-    if sc == "rtsp" and _rtsp_url_is_siyi_style(str(url or "").strip()):
-        # Show frames even when HEVC refs are briefly missing (ZR10 pan/zoom).
+    if sc == "rtsp" and _rtsp_url_is_companion_rtsp(str(url or "").strip()):
+        # Show frames even when HEVC refs are briefly missing (companion pan/zoom / glitch).
         out.extend(["-flags2", "+showall"])
     if sc == "udp":
         out.extend(
@@ -1444,8 +1454,8 @@ class RtspSource(QObject):
         return t
 
     def _siyi_throttle_before_rtsp_open(self, url: str, tail_hint: bytes = b"") -> None:
-        """Minimum gap between FFmpeg RTSP opens (reduces ZR10 -138 / busy slot storms)."""
-        if not _rtsp_url_is_siyi_style(url):
+        """Minimum gap between FFmpeg RTSP opens (reduces companion -138 / busy slot storms)."""
+        if not _rtsp_url_is_companion_rtsp(url):
             return
         streak = int(getattr(self, "_siyi_138_fail_streak", 0) or 0)
         min_gap = 5.0
@@ -1458,7 +1468,7 @@ class RtspSource(QObject):
             wait = min_gap - gap
             try:
                 print(
-                    f"[VGCS:video] SIYI: throttling RTSP open ({wait:.1f}s, "
+                    f"[VGCS:video] companion RTSP: throttling open ({wait:.1f}s, "
                     "avoid camera busy / -138)"
                 )
             except Exception:
@@ -1480,7 +1490,7 @@ class RtspSource(QObject):
             if streak >= 5 and streak % 5 == 0:
                 try:
                     self.error.emit(
-                        "SIYI RTSP busy (-138). Close RC/VLC/handheld video, wait 10s, retry."
+                        "Companion RTSP busy (-138). Close RC/VLC/handheld video, wait 10s, retry."
                     )
                 except Exception:
                     pass
@@ -1550,21 +1560,27 @@ class RtspSource(QObject):
         stall_reconnect_s = _video_stall_reconnect_s(url)
 
         # If every transport fails once, wait before another full pass (encoder cooldown).
+        companion_rtsp = _rtsp_url_is_companion_rtsp(url)
         siyi_url = _rtsp_url_is_siyi_style(url)
-        round_backoff_s = 2.0 if siyi_url else 0.6
-        max_round_backoff_s = 15.0 if siyi_url else 4.0
+        round_backoff_s = 2.0 if companion_rtsp else 0.6
+        max_round_backoff_s = 15.0 if companion_rtsp else 4.0
 
-        if _rtsp_url_is_companion_link_subnet(url):
+        if companion_rtsp:
             print(
                 f"[VGCS:video] RTSP companion link (192.168.144.x): transport order="
                 f"{_rtsp_transport_sequence(url, self._transport)!r}"
             )
-            if _rtsp_url_is_siyi_style(url) and not _stall_watchdog_enabled(url):
+            if not _stall_watchdog_enabled(url):
                 print(
-                    "[VGCS:video] SIYI ZR10: stall watchdog disabled "
-                    "(HEVC decode gaps are normal; set VGCS_SIYI_STALL_WATCHDOG=1 to enable)"
+                    "[VGCS:video] companion HEVC: stall watchdog disabled "
+                    "(decode gaps are normal; set VGCS_COMPANION_STALL_WATCHDOG=1 to enable)"
                 )
-            if _rtsp_url_is_siyi_style(url):
+            if not _frozen_duplicate_kill_enabled(url):
+                print(
+                    "[VGCS:video] companion HEVC: frozen-duplicate reconnect disabled "
+                    "(set VGCS_COMPANION_FROZEN_RECONNECT=1 to enable)"
+                )
+            if siyi_url:
                 mode = "hwaccel=auto" if siyi_hw else "sw (auto codec)"
                 print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
 
@@ -1599,8 +1615,8 @@ class RtspSource(QObject):
                         else:
                             time.sleep(0.05)
 
-                    reconnect_delay = 2.5 if _rtsp_url_is_siyi_style(url) else 0.6
-                    empty_session_limit = 4 if _rtsp_url_is_siyi_style(url) else 20
+                    reconnect_delay = 2.5 if companion_rtsp else 0.6
+                    empty_session_limit = 4 if companion_rtsp else 20
                     empty_sessions = 0
                     tcp_138_streak = 0
                     siyi_transport_override: str | None = None
@@ -1608,11 +1624,11 @@ class RtspSource(QObject):
                     while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
                         use_transport = siyi_transport_override or transport
                         tr_label = str(use_transport) if use_transport is not None else "n/a"
-                        if _rtsp_url_is_siyi_style(url):
+                        if companion_rtsp:
                             self._siyi_throttle_before_rtsp_open(
                                 url, getattr(self, "_siyi_last_open_tail", b"") or b""
                             )
-                        if _rtsp_url_is_siyi_style(url) and (
+                        if siyi_url and (
                             transport_got_frames or siyi_transport_override
                         ):
                             try:
@@ -1841,7 +1857,7 @@ class RtspSource(QObject):
                                     print(
                                         "[VGCS:video] ffmpeg stderr (session, no frames):\n" + txt
                                     )
-                                    if _rtsp_url_is_siyi_style(url):
+                                    if companion_rtsp:
                                         tl = tail.lower()
                                         if b"codec avoption ec" in tl:
                                             reconnect_delay = max(reconnect_delay, 3.0)
@@ -1876,12 +1892,17 @@ class RtspSource(QObject):
                                             if empty_sessions >= 3 and empty_sessions % 3 == 0:
                                                 try:
                                                     print(
-                                                        "[VGCS:video] SIYI RTSP connect timeout (-138): "
+                                                        "[VGCS:video] companion RTSP connect timeout (-138): "
                                                         "close VLC/other viewers on this camera, confirm "
-                                                        "192.168.144.25 is reachable; will try UDP if TCP fails"
+                                                        "192.168.144.x is reachable; will try UDP if TCP fails"
                                                     )
                                                 except Exception:
                                                     pass
+                                        elif b"invalid data found when processing input" in tl:
+                                            reconnect_delay = max(
+                                                reconnect_delay,
+                                                8.0 + min(6.0, float(empty_sessions) * 1.5),
+                                            )
                                     if b"operation not permitted" in tail.lower():
                                         try:
                                             self.error.emit(
@@ -1911,7 +1932,7 @@ class RtspSource(QObject):
                                     )
                             except Exception:
                                 pass
-                            if _rtsp_url_is_siyi_style(url) and _siyi_rtsp_camera_busy(tail):
+                            if companion_rtsp and _siyi_rtsp_camera_busy(tail):
                                 tcp_138_streak += 1
                                 if (
                                     str(use_transport or "").lower() == "tcp"
@@ -1919,7 +1940,7 @@ class RtspSource(QObject):
                                 ):
                                     try:
                                         print(
-                                            "[VGCS:video] SIYI: TCP connect failed 3× (-138), "
+                                            "[VGCS:video] companion RTSP: TCP connect failed 3× (-138), "
                                             "switching to UDP transport"
                                         )
                                     except Exception:
@@ -1927,7 +1948,7 @@ class RtspSource(QObject):
                                     break
                             else:
                                 tcp_138_streak = 0
-                            if _rtsp_url_is_siyi_style(url):
+                            if companion_rtsp:
                                 self._siyi_mark_rtsp_open_result(frames_this_session, tail)
                         self._close_ffmpeg_decode_proc()
 
@@ -1953,7 +1974,7 @@ class RtspSource(QObject):
                             except Exception:
                                 tail_b = b""
                                 tail_txt = ""
-                            hevc_glitch = _rtsp_url_is_siyi_style(url) and _siyi_hevc_glitch_tail(
+                            hevc_glitch = companion_rtsp and _siyi_hevc_glitch_tail(
                                 tail_b
                             )
                             print(
@@ -1962,18 +1983,18 @@ class RtspSource(QObject):
                                 + (f" — {tail_txt[:200]}" if tail_txt else "")
                             )
                             cooldown = _siyi_session_cooldown_s(tail_b, reconnect_delay)
-                            if _rtsp_url_is_siyi_style(url):
+                            if companion_rtsp:
                                 siyi_hw = False
                                 try:
                                     if hevc_glitch:
                                         print(
-                                            "[VGCS:video] SIYI HEVC glitch: reopening RTSP "
+                                            "[VGCS:video] companion HEVC glitch: reopening RTSP "
                                             "(hold last frame in preview)"
                                         )
                                         reconnect_delay = 2.5
                                     elif cooldown >= 6.0:
                                         print(
-                                            f"[VGCS:video] SIYI: cooldown {cooldown:.0f}s "
+                                            f"[VGCS:video] companion RTSP: cooldown {cooldown:.0f}s "
                                             "before reconnect (network / RTSP)"
                                         )
                                 except Exception:
@@ -1986,7 +2007,7 @@ class RtspSource(QObject):
                                         siyi_transport_override = "udp"
                                         try:
                                             print(
-                                                "[VGCS:video] SIYI HEVC on TCP: "
+                                                "[VGCS:video] companion HEVC on TCP: "
                                                 "next session uses UDP transport"
                                             )
                                         except Exception:
@@ -2006,7 +2027,7 @@ class RtspSource(QObject):
                                     time.sleep(cooldown)
                             else:
                                 time.sleep(cooldown)
-                            if _rtsp_url_is_siyi_style(url):
+                            if companion_rtsp:
                                 self._siyi_mark_rtsp_open_result(frames_this_session, tail_b)
                             continue
 
@@ -2026,7 +2047,7 @@ class RtspSource(QObject):
                                 f"on transport={tr_label} demux={demux_label}, trying next"
                             )
                             break
-                        if _rtsp_url_is_siyi_style(url) and _siyi_rtsp_camera_busy(tail_empty):
+                        if companion_rtsp and _siyi_rtsp_camera_busy(tail_empty):
                             _siyi_camera_release_sleep(
                                 tail_empty,
                                 empty_sessions,
@@ -2037,7 +2058,7 @@ class RtspSource(QObject):
                             self._siyi_mark_rtsp_open_result(0, tail_empty)
                         else:
                             time.sleep(reconnect_delay)
-                            if _rtsp_url_is_siyi_style(url) and tail_empty:
+                            if companion_rtsp and tail_empty:
                                 self._siyi_mark_rtsp_open_result(0, tail_empty)
 
                 if self._ffmpeg_stop.is_set() or not self._running:
