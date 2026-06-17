@@ -7365,7 +7365,7 @@ class MapWidget(QWidget):
                     )
             row["segment_distance_m"] = seg_m
         elif dooaf_role == DOOAF_ROLE_SURVEY and pt is not None and track_before:
-            hfov, _ = self._m8_geo_settings()
+            hfov, _, _ = self._m8_geo_settings()
             peak = session_peak_geo_range_m(self._observations)
             facade_ref = session_facade_reference_range_m(
                 self._observations, hfov_deg=hfov
@@ -7531,7 +7531,7 @@ class MapWidget(QWidget):
         """Map labels (one per track edge) and video measure lines."""
         labels: list[str] = []
         segs: list[tuple[float, float, float, float, str]] = []
-        hfov, _ = self._m8_geo_settings()
+        hfov, _, _ = self._m8_geo_settings()
         peak = session_peak_geo_range_m(self._observations)
         facade_ref = session_facade_reference_range_m(
             self._observations, hfov_deg=hfov
@@ -7581,7 +7581,7 @@ class MapWidget(QWidget):
     def _observation_video_measure_segments(self) -> list[tuple[float, float, float, float, str]]:
         """Dashed lines: building height, facade width, intended→impact."""
         dooaf_seg = dooaf_intended_impact_video_segment(self._observations)
-        hfov, _ = self._m8_geo_settings()
+        hfov, _, _ = self._m8_geo_settings()
         segs = list(
             observation_facade_video_segments(self._observations, hfov_deg=hfov)
         )
