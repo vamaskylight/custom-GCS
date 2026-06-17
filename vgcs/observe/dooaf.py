@@ -643,14 +643,30 @@ def _format_report_timestamp(ts: object) -> str:
         return raw
 
 
-def _report_section_card(title: str, body: str, *, extra_class: str = "") -> str:
+def _report_section_card(
+    title: str,
+    body: str,
+    *,
+    extra_class: str = "",
+    section_id: str = "",
+    subtitle: str = "",
+) -> str:
     cls = "section-card"
     if extra_class:
         cls += f" {extra_class}"
+    sid = f" id='{_html_esc(section_id)}'" if section_id else ""
+    sub = (
+        f"<p class='section-subtitle'>{_html_esc(subtitle)}</p>"
+        if subtitle
+        else ""
+    )
     return (
-        f"<section class='{cls}'>"
+        f"<section class='{cls}'{sid}>"
+        "<div class='section-head'>"
         f"<h3 class='section-title'>{_html_esc(title)}</h3>"
-        f"{body}"
+        f"{sub}"
+        "</div>"
+        f"<div class='section-body'>{body}</div>"
         "</section>"
     )
 
@@ -686,118 +702,61 @@ def format_geo_method_badge(method: object) -> str:
 
 
 def observation_report_html_style() -> str:
+    from vgcs.observe.observation_report_theme import REPORT_CSS
+
+    return REPORT_CSS
+
+
+def observation_report_html_script() -> str:
+    from vgcs.observe.observation_report_theme import REPORT_SCRIPT
+
+    return REPORT_SCRIPT
+
+
+def _report_nav_link(section_id: str, label: str) -> str:
     return (
-        ":root{"
-        "--bg:#eef2f7;--card:#fff;--border:#d8dee9;--text:#1e293b;--muted:#64748b;"
-        "--header:#0f172a;--accent:#2563eb;--good:#15803d;--warn:#b45309;--bad:#b91c1c;"
-        "--target:#1d4ed8;--impact:#15803d;--corr:#c2410c;--dem:#0369a1;"
-        "}"
-        "*{box-sizing:border-box;}"
-        "body{margin:0;background:var(--bg);color:var(--text);"
-        "font-family:Segoe UI,system-ui,-apple-system,Arial,sans-serif;line-height:1.45;}"
-        ".report-page{max-width:1280px;margin:0 auto;padding:24px 20px 40px;}"
-        ".report-header{background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%);"
-        "color:#f8fafc;border-radius:14px;padding:22px 26px;margin-bottom:20px;"
-        "box-shadow:0 8px 24px rgba(15,23,42,.18);}"
-        ".report-header h1{margin:0 0 6px;font-size:22px;font-weight:700;letter-spacing:.01em;}"
-        ".report-meta{display:flex;flex-wrap:wrap;gap:10px 18px;font-size:13px;color:#cbd5e1;}"
-        ".report-meta strong{color:#f8fafc;font-weight:600;}"
-        ".section-card{background:var(--card);border:1px solid var(--border);border-radius:12px;"
-        "padding:16px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(15,23,42,.06);}"
-        ".section-title{margin:0 0 12px;font-size:15px;font-weight:700;color:var(--text);}"
-        ".data-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;}"
-        ".data-table th,.data-table td{border-bottom:1px solid var(--border);padding:8px 10px;"
-        "vertical-align:top;text-align:left;}"
-        ".data-table thead th{background:#f1f5f9;color:#334155;font-weight:600;font-size:11px;"
-        "text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid var(--border);}"
-        ".data-table tbody tr:last-child td{border-bottom:none;}"
-        ".data-table tbody tr:hover td{background:#f8fafc;}"
-        ".data-table .label-col{font-weight:600;color:#334155;width:28%;}"
-        ".mono{font-family:Consolas,Monaco,ui-monospace,monospace;font-size:11px;}"
-        ".muted{color:var(--muted);}"
-        ".table-scroll{margin-top:4px;border:1px solid var(--border);border-radius:8px;"
-        "overflow:auto;max-width:100%;background:#fff;}"
-        ".table-scroll .data-table{margin:0;}"
-        ".table-scroll thead th{position:sticky;top:0;z-index:1;box-shadow:0 1px 0 var(--border);}"
-        ".badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;"
-        "font-weight:600;line-height:1.5;white-space:nowrap;}"
-        ".badge-good{background:#dcfce7;color:var(--good);}"
-        ".badge-bad{background:#fee2e2;color:var(--bad);}"
-        ".badge-warn{background:#ffedd5;color:var(--warn);}"
-        ".badge-info{background:#e0f2fe;color:#0369a1;}"
-        ".badge-dem{background:#e0f2fe;color:var(--dem);border:1px solid #7dd3fc;}"
-        ".badge-muted{background:#f1f5f9;color:var(--muted);}"
-        ".dooaf-target-coords td{color:var(--target);font-weight:600;background:#eff6ff;}"
-        ".dooaf-impact-coords td{color:var(--impact);font-weight:600;background:#ecfdf5;}"
-        ".dooaf-fire-corr{border-color:#fed7aa;background:linear-gradient(180deg,#fff7ed 0%,#fff 40%);}"
-        ".metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));"
-        "gap:12px;margin-bottom:14px;}"
-        ".metric-card{background:#fff;border:1px solid #fdba74;border-radius:10px;padding:12px 14px;}"
-        ".metric-label{font-size:11px;color:var(--muted);text-transform:uppercase;"
-        "letter-spacing:.04em;margin-bottom:4px;}"
-        ".metric-value{font-size:22px;font-weight:700;color:var(--corr);line-height:1.2;}"
-        ".metric-sub{font-size:11px;color:var(--muted);margin-top:4px;}"
-        ".camera-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;}"
-        ".camera-stat{background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:12px 14px;}"
-        ".camera-stat .label{font-size:11px;color:var(--muted);text-transform:uppercase;"
-        "letter-spacing:.04em;margin-bottom:6px;}"
-        ".camera-stat .value{font-size:15px;font-weight:600;color:var(--text);}"
-        ".path-cell{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}"
-        "th.col-geo,td.col-geo{background:#f0f9ff;}"
-        "th.col-target,td.col-target{background:#f8fafc;}"
-        ".log-entries{display:flex;flex-direction:column;gap:16px;}"
-        ".log-entry{border:1px solid var(--border);border-radius:12px;background:#fff;overflow:hidden;}"
-        ".log-entry-impact{border-color:#4ade80;box-shadow:0 0 0 1px rgba(74,222,128,.25);}"
-        ".log-entry-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;"
-        "padding:12px 16px;background:#f8fafc;border-bottom:1px solid var(--border);}"
-        ".log-entry-impact .log-entry-head{background:linear-gradient(90deg,#ecfdf5 0%,#f8fafc 100%);}"
-        ".log-entry-index{font-weight:700;font-size:13px;color:var(--text);}"
-        ".log-entry-time{font-size:12px;color:var(--muted);"
-        "font-family:Consolas,Monaco,ui-monospace,monospace;}"
-        ".log-entry-badges{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-left:auto;}"
-        ".log-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;"
-        "border-bottom:1px solid var(--border);background:#fff;}"
-        ".log-metric{padding:14px 16px;border-right:1px solid var(--border);min-height:78px;}"
-        ".log-metric:last-child{border-right:none;}"
-        ".log-metric-label{font-size:10px;text-transform:uppercase;letter-spacing:.05em;"
-        "color:var(--muted);font-weight:600;margin-bottom:8px;}"
-        ".log-metric-value{font-size:15px;font-weight:600;color:var(--text);line-height:1.3;}"
-        ".log-metric-value.mgrs{font-family:Consolas,Monaco,ui-monospace,monospace;font-size:12px;}"
-        ".log-metric-sub{font-size:11px;color:var(--muted);margin-top:4px;}"
-        ".log-detail-table{width:100%;border-collapse:collapse;font-size:12px;}"
-        ".log-detail-table th{width:34%;padding:9px 16px;text-align:left;font-weight:600;"
-        "color:#475569;background:#fafbfc;border-bottom:1px solid var(--border);vertical-align:top;}"
-        ".log-detail-table td{padding:9px 16px;border-bottom:1px solid var(--border);"
-        "vertical-align:top;color:var(--text);}"
-        ".log-detail-section td{background:#f1f5f9;color:#334155;font-size:10px;font-weight:700;"
-        "text-transform:uppercase;letter-spacing:.06em;padding:7px 16px;border-bottom:1px solid var(--border);}"
-        ".log-detail-table tbody tr:last-child th,.log-detail-table tbody tr:last-child td{border-bottom:none;}"
-        ".mgrs-badge{display:inline-block;font-family:Consolas,Monaco,ui-monospace,monospace;"
-        "font-size:12px;padding:4px 10px;background:#e2e8f0;border-radius:6px;"
-        "white-space:nowrap;color:#334155;}"
-        ".elev-badge{display:inline-block;font-family:Consolas,Monaco,ui-monospace,monospace;"
-        "font-size:12px;padding:4px 10px;background:#fef3c7;border-radius:6px;"
-        "white-space:nowrap;color:#92400e;border:1px solid #fcd34d;}"
-        ".coord-pair{cursor:help;border-bottom:1px dotted #94a3b8;}"
-        ".kind-badge{background:#e0e7ff;color:#3730a3;}"
-        ".role-badge{background:#f1f5f9;color:#475569;}"
-        ".file-link{color:var(--accent);text-decoration:none;border-bottom:1px solid transparent;}"
-        ".file-link:hover{border-bottom-color:var(--accent);}"
-        ".log-hint{font-size:12px;color:var(--muted);margin:0 0 12px;line-height:1.5;}"
-        "@media (max-width:900px){"
-        ".log-metrics{grid-template-columns:repeat(2,minmax(0,1fr));}"
-        ".log-metric:nth-child(2){border-right:none;}"
-        ".log-metric{border-bottom:1px solid var(--border);}"
-        "}"
-        "@media print{"
-        "body{background:#fff;}.report-page{padding:0;max-width:none;}"
-        ".report-header{box-shadow:none;border-radius:0;}"
-        ".section-card{box-shadow:none;break-inside:avoid;}"
-        ".table-scroll{overflow:visible;border:none;}"
-        ".table-scroll thead th{position:static;}"
-        ".log-entry{break-inside:avoid;}"
-        ".log-metrics{grid-template-columns:repeat(4,minmax(0,1fr));}"
-        "}"
+        f"<a href='#{_html_esc(section_id)}'>{_html_esc(label)}</a>"
+    )
+
+
+def format_report_nav_html(session: DooafSession | None = None) -> str:
+    has_corr = session is not None and session.correction is not None
+    links = [
+        _report_nav_link("summary", "Summary"),
+        _report_nav_link("guide", "Guide"),
+    ]
+    if has_corr:
+        links.append(_report_nav_link("correction", "Correction"))
+    links.extend(
+        [
+            _report_nav_link("positions", "Map"),
+            _report_nav_link("glossary", "Glossary"),
+            _report_nav_link("audit", "Audit"),
+        ]
+    )
+    return (
+        "<nav class='report-nav-wrap' aria-label='Report sections'>"
+        f"<div class='report-nav'>{''.join(links)}</div>"
+        "</nav>"
+    )
+
+
+def _header_kpi_html(session: DooafSession | None) -> str:
+    c = session.correction if session is not None else None
+    if c is None:
+        return ""
+    return (
+        "<div class='hero-kpis'>"
+        f"<div class='hero-kpi hero-kpi-miss'>"
+        f"<span class='hero-kpi-val'>{c.impact_to_intended_m:.1f} m</span>"
+        "<span class='hero-kpi-label'>Horizontal miss</span></div>"
+        f"<div class='hero-kpi hero-kpi-range'>"
+        f"<span class='hero-kpi-val'>{c.range_correction_m:+.1f} m</span>"
+        "<span class='hero-kpi-label'>Range add</span></div>"
+        f"<div class='hero-kpi hero-kpi-defl'>"
+        f"<span class='hero-kpi-val'>{c.deflection_correction_m:+.1f} m</span>"
+        "<span class='hero-kpi-label'>Deflection add</span></div>"
+        "</div>"
     )
 
 
@@ -812,21 +771,42 @@ def observation_report_html_head(title: str = "Observation Report") -> str:
 
 
 def observation_report_html_footer() -> str:
-    return "</div></body></html>"
+    return (
+        "<footer class='report-footer'>"
+        "<strong>VGCS</strong> observation export · "
+        "Pictures and summary are for quick decisions; CSV beside this file has full audit data."
+        "</footer>"
+        "<button type='button' class='back-to-top' id='back-to-top' "
+        "aria-label='Back to top' title='Back to top'>↑</button>"
+        f"<script>{observation_report_html_script()}</script>"
+        "</div></body></html>"
+    )
 
 
-def format_observation_report_header(entry_count: int, *, title: str = "Observation Report") -> str:
+def format_observation_report_header(
+    entry_count: int,
+    *,
+    title: str = "Observation Report",
+    session: DooafSession | None = None,
+) -> str:
     from datetime import datetime, timezone
 
     exported = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    kpis = _header_kpi_html(session)
     return (
         "<header class='report-header'>"
+        "<div class='report-header-inner'>"
+        "<div class='report-header-text'>"
+        "<div class='report-brand'>VGCS · Fire observation</div>"
         f"<h1>{_html_esc(title)}</h1>"
         "<div class='report-meta'>"
-        f"<span><strong>Entries</strong> {int(entry_count)}</span>"
-        f"<span><strong>Exported</strong> {exported}</span>"
-        "<span><strong>Source</strong> VGCS observation export</span>"
+        f"<span class='report-meta-pill'><strong>Entries</strong> {int(entry_count)}</span>"
+        f"<span class='report-meta-pill'><strong>Exported</strong> {exported}</span>"
+        "<span class='report-meta-pill'><strong>Source</strong> VGCS</span>"
+        "</div></div>"
+        f"{kpis}"
         "</div></header>"
+        + format_report_nav_html(session)
     )
 
 
@@ -899,6 +879,1643 @@ def _format_miss_dir(value_m: float, pos_label: str, neg_label: str) -> str:
     if v > 0:
         return f"{v:.1f} m ({pos_label})"
     return f"{abs(v):.1f} m ({neg_label})"
+
+
+def _fc_svg_esc(text: str) -> str:
+    return _html_esc(text).replace("'", "&#39;")
+
+
+def _fc_svg_pill(cx: float, cy: float, text: str, stroke: str, fill: str, font_size: int = 10) -> str:
+    """Centered label pill for diagram footers (avoids marker-cluster overlap)."""
+    esc = _fc_svg_esc(text)
+    w = max(len(text) * (font_size * 0.58) + 16.0, 72.0)
+    h = font_size + 10.0
+    return (
+        f"<rect x='{cx - w / 2:.1f}' y='{cy - h / 2:.1f}' width='{w:.1f}' height='{h:.1f}' "
+        f"fill='#fff' stroke='{stroke}' stroke-width='1.5' rx='8'/>"
+        f"<text x='{cx:.0f}' y='{cy + font_size / 3:.1f}' text-anchor='middle' "
+        f"font-size='{font_size}' fill='{fill}' font-weight='700'>{esc}</text>"
+    )
+
+
+def _fc_label_box_size(text: str, font_size: int) -> tuple[float, float]:
+    return max(len(text) * font_size * 0.56 + 10.0, 36.0), font_size + 6.0
+
+
+def _fc_label_boxes_overlap(
+    ax: float,
+    ay: float,
+    aw: float,
+    ah: float,
+    bx: float,
+    by: float,
+    bw: float,
+    bh: float,
+    pad: float = 3.0,
+) -> bool:
+    return (
+        ax - aw / 2 - pad < bx + bw / 2 + pad
+        and ax + aw / 2 + pad > bx - bw / 2 - pad
+        and ay - ah / 2 - pad < by + bh / 2 + pad
+        and ay + ah / 2 + pad > by - bh / 2 - pad
+    )
+
+
+def _fc_label_hits_circle(
+    lx: float,
+    ly: float,
+    w: float,
+    h: float,
+    cx: float,
+    cy: float,
+    r: float,
+    pad: float = 5.0,
+) -> bool:
+    for px in (lx - w / 2, lx + w / 2):
+        for py in (ly - h / 2, ly + h / 2):
+            if math.hypot(px - cx, py - cy) < r + pad:
+                return True
+    return math.hypot(lx - cx, ly - cy) < r + pad
+
+
+def _fc_svg_text_box(lx: float, ly: float, text: str, fill: str, font_size: int) -> str:
+    w, h = _fc_label_box_size(text, font_size)
+    esc = _fc_svg_esc(text)
+    return (
+        f"<rect x='{lx - w / 2:.1f}' y='{ly - h / 2:.1f}' width='{w:.1f}' height='{h:.1f}' "
+        f"fill='#fff' fill-opacity='0.95' stroke='{fill}' stroke-width='1' rx='4'/>"
+        f"<text x='{lx:.1f}' y='{ly + font_size / 3:.1f}' text-anchor='middle' "
+        f"font-size='{font_size}' fill='{fill}' font-weight='700'>{esc}</text>"
+    )
+
+
+class _FcSvgLabelPlacer:
+    """Place line labels with white boxes; avoid markers and other labels."""
+
+    def __init__(self) -> None:
+        self._placed: list[tuple[float, float, float, float]] = []
+        self._circles: list[tuple[float, float, float]] = []
+
+    def add_marker(self, cx: float, cy: float, r: float) -> None:
+        self._circles.append((cx, cy, r))
+
+    def add_blocked_zone(self, cx: float, cy: float, w: float, h: float) -> None:
+        self._placed.append((cx, cy, w, h))
+
+    def _blocked(self, lx: float, ly: float, w: float, h: float) -> bool:
+        for cx, cy, r in self._circles:
+            if _fc_label_hits_circle(lx, ly, w, h, cx, cy, r):
+                return True
+        for px, py, pw, ph in self._placed:
+            if _fc_label_boxes_overlap(lx, ly, w, h, px, py, pw, ph):
+                return True
+        return False
+
+    def place_on_segment(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        text: str,
+        fill: str,
+        font_size: int = 9,
+        prefer_side: float = 1.0,
+        min_len: float = 10.0,
+    ) -> str:
+        seg_len = math.hypot(x2 - x1, y2 - y1)
+        if seg_len < min_len:
+            return ""
+        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        w, h = _fc_label_box_size(text, font_size)
+        dx, dy = x2 - x1, y2 - y1
+        length = seg_len or 1.0
+        px, py = -dy / length, dx / length
+        candidates: list[tuple[float, float]] = []
+        for mul in (prefer_side, -prefer_side, prefer_side * 2.0, -prefer_side * 2.0):
+            dist = 10.0 + 7.0 * (abs(mul) - 1.0)
+            sign = 1.0 if mul > 0 else -1.0
+            candidates.append((mx + px * dist * sign, my + py * dist * sign))
+        for lx, ly in candidates:
+            if not self._blocked(lx, ly, w, h):
+                self._placed.append((lx, ly, w, h))
+                return _fc_svg_text_box(lx, ly, text, fill, font_size)
+        return ""
+
+    def place_at(
+        self,
+        lx: float,
+        ly: float,
+        text: str,
+        fill: str,
+        font_size: int = 9,
+    ) -> str:
+        w, h = _fc_label_box_size(text, font_size)
+        for ox, oy in ((0.0, -12.0), (0.0, 12.0), (0.0, -22.0), (0.0, 22.0), (-20.0, 0.0), (20.0, 0.0)):
+            tx, ty = lx + ox, ly + oy
+            if not self._blocked(tx, ty, w, h):
+                self._placed.append((tx, ty, w, h))
+                return _fc_svg_text_box(tx, ty, text, fill, font_size)
+        return ""
+
+
+def _fc_svg_leader_label(
+    placer: _FcSvgLabelPlacer,
+    ax: float,
+    ay: float,
+    text: str,
+    fill: str,
+    font_size: int = 9,
+    reach: float = 34.0,
+) -> str:
+    """Label offset from a point with a short leader (for tiny line segments)."""
+    w, h = _fc_label_box_size(text, font_size)
+    offsets = (
+        (0.0, -reach),
+        (-reach, 0.0),
+        (reach, 0.0),
+        (0.0, reach),
+        (-reach * 0.75, -reach * 0.75),
+        (reach * 0.75, -reach * 0.75),
+        (-reach * 0.75, reach * 0.75),
+        (reach * 0.75, reach * 0.75),
+        (0.0, -reach * 1.5),
+        (0.0, reach * 1.5),
+    )
+    for ox, oy in offsets:
+        lx, ly = ax + ox, ay + oy
+        if placer._blocked(lx, ly, w, h):
+            continue
+        placer._placed.append((lx, ly, w, h))
+        return (
+            f"<line x1='{ax:.1f}' y1='{ay:.1f}' x2='{lx:.1f}' y2='{ly:.1f}' "
+            f"stroke='{fill}' stroke-width='1' stroke-dasharray='2,2'/>"
+            + _fc_svg_text_box(lx, ly, text, fill, font_size)
+        )
+    return ""
+
+
+def _fc_plan_place_label(
+    placer: _FcSvgLabelPlacer,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    text: str,
+    fill: str,
+    font_size: int = 9,
+    prefer_side: float = 1.0,
+) -> str:
+    """On-segment label when room allows; otherwise leader callout from midpoint."""
+    lbl = placer.place_on_segment(
+        x1, y1, x2, y2, text, fill, font_size, prefer_side, min_len=6.0
+    )
+    if lbl:
+        return lbl
+    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    return _fc_svg_leader_label(placer, mx, my, text, fill, font_size)
+
+
+def _fc_seg_can_label(seg_len: float, text: str, font_size: int, min_pad: float = 14.0) -> bool:
+    w, _ = _fc_label_box_size(text, font_size)
+    return seg_len >= w + min_pad
+
+
+def _fc_diagram_footer_height(
+    columns: list[tuple[str, list[str], str]],
+    *,
+    min_h: float = 48.0,
+) -> float:
+    """Footer height that fits the tallest column (header + value lines)."""
+    line_step = 13.0
+    value_start = 28.0
+    value_font = 9.0
+    bottom_pad = 8.0
+    max_lines = max((len(lines) for _, lines, _ in columns), default=1)
+    last_baseline = value_start + (max_lines - 1) * line_step
+    return max(min_h, last_baseline + value_font + bottom_pad)
+
+
+def _fc_svg_diagram_footer(
+    bg_x: float,
+    bg_w: float,
+    footer_top: float,
+    footer_h: float,
+    columns: list[tuple[str, list[str], str]],
+) -> str:
+    """Fixed-width footer columns — headers + value lines, no overlap."""
+    footer_h = max(footer_h, _fc_diagram_footer_height(columns, min_h=footer_h))
+    parts = [
+        f"<rect x='{bg_x:.0f}' y='{footer_top:.0f}' width='{bg_w:.0f}' height='{footer_h:.0f}' "
+        "fill='#fff' stroke='#e2e8f0' stroke-width='1' rx='6'/>",
+    ]
+    col_n = len(columns)
+    col_w = bg_w / col_n
+    line_step = 13.0
+    for i, (header, lines, color) in enumerate(columns):
+        col_left = bg_x + col_w * i
+        if i > 0:
+            parts.append(
+                f"<line x1='{col_left:.0f}' y1='{footer_top + 6:.0f}' x2='{col_left:.0f}' "
+                f"y2='{footer_top + footer_h - 6:.0f}' stroke='#e2e8f0' stroke-width='1'/>"
+            )
+        hx = col_left + 10.0
+        parts.append(
+            f"<text x='{hx:.0f}' y='{footer_top + 14:.0f}' font-size='8' fill='#64748b' "
+            f"font-weight='600'>{_fc_svg_esc(header)}</text>"
+        )
+        for j, line in enumerate(lines):
+            parts.append(
+                f"<text x='{hx:.0f}' y='{footer_top + 28.0 + j * line_step:.0f}' font-size='9' "
+                f"fill='{color}' font-weight='700'>{_fc_svg_esc(line)}</text>"
+            )
+    return "".join(parts)
+
+
+def _fc_svg_cluster_card(
+    placer: _FcSvgLabelPlacer,
+    anchor_x: float,
+    anchor_y: float,
+    rows: list[tuple[str, str]],
+    bounds: tuple[float, float, float, float],
+    prefer_left: bool,
+    font_size: int = 9,
+) -> str:
+    """Miss-only label card offset from T/I cluster (never overlaps markers)."""
+    if not rows:
+        return ""
+    line_h = font_size + 7.0
+    pad_x, pad_y = 8.0, 5.0
+    card_w = max(_fc_label_box_size(text, font_size)[0] for text, _ in rows) + pad_x * 2
+    card_h = len(rows) * line_h + pad_y * 2
+    xmin, ymin, xmax, ymax = bounds
+    gap = 38.0
+    if prefer_left:
+        candidates = [
+            (anchor_x - card_w / 2 - gap, anchor_y),
+            (anchor_x - card_w / 2 - gap, anchor_y - card_h / 2 - 12.0),
+            (anchor_x - card_w / 2 - gap, anchor_y + card_h / 2 + 12.0),
+            (xmin + card_w / 2 + 8.0, anchor_y),
+        ]
+    else:
+        candidates = [
+            (anchor_x + card_w / 2 + gap, anchor_y),
+            (anchor_x + card_w / 2 + gap, anchor_y - card_h / 2 - 12.0),
+            (anchor_x + card_w / 2 + gap, anchor_y + card_h / 2 + 12.0),
+            (xmax - card_w / 2 - 8.0, anchor_y),
+        ]
+    for cx, cy in candidates:
+        if cx - card_w / 2 < xmin + 4 or cx + card_w / 2 > xmax - 4:
+            continue
+        if cy - card_h / 2 < ymin + 4 or cy + card_h / 2 > ymax - 4:
+            continue
+        if placer._blocked(cx, cy, card_w, card_h):
+            continue
+        placer._placed.append((cx, cy, card_w, card_h))
+        left = cx - card_w / 2
+        top = cy - card_h / 2
+        parts = [
+            f"<line x1='{anchor_x:.1f}' y1='{anchor_y:.1f}' x2='{cx:.1f}' y2='{cy:.1f}' "
+            "stroke='#fdba74' stroke-width='1' stroke-dasharray='3,2'/>",
+            f"<rect x='{left:.1f}' y='{top:.1f}' width='{card_w:.1f}' height='{card_h:.1f}' "
+            "fill='#fff' stroke='#ea580c' stroke-width='1.2' rx='6'/>",
+        ]
+        for i, (text, fill) in enumerate(rows):
+            ty = top + pad_y + (i + 0.72) * line_h
+            parts.append(
+                f"<text x='{cx:.1f}' y='{ty:.1f}' text-anchor='middle' font-size='{font_size}' "
+                f"fill='{fill}' font-weight='700'>{_fc_svg_esc(text)}</text>"
+            )
+        return "".join(parts)
+    return ""
+
+
+def _fc_svg_callout_card(
+    anchor_x: float,
+    anchor_y: float,
+    rows: list[tuple[str, str]],
+    placer: _FcSvgLabelPlacer,
+    bounds: tuple[float, float, float, float],
+    font_size: int = 9,
+) -> str:
+    """Stacked callout for crowded clusters; leader line to anchor."""
+    if not rows:
+        return ""
+    line_h = font_size + 7.0
+    pad_x, pad_y = 8.0, 5.0
+    card_w = max(_fc_label_box_size(text, font_size)[0] for text, _ in rows) + pad_x * 2
+    card_h = len(rows) * line_h + pad_y * 2
+    xmin, ymin, xmax, ymax = bounds
+    gap = 32.0
+    candidates: list[tuple[float, float]] = [
+        (anchor_x - card_w / 2 - gap, anchor_y),
+        (anchor_x + card_w / 2 + gap, anchor_y),
+        (anchor_x - card_w / 2 - gap, anchor_y - card_h / 2 - gap),
+        (anchor_x - card_w / 2 - gap, anchor_y + card_h / 2 + gap),
+        (anchor_x + card_w / 2 + gap, anchor_y + card_h / 2 + gap),
+        (anchor_x, anchor_y + card_h / 2 + gap + 8.0),
+        (anchor_x, anchor_y - card_h / 2 - gap - 8.0),
+        ((xmin + xmax) / 2.0, ymax - card_h / 2 - 6.0),
+        (xmin + card_w / 2 + 8.0, anchor_y),
+        (xmax - card_w / 2 - 8.0, anchor_y),
+    ]
+
+    for cx, cy in candidates:
+        if cx - card_w / 2 < xmin + 2 or cx + card_w / 2 > xmax - 2:
+            continue
+        if cy - card_h / 2 < ymin + 2 or cy + card_h / 2 > ymax - 2:
+            continue
+        if placer._blocked(cx, cy, card_w, card_h):
+            continue
+        placer._placed.append((cx, cy, card_w, card_h))
+        left = cx - card_w / 2
+        top = cy - card_h / 2
+        parts = [
+            f"<line x1='{anchor_x:.1f}' y1='{anchor_y:.1f}' x2='{cx:.1f}' y2='{cy:.1f}' "
+            "stroke='#94a3b8' stroke-width='1' stroke-dasharray='3,2'/>",
+            f"<rect x='{left:.1f}' y='{top:.1f}' width='{card_w:.1f}' height='{card_h:.1f}' "
+            "fill='#fff' stroke='#cbd5e1' stroke-width='1.2' rx='6'/>",
+        ]
+        for i, (text, fill) in enumerate(rows):
+            ty = top + pad_y + (i + 0.72) * line_h
+            parts.append(
+                f"<text x='{cx:.1f}' y='{ty:.1f}' text-anchor='middle' font-size='{font_size}' "
+                f"fill='{fill}' font-weight='700'>{_fc_svg_esc(text)}</text>"
+            )
+        return "".join(parts)
+    return ""
+
+
+def _fc_seg_prefer_side(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    avoid_x: float,
+    avoid_y: float,
+) -> float:
+    """Perpendicular side (+1 / -1) that offsets the label away from a point."""
+    mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy) or 1.0
+    px, py = -dy / length, dx / length
+    vx, vy = avoid_x - mx, avoid_y - my
+    dot = px * vx + py * vy
+    return -1.0 if dot > 0 else 1.0
+
+
+def _fire_correction_workflow_html() -> str:
+    return (
+        "<div class='fc-workflow'>"
+        "<div class='fc-workflow-step' data-step='1'>"
+        "<strong>DOOAF Setup</strong>"
+        "<span class='muted'>Pick on video = target</span></div>"
+        "<div class='fc-workflow-step' data-step='2'>"
+        "<strong>Target ON</strong>"
+        "<span class='muted'>Click = fall of shot</span></div>"
+        "<div class='fc-workflow-step' data-step='3'>"
+        "<strong>Report</strong>"
+        "<span class='muted'>Miss + correction</span></div>"
+        "<div class='fc-workflow-step' data-step='4'>"
+        "<strong>Next round</strong>"
+        "<span class='muted'>Apply corrections</span></div>"
+        "</div>"
+    )
+
+
+def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
+    """Plan-view SVG: gun, target, impact, miss vector (North up)."""
+    gun = session.gun
+    intended = session.intended
+    impact = session.impact
+    if gun is None or intended is None or impact is None:
+        return ""
+    ne_t = latlon_delta_to_ne_m(gun.lat, gun.lon, intended.lat, intended.lon)
+    ne_i = latlon_delta_to_ne_m(gun.lat, gun.lon, impact.lat, impact.lon)
+    miss_e = float(c.miss_east_m)
+    miss_n = float(c.miss_north_m)
+    corr_e = -miss_e
+    corr_n = -miss_n
+    range_text = f"{c.range_gun_to_intended_m:.1f} m"
+    gi_text = f"{c.range_gun_to_impact_m:.1f} m"
+    round_landed = [f"Miss {c.impact_to_intended_m:.1f} m"]
+    if abs(miss_e) >= 0.05:
+        round_landed.append(f"{abs(miss_e):.1f} m {'E' if miss_e >= 0 else 'W'}")
+    if abs(miss_n) >= 0.05:
+        round_landed.append(f"{abs(miss_n):.1f} m {'N' if miss_n >= 0 else 'S'}")
+    corr_e_txt = f"{'East' if corr_e >= 0 else 'West'} {abs(corr_e):.1f} m"
+    corr_n_txt = f"{'North' if corr_n >= 0 else 'South'} {abs(corr_n):.1f} m"
+    footer_columns = [
+        ("Distances", [f"gun→target {range_text}", f"gun→impact {gi_text}"], "#64748b"),
+        ("Round landed", round_landed, "#ea580c"),
+        ("Apply", [corr_e_txt, corr_n_txt], "#0d9488"),
+    ]
+    east_pts = [0.0, ne_t[1], ne_i[1]]
+    north_pts = [0.0, ne_t[0], ne_i[0]]
+    pad = 18.0
+    min_e, max_e = min(east_pts) - pad, max(east_pts) + pad
+    min_n, max_n = min(north_pts) - pad, max(north_pts) + pad
+    span_e = max(max_e - min_e, 12.0)
+    span_n = max(max_n - min_n, 12.0)
+    vb_w, vb_h = 520.0, 348.0
+    margin = 48.0
+    graph_top = 28.0
+    footer_gap = 8.0
+    footer_h = _fc_diagram_footer_height(footer_columns)
+    footer_top = vb_h - footer_h - 6.0
+    graph_bottom = footer_top - footer_gap
+    plot_bottom = graph_bottom - 20.0
+    scale = min(
+        (vb_w - 2 * margin) / span_e,
+        (plot_bottom - graph_top - margin) / span_n,
+        12.0,
+    )
+
+    def _xy(east: float, north: float) -> tuple[float, float]:
+        x = margin + (east - min_e) * scale
+        y = plot_bottom - (north - min_n) * scale
+        return x, y
+
+    gx, gy = _xy(0.0, 0.0)
+    tx, ty = _xy(ne_t[1], ne_t[0])
+    ix, iy = _xy(ne_i[1], ne_i[0])
+    corner_x, corner_y = ix, ty
+    cluster_x = (tx + ix) / 2.0
+    cluster_y = (ty + iy) / 2.0
+    bg_x = margin - 8.0
+    bg_w = vb_w - 2 * (margin - 8.0)
+    bg_h = graph_bottom - graph_top
+    fs = 9
+
+    placer = _FcSvgLabelPlacer()
+    placer.add_blocked_zone(bg_x + bg_w / 2, footer_top + footer_h / 2, bg_w + 4, footer_h + footer_gap + 4)
+    placer.add_marker(gx, gy, 14.0)
+    placer.add_marker(tx, ty, 15.0)
+    placer.add_marker(ix, iy, 14.0)
+
+    parts: list[str] = [
+        f"<svg class='fc-plan-svg' viewBox='0 0 {vb_w:.0f} {vb_h:.0f}' width='100%' "
+        "xmlns='http://www.w3.org/2000/svg' font-family='Segoe UI,sans-serif'>",
+        "<defs>",
+        "<marker id='fc-arrow-miss' markerWidth='8' markerHeight='8' refX='6' refY='3' orient='auto'>",
+        "<path d='M0,0 L6,3 L0,6 Z' fill='#ea580c'/>",
+        "</marker>",
+        "<marker id='fc-arrow-corr' markerWidth='8' markerHeight='8' refX='6' refY='3' orient='auto'>",
+        "<path d='M0,0 L6,3 L0,6 Z' fill='#0d9488'/>",
+        "</marker>",
+        "</defs>",
+        f"<text x='{vb_w / 2:.0f}' y='{graph_top - 8:.0f}' text-anchor='middle' font-size='11' "
+        "fill='#64748b' font-weight='700'>N</text>",
+        f"<line x1='{vb_w / 2:.0f}' y1='{graph_top - 4:.0f}' x2='{vb_w / 2:.0f}' "
+        f"y2='{graph_top + 10:.0f}' stroke='#64748b' stroke-width='2'/>",
+        f"<polygon points='{vb_w / 2:.0f},{graph_top - 8:.0f} {vb_w / 2 - 5:.0f},"
+        f"{graph_top - 2:.0f} {vb_w / 2 + 5:.0f},{graph_top - 2:.0f}' fill='#64748b'/>",
+        f"<rect x='{bg_x:.0f}' y='{graph_top:.0f}' width='{bg_w:.0f}' height='{bg_h:.0f}' "
+        "fill='#f8fafc' rx='8'/>",
+        f"<line x1='{gx:.1f}' y1='{gy:.1f}' x2='{tx:.1f}' y2='{ty:.1f}' stroke='#94a3b8' "
+        "stroke-width='1.5' stroke-dasharray='6,4'/>",
+        f"<line x1='{gx:.1f}' y1='{gy:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#cbd5e1' "
+        "stroke-width='1' stroke-dasharray='4,4'/>",
+        f"<circle cx='{gx:.1f}' cy='{gy:.1f}' r='10' fill='#2563eb'/>",
+        f"<text x='{gx:.1f}' y='{gy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
+        "font-weight='700'>G</text>",
+        f"<text x='{gx:.1f}' y='{gy - 14:.1f}' text-anchor='middle' font-size='{fs}' fill='#2563eb' "
+        "font-weight='600'>Gun</text>",
+        f"<circle cx='{tx:.1f}' cy='{ty:.1f}' r='11' fill='#16a34a'/>",
+        f"<text x='{tx:.1f}' y='{ty + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
+        "font-weight='700'>T</text>",
+        f"<circle cx='{ix:.1f}' cy='{iy:.1f}' r='10' fill='#dc2626'/>",
+        f"<text x='{ix:.1f}' y='{iy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
+        "font-weight='700'>I</text>",
+    ]
+
+    gt_side = _fc_seg_prefer_side(gx, gy, tx, ty, cluster_x, cluster_y)
+    gi_side = _fc_seg_prefer_side(gx, gy, ix, iy, cluster_x, cluster_y)
+    parts.append(
+        placer.place_on_segment(gx, gy, tx, ty, range_text, "#64748b", fs, gt_side, min_len=56.0)
+    )
+    parts.append(
+        placer.place_on_segment(gx, gy, ix, iy, gi_text, "#94a3b8", fs, gi_side, min_len=56.0)
+    )
+
+    if abs(miss_e) >= 0.05:
+        parts.append(
+            f"<line x1='{tx:.1f}' y1='{ty:.1f}' x2='{corner_x:.1f}' y2='{corner_y:.1f}' "
+            "stroke='#fdba74' stroke-width='2' stroke-dasharray='4,3'/>"
+        )
+    if abs(miss_n) >= 0.05:
+        parts.append(
+            f"<line x1='{corner_x:.1f}' y1='{corner_y:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' "
+            "stroke='#fdba74' stroke-width='2' stroke-dasharray='4,3'/>"
+        )
+
+    parts.extend(
+        [
+            f"<line x1='{tx:.1f}' y1='{ty:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#ea580c' "
+            "stroke-width='2.5' marker-end='url(#fc-arrow-miss)'/>",
+            f"<line x1='{ix:.1f}' y1='{iy:.1f}' x2='{tx:.1f}' y2='{ty:.1f}' stroke='#0d9488' "
+            "stroke-width='2' stroke-dasharray='5,3' marker-end='url(#fc-arrow-corr)'/>",
+        ]
+    )
+
+    parts.append(
+        _fc_svg_diagram_footer(bg_x, bg_w, footer_top, footer_h, footer_columns)
+    )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _fire_correction_gunline_svg(c: FireCorrection) -> str:
+    """Gun-line view: along-range and right miss."""
+    along = float(c.miss_along_m)
+    right = float(c.miss_right_m)
+    r_gt = max(float(c.range_gun_to_intended_m), 1.0)
+    span = max(r_gt + abs(along) + 20.0, 40.0)
+    vb_w, vb_h = 520.0, 348.0
+    margin = 56.0
+    graph_top = 36.0
+    footer_gap = 8.0
+    range_text = f"{r_gt:.1f} m"
+    along_label = f"{along:+.1f} m along"
+    right_label = f"{right:+.1f} m R"
+    corr_along = float(c.range_correction_m)
+    corr_right = float(c.deflection_correction_m)
+    corr_range_label = f"range {corr_along:+.1f} m"
+    corr_lr_label = f"L/R {corr_right:+.1f} m"
+    miss_total = f"Miss {c.impact_to_intended_m:.1f} m"
+    landed_lines = [miss_total]
+    if abs(along) >= 0.05:
+        landed_lines.append(along_label)
+    if abs(right) >= 0.05:
+        landed_lines.append(right_label)
+    footer_columns = [
+        ("Range", [f"target {range_text}"], "#64748b"),
+        ("Round landed", landed_lines, "#ea580c"),
+        ("Apply", [corr_range_label, corr_lr_label], "#0d9488"),
+    ]
+    footer_h = _fc_diagram_footer_height(footer_columns)
+    footer_top = vb_h - footer_h - 6.0
+    graph_bottom = footer_top - footer_gap
+    y_line = (graph_top + graph_bottom) / 2.0
+    scale = (vb_w - 2 * margin) / span
+    base_x = margin
+    tgt_x = base_x + r_gt * scale
+    imp_x = tgt_x + along * scale
+    max_defl_px = min(36.0, (graph_bottom - graph_top) / 2.0 - 20.0)
+    defl_scale = min(scale * 0.85, max_defl_px / max(abs(right), 1.0))
+    imp_y = y_line + right * defl_scale
+    imp_y = max(graph_top + 16.0, min(graph_bottom - 20.0, imp_y))
+    fs = 9
+    bg_x = margin - 10.0
+    bg_w = vb_w - 2 * (margin - 10.0)
+
+    placer = _FcSvgLabelPlacer()
+    placer.add_blocked_zone(bg_x + bg_w / 2, footer_top + footer_h / 2, bg_w + 4, footer_h + footer_gap + 4)
+    placer.add_marker(base_x, y_line, 12.0)
+    placer.add_marker(tgt_x, y_line, 14.0)
+    placer.add_marker(imp_x, imp_y, 13.0)
+
+    parts: list[str] = [
+        f"<svg class='fc-gunline-svg' viewBox='0 0 {vb_w:.0f} {vb_h:.0f}' width='100%' "
+        "xmlns='http://www.w3.org/2000/svg' font-family='Segoe UI,sans-serif'>",
+        f"<text x='{vb_w / 2:.0f}' y='{graph_top - 10:.0f}' text-anchor='middle' font-size='10' "
+        "fill='#64748b'>Along gun→target line · Right = R+</text>",
+        f"<rect x='{bg_x:.0f}' y='{graph_top:.0f}' width='{bg_w:.0f}' "
+        f"height='{graph_bottom - graph_top:.0f}' fill='#f8fafc' rx='8'/>",
+        f"<line x1='{base_x:.0f}' y1='{y_line:.0f}' x2='{vb_w - margin:.0f}' y2='{y_line:.0f}' "
+        "stroke='#94a3b8' stroke-width='2'/>",
+        f"<circle cx='{base_x:.0f}' cy='{y_line:.0f}' r='8' fill='#2563eb'/>",
+        f"<text x='{base_x:.0f}' y='{y_line + 4:.0f}' text-anchor='middle' font-size='8' fill='#fff' "
+        "font-weight='700'>G</text>",
+        f"<text x='{base_x:.0f}' y='{y_line - 14:.0f}' text-anchor='middle' font-size='{fs}' "
+        "fill='#2563eb'>Gun</text>",
+        f"<circle cx='{tgt_x:.0f}' cy='{y_line:.0f}' r='10' fill='#16a34a'/>",
+        f"<text x='{tgt_x:.0f}' y='{y_line + 4:.0f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
+        "font-weight='700'>T</text>",
+        f"<circle cx='{imp_x:.0f}' cy='{imp_y:.0f}' r='9' fill='#dc2626'/>",
+        f"<text x='{imp_x:.0f}' y='{imp_y + 4:.0f}' text-anchor='middle' font-size='8' fill='#fff' "
+        "font-weight='700'>I</text>",
+    ]
+
+    range_mid_x = base_x + (tgt_x - base_x) * 0.38
+    parts.append(placer.place_at(range_mid_x, y_line, range_text, "#64748b", fs))
+
+    if abs(along) >= 0.05:
+        parts.append(
+            f"<line x1='{tgt_x:.0f}' y1='{y_line:.0f}' x2='{imp_x:.0f}' y2='{y_line:.0f}' "
+            "stroke='#fdba74' stroke-width='2' stroke-dasharray='4,3'/>"
+        )
+
+    if abs(right) >= 0.05:
+        parts.append(
+            f"<line x1='{imp_x:.0f}' y1='{y_line:.0f}' x2='{imp_x:.0f}' y2='{imp_y:.0f}' "
+            "stroke='#fdba74' stroke-width='2' stroke-dasharray='4,3'/>"
+        )
+
+    parts.append(
+        _fc_svg_diagram_footer(bg_x, bg_w, footer_top, footer_h, footer_columns)
+    )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _fc_compass_span(miss_e: float, miss_n: float, *, floor: float = 10.0) -> float:
+    return max(abs(miss_e), abs(miss_n), floor, 1.0)
+
+
+def _fire_correction_compass_miss_svg(c: FireCorrection, *, compact: bool = False) -> str:
+    """Target-centred compass: impact offset and E/N miss components."""
+    miss_e = float(c.miss_east_m)
+    miss_n = float(c.miss_north_m)
+    span = _fc_compass_span(miss_e, miss_n, floor=8.0 if compact else 12.0)
+    if compact:
+        vb_w, vb_h, margin, r_tgt, r_imp = 280.0, 280.0, 40.0, 9.0, 8.0
+    else:
+        vb_w, vb_h, margin, r_tgt, r_imp = 400.0, 400.0, 52.0, 11.0, 10.0
+    cx, cy = vb_w / 2.0, vb_h / 2.0
+    plot_r = min(cx, cy) - margin
+    px_per_m = plot_r / span
+    ix = cx + miss_e * px_per_m
+    iy = cy - miss_n * px_per_m
+    ex, ey = cx + miss_e * px_per_m, cy
+    e_label = (
+        f"{abs(miss_e):.1f} m {'E' if miss_e >= 0 else 'W'}"
+        if abs(miss_e) >= 0.05
+        else ""
+    )
+    n_label = (
+        f"{abs(miss_n):.1f} m {'N' if miss_n >= 0 else 'S'}"
+        if abs(miss_n) >= 0.05
+        else ""
+    )
+    fs = 8 if compact else 9
+    parts: list[str] = [
+        f"<svg class='fc-compass-svg' viewBox='0 0 {vb_w:.0f} {vb_h:.0f}' width='100%' "
+        "xmlns='http://www.w3.org/2000/svg' font-family='Segoe UI,sans-serif'>",
+        f"<rect x='{margin:.0f}' y='{margin:.0f}' width='{vb_w - 2 * margin:.0f}' "
+        f"height='{vb_h - 2 * margin:.0f}' fill='#f8fafc' rx='8'/>",
+        f"<line x1='{cx:.0f}' y1='{margin:.0f}' x2='{cx:.0f}' y2='{vb_h - margin:.0f}' "
+        "stroke='#cbd5e1' stroke-width='1' stroke-dasharray='4,4'/>",
+        f"<line x1='{margin:.0f}' y1='{cy:.0f}' x2='{vb_w - margin:.0f}' y2='{cy:.0f}' "
+        "stroke='#cbd5e1' stroke-width='1' stroke-dasharray='4,4'/>",
+        f"<text x='{cx:.0f}' y='{margin + 14:.0f}' text-anchor='middle' font-size='{fs + 1}' "
+        "fill='#64748b' font-weight='700'>N</text>",
+        f"<text x='{vb_w - margin - 4:.0f}' y='{cy + 4:.0f}' text-anchor='end' font-size='{fs}' "
+        "fill='#64748b' font-weight='600'>E</text>",
+        f"<text x='{margin + 4:.0f}' y='{cy + 4:.0f}' font-size='{fs}' fill='#64748b' "
+        "font-weight='600'>W</text>",
+        f"<text x='{cx:.0f}' y='{vb_h - margin - 6:.0f}' text-anchor='middle' font-size='{fs}' "
+        "fill='#64748b' font-weight='600'>S</text>",
+        f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='{r_tgt:.0f}' fill='#16a34a'/>",
+        f"<text x='{cx:.1f}' y='{cy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
+        "font-weight='700'>T</text>",
+        f"<text x='{cx:.1f}' y='{cy - r_tgt - 6:.1f}' text-anchor='middle' font-size='{fs}' "
+        "fill='#16a34a' font-weight='600'>Target</text>",
+    ]
+    if abs(miss_e) >= 0.05:
+        parts.append(
+            f"<line x1='{cx:.1f}' y1='{cy:.1f}' x2='{ex:.1f}' y2='{ey:.1f}' stroke='#fdba74' "
+            "stroke-width='2' stroke-dasharray='3,2'/>"
+        )
+    if abs(miss_n) >= 0.05:
+        parts.append(
+            f"<line x1='{ex:.1f}' y1='{ey:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#fdba74' "
+            "stroke-width='2' stroke-dasharray='3,2'/>"
+        )
+    if e_label:
+        parts.append(
+            f"<text x='{(cx + ex) / 2:.0f}' y='{cy + 16:.0f}' text-anchor='middle' "
+            f"font-size='{fs}' fill='#ea580c'>{_fc_svg_esc(e_label)}</text>"
+        )
+    if n_label:
+        parts.append(
+            f"<text x='{ix + 8:.0f}' y='{(ey + iy) / 2:.0f}' font-size='{fs}' fill='#ea580c'>"
+            f"{_fc_svg_esc(n_label)}</text>"
+        )
+    parts.extend(
+        [
+            f"<circle cx='{ix:.1f}' cy='{iy:.1f}' r='{r_imp:.0f}' fill='#dc2626'/>",
+            f"<text x='{ix:.1f}' y='{iy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
+            "font-weight='700'>I</text>",
+            f"<text x='{ix:.1f}' y='{iy + r_imp + 14:.1f}' text-anchor='middle' font-size='{fs}' "
+            "fill='#dc2626' font-weight='600'>Impact</text>",
+            f"<line x1='{cx:.1f}' y1='{cy:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#ea580c' "
+            "stroke-width='2.5'/>",
+            f"<line x1='{ix:.1f}' y1='{iy:.1f}' x2='{cx:.1f}' y2='{cy:.1f}' stroke='#0d9488' "
+            "stroke-width='2' stroke-dasharray='5,3'/>",
+            f"<text x='{min(cx, ix) - 6:.0f}' y='{(cy + iy) / 2 - 6:.0f}' font-size='{fs + 1}' "
+            f"fill='#ea580c' font-weight='700'>"
+            f"{_fc_svg_esc(f'Miss {c.impact_to_intended_m:.1f} m')}</text>",
+            "</svg>",
+        ]
+    )
+    return "".join(parts)
+
+
+def _fire_correction_aim_story_svg(c: FireCorrection) -> str:
+    """Three-step story: aimed → landed → correct next round."""
+    miss_e = float(c.miss_east_m)
+    miss_n = float(c.miss_north_m)
+    horiz_m = float(c.impact_to_intended_m)
+    vb_w, vb_h = 720.0, 248.0
+    col_w = vb_w / 3.0
+    cols = [col_w * 0.5, col_w * 1.5, col_w * 2.5]
+    graph_top = 50.0
+    graph_bottom = 142.0
+    target_y = 74.0
+    label_y = 178.0
+    tgt_r, imp_r = 11.0, 10.0
+    half_col = col_w / 2.0 - 18.0
+    avail_down = graph_bottom - target_y - imp_r - 4.0
+    avail_up = target_y - graph_top - tgt_r - 4.0
+
+    def _impact_xy(cx: float) -> tuple[float, float]:
+        se = max(abs(miss_e), 0.5)
+        sn = max(abs(miss_n), 0.5)
+        px_e = min(half_col / se, 42.0 / _fc_compass_span(miss_e, miss_n, floor=20.0))
+        if miss_n >= 0:
+            px_n = min(avail_up / sn, px_e)
+        else:
+            px_n = min(avail_down / sn, px_e)
+        px = min(px_e, px_n)
+        ix = cx + miss_e * px
+        iy = target_y - miss_n * px
+        ix = max(cx - half_col, min(cx + half_col, ix))
+        iy = max(graph_top + tgt_r, min(graph_bottom - imp_r, iy))
+        return ix, iy
+
+    def _panel_bg(idx: int) -> str:
+        x0 = idx * col_w + 6.0
+        return (
+            f"<rect x='{x0:.0f}' y='{graph_top - 2:.0f}' width='{col_w - 12:.0f}' "
+            f"height='{graph_bottom - graph_top + 36:.0f}' fill='#f8fafc' "
+            "stroke='#e2e8f0' stroke-width='1' rx='10'/>"
+        )
+
+    def _story_heading(cx: float, title: str, subtitle: str) -> str:
+        return (
+            f"<text x='{cx:.0f}' y='24' text-anchor='middle' font-size='11' fill='#334155' "
+            f"font-weight='700'>{_fc_svg_esc(title)}</text>"
+            f"<text x='{cx:.0f}' y='38' text-anchor='middle' font-size='9' fill='#64748b'>"
+            f"{_fc_svg_esc(subtitle)}</text>"
+        )
+
+    def _story_target(cx: float, aim_hint: bool = False) -> str:
+        hint = ""
+        if aim_hint:
+            hint = (
+                f"<text x='{cx:.0f}' y='{target_y - 16:.0f}' text-anchor='middle' font-size='8' "
+                "fill='#0d9488' font-weight='700'>Aim here</text>"
+            )
+        return (
+            hint
+            + f"<circle cx='{cx:.0f}' cy='{target_y:.0f}' r='{tgt_r:.0f}' fill='#16a34a'/>"
+            + f"<text x='{cx:.0f}' y='{target_y + 4:.0f}' text-anchor='middle' font-size='9' "
+            "fill='#fff' font-weight='700'>T</text>"
+        )
+
+    def _story_impact(ix: float, iy: float) -> str:
+        return (
+            f"<circle cx='{ix:.1f}' cy='{iy:.1f}' r='{imp_r:.0f}' fill='#dc2626'/>"
+            f"<text x='{ix:.1f}' y='{iy + 4:.1f}' text-anchor='middle' font-size='9' fill='#fff' "
+            "font-weight='700'>I</text>"
+        )
+
+    def _story_pill(cx: float, text: str, stroke: str, fill: str) -> str:
+        esc = _fc_svg_esc(text)
+        w = max(len(text) * 6.0 + 18.0, 80.0)
+        return (
+            f"<rect x='{cx - w / 2:.1f}' y='{label_y - 14:.0f}' width='{w:.1f}' height='20' "
+            f"fill='#fff' stroke='{stroke}' stroke-width='1.5' rx='8'/>"
+            f"<text x='{cx:.0f}' y='{label_y:.0f}' text-anchor='middle' font-size='10' "
+            f"fill='{fill}' font-weight='700'>{esc}</text>"
+        )
+
+    # Step 1
+    panel1 = _panel_bg(0) + _story_heading(cols[0], "1 · You aimed at", "Actual target (green)") + _story_target(
+        cols[0]
+    )
+
+    # Step 2 — orange miss
+    cx2 = cols[1]
+    ix2, iy2 = _impact_xy(cx2)
+    panel2 = (
+        _panel_bg(1)
+        + _story_heading(cx2, "2 · Round landed", "Fall of shot (red)")
+        + _story_target(cx2)
+        + f"<line x1='{cx2:.0f}' y1='{target_y:.0f}' x2='{ix2:.1f}' y2='{iy2:.1f}' "
+        "stroke='#ea580c' stroke-width='2.5'/>"
+        + _story_impact(ix2, iy2)
+        + _story_pill(cx2, f"Miss {horiz_m:.1f} m", "#fdba74", "#ea580c")
+    )
+
+    # Step 3 — teal correction (no orange line)
+    cx3 = cols[2]
+    ix3, iy3 = _impact_xy(cx3)
+    panel3 = (
+        _panel_bg(2)
+        + _story_heading(cx3, "3 · Next round", "Move aim back to target")
+        + _story_target(cx3, aim_hint=True)
+        + _story_impact(ix3, iy3)
+        + f"<line x1='{ix3:.1f}' y1='{iy3:.1f}' x2='{cx3:.0f}' y2='{target_y:.0f}' "
+        "stroke='#0d9488' stroke-width='2.5' stroke-dasharray='6,4' "
+        "marker-end='url(#fc-story-arrow)'/>"
+        + _story_pill(cx3, "Apply correction", "#5eead4", "#0d9488")
+    )
+
+    dividers = (
+        f"<line x1='{col_w:.0f}' y1='{graph_top:.0f}' x2='{col_w:.0f}' y2='{label_y + 14:.0f}' "
+        "stroke='#e2e8f0' stroke-width='1'/>"
+        f"<line x1='{col_w * 2:.0f}' y1='{graph_top:.0f}' x2='{col_w * 2:.0f}' "
+        f"y2='{label_y + 14:.0f}' stroke='#e2e8f0' stroke-width='1'/>"
+    )
+
+    return "".join(
+        [
+            f"<svg class='fc-story-svg' viewBox='0 0 {vb_w:.0f} {vb_h:.0f}' width='100%' "
+            "xmlns='http://www.w3.org/2000/svg' font-family='Segoe UI,sans-serif'>",
+            "<defs>",
+            "<marker id='fc-story-arrow' markerWidth='8' markerHeight='8' refX='6' refY='3' orient='auto'>",
+            "<path d='M0,0 L6,3 L0,6 Z' fill='#0d9488'/>",
+            "</marker>",
+            "</defs>",
+            dividers,
+            panel1,
+            panel2,
+            panel3,
+            "<text x='360' y='222' text-anchor='middle' font-size='9' fill='#64748b'>",
+            f"{_fc_svg_esc('Step 2 = orange miss distance · Step 3 = teal correction arrow')}</text>",
+            "</svg>",
+        ]
+    )
+
+
+def _fire_correction_positions_svg(session: DooafSession) -> str:
+    """All marks on one map: gun, target, impact, drone."""
+    entries: list[tuple[str, GeoPoint, str, str]] = []
+    if session.gun is not None:
+        entries.append(("Gun", session.gun, "#2563eb", "G"))
+    if session.intended is not None:
+        entries.append(("Target", session.intended, "#16a34a", "T"))
+    if session.impact is not None:
+        entries.append(("Impact", session.impact, "#dc2626", "I"))
+    if session.drone is not None:
+        entries.append(("Drone", session.drone, "#9333ea", "D"))
+    if len(entries) < 2:
+        return ""
+    ref_lat = sum(p.lat for _, p, _, _ in entries) / len(entries)
+    ref_lon = sum(p.lon for _, p, _, _ in entries) / len(entries)
+    en_pts: list[tuple[str, float, float, str, str]] = []
+    for label, pt, color, letter in entries:
+        north, east = latlon_delta_to_ne_m(ref_lat, ref_lon, pt.lat, pt.lon)
+        en_pts.append((label, east, north, color, letter))
+    east_vals = [e for _, e, _, _, _ in en_pts]
+    north_vals = [n for _, _, n, _, _ in en_pts]
+    mid_e = (min(east_vals) + max(east_vals)) / 2.0
+    mid_n = (min(north_vals) + max(north_vals)) / 2.0
+    span_e = max(max(east_vals) - min(east_vals), 20.0)
+    span_n = max(max(north_vals) - min(north_vals), 20.0)
+    c = session.correction
+    range_gt = float(c.range_gun_to_intended_m) if c else 0.0
+    range_gi = float(c.range_gun_to_impact_m) if c else 0.0
+    miss_ti = float(c.impact_to_intended_m) if c else 0.0
+    drone_dist = ""
+    if session.drone is not None and session.intended is not None:
+        d_n, d_e = latlon_delta_to_ne_m(
+            session.intended.lat,
+            session.intended.lon,
+            session.drone.lat,
+            session.drone.lon,
+        )
+        drone_dist = f"{math.hypot(d_n, d_e):.1f} m"
+    dist_lines = [f"gun→target {range_gt:.1f} m", f"gun→impact {range_gi:.1f} m"]
+    if drone_dist:
+        dist_lines.append(f"target→drone {drone_dist}")
+    miss_lines = [f"target→impact {miss_ti:.1f} m"] if miss_ti > 0 else ["—"]
+    footer_columns = [
+        ("Marks", ["G Gun · T Target", "I Impact · D Drone"], "#64748b"),
+        ("Distances", dist_lines, "#64748b"),
+        ("Miss", miss_lines, "#ea580c"),
+    ]
+    vb_w, vb_h = 520.0, 288.0
+    margin = 44.0
+    graph_top = 28.0
+    footer_gap = 8.0
+    footer_h = _fc_diagram_footer_height(footer_columns)
+    footer_top = vb_h - footer_h - 6.0
+    graph_bottom = footer_top - footer_gap
+    bg_x = margin - 8.0
+    bg_w = vb_w - 2 * (margin - 8.0)
+    graph_h = graph_bottom - graph_top
+    fs = 9
+    scale = min((vb_w - 2 * margin) / span_e, graph_h / span_n, 12.0)
+    cx_graph = bg_x + bg_w / 2.0
+    cy_graph = graph_top + graph_h / 2.0
+
+    def _xy(east: float, north: float) -> tuple[float, float]:
+        x = cx_graph + (east - mid_e) * scale
+        y = cy_graph - (north - mid_n) * scale
+        return x, y
+
+    pt_xy: dict[str, tuple[float, float]] = {}
+    for label, east, north, color, letter in en_pts:
+        pt_xy[label] = _xy(east, north)
+
+    placer = _FcSvgLabelPlacer()
+    placer.add_blocked_zone(bg_x + bg_w / 2, footer_top + footer_h / 2, bg_w + 4, footer_h + footer_gap + 4)
+    for xy in pt_xy.values():
+        placer.add_marker(xy[0], xy[1], 13.0)
+
+    parts: list[str] = [
+        f"<svg class='fc-positions-svg' viewBox='0 0 {vb_w:.0f} {vb_h:.0f}' width='100%' "
+        "xmlns='http://www.w3.org/2000/svg' font-family='Segoe UI,sans-serif'>",
+        f"<rect x='{bg_x:.0f}' y='{graph_top:.0f}' width='{bg_w:.0f}' height='{graph_h:.0f}' "
+        "fill='#f8fafc' rx='8'/>",
+        f"<text x='{cx_graph:.0f}' y='{graph_top - 8:.0f}' text-anchor='middle' font-size='10' "
+        "fill='#64748b' font-weight='700'>N</text>",
+        f"<line x1='{cx_graph:.0f}' y1='{graph_top - 4:.0f}' x2='{cx_graph:.0f}' "
+        f"y2='{graph_top + 10:.0f}' stroke='#64748b' stroke-width='2'/>",
+        f"<polygon points='{cx_graph:.0f},{graph_top - 8:.0f} {cx_graph - 5:.0f},"
+        f"{graph_top - 2:.0f} {cx_graph + 5:.0f},{graph_top - 2:.0f}' fill='#64748b'/>",
+    ]
+
+    if "Gun" in pt_xy and "Target" in pt_xy:
+        gx, gy = pt_xy["Gun"]
+        tx, ty = pt_xy["Target"]
+        parts.append(
+            f"<line x1='{gx:.1f}' y1='{gy:.1f}' x2='{tx:.1f}' y2='{ty:.1f}' stroke='#94a3b8' "
+            "stroke-width='1.5' stroke-dasharray='6,4'/>"
+        )
+        if range_gt > 0:
+            gt_side = _fc_seg_prefer_side(gx, gy, tx, ty, cx_graph, cy_graph)
+            lbl = placer.place_on_segment(
+                gx, gy, tx, ty, f"{range_gt:.1f} m", "#64748b", fs, gt_side, min_len=40.0
+            )
+            if lbl:
+                parts.append(lbl)
+
+    if "Gun" in pt_xy and "Impact" in pt_xy:
+        gx, gy = pt_xy["Gun"]
+        ix, iy = pt_xy["Impact"]
+        parts.append(
+            f"<line x1='{gx:.1f}' y1='{gy:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#cbd5e1' "
+            "stroke-width='1' stroke-dasharray='4,4'/>"
+        )
+        if range_gi > 0:
+            gi_side = _fc_seg_prefer_side(gx, gy, ix, iy, cx_graph, cy_graph)
+            lbl = placer.place_on_segment(
+                gx, gy, ix, iy, f"{range_gi:.1f} m", "#94a3b8", fs, gi_side, min_len=40.0
+            )
+            if lbl:
+                parts.append(lbl)
+
+    if "Target" in pt_xy and "Impact" in pt_xy:
+        tx, ty = pt_xy["Target"]
+        ix, iy = pt_xy["Impact"]
+        parts.append(
+            f"<line x1='{tx:.1f}' y1='{ty:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#ea580c' "
+            "stroke-width='2.5'/>"
+        )
+
+    if "Target" in pt_xy and "Drone" in pt_xy:
+        tx, ty = pt_xy["Target"]
+        dx, dy = pt_xy["Drone"]
+        parts.append(
+            f"<line x1='{tx:.1f}' y1='{ty:.1f}' x2='{dx:.1f}' y2='{dy:.1f}' stroke='#c4b5fd' "
+            "stroke-width='1.5' stroke-dasharray='4,3'/>"
+        )
+
+    for label, east, north, color, letter in en_pts:
+        x, y = _xy(east, north)
+        parts.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='10' fill='{color}'/>")
+        parts.append(
+            f"<text x='{x:.1f}' y='{y + 4:.1f}' text-anchor='middle' font-size='9' fill='#fff' "
+            f"font-weight='700'>{letter}</text>"
+        )
+
+    parts.append(
+        _fc_svg_diagram_footer(bg_x, bg_w, footer_top, footer_h, footer_columns)
+    )
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _fc_bar_row_html(
+    label: str,
+    value_m: float,
+    pos_word: str,
+    neg_word: str,
+    max_scale: float,
+    *,
+    kind: str = "miss",
+) -> str:
+    v = float(value_m)
+    if abs(v) < 0.05:
+        return (
+            f"<div class='fc-bar-row'><span class='fc-bar-label'>{_html_esc(label)}</span>"
+            "<div class='fc-bar-track'></div>"
+            "<span class='fc-bar-value muted'>0.0 m</span></div>"
+        )
+    pct = min(abs(v) / max_scale * 50.0, 49.5)
+    if v >= 0:
+        style = f"left:50%;width:{pct:.1f}%"
+        dir_text = f"{pos_word} {abs(v):.1f} m"
+    else:
+        style = f"left:calc(50% - {pct:.1f}%);width:{pct:.1f}%"
+        dir_text = f"{neg_word} {abs(v):.1f} m"
+    return (
+        f"<div class='fc-bar-row'><span class='fc-bar-label'>{_html_esc(label)}</span>"
+        f"<div class='fc-bar-track'><div class='fc-bar-fill fc-bar-{kind}' style='{style}'></div></div>"
+        f"<span class='fc-bar-value'>{_html_esc(dir_text)}</span></div>"
+    )
+
+
+def _fire_correction_bars_html(c: FireCorrection) -> str:
+    miss_scale = max(
+        abs(float(c.miss_east_m)),
+        abs(float(c.miss_north_m)),
+        abs(float(c.miss_along_m)),
+        abs(float(c.miss_right_m)),
+        5.0,
+    )
+    corr_e = -float(c.miss_east_m)
+    corr_n = -float(c.miss_north_m)
+    corr_scale = max(
+        abs(corr_e),
+        abs(corr_n),
+        abs(float(c.deflection_correction_m)),
+        abs(float(c.range_correction_m)),
+        5.0,
+    )
+    miss_rows = (
+        _fc_bar_row_html("East / West miss", c.miss_east_m, "East", "West", miss_scale, kind="miss")
+        + _fc_bar_row_html(
+            "North / South miss", c.miss_north_m, "North", "South", miss_scale, kind="miss"
+        )
+        + _fc_bar_row_html(
+            "Along gun line", c.miss_along_m, "Far", "Short", miss_scale, kind="miss"
+        )
+        + _fc_bar_row_html(
+            "Left / Right", c.miss_right_m, "Right", "Left", miss_scale, kind="miss"
+        )
+    )
+    corr_rows = (
+        _fc_bar_row_html("East / West add", corr_e, "East", "West", corr_scale, kind="corr")
+        + _fc_bar_row_html("North / South add", corr_n, "North", "South", corr_scale, kind="corr")
+        + _fc_bar_row_html(
+            "Range add",
+            float(c.range_correction_m),
+            "Add",
+            "Drop",
+            corr_scale,
+            kind="corr",
+        )
+        + _fc_bar_row_html(
+            "Left / Right add",
+            float(c.deflection_correction_m),
+            "Right",
+            "Left",
+            corr_scale,
+            kind="corr",
+        )
+    )
+    return (
+        "<div class='fc-bars-panel'>"
+        "<div class='fc-bars-title'>Miss & correction bars (centre = zero)</div>"
+        "<p class='log-hint' style='margin:0 0 10px'>Bar length shows distance; "
+        "left/right or north/south label shows direction.</p>"
+        + miss_rows
+        + "<div class='fc-bars-title' style='margin-top:14px'>Corrections to add</div>"
+        + corr_rows
+        + "</div>"
+    )
+
+
+def _exec_panel_header_html(
+    step: int,
+    kind: str,
+    title: str,
+    subtitle: str,
+    icon: str,
+) -> str:
+    return (
+        f"<div class='exec-panel-header exec-panel-header-{kind}'>"
+        f"<span class='exec-panel-step'>{step}</span>"
+        f"<span class='exec-panel-icon' aria-hidden='true'>{icon}</span>"
+        "<div class='exec-panel-text'>"
+        f"<span class='exec-panel-title'>{_html_esc(title)}</span>"
+        f"<span class='exec-panel-sub'>{_html_esc(subtitle)}</span>"
+        "</div></div>"
+    )
+
+
+def _executive_miss_chips_html(c: FireCorrection) -> str:
+    """Small chips: where impact landed relative to target."""
+    chips: list[str] = []
+    miss_n = float(c.miss_north_m)
+    miss_e = float(c.miss_east_m)
+    along = float(c.miss_along_m)
+    if abs(miss_n) >= 0.5:
+        d = "south" if miss_n < 0 else "north"
+        chips.append(f"<li><strong>{abs(miss_n):.1f}</strong> m {d}</li>")
+    if abs(miss_e) >= 0.5:
+        d = "west" if miss_e < 0 else "east"
+        chips.append(f"<li><strong>{abs(miss_e):.1f}</strong> m {d}</li>")
+    if abs(along) >= 0.5:
+        d = "too far" if along > 0 else "short"
+        chips.append(f"<li><strong>{abs(along):.1f}</strong> m {d}</li>")
+    if not chips:
+        return ""
+    return "<ul class='exec-miss-list'>" + "".join(chips) + "</ul>"
+
+
+def _fire_correction_action_cards_html(
+    c: FireCorrection,
+    *,
+    for_executive: bool = False,
+) -> str:
+    corr_e = -float(c.miss_east_m)
+    corr_n = -float(c.miss_north_m)
+    items: list[tuple[str, float, str, str, str, str, str]] = [
+        ("East / West", corr_e, "East", "West", "→", "←", "fc-action-card-map"),
+        ("North / South", corr_n, "North", "South", "↑", "↓", "fc-action-card-map"),
+        (
+            "Range",
+            float(c.range_correction_m),
+            "Add",
+            "Drop",
+            "⟶",
+            "⟵",
+            "fc-action-card-range",
+        ),
+        (
+            "Deflection (R+)",
+            float(c.deflection_correction_m),
+            "Right",
+            "Left",
+            "↷",
+            "↶",
+            "fc-action-card-defl",
+        ),
+    ]
+    if c.elevation_correction_m is not None:
+        u = float(c.elevation_correction_m)
+        if abs(u) >= 0.5:
+            items.append(
+                ("Elevation", u, "Up", "Down", "⬆", "⬇", "fc-action-card-elev")
+            )
+    cards: list[str] = []
+    for label, val, pos, neg, ap, an, extra_cls in items:
+        if abs(val) < 0.5:
+            continue
+        word = pos if val > 0 else neg
+        arrow = ap if val > 0 else an
+        cls = f"fc-action-card {extra_cls}".strip()
+        if for_executive:
+            value_html = (
+                "<div class='fc-action-value'>"
+                f"<span class='fc-action-dir'>{_html_esc(word)}</span>"
+                f"<span class='fc-action-num'>{abs(val):.1f}</span>"
+                "<span class='fc-action-unit'>m</span></div>"
+            )
+            badge = "<span class='fc-action-badge'>Correction</span>"
+            sub = "<div class='fc-action-sub'>add to firing data</div>"
+        else:
+            badge = ""
+            value_html = (
+                f"<div class='fc-action-value'>"
+                f"<span class='fc-action-dir'>{_html_esc(word)}</span> "
+                f"<span class='fc-action-num'>{abs(val):.1f}</span>"
+                "<span class='fc-action-unit'>m</span></div>"
+            )
+            sub = "<div class='fc-action-sub'>add on next round</div>"
+        cards.append(
+            f"<div class='{cls}'>"
+            + badge
+            + f"<div class='fc-action-arrow'>{arrow}</div>"
+            f"<div class='fc-action-label'>{_html_esc(label)}</div>"
+            + value_html
+            + sub
+            + "</div>"
+        )
+    if not cards:
+        cards.append(
+            "<div class='fc-action-card'>"
+            "<div class='fc-action-value' style='font-size:14px'>On target</div>"
+            "<div class='fc-action-sub'>No significant correction</div>"
+            "</div>"
+        )
+    cards_html = f"<div class='fc-action-cards{' exec-corr-cards' if for_executive else ''}'>"
+    cards_html += "".join(cards) + "</div>"
+    if not for_executive:
+        return (
+            "<div class='fc-action-cards-title'>What to add — at a glance</div>"
+            + cards_html
+        )
+    return (
+        "<div class='exec-corr-panel'>"
+        + _exec_panel_header_html(
+            2,
+            "corr",
+            "What to add on the next round",
+            "Fire correction values — add to your data",
+            "+",
+        )
+        + "<div class='exec-panel-body'>"
+        + cards_html
+        + "<p class='exec-legend-note'>"
+        + "<span class='legend-miss'>Orange on the map</span> = fall of shot. "
+        + "<span class='legend-corr'>Teal cards</span> = add on the next round "
+        + "(landed south → add north).</p>"
+        + "</div></div>"
+    )
+
+
+def _executive_summary_visual_html(c: FireCorrection) -> str:
+    mini_compass = _fire_correction_compass_miss_svg(c, compact=True)
+    miss_panel = (
+        "<div class='exec-miss-panel'>"
+        + _exec_panel_header_html(
+            1,
+            "miss",
+            "Where the round landed",
+            "Fall of shot vs aim point on the map",
+            "!",
+        )
+        + "<div class='exec-panel-body'>"
+        + f"<div class='exec-compass-wrap'>{mini_compass}</div>"
+        + "<p class='exec-visual-caption'>Green = target · Red = impact · Orange = miss distance</p>"
+        + _executive_miss_chips_html(c)
+        + "</div></div>"
+    )
+    bridge = (
+        "<div class='exec-split-bridge' aria-hidden='true'>"
+        "<span class='exec-bridge-arrow'>→</span>"
+        "<span class='exec-bridge-text'>Apply opposite direction</span>"
+        "</div>"
+    )
+    return (
+        "<div class='exec-split'>"
+        + miss_panel
+        + bridge
+        + _fire_correction_action_cards_html(c, for_executive=True)
+        + "</div>"
+    )
+
+
+def format_fire_correction_diagram_html(session: DooafSession) -> str:
+    """Visual-first fire correction: story, maps, compass, bars, action cards."""
+    c = session.correction
+    if c is None or session.gun is None or session.intended is None or session.impact is None:
+        return ""
+    plan = _fire_correction_plan_svg(session, c)
+    gunline = _fire_correction_gunline_svg(c)
+    compass = _fire_correction_compass_miss_svg(c)
+    story = _fire_correction_aim_story_svg(c)
+    bars = _fire_correction_bars_html(c)
+    if not plan:
+        return ""
+    horiz_check = math.hypot(float(c.miss_east_m), float(c.miss_north_m))
+    foot = (
+        f"<p class='log-hint' style='margin-top:8px'>"
+        f"Horizontal check: √(E²+N²) = <strong>{horiz_check:.1f} m</strong> "
+        f"(report horizontal miss {c.impact_to_intended_m:.1f} m). "
+        "<span class='muted'>Orange = miss · Teal = correction · Purple = drone.</span>"
+        "</p>"
+    )
+
+    def _viz(title: str, svg: str, extra_class: str = "") -> str:
+        cls = f"viz-card {extra_class}".strip()
+        return (
+            f"<div class='{cls}'>"
+            f"<div class='viz-card-head'>{_html_esc(title)}</div>"
+            f"<div class='viz-card-body'><div class='fc-diagram-wrap'>{svg}</div></div>"
+            "</div>"
+        )
+
+    return (
+        "<div class='fc-legend'>"
+        "<span><i class='fc-dot fc-dot-gun'></i>Gun</span>"
+        "<span><i class='fc-dot fc-dot-target'></i>Actual target</span>"
+        "<span><i class='fc-dot fc-dot-impact'></i>Fall of shot</span>"
+        "<span><i class='fc-dot fc-dot-drone'></i>Drone</span>"
+        "</div>"
+        + _fire_correction_workflow_html()
+        + "<div class='viz-card fc-story-wrap'>"
+        "<div class='viz-card-head'>What happened — 3 steps</div>"
+        f"<div class='viz-card-body'>{story}</div></div>"
+        + "<div class='fc-diagram-grid-4'>"
+        + _viz("Plan view (North up)", plan)
+        + _viz("Gun line view", gunline)
+        + _viz("Compass miss (target at centre)", compass)
+        + f"<div class='viz-card'>{bars}</div>"
+        + "</div>"
+        + foot
+    )
+
+
+def _plain_offset_parts(value_m: float, pos_word: str, neg_word: str) -> str | None:
+    v = float(value_m)
+    if abs(v) < 0.5:
+        return None
+    return f"{abs(v):.1f} m {pos_word if v > 0 else neg_word}"
+
+
+def _plain_horizontal_miss_sentence(c: FireCorrection) -> str:
+    parts: list[str] = []
+    n = _plain_offset_parts(c.miss_north_m, "north of", "south of")
+    e = _plain_offset_parts(c.miss_east_m, "east of", "west of")
+    if n:
+        parts.append(n)
+    if e:
+        parts.append(e)
+    if not parts:
+        return "almost on the target horizontally"
+    if len(parts) == 1:
+        return parts[0] + " the target"
+    return parts[0] + " and " + parts[1] + " the target"
+
+
+def _plain_range_sentence(c: FireCorrection) -> str:
+    along = float(c.miss_along_m)
+    if along > 0.5:
+        return f"The round landed about <strong>{along:.1f} m too far</strong> (beyond the target along the gun line)."
+    if along < -0.5:
+        return f"The round landed about <strong>{abs(along):.1f} m short</strong> (before the target along the gun line)."
+    return "Range along the gun line was close to the target."
+
+
+def _plain_vertical_sentence(c: FireCorrection) -> str | None:
+    if c.miss_vertical_m is None:
+        return None
+    v = float(c.miss_vertical_m)
+    if abs(v) < 0.5:
+        return "Height difference was negligible."
+    if v > 0:
+        return f"The target was <strong>{v:.1f} m higher</strong> than where the round landed."
+    return f"The target was <strong>{abs(v):.1f} m lower</strong> than where the round landed."
+
+
+def _plain_correction_bullets(c: FireCorrection) -> list[str]:
+    bullets: list[str] = []
+    corr_e = -float(c.miss_east_m)
+    corr_n = -float(c.miss_north_m)
+    if abs(corr_e) >= 0.5:
+        bullets.append(
+            f"Move aim <strong>{'east' if corr_e > 0 else 'west'}</strong> by {abs(corr_e):.1f} m"
+        )
+    if abs(corr_n) >= 0.5:
+        bullets.append(
+            f"Move aim <strong>{'north' if corr_n > 0 else 'south'}</strong> by {abs(corr_n):.1f} m"
+        )
+    if abs(float(c.deflection_correction_m)) >= 0.5:
+        d = float(c.deflection_correction_m)
+        bullets.append(
+            f"Deflection (left/right on gun line): <strong>{'right' if d > 0 else 'left'} {abs(d):.1f} m</strong>"
+        )
+    if abs(float(c.range_correction_m)) >= 0.5:
+        r = float(c.range_correction_m)
+        bullets.append(
+            f"Range: <strong>{'add' if r > 0 else 'drop'} {abs(r):.1f} m</strong>"
+        )
+    if c.elevation_correction_m is not None and abs(float(c.elevation_correction_m)) >= 0.5:
+        u = float(c.elevation_correction_m)
+        bullets.append(
+            f"Elevation: <strong>{'up' if u > 0 else 'down'} {abs(u):.1f} m</strong>"
+        )
+    if not bullets:
+        bullets.append("No significant correction needed — repeat the same fire data.")
+    return bullets
+
+
+def format_executive_summary_html(session: DooafSession) -> str:
+    """Plain-language opening: what happened and what to do next."""
+    c = session.correction
+    if c is None:
+        body = (
+            "<p class='report-executive-lead'>This export records observation marks from the drone. "
+            "To get fire correction, complete <strong>DOOAF Setup</strong> (gun + actual target), "
+            "then turn <strong>Target ON</strong> and click the <strong>fall of shot</strong> on the video.</p>"
+        )
+        return f"<section class='report-executive' id='summary'><div class='report-executive-head'><h2>Summary</h2></div><div class='report-executive-body'>{body}</div></section>"
+
+    horiz = float(c.impact_to_intended_m)
+    range_line = _plain_range_sentence(c)
+    story_parts = [
+        "<div class='exec-story-lead'>",
+        f"<p><span class='exec-big'>{horiz:.1f} m</span> total miss from the intended target.</p>",
+        f"<p>Impact was <strong>{_plain_horizontal_miss_sentence(c)}</strong>.</p>",
+        f"<p>{range_line}</p>",
+    ]
+    vert = _plain_vertical_sentence(c)
+    if vert:
+        story_parts.append(f"<p>{vert}</p>")
+    story_parts.append("</div>")
+    story_lead = "".join(story_parts)
+
+    return (
+        "<section class='report-executive' id='summary'>"
+        "<div class='report-executive-head'>"
+        "<h2>Summary<span class='report-executive-badge'>Start here</span></h2>"
+        "</div>"
+        "<div class='report-executive-body'>"
+        + story_lead
+        + _executive_summary_visual_html(c)
+        + "</div></section>"
+    )
+
+
+def _guide_card_html(
+    section_id: str,
+    accent: str,
+    title: str,
+    description: str,
+    icon_svg: str,
+    preview_html: str,
+) -> str:
+    return (
+        f"<a class='guide-card guide-card--{accent}' href='#{_html_esc(section_id)}'>"
+        "<div class='guide-card-top'>"
+        f"<span class='guide-card-icon' aria-hidden='true'>{icon_svg}</span>"
+        "<div>"
+        f"<span class='guide-card-title'>{_html_esc(title)}</span>"
+        f"<span class='guide-card-desc'>{_html_esc(description)}</span>"
+        "</div></div>"
+        f"<div class='guide-preview' aria-hidden='true'>{preview_html}</div>"
+        "<span class='guide-card-link'>Jump to section →</span>"
+        "</a>"
+    )
+
+
+def format_report_reading_guide_html() -> str:
+    icon_summary = (
+        "<svg viewBox='0 0 32 32' fill='none' xmlns='http://www.w3.org/2000/svg'>"
+        "<circle cx='16' cy='16' r='7' fill='#16a34a'/>"
+        "<circle cx='22' cy='22' r='6' fill='#dc2626'/>"
+        "<line x1='16' y1='16' x2='22' y2='22' stroke='#ea580c' stroke-width='2'/>"
+        "</svg>"
+    )
+    icon_story = (
+        "<svg viewBox='0 0 32 32' fill='none' xmlns='http://www.w3.org/2000/svg'>"
+        "<circle cx='8' cy='16' r='5' fill='#16a34a'/>"
+        "<circle cx='16' cy='16' r='5' fill='#dc2626'/>"
+        "<circle cx='24' cy='16' r='5' fill='#0d9488'/>"
+        "<path d='M13 16h2M21 16h2' stroke='#94a3b8' stroke-width='2'/>"
+        "</svg>"
+    )
+    icon_diagrams = (
+        "<svg viewBox='0 0 32 32' fill='none' xmlns='http://www.w3.org/2000/svg'>"
+        "<rect x='4' y='18' width='24' height='3' rx='1' fill='#cbd5e1'/>"
+        "<rect x='4' y='12' width='16' height='3' rx='1' fill='#ea580c'/>"
+        "<rect x='4' y='6' width='20' height='3' rx='1' fill='#0d9488'/>"
+        "</svg>"
+    )
+    icon_tables = (
+        "<svg viewBox='0 0 32 32' fill='none' xmlns='http://www.w3.org/2000/svg'>"
+        "<rect x='6' y='8' width='20' height='16' rx='2' stroke='#94a3b8' stroke-width='2'/>"
+        "<line x1='6' y1='14' x2='26' y2='14' stroke='#94a3b8' stroke-width='1.5'/>"
+        "<line x1='14' y1='8' x2='14' y2='24' stroke='#94a3b8' stroke-width='1.5'/>"
+        "<text x='16' y='20' text-anchor='middle' font-size='8' fill='#64748b'>#</text>"
+        "</svg>"
+    )
+    icon_map = (
+        "<svg viewBox='0 0 32 32' fill='none' xmlns='http://www.w3.org/2000/svg'>"
+        "<circle cx='10' cy='20' r='4' fill='#2563eb'/>"
+        "<circle cx='22' cy='12' r='4' fill='#16a34a'/>"
+        "<circle cx='18' cy='22' r='3' fill='#dc2626'/>"
+        "<circle cx='14' cy='10' r='3' fill='#9333ea'/>"
+        "</svg>"
+    )
+    icon_nav = (
+        "<svg viewBox='0 0 32 32' fill='none' xmlns='http://www.w3.org/2000/svg'>"
+        "<rect x='6' y='9' width='20' height='3' rx='1.5' fill='#0369a1'/>"
+        "<rect x='6' y='15' width='14' height='3' rx='1.5' fill='#7dd3fc'/>"
+        "<rect x='6' y='21' width='18' height='3' rx='1.5' fill='#0369a1'/>"
+        "</svg>"
+    )
+    preview_summary = (
+        "<span class='guide-preview-dot' style='background:#16a34a'></span>"
+        "<span class='guide-preview-dot' style='background:#dc2626'></span>"
+        "<span class='guide-preview-bar' style='width:40px'></span>"
+    )
+    preview_story = "① aim → ② land → ③ fix"
+    preview_diagrams = (
+        "<span class='guide-preview-bar' style='width:28px'></span>"
+        "<span class='guide-preview-bar guide-preview-bar-corr' style='width:20px'></span>"
+    )
+    preview_tables = "▸ click to expand numbers"
+    preview_map = (
+        "<span class='guide-preview-dot' style='background:#2563eb'></span>"
+        "<span class='guide-preview-dot' style='background:#16a34a'></span>"
+        "<span class='guide-preview-dot' style='background:#dc2626'></span>"
+        "<span class='guide-preview-dot' style='background:#9333ea'></span>"
+    )
+    flow = (
+        "<div class='guide-flow'>"
+        "<span class='guide-flow-label'>Quick path</span>"
+        "<a class='guide-flow-step' href='#summary'>"
+        "<span class='guide-flow-num'>1</span>Summary</a>"
+        "<span class='guide-flow-arrow'>→</span>"
+        "<a class='guide-flow-step' href='#correction'>"
+        "<span class='guide-flow-num'>2</span>Diagrams</a>"
+        "<span class='guide-flow-arrow'>→</span>"
+        "<a class='guide-flow-step' href='#positions'>"
+        "<span class='guide-flow-num'>3</span>Map</a>"
+        "<span class='guide-flow-arrow'>→</span>"
+        "<a class='guide-flow-step' href='#glossary'>"
+        "<span class='guide-flow-num'>4</span>Glossary</a>"
+        "</div>"
+    )
+    cards = (
+        "<div class='guide-cards'>"
+        + _guide_card_html(
+            "summary",
+            "summary",
+            "Green summary",
+            "Compass + correction cards — the answer in plain view.",
+            icon_summary,
+            preview_summary,
+        )
+        + _guide_card_html(
+            "correction",
+            "story",
+            "3-step story",
+            "You aimed → round landed → what to add next.",
+            icon_story,
+            preview_story,
+        )
+        + _guide_card_html(
+            "correction",
+            "diagrams",
+            "Diagrams & bars",
+            "Map views and bar charts for distance and direction.",
+            icon_diagrams,
+            preview_diagrams,
+        )
+        + _guide_card_html(
+            "correction",
+            "tables",
+            "Number tables",
+            "Exact figures — hidden until you expand them.",
+            icon_tables,
+            preview_tables,
+        )
+        + _guide_card_html(
+            "positions",
+            "map",
+            "Positions map",
+            "Gun, target, impact, and drone on the ground.",
+            icon_map,
+            preview_map,
+        )
+        + _guide_card_html(
+            "summary",
+            "nav",
+            "Sticky menu",
+            "Use the bar at the top to jump to any section.",
+            icon_nav,
+            "↑ scroll · menu highlights active section",
+        )
+        + "</div>"
+    )
+    return (
+        "<section class='reading-guide' id='guide'>"
+        "<div class='reading-guide-head'>"
+        "<h3>How to read this report</h3>"
+        "<p class='reading-guide-intro'>Pictures first — follow the quick path below. "
+        "Open tables only if you need exact numbers.</p>"
+        "</div>"
+        + flow
+        + cards
+        + "</section>"
+    )
+
+
+def format_report_glossary_html() -> str:
+    return (
+        "<section class='section-card report-glossary' id='glossary'>"
+        "<div class='section-head'>"
+        "<h3 class='section-title'>Glossary</h3>"
+        "<p class='section-subtitle'>Short definitions for report terms.</p>"
+        "</div>"
+        "<div class='section-body'>"
+        "<details>"
+        "<summary>What do these terms mean?</summary>"
+        "<dl>"
+        "<dt>Actual target</dt><dd>Where you intended to hit (set in DOOAF Setup → Pick on video).</dd>"
+        "<dt>Fall of shot / Impact</dt><dd>Where the round actually landed (Target ON → click on video).</dd>"
+        "<dt>Miss</dt><dd>How far the impact was from the target, and in which direction.</dd>"
+        "<dt>Correction (add)</dt><dd>Values to <em>add</em> to your firing data on the next round.</dd>"
+        "<dt>East / West · North / South</dt><dd>Directions on the map (compass axes).</dd>"
+        "<dt>Left / Right (gun line)</dt><dd>Sideways miss relative to the line from gun to target.</dd>"
+        "<dt>Range along line</dt><dd>Shorten (−) or lengthen (+) range along the gun→target direction.</dd>"
+        "<dt>Up / Down</dt><dd>Vertical correction using elevation (metres above sea level).</dd>"
+        "<dt>MGRS</dt><dd>Military grid reference for the marked point.</dd>"
+        "<dt>MSL</dt><dd>Height above mean sea level.</dd>"
+        "</dl>"
+        "</details>"
+        "</div></section>"
+    )
 
 
 def format_elevation_summary_html(session: DooafSession) -> str:
@@ -1001,11 +2618,13 @@ def format_client_fire_correction_html(session: DooafSession) -> str:
         )
 
     return _report_section_card(
-        "Fire correction summary (client)",
+        "Fire correction",
         (
-            "<p class='log-hint'>Corrections to <strong>add</strong> on the next round. "
-            "East/West and North/South are map axes; Left/Right is relative to the "
-            "gun→target line; Up/Down is elevation (MSL).</p>"
+            "<p class='log-hint'>Visual explanation first — open tables below for exact numbers.</p>"
+            + format_fire_correction_diagram_html(session)
+            + "<details class='report-collapsible'>"
+            "<summary>Exact miss & correction numbers (tables)</summary>"
+            "<div class='report-collapsible-body'>"
             "<table class='data-table dooaf-client-corr'>"
             "<thead><tr><th colspan='2'>Miss — impact relative to target</th></tr></thead>"
             "<tbody>"
@@ -1016,8 +2635,11 @@ def format_client_fire_correction_html(session: DooafSession) -> str:
             "<tbody>"
             + corr_rows
             + "</tbody></table>"
+            "</div></details>"
         ),
         extra_class="dooaf-client-corr",
+        section_id="correction",
+        subtitle="Diagrams show where the round missed and what to add next.",
     )
 
 
@@ -1086,7 +2708,7 @@ def format_dooaf_html_summary(
                 f"<td>{session.height_correction_m:+.1f} m</td></tr>"
             )
         corr_rows = _report_section_card(
-            "Fire correction",
+            "Technical reference (fire geometry)",
             (
                 "<div class='metrics-grid'>"
                 "<div class='metric-card'>"
@@ -1122,10 +2744,24 @@ def format_dooaf_html_summary(
                 + elev_delta_row
                 + "</tbody></table>"
             ),
-            extra_class="dooaf-fire-corr",
+            extra_class="dooaf-fire-corr section-technical",
+            section_id="technical",
+            subtitle="Detailed geometry for engineers and audit.",
         )
     obs_row = observation_row or None
-    session_body = (
+    positions_map = _fire_correction_positions_svg(session)
+    map_block = ""
+    if positions_map:
+        map_block = (
+            "<div class='viz-card' style='margin-bottom:14px'>"
+            "<div class='viz-card-head'>All positions on the map</div>"
+            f"<div class='viz-card-body'><div class='fc-diagram-wrap'>{positions_map}</div></div>"
+            "</div>"
+            "<p class='log-hint'>Blue dashed = gun to target. Grey dashed = gun to impact. "
+            "Orange = miss (target to impact). Purple dashed = drone line of sight to target. "
+            "Full distances and miss are in the table below the map.</p>"
+        )
+    session_table = (
         "<table class='data-table'>"
         "<thead><tr><th>Variable</th><th>Lat</th><th>Lon</th>"
         "<th>Grid ref (MGRS)</th><th>Elevation (MSL)</th></tr></thead>"
@@ -1144,12 +2780,26 @@ def format_dooaf_html_summary(
         )
         + "</tbody></table>"
     )
+    session_body = map_block + (
+        "<details class='report-collapsible'>"
+        "<summary>Coordinate table (lat / lon / MGRS)</summary>"
+        f"<div class='report-collapsible-body'>{session_table}</div>"
+        "</details>"
+    )
     return (
-        _report_section_card("DOOAF session", session_body)
-        + format_elevation_summary_html(session)
+        format_executive_summary_html(session)
+        + format_report_reading_guide_html()
         + format_client_fire_correction_html(session)
+        + _report_section_card(
+            "Positions",
+            session_body,
+            section_id="positions",
+            subtitle="Gun, target, fall of shot, and drone — map plus coordinate table.",
+        )
+        + format_elevation_summary_html(session)
         + format_camera_orientation_html(obs_row)
         + corr_rows
+        + format_report_glossary_html()
     )
 
 
@@ -1727,20 +3377,30 @@ def format_observation_detailed_log_html(
     """Card-based detailed log — grouped fields instead of a wide scroll table."""
     if not export_rows:
         body = "<p class='muted'>No observation entries in this export.</p>"
-        return _report_section_card("Detailed log", body)
+        return _report_section_card(
+            "Audit log",
+            body,
+            section_id="audit",
+            subtitle="Full field dump for engineers.",
+        )
 
     entries = "".join(
         _format_observation_log_entry(idx, row, cell_fn)
         for idx, row in enumerate(export_rows, start=1)
     )
     hint = (
-        "<p class='log-hint'>Summary metrics above; expandable detail below. "
-        "Hover lat/lon for full precision. "
+        "<p class='log-hint'>For auditors and engineers: every recorded field from each "
+        "observation mark. Hover lat/lon for full precision. "
         "<strong>Full raw export</strong> (every field, unrounded) is in the "
         "<span class='mono'>CSV</span> file saved beside this HTML.</p>"
     )
     body = hint + f"<div class='log-entries'>{entries}</div>"
-    return _report_section_card("Detailed log", body)
+    return _report_section_card(
+        "Audit log",
+        body,
+        section_id="audit",
+        subtitle="Full field dump for engineers.",
+    )
 
 
 def assemble_observation_report_html(
@@ -1749,10 +3409,11 @@ def assemble_observation_report_html(
     detailed_log_html: str,
     *,
     title: str = "Observation Report",
+    session: DooafSession | None = None,
 ) -> str:
     return (
         observation_report_html_head(title=title)
-        + format_observation_report_header(entry_count, title=title)
+        + format_observation_report_header(entry_count, title=title, session=session)
         + dooaf_summary_html
         + detailed_log_html
         + observation_report_html_footer()
