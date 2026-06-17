@@ -9248,10 +9248,7 @@ class MapWidget(QWidget):
         if sig == self._last_flight_telemetry_sig:
             return
         self._last_flight_telemetry_sig = sig
-        try:
-            self._vehicle_rel_alt_m = float(relative_alt_m)
-        except Exception:
-            pass
+        # HUD display only — keep _vehicle_rel_alt_m from set_vehicle_position (raw MAVLink).
         try:
             self._native_telemetry.set_values(
                 f"{rel_alt_m} m",

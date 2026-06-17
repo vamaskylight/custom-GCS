@@ -346,6 +346,10 @@ def prefer_dem_ground_agl_over_ekf(
         return dem, src
     if dem < ekf - 2.0:
         return dem, src
+    # Home is often below local DEM surface — EKF rel can read lower than terrain AGL
+    # (more visible at higher hover altitudes).
+    if dem >= 15.0 and ekf is not None and dem > ekf + 1.0:
+        return dem, src
     return facade_agl_m, facade_src
 
 

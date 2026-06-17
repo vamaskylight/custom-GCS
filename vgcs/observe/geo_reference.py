@@ -397,6 +397,14 @@ def compute_geo_reference(
     if terrain_hit and dem_model is not None:
         extra = f"terrain DEM ({dem_model.kind})"
         warn = f"{warn}; {extra}" if warn else extra
+    if agl_m >= 70.0 or (depression is not None and float(depression) >= 50.0):
+        extra = (
+            "steep look / high AGL — ground geo less accurate "
+            "(click low in frame, use rangefinder if available)"
+        )
+        warn = f"{warn}; {extra}" if warn else extra
+        if quality == "good":
+            quality = "fair"
     ok = quality != "insufficient"
     return GeoReferenceResult(
         ok=ok,
