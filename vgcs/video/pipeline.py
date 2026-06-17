@@ -98,6 +98,35 @@ def suggested_recording_save_path(directory: str | Path | None = None) -> str:
     return str(d / suggested_recording_filename())
 
 
+def apply_digital_zoom_rgb24(raw: bytes, w: int, h: int, zoom: float) -> bytes:
+    """
+    Center-crop digital zoom on packed RGB24 (matches preview ``_apply_digital_zoom``).
+
+    Used when saving thermal RTSP video: the thermal encoder feed stays wide while the
+    operator preview applies software magnification.
+    """
+    z = float(zoom)
+    if z <= 1.001 or not raw or w <= 0 or h <= 0:
+        return raw
+    if not HAS_NUMPY or np is None:
+        return raw
+    cw = max(1, int(w / z))
+    ch = max(1, int(h / z))
+    x = max(0, (w - cw) // 2)
+    y = max(0, (h - ch) // 2)
+    try:
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
+        crop = arr[y : y + ch, x : x + cw, :]
+        row_idx = (np.arange(h) * ch / h).astype(np.int32)
+        row_idx = np.clip(row_idx, 0, ch - 1)
+        col_idx = (np.arange(w) * cw / w).astype(np.int32)
+        col_idx = np.clip(col_idx, 0, cw - 1)
+        scaled = crop[row_idx][:, col_idx]
+        return scaled.tobytes()
+    except Exception:
+        return raw
+
+
 def suggested_photo_filename(extension: str = "jpg") -> str:
     ext = str(extension or "jpg").strip().lower().lstrip(".")
     if ext in ("jpeg",):
@@ -796,6 +825,8 @@ class RtspSource(QObject):
         self._siyi_last_open_tail: bytes = b""
         self._rec_proc: subprocess.Popen[bytes] | None = None
         self._rec_lock = threading.Lock()
+        self._rec_digital_zoom: float = 1.0
+        self._rec_apply_digital_zoom: bool = False
         self._running = False
 
     @property
@@ -1011,6 +1042,20 @@ class RtspSource(QObject):
             )
         except Exception:
             self._qt_stop_teardown()
+
+    def set_recording_preview_transform(
+        self,
+        *,
+        digital_zoom: float = 1.0,
+        apply_digital_zoom: bool = False,
+    ) -> None:
+        """Match saved RTSP video to on-screen preview transforms (thermal software zoom)."""
+        with self._rec_lock:
+            try:
+                self._rec_digital_zoom = max(1.0, float(digital_zoom))
+            except Exception:
+                self._rec_digital_zoom = 1.0
+            self._rec_apply_digital_zoom = bool(apply_digital_zoom)
 
     def start_recording(self, filename: str) -> bool:
         """
@@ -1779,13 +1824,18 @@ class RtspSource(QObject):
                                         break
                                 with self._rec_lock:
                                     recp = self._rec_proc
+                                    rec_raw = raw
+                                    if self._rec_apply_digital_zoom:
+                                        z = float(self._rec_digital_zoom)
+                                        if z > 1.001:
+                                            rec_raw = apply_digital_zoom_rgb24(raw, w, h, z)
                                     if (
                                         recp is not None
                                         and recp.poll() is None
                                         and recp.stdin is not None
                                     ):
                                         try:
-                                            recp.stdin.write(raw)
+                                            recp.stdin.write(rec_raw)
                                         except BrokenPipeError:
                                             pass
                                         except Exception:
