@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QSettings, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -13,11 +14,19 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QInputDialog,
     QPushButton,
     QVBoxLayout,
 )
 
-from vgcs.observe.dooaf import DooafSettings, validate_dooaf_settings
+from vgcs.observe.dooaf import (
+    DooafPreset,
+    DooafSettings,
+    delete_dooaf_preset,
+    load_dooaf_presets,
+    upsert_dooaf_preset,
+    validate_dooaf_settings,
+)
 
 DOOAF_PICK_GUN = "gun"
 DOOAF_PICK_TARGET = "target"
@@ -133,6 +142,23 @@ class DooafSetupDialog(QDialog):
         intro.setWordWrap(True)
         root.addWidget(intro)
 
+        preset_box = QGroupBox("Saved positions")
+        preset_lay = QHBoxLayout(preset_box)
+        preset_lay.setContentsMargins(8, 8, 8, 8)
+        self._preset_combo = QComboBox()
+        self._preset_combo.setMinimumWidth(180)
+        preset_lay.addWidget(self._preset_combo, 1)
+        btn_save_preset = QPushButton("Save…")
+        btn_save_preset.setToolTip("Save current gun + target coordinates as a named preset.")
+        btn_save_preset.clicked.connect(self._save_preset)
+        btn_delete_preset = QPushButton("Delete")
+        btn_delete_preset.clicked.connect(self._delete_preset)
+        preset_lay.addWidget(btn_save_preset)
+        preset_lay.addWidget(btn_delete_preset)
+        root.addWidget(preset_box)
+        self._reload_presets()
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_selected)
+
         s = settings or DooafSettings()
 
         gun_box = QGroupBox("Artillery position (gun origin)")
@@ -212,6 +238,75 @@ class DooafSetupDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    def _settings_store(self) -> QSettings:
+        return QSettings("VGCS", "VGCS")
+
+    def _reload_presets(self) -> None:
+        self._preset_combo.blockSignals(True)
+        self._preset_combo.clear()
+        self._preset_combo.addItem("— Load preset —", "")
+        for preset in load_dooaf_presets(self._settings_store()):
+            self._preset_combo.addItem(preset.name, preset.name)
+        self._preset_combo.blockSignals(False)
+
+    def _apply_settings_to_form(self, settings: DooafSettings) -> None:
+        self._gun_lat.setText(
+            f"{float(settings.gun_lat):.7f}" if settings.gun_lat is not None else ""
+        )
+        self._gun_lon.setText(
+            f"{float(settings.gun_lon):.7f}" if settings.gun_lon is not None else ""
+        )
+        _set_optional_alt(self._gun_alt, settings.gun_alt_m)
+        self._tgt_lat.setText(
+            f"{float(settings.target_lat):.7f}" if settings.target_lat is not None else ""
+        )
+        self._tgt_lon.setText(
+            f"{float(settings.target_lon):.7f}" if settings.target_lon is not None else ""
+        )
+        _set_optional_alt(self._tgt_alt, settings.target_alt_m)
+
+    def _on_preset_selected(self, _idx: int) -> None:
+        name = str(self._preset_combo.currentData() or "").strip()
+        if not name:
+            return
+        for preset in load_dooaf_presets(self._settings_store()):
+            if preset.name == name:
+                self._apply_settings_to_form(preset.settings)
+                self.coordinates_changed.emit("all")
+                break
+
+    def _save_preset(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
+        if not ok:
+            return
+        label = str(name or "").strip()
+        if not label:
+            return
+        settings = settings_from_edits(
+            gun_lat=self._gun_lat,
+            gun_lon=self._gun_lon,
+            gun_alt=self._gun_alt,
+            tgt_lat=self._tgt_lat,
+            tgt_lon=self._tgt_lon,
+            tgt_alt=self._tgt_alt,
+        )
+        err = validate_dooaf_settings(settings)
+        if err:
+            QMessageBox.warning(self, "DOOAF Setup", err)
+            return
+        upsert_dooaf_preset(self._settings_store(), DooafPreset(name=label, settings=settings))
+        self._reload_presets()
+        idx = self._preset_combo.findData(label)
+        if idx >= 0:
+            self._preset_combo.setCurrentIndex(idx)
+
+    def _delete_preset(self) -> None:
+        name = str(self._preset_combo.currentData() or "").strip()
+        if not name:
+            return
+        delete_dooaf_preset(self._settings_store(), name)
+        self._reload_presets()
 
     def _clear_gun(self) -> None:
         self._gun_lat.clear()

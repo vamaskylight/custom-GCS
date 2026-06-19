@@ -15,6 +15,8 @@ from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QRunnable, QThreadPool,
 from PySide6.QtGui import QColor, QFont, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
+from vgcs.observe.dooaf_map_symbols import bearing_deg, paint_gun_marker, paint_target_marker
+
 try:
     from PySide6.QtCore import QEventLoop
     from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -1084,60 +1086,50 @@ class NativeTileMapView(QWidget):
             painter.drawText(QRectF(c.x() - 16, c.y() - 8, 32, 16), Qt.AlignmentFlag.AlignCenter, str(i + 1))
 
         # DOOAF fixed points (military gun / target / impact)
-        def _dooaf_labeled_point(
-            lat: float,
-            lon: float,
-            *,
-            radius: int,
-            fill: QColor,
-            outline: QColor,
-            label: str,
-        ) -> None:
-            c = self._project(lat, lon, z, fx, fy, w, h)
-            painter.setPen(QPen(outline, 2))
-            painter.setBrush(fill)
-            painter.drawEllipse(c, radius, radius)
+        def _dooaf_label_tag(painter: QPainter, cx: float, cy: float, tag: str, *, above: float) -> None:
             font = QFont("Segoe UI", 8, QFont.Weight.Bold)
             painter.setFont(font)
             metrics = painter.fontMetrics()
-            tw = metrics.horizontalAdvance(label) + 8
+            tw = metrics.horizontalAdvance(tag) + 8
             th = metrics.height() + 4
-            tx = int(c.x()) - tw // 2
-            ty = int(c.y()) - radius - th - 4
+            tx = int(cx) - tw // 2
+            ty = int(cy) - int(above) - th - 4
             painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 210))
             painter.setPen(QColor(240, 245, 255))
-            painter.drawText(tx + 4, ty + metrics.ascent() + 2, label)
+            painter.drawText(tx + 4, ty + metrics.ascent() + 2, tag)
+
+        gun_bearing: float | None = None
+        if self._dooaf_gun is not None and self._dooaf_intended is not None:
+            gun_bearing = bearing_deg(
+                self._dooaf_gun[0],
+                self._dooaf_gun[1],
+                self._dooaf_intended[0],
+                self._dooaf_intended[1],
+            )
 
         if self._dooaf_gun is not None:
             gla, glo = self._dooaf_gun
-            _dooaf_labeled_point(
-                gla,
-                glo,
-                radius=9,
-                fill=QColor(30, 70, 160, 230),
-                outline=QColor(180, 210, 255, 240),
-                label="GUN",
+            c = self._project(gla, glo, z, fx, fy, w, h)
+            gun_r = paint_gun_marker(
+                painter,
+                c.x(),
+                c.y(),
+                scale=1.0,
+                bearing_deg=gun_bearing,
             )
+            _dooaf_label_tag(painter, c.x(), c.y(), "GUN", above=gun_r)
         if self._dooaf_intended is not None:
             tla, tlo = self._dooaf_intended
-            _dooaf_labeled_point(
-                tla,
-                tlo,
-                radius=7,
-                fill=QColor(40, 170, 80, 220),
-                outline=QColor(180, 255, 200, 240),
-                label="TARGET",
-            )
+            c = self._project(tla, tlo, z, fx, fy, w, h)
+            tgt_r = paint_target_marker(painter, c.x(), c.y(), scale=1.0)
+            _dooaf_label_tag(painter, c.x(), c.y(), "TARGET", above=tgt_r)
         if self._dooaf_impact is not None:
             ila, ilo = self._dooaf_impact
-            _dooaf_labeled_point(
-                ila,
-                ilo,
-                radius=7,
-                fill=QColor(220, 90, 40, 220),
-                outline=QColor(255, 200, 140, 240),
-                label="HIT",
-            )
+            c = self._project(ila, ilo, z, fx, fy, w, h)
+            painter.setPen(QPen(QColor(255, 200, 140, 240), 2))
+            painter.setBrush(QColor(220, 90, 40, 220))
+            painter.drawEllipse(c, 7, 7)
+            _dooaf_label_tag(painter, c.x(), c.y(), "HIT", above=9)
         if self._dooaf_gun is not None and self._dooaf_intended is not None:
             c0 = self._project(
                 self._dooaf_gun[0], self._dooaf_gun[1], z, fx, fy, w, h

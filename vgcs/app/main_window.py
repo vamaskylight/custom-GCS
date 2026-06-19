@@ -8,7 +8,7 @@ import math
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QSize, Qt, QSettings, QTimer
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QSettings, QTimer
 from PySide6.QtGui import (
     QColor,
     QGuiApplication,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -39,6 +40,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QRadioButton,
+    QButtonGroup,
     QScrollArea,
     QScrollBar,
     QSizePolicy,
@@ -66,7 +69,7 @@ from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
 from vgcs.video.pipeline import VideoPipeline
-from vgcs.video.widgets import CameraControlPanel, SplitVideoPanel
+from vgcs.video.widgets import CameraControlPanel
 from vgcs.video.camera_control import (
     CompositeGimbalCameraControl,
     MavlinkCameraControl,
@@ -1052,8 +1055,6 @@ class MainWindow(QMainWindow):
 
         self._footer_row = QBoxLayout(QBoxLayout.LeftToRight)
         self._footer_row.setSpacing(8 if self._compact_ui else 12)
-        self._split_camera_panel = self._build_split_camera_panel()
-        self._footer_row.addWidget(self._split_camera_panel, 1)
         self._footer_row.addWidget(self._build_primary_flight_footer(), 1)
         self._footer_row.addWidget(self._build_compass_footer(), 1)
         self._footer_row.addWidget(self._build_nav_system_footer(), 1)
@@ -1076,10 +1077,6 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         panel.layout().addItem(row)  # type: ignore[union-attr]
         return panel
-
-    def _build_split_camera_panel(self) -> QGroupBox:
-        # 2x2 split preview for up to 4 cameras.
-        return SplitVideoPanel(self._video, self._camera_panel, self)
 
     def _build_primary_flight_footer(self) -> QGroupBox:
         box = QGroupBox("Primary Flight Data")
@@ -1183,10 +1180,6 @@ class MainWindow(QMainWindow):
         self._mission_list_panel.setVisible(False)
         self._log.setVisible(False)
         self._footer_widget.setVisible(False)
-        try:
-            self._split_camera_panel.setVisible(False)
-        except Exception:
-            pass
         self._vehicle_msg_frame.setVisible(False)
         self._camera_panel.setVisible(False)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1273,7 +1266,7 @@ class MainWindow(QMainWindow):
 
         row_sys("GPS", "gps", "Battery", "battery")
         row_sys("RC link", "rc_link", "Video link", "video_link")
-        row_sys("Obstacle (prox)", "obstacle_prox", "Rangefinder", "rangefinder")
+        row_sys("Obstacle (prox)", "obstacle_prox", "LRF", "rangefinder")
         row_sys("Battery failsafe", "failsafe_battery", "RC failsafe", "failsafe_rc")
         la = QLabel("Arm readiness")
         la.setStyleSheet("color: #7d869c;")
@@ -1858,7 +1851,8 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle("Application Settings")
         dlg.setModal(True)
-        dlg.resize(860, 520)
+        dlg.setMinimumSize(880, 580)
+        dlg.resize(920, 640)
         dlg.setObjectName("appSettingsDialog")
         # Ensure consistent styling even if launched in a context where the
         # application stylesheet wasn't applied (e.g. external launcher/tests).
@@ -1890,6 +1884,37 @@ class MainWindow(QMainWindow):
                     background-color: #2d3a52;
                     color: #f0f4ff;
                 }
+                QDialog#appSettingsDialog QGroupBox {
+                    font-weight: 600;
+                    border: 1px solid #2a3344;
+                    border-radius: 8px;
+                    margin-top: 14px;
+                    padding: 14px 12px 12px 12px;
+                }
+                QDialog#appSettingsDialog QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 10px;
+                    padding: 0 6px;
+                    color: #dbe1ee;
+                }
+                QDialog#appSettingsDialog QScrollArea {
+                    background: transparent;
+                    border: none;
+                }
+                QDialog#appSettingsDialog QLineEdit,
+                QDialog#appSettingsDialog QComboBox,
+                QDialog#appSettingsDialog QSpinBox,
+                QDialog#appSettingsDialog QDoubleSpinBox {
+                    background-color: #12151c;
+                    border: 1px solid #252d3d;
+                    border-radius: 6px;
+                    padding: 6px 8px;
+                    min-height: 28px;
+                }
+                QDialog#appSettingsDialog QRadioButton,
+                QDialog#appSettingsDialog QCheckBox {
+                    spacing: 8px;
+                }
                 """
             )
         except Exception:
@@ -1909,6 +1934,7 @@ class MainWindow(QMainWindow):
         content_row.addWidget(nav, 0)
 
         stack = QStackedWidget()
+        stack.setMinimumHeight(420)
         content_row.addWidget(stack, 1)
         outer.addLayout(content_row, 1)
 
@@ -1927,79 +1953,129 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(12, 12, 12, 12)
         v.setSpacing(10)
 
+        def _settings_hint(text: str) -> QLabel:
+            hint = QLabel(text)
+            hint.setWordWrap(True)
+            hint.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+            return hint
+
+        class _ScrollBodyWidthFilter(QObject):
+            def __init__(self, scroll: QScrollArea, body: QWidget) -> None:
+                super().__init__(body)
+                self._scroll = scroll
+                self._body = body
+
+            def eventFilter(self, obj, event) -> bool:  # noqa: N802
+                if (
+                    obj is self._scroll.viewport()
+                    and event.type() == QEvent.Type.Resize
+                ):
+                    width = self._scroll.viewport().width()
+                    if width > 0:
+                        self._body.setMinimumWidth(width)
+                return False
+
         # Put settings in a scroll area so Apply/Close remain visible on small/high-DPI screens.
         video_scroll = QScrollArea()
         video_scroll.setWidgetResizable(True)
         video_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        video_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         v.addWidget(video_scroll, 1)
 
         video_body = QWidget()
         video_scroll.setWidget(video_body)
+        width_filter = _ScrollBodyWidthFilter(video_scroll, video_body)
+        video_scroll.viewport().installEventFilter(width_filter)
+        QTimer.singleShot(
+            0,
+            lambda: video_body.setMinimumWidth(max(1, video_scroll.viewport().width())),
+        )
         vb = QVBoxLayout(video_body)
-        vb.setContentsMargins(0, 0, 0, 0)
-        vb.setSpacing(10)
+        vb.setContentsMargins(0, 0, 4, 20)
+        vb.setSpacing(12)
 
         enabled = QCheckBox("Enable video streaming")
         vb.addWidget(enabled)
-        video_enable_hint = QLabel(
-            "When this is unchecked, stream URLs are saved but VGCS does not open or decode video — "
-            "the map preview stays black. Check the box to actually connect to RTSP/UDP."
+        vb.addWidget(
+            _settings_hint(
+                "When this is unchecked, stream URLs are saved but VGCS does not open or decode "
+                "video — the map preview stays black. Check the box to actually connect to RTSP/UDP."
+            )
         )
-        video_enable_hint.setWordWrap(True)
-        video_enable_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
-        vb.addWidget(video_enable_hint)
 
         source_group = QGroupBox("Video Source")
-        sg = QGridLayout()
-        sg.addWidget(QLabel("Source"), 0, 0)
+        sg = QVBoxLayout()
+        sg.setSpacing(8)
+        source_row = QHBoxLayout()
+        source_row.setSpacing(10)
+        source_row.addWidget(QLabel("Source"))
         source_combo = QComboBox()
         source_combo.addItem("Video Stream Disabled", "disabled")
         source_combo.addItem("RTSP Video Stream", "rtsp")
         source_combo.addItem("UDP h.264 stream", "udp_h264")
         source_combo.addItem("UDP h.265 / HEVC stream", "udp_h265")
-        sg.addWidget(source_combo, 0, 1)
-        sg.addWidget(QLabel("URL hints"), 1, 0)
-        url_hint = QLabel(
-            "Examples:\n"
-            "• RTSP — rtsp://192.168.x.x/stream (works on local radio/Wi‑Fi without internet).\n"
-            "• UDP — udp://0.0.0.0:5600; pick h.264/h.265 for raw Annex B, or RTSP mode for MPEG‑TS UDP (auto-detect)."
+        source_row.addWidget(source_combo, 1)
+        sg.addLayout(source_row)
+        sg.addWidget(
+            _settings_hint(
+                "Examples:\n"
+                "• RTSP — rtsp://192.168.x.x/stream (works on local radio/Wi‑Fi without internet).\n"
+                "• UDP — udp://0.0.0.0:5600; pick h.264/h.265 for raw Annex B, or RTSP mode for "
+                "MPEG‑TS UDP (auto-detect)."
+            )
         )
-        url_hint.setWordWrap(True)
-        url_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
-        sg.addWidget(url_hint, 1, 1)
         source_group.setLayout(sg)
         vb.addWidget(source_group)
 
         conn_group = QGroupBox("Connection")
-        cg = QGridLayout()
-        cg.addWidget(QLabel("Stream URL 1 (Day / primary)"), 0, 0)
+        conn_form = QFormLayout()
+        conn_form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        conn_form.setHorizontalSpacing(12)
+        conn_form.setVerticalSpacing(10)
+        conn_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         rtsp_day = QLineEdit()
         rtsp_day.setPlaceholderText(
-            "SIYI ZR10: rtsp://192.168.144.25:8554/main.264  (video2 not on all firmware)"
+            "ZR10: rtsp://192.168.144.25:8554/main.264  (video2 not on all firmware)"
         )
-        cg.addWidget(rtsp_day, 0, 1)
-        cg.addWidget(QLabel("Stream URL 2 (Thermal / secondary)"), 1, 0)
         rtsp_th = QLineEdit()
-        cg.addWidget(rtsp_th, 1, 1)
-        conn_group.setLayout(cg)
+        conn_form.addRow("Stream URL 1 (Day / primary)", rtsp_day)
+        conn_form.addRow("Stream URL 2 (Thermal / secondary)", rtsp_th)
+        conn_group.setLayout(conn_form)
         vb.addWidget(conn_group)
 
         camera_group = QGroupBox("Camera / gimbal control")
         cam_outer = QVBoxLayout()
         cam_outer.setSpacing(10)
-        cam_row = QHBoxLayout()
-        cam_row.addWidget(QLabel("Control provider"))
-        camera_provider = QComboBox()
-        camera_provider.addItem("MAVLink (ArduPilot mount)", "mavlink")
-        camera_provider.addItem("SIYI SDK UDP (ZR10, ZT6, …)", "siyi")
-        camera_provider.addItem("Skydroid TOP UDP (C13)", "skydroid")
-        camera_provider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        cam_row.addWidget(camera_provider, 1)
-        cam_outer.addLayout(cam_row)
+        provider_group = QButtonGroup(camera_group)
+        rb_mavlink = QRadioButton("MAVLink (ArduPilot mount)")
+        rb_mavlink.setProperty("provider_id", "mavlink")
+        rb_siyi = QRadioButton("ZR Gimbal Camera (UDP)")
+        rb_siyi.setProperty("provider_id", "siyi")
+        rb_skydroid = QRadioButton("C13 Gimbal Camera (UDP)")
+        rb_skydroid.setProperty("provider_id", "skydroid")
+        provider_wrap = QWidget()
+        provider_wrap.setObjectName("cameraProviderWrap")
+        provider_lay = QVBoxLayout(provider_wrap)
+        provider_lay.setContentsMargins(10, 8, 10, 8)
+        provider_lay.setSpacing(6)
+        provider_title = QLabel("Control provider")
+        provider_title.setStyleSheet("font-weight: 600; color: #dbe1ee;")
+        provider_lay.addWidget(provider_title)
+        for rb in (rb_mavlink, rb_siyi, rb_skydroid):
+            provider_group.addButton(rb)
+            provider_lay.addWidget(rb)
+        provider_wrap.setStyleSheet(
+            "QWidget#cameraProviderWrap {"
+            "background-color: #12151c; border: 1px solid #252d3d; border-radius: 8px;"
+            "}"
+        )
+        cam_outer.addWidget(provider_wrap)
 
-        camera_hint = QLabel()
-        camera_hint.setWordWrap(True)
-        camera_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        camera_hint = _settings_hint("")
         cam_outer.addWidget(camera_hint)
 
         _hint_style = "color: #c8d0e0; font-size: 12px;"
@@ -2087,34 +2163,56 @@ class MainWindow(QMainWindow):
                 "ArduPilot mount control over MAVLink. Connect the FC link before using gimbal buttons or M7 gimbal columns."
             ),
             "siyi": (
-                "SIYI gimbal SDK (ZR10, ZT6, A8 mini): UDP port 37260 on the camera IP — usually the same host as your RTSP URL."
+                "ZR-series gimbal SDK (ZR10, ZT6, A8 mini): UDP port 37260 on the camera IP — usually the same host as your RTSP URL."
             ),
             "skydroid": (
-                "Skydroid C13 TOP (PROTOCAL): UDP 192.168.144.108 port 5000 (#TP frames). "
+                "C13 gimbal TOP (PROTOCAL): UDP 192.168.144.108 port 5000 (#TP frames). "
                 "RTSP: rtsp://192.168.144.108:554/stream=1. PC Ethernet 192.168.144.10/24."
             ),
         }
         _CAMERA_STACK_INDEX = {"mavlink": 0, "siyi": 1, "skydroid": 2}
         _RTSP_PLACEHOLDER = {
             "mavlink": "rtsp://host/stream or udp://0.0.0.0:5600",
-            "siyi": "SIYI ZR10: rtsp://192.168.144.25:8554/main.264",
-            "skydroid": "Skydroid C13: rtsp://192.168.144.108:554/stream=1",
+            "siyi": "ZR10: rtsp://192.168.144.25:8554/main.264",
+            "skydroid": "C13: rtsp://192.168.144.108:554/stream=1",
         }
 
+        def _camera_provider_id() -> str:
+            for rb in (rb_mavlink, rb_siyi, rb_skydroid):
+                if rb.isChecked():
+                    return str(rb.property("provider_id") or "mavlink")
+            return "mavlink"
+
+        def _set_camera_provider_id(pid: str) -> None:
+            want = str(pid or "mavlink").strip().lower()
+            for rb in (rb_mavlink, rb_siyi, rb_skydroid):
+                rb.setChecked(str(rb.property("provider_id") or "") == want)
+
         def _sync_camera_provider_ui() -> None:
-            pid = str(camera_provider.currentData() or "mavlink")
+            pid = _camera_provider_id()
             camera_stack.setCurrentIndex(_CAMERA_STACK_INDEX.get(pid, 0))
             camera_hint.setText(_CAMERA_PROVIDER_HINTS.get(pid, ""))
             rtsp_day.setPlaceholderText(_RTSP_PLACEHOLDER.get(pid, _RTSP_PLACEHOLDER["mavlink"]))
 
-        camera_provider.currentIndexChanged.connect(lambda _idx: _sync_camera_provider_ui())
+        provider_group.buttonClicked.connect(lambda _btn: _sync_camera_provider_ui())
         _sync_camera_provider_ui()
+
+        def _maybe_enable_video_from_urls() -> None:
+            if str(rtsp_day.text()).strip() or str(rtsp_th.text()).strip():
+                enabled.setChecked(True)
+
+        rtsp_day.textChanged.connect(lambda _t: _maybe_enable_video_from_urls())
+        rtsp_th.textChanged.connect(lambda _t: _maybe_enable_video_from_urls())
 
         camera_group.setLayout(cam_outer)
         vb.addWidget(camera_group)
 
         settings_group = QGroupBox("Settings")
         stg = QGridLayout()
+        stg.setHorizontalSpacing(12)
+        stg.setVerticalSpacing(10)
+        stg.setColumnStretch(1, 1)
+        stg.setColumnMinimumWidth(0, 160)
         stg.addWidget(QLabel("Aspect ratio"), 0, 0)
         aspect = QComboBox()
         aspect.addItems(["Auto", "16:9", "4:3", "1:1"])
@@ -2136,6 +2234,10 @@ class MainWindow(QMainWindow):
 
         storage_group = QGroupBox("Local Video Storage")
         lg = QGridLayout()
+        lg.setHorizontalSpacing(12)
+        lg.setVerticalSpacing(10)
+        lg.setColumnStretch(1, 1)
+        lg.setColumnMinimumWidth(0, 160)
         lg.addWidget(QLabel("Record file format"), 0, 0)
         record_fmt = QComboBox()
         record_fmt.addItems(["mp4", "mkv"])
@@ -2157,7 +2259,6 @@ class MainWindow(QMainWindow):
         row3.addWidget(split_default)
         row3.addStretch(1)
         vb.addLayout(row3)
-        vb.addStretch(1)
         stack.addWidget(video)
 
         observe = QWidget()
@@ -2251,9 +2352,7 @@ class MainWindow(QMainWindow):
             max_mb.setValue(int(s.value("video/max_storage_mb", 10240) or 10240))
         except Exception:
             max_mb.setValue(10240)
-        camera_provider.setCurrentIndex(
-            max(0, camera_provider.findData(str(s.value("camera/provider", "mavlink") or "mavlink")))
-        )
+        _set_camera_provider_id(str(s.value("camera/provider", "mavlink") or "mavlink"))
         skydroid_host.setText(str(s.value("camera/skydroid_host", "") or ""))
         try:
             skydroid_port.setValue(int(s.value("camera/skydroid_port", 5000) or 5000))
@@ -2334,7 +2433,10 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 s.setValue("video/rtsp_day", _day_rtsp)
-                s.setValue("video/rtsp_thermal", str(rtsp_th.text()).strip())
+                _th_u = str(rtsp_th.text()).strip()
+                s.setValue("video/rtsp_thermal", _th_u)
+                if _day_rtsp and _th_u:
+                    split_default.setCurrentText("Split")
                 s.setValue("video/default_view", str(split_default.currentText()))
                 s.setValue("video/aspect", str(aspect.currentText()))
                 s.setValue("video/low_latency", bool(low_latency.isChecked()))
@@ -2343,7 +2445,7 @@ class MainWindow(QMainWindow):
                 s.setValue("video/record_format", str(record_fmt.currentText()))
                 s.setValue("video/auto_delete", bool(auto_del.isChecked()))
                 s.setValue("video/max_storage_mb", int(max_mb.value()))
-                s.setValue("camera/provider", str(camera_provider.currentData() or "mavlink"))
+                s.setValue("camera/provider", _camera_provider_id())
                 s.setValue("camera/siyi_host", str(siyi_host.text()).strip())
                 s.setValue("camera/siyi_port", int(siyi_port.value()))
                 s.setValue("camera/siyi_timeout_ms", int(siyi_timeout.value()))
@@ -2377,7 +2479,16 @@ class MainWindow(QMainWindow):
         btn_apply.clicked.connect(_apply)
         btn_close.clicked.connect(dlg.accept)
 
-        dlg.exec()
+        overlay_restore: dict[str, bool] = {}
+        try:
+            if self._map_widget is not None:
+                overlay_restore = self._map_widget.suppress_floating_overlays()
+            dlg.raise_()
+            dlg.activateWindow()
+            dlg.exec()
+        finally:
+            if self._map_widget is not None:
+                self._map_widget.restore_floating_overlays(overlay_restore)
 
     def _show_vehicle_configuration_help(self) -> None:
         QMessageBox.information(
@@ -2441,21 +2552,17 @@ class MainWindow(QMainWindow):
         cal_btn_row1 = QHBoxLayout()
         btn_cal_accel = QPushButton("Accelerometer")
         btn_cal_compass = QPushButton("Compass")
-        btn_cal_gyro = QPushButton("Gyro")
         cal_btn_row1.addWidget(btn_cal_accel)
         cal_btn_row1.addWidget(btn_cal_compass)
-        cal_btn_row1.addWidget(btn_cal_gyro)
         cal_lay.addLayout(cal_btn_row1)
 
         cal_btn_row2 = QHBoxLayout()
-        btn_cal_baro = QPushButton("Barometer")
         btn_cal_rc = QPushButton("RC")
-        cal_btn_row2.addWidget(btn_cal_baro)
         cal_btn_row2.addWidget(btn_cal_rc)
         cal_btn_row2.addStretch()
         cal_lay.addLayout(cal_btn_row2)
 
-        for b in (btn_cal_accel, btn_cal_compass, btn_cal_gyro, btn_cal_baro, btn_cal_rc):
+        for b in (btn_cal_accel, btn_cal_compass, btn_cal_rc):
             b.setEnabled(can_send)
 
         def _queue_cal(kind: str) -> None:
@@ -2470,8 +2577,6 @@ class MainWindow(QMainWindow):
 
         btn_cal_accel.clicked.connect(lambda: _queue_cal("accel"))
         btn_cal_compass.clicked.connect(lambda: _queue_cal("compass"))
-        btn_cal_gyro.clicked.connect(lambda: _queue_cal("gyro"))
-        btn_cal_baro.clicked.connect(lambda: _queue_cal("baro"))
         btn_cal_rc.clicked.connect(lambda: _queue_cal("rc"))
 
         cal_group.setLayout(cal_lay)
@@ -2796,7 +2901,7 @@ class MainWindow(QMainWindow):
         if now < float(self._arm_denied_until_mono):
             reason = str(self._arm_denied_reason or self._prearm_block_reason or "").strip()
             msg = f"Arm denied - {reason}" if reason else "Arm denied"
-            self._set_dashboard_flight_status("yellow", msg)
+            self._set_dashboard_flight_status("red", msg)
             return
         if self._hb_armed:
             mode_disp = str(self._hb_mode_text or "Unknown").strip()
@@ -2819,7 +2924,7 @@ class MainWindow(QMainWindow):
                 )
             else:
                 msg = "Connected - Not Ready to Arm (waiting for PreArm OK)"
-            self._set_dashboard_flight_status("yellow", msg)
+            self._set_dashboard_flight_status("red", msg)
             return
         mode_disp = str(self._hb_mode_text or "").strip()
         ready_msg = f"Ready to Arm - {mode_disp}" if mode_disp and mode_disp != "—" else "Ready to Arm"

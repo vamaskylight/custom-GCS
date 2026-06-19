@@ -126,13 +126,6 @@ body{
 .log-entry-index{font-weight:700;font-size:13px;}
 .log-entry-time{font-size:12px;color:var(--muted);font-family:var(--mono);}
 .log-entry-badges{display:flex;flex-wrap:wrap;gap:6px;margin-left:auto;}
-.log-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0;border-bottom:1px solid var(--border-light);}
-.log-metric{padding:14px 16px;border-right:1px solid var(--border-light);min-height:80px;}
-.log-metric:last-child{border-right:none;}
-.log-metric-label{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600;margin-bottom:8px;}
-.log-metric-value{font-size:15px;font-weight:600;line-height:1.3;}
-.log-metric-value.mgrs{font-family:var(--mono);font-size:12px;}
-.log-metric-sub{font-size:11px;color:var(--muted);margin-top:4px;}
 .log-detail-table{width:100%;border-collapse:collapse;font-size:12px;}
 .log-detail-table th{width:34%;padding:10px 18px;font-weight:600;color:#475569;
   background:#fafbfc;border-bottom:1px solid var(--border-light);vertical-align:top;}
@@ -165,6 +158,11 @@ body{
   font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);}
 .viz-card-body{padding:8px;}
 .fc-diagram-wrap{background:#fafbfc;border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:8px;}
+.fc-diagram-wrap svg{display:block;vertical-align:top;min-height:320px;}
+.fc-positions-svg,.fc-plan-svg,.fc-gunline-svg,.fc-compass-svg{min-height:360px;}
+.lr-icon{display:inline-block;min-width:1.15em;font-weight:800;text-align:center;margin-right:4px;}
+.lr-pos{color:#15803d;}
+.lr-neg{color:#b91c1c;}
 .fc-diagram-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
   color:var(--muted);text-align:center;margin:0 0 8px;}
 .fc-workflow{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:0 0 16px;}
@@ -417,11 +415,6 @@ body{
   .hero-kpis{width:100%;}
   .fc-bar-row{grid-template-columns:1fr;gap:4px;}
   .fc-bar-value{text-align:left;}
-}
-@media (max-width:900px){
-  .log-metrics{grid-template-columns:repeat(2,minmax(0,1fr));}
-  .log-metric:nth-child(2){border-right:none;}
-  .log-metric{border-bottom:1px solid var(--border-light);}
 }
 @media print{
   .report-nav-wrap,.back-to-top{display:none!important;}
