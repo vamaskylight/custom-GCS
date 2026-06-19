@@ -7,11 +7,17 @@ Tracks artillery variables per field workflow:
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from typing import Any
 
 from vgcs.observe.grid_reference import format_grid_reference
+from vgcs.observe.dooaf_map_symbols import (
+    bearing_deg as _dooaf_bearing_deg,
+    svg_gun_marker as _fc_svg_marker_gun,
+    svg_target_marker as _fc_svg_marker_crosshair,
+)
 from vgcs.observe.target_measure import haversine_m, observation_target_latlon
 
 DOOAF_ROLE_SURVEY = "survey"
@@ -29,7 +35,7 @@ DOOAF_ROLES = (
 # Operator-facing labels (dropdown, status, reports).
 DOOAF_ROLE_DISPLAY: dict[str, str] = {
     DOOAF_ROLE_INTENDED: "Actual target",
-    DOOAF_ROLE_IMPACT: "Fall of shot",
+    DOOAF_ROLE_IMPACT: "Impact Target",
     DOOAF_ROLE_GUN: "Artillery (gun)",
     DOOAF_ROLE_SURVEY: "Wall measure",
 }
@@ -39,7 +45,7 @@ DOOAF_ROLE_TOOLTIPS: dict[str, str] = {
         "Planned impact point from military staff — where the round should land."
     ),
     DOOAF_ROLE_IMPACT: (
-        "Mark fall of shot after firing — click burst or smoke on video. "
+        "Mark Impact Target after firing — click burst or smoke on video. "
         "Set gun and actual target in DOOAF Setup first."
     ),
     DOOAF_ROLE_GUN: (
@@ -111,6 +117,7 @@ _QS_GUN_ALT = "dooaf/gun_alt_m"
 _QS_TARGET_LAT = "dooaf/target_lat"
 _QS_TARGET_LON = "dooaf/target_lon"
 _QS_TARGET_ALT = "dooaf/target_alt_m"
+_QS_PRESETS_JSON = "dooaf/presets_json"
 
 
 def initial_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -376,6 +383,76 @@ def read_dooaf_settings(st: Any) -> DooafSettings:
         target_lon=_qs_float(st, _QS_TARGET_LON),
         target_alt_m=_qs_float(st, _QS_TARGET_ALT),
     )
+
+
+@dataclass(frozen=True)
+class DooafPreset:
+    name: str
+    settings: DooafSettings
+
+
+def _preset_to_dict(preset: DooafPreset) -> dict[str, object]:
+    s = preset.settings
+    return {
+        "name": str(preset.name),
+        "gun_lat": s.gun_lat,
+        "gun_lon": s.gun_lon,
+        "gun_alt_m": s.gun_alt_m,
+        "target_lat": s.target_lat,
+        "target_lon": s.target_lon,
+        "target_alt_m": s.target_alt_m,
+    }
+
+
+def load_dooaf_presets(st: Any) -> list[DooafPreset]:
+    raw = str(st.value(_QS_PRESETS_JSON, "") or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[DooafPreset] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            preset = DooafPreset(
+                name=str(item.get("name") or "").strip(),
+                settings=DooafSettings(
+                    gun_lat=float(item["gun_lat"]) if item.get("gun_lat") not in (None, "") else None,
+                    gun_lon=float(item["gun_lon"]) if item.get("gun_lon") not in (None, "") else None,
+                    gun_alt_m=float(item["gun_alt_m"]) if item.get("gun_alt_m") not in (None, "") else None,
+                    target_lat=float(item["target_lat"]) if item.get("target_lat") not in (None, "") else None,
+                    target_lon=float(item["target_lon"]) if item.get("target_lon") not in (None, "") else None,
+                    target_alt_m=float(item["target_alt_m"]) if item.get("target_alt_m") not in (None, "") else None,
+                ),
+            )
+        except (TypeError, ValueError, KeyError):
+            continue
+        if preset.name:
+            out.append(preset)
+    return out
+
+
+def save_dooaf_presets(st: Any, presets: list[DooafPreset]) -> None:
+    payload = [_preset_to_dict(p) for p in presets]
+    st.setValue(_QS_PRESETS_JSON, json.dumps(payload))
+
+
+def upsert_dooaf_preset(st: Any, preset: DooafPreset) -> None:
+    presets = [p for p in load_dooaf_presets(st) if p.name != preset.name]
+    presets.append(preset)
+    save_dooaf_presets(st, presets)
+
+
+def delete_dooaf_preset(st: Any, name: str) -> None:
+    want = str(name or "").strip()
+    if not want:
+        return
+    save_dooaf_presets(st, [p for p in load_dooaf_presets(st) if p.name != want])
 
 
 def merge_dooaf_settings(
@@ -862,10 +939,20 @@ def _format_signed_correction_dir(
     pos_label: str,
     neg_label: str,
 ) -> str:
-    """Format correction as e.g. ``East +3.2 m`` or ``West +1.0 m``."""
+    """Format correction as e.g. ``+ Right 3.2 m`` or ``− Left 1.0 m``."""
     v = float(value_m)
     if abs(v) < 0.05:
         return "<span class='muted'>0.0 m</span>"
+    if pos_label == "Right" and neg_label == "Left":
+        if v > 0:
+            return (
+                f"<span class='lr-icon lr-pos' title='Right'>+</span> "
+                f"{_html_esc(pos_label)} {v:.1f} m"
+            )
+        return (
+            f"<span class='lr-icon lr-neg' title='Left'>−</span> "
+            f"{_html_esc(neg_label)} {abs(v):.1f} m"
+        )
     if v > 0:
         return f"{_html_esc(pos_label)} +{v:.1f} m"
     return f"{_html_esc(neg_label)} +{abs(v):.1f} m"
@@ -883,6 +970,53 @@ def _format_miss_dir(value_m: float, pos_label: str, neg_label: str) -> str:
 
 def _fc_svg_esc(text: str) -> str:
     return _html_esc(text).replace("'", "&#39;")
+
+
+def _fc_svg_gun_drone_inset(session: DooafSession, x0: float, y0: float, w: float, h: float) -> str:
+    """Mini reference map: artillery + drone when coordinates are known."""
+    pts: list[tuple[str, GeoPoint, str]] = []
+    if session.gun is not None:
+        pts.append(("G", session.gun, "#2563eb"))
+    if session.drone is not None:
+        pts.append(("D", session.drone, "#9333ea"))
+    if len(pts) < 1:
+        return ""
+    ref_lat = sum(p.lat for _, p, _ in pts) / len(pts)
+    ref_lon = sum(p.lon for _, p, _ in pts) / len(pts)
+    en: list[tuple[str, float, float, str]] = []
+    for label, pt, color in pts:
+        n, e = latlon_delta_to_ne_m(ref_lat, ref_lon, pt.lat, pt.lon)
+        en.append((label, e, n, color))
+    span = max(max(abs(v[1]) for v in en), max(abs(v[2]) for v in en), 8.0)
+    scale = min((w - 16.0) / (2.0 * span), (h - 16.0) / (2.0 * span), 3.5)
+    cx = x0 + w / 2.0
+    cy = y0 + h / 2.0
+    parts = [
+        f"<rect x='{x0:.1f}' y='{y0:.1f}' width='{w:.1f}' height='{h:.1f}' "
+        "fill='#fff' fill-opacity='0.92' stroke='#cbd5e1' stroke-width='1' rx='6'/>",
+        f"<text x='{cx:.1f}' y='{y0 + 10:.1f}' text-anchor='middle' font-size='7' "
+        "fill='#64748b' font-weight='700'>Gun · Drone</text>",
+    ]
+    for label, east, north, color in en:
+        px = cx + east * scale
+        py = cy - north * scale
+        if label == "G":
+            brg = None
+            if session.gun is not None and session.drone is not None:
+                brg = _dooaf_bearing_deg(
+                    session.gun.lat,
+                    session.gun.lon,
+                    session.drone.lat,
+                    session.drone.lon,
+                )
+            parts.append(_fc_svg_marker_gun(px, py, scale=0.55, bearing_deg=brg))
+        else:
+            parts.append(f"<circle cx='{px:.1f}' cy='{py:.1f}' r='4' fill='{color}'/>")
+            parts.append(
+                f"<text x='{px:.1f}' y='{py + 2.5:.1f}' text-anchor='middle' font-size='6' "
+                f"fill='#fff' font-weight='700'>{label}</text>"
+            )
+    return "".join(parts)
 
 
 def _fc_svg_pill(cx: float, cy: float, text: str, stroke: str, fill: str, font_size: int = 10) -> str:
@@ -1272,12 +1406,12 @@ def _fire_correction_workflow_html() -> str:
         "<span class='muted'>Pick on video = target</span></div>"
         "<div class='fc-workflow-step' data-step='2'>"
         "<strong>Target ON</strong>"
-        "<span class='muted'>Click = fall of shot</span></div>"
+        "<span class='muted'>Click = Impact Target</span></div>"
         "<div class='fc-workflow-step' data-step='3'>"
         "<strong>Report</strong>"
         "<span class='muted'>Miss + correction</span></div>"
         "<div class='fc-workflow-step' data-step='4'>"
-        "<strong>Next round</strong>"
+        "<strong>Course Correction</strong>"
         "<span class='muted'>Apply corrections</span></div>"
         "</div>"
     )
@@ -1307,8 +1441,8 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     corr_n_txt = f"{'North' if corr_n >= 0 else 'South'} {abs(corr_n):.1f} m"
     footer_columns = [
         ("Distances", [f"gun→target {range_text}", f"gun→impact {gi_text}"], "#64748b"),
-        ("Round landed", round_landed, "#ea580c"),
-        ("Apply", [corr_e_txt, corr_n_txt], "#0d9488"),
+        ("Impact distance", round_landed, "#ea580c"),
+        ("Course Correction", [corr_e_txt, corr_n_txt], "#0d9488"),
     ]
     east_pts = [0.0, ne_t[1], ne_i[1]]
     north_pts = [0.0, ne_t[0], ne_i[0]]
@@ -1317,7 +1451,7 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     min_n, max_n = min(north_pts) - pad, max(north_pts) + pad
     span_e = max(max_e - min_e, 12.0)
     span_n = max(max_n - min_n, 12.0)
-    vb_w, vb_h = 520.0, 348.0
+    vb_w, vb_h = 520.0, 420.0
     margin = 48.0
     graph_top = 28.0
     footer_gap = 8.0
@@ -1376,19 +1510,27 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
         "stroke-width='1.5' stroke-dasharray='6,4'/>",
         f"<line x1='{gx:.1f}' y1='{gy:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#cbd5e1' "
         "stroke-width='1' stroke-dasharray='4,4'/>",
-        f"<circle cx='{gx:.1f}' cy='{gy:.1f}' r='10' fill='#2563eb'/>",
-        f"<text x='{gx:.1f}' y='{gy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
-        "font-weight='700'>G</text>",
+        _fc_svg_marker_gun(
+            gx,
+            gy,
+            bearing_deg=_dooaf_bearing_deg(gun.lat, gun.lon, intended.lat, intended.lon),
+        ),
         f"<text x='{gx:.1f}' y='{gy - 14:.1f}' text-anchor='middle' font-size='{fs}' fill='#2563eb' "
         "font-weight='600'>Gun</text>",
-        f"<circle cx='{tx:.1f}' cy='{ty:.1f}' r='11' fill='#16a34a'/>",
-        f"<text x='{tx:.1f}' y='{ty + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
-        "font-weight='700'>T</text>",
+        _fc_svg_marker_crosshair(tx, ty),
         f"<circle cx='{ix:.1f}' cy='{iy:.1f}' r='10' fill='#dc2626'/>",
         f"<text x='{ix:.1f}' y='{iy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
         "font-weight='700'>I</text>",
     ]
-
+    if session.drone is not None:
+        ne_d = latlon_delta_to_ne_m(gun.lat, gun.lon, session.drone.lat, session.drone.lon)
+        dx, dy = _xy(ne_d[1], ne_d[0])
+        parts.append(f"<circle cx='{dx:.1f}' cy='{dy:.1f}' r='8' fill='#9333ea'/>")
+        parts.append(
+            f"<text x='{dx:.1f}' y='{dy + 3:.1f}' text-anchor='middle' font-size='8' fill='#fff' "
+            "font-weight='700'>D</text>"
+        )
+    parts.append(_fc_svg_gun_drone_inset(session, bg_x + 4.0, graph_top + 4.0, 78.0, 52.0))
     gt_side = _fc_seg_prefer_side(gx, gy, tx, ty, cluster_x, cluster_y)
     gi_side = _fc_seg_prefer_side(gx, gy, ix, iy, cluster_x, cluster_y)
     parts.append(
@@ -1425,13 +1567,13 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     return "".join(parts)
 
 
-def _fire_correction_gunline_svg(c: FireCorrection) -> str:
+def _fire_correction_gunline_svg(c: FireCorrection, *, session: DooafSession | None = None) -> str:
     """Gun-line view: along-range and right miss."""
     along = float(c.miss_along_m)
     right = float(c.miss_right_m)
     r_gt = max(float(c.range_gun_to_intended_m), 1.0)
     span = max(r_gt + abs(along) + 20.0, 40.0)
-    vb_w, vb_h = 520.0, 348.0
+    vb_w, vb_h = 520.0, 420.0
     margin = 56.0
     graph_top = 36.0
     footer_gap = 8.0
@@ -1450,8 +1592,8 @@ def _fire_correction_gunline_svg(c: FireCorrection) -> str:
         landed_lines.append(right_label)
     footer_columns = [
         ("Range", [f"target {range_text}"], "#64748b"),
-        ("Round landed", landed_lines, "#ea580c"),
-        ("Apply", [corr_range_label, corr_lr_label], "#0d9488"),
+        ("Impact distance", landed_lines, "#ea580c"),
+        ("Course Correction", [corr_range_label, corr_lr_label], "#0d9488"),
     ]
     footer_h = _fc_diagram_footer_height(footer_columns)
     footer_top = vb_h - footer_h - 6.0
@@ -1512,6 +1654,9 @@ def _fire_correction_gunline_svg(c: FireCorrection) -> str:
             "stroke='#fdba74' stroke-width='2' stroke-dasharray='4,3'/>"
         )
 
+    if session is not None:
+        parts.append(_fc_svg_gun_drone_inset(session, margin, graph_top, 78.0, 52.0))
+
     parts.append(
         _fc_svg_diagram_footer(bg_x, bg_w, footer_top, footer_h, footer_columns)
     )
@@ -1523,7 +1668,12 @@ def _fc_compass_span(miss_e: float, miss_n: float, *, floor: float = 10.0) -> fl
     return max(abs(miss_e), abs(miss_n), floor, 1.0)
 
 
-def _fire_correction_compass_miss_svg(c: FireCorrection, *, compact: bool = False) -> str:
+def _fire_correction_compass_miss_svg(
+    c: FireCorrection,
+    *,
+    compact: bool = False,
+    session: DooafSession | None = None,
+) -> str:
     """Target-centred compass: impact offset and E/N miss components."""
     miss_e = float(c.miss_east_m)
     miss_n = float(c.miss_north_m)
@@ -1566,9 +1716,7 @@ def _fire_correction_compass_miss_svg(c: FireCorrection, *, compact: bool = Fals
         "font-weight='600'>W</text>",
         f"<text x='{cx:.0f}' y='{vb_h - margin - 6:.0f}' text-anchor='middle' font-size='{fs}' "
         "fill='#64748b' font-weight='600'>S</text>",
-        f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='{r_tgt:.0f}' fill='#16a34a'/>",
-        f"<text x='{cx:.1f}' y='{cy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
-        "font-weight='700'>T</text>",
+        _fc_svg_marker_crosshair(cx, cy, r=r_tgt),
         f"<text x='{cx:.1f}' y='{cy - r_tgt - 6:.1f}' text-anchor='middle' font-size='{fs}' "
         "fill='#16a34a' font-weight='600'>Target</text>",
     ]
@@ -1609,10 +1757,16 @@ def _fire_correction_compass_miss_svg(c: FireCorrection, *, compact: bool = Fals
             "</svg>",
         ]
     )
+    if session is not None:
+        parts.insert(-1, _fc_svg_gun_drone_inset(session, margin, margin, 78.0, 52.0))
     return "".join(parts)
 
 
-def _fire_correction_aim_story_svg(c: FireCorrection) -> str:
+def _fire_correction_aim_story_svg(
+    c: FireCorrection,
+    *,
+    session: DooafSession | None = None,
+) -> str:
     """Three-step story: aimed → landed → correct next round."""
     miss_e = float(c.miss_east_m)
     miss_n = float(c.miss_north_m)
@@ -1701,7 +1855,7 @@ def _fire_correction_aim_story_svg(c: FireCorrection) -> str:
     ix2, iy2 = _impact_xy(cx2)
     panel2 = (
         _panel_bg(1)
-        + _story_heading(cx2, "2 · Round landed", "Fall of shot (red)")
+        + _story_heading(cx2, "2 · Impact distance", "Impact Target (red)")
         + _story_target(cx2)
         + f"<line x1='{cx2:.0f}' y1='{target_y:.0f}' x2='{ix2:.1f}' y2='{iy2:.1f}' "
         "stroke='#ea580c' stroke-width='2.5'/>"
@@ -1714,7 +1868,7 @@ def _fire_correction_aim_story_svg(c: FireCorrection) -> str:
     ix3, iy3 = _impact_xy(cx3)
     panel3 = (
         _panel_bg(2)
-        + _story_heading(cx3, "3 · Next round", "Move aim back to target")
+        + _story_heading(cx3, "3 · Course Correction", "Move aim back to target")
         + _story_target(cx3, aim_hint=True)
         + _story_impact(ix3, iy3)
         + f"<line x1='{ix3:.1f}' y1='{iy3:.1f}' x2='{cx3:.0f}' y2='{target_y:.0f}' "
@@ -1797,7 +1951,7 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
         ("Distances", dist_lines, "#64748b"),
         ("Miss", miss_lines, "#ea580c"),
     ]
-    vb_w, vb_h = 520.0, 288.0
+    vb_w, vb_h = 520.0, 400.0
     margin = 44.0
     graph_top = 28.0
     footer_gap = 8.0
@@ -1885,12 +2039,31 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
             "stroke-width='1.5' stroke-dasharray='4,3'/>"
         )
 
+    gun_brg: float | None = None
+    if session.gun is not None and session.intended is not None:
+        gun_brg = _dooaf_bearing_deg(
+            session.gun.lat,
+            session.gun.lon,
+            session.intended.lat,
+            session.intended.lon,
+        )
+
     for label, east, north, color, letter in en_pts:
         x, y = _xy(east, north)
-        parts.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='10' fill='{color}'/>")
+        if label == "Gun":
+            parts.append(_fc_svg_marker_gun(x, y, bearing_deg=gun_brg))
+        elif label == "Target":
+            parts.append(_fc_svg_marker_crosshair(x, y, r=10.0))
+        else:
+            parts.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='10' fill='{color}'/>")
+            parts.append(
+                f"<text x='{x:.1f}' y='{y + 4:.1f}' text-anchor='middle' font-size='9' fill='#fff' "
+                f"font-weight='700'>{letter}</text>"
+            )
+            continue
         parts.append(
-            f"<text x='{x:.1f}' y='{y + 4:.1f}' text-anchor='middle' font-size='9' fill='#fff' "
-            f"font-weight='700'>{letter}</text>"
+            f"<text x='{x:.1f}' y='{y - 14:.1f}' text-anchor='middle' font-size='8' fill='{color}' "
+            f"font-weight='600'>{label}</text>"
         )
 
     parts.append(
@@ -2139,7 +2312,7 @@ def _executive_summary_visual_html(c: FireCorrection) -> str:
             1,
             "miss",
             "Where the round landed",
-            "Fall of shot vs aim point on the map",
+            "Impact Target vs aim point on the map",
             "!",
         )
         + "<div class='exec-panel-body'>"
@@ -2169,9 +2342,9 @@ def format_fire_correction_diagram_html(session: DooafSession) -> str:
     if c is None or session.gun is None or session.intended is None or session.impact is None:
         return ""
     plan = _fire_correction_plan_svg(session, c)
-    gunline = _fire_correction_gunline_svg(c)
-    compass = _fire_correction_compass_miss_svg(c)
-    story = _fire_correction_aim_story_svg(c)
+    gunline = _fire_correction_gunline_svg(c, session=session)
+    compass = _fire_correction_compass_miss_svg(c, session=session)
+    story = _fire_correction_aim_story_svg(c, session=session)
     bars = _fire_correction_bars_html(c)
     if not plan:
         return ""
@@ -2197,7 +2370,7 @@ def format_fire_correction_diagram_html(session: DooafSession) -> str:
         "<div class='fc-legend'>"
         "<span><i class='fc-dot fc-dot-gun'></i>Gun</span>"
         "<span><i class='fc-dot fc-dot-target'></i>Actual target</span>"
-        "<span><i class='fc-dot fc-dot-impact'></i>Fall of shot</span>"
+        "<span><i class='fc-dot fc-dot-impact'></i>Impact Target</span>"
         "<span><i class='fc-dot fc-dot-drone'></i>Drone</span>"
         "</div>"
         + _fire_correction_workflow_html()
@@ -2503,7 +2676,7 @@ def format_report_glossary_html() -> str:
         "<summary>What do these terms mean?</summary>"
         "<dl>"
         "<dt>Actual target</dt><dd>Where you intended to hit (set in DOOAF Setup → Pick on video).</dd>"
-        "<dt>Fall of shot / Impact</dt><dd>Where the round actually landed (Target ON → click on video).</dd>"
+        "<dt>Impact Target</dt><dd>Where the round actually landed (Target ON → click on video).</dd>"
         "<dt>Miss</dt><dd>How far the impact was from the target, and in which direction.</dd>"
         "<dt>Correction (add)</dt><dd>Values to <em>add</em> to your firing data on the next round.</dd>"
         "<dt>East / West · North / South</dt><dd>Directions on the map (compass axes).</dd>"
@@ -2794,7 +2967,7 @@ def format_dooaf_html_summary(
             "Positions",
             session_body,
             section_id="positions",
-            subtitle="Gun, target, fall of shot, and drone — map plus coordinate table.",
+            subtitle="Gun, target, Impact Target, and drone — map plus coordinate table.",
         )
         + format_elevation_summary_html(session)
         + format_camera_orientation_html(obs_row)
@@ -2994,61 +3167,71 @@ def _position_section_title(row: dict[str, object]) -> str:
     return "Map mark"
 
 
-def _format_log_metrics_row(row: dict[str, object], cell_fn: Any) -> str:
-    mgrs = str(
-        row.get("target_grid_ref") or row.get("map_grid_ref") or ""
-    ).strip()
-    mgrs_html = (
-        f"<span class='mgrs-badge'>{_html_esc(mgrs)}</span>"
-        if mgrs
-        else "<span class='muted'>—</span>"
+def _log_summary_rows(row: dict[str, object], cell_fn: Any) -> list[str]:
+    """Top-of-entry summary fields in the same table layout as coordinate rows."""
+    rows: list[str] = [_log_detail_section("Summary")]
+
+    mgrs = str(row.get("target_grid_ref") or row.get("map_grid_ref") or "").strip()
+    rows.append(
+        _log_detail_row(
+            "Grid reference",
+            _format_mgrs_badge(mgrs) if mgrs else "<span class='muted'>—</span>",
+        )
     )
-    geo_html = (
-        format_geo_method_badge(row.get("geo_method"))
-        + "<div class='log-metric-sub'>"
-        + format_geo_quality_badge(row.get("geo_quality"))
-        + "</div>"
-    )
-    sep_html = _format_distance_m_html(row.get("segment_distance_m"), cell_fn)
-    range_html = _format_distance_m_html(row.get("geo_range_m"), cell_fn)
-    ekf_html = _format_alt_m_html(row.get("ekf_rel_alt_m"), cell_fn)
-    if ekf_html == "<span class='muted'>—</span>":
-        ekf_html = _format_alt_m_html(row.get("vehicle_rel_alt_m"), cell_fn)
+
+    if not _is_missing_cell(row.get("geo_method")):
+        rows.append(
+            _log_detail_row("Geo method", format_geo_method_badge(row.get("geo_method")))
+        )
+    if not _is_missing_cell(row.get("geo_quality")):
+        rows.append(
+            _log_detail_row("Geo quality", format_geo_quality_badge(row.get("geo_quality")))
+        )
+
+    if not _is_missing_cell(row.get("segment_distance_m"), cell_fn):
+        rows.append(
+            _log_detail_row(
+                "Separation",
+                _format_distance_m_html(row.get("segment_distance_m"), cell_fn),
+            )
+        )
+    if not _is_missing_cell(row.get("geo_range_m"), cell_fn):
+        rows.append(
+            _log_detail_row(
+                "Geo range",
+                _format_distance_m_html(row.get("geo_range_m"), cell_fn),
+            )
+        )
+
+    ekf_val = row.get("ekf_rel_alt_m")
+    if _is_missing_cell(ekf_val, cell_fn):
+        ekf_val = row.get("vehicle_rel_alt_m")
+    if not _is_missing_cell(ekf_val, cell_fn):
+        rows.append(
+            _log_detail_row(
+                "EKF rel (above home)",
+                _format_alt_m_html(ekf_val, cell_fn),
+            )
+        )
+
     dem_ground = row.get("dem_ground_agl_m")
     ray_agl = row.get("measure_agl_m")
-    height_sub = ""
     if not _is_missing_cell(dem_ground, cell_fn):
-        height_sub = (
-            f"<div class='log-metric-sub'>Ground ~"
-            f"{_format_alt_m_html(dem_ground, cell_fn)} (DEM)</div>"
+        rows.append(
+            _log_detail_row(
+                "Ground height (DEM)",
+                _format_alt_m_html(dem_ground, cell_fn),
+            )
         )
     elif not _is_missing_cell(ray_agl, cell_fn):
-        height_sub = (
-            f"<div class='log-metric-sub'>Ray height "
-            f"{_format_alt_m_html(ray_agl, cell_fn)}</div>"
+        rows.append(
+            _log_detail_row(
+                "Ray height (AGL)",
+                _format_alt_m_html(ray_agl, cell_fn),
+            )
         )
-    return (
-        "<div class='log-metrics'>"
-        "<div class='log-metric'>"
-        "<div class='log-metric-label'>Grid reference</div>"
-        f"<div class='log-metric-value mgrs'>{mgrs_html}</div>"
-        "</div>"
-        "<div class='log-metric'>"
-        "<div class='log-metric-label'>Geo method</div>"
-        f"<div class='log-metric-value'>{geo_html}</div>"
-        "</div>"
-        "<div class='log-metric'>"
-        "<div class='log-metric-label'>Separation / range</div>"
-        f"<div class='log-metric-value'>{sep_html}</div>"
-        f"<div class='log-metric-sub'>Geo range {range_html}</div>"
-        "</div>"
-        "<div class='log-metric'>"
-        "<div class='log-metric-label'>EKF rel (above home)</div>"
-        f"<div class='log-metric-value'>{ekf_html}</div>"
-        f"{height_sub}"
-        "</div>"
-        "</div>"
-    )
+
+    return rows
 
 
 def _format_path_cell(path: object) -> str:
@@ -3083,7 +3266,7 @@ def _format_observation_log_entry(
         cell_fn,
     )
 
-    detail_rows: list[str] = []
+    detail_rows: list[str] = _log_summary_rows(row, cell_fn)
 
     if map_ok and tgt_ok and same_pos:
         detail_rows.append(_log_detail_section(_position_section_title(row)))
@@ -3364,7 +3547,6 @@ def _format_observation_log_entry(
         + _format_kind_badge(row.get("kind"))
         + _format_role_badge(row.get("dooaf_role"))
         + "</div></header>"
-        + _format_log_metrics_row(row, cell_fn)
         + detail_table
         + "</article>"
     )

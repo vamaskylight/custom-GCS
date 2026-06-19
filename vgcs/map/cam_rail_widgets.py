@@ -8,7 +8,7 @@ zoom/focus/gimbal/observe strips are native MAVLink controls styled to match pro
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -20,6 +20,65 @@ from PySide6.QtWidgets import (
 )
 
 from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT
+
+
+class CamRailShowHandle(QFrame):
+    """Edge drawer tab — shown when the operator collapses the camera rail."""
+
+    WIDTH_PX = 36
+    HEIGHT_PX = 92
+
+    clicked = Signal()
+
+    def __init__(self, parent=None, *, icon: QIcon | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("camRailShowHandle")
+        self.setFixedSize(self.WIDTH_PX, self.HEIGHT_PX)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Show camera panel")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet(
+            "QFrame#camRailShowHandle {"
+            " background: rgba(24, 30, 40, 0.96);"
+            " border: 1px solid rgba(196, 209, 230, 90);"
+            " border-right: none;"
+            " border-top-left-radius: 12px;"
+            " border-bottom-left-radius: 12px;"
+            "}"
+            "QFrame#camRailShowHandle:hover {"
+            " background: rgba(46, 56, 72, 0.98);"
+            " border-color: rgba(229, 237, 251, 130);"
+            "}"
+            "QLabel#camRailShowChevron {"
+            " color: #dce5f5; font-size: 15px; font-weight: 700;"
+            " background: transparent; border: none;"
+            "}"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 14, 0, 12)
+        lay.setSpacing(8)
+        lay.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        icon_lbl = QLabel()
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_lbl.setFixedSize(22, 22)
+        if icon is not None and not icon.isNull():
+            icon_lbl.setPixmap(icon.pixmap(22, 22))
+        else:
+            icon_lbl.setText("🎥")
+            icon_lbl.setStyleSheet("font-size: 16px; background: transparent; border: none;")
+        chev = QLabel("◀")
+        chev.setObjectName("camRailShowChevron")
+        chev.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(chev, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addStretch(1)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class CamRecordArch(QWidget):
@@ -140,12 +199,12 @@ class CamObserveBlock(QWidget):
         row_setup.setContentsMargins(0, 0, 0, 0)
         row_setup.setSpacing(4)
         row_setup.addWidget(self.setup_btn, 1)
-        hint = QLabel("DOOAF Setup: Pick on video for target · Target ON = fall of shot (red)")
+        hint = QLabel("DOOAF Setup: Pick on video for target · Target ON = Impact Target (red)")
         hint.setObjectName("observeDooafHint")
         hint.setWordWrap(True)
         hint.setToolTip(
             "Set gun and actual target in DOOAF Setup (Pick on map or Pick on video). "
-            "Then turn Target ON and click fall of shot on the video feed."
+            "Then turn Target ON and click Impact Target on the video feed."
         )
         v.addLayout(row1)
         v.addLayout(row2)

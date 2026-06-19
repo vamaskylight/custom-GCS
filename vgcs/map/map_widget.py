@@ -158,6 +158,7 @@ from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_u
 from vgcs.map.cam_rail_widgets import (
     CamObserveBlock,
     CamRailGimbalPad,
+    CamRailShowHandle,
     CamRecordTimerRow,
 )
 from vgcs.map.plan_flight_panel import PlanFlightPanel
@@ -240,6 +241,7 @@ _KEY_VIDEO_RTSP_TRANSPORT = "video/rtsp_transport"  # 'auto' | 'udp' | 'tcp'
 _KEY_VIDEO_LOW_LATENCY = "video/low_latency"
 _KEY_VIDEO_RECORD_FORMAT = "video/record_format"  # 'mp4' | 'mkv'
 _KEY_VIDEO_DEFAULT_VIEW = "video/default_view"  # 'Single' | 'Split'
+_KEY_CAMERA_RAIL_VISIBLE = "map/camera_rail_visible"
 
 # Native HUD top inset from the map canvas (px) — Takeoff/Return and camera rail share the same gap below the app header.
 # Legacy Web used ~78px to clear an in-map `#linkBanner`; native 2D has no banner, so keep this tight.
@@ -413,7 +415,6 @@ QPushButton#camPhotoBtn:checked {
   border: 1px solid rgba(214, 224, 241, 230);
   background: rgba(27, 33, 45, 245);
 }
-/* Split / Follow: icon-only — same 28px footprint as `#camPhotoBtn` (git `camSplitBtn` / `camFollowBtn`). */
 QPushButton#camSplitBtn, QPushButton#camFollowBtn {
   width: 28px;
   height: 28px;
@@ -454,6 +455,27 @@ QLabel#camMagnificationLabel {
   border: 1px solid rgba(80, 92, 118, 107);
   background: rgba(26, 33, 45, 215);
   min-width: 44px;
+}
+QPushButton#camRailHideBtn {
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  max-width: 28px;
+  min-height: 28px;
+  max-height: 28px;
+  padding: 0px;
+  margin: 0px;
+  border-radius: 7px;
+  border: 1px solid rgba(196, 209, 230, 55);
+  background-color: rgba(22, 27, 38, 235);
+  color: #e8edf8;
+  font-size: 18px;
+  font-weight: 600;
+}
+QPushButton#camRailHideBtn:hover {
+  background-color: rgba(40, 48, 62, 245);
+  border-color: rgba(229, 237, 251, 85);
+  color: #ffffff;
 }
 QPushButton#camRecordBtn {
   width: 34px;
@@ -1387,6 +1409,15 @@ class MapWidget(QWidget):
         self._lbl_camera_top_zoom.setToolTip("Camera magnification")
         ctr_layout.addWidget(self._lbl_camera_top_zoom, 0, Qt.AlignmentFlag.AlignVCenter)
         ctr_layout.addStretch(1)
+        self._btn_native_rail_hide = QPushButton("›")
+        self._btn_native_rail_hide.setObjectName("camRailHideBtn")
+        self._btn_native_rail_hide.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_rail_hide.setFixedSize(28, 28)
+        self._btn_native_rail_hide.setToolTip("Hide camera panel")
+        self._btn_native_rail_hide.clicked.connect(
+            lambda: self._set_camera_rail_panel_visible(False)
+        )
+        ctr_layout.addWidget(self._btn_native_rail_hide, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._btn_native_record = QPushButton()
         self._btn_native_record.setObjectName("camRecordBtn")
@@ -1495,6 +1526,16 @@ class MapWidget(QWidget):
         self._native_hud_right.setMinimumWidth(_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX)
         self._native_hud_right.hide()
         self._native_rail_layer.hide()
+
+        self._btn_camera_rail_show = CamRailShowHandle(
+            self._panel,
+            icon=_git_cam_icon_from_svg(_GIT_CAM_VIDEO_SVG, 22),
+        )
+        self._btn_camera_rail_show.clicked.connect(
+            lambda: self._set_camera_rail_panel_visible(True)
+        )
+        self._btn_camera_rail_show.hide()
+        self._btn_camera_rail_show.raise_()
 
         # Native tile map ignores `setTelemetryOverlay` / compass DOM (see native_tile_map._eval_one skips).
         # Mirror git e48c1a7 bottom HUD: painted compass + 3-cell telemetry strip (Web CSS parity).
@@ -2586,8 +2627,7 @@ class MapWidget(QWidget):
             pass
         if bool(getattr(self, "_last_link_connected", False)):
             try:
-                self._native_hud_right.show()
-                self._native_rail_layer.show()
+                self._sync_camera_rail_panel_visibility()
                 self._obstacle_radar.show()
             except Exception:
                 pass
@@ -2616,6 +2656,9 @@ class MapWidget(QWidget):
                     self._native_hud_right.raise_()
                 except Exception:
                     pass
+            tab = getattr(self, "_btn_camera_rail_show", None)
+            if tab is not None and tab.isVisible():
+                tab.raise_()
             obr = getattr(self, "_obstacle_radar", None)
             if obr is not None and obr.isVisible():
                 obr.raise_()
@@ -2768,6 +2811,95 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _camera_rail_visible_pref(self) -> bool:
+        try:
+            raw = QSettings(_QS_NS, _QS_APP).value(_KEY_CAMERA_RAIL_VISIBLE, True)
+            if raw in (False, "false", "False", "0", 0):
+                return False
+            return True
+        except Exception:
+            return True
+
+    def _camera_rail_may_appear(self) -> bool:
+        if not bool(getattr(self, "_last_link_connected", False)):
+            return False
+        if not bool(getattr(self, "_web_ready", False)):
+            return False
+        if self._plan_flight_layer_obscures_native_camera_ui():
+            return False
+        return True
+
+    def _set_camera_rail_panel_visible(self, visible: bool) -> None:
+        try:
+            QSettings(_QS_NS, _QS_APP).setValue(_KEY_CAMERA_RAIL_VISIBLE, bool(visible))
+        except Exception:
+            pass
+        self._sync_camera_rail_panel_visibility()
+        try:
+            QTimer.singleShot(0, self._layout_native_hud)
+        except Exception:
+            pass
+
+    def _sync_camera_rail_panel_visibility(self) -> None:
+        """Operator hide/show for the native `#cameraRail` (record, gimbal, OBSERVE)."""
+        show_rail = self._camera_rail_may_appear() and self._camera_rail_visible_pref()
+        tab = getattr(self, "_btn_camera_rail_show", None)
+        try:
+            if show_rail:
+                self._native_hud_right.show()
+                self._native_rail_layer.show()
+                if tab is not None:
+                    tab.hide()
+            else:
+                self._native_hud_right.hide()
+                self._native_rail_layer.hide()
+                if (
+                    tab is not None
+                    and self._camera_rail_may_appear()
+                    and not self._camera_rail_visible_pref()
+                ):
+                    tab.show()
+                    tab.raise_()
+                elif tab is not None:
+                    tab.hide()
+        except Exception:
+            pass
+
+    def _position_camera_rail_show_tab(self) -> None:
+        tab = getattr(self, "_btn_camera_rail_show", None)
+        if tab is None or not tab.isVisible():
+            return
+        try:
+            w = max(1, self._map_canvas.width())
+            tw = int(getattr(CamRailShowHandle, "WIDTH_PX", 36))
+            th = int(getattr(CamRailShowHandle, "HEIGHT_PX", 92))
+            pt = self._map_canvas.mapTo(
+                self._panel, QPoint(max(0, w - tw), int(_NATIVE_CAM_RAIL_TOP_PX))
+            )
+            tab.setGeometry(pt.x(), pt.y(), tw, th)
+            tab.raise_()
+        except Exception:
+            pass
+
+    def suppress_floating_overlays(self) -> dict[str, bool]:
+        """Hide map chrome that can paint over modal dialogs (e.g. camera-rail tab)."""
+        restore: dict[str, bool] = {}
+        tab = getattr(self, "_btn_camera_rail_show", None)
+        if tab is not None:
+            restore["show_tab"] = bool(tab.isVisible())
+            if restore["show_tab"]:
+                tab.hide()
+        return restore
+
+    def restore_floating_overlays(self, restore: dict[str, bool] | None) -> None:
+        if not restore:
+            return
+        if restore.get("show_tab"):
+            tab = getattr(self, "_btn_camera_rail_show", None)
+            if tab is not None:
+                tab.show()
+                self._position_camera_rail_show_tab()
+
     def _layout_native_hud(self) -> None:
         try:
             plan_on = self._plan_flight_layer_obscures_native_camera_ui()
@@ -2775,6 +2907,7 @@ class MapWidget(QWidget):
                 try:
                     self._native_rail_layer.hide()
                     self._native_hud_right.hide()
+                    self._btn_camera_rail_show.hide()
                     self._native_video_preview.hide()
                     self._native_minimap_wrap.hide()
                     self._btn_native_minimap_plus.hide()
@@ -2784,17 +2917,7 @@ class MapWidget(QWidget):
                 except Exception:
                     pass
             else:
-                try:
-                    if bool(getattr(self, "_last_link_connected", False)) and bool(
-                        getattr(self, "_web_ready", False)
-                    ):
-                        self._native_hud_right.show()
-                        self._native_rail_layer.show()
-                    else:
-                        self._native_hud_right.hide()
-                        self._native_rail_layer.hide()
-                except Exception:
-                    pass
+                self._sync_camera_rail_panel_visibility()
             w = max(1, self._map_canvas.width())
             h = max(1, self._map_canvas.height())
             rail = self._native_hud_right
@@ -2835,6 +2958,7 @@ class MapWidget(QWidget):
                 pt = self._map_canvas.mapTo(self._panel, QPoint(panel_x, panel_y))
                 ly.setGeometry(pt.x(), pt.y(), panel_w, panel_h)
             rail.setGeometry(inl, intop, content_w, content_h)
+            self._position_camera_rail_show_tab()
             # Git `#mapFooterHud { right: 10px; bottom: 2px }` — compass stays bottom-right of the
             # map even when `#cameraRail` is shown after MAVLink connect (rail is top-right; z-order
             # keeps HUD above the map tiles, not shoved left).
@@ -3664,6 +3788,7 @@ class MapWidget(QWidget):
                 pass
             try:
                 self._native_rail_layer.hide()
+                self._btn_camera_rail_show.hide()
             except Exception:
                 pass
             try:
@@ -3685,12 +3810,12 @@ class MapWidget(QWidget):
             if self._plan_flight_layer_obscures_native_camera_ui():
                 self._native_hud_right.hide()
                 self._native_rail_layer.hide()
-            else:
-                self._native_hud_right.show()
                 try:
-                    self._native_rail_layer.show()
+                    self._btn_camera_rail_show.hide()
                 except Exception:
                     pass
+            else:
+                self._sync_camera_rail_panel_visibility()
             if bool(getattr(self, "_web_ready", False)):
                 self._native_compass.show()
                 self._native_telemetry.show()
@@ -4805,14 +4930,11 @@ class MapWidget(QWidget):
                         try:
                             self._native_hud_right.hide()
                             self._native_rail_layer.hide()
+                            self._btn_camera_rail_show.hide()
                         except Exception:
                             pass
                     else:
-                        self._native_hud_right.show()
-                        try:
-                            self._native_rail_layer.show()
-                        except Exception:
-                            pass
+                        self._sync_camera_rail_panel_visibility()
                     # Layout + Z-order immediately: `resizeEvent` can run while the layer is still hidden,
                     # which skipped `ly.raise_()` when gated on `isVisible()` — map then stayed above the rail.
                     try:
@@ -4828,6 +4950,7 @@ class MapWidget(QWidget):
                         pass
                     try:
                         self._native_rail_layer.hide()
+                        self._btn_camera_rail_show.hide()
                     except Exception:
                         pass
             except Exception:
@@ -5526,6 +5649,33 @@ class MapWidget(QWidget):
         if "day" in keys:
             return ["day"]
         return [keys[0]]
+
+    def _gps_available_for_geo_pick(self) -> bool:
+        fix = int(getattr(self, "_gps_fix_type", 0) or 0)
+        if fix < 3:
+            return False
+        lat = self._lat
+        lon = self._lon
+        if lat is None or lon is None:
+            try:
+                pos = self.get_vehicle_display_position()
+                if pos is not None:
+                    lat, lon = float(pos[0]), float(pos[1])
+            except Exception:
+                lat, lon = None, None
+        return lat is not None and lon is not None
+
+    def _warn_gps_unavailable_for_pick(self) -> bool:
+        """Return True when pick should be blocked (GPS popup shown)."""
+        if self._gps_available_for_geo_pick():
+            return True
+        QMessageBox.warning(
+            self,
+            "GPS unavailable",
+            "GPS is not available (need 3D fix and vehicle position).\n\n"
+            "You cannot pick coordinates on the map or video until GPS is ready.",
+        )
+        return False
 
     def _start_video_decode_sources(self, vp, *, force: bool = False) -> None:
         """Start only the decoders needed for the current preview mode."""
@@ -6883,7 +7033,7 @@ class MapWidget(QWidget):
                         f"{detail}\n\n"
                         "Tips:\n"
                         "• Actual target: click roof / aim point on the building.\n"
-                        "• Fall of shot: click ground in the lower part of the video (not sky).\n"
+                        "• Impact Target: click ground in the lower part of the video (not sky).\n"
                         "• Wait for mavlink GPS fix (3D GPS helps).\n"
                         "• Pitch gimbal down if the scene is oblique.\n"
                         "• Pick on map if video geo is unreliable."
@@ -6963,6 +7113,14 @@ class MapWidget(QWidget):
         *,
         from_video: bool,
     ) -> None:
+        if from_video and not self._gps_available_for_geo_pick():
+            QMessageBox.warning(
+                dlg,
+                "GPS unavailable",
+                "GPS is not available (need 3D fix and vehicle position).\n\n"
+                "You cannot pick coordinates on video until GPS is ready.",
+            )
+            return
         self._end_dooaf_map_pick(restore_target_mode=True)
         self._dooaf_pick_dialog = dlg
         pick_role = DOOAF_ROLE_GUN if role == DOOAF_PICK_GUN else DOOAF_ROLE_INTENDED
@@ -7363,6 +7521,21 @@ class MapWidget(QWidget):
         capture_snapshot: bool = True,
     ) -> None:
         ts = datetime.now(timezone.utc).isoformat()
+        dooaf_role = self._current_observe_dooaf_role()
+        if kind in ("video_mark", "map_mark") and not self._warn_gps_unavailable_for_pick():
+            return
+        if (
+            dooaf_role == DOOAF_ROLE_IMPACT
+            and kind in ("video_mark", "map_mark")
+            and latest_mark(self._observations, DOOAF_ROLE_IMPACT) is not None
+        ):
+            QMessageBox.warning(
+                self,
+                "DOOAF",
+                "Only one Impact Target is allowed per session.\n\n"
+                "Press Reset to clear the previous mark and try again.",
+            )
+            return
         row: dict[str, object] = {
             "timestamp_utc": ts,
             "kind": str(kind),
@@ -7374,7 +7547,6 @@ class MapWidget(QWidget):
             "clip_path": str(clip_path or "").strip(),
         }
         row.update(self._observation_context())
-        dooaf_role = self._current_observe_dooaf_role()
         row["dooaf_role"] = dooaf_role
         self._enrich_observation_geo_reference(row)
         track_before = target_track_from_observations(self._observations)
@@ -7955,6 +8127,11 @@ class MapWidget(QWidget):
             def _open_folder() -> None:
                 try:
                     lines = [ln.strip() for ln in str(summary).splitlines() if ln.strip()]
+                    for ln in lines[1:]:
+                        p = Path(ln)
+                        if p.suffix.lower() in (".html", ".htm") and p.is_file():
+                            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
+                            return
                     folder = ""
                     for ln in lines[1:]:
                         p = Path(ln)
