@@ -1291,8 +1291,9 @@ class MapWidget(QWidget):
         self._video_swapped = False
         # Operator chose map-main (PiP video); do not auto-force fullscreen video on gaps/first frame.
         self._video_swap_user_map_main = False
-        # Split PiP → fullscreen: which source to fill the canvas (None = entire 2×2 grid).
+        # Split PiP → fullscreen: which source fills the canvas (None = auto primary stream).
         self._split_fullscreen_source_id: str | None = None
+        self._minimap_refresh_mono: float = 0.0
         # Last 2×2 composite geometry + per-slot source ids (for hit-testing PiP clicks).
         self._split_layout_snapshot: dict[str, object] | None = None
         # Last PiP paint: pixmap rect in label logical coords + source image size (fixes HiDPI hit-test).
@@ -2129,9 +2130,11 @@ class MapWidget(QWidget):
         self._video_swapped = not was_swapped
         if self._video_swapped:
             self._video_swap_user_map_main = False
+            self._prepare_video_swap_layout(entering_fullscreen=True)
             self._refresh_native_overlay_insets()
         else:
             self._video_swap_user_map_main = True
+            self._prepare_video_swap_layout(entering_fullscreen=False)
         QTimer.singleShot(0, self._apply_native_video_click_layout)
         # Native fullscreen toggle is fully handled in Qt. Keep Web map in map mode
         # to avoid duplicating/fragmenting video content in Web overlays/minimap grabs.
@@ -2230,6 +2233,64 @@ class MapWidget(QWidget):
             return
         # Remember operator intent even before the first thermal frame (avoid fullscreen 2×2 composite).
         self._split_fullscreen_source_id = str(sid)
+
+    def _pick_primary_split_source_id(self) -> str | None:
+        """Best live stream for fullscreen when the operator did not pick a quadrant."""
+        cache = getattr(self, "_split_last_images", None) or {}
+        try:
+            vp = getattr(self, "_video", None)
+            src_keys = list(vp.sources().keys()) if vp is not None else []
+        except Exception:
+            src_keys = []
+        ordered: list[str] = []
+        for sid in ("day", "thermal"):
+            if sid in src_keys or sid in cache:
+                ordered.append(sid)
+        for sid in src_keys:
+            if sid not in ordered:
+                ordered.append(str(sid))
+        for sid in cache.keys():
+            if sid not in ordered:
+                ordered.append(str(sid))
+        for sid in ordered:
+            im = cache.get(sid)
+            if isinstance(im, QImage) and not im.isNull() and im.width() > 0:
+                return str(sid)
+        if ordered:
+            return str(ordered[0])
+        lf = getattr(self, "_native_pip_last_source_frame", None)
+        if isinstance(lf, QImage) and not lf.isNull() and lf.width() > 0:
+            return "day"
+        return None
+
+    def _ensure_split_fullscreen_focus(self) -> str | None:
+        """Never stretch the 2×2 composite to fullscreen — pick one channel instead."""
+        focus = getattr(self, "_split_fullscreen_source_id", None)
+        if focus:
+            return str(focus)
+        picked = self._pick_primary_split_source_id()
+        if picked:
+            self._split_fullscreen_source_id = picked
+        return picked
+
+    def _prepare_video_swap_layout(self, *, entering_fullscreen: bool) -> None:
+        """Enter/leave map↔video swap: pick a single stream and repaint at display size."""
+        if entering_fullscreen and bool(getattr(self, "_video_split_enabled", False)):
+            self._ensure_split_fullscreen_focus()
+        try:
+            if entering_fullscreen:
+                if bool(getattr(self, "_video_split_enabled", False)):
+                    self._flush_split_preview_render()
+                else:
+                    im = getattr(self, "_native_pip_last_source_frame", None)
+                    if not isinstance(im, QImage) or im.isNull():
+                        im = getattr(self, "_native_video_last", None)
+                    if isinstance(im, QImage) and not im.isNull():
+                        self._render_native_video_preview(im)
+            else:
+                self._split_fullscreen_source_id = None
+        except Exception:
+            pass
 
     def _schedule_minimap_grab_refresh(self) -> None:
         try:
@@ -3080,7 +3141,7 @@ class MapWidget(QWidget):
                 self._btn_native_minimap_plus.show()
                 self._btn_native_minimap_minus.show()
                 try:
-                    QTimer.singleShot(0, self._update_native_minimap)
+                    QTimer.singleShot(0, lambda: self._schedule_native_minimap_refresh(force=True))
                 except Exception:
                     pass
             self._sync_native_map_vehicle_arrow_scale()
@@ -3260,6 +3321,27 @@ class MapWidget(QWidget):
         except Exception:
             return QImage()
 
+    def _schedule_native_minimap_refresh(self, *, force: bool = False) -> None:
+        """Throttle swap minimap grabs — full map `grab()` on every telemetry tick freezes video."""
+        try:
+            if not self._native_minimap_wrap.isVisible():
+                return
+        except Exception:
+            return
+        now = time.monotonic()
+        min_gap = 0.35
+        last = float(getattr(self, "_minimap_refresh_mono", 0.0) or 0.0)
+        if not force and now - last < min_gap:
+            try:
+                t = getattr(self, "_minimap_grab_refresh_timer", None)
+                if t is not None and not t.isActive():
+                    t.start(max(40, int((min_gap - (now - last)) * 1000)))
+            except Exception:
+                pass
+            return
+        self._minimap_refresh_mono = now
+        self._update_native_minimap()
+
     def _update_native_minimap(self) -> None:
         try:
             if not self._native_minimap_wrap.isVisible():
@@ -3419,7 +3501,13 @@ class MapWidget(QWidget):
                 if swap_on
                 else Qt.AspectRatioMode.KeepAspectRatio
             )
-            scaled_pm = pm.scaled(size, ar_mode, Qt.TransformationMode.FastTransformation)
+            scaled_pm = pm.scaled(
+                size,
+                ar_mode,
+                Qt.TransformationMode.SmoothTransformation
+                if swap_on
+                else Qt.TransformationMode.FastTransformation,
+            )
             self._native_video_preview.setPixmap(scaled_pm)
             # Record PiP layout for split-grid hit-testing (must match paint; pixmap().size() alone
             # mis-maps clicks on HiDPI — device pixels vs logical coords skew u,v into cell 0 / day).
@@ -3549,9 +3637,9 @@ class MapWidget(QWidget):
             return
         if not self._mini_video_pip_allowed():
             return
-        # Fullscreen from split: operator clicked a quadrant — stretch that channel only.
+        # Fullscreen: one live channel only — never upscale the PiP 2×2 composite.
         if bool(getattr(self, "_video_swapped", False)):
-            focus = getattr(self, "_split_fullscreen_source_id", None)
+            focus = self._ensure_split_fullscreen_focus()
             if focus:
                 cache0 = getattr(self, "_split_last_images", None) or {}
                 im0 = cache0.get(str(focus))
@@ -3561,11 +3649,26 @@ class MapWidget(QWidget):
                     except Exception:
                         pass
                     return
+                lf = getattr(self, "_native_pip_last_source_frame", None)
+                if isinstance(lf, QImage) and not lf.isNull() and lf.width() > 0:
+                    try:
+                        self._render_native_video_preview(lf)
+                    except Exception:
+                        pass
+                    return
                 try:
                     self._render_split_fullscreen_waiting(str(focus))
                 except Exception:
                     pass
                 return
+            lf = getattr(self, "_native_pip_last_source_frame", None)
+            if isinstance(lf, QImage) and not lf.isNull() and lf.width() > 0:
+                try:
+                    self._render_native_video_preview(lf)
+                except Exception:
+                    pass
+                return
+            return
         cache = getattr(self, "_split_last_images", None) or {}
         keys: list[str] = []
         try:
@@ -4664,7 +4767,7 @@ class MapWidget(QWidget):
                     nm.center_on_vehicle()
                 try:
                     if self._native_minimap_wrap.isVisible():
-                        self._update_native_minimap()
+                        self._schedule_native_minimap_refresh()
                 except Exception:
                     pass
                 return
@@ -6118,6 +6221,19 @@ class MapWidget(QWidget):
             self._split_last_images[str(source_id)] = img2
         except Exception:
             pass
+
+        if bool(getattr(self, "_video_swapped", False)):
+            focus = self._ensure_split_fullscreen_focus()
+            if focus and str(source_id) == str(focus):
+                last_render = float(getattr(self, "_video_ui_render_mono", 0.0) or 0.0)
+                if now_frame - last_render >= 0.04:
+                    self._video_ui_render_mono = now_frame
+                    try:
+                        self._render_native_video_preview(img2)
+                    except RuntimeError:
+                        pass
+                return
+
         try:
             self._schedule_split_preview_render()
         except RuntimeError:
@@ -7107,7 +7223,7 @@ class MapWidget(QWidget):
             # Keep fullscreen / swapped preview — do not restart PiP (that shrinks video).
             try:
                 self._layout_native_video_preview()
-                self._update_native_minimap()
+                self._schedule_native_minimap_refresh()
                 self._stack_native_overlays_above_tile_map()
             except Exception:
                 pass
@@ -8919,10 +9035,11 @@ class MapWidget(QWidget):
             except Exception:
                 self._video_swapped = False
             if not bool(getattr(self, "_video_swapped", False)):
-                self._split_fullscreen_source_id = None
+                self._prepare_video_swap_layout(entering_fullscreen=False)
                 self._video_swap_user_map_main = True
             else:
                 self._video_swap_user_map_main = False
+                self._prepare_video_swap_layout(entering_fullscreen=True)
             # Ignore Web swap state for rendering; native layer controls camera fullscreen.
             try:
                 self._run_js("setVideoSwapMode(false);")
@@ -9318,7 +9435,7 @@ class MapWidget(QWidget):
                     pass
         try:
             if self._native_minimap_wrap.isVisible():
-                self._update_native_minimap()
+                self._schedule_native_minimap_refresh()
         except Exception:
             pass
         if map_moved or first_fix:
