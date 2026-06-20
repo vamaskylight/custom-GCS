@@ -920,8 +920,16 @@ class RtspSource(QObject):
                 return True
         return False
 
-    def restart_decode(self, *, delay_ms: int = 0) -> None:
-        """Stop FFmpeg and open a fresh RTSP session (companion link-up / settings Apply)."""
+    def restart_decode(self, *, delay_ms: int = 0, force: bool = False) -> None:
+        """Stop FFmpeg and open a fresh RTSP session (settings Apply / explicit recovery only)."""
+        if not force and self.decode_recently_active(8.0):
+            try:
+                print(
+                    f"[VGCS:video] restart_decode skipped (decode active) url={self._url}"
+                )
+            except Exception:
+                pass
+            return
         now = time.monotonic()
         if now - float(self._restart_decode_last_mono or 0.0) < 4.0:
             return
@@ -954,6 +962,15 @@ class RtspSource(QObject):
     @Slot()
     def _deferred_companion_ffmpeg_restart(self) -> None:
         """Companion/SIYI: restart FFmpeg without stop()/start() tearing down preview state."""
+        if self.decode_recently_active(8.0):
+            try:
+                print(
+                    f"[VGCS:video] deferred companion restart skipped (decode active) "
+                    f"url={self._url}"
+                )
+            except Exception:
+                pass
+            return
         try:
             self._ffmpeg_stop.set()
         except Exception:
@@ -990,6 +1007,12 @@ class RtspSource(QObject):
         self.start()
 
     def start(self) -> None:
+        try:
+            t = self._restart_decode_timer
+            if t is not None and t.isActive():
+                t.stop()
+        except Exception:
+            pass
         if self._running:
             # Recover after a partial stop (decode thread exited but preview still "on").
             if self._prefer_ffmpeg_immediately():
