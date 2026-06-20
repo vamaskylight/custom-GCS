@@ -4584,7 +4584,7 @@ class MainWindow(QMainWindow):
             pass
         if not is_locked:
             try:
-                self._fields["rangefinder"].setText("— (click ⊕, then video)")
+                self._fields["rangefinder"].setText("— (tap ⌖ on PROXIMITY)")
                 self._apply_state_style(self._fields["rangefinder"], "idle")
             except Exception:
                 pass
@@ -4599,7 +4599,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self._map_widget.refresh_c13_lrf_from_companion(dist)
+            self._map_widget.set_companion_laser_range_m(dist)
         except Exception:
             pass
 
