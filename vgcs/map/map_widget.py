@@ -1274,6 +1274,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv: tuple[float, float] | None = None
         self._lrf_lock_distance_m: float | None = None
         self._lrf_lock_in_progress = False
+        self._lrf_lock_failed = False
         self._lrf_lock_bridge = _LrfLockBridge(self)
         self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
         self._lrf_lock_bridge.progress.connect(self._on_c13_lrf_lock_progress)
@@ -9645,7 +9646,8 @@ class MapWidget(QWidget):
             armed = bool(getattr(self, "_lrf_lock_armed", False))
             dist = getattr(self, "_lrf_lock_distance_m", None)
             in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
-            pending = in_progress or (
+            failed = bool(getattr(self, "_lrf_lock_failed", False))
+            pending = in_progress or failed or (
                 uv is not None and not self._c13_lrf_is_locked() and not armed
             )
             if uv is not None:
@@ -9654,7 +9656,8 @@ class MapWidget(QWidget):
                         x=float(uv[0]),
                         y=float(uv[1]),
                         distance_m=float(dist) if dist is not None else None,
-                        pending=pending,
+                        pending=pending and not failed,
+                        failed=failed,
                     )
                 )
             else:
@@ -9712,8 +9715,22 @@ class MapWidget(QWidget):
             return
         self._arm_c13_lrf_lock()
 
+    def _clear_lrf_failed_reticle(self) -> None:
+        if not bool(getattr(self, "_lrf_lock_failed", False)):
+            return
+        self._lrf_lock_failed = False
+        if not self._c13_lrf_is_locked():
+            self._lrf_lock_uv = None
+            self._lrf_lock_armed = True
+            try:
+                self._obstacle_radar.set_c13_lrf_armed(True)
+            except Exception:
+                pass
+        self._refresh_lrf_lock_overlay()
+
     def _arm_c13_lrf_lock(self) -> None:
         self._lrf_lock_armed = True
+        self._lrf_lock_failed = False
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
         try:
@@ -9726,6 +9743,7 @@ class MapWidget(QWidget):
 
     def _cancel_c13_lrf_arm(self) -> None:
         self._lrf_lock_armed = False
+        self._lrf_lock_failed = False
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
@@ -9738,6 +9756,7 @@ class MapWidget(QWidget):
 
     def _unlock_c13_lrf(self) -> None:
         self._lrf_lock_armed = False
+        self._lrf_lock_failed = False
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
@@ -9767,6 +9786,7 @@ class MapWidget(QWidget):
             self._cancel_c13_lrf_arm()
             return
         self._lrf_lock_armed = False
+        self._lrf_lock_failed = False
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = True
@@ -9799,19 +9819,22 @@ class MapWidget(QWidget):
         self._lrf_lock_in_progress = False
         try:
             if dist is None:
-                self._lrf_lock_uv = None
+                self._lrf_lock_uv = (float(u), float(v))
                 self._lrf_lock_distance_m = None
-                self._lrf_lock_armed = True
+                self._lrf_lock_failed = True
+                self._lrf_lock_armed = False
                 self._refresh_lrf_lock_overlay()
                 try:
                     self._obstacle_radar.set_c13_lrf_lock_failed()
                 except Exception:
                     pass
                 self._set_status(
-                    "LRF lock failed — tap ◎ in PROXIMITY and click target again"
+                    "LRF lock failed — click target again or tap ◎ to re-arm"
                 )
+                QTimer.singleShot(12000, self._clear_lrf_failed_reticle)
                 return
             dm = float(dist)
+            self._lrf_lock_failed = False
             self._lrf_lock_uv = (float(u), float(v))
             self._lrf_lock_distance_m = dm
             self._companion_laser_range_m = dm

@@ -40,6 +40,7 @@ class VideoOverlayLrfLock:
     y: float
     distance_m: float | None = None
     pending: bool = False
+    failed: bool = False
 
 
 class NativeVideoOverlayLayer(QWidget):
@@ -171,6 +172,7 @@ class NativeVideoOverlayLayer(QWidget):
                         else None
                     ),
                     pending=bool(lock.get("pending", False)),
+                    failed=bool(lock.get("failed", False)),
                 )
             except (TypeError, ValueError):
                 self._lrf_lock = None
@@ -279,6 +281,7 @@ class NativeVideoOverlayLayer(QWidget):
         *,
         distance_m: float | None,
         pending: bool,
+        failed: bool = False,
     ) -> None:
         """Tactical corner brackets + crosshair — distinct from AI detection (green) boxes."""
         span = max(28.0, min(cw, ch) * 0.14)
@@ -286,7 +289,10 @@ class NativeVideoOverlayLayer(QWidget):
         x0, y0 = cx - half, cy - half
         x1, y1 = cx + half, cy + half
         arm = max(10.0, span * 0.28)
-        if pending:
+        if failed:
+            color = QColor(248, 113, 113, 240)
+            fill = QColor(248, 113, 113, 28)
+        elif pending:
             color = QColor(251, 191, 36, 240)
             fill = QColor(251, 191, 36, 28)
         else:
@@ -314,7 +320,12 @@ class NativeVideoOverlayLayer(QWidget):
         p.setBrush(color)
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(int(cx) - 4, int(cy) - 4, 8, 8)
-        if distance_m is not None and not pending:
+        if failed:
+            if distance_m is not None:
+                caption = f"LRF {float(distance_m):.1f} m — failed"
+            else:
+                caption = "LRF failed — retry"
+        elif distance_m is not None and not pending:
             caption = f"LRF {float(distance_m):.1f} m"
         elif pending:
             if distance_m is not None:
@@ -380,6 +391,7 @@ class NativeVideoOverlayLayer(QWidget):
                 ch,
                 distance_m=lk.distance_m,
                 pending=bool(lk.pending),
+                failed=bool(lk.failed),
             )
 
         for det in self._detections:
