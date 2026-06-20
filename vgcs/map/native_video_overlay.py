@@ -32,6 +32,16 @@ class VideoOverlayMark:
     index: int = 0
 
 
+@dataclass(frozen=True)
+class VideoOverlayLrfLock:
+    """C13 LRF target lock — normalized point on video (0..1) + optional range label."""
+
+    x: float
+    y: float
+    distance_m: float | None = None
+    pending: bool = False
+
+
 class NativeVideoOverlayLayer(QWidget):
     """
     Child of ``QLabel`` video preview — draws detection boxes/labels and manual video marks.
@@ -50,22 +60,8 @@ class NativeVideoOverlayLayer(QWidget):
         self._video_marks: list[VideoOverlayMark] = []
         # Normalized segments (x1,y1,x2,y2) in widget coords + ground distance label.
         self._measure_segments: list[tuple[float, float, float, float, str]] = []
-        self._lrf_lock: tuple[float, float, float | None, bool] | None = None
-
-    def set_lrf_lock(
-        self,
-        x_norm: float,
-        y_norm: float,
-        distance_m: float | None = None,
-        *,
-        external: bool = False,
-    ) -> None:
-        self._lrf_lock = (float(x_norm), float(y_norm), distance_m, bool(external))
-        self.update()
-
-    def clear_lrf_lock(self) -> None:
-        self._lrf_lock = None
-        self.update()
+        self._lrf_lock: VideoOverlayLrfLock | None = None
+        self._lrf_armed_hint = False
 
     def set_content_rect(self, rect: dict[str, float] | None) -> None:
         self._content_rect = dict(rect) if rect else None
@@ -156,11 +152,45 @@ class NativeVideoOverlayLayer(QWidget):
         self._video_marks.clear()
         self.update()
 
+    def set_lrf_lock(
+        self,
+        lock: VideoOverlayLrfLock | dict[str, object] | None,
+    ) -> None:
+        if lock is None:
+            self._lrf_lock = None
+        elif isinstance(lock, VideoOverlayLrfLock):
+            self._lrf_lock = lock
+        else:
+            try:
+                self._lrf_lock = VideoOverlayLrfLock(
+                    x=float(lock.get("x", 0)),
+                    y=float(lock.get("y", 0)),
+                    distance_m=(
+                        float(lock["distance_m"])
+                        if lock.get("distance_m") is not None
+                        else None
+                    ),
+                    pending=bool(lock.get("pending", False)),
+                )
+            except (TypeError, ValueError):
+                self._lrf_lock = None
+        self.update()
+
+    def set_lrf_armed_hint(self, armed: bool) -> None:
+        self._lrf_armed_hint = bool(armed)
+        self.update()
+
+    def clear_lrf_overlay(self) -> None:
+        self._lrf_lock = None
+        self._lrf_armed_hint = False
+        self.update()
+
     def clear_all(self) -> None:
         self._detections.clear()
         self._video_marks.clear()
         self._measure_segments.clear()
         self._lrf_lock = None
+        self._lrf_armed_hint = False
         self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -238,6 +268,73 @@ class NativeVideoOverlayLayer(QWidget):
         ph = float(cr.get("ph", h))
         return left, top, max(1.0, pw), max(1.0, ph)
 
+    def _draw_lrf_lock_reticle(
+        self,
+        p: QPainter,
+        cx: float,
+        cy: float,
+        ct: float,
+        cw: float,
+        ch: float,
+        *,
+        distance_m: float | None,
+        pending: bool,
+    ) -> None:
+        """Tactical corner brackets + crosshair — distinct from AI detection (green) boxes."""
+        span = max(28.0, min(cw, ch) * 0.14)
+        half = span / 2.0
+        x0, y0 = cx - half, cy - half
+        x1, y1 = cx + half, cy + half
+        arm = max(10.0, span * 0.28)
+        if pending:
+            color = QColor(251, 191, 36, 240)
+            fill = QColor(251, 191, 36, 28)
+        else:
+            color = QColor(56, 189, 248, 245)
+            fill = QColor(56, 189, 248, 40)
+        pen = QPen(color, 3)
+        p.setPen(pen)
+        p.setBrush(fill)
+        p.drawRect(int(x0), int(y0), int(span), int(span))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for ax, ay, dx, dy in (
+            (x0, y0, arm, 0),
+            (x0, y0, 0, arm),
+            (x1, y0, -arm, 0),
+            (x1, y0, 0, arm),
+            (x0, y1, arm, 0),
+            (x0, y1, 0, -arm),
+            (x1, y1, -arm, 0),
+            (x1, y1, 0, -arm),
+        ):
+            p.drawLine(int(ax), int(ay), int(ax + dx), int(ay + dy))
+        p.setPen(QPen(color, 2))
+        p.drawLine(int(cx - half - 6), int(cy), int(cx + half + 6), int(cy))
+        p.drawLine(int(cx), int(cy - half - 6), int(cx), int(cy + half + 6))
+        p.setBrush(color)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(int(cx) - 4, int(cy) - 4, 8, 8)
+        if distance_m is not None and not pending:
+            caption = f"LRF {float(distance_m):.1f} m"
+        elif pending:
+            caption = "LRF locking…"
+        else:
+            caption = "LRF"
+        font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        tw = metrics.horizontalAdvance(caption) + 12
+        th = metrics.height() + 8
+        tx = int(cx - tw / 2)
+        ty = int(y1 + 6)
+        if ty + th > ct + ch - 4:
+            ty = int(y0 - th - 6)
+        p.fillRect(tx, ty, tw, th, QColor(8, 20, 36, 215))
+        p.setPen(QPen(color, 2))
+        p.drawRect(tx, ty, tw, th)
+        p.setPen(QColor(224, 242, 254))
+        p.drawText(tx + 6, ty + metrics.ascent() + 4, caption)
+
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
         if (
@@ -245,11 +342,42 @@ class NativeVideoOverlayLayer(QWidget):
             and not self._video_marks
             and not self._measure_segments
             and self._lrf_lock is None
+            and not self._lrf_armed_hint
         ):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         cl, ct, cw, ch = self._content_qrect()
+
+        if self._lrf_armed_hint and self._lrf_lock is None:
+            banner = "Click target on video to lock LRF range"
+            font = QFont("Segoe UI", 11, QFont.Weight.Bold)
+            p.setFont(font)
+            metrics = p.fontMetrics()
+            tw = metrics.horizontalAdvance(banner) + 20
+            th = metrics.height() + 12
+            tx = int(cl + (cw - tw) / 2.0)
+            ty = int(ct + 8)
+            p.fillRect(tx, ty, tw, th, QColor(8, 20, 36, 210))
+            p.setPen(QPen(QColor(251, 191, 36, 230), 2))
+            p.drawRect(tx, ty, tw, th)
+            p.setPen(QColor(255, 236, 179))
+            p.drawText(tx + 10, ty + metrics.ascent() + 6, banner)
+
+        if self._lrf_lock is not None:
+            lk = self._lrf_lock
+            cx = cl + float(lk.x) * cw
+            cy = ct + float(lk.y) * ch
+            self._draw_lrf_lock_reticle(
+                p,
+                cx,
+                cy,
+                ct,
+                cw,
+                ch,
+                distance_m=lk.distance_m,
+                pending=bool(lk.pending),
+            )
 
         for det in self._detections:
             bx = cl + det.x * cw
@@ -322,44 +450,3 @@ class NativeVideoOverlayLayer(QWidget):
                 p.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
                 p.setPen(QColor(255, 255, 255))
                 p.drawText(tx + 4, ty + metrics.ascent() + 2, label)
-
-        if self._lrf_lock is not None:
-            xn, yn, dist_m, external = self._lrf_lock
-            cx = cl + float(xn) * cw
-            cy = ct + float(yn) * ch
-            box = 44.0
-            bx = cx - box / 2.0
-            by = cy - box / 2.0
-            if external:
-                pen = QPen(QColor(251, 191, 36, 240), 2, Qt.PenStyle.DashLine)
-                fill = QColor(251, 191, 36, 28)
-                caption = "RC lock"
-            else:
-                pen = QPen(QColor(56, 189, 248, 245), 3)
-                fill = QColor(56, 189, 248, 36)
-                caption = "LRF lock"
-            p.setPen(pen)
-            p.setBrush(fill)
-            p.drawRect(int(bx), int(by), int(box), int(box))
-            p.setPen(pen)
-            p.drawLine(int(cx - 22), int(cy), int(cx + 22), int(cy))
-            p.drawLine(int(cx), int(cy - 22), int(cx), int(cy + 22))
-            p.setPen(QPen(pen.color(), 2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(int(cx) - 6, int(cy) - 6, 12, 12)
-            lines = [caption]
-            if dist_m is not None and dist_m >= 0:
-                lines.append(f"{float(dist_m):.1f} m")
-            font = QFont("Segoe UI", 9, QFont.Weight.Bold)
-            p.setFont(font)
-            metrics = p.fontMetrics()
-            tw = max(metrics.horizontalAdvance(line) for line in lines) + 10
-            th = metrics.height() * len(lines) + 8
-            tx = int(cx - tw / 2)
-            ty = max(int(ct), int(by) - th - 4)
-            p.fillRect(tx, ty, int(tw), int(th), QColor(0, 0, 0, 205))
-            p.setPen(QColor(224, 242, 254))
-            y_text = ty + 4 + metrics.ascent()
-            for line in lines:
-                p.drawText(tx + 5, y_text, line)
-                y_text += metrics.height()

@@ -65,6 +65,7 @@ from PySide6.QtGui import (
 from vgcs.map.native_video_overlay import (
     NativeVideoOverlayLayer,
     VideoOverlayDetection,
+    VideoOverlayLrfLock,
     VideoOverlayMark,
 )
 from vgcs.map.dooaf_setup_dialog import (
@@ -855,7 +856,7 @@ class _ObservationSnapshotBridge(QObject):
 
 
 class _LrfLockBridge(QObject):
-    finished = Signal(object)  # float | None — locked range in metres
+    finished = Signal(object, float, float)  # distance_m | None, u, v
 
 
 class _LrfLockTask(QRunnable):
@@ -877,7 +878,7 @@ class _LrfLockTask(QRunnable):
         except Exception as exc:
             print(f"[VGCS:lrf] lock failed: {exc}")
         try:
-            self._bridge.finished.emit(dist)
+            self._bridge.finished.emit(dist, self._u, self._v)
         except Exception:
             pass
 
@@ -1245,7 +1246,8 @@ class MapWidget(QWidget):
         self._video_preview_stall_recovery_active = False
         self._camera_control = NoopCameraControl()
         self._lrf_lock_armed = False
-        self._lrf_lock_pick_norm: tuple[float, float] | None = None
+        self._lrf_lock_uv: tuple[float, float] | None = None
+        self._lrf_lock_distance_m: float | None = None
         self._lrf_lock_bridge = _LrfLockBridge(self)
         self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
         self._obs_mark_mode = False
@@ -2791,11 +2793,7 @@ class MapWidget(QWidget):
                 ov.raise_()
             # Target ON (map-main PiP only): lift video above the map so PiP clicks reach the preview.
             # Fullscreen swap keeps the camera rail above video — do not raise video over the rail.
-            if (
-                self._observation_mark_active()
-                or bool(getattr(self, "_lrf_lock_armed", False))
-                or self._c13_lrf_is_locked()
-            ) and preview_on and not swapped:
+            if (self._observation_mark_active() or bool(getattr(self, "_lrf_lock_armed", False))) and preview_on and not swapped:
                 pv = getattr(self, "_native_video_preview", None)
                 if pv is not None and pv.isVisible():
                     pv.raise_()
@@ -3520,6 +3518,10 @@ class MapWidget(QWidget):
                 ly.raise_()
             else:
                 ly.hide()
+            if getattr(self, "_lrf_lock_uv", None) is not None or bool(
+                getattr(self, "_lrf_lock_armed", False)
+            ):
+                ly.update()
         except Exception:
             pass
 
@@ -3945,10 +3947,13 @@ class MapWidget(QWidget):
                 self._obstacle_radar.hide()
                 self._obstacle_radar.notify_link_connected(False)
                 self._lrf_lock_armed = False
+                self._lrf_lock_uv = None
+                self._lrf_lock_distance_m = None
                 cc = getattr(self, "_camera_control", None)
                 unlock = getattr(cc, "unlock_lrf", None)
                 if callable(unlock):
                     unlock()
+                self._refresh_lrf_lock_overlay()
             except Exception:
                 pass
             # Companion RTSP (192.168.144.x) is independent of MAVLink — keep FFmpeg running;
@@ -6068,6 +6073,9 @@ class MapWidget(QWidget):
             self._ai_timer.stop()
         try:
             self._native_video_overlay.clear_all()
+            self._lrf_lock_uv = None
+            self._lrf_lock_distance_m = None
+            self._lrf_lock_armed = False
             self._native_video_overlay.hide()
         except Exception:
             pass
@@ -8217,7 +8225,10 @@ class MapWidget(QWidget):
         except Exception:
             pass
         try:
-            self._native_video_overlay.clear_all()
+            self._native_video_overlay.clear_video_marks()
+            self._native_video_overlay.clear_detections()
+            self._native_video_overlay.set_target_measure_segments([])
+            self._refresh_lrf_lock_overlay()
         except Exception:
             pass
         self._run_js("if (window.clearObservationMarks) clearObservationMarks();")
@@ -9596,16 +9607,47 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _refresh_lrf_lock_overlay(self) -> None:
+        """Draw cyan LRF reticle on video at the VGCS-locked target point."""
+        try:
+            ly = self._native_video_overlay
+        except AttributeError:
+            return
+        try:
+            uv = getattr(self, "_lrf_lock_uv", None)
+            armed = bool(getattr(self, "_lrf_lock_armed", False))
+            dist = getattr(self, "_lrf_lock_distance_m", None)
+            pending = uv is not None and dist is None and not armed
+            if uv is not None:
+                ly.set_lrf_lock(
+                    VideoOverlayLrfLock(
+                        x=float(uv[0]),
+                        y=float(uv[1]),
+                        distance_m=float(dist) if dist is not None else None,
+                        pending=pending,
+                    )
+                )
+            else:
+                ly.set_lrf_lock(None)
+            ly.set_lrf_armed_hint(armed and uv is None)
+            if bool(getattr(self, "_video_preview_enabled", False)):
+                ly.show()
+                ly.raise_()
+            self._sync_native_video_overlay()
+        except Exception:
+            pass
+
     def set_companion_laser_range_m(self, distance_m: float | None) -> None:
         """C13 TOP laser rangefinder (Skydroid SLR); updates PROXIMITY Range when target is locked."""
         try:
             self._companion_laser_range_m = float(distance_m) if distance_m is not None else None
+            if distance_m is not None and getattr(self, "_lrf_lock_uv", None) is not None:
+                self._lrf_lock_distance_m = float(distance_m)
+                self._refresh_lrf_lock_overlay()
         except (TypeError, ValueError):
             self._companion_laser_range_m = None
         try:
             self._obstacle_radar.set_companion_lrf_range_m(distance_m)
-            if distance_m is not None:
-                self.sync_c13_lrf_video_overlay()
             if bool(getattr(self, "_last_link_connected", False)) and bool(
                 getattr(self, "_web_ready", False)
             ):
@@ -9631,62 +9673,6 @@ class MapWidget(QWidget):
         fn = getattr(cc, "is_lrf_locked", None)
         return bool(fn()) if callable(fn) else False
 
-    def refresh_c13_lrf_from_companion(self, distance_m: float) -> None:
-        """Sync proximity panel + video reticle when C13 LRF is locked (VGCS or RC)."""
-        try:
-            dm = float(distance_m)
-        except (TypeError, ValueError):
-            return
-        self._companion_laser_range_m = dm
-        try:
-            self._obstacle_radar.set_c13_lrf_locked(dm)
-        except Exception:
-            pass
-        self.sync_c13_lrf_video_overlay()
-
-    def sync_c13_lrf_video_overlay(self) -> None:
-        """Draw LRF lock reticle on video (VGCS pick or RC/companion track)."""
-        try:
-            ly = self._native_video_overlay
-        except Exception:
-            return
-        cc = getattr(self, "_camera_control", None)
-        if not self._c13_lrf_is_locked():
-            ly.clear_lrf_lock()
-            return
-        norm = self._lrf_lock_pick_norm
-        external = False
-        if cc is not None:
-            fn = getattr(cc, "get_lrf_lock_video_norm", None)
-            if callable(fn):
-                adapter_norm = fn()
-                if adapter_norm is not None:
-                    norm = adapter_norm
-            ext_fn = getattr(cc, "is_lrf_lock_external", None)
-            if callable(ext_fn):
-                external = bool(ext_fn())
-        if norm is None:
-            ly.clear_lrf_lock()
-            return
-        dist = getattr(self, "_companion_laser_range_m", None)
-        if dist is None and cc is not None:
-            getter = getattr(cc, "get_laser_range_m", None)
-            if callable(getter):
-                try:
-                    dist = getter()
-                except Exception:
-                    dist = None
-        ly.set_lrf_lock(
-            float(norm[0]),
-            float(norm[1]),
-            float(dist) if dist is not None else None,
-            external=external,
-        )
-        if bool(getattr(self, "_video_preview_enabled", False)):
-            ly.show()
-            ly.raise_()
-        self._sync_native_video_overlay()
-
     def _on_c13_lrf_icon_clicked(self) -> None:
         if self._c13_lrf_is_locked():
             self._unlock_c13_lrf()
@@ -9698,24 +9684,31 @@ class MapWidget(QWidget):
 
     def _arm_c13_lrf_lock(self) -> None:
         self._lrf_lock_armed = True
+        self._lrf_lock_uv = None
+        self._lrf_lock_distance_m = None
         try:
             self._obstacle_radar.set_c13_lrf_armed(True)
         except Exception:
             pass
+        self._refresh_lrf_lock_overlay()
         self._set_status("Click target on video to lock C13 laser range")
         QTimer.singleShot(0, self._raise_flight_hud_above_video)
 
     def _cancel_c13_lrf_arm(self) -> None:
         self._lrf_lock_armed = False
+        self._lrf_lock_uv = None
+        self._lrf_lock_distance_m = None
         try:
             self._obstacle_radar.set_c13_lrf_armed(False)
         except Exception:
             pass
+        self._refresh_lrf_lock_overlay()
         self._set_status("C13 LRF lock cancelled")
 
     def _unlock_c13_lrf(self) -> None:
         self._lrf_lock_armed = False
-        self._lrf_lock_pick_norm = None
+        self._lrf_lock_uv = None
+        self._lrf_lock_distance_m = None
         cc = getattr(self, "_camera_control", None)
         try:
             unlock = getattr(cc, "unlock_lrf", None)
@@ -9731,10 +9724,7 @@ class MapWidget(QWidget):
             self._companion_laser_range_m = None
         except Exception:
             pass
-        try:
-            self._native_video_overlay.clear_lrf_lock()
-        except Exception:
-            pass
+        self._refresh_lrf_lock_overlay()
         self._set_status("C13 LRF target unlocked")
 
     def _begin_c13_lrf_video_lock(self, u: float, v: float) -> None:
@@ -9745,31 +9735,36 @@ class MapWidget(QWidget):
             self._cancel_c13_lrf_arm()
             return
         self._lrf_lock_armed = False
-        self._lrf_lock_pick_norm = (float(u), float(v))
+        self._lrf_lock_uv = (float(u), float(v))
+        self._lrf_lock_distance_m = None
+        self._refresh_lrf_lock_overlay()
         self._set_status("Locking LRF target…")
         task = _LrfLockTask(cc, u, v, self._lrf_lock_bridge)
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(task)
 
-    def _on_c13_lrf_lock_finished(self, dist: object) -> None:
+    def _on_c13_lrf_lock_finished(self, dist: object, u: float, v: float) -> None:
         try:
             if dist is None:
-                self._lrf_lock_pick_norm = None
+                self._lrf_lock_uv = None
+                self._lrf_lock_distance_m = None
+                self._refresh_lrf_lock_overlay()
                 self._obstacle_radar.set_c13_lrf_armed(False)
                 self._set_status("LRF lock failed — try another point on the target")
-                try:
-                    self._native_video_overlay.clear_lrf_lock()
-                except Exception:
-                    pass
                 return
             dm = float(dist)
+            self._lrf_lock_uv = (float(u), float(v))
+            self._lrf_lock_distance_m = dm
             self._companion_laser_range_m = dm
             self._obstacle_radar.set_c13_lrf_locked(dm)
-            self._set_status(f"C13 LRF locked · {dm:.1f} m")
-            print(f"[VGCS:lrf] locked range={dm:.1f} m")
-            self.sync_c13_lrf_video_overlay()
+            self._refresh_lrf_lock_overlay()
+            self._set_status(f"C13 LRF locked · {dm:.1f} m — cyan box on video")
+            print(f"[VGCS:lrf] locked u={u:.3f} v={v:.3f} range={dm:.1f} m")
         except Exception as exc:
             print(f"[VGCS:lrf] lock result error: {exc}")
+            self._lrf_lock_uv = None
+            self._lrf_lock_distance_m = None
+            self._refresh_lrf_lock_overlay()
             self._set_status("LRF lock failed")
             try:
                 self._obstacle_radar.set_c13_lrf_armed(False)

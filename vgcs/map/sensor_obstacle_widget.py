@@ -428,12 +428,12 @@ class _LrfRangeBlock(QWidget):
         self._stack = QStackedWidget()
         self._stack.setStyleSheet("background: transparent; border: none;")
 
-        self._btn = QPushButton("⊕")
+        self._btn = QPushButton("⌖")
         self._btn.setObjectName("lrfLockBtn")
         self._btn.setCheckable(True)
         self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn.setStyleSheet(_LRF_BTN_QSS)
-        self._btn.setToolTip("Lock C13 laser range on a video target")
+        self._btn.setToolTip("Lock C13 laser range — click, then pick target on video")
         self._btn.clicked.connect(self.lock_clicked.emit)
         btn_wrap = QWidget()
         btn_wrap.setStyleSheet("background: transparent; border: none;")
@@ -494,9 +494,9 @@ class _LrfRangeBlock(QWidget):
         self._c13_mode = True
         self._c13_state = "idle"
         self._btn.setChecked(False)
-        self._btn.setText("⊕")
-        self._btn.setToolTip("Lock C13 laser range on a video target")
-        self._sub.setText("C13 LRF")
+        self._btn.setText("⌖")
+        self._btn.setToolTip("Lock C13 laser range — click, then pick target on video")
+        self._sub.setText("C13 LRF · tap to lock")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(0)
 
@@ -516,7 +516,7 @@ class _LrfRangeBlock(QWidget):
         self._btn.setChecked(False)
         self._val.setText(f"{float(distance_m):.1f} m")
         self._val.setStyleSheet(_VALUE_ALERT_QSS if alert else _VALUE_QSS)
-        self._sub.setText("C13 LRF · locked")
+        self._sub.setText("C13 LRF · locked — tap value to unlock")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(1)
 
