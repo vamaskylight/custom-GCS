@@ -124,7 +124,12 @@ def test_cam_zoom_maps_to_dzm_not_legacy() -> None:
 
 
 def test_build_slr_query_matches_protocal_doc() -> None:
-    from vgcs.skydroid.protocol import build_slr_query, decode_slr_distance_m, parse_top_frame
+    from vgcs.skydroid.protocol import (
+        build_slr_query,
+        decode_slr_distance_m,
+        parse_slr_distance_from_payload,
+        parse_top_frame,
+    )
 
     assert build_slr_query() == b"#TPUD2rSLR0055"
     dec = parse_top_frame(b"#TPUD4rSLR0005BC")
@@ -133,7 +138,9 @@ def test_build_slr_query_matches_protocal_doc() -> None:
     assert decode_slr_distance_m("0005") is None  # below 5 m minimum (0x32 dm)
     assert decode_slr_distance_m("0032") == 5.0
     assert decode_slr_distance_m("0064") == 10.0
+    assert decode_slr_distance_m("0140") == 32.0
     assert decode_slr_distance_m("2710") == 1000.0
+    assert parse_slr_distance_from_payload(b"#TPUD4rSLR0140BC") == 32.0
 
 
 def test_build_got_and_sum_match_protocal_doc() -> None:

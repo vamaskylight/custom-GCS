@@ -194,6 +194,19 @@ def decode_slr_distance_m(data_field: str) -> float | None:
     return float(dm) / 10.0
 
 
+def parse_slr_distance_from_payload(payload: bytes) -> float | None:
+    """Parse SLR range (metres) from a TOP reply frame, or None."""
+    dec = parse_top_frame(payload)
+    if dec is None or dec.command != "SLR":
+        return None
+    data = str(dec.params.get("slr_data") or "")
+    if not data and dec.raw:
+        m = re.search(r"SLR([0-9A-Fa-f]{4})", dec.raw, re.IGNORECASE)
+        if m:
+            data = m.group(1)
+    return decode_slr_distance_m(data)
+
+
 def build_pod_camera_command(
     tag: str,
     data: str,

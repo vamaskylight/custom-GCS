@@ -409,10 +409,22 @@ class SkydroidCameraControl:
         except Exception:
             return False
 
-    def lock_lrf_at_video_norm(self, u: float, v: float) -> float | None:
-        """Lock LRF on video target (normalized 0..1 coords on 1280×720 frame)."""
+    def lock_lrf_at_video_norm(
+        self,
+        u: float,
+        v: float,
+        *,
+        frame_w: int = 1280,
+        frame_h: int = 720,
+    ) -> float | None:
+        """Lock LRF on video target (normalized 0..1 coords on companion video frame)."""
         try:
-            return self._adapter.lock_lrf_target_at_norm(float(u), float(v))
+            return self._adapter.lock_lrf_target_at_norm(
+                float(u),
+                float(v),
+                frame_w=int(frame_w),
+                frame_h=int(frame_h),
+            )
         except Exception:
             return None
 

@@ -15,6 +15,7 @@ from vgcs.skydroid.protocol import (
     build_zoom_command_burst,
     decode_slr_distance_m,
     extract_attitude_deg,
+    parse_slr_distance_from_payload,
     parse_top_frame,
 )
 from vgcs.skydroid.transport import TopUdpTransport
@@ -139,7 +140,7 @@ class SkydroidTopUdpAdapter:
         frame_w: int = 1280,
         frame_h: int = 720,
     ) -> float | None:
-        """GOT + SUM track confirm at video pixel, then read SLR range (blocking — run off UI thread)."""
+        """GOT + SUM track confirm at video pixel, then read SLR after tracker settles."""
         if not self.gimbal_telemetry_ok():
             return None
         fw = max(1, int(frame_w))
@@ -149,42 +150,99 @@ class SkydroidTopUdpAdapter:
         active_port = int(self._transport._port)
         dist_m: float | None = None
         try:
+            with self._status_lock:
+                self._laser_range_m = None
+                self._laser_range_mono = 0.0
+
+            baseline_m = self._query_slr_distance_m(log=False)
+            print(
+                f"[VGCS:lrf] lock start px=({x_px},{y_px}) baseline={baseline_m}"
+            )
+
+            # Reset any RC/previous track before selecting a new target.
+            stop = build_sum_track(confirm=False)
+            self._transport.send_and_receive(
+                stop, expect_reply=False, log=True, timeout_s=0.08
+            )
+            time.sleep(0.08)
+
             got = build_got_target(x_px, y_px, frame_w=fw, frame_h=fh)
             self._transport.send_and_receive(
                 got, expect_reply=False, log=True, timeout_s=0.08
             )
-            time.sleep(0.06)
+            time.sleep(0.1)
             confirm = build_sum_track(confirm=True)
             self._transport.send_and_receive(
                 confirm, expect_reply=False, log=True, timeout_s=0.08
             )
-            time.sleep(0.12)
-            for _ in range(6):
-                frame = build_slr_query()
-                reply = self._transport.send_and_receive(
-                    frame, expect_reply=True, log=True, timeout_s=0.45
-                )
-                if reply:
-                    self._maybe_update_slr(reply)
-                with self._status_lock:
-                    cand = self._laser_range_m
-                if cand is not None:
-                    dist_m = float(cand)
-                    break
-                time.sleep(0.1)
+
+            # Tracker/gimbal must slew onto the pick before SLR (along boresight).
+            samples: list[float] = []
+            deadline = time.monotonic() + 4.5
+            while time.monotonic() < deadline:
+                time.sleep(0.35)
+                reading = self._query_slr_distance_m(log=True)
+                if reading is None:
+                    continue
+                samples.append(float(reading))
+                print(f"[VGCS:lrf] SLR sample {reading:.1f} m (n={len(samples)})")
+                if baseline_m is not None and abs(reading - baseline_m) >= 2.0:
+                    if len(samples) >= 2 and abs(samples[-1] - samples[-2]) < 1.0:
+                        dist_m = float(samples[-1])
+                        break
+                if len(samples) >= 3:
+                    tail = samples[-3:]
+                    if max(tail) - min(tail) < 0.8:
+                        dist_m = sum(tail) / len(tail)
+                        break
+
+            if dist_m is None and samples:
+                dist_m = float(samples[-1])
+
             with self._status_lock:
                 if dist_m is not None:
                     self._lrf_locked = True
                     self._lrf_lock_x = x_px
                     self._lrf_lock_y = y_px
+                    self._laser_range_m = float(dist_m)
+                    self._laser_range_mono = time.monotonic()
                 else:
                     self._lrf_locked = False
                     self._laser_range_m = None
                     self._laser_range_mono = 0.0
+            if dist_m is not None:
+                print(f"[VGCS:lrf] lock ok range={dist_m:.1f} m (samples={len(samples)})")
+            else:
+                print("[VGCS:lrf] lock failed — no SLR samples")
             return dist_m
-        except Exception:
+        except Exception as exc:
+            print(f"[VGCS:lrf] lock exception: {exc}")
             with self._status_lock:
                 self._lrf_locked = False
+            return None
+        finally:
+            self._transport._port = active_port
+
+    def _query_slr_distance_m(self, *, log: bool = False) -> float | None:
+        """Single SLR read — returns distance parsed from this reply only (no stale cache)."""
+        active_port = int(self._transport._port)
+        try:
+            frame = build_slr_query()
+            reply = self._transport.send_and_receive(
+                frame,
+                expect_reply=True,
+                log=log,
+                timeout_s=0.5,
+            )
+            if not reply:
+                return None
+            dist_m = parse_slr_distance_from_payload(reply)
+            if dist_m is not None:
+                with self._status_lock:
+                    self._laser_range_m = float(dist_m)
+                    self._laser_range_mono = time.monotonic()
+            return dist_m
+        except Exception:
             return None
         finally:
             self._transport._port = active_port
@@ -519,32 +577,10 @@ class SkydroidTopUdpAdapter:
         """C13 single laser rangefinding (PROTOCAL §4.22 SLR read on D-class)."""
         if not self.gimbal_telemetry_ok():
             return
-        active_port = int(self._transport._port)
-        try:
-            frame = build_slr_query()
-            reply = self._transport.send_and_receive(
-                frame,
-                expect_reply=True,
-                log=False,
-                timeout_s=0.35,
-            )
-            if reply:
-                self._maybe_update_slr(reply)
-        except Exception:
-            pass
-        finally:
-            self._transport._port = active_port
+        self._query_slr_distance_m(log=False)
 
     def _maybe_update_slr(self, payload: bytes) -> None:
-        dec = parse_top_frame(payload)
-        if dec is None or dec.command != "SLR":
-            return
-        data = str(dec.params.get("slr_data") or "")
-        if not data and dec.raw:
-            m = re.search(r"SLR([0-9A-Fa-f]{4})", dec.raw, re.IGNORECASE)
-            if m:
-                data = m.group(1)
-        dist_m = decode_slr_distance_m(data)
+        dist_m = parse_slr_distance_from_payload(payload)
         if dist_m is None:
             return
         with self._status_lock:
