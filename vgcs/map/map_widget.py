@@ -1245,6 +1245,7 @@ class MapWidget(QWidget):
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
         self._rangefinder_down_m: float | None = None
+        self._companion_laser_range_m: float | None = None
         self._vehicle_alt_msl_m: float | None = None
         self._vehicle_roll_deg: float | None = None
         self._vehicle_pitch_deg: float | None = None
@@ -9535,6 +9536,22 @@ class MapWidget(QWidget):
             pass
         try:
             self._obstacle_radar.set_distance_sensor(payload)
+            if bool(getattr(self, "_last_link_connected", False)) and bool(
+                getattr(self, "_web_ready", False)
+            ):
+                self._obstacle_radar.show()
+                QTimer.singleShot(0, self._layout_native_hud)
+        except Exception:
+            pass
+
+    def set_companion_laser_range_m(self, distance_m: float | None) -> None:
+        """C13 TOP laser rangefinder (Skydroid SLR); updates PROXIMITY Range + dashboard LRF."""
+        try:
+            self._companion_laser_range_m = float(distance_m) if distance_m is not None else None
+        except (TypeError, ValueError):
+            self._companion_laser_range_m = None
+        try:
+            self._obstacle_radar.set_companion_lrf_range_m(distance_m)
             if bool(getattr(self, "_last_link_connected", False)) and bool(
                 getattr(self, "_web_ready", False)
             ):

@@ -141,6 +141,38 @@ def build_system_command(tag: str, data: str, *, write: bool = True) -> bytes:
     )
 
 
+def build_slr_query() -> bytes:
+    """C13 single laser rangefinding read (PROTOCAL §4.22, tag SLR, D-class read)."""
+    return build_system_command("SLR", "00", write=False)
+
+
+# SLR data field: four hex ASCII chars; value is decimeters (分米), range 0x0032–0x2710 (5–1000 m).
+_SLR_DM_MIN = 0x0032
+_SLR_DM_MAX = 0x2710
+
+
+def decode_slr_decimeters(data_field: str) -> int | None:
+    """Parse SLR response data (X0X1X2X3) to decimeters, or None if invalid."""
+    s = re.sub(r"[^0-9A-Fa-f]", "", str(data_field or ""))
+    if len(s) != 4:
+        return None
+    try:
+        dm = int(s, 16)
+    except ValueError:
+        return None
+    if dm < _SLR_DM_MIN or dm > _SLR_DM_MAX:
+        return None
+    return dm
+
+
+def decode_slr_distance_m(data_field: str) -> float | None:
+    """SLR range in metres (protocol unit = decimeters)."""
+    dm = decode_slr_decimeters(data_field)
+    if dm is None:
+        return None
+    return float(dm) / 10.0
+
+
 def build_pod_camera_command(
     tag: str,
     data: str,
@@ -381,6 +413,9 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
     if cmd in ("CAM_FOCUS_FAR", "CAM_FF", "FOCUS_FAR"):
         return build_fcc_focus("far")
 
+    if cmd == "SLR":
+        return build_slr_query()
+
     return build_legacy_top_frame(cmd, p)
 
 
@@ -421,6 +456,12 @@ def parse_tp_frame(raw: bytes) -> DecodedTopFrame | None:
             params["pitch"] = f"{pitch:.4f}"
         if roll is not None:
             params["roll"] = f"{roll:.4f}"
+    elif tag_u == "SLR" and data:
+        params["slr_data"] = str(data).upper()
+        dm = decode_slr_decimeters(data)
+        if dm is not None:
+            params["slr_dm"] = str(dm)
+            params["slr_m"] = f"{dm / 10.0:.3f}"
     return DecodedTopFrame(command=tag_u, params=params, raw=text, protocol="tp")
 
 
