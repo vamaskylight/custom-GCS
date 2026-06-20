@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
 from vgcs.skydroid.protocol import (
     build_gac_query,
+    build_gimbal_angle_axis,
+    build_gimbal_speed,
     build_got_target,
     build_slr_query,
     build_sum_track,
@@ -49,6 +51,10 @@ _LRF_BASELINE_RETRIES = 8
 _LRF_BASELINE_GAP_S = 0.2
 _LRF_POST_GOT_WAIT_S = 2.0
 _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
+_LRF_FOV_H_DEG = 83.4
+_LRF_FOV_V_DEG = 46.9
+_LRF_NUDGE_AFTER_S = 3.0
+_LRF_MAX_NUDGES = 2
 _PROBE_TIMEOUT_S = 0.12
 
 # Motion commands: no UDP reply wait (C13 often has no timely ACK for GSY/GSP/GSM).
@@ -168,6 +174,50 @@ class SkydroidTopUdpAdapter:
         confirm = build_sum_track(confirm=True)
         self._transport.send_and_receive(
             confirm, expect_reply=False, log=True, timeout_s=0.08
+        )
+
+    @staticmethod
+    def _pixel_boresight_offset_deg(
+        x_px: int, y_px: int, *, fw: int = _LRF_FRAME_W, fh: int = _LRF_FRAME_H
+    ) -> tuple[float, float]:
+        """Yaw/pitch delta (degrees) from frame centre to pixel (companion 83.4° HFOV)."""
+        ox = (float(x_px) - fw / 2.0) / max(1.0, fw / 2.0)
+        oy = (float(y_px) - fh / 2.0) / max(1.0, fh / 2.0)
+        dyaw = ox * (_LRF_FOV_H_DEG / 2.0)
+        dpitch = oy * (_LRF_FOV_V_DEG / 2.0)
+        return float(dyaw), float(dpitch)
+
+    def _send_gimbal_point_at_pixel(
+        self,
+        x_px: int,
+        y_px: int,
+        att_now: tuple[float, float] | None,
+    ) -> None:
+        """Fallback when GOT/SUM does not slew — point gimbal at click using FOV math."""
+        if att_now is None:
+            att_now = self._read_gimbal_attitude_deg()
+        if att_now is None:
+            print("[VGCS:lrf] gimbal nudge skipped — no GAC attitude")
+            return
+        dyaw, dpitch_img = self._pixel_boresight_offset_deg(x_px, y_px)
+        yaw_tgt = float(att_now[0]) + dyaw
+        pitch_tgt = float(att_now[1]) - dpitch_img
+        pitch_tgt = max(-90.0, min(90.0, pitch_tgt))
+        gay = build_gimbal_angle_axis("GAY", yaw_tgt, speed=25.0)
+        gap = build_gimbal_angle_axis("GAP", pitch_tgt, speed=25.0)
+        for frame in (gay, gap):
+            self._transport.send_and_receive(
+                frame, expect_reply=False, log=True, timeout_s=0.08
+            )
+        slew_s = min(3.5, max(1.0, (abs(dyaw) + abs(dpitch_img)) / 12.0))
+        print(
+            f"[VGCS:lrf] gimbal nudge px=({x_px},{y_px}) "
+            f"-> yaw={yaw_tgt:.2f} pitch={pitch_tgt:.2f} wait={slew_s:.1f}s"
+        )
+        time.sleep(slew_s)
+        stop = build_gimbal_speed(0.0, 0.0)
+        self._transport.send_and_receive(
+            stop, expect_reply=False, log=True, timeout_s=0.08
         )
 
     @staticmethod
@@ -409,9 +459,12 @@ class SkydroidTopUdpAdapter:
             deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
             next_resend = _LRF_GOT_RESEND_INTERVAL_S
             move_mono: float | None = None
+            nudge_count = 0
 
             def _emit_sample(value_m: float) -> None:
-                if on_sample is None:
+                if on_sample is None or baseline_m is None:
+                    return
+                if abs(float(value_m) - float(baseline_m)) < _LRF_MOVED_MIN_M:
                     return
                 try:
                     on_sample(float(value_m))
@@ -439,12 +492,24 @@ class SkydroidTopUdpAdapter:
 
                 att_now = self._read_gimbal_attitude_deg()
                 gimbal_moved = self._gimbal_attitude_moved(att_before, att_now)
-                if gimbal_moved is False and not self._slr_samples_moved_from_baseline(
-                    samples, baseline_m
+                slr_moved = self._slr_samples_moved_from_baseline(samples, baseline_m)
+
+                if (
+                    not slr_moved
+                    and gimbal_moved is not True
+                    and nudge_count < _LRF_MAX_NUDGES
+                    and elapsed >= _LRF_NUDGE_AFTER_S * float(nudge_count + 1)
                 ):
+                    self._send_gimbal_point_at_pixel(x_px, y_px, att_now)
+                    self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
+                    nudge_count += 1
+                    move_mono = None
                     continue
 
-                if not self._slr_samples_moved_from_baseline(samples, baseline_m):
+                if gimbal_moved is False and not slr_moved:
+                    continue
+
+                if not slr_moved:
                     if gimbal_moved is True:
                         print(
                             f"[VGCS:lrf] gimbal slewed but SLR still {reading:.1f} m "

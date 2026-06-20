@@ -9770,8 +9770,13 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = True
+        self._lrf_lock_distance_m = None
         self._refresh_lrf_lock_overlay()
         self._set_status("Locking LRF target…")
+        try:
+            self._obstacle_radar.set_c13_lrf_locking(None)
+        except Exception:
+            pass
         fw, fh = 1280, 720
         task = _LrfLockTask(cc, u, v, self._lrf_lock_bridge, frame_w=fw, frame_h=fh)
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
@@ -9797,10 +9802,14 @@ class MapWidget(QWidget):
                 self._lrf_lock_uv = None
                 self._lrf_lock_distance_m = None
                 self._refresh_lrf_lock_overlay()
-                self._obstacle_radar.set_c13_lrf_armed(False)
+                self._lrf_lock_armed = True
+                try:
+                    self._obstacle_radar.set_c13_lrf_armed(True)
+                except Exception:
+                    pass
                 self._set_status(
-                    "LRF lock failed — range did not update. Hold gimbal steady and retry, "
-                    "or lock via RC then tap ⌖ to refresh."
+                    "LRF lock failed — laser did not move to target. "
+                    "Hold gimbal steady and click again, or lock via RC first."
                 )
                 return
             dm = float(dist)

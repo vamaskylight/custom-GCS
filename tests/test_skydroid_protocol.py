@@ -199,6 +199,16 @@ def test_gimbal_attitude_moved() -> None:
     assert SkydroidTopUdpAdapter._gimbal_attitude_moved(None, (1.0, 2.0)) is None
 
 
+def test_pixel_boresight_offset_deg() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    dy, dp = SkydroidTopUdpAdapter._pixel_boresight_offset_deg(640, 360)
+    assert abs(dy) < 0.01 and abs(dp) < 0.01
+    dy2, dp2 = SkydroidTopUdpAdapter._pixel_boresight_offset_deg(676, 496)
+    assert dy2 > 0.5
+    assert dp2 > 2.0
+
+
 def test_slr_median_and_converged() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
