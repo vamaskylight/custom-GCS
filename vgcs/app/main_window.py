@@ -4567,17 +4567,32 @@ class MainWindow(QMainWindow):
         self._append_log("UI defaults restored.")
 
     def _refresh_c13_lrf_display(self) -> None:
-        """Poll C13 TOP SLR (laser rangefinder) and mirror to PROXIMITY + Systems LRF."""
+        """Poll C13 TOP SLR when a video target is locked; otherwise show lock icon only."""
         if not bool(getattr(self, "_heartbeat_seen", False)):
             return
         provider = str(self._settings.value("camera/provider", "mavlink") or "mavlink").strip().lower()
         if provider != "skydroid":
             return
         cc = self._camera_control_backend
+        is_locked = False
+        if cc is not None:
+            fn = getattr(cc, "is_lrf_locked", None)
+            is_locked = bool(fn()) if callable(fn) else False
+        try:
+            self._map_widget.enable_c13_lrf_ui(True)
+        except Exception:
+            pass
+        if not is_locked:
+            try:
+                self._fields["rangefinder"].setText("— (click ⊕ on map)")
+                self._apply_state_style(self._fields["rangefinder"], "idle")
+            except Exception:
+                pass
+            return
         dist = read_companion_laser_range_m(cc)
         if dist is None:
             return
-        text = f"{dist:.1f} m (C13)"
+        text = f"{dist:.1f} m (C13 locked)"
         try:
             self._fields["rangefinder"].setText(text)
             self._apply_state_style(self._fields["rangefinder"], "ok")

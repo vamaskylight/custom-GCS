@@ -10,7 +10,7 @@ import math
 import time
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QConicalGradient,
@@ -27,7 +27,9 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -83,6 +85,19 @@ _PILL_ON = (
     " background: rgba(52, 211, 153, 0.22);"
     " border: 1px solid rgba(52, 211, 153, 0.35);"
     " border-radius: 6px; padding: 3px 0;"
+)
+_LRF_BTN_QSS = (
+    "QPushButton#lrfLockBtn {"
+    " color: #64b4ff; font-size: 17px; font-weight: 600;"
+    " background: rgba(36, 48, 68, 180);"
+    " border: 1px solid rgba(100, 180, 255, 120);"
+    " border-radius: 8px; padding: 0 6px; min-height: 24px; max-height: 28px;"
+    "}"
+    "QPushButton#lrfLockBtn:hover { background: rgba(50, 66, 92, 220); }"
+    "QPushButton#lrfLockBtn:checked {"
+    " color: #34d399; border-color: rgba(52, 211, 153, 160);"
+    " background: rgba(32, 56, 48, 200);"
+    "}"
 )
 
 
@@ -393,6 +408,124 @@ class _MetricBlock(QWidget):
             self._sub.setVisible(False)
 
 
+class _LrfRangeBlock(QWidget):
+    """Range column — MAVLink value or C13 lock icon until target is picked on video."""
+
+    lock_clicked = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(1)
+
+        self._title = QLabel("RANGE")
+        self._title.setStyleSheet(_LABEL_QSS)
+        self._title.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background: transparent; border: none;")
+
+        self._btn = QPushButton("⊕")
+        self._btn.setObjectName("lrfLockBtn")
+        self._btn.setCheckable(True)
+        self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn.setStyleSheet(_LRF_BTN_QSS)
+        self._btn.setToolTip("Lock C13 laser range on a video target")
+        self._btn.clicked.connect(self.lock_clicked.emit)
+        btn_wrap = QWidget()
+        btn_wrap.setStyleSheet("background: transparent; border: none;")
+        btn_lay = QHBoxLayout(btn_wrap)
+        btn_lay.setContentsMargins(0, 0, 0, 0)
+        btn_lay.addWidget(self._btn, 0, Qt.AlignmentFlag.AlignLeft)
+        btn_lay.addStretch(1)
+        self._stack.addWidget(btn_wrap)
+
+        val_wrap = QWidget()
+        val_wrap.setStyleSheet("background: transparent; border: none;")
+        val_lay = QVBoxLayout(val_wrap)
+        val_lay.setContentsMargins(0, 0, 0, 0)
+        val_lay.setSpacing(1)
+        self._val = QLabel("—")
+        self._val.setStyleSheet(_VALUE_QSS)
+        self._val.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self._val.setMinimumHeight(20)
+        self._val.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._val.setToolTip("Click to unlock LRF target")
+        val_lay.addWidget(self._val)
+        self._stack.addWidget(val_wrap)
+
+        self._sub = QLabel("Rangefinder")
+        self._sub.setStyleSheet(_SUB_QSS)
+        self._sub.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        lay.addWidget(self._title)
+        lay.addWidget(self._stack)
+        lay.addWidget(self._sub)
+
+        self._c13_mode = False
+        self._c13_state = "idle"
+        self._val.mousePressEvent = self._on_val_pressed  # type: ignore[method-assign]
+
+    def _on_val_pressed(self, event) -> None:
+        if self._c13_mode and self._c13_state == "locked":
+            self.lock_clicked.emit()
+        if event is not None and hasattr(event, "accept"):
+            event.accept()
+
+    def set_reading(self, value: str, *, subtitle: str = "", alert: bool = False) -> None:
+        """MAVLink rangefinder — show live distance."""
+        self._c13_mode = False
+        self._c13_state = "mavlink"
+        self._btn.setChecked(False)
+        self._val.setText(value)
+        self._val.setStyleSheet(_VALUE_ALERT_QSS if alert else _VALUE_QSS)
+        if subtitle:
+            self._sub.setText(subtitle)
+            self._sub.setVisible(True)
+        else:
+            self._sub.setText("Rangefinder")
+            self._sub.setVisible(True)
+        self._stack.setCurrentIndex(1)
+
+    def set_c13_idle(self) -> None:
+        self._c13_mode = True
+        self._c13_state = "idle"
+        self._btn.setChecked(False)
+        self._btn.setText("⊕")
+        self._btn.setToolTip("Lock C13 laser range on a video target")
+        self._sub.setText("C13 LRF")
+        self._sub.setVisible(True)
+        self._stack.setCurrentIndex(0)
+
+    def set_c13_armed(self) -> None:
+        self._c13_mode = True
+        self._c13_state = "armed"
+        self._btn.setChecked(True)
+        self._btn.setText("◎")
+        self._btn.setToolTip("Click target on video — or click here to cancel")
+        self._sub.setText("Click video")
+        self._sub.setVisible(True)
+        self._stack.setCurrentIndex(0)
+
+    def set_c13_locked(self, distance_m: float, *, alert: bool = False) -> None:
+        self._c13_mode = True
+        self._c13_state = "locked"
+        self._btn.setChecked(False)
+        self._val.setText(f"{float(distance_m):.1f} m")
+        self._val.setStyleSheet(_VALUE_ALERT_QSS if alert else _VALUE_QSS)
+        self._sub.setText("C13 LRF · locked")
+        self._sub.setVisible(True)
+        self._stack.setCurrentIndex(1)
+
+    def clear_c13(self) -> None:
+        self._c13_mode = False
+        self._c13_state = "idle"
+        self.set_reading("—", subtitle="Rangefinder")
+
+
 class _SensorPills(QWidget):
     """Segmented LiDAR / Radar / RF selector — active source highlighted."""
 
@@ -430,6 +563,8 @@ class _SensorPills(QWidget):
 
 class ObstacleRadarPanel(QFrame):
     """Top-left map HUD — single card: radar + metrics + sensor pills + status."""
+
+    c13_lrf_lock_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -484,8 +619,11 @@ class ObstacleRadarPanel(QFrame):
         metrics.setVerticalSpacing(0)
         self._metric_nearest = _MetricBlock("Nearest", subtitle="LiDAR / Radar")
         self._metric_nearest.setToolTip("Shortest distance from proximity scan bins")
-        self._metric_range = _MetricBlock("Range", subtitle="Rangefinder")
-        self._metric_range.setToolTip("Single-beam rangefinder distance")
+        self._metric_range = _LrfRangeBlock()
+        self._metric_range.setToolTip(
+            "C13 laser rangefinder — click icon, then pick target on video to show range"
+        )
+        self._metric_range.lock_clicked.connect(self.c13_lrf_lock_clicked.emit)
         metrics.addWidget(self._metric_nearest, 0, 0)
         metrics.addWidget(self._metric_range, 0, 1)
         metrics.setColumnStretch(0, 1)
@@ -523,6 +661,9 @@ class ObstacleRadarPanel(QFrame):
         self._rangefinder_stream_seen = False
         self._active_sensor: str | None = None
         self._panel_connected_mono = 0.0
+        self._c13_lrf_ui = False
+        self._c13_lrf_armed = False
+        self._c13_lrf_locked = False
 
         self._stale_timer = QTimer(self)
         self._stale_timer.setInterval(500)
@@ -555,6 +696,18 @@ class ObstacleRadarPanel(QFrame):
         )
 
     def _sync_status_line(self) -> None:
+        if bool(getattr(self, "_c13_lrf_armed", False)):
+            self._lbl_status.setText("Rangefinder · click video")
+            self._set_status_mode("live")
+            return
+        if bool(getattr(self, "_c13_lrf_locked", False)):
+            rf = self._rangefinder.current_distance_m
+            if rf is not None and rf >= 0:
+                self._lbl_status.setText("Rangefinder · locked")
+                close = rf < 15.0
+                self._set_status_mode("alert" if close else "live")
+                return
+
         now = time.monotonic()
         obs_age = now - float(self._obstacle.updated_mono or 0.0)
         rf_age = now - float(self._rangefinder.updated_mono or 0.0)
@@ -627,8 +780,11 @@ class ObstacleRadarPanel(QFrame):
             self._panel_connected_mono = 0.0
             self._proximity_stream_seen = False
             self._rangefinder_stream_seen = False
+            self._c13_lrf_ui = False
+            self._c13_lrf_armed = False
+            self._c13_lrf_locked = False
             self._metric_nearest.set_reading("—", subtitle="LiDAR / Radar")
-            self._metric_range.set_reading("—", subtitle="Rangefinder")
+            self._metric_range.clear_c13()
             self._sensor_pills.set_active(None)
             self._sync_status_line()
 
@@ -676,6 +832,8 @@ class ObstacleRadarPanel(QFrame):
         self._sync_status_line()
 
     def set_distance_sensor(self, payload: dict) -> None:
+        if bool(getattr(self, "_c13_lrf_ui", False)):
+            return
         cur = payload.get("current_distance_m")
         try:
             cur_m = None if cur is None else float(cur)
@@ -704,14 +862,46 @@ class ObstacleRadarPanel(QFrame):
         self._set_sensor_active("rf")
         self._sync_status_line()
 
-    def set_companion_lrf_range_m(self, distance_m: float | None) -> None:
-        """C13 built-in laser rangefinder (TOP SLR), line-of-sight range in metres."""
-        try:
-            cur_m = None if distance_m is None else float(distance_m)
-        except (TypeError, ValueError):
-            cur_m = None
-        if cur_m is None or cur_m < 0:
+    def enable_c13_lrf_ui(self, enabled: bool = True) -> None:
+        """Show C13 LRF lock icon instead of live distance until target is locked on video."""
+        self._c13_lrf_ui = bool(enabled)
+        if not self._c13_lrf_ui:
+            self._c13_lrf_armed = False
+            self._c13_lrf_locked = False
+            self._metric_range.clear_c13()
+            self._sync_status_line()
             return
+        if not self._c13_lrf_locked:
+            self._metric_range.set_c13_idle()
+            self._set_sensor_active("rf")
+            self._sync_status_line()
+
+    def set_c13_lrf_armed(self, armed: bool) -> None:
+        self._c13_lrf_armed = bool(armed)
+        if not self._c13_lrf_ui:
+            return
+        if self._c13_lrf_armed:
+            self._metric_range.set_c13_armed()
+        elif not self._c13_lrf_locked:
+            self._metric_range.set_c13_idle()
+        self._set_sensor_active("rf")
+        self._sync_status_line()
+
+    def set_c13_lrf_locked(self, distance_m: float | None) -> None:
+        if distance_m is None:
+            self._c13_lrf_locked = False
+            self._c13_lrf_armed = False
+            if self._c13_lrf_ui:
+                self._metric_range.set_c13_idle()
+            self._rangefinder = DistanceSensorState()
+            self._sync_status_line()
+            return
+        try:
+            cur_m = float(distance_m)
+        except (TypeError, ValueError):
+            return
+        self._c13_lrf_locked = True
+        self._c13_lrf_armed = False
         st = DistanceSensorState(
             sensor_type=_SENSOR_LASER,
             orientation=0,
@@ -724,9 +914,21 @@ class ObstacleRadarPanel(QFrame):
         self._rangefinder_subtitle = "C13 LRF"
         self._rangefinder_stream_seen = True
         close = cur_m < 15.0
-        self._metric_range.set_reading(f"{cur_m:.1f} m", subtitle="C13 LRF", alert=close)
+        self._metric_range.set_c13_locked(cur_m, alert=close)
         self._set_sensor_active("rf")
         self._sync_status_line()
+
+    def set_companion_lrf_range_m(self, distance_m: float | None) -> None:
+        """C13 built-in laser rangefinder (TOP SLR) — updates only when target is locked."""
+        if not bool(getattr(self, "_c13_lrf_locked", False)):
+            return
+        try:
+            cur_m = None if distance_m is None else float(distance_m)
+        except (TypeError, ValueError):
+            cur_m = None
+        if cur_m is None or cur_m < 0:
+            return
+        self.set_c13_lrf_locked(cur_m)
 
     def _set_sensor_active(self, which: str | None) -> None:
         self._active_sensor = which

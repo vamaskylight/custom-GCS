@@ -397,11 +397,30 @@ class SkydroidCameraControl:
             return None
 
     def get_laser_range_m(self) -> float | None:
-        """C13 built-in laser rangefinder (TOP SLR), metres."""
+        """C13 built-in laser rangefinder (TOP SLR), metres — only when target is locked."""
         try:
             return self._adapter.get_laser_range_m()
         except Exception:
             return None
+
+    def is_lrf_locked(self) -> bool:
+        try:
+            return bool(self._adapter.is_lrf_locked())
+        except Exception:
+            return False
+
+    def lock_lrf_at_video_norm(self, u: float, v: float) -> float | None:
+        """Lock LRF on video target (normalized 0..1 coords on 1280×720 frame)."""
+        try:
+            return self._adapter.lock_lrf_target_at_norm(float(u), float(v))
+        except Exception:
+            return None
+
+    def unlock_lrf(self) -> None:
+        try:
+            self._adapter.unlock_lrf()
+        except Exception:
+            return
 
     def gimbal_center(self) -> None:
         try:
