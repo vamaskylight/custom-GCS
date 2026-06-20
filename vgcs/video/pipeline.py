@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-20-companion-hevc-noshowall"
+_VIDEO_PIPELINE_REV = "2026-06-20-restore-b0e75151-video"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -352,42 +352,6 @@ def _stall_watchdog_enabled(url: str) -> bool:
     return True
 
 
-def _companion_hevc_showall_enabled(url: str) -> bool:
-    """
-    FFmpeg ``+showall`` emits HEVC frames even when reference pictures are missing.
-
-    That avoids brief freezes on SIYI pan/zoom but paints gray macroblock splats on C13
-    (symptom: entire preview turns blocky). Default off — hold the last good frame instead.
-    Opt in with ``VGCS_COMPANION_HEVC_SHOWALL=1``.
-    """
-    if not _rtsp_url_is_companion_rtsp(url):
-        return False
-    raw = str(os.environ.get("VGCS_COMPANION_HEVC_SHOWALL", "") or "").strip()
-    if not raw:
-        raw = str(os.environ.get("VGCS_SIYI_HEVC_SHOWALL", "0") or "0").strip()
-    return raw == "1"
-
-
-def _rgb24_frame_likely_hevc_corrupt(raw: bytes, w: int, h: int) -> bool:
-    """Skip flat gray macroblock splats when companion HEVC refs are briefly lost."""
-    need = int(w) * int(h) * 3
-    if len(raw) < need:
-        return True
-    step = max(3, (need // 4096) * 3)
-    gray = 0
-    total = 0
-    for i in range(0, need - 2, step):
-        r, g, b = raw[i], raw[i + 1], raw[i + 2]
-        total += 1
-        if abs(int(r) - int(g)) <= 8 and abs(int(g) - int(b)) <= 8:
-            mid = (int(r) + int(g) + int(b)) // 3
-            if 112 <= mid <= 148:
-                gray += 1
-    if total < 64:
-        return False
-    return (gray / total) >= 0.86
-
-
 def _siyi_hevc_glitch_tail(tail_b: bytes) -> bool:
     """True when FFmpeg stderr shows HEVC reference/RPS loss (common on ZR10 during pan/zoom)."""
     if not tail_b:
@@ -614,9 +578,8 @@ def _ffmpeg_preflags_before_input(
             out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     out.extend(["-err_detect", "ignore_err"])
     if sc == "rtsp" and _rtsp_url_is_companion_rtsp(str(url or "").strip()):
-        if _companion_hevc_showall_enabled(str(url or "").strip()):
-            # Opt-in only: show partial HEVC frames (may paint macroblock corruption).
-            out.extend(["-flags2", "+showall"])
+        # Show frames even when HEVC refs are briefly missing (companion pan/zoom / glitch).
+        out.extend(["-flags2", "+showall"])
     if sc == "udp":
         out.extend(
             [
@@ -957,16 +920,8 @@ class RtspSource(QObject):
                 return True
         return False
 
-    def restart_decode(self, *, delay_ms: int = 0, force: bool = False) -> None:
-        """Stop FFmpeg and open a fresh RTSP session (settings Apply / explicit recovery only)."""
-        if not force and self.decode_recently_active(8.0):
-            try:
-                print(
-                    f"[VGCS:video] restart_decode skipped (decode active) url={self._url}"
-                )
-            except Exception:
-                pass
-            return
+    def restart_decode(self, *, delay_ms: int = 0) -> None:
+        """Stop FFmpeg and open a fresh RTSP session (companion link-up / settings Apply)."""
         now = time.monotonic()
         if now - float(self._restart_decode_last_mono or 0.0) < 4.0:
             return
@@ -999,15 +954,6 @@ class RtspSource(QObject):
     @Slot()
     def _deferred_companion_ffmpeg_restart(self) -> None:
         """Companion/SIYI: restart FFmpeg without stop()/start() tearing down preview state."""
-        if self.decode_recently_active(8.0):
-            try:
-                print(
-                    f"[VGCS:video] deferred companion restart skipped (decode active) "
-                    f"url={self._url}"
-                )
-            except Exception:
-                pass
-            return
         try:
             self._ffmpeg_stop.set()
         except Exception:
@@ -1630,18 +1576,10 @@ class RtspSource(QObject):
         src_h = max(1, int(src_h))
         cap_w = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_W", "1920") or 1920)
         cap_h = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_H", "1080") or 1080)
-        companion_rtsp_early = _rtsp_url_is_companion_rtsp(url)
-        if companion_rtsp_early or _rtsp_url_is_siyi_style(url):
-            # Lighter preview decode on companion link (C13 + SIYI) — full 1280×720 HEVC sw decode
-            # often starves the GUI and shows macroblock corruption under load.
-            cap_w = min(
-                cap_w,
-                int(os.environ.get("VGCS_COMPANION_DECODE_MAX_W", "960") or 960),
-            )
-            cap_h = min(
-                cap_h,
-                int(os.environ.get("VGCS_COMPANION_DECODE_MAX_H", "540") or 540),
-            )
+        if _rtsp_url_is_siyi_style(url):
+            # ZR10 main.264 is often HEVC 1080p+; lighter preview decode = smoother pan on laptops.
+            cap_w = min(cap_w, int(os.environ.get("VGCS_SIYI_DECODE_MAX_W", "960") or 960))
+            cap_h = min(cap_h, int(os.environ.get("VGCS_SIYI_DECODE_MAX_H", "540") or 540))
         cap_w = max(640, min(1920, cap_w))
         cap_h = max(360, min(1080, cap_h))
         scale = min(float(cap_w) / float(src_w), float(cap_h) / float(src_h), 1.0)
@@ -1696,18 +1634,6 @@ class RtspSource(QObject):
             if siyi_url:
                 mode = "hwaccel=auto" if siyi_hw else "sw (auto codec)"
                 print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
-            if not _companion_hevc_showall_enabled(url):
-                print(
-                    "[VGCS:video] companion HEVC: corrupt frames dropped "
-                    "(set VGCS_COMPANION_HEVC_SHOWALL=1 to show glitches)"
-                )
-            try:
-                print(
-                    f"[VGCS:video] companion preview decode size {w}x{h} "
-                    f"(source {src_w}x{src_h})"
-                )
-            except Exception:
-                pass
 
         while self._running and not self._ffmpeg_stop.is_set():
             transport_seq = _rtsp_transport_sequence(url, self._transport)
@@ -1922,8 +1848,6 @@ class RtspSource(QObject):
                                             pass
                                 now = time.monotonic()
                                 if (now - last_emit_mono) < min_emit_dt:
-                                    continue
-                                if companion_rtsp and _rgb24_frame_likely_hevc_corrupt(raw, w, h):
                                     continue
                                 try:
                                     assert np is not None

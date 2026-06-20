@@ -3481,36 +3481,26 @@ class MapWidget(QWidget):
         self._set_native_video_pip_placeholder(False)
         self._native_video_last = img
         split_on = bool(getattr(self, "_video_split_enabled", False))
-        swap_on = bool(getattr(self, "_video_swapped", False))
-        focus_fs = bool(getattr(self, "_split_fullscreen_source_id", None)) if split_on else False
-        # Fullscreen single feed: QLabel scales once per frame (faster than SmoothTransformation).
-        use_label_scale = swap_on and (not split_on or focus_fs)
         try:
-            self._native_video_preview.setScaledContents(bool(use_label_scale))
+            if not split_on:
+                self._native_video_preview.setScaledContents(False)
         except Exception:
             pass
         try:
             pm = QPixmap.fromImage(img)
             if pm.isNull():
                 return
-            if use_label_scale:
-                self._native_video_preview.setPixmap(pm)
-                self._split_pip_hit = None
-                return
             size = self._native_video_preview.size()
             if size.width() <= 0 or size.height() <= 0:
                 QTimer.singleShot(0, self._retry_native_video_pixmap)
                 return
+            swap_on = bool(getattr(self, "_video_swapped", False))
             ar_mode = (
                 Qt.AspectRatioMode.IgnoreAspectRatio
                 if swap_on
                 else Qt.AspectRatioMode.KeepAspectRatio
             )
-            scaled_pm = pm.scaled(
-                size,
-                ar_mode,
-                Qt.TransformationMode.FastTransformation,
-            )
+            scaled_pm = pm.scaled(size, ar_mode, Qt.TransformationMode.FastTransformation)
             self._native_video_preview.setPixmap(scaled_pm)
             # Record PiP layout for split-grid hit-testing (must match paint; pixmap().size() alone
             # mis-maps clicks on HiDPI — device pixels vs logical coords skew u,v into cell 0 / day).
@@ -3908,7 +3898,15 @@ class MapWidget(QWidget):
                 self._obstacle_radar.notify_link_connected(False)
             except Exception:
                 pass
-            # Hide mini-video / split grid until the operator connects the vehicle.
+            # Companion RTSP (192.168.144.x) is independent of MAVLink — keep FFmpeg running;
+            # only hide the PiP shell until the vehicle reconnects (CR: no split before connect).
+            if self._uses_companion_rtsp() and self._video_preview_should_run():
+                try:
+                    self._native_video_preview.hide()
+                    self._native_video_overlay.hide()
+                except Exception:
+                    pass
+                return
             self._stop_video_preview(clear_overlay=True)
             return
         # MAVLink connected: refresh HUD geometry (rail stays visible whenever map is ready; see `_on_map_loaded`).
@@ -3945,8 +3943,11 @@ class MapWidget(QWidget):
             return
         self._show_mini_video_pip_shell()
         if self._video_preview_should_run():
-            # One RTSP session on companion cameras — start decode once; never restart_decode on link-up.
-            self._auto_start_mini_video_pip(force_decode=False, preserve_layout=True)
+            self._auto_start_mini_video_pip(force_decode=True, preserve_layout=True)
+            QTimer.singleShot(
+                800,
+                lambda: self._companion_start_decode_if_needed(reason="mavlink_link"),
+            )
 
     def _uses_companion_rtsp(self) -> bool:
         day = str(getattr(self, "_video_settings_day", "") or "").strip().lower()
@@ -3958,7 +3959,22 @@ class MapWidget(QWidget):
             return False
         return not bool(getattr(self, "_last_link_connected", False))
 
-    def _uses_companion_rtsp(self) -> bool:
+    def _companion_decode_running(self, vp) -> bool:
+        try:
+            for sid in self._video_preview_source_ids_to_run(vp):
+                src = vp.sources().get(sid)
+                if src is None:
+                    continue
+                if not getattr(src, "_running", False):
+                    continue
+                th = getattr(src, "_ffmpeg_thread", None)
+                if th is not None and th.is_alive():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _companion_wire_preview_ui(self) -> bool:
         """Connect frame slots and show the native video overlay (no FFmpeg stop/start)."""
         if not self._mini_video_pip_allowed():
             return False
@@ -3993,26 +4009,6 @@ class MapWidget(QWidget):
             pass
         return True
 
-    def _companion_decode_healthy(self, vp) -> bool:
-        """True when every preview source is decoding or still connecting (no second RTSP open)."""
-        try:
-            want = set(self._video_preview_source_ids_to_run(vp))
-            if not want:
-                return False
-            for sid in want:
-                src = vp.sources().get(sid)
-                if src is None:
-                    return False
-                if hasattr(src, "decode_recently_active") and src.decode_recently_active(8.0):
-                    continue
-                th = getattr(src, "_ffmpeg_thread", None)
-                if th is not None and th.is_alive():
-                    continue
-                return False
-            return True
-        except Exception:
-            return False
-
     def _companion_start_decode_if_needed(self, *, reason: str = "") -> None:
         """Start RTSP decode once; never tear down a session that is already connecting."""
         if not self._video_preview_should_run():
@@ -4024,25 +4020,26 @@ class MapWidget(QWidget):
         vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
         if vp is None:
             return
-        if self._companion_decode_healthy(vp):
-            try:
-                print(
-                    f"[VGCS:video] decode already active ({reason}), "
-                    "skipping restart (companion allows one RTSP client)"
-                )
-            except Exception:
-                pass
-            return
+        if self._companion_decode_running(vp):
+            if bool(getattr(self, "_video_preview_enabled", False)):
+                try:
+                    print(
+                        f"[VGCS:video] decode already active ({reason}), "
+                        "skipping restart (companion allows one RTSP client)"
+                    )
+                except Exception:
+                    pass
+                return
         now = time.monotonic()
         last = float(getattr(self, "_companion_video_restart_mono", 0.0) or 0.0)
-        if now - last < 3.0:
+        if now - last < 8.0:
             return
         self._companion_video_restart_mono = now
         try:
             print(f"[VGCS:video] companion decode start ({reason})")
         except Exception:
             pass
-        self._start_video_decode_sources(vp, force=False)
+        self._restart_video_preview_after_settings(force_decode=False)
 
     def _request_companion_video_restart(self, *, reason: str = "") -> None:
         """Alias: start decode if needed (no forced restart_decode)."""
@@ -5599,7 +5596,7 @@ class MapWidget(QWidget):
         try:
             if vp.sources():
                 self._auto_start_mini_video_pip(
-                    force_decode=False,
+                    force_decode=bool(getattr(self, "_last_link_connected", False)),
                 )
                 if bool(getattr(self, "_last_link_connected", False)):
                     self._companion_start_decode_if_needed(reason="schedule")
@@ -5661,16 +5658,8 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._payload_hardware_recording = False
-        vp_shared = getattr(self, "_video_pipeline_shared", None)
-        decode_active = vp_shared is not None and self._companion_decode_healthy(vp_shared)
-        if not decode_active:
-            self._video_inited = False
-            self._shared_vp_hooks_connected = False
-        elif self._video_preview_should_run() and bool(getattr(self, "_last_link_connected", False)):
-            try:
-                self._companion_wire_preview_ui()
-            except Exception:
-                pass
+        self._video_inited = False
+        self._shared_vp_hooks_connected = False
 
         # Do not reset `_video_split_enabled` here: this runs on every connect/disconnect and on
         # camera-backend hot-swap; the operator's SPLIT choice must persist (apply_video_settings
@@ -5685,17 +5674,11 @@ class MapWidget(QWidget):
             pass
         self._sync_native_camera_rail_toggles()
         try:
-            if (
-                bool(getattr(self, "_web_ready", False))
-                and self._video_preview_should_run()
-                and bool(getattr(self, "_last_link_connected", False))
-            ):
-                vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
-                if vp is None or not self._companion_decode_healthy(vp):
-                    QTimer.singleShot(
-                        400,
-                        lambda: self._companion_start_decode_if_needed(reason="camera_control"),
-                    )
+            if bool(getattr(self, "_web_ready", False)) and self._video_preview_should_run():
+                QTimer.singleShot(
+                    400,
+                    lambda: self._companion_start_decode_if_needed(reason="camera_control"),
+                )
         except Exception:
             pass
 
@@ -5813,22 +5796,14 @@ class MapWidget(QWidget):
             return
         want = set(self._video_preview_source_ids_to_run(vp))
         for sid, src in vp.sources().items():
-            if sid not in want:
-                continue
-            try:
-                if hasattr(src, "decode_recently_active") and src.decode_recently_active(6.0):
-                    continue
-                th = getattr(src, "_ffmpeg_thread", None)
-                if th is not None and th.is_alive() and bool(getattr(src, "_ffmpeg_had_frame", False)):
-                    continue
-                if force and hasattr(src, "restart_decode"):
-                    if hasattr(src, "decode_recently_active") and src.decode_recently_active(4.0):
-                        continue
-                    src.restart_decode(force=True)
-                else:
-                    src.start()
-            except Exception:
-                pass
+            if sid in want:
+                try:
+                    if force and hasattr(src, "restart_decode"):
+                        src.restart_decode()
+                    else:
+                        src.start()
+                except Exception:
+                    pass
 
     def _stop_idle_video_decode_sources(self, vp) -> None:
         """Stop decoders that are not needed (e.g. thermal when leaving split view)."""
@@ -5921,7 +5896,7 @@ class MapWidget(QWidget):
             try:
                 src = vp.sources().get(sid)
                 if src is not None and hasattr(src, "restart_decode"):
-                    src.restart_decode(delay_ms=1500, force=True)
+                    src.restart_decode(delay_ms=1500)
             except Exception:
                 pass
 
@@ -6002,7 +5977,6 @@ class MapWidget(QWidget):
             vp = getattr(self, "_video", None)
             if vp is not None:
                 self._start_video_decode_sources(vp, force=force_decode)
-                self._stop_idle_video_decode_sources(vp)
                 try:
                     self._video_preview_got_frame = False
                     self._video_preview_started_mono = time.monotonic()
