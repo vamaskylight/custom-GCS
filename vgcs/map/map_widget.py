@@ -854,6 +854,34 @@ class _ObservationSnapshotBridge(QObject):
     finished = Signal(int, str)  # observation index, snapshot path (may be empty)
 
 
+class _LrfLockBridge(QObject):
+    finished = Signal(object)  # float | None — locked range in metres
+
+
+class _LrfLockTask(QRunnable):
+    """GOT + SUM + SLR on worker thread (UDP can block)."""
+
+    def __init__(self, cc: object, u: float, v: float, bridge: _LrfLockBridge) -> None:
+        super().__init__()
+        self._cc = cc
+        self._u = float(u)
+        self._v = float(v)
+        self._bridge = bridge
+
+    def run(self) -> None:
+        dist = None
+        try:
+            lock_fn = getattr(self._cc, "lock_lrf_at_video_norm", None)
+            if callable(lock_fn):
+                dist = lock_fn(self._u, self._v)
+        except Exception as exc:
+            print(f"[VGCS:lrf] lock failed: {exc}")
+        try:
+            self._bridge.finished.emit(dist)
+        except Exception:
+            pass
+
+
 class _ObservationSnapshotTask(QRunnable):
     """Save a preview still off the GUI thread (Target / Report must not freeze the app)."""
 
@@ -1216,6 +1244,9 @@ class MapWidget(QWidget):
         self._video_preview_started_mono = 0.0
         self._video_preview_stall_recovery_active = False
         self._camera_control = NoopCameraControl()
+        self._lrf_lock_armed = False
+        self._lrf_lock_bridge = _LrfLockBridge(self)
+        self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
         self._obs_mark_mode = False
         self._observations: list[dict[str, object]] = []
         self._dooaf_pick_complete = None
@@ -1560,7 +1591,7 @@ class MapWidget(QWidget):
 
         # M9 — obstacle radar on `_panel` (same stacking layer as PiP / compass).
         self._obstacle_radar = ObstacleRadarPanel(self._panel)
-        self._obstacle_radar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._obstacle_radar.c13_lrf_lock_clicked.connect(self._on_c13_lrf_icon_clicked)
         self._obstacle_radar.hide()
 
         # Legacy Web `#actionRail` / `.actionBtn` — parent `_panel` (not `_map_canvas`) so Takeoff/Return
@@ -2094,6 +2125,17 @@ class MapWidget(QWidget):
             except Exception as e:
                 print(f"[VGCS:observe] dooaf video pick failed: {e}")
                 self._set_status(f"Video pick failed: {e}")
+            return
+        if bool(getattr(self, "_lrf_lock_armed", False)):
+            try:
+                if event is not None:
+                    event.accept()
+                pos = event.position()
+                xn, yn = self._native_video_click_norm(pos)
+                self._begin_c13_lrf_video_lock(float(xn), float(yn))
+            except Exception as e:
+                print(f"[VGCS:lrf] video pick failed: {e}")
+                self._set_status(f"LRF lock failed: {e}")
             return
         if self._observation_mark_active():
             try:
@@ -2748,7 +2790,7 @@ class MapWidget(QWidget):
                 ov.raise_()
             # Target ON (map-main PiP only): lift video above the map so PiP clicks reach the preview.
             # Fullscreen swap keeps the camera rail above video — do not raise video over the rail.
-            if self._observation_mark_active() and preview_on and not swapped:
+            if (self._observation_mark_active() or bool(getattr(self, "_lrf_lock_armed", False))) and preview_on and not swapped:
                 pv = getattr(self, "_native_video_preview", None)
                 if pv is not None and pv.isVisible():
                     pv.raise_()
@@ -3897,6 +3939,11 @@ class MapWidget(QWidget):
             try:
                 self._obstacle_radar.hide()
                 self._obstacle_radar.notify_link_connected(False)
+                self._lrf_lock_armed = False
+                cc = getattr(self, "_camera_control", None)
+                unlock = getattr(cc, "unlock_lrf", None)
+                if callable(unlock):
+                    unlock()
             except Exception:
                 pass
             # Companion RTSP (192.168.144.x) is independent of MAVLink — keep FFmpeg running;
@@ -9545,7 +9592,7 @@ class MapWidget(QWidget):
             pass
 
     def set_companion_laser_range_m(self, distance_m: float | None) -> None:
-        """C13 TOP laser rangefinder (Skydroid SLR); updates PROXIMITY Range + dashboard LRF."""
+        """C13 TOP laser rangefinder (Skydroid SLR); updates PROXIMITY Range when target is locked."""
         try:
             self._companion_laser_range_m = float(distance_m) if distance_m is not None else None
         except (TypeError, ValueError):
@@ -9559,6 +9606,100 @@ class MapWidget(QWidget):
                 QTimer.singleShot(0, self._layout_native_hud)
         except Exception:
             pass
+
+    def enable_c13_lrf_ui(self, enabled: bool = True) -> None:
+        """PROXIMITY Range shows C13 lock icon until user picks a target on video."""
+        try:
+            self._obstacle_radar.enable_c13_lrf_ui(bool(enabled))
+            if enabled and bool(getattr(self, "_last_link_connected", False)):
+                self._obstacle_radar.show()
+                QTimer.singleShot(0, self._layout_native_hud)
+        except Exception:
+            pass
+
+    def _c13_lrf_is_locked(self) -> bool:
+        cc = getattr(self, "_camera_control", None)
+        if cc is None:
+            return False
+        fn = getattr(cc, "is_lrf_locked", None)
+        return bool(fn()) if callable(fn) else False
+
+    def _on_c13_lrf_icon_clicked(self) -> None:
+        if self._c13_lrf_is_locked():
+            self._unlock_c13_lrf()
+            return
+        if bool(getattr(self, "_lrf_lock_armed", False)):
+            self._cancel_c13_lrf_arm()
+            return
+        self._arm_c13_lrf_lock()
+
+    def _arm_c13_lrf_lock(self) -> None:
+        self._lrf_lock_armed = True
+        try:
+            self._obstacle_radar.set_c13_lrf_armed(True)
+        except Exception:
+            pass
+        self._set_status("Click target on video to lock C13 laser range")
+        QTimer.singleShot(0, self._raise_flight_hud_above_video)
+
+    def _cancel_c13_lrf_arm(self) -> None:
+        self._lrf_lock_armed = False
+        try:
+            self._obstacle_radar.set_c13_lrf_armed(False)
+        except Exception:
+            pass
+        self._set_status("C13 LRF lock cancelled")
+
+    def _unlock_c13_lrf(self) -> None:
+        self._lrf_lock_armed = False
+        cc = getattr(self, "_camera_control", None)
+        try:
+            unlock = getattr(cc, "unlock_lrf", None)
+            if callable(unlock):
+                unlock()
+        except Exception:
+            pass
+        try:
+            self._obstacle_radar.set_c13_lrf_locked(None)
+        except Exception:
+            pass
+        try:
+            self._companion_laser_range_m = None
+        except Exception:
+            pass
+        self._set_status("C13 LRF target unlocked")
+
+    def _begin_c13_lrf_video_lock(self, u: float, v: float) -> None:
+        cc = getattr(self, "_camera_control", None)
+        lock_fn = getattr(cc, "lock_lrf_at_video_norm", None)
+        if not callable(lock_fn):
+            self._set_status("C13 LRF not available — set Camera provider to Skydroid")
+            self._cancel_c13_lrf_arm()
+            return
+        self._lrf_lock_armed = False
+        self._set_status("Locking LRF target…")
+        task = _LrfLockTask(cc, u, v, self._lrf_lock_bridge)
+        pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
+        pool.start(task)
+
+    def _on_c13_lrf_lock_finished(self, dist: object) -> None:
+        try:
+            if dist is None:
+                self._obstacle_radar.set_c13_lrf_armed(False)
+                self._set_status("LRF lock failed — try another point on the target")
+                return
+            dm = float(dist)
+            self._companion_laser_range_m = dm
+            self._obstacle_radar.set_c13_lrf_locked(dm)
+            self._set_status(f"C13 LRF locked · {dm:.1f} m")
+            print(f"[VGCS:lrf] locked range={dm:.1f} m")
+        except Exception as exc:
+            print(f"[VGCS:lrf] lock result error: {exc}")
+            self._set_status("LRF lock failed")
+            try:
+                self._obstacle_radar.set_c13_lrf_armed(False)
+            except Exception:
+                pass
 
     def get_obstacle_sensor_summary(self) -> tuple[str, str]:
         """Nearest obstacle + rangefinder text for dashboard telemetry panel."""

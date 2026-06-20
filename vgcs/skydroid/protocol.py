@@ -146,6 +146,27 @@ def build_slr_query() -> bytes:
     return build_system_command("SLR", "00", write=False)
 
 
+# C13 target lock on 1280×720 video frame (PROTOCAL §3.3.5 GOT) + track confirm/stop (§3.3.4 SUM).
+_LRF_FRAME_W = 1280
+_LRF_FRAME_H = 720
+
+
+def build_got_target(x_px: int, y_px: int, *, frame_w: int = _LRF_FRAME_W, frame_h: int = _LRF_FRAME_H) -> bytes:
+    """Lock/track target at pixel on companion video (G-class write, tag GOT)."""
+    fw = max(1, int(frame_w))
+    fh = max(1, int(frame_h))
+    x = max(0, min(fw, int(x_px)))
+    y = max(0, min(fh, int(y_px)))
+    data = f"{x:04X}{y:04X}"
+    return build_tp_frame(dest="G", control="w", tag="GOT", data=data, variable=True)
+
+
+def build_sum_track(*, confirm: bool) -> bytes:
+    """Start/stop visual track after GOT — 01 confirm, 00 stop (G-class write, tag SUM)."""
+    code = "01" if confirm else "00"
+    return build_tp_frame(dest="G", control="w", tag="SUM", data=code)
+
+
 # SLR data field: four hex ASCII chars; value is decimeters (分米), range 0x0032–0x2710 (5–1000 m).
 _SLR_DM_MIN = 0x0032
 _SLR_DM_MAX = 0x2710

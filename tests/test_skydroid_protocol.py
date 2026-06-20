@@ -136,6 +136,15 @@ def test_build_slr_query_matches_protocal_doc() -> None:
     assert decode_slr_distance_m("2710") == 1000.0
 
 
+def test_build_got_and_sum_match_protocal_doc() -> None:
+    from vgcs.skydroid.protocol import build_got_target, build_sum_track
+
+    # §3.3.5 GOT — 640×360 on 1280×720 frame (variable #tp, 8 data chars).
+    assert build_got_target(640, 360) == b"#tpUG8wGOT02800168D5"
+    assert build_sum_track(confirm=True) == b"#TPUG2wSUM0162"
+    assert build_sum_track(confirm=False) == b"#TPUG2wSUM0061"
+
+
 def test_zmc_zoom_in_udp_pm_format() -> None:
     frame = build_top_frame("ZMC", {"action": "in"})
     assert frame.decode("ascii") == "#tpPM2wZMC0299"

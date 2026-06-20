@@ -8,7 +8,9 @@ from dataclasses import dataclass
 
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
 from vgcs.skydroid.protocol import (
+    build_got_target,
     build_slr_query,
+    build_sum_track,
     build_top_frame,
     build_zoom_command_burst,
     decode_slr_distance_m,
@@ -103,6 +105,9 @@ class SkydroidTopUdpAdapter:
         self._laser_range_m: float | None = None
         self._laser_range_mono: float = 0.0
         self._last_slr_poll_mono: float = 0.0
+        self._lrf_locked = False
+        self._lrf_lock_x = 0
+        self._lrf_lock_y = 0
         self._active_port = int(port)
         self._transport.set_datagram_handler(self._maybe_update_status)
 
@@ -110,8 +115,10 @@ class SkydroidTopUdpAdapter:
         return (str(self._active_host), int(self._active_port), str(self._profile_id))
 
     def get_laser_range_m(self, *, max_age_s: float = 4.0) -> float | None:
-        """Last C13 SLR reading (TOP tag SLR, metres). None when stale or unavailable."""
+        """Last C13 SLR reading (TOP tag SLR, metres). None when stale or not locked."""
         with self._status_lock:
+            if not self._lrf_locked:
+                return None
             dist = self._laser_range_m
             ts = float(self._laser_range_mono or 0.0)
         if dist is None or ts <= 0.0:
@@ -119,6 +126,87 @@ class SkydroidTopUdpAdapter:
         if time.monotonic() - ts > max(0.5, float(max_age_s)):
             return None
         return float(dist)
+
+    def is_lrf_locked(self) -> bool:
+        with self._status_lock:
+            return bool(self._lrf_locked)
+
+    def lock_lrf_target_at_norm(
+        self,
+        u: float,
+        v: float,
+        *,
+        frame_w: int = 1280,
+        frame_h: int = 720,
+    ) -> float | None:
+        """GOT + SUM track confirm at video pixel, then read SLR range (blocking — run off UI thread)."""
+        if not self.gimbal_telemetry_ok():
+            return None
+        fw = max(1, int(frame_w))
+        fh = max(1, int(frame_h))
+        x_px = max(0, min(fw, int(round(max(0.0, min(1.0, float(u))) * fw))))
+        y_px = max(0, min(fh, int(round(max(0.0, min(1.0, float(v))) * fh))))
+        active_port = int(self._transport._port)
+        dist_m: float | None = None
+        try:
+            got = build_got_target(x_px, y_px, frame_w=fw, frame_h=fh)
+            self._transport.send_and_receive(
+                got, expect_reply=False, log=True, timeout_s=0.08
+            )
+            time.sleep(0.06)
+            confirm = build_sum_track(confirm=True)
+            self._transport.send_and_receive(
+                confirm, expect_reply=False, log=True, timeout_s=0.08
+            )
+            time.sleep(0.12)
+            for _ in range(6):
+                frame = build_slr_query()
+                reply = self._transport.send_and_receive(
+                    frame, expect_reply=True, log=True, timeout_s=0.45
+                )
+                if reply:
+                    self._maybe_update_slr(reply)
+                with self._status_lock:
+                    cand = self._laser_range_m
+                if cand is not None:
+                    dist_m = float(cand)
+                    break
+                time.sleep(0.1)
+            with self._status_lock:
+                if dist_m is not None:
+                    self._lrf_locked = True
+                    self._lrf_lock_x = x_px
+                    self._lrf_lock_y = y_px
+                else:
+                    self._lrf_locked = False
+                    self._laser_range_m = None
+                    self._laser_range_mono = 0.0
+            return dist_m
+        except Exception:
+            with self._status_lock:
+                self._lrf_locked = False
+            return None
+        finally:
+            self._transport._port = active_port
+
+    def unlock_lrf(self) -> None:
+        """Stop visual track and clear locked LRF reading."""
+        active_port = int(self._transport._port)
+        try:
+            stop = build_sum_track(confirm=False)
+            self._transport.send_and_receive(
+                stop, expect_reply=False, log=True, timeout_s=0.08
+            )
+        except Exception:
+            pass
+        finally:
+            self._transport._port = active_port
+        with self._status_lock:
+            self._lrf_locked = False
+            self._laser_range_m = None
+            self._laser_range_mono = 0.0
+            self._lrf_lock_x = 0
+            self._lrf_lock_y = 0
 
     def gimbal_telemetry_ok(self) -> bool:
         with self._status_lock:
@@ -421,7 +509,7 @@ class SkydroidTopUdpAdapter:
                 continue
             self._poll_active_endpoint_once()
             now = time.monotonic()
-            if now - float(self._last_slr_poll_mono or 0.0) >= 1.0:
+            if self._lrf_locked and now - float(self._last_slr_poll_mono or 0.0) >= 1.0:
                 self._last_slr_poll_mono = now
                 self._poll_laser_range_once()
             interval = 1.0 if not self.gimbal_telemetry_ok() else 0.5
