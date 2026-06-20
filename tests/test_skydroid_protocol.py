@@ -183,6 +183,20 @@ def test_slr_post_move_samples() -> None:
     assert post == [40.1, 42.1, 42.2]
     assert SkydroidTopUdpAdapter._slr_samples_moved_from_baseline(samples, 81.4) is True
     assert SkydroidTopUdpAdapter._slr_samples_moved_from_baseline([52.2, 52.3], 52.2) is False
+    assert SkydroidTopUdpAdapter._slr_samples_moved_from_baseline([52.2], None) is False
+    assert SkydroidTopUdpAdapter._slr_moved_from_baseline(52.0, None) is False
+
+
+def test_gimbal_attitude_moved() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    assert (
+        SkydroidTopUdpAdapter._gimbal_attitude_moved((10.0, 5.0), (10.5, 5.0)) is True
+    )
+    assert (
+        SkydroidTopUdpAdapter._gimbal_attitude_moved((10.0, 5.0), (10.0, 5.0)) is False
+    )
+    assert SkydroidTopUdpAdapter._gimbal_attitude_moved(None, (1.0, 2.0)) is None
 
 
 def test_slr_median_and_converged() -> None:
