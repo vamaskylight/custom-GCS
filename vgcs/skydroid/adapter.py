@@ -57,9 +57,10 @@ _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
 _LRF_REPOINT_AFTER_S = 4.0
 _LRF_MAX_REPOINTS = 2
-_LRF_GIMBAL_SLEW_SPEED_DPS = 18.0
-_LRF_GIMBAL_SLEW_MIN_S = 1.0
-_LRF_GIMBAL_SLEW_MAX_S = 3.5
+_LRF_GIMBAL_SLEW_SPEED_DPS = 5.0
+_LRF_GIMBAL_HOLD_REFRESH_S = 0.08
+_LRF_GIMBAL_SLEW_MIN_S = 1.5
+_LRF_GIMBAL_SLEW_MAX_S = 5.0
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.45
 _PROBE_TIMEOUT_S = 0.12
 
@@ -193,8 +194,56 @@ class SkydroidTopUdpAdapter:
         dpitch = oy * (_LRF_FOV_V_DEG / 2.0)
         return float(dyaw), float(dpitch)
 
+    def _ensure_active_transport(self) -> None:
+        host = str(self._active_host or self._hosts[0] or "").strip()
+        if host:
+            self._transport.set_route_host(host)
+            self._transport._host = host
+
+    def _send_gimbal_speed_burst(
+        self,
+        yaw_rate: float,
+        pitch_rate: float,
+        duration_s: float,
+        *,
+        log_first: bool = True,
+    ) -> None:
+        """Hold-style GSY/GSP refresh loop — C13 ignores one-shot GSM packets."""
+        self._ensure_active_transport()
+        self._drop_pending_motion_commands()
+        deadline = time.monotonic() + max(0.1, float(duration_s))
+        tick = max(0.05, float(_LRF_GIMBAL_HOLD_REFRESH_S))
+        sent = 0
+        while time.monotonic() < deadline:
+            y = float(yaw_rate)
+            p = float(pitch_rate)
+            if abs(y) >= 0.05:
+                frame = build_top_frame("GSY", {"yaw": y})
+                self._transport.send_and_receive(
+                    frame,
+                    expect_reply=False,
+                    log=log_first and sent == 0,
+                    timeout_s=0.05,
+                )
+            if abs(p) >= 0.05:
+                frame = build_top_frame("GSP", {"pitch": p})
+                self._transport.send_and_receive(
+                    frame,
+                    expect_reply=False,
+                    log=False,
+                    timeout_s=0.05,
+                )
+            sent += 1
+            time.sleep(tick)
+        stop = build_gimbal_speed(0.0, 0.0)
+        for _ in range(4):
+            self._transport.send_and_receive(
+                stop, expect_reply=False, log=False, timeout_s=0.05
+            )
+            time.sleep(tick)
+
     @staticmethod
-    def _gimbal_velocity_rates_for_offset(
+    def _gimbal_hold_plan_for_offset(
         dyaw: float,
         dpitch: float,
         *,
@@ -202,16 +251,21 @@ class SkydroidTopUdpAdapter:
         max_dur_s: float = _LRF_GIMBAL_SLEW_MAX_S,
         min_dur_s: float = _LRF_GIMBAL_SLEW_MIN_S,
     ) -> tuple[float, float, float]:
-        """GSM speed-mode slew toward click offset (C13 uses GSY/GSP/GSM, not GAY/GAP)."""
+        """UI-matched hold speeds + duration to cover click offset (deg)."""
         if abs(float(dyaw)) < 0.2 and abs(float(dpitch)) < 0.2:
             return 0.0, 0.0, 0.0
+        spd = max(2.5, float(speed_dps))
+        yaw_rate = 0.0
+        pitch_rate = 0.0
+        if abs(float(dyaw)) >= 0.2:
+            yaw_rate = spd if float(dyaw) > 0.0 else -spd
+        if abs(float(dpitch)) >= 0.2:
+            pitch_rate = -spd if float(dpitch) > 0.0 else spd
         max_angle = max(abs(float(dyaw)), abs(float(dpitch)))
         dur = max(
             float(min_dur_s),
-            min(float(max_dur_s), max_angle / max(1.0, float(speed_dps)) + 0.35),
+            min(float(max_dur_s), max_angle / spd + 0.65),
         )
-        yaw_rate = float(dyaw) / dur if abs(float(dyaw)) > 0.2 else 0.0
-        pitch_rate = -float(dpitch) / dur if abs(float(dpitch)) > 0.2 else 0.0
         return yaw_rate, pitch_rate, dur
 
     def _send_gimbal_point_at_pixel(
@@ -220,34 +274,28 @@ class SkydroidTopUdpAdapter:
         y_px: int,
         att_now: tuple[float, float] | None,
     ) -> tuple[float, float] | None:
-        """Point C13 gimbal at click using GSM velocity slew (same path as UI hold-to-pan)."""
+        """Point C13 gimbal at click using hold-style GSY/GSP burst (same as UI pan buttons)."""
+        self._ensure_active_transport()
         if att_now is None:
             att_now = self._read_gimbal_attitude_deg()
         if att_now is None:
             print("[VGCS:lrf] gimbal slew skipped — no GAC attitude")
             return None
         dyaw, dpitch_img = self._pixel_boresight_offset_deg(x_px, y_px)
-        yaw_rate, pitch_rate, dur = self._gimbal_velocity_rates_for_offset(
+        yaw_rate, pitch_rate, dur = self._gimbal_hold_plan_for_offset(
             dyaw, dpitch_img
         )
         if dur <= 0.0:
             return att_now
         yaw_tgt = float(att_now[0]) + dyaw
         pitch_tgt = max(-90.0, min(90.0, float(att_now[1]) - dpitch_img))
-        gsm = build_gimbal_speed(yaw_rate, pitch_rate)
-        self._transport.send_and_receive(
-            gsm, expect_reply=False, log=True, timeout_s=0.08
-        )
         print(
-            f"[VGCS:lrf] gimbal slew GSM px=({x_px},{y_px}) "
+            f"[VGCS:lrf] gimbal slew hold px=({x_px},{y_px}) "
             f"-> target yaw={yaw_tgt:.2f} pitch={pitch_tgt:.2f} "
-            f"rates=({yaw_rate:.1f},{pitch_rate:.1f})°/s dur={dur:.1f}s"
+            f"rates=({yaw_rate:.1f},{pitch_rate:.1f})°/s dur={dur:.1f}s "
+            f"host={self._active_host}:{self._transport._port}"
         )
-        time.sleep(dur)
-        stop = build_gimbal_speed(0.0, 0.0)
-        self._transport.send_and_receive(
-            stop, expect_reply=False, log=True, timeout_s=0.08
-        )
+        self._send_gimbal_speed_burst(yaw_rate, pitch_rate, dur)
         time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
         att_after = self._read_gimbal_attitude_deg()
         for _ in range(4):
@@ -268,16 +316,15 @@ class SkydroidTopUdpAdapter:
                 {
                     "yaw": yaw_tgt,
                     "pitch": pitch_tgt,
-                    "speed": _LRF_GIMBAL_SLEW_SPEED_DPS,
+                    "speed": 25.0,
                 },
             )
-            self._transport.send_and_receive(
-                gam, expect_reply=False, log=True, timeout_s=0.08
-            )
-            time.sleep(min(_LRF_GIMBAL_SLEW_MAX_S, dur + 0.5))
-            self._transport.send_and_receive(
-                stop, expect_reply=False, log=True, timeout_s=0.08
-            )
+            for i in range(3):
+                self._transport.send_and_receive(
+                    gam, expect_reply=False, log=i == 0, timeout_s=0.05
+                )
+                time.sleep(0.35)
+            self._send_gimbal_speed_burst(0.0, 0.0, 0.2)
             time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
             att_after = self._read_gimbal_attitude_deg()
             move_deg = (
@@ -778,7 +825,10 @@ class SkydroidTopUdpAdapter:
             if dist_m is not None:
                 print(f"[VGCS:lrf] lock ok range={dist_m:.1f} m (samples={len(samples)})")
             else:
-                print("[VGCS:lrf] lock failed — no SLR samples")
+                print(
+                    f"[VGCS:lrf] lock failed — no stable range "
+                    f"(samples={len(samples)}, baseline={baseline_m})"
+                )
             return dist_m
         except Exception as exc:
             print(f"[VGCS:lrf] lock exception: {exc}")

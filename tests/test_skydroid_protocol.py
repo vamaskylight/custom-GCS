@@ -216,18 +216,18 @@ def test_gimbal_total_move_deg() -> None:
     assert deg > 10.0
 
 
-def test_gimbal_velocity_rates_for_offset() -> None:
+def test_gimbal_hold_plan_for_offset() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     dy, dp = SkydroidTopUdpAdapter._pixel_boresight_offset_deg(791, 249)
-    yaw_r, pitch_r, dur = SkydroidTopUdpAdapter._gimbal_velocity_rates_for_offset(dy, dp)
-    assert dur >= 1.0
+    yaw_r, pitch_r, dur = SkydroidTopUdpAdapter._gimbal_hold_plan_for_offset(dy, dp)
+    assert dur >= 1.5
     assert yaw_r > 0.0
     assert pitch_r > 0.0
-    assert abs(abs(yaw_r) * dur - abs(dy)) < abs(dy) * 0.15 + 0.05
-    assert abs(abs(pitch_r) * dur - abs(dp)) < abs(dp) * 0.15 + 0.05
+    assert abs(yaw_r) == 5.0
+    assert abs(pitch_r) == 5.0
 
-    zero = SkydroidTopUdpAdapter._gimbal_velocity_rates_for_offset(0.0, 0.0)
+    zero = SkydroidTopUdpAdapter._gimbal_hold_plan_for_offset(0.0, 0.0)
     assert zero == (0.0, 0.0, 0.0)
 
 
