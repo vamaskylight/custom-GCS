@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
 from vgcs.skydroid.protocol import (
     build_gac_query,
+    build_gimbal_speed,
     build_got_target,
     build_slr_query,
     build_sum_track,
@@ -56,10 +57,9 @@ _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
 _LRF_REPOINT_AFTER_S = 4.0
 _LRF_MAX_REPOINTS = 2
-_LRF_GIMBAL_SLEW_SPEED_DPS = 4.0
+_LRF_GIMBAL_SLEW_SPEED_DPS = 5.0
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
-_LRF_GIMBAL_CLOSED_LOOP_MAX_S = 6.0
-_LRF_GIMBAL_AIM_TOL_DEG = 1.25
+_LRF_GIMBAL_AXIS_MAX_S = 3.5
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.75
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.35
 _PROBE_TIMEOUT_S = 0.12
@@ -238,59 +238,106 @@ class SkydroidTopUdpAdapter:
                 f"expected≈{expected:.1f}° att={att_start}->{att_end}"
             )
             return False
-        yaw_err = abs(self._angle_err_deg(yaw_tgt, att_end[0]))
-        pitch_err = abs(self._angle_err_deg(pitch_tgt, att_end[1]))
-        if yaw_err > 2.5 or pitch_err > 2.5:
+        if move < 0.25 and expected > 2.0:
             print(
-                f"[VGCS:lrf] gimbal missed aim err=({yaw_err:.1f},{pitch_err:.1f})° "
-                f"target=({yaw_tgt:.1f},{pitch_tgt:.1f}) att={att_end}"
+                f"[VGCS:lrf] gimbal did not move ({move:.1f}°) "
+                f"expected≈{expected:.1f}° att={att_start}->{att_end}"
             )
             return False
-        return move >= _LRF_GIMBAL_MOVE_MIN_DEG or expected < 1.0
+        yaw_err = abs(self._angle_err_deg(yaw_tgt, att_end[0]))
+        yaw_delta = abs(float(att_end[0]) - float(att_start[0]))
+        pitch_gac_stuck = (
+            abs(float(att_end[1])) < 0.05
+            and abs(float(att_start[1])) < 0.05
+            and abs(float(dpitch)) > 1.0
+        )
+        if pitch_gac_stuck:
+            return yaw_err <= 2.5 or yaw_delta >= abs(float(dyaw)) * 0.35
+        pitch_err = abs(self._angle_err_deg(pitch_tgt, att_end[1]))
+        if yaw_err > 2.5 and yaw_delta < abs(float(dyaw)) * 0.35:
+            print(
+                f"[VGCS:lrf] gimbal missed aim yaw_err={yaw_err:.1f}° "
+                f"target={yaw_tgt:.1f} att={att_end}"
+            )
+            return False
+        if pitch_err > 2.5:
+            print(
+                f"[VGCS:lrf] gimbal missed aim pitch_err={pitch_err:.1f}° "
+                f"target={pitch_tgt:.1f} att={att_end}"
+            )
+            return False
+        return True
 
-    def _slew_gimbal_to_target_angles(
+    def _hold_speed_direct_burst(
         self,
+        yaw_rate: float,
+        pitch_rate: float,
+        duration_s: float,
+    ) -> None:
+        """GSY/GSP refresh without GAC reads (GAC polling blocks the transport lock)."""
+        self._ensure_active_transport()
+        deadline = time.monotonic() + max(0.12, min(_LRF_GIMBAL_AXIS_MAX_S, float(duration_s)))
+        tick = max(0.05, float(_LRF_GIMBAL_HOLD_REFRESH_S))
+        while time.monotonic() < deadline:
+            y = float(yaw_rate)
+            p = float(pitch_rate)
+            if abs(y) >= 0.05:
+                self._transport.send_and_receive(
+                    build_top_frame("GSY", {"yaw": y}),
+                    expect_reply=False,
+                    log=False,
+                    timeout_s=0.05,
+                )
+            if abs(p) >= 0.05:
+                self._transport.send_and_receive(
+                    build_top_frame("GSP", {"pitch": p}),
+                    expect_reply=False,
+                    log=False,
+                    timeout_s=0.05,
+                )
+            time.sleep(tick)
+        stop = build_gimbal_speed(0.0, 0.0)
+        for _ in range(4):
+            self._transport.send_and_receive(
+                stop, expect_reply=False, log=False, timeout_s=0.05
+            )
+            time.sleep(tick)
+
+    def _slew_gimbal_open_loop_offset(
+        self,
+        dyaw: float,
+        dpitch: float,
+        att_start: tuple[float, float],
         yaw_tgt: float,
-        pitch_tgt: float,
         *,
         speed_dps: float = _LRF_GIMBAL_SLEW_SPEED_DPS,
-        max_s: float = _LRF_GIMBAL_CLOSED_LOOP_MAX_S,
     ) -> tuple[float, float] | None:
-        """Closed-loop GSY/GSP hold until GAC reaches target or timeout."""
-        self._ensure_active_transport()
-        self._drop_pending_motion_commands()
-        spd = max(2.0, min(6.0, float(speed_dps)))
-        tick = max(0.05, float(_LRF_GIMBAL_HOLD_REFRESH_S))
-        deadline = time.monotonic() + max(1.0, float(max_s))
-        last_att: tuple[float, float] | None = None
-        while time.monotonic() < deadline:
-            att = self._read_gimbal_attitude_deg()
-            if att is not None:
-                last_att = att
-            elif last_att is None:
-                time.sleep(tick)
-                continue
-            else:
-                att = last_att
-            yaw_err = self._angle_err_deg(yaw_tgt, att[0])
-            pitch_err = self._angle_err_deg(pitch_tgt, att[1])
-            if (
-                abs(yaw_err) < _LRF_GIMBAL_AIM_TOL_DEG
-                and abs(pitch_err) < _LRF_GIMBAL_AIM_TOL_DEG
-            ):
-                print(
-                    f"[VGCS:lrf] slew on-target att={att} "
-                    f"err=({yaw_err:.1f},{pitch_err:.1f})°"
-                )
-                break
-            yaw_r = spd if yaw_err > 0.4 else (-spd if yaw_err < -0.4 else 0.0)
-            pitch_r = spd if pitch_err > 0.4 else (-spd if pitch_err < -0.4 else 0.0)
-            self.set_speed(yaw_r, pitch_r)
-            time.sleep(tick)
-        for _ in range(6):
-            self.set_speed(0.0, 0.0)
-            time.sleep(tick)
-        return self._read_gimbal_attitude_deg()
+        """Timed pitch-then-yaw burst; one optional yaw correction from GAC."""
+        spd = max(2.5, float(speed_dps))
+        if abs(float(dpitch)) >= 0.3:
+            pitch_r = -spd if float(dpitch) > 0.0 else spd
+            dur_p = min(_LRF_GIMBAL_AXIS_MAX_S, abs(float(dpitch)) / spd + 0.3)
+            self._hold_speed_direct_burst(0.0, pitch_r, dur_p)
+        if abs(float(dyaw)) >= 0.3:
+            yaw_r = spd if float(dyaw) > 0.0 else -spd
+            dur_y = min(_LRF_GIMBAL_AXIS_MAX_S, abs(float(dyaw)) / spd + 0.3)
+            self._hold_speed_direct_burst(yaw_r, 0.0, dur_y)
+        time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+        att = self._read_gimbal_attitude_deg()
+        if att is None:
+            return None
+        yaw_err = self._angle_err_deg(yaw_tgt, att[0])
+        if abs(yaw_err) > 2.0:
+            yaw_r = spd if yaw_err > 0.0 else -spd
+            dur_c = min(2.5, abs(yaw_err) / spd + 0.25)
+            print(
+                f"[VGCS:lrf] yaw correction err={yaw_err:.1f}° "
+                f"dur={dur_c:.1f}s att={att_start}->{att}"
+            )
+            self._hold_speed_direct_burst(yaw_r, 0.0, dur_c)
+            time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+            att = self._read_gimbal_attitude_deg() or att
+        return att
 
     def _send_gimbal_point_at_pixel(
         self,
@@ -311,15 +358,15 @@ class SkydroidTopUdpAdapter:
         if abs(dyaw) < 0.2 and abs(dpitch_img) < 0.2:
             return att_now, True
         print(
-            f"[VGCS:lrf] gimbal closed-loop px=({x_px},{y_px}) "
+            f"[VGCS:lrf] gimbal slew px=({x_px},{y_px}) "
             f"att={att_now} -> target=({yaw_tgt:.2f},{pitch_tgt:.2f}) "
             f"offset=({dyaw:.1f}°,{dpitch_img:.1f}°) "
             f"endpoint={self._active_host}:{self._active_port}"
         )
-        att_after = self._slew_gimbal_to_target_angles(yaw_tgt, pitch_tgt)
-        time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
-        if att_after is None:
-            att_after = self._read_gimbal_attitude_deg()
+        self._drop_pending_motion_commands()
+        att_after = self._slew_gimbal_open_loop_offset(
+            dyaw, dpitch_img, att_now, yaw_tgt
+        )
         aim_ok = self._gimbal_aim_ok(
             att_now,
             att_after,
@@ -637,6 +684,12 @@ class SkydroidTopUdpAdapter:
                 )
                 return None
 
+            if on_sample is not None:
+                try:
+                    on_sample(float(baseline_m))
+                except Exception:
+                    pass
+
             att_after_point, slew_ok = self._send_gimbal_point_at_pixel(
                 x_px, y_px, att_before
             )
@@ -645,11 +698,7 @@ class SkydroidTopUdpAdapter:
             att_latest = att_after_point or att_before
 
             if not slew_ok:
-                for _ in range(4):
-                    self.set_speed(0.0, 0.0)
-                    time.sleep(_LRF_GIMBAL_HOLD_REFRESH_S)
-                print("[VGCS:lrf] lock failed — gimbal overshot or missed aim")
-                return None
+                print("[VGCS:lrf] gimbal aim uncertain — continuing SLR poll")
 
             samples: list[float] = []
             start_mono = time.monotonic()
@@ -662,16 +711,7 @@ class SkydroidTopUdpAdapter:
                 *,
                 force: bool = False,
             ) -> None:
-                if on_sample is None or baseline_m is None:
-                    return
-                slr_moved = self._slr_moved_enough(
-                    value_m, baseline_m, min_m=_LRF_MOVED_MIN_M
-                )
-                gimbal_ok = (
-                    self._gimbal_total_move_deg(att_before, att_now)
-                    >= _LRF_GIMBAL_ACCEPT_MIN_DEG
-                )
-                if not force and not slr_moved and not gimbal_ok:
+                if on_sample is None:
                     return
                 try:
                     on_sample(float(value_m))
