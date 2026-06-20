@@ -9754,7 +9754,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
         self._refresh_lrf_lock_overlay()
-        self._set_status("Locking LRF target… (waiting for tracker)")
+        self._set_status("Locking LRF target… (wait for tracker, up to 12 s)")
         fw, fh = 1280, 720
         try:
             im = getattr(self, "_native_video_last", None)
@@ -9774,7 +9774,10 @@ class MapWidget(QWidget):
                 self._lrf_lock_distance_m = None
                 self._refresh_lrf_lock_overlay()
                 self._obstacle_radar.set_c13_lrf_armed(False)
-                self._set_status("LRF lock failed — try another point on the target")
+                self._set_status(
+                    "LRF lock failed — range did not update. Hold gimbal steady and retry, "
+                    "or lock via RC then tap ⌖ to refresh."
+                )
                 return
             dm = float(dist)
             self._lrf_lock_uv = (float(u), float(v))

@@ -23,6 +23,15 @@ from vgcs.skydroid.transport import TopUdpTransport
 # PROTOCAL.doc: TOP UDP port 5000; lens/system also on 9003 on some C13 builds.
 _C13_PROBE_PORTS = (5000, 9003, 19856)
 _ZOOM_EXTRA_PORTS = (9003, 19853)
+
+# LRF lock: SLR reads along laser boresight — wait for tracker slew before accepting range.
+_LRF_LOCK_MIN_WAIT_S = 2.0
+_LRF_LOCK_MAX_WAIT_S = 12.0
+_LRF_LOCK_POLL_S = 0.45
+_LRF_BASELINE_EPS_M = 1.5
+_LRF_STABLE_EPS_M = 0.9
+_LRF_MOVED_MIN_M = 2.0
+_LRF_SAME_RANGE_ACCEPT_S = 7.5
 _PROBE_TIMEOUT_S = 0.12
 
 # Motion commands: no UDP reply wait (C13 often has no timely ACK for GSY/GSP/GSM).
@@ -132,6 +141,33 @@ class SkydroidTopUdpAdapter:
         with self._status_lock:
             return bool(self._lrf_locked)
 
+    def _send_got_track(self, x_px: int, y_px: int, *, frame_w: int, frame_h: int) -> None:
+        got = build_got_target(x_px, y_px, frame_w=frame_w, frame_h=frame_h)
+        self._transport.send_and_receive(
+            got, expect_reply=False, log=True, timeout_s=0.08
+        )
+        time.sleep(0.12)
+        confirm = build_sum_track(confirm=True)
+        self._transport.send_and_receive(
+            confirm, expect_reply=False, log=True, timeout_s=0.08
+        )
+
+    @staticmethod
+    def _slr_tail_stable(samples: list[float], n: int = 3) -> tuple[float, float] | None:
+        if len(samples) < n:
+            return None
+        tail = samples[-n:]
+        spread = max(tail) - min(tail)
+        if spread > _LRF_STABLE_EPS_M:
+            return None
+        return sum(tail) / len(tail), spread
+
+    @staticmethod
+    def _slr_moved_from_baseline(value_m: float, baseline_m: float | None) -> bool:
+        if baseline_m is None:
+            return True
+        return abs(float(value_m) - float(baseline_m)) >= _LRF_MOVED_MIN_M
+
     def lock_lrf_target_at_norm(
         self,
         u: float,
@@ -164,40 +200,77 @@ class SkydroidTopUdpAdapter:
             self._transport.send_and_receive(
                 stop, expect_reply=False, log=True, timeout_s=0.08
             )
-            time.sleep(0.08)
-
-            got = build_got_target(x_px, y_px, frame_w=fw, frame_h=fh)
-            self._transport.send_and_receive(
-                got, expect_reply=False, log=True, timeout_s=0.08
-            )
             time.sleep(0.1)
-            confirm = build_sum_track(confirm=True)
-            self._transport.send_and_receive(
-                confirm, expect_reply=False, log=True, timeout_s=0.08
-            )
+            self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
 
-            # Tracker/gimbal must slew onto the pick before SLR (along boresight).
             samples: list[float] = []
-            deadline = time.monotonic() + 4.5
+            start_mono = time.monotonic()
+            deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
+            next_resend = 2.0
+
             while time.monotonic() < deadline:
-                time.sleep(0.35)
+                elapsed = time.monotonic() - start_mono
+                if elapsed >= next_resend and next_resend <= 8.0:
+                    print(f"[VGCS:lrf] re-send GOT+SUM @ {next_resend:.1f}s")
+                    self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
+                    next_resend += 3.0
+
+                time.sleep(_LRF_LOCK_POLL_S)
                 reading = self._query_slr_distance_m(log=True)
                 if reading is None:
                     continue
                 samples.append(float(reading))
-                print(f"[VGCS:lrf] SLR sample {reading:.1f} m (n={len(samples)})")
-                if baseline_m is not None and abs(reading - baseline_m) >= 2.0:
-                    if len(samples) >= 2 and abs(samples[-1] - samples[-2]) < 1.0:
-                        dist_m = float(samples[-1])
-                        break
-                if len(samples) >= 3:
-                    tail = samples[-3:]
-                    if max(tail) - min(tail) < 0.8:
-                        dist_m = sum(tail) / len(tail)
+                print(f"[VGCS:lrf] SLR sample {reading:.1f} m (n={len(samples)}, t={elapsed:.1f}s)")
+
+                if elapsed < _LRF_LOCK_MIN_WAIT_S:
+                    continue
+
+                stable = self._slr_tail_stable(samples, 3)
+                if stable is None:
+                    continue
+                avg, _spread = stable
+
+                if self._slr_moved_from_baseline(avg, baseline_m):
+                    dist_m = float(avg)
+                    print(f"[VGCS:lrf] accept moved range {dist_m:.1f} m (baseline={baseline_m})")
+                    break
+
+                # Readings still at old boresight — keep waiting for tracker slew.
+                if elapsed >= _LRF_SAME_RANGE_ACCEPT_S:
+                    climbing = len(samples) >= 4 and samples[-1] > samples[0] + 1.0
+                    if not climbing and baseline_m is not None and abs(avg - baseline_m) < _LRF_BASELINE_EPS_M:
+                        print(
+                            f"[VGCS:lrf] accept same-range {avg:.1f} m "
+                            f"after {elapsed:.1f}s (target likely at current boresight)"
+                        )
+                        dist_m = float(avg)
                         break
 
+                # Trending farther — do not accept early while still climbing.
+                if len(samples) >= 4 and samples[-1] > samples[-4] + 3.0:
+                    continue
+
             if dist_m is None and samples:
-                dist_m = float(samples[-1])
+                elapsed = time.monotonic() - start_mono
+                stable = self._slr_tail_stable(samples, min(5, len(samples)))
+                if stable is not None:
+                    avg, _spread = stable
+                    if self._slr_moved_from_baseline(avg, baseline_m):
+                        dist_m = float(avg)
+                    elif elapsed >= _LRF_LOCK_MAX_WAIT_S - 0.5:
+                        if baseline_m is not None and abs(avg - baseline_m) < _LRF_BASELINE_EPS_M:
+                            print(
+                                f"[VGCS:lrf] lock rejected — SLR stayed at baseline "
+                                f"{baseline_m:.1f} m (need tracker slew to new target)"
+                            )
+                            dist_m = None
+                        else:
+                            dist_m = float(avg)
+                if dist_m is None and samples:
+                    peak = max(samples[-min(8, len(samples)):])
+                    if baseline_m is not None and peak - baseline_m >= _LRF_MOVED_MIN_M:
+                        dist_m = float(peak)
+                        print(f"[VGCS:lrf] accept peak sample {dist_m:.1f} m")
 
             with self._status_lock:
                 if dist_m is not None:
@@ -567,7 +640,7 @@ class SkydroidTopUdpAdapter:
                 continue
             self._poll_active_endpoint_once()
             now = time.monotonic()
-            if self._lrf_locked and now - float(self._last_slr_poll_mono or 0.0) >= 1.0:
+            if self._lrf_locked and now - float(self._last_slr_poll_mono or 0.0) >= 0.5:
                 self._last_slr_poll_mono = now
                 self._poll_laser_range_once()
             interval = 1.0 if not self.gimbal_telemetry_ok() else 0.5
