@@ -518,6 +518,7 @@ class ObstacleRadarPanel(QFrame):
 
         self._obstacle = ObstacleDistanceState()
         self._rangefinder = DistanceSensorState()
+        self._rangefinder_subtitle = "Rangefinder"
         self._proximity_stream_seen = False
         self._rangefinder_stream_seen = False
         self._active_sensor: str | None = None
@@ -693,12 +694,37 @@ class ObstacleRadarPanel(QFrame):
         self._rangefinder_stream_seen = True
 
         ori = _orientation_label(st.orientation)
+        self._rangefinder_subtitle = ori
         if cur_m is not None and cur_m >= 0:
             close = cur_m < 2.0
             self._metric_range.set_reading(f"{cur_m:.1f} m", subtitle=ori, alert=close)
         else:
             self._metric_range.set_reading("—", subtitle="Rangefinder")
 
+        self._set_sensor_active("rf")
+        self._sync_status_line()
+
+    def set_companion_lrf_range_m(self, distance_m: float | None) -> None:
+        """C13 built-in laser rangefinder (TOP SLR), line-of-sight range in metres."""
+        try:
+            cur_m = None if distance_m is None else float(distance_m)
+        except (TypeError, ValueError):
+            cur_m = None
+        if cur_m is None or cur_m < 0:
+            return
+        st = DistanceSensorState(
+            sensor_type=_SENSOR_LASER,
+            orientation=0,
+            current_distance_m=cur_m,
+            min_distance_m=5.0,
+            max_distance_m=1000.0,
+            updated_mono=time.monotonic(),
+        )
+        self._rangefinder = st
+        self._rangefinder_subtitle = "C13 LRF"
+        self._rangefinder_stream_seen = True
+        close = cur_m < 15.0
+        self._metric_range.set_reading(f"{cur_m:.1f} m", subtitle="C13 LRF", alert=close)
         self._set_sensor_active("rf")
         self._sync_status_line()
 
@@ -725,5 +751,6 @@ class ObstacleRadarPanel(QFrame):
         if rf is None or rf < 0:
             r_text = "N/A"
         else:
-            r_text = f"{rf:.1f} m ({_orientation_label(self._rangefinder.orientation)})"
+            sub = str(getattr(self, "_rangefinder_subtitle", "Rangefinder") or "Rangefinder")
+            r_text = f"{rf:.1f} m ({sub})"
         return n_text, r_text

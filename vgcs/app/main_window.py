@@ -74,6 +74,7 @@ from vgcs.video.camera_control import (
     CompositeGimbalCameraControl,
     MavlinkCameraControl,
     NoopCameraControl,
+    read_companion_laser_range_m,
     SiyiCameraControl,
     SkydroidCameraControl,
     resolve_siyi_host,
@@ -458,6 +459,10 @@ class MainWindow(QMainWindow):
         self._flight_timer.setInterval(1000)
         self._flight_timer.timeout.connect(self._on_flight_timer_tick)
         self._flight_timer.start()
+        self._c13_lrf_timer = QTimer(self)
+        self._c13_lrf_timer.setInterval(1000)
+        self._c13_lrf_timer.timeout.connect(self._refresh_c13_lrf_display)
+        self._c13_lrf_timer.start()
         self._dev_reload_shortcut = QShortcut(QKeySequence("Ctrl+Shift+R"), self)
         self._dev_reload_shortcut.activated.connect(self._on_dev_reload)
         self._map_3d_shortcut = QShortcut(QKeySequence("Ctrl+3"), self)
@@ -4560,6 +4565,28 @@ class MainWindow(QMainWindow):
         self._settings.setValue("watchdog_timeout_s", 2.0)
         self._settings.setValue("ui_theme", "Default")
         self._append_log("UI defaults restored.")
+
+    def _refresh_c13_lrf_display(self) -> None:
+        """Poll C13 TOP SLR (laser rangefinder) and mirror to PROXIMITY + Systems LRF."""
+        if not bool(getattr(self, "_heartbeat_seen", False)):
+            return
+        provider = str(self._settings.value("camera/provider", "mavlink") or "mavlink").strip().lower()
+        if provider != "skydroid":
+            return
+        cc = self._camera_control_backend
+        dist = read_companion_laser_range_m(cc)
+        if dist is None:
+            return
+        text = f"{dist:.1f} m (C13)"
+        try:
+            self._fields["rangefinder"].setText(text)
+            self._apply_state_style(self._fields["rangefinder"], "ok")
+        except Exception:
+            pass
+        try:
+            self._map_widget.set_companion_laser_range_m(dist)
+        except Exception:
+            pass
 
     def _on_flight_timer_tick(self) -> None:
         try:

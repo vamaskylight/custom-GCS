@@ -396,6 +396,13 @@ class SkydroidCameraControl:
         except Exception:
             return None
 
+    def get_laser_range_m(self) -> float | None:
+        """C13 built-in laser rangefinder (TOP SLR), metres."""
+        try:
+            return self._adapter.get_laser_range_m()
+        except Exception:
+            return None
+
     def gimbal_center(self) -> None:
         try:
             self.ptz("center")
@@ -679,4 +686,19 @@ def camera_recording_applies_digital_zoom(source_id: str, control: object | None
     """
     _ = control
     return str(source_id or "").strip().lower() == "thermal"
+
+
+def read_companion_laser_range_m(control: object | None) -> float | None:
+    """C13 TOP SLR distance in metres when Skydroid backend is active."""
+    primary = resolve_camera_control_primary(control)
+    getter = getattr(primary, "get_laser_range_m", None)
+    if not callable(getter):
+        return None
+    try:
+        dist = getter()
+        if dist is None:
+            return None
+        return float(dist)
+    except Exception:
+        return None
 

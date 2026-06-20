@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
 
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
 from vgcs.skydroid.protocol import (
+    build_slr_query,
     build_top_frame,
     build_zoom_command_burst,
+    decode_slr_distance_m,
     extract_attitude_deg,
     parse_top_frame,
 )
@@ -97,11 +100,25 @@ class SkydroidTopUdpAdapter:
         self._gaa_enabled = False
         self._min_dt = 1.0 / max(1.0, float(rate_limit_hz))
         self._last_send_mono = 0.0
+        self._laser_range_m: float | None = None
+        self._laser_range_mono: float = 0.0
+        self._last_slr_poll_mono: float = 0.0
         self._active_port = int(port)
         self._transport.set_datagram_handler(self._maybe_update_status)
 
     def active_endpoint(self) -> tuple[str, int, str]:
         return (str(self._active_host), int(self._active_port), str(self._profile_id))
+
+    def get_laser_range_m(self, *, max_age_s: float = 4.0) -> float | None:
+        """Last C13 SLR reading (TOP tag SLR, metres). None when stale or unavailable."""
+        with self._status_lock:
+            dist = self._laser_range_m
+            ts = float(self._laser_range_mono or 0.0)
+        if dist is None or ts <= 0.0:
+            return None
+        if time.monotonic() - ts > max(0.5, float(max_age_s)):
+            return None
+        return float(dist)
 
     def gimbal_telemetry_ok(self) -> bool:
         with self._status_lock:
@@ -403,12 +420,55 @@ class SkydroidTopUdpAdapter:
             if not self._probe_finished.wait(timeout=0.25):
                 continue
             self._poll_active_endpoint_once()
+            now = time.monotonic()
+            if now - float(self._last_slr_poll_mono or 0.0) >= 1.0:
+                self._last_slr_poll_mono = now
+                self._poll_laser_range_once()
             interval = 1.0 if not self.gimbal_telemetry_ok() else 0.5
             time.sleep(interval)
+
+    def _poll_laser_range_once(self) -> None:
+        """C13 single laser rangefinding (PROTOCAL §4.22 SLR read on D-class)."""
+        if not self.gimbal_telemetry_ok():
+            return
+        active_port = int(self._transport._port)
+        try:
+            frame = build_slr_query()
+            reply = self._transport.send_and_receive(
+                frame,
+                expect_reply=True,
+                log=False,
+                timeout_s=0.35,
+            )
+            if reply:
+                self._maybe_update_slr(reply)
+        except Exception:
+            pass
+        finally:
+            self._transport._port = active_port
+
+    def _maybe_update_slr(self, payload: bytes) -> None:
+        dec = parse_top_frame(payload)
+        if dec is None or dec.command != "SLR":
+            return
+        data = str(dec.params.get("slr_data") or "")
+        if not data and dec.raw:
+            m = re.search(r"SLR([0-9A-Fa-f]{4})", dec.raw, re.IGNORECASE)
+            if m:
+                data = m.group(1)
+        dist_m = decode_slr_distance_m(data)
+        if dist_m is None:
+            return
+        with self._status_lock:
+            self._laser_range_m = float(dist_m)
+            self._laser_range_mono = time.monotonic()
 
     def _maybe_update_status(self, payload: bytes) -> None:
         dec = parse_top_frame(payload)
         if dec is None:
+            return
+        if dec.command == "SLR":
+            self._maybe_update_slr(payload)
             return
         yaw, pitch = extract_attitude_deg(dec)
         if yaw is None and pitch is None:
