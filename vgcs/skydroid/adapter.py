@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
 from vgcs.skydroid.protocol import (
+    build_gac_query,
     build_got_target,
     build_slr_query,
     build_sum_track,
@@ -18,6 +19,8 @@ from vgcs.skydroid.protocol import (
     extract_attitude_deg,
     parse_slr_distance_from_payload,
     parse_top_frame,
+    _LRF_FRAME_H,
+    _LRF_FRAME_W,
 )
 from vgcs.skydroid.transport import TopUdpTransport
 
@@ -42,6 +45,10 @@ _LRF_SETTLE_MIN_DRIFT_M = 2.0
 _LRF_POST_MOVE_MIN_WAIT_S = 2.5
 _LRF_POST_MOVE_SETTLE_S = 4.0
 _LRF_GOT_RESEND_INTERVAL_S = 2.0
+_LRF_BASELINE_RETRIES = 8
+_LRF_BASELINE_GAP_S = 0.2
+_LRF_POST_GOT_WAIT_S = 2.0
+_LRF_GIMBAL_MOVE_MIN_DEG = 0.35
 _PROBE_TIMEOUT_S = 0.12
 
 # Motion commands: no UDP reply wait (C13 often has no timely ACK for GSY/GSP/GSM).
@@ -221,7 +228,7 @@ class SkydroidTopUdpAdapter:
         samples: list[float], baseline_m: float | None
     ) -> bool:
         if baseline_m is None:
-            return bool(samples)
+            return False
         base = float(baseline_m)
         return any(abs(float(s) - base) >= _LRF_MOVED_MIN_M for s in samples)
 
@@ -230,12 +237,25 @@ class SkydroidTopUdpAdapter:
         samples: list[float], baseline_m: float | None
     ) -> list[float]:
         if baseline_m is None:
-            return [float(v) for v in samples]
+            return []
         base = float(baseline_m)
         for i, s in enumerate(samples):
             if abs(float(s) - base) >= _LRF_MOVED_MIN_M:
                 return [float(v) for v in samples[i:]]
         return []
+
+    @staticmethod
+    def _gimbal_attitude_moved(
+        before: tuple[float, float] | None,
+        after: tuple[float, float] | None,
+        *,
+        min_deg: float = _LRF_GIMBAL_MOVE_MIN_DEG,
+    ) -> bool | None:
+        if before is None or after is None:
+            return None
+        dy = abs(float(after[0]) - float(before[0]))
+        dp = abs(float(after[1]) - float(before[1]))
+        return dy >= float(min_deg) or dp >= float(min_deg)
 
     @staticmethod
     def _slr_tail_stable(samples: list[float], n: int = 3) -> tuple[float, float] | None:
@@ -301,23 +321,58 @@ class SkydroidTopUdpAdapter:
     @staticmethod
     def _slr_moved_from_baseline(value_m: float, baseline_m: float | None) -> bool:
         if baseline_m is None:
-            return True
+            return False
         return abs(float(value_m) - float(baseline_m)) >= _LRF_MOVED_MIN_M
+
+    def _read_slr_baseline_m(self) -> float | None:
+        """Median of several pre-lock SLR reads — required before accepting any lock."""
+        readings: list[float] = []
+        for _ in range(_LRF_BASELINE_RETRIES):
+            reading = self._query_slr_distance_m(log=False)
+            if reading is not None:
+                readings.append(float(reading))
+            time.sleep(_LRF_BASELINE_GAP_S)
+        if not readings:
+            return None
+        tail = readings[-min(5, len(readings)) :]
+        return float(self._slr_median(tail))
+
+    def _read_gimbal_attitude_deg(self) -> tuple[float, float] | None:
+        active_port = int(self._transport._port)
+        try:
+            reply = self._transport.send_and_receive(
+                build_gac_query(),
+                expect_reply=True,
+                log=False,
+                timeout_s=0.45,
+            )
+            if not reply:
+                return None
+            dec = parse_top_frame(reply)
+            yaw, pitch = extract_attitude_deg(dec)
+            if yaw is None and pitch is None:
+                return None
+            return float(yaw or 0.0), float(pitch or 0.0)
+        except Exception:
+            return None
+        finally:
+            self._transport._port = active_port
 
     def lock_lrf_target_at_norm(
         self,
         u: float,
         v: float,
         *,
-        frame_w: int = 1280,
-        frame_h: int = 720,
+        frame_w: int = _LRF_FRAME_W,
+        frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
         """GOT + SUM track confirm at video pixel, then read SLR after tracker settles."""
         if not self.gimbal_telemetry_ok():
             return None
-        fw = max(1, int(frame_w))
-        fh = max(1, int(frame_h))
+        # PROTOCAL §3.3.5: GOT coordinates are always on 1280×720 companion video.
+        fw = _LRF_FRAME_W
+        fh = _LRF_FRAME_H
         x_px = max(0, min(fw, int(round(max(0.0, min(1.0, float(u))) * fw))))
         y_px = max(0, min(fh, int(round(max(0.0, min(1.0, float(v))) * fh))))
         active_port = int(self._transport._port)
@@ -328,18 +383,26 @@ class SkydroidTopUdpAdapter:
                 self._laser_range_mono = 0.0
                 self._lrf_locked_distance_m = None
 
-            baseline_m = self._query_slr_distance_m(log=False)
+            baseline_m = self._read_slr_baseline_m()
+            att_before = self._read_gimbal_attitude_deg()
             print(
-                f"[VGCS:lrf] lock start px=({x_px},{y_px}) baseline={baseline_m}"
+                f"[VGCS:lrf] lock start px=({x_px},{y_px}) "
+                f"baseline={baseline_m} att={att_before}"
             )
+            if baseline_m is None:
+                print(
+                    "[VGCS:lrf] lock failed — cannot read SLR baseline (check C13 TOP link)"
+                )
+                return None
 
             # Reset any RC/previous track before selecting a new target.
             stop = build_sum_track(confirm=False)
             self._transport.send_and_receive(
                 stop, expect_reply=False, log=True, timeout_s=0.08
             )
-            time.sleep(0.1)
+            time.sleep(0.15)
             self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
+            time.sleep(_LRF_POST_GOT_WAIT_S)
 
             samples: list[float] = []
             start_mono = time.monotonic()
@@ -360,6 +423,7 @@ class SkydroidTopUdpAdapter:
                 if elapsed >= next_resend and next_resend <= _LRF_LOCK_MAX_WAIT_S - 1.0:
                     print(f"[VGCS:lrf] re-send GOT+SUM @ {next_resend:.1f}s")
                     self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
+                    time.sleep(0.75)
                     next_resend += _LRF_GOT_RESEND_INTERVAL_S
 
                 time.sleep(_LRF_LOCK_POLL_S)
@@ -373,7 +437,19 @@ class SkydroidTopUdpAdapter:
                 if elapsed < _LRF_LOCK_MIN_WAIT_S:
                     continue
 
+                att_now = self._read_gimbal_attitude_deg()
+                gimbal_moved = self._gimbal_attitude_moved(att_before, att_now)
+                if gimbal_moved is False and not self._slr_samples_moved_from_baseline(
+                    samples, baseline_m
+                ):
+                    continue
+
                 if not self._slr_samples_moved_from_baseline(samples, baseline_m):
+                    if gimbal_moved is True:
+                        print(
+                            f"[VGCS:lrf] gimbal slewed but SLR still {reading:.1f} m "
+                            f"(baseline={baseline_m:.1f} m) — waiting for laser…"
+                        )
                     continue
 
                 post = self._slr_post_move_samples(samples, baseline_m)
@@ -390,11 +466,13 @@ class SkydroidTopUdpAdapter:
                     continue
                 if not self._slr_moved_from_baseline(converged, baseline_m):
                     continue
+                if gimbal_moved is False:
+                    continue
 
                 print(
                     f"[VGCS:lrf] tracker slew ok {converged:.1f} m "
-                    f"(baseline={baseline_m}, t={elapsed:.1f}s, "
-                    f"since_move={elapsed_since_move:.1f}s)"
+                    f"(baseline={baseline_m}, att={att_before}->{att_now}, "
+                    f"t={elapsed:.1f}s, since_move={elapsed_since_move:.1f}s)"
                 )
                 dist_m = self._refine_slr_estimate(on_sample)
                 if dist_m is None:
@@ -403,8 +481,9 @@ class SkydroidTopUdpAdapter:
 
             if dist_m is None and samples:
                 post = self._slr_post_move_samples(samples, baseline_m)
-                if post and move_mono is not None:
-                    elapsed_since_move = time.monotonic() - float(move_mono)
+                att_now = self._read_gimbal_attitude_deg()
+                gimbal_moved = self._gimbal_attitude_moved(att_before, att_now)
+                if post and move_mono is not None and gimbal_moved is not False:
                     converged = self._slr_converged(
                         post, min(_LRF_CONVERGE_SAMPLES, len(post))
                     )
@@ -419,6 +498,11 @@ class SkydroidTopUdpAdapter:
                         print(
                             f"[VGCS:lrf] lock rejected — SLR stayed at baseline "
                             f"{baseline_m:.1f} m (GOT+SUM did not slew laser to target)"
+                        )
+                    elif gimbal_moved is False:
+                        print(
+                            f"[VGCS:lrf] lock rejected — gimbal did not move "
+                            f"(att={att_before}->{att_now}); check C13 tracking support"
                         )
                     else:
                         print(

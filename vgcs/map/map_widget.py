@@ -9773,13 +9773,6 @@ class MapWidget(QWidget):
         self._refresh_lrf_lock_overlay()
         self._set_status("Locking LRF target…")
         fw, fh = 1280, 720
-        try:
-            im = getattr(self, "_native_video_last", None)
-            if im is not None and not im.isNull():
-                fw = max(1, int(im.width()))
-                fh = max(1, int(im.height()))
-        except Exception:
-            pass
         task = _LrfLockTask(cc, u, v, self._lrf_lock_bridge, frame_w=fw, frame_h=fh)
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(task)
