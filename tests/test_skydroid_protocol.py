@@ -216,19 +216,27 @@ def test_gimbal_total_move_deg() -> None:
     assert deg > 10.0
 
 
-def test_gimbal_hold_plan_for_offset() -> None:
+def test_angle_err_deg() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
-    dy, dp = SkydroidTopUdpAdapter._pixel_boresight_offset_deg(791, 249)
-    yaw_r, pitch_r, dur = SkydroidTopUdpAdapter._gimbal_hold_plan_for_offset(dy, dp)
-    assert dur >= 1.5
-    assert yaw_r > 0.0
-    assert pitch_r > 0.0
-    assert abs(yaw_r) == 5.0
-    assert abs(pitch_r) == 5.0
+    assert SkydroidTopUdpAdapter._angle_err_deg(10.0, 0.0) == 10.0
+    assert SkydroidTopUdpAdapter._angle_err_deg(-5.0, 10.0) == -15.0
+    assert abs(abs(SkydroidTopUdpAdapter._angle_err_deg(85.0, -85.0)) - 10.0) < 0.01
 
-    zero = SkydroidTopUdpAdapter._gimbal_hold_plan_for_offset(0.0, 0.0)
-    assert zero == (0.0, 0.0, 0.0)
+
+def test_gimbal_aim_ok_rejects_overshoot() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    ok = SkydroidTopUdpAdapter._gimbal_aim_ok(
+        SkydroidTopUdpAdapter(),
+        (10.0, 0.0),
+        (90.0, 26.0),
+        yaw_tgt=-5.0,
+        pitch_tgt=2.0,
+        dyaw=-15.0,
+        dpitch=-2.0,
+    )
+    assert ok is False
 
 
 def test_slr_median_and_converged() -> None:
