@@ -2469,6 +2469,8 @@ class MapWidget(QWidget):
 
     def _show_mini_video_pip_shell(self) -> None:
         """Always paint the bottom-left PiP frame (even before FFmpeg / pipeline sources exist)."""
+        if not self._mini_video_pip_allowed():
+            return
         if not bool(getattr(self, "_web_ready", False)):
             return
         if self._plan_flight_layer_obscures_native_camera_ui():
@@ -2526,6 +2528,12 @@ class MapWidget(QWidget):
 
     def _layout_native_video_preview(self) -> None:
         try:
+            if not self._mini_video_pip_allowed():
+                try:
+                    self._native_video_preview.hide()
+                except Exception:
+                    pass
+                return
             if not bool(getattr(self, "_video_preview_enabled", False)):
                 return
             if self._plan_flight_layer_obscures_native_camera_ui():
@@ -3539,6 +3547,8 @@ class MapWidget(QWidget):
         """
         if not bool(getattr(self, "_video_split_enabled", False)):
             return
+        if not self._mini_video_pip_allowed():
+            return
         # Fullscreen from split: operator clicked a quadrant — stretch that channel only.
         if bool(getattr(self, "_video_swapped", False)):
             focus = getattr(self, "_split_fullscreen_source_id", None)
@@ -3776,10 +3786,6 @@ class MapWidget(QWidget):
                 QTimer.singleShot(1500, lambda: self._probe_current_tiles(reason="connect"))
             except Exception:
                 pass
-        webcam_enabled = bool(getattr(self, "_btn_webcam", None)) and bool(self._btn_webcam.isChecked())
-        # Do not stop video preview purely because telemetry link is down.
-        # This matches QGC behavior and avoids blank video when the vehicle is in
-        # pre-arm/GPS-failure states.
         if not c:
             # Keep camera controls hidden until MAVLink link-up (heartbeat).
             try:
@@ -3796,14 +3802,8 @@ class MapWidget(QWidget):
                 self._obstacle_radar.notify_link_connected(False)
             except Exception:
                 pass
-            # Companion RTSP (192.168.144.x) is independent of the serial MAVLink link — do not
-            # tear down FFmpeg or clear the preview pixmap on COM disconnect/reconnect.
-            if self._uses_companion_rtsp() and self._video_preview_should_run():
-                return
-            if webcam_enabled and bool(getattr(self, "_web_ready", False)):
-                self._start_video_preview()
-            else:
-                self._stop_video_preview(clear_overlay=True)
+            # Hide mini-video / split grid until the operator connects the vehicle.
+            self._stop_video_preview(clear_overlay=True)
             return
         # MAVLink connected: refresh HUD geometry (rail stays visible whenever map is ready; see `_on_map_loaded`).
         try:
@@ -3872,6 +3872,8 @@ class MapWidget(QWidget):
 
     def _companion_wire_preview_ui(self) -> bool:
         """Connect frame slots and show the native video overlay (no FFmpeg stop/start)."""
+        if not self._mini_video_pip_allowed():
+            return False
         if not self._video_preview_should_run():
             return False
         vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
@@ -4955,13 +4957,10 @@ class MapWidget(QWidget):
                         pass
             except Exception:
                 pass
-            # Start preview if user enabled it (do not require telemetry link).
+            # Start preview only after MAVLink connect (see `_on_mavlink_link_show_mini_video`).
             try:
                 if bool(getattr(self, "_last_link_connected", False)):
                     QTimer.singleShot(0, self._on_mavlink_link_show_mini_video)
-                elif self._video_preview_should_run():
-                    self._show_mini_video_pip_shell()
-                    self._auto_start_mini_video_pip(force_decode=False)
             except Exception:
                 pass
             # Auto-detect low-spec devices and reduce map workload if needed.
@@ -5087,6 +5086,8 @@ class MapWidget(QWidget):
         if not bool(getattr(self, "_web_ready", False)):
             return
         if not self._video_preview_should_run():
+            return
+        if not self._mini_video_pip_allowed():
             return
         vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
         if vp is None:
@@ -5317,6 +5318,10 @@ class MapWidget(QWidget):
             getattr(self, "_web_ready", False)
         )
 
+    def _mini_video_pip_allowed(self) -> bool:
+        """Bottom-left PiP / 2×2 split is shown only after the vehicle MAVLink link is up."""
+        return bool(getattr(self, "_last_link_connected", False))
+
     def _auto_start_mini_video_pip(
         self,
         *,
@@ -5324,11 +5329,11 @@ class MapWidget(QWidget):
         preserve_layout: bool = False,
     ) -> None:
         """Show bottom-left mini-video automatically when RTSP/UDP is configured."""
-        if not bool(getattr(self, "_last_link_connected", False)) and not self._video_preview_should_run():
+        if not self._mini_video_pip_allowed():
             return
-        self._show_mini_video_pip_shell()
         if not self._video_preview_should_run():
             return
+        self._show_mini_video_pip_shell()
         if preserve_layout:
             reset_swapped = False
         else:
@@ -5809,6 +5814,12 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             return
+        if not self._mini_video_pip_allowed():
+            try:
+                print("[VGCS:video] preview start skipped: vehicle not connected")
+            except Exception:
+                pass
+            return
         self._show_mini_video_pip_shell()
         try:
             self._video_preview_enabled = True
@@ -5980,7 +5991,7 @@ class MapWidget(QWidget):
             # Per-source `_on_pipeline_frame_for` owns split cache + paint (active is also in sources()).
             return
         if not bool(getattr(self, "_video_preview_enabled", False)):
-            if self._uses_companion_rtsp():
+            if self._uses_companion_rtsp() and self._mini_video_pip_allowed():
                 self._video_preview_enabled = True
                 if not bool(getattr(self, "_video_swap_user_map_main", False)):
                     self._video_swapped = False
