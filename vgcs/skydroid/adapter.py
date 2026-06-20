@@ -106,6 +106,7 @@ class SkydroidTopUdpAdapter:
         self._laser_range_mono: float = 0.0
         self._last_slr_poll_mono: float = 0.0
         self._lrf_locked = False
+        self._lrf_lock_external = False
         self._lrf_lock_x = 0
         self._lrf_lock_y = 0
         self._active_port = int(port)
@@ -130,6 +131,26 @@ class SkydroidTopUdpAdapter:
     def is_lrf_locked(self) -> bool:
         with self._status_lock:
             return bool(self._lrf_locked)
+
+    def is_lrf_lock_external(self) -> bool:
+        """True when lock came from RC/companion track, not a VGCS video pick."""
+        with self._status_lock:
+            return bool(self._lrf_lock_external)
+
+    def get_lrf_lock_video_norm(
+        self,
+        *,
+        frame_w: int = 1280,
+        frame_h: int = 720,
+    ) -> tuple[float, float] | None:
+        with self._status_lock:
+            if not self._lrf_locked:
+                return None
+            x_px = int(self._lrf_lock_x)
+            y_px = int(self._lrf_lock_y)
+        fw = max(1, int(frame_w))
+        fh = max(1, int(frame_h))
+        return (x_px / fw, y_px / fh)
 
     def lock_lrf_target_at_norm(
         self,
@@ -175,10 +196,12 @@ class SkydroidTopUdpAdapter:
             with self._status_lock:
                 if dist_m is not None:
                     self._lrf_locked = True
+                    self._lrf_lock_external = False
                     self._lrf_lock_x = x_px
                     self._lrf_lock_y = y_px
                 else:
                     self._lrf_locked = False
+                    self._lrf_lock_external = False
                     self._laser_range_m = None
                     self._laser_range_mono = 0.0
             return dist_m
@@ -203,6 +226,7 @@ class SkydroidTopUdpAdapter:
             self._transport._port = active_port
         with self._status_lock:
             self._lrf_locked = False
+            self._lrf_lock_external = False
             self._laser_range_m = None
             self._laser_range_mono = 0.0
             self._lrf_lock_x = 0
@@ -509,7 +533,16 @@ class SkydroidTopUdpAdapter:
                 continue
             self._poll_active_endpoint_once()
             now = time.monotonic()
-            if self._lrf_locked and now - float(self._last_slr_poll_mono or 0.0) >= 1.0:
+            slr_active = False
+            with self._status_lock:
+                if self._lrf_locked:
+                    slr_active = True
+                elif (
+                    self._laser_range_m is not None
+                    and time.monotonic() - float(self._laser_range_mono or 0.0) <= 4.0
+                ):
+                    slr_active = True
+            if slr_active and now - float(self._last_slr_poll_mono or 0.0) >= 1.0:
                 self._last_slr_poll_mono = now
                 self._poll_laser_range_once()
             interval = 1.0 if not self.gimbal_telemetry_ok() else 0.5
@@ -550,6 +583,14 @@ class SkydroidTopUdpAdapter:
         with self._status_lock:
             self._laser_range_m = float(dist_m)
             self._laser_range_mono = time.monotonic()
+            if not self._lrf_locked:
+                self._lrf_locked = True
+                self._lrf_lock_external = True
+                if self._lrf_lock_x <= 0 and self._lrf_lock_y <= 0:
+                    from vgcs.skydroid.protocol import _LRF_FRAME_H, _LRF_FRAME_W
+
+                    self._lrf_lock_x = int(_LRF_FRAME_W) // 2
+                    self._lrf_lock_y = int(_LRF_FRAME_H) // 2
 
     def _maybe_update_status(self, payload: bytes) -> None:
         dec = parse_top_frame(payload)

@@ -409,6 +409,20 @@ class SkydroidCameraControl:
         except Exception:
             return False
 
+    def is_lrf_lock_external(self) -> bool:
+        try:
+            fn = getattr(self._adapter, "is_lrf_lock_external", None)
+            return bool(fn()) if callable(fn) else False
+        except Exception:
+            return False
+
+    def get_lrf_lock_video_norm(self) -> tuple[float, float] | None:
+        try:
+            fn = getattr(self._adapter, "get_lrf_lock_video_norm", None)
+            return fn() if callable(fn) else None
+        except Exception:
+            return None
+
     def lock_lrf_at_video_norm(self, u: float, v: float) -> float | None:
         """Lock LRF on video target (normalized 0..1 coords on 1280×720 frame)."""
         try:
