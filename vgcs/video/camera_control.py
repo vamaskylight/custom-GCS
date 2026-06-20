@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import threading
 import time
+from collections.abc import Callable
 from typing import Protocol
 
 from PySide6.QtCore import QSettings
@@ -416,6 +417,7 @@ class SkydroidCameraControl:
         *,
         frame_w: int = 1280,
         frame_h: int = 720,
+        on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
         """Lock LRF on video target (normalized 0..1 coords on companion video frame)."""
         try:
@@ -424,6 +426,7 @@ class SkydroidCameraControl:
                 float(v),
                 frame_w=int(frame_w),
                 frame_h=int(frame_h),
+                on_sample=on_sample,
             )
         except Exception:
             return None

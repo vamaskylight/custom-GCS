@@ -317,7 +317,10 @@ class NativeVideoOverlayLayer(QWidget):
         if distance_m is not None and not pending:
             caption = f"LRF {float(distance_m):.1f} m"
         elif pending:
-            caption = "LRF locking…"
+            if distance_m is not None:
+                caption = f"LRF {float(distance_m):.1f} m …"
+            else:
+                caption = "LRF locking…"
         else:
             caption = "LRF"
         font = QFont("Segoe UI", 10, QFont.Weight.Bold)

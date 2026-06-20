@@ -161,3 +161,35 @@ def test_dzm_step_zoom_in() -> None:
     frame = build_top_frame("DZM_STEP", {"action": "in"})
     assert b"DZM" in frame
     assert b"000C" in frame
+
+
+def test_slr_still_settling_detects_drift() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    rising = [45.0, 47.0, 49.0, 50.5, 51.5, 52.0, 52.1, 52.2]
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 2.0) is True
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 3.5) is True
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 5.0) is False
+
+    flat = [52.0, 52.1, 52.1, 52.2, 52.2, 52.2, 52.2, 52.2]
+    assert SkydroidTopUdpAdapter._slr_still_settling(flat, 5.0) is False
+
+
+def test_slr_post_move_samples() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    samples = [81.4, 81.4, 81.4, 40.1, 42.1, 42.2]
+    post = SkydroidTopUdpAdapter._slr_post_move_samples(samples, 81.4)
+    assert post == [40.1, 42.1, 42.2]
+    assert SkydroidTopUdpAdapter._slr_samples_moved_from_baseline(samples, 81.4) is True
+    assert SkydroidTopUdpAdapter._slr_samples_moved_from_baseline([52.2, 52.3], 52.2) is False
+
+
+def test_slr_median_and_converged() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    assert SkydroidTopUdpAdapter._slr_median([52.0, 52.2, 56.0]) == 52.2
+    stable = [55.8, 56.0, 56.1, 56.0, 56.0]
+    assert SkydroidTopUdpAdapter._slr_converged(stable) == 56.0
+    climbing = [54.0, 55.0, 56.0, 57.0, 58.0]
+    assert SkydroidTopUdpAdapter._slr_converged(climbing) is None

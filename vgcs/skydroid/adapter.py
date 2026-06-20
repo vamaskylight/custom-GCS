@@ -4,6 +4,7 @@ import queue
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
@@ -25,13 +26,22 @@ _C13_PROBE_PORTS = (5000, 9003, 19856)
 _ZOOM_EXTRA_PORTS = (9003, 19853)
 
 # LRF lock: SLR reads along laser boresight — wait for tracker slew before accepting range.
-_LRF_LOCK_MIN_WAIT_S = 2.0
+_LRF_LOCK_MIN_WAIT_S = 1.25
 _LRF_LOCK_MAX_WAIT_S = 12.0
-_LRF_LOCK_POLL_S = 0.45
+_LRF_LOCK_POLL_S = 0.25
 _LRF_BASELINE_EPS_M = 1.5
-_LRF_STABLE_EPS_M = 0.9
+_LRF_STABLE_EPS_M = 0.6
 _LRF_MOVED_MIN_M = 2.0
-_LRF_SAME_RANGE_ACCEPT_S = 7.5
+_LRF_CONVERGE_SAMPLES = 5
+_LRF_REFINE_SAMPLES = 8
+_LRF_REFINE_HOLD_S = 2.75
+_LRF_REFINE_EXTEND_S = 2.5
+_LRF_CLIMB_EPS_M = 0.35
+_LRF_SETTLE_WINDOW = 8
+_LRF_SETTLE_MIN_DRIFT_M = 2.0
+_LRF_POST_MOVE_MIN_WAIT_S = 2.5
+_LRF_POST_MOVE_SETTLE_S = 4.0
+_LRF_GOT_RESEND_INTERVAL_S = 2.0
 _PROBE_TIMEOUT_S = 0.12
 
 # Motion commands: no UDP reply wait (C13 often has no timely ACK for GSY/GSP/GSM).
@@ -118,6 +128,7 @@ class SkydroidTopUdpAdapter:
         self._lrf_locked = False
         self._lrf_lock_x = 0
         self._lrf_lock_y = 0
+        self._lrf_locked_distance_m: float | None = None
         self._active_port = int(port)
         self._transport.set_datagram_handler(self._maybe_update_status)
 
@@ -125,11 +136,11 @@ class SkydroidTopUdpAdapter:
         return (str(self._active_host), int(self._active_port), str(self._profile_id))
 
     def get_laser_range_m(self, *, max_age_s: float = 4.0) -> float | None:
-        """Last C13 SLR reading (TOP tag SLR, metres). None when stale or not locked."""
+        """Frozen C13 SLR distance after video lock; None when not locked."""
         with self._status_lock:
             if not self._lrf_locked:
                 return None
-            dist = self._laser_range_m
+            dist = self._lrf_locked_distance_m
             ts = float(self._laser_range_mono or 0.0)
         if dist is None or ts <= 0.0:
             return None
@@ -153,6 +164,80 @@ class SkydroidTopUdpAdapter:
         )
 
     @staticmethod
+    def _slr_median(values: list[float]) -> float:
+        s = sorted(float(v) for v in values)
+        n = len(s)
+        if n <= 0:
+            return 0.0
+        mid = n // 2
+        if n % 2:
+            return float(s[mid])
+        return (float(s[mid - 1]) + float(s[mid])) / 2.0
+
+    @staticmethod
+    def _slr_still_climbing(samples: list[float], eps: float = _LRF_CLIMB_EPS_M) -> bool:
+        if len(samples) < 2:
+            return False
+        return float(samples[-1]) > float(samples[-2]) + float(eps)
+
+    @staticmethod
+    def _slr_converged(samples: list[float], n: int = _LRF_CONVERGE_SAMPLES) -> float | None:
+        if len(samples) < n:
+            return None
+        tail = [float(v) for v in samples[-n:]]
+        if max(tail) - min(tail) > _LRF_STABLE_EPS_M:
+            return None
+        if SkydroidTopUdpAdapter._slr_still_climbing(tail):
+            return None
+        return SkydroidTopUdpAdapter._slr_median(tail)
+
+    @staticmethod
+    def _slr_still_settling(samples: list[float], elapsed: float) -> bool:
+        """True while SLR drift after tracker slew suggests readings have not plateaued."""
+        if len(samples) < 4:
+            return elapsed < _LRF_POST_MOVE_MIN_WAIT_S
+        if elapsed < _LRF_POST_MOVE_MIN_WAIT_S:
+            return True
+        n = min(len(samples), _LRF_SETTLE_WINDOW)
+        window = [float(v) for v in samples[-n:]]
+        drift = abs(window[-1] - window[0])
+        if drift >= _LRF_SETTLE_MIN_DRIFT_M and elapsed < _LRF_POST_MOVE_SETTLE_S:
+            return True
+        if len(samples) >= 8 and elapsed < _LRF_POST_MOVE_SETTLE_S:
+            mid = SkydroidTopUdpAdapter._slr_median(samples[-8:-4])
+            recent = SkydroidTopUdpAdapter._slr_median(samples[-4:])
+            if abs(recent - mid) > 0.8:
+                return True
+        if len(window) >= 6 and elapsed < _LRF_POST_MOVE_SETTLE_S:
+            half = max(2, n // 2)
+            first = SkydroidTopUdpAdapter._slr_median(window[:half])
+            second = SkydroidTopUdpAdapter._slr_median(window[half:])
+            if abs(second - first) > 1.0:
+                return True
+        return False
+
+    @staticmethod
+    def _slr_samples_moved_from_baseline(
+        samples: list[float], baseline_m: float | None
+    ) -> bool:
+        if baseline_m is None:
+            return bool(samples)
+        base = float(baseline_m)
+        return any(abs(float(s) - base) >= _LRF_MOVED_MIN_M for s in samples)
+
+    @staticmethod
+    def _slr_post_move_samples(
+        samples: list[float], baseline_m: float | None
+    ) -> list[float]:
+        if baseline_m is None:
+            return [float(v) for v in samples]
+        base = float(baseline_m)
+        for i, s in enumerate(samples):
+            if abs(float(s) - base) >= _LRF_MOVED_MIN_M:
+                return [float(v) for v in samples[i:]]
+        return []
+
+    @staticmethod
     def _slr_tail_stable(samples: list[float], n: int = 3) -> tuple[float, float] | None:
         if len(samples) < n:
             return None
@@ -160,7 +245,58 @@ class SkydroidTopUdpAdapter:
         spread = max(tail) - min(tail)
         if spread > _LRF_STABLE_EPS_M:
             return None
-        return sum(tail) / len(tail), spread
+        return SkydroidTopUdpAdapter._slr_median(tail), spread
+
+    def _note_slr_sample(self, value_m: float) -> None:
+        # Distance is frozen after lock — ignore live SLR datagrams while locked.
+        with self._status_lock:
+            if self._lrf_locked:
+                return
+            self._laser_range_m = float(value_m)
+            self._laser_range_mono = time.monotonic()
+
+    def _refine_slr_estimate(
+        self,
+        on_sample: Callable[[float], None] | None,
+    ) -> float | None:
+        """Extra SLR polls after coarse converge — median filters jitter / late slew."""
+        buf: list[float] = []
+        start_mono = time.monotonic()
+        deadline = start_mono + _LRF_REFINE_HOLD_S
+        max_deadline = start_mono + _LRF_REFINE_HOLD_S + _LRF_REFINE_EXTEND_S
+
+        def _emit(value_m: float) -> None:
+            if on_sample is None:
+                return
+            try:
+                on_sample(float(value_m))
+            except Exception:
+                pass
+
+        while time.monotonic() < deadline and len(buf) < _LRF_REFINE_SAMPLES:
+            time.sleep(_LRF_LOCK_POLL_S)
+            reading = self._query_slr_distance_m(log=False)
+            if reading is None:
+                continue
+            buf.append(float(reading))
+            _emit(float(reading))
+            if (
+                len(buf) >= 3
+                and self._slr_still_climbing(buf[-3:])
+                and deadline < max_deadline
+            ):
+                deadline = min(deadline + 0.45, max_deadline)
+        if not buf:
+            return None
+        tail_n = min(_LRF_REFINE_SAMPLES, len(buf))
+        tail = [float(v) for v in buf[-tail_n:]]
+        refined = self._slr_median(tail)
+        if len(buf) >= 5 and buf[-1] > buf[0] + 2.0:
+            upper = sorted(tail)[max(0, len(tail) - max(3, len(tail) // 2)) :]
+            if upper:
+                refined = self._slr_median(upper)
+        print(f"[VGCS:lrf] refine median={refined:.1f} m from {buf}")
+        return float(refined)
 
     @staticmethod
     def _slr_moved_from_baseline(value_m: float, baseline_m: float | None) -> bool:
@@ -175,6 +311,7 @@ class SkydroidTopUdpAdapter:
         *,
         frame_w: int = 1280,
         frame_h: int = 720,
+        on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
         """GOT + SUM track confirm at video pixel, then read SLR after tracker settles."""
         if not self.gimbal_telemetry_ok():
@@ -189,6 +326,7 @@ class SkydroidTopUdpAdapter:
             with self._status_lock:
                 self._laser_range_m = None
                 self._laser_range_mono = 0.0
+                self._lrf_locked_distance_m = None
 
             baseline_m = self._query_slr_distance_m(log=False)
             print(
@@ -206,81 +344,99 @@ class SkydroidTopUdpAdapter:
             samples: list[float] = []
             start_mono = time.monotonic()
             deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
-            next_resend = 2.0
+            next_resend = _LRF_GOT_RESEND_INTERVAL_S
+            move_mono: float | None = None
+
+            def _emit_sample(value_m: float) -> None:
+                if on_sample is None:
+                    return
+                try:
+                    on_sample(float(value_m))
+                except Exception:
+                    pass
 
             while time.monotonic() < deadline:
                 elapsed = time.monotonic() - start_mono
-                if elapsed >= next_resend and next_resend <= 8.0:
+                if elapsed >= next_resend and next_resend <= _LRF_LOCK_MAX_WAIT_S - 1.0:
                     print(f"[VGCS:lrf] re-send GOT+SUM @ {next_resend:.1f}s")
                     self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
-                    next_resend += 3.0
+                    next_resend += _LRF_GOT_RESEND_INTERVAL_S
 
                 time.sleep(_LRF_LOCK_POLL_S)
-                reading = self._query_slr_distance_m(log=True)
+                reading = self._query_slr_distance_m(log=False)
                 if reading is None:
                     continue
                 samples.append(float(reading))
+                _emit_sample(float(reading))
                 print(f"[VGCS:lrf] SLR sample {reading:.1f} m (n={len(samples)}, t={elapsed:.1f}s)")
 
                 if elapsed < _LRF_LOCK_MIN_WAIT_S:
                     continue
 
-                stable = self._slr_tail_stable(samples, 3)
-                if stable is None:
+                if not self._slr_samples_moved_from_baseline(samples, baseline_m):
                     continue
-                avg, _spread = stable
 
-                if self._slr_moved_from_baseline(avg, baseline_m):
-                    dist_m = float(avg)
-                    print(f"[VGCS:lrf] accept moved range {dist_m:.1f} m (baseline={baseline_m})")
-                    break
-
-                # Readings still at old boresight — keep waiting for tracker slew.
-                if elapsed >= _LRF_SAME_RANGE_ACCEPT_S:
-                    climbing = len(samples) >= 4 and samples[-1] > samples[0] + 1.0
-                    if not climbing and baseline_m is not None and abs(avg - baseline_m) < _LRF_BASELINE_EPS_M:
-                        print(
-                            f"[VGCS:lrf] accept same-range {avg:.1f} m "
-                            f"after {elapsed:.1f}s (target likely at current boresight)"
-                        )
-                        dist_m = float(avg)
-                        break
-
-                # Trending farther — do not accept early while still climbing.
-                if len(samples) >= 4 and samples[-1] > samples[-4] + 3.0:
+                post = self._slr_post_move_samples(samples, baseline_m)
+                if not post:
                     continue
+                if move_mono is None:
+                    move_mono = time.monotonic()
+                elapsed_since_move = time.monotonic() - float(move_mono)
+
+                converged = self._slr_converged(post, _LRF_CONVERGE_SAMPLES)
+                if converged is None:
+                    continue
+                if self._slr_still_settling(post, elapsed_since_move):
+                    continue
+                if not self._slr_moved_from_baseline(converged, baseline_m):
+                    continue
+
+                print(
+                    f"[VGCS:lrf] tracker slew ok {converged:.1f} m "
+                    f"(baseline={baseline_m}, t={elapsed:.1f}s, "
+                    f"since_move={elapsed_since_move:.1f}s)"
+                )
+                dist_m = self._refine_slr_estimate(on_sample)
+                if dist_m is None:
+                    dist_m = float(converged)
+                break
 
             if dist_m is None and samples:
-                elapsed = time.monotonic() - start_mono
-                stable = self._slr_tail_stable(samples, min(5, len(samples)))
-                if stable is not None:
-                    avg, _spread = stable
-                    if self._slr_moved_from_baseline(avg, baseline_m):
-                        dist_m = float(avg)
-                    elif elapsed >= _LRF_LOCK_MAX_WAIT_S - 0.5:
-                        if baseline_m is not None and abs(avg - baseline_m) < _LRF_BASELINE_EPS_M:
-                            print(
-                                f"[VGCS:lrf] lock rejected — SLR stayed at baseline "
-                                f"{baseline_m:.1f} m (need tracker slew to new target)"
-                            )
-                            dist_m = None
-                        else:
-                            dist_m = float(avg)
-                if dist_m is None and samples:
-                    peak = max(samples[-min(8, len(samples)):])
-                    if baseline_m is not None and peak - baseline_m >= _LRF_MOVED_MIN_M:
-                        dist_m = float(peak)
-                        print(f"[VGCS:lrf] accept peak sample {dist_m:.1f} m")
+                post = self._slr_post_move_samples(samples, baseline_m)
+                if post and move_mono is not None:
+                    elapsed_since_move = time.monotonic() - float(move_mono)
+                    converged = self._slr_converged(
+                        post, min(_LRF_CONVERGE_SAMPLES, len(post))
+                    )
+                    if (
+                        converged is not None
+                        and self._slr_moved_from_baseline(converged, baseline_m)
+                        and not self._slr_still_climbing(post[-min(4, len(post)):])
+                    ):
+                        dist_m = self._refine_slr_estimate(on_sample) or float(converged)
+                if dist_m is None:
+                    if not self._slr_samples_moved_from_baseline(samples, baseline_m):
+                        print(
+                            f"[VGCS:lrf] lock rejected — SLR stayed at baseline "
+                            f"{baseline_m:.1f} m (GOT+SUM did not slew laser to target)"
+                        )
+                    else:
+                        print(
+                            f"[VGCS:lrf] lock rejected — range moved but did not settle "
+                            f"(baseline={baseline_m}, last={samples[-1]:.1f} m)"
+                        )
 
             with self._status_lock:
                 if dist_m is not None:
                     self._lrf_locked = True
                     self._lrf_lock_x = x_px
                     self._lrf_lock_y = y_px
+                    self._lrf_locked_distance_m = float(dist_m)
                     self._laser_range_m = float(dist_m)
                     self._laser_range_mono = time.monotonic()
                 else:
                     self._lrf_locked = False
+                    self._lrf_locked_distance_m = None
                     self._laser_range_m = None
                     self._laser_range_mono = 0.0
             if dist_m is not None:
@@ -310,7 +466,7 @@ class SkydroidTopUdpAdapter:
             if not reply:
                 return None
             dist_m = parse_slr_distance_from_payload(reply)
-            if dist_m is not None:
+            if dist_m is not None and not self._lrf_locked:
                 with self._status_lock:
                     self._laser_range_m = float(dist_m)
                     self._laser_range_mono = time.monotonic()
@@ -336,6 +492,7 @@ class SkydroidTopUdpAdapter:
             self._lrf_locked = False
             self._laser_range_m = None
             self._laser_range_mono = 0.0
+            self._lrf_locked_distance_m = None
             self._lrf_lock_x = 0
             self._lrf_lock_y = 0
 
@@ -639,10 +796,6 @@ class SkydroidTopUdpAdapter:
             if not self._probe_finished.wait(timeout=0.25):
                 continue
             self._poll_active_endpoint_once()
-            now = time.monotonic()
-            if self._lrf_locked and now - float(self._last_slr_poll_mono or 0.0) >= 0.5:
-                self._last_slr_poll_mono = now
-                self._poll_laser_range_once()
             interval = 1.0 if not self.gimbal_telemetry_ok() else 0.5
             time.sleep(interval)
 
@@ -655,6 +808,9 @@ class SkydroidTopUdpAdapter:
     def _maybe_update_slr(self, payload: bytes) -> None:
         dist_m = parse_slr_distance_from_payload(payload)
         if dist_m is None:
+            return
+        if self._lrf_locked:
+            self._note_slr_sample(float(dist_m))
             return
         with self._status_lock:
             self._laser_range_m = float(dist_m)
