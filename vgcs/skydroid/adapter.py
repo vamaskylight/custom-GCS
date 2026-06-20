@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
 from vgcs.skydroid.protocol import (
     build_gac_query,
-    build_gimbal_angle_axis,
     build_gimbal_speed,
     build_got_target,
     build_slr_query,
@@ -56,8 +55,12 @@ _LRF_POST_GOT_WAIT_S = 2.0
 _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
 _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
-_LRF_NUDGE_AFTER_S = 3.0
-_LRF_MAX_NUDGES = 2
+_LRF_REPOINT_AFTER_S = 4.0
+_LRF_MAX_REPOINTS = 2
+_LRF_GIMBAL_SLEW_SPEED_DPS = 18.0
+_LRF_GIMBAL_SLEW_MIN_S = 1.0
+_LRF_GIMBAL_SLEW_MAX_S = 3.5
+_LRF_GIMBAL_SLEW_SETTLE_S = 0.45
 _PROBE_TIMEOUT_S = 0.12
 
 # Motion commands: no UDP reply wait (C13 often has no timely ACK for GSY/GSP/GSM).
@@ -190,38 +193,108 @@ class SkydroidTopUdpAdapter:
         dpitch = oy * (_LRF_FOV_V_DEG / 2.0)
         return float(dyaw), float(dpitch)
 
+    @staticmethod
+    def _gimbal_velocity_rates_for_offset(
+        dyaw: float,
+        dpitch: float,
+        *,
+        speed_dps: float = _LRF_GIMBAL_SLEW_SPEED_DPS,
+        max_dur_s: float = _LRF_GIMBAL_SLEW_MAX_S,
+        min_dur_s: float = _LRF_GIMBAL_SLEW_MIN_S,
+    ) -> tuple[float, float, float]:
+        """GSM speed-mode slew toward click offset (C13 uses GSY/GSP/GSM, not GAY/GAP)."""
+        if abs(float(dyaw)) < 0.2 and abs(float(dpitch)) < 0.2:
+            return 0.0, 0.0, 0.0
+        max_angle = max(abs(float(dyaw)), abs(float(dpitch)))
+        dur = max(
+            float(min_dur_s),
+            min(float(max_dur_s), max_angle / max(1.0, float(speed_dps)) + 0.35),
+        )
+        yaw_rate = float(dyaw) / dur if abs(float(dyaw)) > 0.2 else 0.0
+        pitch_rate = -float(dpitch) / dur if abs(float(dpitch)) > 0.2 else 0.0
+        return yaw_rate, pitch_rate, dur
+
     def _send_gimbal_point_at_pixel(
         self,
         x_px: int,
         y_px: int,
         att_now: tuple[float, float] | None,
-    ) -> None:
-        """Fallback when GOT/SUM does not slew — point gimbal at click using FOV math."""
+    ) -> tuple[float, float] | None:
+        """Point C13 gimbal at click using GSM velocity slew (same path as UI hold-to-pan)."""
         if att_now is None:
             att_now = self._read_gimbal_attitude_deg()
         if att_now is None:
-            print("[VGCS:lrf] gimbal nudge skipped — no GAC attitude")
-            return
+            print("[VGCS:lrf] gimbal slew skipped — no GAC attitude")
+            return None
         dyaw, dpitch_img = self._pixel_boresight_offset_deg(x_px, y_px)
-        yaw_tgt = float(att_now[0]) + dyaw
-        pitch_tgt = float(att_now[1]) - dpitch_img
-        pitch_tgt = max(-90.0, min(90.0, pitch_tgt))
-        gay = build_gimbal_angle_axis("GAY", yaw_tgt, speed=25.0)
-        gap = build_gimbal_angle_axis("GAP", pitch_tgt, speed=25.0)
-        for frame in (gay, gap):
-            self._transport.send_and_receive(
-                frame, expect_reply=False, log=True, timeout_s=0.08
-            )
-        slew_s = min(3.5, max(1.0, (abs(dyaw) + abs(dpitch_img)) / 12.0))
-        print(
-            f"[VGCS:lrf] gimbal nudge px=({x_px},{y_px}) "
-            f"-> yaw={yaw_tgt:.2f} pitch={pitch_tgt:.2f} wait={slew_s:.1f}s"
+        yaw_rate, pitch_rate, dur = self._gimbal_velocity_rates_for_offset(
+            dyaw, dpitch_img
         )
-        time.sleep(slew_s)
+        if dur <= 0.0:
+            return att_now
+        yaw_tgt = float(att_now[0]) + dyaw
+        pitch_tgt = max(-90.0, min(90.0, float(att_now[1]) - dpitch_img))
+        gsm = build_gimbal_speed(yaw_rate, pitch_rate)
+        self._transport.send_and_receive(
+            gsm, expect_reply=False, log=True, timeout_s=0.08
+        )
+        print(
+            f"[VGCS:lrf] gimbal slew GSM px=({x_px},{y_px}) "
+            f"-> target yaw={yaw_tgt:.2f} pitch={pitch_tgt:.2f} "
+            f"rates=({yaw_rate:.1f},{pitch_rate:.1f})°/s dur={dur:.1f}s"
+        )
+        time.sleep(dur)
         stop = build_gimbal_speed(0.0, 0.0)
         self._transport.send_and_receive(
             stop, expect_reply=False, log=True, timeout_s=0.08
         )
+        time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+        att_after = self._read_gimbal_attitude_deg()
+        for _ in range(4):
+            if att_after is not None:
+                moved = self._gimbal_total_move_deg(att_now, att_after)
+                if moved >= _LRF_GIMBAL_MOVE_MIN_DEG:
+                    break
+            time.sleep(0.35)
+            att_after = self._read_gimbal_attitude_deg()
+        move_deg = (
+            self._gimbal_total_move_deg(att_now, att_after)
+            if att_after is not None
+            else 0.0
+        )
+        if move_deg < _LRF_GIMBAL_MOVE_MIN_DEG:
+            gam = build_top_frame(
+                "GAM",
+                {
+                    "yaw": yaw_tgt,
+                    "pitch": pitch_tgt,
+                    "speed": _LRF_GIMBAL_SLEW_SPEED_DPS,
+                },
+            )
+            self._transport.send_and_receive(
+                gam, expect_reply=False, log=True, timeout_s=0.08
+            )
+            time.sleep(min(_LRF_GIMBAL_SLEW_MAX_S, dur + 0.5))
+            self._transport.send_and_receive(
+                stop, expect_reply=False, log=True, timeout_s=0.08
+            )
+            time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+            att_after = self._read_gimbal_attitude_deg()
+            move_deg = (
+                self._gimbal_total_move_deg(att_now, att_after)
+                if att_after is not None
+                else 0.0
+            )
+            print(
+                f"[VGCS:lrf] gimbal GAM fallback px=({x_px},{y_px}) "
+                f"att={att_now}->{att_after} move={move_deg:.1f}°"
+            )
+        else:
+            print(
+                f"[VGCS:lrf] gimbal slew done att={att_now}->{att_after} "
+                f"move={move_deg:.1f}°"
+            )
+        return att_after
 
     @staticmethod
     def _slr_median(values: list[float]) -> float:
@@ -342,12 +415,12 @@ class SkydroidTopUdpAdapter:
         gimbal_slew_mono: float | None,
     ) -> float | None:
         """After gimbal points at click, accept stable SLR even if delta from baseline is small."""
-        total = self._gimbal_total_move_deg(att_before, att_now)
-        if total < _LRF_GIMBAL_ACCEPT_MIN_DEG or len(samples) < _LRF_CONVERGE_SAMPLES:
-            return None
-        if gimbal_slew_mono is None:
+        if gimbal_slew_mono is None or len(samples) < _LRF_CONVERGE_SAMPLES:
             return None
         if time.monotonic() - float(gimbal_slew_mono) < _LRF_GIMBAL_SLR_SETTLE_S:
+            return None
+        total = self._gimbal_total_move_deg(att_before, att_now)
+        if total < _LRF_GIMBAL_ACCEPT_MIN_DEG:
             return None
         tail = [float(v) for v in samples[-_LRF_CONVERGE_SAMPLES:]]
         converged = self._slr_converged(tail, _LRF_CONVERGE_SAMPLES)
@@ -467,7 +540,7 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
-        """GOT + SUM track confirm at video pixel, then read SLR after tracker settles."""
+        """C13: GSM slew to click pixel, then read SLR (GOT/SUM is C12-only per PROTOCAL)."""
         if not self.gimbal_telemetry_ok():
             return None
         # PROTOCAL §3.3.5: GOT coordinates are always on 1280×720 companion video.
@@ -501,19 +574,32 @@ class SkydroidTopUdpAdapter:
                 stop, expect_reply=False, log=True, timeout_s=0.08
             )
             time.sleep(0.15)
+
+            # C13: point gimbal first (GSM speed mode — same as UI pan buttons).
+            gimbal_slew_mono = time.monotonic()
+            att_after_point = self._send_gimbal_point_at_pixel(x_px, y_px, att_before)
+            if att_after_point is not None:
+                att_latest = att_after_point
+            gimbal_slew_mono = time.monotonic()
+            point_count = 1
+
+            # Optional GOT+SUM (C12 tracker); harmless on C13 but not relied upon.
             self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
-            time.sleep(_LRF_POST_GOT_WAIT_S)
+            time.sleep(0.75)
 
             samples: list[float] = []
             start_mono = time.monotonic()
             deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
             next_resend = _LRF_GOT_RESEND_INTERVAL_S
             move_mono: float | None = None
-            nudge_count = 0
-            gimbal_slew_mono: float | None = None
-            att_latest = att_before
+            att_latest = att_after_point or att_before
 
-            def _emit_sample(value_m: float, att_now: tuple[float, float] | None) -> None:
+            def _emit_sample(
+                value_m: float,
+                att_now: tuple[float, float] | None,
+                *,
+                force: bool = False,
+            ) -> None:
                 if on_sample is None or baseline_m is None:
                     return
                 slr_moved = self._slr_moved_enough(
@@ -523,7 +609,11 @@ class SkydroidTopUdpAdapter:
                     self._gimbal_total_move_deg(att_before, att_now)
                     >= _LRF_GIMBAL_ACCEPT_MIN_DEG
                 )
-                if not slr_moved and not gimbal_ok:
+                pointed_ok = (
+                    gimbal_slew_mono is not None
+                    and time.monotonic() - float(gimbal_slew_mono) >= 1.5
+                )
+                if not force and not slr_moved and not gimbal_ok and not pointed_ok:
                     return
                 try:
                     on_sample(float(value_m))
@@ -560,12 +650,13 @@ class SkydroidTopUdpAdapter:
                 if (
                     not slr_moved
                     and gimbal_moved is not True
-                    and nudge_count < _LRF_MAX_NUDGES
-                    and elapsed >= _LRF_NUDGE_AFTER_S * float(nudge_count + 1)
+                    and point_count < _LRF_MAX_REPOINTS + 1
+                    and elapsed >= _LRF_REPOINT_AFTER_S * float(point_count)
                 ):
-                    self._send_gimbal_point_at_pixel(x_px, y_px, att_now)
+                    att_ref = att_now if att_now is not None else att_latest
+                    self._send_gimbal_point_at_pixel(x_px, y_px, att_ref)
                     self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
-                    nudge_count += 1
+                    point_count += 1
                     move_mono = None
                     gimbal_slew_mono = time.monotonic()
                     continue
@@ -584,10 +675,10 @@ class SkydroidTopUdpAdapter:
                         f"{self._gimbal_total_move_deg(att_before, att_now):.1f}°)"
                     )
                     dist_m = self._refine_slr_estimate(on_sample) or float(gimbal_accept)
-                    _emit_sample(float(dist_m), att_now)
+                    _emit_sample(float(dist_m), att_now, force=True)
                     break
 
-                if gimbal_moved is False and not slr_moved:
+                if gimbal_moved is False and not slr_moved and gimbal_slew_mono is None:
                     continue
 
                 if not slr_moved:
@@ -660,10 +751,10 @@ class SkydroidTopUdpAdapter:
                             f"[VGCS:lrf] lock rejected — SLR stayed at baseline "
                             f"{baseline_m:.1f} m (target track did not slew laser)"
                         )
-                    elif gimbal_moved is False:
+                    elif gimbal_moved is False and point_count <= 1:
                         print(
                             f"[VGCS:lrf] lock rejected — gimbal did not move "
-                            f"(att={att_before}->{att_now}); check C13 tracking support"
+                            f"(att={att_before}->{att_now}); check C13 GSM slew / TOP link"
                         )
                     else:
                         print(
