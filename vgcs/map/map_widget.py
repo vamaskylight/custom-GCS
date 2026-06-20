@@ -862,19 +862,35 @@ class _LrfLockBridge(QObject):
 class _LrfLockTask(QRunnable):
     """GOT + SUM + SLR on worker thread (UDP can block)."""
 
-    def __init__(self, cc: object, u: float, v: float, bridge: _LrfLockBridge) -> None:
+    def __init__(
+        self,
+        cc: object,
+        u: float,
+        v: float,
+        bridge: _LrfLockBridge,
+        *,
+        frame_w: int = 1280,
+        frame_h: int = 720,
+    ) -> None:
         super().__init__()
         self._cc = cc
         self._u = float(u)
         self._v = float(v)
         self._bridge = bridge
+        self._frame_w = int(frame_w)
+        self._frame_h = int(frame_h)
 
     def run(self) -> None:
         dist = None
         try:
             lock_fn = getattr(self._cc, "lock_lrf_at_video_norm", None)
             if callable(lock_fn):
-                dist = lock_fn(self._u, self._v)
+                dist = lock_fn(
+                    self._u,
+                    self._v,
+                    frame_w=self._frame_w,
+                    frame_h=self._frame_h,
+                )
         except Exception as exc:
             print(f"[VGCS:lrf] lock failed: {exc}")
         try:
@@ -9738,8 +9754,16 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
         self._refresh_lrf_lock_overlay()
-        self._set_status("Locking LRF target…")
-        task = _LrfLockTask(cc, u, v, self._lrf_lock_bridge)
+        self._set_status("Locking LRF target… (waiting for tracker)")
+        fw, fh = 1280, 720
+        try:
+            im = getattr(self, "_native_video_last", None)
+            if im is not None and not im.isNull():
+                fw = max(1, int(im.width()))
+                fh = max(1, int(im.height()))
+        except Exception:
+            pass
+        task = _LrfLockTask(cc, u, v, self._lrf_lock_bridge, frame_w=fw, frame_h=fh)
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(task)
 
