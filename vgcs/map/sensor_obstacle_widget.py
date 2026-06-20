@@ -520,13 +520,16 @@ class _LrfRangeBlock(QWidget):
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(1)
 
-    def set_c13_locking(self, distance_m: float) -> None:
+    def set_c13_locking(self, distance_m: float | None) -> None:
         """Live SLR readout while tracker settles (before lock confirmed)."""
         self._c13_mode = True
         self._c13_state = "locking"
-        self._val.setText(f"{float(distance_m):.1f} m")
+        if distance_m is None:
+            self._val.setText("…")
+        else:
+            self._val.setText(f"{float(distance_m):.1f} m")
         self._val.setStyleSheet(_VALUE_QSS)
-        self._sub.setText("C13 LRF · locking…")
+        self._sub.setText("C13 LRF · slewing to target…")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(1)
 
@@ -928,14 +931,14 @@ class ObstacleRadarPanel(QFrame):
         self._set_sensor_active("rf")
         self._sync_status_line()
 
-    def set_c13_lrf_locking(self, distance_m: float) -> None:
+    def set_c13_lrf_locking(self, distance_m: float | None) -> None:
         """Show live range in PROXIMITY while LRF lock is in progress."""
         if not self._c13_lrf_ui:
             return
         try:
-            cur_m = float(distance_m)
+            cur_m = float(distance_m) if distance_m is not None else None
         except (TypeError, ValueError):
-            return
+            cur_m = None
         self._metric_range.set_c13_locking(cur_m)
         self._set_sensor_active("rf")
         self._lbl_status.setText("Rangefinder · locking")
