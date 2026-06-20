@@ -3,7 +3,9 @@
 import os
 
 from vgcs.video.pipeline import (
+    _companion_hevc_showall_enabled,
     _frozen_duplicate_kill_enabled,
+    _rgb24_frame_likely_hevc_corrupt,
     _rtsp_url_is_companion_rtsp,
     _stall_watchdog_enabled,
     _video_stall_reconnect_s,
@@ -39,3 +41,21 @@ def test_non_companion_still_aggressive():
     assert _frozen_duplicate_kill_enabled(LOCAL_URL)
     assert _stall_watchdog_enabled(LOCAL_URL)
     assert _video_stall_reconnect_s(LOCAL_URL) == 3.0
+
+
+def test_companion_hevc_showall_off_by_default():
+    assert not _companion_hevc_showall_enabled(C13_URL)
+    os.environ["VGCS_COMPANION_HEVC_SHOWALL"] = "1"
+    try:
+        assert _companion_hevc_showall_enabled(C13_URL)
+    finally:
+        os.environ.pop("VGCS_COMPANION_HEVC_SHOWALL", None)
+
+
+def test_corrupt_gray_hevc_frame_detected():
+    w, h = 640, 360
+    raw = bytes([130, 130, 130] * (w * h))
+    assert _rgb24_frame_likely_hevc_corrupt(raw, w, h)
+    # Mostly natural color — should not be flagged
+    natural = bytearray([40, 90, 30] * (w * h))
+    assert not _rgb24_frame_likely_hevc_corrupt(bytes(natural), w, h)

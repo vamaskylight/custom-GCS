@@ -6002,6 +6002,7 @@ class MapWidget(QWidget):
             vp = getattr(self, "_video", None)
             if vp is not None:
                 self._start_video_decode_sources(vp, force=force_decode)
+                self._stop_idle_video_decode_sources(vp)
                 try:
                     self._video_preview_got_frame = False
                     self._video_preview_started_mono = time.monotonic()
