@@ -9801,15 +9801,14 @@ class MapWidget(QWidget):
             if dist is None:
                 self._lrf_lock_uv = None
                 self._lrf_lock_distance_m = None
-                self._refresh_lrf_lock_overlay()
                 self._lrf_lock_armed = True
+                self._refresh_lrf_lock_overlay()
                 try:
-                    self._obstacle_radar.set_c13_lrf_armed(True)
+                    self._obstacle_radar.set_c13_lrf_lock_failed()
                 except Exception:
                     pass
                 self._set_status(
-                    "LRF lock failed — laser did not move to target. "
-                    "Hold gimbal steady and click again, or lock via RC first."
+                    "LRF lock failed — tap ◎ in PROXIMITY and click target again"
                 )
                 return
             dm = float(dist)

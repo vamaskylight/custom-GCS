@@ -209,6 +209,13 @@ def test_pixel_boresight_offset_deg() -> None:
     assert dp2 > 2.0
 
 
+def test_gimbal_total_move_deg() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    deg = SkydroidTopUdpAdapter._gimbal_total_move_deg((-24.0, 0.0), (-14.0, 7.0))
+    assert deg > 10.0
+
+
 def test_slr_median_and_converged() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 

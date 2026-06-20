@@ -533,6 +533,17 @@ class _LrfRangeBlock(QWidget):
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(1)
 
+    def set_c13_lock_failed(self) -> None:
+        """Return to armed icon after a failed lock attempt."""
+        self._c13_mode = True
+        self._c13_state = "armed"
+        self._btn.setChecked(True)
+        self._btn.setText("◎")
+        self._btn.setToolTip("Lock failed — click target on video again")
+        self._sub.setText("Lock failed — click video to retry")
+        self._sub.setVisible(True)
+        self._stack.setCurrentIndex(0)
+
     def clear_c13(self) -> None:
         self._c13_mode = False
         self._c13_state = "idle"
@@ -888,6 +899,18 @@ class ObstacleRadarPanel(QFrame):
             self._metric_range.set_c13_idle()
             self._set_sensor_active("rf")
             self._sync_status_line()
+
+    def set_c13_lrf_lock_failed(self) -> None:
+        """Restore armed icon after failed lock — keeps ⌖ visible for retry."""
+        self._c13_lrf_armed = True
+        self._c13_lrf_locked = False
+        if not self._c13_lrf_ui:
+            return
+        self._metric_range.set_c13_lock_failed()
+        self._set_sensor_active("rf")
+        self._lbl_status.setText("Rangefinder · lock failed")
+        self._set_status_mode("live")
+        self._sync_status_line()
 
     def set_c13_lrf_armed(self, armed: bool) -> None:
         self._c13_lrf_armed = bool(armed)
