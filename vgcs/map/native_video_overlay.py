@@ -50,6 +50,22 @@ class NativeVideoOverlayLayer(QWidget):
         self._video_marks: list[VideoOverlayMark] = []
         # Normalized segments (x1,y1,x2,y2) in widget coords + ground distance label.
         self._measure_segments: list[tuple[float, float, float, float, str]] = []
+        self._lrf_lock: tuple[float, float, float | None, bool] | None = None
+
+    def set_lrf_lock(
+        self,
+        x_norm: float,
+        y_norm: float,
+        distance_m: float | None = None,
+        *,
+        external: bool = False,
+    ) -> None:
+        self._lrf_lock = (float(x_norm), float(y_norm), distance_m, bool(external))
+        self.update()
+
+    def clear_lrf_lock(self) -> None:
+        self._lrf_lock = None
+        self.update()
 
     def set_content_rect(self, rect: dict[str, float] | None) -> None:
         self._content_rect = dict(rect) if rect else None
@@ -144,6 +160,7 @@ class NativeVideoOverlayLayer(QWidget):
         self._detections.clear()
         self._video_marks.clear()
         self._measure_segments.clear()
+        self._lrf_lock = None
         self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -223,7 +240,12 @@ class NativeVideoOverlayLayer(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
-        if not self._detections and not self._video_marks and not self._measure_segments:
+        if (
+            not self._detections
+            and not self._video_marks
+            and not self._measure_segments
+            and self._lrf_lock is None
+        ):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -300,3 +322,44 @@ class NativeVideoOverlayLayer(QWidget):
                 p.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
                 p.setPen(QColor(255, 255, 255))
                 p.drawText(tx + 4, ty + metrics.ascent() + 2, label)
+
+        if self._lrf_lock is not None:
+            xn, yn, dist_m, external = self._lrf_lock
+            cx = cl + float(xn) * cw
+            cy = ct + float(yn) * ch
+            box = 44.0
+            bx = cx - box / 2.0
+            by = cy - box / 2.0
+            if external:
+                pen = QPen(QColor(251, 191, 36, 240), 2, Qt.PenStyle.DashLine)
+                fill = QColor(251, 191, 36, 28)
+                caption = "RC lock"
+            else:
+                pen = QPen(QColor(56, 189, 248, 245), 3)
+                fill = QColor(56, 189, 248, 36)
+                caption = "LRF lock"
+            p.setPen(pen)
+            p.setBrush(fill)
+            p.drawRect(int(bx), int(by), int(box), int(box))
+            p.setPen(pen)
+            p.drawLine(int(cx - 22), int(cy), int(cx + 22), int(cy))
+            p.drawLine(int(cx), int(cy - 22), int(cx), int(cy + 22))
+            p.setPen(QPen(pen.color(), 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(int(cx) - 6, int(cy) - 6, 12, 12)
+            lines = [caption]
+            if dist_m is not None and dist_m >= 0:
+                lines.append(f"{float(dist_m):.1f} m")
+            font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+            p.setFont(font)
+            metrics = p.fontMetrics()
+            tw = max(metrics.horizontalAdvance(line) for line in lines) + 10
+            th = metrics.height() * len(lines) + 8
+            tx = int(cx - tw / 2)
+            ty = max(int(ct), int(by) - th - 4)
+            p.fillRect(tx, ty, int(tw), int(th), QColor(0, 0, 0, 205))
+            p.setPen(QColor(224, 242, 254))
+            y_text = ty + 4 + metrics.ascent()
+            for line in lines:
+                p.drawText(tx + 5, y_text, line)
+                y_text += metrics.height()
