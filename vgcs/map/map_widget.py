@@ -857,6 +857,7 @@ class _ObservationSnapshotBridge(QObject):
 
 class _LrfLockBridge(QObject):
     finished = Signal(object, float, float)  # distance_m | None, u, v
+    progress = Signal(float)  # live SLR sample while locking
 
 
 class _LrfLockTask(QRunnable):
@@ -882,6 +883,13 @@ class _LrfLockTask(QRunnable):
 
     def run(self) -> None:
         dist = None
+
+        def _on_sample(value_m: float) -> None:
+            try:
+                self._bridge.progress.emit(float(value_m))
+            except Exception:
+                pass
+
         try:
             lock_fn = getattr(self._cc, "lock_lrf_at_video_norm", None)
             if callable(lock_fn):
@@ -890,6 +898,7 @@ class _LrfLockTask(QRunnable):
                     self._v,
                     frame_w=self._frame_w,
                     frame_h=self._frame_h,
+                    on_sample=_on_sample,
                 )
         except Exception as exc:
             print(f"[VGCS:lrf] lock failed: {exc}")
@@ -1264,8 +1273,10 @@ class MapWidget(QWidget):
         self._lrf_lock_armed = False
         self._lrf_lock_uv: tuple[float, float] | None = None
         self._lrf_lock_distance_m: float | None = None
+        self._lrf_lock_in_progress = False
         self._lrf_lock_bridge = _LrfLockBridge(self)
         self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
+        self._lrf_lock_bridge.progress.connect(self._on_c13_lrf_lock_progress)
         self._obs_mark_mode = False
         self._observations: list[dict[str, object]] = []
         self._dooaf_pick_complete = None
@@ -9633,7 +9644,10 @@ class MapWidget(QWidget):
             uv = getattr(self, "_lrf_lock_uv", None)
             armed = bool(getattr(self, "_lrf_lock_armed", False))
             dist = getattr(self, "_lrf_lock_distance_m", None)
-            pending = uv is not None and dist is None and not armed
+            in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
+            pending = in_progress or (
+                uv is not None and not self._c13_lrf_is_locked() and not armed
+            )
             if uv is not None:
                 ly.set_lrf_lock(
                     VideoOverlayLrfLock(
@@ -9714,6 +9728,7 @@ class MapWidget(QWidget):
         self._lrf_lock_armed = False
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
+        self._lrf_lock_in_progress = False
         try:
             self._obstacle_radar.set_c13_lrf_armed(False)
         except Exception:
@@ -9725,6 +9740,7 @@ class MapWidget(QWidget):
         self._lrf_lock_armed = False
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
+        self._lrf_lock_in_progress = False
         cc = getattr(self, "_camera_control", None)
         try:
             unlock = getattr(cc, "unlock_lrf", None)
@@ -9753,8 +9769,9 @@ class MapWidget(QWidget):
         self._lrf_lock_armed = False
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
+        self._lrf_lock_in_progress = True
         self._refresh_lrf_lock_overlay()
-        self._set_status("Locking LRF target… (wait for tracker, up to 12 s)")
+        self._set_status("Locking LRF target…")
         fw, fh = 1280, 720
         try:
             im = getattr(self, "_native_video_last", None)
@@ -9767,7 +9784,21 @@ class MapWidget(QWidget):
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(task)
 
+    def _on_c13_lrf_lock_progress(self, distance_m: float) -> None:
+        try:
+            dm = float(distance_m)
+            self._lrf_lock_distance_m = dm
+            self._refresh_lrf_lock_overlay()
+            try:
+                self._obstacle_radar.set_c13_lrf_locking(dm)
+            except Exception:
+                pass
+            self._set_status(f"Locking LRF… {dm:.1f} m")
+        except (TypeError, ValueError):
+            pass
+
     def _on_c13_lrf_lock_finished(self, dist: object, u: float, v: float) -> None:
+        self._lrf_lock_in_progress = False
         try:
             if dist is None:
                 self._lrf_lock_uv = None
