@@ -435,7 +435,7 @@ class _LrfRangeBlock(QWidget):
         self._btn.setCheckable(True)
         self._btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn.setStyleSheet(_LRF_BTN_QSS)
-        self._btn.setToolTip("Lock C13 laser range — click, then pick target on video")
+        self._btn.setToolTip("Arm C13 LRF — click any target on video to slew and measure")
         self._btn.clicked.connect(self.lock_clicked.emit)
         btn_wrap = QWidget()
         btn_wrap.setStyleSheet("background: transparent; border: none;")
@@ -497,7 +497,7 @@ class _LrfRangeBlock(QWidget):
         self._c13_state = "idle"
         self._btn.setChecked(False)
         self._btn.setText("⌖")
-        self._btn.setToolTip("Lock C13 laser range — click, then pick target on video")
+        self._btn.setToolTip("Arm C13 LRF — click any target on video to slew and measure")
         self._sub.setText("C13 LRF · tap to lock")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(0)
@@ -508,9 +508,9 @@ class _LrfRangeBlock(QWidget):
         self._btn.setChecked(True)
         self._btn.setText("◎")
         self._btn.setToolTip(
-            "Aim gimbal until live SLR matches target, then click near video centre to lock"
+            "Arm LRF, then click any target on video — camera slews and measures range"
         )
-        self._sub.setText("Aim gimbal — live SLR below")
+        self._sub.setText("Click target on video to measure")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(0)
 
@@ -555,7 +555,7 @@ class _LrfRangeBlock(QWidget):
         else:
             self._val.setText(format_slr_display_m(distance_m))
         self._val.setStyleSheet(_VALUE_QSS)
-        self._sub.setText("C13 LRF · reading laser…")
+        self._sub.setText("C13 LRF · slewing to target…")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(1)
 

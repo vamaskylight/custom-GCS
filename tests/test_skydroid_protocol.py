@@ -288,7 +288,17 @@ def test_gsy_yaw_rate_inverted_on_c13() -> None:
     assert SkydroidTopUdpAdapter._gsy_yaw_rate_for_offset(-5.0, 3.0) == 3.0
 
 
-def test_try_accept_gimbal_slew_slr_requires_range_move() -> None:
+def test_lrf_lock_move_gimbal_default(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.delenv("VGCS_LRF_HOLD_GIMBAL", raising=False)
+    monkeypatch.delenv("VGCS_LRF_MOVE_GIMBAL", raising=False)
+    assert SkydroidTopUdpAdapter._lrf_lock_move_gimbal() is True
+    monkeypatch.setenv("VGCS_LRF_HOLD_GIMBAL", "1")
+    assert SkydroidTopUdpAdapter._lrf_lock_move_gimbal() is False
+
+
+def test_try_accept_gimbal_slew_slr_accepts_same_range_after_slew() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     adapter = SkydroidTopUdpAdapter()
@@ -298,6 +308,26 @@ def test_try_accept_gimbal_slew_slr_requires_range_move() -> None:
         30.1,
         (-42.0, 0.0),
         (-47.0, 0.0),
+        gimbal_slew_mono=0.0,
+        yaw_tgt=-47.0,
+        pitch_tgt=6.9,
+        dyaw=-5.0,
+        dpitch=-6.9,
+    )
+    assert got is not None
+    assert abs(float(got) - 30.0) < 0.5
+
+
+def test_try_accept_gimbal_slew_slr_requires_range_move_without_slew() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    samples = [29.8, 30.0, 30.0, 29.9, 30.0]
+    got = adapter._try_accept_gimbal_slew_slr(
+        samples,
+        30.1,
+        (-42.0, 0.0),
+        (-42.0, 0.0),
         gimbal_slew_mono=0.0,
         yaw_tgt=-47.0,
         pitch_tgt=6.9,
@@ -350,6 +380,7 @@ def test_try_accept_lrf_lock_slr_rejects_unchanged_foreground() -> None:
         elapsed=8.0,
         pre_slr=16.3,
         align_attempted=True,
+        align_ok=False,
         click_offset_deg=14.0,
     )
     assert got is None
@@ -365,6 +396,7 @@ def test_try_accept_lrf_lock_slr_accepts_after_align_to_building() -> None:
         elapsed=8.0,
         pre_slr=16.3,
         align_attempted=True,
+        align_ok=True,
         click_offset_deg=14.0,
     )
     assert got is not None
