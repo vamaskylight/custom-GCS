@@ -33,16 +33,16 @@ _C13_PROBE_PORTS = (5000, 9003, 19856)
 _ZOOM_EXTRA_PORTS = (9003, 19853)
 
 # LRF lock: SLR reads along laser boresight — wait for tracker slew before accepting range.
-_LRF_LOCK_MIN_WAIT_S = 0.8
+_LRF_LOCK_MIN_WAIT_S = 0.5
 _LRF_LOCK_MAX_WAIT_S = 10.0
-_LRF_LOCK_POLL_S = 0.15
+_LRF_LOCK_POLL_S = 0.12
 _LRF_BASELINE_EPS_M = 1.5
 _LRF_STABLE_EPS_M = 0.35
 _LRF_MOVED_MIN_M = 2.0
 _LRF_GIMBAL_SLR_MIN_M = 0.5
 _LRF_GIMBAL_ACCEPT_MIN_DEG = 1.5
-_LRF_GIMBAL_SLR_SETTLE_S = 1.0
-_LRF_GIMBAL_SLR_SETTLE_ALIGN_OK_S = 0.5
+_LRF_GIMBAL_SLR_SETTLE_S = 0.8
+_LRF_GIMBAL_SLR_SETTLE_ALIGN_OK_S = 0.35
 _LRF_CONVERGE_SAMPLES = 3
 _LRF_REFINE_SAMPLES = 3
 _LRF_REFINE_HOLD_S = 0.75
@@ -50,13 +50,13 @@ _LRF_REFINE_EXTEND_S = 1.0
 _LRF_CLIMB_EPS_M = 0.35
 _LRF_SETTLE_WINDOW = 8
 _LRF_SETTLE_MIN_DRIFT_M = 2.0
-_LRF_POST_MOVE_MIN_WAIT_S = 1.0
-_LRF_POST_MOVE_SETTLE_S = 1.0
+_LRF_POST_MOVE_MIN_WAIT_S = 0.5
+_LRF_POST_MOVE_SETTLE_S = 0.2
 _LRF_GOT_RESEND_INTERVAL_S = 2.0
 _LRF_BASELINE_RETRIES = 8
 _LRF_BASELINE_GAP_S = 0.2
-_LRF_POST_GOT_WAIT_S = 1.0
-_LRF_SLR_SHOT_SETTLE_S = 0.55
+_LRF_POST_GOT_WAIT_S = 0.25
+_LRF_SLR_SHOT_SETTLE_S = 0.25
 _LRF_GAM_APPROACH_DPS = 20.0
 _LRF_GAM_SETTLE_S = 2.0
 _LRF_GAM_AIM_TOL_DEG = 2.5
@@ -67,26 +67,28 @@ _LRF_FOV_V_DEG = 46.9
 _LRF_REPOINT_AFTER_S = 4.0
 _LRF_GIMBAL_SLEW_SPEED_DPS = 2.0
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
-_LRF_GIMBAL_AXIS_MAX_S = 1.8
+_LRF_GIMBAL_AXIS_MAX_S = 1.15
 _LRF_GIMBAL_SLEW_SCALE = 0.90
 _LRF_C13_INVERT_GSY = True
 _LRF_C13_INVERT_GSP = False
 _LRF_C13_NEGATE_IMAGE_YAW = True
 _LRF_ALIGN_MIN_OFFSET_DEG = 0.35
-_LRF_ALIGN_SPEED_DPS = 3.0
+_LRF_ALIGN_SPEED_DPS = 5.0
+_LRF_ALIGN_BULK_MIN_DEG = 4.0
+_LRF_ALIGN_BULK_SPEED_DPS = 8.0
 _LRF_ALIGN_MAX_ITERS = 16
 _LRF_ALIGN_TOL_DEG = 2.5
 _LRF_ALIGN_YAW_TOL_DEG = 0.75
 _LRF_ALIGN_PITCH_TOL_DEG = 0.75
 _LRF_ALIGN_SNAP_MIN_DEG = 0.35
 _LRF_ALIGN_GAP_PITCH_MIN_DEG = 3.0
-_LRF_ALIGN_GAP_YAW_MIN_DEG = 6.0
+_LRF_ALIGN_GAP_YAW_MIN_DEG = 3.0
 _LRF_ALIGN_MAX_TOTAL_DEG = 45.0
 _LRF_ALIGN_MAX_TOTAL_CAP_DEG = 55.0
 _LRF_HOLD_MAX_CLICK_OFFSET_DEG = 4.0
 _LRF_HOLD_MIN_PIXEL_MOVE_PX = 48
 _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG = 0.45
-_LRF_PRELOCK_SAMPLES = 3
+_LRF_PRELOCK_SAMPLES = 2
 _LRF_LIVE_POLL_SAMPLES = 3
 _LRF_SLR_QUERY_RETRIES = 3
 _LRF_SLR_DEST_LASER = "E"
@@ -243,6 +245,16 @@ class SkydroidTopUdpAdapter:
 
     def _read_slr_prelock_median(self) -> float | None:
         """Several fresh SLR shots before lock — reduces single-shot error."""
+        with self._status_lock:
+            cached = self._laser_range_m
+            age = (
+                time.monotonic() - float(self._laser_range_mono)
+                if float(self._laser_range_mono or 0.0) > 0.0
+                else 999.0
+            )
+        if cached is not None and age < 0.45:
+            return float(cached)
+
         samples: list[float] = []
         n = int(_LRF_PRELOCK_SAMPLES)
         for i in range(n):
@@ -250,7 +262,7 @@ class SkydroidTopUdpAdapter:
             if reading is not None:
                 samples.append(float(reading))
             if i + 1 < n:
-                time.sleep(0.12)
+                time.sleep(0.08)
         if not samples:
             return None
         if len(samples) >= 5:
@@ -614,6 +626,60 @@ class SkydroidTopUdpAdapter:
             return min(base, 0.65)
         return base
 
+    @staticmethod
+    def _align_speed_for_need(need_deg: float) -> float:
+        try:
+            base = float(
+                os.environ.get(
+                    "VGCS_LRF_ALIGN_SPEED_DPS",
+                    str(_LRF_ALIGN_SPEED_DPS),
+                )
+                or _LRF_ALIGN_SPEED_DPS
+            )
+        except ValueError:
+            base = float(_LRF_ALIGN_SPEED_DPS)
+        need = abs(float(need_deg))
+        if need >= 15.0:
+            return max(base, float(_LRF_ALIGN_BULK_SPEED_DPS))
+        if need >= 8.0:
+            return max(base, 6.5)
+        if need >= float(_LRF_ALIGN_BULK_MIN_DEG):
+            return max(base, 5.5)
+        return base
+
+    def _align_bulk_goto(
+        self,
+        yaw_tgt: float,
+        pitch_tgt: float,
+        att: tuple[float, float],
+        *,
+        spd: float,
+    ) -> tuple[float, float]:
+        """Large click: one GAP + one GAY at high speed, then iterative refine."""
+        att_now = att
+        bulk_spd = max(float(spd), float(_LRF_ALIGN_BULK_SPEED_DPS))
+        pitch_delta = abs(self._angle_err_deg(float(pitch_tgt), float(att_now[1])))
+        yaw_delta = abs(self._angle_err_deg(float(yaw_tgt), float(att_now[0])))
+        if pitch_delta >= 2.5:
+            print(
+                f"[VGCS:lrf] align bulk pitch GAP -> {float(pitch_tgt):.1f}° "
+                f"(Δ={pitch_delta:.1f}° spd={bulk_spd:.0f})"
+            )
+            self._send_gap_pitch_direct(
+                float(pitch_tgt), bulk_spd, att_pitch=float(att_now[1])
+            )
+            att_now = self._read_gimbal_attitude_deg() or att_now
+        if yaw_delta >= 2.5:
+            print(
+                f"[VGCS:lrf] align bulk yaw GAY -> {float(yaw_tgt):.1f}° "
+                f"(Δ={yaw_delta:.1f}° spd={bulk_spd:.0f})"
+            )
+            self._send_gay_yaw_direct(
+                float(yaw_tgt), bulk_spd, att_yaw=float(att_now[0])
+            )
+            att_now = self._read_gimbal_attitude_deg() or att_now
+        return att_now
+
     def _send_gay_yaw_direct(self, yaw_tgt: float, spd: float, *, att_yaw: float = 0.0) -> None:
         """Absolute yaw (GAY) — large horizontal clicks."""
         self._ensure_active_transport()
@@ -631,7 +697,7 @@ class SkydroidTopUdpAdapter:
         except Exception:
             pass
         delta = abs(self._angle_err_deg(float(yaw_tgt), float(att_yaw)))
-        settle = min(3.0, delta / max(2.0, float(spd)) + 0.4)
+        settle = min(2.2, delta / max(4.0, float(spd)) + 0.22)
         time.sleep(float(settle))
         self._gimbal_stop_hard()
 
@@ -658,7 +724,7 @@ class SkydroidTopUdpAdapter:
         except Exception:
             pass
         delta = abs(self._angle_err_deg(float(pitch_tgt), float(att_pitch)))
-        settle = min(3.2, delta / max(2.0, float(spd)) + 0.45)
+        settle = min(2.4, delta / max(4.0, float(spd)) + 0.25)
         time.sleep(float(settle))
         self._gimbal_stop_hard()
 
@@ -860,13 +926,23 @@ class SkydroidTopUdpAdapter:
 
         yaw_tgt = self._gimbal_yaw_target_deg(float(att_start[0]), float(dyaw0))
         pitch_tgt = self._gimbal_pitch_target_deg(float(att_start[1]), float(dpitch0))
-        spd = float(_LRF_ALIGN_SPEED_DPS)
+        spd = self._align_speed_for_need(float(need))
         att: tuple[float, float] = att_start
         total_move = 0.0
         pitch_open_sent = 0.0
         pitch_need_deg = abs(float(dpitch0))
         gap_pitch_sent = False
         gap_yaw_sent = False
+        if float(need) >= float(_LRF_ALIGN_BULK_MIN_DEG):
+            att = self._align_bulk_goto(
+                float(yaw_tgt),
+                float(pitch_tgt),
+                att_start,
+                spd=float(spd),
+            )
+            gap_pitch_sent = True
+            gap_yaw_sent = abs(float(dyaw0)) >= 2.5
+            pitch_open_sent = pitch_need_deg * 0.85
         yaw_tol = self._align_yaw_tol_deg()
         pitch_tol = self._align_pitch_tol_deg(float(dpitch0))
         move_cap = self._align_move_cap_deg(float(need))
@@ -1783,9 +1859,8 @@ class SkydroidTopUdpAdapter:
                     yaw_tgt = self._gimbal_yaw_target_deg(
                         float(att_before[0]), float(align_dyaw)
                     )
-                    pitch_tgt = max(
-                        -90.0,
-                        min(90.0, float(att_before[1]) - float(align_dpitch)),
+                    pitch_tgt = self._gimbal_pitch_target_deg(
+                        float(att_before[1]), float(align_dpitch)
                     )
                     gimbal_slew_mono = time.monotonic()
                     if not align_ok:
@@ -1794,7 +1869,7 @@ class SkydroidTopUdpAdapter:
                             "(try a closer target or use gimbal sticks)"
                         )
                         return None
-                    time.sleep(_LRF_POST_MOVE_SETTLE_S)
+                    time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
                     print(
                         f"[VGCS:lrf] slew done att={att_before}->{att_lock_ref} "
                         f"target=({yaw_tgt:.1f},{pitch_tgt:.1f})"
@@ -1814,7 +1889,9 @@ class SkydroidTopUdpAdapter:
 
             self._send_got_mark_only(x_px, y_px, frame_w=fw, frame_h=fh)
             post_got_wait = (
-                _LRF_POST_GOT_WAIT_S if not move_gimbal else max(0.5, _LRF_POST_GOT_WAIT_S * 0.5)
+                _LRF_POST_GOT_WAIT_S
+                if not move_gimbal
+                else float(_LRF_POST_GOT_WAIT_S)
             )
             time.sleep(post_got_wait)
 
