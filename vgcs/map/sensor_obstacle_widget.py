@@ -508,7 +508,7 @@ class _LrfRangeBlock(QWidget):
         self._btn.setChecked(True)
         self._btn.setText("◎")
         self._btn.setToolTip(
-            "Aim gimbal until live SLR shows target range, then click video to lock"
+            "Aim gimbal until live SLR matches target, then click near video centre to lock"
         )
         self._sub.setText("Aim gimbal — live SLR below")
         self._sub.setVisible(True)

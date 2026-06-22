@@ -9846,7 +9846,8 @@ class MapWidget(QWidget):
                 except Exception:
                     pass
                 self._set_status(
-                    "LRF lock failed — click target again or tap ◎ to re-arm"
+                    "LRF lock failed — aim gimbal at target (watch live SLR), "
+                    "click near centre, or tap ◎ to re-arm"
                 )
                 QTimer.singleShot(12000, self._clear_lrf_failed_reticle)
                 return
