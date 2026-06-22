@@ -45,18 +45,18 @@ def test_build_top_frame_ptz() -> None:
     assert frame == b"#TPUG2wPTZ016B"
 
 
-def test_encode_speed_uses_0_1_deg_per_s_units() -> None:
+def test_encode_speed_uses_0_5_deg_per_s_units() -> None:
     from vgcs.skydroid.protocol import encode_speed_2char
 
-    # 5.0 deg/s -> 50 -> 0x32
-    assert encode_speed_2char(5.0) == "32"
-    # -5.0 deg/s -> -50 -> 0xCE
-    assert encode_speed_2char(-5.0) == "CE"
+    # 5.0 deg/s -> 10 -> 0x0A (PROTOCAL.doc V1.1.6)
+    assert encode_speed_2char(5.0) == "0A"
+    # -5.0 deg/s -> -10 -> 0xF6
+    assert encode_speed_2char(-5.0) == "F6"
 
 
 def test_gsy_frame_5_deg_per_s() -> None:
     frame = build_top_frame("GSY", {"yaw": 5.0})
-    assert frame == b"#TPUG2wGSY3264"
+    assert frame == b"#TPUG2wGSY0A70"
 
 
 def test_gsm_stop_both_axes() -> None:
@@ -255,3 +255,31 @@ def test_slr_median_and_converged() -> None:
     assert SkydroidTopUdpAdapter._slr_converged(stable) == 56.0
     climbing = [54.0, 55.0, 56.0, 57.0, 58.0]
     assert SkydroidTopUdpAdapter._slr_converged(climbing) is None
+
+
+def test_try_accept_current_aim_slr_accepts_stable_baseline() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    att = (-27.29, 0.0)
+    samples = [42.0, 42.1, 42.2, 42.2, 42.1]
+    got = adapter._try_accept_current_aim_slr(
+        samples, 42.2, att, att, elapsed=2.0
+    )
+    assert got is not None
+    assert abs(float(got) - 42.2) < 0.5
+
+
+def test_try_accept_current_aim_slr_rejects_gimbal_motion() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    samples = [42.0, 42.1, 42.2, 42.2, 42.1]
+    got = adapter._try_accept_current_aim_slr(
+        samples,
+        42.2,
+        (-27.29, 0.0),
+        (-46.0, 0.0),
+        elapsed=2.0,
+    )
+    assert got is None
