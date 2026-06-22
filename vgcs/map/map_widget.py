@@ -145,6 +145,7 @@ from vgcs.video.camera_control import (
     camera_recording_applies_digital_zoom,
     camera_zoom_limits,
 )
+from vgcs.skydroid.protocol import format_slr_display_m
 from vgcs.map.native_tile_map import NativeTileMapView, bundled_seed_root, fetch_tile_http_bytes
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_footer_hud import (
@@ -9827,7 +9828,7 @@ class MapWidget(QWidget):
                 self._obstacle_radar.set_c13_lrf_locking(dm)
             except Exception:
                 pass
-            self._set_status(f"Locking LRF… {dm:.1f} m")
+            self._set_status(f"Locking LRF… {format_slr_display_m(dm)}")
         except (TypeError, ValueError):
             pass
 
@@ -9856,7 +9857,7 @@ class MapWidget(QWidget):
             self._companion_laser_range_m = dm
             self._obstacle_radar.set_c13_lrf_locked(dm)
             self._refresh_lrf_lock_overlay()
-            self._set_status(f"C13 LRF locked · {dm:.1f} m — cyan box on video")
+            self._set_status(f"C13 LRF locked · {format_slr_display_m(dm)} — cyan box on video")
             print(f"[VGCS:lrf] locked u={u:.3f} v={v:.3f} range={dm:.1f} m")
         except Exception as exc:
             print(f"[VGCS:lrf] lock result error: {exc}")

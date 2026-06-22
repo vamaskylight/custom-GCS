@@ -34,6 +34,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from vgcs.skydroid.protocol import format_slr_display_m
+
 _SENSOR_LASER = 0
 _SENSOR_ULTRASOUND = 1
 _SENSOR_INFRARED = 2
@@ -528,7 +530,7 @@ class _LrfRangeBlock(QWidget):
             return
         if cur_m < 0:
             return
-        self._val.setText(f"{cur_m:.1f} m")
+        self._val.setText(format_slr_display_m(cur_m))
         self._val.setStyleSheet(_VALUE_QSS)
         self._sub.setText("Live SLR — aim gimbal, then click video")
         self._sub.setVisible(True)
@@ -538,7 +540,7 @@ class _LrfRangeBlock(QWidget):
         self._c13_mode = True
         self._c13_state = "locked"
         self._btn.setChecked(False)
-        self._val.setText(f"{float(distance_m):.1f} m")
+        self._val.setText(format_slr_display_m(distance_m))
         self._val.setStyleSheet(_VALUE_ALERT_QSS if alert else _VALUE_QSS)
         self._sub.setText("C13 LRF · locked — tap value to unlock")
         self._sub.setVisible(True)
@@ -551,7 +553,7 @@ class _LrfRangeBlock(QWidget):
         if distance_m is None:
             self._val.setText("…")
         else:
-            self._val.setText(f"{float(distance_m):.1f} m")
+            self._val.setText(format_slr_display_m(distance_m))
         self._val.setStyleSheet(_VALUE_QSS)
         self._sub.setText("C13 LRF · reading laser…")
         self._sub.setVisible(True)
