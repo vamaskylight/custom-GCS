@@ -288,6 +288,18 @@ def test_gsy_yaw_rate_inverted_on_c13() -> None:
     assert SkydroidTopUdpAdapter._gsy_yaw_rate_for_offset(-5.0, 3.0) == 3.0
 
 
+def test_normalize_lrf_click_uv_flips_x_by_default(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.delenv("VGCS_LRF_FLIP_X", raising=False)
+    u, v = SkydroidTopUdpAdapter.normalize_lrf_click_uv(0.988, 0.572)
+    assert abs(u - 0.012) < 0.001
+    assert abs(v - 0.572) < 0.001
+    monkeypatch.setenv("VGCS_LRF_FLIP_X", "0")
+    u2, _ = SkydroidTopUdpAdapter.normalize_lrf_click_uv(0.988, 0.572)
+    assert abs(u2 - 0.988) < 0.001
+
+
 def test_align_move_cap_scales_with_offset() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 

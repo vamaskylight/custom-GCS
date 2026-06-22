@@ -2165,6 +2165,9 @@ class MapWidget(QWidget):
                     event.accept()
                 pos = event.position()
                 xn, yn = self._native_video_click_norm(pos)
+                from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+                xn, yn = SkydroidTopUdpAdapter.normalize_lrf_click_uv(float(xn), float(yn))
                 self._begin_c13_lrf_video_lock(float(xn), float(yn))
             except Exception as e:
                 print(f"[VGCS:lrf] video pick failed: {e}")

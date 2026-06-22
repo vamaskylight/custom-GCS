@@ -1178,6 +1178,34 @@ class SkydroidTopUdpAdapter:
         return True
 
     @staticmethod
+    def _lrf_flip_x() -> bool:
+        """Companion RTSP X is mirrored vs PROTOCAL GOT 1280×720 (field C13)."""
+        if str(os.environ.get("VGCS_LRF_FLIP_X", "") or "").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return False
+        if str(os.environ.get("VGCS_LRF_FLIP_X", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return True
+        return True
+
+    @staticmethod
+    def normalize_lrf_click_uv(u: float, v: float) -> tuple[float, float]:
+        """Map GUI video click (0..1) to C13 GOT / gimbal frame coordinates."""
+        uf = max(0.0, min(1.0, float(u)))
+        vf = max(0.0, min(1.0, float(v)))
+        if SkydroidTopUdpAdapter._lrf_flip_x():
+            uf = 1.0 - uf
+        return float(uf), float(vf)
+
+    @staticmethod
     def _hold_max_click_offset_deg() -> float:
         try:
             return float(
@@ -1205,6 +1233,8 @@ class SkydroidTopUdpAdapter:
         move_gimbal = self._lrf_lock_move_gimbal()
         fw = _LRF_FRAME_W
         fh = _LRF_FRAME_H
+        u_in, v_in = float(u), float(v)
+        u, v = self.normalize_lrf_click_uv(u_in, v_in)
         x_px = max(0, min(fw, int(round(max(0.0, min(1.0, float(u))) * fw))))
         y_px = max(0, min(fh, int(round(max(0.0, min(1.0, float(v))) * fh))))
         self._ensure_active_transport()
@@ -1233,7 +1263,8 @@ class SkydroidTopUdpAdapter:
             print(
                 f"[VGCS:lrf] lock start px=({x_px},{y_px}) "
                 f"att={att_before} offset=({dyaw:.1f}°,{dpitch_img:.1f}°) "
-                f"mode={'click-to-aim' if move_gimbal else 'hold-gimbal'}"
+                f"mode={'click-to-aim' if move_gimbal else 'hold-gimbal'} "
+                f"click=({u_in:.3f},{v_in:.3f}) frame=({u:.3f},{v:.3f})"
             )
 
             if not move_gimbal:
