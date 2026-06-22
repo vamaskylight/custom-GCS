@@ -452,6 +452,9 @@ class SkydroidTopUdpAdapter:
         ref_uv: tuple[float, float],
         ref_att: tuple[float, float],
         cur_att: tuple[float, float],
+        *,
+        gac_h_scale: float = 1.0,
+        gac_v_scale: float = 1.0,
     ) -> tuple[float, float]:
         """Screen UV of a world-fixed point marked at ref_uv when gimbal was at ref_att."""
         u0, v0 = float(ref_uv[0]), float(ref_uv[1])
@@ -461,13 +464,49 @@ class SkydroidTopUdpAdapter:
         dpitch_img0 = (v0 - 0.5) * _LRF_FOV_V_DEG
         gac_dy = yaw - yaw0
         gac_dp = pitch - pitch0
-        img_dy_delta = SkydroidTopUdpAdapter._gac_to_image_yaw_delta(gac_dy)
-        img_dp_delta = SkydroidTopUdpAdapter._gac_to_image_pitch_delta(gac_dp)
+        hs = max(0.75, min(1.25, float(gac_h_scale)))
+        vs = max(0.75, min(1.25, float(gac_v_scale)))
+        img_dy_delta = (
+            SkydroidTopUdpAdapter._gac_to_image_yaw_delta(gac_dy) * hs
+        )
+        img_dp_delta = (
+            SkydroidTopUdpAdapter._gac_to_image_pitch_delta(gac_dp) * vs
+        )
         u = 0.5 + (dyaw_img0 - img_dy_delta) / _LRF_FOV_H_DEG
         v = 0.5 + (dpitch_img0 - img_dp_delta) / _LRF_FOV_V_DEG
         return (
             max(0.0, min(1.0, float(u))),
             max(0.0, min(1.0, float(v))),
+        )
+
+    @staticmethod
+    def calibrate_track_gac_scales(
+        ref_uv: tuple[float, float],
+        ref_att: tuple[float, float],
+        lock_att: tuple[float, float],
+        *,
+        h_scale: float = 1.0,
+        v_scale: float = 1.0,
+    ) -> tuple[float, float]:
+        """Learn GAC→image scale from click-to-aim slew (reduces pan tracking error)."""
+        u0, v0 = float(ref_uv[0]), float(ref_uv[1])
+        dyaw_img0 = (u0 - 0.5) * _LRF_FOV_H_DEG
+        dpitch_img0 = (v0 - 0.5) * _LRF_FOV_V_DEG
+        gac_dy = float(lock_att[0]) - float(ref_att[0])
+        gac_dp = float(lock_att[1]) - float(ref_att[1])
+        img_dy = SkydroidTopUdpAdapter._gac_to_image_yaw_delta(gac_dy)
+        img_dp = SkydroidTopUdpAdapter._gac_to_image_pitch_delta(gac_dp)
+        h_new = float(h_scale)
+        v_new = float(v_scale)
+        if abs(float(img_dy)) > 0.4 and abs(float(dyaw_img0)) > 1.0:
+            measured = abs(float(dyaw_img0)) / abs(float(img_dy))
+            h_new = measured * 0.4 + float(h_scale) * 0.6
+        if abs(float(img_dp)) > 0.4 and abs(float(dpitch_img0)) > 1.0:
+            measured = abs(float(dpitch_img0)) / abs(float(img_dp))
+            v_new = measured * 0.4 + float(v_scale) * 0.6
+        return (
+            max(0.75, min(1.25, float(h_new))),
+            max(0.75, min(1.25, float(v_new))),
         )
 
     @staticmethod

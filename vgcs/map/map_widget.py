@@ -1278,6 +1278,8 @@ class MapWidget(QWidget):
         self._lrf_lock_failed = False
         self._lrf_track_ref_uv: tuple[float, float] | None = None
         self._lrf_track_ref_att: tuple[float, float] | None = None
+        self._lrf_track_gac_h_scale = 1.0
+        self._lrf_track_gac_v_scale = 1.0
         self._lrf_lock_bridge = _LrfLockBridge(self)
         self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
         self._lrf_lock_bridge.progress.connect(self._on_c13_lrf_lock_progress)
@@ -9696,17 +9698,49 @@ class MapWidget(QWidget):
             return
         self._lrf_track_ref_uv = (float(u), float(v))
         self._lrf_track_ref_att = att
+        self._lrf_track_gac_h_scale = 1.0
+        self._lrf_track_gac_v_scale = 1.0
 
-    def _reanchor_lrf_track_to_center(self) -> None:
-        att = self._read_gimbal_attitude_pair()
-        if att is None:
+    def _calibrate_lrf_track_after_lock(self) -> None:
+        """Refine GAC→screen mapping from the slew we just completed."""
+        ref_uv = getattr(self, "_lrf_track_ref_uv", None)
+        ref_att = getattr(self, "_lrf_track_ref_att", None)
+        lock_att = self._read_gimbal_attitude_pair()
+        if ref_uv is None or ref_att is None or lock_att is None:
             return
-        self._lrf_track_ref_uv = (0.5, 0.5)
-        self._lrf_track_ref_att = att
+        try:
+            from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+            h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
+            v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
+            h_new, v_new = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
+                ref_uv,
+                ref_att,
+                lock_att,
+                h_scale=h_scale,
+                v_scale=v_scale,
+            )
+            self._lrf_track_gac_h_scale = float(h_new)
+            self._lrf_track_gac_v_scale = float(v_new)
+            u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+                ref_uv,
+                ref_att,
+                lock_att,
+                gac_h_scale=h_new,
+                gac_v_scale=v_new,
+            )
+            print(
+                f"[VGCS:lrf] track calibrate gac_scale=({h_new:.3f},{v_new:.3f}) "
+                f"lock_uv=({u:.3f},{v:.3f})"
+            )
+        except Exception:
+            pass
 
     def _clear_lrf_track_ref(self) -> None:
         self._lrf_track_ref_uv = None
         self._lrf_track_ref_att = None
+        self._lrf_track_gac_h_scale = 1.0
+        self._lrf_track_gac_v_scale = 1.0
 
     def _update_lrf_reticle_track(self) -> None:
         if not self._lrf_reticle_tracking_active():
@@ -9722,7 +9756,11 @@ class MapWidget(QWidget):
             from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
             u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
-                ref_uv, ref_att, cur
+                ref_uv,
+                ref_att,
+                cur,
+                gac_h_scale=float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0),
+                gac_v_scale=float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0),
             )
             self._lrf_lock_uv = (float(u), float(v))
         except Exception:
@@ -9950,7 +9988,7 @@ class MapWidget(QWidget):
                 return
             dm = float(dist)
             self._lrf_lock_failed = False
-            self._reanchor_lrf_track_to_center()
+            self._calibrate_lrf_track_after_lock()
             self._update_lrf_reticle_track()
             uv = getattr(self, "_lrf_lock_uv", None) or (float(u), float(v))
             self._lrf_lock_distance_m = dm
