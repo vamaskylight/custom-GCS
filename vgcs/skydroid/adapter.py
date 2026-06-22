@@ -74,7 +74,9 @@ _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG = 0.45
 _LRF_PRELOCK_SAMPLES = 7
 _LRF_LIVE_POLL_SAMPLES = 3
 _LRF_SLR_QUERY_RETRIES = 3
-_LRF_SLR_DEST_PRIMARY = "D"
+_LRF_SLR_DEST_LASER = "E"
+_LRF_SLR_DEST_SYSTEM = "D"
+_LRF_SLR_DIVERGE_WARN_M = 2.0
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.25
 _LRF_MAX_REPOINTS = 0
@@ -731,6 +733,37 @@ class SkydroidTopUdpAdapter:
         return float(raw_m) * scale + offset
 
     @staticmethod
+    def _slr_use_trigger() -> bool:
+        """Native Skydroid uses PROTOCAL read-only SLR; optional VGCS_LRF_TRIGGER=1."""
+        return str(os.environ.get("VGCS_LRF_TRIGGER", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    @staticmethod
+    def _pick_slr_readings(
+        laser_m: float | None,
+        system_m: float | None,
+        *,
+        log: bool = False,
+    ) -> float | None:
+        """Prefer E-class (laser module); D-class is system/image path (PROTOCAL §2.2.2)."""
+        if laser_m is not None and system_m is not None:
+            if abs(float(laser_m) - float(system_m)) > _LRF_SLR_DIVERGE_WARN_M and log:
+                print(
+                    f"[VGCS:lrf] SLR E(laser)={float(laser_m):.1f} m "
+                    f"D(system)={float(system_m):.1f} m — using E"
+                )
+            return float(laser_m)
+        if laser_m is not None:
+            return float(laser_m)
+        if system_m is not None:
+            return float(system_m)
+        return None
+
+    @staticmethod
     def _payload_is_slr_reply(payload: bytes) -> bool:
         dec = parse_top_frame(payload)
         return dec is not None and str(dec.command or "").upper() == "SLR"
@@ -1202,47 +1235,48 @@ class SkydroidTopUdpAdapter:
             self._transport._port = active_port
 
     def _query_slr_distance_m(self, *, log: bool = False, fresh: bool = False) -> float | None:
-        """Single SLR read on D-class (PROTOCAL §4.22); E-class fallback only."""
+        """SLR read: E-class laser module first, D-class fallback (PROTOCAL §2.2.2 / §4.22)."""
         active_port = int(self._transport._port)
-        primary = build_slr_query(dest=_LRF_SLR_DEST_PRIMARY)
-        fallback = build_slr_query(dest="E")
+        laser_q = build_slr_query(dest=_LRF_SLR_DEST_LASER)
+        system_q = build_slr_query(dest=_LRF_SLR_DEST_SYSTEM)
         try:
-            if fresh:
-                for dest in (_LRF_SLR_DEST_PRIMARY, "E"):
-                    try:
-                        self._transport.send_and_receive(
-                            build_slr_trigger(dest=dest),
-                            expect_reply=False,
-                            log=False,
-                            timeout_s=0.25,
-                        )
-                    except Exception:
-                        continue
+            if fresh and self._slr_use_trigger():
+                try:
+                    self._transport.send_and_receive(
+                        build_slr_trigger(dest=_LRF_SLR_DEST_LASER),
+                        expect_reply=False,
+                        log=False,
+                        timeout_s=0.25,
+                    )
+                except Exception:
+                    pass
                 time.sleep(0.15)
-                self._transmit_slr_read(primary, log=False)
+                self._transmit_slr_read(laser_q, log=False)
                 time.sleep(_LRF_SLR_SHOT_SETTLE_S)
-            reply = self._transmit_slr_read(primary, log=log)
-            if reply is None:
-                reply = self._transmit_slr_read(fallback, log=False)
-            if reply is None:
-                if log:
-                    print("[VGCS:lrf] SLR read failed — no valid SLR reply")
-                return None
-            dist_m = parse_slr_distance_from_payload(reply)
+            laser_reply = self._transmit_slr_read(laser_q, log=log)
+            system_reply = self._transmit_slr_read(system_q, log=False)
+            laser_m = (
+                parse_slr_distance_from_payload(laser_reply)
+                if laser_reply is not None
+                else None
+            )
+            system_m = (
+                parse_slr_distance_from_payload(system_reply)
+                if system_reply is not None
+                else None
+            )
+            dist_m = self._pick_slr_readings(laser_m, system_m, log=log)
             if dist_m is None:
                 if log:
-                    print(
-                        f"[VGCS:lrf] SLR parse failed raw="
-                        f"{reply.decode('ascii', errors='ignore')!r}"
-                    )
+                    print("[VGCS:lrf] SLR read failed — no valid E/D reply")
                 return None
             dist_m = self._calibrate_slr_m(float(dist_m))
             if log:
-                hx = slr_raw_hex(reply)
+                hx = slr_raw_hex(laser_reply or system_reply or b"")
                 print(
                     f"[VGCS:lrf] SLR reply hex={hx} "
                     f"range={float(dist_m):.1f} m "
-                    f"raw={reply.decode('ascii', errors='ignore')!r}"
+                    f"(E={laser_m}, D={system_m})"
                 )
             if not self._lrf_locked:
                 with self._status_lock:
