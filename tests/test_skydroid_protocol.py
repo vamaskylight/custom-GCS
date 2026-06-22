@@ -279,3 +279,29 @@ def test_try_accept_stable_slr_rejects_climbing() -> None:
     climbing = [30.0, 40.0, 50.0, 51.0, 52.0]
     got = adapter._try_accept_stable_slr(climbing, elapsed=2.0)
     assert got is None
+
+
+def test_gsy_yaw_rate_inverted_on_c13() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    assert SkydroidTopUdpAdapter._gsy_yaw_rate_for_offset(5.0, 3.0) == -3.0
+    assert SkydroidTopUdpAdapter._gsy_yaw_rate_for_offset(-5.0, 3.0) == 3.0
+
+
+def test_try_accept_gimbal_slew_slr_requires_range_move() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    samples = [29.8, 30.0, 30.0, 29.9, 30.0]
+    got = adapter._try_accept_gimbal_slew_slr(
+        samples,
+        30.1,
+        (-42.0, 0.0),
+        (-47.0, 0.0),
+        gimbal_slew_mono=0.0,
+        yaw_tgt=-47.0,
+        pitch_tgt=6.9,
+        dyaw=-5.0,
+        dpitch=-6.9,
+    )
+    assert got is None
