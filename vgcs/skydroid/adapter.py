@@ -56,12 +56,13 @@ _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
 _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
 _LRF_REPOINT_AFTER_S = 4.0
-_LRF_MAX_REPOINTS = 2
-_LRF_GIMBAL_SLEW_SPEED_DPS = 5.0
+_LRF_GIMBAL_SLEW_SPEED_DPS = 3.5
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
-_LRF_GIMBAL_AXIS_MAX_S = 3.5
-_LRF_GIMBAL_OVERSHOOT_FACTOR = 1.75
-_LRF_GIMBAL_SLEW_SETTLE_S = 0.35
+_LRF_GIMBAL_AXIS_MAX_S = 1.8
+_LRF_GIMBAL_SLEW_SCALE = 0.55
+_LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
+_LRF_GIMBAL_SLEW_SETTLE_S = 0.25
+_LRF_MAX_REPOINTS = 0
 _PROBE_TIMEOUT_S = 0.12
 
 # Motion commands: no UDP reply wait (C13 often has no timely ACK for GSY/GSP/GSM).
@@ -268,6 +269,33 @@ class SkydroidTopUdpAdapter:
             return False
         return True
 
+    def _gimbal_stop_hard(self) -> None:
+        """Multiple GSM stops — C13 can coast after a single stop packet."""
+        self._ensure_active_transport()
+        self._drop_pending_motion_commands()
+        tick = max(0.05, float(_LRF_GIMBAL_HOLD_REFRESH_S))
+        stop = build_gimbal_speed(0.0, 0.0)
+        for _ in range(12):
+            try:
+                self._transport.send_and_receive(
+                    stop, expect_reply=False, log=False, timeout_s=0.04
+                )
+            except Exception:
+                pass
+            try:
+                self.set_speed(0.0, 0.0)
+            except Exception:
+                pass
+            time.sleep(tick)
+
+    @staticmethod
+    def _axis_burst_duration_s(angle_deg: float, speed_dps: float) -> float:
+        spd = max(2.0, float(speed_dps))
+        return min(
+            float(_LRF_GIMBAL_AXIS_MAX_S),
+            abs(float(angle_deg)) / spd * float(_LRF_GIMBAL_SLEW_SCALE) + 0.12,
+        )
+
     def _hold_speed_direct_burst(
         self,
         yaw_rate: float,
@@ -297,7 +325,7 @@ class SkydroidTopUdpAdapter:
                 )
             time.sleep(tick)
         stop = build_gimbal_speed(0.0, 0.0)
-        for _ in range(4):
+        for _ in range(6):
             self._transport.send_and_receive(
                 stop, expect_reply=False, log=False, timeout_s=0.05
             )
@@ -308,36 +336,41 @@ class SkydroidTopUdpAdapter:
         dyaw: float,
         dpitch: float,
         att_start: tuple[float, float],
-        yaw_tgt: float,
         *,
         speed_dps: float = _LRF_GIMBAL_SLEW_SPEED_DPS,
     ) -> tuple[float, float] | None:
-        """Timed pitch-then-yaw burst; one optional yaw correction from GAC."""
-        spd = max(2.5, float(speed_dps))
-        if abs(float(dpitch)) >= 0.3:
-            pitch_r = -spd if float(dpitch) > 0.0 else spd
-            dur_p = min(_LRF_GIMBAL_AXIS_MAX_S, abs(float(dpitch)) / spd + 0.3)
-            self._hold_speed_direct_burst(0.0, pitch_r, dur_p)
+        """Short undershoot bursts: yaw first, optional brief pitch (no GAC correction chase)."""
+        spd = max(2.0, float(speed_dps))
+        expected = self._expected_offset_deg(dyaw, dpitch)
+        att: tuple[float, float] | None = att_start
         if abs(float(dyaw)) >= 0.3:
             yaw_r = spd if float(dyaw) > 0.0 else -spd
-            dur_y = min(_LRF_GIMBAL_AXIS_MAX_S, abs(float(dyaw)) / spd + 0.3)
+            dur_y = self._axis_burst_duration_s(dyaw, spd)
+            print(f"[VGCS:lrf] yaw burst {yaw_r:+.1f}°/s dur={dur_y:.2f}s")
             self._hold_speed_direct_burst(yaw_r, 0.0, dur_y)
-        time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
-        att = self._read_gimbal_attitude_deg()
-        if att is None:
-            return None
-        yaw_err = self._angle_err_deg(yaw_tgt, att[0])
-        if abs(yaw_err) > 2.0:
-            yaw_r = spd if yaw_err > 0.0 else -spd
-            dur_c = min(2.5, abs(yaw_err) / spd + 0.25)
-            print(
-                f"[VGCS:lrf] yaw correction err={yaw_err:.1f}° "
-                f"dur={dur_c:.1f}s att={att_start}->{att}"
-            )
-            self._hold_speed_direct_burst(yaw_r, 0.0, dur_c)
+            self._gimbal_stop_hard()
             time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
             att = self._read_gimbal_attitude_deg() or att
-        return att
+            move = self._gimbal_total_move_deg(att_start, att)
+            if move > expected * _LRF_GIMBAL_OVERSHOOT_FACTOR + 1.5:
+                print(
+                    f"[VGCS:lrf] abort after yaw burst — overshoot {move:.1f}° "
+                    f"(expected≈{expected:.1f}°)"
+                )
+                return att
+        if (
+            att is not None
+            and abs(float(dpitch)) >= 0.5
+            and self._gimbal_total_move_deg(att_start, att)
+            <= expected * _LRF_GIMBAL_OVERSHOOT_FACTOR + 1.5
+        ):
+            pitch_r = -spd if float(dpitch) > 0.0 else spd
+            dur_p = min(1.0, self._axis_burst_duration_s(dpitch, spd))
+            print(f"[VGCS:lrf] pitch burst {pitch_r:+.1f}°/s dur={dur_p:.2f}s")
+            self._hold_speed_direct_burst(0.0, pitch_r, dur_p)
+        self._gimbal_stop_hard()
+        time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+        return self._read_gimbal_attitude_deg() or att
 
     def _send_gimbal_point_at_pixel(
         self,
@@ -365,8 +398,9 @@ class SkydroidTopUdpAdapter:
         )
         self._drop_pending_motion_commands()
         att_after = self._slew_gimbal_open_loop_offset(
-            dyaw, dpitch_img, att_now, yaw_tgt
+            dyaw, dpitch_img, att_now
         )
+        self._gimbal_stop_hard()
         aim_ok = self._gimbal_aim_ok(
             att_now,
             att_after,
@@ -693,12 +727,25 @@ class SkydroidTopUdpAdapter:
             att_after_point, slew_ok = self._send_gimbal_point_at_pixel(
                 x_px, y_px, att_before
             )
+            self._gimbal_stop_hard()
             gimbal_slew_mono = time.monotonic()
-            point_count = 1
             att_latest = att_after_point or att_before
-
-            if not slew_ok:
-                print("[VGCS:lrf] gimbal aim uncertain — continuing SLR poll")
+            expected_move = self._expected_offset_deg(dyaw, dpitch_img)
+            actual_move = self._gimbal_total_move_deg(
+                att_before, att_after_point or att_before
+            )
+            if actual_move > expected_move * _LRF_GIMBAL_OVERSHOOT_FACTOR + 1.5:
+                print(
+                    f"[VGCS:lrf] lock failed — gimbal overshoot {actual_move:.1f}° "
+                    f"(expected≈{expected_move:.1f}°)"
+                )
+                return None
+            if not slew_ok and actual_move < max(0.5, expected_move * 0.2):
+                print(
+                    f"[VGCS:lrf] lock failed — gimbal did not move "
+                    f"({actual_move:.1f}°)"
+                )
+                return None
 
             samples: list[float] = []
             start_mono = time.monotonic()
@@ -739,25 +786,6 @@ class SkydroidTopUdpAdapter:
                 if gimbal_moved is True and gimbal_slew_mono is None:
                     gimbal_slew_mono = time.monotonic()
                 slr_moved = self._slr_samples_moved_from_baseline(samples, baseline_m)
-
-                if (
-                    not slr_moved
-                    and gimbal_moved is not True
-                    and point_count < _LRF_MAX_REPOINTS + 1
-                    and elapsed >= _LRF_REPOINT_AFTER_S * float(point_count)
-                ):
-                    att_ref = att_now if att_now is not None else att_latest
-                    att_retry, retry_ok = self._send_gimbal_point_at_pixel(
-                        x_px, y_px, att_ref
-                    )
-                    if att_retry is not None:
-                        att_latest = att_retry
-                    point_count += 1
-                    move_mono = None
-                    gimbal_slew_mono = time.monotonic()
-                    if not retry_ok:
-                        break
-                    continue
 
                 gimbal_accept = self._try_accept_gimbal_slew_slr(
                     samples,

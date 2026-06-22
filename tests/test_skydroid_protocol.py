@@ -224,6 +224,14 @@ def test_angle_err_deg() -> None:
     assert abs(abs(SkydroidTopUdpAdapter._angle_err_deg(85.0, -85.0)) - 10.0) < 0.01
 
 
+def test_axis_burst_duration_undershoots() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    dur = SkydroidTopUdpAdapter._axis_burst_duration_s(10.6, 3.5)
+    assert dur <= 1.8
+    assert dur < 10.6 / 3.5
+
+
 def test_gimbal_aim_ok_rejects_overshoot() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
