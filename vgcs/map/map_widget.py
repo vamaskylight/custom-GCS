@@ -9766,7 +9766,7 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._refresh_lrf_lock_overlay()
-        self._set_status("Click near centre crosshair to lock C13 laser range")
+        self._set_status("Click target on video to lock C13 laser range (camera will slew)")
         QTimer.singleShot(0, self._raise_flight_hud_above_video)
 
     def _cancel_c13_lrf_arm(self) -> None:
@@ -9823,7 +9823,7 @@ class MapWidget(QWidget):
         self._sync_lrf_armed_backend(False)
         self._lrf_lock_distance_m = None
         self._refresh_lrf_lock_overlay()
-        self._set_status("Locking LRF target…")
+        self._set_status("Locking LRF — slewing camera to target…")
         try:
             self._obstacle_radar.set_c13_lrf_locking(None)
         except Exception:
@@ -9860,7 +9860,7 @@ class MapWidget(QWidget):
                 except Exception:
                     pass
                 self._set_status(
-                    "LRF lock failed — aim target at centre crosshair (live SLR), then click again"
+                    "LRF lock failed — retry click or tap ◎ to re-arm"
                 )
                 QTimer.singleShot(2500, self._clear_lrf_failed_reticle)
                 return

@@ -69,7 +69,11 @@ _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
 _LRF_GIMBAL_AXIS_MAX_S = 1.8
 _LRF_GIMBAL_SLEW_SCALE = 0.90
 _LRF_C13_INVERT_GSY = True
-_LRF_LOCK_MOVE_GIMBAL = False
+_LRF_ALIGN_MIN_OFFSET_DEG = 0.35
+_LRF_ALIGN_SPEED_DPS = 2.0
+_LRF_ALIGN_MAX_ITERS = 10
+_LRF_ALIGN_TOL_DEG = 2.5
+_LRF_ALIGN_MAX_TOTAL_DEG = 20.0
 _LRF_HOLD_MAX_CLICK_OFFSET_DEG = 4.0
 _LRF_HOLD_MIN_PIXEL_MOVE_PX = 48
 _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG = 0.45
@@ -656,8 +660,8 @@ class SkydroidTopUdpAdapter:
         y_px: int,
         att_now: tuple[float, float] | None,
     ) -> tuple[tuple[float, float] | None, bool]:
-        """Closed-loop point at click; returns (attitude, aim_ok). Not used for LRF lock."""
-        if not _LRF_LOCK_MOVE_GIMBAL:
+        """Closed-loop point at click; returns (attitude, aim_ok)."""
+        if not self._lrf_lock_move_gimbal():
             if att_now is None:
                 att_now = self._read_gimbal_attitude_deg()
             return att_now, True
@@ -938,7 +942,7 @@ class SkydroidTopUdpAdapter:
         dyaw: float = 0.0,
         dpitch: float = 0.0,
     ) -> float | None:
-        """Accept stable SLR only when gimbal aimed correctly and range moved from baseline."""
+        """Accept stable SLR after click-to-aim slew (range may match baseline on same facade)."""
         if gimbal_slew_mono is None or len(samples) < _LRF_CONVERGE_SAMPLES:
             return None
         if time.monotonic() - float(gimbal_slew_mono) < _LRF_GIMBAL_SLR_SETTLE_S:
@@ -961,7 +965,12 @@ class SkydroidTopUdpAdapter:
             return None
         if self._slr_still_climbing(tail[-3:]):
             return None
-        if not self._slr_moved_from_baseline(converged, baseline_m):
+        gimbal_move = self._gimbal_total_move_deg(att_before, att_now)
+        if (
+            baseline_m is not None
+            and not self._slr_moved_from_baseline(converged, baseline_m)
+            and gimbal_move < _LRF_GIMBAL_MOVE_MIN_DEG
+        ):
             return None
         return float(converged)
 
@@ -972,6 +981,7 @@ class SkydroidTopUdpAdapter:
         elapsed: float,
         pre_slr: float | None,
         align_attempted: bool,
+        align_ok: bool = True,
         click_offset_deg: float,
         hold_gimbal: bool = False,
     ) -> float | None:
@@ -985,11 +995,13 @@ class SkydroidTopUdpAdapter:
             and abs(float(stable) - float(pre_slr)) < _LRF_MOVED_MIN_M
             and not self._slr_still_climbing(samples[-3:])
         )
+        if align_attempted and align_ok:
+            return float(stable)
         if align_attempted and off_centre and unchanged:
             print(
                 f"[VGCS:lrf] lock rejected — range {float(stable):.1f} m "
                 f"unchanged from pre-lock {float(pre_slr):.1f} m "
-                f"(laser still on foreground?)"
+                f"(gimbal slew did not reach target?)"
             )
             return None
         if hold_gimbal and off_centre and unchanged:
@@ -1090,6 +1102,25 @@ class SkydroidTopUdpAdapter:
             self._transport._port = active_port
 
     @staticmethod
+    def _lrf_lock_move_gimbal() -> bool:
+        """Default: slew gimbal to click on LRF lock. Set VGCS_LRF_HOLD_GIMBAL=1 for manual aim."""
+        if str(os.environ.get("VGCS_LRF_HOLD_GIMBAL", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return False
+        if str(os.environ.get("VGCS_LRF_MOVE_GIMBAL", "") or "").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return False
+        return True
+
+    @staticmethod
     def _hold_max_click_offset_deg() -> float:
         try:
             return float(
@@ -1111,10 +1142,10 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
-        """C13: hold gimbal, mark click pixel, confirm stable SLR at current laser aim."""
+        """C13 LRF lock: slew gimbal to click (default), then confirm stable E-class SLR."""
         if not self.gimbal_telemetry_ok():
             return None
-        # PROTOCAL §3.3.5: GOT coordinates are always on 1280×720 companion video.
+        move_gimbal = self._lrf_lock_move_gimbal()
         fw = _LRF_FRAME_W
         fh = _LRF_FRAME_H
         x_px = max(0, min(fw, int(round(max(0.0, min(1.0, float(u))) * fw))))
@@ -1144,10 +1175,11 @@ class SkydroidTopUdpAdapter:
             click_offset_deg = self._expected_offset_deg(dyaw, dpitch_img)
             print(
                 f"[VGCS:lrf] lock start px=({x_px},{y_px}) "
-                f"att={att_before} offset=({dyaw:.1f}°,{dpitch_img:.1f}°)"
+                f"att={att_before} offset=({dyaw:.1f}°,{dpitch_img:.1f}°) "
+                f"mode={'click-to-aim' if move_gimbal else 'hold-gimbal'}"
             )
 
-            if not _LRF_LOCK_MOVE_GIMBAL:
+            if not move_gimbal:
                 max_off = self._hold_max_click_offset_deg()
                 if float(click_offset_deg) > float(max_off):
                     print(
@@ -1169,7 +1201,7 @@ class SkydroidTopUdpAdapter:
                 print(f"[VGCS:lrf] pre-lock SLR={float(pre_slr):.1f} m (median)")
 
             if (
-                not _LRF_LOCK_MOVE_GIMBAL
+                not move_gimbal
                 and prev_locked_m is not None
                 and pre_slr is not None
                 and prev_lock_xy is not None
@@ -1188,21 +1220,67 @@ class SkydroidTopUdpAdapter:
                     )
                     return None
 
-            att_latest = att_before
-            print(
-                f"[VGCS:lrf] hold gimbal — lock SLR at current aim "
-                f"(offset=({dyaw:.1f}°,{dpitch_img:.1f}°), no camera move)"
-            )
-            if click_offset_deg >= 5.0:
-                print(
-                    "[VGCS:lrf] hint: SLR measures along the laser, not the video click — "
-                    "aim the building at frame centre with the gimbal first, then click to lock"
-                )
-            self._send_got_mark_only(x_px, y_px, frame_w=fw, frame_h=fh)
-            time.sleep(_LRF_POST_GOT_WAIT_S)
+            align_ok = True
+            align_dyaw, align_dpitch = float(dyaw), float(dpitch_img)
+            yaw_tgt: float | None = None
+            pitch_tgt: float | None = None
+            gimbal_slew_mono: float | None = None
+            att_lock_ref = att_before
 
+            if move_gimbal:
+                if att_before is None:
+                    print("[VGCS:lrf] lock failed — no GAC attitude for gimbal slew")
+                    return None
+                if float(click_offset_deg) >= _LRF_ALIGN_MIN_OFFSET_DEG:
+                    print(
+                        f"[VGCS:lrf] click-to-aim — slewing gimbal to px=({x_px},{y_px}) "
+                        f"offset=({dyaw:.1f}°,{dpitch_img:.1f}°)"
+                    )
+                    att_after, align_ok, align_dyaw, align_dpitch = (
+                        self._align_laser_boresight_to_pixel(x_px, y_px, att_before)
+                    )
+                    att_lock_ref = att_after or att_before
+                    yaw_tgt = float(att_before[0]) + float(align_dyaw)
+                    pitch_tgt = max(
+                        -90.0,
+                        min(90.0, float(att_before[1]) - float(align_dpitch)),
+                    )
+                    gimbal_slew_mono = time.monotonic()
+                    if not align_ok:
+                        print(
+                            "[VGCS:lrf] lock failed — gimbal could not aim at click "
+                            "(try a closer target or use gimbal sticks)"
+                        )
+                        return None
+                    time.sleep(_LRF_POST_MOVE_SETTLE_S)
+                    print(
+                        f"[VGCS:lrf] slew done att={att_before}->{att_lock_ref} "
+                        f"target=({yaw_tgt:.1f},{pitch_tgt:.1f})"
+                    )
+                else:
+                    print("[VGCS:lrf] click near boresight — skipping slew")
+            else:
+                print(
+                    f"[VGCS:lrf] hold gimbal — lock SLR at current aim "
+                    f"(offset=({dyaw:.1f}°,{dpitch_img:.1f}°), no camera move)"
+                )
+                if click_offset_deg >= 5.0:
+                    print(
+                        "[VGCS:lrf] hint: SLR measures along the laser, not the video click — "
+                        "aim the building at frame centre with the gimbal first, then click to lock"
+                    )
+
+            self._send_got_mark_only(x_px, y_px, frame_w=fw, frame_h=fh)
+            post_got_wait = (
+                _LRF_POST_GOT_WAIT_S if not move_gimbal else max(1.0, _LRF_POST_GOT_WAIT_S * 0.5)
+            )
+            time.sleep(post_got_wait)
+
+            att_latest = att_lock_ref
             start_mono = time.monotonic()
-            deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
+            deadline = start_mono + (
+                _LRF_LOCK_MAX_WAIT_S + (6.0 if move_gimbal and gimbal_slew_mono else 0.0)
+            )
 
             def _emit_sample(value_m: float) -> None:
                 if on_sample is None:
@@ -1211,6 +1289,12 @@ class SkydroidTopUdpAdapter:
                     on_sample(float(value_m))
                 except Exception:
                     pass
+
+            min_wait = (
+                _LRF_POST_MOVE_MIN_WAIT_S
+                if move_gimbal and gimbal_slew_mono is not None
+                else _LRF_LOCK_MIN_WAIT_S
+            )
 
             while time.monotonic() < deadline:
                 elapsed = time.monotonic() - start_mono
@@ -1222,18 +1306,18 @@ class SkydroidTopUdpAdapter:
                 if reading is None:
                     continue
                 samples.append(float(reading))
-                att_now = self._attitude_from_cache()
+                att_now = self._attitude_from_cache() or self._read_gimbal_attitude_deg()
                 if att_now is not None:
                     att_latest = att_now
                 if (
-                    att_before is not None
+                    att_lock_ref is not None
                     and att_now is not None
-                    and self._gimbal_total_move_deg(att_before, att_now)
+                    and self._gimbal_total_move_deg(att_lock_ref, att_now)
                     > _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG
                 ):
                     print(
-                        f"[VGCS:lrf] lock aborted — gimbal moved during lock "
-                        f"{att_before}->{att_now}"
+                        f"[VGCS:lrf] lock aborted — gimbal drift during lock "
+                        f"{att_lock_ref}->{att_now}"
                     )
                     return None
                 _emit_sample(float(reading))
@@ -1242,17 +1326,31 @@ class SkydroidTopUdpAdapter:
                     f"(n={len(samples)}, t={elapsed:.1f}s)"
                 )
 
-                if elapsed < _LRF_LOCK_MIN_WAIT_S:
+                if elapsed < min_wait:
                     continue
 
-                stable = self._try_accept_lrf_lock_slr(
-                    samples,
-                    elapsed=elapsed,
-                    pre_slr=pre_slr,
-                    align_attempted=_LRF_LOCK_MOVE_GIMBAL,
-                    click_offset_deg=click_offset_deg,
-                    hold_gimbal=not _LRF_LOCK_MOVE_GIMBAL,
-                )
+                if move_gimbal and gimbal_slew_mono is not None:
+                    stable = self._try_accept_gimbal_slew_slr(
+                        samples,
+                        pre_slr,
+                        att_before,
+                        att_latest,
+                        gimbal_slew_mono=gimbal_slew_mono,
+                        yaw_tgt=yaw_tgt,
+                        pitch_tgt=pitch_tgt,
+                        dyaw=align_dyaw,
+                        dpitch=align_dpitch,
+                    )
+                else:
+                    stable = self._try_accept_lrf_lock_slr(
+                        samples,
+                        elapsed=elapsed,
+                        pre_slr=pre_slr,
+                        align_attempted=move_gimbal,
+                        align_ok=align_ok,
+                        click_offset_deg=click_offset_deg,
+                        hold_gimbal=not move_gimbal,
+                    )
                 if stable is not None:
                     print(
                         f"[VGCS:lrf] lock stable {stable:.1f} m "
@@ -1263,14 +1361,28 @@ class SkydroidTopUdpAdapter:
                     break
 
             if dist_m is None and samples:
-                stable = self._try_accept_lrf_lock_slr(
-                    samples,
-                    elapsed=time.monotonic() - start_mono,
-                    pre_slr=pre_slr,
-                    align_attempted=_LRF_LOCK_MOVE_GIMBAL,
-                    click_offset_deg=click_offset_deg,
-                    hold_gimbal=not _LRF_LOCK_MOVE_GIMBAL,
-                )
+                if move_gimbal and gimbal_slew_mono is not None:
+                    stable = self._try_accept_gimbal_slew_slr(
+                        samples,
+                        pre_slr,
+                        att_before,
+                        att_latest,
+                        gimbal_slew_mono=gimbal_slew_mono,
+                        yaw_tgt=yaw_tgt,
+                        pitch_tgt=pitch_tgt,
+                        dyaw=align_dyaw,
+                        dpitch=align_dpitch,
+                    )
+                else:
+                    stable = self._try_accept_lrf_lock_slr(
+                        samples,
+                        elapsed=time.monotonic() - start_mono,
+                        pre_slr=pre_slr,
+                        align_attempted=move_gimbal,
+                        align_ok=align_ok,
+                        click_offset_deg=click_offset_deg,
+                        hold_gimbal=not move_gimbal,
+                    )
                 if stable is not None:
                     dist_m = self._refine_slr_estimate(on_sample) or float(stable)
                 else:
