@@ -63,12 +63,17 @@ _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
 _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
 _LRF_REPOINT_AFTER_S = 4.0
-_LRF_GIMBAL_SLEW_SPEED_DPS = 3.0
+_LRF_GIMBAL_SLEW_SPEED_DPS = 2.0
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
 _LRF_GIMBAL_AXIS_MAX_S = 1.8
-_LRF_GIMBAL_SLEW_SCALE = 0.88
+_LRF_GIMBAL_SLEW_SCALE = 0.90
 _LRF_C13_INVERT_GSY = True
 _LRF_LOCK_MOVE_GIMBAL = False
+_LRF_ALIGN_SPEED_DPS = 2.0
+_LRF_ALIGN_TOL_DEG = 2.0
+_LRF_ALIGN_MAX_ITERS = 10
+_LRF_ALIGN_MAX_TOTAL_DEG = 22.0
+_LRF_ALIGN_MIN_OFFSET_DEG = 0.35
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.25
 _LRF_MAX_REPOINTS = 0
@@ -383,6 +388,96 @@ class SkydroidTopUdpAdapter:
         time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
         return self._read_gimbal_attitude_deg() or att
 
+    def _align_laser_boresight_to_pixel(
+        self,
+        x_px: int,
+        y_px: int,
+        att_start: tuple[float, float],
+    ) -> tuple[tuple[float, float] | None, bool, float, float]:
+        """Iterative GSY/GSP bursts until laser boresight matches click (C13, no GAM)."""
+        dyaw0, dpitch0 = self._pixel_boresight_offset_deg(x_px, y_px)
+        need = self._expected_offset_deg(dyaw0, dpitch0)
+        if need < _LRF_ALIGN_MIN_OFFSET_DEG:
+            return att_start, True, float(dyaw0), float(dpitch0)
+
+        yaw_tgt = float(att_start[0]) + float(dyaw0)
+        pitch_tgt = max(-90.0, min(90.0, float(att_start[1]) - float(dpitch0)))
+        spd = float(_LRF_ALIGN_SPEED_DPS)
+        att: tuple[float, float] = att_start
+        total_move = 0.0
+        print(
+            f"[VGCS:lrf] align laser px=({x_px},{y_px}) "
+            f"-> ({yaw_tgt:.1f},{pitch_tgt:.1f}) offset=({dyaw0:.1f}°,{dpitch0:.1f}°)"
+        )
+        for n in range(int(_LRF_ALIGN_MAX_ITERS)):
+            att_read = self._read_gimbal_attitude_deg() or att
+            att = att_read
+            yaw_err = self._angle_err_deg(yaw_tgt, att[0])
+            pitch_err = self._angle_err_deg(pitch_tgt, att[1])
+            pitch_gac_stuck = (
+                abs(float(att[1])) < 0.05
+                and abs(float(dpitch0)) > 1.0
+            )
+            yaw_ok = abs(float(yaw_err)) <= _LRF_ALIGN_TOL_DEG
+            pitch_ok = pitch_gac_stuck or abs(float(pitch_err)) <= _LRF_ALIGN_TOL_DEG
+            if yaw_ok and pitch_ok:
+                print(f"[VGCS:lrf] align ok iter={n + 1} att={att}")
+                return att, True, float(dyaw0), float(dpitch0)
+            if total_move >= float(_LRF_ALIGN_MAX_TOTAL_DEG):
+                print(
+                    f"[VGCS:lrf] align stopped — total move {total_move:.1f}° "
+                    f"(cap={_LRF_ALIGN_MAX_TOTAL_DEG:.0f}°)"
+                )
+                break
+
+            if not yaw_ok and (pitch_ok or abs(float(yaw_err)) >= abs(float(pitch_err))):
+                dur = min(
+                    float(_LRF_GIMBAL_AXIS_MAX_S),
+                    abs(float(yaw_err)) / spd * 0.90 + 0.10,
+                )
+                rate = self._gsy_yaw_rate_for_offset(float(yaw_err), spd)
+                print(
+                    f"[VGCS:lrf] align yaw err={yaw_err:+.1f}° "
+                    f"burst {rate:+.1f}°/s dur={dur:.2f}s"
+                )
+                self._hold_speed_direct_burst(rate, 0.0, dur)
+            elif not pitch_ok:
+                dur = min(
+                    float(_LRF_GIMBAL_AXIS_MAX_S),
+                    abs(float(pitch_err)) / spd * 0.90 + 0.10,
+                )
+                rate = spd if float(pitch_err) > 0.0 else -spd
+                print(
+                    f"[VGCS:lrf] align pitch err={pitch_err:+.1f}° "
+                    f"burst {rate:+.1f}°/s dur={dur:.2f}s"
+                )
+                self._hold_speed_direct_burst(0.0, rate, dur)
+            else:
+                break
+
+            self._gimbal_stop_hard()
+            time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+            att_new = self._read_gimbal_attitude_deg()
+            if att_new is not None:
+                total_move += self._gimbal_total_move_deg(att, att_new)
+                att = att_new
+
+        att_end = self._read_gimbal_attitude_deg() or att
+        aim_ok = self._gimbal_aim_ok(
+            att_start,
+            att_end,
+            yaw_tgt=yaw_tgt,
+            pitch_tgt=pitch_tgt,
+            dyaw=float(dyaw0),
+            dpitch=float(dpitch0),
+        )
+        move = self._gimbal_total_move_deg(att_start, att_end)
+        print(
+            f"[VGCS:lrf] align done att={att_start}->{att_end} "
+            f"move={move:.1f}° ok={aim_ok}"
+        )
+        return att_end, aim_ok, float(dyaw0), float(dpitch0)
+
     def _wait_gimbal_at_angles(
         self,
         yaw_tgt: float,
@@ -690,6 +785,34 @@ class SkydroidTopUdpAdapter:
             return None
         return float(converged)
 
+    def _try_accept_lrf_lock_slr(
+        self,
+        samples: list[float],
+        *,
+        elapsed: float,
+        pre_slr: float | None,
+        align_attempted: bool,
+        click_offset_deg: float,
+    ) -> float | None:
+        """Stable SLR after lock; reject unchanged foreground when click was off-centre."""
+        stable = self._try_accept_stable_slr(samples, elapsed=elapsed)
+        if stable is None:
+            return None
+        if (
+            align_attempted
+            and pre_slr is not None
+            and float(click_offset_deg) >= 3.0
+            and abs(float(stable) - float(pre_slr)) < _LRF_MOVED_MIN_M
+            and not self._slr_still_climbing(samples[-3:])
+        ):
+            print(
+                f"[VGCS:lrf] lock rejected — range {float(stable):.1f} m "
+                f"unchanged from pre-lock {float(pre_slr):.1f} m "
+                f"(laser still on foreground?)"
+            )
+            return None
+        return float(stable)
+
     @staticmethod
     def _slr_tail_stable(samples: list[float], n: int = 3) -> tuple[float, float] | None:
         if len(samples) < n:
@@ -787,7 +910,7 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
-        """C13: GOT+SUM at click pixel, then fresh SLR reads (never slews gimbal)."""
+        """C13: GOT+SUM + iterative laser align at click, then fresh SLR reads."""
         if not self.gimbal_telemetry_ok():
             return None
         # PROTOCAL §3.3.5: GOT coordinates are always on 1280×720 companion video.
@@ -824,17 +947,25 @@ class SkydroidTopUdpAdapter:
                 print(f"[VGCS:lrf] pre-lock SLR={float(pre_slr):.1f} m")
 
             att_latest = att_before
-            print(
-                f"[VGCS:lrf] GOT track px=({x_px},{y_px}) "
-                f"— lock at current aim (no gimbal slew)"
-            )
-            if abs(dyaw) >= 5.0 or abs(dpitch_img) >= 5.0:
-                print(
-                    f"[VGCS:lrf] hint: click {abs(dyaw):.0f}°/{abs(dpitch_img):.0f}° "
-                    f"off centre — aim LRF at target manually before locking"
-                )
+            align_attempted = False
+            align_mono: float | None = None
+            click_offset_deg = self._expected_offset_deg(dyaw, dpitch_img)
             self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
-            time.sleep(_LRF_POST_GOT_WAIT_S)
+            time.sleep(0.35)
+            if att_before is not None and click_offset_deg >= _LRF_ALIGN_MIN_OFFSET_DEG:
+                align_attempted = True
+                att_latest, _align_ok, _dy, _dp = self._align_laser_boresight_to_pixel(
+                    x_px, y_px, att_before
+                )
+                align_mono = time.monotonic()
+                if not _align_ok:
+                    print("[VGCS:lrf] align partial — continuing SLR poll")
+            else:
+                print(
+                    f"[VGCS:lrf] click near centre offset=({dyaw:.1f}°,{dpitch_img:.1f}°) "
+                    f"— skip align"
+                )
+            time.sleep(_LRF_SLR_SHOT_SETTLE_S)
 
             start_mono = time.monotonic()
             deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
@@ -868,8 +999,16 @@ class SkydroidTopUdpAdapter:
 
                 if elapsed < _LRF_LOCK_MIN_WAIT_S:
                     continue
+                if align_mono is not None and time.monotonic() - align_mono < _LRF_GIMBAL_SLR_SETTLE_S:
+                    continue
 
-                stable = self._try_accept_stable_slr(samples, elapsed=elapsed)
+                stable = self._try_accept_lrf_lock_slr(
+                    samples,
+                    elapsed=elapsed,
+                    pre_slr=pre_slr,
+                    align_attempted=align_attempted,
+                    click_offset_deg=click_offset_deg,
+                )
                 if stable is not None:
                     print(
                         f"[VGCS:lrf] lock stable {stable:.1f} m "
@@ -880,9 +1019,12 @@ class SkydroidTopUdpAdapter:
                     break
 
             if dist_m is None and samples:
-                stable = self._try_accept_stable_slr(
+                stable = self._try_accept_lrf_lock_slr(
                     samples,
                     elapsed=time.monotonic() - start_mono,
+                    pre_slr=pre_slr,
+                    align_attempted=align_attempted,
+                    click_offset_deg=click_offset_deg,
                 )
                 if stable is not None:
                     dist_m = self._refine_slr_estimate(on_sample) or float(stable)
@@ -930,6 +1072,17 @@ class SkydroidTopUdpAdapter:
         )
         try:
             if fresh:
+                for dest in ("D", "E"):
+                    try:
+                        self._transport.send_and_receive(
+                            build_slr_trigger(dest=dest),
+                            expect_reply=False,
+                            log=False,
+                            timeout_s=0.25,
+                        )
+                    except Exception:
+                        continue
+                time.sleep(0.12)
                 for frame in frames_read:
                     try:
                         self._transport.send_and_receive(
