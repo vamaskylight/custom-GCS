@@ -1194,11 +1194,11 @@ class SkydroidTopUdpAdapter:
             "on",
         ):
             return True
-        return True
+        return False
 
     @staticmethod
     def normalize_lrf_click_uv(u: float, v: float) -> tuple[float, float]:
-        """Map GUI video click (0..1) to C13 GOT / gimbal frame coordinates."""
+        """Optional extra X flip via VGCS_LRF_FLIP_X (screen mirror is in map click norm)."""
         uf = max(0.0, min(1.0, float(u)))
         vf = max(0.0, min(1.0, float(v)))
         if SkydroidTopUdpAdapter._lrf_flip_x():
@@ -1234,7 +1234,10 @@ class SkydroidTopUdpAdapter:
         fw = _LRF_FRAME_W
         fh = _LRF_FRAME_H
         u_in, v_in = float(u), float(v)
-        u, v = self.normalize_lrf_click_uv(u_in, v_in)
+        if self._lrf_flip_x():
+            u, v = self.normalize_lrf_click_uv(u_in, v_in)
+        else:
+            u, v = u_in, v_in
         x_px = max(0, min(fw, int(round(max(0.0, min(1.0, float(u))) * fw))))
         y_px = max(0, min(fh, int(round(max(0.0, min(1.0, float(v))) * fh))))
         self._ensure_active_transport()
