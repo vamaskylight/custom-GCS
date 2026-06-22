@@ -362,6 +362,14 @@ def test_pick_slr_readings_prefers_e_class_laser() -> None:
     assert abs(float(got) - 53.0) < 0.01
 
 
+def test_format_slr_display_m_native_integer() -> None:
+    from vgcs.skydroid.protocol import format_slr_display_m
+
+    assert format_slr_display_m(53.7) == "53 m"
+    assert format_slr_display_m(52.9) == "52 m"
+    assert format_slr_display_m(None) == "—"
+
+
 def test_build_slr_query_e_class() -> None:
     from vgcs.skydroid.protocol import build_slr_query
 

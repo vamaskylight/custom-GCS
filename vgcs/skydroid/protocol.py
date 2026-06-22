@@ -240,6 +240,19 @@ def slr_raw_hex(payload: bytes) -> str | None:
     return m.group(1).upper() if m else None
 
 
+def format_slr_display_m(distance_m: float | None) -> str:
+    """Skydroid native RNG display: integer metres (truncates decimeters, e.g. 53.7 → 53 m)."""
+    if distance_m is None:
+        return "—"
+    try:
+        metres = float(distance_m)
+    except (TypeError, ValueError):
+        return "—"
+    if metres < 0:
+        return "—"
+    return f"{int(metres)} m"
+
+
 def build_pod_camera_command(
     tag: str,
     data: str,

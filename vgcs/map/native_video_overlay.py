@@ -9,6 +9,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
+from vgcs.skydroid.protocol import format_slr_display_m
+
 
 @dataclass(frozen=True)
 class VideoOverlayDetection:
@@ -322,14 +324,14 @@ class NativeVideoOverlayLayer(QWidget):
         p.drawEllipse(int(cx) - 4, int(cy) - 4, 8, 8)
         if failed:
             if distance_m is not None:
-                caption = f"LRF {float(distance_m):.1f} m — failed"
+                caption = f"LRF {format_slr_display_m(distance_m)} — failed"
             else:
                 caption = "LRF failed — retry"
         elif distance_m is not None and not pending:
-            caption = f"LRF {float(distance_m):.1f} m"
+            caption = f"LRF {format_slr_display_m(distance_m)}"
         elif pending:
             if distance_m is not None:
-                caption = f"LRF {float(distance_m):.1f} m …"
+                caption = f"LRF {format_slr_display_m(distance_m)} …"
             else:
                 caption = "LRF reading…"
         else:
