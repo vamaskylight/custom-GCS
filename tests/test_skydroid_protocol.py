@@ -352,3 +352,18 @@ def test_calibrate_slr_m_env(monkeypatch) -> None:
     monkeypatch.setenv("VGCS_LRF_OFFSET_M", "-4.4")
     monkeypatch.setenv("VGCS_LRF_SCALE", "1")
     assert abs(SkydroidTopUdpAdapter._calibrate_slr_m(56.4) - 52.0) < 0.01
+
+
+def test_pick_slr_readings_prefers_e_class_laser() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    got = SkydroidTopUdpAdapter._pick_slr_readings(53.0, 56.4, log=False)
+    assert got is not None
+    assert abs(float(got) - 53.0) < 0.01
+
+
+def test_build_slr_query_e_class() -> None:
+    from vgcs.skydroid.protocol import build_slr_query
+
+    frame = build_slr_query(dest="E")
+    assert frame.startswith(b"#TPUE2rSLR")
