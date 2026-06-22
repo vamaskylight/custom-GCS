@@ -360,6 +360,22 @@ def test_align_move_cap_scales_with_offset() -> None:
     assert cap <= 55.0
 
 
+def test_gac_pitch_untrusted_when_stuck_at_zero() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    assert SkydroidTopUdpAdapter._gac_pitch_trusted(0.0, 8.8) is False
+    assert SkydroidTopUdpAdapter._gac_pitch_trusted(0.0, 2.0) is True
+    assert SkydroidTopUdpAdapter._gac_pitch_trusted(2.0, 8.8) is True
+
+
+def test_gsp_pitch_rate_above_centre_click() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    # Click above centre → negative image dpitch → positive GSP (tilt up).
+    assert SkydroidTopUdpAdapter._gsp_pitch_rate_for_image_offset(-8.8, 3.0) > 0.0
+    assert SkydroidTopUdpAdapter._gsp_pitch_rate_for_image_offset(8.8, 3.0) < 0.0
+
+
 def test_align_aim_satisfied_requires_yaw_on_target() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
