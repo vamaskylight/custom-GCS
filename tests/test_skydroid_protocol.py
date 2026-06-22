@@ -305,3 +305,34 @@ def test_try_accept_gimbal_slew_slr_requires_range_move() -> None:
         dpitch=-6.9,
     )
     assert got is None
+
+
+def test_try_accept_lrf_lock_slr_rejects_unchanged_foreground() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    samples = [16.1, 16.2, 16.3, 16.3, 16.3]
+    got = adapter._try_accept_lrf_lock_slr(
+        samples,
+        elapsed=8.0,
+        pre_slr=16.3,
+        align_attempted=True,
+        click_offset_deg=14.0,
+    )
+    assert got is None
+
+
+def test_try_accept_lrf_lock_slr_accepts_after_align_to_building() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    samples = [16.3, 40.0, 52.0, 52.1, 52.0, 52.0, 52.1]
+    got = adapter._try_accept_lrf_lock_slr(
+        samples,
+        elapsed=8.0,
+        pre_slr=16.3,
+        align_attempted=True,
+        click_offset_deg=14.0,
+    )
+    assert got is not None
+    assert abs(float(got) - 52.0) < 0.5
