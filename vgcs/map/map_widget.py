@@ -9711,28 +9711,53 @@ class MapWidget(QWidget):
         try:
             from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
-            h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
-            v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
-            h_new, v_new = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
+            u_raw, v_raw = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
                 ref_uv,
                 ref_att,
                 lock_att,
-                h_scale=h_scale,
-                v_scale=v_scale,
+                gac_h_scale=1.0,
+                gac_v_scale=1.0,
             )
-            self._lrf_track_gac_h_scale = float(h_new)
-            self._lrf_track_gac_v_scale = float(v_new)
-            u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
-                ref_uv,
-                ref_att,
-                lock_att,
-                gac_h_scale=h_new,
-                gac_v_scale=v_new,
-            )
-            print(
-                f"[VGCS:lrf] track calibrate gac_scale=({h_new:.3f},{v_new:.3f}) "
-                f"lock_uv=({u:.3f},{v:.3f})"
-            )
+            self._lrf_lock_uv = (float(u_raw), float(v_raw))
+            res_u = abs(float(u_raw) - 0.5)
+            res_v = abs(float(v_raw) - 0.5)
+            # Only learn GAC scale when boresight is on the click (avoids biasing pan track).
+            if res_u < 0.012 and res_v < 0.012:
+                h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
+                v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
+                h_new, v_new = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
+                    ref_uv,
+                    ref_att,
+                    lock_att,
+                    h_scale=h_scale,
+                    v_scale=v_scale,
+                )
+                self._lrf_track_gac_h_scale = float(h_new)
+                self._lrf_track_gac_v_scale = float(v_new)
+                u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+                    ref_uv,
+                    ref_att,
+                    lock_att,
+                    gac_h_scale=h_new,
+                    gac_v_scale=v_new,
+                )
+                self._lrf_lock_uv = (float(u), float(v))
+                print(
+                    f"[VGCS:lrf] track calibrate gac_scale=({h_new:.3f},{v_new:.3f}) "
+                    f"lock_uv=({u:.3f},{v:.3f})"
+                )
+                self._lrf_track_ref_uv = (0.5, 0.5)
+                self._lrf_track_ref_att = lock_att
+            else:
+                self._lrf_track_gac_h_scale = 1.0
+                self._lrf_track_gac_v_scale = 1.0
+                self._lrf_track_ref_uv = (float(u_raw), float(v_raw))
+                self._lrf_track_ref_att = lock_att
+                print(
+                    f"[VGCS:lrf] track skip calibrate "
+                    f"lock_uv=({u_raw:.3f},{v_raw:.3f}) "
+                    f"residual=({res_u:.3f},{res_v:.3f})"
+                )
         except Exception:
             pass
 
