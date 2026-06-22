@@ -63,10 +63,11 @@ _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
 _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
 _LRF_REPOINT_AFTER_S = 4.0
-_LRF_GIMBAL_SLEW_SPEED_DPS = 3.5
+_LRF_GIMBAL_SLEW_SPEED_DPS = 3.0
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
 _LRF_GIMBAL_AXIS_MAX_S = 1.8
-_LRF_GIMBAL_SLEW_SCALE = 0.55
+_LRF_GIMBAL_SLEW_SCALE = 0.88
+_LRF_C13_INVERT_GSY = True
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.25
 _LRF_MAX_REPOINTS = 0
@@ -303,6 +304,14 @@ class SkydroidTopUdpAdapter:
             abs(float(angle_deg)) / spd * float(_LRF_GIMBAL_SLEW_SCALE) + 0.12,
         )
 
+    @staticmethod
+    def _gsy_yaw_rate_for_offset(dyaw: float, spd: float) -> float:
+        """C13 field firmware: GSY sign is opposite PROTOCAL §3.2.1 (yaw right = positive)."""
+        rate = float(spd) if float(dyaw) > 0.0 else -float(spd)
+        if _LRF_C13_INVERT_GSY:
+            rate = -rate
+        return rate
+
     def _hold_speed_direct_burst(
         self,
         yaw_rate: float,
@@ -351,7 +360,7 @@ class SkydroidTopUdpAdapter:
         expected = self._expected_offset_deg(dyaw, dpitch)
         att: tuple[float, float] | None = att_start
         if abs(float(dyaw)) >= 0.3:
-            yaw_r = spd if float(dyaw) > 0.0 else -spd
+            yaw_r = self._gsy_yaw_rate_for_offset(dyaw, spd)
             dur_y = self._axis_burst_duration_s(dyaw, spd)
             print(f"[VGCS:lrf] yaw burst {yaw_r:+.1f}°/s dur={dur_y:.2f}s")
             self._hold_speed_direct_burst(yaw_r, 0.0, dur_y)
@@ -361,16 +370,10 @@ class SkydroidTopUdpAdapter:
             move = self._gimbal_total_move_deg(att_start, att)
             if move > expected * _LRF_GIMBAL_OVERSHOOT_FACTOR + 1.5:
                 print(
-                    f"[VGCS:lrf] abort after yaw burst — overshoot {move:.1f}° "
-                    f"(expected≈{expected:.1f}°)"
+                    f"[VGCS:lrf] yaw burst overshoot {move:.1f}° "
+                    f"(expected≈{expected:.1f}°) — continuing pitch"
                 )
-                return att
-        if (
-            att is not None
-            and abs(float(dpitch)) >= 0.5
-            and self._gimbal_total_move_deg(att_start, att)
-            <= expected * _LRF_GIMBAL_OVERSHOOT_FACTOR + 1.5
-        ):
+        if att is not None and abs(float(dpitch)) >= 0.5:
             pitch_r = -spd if float(dpitch) > 0.0 else spd
             dur_p = min(1.0, self._axis_burst_duration_s(dpitch, spd))
             print(f"[VGCS:lrf] pitch burst {pitch_r:+.1f}°/s dur={dur_p:.2f}s")
@@ -779,7 +782,7 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
-        """C13: GAM point at click pixel, then fresh SLR reads."""
+        """C13: GSY/GSP point at click pixel, then fresh SLR reads."""
         if not self.gimbal_telemetry_ok():
             return None
         # PROTOCAL §3.3.5: GOT coordinates are always on 1280×720 companion video.
@@ -816,13 +819,52 @@ class SkydroidTopUdpAdapter:
                 print(f"[VGCS:lrf] pre-point SLR={float(pre_slr):.1f} m")
 
             att_latest = att_before
-            if abs(dyaw) >= 0.35 or abs(dpitch_img) >= 0.35:
-                att_latest, _aim_ok = self._point_gimbal_at_pixel_gam(
+            attempted_point = abs(dyaw) >= 0.35 or abs(dpitch_img) >= 0.35
+            slew_mono: float | None = None
+            yaw_tgt: float | None = None
+            pitch_tgt: float | None = None
+            if attempted_point:
+                if att_before is not None:
+                    yaw_tgt = float(att_before[0]) + float(dyaw)
+                    pitch_tgt = max(
+                        -90.0,
+                        min(90.0, float(att_before[1]) - float(dpitch_img)),
+                    )
+                print(
+                    f"[VGCS:lrf] GSY/GSP point px=({x_px},{y_px}) "
+                    f"offset=({dyaw:.1f}°,{dpitch_img:.1f}°)"
+                )
+                att_latest, _aim_ok = self._send_gimbal_point_at_pixel(
                     x_px, y_px, att_before
                 )
+                slew_mono = time.monotonic()
+                if (
+                    not _aim_ok
+                    and att_before is not None
+                    and att_latest is not None
+                    and self._gimbal_total_move_deg(att_before, att_latest) < 0.35
+                ):
+                    print("[VGCS:lrf] GSY/GSP weak — trying GAY/GAP absolute axes")
+                    self._drop_pending_motion_commands()
+                    if yaw_tgt is not None:
+                        self.set_angle_axes(
+                            yaw_deg=float(yaw_tgt),
+                            approach_speed_dps=_LRF_GAM_APPROACH_DPS,
+                        )
+                        time.sleep(1.6)
+                    if pitch_tgt is not None and abs(float(dpitch_img)) >= 0.5:
+                        self.set_angle_axes(
+                            pitch_deg=float(pitch_tgt),
+                            approach_speed_dps=_LRF_GAM_APPROACH_DPS,
+                        )
+                        time.sleep(1.6)
+                    att_latest = self._read_gimbal_attitude_deg() or att_latest
+                    slew_mono = time.monotonic()
+                elif not _aim_ok:
+                    print("[VGCS:lrf] gimbal point warn — continuing SLR poll")
                 time.sleep(_LRF_SLR_SHOT_SETTLE_S)
             else:
-                print("[VGCS:lrf] click near frame centre — skip GAM point")
+                print("[VGCS:lrf] click near frame centre — skip gimbal point")
 
             start_mono = time.monotonic()
             deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
@@ -857,7 +899,26 @@ class SkydroidTopUdpAdapter:
                 if elapsed < _LRF_LOCK_MIN_WAIT_S:
                     continue
 
-                stable = self._try_accept_stable_slr(samples, elapsed=elapsed)
+                if (
+                    attempted_point
+                    and pre_slr is not None
+                    and slew_mono is not None
+                    and yaw_tgt is not None
+                    and pitch_tgt is not None
+                ):
+                    stable = self._try_accept_gimbal_slew_slr(
+                        samples,
+                        pre_slr,
+                        att_before,
+                        att_latest,
+                        gimbal_slew_mono=slew_mono,
+                        yaw_tgt=float(yaw_tgt),
+                        pitch_tgt=float(pitch_tgt),
+                        dyaw=float(dyaw),
+                        dpitch=float(dpitch_img),
+                    )
+                else:
+                    stable = self._try_accept_stable_slr(samples, elapsed=elapsed)
                 if stable is not None:
                     print(
                         f"[VGCS:lrf] lock stable {stable:.1f} m "
@@ -868,10 +929,29 @@ class SkydroidTopUdpAdapter:
                     break
 
             if dist_m is None and samples:
-                stable = self._try_accept_stable_slr(
-                    samples,
-                    elapsed=time.monotonic() - start_mono,
-                )
+                if (
+                    attempted_point
+                    and pre_slr is not None
+                    and slew_mono is not None
+                    and yaw_tgt is not None
+                    and pitch_tgt is not None
+                ):
+                    stable = self._try_accept_gimbal_slew_slr(
+                        samples,
+                        pre_slr,
+                        att_before,
+                        att_latest,
+                        gimbal_slew_mono=slew_mono,
+                        yaw_tgt=float(yaw_tgt),
+                        pitch_tgt=float(pitch_tgt),
+                        dyaw=float(dyaw),
+                        dpitch=float(dpitch_img),
+                    )
+                else:
+                    stable = self._try_accept_stable_slr(
+                        samples,
+                        elapsed=time.monotonic() - start_mono,
+                    )
                 if stable is not None:
                     dist_m = self._refine_slr_estimate(on_sample) or float(stable)
                 else:
