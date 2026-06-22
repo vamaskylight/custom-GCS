@@ -33,28 +33,29 @@ _C13_PROBE_PORTS = (5000, 9003, 19856)
 _ZOOM_EXTRA_PORTS = (9003, 19853)
 
 # LRF lock: SLR reads along laser boresight — wait for tracker slew before accepting range.
-_LRF_LOCK_MIN_WAIT_S = 1.25
-_LRF_LOCK_MAX_WAIT_S = 12.0
-_LRF_LOCK_POLL_S = 0.25
+_LRF_LOCK_MIN_WAIT_S = 0.8
+_LRF_LOCK_MAX_WAIT_S = 10.0
+_LRF_LOCK_POLL_S = 0.15
 _LRF_BASELINE_EPS_M = 1.5
 _LRF_STABLE_EPS_M = 0.35
 _LRF_MOVED_MIN_M = 2.0
 _LRF_GIMBAL_SLR_MIN_M = 0.5
 _LRF_GIMBAL_ACCEPT_MIN_DEG = 1.5
-_LRF_GIMBAL_SLR_SETTLE_S = 2.5
-_LRF_CONVERGE_SAMPLES = 5
-_LRF_REFINE_SAMPLES = 8
-_LRF_REFINE_HOLD_S = 2.75
-_LRF_REFINE_EXTEND_S = 2.5
+_LRF_GIMBAL_SLR_SETTLE_S = 1.0
+_LRF_GIMBAL_SLR_SETTLE_ALIGN_OK_S = 0.5
+_LRF_CONVERGE_SAMPLES = 3
+_LRF_REFINE_SAMPLES = 3
+_LRF_REFINE_HOLD_S = 0.75
+_LRF_REFINE_EXTEND_S = 1.0
 _LRF_CLIMB_EPS_M = 0.35
 _LRF_SETTLE_WINDOW = 8
 _LRF_SETTLE_MIN_DRIFT_M = 2.0
-_LRF_POST_MOVE_MIN_WAIT_S = 2.5
-_LRF_POST_MOVE_SETTLE_S = 4.0
+_LRF_POST_MOVE_MIN_WAIT_S = 1.0
+_LRF_POST_MOVE_SETTLE_S = 1.0
 _LRF_GOT_RESEND_INTERVAL_S = 2.0
 _LRF_BASELINE_RETRIES = 8
 _LRF_BASELINE_GAP_S = 0.2
-_LRF_POST_GOT_WAIT_S = 2.5
+_LRF_POST_GOT_WAIT_S = 1.0
 _LRF_SLR_SHOT_SETTLE_S = 0.55
 _LRF_GAM_APPROACH_DPS = 20.0
 _LRF_GAM_SETTLE_S = 2.0
@@ -85,7 +86,7 @@ _LRF_ALIGN_MAX_TOTAL_CAP_DEG = 55.0
 _LRF_HOLD_MAX_CLICK_OFFSET_DEG = 4.0
 _LRF_HOLD_MIN_PIXEL_MOVE_PX = 48
 _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG = 0.45
-_LRF_PRELOCK_SAMPLES = 7
+_LRF_PRELOCK_SAMPLES = 3
 _LRF_LIVE_POLL_SAMPLES = 3
 _LRF_SLR_QUERY_RETRIES = 3
 _LRF_SLR_DEST_LASER = "E"
@@ -1414,15 +1415,21 @@ class SkydroidTopUdpAdapter:
         pitch_tgt: float | None = None,
         dyaw: float = 0.0,
         dpitch: float = 0.0,
+        align_ok: bool = False,
     ) -> float | None:
         """Accept stable SLR after click-to-aim slew (range may match baseline on same facade)."""
         if gimbal_slew_mono is None or len(samples) < _LRF_CONVERGE_SAMPLES:
             return None
-        if time.monotonic() - float(gimbal_slew_mono) < _LRF_GIMBAL_SLR_SETTLE_S:
+        settle_s = (
+            float(_LRF_GIMBAL_SLR_SETTLE_ALIGN_OK_S)
+            if align_ok
+            else float(_LRF_GIMBAL_SLR_SETTLE_S)
+        )
+        if time.monotonic() - float(gimbal_slew_mono) < settle_s:
             return None
         if att_before is None or att_now is None:
             return None
-        if yaw_tgt is not None and pitch_tgt is not None:
+        if yaw_tgt is not None and pitch_tgt is not None and not align_ok:
             pitch_open = (
                 abs(float(dpitch)) * 0.95
                 if not self._gac_pitch_trusted(float(att_now[1]), float(dpitch))
@@ -1442,6 +1449,8 @@ class SkydroidTopUdpAdapter:
             return None
         if self._slr_still_climbing(tail[-3:]):
             return None
+        if align_ok:
+            return float(converged)
         gimbal_move = self._gimbal_total_move_deg(att_before, att_now)
         if (
             baseline_m is not None
@@ -1511,8 +1520,28 @@ class SkydroidTopUdpAdapter:
     def _refine_slr_estimate(
         self,
         on_sample: Callable[[float], None] | None,
+        *,
+        coarse_m: float | None = None,
     ) -> float | None:
         """Extra SLR polls after coarse converge — median filters jitter / late slew."""
+        if coarse_m is not None:
+            buf = [float(coarse_m)]
+            for _ in range(2):
+                time.sleep(max(0.08, float(_LRF_LOCK_POLL_S)))
+                reading = self._query_slr_distance_m(log=False, fresh=True)
+                if reading is None:
+                    continue
+                buf.append(float(reading))
+            if len(buf) >= 3 and max(buf) - min(buf) <= _LRF_STABLE_EPS_M:
+                refined = float(self._slr_median(buf))
+                print(f"[VGCS:lrf] refine quick median={refined:.1f} m from {buf}")
+                if on_sample is not None:
+                    try:
+                        on_sample(refined)
+                    except Exception:
+                        pass
+                return refined
+
         buf: list[float] = []
         start_mono = time.monotonic()
         deadline = start_mono + _LRF_REFINE_HOLD_S
@@ -1785,14 +1814,14 @@ class SkydroidTopUdpAdapter:
 
             self._send_got_mark_only(x_px, y_px, frame_w=fw, frame_h=fh)
             post_got_wait = (
-                _LRF_POST_GOT_WAIT_S if not move_gimbal else max(1.0, _LRF_POST_GOT_WAIT_S * 0.5)
+                _LRF_POST_GOT_WAIT_S if not move_gimbal else max(0.5, _LRF_POST_GOT_WAIT_S * 0.5)
             )
             time.sleep(post_got_wait)
 
             att_latest = att_lock_ref
             start_mono = time.monotonic()
             deadline = start_mono + (
-                _LRF_LOCK_MAX_WAIT_S + (6.0 if move_gimbal and gimbal_slew_mono else 0.0)
+                _LRF_LOCK_MAX_WAIT_S + (3.0 if move_gimbal and gimbal_slew_mono else 0.0)
             )
 
             def _emit_sample(value_m: float) -> None:
@@ -1853,6 +1882,7 @@ class SkydroidTopUdpAdapter:
                         pitch_tgt=pitch_tgt,
                         dyaw=align_dyaw,
                         dpitch=align_dpitch,
+                        align_ok=bool(align_ok),
                     )
                 else:
                     stable = self._try_accept_lrf_lock_slr(
@@ -1869,7 +1899,9 @@ class SkydroidTopUdpAdapter:
                         f"[VGCS:lrf] lock stable {stable:.1f} m "
                         f"(att={att_before}->{att_latest})"
                     )
-                    dist_m = self._refine_slr_estimate(on_sample) or float(stable)
+                    dist_m = self._refine_slr_estimate(
+                        on_sample, coarse_m=float(stable)
+                    ) or float(stable)
                     _emit_sample(float(dist_m))
                     break
 
@@ -1885,6 +1917,7 @@ class SkydroidTopUdpAdapter:
                         pitch_tgt=pitch_tgt,
                         dyaw=align_dyaw,
                         dpitch=align_dpitch,
+                        align_ok=bool(align_ok),
                     )
                 else:
                     stable = self._try_accept_lrf_lock_slr(
@@ -1897,7 +1930,9 @@ class SkydroidTopUdpAdapter:
                         hold_gimbal=not move_gimbal,
                     )
                 if stable is not None:
-                    dist_m = self._refine_slr_estimate(on_sample) or float(stable)
+                    dist_m = self._refine_slr_estimate(
+                        on_sample, coarse_m=float(stable)
+                    ) or float(stable)
                 else:
                     print(
                         f"[VGCS:lrf] lock rejected — SLR did not stabilize "

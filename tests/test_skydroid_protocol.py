@@ -172,12 +172,12 @@ def test_slr_still_settling_detects_drift() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     rising = [45.0, 47.0, 49.0, 50.5, 51.5, 52.0, 52.1, 52.2]
-    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 2.0) is True
-    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 3.5) is True
-    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 5.0) is False
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.5) is True
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.9) is True
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 2.0) is False
 
     flat = [52.0, 52.1, 52.1, 52.2, 52.2, 52.2, 52.2, 52.2]
-    assert SkydroidTopUdpAdapter._slr_still_settling(flat, 5.0) is False
+    assert SkydroidTopUdpAdapter._slr_still_settling(flat, 2.0) is False
 
 
 def test_slr_post_move_samples() -> None:
@@ -441,6 +441,28 @@ def test_try_accept_gimbal_slew_slr_accepts_same_range_after_slew() -> None:
     )
     assert got is not None
     assert abs(float(got) - 30.0) < 0.5
+
+
+def test_try_accept_gimbal_slew_slr_align_ok_unchanged_range() -> None:
+    """Re-click on same building: range unchanged, tiny gimbal move — accept when aligned."""
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    samples = [33.0, 33.0, 33.0]
+    got = adapter._try_accept_gimbal_slew_slr(
+        samples,
+        33.0,
+        (25.85, 2.13),
+        (25.89, 2.13),
+        gimbal_slew_mono=0.0,
+        yaw_tgt=25.3,
+        pitch_tgt=2.6,
+        dyaw=0.6,
+        dpitch=-0.5,
+        align_ok=True,
+    )
+    assert got is not None
+    assert abs(float(got) - 33.0) < 0.1
 
 
 def test_try_accept_gimbal_slew_slr_requires_range_move_without_slew() -> None:
