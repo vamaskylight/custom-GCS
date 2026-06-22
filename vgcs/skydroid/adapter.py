@@ -1153,7 +1153,7 @@ class SkydroidTopUdpAdapter:
                     print(
                         f"[VGCS:lrf] lock rejected — click {click_offset_deg:.1f}° "
                         f"off laser aim (max {max_off:.1f}°). "
-                        f"Aim gimbal so the target is at frame centre, then click."
+                        f"Aim gimbal so the target is under the centre crosshair, then click."
                     )
                     return None
 

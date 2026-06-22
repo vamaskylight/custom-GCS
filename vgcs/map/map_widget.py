@@ -1853,6 +1853,7 @@ class MapWidget(QWidget):
 
         def _obs_reset() -> None:
             print("[VGCS:cam_rail] OBSERVE Reset clicked")
+            self._reset_c13_lrf_for_observe_reset()
             self._clear_observations()
 
         def _obs_dooaf_setup() -> None:
@@ -9636,6 +9637,19 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _reset_c13_lrf_for_observe_reset(self) -> None:
+        """OBSERVE Reset also clears C13 LRF lock / armed / failed reticle."""
+        try:
+            if self._c13_lrf_is_locked():
+                self._unlock_c13_lrf()
+                return
+            if bool(getattr(self, "_lrf_lock_armed", False)) or bool(
+                getattr(self, "_lrf_lock_failed", False)
+            ):
+                self._cancel_c13_lrf_arm()
+        except Exception:
+            pass
+
     def _refresh_lrf_lock_overlay(self) -> None:
         """Draw cyan LRF reticle on video at the VGCS-locked target point."""
         try:
@@ -9752,7 +9766,7 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._refresh_lrf_lock_overlay()
-        self._set_status("Click target on video to lock C13 laser range")
+        self._set_status("Click near centre crosshair to lock C13 laser range")
         QTimer.singleShot(0, self._raise_flight_hud_above_video)
 
     def _cancel_c13_lrf_arm(self) -> None:
@@ -9846,10 +9860,9 @@ class MapWidget(QWidget):
                 except Exception:
                     pass
                 self._set_status(
-                    "LRF lock failed — aim gimbal at target (watch live SLR), "
-                    "click near centre, or tap ◎ to re-arm"
+                    "LRF lock failed — aim target at centre crosshair (live SLR), then click again"
                 )
-                QTimer.singleShot(12000, self._clear_lrf_failed_reticle)
+                QTimer.singleShot(2500, self._clear_lrf_failed_reticle)
                 return
             dm = float(dist)
             self._lrf_lock_failed = False

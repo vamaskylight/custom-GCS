@@ -366,7 +366,7 @@ class NativeVideoOverlayLayer(QWidget):
         cl, ct, cw, ch = self._content_qrect()
 
         if self._lrf_armed_hint and self._lrf_lock is None:
-            banner = "Click target on video to lock LRF range"
+            banner = "Aim target at centre crosshair — laser range is measured there"
             font = QFont("Segoe UI", 11, QFont.Weight.Bold)
             p.setFont(font)
             metrics = p.fontMetrics()
@@ -379,6 +379,16 @@ class NativeVideoOverlayLayer(QWidget):
             p.drawRect(tx, ty, tw, th)
             p.setPen(QColor(255, 236, 179))
             p.drawText(tx + 10, ty + metrics.ascent() + 6, banner)
+            ccx = cl + cw / 2.0
+            ccy = ct + ch / 2.0
+            arm = max(14.0, min(cw, ch) * 0.045)
+            pen = QPen(QColor(251, 191, 36, 210), 2, Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.drawLine(int(ccx - arm), int(ccy), int(ccx + arm), int(ccy))
+            p.drawLine(int(ccx), int(ccy - arm), int(ccx), int(ccy + arm))
+            p.setBrush(QColor(251, 191, 36, 220))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(int(ccx) - 3, int(ccy) - 3, 6, 6)
 
         if self._lrf_lock is not None:
             lk = self._lrf_lock
