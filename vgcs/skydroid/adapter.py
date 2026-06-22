@@ -70,10 +70,11 @@ _LRF_GIMBAL_AXIS_MAX_S = 1.8
 _LRF_GIMBAL_SLEW_SCALE = 0.90
 _LRF_C13_INVERT_GSY = True
 _LRF_ALIGN_MIN_OFFSET_DEG = 0.35
-_LRF_ALIGN_SPEED_DPS = 2.0
-_LRF_ALIGN_MAX_ITERS = 10
+_LRF_ALIGN_SPEED_DPS = 3.0
+_LRF_ALIGN_MAX_ITERS = 14
 _LRF_ALIGN_TOL_DEG = 2.5
-_LRF_ALIGN_MAX_TOTAL_DEG = 20.0
+_LRF_ALIGN_MAX_TOTAL_DEG = 45.0
+_LRF_ALIGN_MAX_TOTAL_CAP_DEG = 55.0
 _LRF_HOLD_MAX_CLICK_OFFSET_DEG = 4.0
 _LRF_HOLD_MIN_PIXEL_MOVE_PX = 48
 _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG = 0.45
@@ -400,12 +401,76 @@ class SkydroidTopUdpAdapter:
         )
 
     @staticmethod
+    def _c13_invert_gsy() -> bool:
+        if str(os.environ.get("VGCS_LRF_INVERT_GSY", "") or "").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return False
+        if str(os.environ.get("VGCS_LRF_INVERT_GSY", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return True
+        return bool(_LRF_C13_INVERT_GSY)
+
+    @staticmethod
     def _gsy_yaw_rate_for_offset(dyaw: float, spd: float) -> float:
         """C13 field firmware: GSY sign is opposite PROTOCAL §3.2.1 (yaw right = positive)."""
         rate = float(spd) if float(dyaw) > 0.0 else -float(spd)
-        if _LRF_C13_INVERT_GSY:
+        if SkydroidTopUdpAdapter._c13_invert_gsy():
             rate = -rate
         return rate
+
+    def _align_aim_satisfied(
+        self,
+        att: tuple[float, float] | None,
+        yaw_tgt: float,
+        pitch_tgt: float,
+        dpitch: float,
+    ) -> bool:
+        """Strict post-align check — must be on target, not merely 'moved a bit'."""
+        if att is None:
+            return False
+        yaw_err = abs(self._angle_err_deg(float(yaw_tgt), float(att[0])))
+        pitch_err = abs(self._angle_err_deg(float(pitch_tgt), float(att[1])))
+        pitch_gac_stuck = (
+            abs(float(att[1])) < 0.05 and abs(float(dpitch)) > 1.0
+        )
+        if yaw_err > _LRF_ALIGN_TOL_DEG:
+            print(
+                f"[VGCS:lrf] align miss yaw_err={yaw_err:.1f}° "
+                f"(target={float(yaw_tgt):.1f} att={float(att[0]):.1f})"
+            )
+            return False
+        if not pitch_gac_stuck and pitch_err > _LRF_ALIGN_TOL_DEG:
+            print(
+                f"[VGCS:lrf] align miss pitch_err={pitch_err:.1f}° "
+                f"(target={float(pitch_tgt):.1f} att={float(att[1]):.1f})"
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _align_move_cap_deg(need_deg: float) -> float:
+        try:
+            base = float(
+                os.environ.get(
+                    "VGCS_LRF_ALIGN_MAX_DEG",
+                    str(_LRF_ALIGN_MAX_TOTAL_DEG),
+                )
+                or _LRF_ALIGN_MAX_TOTAL_DEG
+            )
+        except ValueError:
+            base = float(_LRF_ALIGN_MAX_TOTAL_DEG)
+        return min(
+            float(_LRF_ALIGN_MAX_TOTAL_CAP_DEG),
+            max(base, float(need_deg) * 1.15 + 4.0),
+        )
 
     def _hold_speed_direct_burst(
         self,
@@ -494,9 +559,11 @@ class SkydroidTopUdpAdapter:
         spd = float(_LRF_ALIGN_SPEED_DPS)
         att: tuple[float, float] = att_start
         total_move = 0.0
+        move_cap = self._align_move_cap_deg(float(need))
         print(
             f"[VGCS:lrf] align laser px=({x_px},{y_px}) "
-            f"-> ({yaw_tgt:.1f},{pitch_tgt:.1f}) offset=({dyaw0:.1f}°,{dpitch0:.1f}°)"
+            f"-> ({yaw_tgt:.1f},{pitch_tgt:.1f}) offset=({dyaw0:.1f}°,{dpitch0:.1f}°) "
+            f"cap={move_cap:.0f}°"
         )
         for n in range(int(_LRF_ALIGN_MAX_ITERS)):
             att_read = self._read_gimbal_attitude_deg() or att
@@ -512,10 +579,10 @@ class SkydroidTopUdpAdapter:
             if yaw_ok and pitch_ok:
                 print(f"[VGCS:lrf] align ok iter={n + 1} att={att}")
                 return att, True, float(dyaw0), float(dpitch0)
-            if total_move >= float(_LRF_ALIGN_MAX_TOTAL_DEG):
+            if total_move >= float(move_cap):
                 print(
                     f"[VGCS:lrf] align stopped — total move {total_move:.1f}° "
-                    f"(cap={_LRF_ALIGN_MAX_TOTAL_DEG:.0f}°)"
+                    f"(cap={move_cap:.0f}°)"
                 )
                 break
 
@@ -552,13 +619,8 @@ class SkydroidTopUdpAdapter:
                 att = att_new
 
         att_end = self._read_gimbal_attitude_deg() or att
-        aim_ok = self._gimbal_aim_ok(
-            att_start,
-            att_end,
-            yaw_tgt=yaw_tgt,
-            pitch_tgt=pitch_tgt,
-            dyaw=float(dyaw0),
-            dpitch=float(dpitch0),
+        aim_ok = self._align_aim_satisfied(
+            att_end, float(yaw_tgt), float(pitch_tgt), float(dpitch0)
         )
         move = self._gimbal_total_move_deg(att_start, att_end)
         print(
@@ -950,13 +1012,8 @@ class SkydroidTopUdpAdapter:
         if att_before is None or att_now is None:
             return None
         if yaw_tgt is not None and pitch_tgt is not None:
-            if not self._gimbal_aim_ok(
-                att_before,
-                att_now,
-                yaw_tgt=float(yaw_tgt),
-                pitch_tgt=float(pitch_tgt),
-                dyaw=float(dyaw),
-                dpitch=float(dpitch),
+            if not self._align_aim_satisfied(
+                att_now, float(yaw_tgt), float(pitch_tgt), float(dpitch)
             ):
                 return None
         tail = [float(v) for v in samples[-_LRF_CONVERGE_SAMPLES:]]

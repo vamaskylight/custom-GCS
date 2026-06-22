@@ -288,6 +288,22 @@ def test_gsy_yaw_rate_inverted_on_c13() -> None:
     assert SkydroidTopUdpAdapter._gsy_yaw_rate_for_offset(-5.0, 3.0) == 3.0
 
 
+def test_align_move_cap_scales_with_offset() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    cap = SkydroidTopUdpAdapter._align_move_cap_deg(36.4)
+    assert cap >= 45.0
+    assert cap <= 55.0
+
+
+def test_align_aim_satisfied_requires_yaw_on_target() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    assert adapter._align_aim_satisfied((24.5, 0.0), 38.2, 1.1, -1.1) is False
+    assert adapter._align_aim_satisfied((37.5, 0.0), 38.2, 1.1, -1.1) is True
+
+
 def test_lrf_lock_move_gimbal_default(monkeypatch) -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
