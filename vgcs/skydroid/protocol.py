@@ -145,9 +145,26 @@ def build_system_command(tag: str, data: str, *, write: bool = True) -> bytes:
     )
 
 
-def build_slr_query() -> bytes:
-    """C13 single laser rangefinding read (PROTOCAL §4.22, tag SLR, D-class read)."""
-    return build_system_command("SLR", "00", write=False)
+def build_slr_query(*, dest: str = "D") -> bytes:
+    """C13 single laser rangefinding read (PROTOCAL §4.22, tag SLR)."""
+    return build_tp_frame(
+        dest=str(dest or "D").strip().upper()[:1],
+        control="r",
+        tag="SLR",
+        data="00",
+        src="U",
+    )
+
+
+def build_slr_trigger(*, dest: str = "D") -> bytes:
+    """Fire a single laser shot before reading (field C13: write 01 then read)."""
+    return build_tp_frame(
+        dest=str(dest or "D").strip().upper()[:1],
+        control="w",
+        tag="SLR",
+        data="01",
+        src="U",
+    )
 
 
 # C13 target lock on 1280×720 video frame (PROTOCAL §3.3.5 GOT) + track confirm/stop (§3.3.4 SUM).
@@ -209,6 +226,18 @@ def parse_slr_distance_from_payload(payload: bytes) -> float | None:
         if m:
             data = m.group(1)
     return decode_slr_distance_m(data)
+
+
+def slr_raw_hex(payload: bytes) -> str | None:
+    """Four hex distance chars from an SLR reply (for debug logs)."""
+    dec = parse_top_frame(payload)
+    if dec is None or dec.command != "SLR":
+        return None
+    data = str(dec.params.get("slr_data") or "")
+    if len(data) == 4:
+        return data.upper()
+    m = re.search(r"SLR([0-9A-Fa-f]{4})", str(dec.raw or ""), re.IGNORECASE)
+    return m.group(1).upper() if m else None
 
 
 def build_pod_camera_command(
