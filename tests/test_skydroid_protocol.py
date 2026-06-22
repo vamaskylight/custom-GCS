@@ -336,3 +336,19 @@ def test_try_accept_lrf_lock_slr_accepts_after_align_to_building() -> None:
     )
     assert got is not None
     assert abs(float(got) - 52.0) < 0.5
+
+
+def test_slr_trimmed_median_drops_outliers() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    vals = [50.0, 52.0, 52.1, 52.0, 58.0]
+    med = SkydroidTopUdpAdapter._slr_trimmed_median(vals, trim=1)
+    assert abs(med - 52.0) < 0.2
+
+
+def test_calibrate_slr_m_env(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.setenv("VGCS_LRF_OFFSET_M", "-4.4")
+    monkeypatch.setenv("VGCS_LRF_SCALE", "1")
+    assert abs(SkydroidTopUdpAdapter._calibrate_slr_m(56.4) - 52.0) < 0.01
