@@ -172,8 +172,8 @@ def test_slr_still_settling_detects_drift() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     rising = [45.0, 47.0, 49.0, 50.5, 51.5, 52.0, 52.1, 52.2]
-    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.5) is True
-    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.9) is True
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.4) is True
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.45) is True
     assert SkydroidTopUdpAdapter._slr_still_settling(rising, 2.0) is False
 
     flat = [52.0, 52.1, 52.1, 52.2, 52.2, 52.2, 52.2, 52.2]
@@ -411,6 +411,14 @@ def test_align_pitch_tol_tightens_for_large_click() -> None:
 
     assert SkydroidTopUdpAdapter._align_pitch_tol_deg(20.0) <= 0.55
     assert SkydroidTopUdpAdapter._align_pitch_tol_deg(2.0) <= 0.75
+
+
+def test_align_speed_scales_with_click_offset() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    assert SkydroidTopUdpAdapter._align_speed_for_need(2.0) >= 5.0
+    assert SkydroidTopUdpAdapter._align_speed_for_need(10.0) >= 6.5
+    assert SkydroidTopUdpAdapter._align_speed_for_need(18.0) >= 8.0
 
 
 def test_lrf_lock_move_gimbal_default(monkeypatch) -> None:
