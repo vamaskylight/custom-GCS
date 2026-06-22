@@ -9832,7 +9832,10 @@ class MapWidget(QWidget):
         """C13 TOP laser rangefinder (Skydroid SLR); updates PROXIMITY Range when target is locked."""
         try:
             self._companion_laser_range_m = float(distance_m) if distance_m is not None else None
-            if distance_m is not None and getattr(self, "_lrf_lock_uv", None) is not None:
+            if distance_m is not None and (
+                getattr(self, "_lrf_lock_uv", None) is not None
+                or getattr(self, "_lrf_lock_in_progress", False)
+            ):
                 self._lrf_lock_distance_m = float(distance_m)
                 self._refresh_lrf_lock_overlay()
         except (TypeError, ValueError):
@@ -9888,6 +9891,9 @@ class MapWidget(QWidget):
 
     def is_c13_lrf_armed(self) -> bool:
         return bool(getattr(self, "_lrf_lock_armed", False))
+
+    def is_c13_lrf_locking(self) -> bool:
+        return bool(getattr(self, "_lrf_lock_in_progress", False))
 
     def _sync_lrf_armed_backend(self, armed: bool) -> None:
         cc = getattr(self, "_camera_control", None)
@@ -9968,11 +9974,25 @@ class MapWidget(QWidget):
         self._lrf_lock_in_progress = True
         self._capture_lrf_track_ref(float(u), float(v))
         self._sync_lrf_armed_backend(False)
-        self._lrf_lock_distance_m = None
-        self._refresh_lrf_lock_overlay()
-        self._set_status("Locking LRF — slewing camera to target…")
         try:
-            self._obstacle_radar.set_c13_lrf_locking(None)
+            from vgcs.video.camera_control import poll_companion_laser_range_m
+
+            live = poll_companion_laser_range_m(cc)
+            if live is not None:
+                self._lrf_lock_distance_m = float(live)
+        except Exception:
+            pass
+        self._refresh_lrf_lock_overlay()
+        if getattr(self, "_lrf_lock_distance_m", None) is not None:
+            self._set_status(
+                f"Locking LRF… {format_slr_display_m(self._lrf_lock_distance_m)}"
+            )
+        else:
+            self._set_status("Locking LRF — slewing camera to target…")
+        try:
+            self._obstacle_radar.set_c13_lrf_locking(
+                getattr(self, "_lrf_lock_distance_m", None)
+            )
         except Exception:
             pass
         fw, fh = 1280, 720

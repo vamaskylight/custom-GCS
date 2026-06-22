@@ -4580,8 +4580,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         armed = False
+        locking = False
         try:
             armed = bool(self._map_widget.is_c13_lrf_armed())
+            locking = bool(self._map_widget.is_c13_lrf_locking())
         except Exception:
             pass
         is_locked = False
@@ -4591,7 +4593,7 @@ class MainWindow(QMainWindow):
         dist = None
         if is_locked:
             dist = read_companion_laser_range_m(cc)
-        elif armed:
+        elif armed or locking:
             dist = poll_companion_laser_range_m(cc)
         if dist is None:
             if is_locked:
@@ -4600,14 +4602,20 @@ class MainWindow(QMainWindow):
                     self._apply_state_style(self._fields["rangefinder"], "idle")
                 except Exception:
                     pass
-            elif armed:
+            elif armed or locking:
                 try:
-                    self._fields["rangefinder"].setText("— (aim gimbal at target)")
+                    hint = "locking…" if locking else "aim gimbal at target"
+                    self._fields["rangefinder"].setText(f"— ({hint})")
                     self._apply_state_style(self._fields["rangefinder"], "idle")
                 except Exception:
                     pass
             return
-        text = f"{dist:.1f} m (C13 live)" if armed and not is_locked else f"{dist:.1f} m (C13 locked)"
+        if locking and not is_locked:
+            text = f"{dist:.1f} m (C13 locking)"
+        elif armed and not is_locked:
+            text = f"{dist:.1f} m (C13 live)"
+        else:
+            text = f"{dist:.1f} m (C13 locked)"
         try:
             self._fields["rangefinder"].setText(text)
             self._apply_state_style(self._fields["rangefinder"], "ok")
