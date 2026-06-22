@@ -2165,9 +2165,6 @@ class MapWidget(QWidget):
                     event.accept()
                 pos = event.position()
                 xn, yn = self._native_video_click_norm(pos)
-                from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
-
-                xn, yn = SkydroidTopUdpAdapter.normalize_lrf_click_uv(float(xn), float(yn))
                 self._begin_c13_lrf_video_lock(float(xn), float(yn))
             except Exception as e:
                 print(f"[VGCS:lrf] video pick failed: {e}")
@@ -3445,6 +3442,11 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _native_video_click_mirror_x(self) -> bool:
+        """Optional horizontal flip for click coords (off by default — reticle and gimbal share same u,v)."""
+        env = str(os.environ.get("VGCS_VIDEO_MIRROR_X", "") or "").strip().lower()
+        return env in ("1", "true", "yes", "on")
+
     def _native_video_click_norm(self, pos: QPointF) -> tuple[float, float]:
         """Normalized click (0..1) on the visible video pixmap; falls back to full label size."""
         try:
@@ -3456,6 +3458,8 @@ class MapWidget(QWidget):
                 ph = max(1.0, float(cr.get("ph", 1.0)))
                 xn = (float(pos.x()) - left) / pw
                 yn = (float(pos.y()) - top) / ph
+                if self._native_video_click_mirror_x():
+                    xn = 1.0 - xn
                 return (
                     max(0.0, min(1.0, xn)),
                     max(0.0, min(1.0, yn)),
@@ -3464,9 +3468,13 @@ class MapWidget(QWidget):
             pass
         w = max(1, int(self._native_video_preview.width()))
         h = max(1, int(self._native_video_preview.height()))
+        xn = float(pos.x()) / float(w)
+        yn = float(pos.y()) / float(h)
+        if self._native_video_click_mirror_x():
+            xn = 1.0 - xn
         return (
-            max(0.0, min(1.0, float(pos.x()) / float(w))),
-            max(0.0, min(1.0, float(pos.y()) / float(h))),
+            max(0.0, min(1.0, xn)),
+            max(0.0, min(1.0, yn)),
         )
 
     def _minimap_click_to_lat_lon(self, pos: QPointF) -> tuple[float, float] | None:
