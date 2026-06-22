@@ -398,11 +398,29 @@ class SkydroidCameraControl:
             return None
 
     def get_laser_range_m(self) -> float | None:
-        """C13 built-in laser rangefinder (TOP SLR), metres — only when target is locked."""
+        """C13 SLR metres — locked value or live read while LRF armed."""
         try:
             return self._adapter.get_laser_range_m()
         except Exception:
             return None
+
+    def set_lrf_armed(self, armed: bool) -> None:
+        try:
+            self._adapter.set_lrf_armed(bool(armed))
+        except Exception:
+            return
+
+    def poll_live_laser_range_m(self) -> float | None:
+        try:
+            return self._adapter.poll_live_slr()
+        except Exception:
+            return None
+
+    def is_lrf_armed(self) -> bool:
+        try:
+            return bool(self._adapter.is_lrf_armed())
+        except Exception:
+            return False
 
     def is_lrf_locked(self) -> bool:
         try:
@@ -723,7 +741,7 @@ def camera_recording_applies_digital_zoom(source_id: str, control: object | None
 
 
 def read_companion_laser_range_m(control: object | None) -> float | None:
-    """C13 TOP SLR distance in metres when Skydroid backend is active."""
+    """C13 TOP SLR distance in metres (live when armed, frozen when locked)."""
     primary = resolve_camera_control_primary(control)
     getter = getattr(primary, "get_laser_range_m", None)
     if not callable(getter):
@@ -735,4 +753,18 @@ def read_companion_laser_range_m(control: object | None) -> float | None:
         return float(dist)
     except Exception:
         return None
+
+
+def poll_companion_laser_range_m(control: object | None) -> float | None:
+    """Fresh C13 SLR poll while LRF is armed."""
+    primary = resolve_camera_control_primary(control)
+    poll = getattr(primary, "poll_live_laser_range_m", None)
+    if callable(poll):
+        try:
+            dist = poll()
+            if dist is not None:
+                return float(dist)
+        except Exception:
+            pass
+    return read_companion_laser_range_m(control)
 

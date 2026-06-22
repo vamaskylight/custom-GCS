@@ -9728,11 +9728,24 @@ class MapWidget(QWidget):
                 pass
         self._refresh_lrf_lock_overlay()
 
+    def is_c13_lrf_armed(self) -> bool:
+        return bool(getattr(self, "_lrf_lock_armed", False))
+
+    def _sync_lrf_armed_backend(self, armed: bool) -> None:
+        cc = getattr(self, "_camera_control", None)
+        fn = getattr(cc, "set_lrf_armed", None)
+        if callable(fn):
+            try:
+                fn(bool(armed))
+            except Exception:
+                pass
+
     def _arm_c13_lrf_lock(self) -> None:
         self._lrf_lock_armed = True
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
+        self._sync_lrf_armed_backend(True)
         try:
             self._obstacle_radar.set_c13_lrf_armed(True)
         except Exception:
@@ -9747,6 +9760,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
+        self._sync_lrf_armed_backend(False)
         try:
             self._obstacle_radar.set_c13_lrf_armed(False)
         except Exception:
@@ -9760,6 +9774,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
+        self._sync_lrf_armed_backend(False)
         cc = getattr(self, "_camera_control", None)
         try:
             unlock = getattr(cc, "unlock_lrf", None)
@@ -9790,6 +9805,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = True
+        self._sync_lrf_armed_backend(False)
         self._lrf_lock_distance_m = None
         self._refresh_lrf_lock_overlay()
         self._set_status("Locking LRF target…")
