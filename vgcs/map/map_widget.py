@@ -1276,6 +1276,8 @@ class MapWidget(QWidget):
         self._lrf_lock_distance_m: float | None = None
         self._lrf_lock_in_progress = False
         self._lrf_lock_failed = False
+        self._lrf_track_ref_uv: tuple[float, float] | None = None
+        self._lrf_track_ref_att: tuple[float, float] | None = None
         self._lrf_lock_bridge = _LrfLockBridge(self)
         self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
         self._lrf_lock_bridge.progress.connect(self._on_c13_lrf_lock_progress)
@@ -3544,7 +3546,7 @@ class MapWidget(QWidget):
         except Exception:
             return None
 
-    def _sync_native_video_overlay(self) -> None:
+    def _sync_native_video_overlay(self, *, from_lrf: bool = False) -> None:
         """Match overlay layer to video preview geometry and refresh content rect."""
         try:
             pv = self._native_video_preview
@@ -3559,7 +3561,9 @@ class MapWidget(QWidget):
                 ly.raise_()
             else:
                 ly.hide()
-            if getattr(self, "_lrf_lock_uv", None) is not None or bool(
+            if not from_lrf and self._lrf_reticle_tracking_active():
+                self._refresh_lrf_lock_overlay(sync_geometry=False)
+            elif getattr(self, "_lrf_lock_uv", None) is not None or bool(
                 getattr(self, "_lrf_lock_armed", False)
             ):
                 ly.update()
@@ -9661,13 +9665,77 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-    def _refresh_lrf_lock_overlay(self) -> None:
+    def _read_gimbal_attitude_pair(self) -> tuple[float, float] | None:
+        cc = getattr(self, "_camera_control", None)
+        if cc is None:
+            return None
+        try:
+            st = cc.get_gimbal_status()
+            if st is None or not bool(getattr(st, "supported", False)):
+                return None
+            yaw = getattr(st, "yaw_deg", None)
+            pitch = getattr(st, "pitch_deg", None)
+            if yaw is None or pitch is None:
+                return None
+            return float(yaw), float(pitch)
+        except Exception:
+            return None
+
+    def _lrf_reticle_tracking_active(self) -> bool:
+        if getattr(self, "_lrf_track_ref_uv", None) is None:
+            return False
+        if getattr(self, "_lrf_track_ref_att", None) is None:
+            return False
+        return bool(getattr(self, "_lrf_lock_in_progress", False)) or self._c13_lrf_is_locked()
+
+    def _capture_lrf_track_ref(self, u: float, v: float) -> None:
+        att = self._read_gimbal_attitude_pair()
+        if att is None:
+            self._lrf_track_ref_uv = None
+            self._lrf_track_ref_att = None
+            return
+        self._lrf_track_ref_uv = (float(u), float(v))
+        self._lrf_track_ref_att = att
+
+    def _reanchor_lrf_track_to_center(self) -> None:
+        att = self._read_gimbal_attitude_pair()
+        if att is None:
+            return
+        self._lrf_track_ref_uv = (0.5, 0.5)
+        self._lrf_track_ref_att = att
+
+    def _clear_lrf_track_ref(self) -> None:
+        self._lrf_track_ref_uv = None
+        self._lrf_track_ref_att = None
+
+    def _update_lrf_reticle_track(self) -> None:
+        if not self._lrf_reticle_tracking_active():
+            return
+        ref_uv = getattr(self, "_lrf_track_ref_uv", None)
+        ref_att = getattr(self, "_lrf_track_ref_att", None)
+        if ref_uv is None or ref_att is None:
+            return
+        cur = self._read_gimbal_attitude_pair()
+        if cur is None:
+            return
+        try:
+            from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+            u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+                ref_uv, ref_att, cur
+            )
+            self._lrf_lock_uv = (float(u), float(v))
+        except Exception:
+            pass
+
+    def _refresh_lrf_lock_overlay(self, *, sync_geometry: bool = True) -> None:
         """Draw cyan LRF reticle on video at the VGCS-locked target point."""
         try:
             ly = self._native_video_overlay
         except AttributeError:
             return
         try:
+            self._update_lrf_reticle_track()
             uv = getattr(self, "_lrf_lock_uv", None)
             armed = bool(getattr(self, "_lrf_lock_armed", False))
             dist = getattr(self, "_lrf_lock_distance_m", None)
@@ -9692,7 +9760,8 @@ class MapWidget(QWidget):
             if bool(getattr(self, "_video_preview_enabled", False)):
                 ly.show()
                 ly.raise_()
-            self._sync_native_video_overlay()
+            if sync_geometry:
+                self._sync_native_video_overlay(from_lrf=True)
         except Exception:
             pass
 
@@ -9771,6 +9840,7 @@ class MapWidget(QWidget):
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
+        self._clear_lrf_track_ref()
         self._sync_lrf_armed_backend(True)
         try:
             self._obstacle_radar.set_c13_lrf_armed(True)
@@ -9786,6 +9856,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
+        self._clear_lrf_track_ref()
         self._sync_lrf_armed_backend(False)
         try:
             self._obstacle_radar.set_c13_lrf_armed(False)
@@ -9800,6 +9871,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
+        self._clear_lrf_track_ref()
         self._sync_lrf_armed_backend(False)
         cc = getattr(self, "_camera_control", None)
         try:
@@ -9831,6 +9903,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = True
+        self._capture_lrf_track_ref(float(u), float(v))
         self._sync_lrf_armed_backend(False)
         self._lrf_lock_distance_m = None
         self._refresh_lrf_lock_overlay()
@@ -9877,13 +9950,17 @@ class MapWidget(QWidget):
                 return
             dm = float(dist)
             self._lrf_lock_failed = False
-            self._lrf_lock_uv = (float(u), float(v))
+            self._reanchor_lrf_track_to_center()
+            self._update_lrf_reticle_track()
+            uv = getattr(self, "_lrf_lock_uv", None) or (float(u), float(v))
             self._lrf_lock_distance_m = dm
             self._companion_laser_range_m = dm
             self._obstacle_radar.set_c13_lrf_locked(dm)
             self._refresh_lrf_lock_overlay()
             self._set_status(f"C13 LRF locked · {format_slr_display_m(dm)} — cyan box on video")
-            print(f"[VGCS:lrf] locked u={u:.3f} v={v:.3f} range={dm:.1f} m")
+            print(
+                f"[VGCS:lrf] locked u={uv[0]:.3f} v={uv[1]:.3f} range={dm:.1f} m"
+            )
         except Exception as exc:
             print(f"[VGCS:lrf] lock result error: {exc}")
             self._lrf_lock_uv = None
