@@ -433,6 +433,40 @@ class SkydroidTopUdpAdapter:
         return float(att_yaw) + SkydroidTopUdpAdapter._image_yaw_to_gac_delta(dyaw_image)
 
     @staticmethod
+    def _gac_to_image_yaw_delta(dyaw_gac: float) -> float:
+        d = float(dyaw_gac)
+        if SkydroidTopUdpAdapter._c13_negate_image_yaw():
+            d = -d
+        return d
+
+    @staticmethod
+    def _gac_to_image_pitch_delta(dpitch_gac: float) -> float:
+        return -float(dpitch_gac)
+
+    @staticmethod
+    def lrf_track_uv_from_attitude(
+        ref_uv: tuple[float, float],
+        ref_att: tuple[float, float],
+        cur_att: tuple[float, float],
+    ) -> tuple[float, float]:
+        """Screen UV of a world-fixed point marked at ref_uv when gimbal was at ref_att."""
+        u0, v0 = float(ref_uv[0]), float(ref_uv[1])
+        yaw0, pitch0 = float(ref_att[0]), float(ref_att[1])
+        yaw, pitch = float(cur_att[0]), float(cur_att[1])
+        dyaw_img0 = (u0 - 0.5) * _LRF_FOV_H_DEG
+        dpitch_img0 = (v0 - 0.5) * _LRF_FOV_V_DEG
+        gac_dy = yaw - yaw0
+        gac_dp = pitch - pitch0
+        img_dy_delta = SkydroidTopUdpAdapter._gac_to_image_yaw_delta(gac_dy)
+        img_dp_delta = SkydroidTopUdpAdapter._gac_to_image_pitch_delta(gac_dp)
+        u = 0.5 + (dyaw_img0 - img_dy_delta) / _LRF_FOV_H_DEG
+        v = 0.5 + (dpitch_img0 - img_dp_delta) / _LRF_FOV_V_DEG
+        return (
+            max(0.0, min(1.0, float(u))),
+            max(0.0, min(1.0, float(v))),
+        )
+
+    @staticmethod
     def _c13_invert_gsy() -> bool:
         if str(os.environ.get("VGCS_LRF_INVERT_GSY", "") or "").strip().lower() in (
             "0",

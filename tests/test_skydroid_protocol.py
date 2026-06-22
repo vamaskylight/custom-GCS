@@ -300,6 +300,33 @@ def test_gimbal_yaw_target_negates_image_yaw_by_default(monkeypatch) -> None:
     assert abs(tgt2 - 95.27) < 0.05
 
 
+def test_lrf_track_uv_follows_gimbal_slew(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.delenv("VGCS_LRF_NEGATE_YAW_DELTA", raising=False)
+    # Field log: click right while att=(47.62, 9.25); after slew att=(16.8, 5.21) → centre.
+    u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        (0.872, 0.621),
+        (47.62, 9.25),
+        (16.8, 5.21),
+    )
+    assert abs(u - 0.5) < 0.03
+    assert abs(v - 0.5) < 0.08
+
+
+def test_lrf_track_uv_shifts_when_gimbal_pans_after_lock(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.delenv("VGCS_LRF_NEGATE_YAW_DELTA", raising=False)
+    u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        (0.5, 0.5),
+        (16.8, 5.21),
+        (26.8, 5.21),
+    )
+    assert u > 0.55
+    assert abs(v - 0.5) < 0.05
+
+
 def test_align_yaw_burst_right_click_uses_positive_gsy(monkeypatch) -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
