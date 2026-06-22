@@ -75,6 +75,7 @@ from vgcs.video.camera_control import (
     MavlinkCameraControl,
     NoopCameraControl,
     read_companion_laser_range_m,
+    poll_companion_laser_range_m,
     SiyiCameraControl,
     SkydroidCameraControl,
     resolve_siyi_host,
@@ -4567,32 +4568,46 @@ class MainWindow(QMainWindow):
         self._append_log("UI defaults restored.")
 
     def _refresh_c13_lrf_display(self) -> None:
-        """Poll C13 TOP SLR when a video target is locked; otherwise show lock icon only."""
+        """Poll C13 TOP SLR when LRF armed or locked."""
         if not bool(getattr(self, "_heartbeat_seen", False)):
             return
         provider = str(self._settings.value("camera/provider", "mavlink") or "mavlink").strip().lower()
         if provider != "skydroid":
             return
         cc = self._camera_control_backend
-        is_locked = False
-        if cc is not None:
-            fn = getattr(cc, "is_lrf_locked", None)
-            is_locked = bool(fn()) if callable(fn) else False
         try:
             self._map_widget.enable_c13_lrf_ui(True)
         except Exception:
             pass
-        if not is_locked:
-            try:
-                self._fields["rangefinder"].setText("— (tap ⌖ on PROXIMITY)")
-                self._apply_state_style(self._fields["rangefinder"], "idle")
-            except Exception:
-                pass
-            return
-        dist = read_companion_laser_range_m(cc)
+        armed = False
+        try:
+            armed = bool(self._map_widget.is_c13_lrf_armed())
+        except Exception:
+            pass
+        is_locked = False
+        if cc is not None:
+            fn = getattr(cc, "is_lrf_locked", None)
+            is_locked = bool(fn()) if callable(fn) else False
+        dist = None
+        if is_locked:
+            dist = read_companion_laser_range_m(cc)
+        elif armed:
+            dist = poll_companion_laser_range_m(cc)
         if dist is None:
+            if is_locked:
+                try:
+                    self._fields["rangefinder"].setText("— (C13 locked, no SLR)")
+                    self._apply_state_style(self._fields["rangefinder"], "idle")
+                except Exception:
+                    pass
+            elif armed:
+                try:
+                    self._fields["rangefinder"].setText("— (aim gimbal at target)")
+                    self._apply_state_style(self._fields["rangefinder"], "idle")
+                except Exception:
+                    pass
             return
-        text = f"{dist:.1f} m (C13 locked)"
+        text = f"{dist:.1f} m (C13 live)" if armed and not is_locked else f"{dist:.1f} m (C13 locked)"
         try:
             self._fields["rangefinder"].setText(text)
             self._apply_state_style(self._fields["rangefinder"], "ok")

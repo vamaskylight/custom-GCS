@@ -506,11 +506,33 @@ class _LrfRangeBlock(QWidget):
         self._btn.setChecked(True)
         self._btn.setText("◎")
         self._btn.setToolTip(
-            "Aim LRF at target with gimbal, then click video to lock (camera will not move)"
+            "Aim gimbal until live SLR shows target range, then click video to lock"
         )
-        self._sub.setText("Click video")
+        self._sub.setText("Aim gimbal — live SLR below")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(0)
+
+    def set_c13_lrf_live_range_m(self, distance_m: float | None) -> None:
+        """Live SLR while armed (before lock) — user aims gimbal using this readout."""
+        if self._c13_state in ("locked", "locking"):
+            return
+        if not self._c13_mode:
+            return
+        self._c13_state = "armed"
+        if distance_m is None:
+            self._stack.setCurrentIndex(0)
+            return
+        try:
+            cur_m = float(distance_m)
+        except (TypeError, ValueError):
+            return
+        if cur_m < 0:
+            return
+        self._val.setText(f"{cur_m:.1f} m")
+        self._val.setStyleSheet(_VALUE_QSS)
+        self._sub.setText("Live SLR — aim gimbal, then click video")
+        self._sub.setVisible(True)
+        self._stack.setCurrentIndex(1)
 
     def set_c13_locked(self, distance_m: float, *, alert: bool = False) -> None:
         self._c13_mode = True
@@ -970,16 +992,18 @@ class ObstacleRadarPanel(QFrame):
         self._set_status_mode("live")
 
     def set_companion_lrf_range_m(self, distance_m: float | None) -> None:
-        """C13 built-in laser rangefinder (TOP SLR) — updates only when target is locked."""
-        if not bool(getattr(self, "_c13_lrf_locked", False)):
+        """C13 TOP SLR — live while armed, frozen when locked."""
+        if bool(getattr(self, "_c13_lrf_locked", False)):
+            try:
+                cur_m = None if distance_m is None else float(distance_m)
+            except (TypeError, ValueError):
+                cur_m = None
+            if cur_m is None or cur_m < 0:
+                return
+            self.set_c13_lrf_locked(cur_m)
             return
-        try:
-            cur_m = None if distance_m is None else float(distance_m)
-        except (TypeError, ValueError):
-            cur_m = None
-        if cur_m is None or cur_m < 0:
-            return
-        self.set_c13_lrf_locked(cur_m)
+        if bool(getattr(self, "_c13_lrf_armed", False)):
+            self.set_c13_lrf_live_range_m(distance_m)
 
     def _set_sensor_active(self, which: str | None) -> None:
         self._active_sensor = which

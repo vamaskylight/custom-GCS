@@ -70,7 +70,9 @@ _LRF_GIMBAL_SLEW_SCALE = 0.90
 _LRF_C13_INVERT_GSY = True
 _LRF_LOCK_MOVE_GIMBAL = False
 _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG = 0.45
-_LRF_GOT_MARK_ONLY = True
+_LRF_PRELOCK_SAMPLES = 5
+_LRF_LIVE_POLL_SAMPLES = 3
+_LRF_SLR_MULTI_DEST_MAX = True
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.25
 _LRF_MAX_REPOINTS = 0
@@ -158,6 +160,7 @@ class SkydroidTopUdpAdapter:
         self._laser_range_mono: float = 0.0
         self._last_slr_poll_mono: float = 0.0
         self._lrf_locked = False
+        self._lrf_armed = False
         self._lrf_lock_x = 0
         self._lrf_lock_y = 0
         self._lrf_locked_distance_m: float | None = None
@@ -168,17 +171,78 @@ class SkydroidTopUdpAdapter:
         return (str(self._active_host), int(self._active_port), str(self._profile_id))
 
     def get_laser_range_m(self, *, max_age_s: float = 4.0) -> float | None:
-        """Frozen C13 SLR distance after video lock; None when not locked."""
+        """C13 SLR metres — locked value, or latest live read while LRF is armed."""
         with self._status_lock:
-            if not self._lrf_locked:
+            if self._lrf_locked:
+                dist = self._lrf_locked_distance_m
+            elif self._lrf_armed:
+                dist = self._laser_range_m
+            else:
                 return None
-            dist = self._lrf_locked_distance_m
             ts = float(self._laser_range_mono or 0.0)
         if dist is None or ts <= 0.0:
             return None
         if time.monotonic() - ts > max(0.5, float(max_age_s)):
             return None
         return float(dist)
+
+    def set_lrf_armed(self, armed: bool) -> None:
+        with self._status_lock:
+            self._lrf_armed = bool(armed)
+            if not self._lrf_armed and not self._lrf_locked:
+                self._laser_range_m = None
+                self._laser_range_mono = 0.0
+
+    def is_lrf_armed(self) -> bool:
+        with self._status_lock:
+            return bool(self._lrf_armed)
+
+    def poll_live_slr(self, *, log: bool = False) -> float | None:
+        """Fresh multi-shot SLR while armed (no lock); updates cached live readout."""
+        if not self.gimbal_telemetry_ok():
+            return None
+        with self._status_lock:
+            if self._lrf_locked:
+                return self._lrf_locked_distance_m
+            if not self._lrf_armed:
+                return None
+        samples: list[float] = []
+        for i in range(int(_LRF_LIVE_POLL_SAMPLES)):
+            reading = self._query_slr_distance_m(log=log and i == 0, fresh=True)
+            if reading is not None:
+                samples.append(float(reading))
+            if i + 1 < int(_LRF_LIVE_POLL_SAMPLES):
+                time.sleep(0.1)
+        if not samples:
+            return None
+        value = float(self._slr_median(samples))
+        with self._status_lock:
+            if not self._lrf_locked:
+                self._laser_range_m = value
+                self._laser_range_mono = time.monotonic()
+        return value
+
+    def _read_slr_prelock_median(self) -> float | None:
+        """Several fresh SLR shots before lock — reduces single-shot error."""
+        samples: list[float] = []
+        n = int(_LRF_PRELOCK_SAMPLES)
+        for i in range(n):
+            reading = self._query_slr_distance_m(log=i == 0, fresh=True)
+            if reading is not None:
+                samples.append(float(reading))
+            if i + 1 < n:
+                time.sleep(0.12)
+        if not samples:
+            return None
+        med = float(self._slr_median(samples))
+        if len(samples) >= 2:
+            spread = max(samples) - min(samples)
+            if spread > 0.5:
+                print(
+                    f"[VGCS:lrf] pre-lock spread {spread:.1f} m "
+                    f"samples={[round(s, 1) for s in samples]} median={med:.1f} m"
+                )
+        return med
 
     def is_lrf_locked(self) -> bool:
         with self._status_lock:
@@ -955,9 +1019,9 @@ class SkydroidTopUdpAdapter:
                     )
                     return None
 
-            pre_slr = self._query_slr_distance_m(log=True, fresh=True)
+            pre_slr = self._read_slr_prelock_median()
             if pre_slr is not None:
-                print(f"[VGCS:lrf] pre-lock SLR={float(pre_slr):.1f} m")
+                print(f"[VGCS:lrf] pre-lock SLR={float(pre_slr):.1f} m (median)")
 
             att_latest = att_before
             click_offset_deg = self._expected_offset_deg(dyaw, dpitch_img)
@@ -1101,6 +1165,8 @@ class SkydroidTopUdpAdapter:
                         continue
                 time.sleep(_LRF_SLR_SHOT_SETTLE_S)
             last_raw: bytes | None = None
+            readings: list[float] = []
+            last_reply: bytes | None = None
             for frame in frames_read:
                 try:
                     reply = self._transport.send_and_receive(
@@ -1114,20 +1180,32 @@ class SkydroidTopUdpAdapter:
                 if not reply:
                     continue
                 last_raw = reply
+                last_reply = reply
                 dist_m = parse_slr_distance_from_payload(reply)
                 if dist_m is not None:
-                    if log:
-                        hx = slr_raw_hex(reply)
+                    readings.append(float(dist_m))
+            if readings:
+                if _LRF_SLR_MULTI_DEST_MAX and len(readings) > 1:
+                    dist_m = max(readings)
+                    if log and max(readings) - min(readings) > 0.3:
                         print(
-                            f"[VGCS:lrf] SLR reply hex={hx} "
-                            f"range={float(dist_m):.1f} m "
-                            f"raw={reply.decode('ascii', errors='ignore')!r}"
+                            f"[VGCS:lrf] SLR D/E reads "
+                            f"{[round(v, 1) for v in readings]} -> {dist_m:.1f} m"
                         )
-                    if not self._lrf_locked:
-                        with self._status_lock:
-                            self._laser_range_m = float(dist_m)
-                            self._laser_range_mono = time.monotonic()
-                    return float(dist_m)
+                else:
+                    dist_m = readings[0]
+                if log and last_reply:
+                    hx = slr_raw_hex(last_reply)
+                    print(
+                        f"[VGCS:lrf] SLR reply hex={hx} "
+                        f"range={float(dist_m):.1f} m "
+                        f"raw={last_reply.decode('ascii', errors='ignore')!r}"
+                    )
+                if not self._lrf_locked:
+                    with self._status_lock:
+                        self._laser_range_m = float(dist_m)
+                        self._laser_range_mono = time.monotonic()
+                return float(dist_m)
             if log and last_raw:
                 print(
                     f"[VGCS:lrf] SLR parse failed raw="
@@ -1153,6 +1231,7 @@ class SkydroidTopUdpAdapter:
             self._transport._port = active_port
         with self._status_lock:
             self._lrf_locked = False
+            self._lrf_armed = False
             self._laser_range_m = None
             self._laser_range_mono = 0.0
             self._lrf_locked_distance_m = None
