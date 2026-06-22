@@ -172,8 +172,8 @@ def test_slr_still_settling_detects_drift() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     rising = [45.0, 47.0, 49.0, 50.5, 51.5, 52.0, 52.1, 52.2]
-    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.4) is True
-    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.45) is True
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.05) is True
+    assert SkydroidTopUdpAdapter._slr_still_settling(rising, 0.08) is True
     assert SkydroidTopUdpAdapter._slr_still_settling(rising, 2.0) is False
 
     flat = [52.0, 52.1, 52.1, 52.2, 52.2, 52.2, 52.2, 52.2]
