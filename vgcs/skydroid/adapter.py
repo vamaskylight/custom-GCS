@@ -55,7 +55,10 @@ _LRF_BASELINE_RETRIES = 8
 _LRF_BASELINE_GAP_S = 0.2
 _LRF_POST_GOT_WAIT_S = 2.5
 _LRF_SLR_SHOT_SETTLE_S = 0.45
-_LRF_SLR_FRESH_RETRIES = 3
+_LRF_GAM_APPROACH_DPS = 20.0
+_LRF_GAM_SETTLE_S = 2.0
+_LRF_GAM_AIM_TOL_DEG = 2.5
+_LRF_GAM_WAIT_S = 4.5
 _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
 _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
@@ -376,6 +379,93 @@ class SkydroidTopUdpAdapter:
         time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
         return self._read_gimbal_attitude_deg() or att
 
+    def _wait_gimbal_at_angles(
+        self,
+        yaw_tgt: float,
+        pitch_tgt: float,
+        *,
+        timeout_s: float = _LRF_GAM_WAIT_S,
+    ) -> tuple[float, float] | None:
+        deadline = time.monotonic() + max(0.5, float(timeout_s))
+        last: tuple[float, float] | None = None
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            att = self._read_gimbal_attitude_deg()
+            if att is None:
+                continue
+            last = att
+            yaw_err = abs(self._angle_err_deg(float(yaw_tgt), att[0]))
+            pitch_err = abs(self._angle_err_deg(float(pitch_tgt), att[1]))
+            if (
+                yaw_err <= _LRF_GAM_AIM_TOL_DEG
+                and pitch_err <= _LRF_GAM_AIM_TOL_DEG
+            ):
+                return att
+        return last
+
+    def _point_gimbal_at_pixel_gam(
+        self,
+        x_px: int,
+        y_px: int,
+        att_now: tuple[float, float] | None,
+    ) -> tuple[tuple[float, float] | None, bool]:
+        """Point gimbal at click via GAM absolute angles (PROTOCAL §3.3.1)."""
+        self._ensure_active_transport()
+        if att_now is None:
+            att_now = self._read_gimbal_attitude_deg()
+        if att_now is None:
+            print("[VGCS:lrf] GAM point skipped — no GAC attitude")
+            return None, False
+        dyaw, dpitch_img = self._pixel_boresight_offset_deg(x_px, y_px)
+        yaw_tgt = float(att_now[0]) + dyaw
+        pitch_tgt = max(-90.0, min(90.0, float(att_now[1]) - dpitch_img))
+        if abs(dyaw) < 0.2 and abs(dpitch_img) < 0.2:
+            return att_now, True
+        print(
+            f"[VGCS:lrf] GAM point px=({x_px},{y_px}) "
+            f"att={att_now} -> target=({yaw_tgt:.2f},{pitch_tgt:.2f}) "
+            f"offset=({dyaw:.1f}°,{dpitch_img:.1f}°)"
+        )
+        self._drop_pending_motion_commands()
+        spd = float(_LRF_GAM_APPROACH_DPS)
+        try:
+            frame = build_top_frame(
+                "GAM",
+                {
+                    "yaw": yaw_tgt,
+                    "pitch": pitch_tgt,
+                    "speed": spd,
+                    "yaw_speed": spd,
+                    "pitch_speed": spd,
+                },
+            )
+            self._transport.send_and_receive(
+                frame, expect_reply=False, log=True, timeout_s=0.12
+            )
+        except Exception as exc:
+            print(f"[VGCS:lrf] GAM point failed: {exc}")
+            return att_now, False
+        time.sleep(_LRF_GAM_SETTLE_S)
+        att_after = self._wait_gimbal_at_angles(yaw_tgt, pitch_tgt)
+        aim_ok = self._gimbal_aim_ok(
+            att_now,
+            att_after,
+            yaw_tgt=yaw_tgt,
+            pitch_tgt=pitch_tgt,
+            dyaw=dyaw,
+            dpitch=dpitch_img,
+        )
+        move_deg = (
+            self._gimbal_total_move_deg(att_now, att_after)
+            if att_after is not None
+            else 0.0
+        )
+        print(
+            f"[VGCS:lrf] GAM point done att={att_now}->{att_after} "
+            f"move={move_deg:.1f}° ok={aim_ok}"
+        )
+        return att_after, aim_ok
+
     def _send_gimbal_point_at_pixel(
         self,
         x_px: int,
@@ -689,7 +779,7 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
-        """C13: GOT+SUM at click pixel, then fresh SLR reads (no GSY slew)."""
+        """C13: GAM point at click pixel, then fresh SLR reads."""
         if not self.gimbal_telemetry_ok():
             return None
         # PROTOCAL §3.3.5: GOT coordinates are always on 1280×720 companion video.
@@ -721,13 +811,18 @@ class SkydroidTopUdpAdapter:
                     )
                     return None
 
-            print(
-                f"[VGCS:lrf] GOT track px=({x_px},{y_px}) — "
-                "align LRF to video click (no GSY slew)"
-            )
-            self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
-            time.sleep(_LRF_POST_GOT_WAIT_S)
-            att_latest = self._read_gimbal_attitude_deg() or att_before
+            pre_slr = self._query_slr_distance_m(log=True, fresh=True)
+            if pre_slr is not None:
+                print(f"[VGCS:lrf] pre-point SLR={float(pre_slr):.1f} m")
+
+            att_latest = att_before
+            if abs(dyaw) >= 0.35 or abs(dpitch_img) >= 0.35:
+                att_latest, _aim_ok = self._point_gimbal_at_pixel_gam(
+                    x_px, y_px, att_before
+                )
+                time.sleep(_LRF_SLR_SHOT_SETTLE_S)
+            else:
+                print("[VGCS:lrf] click near frame centre — skip GAM point")
 
             start_mono = time.monotonic()
             deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
@@ -815,60 +910,53 @@ class SkydroidTopUdpAdapter:
             self._transport._port = active_port
 
     def _query_slr_distance_m(self, *, log: bool = False, fresh: bool = False) -> float | None:
-        """Single SLR read — optional fresh shot (trigger + settle + read)."""
+        """Single SLR read — optional fresh shot (PROTOCAL §4.22 read fires + re-read)."""
         active_port = int(self._transport._port)
-        frames_trigger = (
-            build_slr_trigger(dest="D"),
-            build_slr_trigger(dest="E"),
-        )
         frames_read = (
             build_slr_query(dest="D"),
             build_slr_query(dest="E"),
         )
         try:
             if fresh:
-                for frame in frames_trigger:
+                for frame in frames_read:
                     try:
                         self._transport.send_and_receive(
                             frame,
                             expect_reply=True,
-                            log=log,
+                            log=False,
                             timeout_s=0.35,
                         )
                     except Exception:
                         continue
                 time.sleep(_LRF_SLR_SHOT_SETTLE_S)
             last_raw: bytes | None = None
-            for attempt in range(_LRF_SLR_FRESH_RETRIES if fresh else 1):
-                for frame in frames_read:
-                    try:
-                        reply = self._transport.send_and_receive(
-                            frame,
-                            expect_reply=True,
-                            log=log,
-                            timeout_s=0.5,
+            for frame in frames_read:
+                try:
+                    reply = self._transport.send_and_receive(
+                        frame,
+                        expect_reply=True,
+                        log=log,
+                        timeout_s=0.5,
+                    )
+                except Exception:
+                    continue
+                if not reply:
+                    continue
+                last_raw = reply
+                dist_m = parse_slr_distance_from_payload(reply)
+                if dist_m is not None:
+                    if log:
+                        hx = slr_raw_hex(reply)
+                        print(
+                            f"[VGCS:lrf] SLR reply hex={hx} "
+                            f"range={float(dist_m):.1f} m "
+                            f"raw={reply.decode('ascii', errors='ignore')!r}"
                         )
-                    except Exception:
-                        continue
-                    if not reply:
-                        continue
-                    last_raw = reply
-                    dist_m = parse_slr_distance_from_payload(reply)
-                    if dist_m is not None:
-                        if log:
-                            hx = slr_raw_hex(reply)
-                            print(
-                                f"[VGCS:lrf] SLR reply hex={hx} "
-                                f"range={float(dist_m):.1f} m "
-                                f"raw={reply.decode('ascii', errors='ignore')!r}"
-                            )
-                        if not self._lrf_locked:
-                            with self._status_lock:
-                                self._laser_range_m = float(dist_m)
-                                self._laser_range_mono = time.monotonic()
-                        return float(dist_m)
-                if fresh and attempt + 1 < _LRF_SLR_FRESH_RETRIES:
-                    time.sleep(_LRF_SLR_SHOT_SETTLE_S)
+                    if not self._lrf_locked:
+                        with self._status_lock:
+                            self._laser_range_m = float(dist_m)
+                            self._laser_range_mono = time.monotonic()
+                    return float(dist_m)
             if log and last_raw:
                 print(
                     f"[VGCS:lrf] SLR parse failed raw="
