@@ -73,8 +73,12 @@ _LRF_C13_INVERT_GSP = False
 _LRF_C13_NEGATE_IMAGE_YAW = True
 _LRF_ALIGN_MIN_OFFSET_DEG = 0.35
 _LRF_ALIGN_SPEED_DPS = 3.0
-_LRF_ALIGN_MAX_ITERS = 14
+_LRF_ALIGN_MAX_ITERS = 16
 _LRF_ALIGN_TOL_DEG = 2.5
+_LRF_ALIGN_YAW_TOL_DEG = 2.0
+_LRF_ALIGN_PITCH_TOL_DEG = 0.75
+_LRF_ALIGN_GAP_PITCH_MIN_DEG = 3.0
+_LRF_ALIGN_GAP_YAW_MIN_DEG = 6.0
 _LRF_ALIGN_MAX_TOTAL_DEG = 45.0
 _LRF_ALIGN_MAX_TOTAL_CAP_DEG = 55.0
 _LRF_HOLD_MAX_CLICK_OFFSET_DEG = 4.0
@@ -353,18 +357,20 @@ class SkydroidTopUdpAdapter:
             return False
         yaw_err = abs(self._angle_err_deg(yaw_tgt, att_end[0]))
         yaw_delta = abs(float(att_end[0]) - float(att_start[0]))
+        yaw_tol = self._align_yaw_tol_deg()
+        pitch_tol = self._align_pitch_tol_deg(float(dpitch))
         pitch_trusted = self._gac_pitch_trusted(float(att_end[1]), float(dpitch))
         if pitch_trusted:
             pitch_err = abs(self._angle_err_deg(pitch_tgt, att_end[1]))
         else:
             pitch_err = 0.0
-        if yaw_err > 2.5 and yaw_delta < abs(float(dyaw)) * 0.35:
+        if yaw_err > float(yaw_tol) and yaw_delta < abs(float(dyaw)) * 0.35:
             print(
                 f"[VGCS:lrf] gimbal missed aim yaw_err={yaw_err:.1f}° "
                 f"target={yaw_tgt:.1f} att={att_end}"
             )
             return False
-        if pitch_trusted and pitch_err > 2.5:
+        if pitch_trusted and pitch_err > float(pitch_tol):
             print(
                 f"[VGCS:lrf] gimbal missed aim pitch_err={pitch_err:.1f}° "
                 f"target={pitch_tgt:.1f} att={att_end}"
@@ -534,8 +540,68 @@ class SkydroidTopUdpAdapter:
     def _gimbal_pitch_target_deg(att_pitch: float, dpitch_image: float) -> float:
         return max(-90.0, min(90.0, float(att_pitch) - float(dpitch_image)))
 
-    def _send_gap_pitch_direct(self, pitch_tgt: float, spd: float) -> None:
-        """Absolute pitch (GAP) — used when GAC pitch telemetry stays at 0.0."""
+    @staticmethod
+    def _align_yaw_tol_deg() -> float:
+        try:
+            return float(
+                os.environ.get(
+                    "VGCS_LRF_ALIGN_YAW_TOL",
+                    str(_LRF_ALIGN_YAW_TOL_DEG),
+                )
+                or _LRF_ALIGN_YAW_TOL_DEG
+            )
+        except ValueError:
+            return float(_LRF_ALIGN_YAW_TOL_DEG)
+
+    @staticmethod
+    def _align_pitch_tol_deg(dpitch_image: float) -> float:
+        try:
+            base = float(
+                os.environ.get(
+                    "VGCS_LRF_ALIGN_PITCH_TOL",
+                    str(_LRF_ALIGN_PITCH_TOL_DEG),
+                )
+                or _LRF_ALIGN_PITCH_TOL_DEG
+            )
+        except ValueError:
+            base = float(_LRF_ALIGN_PITCH_TOL_DEG)
+        # Large vertical clicks need tighter aim than the global yaw tolerance.
+        need = abs(float(dpitch_image))
+        if need >= 12.0:
+            return min(base, 0.55)
+        if need >= 6.0:
+            return min(base, 0.65)
+        return base
+
+    def _send_gay_yaw_direct(self, yaw_tgt: float, spd: float, *, att_yaw: float = 0.0) -> None:
+        """Absolute yaw (GAY) — large horizontal clicks."""
+        self._ensure_active_transport()
+        self._drop_pending_motion_commands()
+        try:
+            self._transport.send_and_receive(
+                build_top_frame(
+                    "GAY",
+                    {"yaw": float(yaw_tgt), "speed": float(spd)},
+                ),
+                expect_reply=False,
+                log=True,
+                timeout_s=0.12,
+            )
+        except Exception:
+            pass
+        delta = abs(self._angle_err_deg(float(yaw_tgt), float(att_yaw)))
+        settle = min(3.0, delta / max(2.0, float(spd)) + 0.4)
+        time.sleep(float(settle))
+        self._gimbal_stop_hard()
+
+    def _send_gap_pitch_direct(
+        self,
+        pitch_tgt: float,
+        spd: float,
+        *,
+        att_pitch: float = 0.0,
+    ) -> None:
+        """Absolute pitch (GAP) — precise vertical aim on C13."""
         self._ensure_active_transport()
         self._drop_pending_motion_commands()
         try:
@@ -550,12 +616,47 @@ class SkydroidTopUdpAdapter:
             )
         except Exception:
             pass
-        settle = min(
-            2.8,
-            abs(float(pitch_tgt)) / max(2.0, float(spd)) + 0.35,
-        )
+        delta = abs(self._angle_err_deg(float(pitch_tgt), float(att_pitch)))
+        settle = min(3.2, delta / max(2.0, float(spd)) + 0.45)
         time.sleep(float(settle))
         self._gimbal_stop_hard()
+
+    def _refine_align_axes(
+        self,
+        att: tuple[float, float],
+        yaw_tgt: float,
+        pitch_tgt: float,
+        dyaw_image: float,
+        dpitch_image: float,
+        *,
+        spd: float = _LRF_ALIGN_SPEED_DPS,
+    ) -> tuple[float, float]:
+        """Final GAY/GAP nudge when iterative bursts stop short of click."""
+        att_now = self._read_gimbal_attitude_deg() or att
+        yaw_tol = self._align_yaw_tol_deg()
+        pitch_tol = self._align_pitch_tol_deg(dpitch_image)
+        yaw_err = self._angle_err_deg(float(yaw_tgt), float(att_now[0]))
+        pitch_err = self._angle_err_deg(float(pitch_tgt), float(att_now[1]))
+        if abs(float(pitch_err)) > float(pitch_tol):
+            print(
+                f"[VGCS:lrf] refine pitch GAP {float(att_now[1]):.1f}° "
+                f"-> {float(pitch_tgt):.1f}° (err={float(pitch_err):+.1f}°)"
+            )
+            self._send_gap_pitch_direct(
+                float(pitch_tgt), float(spd), att_pitch=float(att_now[1])
+            )
+            att_now = self._read_gimbal_attitude_deg() or att_now
+            pitch_err = self._angle_err_deg(float(pitch_tgt), float(att_now[1]))
+        if abs(float(yaw_err)) > float(yaw_tol):
+            print(
+                f"[VGCS:lrf] refine yaw GAY {float(att_now[0]):.1f}° "
+                f"-> {float(yaw_tgt):.1f}° (err={float(yaw_err):+.1f}°)"
+            )
+            self._send_gay_yaw_direct(
+                float(yaw_tgt), float(spd), att_yaw=float(att_now[0])
+            )
+            att_now = self._read_gimbal_attitude_deg() or att_now
+        return att_now
 
     def _align_aim_satisfied(
         self,
@@ -565,21 +666,24 @@ class SkydroidTopUdpAdapter:
         dpitch: float,
         *,
         pitch_open_sent_deg: float = 0.0,
+        dyaw: float = 0.0,
     ) -> bool:
         """Strict post-align check — must be on target, not merely 'moved a bit'."""
         if att is None:
             return False
+        yaw_tol = self._align_yaw_tol_deg()
+        pitch_tol = self._align_pitch_tol_deg(float(dpitch))
         yaw_err = abs(self._angle_err_deg(float(yaw_tgt), float(att[0])))
         pitch_err = abs(self._angle_err_deg(float(pitch_tgt), float(att[1])))
         pitch_trusted = self._gac_pitch_trusted(float(att[1]), float(dpitch))
-        if yaw_err > _LRF_ALIGN_TOL_DEG:
+        if yaw_err > float(yaw_tol):
             print(
                 f"[VGCS:lrf] align miss yaw_err={yaw_err:.1f}° "
                 f"(target={float(yaw_tgt):.1f} att={float(att[0]):.1f})"
             )
             return False
         if pitch_trusted:
-            if pitch_err > _LRF_ALIGN_TOL_DEG:
+            if pitch_err > float(pitch_tol):
                 print(
                     f"[VGCS:lrf] align miss pitch_err={pitch_err:.1f}° "
                     f"(target={float(pitch_tgt):.1f} att={float(att[1]):.1f})"
@@ -701,12 +805,16 @@ class SkydroidTopUdpAdapter:
         pitch_open_sent = 0.0
         pitch_need_deg = abs(float(dpitch0))
         gap_pitch_sent = False
+        gap_yaw_sent = False
+        yaw_tol = self._align_yaw_tol_deg()
+        pitch_tol = self._align_pitch_tol_deg(float(dpitch0))
         move_cap = self._align_move_cap_deg(float(need))
         print(
             f"[VGCS:lrf] align laser px=({x_px},{y_px}) "
             f"-> ({yaw_tgt:.1f},{pitch_tgt:.1f}) "
             f"offset=({dyaw0:.1f}°,{dpitch0:.1f}°) "
             f"gac_yaw=({self._image_yaw_to_gac_delta(dyaw0):+.1f}°) "
+            f"tol=(yaw={yaw_tol:.2f}°,pitch={pitch_tol:.2f}°) "
             f"cap={move_cap:.0f}°"
         )
         for n in range(int(_LRF_ALIGN_MAX_ITERS)):
@@ -715,9 +823,9 @@ class SkydroidTopUdpAdapter:
             yaw_err = self._angle_err_deg(yaw_tgt, att[0])
             pitch_err = self._angle_err_deg(pitch_tgt, att[1])
             pitch_trusted = self._gac_pitch_trusted(float(att[1]), float(dpitch0))
-            yaw_ok = abs(float(yaw_err)) <= _LRF_ALIGN_TOL_DEG
+            yaw_ok = abs(float(yaw_err)) <= float(yaw_tol)
             if pitch_trusted:
-                pitch_ok = abs(float(pitch_err)) <= _LRF_ALIGN_TOL_DEG
+                pitch_ok = abs(float(pitch_err)) <= float(pitch_tol)
             else:
                 pitch_ok = pitch_open_sent >= pitch_need_deg * 0.88
             if yaw_ok and pitch_ok:
@@ -730,42 +838,28 @@ class SkydroidTopUdpAdapter:
                 )
                 break
 
-            pitch_residual = (
-                abs(float(pitch_err))
-                if pitch_trusted
-                else max(0.0, pitch_need_deg - pitch_open_sent)
-            )
-
-            if not yaw_ok and (
-                pitch_ok or abs(float(yaw_err)) >= float(pitch_residual)
-            ):
-                spur = float(spd)
-                if abs(float(yaw_err)) < 6.0:
-                    spur = min(spur, max(1.5, abs(float(yaw_err)) * 1.15))
-                dur = min(
-                    float(_LRF_GIMBAL_AXIS_MAX_S),
-                    abs(float(yaw_err)) / max(1.5, spur) * 0.88 + 0.08,
-                )
-                rate = self._gsy_yaw_rate_for_offset(float(yaw_err), spur)
-                print(
-                    f"[VGCS:lrf] align yaw err={yaw_err:+.1f}° "
-                    f"burst {rate:+.1f}°/s dur={dur:.2f}s"
-                )
-                self._hold_speed_direct_burst(rate, 0.0, dur)
-            elif not pitch_ok:
+            if not pitch_ok:
                 spur = float(spd)
                 if pitch_trusted and abs(float(pitch_err)) < 6.0:
-                    spur = min(spur, max(1.5, abs(float(pitch_err)) * 1.15))
-                if (
+                    spur = min(spur, max(1.5, abs(float(pitch_err)) * 1.2))
+                use_gap = (
+                    pitch_need_deg >= float(_LRF_ALIGN_GAP_PITCH_MIN_DEG)
+                    and not gap_pitch_sent
+                )
+                if use_gap or (
                     not pitch_trusted
                     and pitch_need_deg >= 1.0
                     and not gap_pitch_sent
                 ):
                     print(
                         f"[VGCS:lrf] align pitch GAP -> {pitch_tgt:.1f}° "
-                        f"(GAC pitch untrusted)"
+                        f"(need={pitch_need_deg:.1f}°)"
                     )
-                    self._send_gap_pitch_direct(float(pitch_tgt), spur)
+                    self._send_gap_pitch_direct(
+                        float(pitch_tgt),
+                        spur,
+                        att_pitch=float(att[1]),
+                    )
                     gap_pitch_sent = True
                     pitch_open_sent = max(
                         pitch_open_sent, pitch_need_deg * 0.95
@@ -783,7 +877,7 @@ class SkydroidTopUdpAdapter:
                         need_d = max(0.0, pitch_need_deg - pitch_open_sent)
                     dur = min(
                         float(_LRF_GIMBAL_AXIS_MAX_S),
-                        need_d / max(1.5, spur) * 0.88 + 0.08,
+                        need_d / max(1.5, spur) * 0.95 + 0.10,
                     )
                     print(
                         f"[VGCS:lrf] align pitch "
@@ -793,6 +887,33 @@ class SkydroidTopUdpAdapter:
                     )
                     self._hold_speed_direct_burst(0.0, rate, dur)
                     pitch_open_sent += spur * dur
+            elif not yaw_ok:
+                spur = float(spd)
+                if abs(float(yaw_err)) < 6.0:
+                    spur = min(spur, max(1.5, abs(float(yaw_err)) * 1.15))
+                if (
+                    abs(float(dyaw0)) >= float(_LRF_ALIGN_GAP_YAW_MIN_DEG)
+                    and not gap_yaw_sent
+                ):
+                    print(
+                        f"[VGCS:lrf] align yaw GAY -> {yaw_tgt:.1f}° "
+                        f"(need={abs(float(dyaw0)):.1f}°)"
+                    )
+                    self._send_gay_yaw_direct(
+                        float(yaw_tgt), spur, att_yaw=float(att[0])
+                    )
+                    gap_yaw_sent = True
+                else:
+                    dur = min(
+                        float(_LRF_GIMBAL_AXIS_MAX_S),
+                        abs(float(yaw_err)) / max(1.5, spur) * 0.95 + 0.10,
+                    )
+                    rate = self._gsy_yaw_rate_for_offset(float(yaw_err), spur)
+                    print(
+                        f"[VGCS:lrf] align yaw err={yaw_err:+.1f}° "
+                        f"burst {rate:+.1f}°/s dur={dur:.2f}s"
+                    )
+                    self._hold_speed_direct_burst(rate, 0.0, dur)
             else:
                 break
 
@@ -803,13 +924,21 @@ class SkydroidTopUdpAdapter:
                 total_move += self._gimbal_total_move_deg(att, att_new)
                 att = att_new
 
-        att_end = self._read_gimbal_attitude_deg() or att
+        att_end = self._refine_align_axes(
+            att,
+            float(yaw_tgt),
+            float(pitch_tgt),
+            float(dyaw0),
+            float(dpitch0),
+            spd=float(spd),
+        )
         aim_ok = self._align_aim_satisfied(
             att_end,
             float(yaw_tgt),
             float(pitch_tgt),
             float(dpitch0),
             pitch_open_sent_deg=float(pitch_open_sent),
+            dyaw=float(dyaw0),
         )
         move = self._gimbal_total_move_deg(att_start, att_end)
         print(
