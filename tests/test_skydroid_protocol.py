@@ -126,12 +126,15 @@ def test_cam_zoom_maps_to_dzm_not_legacy() -> None:
 def test_build_slr_query_matches_protocal_doc() -> None:
     from vgcs.skydroid.protocol import (
         build_slr_query,
+        build_slr_trigger,
         decode_slr_distance_m,
         parse_slr_distance_from_payload,
         parse_top_frame,
+        slr_raw_hex,
     )
 
     assert build_slr_query() == b"#TPUD2rSLR0055"
+    assert build_slr_trigger() == b"#TPUD2wSLR015B"
     dec = parse_top_frame(b"#TPUD4rSLR0005BC")
     assert dec is not None
     assert dec.command == "SLR"
@@ -139,8 +142,10 @@ def test_build_slr_query_matches_protocal_doc() -> None:
     assert decode_slr_distance_m("0032") == 5.0
     assert decode_slr_distance_m("0064") == 10.0
     assert decode_slr_distance_m("0140") == 32.0
-    assert decode_slr_distance_m("2710") == 1000.0
+    assert decode_slr_distance_m("0208") == 52.0
     assert parse_slr_distance_from_payload(b"#TPUD4rSLR0140BC") == 32.0
+    assert parse_slr_distance_from_payload(b"#TPUD4rSLR0208BC") == 52.0
+    assert slr_raw_hex(b"#TPUD4rSLR0208BC") == "0208"
 
 
 def test_build_got_and_sum_match_protocal_doc() -> None:
@@ -257,29 +262,20 @@ def test_slr_median_and_converged() -> None:
     assert SkydroidTopUdpAdapter._slr_converged(climbing) is None
 
 
-def test_try_accept_current_aim_slr_accepts_stable_baseline() -> None:
+def test_try_accept_stable_slr_accepts_converged_samples() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     adapter = SkydroidTopUdpAdapter()
-    att = (-27.29, 0.0)
-    samples = [42.0, 42.1, 42.2, 42.2, 42.1]
-    got = adapter._try_accept_current_aim_slr(
-        samples, 42.2, att, att, elapsed=2.0
-    )
+    samples = [51.8, 52.0, 52.1, 52.0, 52.0]
+    got = adapter._try_accept_stable_slr(samples, elapsed=2.0)
     assert got is not None
-    assert abs(float(got) - 42.2) < 0.5
+    assert abs(float(got) - 52.0) < 0.5
 
 
-def test_try_accept_current_aim_slr_rejects_gimbal_motion() -> None:
+def test_try_accept_stable_slr_rejects_climbing() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     adapter = SkydroidTopUdpAdapter()
-    samples = [42.0, 42.1, 42.2, 42.2, 42.1]
-    got = adapter._try_accept_current_aim_slr(
-        samples,
-        42.2,
-        (-27.29, 0.0),
-        (-46.0, 0.0),
-        elapsed=2.0,
-    )
+    climbing = [30.0, 40.0, 50.0, 51.0, 52.0]
+    got = adapter._try_accept_stable_slr(climbing, elapsed=2.0)
     assert got is None

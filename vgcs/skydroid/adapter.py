@@ -13,12 +13,14 @@ from vgcs.skydroid.protocol import (
     build_gimbal_speed,
     build_got_target,
     build_slr_query,
+    build_slr_trigger,
     build_sum_track,
     build_top_frame,
     build_zoom_command_burst,
     decode_slr_distance_m,
     extract_attitude_deg,
     parse_slr_distance_from_payload,
+    slr_raw_hex,
     parse_top_frame,
     _LRF_FRAME_H,
     _LRF_FRAME_W,
@@ -51,7 +53,9 @@ _LRF_POST_MOVE_SETTLE_S = 4.0
 _LRF_GOT_RESEND_INTERVAL_S = 2.0
 _LRF_BASELINE_RETRIES = 8
 _LRF_BASELINE_GAP_S = 0.2
-_LRF_POST_GOT_WAIT_S = 2.0
+_LRF_POST_GOT_WAIT_S = 2.5
+_LRF_SLR_SHOT_SETTLE_S = 0.45
+_LRF_SLR_FRESH_RETRIES = 3
 _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
 _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
@@ -529,30 +533,22 @@ class SkydroidTopUdpAdapter:
             return False
         return abs(float(value_m) - float(baseline_m)) >= float(min_m)
 
-    def _try_accept_current_aim_slr(
+    def _try_accept_stable_slr(
         self,
         samples: list[float],
-        baseline_m: float | None,
-        att_before: tuple[float, float] | None,
-        att_now: tuple[float, float] | None,
         *,
         elapsed: float,
     ) -> float | None:
-        """Accept stable SLR at current gimbal aim (manual pre-aim — no auto-slew)."""
-        if baseline_m is None or len(samples) < _LRF_CONVERGE_SAMPLES:
+        """Accept a stable post-GOT SLR median (no stale-baseline gate)."""
+        if len(samples) < _LRF_CONVERGE_SAMPLES:
             return None
         if float(elapsed) < _LRF_LOCK_MIN_WAIT_S:
             return None
-        if att_before is not None and att_now is not None:
-            if self._gimbal_attitude_moved(att_before, att_now) is True:
-                return None
         tail = [float(v) for v in samples[-_LRF_CONVERGE_SAMPLES:]]
         converged = self._slr_converged(tail, _LRF_CONVERGE_SAMPLES)
         if converged is None:
             return None
         if self._slr_still_climbing(tail[-3:]):
-            return None
-        if abs(float(converged) - float(baseline_m)) > _LRF_MOVED_MIN_M:
             return None
         return float(converged)
 
@@ -634,7 +630,7 @@ class SkydroidTopUdpAdapter:
 
         while time.monotonic() < deadline and len(buf) < _LRF_REFINE_SAMPLES:
             time.sleep(_LRF_LOCK_POLL_S)
-            reading = self._query_slr_distance_m(log=False)
+            reading = self._query_slr_distance_m(log=False, fresh=True)
             if reading is None:
                 continue
             buf.append(float(reading))
@@ -662,19 +658,6 @@ class SkydroidTopUdpAdapter:
         if baseline_m is None:
             return False
         return abs(float(value_m) - float(baseline_m)) >= _LRF_MOVED_MIN_M
-
-    def _read_slr_baseline_m(self) -> float | None:
-        """Median of several pre-lock SLR reads — required before accepting any lock."""
-        readings: list[float] = []
-        for _ in range(_LRF_BASELINE_RETRIES):
-            reading = self._query_slr_distance_m(log=False)
-            if reading is not None:
-                readings.append(float(reading))
-            time.sleep(_LRF_BASELINE_GAP_S)
-        if not readings:
-            return None
-        tail = readings[-min(5, len(readings)) :]
-        return float(self._slr_median(tail))
 
     def _read_gimbal_attitude_deg(self) -> tuple[float, float] | None:
         active_port = int(self._transport._port)
@@ -706,7 +689,7 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
-        """C13: confirm SLR at current gimbal aim after video click (no auto-slew)."""
+        """C13: GOT+SUM at click pixel, then fresh SLR reads (no GSY slew)."""
         if not self.gimbal_telemetry_ok():
             return None
         # PROTOCAL §3.3.5: GOT coordinates are always on 1280×720 companion video.
@@ -717,61 +700,39 @@ class SkydroidTopUdpAdapter:
         self._ensure_active_transport()
         active_port = int(self._active_port)
         dist_m: float | None = None
+        samples: list[float] = []
         try:
             with self._status_lock:
                 self._laser_range_m = None
                 self._laser_range_mono = 0.0
                 self._lrf_locked_distance_m = None
 
-            baseline_m = self._read_slr_baseline_m()
             att_before = self._read_gimbal_attitude_deg()
             dyaw, dpitch_img = self._pixel_boresight_offset_deg(x_px, y_px)
-            yaw_tgt = (
-                float(att_before[0]) + dyaw if att_before is not None else dyaw
-            )
-            pitch_tgt = (
-                max(-90.0, min(90.0, float(att_before[1]) - dpitch_img))
-                if att_before is not None
-                else 0.0
-            )
             print(
                 f"[VGCS:lrf] lock start px=({x_px},{y_px}) "
-                f"baseline={baseline_m} att={att_before} "
-                f"offset=({dyaw:.1f}°,{dpitch_img:.1f}°)"
+                f"att={att_before} offset=({dyaw:.1f}°,{dpitch_img:.1f}°)"
             )
-            if baseline_m is None:
-                print(
-                    "[VGCS:lrf] lock failed — cannot read SLR baseline (check C13 TOP link)"
-                )
-                return None
 
-            if on_sample is not None:
-                try:
-                    on_sample(float(baseline_m))
-                except Exception:
-                    pass
+            if self._query_slr_distance_m(log=False, fresh=False) is None:
+                if self._query_slr_distance_m(log=True, fresh=True) is None:
+                    print(
+                        "[VGCS:lrf] lock failed — cannot read SLR (check C13 TOP link)"
+                    )
+                    return None
 
-            # C13 SLR reads along the laser boresight at the current gimbal attitude.
-            # Re-slewing from pixel offset would move the laser off a manually aimed point
-            # whenever the target is off video centre (common after operator alignment).
             print(
-                "[VGCS:lrf] hold gimbal — confirming SLR at current aim "
-                f"(baseline={baseline_m:.1f} m)"
+                f"[VGCS:lrf] GOT track px=({x_px},{y_px}) — "
+                "align LRF to video click (no GSY slew)"
             )
-            att_latest = att_before
-            gimbal_slew_mono: float | None = None
+            self._send_got_track(x_px, y_px, frame_w=fw, frame_h=fh)
+            time.sleep(_LRF_POST_GOT_WAIT_S)
+            att_latest = self._read_gimbal_attitude_deg() or att_before
 
-            samples: list[float] = []
             start_mono = time.monotonic()
             deadline = start_mono + _LRF_LOCK_MAX_WAIT_S
-            move_mono: float | None = None
 
-            def _emit_sample(
-                value_m: float,
-                att_now: tuple[float, float] | None,
-                *,
-                force: bool = False,
-            ) -> None:
+            def _emit_sample(value_m: float) -> None:
                 if on_sample is None:
                     return
                 try:
@@ -781,159 +742,48 @@ class SkydroidTopUdpAdapter:
 
             while time.monotonic() < deadline:
                 elapsed = time.monotonic() - start_mono
-
                 time.sleep(_LRF_LOCK_POLL_S)
-                reading = self._query_slr_distance_m(log=False)
+                reading = self._query_slr_distance_m(
+                    log=len(samples) == 0,
+                    fresh=True,
+                )
                 if reading is None:
                     continue
                 samples.append(float(reading))
                 att_now = self._read_gimbal_attitude_deg()
                 if att_now is not None:
                     att_latest = att_now
-                _emit_sample(float(reading), att_now)
-                print(f"[VGCS:lrf] SLR sample {reading:.1f} m (n={len(samples)}, t={elapsed:.1f}s)")
+                _emit_sample(float(reading))
+                print(
+                    f"[VGCS:lrf] SLR sample {reading:.1f} m "
+                    f"(n={len(samples)}, t={elapsed:.1f}s)"
+                )
 
                 if elapsed < _LRF_LOCK_MIN_WAIT_S:
                     continue
 
-                gimbal_moved = self._gimbal_attitude_moved(att_before, att_now)
-                slr_moved = self._slr_samples_moved_from_baseline(samples, baseline_m)
-
-                current_aim = self._try_accept_current_aim_slr(
-                    samples,
-                    baseline_m,
-                    att_before,
-                    att_now,
-                    elapsed=elapsed,
-                )
-                if current_aim is not None:
+                stable = self._try_accept_stable_slr(samples, elapsed=elapsed)
+                if stable is not None:
                     print(
-                        f"[VGCS:lrf] lock at current aim {current_aim:.1f} m "
-                        f"(baseline={baseline_m:.1f} m, att={att_before})"
+                        f"[VGCS:lrf] lock stable {stable:.1f} m "
+                        f"(att={att_before}->{att_latest})"
                     )
-                    dist_m = self._refine_slr_estimate(on_sample) or float(current_aim)
-                    _emit_sample(float(dist_m), att_now, force=True)
+                    dist_m = self._refine_slr_estimate(on_sample) or float(stable)
+                    _emit_sample(float(dist_m))
                     break
-
-                gimbal_accept = self._try_accept_gimbal_slew_slr(
-                    samples,
-                    baseline_m,
-                    att_before,
-                    att_now,
-                    gimbal_slew_mono=gimbal_slew_mono,
-                    yaw_tgt=yaw_tgt,
-                    pitch_tgt=pitch_tgt,
-                    dyaw=dyaw,
-                    dpitch=dpitch_img,
-                )
-                if gimbal_accept is not None:
-                    print(
-                        f"[VGCS:lrf] gimbal-slew lock {gimbal_accept:.1f} m "
-                        f"(baseline={baseline_m}, move="
-                        f"{self._gimbal_total_move_deg(att_before, att_now):.1f}°)"
-                    )
-                    dist_m = self._refine_slr_estimate(on_sample) or float(gimbal_accept)
-                    _emit_sample(float(dist_m), att_now, force=True)
-                    break
-
-                if gimbal_moved is False and not slr_moved and gimbal_slew_mono is None:
-                    continue
-
-                if not slr_moved:
-                    if gimbal_moved is True:
-                        print(
-                            f"[VGCS:lrf] gimbal slewed but SLR still {reading:.1f} m "
-                            f"(baseline={baseline_m:.1f} m) — waiting for laser…"
-                        )
-                    continue
-
-                post = self._slr_post_move_samples(samples, baseline_m)
-                if not post:
-                    continue
-                if move_mono is None:
-                    move_mono = time.monotonic()
-                elapsed_since_move = time.monotonic() - float(move_mono)
-
-                converged = self._slr_converged(post, _LRF_CONVERGE_SAMPLES)
-                if converged is None:
-                    continue
-                if self._slr_still_settling(post, elapsed_since_move):
-                    continue
-                if not self._slr_moved_from_baseline(converged, baseline_m):
-                    continue
-                if gimbal_moved is False:
-                    continue
-
-                print(
-                    f"[VGCS:lrf] tracker slew ok {converged:.1f} m "
-                    f"(baseline={baseline_m}, att={att_before}->{att_now}, "
-                    f"t={elapsed:.1f}s, since_move={elapsed_since_move:.1f}s)"
-                )
-                dist_m = self._refine_slr_estimate(on_sample)
-                if dist_m is None:
-                    dist_m = float(converged)
-                break
 
             if dist_m is None and samples:
-                post = self._slr_post_move_samples(samples, baseline_m)
-                att_now = att_latest
-                gimbal_moved = self._gimbal_attitude_moved(att_before, att_now)
-                current_aim = self._try_accept_current_aim_slr(
+                stable = self._try_accept_stable_slr(
                     samples,
-                    baseline_m,
-                    att_before,
-                    att_now,
                     elapsed=time.monotonic() - start_mono,
                 )
-                if current_aim is not None:
-                    dist_m = self._refine_slr_estimate(on_sample) or float(current_aim)
-                gimbal_accept = self._try_accept_gimbal_slew_slr(
-                    samples,
-                    baseline_m,
-                    att_before,
-                    att_now,
-                    gimbal_slew_mono=gimbal_slew_mono,
-                    yaw_tgt=yaw_tgt,
-                    pitch_tgt=pitch_tgt,
-                    dyaw=dyaw,
-                    dpitch=dpitch_img,
-                )
-                if gimbal_accept is not None:
-                    dist_m = self._refine_slr_estimate(on_sample) or float(gimbal_accept)
-                elif post and move_mono is not None and gimbal_moved is not False:
-                    converged = self._slr_converged(
-                        post, min(_LRF_CONVERGE_SAMPLES, len(post))
+                if stable is not None:
+                    dist_m = self._refine_slr_estimate(on_sample) or float(stable)
+                else:
+                    print(
+                        f"[VGCS:lrf] lock rejected — SLR did not stabilize "
+                        f"(samples={samples[-5:]})"
                     )
-                    if (
-                        converged is not None
-                        and self._slr_moved_from_baseline(converged, baseline_m)
-                        and not self._slr_still_climbing(post[-min(4, len(post)):])
-                    ):
-                        dist_m = self._refine_slr_estimate(on_sample) or float(converged)
-                if dist_m is None:
-                    gimbal_deg = self._gimbal_total_move_deg(att_before, att_now)
-                    if gimbal_deg >= _LRF_GIMBAL_ACCEPT_MIN_DEG:
-                        print(
-                            f"[VGCS:lrf] lock rejected — gimbal moved {gimbal_deg:.1f}° "
-                            f"during lock (baseline={baseline_m:.1f} m)"
-                        )
-                    elif not self._slr_samples_moved_from_baseline(samples, baseline_m):
-                        stable = self._slr_converged(
-                            samples[-_LRF_CONVERGE_SAMPLES:],
-                            min(_LRF_CONVERGE_SAMPLES, len(samples)),
-                        )
-                        if stable is not None and abs(stable - float(baseline_m)) <= _LRF_STABLE_EPS_M:
-                            dist_m = self._refine_slr_estimate(on_sample) or float(stable)
-                        else:
-                            print(
-                                f"[VGCS:lrf] lock rejected — SLR did not stabilize near "
-                                f"baseline {baseline_m:.1f} m"
-                            )
-                    else:
-                        print(
-                            f"[VGCS:lrf] lock rejected — range moved but did not settle "
-                            f"(baseline={baseline_m}, last={samples[-1]:.1f} m)"
-                        )
 
             with self._status_lock:
                 if dist_m is not None:
@@ -953,7 +803,7 @@ class SkydroidTopUdpAdapter:
             else:
                 print(
                     f"[VGCS:lrf] lock failed — no stable range "
-                    f"(samples={len(samples)}, baseline={baseline_m})"
+                    f"(samples={len(samples)})"
                 )
             return dist_m
         except Exception as exc:
@@ -964,25 +814,67 @@ class SkydroidTopUdpAdapter:
         finally:
             self._transport._port = active_port
 
-    def _query_slr_distance_m(self, *, log: bool = False) -> float | None:
-        """Single SLR read — returns distance parsed from this reply only (no stale cache)."""
+    def _query_slr_distance_m(self, *, log: bool = False, fresh: bool = False) -> float | None:
+        """Single SLR read — optional fresh shot (trigger + settle + read)."""
         active_port = int(self._transport._port)
+        frames_trigger = (
+            build_slr_trigger(dest="D"),
+            build_slr_trigger(dest="E"),
+        )
+        frames_read = (
+            build_slr_query(dest="D"),
+            build_slr_query(dest="E"),
+        )
         try:
-            frame = build_slr_query()
-            reply = self._transport.send_and_receive(
-                frame,
-                expect_reply=True,
-                log=log,
-                timeout_s=0.5,
-            )
-            if not reply:
-                return None
-            dist_m = parse_slr_distance_from_payload(reply)
-            if dist_m is not None and not self._lrf_locked:
-                with self._status_lock:
-                    self._laser_range_m = float(dist_m)
-                    self._laser_range_mono = time.monotonic()
-            return dist_m
+            if fresh:
+                for frame in frames_trigger:
+                    try:
+                        self._transport.send_and_receive(
+                            frame,
+                            expect_reply=True,
+                            log=log,
+                            timeout_s=0.35,
+                        )
+                    except Exception:
+                        continue
+                time.sleep(_LRF_SLR_SHOT_SETTLE_S)
+            last_raw: bytes | None = None
+            for attempt in range(_LRF_SLR_FRESH_RETRIES if fresh else 1):
+                for frame in frames_read:
+                    try:
+                        reply = self._transport.send_and_receive(
+                            frame,
+                            expect_reply=True,
+                            log=log,
+                            timeout_s=0.5,
+                        )
+                    except Exception:
+                        continue
+                    if not reply:
+                        continue
+                    last_raw = reply
+                    dist_m = parse_slr_distance_from_payload(reply)
+                    if dist_m is not None:
+                        if log:
+                            hx = slr_raw_hex(reply)
+                            print(
+                                f"[VGCS:lrf] SLR reply hex={hx} "
+                                f"range={float(dist_m):.1f} m "
+                                f"raw={reply.decode('ascii', errors='ignore')!r}"
+                            )
+                        if not self._lrf_locked:
+                            with self._status_lock:
+                                self._laser_range_m = float(dist_m)
+                                self._laser_range_mono = time.monotonic()
+                        return float(dist_m)
+                if fresh and attempt + 1 < _LRF_SLR_FRESH_RETRIES:
+                    time.sleep(_LRF_SLR_SHOT_SETTLE_S)
+            if log and last_raw:
+                print(
+                    f"[VGCS:lrf] SLR parse failed raw="
+                    f"{last_raw.decode('ascii', errors='ignore')!r}"
+                )
+            return None
         except Exception:
             return None
         finally:
