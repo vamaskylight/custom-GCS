@@ -69,6 +69,7 @@ _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
 _LRF_GIMBAL_AXIS_MAX_S = 1.8
 _LRF_GIMBAL_SLEW_SCALE = 0.90
 _LRF_C13_INVERT_GSY = True
+_LRF_C13_NEGATE_IMAGE_YAW = True
 _LRF_ALIGN_MIN_OFFSET_DEG = 0.35
 _LRF_ALIGN_SPEED_DPS = 3.0
 _LRF_ALIGN_MAX_ITERS = 14
@@ -401,6 +402,37 @@ class SkydroidTopUdpAdapter:
         )
 
     @staticmethod
+    def _c13_negate_image_yaw() -> bool:
+        """C13 GAC yaw axis is opposite companion-video horizontal (field firmware)."""
+        if str(os.environ.get("VGCS_LRF_NEGATE_YAW_DELTA", "") or "").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return False
+        if str(os.environ.get("VGCS_LRF_NEGATE_YAW_DELTA", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return True
+        return bool(_LRF_C13_NEGATE_IMAGE_YAW)
+
+    @staticmethod
+    def _image_yaw_to_gac_delta(dyaw_image: float) -> float:
+        """Map video-frame yaw offset (right = +) to GAC yaw delta."""
+        d = float(dyaw_image)
+        if SkydroidTopUdpAdapter._c13_negate_image_yaw():
+            d = -d
+        return d
+
+    @staticmethod
+    def _gimbal_yaw_target_deg(att_yaw: float, dyaw_image: float) -> float:
+        return float(att_yaw) + SkydroidTopUdpAdapter._image_yaw_to_gac_delta(dyaw_image)
+
+    @staticmethod
     def _c13_invert_gsy() -> bool:
         if str(os.environ.get("VGCS_LRF_INVERT_GSY", "") or "").strip().lower() in (
             "0",
@@ -519,9 +551,10 @@ class SkydroidTopUdpAdapter:
         spd = max(2.0, float(speed_dps))
         expected = self._expected_offset_deg(dyaw, dpitch)
         att: tuple[float, float] | None = att_start
-        if abs(float(dyaw)) >= 0.3:
-            yaw_r = self._gsy_yaw_rate_for_offset(dyaw, spd)
-            dur_y = self._axis_burst_duration_s(dyaw, spd)
+        gac_dyaw = self._image_yaw_to_gac_delta(dyaw)
+        if abs(float(gac_dyaw)) >= 0.3:
+            yaw_r = self._gsy_yaw_rate_for_offset(gac_dyaw, spd)
+            dur_y = self._axis_burst_duration_s(gac_dyaw, spd)
             print(f"[VGCS:lrf] yaw burst {yaw_r:+.1f}°/s dur={dur_y:.2f}s")
             self._hold_speed_direct_burst(yaw_r, 0.0, dur_y)
             self._gimbal_stop_hard()
@@ -554,7 +587,7 @@ class SkydroidTopUdpAdapter:
         if need < _LRF_ALIGN_MIN_OFFSET_DEG:
             return att_start, True, float(dyaw0), float(dpitch0)
 
-        yaw_tgt = float(att_start[0]) + float(dyaw0)
+        yaw_tgt = self._gimbal_yaw_target_deg(float(att_start[0]), float(dyaw0))
         pitch_tgt = max(-90.0, min(90.0, float(att_start[1]) - float(dpitch0)))
         spd = float(_LRF_ALIGN_SPEED_DPS)
         att: tuple[float, float] = att_start
@@ -562,7 +595,9 @@ class SkydroidTopUdpAdapter:
         move_cap = self._align_move_cap_deg(float(need))
         print(
             f"[VGCS:lrf] align laser px=({x_px},{y_px}) "
-            f"-> ({yaw_tgt:.1f},{pitch_tgt:.1f}) offset=({dyaw0:.1f}°,{dpitch0:.1f}°) "
+            f"-> ({yaw_tgt:.1f},{pitch_tgt:.1f}) "
+            f"offset=({dyaw0:.1f}°,{dpitch0:.1f}°) "
+            f"gac_yaw=({self._image_yaw_to_gac_delta(dyaw0):+.1f}°) "
             f"cap={move_cap:.0f}°"
         )
         for n in range(int(_LRF_ALIGN_MAX_ITERS)):
@@ -587,11 +622,14 @@ class SkydroidTopUdpAdapter:
                 break
 
             if not yaw_ok and (pitch_ok or abs(float(yaw_err)) >= abs(float(pitch_err))):
+                spur = float(spd)
+                if abs(float(yaw_err)) < 6.0:
+                    spur = min(spur, max(1.5, abs(float(yaw_err)) * 1.15))
                 dur = min(
                     float(_LRF_GIMBAL_AXIS_MAX_S),
-                    abs(float(yaw_err)) / spd * 0.90 + 0.10,
+                    abs(float(yaw_err)) / max(1.5, spur) * 0.88 + 0.08,
                 )
-                rate = self._gsy_yaw_rate_for_offset(float(yaw_err), spd)
+                rate = self._gsy_yaw_rate_for_offset(float(yaw_err), spur)
                 print(
                     f"[VGCS:lrf] align yaw err={yaw_err:+.1f}° "
                     f"burst {rate:+.1f}°/s dur={dur:.2f}s"
@@ -667,7 +705,7 @@ class SkydroidTopUdpAdapter:
             print("[VGCS:lrf] GAM point skipped — no GAC attitude")
             return None, False
         dyaw, dpitch_img = self._pixel_boresight_offset_deg(x_px, y_px)
-        yaw_tgt = float(att_now[0]) + dyaw
+        yaw_tgt = self._gimbal_yaw_target_deg(float(att_now[0]), dyaw)
         pitch_tgt = max(-90.0, min(90.0, float(att_now[1]) - dpitch_img))
         if abs(dyaw) < 0.2 and abs(dpitch_img) < 0.2:
             return att_now, True
@@ -734,7 +772,7 @@ class SkydroidTopUdpAdapter:
             print("[VGCS:lrf] gimbal slew skipped — no GAC attitude")
             return None, False
         dyaw, dpitch_img = self._pixel_boresight_offset_deg(x_px, y_px)
-        yaw_tgt = float(att_now[0]) + dyaw
+        yaw_tgt = self._gimbal_yaw_target_deg(float(att_now[0]), dyaw)
         pitch_tgt = max(-90.0, min(90.0, float(att_now[1]) - dpitch_img))
         if abs(dyaw) < 0.2 and abs(dpitch_img) < 0.2:
             return att_now, True
@@ -1331,7 +1369,9 @@ class SkydroidTopUdpAdapter:
                         self._align_laser_boresight_to_pixel(x_px, y_px, att_before)
                     )
                     att_lock_ref = att_after or att_before
-                    yaw_tgt = float(att_before[0]) + float(align_dyaw)
+                    yaw_tgt = self._gimbal_yaw_target_deg(
+                        float(att_before[0]), float(align_dyaw)
+                    )
                     pitch_tgt = max(
                         -90.0,
                         min(90.0, float(att_before[1]) - float(align_dpitch)),

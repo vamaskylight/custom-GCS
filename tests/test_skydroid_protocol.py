@@ -288,6 +288,31 @@ def test_gsy_yaw_rate_inverted_on_c13() -> None:
     assert SkydroidTopUdpAdapter._gsy_yaw_rate_for_offset(-5.0, 3.0) == 3.0
 
 
+def test_gimbal_yaw_target_negates_image_yaw_by_default(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.delenv("VGCS_LRF_NEGATE_YAW_DELTA", raising=False)
+    # Right-of-centre click (+image dyaw) → lower GAC yaw on C13.
+    tgt = SkydroidTopUdpAdapter._gimbal_yaw_target_deg(60.77, 34.5)
+    assert abs(tgt - 26.27) < 0.05
+    monkeypatch.setenv("VGCS_LRF_NEGATE_YAW_DELTA", "0")
+    tgt2 = SkydroidTopUdpAdapter._gimbal_yaw_target_deg(60.77, 34.5)
+    assert abs(tgt2 - 95.27) < 0.05
+
+
+def test_align_yaw_burst_right_click_uses_positive_gsy(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.delenv("VGCS_LRF_INVERT_GSY", raising=False)
+    monkeypatch.delenv("VGCS_LRF_NEGATE_YAW_DELTA", raising=False)
+    # att=60.77, right click → target≈26.27 → yaw_err negative → +GSY after invert.
+    yaw_tgt = SkydroidTopUdpAdapter._gimbal_yaw_target_deg(60.77, 34.5)
+    err = SkydroidTopUdpAdapter._angle_err_deg(yaw_tgt, 60.77)
+    assert err < -30.0
+    rate = SkydroidTopUdpAdapter._gsy_yaw_rate_for_offset(err, 3.0)
+    assert rate > 0.0
+
+
 def test_normalize_lrf_click_uv_no_flip_by_default(monkeypatch) -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
