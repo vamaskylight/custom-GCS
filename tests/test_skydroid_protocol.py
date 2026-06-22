@@ -300,6 +300,28 @@ def test_gimbal_yaw_target_negates_image_yaw_by_default(monkeypatch) -> None:
     assert abs(tgt2 - 95.27) < 0.05
 
 
+def test_calibrate_track_gac_scales_from_lock() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    # Click upper-right; slew log: att (-4.86,-5.64)->(-14.79,7.44).
+    h, v = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
+        (0.621, 0.220),
+        (-4.86, -5.64),
+        (-14.79, 7.44),
+    )
+    assert 0.75 <= h <= 1.25
+    assert 0.75 <= v <= 1.25
+    u, uv = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        (0.621, 0.220),
+        (-4.86, -5.64),
+        (-14.79, 7.44),
+        gac_h_scale=h,
+        gac_v_scale=v,
+    )
+    assert abs(u - 0.5) < 0.04
+    assert abs(uv - 0.5) < 0.04
+
+
 def test_lrf_track_uv_follows_gimbal_slew(monkeypatch) -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
