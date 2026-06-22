@@ -529,6 +529,33 @@ class SkydroidTopUdpAdapter:
             return False
         return abs(float(value_m) - float(baseline_m)) >= float(min_m)
 
+    def _try_accept_current_aim_slr(
+        self,
+        samples: list[float],
+        baseline_m: float | None,
+        att_before: tuple[float, float] | None,
+        att_now: tuple[float, float] | None,
+        *,
+        elapsed: float,
+    ) -> float | None:
+        """Accept stable SLR at current gimbal aim (manual pre-aim — no auto-slew)."""
+        if baseline_m is None or len(samples) < _LRF_CONVERGE_SAMPLES:
+            return None
+        if float(elapsed) < _LRF_LOCK_MIN_WAIT_S:
+            return None
+        if att_before is not None and att_now is not None:
+            if self._gimbal_attitude_moved(att_before, att_now) is True:
+                return None
+        tail = [float(v) for v in samples[-_LRF_CONVERGE_SAMPLES:]]
+        converged = self._slr_converged(tail, _LRF_CONVERGE_SAMPLES)
+        if converged is None:
+            return None
+        if self._slr_still_climbing(tail[-3:]):
+            return None
+        if abs(float(converged) - float(baseline_m)) > _LRF_MOVED_MIN_M:
+            return None
+        return float(converged)
+
     def _try_accept_gimbal_slew_slr(
         self,
         samples: list[float],
@@ -679,7 +706,7 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
     ) -> float | None:
-        """C13: GSM slew to click pixel, then read SLR (GOT/SUM is C12-only per PROTOCAL)."""
+        """C13: confirm SLR at current gimbal aim after video click (no auto-slew)."""
         if not self.gimbal_telemetry_ok():
             return None
         # PROTOCAL §3.3.5: GOT coordinates are always on 1280×720 companion video.
@@ -724,28 +751,15 @@ class SkydroidTopUdpAdapter:
                 except Exception:
                     pass
 
-            att_after_point, slew_ok = self._send_gimbal_point_at_pixel(
-                x_px, y_px, att_before
+            # C13 SLR reads along the laser boresight at the current gimbal attitude.
+            # Re-slewing from pixel offset would move the laser off a manually aimed point
+            # whenever the target is off video centre (common after operator alignment).
+            print(
+                "[VGCS:lrf] hold gimbal — confirming SLR at current aim "
+                f"(baseline={baseline_m:.1f} m)"
             )
-            self._gimbal_stop_hard()
-            gimbal_slew_mono = time.monotonic()
-            att_latest = att_after_point or att_before
-            expected_move = self._expected_offset_deg(dyaw, dpitch_img)
-            actual_move = self._gimbal_total_move_deg(
-                att_before, att_after_point or att_before
-            )
-            if actual_move > expected_move * _LRF_GIMBAL_OVERSHOOT_FACTOR + 1.5:
-                print(
-                    f"[VGCS:lrf] lock failed — gimbal overshoot {actual_move:.1f}° "
-                    f"(expected≈{expected_move:.1f}°)"
-                )
-                return None
-            if not slew_ok and actual_move < max(0.5, expected_move * 0.2):
-                print(
-                    f"[VGCS:lrf] lock failed — gimbal did not move "
-                    f"({actual_move:.1f}°)"
-                )
-                return None
+            att_latest = att_before
+            gimbal_slew_mono: float | None = None
 
             samples: list[float] = []
             start_mono = time.monotonic()
@@ -783,9 +797,23 @@ class SkydroidTopUdpAdapter:
                     continue
 
                 gimbal_moved = self._gimbal_attitude_moved(att_before, att_now)
-                if gimbal_moved is True and gimbal_slew_mono is None:
-                    gimbal_slew_mono = time.monotonic()
                 slr_moved = self._slr_samples_moved_from_baseline(samples, baseline_m)
+
+                current_aim = self._try_accept_current_aim_slr(
+                    samples,
+                    baseline_m,
+                    att_before,
+                    att_now,
+                    elapsed=elapsed,
+                )
+                if current_aim is not None:
+                    print(
+                        f"[VGCS:lrf] lock at current aim {current_aim:.1f} m "
+                        f"(baseline={baseline_m:.1f} m, att={att_before})"
+                    )
+                    dist_m = self._refine_slr_estimate(on_sample) or float(current_aim)
+                    _emit_sample(float(dist_m), att_now, force=True)
+                    break
 
                 gimbal_accept = self._try_accept_gimbal_slew_slr(
                     samples,
@@ -850,6 +878,15 @@ class SkydroidTopUdpAdapter:
                 post = self._slr_post_move_samples(samples, baseline_m)
                 att_now = att_latest
                 gimbal_moved = self._gimbal_attitude_moved(att_before, att_now)
+                current_aim = self._try_accept_current_aim_slr(
+                    samples,
+                    baseline_m,
+                    att_before,
+                    att_now,
+                    elapsed=time.monotonic() - start_mono,
+                )
+                if current_aim is not None:
+                    dist_m = self._refine_slr_estimate(on_sample) or float(current_aim)
                 gimbal_accept = self._try_accept_gimbal_slew_slr(
                     samples,
                     baseline_m,
@@ -878,18 +915,20 @@ class SkydroidTopUdpAdapter:
                     if gimbal_deg >= _LRF_GIMBAL_ACCEPT_MIN_DEG:
                         print(
                             f"[VGCS:lrf] lock rejected — gimbal moved {gimbal_deg:.1f}° "
-                            f"but SLR did not stabilize (baseline={baseline_m:.1f} m)"
+                            f"during lock (baseline={baseline_m:.1f} m)"
                         )
                     elif not self._slr_samples_moved_from_baseline(samples, baseline_m):
-                        print(
-                            f"[VGCS:lrf] lock rejected — SLR stayed at baseline "
-                            f"{baseline_m:.1f} m (target track did not slew laser)"
+                        stable = self._slr_converged(
+                            samples[-_LRF_CONVERGE_SAMPLES:],
+                            min(_LRF_CONVERGE_SAMPLES, len(samples)),
                         )
-                    elif gimbal_moved is False and point_count <= 1:
-                        print(
-                            f"[VGCS:lrf] lock rejected — gimbal did not move "
-                            f"(att={att_before}->{att_now}); check C13 GSM slew / TOP link"
-                        )
+                        if stable is not None and abs(stable - float(baseline_m)) <= _LRF_STABLE_EPS_M:
+                            dist_m = self._refine_slr_estimate(on_sample) or float(stable)
+                        else:
+                            print(
+                                f"[VGCS:lrf] lock rejected — SLR did not stabilize near "
+                                f"baseline {baseline_m:.1f} m"
+                            )
                     else:
                         print(
                             f"[VGCS:lrf] lock rejected — range moved but did not settle "

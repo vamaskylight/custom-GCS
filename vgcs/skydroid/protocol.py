@@ -52,10 +52,14 @@ def build_tp_frame(
     return f"{body}{tp_checksum(body)}".encode("ascii", errors="ignore")
 
 
+# PROTOCAL.doc V1.1.6 (2025-06-19): GSY/GSP/GSM/GAM speed fields use 0.5 deg/s units.
+_GIMBAL_SPEED_UNIT_DPS = 0.5
+
+
 def encode_speed_2char(deg_per_s: float) -> str:
-    """Gimbal speed field: signed byte in 0.1 deg/s units (Yunzhuo TOP / Topotek), two hex ASCII chars."""
-    units = int(round(float(deg_per_s) / 0.1))
-    units = max(-99, min(99, units))
+    """Gimbal speed field: signed byte in 0.5 deg/s units (Yunzhuo TOP C13), two hex ASCII chars."""
+    units = int(round(float(deg_per_s) / _GIMBAL_SPEED_UNIT_DPS))
+    units = max(-127, min(127, units))
     return f"{units & 0xFF:02X}"
 
 
