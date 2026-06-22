@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-20-restore-b0e75151-video"
+_VIDEO_PIPELINE_REV = "2026-06-22-companion-hevc-hold"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -352,6 +352,20 @@ def _stall_watchdog_enabled(url: str) -> bool:
     return True
 
 
+def _hevc_stderr_line_indicates_glitch(line: bytes) -> bool:
+    """Single FFmpeg stderr line that signals HEVC reference / slice loss."""
+    if not line:
+        return False
+    tl = line.lower()
+    return (
+        b"could not find ref" in tl
+        or b"cu_qp_delta" in tl
+        or b"error constructing the frame rps" in tl
+        or b"constructing the frame rps" in tl
+        or (b"[hevc @" in tl and b"poc" in tl)
+    )
+
+
 def _siyi_hevc_glitch_tail(tail_b: bytes) -> bool:
     """True when FFmpeg stderr shows HEVC reference/RPS loss (common on ZR10 during pan/zoom)."""
     if not tail_b:
@@ -359,10 +373,84 @@ def _siyi_hevc_glitch_tail(tail_b: bytes) -> bool:
     tl = tail_b.lower()
     return (
         b"could not find ref" in tl
+        or b"cu_qp_delta" in tl
         or b"error constructing the frame rps" in tl
         or b"constructing the frame rps" in tl
         or b"poc " in tl
     )
+
+
+def _companion_hevc_showall_enabled() -> bool:
+    """Opt-in: FFmpeg +showall emits partial HEVC frames (macroblock garbage). Default off."""
+    raw = str(os.environ.get("VGCS_COMPANION_SHOWALL", "0") or "0").strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
+def _companion_decode_max_dims(url: str) -> tuple[int, int]:
+    """Preview decode cap for companion RTSP (Skydroid C13, SIYI ZR10, etc.)."""
+    cap_w = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_W", "1920") or 1920)
+    cap_h = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_H", "1080") or 1080)
+    if not _rtsp_url_is_companion_rtsp(url):
+        return cap_w, cap_h
+    try:
+        w_raw = str(
+            os.environ.get("VGCS_COMPANION_DECODE_MAX_W")
+            or os.environ.get("VGCS_SIYI_DECODE_MAX_W", "960")
+            or "960"
+        ).strip()
+        h_raw = str(
+            os.environ.get("VGCS_COMPANION_DECODE_MAX_H")
+            or os.environ.get("VGCS_SIYI_DECODE_MAX_H", "540")
+            or "540"
+        ).strip()
+        cap_w = min(cap_w, int(w_raw))
+        cap_h = min(cap_h, int(h_raw))
+    except ValueError:
+        cap_w = min(cap_w, 960)
+        cap_h = min(cap_h, 540)
+    return cap_w, cap_h
+
+
+def _rtsp_transport_sequence_with_override(
+    url: str, mode: str, override: str | None
+) -> tuple[str | None, ...]:
+    """Like ``_rtsp_transport_sequence`` but prefers a sticky transport after HEVC glitch."""
+    seq = list(_rtsp_transport_sequence(url, mode))
+    ov = str(override or "").strip().lower()
+    if ov in ("tcp", "udp") and ov in seq:
+        seq = [ov] + [t for t in seq if t != ov]
+    return tuple(seq)
+
+
+def _rgb_frame_looks_hevc_corrupt(
+    arr: "np.ndarray",
+    prev: "np.ndarray | None",
+    *,
+    block: int = 16,
+    stride: int = 16,
+) -> bool:
+    """
+    Detect macroblock-soup HEVC corruption (sudden tile chaos vs last good frame).
+
+    Lightweight grid sample — skips compare when there is no prior good frame.
+    """
+    if not HAS_NUMPY or np is None or prev is None or prev.shape != arr.shape:
+        return False
+    h, w, _ = arr.shape
+    if h < block or w < block:
+        return False
+    bad = 0
+    tiles = 0
+    cur = arr.astype(np.int16)
+    prv = prev.astype(np.int16)
+    for y in range(0, h - block + 1, stride):
+        for x in range(0, w - block + 1, stride):
+            tiles += 1
+            tile = cur[y : y + block, x : x + block]
+            if float(np.abs(tile - prv[y : y + block, x : x + block]).mean()) > 38.0:
+                if float(tile.std()) > 32.0:
+                    bad += 1
+    return tiles >= 8 and (bad / tiles) > 0.22
 
 
 def _siyi_rtsp_camera_busy(tail_b: bytes) -> bool:
@@ -577,8 +665,12 @@ def _ffmpeg_preflags_before_input(
         if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
             out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     out.extend(["-err_detect", "ignore_err"])
-    if sc == "rtsp" and _rtsp_url_is_companion_rtsp(str(url or "").strip()):
-        # Show frames even when HEVC refs are briefly missing (companion pan/zoom / glitch).
+    if (
+        sc == "rtsp"
+        and _rtsp_url_is_companion_rtsp(str(url or "").strip())
+        and _companion_hevc_showall_enabled()
+    ):
+        # Opt-in only: +showall surfaces partial HEVC frames (macroblock garbage in preview).
         out.extend(["-flags2", "+showall"])
     if sc == "udp":
         out.extend(
@@ -823,6 +915,7 @@ class RtspSource(QObject):
         self._siyi_last_rtsp_open_mono: float = 0.0
         self._siyi_138_fail_streak: int = 0
         self._siyi_last_open_tail: bytes = b""
+        self._companion_transport_override: str | None = None
         self._rec_proc: subprocess.Popen[bytes] | None = None
         self._rec_lock = threading.Lock()
         self._rec_digital_zoom: float = 1.0
@@ -1576,10 +1669,10 @@ class RtspSource(QObject):
         src_h = max(1, int(src_h))
         cap_w = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_W", "1920") or 1920)
         cap_h = int(os.environ.get("VGCS_VIDEO_DECODE_MAX_H", "1080") or 1080)
-        if _rtsp_url_is_siyi_style(url):
-            # ZR10 main.264 is often HEVC 1080p+; lighter preview decode = smoother pan on laptops.
-            cap_w = min(cap_w, int(os.environ.get("VGCS_SIYI_DECODE_MAX_W", "960") or 960))
-            cap_h = min(cap_h, int(os.environ.get("VGCS_SIYI_DECODE_MAX_H", "540") or 540))
+        comp_cap_w, comp_cap_h = _companion_decode_max_dims(url)
+        if _rtsp_url_is_companion_rtsp(url):
+            cap_w = min(cap_w, comp_cap_w)
+            cap_h = min(cap_h, comp_cap_h)
         cap_w = max(640, min(1920, cap_w))
         cap_h = max(360, min(1080, cap_h))
         scale = min(float(cap_w) / float(src_w), float(cap_h) / float(src_h), 1.0)
@@ -1619,8 +1712,18 @@ class RtspSource(QObject):
         if companion_rtsp:
             print(
                 f"[VGCS:video] RTSP companion link (192.168.144.x): transport order="
-                f"{_rtsp_transport_sequence(url, self._transport)!r}"
+                f"{_rtsp_transport_sequence_with_override(url, self._transport, self._companion_transport_override)!r}"
             )
+            if not _companion_hevc_showall_enabled():
+                print(
+                    "[VGCS:video] companion HEVC: corrupt frames hidden "
+                    "(hold last good preview; set VGCS_COMPANION_SHOWALL=1 for old behaviour)"
+                )
+            if _rtsp_url_is_companion_rtsp(url):
+                print(
+                    f"[VGCS:video] companion decode cap {w}x{h} "
+                    f"(set VGCS_COMPANION_DECODE_MAX_W/H to override)"
+                )
             if not _stall_watchdog_enabled(url):
                 print(
                     "[VGCS:video] companion HEVC: stall watchdog disabled "
@@ -1636,7 +1739,9 @@ class RtspSource(QObject):
                 print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
 
         while self._running and not self._ffmpeg_stop.is_set():
-            transport_seq = _rtsp_transport_sequence(url, self._transport)
+            transport_seq = _rtsp_transport_sequence_with_override(
+                url, self._transport, self._companion_transport_override
+            )
             round_ok = False
             url_fatal = False
             for transport in transport_seq:
@@ -1653,9 +1758,11 @@ class RtspSource(QObject):
                         break
                     demux = _ffmpeg_udp_raw_demux(url, demux_fmt)
                     tr_label = str(transport) if transport is not None else "n/a"
+                    eff_transport = self._companion_transport_override or transport
+                    eff_label = str(eff_transport) if eff_transport is not None else tr_label
                     demux_label = demux_fmt or "auto"
                     print(
-                        f"[VGCS:video] FFmpeg decode try rtsp_transport={tr_label} "
+                        f"[VGCS:video] FFmpeg decode try rtsp_transport={eff_label} "
                         f"udp_demux={demux_label} url={url}"
                     )
 
@@ -1670,17 +1777,16 @@ class RtspSource(QObject):
                     empty_session_limit = 4 if companion_rtsp else 20
                     empty_sessions = 0
                     tcp_138_streak = 0
-                    siyi_transport_override: str | None = None
 
                     while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
-                        use_transport = siyi_transport_override or transport
+                        use_transport = self._companion_transport_override or transport
                         tr_label = str(use_transport) if use_transport is not None else "n/a"
                         if companion_rtsp:
                             self._siyi_throttle_before_rtsp_open(
                                 url, getattr(self, "_siyi_last_open_tail", b"") or b""
                             )
                         if siyi_url and (
-                            transport_got_frames or siyi_transport_override
+                            transport_got_frames or self._companion_transport_override
                         ):
                             try:
                                 print(
@@ -1715,6 +1821,7 @@ class RtspSource(QObject):
                             "pipe:1",
                         ]
                         stderr_buf: list[bytes] = []
+                        hevc_glitch_hold = {"until_mono": 0.0}
                         p: subprocess.Popen[bytes] | None = None
                         try:
                             p = subprocess.Popen(
@@ -1725,7 +1832,11 @@ class RtspSource(QObject):
                             )
                             self._ffmpeg_proc = p
 
-                            def _drain_stderr(proc: subprocess.Popen[bytes], buf: list[bytes]) -> None:
+                            def _drain_stderr(
+                                proc: subprocess.Popen[bytes],
+                                buf: list[bytes],
+                                hold: dict[str, float],
+                            ) -> None:
                                 try:
                                     ep = proc.stderr
                                     if ep is None:
@@ -1736,10 +1847,18 @@ class RtspSource(QObject):
                                             break
                                         if len(buf) < 200:
                                             buf.append(line)
+                                        if companion_rtsp and _hevc_stderr_line_indicates_glitch(
+                                            line
+                                        ):
+                                            hold["until_mono"] = time.monotonic() + 0.35
                                 except Exception:
                                     pass
 
-                            threading.Thread(target=_drain_stderr, args=(p, stderr_buf), daemon=True).start()
+                            threading.Thread(
+                                target=_drain_stderr,
+                                args=(p, stderr_buf, hevc_glitch_hold),
+                                daemon=True,
+                            ).start()
                         except Exception as e:
                             self.error.emit(f"FFmpeg start (continuous) failed: {e}")
                             self._ffmpeg_proc = None
@@ -1763,6 +1882,8 @@ class RtspSource(QObject):
                         waiting_logged = False
                         session_t0 = time.monotonic()
                         frozen_logged = False
+                        corrupt_skip_logged = False
+                        last_good_arr: "np.ndarray | None" = None
                         self._ffmpeg_last_raw_sig = None
                         self._ffmpeg_last_raw_change_mono = time.monotonic()
                         session_stop = threading.Event()
@@ -1849,9 +1970,34 @@ class RtspSource(QObject):
                                 now = time.monotonic()
                                 if (now - last_emit_mono) < min_emit_dt:
                                     continue
+                                if companion_rtsp and now < float(
+                                    hevc_glitch_hold.get("until_mono", 0.0) or 0.0
+                                ):
+                                    if not corrupt_skip_logged:
+                                        corrupt_skip_logged = True
+                                        try:
+                                            print(
+                                                "[VGCS:video] companion HEVC: skipping frames "
+                                                "during decoder glitch (hold last good preview)"
+                                            )
+                                        except Exception:
+                                            pass
+                                    continue
                                 try:
                                     assert np is not None
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
+                                    if companion_rtsp and not _companion_hevc_showall_enabled():
+                                        if _rgb_frame_looks_hevc_corrupt(arr, last_good_arr):
+                                            if not corrupt_skip_logged:
+                                                corrupt_skip_logged = True
+                                                try:
+                                                    print(
+                                                        "[VGCS:video] companion HEVC: skipping "
+                                                        "corrupt frame (hold last good preview)"
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            continue
                                     qimg = QImage(
                                         arr.data, w, h, 3 * w, QImage.Format.Format_RGB888
                                     ).copy()
@@ -1863,6 +2009,8 @@ class RtspSource(QObject):
                                     )
                                     if not self._emit_video_frame_safe(qimg, meta):
                                         break
+                                    if companion_rtsp:
+                                        last_good_arr = arr.copy()
                                     self._ffmpeg_last_frame_mono = last_emit_mono
                                     frames_this_session += 1
                                     frame_count_box[0] = frames_this_session
@@ -2060,7 +2208,7 @@ class RtspSource(QObject):
                                         str(use_transport or "").lower() == "tcp"
                                         and "udp" in transport_seq
                                     ):
-                                        siyi_transport_override = "udp"
+                                        self._companion_transport_override = "udp"
                                         try:
                                             print(
                                                 "[VGCS:video] companion HEVC on TCP: "
