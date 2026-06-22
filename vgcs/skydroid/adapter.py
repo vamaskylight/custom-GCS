@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import re
 import threading
@@ -36,7 +37,7 @@ _LRF_LOCK_MIN_WAIT_S = 1.25
 _LRF_LOCK_MAX_WAIT_S = 12.0
 _LRF_LOCK_POLL_S = 0.25
 _LRF_BASELINE_EPS_M = 1.5
-_LRF_STABLE_EPS_M = 0.6
+_LRF_STABLE_EPS_M = 0.35
 _LRF_MOVED_MIN_M = 2.0
 _LRF_GIMBAL_SLR_MIN_M = 0.5
 _LRF_GIMBAL_ACCEPT_MIN_DEG = 1.5
@@ -54,7 +55,7 @@ _LRF_GOT_RESEND_INTERVAL_S = 2.0
 _LRF_BASELINE_RETRIES = 8
 _LRF_BASELINE_GAP_S = 0.2
 _LRF_POST_GOT_WAIT_S = 2.5
-_LRF_SLR_SHOT_SETTLE_S = 0.45
+_LRF_SLR_SHOT_SETTLE_S = 0.55
 _LRF_GAM_APPROACH_DPS = 20.0
 _LRF_GAM_SETTLE_S = 2.0
 _LRF_GAM_AIM_TOL_DEG = 2.5
@@ -70,9 +71,10 @@ _LRF_GIMBAL_SLEW_SCALE = 0.90
 _LRF_C13_INVERT_GSY = True
 _LRF_LOCK_MOVE_GIMBAL = False
 _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG = 0.45
-_LRF_PRELOCK_SAMPLES = 5
+_LRF_PRELOCK_SAMPLES = 7
 _LRF_LIVE_POLL_SAMPLES = 3
-_LRF_SLR_MULTI_DEST_MAX = True
+_LRF_SLR_QUERY_RETRIES = 3
+_LRF_SLR_DEST_PRIMARY = "D"
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.25
 _LRF_MAX_REPOINTS = 0
@@ -234,14 +236,16 @@ class SkydroidTopUdpAdapter:
                 time.sleep(0.12)
         if not samples:
             return None
-        med = float(self._slr_median(samples))
-        if len(samples) >= 2:
-            spread = max(samples) - min(samples)
-            if spread > 0.5:
-                print(
-                    f"[VGCS:lrf] pre-lock spread {spread:.1f} m "
-                    f"samples={[round(s, 1) for s in samples]} median={med:.1f} m"
-                )
+        if len(samples) >= 5:
+            med = float(self._slr_trimmed_median(samples, trim=1))
+        else:
+            med = float(self._slr_median(samples))
+        spread = max(samples) - min(samples)
+        if len(samples) >= 2 and spread > 0.5:
+            print(
+                f"[VGCS:lrf] pre-lock spread {spread:.1f} m "
+                f"samples={[round(s, 1) for s in samples]} median={med:.1f} m"
+            )
         return med
 
     def is_lrf_locked(self) -> bool:
@@ -706,6 +710,68 @@ class SkydroidTopUdpAdapter:
         return (float(s[mid - 1]) + float(s[mid])) / 2.0
 
     @staticmethod
+    def _slr_trimmed_median(values: list[float], *, trim: int = 1) -> float:
+        s = sorted(float(v) for v in values)
+        n = len(s)
+        if n <= 0:
+            return 0.0
+        if n <= max(1, 2 * int(trim)):
+            return SkydroidTopUdpAdapter._slr_median(s)
+        core = s[int(trim) : n - int(trim)]
+        return SkydroidTopUdpAdapter._slr_median(core)
+
+    @staticmethod
+    def _calibrate_slr_m(raw_m: float) -> float:
+        """Optional field calibration: VGCS_LRF_OFFSET_M and VGCS_LRF_SCALE env vars."""
+        try:
+            scale = float(os.environ.get("VGCS_LRF_SCALE", "1") or "1")
+            offset = float(os.environ.get("VGCS_LRF_OFFSET_M", "0") or "0")
+        except ValueError:
+            scale, offset = 1.0, 0.0
+        return float(raw_m) * scale + offset
+
+    @staticmethod
+    def _payload_is_slr_reply(payload: bytes) -> bool:
+        dec = parse_top_frame(payload)
+        return dec is not None and str(dec.command or "").upper() == "SLR"
+
+    def _transmit_slr_read(
+        self,
+        frame: bytes,
+        *,
+        log: bool,
+        retries: int = _LRF_SLR_QUERY_RETRIES,
+    ) -> bytes | None:
+        """Send SLR read; discard stray GAC/GAA datagrams on the shared UDP socket."""
+        for attempt in range(max(1, int(retries))):
+            try:
+                reply = self._transport.send_and_receive(
+                    frame,
+                    expect_reply=True,
+                    log=log and attempt == 0,
+                    timeout_s=0.5,
+                )
+            except Exception:
+                continue
+            if reply and self._payload_is_slr_reply(reply):
+                return reply
+            if log and reply:
+                print(
+                    f"[VGCS:lrf] SLR stray reply (retry {attempt + 1}) "
+                    f"raw={reply.decode('ascii', errors='ignore')!r}"
+                )
+            time.sleep(0.06)
+        return None
+
+    def _attitude_from_cache(self) -> tuple[float, float] | None:
+        st = self.get_status_cached()
+        if not st.supported:
+            return None
+        if st.yaw_deg is None and st.pitch_deg is None:
+            return None
+        return float(st.yaw_deg or 0.0), float(st.pitch_deg or 0.0)
+
+    @staticmethod
     def _slr_still_climbing(samples: list[float], eps: float = _LRF_CLIMB_EPS_M) -> bool:
         if len(samples) < 2:
             return False
@@ -720,6 +786,8 @@ class SkydroidTopUdpAdapter:
             return None
         if SkydroidTopUdpAdapter._slr_still_climbing(tail):
             return None
+        if len(tail) >= 5:
+            return SkydroidTopUdpAdapter._slr_trimmed_median(tail, trim=1)
         return SkydroidTopUdpAdapter._slr_median(tail)
 
     @staticmethod
@@ -943,7 +1011,7 @@ class SkydroidTopUdpAdapter:
             return None
         tail_n = min(_LRF_REFINE_SAMPLES, len(buf))
         tail = [float(v) for v in buf[-tail_n:]]
-        refined = self._slr_median(tail)
+        refined = self._slr_trimmed_median(tail, trim=1) if len(tail) >= 5 else self._slr_median(tail)
         if len(buf) >= 5 and buf[-1] > buf[0] + 2.0:
             upper = sorted(tail)[max(0, len(tail) - max(3, len(tail) // 2)) :]
             if upper:
@@ -1058,7 +1126,7 @@ class SkydroidTopUdpAdapter:
                 if reading is None:
                     continue
                 samples.append(float(reading))
-                att_now = self._read_gimbal_attitude_deg()
+                att_now = self._attitude_from_cache()
                 if att_now is not None:
                     att_latest = att_now
                 if (
@@ -1134,15 +1202,13 @@ class SkydroidTopUdpAdapter:
             self._transport._port = active_port
 
     def _query_slr_distance_m(self, *, log: bool = False, fresh: bool = False) -> float | None:
-        """Single SLR read — optional fresh shot (PROTOCAL §4.22 read fires + re-read)."""
+        """Single SLR read on D-class (PROTOCAL §4.22); E-class fallback only."""
         active_port = int(self._transport._port)
-        frames_read = (
-            build_slr_query(dest="D"),
-            build_slr_query(dest="E"),
-        )
+        primary = build_slr_query(dest=_LRF_SLR_DEST_PRIMARY)
+        fallback = build_slr_query(dest="E")
         try:
             if fresh:
-                for dest in ("D", "E"):
+                for dest in (_LRF_SLR_DEST_PRIMARY, "E"):
                     try:
                         self._transport.send_and_receive(
                             build_slr_trigger(dest=dest),
@@ -1152,66 +1218,37 @@ class SkydroidTopUdpAdapter:
                         )
                     except Exception:
                         continue
-                time.sleep(0.12)
-                for frame in frames_read:
-                    try:
-                        self._transport.send_and_receive(
-                            frame,
-                            expect_reply=True,
-                            log=False,
-                            timeout_s=0.35,
-                        )
-                    except Exception:
-                        continue
+                time.sleep(0.15)
+                self._transmit_slr_read(primary, log=False)
                 time.sleep(_LRF_SLR_SHOT_SETTLE_S)
-            last_raw: bytes | None = None
-            readings: list[float] = []
-            last_reply: bytes | None = None
-            for frame in frames_read:
-                try:
-                    reply = self._transport.send_and_receive(
-                        frame,
-                        expect_reply=True,
-                        log=log,
-                        timeout_s=0.5,
-                    )
-                except Exception:
-                    continue
-                if not reply:
-                    continue
-                last_raw = reply
-                last_reply = reply
-                dist_m = parse_slr_distance_from_payload(reply)
-                if dist_m is not None:
-                    readings.append(float(dist_m))
-            if readings:
-                if _LRF_SLR_MULTI_DEST_MAX and len(readings) > 1:
-                    dist_m = max(readings)
-                    if log and max(readings) - min(readings) > 0.3:
-                        print(
-                            f"[VGCS:lrf] SLR D/E reads "
-                            f"{[round(v, 1) for v in readings]} -> {dist_m:.1f} m"
-                        )
-                else:
-                    dist_m = readings[0]
-                if log and last_reply:
-                    hx = slr_raw_hex(last_reply)
+            reply = self._transmit_slr_read(primary, log=log)
+            if reply is None:
+                reply = self._transmit_slr_read(fallback, log=False)
+            if reply is None:
+                if log:
+                    print("[VGCS:lrf] SLR read failed — no valid SLR reply")
+                return None
+            dist_m = parse_slr_distance_from_payload(reply)
+            if dist_m is None:
+                if log:
                     print(
-                        f"[VGCS:lrf] SLR reply hex={hx} "
-                        f"range={float(dist_m):.1f} m "
-                        f"raw={last_reply.decode('ascii', errors='ignore')!r}"
+                        f"[VGCS:lrf] SLR parse failed raw="
+                        f"{reply.decode('ascii', errors='ignore')!r}"
                     )
-                if not self._lrf_locked:
-                    with self._status_lock:
-                        self._laser_range_m = float(dist_m)
-                        self._laser_range_mono = time.monotonic()
-                return float(dist_m)
-            if log and last_raw:
+                return None
+            dist_m = self._calibrate_slr_m(float(dist_m))
+            if log:
+                hx = slr_raw_hex(reply)
                 print(
-                    f"[VGCS:lrf] SLR parse failed raw="
-                    f"{last_raw.decode('ascii', errors='ignore')!r}"
+                    f"[VGCS:lrf] SLR reply hex={hx} "
+                    f"range={float(dist_m):.1f} m "
+                    f"raw={reply.decode('ascii', errors='ignore')!r}"
                 )
-            return None
+            if not self._lrf_locked:
+                with self._status_lock:
+                    self._laser_range_m = float(dist_m)
+                    self._laser_range_mono = time.monotonic()
+            return float(dist_m)
         except Exception:
             return None
         finally:
@@ -1551,6 +1588,7 @@ class SkydroidTopUdpAdapter:
         dist_m = parse_slr_distance_from_payload(payload)
         if dist_m is None:
             return
+        dist_m = self._calibrate_slr_m(float(dist_m))
         if self._lrf_locked:
             self._note_slr_sample(float(dist_m))
             return
