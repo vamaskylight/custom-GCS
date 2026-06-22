@@ -381,7 +381,14 @@ def test_align_aim_satisfied_requires_yaw_on_target() -> None:
 
     adapter = SkydroidTopUdpAdapter()
     assert adapter._align_aim_satisfied((24.5, 0.0), 38.2, 1.1, -1.1) is False
-    assert adapter._align_aim_satisfied((37.5, 0.0), 38.2, 1.1, -1.1) is True
+    assert adapter._align_aim_satisfied((37.5, 1.05), 38.2, 1.1, -1.1) is True
+
+
+def test_align_pitch_tol_tightens_for_large_click() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    assert SkydroidTopUdpAdapter._align_pitch_tol_deg(20.0) <= 0.55
+    assert SkydroidTopUdpAdapter._align_pitch_tol_deg(2.0) <= 0.75
 
 
 def test_lrf_lock_move_gimbal_default(monkeypatch) -> None:
