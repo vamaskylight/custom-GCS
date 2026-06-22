@@ -505,7 +505,9 @@ class _LrfRangeBlock(QWidget):
         self._c13_state = "armed"
         self._btn.setChecked(True)
         self._btn.setText("◎")
-        self._btn.setToolTip("Click target on video — or click here to cancel")
+        self._btn.setToolTip(
+            "Aim LRF at target with gimbal, then click video to lock (camera will not move)"
+        )
         self._sub.setText("Click video")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(0)
@@ -529,7 +531,7 @@ class _LrfRangeBlock(QWidget):
         else:
             self._val.setText(f"{float(distance_m):.1f} m")
         self._val.setStyleSheet(_VALUE_QSS)
-        self._sub.setText("C13 LRF · slewing to target…")
+        self._sub.setText("C13 LRF · reading laser…")
         self._sub.setVisible(True)
         self._stack.setCurrentIndex(1)
 
