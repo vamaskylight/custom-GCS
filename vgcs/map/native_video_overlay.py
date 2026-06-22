@@ -331,7 +331,7 @@ class NativeVideoOverlayLayer(QWidget):
             if distance_m is not None:
                 caption = f"LRF {float(distance_m):.1f} m …"
             else:
-                caption = "LRF slewing…"
+                caption = "LRF reading…"
         else:
             caption = "LRF"
         font = QFont("Segoe UI", 10, QFont.Weight.Bold)
