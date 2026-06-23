@@ -353,8 +353,57 @@ def prefer_dem_ground_agl_over_ekf(
     # Home is often below local DEM surface — EKF rel can read lower than terrain AGL
     # (more visible at higher hover altitudes).
     if dem >= 15.0 and ekf is not None and dem > ekf + 1.0:
+        if ekf < 6.0 and dem > ekf + 8.0:
+            if facade_agl_m is not None and facade_agl_m >= MIN_FACADE_AGL_M:
+                return facade_agl_m, facade_src
+            return max(float(ekf), 2.5), "ekf_low_hover"
         return dem, src
     return facade_agl_m, facade_src
+
+
+def sanitize_dem_ground_agl_m(
+    dem_ground_agl_m: float | None,
+    ekf_rel_alt_m: float | None,
+) -> float | None:
+    """Drop absurd DEM terrain AGL when EKF shows the drone is still near the ground."""
+    if dem_ground_agl_m is None:
+        return None
+    try:
+        dem = float(dem_ground_agl_m)
+        ekf = float(ekf_rel_alt_m) if ekf_rel_alt_m is not None else None
+    except (TypeError, ValueError):
+        return dem_ground_agl_m
+    if ekf is not None and ekf < 6.0 and dem > max(15.0, ekf + 8.0):
+        return None
+    return dem
+
+
+def low_hover_ray_agl_m(ekf_rel_alt_m: float | None) -> float:
+    """Minimum AGL used when re-trying facade rays after DEM/home mismatch."""
+    try:
+        ekf = float(ekf_rel_alt_m) if ekf_rel_alt_m is not None else 0.0
+    except (TypeError, ValueError):
+        ekf = 0.0
+    return max(3.0, ekf) if ekf >= 0.5 else 3.0
+
+
+def ray_agl_suspect_dem_mismatch(
+    ray_agl_m: float | None,
+    agl_src: str,
+    ekf_rel_alt_m: float | None,
+) -> bool:
+    if ray_agl_m is None:
+        return False
+    ekf = observation_ekf_rel_alt_m({"ekf_rel_alt_m": ekf_rel_alt_m})
+    if ekf is None or ekf >= 6.0:
+        return False
+    try:
+        ray = float(ray_agl_m)
+    except (TypeError, ValueError):
+        return False
+    if "dem" in str(agl_src or "") and ray > float(ekf) + 10.0:
+        return True
+    return ray > max(20.0, float(ekf) + 12.0)
 
 
 def resolve_ray_agl_for_geo(
@@ -378,6 +427,7 @@ def resolve_ray_agl_for_geo(
         vehicle_lon=vehicle_lon,
         dem_path=dem_path,
     )
+    dem_agl = sanitize_dem_ground_agl_m(dem_agl, relative_alt_m)
     return prefer_dem_ground_agl_over_ekf(
         relative_alt_m=relative_alt_m,
         facade_agl_m=facade_agl,

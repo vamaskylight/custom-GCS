@@ -24,6 +24,7 @@ from vgcs.observe.target_measure import (
     is_plausible_ground_range,
     prefer_dem_ground_agl_over_ekf,
     resolve_facade_ray_agl_m,
+    sanitize_dem_ground_agl_m,
     slant_horizontal_range_m,
 )
 
@@ -181,6 +182,7 @@ def compute_geo_reference(
             vehicle_lon=vehicle_lon,
             dem_path=str(dem_path or "") if dem_path else None,
         )
+        dem_agl = sanitize_dem_ground_agl_m(dem_agl, vehicle_rel_alt_m)
         agl_m, agl_src = prefer_dem_ground_agl_over_ekf(
             relative_alt_m=vehicle_rel_alt_m,
             facade_agl_m=agl_m,

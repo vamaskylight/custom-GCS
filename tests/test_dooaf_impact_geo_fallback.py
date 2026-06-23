@@ -9,8 +9,13 @@ from vgcs.observe.dooaf import (
     apply_dooaf_impact_geo_fallback,
     build_dooaf_session,
     dooaf_export_blockers,
+    refine_impact_geo_from_video_rays,
 )
-from vgcs.observe.target_measure import observation_target_latlon
+from vgcs.observe.target_measure import (
+    observation_target_latlon,
+    prefer_dem_ground_agl_over_ekf,
+    sanitize_dem_ground_agl_m,
+)
 
 
 def _failed_impact_row() -> dict:
@@ -99,3 +104,37 @@ def test_export_blockers_warns_low_ekf():
         setup_video_marks={DOOAF_ROLE_INTENDED: (0.298, 0.555)},
     )
     assert any("near ground" in w.lower() or "estimated" in w.lower() for w in warns)
+
+
+def test_sanitize_dem_drops_absurd_terrain_agl():
+    assert sanitize_dem_ground_agl_m(45.76, 0.343) is None
+    assert sanitize_dem_ground_agl_m(5.0, 2.2) == 5.0
+
+
+def test_prefer_dem_rejects_home_below_terrain_mismatch():
+    agl, src = prefer_dem_ground_agl_over_ekf(
+        relative_alt_m=2.2,
+        facade_agl_m=2.2,
+        facade_src="ekf_relative",
+        dem_ground_agl_m=47.0,
+        dem_ground_src="dem_terrain",
+    )
+    assert src == "ekf_low_hover"
+    assert agl == 2.5
+
+
+def test_refine_impact_when_footprint_collapsed_on_target():
+    row = _failed_impact_row()
+    row["target_lat"] = 20.4470249
+    row["target_lon"] = 72.8628042
+    row["geo_method"] = "dooaf_setup_target_footprint"
+    ok = refine_impact_geo_from_video_rays(
+        row,
+        target_lat=20.4470249,
+        target_lon=72.8628042,
+        setup_video_marks={DOOAF_ROLE_INTENDED: (0.298, 0.555)},
+    )
+    assert ok is True
+    assert row.get("geo_method") == "ray_facade_retry"
+    pt = observation_target_latlon(row)
+    assert pt is not None

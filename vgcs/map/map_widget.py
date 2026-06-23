@@ -101,6 +101,9 @@ from vgcs.observe.dooaf import (
     clear_dooaf_setup_video_mark,
     apply_dooaf_impact_geo_fallback,
     dooaf_export_blockers,
+    refine_impact_geo_from_video_rays,
+    _apply_geo_reference_to_mark_row,
+    _forced_ray_geo_for_row,
 )
 from vgcs.observe.geo_reference import compute_geo_reference, compute_lrf_slant_geo
 from vgcs.observe.grid_reference import format_grid_reference
@@ -111,7 +114,10 @@ from vgcs.observe.target_measure import (
     format_target_segment_label,
     haversine_m,
     is_downward_sensor_orientation,
+    low_hover_ray_agl_m,
     marks_need_level_warning,
+    ray_agl_suspect_dem_mismatch,
+    sanitize_dem_ground_agl_m,
     marks_same_height_band,
     MARKS_NOT_LEVEL_HINT,
     observation_facade_video_segments,
@@ -7207,19 +7213,20 @@ class MapWidget(QWidget):
             vehicle_lon=v_lon,
             dem_path=dem_path,
         )
+        ekf_raw = self._vehicle_rel_alt_m
+        try:
+            ekf_stored = float(ekf_raw) if ekf_raw is not None else None
+        except (TypeError, ValueError):
+            ekf_stored = None
+        dem_ground = sanitize_dem_ground_agl_m(dem_ground, ekf_stored)
         agl_m, agl_src = resolve_ray_agl_for_geo(
-            relative_alt_m=self._vehicle_rel_alt_m,
+            relative_alt_m=ekf_stored,
             rangefinder_down_m=self._rangefinder_down_m,
             vehicle_alt_msl_m=self._vehicle_alt_msl_m,
             vehicle_lat=v_lat,
             vehicle_lon=v_lon,
             dem_path=dem_path,
         )
-        ekf_raw = self._vehicle_rel_alt_m
-        try:
-            ekf_stored = float(ekf_raw) if ekf_raw is not None else None
-        except (TypeError, ValueError):
-            ekf_stored = None
         return {
             "vehicle_lat": v_lat,
             "vehicle_lon": v_lon,
@@ -8064,6 +8071,48 @@ class MapWidget(QWidget):
         else:
             row["geo_range_m"] = None
             row["geo_bearing_deg"] = None
+        ekf = row.get("ekf_rel_alt_m")
+        needs_ray_retry = (
+            row.get("target_lat") is None
+            or row.get("target_lon") is None
+            or str(geo.quality or "") == "insufficient"
+            or not geo.ok
+            or ray_agl_suspect_dem_mismatch(ray_agl, ray_src, ekf)
+        )
+        if needs_ray_retry:
+            retry_agl = low_hover_ray_agl_m(ekf)  # type: ignore[arg-type]
+            retry_geo = _forced_ray_geo_for_row(
+                row,
+                dem_path=dem_path,
+                camera_hfov_deg=hfov,
+                vehicle_alt_msl_m=self._vehicle_alt_msl_m,
+                force_agl_m=retry_agl,
+            )
+            if (
+                retry_geo is not None
+                and retry_geo.ok
+                and retry_geo.target_lat is not None
+                and retry_geo.target_lon is not None
+            ):
+                _apply_geo_reference_to_mark_row(
+                    row,
+                    retry_geo,
+                    ray_agl=retry_agl,
+                    ray_src="ray_facade_retry",
+                )
+                row["geo_quality"] = "fair"
+                row["geo_method"] = "ray_facade_retry"
+                warn = str(retry_geo.warning or "")
+                if ekf is not None:
+                    try:
+                        if float(ekf) < 2.5:
+                            warn = (
+                                f"low-hover ray retry (EKF {float(ekf):.1f} m — "
+                                "hover ≥3 m for better accuracy)"
+                            )
+                    except (TypeError, ValueError):
+                        pass
+                row["geo_warning"] = warn or "geo from low-hover ray retry"
         from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
 
         enrich_video_mark_target_altitude(row)
@@ -8079,6 +8128,31 @@ class MapWidget(QWidget):
                     )
             except Exception:
                 pass
+        if (
+            str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
+            and observation_target_latlon(row) is not None
+        ):
+            rs = self._resolved_dooaf_settings()
+            marks = getattr(self, "_dooaf_setup_video_marks", None) or {}
+            merged = merge_setup_video_marks(marks, st=self._dooaf_settings_store())
+            if refine_impact_geo_from_video_rays(
+                row,
+                target_lat=rs.target_lat,
+                target_lon=rs.target_lon,
+                setup_video_marks=merged,
+                dem_path=dem_path,
+                camera_hfov_deg=hfov,
+                vehicle_alt_msl_m=self._vehicle_alt_msl_m,
+            ):
+                try:
+                    nm = getattr(self, "_native_map", None)
+                    if nm is not None and hasattr(nm, "add_geo_referenced_marker"):
+                        la = row.get("target_lat")
+                        lo = row.get("target_lon")
+                        if la is not None and lo is not None:
+                            nm.add_geo_referenced_marker(float(la), float(lo))
+                except Exception:
+                    pass
         if (
             str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
             and observation_target_latlon(row) is None
