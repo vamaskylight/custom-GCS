@@ -10,17 +10,47 @@ import json
 from urllib.parse import urlparse
 import shutil
 import subprocess
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 # Common Herelink / Skydroid / IRCam companion Wi‑Fi video subnet (RTSP host lives here).
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-23-companion-clean-preview"
+_VIDEO_PIPELINE_REV = "2026-06-23-companion-single-rtsp"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
 _COMPANION_RTSP_LAST_OPEN_MONO: float = 0.0
+
+# MapWidget registers which source ids may open FFmpeg (single view = day only).
+_companion_decode_gate: Callable[[str], bool] | None = None
+
+
+def set_companion_decode_gate(fn: Callable[[str], bool] | None) -> None:
+    """Optional gate: return False to block FFmpeg for a source id (companion RTSP)."""
+    global _companion_decode_gate
+    _companion_decode_gate = fn
+
+
+def _companion_decode_permitted(source_id: str, url: str) -> bool:
+    if not _rtsp_url_is_companion_rtsp(str(url or "").strip()):
+        return True
+    sid = str(source_id or "").strip()
+    if _companion_decode_gate is None:
+        return True
+    try:
+        ok = bool(_companion_decode_gate(sid))
+    except Exception:
+        return True
+    if not ok:
+        try:
+            print(
+                f"[VGCS:video] companion decode blocked for {sid!r} "
+                f"(single-view — C13 allows one RTSP client; url={url})"
+            )
+        except Exception:
+            pass
+    return ok
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -224,6 +254,16 @@ def _rtsp_transport_sequence(url: str, mode: str) -> tuple[str | None, ...]:
         if str(os.environ.get("VGCS_SIYI_RTSP_TCP_FIRST", "0") or "0").strip() == "1":
             return ("tcp", "udp")
         return ("udp", "tcp")
+    # Skydroid C13 (stream=1 / stream=2): UDP first — TCP often triggers HEVC POC/RPS tears.
+    if m == "auto" and _rtsp_url_is_companion_link_subnet(raw):
+        try:
+            path = (urlparse(raw).path or "").lower()
+        except Exception:
+            path = ""
+        if "stream=" in path or "/stream" in path:
+            if str(os.environ.get("VGCS_C13_RTSP_TCP_FIRST", "0") or "0").strip() == "1":
+                return ("tcp", "udp")
+            return ("udp", "tcp")
     return _rtsp_transport_order_auto(raw)
 
 
@@ -509,6 +549,14 @@ def _rgb_frame_has_decode_artifacts(arr: "np.ndarray") -> bool:
     row_magenta = magenta.mean(axis=1)
     if int((row_magenta > 0.30).sum()) >= 2:
         return True
+    # Horizontal noise bands / macroblock smear (white-gray grid in lower frame).
+    gray = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
+    row_std = gray.std(axis=1)
+    third = max(4, h // 3)
+    top_std = float(np.median(row_std[:third]))
+    bot_std = float(np.median(row_std[h - third :]))
+    if bot_std > max(14.0, top_std * 2.5) and bot_std > top_std + 8.0:
+        return True
     return False
 
 
@@ -696,26 +744,18 @@ def _ffmpeg_preflags_before_input(
             )
         else:
             if _rtsp_url_is_companion_rtsp(u):
-                # Companion HEVC (SIYI ZR10, Skydroid C13): gentler demux + igndts;
-                # demuxer auto-reconnect survives brief HEVC POC/RPS loss.
+                # Companion HEVC (C13, SIYI): gentler demux; app-level reconnect only
+                # (FFmpeg demuxer -reconnect joins mid-GOP → POC/RPS macroblock tears).
                 out.extend(
                     [
                         "-fflags",
                         "+genpts+discardcorrupt+igndts",
                         "-analyzeduration",
-                        "8000000",
+                        "12000000",
                         "-probesize",
-                        "8000000",
+                        "12000000",
                         "-flags",
                         "low_delay",
-                        "-reconnect",
-                        "1",
-                        "-reconnect_at_eof",
-                        "1",
-                        "-reconnect_streamed",
-                        "1",
-                        "-reconnect_delay_max",
-                        "2",
                     ]
                 )
             else:
@@ -1163,11 +1203,15 @@ class RtspSource(QObject):
         if self._running:
             # Recover after a partial stop (decode thread exited but preview still "on").
             if self._prefer_ffmpeg_immediately():
+                if not _companion_decode_permitted(self.source_id, str(self._url or "")):
+                    return
                 th = self._ffmpeg_thread
                 if th is None or not th.is_alive():
                     self._start_ffmpeg()
             return
         if self._prefer_ffmpeg_immediately():
+            if not _companion_decode_permitted(self.source_id, str(self._url or "")):
+                return
             print(
                 f"[VGCS:video] Stream: FFmpeg decoder (skip Qt Multimedia probe) url={self._url}"
             )
@@ -1454,6 +1498,8 @@ class RtspSource(QObject):
         url = str(self._url or "").strip()
         if not url:
             self.error.emit("Stream URL is empty")
+            return
+        if not _companion_decode_permitted(self.source_id, url):
             return
         if shutil.which("ffmpeg") is None:
             self.error.emit("ffmpeg not found in PATH (required for network video decode)")
@@ -2065,7 +2111,7 @@ class RtspSource(QObject):
                                         )
                                         if hide:
                                             corrupt_skip_streak += 1
-                                            if corrupt_skip_streak in (1, 8, 16, 24):
+                                            if corrupt_skip_streak in (1, 12, 24, 36):
                                                 try:
                                                     print(
                                                         "[VGCS:video] companion HEVC: "
@@ -2075,7 +2121,7 @@ class RtspSource(QObject):
                                                     )
                                                 except Exception:
                                                     pass
-                                            if corrupt_skip_streak >= 20:
+                                            if corrupt_skip_streak >= 45:
                                                 try:
                                                     print(
                                                         "[VGCS:video] companion HEVC: "

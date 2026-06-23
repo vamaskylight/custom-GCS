@@ -2456,7 +2456,18 @@ class MainWindow(QMainWindow):
                 s.setValue("camera/siyi_port", int(siyi_port.value()))
                 s.setValue("camera/siyi_timeout_ms", int(siyi_timeout.value()))
                 s.setValue("camera/skydroid_host", str(skydroid_host.text()).strip())
-                s.setValue("camera/skydroid_port", int(skydroid_port.value()))
+                sk_port = int(skydroid_port.value())
+                if str(skydroid_profile.currentData() or "c13_default").startswith("c13") and sk_port != 5000:
+                    try:
+                        print(
+                            f"[VGCS:skydroid] settings: TOP port {sk_port} corrected to "
+                            "5000 (PROTOCAL.doc C13 gimbal UDP)"
+                        )
+                    except Exception:
+                        pass
+                    sk_port = 5000
+                    skydroid_port.setValue(5000)
+                s.setValue("camera/skydroid_port", sk_port)
                 s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
                 s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
                 s.setValue("camera/skydroid_gimbal_speed_yaw", float(skydroid_gimbal_speed_yaw.value()))

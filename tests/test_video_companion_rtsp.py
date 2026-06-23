@@ -9,6 +9,7 @@ from vgcs.video.pipeline import (
     _companion_frame_should_hide,
     _companion_hevc_showall_enabled,
     _rgb_frame_has_decode_artifacts,
+    _rtsp_transport_sequence,
     _rtsp_transport_sequence_with_override,
     _frozen_duplicate_kill_enabled,
     _hevc_stderr_line_indicates_glitch,
@@ -121,3 +122,19 @@ def test_magenta_artifact_detector():
     hide, why = _companion_frame_should_hide(torn, good)
     assert hide and why == "artifact"
     assert not _rgb_frame_has_decode_artifacts(good)
+
+
+def test_horizontal_band_artifact_detector():
+    h, w = 120, 200
+    good = np.zeros((h, w, 3), dtype=np.uint8)
+    good[:, :, 1] = 90
+    torn = good.copy()
+    rng = np.random.default_rng(1)
+    torn[h // 2 :, :, :] = rng.integers(40, 220, (h - h // 2, w, 3), dtype=np.uint8)
+    assert _rgb_frame_has_decode_artifacts(torn)
+
+
+def test_c13_rtsp_prefers_udp_first():
+    seq = _rtsp_transport_sequence(C13_URL, "auto")
+    assert seq[0] == "udp"
+    assert "tcp" in seq
