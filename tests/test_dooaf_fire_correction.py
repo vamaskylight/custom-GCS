@@ -26,6 +26,7 @@ from vgcs.observe.dooaf import (
     _fire_correction_compass_miss_svg,
     _executive_miss_map_svg,
     _fire_correction_positions_svg,
+    _fc_inset_overlaps_markers,
 )
 
 
@@ -382,6 +383,49 @@ def test_small_miss_uses_schematic_spacing():
     assert exec_impact
     ex, ey = float(exec_impact.group(1)), float(exec_impact.group(2))
     assert math.hypot(ex - 180.0, ey - 180.0) > 45.0
+
+
+def test_inset_corner_avoids_clustered_target():
+    """Gun/drone inset must not sit on top of the plan-view target marker."""
+    from vgcs.observe.dooaf import _fc_pick_inset_corner
+
+    inset_w, inset_h = 78.0, 52.0
+    markers = [(71.6, 87.6, 20.0), (661.5, 241.3, 18.0), (58.5, 355.4, 14.0)]
+    x0, y0 = _fc_pick_inset_corner(
+        inset_w, inset_h, 40.0, 28.0, 664.0, 360.0, markers
+    )
+    assert _fc_inset_overlaps_markers(x0, y0, inset_w, inset_h, markers) < 1.0
+    assert x0 > 500.0
+
+
+def test_plan_view_inset_not_at_fixed_top_left():
+    session = build_dooaf_session(
+        [
+            _row(DOOAF_ROLE_GUN, -35.3618203, 149.1715498),
+            _row(DOOAF_ROLE_INTENDED, -35.3612780, 149.1628810),
+            _row(
+                DOOAF_ROLE_IMPACT,
+                -35.3619500,
+                149.1627000,
+                vehicle_lat=-35.3633516,
+                vehicle_lon=149.1652413,
+            ),
+        ],
+    )
+    assert session.correction is not None
+    svg = _fire_correction_plan_svg(session, session.correction)
+    inset = re.search(
+        r"<rect x='([\d.]+)' y='([\d.]+)' width='78.0' height='52.0'[^>]*fill='#fff' fill-opacity='0.92'",
+        svg,
+    )
+    assert inset
+    ix, iy = float(inset.group(1)), float(inset.group(2))
+    assert ix > 200.0, f"inset should move away from top-left cluster, got ({ix}, {iy})"
+    greens = re.findall(r"<circle cx='([\d.]+)' cy='([\d.]+)'[^>]*#22c55e", svg)
+    assert greens
+    tx, ty = float(greens[0][0]), float(greens[0][1])
+    overlap = _fc_inset_overlaps_markers(ix, iy, 78.0, 52.0, [(tx, ty, 20.0)])
+    assert overlap < 1.0
 
 
 def test_positions_map_spreads_overlapping_marks():
