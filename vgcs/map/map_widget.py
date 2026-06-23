@@ -136,6 +136,7 @@ from vgcs.video.pipeline import (
     VideoPipeline,
     QS_KEY_LAST_PHOTO_SAVE_DIR,
     notify_companion_preview_motion,
+    release_all_companion_rtsp_hosts,
     release_companion_rtsp_host,
     set_companion_decode_gate,
     suggested_photo_save_path,
@@ -4150,32 +4151,65 @@ class MapWidget(QWidget):
             print(f"[VGCS:video] companion feed switch {cur!r} -> {sid!r} ({reason})")
         except Exception:
             pass
-        for osid, src in sources.items():
+        for _osid, src in sources.items():
             try:
-                url = str(getattr(src, "_url", "") or "")
-                src.stop()
-                release_companion_rtsp_host(str(osid), url)
+                if hasattr(src, "companion_hard_stop_decode"):
+                    src.companion_hard_stop_decode(join_s=2.5)
+                else:
+                    src.stop()
+                    release_companion_rtsp_host(
+                        str(getattr(src, "source_id", "") or ""),
+                        str(getattr(src, "_url", "") or ""),
+                    )
             except Exception:
                 pass
         try:
-            vp.set_active_source(sid)
-            self._video_active_source = vp.active_source()
+            release_all_companion_rtsp_hosts()
         except Exception:
             pass
+        self._split_fullscreen_source_id = sid
+        self._native_pip_last_source_frame = QImage()
+        self._last_video_pushed = ""
         try:
-            self._start_video_decode_sources(vp)
+            self._video_gui_logged_frame = False
         except Exception:
             pass
-        try:
-            self._connect_video_pipeline_frame_slots(vp)
-        except Exception:
-            pass
-        self._sync_native_thermal_feed_button()
-        label = "Thermal" if sid == "thermal" else "Day"
-        self._set_status(
-            f"Camera feed: {label} "
-            "(C13 — day and thermal share one RTSP slot; gimbal still works)"
-        )
+
+        def _finish_switch() -> None:
+            vp2 = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+            if vp2 is None:
+                return
+            try:
+                vp2.set_active_source(sid)
+                self._video_active_source = vp2.active_source()
+            except Exception:
+                pass
+            try:
+                self._connect_video_pipeline_frame_slots(vp2)
+            except Exception:
+                pass
+            try:
+                self._start_video_decode_sources(vp2)
+            except Exception:
+                pass
+            self._sync_native_thermal_feed_button()
+            label = "Thermal" if sid == "thermal" else "Day"
+            self._set_status(
+                f"Camera feed: {label} "
+                "(C13 — one RTSP stream; gimbal unchanged)"
+            )
+            try:
+                if bool(getattr(self, "_video_swapped", False)):
+                    self._render_split_fullscreen_waiting(sid)
+                elif not bool(getattr(self, "_video_split_enabled", False)):
+                    self._native_video_preview.setPixmap(QPixmap())
+                    self._native_video_last = QImage()
+                else:
+                    self._flush_split_preview_render()
+            except Exception:
+                pass
+
+        QTimer.singleShot(450, _finish_switch)
 
     def _sync_native_thermal_feed_button(self) -> None:
         btn = getattr(self, "_btn_native_thermal", None)
@@ -6609,6 +6643,30 @@ class MapWidget(QWidget):
             self._split_last_images[str(source_id)] = img2
         except Exception:
             pass
+
+        # C13 IR switch: when split/fullscreen, paint the active feed immediately (not stale day).
+        try:
+            vp = getattr(self, "_video", None)
+            active = str(vp.active_source_id() or "").strip() if vp is not None else ""
+        except Exception:
+            active = ""
+        if (
+            self._uses_companion_rtsp()
+            and active
+            and str(source_id) == active
+            and bool(getattr(self, "_video_swapped", False))
+        ):
+            focus = str(getattr(self, "_split_fullscreen_source_id", None) or active)
+            if str(source_id) == focus:
+                last_render = float(getattr(self, "_video_ui_render_mono", 0.0) or 0.0)
+                if now_frame - last_render >= 0.04:
+                    self._video_ui_render_mono = now_frame
+                    try:
+                        self._native_pip_last_source_frame = img2
+                        self._render_native_video_preview(img2)
+                    except RuntimeError:
+                        pass
+                return
 
         if bool(getattr(self, "_video_swapped", False)):
             focus = self._ensure_split_fullscreen_focus()
