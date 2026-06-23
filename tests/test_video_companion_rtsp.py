@@ -19,6 +19,7 @@ from vgcs.video.pipeline import (
     _rtsp_url_is_companion_rtsp,
     _stall_watchdog_enabled,
     _video_stall_reconnect_s,
+    notify_companion_preview_motion,
     set_companion_decode_gate,
 )
 
@@ -154,3 +155,18 @@ def test_companion_rtsp_host_single_owner():
     finally:
         _companion_release_rtsp_host("thermal", thermal)
         set_companion_decode_gate(None)
+
+
+def test_companion_motion_preview_passes_pan_frames():
+    h, w = 64, 64
+    last = np.zeros((h, w, 3), dtype=np.uint8)
+    last[:, :, 1] = 100
+    shifted = np.zeros_like(last)
+    shifted[:, 4:, :] = last[:, :-4, :]
+    hide_still, _ = _companion_frame_should_hide(shifted, last, motion_preview=False)
+    assert not hide_still
+    notify_companion_preview_motion(duration_s=3.0)
+    # Uniform new scene after gimbal slew — must not freeze on stale last-good compare.
+    new_scene = np.full((h, w, 3), 140, dtype=np.uint8)
+    hide_motion, _ = _companion_frame_should_hide(new_scene, last, motion_preview=True)
+    assert not hide_motion
