@@ -16,11 +16,13 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-23-companion-single-rtsp"
+_VIDEO_PIPELINE_REV = "2026-06-23-companion-host-single-rtsp"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
 _COMPANION_RTSP_LAST_OPEN_MONO: float = 0.0
+# Same camera IP (e.g. 192.168.144.108) may only host one FFmpeg RTSP session.
+_COMPANION_RTSP_HOST_OWNER: dict[str, str] = {}
 
 # MapWidget registers which source ids may open FFmpeg (single view = day only).
 _companion_decode_gate: Callable[[str], bool] | None = None
@@ -30,6 +32,13 @@ def set_companion_decode_gate(fn: Callable[[str], bool] | None) -> None:
     """Optional gate: return False to block FFmpeg for a source id (companion RTSP)."""
     global _companion_decode_gate
     _companion_decode_gate = fn
+
+
+def _companion_rtsp_host(url: str) -> str:
+    try:
+        return str(urlparse(str(url or "").strip()).hostname or "").strip()
+    except Exception:
+        return ""
 
 
 def _companion_decode_permitted(source_id: str, url: str) -> bool:
@@ -51,6 +60,48 @@ def _companion_decode_permitted(source_id: str, url: str) -> bool:
         except Exception:
             pass
     return ok
+
+
+def _companion_claim_rtsp_host(source_id: str, url: str) -> bool:
+    """One FFmpeg RTSP session per companion camera host (C13 hardware limit)."""
+    u = str(url or "").strip()
+    if not _rtsp_url_is_companion_rtsp(u):
+        return True
+    if not _companion_decode_permitted(source_id, u):
+        return False
+    if str(os.environ.get("VGCS_COMPANION_DUAL_RTSP", "") or "").strip() == "1":
+        return True
+    host = _companion_rtsp_host(u)
+    if not host:
+        return True
+    sid = str(source_id or "").strip()
+    with _COMPANION_RTSP_OPEN_LOCK:
+        owner = _COMPANION_RTSP_HOST_OWNER.get(host)
+        if owner is None or owner == sid:
+            _COMPANION_RTSP_HOST_OWNER[host] = sid
+            return True
+        try:
+            print(
+                f"[VGCS:video] companion RTSP blocked for {sid!r} on {host} "
+                f"(owned by {owner!r}; C13 allows one RTSP client — set Default view "
+                f"to Single or rail ▦ off; VGCS_COMPANION_DUAL_RTSP=1 to override)"
+            )
+        except Exception:
+            pass
+        return False
+
+
+def _companion_release_rtsp_host(source_id: str, url: str) -> None:
+    u = str(url or "").strip()
+    if not _rtsp_url_is_companion_rtsp(u):
+        return
+    host = _companion_rtsp_host(u)
+    if not host:
+        return
+    sid = str(source_id or "").strip()
+    with _COMPANION_RTSP_OPEN_LOCK:
+        if _COMPANION_RTSP_HOST_OWNER.get(host) == sid:
+            _COMPANION_RTSP_HOST_OWNER.pop(host, None)
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -1203,14 +1254,14 @@ class RtspSource(QObject):
         if self._running:
             # Recover after a partial stop (decode thread exited but preview still "on").
             if self._prefer_ffmpeg_immediately():
-                if not _companion_decode_permitted(self.source_id, str(self._url or "")):
+                if not _companion_claim_rtsp_host(self.source_id, str(self._url or "")):
                     return
                 th = self._ffmpeg_thread
                 if th is None or not th.is_alive():
                     self._start_ffmpeg()
             return
         if self._prefer_ffmpeg_immediately():
-            if not _companion_decode_permitted(self.source_id, str(self._url or "")):
+            if not _companion_claim_rtsp_host(self.source_id, str(self._url or "")):
                 return
             print(
                 f"[VGCS:video] Stream: FFmpeg decoder (skip Qt Multimedia probe) url={self._url}"
@@ -1499,7 +1550,7 @@ class RtspSource(QObject):
         if not url:
             self.error.emit("Stream URL is empty")
             return
-        if not _companion_decode_permitted(self.source_id, url):
+        if not _companion_claim_rtsp_host(self.source_id, url):
             return
         if shutil.which("ffmpeg") is None:
             self.error.emit("ffmpeg not found in PATH (required for network video decode)")
@@ -1897,6 +1948,11 @@ class RtspSource(QObject):
                     tcp_138_streak = 0
 
                     while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
+                        if companion_rtsp:
+                            if not _companion_decode_permitted(self.source_id, url):
+                                break
+                            if not _companion_claim_rtsp_host(self.source_id, url):
+                                break
                         use_transport = self._companion_transport_override or transport
                         tr_label = str(use_transport) if use_transport is not None else "n/a"
                         if companion_rtsp:
@@ -2423,6 +2479,7 @@ class RtspSource(QObject):
 
         # User called stop() or thread tear-down; only close the child.
         self._close_ffmpeg_decode_proc()
+        _companion_release_rtsp_host(self.source_id, url)
 
 
 class VideoPipeline(QObject):

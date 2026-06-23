@@ -4051,7 +4051,6 @@ class MapWidget(QWidget):
         """MAVLink connected: show PiP shell immediately, then start decode when possible."""
         if not bool(getattr(self, "_last_link_connected", False)):
             return
-        self._sync_video_split_from_settings()
         self._show_mini_video_pip_shell()
         vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
         if vp is not None:
@@ -4165,7 +4164,6 @@ class MapWidget(QWidget):
         if vp is None:
             return
         try:
-            self._sync_video_split_from_settings()
             self._stop_idle_video_decode_sources(vp)
         except Exception:
             pass
@@ -5942,6 +5940,15 @@ class MapWidget(QWidget):
                 pass
             return
         want = set(self._video_preview_source_ids_to_run(vp))
+        if self._uses_companion_rtsp():
+            try:
+                print(
+                    f"[VGCS:video] companion decode plan: split="
+                    f"{bool(getattr(self, '_video_split_enabled', False))} "
+                    f"sources={sorted(want)}"
+                )
+            except Exception:
+                pass
         self._stop_idle_video_decode_sources(vp)
         for sid, src in vp.sources().items():
             if sid in want:
@@ -8670,9 +8677,32 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
-    # Skydroid TOP: hold = continuous GSY/GSP (deg/s). Fire-and-forget UDP — no reply wait.
+    # Skydroid C13: hold arrows use PTZ (PT_UP/…) — GSY/GSP speed hold is unreliable on field firmware.
     _GIMBAL_HOLD_SPEED_YAW_DPS = 5.0
     _GIMBAL_HOLD_SPEED_PITCH_DPS = 5.0
+
+    def _native_gimbal_uses_ptz_hold(self) -> bool:
+        cc = getattr(self, "_camera_control", None)
+        if cc is None:
+            return False
+        try:
+            from vgcs.video.camera_control import SkydroidCameraControl
+
+            return isinstance(cc, SkydroidCameraControl)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _native_gimbal_ptz_action(dx: int, dy: int) -> str | None:
+        if int(dy) > 0:
+            return "up"
+        if int(dy) < 0:
+            return "down"
+        if int(dx) < 0:
+            return "left"
+        if int(dx) > 0:
+            return "right"
+        return None
 
     def _gimbal_hold_speeds(self, dx: int, dy: int) -> tuple[float, float]:
         s = QSettings("VGCS", "VGCS")
@@ -8721,6 +8751,14 @@ class MapWidget(QWidget):
         cc = getattr(self, "_camera_control", None)
         if cc is None:
             return
+        if self._native_gimbal_uses_ptz_hold():
+            act = self._native_gimbal_ptz_action(dx, dy)
+            if act:
+                try:
+                    cc.ptz(act)
+                except Exception:
+                    pass
+            return
         yaw_s, pitch_s = self._gimbal_hold_speeds(dx, dy)
         try:
             cc.set_gimbal_speed(yaw_s, pitch_s)
@@ -8731,10 +8769,16 @@ class MapWidget(QWidget):
         cc = getattr(self, "_camera_control", None)
         if cc is None:
             return
-        try:
-            cc.set_gimbal_speed(0.0, 0.0)
-        except Exception:
-            pass
+        if self._native_gimbal_uses_ptz_hold():
+            try:
+                cc.ptz("stop")
+            except Exception:
+                pass
+        else:
+            try:
+                cc.set_gimbal_speed(0.0, 0.0)
+            except Exception:
+                pass
         # Trigger auto-focus shortly after gimbal stops so the image sharpens immediately
         # instead of waiting for the camera's internal AF timer (can take 3-5s on ZR10).
         QTimer.singleShot(400, self._trigger_gimbal_stop_autofocus)

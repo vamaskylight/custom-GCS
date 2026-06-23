@@ -5,9 +5,11 @@ import os
 import numpy as np
 
 from vgcs.video.pipeline import (
+    _companion_claim_rtsp_host,
     _companion_decode_max_dims,
     _companion_frame_should_hide,
     _companion_hevc_showall_enabled,
+    _companion_release_rtsp_host,
     _rgb_frame_has_decode_artifacts,
     _rtsp_transport_sequence,
     _rtsp_transport_sequence_with_override,
@@ -17,6 +19,7 @@ from vgcs.video.pipeline import (
     _rtsp_url_is_companion_rtsp,
     _stall_watchdog_enabled,
     _video_stall_reconnect_s,
+    set_companion_decode_gate,
 )
 
 C13_URL = "rtsp://192.168.144.108:554/stream=1"
@@ -138,3 +141,16 @@ def test_c13_rtsp_prefers_udp_first():
     seq = _rtsp_transport_sequence(C13_URL, "auto")
     assert seq[0] == "udp"
     assert "tcp" in seq
+
+
+def test_companion_rtsp_host_single_owner():
+    thermal = "rtsp://192.168.144.108:555/stream=2"
+    set_companion_decode_gate(lambda sid: sid in ("day", "thermal"))
+    try:
+        assert _companion_claim_rtsp_host("day", C13_URL)
+        assert not _companion_claim_rtsp_host("thermal", thermal)
+        _companion_release_rtsp_host("day", C13_URL)
+        assert _companion_claim_rtsp_host("thermal", thermal)
+    finally:
+        _companion_release_rtsp_host("thermal", thermal)
+        set_companion_decode_gate(None)
