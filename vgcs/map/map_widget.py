@@ -993,6 +993,7 @@ class _ObservationExportTask(QRunnable):
             "vehicle_roll_deg",
             "vehicle_pitch_deg",
             "vehicle_rel_alt_m",
+            "vehicle_alt_msl_m",
             "gimbal_yaw_deg",
             "gimbal_pitch_deg",
             "gimbal_yaw_direction",

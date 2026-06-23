@@ -23,6 +23,9 @@ from vgcs.observe.dooaf import (
     validate_dooaf_settings,
     _fire_correction_plan_svg,
     _fire_correction_gunline_svg,
+    _fire_correction_compass_miss_svg,
+    _executive_miss_map_svg,
+    _fire_correction_positions_svg,
 )
 
 
@@ -72,6 +75,7 @@ def test_build_session_from_marks():
             77.0,
             vehicle_lat=12.005,
             vehicle_lon=77.0,
+            vehicle_alt_msl_m=120.0,
             vehicle_rel_alt_m=120.0,
         ),
     ]
@@ -336,3 +340,78 @@ def test_gunline_view_matches_compass_readability():
     ix, iy = float(impact.group(1)), float(impact.group(2))
     miss_px = math.hypot(ix - cx, iy - cy)
     assert miss_px > 80.0, f"miss vector should fill gun-line plot, got {miss_px:.1f}px"
+
+
+def _small_miss_session():
+    """~2 m miss: impact slightly south-east of intended, gun nearby."""
+    gun = GeoPoint(12.0, 77.0)
+    intended = GeoPoint(12.00005, 77.00005)
+    dlat_s = -2.0 / 111_320.0
+    dlon_e = 1.0 / (111_320.0 * math.cos(math.radians(intended.lat)))
+    impact = GeoPoint(intended.lat + dlat_s, intended.lon + dlon_e)
+    return build_dooaf_session(
+        [
+            _row(DOOAF_ROLE_GUN, gun.lat, gun.lon),
+            _row(DOOAF_ROLE_INTENDED, intended.lat, intended.lon),
+            _row(DOOAF_ROLE_IMPACT, impact.lat, impact.lon),
+        ],
+    )
+
+
+def test_small_miss_uses_schematic_spacing():
+    """Sub-12 m misses keep readable diagram spacing; values stay in labels."""
+    session = _small_miss_session()
+    assert session.correction is not None
+    c = session.correction
+    assert c.impact_to_intended_m < 5.0
+
+    gunline = _fire_correction_gunline_svg(c, session=session)
+    compass = _fire_correction_compass_miss_svg(c, session=session)
+    executive = _executive_miss_map_svg(session, c)
+    plan = _fire_correction_plan_svg(session, c)
+
+    for svg in (gunline, compass, executive, plan):
+        assert "Spacing for readability" in svg
+
+    gun_impact = re.search(r"<circle cx='([\d.]+)' cy='([\d.]+)' r='10'", gunline)
+    assert gun_impact
+    ix, iy = float(gun_impact.group(1)), float(gun_impact.group(2))
+    assert math.hypot(ix - 200.0, iy - 200.0) > 50.0
+
+    exec_impact = re.search(r"<circle cx='([\d.]+)' cy='([\d.]+)' r='9'", executive)
+    assert exec_impact
+    ex, ey = float(exec_impact.group(1)), float(exec_impact.group(2))
+    assert math.hypot(ex - 180.0, ey - 180.0) > 45.0
+
+
+def test_positions_map_spreads_overlapping_marks():
+    """Gun, target, and impact icons separate when geographically coincident."""
+    gun = GeoPoint(12.0, 77.0)
+    intended = GeoPoint(12.00005, 77.00005)
+    dlat_s = -2.0 / 111_320.0
+    dlon_e = 1.0 / (111_320.0 * math.cos(math.radians(intended.lat)))
+    impact = GeoPoint(intended.lat + dlat_s, intended.lon + dlon_e)
+    session = build_dooaf_session(
+        [
+            _row(DOOAF_ROLE_GUN, gun.lat, gun.lon),
+            _row(DOOAF_ROLE_INTENDED, intended.lat, intended.lon),
+            _row(DOOAF_ROLE_IMPACT, impact.lat, impact.lon),
+        ],
+    )
+    svg = _fire_correction_positions_svg(session)
+    label_pts = {
+        m.group(3): (float(m.group(1)), float(m.group(2)) + 14.0)
+        for m in re.finditer(
+            r"<text x='([\d.]+)' y='([\d.]+)'[^>]*>(Gun|Target)</text>",
+            svg,
+        )
+    }
+    impact_m = re.search(r"<circle cx='([\d.]+)' cy='([\d.]+)' r='10' fill='#dc2626'", svg)
+    assert impact_m
+    label_pts["Impact"] = (float(impact_m.group(1)), float(impact_m.group(2)))
+    assert {"Gun", "Target", "Impact"} <= set(label_pts)
+    gx, gy = label_pts["Gun"]
+    tx, ty = label_pts["Target"]
+    ix, iy = label_pts["Impact"]
+    assert math.hypot(gx - tx, gy - ty) > 24.0
+    assert math.hypot(ix - tx, iy - ty) > 24.0
