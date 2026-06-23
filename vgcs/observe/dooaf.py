@@ -311,6 +311,21 @@ def point_from_row(row: dict[str, Any]) -> GeoPoint | None:
     return GeoPoint(pt[0], pt[1], _float_or_none(row.get("target_alt_m")))
 
 
+def _drone_alt_msl_from_row(row: dict[str, Any]) -> float | None:
+    """Drone position MSL — never treat EKF relative (above home) as sea level."""
+    msl = _float_or_none(row.get("vehicle_alt_msl_m"))
+    if msl is not None:
+        return msl
+    lat = _float_or_none(row.get("vehicle_lat"))
+    lon = _float_or_none(row.get("vehicle_lon"))
+    agl = _float_or_none(row.get("dem_ground_agl_m"))
+    if lat is not None and lon is not None and agl is not None:
+        dem = dem_alt_msl_at_mark(row, GeoPoint(lat, lon, None))
+        if dem is not None:
+            return float(dem) + float(agl)
+    return None
+
+
 def drone_from_row(row: dict[str, Any] | None) -> GeoPoint | None:
     if row is None:
         return None
@@ -318,7 +333,27 @@ def drone_from_row(row: dict[str, Any] | None) -> GeoPoint | None:
     lon = _float_or_none(row.get("vehicle_lon"))
     if lat is None or lon is None:
         return None
-    return GeoPoint(lat, lon, _float_or_none(row.get("vehicle_rel_alt_m")))
+    return GeoPoint(lat, lon, _drone_alt_msl_from_row(row))
+
+
+def _fill_point_alt_m(
+    pt: GeoPoint | None,
+    row: dict[str, Any] | None,
+    settings_alt_m: float | None,
+    *,
+    dem_path: str | Path | None = None,
+) -> GeoPoint | None:
+    """Prefer mark/settings altitude; fall back to DEM at the footprint."""
+    if pt is None:
+        return None
+    alt = pt.alt_m
+    if alt is None and settings_alt_m is not None:
+        alt = float(settings_alt_m)
+    if alt is None:
+        alt = dem_alt_msl_at_mark(row, pt, dem_path=dem_path)
+    if alt is None or alt == pt.alt_m:
+        return pt
+    return GeoPoint(pt.lat, pt.lon, alt)
 
 
 def latest_mark(rows: list[dict[str, Any]], role: str) -> GeoPoint | None:
@@ -630,16 +665,20 @@ def build_dooaf_session(
     target_alt_m: float | None = None,
     dem_path: str | Path | None = None,
 ) -> DooafSession:
+    gun_row = latest_mark_row(rows, DOOAF_ROLE_GUN)
+    intended_row = latest_mark_row(rows, DOOAF_ROLE_INTENDED)
+    impact_row = latest_mark_row(rows, DOOAF_ROLE_IMPACT)
     gun = latest_mark(rows, DOOAF_ROLE_GUN) or gun_from_settings(
         gun_lat=gun_lat, gun_lon=gun_lon, gun_alt_m=gun_alt_m
     )
+    gun = _fill_point_alt_m(gun, gun_row, gun_alt_m, dem_path=dem_path)
     intended = latest_mark(rows, DOOAF_ROLE_INTENDED) or point_from_latlon(
         lat=target_lat, lon=target_lon, alt_m=target_alt_m
     )
+    intended = _fill_point_alt_m(intended, intended_row, target_alt_m, dem_path=dem_path)
     impact = latest_mark(rows, DOOAF_ROLE_IMPACT)
+    impact = _fill_point_alt_m(impact, impact_row, None, dem_path=dem_path)
     drone = drone_from_row(rows[-1] if rows else None)
-    intended_row = latest_mark_row(rows, DOOAF_ROLE_INTENDED)
-    impact_row = latest_mark_row(rows, DOOAF_ROLE_IMPACT)
     building_height_m: float | None = None
     if intended is not None and impact is not None:
         intended, impact, building_height_m = resolve_dooaf_mark_elevations(
@@ -1517,9 +1556,24 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
         y = cy_graph - (north - mid_n) * scale_n
         return x, y
 
-    gx, gy = _xy(0.0, 0.0)
-    tx, ty = _xy(ne_t[1], ne_t[0])
-    ix, iy = _xy(ne_i[1], ne_i[0])
+    geo_span_m = max(
+        math.hypot(ne_t[0], ne_t[1]),
+        math.hypot(ne_i[0], ne_i[1]),
+        math.hypot(miss_e, miss_n),
+        1.0,
+    )
+    plan_schematic = geo_span_m < 15.0
+    if plan_schematic:
+        tri_r = min(plot_w, plot_h) * 0.40
+        gx = cx_graph - tri_r * 0.72
+        gy = cy_graph
+        tx, ty = cx_graph, cy_graph
+        imp_pts = _fc_miss_plot_points(tx, ty, tri_r * 0.55, miss_e, miss_n)
+        ix, iy = imp_pts.ix, imp_pts.iy
+    else:
+        gx, gy = _xy(0.0, 0.0)
+        tx, ty = _xy(ne_t[1], ne_t[0])
+        ix, iy = _xy(ne_i[1], ne_i[0])
     corner_x, corner_y = ix, ty
     cluster_x = (tx + ix) / 2.0
     cluster_y = (ty + iy) / 2.0
@@ -1556,6 +1610,10 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
         parts.append(
             f"<text x='{bg_x + bg_w - 6:.0f}' y='{graph_bottom - 5:.0f}' text-anchor='end' "
             "font-size='7' fill='#94a3b8'>N/S scale exaggerated for visibility</text>"
+        )
+    if plan_schematic:
+        parts.append(
+            _fc_schematic_spacing_note(bg_x + bg_w - 6.0, graph_bottom - (16.0 if axis_stretched else 5.0))
         )
     parts.extend(
         [
@@ -1626,22 +1684,111 @@ def _fc_miss_offset_label(value_m: float, pos_word: str, neg_word: str) -> str |
         return None
     return f"{abs(v):.1f} m {pos_word if v > 0 else neg_word}"
 
+
+@dataclass(frozen=True)
+class _FcMissPlotPoints:
+    ix: float
+    iy: float
+    ex: float
+    ey: float
+    schematic: bool
+
+
+def _fc_miss_plot_points(
+    cx: float,
+    cy: float,
+    plot_r: float,
+    h_m: float,
+    v_m: float,
+    *,
+    vertical_down: bool = False,
+    fill: float = 0.50,
+    floor: float = 12.0,
+    schematic_below_m: float = 12.0,
+) -> _FcMissPlotPoints:
+    """Place impact for readability: small misses use fixed diagram spacing, not true scale."""
+    dist_m = math.hypot(h_m, v_m)
+    if dist_m < 0.05:
+        return _FcMissPlotPoints(cx, cy, cx, cy, False)
+    if dist_m < schematic_below_m:
+        scale = (plot_r * fill) / dist_m
+        schematic = True
+    else:
+        span = max(abs(h_m), abs(v_m), floor)
+        scale = plot_r / span
+        schematic = False
+    hx = h_m * scale
+    vy = v_m * scale if vertical_down else -v_m * scale
+    return _FcMissPlotPoints(cx + hx, cy + vy, cx + hx, cy, schematic)
+
+
+def _fc_schematic_spacing_note(x: float, y: float) -> str:
+    return (
+        f"<text x='{x:.1f}' y='{y:.1f}' text-anchor='end' font-size='7' fill='#94a3b8'>"
+        "Spacing for readability · values true</text>"
+    )
+
+
+def _fc_miss_vector_label_xy(
+    cx: float,
+    cy: float,
+    ix: float,
+    iy: float,
+    *,
+    offset: float = 16.0,
+) -> tuple[float, float]:
+    """Offset the miss label off the miss vector so it does not sit on component text."""
+    mx, my = (cx + ix) / 2.0, (cy + iy) / 2.0
+    dx, dy = ix - cx, iy - cy
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return mx, my - offset
+    px, py = -dy / length, dx / length
+    return mx + px * offset, my + py * offset
+
+
+def _fc_spread_position_markers(
+    pt_xy: dict[str, tuple[float, float]],
+    *,
+    min_sep_px: float = 36.0,
+) -> dict[str, tuple[float, float]]:
+    """Separate overlapping Gun / Target / Impact icons; distances stay in the table."""
+    cluster = [lbl for lbl in ("Gun", "Target", "Impact") if lbl in pt_xy]
+    if len(cluster) < 2:
+        return pt_xy
+    pts = dict(pt_xy)
+    max_sep = 0.0
+    for i, a in enumerate(cluster):
+        ax, ay = pts[a]
+        for b in cluster[i + 1 :]:
+            bx, by = pts[b]
+            max_sep = max(max_sep, math.hypot(ax - bx, ay - by))
+    if max_sep >= min_sep_px:
+        return pts
+    cx = sum(pts[lbl][0] for lbl in cluster) / len(cluster)
+    cy = sum(pts[lbl][1] for lbl in cluster) / len(cluster)
+    angles_deg = {"Gun": 205.0, "Target": 25.0, "Impact": 115.0}
+    radius = min_sep_px * 0.92
+    for lbl in cluster:
+        ang = math.radians(angles_deg.get(lbl, 0.0))
+        pts[lbl] = (cx + radius * math.cos(ang), cy - radius * math.sin(ang))
+    return pts
+
+
 def _fire_correction_gunline_svg(c: FireCorrection, *, session: DooafSession | None = None) -> str:
     """Gun-line miss view (target at centre) — same layout pattern as compass miss."""
     along = float(c.miss_along_m)
     right = float(c.miss_right_m)
-    span = max(abs(along), abs(right), 12.0)
     along_label = _fc_miss_offset_label(along, "Far", "Short")
     right_label = _fc_miss_offset_label(right, "Right", "Left")
 
     vb_w, vb_h, margin, r_tgt, r_imp = 400.0, 400.0, 52.0, 11.0, 10.0
     cx, cy = vb_w / 2.0, vb_h / 2.0
     plot_r = min(cx, cy) - margin
-    px_per_m = plot_r / span
+    pts = _fc_miss_plot_points(cx, cy, plot_r, along, right, vertical_down=True)
+    ix, iy, ax, ay = pts.ix, pts.iy, pts.ex, pts.ey
     tx, ty = cx, cy
-    ix = cx + along * px_per_m
-    iy = cy + right * px_per_m
-    ax, ay = ix, ty
+    miss_lx, miss_ly = _fc_miss_vector_label_xy(tx, ty, ix, iy)
     fs = 9
 
     parts: list[str] = [
@@ -1696,14 +1843,16 @@ def _fire_correction_gunline_svg(c: FireCorrection, *, session: DooafSession | N
             "stroke-width='2.5'/>",
             f"<line x1='{ix:.1f}' y1='{iy:.1f}' x2='{tx:.1f}' y2='{ty:.1f}' stroke='#0d9488' "
             "stroke-width='2' stroke-dasharray='5,3'/>",
-            f"<text x='{min(tx, ix) - 6:.0f}' y='{(ty + iy) / 2 - 6:.0f}' font-size='{fs + 1}' "
+            f"<text x='{miss_lx:.0f}' y='{miss_ly:.0f}' text-anchor='middle' font-size='{fs + 1}' "
             f"fill='#ea580c' font-weight='700'>"
             f"{_fc_svg_esc(f'Miss {c.impact_to_intended_m:.1f} m')}</text>",
-            "</svg>",
         ]
     )
+    if pts.schematic:
+        parts.insert(-1, _fc_schematic_spacing_note(vb_w - margin - 4.0, vb_h - margin + 2.0))
     if session is not None:
         parts.insert(-1, _fc_svg_gun_drone_inset(session, margin, margin, 78.0, 52.0))
+    parts.append("</svg>")
     return "".join(parts)
 
 
@@ -1720,17 +1869,15 @@ def _fire_correction_compass_miss_svg(
     """Target-centred compass: impact offset and E/N miss components."""
     miss_e = float(c.miss_east_m)
     miss_n = float(c.miss_north_m)
-    span = _fc_compass_span(miss_e, miss_n, floor=8.0 if compact else 12.0)
     if compact:
         vb_w, vb_h, margin, r_tgt, r_imp = 280.0, 280.0, 40.0, 9.0, 8.0
     else:
         vb_w, vb_h, margin, r_tgt, r_imp = 400.0, 400.0, 52.0, 11.0, 10.0
     cx, cy = vb_w / 2.0, vb_h / 2.0
     plot_r = min(cx, cy) - margin
-    px_per_m = plot_r / span
-    ix = cx + miss_e * px_per_m
-    iy = cy - miss_n * px_per_m
-    ex, ey = cx + miss_e * px_per_m, cy
+    pts = _fc_miss_plot_points(cx, cy, plot_r, miss_e, miss_n)
+    ix, iy, ex, ey = pts.ix, pts.iy, pts.ex, pts.ey
+    miss_lx, miss_ly = _fc_miss_vector_label_xy(cx, cy, ix, iy)
     e_label = (
         f"{abs(miss_e):.1f} m {'E' if miss_e >= 0 else 'W'}"
         if abs(miss_e) >= 0.05
@@ -1794,14 +1941,16 @@ def _fire_correction_compass_miss_svg(
             "stroke-width='2.5'/>",
             f"<line x1='{ix:.1f}' y1='{iy:.1f}' x2='{cx:.1f}' y2='{cy:.1f}' stroke='#0d9488' "
             "stroke-width='2' stroke-dasharray='5,3'/>",
-            f"<text x='{min(cx, ix) - 6:.0f}' y='{(cy + iy) / 2 - 6:.0f}' font-size='{fs + 1}' "
+            f"<text x='{miss_lx:.0f}' y='{miss_ly:.0f}' text-anchor='middle' font-size='{fs + 1}' "
             f"fill='#ea580c' font-weight='700'>"
             f"{_fc_svg_esc(f'Miss {c.impact_to_intended_m:.1f} m')}</text>",
-            "</svg>",
         ]
     )
+    if pts.schematic:
+        parts.insert(-1, _fc_schematic_spacing_note(vb_w - margin - 4.0, vb_h - margin + 2.0))
     if session is not None:
         parts.insert(-1, _fc_svg_gun_drone_inset(session, margin, margin, 78.0, 52.0))
+    parts.append("</svg>")
     return "".join(parts)
 
 
@@ -2017,6 +2166,7 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
     pt_xy: dict[str, tuple[float, float]] = {}
     for label, east, north, color, letter in en_pts:
         pt_xy[label] = _xy(east, north)
+    pt_xy = _fc_spread_position_markers(pt_xy)
 
     placer = _FcSvgLabelPlacer()
     placer.add_blocked_zone(bg_x + bg_w / 2, footer_top + footer_h / 2, bg_w + 4, footer_h + footer_gap + 4)
@@ -2092,7 +2242,7 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
         )
 
     for label, east, north, color, letter in en_pts:
-        x, y = _xy(east, north)
+        x, y = pt_xy[label]
         if label == "Gun":
             parts.append(_fc_svg_marker_gun(x, y, bearing_deg=gun_brg))
         elif label == "Target":
@@ -2427,17 +2577,15 @@ def _executive_miss_map_svg(session: DooafSession, c: FireCorrection) -> str:
     """Summary map: target-centred miss, +/- labels, artillery & drone on rim."""
     miss_e = float(c.miss_east_m)
     miss_n = float(c.miss_north_m)
-    span = _fc_compass_span(miss_e, miss_n, floor=8.0)
     vb_w, vb_h = 360.0, 360.0
     margin = 42.0
     r_tgt, r_imp = 10.0, 9.0
     fs = 10
     cx, cy = vb_w / 2.0, vb_h / 2.0
     plot_r = min(cx, cy) - margin
-    px_per_m = plot_r / span
-    ix = cx + miss_e * px_per_m
-    iy = cy - miss_n * px_per_m
-    ex, ey = cx + miss_e * px_per_m, cy
+    pts = _fc_miss_plot_points(cx, cy, plot_r, miss_e, miss_n)
+    ix, iy, ex, ey = pts.ix, pts.iy, pts.ex, pts.ey
+    miss_lx, miss_ly = _fc_miss_vector_label_xy(cx, cy, ix, iy)
     intended = session.intended
 
     parts: list[str] = [
@@ -2507,15 +2655,17 @@ def _executive_miss_map_svg(session: DooafSession, c: FireCorrection) -> str:
             "stroke-width='2.5'/>",
             f"<line x1='{ix:.1f}' y1='{iy:.1f}' x2='{cx:.1f}' y2='{cy:.1f}' stroke='#0d9488' "
             "stroke-width='2' stroke-dasharray='5,3'/>",
-            f"<text x='{min(cx, ix) - 8:.0f}' y='{(cy + iy) / 2 - 6:.0f}' font-size='{fs + 1}' "
+            f"<text x='{miss_lx:.0f}' y='{miss_ly:.0f}' text-anchor='middle' font-size='{fs + 1}' "
             f"fill='#ea580c' font-weight='800'>"
             f"{_fc_svg_esc(f'Miss {c.impact_to_intended_m:.1f} m')}</text>",
             f"<text x='{margin + 4:.0f}' y='{vb_h - 10:.0f}' font-size='8' fill='#64748b'>"
             "<tspan fill='#15803d' font-weight='800'>+</tspan><tspan> / </tspan>"
             "<tspan fill='#b91c1c' font-weight='800'>−</tspan><tspan> = direction</tspan></text>",
-            "</svg>",
         ]
     )
+    if pts.schematic:
+        parts.insert(-2, _fc_schematic_spacing_note(vb_w - margin - 4.0, vb_h - margin + 2.0))
+    parts.append("</svg>")
     return "".join(parts)
 
 
@@ -3594,6 +3744,14 @@ def _format_observation_log_entry(
         detail_rows.append(
             _log_detail_row("Grid ref (MGRS)", _format_mgrs_badge(row.get("vehicle_grid_ref")))
         )
+        msl_alt = row.get("vehicle_alt_msl_m")
+        if not _is_missing_cell(msl_alt, cell_fn):
+            detail_rows.append(
+                _log_detail_row(
+                    "Altitude (MSL)",
+                    _format_alt_m_html(msl_alt, cell_fn),
+                )
+            )
         ekf_alt = row.get("ekf_rel_alt_m")
         if _is_missing_cell(ekf_alt, cell_fn):
             ekf_alt = row.get("vehicle_rel_alt_m")
