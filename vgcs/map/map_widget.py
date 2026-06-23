@@ -64,7 +64,6 @@ from PySide6.QtGui import (
 )
 from vgcs.map.native_video_overlay import (
     NativeVideoOverlayLayer,
-    VideoOverlayDetection,
     VideoOverlayLrfLock,
     VideoOverlayMark,
 )
@@ -1322,7 +1321,6 @@ class MapWidget(QWidget):
         self._obs_clip_secs_left = 0
         self._obs_clip_countdown_timer: QTimer | None = None
         self._obs_clip_banner: QLabel | None = None
-        self._ai_phase = 0.0
         self._payload_hardware_recording = False
         self._vehicle_rel_alt_m: float | None = None
         self._rangefinder_down_m: float | None = None
@@ -5670,7 +5668,6 @@ class MapWidget(QWidget):
         self._video_pool = QThreadPool.globalInstance()
         self._split_last_images = {}
         self._native_pip_last_source_frame = QImage()
-        self._ai_phase = 0.0
 
         try:
             if shared is not None:
@@ -5718,11 +5715,6 @@ class MapWidget(QWidget):
             self._split_render_timer = QTimer(self)
             self._split_render_timer.setSingleShot(True)
             self._split_render_timer.timeout.connect(self._flush_split_preview_render)
-        if not hasattr(self, "_ai_timer") or self._ai_timer is None:
-            self._ai_timer = QTimer(self)
-            self._ai_timer.setInterval(250)  # 4 Hz — lower paint load during Target / RTSP
-            self._ai_timer.timeout.connect(self._push_dummy_ai_overlay)
-
         try:
             old_br = getattr(self, "_video_encode_bridge", None)
             if old_br is not None:
@@ -6433,10 +6425,10 @@ class MapWidget(QWidget):
                         self._set_status(f"Video preview: {dname} [{sid}]")
                 except Exception:
                     pass
-            t_ai = getattr(self, "_ai_timer", None)
-            if t_ai is not None and not t_ai.isActive():
-                t_ai.start()
-            self._tick_native_ai_overlay()
+            try:
+                self._native_video_overlay.clear_detections()
+            except Exception:
+                pass
             if self._should_defer_companion_rtsp_decode() and not force_decode:
                 self._set_status("Mini-video ready — stream starts when vehicle connects")
                 return
@@ -6451,8 +6443,6 @@ class MapWidget(QWidget):
         self._run_js("if (window.setNativeHudMode) setNativeHudMode(false);")
         if hasattr(self, "_video_push_timer") and self._video_push_timer.isActive():
             self._video_push_timer.stop()
-        if hasattr(self, "_ai_timer") and self._ai_timer.isActive():
-            self._ai_timer.stop()
         try:
             self._native_video_overlay.clear_all()
             self._lrf_lock_uv = None
@@ -6796,27 +6786,6 @@ class MapWidget(QWidget):
         self._last_video_pushed = src
         self._run_js("setVideoPreviewMode('single');")
         self._run_js(f"setVideoPreviewImage({json.dumps(src)});")
-
-    def _tick_native_ai_overlay(self) -> None:
-        """M7 demo detection box on native video preview (replaces inactive WebEngine-only path)."""
-        if not bool(getattr(self, "_video_preview_enabled", False)):
-            return
-        try:
-            self._ai_phase = float(getattr(self, "_ai_phase", 0.0)) + 0.06
-        except Exception:
-            self._ai_phase = 0.0
-        p = float(getattr(self, "_ai_phase", 0.0))
-        x = 0.1 + (0.6 * (0.5 + 0.5 * math.sin(p)))  # 0.1..0.7
-        det = [
-            VideoOverlayDetection(x=x, y=0.18, w=0.22, h=0.22, label="demo", score=0.86),
-        ]
-        try:
-            self._native_video_overlay.set_detections(det)
-        except Exception:
-            pass
-
-    def _push_dummy_ai_overlay(self) -> None:
-        self._tick_native_ai_overlay()
 
     def _apply_digital_zoom(self, img: QImage, zoom: float) -> QImage:
         try:
