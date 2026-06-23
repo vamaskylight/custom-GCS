@@ -135,6 +135,7 @@ from vgcs.video.pipeline import (
     VideoFrame,
     VideoPipeline,
     QS_KEY_LAST_PHOTO_SAVE_DIR,
+    set_companion_decode_gate,
     suggested_photo_save_path,
     suggested_recording_save_path,
     wait_qmedia_recorder_stopped,
@@ -1214,6 +1215,7 @@ class MapWidget(QWidget):
         self._video_sources_changed_conn_id: int | None = None
         if self._video_pipeline_shared is not None:
             self._hook_video_pipeline_sources_changed(self._video_pipeline_shared)
+        set_companion_decode_gate(self._companion_video_decode_gate)
         self._lat: float | None = None
         self._lon: float | None = None
         self._map_display_lat: float | None = None
@@ -4049,13 +4051,47 @@ class MapWidget(QWidget):
         """MAVLink connected: show PiP shell immediately, then start decode when possible."""
         if not bool(getattr(self, "_last_link_connected", False)):
             return
+        self._sync_video_split_from_settings()
         self._show_mini_video_pip_shell()
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is not None:
+            try:
+                self._stop_idle_video_decode_sources(vp)
+            except Exception:
+                pass
         if self._video_preview_should_run():
             self._auto_start_mini_video_pip(force_decode=False, preserve_layout=True)
             QTimer.singleShot(
                 800,
                 lambda: self._companion_start_decode_if_needed(reason="mavlink_link"),
             )
+
+    def _companion_video_decode_gate(self, source_id: str) -> bool:
+        """C13 allows one RTSP client — decode only sources needed for current preview mode."""
+        if not self._mini_video_pip_allowed():
+            return False
+        if not self._video_preview_should_run():
+            return False
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is None:
+            return str(source_id or "").strip() == "day"
+        try:
+            want = set(self._video_preview_source_ids_to_run(vp))
+        except Exception:
+            return str(source_id or "").strip() == "day"
+        return str(source_id or "").strip() in want
+
+    def _sync_video_split_from_settings(self) -> None:
+        try:
+            self._read_video_settings()
+            self._video_split_enabled = (
+                str(getattr(self, "_video_settings_default_view", "Single") or "Single")
+                .strip()
+                .lower()
+                == "split"
+            )
+        except Exception:
+            pass
 
     def _uses_companion_rtsp(self) -> bool:
         day = str(getattr(self, "_video_settings_day", "") or "").strip().lower()
@@ -4128,6 +4164,11 @@ class MapWidget(QWidget):
         vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
         if vp is None:
             return
+        try:
+            self._sync_video_split_from_settings()
+            self._stop_idle_video_decode_sources(vp)
+        except Exception:
+            pass
         if self._companion_decode_running(vp):
             if bool(getattr(self, "_video_preview_enabled", False)):
                 try:

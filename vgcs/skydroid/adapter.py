@@ -170,6 +170,15 @@ class SkydroidTopUdpAdapter:
         self._status_lock = threading.Lock()
         self._profile: SkydroidCommandProfile = get_profile(profile_id)
         self._profile_id = str(profile_id or "c13_default")
+        port_i = int(port)
+        if port_i not in _C13_PROBE_PORTS:
+            try:
+                print(
+                    f"[VGCS:skydroid] configured TOP UDP port {port_i} is not PROTOCAL "
+                    f"default 5000 — background probe will use 192.168.144.108:5000"
+                )
+            except Exception:
+                pass
         self._running = False
         self._worker: threading.Thread | None = None
         self._status_poller: threading.Thread | None = None
