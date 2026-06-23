@@ -369,6 +369,14 @@ def facade_vertical_height_between_marks(
 
         agl_eff, _ = session_facade_measure_agl_m([row_a, row_b])
     if agl_eff is None or agl_eff < _MIN_FACADE_AGL_M:
+        fb = _pair_height_from_video_y_and_range(
+            upper_row,
+            lower_row,
+            hfov_deg=hfov_deg,
+            camera_vfov_deg=camera_vfov_deg,
+        )
+        if fb is not None:
+            return fb
         return None
 
     vfov = (
@@ -423,6 +431,14 @@ def facade_vertical_height_between_marks(
                 estimates.append(h_rh)
 
     if not estimates:
+        fb = _pair_height_from_video_y_and_range(
+            upper_row,
+            lower_row,
+            hfov_deg=hfov_deg,
+            camera_vfov_deg=camera_vfov_deg,
+        )
+        if fb is not None:
+            return fb
         return None
 
     h_dep: float | None = None
@@ -443,3 +459,50 @@ def facade_vertical_height_between_marks(
                 return h_dep
 
     return sum(estimates) / len(estimates)
+
+
+def _pair_height_from_video_y_and_range(
+    row_upper: dict[str, Any],
+    row_lower: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    camera_vfov_deg: float | None = None,
+    min_dy: float = 0.04,
+) -> float | None:
+    """
+    Low-hover fallback: estimate vertical separation from video Y and geo range.
+
+    Used when drone AGL is below the full facade-ray threshold but the operator
+  picked aim point and impact at different heights on the same facade.
+    """
+    xy_u, xy_l = _video_xy(row_upper), _video_xy(row_lower)
+    if xy_u is None or xy_l is None:
+        return None
+    dy = float(xy_l[1]) - float(xy_u[1])
+    if dy < min_dy:
+        return None
+    vfov = (
+        float(camera_vfov_deg)
+        if camera_vfov_deg is not None
+        else float(hfov_deg) * 0.5625
+    )
+    angle_v = dy * math.radians(vfov)
+    if angle_v < 0.012:
+        return None
+    rh_vals: list[float] = []
+    for row in (row_upper, row_lower):
+        for key in ("geo_range_m",):
+            raw = row.get(key)
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if val >= 3.0:
+                rh_vals.append(val)
+    if not rh_vals:
+        return None
+    rh = sum(rh_vals) / len(rh_vals)
+    height = rh * math.tan(angle_v)
+    return height if height >= 0.35 else None
