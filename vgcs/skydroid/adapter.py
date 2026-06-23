@@ -1679,23 +1679,38 @@ class SkydroidTopUdpAdapter:
             return False
         return abs(float(value_m) - float(baseline_m)) >= _LRF_MOVED_MIN_M
 
-    def _read_gimbal_attitude_deg(self) -> tuple[float, float] | None:
+    def _read_gimbal_attitude_deg(self, *, use_cache: bool = True) -> tuple[float, float] | None:
+        """Blocking GAC read on the active probe endpoint (retries + recent cache fallback)."""
+        self._ensure_active_transport()
         active_port = int(self._transport._port)
         try:
-            reply = self._transport.send_and_receive(
-                build_gac_query(),
-                expect_reply=True,
-                log=False,
-                timeout_s=0.45,
-            )
-            if not reply:
-                return None
-            dec = parse_top_frame(reply)
-            yaw, pitch = extract_attitude_deg(dec)
-            if yaw is None and pitch is None:
-                return None
-            return float(yaw or 0.0), float(pitch or 0.0)
-        except Exception:
+            for attempt in range(3):
+                try:
+                    reply = self._transport.send_and_receive(
+                        build_gac_query(),
+                        expect_reply=True,
+                        log=False,
+                        timeout_s=0.55 if attempt else 0.45,
+                    )
+                except Exception:
+                    time.sleep(0.05)
+                    continue
+                if not reply:
+                    time.sleep(0.04)
+                    continue
+                dec = parse_top_frame(reply)
+                yaw, pitch = extract_attitude_deg(dec)
+                if yaw is None and pitch is None:
+                    time.sleep(0.04)
+                    continue
+                return float(yaw or 0.0), float(pitch or 0.0)
+            if use_cache:
+                st = self.get_status_cached()
+                age = time.monotonic() - float(st.updated_mono or 0.0)
+                if st.supported and age < 2.5:
+                    cached = self._attitude_from_cache()
+                    if cached is not None:
+                        return cached
             return None
         finally:
             self._transport._port = active_port
@@ -2117,6 +2132,7 @@ class SkydroidTopUdpAdapter:
 
     def _query_slr_distance_m(self, *, log: bool = False, fresh: bool = False) -> float | None:
         """SLR read: E-class laser module first, D-class fallback (PROTOCAL §2.2.2 / §4.22)."""
+        self._ensure_active_transport()
         active_port = int(self._transport._port)
         laser_q = build_slr_query(dest=_LRF_SLR_DEST_LASER)
         system_q = build_slr_query(dest=_LRF_SLR_DEST_SYSTEM)
@@ -2444,6 +2460,7 @@ class SkydroidTopUdpAdapter:
                 except Exception:
                     pass
                 continue
+            self._ensure_active_transport()
             for command in commands:
                 frame = build_top_frame(command, params)
                 try:

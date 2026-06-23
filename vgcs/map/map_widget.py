@@ -9831,6 +9831,8 @@ class MapWidget(QWidget):
         if slant < 0.5:
             return
         ctx = self._observation_context()
+        if ctx.get("gimbal_yaw_deg") is None:
+            return
         uv = getattr(self, "_lrf_lock_uv", None) or (0.5, 0.5)
         hfov, vfov = self._c13_lrf_geo_fov()
         geo = compute_lrf_slant_geo(
