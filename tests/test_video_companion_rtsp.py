@@ -6,7 +6,9 @@ import numpy as np
 
 from vgcs.video.pipeline import (
     _companion_decode_max_dims,
+    _companion_frame_should_hide,
     _companion_hevc_showall_enabled,
+    _rgb_frame_has_decode_artifacts,
     _rtsp_transport_sequence_with_override,
     _frozen_duplicate_kill_enabled,
     _hevc_stderr_line_indicates_glitch,
@@ -105,3 +107,17 @@ def test_rgb_corrupt_detector_ignores_gimbal_pan():
     panned[:, shift:, :] = good[:, :-shift, :]
     panned[:, :shift, :] = 90
     assert not _rgb_frame_looks_hevc_corrupt(panned, good)
+
+
+def test_magenta_artifact_detector():
+    h, w = 120, 200
+    good = np.zeros((h, w, 3), dtype=np.uint8)
+    good[:, :, 1] = 100
+    torn = good.copy()
+    torn[h // 2 :, :, 0] = 240
+    torn[h // 2 :, :, 1] = 20
+    torn[h // 2 :, :, 2] = 240
+    assert _rgb_frame_has_decode_artifacts(torn)
+    hide, why = _companion_frame_should_hide(torn, good)
+    assert hide and why == "artifact"
+    assert not _rgb_frame_has_decode_artifacts(good)
