@@ -16,16 +16,30 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-23-companion-host-single-rtsp"
+_VIDEO_PIPELINE_REV = "2026-06-23-companion-motion-preview"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
 _COMPANION_RTSP_LAST_OPEN_MONO: float = 0.0
 # Same camera IP (e.g. 192.168.144.108) may only host one FFmpeg RTSP session.
 _COMPANION_RTSP_HOST_OWNER: dict[str, str] = {}
+# While gimbal is slewing, never freeze preview on "corrupt" vs last-good (scene changed).
+_companion_preview_motion_until: float = 0.0
 
 # MapWidget registers which source ids may open FFmpeg (single view = day only).
 _companion_decode_gate: Callable[[str], bool] | None = None
+
+
+def notify_companion_preview_motion(*, duration_s: float = 2.5) -> None:
+    """Extend motion-preview window (gimbal slew — show live frames, do not hold stale preview)."""
+    global _companion_preview_motion_until
+    until = time.monotonic() + max(0.25, float(duration_s))
+    if until > _companion_preview_motion_until:
+        _companion_preview_motion_until = until
+
+
+def _companion_preview_motion_active() -> bool:
+    return time.monotonic() < float(_companion_preview_motion_until or 0.0)
 
 
 def set_companion_decode_gate(fn: Callable[[str], bool] | None) -> None:
@@ -572,7 +586,11 @@ def _rgb_frame_looks_hevc_corrupt(
     return (bad / tiles) > 0.22
 
 
-def _rgb_frame_has_decode_artifacts(arr: "np.ndarray") -> bool:
+def _rgb_frame_has_decode_artifacts(
+    arr: "np.ndarray",
+    *,
+    strict: bool = True,
+) -> bool:
     """
     Detect classic HEVC decode tears (magenta/green macroblock bands).
 
@@ -590,15 +608,18 @@ def _rgb_frame_has_decode_artifacts(arr: "np.ndarray") -> bool:
     # YUV plane misalignment: neon magenta (high R+B, low G).
     magenta = (r > 175) & (g < 85) & (b > 175)
     magenta_ratio = float(magenta.sum()) / pixels
-    if magenta_ratio > 0.06:
+    magenta_thr = 0.06 if strict else 0.14
+    if magenta_ratio > magenta_thr:
         return True
     # Green macroblock smear.
     green_tear = (g > 195) & (r < 70) & (b < 70)
-    if float(green_tear.sum()) / pixels > 0.06:
+    green_thr = 0.06 if strict else 0.14
+    if float(green_tear.sum()) / pixels > green_thr:
         return True
     # Thick horizontal tear bands (common in the user's field captures).
     row_magenta = magenta.mean(axis=1)
-    if int((row_magenta > 0.30).sum()) >= 2:
+    row_thr = 0.30 if strict else 0.45
+    if int((row_magenta > row_thr).sum()) >= (2 if strict else 3):
         return True
     # Horizontal noise bands / macroblock smear (white-gray grid in lower frame).
     gray = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
@@ -614,10 +635,15 @@ def _rgb_frame_has_decode_artifacts(arr: "np.ndarray") -> bool:
 def _companion_frame_should_hide(
     arr: "np.ndarray",
     last_good: "np.ndarray | None",
+    *,
+    motion_preview: bool = False,
 ) -> tuple[bool, str]:
     """Return (hide, reason) for companion preview quality gate."""
-    if _rgb_frame_has_decode_artifacts(arr):
+    strict_art = not motion_preview
+    if _rgb_frame_has_decode_artifacts(arr, strict=strict_art):
         return True, "artifact"
+    if motion_preview:
+        return False, ""
     if last_good is not None and _rgb_frame_looks_hevc_corrupt(arr, last_good):
         return True, "corrupt"
     return False, ""
@@ -2145,8 +2171,14 @@ class RtspSource(QObject):
                                 now = time.monotonic()
                                 if (now - last_emit_mono) < min_emit_dt:
                                     continue
-                                if companion_rtsp and now < float(
-                                    hevc_glitch_hold.get("until_mono", 0.0) or 0.0
+                                motion_preview = (
+                                    companion_rtsp and _companion_preview_motion_active()
+                                )
+                                if (
+                                    companion_rtsp
+                                    and not motion_preview
+                                    and now
+                                    < float(hevc_glitch_hold.get("until_mono", 0.0) or 0.0)
                                 ):
                                     if not corrupt_skip_logged:
                                         corrupt_skip_logged = True
@@ -2163,7 +2195,9 @@ class RtspSource(QObject):
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
                                     if companion_rtsp and not _companion_hevc_showall_enabled():
                                         hide, why = _companion_frame_should_hide(
-                                            arr, last_good_arr
+                                            arr,
+                                            last_good_arr,
+                                            motion_preview=motion_preview,
                                         )
                                         if hide:
                                             corrupt_skip_streak += 1
@@ -2177,7 +2211,8 @@ class RtspSource(QObject):
                                                     )
                                                 except Exception:
                                                     pass
-                                            if corrupt_skip_streak >= 45:
+                                            streak_limit = 999 if motion_preview else 45
+                                            if corrupt_skip_streak >= streak_limit:
                                                 try:
                                                     print(
                                                         "[VGCS:video] companion HEVC: "

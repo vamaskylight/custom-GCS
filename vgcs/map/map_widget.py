@@ -135,6 +135,7 @@ from vgcs.video.pipeline import (
     VideoFrame,
     VideoPipeline,
     QS_KEY_LAST_PHOTO_SAVE_DIR,
+    notify_companion_preview_motion,
     set_companion_decode_gate,
     suggested_photo_save_path,
     suggested_recording_save_path,
@@ -5651,10 +5652,30 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             try:
-                self._video_split_enabled = (
-                    str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
-                    == "split"
-                )
+                if self._uses_companion_rtsp():
+                    dv = (
+                        str(getattr(self, "_video_settings_default_view", "Single") or "Single")
+                        .strip()
+                        .lower()
+                    )
+                    if dv == "split":
+                        try:
+                            print(
+                                "[VGCS:video] C13 companion: Default view Split is decode-only "
+                                "Single (one RTSP client); toggle ▦ for layout without dual decode"
+                            )
+                        except Exception:
+                            pass
+                    self._video_split_enabled = False
+                else:
+                    self._video_split_enabled = (
+                        str(
+                            getattr(self, "_video_settings_default_view", "Single") or "Single"
+                        )
+                        .strip()
+                        .lower()
+                        == "split"
+                    )
             except Exception:
                 pass
             self._sync_native_camera_rail_toggles()
@@ -5718,10 +5739,15 @@ class MapWidget(QWidget):
         self._video_inited = False
         self._shared_vp_hooks_connected = False
         try:
-            self._video_split_enabled = (
-                str(getattr(self, "_video_settings_default_view", "Single") or "Single").strip().lower()
-                == "split"
-            )
+            if self._uses_companion_rtsp():
+                self._video_split_enabled = False
+            else:
+                self._video_split_enabled = (
+                    str(getattr(self, "_video_settings_default_view", "Single") or "Single")
+                    .strip()
+                    .lower()
+                    == "split"
+                )
         except Exception:
             pass
         self._sync_native_camera_rail_toggles()
@@ -5882,6 +5908,18 @@ class MapWidget(QWidget):
         keys = list(sources.keys())
         if not keys:
             return []
+        # C13 / companion: hardware allows one RTSP client — never decode day+thermal together.
+        if self._uses_companion_rtsp():
+            active = ""
+            try:
+                active = str(vp.active_source_id() or "").strip()
+            except Exception:
+                active = ""
+            if active in keys:
+                return [active]
+            if "day" in keys:
+                return ["day"]
+            return [keys[0]]
         if bool(getattr(self, "_video_split_enabled", False)):
             ordered: list[str] = []
             for k in ("day", "thermal"):
@@ -8681,6 +8719,14 @@ class MapWidget(QWidget):
     _GIMBAL_HOLD_SPEED_YAW_DPS = 5.0
     _GIMBAL_HOLD_SPEED_PITCH_DPS = 5.0
 
+    def _notify_companion_gimbal_motion(self, *, duration_s: float = 2.5) -> None:
+        if not self._uses_companion_rtsp():
+            return
+        try:
+            notify_companion_preview_motion(duration_s=float(duration_s))
+        except Exception:
+            pass
+
     def _native_gimbal_uses_ptz_hold(self) -> bool:
         cc = getattr(self, "_camera_control", None)
         if cc is None:
@@ -8745,9 +8791,11 @@ class MapWidget(QWidget):
         axis = self._gimbal_hold_axis
         if axis is None:
             return
+        self._notify_companion_gimbal_motion(duration_s=1.2)
         self._native_gimbal_speed_start(axis[0], axis[1])
 
     def _native_gimbal_speed_start(self, dx: int, dy: int) -> None:
+        self._notify_companion_gimbal_motion(duration_s=2.5)
         cc = getattr(self, "_camera_control", None)
         if cc is None:
             return
@@ -8779,11 +8827,13 @@ class MapWidget(QWidget):
                 cc.set_gimbal_speed(0.0, 0.0)
             except Exception:
                 pass
+        self._notify_companion_gimbal_motion(duration_s=1.5)
         # Trigger auto-focus shortly after gimbal stops so the image sharpens immediately
         # instead of waiting for the camera's internal AF timer (can take 3-5s on ZR10).
         QTimer.singleShot(400, self._trigger_gimbal_stop_autofocus)
 
     def _native_gimbal_center(self) -> None:
+        self._notify_companion_gimbal_motion(duration_s=4.0)
         self._gimbal_hold_axis = None
         if self._gimbal_hold_timer.isActive():
             self._gimbal_hold_timer.stop()
@@ -8800,6 +8850,7 @@ class MapWidget(QWidget):
             self._set_status("Gimbal center failed")
 
     def _native_gimbal_point_down(self) -> None:
+        self._notify_companion_gimbal_motion(duration_s=6.0)
         self._gimbal_hold_axis = None
         if self._gimbal_hold_timer.isActive():
             self._gimbal_hold_timer.stop()
