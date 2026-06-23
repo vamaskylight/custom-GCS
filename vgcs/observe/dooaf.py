@@ -174,6 +174,9 @@ def compute_fire_correction(
         template = gun_row or intended_row
         if template is not None:
             _enrich_mark_row_ray_geometry(impact_row, template)
+    for row in (gun_row, intended_row):
+        if row is not None and impact_row is not None:
+            _enrich_mark_row_ray_geometry(row, impact_row)
 
     range_gt = haversine_m(gun.lat, gun.lon, intended.lat, intended.lon)
     range_gi = haversine_m(gun.lat, gun.lon, impact.lat, impact.lon)
@@ -189,19 +192,6 @@ def compute_fire_correction(
         )
         if ray_gi is not None and float(ray_gi) > float(range_gi) * 1.08:
             range_gi = float(ray_gi)
-    if (
-        gun_row is not None
-        and impact_row is not None
-        and intended_row is not None
-        and float(range_gt) > float(range_gi) * 1.2
-    ):
-        try:
-            vx_t = float(intended_row.get("video_x_norm"))  # type: ignore[arg-type]
-            vx_i = float(impact_row.get("video_x_norm"))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            vx_t = vx_i = 0.0
-        if abs(vx_t - vx_i) <= 0.14:
-            range_gi = max(float(range_gi), float(range_gt))
     bearing_gt = initial_bearing_deg(gun.lat, gun.lon, intended.lat, intended.lon)
     bearing_gi = initial_bearing_deg(gun.lat, gun.lon, impact.lat, impact.lon)
     d_theta = math.radians(bearing_gi - bearing_gt)
@@ -526,11 +516,13 @@ def _synthesize_setup_mark_row(
     )
     from vgcs.observe.target_measure import (
         low_hover_ray_agl_m,
+        observation_cached_dem_ground_agl_m,
         observation_ekf_rel_alt_m,
         ray_agl_suspect_dem_mismatch,
         resolve_ray_agl_for_geo,
     )
 
+    cached_dem = observation_cached_dem_ground_agl_m(template_row) or observation_cached_dem_ground_agl_m(row)
     ray_agl, ray_src = resolve_ray_agl_for_geo(
         relative_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
         rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
@@ -539,6 +531,7 @@ def _synthesize_setup_mark_row(
         vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
         vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
         dem_path=str(dem_path) if dem_path else None,
+        cached_dem_ground_agl_m=cached_dem,
     )
     needs_retry = (
         not geo.ok

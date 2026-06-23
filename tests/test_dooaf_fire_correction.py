@@ -218,6 +218,55 @@ def test_build_session_183427_gun_impact_ray_distance():
     assert session.correction.range_gun_to_impact_m > 8.5
 
 
+def test_fire_correction_gun_impact_differ_without_dem_file():
+    """Session 185254 — no DEM file but cached terrain AGL on impact row."""
+    from vgcs.observe.dooaf import build_dooaf_session
+
+    impact = {
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_IMPACT,
+        "target_lat": 20.4459447776644,
+        "target_lon": 72.8629922962151,
+        "target_alt_m": 20.69,
+        "video_x_norm": 0.38125,
+        "video_y_norm": 0.5505857294994675,
+        "vehicle_lat": 20.4458221,
+        "vehicle_lon": 72.8632659,
+        "vehicle_heading_deg": 315.0,
+        "vehicle_pitch_deg": -7.4,
+        "vehicle_roll_deg": 0.0,
+        "vehicle_alt_msl_m": 36.0,
+        "ekf_rel_alt_m": 1.846,
+        "dem_ground_agl_m": 13.58,
+        "agl_source": "dem_terrain",
+        "gimbal_pitch_deg": -20.0,
+        "gimbal_yaw_deg": 0.09,
+        "gps_fix_type": 3,
+        "camera_hfov_deg": 62.0,
+    }
+    session = build_dooaf_session(
+        [impact],
+        gun_lat=20.4458870,
+        gun_lon=72.8629401,
+        gun_alt_m=20.69,
+        target_lat=20.4458676,
+        target_lon=72.8631441,
+        target_alt_m=22.14,
+        setup_video_marks={
+            DOOAF_ROLE_GUN: (0.187, 0.853),
+            DOOAF_ROLE_INTENDED: (0.366, 0.448),
+        },
+        dem_path=None,
+    )
+    assert session.correction is not None
+    gt = session.correction.range_gun_to_intended_m
+    gi = session.correction.range_gun_to_impact_m
+    assert gt > 25.0
+    assert gi > 20.0
+    assert abs(gt - gi) > 2.0
+    assert gi < gt
+
+
 def test_fire_correction_on_line_short():
     gun = GeoPoint(12.0, 77.0)
     intended = GeoPoint(12.01, 77.0)

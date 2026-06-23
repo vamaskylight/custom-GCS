@@ -8896,7 +8896,10 @@ class MapWidget(QWidget):
                 out.get("target_lat"), out.get("target_lon")
             )
             export_rows.append(out)
-        session = build_dooaf_session(list(self._observations), dem_path=self._observe_dem_path())
+        session = build_dooaf_session(
+            list(self._observations),
+            **self._dooaf_session_kwargs(),
+        )
         obs_row = latest_mark_row(self._observations, DOOAF_ROLE_IMPACT)
         if obs_row is None and self._observations:
             obs_row = self._observations[-1]

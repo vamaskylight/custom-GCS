@@ -292,12 +292,20 @@ def dem_ground_agl_m(
     vehicle_lat: float | None,
     vehicle_lon: float | None,
     dem_path: str | None,
+    cached_dem_ground_agl_m: float | None = None,
 ) -> tuple[float | None, str]:
     """Physical height above local terrain from MSL altitude and DEM."""
     if vehicle_alt_msl_m is None or vehicle_lat is None or vehicle_lon is None:
         return None, ""
     path = str(dem_path or "").strip()
     if not path:
+        if cached_dem_ground_agl_m is not None:
+            try:
+                agl = float(cached_dem_ground_agl_m)
+            except (TypeError, ValueError):
+                return None, ""
+            if 0.25 <= agl <= 800.0:
+                return agl, "dem_terrain_cached"
         return None, ""
     try:
         from vgcs.observe.dem import elevation_at_wgs84
@@ -419,6 +427,7 @@ def resolve_ray_agl_for_geo(
     vehicle_lat: float | None = None,
     vehicle_lon: float | None = None,
     dem_path: str | None = None,
+    cached_dem_ground_agl_m: float | None = None,
 ) -> tuple[float | None, str]:
     facade_agl, facade_src = resolve_facade_ray_agl_m(
         relative_alt_m=relative_alt_m,
@@ -430,6 +439,7 @@ def resolve_ray_agl_for_geo(
         vehicle_lat=vehicle_lat,
         vehicle_lon=vehicle_lon,
         dem_path=dem_path,
+        cached_dem_ground_agl_m=cached_dem_ground_agl_m,
     )
     dem_agl = sanitize_dem_ground_agl_m(dem_agl, relative_alt_m)
     return prefer_dem_ground_agl_over_ekf(
@@ -472,6 +482,25 @@ def observation_ekf_rel_alt_m(row: dict[str, Any]) -> float | None:
     except (TypeError, ValueError):
         pass
     return rel
+
+
+def observation_cached_dem_ground_agl_m(row: dict[str, Any]) -> float | None:
+    """Terrain AGL captured at mark time when DEM file may be unavailable later."""
+    for key in ("dem_ground_agl_m", "measure_agl_m"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v) or v < 0.25:
+            continue
+        src = str(row.get("agl_source") or row.get("geo_agl_source") or "")
+        if key == "measure_agl_m" and src and "dem" not in src and "terrain" not in src:
+            continue
+        return v
+    return None
 
 
 def is_oblique_roof_context(row_a: dict[str, Any], row_b: dict[str, Any]) -> bool:
