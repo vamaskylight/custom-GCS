@@ -150,6 +150,11 @@ def compute_fire_correction(
     gun: GeoPoint,
     intended: GeoPoint,
     impact: GeoPoint,
+    *,
+    gun_row: dict[str, Any] | None = None,
+    intended_row: dict[str, Any] | None = None,
+    impact_row: dict[str, Any] | None = None,
+    camera_hfov_deg: float = 62.0,
 ) -> FireCorrection:
     """
     Gun-centric miss and correction.
@@ -158,9 +163,27 @@ def compute_fire_correction(
     ``miss_right`` > 0 when impact is to the right of gun→target line.
     Corrections are the negation (what to add to firing data).
     Horizontal miss is ground distance; vertical miss uses MSL altitudes when set.
+
+    When mark rows carry per-click ``geo_range_m`` / ``geo_bearing_deg``, gun→target
+  and gun→impact ranges use ray geometry (law of cosines) instead of haversine on
+    DEM footprints that often cluster on facade picks.
     """
+    from vgcs.observe.target_measure import mark_pair_ground_separation_m
+
     range_gt = haversine_m(gun.lat, gun.lon, intended.lat, intended.lon)
     range_gi = haversine_m(gun.lat, gun.lon, impact.lat, impact.lon)
+    if gun_row is not None and intended_row is not None:
+        ray_gt = mark_pair_ground_separation_m(
+            gun_row, intended_row, hfov_deg=camera_hfov_deg
+        )
+        if ray_gt is not None:
+            range_gt = float(ray_gt)
+    if gun_row is not None and impact_row is not None:
+        ray_gi = mark_pair_ground_separation_m(
+            gun_row, impact_row, hfov_deg=camera_hfov_deg
+        )
+        if ray_gi is not None:
+            range_gi = float(ray_gi)
     bearing_gt = initial_bearing_deg(gun.lat, gun.lon, intended.lat, intended.lon)
     bearing_gi = initial_bearing_deg(gun.lat, gun.lon, impact.lat, impact.lon)
     d_theta = math.radians(bearing_gi - bearing_gt)
@@ -1374,7 +1397,23 @@ def build_dooaf_session(
                 pass
     correction = None
     if gun is not None and intended is not None and impact is not None:
-        correction = compute_fire_correction(gun, intended, impact)
+        hfov = 62.0
+        for src in (impact_row, intended_row, ground_row):
+            if src is not None and src.get("camera_hfov_deg") is not None:
+                try:
+                    hfov = float(src["camera_hfov_deg"])
+                except (TypeError, ValueError):
+                    pass
+                break
+        correction = compute_fire_correction(
+            gun,
+            intended,
+            impact,
+            gun_row=ground_row,
+            intended_row=intended_row,
+            impact_row=impact_row,
+            camera_hfov_deg=hfov,
+        )
     intended_dem = dem_alt_msl_at_mark(intended_row, intended, dem_path=dem_path)
     impact_dem = dem_alt_msl_at_mark(impact_row, impact, dem_path=dem_path)
     height_correction_m: float | None = None
