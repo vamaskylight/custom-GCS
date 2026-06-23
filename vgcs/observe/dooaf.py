@@ -19,7 +19,11 @@ from vgcs.observe.dooaf_map_symbols import (
     svg_gun_marker as _fc_svg_marker_gun,
     svg_target_marker as _fc_svg_marker_crosshair,
 )
-from vgcs.observe.target_measure import haversine_m, observation_target_latlon
+from vgcs.observe.target_measure import (
+    haversine_m,
+    observation_ekf_rel_alt_m,
+    observation_target_latlon,
+)
 
 DOOAF_ROLE_SURVEY = "survey"
 DOOAF_ROLE_INTENDED = "intended_target"
@@ -344,7 +348,12 @@ def _drone_alt_msl_from_row(row: dict[str, Any]) -> float | None:
         return msl
     lat = _float_or_none(row.get("vehicle_lat"))
     lon = _float_or_none(row.get("vehicle_lon"))
+    ekf = observation_ekf_rel_alt_m(row)
     agl = _float_or_none(row.get("dem_ground_agl_m"))
+    if ekf is not None and ekf < 2.5 and agl is not None and agl > float(ekf) + 12.0:
+        agl = max(float(ekf), 0.5)
+    elif agl is None and ekf is not None and ekf > 0.05:
+        agl = float(ekf)
     if lat is not None and lon is not None and agl is not None:
         dem = dem_alt_msl_at_mark(row, GeoPoint(lat, lon, None))
         if dem is not None:
@@ -455,6 +464,175 @@ def _synthesize_setup_mark_row(
             row["geo_bearing_deg"] = geo.bearing_deg
     enrich_video_mark_target_altitude(row)
     return row
+
+
+def apply_dooaf_impact_geo_fallback(
+    row: dict[str, Any],
+    *,
+    target_lat: float | None = None,
+    target_lon: float | None = None,
+    setup_video_marks: dict[str, tuple[float, float]] | None = None,
+    dem_path: str | Path | None = None,
+    camera_hfov_deg: float = 62.0,
+    vehicle_alt_msl_m: float | None = None,
+) -> bool:
+    """
+    Fill impact footprint when the primary DEM ray fails (common on-ground / low EKF).
+
+    Tries a low-hover ray retry, then DOOAF Setup target footprint when video picks
+    align on the same facade column.
+    """
+    if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
+        return False
+    if observation_target_latlon(row) is not None:
+        return False
+    vx = row.get("video_x_norm")
+    vy = row.get("video_y_norm")
+    if vx is None or vy is None:
+        return False
+
+    from vgcs.observe.geo_reference import compute_geo_reference, enrich_video_mark_target_altitude
+    from vgcs.observe.target_measure import is_plausible_ground_range
+
+    marks = merge_setup_video_marks(setup_video_marks) or {}
+    ekf = observation_ekf_rel_alt_m(row)
+    retry_agl = 3.0
+    if ekf is not None and ekf >= 0.5:
+        retry_agl = max(3.0, float(ekf))
+
+    geo = compute_geo_reference(
+        vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
+        vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
+        vehicle_heading_deg=row.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+        vehicle_roll_deg=row.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+        vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+        vehicle_rel_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
+        vehicle_alt_msl_m=vehicle_alt_msl_m or row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+        rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
+        gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+        gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+        video_x_norm=float(vx),
+        video_y_norm=float(vy),
+        gps_fix_type=int(row.get("gps_fix_type") or 0),
+        gps_hdop=row.get("gps_hdop"),  # type: ignore[arg-type]
+        camera_hfov_deg=float(camera_hfov_deg),
+        dem_path=dem_path,
+        dem_terrain=False,
+        force_agl_m=retry_agl,
+    )
+    if (
+        geo.ok
+        and geo.target_lat is not None
+        and geo.target_lon is not None
+        and geo.horizontal_range_m is not None
+        and geo.depression_deg is not None
+        and is_plausible_ground_range(
+            retry_agl,
+            float(geo.horizontal_range_m),
+            float(geo.depression_deg),
+        )
+    ):
+        row["target_lat"] = geo.target_lat
+        row["target_lon"] = geo.target_lon
+        row["target_alt_m"] = geo.target_alt_m
+        row["geo_quality"] = "fair"
+        row["geo_method"] = "ray_facade_retry"
+        row["geo_warning"] = (
+            "impact geo from low-hover ray retry "
+            f"(EKF {ekf:.1f} m — arm and hover ≥3 m for better accuracy)"
+            if ekf is not None and ekf < 2.5
+            else str(geo.warning or "impact geo from ray retry")
+        )
+        if geo.depression_deg is not None:
+            row["geo_depression_deg"] = geo.depression_deg
+        if geo.horizontal_range_m is not None:
+            row["geo_range_m"] = geo.horizontal_range_m
+        if geo.bearing_deg is not None:
+            row["geo_bearing_deg"] = geo.bearing_deg
+        row["measure_agl_m"] = retry_agl
+        row["agl_source"] = "forced_facade_retry"
+        enrich_video_mark_target_altitude(row)
+        return True
+
+    if target_lat is None or target_lon is None:
+        return False
+    if DOOAF_ROLE_INTENDED not in marks:
+        return False
+    try:
+        vx_i, vy_i = marks[DOOAF_ROLE_INTENDED]
+        vx_p = float(vx)
+        vy_p = float(vy)
+    except (TypeError, ValueError):
+        return False
+    if abs(vx_p - float(vx_i)) > 0.18:
+        return False
+    if vy_p >= float(vy_i) + 0.08:
+        return False
+
+    row["target_lat"] = float(target_lat)
+    row["target_lon"] = float(target_lon)
+    row["geo_quality"] = "fair"
+    row["geo_method"] = "dooaf_setup_target_footprint"
+    row["geo_warning"] = (
+        "impact footprint from DOOAF target (primary ray failed — "
+        "hover ≥3 m with GPS for accurate ground geo)"
+    )
+    enrich_video_mark_target_altitude(row)
+    return True
+
+
+def dooaf_export_blockers(
+    rows: list[dict[str, Any]],
+    *,
+    gun_lat: float | None = None,
+    gun_lon: float | None = None,
+    target_lat: float | None = None,
+    target_lon: float | None = None,
+    setup_video_marks: dict[str, tuple[float, float]] | None = None,
+    dem_path: str | Path | None = None,
+) -> list[str]:
+    """Human-readable export warnings after impact geo fallback attempts."""
+    warnings: list[str] = []
+    impact_row = latest_mark_row(rows, DOOAF_ROLE_IMPACT)
+    if impact_row is None:
+        return warnings
+    if observation_target_latlon(impact_row) is None:
+        apply_dooaf_impact_geo_fallback(
+            impact_row,
+            target_lat=target_lat,
+            target_lon=target_lon,
+            setup_video_marks=setup_video_marks,
+            dem_path=dem_path,
+        )
+    if observation_target_latlon(impact_row) is None:
+        warnings.append(
+            "Impact Target has no map position (geo failed). "
+            "Arm, hover at least 3 m, wait for GPS, then mark fall of shot again."
+        )
+        return warnings
+    if gun_lat is None or gun_lon is None or target_lat is None or target_lon is None:
+        warnings.append(
+            "DOOAF Setup incomplete (gun and/or target missing). "
+            "Fire correction will be partial."
+        )
+    q = str(impact_row.get("geo_quality") or "")
+    if q in ("insufficient", ""):
+        warnings.append(
+            "Impact geo quality is low. Hover higher and re-mark for better correction."
+        )
+    elif q == "fair" and str(impact_row.get("geo_method") or "").startswith(
+        ("dooaf_setup", "ray_facade_retry")
+    ):
+        warnings.append(
+            "Impact position is estimated (video mark saved; map footprint approximate). "
+            "Hover ≥3 m for GPS-quality geo."
+        )
+    ekf = observation_ekf_rel_alt_m(impact_row)
+    if ekf is not None and ekf < 2.5:
+        warnings.append(
+            f"Drone was near ground (EKF {ekf:.1f} m) when impact was marked."
+        )
+    return warnings
 
 
 def _fill_point_alt_m(
@@ -868,6 +1046,15 @@ def build_dooaf_session(
     )
     intended = _fill_point_alt_m(intended, intended_row, target_alt_m, dem_path=dem_path)
     impact = latest_mark(rows, DOOAF_ROLE_IMPACT)
+    if impact is None and impact_row is not None:
+        apply_dooaf_impact_geo_fallback(
+            impact_row,
+            target_lat=target_lat,
+            target_lon=target_lon,
+            setup_video_marks=setup_video_marks,
+            dem_path=dem_path,
+        )
+        impact = latest_mark(rows, DOOAF_ROLE_IMPACT) or point_from_row(impact_row)
     impact = _fill_point_alt_m(impact, impact_row, None, dem_path=dem_path)
     drone = drone_from_row(rows[-1] if rows else None)
     template_row = impact_row or (rows[-1] if rows else None)

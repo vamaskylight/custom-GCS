@@ -99,6 +99,8 @@ from vgcs.observe.dooaf import (
     write_dooaf_settings,
     write_dooaf_setup_video_mark,
     clear_dooaf_setup_video_mark,
+    apply_dooaf_impact_geo_fallback,
+    dooaf_export_blockers,
 )
 from vgcs.observe.geo_reference import compute_geo_reference, compute_lrf_slant_geo
 from vgcs.observe.grid_reference import format_grid_reference
@@ -8077,6 +8079,31 @@ class MapWidget(QWidget):
                     )
             except Exception:
                 pass
+        if (
+            str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
+            and observation_target_latlon(row) is None
+        ):
+            rs = self._resolved_dooaf_settings()
+            marks = getattr(self, "_dooaf_setup_video_marks", None) or {}
+            merged = merge_setup_video_marks(marks, st=self._dooaf_settings_store())
+            if apply_dooaf_impact_geo_fallback(
+                row,
+                target_lat=rs.target_lat,
+                target_lon=rs.target_lon,
+                setup_video_marks=merged,
+                dem_path=self._observe_dem_path(),
+                camera_hfov_deg=hfov,
+                vehicle_alt_msl_m=self._vehicle_alt_msl_m,
+            ):
+                try:
+                    nm = getattr(self, "_native_map", None)
+                    if nm is not None and hasattr(nm, "add_geo_referenced_marker"):
+                        la = row.get("target_lat")
+                        lo = row.get("target_lon")
+                        if la is not None and lo is not None:
+                            nm.add_geo_referenced_marker(float(la), float(lo))
+                except Exception:
+                    pass
 
     def _log_observation(
         self,
@@ -8686,9 +8713,40 @@ class MapWidget(QWidget):
         html_path = str(Path(csv_path).with_suffix(".html"))
         self._obs_export_busy = True
         self._obs_export_quick = bool(quick)
-        self._set_status("Exporting observation report…")
         rows = [dict(r) for r in self._observations]
         dooaf = self._dooaf_session_kwargs()
+        for row in rows:
+            if str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT:
+                apply_dooaf_impact_geo_fallback(
+                    row,
+                    target_lat=dooaf.get("target_lat"),  # type: ignore[arg-type]
+                    target_lon=dooaf.get("target_lon"),  # type: ignore[arg-type]
+                    setup_video_marks=dooaf.get("setup_video_marks"),  # type: ignore[arg-type]
+                    dem_path=dooaf.get("dem_path"),  # type: ignore[arg-type]
+                    vehicle_alt_msl_m=self._vehicle_alt_msl_m,
+                )
+        export_warnings = dooaf_export_blockers(
+            rows,
+            gun_lat=dooaf.get("gun_lat"),  # type: ignore[arg-type]
+            gun_lon=dooaf.get("gun_lon"),  # type: ignore[arg-type]
+            target_lat=dooaf.get("target_lat"),  # type: ignore[arg-type]
+            target_lon=dooaf.get("target_lon"),  # type: ignore[arg-type]
+            setup_video_marks=dooaf.get("setup_video_marks"),  # type: ignore[arg-type]
+            dem_path=dooaf.get("dem_path"),  # type: ignore[arg-type]
+        )
+        self._obs_export_warnings = export_warnings
+        if export_warnings:
+            note = " | ".join(export_warnings)
+            self._set_status(f"Exporting with warnings: {note[:120]}")
+            print(f"[VGCS:observe] export warnings: {note}")
+            if quick:
+                QMessageBox.warning(
+                    self,
+                    "Observation Report",
+                    "\n\n".join(export_warnings)
+                    + "\n\nReport will still export with available data.",
+                )
+        self._set_status("Exporting observation report…")
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(
             _ObservationExportTask(
