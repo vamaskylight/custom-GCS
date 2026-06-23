@@ -665,6 +665,31 @@ def session_peak_geo_range_m(rows: list[dict[str, Any]]) -> float:
     return peak
 
 
+def mark_pair_ground_separation_m(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+) -> float | None:
+    """
+    Ground distance between two video marks from drone ray ranges (law of cosines).
+
+    Prefer this over haversine on DEM footprints when gun is on the ground and
+    target/impact are on a facade — terrain lat/lon often clusters incorrectly.
+    """
+    filled = _fill_pair_geo_ranges(row_a, row_b, hfov_deg=hfov_deg)
+    if filled is not None:
+        r1, r2, b1, b2 = filled
+        d_law = _law_of_cosines_m(r1, r2, b1, b2)
+        if d_law is not None and d_law > 0.5:
+            return float(d_law)
+    pa = observation_target_latlon(row_a)
+    pb = observation_target_latlon(row_b)
+    if pa is not None and pb is not None:
+        return haversine_m(pa[0], pa[1], pb[0], pb[1])
+    return None
+
+
 def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:
     vx = row.get("video_x_norm")
     vy = row.get("video_y_norm")

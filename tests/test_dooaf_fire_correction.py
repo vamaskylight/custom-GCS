@@ -45,6 +45,72 @@ def test_initial_bearing_north_east():
     assert abs(initial_bearing_deg(0.0, 0.0, 0.0, 1.0) - 90.0) < 0.1
 
 
+def test_fire_correction_uses_ray_range_for_facade_setup():
+    """Session 181133 — DEM footprints ~8 m apart; rays ~32 m gun→target."""
+    template = {
+        "vehicle_lat": 20.4458179,
+        "vehicle_lon": 72.8632723,
+        "vehicle_heading_deg": 315.0,
+        "vehicle_pitch_deg": -7.4,
+        "vehicle_roll_deg": 0.0,
+        "vehicle_alt_msl_m": 36.0,
+        "ekf_rel_alt_m": -0.159,
+        "dem_ground_agl_m": 13.41,
+        "gimbal_pitch_deg": -20.0,
+        "gimbal_yaw_deg": 0.09,
+        "gps_fix_type": 3,
+        "camera_hfov_deg": 62.0,
+    }
+    gun_row = {
+        **template,
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_GUN,
+        "target_lat": 20.4459722,
+        "target_lon": 72.8631038,
+        "video_x_norm": 0.217,
+        "video_y_norm": 0.942,
+        "geo_range_m": 66.21,
+        "geo_bearing_deg": 297.18,
+    }
+    tgt_row = {
+        **template,
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_INTENDED,
+        "target_lat": 20.4459501,
+        "target_lon": 72.8631776,
+        "video_x_norm": 0.454,
+        "video_y_norm": 0.548,
+        "geo_range_m": 37.14,
+        "geo_bearing_deg": 312.09,
+    }
+    imp_row = {
+        **template,
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_IMPACT,
+        "target_lat": 20.44600962508643,
+        "target_lon": 72.86313377357139,
+        "video_x_norm": 0.4828125,
+        "video_y_norm": 0.6741214057507987,
+        "geo_range_m": 28.25,
+        "geo_bearing_deg": 313.93,
+    }
+    gun = GeoPoint(20.4459722, 72.8631038, 23.516)
+    intended = GeoPoint(20.4459501, 72.8631776, 24.15)
+    impact = GeoPoint(20.44600962508643, 72.86313377357139, 20.69)
+    corr_map = compute_fire_correction(gun, intended, impact)
+    corr_ray = compute_fire_correction(
+        gun,
+        intended,
+        impact,
+        gun_row=gun_row,
+        intended_row=tgt_row,
+        impact_row=imp_row,
+    )
+    assert corr_map.range_gun_to_intended_m < 12.0
+    assert corr_ray.range_gun_to_intended_m > 25.0
+    assert corr_ray.range_gun_to_intended_m < 40.0
+
+
 def test_fire_correction_on_line_short():
     gun = GeoPoint(12.0, 77.0)
     intended = GeoPoint(12.01, 77.0)
