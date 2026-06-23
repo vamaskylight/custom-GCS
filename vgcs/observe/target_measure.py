@@ -341,6 +341,10 @@ def prefer_dem_ground_agl_over_ekf(
         ekf = None
     src = str(dem_ground_src or "dem_terrain")
     if ekf is None or ekf < 1.0:
+        if dem > 20.0 and (ekf is None or ekf < 2.0):
+            if ekf is not None and ekf > 0.05:
+                return max(float(ekf), 0.5), "ekf_near_ground"
+            return min(dem, 12.0), src
         return dem, src
     if ekf > dem + 3.0:
         return dem, src

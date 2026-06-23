@@ -151,6 +151,7 @@ def compute_geo_reference(
     dem_path: str | Path | None = None,
     dem_lookup: Callable[[float, float], float | None] | None = None,
     dem_terrain: bool = True,
+    force_agl_m: float | None = None,
 ) -> GeoReferenceResult:
     """
     Estimate ground intersection for a normalized video click (0..1, top-left origin).
@@ -160,24 +161,33 @@ def compute_geo_reference(
     """
     if vehicle_lat is None or vehicle_lon is None:
         return GeoReferenceResult(ok=False, warning="vehicle position missing", method="none")
-    agl_m, agl_src = resolve_facade_ray_agl_m(
-        relative_alt_m=vehicle_rel_alt_m,
-        rangefinder_down_m=rangefinder_down_m,
-        video_y_norm=video_y_norm,
-    )
-    dem_agl, dem_src = dem_ground_agl_m(
-        vehicle_alt_msl_m=vehicle_alt_msl_m,
-        vehicle_lat=vehicle_lat,
-        vehicle_lon=vehicle_lon,
-        dem_path=str(dem_path or "") if dem_path else None,
-    )
-    agl_m, agl_src = prefer_dem_ground_agl_over_ekf(
-        relative_alt_m=vehicle_rel_alt_m,
-        facade_agl_m=agl_m,
-        facade_src=agl_src,
-        dem_ground_agl_m=dem_agl,
-        dem_ground_src=dem_src,
-    )
+    agl_m: float | None = None
+    agl_src = ""
+    if force_agl_m is not None:
+        try:
+            agl_m = max(0.5, float(force_agl_m))
+            agl_src = "forced_facade_retry"
+        except (TypeError, ValueError):
+            agl_m = None
+    if agl_m is None:
+        agl_m, agl_src = resolve_facade_ray_agl_m(
+            relative_alt_m=vehicle_rel_alt_m,
+            rangefinder_down_m=rangefinder_down_m,
+            video_y_norm=video_y_norm,
+        )
+        dem_agl, dem_src = dem_ground_agl_m(
+            vehicle_alt_msl_m=vehicle_alt_msl_m,
+            vehicle_lat=vehicle_lat,
+            vehicle_lon=vehicle_lon,
+            dem_path=str(dem_path or "") if dem_path else None,
+        )
+        agl_m, agl_src = prefer_dem_ground_agl_over_ekf(
+            relative_alt_m=vehicle_rel_alt_m,
+            facade_agl_m=agl_m,
+            facade_src=agl_src,
+            dem_ground_agl_m=dem_agl,
+            dem_ground_src=dem_src,
+        )
     if agl_m is None:
         return GeoReferenceResult(
             ok=False,
