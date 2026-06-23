@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-22-companion-hevc-hold"
+_VIDEO_PIPELINE_REV = "2026-06-23-companion-motion-preview"
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -430,9 +430,9 @@ def _rgb_frame_looks_hevc_corrupt(
     stride: int = 16,
 ) -> bool:
     """
-    Detect macroblock-soup HEVC corruption (sudden tile chaos vs last good frame).
+    Detect macroblock-soup HEVC corruption (patchy tile chaos vs last good frame).
 
-    Lightweight grid sample — skips compare when there is no prior good frame.
+    Gimbal pan/tilt produces a coherent global scene shift — that is motion, not corruption.
     """
     if not HAS_NUMPY or np is None or prev is None or prev.shape != arr.shape:
         return False
@@ -441,16 +441,40 @@ def _rgb_frame_looks_hevc_corrupt(
         return False
     bad = 0
     tiles = 0
+    tile_diffs: list[float] = []
     cur = arr.astype(np.int16)
     prv = prev.astype(np.int16)
     for y in range(0, h - block + 1, stride):
         for x in range(0, w - block + 1, stride):
             tiles += 1
+            prv_tile = prv[y : y + block, x : x + block]
             tile = cur[y : y + block, x : x + block]
-            if float(np.abs(tile - prv[y : y + block, x : x + block]).mean()) > 38.0:
-                if float(tile.std()) > 32.0:
-                    bad += 1
-    return tiles >= 8 and (bad / tiles) > 0.22
+            diff_mean = float(np.abs(tile - prv_tile).mean())
+            tile_diffs.append(diff_mean)
+            if diff_mean > 38.0 and float(tile.std()) > 32.0:
+                bad += 1
+    if tiles < 8:
+        return False
+    mean_d = float(np.mean(tile_diffs))
+    std_d = float(np.std(tile_diffs))
+    high_diff = sum(1 for d in tile_diffs if d > 28.0)
+    high_diff_ratio = high_diff / tiles
+    unchanged_ratio = sum(1 for d in tile_diffs if d < 8.0) / tiles
+    # Coherent gimbal motion: nearly every tile shifts by a similar amount.
+    if (
+        unchanged_ratio < 0.12
+        and mean_d > 20.0
+        and std_d < 14.0
+    ):
+        return False
+    if mean_d > 18.0 and std_d < 15.0 and high_diff_ratio > 0.30:
+        return False
+    if high_diff_ratio > 0.38 and std_d < 18.0:
+        return False
+    # Patchy macroblock soup: mixed unchanged tiles + chaotic tiles (high diff spread).
+    if std_d > 20.0 and mean_d > 8.0 and (bad / tiles) > 0.10:
+        return True
+    return (bad / tiles) > 0.22
 
 
 def _siyi_rtsp_camera_busy(tail_b: bytes) -> bool:
@@ -1717,7 +1741,7 @@ class RtspSource(QObject):
             if not _companion_hevc_showall_enabled():
                 print(
                     "[VGCS:video] companion HEVC: corrupt frames hidden "
-                    "(hold last good preview; set VGCS_COMPANION_SHOWALL=1 for old behaviour)"
+                    "(motion-aware; set VGCS_COMPANION_SHOWALL=1 for legacy show-all)"
                 )
             if _rtsp_url_is_companion_rtsp(url):
                 print(
@@ -1883,6 +1907,7 @@ class RtspSource(QObject):
                         session_t0 = time.monotonic()
                         frozen_logged = False
                         corrupt_skip_logged = False
+                        corrupt_skip_streak = 0
                         last_good_arr: "np.ndarray | None" = None
                         self._ffmpeg_last_raw_sig = None
                         self._ffmpeg_last_raw_change_mono = time.monotonic()
@@ -1988,16 +2013,27 @@ class RtspSource(QObject):
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
                                     if companion_rtsp and not _companion_hevc_showall_enabled():
                                         if _rgb_frame_looks_hevc_corrupt(arr, last_good_arr):
-                                            if not corrupt_skip_logged:
-                                                corrupt_skip_logged = True
-                                                try:
-                                                    print(
-                                                        "[VGCS:video] companion HEVC: skipping "
-                                                        "corrupt frame (hold last good preview)"
-                                                    )
-                                                except Exception:
-                                                    pass
-                                            continue
+                                            corrupt_skip_streak += 1
+                                            if corrupt_skip_streak < 12:
+                                                if not corrupt_skip_logged:
+                                                    corrupt_skip_logged = True
+                                                    try:
+                                                        print(
+                                                            "[VGCS:video] companion HEVC: skipping "
+                                                            "corrupt frame (hold last good preview)"
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                                continue
+                                            try:
+                                                print(
+                                                    "[VGCS:video] companion HEVC: resuming preview "
+                                                    "(motion / skip streak — was holding last frame)"
+                                                )
+                                            except Exception:
+                                                pass
+                                        else:
+                                            corrupt_skip_streak = 0
                                     qimg = QImage(
                                         arr.data, w, h, 3 * w, QImage.Format.Format_RGB888
                                     ).copy()
