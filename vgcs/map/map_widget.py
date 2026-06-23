@@ -255,7 +255,7 @@ _MAP_ACTION_RAIL_LEFT_PX = 10
 _MAP_ACTION_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _NATIVE_CAM_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 # Content width inside glass inset (see ``_CAM_RAIL_LAYER_INSET``).
-_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX = 286
+_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX = 318
 # Inset ``native_hud_right`` inside rounded ``nativeCameraRailLayer`` (extra right for radius).
 _CAM_RAIL_LAYER_INSET = (5, 5, 14, 5)
 _NATIVE_CAM_RAIL_MIN_WIDTH_PX = (
@@ -420,7 +420,7 @@ QPushButton#camPhotoBtn:checked {
   border: 1px solid rgba(214, 224, 241, 230);
   background: rgba(27, 33, 45, 245);
 }
-QPushButton#camSplitBtn, QPushButton#camFollowBtn {
+QPushButton#camSplitBtn, QPushButton#camFollowBtn, QPushButton#camThermalBtn {
   width: 28px;
   height: 28px;
   min-width: 28px;
@@ -433,15 +433,21 @@ QPushButton#camSplitBtn, QPushButton#camFollowBtn {
   border: 1px solid rgba(196, 209, 230, 55);
   background-color: rgba(22, 27, 38, 235);
   color: #e8edf8;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 11px;
+  font-weight: 700;
 }
-QPushButton#camSplitBtn:hover, QPushButton#camFollowBtn:hover {
+QPushButton#camSplitBtn:hover, QPushButton#camFollowBtn:hover, QPushButton#camThermalBtn:hover {
   background-color: rgba(40, 48, 62, 245);
   border-color: rgba(229, 237, 251, 85);
 }
-QPushButton#camSplitBtn:checked, QPushButton#camFollowBtn:checked {
+QPushButton#camSplitBtn:checked, QPushButton#camFollowBtn:checked, QPushButton#camThermalBtn:checked {
   border: 1px solid rgba(105, 232, 111, 220);
   background-color: rgba(24, 52, 34, 250);
   color: #c8ffc8;
+}
+QPushButton#camThermalBtn:disabled {
+  opacity: 0.45;
 }
 /* Split is logically on but main canvas is a single zoomed channel (not the 2×2 composite): neutral chrome. */
 QPushButton#camSplitBtn:checked[splitHidden="true"] {
@@ -1489,6 +1495,7 @@ class MapWidget(QWidget):
             "Thermal IR camera (C13: one RTSP stream — switches between day and thermal; "
             "gimbal control unchanged)"
         )
+        self._btn_native_thermal.setText("IR")
         self._btn_native_thermal.hide()
 
         ctr_layout.addWidget(self._btn_native_split, 0)
@@ -4088,9 +4095,33 @@ class MapWidget(QWidget):
     def _companion_has_dual_feed(self) -> bool:
         if not self._uses_companion_rtsp():
             return False
+        try:
+            self._read_video_settings()
+        except Exception:
+            pass
         day = str(getattr(self, "_video_settings_day", "") or "").strip()
         thermal = str(getattr(self, "_video_settings_thermal", "") or "").strip()
-        return bool(day) and bool(thermal)
+        if bool(day) and bool(thermal):
+            return True
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is not None:
+            try:
+                if "thermal" in vp.sources():
+                    th = vp.sources().get("thermal")
+                    url = str(getattr(th, "_url", "") or "").strip()
+                    if url:
+                        return True
+            except Exception:
+                pass
+        return False
+
+    def _companion_show_ir_button(self) -> bool:
+        """Show IR toggle on Skydroid / 192.168.144.x companion links."""
+        try:
+            self._read_video_settings()
+        except Exception:
+            pass
+        return self._uses_companion_rtsp()
 
     def _companion_switch_active_feed(self, source_id: str, *, reason: str = "") -> None:
         """C13: swap day ↔ thermal RTSP (one client). Gimbal UDP is unaffected."""
@@ -4150,12 +4181,42 @@ class MapWidget(QWidget):
         btn = getattr(self, "_btn_native_thermal", None)
         if btn is None:
             return
-        show = self._companion_has_dual_feed()
+        show = self._companion_show_ir_button()
+        dual = self._companion_has_dual_feed()
         try:
             btn.setVisible(bool(show))
+            btn.setEnabled(bool(dual))
+            if dual:
+                btn.setToolTip(
+                    "Thermal IR feed (C13: switches day ↔ thermal — one RTSP stream at a time; "
+                    "gimbal unchanged)"
+                )
+            else:
+                btn.setToolTip(
+                    "Thermal IR — set both day and thermal RTSP URLs in "
+                    "Application Settings → Video → Apply"
+                )
         except Exception:
             pass
         if not show:
+            return
+        if not dual:
+            try:
+                print(
+                    "[VGCS:video] IR button visible but disabled — configure thermal RTSP URL "
+                    f"(day={getattr(self, '_video_settings_day', '')!r} "
+                    f"thermal={getattr(self, '_video_settings_thermal', '')!r})"
+                )
+            except Exception:
+                pass
+            try:
+                btn.blockSignals(True)
+                btn.setChecked(False)
+            finally:
+                try:
+                    btn.blockSignals(False)
+                except Exception:
+                    pass
             return
         active = "day"
         vp = getattr(self, "_video", None)
@@ -4174,6 +4235,12 @@ class MapWidget(QWidget):
                 pass
 
     def _on_native_thermal_feed_toggled(self, on: bool) -> None:
+        if not self._companion_has_dual_feed():
+            self._sync_native_thermal_feed_button()
+            self._set_status(
+                "Thermal IR — set day + thermal RTSP in Application Settings → Video → Apply"
+            )
+            return
         target = "thermal" if bool(on) else "day"
         self._companion_switch_active_feed(target, reason="ir_button")
 
@@ -5277,6 +5344,10 @@ class MapWidget(QWidget):
                 pass
             try:
                 self.apply_video_settings()
+            except Exception:
+                pass
+            try:
+                self._sync_native_thermal_feed_button()
             except Exception:
                 pass
             try:
