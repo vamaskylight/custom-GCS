@@ -93,9 +93,12 @@ from vgcs.observe.dooaf import (
     dooaf_role_display,
     dooaf_settings_kwargs,
     merge_dooaf_settings,
+    merge_setup_video_marks,
     read_dooaf_settings,
     resolved_dooaf_settings,
     write_dooaf_settings,
+    write_dooaf_setup_video_mark,
+    clear_dooaf_setup_video_mark,
 )
 from vgcs.observe.geo_reference import compute_geo_reference, compute_lrf_slant_geo
 from vgcs.observe.grid_reference import format_grid_reference
@@ -1041,7 +1044,7 @@ class _ObservationExportTask(QRunnable):
             target_lon=self._target_lon,
             target_alt_m=self._target_alt_m,
             dem_path=self._dem_path,
-            setup_video_marks=self._setup_video_marks,
+            setup_video_marks=merge_setup_video_marks(self._setup_video_marks),
         )
         corr = session.correction
         export_rows: list[dict[str, object]] = []
@@ -7299,11 +7302,9 @@ class MapWidget(QWidget):
         kw = dooaf_settings_kwargs(s)
         kw["dem_path"] = self._observe_dem_path()
         marks = getattr(self, "_dooaf_setup_video_marks", None) or {}
-        if marks:
-            kw["setup_video_marks"] = {
-                str(role): (float(pt[0]), float(pt[1]))
-                for role, pt in marks.items()
-            }
+        merged = merge_setup_video_marks(marks, st=self._dooaf_settings_store())
+        if merged:
+            kw["setup_video_marks"] = merged
         return kw
 
     def _resolved_dooaf_settings(self) -> DooafSettings:
@@ -7635,6 +7636,15 @@ class MapWidget(QWidget):
         lat, lon, alt_m = geo
         pick_role = str(getattr(self, "_dooaf_pick_role", "") or DOOAF_ROLE_INTENDED)
         self._dooaf_setup_video_marks[pick_role] = (float(video_x), float(video_y))
+        try:
+            write_dooaf_setup_video_mark(
+                self._dooaf_settings_store(),
+                pick_role,
+                float(video_x),
+                float(video_y),
+            )
+        except Exception:
+            pass
         self._schedule_video_marks_overlay_refresh()
         self._end_dooaf_map_pick(restore_target_mode=True)
         print(
@@ -7848,9 +7858,21 @@ class MapWidget(QWidget):
         if clear_gun:
             roles_remove.add(DOOAF_ROLE_GUN)
             self._dooaf_setup_video_marks.pop(DOOAF_ROLE_GUN, None)
+            try:
+                clear_dooaf_setup_video_mark(
+                    self._dooaf_settings_store(), DOOAF_ROLE_GUN
+                )
+            except Exception:
+                pass
         if clear_target:
             roles_remove.add(DOOAF_ROLE_INTENDED)
             self._dooaf_setup_video_marks.pop(DOOAF_ROLE_INTENDED, None)
+            try:
+                clear_dooaf_setup_video_mark(
+                    self._dooaf_settings_store(), DOOAF_ROLE_INTENDED
+                )
+            except Exception:
+                pass
         if roles_remove:
             self._observations = [
                 r

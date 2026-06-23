@@ -119,6 +119,7 @@ _QS_TARGET_LAT = "dooaf/target_lat"
 _QS_TARGET_LON = "dooaf/target_lon"
 _QS_TARGET_ALT = "dooaf/target_alt_m"
 _QS_PRESETS_JSON = "dooaf/presets_json"
+_QS_SETUP_VIDEO_MARKS_JSON = "dooaf/setup_video_marks_json"
 
 
 def initial_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -412,10 +413,11 @@ def _synthesize_setup_mark_row(
         camera_hfov_deg=hfov,
         dem_path=dem_path,
     )
-    if geo.ok and geo.target_lat is not None and geo.target_lon is not None:
-        row["target_lat"] = geo.target_lat
-        row["target_lon"] = geo.target_lon
-        if geo.target_alt_m is not None:
+    if geo.ok:
+        # Keep DOOAF Setup footprint; ray fields are for facade elevation geometry.
+        row["target_lat"] = lat
+        row["target_lon"] = lon
+        if geo.target_alt_m is not None and row.get("target_alt_m") is None:
             row["target_alt_m"] = geo.target_alt_m
         row["geo_quality"] = geo.quality
         row["geo_method"] = geo.method
@@ -513,6 +515,74 @@ def read_dooaf_settings(st: Any) -> DooafSettings:
         target_lon=_qs_float(st, _QS_TARGET_LON),
         target_alt_m=_qs_float(st, _QS_TARGET_ALT),
     )
+
+
+def read_dooaf_setup_video_marks(st: Any) -> dict[str, tuple[float, float]]:
+    """DOOAF Setup video picks persisted across export (role → norm x, y)."""
+    raw = str(st.value(_QS_SETUP_VIDEO_MARKS_JSON, "") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for role, pair in data.items():
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        try:
+            out[str(role)] = (float(pair[0]), float(pair[1]))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def write_dooaf_setup_video_marks(
+    st: Any, marks: dict[str, tuple[float, float]]
+) -> None:
+    if not marks:
+        st.remove(_QS_SETUP_VIDEO_MARKS_JSON)
+        return
+    payload = {str(role): [float(xy[0]), float(xy[1])] for role, xy in marks.items()}
+    st.setValue(_QS_SETUP_VIDEO_MARKS_JSON, json.dumps(payload))
+
+
+def write_dooaf_setup_video_mark(st: Any, role: str, x: float, y: float) -> None:
+    marks = read_dooaf_setup_video_marks(st)
+    marks[str(role)] = (float(x), float(y))
+    write_dooaf_setup_video_marks(st, marks)
+
+
+def clear_dooaf_setup_video_mark(st: Any, role: str) -> None:
+    marks = read_dooaf_setup_video_marks(st)
+    if marks.pop(str(role), None) is None:
+        return
+    write_dooaf_setup_video_marks(st, marks)
+
+
+def merge_setup_video_marks(
+    memory: dict[str, tuple[float, float]] | None = None,
+    *,
+    st: Any | None = None,
+) -> dict[str, tuple[float, float]] | None:
+    """Merge persisted QSettings marks with in-memory DOOAF Setup picks."""
+    merged: dict[str, tuple[float, float]] = {}
+    store = st
+    if store is None:
+        try:
+            from PySide6.QtCore import QSettings
+
+            store = QSettings("VGCS", "VGCS")
+        except Exception:
+            store = None
+    if store is not None:
+        merged.update(read_dooaf_setup_video_marks(store))
+    if memory:
+        for role, pt in memory.items():
+            merged[str(role)] = (float(pt[0]), float(pt[1]))
+    return merged or None
 
 
 @dataclass(frozen=True)
@@ -760,6 +830,7 @@ def build_dooaf_session(
     dem_path: str | Path | None = None,
     setup_video_marks: dict[str, tuple[float, float]] | None = None,
 ) -> DooafSession:
+    setup_video_marks = merge_setup_video_marks(setup_video_marks)
     gun_row = latest_mark_row(rows, DOOAF_ROLE_GUN)
     intended_row = latest_mark_row(rows, DOOAF_ROLE_INTENDED)
     impact_row = latest_mark_row(rows, DOOAF_ROLE_IMPACT)
@@ -783,6 +854,7 @@ def build_dooaf_session(
         and DOOAF_ROLE_INTENDED in setup_video_marks
     ):
         vx, vy = setup_video_marks[DOOAF_ROLE_INTENDED]
+        setup_footprint = intended
         intended_row = _synthesize_setup_mark_row(
             DOOAF_ROLE_INTENDED,
             intended.lat,
@@ -793,7 +865,12 @@ def build_dooaf_session(
             dem_path=dem_path,
             alt_m=intended.alt_m,
         )
-        intended = point_from_row(intended_row) or intended
+        if setup_footprint is not None:
+            intended = GeoPoint(
+                setup_footprint.lat,
+                setup_footprint.lon,
+                setup_footprint.alt_m,
+            )
     building_height_m: float | None = None
     if intended is not None and impact is not None:
         intended, impact, building_height_m = resolve_dooaf_mark_elevations(
