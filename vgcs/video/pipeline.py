@@ -16,7 +16,11 @@ from typing import Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-23-companion-motion-preview"
+_VIDEO_PIPELINE_REV = "2026-06-23-companion-clean-preview"
+
+# C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
+_COMPANION_RTSP_OPEN_LOCK = threading.Lock()
+_COMPANION_RTSP_LAST_OPEN_MONO: float = 0.0
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
 _SIYI_HWACCEL_UNAVAILABLE = False
@@ -475,6 +479,49 @@ def _rgb_frame_looks_hevc_corrupt(
     if std_d > 20.0 and mean_d > 8.0 and (bad / tiles) > 0.10:
         return True
     return (bad / tiles) > 0.22
+
+
+def _rgb_frame_has_decode_artifacts(arr: "np.ndarray") -> bool:
+    """
+    Detect classic HEVC decode tears (magenta/green macroblock bands).
+
+    These must never be shown — hold the last good preview instead.
+    """
+    if not HAS_NUMPY or np is None:
+        return False
+    h, w, _ = arr.shape
+    if h < 8 or w < 8:
+        return False
+    r = arr[:, :, 0].astype(np.int16)
+    g = arr[:, :, 1].astype(np.int16)
+    b = arr[:, :, 2].astype(np.int16)
+    pixels = float(h * w)
+    # YUV plane misalignment: neon magenta (high R+B, low G).
+    magenta = (r > 175) & (g < 85) & (b > 175)
+    magenta_ratio = float(magenta.sum()) / pixels
+    if magenta_ratio > 0.06:
+        return True
+    # Green macroblock smear.
+    green_tear = (g > 195) & (r < 70) & (b < 70)
+    if float(green_tear.sum()) / pixels > 0.06:
+        return True
+    # Thick horizontal tear bands (common in the user's field captures).
+    row_magenta = magenta.mean(axis=1)
+    if int((row_magenta > 0.30).sum()) >= 2:
+        return True
+    return False
+
+
+def _companion_frame_should_hide(
+    arr: "np.ndarray",
+    last_good: "np.ndarray | None",
+) -> tuple[bool, str]:
+    """Return (hide, reason) for companion preview quality gate."""
+    if _rgb_frame_has_decode_artifacts(arr):
+        return True, "artifact"
+    if last_good is not None and _rgb_frame_looks_hevc_corrupt(arr, last_good):
+        return True, "corrupt"
+    return False, ""
 
 
 def _siyi_rtsp_camera_busy(tail_b: bytes) -> bool:
@@ -1625,24 +1672,25 @@ class RtspSource(QObject):
         """Minimum gap between FFmpeg RTSP opens (reduces companion -138 / busy slot storms)."""
         if not _rtsp_url_is_companion_rtsp(url):
             return
+        global _COMPANION_RTSP_LAST_OPEN_MONO
         streak = int(getattr(self, "_siyi_138_fail_streak", 0) or 0)
         min_gap = 5.0
         if streak >= 2 or _siyi_rtsp_camera_busy(tail_hint):
             min_gap = min(25.0, 8.0 + streak * 2.0)
-        now = time.monotonic()
-        last = float(getattr(self, "_siyi_last_rtsp_open_mono", 0) or 0)
-        gap = now - last
-        if gap < min_gap:
-            wait = min_gap - gap
-            try:
-                print(
-                    f"[VGCS:video] companion RTSP: throttling open ({wait:.1f}s, "
-                    "avoid camera busy / -138)"
-                )
-            except Exception:
-                pass
-            time.sleep(wait)
-        self._siyi_last_rtsp_open_mono = time.monotonic()
+        with _COMPANION_RTSP_OPEN_LOCK:
+            now = time.monotonic()
+            gap = now - float(_COMPANION_RTSP_LAST_OPEN_MONO or 0.0)
+            if gap < min_gap:
+                wait = min_gap - gap
+                try:
+                    print(
+                        f"[VGCS:video] companion RTSP: throttling open ({wait:.1f}s, "
+                        f"url={url}, avoid camera busy / -138)"
+                    )
+                except Exception:
+                    pass
+                time.sleep(wait)
+            _COMPANION_RTSP_LAST_OPEN_MONO = time.monotonic()
 
     def _siyi_mark_rtsp_open_result(self, frames: int, tail: bytes) -> None:
         if not tail:
@@ -1740,8 +1788,8 @@ class RtspSource(QObject):
             )
             if not _companion_hevc_showall_enabled():
                 print(
-                    "[VGCS:video] companion HEVC: corrupt frames hidden "
-                    "(motion-aware; set VGCS_COMPANION_SHOWALL=1 for legacy show-all)"
+                    "[VGCS:video] companion HEVC: artifact frames hidden "
+                    "(hold last good preview; never show macroblock tears)"
                 )
             if _rtsp_url_is_companion_rtsp(url):
                 print(
@@ -2012,28 +2060,37 @@ class RtspSource(QObject):
                                     assert np is not None
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
                                     if companion_rtsp and not _companion_hevc_showall_enabled():
-                                        if _rgb_frame_looks_hevc_corrupt(arr, last_good_arr):
+                                        hide, why = _companion_frame_should_hide(
+                                            arr, last_good_arr
+                                        )
+                                        if hide:
                                             corrupt_skip_streak += 1
-                                            if corrupt_skip_streak < 12:
-                                                if not corrupt_skip_logged:
-                                                    corrupt_skip_logged = True
-                                                    try:
-                                                        print(
-                                                            "[VGCS:video] companion HEVC: skipping "
-                                                            "corrupt frame (hold last good preview)"
-                                                        )
-                                                    except Exception:
-                                                        pass
-                                                continue
-                                            try:
-                                                print(
-                                                    "[VGCS:video] companion HEVC: resuming preview "
-                                                    "(motion / skip streak — was holding last frame)"
-                                                )
-                                            except Exception:
-                                                pass
-                                        else:
-                                            corrupt_skip_streak = 0
+                                            if corrupt_skip_streak in (1, 8, 16, 24):
+                                                try:
+                                                    print(
+                                                        "[VGCS:video] companion HEVC: "
+                                                        f"hiding {why} frame "
+                                                        f"(streak={corrupt_skip_streak}, "
+                                                        "hold last good preview)"
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            if corrupt_skip_streak >= 20:
+                                                try:
+                                                    print(
+                                                        "[VGCS:video] companion HEVC: "
+                                                        "corrupt streak — reconnecting RTSP"
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    if p.poll() is None:
+                                                        p.kill()
+                                                except Exception:
+                                                    pass
+                                                break
+                                            continue
+                                        corrupt_skip_streak = 0
                                     qimg = QImage(
                                         arr.data, w, h, 3 * w, QImage.Format.Format_RGB888
                                     ).copy()

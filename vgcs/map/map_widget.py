@@ -4051,7 +4051,7 @@ class MapWidget(QWidget):
             return
         self._show_mini_video_pip_shell()
         if self._video_preview_should_run():
-            self._auto_start_mini_video_pip(force_decode=True, preserve_layout=True)
+            self._auto_start_mini_video_pip(force_decode=False, preserve_layout=True)
             QTimer.singleShot(
                 800,
                 lambda: self._companion_start_decode_if_needed(reason="mavlink_link"),
@@ -5703,9 +5703,7 @@ class MapWidget(QWidget):
             return
         try:
             if vp.sources():
-                self._auto_start_mini_video_pip(
-                    force_decode=bool(getattr(self, "_last_link_connected", False)),
-                )
+                self._auto_start_mini_video_pip(force_decode=False)
                 if bool(getattr(self, "_last_link_connected", False)):
                     self._companion_start_decode_if_needed(reason="schedule")
                 return
@@ -5903,6 +5901,7 @@ class MapWidget(QWidget):
                 pass
             return
         want = set(self._video_preview_source_ids_to_run(vp))
+        self._stop_idle_video_decode_sources(vp)
         for sid, src in vp.sources().items():
             if sid in want:
                 try:
