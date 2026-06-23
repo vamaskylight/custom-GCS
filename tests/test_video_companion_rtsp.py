@@ -80,9 +80,28 @@ def test_rgb_corrupt_detector():
     good = np.zeros((h, w, 3), dtype=np.uint8)
     good[:, :, 1] = 120
     corrupt = good.copy()
-    for y in range(0, h, 16):
-        for x in range(0, w, 16):
-            corrupt[y : y + 16, x : x + 16] = np.random.randint(0, 256, (16, 16, 3), dtype=np.uint8)
+    rng = np.random.default_rng(0)
+    for y in range(0, h - 16, 16):
+        for x in range(0, w - 16, 16):
+            if ((x // 16) + (y // 16)) % 3 != 0:
+                continue
+            corrupt[y : y + 16, x : x + 16] = rng.integers(
+                0, 256, (16, 16, 3), dtype=np.uint8
+            )
     assert _rgb_frame_looks_hevc_corrupt(corrupt, good)
     assert not _rgb_frame_looks_hevc_corrupt(good, good)
     assert not _rgb_frame_looks_hevc_corrupt(good, None)
+
+
+def test_rgb_corrupt_detector_ignores_gimbal_pan():
+    """Gimbal pan shifts the whole scene — must not freeze preview as 'corrupt'."""
+    h, w = 144, 256
+    good = np.zeros((h, w, 3), dtype=np.uint8)
+    for y in range(h):
+        good[y, :, 0] = (y * 5) % 256
+        good[y, :, 1] = 80 + (y % 40)
+    panned = np.zeros_like(good)
+    shift = 48
+    panned[:, shift:, :] = good[:, :-shift, :]
+    panned[:, :shift, :] = 90
+    assert not _rgb_frame_looks_hevc_corrupt(panned, good)
