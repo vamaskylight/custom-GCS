@@ -4189,6 +4189,14 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             try:
+                active_now = str(vp2.active_source_id() or "").strip()
+                print(
+                    f"[VGCS:video] companion feed switch done: active={active_now!r} "
+                    f"(want={sid!r})"
+                )
+            except Exception:
+                pass
+            try:
                 self._start_video_decode_sources(vp2)
             except Exception:
                 pass
@@ -5486,13 +5494,25 @@ class MapWidget(QWidget):
             self._video_active_source = vp.active_source()
             src_ids = set(sources.keys())
             preferred_id = ""
-            if "day" in src_ids:
+            try:
+                cur_active = str(vp.active_source_id() or "").strip()
+            except Exception:
+                cur_active = ""
+            if cur_active in src_ids:
+                preferred_id = cur_active
+            elif "day" in src_ids:
                 preferred_id = "day"
             elif "thermal" in src_ids:
                 preferred_id = "thermal"
             elif src_ids:
                 preferred_id = str(next(iter(src_ids)))
-            if preferred_id:
+            if preferred_id and preferred_id != cur_active:
+                try:
+                    vp.set_active_source(preferred_id)
+                    self._video_active_source = vp.active_source()
+                except Exception:
+                    pass
+            elif preferred_id and self._video_active_source is None:
                 try:
                     vp.set_active_source(preferred_id)
                     self._video_active_source = vp.active_source()
