@@ -1012,6 +1012,53 @@ def _fc_svg_esc(text: str) -> str:
     return _html_esc(text).replace("'", "&#39;")
 
 
+def _fc_inset_overlaps_markers(
+    x0: float,
+    y0: float,
+    w: float,
+    h: float,
+    markers: list[tuple[float, float, float]],
+    *,
+    pad: float = 10.0,
+) -> float:
+    """Overlap penalty between an inset rect and diagram markers (x, y, radius)."""
+    penalty = 0.0
+    ex0, ey0 = x0 - pad, y0 - pad
+    ex1, ey1 = x0 + w + pad, y0 + h + pad
+    for mx, my, mr in markers:
+        closest_x = max(ex0, min(mx, ex1))
+        closest_y = max(ey0, min(my, ey1))
+        dist = math.hypot(mx - closest_x, my - closest_y)
+        if dist < mr:
+            penalty += (mr - dist + 24.0) ** 2
+    return penalty
+
+
+def _fc_pick_inset_corner(
+    inset_w: float,
+    inset_h: float,
+    plot_x: float,
+    plot_y: float,
+    plot_w: float,
+    plot_h: float,
+    markers: list[tuple[float, float, float]],
+    *,
+    margin: float = 6.0,
+) -> tuple[float, float]:
+    """Place gun/drone inset in the plot corner farthest from main markers."""
+    m = margin
+    options = [
+        (plot_x + m, plot_y + m),
+        (plot_x + plot_w - inset_w - m, plot_y + m),
+        (plot_x + m, plot_y + plot_h - inset_h - m),
+        (plot_x + plot_w - inset_w - m, plot_y + plot_h - inset_h - m),
+    ]
+    return min(
+        options,
+        key=lambda pos: _fc_inset_overlaps_markers(pos[0], pos[1], inset_w, inset_h, markers),
+    )
+
+
 def _fc_svg_gun_drone_inset(session: DooafSession, x0: float, y0: float, w: float, h: float) -> str:
     """Mini reference map: artillery + drone when coordinates are known."""
     pts: list[tuple[str, GeoPoint, str]] = []
@@ -1028,6 +1075,7 @@ def _fc_svg_gun_drone_inset(session: DooafSession, x0: float, y0: float, w: floa
         n, e = latlon_delta_to_ne_m(ref_lat, ref_lon, pt.lat, pt.lon)
         en.append((label, e, n, color))
     span = max(max(abs(v[1]) for v in en), max(abs(v[2]) for v in en), 8.0)
+    schematic_inset = len(en) == 2 and span < 8.0
     scale = min((w - 16.0) / (2.0 * span), (h - 16.0) / (2.0 * span), 3.5)
     cx = x0 + w / 2.0
     cy = y0 + h / 2.0
@@ -1038,8 +1086,14 @@ def _fc_svg_gun_drone_inset(session: DooafSession, x0: float, y0: float, w: floa
         "fill='#64748b' font-weight='700'>Gun · Drone</text>",
     ]
     for label, east, north, color in en:
-        px = cx + east * scale
-        py = cy - north * scale
+        if schematic_inset:
+            if label == "G":
+                px, py = cx - 15.0, cy + 5.0
+            else:
+                px, py = cx + 15.0, cy + 5.0
+        else:
+            px = cx + east * scale
+            py = cy - north * scale
         if label == "G":
             brg = None
             if session.gun is not None and session.drone is not None:
@@ -1585,6 +1639,20 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     placer.add_marker(gx, gy, 14.0)
     placer.add_marker(tx, ty, 15.0)
     placer.add_marker(ix, iy, 14.0)
+    inset_w, inset_h = 78.0, 52.0
+    inset_markers: list[tuple[float, float, float]] = [
+        (gx, gy, 18.0),
+        (tx, ty, 20.0),
+        (ix, iy, 14.0),
+    ]
+    if ne_d is not None:
+        dx_m, dy_m = _xy(ne_d[1], ne_d[0])
+        if bg_x <= dx_m <= bg_x + bg_w and graph_top <= dy_m <= graph_bottom:
+            inset_markers.append((dx_m, dy_m, 12.0))
+    inset_x, inset_y = _fc_pick_inset_corner(
+        inset_w, inset_h, bg_x, graph_top, bg_w, bg_h, inset_markers
+    )
+    placer.add_blocked_zone(inset_x + inset_w / 2, inset_y + inset_h / 2, inset_w + 12, inset_h + 12)
 
     parts: list[str] = [
         f"<svg class='fc-plan-svg' viewBox='0 0 {vb_w:.0f} {vb_h:.0f}' width='100%' "
@@ -1641,7 +1709,6 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
             f"<text x='{dx:.1f}' y='{dy + 3:.1f}' text-anchor='middle' font-size='8' fill='#fff' "
             "font-weight='700'>D</text>"
         )
-    parts.append(_fc_svg_gun_drone_inset(session, bg_x + 4.0, graph_top + 4.0, 78.0, 52.0))
     gt_side = _fc_seg_prefer_side(gx, gy, tx, ty, cluster_x, cluster_y)
     gi_side = _fc_seg_prefer_side(gx, gy, ix, iy, cluster_x, cluster_y)
     parts.append(
@@ -1670,6 +1737,8 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
             "stroke-width='2' stroke-dasharray='5,3' marker-end='url(#fc-arrow-corr)'/>",
         ]
     )
+
+    parts.append(_fc_svg_gun_drone_inset(session, inset_x, inset_y, inset_w, inset_h))
 
     parts.append(
         _fc_svg_diagram_footer(bg_x, bg_w, footer_top, footer_h, footer_columns)
@@ -1851,7 +1920,19 @@ def _fire_correction_gunline_svg(c: FireCorrection, *, session: DooafSession | N
     if pts.schematic:
         parts.insert(-1, _fc_schematic_spacing_note(vb_w - margin - 4.0, vb_h - margin + 2.0))
     if session is not None:
-        parts.insert(-1, _fc_svg_gun_drone_inset(session, margin, margin, 78.0, 52.0))
+        inset_w, inset_h = 78.0, 52.0
+        plot_w = vb_w - 2.0 * margin
+        plot_h = vb_h - 2.0 * margin
+        ix0, iy0 = _fc_pick_inset_corner(
+            inset_w,
+            inset_h,
+            margin,
+            margin,
+            plot_w,
+            plot_h,
+            [(cx, cy, 14.0), (ix, iy, 12.0)],
+        )
+        parts.insert(-1, _fc_svg_gun_drone_inset(session, ix0, iy0, inset_w, inset_h))
     parts.append("</svg>")
     return "".join(parts)
 
@@ -1949,7 +2030,19 @@ def _fire_correction_compass_miss_svg(
     if pts.schematic:
         parts.insert(-1, _fc_schematic_spacing_note(vb_w - margin - 4.0, vb_h - margin + 2.0))
     if session is not None:
-        parts.insert(-1, _fc_svg_gun_drone_inset(session, margin, margin, 78.0, 52.0))
+        inset_w, inset_h = 78.0, 52.0
+        plot_w = vb_w - 2.0 * margin
+        plot_h = vb_h - 2.0 * margin
+        ix0, iy0 = _fc_pick_inset_corner(
+            inset_w,
+            inset_h,
+            margin,
+            margin,
+            plot_w,
+            plot_h,
+            [(cx, cy, 14.0), (ix, iy, 12.0)],
+        )
+        parts.insert(-1, _fc_svg_gun_drone_inset(session, ix0, iy0, inset_w, inset_h))
     parts.append("</svg>")
     return "".join(parts)
 
