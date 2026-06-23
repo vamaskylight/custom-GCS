@@ -250,6 +250,7 @@ def resolve_dooaf_mark_elevations(
     """
     from vgcs.observe.facade_plane import (
         facade_msl_heights_from_ground_mark,
+        facade_msl_heights_from_horizon_marks,
         facade_vertical_height_between_marks,
     )
 
@@ -268,37 +269,36 @@ def resolve_dooaf_mark_elevations(
     pair_h = facade_vertical_height_between_marks(
         intended_row, impact_row, hfov_deg=hfov_deg
     )
-    if pair_h is None or pair_h < 1.0:
-        return new_intended, new_impact, building_h
-
-    uy_i = intended_row.get("video_y_norm")
-    uy_p = impact_row.get("video_y_norm")
-    if uy_i is None or uy_p is None:
-        return new_intended, new_impact, building_h
-
-    try:
-        y_intended = float(uy_i)
-        y_impact = float(uy_p)
-    except (TypeError, ValueError):
-        return new_intended, new_impact, building_h
-
-    if y_intended < y_impact:
-        base_dem = _dem_alt_from_row(impact_row) or impact.alt_m
-        if base_dem is not None:
-            roof_alt = base_dem + pair_h
-            new_intended = GeoPoint(intended.lat, intended.lon, roof_alt)
-            new_impact = GeoPoint(impact.lat, impact.lon, base_dem)
-            building_h = pair_h
-            intended_row["building_height_m"] = pair_h
-            intended_row["target_alt_method"] = "pair_facade_vertical"
-            impact_row["target_alt_method"] = "terrain_dem"
-    elif y_impact < y_intended:
-        base_dem = _dem_alt_from_row(intended_row) or intended.alt_m
-        if base_dem is not None:
-            roof_alt = base_dem + pair_h
-            new_impact = GeoPoint(impact.lat, impact.lon, roof_alt)
-            new_intended = GeoPoint(intended.lat, intended.lon, roof_alt - pair_h)
-            building_h = pair_h
+    min_pair_h = 0.35
+    if pair_h is not None and pair_h >= min_pair_h:
+        uy_i = intended_row.get("video_y_norm")
+        uy_p = impact_row.get("video_y_norm")
+        if uy_i is not None and uy_p is not None:
+            try:
+                y_intended = float(uy_i)
+                y_impact = float(uy_p)
+            except (TypeError, ValueError):
+                y_intended = y_impact = 0.0
+            else:
+                if y_intended < y_impact:
+                    base_dem = _dem_alt_from_row(impact_row) or impact.alt_m
+                    if base_dem is not None:
+                        roof_alt = base_dem + pair_h
+                        new_intended = GeoPoint(intended.lat, intended.lon, roof_alt)
+                        new_impact = GeoPoint(impact.lat, impact.lon, base_dem)
+                        building_h = pair_h
+                        intended_row["building_height_m"] = pair_h
+                        intended_row["target_alt_method"] = "pair_facade_vertical"
+                        impact_row["target_alt_method"] = "terrain_dem"
+                elif y_impact < y_intended:
+                    base_dem = _dem_alt_from_row(intended_row) or intended.alt_m
+                    if base_dem is not None:
+                        roof_alt = base_dem + pair_h
+                        new_impact = GeoPoint(impact.lat, impact.lon, roof_alt)
+                        new_intended = GeoPoint(
+                            intended.lat, intended.lon, roof_alt - pair_h
+                        )
+                        building_h = pair_h
 
     if (
         ground_row is not None
@@ -319,6 +319,22 @@ def resolve_dooaf_mark_elevations(
             impact_row["target_alt_method"] = "facade_ground_interpolate"
             if building_h is not None and building_h > 0.1:
                 intended_row["building_height_m"] = building_h
+        else:
+            g_msl, t_msl_h, i_msl = facade_msl_heights_from_horizon_marks(
+                ground_row,
+                intended_row,
+                impact_row,
+                hfov_deg=hfov_deg,
+            )
+            if g_msl is not None and t_msl_h is not None and i_msl is not None:
+                new_intended = GeoPoint(intended.lat, intended.lon, t_msl_h)
+                new_impact = GeoPoint(impact.lat, impact.lon, i_msl)
+                building_h = abs(float(t_msl_h) - float(i_msl))
+                intended_row["target_alt_method"] = "horizon_video_interpolate"
+                impact_row["target_alt_method"] = "horizon_video_interpolate"
+                ground_row["resolved_alt_msl_m"] = g_msl
+                if building_h > 0.1:
+                    intended_row["building_height_m"] = building_h
 
     return new_intended, new_impact, building_h
 
@@ -348,6 +364,11 @@ def _drone_alt_msl_from_row(row: dict[str, Any]) -> float | None:
     lon = _float_or_none(row.get("vehicle_lon"))
     ekf = observation_ekf_rel_alt_m(row)
     dem = dem_alt_msl_at_mark(row, GeoPoint(lat, lon, None)) if lat is not None and lon is not None else None
+    ground_agl = _float_or_none(row.get("dem_ground_agl_m"))
+    if dem is not None and ground_agl is not None and ground_agl > 0.5:
+        ekf_val = float(ekf) if ekf is not None else 0.0
+        if ground_agl > ekf_val + 2.0 or ekf_val < 3.0:
+            return float(dem) + float(ground_agl)
     msl = _float_or_none(row.get("vehicle_alt_msl_m"))
     if dem is not None and ekf is not None and ekf < 8.0:
         est = float(dem) + max(float(ekf), 0.5)
@@ -460,7 +481,54 @@ def _synthesize_setup_mark_row(
         gps_hdop=template_row.get("gps_hdop"),  # type: ignore[arg-type]
         camera_hfov_deg=hfov,
         dem_path=dem_path,
+        dem_terrain=True,
     )
+    from vgcs.observe.target_measure import (
+        low_hover_ray_agl_m,
+        observation_ekf_rel_alt_m,
+        ray_agl_suspect_dem_mismatch,
+        resolve_ray_agl_for_geo,
+    )
+
+    ray_agl, ray_src = resolve_ray_agl_for_geo(
+        relative_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
+        rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
+        video_y_norm=float(video_y),
+        vehicle_alt_msl_m=row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+        vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
+        vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
+        dem_path=str(dem_path) if dem_path else None,
+    )
+    needs_retry = (
+        not geo.ok
+        or geo.target_lat is None
+        or ray_agl_suspect_dem_mismatch(ray_agl, ray_src, row.get("ekf_rel_alt_m"))
+    )
+    if needs_retry and ray_agl is not None:
+        retry_agl = max(float(ray_agl), low_hover_ray_agl_m(observation_ekf_rel_alt_m(row)))
+        retry_geo = compute_geo_reference(
+            vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
+            vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
+            vehicle_heading_deg=row.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+            vehicle_roll_deg=row.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+            vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+            vehicle_rel_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
+            vehicle_alt_msl_m=row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+            rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
+            gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+            video_x_norm=float(video_x),
+            video_y_norm=float(video_y),
+            gps_fix_type=int(template_row.get("gps_fix_type") or 0),
+            gps_hdop=template_row.get("gps_hdop"),  # type: ignore[arg-type]
+            camera_hfov_deg=hfov,
+            dem_path=dem_path,
+            dem_terrain=False,
+            force_agl_m=retry_agl,
+        )
+        if retry_geo.ok and retry_geo.target_lat is not None:
+            geo = retry_geo
+            ray_agl = retry_agl
     if geo.ok:
         # Keep DOOAF Setup footprint; ray fields are for facade elevation geometry.
         row["target_lat"] = lat
@@ -476,6 +544,10 @@ def _synthesize_setup_mark_row(
             row["geo_range_m"] = geo.horizontal_range_m
         if geo.bearing_deg is not None:
             row["geo_bearing_deg"] = geo.bearing_deg
+        if ray_agl is not None:
+            row["measure_agl_m"] = ray_agl
+            row["geo_agl_source"] = ray_src
+            row["agl_source"] = ray_src
     enrich_video_mark_target_altitude(row)
     return row
 
@@ -771,10 +843,43 @@ def dooaf_export_blockers(
             "Hover ≥3 m for GPS-quality geo."
         )
     ekf = observation_ekf_rel_alt_m(impact_row)
+    ground_agl = _float_or_none(impact_row.get("dem_ground_agl_m"))
     if ekf is not None and ekf < 2.5:
-        warnings.append(
-            f"Drone was near ground (EKF {ekf:.1f} m) when impact was marked."
-        )
+        if ground_agl is not None and ground_agl > float(ekf) + 5.0:
+            warnings.append(
+                f"EKF reads {ekf:.1f} m above home but terrain AGL is ~{ground_agl:.0f} m "
+                "(rooftop / raised surface). Horizontal geo for skyline picks is approximate."
+            )
+        else:
+            warnings.append(
+                f"Drone was near ground (EKF {ekf:.1f} m) when impact was marked."
+            )
+    if (
+        gun_lat is not None
+        and gun_lon is not None
+        and target_lat is not None
+        and target_lon is not None
+        and setup_video_marks
+    ):
+        marks = merge_setup_video_marks(setup_video_marks) or {}
+        if DOOAF_ROLE_GUN in marks and DOOAF_ROLE_INTENDED in marks:
+            try:
+                gx, gy = marks[DOOAF_ROLE_GUN]
+                tx, ty = marks[DOOAF_ROLE_INTENDED]
+                sep_m = haversine_m(
+                    float(gun_lat),
+                    float(gun_lon),
+                    float(target_lat),
+                    float(target_lon),
+                )
+                if sep_m < 15.0 and abs(float(gx) - float(tx)) > 0.1:
+                    warnings.append(
+                        "Gun and target are only "
+                        f"{sep_m:.0f} m apart on the map but video picks are far apart — "
+                        "skyline/horizon clicks are approximate. Prefer map pick or hover ≥5 m."
+                    )
+            except (TypeError, ValueError):
+                pass
     return warnings
 
 
@@ -1254,6 +1359,19 @@ def build_dooaf_session(
             impact,
             ground_row=ground_row,
         )
+        if (
+            gun is not None
+            and ground_row is not None
+            and ground_row.get("resolved_alt_msl_m") is not None
+        ):
+            try:
+                gun = GeoPoint(
+                    gun.lat,
+                    gun.lon,
+                    float(ground_row["resolved_alt_msl_m"]),  # type: ignore[arg-type]
+                )
+            except (TypeError, ValueError):
+                pass
     correction = None
     if gun is not None and intended is not None and impact is not None:
         correction = compute_fire_correction(gun, intended, impact)
