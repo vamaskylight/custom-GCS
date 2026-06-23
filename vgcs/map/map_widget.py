@@ -136,6 +136,7 @@ from vgcs.video.pipeline import (
     VideoPipeline,
     QS_KEY_LAST_PHOTO_SAVE_DIR,
     notify_companion_preview_motion,
+    release_companion_rtsp_host,
     set_companion_decode_gate,
     suggested_photo_save_path,
     suggested_recording_save_path,
@@ -1476,7 +1477,22 @@ class MapWidget(QWidget):
             self._btn_native_follow.setIcon(_ifw)
             self._btn_native_follow.setIconSize(QSize(_ico_main, _ico_main))
 
+        self._btn_native_thermal = QPushButton("IR")
+        self._btn_native_thermal.setObjectName("camThermalBtn")
+        self._btn_native_thermal.setCheckable(True)
+        self._btn_native_thermal.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_thermal.setFixedSize(28, 28)
+        self._btn_native_thermal.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self._btn_native_thermal.setToolTip(
+            "Thermal IR camera (C13: one RTSP stream — switches between day and thermal; "
+            "gimbal control unchanged)"
+        )
+        self._btn_native_thermal.hide()
+
         ctr_layout.addWidget(self._btn_native_split, 0)
+        ctr_layout.addWidget(self._btn_native_thermal, 0)
         ctr_layout.addWidget(self._btn_native_follow, 0)
         self._lbl_camera_top_zoom = QLabel(_format_video_zoom_label(1.0))
         self._lbl_camera_top_zoom.setObjectName("camMagnificationLabel")
@@ -1833,6 +1849,7 @@ class MapWidget(QWidget):
         self._follow_rail_debounce.setInterval(50)
         self._follow_rail_debounce.timeout.connect(self._commit_native_follow_rail_toggle)
         self._btn_native_split.toggled.connect(self._on_native_split_rail_toggled)
+        self._btn_native_thermal.toggled.connect(self._on_native_thermal_feed_toggled)
         self._btn_native_follow.toggled.connect(self._on_native_follow_rail_toggled)
         self._btn_native_record.clicked.connect(self._on_native_record_center_clicked)
         self._btn_native_record.toggled.connect(self._on_native_record_toggled)
@@ -2319,6 +2336,8 @@ class MapWidget(QWidget):
             return
         # Remember operator intent even before the first thermal frame (avoid fullscreen 2×2 composite).
         self._split_fullscreen_source_id = str(sid)
+        if self._companion_has_dual_feed():
+            self._companion_switch_active_feed(str(sid), reason="split_click")
 
     def _pick_primary_split_source_id(self) -> str | None:
         """Best live stream for fullscreen when the operator did not pick a quadrant."""
@@ -4066,6 +4085,98 @@ class MapWidget(QWidget):
                 lambda: self._companion_start_decode_if_needed(reason="mavlink_link"),
             )
 
+    def _companion_has_dual_feed(self) -> bool:
+        if not self._uses_companion_rtsp():
+            return False
+        day = str(getattr(self, "_video_settings_day", "") or "").strip()
+        thermal = str(getattr(self, "_video_settings_thermal", "") or "").strip()
+        return bool(day) and bool(thermal)
+
+    def _companion_switch_active_feed(self, source_id: str, *, reason: str = "") -> None:
+        """C13: swap day ↔ thermal RTSP (one client). Gimbal UDP is unaffected."""
+        sid = str(source_id or "").strip().lower()
+        if sid not in ("day", "thermal"):
+            return
+        if not self._companion_has_dual_feed():
+            return
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is None:
+            return
+        try:
+            sources = vp.sources()
+        except Exception:
+            return
+        if sid not in sources:
+            return
+        try:
+            cur = str(vp.active_source_id() or "").strip().lower()
+        except Exception:
+            cur = ""
+        if cur == sid:
+            self._sync_native_thermal_feed_button()
+            return
+        try:
+            print(f"[VGCS:video] companion feed switch {cur!r} -> {sid!r} ({reason})")
+        except Exception:
+            pass
+        for osid, src in sources.items():
+            try:
+                url = str(getattr(src, "_url", "") or "")
+                src.stop()
+                release_companion_rtsp_host(str(osid), url)
+            except Exception:
+                pass
+        try:
+            vp.set_active_source(sid)
+            self._video_active_source = vp.active_source()
+        except Exception:
+            pass
+        try:
+            self._start_video_decode_sources(vp)
+        except Exception:
+            pass
+        try:
+            self._connect_video_pipeline_frame_slots(vp)
+        except Exception:
+            pass
+        self._sync_native_thermal_feed_button()
+        label = "Thermal" if sid == "thermal" else "Day"
+        self._set_status(
+            f"Camera feed: {label} "
+            "(C13 — day and thermal share one RTSP slot; gimbal still works)"
+        )
+
+    def _sync_native_thermal_feed_button(self) -> None:
+        btn = getattr(self, "_btn_native_thermal", None)
+        if btn is None:
+            return
+        show = self._companion_has_dual_feed()
+        try:
+            btn.setVisible(bool(show))
+        except Exception:
+            pass
+        if not show:
+            return
+        active = "day"
+        vp = getattr(self, "_video", None)
+        if vp is not None:
+            try:
+                active = str(vp.active_source_id() or "day").strip().lower()
+            except Exception:
+                active = "day"
+        try:
+            btn.blockSignals(True)
+            btn.setChecked(active == "thermal")
+        finally:
+            try:
+                btn.blockSignals(False)
+            except Exception:
+                pass
+
+    def _on_native_thermal_feed_toggled(self, on: bool) -> None:
+        target = "thermal" if bool(on) else "day"
+        self._companion_switch_active_feed(target, reason="ir_button")
+
     def _companion_video_decode_gate(self, source_id: str) -> bool:
         """C13 allows one RTSP client — decode only sources needed for current preview mode."""
         if not self._mini_video_pip_allowed():
@@ -4149,6 +4260,10 @@ class MapWidget(QWidget):
                 self._native_video_preview.show()
                 self._layout_native_video_preview()
                 self._stack_native_overlays_above_tile_map()
+        except Exception:
+            pass
+        try:
+            self._sync_native_thermal_feed_button()
         except Exception:
             pass
         return True
@@ -5661,12 +5776,12 @@ class MapWidget(QWidget):
                     if dv == "split":
                         try:
                             print(
-                                "[VGCS:video] C13 companion: Default view Split is decode-only "
-                                "Single (one RTSP client); toggle ▦ for layout without dual decode"
+                                "[VGCS:video] C13 companion: split layout OK — only one RTSP "
+                                "decodes at a time; use IR or tap Thermal cell to switch feed"
                             )
                         except Exception:
                             pass
-                    self._video_split_enabled = False
+                    self._video_split_enabled = dv == "split"
                 else:
                     self._video_split_enabled = (
                         str(
@@ -5679,6 +5794,7 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             self._sync_native_camera_rail_toggles()
+            self._sync_native_thermal_feed_button()
             QTimer.singleShot(
                 200,
                 lambda: self._companion_start_decode_if_needed(reason="settings_apply"),
@@ -5739,18 +5855,24 @@ class MapWidget(QWidget):
         self._video_inited = False
         self._shared_vp_hooks_connected = False
         try:
-            if self._uses_companion_rtsp():
-                self._video_split_enabled = False
-            else:
-                self._video_split_enabled = (
-                    str(getattr(self, "_video_settings_default_view", "Single") or "Single")
-                    .strip()
-                    .lower()
-                    == "split"
-                )
+            dv = (
+                str(getattr(self, "_video_settings_default_view", "Single") or "Single")
+                .strip()
+                .lower()
+            )
+            self._video_split_enabled = dv == "split"
+            if self._uses_companion_rtsp() and dv == "split":
+                try:
+                    print(
+                        "[VGCS:video] C13 companion: split layout — one RTSP at a time; "
+                        "IR button or Thermal cell switches feed"
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
         self._sync_native_camera_rail_toggles()
+        self._sync_native_thermal_feed_button()
 
         if self._video_preview_should_run():
             self._schedule_video_preview_after_settings()
@@ -8712,6 +8834,7 @@ class MapWidget(QWidget):
                 self._btn_native_follow.blockSignals(True)
                 self._btn_native_follow.setChecked(fen)
                 self._btn_native_follow.blockSignals(False)
+            self._sync_native_thermal_feed_button()
         except Exception:
             pass
 
@@ -8977,8 +9100,19 @@ class MapWidget(QWidget):
             return
         if title.startswith("VGCS_CAM_VISION_TOGGLE:"):
             try:
-                cur = str(getattr(self, "_video_vision_mode", "day") or "day").lower()
-                self._video_vision_mode = "night" if cur != "night" else "day"
+                if self._companion_has_dual_feed():
+                    vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+                    cur = "day"
+                    if vp is not None:
+                        try:
+                            cur = str(vp.active_source_id() or "day").strip().lower()
+                        except Exception:
+                            cur = "day"
+                    nxt = "thermal" if cur == "day" else "day"
+                    self._companion_switch_active_feed(nxt, reason="vision_toggle")
+                else:
+                    cur = str(getattr(self, "_video_vision_mode", "day") or "day").lower()
+                    self._video_vision_mode = "night" if cur != "night" else "day"
             except Exception:
                 self._video_vision_mode = "day"
             self._run_js("document.title = 'VGCS Map';")

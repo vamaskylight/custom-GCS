@@ -105,6 +105,11 @@ def _companion_claim_rtsp_host(source_id: str, url: str) -> bool:
         return False
 
 
+def release_companion_rtsp_host(source_id: str, url: str) -> None:
+    """Drop host ownership so another source (day ↔ thermal) may open RTSP."""
+    _companion_release_rtsp_host(source_id, url)
+
+
 def _companion_release_rtsp_host(source_id: str, url: str) -> None:
     u = str(url or "").strip()
     if not _rtsp_url_is_companion_rtsp(u):
