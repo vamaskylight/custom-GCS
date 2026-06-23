@@ -98,7 +98,7 @@ from vgcs.observe.dooaf import (
     resolved_dooaf_settings,
     write_dooaf_settings,
 )
-from vgcs.observe.geo_reference import compute_geo_reference
+from vgcs.observe.geo_reference import compute_geo_reference, compute_lrf_slant_geo
 from vgcs.observe.grid_reference import format_grid_reference
 from vgcs.observe.target_measure import (
     band_width_partner_row,
@@ -1280,6 +1280,9 @@ class MapWidget(QWidget):
         self._lrf_track_ref_att: tuple[float, float] | None = None
         self._lrf_track_gac_h_scale = 1.0
         self._lrf_track_gac_v_scale = 1.0
+        self._lrf_lock_lat: float | None = None
+        self._lrf_lock_lon: float | None = None
+        self._lrf_lock_geo_label: str = ""
         self._lrf_lock_bridge = _LrfLockBridge(self)
         self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
         self._lrf_lock_bridge.progress.connect(self._on_c13_lrf_lock_progress)
@@ -9791,6 +9794,84 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _clear_lrf_lock_geo(self) -> None:
+        self._lrf_lock_lat = None
+        self._lrf_lock_lon = None
+        self._lrf_lock_geo_label = ""
+        try:
+            nm = self._native_map
+            if nm is not None and hasattr(nm, "set_lrf_lock_marker"):
+                nm.set_lrf_lock_marker(None, None)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_lrf_geo_label(lat: float, lon: float) -> str:
+        return f"{float(lat):.6f}, {float(lon):.6f}"
+
+    def _c13_lrf_geo_fov(self) -> tuple[float, float]:
+        try:
+            from vgcs.skydroid.adapter import (
+                _LRF_FOV_H_DEG as hfov,
+                _LRF_FOV_V_DEG as vfov,
+            )
+
+            return float(hfov), float(vfov)
+        except Exception:
+            return 83.4, 46.9
+
+    def _update_lrf_lock_geo(self, distance_m: float | None) -> None:
+        """Estimate locked target lat/lon from vehicle pose, gimbal, and LRF slant range."""
+        if distance_m is None:
+            return
+        try:
+            slant = float(distance_m)
+        except (TypeError, ValueError):
+            return
+        if slant < 0.5:
+            return
+        ctx = self._observation_context()
+        uv = getattr(self, "_lrf_lock_uv", None) or (0.5, 0.5)
+        hfov, vfov = self._c13_lrf_geo_fov()
+        geo = compute_lrf_slant_geo(
+            vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
+            vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
+            vehicle_heading_deg=ctx.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+            vehicle_roll_deg=ctx.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+            vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+            vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+            gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+            slant_range_m=slant,
+            video_x_norm=float(uv[0]),
+            video_y_norm=float(uv[1]),
+            gps_fix_type=int(ctx.get("gps_fix_type") or 0),
+            gps_hdop=ctx.get("gps_hdop"),  # type: ignore[arg-type]
+            camera_hfov_deg=hfov,
+            camera_vfov_deg=vfov,
+        )
+        if not geo.ok or geo.target_lat is None or geo.target_lon is None:
+            print(
+                f"[VGCS:lrf] geo unavailable — {geo.warning or geo.quality}"
+            )
+            return
+        self._lrf_lock_lat = float(geo.target_lat)
+        self._lrf_lock_lon = float(geo.target_lon)
+        self._lrf_lock_geo_label = self._format_lrf_geo_label(
+            float(geo.target_lat), float(geo.target_lon)
+        )
+        try:
+            nm = self._native_map
+            if nm is not None and hasattr(nm, "set_lrf_lock_marker"):
+                nm.set_lrf_lock_marker(float(geo.target_lat), float(geo.target_lon))
+        except Exception:
+            pass
+        print(
+            f"[VGCS:lrf] target geo=({float(geo.target_lat):.6f},"
+            f"{float(geo.target_lon):.6f}) q={geo.quality} "
+            f"range={slant:.1f} m"
+        )
+
     def _refresh_lrf_lock_overlay(self, *, sync_geometry: bool = True) -> None:
         """Draw cyan LRF reticle on video at the VGCS-locked target point."""
         try:
@@ -9815,6 +9896,7 @@ class MapWidget(QWidget):
                         distance_m=float(dist) if dist is not None else None,
                         pending=pending and not failed,
                         failed=failed,
+                        geo_label=str(getattr(self, "_lrf_lock_geo_label", "") or ""),
                     )
                 )
             else:
@@ -9895,6 +9977,16 @@ class MapWidget(QWidget):
     def is_c13_lrf_locking(self) -> bool:
         return bool(getattr(self, "_lrf_lock_in_progress", False))
 
+    def get_c13_lrf_lock_latlon(self) -> tuple[float, float] | None:
+        lat = getattr(self, "_lrf_lock_lat", None)
+        lon = getattr(self, "_lrf_lock_lon", None)
+        if lat is None or lon is None:
+            return None
+        try:
+            return float(lat), float(lon)
+        except (TypeError, ValueError):
+            return None
+
     def _sync_lrf_armed_backend(self, armed: bool) -> None:
         cc = getattr(self, "_camera_control", None)
         fn = getattr(cc, "set_lrf_armed", None)
@@ -9926,6 +10018,7 @@ class MapWidget(QWidget):
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
         self._clear_lrf_track_ref()
+        self._clear_lrf_lock_geo()
         self._sync_lrf_armed_backend(False)
         try:
             self._obstacle_radar.set_c13_lrf_armed(False)
@@ -9941,6 +10034,7 @@ class MapWidget(QWidget):
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
         self._clear_lrf_track_ref()
+        self._clear_lrf_lock_geo()
         self._sync_lrf_armed_backend(False)
         cc = getattr(self, "_camera_control", None)
         try:
@@ -9972,6 +10066,7 @@ class MapWidget(QWidget):
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = True
+        self._clear_lrf_lock_geo()
         self._capture_lrf_track_ref(float(u), float(v))
         self._sync_lrf_armed_backend(False)
         try:
@@ -9980,18 +10075,21 @@ class MapWidget(QWidget):
             live = poll_companion_laser_range_m(cc)
             if live is not None:
                 self._lrf_lock_distance_m = float(live)
+                self._update_lrf_lock_geo(float(live))
         except Exception:
             pass
         self._refresh_lrf_lock_overlay()
         if getattr(self, "_lrf_lock_distance_m", None) is not None:
-            self._set_status(
-                f"Locking LRF… {format_slr_display_m(self._lrf_lock_distance_m)}"
-            )
+            status = f"Locking LRF… {format_slr_display_m(self._lrf_lock_distance_m)}"
+            if getattr(self, "_lrf_lock_geo_label", ""):
+                status += f" · {self._lrf_lock_geo_label}"
+            self._set_status(status)
         else:
             self._set_status("Locking LRF — slewing camera to target…")
         try:
             self._obstacle_radar.set_c13_lrf_locking(
-                getattr(self, "_lrf_lock_distance_m", None)
+                getattr(self, "_lrf_lock_distance_m", None),
+                geo_label=str(getattr(self, "_lrf_lock_geo_label", "") or ""),
             )
         except Exception:
             pass
@@ -10004,12 +10102,18 @@ class MapWidget(QWidget):
         try:
             dm = float(distance_m)
             self._lrf_lock_distance_m = dm
+            self._update_lrf_lock_geo(dm)
             self._refresh_lrf_lock_overlay()
             try:
-                self._obstacle_radar.set_c13_lrf_locking(dm)
+                self._obstacle_radar.set_c13_lrf_locking(
+                    dm, geo_label=str(getattr(self, "_lrf_lock_geo_label", "") or "")
+                )
             except Exception:
                 pass
-            self._set_status(f"Locking LRF… {format_slr_display_m(dm)}")
+            status = f"Locking LRF… {format_slr_display_m(dm)}"
+            if getattr(self, "_lrf_lock_geo_label", ""):
+                status += f" · {self._lrf_lock_geo_label}"
+            self._set_status(status)
         except (TypeError, ValueError):
             pass
 
@@ -10037,10 +10141,16 @@ class MapWidget(QWidget):
             self._update_lrf_reticle_track()
             uv = getattr(self, "_lrf_lock_uv", None) or (float(u), float(v))
             self._lrf_lock_distance_m = dm
+            self._update_lrf_lock_geo(dm)
             self._companion_laser_range_m = dm
-            self._obstacle_radar.set_c13_lrf_locked(dm)
+            self._obstacle_radar.set_c13_lrf_locked(
+                dm, geo_label=str(getattr(self, "_lrf_lock_geo_label", "") or "")
+            )
             self._refresh_lrf_lock_overlay()
-            self._set_status(f"C13 LRF locked · {format_slr_display_m(dm)} — cyan box on video")
+            status = f"C13 LRF locked · {format_slr_display_m(dm)}"
+            if getattr(self, "_lrf_lock_geo_label", ""):
+                status += f" · {self._lrf_lock_geo_label}"
+            self._set_status(f"{status} — cyan box on video")
             print(
                 f"[VGCS:lrf] locked u={uv[0]:.3f} v={uv[1]:.3f} range={dm:.1f} m"
             )

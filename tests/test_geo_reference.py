@@ -23,6 +23,43 @@ def _nadir_result():
     )
 
 
+def test_lrf_slant_geo_nadir():
+    from vgcs.observe.geo_reference import compute_lrf_slant_geo
+
+    r = compute_lrf_slant_geo(
+        vehicle_lat=20.0,
+        vehicle_lon=72.0,
+        vehicle_heading_deg=0.0,
+        gimbal_yaw_deg=0.0,
+        gimbal_pitch_deg=-90.0,
+        slant_range_m=100.0,
+        gps_fix_type=3,
+    )
+    assert r.ok
+    assert r.target_lat is not None
+    assert r.target_lon is not None
+    assert abs(float(r.target_lat) - 20.0) < 0.0002
+    assert abs(float(r.target_lon) - 72.0) < 0.0002
+
+
+def test_lrf_slant_geo_forward():
+    from vgcs.observe.geo_reference import compute_lrf_slant_geo
+
+    r = compute_lrf_slant_geo(
+        vehicle_lat=20.0,
+        vehicle_lon=72.0,
+        vehicle_heading_deg=0.0,
+        gimbal_yaw_deg=0.0,
+        gimbal_pitch_deg=-45.0,
+        slant_range_m=100.0,
+        gps_fix_type=3,
+    )
+    assert r.ok
+    assert r.target_lat is not None
+    assert float(r.target_lat) > 20.0
+    assert abs(float(r.target_lon) - 72.0) < 0.001
+
+
 def test_dem_ground_agl_when_ekf_home_offset():
     """EKF rel above home can read ~7 m on the ground; DEM ground height is physical AGL."""
     agl, src = prefer_dem_ground_agl_over_ekf(

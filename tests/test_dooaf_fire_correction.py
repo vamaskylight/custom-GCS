@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 from vgcs.observe.dooaf import (
     DOOAF_ROLE_GUN,
@@ -20,6 +21,8 @@ from vgcs.observe.dooaf import (
     latlon_delta_to_ne_m,
     resolved_dooaf_settings,
     validate_dooaf_settings,
+    _fire_correction_plan_svg,
+    _fire_correction_gunline_svg,
 )
 
 
@@ -206,6 +209,8 @@ def test_dooaf_html_summary_highlights_and_camera():
     assert "fc-plan-svg" in html
     assert "fc-gunline-svg" in html
     assert "Plan view (North up)" in html
+    assert "fc-diagram-grid-plan" in html
+    assert "fc-diagram-grid-maps" in html
     assert "Start here" in html
     assert "How to read this report" in html
     assert "guide-flow" in html
@@ -221,3 +226,113 @@ def test_dooaf_html_summary_highlights_and_camera():
     assert "fc-positions-svg" in html
     assert "fc-action-cards" in html
     assert "Exact miss & correction numbers" in html
+
+
+def test_executive_miss_map_has_icons_and_signed_labels():
+    session = build_dooaf_session(
+        [
+            _row(DOOAF_ROLE_GUN, -35.3618203, 149.1715498),
+            _row(DOOAF_ROLE_INTENDED, -35.3612780, 149.1628810),
+            _row(
+                DOOAF_ROLE_IMPACT,
+                -35.3619500,
+                149.1627000,
+                vehicle_lat=-35.3633516,
+                vehicle_lon=149.1652413,
+            ),
+        ],
+    )
+    assert session.correction is not None
+    html = format_dooaf_html_summary(session)
+    assert "exec-miss-map-svg" in html
+    assert "Artillery</text>" in html
+    assert "Drone</text>" in html
+    assert "lr-icon lr-pos" in html
+    assert "lr-icon lr-neg" in html
+    assert "<tspan fill='#15803d'" in html
+
+
+def test_plan_view_svg_centers_marks_in_plot():
+    """Plan view should fill the plot area instead of clustering in a corner."""
+    gun = GeoPoint(12.0, 77.0)
+    intended = GeoPoint(12.00068, 77.0)
+    impact = GeoPoint(12.00015, 76.99997)
+    session = build_dooaf_session(
+        [
+            _row(DOOAF_ROLE_GUN, gun.lat, gun.lon),
+            _row(DOOAF_ROLE_INTENDED, intended.lat, intended.lon),
+            _row(DOOAF_ROLE_IMPACT, impact.lat, impact.lon),
+        ],
+    )
+    assert session.correction is not None
+    svg = _fire_correction_plan_svg(session, session.correction)
+    assert "viewBox='0 0 720 520'" in svg
+    xs = [float(x) for x in re.findall(r"<circle cx='([\d.]+)' cy='[\d.]+' r='(?:8|10)'", svg)]
+    assert xs, "expected marker circles in plan SVG"
+    mid_x = 320.0
+    assert all(80.0 < x < 560.0 for x in xs), f"marks should stay centered in plot, got {xs}"
+    assert any(abs(x - mid_x) < 120.0 for x in xs), f"marks should span near plot center, got {xs}"
+
+
+def test_plan_view_stretches_long_range_shot_vertically():
+    """788 m gun line with ~65 m miss should fill plan height, not a thin strip."""
+    session = build_dooaf_session(
+        [
+            _row(DOOAF_ROLE_GUN, -35.3618203, 149.1715498),
+            _row(DOOAF_ROLE_INTENDED, -35.3612780, 149.1628810),
+            _row(
+                DOOAF_ROLE_IMPACT,
+                -35.3618554,
+                149.1627737,
+                vehicle_lat=-35.3633516,
+                vehicle_lon=149.1652413,
+            ),
+        ],
+    )
+    assert session.correction is not None
+    svg = _fire_correction_plan_svg(session, session.correction)
+    assert "N/S scale exaggerated for visibility" in svg
+    gun = re.search(r"Gun</text>", svg)
+    impact = re.search(r"<circle cx='([\d.]+)' cy='([\d.]+)' r='10'", svg)
+    assert gun and impact
+    lines = re.findall(r"x1='([\d.]+)' y1='([\d.]+)' x2='([\d.]+)' y2='([\d.]+)'", svg)
+    longest = max(
+        lines,
+        key=lambda ln: (float(ln[2]) - float(ln[0])) ** 2 + (float(ln[3]) - float(ln[1])) ** 2,
+    )
+    y_span = abs(float(longest[3]) - float(longest[1]))
+    assert y_span > 80.0, f"gun-target line should use vertical space, got {y_span:.1f}px"
+
+
+def test_gunline_view_matches_compass_readability():
+    """Gun-line view uses plain Far/Short/Left/Right labels on a target-centred diagram."""
+    session = build_dooaf_session(
+        [
+            _row(DOOAF_ROLE_GUN, -35.3618203, 149.1715498),
+            _row(DOOAF_ROLE_INTENDED, -35.3612780, 149.1628810),
+            _row(
+                DOOAF_ROLE_IMPACT,
+                -35.3619500,
+                149.1627000,
+                vehicle_lat=-35.3633516,
+                vehicle_lon=149.1652413,
+            ),
+        ],
+    )
+    assert session.correction is not None
+    svg = _fire_correction_gunline_svg(session.correction, session=session)
+    assert "viewBox='0 0 400 400'" in svg
+    assert "Target</text>" in svg
+    assert "Impact</text>" in svg
+    assert f"Miss {session.correction.impact_to_intended_m:.1f} m" in svg
+    assert " m along" not in svg
+    assert re.search(r" m R\"", svg) is None
+    assert re.search(r"\d+\.\d+ m (Far|Short|Left|Right)", svg)
+    assert "Course correction" not in svg
+    target = re.search(r"font-weight='600'>Target</text>", svg)
+    impact = re.search(r"<circle cx='([\d.]+)' cy='([\d.]+)' r='10'", svg)
+    assert target and impact
+    cx, cy = 200.0, 200.0
+    ix, iy = float(impact.group(1)), float(impact.group(2))
+    miss_px = math.hypot(ix - cx, iy - cy)
+    assert miss_px > 80.0, f"miss vector should fill gun-line plot, got {miss_px:.1f}px"

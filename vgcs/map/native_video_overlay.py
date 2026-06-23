@@ -43,6 +43,7 @@ class VideoOverlayLrfLock:
     distance_m: float | None = None
     pending: bool = False
     failed: bool = False
+    geo_label: str = ""
 
 
 class NativeVideoOverlayLayer(QWidget):
@@ -175,6 +176,7 @@ class NativeVideoOverlayLayer(QWidget):
                     ),
                     pending=bool(lock.get("pending", False)),
                     failed=bool(lock.get("failed", False)),
+                    geo_label=str(lock.get("geo_label", "") or ""),
                 )
             except (TypeError, ValueError):
                 self._lrf_lock = None
@@ -284,6 +286,7 @@ class NativeVideoOverlayLayer(QWidget):
         distance_m: float | None,
         pending: bool,
         failed: bool = False,
+        geo_label: str = "",
     ) -> None:
         """Tactical corner brackets + crosshair — distinct from AI detection (green) boxes."""
         span = max(28.0, min(cw, ch) * 0.14)
@@ -336,11 +339,15 @@ class NativeVideoOverlayLayer(QWidget):
                 caption = "LRF slewing…"
         else:
             caption = "LRF"
+        geo = str(geo_label or "").strip()
+        lines = [caption]
+        if geo:
+            lines.append(geo)
         font = QFont("Segoe UI", 10, QFont.Weight.Bold)
         p.setFont(font)
         metrics = p.fontMetrics()
-        tw = metrics.horizontalAdvance(caption) + 12
-        th = metrics.height() + 8
+        tw = max(metrics.horizontalAdvance(line) for line in lines) + 12
+        th = metrics.height() * len(lines) + 8
         tx = int(cx - tw / 2)
         ty = int(y1 + 6)
         if ty + th > ct + ch - 4:
@@ -349,7 +356,10 @@ class NativeVideoOverlayLayer(QWidget):
         p.setPen(QPen(color, 2))
         p.drawRect(tx, ty, tw, th)
         p.setPen(QColor(224, 242, 254))
-        p.drawText(tx + 6, ty + metrics.ascent() + 4, caption)
+        y_text = ty + metrics.ascent() + 4
+        for line in lines:
+            p.drawText(tx + 6, y_text, line)
+            y_text += metrics.height()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
@@ -394,6 +404,7 @@ class NativeVideoOverlayLayer(QWidget):
                 distance_m=lk.distance_m,
                 pending=bool(lk.pending),
                 failed=bool(lk.failed),
+                geo_label=str(lk.geo_label or ""),
             )
 
         for det in self._detections:

@@ -214,3 +214,21 @@ def svg_target_marker(cx: float, cy: float, *, r: float = 12.0) -> str:
         f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='2.5' fill='#16a34a'/>"
     )
     return "".join(parts)
+
+
+def svg_drone_marker(cx: float, cy: float, *, scale: float = 1.0) -> str:
+    """Purple drone observation marker for HTML/SVG reports."""
+    s = max(0.35, float(scale))
+    r = 8.0 * s
+    arm = 5.5 * s
+    return (
+        f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='{r + 2.5 * s:.1f}' fill='#9333ea' fill-opacity='0.14'/>"
+        f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='{r:.1f}' fill='#9333ea' stroke='#e9d5ff' "
+        f"stroke-width='{max(1.2, 1.5 * s):.1f}'/>"
+        f"<line x1='{cx - arm:.1f}' y1='{cy - arm:.1f}' x2='{cx + arm:.1f}' y2='{cy + arm:.1f}' "
+        f"stroke='#faf5ff' stroke-width='{max(1.0, 1.2 * s):.1f}' stroke-linecap='round'/>"
+        f"<line x1='{cx - arm:.1f}' y1='{cy + arm:.1f}' x2='{cx + arm:.1f}' y2='{cy - arm:.1f}' "
+        f"stroke='#faf5ff' stroke-width='{max(1.0, 1.2 * s):.1f}' stroke-linecap='round'/>"
+        f"<text x='{cx:.1f}' y='{cy + 3.2 * s:.1f}' text-anchor='middle' font-size='{7 * s:.1f}' "
+        f"fill='#fff' font-weight='700'>D</text>"
+    )

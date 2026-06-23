@@ -420,6 +420,109 @@ def compute_geo_reference(
     )
 
 
+def compute_lrf_slant_geo(
+    *,
+    vehicle_lat: float | None,
+    vehicle_lon: float | None,
+    vehicle_heading_deg: float | None,
+    vehicle_roll_deg: float | None = None,
+    vehicle_pitch_deg: float | None = None,
+    vehicle_alt_msl_m: float | None = None,
+    gimbal_yaw_deg: float | None,
+    gimbal_pitch_deg: float | None,
+    slant_range_m: float,
+    video_x_norm: float = 0.5,
+    video_y_norm: float = 0.5,
+    gps_fix_type: int = 0,
+    gps_hdop: float | None = None,
+    camera_hfov_deg: float = 83.4,
+    camera_vfov_deg: float | None = None,
+) -> GeoReferenceResult:
+    """
+    Ground lat/lon from C13 LRF slant range along the laser line-of-sight.
+
+    Uses vehicle pose + gimbal attitude + measured slant range (not ray–ground guess).
+    """
+    if vehicle_lat is None or vehicle_lon is None:
+        return GeoReferenceResult(ok=False, warning="vehicle position missing", method="none")
+    try:
+        slant = float(slant_range_m)
+    except (TypeError, ValueError):
+        return GeoReferenceResult(ok=False, warning="invalid LRF range", method="none")
+    if slant < 0.5:
+        return GeoReferenceResult(ok=False, warning="LRF range too short", method="none")
+
+    gimbal_assumed = False
+    gy = float(gimbal_yaw_deg) if gimbal_yaw_deg is not None else 0.0
+    gp = float(gimbal_pitch_deg) if gimbal_pitch_deg is not None else 0.0
+    if gimbal_yaw_deg is None or gimbal_pitch_deg is None:
+        gimbal_assumed = True
+
+    hfov = max(5.0, min(120.0, float(camera_hfov_deg)))
+    vfov = float(camera_vfov_deg) if camera_vfov_deg is not None else hfov * 0.5625
+    vfov = max(5.0, min(90.0, vfov))
+    u = max(0.0, min(1.0, float(video_x_norm)))
+    v = max(0.0, min(1.0, float(video_y_norm)))
+    az_off = (u - 0.5) * hfov
+    el_off = (v - 0.5) * vfov
+
+    roll = _deg2rad(float(vehicle_roll_deg or 0.0))
+    pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
+    hdg = _deg2rad(float(vehicle_heading_deg or 0.0))
+    g_yaw = _deg2rad(gy)
+    g_pitch = _deg2rad(gp)
+
+    r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
+    r_body_gimbal = _mat_mul(_rot_z(g_yaw), _rot_y(g_pitch))
+    r_gimbal_cam = _mat_mul(_rot_y(_deg2rad(el_off)), _rot_z(_deg2rad(az_off)))
+    r_ned_cam = _mat_mul(r_ned_body, _mat_mul(r_body_gimbal, r_gimbal_cam))
+    dir_ned = _mat_vec(r_ned_cam, (1.0, 0.0, 0.0))
+    mag = math.hypot(dir_ned[0], dir_ned[1], dir_ned[2])
+    if mag < 1e-9:
+        return GeoReferenceResult(ok=False, warning="invalid look direction", method="lrf_slant")
+    dir_unit = (dir_ned[0] / mag, dir_ned[1] / mag, dir_ned[2] / mag)
+
+    north_m = slant * dir_unit[0]
+    east_m = slant * dir_unit[1]
+    down_m = slant * dir_unit[2]
+    horiz = math.hypot(north_m, east_m)
+    depression = math.degrees(math.atan2(down_m, max(1e-6, horiz)))
+    bearing = (math.degrees(math.atan2(east_m, north_m)) + 360.0) % 360.0
+    tgt_lat, tgt_lon = _offset_lat_lon(float(vehicle_lat), float(vehicle_lon), north_m, east_m)
+    tgt_alt: float | None = None
+    if vehicle_alt_msl_m is not None:
+        tgt_alt = float(vehicle_alt_msl_m) - down_m
+
+    quality, warn = _quality_label(
+        gps_fix_type=int(gps_fix_type or 0),
+        gps_hdop=gps_hdop,
+        has_gimbal=not gimbal_assumed,
+        depression_deg=depression,
+        range_m=horiz,
+    )
+    if gimbal_assumed:
+        extra = "gimbal attitude assumed level (0°, 0°)"
+        warn = f"{warn}; {extra}" if warn else extra
+    if depression < 3.0:
+        extra = "near-horizon LRF — ground geo less accurate"
+        warn = f"{warn}; {extra}" if warn else extra
+        if quality == "good":
+            quality = "fair"
+
+    return GeoReferenceResult(
+        ok=quality != "insufficient",
+        target_lat=tgt_lat,
+        target_lon=tgt_lon,
+        target_alt_m=tgt_alt,
+        horizontal_range_m=horiz,
+        depression_deg=depression,
+        quality=quality,
+        warning=warn,
+        method="lrf_slant",
+        bearing_deg=bearing,
+    )
+
+
 def enrich_video_mark_target_altitude(row: dict[str, object]) -> None:
     """
     Resolve ``target_alt_m`` for video marks: DEM ground vs ray-derived facade height.
