@@ -45,6 +45,21 @@ def test_drone_alt_msl_from_dem_ground_agl_when_msl_missing():
     assert _drone_alt_msl_from_row(row) == 23.2
 
 
+def test_drone_alt_msl_rejects_stale_vehicle_msl_on_low_hover():
+    row = {
+        "vehicle_lat": 20.4461082,
+        "vehicle_lon": 72.8632194,
+        "vehicle_alt_msl_m": 69.5,
+        "ekf_rel_alt_m": 2.2,
+        "dem_ground_agl_m": 2.0,
+        "target_alt_m_dem": 21.9,
+    }
+    alt = _drone_alt_msl_from_row(row)
+    assert alt is not None
+    assert abs(float(alt) - 24.1) < 1.0
+    assert abs(float(alt) - 69.5) > 10.0
+
+
 def test_build_session_drone_uses_msl_in_coordinate_table():
     session = build_dooaf_session(
         [

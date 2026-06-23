@@ -21,6 +21,7 @@ from vgcs.observe.dooaf_map_symbols import (
 )
 from vgcs.observe.target_measure import (
     haversine_m,
+    low_hover_ray_agl_m,
     observation_ekf_rel_alt_m,
     observation_target_latlon,
 )
@@ -343,21 +344,34 @@ def point_from_row(row: dict[str, Any]) -> GeoPoint | None:
 
 def _drone_alt_msl_from_row(row: dict[str, Any]) -> float | None:
     """Drone position MSL — never treat EKF relative (above home) as sea level."""
-    msl = _float_or_none(row.get("vehicle_alt_msl_m"))
-    if msl is not None:
-        return msl
     lat = _float_or_none(row.get("vehicle_lat"))
     lon = _float_or_none(row.get("vehicle_lon"))
     ekf = observation_ekf_rel_alt_m(row)
+    dem = dem_alt_msl_at_mark(row, GeoPoint(lat, lon, None)) if lat is not None and lon is not None else None
+    msl = _float_or_none(row.get("vehicle_alt_msl_m"))
+    if dem is not None and ekf is not None and ekf < 8.0:
+        est = float(dem) + max(float(ekf), 0.5)
+        if msl is not None and abs(float(msl) - est) > 18.0:
+            return est
+    if msl is not None:
+        return msl
     agl = _float_or_none(row.get("dem_ground_agl_m"))
     if ekf is not None and ekf < 2.5 and agl is not None and agl > float(ekf) + 12.0:
         agl = max(float(ekf), 0.5)
     elif agl is None and ekf is not None and ekf > 0.05:
         agl = float(ekf)
-    if lat is not None and lon is not None and agl is not None:
-        dem = dem_alt_msl_at_mark(row, GeoPoint(lat, lon, None))
-        if dem is not None:
-            return float(dem) + float(agl)
+    measure = _float_or_none(row.get("measure_agl_m"))
+    if (
+        ekf is not None
+        and ekf < 6.0
+        and measure is not None
+        and measure > float(ekf) + 10.0
+    ):
+        agl = max(float(ekf), 0.5)
+    elif agl is None and measure is not None:
+        agl = measure
+    if lat is not None and lon is not None and agl is not None and dem is not None:
+        return float(dem) + float(agl)
     return None
 
 
@@ -466,6 +480,157 @@ def _synthesize_setup_mark_row(
     return row
 
 
+def _apply_geo_reference_to_mark_row(
+    row: dict[str, Any],
+    geo: Any,
+    *,
+    ray_agl: float | None,
+    ray_src: str,
+) -> None:
+    from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
+    from vgcs.observe.target_measure import is_plausible_ground_range
+
+    row["target_lat"] = geo.target_lat
+    row["target_lon"] = geo.target_lon
+    row["target_alt_m"] = geo.target_alt_m
+    row["geo_quality"] = geo.quality
+    row["geo_warning"] = geo.warning
+    row["geo_method"] = geo.method
+    if geo.depression_deg is not None:
+        row["geo_depression_deg"] = geo.depression_deg
+    else:
+        row["geo_depression_deg"] = None
+    long_range_ray = ray_src == "rangefinder_clamped_long" or str(
+        geo.method or ""
+    ).startswith("ray_slant_long")
+    if (
+        geo.horizontal_range_m is not None
+        and geo.bearing_deg is not None
+        and geo.depression_deg is not None
+        and ray_agl is not None
+        and (
+            long_range_ray
+            or str(geo.method or "") in ("ray_facade_retry", "forced_facade_retry")
+            or is_plausible_ground_range(
+                float(ray_agl),
+                float(geo.horizontal_range_m),
+                float(geo.depression_deg),
+            )
+        )
+    ):
+        row["geo_range_m"] = geo.horizontal_range_m
+        row["geo_bearing_deg"] = geo.bearing_deg
+    else:
+        row["geo_range_m"] = None
+        row["geo_bearing_deg"] = None
+    if ray_agl is not None:
+        row["measure_agl_m"] = ray_agl
+        row["geo_agl_source"] = ray_src
+        row["agl_source"] = ray_src
+    enrich_video_mark_target_altitude(row)
+    if row.get("target_lat") is None or row.get("target_lon") is None:
+        row["target_lat"] = None
+        row["target_lon"] = None
+
+
+def _forced_ray_geo_for_row(
+    row: dict[str, Any],
+    *,
+    dem_path: str | Path | None = None,
+    camera_hfov_deg: float = 62.0,
+    vehicle_alt_msl_m: float | None = None,
+    force_agl_m: float | None = None,
+) -> Any:
+    from vgcs.observe.geo_reference import compute_geo_reference
+
+    vx = row.get("video_x_norm")
+    vy = row.get("video_y_norm")
+    if vx is None or vy is None:
+        return None
+    ekf = observation_ekf_rel_alt_m(row)
+    agl = force_agl_m if force_agl_m is not None else low_hover_ray_agl_m(ekf)
+    return compute_geo_reference(
+        vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
+        vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
+        vehicle_heading_deg=row.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+        vehicle_roll_deg=row.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+        vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+        vehicle_rel_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
+        vehicle_alt_msl_m=vehicle_alt_msl_m or row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+        rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
+        gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+        gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+        video_x_norm=float(vx),
+        video_y_norm=float(vy),
+        gps_fix_type=int(row.get("gps_fix_type") or 0),
+        gps_hdop=row.get("gps_hdop"),  # type: ignore[arg-type]
+        camera_hfov_deg=float(camera_hfov_deg),
+        dem_path=dem_path,
+        dem_terrain=False,
+        force_agl_m=float(agl),
+    )
+
+
+def refine_impact_geo_from_video_rays(
+    row: dict[str, Any],
+    *,
+    target_lat: float | None,
+    target_lon: float | None,
+    setup_video_marks: dict[str, tuple[float, float]] | None = None,
+    dem_path: str | Path | None = None,
+    camera_hfov_deg: float = 62.0,
+    vehicle_alt_msl_m: float | None = None,
+) -> bool:
+    """
+    Re-geo impact when it collapsed onto the setup target footprint but video Y differs.
+    """
+    if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
+        return False
+    if target_lat is None or target_lon is None:
+        return False
+    pt = observation_target_latlon(row)
+    if pt is None:
+        return False
+    if haversine_m(pt[0], pt[1], float(target_lat), float(target_lon)) > 2.5:
+        return False
+    marks = merge_setup_video_marks(setup_video_marks) or {}
+    if DOOAF_ROLE_INTENDED not in marks:
+        return False
+    try:
+        _vx_i, vy_i = marks[DOOAF_ROLE_INTENDED]
+        vy_p = float(row.get("video_y_norm"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if vy_p >= float(vy_i) - 0.03:
+        return False
+    geo = _forced_ray_geo_for_row(
+        row,
+        dem_path=dem_path,
+        camera_hfov_deg=camera_hfov_deg,
+        vehicle_alt_msl_m=vehicle_alt_msl_m,
+    )
+    if geo is None or not geo.ok or geo.target_lat is None or geo.target_lon is None:
+        return False
+    ekf = observation_ekf_rel_alt_m(row)
+    retry_agl = low_hover_ray_agl_m(ekf)
+    _apply_geo_reference_to_mark_row(
+        row,
+        geo,
+        ray_agl=retry_agl,
+        ray_src="ray_facade_retry",
+    )
+    if observation_target_latlon(row) is None:
+        return False
+    row["geo_quality"] = "fair"
+    row["geo_method"] = "ray_facade_retry"
+    warn = (
+        "impact geo from low-hover ray (distinct from target footprint; "
+        "hover ≥3 m for GPS-quality geo)"
+    )
+    row["geo_warning"] = warn
+    return True
+
+
 def apply_dooaf_impact_geo_fallback(
     row: dict[str, Any],
     *,
@@ -491,50 +656,24 @@ def apply_dooaf_impact_geo_fallback(
     if vx is None or vy is None:
         return False
 
-    from vgcs.observe.geo_reference import compute_geo_reference, enrich_video_mark_target_altitude
-    from vgcs.observe.target_measure import is_plausible_ground_range
-
     marks = merge_setup_video_marks(setup_video_marks) or {}
     ekf = observation_ekf_rel_alt_m(row)
-    retry_agl = 3.0
-    if ekf is not None and ekf >= 0.5:
-        retry_agl = max(3.0, float(ekf))
+    retry_agl = low_hover_ray_agl_m(ekf)
 
-    geo = compute_geo_reference(
-        vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
-        vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
-        vehicle_heading_deg=row.get("vehicle_heading_deg"),  # type: ignore[arg-type]
-        vehicle_roll_deg=row.get("vehicle_roll_deg"),  # type: ignore[arg-type]
-        vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
-        vehicle_rel_alt_m=row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
-        vehicle_alt_msl_m=vehicle_alt_msl_m or row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
-        rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
-        gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
-        gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
-        video_x_norm=float(vx),
-        video_y_norm=float(vy),
-        gps_fix_type=int(row.get("gps_fix_type") or 0),
-        gps_hdop=row.get("gps_hdop"),  # type: ignore[arg-type]
-        camera_hfov_deg=float(camera_hfov_deg),
+    geo = _forced_ray_geo_for_row(
+        row,
         dem_path=dem_path,
-        dem_terrain=False,
+        camera_hfov_deg=camera_hfov_deg,
+        vehicle_alt_msl_m=vehicle_alt_msl_m,
         force_agl_m=retry_agl,
     )
-    if (
-        geo.ok
-        and geo.target_lat is not None
-        and geo.target_lon is not None
-        and geo.horizontal_range_m is not None
-        and geo.depression_deg is not None
-        and is_plausible_ground_range(
-            retry_agl,
-            float(geo.horizontal_range_m),
-            float(geo.depression_deg),
+    if geo is not None and geo.ok and geo.target_lat is not None and geo.target_lon is not None:
+        _apply_geo_reference_to_mark_row(
+            row,
+            geo,
+            ray_agl=retry_agl,
+            ray_src="ray_facade_retry",
         )
-    ):
-        row["target_lat"] = geo.target_lat
-        row["target_lon"] = geo.target_lon
-        row["target_alt_m"] = geo.target_alt_m
         row["geo_quality"] = "fair"
         row["geo_method"] = "ray_facade_retry"
         row["geo_warning"] = (
@@ -543,15 +682,17 @@ def apply_dooaf_impact_geo_fallback(
             if ekf is not None and ekf < 2.5
             else str(geo.warning or "impact geo from ray retry")
         )
-        if geo.depression_deg is not None:
-            row["geo_depression_deg"] = geo.depression_deg
-        if geo.horizontal_range_m is not None:
-            row["geo_range_m"] = geo.horizontal_range_m
-        if geo.bearing_deg is not None:
-            row["geo_bearing_deg"] = geo.bearing_deg
-        row["measure_agl_m"] = retry_agl
-        row["agl_source"] = "forced_facade_retry"
-        enrich_video_mark_target_altitude(row)
+        return True
+
+    if refine_impact_geo_from_video_rays(
+        row,
+        target_lat=target_lat,
+        target_lon=target_lon,
+        setup_video_marks=marks,
+        dem_path=dem_path,
+        camera_hfov_deg=camera_hfov_deg,
+        vehicle_alt_msl_m=vehicle_alt_msl_m,
+    ):
         return True
 
     if target_lat is None or target_lon is None:
@@ -577,6 +718,8 @@ def apply_dooaf_impact_geo_fallback(
         "impact footprint from DOOAF target (primary ray failed — "
         "hover ≥3 m with GPS for accurate ground geo)"
     )
+    from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
+
     enrich_video_mark_target_altitude(row)
     return True
 
