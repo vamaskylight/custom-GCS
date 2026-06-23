@@ -363,6 +363,59 @@ def _ordered_upper_lower_rows(
     return row_b, row_a
 
 
+def _dem_msl_from_row(row: dict[str, Any]) -> float | None:
+    for key in ("target_alt_m_dem", "target_alt_m"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v):
+            return v
+    return None
+
+
+def facade_msl_heights_from_ground_mark(
+    ground_row: dict[str, Any],
+    intended_row: dict[str, Any],
+    impact_row: dict[str, Any],
+    impact_msl: float,
+) -> tuple[float | None, float | None]:
+    """
+    Interpolate intended MSL between gun/ground DEM and a known impact MSL.
+
+    Ground must be the lowest click (largest video Y); impact the highest (smallest Y).
+    Target and impact should share the same facade column (similar video X).
+    """
+    xy_g = _video_xy(ground_row)
+    xy_t = _video_xy(intended_row)
+    xy_i = _video_xy(impact_row)
+    if xy_g is None or xy_t is None or xy_i is None:
+        return None, None
+
+    y_g, y_t, y_i = float(xy_g[1]), float(xy_t[1]), float(xy_i[1])
+    if not (y_g > y_t + 0.02 and y_g > y_i + 0.02 and y_t > y_i + 0.01):
+        return None, None
+    if abs(xy_t[0] - xy_i[0]) > _MAX_VERTICAL_DX_NORM:
+        return None, None
+
+    ground_msl = _dem_msl_from_row(ground_row)
+    if ground_msl is None:
+        ground_msl = _dem_msl_from_row(intended_row)
+    if ground_msl is None:
+        return None, None
+
+    span = y_g - y_i
+    if span < _MIN_VERTICAL_DY_NORM:
+        return None, None
+    frac_t = max(0.0, min(1.0, (y_g - y_t) / span))
+    impact_alt = float(impact_msl)
+    intended_alt = float(ground_msl) + (impact_alt - float(ground_msl)) * frac_t
+    return intended_alt, float(ground_msl)
+
+
 def facade_vertical_height_between_marks(
     row_a: dict[str, Any],
     row_b: dict[str, Any],

@@ -233,15 +233,20 @@ def resolve_dooaf_mark_elevations(
     intended: GeoPoint | None,
     impact: GeoPoint | None,
     *,
+    ground_row: dict[str, Any] | None = None,
     hfov_deg: float = 62.0,
 ) -> tuple[GeoPoint | None, GeoPoint | None, float | None]:
     """
-    Apply roof+base pair height to DOOAF intended/impact MSL altitudes.
+    Apply facade geometry to DOOAF intended/impact MSL altitudes.
 
-    When intended is picked on the roof and impact at the base (video), building
-    height from facade geometry sets target roof MSL = base DEM + height.
+    When a gun/ground video pick is available, target and impact heights are
+    interpolated along the facade from terrain at the ground click. Otherwise
+    falls back to a two-mark roof/base pair between target and impact.
     """
-    from vgcs.observe.facade_plane import facade_vertical_height_between_marks
+    from vgcs.observe.facade_plane import (
+        facade_msl_heights_from_ground_mark,
+        facade_vertical_height_between_marks,
+    )
 
     building_h: float | None = None
     new_intended = intended
@@ -287,8 +292,28 @@ def resolve_dooaf_mark_elevations(
         if base_dem is not None:
             roof_alt = base_dem + pair_h
             new_impact = GeoPoint(impact.lat, impact.lon, roof_alt)
-            new_intended = GeoPoint(intended.lat, intended.lon, base_dem)
+            new_intended = GeoPoint(intended.lat, intended.lon, roof_alt - pair_h)
             building_h = pair_h
+
+    if (
+        ground_row is not None
+        and new_impact is not None
+        and new_impact.alt_m is not None
+        and new_intended is not None
+    ):
+        t_msl, _g_msl = facade_msl_heights_from_ground_mark(
+            ground_row,
+            intended_row,
+            impact_row,
+            float(new_impact.alt_m),
+        )
+        if t_msl is not None:
+            new_intended = GeoPoint(intended.lat, intended.lon, t_msl)
+            building_h = abs(float(new_impact.alt_m) - float(t_msl))
+            intended_row["target_alt_method"] = "facade_ground_interpolate"
+            impact_row["target_alt_method"] = "facade_ground_interpolate"
+            if building_h is not None and building_h > 0.1:
+                intended_row["building_height_m"] = building_h
 
     return new_intended, new_impact, building_h
 
@@ -871,6 +896,25 @@ def build_dooaf_session(
                 setup_footprint.lon,
                 setup_footprint.alt_m,
             )
+    ground_row = gun_row
+    if (
+        ground_row is None
+        and gun is not None
+        and template_row is not None
+        and setup_video_marks
+        and DOOAF_ROLE_GUN in setup_video_marks
+    ):
+        gx, gy = setup_video_marks[DOOAF_ROLE_GUN]
+        ground_row = _synthesize_setup_mark_row(
+            DOOAF_ROLE_GUN,
+            gun.lat,
+            gun.lon,
+            gx,
+            gy,
+            template_row,
+            dem_path=dem_path,
+            alt_m=gun.alt_m,
+        )
     building_height_m: float | None = None
     if intended is not None and impact is not None:
         intended, impact, building_height_m = resolve_dooaf_mark_elevations(
@@ -878,6 +922,7 @@ def build_dooaf_session(
             impact_row,
             intended,
             impact,
+            ground_row=ground_row,
         )
     correction = None
     if gun is not None and intended is not None and impact is not None:
