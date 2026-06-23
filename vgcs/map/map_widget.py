@@ -961,6 +961,7 @@ class _ObservationExportTask(QRunnable):
         target_lon: float | None = None,
         target_alt_m: float | None = None,
         dem_path: str | None = None,
+        setup_video_marks: dict[str, tuple[float, float]] | None = None,
     ) -> None:
         super().__init__()
         self._rows = list(rows)
@@ -975,6 +976,7 @@ class _ObservationExportTask(QRunnable):
         self._target_lon = target_lon
         self._target_alt_m = target_alt_m
         self._dem_path = dem_path
+        self._setup_video_marks = setup_video_marks
 
     def run(self) -> None:
         fields = [
@@ -1039,6 +1041,7 @@ class _ObservationExportTask(QRunnable):
             target_lon=self._target_lon,
             target_alt_m=self._target_alt_m,
             dem_path=self._dem_path,
+            setup_video_marks=self._setup_video_marks,
         )
         corr = session.correction
         export_rows: list[dict[str, object]] = []
@@ -7295,6 +7298,12 @@ class MapWidget(QWidget):
         )
         kw = dooaf_settings_kwargs(s)
         kw["dem_path"] = self._observe_dem_path()
+        marks = getattr(self, "_dooaf_setup_video_marks", None) or {}
+        if marks:
+            kw["setup_video_marks"] = {
+                str(role): (float(pt[0]), float(pt[1]))
+                for role, pt in marks.items()
+            }
         return kw
 
     def _resolved_dooaf_settings(self) -> DooafSettings:
@@ -8673,6 +8682,7 @@ class MapWidget(QWidget):
                 target_lon=dooaf.get("target_lon"),
                 target_alt_m=dooaf.get("target_alt_m"),
                 dem_path=dooaf.get("dem_path"),
+                setup_video_marks=dooaf.get("setup_video_marks"),
             )
         )
 

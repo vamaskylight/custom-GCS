@@ -1,0 +1,89 @@
+"""Elevation summary when target is set in DOOAF Setup (not an observation row)."""
+
+from __future__ import annotations
+
+from vgcs.observe.dooaf import (
+    DOOAF_ROLE_IMPACT,
+    DOOAF_ROLE_INTENDED,
+    build_dooaf_session,
+    format_elevation_summary_html,
+    _synthesize_setup_mark_row,
+)
+from vgcs.observe.facade_plane import _pair_height_from_video_y_and_range
+
+
+def _impact_row() -> dict:
+    return {
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_IMPACT,
+        "target_lat": 20.445869,
+        "target_lon": 72.8632646,
+        "target_alt_m": 22.14,
+        "target_alt_m_dem": 22.14,
+        "video_x_norm": 0.293,
+        "video_y_norm": 0.462,
+        "vehicle_lat": 20.4459821,
+        "vehicle_lon": 72.8632314,
+        "vehicle_alt_msl_m": 24.2,
+        "vehicle_rel_alt_m": 2.037,
+        "ekf_rel_alt_m": 2.037,
+        "dem_ground_agl_m": 2.0,
+        "measure_agl_m": 2.037,
+        "agl_source": "ekf_relative",
+        "gimbal_yaw_deg": 0.0,
+        "gimbal_pitch_deg": -25.0,
+        "gps_fix_type": 3,
+        "geo_quality": "good",
+        "geo_method": "ray_dem",
+        "geo_range_m": 42.0,
+        "geo_depression_deg": 2.8,
+        "geo_bearing_deg": 195.0,
+        "camera_hfov_deg": 62.0,
+    }
+
+
+def test_pair_height_fallback_low_hover():
+    upper = {**_impact_row(), "video_y_norm": 0.462}
+    lower = {
+        **_impact_row(),
+        "video_y_norm": 0.563,
+        "video_x_norm": 0.292,
+    }
+    h = _pair_height_from_video_y_and_range(upper, lower)
+    assert h is not None
+    assert h > 1.0
+
+
+def test_build_session_uses_setup_video_mark_for_target_elevation():
+    impact = _impact_row()
+    session = build_dooaf_session(
+        [impact],
+        target_lat=20.4458765,
+        target_lon=72.8632638,
+        target_alt_m=22.14,
+        setup_video_marks={DOOAF_ROLE_INTENDED: (0.292, 0.563)},
+    )
+    assert session.intended is not None
+    assert session.impact is not None
+    assert session.height_correction_m is not None
+    assert abs(float(session.height_correction_m)) > 0.3
+    assert session.impact.alt_m is not None
+    assert session.intended.alt_m is not None
+    assert session.impact.alt_m > session.intended.alt_m
+    assert session.height_correction_m is not None
+    assert float(session.height_correction_m) < -0.3
+    html = format_elevation_summary_html(session)
+    assert "same as terrain DEM at footprint" not in html or "Height correction" in html
+
+
+def test_synthesize_setup_mark_row_carries_geo_range():
+    row = _synthesize_setup_mark_row(
+        DOOAF_ROLE_INTENDED,
+        20.4458765,
+        72.8632638,
+        0.292,
+        0.563,
+        _impact_row(),
+    )
+    assert row.get("video_y_norm") == 0.563
+    assert row.get("geo_range_m") is not None or row.get("target_alt_m") is not None

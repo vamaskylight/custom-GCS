@@ -336,6 +336,100 @@ def drone_from_row(row: dict[str, Any] | None) -> GeoPoint | None:
     return GeoPoint(lat, lon, _drone_alt_msl_from_row(row))
 
 
+_SETUP_ROW_CONTEXT_KEYS = (
+    "vehicle_lat",
+    "vehicle_lon",
+    "vehicle_heading_deg",
+    "vehicle_roll_deg",
+    "vehicle_pitch_deg",
+    "ekf_rel_alt_m",
+    "vehicle_rel_alt_m",
+    "vehicle_alt_msl_m",
+    "dem_ground_agl_m",
+    "dem_ground_agl_source",
+    "measure_agl_m",
+    "agl_source",
+    "rangefinder_down_m",
+    "gimbal_yaw_deg",
+    "gimbal_pitch_deg",
+    "gps_fix_type",
+    "gps_hdop",
+    "camera_hfov_deg",
+)
+
+
+def _synthesize_setup_mark_row(
+    role: str,
+    lat: float,
+    lon: float,
+    video_x: float,
+    video_y: float,
+    template_row: dict[str, Any],
+    *,
+    dem_path: str | Path | None = None,
+    alt_m: float | None = None,
+) -> dict[str, Any]:
+    """Rebuild a DOOAF Setup video pick as a mark row for elevation geometry."""
+    from vgcs.observe.geo_reference import (
+        compute_geo_reference,
+        enrich_video_mark_target_altitude,
+    )
+
+    row: dict[str, Any] = {
+        "kind": "video_mark",
+        "dooaf_role": role,
+        "target_lat": lat,
+        "target_lon": lon,
+        "video_x_norm": float(video_x),
+        "video_y_norm": float(video_y),
+    }
+    if alt_m is not None:
+        row["target_alt_m"] = alt_m
+    for key in _SETUP_ROW_CONTEXT_KEYS:
+        if template_row.get(key) is not None:
+            row[key] = template_row[key]
+    hfov = 62.0
+    try:
+        if template_row.get("camera_hfov_deg") is not None:
+            hfov = float(template_row["camera_hfov_deg"])
+    except (TypeError, ValueError):
+        pass
+    geo = compute_geo_reference(
+        vehicle_lat=row.get("vehicle_lat"),  # type: ignore[arg-type]
+        vehicle_lon=row.get("vehicle_lon"),  # type: ignore[arg-type]
+        vehicle_heading_deg=row.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+        vehicle_roll_deg=row.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+        vehicle_pitch_deg=row.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+        vehicle_rel_alt_m=row.get("vehicle_rel_alt_m") or row.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
+        vehicle_alt_msl_m=row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+        rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
+        gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+        gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+        video_x_norm=float(video_x),
+        video_y_norm=float(video_y),
+        gps_fix_type=int(template_row.get("gps_fix_type") or 0),
+        gps_hdop=template_row.get("gps_hdop"),  # type: ignore[arg-type]
+        camera_hfov_deg=hfov,
+        dem_path=dem_path,
+    )
+    if geo.ok and geo.target_lat is not None and geo.target_lon is not None:
+        row["target_lat"] = geo.target_lat
+        row["target_lon"] = geo.target_lon
+        if geo.target_alt_m is not None:
+            row["target_alt_m"] = geo.target_alt_m
+        row["geo_quality"] = geo.quality
+        row["geo_method"] = geo.method
+        row["geo_warning"] = geo.warning
+        if geo.depression_deg is not None:
+            row["geo_depression_deg"] = geo.depression_deg
+        if geo.horizontal_range_m is not None:
+            row["geo_range_m"] = geo.horizontal_range_m
+        if geo.bearing_deg is not None:
+            row["geo_bearing_deg"] = geo.bearing_deg
+    enrich_video_mark_target_altitude(row)
+    return row
+
+
 def _fill_point_alt_m(
     pt: GeoPoint | None,
     row: dict[str, Any] | None,
@@ -664,6 +758,7 @@ def build_dooaf_session(
     target_lon: float | None = None,
     target_alt_m: float | None = None,
     dem_path: str | Path | None = None,
+    setup_video_marks: dict[str, tuple[float, float]] | None = None,
 ) -> DooafSession:
     gun_row = latest_mark_row(rows, DOOAF_ROLE_GUN)
     intended_row = latest_mark_row(rows, DOOAF_ROLE_INTENDED)
@@ -679,6 +774,26 @@ def build_dooaf_session(
     impact = latest_mark(rows, DOOAF_ROLE_IMPACT)
     impact = _fill_point_alt_m(impact, impact_row, None, dem_path=dem_path)
     drone = drone_from_row(rows[-1] if rows else None)
+    template_row = impact_row or (rows[-1] if rows else None)
+    if (
+        intended_row is None
+        and intended is not None
+        and template_row is not None
+        and setup_video_marks
+        and DOOAF_ROLE_INTENDED in setup_video_marks
+    ):
+        vx, vy = setup_video_marks[DOOAF_ROLE_INTENDED]
+        intended_row = _synthesize_setup_mark_row(
+            DOOAF_ROLE_INTENDED,
+            intended.lat,
+            intended.lon,
+            vx,
+            vy,
+            template_row,
+            dem_path=dem_path,
+            alt_m=intended.alt_m,
+        )
+        intended = point_from_row(intended_row) or intended
     building_height_m: float | None = None
     if intended is not None and impact is not None:
         intended, impact, building_height_m = resolve_dooaf_mark_elevations(
@@ -692,8 +807,8 @@ def build_dooaf_session(
         correction = compute_fire_correction(gun, intended, impact)
     intended_dem = dem_alt_msl_at_mark(intended_row, intended, dem_path=dem_path)
     impact_dem = dem_alt_msl_at_mark(impact_row, impact, dem_path=dem_path)
-    height_correction_m: float | None = building_height_m
-    if height_correction_m is None and intended is not None and impact is not None:
+    height_correction_m: float | None = None
+    if intended is not None and impact is not None:
         if intended.alt_m is not None and impact.alt_m is not None:
             height_correction_m = float(intended.alt_m) - float(impact.alt_m)
     return DooafSession(
@@ -3174,11 +3289,19 @@ def format_elevation_summary_html(session: DooafSession) -> str:
             "<span class='muted'>(terrain at target footprint)</span></td></tr>"
         )
     if tgt is not None and tgt.alt_m is not None:
-        rows.append(
-            f"<tr><td class='label-col'>Target elevation (corrected)</td>"
-            f"<td>{_format_elev_msl_html(tgt.alt_m)} "
-            "<span class='muted'>(aim point on structure / facade geometry)</span></td></tr>"
-        )
+        dem = session.intended_dem_alt_m
+        if dem is None or abs(float(tgt.alt_m) - float(dem)) >= 0.15:
+            rows.append(
+                f"<tr><td class='label-col'>Target elevation (corrected)</td>"
+                f"<td>{_format_elev_msl_html(tgt.alt_m)} "
+                "<span class='muted'>(aim point on structure / facade geometry)</span></td></tr>"
+            )
+        else:
+            rows.append(
+                f"<tr><td class='label-col'>Target elevation (corrected)</td>"
+                f"<td>{_format_elev_msl_html(tgt.alt_m)} "
+                "<span class='muted'>(same as terrain DEM at footprint)</span></td></tr>"
+            )
     if session.impact_dem_alt_m is not None:
         rows.append(
             f"<tr><td class='label-col'>Impact DEM elevation</td>"
@@ -3186,16 +3309,32 @@ def format_elevation_summary_html(session: DooafSession) -> str:
             "<span class='muted'>(terrain at impact footprint)</span></td></tr>"
         )
     if imp is not None and imp.alt_m is not None:
-        rows.append(
-            f"<tr><td class='label-col'>Impact elevation (corrected)</td>"
-            f"<td>{_format_elev_msl_html(imp.alt_m)}</td></tr>"
-        )
+        dem = session.impact_dem_alt_m
+        if dem is None or abs(float(imp.alt_m) - float(dem)) >= 0.15:
+            rows.append(
+                f"<tr><td class='label-col'>Impact elevation (corrected)</td>"
+                f"<td>{_format_elev_msl_html(imp.alt_m)} "
+                "<span class='muted'>(fall of shot on structure / facade geometry)</span></td></tr>"
+            )
+        else:
+            rows.append(
+                f"<tr><td class='label-col'>Impact elevation (corrected)</td>"
+                f"<td>{_format_elev_msl_html(imp.alt_m)} "
+                "<span class='muted'>(same as terrain DEM at footprint)</span></td></tr>"
+            )
     if session.height_correction_m is not None:
         h = float(session.height_correction_m)
         rows.append(
             f"<tr><td class='label-col'>Height correction (target − impact)</td>"
             f"<td><strong>{h:+.1f} m</strong> "
             "<span class='muted'>(+ = target above impact)</span></td></tr>"
+        )
+    elif tgt is not None and imp is not None:
+        rows.append(
+            "<tr><td class='label-col'>Height correction (target − impact)</td>"
+            "<td><span class='muted'>— "
+            "(need target + impact video picks at different heights, or higher drone hover)</span>"
+            "</td></tr>"
         )
     if not rows:
         return ""
