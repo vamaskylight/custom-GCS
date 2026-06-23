@@ -110,6 +110,12 @@ def release_companion_rtsp_host(source_id: str, url: str) -> None:
     _companion_release_rtsp_host(source_id, url)
 
 
+def release_all_companion_rtsp_hosts() -> None:
+    """Clear all C13 host locks (day ↔ thermal handoff)."""
+    with _COMPANION_RTSP_OPEN_LOCK:
+        _COMPANION_RTSP_HOST_OWNER.clear()
+
+
 def _companion_release_rtsp_host(source_id: str, url: str) -> None:
     u = str(url or "").strip()
     if not _rtsp_url_is_companion_rtsp(u):
@@ -1338,6 +1344,37 @@ class RtspSource(QObject):
             )
         except Exception:
             self._qt_stop_teardown()
+
+    def companion_hard_stop_decode(self, *, join_s: float = 3.0) -> None:
+        """Stop FFmpeg and release the C13 RTSP slot (day ↔ thermal IR switch)."""
+        url = str(self._url or "").strip()
+        self._running = False
+        try:
+            self._ffmpeg_stop.set()
+        except Exception:
+            pass
+        try:
+            self._close_ffmpeg_decode_proc()
+        except Exception:
+            pass
+        th = self._ffmpeg_thread
+        if th is not None and th.is_alive():
+            try:
+                th.join(timeout=max(0.2, float(join_s)))
+            except Exception:
+                pass
+        self._ffmpeg_thread = None
+        try:
+            self._ffmpeg_stop.clear()
+        except Exception:
+            pass
+        try:
+            if self._player is not None:
+                self._player.stop()
+        except Exception:
+            pass
+        if url:
+            release_companion_rtsp_host(self.source_id, url)
 
     def set_recording_preview_transform(
         self,
