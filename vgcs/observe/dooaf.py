@@ -170,20 +170,38 @@ def compute_fire_correction(
     """
     from vgcs.observe.target_measure import mark_pair_ground_separation_m
 
+    if impact_row is not None:
+        template = gun_row or intended_row
+        if template is not None:
+            _enrich_mark_row_ray_geometry(impact_row, template)
+
     range_gt = haversine_m(gun.lat, gun.lon, intended.lat, intended.lon)
     range_gi = haversine_m(gun.lat, gun.lon, impact.lat, impact.lon)
     if gun_row is not None and intended_row is not None:
         ray_gt = mark_pair_ground_separation_m(
             gun_row, intended_row, hfov_deg=camera_hfov_deg
         )
-        if ray_gt is not None:
+        if ray_gt is not None and float(ray_gt) > float(range_gt) * 1.08:
             range_gt = float(ray_gt)
     if gun_row is not None and impact_row is not None:
         ray_gi = mark_pair_ground_separation_m(
             gun_row, impact_row, hfov_deg=camera_hfov_deg
         )
-        if ray_gi is not None:
+        if ray_gi is not None and float(ray_gi) > float(range_gi) * 1.08:
             range_gi = float(ray_gi)
+    if (
+        gun_row is not None
+        and impact_row is not None
+        and intended_row is not None
+        and float(range_gt) > float(range_gi) * 1.2
+    ):
+        try:
+            vx_t = float(intended_row.get("video_x_norm"))  # type: ignore[arg-type]
+            vx_i = float(impact_row.get("video_x_norm"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            vx_t = vx_i = 0.0
+        if abs(vx_t - vx_i) <= 0.14:
+            range_gi = max(float(range_gi), float(range_gt))
     bearing_gt = initial_bearing_deg(gun.lat, gun.lon, intended.lat, intended.lon)
     bearing_gi = initial_bearing_deg(gun.lat, gun.lon, impact.lat, impact.lon)
     d_theta = math.radians(bearing_gi - bearing_gt)
@@ -573,6 +591,45 @@ def _synthesize_setup_mark_row(
             row["agl_source"] = ray_src
     enrich_video_mark_target_altitude(row)
     return row
+
+
+def _enrich_mark_row_ray_geometry(
+    row: dict[str, Any],
+    template_row: dict[str, Any],
+    *,
+    dem_path: str | Path | None = None,
+) -> None:
+    """Fill per-click ray range/bearing on observation rows when enrich dropped them."""
+    if row.get("geo_range_m") is not None and row.get("geo_bearing_deg") is not None:
+        return
+    vx = row.get("video_x_norm")
+    vy = row.get("video_y_norm")
+    lat = row.get("target_lat")
+    lon = row.get("target_lon")
+    if vx is None or vy is None or lat is None or lon is None:
+        return
+    try:
+        synth = _synthesize_setup_mark_row(
+            str(row.get("dooaf_role") or DOOAF_ROLE_IMPACT),
+            float(lat),
+            float(lon),
+            float(vx),
+            float(vy),
+            template_row,
+            dem_path=dem_path,
+        )
+    except (TypeError, ValueError):
+        return
+    for key in (
+        "geo_range_m",
+        "geo_bearing_deg",
+        "geo_depression_deg",
+        "measure_agl_m",
+        "geo_agl_source",
+        "agl_source",
+    ):
+        if row.get(key) is None and synth.get(key) is not None:
+            row[key] = synth[key]
 
 
 def _apply_geo_reference_to_mark_row(
@@ -1372,6 +1429,10 @@ def build_dooaf_session(
             template_row,
             dem_path=dem_path,
             alt_m=gun.alt_m,
+        )
+    if impact_row is not None and template_row is not None:
+        _enrich_mark_row_ray_geometry(
+            impact_row, template_row, dem_path=dem_path
         )
     building_height_m: float | None = None
     if intended is not None and impact is not None:

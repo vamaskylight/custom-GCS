@@ -111,6 +111,113 @@ def test_fire_correction_uses_ray_range_for_facade_setup():
     assert corr_ray.range_gun_to_intended_m < 40.0
 
 
+def test_fire_correction_gun_impact_uses_ray_when_footprint_collapsed():
+    """Session 183427 — impact footprint ~8 m from gun; ray ~29 m on same facade."""
+    template = {
+        "vehicle_lat": 20.4458179,
+        "vehicle_lon": 72.8632723,
+        "vehicle_heading_deg": 315.0,
+        "vehicle_pitch_deg": -7.4,
+        "vehicle_roll_deg": 0.0,
+        "vehicle_alt_msl_m": 36.0,
+        "ekf_rel_alt_m": 2.2,
+        "dem_ground_agl_m": 13.94,
+        "gimbal_pitch_deg": -20.0,
+        "gimbal_yaw_deg": 0.09,
+        "gps_fix_type": 3,
+        "camera_hfov_deg": 62.0,
+    }
+    gun_row = {
+        **template,
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_GUN,
+        "target_lat": 20.4459722,
+        "target_lon": 72.8629682,
+        "video_x_norm": 0.294,
+        "video_y_norm": 0.900,
+        "geo_range_m": 59.49,
+        "geo_bearing_deg": 301.97,
+    }
+    tgt_row = {
+        **template,
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_INTENDED,
+        "target_lat": 20.4459258,
+        "target_lon": 72.8631324,
+        "video_x_norm": 0.458,
+        "video_y_norm": 0.485,
+        "geo_range_m": 26.19,
+        "geo_bearing_deg": 312.15,
+    }
+    imp_row = {
+        **template,
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_IMPACT,
+        "target_lat": 20.44600266027315,
+        "target_lon": 72.86304599625547,
+        "video_x_norm": 0.48020833333333335,
+        "video_y_norm": 0.6134185303514377,
+    }
+    gun = GeoPoint(20.4459722, 72.8629682, 23.516)
+    intended = GeoPoint(20.4459258, 72.8631324, 24.15)
+    impact = GeoPoint(20.44600266027315, 72.86304599625547, 20.69)
+    corr = compute_fire_correction(
+        gun,
+        intended,
+        impact,
+        gun_row=gun_row,
+        intended_row=tgt_row,
+        impact_row=imp_row,
+    )
+    assert corr.range_gun_to_intended_m > 25.0
+    assert corr.range_gun_to_impact_m > 20.0
+    assert corr.range_gun_to_impact_m > corr.range_gun_to_intended_m * 0.55
+
+
+def test_build_session_183427_gun_impact_ray_distance():
+    from vgcs.observe.dooaf import build_dooaf_session
+
+    impact = {
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_IMPACT,
+        "target_lat": 20.44600266027315,
+        "target_lon": 72.86304599625547,
+        "target_alt_m": 20.69,
+        "video_x_norm": 0.48020833333333335,
+        "video_y_norm": 0.6134185303514377,
+        "vehicle_lat": 20.4458179,
+        "vehicle_lon": 72.8632723,
+        "vehicle_heading_deg": 315.0,
+        "vehicle_pitch_deg": -7.4,
+        "vehicle_roll_deg": 0.0,
+        "vehicle_alt_msl_m": 36.0,
+        "ekf_rel_alt_m": 2.2,
+        "dem_ground_agl_m": 13.94,
+        "gimbal_pitch_deg": -20.0,
+        "gimbal_yaw_deg": 0.09,
+        "gps_fix_type": 3,
+        "camera_hfov_deg": 62.0,
+    }
+    session = build_dooaf_session(
+        [impact],
+        gun_lat=20.4459722,
+        gun_lon=72.8629682,
+        gun_alt_m=23.516,
+        target_lat=20.4459258,
+        target_lon=72.8631324,
+        target_alt_m=20.691,
+        setup_video_marks={
+            DOOAF_ROLE_GUN: (0.294, 0.900),
+            DOOAF_ROLE_INTENDED: (0.458, 0.485),
+        },
+        dem_path="output_hh.tif",
+    )
+    assert session.correction is not None
+    assert session.correction.range_gun_to_intended_m > 25.0
+    assert session.correction.range_gun_to_impact_m > 25.0
+    assert session.correction.range_gun_to_impact_m > 8.5
+
+
 def test_fire_correction_on_line_short():
     gun = GeoPoint(12.0, 77.0)
     intended = GeoPoint(12.01, 77.0)
