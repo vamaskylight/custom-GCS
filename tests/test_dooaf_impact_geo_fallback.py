@@ -87,6 +87,33 @@ def test_build_session_after_fallback():
     assert session.correction is not None
 
 
+def test_horizon_elevation_spreads_msl_along_video_y():
+    from vgcs.observe.facade_plane import facade_msl_heights_from_horizon_marks
+
+    gun = {
+        "video_x_norm": 0.501,
+        "video_y_norm": 0.349,
+        "geo_range_m": 80.0,
+        "target_alt_m_dem": 23.0,
+    }
+    tgt = {
+        "video_x_norm": 0.363,
+        "video_y_norm": 0.355,
+        "geo_range_m": 85.0,
+        "target_alt_m_dem": 23.0,
+    }
+    imp = {
+        "video_x_norm": 0.406,
+        "video_y_norm": 0.378,
+        "geo_range_m": 82.0,
+        "target_alt_m_dem": 23.0,
+    }
+    g, t, i = facade_msl_heights_from_horizon_marks(gun, tgt, imp)
+    assert g is not None and t is not None and i is not None
+    assert g > t > i
+    assert g - i > 0.5
+
+
 def test_export_blockers_warns_low_ekf():
     row = _failed_impact_row()
     apply_dooaf_impact_geo_fallback(
@@ -106,9 +133,46 @@ def test_export_blockers_warns_low_ekf():
     assert any("near ground" in w.lower() or "estimated" in w.lower() for w in warns)
 
 
+def test_export_blockers_warns_horizon_cluster():
+    row = _failed_impact_row()
+    apply_dooaf_impact_geo_fallback(
+        row,
+        target_lat=20.4456768,
+        target_lon=72.8633555,
+        setup_video_marks={
+            DOOAF_ROLE_GUN: (0.501, 0.349),
+            DOOAF_ROLE_INTENDED: (0.363, 0.355),
+        },
+    )
+    warns = dooaf_export_blockers(
+        [row],
+        gun_lat=20.4456669,
+        gun_lon=72.8633355,
+        target_lat=20.4456768,
+        target_lon=72.8633555,
+        setup_video_marks={
+            DOOAF_ROLE_GUN: (0.501, 0.349),
+            DOOAF_ROLE_INTENDED: (0.363, 0.355),
+        },
+    )
+    assert any("skyline" in w.lower() or "horizon" in w.lower() for w in warns)
+
+
 def test_sanitize_dem_drops_absurd_terrain_agl():
     assert sanitize_dem_ground_agl_m(45.76, 0.343) is None
     assert sanitize_dem_ground_agl_m(5.0, 2.2) == 5.0
+
+
+def test_prefer_dem_uses_terrain_agl_on_rooftop():
+    agl, src = prefer_dem_ground_agl_over_ekf(
+        relative_alt_m=1.33,
+        facade_agl_m=1.33,
+        facade_src="ekf_relative",
+        dem_ground_agl_m=14.29,
+        dem_ground_src="dem_terrain",
+    )
+    assert src == "dem_terrain"
+    assert agl == 14.29
 
 
 def test_prefer_dem_rejects_home_below_terrain_mismatch():

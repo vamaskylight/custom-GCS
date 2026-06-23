@@ -377,6 +377,79 @@ def _dem_msl_from_row(row: dict[str, Any]) -> float | None:
     return None
 
 
+def facade_msl_heights_from_horizon_marks(
+    gun_row: dict[str, Any],
+    intended_row: dict[str, Any],
+    impact_row: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    camera_vfov_deg: float | None = None,
+) -> tuple[float | None, float | None, float | None]:
+    """
+    Hillcrest / skyline picks: smallest video Y is the highest point.
+
+    Spreads MSL between marks using vertical angle × mean ray range when the
+    gun/ground mark is in the upper frame (not at the foot of a facade).
+    """
+    xy_g = _video_xy(gun_row)
+    xy_t = _video_xy(intended_row)
+    xy_i = _video_xy(impact_row)
+    if xy_g is None or xy_t is None or xy_i is None:
+        return None, None, None
+
+    y_g, y_t, y_i = float(xy_g[1]), float(xy_t[1]), float(xy_i[1])
+    y_min = min(y_g, y_t, y_i)
+    y_max = max(y_g, y_t, y_i)
+    span = y_max - y_min
+    if span < 0.012:
+        return None, None, None
+    if y_g > y_min + 0.02:
+        return None, None, None
+
+    rh_vals: list[float] = []
+    for row in (gun_row, intended_row, impact_row):
+        for key in ("geo_range_m",):
+            raw = row.get(key)
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if val >= 3.0:
+                rh_vals.append(val)
+    if not rh_vals:
+        return None, None, None
+    rh = sum(rh_vals) / len(rh_vals)
+
+    vfov = (
+        float(camera_vfov_deg)
+        if camera_vfov_deg is not None
+        else float(hfov_deg) * 0.5625
+    )
+    angle_span = span * math.radians(vfov)
+    if angle_span < 0.008:
+        return None, None, None
+    height_span = rh * math.tan(angle_span)
+    if height_span < 0.12:
+        return None, None, None
+
+    dem_vals: list[float] = []
+    for row in (gun_row, intended_row, impact_row):
+        dem_m = _dem_msl_from_row(row)
+        if dem_m is not None:
+            dem_vals.append(float(dem_m))
+    base = min(dem_vals) if dem_vals else None
+    if base is None:
+        return None, None, None
+
+    def _msl_for_y(y: float) -> float:
+        frac = (float(y) - y_min) / span
+        return float(base) + height_span * (1.0 - frac)
+
+    return _msl_for_y(y_g), _msl_for_y(y_t), _msl_for_y(y_i)
+
+
 def facade_msl_heights_from_ground_mark(
     ground_row: dict[str, Any],
     intended_row: dict[str, Any],
@@ -544,7 +617,7 @@ def _pair_height_from_video_y_and_range(
     *,
     hfov_deg: float = 62.0,
     camera_vfov_deg: float | None = None,
-    min_dy: float = 0.04,
+    min_dy: float = 0.015,
 ) -> float | None:
     """
     Low-hover fallback: estimate vertical separation from video Y and geo range.
@@ -582,4 +655,4 @@ def _pair_height_from_video_y_and_range(
         return None
     rh = sum(rh_vals) / len(rh_vals)
     height = rh * math.tan(angle_v)
-    return height if height >= 0.35 else None
+    return height if height >= 0.12 else None

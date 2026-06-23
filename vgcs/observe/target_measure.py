@@ -350,6 +350,10 @@ def prefer_dem_ground_agl_over_ekf(
         return dem, src
     if dem < ekf - 2.0:
         return dem, src
+    # EKF is height above home/arming point; DEM terrain AGL is above local ground (e.g. rooftop).
+    if ekf is not None and ekf < 6.0 and dem > float(ekf) + 3.0:
+        if dem <= float(ekf) + 20.0:
+            return dem, src
     # Home is often below local DEM surface — EKF rel can read lower than terrain AGL
     # (more visible at higher hover altitudes).
     if dem >= 15.0 and ekf is not None and dem > ekf + 1.0:
