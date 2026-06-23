@@ -208,13 +208,37 @@ def infer_ray_target_msl_from_row(row: dict[str, Any]) -> float | None:
 
 
 def _row_measure_agl_m(row: dict[str, Any]) -> float | None:
-    for key in ("measure_agl_m", "ekf_rel_alt_m", "vehicle_rel_alt_m"):
+    ekf: float | None = None
+    try:
+        raw_ekf = row.get("ekf_rel_alt_m")
+        if raw_ekf is not None:
+            ekf = float(raw_ekf)
+    except (TypeError, ValueError):
+        ekf = None
+    measure: float | None = None
+    for key in ("measure_agl_m", "vehicle_rel_alt_m"):
         try:
             v = float(row.get(key) or 0)
         except (TypeError, ValueError):
             continue
         if v > 0.5:
-            return v
+            measure = v
+            break
+    agl_src = str(row.get("agl_source") or "")
+    if (
+        ekf is not None
+        and ekf >= _MIN_FACADE_AGL_M
+        and (
+            measure is None
+            or measure < _MIN_FACADE_AGL_M
+            or agl_src.startswith("dem")
+        )
+    ):
+        return ekf
+    if measure is not None:
+        return measure
+    if ekf is not None and ekf > 0.5:
+        return ekf
     return _observation_agl_m(row)
 
 
