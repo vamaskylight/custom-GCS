@@ -15,6 +15,7 @@ from typing import Any
 from vgcs.observe.grid_reference import format_grid_reference
 from vgcs.observe.dooaf_map_symbols import (
     bearing_deg as _dooaf_bearing_deg,
+    svg_drone_marker as _fc_svg_marker_drone,
     svg_gun_marker as _fc_svg_marker_gun,
     svg_target_marker as _fc_svg_marker_crosshair,
 )
@@ -1010,11 +1011,15 @@ def _fc_svg_gun_drone_inset(session: DooafSession, x0: float, y0: float, w: floa
                     session.drone.lon,
                 )
             parts.append(_fc_svg_marker_gun(px, py, scale=0.55, bearing_deg=brg))
-        else:
-            parts.append(f"<circle cx='{px:.1f}' cy='{py:.1f}' r='4' fill='{color}'/>")
             parts.append(
-                f"<text x='{px:.1f}' y='{py + 2.5:.1f}' text-anchor='middle' font-size='6' "
-                f"fill='#fff' font-weight='700'>{label}</text>"
+                f"<text x='{px:.1f}' y='{py + 14:.1f}' text-anchor='middle' font-size='6' "
+                f"fill='#2563eb' font-weight='700'>Artillery</text>"
+            )
+        else:
+            parts.append(_fc_svg_marker_drone(px, py, scale=0.55))
+            parts.append(
+                f"<text x='{px:.1f}' y='{py + 14:.1f}' text-anchor='middle' font-size='6' "
+                f"fill='#7e22ce' font-weight='700'>Drone</text>"
             )
     return "".join(parts)
 
@@ -1417,6 +1422,39 @@ def _fire_correction_workflow_html() -> str:
     )
 
 
+def _fc_axis_fit_scales(
+    span_a: float,
+    span_b: float,
+    plot_w: float,
+    plot_h: float,
+    *,
+    min_a: float = 12.0,
+    min_b: float = 8.0,
+    stretch_threshold: float = 1.1,
+) -> tuple[float, float, bool]:
+    """Independent axis scales when geographic aspect does not match the plot."""
+    span_a = max(span_a, min_a)
+    span_b = max(span_b, min_b)
+    scale_a = plot_w / span_a
+    scale_b = plot_h / span_b
+    plot_aspect = plot_w / plot_h if plot_h > 0 else 1.0
+    geo_aspect = span_a / span_b
+    if geo_aspect > plot_aspect * stretch_threshold or geo_aspect < plot_aspect / stretch_threshold:
+        return scale_a, scale_b, True
+    uniform = min(scale_a, scale_b)
+    return uniform, uniform, False
+
+
+def _fc_plan_view_scales(
+    span_e: float,
+    span_n: float,
+    plot_w: float,
+    plot_h: float,
+) -> tuple[float, float, bool]:
+    """North-up plan scales; stretch the shorter axis when range dwarfs lateral miss."""
+    return _fc_axis_fit_scales(span_e, span_n, plot_w, plot_h)
+
+
 def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     """Plan-view SVG: gun, target, impact, miss vector (North up)."""
     gun = session.gun
@@ -1446,12 +1484,19 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     ]
     east_pts = [0.0, ne_t[1], ne_i[1]]
     north_pts = [0.0, ne_t[0], ne_i[0]]
-    pad = 18.0
-    min_e, max_e = min(east_pts) - pad, max(east_pts) + pad
-    min_n, max_n = min(north_pts) - pad, max(north_pts) + pad
+    ne_d: tuple[float, float] | None = None
+    if session.drone is not None:
+        ne_d = latlon_delta_to_ne_m(gun.lat, gun.lon, session.drone.lat, session.drone.lon)
+    pad = 14.0
+    min_e = min(east_pts) - pad
+    max_e = max(east_pts) + pad
+    min_n = min(north_pts) - pad
+    max_n = max(north_pts) + pad
+    mid_e = (min(east_pts) + max(east_pts)) / 2.0
+    mid_n = (min(north_pts) + max(north_pts)) / 2.0
     span_e = max(max_e - min_e, 12.0)
     span_n = max(max_n - min_n, 12.0)
-    vb_w, vb_h = 520.0, 420.0
+    vb_w, vb_h = 720.0, 520.0
     margin = 48.0
     graph_top = 28.0
     footer_gap = 8.0
@@ -1459,15 +1504,17 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     footer_top = vb_h - footer_h - 6.0
     graph_bottom = footer_top - footer_gap
     plot_bottom = graph_bottom - 20.0
-    scale = min(
-        (vb_w - 2 * margin) / span_e,
-        (plot_bottom - graph_top - margin) / span_n,
-        12.0,
-    )
+    bg_x = margin - 8.0
+    bg_w = vb_w - 2 * (margin - 8.0)
+    plot_w = vb_w - 2 * margin
+    plot_h = plot_bottom - graph_top - margin
+    scale_e, scale_n, axis_stretched = _fc_plan_view_scales(span_e, span_n, plot_w, plot_h)
+    cx_graph = bg_x + bg_w / 2.0
+    cy_graph = (graph_top + plot_bottom) / 2.0
 
     def _xy(east: float, north: float) -> tuple[float, float]:
-        x = margin + (east - min_e) * scale
-        y = plot_bottom - (north - min_n) * scale
+        x = cx_graph + (east - mid_e) * scale_e
+        y = cy_graph - (north - mid_n) * scale_n
         return x, y
 
     gx, gy = _xy(0.0, 0.0)
@@ -1476,8 +1523,6 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     corner_x, corner_y = ix, ty
     cluster_x = (tx + ix) / 2.0
     cluster_y = (ty + iy) / 2.0
-    bg_x = margin - 8.0
-    bg_w = vb_w - 2 * (margin - 8.0)
     bg_h = graph_bottom - graph_top
     fs = 9
 
@@ -1498,14 +1543,22 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
         "<path d='M0,0 L6,3 L0,6 Z' fill='#0d9488'/>",
         "</marker>",
         "</defs>",
-        f"<text x='{vb_w / 2:.0f}' y='{graph_top - 8:.0f}' text-anchor='middle' font-size='11' "
+        f"<text x='{cx_graph:.0f}' y='{graph_top - 8:.0f}' text-anchor='middle' font-size='11' "
         "fill='#64748b' font-weight='700'>N</text>",
-        f"<line x1='{vb_w / 2:.0f}' y1='{graph_top - 4:.0f}' x2='{vb_w / 2:.0f}' "
+        f"<line x1='{cx_graph:.0f}' y1='{graph_top - 4:.0f}' x2='{cx_graph:.0f}' "
         f"y2='{graph_top + 10:.0f}' stroke='#64748b' stroke-width='2'/>",
-        f"<polygon points='{vb_w / 2:.0f},{graph_top - 8:.0f} {vb_w / 2 - 5:.0f},"
-        f"{graph_top - 2:.0f} {vb_w / 2 + 5:.0f},{graph_top - 2:.0f}' fill='#64748b'/>",
+        f"<polygon points='{cx_graph:.0f},{graph_top - 8:.0f} {cx_graph - 5:.0f},"
+        f"{graph_top - 2:.0f} {cx_graph + 5:.0f},{graph_top - 2:.0f}' fill='#64748b'/>",
         f"<rect x='{bg_x:.0f}' y='{graph_top:.0f}' width='{bg_w:.0f}' height='{bg_h:.0f}' "
         "fill='#f8fafc' rx='8'/>",
+    ]
+    if axis_stretched:
+        parts.append(
+            f"<text x='{bg_x + bg_w - 6:.0f}' y='{graph_bottom - 5:.0f}' text-anchor='end' "
+            "font-size='7' fill='#94a3b8'>N/S scale exaggerated for visibility</text>"
+        )
+    parts.extend(
+        [
         f"<line x1='{gx:.1f}' y1='{gy:.1f}' x2='{tx:.1f}' y2='{ty:.1f}' stroke='#94a3b8' "
         "stroke-width='1.5' stroke-dasharray='6,4'/>",
         f"<line x1='{gx:.1f}' y1='{gy:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#cbd5e1' "
@@ -1521,9 +1574,9 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
         f"<circle cx='{ix:.1f}' cy='{iy:.1f}' r='10' fill='#dc2626'/>",
         f"<text x='{ix:.1f}' y='{iy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
         "font-weight='700'>I</text>",
-    ]
-    if session.drone is not None:
-        ne_d = latlon_delta_to_ne_m(gun.lat, gun.lon, session.drone.lat, session.drone.lon)
+        ]
+    )
+    if ne_d is not None:
         dx, dy = _xy(ne_d[1], ne_d[0])
         parts.append(f"<circle cx='{dx:.1f}' cy='{dy:.1f}' r='8' fill='#9333ea'/>")
         parts.append(
@@ -1567,100 +1620,90 @@ def _fire_correction_plan_svg(session: DooafSession, c: FireCorrection) -> str:
     return "".join(parts)
 
 
+def _fc_miss_offset_label(value_m: float, pos_word: str, neg_word: str) -> str | None:
+    v = float(value_m)
+    if abs(v) < 0.05:
+        return None
+    return f"{abs(v):.1f} m {pos_word if v > 0 else neg_word}"
+
 def _fire_correction_gunline_svg(c: FireCorrection, *, session: DooafSession | None = None) -> str:
-    """Gun-line view: along-range and right miss."""
+    """Gun-line miss view (target at centre) — same layout pattern as compass miss."""
     along = float(c.miss_along_m)
     right = float(c.miss_right_m)
-    r_gt = max(float(c.range_gun_to_intended_m), 1.0)
-    span = max(r_gt + abs(along) + 20.0, 40.0)
-    vb_w, vb_h = 520.0, 420.0
-    margin = 56.0
-    graph_top = 36.0
-    footer_gap = 8.0
-    range_text = f"{r_gt:.1f} m"
-    along_label = f"{along:+.1f} m along"
-    right_label = f"{right:+.1f} m R"
-    corr_along = float(c.range_correction_m)
-    corr_right = float(c.deflection_correction_m)
-    corr_range_label = f"range {corr_along:+.1f} m"
-    corr_lr_label = f"L/R {corr_right:+.1f} m"
-    miss_total = f"Miss {c.impact_to_intended_m:.1f} m"
-    landed_lines = [miss_total]
-    if abs(along) >= 0.05:
-        landed_lines.append(along_label)
-    if abs(right) >= 0.05:
-        landed_lines.append(right_label)
-    footer_columns = [
-        ("Range", [f"target {range_text}"], "#64748b"),
-        ("Impact distance", landed_lines, "#ea580c"),
-        ("Course Correction", [corr_range_label, corr_lr_label], "#0d9488"),
-    ]
-    footer_h = _fc_diagram_footer_height(footer_columns)
-    footer_top = vb_h - footer_h - 6.0
-    graph_bottom = footer_top - footer_gap
-    y_line = (graph_top + graph_bottom) / 2.0
-    scale = (vb_w - 2 * margin) / span
-    base_x = margin
-    tgt_x = base_x + r_gt * scale
-    imp_x = tgt_x + along * scale
-    max_defl_px = min(36.0, (graph_bottom - graph_top) / 2.0 - 20.0)
-    defl_scale = min(scale * 0.85, max_defl_px / max(abs(right), 1.0))
-    imp_y = y_line + right * defl_scale
-    imp_y = max(graph_top + 16.0, min(graph_bottom - 20.0, imp_y))
-    fs = 9
-    bg_x = margin - 10.0
-    bg_w = vb_w - 2 * (margin - 10.0)
+    span = max(abs(along), abs(right), 12.0)
+    along_label = _fc_miss_offset_label(along, "Far", "Short")
+    right_label = _fc_miss_offset_label(right, "Right", "Left")
 
-    placer = _FcSvgLabelPlacer()
-    placer.add_blocked_zone(bg_x + bg_w / 2, footer_top + footer_h / 2, bg_w + 4, footer_h + footer_gap + 4)
-    placer.add_marker(base_x, y_line, 12.0)
-    placer.add_marker(tgt_x, y_line, 14.0)
-    placer.add_marker(imp_x, imp_y, 13.0)
+    vb_w, vb_h, margin, r_tgt, r_imp = 400.0, 400.0, 52.0, 11.0, 10.0
+    cx, cy = vb_w / 2.0, vb_h / 2.0
+    plot_r = min(cx, cy) - margin
+    px_per_m = plot_r / span
+    tx, ty = cx, cy
+    ix = cx + along * px_per_m
+    iy = cy + right * px_per_m
+    ax, ay = ix, ty
+    fs = 9
 
     parts: list[str] = [
         f"<svg class='fc-gunline-svg' viewBox='0 0 {vb_w:.0f} {vb_h:.0f}' width='100%' "
         "xmlns='http://www.w3.org/2000/svg' font-family='Segoe UI,sans-serif'>",
-        f"<text x='{vb_w / 2:.0f}' y='{graph_top - 10:.0f}' text-anchor='middle' font-size='10' "
-        "fill='#64748b'>Along gun→target line · Right = R+</text>",
-        f"<rect x='{bg_x:.0f}' y='{graph_top:.0f}' width='{bg_w:.0f}' "
-        f"height='{graph_bottom - graph_top:.0f}' fill='#f8fafc' rx='8'/>",
-        f"<line x1='{base_x:.0f}' y1='{y_line:.0f}' x2='{vb_w - margin:.0f}' y2='{y_line:.0f}' "
-        "stroke='#94a3b8' stroke-width='2'/>",
-        f"<circle cx='{base_x:.0f}' cy='{y_line:.0f}' r='8' fill='#2563eb'/>",
-        f"<text x='{base_x:.0f}' y='{y_line + 4:.0f}' text-anchor='middle' font-size='8' fill='#fff' "
-        "font-weight='700'>G</text>",
-        f"<text x='{base_x:.0f}' y='{y_line - 14:.0f}' text-anchor='middle' font-size='{fs}' "
-        "fill='#2563eb'>Gun</text>",
-        f"<circle cx='{tgt_x:.0f}' cy='{y_line:.0f}' r='10' fill='#16a34a'/>",
-        f"<text x='{tgt_x:.0f}' y='{y_line + 4:.0f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
-        "font-weight='700'>T</text>",
-        f"<circle cx='{imp_x:.0f}' cy='{imp_y:.0f}' r='9' fill='#dc2626'/>",
-        f"<text x='{imp_x:.0f}' y='{imp_y + 4:.0f}' text-anchor='middle' font-size='8' fill='#fff' "
-        "font-weight='700'>I</text>",
+        f"<rect x='{margin:.0f}' y='{margin:.0f}' width='{vb_w - 2 * margin:.0f}' "
+        f"height='{vb_h - 2 * margin:.0f}' fill='#f8fafc' rx='8'/>",
+        f"<line x1='{margin:.0f}' y1='{cy:.0f}' x2='{vb_w - margin:.0f}' y2='{cy:.0f}' "
+        "stroke='#cbd5e1' stroke-width='1' stroke-dasharray='4,4'/>",
+        f"<line x1='{cx:.0f}' y1='{margin:.0f}' x2='{cx:.0f}' y2='{vb_h - margin:.0f}' "
+        "stroke='#cbd5e1' stroke-width='1' stroke-dasharray='4,4'/>",
+        f"<text x='{vb_w - margin - 4:.0f}' y='{cy + 4:.0f}' text-anchor='end' font-size='{fs}' "
+        "fill='#64748b' font-weight='600'>Far</text>",
+        f"<text x='{margin + 4:.0f}' y='{cy + 4:.0f}' font-size='{fs}' fill='#64748b' "
+        "font-weight='600'>Short</text>",
+        f"<text x='{cx:.0f}' y='{margin + 14:.0f}' text-anchor='middle' font-size='{fs + 1}' "
+        "fill='#64748b' font-weight='700'>Left</text>",
+        f"<text x='{cx:.0f}' y='{vb_h - margin - 6:.0f}' text-anchor='middle' font-size='{fs}' "
+        "fill='#64748b' font-weight='600'>Right</text>",
+        _fc_svg_marker_crosshair(tx, ty, r=r_tgt),
+        f"<text x='{tx:.1f}' y='{ty - r_tgt - 6:.1f}' text-anchor='middle' font-size='{fs}' "
+        "fill='#16a34a' font-weight='600'>Target</text>",
     ]
-
-    range_mid_x = base_x + (tgt_x - base_x) * 0.38
-    parts.append(placer.place_at(range_mid_x, y_line, range_text, "#64748b", fs))
-
     if abs(along) >= 0.05:
         parts.append(
-            f"<line x1='{tgt_x:.0f}' y1='{y_line:.0f}' x2='{imp_x:.0f}' y2='{y_line:.0f}' "
-            "stroke='#fdba74' stroke-width='2' stroke-dasharray='4,3'/>"
+            f"<line x1='{tx:.1f}' y1='{ty:.1f}' x2='{ax:.1f}' y2='{ay:.1f}' stroke='#fdba74' "
+            "stroke-width='2' stroke-dasharray='3,2'/>"
         )
-
     if abs(right) >= 0.05:
         parts.append(
-            f"<line x1='{imp_x:.0f}' y1='{y_line:.0f}' x2='{imp_x:.0f}' y2='{imp_y:.0f}' "
-            "stroke='#fdba74' stroke-width='2' stroke-dasharray='4,3'/>"
+            f"<line x1='{ax:.1f}' y1='{ay:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#fdba74' "
+            "stroke-width='2' stroke-dasharray='3,2'/>"
         )
-
-    if session is not None:
-        parts.append(_fc_svg_gun_drone_inset(session, margin, graph_top, 78.0, 52.0))
-
-    parts.append(
-        _fc_svg_diagram_footer(bg_x, bg_w, footer_top, footer_h, footer_columns)
+    if along_label:
+        parts.append(
+            f"<text x='{(tx + ax) / 2:.0f}' y='{cy + 16:.0f}' text-anchor='middle' "
+            f"font-size='{fs}' fill='#ea580c'>{_fc_svg_esc(along_label)}</text>"
+        )
+    if right_label:
+        parts.append(
+            f"<text x='{ix + 8:.0f}' y='{(ay + iy) / 2:.0f}' font-size='{fs}' fill='#ea580c'>"
+            f"{_fc_svg_esc(right_label)}</text>"
+        )
+    parts.extend(
+        [
+            f"<circle cx='{ix:.1f}' cy='{iy:.1f}' r='{r_imp:.0f}' fill='#dc2626'/>",
+            f"<text x='{ix:.1f}' y='{iy + 4:.1f}' text-anchor='middle' font-size='{fs}' fill='#fff' "
+            "font-weight='700'>I</text>",
+            f"<text x='{ix:.1f}' y='{iy + r_imp + 14:.1f}' text-anchor='middle' font-size='{fs}' "
+            "fill='#dc2626' font-weight='600'>Impact</text>",
+            f"<line x1='{tx:.1f}' y1='{ty:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#ea580c' "
+            "stroke-width='2.5'/>",
+            f"<line x1='{ix:.1f}' y1='{iy:.1f}' x2='{tx:.1f}' y2='{ty:.1f}' stroke='#0d9488' "
+            "stroke-width='2' stroke-dasharray='5,3'/>",
+            f"<text x='{min(tx, ix) - 6:.0f}' y='{(ty + iy) / 2 - 6:.0f}' font-size='{fs + 1}' "
+            f"fill='#ea580c' font-weight='700'>"
+            f"{_fc_svg_esc(f'Miss {c.impact_to_intended_m:.1f} m')}</text>",
+            "</svg>",
+        ]
     )
-    parts.append("</svg>")
+    if session is not None:
+        parts.insert(-1, _fc_svg_gun_drone_inset(session, margin, margin, 78.0, 52.0))
     return "".join(parts)
 
 
@@ -1951,7 +1994,7 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
         ("Distances", dist_lines, "#64748b"),
         ("Miss", miss_lines, "#ea580c"),
     ]
-    vb_w, vb_h = 520.0, 400.0
+    vb_w, vb_h = 640.0, 460.0
     margin = 44.0
     graph_top = 28.0
     footer_gap = 8.0
@@ -1962,7 +2005,7 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
     bg_w = vb_w - 2 * (margin - 8.0)
     graph_h = graph_bottom - graph_top
     fs = 9
-    scale = min((vb_w - 2 * margin) / span_e, graph_h / span_n, 12.0)
+    scale = min((vb_w - 2 * margin) / span_e, graph_h / span_n)
     cx_graph = bg_x + bg_w / 2.0
     cy_graph = graph_top + graph_h / 2.0
 
@@ -2182,21 +2225,29 @@ def _exec_panel_header_html(
     )
 
 
+def _executive_miss_chip(value_m: float, pos_word: str, neg_word: str) -> str | None:
+    v = float(value_m)
+    if abs(v) < 0.5:
+        return None
+    if v > 0:
+        icon = "<span class='lr-icon lr-pos' title='Positive'>+</span> "
+        word = pos_word
+    else:
+        icon = "<span class='lr-icon lr-neg' title='Negative'>−</span> "
+        word = neg_word
+    return f"<li>{icon}<strong>{abs(v):.1f}</strong> m {word}</li>"
+
+
 def _executive_miss_chips_html(c: FireCorrection) -> str:
     """Small chips: where impact landed relative to target."""
     chips: list[str] = []
-    miss_n = float(c.miss_north_m)
-    miss_e = float(c.miss_east_m)
-    along = float(c.miss_along_m)
-    if abs(miss_n) >= 0.5:
-        d = "south" if miss_n < 0 else "north"
-        chips.append(f"<li><strong>{abs(miss_n):.1f}</strong> m {d}</li>")
-    if abs(miss_e) >= 0.5:
-        d = "west" if miss_e < 0 else "east"
-        chips.append(f"<li><strong>{abs(miss_e):.1f}</strong> m {d}</li>")
-    if abs(along) >= 0.5:
-        d = "too far" if along > 0 else "short"
-        chips.append(f"<li><strong>{abs(along):.1f}</strong> m {d}</li>")
+    for part in (
+        _executive_miss_chip(c.miss_north_m, "north", "south"),
+        _executive_miss_chip(c.miss_east_m, "east", "west"),
+        _executive_miss_chip(c.miss_along_m, "too far", "short"),
+    ):
+        if part:
+            chips.append(part)
     if not chips:
         return ""
     return "<ul class='exec-miss-list'>" + "".join(chips) + "</ul>"
@@ -2304,8 +2355,175 @@ def _fire_correction_action_cards_html(
     )
 
 
-def _executive_summary_visual_html(c: FireCorrection) -> str:
-    mini_compass = _fire_correction_compass_miss_svg(c, compact=True)
+def _fc_svg_signed_miss_label(
+    x: float,
+    y: float,
+    value_m: float,
+    pos_dir: str,
+    neg_dir: str,
+    *,
+    fs: int = 10,
+    anchor: str = "middle",
+) -> str:
+    """Orange miss label with green + / red − prefix (E/W/N/S)."""
+    v = float(value_m)
+    if abs(v) < 0.05:
+        return ""
+    sign = "+" if v > 0 else "−"
+    sign_color = "#15803d" if v > 0 else "#b91c1c"
+    direction = pos_dir if v > 0 else neg_dir
+    return (
+        f"<text x='{x:.1f}' y='{y:.1f}' text-anchor='{anchor}' font-size='{fs}' "
+        f"fill='#ea580c' font-weight='700'>"
+        f"<tspan fill='{sign_color}' font-weight='800'>{_fc_svg_esc(sign)}</tspan>"
+        f"<tspan> {_fc_svg_esc(f'{abs(v):.1f} m {direction}')}</tspan></text>"
+    )
+
+
+def _fc_svg_edge_role_marker(
+    cx: float,
+    cy: float,
+    plot_r: float,
+    east_m: float,
+    north_m: float,
+    role: str,
+    *,
+    session: DooafSession,
+    intended: GeoPoint,
+) -> str:
+    """Place gun or drone on the map rim toward its bearing from target."""
+    dist = math.hypot(east_m, north_m)
+    if dist < 1e-6:
+        return ""
+    ux = east_m / dist
+    uy = north_m / dist
+    px = cx + ux * (plot_r - 18.0)
+    py = cy - uy * (plot_r - 18.0)
+    label_y = py + (16.0 if role == "gun" else 15.0)
+    if role == "gun":
+        brg = None
+        if session.gun is not None:
+            brg = _dooaf_bearing_deg(
+                session.gun.lat,
+                session.gun.lon,
+                intended.lat,
+                intended.lon,
+            )
+        marker = _fc_svg_marker_gun(px, py, scale=0.46, bearing_deg=brg)
+        label = "Artillery"
+        color = "#2563eb"
+    else:
+        marker = _fc_svg_marker_drone(px, py, scale=0.5)
+        label = "Drone"
+        color = "#7e22ce"
+    return (
+        marker
+        + f"<text x='{px:.1f}' y='{label_y:.1f}' text-anchor='middle' font-size='8' "
+        f"fill='{color}' font-weight='700'>{label}</text>"
+    )
+
+
+def _executive_miss_map_svg(session: DooafSession, c: FireCorrection) -> str:
+    """Summary map: target-centred miss, +/- labels, artillery & drone on rim."""
+    miss_e = float(c.miss_east_m)
+    miss_n = float(c.miss_north_m)
+    span = _fc_compass_span(miss_e, miss_n, floor=8.0)
+    vb_w, vb_h = 360.0, 360.0
+    margin = 42.0
+    r_tgt, r_imp = 10.0, 9.0
+    fs = 10
+    cx, cy = vb_w / 2.0, vb_h / 2.0
+    plot_r = min(cx, cy) - margin
+    px_per_m = plot_r / span
+    ix = cx + miss_e * px_per_m
+    iy = cy - miss_n * px_per_m
+    ex, ey = cx + miss_e * px_per_m, cy
+    intended = session.intended
+
+    parts: list[str] = [
+        f"<svg class='fc-compass-svg exec-miss-map-svg' viewBox='0 0 {vb_w:.0f} {vb_h:.0f}' "
+        "width='100%' xmlns='http://www.w3.org/2000/svg' font-family='Segoe UI,sans-serif'>",
+        f"<rect x='{margin:.0f}' y='{margin:.0f}' width='{vb_w - 2 * margin:.0f}' "
+        f"height='{vb_h - 2 * margin:.0f}' fill='#f8fafc' rx='8'/>",
+        f"<line x1='{cx:.0f}' y1='{margin:.0f}' x2='{cx:.0f}' y2='{vb_h - margin:.0f}' "
+        "stroke='#cbd5e1' stroke-width='1' stroke-dasharray='4,4'/>",
+        f"<line x1='{margin:.0f}' y1='{cy:.0f}' x2='{vb_w - margin:.0f}' y2='{cy:.0f}' "
+        "stroke='#cbd5e1' stroke-width='1' stroke-dasharray='4,4'/>",
+        f"<text x='{cx:.0f}' y='{margin + 14:.0f}' text-anchor='middle' font-size='{fs}' "
+        "fill='#64748b' font-weight='700'>N</text>",
+        f"<text x='{vb_w - margin - 4:.0f}' y='{cy + 4:.0f}' text-anchor='end' font-size='{fs}' "
+        "fill='#64748b' font-weight='600'>E</text>",
+        f"<text x='{margin + 4:.0f}' y='{cy + 4:.0f}' font-size='{fs}' fill='#64748b' "
+        "font-weight='600'>W</text>",
+        f"<text x='{cx:.0f}' y='{vb_h - margin - 6:.0f}' text-anchor='middle' font-size='{fs}' "
+        "fill='#64748b' font-weight='600'>S</text>",
+    ]
+    if intended is not None:
+        if session.gun is not None:
+            g_n, g_e = latlon_delta_to_ne_m(
+                intended.lat, intended.lon, session.gun.lat, session.gun.lon
+            )
+            parts.append(
+                _fc_svg_edge_role_marker(
+                    cx, cy, plot_r, g_e, g_n, "gun", session=session, intended=intended
+                )
+            )
+        if session.drone is not None:
+            d_n, d_e = latlon_delta_to_ne_m(
+                intended.lat, intended.lon, session.drone.lat, session.drone.lon
+            )
+            parts.append(
+                _fc_svg_edge_role_marker(
+                    cx, cy, plot_r, d_e, d_n, "drone", session=session, intended=intended
+                )
+            )
+    parts.append(_fc_svg_marker_crosshair(cx, cy, r=r_tgt))
+    parts.append(
+        f"<text x='{cx:.1f}' y='{cy - r_tgt - 7:.1f}' text-anchor='middle' font-size='{fs}' "
+        "fill='#16a34a' font-weight='700'>Target</text>"
+    )
+    if abs(miss_e) >= 0.05:
+        parts.append(
+            f"<line x1='{cx:.1f}' y1='{cy:.1f}' x2='{ex:.1f}' y2='{ey:.1f}' stroke='#fdba74' "
+            "stroke-width='2' stroke-dasharray='3,2'/>"
+        )
+    if abs(miss_n) >= 0.05:
+        parts.append(
+            f"<line x1='{ex:.1f}' y1='{ey:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#fdba74' "
+            "stroke-width='2' stroke-dasharray='3,2'/>"
+        )
+    if abs(miss_e) >= 0.05:
+        parts.append(_fc_svg_signed_miss_label((cx + ex) / 2.0, cy + 18.0, miss_e, "E", "W", fs=fs))
+    if abs(miss_n) >= 0.05:
+        parts.append(_fc_svg_signed_miss_label(ix + 10.0, (ey + iy) / 2.0, miss_n, "N", "S", fs=fs, anchor="start"))
+    parts.extend(
+        [
+            f"<circle cx='{ix:.1f}' cy='{iy:.1f}' r='{r_imp:.0f}' fill='#dc2626'/>",
+            f"<text x='{ix:.1f}' y='{iy + 3.5:.1f}' text-anchor='middle' font-size='{fs - 1}' "
+            "fill='#fff' font-weight='700'>I</text>",
+            f"<text x='{ix:.1f}' y='{iy + r_imp + 14:.1f}' text-anchor='middle' font-size='{fs}' "
+            "fill='#dc2626' font-weight='700'>Impact</text>",
+            f"<line x1='{cx:.1f}' y1='{cy:.1f}' x2='{ix:.1f}' y2='{iy:.1f}' stroke='#ea580c' "
+            "stroke-width='2.5'/>",
+            f"<line x1='{ix:.1f}' y1='{iy:.1f}' x2='{cx:.1f}' y2='{cy:.1f}' stroke='#0d9488' "
+            "stroke-width='2' stroke-dasharray='5,3'/>",
+            f"<text x='{min(cx, ix) - 8:.0f}' y='{(cy + iy) / 2 - 6:.0f}' font-size='{fs + 1}' "
+            f"fill='#ea580c' font-weight='800'>"
+            f"{_fc_svg_esc(f'Miss {c.impact_to_intended_m:.1f} m')}</text>",
+            f"<text x='{margin + 4:.0f}' y='{vb_h - 10:.0f}' font-size='8' fill='#64748b'>"
+            "<tspan fill='#15803d' font-weight='800'>+</tspan><tspan> / </tspan>"
+            "<tspan fill='#b91c1c' font-weight='800'>−</tspan><tspan> = direction</tspan></text>",
+            "</svg>",
+        ]
+    )
+    return "".join(parts)
+
+
+def _executive_summary_visual_html(session: DooafSession) -> str:
+    c = session.correction
+    if c is None:
+        return ""
+    mini_map = _executive_miss_map_svg(session, c)
     miss_panel = (
         "<div class='exec-miss-panel'>"
         + _exec_panel_header_html(
@@ -2316,8 +2534,14 @@ def _executive_summary_visual_html(c: FireCorrection) -> str:
             "!",
         )
         + "<div class='exec-panel-body'>"
-        + f"<div class='exec-compass-wrap'>{mini_compass}</div>"
-        + "<p class='exec-visual-caption'>Green = target · Red = impact · Orange = miss distance</p>"
+        + f"<div class='exec-compass-wrap'>{mini_map}</div>"
+        + "<p class='exec-visual-caption'>"
+        "<span class='fc-dot fc-dot-target'></span> Target · "
+        "<span class='fc-dot fc-dot-impact'></span> Impact · "
+        "<span class='fc-dot fc-dot-gun'></span> Artillery · "
+        "<span class='fc-dot fc-dot-drone'></span> Drone · "
+        "<span class='lr-icon lr-pos'>+</span>/<span class='lr-icon lr-neg'>−</span> direction"
+        "</p>"
         + _executive_miss_chips_html(c)
         + "</div></div>"
     )
@@ -2377,12 +2601,14 @@ def format_fire_correction_diagram_html(session: DooafSession) -> str:
         + "<div class='viz-card fc-story-wrap'>"
         "<div class='viz-card-head'>What happened — 3 steps</div>"
         f"<div class='viz-card-body'>{story}</div></div>"
-        + "<div class='fc-diagram-grid-4'>"
-        + _viz("Plan view (North up)", plan)
-        + _viz("Gun line view", gunline)
-        + _viz("Compass miss (target at centre)", compass)
-        + f"<div class='viz-card'>{bars}</div>"
+        + "<div class='fc-diagram-grid fc-diagram-grid-plan'>"
+        + _viz("Plan view (North up)", plan, "fc-plan-viz")
         + "</div>"
+        + "<div class='fc-diagram-grid fc-diagram-grid-maps'>"
+        + _viz("Gun line view", gunline, "fc-gunline-viz")
+        + _viz("Compass miss (target at centre)", compass)
+        + "</div>"
+        + f"<div class='viz-card fc-bars-full'>{bars}</div>"
         + foot
     )
 
@@ -2493,7 +2719,7 @@ def format_executive_summary_html(session: DooafSession) -> str:
         "</div>"
         "<div class='report-executive-body'>"
         + story_lead
-        + _executive_summary_visual_html(c)
+        + _executive_summary_visual_html(session)
         + "</div></section>"
     )
 

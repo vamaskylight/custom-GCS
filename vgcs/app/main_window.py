@@ -4617,6 +4617,12 @@ class MainWindow(QMainWindow):
         else:
             text = f"{dist:.1f} m (C13 locked)"
         try:
+            latlon = self._map_widget.get_c13_lrf_lock_latlon()
+            if latlon is not None and is_locked:
+                text = f"{text} · {latlon[0]:.6f}, {latlon[1]:.6f}"
+        except Exception:
+            pass
+        try:
             self._fields["rangefinder"].setText(text)
             self._apply_state_style(self._fields["rangefinder"], "ok")
         except Exception:

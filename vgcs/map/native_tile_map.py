@@ -478,6 +478,7 @@ class NativeTileMapView(QWidget):
         # Stores lat/lon pairs for OBSERVE -> Target marks (native rendering).
         self._observation_marks: list[tuple[float, float]] = []
         self._geo_referenced_marks: list[tuple[float, float]] = []
+        self._lrf_lock_marker: tuple[float, float] | None = None
         self._dooaf_gun: tuple[float, float] | None = None
         self._dooaf_intended: tuple[float, float] | None = None
         self._dooaf_impact: tuple[float, float] | None = None
@@ -725,6 +726,17 @@ class NativeTileMapView(QWidget):
             self._geo_referenced_marks = self._geo_referenced_marks[-2000:]
         self.update()
 
+    def set_lrf_lock_marker(self, lat: float | None, lon: float | None) -> None:
+        """C13 LRF locked target — single cyan marker on the map."""
+        try:
+            if lat is None or lon is None:
+                self._lrf_lock_marker = None
+            else:
+                self._lrf_lock_marker = (float(lat), float(lon))
+        except Exception:
+            self._lrf_lock_marker = None
+        self.update()
+
     def set_observation_target_track(
         self,
         points: list[tuple[float, float]],
@@ -769,6 +781,7 @@ class NativeTileMapView(QWidget):
         try:
             self._observation_marks.clear()
             self._geo_referenced_marks.clear()
+            self._lrf_lock_marker = None
             self._target_track.clear()
             self._target_track_labels.clear()
         except Exception:
@@ -1185,6 +1198,30 @@ class NativeTileMapView(QWidget):
                 ty = int(c.y()) - th - 6
                 painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
                 painter.setPen(QColor(120, 235, 255))
+                painter.drawText(tx + 4, ty + metrics.ascent() + 2, caption)
+            except Exception:
+                pass
+
+        # C13 LRF locked target (single marker, always latest lock).
+        if self._lrf_lock_marker is not None:
+            try:
+                lat, lon = self._lrf_lock_marker
+                c = self._project(lat, lon, z, fx, fy, w, h)
+                painter.setPen(QPen(QColor(56, 189, 248, 250), 3))
+                painter.setBrush(QColor(56, 189, 248, 120))
+                painter.drawEllipse(c, 8, 8)
+                painter.drawLine(int(c.x() - 14), int(c.y()), int(c.x() + 14), int(c.y()))
+                painter.drawLine(int(c.x()), int(c.y() - 14), int(c.x()), int(c.y() + 14))
+                caption = f"LRF {float(lat):.6f}, {float(lon):.6f}"
+                font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+                painter.setFont(font)
+                metrics = painter.fontMetrics()
+                tw = metrics.horizontalAdvance(caption) + 8
+                th = metrics.height() + 4
+                tx = int(c.x()) + 12
+                ty = int(c.y()) - th - 8
+                painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 210))
+                painter.setPen(QColor(120, 220, 255))
                 painter.drawText(tx + 4, ty + metrics.ascent() + 2, caption)
             except Exception:
                 pass
