@@ -280,7 +280,8 @@ ZOOM_MIN = 1.0
 ZOOM_MAX_PREVIEW = 4.0
 ZOOM_MAX_SKYDROID = 30.0
 ZOOM_STEP_PREVIEW = 0.25
-ZOOM_STEP_SKYDROID = 1.0
+# C13 DZM/MUL use 0.1× absolute steps; coarse 1.0× jumps look blurry on optical zoom.
+ZOOM_STEP_SKYDROID = 0.1
 
 
 class SkydroidCameraControl:
@@ -724,8 +725,18 @@ def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:
     return (ZOOM_MIN, ZOOM_MAX_PREVIEW, ZOOM_STEP_PREVIEW)
 
 
-def camera_preview_applies_digital_zoom(control: object | None) -> bool:
-    """Apply VGCS preview crop-zoom so magnification matches the rail (TOP UDP is best-effort)."""
+def camera_preview_applies_digital_zoom(
+    control: object | None,
+    source_id: str = "",
+) -> bool:
+    """
+    Software crop-zoom when the RTSP feed does not carry hardware magnification.
+
+    C13 day RTSP reflects TOP zoom; thermal stays wide — crop only for thermal.
+    """
+    primary = resolve_camera_control_primary(control)
+    if isinstance(primary, SkydroidCameraControl):
+        return str(source_id or "").strip().lower() == "thermal"
     return True
 
 

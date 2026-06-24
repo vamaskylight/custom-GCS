@@ -2933,8 +2933,17 @@ class MapWidget(QWidget):
     def _video_zoom_limits(self) -> tuple[float, float, float]:
         return camera_zoom_limits(getattr(self, "_camera_control", None))
 
-    def _effective_preview_digital_zoom(self) -> float:
-        if not camera_preview_applies_digital_zoom(getattr(self, "_camera_control", None)):
+    def _effective_preview_digital_zoom(self, source_id: str | None = None) -> float:
+        sid = str(source_id or "").strip()
+        if not sid:
+            try:
+                sid = self._operator_preview_source_id()
+            except Exception:
+                sid = ""
+        if not camera_preview_applies_digital_zoom(
+            getattr(self, "_camera_control", None),
+            sid,
+        ):
             return 1.0
         try:
             return float(getattr(self, "_video_zoom", 1.0))
@@ -2950,7 +2959,7 @@ class MapWidget(QWidget):
             return
         try:
             src.set_recording_preview_transform(
-                digital_zoom=self._effective_preview_digital_zoom(),
+                digital_zoom=self._effective_preview_digital_zoom(sid),
                 apply_digital_zoom=camera_recording_applies_digital_zoom(
                     sid,
                     getattr(self, "_camera_control", None),
@@ -6739,7 +6748,10 @@ class MapWidget(QWidget):
         if not refresh_cache:
             return
 
-        img = self._apply_digital_zoom(img, self._effective_preview_digital_zoom())
+        img = self._apply_digital_zoom(
+            img,
+            self._effective_preview_digital_zoom(self._operator_preview_source_id()),
+        )
         try:
             img2 = img.copy()
         except Exception:
@@ -6790,7 +6802,7 @@ class MapWidget(QWidget):
                 img = img.convertToFormat(QImage.Format.Format_Grayscale8)
         except Exception:
             pass
-        img = self._apply_digital_zoom(img, self._effective_preview_digital_zoom())
+        img = self._apply_digital_zoom(img, self._effective_preview_digital_zoom(sid))
         try:
             img2 = img.copy()
         except Exception:
@@ -9788,7 +9800,7 @@ class MapWidget(QWidget):
             except Exception:
                 prev = 1.0
             zmin, zmax, zstep = self._video_zoom_limits()
-            cur = max(zmin, min(zmax, prev + zstep * float(step)))
+            cur = round(max(zmin, min(zmax, prev + zstep * float(step))), 1)
             if abs(cur - prev) < 1e-6:
                 self._run_js("document.title = 'VGCS Map';")
                 return
