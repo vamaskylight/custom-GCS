@@ -6999,11 +6999,16 @@ class MapWidget(QWidget):
             self._native_pip_last_raw_frame = raw
 
     def _reapply_preview_zoom_now(self) -> None:
-        """Re-crop the cached raw frame when zoom +/- changes (do not wait for next RTSP frame)."""
+        """Re-crop the cached raw frame when zoom +/- changes (thermal software zoom only)."""
         try:
             sid = self._operator_preview_source_id()
         except Exception:
             sid = ""
+        if not camera_preview_applies_digital_zoom(
+            getattr(self, "_camera_control", None),
+            sid,
+        ):
+            return
         raw = None
         cache = getattr(self, "_split_last_raw_images", None) or {}
         if sid and sid in cache:
@@ -9878,7 +9883,7 @@ class MapWidget(QWidget):
             except Exception:
                 pass
             try:
-                # Rail +/- : MAVLink uses ZOOM_TYPE_STEP (real payloads); Skydroid uses absolute TOP level.
+                # Skydroid day: MUL optical (lens); MAVLink: ZOOM_TYPE_STEP; thermal: software crop.
                 self._camera_control.handle_zoom_step(int(step), float(cur))
             except Exception:
                 pass
