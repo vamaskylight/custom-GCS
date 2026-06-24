@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-tear-guard"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-tear-guard2"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -985,6 +985,8 @@ def _ffmpeg_preflags_before_input(
                 )
         if _rtsp_url_is_companion_rtsp(u):
             out.extend(["-thread_queue_size", "512", "-max_delay", "500000"])
+            # Decoder opts must be before `-i` (after `-i` they apply to rawvideo output and fail).
+            out.extend(["-threads", "1"])
         if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
             out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     if _rtsp_url_is_companion_rtsp(str(url or "").strip()):
@@ -2178,9 +2180,6 @@ class RtspSource(QObject):
                             except Exception:
                                 pass
                         vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h, hwaccel=siyi_hw)
-                        post_in: list[str] = []
-                        if companion_rtsp:
-                            post_in.extend(["-threads", "1", "-ec", "favor_inter+deblock"])
                         cmd_base = [
                             "ffmpeg",
                             "-hide_banner",
@@ -2196,7 +2195,6 @@ class RtspSource(QObject):
                             ),
                             "-i",
                             url,
-                            *post_in,
                             "-an",
                             "-vf",
                             vf_rgb,
