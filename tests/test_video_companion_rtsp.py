@@ -216,8 +216,22 @@ def test_natural_outdoor_scene_passes_gop_warmup():
     for y in range(h):
         frame[y, :, 1] = 60 + int((y / h) * 90)
         frame[y, :, 2] = min(255, 140 + int((y / h) * 80))
-    assert _companion_gop_warmup_frame_ok(frame)
+    assert _companion_gop_warmup_frame_ok(frame, source_id="day")
     assert not _rgb_frame_has_structural_tear(frame)
+
+
+def test_thermal_grayscale_passes_relaxed_gop_warmup():
+    h, w = 120, 200
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    gray = (80 + (np.arange(h, dtype=np.uint8)[:, None] % 40)).astype(np.uint8)
+    frame[:, :, 0] = gray
+    frame[:, :, 1] = gray
+    frame[:, :, 2] = gray
+    assert _companion_gop_warmup_frame_ok(
+        frame,
+        source_id="thermal",
+        url="rtsp://192.168.144.108:555/stream=2",
+    )
 
 
 def test_full_frame_macroblock_soup_detected():
