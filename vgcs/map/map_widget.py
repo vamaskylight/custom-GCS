@@ -10624,6 +10624,7 @@ class MapWidget(QWidget):
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = True
         self._clear_lrf_lock_geo()
+        self._notify_companion_gimbal_motion(duration_s=5.0)
         self._capture_lrf_track_ref(float(u), float(v))
         self._sync_lrf_armed_backend(False)
         try:

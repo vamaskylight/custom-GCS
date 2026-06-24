@@ -10,6 +10,7 @@ from vgcs.video.pipeline import (
     _companion_frame_should_hide,
     _companion_hevc_showall_enabled,
     _companion_release_rtsp_host,
+    _companion_transport_after_hevc_glitch,
     _rgb_frame_has_decode_artifacts,
     _rtsp_transport_sequence,
     _rtsp_transport_sequence_with_override,
@@ -82,6 +83,16 @@ def test_transport_override_prefers_udp_after_glitch():
     assert "tcp" in seq
 
 
+def test_hevc_glitch_flips_udp_to_tcp():
+    seq = _rtsp_transport_sequence(C13_URL, "auto")
+    assert _companion_transport_after_hevc_glitch("udp", seq) == "tcp"
+
+
+def test_hevc_glitch_flips_tcp_to_udp():
+    seq = _rtsp_transport_sequence(C13_URL, "auto")
+    assert _companion_transport_after_hevc_glitch("tcp", seq) == "udp"
+
+
 def test_rgb_corrupt_detector():
     h, w = 144, 256
     good = np.zeros((h, w, 3), dtype=np.uint8)
@@ -138,10 +149,10 @@ def test_horizontal_band_artifact_detector():
     assert _rgb_frame_has_decode_artifacts(torn)
 
 
-def test_c13_rtsp_prefers_udp_first():
+def test_c13_rtsp_prefers_tcp_first():
     seq = _rtsp_transport_sequence(C13_URL, "auto")
-    assert seq[0] == "udp"
-    assert "tcp" in seq
+    assert seq[0] == "tcp"
+    assert "udp" in seq
 
 
 def test_companion_rtsp_host_single_owner():
