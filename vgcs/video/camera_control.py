@@ -255,13 +255,18 @@ class CompositeGimbalCameraControl:
         setter = getattr(self._primary, "set_zoom", None)
         if callable(setter):
             setter(float(level))
-        self._queue_mavlink_zoom_level(float(level))
+        if not uses_skydroid_top_camera(self):
+            self._queue_mavlink_zoom_level(float(level))
 
     def handle_zoom_step(self, step: int, ui_level: float) -> None:
         handler = getattr(self._primary, "handle_zoom_step", None)
         if callable(handler):
             handler(int(step), float(ui_level))
-        if self._mavlink is not None and int(step) != 0:
+        if (
+            self._mavlink is not None
+            and int(step) != 0
+            and not uses_skydroid_top_camera(self)
+        ):
             try:
                 self._mavlink.queue_camera_zoom_step(int(step))
             except Exception:
@@ -331,6 +336,8 @@ class SkydroidCameraControl:
         try:
             if int(step) == 0:
                 return
+            # ZMC lens step (PROTOCAL M-address) + absolute DZM/MUL sync for RTSP.
+            self._adapter.camera_zoom_step(int(step))
             lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))
             self._adapter.camera_zoom(lvl)
         except Exception:
@@ -715,6 +722,11 @@ def resolve_camera_control_primary(control: object | None) -> object | None:
         return None
     primary = getattr(control, "_primary", None)
     return primary if primary is not None else control
+
+
+def uses_skydroid_top_camera(control: object | None) -> bool:
+    """True when C13/TOP UDP is the active camera backend (not MAVLink mount zoom)."""
+    return isinstance(resolve_camera_control_primary(control), SkydroidCameraControl)
 
 
 def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:

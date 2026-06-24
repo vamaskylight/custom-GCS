@@ -2547,10 +2547,17 @@ class SkydroidTopUdpAdapter:
                     continue
 
     def _send_zoom_burst(self, level: float) -> None:
-        """Send optical MUL (lens) on active + alternate TOP UDP ports (no reply wait)."""
+        """C13 zoom: DZM absolute + MUL on active + alternate TOP UDP ports."""
         frames = build_zoom_command_burst(level)
         if not frames:
             return
+        try:
+            print(
+                f"[VGCS:skydroid] zoom TOP level={float(level):.1f}× "
+                f"frames={len(frames)} ports=5000,9003,19853"
+            )
+        except Exception:
+            pass
         active_port = int(self._transport._port)
         ports: list[int] = []
         for p in (active_port, *_ZOOM_EXTRA_PORTS):

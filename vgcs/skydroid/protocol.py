@@ -299,16 +299,21 @@ def build_mul_optical_zoom(zoom_x: float) -> bytes:
 
 def build_optical_zoom_frames(zoom_x: float) -> list[bytes]:
     """
-    C13 visible-light optical zoom (lens MUL only).
+    C13 visible-light zoom frames (field firmware on 5000 / 9003 / 19853).
 
-    DZM (§4.7) is *digital* zoom for C12 — do not mix with optical preview zoom.
+    - DZM absolute (#tpPD… / #tpUD…): drives encoder / RTSP magnification on C13.
+    - MUL (#tpPM…): lens optical position (PROTOCAL M-address).
     """
     lvl = max(1.0, min(30.0, float(zoom_x)))
-    return [build_mul_optical_zoom(lvl)]
+    return [
+        build_dzm_absolute_zoom(lvl),
+        build_dzm_absolute_zoom_ud(lvl),
+        build_mul_optical_zoom(lvl),
+    ]
 
 
 def build_zoom_command_burst(zoom_x: float) -> list[bytes]:
-    """Backward-compatible alias — optical MUL only (real lens zoom)."""
+    """All C13 zoom frames for one UI level."""
     return build_optical_zoom_frames(zoom_x)
 
 
@@ -475,11 +480,12 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
 
     if cmd in ("CAM_ZOOM", "CAM_Z"):
         level = float(p.get("level", p.get("zoom", 1.0)) or 1.0)
-        return build_mul_optical_zoom(level)
+        return build_dzm_absolute_zoom(level)
 
     if cmd == "ZOOM_BURST":
+        # Worker expands to full C13 burst (DZM + MUL).
         level = float(p.get("level", 1.0) or 1.0)
-        return build_mul_optical_zoom(level)
+        return build_dzm_absolute_zoom(level)
 
     if cmd == "ZMC":
         return build_zmc_zoom(str(p.get("action", "stop")))
