@@ -11,6 +11,7 @@ from vgcs.video.camera_control import (
     camera_preview_applies_digital_zoom,
     camera_recording_applies_digital_zoom,
     camera_zoom_limits,
+    uses_skydroid_top_camera,
 )
 
 
@@ -43,6 +44,12 @@ def test_composite_wrapper_uses_skydroid_zoom_limits() -> None:
     assert zstep == ZOOM_STEP_SKYDROID == 0.1
     assert camera_preview_applies_digital_zoom(wrapped, "day") is False
     assert camera_preview_applies_digital_zoom(wrapped, "thermal") is True
+
+
+def test_composite_skydroid_skips_mavlink_zoom_step() -> None:
+    inner = object.__new__(SkydroidCameraControl)
+    wrapped = CompositeGimbalCameraControl(inner, object())  # non-None mavlink placeholder
+    assert uses_skydroid_top_camera(wrapped) is True
 
 
 def test_recording_digital_zoom_only_for_thermal() -> None:
