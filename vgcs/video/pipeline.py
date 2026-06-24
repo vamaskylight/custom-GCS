@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-tear-guard2"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-tear-guard3"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -567,11 +567,25 @@ def _companion_corrupt_streak_reconnect_enabled() -> bool:
 
 def _companion_gop_warmup_frames() -> int:
     """Consecutive artifact-free frames required before showing companion preview."""
-    raw = str(os.environ.get("VGCS_COMPANION_GOP_WARMUP", "5") or "5").strip()
+    raw = str(os.environ.get("VGCS_COMPANION_GOP_WARMUP", "2") or "2").strip()
     try:
         return max(1, min(30, int(raw)))
     except ValueError:
-        return 5
+        return 2
+
+
+def _companion_gop_warmup_frame_ok(arr: "np.ndarray") -> bool:
+    """
+    Minimal warmup gate — only obvious neon tear colors.
+
+    Structural / regional checks false-positive on normal outdoor scenes (sky vs trees)
+    and were blocking preview forever.
+    """
+    if not HAS_NUMPY or np is None:
+        return True
+    return not _rgb_frame_region_has_decode_artifacts(
+        arr, strict=False, regional=False, colors_only=True
+    )
 
 
 def _rgb_frame_looks_hevc_corrupt(
@@ -671,16 +685,16 @@ def _rgb_frame_has_structural_tear(arr: "np.ndarray") -> bool:
     g = arr[:, :, 1].astype(np.float32)
     b = arr[:, :, 2].astype(np.float32)
     gray = 0.299 * r + 0.587 * g + 0.114 * b
+    magenta = (r > 165) & (g < 95) & (b > 165)
     mid = h // 2
     top = gray[:mid, :]
     bot = gray[mid:, :]
     top_std = float(top.std())
     bot_std = float(bot.std())
-    if bot_std > max(22.0, top_std * 2.2) and bot_std > top_std + 12.0:
-        return True
     bot_extreme = float(((bot < 30.0) | (bot > 225.0)).sum()) / float(bot.size)
     top_extreme = float(((top < 30.0) | (top > 225.0)).sum()) / float(top.size)
-    if bot_extreme > 0.10 and bot_extreme > max(0.04, top_extreme * 2.0):
+    # B/W digital noise band — not natural ground texture.
+    if bot_extreme > 0.12 and bot_extreme > max(0.04, top_extreme * 2.5):
         return True
     row_mean = gray.mean(axis=1)
     diffs = np.abs(np.diff(row_mean))
@@ -703,8 +717,9 @@ def _rgb_frame_has_structural_tear(arr: "np.ndarray") -> bool:
         if block_vars:
             med_v = float(np.median(block_vars))
             max_v = float(np.max(block_vars))
-            if max_v > 40.0 and max_v > med_v * 2.6 and med_v > 7.0:
-                return True
+            if max_v > 55.0 and max_v > med_v * 3.2 and med_v > 10.0:
+                if bot_extreme > 0.06 or float(magenta.sum()) / float(h * w) > 0.02:
+                    return True
     return False
 
 
@@ -713,6 +728,7 @@ def _rgb_frame_region_has_decode_artifacts(
     *,
     strict: bool = True,
     regional: bool = False,
+    colors_only: bool = False,
 ) -> bool:
     """Artifact heuristics on one RGB region (full frame or lower band)."""
     if not HAS_NUMPY or np is None:
@@ -735,8 +751,10 @@ def _rgb_frame_region_has_decode_artifacts(
     green_tear = (g > 185) & (r < 80) & (b < 80)
     if float(green_tear.sum()) / pixels > green_thr:
         return True
-    # Cyan / blue macroblock patches (common in C13 HEVC tears).
-    cyan_tear = (b > 175) & (g > 120) & (r < 130)
+    if colors_only:
+        return False
+    # Cyan / blue macroblock patches (common in C13 HEVC tears; not natural sky).
+    cyan_tear = (b > 188) & (g > 155) & (r < 50)
     cyan_thr = 0.035 if (strict and regional) else (0.05 if strict else 0.12)
     if float(cyan_tear.sum()) / pixels > cyan_thr:
         return True
@@ -990,8 +1008,8 @@ def _ffmpeg_preflags_before_input(
         if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
             out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     if _rtsp_url_is_companion_rtsp(str(url or "").strip()):
-        # Do not use ignore_err — it forces corrupt HEVC macroblocks into rawvideo.
-        out.extend(["-err_detect", "careful"])
+        # ignore_err: FFmpeg still outputs frames; Python quality gate hides tears.
+        out.extend(["-err_detect", "ignore_err"])
     else:
         out.extend(["-err_detect", "ignore_err"])
     if (
@@ -2395,12 +2413,7 @@ class RtspSource(QObject):
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
                                     if companion_rtsp and not _companion_hevc_showall_enabled():
                                         if not session_gop_ready:
-                                            hide_warm, _ = _companion_frame_should_hide(
-                                                arr,
-                                                None,
-                                                motion_preview=False,
-                                            )
-                                            if hide_warm:
+                                            if not _companion_gop_warmup_frame_ok(arr):
                                                 clean_warmup_streak = 0
                                                 corrupt_skip_streak += 1
                                                 if corrupt_skip_streak in (1, 30, 90):
