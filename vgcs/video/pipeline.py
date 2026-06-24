@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-hevc-tcp-fallback"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-hold-gop"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -330,8 +330,11 @@ def _rtsp_transport_sequence(url: str, mode: str) -> tuple[str | None, ...]:
         if str(os.environ.get("VGCS_SIYI_RTSP_TCP_FIRST", "0") or "0").strip() == "1":
             return ("tcp", "udp")
         return ("udp", "tcp")
-    # Skydroid C13 (stream=1 / stream=2): TCP interleaved first — UDP RTP loses HEVC ref
-    # frames on Wi‑Fi (POC/RPS macroblock tears). Set VGCS_C13_RTSP_UDP_FIRST=1 for legacy UDP-first.
+    # Skydroid C13 (stream=1 / stream=2): TCP interleaved only by default.
+    # UDP RTP loses HEVC reference frames on Wi‑Fi; flipping transport mid-stream
+    # reopens RTSP mid-GOP and makes POC/RPS tears worse.
+    # VGCS_C13_RTSP_UDP_FALLBACK=1 → try UDP after TCP fails.
+    # VGCS_C13_RTSP_UDP_FIRST=1 → legacy UDP-first order.
     if m == "auto" and _rtsp_url_is_companion_link_subnet(raw):
         try:
             path = (urlparse(raw).path or "").lower()
@@ -340,7 +343,9 @@ def _rtsp_transport_sequence(url: str, mode: str) -> tuple[str | None, ...]:
         if "stream=" in path or "/stream" in path:
             if str(os.environ.get("VGCS_C13_RTSP_UDP_FIRST", "0") or "0").strip() == "1":
                 return ("udp", "tcp")
-            return ("tcp", "udp")
+            if str(os.environ.get("VGCS_C13_RTSP_UDP_FALLBACK", "0") or "0").strip() == "1":
+                return ("tcp", "udp")
+            return ("tcp",)
     return _rtsp_transport_order_auto(raw)
 
 
@@ -546,14 +551,18 @@ def _rtsp_transport_sequence_with_override(
 def _companion_transport_after_hevc_glitch(
     current: str | None, transport_seq: tuple[str | None, ...]
 ) -> str | None:
-    """Flip RTP mode after HEVC POC/RPS loss (UDP packet loss → TCP; TCP stall → UDP)."""
+    """After HEVC POC/RPS loss on UDP, stick to TCP. Never flip TCP → UDP (reopen mid-GOP)."""
     cur = str(current or "").strip().lower()
     alts = {str(t).strip().lower() for t in transport_seq if t}
     if cur == "udp" and "tcp" in alts:
         return "tcp"
-    if cur == "tcp" and "udp" in alts:
-        return "udp"
     return None
+
+
+def _companion_corrupt_streak_reconnect_enabled() -> bool:
+    """Companion preview: hiding corrupt frames is enough; reconnect mid-GOP worsens HEVC."""
+    raw = str(os.environ.get("VGCS_COMPANION_CORRUPT_RECONNECT", "0") or "0").strip().lower()
+    return raw in ("1", "on", "true", "yes")
 
 
 def _rgb_frame_looks_hevc_corrupt(
@@ -626,33 +635,72 @@ def _rgb_frame_has_decode_artifacts(
     h, w, _ = arr.shape
     if h < 8 or w < 8:
         return False
+    if _rgb_frame_region_has_decode_artifacts(arr, strict=strict):
+        return True
+    # Field captures often show tears only in the lower half; global ratios miss them.
+    band = max(8, int(h * 0.45))
+    if band < h and _rgb_frame_region_has_decode_artifacts(
+        arr[h - band :, :, :], strict=strict, regional=True
+    ):
+        return True
+    return False
+
+
+def _rgb_frame_region_has_decode_artifacts(
+    arr: "np.ndarray",
+    *,
+    strict: bool = True,
+    regional: bool = False,
+) -> bool:
+    """Artifact heuristics on one RGB region (full frame or lower band)."""
+    if not HAS_NUMPY or np is None:
+        return False
+    h, w, _ = arr.shape
+    if h < 4 or w < 4:
+        return False
     r = arr[:, :, 0].astype(np.int16)
     g = arr[:, :, 1].astype(np.int16)
     b = arr[:, :, 2].astype(np.int16)
     pixels = float(h * w)
+    magenta_thr = 0.04 if (strict and regional) else (0.06 if strict else 0.14)
+    green_thr = 0.04 if (strict and regional) else (0.06 if strict else 0.14)
     # YUV plane misalignment: neon magenta (high R+B, low G).
-    magenta = (r > 175) & (g < 85) & (b > 175)
+    magenta = (r > 165) & (g < 95) & (b > 165)
     magenta_ratio = float(magenta.sum()) / pixels
-    magenta_thr = 0.06 if strict else 0.14
     if magenta_ratio > magenta_thr:
         return True
     # Green macroblock smear.
-    green_tear = (g > 195) & (r < 70) & (b < 70)
-    green_thr = 0.06 if strict else 0.14
+    green_tear = (g > 185) & (r < 80) & (b < 80)
     if float(green_tear.sum()) / pixels > green_thr:
         return True
-    # Thick horizontal tear bands (common in the user's field captures).
-    row_magenta = magenta.mean(axis=1)
-    row_thr = 0.30 if strict else 0.45
-    if int((row_magenta > row_thr).sum()) >= (2 if strict else 3):
+    # Cyan / blue macroblock patches (common in C13 HEVC tears).
+    cyan_tear = (b > 175) & (g > 120) & (r < 130)
+    cyan_thr = 0.035 if (strict and regional) else (0.05 if strict else 0.12)
+    if float(cyan_tear.sum()) / pixels > cyan_thr:
         return True
-    # Horizontal noise bands / macroblock smear (white-gray grid in lower frame).
+    # Thick horizontal tear bands.
+    row_magenta = magenta.mean(axis=1)
+    row_thr = 0.22 if (strict and regional) else (0.30 if strict else 0.45)
+    if int((row_magenta > row_thr).sum()) >= (1 if regional else (2 if strict else 3)):
+        return True
+    # Horizontal noise / macroblock smear (white-gray or colored chaos in lower band).
     gray = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
     row_std = gray.std(axis=1)
-    third = max(4, h // 3)
-    top_std = float(np.median(row_std[:third]))
-    bot_std = float(np.median(row_std[h - third :]))
-    if bot_std > max(14.0, top_std * 2.5) and bot_std > top_std + 8.0:
+    if h >= 12:
+        top_std = float(np.median(row_std[: max(2, h // 3)]))
+        bot_std = float(np.median(row_std[h - max(2, h // 3) :]))
+        if regional:
+            if bot_std > max(12.0, top_std * 1.8) and bot_std > top_std + 5.0:
+                return True
+        elif bot_std > max(14.0, top_std * 2.5) and bot_std > top_std + 8.0:
+            return True
+    # High local chroma variance (patchy macroblock soup) — not uniform natural scenes.
+    chroma_spread = (np.abs(r - g) + np.abs(g - b)).astype(np.float32)
+    if (
+        magenta_ratio > 0.015
+        and float(np.percentile(chroma_spread, 92)) > 160.0
+        and float(chroma_spread.std()) > 35.0
+    ):
         return True
     return False
 
@@ -664,8 +712,8 @@ def _companion_frame_should_hide(
     motion_preview: bool = False,
 ) -> tuple[bool, str]:
     """Return (hide, reason) for companion preview quality gate."""
-    strict_art = not motion_preview
-    if _rgb_frame_has_decode_artifacts(arr, strict=strict_art):
+    # Always reject macroblock tears — motion preview only skips stale-frame compare.
+    if _rgb_frame_has_decode_artifacts(arr, strict=True):
         return True, "artifact"
     if motion_preview:
         return False, ""
@@ -1985,6 +2033,11 @@ class RtspSource(QObject):
                     "[VGCS:video] companion HEVC: frozen-duplicate reconnect disabled "
                     "(set VGCS_COMPANION_FROZEN_RECONNECT=1 to enable)"
                 )
+            if not _companion_corrupt_streak_reconnect_enabled():
+                print(
+                    "[VGCS:video] companion HEVC: corrupt-streak reconnect disabled "
+                    "(hold last good preview; set VGCS_COMPANION_CORRUPT_RECONNECT=1 to enable)"
+                )
             if siyi_url:
                 mode = "hwaccel=auto" if siyi_hw else "sw (auto codec)"
                 print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
@@ -2155,6 +2208,7 @@ class RtspSource(QObject):
                         corrupt_skip_logged = False
                         corrupt_skip_streak = 0
                         last_good_arr: "np.ndarray | None" = None
+                        session_gop_ready = not companion_rtsp
                         self._ffmpeg_last_raw_sig = None
                         self._ffmpeg_last_raw_change_mono = time.monotonic()
                         session_stop = threading.Event()
@@ -2264,6 +2318,33 @@ class RtspSource(QObject):
                                     assert np is not None
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
                                     if companion_rtsp and not _companion_hevc_showall_enabled():
+                                        if not session_gop_ready:
+                                            hide_warm, _ = _companion_frame_should_hide(
+                                                arr,
+                                                None,
+                                                motion_preview=False,
+                                            )
+                                            if hide_warm:
+                                                corrupt_skip_streak += 1
+                                                if corrupt_skip_streak in (1, 30, 90):
+                                                    try:
+                                                        print(
+                                                            "[VGCS:video] companion HEVC: "
+                                                            "waiting for clean GOP before preview "
+                                                            f"(skipped={corrupt_skip_streak})"
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                                continue
+                                            session_gop_ready = True
+                                            corrupt_skip_streak = 0
+                                            try:
+                                                print(
+                                                    "[VGCS:video] companion HEVC: clean GOP — "
+                                                    "preview unlocked"
+                                                )
+                                            except Exception:
+                                                pass
                                         hide, why = _companion_frame_should_hide(
                                             arr,
                                             last_good_arr,
@@ -2271,7 +2352,7 @@ class RtspSource(QObject):
                                         )
                                         if hide:
                                             corrupt_skip_streak += 1
-                                            if corrupt_skip_streak in (1, 12, 24, 36):
+                                            if corrupt_skip_streak in (1, 30, 90, 180):
                                                 try:
                                                     print(
                                                         "[VGCS:video] companion HEVC: "
@@ -2281,8 +2362,11 @@ class RtspSource(QObject):
                                                     )
                                                 except Exception:
                                                     pass
-                                            streak_limit = 999 if motion_preview else 120
-                                            if corrupt_skip_streak >= streak_limit:
+                                            if (
+                                                _companion_corrupt_streak_reconnect_enabled()
+                                                and not motion_preview
+                                                and corrupt_skip_streak >= 120
+                                            ):
                                                 try:
                                                     print(
                                                         "[VGCS:video] companion HEVC: "
@@ -2536,8 +2620,9 @@ class RtspSource(QObject):
                                             )
                                         except Exception:
                                             pass
-                                    _siyi_hevc_glitch_release_sleep(
-                                        brief_session=frames_this_session < 30
+                                    # Short cooldown only — reconnect mid-GOP causes more POC loss.
+                                    time.sleep(
+                                        _siyi_session_cooldown_s(tail_b, reconnect_delay)
                                     )
                                 elif _siyi_rtsp_camera_busy(tail_b):
                                     _siyi_camera_release_sleep(
