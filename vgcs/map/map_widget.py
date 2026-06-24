@@ -148,6 +148,7 @@ from vgcs.video.pipeline import (
     notify_companion_preview_motion,
     notify_companion_app_background,
     notify_companion_app_foreground,
+    notify_companion_feed_switch,
     release_all_companion_rtsp_hosts,
     release_companion_rtsp_host,
     set_companion_decode_gate,
@@ -4233,6 +4234,11 @@ class MapWidget(QWidget):
             print(f"[VGCS:video] companion feed switch {cur!r} -> {sid!r} ({reason})")
         except Exception:
             pass
+        try:
+            notify_companion_feed_switch(duration_s=12.0)
+            notify_companion_preview_motion(duration_s=8.0)
+        except Exception:
+            pass
         for _osid, src in sources.items():
             try:
                 if hasattr(src, "companion_hard_stop_decode"):
@@ -4299,7 +4305,7 @@ class MapWidget(QWidget):
             except Exception:
                 pass
 
-        QTimer.singleShot(450, _finish_switch)
+        QTimer.singleShot(2800, _finish_switch)
 
     def _sync_native_thermal_feed_button(self) -> None:
         btn = getattr(self, "_btn_native_thermal", None)

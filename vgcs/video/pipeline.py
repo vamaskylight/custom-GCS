@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview4"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview5"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -27,6 +27,8 @@ _COMPANION_RTSP_HOST_OWNER: dict[str, str] = {}
 _companion_preview_motion_until: float = 0.0
 # App minimized / alt-tab — pause RTSP reconnect churn until foreground.
 _companion_app_background_mono: float = 0.0
+# Day ↔ thermal IR switch — never block decode on background flicker during handoff.
+_companion_feed_switch_until: float = 0.0
 
 # MapWidget registers which source ids may open FFmpeg (single view = day only).
 _companion_decode_gate: Callable[[str], bool] | None = None
@@ -68,7 +70,26 @@ def notify_companion_app_foreground() -> None:
             pass
 
 
+def notify_companion_feed_switch(*, duration_s: float = 12.0) -> None:
+    """Day ↔ thermal handoff — keep decode alive despite brief window inactive states."""
+    global _companion_feed_switch_until
+    _companion_feed_switch_until = time.monotonic() + max(2.0, float(duration_s))
+    try:
+        print(
+            f"[VGCS:video] companion feed switch: RTSP handoff "
+            f"(hold {float(duration_s):.0f}s, ignore background pause)"
+        )
+    except Exception:
+        pass
+
+
+def _companion_feed_switch_active() -> bool:
+    return time.monotonic() < float(_companion_feed_switch_until or 0.0)
+
+
 def _companion_app_is_background() -> bool:
+    if _companion_feed_switch_active():
+        return False
     return float(_companion_app_background_mono or 0.0) > 0.0
 
 
@@ -600,13 +621,32 @@ def _companion_corrupt_streak_reconnect_enabled() -> bool:
     return raw in ("1", "on", "true", "yes")
 
 
-def _companion_gop_warmup_frames() -> int:
+def _companion_is_thermal_source(source_id: str, url: str) -> bool:
+    if str(source_id or "").strip().lower() == "thermal":
+        return True
+    u = str(url or "").strip().lower()
+    return ":555/" in u or "stream=2" in u
+
+
+def _companion_gop_warmup_frames(*, source_id: str = "", url: str = "") -> int:
     """Consecutive artifact-free frames required before showing companion preview."""
-    raw = str(os.environ.get("VGCS_COMPANION_GOP_WARMUP", "2") or "2").strip()
+    if _companion_is_thermal_source(source_id, url):
+        raw = str(os.environ.get("VGCS_COMPANION_THERMAL_GOP_WARMUP", "1") or "1").strip()
+    else:
+        raw = str(os.environ.get("VGCS_COMPANION_GOP_WARMUP", "2") or "2").strip()
     try:
         return max(1, min(30, int(raw)))
     except ValueError:
-        return 2
+        return 1 if _companion_is_thermal_source(source_id, url) else 2
+
+
+def _companion_gop_warmup_timeout_frames(*, source_id: str = "", url: str = "") -> int:
+    default = "45" if _companion_is_thermal_source(source_id, url) else "150"
+    raw = str(os.environ.get("VGCS_COMPANION_THERMAL_GOP_TIMEOUT", default) or default).strip()
+    try:
+        return max(20, min(600, int(raw)))
+    except ValueError:
+        return int(default)
 
 
 def _companion_rgb_sample_for_qc(arr: "np.ndarray", *, max_w: int = 320) -> "np.ndarray":
@@ -620,12 +660,21 @@ def _companion_rgb_sample_for_qc(arr: "np.ndarray", *, max_w: int = 320) -> "np.
     return arr[::step, ::step, :]
 
 
-def _companion_gop_warmup_frame_ok(arr: "np.ndarray") -> bool:
-    """Warmup uses the same gate as live preview (no corrupt-vs-last-good compare)."""
+def _companion_gop_warmup_frame_ok(
+    arr: "np.ndarray",
+    *,
+    source_id: str = "",
+    url: str = "",
+) -> bool:
+    """Warmup gate — thermal IR uses a gentle check (grayscale noise ≠ macroblock tears)."""
     if not HAS_NUMPY or np is None:
         return True
     sample = _companion_rgb_sample_for_qc(arr)
-    hide, _ = _companion_frame_should_hide(sample, None, motion_preview=False)
+    if _companion_is_thermal_source(source_id, url):
+        return not _rgb_frame_region_has_decode_artifacts(
+            sample, strict=False, regional=False, colors_only=True
+        )
+    hide, _ = _companion_frame_should_hide(sample, None, motion_preview=False, thermal=False)
     return not hide
 
 
@@ -953,9 +1002,22 @@ def _companion_frame_should_hide(
     last_good: "np.ndarray | None",
     *,
     motion_preview: bool = False,
+    thermal: bool = False,
 ) -> tuple[bool, str]:
     """Return (hide, reason) for companion preview quality gate."""
     sample = _companion_rgb_sample_for_qc(arr)
+    if thermal:
+        if _rgb_frame_region_has_decode_artifacts(
+            sample, strict=False, regional=False, colors_only=True
+        ):
+            return True, "artifact"
+        if motion_preview:
+            return False, ""
+        if last_good is not None:
+            lg = _companion_rgb_sample_for_qc(last_good)
+            if lg.shape == sample.shape and _rgb_frame_looks_hevc_corrupt(sample, lg):
+                return True, "corrupt"
+        return False, ""
     # Always reject macroblock tears — motion preview only skips stale-frame compare.
     if _rgb_frame_has_decode_artifacts(sample, strict=True):
         return True, "artifact"
@@ -2155,6 +2217,8 @@ class RtspSource(QObject):
         global _COMPANION_RTSP_LAST_OPEN_MONO
         streak = int(getattr(self, "_siyi_138_fail_streak", 0) or 0)
         min_gap = 5.0
+        if _companion_feed_switch_active():
+            min_gap = 2.0
         if streak >= 2 or _siyi_rtsp_camera_busy(tail_hint):
             min_gap = min(25.0, 8.0 + streak * 2.0)
         with _COMPANION_RTSP_OPEN_LOCK:
@@ -2297,9 +2361,11 @@ class RtspSource(QObject):
                     "(hold last good preview; set VGCS_COMPANION_CORRUPT_RECONNECT=1 to enable)"
                 )
             try:
+                th_label = "thermal" if _companion_is_thermal_source(self.source_id, url) else "day"
                 print(
                     f"[VGCS:video] companion HEVC: GOP warmup "
-                    f"{_companion_gop_warmup_frames()} clean frame(s) before preview"
+                    f"{_companion_gop_warmup_frames(source_id=self.source_id, url=url)} "
+                    f"clean frame(s) before preview ({th_label})"
                 )
             except Exception:
                 pass
@@ -2477,6 +2543,7 @@ class RtspSource(QObject):
                         last_good_arr: "np.ndarray | None" = None
                         session_gop_ready = not companion_rtsp
                         clean_warmup_streak = 0
+                        thermal_feed = _companion_is_thermal_source(self.source_id, url)
                         self._ffmpeg_last_raw_sig = None
                         self._ffmpeg_last_raw_change_mono = time.monotonic()
                         session_stop = threading.Event()
@@ -2587,7 +2654,27 @@ class RtspSource(QObject):
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
                                     if companion_rtsp and not _companion_hevc_showall_enabled():
                                         if not session_gop_ready:
-                                            if not _companion_gop_warmup_frame_ok(arr):
+                                            warmup_timeout = _companion_gop_warmup_timeout_frames(
+                                                source_id=self.source_id, url=url
+                                            )
+                                            if corrupt_skip_streak >= warmup_timeout:
+                                                session_gop_ready = True
+                                                clean_warmup_streak = 0
+                                                corrupt_skip_streak = 0
+                                                try:
+                                                    tag = "thermal" if thermal_feed else "day"
+                                                    print(
+                                                        "[VGCS:video] companion HEVC: "
+                                                        f"GOP warmup timeout — preview unlocked "
+                                                        f"({tag}, waited {warmup_timeout} frames)"
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            elif not _companion_gop_warmup_frame_ok(
+                                                arr,
+                                                source_id=self.source_id,
+                                                url=url,
+                                            ):
                                                 clean_warmup_streak = 0
                                                 corrupt_skip_streak += 1
                                                 if corrupt_skip_streak in (1, 30, 90):
@@ -2600,31 +2687,35 @@ class RtspSource(QObject):
                                                     except Exception:
                                                         pass
                                                 continue
-                                            clean_warmup_streak += 1
-                                            need = _companion_gop_warmup_frames()
-                                            if clean_warmup_streak < need:
-                                                if clean_warmup_streak in (1, need - 1):
-                                                    try:
-                                                        print(
-                                                            "[VGCS:video] companion HEVC: "
-                                                            f"GOP warmup {clean_warmup_streak}/{need}"
-                                                        )
-                                                    except Exception:
-                                                        pass
-                                                continue
-                                            session_gop_ready = True
-                                            corrupt_skip_streak = 0
-                                            try:
-                                                print(
-                                                    "[VGCS:video] companion HEVC: clean GOP — "
-                                                    f"preview unlocked ({need} frames)"
+                                            else:
+                                                clean_warmup_streak += 1
+                                                need = _companion_gop_warmup_frames(
+                                                    source_id=self.source_id, url=url
                                                 )
-                                            except Exception:
-                                                pass
+                                                if clean_warmup_streak < need:
+                                                    if clean_warmup_streak in (1, need - 1):
+                                                        try:
+                                                            print(
+                                                                "[VGCS:video] companion HEVC: "
+                                                                f"GOP warmup {clean_warmup_streak}/{need}"
+                                                            )
+                                                        except Exception:
+                                                            pass
+                                                    continue
+                                                session_gop_ready = True
+                                                corrupt_skip_streak = 0
+                                                try:
+                                                    print(
+                                                        "[VGCS:video] companion HEVC: clean GOP — "
+                                                        f"preview unlocked ({need} frames)"
+                                                    )
+                                                except Exception:
+                                                    pass
                                         hide, why = _companion_frame_should_hide(
                                             arr,
                                             last_good_arr,
                                             motion_preview=motion_preview,
+                                            thermal=thermal_feed,
                                         )
                                         if hide:
                                             corrupt_skip_streak += 1
@@ -2633,6 +2724,7 @@ class RtspSource(QObject):
                                                     last_good_arr,
                                                     None,
                                                     motion_preview=False,
+                                                    thermal=thermal_feed,
                                                 )
                                                 if lg_hide or corrupt_skip_streak >= 45:
                                                     last_good_arr = None
