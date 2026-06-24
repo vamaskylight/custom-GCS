@@ -3898,6 +3898,13 @@ class MapWidget(QWidget):
                         p.drawRect(int(dx) + 2, int(dy) + 2, int(cw) - 4, int(ch) - 4)
                     except Exception:
                         pass
+                    empty_label = f"Cell {slot}\nEmpty"
+                    if (
+                        sid == "thermal"
+                        and self._companion_has_dual_feed()
+                        and self._uses_companion_rtsp()
+                    ):
+                        empty_label = "Cell 2\nThermal (IR)"
                     try:
                         font_e = QFont("Segoe UI", 14, QFont.Weight.DemiBold)
                         p.setFont(font_e)
@@ -3908,7 +3915,7 @@ class MapWidget(QWidget):
                             int(cw),
                             int(ch),
                             Qt.AlignmentFlag.AlignCenter,
-                            f"Cell {slot}\nEmpty",
+                            empty_label,
                         )
                     except Exception:
                         pass
@@ -3958,17 +3965,77 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _best_native_preview_frame(self) -> QImage | None:
+        """Latest frame suitable for single-view repaint or split cache seed."""
+        for candidate in (
+            getattr(self, "_native_pip_last_source_frame", None),
+            getattr(self, "_native_video_last", None),
+        ):
+            if isinstance(candidate, QImage) and not candidate.isNull() and candidate.width() > 0:
+                return candidate
+        cache = getattr(self, "_split_last_images", None) or {}
+        for sid in ("day", "thermal"):
+            im = cache.get(sid)
+            if isinstance(im, QImage) and not im.isNull() and im.width() > 0:
+                return im
+        for im in cache.values():
+            if isinstance(im, QImage) and not im.isNull() and im.width() > 0:
+                return im
+        return None
+
+    def _apply_native_split_mode_changed(self, enabled: bool) -> None:
+        """Repaint native PiP/fullscreen after SPLIT rail toggle (single ↔ 2×2)."""
+        if not isinstance(getattr(self, "_split_last_images", None), dict):
+            self._split_last_images = {}
+        if enabled:
+            vp = getattr(self, "_video", None)
+            if vp is not None and bool(getattr(self, "_video_preview_enabled", False)):
+                try:
+                    self._connect_video_pipeline_frame_slots(vp)
+                    self._start_video_decode_sources(vp)
+                except Exception:
+                    pass
+            self._seed_split_cache_from_last_frame()
+            try:
+                self._layout_native_video_preview()
+                self._render_native_split_preview()
+                QTimer.singleShot(0, self._retry_native_video_pixmap)
+            except Exception:
+                pass
+            return
+        self._split_fullscreen_source_id = None
+        self._split_layout_snapshot = None
+        self._split_pip_hit = None
+        try:
+            vp0 = getattr(self, "_video", None)
+            if vp0 is not None:
+                self._stop_idle_video_decode_sources(vp0)
+        except Exception:
+            pass
+        im = self._best_native_preview_frame()
+        try:
+            self._layout_native_video_preview()
+            if isinstance(im, QImage) and not im.isNull():
+                self._native_video_last = im
+                self._set_native_video_pip_placeholder(False)
+                self._render_native_video_preview(im)
+            elif self._native_video_last.isNull():
+                self._set_native_video_pip_placeholder(True)
+        except Exception:
+            pass
+
     def _seed_split_cache_from_last_frame(self) -> None:
         """After enabling split, paint immediately from the last single-view frame (avoids blank until next tick)."""
         if not bool(getattr(self, "_video_split_enabled", False)):
             return
         try:
-            im = getattr(self, "_native_video_last", None)
+            im = self._best_native_preview_frame()
             if not isinstance(im, QImage) or im.isNull():
                 return
             c = getattr(self, "_split_last_images", None)
             if c is None:
-                return
+                self._split_last_images = {}
+                c = self._split_last_images
             vp = getattr(self, "_video", None)
             if vp is not None:
                 keys = list(vp.sources().keys())
@@ -6668,6 +6735,27 @@ class MapWidget(QWidget):
             self._split_last_images[str(source_id)] = img2
         except Exception:
             pass
+
+        try:
+            vp_act = getattr(self, "_video", None)
+            active_sid = str(vp_act.active_source_id() or "").strip() if vp_act is not None else ""
+        except Exception:
+            active_sid = ""
+        if active_sid and str(source_id) == active_sid:
+            try:
+                self._native_pip_last_source_frame = img2
+            except Exception:
+                pass
+        if not bool(getattr(self, "_video_gui_logged_frame", False)):
+            self._video_gui_logged_frame = True
+            try:
+                print(
+                    "[VGCS:video] GUI preview receiving frames "
+                    f"(split=True source={source_id!r} swapped="
+                    f"{bool(getattr(self, '_video_swapped', False))})"
+                )
+            except Exception:
+                pass
 
         # C13 IR switch: when split/fullscreen, paint the active feed immediately (not stale day).
         try:
@@ -9600,31 +9688,16 @@ class MapWidget(QWidget):
                     self._run_js("if (window.setNativeHudMode) setNativeHudMode(false);")
                     # Do not clear fullscreen swap: split in PiP stays PiP; split in fullscreen stays fullscreen.
                     self._start_video_preview(reset_swapped=False)
-                    try:
-                        self._seed_split_cache_from_last_frame()
-                        self._layout_native_video_preview()
-                        self._push_video_preview_any_to_overlay()
-                        self._render_native_split_preview()
-                        QTimer.singleShot(0, self._retry_native_video_pixmap)
-                    except Exception:
-                        pass
+                    self._apply_native_split_mode_changed(True)
+                    self._push_video_preview_any_to_overlay()
                 else:
-                    self._split_fullscreen_source_id = None
-                    self._split_layout_snapshot = None
-                    self._split_pip_hit = None
-                    try:
-                        vp0 = getattr(self, "_video", None)
-                        if vp0 is not None:
-                            self._stop_idle_video_decode_sources(vp0)
-                    except Exception:
-                        pass
                     self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
                     self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
                     # Force UI to re-render in single mode even if the underlying frame hasn't changed.
                     self._last_video_pushed = ""
                     self._run_js("clearVideoPreviewGrid();")
                     self._run_js("setVideoPreviewMode('single');")
-                    # Immediately repaint a single frame (don't wait for next timer tick).
+                    self._apply_native_split_mode_changed(False)
                     try:
                         self._push_video_preview_any_to_overlay()
                     except Exception:
