@@ -730,13 +730,11 @@ def camera_preview_applies_digital_zoom(
     source_id: str = "",
 ) -> bool:
     """
-    Software crop-zoom when the RTSP feed does not carry hardware magnification.
+    Software crop-zoom on the preview so rail +/- always has immediate visual feedback.
 
-    C13 day RTSP reflects TOP zoom; thermal stays wide — crop only for thermal.
+    C13 TOP/RTSP hardware zoom is best-effort and often lags; the UI level drives preview.
     """
-    primary = resolve_camera_control_primary(control)
-    if isinstance(primary, SkydroidCameraControl):
-        return str(source_id or "").strip().lower() == "thermal"
+    _ = (control, source_id)
     return True
 
 

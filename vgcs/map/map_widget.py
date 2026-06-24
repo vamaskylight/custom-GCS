@@ -6748,9 +6748,15 @@ class MapWidget(QWidget):
         if not refresh_cache:
             return
 
+        sid = self._operator_preview_source_id()
+        try:
+            self._cache_preview_raw_frame(sid or "day", img)
+        except Exception:
+            pass
+
         img = self._apply_digital_zoom(
             img,
-            self._effective_preview_digital_zoom(self._operator_preview_source_id()),
+            self._effective_preview_digital_zoom(sid),
         )
         try:
             img2 = img.copy()
@@ -6800,6 +6806,10 @@ class MapWidget(QWidget):
         try:
             if str(getattr(self, "_video_vision_mode", "day") or "day").lower() == "night":
                 img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+        except Exception:
+            pass
+        try:
+            self._cache_preview_raw_frame(sid, img)
         except Exception:
             pass
         img = self._apply_digital_zoom(img, self._effective_preview_digital_zoom(sid))
@@ -6966,6 +6976,56 @@ class MapWidget(QWidget):
         self._last_video_pushed = src
         self._run_js("setVideoPreviewMode('single');")
         self._run_js(f"setVideoPreviewImage({json.dumps(src)});")
+
+    def _cache_preview_raw_frame(self, source_id: str, img: QImage) -> None:
+        """Keep the latest uncropped preview frame so rail zoom can repaint immediately."""
+        sid = str(source_id or "").strip() or "day"
+        if img is None or img.isNull():
+            return
+        try:
+            raw = img.copy()
+        except Exception:
+            raw = img
+        cache = getattr(self, "_split_last_raw_images", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._split_last_raw_images = cache
+        cache[sid] = raw
+        try:
+            active = self._operator_preview_source_id()
+        except Exception:
+            active = sid
+        if not active or sid == active:
+            self._native_pip_last_raw_frame = raw
+
+    def _reapply_preview_zoom_now(self) -> None:
+        """Re-crop the cached raw frame when zoom +/- changes (do not wait for next RTSP frame)."""
+        try:
+            sid = self._operator_preview_source_id()
+        except Exception:
+            sid = ""
+        raw = None
+        cache = getattr(self, "_split_last_raw_images", None) or {}
+        if sid and sid in cache:
+            raw = cache.get(sid)
+        if raw is None or not isinstance(raw, QImage) or raw.isNull():
+            raw = getattr(self, "_native_pip_last_raw_frame", None)
+        if raw is None or not isinstance(raw, QImage) or raw.isNull():
+            return
+        try:
+            zimg = self._apply_digital_zoom(raw.copy(), self._effective_preview_digital_zoom(sid))
+        except Exception:
+            return
+        try:
+            self._native_pip_last_source_frame = zimg
+            if sid:
+                if not isinstance(getattr(self, "_split_last_images", None), dict):
+                    self._split_last_images = {}
+                self._split_last_images[sid] = zimg
+            self._video_cache_mono = 0.0
+            self._render_native_video_preview(zimg)
+        except Exception:
+            pass
 
     def _apply_digital_zoom(self, img: QImage, zoom: float) -> QImage:
         try:
@@ -9811,6 +9871,10 @@ class MapWidget(QWidget):
                 pass
             try:
                 self._sync_video_recording_preview_transform()
+            except Exception:
+                pass
+            try:
+                self._reapply_preview_zoom_now()
             except Exception:
                 pass
             try:
