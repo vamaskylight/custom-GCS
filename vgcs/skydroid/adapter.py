@@ -2249,7 +2249,11 @@ class SkydroidTopUdpAdapter:
         self._transport.close()
 
     def ptz(self, action: str) -> None:
-        commands = self._profile.ptz_commands.get(str(action or "").strip().lower(), [])
+        action_l = str(action or "").strip().lower()
+        if action_l == "stop":
+            self.ptz_stop_burst(count=3)
+            return
+        commands = self._profile.ptz_commands.get(action_l, [])
         if not commands:
             return
         self._enqueue(commands, {}, False)
@@ -2410,9 +2414,29 @@ class SkydroidTopUdpAdapter:
     def _is_motion_command(commands: list[str]) -> bool:
         return bool(commands) and str(commands[0]).upper() in _MOTION_COMMANDS
 
+    @staticmethod
+    def _is_motion_stop_command(commands: list[str], params: dict[str, object]) -> bool:
+        """PT_STOP / GSM(0,0) must not be dropped when coalescing motion queue."""
+        if not commands:
+            return False
+        c0 = str(commands[0]).upper()
+        if c0 in ("PT_STOP", "PTZ_STOP"):
+            return True
+        if c0 == "PTZ" and str(params.get("action", "")).strip().lower() == "stop":
+            return True
+        if c0 == "GSM":
+            try:
+                y = float(params.get("yaw", 0) or 0)
+                p = float(params.get("pitch", 0) or 0)
+            except (TypeError, ValueError):
+                return False
+            return abs(y) < 1e-6 and abs(p) < 1e-6
+        return False
+
     def _drop_pending_motion_commands(self) -> None:
-        """Keep only the latest motion command — avoids queue backlog and UI lag."""
+        """Coalesce motion queue — keep the latest stop so release→press races still halt."""
         pending: list[tuple[list[str], dict[str, object], bool]] = []
+        latest_stop: tuple[list[str], dict[str, object], bool] | None = None
         while True:
             try:
                 pending.append(self._queue.get_nowait())
@@ -2420,19 +2444,48 @@ class SkydroidTopUdpAdapter:
                 break
         for item in pending:
             cmds, params, expect_reply = item
+            if self._is_motion_stop_command(cmds, params):
+                latest_stop = item
+                continue
             if self._is_motion_command(cmds):
                 continue
             try:
-                self._queue.put_nowait((cmds, params, expect_reply))
+                self._queue.put_nowait(item)
+            except queue.Full:
+                pass
+        if latest_stop is not None:
+            try:
+                self._queue.put_nowait(latest_stop)
             except queue.Full:
                 pass
 
-    def _enqueue(self, commands: list[str], params: dict[str, object], expect_reply: bool) -> None:
+    def ptz_stop_burst(self, *, count: int = 3) -> None:
+        """C13 can coast after a single PT_STOP — send a short burst on release."""
+        commands = self._profile.ptz_commands.get("stop", [])
+        if not commands:
+            return
+        n = max(1, min(6, int(count)))
+        for i in range(n):
+            self._enqueue(
+                list(commands),
+                {},
+                False,
+                coalesce_motion=(i == 0),
+            )
+
+    def _enqueue(
+        self,
+        commands: list[str],
+        params: dict[str, object],
+        expect_reply: bool,
+        *,
+        coalesce_motion: bool = True,
+    ) -> None:
         if not commands:
             return
         if not self._running:
             self.start()
-        if not expect_reply and self._is_motion_command(commands):
+        if coalesce_motion and not expect_reply and self._is_motion_command(commands):
             self._drop_pending_motion_commands()
         try:
             self._queue.put_nowait((list(commands), params, expect_reply))
