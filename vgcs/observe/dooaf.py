@@ -168,7 +168,7 @@ def compute_fire_correction(
   and gun→impact ranges use ray geometry (law of cosines) instead of haversine on
     DEM footprints that often cluster on facade picks.
     """
-    from vgcs.observe.target_measure import mark_pair_ground_separation_m
+    from vgcs.observe.target_measure import mark_pair_fire_range_m
 
     if impact_row is not None:
         template = gun_row or intended_row
@@ -181,16 +181,22 @@ def compute_fire_correction(
     range_gt = haversine_m(gun.lat, gun.lon, intended.lat, intended.lon)
     range_gi = haversine_m(gun.lat, gun.lon, impact.lat, impact.lon)
     if gun_row is not None and intended_row is not None:
-        ray_gt = mark_pair_ground_separation_m(
-            gun_row, intended_row, hfov_deg=camera_hfov_deg
+        ray_gt = mark_pair_fire_range_m(
+            gun_row,
+            intended_row,
+            hfov_deg=camera_hfov_deg,
+            footprint_m=range_gt,
         )
-        if ray_gt is not None and float(ray_gt) > float(range_gt) * 1.08:
+        if ray_gt is not None:
             range_gt = float(ray_gt)
     if gun_row is not None and impact_row is not None:
-        ray_gi = mark_pair_ground_separation_m(
-            gun_row, impact_row, hfov_deg=camera_hfov_deg
+        ray_gi = mark_pair_fire_range_m(
+            gun_row,
+            impact_row,
+            hfov_deg=camera_hfov_deg,
+            footprint_m=range_gi,
         )
-        if ray_gi is not None and float(ray_gi) > float(range_gi) * 1.08:
+        if ray_gi is not None:
             range_gi = float(ray_gi)
     bearing_gt = initial_bearing_deg(gun.lat, gun.lon, intended.lat, intended.lon)
     bearing_gi = initial_bearing_deg(gun.lat, gun.lon, impact.lat, impact.lon)
@@ -916,8 +922,21 @@ def dooaf_export_blockers(
             "Hover ≥3 m for GPS-quality geo."
         )
     ekf = observation_ekf_rel_alt_m(impact_row)
+    if ekf is None:
+        try:
+            raw_ekf = float(impact_row.get("ekf_rel_alt_m"))  # type: ignore[arg-type]
+            if math.isfinite(raw_ekf):
+                ekf = raw_ekf
+        except (TypeError, ValueError):
+            pass
     ground_agl = _float_or_none(impact_row.get("dem_ground_agl_m"))
-    if ekf is not None and ekf < 2.5:
+    if ekf is not None and ekf < 0.0:
+        warnings.append(
+            f"EKF relative altitude is negative ({ekf:.1f} m) — home position is wrong. "
+            "Re-arm on site or set home at current location before DOOAF. "
+            "Gun/target distances from video-only picks will be unreliable."
+        )
+    elif ekf is not None and ekf < 2.5:
         if ground_agl is not None and ground_agl > float(ekf) + 5.0:
             warnings.append(
                 f"EKF reads {ekf:.1f} m above home but terrain AGL is ~{ground_agl:.0f} m "
@@ -945,7 +964,16 @@ def dooaf_export_blockers(
                     float(target_lat),
                     float(target_lon),
                 )
-                if sep_m < 15.0 and abs(float(gx) - float(tx)) > 0.1:
+                video_far = abs(float(gx) - float(tx)) > 0.10
+                skyline_band = float(ty) < 0.58 and float(gy) < 0.65
+                if video_far and skyline_band and sep_m < 50.0:
+                    warnings.append(
+                        "Gun and target look far apart in video but map distance is only "
+                        f"{sep_m:.0f} m — distant hillside / skyline picks cannot be ranged "
+                        "accurately from video alone. Place gun and target with map picks "
+                        "(or survey coordinates) for reliable fire distance."
+                    )
+                elif sep_m < 15.0 and video_far:
                     warnings.append(
                         "Gun and target are only "
                         f"{sep_m:.0f} m apart on the map but video picks are far apart — "

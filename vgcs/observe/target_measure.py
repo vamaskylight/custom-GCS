@@ -719,6 +719,39 @@ def mark_pair_ground_separation_m(
     return None
 
 
+def _row_own_geo_range_m(row: dict[str, Any]) -> float | None:
+    try:
+        r = float(row.get("geo_range_m") or 0)
+    except (TypeError, ValueError):
+        return None
+    return r if r > 0.5 else None
+
+
+def mark_pair_fire_range_m(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    footprint_m: float | None = None,
+) -> float | None:
+    """
+    Gun-centric range for fire correction.
+
+    When both marks have independent ``geo_range_m``, trust ray law-of-cosines
+    over haversine on collapsed skyline / rooftop footprints.
+    """
+    ray = mark_pair_ground_separation_m(row_a, row_b, hfov_deg=hfov_deg)
+    r1 = _row_own_geo_range_m(row_a)
+    r2 = _row_own_geo_range_m(row_b)
+    if ray is not None and r1 is not None and r2 is not None:
+        return float(ray)
+    if ray is not None and footprint_m is not None and float(ray) > float(footprint_m) * 1.08:
+        return float(ray)
+    if footprint_m is not None:
+        return float(footprint_m)
+    return ray
+
+
 def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:
     vx = row.get("video_x_norm")
     vy = row.get("video_y_norm")
