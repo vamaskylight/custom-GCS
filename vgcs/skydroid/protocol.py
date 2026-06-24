@@ -317,6 +317,36 @@ def build_zoom_command_burst(zoom_x: float) -> list[bytes]:
     return build_optical_zoom_frames(zoom_x)
 
 
+def build_dzm_zoom_step_v47(action: str) -> bytes:
+    """PROTOCAL §4.7.1 DZM on D-class: 0A=Zoom+, 0B=Zoom- (e.g. #TPUD2wDZM0A65)."""
+    act = str(action or "").strip().lower()
+    code = {
+        "in": "0A",
+        "out": "0B",
+        "tele": "0A",
+        "wide": "0B",
+        "+": "0A",
+        "-": "0B",
+    }.get(act)
+    if code is None:
+        raise ValueError(f"unsupported DZM §4.7 step {action!r}")
+    return build_tp_frame(dest="D", src="U", control="w", tag="DZM", data=code, variable=False)
+
+
+def build_c13_zoom_step_frames(direction: int) -> list[bytes]:
+    """
+    One rail +/- step: lens ZMC (M) + encoder DZM step (D) per PROTOCAL.
+
+    Avoids flooding fractional absolute DZM (1.1×, 1.2×…) which C13 firmware often ignores.
+    """
+    act = "in" if int(direction) > 0 else "out"
+    return [
+        build_zmc_zoom(act),
+        build_dzm_zoom_step_v47(act),
+        build_zmc_zoom("stop"),
+    ]
+
+
 def build_dzm_step_zoom(action: str) -> bytes:
     """Digital zoom step in/out/stop (PROTOCAL §14.1: 0C/0D with 0E stop)."""
     act = str(action or "").strip().lower()
