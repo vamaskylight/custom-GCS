@@ -10,8 +10,10 @@ from vgcs.video.pipeline import (
     _companion_frame_should_hide,
     _companion_hevc_showall_enabled,
     _companion_release_rtsp_host,
+    _companion_gop_warmup_frame_ok,
     _companion_transport_after_hevc_glitch,
     _rgb_frame_has_decode_artifacts,
+    _rgb_frame_has_structural_tear,
     _rtsp_transport_sequence,
     _rtsp_transport_sequence_with_override,
     _frozen_duplicate_kill_enabled,
@@ -203,6 +205,17 @@ def test_partial_bottom_magenta_patch_detected():
             frame[y : y + 16, x : x + 16, 1] = 35
             frame[y : y + 16, x : x + 16, 2] = 230
     assert _rgb_frame_has_decode_artifacts(frame)
+
+
+def test_natural_outdoor_scene_passes_gop_warmup():
+    """Sky + ground texture must not block preview forever."""
+    h, w = 120, 200
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    for y in range(h):
+        frame[y, :, 1] = 60 + int((y / h) * 90)
+        frame[y, :, 2] = min(255, 140 + int((y / h) * 80))
+    assert _companion_gop_warmup_frame_ok(frame)
+    assert not _rgb_frame_has_structural_tear(frame)
 
 
 def test_motion_preview_still_hides_artifact_frames():
