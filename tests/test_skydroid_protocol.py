@@ -104,22 +104,27 @@ def test_build_mul_24x() -> None:
     assert build_mul_optical_zoom(24.0).decode("ascii") == "#tpPM4wMUL024003"
 
 
-def test_zoom_burst_has_three_variants() -> None:
-    from vgcs.skydroid.protocol import build_zoom_command_burst
+def test_zoom_burst_is_optical_mul_only() -> None:
+    from vgcs.skydroid.protocol import build_optical_zoom_frames, build_zoom_command_burst
 
     frames = build_zoom_command_burst(24.0)
-    assert len(frames) == 3
-    texts = [f.decode("ascii") for f in frames]
-    assert any(t.startswith("#tpPD6wDZM") for t in texts)
-    assert any(t.startswith("#tpUD6wDZM") for t in texts)
-    assert any(t.startswith("#tpPM4wMUL") for t in texts)
+    assert frames == build_optical_zoom_frames(24.0)
+    assert len(frames) == 1
+    assert frames[0].decode("ascii") == "#tpPM4wMUL024003"
 
 
-def test_cam_zoom_maps_to_dzm_not_legacy() -> None:
+def test_optical_zoom_soft_step_1_1x() -> None:
+    from vgcs.skydroid.protocol import build_mul_optical_zoom
+
+    assert build_mul_optical_zoom(1.1).decode("ascii") == "#tpPM4wMUL0011FF"
+
+
+def test_cam_zoom_maps_to_mul_optical() -> None:
     frame = build_top_frame("CAM_ZOOM", {"level": 30.0})
-    assert frame.startswith(b"#tpPD")
-    assert b"DZM" in frame
-    assert b"00F12C" in frame
+    assert frame.startswith(b"#tpPM")
+    assert b"MUL" in frame
+    assert b"0300" in frame
+    assert b"DZM" not in frame
     assert not frame.startswith(b"$TOP")
 
 

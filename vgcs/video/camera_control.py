@@ -280,7 +280,7 @@ ZOOM_MIN = 1.0
 ZOOM_MAX_PREVIEW = 4.0
 ZOOM_MAX_SKYDROID = 30.0
 ZOOM_STEP_PREVIEW = 0.25
-# C13 DZM/MUL use 0.1× absolute steps; coarse 1.0× jumps look blurry on optical zoom.
+# C13 MUL optical zoom uses 0.1× absolute steps on the lens (PROTOCAL M-address).
 ZOOM_STEP_SKYDROID = 0.1
 
 
@@ -730,11 +730,14 @@ def camera_preview_applies_digital_zoom(
     source_id: str = "",
 ) -> bool:
     """
-    Software crop-zoom on the preview so rail +/- always has immediate visual feedback.
+    Software crop-zoom only when the RTSP feed cannot carry lens magnification.
 
-    C13 TOP/RTSP hardware zoom is best-effort and often lags; the UI level drives preview.
+    C13 day: MUL optical zoom is in the RTSP stream — never crop the preview.
+    Thermal: wide RTSP — software magnify for the rail level.
     """
-    _ = (control, source_id)
+    primary = resolve_camera_control_primary(control)
+    if isinstance(primary, SkydroidCameraControl):
+        return str(source_id or "").strip().lower() == "thermal"
     return True
 
 

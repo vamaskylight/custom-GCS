@@ -2313,6 +2313,12 @@ class SkydroidTopUdpAdapter:
     def camera_zoom(self, level: float) -> None:
         self._enqueue(["ZOOM_BURST"], {"level": float(level)}, False)
 
+    def camera_zoom_step(self, direction: int) -> None:
+        """PROTOCAL ZMC — lens zoom in/out (M-address), paired with stop like FCC focus."""
+        act = "out" if int(direction) < 0 else "in"
+        self._enqueue(["ZMC"], {"action": act}, False)
+        self._enqueue(["ZMC"], {"action": "stop"}, False)
+
     def camera_focus_step(self, direction: int) -> None:
         key = "focus_in" if int(direction) < 0 else "focus_out"
         cmds = self._profile.camera_commands.get(key, [])
@@ -2541,7 +2547,7 @@ class SkydroidTopUdpAdapter:
                     continue
 
     def _send_zoom_burst(self, level: float) -> None:
-        """Fire every known zoom frame on active + alternate TOP UDP ports (no reply wait)."""
+        """Send optical MUL (lens) on active + alternate TOP UDP ports (no reply wait)."""
         frames = build_zoom_command_burst(level)
         if not frames:
             return

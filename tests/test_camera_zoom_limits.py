@@ -28,12 +28,11 @@ def test_preview_zoom_limits_stay_at_4x() -> None:
     assert zstep == ZOOM_STEP_PREVIEW == 0.25
 
 
-def test_preview_digital_zoom_always_applied() -> None:
+def test_skydroid_day_uses_lens_zoom_not_software_crop() -> None:
     control = object.__new__(SkydroidCameraControl)
-    assert camera_preview_applies_digital_zoom(control) is True
-    assert camera_preview_applies_digital_zoom(control, "day") is True
+    assert camera_preview_applies_digital_zoom(control, "day") is False
     assert camera_preview_applies_digital_zoom(control, "thermal") is True
-    assert camera_preview_applies_digital_zoom(NoopCameraControl()) is True
+    assert camera_preview_applies_digital_zoom(NoopCameraControl(), "day") is True
 
 
 def test_composite_wrapper_uses_skydroid_zoom_limits() -> None:
@@ -42,7 +41,8 @@ def test_composite_wrapper_uses_skydroid_zoom_limits() -> None:
     zmin, zmax, zstep = camera_zoom_limits(wrapped)
     assert zmax == ZOOM_MAX_SKYDROID == 30.0
     assert zstep == ZOOM_STEP_SKYDROID == 0.1
-    assert camera_preview_applies_digital_zoom(wrapped, "day") is True
+    assert camera_preview_applies_digital_zoom(wrapped, "day") is False
+    assert camera_preview_applies_digital_zoom(wrapped, "thermal") is True
 
 
 def test_recording_digital_zoom_only_for_thermal() -> None:

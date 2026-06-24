@@ -292,21 +292,24 @@ def build_dzm_absolute_zoom_ud(zoom_x: float, *, camera_x0: int = 0) -> bytes:
 
 
 def build_mul_optical_zoom(zoom_x: float) -> bytes:
-    """Optical magnification (PROTOCAL §9.1, MUL). 24.0× → ``#tpPM4wMUL0240…``."""
+    """Optical magnification (PROTOCAL M-address / lens). 24.0× → ``#tpPM4wMUL0240…``."""
     units = int(round(max(1.0, min(300.0, float(zoom_x) * 10.0))))
     return build_pod_camera_command("MUL", f"{units:04d}", dest="M")
 
 
-def build_zoom_command_burst(zoom_x: float) -> list[bytes]:
+def build_optical_zoom_frames(zoom_x: float) -> list[bytes]:
     """
-    All known C13 zoom frames for one UI level (field firmware varies by port/addressing).
+    C13 visible-light optical zoom (lens MUL only).
+
+    DZM (§4.7) is *digital* zoom for C12 — do not mix with optical preview zoom.
     """
     lvl = max(1.0, min(30.0, float(zoom_x)))
-    return [
-        build_dzm_absolute_zoom(lvl),
-        build_dzm_absolute_zoom_ud(lvl),
-        build_mul_optical_zoom(lvl),
-    ]
+    return [build_mul_optical_zoom(lvl)]
+
+
+def build_zoom_command_burst(zoom_x: float) -> list[bytes]:
+    """Backward-compatible alias — optical MUL only (real lens zoom)."""
+    return build_optical_zoom_frames(zoom_x)
 
 
 def build_dzm_step_zoom(action: str) -> bytes:
@@ -472,12 +475,11 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
 
     if cmd in ("CAM_ZOOM", "CAM_Z"):
         level = float(p.get("level", p.get("zoom", 1.0)) or 1.0)
-        return build_dzm_absolute_zoom(level)
+        return build_mul_optical_zoom(level)
 
     if cmd == "ZOOM_BURST":
-        # Expanded in adapter worker — placeholder frame.
         level = float(p.get("level", 1.0) or 1.0)
-        return build_dzm_absolute_zoom(level)
+        return build_mul_optical_zoom(level)
 
     if cmd == "ZMC":
         return build_zmc_zoom(str(p.get("action", "stop")))
