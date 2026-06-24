@@ -78,9 +78,13 @@ def test_hevc_stderr_glitch_lines():
 
 
 def test_transport_override_prefers_udp_after_glitch():
-    seq = _rtsp_transport_sequence_with_override(C13_URL, "auto", "udp")
-    assert seq[0] == "udp"
-    assert "tcp" in seq
+    os.environ["VGCS_C13_RTSP_UDP_FALLBACK"] = "1"
+    try:
+        seq = _rtsp_transport_sequence_with_override(C13_URL, "auto", "udp")
+        assert seq[0] == "udp"
+        assert "tcp" in seq
+    finally:
+        os.environ.pop("VGCS_C13_RTSP_UDP_FALLBACK", None)
 
 
 def test_hevc_glitch_flips_udp_to_tcp():
@@ -88,9 +92,9 @@ def test_hevc_glitch_flips_udp_to_tcp():
     assert _companion_transport_after_hevc_glitch("udp", seq) == "tcp"
 
 
-def test_hevc_glitch_flips_tcp_to_udp():
+def test_hevc_glitch_never_flips_tcp_to_udp_on_c13():
     seq = _rtsp_transport_sequence(C13_URL, "auto")
-    assert _companion_transport_after_hevc_glitch("tcp", seq) == "udp"
+    assert _companion_transport_after_hevc_glitch("tcp", seq) is None
 
 
 def test_rgb_corrupt_detector():
@@ -149,10 +153,48 @@ def test_horizontal_band_artifact_detector():
     assert _rgb_frame_has_decode_artifacts(torn)
 
 
-def test_c13_rtsp_prefers_tcp_first():
+def test_c13_rtsp_prefers_tcp_only():
     seq = _rtsp_transport_sequence(C13_URL, "auto")
-    assert seq[0] == "tcp"
-    assert "udp" in seq
+    assert seq == ("tcp",)
+
+
+def test_c13_rtsp_udp_fallback_opt_in():
+    os.environ["VGCS_C13_RTSP_UDP_FALLBACK"] = "1"
+    try:
+        seq = _rtsp_transport_sequence(C13_URL, "auto")
+        assert seq[0] == "tcp"
+        assert "udp" in seq
+    finally:
+        os.environ.pop("VGCS_C13_RTSP_UDP_FALLBACK", None)
+
+
+def test_partial_bottom_magenta_tear_detected():
+    """Top-half OK + patchy bottom macroblocks must not reach the preview."""
+    h, w = 120, 200
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    frame[: h // 2, :, 1] = 100
+    rng = np.random.default_rng(3)
+    for y in range(h // 2, h, 16):
+        for x in range(0, w, 16):
+            if rng.random() > 0.35:
+                continue
+            frame[y : y + 16, x : x + 16, 0] = 230
+            frame[y : y + 16, x : x + 16, 1] = 35
+            frame[y : y + 16, x : x + 16, 2] = 230
+    assert _rgb_frame_has_decode_artifacts(frame)
+
+
+def test_motion_preview_still_hides_artifact_frames():
+    h, w = 120, 200
+    good = np.zeros((h, w, 3), dtype=np.uint8)
+    good[:, :, 1] = 100
+    torn = good.copy()
+    torn[h // 2 :, :, 0] = 240
+    torn[h // 2 :, :, 1] = 20
+    torn[h // 2 :, :, 2] = 240
+    notify_companion_preview_motion(duration_s=3.0)
+    hide, why = _companion_frame_should_hide(torn, good, motion_preview=True)
+    assert hide and why == "artifact"
 
 
 def test_companion_rtsp_host_single_owner():
@@ -173,7 +215,9 @@ def test_companion_motion_preview_passes_pan_frames():
     last = np.zeros((h, w, 3), dtype=np.uint8)
     last[:, :, 1] = 100
     shifted = np.zeros_like(last)
-    shifted[:, 4:, :] = last[:, :-4, :]
+    shift = 4
+    shifted[:, shift:, :] = last[:, :-shift, :]
+    shifted[:, :shift, :] = last[:, :shift, :]
     hide_still, _ = _companion_frame_should_hide(shifted, last, motion_preview=False)
     assert not hide_still
     notify_companion_preview_motion(duration_s=3.0)
