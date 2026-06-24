@@ -145,7 +145,9 @@ from vgcs.video.pipeline import (
     VideoFrame,
     VideoPipeline,
     QS_KEY_LAST_PHOTO_SAVE_DIR,
+    companion_preview_qimage_ok,
     notify_companion_preview_motion,
+    _companion_preview_motion_active,
     release_all_companion_rtsp_hosts,
     release_companion_rtsp_host,
     set_companion_decode_gate,
@@ -3618,9 +3620,35 @@ class MapWidget(QWidget):
         except Exception:
             pass
 
+    def _companion_preview_frame_ok_for_paint(self, img: QImage) -> bool:
+        if not self._uses_companion_rtsp():
+            return True
+        last_good = getattr(self, "_native_video_last_good", None)
+        lg = last_good if isinstance(last_good, QImage) and not last_good.isNull() else None
+        return companion_preview_qimage_ok(
+            img,
+            last_good=lg,
+            motion_preview=_companion_preview_motion_active(),
+        )
+
     def _render_native_video_preview(self, img: QImage) -> None:
         if img is None or img.isNull():
             return
+        if not self._companion_preview_frame_ok_for_paint(img):
+            last_good = getattr(self, "_native_video_last_good", None)
+            if (
+                isinstance(last_good, QImage)
+                and not last_good.isNull()
+                and companion_preview_qimage_ok(last_good, last_good=None)
+            ):
+                img = last_good
+            else:
+                return
+        else:
+            try:
+                self._native_video_last_good = img.copy()
+            except Exception:
+                self._native_video_last_good = img
         self._set_native_video_pip_placeholder(False)
         self._native_video_last = img
         split_on = bool(getattr(self, "_video_split_enabled", False))

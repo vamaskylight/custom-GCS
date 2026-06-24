@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-tear-guard3"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -575,17 +575,119 @@ def _companion_gop_warmup_frames() -> int:
 
 
 def _companion_gop_warmup_frame_ok(arr: "np.ndarray") -> bool:
-    """
-    Minimal warmup gate — only obvious neon tear colors.
-
-    Structural / regional checks false-positive on normal outdoor scenes (sky vs trees)
-    and were blocking preview forever.
-    """
+    """Warmup uses the same gate as live preview (no corrupt-vs-last-good compare)."""
     if not HAS_NUMPY or np is None:
         return True
-    return not _rgb_frame_region_has_decode_artifacts(
-        arr, strict=False, regional=False, colors_only=True
-    )
+    hide, _ = _companion_frame_should_hide(arr, None, motion_preview=False)
+    return not hide
+
+
+def _companion_stale_preview_reconnect_enabled() -> bool:
+    """Reconnect for a fresh IDR when preview hides frames too long (same TCP transport)."""
+    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT", "1") or "1").strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
+def _companion_stale_preview_reconnect_streak() -> int:
+    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT_STREAK", "90") or "90").strip()
+    try:
+        return max(30, min(600, int(raw)))
+    except ValueError:
+        return 90
+
+
+def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
+    """Full-frame HEVC decode collapse — patchy 8×8 tile chaos across the whole image."""
+    if not HAS_NUMPY or np is None:
+        return False
+    h, w, _ = arr.shape
+    if h < 32 or w < 32:
+        return False
+    r = arr[:, :, 0].astype(np.float32)
+    g = arr[:, :, 1].astype(np.float32)
+    b = arr[:, :, 2].astype(np.float32)
+    gray = 0.299 * r + 0.587 * g + 0.114 * b
+    block_stds: list[float] = []
+    for y in range(0, h - 8, 8):
+        for x in range(0, w - 8, 8):
+            block_stds.append(float(gray[y : y + 8, x : x + 8].std()))
+    if len(block_stds) < 20:
+        return False
+    med = float(np.median(block_stds))
+    std_of_stds = float(np.std(block_stds))
+    hi = sum(1 for s in block_stds if s > max(24.0, med * 2.4))
+    lo = sum(1 for s in block_stds if s < max(6.0, med * 0.35))
+    ratio = hi / float(len(block_stds))
+    lo_ratio = lo / float(len(block_stds))
+    # Patchy macroblock soup: mix of flat tiles and chaotic tiles (classic HEVC tear).
+    if ratio > 0.28 and lo_ratio > 0.20 and med > 12.0:
+        return True
+    if ratio > 0.42:
+        return True
+    if med > 22.0 and ratio > 0.30:
+        return True
+    if std_of_stds > 14.0 and med > 16.0 and ratio > 0.18:
+        return True
+    return False
+
+
+def companion_preview_qimage_ok(
+    img: QImage,
+    *,
+    last_good: QImage | None = None,
+    motion_preview: bool = False,
+) -> bool:
+    """GUI-side safety net — never paint a frame that fails companion quality gates."""
+    if not HAS_NUMPY or np is None or img is None or img.isNull():
+        return False
+    try:
+        rgb = img.convertToFormat(QImage.Format.Format_RGB888)
+        w, h = rgb.width(), rgb.height()
+        if w < 8 or h < 8:
+            return False
+        bpl = int(rgb.bytesPerLine())
+        raw = rgb.bits()
+        if hasattr(raw, "setsize"):
+            raw.setsize(bpl * h)
+        buf = np.frombuffer(raw, dtype=np.uint8, count=bpl * h)
+        if bpl == w * 3:
+            arr = buf.reshape((h, w, 3)).copy()
+        else:
+            arr = np.zeros((h, w, 3), dtype=np.uint8)
+            for row in range(h):
+                arr[row, :, :] = buf[row * bpl : row * bpl + w * 3].reshape((w, 3))
+        prev = None
+        if last_good is not None and not last_good.isNull():
+            prev = companion_preview_qimage_to_array(last_good)
+        hide, _ = _companion_frame_should_hide(
+            arr,
+            prev,
+            motion_preview=motion_preview,
+        )
+        return not hide
+    except Exception:
+        return True
+
+
+def companion_preview_qimage_to_array(img: QImage) -> "np.ndarray | None":
+    if img is None or img.isNull() or not HAS_NUMPY or np is None:
+        return None
+    try:
+        rgb = img.convertToFormat(QImage.Format.Format_RGB888)
+        w, h = rgb.width(), rgb.height()
+        bpl = int(rgb.bytesPerLine())
+        raw = rgb.bits()
+        if hasattr(raw, "setsize"):
+            raw.setsize(bpl * h)
+        buf = np.frombuffer(raw, dtype=np.uint8, count=bpl * h)
+        if bpl == w * 3:
+            return buf.reshape((h, w, 3)).copy()
+        arr = np.zeros((h, w, 3), dtype=np.uint8)
+        for row in range(h):
+            arr[row, :, :] = buf[row * bpl : row * bpl + w * 3].reshape((w, 3))
+        return arr
+    except Exception:
+        return None
 
 
 def _rgb_frame_looks_hevc_corrupt(
@@ -667,6 +769,8 @@ def _rgb_frame_has_decode_artifacts(
     ):
         return True
     if _rgb_frame_has_structural_tear(arr):
+        return True
+    if _rgb_frame_looks_like_macroblock_soup(arr):
         return True
     return False
 
@@ -2119,6 +2223,11 @@ class RtspSource(QObject):
                     "[VGCS:video] companion HEVC: frozen-duplicate reconnect disabled "
                     "(set VGCS_COMPANION_FROZEN_RECONNECT=1 to enable)"
                 )
+            if not _companion_stale_preview_reconnect_enabled():
+                print(
+                    "[VGCS:video] companion HEVC: stale-preview reconnect disabled "
+                    "(set VGCS_COMPANION_STALE_RECONNECT=1 to enable)"
+                )
             if not _companion_corrupt_streak_reconnect_enabled():
                 print(
                     "[VGCS:video] companion HEVC: corrupt-streak reconnect disabled "
@@ -2454,6 +2563,14 @@ class RtspSource(QObject):
                                         )
                                         if hide:
                                             corrupt_skip_streak += 1
+                                            if last_good_arr is not None:
+                                                lg_hide, _ = _companion_frame_should_hide(
+                                                    last_good_arr,
+                                                    None,
+                                                    motion_preview=False,
+                                                )
+                                                if lg_hide or corrupt_skip_streak >= 45:
+                                                    last_good_arr = None
                                             if corrupt_skip_streak in (1, 30, 90, 180):
                                                 try:
                                                     print(
@@ -2464,6 +2581,29 @@ class RtspSource(QObject):
                                                     )
                                                 except Exception:
                                                     pass
+                                            stale_thr = _companion_stale_preview_reconnect_streak()
+                                            if (
+                                                _companion_stale_preview_reconnect_enabled()
+                                                and not motion_preview
+                                                and corrupt_skip_streak == stale_thr
+                                            ):
+                                                try:
+                                                    print(
+                                                        "[VGCS:video] companion HEVC: "
+                                                        "stale preview — reconnecting RTSP "
+                                                        "for fresh GOP (same transport)"
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                session_gop_ready = False
+                                                clean_warmup_streak = 0
+                                                last_good_arr = None
+                                                try:
+                                                    if p.poll() is None:
+                                                        p.kill()
+                                                except Exception:
+                                                    pass
+                                                break
                                             if (
                                                 _companion_corrupt_streak_reconnect_enabled()
                                                 and not motion_preview

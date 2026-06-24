@@ -11,9 +11,11 @@ from vgcs.video.pipeline import (
     _companion_hevc_showall_enabled,
     _companion_release_rtsp_host,
     _companion_gop_warmup_frame_ok,
+    _companion_stale_preview_reconnect_enabled,
     _companion_transport_after_hevc_glitch,
     _rgb_frame_has_decode_artifacts,
     _rgb_frame_has_structural_tear,
+    _rgb_frame_looks_like_macroblock_soup,
     _rtsp_transport_sequence,
     _rtsp_transport_sequence_with_override,
     _frozen_duplicate_kill_enabled,
@@ -216,6 +218,26 @@ def test_natural_outdoor_scene_passes_gop_warmup():
         frame[y, :, 2] = min(255, 140 + int((y / h) * 80))
     assert _companion_gop_warmup_frame_ok(frame)
     assert not _rgb_frame_has_structural_tear(frame)
+
+
+def test_full_frame_macroblock_soup_detected():
+    h, w = 120, 200
+    soup = np.zeros((h, w, 3), dtype=np.uint8)
+    soup[:, :, 1] = 80
+    rng = np.random.default_rng(7)
+    for y in range(0, h - 15, 16):
+        for x in range(0, w - 15, 16):
+            if rng.random() > 0.45:
+                soup[y : y + 16, x : x + 16, :] = rng.integers(
+                    0, 256, (16, 16, 3), dtype=np.uint8
+                )
+    assert _rgb_frame_looks_like_macroblock_soup(soup)
+    hide, why = _companion_frame_should_hide(soup, None)
+    assert hide and why == "artifact"
+
+
+def test_stale_preview_reconnect_default_on():
+    assert _companion_stale_preview_reconnect_enabled()
 
 
 def test_motion_preview_still_hides_artifact_frames():
