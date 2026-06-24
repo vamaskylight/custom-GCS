@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview2"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -574,11 +574,23 @@ def _companion_gop_warmup_frames() -> int:
         return 2
 
 
+def _companion_rgb_sample_for_qc(arr: "np.ndarray", *, max_w: int = 320) -> "np.ndarray":
+    """Downsample for artifact QC — full-res checks are too slow on the decode thread."""
+    if not HAS_NUMPY or np is None:
+        return arr
+    h, w, _ = arr.shape
+    if w <= max_w:
+        return arr
+    step = max(2, int(round(w / max_w)))
+    return arr[::step, ::step, :]
+
+
 def _companion_gop_warmup_frame_ok(arr: "np.ndarray") -> bool:
     """Warmup uses the same gate as live preview (no corrupt-vs-last-good compare)."""
     if not HAS_NUMPY or np is None:
         return True
-    hide, _ = _companion_frame_should_hide(arr, None, motion_preview=False)
+    sample = _companion_rgb_sample_for_qc(arr)
+    hide, _ = _companion_frame_should_hide(sample, None, motion_preview=False)
     return not hide
 
 
@@ -608,10 +620,11 @@ def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
     b = arr[:, :, 2].astype(np.float32)
     gray = 0.299 * r + 0.587 * g + 0.114 * b
     block_stds: list[float] = []
-    for y in range(0, h - 8, 8):
-        for x in range(0, w - 8, 8):
+    step = 16
+    for y in range(0, h - 8, step):
+        for x in range(0, w - 8, step):
             block_stds.append(float(gray[y : y + 8, x : x + 8].std()))
-    if len(block_stds) < 20:
+    if len(block_stds) < 12:
         return False
     med = float(np.median(block_stds))
     std_of_stds = float(np.std(block_stds))
@@ -770,6 +783,9 @@ def _rgb_frame_has_decode_artifacts(
         return True
     if _rgb_frame_has_structural_tear(arr):
         return True
+    top_h = max(32, int(h * 0.45))
+    if top_h < h and _rgb_frame_looks_like_macroblock_soup(arr[:top_h, :, :]):
+        return True
     if _rgb_frame_looks_like_macroblock_soup(arr):
         return True
     return False
@@ -896,13 +912,16 @@ def _companion_frame_should_hide(
     motion_preview: bool = False,
 ) -> tuple[bool, str]:
     """Return (hide, reason) for companion preview quality gate."""
+    sample = _companion_rgb_sample_for_qc(arr)
     # Always reject macroblock tears — motion preview only skips stale-frame compare.
-    if _rgb_frame_has_decode_artifacts(arr, strict=True):
+    if _rgb_frame_has_decode_artifacts(sample, strict=True):
         return True, "artifact"
     if motion_preview:
         return False, ""
-    if last_good is not None and _rgb_frame_looks_hevc_corrupt(arr, last_good):
-        return True, "corrupt"
+    if last_good is not None:
+        lg = _companion_rgb_sample_for_qc(last_good)
+        if lg.shape == sample.shape and _rgb_frame_looks_hevc_corrupt(sample, lg):
+            return True, "corrupt"
     return False, ""
 
 
