@@ -146,6 +146,8 @@ from vgcs.video.pipeline import (
     VideoPipeline,
     QS_KEY_LAST_PHOTO_SAVE_DIR,
     notify_companion_preview_motion,
+    notify_companion_app_background,
+    notify_companion_app_foreground,
     release_all_companion_rtsp_hosts,
     release_companion_rtsp_host,
     set_companion_decode_gate,
@@ -6287,6 +6289,63 @@ class MapWidget(QWidget):
             "You cannot pick coordinates on the map or video until GPS is ready.",
         )
         return False
+
+    def on_application_background(self) -> None:
+        """Windows minimize / alt-tab — avoid RTSP reconnect death spiral while hidden."""
+        try:
+            self._video_preview_background_mono = time.monotonic()
+        except Exception:
+            pass
+        try:
+            notify_companion_app_background()
+        except Exception:
+            pass
+
+    def on_application_foreground(self) -> None:
+        """Return from background — reopen companion RTSP with a clean GOP."""
+        try:
+            notify_companion_app_foreground()
+        except Exception:
+            pass
+        bg = float(getattr(self, "_video_preview_background_mono", 0.0) or 0.0)
+        if bg <= 0.0:
+            return
+        elapsed = time.monotonic() - bg
+        self._video_preview_background_mono = 0.0
+        if elapsed < 2.5:
+            return
+        if not bool(getattr(self, "_video_preview_enabled", False)):
+            return
+        if not self._uses_companion_rtsp():
+            return
+        self._refresh_companion_video_after_foreground(elapsed_bg_s=elapsed)
+
+    def _refresh_companion_video_after_foreground(self, *, elapsed_bg_s: float) -> None:
+        last = float(getattr(self, "_last_foreground_video_refresh_mono", 0.0) or 0.0)
+        if time.monotonic() - last < 6.0:
+            return
+        self._last_foreground_video_refresh_mono = time.monotonic()
+        vp = getattr(self, "_video", None)
+        if vp is None:
+            return
+        want = self._video_preview_source_ids_to_run(vp)
+        if not want:
+            return
+        delay_ms = 3200 if elapsed_bg_s >= 8.0 else 2200
+        try:
+            print(
+                f"[VGCS:video] foreground RTSP refresh for {want!r} "
+                f"(background {elapsed_bg_s:.0f}s, delay={delay_ms}ms)"
+            )
+        except Exception:
+            pass
+        for sid in want:
+            try:
+                src = vp.sources().get(sid)
+                if src is not None and hasattr(src, "restart_decode"):
+                    src.restart_decode(delay_ms=delay_ms)
+            except Exception:
+                pass
 
     def _start_video_decode_sources(self, vp, *, force: bool = False) -> None:
         """Start only the decoders needed for the current preview mode."""
