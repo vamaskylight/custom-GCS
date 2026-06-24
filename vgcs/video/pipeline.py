@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-23-companion-motion-preview"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-hevc-tcp-fallback"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -330,16 +330,17 @@ def _rtsp_transport_sequence(url: str, mode: str) -> tuple[str | None, ...]:
         if str(os.environ.get("VGCS_SIYI_RTSP_TCP_FIRST", "0") or "0").strip() == "1":
             return ("tcp", "udp")
         return ("udp", "tcp")
-    # Skydroid C13 (stream=1 / stream=2): UDP first — TCP often triggers HEVC POC/RPS tears.
+    # Skydroid C13 (stream=1 / stream=2): TCP interleaved first — UDP RTP loses HEVC ref
+    # frames on Wi‑Fi (POC/RPS macroblock tears). Set VGCS_C13_RTSP_UDP_FIRST=1 for legacy UDP-first.
     if m == "auto" and _rtsp_url_is_companion_link_subnet(raw):
         try:
             path = (urlparse(raw).path or "").lower()
         except Exception:
             path = ""
         if "stream=" in path or "/stream" in path:
-            if str(os.environ.get("VGCS_C13_RTSP_TCP_FIRST", "0") or "0").strip() == "1":
-                return ("tcp", "udp")
-            return ("udp", "tcp")
+            if str(os.environ.get("VGCS_C13_RTSP_UDP_FIRST", "0") or "0").strip() == "1":
+                return ("udp", "tcp")
+            return ("tcp", "udp")
     return _rtsp_transport_order_auto(raw)
 
 
@@ -542,6 +543,19 @@ def _rtsp_transport_sequence_with_override(
     return tuple(seq)
 
 
+def _companion_transport_after_hevc_glitch(
+    current: str | None, transport_seq: tuple[str | None, ...]
+) -> str | None:
+    """Flip RTP mode after HEVC POC/RPS loss (UDP packet loss → TCP; TCP stall → UDP)."""
+    cur = str(current or "").strip().lower()
+    alts = {str(t).strip().lower() for t in transport_seq if t}
+    if cur == "udp" and "tcp" in alts:
+        return "tcp"
+    if cur == "tcp" and "udp" in alts:
+        return "udp"
+    return None
+
+
 def _rgb_frame_looks_hevc_corrupt(
     arr: "np.ndarray",
     prev: "np.ndarray | None",
@@ -683,11 +697,11 @@ def _siyi_hevc_glitch_release_sleep(*, brief_session: bool = False) -> None:
     if brief_session:
         try:
             extra = float(
-                str(os.environ.get("VGCS_SIYI_HEVC_BRIEF_RELEASE_S", "5.0") or "5.0").strip()
+                str(os.environ.get("VGCS_SIYI_HEVC_BRIEF_RELEASE_S", "2.5") or "2.5").strip()
             )
         except ValueError:
-            extra = 5.0
-        delay = min(12.0, delay + max(0.0, extra))
+            extra = 2.5
+        delay = min(10.0, delay + max(0.0, extra))
     try:
         msg = (
             f"[VGCS:video] companion HEVC: waiting {delay:.1f}s for camera after glitch "
@@ -860,7 +874,7 @@ def _ffmpeg_preflags_before_input(
                     ]
                 )
         if _rtsp_url_is_companion_rtsp(u):
-            out.extend(["-thread_queue_size", "512"])
+            out.extend(["-thread_queue_size", "512", "-max_delay", "500000"])
         if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
             out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     out.extend(["-err_detect", "ignore_err"])
@@ -2092,7 +2106,21 @@ class RtspSource(QObject):
                                         if companion_rtsp and _hevc_stderr_line_indicates_glitch(
                                             line
                                         ):
-                                            hold["until_mono"] = time.monotonic() + 0.35
+                                            hold_s = 1.0
+                                            try:
+                                                hold_s = float(
+                                                    str(
+                                                        os.environ.get(
+                                                            "VGCS_COMPANION_HEVC_GLITCH_HOLD_S",
+                                                            "1.0",
+                                                        )
+                                                        or "1.0"
+                                                    ).strip()
+                                                )
+                                            except ValueError:
+                                                hold_s = 1.0
+                                            hold_s = max(0.35, min(3.0, hold_s))
+                                            hold["until_mono"] = time.monotonic() + hold_s
                                 except Exception:
                                     pass
 
@@ -2253,7 +2281,7 @@ class RtspSource(QObject):
                                                     )
                                                 except Exception:
                                                     pass
-                                            streak_limit = 999 if motion_preview else 45
+                                            streak_limit = 999 if motion_preview else 120
                                             if corrupt_skip_streak >= streak_limit:
                                                 try:
                                                     print(
@@ -2262,6 +2290,25 @@ class RtspSource(QObject):
                                                     )
                                                 except Exception:
                                                     pass
+                                                alt = _companion_transport_after_hevc_glitch(
+                                                    str(use_transport or ""),
+                                                    transport_seq,
+                                                )
+                                                cur_tr = str(
+                                                    self._companion_transport_override
+                                                    or use_transport
+                                                    or ""
+                                                ).lower()
+                                                if alt and alt != cur_tr:
+                                                    self._companion_transport_override = alt
+                                                    try:
+                                                        print(
+                                                            "[VGCS:video] companion HEVC corrupt "
+                                                            f"streak: next session uses "
+                                                            f"{alt.upper()} transport"
+                                                        )
+                                                    except Exception:
+                                                        pass
                                                 try:
                                                     if p.poll() is None:
                                                         p.kill()
@@ -2476,20 +2523,21 @@ class RtspSource(QObject):
                                 except Exception:
                                     pass
                                 if hevc_glitch:
-                                    if (
-                                        str(use_transport or "").lower() == "tcp"
-                                        and "udp" in transport_seq
-                                    ):
-                                        self._companion_transport_override = "udp"
+                                    alt = _companion_transport_after_hevc_glitch(
+                                        str(use_transport or ""),
+                                        transport_seq,
+                                    )
+                                    if alt:
+                                        self._companion_transport_override = alt
                                         try:
                                             print(
-                                                "[VGCS:video] companion HEVC on TCP: "
-                                                "next session uses UDP transport"
+                                                "[VGCS:video] companion HEVC glitch: "
+                                                f"next session uses {alt.upper()} transport"
                                             )
                                         except Exception:
                                             pass
                                     _siyi_hevc_glitch_release_sleep(
-                                        brief_session=frames_this_session < 50
+                                        brief_session=frames_this_session < 30
                                     )
                                 elif _siyi_rtsp_camera_busy(tail_b):
                                     _siyi_camera_release_sleep(
