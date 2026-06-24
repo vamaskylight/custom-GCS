@@ -267,6 +267,54 @@ def test_fire_correction_gun_impact_differ_without_dem_file():
     assert gi < gt
 
 
+def test_fire_correction_hillcrest_session_103428():
+    """Hillcrest skyline — gun→impact should be shorter than gun→target (ray geometry)."""
+    from vgcs.observe.dooaf import build_dooaf_session
+
+    impact = {
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_IMPACT,
+        "target_lat": 20.443179879154307,
+        "target_lon": 72.85429593320264,
+        "target_alt_m": 34.0,
+        "video_x_norm": 0.39010416666666664,
+        "video_y_norm": 0.5047923322683706,
+        "vehicle_lat": 20.4430907,
+        "vehicle_lon": 72.8542565,
+        "vehicle_heading_deg": 4.0,
+        "vehicle_pitch_deg": 0.0,
+        "vehicle_roll_deg": 0.0,
+        "vehicle_alt_msl_m": 45.0,
+        "ekf_rel_alt_m": -0.159,
+        "dem_ground_agl_m": 11.571627960205078,
+        "agl_source": "dem_terrain",
+        "gimbal_pitch_deg": -15.0,
+        "gimbal_yaw_deg": 0.0,
+        "gps_fix_type": 3,
+        "camera_hfov_deg": 62.0,
+    }
+    session = build_dooaf_session(
+        [impact],
+        gun_lat=20.4433689,
+        gun_lon=72.8542809,
+        gun_alt_m=28.26,
+        target_lat=20.4431679,
+        target_lon=72.8543127,
+        target_alt_m=34.98,
+        setup_video_marks={
+            DOOAF_ROLE_GUN: (0.236, 0.600),
+            DOOAF_ROLE_INTENDED: (0.504, 0.498),
+        },
+        dem_path=None,
+    )
+    assert session.correction is not None
+    gt = session.correction.range_gun_to_intended_m
+    gi = session.correction.range_gun_to_impact_m
+    assert gt > gi
+    assert gt - gi > 2.5
+    assert session.correction.impact_to_intended_m < 5.0
+
+
 def test_fire_correction_on_line_short():
     gun = GeoPoint(12.0, 77.0)
     intended = GeoPoint(12.01, 77.0)
