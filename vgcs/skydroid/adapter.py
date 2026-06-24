@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
 from vgcs.skydroid.protocol import (
+    build_c13_zoom_step_frames,
     build_gac_query,
     build_gimbal_speed,
     build_got_target,
@@ -2314,10 +2315,7 @@ class SkydroidTopUdpAdapter:
         self._enqueue(["ZOOM_BURST"], {"level": float(level)}, False)
 
     def camera_zoom_step(self, direction: int) -> None:
-        """PROTOCAL ZMC — lens zoom in/out (M-address), paired with stop like FCC focus."""
-        act = "out" if int(direction) < 0 else "in"
-        self._enqueue(["ZMC"], {"action": act}, False)
-        self._enqueue(["ZMC"], {"action": "stop"}, False)
+        self._enqueue(["C13_ZOOM_STEP"], {"direction": int(direction)}, False)
 
     def camera_focus_step(self, direction: int) -> None:
         key = "focus_in" if int(direction) < 0 else "focus_out"
@@ -2528,6 +2526,12 @@ class SkydroidTopUdpAdapter:
                 except Exception:
                     pass
                 continue
+            if commands and commands[0] == "C13_ZOOM_STEP":
+                try:
+                    self._send_zoom_step(int(params.get("direction", 0) or 0))
+                except Exception:
+                    pass
+                continue
             self._ensure_active_transport()
             for command in commands:
                 frame = build_top_frame(command, params)
@@ -2547,14 +2551,50 @@ class SkydroidTopUdpAdapter:
                     continue
 
     def _send_zoom_burst(self, level: float) -> None:
-        """C13 zoom: DZM absolute + MUL on active + alternate TOP UDP ports."""
+        """C13 absolute zoom: DZM + MUL on active host and alternate UDP ports."""
+        self._ensure_active_transport()
         frames = build_zoom_command_burst(level)
         if not frames:
             return
         try:
             print(
-                f"[VGCS:skydroid] zoom TOP level={float(level):.1f}× "
-                f"frames={len(frames)} ports=5000,9003,19853"
+                f"[VGCS:skydroid] zoom TOP abs level={float(level):.1f}× "
+                f"frames={len(frames)} host={self._transport._host}:{self._transport._port}"
+            )
+        except Exception:
+            pass
+        active_port = int(self._transport._port)
+        ports: list[int] = []
+        for p in (active_port, *_ZOOM_EXTRA_PORTS):
+            if int(p) not in ports:
+                ports.append(int(p))
+        for port in ports:
+            self._transport._port = int(port)
+            for frame in frames:
+                try:
+                    self._transport.send_and_receive(
+                        frame,
+                        expect_reply=False,
+                        log=True,
+                        timeout_s=0.05,
+                    )
+                except Exception:
+                    continue
+        self._transport._port = active_port
+
+    def _send_zoom_step(self, direction: int) -> None:
+        """C13 rail +/- : ZMC lens step + DZM §4.7 Zoom+/Zoom-."""
+        if int(direction) == 0:
+            return
+        self._ensure_active_transport()
+        frames = build_c13_zoom_step_frames(int(direction))
+        if not frames:
+            return
+        sign = "+" if int(direction) > 0 else "-"
+        try:
+            print(
+                f"[VGCS:skydroid] zoom TOP step dir={sign}1 "
+                f"frames={len(frames)} host={self._transport._host}:{self._transport._port}"
             )
         except Exception:
             pass

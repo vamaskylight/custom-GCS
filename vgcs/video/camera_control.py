@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from PySide6.QtCore import QSettings
@@ -336,10 +337,12 @@ class SkydroidCameraControl:
         try:
             if int(step) == 0:
                 return
-            # ZMC lens step (PROTOCAL M-address) + absolute DZM/MUL sync for RTSP.
+            # PROTOCAL §4.7 / ZMC step per click (not fractional absolute DZM).
             self._adapter.camera_zoom_step(int(step))
             lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))
-            self._adapter.camera_zoom(lvl)
+            # Sync absolute burst only on whole-number × (1×, 2×, 3×…).
+            if abs(lvl - round(lvl)) < 0.05:
+                self._adapter.camera_zoom(round(lvl))
         except Exception:
             return
 
@@ -737,19 +740,34 @@ def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:
     return (ZOOM_MIN, ZOOM_MAX_PREVIEW, ZOOM_STEP_PREVIEW)
 
 
+def _c13_software_preview_zoom_enabled() -> bool:
+    """Until RTSP reflects lens zoom, mirror rail level on preview (set env=0 for RTSP-only)."""
+    return os.environ.get("VGCS_C13_SOFTWARE_PREVIEW_ZOOM", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
 def camera_preview_applies_digital_zoom(
     control: object | None,
     source_id: str = "",
 ) -> bool:
     """
-    Software crop-zoom only when the RTSP feed cannot carry lens magnification.
+    Software crop-zoom when RTSP does not yet show lens magnification.
 
-    C13 day: MUL optical zoom is in the RTSP stream — never crop the preview.
-    Thermal: wide RTSP — software magnify for the rail level.
+    C13 day: hardware ZMC/DZM steps drive the lens; preview can mirror the rail
+    (``VGCS_C13_SOFTWARE_PREVIEW_ZOOM=0`` for RTSP-only once hardware is confirmed).
+    Thermal: wide RTSP — always software magnify.
     """
     primary = resolve_camera_control_primary(control)
     if isinstance(primary, SkydroidCameraControl):
-        return str(source_id or "").strip().lower() == "thermal"
+        sid = str(source_id or "").strip().lower()
+        if sid == "thermal":
+            return True
+        if sid in ("", "day") and _c13_software_preview_zoom_enabled():
+            return True
+        return False
     return True
 
 

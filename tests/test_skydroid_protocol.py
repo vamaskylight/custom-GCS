@@ -104,6 +104,19 @@ def test_build_mul_24x() -> None:
     assert build_mul_optical_zoom(24.0).decode("ascii") == "#tpPM4wMUL024003"
 
 
+def test_dzm_zoom_step_v47_matches_protocal_doc() -> None:
+    from vgcs.skydroid.protocol import build_c13_zoom_step_frames, build_dzm_zoom_step_v47
+
+    assert build_dzm_zoom_step_v47("in") == b"#TPUD2wDZM0A65"
+    assert build_dzm_zoom_step_v47("out") == b"#TPUD2wDZM0B66"
+    frames = build_c13_zoom_step_frames(1)
+    assert len(frames) == 3
+    texts = [f.decode("ascii") for f in frames]
+    assert any("ZMC02" in t for t in texts)
+    assert any("DZM0A" in t for t in texts)
+    assert any("ZMC00" in t for t in texts)
+
+
 def test_zoom_burst_c13_three_frames() -> None:
     from vgcs.skydroid.protocol import build_optical_zoom_frames, build_zoom_command_burst
 
