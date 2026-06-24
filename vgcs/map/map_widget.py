@@ -9268,11 +9268,14 @@ class MapWidget(QWidget):
         return (float(dx) * sy, float(dy) * sp)
 
     def _wire_native_gimbal_hold_button(self, btn: QPushButton, dx: int, dy: int) -> None:
-        """Press/hold = immediate GSY/GSP; release = GSM stop (responsive, no UDP reply wait)."""
+        """Press/hold = PTZ once on C13 (PT_RIGHT…); GSY/GSP refresh on other backends."""
 
         def _start() -> None:
+            self._native_gimbal_speed_stop()
             self._gimbal_hold_axis = (int(dx), int(dy))
             self._native_gimbal_speed_start(dx, dy)
+            if self._native_gimbal_uses_ptz_hold():
+                return
             if not self._gimbal_hold_timer.isActive():
                 self._gimbal_hold_timer.start()
 
@@ -9287,6 +9290,8 @@ class MapWidget(QWidget):
     def _on_gimbal_hold_tick(self) -> None:
         axis = self._gimbal_hold_axis
         if axis is None:
+            return
+        if self._native_gimbal_uses_ptz_hold():
             return
         self._notify_companion_gimbal_motion(duration_s=1.2)
         self._native_gimbal_speed_start(axis[0], axis[1])

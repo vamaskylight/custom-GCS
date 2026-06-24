@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview2"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview3"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -601,11 +601,19 @@ def _companion_stale_preview_reconnect_enabled() -> bool:
 
 
 def _companion_stale_preview_reconnect_streak() -> int:
-    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT_STREAK", "90") or "90").strip()
+    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT_STREAK", "150") or "150").strip()
     try:
-        return max(30, min(600, int(raw)))
+        return max(60, min(600, int(raw)))
     except ValueError:
-        return 90
+        return 150
+
+
+def _companion_stale_preview_reconnect_min_s() -> float:
+    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT_MIN_S", "30") or "30").strip()
+    try:
+        return max(10.0, min(120.0, float(raw)))
+    except ValueError:
+        return 30.0
 
 
 def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
@@ -1386,6 +1394,7 @@ class RtspSource(QObject):
         self._siyi_138_fail_streak: int = 0
         self._siyi_last_open_tail: bytes = b""
         self._companion_transport_override: str | None = None
+        self._companion_last_stale_reconnect_mono: float = 0.0
         self._rec_proc: subprocess.Popen[bytes] | None = None
         self._rec_lock = threading.Lock()
         self._rec_digital_zoom: float = 1.0
@@ -2601,11 +2610,24 @@ class RtspSource(QObject):
                                                 except Exception:
                                                     pass
                                             stale_thr = _companion_stale_preview_reconnect_streak()
-                                            if (
+                                            stale_now = time.monotonic()
+                                            stale_gap = _companion_stale_preview_reconnect_min_s()
+                                            stale_due = (
                                                 _companion_stale_preview_reconnect_enabled()
                                                 and not motion_preview
-                                                and corrupt_skip_streak == stale_thr
-                                            ):
+                                                and corrupt_skip_streak >= stale_thr
+                                                and stale_now
+                                                - float(
+                                                    getattr(
+                                                        self,
+                                                        "_companion_last_stale_reconnect_mono",
+                                                        0.0,
+                                                    )
+                                                    or 0.0
+                                                )
+                                                >= stale_gap
+                                            )
+                                            if stale_due:
                                                 try:
                                                     print(
                                                         "[VGCS:video] companion HEVC: "
@@ -2622,6 +2644,7 @@ class RtspSource(QObject):
                                                         p.kill()
                                                 except Exception:
                                                     pass
+                                                self._companion_last_stale_reconnect_mono = stale_now
                                                 break
                                             if (
                                                 _companion_corrupt_streak_reconnect_enabled()
