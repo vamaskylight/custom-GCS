@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview3"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview4"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -25,6 +25,8 @@ _COMPANION_RTSP_LAST_OPEN_MONO: float = 0.0
 _COMPANION_RTSP_HOST_OWNER: dict[str, str] = {}
 # While gimbal is slewing, never freeze preview on "corrupt" vs last-good (scene changed).
 _companion_preview_motion_until: float = 0.0
+# App minimized / alt-tab — pause RTSP reconnect churn until foreground.
+_companion_app_background_mono: float = 0.0
 
 # MapWidget registers which source ids may open FFmpeg (single view = day only).
 _companion_decode_gate: Callable[[str], bool] | None = None
@@ -40,6 +42,39 @@ def notify_companion_preview_motion(*, duration_s: float = 2.5) -> None:
 
 def _companion_preview_motion_active() -> bool:
     return time.monotonic() < float(_companion_preview_motion_until or 0.0)
+
+
+def notify_companion_app_background() -> None:
+    """Mark app inactive (minimized / alt-tab) — decode thread must not reconnect RTSP."""
+    global _companion_app_background_mono
+    if float(_companion_app_background_mono or 0.0) <= 0.0:
+        try:
+            print("[VGCS:video] companion RTSP: app background — holding decode reconnects")
+        except Exception:
+            pass
+    _companion_app_background_mono = time.monotonic()
+
+
+def notify_companion_app_foreground() -> None:
+    """App active again — caller should schedule a fresh RTSP session."""
+    global _companion_app_background_mono
+    was_bg = float(_companion_app_background_mono or 0.0) > 0.0
+    _companion_app_background_mono = 0.0
+    if was_bg:
+        notify_companion_preview_motion(duration_s=6.0)
+        try:
+            print("[VGCS:video] companion RTSP: app foreground — ready for RTSP refresh")
+        except Exception:
+            pass
+
+
+def _companion_app_is_background() -> bool:
+    return float(_companion_app_background_mono or 0.0) > 0.0
+
+
+def _companion_wait_until_foreground(*, poll_s: float = 0.5) -> None:
+    while _companion_app_is_background():
+        time.sleep(max(0.2, float(poll_s)))
 
 
 def set_companion_decode_gate(fn: Callable[[str], bool] | None) -> None:
@@ -595,8 +630,8 @@ def _companion_gop_warmup_frame_ok(arr: "np.ndarray") -> bool:
 
 
 def _companion_stale_preview_reconnect_enabled() -> bool:
-    """Reconnect for a fresh IDR when preview hides frames too long (same TCP transport)."""
-    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT", "1") or "1").strip().lower()
+    """Off by default — mid-stream kills worsen C13 HEVC; use foreground refresh instead."""
+    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT", "0") or "0").strip().lower()
     return raw in ("1", "on", "true", "yes")
 
 
@@ -2313,6 +2348,8 @@ class RtspSource(QObject):
                     tcp_138_streak = 0
 
                     while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
+                        if companion_rtsp and _companion_app_is_background():
+                            _companion_wait_until_foreground()
                         if companion_rtsp:
                             if not _companion_decode_permitted(self.source_id, url):
                                 break
@@ -2615,6 +2652,7 @@ class RtspSource(QObject):
                                             stale_due = (
                                                 _companion_stale_preview_reconnect_enabled()
                                                 and not motion_preview
+                                                and not _companion_app_is_background()
                                                 and corrupt_skip_streak >= stale_thr
                                                 and stale_now
                                                 - float(
@@ -2874,6 +2912,8 @@ class RtspSource(QObject):
                                 + (f" — {tail_txt[:200]}" if tail_txt else "")
                             )
                             cooldown = _siyi_session_cooldown_s(tail_b, reconnect_delay)
+                            if companion_rtsp:
+                                _companion_wait_until_foreground()
                             if companion_rtsp:
                                 siyi_hw = False
                                 try:

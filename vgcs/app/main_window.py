@@ -456,6 +456,10 @@ class MainWindow(QMainWindow):
         self._map_widget.map_3d_mode_changed.connect(self._on_map_3d_mode_changed)
         self._map_widget.mission_start_requested.connect(self._on_map_mission_start_requested)
 
+        app = QGuiApplication.instance()
+        if app is not None:
+            app.applicationStateChanged.connect(self._on_application_state_changed)
+
         self._flight_timer = QTimer(self)
         self._flight_timer.setInterval(1000)
         self._flight_timer.timeout.connect(self._on_flight_timer_tick)
@@ -4689,6 +4693,40 @@ class MainWindow(QMainWindow):
     def _on_thread_finished(self) -> None:
         self._mission_upload_pending = False
         self._thread = None
+
+    def _on_application_state_changed(self, state: Qt.ApplicationState) -> None:
+        mw = getattr(self, "_map_widget", None)
+        if mw is None:
+            return
+        if state == Qt.ApplicationState.ApplicationActive:
+            try:
+                mw.on_application_foreground()
+            except Exception:
+                pass
+        elif state in (
+            Qt.ApplicationState.ApplicationInactive,
+            Qt.ApplicationState.ApplicationSuspended,
+        ):
+            try:
+                mw.on_application_background()
+            except Exception:
+                pass
+
+    def changeEvent(self, event) -> None:  # noqa: N802 — Qt API
+        if event.type() == QEvent.Type.WindowStateChange:
+            mw = getattr(self, "_map_widget", None)
+            if mw is not None:
+                if self.isMinimized():
+                    try:
+                        mw.on_application_background()
+                    except Exception:
+                        pass
+                elif self.isActiveWindow():
+                    try:
+                        mw.on_application_foreground()
+                    except Exception:
+                        pass
+        super().changeEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt API
         self._on_disconnect()
