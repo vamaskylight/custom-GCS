@@ -169,6 +169,27 @@ def test_c13_rtsp_udp_fallback_opt_in():
 
 
 def test_partial_bottom_magenta_tear_detected():
+    h, w = 120, 200
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    frame[: h // 2, :, 1] = 90
+    rng = np.random.default_rng(4)
+    noise = rng.integers(0, 256, (h - h // 2, w), dtype=np.uint8)
+    frame[h // 2 :, :, 0] = noise
+    frame[h // 2 :, :, 1] = noise
+    frame[h // 2 :, :, 2] = noise
+    assert _rgb_frame_has_decode_artifacts(frame)
+
+
+def test_structural_tear_seam_detected():
+    h, w = 100, 160
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    frame[:60, :, 1] = 100
+    rng = np.random.default_rng(5)
+    frame[60:, :, :] = rng.integers(0, 256, (h - 60, w, 3), dtype=np.uint8)
+    assert _rgb_frame_has_decode_artifacts(frame)
+
+
+def test_partial_bottom_magenta_patch_detected():
     """Top-half OK + patchy bottom macroblocks must not reach the preview."""
     h, w = 120, 200
     frame = np.zeros((h, w, 3), dtype=np.uint8)

@@ -16,7 +16,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-hold-gop"
+_VIDEO_PIPELINE_REV = "2026-06-24-companion-tear-guard"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -565,6 +565,15 @@ def _companion_corrupt_streak_reconnect_enabled() -> bool:
     return raw in ("1", "on", "true", "yes")
 
 
+def _companion_gop_warmup_frames() -> int:
+    """Consecutive artifact-free frames required before showing companion preview."""
+    raw = str(os.environ.get("VGCS_COMPANION_GOP_WARMUP", "5") or "5").strip()
+    try:
+        return max(1, min(30, int(raw)))
+    except ValueError:
+        return 5
+
+
 def _rgb_frame_looks_hevc_corrupt(
     arr: "np.ndarray",
     prev: "np.ndarray | None",
@@ -643,6 +652,59 @@ def _rgb_frame_has_decode_artifacts(
         arr[h - band :, :, :], strict=strict, regional=True
     ):
         return True
+    if _rgb_frame_has_structural_tear(arr):
+        return True
+    return False
+
+
+def _rgb_frame_has_structural_tear(arr: "np.ndarray") -> bool:
+    """
+    Detect HEVC tears that are not neon-colored: B/W noise bands, sky macroblocks,
+    and a sharp horizontal seam between a clean upper scene and corrupt lower rows.
+    """
+    if not HAS_NUMPY or np is None:
+        return False
+    h, w, _ = arr.shape
+    if h < 32 or w < 32:
+        return False
+    r = arr[:, :, 0].astype(np.float32)
+    g = arr[:, :, 1].astype(np.float32)
+    b = arr[:, :, 2].astype(np.float32)
+    gray = 0.299 * r + 0.587 * g + 0.114 * b
+    mid = h // 2
+    top = gray[:mid, :]
+    bot = gray[mid:, :]
+    top_std = float(top.std())
+    bot_std = float(bot.std())
+    if bot_std > max(22.0, top_std * 2.2) and bot_std > top_std + 12.0:
+        return True
+    bot_extreme = float(((bot < 30.0) | (bot > 225.0)).sum()) / float(bot.size)
+    top_extreme = float(((top < 30.0) | (top > 225.0)).sum()) / float(top.size)
+    if bot_extreme > 0.10 and bot_extreme > max(0.04, top_extreme * 2.0):
+        return True
+    row_mean = gray.mean(axis=1)
+    diffs = np.abs(np.diff(row_mean))
+    y0 = h // 4
+    y1 = (h * 4) // 5
+    if y1 > y0 + 2:
+        seam_rel = int(np.argmax(diffs[y0:y1])) + y0
+        if float(diffs[seam_rel]) > 16.0:
+            below_std = float(gray[seam_rel + 1 :, :].std())
+            above_std = float(gray[: max(1, seam_rel), :].std())
+            if below_std > max(20.0, above_std * 1.65):
+                return True
+    sky = gray[: max(8, h // 3), :]
+    sh, sw = sky.shape
+    if sh >= 16 and sw >= 16:
+        block_vars: list[float] = []
+        for y in range(0, sh - 8, 8):
+            for x in range(0, sw - 8, 8):
+                block_vars.append(float(sky[y : y + 8, x : x + 8].std()))
+        if block_vars:
+            med_v = float(np.median(block_vars))
+            max_v = float(np.max(block_vars))
+            if max_v > 40.0 and max_v > med_v * 2.6 and med_v > 7.0:
+                return True
     return False
 
 
@@ -925,7 +987,11 @@ def _ffmpeg_preflags_before_input(
             out.extend(["-thread_queue_size", "512", "-max_delay", "500000"])
         if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
             out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
-    out.extend(["-err_detect", "ignore_err"])
+    if _rtsp_url_is_companion_rtsp(str(url or "").strip()):
+        # Do not use ignore_err — it forces corrupt HEVC macroblocks into rawvideo.
+        out.extend(["-err_detect", "careful"])
+    else:
+        out.extend(["-err_detect", "ignore_err"])
     if (
         sc == "rtsp"
         and _rtsp_url_is_companion_rtsp(str(url or "").strip())
@@ -2038,6 +2104,13 @@ class RtspSource(QObject):
                     "[VGCS:video] companion HEVC: corrupt-streak reconnect disabled "
                     "(hold last good preview; set VGCS_COMPANION_CORRUPT_RECONNECT=1 to enable)"
                 )
+            try:
+                print(
+                    f"[VGCS:video] companion HEVC: GOP warmup "
+                    f"{_companion_gop_warmup_frames()} clean frame(s) before preview"
+                )
+            except Exception:
+                pass
             if siyi_url:
                 mode = "hwaccel=auto" if siyi_hw else "sw (auto codec)"
                 print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
@@ -2105,6 +2178,9 @@ class RtspSource(QObject):
                             except Exception:
                                 pass
                         vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h, hwaccel=siyi_hw)
+                        post_in: list[str] = []
+                        if companion_rtsp:
+                            post_in.extend(["-threads", "1", "-ec", "favor_inter+deblock"])
                         cmd_base = [
                             "ffmpeg",
                             "-hide_banner",
@@ -2120,6 +2196,7 @@ class RtspSource(QObject):
                             ),
                             "-i",
                             url,
+                            *post_in,
                             "-an",
                             "-vf",
                             vf_rgb,
@@ -2209,6 +2286,7 @@ class RtspSource(QObject):
                         corrupt_skip_streak = 0
                         last_good_arr: "np.ndarray | None" = None
                         session_gop_ready = not companion_rtsp
+                        clean_warmup_streak = 0
                         self._ffmpeg_last_raw_sig = None
                         self._ffmpeg_last_raw_change_mono = time.monotonic()
                         session_stop = threading.Event()
@@ -2325,6 +2403,7 @@ class RtspSource(QObject):
                                                 motion_preview=False,
                                             )
                                             if hide_warm:
+                                                clean_warmup_streak = 0
                                                 corrupt_skip_streak += 1
                                                 if corrupt_skip_streak in (1, 30, 90):
                                                     try:
@@ -2336,12 +2415,24 @@ class RtspSource(QObject):
                                                     except Exception:
                                                         pass
                                                 continue
+                                            clean_warmup_streak += 1
+                                            need = _companion_gop_warmup_frames()
+                                            if clean_warmup_streak < need:
+                                                if clean_warmup_streak in (1, need - 1):
+                                                    try:
+                                                        print(
+                                                            "[VGCS:video] companion HEVC: "
+                                                            f"GOP warmup {clean_warmup_streak}/{need}"
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                                continue
                                             session_gop_ready = True
                                             corrupt_skip_streak = 0
                                             try:
                                                 print(
                                                     "[VGCS:video] companion HEVC: clean GOP — "
-                                                    "preview unlocked"
+                                                    f"preview unlocked ({need} frames)"
                                                 )
                                             except Exception:
                                                 pass
