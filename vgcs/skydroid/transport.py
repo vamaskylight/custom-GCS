@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -196,6 +197,52 @@ class TopUdpTransport:
                 self._listener_paused = False
         self._append_log("ERR", str(last_error or "unknown").encode("ascii", errors="ignore"))
         raise RuntimeError(f"TOP UDP request failed: {last_error}")
+
+    def receive_matching(
+        self,
+        predicate: Callable[[bytes], bool],
+        *,
+        timeout_s: float = 1.0,
+        log: bool = False,
+    ) -> bytes | None:
+        """Drain datagrams until ``predicate`` matches or timeout (shared UDP socket)."""
+        self.open()
+        with self._lock:
+            self._listener_paused = True
+            try:
+                assert self._sock is not None
+                prev_timeout = self._sock.gettimeout()
+                deadline = time.monotonic() + max(0.05, float(timeout_s))
+                stray_logged = False
+                try:
+                    while time.monotonic() < deadline:
+                        remaining = deadline - time.monotonic()
+                        self._sock.settimeout(max(0.05, remaining))
+                        try:
+                            data, _addr = self._sock.recvfrom(4096)
+                        except socket.timeout:
+                            continue
+                        except Exception:
+                            break
+                        if log:
+                            self._append_log("RX", data)
+                        if predicate(data):
+                            return data
+                        if log and not stray_logged:
+                            text = (data or b"").decode("ascii", errors="ignore")
+                            self._append_log(
+                                "RX-stray",
+                                text.encode("ascii", errors="ignore"),
+                            )
+                            stray_logged = True
+                finally:
+                    try:
+                        self._sock.settimeout(prev_timeout)
+                    except Exception:
+                        pass
+            finally:
+                self._listener_paused = False
+        return None
 
     def _append_log(self, direction: str, payload: bytes) -> None:
         if not self._log_path:

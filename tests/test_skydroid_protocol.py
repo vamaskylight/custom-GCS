@@ -452,6 +452,47 @@ def test_lrf_lock_move_gimbal_default(monkeypatch) -> None:
     assert SkydroidTopUdpAdapter._lrf_lock_move_gimbal() is False
 
 
+def test_slr_use_trigger_defaults_on(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.delenv("VGCS_LRF_TRIGGER", raising=False)
+    assert SkydroidTopUdpAdapter._slr_use_trigger() is True
+    monkeypatch.setenv("VGCS_LRF_TRIGGER", "0")
+    assert SkydroidTopUdpAdapter._slr_use_trigger() is False
+
+
+def test_transport_receive_matching_drains_stray() -> None:
+    from vgcs.skydroid.transport import TopUdpTransport
+
+    class _FakeSock:
+        def __init__(self) -> None:
+            self._queue = [
+                b"#tpUGCrGACF9F5FD910000D1",
+                b"#TPUD4rSLR0140BC",
+            ]
+            self._timeout = 0.2
+
+        def gettimeout(self) -> float:
+            return self._timeout
+
+        def settimeout(self, value: float) -> None:
+            self._timeout = float(value)
+
+        def recvfrom(self, _n: int) -> tuple[bytes, tuple[str, int]]:
+            if not self._queue:
+                raise TimeoutError("timed out")
+            return self._queue.pop(0), ("127.0.0.1", 5000)
+
+    transport = TopUdpTransport("127.0.0.1", 5000)
+    transport._sock = _FakeSock()  # type: ignore[assignment]
+    got = transport.receive_matching(
+        lambda raw: b"SLR" in raw,
+        timeout_s=0.5,
+        log=False,
+    )
+    assert got == b"#TPUD4rSLR0140BC"
+
+
 def test_try_accept_gimbal_slew_slr_accepts_same_range_after_slew() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
