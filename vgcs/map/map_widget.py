@@ -7551,8 +7551,40 @@ class MapWidget(QWidget):
             "ref_att": track_att,
             "h_scale": float(h_scale),
             "v_scale": float(v_scale),
+            "lrf_slew": bool(used_lrf_slew),
         }
         return out
+
+    def _sync_dooaf_setup_track_from_lrf_lock(self, role: str | None = None) -> None:
+        """Copy post-lock GAC calibration into DOOAF setup mark tracks."""
+        ref_uv = getattr(self, "_lrf_track_ref_uv", None)
+        ref_att = getattr(self, "_lrf_track_ref_att", None)
+        if ref_uv is None or ref_att is None:
+            return
+        roles = [str(role)] if role else list(self._dooaf_setup_mark_track.keys())
+        for rk in roles:
+            built = self._dooaf_setup_mark_track.get(str(rk))
+            if not built or not built.get("lrf_slew"):
+                continue
+            built["ref_uv"] = (float(ref_uv[0]), float(ref_uv[1]))
+            built["ref_att"] = (float(ref_att[0]), float(ref_att[1]))
+            built["h_scale"] = float(
+                getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0
+            )
+            built["v_scale"] = float(
+                getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0
+            )
+
+    def _hide_lrf_video_reticle_keep_range(self) -> None:
+        """Hide duplicate cyan LRF box on video; keep slant range on PROXIMITY."""
+        self._lrf_lock_uv = None
+        self._clear_lrf_track_ref()
+        try:
+            ly = self._native_video_overlay
+            ly.set_lrf_lock(None)
+            ly.update()
+        except Exception:
+            pass
 
     def _register_dooaf_setup_mark_track(
         self,
@@ -7662,6 +7694,7 @@ class MapWidget(QWidget):
         row["video_mark_track_ref_pitch"] = float(ref_att_out[1])
         row["video_mark_track_h_scale"] = float(built["h_scale"])
         row["video_mark_track_v_scale"] = float(built["v_scale"])
+        row["video_mark_lrf_slew"] = bool(used_lrf_slew)
         tlat = row.get("target_lat")
         tlon = row.get("target_lon")
         if tlat is not None and tlon is not None:
@@ -7707,7 +7740,8 @@ class MapWidget(QWidget):
         track: dict[str, object] | None,
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
-        if track is not None:
+        use_attitude = bool(track and track.get("lrf_slew"))
+        if track is not None and not use_attitude:
             glat = track.get("geo_lat")
             glon = track.get("geo_lon")
             if glat is not None and glon is not None:
@@ -7801,23 +7835,24 @@ class MapWidget(QWidget):
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
-        glat = row.get("video_mark_geo_lat")
-        glon = row.get("video_mark_geo_lon")
-        if glat is not None and glon is not None:
-            try:
-                galt = row.get("video_mark_geo_alt_m")
-                alt = float(galt) if galt is not None else None
-            except (TypeError, ValueError):
-                alt = None
-            geo_uv = self._project_geo_to_video_norm(float(glat), float(glon), alt_m=alt)
-            if geo_uv is not None:
-                u, v = geo_uv
-                if self._mark_uv_on_screen(u, v):
-                    return (
-                        max(0.0, min(1.0, float(u))),
-                        max(0.0, min(1.0, float(v))),
-                    )
-                return None
+        if not row.get("video_mark_lrf_slew"):
+            glat = row.get("video_mark_geo_lat")
+            glon = row.get("video_mark_geo_lon")
+            if glat is not None and glon is not None:
+                try:
+                    galt = row.get("video_mark_geo_alt_m")
+                    alt = float(galt) if galt is not None else None
+                except (TypeError, ValueError):
+                    alt = None
+                geo_uv = self._project_geo_to_video_norm(float(glat), float(glon), alt_m=alt)
+                if geo_uv is not None:
+                    u, v = geo_uv
+                    if self._mark_uv_on_screen(u, v):
+                        return (
+                            max(0.0, min(1.0, float(u))),
+                            max(0.0, min(1.0, float(v))),
+                        )
+                    return None
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
             return (float(stored_u), float(stored_v))
@@ -7873,7 +7908,16 @@ class MapWidget(QWidget):
                     ),
                     "h_scale": float(row.get("video_mark_track_h_scale") or 1.0),
                     "v_scale": float(row.get("video_mark_track_v_scale") or 1.0),
+                    "lrf_slew": bool(row.get("video_mark_lrf_slew")),
                 }
+                glat = row.get("video_mark_geo_lat")
+                glon = row.get("video_mark_geo_lon")
+                if glat is not None and glon is not None:
+                    track["geo_lat"] = float(glat)
+                    track["geo_lon"] = float(glon)
+                    galt = row.get("video_mark_geo_alt_m")
+                    if galt is not None:
+                        track["geo_alt_m"] = float(galt)
                 raw = self._project_mark_uv_unclamped(
                     track, (float(vx), float(vy))
                 )
@@ -8803,7 +8847,10 @@ class MapWidget(QWidget):
             new_settings, self._observe_dem_path()
         )
         write_dooaf_settings(st, new_settings)
+        self._sync_dooaf_setup_track_from_lrf_lock()
+        self._hide_lrf_video_reticle_keep_range()
         self._refresh_dooaf_map_overlay()
+        self._schedule_video_marks_overlay_refresh()
         session = build_dooaf_session(self._observations, **self._dooaf_session_kwargs())
         self._set_status(f"DOOAF setup saved — {format_dooaf_status(session)}")
         try:
@@ -11692,6 +11739,12 @@ class MapWidget(QWidget):
                 self._calibrate_lrf_track_after_lock()
                 self._lrf_lock_uv = (0.5, 0.5)
                 self._update_lrf_lock_geo(slant_m)
+                if pending.purpose == "dooaf_setup":
+                    pick_role = str(
+                        getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED
+                    )
+                    self._sync_dooaf_setup_track_from_lrf_lock(pick_role)
+                    self._schedule_video_marks_overlay_refresh()
                 try:
                     self._obstacle_radar.set_c13_lrf_locked(
                         slant_m,
