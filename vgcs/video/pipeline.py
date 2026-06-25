@@ -616,9 +616,9 @@ def _companion_transport_after_hevc_glitch(
 
 
 def _companion_corrupt_streak_reconnect_enabled() -> bool:
-    """Companion preview: hiding corrupt frames is enough; reconnect mid-GOP worsens HEVC."""
-    raw = str(os.environ.get("VGCS_COMPANION_CORRUPT_RECONNECT", "0") or "0").strip().lower()
-    return raw in ("1", "on", "true", "yes")
+    """Re-open RTSP after long artifact streaks (RC Wi‑Fi / hotspot links freeze without this)."""
+    raw = str(os.environ.get("VGCS_COMPANION_CORRUPT_RECONNECT", "1") or "1").strip().lower()
+    return raw not in ("0", "off", "false", "no")
 
 
 def _companion_is_thermal_source(source_id: str, url: str) -> bool:
@@ -679,25 +679,33 @@ def _companion_gop_warmup_frame_ok(
 
 
 def _companion_stale_preview_reconnect_enabled() -> bool:
-    """Off by default — mid-stream kills worsen C13 HEVC; use foreground refresh instead."""
-    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT", "0") or "0").strip().lower()
-    return raw in ("1", "on", "true", "yes")
+    """On by default — hold-last-good without reconnect freezes preview on lossy RC Wi‑Fi."""
+    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT", "1") or "1").strip().lower()
+    return raw not in ("0", "off", "false", "no")
 
 
 def _companion_stale_preview_reconnect_streak() -> int:
-    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT_STREAK", "150") or "150").strip()
+    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT_STREAK", "120") or "120").strip()
     try:
         return max(60, min(600, int(raw)))
     except ValueError:
-        return 150
+        return 120
 
 
 def _companion_stale_preview_reconnect_min_s() -> float:
-    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT_MIN_S", "30") or "30").strip()
+    raw = str(os.environ.get("VGCS_COMPANION_STALE_RECONNECT_MIN_S", "18") or "18").strip()
     try:
         return max(10.0, min(120.0, float(raw)))
     except ValueError:
-        return 30.0
+        return 18.0
+
+
+def _companion_corrupt_streak_reconnect_threshold() -> int:
+    raw = str(os.environ.get("VGCS_COMPANION_CORRUPT_RECONNECT_STREAK", "90") or "90").strip()
+    try:
+        return max(45, min(300, int(raw)))
+    except ValueError:
+        return 90
 
 
 def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
@@ -2350,15 +2358,28 @@ class RtspSource(QObject):
                     "[VGCS:video] companion HEVC: frozen-duplicate reconnect disabled "
                     "(set VGCS_COMPANION_FROZEN_RECONNECT=1 to enable)"
                 )
-            if not _companion_stale_preview_reconnect_enabled():
+            if _companion_stale_preview_reconnect_enabled():
+                print(
+                    "[VGCS:video] companion HEVC: stale-preview reconnect enabled "
+                    f"(streak>={_companion_stale_preview_reconnect_streak()}, "
+                    f"cooldown={_companion_stale_preview_reconnect_min_s():.0f}s; "
+                    "set VGCS_COMPANION_STALE_RECONNECT=0 to disable)"
+                )
+            else:
                 print(
                     "[VGCS:video] companion HEVC: stale-preview reconnect disabled "
-                    "(set VGCS_COMPANION_STALE_RECONNECT=1 to enable)"
+                    "(preview may freeze on RC Wi‑Fi — set VGCS_COMPANION_STALE_RECONNECT=1)"
                 )
-            if not _companion_corrupt_streak_reconnect_enabled():
+            if _companion_corrupt_streak_reconnect_enabled():
+                print(
+                    "[VGCS:video] companion HEVC: corrupt-streak reconnect enabled "
+                    f"(streak>={_companion_corrupt_streak_reconnect_threshold()}; "
+                    "set VGCS_COMPANION_CORRUPT_RECONNECT=0 to disable)"
+                )
+            else:
                 print(
                     "[VGCS:video] companion HEVC: corrupt-streak reconnect disabled "
-                    "(hold last good preview; set VGCS_COMPANION_CORRUPT_RECONNECT=1 to enable)"
+                    "(hold last good preview; set VGCS_COMPANION_CORRUPT_RECONNECT=1)"
                 )
             try:
                 th_label = "thermal" if _companion_is_thermal_source(self.source_id, url) else "day"
@@ -2776,15 +2797,20 @@ class RtspSource(QObject):
                                                     pass
                                                 self._companion_last_stale_reconnect_mono = stale_now
                                                 break
+                                            corrupt_thr = (
+                                                _companion_corrupt_streak_reconnect_threshold()
+                                            )
                                             if (
                                                 _companion_corrupt_streak_reconnect_enabled()
                                                 and not motion_preview
-                                                and corrupt_skip_streak >= 120
+                                                and not _companion_app_is_background()
+                                                and corrupt_skip_streak >= corrupt_thr
                                             ):
                                                 try:
                                                     print(
                                                         "[VGCS:video] companion HEVC: "
-                                                        "corrupt streak — reconnecting RTSP"
+                                                        f"corrupt streak ({corrupt_skip_streak}) "
+                                                        "— reconnecting RTSP for fresh GOP"
                                                     )
                                                 except Exception:
                                                     pass
@@ -2812,6 +2838,9 @@ class RtspSource(QObject):
                                                         p.kill()
                                                 except Exception:
                                                     pass
+                                                session_gop_ready = False
+                                                clean_warmup_streak = 0
+                                                last_good_arr = None
                                                 break
                                             continue
                                         corrupt_skip_streak = 0
