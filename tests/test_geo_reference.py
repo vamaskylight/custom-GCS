@@ -87,6 +87,48 @@ def test_lrf_slant_geo_forward():
     assert abs(float(r.target_lon) - 72.0) < 0.001
 
 
+def test_lrf_slant_geo_boresight_round_trip():
+    """After click-to-aim slew, geo is at boresight; inverse projection returns centre."""
+    from vgcs.observe.geo_reference import (
+        compute_lrf_slant_geo,
+        project_wgs84_to_video_norm,
+    )
+
+    geo = compute_lrf_slant_geo(
+        vehicle_lat=20.4100559,
+        vehicle_lon=72.8799531,
+        vehicle_heading_deg=45.0,
+        vehicle_alt_msl_m=120.0,
+        gimbal_yaw_deg=18.8,
+        gimbal_pitch_deg=-18.0,
+        slant_range_m=79.0,
+        video_x_norm=0.5,
+        video_y_norm=0.5,
+        gps_fix_type=3,
+        camera_hfov_deg=83.4,
+        camera_vfov_deg=46.9,
+    )
+    assert geo.ok
+    assert geo.target_lat is not None
+    assert geo.target_lon is not None
+    uv = project_wgs84_to_video_norm(
+        target_lat=float(geo.target_lat),
+        target_lon=float(geo.target_lon),
+        target_alt_m=geo.target_alt_m,
+        vehicle_lat=20.4100559,
+        vehicle_lon=72.8799531,
+        vehicle_heading_deg=45.0,
+        vehicle_alt_msl_m=120.0,
+        gimbal_yaw_deg=18.8,
+        gimbal_pitch_deg=-18.0,
+        camera_hfov_deg=83.4,
+        camera_vfov_deg=46.9,
+    )
+    assert uv is not None
+    assert abs(uv[0] - 0.5) < 0.02
+    assert abs(uv[1] - 0.5) < 0.02
+
+
 def test_dem_ground_agl_when_ekf_home_offset():
     """EKF rel above home can read ~7 m on the ground; DEM ground height is physical AGL."""
     agl, src = prefer_dem_ground_agl_over_ekf(

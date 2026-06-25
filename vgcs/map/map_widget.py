@@ -112,6 +112,7 @@ from vgcs.observe.geo_reference import (
     apply_geo_reference_result_to_video_row,
     compute_geo_reference,
     compute_lrf_slant_geo,
+    project_wgs84_to_video_norm,
 )
 from vgcs.observe.grid_reference import format_grid_reference
 from vgcs.observe.target_measure import (
@@ -7538,28 +7539,20 @@ class MapWidget(QWidget):
         h_scale = 1.0
         v_scale = 1.0
         if used_lrf_slew and lock_att is not None:
-            u_raw, v_raw = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+            h_scale, v_scale = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
                 track_uv,
                 track_att,
                 lock_att,
             )
-            if abs(float(u_raw) - 0.5) < 0.012 and abs(float(v_raw) - 0.5) < 0.012:
-                h_scale, v_scale = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
-                    track_uv,
-                    track_att,
-                    lock_att,
-                )
-                track_uv = (0.5, 0.5)
-                track_att = (float(lock_att[0]), float(lock_att[1]))
-            else:
-                track_uv = (float(u_raw), float(v_raw))
-                track_att = (float(lock_att[0]), float(lock_att[1]))
-        return {
+            track_uv = (0.5, 0.5)
+            track_att = (float(lock_att[0]), float(lock_att[1]))
+        out: dict[str, object] = {
             "ref_uv": track_uv,
             "ref_att": track_att,
             "h_scale": float(h_scale),
             "v_scale": float(v_scale),
         }
+        return out
 
     def _register_dooaf_setup_mark_track(
         self,
@@ -7569,6 +7562,9 @@ class MapWidget(QWidget):
         ref_att: tuple[float, float] | None,
         lock_att: tuple[float, float] | None,
         used_lrf_slew: bool,
+        geo_lat: float | None = None,
+        geo_lon: float | None = None,
+        geo_alt_m: float | None = None,
     ) -> None:
         """Remember gimbal attitude at pick so marks stay on the world point when camera moves."""
         built = self._build_video_mark_track(
@@ -7582,6 +7578,11 @@ class MapWidget(QWidget):
             self._dooaf_setup_mark_track.pop(key, None)
             self._sync_video_mark_track_timer()
             return
+        if geo_lat is not None and geo_lon is not None:
+            built["geo_lat"] = float(geo_lat)
+            built["geo_lon"] = float(geo_lon)
+            if geo_alt_m is not None:
+                built["geo_alt_m"] = float(geo_alt_m)
         self._dooaf_setup_mark_track[key] = built
         self._sync_video_mark_track_timer()
 
@@ -7661,13 +7662,65 @@ class MapWidget(QWidget):
         row["video_mark_track_ref_pitch"] = float(ref_att_out[1])
         row["video_mark_track_h_scale"] = float(built["h_scale"])
         row["video_mark_track_v_scale"] = float(built["v_scale"])
+        tlat = row.get("target_lat")
+        tlon = row.get("target_lon")
+        if tlat is not None and tlon is not None:
+            row["video_mark_geo_lat"] = float(tlat)
+            row["video_mark_geo_lon"] = float(tlon)
+            talt = row.get("target_alt_m")
+            if talt is not None:
+                try:
+                    row["video_mark_geo_alt_m"] = float(talt)
+                except (TypeError, ValueError):
+                    pass
         self._sync_video_mark_track_timer()
+
+    def _project_geo_to_video_norm(
+        self,
+        lat: float,
+        lon: float,
+        alt_m: float | None = None,
+    ) -> tuple[float, float] | None:
+        ctx = self._observation_context()
+        hfov, vfov = self._c13_lrf_geo_fov()
+        try:
+            return project_wgs84_to_video_norm(
+                target_lat=float(lat),
+                target_lon=float(lon),
+                target_alt_m=alt_m,
+                vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
+                vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
+                vehicle_heading_deg=ctx.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+                vehicle_roll_deg=ctx.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+                vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+                vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+                gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+                gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+                camera_hfov_deg=hfov,
+                camera_vfov_deg=vfov,
+            )
+        except Exception:
+            return None
 
     def _project_mark_uv_unclamped(
         self,
         track: dict[str, object] | None,
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
+        if track is not None:
+            glat = track.get("geo_lat")
+            glon = track.get("geo_lon")
+            if glat is not None and glon is not None:
+                galt = track.get("geo_alt_m")
+                try:
+                    alt = float(galt) if galt is not None else None
+                except (TypeError, ValueError):
+                    alt = None
+                geo_uv = self._project_geo_to_video_norm(
+                    float(glat), float(glon), alt_m=alt
+                )
+                if geo_uv is not None:
+                    return (float(geo_uv[0]), float(geo_uv[1]))
         if not track:
             return (float(stored_uv[0]), float(stored_uv[1]))
         cur = self._read_gimbal_attitude_pair()
@@ -7748,6 +7801,23 @@ class MapWidget(QWidget):
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
+        glat = row.get("video_mark_geo_lat")
+        glon = row.get("video_mark_geo_lon")
+        if glat is not None and glon is not None:
+            try:
+                galt = row.get("video_mark_geo_alt_m")
+                alt = float(galt) if galt is not None else None
+            except (TypeError, ValueError):
+                alt = None
+            geo_uv = self._project_geo_to_video_norm(float(glat), float(glon), alt_m=alt)
+            if geo_uv is not None:
+                u, v = geo_uv
+                if self._mark_uv_on_screen(u, v):
+                    return (
+                        max(0.0, min(1.0, float(u))),
+                        max(0.0, min(1.0, float(v))),
+                    )
+                return None
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
             return (float(stored_u), float(stored_v))
@@ -8177,6 +8247,8 @@ class MapWidget(QWidget):
         slant_range_m: float,
         video_x: float,
         video_y: float,
+        *,
+        boresight_after_slew: bool = False,
     ) -> bool:
         """Place mark geo from measured C13 SLR along the post-slew look vector."""
         try:
@@ -8199,8 +8271,8 @@ class MapWidget(QWidget):
             gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
             gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             slant_range_m=slant,
-            video_x_norm=float(video_x),
-            video_y_norm=float(video_y),
+            video_x_norm=0.5 if boresight_after_slew else float(video_x),
+            video_y_norm=0.5 if boresight_after_slew else float(video_y),
             gps_fix_type=int(ctx.get("gps_fix_type") or 0),
             gps_hdop=ctx.get("gps_hdop"),  # type: ignore[arg-type]
             camera_hfov_deg=hfov,
@@ -8278,7 +8350,11 @@ class MapWidget(QWidget):
         used_lrf = False
         if slant_m is not None:
             used_lrf = self._apply_lrf_slant_geo_to_row(
-                row, float(slant_m), video_x, video_y
+                row,
+                float(slant_m),
+                video_x,
+                video_y,
+                boresight_after_slew=True,
             )
         if not used_lrf:
             self._enrich_observation_geo_reference(row)
@@ -8313,6 +8389,9 @@ class MapWidget(QWidget):
             ref_att=getattr(self, "_lrf_track_ref_att", None),
             lock_att=self._read_gimbal_attitude_pair(),
             used_lrf_slew=bool(used_lrf),
+            geo_lat=float(lat),
+            geo_lon=float(lon),
+            geo_alt_m=alt_m,
         )
         try:
             write_dooaf_setup_video_mark(
@@ -8419,6 +8498,9 @@ class MapWidget(QWidget):
             ref_att=ref_att,
             lock_att=ref_att,
             used_lrf_slew=False,
+            geo_lat=float(lat),
+            geo_lon=float(lon),
+            geo_alt_m=alt_m,
         )
         try:
             write_dooaf_setup_video_mark(
@@ -9097,7 +9179,11 @@ class MapWidget(QWidget):
         used_lrf = False
         if slant_m is not None:
             used_lrf = self._apply_lrf_slant_geo_to_row(
-                row, float(slant_m), video_x, video_y
+                row,
+                float(slant_m),
+                video_x,
+                video_y,
+                boresight_after_slew=True,
             )
         if not used_lrf:
             self._enrich_observation_geo_reference(row)
@@ -11285,7 +11371,7 @@ class MapWidget(QWidget):
         ctx = self._observation_context()
         if ctx.get("gimbal_yaw_deg") is None:
             return
-        uv = getattr(self, "_lrf_lock_uv", None) or (0.5, 0.5)
+        # C13 SLR measures along gimbal boresight (frame centre after click-to-aim slew).
         hfov, vfov = self._c13_lrf_geo_fov()
         geo = compute_lrf_slant_geo(
             vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
@@ -11297,8 +11383,8 @@ class MapWidget(QWidget):
             gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
             gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             slant_range_m=slant,
-            video_x_norm=float(uv[0]),
-            video_y_norm=float(uv[1]),
+            video_x_norm=0.5,
+            video_y_norm=0.5,
             gps_fix_type=int(ctx.get("gps_fix_type") or 0),
             gps_hdop=ctx.get("gps_hdop"),  # type: ignore[arg-type]
             camera_hfov_deg=hfov,
@@ -11603,6 +11689,9 @@ class MapWidget(QWidget):
                 self._lrf_lock_distance_m = slant_m
                 self._lrf_lock_failed = False
                 self._companion_laser_range_m = slant_m
+                self._calibrate_lrf_track_after_lock()
+                self._lrf_lock_uv = (0.5, 0.5)
+                self._update_lrf_lock_geo(slant_m)
                 try:
                     self._obstacle_radar.set_c13_lrf_locked(
                         slant_m,

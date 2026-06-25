@@ -80,6 +80,92 @@ def _mat_vec(m: list[list[float]], v: tuple[float, float, float]) -> tuple[float
     )
 
 
+def _mat_transpose(m: list[list[float]]) -> list[list[float]]:
+    return [[m[r][c] for r in range(3)] for c in range(3)]
+
+
+def _delta_ned_m(
+    vehicle_lat: float,
+    vehicle_lon: float,
+    vehicle_alt_m: float | None,
+    target_lat: float,
+    target_lon: float,
+    target_alt_m: float | None,
+) -> tuple[float, float, float]:
+    """NED offset (m) from vehicle to target; down is positive."""
+    lat_rad = _deg2rad(vehicle_lat)
+    north_m = math.radians(float(target_lat) - float(vehicle_lat)) * _EARTH_RADIUS_M
+    east_m = (
+        math.radians(float(target_lon) - float(vehicle_lon))
+        * _EARTH_RADIUS_M
+        * max(1e-6, math.cos(lat_rad))
+    )
+    v_alt = float(vehicle_alt_m) if vehicle_alt_m is not None else 0.0
+    t_alt = float(target_alt_m) if target_alt_m is not None else v_alt
+    down_m = v_alt - t_alt
+    return float(north_m), float(east_m), float(down_m)
+
+
+def project_wgs84_to_video_norm(
+    *,
+    target_lat: float,
+    target_lon: float,
+    target_alt_m: float | None = None,
+    vehicle_lat: float | None,
+    vehicle_lon: float | None,
+    vehicle_heading_deg: float | None,
+    vehicle_roll_deg: float | None = None,
+    vehicle_pitch_deg: float | None = None,
+    vehicle_alt_msl_m: float | None = None,
+    gimbal_yaw_deg: float | None,
+    gimbal_pitch_deg: float | None,
+    camera_hfov_deg: float = 83.4,
+    camera_vfov_deg: float | None = None,
+) -> tuple[float, float] | None:
+    """Project a WGS84 point into normalized companion video coords (inverse of ray geo)."""
+    if vehicle_lat is None or vehicle_lon is None:
+        return None
+    if gimbal_yaw_deg is None or gimbal_pitch_deg is None:
+        return None
+    north_m, east_m, down_m = _delta_ned_m(
+        float(vehicle_lat),
+        float(vehicle_lon),
+        vehicle_alt_msl_m,
+        float(target_lat),
+        float(target_lon),
+        target_alt_m,
+    )
+    horiz = math.hypot(north_m, east_m)
+    dist = math.hypot(horiz, down_m)
+    if dist < 0.5:
+        return None
+    dir_ned = (north_m / dist, east_m / dist, down_m / dist)
+
+    roll = _deg2rad(float(vehicle_roll_deg or 0.0))
+    pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
+    hdg = _deg2rad(float(vehicle_heading_deg or 0.0))
+    g_yaw = _deg2rad(float(gimbal_yaw_deg))
+    g_pitch = _deg2rad(float(gimbal_pitch_deg))
+
+    r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
+    r_body_gimbal = _mat_mul(_rot_z(g_yaw), _rot_y(g_pitch))
+    r_ned_gimbal = _mat_mul(r_ned_body, r_body_gimbal)
+    v_gimbal = _mat_vec(_mat_transpose(r_ned_gimbal), dir_ned)
+    vx, vy, vz = float(v_gimbal[0]), float(v_gimbal[1]), float(v_gimbal[2])
+    horiz_g = math.hypot(vx, vy)
+    if horiz_g < 1e-4 or vx < 0.02:
+        return None
+
+    az_deg = math.degrees(math.atan2(vy, vx))
+    el_deg = math.degrees(math.atan2(-vz, horiz_g))
+    hfov = max(5.0, min(120.0, float(camera_hfov_deg)))
+    vfov = float(camera_vfov_deg) if camera_vfov_deg is not None else hfov * 0.5625
+    vfov = max(5.0, min(90.0, vfov))
+    u = 0.5 + az_deg / hfov
+    v = 0.5 + el_deg / vfov
+    return (float(u), float(v))
+
+
 def _offset_lat_lon(lat_deg: float, lon_deg: float, north_m: float, east_m: float) -> tuple[float, float]:
     lat_rad = _deg2rad(lat_deg)
     dlat = north_m / _EARTH_RADIUS_M

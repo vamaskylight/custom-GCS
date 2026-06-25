@@ -76,9 +76,9 @@ _LRF_C13_INVERT_GSY = True
 _LRF_C13_INVERT_GSP = False
 _LRF_C13_NEGATE_IMAGE_YAW = True
 _LRF_ALIGN_MIN_OFFSET_DEG = 0.35
-_LRF_ALIGN_SPEED_DPS = 5.0
+_LRF_ALIGN_SPEED_DPS = 3.5
 _LRF_ALIGN_BULK_MIN_DEG = 4.0
-_LRF_ALIGN_BULK_SPEED_DPS = 8.0
+_LRF_ALIGN_BULK_SPEED_DPS = 4.5
 _LRF_ALIGN_MAX_ITERS = 16
 _LRF_ALIGN_TOL_DEG = 2.5
 _LRF_ALIGN_YAW_TOL_DEG = 0.75
@@ -98,7 +98,7 @@ _LRF_SLR_DEST_LASER = "E"
 _LRF_SLR_DEST_SYSTEM = "D"
 _LRF_SLR_DIVERGE_WARN_M = 2.0
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
-_LRF_GIMBAL_SLEW_SETTLE_S = 0.25
+_LRF_GIMBAL_SLEW_SETTLE_S = 0.32
 _LRF_MAX_REPOINTS = 0
 _PROBE_TIMEOUT_S = 0.12
 
@@ -670,32 +670,51 @@ class SkydroidTopUdpAdapter:
         *,
         spd: float,
     ) -> tuple[float, float]:
-        """Large click: one GAP + one GAY at high speed, then iterative refine."""
+        """Large click: one GAP + one GAY at moderate speed, single stop at end."""
         att_now = att
         bulk_spd = max(float(spd), float(_LRF_ALIGN_BULK_SPEED_DPS))
         pitch_delta = abs(self._angle_err_deg(float(pitch_tgt), float(att_now[1])))
         yaw_delta = abs(self._angle_err_deg(float(yaw_tgt), float(att_now[0])))
+        moved = False
         if pitch_delta >= 2.5:
             print(
                 f"[VGCS:lrf] align bulk pitch GAP -> {float(pitch_tgt):.1f}° "
                 f"(Δ={pitch_delta:.1f}° spd={bulk_spd:.0f})"
             )
             self._send_gap_pitch_direct(
-                float(pitch_tgt), bulk_spd, att_pitch=float(att_now[1])
+                float(pitch_tgt),
+                bulk_spd,
+                att_pitch=float(att_now[1]),
+                finalize=False,
             )
             att_now = self._read_gimbal_attitude_deg() or att_now
+            moved = True
         if yaw_delta >= 2.5:
             print(
                 f"[VGCS:lrf] align bulk yaw GAY -> {float(yaw_tgt):.1f}° "
                 f"(Δ={yaw_delta:.1f}° spd={bulk_spd:.0f})"
             )
             self._send_gay_yaw_direct(
-                float(yaw_tgt), bulk_spd, att_yaw=float(att_now[0])
+                float(yaw_tgt),
+                bulk_spd,
+                att_yaw=float(att_now[0]),
+                finalize=False,
             )
             att_now = self._read_gimbal_attitude_deg() or att_now
+            moved = True
+        if moved:
+            time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+            self._gimbal_stop_hard()
         return att_now
 
-    def _send_gay_yaw_direct(self, yaw_tgt: float, spd: float, *, att_yaw: float = 0.0) -> None:
+    def _send_gay_yaw_direct(
+        self,
+        yaw_tgt: float,
+        spd: float,
+        *,
+        att_yaw: float = 0.0,
+        finalize: bool = True,
+    ) -> None:
         """Absolute yaw (GAY) — large horizontal clicks."""
         self._ensure_active_transport()
         self._drop_pending_motion_commands()
@@ -712,9 +731,10 @@ class SkydroidTopUdpAdapter:
         except Exception:
             pass
         delta = abs(self._angle_err_deg(float(yaw_tgt), float(att_yaw)))
-        settle = min(2.2, delta / max(4.0, float(spd)) + 0.22)
+        settle = min(2.5, delta / max(3.0, float(spd)) + 0.30)
         time.sleep(float(settle))
-        self._gimbal_stop_hard()
+        if finalize:
+            self._gimbal_stop_hard()
 
     def _send_gap_pitch_direct(
         self,
@@ -722,6 +742,7 @@ class SkydroidTopUdpAdapter:
         spd: float,
         *,
         att_pitch: float = 0.0,
+        finalize: bool = True,
     ) -> None:
         """Absolute pitch (GAP) — precise vertical aim on C13."""
         self._ensure_active_transport()
@@ -739,9 +760,10 @@ class SkydroidTopUdpAdapter:
         except Exception:
             pass
         delta = abs(self._angle_err_deg(float(pitch_tgt), float(att_pitch)))
-        settle = min(2.4, delta / max(4.0, float(spd)) + 0.25)
+        settle = min(2.5, delta / max(3.0, float(spd)) + 0.30)
         time.sleep(float(settle))
-        self._gimbal_stop_hard()
+        if finalize:
+            self._gimbal_stop_hard()
 
     def _refine_align_axes(
         self,
