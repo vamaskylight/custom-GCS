@@ -738,18 +738,35 @@ def mark_pair_fire_range_m(
     Gun-centric range for fire correction.
 
     When both marks have independent ``geo_range_m``, trust ray law-of-cosines
-    over haversine on collapsed skyline / rooftop footprints.
+    over haversine on collapsed skyline / rooftop footprints — except for a
+    foreground artillery gun pick where drone slant ranges over-estimate
+    horizontal gun→target distance vs setup footprints.
     """
     ray = mark_pair_ground_separation_m(row_a, row_b, hfov_deg=hfov_deg)
     r1 = _row_own_geo_range_m(row_a)
     r2 = _row_own_geo_range_m(row_b)
     if ray is not None and r1 is not None and r2 is not None:
+        if footprint_m is not None and _row_foreground_artillery(row_a):
+            fp = float(footprint_m)
+            # Open-field gun: setup footprints are ground truth; drone rays inflate range.
+            # Facade-collapse sessions keep footprint < ~18 m — still prefer ray there.
+            if fp >= 18.0 and float(ray) > fp * 1.45:
+                return fp
         return float(ray)
     if ray is not None and footprint_m is not None and float(ray) > float(footprint_m) * 1.08:
         return float(ray)
     if footprint_m is not None:
         return float(footprint_m)
     return ray
+
+
+def _row_foreground_artillery(row: dict[str, Any]) -> bool:
+    if str(row.get("dooaf_role") or "") not in ("gun_origin", "gun"):
+        return False
+    try:
+        return float(row.get("video_y_norm") or 0) >= 0.60
+    except (TypeError, ValueError):
+        return False
 
 
 def _video_xy(row: dict[str, Any]) -> tuple[float, float] | None:

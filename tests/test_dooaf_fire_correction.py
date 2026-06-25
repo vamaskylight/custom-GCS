@@ -315,6 +315,68 @@ def test_fire_correction_hillcrest_session_103428():
     assert session.correction.impact_to_intended_m < 5.0
 
 
+def test_fire_correction_session_110839_field_gun_building_impact():
+    """Session 110839 — field gun, roof target, building-base impact at ~20 m hover."""
+    from vgcs.observe.dooaf import build_dooaf_session
+
+    impact = {
+        "kind": "video_mark",
+        "dooaf_role": DOOAF_ROLE_IMPACT,
+        "target_lat": 20.409655445847285,
+        "target_lon": 72.87978047392926,
+        "target_alt_m": 11.7,
+        "video_x_norm": 0.5328125,
+        "video_y_norm": 0.6368477103301384,
+        "vehicle_lat": 20.4100921,
+        "vehicle_lon": 72.8799296,
+        "vehicle_heading_deg": 223.0,
+        "vehicle_pitch_deg": 0.0,
+        "vehicle_roll_deg": 0.0,
+        "vehicle_alt_msl_m": 36.0,
+        "ekf_rel_alt_m": 19.844,
+        "dem_ground_agl_m": 21.434257392883303,
+        "agl_source": "dem_terrain",
+        "gimbal_pitch_deg": -20.0,
+        "gimbal_yaw_deg": 0.0,
+        "gps_fix_type": 3,
+        "camera_hfov_deg": 62.0,
+        "geo_quality": "good",
+    }
+    session = build_dooaf_session(
+        [impact],
+        gun_lat=20.4096387,
+        gun_lon=72.8798257,
+        gun_alt_m=11.676,
+        target_lat=20.4098528,
+        target_lon=72.8798845,
+        target_alt_m=11.746,
+        setup_video_marks={
+            DOOAF_ROLE_GUN: (0.411, 0.721),
+            DOOAF_ROLE_INTENDED: (0.477, 0.443),
+        },
+        dem_path=None,
+    )
+    assert session.correction is not None
+    gt = session.correction.range_gun_to_intended_m
+    gi = session.correction.range_gun_to_impact_m
+    assert gt > 20.0
+    assert gi > 15.0
+    assert gi > 8.5
+    assert gi < gt
+    assert session.correction.impact_to_intended_m < 12.0
+
+
+def test_normalize_setup_video_marks_legacy_keys():
+    from vgcs.observe.dooaf import normalize_dooaf_setup_video_marks
+
+    marks = normalize_dooaf_setup_video_marks(
+        {"gun": (0.411, 0.721), "intended": (0.477, 0.443)}
+    )
+    assert marks is not None
+    assert DOOAF_ROLE_GUN in marks
+    assert DOOAF_ROLE_INTENDED in marks
+
+
 def test_fire_correction_on_line_short():
     gun = GeoPoint(12.0, 77.0)
     intended = GeoPoint(12.01, 77.0)
