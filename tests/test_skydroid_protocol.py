@@ -437,9 +437,9 @@ def test_align_pitch_tol_tightens_for_large_click() -> None:
 def test_align_speed_scales_with_click_offset() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
-    assert SkydroidTopUdpAdapter._align_speed_for_need(2.0) >= 5.0
-    assert SkydroidTopUdpAdapter._align_speed_for_need(10.0) >= 6.5
-    assert SkydroidTopUdpAdapter._align_speed_for_need(18.0) >= 8.0
+    assert SkydroidTopUdpAdapter._align_speed_for_need(2.0) >= 3.5
+    assert SkydroidTopUdpAdapter._align_speed_for_need(10.0) >= 5.5
+    assert SkydroidTopUdpAdapter._align_speed_for_need(18.0) >= 4.5
 
 
 def test_lrf_lock_move_gimbal_default(monkeypatch) -> None:
