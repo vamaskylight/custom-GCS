@@ -180,8 +180,8 @@ class DooafSetupDialog(QDialog):
         )
         btn_pick_gun_vid = QPushButton("Pick on video")
         btn_pick_gun_vid.setToolTip(
-            "Hide this dialog and click the ground in the live video feed "
-            "(uses GPS + gimbal + DEM like a video mark)."
+            "Hide this dialog and click the ground in the live video feed. "
+            "On C13: camera slews to the click and LRF confirms range."
         )
         btn_pick_gun_vid.clicked.connect(
             lambda: self.pick_video_requested.emit(DOOAF_PICK_GUN)
@@ -214,7 +214,8 @@ class DooafSetupDialog(QDialog):
         )
         btn_pick_tgt_vid = QPushButton("Pick on video")
         btn_pick_tgt_vid.setToolTip(
-            "Hide this dialog and click the intended target on the live video feed."
+            "Hide this dialog and click the intended target on the live video feed. "
+            "On C13: camera slews to the click and LRF confirms range."
         )
         btn_pick_tgt_vid.clicked.connect(
             lambda: self.pick_video_requested.emit(DOOAF_PICK_TARGET)

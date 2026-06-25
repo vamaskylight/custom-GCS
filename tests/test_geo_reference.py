@@ -23,6 +23,33 @@ def _nadir_result():
     )
 
 
+def test_apply_geo_reference_result_to_video_row_sets_lrf():
+    from vgcs.observe.geo_reference import (
+        GeoReferenceResult,
+        apply_geo_reference_result_to_video_row,
+    )
+
+    geo = GeoReferenceResult(
+        ok=True,
+        target_lat=20.1,
+        target_lon=72.2,
+        target_alt_m=15.0,
+        quality="good",
+        warning="",
+        method="lrf_slant",
+        horizontal_range_m=42.0,
+        bearing_deg=90.0,
+        depression_deg=-12.0,
+    )
+    row: dict[str, object] = {"kind": "video_mark"}
+    apply_geo_reference_result_to_video_row(row, geo, slant_range_m=45.5)
+    assert row["target_lat"] == 20.1
+    assert row["target_lon"] == 72.2
+    assert row["geo_method"] == "lrf_slant"
+    assert row["lrf_slant_range_m"] == 45.5
+    assert row["geo_range_m"] == 42.0
+
+
 def test_lrf_slant_geo_nadir():
     from vgcs.observe.geo_reference import compute_lrf_slant_geo
 

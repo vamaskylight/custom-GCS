@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 import csv
 import json
 import math
@@ -105,7 +106,11 @@ from vgcs.observe.dooaf import (
     _apply_geo_reference_to_mark_row,
     _forced_ray_geo_for_row,
 )
-from vgcs.observe.geo_reference import compute_geo_reference, compute_lrf_slant_geo
+from vgcs.observe.geo_reference import (
+    apply_geo_reference_result_to_video_row,
+    compute_geo_reference,
+    compute_lrf_slant_geo,
+)
 from vgcs.observe.grid_reference import format_grid_reference
 from vgcs.observe.target_measure import (
     band_width_partner_row,
@@ -879,6 +884,23 @@ class _ObservationSnapshotBridge(QObject):
     finished = Signal(int, str)  # observation index, snapshot path (may be empty)
 
 
+@dataclass
+class _PendingLrfVideoPick:
+    """DOOAF / observation video pick waiting on C13 LRF lock."""
+
+    purpose: str  # "dooaf_setup" | "observation"
+    u: float
+    v: float
+    label: str = ""
+    pick_role: str = ""
+    observation_row: dict[str, object] | None = None
+    obs_kind: str = ""
+    obs_map_lat: float | None = None
+    obs_map_lon: float | None = None
+    obs_clip_path: str = ""
+    obs_capture_snapshot: bool = True
+
+
 class _LrfLockBridge(QObject):
     finished = Signal(object, float, float)  # distance_m | None, u, v
     progress = Signal(float)  # live SLR sample while locking
@@ -1027,6 +1049,7 @@ class _ObservationExportTask(QRunnable):
             "geo_range_m",
             "geo_bearing_deg",
             "geo_depression_deg",
+            "lrf_slant_range_m",
             "segment_distance_m",
             "measure_agl_m",
             "agl_source",
@@ -1314,6 +1337,7 @@ class MapWidget(QWidget):
         self._lrf_lock_bridge = _LrfLockBridge(self)
         self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
         self._lrf_lock_bridge.progress.connect(self._on_c13_lrf_lock_progress)
+        self._pending_lrf_video_pick: _PendingLrfVideoPick | None = None
         self._obs_mark_mode = False
         self._observations: list[dict[str, object]] = []
         self._dooaf_pick_complete = None
@@ -2225,6 +2249,9 @@ class MapWidget(QWidget):
             try:
                 if event is not None:
                     event.accept()
+                if self._lrf_lock_in_progress or self._pending_lrf_video_pick is not None:
+                    self._set_status("LRF lock in progress — wait for range to confirm…")
+                    return
                 pos = event.position()
                 xn, yn = self._native_video_click_norm(pos)
                 self._log_observation("video_mark", video_x=xn, video_y=yn)
@@ -7824,6 +7851,183 @@ class MapWidget(QWidget):
                 alt_m = None
         return float(lat), float(lon), alt_m
 
+    def _dooaf_lrf_geo_enabled(self) -> bool:
+        """True when C13 TOP LRF lock API is available (Skydroid companion)."""
+        cc = getattr(self, "_camera_control", None)
+        if cc is None:
+            return False
+        from vgcs.video.camera_control import NoopCameraControl
+
+        if isinstance(cc, NoopCameraControl):
+            return False
+        return callable(getattr(cc, "lock_lrf_at_video_norm", None))
+
+    def _apply_lrf_slant_geo_to_row(
+        self,
+        row: dict[str, object],
+        slant_range_m: float,
+        video_x: float,
+        video_y: float,
+    ) -> bool:
+        """Place mark geo from measured C13 SLR along the post-slew look vector."""
+        try:
+            slant = float(slant_range_m)
+        except (TypeError, ValueError):
+            return False
+        if slant < 0.5:
+            return False
+        ctx = self._observation_context()
+        if ctx.get("gimbal_yaw_deg") is None:
+            return False
+        hfov, vfov = self._c13_lrf_geo_fov()
+        geo = compute_lrf_slant_geo(
+            vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
+            vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
+            vehicle_heading_deg=ctx.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+            vehicle_roll_deg=ctx.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+            vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+            vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+            gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+            slant_range_m=slant,
+            video_x_norm=float(video_x),
+            video_y_norm=float(video_y),
+            gps_fix_type=int(ctx.get("gps_fix_type") or 0),
+            gps_hdop=ctx.get("gps_hdop"),  # type: ignore[arg-type]
+            camera_hfov_deg=hfov,
+            camera_vfov_deg=vfov,
+        )
+        if not geo.ok or geo.target_lat is None or geo.target_lon is None:
+            print(
+                f"[VGCS:observe] LRF geo unavailable — {geo.warning or geo.quality}"
+            )
+            return False
+        row.update(
+            {
+                k: ctx[k]
+                for k in (
+                    "vehicle_lat",
+                    "vehicle_lon",
+                    "vehicle_heading_deg",
+                    "vehicle_roll_deg",
+                    "vehicle_pitch_deg",
+                    "ekf_rel_alt_m",
+                    "vehicle_rel_alt_m",
+                    "vehicle_alt_msl_m",
+                    "gimbal_yaw_deg",
+                    "gimbal_pitch_deg",
+                    "gps_fix_type",
+                    "gps_satellites",
+                    "gps_hdop",
+                    "rangefinder_down_m",
+                    "measure_agl_m",
+                    "agl_source",
+                    "dem_ground_agl_m",
+                )
+                if k in ctx
+            }
+        )
+        apply_geo_reference_result_to_video_row(row, geo, slant_range_m=slant)
+        print(
+            f"[VGCS:observe] LRF geo=({float(geo.target_lat):.7f},"
+            f"{float(geo.target_lon):.7f}) slant={slant:.1f} m "
+            f"q={geo.quality} method={geo.method}"
+        )
+        try:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None and hasattr(nm, "add_geo_referenced_marker"):
+                nm.add_geo_referenced_marker(
+                    float(geo.target_lat), float(geo.target_lon)
+                )
+        except Exception:
+            pass
+        return True
+
+    def _append_lrf_fallback_warning(self, row: dict[str, object], note: str) -> None:
+        prev = str(row.get("geo_warning") or "").strip()
+        row["geo_warning"] = f"{prev}; {note}" if prev else note
+
+    def _begin_c13_lrf_video_lock_for_pick(self, u: float, v: float, *, label: str) -> None:
+        """Start async LRF lock for a DOOAF / observation video pick."""
+        self._set_status(f"{label} — slewing camera and locking LRF…")
+        self._begin_c13_lrf_video_lock(float(u), float(v))
+
+    def _complete_pending_dooaf_setup_lrf_pick(
+        self,
+        slant_m: float | None,
+        pending: _PendingLrfVideoPick,
+    ) -> None:
+        """Finish DOOAF Setup video pick after LRF lock (or DEM fallback)."""
+        video_x, video_y = float(pending.u), float(pending.v)
+        pick_role = str(pending.pick_role or DOOAF_ROLE_INTENDED)
+        row: dict[str, object] = {
+            "kind": "video_mark",
+            "video_x_norm": video_x,
+            "video_y_norm": video_y,
+        }
+        row.update(self._observation_context())
+        used_lrf = False
+        if slant_m is not None:
+            used_lrf = self._apply_lrf_slant_geo_to_row(
+                row, float(slant_m), video_x, video_y
+            )
+        if not used_lrf:
+            self._enrich_observation_geo_reference(row)
+            if slant_m is None:
+                self._append_lrf_fallback_warning(
+                    row,
+                    "LRF lock failed — position from DEM ray estimate",
+                )
+            else:
+                self._append_lrf_fallback_warning(
+                    row,
+                    "LRF geo failed — position from DEM ray estimate",
+                )
+        lat = row.get("target_lat")
+        lon = row.get("target_lon")
+        if lat is None or lon is None:
+            reason = str(row.get("geo_warning") or row.get("geo_quality") or "")
+            self._dooaf_video_pick_failed(reason)
+            return
+        alt_raw = row.get("target_alt_m")
+        alt_m: float | None = None
+        if alt_raw is not None:
+            try:
+                alt_m = float(alt_raw)
+            except (TypeError, ValueError):
+                alt_m = None
+        cb = self._dooaf_pick_complete
+        self._dooaf_setup_video_marks[pick_role] = (video_x, video_y)
+        try:
+            write_dooaf_setup_video_mark(
+                self._dooaf_settings_store(),
+                pick_role,
+                video_x,
+                video_y,
+            )
+        except Exception:
+            pass
+        self._schedule_video_marks_overlay_refresh()
+        self._end_dooaf_map_pick(restore_target_mode=True)
+        lrf_note = (
+            f" LRF {float(slant_m):.1f} m"
+            if used_lrf and slant_m is not None
+            else " (DEM estimate)"
+        )
+        print(
+            f"[VGCS:observe] dooaf video pick ok lat={float(lat):.7f} lon={float(lon):.7f} "
+            f"alt={alt_m} video=({video_x:.3f},{video_y:.3f}){lrf_note}"
+        )
+        try:
+            cb(float(lat), float(lon), alt_m)
+        except TypeError:
+            cb(float(lat), float(lon))
+        method = str(row.get("geo_method") or "")
+        self._set_status(
+            f"DOOAF {pending.label} saved{lrf_note} — OK to confirm or pick again"
+            + (" · lrf_slant" if method == "lrf_slant" else "")
+        )
+
     def _dooaf_video_pick_failed(self, reason: str) -> None:
         dlg = self._dooaf_pick_dialog
         self._end_dooaf_map_pick(restore_target_mode=True)
@@ -7859,6 +8063,23 @@ class MapWidget(QWidget):
             getattr(self, "_dooaf_pick_from_video", False)
         ):
             return False
+        if self._lrf_lock_in_progress or self._pending_lrf_video_pick is not None:
+            self._set_status("LRF lock in progress — wait for range to confirm…")
+            return True
+        pick_role = str(getattr(self, "_dooaf_pick_role", "") or DOOAF_ROLE_INTENDED)
+        label = dooaf_role_display(pick_role)
+        if self._dooaf_lrf_geo_enabled():
+            self._pending_lrf_video_pick = _PendingLrfVideoPick(
+                purpose="dooaf_setup",
+                u=float(video_x),
+                v=float(video_y),
+                label=label,
+                pick_role=pick_role,
+            )
+            self._begin_c13_lrf_video_lock_for_pick(
+                float(video_x), float(video_y), label=label
+            )
+            return True
         geo = self._compute_video_pick_geo(video_x, video_y)
         if geo is None:
             row: dict[str, object] = {
@@ -8020,11 +8241,20 @@ class MapWidget(QWidget):
                 f"[VGCS:observe] dooaf video pick started role={role} "
                 f"(Target paused={self._dooaf_restore_target_after_pick})"
             )
-            self._set_status(
-                f"Click actual target on video ({label}) — roof / aim point on building"
-                if pick_role == DOOAF_ROLE_INTENDED
-                else f"Click the ground in the video to set {label} (GPS + DEM geo)"
-            )
+            if self._dooaf_lrf_geo_enabled():
+                self._set_status(
+                    f"Click actual target on video ({label}) — roof / aim point; "
+                    "camera will slew and LRF confirms range"
+                    if pick_role == DOOAF_ROLE_INTENDED
+                    else f"Click the ground in the video to set {label}; "
+                    "camera will slew and LRF confirms range"
+                )
+            else:
+                self._set_status(
+                    f"Click actual target on video ({label}) — roof / aim point on building"
+                    if pick_role == DOOAF_ROLE_INTENDED
+                    else f"Click the ground in the video to set {label} (GPS + DEM geo)"
+                )
         else:
             try:
                 nm = getattr(self, "_native_map", None)
@@ -8473,11 +8703,101 @@ class MapWidget(QWidget):
         }
         row.update(self._observation_context())
         row["dooaf_role"] = dooaf_role
+        if (
+            kind == "video_mark"
+            and dooaf_role == DOOAF_ROLE_IMPACT
+            and video_x is not None
+            and video_y is not None
+            and self._dooaf_lrf_geo_enabled()
+        ):
+            if self._lrf_lock_in_progress or self._pending_lrf_video_pick is not None:
+                self._set_status("LRF lock in progress — wait before marking impact…")
+                return
+            self._pending_lrf_video_pick = _PendingLrfVideoPick(
+                purpose="observation",
+                u=float(video_x),
+                v=float(video_y),
+                label="Impact Target",
+                observation_row=row,
+                obs_kind=str(kind),
+                obs_map_lat=map_lat,
+                obs_map_lon=map_lon,
+                obs_clip_path=str(clip_path or "").strip(),
+                obs_capture_snapshot=bool(capture_snapshot),
+            )
+            self._begin_c13_lrf_video_lock_for_pick(
+                float(video_x), float(video_y), label="Impact Target"
+            )
+            return
         self._enrich_observation_geo_reference(row)
+        self._log_observation_after_geo(
+            row,
+            kind=kind,
+            map_lat=map_lat,
+            map_lon=map_lon,
+            video_x=video_x,
+            video_y=video_y,
+            clip_path=clip_path,
+            capture_snapshot=capture_snapshot,
+        )
+
+    def _complete_pending_observation_lrf_pick(
+        self,
+        slant_m: float | None,
+        pending: _PendingLrfVideoPick,
+    ) -> None:
+        row = pending.observation_row
+        if row is None:
+            return
+        video_x, video_y = float(pending.u), float(pending.v)
+        row.update(self._observation_context())
+        used_lrf = False
+        if slant_m is not None:
+            used_lrf = self._apply_lrf_slant_geo_to_row(
+                row, float(slant_m), video_x, video_y
+            )
+        if not used_lrf:
+            self._enrich_observation_geo_reference(row)
+            if slant_m is None:
+                self._append_lrf_fallback_warning(
+                    row,
+                    "LRF lock failed — impact from DEM ray estimate",
+                )
+            else:
+                self._append_lrf_fallback_warning(
+                    row,
+                    "LRF geo failed — impact from DEM ray estimate",
+                )
+        self._log_observation_after_geo(
+            row,
+            kind=str(pending.obs_kind or "video_mark"),
+            map_lat=pending.obs_map_lat,
+            map_lon=pending.obs_map_lon,
+            video_x=video_x,
+            video_y=video_y,
+            clip_path=pending.obs_clip_path or None,
+            capture_snapshot=bool(pending.obs_capture_snapshot),
+        )
+
+    def _log_observation_after_geo(
+        self,
+        row: dict[str, object],
+        *,
+        kind: str,
+        map_lat: float | None = None,
+        map_lon: float | None = None,
+        video_x: float | None = None,
+        video_y: float | None = None,
+        clip_path: str | None = None,
+        capture_snapshot: bool = True,
+    ) -> None:
+        """Append observation row after geo (DEM ray or LRF) is on ``row``."""
+        dooaf_role = str(row.get("dooaf_role") or "")
         track_before = target_track_from_observations(self._observations)
         seg_m = None
         pt = observation_target_latlon(row)
         cross_band = False
+        partner: dict[str, object] | None = None
         if dooaf_role == DOOAF_ROLE_IMPACT and pt is not None:
             intended = latest_mark(self._observations, DOOAF_ROLE_INTENDED)
             if intended is not None:
@@ -10886,13 +11206,19 @@ class MapWidget(QWidget):
             self._lrf_lock_distance_m = dm
             self._update_lrf_lock_geo(dm)
             self._refresh_lrf_lock_overlay()
+            pending = getattr(self, "_pending_lrf_video_pick", None)
             try:
                 self._obstacle_radar.set_c13_lrf_locking(
                     dm, geo_label=str(getattr(self, "_lrf_lock_geo_label", "") or "")
                 )
             except Exception:
                 pass
-            status = f"Locking LRF… {format_slr_display_m(dm)}"
+            if pending is not None:
+                status = (
+                    f"{pending.label} — locking LRF… {format_slr_display_m(dm)}"
+                )
+            else:
+                status = f"Locking LRF… {format_slr_display_m(dm)}"
             if getattr(self, "_lrf_lock_geo_label", ""):
                 status += f" · {self._lrf_lock_geo_label}"
             self._set_status(status)
@@ -10901,6 +11227,44 @@ class MapWidget(QWidget):
 
     def _on_c13_lrf_lock_finished(self, dist: object, u: float, v: float) -> None:
         self._lrf_lock_in_progress = False
+        pending = getattr(self, "_pending_lrf_video_pick", None)
+        if pending is not None:
+            self._pending_lrf_video_pick = None
+            slant_m: float | None = None
+            if dist is not None:
+                try:
+                    slant_m = float(dist)
+                except (TypeError, ValueError):
+                    slant_m = None
+            try:
+                if pending.purpose == "dooaf_setup":
+                    self._complete_pending_dooaf_setup_lrf_pick(slant_m, pending)
+                elif pending.purpose == "observation":
+                    self._complete_pending_observation_lrf_pick(slant_m, pending)
+            except Exception as exc:
+                print(f"[VGCS:observe] DOOAF/LRF pick failed: {exc}")
+                if pending.purpose == "dooaf_setup":
+                    self._dooaf_video_pick_failed(str(exc))
+            self._lrf_lock_uv = (float(u), float(v))
+            if slant_m is not None:
+                self._lrf_lock_distance_m = slant_m
+                self._lrf_lock_failed = False
+                self._companion_laser_range_m = slant_m
+                try:
+                    self._obstacle_radar.set_c13_lrf_locked(
+                        slant_m,
+                        geo_label=str(getattr(self, "_lrf_lock_geo_label", "") or ""),
+                    )
+                except Exception:
+                    pass
+            else:
+                self._lrf_lock_failed = True
+                try:
+                    self._obstacle_radar.set_c13_lrf_lock_failed()
+                except Exception:
+                    pass
+            self._refresh_lrf_lock_overlay()
+            return
         try:
             if dist is None:
                 self._lrf_lock_uv = (float(u), float(v))
