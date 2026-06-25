@@ -7622,6 +7622,8 @@ class MapWidget(QWidget):
         self._sync_video_mark_track_timer()
 
     def _video_mark_tracking_active(self) -> bool:
+        if bool(getattr(self, "_lrf_lock_in_progress", False)):
+            return True
         if getattr(self, "_dooaf_setup_mark_track", None):
             return True
         for row in self._observations:
@@ -7646,9 +7648,21 @@ class MapWidget(QWidget):
             t.start()
 
     def _refresh_tracked_video_marks_light(self) -> None:
-        """Reproject tracked marks only — no DEM/session work on the UI thread."""
-        if not self._video_mark_tracking_active():
-            self._sync_video_mark_track_timer()
+        """Reproject tracked marks and LRF reticle during slew (~20 Hz)."""
+        if bool(getattr(self, "_lrf_lock_in_progress", False)):
+            try:
+                self._refresh_lrf_lock_overlay(sync_geometry=False)
+            except Exception:
+                pass
+        if not (
+            getattr(self, "_dooaf_setup_mark_track", None)
+            or any(
+                row.get("video_mark_track_ref_u") is not None
+                for row in self._observations
+            )
+        ):
+            if not bool(getattr(self, "_lrf_lock_in_progress", False)):
+                self._sync_video_mark_track_timer()
             return
         try:
             marks = self._video_overlay_marks()
@@ -8515,7 +8529,18 @@ class MapWidget(QWidget):
                 float(video_x),
                 float(video_y),
             )
-            self._dooaf_setup_mark_track.pop(pick_role, None)
+            ref_att = self._read_gimbal_attitude_pair()
+            if ref_att is not None:
+                self._dooaf_setup_mark_track[pick_role] = {
+                    "ref_uv": (float(video_x), float(video_y)),
+                    "ref_att": (float(ref_att[0]), float(ref_att[1])),
+                    "h_scale": 1.0,
+                    "v_scale": 1.0,
+                    "lrf_slew": False,
+                }
+            else:
+                self._dooaf_setup_mark_track.pop(pick_role, None)
+            self._sync_video_mark_track_timer()
             self._schedule_video_marks_overlay_refresh()
             self._pending_lrf_video_pick = _PendingLrfVideoPick(
                 purpose="dooaf_setup",
@@ -11372,31 +11397,32 @@ class MapWidget(QWidget):
         self._lrf_track_gac_v_scale = 1.0
 
     def _update_lrf_reticle_track(self) -> None:
-        # While slewing, keep the reticle on the user's click — not boresight / geo centre.
-        if bool(getattr(self, "_lrf_lock_in_progress", False)):
-            click_uv = getattr(self, "_lrf_click_uv", None)
-            if click_uv is not None:
-                self._lrf_lock_uv = (float(click_uv[0]), float(click_uv[1]))
-                return
-        lock_lat = getattr(self, "_lrf_lock_lat", None)
-        lock_lon = getattr(self, "_lrf_lock_lon", None)
-        if lock_lat is not None and lock_lon is not None:
-            lock_alt = getattr(self, "_lrf_lock_alt_m", None)
-            try:
-                alt = float(lock_alt) if lock_alt is not None else None
-            except (TypeError, ValueError):
-                alt = None
-            geo_uv = self._project_geo_to_video_norm(
-                float(lock_lat), float(lock_lon), alt_m=alt
-            )
-            if geo_uv is not None:
-                self._lrf_lock_uv = (float(geo_uv[0]), float(geo_uv[1]))
-                return
-        if not self._lrf_reticle_tracking_active():
-            return
+        in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
+        # After lock: world-fixed geo projection (handles drone movement in wind).
+        if not in_progress:
+            lock_lat = getattr(self, "_lrf_lock_lat", None)
+            lock_lon = getattr(self, "_lrf_lock_lon", None)
+            if lock_lat is not None and lock_lon is not None:
+                lock_alt = getattr(self, "_lrf_lock_alt_m", None)
+                try:
+                    alt = float(lock_alt) if lock_alt is not None else None
+                except (TypeError, ValueError):
+                    alt = None
+                geo_uv = self._project_geo_to_video_norm(
+                    float(lock_lat), float(lock_lon), alt_m=alt
+                )
+                if geo_uv is not None:
+                    self._lrf_lock_uv = (float(geo_uv[0]), float(geo_uv[1]))
+                    return
+        # During slew: attitude track from click pose so mark stays on the building.
         ref_uv = getattr(self, "_lrf_track_ref_uv", None)
         ref_att = getattr(self, "_lrf_track_ref_att", None)
         if ref_uv is None or ref_att is None:
+            click_uv = getattr(self, "_lrf_click_uv", None)
+            if click_uv is not None:
+                self._lrf_lock_uv = (float(click_uv[0]), float(click_uv[1]))
+            return
+        if not in_progress and not self._lrf_reticle_tracking_active():
             return
         cur = self._read_gimbal_attitude_pair()
         if cur is None:
@@ -11709,6 +11735,7 @@ class MapWidget(QWidget):
         self._clear_lrf_lock_geo()
         self._notify_companion_gimbal_motion(duration_s=5.0)
         self._capture_lrf_track_ref(float(u), float(v))
+        self._sync_video_mark_track_timer()
         self._sync_lrf_armed_backend(False)
         try:
             from vgcs.video.camera_control import poll_companion_laser_range_m
@@ -11766,6 +11793,7 @@ class MapWidget(QWidget):
 
     def _on_c13_lrf_lock_finished(self, dist: object, u: float, v: float) -> None:
         self._lrf_lock_in_progress = False
+        self._sync_video_mark_track_timer()
         pending = getattr(self, "_pending_lrf_video_pick", None)
         if pending is not None:
             self._pending_lrf_video_pick = None
