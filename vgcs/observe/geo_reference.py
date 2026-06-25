@@ -30,6 +30,53 @@ from vgcs.observe.target_measure import (
 
 _EARTH_RADIUS_M = 6_371_000.0
 
+# EMA for mark-track vehicle pose (lat/lon/heading) — tames GPS jitter in flight.
+_MARK_TRACK_POSE_SMOOTH_ALPHA = 0.28
+
+
+def smooth_vehicle_pose_ema(
+    store: dict[str, object],
+    *,
+    vehicle_lat: float | None,
+    vehicle_lon: float | None,
+    vehicle_heading_deg: float | None,
+    alpha: float = _MARK_TRACK_POSE_SMOOTH_ALPHA,
+) -> tuple[float | None, float | None, float | None]:
+    """Low-pass vehicle pose for stable world→video mark projection while airborne."""
+    a = max(0.05, min(1.0, float(alpha)))
+    out_lat: float | None = None
+    out_lon: float | None = None
+    out_hdg: float | None = None
+    if vehicle_lat is not None:
+        try:
+            cur = float(vehicle_lat)
+            prev = store.get("smooth_vehicle_lat")
+            out_lat = cur if prev is None else (1.0 - a) * float(prev) + a * cur
+            store["smooth_vehicle_lat"] = out_lat
+        except (TypeError, ValueError):
+            pass
+    if vehicle_lon is not None:
+        try:
+            cur = float(vehicle_lon)
+            prev = store.get("smooth_vehicle_lon")
+            out_lon = cur if prev is None else (1.0 - a) * float(prev) + a * cur
+            store["smooth_vehicle_lon"] = out_lon
+        except (TypeError, ValueError):
+            pass
+    if vehicle_heading_deg is not None:
+        try:
+            cur = float(vehicle_heading_deg)
+            prev = store.get("smooth_vehicle_heading_deg")
+            if prev is None:
+                out_hdg = cur
+            else:
+                diff = ((cur - float(prev) + 180.0) % 360.0) - 180.0
+                out_hdg = float(prev) + a * diff
+            store["smooth_vehicle_heading_deg"] = out_hdg
+        except (TypeError, ValueError):
+            pass
+    return out_lat, out_lon, out_hdg
+
 
 @dataclass(frozen=True)
 class GeoReferenceResult:
