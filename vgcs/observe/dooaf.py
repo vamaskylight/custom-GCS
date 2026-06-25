@@ -1798,6 +1798,9 @@ def format_geo_method_badge(method: object) -> str:
         tone = "badge-muted"
     elif m.startswith("ray_ground"):
         tone = "badge-info"
+    elif m == "lrf_slant":
+        tone = "badge-dem"
+        label = "lrf_slant (C13 LRF)"
     return f"<span class='badge {tone}'>{_html_esc(label)}</span>"
 
 
@@ -4676,6 +4679,13 @@ def _log_summary_rows(row: dict[str, object], cell_fn: Any) -> list[str]:
             _log_detail_row(
                 "Geo range",
                 _format_distance_m_html(row.get("geo_range_m"), cell_fn),
+            )
+        )
+    if not _is_missing_cell(row.get("lrf_slant_range_m"), cell_fn):
+        rows.append(
+            _log_detail_row(
+                "LRF slant range",
+                _format_distance_m_html(row.get("lrf_slant_range_m"), cell_fn),
             )
         )
 

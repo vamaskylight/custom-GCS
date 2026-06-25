@@ -596,3 +596,36 @@ def enrich_video_mark_target_altitude(row: dict[str, object]) -> None:
 
     row["target_alt_m"] = resolved
     row["target_alt_method"] = method
+
+
+def apply_geo_reference_result_to_video_row(
+    row: dict[str, object],
+    geo: GeoReferenceResult,
+    *,
+    slant_range_m: float | None = None,
+) -> None:
+    """Copy a geo result onto a video mark / DOOAF pick row."""
+    row["target_lat"] = geo.target_lat
+    row["target_lon"] = geo.target_lon
+    row["target_alt_m"] = geo.target_alt_m
+    row["geo_quality"] = geo.quality
+    row["geo_warning"] = geo.warning
+    row["geo_method"] = geo.method
+    if geo.depression_deg is not None:
+        row["geo_depression_deg"] = geo.depression_deg
+    else:
+        row["geo_depression_deg"] = None
+    if geo.horizontal_range_m is not None:
+        row["geo_range_m"] = geo.horizontal_range_m
+    else:
+        row["geo_range_m"] = None
+    if geo.bearing_deg is not None:
+        row["geo_bearing_deg"] = geo.bearing_deg
+    else:
+        row["geo_bearing_deg"] = None
+    if slant_range_m is not None:
+        try:
+            row["lrf_slant_range_m"] = float(slant_range_m)
+        except (TypeError, ValueError):
+            row["lrf_slant_range_m"] = None
+    enrich_video_mark_target_altitude(row)  # type: ignore[arg-type]
