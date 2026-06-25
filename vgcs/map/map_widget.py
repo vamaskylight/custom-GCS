@@ -1328,6 +1328,7 @@ class MapWidget(QWidget):
         self._lrf_lock_armed = False
         self._lrf_lock_uv: tuple[float, float] | None = None
         self._lrf_click_uv: tuple[float, float] | None = None
+        self._lrf_click_att: tuple[float, float] | None = None
         self._lrf_lock_distance_m: float | None = None
         self._lrf_lock_in_progress = False
         self._lrf_lock_failed = False
@@ -7541,11 +7542,14 @@ class MapWidget(QWidget):
         h_scale = 1.0
         v_scale = 1.0
         if used_lrf_slew and lock_att is not None:
-            h_scale, v_scale = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
-                track_uv,
-                track_att,
-                lock_att,
-            )
+            h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
+            v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
+            if abs(h_scale - 1.0) < 1e-6 and abs(v_scale - 1.0) < 1e-6:
+                h_scale, v_scale = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
+                    track_uv,
+                    track_att,
+                    lock_att,
+                )
             track_uv = (0.5, 0.5)
             track_att = (float(lock_att[0]), float(lock_att[1]))
         out: dict[str, object] = {
@@ -7558,29 +7562,26 @@ class MapWidget(QWidget):
         return out
 
     def _sync_dooaf_setup_track_from_lrf_lock(self, role: str | None = None) -> None:
-        """Copy post-lock GAC calibration into DOOAF setup mark tracks."""
-        ref_uv = getattr(self, "_lrf_track_ref_uv", None)
-        ref_att = getattr(self, "_lrf_track_ref_att", None)
-        if ref_uv is None or ref_att is None:
-            return
+        """Copy post-lock GAC scale factors into DOOAF setup mark tracks.
+
+        ref_uv/ref_att stay at boresight+lock pose from _build_video_mark_track;
+        overwriting them with pre-lock calibration residuals caused post-OK drift.
+        """
+        h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
+        v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
         roles = [str(role)] if role else list(self._dooaf_setup_mark_track.keys())
         for rk in roles:
             built = self._dooaf_setup_mark_track.get(str(rk))
             if not built or not built.get("lrf_slew"):
                 continue
-            built["ref_uv"] = (float(ref_uv[0]), float(ref_uv[1]))
-            built["ref_att"] = (float(ref_att[0]), float(ref_att[1]))
-            built["h_scale"] = float(
-                getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0
-            )
-            built["v_scale"] = float(
-                getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0
-            )
+            built["h_scale"] = h_scale
+            built["v_scale"] = v_scale
 
     def _hide_lrf_video_reticle_keep_range(self) -> None:
         """Hide duplicate cyan LRF box on video; keep slant range on PROXIMITY."""
         self._lrf_lock_uv = None
         self._lrf_click_uv = None
+        self._lrf_click_att = None
         self._clear_lrf_track_ref()
         try:
             ly = self._native_video_overlay
@@ -8504,11 +8505,13 @@ class MapWidget(QWidget):
             except (TypeError, ValueError):
                 alt_m = None
         cb = self._dooaf_pick_complete
-        self._dooaf_setup_video_marks[pick_role] = (video_x, video_y)
+        mark_u, mark_v = (0.5, 0.5) if used_lrf else (video_x, video_y)
+        self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
+        click_att = getattr(self, "_lrf_click_att", None)
         self._register_dooaf_setup_mark_track(
             pick_role,
             ref_uv=(video_x, video_y),
-            ref_att=getattr(self, "_lrf_track_ref_att", None),
+            ref_att=click_att,
             lock_att=self._read_gimbal_attitude_pair(),
             used_lrf_slew=bool(used_lrf),
             geo_lat=float(lat),
@@ -8519,8 +8522,8 @@ class MapWidget(QWidget):
             write_dooaf_setup_video_mark(
                 self._dooaf_settings_store(),
                 pick_role,
-                video_x,
-                video_y,
+                mark_u,
+                mark_v,
             )
         except Exception:
             pass
@@ -11385,9 +11388,11 @@ class MapWidget(QWidget):
         if att is None:
             self._lrf_track_ref_uv = None
             self._lrf_track_ref_att = None
+            self._lrf_click_att = None
             return
         self._lrf_track_ref_uv = (float(u), float(v))
         self._lrf_track_ref_att = att
+        self._lrf_click_att = att
         self._lrf_track_gac_h_scale = 1.0
         self._lrf_track_gac_v_scale = 1.0
 
@@ -11401,20 +11406,10 @@ class MapWidget(QWidget):
         try:
             from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
-            u_raw, v_raw = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
-                ref_uv,
-                ref_att,
-                lock_att,
-                gac_h_scale=1.0,
-                gac_v_scale=1.0,
-            )
-            self._lrf_lock_uv = (float(u_raw), float(v_raw))
-            res_u = abs(float(u_raw) - 0.5)
-            res_v = abs(float(v_raw) - 0.5)
-            # Only learn GAC scale when boresight is on the click (avoids biasing pan track).
-            if res_u < 0.012 and res_v < 0.012:
-                h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
-                v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
+            h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
+            v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
+            click_off = max(abs(float(ref_uv[0]) - 0.5), abs(float(ref_uv[1]) - 0.5))
+            if click_off > 0.02:
                 h_new, v_new = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
                     ref_uv,
                     ref_att,
@@ -11424,30 +11419,25 @@ class MapWidget(QWidget):
                 )
                 self._lrf_track_gac_h_scale = float(h_new)
                 self._lrf_track_gac_v_scale = float(v_new)
-                u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
-                    ref_uv,
-                    ref_att,
-                    lock_att,
-                    gac_h_scale=h_new,
-                    gac_v_scale=v_new,
-                )
-                self._lrf_lock_uv = (float(u), float(v))
                 print(
-                    f"[VGCS:lrf] track calibrate gac_scale=({h_new:.3f},{v_new:.3f}) "
-                    f"lock_uv=({u:.3f},{v:.3f})"
+                    f"[VGCS:lrf] track calibrate gac_scale=({h_new:.3f},{v_new:.3f})"
                 )
-                self._lrf_track_ref_uv = (0.5, 0.5)
-                self._lrf_track_ref_att = lock_att
-            else:
-                self._lrf_track_gac_h_scale = 1.0
-                self._lrf_track_gac_v_scale = 1.0
-                self._lrf_track_ref_uv = (float(u_raw), float(v_raw))
-                self._lrf_track_ref_att = lock_att
-                print(
-                    f"[VGCS:lrf] track skip calibrate "
-                    f"lock_uv=({u_raw:.3f},{v_raw:.3f}) "
-                    f"residual=({res_u:.3f},{res_v:.3f})"
-                )
+            u_chk, v_chk = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+                ref_uv,
+                ref_att,
+                lock_att,
+                gac_h_scale=float(self._lrf_track_gac_h_scale),
+                gac_v_scale=float(self._lrf_track_gac_v_scale),
+            )
+            res_u = abs(float(u_chk) - 0.5)
+            res_v = abs(float(v_chk) - 0.5)
+            # Laser range is along boresight — track from frame centre at lock pose.
+            self._lrf_track_ref_uv = (0.5, 0.5)
+            self._lrf_track_ref_att = lock_att
+            self._lrf_lock_uv = (0.5, 0.5)
+            print(
+                f"[VGCS:lrf] track lock boresight residual=({res_u:.3f},{res_v:.3f})"
+            )
         except Exception:
             pass
 
@@ -11459,22 +11449,6 @@ class MapWidget(QWidget):
 
     def _update_lrf_reticle_track(self) -> None:
         in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
-        # After lock: world-fixed geo projection (handles drone movement in wind).
-        if not in_progress:
-            lock_lat = getattr(self, "_lrf_lock_lat", None)
-            lock_lon = getattr(self, "_lrf_lock_lon", None)
-            if lock_lat is not None and lock_lon is not None:
-                lock_alt = getattr(self, "_lrf_lock_alt_m", None)
-                try:
-                    alt = float(lock_alt) if lock_alt is not None else None
-                except (TypeError, ValueError):
-                    alt = None
-                geo_uv = self._project_geo_to_video_norm(
-                    float(lock_lat), float(lock_lon), alt_m=alt
-                )
-                if geo_uv is not None:
-                    self._lrf_lock_uv = (float(geo_uv[0]), float(geo_uv[1]))
-                    return
         # During slew: attitude track from click pose so mark stays on the building.
         ref_uv = getattr(self, "_lrf_track_ref_uv", None)
         ref_att = getattr(self, "_lrf_track_ref_att", None)
@@ -11544,7 +11518,13 @@ class MapWidget(QWidget):
             return
         in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
         click_uv = getattr(self, "_lrf_click_uv", None)
-        if in_progress and click_uv is not None:
+        use_click = (
+            in_progress
+            and click_uv is not None
+            and not self._c13_lrf_is_locked()
+            and getattr(self, "_lrf_lock_distance_m", None) is None
+        )
+        if use_click:
             video_u, video_v = float(click_uv[0]), float(click_uv[1])
         else:
             # After slew: SLR measures along gimbal boresight (frame centre).
@@ -11687,6 +11667,7 @@ class MapWidget(QWidget):
         if not self._c13_lrf_is_locked():
             self._lrf_lock_uv = None
             self._lrf_click_uv = None
+            self._lrf_click_att = None
             self._lrf_lock_armed = True
             try:
                 self._obstacle_radar.set_c13_lrf_armed(True)
@@ -11724,6 +11705,7 @@ class MapWidget(QWidget):
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None
         self._lrf_click_uv = None
+        self._lrf_click_att = None
         self._lrf_lock_distance_m = None
         self._clear_lrf_track_ref()
         self._sync_lrf_armed_backend(True)
@@ -11740,6 +11722,7 @@ class MapWidget(QWidget):
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None
         self._lrf_click_uv = None
+        self._lrf_click_att = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
         self._clear_lrf_track_ref()
@@ -11757,6 +11740,7 @@ class MapWidget(QWidget):
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None
         self._lrf_click_uv = None
+        self._lrf_click_att = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
         self._clear_lrf_track_ref()
@@ -11872,7 +11856,6 @@ class MapWidget(QWidget):
                 self._lrf_lock_failed = False
                 self._companion_laser_range_m = slant_m
                 self._calibrate_lrf_track_after_lock()
-                self._lrf_lock_uv = (0.5, 0.5)
                 self._update_lrf_lock_geo(slant_m)
             try:
                 if pending.purpose == "dooaf_setup":
