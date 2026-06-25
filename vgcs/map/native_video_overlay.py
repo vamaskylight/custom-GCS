@@ -2,14 +2,53 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import Qt, QPointF
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from vgcs.skydroid.protocol import format_slr_display_m
+
+
+def offscreen_hint_edge_uv(
+    u: float,
+    v: float,
+    *,
+    margin: float = 0.04,
+) -> tuple[float, float, float]:
+    """Map an off-screen mark UV to an in-frame edge anchor and outward arrow angle (degrees)."""
+    cu, cv = 0.5, 0.5
+    du = float(u) - cu
+    dv = float(v) - cv
+    lo = float(margin)
+    hi = 1.0 - float(margin)
+    if abs(du) < 1e-9 and abs(dv) < 1e-9:
+        return lo, 0.5, 180.0
+    min_t = float("inf")
+    edge_u, edge_v = lo, 0.5
+    if abs(du) > 1e-9:
+        for x_edge in (lo, hi):
+            t = (x_edge - cu) / du
+            if t <= 0.0:
+                continue
+            py = cv + t * dv
+            if lo <= py <= hi and t < min_t:
+                min_t = t
+                edge_u, edge_v = float(x_edge), float(py)
+    if abs(dv) > 1e-9:
+        for y_edge in (lo, hi):
+            t = (y_edge - cv) / dv
+            if t <= 0.0:
+                continue
+            px = cu + t * du
+            if lo <= px <= hi and t < min_t:
+                min_t = t
+                edge_u, edge_v = float(px), float(y_edge)
+    angle = math.degrees(math.atan2(dv, du))
+    return edge_u, edge_v, angle
 
 
 @dataclass(frozen=True)
@@ -30,6 +69,18 @@ class VideoOverlayMark:
 
     x: float
     y: float
+    role: str = ""
+    index: int = 0
+
+
+@dataclass(frozen=True)
+class VideoOverlayOffscreenHint:
+    """Edge cue when a world-anchored mark is outside the current video frame."""
+
+    edge_x: float
+    edge_y: float
+    angle_deg: float
+    label: str
     role: str = ""
     index: int = 0
 
@@ -62,6 +113,7 @@ class NativeVideoOverlayLayer(QWidget):
         self._content_rect: dict[str, float] | None = None
         self._detections: list[VideoOverlayDetection] = []
         self._video_marks: list[VideoOverlayMark] = []
+        self._offscreen_hints: list[VideoOverlayOffscreenHint] = []
         # Normalized segments (x1,y1,x2,y2) in widget coords + ground distance label.
         self._measure_segments: list[tuple[float, float, float, float, str]] = []
         self._lrf_lock: VideoOverlayLrfLock | None = None
@@ -127,6 +179,31 @@ class NativeVideoOverlayLayer(QWidget):
         self._video_marks = out
         self.update()
 
+    def set_offscreen_hints(
+        self,
+        hints: list[VideoOverlayOffscreenHint | dict[str, object]],
+    ) -> None:
+        out: list[VideoOverlayOffscreenHint] = []
+        for raw in hints:
+            if isinstance(raw, VideoOverlayOffscreenHint):
+                out.append(raw)
+                continue
+            try:
+                out.append(
+                    VideoOverlayOffscreenHint(
+                        edge_x=float(raw.get("edge_x", 0)),
+                        edge_y=float(raw.get("edge_y", 0)),
+                        angle_deg=float(raw.get("angle_deg", 0)),
+                        label=str(raw.get("label", "") or ""),
+                        role=str(raw.get("role", "") or ""),
+                        index=int(raw.get("index", 0) or 0),
+                    )
+                )
+            except (TypeError, ValueError, AttributeError):
+                continue
+        self._offscreen_hints = out
+        self.update()
+
     def set_target_measure_segments(
         self, segments: list[tuple[float, float, float, float, str]]
     ) -> None:
@@ -154,6 +231,7 @@ class NativeVideoOverlayLayer(QWidget):
 
     def clear_video_marks(self) -> None:
         self._video_marks.clear()
+        self._offscreen_hints.clear()
         self.update()
 
     def set_lrf_lock(
@@ -194,6 +272,7 @@ class NativeVideoOverlayLayer(QWidget):
     def clear_all(self) -> None:
         self._detections.clear()
         self._video_marks.clear()
+        self._offscreen_hints.clear()
         self._measure_segments.clear()
         self._lrf_lock = None
         self._lrf_armed_hint = False
@@ -273,6 +352,70 @@ class NativeVideoOverlayLayer(QWidget):
         pw = float(cr.get("pw", w))
         ph = float(cr.get("ph", h))
         return left, top, max(1.0, pw), max(1.0, ph)
+
+    @staticmethod
+    def _mark_role_colors(role: str) -> tuple[QColor, QColor]:
+        r = str(role or "").strip().lower()
+        if r == "intended_target":
+            return QColor(34, 197, 94, 235), QColor(187, 247, 208, 255)
+        if r == "impact":
+            return QColor(239, 68, 68, 235), QColor(254, 202, 202, 255)
+        if r == "gun_origin":
+            return QColor(59, 130, 246, 235), QColor(191, 219, 254, 255)
+        return QColor(255, 120, 60, 230), QColor(255, 220, 120, 255)
+
+    def _draw_offscreen_hint(
+        self,
+        p: QPainter,
+        cl: float,
+        ct: float,
+        cw: float,
+        ch: float,
+        hint: VideoOverlayOffscreenHint,
+    ) -> None:
+        fill, ring = self._mark_role_colors(hint.role)
+        ex = cl + float(hint.edge_x) * cw
+        ey = ct + float(hint.edge_y) * ch
+        rad = math.radians(float(hint.angle_deg))
+        cos_a = math.cos(rad)
+        sin_a = math.sin(rad)
+        tip_len = max(12.0, min(cw, ch) * 0.035)
+        half = tip_len * 0.55
+        tip_x = ex + cos_a * tip_len
+        tip_y = ey + sin_a * tip_len
+        base_x = ex - cos_a * tip_len * 0.35
+        base_y = ey - sin_a * tip_len * 0.35
+        perp_x = -sin_a * half
+        perp_y = cos_a * half
+        tri = QPolygonF(
+            [
+                QPointF(tip_x, tip_y),
+                QPointF(base_x + perp_x, base_y + perp_y),
+                QPointF(base_x - perp_x, base_y - perp_y),
+            ]
+        )
+        p.setPen(QPen(ring, 2))
+        p.setBrush(fill)
+        p.drawPolygon(tri)
+
+        caption = str(hint.label or "").strip()
+        if not caption:
+            return
+        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        tw = metrics.horizontalAdvance(caption) + 10
+        th = metrics.height() + 6
+        label_off = tip_len + 6.0
+        tx = int(tip_x + cos_a * label_off - tw / 2.0)
+        ty = int(tip_y + sin_a * label_off - th / 2.0)
+        tx = int(max(cl + 4.0, min(cl + cw - tw - 4.0, float(tx))))
+        ty = int(max(ct + 4.0, min(ct + ch - th - 4.0, float(ty))))
+        p.fillRect(tx, ty, tw, th, QColor(8, 20, 36, 220))
+        p.setPen(QPen(ring, 1))
+        p.drawRect(tx, ty, tw, th)
+        p.setPen(QColor(224, 242, 254))
+        p.drawText(tx + 5, ty + metrics.ascent() + 3, caption)
 
     def _draw_lrf_lock_reticle(
         self,
@@ -366,6 +509,7 @@ class NativeVideoOverlayLayer(QWidget):
         if (
             not self._detections
             and not self._video_marks
+            and not self._offscreen_hints
             and not self._measure_segments
             and self._lrf_lock is None
             and not self._lrf_armed_hint
@@ -447,18 +591,7 @@ class NativeVideoOverlayLayer(QWidget):
             cx = cl + xn * cw
             cy = ct + yn * ch
             role = str(mark.role or "").strip().lower()
-            if role == "intended_target":
-                fill = QColor(34, 197, 94, 235)
-                ring = QColor(187, 247, 208, 255)
-            elif role == "impact":
-                fill = QColor(239, 68, 68, 235)
-                ring = QColor(254, 202, 202, 255)
-            elif role == "gun_origin":
-                fill = QColor(59, 130, 246, 235)
-                ring = QColor(191, 219, 254, 255)
-            else:
-                fill = QColor(255, 120, 60, 230)
-                ring = QColor(255, 220, 120, 255)
+            fill, ring = self._mark_role_colors(role)
             radius = 7
             p.setPen(QPen(ring, 3))
             p.setBrush(fill)
@@ -478,3 +611,6 @@ class NativeVideoOverlayLayer(QWidget):
                 p.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
                 p.setPen(QColor(255, 255, 255))
                 p.drawText(tx + 4, ty + metrics.ascent() + 2, label)
+
+        for hint in self._offscreen_hints:
+            self._draw_offscreen_hint(p, cl, ct, cw, ch, hint)

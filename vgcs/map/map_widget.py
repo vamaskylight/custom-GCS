@@ -67,6 +67,8 @@ from vgcs.map.native_video_overlay import (
     NativeVideoOverlayLayer,
     VideoOverlayLrfLock,
     VideoOverlayMark,
+    VideoOverlayOffscreenHint,
+    offscreen_hint_edge_uv,
 )
 from vgcs.map.dooaf_setup_dialog import (
     DOOAF_PICK_GUN,
@@ -81,6 +83,7 @@ from vgcs.observe.dooaf import (
     build_dooaf_session,
     dooaf_intended_impact_video_segment,
     assemble_observation_report_html,
+    dooaf_role_display,
     format_dooaf_html_summary,
     format_dooaf_status,
     format_gimbal_pitch_direction,
@@ -91,7 +94,6 @@ from vgcs.observe.dooaf import (
     DooafSettings,
     apply_map_pick_to_settings,
     enrich_dooaf_settings_elevation_from_dem,
-    dooaf_role_display,
     dooaf_settings_kwargs,
     merge_dooaf_settings,
     merge_setup_video_marks,
@@ -1345,6 +1347,7 @@ class MapWidget(QWidget):
         self._dooaf_pick_from_video = False
         self._dooaf_pick_role: str = ""
         self._dooaf_setup_video_marks: dict[str, tuple[float, float]] = {}
+        self._dooaf_setup_mark_track: dict[str, dict[str, object]] = {}
         self._dooaf_restore_target_after_pick = False
         self._video_obs_marks: list[tuple[float, float]] = []
         self._obs_snapshot_bridge = _ObservationSnapshotBridge(self)
@@ -3744,6 +3747,8 @@ class MapWidget(QWidget):
         finally:
             try:
                 self._sync_native_video_overlay()
+                if getattr(self, "_dooaf_setup_mark_track", None):
+                    self._flush_video_marks_overlay()
             except Exception:
                 pass
 
@@ -7517,20 +7522,279 @@ class MapWidget(QWidget):
         """Observation Target clicks are always fall of shot (use DOOAF Setup → Pick on video for actual target)."""
         return DOOAF_ROLE_IMPACT
 
+    def _build_video_mark_track(
+        self,
+        ref_uv: tuple[float, float],
+        ref_att: tuple[float, float] | None,
+        lock_att: tuple[float, float] | None,
+        *,
+        used_lrf_slew: bool,
+    ) -> dict[str, object] | None:
+        if ref_att is None:
+            return None
+        from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+        track_uv = (float(ref_uv[0]), float(ref_uv[1]))
+        track_att = (float(ref_att[0]), float(ref_att[1]))
+        h_scale = 1.0
+        v_scale = 1.0
+        if used_lrf_slew and lock_att is not None:
+            u_raw, v_raw = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+                track_uv,
+                track_att,
+                lock_att,
+            )
+            if abs(float(u_raw) - 0.5) < 0.012 and abs(float(v_raw) - 0.5) < 0.012:
+                h_scale, v_scale = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
+                    track_uv,
+                    track_att,
+                    lock_att,
+                )
+                track_uv = (0.5, 0.5)
+                track_att = (float(lock_att[0]), float(lock_att[1]))
+            else:
+                track_uv = (float(u_raw), float(v_raw))
+                track_att = (float(lock_att[0]), float(lock_att[1]))
+        return {
+            "ref_uv": track_uv,
+            "ref_att": track_att,
+            "h_scale": float(h_scale),
+            "v_scale": float(v_scale),
+        }
+
+    def _register_dooaf_setup_mark_track(
+        self,
+        role: str,
+        *,
+        ref_uv: tuple[float, float],
+        ref_att: tuple[float, float] | None,
+        lock_att: tuple[float, float] | None,
+        used_lrf_slew: bool,
+    ) -> None:
+        """Remember gimbal attitude at pick so marks stay on the world point when camera moves."""
+        built = self._build_video_mark_track(
+            ref_uv,
+            ref_att,
+            lock_att,
+            used_lrf_slew=used_lrf_slew,
+        )
+        key = str(role)
+        if built is None:
+            self._dooaf_setup_mark_track.pop(key, None)
+            return
+        self._dooaf_setup_mark_track[key] = built
+
+    def _apply_video_mark_gimbal_track_to_row(
+        self,
+        row: dict[str, object],
+        u: float,
+        v: float,
+        *,
+        ref_att: tuple[float, float] | None,
+        lock_att: tuple[float, float] | None,
+        used_lrf_slew: bool,
+    ) -> None:
+        built = self._build_video_mark_track(
+            (float(u), float(v)),
+            ref_att,
+            lock_att,
+            used_lrf_slew=used_lrf_slew,
+        )
+        if built is None:
+            for key in (
+                "video_mark_track_ref_u",
+                "video_mark_track_ref_v",
+                "video_mark_track_ref_yaw",
+                "video_mark_track_ref_pitch",
+                "video_mark_track_h_scale",
+                "video_mark_track_v_scale",
+            ):
+                row.pop(key, None)
+            return
+        ref_uv = built["ref_uv"]
+        ref_att_out = built["ref_att"]
+        assert isinstance(ref_uv, tuple) and isinstance(ref_att_out, tuple)
+        row["video_mark_track_ref_u"] = float(ref_uv[0])
+        row["video_mark_track_ref_v"] = float(ref_uv[1])
+        row["video_mark_track_ref_yaw"] = float(ref_att_out[0])
+        row["video_mark_track_ref_pitch"] = float(ref_att_out[1])
+        row["video_mark_track_h_scale"] = float(built["h_scale"])
+        row["video_mark_track_v_scale"] = float(built["v_scale"])
+
+    def _project_mark_uv_unclamped(
+        self,
+        track: dict[str, object] | None,
+        stored_uv: tuple[float, float],
+    ) -> tuple[float, float]:
+        if not track:
+            return (float(stored_uv[0]), float(stored_uv[1]))
+        cur = self._read_gimbal_attitude_pair()
+        if cur is None:
+            return (float(stored_uv[0]), float(stored_uv[1]))
+        ref_uv = track.get("ref_uv")
+        ref_att = track.get("ref_att")
+        if not isinstance(ref_uv, tuple) or not isinstance(ref_att, tuple):
+            return (float(stored_uv[0]), float(stored_uv[1]))
+        try:
+            from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+            u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+                (float(ref_uv[0]), float(ref_uv[1])),
+                (float(ref_att[0]), float(ref_att[1])),
+                cur,
+                gac_h_scale=float(track.get("h_scale", 1.0) or 1.0),
+                gac_v_scale=float(track.get("v_scale", 1.0) or 1.0),
+                clamp=False,
+            )
+            return (float(u), float(v))
+        except Exception:
+            return (float(stored_uv[0]), float(stored_uv[1]))
+
+    @staticmethod
+    def _mark_uv_on_screen(u: float, v: float, *, margin: float = 0.02) -> bool:
+        return (
+            float(u) >= -float(margin)
+            and float(u) <= 1.0 + float(margin)
+            and float(v) >= -float(margin)
+            and float(v) <= 1.0 + float(margin)
+        )
+
+    def _make_offscreen_hint(
+        self,
+        role: str,
+        raw_uv: tuple[float, float],
+        *,
+        index: int = 0,
+    ) -> VideoOverlayOffscreenHint:
+        edge_x, edge_y, angle = offscreen_hint_edge_uv(
+            float(raw_uv[0]),
+            float(raw_uv[1]),
+        )
+        name = dooaf_role_display(str(role or "")).strip() or "Mark"
+        return VideoOverlayOffscreenHint(
+            edge_x=float(edge_x),
+            edge_y=float(edge_y),
+            angle_deg=float(angle),
+            label=f"{name} off-screen — see map",
+            role=str(role or ""),
+            index=int(index),
+        )
+
+    def _tracked_uv_from_store(
+        self,
+        track: dict[str, object] | None,
+        stored_uv: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        """Project a world-fixed mark to screen UV; None when the point is outside the frame."""
+        u, v = self._project_mark_uv_unclamped(track, stored_uv)
+        if track is not None and not self._mark_uv_on_screen(u, v):
+            return None
+        if track is not None:
+            return (
+                max(0.0, min(1.0, float(u))),
+                max(0.0, min(1.0, float(v))),
+            )
+        return (float(u), float(v))
+
+    def _dooaf_mark_display_uv(
+        self, role: str, stored_uv: tuple[float, float]
+    ) -> tuple[float, float] | None:
+        """Screen UV for a DOOAF setup mark — tracks gimbal; hidden when off-screen."""
+        track = self._dooaf_setup_mark_track.get(str(role))
+        return self._tracked_uv_from_store(track, stored_uv)
+
+    def _observation_mark_display_uv(
+        self, row: dict[str, object], stored_u: float, stored_v: float
+    ) -> tuple[float, float] | None:
+        ref_u = row.get("video_mark_track_ref_u")
+        if ref_u is None:
+            return (float(stored_u), float(stored_v))
+        try:
+            track: dict[str, object] = {
+                "ref_uv": (
+                    float(ref_u),
+                    float(row.get("video_mark_track_ref_v") or 0.0),
+                ),
+                "ref_att": (
+                    float(row.get("video_mark_track_ref_yaw") or 0.0),
+                    float(row.get("video_mark_track_ref_pitch") or 0.0),
+                ),
+                "h_scale": float(row.get("video_mark_track_h_scale") or 1.0),
+                "v_scale": float(row.get("video_mark_track_v_scale") or 1.0),
+            }
+        except (TypeError, ValueError):
+            return (float(stored_u), float(stored_v))
+        return self._tracked_uv_from_store(track, (float(stored_u), float(stored_v)))
+
+    def _video_overlay_offscreen_hints(self) -> list[VideoOverlayOffscreenHint]:
+        """Edge arrows for tracked marks that left the current video frame."""
+        out: list[VideoOverlayOffscreenHint] = []
+        for role, pt in self._dooaf_setup_video_marks.items():
+            track = self._dooaf_setup_mark_track.get(str(role))
+            if not track:
+                continue
+            try:
+                raw = self._project_mark_uv_unclamped(track, pt)
+                if self._mark_uv_on_screen(raw[0], raw[1]):
+                    continue
+                out.append(self._make_offscreen_hint(str(role), raw, index=0))
+            except (TypeError, ValueError, IndexError):
+                continue
+        for idx, row in enumerate(self._observations):
+            if str(row.get("kind") or "") != "video_mark":
+                continue
+            if row.get("video_mark_track_ref_u") is None:
+                continue
+            vx = row.get("video_x_norm")
+            vy = row.get("video_y_norm")
+            if vx is None or vy is None:
+                continue
+            try:
+                track: dict[str, object] = {
+                    "ref_uv": (
+                        float(row.get("video_mark_track_ref_u") or 0.0),
+                        float(row.get("video_mark_track_ref_v") or 0.0),
+                    ),
+                    "ref_att": (
+                        float(row.get("video_mark_track_ref_yaw") or 0.0),
+                        float(row.get("video_mark_track_ref_pitch") or 0.0),
+                    ),
+                    "h_scale": float(row.get("video_mark_track_h_scale") or 1.0),
+                    "v_scale": float(row.get("video_mark_track_v_scale") or 1.0),
+                }
+                raw = self._project_mark_uv_unclamped(
+                    track, (float(vx), float(vy))
+                )
+                if self._mark_uv_on_screen(raw[0], raw[1]):
+                    continue
+                out.append(
+                    self._make_offscreen_hint(
+                        str(row.get("dooaf_role") or ""),
+                        raw,
+                        index=idx + 1,
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return out
+
     def _video_overlay_marks(self) -> list[VideoOverlayMark]:
         """Video clicks: DOOAF Setup picks (green target) + observation fall-of-shot (red)."""
         out: list[VideoOverlayMark] = []
         seen: set[tuple[float, float]] = set()
         for role, pt in self._dooaf_setup_video_marks.items():
             try:
-                key = (round(float(pt[0]), 4), round(float(pt[1]), 4))
+                disp = self._dooaf_mark_display_uv(str(role), pt)
+                if disp is None:
+                    continue
+                key = (round(float(disp[0]), 4), round(float(disp[1]), 4))
                 if key in seen:
                     continue
                 seen.add(key)
                 out.append(
                     VideoOverlayMark(
-                        x=float(pt[0]),
-                        y=float(pt[1]),
+                        x=float(disp[0]),
+                        y=float(disp[1]),
                         role=str(role),
                         index=0,
                     )
@@ -7545,15 +7809,18 @@ class MapWidget(QWidget):
             if vx is None or vy is None:
                 continue
             try:
+                disp = self._observation_mark_display_uv(row, float(vx), float(vy))
+                if disp is None:
+                    continue
                 out.append(
                     VideoOverlayMark(
-                        x=float(vx),
-                        y=float(vy),
+                        x=float(disp[0]),
+                        y=float(disp[1]),
                         role=str(row.get("dooaf_role") or ""),
                         index=idx + 1,
                     )
                 )
-                seen.add((round(float(vx), 4), round(float(vy), 4)))
+                seen.add((round(float(disp[0]), 4), round(float(disp[1]), 4)))
             except (TypeError, ValueError):
                 continue
         return out
@@ -7998,6 +8265,13 @@ class MapWidget(QWidget):
                 alt_m = None
         cb = self._dooaf_pick_complete
         self._dooaf_setup_video_marks[pick_role] = (video_x, video_y)
+        self._register_dooaf_setup_mark_track(
+            pick_role,
+            ref_uv=(video_x, video_y),
+            ref_att=getattr(self, "_lrf_track_ref_att", None),
+            lock_att=self._read_gimbal_attitude_pair(),
+            used_lrf_slew=bool(used_lrf),
+        )
         try:
             write_dooaf_setup_video_mark(
                 self._dooaf_settings_store(),
@@ -8096,6 +8370,14 @@ class MapWidget(QWidget):
         lat, lon, alt_m = geo
         pick_role = str(getattr(self, "_dooaf_pick_role", "") or DOOAF_ROLE_INTENDED)
         self._dooaf_setup_video_marks[pick_role] = (float(video_x), float(video_y))
+        ref_att = self._read_gimbal_attitude_pair()
+        self._register_dooaf_setup_mark_track(
+            pick_role,
+            ref_uv=(float(video_x), float(video_y)),
+            ref_att=ref_att,
+            lock_att=ref_att,
+            used_lrf_slew=False,
+        )
         try:
             write_dooaf_setup_video_mark(
                 self._dooaf_settings_store(),
@@ -8327,6 +8609,7 @@ class MapWidget(QWidget):
         if clear_gun:
             roles_remove.add(DOOAF_ROLE_GUN)
             self._dooaf_setup_video_marks.pop(DOOAF_ROLE_GUN, None)
+            self._dooaf_setup_mark_track.pop(DOOAF_ROLE_GUN, None)
             try:
                 clear_dooaf_setup_video_mark(
                     self._dooaf_settings_store(), DOOAF_ROLE_GUN
@@ -8336,6 +8619,7 @@ class MapWidget(QWidget):
         if clear_target:
             roles_remove.add(DOOAF_ROLE_INTENDED)
             self._dooaf_setup_video_marks.pop(DOOAF_ROLE_INTENDED, None)
+            self._dooaf_setup_mark_track.pop(DOOAF_ROLE_INTENDED, None)
             try:
                 clear_dooaf_setup_video_mark(
                     self._dooaf_settings_store(), DOOAF_ROLE_INTENDED
@@ -8730,6 +9014,16 @@ class MapWidget(QWidget):
             )
             return
         self._enrich_observation_geo_reference(row)
+        if kind == "video_mark" and video_x is not None and video_y is not None:
+            att = self._read_gimbal_attitude_pair()
+            self._apply_video_mark_gimbal_track_to_row(
+                row,
+                float(video_x),
+                float(video_y),
+                ref_att=att,
+                lock_att=att,
+                used_lrf_slew=False,
+            )
         self._log_observation_after_geo(
             row,
             kind=kind,
@@ -8768,6 +9062,14 @@ class MapWidget(QWidget):
                     row,
                     "LRF geo failed — impact from DEM ray estimate",
                 )
+        self._apply_video_mark_gimbal_track_to_row(
+            row,
+            video_x,
+            video_y,
+            ref_att=getattr(self, "_lrf_track_ref_att", None),
+            lock_att=self._read_gimbal_attitude_pair(),
+            used_lrf_slew=bool(used_lrf),
+        )
         self._log_observation_after_geo(
             row,
             kind=str(pending.obs_kind or "video_mark"),
@@ -8967,6 +9269,7 @@ class MapWidget(QWidget):
             self._video_obs_marks = [(m.x, m.y) for m in marks]
             ly = self._native_video_overlay
             ly.set_video_marks(marks)
+            ly.set_offscreen_hints(self._video_overlay_offscreen_hints())
             ly.set_target_measure_segments(self._observation_video_measure_segments())
             if bool(getattr(self, "_video_preview_enabled", False)):
                 ly.show()
@@ -11008,6 +11311,8 @@ class MapWidget(QWidget):
                 ly.raise_()
             if sync_geometry:
                 self._sync_native_video_overlay(from_lrf=True)
+            elif getattr(self, "_dooaf_setup_mark_track", None):
+                self._flush_video_marks_overlay()
         except Exception:
             pass
 
