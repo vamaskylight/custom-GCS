@@ -38,6 +38,16 @@ DOOAF_ROLES = (
     DOOAF_ROLE_GUN,
 )
 
+# Legacy / shorthand keys sometimes stored in QSettings or test fixtures.
+_SETUP_MARK_ROLE_ALIASES: dict[str, str] = {
+    "gun": DOOAF_ROLE_GUN,
+    "gun_origin": DOOAF_ROLE_GUN,
+    "intended": DOOAF_ROLE_INTENDED,
+    "target": DOOAF_ROLE_INTENDED,
+    "intended_target": DOOAF_ROLE_INTENDED,
+    "impact": DOOAF_ROLE_IMPACT,
+}
+
 # Operator-facing labels (dropdown, status, reports).
 DOOAF_ROLE_DISPLAY: dict[str, str] = {
     DOOAF_ROLE_INTENDED: "Actual target",
@@ -722,6 +732,141 @@ def _forced_ray_geo_for_row(
     )
 
 
+def normalize_dooaf_setup_video_marks(
+    marks: dict[str, tuple[float, float]] | None,
+) -> dict[str, tuple[float, float]] | None:
+    """Map legacy setup keys (``gun``, ``intended``) to canonical DOOAF roles."""
+    if not marks:
+        return None
+    out: dict[str, tuple[float, float]] = {}
+    for role, pt in marks.items():
+        key = _SETUP_MARK_ROLE_ALIASES.get(str(role), str(role))
+        try:
+            out[key] = (float(pt[0]), float(pt[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out or None
+
+
+def _setup_video_marks_complete(
+    marks: dict[str, tuple[float, float]] | None,
+) -> bool:
+    return bool(
+        marks
+        and DOOAF_ROLE_GUN in marks
+        and DOOAF_ROLE_INTENDED in marks
+    )
+
+
+def _destination_point_m(
+    lat_deg: float,
+    lon_deg: float,
+    bearing_deg: float,
+    distance_m: float,
+) -> tuple[float, float]:
+    from vgcs.observe.geo_reference import _offset_lat_lon
+
+    br = math.radians(float(bearing_deg))
+    north = float(distance_m) * math.cos(br)
+    east = float(distance_m) * math.sin(br)
+    return _offset_lat_lon(float(lat_deg), float(lon_deg), north, east)
+
+
+def refine_impact_geo_artillery_field(
+    row: dict[str, Any],
+    *,
+    gun_lat: float | None,
+    gun_lon: float | None,
+    target_lat: float | None,
+    target_lon: float | None,
+    setup_video_marks: dict[str, tuple[float, float]] | None = None,
+    dem_path: str | Path | None = None,
+    camera_hfov_deg: float = 62.0,
+    vehicle_alt_msl_m: float | None = None,
+) -> bool:
+    """
+    Re-place impact on the building facade when DEM collapsed it near the gun.
+
+    Common when the gun is in an open field (foreground video pick) and impact
+    is at the building base on the same column as the roof target.
+    """
+    if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
+        return False
+    if gun_lat is None or gun_lon is None or target_lat is None or target_lon is None:
+        return False
+    pt = observation_target_latlon(row)
+    if pt is None:
+        return False
+    gt = haversine_m(float(gun_lat), float(gun_lon), float(target_lat), float(target_lon))
+    gi = haversine_m(float(gun_lat), float(gun_lon), pt[0], pt[1])
+    if gt < 8.0 or gi > gt * 0.55:
+        return False
+    marks = normalize_dooaf_setup_video_marks(setup_video_marks) or {}
+    if DOOAF_ROLE_INTENDED not in marks:
+        return False
+    try:
+        vx_t, vy_t = marks[DOOAF_ROLE_INTENDED]
+        vx_i = float(row.get("video_x_norm"))  # type: ignore[arg-type]
+        vy_i = float(row.get("video_y_norm"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if abs(vx_i - float(vx_t)) > 0.16:
+        return False
+    if vy_i < float(vy_t) - 0.06:
+        return False
+
+    geo = _forced_ray_geo_for_row(
+        row,
+        dem_path=dem_path,
+        camera_hfov_deg=camera_hfov_deg,
+        vehicle_alt_msl_m=vehicle_alt_msl_m,
+    )
+    if geo is not None and geo.ok and geo.target_lat is not None and geo.target_lon is not None:
+        new_gi = haversine_m(float(gun_lat), float(gun_lon), geo.target_lat, geo.target_lon)
+        if new_gi > gi * 1.35 and new_gi <= gt * 1.05:
+            ekf = observation_ekf_rel_alt_m(row)
+            retry_agl = low_hover_ray_agl_m(ekf)
+            _apply_geo_reference_to_mark_row(
+                row,
+                geo,
+                ray_agl=retry_agl,
+                ray_src="ray_facade_retry",
+            )
+            row["geo_quality"] = "fair"
+            row["geo_method"] = "ray_facade_retry"
+            row["geo_warning"] = (
+                "impact geo from facade ray (corrected from gun-cluster collapse; "
+                "hover ≥3 m for GPS-quality geo)"
+            )
+            return True
+
+    dy = max(0.0, vy_i - float(vy_t))
+    offset_m = min(10.0, max(2.5, gt * 0.08 + dy * 18.0))
+    bearing_tg = initial_bearing_deg(
+        float(target_lat), float(target_lon), float(gun_lat), float(gun_lon)
+    )
+    new_lat, new_lon = _destination_point_m(
+        float(target_lat), float(target_lon), bearing_tg, offset_m
+    )
+    new_gi = haversine_m(float(gun_lat), float(gun_lon), new_lat, new_lon)
+    if new_gi <= gi * 1.2 or new_gi > gt * 1.02:
+        return False
+    row["target_lat"] = new_lat
+    row["target_lon"] = new_lon
+    row["geo_quality"] = "fair"
+    row["geo_method"] = "dooaf_facade_from_target"
+    row["geo_warning"] = (
+        "impact footprint from target facade offset "
+        f"({offset_m:.0f} m toward gun — primary ray landed near artillery)"
+    )
+    from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
+
+    enrich_video_mark_target_altitude(row)
+    row["geo_range_m"] = None
+    row["geo_bearing_deg"] = None
+    return True
+
+
 def refine_impact_geo_from_video_rays(
     row: dict[str, Any],
     *,
@@ -1134,7 +1279,7 @@ def merge_setup_video_marks(
     if memory:
         for role, pt in memory.items():
             merged[str(role)] = (float(pt[0]), float(pt[1]))
-    return merged or None
+    return normalize_dooaf_setup_video_marks(merged)
 
 
 @dataclass(frozen=True)
@@ -1383,6 +1528,8 @@ def build_dooaf_session(
     setup_video_marks: dict[str, tuple[float, float]] | None = None,
 ) -> DooafSession:
     setup_video_marks = merge_setup_video_marks(setup_video_marks)
+    if not _setup_video_marks_complete(setup_video_marks):
+        setup_video_marks = merge_setup_video_marks(None) or setup_video_marks
     gun_row = latest_mark_row(rows, DOOAF_ROLE_GUN)
     intended_row = latest_mark_row(rows, DOOAF_ROLE_INTENDED)
     impact_row = latest_mark_row(rows, DOOAF_ROLE_IMPACT)
@@ -1455,6 +1602,36 @@ def build_dooaf_session(
         _enrich_mark_row_ray_geometry(
             impact_row, template_row, dem_path=dem_path
         )
+    for setup_row in (ground_row, intended_row):
+        if setup_row is not None and impact_row is not None:
+            _enrich_mark_row_ray_geometry(
+                setup_row, impact_row, dem_path=dem_path
+            )
+    if (
+        impact_row is not None
+        and gun is not None
+        and intended is not None
+    ):
+        refine_impact_geo_artillery_field(
+            impact_row,
+            gun_lat=gun.lat,
+            gun_lon=gun.lon,
+            target_lat=intended.lat,
+            target_lon=intended.lon,
+            setup_video_marks=setup_video_marks,
+            dem_path=dem_path,
+            vehicle_alt_msl_m=(
+                template_row.get("vehicle_alt_msl_m") if template_row else None
+            ),  # type: ignore[union-attr]
+        )
+        imp_pt = observation_target_latlon(impact_row)
+        if imp_pt is not None:
+            impact = GeoPoint(
+                imp_pt[0],
+                imp_pt[1],
+                impact.alt_m if impact is not None else None,
+            )
+            impact = _fill_point_alt_m(impact, impact_row, None, dem_path=dem_path)
     building_height_m: float | None = None
     if intended is not None and impact is not None:
         intended, impact, building_height_m = resolve_dooaf_mark_elevations(
