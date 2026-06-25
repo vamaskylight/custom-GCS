@@ -481,6 +481,7 @@ class SkydroidTopUdpAdapter:
         *,
         gac_h_scale: float = 1.0,
         gac_v_scale: float = 1.0,
+        clamp: bool = True,
     ) -> tuple[float, float]:
         """Screen UV of a world-fixed point marked at ref_uv when gimbal was at ref_att."""
         u0, v0 = float(ref_uv[0]), float(ref_uv[1])
@@ -500,6 +501,8 @@ class SkydroidTopUdpAdapter:
         )
         u = 0.5 + (dyaw_img0 - img_dy_delta) / _LRF_FOV_H_DEG
         v = 0.5 + (dpitch_img0 - img_dp_delta) / _LRF_FOV_V_DEG
+        if not clamp:
+            return (float(u), float(v))
         return (
             max(0.0, min(1.0, float(u))),
             max(0.0, min(1.0, float(v))),
