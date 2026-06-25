@@ -250,15 +250,15 @@ def test_full_frame_macroblock_soup_detected():
     assert hide and why == "artifact"
 
 
-def test_stale_preview_reconnect_default_off():
+def test_stale_preview_reconnect_default_on():
     os.environ.pop("VGCS_COMPANION_STALE_RECONNECT", None)
-    assert not _companion_stale_preview_reconnect_enabled()
+    assert _companion_stale_preview_reconnect_enabled()
 
 
-def test_stale_preview_reconnect_opt_in():
-    os.environ["VGCS_COMPANION_STALE_RECONNECT"] = "1"
+def test_stale_preview_reconnect_opt_out():
+    os.environ["VGCS_COMPANION_STALE_RECONNECT"] = "0"
     try:
-        assert _companion_stale_preview_reconnect_enabled()
+        assert not _companion_stale_preview_reconnect_enabled()
     finally:
         os.environ.pop("VGCS_COMPANION_STALE_RECONNECT", None)
 
