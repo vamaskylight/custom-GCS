@@ -7618,8 +7618,61 @@ class MapWidget(QWidget):
             built["geo_lon"] = float(geo_lon)
             if geo_alt_m is not None:
                 built["geo_alt_m"] = float(geo_alt_m)
+        self._attach_lock_vehicle_pose_to_track(built)
         self._dooaf_setup_mark_track[key] = built
         self._sync_video_mark_track_timer()
+
+    def _attach_lock_vehicle_pose_to_track(self, track: dict[str, object]) -> None:
+        ctx = self._observation_context()
+        vlat = ctx.get("vehicle_lat")
+        vlon = ctx.get("vehicle_lon")
+        if vlat is not None and vlon is not None:
+            track["lock_vehicle_lat"] = float(vlat)
+            track["lock_vehicle_lon"] = float(vlon)
+        hdg = ctx.get("vehicle_heading_deg")
+        if hdg is not None:
+            try:
+                track["lock_vehicle_heading_deg"] = float(hdg)
+            except (TypeError, ValueError):
+                pass
+
+    def _mark_track_use_geo_projection(self, track: dict[str, object]) -> bool:
+        """Use geo when no LRF slew, or when the aircraft has moved since lock."""
+        glat = track.get("geo_lat")
+        glon = track.get("geo_lon")
+        if glat is None or glon is None:
+            return False
+        if not track.get("lrf_slew"):
+            return True
+        lock_lat = track.get("lock_vehicle_lat")
+        lock_lon = track.get("lock_vehicle_lon")
+        if lock_lat is None or lock_lon is None:
+            return False
+        ctx = self._observation_context()
+        clat = ctx.get("vehicle_lat")
+        clon = ctx.get("vehicle_lon")
+        if clat is None or clon is None:
+            return False
+        try:
+            shift_m = self._haversine_m(
+                float(lock_lat), float(lock_lon), float(clat), float(clon)
+            )
+        except (TypeError, ValueError):
+            shift_m = 0.0
+        if float(shift_m) >= 1.5:
+            return True
+        lock_h = track.get("lock_vehicle_heading_deg")
+        cur_h = ctx.get("vehicle_heading_deg")
+        if lock_h is not None and cur_h is not None:
+            try:
+                dh = abs(
+                    ((float(cur_h) - float(lock_h) + 180.0) % 360.0) - 180.0
+                )
+                if dh >= 2.0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
 
     def _video_mark_tracking_active(self) -> bool:
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
@@ -7712,6 +7765,18 @@ class MapWidget(QWidget):
         row["video_mark_track_h_scale"] = float(built["h_scale"])
         row["video_mark_track_v_scale"] = float(built["v_scale"])
         row["video_mark_lrf_slew"] = bool(used_lrf_slew)
+        ctx = self._observation_context()
+        vlat = ctx.get("vehicle_lat")
+        vlon = ctx.get("vehicle_lon")
+        if vlat is not None and vlon is not None:
+            row["lock_vehicle_lat"] = float(vlat)
+            row["lock_vehicle_lon"] = float(vlon)
+        hdg = ctx.get("vehicle_heading_deg")
+        if hdg is not None:
+            try:
+                row["lock_vehicle_heading_deg"] = float(hdg)
+            except (TypeError, ValueError):
+                pass
         tlat = row.get("target_lat")
         tlon = row.get("target_lon")
         if tlat is not None and tlon is not None:
@@ -7757,20 +7822,19 @@ class MapWidget(QWidget):
         track: dict[str, object] | None,
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
-        if track is not None:
+        if track is not None and self._mark_track_use_geo_projection(track):
             glat = track.get("geo_lat")
             glon = track.get("geo_lon")
-            if glat is not None and glon is not None:
-                galt = track.get("geo_alt_m")
-                try:
-                    alt = float(galt) if galt is not None else None
-                except (TypeError, ValueError):
-                    alt = None
-                geo_uv = self._project_geo_to_video_norm(
-                    float(glat), float(glon), alt_m=alt
-                )
-                if geo_uv is not None:
-                    return (float(geo_uv[0]), float(geo_uv[1]))
+            galt = track.get("geo_alt_m")
+            try:
+                alt = float(galt) if galt is not None else None
+            except (TypeError, ValueError):
+                alt = None
+            geo_uv = self._project_geo_to_video_norm(
+                float(glat), float(glon), alt_m=alt  # type: ignore[arg-type]
+            )
+            if geo_uv is not None:
+                return (float(geo_uv[0]), float(geo_uv[1]))
         if not track:
             return (float(stored_uv[0]), float(stored_uv[1]))
         cur = self._read_gimbal_attitude_pair()
@@ -7851,23 +7915,6 @@ class MapWidget(QWidget):
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
-        glat = row.get("video_mark_geo_lat")
-        glon = row.get("video_mark_geo_lon")
-        if glat is not None and glon is not None:
-            try:
-                galt = row.get("video_mark_geo_alt_m")
-                alt = float(galt) if galt is not None else None
-            except (TypeError, ValueError):
-                alt = None
-            geo_uv = self._project_geo_to_video_norm(float(glat), float(glon), alt_m=alt)
-            if geo_uv is not None:
-                u, v = geo_uv
-                if self._mark_uv_on_screen(u, v):
-                    return (
-                        max(0.0, min(1.0, float(u))),
-                        max(0.0, min(1.0, float(v))),
-                    )
-                return None
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
             return (float(stored_u), float(stored_v))
@@ -7883,7 +7930,23 @@ class MapWidget(QWidget):
                 ),
                 "h_scale": float(row.get("video_mark_track_h_scale") or 1.0),
                 "v_scale": float(row.get("video_mark_track_v_scale") or 1.0),
+                "lrf_slew": bool(row.get("video_mark_lrf_slew")),
             }
+            glat = row.get("video_mark_geo_lat")
+            glon = row.get("video_mark_geo_lon")
+            if glat is not None and glon is not None:
+                track["geo_lat"] = float(glat)
+                track["geo_lon"] = float(glon)
+                galt = row.get("video_mark_geo_alt_m")
+                if galt is not None:
+                    track["geo_alt_m"] = float(galt)
+            for key in (
+                "lock_vehicle_lat",
+                "lock_vehicle_lon",
+                "lock_vehicle_heading_deg",
+            ):
+                if row.get(key) is not None:
+                    track[key] = row.get(key)
         except (TypeError, ValueError):
             return (float(stored_u), float(stored_v))
         return self._tracked_uv_from_store(track, (float(stored_u), float(stored_v)))
@@ -8477,8 +8540,6 @@ class MapWidget(QWidget):
         except TypeError:
             cb(float(lat), float(lon))
         method = str(row.get("geo_method") or "")
-        self._hide_lrf_video_reticle_keep_range()
-        self._schedule_video_marks_overlay_refresh()
         self._set_status(
             f"DOOAF {pending.label} saved{lrf_note} — OK to confirm or pick again"
             + (" · lrf_slant" if method == "lrf_slant" else "")
@@ -11796,6 +11857,9 @@ class MapWidget(QWidget):
         self._sync_video_mark_track_timer()
         pending = getattr(self, "_pending_lrf_video_pick", None)
         if pending is not None:
+            pick_role = str(
+                getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED
+            )
             self._pending_lrf_video_pick = None
             slant_m: float | None = None
             if dist is not None:
@@ -11803,6 +11867,13 @@ class MapWidget(QWidget):
                     slant_m = float(dist)
                 except (TypeError, ValueError):
                     slant_m = None
+            if slant_m is not None:
+                self._lrf_lock_distance_m = slant_m
+                self._lrf_lock_failed = False
+                self._companion_laser_range_m = slant_m
+                self._calibrate_lrf_track_after_lock()
+                self._lrf_lock_uv = (0.5, 0.5)
+                self._update_lrf_lock_geo(slant_m)
             try:
                 if pending.purpose == "dooaf_setup":
                     self._complete_pending_dooaf_setup_lrf_pick(slant_m, pending)
@@ -11812,20 +11883,9 @@ class MapWidget(QWidget):
                 print(f"[VGCS:observe] DOOAF/LRF pick failed: {exc}")
                 if pending.purpose == "dooaf_setup":
                     self._dooaf_video_pick_failed(str(exc))
-            self._lrf_lock_uv = (float(u), float(v))
             if slant_m is not None:
-                self._lrf_lock_distance_m = slant_m
-                self._lrf_lock_failed = False
-                self._companion_laser_range_m = slant_m
-                self._calibrate_lrf_track_after_lock()
-                self._lrf_lock_uv = (0.5, 0.5)
-                self._update_lrf_lock_geo(slant_m)
                 if pending.purpose == "dooaf_setup":
-                    pick_role = str(
-                        getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED
-                    )
                     self._sync_dooaf_setup_track_from_lrf_lock(pick_role)
-                    self._schedule_video_marks_overlay_refresh()
                 try:
                     self._obstacle_radar.set_c13_lrf_locked(
                         slant_m,
@@ -11833,7 +11893,10 @@ class MapWidget(QWidget):
                     )
                 except Exception:
                     pass
+                self._hide_lrf_video_reticle_keep_range()
+                self._schedule_video_marks_overlay_refresh()
             else:
+                self._lrf_lock_uv = (float(u), float(v))
                 self._lrf_lock_failed = True
                 try:
                     self._obstacle_radar.set_c13_lrf_lock_failed()
