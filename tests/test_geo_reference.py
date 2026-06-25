@@ -378,3 +378,27 @@ def test_pixel_offset_changes_bearing():
     assert left.ok and right.ok
     assert left.bearing_deg is not None and right.bearing_deg is not None
     assert abs(left.bearing_deg - right.bearing_deg) > 1.0
+
+
+def test_smooth_vehicle_pose_ema_filters_gps_jumps() -> None:
+    from vgcs.observe.geo_reference import smooth_vehicle_pose_ema
+
+    store: dict[str, object] = {}
+    lat0, lon0, h0 = smooth_vehicle_pose_ema(
+        store,
+        vehicle_lat=20.409447,
+        vehicle_lon=72.879918,
+        vehicle_heading_deg=170.0,
+    )
+    assert lat0 == 20.409447
+    assert lon0 == 72.879918
+    assert h0 == 170.0
+    lat1, _, h1 = smooth_vehicle_pose_ema(
+        store,
+        vehicle_lat=20.409500,
+        vehicle_lon=72.880000,
+        vehicle_heading_deg=175.0,
+    )
+    assert lat1 is not None and lat1 < 20.409500
+    assert lat1 > 20.409447
+    assert h1 is not None and 170.0 < h1 < 175.0

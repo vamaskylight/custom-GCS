@@ -7619,6 +7619,12 @@ class MapWidget(QWidget):
             built["geo_lon"] = float(geo_lon)
             if geo_alt_m is not None:
                 built["geo_alt_m"] = float(geo_alt_m)
+        for sk in (
+            "smooth_vehicle_lat",
+            "smooth_vehicle_lon",
+            "smooth_vehicle_heading_deg",
+        ):
+            built.pop(sk, None)
         self._attach_lock_vehicle_pose_to_track(built)
         self._dooaf_setup_mark_track[key] = built
         self._sync_video_mark_track_timer()
@@ -7637,13 +7643,29 @@ class MapWidget(QWidget):
             except (TypeError, ValueError):
                 pass
 
+    def _vehicle_airborne_for_mark_track(self, *, min_rel_alt_m: float = 2.0) -> bool:
+        """True when the aircraft is airborne enough that mark tracking needs geo, not gimbal-only."""
+        raw = getattr(self, "_vehicle_rel_alt_m", None)
+        if raw is None:
+            ctx = self._observation_context()
+            raw = ctx.get("vehicle_rel_alt_m") or ctx.get("ekf_rel_alt_m")
+        if raw is None:
+            return False
+        try:
+            return float(raw) >= float(min_rel_alt_m)
+        except (TypeError, ValueError):
+            return False
+
     def _mark_track_use_geo_projection(self, track: dict[str, object]) -> bool:
-        """Use geo when no LRF slew, or when the aircraft has moved since lock."""
+        """Use geo when no LRF slew, airborne, or when the aircraft has moved since lock."""
         glat = track.get("geo_lat")
         glon = track.get("geo_lon")
         if glat is None or glon is None:
             return False
         if not track.get("lrf_slew"):
+            return True
+        # Earth-referenced gimbal + LOITER: vehicle translation shifts the scene on screen.
+        if self._vehicle_airborne_for_mark_track():
             return True
         lock_lat = track.get("lock_vehicle_lat")
         lock_lon = track.get("lock_vehicle_lon")
@@ -7796,17 +7818,38 @@ class MapWidget(QWidget):
         lat: float,
         lon: float,
         alt_m: float | None = None,
+        *,
+        pose_store: dict[str, object] | None = None,
+        smooth_pose: bool = False,
     ) -> tuple[float, float] | None:
         ctx = self._observation_context()
         hfov, vfov = self._c13_lrf_geo_fov()
+        vlat = ctx.get("vehicle_lat")
+        vlon = ctx.get("vehicle_lon")
+        vhdg = ctx.get("vehicle_heading_deg")
+        if smooth_pose and pose_store is not None:
+            from vgcs.observe.geo_reference import smooth_vehicle_pose_ema
+
+            slat, slon, shdg = smooth_vehicle_pose_ema(
+                pose_store,
+                vehicle_lat=vlat,  # type: ignore[arg-type]
+                vehicle_lon=vlon,  # type: ignore[arg-type]
+                vehicle_heading_deg=vhdg,  # type: ignore[arg-type]
+            )
+            if slat is not None:
+                vlat = slat
+            if slon is not None:
+                vlon = slon
+            if shdg is not None:
+                vhdg = shdg
         try:
             return project_wgs84_to_video_norm(
                 target_lat=float(lat),
                 target_lon=float(lon),
                 target_alt_m=alt_m,
-                vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
-                vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
-                vehicle_heading_deg=ctx.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+                vehicle_lat=vlat,  # type: ignore[arg-type]
+                vehicle_lon=vlon,  # type: ignore[arg-type]
+                vehicle_heading_deg=vhdg,  # type: ignore[arg-type]
                 vehicle_roll_deg=ctx.get("vehicle_roll_deg"),  # type: ignore[arg-type]
                 vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
                 vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
@@ -7832,7 +7875,12 @@ class MapWidget(QWidget):
             except (TypeError, ValueError):
                 alt = None
             geo_uv = self._project_geo_to_video_norm(
-                float(glat), float(glon), alt_m=alt  # type: ignore[arg-type]
+                float(glat), float(glon), alt_m=alt,  # type: ignore[arg-type]
+                pose_store=track,
+                smooth_pose=bool(
+                    track.get("lrf_slew")
+                    and self._vehicle_airborne_for_mark_track()
+                ),
             )
             if geo_uv is not None:
                 return (float(geo_uv[0]), float(geo_uv[1]))
@@ -7913,6 +7961,18 @@ class MapWidget(QWidget):
         track = self._dooaf_setup_mark_track.get(str(role))
         return self._tracked_uv_from_store(track, stored_uv)
 
+    @staticmethod
+    def _persist_mark_track_smooth_keys(
+        track: dict[str, object], row: dict[str, object]
+    ) -> None:
+        for key in (
+            "smooth_vehicle_lat",
+            "smooth_vehicle_lon",
+            "smooth_vehicle_heading_deg",
+        ):
+            if key in track:
+                row[key] = track[key]
+
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
@@ -7948,9 +8008,18 @@ class MapWidget(QWidget):
             ):
                 if row.get(key) is not None:
                     track[key] = row.get(key)
+            for sk in (
+                "smooth_vehicle_lat",
+                "smooth_vehicle_lon",
+                "smooth_vehicle_heading_deg",
+            ):
+                if row.get(sk) is not None:
+                    track[sk] = row.get(sk)
         except (TypeError, ValueError):
             return (float(stored_u), float(stored_v))
-        return self._tracked_uv_from_store(track, (float(stored_u), float(stored_v)))
+        uv = self._tracked_uv_from_store(track, (float(stored_u), float(stored_v)))
+        self._persist_mark_track_smooth_keys(track, row)
+        return uv
 
     def _video_overlay_offscreen_hints(self) -> list[VideoOverlayOffscreenHint]:
         """Edge arrows for tracked marks that left the current video frame."""
@@ -8536,7 +8605,8 @@ class MapWidget(QWidget):
         )
         print(
             f"[VGCS:observe] dooaf video pick ok lat={float(lat):.7f} lon={float(lon):.7f} "
-            f"alt={alt_m} video=({video_x:.3f},{video_y:.3f}){lrf_note}"
+            f"alt={alt_m} video=({mark_u:.3f},{mark_v:.3f}) "
+            f"click=({video_x:.3f},{video_y:.3f}){lrf_note}"
         )
         try:
             cb(float(lat), float(lon), alt_m)
