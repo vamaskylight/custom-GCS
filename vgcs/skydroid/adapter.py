@@ -1309,13 +1309,32 @@ class SkydroidTopUdpAdapter:
 
     @staticmethod
     def _slr_use_trigger() -> bool:
-        """Native Skydroid uses PROTOCAL read-only SLR; optional VGCS_LRF_TRIGGER=1."""
-        return str(os.environ.get("VGCS_LRF_TRIGGER", "") or "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        """C13 field units usually need SLR write-01 before read; opt out with VGCS_LRF_TRIGGER=0."""
+        env = str(os.environ.get("VGCS_LRF_TRIGGER", "") or "").strip().lower()
+        if env in ("0", "false", "no", "off"):
+            return False
+        return True
+
+    def _slr_probe_ports(self) -> tuple[int, ...]:
+        active = int(self._active_port or self._transport._port or 5000)
+        ordered: list[int] = [active]
+        for port in _C13_PROBE_PORTS:
+            p = int(port)
+            if p not in ordered:
+                ordered.append(p)
+        return tuple(ordered)
+
+    def _fire_slr_trigger(self, *, dest: str = _LRF_SLR_DEST_LASER) -> None:
+        try:
+            self._transport.send_and_receive(
+                build_slr_trigger(dest=str(dest)),
+                expect_reply=False,
+                log=False,
+                timeout_s=0.25,
+            )
+        except Exception:
+            pass
+        time.sleep(0.15)
 
     @staticmethod
     def _pick_slr_readings(
@@ -1350,23 +1369,27 @@ class SkydroidTopUdpAdapter:
         log: bool,
         retries: int = _LRF_SLR_QUERY_RETRIES,
     ) -> bytes | None:
-        """Send SLR read; discard stray GAC/GAA datagrams on the shared UDP socket."""
+        """Send SLR read; drain stray GAC/GAA datagrams on the shared UDP socket."""
         for attempt in range(max(1, int(retries))):
             try:
-                reply = self._transport.send_and_receive(
+                self._transport.send_and_receive(
                     frame,
-                    expect_reply=True,
+                    expect_reply=False,
                     log=log and attempt == 0,
-                    timeout_s=0.5,
+                    timeout_s=0.08,
                 )
             except Exception:
-                continue
-            if reply and self._payload_is_slr_reply(reply):
+                pass
+            reply = self._transport.receive_matching(
+                self._payload_is_slr_reply,
+                timeout_s=1.15 if attempt == 0 else 0.75,
+                log=False,
+            )
+            if reply is not None:
                 return reply
-            if log and reply:
+            if log:
                 print(
-                    f"[VGCS:lrf] SLR stray reply (retry {attempt + 1}) "
-                    f"raw={reply.decode('ascii', errors='ignore')!r}"
+                    f"[VGCS:lrf] SLR no reply (retry {attempt + 1}/{max(1, int(retries))})"
                 )
             time.sleep(0.06)
         return None
@@ -1865,8 +1888,16 @@ class SkydroidTopUdpAdapter:
                     )
                     return None
 
-            if self._query_slr_distance_m(log=False, fresh=False) is None:
-                if self._query_slr_distance_m(log=True, fresh=True) is None:
+            pre_slr_available = self._query_slr_distance_m(log=False, fresh=False)
+            if pre_slr_available is None:
+                pre_slr_available = self._query_slr_distance_m(log=True, fresh=True)
+            if pre_slr_available is None:
+                if move_gimbal:
+                    print(
+                        "[VGCS:lrf] pre-lock SLR unavailable — slewing gimbal anyway "
+                        "(range will be read after aim; DEM fallback if SLR stays offline)"
+                    )
+                else:
                     print(
                         "[VGCS:lrf] lock failed — cannot read SLR (check C13 TOP link)"
                     )
@@ -2146,33 +2177,39 @@ class SkydroidTopUdpAdapter:
         active_port = int(self._transport._port)
         laser_q = build_slr_query(dest=_LRF_SLR_DEST_LASER)
         system_q = build_slr_query(dest=_LRF_SLR_DEST_SYSTEM)
+        trigger = bool(fresh and self._slr_use_trigger())
+        dist_m: float | None = None
+        laser_m: float | None = None
+        system_m: float | None = None
+        laser_reply: bytes | None = None
+        system_reply: bytes | None = None
         try:
-            if fresh and self._slr_use_trigger():
-                try:
-                    self._transport.send_and_receive(
-                        build_slr_trigger(dest=_LRF_SLR_DEST_LASER),
-                        expect_reply=False,
-                        log=False,
-                        timeout_s=0.25,
-                    )
-                except Exception:
-                    pass
-                time.sleep(0.15)
-                self._transmit_slr_read(laser_q, log=False)
-                time.sleep(_LRF_SLR_SHOT_SETTLE_S)
-            laser_reply = self._transmit_slr_read(laser_q, log=log)
-            system_reply = self._transmit_slr_read(system_q, log=False)
-            laser_m = (
-                parse_slr_distance_from_payload(laser_reply)
-                if laser_reply is not None
-                else None
-            )
-            system_m = (
-                parse_slr_distance_from_payload(system_reply)
-                if system_reply is not None
-                else None
-            )
-            dist_m = self._pick_slr_readings(laser_m, system_m, log=log)
+            for port in self._slr_probe_ports():
+                self._transport._port = int(port)
+                if trigger:
+                    self._fire_slr_trigger(dest=_LRF_SLR_DEST_LASER)
+                    self._transmit_slr_read(laser_q, log=False)
+                    time.sleep(_LRF_SLR_SHOT_SETTLE_S)
+                laser_reply = self._transmit_slr_read(laser_q, log=log)
+                system_reply = self._transmit_slr_read(system_q, log=False)
+                laser_m = (
+                    parse_slr_distance_from_payload(laser_reply)
+                    if laser_reply is not None
+                    else None
+                )
+                system_m = (
+                    parse_slr_distance_from_payload(system_reply)
+                    if system_reply is not None
+                    else None
+                )
+                dist_m = self._pick_slr_readings(laser_m, system_m, log=log)
+                if dist_m is not None:
+                    if log and int(port) != int(active_port):
+                        print(
+                            f"[VGCS:lrf] SLR ok on port {int(port)} "
+                            f"(active gimbal port {int(active_port)})"
+                        )
+                    break
             if dist_m is None:
                 if log:
                     print("[VGCS:lrf] SLR read failed — no valid E/D reply")
