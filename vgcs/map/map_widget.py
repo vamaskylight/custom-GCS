@@ -1357,6 +1357,7 @@ class MapWidget(QWidget):
         self._obs_export_busy = False
         self._obs_export_quick = False
         self._obs_marks_overlay_timer: QTimer | None = None
+        self._video_mark_track_timer: QTimer | None = None
         self._video_ui_render_mono = 0.0
         self._split_ui_render_mono = 0.0
         self._split_cache_mono: dict[str, float] = {}
@@ -3747,8 +3748,6 @@ class MapWidget(QWidget):
         finally:
             try:
                 self._sync_native_video_overlay()
-                if getattr(self, "_dooaf_setup_mark_track", None):
-                    self._flush_video_marks_overlay()
             except Exception:
                 pass
 
@@ -7581,8 +7580,49 @@ class MapWidget(QWidget):
         key = str(role)
         if built is None:
             self._dooaf_setup_mark_track.pop(key, None)
+            self._sync_video_mark_track_timer()
             return
         self._dooaf_setup_mark_track[key] = built
+        self._sync_video_mark_track_timer()
+
+    def _video_mark_tracking_active(self) -> bool:
+        if getattr(self, "_dooaf_setup_mark_track", None):
+            return True
+        for row in self._observations:
+            if row.get("video_mark_track_ref_u") is not None:
+                return True
+        return False
+
+    def _sync_video_mark_track_timer(self) -> None:
+        """Start/stop throttled mark tracking (~12 Hz) — never on every video frame."""
+        if not self._video_mark_tracking_active():
+            t = getattr(self, "_video_mark_track_timer", None)
+            if t is not None:
+                t.stop()
+            return
+        t = getattr(self, "_video_mark_track_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setInterval(80)
+            t.timeout.connect(self._refresh_tracked_video_marks_light)
+            self._video_mark_track_timer = t
+        if not t.isActive():
+            t.start()
+
+    def _refresh_tracked_video_marks_light(self) -> None:
+        """Reproject tracked marks only — no DEM/session work on the UI thread."""
+        if not self._video_mark_tracking_active():
+            self._sync_video_mark_track_timer()
+            return
+        try:
+            marks = self._video_overlay_marks()
+            self._video_obs_marks = [(m.x, m.y) for m in marks]
+            ly = self._native_video_overlay
+            ly.set_video_marks(marks)
+            ly.set_offscreen_hints(self._video_overlay_offscreen_hints())
+            ly.update()
+        except Exception:
+            pass
 
     def _apply_video_mark_gimbal_track_to_row(
         self,
@@ -7610,6 +7650,7 @@ class MapWidget(QWidget):
                 "video_mark_track_v_scale",
             ):
                 row.pop(key, None)
+            self._sync_video_mark_track_timer()
             return
         ref_uv = built["ref_uv"]
         ref_att_out = built["ref_att"]
@@ -7620,6 +7661,7 @@ class MapWidget(QWidget):
         row["video_mark_track_ref_pitch"] = float(ref_att_out[1])
         row["video_mark_track_h_scale"] = float(built["h_scale"])
         row["video_mark_track_v_scale"] = float(built["v_scale"])
+        self._sync_video_mark_track_timer()
 
     def _project_mark_uv_unclamped(
         self,
@@ -8639,6 +8681,7 @@ class MapWidget(QWidget):
         self._refresh_dooaf_map_overlay()
         if clear_gun or clear_target:
             self._flush_video_marks_overlay()
+        self._sync_video_mark_track_timer()
 
     def _show_dooaf_setup_dialog(self) -> None:
         pending = self._dooaf_pick_dialog
@@ -8665,8 +8708,14 @@ class MapWidget(QWidget):
         dlg.finished.connect(lambda _code: self._end_dooaf_map_pick())
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        saved_settings = dlg.result_settings()
+        QTimer.singleShot(0, lambda: self._commit_dooaf_setup_dialog(saved_settings))
+
+    def _commit_dooaf_setup_dialog(self, partial: DooafSettings) -> None:
+        """Apply DOOAF Setup after the modal closes (keeps OK responsive)."""
+        st = self._dooaf_settings_store()
         new_settings = merge_dooaf_settings(
-            self._resolved_dooaf_settings(), dlg.result_settings()
+            self._resolved_dooaf_settings(), partial
         )
         new_settings = enrich_dooaf_settings_elevation_from_dem(
             new_settings, self._observe_dem_path()
@@ -9277,6 +9326,7 @@ class MapWidget(QWidget):
             self._sync_native_video_overlay()
         except Exception:
             pass
+        self._sync_video_mark_track_timer()
 
     def _observation_measure_labels_and_segments(
         self,
@@ -11311,8 +11361,6 @@ class MapWidget(QWidget):
                 ly.raise_()
             if sync_geometry:
                 self._sync_native_video_overlay(from_lrf=True)
-            elif getattr(self, "_dooaf_setup_mark_track", None):
-                self._flush_video_marks_overlay()
         except Exception:
             pass
 
