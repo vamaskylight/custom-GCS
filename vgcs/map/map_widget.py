@@ -1336,6 +1336,7 @@ class MapWidget(QWidget):
         self._lrf_track_gac_v_scale = 1.0
         self._lrf_lock_lat: float | None = None
         self._lrf_lock_lon: float | None = None
+        self._lrf_lock_alt_m: float | None = None
         self._lrf_lock_geo_label: str = ""
         self._lrf_lock_bridge = _LrfLockBridge(self)
         self._lrf_lock_bridge.finished.connect(self._on_c13_lrf_lock_finished)
@@ -7636,7 +7637,7 @@ class MapWidget(QWidget):
         t = getattr(self, "_video_mark_track_timer", None)
         if t is None:
             t = QTimer(self)
-            t.setInterval(80)
+            t.setInterval(50)
             t.timeout.connect(self._refresh_tracked_video_marks_light)
             self._video_mark_track_timer = t
         if not t.isActive():
@@ -7740,8 +7741,7 @@ class MapWidget(QWidget):
         track: dict[str, object] | None,
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
-        use_attitude = bool(track and track.get("lrf_slew"))
-        if track is not None and not use_attitude:
+        if track is not None:
             glat = track.get("geo_lat")
             glon = track.get("geo_lon")
             if glat is not None and glon is not None:
@@ -7835,24 +7835,23 @@ class MapWidget(QWidget):
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
-        if not row.get("video_mark_lrf_slew"):
-            glat = row.get("video_mark_geo_lat")
-            glon = row.get("video_mark_geo_lon")
-            if glat is not None and glon is not None:
-                try:
-                    galt = row.get("video_mark_geo_alt_m")
-                    alt = float(galt) if galt is not None else None
-                except (TypeError, ValueError):
-                    alt = None
-                geo_uv = self._project_geo_to_video_norm(float(glat), float(glon), alt_m=alt)
-                if geo_uv is not None:
-                    u, v = geo_uv
-                    if self._mark_uv_on_screen(u, v):
-                        return (
-                            max(0.0, min(1.0, float(u))),
-                            max(0.0, min(1.0, float(v))),
-                        )
-                    return None
+        glat = row.get("video_mark_geo_lat")
+        glon = row.get("video_mark_geo_lon")
+        if glat is not None and glon is not None:
+            try:
+                galt = row.get("video_mark_geo_alt_m")
+                alt = float(galt) if galt is not None else None
+            except (TypeError, ValueError):
+                alt = None
+            geo_uv = self._project_geo_to_video_norm(float(glat), float(glon), alt_m=alt)
+            if geo_uv is not None:
+                u, v = geo_uv
+                if self._mark_uv_on_screen(u, v):
+                    return (
+                        max(0.0, min(1.0, float(u))),
+                        max(0.0, min(1.0, float(v))),
+                    )
+                return None
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
             return (float(stored_u), float(stored_v))
@@ -8462,6 +8461,8 @@ class MapWidget(QWidget):
         except TypeError:
             cb(float(lat), float(lon))
         method = str(row.get("geo_method") or "")
+        self._hide_lrf_video_reticle_keep_range()
+        self._schedule_video_marks_overlay_refresh()
         self._set_status(
             f"DOOAF {pending.label} saved{lrf_note} — OK to confirm or pick again"
             + (" · lrf_slant" if method == "lrf_slant" else "")
@@ -11140,6 +11141,8 @@ class MapWidget(QWidget):
             self._schedule_vehicle_pose_js(immediate=first_fix)
             if bool(getattr(self, "_is_3d_mode", False)):
                 self._refresh_3d_marker_overlay()
+        if self._video_mark_tracking_active():
+            self._refresh_tracked_video_marks_light()
 
     def set_vehicle_attitude(
         self,
@@ -11161,6 +11164,9 @@ class MapWidget(QWidget):
                 pass
         if yaw_deg is not None:
             self.set_vehicle_heading(float(yaw_deg), source="att")
+        elif roll_deg is not None or pitch_deg is not None:
+            if self._video_mark_tracking_active():
+                self._refresh_tracked_video_marks_light()
 
     def set_vehicle_alt_msl(self, alt_msl_m: float | None) -> None:
         if alt_msl_m is None:
@@ -11194,6 +11200,8 @@ class MapWidget(QWidget):
         except Exception:
             pass
         self._apply_map_vehicle_heading()
+        if self._video_mark_tracking_active():
+            self._refresh_tracked_video_marks_light()
 
     def clear_flight_track(self) -> None:
         """Clear the orange breadcrumb trail (e.g. on reconnect / disconnect)."""
@@ -11356,6 +11364,20 @@ class MapWidget(QWidget):
         self._lrf_track_gac_v_scale = 1.0
 
     def _update_lrf_reticle_track(self) -> None:
+        lock_lat = getattr(self, "_lrf_lock_lat", None)
+        lock_lon = getattr(self, "_lrf_lock_lon", None)
+        if lock_lat is not None and lock_lon is not None:
+            lock_alt = getattr(self, "_lrf_lock_alt_m", None)
+            try:
+                alt = float(lock_alt) if lock_alt is not None else None
+            except (TypeError, ValueError):
+                alt = None
+            geo_uv = self._project_geo_to_video_norm(
+                float(lock_lat), float(lock_lon), alt_m=alt
+            )
+            if geo_uv is not None:
+                self._lrf_lock_uv = (float(geo_uv[0]), float(geo_uv[1]))
+                return
         if not self._lrf_reticle_tracking_active():
             return
         ref_uv = getattr(self, "_lrf_track_ref_uv", None)
@@ -11382,6 +11404,7 @@ class MapWidget(QWidget):
     def _clear_lrf_lock_geo(self) -> None:
         self._lrf_lock_lat = None
         self._lrf_lock_lon = None
+        self._lrf_lock_alt_m = None
         self._lrf_lock_geo_label = ""
         try:
             nm = self._native_map
@@ -11444,6 +11467,11 @@ class MapWidget(QWidget):
             return
         self._lrf_lock_lat = float(geo.target_lat)
         self._lrf_lock_lon = float(geo.target_lon)
+        if geo.target_alt_m is not None:
+            try:
+                self._lrf_lock_alt_m = float(geo.target_alt_m)
+            except (TypeError, ValueError):
+                pass
         self._lrf_lock_geo_label = self._format_lrf_geo_label(
             float(geo.target_lat), float(geo.target_lon)
         )
