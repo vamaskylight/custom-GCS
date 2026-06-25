@@ -1327,6 +1327,7 @@ class MapWidget(QWidget):
         self._camera_control = NoopCameraControl()
         self._lrf_lock_armed = False
         self._lrf_lock_uv: tuple[float, float] | None = None
+        self._lrf_click_uv: tuple[float, float] | None = None
         self._lrf_lock_distance_m: float | None = None
         self._lrf_lock_in_progress = False
         self._lrf_lock_failed = False
@@ -7579,6 +7580,7 @@ class MapWidget(QWidget):
     def _hide_lrf_video_reticle_keep_range(self) -> None:
         """Hide duplicate cyan LRF box on video; keep slant range on PROXIMITY."""
         self._lrf_lock_uv = None
+        self._lrf_click_uv = None
         self._clear_lrf_track_ref()
         try:
             ly = self._native_video_overlay
@@ -8509,6 +8511,12 @@ class MapWidget(QWidget):
         pick_role = str(getattr(self, "_dooaf_pick_role", "") or DOOAF_ROLE_INTENDED)
         label = dooaf_role_display(pick_role)
         if self._dooaf_lrf_geo_enabled():
+            self._dooaf_setup_video_marks[pick_role] = (
+                float(video_x),
+                float(video_y),
+            )
+            self._dooaf_setup_mark_track.pop(pick_role, None)
+            self._schedule_video_marks_overlay_refresh()
             self._pending_lrf_video_pick = _PendingLrfVideoPick(
                 purpose="dooaf_setup",
                 u=float(video_x),
@@ -11364,6 +11372,12 @@ class MapWidget(QWidget):
         self._lrf_track_gac_v_scale = 1.0
 
     def _update_lrf_reticle_track(self) -> None:
+        # While slewing, keep the reticle on the user's click — not boresight / geo centre.
+        if bool(getattr(self, "_lrf_lock_in_progress", False)):
+            click_uv = getattr(self, "_lrf_click_uv", None)
+            if click_uv is not None:
+                self._lrf_lock_uv = (float(click_uv[0]), float(click_uv[1]))
+                return
         lock_lat = getattr(self, "_lrf_lock_lat", None)
         lock_lon = getattr(self, "_lrf_lock_lon", None)
         if lock_lat is not None and lock_lon is not None:
@@ -11441,7 +11455,13 @@ class MapWidget(QWidget):
         ctx = self._observation_context()
         if ctx.get("gimbal_yaw_deg") is None:
             return
-        # C13 SLR measures along gimbal boresight (frame centre after click-to-aim slew).
+        in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
+        click_uv = getattr(self, "_lrf_click_uv", None)
+        if in_progress and click_uv is not None:
+            video_u, video_v = float(click_uv[0]), float(click_uv[1])
+        else:
+            # After slew: SLR measures along gimbal boresight (frame centre).
+            video_u, video_v = 0.5, 0.5
         hfov, vfov = self._c13_lrf_geo_fov()
         geo = compute_lrf_slant_geo(
             vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
@@ -11453,8 +11473,8 @@ class MapWidget(QWidget):
             gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
             gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             slant_range_m=slant,
-            video_x_norm=0.5,
-            video_y_norm=0.5,
+            video_x_norm=video_u,
+            video_y_norm=video_v,
             gps_fix_type=int(ctx.get("gps_fix_type") or 0),
             gps_hdop=ctx.get("gps_hdop"),  # type: ignore[arg-type]
             camera_hfov_deg=hfov,
@@ -11579,6 +11599,7 @@ class MapWidget(QWidget):
         self._lrf_lock_failed = False
         if not self._c13_lrf_is_locked():
             self._lrf_lock_uv = None
+            self._lrf_click_uv = None
             self._lrf_lock_armed = True
             try:
                 self._obstacle_radar.set_c13_lrf_armed(True)
@@ -11615,6 +11636,7 @@ class MapWidget(QWidget):
         self._lrf_lock_armed = True
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None
+        self._lrf_click_uv = None
         self._lrf_lock_distance_m = None
         self._clear_lrf_track_ref()
         self._sync_lrf_armed_backend(True)
@@ -11630,6 +11652,7 @@ class MapWidget(QWidget):
         self._lrf_lock_armed = False
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None
+        self._lrf_click_uv = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
         self._clear_lrf_track_ref()
@@ -11646,6 +11669,7 @@ class MapWidget(QWidget):
         self._lrf_lock_armed = False
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None
+        self._lrf_click_uv = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
         self._clear_lrf_track_ref()
@@ -11678,6 +11702,7 @@ class MapWidget(QWidget):
             return
         self._lrf_lock_armed = False
         self._lrf_lock_failed = False
+        self._lrf_click_uv = (float(u), float(v))
         self._lrf_lock_uv = (float(u), float(v))
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = True
