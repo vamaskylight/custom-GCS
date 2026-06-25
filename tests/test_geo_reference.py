@@ -129,6 +129,53 @@ def test_lrf_slant_geo_boresight_round_trip():
     assert abs(uv[1] - 0.5) < 0.02
 
 
+def test_geo_projection_shifts_when_vehicle_moves():
+    """Marks must reproject when the drone moves (wind / LOITER drift)."""
+    from vgcs.observe.geo_reference import (
+        compute_lrf_slant_geo,
+        project_wgs84_to_video_norm,
+    )
+
+    geo = compute_lrf_slant_geo(
+        vehicle_lat=20.4100559,
+        vehicle_lon=72.8799531,
+        vehicle_heading_deg=45.0,
+        vehicle_alt_msl_m=120.0,
+        gimbal_yaw_deg=18.8,
+        gimbal_pitch_deg=-18.0,
+        slant_range_m=79.0,
+        video_x_norm=0.5,
+        video_y_norm=0.5,
+        gps_fix_type=3,
+        camera_hfov_deg=83.4,
+        camera_vfov_deg=46.9,
+    )
+    assert geo.ok and geo.target_lat is not None and geo.target_lon is not None
+    common = dict(
+        target_lat=float(geo.target_lat),
+        target_lon=float(geo.target_lon),
+        target_alt_m=geo.target_alt_m,
+        vehicle_heading_deg=45.0,
+        vehicle_alt_msl_m=120.0,
+        gimbal_yaw_deg=18.8,
+        gimbal_pitch_deg=-18.0,
+        camera_hfov_deg=83.4,
+        camera_vfov_deg=46.9,
+    )
+    uv_a = project_wgs84_to_video_norm(
+        vehicle_lat=20.4100559,
+        vehicle_lon=72.8799531,
+        **common,
+    )
+    uv_b = project_wgs84_to_video_norm(
+        vehicle_lat=20.4101059,
+        vehicle_lon=72.8799531,
+        **common,
+    )
+    assert uv_a is not None and uv_b is not None
+    assert abs(uv_a[0] - uv_b[0]) > 0.005 or abs(uv_a[1] - uv_b[1]) > 0.005
+
+
 def test_dem_ground_agl_when_ekf_home_offset():
     """EKF rel above home can read ~7 m on the ground; DEM ground height is physical AGL."""
     agl, src = prefer_dem_ground_agl_over_ekf(
