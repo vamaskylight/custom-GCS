@@ -516,6 +516,7 @@ class SkydroidTopUdpAdapter:
         *,
         h_scale: float = 1.0,
         v_scale: float = 1.0,
+        live: bool = False,
     ) -> tuple[float, float]:
         """Learn GAC→image scale from click-to-aim slew (reduces pan tracking error)."""
         u0, v0 = float(ref_uv[0]), float(ref_uv[1])
@@ -527,12 +528,16 @@ class SkydroidTopUdpAdapter:
         img_dp = SkydroidTopUdpAdapter._gac_to_image_pitch_delta(gac_dp)
         h_new = float(h_scale)
         v_new = float(v_scale)
-        if abs(float(img_dy)) > 0.4 and abs(float(dyaw_img0)) > 1.0:
+        min_gac = 0.12 if live else 0.4
+        min_img = 0.35 if live else 1.0
+        w_meas = 0.65 if live else 0.4
+        w_old = 1.0 - w_meas
+        if abs(float(img_dy)) > min_gac and abs(float(dyaw_img0)) > min_img:
             measured = abs(float(dyaw_img0)) / abs(float(img_dy))
-            h_new = measured * 0.4 + float(h_scale) * 0.6
-        if abs(float(img_dp)) > 0.4 and abs(float(dpitch_img0)) > 1.0:
+            h_new = measured * w_meas + float(h_scale) * w_old
+        if abs(float(img_dp)) > min_gac and abs(float(dpitch_img0)) > min_img:
             measured = abs(float(dpitch_img0)) / abs(float(img_dp))
-            v_new = measured * 0.4 + float(v_scale) * 0.6
+            v_new = measured * w_meas + float(v_scale) * w_old
         return (
             max(0.75, min(1.25, float(h_new))),
             max(0.75, min(1.25, float(v_new))),
