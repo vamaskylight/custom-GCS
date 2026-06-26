@@ -7562,6 +7562,16 @@ class MapWidget(QWidget):
         }
         return out
 
+    @staticmethod
+    def _pending_lrf_dooaf_pick_role(pending: object | None) -> str | None:
+        """DOOAF Setup pick role during LRF slew, or None for observation impact picks."""
+        if pending is None:
+            return None
+        if str(getattr(pending, "purpose", "") or "") != "dooaf_setup":
+            return None
+        role = str(getattr(pending, "pick_role", "") or "").strip()
+        return role if role else None
+
     def _sync_dooaf_setup_mark_from_lrf_slew_progress(self, role: str | None = None) -> None:
         """Keep DOOAF gun mark aligned with LRF reticle while click-to-aim slew runs."""
         if not bool(getattr(self, "_lrf_lock_in_progress", False)):
@@ -7772,10 +7782,9 @@ class MapWidget(QWidget):
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             try:
                 pending = getattr(self, "_pending_lrf_video_pick", None)
-                pick_role = str(
-                    getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED
-                )
-                self._sync_dooaf_setup_mark_from_lrf_slew_progress(pick_role)
+                pick_role = self._pending_lrf_dooaf_pick_role(pending)
+                if pick_role:
+                    self._sync_dooaf_setup_mark_from_lrf_slew_progress(pick_role)
                 self._refresh_lrf_lock_overlay(sync_geometry=False)
             except Exception:
                 pass
@@ -8027,10 +8036,8 @@ class MapWidget(QWidget):
         """Screen UV for a DOOAF setup mark — tracks gimbal; hidden when off-screen."""
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             pending = getattr(self, "_pending_lrf_video_pick", None)
-            active_role = str(
-                getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED
-            )
-            if str(role) == active_role:
+            active_role = self._pending_lrf_dooaf_pick_role(pending)
+            if active_role and str(role) == active_role:
                 lock_uv = getattr(self, "_lrf_lock_uv", None)
                 if lock_uv is not None:
                     u, v = float(lock_uv[0]), float(lock_uv[1])
@@ -8174,12 +8181,10 @@ class MapWidget(QWidget):
         in_slew = bool(getattr(self, "_lrf_lock_in_progress", False))
         pending = getattr(self, "_pending_lrf_video_pick", None)
         slew_role = (
-            str(getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED)
-            if in_slew
-            else None
+            self._pending_lrf_dooaf_pick_role(pending) if in_slew else None
         )
         for role, pt in self._dooaf_setup_video_marks.items():
-            if in_slew and str(role) == slew_role:
+            if slew_role and str(role) == slew_role:
                 continue
             try:
                 disp = self._dooaf_mark_display_uv(str(role), pt)
