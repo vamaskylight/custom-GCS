@@ -8598,6 +8598,12 @@ class MapWidget(QWidget):
         """Finish DOOAF Setup video pick after LRF lock (or DEM fallback)."""
         video_x, video_y = float(pending.u), float(pending.v)
         pick_role = str(pending.pick_role or DOOAF_ROLE_INTENDED)
+        if slant_m is None:
+            self._dooaf_video_pick_failed(
+                "LRF lock failed — gimbal aimed at click but rangefinder did not "
+                "confirm; retry the pick or choose a surface with a clear laser return"
+            )
+            return
         row: dict[str, object] = {
             "kind": "video_mark",
             "video_x_norm": video_x,
@@ -8615,16 +8621,10 @@ class MapWidget(QWidget):
             )
         if not used_lrf:
             self._enrich_observation_geo_reference(row)
-            if slant_m is None:
-                self._append_lrf_fallback_warning(
-                    row,
-                    "LRF lock failed — position from DEM ray estimate",
-                )
-            else:
-                self._append_lrf_fallback_warning(
-                    row,
-                    "LRF geo failed — position from DEM ray estimate",
-                )
+            self._append_lrf_fallback_warning(
+                row,
+                "LRF geo failed — position from DEM ray estimate",
+            )
         lat = row.get("target_lat")
         lon = row.get("target_lon")
         if lat is None or lon is None:

@@ -645,9 +645,27 @@ def test_slr_plausible_after_slew_rejects_background_jump() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     assert not SkydroidTopUdpAdapter._slr_plausible_after_slew(12.0, 94.3, 20.0)
+    assert SkydroidTopUdpAdapter._slr_plausible_after_slew(92.1, 8.2, 36.5)
     assert SkydroidTopUdpAdapter._slr_plausible_after_slew(95.0, 98.0, 15.0)
     assert SkydroidTopUdpAdapter._slr_plausible_after_slew(12.0, 18.0, 20.0)
     assert SkydroidTopUdpAdapter._slr_plausible_after_slew(16.3, 52.0, 14.0)
+
+
+def test_try_accept_lrf_lock_slr_accepts_near_target_after_background_prelock() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    samples = [8.0, 8.1, 8.2, 8.1, 8.0]
+    got = adapter._try_accept_lrf_lock_slr(
+        samples,
+        elapsed=8.0,
+        pre_slr=92.1,
+        align_attempted=True,
+        align_ok=True,
+        click_offset_deg=36.5,
+    )
+    assert got is not None
+    assert abs(float(got) - 8.1) < 0.5
 
 
 def test_try_accept_lrf_lock_slr_rejects_slr_background_jump() -> None:
