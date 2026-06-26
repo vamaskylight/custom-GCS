@@ -26,6 +26,15 @@ def test_accept_align_phase_slr_after_slew_poll_miss() -> None:
     assert 7.0 <= float(got) <= 11.0
 
 
+def test_accept_align_ok_prelock_slr_short_range() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    got = adapter._accept_align_ok_prelock_slr(6.0, 17.1)
+    assert got == 6.0
+    assert adapter._accept_align_ok_prelock_slr(12.0, 20.0) is None
+
+
 def test_checksum_doc_examples() -> None:
     assert tp_checksum("#TPUD2wAWB01") == "44"
     assert tp_checksum("#TPUG2wGAA01") == "36"

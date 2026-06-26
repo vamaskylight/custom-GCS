@@ -11973,6 +11973,12 @@ class MapWidget(QWidget):
 
     def _begin_c13_lrf_video_lock(self, u: float, v: float) -> None:
         cc = getattr(self, "_camera_control", None)
+        unlock = getattr(cc, "unlock_lrf", None)
+        if callable(unlock):
+            try:
+                unlock()
+            except Exception:
+                pass
         lock_fn = getattr(cc, "lock_lrf_at_video_norm", None)
         if not callable(lock_fn):
             self._set_status("C13 LRF not available — set Camera provider to Skydroid")

@@ -1663,6 +1663,23 @@ class SkydroidTopUdpAdapter:
             return None
         return float(converged)
 
+    def _accept_align_ok_prelock_slr(
+        self,
+        pre_slr: float,
+        click_offset_deg: float,
+    ) -> float | None:
+        """Verified boresight slew but C13 gave no post-aim SLR — keep pre-lock at short range."""
+        pre = float(pre_slr)
+        if pre > 10.0:
+            return None
+        if not self._slr_plausible_after_slew(pre, pre, float(click_offset_deg)):
+            return None
+        print(
+            f"[VGCS:lrf] lock ok from pre-lock SLR {float(pre_slr):.1f} m "
+            f"(align ok, post-slew SLR had no reply)"
+        )
+        return float(pre_slr)
+
     def _accept_align_phase_slr(
         self,
         align_samples: list[float],
@@ -2039,6 +2056,8 @@ class SkydroidTopUdpAdapter:
                     else None
                 )
                 instant_slr = self._laser_range_m
+                # DOOAF / observation may start a new pick while adapter still locked.
+                self._lrf_locked = False
                 self._lrf_locked_distance_m = None
 
             if instant_slr is not None:
@@ -2147,8 +2166,15 @@ class SkydroidTopUdpAdapter:
                     )
                     gimbal_slew_mono = time.monotonic()
 
+                    align_tick_n = 0
+
                     def _align_tick() -> None:
-                        reading = self._query_slr_distance_m(log=False, fresh=False)
+                        nonlocal align_tick_n
+                        align_tick_n += 1
+                        use_fresh = align_tick_n % 3 == 0 or not align_slr_samples
+                        reading = self._query_slr_distance_m(
+                            log=False, fresh=bool(use_fresh)
+                        )
                         if reading is not None:
                             align_slr_samples.append(float(reading))
                             _emit_sample(float(reading))
@@ -2194,9 +2220,25 @@ class SkydroidTopUdpAdapter:
                 gimbal_slew_mono = time.monotonic()
 
             if move_gimbal and align_ok and gimbal_slew_mono is not None:
-                time.sleep(float(_LRF_POST_ALIGN_SLR_SETTLE_S))
+                pitch_ch = abs(float(align_dpitch))
+                settle_s = float(_LRF_POST_ALIGN_SLR_SETTLE_S) + (
+                    0.35 if pitch_ch > 1.5 else 0.0
+                )
+                time.sleep(settle_s)
                 self._gimbal_stop_hard()
-                if align_slr_samples:
+                time.sleep(0.15)
+                if not align_slr_samples:
+                    for burst_i in range(5):
+                        time.sleep(0.14)
+                        reading = self._query_slr_distance_m(
+                            log=burst_i == 0, fresh=True
+                        )
+                        if reading is None:
+                            continue
+                        align_slr_samples.append(float(reading))
+                        samples.append(float(reading))
+                        _emit_sample(float(reading))
+                elif align_slr_samples:
                     samples.extend(float(v) for v in align_slr_samples[-4:])
 
             post_got_wait = 0.0
@@ -2331,6 +2373,20 @@ class SkydroidTopUdpAdapter:
                 fallback = self._accept_align_phase_slr(
                     align_slr_samples,
                     pre_slr,
+                    click_offset_deg,
+                )
+                if fallback is not None:
+                    dist_m = float(fallback)
+                    _emit_sample(dist_m)
+
+            if (
+                dist_m is None
+                and align_ok
+                and pre_slr is not None
+                and not samples
+            ):
+                fallback = self._accept_align_ok_prelock_slr(
+                    float(pre_slr),
                     click_offset_deg,
                 )
                 if fallback is not None:
