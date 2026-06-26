@@ -762,3 +762,40 @@ def apply_geo_reference_result_to_video_row(
         except (TypeError, ValueError):
             row["lrf_slant_range_m"] = None
     enrich_video_mark_target_altitude(row)  # type: ignore[arg-type]
+
+
+def should_project_lrf_mark_via_geo(
+    *,
+    lrf_slew: bool,
+    has_geo: bool,
+    rel_alt_m: float | None,
+    vehicle_shift_m: float,
+    heading_delta_deg: float | None,
+    min_airborne_alt_m: float = 8.0,
+    min_shift_m: float = 1.5,
+    min_heading_deg: float = 5.0,
+) -> bool:
+    """Choose geo vs gimbal-attitude projection for a video mark.
+
+    LRF click-to-aim locks on boresight; on the ground/low hover GPS jitter must not
+    drive the overlay (use attitude until the aircraft is clearly airborne or has moved).
+    """
+    if not has_geo:
+        return False
+    if not lrf_slew:
+        return True
+    try:
+        alt = float(rel_alt_m) if rel_alt_m is not None else -1.0
+    except (TypeError, ValueError):
+        alt = -1.0
+    if alt >= float(min_airborne_alt_m):
+        return True
+    if float(vehicle_shift_m) >= float(min_shift_m):
+        return True
+    if heading_delta_deg is not None:
+        try:
+            if abs(float(heading_delta_deg)) >= float(min_heading_deg):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False

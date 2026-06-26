@@ -50,7 +50,61 @@ def test_apply_geo_reference_result_to_video_row_sets_lrf():
     assert row["geo_range_m"] == 42.0
 
 
-def test_lrf_slant_geo_nadir():
+def test_should_project_lrf_mark_via_geo_ground_stays_attitude() -> None:
+    from vgcs.observe.geo_reference import should_project_lrf_mark_via_geo
+
+    assert not should_project_lrf_mark_via_geo(
+        lrf_slew=True,
+        has_geo=True,
+        rel_alt_m=2.4,
+        vehicle_shift_m=0.2,
+        heading_delta_deg=1.0,
+    )
+    assert not should_project_lrf_mark_via_geo(
+        lrf_slew=True,
+        has_geo=True,
+        rel_alt_m=0.0,
+        vehicle_shift_m=0.0,
+        heading_delta_deg=0.0,
+    )
+
+
+def test_should_project_lrf_mark_via_geo_airborne_or_moved() -> None:
+    from vgcs.observe.geo_reference import should_project_lrf_mark_via_geo
+
+    assert should_project_lrf_mark_via_geo(
+        lrf_slew=True,
+        has_geo=True,
+        rel_alt_m=12.0,
+        vehicle_shift_m=0.0,
+        heading_delta_deg=0.0,
+    )
+    assert should_project_lrf_mark_via_geo(
+        lrf_slew=True,
+        has_geo=True,
+        rel_alt_m=1.0,
+        vehicle_shift_m=2.0,
+        heading_delta_deg=0.0,
+    )
+    assert should_project_lrf_mark_via_geo(
+        lrf_slew=True,
+        has_geo=True,
+        rel_alt_m=1.0,
+        vehicle_shift_m=0.0,
+        heading_delta_deg=6.0,
+    )
+
+
+def test_should_project_lrf_mark_via_geo_non_lrf_always_geo() -> None:
+    from vgcs.observe.geo_reference import should_project_lrf_mark_via_geo
+
+    assert should_project_lrf_mark_via_geo(
+        lrf_slew=False,
+        has_geo=True,
+        rel_alt_m=0.0,
+        vehicle_shift_m=0.0,
+        heading_delta_deg=0.0,
+    )
     from vgcs.observe.geo_reference import compute_lrf_slant_geo
 
     r = compute_lrf_slant_geo(

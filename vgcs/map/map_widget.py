@@ -7665,7 +7665,7 @@ class MapWidget(QWidget):
             except (TypeError, ValueError):
                 pass
 
-    def _vehicle_airborne_for_mark_track(self, *, min_rel_alt_m: float = 2.0) -> bool:
+    def _vehicle_airborne_for_mark_track(self, *, min_rel_alt_m: float = 8.0) -> bool:
         """True when the aircraft is airborne enough that mark tracking needs geo, not gimbal-only."""
         raw = getattr(self, "_vehicle_rel_alt_m", None)
         if raw is None:
@@ -7679,45 +7679,52 @@ class MapWidget(QWidget):
             return False
 
     def _mark_track_use_geo_projection(self, track: dict[str, object]) -> bool:
-        """Use geo when no LRF slew, airborne, or when the aircraft has moved since lock."""
+        """Use geo when no LRF slew, clearly airborne, or when the aircraft has moved since lock."""
+        from vgcs.observe.geo_reference import should_project_lrf_mark_via_geo
+
         glat = track.get("geo_lat")
         glon = track.get("geo_lon")
-        if glat is None or glon is None:
+        has_geo = glat is not None and glon is not None
+        if not has_geo:
             return False
-        if not track.get("lrf_slew"):
+        lrf_slew = bool(track.get("lrf_slew"))
+        if not lrf_slew:
             return True
-        # Earth-referenced gimbal + LOITER: vehicle translation shifts the scene on screen.
-        if self._vehicle_airborne_for_mark_track():
-            return True
+        ctx = self._observation_context()
+        rel_alt = getattr(self, "_vehicle_rel_alt_m", None)
+        if rel_alt is None:
+            rel_alt = ctx.get("vehicle_rel_alt_m") or ctx.get("ekf_rel_alt_m")
+        shift_m = 0.0
+        heading_delta: float | None = None
         lock_lat = track.get("lock_vehicle_lat")
         lock_lon = track.get("lock_vehicle_lon")
-        if lock_lat is None or lock_lon is None:
-            return False
-        ctx = self._observation_context()
         clat = ctx.get("vehicle_lat")
         clon = ctx.get("vehicle_lon")
-        if clat is None or clon is None:
-            return False
-        try:
-            shift_m = self._haversine_m(
-                float(lock_lat), float(lock_lon), float(clat), float(clon)
-            )
-        except (TypeError, ValueError):
-            shift_m = 0.0
-        if float(shift_m) >= 1.5:
-            return True
+        if lock_lat is not None and lock_lon is not None and clat is not None and clon is not None:
+            try:
+                shift_m = float(
+                    self._haversine_m(
+                        float(lock_lat), float(lock_lon), float(clat), float(clon)
+                    )
+                )
+            except (TypeError, ValueError):
+                shift_m = 0.0
         lock_h = track.get("lock_vehicle_heading_deg")
         cur_h = ctx.get("vehicle_heading_deg")
         if lock_h is not None and cur_h is not None:
             try:
-                dh = abs(
+                heading_delta = float(
                     ((float(cur_h) - float(lock_h) + 180.0) % 360.0) - 180.0
                 )
-                if dh >= 2.0:
-                    return True
             except (TypeError, ValueError):
-                pass
-        return False
+                heading_delta = None
+        return should_project_lrf_mark_via_geo(
+            lrf_slew=True,
+            has_geo=True,
+            rel_alt_m=rel_alt,  # type: ignore[arg-type]
+            vehicle_shift_m=shift_m,
+            heading_delta_deg=heading_delta,
+        )
 
     def _video_mark_tracking_active(self) -> bool:
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
@@ -7890,11 +7897,41 @@ class MapWidget(QWidget):
         except Exception:
             return None
 
+    def _attitude_mark_uv_from_track(
+        self,
+        track: dict[str, object],
+        stored_uv: tuple[float, float],
+    ) -> tuple[float, float] | None:
+        cur = self._read_gimbal_attitude_pair()
+        if cur is None:
+            return None
+        ref_uv = track.get("ref_uv")
+        ref_att = track.get("ref_att")
+        if not isinstance(ref_uv, tuple) or not isinstance(ref_att, tuple):
+            return None
+        try:
+            from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+            u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+                (float(ref_uv[0]), float(ref_uv[1])),
+                (float(ref_att[0]), float(ref_att[1])),
+                cur,
+                gac_h_scale=float(track.get("h_scale", 1.0) or 1.0),
+                gac_v_scale=float(track.get("v_scale", 1.0) or 1.0),
+                clamp=False,
+            )
+            return (float(u), float(v))
+        except Exception:
+            return None
+
     def _project_mark_uv_unclamped(
         self,
         track: dict[str, object] | None,
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
+        att_uv: tuple[float, float] | None = None
+        if track is not None:
+            att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
         if track is not None and self._mark_track_use_geo_projection(track):
             glat = track.get("geo_lat")
             glon = track.get("geo_lon")
@@ -7912,30 +7949,18 @@ class MapWidget(QWidget):
                 ),
             )
             if geo_uv is not None:
-                return (float(geo_uv[0]), float(geo_uv[1]))
+                gu, gv = float(geo_uv[0]), float(geo_uv[1])
+                if track.get("lrf_slew") and att_uv is not None:
+                    au, av = att_uv
+                    if not self._vehicle_airborne_for_mark_track():
+                        if abs(gu - au) > 0.10 or abs(gv - av) > 0.10:
+                            return (float(au), float(av))
+                return (gu, gv)
+        if att_uv is not None:
+            return att_uv
         if not track:
             return (float(stored_uv[0]), float(stored_uv[1]))
-        cur = self._read_gimbal_attitude_pair()
-        if cur is None:
-            return (float(stored_uv[0]), float(stored_uv[1]))
-        ref_uv = track.get("ref_uv")
-        ref_att = track.get("ref_att")
-        if not isinstance(ref_uv, tuple) or not isinstance(ref_att, tuple):
-            return (float(stored_uv[0]), float(stored_uv[1]))
-        try:
-            from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
-
-            u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
-                (float(ref_uv[0]), float(ref_uv[1])),
-                (float(ref_att[0]), float(ref_att[1])),
-                cur,
-                gac_h_scale=float(track.get("h_scale", 1.0) or 1.0),
-                gac_v_scale=float(track.get("v_scale", 1.0) or 1.0),
-                clamp=False,
-            )
-            return (float(u), float(v))
-        except Exception:
-            return (float(stored_uv[0]), float(stored_uv[1]))
+        return (float(stored_uv[0]), float(stored_uv[1]))
 
     @staticmethod
     def _mark_uv_on_screen(u: float, v: float, *, margin: float = 0.02) -> bool:
