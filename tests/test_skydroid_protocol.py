@@ -13,6 +13,19 @@ from vgcs.skydroid.protocol import (
 )
 
 
+def test_accept_align_phase_slr_after_slew_poll_miss() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    got = adapter._accept_align_phase_slr(
+        [91.0, 10.5, 9.7, 10.1, 8.8, 7.0],
+        92.1,
+        36.5,
+    )
+    assert got is not None
+    assert 7.0 <= float(got) <= 11.0
+
+
 def test_checksum_doc_examples() -> None:
     assert tp_checksum("#TPUD2wAWB01") == "44"
     assert tp_checksum("#TPUG2wGAA01") == "36"

@@ -55,6 +55,7 @@ _LRF_SETTLE_WINDOW = 8
 _LRF_SETTLE_MIN_DRIFT_M = 2.0
 _LRF_POST_MOVE_MIN_WAIT_S = 0.1
 _LRF_POST_MOVE_SETTLE_S = 0.2
+_LRF_POST_ALIGN_SLR_SETTLE_S = 0.45
 _LRF_GOT_RESEND_INTERVAL_S = 2.0
 _LRF_BASELINE_RETRIES = 8
 _LRF_BASELINE_GAP_S = 0.2
@@ -1662,6 +1663,36 @@ class SkydroidTopUdpAdapter:
             return None
         return float(converged)
 
+    def _accept_align_phase_slr(
+        self,
+        align_samples: list[float],
+        pre_slr: float | None,
+        click_offset_deg: float,
+    ) -> float | None:
+        """Use stable SLR readings collected while slewing (post-poll often fails on C13)."""
+        if len(align_samples) < 2:
+            return None
+        vals = [float(v) for v in align_samples]
+        if pre_slr is not None:
+            pre = max(0.5, float(pre_slr))
+            near = [v for v in vals if v < pre * 0.55]
+            tail = near[-6:] if len(near) >= 2 else vals[-4:]
+        else:
+            tail = vals[-4:]
+        if len(tail) < 2:
+            return None
+        spread = max(tail) - min(tail)
+        if spread > max(4.0, float(_LRF_STABLE_EPS_M) * 8.0):
+            return None
+        med = float(self._slr_median(tail))
+        if not self._slr_plausible_after_slew(pre_slr, med, float(click_offset_deg)):
+            return None
+        print(
+            f"[VGCS:lrf] lock ok from align-phase SLR median={med:.1f} m "
+            f"(samples={tail}, post-slew poll had no reply)"
+        )
+        return med
+
     def _try_accept_gimbal_slew_slr(
         self,
         samples: list[float],
@@ -2103,6 +2134,7 @@ class SkydroidTopUdpAdapter:
             gimbal_slew_mono: float | None = None
             att_lock_ref = att_before
             got_sent = True
+            align_slr_samples: list[float] = []
 
             if move_gimbal:
                 if att_before is None:
@@ -2116,7 +2148,10 @@ class SkydroidTopUdpAdapter:
                     gimbal_slew_mono = time.monotonic()
 
                     def _align_tick() -> None:
-                        _emit_slr_live(fresh=False, log=False)
+                        reading = self._query_slr_distance_m(log=False, fresh=False)
+                        if reading is not None:
+                            align_slr_samples.append(float(reading))
+                            _emit_sample(float(reading))
 
                     att_after, align_ok, align_dyaw, align_dpitch = (
                         self._align_laser_boresight_to_pixel(
@@ -2158,6 +2193,12 @@ class SkydroidTopUdpAdapter:
                     )
                 gimbal_slew_mono = time.monotonic()
 
+            if move_gimbal and align_ok and gimbal_slew_mono is not None:
+                time.sleep(float(_LRF_POST_ALIGN_SLR_SETTLE_S))
+                self._gimbal_stop_hard()
+                if align_slr_samples:
+                    samples.extend(float(v) for v in align_slr_samples[-4:])
+
             post_got_wait = 0.0
 
             att_latest = att_lock_ref
@@ -2167,7 +2208,7 @@ class SkydroidTopUdpAdapter:
             )
 
             min_wait = (
-                0.0
+                float(_LRF_POST_ALIGN_SLR_SETTLE_S)
                 if move_gimbal and gimbal_slew_mono is not None and align_ok
                 else (
                     _LRF_POST_MOVE_MIN_WAIT_S
@@ -2176,12 +2217,15 @@ class SkydroidTopUdpAdapter:
                 )
             )
 
+            post_polls = 0
             while time.monotonic() < deadline:
                 elapsed = time.monotonic() - start_mono
                 time.sleep(_LRF_LOCK_POLL_S)
+                post_polls += 1
+                use_fresh = post_polls > 4
                 reading = self._query_slr_distance_m(
-                    log=len(samples) == 0,
-                    fresh=True,
+                    log=len(samples) == 0 and post_polls <= 2,
+                    fresh=bool(use_fresh),
                 )
                 if reading is None:
                     continue
@@ -2282,6 +2326,16 @@ class SkydroidTopUdpAdapter:
                         f"[VGCS:lrf] lock rejected — SLR did not stabilize "
                         f"(samples={samples[-5:]})"
                     )
+
+            if dist_m is None and align_ok and align_slr_samples:
+                fallback = self._accept_align_phase_slr(
+                    align_slr_samples,
+                    pre_slr,
+                    click_offset_deg,
+                )
+                if fallback is not None:
+                    dist_m = float(fallback)
+                    _emit_sample(dist_m)
 
             with self._status_lock:
                 if dist_m is not None:
