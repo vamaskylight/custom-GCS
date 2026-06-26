@@ -97,6 +97,10 @@ _LRF_SLR_QUERY_RETRIES = 3
 _LRF_SLR_DEST_LASER = "E"
 _LRF_SLR_DEST_SYSTEM = "D"
 _LRF_SLR_DIVERGE_WARN_M = 2.0
+_LRF_SLR_JUMP_RATIO_MAX = 2.5
+_LRF_SLR_JUMP_MIN_M = 12.0
+_LRF_BORESIGHT_TOL_U = 0.032
+_LRF_BORESIGHT_TOL_V = 0.040
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.32
 _LRF_MAX_REPOINTS = 0
@@ -807,6 +811,74 @@ class SkydroidTopUdpAdapter:
             att_now = self._read_gimbal_attitude_deg() or att_now
         return att_now
 
+    @staticmethod
+    def _click_uv_from_px(
+        x_px: int, y_px: int, *, fw: int = _LRF_FRAME_W, fh: int = _LRF_FRAME_H
+    ) -> tuple[float, float]:
+        u = max(0.0, min(1.0, float(x_px) / max(1.0, float(fw))))
+        v = max(0.0, min(1.0, float(y_px) / max(1.0, float(fh))))
+        return (float(u), float(v))
+
+    def _verify_click_on_boresight(
+        self,
+        u: float,
+        v: float,
+        att_at_click: tuple[float, float],
+        att_now: tuple[float, float],
+        *,
+        gac_h_scale: float = 1.0,
+        gac_v_scale: float = 1.0,
+    ) -> tuple[bool, float, float]:
+        """True when the clicked world point reprojects to frame centre at att_now."""
+        u_chk, v_chk = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+            (float(u), float(v)),
+            (float(att_at_click[0]), float(att_at_click[1])),
+            (float(att_now[0]), float(att_now[1])),
+            gac_h_scale=float(gac_h_scale),
+            gac_v_scale=float(gac_v_scale),
+            clamp=False,
+        )
+        ok = (
+            abs(float(u_chk) - 0.5) <= float(_LRF_BORESIGHT_TOL_U)
+            and abs(float(v_chk) - 0.5) <= float(_LRF_BORESIGHT_TOL_V)
+        )
+        return bool(ok), float(u_chk), float(v_chk)
+
+    @staticmethod
+    def _slr_plausible_after_slew(
+        pre_slr: float | None,
+        post_slr: float,
+        click_offset_deg: float,
+    ) -> bool:
+        """Reject locks where the laser jumped to a background surface after a large slew."""
+        if pre_slr is None or float(click_offset_deg) < 3.0:
+            return True
+        pre = max(0.5, float(pre_slr))
+        post = float(post_slr)
+        jump = abs(post - pre)
+        if jump < float(_LRF_SLR_JUMP_MIN_M):
+            return True
+        ratio = post / pre
+        inv = pre / max(post, 0.5)
+        # Near-field pre-lock (grass/tree) jumping to distant facade — field log 12 m -> 94 m.
+        if pre < 14.0 and post > max(35.0, pre * 2.8):
+            print(
+                f"[VGCS:lrf] lock rejected — SLR {pre:.1f} m -> {post:.1f} m "
+                f"(Δ={jump:.1f} m) after {float(click_offset_deg):.1f}° click-to-aim — "
+                f"near target was {pre:.0f} m but laser locked background; "
+                f"pick a feature with clear range or move closer"
+            )
+            return False
+        if ratio > 3.5 or inv > 3.5:
+            if jump >= 25.0:
+                print(
+                    f"[VGCS:lrf] lock rejected — SLR {pre:.1f} m -> {post:.1f} m "
+                    f"(Δ={jump:.1f} m) after {float(click_offset_deg):.1f}° click-to-aim — "
+                    f"laser likely hit background; pick a nearer feature or re-aim"
+                )
+                return False
+        return True
+
     def _align_axes_ok(
         self,
         att: tuple[float, float],
@@ -824,7 +896,11 @@ class SkydroidTopUdpAdapter:
             pitch_err = abs(self._angle_err_deg(float(pitch_tgt), float(att[1])))
             pitch_ok = pitch_err <= float(pitch_tol)
         else:
-            pitch_ok = float(pitch_open_sent) >= abs(float(dpitch_image)) * 0.88
+            # Open-loop pitch counters are not proof of aim — large clicks need GAC or verify.
+            pitch_ok = (
+                abs(float(dpitch_image)) < 3.0
+                and float(pitch_open_sent) >= abs(float(dpitch_image)) * 0.88
+            )
         return yaw_err <= float(yaw_tol) and pitch_ok
 
     def _align_aim_satisfied(
@@ -970,6 +1046,7 @@ class SkydroidTopUdpAdapter:
 
         yaw_tgt = self._gimbal_yaw_target_deg(float(att_start[0]), float(dyaw0))
         pitch_tgt = self._gimbal_pitch_target_deg(float(att_start[1]), float(dpitch0))
+        click_u, click_v = self._click_uv_from_px(x_px, y_px)
         spd = self._align_speed_for_need(float(need))
         att: tuple[float, float] = att_start
         total_move = 0.0
@@ -1030,13 +1107,26 @@ class SkydroidTopUdpAdapter:
                     pitch_open_sent=float(pitch_open_sent),
                     pitch_trusted=bool(pitch_trusted),
                 ):
-                    yaw_e = self._angle_err_deg(float(yaw_tgt), float(att[0]))
-                    pitch_e = self._angle_err_deg(float(pitch_tgt), float(att[1]))
-                    print(
-                        f"[VGCS:lrf] align ok iter={n + 1} att={att} "
-                        f"residual=({float(yaw_e):+.2f}°,{float(pitch_e):+.2f}°)"
+                    bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
+                        click_u, click_v, att_start, att
                     )
-                    return att, True, float(dyaw0), float(dpitch0)
+                    if bore_ok:
+                        yaw_e = self._angle_err_deg(float(yaw_tgt), float(att[0]))
+                        pitch_e = self._angle_err_deg(float(pitch_tgt), float(att[1]))
+                        print(
+                            f"[VGCS:lrf] align ok iter={n + 1} att={att} "
+                            f"residual=({float(yaw_e):+.2f}°,{float(pitch_e):+.2f}°) "
+                            f"verify=({u_chk:.3f},{v_chk:.3f})"
+                        )
+                        return att, True, float(dyaw0), float(dpitch0)
+                    print(
+                        f"[VGCS:lrf] align iter={n + 1} — click still at "
+                        f"({u_chk:.3f},{v_chk:.3f}), need boresight (0.500,0.500)"
+                    )
+                    gap_pitch_sent = False
+                    pitch_open_sent = min(
+                        float(pitch_open_sent), pitch_need_deg * 0.55
+                    )
             yaw_err = self._angle_err_deg(yaw_tgt, att[0])
             pitch_err = self._angle_err_deg(pitch_tgt, att[1])
             pitch_ok = (
@@ -1159,6 +1249,15 @@ class SkydroidTopUdpAdapter:
             pitch_open_sent_deg=float(pitch_open_sent),
             dyaw=float(dyaw0),
         )
+        bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
+            click_u, click_v, att_start, att_end
+        )
+        aim_ok = bool(aim_ok and bore_ok)
+        if not bore_ok:
+            print(
+                f"[VGCS:lrf] align verify fail — click at ({u_chk:.3f},{v_chk:.3f}) "
+                f"not boresight after slew"
+            )
         move = self._gimbal_total_move_deg(att_start, att_end)
         print(
             f"[VGCS:lrf] align done att={att_start}->{att_end} "
@@ -1606,6 +1705,11 @@ class SkydroidTopUdpAdapter:
         if len(tail) >= 3 and self._slr_still_climbing(tail[-3:]):
             return None
         if align_ok:
+            click_off = self._expected_offset_deg(float(dyaw), float(dpitch))
+            if not self._slr_plausible_after_slew(
+                baseline_m, float(converged), float(click_off)
+            ):
+                return None
             return float(converged)
         gimbal_move = self._gimbal_total_move_deg(att_before, att_now)
         if (
@@ -1638,6 +1742,10 @@ class SkydroidTopUdpAdapter:
             and not self._slr_still_climbing(samples[-3:])
         )
         if align_attempted and align_ok:
+            if not self._slr_plausible_after_slew(
+                pre_slr, float(stable), float(click_offset_deg)
+            ):
+                return None
             return float(stable)
         if align_attempted and off_centre and unchanged:
             print(
