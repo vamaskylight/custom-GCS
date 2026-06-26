@@ -620,6 +620,52 @@ def test_try_accept_lrf_lock_slr_accepts_after_align_to_building() -> None:
     assert abs(float(got) - 52.0) < 0.5
 
 
+def test_verify_click_on_boresight_after_slew(monkeypatch) -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    monkeypatch.delenv("VGCS_LRF_NEGATE_YAW_DELTA", raising=False)
+    adapter = SkydroidTopUdpAdapter()
+    click_att = (29.19, -4.24)
+    lock_att = (8.58, 3.30)
+    ok, u, v = adapter._verify_click_on_boresight(
+        0.747, 0.339, click_att, lock_att
+    )
+    assert ok
+    assert abs(u - 0.5) < 0.04
+    assert abs(v - 0.5) < 0.04
+    bad_att = (8.58, -0.09)
+    ok2, u2, v2 = adapter._verify_click_on_boresight(
+        0.747, 0.339, click_att, bad_att
+    )
+    assert not ok2
+    assert abs(u2 - 0.5) > 0.05 or abs(v2 - 0.5) > 0.05
+
+
+def test_slr_plausible_after_slew_rejects_background_jump() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    assert not SkydroidTopUdpAdapter._slr_plausible_after_slew(12.0, 94.3, 20.0)
+    assert SkydroidTopUdpAdapter._slr_plausible_after_slew(95.0, 98.0, 15.0)
+    assert SkydroidTopUdpAdapter._slr_plausible_after_slew(12.0, 18.0, 20.0)
+    assert SkydroidTopUdpAdapter._slr_plausible_after_slew(16.3, 52.0, 14.0)
+
+
+def test_try_accept_lrf_lock_slr_rejects_slr_background_jump() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    samples = [94.0, 94.2, 94.3, 94.1, 94.3]
+    got = adapter._try_accept_lrf_lock_slr(
+        samples,
+        elapsed=8.0,
+        pre_slr=12.0,
+        align_attempted=True,
+        align_ok=True,
+        click_offset_deg=20.0,
+    )
+    assert got is None
+
+
 def test_slr_trimmed_median_drops_outliers() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
