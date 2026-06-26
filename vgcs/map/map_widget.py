@@ -7562,6 +7562,27 @@ class MapWidget(QWidget):
         }
         return out
 
+    def _sync_dooaf_setup_mark_from_lrf_slew_progress(self, role: str | None = None) -> None:
+        """Keep DOOAF gun mark aligned with LRF reticle while click-to-aim slew runs."""
+        if not bool(getattr(self, "_lrf_lock_in_progress", False)):
+            return
+        click_uv = getattr(self, "_lrf_click_uv", None)
+        click_att = getattr(self, "_lrf_click_att", None)
+        if click_uv is None or click_att is None:
+            return
+        h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
+        v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
+        roles = [str(role)] if role else list(self._dooaf_setup_mark_track.keys())
+        for rk in roles:
+            built = self._dooaf_setup_mark_track.get(str(rk))
+            if built is None:
+                continue
+            built["ref_uv"] = (float(click_uv[0]), float(click_uv[1]))
+            built["ref_att"] = (float(click_att[0]), float(click_att[1]))
+            built["h_scale"] = h_scale
+            built["v_scale"] = v_scale
+            built["lrf_slew"] = True
+
     def _sync_dooaf_setup_track_from_lrf_lock(self, role: str | None = None) -> None:
         """Copy post-lock GAC scale factors into DOOAF setup mark tracks.
 
@@ -7721,6 +7742,8 @@ class MapWidget(QWidget):
             t.setInterval(50)
             t.timeout.connect(self._refresh_tracked_video_marks_light)
             self._video_mark_track_timer = t
+        fast = bool(getattr(self, "_lrf_lock_in_progress", False))
+        t.setInterval(33 if fast else 50)
         if not t.isActive():
             t.start()
 
@@ -7728,6 +7751,11 @@ class MapWidget(QWidget):
         """Reproject tracked marks and LRF reticle during slew (~20 Hz)."""
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             try:
+                pending = getattr(self, "_pending_lrf_video_pick", None)
+                pick_role = str(
+                    getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED
+                )
+                self._sync_dooaf_setup_mark_from_lrf_slew_progress(pick_role)
                 self._refresh_lrf_lock_overlay(sync_geometry=False)
             except Exception:
                 pass
@@ -7959,6 +7987,13 @@ class MapWidget(QWidget):
         self, role: str, stored_uv: tuple[float, float]
     ) -> tuple[float, float] | None:
         """Screen UV for a DOOAF setup mark — tracks gimbal; hidden when off-screen."""
+        if bool(getattr(self, "_lrf_lock_in_progress", False)):
+            lock_uv = getattr(self, "_lrf_lock_uv", None)
+            if lock_uv is not None:
+                u, v = float(lock_uv[0]), float(lock_uv[1])
+                if self._mark_uv_on_screen(u, v):
+                    return (u, v)
+                return None
         track = self._dooaf_setup_mark_track.get(str(role))
         return self._tracked_uv_from_store(track, stored_uv)
 
@@ -8087,7 +8122,11 @@ class MapWidget(QWidget):
         """Video clicks: DOOAF Setup picks (green target) + observation fall-of-shot (red)."""
         out: list[VideoOverlayMark] = []
         seen: set[tuple[float, float]] = set()
+        # During click-to-aim slew the yellow LRF reticle is the single tracked target.
+        skip_dooaf_setup = bool(getattr(self, "_lrf_lock_in_progress", False))
         for role, pt in self._dooaf_setup_video_marks.items():
+            if skip_dooaf_setup:
+                continue
             try:
                 disp = self._dooaf_mark_display_uv(str(role), pt)
                 if disp is None:
@@ -8673,7 +8712,7 @@ class MapWidget(QWidget):
                     "ref_att": (float(ref_att[0]), float(ref_att[1])),
                     "h_scale": 1.0,
                     "v_scale": 1.0,
-                    "lrf_slew": False,
+                    "lrf_slew": True,
                 }
             else:
                 self._dooaf_setup_mark_track.pop(pick_role, None)
@@ -9618,6 +9657,8 @@ class MapWidget(QWidget):
 
     def _flush_video_marks_overlay(self) -> None:
         try:
+            if self._lrf_reticle_tracking_active():
+                self._update_lrf_reticle_track()
             marks = self._video_overlay_marks()
             self._video_obs_marks = [(m.x, m.y) for m in marks]
             ly = self._native_video_overlay
@@ -11538,12 +11579,35 @@ class MapWidget(QWidget):
         try:
             from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
+            h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
+            v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
+            if in_progress:
+                click_uv = getattr(self, "_lrf_click_uv", None)
+                click_att = getattr(self, "_lrf_click_att", None)
+                if click_uv is not None and click_att is not None:
+                    dy = abs(float(cur[0]) - float(click_att[0]))
+                    dp = abs(float(cur[1]) - float(click_att[1]))
+                    if dy > 0.06 or dp > 0.06:
+                        h_new, v_new = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
+                            (float(click_uv[0]), float(click_uv[1])),
+                            click_att,
+                            cur,
+                            h_scale=h_scale,
+                            v_scale=v_scale,
+                            live=True,
+                        )
+                        h_scale = float(h_new)
+                        v_scale = float(v_new)
+                        self._lrf_track_gac_h_scale = h_scale
+                        self._lrf_track_gac_v_scale = v_scale
+                ref_uv = (float(click_uv[0]), float(click_uv[1])) if click_uv else ref_uv
+                ref_att = click_att if click_att is not None else ref_att
             u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
                 ref_uv,
                 ref_att,
                 cur,
-                gac_h_scale=float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0),
-                gac_v_scale=float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0),
+                gac_h_scale=h_scale,
+                gac_v_scale=v_scale,
             )
             self._lrf_lock_uv = (float(u), float(v))
         except Exception:
@@ -11682,6 +11746,20 @@ class MapWidget(QWidget):
                 ly.raise_()
             if sync_geometry:
                 self._sync_native_video_overlay(from_lrf=True)
+            elif self._video_mark_tracking_active():
+                self._sync_dooaf_video_marks_on_overlay(ly)
+        except Exception:
+            pass
+
+    def _sync_dooaf_video_marks_on_overlay(self, ly: object | None = None) -> None:
+        """Reproject DOOAF / observation marks after LRF reticle moved (same gimbal sample)."""
+        try:
+            overlay = ly if ly is not None else self._native_video_overlay
+            marks = self._video_overlay_marks()
+            self._video_obs_marks = [(m.x, m.y) for m in marks]
+            overlay.set_video_marks(marks)
+            overlay.set_offscreen_hints(self._video_overlay_offscreen_hints())
+            overlay.update()
         except Exception:
             pass
 
@@ -11893,7 +11971,7 @@ class MapWidget(QWidget):
             self._lrf_lock_distance_m = dm
             self._notify_companion_gimbal_motion(duration_s=45.0)
             self._update_lrf_lock_geo(dm)
-            self._refresh_lrf_lock_overlay()
+            self._refresh_tracked_video_marks_light()
             pending = getattr(self, "_pending_lrf_video_pick", None)
             try:
                 self._obstacle_radar.set_c13_lrf_locking(
