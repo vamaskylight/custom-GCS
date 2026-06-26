@@ -156,6 +156,7 @@ from vgcs.video.pipeline import (
     notify_companion_preview_motion,
     notify_companion_app_background,
     notify_companion_app_foreground,
+    notify_companion_lrf_lock,
     notify_companion_feed_switch,
     release_all_companion_rtsp_hosts,
     release_companion_rtsp_host,
@@ -8574,15 +8575,17 @@ class MapWidget(QWidget):
             except (TypeError, ValueError):
                 alt_m = None
         cb = self._dooaf_pick_complete
-        mark_u, mark_v = (0.5, 0.5) if used_lrf else (video_x, video_y)
-        self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
         click_att = getattr(self, "_lrf_click_att", None)
+        slew_locked = slant_m is not None and click_att is not None
+        used_lrf_slew = bool(used_lrf or slew_locked)
+        mark_u, mark_v = (0.5, 0.5) if used_lrf_slew else (video_x, video_y)
+        self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
         self._register_dooaf_setup_mark_track(
             pick_role,
             ref_uv=(video_x, video_y),
             ref_att=click_att,
             lock_att=self._read_gimbal_attitude_pair(),
-            used_lrf_slew=bool(used_lrf),
+            used_lrf_slew=used_lrf_slew,
             geo_lat=float(lat),
             geo_lon=float(lon),
             geo_alt_m=alt_m,
@@ -11795,6 +11798,7 @@ class MapWidget(QWidget):
         self._lrf_click_att = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
+        notify_companion_lrf_lock(active=False)
         self._clear_lrf_track_ref()
         self._clear_lrf_lock_geo()
         self._sync_lrf_armed_backend(False)
@@ -11813,6 +11817,7 @@ class MapWidget(QWidget):
         self._lrf_click_att = None
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = False
+        notify_companion_lrf_lock(active=False)
         self._clear_lrf_track_ref()
         self._clear_lrf_lock_geo()
         self._sync_lrf_armed_backend(False)
@@ -11848,7 +11853,8 @@ class MapWidget(QWidget):
         self._lrf_lock_distance_m = None
         self._lrf_lock_in_progress = True
         self._clear_lrf_lock_geo()
-        self._notify_companion_gimbal_motion(duration_s=5.0)
+        notify_companion_lrf_lock(active=True)
+        self._notify_companion_gimbal_motion(duration_s=120.0)
         self._capture_lrf_track_ref(float(u), float(v))
         self._sync_video_mark_track_timer()
         self._sync_lrf_armed_backend(False)
@@ -11885,6 +11891,7 @@ class MapWidget(QWidget):
         try:
             dm = float(distance_m)
             self._lrf_lock_distance_m = dm
+            self._notify_companion_gimbal_motion(duration_s=45.0)
             self._update_lrf_lock_geo(dm)
             self._refresh_lrf_lock_overlay()
             pending = getattr(self, "_pending_lrf_video_pick", None)
@@ -11908,6 +11915,8 @@ class MapWidget(QWidget):
 
     def _on_c13_lrf_lock_finished(self, dist: object, u: float, v: float) -> None:
         self._lrf_lock_in_progress = False
+        notify_companion_lrf_lock(active=False)
+        self._notify_companion_gimbal_motion(duration_s=15.0)
         self._sync_video_mark_track_timer()
         pending = getattr(self, "_pending_lrf_video_pick", None)
         if pending is not None:

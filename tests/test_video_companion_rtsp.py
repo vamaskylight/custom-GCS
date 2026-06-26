@@ -25,6 +25,7 @@ from vgcs.video.pipeline import (
     _stall_watchdog_enabled,
     _video_stall_reconnect_s,
     notify_companion_preview_motion,
+    notify_companion_lrf_lock,
     set_companion_decode_gate,
 )
 
@@ -263,17 +264,41 @@ def test_stale_preview_reconnect_opt_out():
         os.environ.pop("VGCS_COMPANION_STALE_RECONNECT", None)
 
 
-def test_motion_preview_still_hides_artifact_frames():
+def test_motion_preview_still_hides_macroblock_soup():
+    h, w = 120, 200
+    soup = np.zeros((h, w, 3), dtype=np.uint8)
+    soup[:, :, 1] = 80
+    rng = np.random.default_rng(7)
+    for y in range(0, h - 15, 16):
+        for x in range(0, w - 15, 16):
+            if rng.random() > 0.45:
+                soup[y : y + 16, x : x + 16, :] = rng.integers(
+                    0, 256, (16, 16, 3), dtype=np.uint8
+                )
+    notify_companion_preview_motion(duration_s=3.0)
+    hide, why = _companion_frame_should_hide(soup, None, motion_preview=True)
+    assert hide and why == "artifact"
+
+
+def test_motion_preview_allows_mild_compression_noise():
     h, w = 120, 200
     good = np.zeros((h, w, 3), dtype=np.uint8)
     good[:, :, 1] = 100
-    torn = good.copy()
-    torn[h // 2 :, :, 0] = 240
-    torn[h // 2 :, :, 1] = 20
-    torn[h // 2 :, :, 2] = 240
+    noisy = good.copy()
+    noisy[40:80, 60:140, 0] = 105
     notify_companion_preview_motion(duration_s=3.0)
-    hide, why = _companion_frame_should_hide(torn, good, motion_preview=True)
-    assert hide and why == "artifact"
+    hide, _ = _companion_frame_should_hide(noisy, good, motion_preview=True)
+    assert not hide
+
+
+def test_lrf_lock_blocks_corrupt_reconnect_flag():
+    notify_companion_lrf_lock(active=True)
+    try:
+        from vgcs.video.pipeline import _companion_lrf_lock_active
+
+        assert _companion_lrf_lock_active()
+    finally:
+        notify_companion_lrf_lock(active=False)
 
 
 def test_companion_rtsp_host_single_owner():
