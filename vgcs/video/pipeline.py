@@ -33,6 +33,21 @@ _companion_feed_switch_until: float = 0.0
 # MapWidget registers which source ids may open FFmpeg (single view = day only).
 _companion_decode_gate: Callable[[str], bool] | None = None
 
+# LRF click-to-aim — block RTSP reconnect churn for the full lock (often 30–60s).
+_companion_lrf_lock_session: bool = False
+
+
+def notify_companion_lrf_lock(*, active: bool) -> None:
+    """Hold RTSP steady while C13 slews + SLR locks (reconnect mid-slew breaks pick)."""
+    global _companion_lrf_lock_session
+    _companion_lrf_lock_session = bool(active)
+    if active:
+        notify_companion_preview_motion(duration_s=120.0)
+
+
+def _companion_lrf_lock_active() -> bool:
+    return bool(_companion_lrf_lock_session)
+
 
 def notify_companion_preview_motion(*, duration_s: float = 2.5) -> None:
     """Extend motion-preview window (gimbal slew — show live frames, do not hold stale preview)."""
@@ -701,11 +716,19 @@ def _companion_stale_preview_reconnect_min_s() -> float:
 
 
 def _companion_corrupt_streak_reconnect_threshold() -> int:
-    raw = str(os.environ.get("VGCS_COMPANION_CORRUPT_RECONNECT_STREAK", "90") or "90").strip()
+    raw = str(os.environ.get("VGCS_COMPANION_CORRUPT_RECONNECT_STREAK", "180") or "180").strip()
     try:
-        return max(45, min(300, int(raw)))
+        return max(90, min(600, int(raw)))
     except ValueError:
-        return 90
+        return 180
+
+
+def _companion_corrupt_reconnect_cooldown_s() -> float:
+    raw = str(os.environ.get("VGCS_COMPANION_CORRUPT_RECONNECT_COOLDOWN_S", "45") or "45").strip()
+    try:
+        return max(15.0, min(180.0, float(raw)))
+    except ValueError:
+        return 45.0
 
 
 def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
@@ -1026,11 +1049,13 @@ def _companion_frame_should_hide(
             if lg.shape == sample.shape and _rgb_frame_looks_hevc_corrupt(sample, lg):
                 return True, "corrupt"
         return False, ""
-    # Always reject macroblock tears — motion preview only skips stale-frame compare.
+    # During gimbal slew / LRF lock: show live frames; only reject full macroblock collapse.
+    if motion_preview:
+        if _rgb_frame_looks_like_macroblock_soup(sample):
+            return True, "artifact"
+        return False, ""
     if _rgb_frame_has_decode_artifacts(sample, strict=True):
         return True, "artifact"
-    if motion_preview:
-        return False, ""
     if last_good is not None:
         lg = _companion_rgb_sample_for_qc(last_good)
         if lg.shape == sample.shape and _rgb_frame_looks_hevc_corrupt(sample, lg):
@@ -2373,8 +2398,9 @@ class RtspSource(QObject):
             if _companion_corrupt_streak_reconnect_enabled():
                 print(
                     "[VGCS:video] companion HEVC: corrupt-streak reconnect enabled "
-                    f"(streak>={_companion_corrupt_streak_reconnect_threshold()}; "
-                    "set VGCS_COMPANION_CORRUPT_RECONNECT=0 to disable)"
+                    f"(streak>={_companion_corrupt_streak_reconnect_threshold()}, "
+                    f"cooldown={_companion_corrupt_reconnect_cooldown_s():.0f}s; "
+                    "blocked during LRF lock; set VGCS_COMPANION_CORRUPT_RECONNECT=0 to disable)"
                 )
             else:
                 print(
@@ -2765,6 +2791,7 @@ class RtspSource(QObject):
                                             stale_due = (
                                                 _companion_stale_preview_reconnect_enabled()
                                                 and not motion_preview
+                                                and not _companion_lrf_lock_active()
                                                 and not _companion_app_is_background()
                                                 and corrupt_skip_streak >= stale_thr
                                                 and stale_now
@@ -2800,11 +2827,24 @@ class RtspSource(QObject):
                                             corrupt_thr = (
                                                 _companion_corrupt_streak_reconnect_threshold()
                                             )
+                                            corrupt_cooldown = (
+                                                _companion_corrupt_reconnect_cooldown_s()
+                                            )
+                                            corrupt_last = float(
+                                                getattr(
+                                                    self,
+                                                    "_companion_last_corrupt_reconnect_mono",
+                                                    0.0,
+                                                )
+                                                or 0.0
+                                            )
                                             if (
                                                 _companion_corrupt_streak_reconnect_enabled()
                                                 and not motion_preview
+                                                and not _companion_lrf_lock_active()
                                                 and not _companion_app_is_background()
                                                 and corrupt_skip_streak >= corrupt_thr
+                                                and stale_now - corrupt_last >= corrupt_cooldown
                                             ):
                                                 try:
                                                     print(
@@ -2841,6 +2881,7 @@ class RtspSource(QObject):
                                                 session_gop_ready = False
                                                 clean_warmup_streak = 0
                                                 last_good_arr = None
+                                                self._companion_last_corrupt_reconnect_mono = stale_now
                                                 break
                                             continue
                                         corrupt_skip_streak = 0
