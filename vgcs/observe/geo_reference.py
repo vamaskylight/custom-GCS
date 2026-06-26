@@ -771,19 +771,30 @@ def should_project_lrf_mark_via_geo(
     rel_alt_m: float | None,
     vehicle_shift_m: float,
     heading_delta_deg: float | None,
+    slant_range_m: float | None = None,
     min_airborne_alt_m: float = 8.0,
     min_shift_m: float = 1.5,
     min_heading_deg: float = 5.0,
+    min_slant_for_airborne_geo_m: float = 25.0,
 ) -> bool:
     """Choose geo vs gimbal-attitude projection for a video mark.
 
     LRF click-to-aim locks on boresight; on the ground/low hover GPS jitter must not
     drive the overlay (use attitude until the aircraft is clearly airborne or has moved).
+
+    Near-field LRF locks (<~25 m slant) stay on gimbal attitude even when the aircraft
+    climbs — GPS geo error dominates at short range and makes dual DOOAF marks drift.
     """
     if not has_geo:
         return False
     if not lrf_slew:
         return True
+    if slant_range_m is not None:
+        try:
+            if float(slant_range_m) < float(min_slant_for_airborne_geo_m):
+                return False
+        except (TypeError, ValueError):
+            pass
     try:
         alt = float(rel_alt_m) if rel_alt_m is not None else -1.0
     except (TypeError, ValueError):

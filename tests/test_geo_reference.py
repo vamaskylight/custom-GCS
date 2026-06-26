@@ -72,12 +72,22 @@ def test_should_project_lrf_mark_via_geo_ground_stays_attitude() -> None:
 def test_should_project_lrf_mark_via_geo_airborne_or_moved() -> None:
     from vgcs.observe.geo_reference import should_project_lrf_mark_via_geo
 
+    # Near-field LRF lock — stay on attitude even when aircraft climbs.
+    assert not should_project_lrf_mark_via_geo(
+        lrf_slew=True,
+        has_geo=True,
+        rel_alt_m=12.0,
+        vehicle_shift_m=0.0,
+        heading_delta_deg=0.0,
+        slant_range_m=6.5,
+    )
     assert should_project_lrf_mark_via_geo(
         lrf_slew=True,
         has_geo=True,
         rel_alt_m=12.0,
         vehicle_shift_m=0.0,
         heading_delta_deg=0.0,
+        slant_range_m=50.0,
     )
     assert should_project_lrf_mark_via_geo(
         lrf_slew=True,
@@ -85,6 +95,7 @@ def test_should_project_lrf_mark_via_geo_airborne_or_moved() -> None:
         rel_alt_m=1.0,
         vehicle_shift_m=2.0,
         heading_delta_deg=0.0,
+        slant_range_m=50.0,
     )
     assert should_project_lrf_mark_via_geo(
         lrf_slew=True,
@@ -92,6 +103,15 @@ def test_should_project_lrf_mark_via_geo_airborne_or_moved() -> None:
         rel_alt_m=1.0,
         vehicle_shift_m=0.0,
         heading_delta_deg=6.0,
+        slant_range_m=50.0,
+    )
+    # Legacy: no slant stored — altitude alone still enables geo.
+    assert should_project_lrf_mark_via_geo(
+        lrf_slew=True,
+        has_geo=True,
+        rel_alt_m=12.0,
+        vehicle_shift_m=0.0,
+        heading_delta_deg=0.0,
     )
 
 

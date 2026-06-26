@@ -7583,21 +7583,20 @@ class MapWidget(QWidget):
             built["v_scale"] = v_scale
             built["lrf_slew"] = True
 
-    def _sync_dooaf_setup_track_from_lrf_lock(self, role: str | None = None) -> None:
-        """Copy post-lock GAC scale factors into DOOAF setup mark tracks.
+    def _sync_dooaf_setup_track_from_lrf_lock(self, role: str) -> None:
+        """Copy post-lock GAC scale factors into one DOOAF setup mark track.
 
         ref_uv/ref_att stay at boresight+lock pose from _build_video_mark_track;
         overwriting them with pre-lock calibration residuals caused post-OK drift.
+        Each role keeps its own scales — never copy the latest global lock onto gun+target.
         """
         h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
         v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
-        roles = [str(role)] if role else list(self._dooaf_setup_mark_track.keys())
-        for rk in roles:
-            built = self._dooaf_setup_mark_track.get(str(rk))
-            if not built or not built.get("lrf_slew"):
-                continue
-            built["h_scale"] = h_scale
-            built["v_scale"] = v_scale
+        built = self._dooaf_setup_mark_track.get(str(role))
+        if not built or not built.get("lrf_slew"):
+            return
+        built["h_scale"] = h_scale
+        built["v_scale"] = v_scale
 
     def _hide_lrf_video_reticle_keep_range(self) -> None:
         """Hide duplicate cyan LRF box on video; keep slant range on PROXIMITY."""
@@ -7623,6 +7622,7 @@ class MapWidget(QWidget):
         geo_lat: float | None = None,
         geo_lon: float | None = None,
         geo_alt_m: float | None = None,
+        lrf_slant_range_m: float | None = None,
     ) -> None:
         """Remember gimbal attitude at pick so marks stay on the world point when camera moves."""
         built = self._build_video_mark_track(
@@ -7641,6 +7641,11 @@ class MapWidget(QWidget):
             built["geo_lon"] = float(geo_lon)
             if geo_alt_m is not None:
                 built["geo_alt_m"] = float(geo_alt_m)
+        if lrf_slant_range_m is not None:
+            try:
+                built["lrf_slant_range_m"] = float(lrf_slant_range_m)
+            except (TypeError, ValueError):
+                pass
         for sk in (
             "smooth_vehicle_lat",
             "smooth_vehicle_lon",
@@ -7718,12 +7723,20 @@ class MapWidget(QWidget):
                 )
             except (TypeError, ValueError):
                 heading_delta = None
+        slant_raw = track.get("lrf_slant_range_m")
+        slant_m: float | None = None
+        if slant_raw is not None:
+            try:
+                slant_m = float(slant_raw)
+            except (TypeError, ValueError):
+                slant_m = None
         return should_project_lrf_mark_via_geo(
             lrf_slew=True,
             has_geo=True,
             rel_alt_m=rel_alt,  # type: ignore[arg-type]
             vehicle_shift_m=shift_m,
             heading_delta_deg=heading_delta,
+            slant_range_m=slant_m,
         )
 
     def _video_mark_tracking_active(self) -> bool:
@@ -8013,12 +8026,17 @@ class MapWidget(QWidget):
     ) -> tuple[float, float] | None:
         """Screen UV for a DOOAF setup mark — tracks gimbal; hidden when off-screen."""
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
-            lock_uv = getattr(self, "_lrf_lock_uv", None)
-            if lock_uv is not None:
-                u, v = float(lock_uv[0]), float(lock_uv[1])
-                if self._mark_uv_on_screen(u, v):
-                    return (u, v)
-                return None
+            pending = getattr(self, "_pending_lrf_video_pick", None)
+            active_role = str(
+                getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED
+            )
+            if str(role) == active_role:
+                lock_uv = getattr(self, "_lrf_lock_uv", None)
+                if lock_uv is not None:
+                    u, v = float(lock_uv[0]), float(lock_uv[1])
+                    if self._mark_uv_on_screen(u, v):
+                        return (u, v)
+                    return None
         track = self._dooaf_setup_mark_track.get(str(role))
         return self._tracked_uv_from_store(track, stored_uv)
 
@@ -8076,6 +8094,12 @@ class MapWidget(QWidget):
             ):
                 if row.get(sk) is not None:
                     track[sk] = row.get(sk)
+            slant = row.get("lrf_slant_range_m")
+            if slant is not None:
+                try:
+                    track["lrf_slant_range_m"] = float(slant)
+                except (TypeError, ValueError):
+                    pass
         except (TypeError, ValueError):
             return (float(stored_u), float(stored_v))
         uv = self._tracked_uv_from_store(track, (float(stored_u), float(stored_v)))
@@ -8147,10 +8171,15 @@ class MapWidget(QWidget):
         """Video clicks: DOOAF Setup picks (green target) + observation fall-of-shot (red)."""
         out: list[VideoOverlayMark] = []
         seen: set[tuple[float, float]] = set()
-        # During click-to-aim slew the yellow LRF reticle is the single tracked target.
-        skip_dooaf_setup = bool(getattr(self, "_lrf_lock_in_progress", False))
+        in_slew = bool(getattr(self, "_lrf_lock_in_progress", False))
+        pending = getattr(self, "_pending_lrf_video_pick", None)
+        slew_role = (
+            str(getattr(pending, "pick_role", None) or DOOAF_ROLE_INTENDED)
+            if in_slew
+            else None
+        )
         for role, pt in self._dooaf_setup_video_marks.items():
-            if skip_dooaf_setup:
+            if in_slew and str(role) == slew_role:
                 continue
             try:
                 disp = self._dooaf_mark_display_uv(str(role), pt)
@@ -8653,6 +8682,7 @@ class MapWidget(QWidget):
             geo_lat=float(lat),
             geo_lon=float(lon),
             geo_alt_m=alt_m,
+            lrf_slant_range_m=float(slant_m) if slant_m is not None else None,
         )
         try:
             write_dooaf_setup_video_mark(
@@ -9082,7 +9112,6 @@ class MapWidget(QWidget):
             new_settings, self._observe_dem_path()
         )
         write_dooaf_settings(st, new_settings)
-        self._sync_dooaf_setup_track_from_lrf_lock()
         self._hide_lrf_video_reticle_keep_range()
         self._refresh_dooaf_map_overlay()
         self._schedule_video_marks_overlay_refresh()
