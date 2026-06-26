@@ -850,17 +850,25 @@ class SkydroidTopUdpAdapter:
         post_slr: float,
         click_offset_deg: float,
     ) -> bool:
-        """Reject locks where the laser jumped to a background surface after a large slew."""
+        """Reject locks only when SLR jumps farther (background), not when it moves nearer."""
         if pre_slr is None or float(click_offset_deg) < 3.0:
             return True
         pre = max(0.5, float(pre_slr))
         post = float(post_slr)
-        jump = abs(post - pre)
+        # Pre-lock range is often along the OLD boresight (background). After click-to-aim
+        # the laser correctly reads a nearer surface — field log 92 m -> 8 m must accept.
+        if post < pre - 2.0:
+            if pre >= 25.0 and post <= 30.0 and float(click_offset_deg) >= 5.0:
+                print(
+                    f"[VGCS:lrf] SLR nearer after aim {pre:.1f} m -> {post:.1f} m "
+                    f"(background pre-lock → click target)"
+                )
+            return True
+        jump = post - pre
         if jump < float(_LRF_SLR_JUMP_MIN_M):
             return True
         ratio = post / pre
-        inv = pre / max(post, 0.5)
-        # Near-field pre-lock (grass/tree) jumping to distant facade — field log 12 m -> 94 m.
+        # Foreground pre-lock jumping to distant background (12 m -> 94 m).
         if pre < 14.0 and post > max(35.0, pre * 2.8):
             print(
                 f"[VGCS:lrf] lock rejected — SLR {pre:.1f} m -> {post:.1f} m "
@@ -869,14 +877,13 @@ class SkydroidTopUdpAdapter:
                 f"pick a feature with clear range or move closer"
             )
             return False
-        if ratio > 3.5 or inv > 3.5:
-            if jump >= 25.0:
-                print(
-                    f"[VGCS:lrf] lock rejected — SLR {pre:.1f} m -> {post:.1f} m "
-                    f"(Δ={jump:.1f} m) after {float(click_offset_deg):.1f}° click-to-aim — "
-                    f"laser likely hit background; pick a nearer feature or re-aim"
-                )
-                return False
+        if jump >= 25.0 and ratio > 3.5:
+            print(
+                f"[VGCS:lrf] lock rejected — SLR {pre:.1f} m -> {post:.1f} m "
+                f"(Δ={jump:.1f} m) after {float(click_offset_deg):.1f}° click-to-aim — "
+                f"laser likely hit background; pick a nearer feature or re-aim"
+            )
+            return False
         return True
 
     def _align_axes_ok(
