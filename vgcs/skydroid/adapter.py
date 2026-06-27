@@ -102,6 +102,8 @@ _LRF_SLR_JUMP_RATIO_MAX = 2.5
 _LRF_SLR_JUMP_MIN_M = 12.0
 _LRF_BORESIGHT_TOL_U = 0.032
 _LRF_BORESIGHT_TOL_V = 0.040
+_LRF_ALIGN_STEEP_PITCH_DEG = 12.0
+_LRF_ALIGN_MAX_GAY_RETRIES = 2
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.32
 _LRF_MAX_REPOINTS = 0
@@ -658,6 +660,59 @@ class SkydroidTopUdpAdapter:
         return u_tol, v_tol
 
     @staticmethod
+    def _align_steep_pitch_click(dpitch_image: float) -> bool:
+        """Ground/near-nadir picks where GAC yaw diverges from image geometry."""
+        return abs(float(dpitch_image)) >= float(_LRF_ALIGN_STEEP_PITCH_DEG)
+
+    @staticmethod
+    def _click_image_yaw_err_deg(u: float) -> float:
+        """Signed image-yaw correction (deg) to move click u toward frame centre."""
+        return -(float(u) - 0.5) * float(_LRF_FOV_H_DEG)
+
+    def _align_ok_from_boresight_and_axes(
+        self,
+        att_end: tuple[float, float] | None,
+        *,
+        yaw_tgt: float,
+        pitch_tgt: float,
+        dpitch0: float,
+        pitch_open_sent: float,
+        dyaw0: float,
+        click_u: float,
+        click_v: float,
+        att_start: tuple[float, float],
+    ) -> tuple[bool, float, float]:
+        """Combine GAC axis check with screen-space verify (boresight wins on steep pitch)."""
+        bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
+            float(click_u),
+            float(click_v),
+            att_start,
+            att_end or att_start,
+            dpitch_image=float(dpitch0),
+        )
+        axis_ok = self._align_aim_satisfied(
+            att_end,
+            float(yaw_tgt),
+            float(pitch_tgt),
+            float(dpitch0),
+            pitch_open_sent_deg=float(pitch_open_sent),
+            dyaw=float(dyaw0),
+        )
+        if bore_ok and self._align_steep_pitch_click(float(dpitch0)):
+            if not axis_ok:
+                print(
+                    f"[VGCS:lrf] align ok via boresight ({u_chk:.3f},{v_chk:.3f}) "
+                    f"— GAC axis residual ignored (steep pitch)"
+                )
+            return True, float(u_chk), float(v_chk)
+        if not bore_ok:
+            print(
+                f"[VGCS:lrf] align verify fail — click at ({u_chk:.3f},{v_chk:.3f}) "
+                f"not boresight after slew"
+            )
+        return bool(axis_ok and bore_ok), float(u_chk), float(v_chk)
+
+    @staticmethod
     def _align_pitch_tol_deg(dpitch_image: float) -> float:
         try:
             base = float(
@@ -1096,6 +1151,7 @@ class SkydroidTopUdpAdapter:
         pitch_need_deg = abs(float(dpitch0))
         gap_pitch_sent = False
         gap_yaw_sent = False
+        gay_attempts = 0
         if float(need) >= float(_LRF_ALIGN_BULK_MIN_DEG):
             att = self._align_bulk_goto(
                 float(yaw_tgt),
@@ -1123,6 +1179,19 @@ class SkydroidTopUdpAdapter:
             yaw_err = self._angle_err_deg(yaw_tgt, att[0])
             pitch_err = self._angle_err_deg(pitch_tgt, att[1])
             pitch_trusted = self._gac_pitch_trusted(float(att[1]), float(dpitch0))
+            if self._align_steep_pitch_click(float(dpitch0)) and (
+                pitch_trusted or pitch_open_sent >= pitch_need_deg * 0.88
+            ):
+                bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
+                    click_u, click_v, att_start, att,
+                    dpitch_image=float(dpitch0),
+                )
+                if bore_ok:
+                    print(
+                        f"[VGCS:lrf] align ok via boresight iter={n + 1} "
+                        f"att={att} verify=({u_chk:.3f},{v_chk:.3f})"
+                    )
+                    return att, True, float(dyaw0), float(dpitch0)
             if self._align_axes_ok(
                 att,
                 float(yaw_tgt),
@@ -1238,13 +1307,39 @@ class SkydroidTopUdpAdapter:
                 spur = float(spd)
                 if abs(float(yaw_err)) < 6.0:
                     spur = min(spur, max(1.5, abs(float(yaw_err)) * 1.15))
-                # GSY bursts overshoot on C13 after steep pitch — prefer GAY snaps.
-                use_gay = (
-                    gap_yaw_sent
-                    or abs(float(dyaw0)) >= 1.5
-                    or (pitch_trusted and abs(float(yaw_err)) >= 0.8)
+                _, u_bore, v_bore = self._verify_click_on_boresight(
+                    click_u, click_v, att_start, att,
+                    dpitch_image=float(dpitch0),
                 )
-                if use_gay:
+                img_yaw_corr = self._click_image_yaw_err_deg(float(u_bore))
+                use_boresight_gsy = (
+                    self._align_steep_pitch_click(float(dpitch0))
+                    and pitch_ok
+                    and (gap_yaw_sent or gay_attempts >= _LRF_ALIGN_MAX_GAY_RETRIES)
+                    and abs(float(img_yaw_corr)) >= 0.35
+                )
+                use_gay = (
+                    not use_boresight_gsy
+                    and gay_attempts < _LRF_ALIGN_MAX_GAY_RETRIES
+                    and (
+                        gap_yaw_sent
+                        or abs(float(dyaw0)) >= 1.5
+                        or (pitch_trusted and abs(float(yaw_err)) >= 0.8)
+                    )
+                )
+                if use_boresight_gsy:
+                    gac_corr = self._image_yaw_to_gac_delta(float(img_yaw_corr))
+                    rate = self._gsy_yaw_rate_for_offset(float(gac_corr), spur)
+                    dur = min(
+                        float(_LRF_GIMBAL_AXIS_MAX_S),
+                        abs(float(img_yaw_corr)) / max(1.5, spur) * 0.95 + 0.10,
+                    )
+                    print(
+                        f"[VGCS:lrf] align yaw boresight err={img_yaw_corr:+.1f}° "
+                        f"at ({u_bore:.3f},{v_bore:.3f}) burst {rate:+.1f}°/s dur={dur:.2f}s"
+                    )
+                    self._hold_speed_direct_burst(rate, 0.0, dur)
+                elif use_gay:
                     if not gap_yaw_sent:
                         print(
                             f"[VGCS:lrf] align yaw GAY -> {yaw_tgt:.1f}° "
@@ -1259,6 +1354,7 @@ class SkydroidTopUdpAdapter:
                         float(yaw_tgt), spur, att_yaw=float(att[0])
                     )
                     gap_yaw_sent = True
+                    gay_attempts += 1
                 else:
                     dur = min(
                         float(_LRF_GIMBAL_AXIS_MAX_S),
@@ -1293,24 +1389,17 @@ class SkydroidTopUdpAdapter:
             float(dpitch0),
             spd=float(spd),
         )
-        aim_ok = self._align_aim_satisfied(
+        aim_ok, u_chk, v_chk = self._align_ok_from_boresight_and_axes(
             att_end,
-            float(yaw_tgt),
-            float(pitch_tgt),
-            float(dpitch0),
-            pitch_open_sent_deg=float(pitch_open_sent),
-            dyaw=float(dyaw0),
+            yaw_tgt=float(yaw_tgt),
+            pitch_tgt=float(pitch_tgt),
+            dpitch0=float(dpitch0),
+            pitch_open_sent=float(pitch_open_sent),
+            dyaw0=float(dyaw0),
+            click_u=float(click_u),
+            click_v=float(click_v),
+            att_start=att_start,
         )
-        bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
-            click_u, click_v, att_start, att_end,
-            dpitch_image=float(dpitch0),
-        )
-        aim_ok = bool(aim_ok and bore_ok)
-        if not bore_ok:
-            print(
-                f"[VGCS:lrf] align verify fail — click at ({u_chk:.3f},{v_chk:.3f}) "
-                f"not boresight after slew"
-            )
         move = self._gimbal_total_move_deg(att_start, att_end)
         print(
             f"[VGCS:lrf] align done att={att_start}->{att_end} "

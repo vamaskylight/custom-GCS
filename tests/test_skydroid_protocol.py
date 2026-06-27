@@ -474,6 +474,30 @@ def test_boresight_tol_relaxes_for_steep_ground_pick() -> None:
     assert v_tol >= 0.048
 
 
+def test_steep_pitch_field_log_accepts_boresight_over_gac_yaw() -> None:
+    """2026-06-27 field log: GAC yaw miss 2.9° but click on boresight at steep pitch."""
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    att_start = (-5.67, 0.0)
+    att_end = (-0.59, -17.44)
+    click_u, click_v = 0.473, 0.870
+    ok, u_chk, v_chk = adapter._align_ok_from_boresight_and_axes(
+        att_end,
+        yaw_tgt=-3.5,
+        pitch_tgt=-17.3,
+        dpitch0=-17.3,
+        pitch_open_sent=17.0,
+        dyaw0=-2.2,
+        click_u=click_u,
+        click_v=click_v,
+        att_start=att_start,
+    )
+    assert ok is True
+    assert abs(u_chk - 0.5) < 0.04
+    assert abs(v_chk - 0.5) < 0.01
+
+
 def test_align_pitch_tol_tightens_for_large_click() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
