@@ -656,8 +656,13 @@ def _companion_gop_warmup_frames(*, source_id: str = "", url: str = "") -> int:
 
 
 def _companion_gop_warmup_timeout_frames(*, source_id: str = "", url: str = "") -> int:
-    default = "45" if _companion_is_thermal_source(source_id, url) else "150"
-    raw = str(os.environ.get("VGCS_COMPANION_THERMAL_GOP_TIMEOUT", default) or default).strip()
+    if _companion_is_thermal_source(source_id, url):
+        default = "45"
+        env_key = "VGCS_COMPANION_THERMAL_GOP_TIMEOUT"
+    else:
+        default = "45"
+        env_key = "VGCS_COMPANION_GOP_TIMEOUT"
+    raw = str(os.environ.get(env_key, default) or default).strip()
     try:
         return max(20, min(600, int(raw)))
     except ValueError:
@@ -2704,6 +2709,10 @@ class RtspSource(QObject):
                                             warmup_timeout = _companion_gop_warmup_timeout_frames(
                                                 source_id=self.source_id, url=url
                                             )
+                                            # Cold link-up: don't wait hundreds of frames for a
+                                            # perfect GOP while FFmpeg is still joining mid-stream.
+                                            if not bool(self._ffmpeg_had_frame):
+                                                warmup_timeout = min(warmup_timeout, 35)
                                             if corrupt_skip_streak >= warmup_timeout:
                                                 session_gop_ready = True
                                                 clean_warmup_streak = 0
@@ -2758,12 +2767,22 @@ class RtspSource(QObject):
                                                     )
                                                 except Exception:
                                                     pass
-                                        hide, why = _companion_frame_should_hide(
-                                            arr,
-                                            last_good_arr,
-                                            motion_preview=motion_preview,
-                                            thermal=thermal_feed,
+                                        cold_start = companion_rtsp and not bool(
+                                            self._ffmpeg_had_frame
                                         )
+                                        if cold_start:
+                                            sample = _companion_rgb_sample_for_qc(arr)
+                                            hide = _rgb_frame_looks_like_macroblock_soup(
+                                                sample
+                                            )
+                                            why = "artifact" if hide else ""
+                                        else:
+                                            hide, why = _companion_frame_should_hide(
+                                                arr,
+                                                last_good_arr,
+                                                motion_preview=motion_preview,
+                                                thermal=thermal_feed,
+                                            )
                                         if hide:
                                             corrupt_skip_streak += 1
                                             if last_good_arr is not None:
@@ -2790,6 +2809,7 @@ class RtspSource(QObject):
                                             stale_gap = _companion_stale_preview_reconnect_min_s()
                                             stale_due = (
                                                 _companion_stale_preview_reconnect_enabled()
+                                                and bool(self._ffmpeg_had_frame)
                                                 and not motion_preview
                                                 and not _companion_lrf_lock_active()
                                                 and not _companion_app_is_background()
@@ -2840,6 +2860,7 @@ class RtspSource(QObject):
                                             )
                                             if (
                                                 _companion_corrupt_streak_reconnect_enabled()
+                                                and bool(self._ffmpeg_had_frame)
                                                 and not motion_preview
                                                 and not _companion_lrf_lock_active()
                                                 and not _companion_app_is_background()
