@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings, QTimer, Qt
+import json
+
+from PySide6.QtCore import QPoint, QSettings, QTimer, Qt
 from PySide6.QtWidgets import QApplication
 
 from vgcs.map.app_settings import QS_APP, QS_ORG
+from vgcs.map.cam_rail_widgets import CamRailShowHandle
 from vgcs.map.surface.constants import (
+    _CAM_RAIL_GIMBAL_GRID_GAP,
+    _CAM_RAIL_LAYER_INSET,
+    _CAM_RAIL_PAD_BTN_W,
     _MAP_ACTION_RAIL_HEIGHT_PX,
     _MAP_ACTION_RAIL_LEFT_PX,
     _MAP_ACTION_RAIL_TOP_PX,
     _MAP_HUD_MARGIN_PX,
     _MAP_HUD_TOP_PX,
+    _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX,
     _NATIVE_CAM_RAIL_TOP_PX,
     _OBSTACLE_PANEL_MAX_H_PX,
     _OBSTACLE_PANEL_TOP_PX,
@@ -73,6 +80,7 @@ class NativeHudLayoutMixin:
         try:
             if bool(getattr(self, "_last_link_connected", False)):
                 QTimer.singleShot(0, self._on_mavlink_link_show_mini_video)
+            QTimer.singleShot(0, self._layout_native_hud)
             QTimer.singleShot(0, self._stack_native_overlays_above_tile_map)
         except Exception:
             pass
@@ -175,7 +183,7 @@ class NativeHudLayoutMixin:
 
     def _camera_rail_visible_pref(self) -> bool:
         try:
-            raw = QSettings(_QS_NS, _QS_APP).value(_KEY_CAMERA_RAIL_VISIBLE, True)
+            raw = QSettings(QS_ORG, QS_APP).value(_KEY_CAMERA_RAIL_VISIBLE, True)
             if raw in (False, "false", "False", "0", 0):
                 return False
             return True
@@ -193,7 +201,7 @@ class NativeHudLayoutMixin:
 
     def _set_camera_rail_panel_visible(self, visible: bool) -> None:
         try:
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_CAMERA_RAIL_VISIBLE, bool(visible))
+            QSettings(QS_ORG, QS_APP).setValue(_KEY_CAMERA_RAIL_VISIBLE, bool(visible))
         except Exception:
             pass
         self._sync_camera_rail_panel_visibility()

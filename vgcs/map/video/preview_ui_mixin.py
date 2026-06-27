@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import os
+import time
+
 from PySide6.QtCore import QPointF, Qt, QTimer
-from PySide6.QtGui import QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QLabel
 
 from vgcs.map.native_video_overlay import NativeVideoOverlayLayer
+from vgcs.map.surface.constants import (
+    _MAP_HUD_MARGIN_PX,
+    _MINI_VIDEO_PIP_H_PX,
+    _MINI_VIDEO_PIP_W_PX,
+)
 from vgcs.map.video.helpers import _format_video_zoom_label
 from vgcs.video.camera_control import (
     camera_preview_applies_digital_zoom,

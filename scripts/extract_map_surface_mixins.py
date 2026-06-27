@@ -415,16 +415,23 @@ def main() -> None:
     mixin_imports = {
         "hud_layout_mixin": textwrap.dedent(
             """\
-            from PySide6.QtCore import QSettings, QTimer, Qt
+            import json
+
+            from PySide6.QtCore import QPoint, QSettings, QTimer, Qt
             from PySide6.QtWidgets import QApplication
 
             from vgcs.map.app_settings import QS_APP, QS_ORG
+            from vgcs.map.cam_rail_widgets import CamRailShowHandle
             from vgcs.map.surface.constants import (
+                _CAM_RAIL_GIMBAL_GRID_GAP,
+                _CAM_RAIL_LAYER_INSET,
+                _CAM_RAIL_PAD_BTN_W,
                 _MAP_ACTION_RAIL_HEIGHT_PX,
                 _MAP_ACTION_RAIL_LEFT_PX,
                 _MAP_ACTION_RAIL_TOP_PX,
                 _MAP_HUD_MARGIN_PX,
                 _MAP_HUD_TOP_PX,
+                _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX,
                 _NATIVE_CAM_RAIL_TOP_PX,
                 _OBSTACLE_PANEL_MAX_H_PX,
                 _OBSTACLE_PANEL_TOP_PX,
@@ -439,7 +446,7 @@ def main() -> None:
             import os
             from pathlib import Path
 
-            from PySide6.QtCore import QSettings, QThreadPool, QTimer, QUrl
+            from PySide6.QtCore import QSettings, QThreadPool, QTimer, Qt, QUrl
             from PySide6.QtWidgets import QFileDialog
 
             from vgcs.map.app_settings import QS_APP, QS_ORG
@@ -633,6 +640,7 @@ def main() -> None:
             _MAP_HUD_GLASS_BORDER,
             _MAP_HUD_MARGIN_PX,
             _MAP_HUD_TOP_PX,
+            _NATIVE_CAM_RAIL_TOP_PX,
             _MAP_MOVE_ARM_SAMPLES,
             _MAP_MOVE_ARM_SPEED_MPS,
             _MAP_MOVE_DISARM_SAMPLES,

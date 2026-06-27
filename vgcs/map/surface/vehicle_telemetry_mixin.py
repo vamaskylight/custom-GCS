@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 
 from PySide6.QtCore import QTimer
 

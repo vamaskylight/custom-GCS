@@ -308,10 +308,18 @@ def main() -> None:
             from datetime import datetime, timezone
             from pathlib import Path
 
-            from PySide6.QtCore import QThreadPool, QTimer
-            from PySide6.QtGui import QImage
-            from PySide6.QtWidgets import QMessageBox
+            import os
+            import shutil
+            import tempfile
+            import time
+            from datetime import datetime, timezone
+            from pathlib import Path
 
+            from PySide6.QtCore import QSettings, QThreadPool, QTimer, Qt, QUrl
+            from PySide6.QtGui import QDesktopServices, QImage
+            from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+            from vgcs.map.app_settings import QS_APP, QS_ORG
             from vgcs.map.image_io import save_qimage_to_path
             from vgcs.map.observation.types import (
                 ObservationExportBridge,
@@ -324,20 +332,36 @@ def main() -> None:
                 DOOAF_ROLE_IMPACT,
                 DOOAF_ROLE_INTENDED,
                 DOOAF_ROLE_SURVEY,
+                apply_dooaf_impact_geo_fallback,
+                assemble_observation_report_html,
                 build_dooaf_session,
+                dooaf_export_blockers,
+                format_dooaf_html_summary,
                 format_dooaf_status,
+                format_observation_detailed_log_html,
                 latest_mark,
+                latest_mark_row,
             )
+            from vgcs.observe.grid_reference import format_grid_reference
             from vgcs.observe.target_measure import (
                 MARKS_NOT_LEVEL_HINT,
                 band_width_partner_row,
+                clear_tape_pair_override,
+                format_target_segment_label,
                 haversine_m,
                 marks_need_level_warning,
+                marks_same_height_band,
                 measure_agl_ok,
+                observation_building_height_segments,
                 observation_facade_video_segments,
+                observation_target_latlon,
+                segment_distance_between_rows,
+                segment_distance_video_fallback,
                 session_facade_reference_range_m,
                 session_peak_geo_range_m,
+                session_rangefinder_reference_m,
                 target_track_from_observations,
+                video_mark_span_norm,
             )
             '''
         ),

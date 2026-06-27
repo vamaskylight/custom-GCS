@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import shutil
+import tempfile
 import time
+from pathlib import Path
 
-from PySide6.QtCore import QPoint, QTimer
+from PySide6.QtCore import QPoint, QSettings, QTimer, Qt, QUrl
+from PySide6.QtWidgets import QFileDialog
 
-from vgcs.video.pipeline import notify_companion_app_background, notify_companion_app_foreground
+from vgcs.map.app_settings import QS_APP, QS_ORG
+from vgcs.video.camera_control import NoopCameraControl
+from vgcs.video.pipeline import (
+    QS_KEY_LAST_PHOTO_SAVE_DIR,
+    notify_companion_app_background,
+    notify_companion_app_foreground,
+)
 
 
 class WebBridgeMixin:
@@ -155,7 +166,9 @@ class WebBridgeMixin:
             try:
                 sdir = None
                 try:
-                    raw = str(QSettings(_QS_NS, _QS_APP).value(_KEY_MEDIA_LAST_PHOTO_DIR, "") or "").strip()
+                    raw = str(
+                        QSettings(QS_ORG, QS_APP).value(QS_KEY_LAST_PHOTO_SAVE_DIR, "") or ""
+                    ).strip()
                     if raw:
                         p = Path(raw)
                         if p.is_dir():
@@ -174,8 +187,8 @@ class WebBridgeMixin:
                 path = self._capture_photo_quick(chosen)
                 if path:
                     try:
-                        QSettings(_QS_NS, _QS_APP).setValue(
-                            _KEY_MEDIA_LAST_PHOTO_DIR, str(Path(path).parent)
+                        QSettings(QS_ORG, QS_APP).setValue(
+                            QS_KEY_LAST_PHOTO_SAVE_DIR, str(Path(path).parent)
                         )
                     except Exception:
                         pass

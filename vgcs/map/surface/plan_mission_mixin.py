@@ -220,7 +220,7 @@ class PlanMissionMixin:
 
     def clear_plan_current_mission_path(self) -> None:
         """Forget the Plan Flight JSON path (e.g. after download or generated pattern)."""
-        s = QSettings(_QS_NS, _QS_APP)
+        s = QSettings(QS_ORG, QS_APP)
         s.remove(_KEY_PLAN_CURRENT_MISSION_JSON)
         if s.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
             s.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
@@ -364,7 +364,7 @@ class PlanMissionMixin:
                 "There are no waypoints to save. Add waypoints on the map first.",
             )
             return
-        settings = QSettings(_QS_NS, _QS_APP)
+        settings = QSettings(QS_ORG, QS_APP)
         path = ""
         if not save_as:
             last = self._plan_current_mission_path(settings)
@@ -407,7 +407,7 @@ class PlanMissionMixin:
                 "There are no waypoints to export as KML.",
             )
             return
-        settings = QSettings(_QS_NS, _QS_APP)
+        settings = QSettings(QS_ORG, QS_APP)
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save mission as KML",
@@ -431,7 +431,7 @@ class PlanMissionMixin:
         )
 
     def _export_mission(self) -> None:
-        settings = QSettings(_QS_NS, _QS_APP)
+        settings = QSettings(QS_ORG, QS_APP)
         last_export = str(settings.value(_KEY_TOOLBAR_EXPORT_MISSION_JSON, "") or "")
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -472,7 +472,7 @@ class PlanMissionMixin:
         self._waypoints_model = list(waypoints)
         js = f"setWaypoints({json.dumps(rows)});"
         self._run_js(js, callback=lambda _: self._after_waypoints_mutated())
-        s = QSettings(_QS_NS, _QS_APP)
+        s = QSettings(QS_ORG, QS_APP)
         s.setValue(_KEY_PLAN_CURRENT_MISSION_JSON, path)
         if s.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
             s.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)

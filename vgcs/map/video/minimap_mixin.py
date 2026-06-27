@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, Qt, QTimer
-from PySide6.QtGui import QImage
+import time
+from urllib.request import Request
+
+from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QApplication
 
 from vgcs.map.native_tile_map import fetch_tile_http_bytes
 
