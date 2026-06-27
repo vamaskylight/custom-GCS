@@ -48,3 +48,42 @@ def test_near_field_pin_releases_when_gimbal_pans() -> None:
     }
     host._att = (22.0, -8.0)
     assert host._mark_track_near_field_pinned_uv(track) is None
+
+
+class _FacadeFreezeHost(VideoMarkTrackingMixin):
+    def __init__(self) -> None:
+        from vgcs.observe.dooaf_flight_session import DooafFacadeSession
+
+        self._dooaf_facade_session = DooafFacadeSession()
+        self._dooaf_setup_mark_track = {}
+        self._dooaf_setup_video_marks = {"gun": (0.5, 0.5)}
+        self._lrf_lock_in_progress = False
+
+    def _observation_context(self) -> dict[str, object]:
+        return {
+            "gimbal_yaw_deg": 17.0,
+            "gimbal_pitch_deg": -8.0,
+            "vehicle_lat": 20.41,
+            "vehicle_lon": 72.88,
+        }
+
+
+def test_facade_session_freezes_dooaf_setup_mark_uv() -> None:
+    host = _FacadeFreezeHost()
+    host._dooaf_facade_session.record_from_context(
+        8.7,
+        {
+            **host._observation_context(),
+            "vehicle_heading_deg": 180.0,
+        },
+    )
+    # Stored gun mark at centre; track would project elsewhere if tracking ran.
+    host._dooaf_setup_mark_track["gun"] = {
+        "ref_uv": (0.5, 0.5),
+        "ref_att": (17.0, -8.0),
+        "h_scale": 1.1,
+        "v_scale": 1.0,
+        "lrf_slew": True,
+    }
+    uv = host._dooaf_mark_display_uv("gun", (0.5, 0.5))
+    assert uv == (0.5, 0.5)
