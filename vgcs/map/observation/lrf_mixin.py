@@ -179,7 +179,7 @@ class LrfVideoLockMixin:
         except Exception:
             pass
 
-    def _format_lrf_geo_label(lat: float, lon: float) -> str:
+    def _format_lrf_geo_label(self, lat: float, lon: float) -> str:
         return f"{float(lat):.6f}, {float(lon):.6f}"
 
     def _c13_lrf_geo_fov(self) -> tuple[float, float]:

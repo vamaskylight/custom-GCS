@@ -50,6 +50,7 @@ class VideoMarkTrackingMixin:
         }
         return out
 
+    @staticmethod
     def _pending_lrf_dooaf_pick_role(pending: object | None) -> str | None:
         """DOOAF Setup pick role during LRF slew, or None for observation impact picks."""
         if pending is None:
@@ -474,6 +475,7 @@ class VideoMarkTrackingMixin:
             return (float(stored_uv[0]), float(stored_uv[1]))
         return (float(stored_uv[0]), float(stored_uv[1]))
 
+    @staticmethod
     def _mark_uv_on_screen(u: float, v: float, *, margin: float = 0.02) -> bool:
         return (
             float(u) >= -float(margin)
