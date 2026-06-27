@@ -241,8 +241,12 @@ def main() -> None:
         ),
         "minimap_mixin": textwrap.dedent(
             """\
-            from PySide6.QtCore import QPointF, Qt, QTimer
-            from PySide6.QtGui import QImage
+            import time
+            from urllib.request import Request
+
+            from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
+            from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+            from PySide6.QtWidgets import QApplication
 
             from vgcs.map.native_tile_map import fetch_tile_http_bytes
             """
@@ -252,8 +256,8 @@ def main() -> None:
             import os
             import time
 
-            from PySide6.QtCore import QSettings, QTimer
-            from PySide6.QtGui import QImage
+            from PySide6.QtCore import QSettings, QThreadPool, QTimer
+            from PySide6.QtGui import QImage, QPixmap
             from PySide6.QtWidgets import QMessageBox
 
             from vgcs.map.app_settings import QS_APP, QS_ORG

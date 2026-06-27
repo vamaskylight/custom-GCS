@@ -7,9 +7,9 @@ import time
 
 from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton
 
-from vgcs.video.camera_control import camera_zoom_limits
+from vgcs.video.camera_control import NoopCameraControl, camera_zoom_limits
 
 
 class CameraRailMixin:

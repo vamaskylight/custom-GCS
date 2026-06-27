@@ -196,6 +196,23 @@ from vgcs.map.cam_rail_widgets import (
     CamRecordTimerRow,
 )
 from vgcs.map.plan_flight_panel import PlanFlightPanel
+from vgcs.map.surface.constants import (
+    _CAM_RAIL_GIMBAL_GRID_GAP,
+    _CAM_RAIL_LAYER_INSET,
+    _CAM_RAIL_LAYOUT_SPACING,
+    _CAM_RAIL_LENS_BTN_H,
+    _CAM_RAIL_LENS_ROW_H,
+    _CAM_RAIL_PAD_BTN_H,
+    _CAM_RAIL_PAD_BTN_W,
+    _MAP_HUD_GLASS_BG,
+    _MAP_HUD_GLASS_BORDER,
+    _MINI_VIDEO_PIP_H_PX,
+    _MINI_VIDEO_PIP_W_PX,
+    _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX,
+    _NATIVE_CAM_RAIL_MIN_WIDTH_PX,
+    _NATIVE_CAM_RAIL_TOP_PX,
+    MAP_BACKEND_BUILD,
+)
 
 try:
     from PySide6.QtSvg import QSvgRenderer
@@ -269,34 +286,8 @@ _KEY_VIDEO_LOW_LATENCY = "video/low_latency"
 _KEY_VIDEO_RECORD_FORMAT = "video/record_format"  # 'mp4' | 'mkv'
 _KEY_VIDEO_DEFAULT_VIEW = "video/default_view"  # 'Single' | 'Split'
 
-# Native HUD top inset from the map canvas (px) — Takeoff/Return and camera rail share the same gap below the app header.
-# Legacy Web used ~78px to clear an in-map `#linkBanner`; native 2D has no banner, so keep this tight.
-# Content width inside glass inset (see ``_CAM_RAIL_LAYER_INSET``).
-_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX = 318
-# Inset ``native_hud_right`` inside rounded ``nativeCameraRailLayer`` (extra right for radius).
-_CAM_RAIL_LAYER_INSET = (5, 5, 14, 5)
-_NATIVE_CAM_RAIL_MIN_WIDTH_PX = (
-    _NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX
-    + _CAM_RAIL_LAYER_INSET[0]
-    + _CAM_RAIL_LAYER_INSET[2]
-)
-# Camera rail vertical rhythm (touch targets / gaps — do not change font-size in QSS below).
-_CAM_RAIL_PAD_BTN_H = 34
-_CAM_RAIL_PAD_BTN_W = 42
-_CAM_RAIL_LENS_ROW_H = 40
-_CAM_RAIL_LENS_BTN_H = 34
-_CAM_RAIL_LAYOUT_SPACING = 5
-_CAM_RAIL_GIMBAL_GRID_GAP = 5
-# Native HUD margins (mini-video bottom-left; obstacle top-left under Takeoff/Return).
-# Must fit ObstacleRadarPanel.sizeHint() — do not clamp below panel minimum or widgets overlap.
-# Fixed mini-video PiP (bottom-left) — do not scale to a large % of the map.
-_MINI_VIDEO_PIP_W_PX = 236
-_MINI_VIDEO_PIP_H_PX = 132
-
 # Primary 2D map: NativeTileMapView only. Optional 3D globe: lazy Qt WebEngine + Cesium (see map_web_3d).
 HAS_WEBENGINE = HAS_WEBENGINE_3D
-# Bumped when map loading / fallback behaviour changes (visible in client console).
-MAP_BACKEND_BUILD = "2026-05-18-native2d-telemetry"
 # Map icon/track only move after sustained GPS speed (avoids ground jitter + false vx/vy).
 
 
@@ -842,7 +833,6 @@ class _VideoEncodeTask(QRunnable):
 from vgcs.map.observation import MapObservationMixins
 from vgcs.map.video import MapVideoMixins
 from vgcs.map.surface import MapSurfaceMixins
-from vgcs.map.surface.constants import _MAP_HUD_GLASS_BG, _MAP_HUD_GLASS_BORDER
 from vgcs.map.surface.settings_keys import _KEY_MAP_LOW_SPEC_MODE, _KEY_MAP_WEBCAM_ENABLED
 from vgcs.map.video.helpers import _format_video_zoom_label
 from vgcs.map.surface.tile_probe import _TileProbeBridge, _TileProbeTask

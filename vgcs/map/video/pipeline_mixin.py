@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import time
 
-from PySide6.QtCore import QSettings, QTimer
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QSettings, QThreadPool, Qt, QTimer
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QMessageBox
 
 from vgcs.map.app_settings import QS_APP, QS_ORG

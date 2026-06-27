@@ -10,6 +10,7 @@ from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_3d_marker_overlay import Map3dLayer, Map3dMarkerOverlay
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_url, create_map_3d_web_view
 from vgcs.map.surface.helpers import _web_2d_fallback_allowed
+from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT, latest_mark
 
 
 class Map3dMixin:

@@ -7,13 +7,13 @@ import math
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QThreadPool, QTimer, QUrl
-from PySide6.QtWidgets import QFileDialog
+from PySide6.QtCore import QSettings, QThreadPool, QTimer, Qt, QUrl
+from PySide6.QtWidgets import QFileDialog, QSizePolicy, QStackedWidget
 
 from vgcs.map.app_settings import QS_APP, QS_ORG
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D
-from vgcs.map.native_tile_map import NativeTileMapView
-from vgcs.map.surface.constants import _WEB_MAP_RELAYOUT_JS
+from vgcs.map.native_tile_map import NativeTileMapView, bundled_seed_root
+from vgcs.map.surface.constants import _WEB_MAP_RELAYOUT_JS, MAP_BACKEND_BUILD
 from vgcs.map.surface.helpers import _web_2d_fallback_allowed
 from vgcs.map.surface.settings_keys import (
     _KEY_MAP_LOW_SPEC_MODE,
@@ -70,7 +70,7 @@ class MapTilesMixin:
     def _activate_startup_tile_source(self) -> None:
         """Default to Esri satellite; use offline only when explicitly configured and tiles exist."""
         try:
-            s = QSettings(_QS_NS, _QS_APP)
+            s = QSettings(QS_ORG, QS_APP)
             mode = str(s.value(_KEY_MAP_TILE_MODE, "sat") or "sat").strip().lower()
             root = str(s.value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
         except Exception:
@@ -431,7 +431,7 @@ class MapTilesMixin:
     def _set_webcam_enabled(self, enabled: bool) -> None:
         on = bool(enabled)
         try:
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_WEBCAM_ENABLED, on)
+            QSettings(QS_ORG, QS_APP).setValue(_KEY_MAP_WEBCAM_ENABLED, on)
         except Exception:
             pass
         if not on:
@@ -453,7 +453,7 @@ class MapTilesMixin:
         elif int(idx) == 2:
             mode = "off"
         try:
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_LOW_SPEC_MODE, mode)
+            QSettings(QS_ORG, QS_APP).setValue(_KEY_MAP_LOW_SPEC_MODE, mode)
         except Exception:
             pass
         if mode == "on":
@@ -497,7 +497,7 @@ class MapTilesMixin:
     def _maybe_autodetect_low_spec(self) -> None:
         # Heuristic: measure WebEngine JS callback latency; if it's consistently high, enable low-spec.
         try:
-            s = QSettings(_QS_NS, _QS_APP)
+            s = QSettings(QS_ORG, QS_APP)
             mode = str(s.value(_KEY_MAP_LOW_SPEC_MODE, "auto") or "auto").strip().lower()
         except Exception:
             mode = "auto"
@@ -606,7 +606,7 @@ class MapTilesMixin:
         QTimer.singleShot(0, self._refresh_dooaf_map_overlay)
 
         try:
-            s = QSettings(_QS_NS, _QS_APP)
+            s = QSettings(QS_ORG, QS_APP)
             mode = str(s.value(_KEY_MAP_LOW_SPEC_MODE, "auto") or "auto").strip().lower()
         except Exception:
             mode = "auto"
@@ -732,6 +732,13 @@ class MapTilesMixin:
                         self._btn_camera_rail_show.hide()
                     except Exception:
                         pass
+                    # Disconnected: still position compass, telemetry, zoom, and action rail.
+                    try:
+                        self._layout_native_hud()
+                        self._stack_native_overlays_above_tile_map()
+                    except Exception:
+                        pass
+                    QTimer.singleShot(0, self._layout_native_hud)
             except Exception:
                 pass
             # Start preview only after MAVLink connect (see `_on_mavlink_link_show_mini_video`).
@@ -774,7 +781,7 @@ class MapTilesMixin:
     def activate_esri_street_tiles(self) -> None:
         """Default online tiles: most compatible in locked-down client networks."""
         try:
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "esri_streets")
+            QSettings(QS_ORG, QS_APP).setValue(_KEY_MAP_TILE_MODE, "esri_streets")
         except Exception:
             pass
         tmpl = (
@@ -792,7 +799,7 @@ class MapTilesMixin:
     def activate_osm_tiles(self) -> None:
         """OSM tiles are often blocked for desktop apps (referrer policy). Keep optional."""
         try:
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "osm")
+            QSettings(QS_ORG, QS_APP).setValue(_KEY_MAP_TILE_MODE, "osm")
         except Exception:
             pass
         tmpl = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -807,7 +814,7 @@ class MapTilesMixin:
 
     def activate_satellite_tiles(self) -> None:
         try:
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "sat")
+            QSettings(QS_ORG, QS_APP).setValue(_KEY_MAP_TILE_MODE, "sat")
         except Exception:
             pass
         tmpl = (
@@ -833,8 +840,8 @@ class MapTilesMixin:
             return
         # Remember for next launch.
         try:
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_OFFLINE_TILE_ROOT, root)
-            QSettings(_QS_NS, _QS_APP).setValue(_KEY_MAP_TILE_MODE, "offline")
+            QSettings(QS_ORG, QS_APP).setValue(_KEY_MAP_OFFLINE_TILE_ROOT, root)
+            QSettings(QS_ORG, QS_APP).setValue(_KEY_MAP_TILE_MODE, "offline")
         except Exception:
             pass
         url = QUrl.fromLocalFile(root).toString().rstrip("/")

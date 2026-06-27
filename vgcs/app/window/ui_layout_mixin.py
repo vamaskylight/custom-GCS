@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import struct
 import time
 from collections import deque
 from pathlib import Path
@@ -19,8 +20,10 @@ from PySide6.QtGui import (
     QPixmap,
     QShortcut,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -56,6 +59,7 @@ from PySide6.QtWidgets import (
 )
 from pymavlink import mavutil
 
+from vgcs.paths import vgcs_assets_dir
 from vgcs.app.window.helpers import (
     _mavlink_autopilot_label,
     _mavlink_vehicle_type_label,
@@ -216,7 +220,7 @@ class MainWindowUiLayoutMixin:
         return sep
 
     def _header_icons_dir(self) -> Path:
-        return Path(__file__).resolve().parents[1] / "assets" / "header_icons"
+        return vgcs_assets_dir() / "header_icons"
 
     def _header_icon_pixmap(self, filename: str, size: int = 22) -> QPixmap:
         """Rasterize SVG from git `vgcs/assets/header_icons/` (same paths as Web template)."""
@@ -396,9 +400,8 @@ class MainWindowUiLayoutMixin:
         )
         # Legacy Web `__LOGO_SRC__` → shipped asset (see git e48c1a7 map_widget template).
         logo_paths = (
-            Path(__file__).resolve().parents[1] / "assets" / "Vama Logo.png",
-            Path(__file__).resolve().parents[2] / "Vama Logo New.png",
-            Path(__file__).resolve().parents[1] / "assets" / "vama_logo.jpg",
+            vgcs_assets_dir() / "Vama Logo.png",
+            vgcs_assets_dir() / "vama_logo.jpg",
         )
         for logo_path in logo_paths:
             if not logo_path.exists():
@@ -605,6 +608,7 @@ class MainWindowUiLayoutMixin:
         bar.setLayout(shell)
         return bar
 
+    @staticmethod
     def _logo_scaled_decode_size(ow: int, oh: int, max_edge: int) -> QSize:
         """QSize for decode whose width/height ratio matches the source image."""
         if ow <= 0 or oh <= 0:
@@ -630,7 +634,7 @@ class MainWindowUiLayoutMixin:
             return None
 
     def _menu_icon(self, filename: str) -> QIcon:
-        path = Path(__file__).resolve().parents[1] / "assets" / "menu_icons" / filename
+        path = vgcs_assets_dir() / "menu_icons" / filename
         if path.exists():
             return QIcon(str(path))
         return QIcon()

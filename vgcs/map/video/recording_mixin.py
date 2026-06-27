@@ -11,6 +11,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QMessageBox
 
 from vgcs.map.image_io import save_qimage_to_path
+from vgcs.video.camera_control import NoopCameraControl
 from vgcs.video.pipeline import (
     suggested_photo_save_path,
     suggested_recording_save_path,
