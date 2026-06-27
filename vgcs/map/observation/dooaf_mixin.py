@@ -569,17 +569,18 @@ class DooafOperationsMixin:
             pass
         self._schedule_video_marks_overlay_refresh()
         self._refresh_dooaf_facade_overlay_hint()
-        self._end_dooaf_map_pick(restore_target_mode=True)
         cb = self._dooaf_pick_complete
         slant_note = f" facade LRF {float(slant):.1f} m" if slant is not None else ""
         print(
             f"[VGCS:observe] dooaf facade uv pick ok role={pick_role} "
             f"lat={lat:.7f} lon={lon:.7f} video=({mark_u:.3f},{mark_v:.3f}){slant_note}"
         )
-        try:
-            cb(float(lat), float(lon), alt_m)
-        except TypeError:
-            cb(float(lat), float(lon))
+        self._end_dooaf_map_pick(restore_target_mode=True)
+        if cb is not None:
+            try:
+                cb(float(lat), float(lon), alt_m)
+            except TypeError:
+                cb(float(lat), float(lon))
         self._set_status(
             f"DOOAF {label} saved (facade pick){slant_note} — OK to confirm"
         )
