@@ -40,7 +40,11 @@ from vgcs.observe.geo_reference import (
     compute_geo_reference,
     compute_lrf_slant_geo,
 )
-from vgcs.observe.target_measure import haversine_m
+from vgcs.observe.target_measure import (
+    haversine_m,
+    low_hover_ray_agl_m,
+    ray_agl_suspect_dem_mismatch,
+)
 from vgcs.video.camera_control import NoopCameraControl
 
 

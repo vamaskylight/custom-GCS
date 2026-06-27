@@ -276,9 +276,10 @@ def main() -> None:
         ),
         "dooaf_mixin": textwrap.dedent(
             '''\
-            from PySide6.QtCore import QSettings, QTimer
-            from PySide6.QtWidgets import QMessageBox
+            from PySide6.QtCore import QSettings, Qt, QTimer
+            from PySide6.QtWidgets import QDialog, QMessageBox
 
+            from vgcs.map.app_settings import QS_APP, QS_ORG
             from vgcs.map.dooaf_setup_dialog import DOOAF_PICK_GUN, DOOAF_PICK_TARGET, DooafSetupDialog
             from vgcs.map.native_video_overlay import VideoOverlayFacadeHint
             from vgcs.map.observation.types import PendingLrfVideoPick
@@ -286,20 +287,38 @@ def main() -> None:
                 DOOAF_ROLE_GUN,
                 DOOAF_ROLE_IMPACT,
                 DOOAF_ROLE_INTENDED,
+                DOOAF_ROLE_SURVEY,
                 DooafSettings,
+                _apply_geo_reference_to_mark_row,
+                _forced_ray_geo_for_row,
+                apply_dooaf_impact_geo_fallback,
                 apply_map_pick_to_settings,
+                build_dooaf_session,
+                clear_dooaf_setup_video_mark,
                 dooaf_role_display,
+                dooaf_settings_kwargs,
                 enrich_dooaf_settings_elevation_from_dem,
+                format_dooaf_status,
                 latest_mark,
                 merge_dooaf_settings,
+                merge_setup_video_marks,
                 read_dooaf_settings,
+                refine_impact_geo_from_video_rays,
                 resolved_dooaf_settings,
                 write_dooaf_settings,
                 write_dooaf_setup_video_mark,
             )
             from vgcs.observe.dooaf_flight_session import build_facade_overlay_hint
-            from vgcs.observe.geo_reference import compute_lrf_slant_geo
-            from vgcs.observe.target_measure import haversine_m
+            from vgcs.observe.geo_reference import (
+                apply_geo_reference_result_to_video_row,
+                compute_geo_reference,
+                compute_lrf_slant_geo,
+            )
+            from vgcs.observe.target_measure import (
+                haversine_m,
+                low_hover_ray_agl_m,
+                ray_agl_suspect_dem_mismatch,
+            )
             from vgcs.video.camera_control import NoopCameraControl
             '''
         ),

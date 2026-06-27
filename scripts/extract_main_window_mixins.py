@@ -291,7 +291,7 @@ def main() -> None:
         from collections import deque
         from pathlib import Path
 
-        from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QSettings, QTimer
+        from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QSettings, QTimer
         from PySide6.QtGui import (
             QColor,
             QGuiApplication,
