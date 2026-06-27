@@ -362,6 +362,7 @@ class CameraRailMixin:
             return False
 
     @staticmethod
+    @staticmethod
     def _native_gimbal_ptz_action(dx: int, dy: int) -> str | None:
         if int(dy) > 0:
             return "up"

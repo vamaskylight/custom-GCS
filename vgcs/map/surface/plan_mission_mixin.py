@@ -348,6 +348,7 @@ class PlanMissionMixin:
         self.mission_download_requested.emit()
         self._set_status("Mission download requested")
 
+    @staticmethod
     def _plan_current_mission_path(settings: QSettings) -> str:
         cur = str(settings.value(_KEY_PLAN_CURRENT_MISSION_JSON, "") or "")
         if cur:

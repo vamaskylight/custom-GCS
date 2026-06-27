@@ -171,6 +171,7 @@ class VideoRecordingMixin:
             btn.blockSignals(False)
         self._sync_native_cam_timer_visibility()
 
+    @staticmethod
     def _format_native_cam_recording_duration(total_secs: int) -> str:
         total_secs = max(0, int(total_secs))
         h = total_secs // 3600
