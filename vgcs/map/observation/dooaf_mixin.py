@@ -873,13 +873,29 @@ class DooafOperationsMixin:
                 f"(Target paused={self._dooaf_restore_target_after_pick})"
             )
             if self._dooaf_lrf_geo_enabled():
-                self._set_status(
-                    f"Click actual target on video ({label}) — roof / aim point; "
-                    "camera will slew and LRF confirms range"
-                    if pick_role == DOOAF_ROLE_INTENDED
-                    else f"Click the ground in the video to set {label}; "
-                    "camera will slew and LRF confirms range"
-                )
+                if self._dooaf_facade_uv_pick_ready():
+                    slant = getattr(
+                        getattr(self, "_dooaf_facade_session", None),
+                        "slant_range_m",
+                        None,
+                    )
+                    slant_note = (
+                        f" (LRF {float(slant):.1f} m)" if slant is not None else ""
+                    )
+                    self._set_status(
+                        f"Click {label} on the same building face{slant_note} — "
+                        "fast pick reuses facade lock (no gimbal slew)"
+                    )
+                elif pick_role == DOOAF_ROLE_INTENDED:
+                    self._set_status(
+                        f"Click actual target on video ({label}) — roof / aim point; "
+                        "camera will slew and LRF confirms range"
+                    )
+                else:
+                    self._set_status(
+                        f"Click the ground in the video to set {label}; "
+                        "camera will slew and LRF confirms range"
+                    )
             else:
                 self._set_status(
                     f"Click actual target on video ({label}) — roof / aim point on building"
