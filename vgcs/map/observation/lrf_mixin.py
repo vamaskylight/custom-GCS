@@ -522,7 +522,7 @@ class LrfVideoLockMixin:
         except Exception:
             pass
         fw, fh = 1280, 720
-        task = _LrfLockTask(cc, u, v, self._lrf_lock_bridge, frame_w=fw, frame_h=fh)
+        task = LrfLockTask(cc, u, v, self._lrf_lock_bridge, frame_w=fw, frame_h=fh)
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(task)
 
