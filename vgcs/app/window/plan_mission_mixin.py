@@ -427,6 +427,7 @@ class MainWindowPlanMissionMixin:
             max_telem_dist_m=max_telem_dist_m,
         )
 
+    @staticmethod
     def _offset_lat_lon_m(lat_deg: float, lon_deg: float, east_m: float, north_m: float) -> tuple[float, float]:
         d_lat = north_m / 111_320.0
         cos_lat = math.cos(math.radians(lat_deg))

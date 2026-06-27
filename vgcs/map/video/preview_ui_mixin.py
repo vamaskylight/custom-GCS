@@ -131,6 +131,7 @@ class VideoPreviewUiMixin:
         except Exception:
             pass
 
+    @staticmethod
     def _split_hit_slot_in_composite(u: float, v: float, snap: dict[str, object]) -> int:
         """Return slot index 0..3 for a hit inside a cell, or -1 (gap / divider)."""
         try:
@@ -903,6 +904,7 @@ class VideoPreviewUiMixin:
             ordered.append((None, None))
         self._render_native_split_grid_4(ordered)
 
+    @staticmethod
     def _split_cell_label(source_id: str | None) -> str:
         if not source_id:
             return ""
@@ -1005,6 +1007,7 @@ class VideoPreviewUiMixin:
         except Exception:
             return
 
+    @staticmethod
     def _draw_split_cell_label(p: QPainter, x: int, y: int, cw: int, text: str, *, filled: bool) -> None:
         try:
             font = QFont("Segoe UI", 11, QFont.Weight.Bold)

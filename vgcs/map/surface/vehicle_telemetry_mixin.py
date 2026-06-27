@@ -35,6 +35,7 @@ class VehicleTelemetryMixin:
                 lat, lon = None, None
         return lat is not None and lon is not None
 
+    @staticmethod
     def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         r = 6_371_000.0
         p1 = math.radians(lat1)
