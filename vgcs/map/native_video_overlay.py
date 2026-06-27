@@ -97,6 +97,15 @@ class VideoOverlayLrfLock:
     geo_label: str = ""
 
 
+@dataclass(frozen=True)
+class VideoOverlayFacadeHint:
+    """DOOAF facade session — rapid UV picks without re-slewing LRF."""
+
+    title: str
+    subtitle: str
+    ready: bool = True
+
+
 class NativeVideoOverlayLayer(QWidget):
     """
     Child of ``QLabel`` video preview — draws detection boxes/labels and manual video marks.
@@ -118,6 +127,7 @@ class NativeVideoOverlayLayer(QWidget):
         self._measure_segments: list[tuple[float, float, float, float, str]] = []
         self._lrf_lock: VideoOverlayLrfLock | None = None
         self._lrf_armed_hint = False
+        self._facade_hint: VideoOverlayFacadeHint | None = None
 
     def set_content_rect(self, rect: dict[str, float] | None) -> None:
         self._content_rect = dict(rect) if rect else None
@@ -264,9 +274,40 @@ class NativeVideoOverlayLayer(QWidget):
         self._lrf_armed_hint = bool(armed)
         self.update()
 
+    def set_facade_hint(
+        self,
+        hint: VideoOverlayFacadeHint | dict[str, object] | tuple[str, str] | None,
+        *,
+        ready: bool = True,
+    ) -> None:
+        if hint is None:
+            self._facade_hint = None
+        elif isinstance(hint, VideoOverlayFacadeHint):
+            self._facade_hint = hint
+        elif isinstance(hint, tuple) and len(hint) >= 2:
+            self._facade_hint = VideoOverlayFacadeHint(
+                title=str(hint[0]),
+                subtitle=str(hint[1]),
+                ready=bool(ready),
+            )
+        else:
+            try:
+                self._facade_hint = VideoOverlayFacadeHint(
+                    title=str(hint.get("title", "")),  # type: ignore[union-attr]
+                    subtitle=str(hint.get("subtitle", "")),  # type: ignore[union-attr]
+                    ready=bool(hint.get("ready", True)),  # type: ignore[union-attr]
+                )
+            except (AttributeError, TypeError, ValueError):
+                self._facade_hint = None
+        self.update()
+
     def clear_lrf_overlay(self) -> None:
         self._lrf_lock = None
         self._lrf_armed_hint = False
+        self.update()
+
+    def clear_facade_hint(self) -> None:
+        self._facade_hint = None
         self.update()
 
     def clear_all(self) -> None:
@@ -276,6 +317,7 @@ class NativeVideoOverlayLayer(QWidget):
         self._measure_segments.clear()
         self._lrf_lock = None
         self._lrf_armed_hint = False
+        self._facade_hint = None
         self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -504,6 +546,53 @@ class NativeVideoOverlayLayer(QWidget):
             p.drawText(tx + 6, y_text, line)
             y_text += metrics.height()
 
+    def _draw_top_banner(
+        self,
+        p: QPainter,
+        *,
+        cl: float,
+        ct: float,
+        cw: float,
+        y_top: float,
+        title: str,
+        subtitle: str = "",
+        border: QColor,
+        fill: QColor,
+        title_color: QColor,
+        subtitle_color: QColor,
+    ) -> float:
+        """Draw a centered two-line banner; return bottom y in widget coords."""
+        font_title = QFont("Segoe UI", 11, QFont.Weight.Bold)
+        font_sub = QFont("Segoe UI", 9, QFont.Weight.DemiBold)
+        p.setFont(font_title)
+        m_title = p.fontMetrics()
+        p.setFont(font_sub)
+        m_sub = p.fontMetrics()
+        pad_x, pad_y = 12, 8
+        line_gap = 3
+        tw = max(
+            m_title.horizontalAdvance(title),
+            m_sub.horizontalAdvance(subtitle) if subtitle else 0,
+        ) + pad_x * 2
+        th = m_title.height() + pad_y * 2
+        if subtitle:
+            th += m_sub.height() + line_gap
+        tx = int(cl + (cw - tw) / 2.0)
+        ty = int(y_top)
+        p.fillRect(tx, ty, int(tw), int(th), fill)
+        p.setPen(QPen(border, 2))
+        p.drawRect(tx, ty, int(tw), int(th))
+        p.setFont(font_title)
+        p.setPen(title_color)
+        y_text = ty + pad_y + m_title.ascent()
+        p.drawText(tx + pad_x, y_text, title)
+        if subtitle:
+            p.setFont(font_sub)
+            p.setPen(subtitle_color)
+            y_text += m_title.height() + line_gap
+            p.drawText(tx + pad_x, y_text + m_sub.ascent() - m_title.ascent(), subtitle)
+        return float(ty + th)
+
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
         if (
@@ -513,26 +602,44 @@ class NativeVideoOverlayLayer(QWidget):
             and not self._measure_segments
             and self._lrf_lock is None
             and not self._lrf_armed_hint
+            and self._facade_hint is None
         ):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         cl, ct, cw, ch = self._content_qrect()
 
+        banner_y = float(ct + 8.0)
         if self._lrf_armed_hint and self._lrf_lock is None:
-            banner = "Click target on video — camera will slew and measure LRF"
-            font = QFont("Segoe UI", 11, QFont.Weight.Bold)
-            p.setFont(font)
-            metrics = p.fontMetrics()
-            tw = metrics.horizontalAdvance(banner) + 20
-            th = metrics.height() + 12
-            tx = int(cl + (cw - tw) / 2.0)
-            ty = int(ct + 8)
-            p.fillRect(tx, ty, tw, th, QColor(8, 20, 36, 210))
-            p.setPen(QPen(QColor(251, 191, 36, 230), 2))
-            p.drawRect(tx, ty, tw, th)
-            p.setPen(QColor(255, 236, 179))
-            p.drawText(tx + 10, ty + metrics.ascent() + 6, banner)
+            banner_y = self._draw_top_banner(
+                p,
+                cl=cl,
+                ct=ct,
+                cw=cw,
+                y_top=banner_y,
+                title="Click target on video — camera will slew and measure LRF",
+                border=QColor(251, 191, 36, 230),
+                fill=QColor(8, 20, 36, 210),
+                title_color=QColor(255, 236, 179),
+                subtitle_color=QColor(255, 236, 179),
+            ) + 6.0
+
+        if self._facade_hint is not None:
+            fh = self._facade_hint
+            ready = bool(fh.ready)
+            self._draw_top_banner(
+                p,
+                cl=cl,
+                ct=ct,
+                cw=cw,
+                y_top=banner_y,
+                title=str(fh.title),
+                subtitle=str(fh.subtitle),
+                border=QColor(34, 197, 94, 235) if ready else QColor(251, 191, 36, 230),
+                fill=QColor(8, 28, 18, 220) if ready else QColor(36, 24, 8, 220),
+                title_color=QColor(187, 247, 208) if ready else QColor(255, 236, 179),
+                subtitle_color=QColor(134, 239, 172) if ready else QColor(253, 224, 171),
+            )
 
         if self._lrf_lock is not None:
             lk = self._lrf_lock
