@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QMessageBox
 
 from vgcs.map.app_settings import QS_APP, QS_ORG
+from vgcs.map.video.encode_bridge import VideoEncodeBridge, VideoEncodeTask
 from vgcs.map.video.helpers import _format_video_zoom_label
 from vgcs.map.video.settings_keys import (
     KEY_VIDEO_DEFAULT_VIEW,
@@ -126,7 +127,7 @@ class VideoPipelineMixin:
                 if not isinstance(getattr(self, "_video_encode_bridge_by_id", None), dict):
                     self._video_encode_bridge_by_id = {}
                 if sid not in self._video_encode_bridge_by_id:
-                    bridge = _VideoEncodeBridge(self)
+                    bridge = VideoEncodeBridge(self)
                     bridge.encoded.connect(
                         lambda data_url, sid=sid: self._on_video_frame_encoded_for(sid, data_url)
                     )
@@ -320,7 +321,7 @@ class VideoPipelineMixin:
                     pass
         except Exception:
             pass
-        self._video_encode_bridge = _VideoEncodeBridge(self)
+        self._video_encode_bridge = VideoEncodeBridge(self)
         self._video_encode_bridge.encoded.connect(self._on_video_frame_encoded)
 
         try:
@@ -1276,7 +1277,7 @@ class VideoPipelineMixin:
         if bridge is None:
             self._video_encode_inflight_by_id[source_id] = False
             return
-        task = _VideoEncodeTask(
+        task = VideoEncodeTask(
             pending,
             bridge,
             max_w=int(getattr(self, "_video_encode_max_w", 1920)),
@@ -1297,7 +1298,7 @@ class VideoPipelineMixin:
             return
         self._video_encode_pending = None
         self._video_encode_inflight = True
-        task = _VideoEncodeTask(
+        task = VideoEncodeTask(
             pending,
             self._video_encode_bridge,
             max_w=int(getattr(self, "_video_encode_max_w", 1920)),

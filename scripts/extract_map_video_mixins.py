@@ -261,6 +261,7 @@ def main() -> None:
             from PySide6.QtWidgets import QMessageBox
 
             from vgcs.map.app_settings import QS_APP, QS_ORG
+            from vgcs.map.video.encode_bridge import VideoEncodeBridge, VideoEncodeTask
             from vgcs.map.video.helpers import _format_video_zoom_label
             from vgcs.video.pipeline import (
                 HAS_MULTIMEDIA,
