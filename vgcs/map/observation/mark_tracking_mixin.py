@@ -606,6 +606,16 @@ class VideoMarkTrackingMixin:
             )
         return (float(u), float(v))
 
+    def _facade_session_freezes_setup_marks(self) -> bool:
+        """True while facade LRF lock is valid — setup marks stay at pick UV on screen."""
+        session = getattr(self, "_dooaf_facade_session", None)
+        if session is None or not session.has_lock:
+            return False
+        try:
+            return bool(session.uv_pick_valid(self._observation_context()))
+        except Exception:
+            return False
+
     def _dooaf_mark_display_uv(
         self, role: str, stored_uv: tuple[float, float]
     ) -> tuple[float, float] | None:
@@ -620,6 +630,16 @@ class VideoMarkTrackingMixin:
                     if self._mark_uv_on_screen(u, v):
                         return (u, v)
                     return None
+        # After gun LRF lock: gun + target facade picks share one slant/pose — do not
+        # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
+        if self._facade_session_freezes_setup_marks():
+            u, v = float(stored_uv[0]), float(stored_uv[1])
+            if not self._mark_uv_on_screen(u, v):
+                return None
+            return (
+                max(0.0, min(1.0, u)),
+                max(0.0, min(1.0, v)),
+            )
         track = self._dooaf_setup_mark_track.get(str(role))
         return self._tracked_uv_from_store(track, stored_uv)
 
