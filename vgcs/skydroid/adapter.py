@@ -633,13 +633,29 @@ class SkydroidTopUdpAdapter:
 
     @staticmethod
     def _align_yaw_tol_for_click(dpitch_image: float) -> float:
-        """Yaw gate for click-to-aim; relax slightly after large pitch slews (C13 yaw coupling)."""
+        """Yaw gate for click-to-aim; relax after large pitch slews (C13 yaw coupling)."""
         base = SkydroidTopUdpAdapter._align_yaw_tol_deg()
         need = abs(float(dpitch_image))
         if need < 8.0:
             return base
-        extra = min(0.55, need * 0.028)
-        return max(base, min(1.4, base + extra))
+        if need >= 15.0:
+            extra = min(1.25, need * 0.045)
+        else:
+            extra = min(0.55, need * 0.028)
+        return max(base, min(2.0, base + extra))
+
+    @staticmethod
+    def _boresight_tol_for_click(dpitch_image: float) -> tuple[float, float]:
+        """Screen-space verify tolerance; relax slightly after steep pitch slews."""
+        u_tol = float(_LRF_BORESIGHT_TOL_U)
+        v_tol = float(_LRF_BORESIGHT_TOL_V)
+        need = abs(float(dpitch_image))
+        if need >= 12.0:
+            u_tol = max(u_tol, 0.048)
+            v_tol = max(v_tol, 0.048)
+        if need >= 18.0:
+            u_tol = max(u_tol, 0.056)
+        return u_tol, v_tol
 
     @staticmethod
     def _align_pitch_tol_deg(dpitch_image: float) -> float:
@@ -709,7 +725,7 @@ class SkydroidTopUdpAdapter:
             )
             att_now = self._read_gimbal_attitude_deg() or att_now
             moved = True
-        if yaw_delta >= 2.5:
+        if yaw_delta >= 2.0:
             print(
                 f"[VGCS:lrf] align bulk yaw GAY -> {float(yaw_tgt):.1f}° "
                 f"(Δ={yaw_delta:.1f}° spd={bulk_spd:.0f})"
@@ -837,6 +853,7 @@ class SkydroidTopUdpAdapter:
         att_at_click: tuple[float, float],
         att_now: tuple[float, float],
         *,
+        dpitch_image: float = 0.0,
         gac_h_scale: float = 1.0,
         gac_v_scale: float = 1.0,
     ) -> tuple[bool, float, float]:
@@ -849,9 +866,10 @@ class SkydroidTopUdpAdapter:
             gac_v_scale=float(gac_v_scale),
             clamp=False,
         )
+        u_tol, v_tol = self._boresight_tol_for_click(float(dpitch_image))
         ok = (
-            abs(float(u_chk) - 0.5) <= float(_LRF_BORESIGHT_TOL_U)
-            and abs(float(v_chk) - 0.5) <= float(_LRF_BORESIGHT_TOL_V)
+            abs(float(u_chk) - 0.5) <= float(u_tol)
+            and abs(float(v_chk) - 0.5) <= float(v_tol)
         )
         return bool(ok), float(u_chk), float(v_chk)
 
@@ -972,9 +990,15 @@ class SkydroidTopUdpAdapter:
             )
         except ValueError:
             base = float(_LRF_ALIGN_MAX_TOTAL_DEG)
+        need = abs(float(need_deg))
+        scaled = float(need) * 1.15 + 4.0
+        if need >= 15.0:
+            scaled = max(scaled, float(need) * 2.4 + 6.0)
+        elif need >= 10.0:
+            scaled = max(scaled, float(need) * 1.8 + 6.0)
         return min(
             float(_LRF_ALIGN_MAX_TOTAL_CAP_DEG),
-            max(base, float(need_deg) * 1.15 + 4.0),
+            max(base, scaled),
         )
 
     def _hold_speed_direct_burst(
@@ -1082,7 +1106,7 @@ class SkydroidTopUdpAdapter:
             gap_pitch_sent = True
             gap_yaw_sent = abs(float(dyaw0)) >= 2.5
             pitch_open_sent = pitch_need_deg * 0.85
-        yaw_tol = self._align_yaw_tol_deg()
+        yaw_tol = self._align_yaw_tol_for_click(float(dpitch0))
         pitch_tol = self._align_pitch_tol_deg(float(dpitch0))
         move_cap = self._align_move_cap_deg(float(need))
         print(
@@ -1126,7 +1150,8 @@ class SkydroidTopUdpAdapter:
                     pitch_trusted=bool(pitch_trusted),
                 ):
                     bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
-                        click_u, click_v, att_start, att
+                        click_u, click_v, att_start, att,
+                        dpitch_image=float(dpitch0),
                     )
                     if bore_ok:
                         yaw_e = self._angle_err_deg(float(yaw_tgt), float(att[0]))
@@ -1213,14 +1238,23 @@ class SkydroidTopUdpAdapter:
                 spur = float(spd)
                 if abs(float(yaw_err)) < 6.0:
                     spur = min(spur, max(1.5, abs(float(yaw_err)) * 1.15))
-                if (
-                    abs(float(dyaw0)) >= float(_LRF_ALIGN_GAP_YAW_MIN_DEG)
-                    and not gap_yaw_sent
-                ):
-                    print(
-                        f"[VGCS:lrf] align yaw GAY -> {yaw_tgt:.1f}° "
-                        f"(need={abs(float(dyaw0)):.1f}°)"
-                    )
+                # GSY bursts overshoot on C13 after steep pitch — prefer GAY snaps.
+                use_gay = (
+                    gap_yaw_sent
+                    or abs(float(dyaw0)) >= 1.5
+                    or (pitch_trusted and abs(float(yaw_err)) >= 0.8)
+                )
+                if use_gay:
+                    if not gap_yaw_sent:
+                        print(
+                            f"[VGCS:lrf] align yaw GAY -> {yaw_tgt:.1f}° "
+                            f"(need={abs(float(dyaw0)):.1f}°)"
+                        )
+                    else:
+                        print(
+                            f"[VGCS:lrf] align yaw GAY retry -> {yaw_tgt:.1f}° "
+                            f"(err={float(yaw_err):+.1f}°)"
+                        )
                     self._send_gay_yaw_direct(
                         float(yaw_tgt), spur, att_yaw=float(att[0])
                     )
@@ -1268,7 +1302,8 @@ class SkydroidTopUdpAdapter:
             dyaw=float(dyaw0),
         )
         bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
-            click_u, click_v, att_start, att_end
+            click_u, click_v, att_start, att_end,
+            dpitch_image=float(dpitch0),
         )
         aim_ok = bool(aim_ok and bore_ok)
         if not bore_ok:
