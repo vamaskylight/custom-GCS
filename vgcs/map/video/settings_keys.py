@@ -1,0 +1,10 @@
+"""QSettings keys for video / camera configuration."""
+
+KEY_VIDEO_ENABLED = "video/enabled"
+KEY_VIDEO_SOURCE = "video/source"
+KEY_VIDEO_RTSP_DAY = "video/rtsp_day"
+KEY_VIDEO_RTSP_THERMAL = "video/rtsp_thermal"
+KEY_VIDEO_RTSP_TRANSPORT = "video/rtsp_transport"
+KEY_VIDEO_LOW_LATENCY = "video/low_latency"
+KEY_VIDEO_RECORD_FORMAT = "video/record_format"
+KEY_VIDEO_DEFAULT_VIEW = "video/default_view"

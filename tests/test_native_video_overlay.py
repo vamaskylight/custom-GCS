@@ -2,7 +2,21 @@
 
 from __future__ import annotations
 
-from vgcs.map.native_video_overlay import offscreen_hint_edge_uv
+from vgcs.map.native_video_overlay import (
+    NativeVideoOverlayLayer,
+    VideoOverlayFacadeHint,
+    offscreen_hint_edge_uv,
+)
+
+
+def test_facade_hint_dataclass() -> None:
+    hint = VideoOverlayFacadeHint(
+        title="Facade locked — LRF 42.5 m",
+        subtitle="Click on video (fast pick): Gun · Target",
+        ready=True,
+    )
+    assert hint.ready is True
+    assert "Facade locked" in hint.title
 
 
 def test_offscreen_hint_edge_uv_left() -> None:
