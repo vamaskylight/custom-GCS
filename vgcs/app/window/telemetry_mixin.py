@@ -88,6 +88,7 @@ from vgcs.video.camera_control import (
 class MainWindowTelemetryMixin:
     """Extracted from MainWindow — uses host state via self."""
 
+    @staticmethod
     def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         r = 6_371_000.0
         p1 = math.radians(lat1)
@@ -97,6 +98,7 @@ class MainWindowTelemetryMixin:
         a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
         return 2 * r * math.asin(min(1.0, math.sqrt(max(0.0, a))))
 
+    @staticmethod
     def _extract_remote_id_text(data: dict[str, object]) -> str:
         candidates = (
             "uas_id",

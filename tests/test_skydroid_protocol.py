@@ -449,6 +449,16 @@ def test_align_aim_satisfied_requires_yaw_on_target() -> None:
     assert adapter._align_aim_satisfied((37.5, 1.05), 38.2, 1.1, -1.1) is True
 
 
+def test_align_yaw_tol_relaxes_for_steep_ground_pick() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    tol = SkydroidTopUdpAdapter._align_yaw_tol_for_click(18.0)
+    assert tol >= 1.2
+    adapter = SkydroidTopUdpAdapter()
+    # Field log: yaw_err=1.2° after ~18° pitch slew to ground click.
+    assert adapter._align_aim_satisfied((6.4, -17.6), 5.2, -18.0, -18.0) is True
+
+
 def test_align_pitch_tol_tightens_for_large_click() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 

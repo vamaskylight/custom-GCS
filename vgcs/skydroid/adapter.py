@@ -632,6 +632,16 @@ class SkydroidTopUdpAdapter:
             return float(_LRF_ALIGN_YAW_TOL_DEG)
 
     @staticmethod
+    def _align_yaw_tol_for_click(dpitch_image: float) -> float:
+        """Yaw gate for click-to-aim; relax slightly after large pitch slews (C13 yaw coupling)."""
+        base = SkydroidTopUdpAdapter._align_yaw_tol_deg()
+        need = abs(float(dpitch_image))
+        if need < 8.0:
+            return base
+        extra = min(0.55, need * 0.028)
+        return max(base, min(1.4, base + extra))
+
+    @staticmethod
     def _align_pitch_tol_deg(dpitch_image: float) -> float:
         try:
             base = float(
@@ -897,7 +907,7 @@ class SkydroidTopUdpAdapter:
         pitch_open_sent: float = 0.0,
         pitch_trusted: bool = True,
     ) -> bool:
-        yaw_tol = self._align_yaw_tol_deg()
+        yaw_tol = self._align_yaw_tol_for_click(float(dpitch_image))
         pitch_tol = self._align_pitch_tol_deg(float(dpitch_image))
         yaw_err = abs(self._angle_err_deg(float(yaw_tgt), float(att[0])))
         if pitch_trusted:
@@ -924,7 +934,7 @@ class SkydroidTopUdpAdapter:
         """Strict post-align check — must be on target, not merely 'moved a bit'."""
         if att is None:
             return False
-        yaw_tol = self._align_yaw_tol_deg()
+        yaw_tol = self._align_yaw_tol_for_click(float(dpitch))
         pitch_tol = self._align_pitch_tol_deg(float(dpitch))
         yaw_err = abs(self._angle_err_deg(float(yaw_tgt), float(att[0])))
         pitch_err = abs(self._angle_err_deg(float(pitch_tgt), float(att[1])))
