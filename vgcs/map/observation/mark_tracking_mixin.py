@@ -10,6 +10,11 @@ from vgcs.observe.dooaf_flight_session import mark_track_use_geo_in_flight
 from vgcs.observe.geo_reference import project_wgs84_to_video_norm, should_project_lrf_mark_via_geo
 from vgcs.observe.target_measure import haversine_m
 
+# Match should_project_lrf_mark_via_geo min_slant_for_airborne_geo_m — below this,
+# GPS geo projection jitters; pin the overlay until the gimbal pans meaningfully.
+_NEAR_FIELD_LRF_PIN_SLANT_M = 25.0
+_LRF_MARK_PIN_ATT_DEADBAND_DEG = 1.25
+
 
 class VideoMarkTrackingMixin:
     """Extracted from MapWidget — uses host widget state via self."""
@@ -33,14 +38,20 @@ class VideoMarkTrackingMixin:
         if used_lrf_slew and lock_att is not None:
             h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
             v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
-            if abs(h_scale - 1.0) < 1e-6 and abs(v_scale - 1.0) < 1e-6:
-                h_scale, v_scale = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
-                    track_uv,
-                    track_att,
-                    lock_att,
-                )
-            track_uv = (0.5, 0.5)
-            track_att = (float(lock_att[0]), float(lock_att[1]))
+            glob_uv = getattr(self, "_lrf_track_ref_uv", None)
+            glob_att = getattr(self, "_lrf_track_ref_att", None)
+            if isinstance(glob_uv, tuple) and isinstance(glob_att, tuple):
+                track_uv = (float(glob_uv[0]), float(glob_uv[1]))
+                track_att = (float(glob_att[0]), float(glob_att[1]))
+            else:
+                if abs(h_scale - 1.0) < 1e-6 and abs(v_scale - 1.0) < 1e-6:
+                    h_scale, v_scale = SkydroidTopUdpAdapter.calibrate_track_gac_scales(
+                        track_uv,
+                        track_att,
+                        lock_att,
+                    )
+                track_uv = (0.5, 0.5)
+                track_att = (float(lock_att[0]), float(lock_att[1]))
         out: dict[str, object] = {
             "ref_uv": track_uv,
             "ref_att": track_att,
@@ -81,12 +92,23 @@ class VideoMarkTrackingMixin:
             built["v_scale"] = v_scale
             built["lrf_slew"] = True
 
-    def _sync_dooaf_setup_track_from_lrf_lock(self, role: str) -> None:
-        """Copy post-lock GAC scale factors into one DOOAF setup mark track.
+    @staticmethod
+    def _gimbal_att_delta_deg(
+        ref_att: tuple[float, float], cur_att: tuple[float, float]
+    ) -> tuple[float, float]:
+        yaw0, pitch0 = float(ref_att[0]), float(ref_att[1])
+        yaw, pitch = float(cur_att[0]), float(cur_att[1])
+        dyaw = abs(((yaw - yaw0 + 180.0) % 360.0) - 180.0)
+        dpitch = abs(pitch - pitch0)
+        return float(dyaw), float(dpitch)
 
-        ref_uv/ref_att stay at boresight+lock pose from _build_video_mark_track;
-        overwriting them with pre-lock calibration residuals caused post-OK drift.
-        Each role keeps its own scales — never copy the latest global lock onto gun+target.
+    def _sync_dooaf_setup_track_from_lrf_lock(
+        self, role: str, *, final_uv: tuple[float, float] | None = None
+    ) -> None:
+        """Copy post-lock LRF calibration into one DOOAF setup mark track.
+
+        Uses the global LRF track pose calibrated in _calibrate_lrf_track_after_lock
+        so the setup mark matches the cyan reticle at lock-complete (no jump/drift).
         """
         h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
         v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
@@ -95,6 +117,32 @@ class VideoMarkTrackingMixin:
             return
         built["h_scale"] = h_scale
         built["v_scale"] = v_scale
+        glob_uv = getattr(self, "_lrf_track_ref_uv", None)
+        glob_att = getattr(self, "_lrf_track_ref_att", None)
+        if isinstance(glob_uv, tuple) and isinstance(glob_att, tuple):
+            built["ref_uv"] = (float(glob_uv[0]), float(glob_uv[1]))
+            built["ref_att"] = (float(glob_att[0]), float(glob_att[1]))
+        pin_src = final_uv
+        if pin_src is None:
+            pin_src = getattr(self, "_lrf_lock_uv", None)
+        if pin_src is None and isinstance(glob_uv, tuple):
+            pin_src = glob_uv
+        if isinstance(pin_src, tuple):
+            built["pin_uv"] = (float(pin_src[0]), float(pin_src[1]))
+            try:
+                self._dooaf_setup_video_marks[str(role)] = (
+                    float(pin_src[0]),
+                    float(pin_src[1]),
+                )
+            except Exception:
+                pass
+        slant_raw = built.get("lrf_slant_range_m")
+        if slant_raw is not None:
+            try:
+                if float(slant_raw) < _NEAR_FIELD_LRF_PIN_SLANT_M:
+                    built["near_field_pin"] = True
+            except (TypeError, ValueError):
+                pass
 
     def _hide_lrf_video_reticle_keep_range(self) -> None:
         """Hide duplicate cyan LRF box on video; keep slant range on PROXIMITY."""
@@ -151,6 +199,15 @@ class VideoMarkTrackingMixin:
         ):
             built.pop(sk, None)
         self._attach_lock_vehicle_pose_to_track(built)
+        if used_lrf_slew and lrf_slant_range_m is not None:
+            try:
+                if float(lrf_slant_range_m) < _NEAR_FIELD_LRF_PIN_SLANT_M:
+                    built["near_field_pin"] = True
+                    ref_uv = built.get("ref_uv")
+                    if isinstance(ref_uv, tuple):
+                        built["pin_uv"] = (float(ref_uv[0]), float(ref_uv[1]))
+            except (TypeError, ValueError):
+                pass
         self._dooaf_setup_mark_track[key] = built
         self._sync_video_mark_track_timer()
 
@@ -437,11 +494,39 @@ class VideoMarkTrackingMixin:
         except Exception:
             return None
 
+    def _mark_track_near_field_pinned_uv(
+        self, track: dict[str, object]
+    ) -> tuple[float, float] | None:
+        """Hold mark fixed on screen after near-field LRF lock until gimbal pans."""
+        if not track.get("near_field_pin"):
+            return None
+        pin = track.get("pin_uv")
+        ref_att = track.get("ref_att")
+        if not isinstance(pin, tuple) or not isinstance(ref_att, tuple):
+            return None
+        cur = self._read_gimbal_attitude_pair()
+        if cur is None:
+            return (float(pin[0]), float(pin[1]))
+        dyaw, dpitch = self._gimbal_att_delta_deg(
+            (float(ref_att[0]), float(ref_att[1])),
+            (float(cur[0]), float(cur[1])),
+        )
+        if (
+            dyaw < _LRF_MARK_PIN_ATT_DEADBAND_DEG
+            and dpitch < _LRF_MARK_PIN_ATT_DEADBAND_DEG
+        ):
+            return (float(pin[0]), float(pin[1]))
+        return None
+
     def _project_mark_uv_unclamped(
         self,
         track: dict[str, object] | None,
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
+        if track is not None:
+            pinned = self._mark_track_near_field_pinned_uv(track)
+            if pinned is not None:
+                return pinned
         att_uv: tuple[float, float] | None = None
         if track is not None:
             att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
@@ -538,6 +623,7 @@ class VideoMarkTrackingMixin:
         track = self._dooaf_setup_mark_track.get(str(role))
         return self._tracked_uv_from_store(track, stored_uv)
 
+    @staticmethod
     def _persist_mark_track_smooth_keys(
         track: dict[str, object], row: dict[str, object]
     ) -> None:

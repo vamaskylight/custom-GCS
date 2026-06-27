@@ -587,7 +587,10 @@ class LrfVideoLockMixin:
                     self._dooaf_video_pick_failed(str(exc))
             if slant_m is not None:
                 if pending.purpose == "dooaf_setup":
-                    self._sync_dooaf_setup_track_from_lrf_lock(pick_role)
+                    final_uv = getattr(self, "_lrf_lock_uv", None)
+                    self._sync_dooaf_setup_track_from_lrf_lock(
+                        pick_role, final_uv=final_uv
+                    )
                 try:
                     self._obstacle_radar.set_c13_lrf_locked(
                         slant_m,

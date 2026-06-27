@@ -365,7 +365,14 @@ class DooafOperationsMixin:
         click_att = getattr(self, "_lrf_click_att", None)
         slew_locked = slant_m is not None and click_att is not None
         used_lrf_slew = bool(used_lrf or slew_locked)
-        mark_u, mark_v = (0.5, 0.5) if used_lrf_slew else (video_x, video_y)
+        if used_lrf_slew:
+            lock_uv = getattr(self, "_lrf_track_ref_uv", None)
+            if isinstance(lock_uv, tuple):
+                mark_u, mark_v = float(lock_uv[0]), float(lock_uv[1])
+            else:
+                mark_u, mark_v = 0.5, 0.5
+        else:
+            mark_u, mark_v = video_x, video_y
         self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
         self._register_dooaf_setup_mark_track(
             pick_role,
