@@ -606,6 +606,20 @@ class VideoMarkTrackingMixin:
             )
         return (float(u), float(v))
 
+    def _facade_frozen_mark_uv(
+        self, stored_u: float, stored_v: float
+    ) -> tuple[float, float] | None:
+        """Screen UV fixed at pick while facade LRF lock is still valid."""
+        if not self._facade_session_freezes_setup_marks():
+            return None
+        u, v = float(stored_u), float(stored_v)
+        if not self._mark_uv_on_screen(u, v):
+            return None
+        return (
+            max(0.0, min(1.0, u)),
+            max(0.0, min(1.0, v)),
+        )
+
     def _facade_session_freezes_setup_marks(self) -> bool:
         """True while facade LRF lock is valid — setup marks stay at pick UV on screen."""
         session = getattr(self, "_dooaf_facade_session", None)
@@ -632,14 +646,11 @@ class VideoMarkTrackingMixin:
                     return None
         # After gun LRF lock: gun + target facade picks share one slant/pose — do not
         # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
-        if self._facade_session_freezes_setup_marks():
-            u, v = float(stored_uv[0]), float(stored_uv[1])
-            if not self._mark_uv_on_screen(u, v):
-                return None
-            return (
-                max(0.0, min(1.0, u)),
-                max(0.0, min(1.0, v)),
-            )
+        frozen = self._facade_frozen_mark_uv(
+            float(stored_uv[0]), float(stored_uv[1])
+        )
+        if frozen is not None:
+            return frozen
         track = self._dooaf_setup_mark_track.get(str(role))
         return self._tracked_uv_from_store(track, stored_uv)
 
@@ -658,6 +669,10 @@ class VideoMarkTrackingMixin:
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
+        if str(row.get("geo_method") or "") == "lrf_facade_uv":
+            frozen = self._facade_frozen_mark_uv(float(stored_u), float(stored_v))
+            if frozen is not None:
+                return frozen
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
             return (float(stored_u), float(stored_v))

@@ -87,3 +87,32 @@ def test_facade_session_freezes_dooaf_setup_mark_uv() -> None:
     }
     uv = host._dooaf_mark_display_uv("gun", (0.5, 0.5))
     assert uv == (0.5, 0.5)
+
+
+def test_facade_session_freezes_impact_observation_mark_uv() -> None:
+    host = _FacadeFreezeHost()
+    host._dooaf_facade_session.record_from_context(
+        8.7,
+        {
+            **host._observation_context(),
+            "vehicle_heading_deg": 180.0,
+        },
+    )
+    row = {
+        "kind": "video_mark",
+        "geo_method": "lrf_facade_uv",
+        "video_x_norm": 0.669,
+        "video_y_norm": 0.422,
+        "video_mark_track_ref_u": 0.669,
+        "video_mark_track_ref_v": 0.422,
+        "video_mark_track_ref_yaw": 17.0,
+        "video_mark_track_ref_pitch": -8.0,
+        "video_mark_track_h_scale": 1.0,
+        "video_mark_track_v_scale": 1.0,
+        "video_mark_lrf_slew": False,
+        "video_mark_geo_lat": 20.410118,
+        "video_mark_geo_lon": 72.879944,
+        "lrf_slant_range_m": 8.7,
+    }
+    uv = host._observation_mark_display_uv(row, 0.669, 0.422)
+    assert uv == (0.669, 0.422)
