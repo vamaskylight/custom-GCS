@@ -719,13 +719,35 @@ class VideoPipelineMixin:
         last = float(getattr(self, "_last_foreground_video_refresh_mono", 0.0) or 0.0)
         if time.monotonic() - last < 6.0:
             return
-        self._last_foreground_video_refresh_mono = time.monotonic()
         vp = getattr(self, "_video", None)
         if vp is None:
             return
         want = self._video_preview_source_ids_to_run(vp)
         if not want:
             return
+        # Alt-tab during link-up: don't schedule a 2–3s RTSP restart while still waiting
+        # for the first preview frame (that was adding 10–20s to "camera connect").
+        try:
+            for sid in want:
+                src = vp.sources().get(sid)
+                if src is None:
+                    continue
+                if bool(getattr(src, "_ffmpeg_had_frame", False)):
+                    break
+                if hasattr(src, "decode_recently_active") and src.decode_recently_active(
+                    max_age_s=45.0
+                ):
+                    try:
+                        print(
+                            "[VGCS:video] foreground refresh skipped — "
+                            "still waiting for first RTSP preview frame"
+                        )
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass
+        self._last_foreground_video_refresh_mono = time.monotonic()
         delay_ms = 3200 if elapsed_bg_s >= 8.0 else 2200
         try:
             print(
