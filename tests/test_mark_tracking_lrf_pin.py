@@ -93,12 +93,41 @@ def test_click_pin_holds_gun_mark_at_pick_uv_mid_range() -> None:
     host._att = (5.14, 2.77)
     host._lrf_lock_in_progress = True
     host._pending_lrf_video_pick = type(
-        "_P", (), {"purpose": "dooaf_setup", "pick_role": "target"}
+        "_P", (), {"purpose": "dooaf_setup", "pick_role": "intended_target"}
     )()
     uv_slew = host._tracked_uv_from_store(track, stored)
     assert uv_slew is not None
     assert uv_slew != stored
     assert uv_slew[1] > stored[1]  # pitch up → ground point moves down on screen
+
+    # LOITER gimbal drift without another pick — gun mark must not walk on screen.
+    host._lrf_lock_in_progress = False
+    host._pending_lrf_video_pick = None
+    host._att = (5.14, 2.77)
+    assert host._tracked_uv_from_store(track, stored) == stored
+
+
+def test_facade_target_pin_stays_at_click_uv() -> None:
+    """2026-06-29 16:26 — facade target at (0.575,0.243) must not geo-project off-screen."""
+    host = _PinHost((-19.86, -7.86))
+    stored = (0.575, 0.243)
+    track = {
+        "click_pin": True,
+        "facade_uv_pick": True,
+        "pin_uv": stored,
+        "pin_ref_att": (-19.86, -7.86),
+        "ref_uv": stored,
+        "ref_att": (-19.86, -7.86),
+        "h_scale": 1.0,
+        "v_scale": 1.0,
+        "geo_lat": 20.4094887,
+        "geo_lon": 72.8797751,
+        "lrf_slant_range_m": 66.7,
+    }
+    host._att = (-21.0, -6.5)
+    uv = host._tracked_uv_from_store(track, stored)
+    assert uv == stored
+    assert host._mark_track_use_geo_projection(track) is False
 
 
 def test_facade_freeze_disabled_during_target_slew() -> None:
@@ -112,7 +141,7 @@ def test_facade_freeze_disabled_during_target_slew() -> None:
     )
     host._lrf_lock_in_progress = True
     host._pending_lrf_video_pick = type(
-        "_P", (), {"purpose": "dooaf_setup", "pick_role": "target"}
+        "_P", (), {"purpose": "dooaf_setup", "pick_role": "intended_target"}
     )()
     assert host._facade_frozen_mark_uv(0.411, 0.686) is None
 

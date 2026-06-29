@@ -546,6 +546,7 @@ class DooafOperationsMixin:
             ref_att=lock_att,
             lock_att=lock_att,
             used_lrf_slew=False,
+            facade_uv_pick=True,
             geo_lat=float(lat),
             geo_lon=float(lon),
             geo_alt_m=alt_m,
