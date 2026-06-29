@@ -472,6 +472,13 @@ class VideoMarkTrackingMixin:
             return None
         ref_uv = track.get("ref_uv")
         ref_att = track.get("ref_att")
+        if track.get("click_pin"):
+            pin_uv = track.get("pin_uv")
+            pin_att = track.get("pin_ref_att")
+            if isinstance(pin_uv, tuple):
+                ref_uv = pin_uv
+            if isinstance(pin_att, tuple):
+                ref_att = pin_att
         if not isinstance(ref_uv, tuple) or not isinstance(ref_att, tuple):
             return None
         try:
@@ -493,6 +500,12 @@ class VideoMarkTrackingMixin:
         self, track: dict[str, object]
     ) -> tuple[float, float] | None:
         """Hold mark at pick UV after LRF lock until the operator pans the gimbal."""
+        if bool(getattr(self, "_lrf_lock_in_progress", False)):
+            pending = getattr(self, "_pending_lrf_video_pick", None)
+            active_role = self._pending_lrf_dooaf_pick_role(pending)
+            if active_role:
+                # Another DOOAF mark is slewing — reproject this one on the world point.
+                return None
         if not (track.get("near_field_pin") or track.get("click_pin")):
             return None
         pin = track.get("pin_uv")
@@ -531,7 +544,12 @@ class VideoMarkTrackingMixin:
         if track is not None and not track.get("click_pin"):
             att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
         if track is not None and track.get("click_pin"):
-            # Gun/target setup marks: stay on click UV; geo projection causes building drift.
+            att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
+            if att_uv is not None:
+                return att_uv
+            pin = track.get("pin_uv")
+            if isinstance(pin, tuple):
+                return (float(pin[0]), float(pin[1]))
             return (float(stored_uv[0]), float(stored_uv[1]))
         if track is not None and self._mark_track_use_geo_projection(track):
             glat = track.get("geo_lat")
@@ -613,6 +631,8 @@ class VideoMarkTrackingMixin:
         self, stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
         """Screen UV fixed at pick while facade LRF lock is still valid."""
+        if bool(getattr(self, "_lrf_lock_in_progress", False)):
+            return None
         if not self._facade_session_freezes_setup_marks():
             return None
         u, v = float(stored_u), float(stored_v)

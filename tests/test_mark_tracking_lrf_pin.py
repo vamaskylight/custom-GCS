@@ -69,7 +69,7 @@ class _FacadeFreezeHost(VideoMarkTrackingMixin):
 
 
 def test_click_pin_holds_gun_mark_at_pick_uv_mid_range() -> None:
-    """67 m field log: mark must stay on click UV, not geo-project onto buildings."""
+    """67 m field log: mark stays on click UV under gimbal jitter, not geo drift."""
     host = _PinHost((-2.6, -10.1))
     stored = (0.334, 0.710)
     track = {
@@ -82,11 +82,42 @@ def test_click_pin_holds_gun_mark_at_pick_uv_mid_range() -> None:
         "lrf_slant_range_m": 67.0,
         "geo_lat": 20.409824,
         "geo_lon": 72.879738,
+        "h_scale": 1.0,
+        "v_scale": 1.0,
     }
     host._att = (-2.8, -10.0)
     uv = host._tracked_uv_from_store(track, stored)
     assert uv == stored
 
+    # Target-pick slew (~12° pitch) — gun mark must move on screen, not stay glued.
+    host._att = (5.14, 2.77)
+    host._lrf_lock_in_progress = True
+    host._pending_lrf_video_pick = type(
+        "_P", (), {"purpose": "dooaf_setup", "pick_role": "target"}
+    )()
+    uv_slew = host._tracked_uv_from_store(track, stored)
+    assert uv_slew is not None
+    assert uv_slew != stored
+    assert uv_slew[1] > stored[1]  # pitch up → ground point moves down on screen
+
+
+def test_facade_freeze_disabled_during_target_slew() -> None:
+    host = _FacadeFreezeHost()
+    host._dooaf_facade_session.record_from_context(
+        68.2,
+        {
+            **host._observation_context(),
+            "vehicle_heading_deg": 180.0,
+        },
+    )
+    host._lrf_lock_in_progress = True
+    host._pending_lrf_video_pick = type(
+        "_P", (), {"purpose": "dooaf_setup", "pick_role": "target"}
+    )()
+    assert host._facade_frozen_mark_uv(0.411, 0.686) is None
+
+
+def test_facade_session_freezes_gun_mark_when_idle() -> None:
     host = _FacadeFreezeHost()
     host._dooaf_facade_session.record_from_context(
         8.7,
@@ -95,7 +126,6 @@ def test_click_pin_holds_gun_mark_at_pick_uv_mid_range() -> None:
             "vehicle_heading_deg": 180.0,
         },
     )
-    # Stored gun mark at centre; track would project elsewhere if tracking ran.
     host._dooaf_setup_mark_track["gun"] = {
         "ref_uv": (0.5, 0.5),
         "ref_att": (17.0, -8.0),
