@@ -690,18 +690,16 @@ class SkydroidTopUdpAdapter:
         v_tol: float | None = None,
     ) -> bool:
         steep = self._align_steep_pitch_click(float(dpitch0))
-        if pitch_trusted:
-            pitch_axis_ok = abs(float(pitch_err)) <= float(pitch_tol)
-        elif steep:
-            # Never trust open-loop pitch counters on steep ground picks (C13 GAC pitch lies).
-            pitch_axis_ok = False
-        else:
-            pitch_axis_ok = float(pitch_open_sent) >= float(pitch_need_deg) * 0.88
-        if not pitch_axis_ok:
-            return False
         if steep and v_chk is not None and v_tol is not None:
-            return abs(float(v_chk) - 0.5) <= float(v_tol) * 1.35
-        return True
+            # C13 GAC pitch often reads 0° while the gimbal tilts — use screen v.
+            if abs(float(v_chk) - 0.5) <= float(v_tol) * 1.35:
+                return True
+            if pitch_trusted:
+                return abs(float(pitch_err)) <= float(pitch_tol)
+            return False
+        if pitch_trusted:
+            return abs(float(pitch_err)) <= float(pitch_tol)
+        return float(pitch_open_sent) >= float(pitch_need_deg) * 0.88
 
     def _align_ok_from_boresight_and_axes(
         self,
@@ -1314,20 +1312,15 @@ class SkydroidTopUdpAdapter:
                 spur = float(spd)
                 if pitch_trusted and abs(float(pitch_err)) < 6.0:
                     spur = min(spur, max(1.5, abs(float(pitch_err)) * 1.2))
-                steep_pitch = self._align_steep_pitch_click(float(dpitch0))
-                use_gap = pitch_need_deg >= float(_LRF_ALIGN_GAP_PITCH_MIN_DEG) and (
-                    not gap_pitch_sent
-                    or (
-                        steep_pitch
-                        and not pitch_trusted
-                        and abs(float(pitch_err)) > 2.5
-                    )
+                use_gap = (
+                    pitch_need_deg >= float(_LRF_ALIGN_GAP_PITCH_MIN_DEG)
+                    and not gap_pitch_sent
                 )
                 if use_gap or (
-                    not steep_pitch
-                    and not pitch_trusted
+                    not pitch_trusted
                     and pitch_need_deg >= 1.0
                     and not gap_pitch_sent
+                    and not self._align_steep_pitch_click(float(dpitch0))
                 ):
                     print(
                         f"[VGCS:lrf] align pitch GAP -> {pitch_tgt:.1f}° "
