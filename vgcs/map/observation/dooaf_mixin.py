@@ -664,6 +664,10 @@ class DooafOperationsMixin:
                 pick_role, float(video_x), float(video_y), label=label
             ):
                 return True
+            print(
+                "[VGCS:observe] facade uv pick geo failed — "
+                "falling back to LRF slew"
+            )
         if self._dooaf_lrf_geo_enabled():
             self._dooaf_setup_video_marks[pick_role] = (
                 float(video_x),
