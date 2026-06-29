@@ -68,7 +68,25 @@ class _FacadeFreezeHost(VideoMarkTrackingMixin):
         }
 
 
-def test_facade_session_freezes_dooaf_setup_mark_uv() -> None:
+def test_click_pin_holds_gun_mark_at_pick_uv_mid_range() -> None:
+    """67 m field log: mark must stay on click UV, not geo-project onto buildings."""
+    host = _PinHost((-2.6, -10.1))
+    stored = (0.334, 0.710)
+    track = {
+        "click_pin": True,
+        "pin_uv": stored,
+        "pin_ref_att": (-2.6, -10.1),
+        "ref_uv": stored,
+        "ref_att": (-16.27, 0.0),
+        "lrf_slew": True,
+        "lrf_slant_range_m": 67.0,
+        "geo_lat": 20.409824,
+        "geo_lon": 72.879738,
+    }
+    host._att = (-2.8, -10.0)
+    uv = host._tracked_uv_from_store(track, stored)
+    assert uv == stored
+
     host = _FacadeFreezeHost()
     host._dooaf_facade_session.record_from_context(
         8.7,
