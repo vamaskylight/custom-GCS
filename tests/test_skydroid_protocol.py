@@ -498,6 +498,43 @@ def test_steep_pitch_field_log_accepts_boresight_over_gac_yaw() -> None:
     assert abs(v_chk - 0.5) < 0.01
 
 
+def test_boresight_yaw_target_moves_click_toward_center() -> None:
+    """2026-06-29 field log: inverted GSY drove u 0.354 -> 0.016; GAY target must fix."""
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    att_start = (-20.48, 0.0)
+    click = (0.377, 0.908)
+    att_cur = (-22.0, -14.6)
+    u_before, _ = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        click, att_start, att_cur, clamp=False
+    )
+    yaw_tgt = adapter._yaw_target_for_boresight_u(float(att_cur[0]), float(u_before))
+    att_after = (float(yaw_tgt), float(att_cur[1]))
+    u_after, _ = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        click, att_start, att_after, clamp=False
+    )
+    assert abs(u_after - 0.5) < abs(u_before - 0.5)
+    assert abs(u_after - 0.5) < 0.02
+
+
+def test_steep_pitch_rejects_open_loop_pitch_ok() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    assert (
+        adapter._pitch_ok_for_align(
+            dpitch0=-19.0,
+            pitch_err=-12.0,
+            pitch_tol=0.55,
+            pitch_trusted=False,
+            pitch_open_sent=20.0,
+            pitch_need_deg=19.0,
+        )
+        is False
+    )
+
+
 def test_align_pitch_tol_tightens_for_large_click() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
