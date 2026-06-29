@@ -438,6 +438,41 @@ def test_large_horizontal_click_uses_boresight_authoritative() -> None:
     assert u_tol >= 0.044
 
 
+def test_target_pick_offset_uses_boresight_authoritative() -> None:
+    """2026-06-29 field log: TARGET click (0.566,0.418) dyaw=5.5° dpitch=-3.8° failed GAY refine."""
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    dyaw, dpitch = SkydroidTopUdpAdapter._pixel_boresight_offset_deg(725, 301)
+    assert abs(dyaw - 5.5) < 0.2
+    assert abs(dpitch + 3.8) < 0.2
+    assert SkydroidTopUdpAdapter._align_large_offset_click(dyaw, dpitch) is True
+    assert SkydroidTopUdpAdapter._align_boresight_authoritative(dyaw, dpitch) is True
+
+
+def test_target_field_log_yaw_overshoot_recentres_via_boresight_gsy() -> None:
+    """2026-06-29 TARGET fail: att -36.3° vs target -27.3°, click at u=0.392."""
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    att_start = (-21.81, -0.6)
+    click = (0.566, 0.418)
+    att_cur = (-36.34, 2.85)
+    u_before, v_before = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        click, att_start, att_cur, clamp=False
+    )
+    assert abs(u_before - 0.392) < 0.02
+    yaw_tgt_bf = adapter._yaw_target_for_boresight_u(float(att_cur[0]), float(u_before))
+    yaw_err_bf = SkydroidTopUdpAdapter._angle_err_deg(
+        float(yaw_tgt_bf), float(att_cur[0])
+    )
+    assert yaw_err_bf > 0.0
+    att_after = (float(yaw_tgt_bf), float(att_cur[1]))
+    u_after, _ = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        click, att_start, att_after, clamp=False
+    )
+    assert abs(u_after - 0.5) < abs(u_before - 0.5)
+
+
 def test_boresight_yaw_fixes_overshoot_from_static_gay() -> None:
     """Field log ended at u=0.541 after static GAY to -10°; boresight GAY should centre."""
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
