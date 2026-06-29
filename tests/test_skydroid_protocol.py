@@ -530,8 +530,23 @@ def test_steep_pitch_rejects_open_loop_pitch_ok() -> None:
             pitch_trusted=False,
             pitch_open_sent=20.0,
             pitch_need_deg=19.0,
+            v_chk=0.92,
+            v_tol=0.048,
         )
         is False
+    )
+    assert (
+        adapter._pitch_ok_for_align(
+            dpitch0=-19.0,
+            pitch_err=-12.0,
+            pitch_tol=0.55,
+            pitch_trusted=False,
+            pitch_open_sent=20.0,
+            pitch_need_deg=19.0,
+            v_chk=0.502,
+            v_tol=0.048,
+        )
+        is True
     )
 
 
