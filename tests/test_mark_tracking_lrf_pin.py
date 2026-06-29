@@ -107,7 +107,29 @@ def test_click_pin_holds_gun_mark_at_pick_uv_mid_range() -> None:
     assert host._tracked_uv_from_store(track, stored) == stored
 
 
-def test_facade_target_pin_stays_at_click_uv() -> None:
+def test_sync_lrf_lock_prefers_click_uv_over_boresight() -> None:
+    """Post-lock calibration sets _lrf_lock_uv to boresight — pin must stay at click."""
+    host = _PinHost((1.05, -9.47))
+    host._lrf_click_uv = (0.394, 0.731)
+    host._lrf_track_gac_h_scale = 1.236
+    host._lrf_track_gac_v_scale = 1.144
+    host._lrf_track_ref_att = (1.05, -9.47)
+    host._dooaf_setup_mark_track = {
+        "gun_origin": {
+            "ref_uv": (0.394, 0.731),
+            "ref_att": (-5.35, 0.0),
+            "lrf_slew": True,
+            "lrf_slant_range_m": 69.6,
+        }
+    }
+    host._dooaf_setup_video_marks = {"gun_origin": (0.394, 0.731)}
+    host._sync_dooaf_setup_track_from_lrf_lock(
+        "gun_origin", final_uv=(0.5, 0.5)
+    )
+    track = host._dooaf_setup_mark_track["gun_origin"]
+    assert track["pin_uv"] == (0.394, 0.731)
+    assert host._dooaf_setup_video_marks["gun_origin"] == (0.394, 0.731)
+
     """2026-06-29 16:26 — facade target at (0.575,0.243) must not geo-project off-screen."""
     host = _PinHost((-19.86, -7.86))
     stored = (0.575, 0.243)
