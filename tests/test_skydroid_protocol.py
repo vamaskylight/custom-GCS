@@ -577,6 +577,49 @@ def test_boresight_yaw_target_moves_click_toward_center() -> None:
     assert abs(u_after - 0.5) < 0.02
 
 
+def test_near_steep_pitch_ok_rejects_loose_v_gate() -> None:
+    """2026-06-29 19:39 field log: v=0.554 must not count as pitch_ok (was *1.35 bug)."""
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    u_tol, v_tol = SkydroidTopUdpAdapter._boresight_tol_for_click(
+        10.8, dyaw_image=-11.3
+    )
+    assert (
+        adapter._pitch_ok_for_align(
+            dpitch0=10.8,
+            pitch_err=-2.5,
+            pitch_tol=0.65,
+            pitch_trusted=True,
+            pitch_open_sent=10.0,
+            pitch_need_deg=10.8,
+            v_chk=0.554,
+            v_tol=v_tol,
+        )
+        is False
+    )
+    assert (
+        adapter._pitch_ok_for_align(
+            dpitch0=10.8,
+            pitch_err=-2.5,
+            pitch_tol=0.65,
+            pitch_trusted=True,
+            pitch_open_sent=10.0,
+            pitch_need_deg=10.8,
+            v_chk=0.502,
+            v_tol=v_tol,
+        )
+        is True
+    )
+
+
+def test_gsp_pitch_rate_for_boresight_v_below_centre_click() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    rate = SkydroidTopUdpAdapter._gsp_pitch_rate_for_boresight_v(0.554, 4.5)
+    assert rate != 0.0
+
+
 def test_steep_pitch_rejects_open_loop_pitch_ok() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 

@@ -708,6 +708,14 @@ class SkydroidTopUdpAdapter:
             float(att_yaw), self._click_image_yaw_offset_deg(float(u_chk))
         )
 
+    @staticmethod
+    def _gsp_pitch_rate_for_boresight_v(v_chk: float, spd: float) -> float:
+        """Screen v offset from centre → GSP rate to move click toward boresight."""
+        dpitch_img = (float(v_chk) - 0.5) * float(_LRF_FOV_V_DEG)
+        return SkydroidTopUdpAdapter._gsp_pitch_rate_for_image_offset(
+            float(dpitch_img), float(spd)
+        )
+
     def _pitch_ok_for_align(
         self,
         *,
@@ -722,16 +730,19 @@ class SkydroidTopUdpAdapter:
     ) -> bool:
         steep = self._align_steep_pitch_click(float(dpitch0))
         near_steep = abs(float(dpitch0)) >= 10.0
-        if (
-            (steep or near_steep)
-            and v_chk is not None
-            and v_tol is not None
-        ):
-            # C13 GAC pitch often reads 0° while the gimbal tilts — use screen v.
-            if abs(float(v_chk) - 0.5) <= float(v_tol) * 1.35:
+        screen_pitch = steep or near_steep or self._align_large_offset_click(
+            0.0, float(dpitch0)
+        )
+        if screen_pitch and v_chk is not None and v_tol is not None:
+            # C13 GAC pitch often lies — trust screen v for ground picks.
+            if abs(float(v_chk) - 0.5) <= float(v_tol):
                 return True
-            if pitch_trusted:
+            if pitch_trusted and not near_steep and not steep:
                 return abs(float(pitch_err)) <= float(pitch_tol)
+            return False
+        if abs(float(dpitch0)) >= 10.0:
+            if v_chk is not None and v_tol is not None:
+                return abs(float(v_chk) - 0.5) <= float(v_tol)
             return False
         if pitch_trusted:
             return abs(float(pitch_err)) <= float(pitch_tol)
@@ -926,6 +937,56 @@ class SkydroidTopUdpAdapter:
         time.sleep(float(settle))
         if finalize:
             self._gimbal_stop_hard()
+
+    def _refine_boresight_pitch_gsy(
+        self,
+        att: tuple[float, float],
+        click_u: float,
+        click_v: float,
+        att_start: tuple[float, float],
+        dpitch0: float,
+        dyaw0: float,
+        *,
+        spd: float = _LRF_ALIGN_SPEED_DPS,
+        max_passes: int = 2,
+    ) -> tuple[float, float]:
+        """Final screen-space pitch nudge when GAC pitch stops short of boresight."""
+        att_now = att
+        snap = float(_LRF_ALIGN_SNAP_MIN_DEG)
+        for _ in range(max(0, int(max_passes))):
+            _, u_bf, v_bf = self._verify_click_on_boresight(
+                float(click_u),
+                float(click_v),
+                att_start,
+                att_now,
+                dpitch_image=float(dpitch0),
+                dyaw_image=float(dyaw0),
+            )
+            _, v_tol = self._boresight_tol_for_click(
+                float(dpitch0), dyaw_image=float(dyaw0)
+            )
+            if abs(float(v_bf) - 0.5) <= float(v_tol):
+                break
+            spur = float(spd)
+            v_err_img = abs((float(v_bf) - 0.5) * float(_LRF_FOV_V_DEG))
+            if v_err_img < 6.0:
+                spur = min(spur, max(1.5, v_err_img * 1.15))
+            dur = min(
+                float(_LRF_GIMBAL_AXIS_MAX_S),
+                v_err_img / max(1.5, spur) * 0.95 + 0.10,
+            )
+            if v_err_img <= snap:
+                break
+            rate = self._gsp_pitch_rate_for_boresight_v(float(v_bf), spur)
+            print(
+                f"[VGCS:lrf] refine pitch boresight GSP at ({u_bf:.3f},{v_bf:.3f}) "
+                f"burst {rate:+.1f}°/s dur={dur:.2f}s"
+            )
+            self._hold_speed_direct_burst(0.0, rate, dur)
+            self._gimbal_stop_hard()
+            time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+            att_now = self._read_gimbal_attitude_deg() or att_now
+        return att_now
 
     def _refine_boresight_yaw_gsy(
         self,
@@ -1428,54 +1489,76 @@ class SkydroidTopUdpAdapter:
 
             if not pitch_ok:
                 spur = float(spd)
-                if pitch_trusted and abs(float(pitch_err)) < 6.0:
-                    spur = min(spur, max(1.5, abs(float(pitch_err)) * 1.2))
-                use_gap = (
-                    pitch_need_deg >= float(_LRF_ALIGN_GAP_PITCH_MIN_DEG)
-                    and not gap_pitch_sent
+                v_off = abs(float(v_pre) - 0.5)
+                use_bore_pitch = (
+                    self._align_boresight_authoritative(float(dyaw0), float(dpitch0))
+                    and v_off >= 0.010
                 )
-                if use_gap or (
-                    not pitch_trusted
-                    and pitch_need_deg >= 1.0
-                    and not gap_pitch_sent
-                    and not self._align_steep_pitch_click(float(dpitch0))
-                ):
-                    print(
-                        f"[VGCS:lrf] align pitch GAP -> {pitch_tgt:.1f}° "
-                        f"(need={pitch_need_deg:.1f}°)"
-                    )
-                    self._send_gap_pitch_direct(
-                        float(pitch_tgt),
-                        spur,
-                        att_pitch=float(att[1]),
-                    )
-                    gap_pitch_sent = True
-                    pitch_open_sent = max(
-                        pitch_open_sent, pitch_need_deg * 0.95
-                    )
-                else:
-                    if pitch_trusted:
-                        rate = self._gsp_pitch_rate_for_error(
-                            float(pitch_err), spur
-                        )
-                        need_d = abs(float(pitch_err))
-                    else:
-                        rate = self._gsp_pitch_rate_for_image_offset(
-                            float(dpitch0), spur
-                        )
-                        need_d = max(0.0, pitch_need_deg - pitch_open_sent)
+                if use_bore_pitch:
+                    if v_off < 6.0 * float(v_tol_pre) / max(0.032, float(v_tol_pre)):
+                        spur = min(spur, max(1.5, v_off * float(_LRF_FOV_V_DEG) * 0.5))
+                    v_err_img = abs((float(v_pre) - 0.5) * float(_LRF_FOV_V_DEG))
                     dur = min(
                         float(_LRF_GIMBAL_AXIS_MAX_S),
-                        need_d / max(1.5, spur) * 0.95 + 0.10,
+                        v_err_img / max(1.5, spur) * 0.95 + 0.10,
                     )
+                    rate = self._gsp_pitch_rate_for_boresight_v(float(v_pre), spur)
                     print(
-                        f"[VGCS:lrf] align pitch "
-                        f"{'err' if pitch_trusted else 'open'}="
-                        f"{pitch_err if pitch_trusted else pitch_need_deg - pitch_open_sent:+.1f}° "
+                        f"[VGCS:lrf] align pitch boresight GSP "
+                        f"at ({u_pre:.3f},{v_pre:.3f}) "
                         f"burst {rate:+.1f}°/s dur={dur:.2f}s"
                     )
                     self._hold_speed_direct_burst(0.0, rate, dur)
                     pitch_open_sent += spur * dur
+                else:
+                    if pitch_trusted and abs(float(pitch_err)) < 6.0:
+                        spur = min(spur, max(1.5, abs(float(pitch_err)) * 1.2))
+                    use_gap = (
+                        pitch_need_deg >= float(_LRF_ALIGN_GAP_PITCH_MIN_DEG)
+                        and not gap_pitch_sent
+                    )
+                    if use_gap or (
+                        not pitch_trusted
+                        and pitch_need_deg >= 1.0
+                        and not gap_pitch_sent
+                        and not self._align_steep_pitch_click(float(dpitch0))
+                    ):
+                        print(
+                            f"[VGCS:lrf] align pitch GAP -> {pitch_tgt:.1f}° "
+                            f"(need={pitch_need_deg:.1f}°)"
+                        )
+                        self._send_gap_pitch_direct(
+                            float(pitch_tgt),
+                            spur,
+                            att_pitch=float(att[1]),
+                        )
+                        gap_pitch_sent = True
+                        pitch_open_sent = max(
+                            pitch_open_sent, pitch_need_deg * 0.95
+                        )
+                    else:
+                        if pitch_trusted:
+                            rate = self._gsp_pitch_rate_for_error(
+                                float(pitch_err), spur
+                            )
+                            need_d = abs(float(pitch_err))
+                        else:
+                            rate = self._gsp_pitch_rate_for_image_offset(
+                                float(dpitch0), spur
+                            )
+                            need_d = max(0.0, pitch_need_deg - pitch_open_sent)
+                        dur = min(
+                            float(_LRF_GIMBAL_AXIS_MAX_S),
+                            need_d / max(1.5, spur) * 0.95 + 0.10,
+                        )
+                        print(
+                            f"[VGCS:lrf] align pitch "
+                            f"{'err' if pitch_trusted else 'open'}="
+                            f"{pitch_err if pitch_trusted else pitch_need_deg - pitch_open_sent:+.1f}° "
+                            f"burst {rate:+.1f}°/s dur={dur:.2f}s"
+                        )
+                        self._hold_speed_direct_burst(0.0, rate, dur)
+                        pitch_open_sent += spur * dur
             elif not yaw_ok:
                 spur = float(spd)
                 if abs(float(yaw_err)) < 6.0:
@@ -1544,7 +1627,21 @@ class SkydroidTopUdpAdapter:
                     )
                     self._hold_speed_direct_burst(rate, 0.0, dur)
             else:
-                break
+                bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
+                    click_u, click_v, att_start, att,
+                    dpitch_image=float(dpitch0),
+                    dyaw_image=float(dyaw0),
+                )
+                if bore_ok:
+                    print(
+                        f"[VGCS:lrf] align ok iter={n + 1} att={att} "
+                        f"verify=({u_chk:.3f},{v_chk:.3f})"
+                    )
+                    return att, True, float(dyaw0), float(dpitch0)
+                pitch_open_sent = min(
+                    float(pitch_open_sent), float(pitch_need_deg) * 0.45
+                )
+                gap_pitch_sent = False
 
             self._gimbal_stop_hard()
             time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
@@ -1570,6 +1667,15 @@ class SkydroidTopUdpAdapter:
             ),
         )
         if self._align_boresight_authoritative(float(dyaw0), float(dpitch0)):
+            att_end = self._refine_boresight_pitch_gsy(
+                att_end,
+                float(click_u),
+                float(click_v),
+                att_start,
+                float(dpitch0),
+                float(dyaw0),
+                spd=float(spd),
+            )
             att_end = self._refine_boresight_yaw_gsy(
                 att_end,
                 float(click_u),
