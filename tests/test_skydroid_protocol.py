@@ -460,7 +460,31 @@ def test_boresight_yaw_fixes_overshoot_from_static_gay() -> None:
     assert abs(u_after - 0.5) < 0.025
 
 
-def test_gac_pitch_untrusted_when_stuck_at_zero() -> None:
+def test_boresight_yaw_gsy_sign_for_left_of_center_click() -> None:
+    """2026-06-29 16:01 field log: u~0.40 needs positive GSY to centre (not repeat GAY)."""
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    att_start = (2.35, 1.65)
+    click = (0.412, 0.732)
+    att_cur = (5.12, -9.11)
+    u_before, _ = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        click, att_start, att_cur, clamp=False
+    )
+    assert u_before < 0.5
+    yaw_tgt_bf = adapter._yaw_target_for_boresight_u(float(att_cur[0]), float(u_before))
+    yaw_err_bf = SkydroidTopUdpAdapter._angle_err_deg(
+        float(yaw_tgt_bf), float(att_cur[0])
+    )
+    assert yaw_err_bf > 0.0
+    rate = SkydroidTopUdpAdapter._gsy_yaw_rate_for_offset(yaw_err_bf, 3.5)
+    assert rate != 0.0
+    att_after = (float(yaw_tgt_bf), float(att_cur[1]))
+    u_after, _ = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
+        click, att_start, att_after, clamp=False
+    )
+    assert abs(u_after - 0.5) < abs(u_before - 0.5)
+
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     assert SkydroidTopUdpAdapter._gac_pitch_trusted(0.0, 8.8) is False
