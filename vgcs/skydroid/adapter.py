@@ -721,7 +721,12 @@ class SkydroidTopUdpAdapter:
         v_tol: float | None = None,
     ) -> bool:
         steep = self._align_steep_pitch_click(float(dpitch0))
-        if steep and v_chk is not None and v_tol is not None:
+        near_steep = abs(float(dpitch0)) >= 10.0
+        if (
+            (steep or near_steep)
+            and v_chk is not None
+            and v_tol is not None
+        ):
             # C13 GAC pitch often reads 0° while the gimbal tilts — use screen v.
             if abs(float(v_chk) - 0.5) <= float(v_tol) * 1.35:
                 return True
@@ -922,6 +927,57 @@ class SkydroidTopUdpAdapter:
         if finalize:
             self._gimbal_stop_hard()
 
+    def _refine_boresight_yaw_gsy(
+        self,
+        att: tuple[float, float],
+        click_u: float,
+        click_v: float,
+        att_start: tuple[float, float],
+        dpitch0: float,
+        dyaw0: float,
+        *,
+        spd: float = _LRF_ALIGN_SPEED_DPS,
+        max_passes: int = 2,
+    ) -> tuple[float, float]:
+        """Final screen-space yaw nudge — C13 often ignores repeated GAY during LRF align."""
+        att_now = att
+        snap = float(_LRF_ALIGN_SNAP_MIN_DEG)
+        for _ in range(max(0, int(max_passes))):
+            _, u_bf, v_bf = self._verify_click_on_boresight(
+                float(click_u),
+                float(click_v),
+                att_start,
+                att_now,
+                dpitch_image=float(dpitch0),
+                dyaw_image=float(dyaw0),
+            )
+            u_tol, _ = self._boresight_tol_for_click(
+                float(dpitch0), dyaw_image=float(dyaw0)
+            )
+            if abs(float(u_bf) - 0.5) <= float(u_tol):
+                break
+            yaw_tgt_bf = self._yaw_target_for_boresight_u(float(att_now[0]), float(u_bf))
+            yaw_err_bf = self._angle_err_deg(float(yaw_tgt_bf), float(att_now[0]))
+            if abs(float(yaw_err_bf)) <= snap:
+                break
+            spur = float(spd)
+            if abs(float(yaw_err_bf)) < 6.0:
+                spur = min(spur, max(1.5, abs(float(yaw_err_bf)) * 1.15))
+            dur = min(
+                float(_LRF_GIMBAL_AXIS_MAX_S),
+                abs(float(yaw_err_bf)) / max(1.5, spur) * 0.95 + 0.10,
+            )
+            rate = self._gsy_yaw_rate_for_offset(float(yaw_err_bf), spur)
+            print(
+                f"[VGCS:lrf] refine yaw boresight GSY err={float(yaw_err_bf):+.1f}° "
+                f"at ({u_bf:.3f},{v_bf:.3f}) burst {rate:+.1f}°/s dur={dur:.2f}s"
+            )
+            self._hold_speed_direct_burst(rate, 0.0, dur)
+            self._gimbal_stop_hard()
+            time.sleep(_LRF_GIMBAL_SLEW_SETTLE_S)
+            att_now = self._read_gimbal_attitude_deg() or att_now
+        return att_now
+
     def _refine_align_axes(
         self,
         att: tuple[float, float],
@@ -931,6 +987,7 @@ class SkydroidTopUdpAdapter:
         dpitch_image: float,
         *,
         spd: float = _LRF_ALIGN_SPEED_DPS,
+        skip_yaw_gay: bool = False,
     ) -> tuple[float, float]:
         """Final GAY/GAP nudge when iterative bursts stop short of click."""
         att_now = self._read_gimbal_attitude_deg() or att
@@ -948,7 +1005,7 @@ class SkydroidTopUdpAdapter:
             att_now = self._read_gimbal_attitude_deg() or att_now
             pitch_err = self._angle_err_deg(float(pitch_tgt), float(att_now[1]))
         yaw_err = self._angle_err_deg(float(yaw_tgt), float(att_now[0]))
-        if abs(float(yaw_err)) > snap:
+        if not skip_yaw_gay and abs(float(yaw_err)) > snap:
             print(
                 f"[VGCS:lrf] refine yaw GAY {float(att_now[0]):.1f}° "
                 f"-> {float(yaw_tgt):.1f}° (err={float(yaw_err):+.1f}°)"
@@ -1441,15 +1498,24 @@ class SkydroidTopUdpAdapter:
                     and not large_off
                 )
                 if use_boresight_gay:
+                    spur = float(spd)
+                    if abs(float(yaw_err_bore)) < 6.0:
+                        spur = min(
+                            spur, max(1.5, abs(float(yaw_err_bore)) * 1.15)
+                        )
+                    dur = min(
+                        float(_LRF_GIMBAL_AXIS_MAX_S),
+                        abs(float(yaw_err_bore)) / max(1.5, spur) * 0.95 + 0.10,
+                    )
+                    rate = self._gsy_yaw_rate_for_offset(
+                        float(yaw_err_bore), spur
+                    )
                     print(
-                        f"[VGCS:lrf] align yaw boresight GAY -> {yaw_tgt_bore:.1f}° "
-                        f"at ({u_bore:.3f},{v_bore:.3f}) err={float(yaw_err_bore):+.1f}°"
+                        f"[VGCS:lrf] align yaw boresight GSY err={float(yaw_err_bore):+.1f}° "
+                        f"at ({u_bore:.3f},{v_bore:.3f}) "
+                        f"burst {rate:+.1f}°/s dur={dur:.2f}s"
                     )
-                    self._send_gay_yaw_direct(
-                        float(yaw_tgt_bore), spur, att_yaw=float(att[0])
-                    )
-                    gap_yaw_sent = True
-                    gay_attempts += 1
+                    self._hold_speed_direct_burst(rate, 0.0, dur)
                 elif use_gay:
                     if not gap_yaw_sent:
                         print(
@@ -1499,7 +1565,20 @@ class SkydroidTopUdpAdapter:
             float(dyaw0),
             float(dpitch0),
             spd=float(spd),
+            skip_yaw_gay=self._align_boresight_authoritative(
+                float(dyaw0), float(dpitch0)
+            ),
         )
+        if self._align_boresight_authoritative(float(dyaw0), float(dpitch0)):
+            att_end = self._refine_boresight_yaw_gsy(
+                att_end,
+                float(click_u),
+                float(click_v),
+                att_start,
+                float(dpitch0),
+                float(dyaw0),
+                spd=float(spd),
+            )
         aim_ok, u_chk, v_chk = self._align_ok_from_boresight_and_axes(
             att_end,
             yaw_tgt=float(yaw_tgt),
