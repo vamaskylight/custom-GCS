@@ -114,9 +114,9 @@ class VideoMarkTrackingMixin:
         glob_att = getattr(self, "_lrf_track_ref_att", None)
         if isinstance(glob_att, tuple):
             built["pin_ref_att"] = (float(glob_att[0]), float(glob_att[1]))
-        pin_src = final_uv
+        pin_src = getattr(self, "_lrf_click_uv", None)
         if pin_src is None:
-            pin_src = getattr(self, "_lrf_click_uv", None)
+            pin_src = final_uv
         if pin_src is None:
             pin_src = getattr(self, "_lrf_lock_uv", None)
         if isinstance(pin_src, tuple):

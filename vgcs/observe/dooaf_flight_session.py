@@ -89,7 +89,7 @@ class DooafFacadeSession:
         self,
         ctx: dict[str, Any],
         *,
-        max_gimbal_delta_deg: float = 4.0,
+        max_gimbal_delta_deg: float = 10.0,
         max_vehicle_shift_m: float = 4.0,
         max_age_s: float = 600.0,
     ) -> bool:
