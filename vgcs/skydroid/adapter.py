@@ -103,7 +103,8 @@ _LRF_SLR_JUMP_MIN_M = 12.0
 _LRF_BORESIGHT_TOL_U = 0.032
 _LRF_BORESIGHT_TOL_V = 0.040
 _LRF_ALIGN_STEEP_PITCH_DEG = 12.0
-_LRF_ALIGN_BORESIGHT_YAW_DEG = 6.0
+_LRF_ALIGN_BORESIGHT_YAW_DEG = 4.5
+_LRF_ALIGN_BORESIGHT_COMBINED_DEG = 5.0
 _LRF_ALIGN_MAX_GAY_RETRIES = 2
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.32
@@ -689,6 +690,11 @@ class SkydroidTopUdpAdapter:
         dyaw_image: float, dpitch_image: float
     ) -> bool:
         """Prefer screen-space verify over GAC axis residuals."""
+        need = SkydroidTopUdpAdapter._expected_offset_deg(
+            float(dyaw_image), float(dpitch_image)
+        )
+        if need >= float(_LRF_ALIGN_BORESIGHT_COMBINED_DEG):
+            return True
         return SkydroidTopUdpAdapter._align_steep_pitch_click(
             float(dpitch_image)
         ) or SkydroidTopUdpAdapter._align_large_offset_click(
@@ -1049,8 +1055,11 @@ class SkydroidTopUdpAdapter:
         *,
         spd: float = _LRF_ALIGN_SPEED_DPS,
         skip_yaw_gay: bool = False,
+        click_u: float | None = None,
+        click_v: float | None = None,
+        att_start: tuple[float, float] | None = None,
     ) -> tuple[float, float]:
-        """Final GAY/GAP nudge when iterative bursts stop short of click."""
+        """Final GAP / boresight GSY nudge when iterative bursts stop short of click."""
         att_now = self._read_gimbal_attitude_deg() or att
         snap = float(_LRF_ALIGN_SNAP_MIN_DEG)
         yaw_err = self._angle_err_deg(float(yaw_tgt), float(att_now[0]))
@@ -1066,7 +1075,24 @@ class SkydroidTopUdpAdapter:
             att_now = self._read_gimbal_attitude_deg() or att_now
             pitch_err = self._angle_err_deg(float(pitch_tgt), float(att_now[1]))
         yaw_err = self._angle_err_deg(float(yaw_tgt), float(att_now[0]))
-        if not skip_yaw_gay and abs(float(yaw_err)) > snap:
+        use_bore_yaw = (
+            click_u is not None
+            and click_v is not None
+            and att_start is not None
+            and (skip_yaw_gay or abs(float(yaw_err)) > snap)
+        )
+        if use_bore_yaw:
+            att_now = self._refine_boresight_yaw_gsy(
+                att_now,
+                float(click_u),
+                float(click_v),
+                att_start,
+                float(dpitch_image),
+                float(dyaw_image),
+                spd=float(spd),
+                max_passes=3,
+            )
+        elif not skip_yaw_gay and abs(float(yaw_err)) > snap:
             print(
                 f"[VGCS:lrf] refine yaw GAY {float(att_now[0]):.1f}° "
                 f"-> {float(yaw_tgt):.1f}° (err={float(yaw_err):+.1f}°)"
@@ -1422,6 +1448,10 @@ class SkydroidTopUdpAdapter:
                     float(dyaw0),
                     float(dpitch0),
                     spd=float(spd),
+                    skip_yaw_gay=bool(gap_yaw_sent),
+                    click_u=float(click_u),
+                    click_v=float(click_v),
+                    att_start=att_start,
                 )
                 att = self._read_gimbal_attitude_deg() or att
                 pitch_trusted = self._gac_pitch_trusted(float(att[1]), float(dpitch0))
@@ -1480,9 +1510,10 @@ class SkydroidTopUdpAdapter:
             yaw_ok = abs(float(yaw_err)) <= float(yaw_tol)
             if self._align_boresight_authoritative(float(dyaw0), float(dpitch0)) and pitch_ok:
                 yaw_ok = abs(float(u_pre) - 0.5) <= float(u_tol_pre)
-            if total_move >= float(move_cap):
+            net_move = self._gimbal_total_move_deg(att_start, att)
+            if net_move >= float(move_cap):
                 print(
-                    f"[VGCS:lrf] align stopped — total move {total_move:.1f}° "
+                    f"[VGCS:lrf] align stopped — net move {net_move:.1f}° "
                     f"(cap={move_cap:.0f}°)"
                 )
                 break
@@ -1662,29 +1693,31 @@ class SkydroidTopUdpAdapter:
             float(dyaw0),
             float(dpitch0),
             spd=float(spd),
-            skip_yaw_gay=self._align_boresight_authoritative(
-                float(dyaw0), float(dpitch0)
-            ),
+            skip_yaw_gay=bool(gap_yaw_sent),
+            click_u=float(click_u),
+            click_v=float(click_v),
+            att_start=att_start,
         )
-        if self._align_boresight_authoritative(float(dyaw0), float(dpitch0)):
-            att_end = self._refine_boresight_pitch_gsy(
-                att_end,
-                float(click_u),
-                float(click_v),
-                att_start,
-                float(dpitch0),
-                float(dyaw0),
-                spd=float(spd),
-            )
-            att_end = self._refine_boresight_yaw_gsy(
-                att_end,
-                float(click_u),
-                float(click_v),
-                att_start,
-                float(dpitch0),
-                float(dyaw0),
-                spd=float(spd),
-            )
+        att_end = self._refine_boresight_pitch_gsy(
+            att_end,
+            float(click_u),
+            float(click_v),
+            att_start,
+            float(dpitch0),
+            float(dyaw0),
+            spd=float(spd),
+            max_passes=2,
+        )
+        att_end = self._refine_boresight_yaw_gsy(
+            att_end,
+            float(click_u),
+            float(click_v),
+            att_start,
+            float(dpitch0),
+            float(dyaw0),
+            spd=float(spd),
+            max_passes=3,
+        )
         aim_ok, u_chk, v_chk = self._align_ok_from_boresight_and_axes(
             att_end,
             yaw_tgt=float(yaw_tgt),

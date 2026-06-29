@@ -322,6 +322,69 @@ class DooafOperationsMixin:
         video_x, video_y = float(pending.u), float(pending.v)
         pick_role = str(pending.pick_role or DOOAF_ROLE_INTENDED)
         if slant_m is None:
+            row: dict[str, object] = {
+                "kind": "video_mark",
+                "video_x_norm": video_x,
+                "video_y_norm": video_y,
+            }
+            row.update(self._observation_context())
+            self._enrich_observation_geo_reference(row)
+            lat_fb = row.get("target_lat")
+            lon_fb = row.get("target_lon")
+            if lat_fb is not None and lon_fb is not None:
+                print(
+                    "[VGCS:observe] LRF lock failed — using DEM/ray geo estimate "
+                    f"lat={float(lat_fb):.7f} lon={float(lon_fb):.7f}"
+                )
+                alt_raw = row.get("target_alt_m")
+                alt_m: float | None = None
+                if alt_raw is not None:
+                    try:
+                        alt_m = float(alt_raw)
+                    except (TypeError, ValueError):
+                        alt_m = None
+                self._append_lrf_fallback_warning(
+                    row,
+                    "LRF lock failed — position from DEM ray estimate",
+                )
+                cb = self._dooaf_pick_complete
+                mark_u, mark_v = float(video_x), float(video_y)
+                self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
+                self._register_dooaf_setup_mark_track(
+                    pick_role,
+                    ref_uv=(video_x, video_y),
+                    ref_att=getattr(self, "_lrf_click_att", None),
+                    lock_att=self._read_gimbal_attitude_pair(),
+                    used_lrf_slew=False,
+                    geo_lat=float(lat_fb),
+                    geo_lon=float(lon_fb),
+                    geo_alt_m=alt_m,
+                )
+                try:
+                    write_dooaf_setup_video_mark(
+                        self._dooaf_settings_store(),
+                        pick_role,
+                        mark_u,
+                        mark_v,
+                    )
+                except Exception:
+                    pass
+                self._schedule_video_marks_overlay_refresh()
+                self._end_dooaf_map_pick(restore_target_mode=True)
+                print(
+                    f"[VGCS:observe] dooaf video pick ok (DEM fallback) "
+                    f"lat={float(lat_fb):.7f} lon={float(lon_fb):.7f} "
+                    f"video=({mark_u:.3f},{mark_v:.3f})"
+                )
+                try:
+                    cb(float(lat_fb), float(lon_fb), alt_m)
+                except TypeError:
+                    cb(float(lat_fb), float(lon_fb))
+                self._set_status(
+                    f"DOOAF {pending.label} saved (DEM estimate) — "
+                    "confirm or re-pick with LRF for better accuracy"
+                )
+                return
             self._dooaf_video_pick_failed(
                 "LRF lock failed — gimbal aimed at click but rangefinder did not "
                 "confirm; retry the pick or choose a surface with a clear laser return"
