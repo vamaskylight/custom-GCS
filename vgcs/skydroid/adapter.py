@@ -103,6 +103,7 @@ _LRF_SLR_JUMP_MIN_M = 12.0
 _LRF_BORESIGHT_TOL_U = 0.032
 _LRF_BORESIGHT_TOL_V = 0.040
 _LRF_ALIGN_STEEP_PITCH_DEG = 12.0
+_LRF_ALIGN_BORESIGHT_YAW_DEG = 6.0
 _LRF_ALIGN_MAX_GAY_RETRIES = 2
 _LRF_GIMBAL_OVERSHOOT_FACTOR = 1.45
 _LRF_GIMBAL_SLEW_SETTLE_S = 0.32
@@ -634,35 +635,65 @@ class SkydroidTopUdpAdapter:
             return float(_LRF_ALIGN_YAW_TOL_DEG)
 
     @staticmethod
-    def _align_yaw_tol_for_click(dpitch_image: float) -> float:
-        """Yaw gate for click-to-aim; relax after large pitch slews (C13 yaw coupling)."""
+    def _align_yaw_tol_for_click(
+        dpitch_image: float, *, dyaw_image: float = 0.0
+    ) -> float:
+        """Yaw gate for click-to-aim; relax after large pitch or horizontal slews."""
         base = SkydroidTopUdpAdapter._align_yaw_tol_deg()
-        need = abs(float(dpitch_image))
-        if need < 8.0:
+        need_p = abs(float(dpitch_image))
+        need_y = abs(float(dyaw_image))
+        if need_p < 8.0 and need_y < 8.0:
             return base
-        if need >= 15.0:
-            extra = min(1.25, need * 0.045)
-        else:
-            extra = min(0.55, need * 0.028)
+        extra = 0.0
+        if need_p >= 15.0:
+            extra = max(extra, min(1.25, need_p * 0.045))
+        elif need_p >= 8.0:
+            extra = max(extra, min(0.55, need_p * 0.028))
+        if need_y >= 8.0:
+            extra = max(extra, min(1.0, need_y * 0.035))
         return max(base, min(2.0, base + extra))
 
     @staticmethod
-    def _boresight_tol_for_click(dpitch_image: float) -> tuple[float, float]:
-        """Screen-space verify tolerance; relax slightly after steep pitch slews."""
+    def _boresight_tol_for_click(
+        dpitch_image: float, *, dyaw_image: float = 0.0
+    ) -> tuple[float, float]:
+        """Screen-space verify tolerance; relax for offset ground picks."""
         u_tol = float(_LRF_BORESIGHT_TOL_U)
         v_tol = float(_LRF_BORESIGHT_TOL_V)
-        need = abs(float(dpitch_image))
-        if need >= 12.0:
+        need_p = abs(float(dpitch_image))
+        need_y = abs(float(dyaw_image))
+        if need_p >= 12.0 or need_y >= 8.0:
             u_tol = max(u_tol, 0.048)
             v_tol = max(v_tol, 0.048)
-        if need >= 18.0:
+        if need_p >= 18.0:
             u_tol = max(u_tol, 0.056)
+        if need_y >= 6.0:
+            u_tol = max(u_tol, 0.044)
         return u_tol, v_tol
 
     @staticmethod
     def _align_steep_pitch_click(dpitch_image: float) -> bool:
-        """Ground/near-nadir picks where GAC yaw diverges from image geometry."""
+        """Ground/near-nadir picks where GAC pitch diverges from image geometry."""
         return abs(float(dpitch_image)) >= float(_LRF_ALIGN_STEEP_PITCH_DEG)
+
+    @staticmethod
+    def _align_large_offset_click(dyaw_image: float, dpitch_image: float) -> bool:
+        """Clicks where GAC yaw coupling dominates (not only steep pitch)."""
+        return (
+            abs(float(dyaw_image)) >= float(_LRF_ALIGN_BORESIGHT_YAW_DEG)
+            or abs(float(dpitch_image)) >= float(_LRF_ALIGN_BORESIGHT_YAW_DEG)
+        )
+
+    @staticmethod
+    def _align_boresight_authoritative(
+        dyaw_image: float, dpitch_image: float
+    ) -> bool:
+        """Prefer screen-space verify over GAC axis residuals."""
+        return SkydroidTopUdpAdapter._align_steep_pitch_click(
+            float(dpitch_image)
+        ) or SkydroidTopUdpAdapter._align_large_offset_click(
+            float(dyaw_image), float(dpitch_image)
+        )
 
     @staticmethod
     def _click_image_yaw_offset_deg(u: float) -> float:
@@ -721,6 +752,7 @@ class SkydroidTopUdpAdapter:
             att_start,
             att_end or att_start,
             dpitch_image=float(dpitch0),
+            dyaw_image=float(dyaw0),
         )
         axis_ok = self._align_aim_satisfied(
             att_end,
@@ -730,11 +762,13 @@ class SkydroidTopUdpAdapter:
             pitch_open_sent_deg=float(pitch_open_sent),
             dyaw=float(dyaw0),
         )
-        if bore_ok and self._align_steep_pitch_click(float(dpitch0)):
+        if bore_ok and self._align_boresight_authoritative(
+            float(dyaw0), float(dpitch0)
+        ):
             if not axis_ok:
                 print(
                     f"[VGCS:lrf] align ok via boresight ({u_chk:.3f},{v_chk:.3f}) "
-                    f"— GAC axis residual ignored (steep pitch)"
+                    f"— GAC axis residual ignored (boresight-primary)"
                 )
             return True, float(u_chk), float(v_chk)
         if not bore_ok:
@@ -941,6 +975,7 @@ class SkydroidTopUdpAdapter:
         att_now: tuple[float, float],
         *,
         dpitch_image: float = 0.0,
+        dyaw_image: float = 0.0,
         gac_h_scale: float = 1.0,
         gac_v_scale: float = 1.0,
     ) -> tuple[bool, float, float]:
@@ -953,7 +988,9 @@ class SkydroidTopUdpAdapter:
             gac_v_scale=float(gac_v_scale),
             clamp=False,
         )
-        u_tol, v_tol = self._boresight_tol_for_click(float(dpitch_image))
+        u_tol, v_tol = self._boresight_tol_for_click(
+            float(dpitch_image), dyaw_image=float(dyaw_image)
+        )
         ok = (
             abs(float(u_chk) - 0.5) <= float(u_tol)
             and abs(float(v_chk) - 0.5) <= float(v_tol)
@@ -1009,10 +1046,13 @@ class SkydroidTopUdpAdapter:
         pitch_tgt: float,
         dpitch_image: float,
         *,
+        dyaw_image: float = 0.0,
         pitch_open_sent: float = 0.0,
         pitch_trusted: bool = True,
     ) -> bool:
-        yaw_tol = self._align_yaw_tol_for_click(float(dpitch_image))
+        yaw_tol = self._align_yaw_tol_for_click(
+            float(dpitch_image), dyaw_image=float(dyaw_image)
+        )
         pitch_tol = self._align_pitch_tol_deg(float(dpitch_image))
         yaw_err = abs(self._angle_err_deg(float(yaw_tgt), float(att[0])))
         if pitch_trusted:
@@ -1039,7 +1079,7 @@ class SkydroidTopUdpAdapter:
         """Strict post-align check — must be on target, not merely 'moved a bit'."""
         if att is None:
             return False
-        yaw_tol = self._align_yaw_tol_for_click(float(dpitch))
+        yaw_tol = self._align_yaw_tol_for_click(float(dpitch), dyaw_image=float(dyaw))
         pitch_tol = self._align_pitch_tol_deg(float(dpitch))
         yaw_err = abs(self._angle_err_deg(float(yaw_tgt), float(att[0])))
         pitch_err = abs(self._angle_err_deg(float(pitch_tgt), float(att[1])))
@@ -1066,7 +1106,9 @@ class SkydroidTopUdpAdapter:
         return True
 
     @staticmethod
-    def _align_move_cap_deg(need_deg: float) -> float:
+    def _align_move_cap_deg(
+        need_deg: float, *, dyaw: float = 0.0, dpitch: float = 0.0
+    ) -> float:
         try:
             base = float(
                 os.environ.get(
@@ -1083,6 +1125,10 @@ class SkydroidTopUdpAdapter:
             scaled = max(scaled, float(need) * 2.4 + 6.0)
         elif need >= 10.0:
             scaled = max(scaled, float(need) * 1.8 + 6.0)
+        scaled = max(
+            scaled,
+            abs(float(dyaw)) * 2.5 + abs(float(dpitch)) * 1.8 + 10.0,
+        )
         return min(
             float(_LRF_ALIGN_MAX_TOTAL_CAP_DEG),
             max(base, scaled),
@@ -1194,9 +1240,13 @@ class SkydroidTopUdpAdapter:
             gap_pitch_sent = True
             gap_yaw_sent = abs(float(dyaw0)) >= 2.5
             pitch_open_sent = pitch_need_deg * 0.85
-        yaw_tol = self._align_yaw_tol_for_click(float(dpitch0))
+        yaw_tol = self._align_yaw_tol_for_click(
+            float(dpitch0), dyaw_image=float(dyaw0)
+        )
         pitch_tol = self._align_pitch_tol_deg(float(dpitch0))
-        move_cap = self._align_move_cap_deg(float(need))
+        move_cap = self._align_move_cap_deg(
+            float(need), dyaw=float(dyaw0), dpitch=float(dpitch0)
+        )
         print(
             f"[VGCS:lrf] align laser px=({x_px},{y_px}) "
             f"-> ({yaw_tgt:.1f},{pitch_tgt:.1f}) "
@@ -1211,14 +1261,17 @@ class SkydroidTopUdpAdapter:
             yaw_err = self._angle_err_deg(yaw_tgt, att[0])
             pitch_err = self._angle_err_deg(pitch_tgt, att[1])
             pitch_trusted = self._gac_pitch_trusted(float(att[1]), float(dpitch0))
-            if self._align_steep_pitch_click(float(dpitch0)) and (
+            if self._align_boresight_authoritative(float(dyaw0), float(dpitch0)) and (
                 pitch_trusted or gap_pitch_sent
             ):
                 bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
                     click_u, click_v, att_start, att,
                     dpitch_image=float(dpitch0),
+                    dyaw_image=float(dyaw0),
                 )
-                u_tol, v_tol = self._boresight_tol_for_click(float(dpitch0))
+                u_tol, v_tol = self._boresight_tol_for_click(
+                    float(dpitch0), dyaw_image=float(dyaw0)
+                )
                 pitch_near = self._pitch_ok_for_align(
                     dpitch0=float(dpitch0),
                     pitch_err=float(pitch_err),
@@ -1240,6 +1293,7 @@ class SkydroidTopUdpAdapter:
                 float(yaw_tgt),
                 float(pitch_tgt),
                 float(dpitch0),
+                dyaw_image=float(dyaw0),
                 pitch_open_sent=float(pitch_open_sent),
                 pitch_trusted=bool(pitch_trusted),
             ):
@@ -1258,12 +1312,14 @@ class SkydroidTopUdpAdapter:
                     float(yaw_tgt),
                     float(pitch_tgt),
                     float(dpitch0),
+                    dyaw_image=float(dyaw0),
                     pitch_open_sent=float(pitch_open_sent),
                     pitch_trusted=bool(pitch_trusted),
                 ):
                     bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
                         click_u, click_v, att_start, att,
                         dpitch_image=float(dpitch0),
+                        dyaw_image=float(dyaw0),
                     )
                     if bore_ok:
                         yaw_e = self._angle_err_deg(float(yaw_tgt), float(att[0]))
@@ -1288,8 +1344,11 @@ class SkydroidTopUdpAdapter:
             _, u_pre, v_pre = self._verify_click_on_boresight(
                 click_u, click_v, att_start, att,
                 dpitch_image=float(dpitch0),
+                dyaw_image=float(dyaw0),
             )
-            u_tol_pre, v_tol_pre = self._boresight_tol_for_click(float(dpitch0))
+            u_tol_pre, v_tol_pre = self._boresight_tol_for_click(
+                float(dpitch0), dyaw_image=float(dyaw0)
+            )
             pitch_ok = self._pitch_ok_for_align(
                 dpitch0=float(dpitch0),
                 pitch_err=float(pitch_err),
@@ -1301,6 +1360,8 @@ class SkydroidTopUdpAdapter:
                 v_tol=float(v_tol_pre),
             )
             yaw_ok = abs(float(yaw_err)) <= float(yaw_tol)
+            if self._align_boresight_authoritative(float(dyaw0), float(dpitch0)) and pitch_ok:
+                yaw_ok = abs(float(u_pre) - 0.5) <= float(u_tol_pre)
             if total_move >= float(move_cap):
                 print(
                     f"[VGCS:lrf] align stopped — total move {total_move:.1f}° "
@@ -1365,23 +1426,19 @@ class SkydroidTopUdpAdapter:
                 _, u_bore, v_bore = self._verify_click_on_boresight(
                     click_u, click_v, att_start, att,
                     dpitch_image=float(dpitch0),
+                    dyaw_image=float(dyaw0),
                 )
                 yaw_tgt_bore = self._yaw_target_for_boresight_u(float(att[0]), float(u_bore))
                 yaw_err_bore = self._angle_err_deg(float(yaw_tgt_bore), float(att[0]))
-                use_boresight_gay = (
-                    self._align_steep_pitch_click(float(dpitch0))
-                    and pitch_ok
-                    and abs(float(yaw_err_bore)) >= 0.35
-                    and (gap_yaw_sent or gay_attempts >= _LRF_ALIGN_MAX_GAY_RETRIES)
-                )
+                u_off = abs(float(u_bore) - 0.5)
+                large_off = self._align_large_offset_click(float(dyaw0), float(dpitch0))
+                use_boresight_gay = pitch_ok and u_off >= 0.010
                 use_gay = (
                     not use_boresight_gay
                     and gay_attempts < _LRF_ALIGN_MAX_GAY_RETRIES
-                    and (
-                        gap_yaw_sent
-                        or abs(float(dyaw0)) >= 1.5
-                        or (pitch_trusted and abs(float(yaw_err)) >= 0.8)
-                    )
+                    and not gap_yaw_sent
+                    and abs(float(dyaw0)) >= 1.5
+                    and not large_off
                 )
                 if use_boresight_gay:
                     print(
