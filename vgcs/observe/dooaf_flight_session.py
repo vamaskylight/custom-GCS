@@ -132,12 +132,9 @@ class DooafFacadeSession:
         lock = self._lock
         if lock is None:
             return GeoReferenceResult(ok=False, warning="no facade lock", method="none")
-        use_ctx = ctx or {}
-        gy = use_ctx.get("gimbal_yaw_deg")
-        gp = use_ctx.get("gimbal_pitch_deg")
-        # UV picks assume gimbal still at lock attitude (validated by uv_pick_valid).
-        g_yaw = float(lock.gimbal_yaw_deg) if gy is None else float(gy)
-        g_pitch = float(lock.gimbal_pitch_deg) if gp is None else float(gp)
+        # Facade UV geo always uses the LRF-lock gimbal pose — not live GAC (yaw lags in LOITER).
+        g_yaw = float(lock.gimbal_yaw_deg)
+        g_pitch = float(lock.gimbal_pitch_deg)
         return compute_lrf_slant_geo(
             vehicle_lat=lock.vehicle_lat,
             vehicle_lon=lock.vehicle_lon,
