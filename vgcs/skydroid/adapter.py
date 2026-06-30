@@ -108,6 +108,7 @@ _LRF_BORESIGHT_TOL_V = 0.018
 # Final LRF lock / DOOAF pick — click world point must be this close to frame centre.
 _LRF_BORESIGHT_LOCK_TOL_U = 0.016
 _LRF_BORESIGHT_LOCK_TOL_V = 0.018
+_LRF_BORESIGHT_NEAR_LOCK_U = 0.055
 _LRF_ALIGN_STEEP_PITCH_DEG = 12.0
 _LRF_ALIGN_BORESIGHT_YAW_DEG = 4.5
 _LRF_ALIGN_BORESIGHT_COMBINED_DEG = 5.0
@@ -673,6 +674,36 @@ class SkydroidTopUdpAdapter:
         return (float(_LRF_BORESIGHT_TOL_U), float(_LRF_BORESIGHT_TOL_V))
 
     @staticmethod
+    def _boresight_near_lock_u_tol(
+        dpitch_image: float, *, dyaw_image: float = 0.0
+    ) -> float:
+        """Extra yaw slack when pitch is on boresight but C13 GAC yaw lags screen space."""
+        _ = dpitch_image, dyaw_image
+        return float(_LRF_BORESIGHT_NEAR_LOCK_U)
+
+    @staticmethod
+    def _boresight_near_lock_ok(
+        u_chk: float,
+        v_chk: float,
+        *,
+        dpitch_image: float,
+        dyaw_image: float = 0.0,
+    ) -> bool:
+        lock_u, lock_v = SkydroidTopUdpAdapter._boresight_tol_for_click(
+            float(dpitch_image), dyaw_image=float(dyaw_image), for_lock=True
+        )
+        u_off = abs(float(u_chk) - 0.5)
+        v_off = abs(float(v_chk) - 0.5)
+        if u_off <= float(lock_u) and v_off <= float(lock_v):
+            return True
+        if v_off > float(lock_v):
+            return False
+        near_u = SkydroidTopUdpAdapter._boresight_near_lock_u_tol(
+            float(dpitch_image), dyaw_image=float(dyaw_image)
+        )
+        return u_off <= float(near_u)
+
+    @staticmethod
     def _align_steep_pitch_click(dpitch_image: float) -> bool:
         """Ground/near-nadir picks where GAC pitch diverges from image geometry."""
         return abs(float(dpitch_image)) >= float(_LRF_ALIGN_STEEP_PITCH_DEG)
@@ -793,6 +824,22 @@ class SkydroidTopUdpAdapter:
                     f"[VGCS:lrf] align ok via boresight ({u_chk:.3f},{v_chk:.3f}) "
                     f"— GAC axis residual ignored (boresight-primary)"
                 )
+            return True, float(u_chk), float(v_chk)
+        if (
+            not bore_ok
+            and self._align_boresight_authoritative(float(dyaw0), float(dpitch0))
+            and self._boresight_near_lock_ok(
+                float(u_chk),
+                float(v_chk),
+                dpitch_image=float(dpitch0),
+                dyaw_image=float(dyaw0),
+            )
+        ):
+            print(
+                f"[VGCS:lrf] align ok near-lock ({u_chk:.3f},{v_chk:.3f}) "
+                f"— pitch on boresight, yaw within "
+                f"{self._boresight_near_lock_u_tol(float(dpitch0), dyaw_image=float(dyaw0)):.3f}"
+            )
             return True, float(u_chk), float(v_chk)
         if not bore_ok:
             print(
@@ -1010,7 +1057,6 @@ class SkydroidTopUdpAdapter:
     ) -> tuple[float, float]:
         """Final screen-space yaw nudge — C13 often ignores repeated GAY during LRF align."""
         att_now = att
-        snap = float(_LRF_ALIGN_SNAP_MIN_DEG)
         for _ in range(max(0, int(max_passes))):
             _, u_bf, v_bf = self._verify_click_on_boresight(
                 float(click_u),
@@ -1020,15 +1066,24 @@ class SkydroidTopUdpAdapter:
                 dpitch_image=float(dpitch0),
                 dyaw_image=float(dyaw0),
             )
-            u_tol, _ = self._boresight_tol_for_click(
-                float(dpitch0), dyaw_image=float(dyaw0)
+            lock_u, lock_v = self._boresight_tol_for_click(
+                float(dpitch0), dyaw_image=float(dyaw0), for_lock=True
             )
-            if abs(float(u_bf) - 0.5) <= float(u_tol):
+            if (
+                abs(float(u_bf) - 0.5) <= float(lock_u)
+                and abs(float(v_bf) - 0.5) <= float(lock_v)
+            ):
                 break
-            yaw_tgt_bf = self._yaw_target_for_boresight_u(float(att_now[0]), float(u_bf))
-            yaw_err_bf = self._angle_err_deg(float(yaw_tgt_bf), float(att_now[0]))
-            if abs(float(yaw_err_bf)) <= snap:
+            if self._boresight_near_lock_ok(
+                float(u_bf),
+                float(v_bf),
+                dpitch_image=float(dpitch0),
+                dyaw_image=float(dyaw0),
+            ):
                 break
+            u_off = float(u_bf) - 0.5
+            dyaw_img = u_off * float(_LRF_FOV_H_DEG)
+            yaw_err_bf = float(dyaw_img)
             spur = float(spd)
             if abs(float(yaw_err_bf)) < 6.0:
                 spur = min(spur, max(1.5, abs(float(yaw_err_bf)) * 1.15))
@@ -1732,7 +1787,7 @@ class SkydroidTopUdpAdapter:
             float(dpitch0),
             float(dyaw0),
             spd=float(spd),
-            max_passes=3,
+            max_passes=5,
         )
         aim_ok, u_chk, v_chk = self._align_ok_from_boresight_and_axes(
             att_end,
