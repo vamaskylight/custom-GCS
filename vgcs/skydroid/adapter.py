@@ -100,8 +100,11 @@ _LRF_SLR_DEST_SYSTEM = "D"
 _LRF_SLR_DIVERGE_WARN_M = 2.0
 _LRF_SLR_JUMP_RATIO_MAX = 2.5
 _LRF_SLR_JUMP_MIN_M = 12.0
-_LRF_BORESIGHT_TOL_U = 0.032
-_LRF_BORESIGHT_TOL_V = 0.040
+_LRF_BORESIGHT_TOL_U = 0.016
+_LRF_BORESIGHT_TOL_V = 0.018
+# Final LRF lock / DOOAF pick — click world point must be this close to frame centre.
+_LRF_BORESIGHT_LOCK_TOL_U = 0.016
+_LRF_BORESIGHT_LOCK_TOL_V = 0.018
 _LRF_ALIGN_STEEP_PITCH_DEG = 12.0
 _LRF_ALIGN_BORESIGHT_YAW_DEG = 4.5
 _LRF_ALIGN_BORESIGHT_COMBINED_DEG = 5.0
@@ -656,21 +659,15 @@ class SkydroidTopUdpAdapter:
 
     @staticmethod
     def _boresight_tol_for_click(
-        dpitch_image: float, *, dyaw_image: float = 0.0
+        dpitch_image: float, *, dyaw_image: float = 0.0, for_lock: bool = False
     ) -> tuple[float, float]:
-        """Screen-space verify tolerance; relax for offset ground picks."""
-        u_tol = float(_LRF_BORESIGHT_TOL_U)
-        v_tol = float(_LRF_BORESIGHT_TOL_V)
-        need_p = abs(float(dpitch_image))
-        need_y = abs(float(dyaw_image))
-        if need_p >= 12.0 or need_y >= 8.0:
-            u_tol = max(u_tol, 0.048)
-            v_tol = max(v_tol, 0.048)
-        if need_p >= 18.0:
-            u_tol = max(u_tol, 0.056)
-        if need_y >= 6.0:
-            u_tol = max(u_tol, 0.044)
-        return u_tol, v_tol
+        """Screen-space verify tolerance (strict — loose tolerances caused false 'align ok')."""
+        if for_lock:
+            return (
+                float(_LRF_BORESIGHT_LOCK_TOL_U),
+                float(_LRF_BORESIGHT_LOCK_TOL_V),
+            )
+        return (float(_LRF_BORESIGHT_TOL_U), float(_LRF_BORESIGHT_TOL_V))
 
     @staticmethod
     def _align_steep_pitch_click(dpitch_image: float) -> bool:
@@ -775,6 +772,7 @@ class SkydroidTopUdpAdapter:
             att_end or att_start,
             dpitch_image=float(dpitch0),
             dyaw_image=float(dyaw0),
+            for_lock=True,
         )
         axis_ok = self._align_aim_satisfied(
             att_end,
@@ -796,7 +794,8 @@ class SkydroidTopUdpAdapter:
         if not bore_ok:
             print(
                 f"[VGCS:lrf] align verify fail — click at ({u_chk:.3f},{v_chk:.3f}) "
-                f"not boresight after slew"
+                f"not boresight after slew "
+                f"(need 0.500±{self._boresight_tol_for_click(float(dpitch0), dyaw_image=float(dyaw0), for_lock=True)[0]:.3f})"
             )
         return bool(axis_ok and bore_ok), float(u_chk), float(v_chk)
 
@@ -1122,6 +1121,7 @@ class SkydroidTopUdpAdapter:
         dyaw_image: float = 0.0,
         gac_h_scale: float = 1.0,
         gac_v_scale: float = 1.0,
+        for_lock: bool = False,
     ) -> tuple[bool, float, float]:
         """True when the clicked world point reprojects to frame centre at att_now."""
         u_chk, v_chk = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
@@ -1133,7 +1133,9 @@ class SkydroidTopUdpAdapter:
             clamp=False,
         )
         u_tol, v_tol = self._boresight_tol_for_click(
-            float(dpitch_image), dyaw_image=float(dyaw_image)
+            float(dpitch_image),
+            dyaw_image=float(dyaw_image),
+            for_lock=bool(for_lock),
         )
         ok = (
             abs(float(u_chk) - 0.5) <= float(u_tol)
@@ -1511,12 +1513,23 @@ class SkydroidTopUdpAdapter:
             if self._align_boresight_authoritative(float(dyaw0), float(dpitch0)) and pitch_ok:
                 yaw_ok = abs(float(u_pre) - 0.5) <= float(u_tol_pre)
             net_move = self._gimbal_total_move_deg(att_start, att)
+            u_off = abs(float(u_pre) - 0.5)
+            v_off = abs(float(v_pre) - 0.5)
+            lock_u_tol, lock_v_tol = self._boresight_tol_for_click(
+                float(dpitch0), dyaw_image=float(dyaw0), for_lock=True
+            )
+            still_off_boresight = (
+                u_off > float(lock_u_tol) or v_off > float(lock_v_tol)
+            )
             if net_move >= float(move_cap):
-                print(
-                    f"[VGCS:lrf] align stopped — net move {net_move:.1f}° "
-                    f"(cap={move_cap:.0f}°)"
-                )
-                break
+                if still_off_boresight and net_move < float(move_cap) * 1.25:
+                    pass  # keep correcting — do not stop while click is still off-centre
+                else:
+                    print(
+                        f"[VGCS:lrf] align stopped — net move {net_move:.1f}° "
+                        f"(cap={move_cap:.0f}°) verify=({u_pre:.3f},{v_pre:.3f})"
+                    )
+                    break
 
             if not pitch_ok:
                 spur = float(spd)

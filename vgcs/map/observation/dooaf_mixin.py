@@ -429,6 +429,25 @@ class DooafOperationsMixin:
         slew_locked = slant_m is not None and click_att is not None
         used_lrf_slew = bool(used_lrf or slew_locked)
         mark_u, mark_v = float(video_x), float(video_y)
+        display_uv: tuple[float, float] | None = None
+        if used_lrf and lat is not None and lon is not None:
+            proj = self._project_geo_to_video_norm(
+                float(lat), float(lon), alt_m=alt_m
+            )
+            if proj is not None:
+                display_uv = (float(proj[0]), float(proj[1]))
+                mark_u, mark_v = display_uv
+                print(
+                    f"[VGCS:observe] mark overlay at ({mark_u:.3f},{mark_v:.3f}) "
+                    f"from LRF geo (operator click was {video_x:.3f},{video_y:.3f})"
+                )
+            else:
+                display_uv = (0.5, 0.5)
+                mark_u, mark_v = display_uv
+                print(
+                    "[VGCS:observe] mark overlay at boresight (0.500,0.500) — "
+                    f"click was ({video_x:.3f},{video_y:.3f})"
+                )
         self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
         self._register_dooaf_setup_mark_track(
             pick_role,
@@ -440,6 +459,7 @@ class DooafOperationsMixin:
             geo_lon=float(lon),
             geo_alt_m=alt_m,
             lrf_slant_range_m=float(slant_m) if slant_m is not None else None,
+            display_uv=display_uv,
         )
         try:
             write_dooaf_setup_video_mark(

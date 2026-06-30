@@ -435,7 +435,7 @@ def test_large_horizontal_click_uses_boresight_authoritative() -> None:
     assert SkydroidTopUdpAdapter._align_large_offset_click(-10.8, 7.2) is True
     assert SkydroidTopUdpAdapter._align_boresight_authoritative(-10.8, 7.2) is True
     u_tol, _ = SkydroidTopUdpAdapter._boresight_tol_for_click(7.2, dyaw_image=-10.8)
-    assert u_tol >= 0.044
+    assert u_tol <= 0.020
 
 
 def test_target_pick_offset_uses_boresight_authoritative() -> None:
@@ -560,12 +560,43 @@ def test_align_move_cap_scales_for_steep_ground_pick() -> None:
     assert cap >= 50.0
 
 
-def test_boresight_tol_relaxes_for_steep_ground_pick() -> None:
+def test_gun_field_log_rejects_loose_boresight_accept() -> None:
+    """2026-06-30 field log: align ok at verify=(0.453,0.536) must not pass strict lock."""
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    adapter = SkydroidTopUdpAdapter()
+    att_start = (-46.87, 0.0)
+    click = (0.296, 0.740)
+    att_end = (-33.75, -9.6)
+    ok, u_chk, v_chk = adapter._verify_click_on_boresight(
+        click[0],
+        click[1],
+        att_start,
+        att_end,
+        dpitch_image=11.3,
+        dyaw_image=-17.1,
+        for_lock=True,
+    )
+    assert abs(u_chk - 0.453) < 0.02
+    assert ok is False
+
+
+def test_boresight_tol_strict_for_lock() -> None:
+    from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
+
+    u_tol, v_tol = SkydroidTopUdpAdapter._boresight_tol_for_click(
+        18.6, dyaw_image=-17.1, for_lock=True
+    )
+    assert u_tol <= 0.018
+    assert v_tol <= 0.018
+
+
+def test_boresight_tol_strict_not_loose_for_steep_ground_pick() -> None:
     from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
     u_tol, v_tol = SkydroidTopUdpAdapter._boresight_tol_for_click(18.6)
-    assert u_tol >= 0.056
-    assert v_tol >= 0.048
+    assert u_tol <= 0.020
+    assert v_tol <= 0.020
 
 
 def test_steep_pitch_field_log_accepts_boresight_over_gac_yaw() -> None:

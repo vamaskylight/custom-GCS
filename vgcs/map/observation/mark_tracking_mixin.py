@@ -111,6 +111,8 @@ class VideoMarkTrackingMixin:
             return
         built["h_scale"] = h_scale
         built["v_scale"] = v_scale
+        if built.get("lrf_boresight_geo"):
+            return
         glob_att = getattr(self, "_lrf_track_ref_att", None)
         if isinstance(glob_att, tuple):
             built["pin_ref_att"] = (float(glob_att[0]), float(glob_att[1]))
@@ -170,10 +172,14 @@ class VideoMarkTrackingMixin:
         geo_lon: float | None = None,
         geo_alt_m: float | None = None,
         lrf_slant_range_m: float | None = None,
+        display_uv: tuple[float, float] | None = None,
     ) -> None:
         """Remember gimbal attitude at pick so marks stay on the world point when camera moves."""
+        track_ref_uv = ref_uv
+        if used_lrf_slew and display_uv is not None:
+            track_ref_uv = (float(display_uv[0]), float(display_uv[1]))
         built = self._build_video_mark_track(
-            ref_uv,
+            track_ref_uv,
             ref_att,
             lock_att,
             used_lrf_slew=used_lrf_slew,
@@ -201,21 +207,33 @@ class VideoMarkTrackingMixin:
             built.pop(sk, None)
         self._attach_lock_vehicle_pose_to_track(built)
         pin_att = lock_att if isinstance(lock_att, tuple) else ref_att
-        if used_lrf_slew or facade_uv_pick:
+        lrf_geo_mark = bool(
+            used_lrf_slew and geo_lat is not None and geo_lon is not None
+        )
+        if facade_uv_pick:
             ref_pin = built.get("ref_uv")
             if isinstance(ref_pin, tuple):
                 built["pin_uv"] = (float(ref_pin[0]), float(ref_pin[1]))
                 built["click_pin"] = True
-            if facade_uv_pick:
-                built["facade_uv_pick"] = True
+            built["facade_uv_pick"] = True
             if isinstance(pin_att, tuple):
                 built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
-            if lrf_slant_range_m is not None:
-                try:
-                    if float(lrf_slant_range_m) < _NEAR_FIELD_LRF_PIN_SLANT_M:
-                        built["near_field_pin"] = True
-                except (TypeError, ValueError):
-                    pass
+        elif used_lrf_slew and not lrf_geo_mark:
+            ref_pin = built.get("ref_uv")
+            if isinstance(ref_pin, tuple):
+                built["pin_uv"] = (float(ref_pin[0]), float(ref_pin[1]))
+                built["click_pin"] = True
+            if isinstance(pin_att, tuple):
+                built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
+        elif lrf_geo_mark:
+            # LRF range is along boresight — overlay tracks geo, not raw click UV.
+            built["lrf_boresight_geo"] = True
+        if used_lrf_slew and lrf_slant_range_m is not None:
+            try:
+                if float(lrf_slant_range_m) < _NEAR_FIELD_LRF_PIN_SLANT_M:
+                    built["near_field_pin"] = True
+            except (TypeError, ValueError):
+                pass
         self._dooaf_setup_mark_track[key] = built
         self._sync_video_mark_track_timer()
 
@@ -248,7 +266,11 @@ class VideoMarkTrackingMixin:
 
     def _mark_track_use_geo_projection(self, track: dict[str, object]) -> bool:
         """Use geo when no LRF slew, clearly airborne, or when the aircraft has moved since lock."""
-        if track.get("click_pin") or track.get("facade_uv_pick"):
+        if track.get("facade_uv_pick"):
+            return False
+        if track.get("lrf_boresight_geo"):
+            return True
+        if track.get("click_pin"):
             return False
         from vgcs.observe.geo_reference import should_project_lrf_mark_via_geo
 
