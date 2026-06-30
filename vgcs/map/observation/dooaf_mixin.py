@@ -749,7 +749,11 @@ class DooafOperationsMixin:
             return True
         pick_role = str(getattr(self, "_dooaf_pick_role", "") or DOOAF_ROLE_INTENDED)
         label = dooaf_role_display(pick_role)
-        if self._dooaf_lrf_geo_enabled() and self._dooaf_facade_uv_pick_ready():
+        if (
+            self._dooaf_lrf_geo_enabled()
+            and pick_role != DOOAF_ROLE_GUN
+            and self._dooaf_facade_uv_pick_ready()
+        ):
             if self._complete_dooaf_setup_facade_uv_pick(
                 pick_role, float(video_x), float(video_y), label=label
             ):
