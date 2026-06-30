@@ -996,14 +996,14 @@ def dooaf_export_blockers(
                 )
                 video_far = abs(float(gx) - float(tx)) > 0.10
                 skyline_band = float(ty) < 0.58 and float(gy) < 0.65
-                if video_far and skyline_band and sep_m < 50.0:
+                if video_far and skyline_band and sep_m < 8.0:
                     warnings.append(
                         "Gun and target look far apart in video but map distance is only "
                         f"{sep_m:.0f} m — distant hillside / skyline picks cannot be ranged "
                         "accurately from video alone. Place gun and target with map picks "
                         "(or survey coordinates) for reliable fire distance."
                     )
-                elif sep_m < 15.0 and video_far:
+                elif sep_m < 8.0 and video_far:
                     warnings.append(
                         "Gun and target are only "
                         f"{sep_m:.0f} m apart on the map but video picks are far apart — "
