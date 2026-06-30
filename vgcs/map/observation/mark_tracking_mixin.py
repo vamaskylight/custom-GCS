@@ -14,7 +14,10 @@ from vgcs.observe.target_measure import haversine_m
 # GPS geo projection jitters; pin the overlay until the gimbal pans meaningfully.
 _NEAR_FIELD_LRF_PIN_SLANT_M = 25.0
 _LRF_MARK_PIN_ATT_DEADBAND_DEG = 1.25
-_DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = 2.0
+# C13 GAC yaw often settles 4–8° after lock without operator input — keep the
+# mark frozen until the operator pans deliberately.
+_DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG = 8.0
+_DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
 
 
 class VideoMarkTrackingMixin:
@@ -113,6 +116,9 @@ class VideoMarkTrackingMixin:
         built["h_scale"] = h_scale
         built["v_scale"] = v_scale
         if built.get("lrf_boresight_geo"):
+            cur = self._current_gimbal_attitude_pair()
+            if cur is not None:
+                built["pin_ref_att"] = (float(cur[0]), float(cur[1]))
             return
         glob_att = getattr(self, "_lrf_track_ref_att", None)
         if isinstance(glob_att, tuple):
@@ -281,7 +287,7 @@ class VideoMarkTrackingMixin:
         if track.get("facade_uv_pick"):
             return False
         if track.get("lrf_boresight_geo"):
-            return True
+            return False
         if track.get("click_pin"):
             return False
         from vgcs.observe.geo_reference import should_project_lrf_mark_via_geo
@@ -773,9 +779,33 @@ class VideoMarkTrackingMixin:
         dyaw, dpitch = self._gimbal_att_delta_deg(lock_att, cur)
         return dyaw >= float(deadband_deg) or dpitch >= float(deadband_deg)
 
+    def _dooaf_mark_pan_track_active(
+        self,
+        track: dict[str, object],
+        *,
+        deadband_deg: float = _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG,
+    ) -> bool:
+        """True when the operator has panned the gimbal away from the lock pose."""
+        return self._gimbal_moved_since_mark_lock(track, deadband_deg=deadband_deg)
+
+    def _dooaf_mark_attitude_display_uv(
+        self, track: dict[str, object], stored_uv: tuple[float, float]
+    ) -> tuple[float, float] | None:
+        att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
+        if att_uv is None:
+            return None
+        u, v = float(att_uv[0]), float(att_uv[1])
+        if self._mark_uv_on_screen(u, v):
+            return (u, v)
+        return None
+
     def _dooaf_mark_geo_track_active(self, track: dict[str, object]) -> bool:
         """World-anchor overlay once the operator pans away from the lock pose."""
         if track.get("geo_lat") is None or track.get("geo_lon") is None:
+            return False
+        # Boresight / facade picks share one slant plane — attitude track is stable;
+        # live GPS geo projection jitters when GAC yaw settles after lock.
+        if track.get("lrf_boresight_geo") or track.get("facade_uv_pick"):
             return False
         return self._gimbal_moved_since_mark_lock(track)
 
@@ -828,13 +858,26 @@ class VideoMarkTrackingMixin:
         # After gun LRF lock: gun + target facade picks share one slant/pose — do not
         # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
         track = self._dooaf_setup_mark_track.get(str(role))
-        if track is not None and self._dooaf_mark_geo_track_active(track):
-            geo_disp = self._dooaf_mark_geo_display_uv(track)
-            if geo_disp is not None:
-                u, v = geo_disp
-                if self._mark_uv_on_screen(u, v):
-                    return (u, v)
-                return None
+        if track is not None:
+            if track.get("lrf_boresight_geo") or track.get("facade_uv_pick"):
+                if self._dooaf_mark_pan_track_active(track):
+                    att_disp = self._dooaf_mark_attitude_display_uv(track, stored_uv)
+                    if att_disp is not None:
+                        return att_disp
+                    return None
+                fu = track.get("frozen_uv")
+                if isinstance(fu, tuple):
+                    u, v = float(fu[0]), float(fu[1])
+                    if self._mark_uv_on_screen(u, v):
+                        return (u, v)
+                    return None
+            elif self._dooaf_mark_geo_track_active(track):
+                geo_disp = self._dooaf_mark_geo_display_uv(track)
+                if geo_disp is not None:
+                    u, v = geo_disp
+                    if self._mark_uv_on_screen(u, v):
+                        return (u, v)
+                    return None
         if track is not None:
             fu = track.get("frozen_uv")
             if isinstance(fu, tuple):
