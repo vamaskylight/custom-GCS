@@ -14,6 +14,7 @@ from vgcs.observe.target_measure import haversine_m
 # GPS geo projection jitters; pin the overlay until the gimbal pans meaningfully.
 _NEAR_FIELD_LRF_PIN_SLANT_M = 25.0
 _LRF_MARK_PIN_ATT_DEADBAND_DEG = 1.25
+_DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = 2.0
 
 
 class VideoMarkTrackingMixin:
@@ -228,6 +229,7 @@ class VideoMarkTrackingMixin:
                 built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
         elif lrf_geo_mark:
             built["lrf_boresight_geo"] = True
+            built["click_pin"] = True
             built["operator_click_uv"] = (float(ref_uv[0]), float(ref_uv[1]))
             pin = (
                 (float(display_uv[0]), float(display_uv[1]))
@@ -236,6 +238,8 @@ class VideoMarkTrackingMixin:
             )
             built["frozen_uv"] = pin
             built["pin_uv"] = pin
+            if isinstance(pin_att, tuple):
+                built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
         if used_lrf_slew and lrf_slant_range_m is not None:
             try:
                 if float(lrf_slant_range_m) < _NEAR_FIELD_LRF_PIN_SLANT_M:
@@ -725,6 +729,83 @@ class VideoMarkTrackingMixin:
             max(0.0, min(1.0, v)),
         )
 
+    def _current_gimbal_attitude_pair(self) -> tuple[float, float] | None:
+        reader = getattr(self, "_read_gimbal_attitude_pair", None)
+        if callable(reader):
+            cur = reader()
+            if cur is not None:
+                return cur
+        ctx_getter = getattr(self, "_observation_context", None)
+        if not callable(ctx_getter):
+            return None
+        ctx = ctx_getter()
+        gy = ctx.get("gimbal_yaw_deg")
+        gp = ctx.get("gimbal_pitch_deg")
+        if gy is None or gp is None:
+            return None
+        return float(gy), float(gp)
+
+    def _mark_lock_attitude(
+        self, track: dict[str, object]
+    ) -> tuple[float, float] | None:
+        pin_att = track.get("pin_ref_att")
+        if isinstance(pin_att, tuple):
+            return (float(pin_att[0]), float(pin_att[1]))
+        ref_att = track.get("ref_att")
+        if isinstance(ref_att, tuple):
+            return (float(ref_att[0]), float(ref_att[1]))
+        session = getattr(self, "_dooaf_facade_session", None)
+        lock = getattr(session, "_lock", None) if session is not None else None
+        if lock is not None:
+            return (float(lock.gimbal_yaw_deg), float(lock.gimbal_pitch_deg))
+        return None
+
+    def _gimbal_moved_since_mark_lock(
+        self,
+        track: dict[str, object],
+        *,
+        deadband_deg: float = _DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG,
+    ) -> bool:
+        lock_att = self._mark_lock_attitude(track)
+        cur = self._current_gimbal_attitude_pair()
+        if lock_att is None or cur is None:
+            return False
+        dyaw, dpitch = self._gimbal_att_delta_deg(lock_att, cur)
+        return dyaw >= float(deadband_deg) or dpitch >= float(deadband_deg)
+
+    def _dooaf_mark_geo_track_active(self, track: dict[str, object]) -> bool:
+        """World-anchor overlay once the operator pans away from the lock pose."""
+        if track.get("geo_lat") is None or track.get("geo_lon") is None:
+            return False
+        return self._gimbal_moved_since_mark_lock(track)
+
+    def _dooaf_mark_geo_display_uv(
+        self, track: dict[str, object]
+    ) -> tuple[float, float] | None:
+        glat = track.get("geo_lat")
+        glon = track.get("geo_lon")
+        if glat is None or glon is None:
+            return None
+        galt = track.get("geo_alt_m")
+        alt: float | None = None
+        if galt is not None:
+            try:
+                alt = float(galt)
+            except (TypeError, ValueError):
+                alt = None
+        geo_uv = self._project_geo_to_video_norm(
+            float(glat),
+            float(glon),
+            alt_m=alt,
+            pose_store=track,
+            smooth_pose=bool(
+                track.get("lrf_slew") and self._vehicle_airborne_for_mark_track()
+            ),
+        )
+        if geo_uv is None:
+            return None
+        return (float(geo_uv[0]), float(geo_uv[1]))
+
     def _facade_session_freezes_setup_marks(self) -> bool:
         """True while a facade LRF lock exists — setup marks stay at pick UV on screen."""
         session = getattr(self, "_dooaf_facade_session", None)
@@ -747,6 +828,13 @@ class VideoMarkTrackingMixin:
         # After gun LRF lock: gun + target facade picks share one slant/pose — do not
         # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
         track = self._dooaf_setup_mark_track.get(str(role))
+        if track is not None and self._dooaf_mark_geo_track_active(track):
+            geo_disp = self._dooaf_mark_geo_display_uv(track)
+            if geo_disp is not None:
+                u, v = geo_disp
+                if self._mark_uv_on_screen(u, v):
+                    return (u, v)
+                return None
         if track is not None:
             fu = track.get("frozen_uv")
             if isinstance(fu, tuple):
@@ -774,10 +862,6 @@ class VideoMarkTrackingMixin:
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
-        if str(row.get("geo_method") or "") == "lrf_facade_uv":
-            frozen = self._facade_frozen_mark_uv(float(stored_u), float(stored_v))
-            if frozen is not None:
-                return frozen
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
             return (float(stored_u), float(stored_v))
@@ -803,6 +887,10 @@ class VideoMarkTrackingMixin:
                 galt = row.get("video_mark_geo_alt_m")
                 if galt is not None:
                     track["geo_alt_m"] = float(galt)
+            pin_yaw = row.get("video_mark_track_ref_yaw")
+            pin_pitch = row.get("video_mark_track_ref_pitch")
+            if pin_yaw is not None and pin_pitch is not None:
+                track["pin_ref_att"] = (float(pin_yaw), float(pin_pitch))
             for key in (
                 "lock_vehicle_lat",
                 "lock_vehicle_lon",
@@ -825,6 +913,17 @@ class VideoMarkTrackingMixin:
                     pass
         except (TypeError, ValueError):
             return (float(stored_u), float(stored_v))
+        if self._dooaf_mark_geo_track_active(track):
+            geo_disp = self._dooaf_mark_geo_display_uv(track)
+            if geo_disp is not None:
+                u, v = geo_disp
+                if self._mark_uv_on_screen(u, v):
+                    return (u, v)
+                return None
+        if str(row.get("geo_method") or "") == "lrf_facade_uv":
+            frozen = self._facade_frozen_mark_uv(float(stored_u), float(stored_v))
+            if frozen is not None:
+                return frozen
         uv = self._tracked_uv_from_store(track, (float(stored_u), float(stored_v)))
         self._persist_mark_track_smooth_keys(track, row)
         return uv
