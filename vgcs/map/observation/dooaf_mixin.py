@@ -428,7 +428,7 @@ class DooafOperationsMixin:
         click_att = getattr(self, "_lrf_click_att", None)
         slew_locked = slant_m is not None and click_att is not None
         used_lrf_slew = bool(used_lrf or slew_locked)
-        # Persist operator click UV for export validation; overlay may use boresight centre.
+        # Persist operator click for audit; on-screen mark uses post-slew boresight.
         mark_u, mark_v = float(video_x), float(video_y)
         display_uv: tuple[float, float] | None = None
         if used_lrf and lat is not None and lon is not None:
@@ -437,17 +437,22 @@ class DooafOperationsMixin:
             )
             if proj is not None:
                 display_uv = (float(proj[0]), float(proj[1]))
-                print(
-                    f"[VGCS:observe] mark overlay at ({display_uv[0]:.3f},{display_uv[1]:.3f}) "
-                    f"from LRF geo (operator click was {video_x:.3f},{video_y:.3f})"
-                )
             else:
                 display_uv = (0.5, 0.5)
+            du, dv = display_uv
+            if abs(float(du) - 0.5) < 0.06 and abs(float(dv) - 0.5) < 0.06:
                 print(
-                    "[VGCS:observe] mark overlay at boresight (0.500,0.500) — "
-                    f"click was ({video_x:.3f},{video_y:.3f})"
+                    f"[VGCS:observe] gun locked at frame centre ({du:.3f},{dv:.3f}) "
+                    f"after slew — you clicked ({video_x:.3f},{video_y:.3f}); "
+                    f"LRF range is along the laser at centre"
                 )
-        self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
+            else:
+                print(
+                    f"[VGCS:observe] gun mark at ({du:.3f},{dv:.3f}) from LRF geo "
+                    f"(operator click was {video_x:.3f},{video_y:.3f})"
+                )
+        overlay_uv = display_uv if display_uv is not None else (mark_u, mark_v)
+        self._dooaf_setup_video_marks[pick_role] = overlay_uv
         self._register_dooaf_setup_mark_track(
             pick_role,
             ref_uv=(video_x, video_y),
@@ -464,8 +469,8 @@ class DooafOperationsMixin:
             write_dooaf_setup_video_mark(
                 self._dooaf_settings_store(),
                 pick_role,
-                mark_u,
-                mark_v,
+                float(overlay_uv[0]),
+                float(overlay_uv[1]),
             )
         except Exception:
             pass
@@ -478,7 +483,7 @@ class DooafOperationsMixin:
         )
         print(
             f"[VGCS:observe] dooaf video pick ok lat={float(lat):.7f} lon={float(lon):.7f} "
-            f"alt={alt_m} video=({mark_u:.3f},{mark_v:.3f}) "
+            f"alt={alt_m} video=({overlay_uv[0]:.3f},{overlay_uv[1]:.3f}) "
             f"click=({video_x:.3f},{video_y:.3f}){lrf_note}"
         )
         try:
@@ -486,8 +491,11 @@ class DooafOperationsMixin:
         except TypeError:
             cb(float(lat), float(lon))
         method = str(row.get("geo_method") or "")
+        slew_note = ""
+        if used_lrf and display_uv is not None and pick_role == DOOAF_ROLE_GUN:
+            slew_note = " — gimbal aimed so locked point is at frame centre"
         self._set_status(
-            f"DOOAF {pending.label} saved{lrf_note} — OK to confirm or pick again"
+            f"DOOAF {pending.label} saved{lrf_note}{slew_note} — OK to confirm or pick again"
             + (" · lrf_slant" if method == "lrf_slant" else "")
         )
 
@@ -969,12 +977,12 @@ class DooafOperationsMixin:
                 elif pick_role == DOOAF_ROLE_INTENDED:
                     self._set_status(
                         f"Click actual target on video ({label}) — roof / aim point; "
-                        "camera will slew and LRF confirms range"
+                        "camera will slew to frame centre and LRF confirms range"
                     )
                 else:
                     self._set_status(
                         f"Click the ground in the video to set {label}; "
-                        "camera will slew and LRF confirms range"
+                        "camera will slew to frame centre and LRF confirms range"
                     )
             else:
                 self._set_status(
