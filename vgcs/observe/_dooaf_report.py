@@ -2793,7 +2793,7 @@ def _format_role_badge(role: object) -> str:
     r = str(role or "").strip()
     if not r:
         return "<span class='badge badge-muted'>—</span>"
-    label = DOOAF_ROLE_DISPLAY.get(r, r.replace("_", " "))
+    label = dooaf_role_display(r)
     tone = "role-badge"
     if r == DOOAF_ROLE_IMPACT:
         tone = "badge-good"
