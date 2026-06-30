@@ -44,6 +44,8 @@ _QS_PRESETS_JSON = "dooaf/presets_json"
 
 _QS_SETUP_VIDEO_MARKS_JSON = "dooaf/setup_video_marks_json"
 
+_QS_FACADE_SLANT_M = "dooaf/facade_slant_range_m"
+
 def initial_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
@@ -1149,6 +1151,99 @@ def clear_dooaf_setup_video_mark(st: Any, role: str) -> None:
         return
     write_dooaf_setup_video_marks(st, marks)
 
+def read_dooaf_facade_slant_range_m(st: Any) -> float | None:
+    """Last LRF facade-lock slant (m) from DOOAF Setup / rapid UV picks."""
+    raw = st.value(_QS_FACADE_SLANT_M, None)
+    if raw in (None, ""):
+        return None
+    try:
+        slant = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return slant if slant >= 8.0 else None
+
+
+def write_dooaf_facade_slant_range_m(st: Any, slant_m: float) -> None:
+    try:
+        slant = float(slant_m)
+    except (TypeError, ValueError):
+        return
+    if slant < 8.0:
+        return
+    st.setValue(_QS_FACADE_SLANT_M, slant)
+
+
+def clear_dooaf_facade_slant_range_m(st: Any) -> None:
+    st.remove(_QS_FACADE_SLANT_M)
+
+
+def facade_slant_from_rows(rows: list[dict[str, Any]] | None) -> float | None:
+    if not rows:
+        return None
+    for row in rows:
+        raw = row.get("lrf_slant_range_m")
+        if raw is None:
+            continue
+        try:
+            slant = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if slant >= 8.0:
+            return slant
+    return None
+
+
+def resolve_facade_slant_range_m(
+    rows: list[dict[str, Any]] | None = None,
+    *,
+    explicit: float | None = None,
+    st: Any | None = None,
+) -> float | None:
+    """Facade LRF slant for distance math — explicit kwarg, rows, then QSettings."""
+    if explicit is not None:
+        try:
+            slant = float(explicit)
+        except (TypeError, ValueError):
+            slant = None
+        else:
+            if slant >= 8.0:
+                return slant
+    found = facade_slant_from_rows(rows)
+    if found is not None:
+        return found
+    if st is not None:
+        return read_dooaf_facade_slant_range_m(st)
+    try:
+        from PySide6.QtCore import QSettings
+
+        return read_dooaf_facade_slant_range_m(QSettings("VGCS", "VGCS"))
+    except Exception:
+        return None
+
+
+def apply_facade_slant_to_mark_row(
+    row: dict[str, Any],
+    slant_m: float,
+) -> None:
+    if row.get("lrf_slant_range_m") is not None:
+        return
+    try:
+        slant = float(slant_m)
+    except (TypeError, ValueError):
+        return
+    if slant >= 8.0:
+        row["lrf_slant_range_m"] = slant
+
+
+def apply_facade_slant_to_mark_rows(
+    slant_m: float,
+    *rows: dict[str, Any] | None,
+) -> None:
+    for row in rows:
+        if row is not None:
+            apply_facade_slant_to_mark_row(row, slant_m)
+
+
 def merge_setup_video_marks(
     memory: dict[str, tuple[float, float]] | None = None,
     *,
@@ -1397,6 +1492,7 @@ def build_dooaf_session(
     target_alt_m: float | None = None,
     dem_path: str | Path | None = None,
     setup_video_marks: dict[str, tuple[float, float]] | None = None,
+    facade_slant_range_m: float | None = None,
 ) -> DooafSession:
     setup_video_marks = merge_setup_video_marks(setup_video_marks)
     if not _setup_video_marks_complete(setup_video_marks):
@@ -1404,6 +1500,14 @@ def build_dooaf_session(
     gun_row = latest_mark_row(rows, DOOAF_ROLE_GUN)
     intended_row = latest_mark_row(rows, DOOAF_ROLE_INTENDED)
     impact_row = latest_mark_row(rows, DOOAF_ROLE_IMPACT)
+    resolved_slant = resolve_facade_slant_range_m(
+        rows, explicit=facade_slant_range_m
+    )
+    if resolved_slant is not None:
+        for row in rows:
+            apply_facade_slant_to_mark_row(row, resolved_slant)
+        if impact_row is not None:
+            apply_facade_slant_to_mark_row(impact_row, resolved_slant)
     gun = latest_mark(rows, DOOAF_ROLE_GUN) or gun_from_settings(
         gun_lat=gun_lat, gun_lon=gun_lon, gun_alt_m=gun_alt_m
     )
@@ -1468,6 +1572,14 @@ def build_dooaf_session(
             template_row,
             dem_path=dem_path,
             alt_m=gun.alt_m,
+        )
+    if resolved_slant is not None:
+        apply_facade_slant_to_mark_rows(
+            resolved_slant,
+            ground_row,
+            intended_row,
+            impact_row,
+            gun_row,
         )
     if impact_row is not None and template_row is not None:
         _enrich_mark_row_ray_geometry(

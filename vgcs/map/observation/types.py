@@ -148,6 +148,7 @@ class ObservationExportTask(QRunnable):
         target_alt_m: float | None = None,
         dem_path: str | None = None,
         setup_video_marks: dict[str, tuple[float, float]] | None = None,
+        facade_slant_range_m: float | None = None,
     ) -> None:
         super().__init__()
         self._rows = list(rows)
@@ -163,6 +164,7 @@ class ObservationExportTask(QRunnable):
         self._target_alt_m = target_alt_m
         self._dem_path = dem_path
         self._setup_video_marks = setup_video_marks
+        self._facade_slant_range_m = facade_slant_range_m
 
     def run(self) -> None:
         fields = [
@@ -229,6 +231,7 @@ class ObservationExportTask(QRunnable):
             target_alt_m=self._target_alt_m,
             dem_path=self._dem_path,
             setup_video_marks=merge_setup_video_marks(self._setup_video_marks),
+            facade_slant_range_m=self._facade_slant_range_m,
         )
         corr = session.correction
         export_rows: list[dict[str, object]] = []

@@ -28,9 +28,11 @@ from vgcs.observe.dooaf import (
     latest_mark,
     merge_dooaf_settings,
     merge_setup_video_marks,
+    read_dooaf_facade_slant_range_m,
     read_dooaf_settings,
     refine_impact_geo_from_video_rays,
     resolved_dooaf_settings,
+    write_dooaf_facade_slant_range_m,
     write_dooaf_settings,
     write_dooaf_setup_video_mark,
 )
@@ -54,6 +56,43 @@ class DooafOperationsMixin:
     def _dooaf_settings_store(self) -> QSettings:
         return QSettings(QS_ORG, QS_APP)
 
+    def _resolve_facade_slant_for_session(self) -> float | None:
+        session = getattr(self, "_dooaf_facade_session", None)
+        slant = getattr(session, "slant_range_m", None) if session is not None else None
+        if slant is not None:
+            try:
+                return float(slant)
+            except (TypeError, ValueError):
+                pass
+        st = self._dooaf_settings_store()
+        slant = read_dooaf_facade_slant_range_m(st)
+        if slant is not None:
+            return slant
+        tracks = getattr(self, "_dooaf_setup_mark_track", None) or {}
+        for track in tracks.values():
+            if not isinstance(track, dict):
+                continue
+            raw = track.get("lrf_slant_range_m")
+            if raw is None:
+                continue
+            try:
+                s = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if s >= 8.0:
+                return s
+        for row in getattr(self, "_observations", None) or []:
+            raw = row.get("lrf_slant_range_m")
+            if raw is None:
+                continue
+            try:
+                s = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if s >= 8.0:
+                return s
+        return None
+
     def _dooaf_session_kwargs(self) -> dict[str, object]:
         s = resolved_dooaf_settings(
             self._dooaf_settings_store(), self._observations
@@ -64,6 +103,9 @@ class DooafOperationsMixin:
         merged = merge_setup_video_marks(marks, st=self._dooaf_settings_store())
         if merged:
             kw["setup_video_marks"] = merged
+        slant = self._resolve_facade_slant_for_session()
+        if slant is not None:
+            kw["facade_slant_range_m"] = float(slant)
         return kw
 
     def _resolved_dooaf_settings(self) -> DooafSettings:
@@ -727,6 +769,9 @@ class DooafOperationsMixin:
         try:
             self._dooaf_facade_session.record_from_context(
                 float(slant_m), self._observation_context()
+            )
+            write_dooaf_facade_slant_range_m(
+                self._dooaf_settings_store(), float(slant_m)
             )
             print(
                 f"[VGCS:observe] facade session lock slant={float(slant_m):.1f} m "
