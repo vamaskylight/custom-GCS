@@ -6,7 +6,7 @@ from PySide6.QtCore import QThreadPool, QTimer
 
 from vgcs.map.native_video_overlay import VideoOverlayLrfLock
 from vgcs.map.observation.types import LrfLockBridge, LrfLockTask, PendingLrfVideoPick
-from vgcs.observe.dooaf import DOOAF_ROLE_INTENDED
+from vgcs.observe.dooaf import DOOAF_ROLE_GUN, DOOAF_ROLE_INTENDED
 from vgcs.observe.geo_reference import compute_lrf_slant_geo
 from vgcs.skydroid.protocol import format_slr_display_m
 from vgcs.video.pipeline import notify_companion_lrf_lock
@@ -575,7 +575,11 @@ class LrfVideoLockMixin:
                 self._companion_laser_range_m = slant_m
                 self._calibrate_lrf_track_after_lock()
                 self._update_lrf_lock_geo(slant_m)
-                self._try_record_dooaf_facade_session(float(slant_m))
+                if pending.purpose == "dooaf_setup" and pick_role in (
+                    DOOAF_ROLE_GUN,
+                    "gun_origin",
+                ):
+                    self._try_record_dooaf_facade_session(float(slant_m))
             try:
                 if pending.purpose == "dooaf_setup":
                     self._complete_pending_dooaf_setup_lrf_pick(slant_m, pending)
