@@ -741,7 +741,19 @@ def mark_pair_fire_range_m(
     over haversine on collapsed skyline / rooftop footprints — except for a
     foreground artillery gun pick where drone slant ranges over-estimate
     horizontal gun→target distance vs setup footprints.
+
+    When both marks share an LRF facade lock (``lrf_slant_range_m``), use
+    slant × full 2D video angle — not horizontal bearing-only rays.
     """
+    from vgcs.observe.facade_plane import facade_slant_uv_separation_m
+
+    facade_d = facade_slant_uv_separation_m(row_a, row_b, hfov_deg=hfov_deg)
+    if facade_d is not None and facade_d > 0.5:
+        if footprint_m is not None and _row_foreground_artillery(row_a):
+            fp = float(footprint_m)
+            if fp >= 18.0 and facade_d > fp * 1.45:
+                return fp
+        return float(facade_d)
     ray = mark_pair_ground_separation_m(row_a, row_b, hfov_deg=hfov_deg)
     r1 = _row_own_geo_range_m(row_a)
     r2 = _row_own_geo_range_m(row_b)

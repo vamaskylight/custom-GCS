@@ -96,6 +96,55 @@ def _sanitized_click_range_m(row: dict[str, Any], agl_eff: float) -> float | Non
     return rh_dep
 
 
+def facade_slant_uv_separation_m(
+    row_a: dict[str, Any],
+    row_b: dict[str, Any],
+    *,
+    hfov_deg: float = 62.0,
+    camera_vfov_deg: float | None = None,
+) -> float | None:
+    """
+    Facade chord (m) between two UV picks sharing one LRF slant lock.
+
+    Uses full horizontal + vertical video angle × slant range. Horizontal-only
+    law-of-cosines underestimates when target/impact are above/below the gun
+    mark on the same building face (common DOOAF facade session).
+    """
+    xy_a, xy_b = _video_xy(row_a), _video_xy(row_b)
+    if xy_a is None or xy_b is None:
+        return None
+    slants: list[float] = []
+    for row in (row_a, row_b):
+        try:
+            s = float(row.get("lrf_slant_range_m") or 0)
+        except (TypeError, ValueError):
+            continue
+        if s >= 8.0:
+            slants.append(s)
+    if not slants:
+        return None
+    slant = min(slants)
+    if len(slants) == 2 and abs(slants[0] - slants[1]) > max(8.0, 0.2 * slant):
+        return None
+    du = float(xy_b[0]) - float(xy_a[0])
+    dv = float(xy_b[1]) - float(xy_a[1])
+    if math.hypot(du, dv) < 0.008:
+        return 0.0
+    hfov_rad = math.radians(float(hfov_deg))
+    if camera_vfov_deg is not None:
+        vfov = float(camera_vfov_deg)
+    else:
+        try:
+            from vgcs.skydroid.adapter import _LRF_FOV_V_DEG as vfov  # type: ignore[attr-defined]
+        except Exception:
+            vfov = float(hfov_deg) * 0.5625
+    vfov_rad = math.radians(float(vfov))
+    angle = math.hypot(du * hfov_rad, dv * vfov_rad)
+    if angle <= 1e-6:
+        return 0.0
+    return float(slant) * 2.0 * math.sin(angle / 2.0)
+
+
 def facade_plane_width_between_marks(
     row_a: dict[str, Any],
     row_b: dict[str, Any],

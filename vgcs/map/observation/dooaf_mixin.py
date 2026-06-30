@@ -376,10 +376,12 @@ class DooafOperationsMixin:
                     f"lat={float(lat_fb):.7f} lon={float(lon_fb):.7f} "
                     f"video=({mark_u:.3f},{mark_v:.3f})"
                 )
-                try:
-                    cb(float(lat_fb), float(lon_fb), alt_m)
-                except TypeError:
-                    cb(float(lat_fb), float(lon_fb))
+        try:
+            if callable(cb):
+                cb(float(lat), float(lon), alt_m)
+        except TypeError:
+            if callable(cb):
+                cb(float(lat), float(lon))
                 self._set_status(
                     f"DOOAF {pending.label} saved (DEM estimate) — "
                     "confirm or re-pick with LRF for better accuracy"
@@ -486,10 +488,11 @@ class DooafOperationsMixin:
             f"alt={alt_m} video=({overlay_uv[0]:.3f},{overlay_uv[1]:.3f}) "
             f"click=({video_x:.3f},{video_y:.3f}){lrf_note}"
         )
-        try:
-            cb(float(lat), float(lon), alt_m)
-        except TypeError:
-            cb(float(lat), float(lon))
+        if callable(cb):
+            try:
+                cb(float(lat), float(lon), alt_m)
+            except TypeError:
+                cb(float(lat), float(lon))
         method = str(row.get("geo_method") or "")
         slew_note = ""
         if used_lrf and display_uv is not None and pick_role == DOOAF_ROLE_GUN:

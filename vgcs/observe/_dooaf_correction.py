@@ -121,6 +121,19 @@ def compute_fire_correction(
     miss_n, miss_e = latlon_delta_to_ne_m(
         intended.lat, intended.lon, impact.lat, impact.lon
     )
+    impact_to_intended_m = haversine_m(
+        intended.lat, intended.lon, impact.lat, impact.lon
+    )
+    if intended_row is not None and impact_row is not None:
+        from vgcs.observe.facade_plane import facade_slant_uv_separation_m
+
+        ti_facade = facade_slant_uv_separation_m(
+            intended_row,
+            impact_row,
+            hfov_deg=camera_hfov_deg,
+        )
+        if ti_facade is not None and ti_facade > 0.5:
+            impact_to_intended_m = float(ti_facade)
     miss_vertical: float | None = None
     elev_correction: float | None = None
     if intended.alt_m is not None and impact.alt_m is not None:
@@ -134,9 +147,7 @@ def compute_fire_correction(
         range_gun_to_intended_m=range_gt,
         range_gun_to_impact_m=range_gi,
         bearing_gun_to_intended_deg=bearing_gt,
-        impact_to_intended_m=haversine_m(
-            intended.lat, intended.lon, impact.lat, impact.lon
-        ),
+        impact_to_intended_m=impact_to_intended_m,
         miss_east_m=miss_e,
         miss_north_m=miss_n,
         miss_vertical_m=miss_vertical,
@@ -400,6 +411,12 @@ def _synthesize_setup_mark_row(
     for key in _SETUP_ROW_CONTEXT_KEYS:
         if template_row.get(key) is not None:
             row[key] = template_row[key]
+    slant_raw = template_row.get("lrf_slant_range_m")
+    if slant_raw is not None:
+        try:
+            row["lrf_slant_range_m"] = float(slant_raw)
+        except (TypeError, ValueError):
+            pass
     hfov = 62.0
     try:
         if template_row.get("camera_hfov_deg") is not None:
