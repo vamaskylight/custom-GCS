@@ -43,7 +43,7 @@ _LRF_MOVED_MIN_M = 2.0
 _LRF_GIMBAL_SLR_MIN_M = 0.5
 _LRF_GIMBAL_ACCEPT_MIN_DEG = 1.5
 _LRF_GIMBAL_SLR_SETTLE_S = 0.5
-_LRF_GIMBAL_SLR_SETTLE_ALIGN_OK_S = 0.0
+_LRF_GIMBAL_SLR_SETTLE_ALIGN_OK_S = 0.35
 _LRF_CONVERGE_SAMPLES = 2
 _LRF_CONVERGE_SAMPLES_ALIGNED = 1
 _LRF_FAST_LOCK_OFFSET_DEG = 1.5
@@ -92,6 +92,9 @@ _LRF_ALIGN_MAX_TOTAL_CAP_DEG = 55.0
 _LRF_HOLD_MAX_CLICK_OFFSET_DEG = 4.0
 _LRF_HOLD_MIN_PIXEL_MOVE_PX = 48
 _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG = 10.0
+_LRF_LOCK_GIMBAL_DRIFT_ALIGN_OK_EXTRA_DEG = 6.0
+_LRF_LOCK_GIMBAL_DRIFT_ALIGN_OK_PITCH_STABLE_DEG = 1.5
+_LRF_LOCK_GIMBAL_DRIFT_HARD_CAP_DEG = 25.0
 _LRF_PRELOCK_SAMPLES = 1
 _LRF_LIVE_POLL_SAMPLES = 3
 _LRF_SLR_QUERY_RETRIES = 3
@@ -2094,6 +2097,47 @@ class SkydroidTopUdpAdapter:
         return dy >= float(min_deg) or dp >= float(min_deg)
 
     @staticmethod
+    def _lrf_lock_drift_threshold_deg(
+        att_lock_ref: tuple[float, float],
+        att_before: tuple[float, float] | None,
+        *,
+        align_ok: bool,
+    ) -> float:
+        base = float(_LRF_LOCK_GIMBAL_DRIFT_MAX_DEG)
+        if not align_ok:
+            return base
+        extra = float(_LRF_LOCK_GIMBAL_DRIFT_ALIGN_OK_EXTRA_DEG)
+        if att_before is not None:
+            align_move = SkydroidTopUdpAdapter._gimbal_total_move_deg(
+                att_before, att_lock_ref
+            )
+            extra = max(extra, min(10.0, align_move * 0.35))
+        return base + extra
+
+    @staticmethod
+    def _lrf_lock_gimbal_drift_abort(
+        att_lock_ref: tuple[float, float],
+        att_now: tuple[float, float],
+        *,
+        align_ok: bool,
+        threshold_deg: float,
+        slr_converged: bool,
+        elapsed_s: float,
+        min_wait_s: float,
+    ) -> bool:
+        """Abort lock on gimbal wander — but not on C13 GAC yaw lag when SLR already plateaus."""
+        if slr_converged:
+            return False
+        move = SkydroidTopUdpAdapter._gimbal_total_move_deg(att_lock_ref, att_now)
+        if float(elapsed_s) < float(min_wait_s):
+            return move > float(_LRF_LOCK_GIMBAL_DRIFT_HARD_CAP_DEG)
+        dpitch = abs(float(att_now[1]) - float(att_lock_ref[1]))
+        if align_ok and dpitch < float(_LRF_LOCK_GIMBAL_DRIFT_ALIGN_OK_PITCH_STABLE_DEG):
+            dyaw = abs(float(att_now[0]) - float(att_lock_ref[0]))
+            return dyaw > float(threshold_deg)
+        return move > float(threshold_deg)
+
+    @staticmethod
     def _gimbal_total_move_deg(
         before: tuple[float, float] | None,
         after: tuple[float, float] | None,
@@ -2380,6 +2424,27 @@ class SkydroidTopUdpAdapter:
         if baseline_m is None:
             return False
         return abs(float(value_m) - float(baseline_m)) >= _LRF_MOVED_MIN_M
+
+    def _read_gimbal_attitude_deg_median(
+        self, *, n: int = 3, gap_s: float = 0.06
+    ) -> tuple[float, float] | None:
+        """Median GAC yaw/pitch over several reads (C13 yaw often lags one sample after slew)."""
+        yaws: list[float] = []
+        pitches: list[float] = []
+        for i in range(max(1, int(n))):
+            if i:
+                time.sleep(float(gap_s))
+            att = self._read_gimbal_attitude_deg(use_cache=False)
+            if att is None:
+                continue
+            yaws.append(float(att[0]))
+            pitches.append(float(att[1]))
+        if not yaws:
+            return self._read_gimbal_attitude_deg(use_cache=True)
+        yaws.sort()
+        pitches.sort()
+        mid = len(yaws) // 2
+        return yaws[mid], pitches[mid]
 
     def _read_gimbal_attitude_deg(self, *, use_cache: bool = True) -> tuple[float, float] | None:
         """Blocking GAC read on the active probe endpoint (retries + recent cache fallback)."""
@@ -2703,6 +2768,9 @@ class SkydroidTopUdpAdapter:
                 time.sleep(settle_s)
                 self._gimbal_stop_hard()
                 time.sleep(0.15)
+                att_refreshed = self._read_gimbal_attitude_deg_median(n=3, gap_s=0.06)
+                if att_refreshed is not None:
+                    att_lock_ref = att_refreshed
                 if not align_slr_samples:
                     for burst_i in range(5):
                         time.sleep(0.14)
@@ -2751,15 +2819,26 @@ class SkydroidTopUdpAdapter:
                 att_now = self._attitude_from_cache() or self._read_gimbal_attitude_deg()
                 if att_now is not None:
                     att_latest = att_now
-                if (
-                    att_lock_ref is not None
-                    and att_now is not None
-                    and self._gimbal_total_move_deg(att_lock_ref, att_now)
-                    > _LRF_LOCK_GIMBAL_DRIFT_MAX_DEG
+                drift_thresh = self._lrf_lock_drift_threshold_deg(
+                    att_lock_ref, att_before, align_ok=bool(align_ok)
+                )
+                slr_settled = (
+                    self._slr_converged(samples[-3:], 2) is not None
+                    if len(samples) >= 2
+                    else False
+                )
+                if att_lock_ref and att_now and self._lrf_lock_gimbal_drift_abort(
+                    att_lock_ref,
+                    att_now,
+                    align_ok=bool(align_ok),
+                    threshold_deg=drift_thresh,
+                    slr_converged=bool(slr_settled),
+                    elapsed_s=elapsed,
+                    min_wait_s=min_wait,
                 ):
                     print(
                         f"[VGCS:lrf] lock aborted — gimbal drift during lock "
-                        f"{att_lock_ref}->{att_now}"
+                        f"{att_lock_ref}->{att_now} (thresh={drift_thresh:.1f}°)"
                     )
                     return None
                 _emit_sample(float(reading))
