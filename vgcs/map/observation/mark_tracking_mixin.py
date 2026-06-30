@@ -228,11 +228,8 @@ class VideoMarkTrackingMixin:
                 built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
         elif lrf_geo_mark:
             built["lrf_boresight_geo"] = True
-            if display_uv is not None:
-                built["frozen_uv"] = (
-                    float(display_uv[0]),
-                    float(display_uv[1]),
-                )
+            built["click_pin"] = True
+            built["frozen_uv"] = (float(ref_uv[0]), float(ref_uv[1]))
         if used_lrf_slew and lrf_slant_range_m is not None:
             try:
                 if float(lrf_slant_range_m) < _NEAR_FIELD_LRF_PIN_SLANT_M:
@@ -723,14 +720,9 @@ class VideoMarkTrackingMixin:
         )
 
     def _facade_session_freezes_setup_marks(self) -> bool:
-        """True while facade LRF lock is valid — setup marks stay at pick UV on screen."""
+        """True while a facade LRF lock exists — setup marks stay at pick UV on screen."""
         session = getattr(self, "_dooaf_facade_session", None)
-        if session is None or not session.has_lock:
-            return False
-        try:
-            return bool(session.uv_pick_valid(self._observation_context()))
-        except Exception:
-            return False
+        return session is not None and session.has_lock
 
     def _dooaf_mark_display_uv(
         self, role: str, stored_uv: tuple[float, float]
