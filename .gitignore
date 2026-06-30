@@ -4,6 +4,9 @@ Ground-Control-Station-for-UAV/
 # Internal planning / milestones (keep local or private; omit from client-facing checkouts)
 DOCS/
 
+# Local dev / analysis scripts (not part of product source)
+tools/
+
 # Python
 __pycache__/
 *.py[cod]

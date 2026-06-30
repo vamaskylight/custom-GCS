@@ -27,6 +27,7 @@ from vgcs.observe.dooaf import (
     DOOAF_ROLE_INTENDED,
     DOOAF_ROLE_SURVEY,
     apply_dooaf_impact_geo_fallback,
+    apply_facade_slant_to_mark_row,
     assemble_observation_report_html,
     build_dooaf_session,
     dooaf_export_blockers,
@@ -874,6 +875,15 @@ class ObservationSessionMixin:
         self._obs_export_quick = bool(quick)
         rows = [dict(r) for r in self._observations]
         dooaf = self._dooaf_session_kwargs()
+        facade_slant = dooaf.get("facade_slant_range_m")
+        if facade_slant is not None:
+            try:
+                slant_f = float(facade_slant)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                slant_f = None
+            if slant_f is not None:
+                for row in rows:
+                    apply_facade_slant_to_mark_row(row, slant_f)
         for row in rows:
             if str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT:
                 apply_dooaf_impact_geo_fallback(
@@ -919,6 +929,7 @@ class ObservationSessionMixin:
                 target_alt_m=dooaf.get("target_alt_m"),
                 dem_path=dooaf.get("dem_path"),
                 setup_video_marks=dooaf.get("setup_video_marks"),
+                facade_slant_range_m=dooaf.get("facade_slant_range_m"),
             )
         )
 
