@@ -428,6 +428,7 @@ class DooafOperationsMixin:
         click_att = getattr(self, "_lrf_click_att", None)
         slew_locked = slant_m is not None and click_att is not None
         used_lrf_slew = bool(used_lrf or slew_locked)
+        # Persist operator click UV for export validation; overlay may use boresight centre.
         mark_u, mark_v = float(video_x), float(video_y)
         display_uv: tuple[float, float] | None = None
         if used_lrf and lat is not None and lon is not None:
@@ -436,14 +437,12 @@ class DooafOperationsMixin:
             )
             if proj is not None:
                 display_uv = (float(proj[0]), float(proj[1]))
-                mark_u, mark_v = display_uv
                 print(
-                    f"[VGCS:observe] mark overlay at ({mark_u:.3f},{mark_v:.3f}) "
+                    f"[VGCS:observe] mark overlay at ({display_uv[0]:.3f},{display_uv[1]:.3f}) "
                     f"from LRF geo (operator click was {video_x:.3f},{video_y:.3f})"
                 )
             else:
                 display_uv = (0.5, 0.5)
-                mark_u, mark_v = display_uv
                 print(
                     "[VGCS:observe] mark overlay at boresight (0.500,0.500) — "
                     f"click was ({video_x:.3f},{video_y:.3f})"

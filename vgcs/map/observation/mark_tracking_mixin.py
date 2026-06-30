@@ -5,7 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import QTimer
 
 from vgcs.map.native_video_overlay import VideoOverlayMark, VideoOverlayOffscreenHint, offscreen_hint_edge_uv
-from vgcs.observe.dooaf import dooaf_role_display
+from vgcs.observe.dooaf import DOOAF_ROLE_GUN, DOOAF_ROLE_INTENDED, dooaf_role_display
 from vgcs.observe.dooaf_flight_session import mark_track_use_geo_in_flight
 from vgcs.observe.geo_reference import project_wgs84_to_video_norm, should_project_lrf_mark_via_geo
 from vgcs.observe.target_measure import haversine_m
@@ -215,6 +215,7 @@ class VideoMarkTrackingMixin:
             if isinstance(ref_pin, tuple):
                 built["pin_uv"] = (float(ref_pin[0]), float(ref_pin[1]))
                 built["click_pin"] = True
+                built["frozen_uv"] = (float(ref_pin[0]), float(ref_pin[1]))
             built["facade_uv_pick"] = True
             if isinstance(pin_att, tuple):
                 built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
@@ -226,8 +227,12 @@ class VideoMarkTrackingMixin:
             if isinstance(pin_att, tuple):
                 built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
         elif lrf_geo_mark:
-            # LRF range is along boresight — overlay tracks geo, not raw click UV.
             built["lrf_boresight_geo"] = True
+            if display_uv is not None:
+                built["frozen_uv"] = (
+                    float(display_uv[0]),
+                    float(display_uv[1]),
+                )
         if used_lrf_slew and lrf_slant_range_m is not None:
             try:
                 if float(lrf_slant_range_m) < _NEAR_FIELD_LRF_PIN_SLANT_M:
@@ -574,6 +579,10 @@ class VideoMarkTrackingMixin:
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
         if track is not None:
+            fu = track.get("frozen_uv")
+            if isinstance(fu, tuple):
+                return (float(fu[0]), float(fu[1]))
+        if track is not None:
             pinned = self._mark_track_pinned_uv(track)
             if pinned is not None:
                 return pinned
@@ -665,6 +674,38 @@ class VideoMarkTrackingMixin:
             )
         return (float(u), float(v))
 
+    def _dooaf_setup_marks_complete(self) -> bool:
+        marks = getattr(self, "_dooaf_setup_video_marks", None) or {}
+        return DOOAF_ROLE_GUN in marks and DOOAF_ROLE_INTENDED in marks
+
+    def _frozen_setup_mark_uv(
+        self, track: dict[str, object] | None, stored_u: float, stored_v: float
+    ) -> tuple[float, float] | None:
+        """Hold DOOAF setup marks at pick UV — stop geo reprojection jitter."""
+        if bool(getattr(self, "_obs_export_busy", False)):
+            fu = (track or {}).get("frozen_uv")
+            if isinstance(fu, tuple):
+                return (float(fu[0]), float(fu[1]))
+            if self._mark_uv_on_screen(stored_u, stored_v):
+                return (
+                    max(0.0, min(1.0, float(stored_u))),
+                    max(0.0, min(1.0, float(stored_v))),
+                )
+        if track is not None:
+            fu = track.get("frozen_uv")
+            if isinstance(fu, tuple) and self._mark_uv_on_screen(float(fu[0]), float(fu[1])):
+                return (float(fu[0]), float(fu[1]))
+        frozen = self._facade_frozen_mark_uv(float(stored_u), float(stored_v))
+        if frozen is not None:
+            return frozen
+        if self._dooaf_setup_marks_complete():
+            if self._mark_uv_on_screen(stored_u, stored_v):
+                return (
+                    max(0.0, min(1.0, float(stored_u))),
+                    max(0.0, min(1.0, float(stored_v))),
+                )
+        return None
+
     def _facade_frozen_mark_uv(
         self, stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
@@ -707,12 +748,17 @@ class VideoMarkTrackingMixin:
                     return None
         # After gun LRF lock: gun + target facade picks share one slant/pose — do not
         # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
-        frozen = self._facade_frozen_mark_uv(
-            float(stored_uv[0]), float(stored_uv[1])
-        )
+        track = self._dooaf_setup_mark_track.get(str(role))
+        if track is not None:
+            fu = track.get("frozen_uv")
+            if isinstance(fu, tuple):
+                u, v = float(fu[0]), float(fu[1])
+                if self._mark_uv_on_screen(u, v):
+                    return (u, v)
+                return None
+        frozen = self._frozen_setup_mark_uv(track, float(stored_uv[0]), float(stored_uv[1]))
         if frozen is not None:
             return frozen
-        track = self._dooaf_setup_mark_track.get(str(role))
         return self._tracked_uv_from_store(track, stored_uv)
 
     @staticmethod

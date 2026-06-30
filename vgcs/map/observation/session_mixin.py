@@ -898,13 +898,10 @@ class ObservationSessionMixin:
             note = " | ".join(export_warnings)
             self._set_status(f"Exporting with warnings: {note[:120]}")
             print(f"[VGCS:observe] export warnings: {note}")
-            if quick:
-                QMessageBox.warning(
-                    self,
-                    "Observation Report",
-                    "\n\n".join(export_warnings)
-                    + "\n\nReport will still export with available data.",
-                )
+        self._obs_export_warning_text = (
+            "\n\n".join(export_warnings) if export_warnings else ""
+        )
+        print(f"[VGCS:observe] export started -> {csv_path}")
         self._set_status("Exporting observation report…")
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(
@@ -938,7 +935,9 @@ class ObservationSessionMixin:
         self._set_status(short)
         print(f"[VGCS:observe] export ok {summary}")
         if quick:
-            # Modal QMessageBox + shell-open while RTSP/ffmpeg run on the GUI thread freezes Windows.
+            warn = str(getattr(self, "_obs_export_warning_text", "") or "").strip()
+            self._obs_export_warning_text = ""
+
             def _open_folder() -> None:
                 try:
                     lines = [ln.strip() for ln in str(summary).splitlines() if ln.strip()]
@@ -958,6 +957,15 @@ class ObservationSessionMixin:
                     pass
 
             QTimer.singleShot(400, _open_folder)
+            if warn:
+                QTimer.singleShot(
+                    600,
+                    lambda: QMessageBox.information(
+                        self,
+                        "Observation Report",
+                        f"Report exported.\n\nWarnings:\n{warn}\n\n{summary}",
+                    ),
+                )
 
     def _write_observation_html_summary(self, path: str) -> None:
         export_rows: list[dict[str, object]] = []
