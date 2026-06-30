@@ -228,8 +228,14 @@ class VideoMarkTrackingMixin:
                 built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
         elif lrf_geo_mark:
             built["lrf_boresight_geo"] = True
-            built["click_pin"] = True
-            built["frozen_uv"] = (float(ref_uv[0]), float(ref_uv[1]))
+            built["operator_click_uv"] = (float(ref_uv[0]), float(ref_uv[1]))
+            pin = (
+                (float(display_uv[0]), float(display_uv[1]))
+                if display_uv is not None
+                else (0.5, 0.5)
+            )
+            built["frozen_uv"] = pin
+            built["pin_uv"] = pin
         if used_lrf_slew and lrf_slant_range_m is not None:
             try:
                 if float(lrf_slant_range_m) < _NEAR_FIELD_LRF_PIN_SLANT_M:
