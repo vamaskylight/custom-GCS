@@ -103,6 +103,7 @@ _LRF_SLR_DEST_SYSTEM = "D"
 _LRF_SLR_DIVERGE_WARN_M = 2.0
 _LRF_SLR_JUMP_RATIO_MAX = 2.5
 _LRF_SLR_JUMP_MIN_M = 12.0
+_LRF_NEAR_FIELD_SUSPICIOUS_MAX_M = 12.0
 _LRF_BORESIGHT_TOL_U = 0.016
 _LRF_BORESIGHT_TOL_V = 0.018
 # Final LRF lock / DOOAF pick — click world point must be this close to frame centre.
@@ -1243,6 +1244,19 @@ class SkydroidTopUdpAdapter:
             return False
         return True
 
+    @staticmethod
+    def _slr_suspicious_near_field_lock(
+        pre_slr: float | None,
+        post_slr: float,
+        click_offset_deg: float,
+    ) -> bool:
+        """Reject locks on ground a few metres away when pre-lock ranged distant background."""
+        if pre_slr is None or float(click_offset_deg) < 5.0:
+            return False
+        pre = max(0.5, float(pre_slr))
+        post = float(post_slr)
+        return pre >= 35.0 and post <= float(_LRF_NEAR_FIELD_SUSPICIOUS_MAX_M)
+
     def _align_axes_ok(
         self,
         att: tuple[float, float],
@@ -2339,6 +2353,15 @@ class SkydroidTopUdpAdapter:
             if not self._slr_plausible_after_slew(
                 baseline_m, float(converged), float(click_off)
             ):
+                return None
+            if self._slr_suspicious_near_field_lock(
+                baseline_m, float(converged), float(click_off)
+            ):
+                print(
+                    f"[VGCS:lrf] lock rejected — SLR {float(baseline_m or 0):.1f} m "
+                    f"-> {float(converged):.1f} m looks like near-field ground, not "
+                    f"the {float(click_off):.0f}° click target; pick again on the feature"
+                )
                 return None
             return float(converged)
         gimbal_move = self._gimbal_total_move_deg(att_before, att_now)

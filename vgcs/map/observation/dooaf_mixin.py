@@ -706,19 +706,18 @@ class DooafOperationsMixin:
         self,
         slant_m: float,
         *,
-        max_shift_m: float = 1.5,
+        max_shift_m: float = 4.0,
     ) -> bool:
         """Store shared facade lock for rapid UV picks if the aircraft stayed still."""
         shift = self._vehicle_shift_during_lrf_lock_m()
         if shift is not None and shift > float(max_shift_m):
-            self._dooaf_facade_session.clear()
             print(
                 f"[VGCS:observe] facade session skipped — vehicle moved "
                 f"{shift:.1f} m during LRF lock (max {float(max_shift_m):.1f} m)"
             )
             self._set_status(
                 f"LRF locked — vehicle moved {shift:.1f} m during lock; "
-                "re-lock before rapid facade picks"
+                "TARGET/IMPACT may need map pick or re-lock GUN for fast video picks"
             )
             self._refresh_dooaf_facade_overlay_hint()
             return False
