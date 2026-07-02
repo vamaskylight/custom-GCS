@@ -51,6 +51,7 @@ from vgcs.observe.geo_reference import (
 from vgcs.observe.target_measure import (
     haversine_m,
     low_hover_ray_agl_m,
+    observation_target_latlon,
     ray_agl_suspect_dem_mismatch,
 )
 from vgcs.video.camera_control import NoopCameraControl

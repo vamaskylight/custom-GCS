@@ -6,7 +6,7 @@ from PySide6.QtCore import QThreadPool, QTimer
 
 from vgcs.map.native_video_overlay import VideoOverlayLrfLock
 from vgcs.map.observation.types import LrfLockBridge, LrfLockTask, PendingLrfVideoPick
-from vgcs.observe.dooaf import DOOAF_ROLE_GUN, DOOAF_ROLE_INTENDED
+from vgcs.observe.dooaf import DOOAF_ROLE_GUN, DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED
 from vgcs.observe.geo_reference import compute_lrf_slant_geo
 from vgcs.skydroid.protocol import format_slr_display_m
 from vgcs.video.pipeline import notify_companion_lrf_lock
@@ -580,6 +580,14 @@ class LrfVideoLockMixin:
                     "gun_origin",
                 ):
                     self._try_record_dooaf_facade_session(float(slant_m))
+                elif pending.purpose == "observation":
+                    obs_row = getattr(pending, "observation_row", None)
+                    if (
+                        obs_row is not None
+                        and str(obs_row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
+                        and not self._dooaf_facade_uv_pick_ready()
+                    ):
+                        self._try_record_dooaf_facade_session(float(slant_m))
             try:
                 if pending.purpose == "dooaf_setup":
                     self._complete_pending_dooaf_setup_lrf_pick(slant_m, pending)
@@ -589,6 +597,10 @@ class LrfVideoLockMixin:
                 print(f"[VGCS:observe] DOOAF/LRF pick failed: {exc}")
                 if pending.purpose == "dooaf_setup":
                     self._dooaf_video_pick_failed(str(exc))
+                elif pending.purpose == "observation":
+                    self._set_status(
+                        f"Impact LRF pick failed — {exc}. Retry the click."
+                    )
             if slant_m is not None:
                 if pending.purpose == "dooaf_setup":
                     click_uv = getattr(self, "_lrf_click_uv", None)
