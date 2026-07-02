@@ -379,17 +379,16 @@ class DooafOperationsMixin:
                     f"lat={float(lat_fb):.7f} lon={float(lon_fb):.7f}"
                 )
                 alt_raw = row.get("target_alt_m")
-                alt_m: float | None = None
+                alt_fb: float | None = None
                 if alt_raw is not None:
                     try:
-                        alt_m = float(alt_raw)
+                        alt_fb = float(alt_raw)
                     except (TypeError, ValueError):
-                        alt_m = None
+                        alt_fb = None
                 self._append_lrf_fallback_warning(
                     row,
                     "LRF lock failed — position from DEM ray estimate",
                 )
-                cb = self._dooaf_pick_complete
                 mark_u, mark_v = float(video_x), float(video_y)
                 self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
                 self._register_dooaf_setup_mark_track(
@@ -400,7 +399,7 @@ class DooafOperationsMixin:
                     used_lrf_slew=False,
                     geo_lat=float(lat_fb),
                     geo_lon=float(lon_fb),
-                    geo_alt_m=alt_m,
+                    geo_alt_m=alt_fb,
                 )
                 try:
                     write_dooaf_setup_video_mark(
@@ -418,12 +417,12 @@ class DooafOperationsMixin:
                     f"lat={float(lat_fb):.7f} lon={float(lon_fb):.7f} "
                     f"video=({mark_u:.3f},{mark_v:.3f})"
                 )
-        try:
-            if callable(cb):
-                cb(float(lat), float(lon), alt_m)
-        except TypeError:
-            if callable(cb):
-                cb(float(lat), float(lon))
+                cb = self._dooaf_pick_complete
+                if callable(cb):
+                    try:
+                        cb(float(lat_fb), float(lon_fb), alt_fb)
+                    except TypeError:
+                        cb(float(lat_fb), float(lon_fb))
                 self._set_status(
                     f"DOOAF {pending.label} saved (DEM estimate) — "
                     "confirm or re-pick with LRF for better accuracy"
