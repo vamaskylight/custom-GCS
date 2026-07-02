@@ -175,6 +175,7 @@ class VideoMarkTrackingMixin:
         lock_att: tuple[float, float] | None,
         used_lrf_slew: bool,
         facade_uv_pick: bool = False,
+        ground_video_pick: bool = False,
         geo_lat: float | None = None,
         geo_lon: float | None = None,
         geo_alt_m: float | None = None,
@@ -224,6 +225,15 @@ class VideoMarkTrackingMixin:
                 built["click_pin"] = True
                 built["frozen_uv"] = (float(ref_pin[0]), float(ref_pin[1]))
             built["facade_uv_pick"] = True
+            if isinstance(pin_att, tuple):
+                built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
+        elif ground_video_pick:
+            ref_pin = built.get("ref_uv")
+            if isinstance(ref_pin, tuple):
+                built["pin_uv"] = (float(ref_pin[0]), float(ref_pin[1]))
+                built["click_pin"] = True
+                built["frozen_uv"] = (float(ref_pin[0]), float(ref_pin[1]))
+            built["ground_video_pick"] = True
             if isinstance(pin_att, tuple):
                 built["pin_ref_att"] = (float(pin_att[0]), float(pin_att[1]))
         elif used_lrf_slew and not lrf_geo_mark:
@@ -285,6 +295,8 @@ class VideoMarkTrackingMixin:
     def _mark_track_use_geo_projection(self, track: dict[str, object]) -> bool:
         """Use geo when no LRF slew, clearly airborne, or when the aircraft has moved since lock."""
         if track.get("facade_uv_pick"):
+            return False
+        if track.get("ground_video_pick"):
             return False
         if track.get("lrf_boresight_geo"):
             return False
@@ -807,6 +819,8 @@ class VideoMarkTrackingMixin:
         # live GPS geo projection jitters when GAC yaw settles after lock.
         if track.get("lrf_boresight_geo") or track.get("facade_uv_pick"):
             return False
+        if track.get("ground_video_pick"):
+            return False
         return self._gimbal_moved_since_mark_lock(track)
 
     def _dooaf_mark_geo_display_uv(
@@ -859,7 +873,11 @@ class VideoMarkTrackingMixin:
         # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
         track = self._dooaf_setup_mark_track.get(str(role))
         if track is not None:
-            if track.get("lrf_boresight_geo") or track.get("facade_uv_pick"):
+            if (
+                track.get("lrf_boresight_geo")
+                or track.get("facade_uv_pick")
+                or track.get("ground_video_pick")
+            ):
                 if self._dooaf_mark_pan_track_active(track):
                     att_disp = self._dooaf_mark_attitude_display_uv(track, stored_uv)
                     if att_disp is not None:
