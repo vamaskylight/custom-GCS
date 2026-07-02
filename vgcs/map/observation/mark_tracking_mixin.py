@@ -74,25 +74,31 @@ class VideoMarkTrackingMixin:
         return role if role else None
 
     def _sync_dooaf_setup_mark_from_lrf_slew_progress(self, role: str | None = None) -> None:
-        """Keep DOOAF gun mark aligned with LRF reticle while click-to-aim slew runs."""
+        """Keep the slewing DOOAF setup mark aligned with LRF reticle during click-to-aim."""
         if not bool(getattr(self, "_lrf_lock_in_progress", False)):
+            return
+        pending = getattr(self, "_pending_lrf_video_pick", None)
+        if pending is not None and str(getattr(pending, "purpose", "") or "") == "observation":
             return
         click_uv = getattr(self, "_lrf_click_uv", None)
         click_att = getattr(self, "_lrf_click_att", None)
         if click_uv is None or click_att is None:
             return
+        active = str(role or self._pending_lrf_dooaf_pick_role(pending) or "").strip()
+        if not active:
+            return
+        built = self._dooaf_setup_mark_track.get(active)
+        if built is None:
+            return
+        if built.get("ground_video_pick") or built.get("facade_uv_pick"):
+            return
         h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
         v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
-        roles = [str(role)] if role else list(self._dooaf_setup_mark_track.keys())
-        for rk in roles:
-            built = self._dooaf_setup_mark_track.get(str(rk))
-            if built is None:
-                continue
-            built["ref_uv"] = (float(click_uv[0]), float(click_uv[1]))
-            built["ref_att"] = (float(click_att[0]), float(click_att[1]))
-            built["h_scale"] = h_scale
-            built["v_scale"] = v_scale
-            built["lrf_slew"] = True
+        built["ref_uv"] = (float(click_uv[0]), float(click_uv[1]))
+        built["ref_att"] = (float(click_att[0]), float(click_att[1]))
+        built["h_scale"] = h_scale
+        built["v_scale"] = v_scale
+        built["lrf_slew"] = True
 
     @staticmethod
     def _gimbal_att_delta_deg(
@@ -565,16 +571,26 @@ class VideoMarkTrackingMixin:
         except Exception:
             return None
 
+    def _mark_track_screen_frozen_uv(
+        self, track: dict[str, object]
+    ) -> tuple[float, float] | None:
+        """UV for ground / facade UV picks — always stay at operator click."""
+        if not (track.get("ground_video_pick") or track.get("facade_uv_pick")):
+            return None
+        pin = track.get("pin_uv")
+        if not isinstance(pin, tuple):
+            pin = track.get("ref_uv")
+        if isinstance(pin, tuple) and len(pin) == 2:
+            return (float(pin[0]), float(pin[1]))
+        return None
+
     def _mark_track_pinned_uv(
         self, track: dict[str, object]
     ) -> tuple[float, float] | None:
         """Hold mark at pick UV after LRF lock until the operator pans the gimbal."""
-        if bool(getattr(self, "_lrf_lock_in_progress", False)):
-            pending = getattr(self, "_pending_lrf_video_pick", None)
-            active_role = self._pending_lrf_dooaf_pick_role(pending)
-            if active_role:
-                # Another DOOAF mark is slewing — reproject this one on the world point.
-                return None
+        frozen = self._mark_track_screen_frozen_uv(track)
+        if frozen is not None:
+            return frozen
         if not (track.get("near_field_pin") or track.get("click_pin")):
             return None
         pin = track.get("pin_uv")
@@ -605,6 +621,10 @@ class VideoMarkTrackingMixin:
         track: dict[str, object] | None,
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
+        if track is not None:
+            frozen = self._mark_track_screen_frozen_uv(track)
+            if frozen is not None:
+                return frozen
         if track is not None:
             fu = track.get("frozen_uv")
             if isinstance(fu, tuple):
