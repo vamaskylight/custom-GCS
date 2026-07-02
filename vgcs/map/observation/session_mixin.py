@@ -222,6 +222,36 @@ class ObservationSessionMixin:
                         f"video=({float(video_x):.3f},{float(video_y):.3f})"
                     )
                     return
+            if self._dooaf_setup_is_ground_workflow():
+                row.update(self._observation_context())
+                self._enrich_observation_geo_reference(row)
+                if str(row.get("geo_method") or "") in ("", "insufficient"):
+                    row["geo_method"] = "dooaf_ground_video"
+                att = self._read_gimbal_attitude_pair()
+                self._apply_video_mark_gimbal_track_to_row(
+                    row,
+                    float(video_x),
+                    float(video_y),
+                    ref_att=att,
+                    lock_att=att,
+                    used_lrf_slew=False,
+                )
+                self._log_observation_after_geo(
+                    row,
+                    kind=kind,
+                    map_lat=map_lat,
+                    map_lon=map_lon,
+                    video_x=float(video_x),
+                    video_y=float(video_y),
+                    clip_path=clip_path,
+                    capture_snapshot=capture_snapshot,
+                )
+                print(
+                    f"[VGCS:observe] impact ground video pick ok "
+                    f"lat={row.get('target_lat')} lon={row.get('target_lon')} "
+                    f"video=({float(video_x):.3f},{float(video_y):.3f})"
+                )
+                return
             self._pending_lrf_video_pick = PendingLrfVideoPick(
                 purpose="observation",
                 u=float(video_x),

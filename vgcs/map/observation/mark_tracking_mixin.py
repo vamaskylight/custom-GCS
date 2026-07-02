@@ -5,7 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import QTimer
 
 from vgcs.map.native_video_overlay import VideoOverlayMark, VideoOverlayOffscreenHint, offscreen_hint_edge_uv
-from vgcs.observe.dooaf import DOOAF_ROLE_GUN, DOOAF_ROLE_INTENDED, dooaf_role_display
+from vgcs.observe.dooaf import DOOAF_ROLE_GUN, DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED, dooaf_role_display
 from vgcs.observe.dooaf_flight_session import mark_track_use_geo_in_flight
 from vgcs.observe.geo_reference import project_wgs84_to_video_norm, should_project_lrf_mark_via_geo
 from vgcs.observe.target_measure import haversine_m
@@ -456,6 +456,8 @@ class VideoMarkTrackingMixin:
         row["video_mark_track_h_scale"] = float(built["h_scale"])
         row["video_mark_track_v_scale"] = float(built["v_scale"])
         row["video_mark_lrf_slew"] = bool(used_lrf_slew)
+        row["video_mark_frozen_u"] = float(ref_uv[0])
+        row["video_mark_frozen_v"] = float(ref_uv[1])
         ctx = self._observation_context()
         vlat = ctx.get("vehicle_lat")
         vlon = ctx.get("vehicle_lon")
@@ -873,19 +875,20 @@ class VideoMarkTrackingMixin:
         # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
         track = self._dooaf_setup_mark_track.get(str(role))
         if track is not None:
+            fu = track.get("frozen_uv")
+            if isinstance(fu, tuple):
+                u, v = float(fu[0]), float(fu[1])
+                if self._mark_uv_on_screen(u, v):
+                    return (u, v)
+                return None
             if (
                 track.get("lrf_boresight_geo")
                 or track.get("facade_uv_pick")
                 or track.get("ground_video_pick")
             ):
-                if self._dooaf_mark_pan_track_active(track):
-                    att_disp = self._dooaf_mark_attitude_display_uv(track, stored_uv)
-                    if att_disp is not None:
-                        return att_disp
-                    return None
-                fu = track.get("frozen_uv")
-                if isinstance(fu, tuple):
-                    u, v = float(fu[0]), float(fu[1])
+                ref_pin = track.get("pin_uv") or track.get("ref_uv")
+                if isinstance(ref_pin, tuple):
+                    u, v = float(ref_pin[0]), float(ref_pin[1])
                     if self._mark_uv_on_screen(u, v):
                         return (u, v)
                     return None
@@ -923,6 +926,20 @@ class VideoMarkTrackingMixin:
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
+        """Screen UV for logged observations — pinned at pick; report geo is separate."""
+        role = str(row.get("dooaf_role") or "")
+        fu_u = row.get("video_mark_frozen_u")
+        fu_v = row.get("video_mark_frozen_v")
+        if fu_u is not None and fu_v is not None:
+            u, v = float(fu_u), float(fu_v)
+            if self._mark_uv_on_screen(u, v):
+                return (u, v)
+            return None
+        if role == DOOAF_ROLE_IMPACT:
+            u, v = float(stored_u), float(stored_v)
+            if self._mark_uv_on_screen(u, v):
+                return (u, v)
+            return None
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
             return (float(stored_u), float(stored_v))
