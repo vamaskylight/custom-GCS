@@ -63,6 +63,52 @@ def latlon_delta_to_ne_m(
     east = (lon1 - lon0) * 111_320.0 * math.cos(lat_rad)
     return north, east
 
+
+def _row_prefers_facade_geometry(row: dict[str, Any] | None) -> bool:
+    """True when a mark row should use facade/ray geometry over pure footprint."""
+    if not isinstance(row, dict):
+        return False
+    method = str(row.get("geo_method") or "").strip().lower()
+    if method.startswith("ray_"):
+        return False
+    if "facade" in method:
+        return True
+    if method in {"lrf_slant", "lrf_lock"}:
+        return True
+    slant = _float_or_none(row.get("lrf_slant_range_m"))
+    if slant is not None and slant >= 8.0:
+        return True
+    if bool(row.get("facade_uv_pick") or row.get("lrf_boresight_geo")):
+        return True
+    # Legacy rows can miss explicit facade method but carry full ray pair.
+    if (
+        row.get("geo_range_m") is not None
+        and row.get("geo_bearing_deg") is not None
+        and row.get("video_x_norm") is not None
+        and row.get("video_y_norm") is not None
+    ):
+        return True
+    return False
+
+
+def _pair_prefers_facade_geometry(
+    left: dict[str, Any] | None, right: dict[str, Any] | None
+) -> bool:
+    left_pref = _row_prefers_facade_geometry(left)
+    right_pref = _row_prefers_facade_geometry(right)
+    if left_pref and right_pref:
+        return True
+    # Allow one-sided facade/ray rows to seed the paired mark when the
+    # counterpart is a video mark without explicit ground-ray method.
+    for row in (left, right):
+        if not isinstance(row, dict):
+            return False
+        method = str(row.get("geo_method") or "").strip().lower()
+        if method.startswith("ray_terrain"):
+            return False
+    return left_pref or right_pref
+
+
 def compute_fire_correction(
     gun: GeoPoint,
     intended: GeoPoint,
@@ -87,17 +133,23 @@ def compute_fire_correction(
     """
     from vgcs.observe.target_measure import mark_pair_fire_range_m
 
-    if impact_row is not None:
+    use_ray_gt = _pair_prefers_facade_geometry(gun_row, intended_row)
+    use_ray_gi = _pair_prefers_facade_geometry(gun_row, impact_row)
+    use_facade_ti = _pair_prefers_facade_geometry(intended_row, impact_row)
+
+    if impact_row is not None and (use_ray_gt or use_ray_gi or use_facade_ti):
         template = gun_row or intended_row
         if template is not None:
             _enrich_mark_row_ray_geometry(impact_row, template)
     for row in (gun_row, intended_row):
-        if row is not None and impact_row is not None:
+        if row is not None and impact_row is not None and (
+            use_ray_gt or use_ray_gi or use_facade_ti
+        ):
             _enrich_mark_row_ray_geometry(row, impact_row)
 
     range_gt = haversine_m(gun.lat, gun.lon, intended.lat, intended.lon)
     range_gi = haversine_m(gun.lat, gun.lon, impact.lat, impact.lon)
-    if gun_row is not None and intended_row is not None:
+    if use_ray_gt and gun_row is not None and intended_row is not None:
         ray_gt = mark_pair_fire_range_m(
             gun_row,
             intended_row,
@@ -106,7 +158,7 @@ def compute_fire_correction(
         )
         if ray_gt is not None:
             range_gt = float(ray_gt)
-    if gun_row is not None and impact_row is not None:
+    if use_ray_gi and gun_row is not None and impact_row is not None:
         ray_gi = mark_pair_fire_range_m(
             gun_row,
             impact_row,
@@ -126,7 +178,7 @@ def compute_fire_correction(
     impact_to_intended_m = haversine_m(
         intended.lat, intended.lon, impact.lat, impact.lon
     )
-    if intended_row is not None and impact_row is not None:
+    if use_facade_ti and intended_row is not None and impact_row is not None:
         from vgcs.observe.facade_plane import facade_slant_uv_separation_m
 
         ti_facade = facade_slant_uv_separation_m(
@@ -155,6 +207,27 @@ def compute_fire_correction(
         miss_vertical_m=miss_vertical,
         elevation_correction_m=elev_correction,
     )
+
+FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M = 2.0
+
+
+def fire_correction_en_miss_m(c: FireCorrection) -> float:
+    """Horizontal miss from East/North components: √(E² + N²)."""
+    return math.hypot(float(c.miss_east_m), float(c.miss_north_m))
+
+
+def fire_correction_miss_consistency_gap_m(c: FireCorrection) -> float:
+    """|target→impact horizontal miss − √(E²+N²)|."""
+    return abs(float(c.impact_to_intended_m) - fire_correction_en_miss_m(c))
+
+
+def fire_correction_miss_is_consistent(
+    c: FireCorrection,
+    *,
+    tol_m: float = FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M,
+) -> bool:
+    return fire_correction_miss_consistency_gap_m(c) <= float(tol_m)
+
 
 def _dem_alt_from_row(row: dict[str, Any]) -> float | None:
     raw = row.get("target_alt_m_dem")

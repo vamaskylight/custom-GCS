@@ -14,6 +14,9 @@ from vgcs.observe.dooaf import (
     DOOAF_ROLE_IMPACT,
     assemble_observation_report_html,
     build_dooaf_session,
+    fire_correction_en_miss_m,
+    fire_correction_miss_consistency_gap_m,
+    fire_correction_miss_is_consistent,
     format_dooaf_html_summary,
     format_gimbal_pitch_direction,
     format_gimbal_yaw_direction,
@@ -213,6 +216,8 @@ class ObservationExportTask(QRunnable):
             "dooaf_miss_m",
             "dooaf_miss_east_m",
             "dooaf_miss_north_m",
+            "dooaf_miss_en_m",
+            "dooaf_miss_consistency_gap_m",
             "dooaf_miss_vertical_m",
             "dooaf_east_correction_m",
             "dooaf_north_correction_m",
@@ -234,6 +239,16 @@ class ObservationExportTask(QRunnable):
             facade_slant_range_m=self._facade_slant_range_m,
         )
         corr = session.correction
+        if corr is not None and not fire_correction_miss_is_consistent(corr):
+            en = fire_correction_en_miss_m(corr)
+            gap = fire_correction_miss_consistency_gap_m(corr)
+            print(
+                f"[VGCS:observe] report sanity: target→impact "
+                f"{corr.impact_to_intended_m:.1f} m vs E/N √(E²+N²) {en:.1f} m "
+                f"(gap {gap:.1f} m) — mixed geometry; "
+                "check gun/target/impact pick modes",
+                flush=True,
+            )
         export_rows: list[dict[str, object]] = []
         for row in self._rows:
             out = dict(row)
@@ -266,6 +281,10 @@ class ObservationExportTask(QRunnable):
                 out["dooaf_miss_m"] = corr.impact_to_intended_m
                 out["dooaf_miss_east_m"] = corr.miss_east_m
                 out["dooaf_miss_north_m"] = corr.miss_north_m
+                out["dooaf_miss_en_m"] = fire_correction_en_miss_m(corr)
+                out["dooaf_miss_consistency_gap_m"] = (
+                    fire_correction_miss_consistency_gap_m(corr)
+                )
                 out["dooaf_miss_vertical_m"] = corr.miss_vertical_m
                 out["dooaf_east_correction_m"] = -corr.miss_east_m
                 out["dooaf_north_correction_m"] = -corr.miss_north_m

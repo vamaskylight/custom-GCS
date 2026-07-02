@@ -7,8 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from vgcs.observe._dooaf_correction import (
+    FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M,
     _float_or_none,
     build_dooaf_session,
+    fire_correction_en_miss_m,
+    fire_correction_miss_consistency_gap_m,
+    fire_correction_miss_is_consistent,
     format_fire_correction,
     format_gimbal_pitch_direction,
     format_gimbal_yaw_direction,
@@ -1998,6 +2002,27 @@ def _executive_miss_map_svg(session: DooafSession, c: FireCorrection) -> str:
     parts.append("</svg>")
     return "".join(parts)
 
+def _fire_correction_miss_consistency_warning_html(c: FireCorrection) -> str:
+    if fire_correction_miss_is_consistent(c):
+        return ""
+    en = fire_correction_en_miss_m(c)
+    gap = fire_correction_miss_consistency_gap_m(c)
+    horiz = float(c.impact_to_intended_m)
+    return (
+        "<div class='report-sanity-warn' role='alert'>"
+        "<strong>Distance consistency warning</strong>"
+        "<p>Reported target→impact horizontal miss is "
+        f"<strong>{horiz:.1f} m</strong>, but √(E²+N²) from East/North "
+        f"components is <strong>{en:.1f} m</strong> "
+        f"(gap <strong>{gap:.1f} m</strong>, threshold "
+        f"{FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M:.0f} m). "
+        "This usually means gun, target, or impact were picked with mixed geometry "
+        "(e.g. ground ray vs facade/LRF). Re-pick marks with the same method or "
+        "verify coordinates in the audit log.</p>"
+        "</div>"
+    )
+
+
 def _executive_summary_visual_html(session: DooafSession) -> str:
     c = session.correction
     if c is None:
@@ -2050,11 +2075,19 @@ def format_fire_correction_diagram_html(session: DooafSession) -> str:
     bars = _fire_correction_bars_html(c)
     if not plan:
         return ""
-    horiz_check = math.hypot(float(c.miss_east_m), float(c.miss_north_m))
+    en_miss = fire_correction_en_miss_m(c)
+    gap = fire_correction_miss_consistency_gap_m(c)
+    if fire_correction_miss_is_consistent(c):
+        check_note = "<span class='report-sanity-ok'>consistent</span>"
+    else:
+        check_note = (
+            f"<span class='report-sanity-bad'>gap {gap:.1f} m — see warning above</span>"
+        )
     foot = (
-        f"<p class='log-hint' style='margin-top:8px'>"
-        f"Horizontal check: √(E²+N²) = <strong>{horiz_check:.1f} m</strong> "
-        f"(report horizontal miss {c.impact_to_intended_m:.1f} m). "
+        _fire_correction_miss_consistency_warning_html(c)
+        + f"<p class='log-hint' style='margin-top:8px'>"
+        f"Horizontal check: √(E²+N²) = <strong>{en_miss:.1f} m</strong> "
+        f"(report horizontal miss {c.impact_to_intended_m:.1f} m) — {check_note}. "
         "<span class='muted'>Orange = miss · Teal = correction · Purple = drone.</span>"
         "</p>"
     )
@@ -2190,6 +2223,7 @@ def format_executive_summary_html(session: DooafSession) -> str:
         "<h2>Summary<span class='report-executive-badge'>Start here</span></h2>"
         "</div>"
         "<div class='report-executive-body'>"
+        + _fire_correction_miss_consistency_warning_html(c)
         + story_lead
         + _executive_summary_visual_html(session)
         + "</div></section>"
