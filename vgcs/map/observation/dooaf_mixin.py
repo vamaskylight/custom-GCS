@@ -60,6 +60,17 @@ from vgcs.video.camera_control import NoopCameraControl
 class DooafOperationsMixin:
     """Extracted from MapWidget — uses host widget state via self."""
 
+    def _dooaf_setup_is_ground_workflow(self) -> bool:
+        """GUN+TARGET from ground video picks with no facade session for fast impact."""
+        if self._dooaf_facade_uv_pick_ready():
+            return False
+        tracks = getattr(self, "_dooaf_setup_mark_track", None) or {}
+        gun = tracks.get(DOOAF_ROLE_GUN) or tracks.get("gun_origin")
+        tgt = tracks.get(DOOAF_ROLE_INTENDED)
+        if not isinstance(gun, dict) or not isinstance(tgt, dict):
+            return False
+        return bool(gun.get("ground_video_pick") and tgt.get("ground_video_pick"))
+
     def _dooaf_settings_store(self) -> QSettings:
         return QSettings(QS_ORG, QS_APP)
 
