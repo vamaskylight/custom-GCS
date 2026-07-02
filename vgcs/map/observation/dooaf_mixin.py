@@ -873,6 +873,10 @@ class DooafOperationsMixin:
             )
         )
 
+    def _dooaf_facade_session_has_lock(self) -> bool:
+        session = getattr(self, "_dooaf_facade_session", None)
+        return session is not None and session.has_lock
+
     def _dooaf_facade_uv_pick_ready(self) -> bool:
         """True when a fast facade UV pick can reuse the last LRF lock."""
         session = getattr(self, "_dooaf_facade_session", None)

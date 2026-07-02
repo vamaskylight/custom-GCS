@@ -176,7 +176,7 @@ class ObservationSessionMixin:
             if self._lrf_lock_in_progress or self._pending_lrf_video_pick is not None:
                 self._set_status("LRF lock in progress — wait before marking impact…")
                 return
-            if self._dooaf_facade_uv_pick_ready():
+            if self._dooaf_facade_session_has_lock():
                 row.update(self._observation_context())
                 geo = self._geo_from_facade_uv_pick(float(video_x), float(video_y))
                 if geo is not None:
@@ -187,11 +187,18 @@ class ObservationSessionMixin:
                         row["target_alt_m"] = float(alt_m)
                     row["geo_quality"] = "fair"
                     row["geo_method"] = "lrf_facade_uv"
-                    row["geo_warning"] = ""
+                    stale = not self._dooaf_facade_uv_pick_ready()
+                    row["geo_warning"] = (
+                        "facade lock stale (gimbal/drone moved) — geo from lock pose"
+                        if stale
+                        else ""
+                    )
                     slant = self._dooaf_facade_session.slant_range_m
                     if slant is not None:
                         row["lrf_slant_range_m"] = float(slant)
                     lock_att = self._facade_lock_gimbal_att()
+                    row["video_mark_frozen_u"] = float(video_x)
+                    row["video_mark_frozen_v"] = float(video_y)
                     self._apply_video_mark_gimbal_track_to_row(
                         row,
                         float(video_x),
@@ -328,13 +335,16 @@ class ObservationSessionMixin:
                     row,
                     "LRF geo failed — impact from DEM ray estimate",
                 )
+        row["video_mark_frozen_u"] = float(video_x)
+        row["video_mark_frozen_v"] = float(video_y)
+        click_att = getattr(self, "_lrf_click_att", None)
         self._apply_video_mark_gimbal_track_to_row(
             row,
             video_x,
             video_y,
-            ref_att=getattr(self, "_lrf_track_ref_att", None),
+            ref_att=click_att,
             lock_att=self._read_gimbal_attitude_pair(),
-            used_lrf_slew=bool(used_lrf),
+            used_lrf_slew=False,
         )
         self._log_observation_after_geo(
             row,
