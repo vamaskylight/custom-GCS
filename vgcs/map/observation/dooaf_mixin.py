@@ -546,8 +546,14 @@ class DooafOperationsMixin:
     ) -> bool:
         """Record facade slant without overwriting a ground gun or pre-target coords."""
         pick_role = str(pending.pick_role or DOOAF_ROLE_INTENDED)
-        if not self._try_record_dooaf_facade_session(float(slant_m)):
-            pass
+        recorded = self._try_record_dooaf_facade_session(float(slant_m))
+        if not recorded:
+            try:
+                write_dooaf_facade_slant_range_m(
+                    self._dooaf_settings_store(), float(slant_m)
+                )
+            except Exception:
+                pass
         self._schedule_video_marks_overlay_refresh()
         self._refresh_dooaf_facade_overlay_after_change()
         cb = self._dooaf_pick_complete
@@ -1010,19 +1016,18 @@ class DooafOperationsMixin:
         *,
         max_shift_m: float = 4.0,
     ) -> bool:
-        """Store shared facade lock for rapid UV picks if the aircraft stayed still."""
+        """Store shared facade lock for rapid UV picks (pose at lock completion)."""
         shift = self._vehicle_shift_during_lrf_lock_m()
         if shift is not None and shift > float(max_shift_m):
             print(
-                f"[VGCS:observe] facade session skipped — vehicle moved "
-                f"{shift:.1f} m during LRF lock (max {float(max_shift_m):.1f} m)"
+                f"[VGCS:observe] facade session: vehicle moved {shift:.1f} m during "
+                f"LRF lock (>{float(max_shift_m):.1f} m) — recording end pose + slant; "
+                "hold hover if possible on next lock"
             )
             self._set_status(
-                f"LRF locked — vehicle moved {shift:.1f} m during lock; "
-                "TARGET/IMPACT may need map pick or re-lock GUN for fast video picks"
+                f"LRF locked — drone moved {shift:.1f} m during lock; "
+                "slant saved — pick TARGET on building now"
             )
-            self._refresh_dooaf_facade_overlay_hint()
-            return False
         try:
             self._dooaf_facade_session.record_from_context(
                 float(slant_m), self._observation_context()

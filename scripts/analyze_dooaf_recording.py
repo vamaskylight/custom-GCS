@@ -109,26 +109,36 @@ def analyze_video(path: Path, *, sample_every_s: float = 1.0) -> dict:
 
     # Overlay hint drift between consecutive samples (proxy for mark movement)
     drifts: list[dict] = []
+    gun_zone_drifts: list[dict] = []
     for a, b in zip(samples, samples[1:], strict=False):
         if not a.get("overlay_hints") or not b.get("overlay_hints"):
             continue
         # match nearest hint by UV
         best = None
+        gun_best = None
         for ha in a["overlay_hints"]:
             for hb in b["overlay_hints"]:
                 du = float(hb["u"]) - float(ha["u"])
                 dv = float(hb["v"]) - float(ha["v"])
                 d = (du * du + dv * dv) ** 0.5
+                entry = {
+                    "t0_s": a["t_s"],
+                    "t1_s": b["t_s"],
+                    "drift_uv": round(d, 4),
+                    "from_uv": [ha["u"], ha["v"]],
+                    "to_uv": [hb["u"], hb["v"]],
+                    "mean_flow_px": b.get("mean_flow_px"),
+                }
                 if best is None or d < best["drift_uv"]:
-                    best = {
-                        "t0_s": a["t_s"],
-                        "t1_s": b["t_s"],
-                        "drift_uv": round(d, 4),
-                        "from_uv": [ha["u"], ha["v"]],
-                        "to_uv": [hb["u"], hb["v"]],
-                    }
+                    best = entry
+                # Gun is usually lower-left on field shots (u<0.45, v>0.55)
+                if float(ha["u"]) < 0.45 and float(ha["v"]) > 0.55:
+                    if gun_best is None or d < gun_best["drift_uv"]:
+                        gun_best = entry
         if best and best["drift_uv"] > 0.02:
             drifts.append(best)
+        if gun_best and gun_best["drift_uv"] > 0.015:
+            gun_zone_drifts.append(gun_best)
 
     return {
         "path": str(path),
@@ -140,6 +150,7 @@ def analyze_video(path: Path, *, sample_every_s: float = 1.0) -> dict:
         "sample_every_s": sample_every_s,
         "pan_segments": pan_segments,
         "overlay_drifts": drifts[:20],
+        "gun_zone_drifts": gun_zone_drifts[:20],
         "samples": samples,
     }
 
@@ -179,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
             "height",
             "pan_segments",
             "overlay_drifts",
+            "gun_zone_drifts",
         )
     }
     print(json.dumps(summary, indent=2))

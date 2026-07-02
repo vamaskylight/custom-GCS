@@ -880,10 +880,24 @@ class VideoMarkTrackingMixin:
     def _dooaf_mark_display_uv(
         self, role: str, stored_uv: tuple[float, float]
     ) -> tuple[float, float] | None:
-        """Screen UV for a DOOAF setup mark — tracks gimbal; hidden when off-screen."""
+        """Screen UV for a DOOAF setup mark — frozen at pick; hidden when off-screen."""
+        track = self._dooaf_setup_mark_track.get(str(role))
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             pending = getattr(self, "_pending_lrf_video_pick", None)
             active_role = self._pending_lrf_dooaf_pick_role(pending)
+            if active_role and str(role) != active_role:
+                for key in ("frozen_uv", "pin_uv"):
+                    if track is not None:
+                        pin = track.get(key)
+                        if isinstance(pin, tuple):
+                            u, v = float(pin[0]), float(pin[1])
+                            if self._mark_uv_on_screen(u, v):
+                                return (u, v)
+                            return None
+                u, v = float(stored_uv[0]), float(stored_uv[1])
+                if self._mark_uv_on_screen(u, v):
+                    return (u, v)
+                return None
             if active_role and str(role) == active_role:
                 lock_uv = getattr(self, "_lrf_lock_uv", None)
                 if lock_uv is not None:
@@ -893,7 +907,6 @@ class VideoMarkTrackingMixin:
                     return None
         # After gun LRF lock: gun + target facade picks share one slant/pose — do not
         # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
-        track = self._dooaf_setup_mark_track.get(str(role))
         if track is not None:
             fu = track.get("frozen_uv")
             if isinstance(fu, tuple):
