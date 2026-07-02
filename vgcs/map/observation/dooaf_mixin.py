@@ -294,6 +294,9 @@ class DooafOperationsMixin:
             return True
         lat, lon, alt_m = geo
         mark_u, mark_v = float(video_x), float(video_y)
+        self._warn_ground_pick_facade_risk(
+            mark_v, pick_role=pick_role, label=label
+        )
         self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
         ref_att = self._read_gimbal_attitude_pair()
         self._register_dooaf_setup_mark_track(
@@ -436,6 +439,163 @@ class DooafOperationsMixin:
         self._set_status(f"{label} — slewing camera and locking LRF…")
         self._begin_c13_lrf_video_lock(float(u), float(v))
 
+    def _dooaf_saved_ground_gun_track(self) -> dict[str, object] | None:
+        """Return a copy of the ground-picked gun track, if any."""
+        tracks = getattr(self, "_dooaf_setup_mark_track", None) or {}
+        for key in (DOOAF_ROLE_GUN, "gun_origin"):
+            tr = tracks.get(key)
+            if isinstance(tr, dict) and tr.get("ground_video_pick"):
+                return dict(tr)
+        return None
+
+    def _dooaf_restore_preserved_ground_gun_track(
+        self,
+        preserve: dict[str, object],
+        *,
+        slant_m: float,
+    ) -> tuple[float, float, float | None] | None:
+        """Re-register ground gun after facade LRF slant-only lock."""
+        role_key = DOOAF_ROLE_GUN
+        marks = getattr(self, "_dooaf_setup_video_marks", None) or {}
+        uv = preserve.get("setup_uv")
+        if not isinstance(uv, tuple) or len(uv) != 2:
+            uv = marks.get(role_key) or marks.get("gun_origin")
+        if not isinstance(uv, tuple) or len(uv) != 2:
+            ref_uv = preserve.get("ref_uv")
+            if isinstance(ref_uv, tuple) and len(ref_uv) == 2:
+                uv = (float(ref_uv[0]), float(ref_uv[1]))
+            else:
+                return None
+        try:
+            lat = float(preserve["geo_lat"])
+            lon = float(preserve["geo_lon"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        alt_m: float | None = None
+        if preserve.get("geo_alt_m") is not None:
+            try:
+                alt_m = float(preserve["geo_alt_m"])
+            except (TypeError, ValueError):
+                alt_m = None
+        mark_u, mark_v = float(uv[0]), float(uv[1])
+        self._dooaf_setup_video_marks[role_key] = (mark_u, mark_v)
+        self._register_dooaf_setup_mark_track(
+            role_key,
+            ref_uv=(mark_u, mark_v),
+            ref_att=self._read_gimbal_attitude_pair(),
+            lock_att=self._read_gimbal_attitude_pair(),
+            used_lrf_slew=False,
+            ground_video_pick=True,
+            geo_lat=lat,
+            geo_lon=lon,
+            geo_alt_m=alt_m,
+            lrf_slant_range_m=float(slant_m),
+        )
+        try:
+            write_dooaf_setup_video_mark(
+                self._dooaf_settings_store(),
+                role_key,
+                mark_u,
+                mark_v,
+            )
+        except Exception:
+            pass
+        self._schedule_video_marks_overlay_refresh()
+        return lat, lon, alt_m
+
+    def _ground_pick_likely_facade_click(
+        self, video_y: float, *, pick_role: str
+    ) -> bool:
+        """Heuristic: mid/upper frame click without facade session is probably a wall."""
+        if pick_role not in (DOOAF_ROLE_INTENDED, DOOAF_ROLE_IMPACT):
+            return False
+        if self._dooaf_facade_uv_pick_ready():
+            return False
+        return float(video_y) < 0.62
+
+    def _warn_ground_pick_facade_risk(
+        self, video_y: float, *, pick_role: str, label: str
+    ) -> None:
+        if not self._ground_pick_likely_facade_click(video_y, pick_role=pick_role):
+            return
+        dlg = getattr(self, "_dooaf_pick_dialog", None)
+        msg = (
+            f"{label} looks like it is on a building face, but ground-ray mode "
+            "projects to the dirt under the drone — distances will be wrong.\n\n"
+            "For gun on open ground + target/impact on a wall:\n"
+            "1. DOOAF Setup → TARGET → LRF lock (facade slant) on the building, or\n"
+            "2. GUN → LRF lock (facade) on the building (keeps a ground gun pick), then\n"
+            "3. TARGET → Pick on video on the same face, then mark impact."
+        )
+        print(f"[VGCS:observe] ground pick facade risk role={pick_role} video_y={video_y:.3f}")
+        if dlg is not None:
+            try:
+                QMessageBox.warning(dlg, "Use facade pick for building face", msg)
+            except Exception:
+                pass
+        self._set_status(
+            f"{label}: building face? Use LRF lock (facade slant) first, then Pick on video"
+        )
+
+    def _complete_dooaf_facade_slant_only_lrf_pick(
+        self,
+        slant_m: float,
+        pending: PendingLrfVideoPick,
+        *,
+        preserve_gun: dict[str, object] | None,
+    ) -> bool:
+        """Record facade slant without overwriting a ground gun or pre-target coords."""
+        pick_role = str(pending.pick_role or DOOAF_ROLE_INTENDED)
+        if not self._try_record_dooaf_facade_session(float(slant_m)):
+            pass
+        self._schedule_video_marks_overlay_refresh()
+        self._refresh_dooaf_facade_overlay_after_change()
+        cb = self._dooaf_pick_complete
+        self._end_dooaf_map_pick(restore_target_mode=True)
+        slant_note = f"LRF {float(slant_m):.1f} m"
+        if preserve_gun is not None and pick_role in (DOOAF_ROLE_GUN, "gun_origin"):
+            restored = self._dooaf_restore_preserved_ground_gun_track(
+                preserve_gun, slant_m=float(slant_m)
+            )
+            if restored is None:
+                self._dooaf_video_pick_failed(
+                    "Facade slant recorded but could not restore ground gun mark"
+                )
+                return True
+            lat, lon, alt_m = restored
+            print(
+                f"[VGCS:observe] facade slant-only lock {slant_note} — "
+                f"gun kept at ground pick ({lat:.7f}, {lon:.7f})"
+            )
+            if callable(cb):
+                try:
+                    cb(float(lat), float(lon), alt_m)
+                except TypeError:
+                    cb(float(lat), float(lon))
+            self._set_status(
+                f"Facade {slant_note} recorded — gun unchanged (ground). "
+                "Pick TARGET on the building face, then mark impact."
+            )
+            return True
+        if pick_role == DOOAF_ROLE_INTENDED:
+            print(
+                f"[VGCS:observe] facade slant-only lock {slant_note} — "
+                "pick TARGET on the building face (Pick on video)"
+            )
+            self._set_status(
+                f"Facade {slant_note} recorded — click TARGET on the same building face"
+            )
+            dlg = self._dooaf_pick_dialog
+            if dlg is not None:
+                try:
+                    dlg.show()
+                    dlg.raise_()
+                    dlg.activateWindow()
+                except Exception:
+                    pass
+            return True
+        return False
+
     def _complete_pending_dooaf_setup_lrf_pick(
         self,
         slant_m: float | None,
@@ -514,6 +674,19 @@ class DooafOperationsMixin:
                 "confirm; retry the pick or choose a surface with a clear laser return"
             )
             return
+        preserve_gun = getattr(self, "_dooaf_facade_slant_preserve_track", None)
+        slant_only = (
+            pick_role in (DOOAF_ROLE_GUN, "gun_origin")
+            and isinstance(preserve_gun, dict)
+        ) or pick_role == DOOAF_ROLE_INTENDED
+        if slant_only:
+            self._dooaf_facade_slant_preserve_track = None
+            if self._complete_dooaf_facade_slant_only_lrf_pick(
+                float(slant_m),
+                pending,
+                preserve_gun=preserve_gun if isinstance(preserve_gun, dict) else None,
+            ):
+                return
         row: dict[str, object] = {
             "kind": "video_mark",
             "video_x_norm": video_x,
@@ -896,8 +1069,18 @@ class DooafOperationsMixin:
         use_facade_lrf = (
             mode == DOOAF_VIDEO_PICK_FACADE_LRF
             and self._dooaf_lrf_geo_enabled()
-            and pick_role == DOOAF_ROLE_GUN
+            and pick_role in (DOOAF_ROLE_GUN, DOOAF_ROLE_INTENDED)
         )
+        if use_facade_lrf and pick_role in (DOOAF_ROLE_GUN, "gun_origin"):
+            preserved = self._dooaf_saved_ground_gun_track()
+            if preserved is not None:
+                marks = getattr(self, "_dooaf_setup_video_marks", None) or {}
+                uv = marks.get(DOOAF_ROLE_GUN) or marks.get("gun_origin")
+                if isinstance(uv, tuple) and len(uv) == 2:
+                    preserved["setup_uv"] = (float(uv[0]), float(uv[1]))
+            self._dooaf_facade_slant_preserve_track = preserved
+        elif use_facade_lrf:
+            self._dooaf_facade_slant_preserve_track = None
         if not use_facade_lrf:
             return self._complete_dooaf_setup_ground_video_pick(
                 pick_role,
@@ -1065,11 +1248,18 @@ class DooafOperationsMixin:
             )
             if self._dooaf_video_pick_mode == DOOAF_VIDEO_PICK_FACADE_LRF:
                 if self._dooaf_lrf_geo_enabled():
-                    self._set_status(
-                        f"Click a point on the building face for {label} — "
-                        "camera will slew to centre and one LRF lock starts "
-                        "facade session for fast TARGET picks"
-                    )
+                    if role == DOOAF_PICK_TARGET:
+                        self._set_status(
+                            f"Click the building face for facade slant — "
+                            "one LRF lock enables TARGET/IMPACT on the wall "
+                            "(gun on open ground is unchanged)"
+                        )
+                    else:
+                        self._set_status(
+                            f"Click a point on the building face for {label} — "
+                            "camera will slew to centre and one LRF lock starts "
+                            "facade session for fast TARGET picks"
+                        )
                 else:
                     self._set_status(
                         f"LRF unavailable — use Pick on video (ground) or map for {label}"
