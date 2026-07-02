@@ -638,9 +638,12 @@ class VideoMarkTrackingMixin:
             att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
         if track is not None and track.get("click_pin"):
             if self._click_pin_reproject_for_other_role_slew():
-                att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
-                if att_uv is not None:
-                    return att_uv
+                if not (
+                    track.get("ground_video_pick") or track.get("facade_uv_pick")
+                ):
+                    att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
+                    if att_uv is not None:
+                        return att_uv
             pin = track.get("pin_uv")
             if isinstance(pin, tuple):
                 return (float(pin[0]), float(pin[1]))
@@ -886,7 +889,7 @@ class VideoMarkTrackingMixin:
             pending = getattr(self, "_pending_lrf_video_pick", None)
             active_role = self._pending_lrf_dooaf_pick_role(pending)
             if active_role and str(role) != active_role:
-                for key in ("frozen_uv", "pin_uv"):
+                for key in ("frozen_uv", "pin_uv", "ref_uv"):
                     if track is not None:
                         pin = track.get(key)
                         if isinstance(pin, tuple):
