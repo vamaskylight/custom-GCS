@@ -578,6 +578,7 @@ class LrfVideoLockMixin:
                 if pending.purpose == "dooaf_setup" and pick_role in (
                     DOOAF_ROLE_GUN,
                     "gun_origin",
+                    DOOAF_ROLE_INTENDED,
                 ):
                     self._try_record_dooaf_facade_session(float(slant_m))
                 elif pending.purpose == "observation":

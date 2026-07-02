@@ -194,7 +194,8 @@ class DooafSetupDialog(QDialog):
         btn_pick_gun_lrf = QPushButton("LRF lock (facade)")
         btn_pick_gun_lrf.setToolTip(
             "Click a point on a building face — camera slews to centre and "
-            "one LRF lock enables fast TARGET/IMPACT picks on the same face."
+            "one LRF lock enables fast TARGET/IMPACT picks. If you already picked "
+            "the gun on open ground, the gun position is kept and only slant is stored."
         )
         btn_pick_gun_lrf.clicked.connect(
             lambda: self.pick_video_facade_lrf_requested.emit(DOOAF_PICK_GUN)
@@ -228,17 +229,27 @@ class DooafSetupDialog(QDialog):
         )
         btn_pick_tgt_vid = QPushButton("Pick on video")
         btn_pick_tgt_vid.setToolTip(
-            "Click target on video — mark at your click. "
-            "After a facade LRF lock: fast pick on the same building face. "
-            "Otherwise GPS + DEM ray (hills / open ground)."
+            "Click target on the building face — mark at your click. "
+            "After a facade LRF lock: fast pick on the same face. "
+            "For open ground / hills only (not walls), use after LRF slant is set "
+            "or when no building is involved."
         )
         btn_pick_tgt_vid.clicked.connect(
             lambda: self.pick_video_requested.emit(DOOAF_PICK_TARGET)
+        )
+        btn_pick_tgt_lrf = QPushButton("LRF lock (facade slant)")
+        btn_pick_tgt_lrf.setToolTip(
+            "Gun on open ground? Click the building face — one LRF lock records "
+            "slant range for fast TARGET/IMPACT picks without moving the gun mark."
+        )
+        btn_pick_tgt_lrf.clicked.connect(
+            lambda: self.pick_video_facade_lrf_requested.emit(DOOAF_PICK_TARGET)
         )
         btn_clear_tgt = QPushButton("Clear")
         btn_clear_tgt.clicked.connect(self._clear_target)
         tgt_actions.addWidget(btn_pick_tgt)
         tgt_actions.addWidget(btn_pick_tgt_vid)
+        tgt_actions.addWidget(btn_pick_tgt_lrf)
         tgt_actions.addWidget(btn_clear_tgt)
         tgt_actions.addStretch(1)
         tgt_form.addRow("", tgt_actions)

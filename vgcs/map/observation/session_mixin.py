@@ -224,6 +224,12 @@ class ObservationSessionMixin:
                     return
             if self._dooaf_setup_is_ground_workflow():
                 row.update(self._observation_context())
+                if hasattr(self, "_warn_ground_pick_facade_risk"):
+                    self._warn_ground_pick_facade_risk(
+                        float(video_y),
+                        pick_role=DOOAF_ROLE_IMPACT,
+                        label="Impact Target",
+                    )
                 self._enrich_observation_geo_reference(row)
                 if str(row.get("geo_method") or "") in ("", "insufficient"):
                     row["geo_method"] = "dooaf_ground_video"
