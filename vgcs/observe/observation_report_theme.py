@@ -106,6 +106,14 @@ body{
 .badge-info{background:#e0f2fe;color:#0369a1;}
 .badge-dem{background:#e0f2fe;color:var(--dem);border:1px solid #7dd3fc;}
 .badge-muted{background:#f1f5f9;color:var(--muted);}
+.report-sanity-warn{
+  margin:0 0 14px;padding:12px 14px;border-radius:var(--radius-sm);
+  border:1px solid #fdba74;background:#fff7ed;color:#7c2d12;
+}
+.report-sanity-warn strong{display:block;margin-bottom:6px;font-size:13px;}
+.report-sanity-warn p{margin:0;font-size:13px;line-height:1.45;}
+.report-sanity-ok{color:var(--good);font-weight:600;}
+.report-sanity-bad{color:var(--warn);font-weight:600;}
 .dooaf-target-coords td{color:var(--target);font-weight:600;background:#eff6ff;}
 .dooaf-impact-coords td{color:var(--impact);font-weight:600;background:#ecfdf5;}
 .metrics-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px;}
