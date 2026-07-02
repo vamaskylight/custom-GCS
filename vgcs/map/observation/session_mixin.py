@@ -272,6 +272,7 @@ class ObservationSessionMixin:
         row.update(self._observation_context())
         used_lrf = False
         if slant_m is not None:
+            row["lrf_slant_range_m"] = float(slant_m)
             used_lrf = self._apply_lrf_slant_geo_to_row(
                 row,
                 float(slant_m),
