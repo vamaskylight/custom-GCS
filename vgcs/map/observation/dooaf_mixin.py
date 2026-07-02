@@ -6,7 +6,13 @@ from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtWidgets import QDialog, QMessageBox
 
 from vgcs.map.app_settings import QS_APP, QS_ORG
-from vgcs.map.dooaf_setup_dialog import DOOAF_PICK_GUN, DOOAF_PICK_TARGET, DooafSetupDialog
+from vgcs.map.dooaf_setup_dialog import (
+    DOOAF_PICK_GUN,
+    DOOAF_PICK_TARGET,
+    DOOAF_VIDEO_PICK_FACADE_LRF,
+    DOOAF_VIDEO_PICK_GROUND,
+    DooafSetupDialog,
+)
 from vgcs.map.native_video_overlay import VideoOverlayFacadeHint
 from vgcs.map.observation.types import PendingLrfVideoPick
 from vgcs.observe.dooaf import (
@@ -179,6 +185,7 @@ class DooafOperationsMixin:
         self._dooaf_pick_complete = None
         self._dooaf_pick_dialog = None
         self._dooaf_pick_from_video = False
+        self._dooaf_video_pick_mode = ""
         try:
             if bool(getattr(self, "_dooaf_restore_target_after_pick", False)):
                 self._dooaf_restore_target_after_pick = False
@@ -251,6 +258,67 @@ class DooafOperationsMixin:
             except (TypeError, ValueError):
                 alt_m = None
         return float(lat), float(lon), alt_m
+
+    def _complete_dooaf_setup_ground_video_pick(
+        self,
+        pick_role: str,
+        video_x: float,
+        video_y: float,
+        *,
+        label: str,
+    ) -> bool:
+        """GPS + DEM ray at click UV — mark stays where the operator clicked."""
+        geo = self._compute_video_pick_geo(video_x, video_y)
+        if geo is None:
+            row: dict[str, object] = {
+                "kind": "video_mark",
+                "video_x_norm": float(video_x),
+                "video_y_norm": float(video_y),
+            }
+            row.update(self._observation_context())
+            self._enrich_observation_geo_reference(row)
+            reason = str(row.get("geo_warning") or row.get("geo_quality") or "")
+            self._dooaf_video_pick_failed(reason)
+            return True
+        lat, lon, alt_m = geo
+        mark_u, mark_v = float(video_x), float(video_y)
+        self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
+        ref_att = self._read_gimbal_attitude_pair()
+        self._register_dooaf_setup_mark_track(
+            pick_role,
+            ref_uv=(mark_u, mark_v),
+            ref_att=ref_att,
+            lock_att=ref_att,
+            used_lrf_slew=False,
+            geo_lat=float(lat),
+            geo_lon=float(lon),
+            geo_alt_m=alt_m,
+        )
+        try:
+            write_dooaf_setup_video_mark(
+                self._dooaf_settings_store(),
+                pick_role,
+                mark_u,
+                mark_v,
+            )
+        except Exception:
+            pass
+        self._schedule_video_marks_overlay_refresh()
+        cb = self._dooaf_pick_complete
+        self._end_dooaf_map_pick(restore_target_mode=True)
+        print(
+            f"[VGCS:observe] dooaf ground video pick ok role={pick_role} "
+            f"lat={lat:.7f} lon={lon:.7f} alt={alt_m} video=({mark_u:.3f},{mark_v:.3f})"
+        )
+        if callable(cb):
+            try:
+                cb(float(lat), float(lon), alt_m)
+            except TypeError:
+                cb(float(lat), float(lon))
+        self._set_status(
+            f"DOOAF {label} saved (ground video pick) — mark at click; OK to confirm"
+        )
+        return True
 
     def _dooaf_lrf_geo_enabled(self) -> bool:
         """True when C13 TOP LRF lock API is available (Skydroid companion)."""
@@ -796,6 +864,9 @@ class DooafOperationsMixin:
             return True
         pick_role = str(getattr(self, "_dooaf_pick_role", "") or DOOAF_ROLE_INTENDED)
         label = dooaf_role_display(pick_role)
+        mode = str(
+            getattr(self, "_dooaf_video_pick_mode", "") or DOOAF_VIDEO_PICK_GROUND
+        )
         if (
             self._dooaf_lrf_geo_enabled()
             and pick_role != DOOAF_ROLE_GUN
@@ -807,83 +878,47 @@ class DooafOperationsMixin:
                 return True
             print(
                 "[VGCS:observe] facade uv pick geo failed — "
-                "falling back to LRF slew"
+                "falling back to ground video pick"
             )
-        if self._dooaf_lrf_geo_enabled():
-            self._dooaf_setup_video_marks[pick_role] = (
-                float(video_x),
-                float(video_y),
-            )
-            ref_att = self._read_gimbal_attitude_pair()
-            if ref_att is not None:
-                self._dooaf_setup_mark_track[pick_role] = {
-                    "ref_uv": (float(video_x), float(video_y)),
-                    "ref_att": (float(ref_att[0]), float(ref_att[1])),
-                    "h_scale": 1.0,
-                    "v_scale": 1.0,
-                    "lrf_slew": True,
-                }
-            else:
-                self._dooaf_setup_mark_track.pop(pick_role, None)
-            self._sync_video_mark_track_timer()
-            self._schedule_video_marks_overlay_refresh()
-            self._pending_lrf_video_pick = PendingLrfVideoPick(
-                purpose="dooaf_setup",
-                u=float(video_x),
-                v=float(video_y),
-                label=label,
-                pick_role=pick_role,
-            )
-            self._begin_c13_lrf_video_lock_for_pick(
-                float(video_x), float(video_y), label=label
-            )
-            return True
-        geo = self._compute_video_pick_geo(video_x, video_y)
-        if geo is None:
-            row: dict[str, object] = {
-                "kind": "video_mark",
-                "video_x_norm": float(video_x),
-                "video_y_norm": float(video_y),
-            }
-            row.update(self._observation_context())
-            self._enrich_observation_geo_reference(row)
-            reason = str(row.get("geo_warning") or row.get("geo_quality") or "")
-            self._dooaf_video_pick_failed(reason)
-            return True
-        cb = self._dooaf_pick_complete
-        lat, lon, alt_m = geo
-        pick_role = str(getattr(self, "_dooaf_pick_role", "") or DOOAF_ROLE_INTENDED)
-        self._dooaf_setup_video_marks[pick_role] = (float(video_x), float(video_y))
-        ref_att = self._read_gimbal_attitude_pair()
-        self._register_dooaf_setup_mark_track(
-            pick_role,
-            ref_uv=(float(video_x), float(video_y)),
-            ref_att=ref_att,
-            lock_att=ref_att,
-            used_lrf_slew=False,
-            geo_lat=float(lat),
-            geo_lon=float(lon),
-            geo_alt_m=alt_m,
+        use_facade_lrf = (
+            mode == DOOAF_VIDEO_PICK_FACADE_LRF
+            and self._dooaf_lrf_geo_enabled()
+            and pick_role == DOOAF_ROLE_GUN
         )
-        try:
-            write_dooaf_setup_video_mark(
-                self._dooaf_settings_store(),
+        if not use_facade_lrf:
+            return self._complete_dooaf_setup_ground_video_pick(
                 pick_role,
                 float(video_x),
                 float(video_y),
+                label=label,
             )
-        except Exception:
-            pass
-        self._schedule_video_marks_overlay_refresh()
-        self._end_dooaf_map_pick(restore_target_mode=True)
-        print(
-            f"[VGCS:observe] dooaf video pick ok lat={lat:.7f} lon={lon:.7f} "
-            f"alt={alt_m} video=({video_x:.3f},{video_y:.3f})"
+        self._dooaf_setup_video_marks[pick_role] = (
+            float(video_x),
+            float(video_y),
         )
-        try:
-            cb(float(lat), float(lon), alt_m)
-        except TypeError:
-            cb(float(lat), float(lon))
+        ref_att = self._read_gimbal_attitude_pair()
+        if ref_att is not None:
+            self._dooaf_setup_mark_track[pick_role] = {
+                "ref_uv": (float(video_x), float(video_y)),
+                "ref_att": (float(ref_att[0]), float(ref_att[1])),
+                "h_scale": 1.0,
+                "v_scale": 1.0,
+                "lrf_slew": True,
+            }
+        else:
+            self._dooaf_setup_mark_track.pop(pick_role, None)
+        self._sync_video_mark_track_timer()
+        self._schedule_video_marks_overlay_refresh()
+        self._pending_lrf_video_pick = PendingLrfVideoPick(
+            purpose="dooaf_setup",
+            u=float(video_x),
+            v=float(video_y),
+            label=label,
+            pick_role=pick_role,
+        )
+        self._begin_c13_lrf_video_lock_for_pick(
+            float(video_x), float(video_y), label=label
+        )
         return True
 
     def _prepare_dooaf_video_pick(self) -> None:
@@ -923,6 +958,7 @@ class DooafOperationsMixin:
         dlg: DooafSetupDialog,
         *,
         from_video: bool,
+        video_mode: str = DOOAF_VIDEO_PICK_GROUND,
     ) -> None:
         if from_video and not self._gps_available_for_geo_pick():
             QMessageBox.warning(
@@ -991,6 +1027,9 @@ class DooafOperationsMixin:
 
         self._dooaf_pick_complete = on_picked
         self._dooaf_pick_from_video = from_video
+        self._dooaf_video_pick_mode = (
+            str(video_mode) if from_video else ""
+        )
         if from_video:
             self._dooaf_restore_target_after_pick = False
             try:
@@ -1008,37 +1047,37 @@ class DooafOperationsMixin:
             self._prepare_dooaf_video_pick()
             print(
                 f"[VGCS:observe] dooaf video pick started role={role} "
+                f"mode={self._dooaf_video_pick_mode} "
                 f"(Target paused={self._dooaf_restore_target_after_pick})"
             )
-            if self._dooaf_lrf_geo_enabled():
-                if self._dooaf_facade_uv_pick_ready():
-                    slant = getattr(
-                        getattr(self, "_dooaf_facade_session", None),
-                        "slant_range_m",
-                        None,
-                    )
-                    slant_note = (
-                        f" (LRF {float(slant):.1f} m)" if slant is not None else ""
-                    )
+            if self._dooaf_video_pick_mode == DOOAF_VIDEO_PICK_FACADE_LRF:
+                if self._dooaf_lrf_geo_enabled():
                     self._set_status(
-                        f"Click {label} on the same building face{slant_note} — "
-                        "fast pick reuses facade lock (no gimbal slew)"
-                    )
-                elif pick_role == DOOAF_ROLE_INTENDED:
-                    self._set_status(
-                        f"Click actual target on video ({label}) — roof / aim point; "
-                        "camera will slew to frame centre and LRF confirms range"
+                        f"Click a point on the building face for {label} — "
+                        "camera will slew to centre and one LRF lock starts "
+                        "facade session for fast TARGET picks"
                     )
                 else:
                     self._set_status(
-                        f"Click the ground in the video to set {label}; "
-                        "camera will slew to frame centre and LRF confirms range"
+                        f"LRF unavailable — use Pick on video (ground) or map for {label}"
                     )
+            elif self._dooaf_lrf_geo_enabled() and self._dooaf_facade_uv_pick_ready():
+                slant = getattr(
+                    getattr(self, "_dooaf_facade_session", None),
+                    "slant_range_m",
+                    None,
+                )
+                slant_note = (
+                    f" (LRF {float(slant):.1f} m)" if slant is not None else ""
+                )
+                self._set_status(
+                    f"Click {label} on the same building face{slant_note} — "
+                    "fast pick reuses facade lock (no gimbal slew)"
+                )
             else:
                 self._set_status(
-                    f"Click actual target on video ({label}) — roof / aim point on building"
-                    if pick_role == DOOAF_ROLE_INTENDED
-                    else f"Click the ground in the video to set {label} (GPS + DEM geo)"
+                    f"Click {label} on video — mark stays at your click "
+                    "(GPS + DEM ray; open ground / hills)"
                 )
         else:
             try:
@@ -1053,7 +1092,16 @@ class DooafOperationsMixin:
         self._begin_dooaf_pick(role, dlg, from_video=False)
 
     def _begin_dooaf_video_pick(self, role: str, dlg: DooafSetupDialog) -> None:
-        self._begin_dooaf_pick(role, dlg, from_video=True)
+        self._begin_dooaf_pick(
+            role, dlg, from_video=True, video_mode=DOOAF_VIDEO_PICK_GROUND
+        )
+
+    def _begin_dooaf_facade_lrf_video_pick(
+        self, role: str, dlg: DooafSetupDialog
+    ) -> None:
+        self._begin_dooaf_pick(
+            role, dlg, from_video=True, video_mode=DOOAF_VIDEO_PICK_FACADE_LRF
+        )
 
     def _sync_dooaf_settings_from_dialog(
         self,
@@ -1135,6 +1183,9 @@ class DooafOperationsMixin:
         )
         dlg.pick_video_requested.connect(
             lambda role: self._begin_dooaf_video_pick(role, dlg)
+        )
+        dlg.pick_video_facade_lrf_requested.connect(
+            lambda role: self._begin_dooaf_facade_lrf_video_pick(role, dlg)
         )
         dlg.coordinates_changed.connect(
             lambda scope: self._on_dooaf_setup_coordinates_changed(scope, dlg)

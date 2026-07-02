@@ -892,6 +892,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._dooaf_pick_dialog: DooafSetupDialog | None = None
         self._dooaf_pick_from_video = False
         self._dooaf_pick_role: str = ""
+        self._dooaf_video_pick_mode: str = ""
         self._dooaf_setup_video_marks: dict[str, tuple[float, float]] = {}
         self._dooaf_setup_mark_track: dict[str, dict[str, object]] = {}
         self._dooaf_facade_session = DooafFacadeSession()
