@@ -31,6 +31,10 @@ from vgcs.observe.dooaf import (
 DOOAF_PICK_GUN = "gun"
 DOOAF_PICK_TARGET = "target"
 
+# Video pick modes (DOOAF Setup → Pick on video)
+DOOAF_VIDEO_PICK_GROUND = "ground"
+DOOAF_VIDEO_PICK_FACADE_LRF = "facade_lrf"
+
 
 def _coord_edit(value: float | None = None) -> QLineEdit:
     edit = QLineEdit()
@@ -115,6 +119,7 @@ class DooafSetupDialog(QDialog):
 
     pick_point_requested = Signal(str)
     pick_video_requested = Signal(str)
+    pick_video_facade_lrf_requested = Signal(str)
     coordinates_changed = Signal(str)
 
     def __init__(
@@ -180,16 +185,25 @@ class DooafSetupDialog(QDialog):
         )
         btn_pick_gun_vid = QPushButton("Pick on video")
         btn_pick_gun_vid.setToolTip(
-            "Hide this dialog and click the ground in the live video feed. "
-            "On C13: camera slews to the click and LRF confirms range."
+            "Click gun position on video — mark stays on your click. "
+            "Uses GPS + DEM ray (open ground / hills; no LRF slew)."
         )
         btn_pick_gun_vid.clicked.connect(
             lambda: self.pick_video_requested.emit(DOOAF_PICK_GUN)
+        )
+        btn_pick_gun_lrf = QPushButton("LRF lock (facade)")
+        btn_pick_gun_lrf.setToolTip(
+            "Click a point on a building face — camera slews to centre and "
+            "one LRF lock enables fast TARGET/IMPACT picks on the same face."
+        )
+        btn_pick_gun_lrf.clicked.connect(
+            lambda: self.pick_video_facade_lrf_requested.emit(DOOAF_PICK_GUN)
         )
         btn_clear_gun = QPushButton("Clear")
         btn_clear_gun.clicked.connect(self._clear_gun)
         gun_actions.addWidget(btn_pick_gun)
         gun_actions.addWidget(btn_pick_gun_vid)
+        gun_actions.addWidget(btn_pick_gun_lrf)
         gun_actions.addWidget(btn_clear_gun)
         gun_actions.addStretch(1)
         gun_form.addRow("", gun_actions)
@@ -214,8 +228,9 @@ class DooafSetupDialog(QDialog):
         )
         btn_pick_tgt_vid = QPushButton("Pick on video")
         btn_pick_tgt_vid.setToolTip(
-            "Hide this dialog and click the intended target on the live video feed. "
-            "On C13: camera slews to the click and LRF confirms range."
+            "Click target on video — mark at your click. "
+            "After a facade LRF lock: fast pick on the same building face. "
+            "Otherwise GPS + DEM ray (hills / open ground)."
         )
         btn_pick_tgt_vid.clicked.connect(
             lambda: self.pick_video_requested.emit(DOOAF_PICK_TARGET)
