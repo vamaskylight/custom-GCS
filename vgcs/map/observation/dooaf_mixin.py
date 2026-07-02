@@ -556,9 +556,30 @@ class DooafOperationsMixin:
                 pass
         self._schedule_video_marks_overlay_refresh()
         self._refresh_dooaf_facade_overlay_after_change()
+        slant_note = f"LRF {float(slant_m):.1f} m"
+        if pick_role == DOOAF_ROLE_INTENDED:
+            video_x, video_y = float(pending.u), float(pending.v)
+            if self._complete_dooaf_setup_facade_uv_pick(
+                pick_role,
+                video_x,
+                video_y,
+                label=dooaf_role_display(pick_role),
+            ):
+                print(
+                    f"[VGCS:observe] facade slant-only lock {slant_note} — "
+                    f"target at click ({video_x:.3f},{video_y:.3f})"
+                )
+                self._set_status(
+                    f"Target set at LRF lock point ({slant_note}) — "
+                    "confirm in DOOAF Setup or re-pick on video"
+                )
+                return True
+            print(
+                f"[VGCS:observe] facade slant-only lock {slant_note} — "
+                "target geo from click failed; use Pick on video"
+            )
         cb = self._dooaf_pick_complete
         self._end_dooaf_map_pick(restore_target_mode=True)
-        slant_note = f"LRF {float(slant_m):.1f} m"
         if preserve_gun is not None and pick_role in (DOOAF_ROLE_GUN, "gun_origin"):
             restored = self._dooaf_restore_preserved_ground_gun_track(
                 preserve_gun, slant_m=float(slant_m)
@@ -584,10 +605,6 @@ class DooafOperationsMixin:
             )
             return True
         if pick_role == DOOAF_ROLE_INTENDED:
-            print(
-                f"[VGCS:observe] facade slant-only lock {slant_note} — "
-                "pick TARGET on the building face (Pick on video)"
-            )
             self._set_status(
                 f"Facade {slant_note} recorded — click TARGET on the same building face"
             )
@@ -1101,6 +1118,18 @@ class DooafOperationsMixin:
             float(video_x),
             float(video_y),
         )
+        gun_track = self._dooaf_setup_mark_track.get(DOOAF_ROLE_GUN)
+        if isinstance(gun_track, dict) and gun_track.get("ground_video_pick"):
+            pin = (
+                gun_track.get("frozen_uv")
+                or gun_track.get("pin_uv")
+                or gun_track.get("ref_uv")
+            )
+            if isinstance(pin, tuple):
+                frozen = (float(pin[0]), float(pin[1]))
+                gun_track["frozen_uv"] = frozen
+                gun_track["pin_uv"] = frozen
+                gun_track["ground_video_pick"] = True
         ref_att = self._read_gimbal_attitude_pair()
         if ref_att is not None:
             self._dooaf_setup_mark_track[pick_role] = {
