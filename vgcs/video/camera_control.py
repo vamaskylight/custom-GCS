@@ -447,6 +447,7 @@ class SkydroidCameraControl:
         frame_w: int = 1280,
         frame_h: int = 720,
         on_sample: Callable[[float], None] | None = None,
+        hold_gimbal: bool | None = None,
     ) -> float | None:
         """Lock LRF on video target (normalized 0..1 coords on companion video frame)."""
         try:
@@ -456,6 +457,7 @@ class SkydroidCameraControl:
                 frame_w=int(frame_w),
                 frame_h=int(frame_h),
                 on_sample=on_sample,
+                hold_gimbal=hold_gimbal,
             )
         except Exception:
             return None

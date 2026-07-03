@@ -2561,8 +2561,12 @@ class SkydroidTopUdpAdapter:
             self._transport._port = active_port
 
     @staticmethod
-    def _lrf_lock_move_gimbal() -> bool:
+    def _lrf_lock_move_gimbal(*, hold_gimbal: bool | None = None) -> bool:
         """Default: slew gimbal to click on LRF lock. Set VGCS_LRF_HOLD_GIMBAL=1 for manual aim."""
+        if hold_gimbal is True:
+            return False
+        if hold_gimbal is False:
+            return True
         if str(os.environ.get("VGCS_LRF_HOLD_GIMBAL", "") or "").strip().lower() in (
             "1",
             "true",
@@ -2628,11 +2632,12 @@ class SkydroidTopUdpAdapter:
         frame_w: int = _LRF_FRAME_W,
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
+        hold_gimbal: bool | None = None,
     ) -> float | None:
         """C13 LRF lock: slew gimbal to click (default), then confirm stable E-class SLR."""
         if not self.gimbal_telemetry_ok():
             return None
-        move_gimbal = self._lrf_lock_move_gimbal()
+        move_gimbal = self._lrf_lock_move_gimbal(hold_gimbal=hold_gimbal)
         fw = _LRF_FRAME_W
         fh = _LRF_FRAME_H
         u_in, v_in = float(u), float(v)

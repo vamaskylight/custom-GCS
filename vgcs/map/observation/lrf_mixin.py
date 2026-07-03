@@ -471,7 +471,9 @@ class LrfVideoLockMixin:
         self._refresh_lrf_lock_overlay()
         self._set_status("C13 LRF target unlocked")
 
-    def _begin_c13_lrf_video_lock(self, u: float, v: float) -> None:
+    def _begin_c13_lrf_video_lock(
+        self, u: float, v: float, *, hold_gimbal: bool | None = None
+    ) -> None:
         cc = getattr(self, "_camera_control", None)
         unlock = getattr(cc, "unlock_lrf", None)
         if callable(unlock):
@@ -512,6 +514,8 @@ class LrfVideoLockMixin:
             if getattr(self, "_lrf_lock_geo_label", ""):
                 status += f" · {self._lrf_lock_geo_label}"
             self._set_status(status)
+        elif hold_gimbal:
+            self._set_status("Locking LRF at current aim (camera stays put)…")
         else:
             self._set_status("Locking LRF — slewing camera to target…")
         try:
@@ -522,7 +526,15 @@ class LrfVideoLockMixin:
         except Exception:
             pass
         fw, fh = 1280, 720
-        task = LrfLockTask(cc, u, v, self._lrf_lock_bridge, frame_w=fw, frame_h=fh)
+        task = LrfLockTask(
+            cc,
+            u,
+            v,
+            self._lrf_lock_bridge,
+            frame_w=fw,
+            frame_h=fh,
+            hold_gimbal=hold_gimbal,
+        )
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(task)
 

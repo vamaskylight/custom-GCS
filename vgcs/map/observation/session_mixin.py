@@ -187,12 +187,18 @@ class ObservationSessionMixin:
                         row["target_alt_m"] = float(alt_m)
                     row["geo_quality"] = "fair"
                     row["geo_method"] = "lrf_facade_uv"
-                    stale = not self._dooaf_facade_uv_pick_ready()
-                    row["geo_warning"] = (
-                        "facade lock stale (gimbal/drone moved) — geo from lock pose"
-                        if stale
-                        else ""
+                    geo_warn = self._facade_geo_warning_from_uv(
+                        float(video_x), float(video_y)
                     )
+                    stale = not self._dooaf_facade_uv_pick_ready()
+                    parts: list[str] = []
+                    if geo_warn:
+                        parts.append(geo_warn)
+                    if stale:
+                        parts.append(
+                            "facade lock stale (gimbal/drone moved) — geo from lock pose"
+                        )
+                    row["geo_warning"] = "; ".join(parts)
                     slant = self._dooaf_facade_session.slant_range_m
                     if slant is not None:
                         row["lrf_slant_range_m"] = float(slant)
@@ -229,6 +235,15 @@ class ObservationSessionMixin:
                         f"video=({float(video_x):.3f},{float(video_y):.3f})"
                     )
                     return
+                print(
+                    "[VGCS:observe] impact blocked — facade lock active but geo "
+                    "missing; re-lock TARGET LRF on the building face"
+                )
+                self._set_status(
+                    "Impact needs facade geo — re-lock TARGET on the building, "
+                    "then click impact (no gimbal slew)"
+                )
+                return
             if self._dooaf_setup_is_ground_workflow():
                 row.update(self._observation_context())
                 if hasattr(self, "_warn_ground_pick_facade_risk"):
