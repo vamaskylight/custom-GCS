@@ -434,10 +434,22 @@ class DooafOperationsMixin:
         prev = str(row.get("geo_warning") or "").strip()
         row["geo_warning"] = f"{prev}; {note}" if prev else note
 
-    def _begin_c13_lrf_video_lock_for_pick(self, u: float, v: float, *, label: str) -> None:
+    def _begin_c13_lrf_video_lock_for_pick(
+        self,
+        u: float,
+        v: float,
+        *,
+        label: str,
+        hold_gimbal: bool | None = None,
+    ) -> None:
         """Start async LRF lock for a DOOAF / observation video pick."""
-        self._set_status(f"{label} — slewing camera and locking LRF…")
-        self._begin_c13_lrf_video_lock(float(u), float(v))
+        if hold_gimbal:
+            self._set_status(
+                f"{label} — reading LRF at current aim (camera stays put)…"
+            )
+        else:
+            self._set_status(f"{label} — slewing camera and locking LRF…")
+        self._begin_c13_lrf_video_lock(float(u), float(v), hold_gimbal=hold_gimbal)
 
     def _dooaf_saved_ground_gun_track(self) -> dict[str, object] | None:
         """Return a copy of the ground-picked gun track, if any."""
@@ -921,8 +933,11 @@ class DooafOperationsMixin:
             vfov_deg=vfov,
             ctx=self._observation_context(),
         )
-        if not geo.ok or geo.target_lat is None or geo.target_lon is None:
+        if geo.target_lat is None or geo.target_lon is None:
             return None
+        # Field facade shots are often near-horizon: slant geo still has coordinates
+        # but quality may be "insufficient" (depression < 1°). Reject only when coords
+        # are missing — callers attach geo.warning for the operator.
         alt: float | None = None
         if geo.target_alt_m is not None:
             try:
@@ -930,6 +945,23 @@ class DooafOperationsMixin:
             except (TypeError, ValueError):
                 alt = None
         return float(geo.target_lat), float(geo.target_lon), alt
+
+    def _facade_geo_warning_from_uv(
+        self, video_x: float, video_y: float
+    ) -> str:
+        """Warning text for a facade UV geo estimate (empty when none)."""
+        session = getattr(self, "_dooaf_facade_session", None)
+        if session is None or not session.has_lock:
+            return ""
+        hfov, vfov = self._c13_lrf_geo_fov()
+        geo = session.geo_from_uv(
+            float(video_x),
+            float(video_y),
+            hfov_deg=hfov,
+            vfov_deg=vfov,
+            ctx=self._observation_context(),
+        )
+        return str(geo.warning or geo.quality or "").strip()
 
     def _facade_lock_gimbal_att(self) -> tuple[float, float] | None:
         session = getattr(self, "_dooaf_facade_session", None)
@@ -1150,8 +1182,14 @@ class DooafOperationsMixin:
             label=label,
             pick_role=pick_role,
         )
+        # Facade slant lock: read range along the laser without slewing the gimbal.
+        # Operator aims the building at the crosshair first; gun/target marks stay frozen.
+        hold_gimbal = pick_role == DOOAF_ROLE_INTENDED
         self._begin_c13_lrf_video_lock_for_pick(
-            float(video_x), float(video_y), label=label
+            float(video_x),
+            float(video_y),
+            label=label,
+            hold_gimbal=hold_gimbal,
         )
         return True
 
@@ -1288,9 +1326,9 @@ class DooafOperationsMixin:
                 if self._dooaf_lrf_geo_enabled():
                     if role == DOOAF_PICK_TARGET:
                         self._set_status(
-                            f"Click the building face for facade slant — "
-                            "one LRF lock enables TARGET/IMPACT on the wall "
-                            "(gun on open ground is unchanged)"
+                            "Aim the building at the crosshair, then click the face — "
+                            "LRF reads range in a few seconds (camera does not move; "
+                            "gun mark stays put)"
                         )
                     else:
                         self._set_status(

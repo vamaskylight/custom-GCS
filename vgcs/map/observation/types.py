@@ -65,6 +65,7 @@ class LrfLockTask(QRunnable):
         *,
         frame_w: int = 1280,
         frame_h: int = 720,
+        hold_gimbal: bool | None = None,
     ) -> None:
         super().__init__()
         self._cc = cc
@@ -73,6 +74,7 @@ class LrfLockTask(QRunnable):
         self._bridge = bridge
         self._frame_w = int(frame_w)
         self._frame_h = int(frame_h)
+        self._hold_gimbal = hold_gimbal
 
     def run(self) -> None:
         dist = None
@@ -92,6 +94,7 @@ class LrfLockTask(QRunnable):
                     frame_w=self._frame_w,
                     frame_h=self._frame_h,
                     on_sample=_on_sample,
+                    hold_gimbal=self._hold_gimbal,
                 )
         except Exception as exc:
             print(f"[VGCS:lrf] lock failed: {exc}")
