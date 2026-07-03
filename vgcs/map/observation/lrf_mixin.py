@@ -472,7 +472,12 @@ class LrfVideoLockMixin:
         self._set_status("C13 LRF target unlocked")
 
     def _begin_c13_lrf_video_lock(
-        self, u: float, v: float, *, hold_gimbal: bool | None = None
+        self,
+        u: float,
+        v: float,
+        *,
+        hold_gimbal: bool | None = None,
+        hold_slant_boresight: bool = False,
     ) -> None:
         cc = getattr(self, "_camera_control", None)
         unlock = getattr(cc, "unlock_lrf", None)
@@ -534,6 +539,7 @@ class LrfVideoLockMixin:
             frame_w=fw,
             frame_h=fh,
             hold_gimbal=hold_gimbal,
+            hold_slant_boresight=hold_slant_boresight,
         )
         pool = getattr(self, "_video_pool", None) or QThreadPool.globalInstance()
         pool.start(task)

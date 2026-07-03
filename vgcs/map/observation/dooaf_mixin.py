@@ -441,6 +441,7 @@ class DooafOperationsMixin:
         *,
         label: str,
         hold_gimbal: bool | None = None,
+        hold_slant_boresight: bool = False,
     ) -> None:
         """Start async LRF lock for a DOOAF / observation video pick."""
         if hold_gimbal:
@@ -449,7 +450,12 @@ class DooafOperationsMixin:
             )
         else:
             self._set_status(f"{label} — slewing camera and locking LRF…")
-        self._begin_c13_lrf_video_lock(float(u), float(v), hold_gimbal=hold_gimbal)
+        self._begin_c13_lrf_video_lock(
+            float(u),
+            float(v),
+            hold_gimbal=hold_gimbal,
+            hold_slant_boresight=hold_slant_boresight,
+        )
 
     def _dooaf_saved_ground_gun_track(self) -> dict[str, object] | None:
         """Return a copy of the ground-picked gun track, if any."""
@@ -687,18 +693,25 @@ class DooafOperationsMixin:
                 except Exception:
                     pass
                 self._schedule_video_marks_overlay_refresh()
-                self._end_dooaf_map_pick(restore_target_mode=True)
+                cb = self._dooaf_pick_complete
                 print(
                     f"[VGCS:observe] dooaf video pick ok (DEM fallback) "
                     f"lat={float(lat_fb):.7f} lon={float(lon_fb):.7f} "
                     f"video=({mark_u:.3f},{mark_v:.3f})"
                 )
-                cb = self._dooaf_pick_complete
                 if callable(cb):
                     try:
                         cb(float(lat_fb), float(lon_fb), alt_fb)
                     except TypeError:
                         cb(float(lat_fb), float(lon_fb))
+                else:
+                    self._apply_dooaf_setup_pick_to_settings(
+                        pick_role,
+                        float(lat_fb),
+                        float(lon_fb),
+                        alt_m=alt_fb,
+                    )
+                self._end_dooaf_map_pick(restore_target_mode=True)
                 self._set_status(
                     f"DOOAF {pending.label} saved (DEM estimate) — "
                     "confirm or re-pick with LRF for better accuracy"
@@ -1190,6 +1203,7 @@ class DooafOperationsMixin:
             float(video_y),
             label=label,
             hold_gimbal=hold_gimbal,
+            hold_slant_boresight=hold_gimbal,
         )
         return True
 
@@ -1224,6 +1238,47 @@ class DooafOperationsMixin:
         except Exception:
             pass
 
+    def _apply_dooaf_setup_pick_to_settings(
+        self,
+        pick_role: str,
+        lat: float,
+        lon: float,
+        alt_m: float | None = None,
+    ) -> None:
+        """Write gun/target coords to QSettings and refresh the setup dialog fields."""
+        pick_alt = alt_m
+        if pick_alt is None:
+            pick_alt = self._dem_elevation_at(float(lat), float(lon))
+        st = self._dooaf_settings_store()
+        merged = apply_map_pick_to_settings(
+            self._resolved_dooaf_settings(),
+            pick_role,
+            float(lat),
+            float(lon),
+            alt_m=pick_alt,
+        )
+        merged = enrich_dooaf_settings_elevation_from_dem(
+            merged, self._observe_dem_path()
+        )
+        write_dooaf_settings(st, merged)
+        dlg = self._dooaf_pick_dialog
+        if dlg is not None:
+            if merged.gun_lat is not None and merged.gun_lon is not None:
+                dlg.set_point_coords(
+                    DOOAF_PICK_GUN,
+                    float(merged.gun_lat),
+                    float(merged.gun_lon),
+                    alt_m=merged.gun_alt_m,
+                )
+            if merged.target_lat is not None and merged.target_lon is not None:
+                dlg.set_point_coords(
+                    DOOAF_PICK_TARGET,
+                    float(merged.target_lat),
+                    float(merged.target_lon),
+                    alt_m=merged.target_alt_m,
+                )
+        self._refresh_dooaf_map_overlay()
+
     def _begin_dooaf_pick(
         self,
         role: str,
@@ -1252,46 +1307,21 @@ class DooafOperationsMixin:
             lon: float,
             alt_m: float | None = None,
         ) -> None:
-            pick_alt = alt_m
-            if pick_alt is None:
-                pick_alt = self._dem_elevation_at(float(lat), float(lon))
-            st = self._dooaf_settings_store()
-            merged = apply_map_pick_to_settings(
-                self._resolved_dooaf_settings(),
-                pick_role,
-                float(lat),
-                float(lon),
-                alt_m=pick_alt,
+            self._apply_dooaf_setup_pick_to_settings(
+                pick_role, float(lat), float(lon), alt_m=alt_m
             )
-            merged = enrich_dooaf_settings_elevation_from_dem(
-                merged, self._observe_dem_path()
-            )
-            write_dooaf_settings(st, merged)
-            if merged.gun_lat is not None and merged.gun_lon is not None:
-                dlg.set_point_coords(
-                    DOOAF_PICK_GUN,
-                    float(merged.gun_lat),
-                    float(merged.gun_lon),
-                    alt_m=merged.gun_alt_m,
-                )
-            if merged.target_lat is not None and merged.target_lon is not None:
-                dlg.set_point_coords(
-                    DOOAF_PICK_TARGET,
-                    float(merged.target_lat),
-                    float(merged.target_lon),
-                    alt_m=merged.target_alt_m,
-                )
-            self._refresh_dooaf_map_overlay()
             dlg.show()
             dlg.raise_()
             dlg.activateWindow()
             show_alt = (
-                merged.target_alt_m
+                self._resolved_dooaf_settings().target_alt_m
                 if pick_role == DOOAF_ROLE_INTENDED
-                else merged.gun_alt_m
+                else self._resolved_dooaf_settings().gun_alt_m
             )
             if show_alt is None:
-                show_alt = pick_alt
+                show_alt = alt_m
+                if show_alt is None:
+                    show_alt = self._dem_elevation_at(float(lat), float(lon))
             alt_note = f", alt {show_alt:.1f} m (DEM)" if show_alt is not None else ""
             self._set_status(
                 f"DOOAF {label} saved from {source}{alt_note} — OK to confirm or pick again"

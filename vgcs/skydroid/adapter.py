@@ -2633,6 +2633,7 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
         on_sample: Callable[[float], None] | None = None,
         hold_gimbal: bool | None = None,
+        hold_slant_boresight: bool = False,
     ) -> float | None:
         """C13 LRF lock: slew gimbal to click (default), then confirm stable E-class SLR."""
         if not self.gimbal_telemetry_ok():
@@ -2700,12 +2701,19 @@ class SkydroidTopUdpAdapter:
             if not move_gimbal:
                 max_off = self._hold_max_click_offset_deg()
                 if float(click_offset_deg) > float(max_off):
-                    print(
-                        f"[VGCS:lrf] lock rejected — click {click_offset_deg:.1f}° "
-                        f"off laser aim (max {max_off:.1f}°). "
-                        f"Aim gimbal so the target is under the centre crosshair, then click."
-                    )
-                    return None
+                    if hold_slant_boresight:
+                        print(
+                            f"[VGCS:lrf] hold slant — click {click_offset_deg:.1f}° "
+                            f"off laser boresight; reading SLR along crosshair "
+                            f"(target aim stays at click UV)"
+                        )
+                    else:
+                        print(
+                            f"[VGCS:lrf] lock rejected — click {click_offset_deg:.1f}° "
+                            f"off laser aim (max {max_off:.1f}°). "
+                            f"Aim gimbal so the target is under the centre crosshair, then click."
+                        )
+                        return None
 
             pre_slr_available = self._query_slr_distance_m(log=False, fresh=False)
             if pre_slr_available is None:
