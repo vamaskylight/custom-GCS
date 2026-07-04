@@ -1011,34 +1011,51 @@ class ObservationSessionMixin:
             warn = str(getattr(self, "_obs_export_warning_text", "") or "").strip()
             self._obs_export_warning_text = ""
 
-            def _open_folder() -> None:
+            def _prompt_open_report() -> None:
                 try:
                     lines = [ln.strip() for ln in str(summary).splitlines() if ln.strip()]
-                    for ln in lines[1:]:
-                        p = Path(ln)
-                        if p.suffix.lower() in (".html", ".htm") and p.is_file():
-                            QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
-                            return
+                    html_path: Path | None = None
                     folder = ""
                     for ln in lines[1:]:
                         p = Path(ln)
+                        if p.suffix.lower() in (".html", ".htm") and p.is_file():
+                            html_path = p.resolve()
+                            folder = str(p.parent)
+                            break
                         folder = str(p.parent if p.suffix else p)
-                        break
+                    body = str(summary)
+                    if warn:
+                        body = f"Report exported.\n\nWarnings:\n{warn}\n\n{summary}"
+                    box = QMessageBox(self)
+                    box.setWindowTitle("Observation Report")
+                    box.setText(body)
+                    box.setIcon(
+                        QMessageBox.Icon.Warning if warn else QMessageBox.Icon.Information
+                    )
+                    open_btn = box.addButton(
+                        "Open HTML report",
+                        QMessageBox.ButtonRole.AcceptRole,
+                    )
+                    box.addButton("Stay in VGCS", QMessageBox.ButtonRole.RejectRole)
                     if folder:
+                        folder_btn = box.addButton(
+                            "Open folder",
+                            QMessageBox.ButtonRole.ActionRole,
+                        )
+                    else:
+                        folder_btn = None
+                    box.exec()
+                    clicked = box.clickedButton()
+                    if clicked is open_btn and html_path is not None:
+                        QDesktopServices.openUrl(
+                            QUrl.fromLocalFile(str(html_path))
+                        )
+                    elif clicked is folder_btn and folder:
                         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
                 except Exception:
                     pass
 
-            QTimer.singleShot(400, _open_folder)
-            if warn:
-                QTimer.singleShot(
-                    600,
-                    lambda: QMessageBox.information(
-                        self,
-                        "Observation Report",
-                        f"Report exported.\n\nWarnings:\n{warn}\n\n{summary}",
-                    ),
-                )
+            QTimer.singleShot(400, _prompt_open_report)
 
     def _write_observation_html_summary(self, path: str) -> None:
         export_rows: list[dict[str, object]] = []

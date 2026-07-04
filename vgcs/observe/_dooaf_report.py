@@ -2474,7 +2474,8 @@ def format_elevation_summary_html(session: DooafSession) -> str:
         rows.append(
             f"<tr><td class='label-col'>Height correction (target − impact)</td>"
             f"<td><strong>{h:+.1f} m</strong> "
-            "<span class='muted'>(+ = target above impact)</span></td></tr>"
+            "<span class='muted'>(+ = target above impact; "
+            "facade shots use video Y × LRF slant for vertical separation)</span></td></tr>"
         )
     elif tgt is not None and imp is not None:
         rows.append(
