@@ -313,7 +313,11 @@ class ObservationExportTask(QRunnable):
             detailed_log = format_observation_detailed_log_html(
                 export_rows, self._obs_cell_fn
             )
-            dooaf_summary = format_dooaf_html_summary(session, observation_row=obs_row)
+            dooaf_summary = format_dooaf_html_summary(
+                session,
+                observation_row=obs_row,
+                observation_rows=list(self._rows),
+            )
             html = assemble_observation_report_html(
                 len(self._rows),
                 dooaf_summary,
