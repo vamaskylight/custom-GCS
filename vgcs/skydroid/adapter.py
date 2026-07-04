@@ -2383,6 +2383,7 @@ class SkydroidTopUdpAdapter:
         align_ok: bool = True,
         click_offset_deg: float,
         hold_gimbal: bool = False,
+        hold_slant_boresight: bool = False,
     ) -> float | None:
         """Stable SLR after lock; reject unchanged range when click is off laser boresight."""
         stable = self._try_accept_stable_slr(samples, elapsed=elapsed, align_ok=align_ok)
@@ -2399,6 +2400,13 @@ class SkydroidTopUdpAdapter:
                 pre_slr, float(stable), float(click_offset_deg)
             ):
                 return None
+            return float(stable)
+        if hold_slant_boresight and hold_gimbal and unchanged:
+            # DOOAF facade: SLR reads along crosshair; click UV marks the wall point.
+            print(
+                f"[VGCS:lrf] hold-slant lock ok — stable SLR {float(stable):.1f} m "
+                f"at crosshair (click {float(click_offset_deg):.1f}° off marks facade UV)"
+            )
             return float(stable)
         if align_attempted and off_centre and unchanged:
             print(
@@ -2737,6 +2745,7 @@ class SkydroidTopUdpAdapter:
 
             if (
                 not move_gimbal
+                and not hold_slant_boresight
                 and prev_locked_m is not None
                 and pre_slr is not None
                 and prev_lock_xy is not None
@@ -2963,6 +2972,7 @@ class SkydroidTopUdpAdapter:
                         align_ok=align_ok,
                         click_offset_deg=click_offset_deg,
                         hold_gimbal=not move_gimbal,
+                        hold_slant_boresight=hold_slant_boresight,
                     )
                 if stable is not None:
                     print(
@@ -3001,6 +3011,7 @@ class SkydroidTopUdpAdapter:
                         align_ok=align_ok,
                         click_offset_deg=click_offset_deg,
                         hold_gimbal=not move_gimbal,
+                        hold_slant_boresight=hold_slant_boresight,
                     )
                 if stable is not None:
                     if align_ok:
