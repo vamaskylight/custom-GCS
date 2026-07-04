@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QThreadPool, QTimer, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QImage
+from PySide6.QtCore import QSettings, QThreadPool, QTimer, Qt
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from vgcs.map.app_settings import QS_APP, QS_ORG
@@ -58,6 +60,39 @@ from vgcs.observe.target_measure import (
     target_track_from_observations,
     video_mark_span_norm,
 )
+
+
+def _open_path_in_system_viewer(path: str) -> None:
+    """Open a file in the default OS viewer without routing through Qt URL handlers."""
+    target = Path(path).resolve()
+    if not target.is_file():
+        return
+    p = str(target)
+    if sys.platform == "win32":
+        os.startfile(p)  # noqa: S606 — intentional Windows shell open
+        return
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", p], close_fds=True, start_new_session=True)
+        return
+    subprocess.Popen(["xdg-open", p], close_fds=True, start_new_session=True)
+
+
+def _refocus_vgcs_window(host: object) -> None:
+    """Bring the main VGCS window back after opening an external report viewer."""
+    try:
+        win = host.window() if hasattr(host, "window") else host
+        if win is None:
+            return
+        if hasattr(win, "isMinimized") and win.isMinimized():
+            win.showNormal()
+        if hasattr(win, "show"):
+            win.show()
+        if hasattr(win, "raise_"):
+            win.raise_()
+        if hasattr(win, "activateWindow"):
+            win.activateWindow()
+    except Exception:
+        pass
 
 
 class ObservationSessionMixin:
@@ -1023,10 +1058,14 @@ class ObservationSessionMixin:
                             folder = str(p.parent)
                             break
                         folder = str(p.parent if p.suffix else p)
-                    body = str(summary)
+                    body = (
+                        f"Report exported.\n\n{summary}\n\n"
+                        "VGCS keeps running — use Alt+Tab to return after viewing the report."
+                    )
                     if warn:
-                        body = f"Report exported.\n\nWarnings:\n{warn}\n\n{summary}"
-                    box = QMessageBox(self)
+                        body = f"Report exported.\n\nWarnings:\n{warn}\n\n{summary}\n\nVGCS keeps running."
+                    parent = self.window() or self
+                    box = QMessageBox(parent)
                     box.setWindowTitle("Observation Report")
                     box.setText(body)
                     box.setIcon(
@@ -1036,24 +1075,41 @@ class ObservationSessionMixin:
                         "Open HTML report",
                         QMessageBox.ButtonRole.AcceptRole,
                     )
-                    box.addButton("Stay in VGCS", QMessageBox.ButtonRole.RejectRole)
+                    stay_btn = box.addButton(
+                        "Stay in VGCS",
+                        QMessageBox.ButtonRole.RejectRole,
+                    )
+                    folder_btn = None
                     if folder:
                         folder_btn = box.addButton(
                             "Open folder",
                             QMessageBox.ButtonRole.ActionRole,
                         )
-                    else:
-                        folder_btn = None
                     box.exec()
                     clicked = box.clickedButton()
                     if clicked is open_btn and html_path is not None:
-                        QDesktopServices.openUrl(
-                            QUrl.fromLocalFile(str(html_path))
+                        from vgcs.video.pipeline import notify_companion_report_viewer_opened
+
+                        notify_companion_report_viewer_opened(duration_s=180.0)
+                        _open_path_in_system_viewer(str(html_path))
+                        print(
+                            "[VGCS:observe] report opened in external browser — "
+                            "VGCS still running (Alt+Tab to return)"
                         )
+                        self._set_status(
+                            "Report opened in browser — VGCS still running (Alt+Tab to return)"
+                        )
+                        QTimer.singleShot(1200, lambda: _refocus_vgcs_window(self))
                     elif clicked is folder_btn and folder:
-                        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
-                except Exception:
-                    pass
+                        _open_path_in_system_viewer(folder)
+                        QTimer.singleShot(400, lambda: _refocus_vgcs_window(self))
+                    elif clicked is stay_btn:
+                        QTimer.singleShot(0, lambda: _refocus_vgcs_window(self))
+                except Exception as exc:
+                    try:
+                        print(f"[VGCS:observe] report open failed: {exc}")
+                    except Exception:
+                        pass
 
             QTimer.singleShot(400, _prompt_open_report)
 
