@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from vgcs.observe.geo_reference import GeoReferenceResult, compute_lrf_slant_geo
+from vgcs.observe.geo_reference import GeoReferenceResult, compute_lrf_facade_plane_geo
 
 
 @dataclass
@@ -135,7 +135,7 @@ class DooafFacadeSession:
         # Facade UV geo always uses the LRF-lock gimbal pose — not live GAC (yaw lags in LOITER).
         g_yaw = float(lock.gimbal_yaw_deg)
         g_pitch = float(lock.gimbal_pitch_deg)
-        return compute_lrf_slant_geo(
+        return compute_lrf_facade_plane_geo(
             vehicle_lat=lock.vehicle_lat,
             vehicle_lon=lock.vehicle_lon,
             vehicle_heading_deg=lock.vehicle_heading_deg,

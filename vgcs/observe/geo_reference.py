@@ -565,6 +565,51 @@ def compute_geo_reference(
     )
 
 
+def _lrf_camera_dir_ned_unit(
+    *,
+    vehicle_heading_deg: float | None,
+    vehicle_roll_deg: float | None = None,
+    vehicle_pitch_deg: float | None = None,
+    gimbal_yaw_deg: float | None,
+    gimbal_pitch_deg: float | None,
+    video_x_norm: float = 0.5,
+    video_y_norm: float = 0.5,
+    camera_hfov_deg: float = 83.4,
+    camera_vfov_deg: float | None = None,
+) -> tuple[tuple[float, float, float], bool] | None:
+    """Unit camera look direction in NED (north, east, down)."""
+    gimbal_assumed = False
+    gy = float(gimbal_yaw_deg) if gimbal_yaw_deg is not None else 0.0
+    gp = float(gimbal_pitch_deg) if gimbal_pitch_deg is not None else 0.0
+    if gimbal_yaw_deg is None or gimbal_pitch_deg is None:
+        gimbal_assumed = True
+
+    hfov = max(5.0, min(120.0, float(camera_hfov_deg)))
+    vfov = float(camera_vfov_deg) if camera_vfov_deg is not None else hfov * 0.5625
+    vfov = max(5.0, min(90.0, vfov))
+    u = max(0.0, min(1.0, float(video_x_norm)))
+    v = max(0.0, min(1.0, float(video_y_norm)))
+    az_off = (u - 0.5) * hfov
+    el_off = (v - 0.5) * vfov
+
+    roll = _deg2rad(float(vehicle_roll_deg or 0.0))
+    pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
+    hdg = _deg2rad(float(vehicle_heading_deg or 0.0))
+    g_yaw = _deg2rad(gy)
+    g_pitch = _deg2rad(gp)
+
+    r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
+    r_body_gimbal = _mat_mul(_rot_z(g_yaw), _rot_y(g_pitch))
+    r_gimbal_cam = _mat_mul(_rot_y(_deg2rad(el_off)), _rot_z(_deg2rad(az_off)))
+    r_ned_cam = _mat_mul(r_ned_body, _mat_mul(r_body_gimbal, r_gimbal_cam))
+    dir_ned = _mat_vec(r_ned_cam, (1.0, 0.0, 0.0))
+    mag = math.hypot(dir_ned[0], dir_ned[1], dir_ned[2])
+    if mag < 1e-9:
+        return None
+    dir_unit = (dir_ned[0] / mag, dir_ned[1] / mag, dir_ned[2] / mag)
+    return dir_unit, gimbal_assumed
+
+
 def compute_lrf_slant_geo(
     *,
     vehicle_lat: float | None,
@@ -597,35 +642,20 @@ def compute_lrf_slant_geo(
     if slant < 0.5:
         return GeoReferenceResult(ok=False, warning="LRF range too short", method="none")
 
-    gimbal_assumed = False
-    gy = float(gimbal_yaw_deg) if gimbal_yaw_deg is not None else 0.0
-    gp = float(gimbal_pitch_deg) if gimbal_pitch_deg is not None else 0.0
-    if gimbal_yaw_deg is None or gimbal_pitch_deg is None:
-        gimbal_assumed = True
-
-    hfov = max(5.0, min(120.0, float(camera_hfov_deg)))
-    vfov = float(camera_vfov_deg) if camera_vfov_deg is not None else hfov * 0.5625
-    vfov = max(5.0, min(90.0, vfov))
-    u = max(0.0, min(1.0, float(video_x_norm)))
-    v = max(0.0, min(1.0, float(video_y_norm)))
-    az_off = (u - 0.5) * hfov
-    el_off = (v - 0.5) * vfov
-
-    roll = _deg2rad(float(vehicle_roll_deg or 0.0))
-    pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
-    hdg = _deg2rad(float(vehicle_heading_deg or 0.0))
-    g_yaw = _deg2rad(gy)
-    g_pitch = _deg2rad(gp)
-
-    r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
-    r_body_gimbal = _mat_mul(_rot_z(g_yaw), _rot_y(g_pitch))
-    r_gimbal_cam = _mat_mul(_rot_y(_deg2rad(el_off)), _rot_z(_deg2rad(az_off)))
-    r_ned_cam = _mat_mul(r_ned_body, _mat_mul(r_body_gimbal, r_gimbal_cam))
-    dir_ned = _mat_vec(r_ned_cam, (1.0, 0.0, 0.0))
-    mag = math.hypot(dir_ned[0], dir_ned[1], dir_ned[2])
-    if mag < 1e-9:
+    ray = _lrf_camera_dir_ned_unit(
+        vehicle_heading_deg=vehicle_heading_deg,
+        vehicle_roll_deg=vehicle_roll_deg,
+        vehicle_pitch_deg=vehicle_pitch_deg,
+        gimbal_yaw_deg=gimbal_yaw_deg,
+        gimbal_pitch_deg=gimbal_pitch_deg,
+        video_x_norm=video_x_norm,
+        video_y_norm=video_y_norm,
+        camera_hfov_deg=camera_hfov_deg,
+        camera_vfov_deg=camera_vfov_deg,
+    )
+    if ray is None:
         return GeoReferenceResult(ok=False, warning="invalid look direction", method="lrf_slant")
-    dir_unit = (dir_ned[0] / mag, dir_ned[1] / mag, dir_ned[2] / mag)
+    dir_unit, gimbal_assumed = ray
 
     north_m = slant * dir_unit[0]
     east_m = slant * dir_unit[1]
@@ -668,6 +698,168 @@ def compute_lrf_slant_geo(
     )
 
 
+def compute_lrf_facade_plane_geo(
+    *,
+    vehicle_lat: float | None,
+    vehicle_lon: float | None,
+    vehicle_heading_deg: float | None,
+    vehicle_roll_deg: float | None = None,
+    vehicle_pitch_deg: float | None = None,
+    vehicle_alt_msl_m: float | None = None,
+    gimbal_yaw_deg: float | None,
+    gimbal_pitch_deg: float | None,
+    slant_range_m: float,
+    video_x_norm: float = 0.5,
+    video_y_norm: float = 0.5,
+    gps_fix_type: int = 0,
+    gps_hdop: float | None = None,
+    camera_hfov_deg: float = 83.4,
+    camera_vfov_deg: float | None = None,
+    boresight_u: float = 0.5,
+    boresight_v: float = 0.5,
+) -> GeoReferenceResult:
+    """
+    Map a video UV to lat/lon on a vertical facade plane anchored by LRF at boresight.
+
+    The LRF lock at crosshair defines a 3D anchor on the wall at ``slant_range_m``.
+    A vertical plane through that anchor (normal = horizontal look-back toward the
+    drone) is intersected with the click ray.  This yields wall coordinates instead
+    of a ground footprint when the camera is near the horizon.
+    """
+    method = "lrf_facade_plane"
+    if vehicle_lat is None or vehicle_lon is None:
+        return GeoReferenceResult(ok=False, warning="vehicle position missing", method=method)
+    try:
+        slant = float(slant_range_m)
+    except (TypeError, ValueError):
+        return GeoReferenceResult(ok=False, warning="invalid LRF range", method=method)
+    if slant < 0.5:
+        return GeoReferenceResult(ok=False, warning="LRF range too short", method=method)
+
+    pose_kw = dict(
+        vehicle_heading_deg=vehicle_heading_deg,
+        vehicle_roll_deg=vehicle_roll_deg,
+        vehicle_pitch_deg=vehicle_pitch_deg,
+        gimbal_yaw_deg=gimbal_yaw_deg,
+        gimbal_pitch_deg=gimbal_pitch_deg,
+        camera_hfov_deg=camera_hfov_deg,
+        camera_vfov_deg=camera_vfov_deg,
+    )
+    bore = _lrf_camera_dir_ned_unit(
+        video_x_norm=boresight_u,
+        video_y_norm=boresight_v,
+        **pose_kw,
+    )
+    click = _lrf_camera_dir_ned_unit(
+        video_x_norm=video_x_norm,
+        video_y_norm=video_y_norm,
+        **pose_kw,
+    )
+    if bore is None or click is None:
+        return GeoReferenceResult(ok=False, warning="invalid look direction", method=method)
+    (b_n, b_e, b_d), gimbal_assumed = bore
+    (c_n, c_e, c_d), _ = click
+
+    horiz_b = math.hypot(b_n, b_e)
+    if horiz_b < 1e-4:
+        fallback = compute_lrf_slant_geo(
+            vehicle_lat=vehicle_lat,
+            vehicle_lon=vehicle_lon,
+            vehicle_heading_deg=vehicle_heading_deg,
+            vehicle_roll_deg=vehicle_roll_deg,
+            vehicle_pitch_deg=vehicle_pitch_deg,
+            vehicle_alt_msl_m=vehicle_alt_msl_m,
+            gimbal_yaw_deg=gimbal_yaw_deg,
+            gimbal_pitch_deg=gimbal_pitch_deg,
+            slant_range_m=slant,
+            video_x_norm=video_x_norm,
+            video_y_norm=video_y_norm,
+            gps_fix_type=gps_fix_type,
+            gps_hdop=gps_hdop,
+            camera_hfov_deg=camera_hfov_deg,
+            camera_vfov_deg=camera_vfov_deg,
+        )
+        extra = "facade plane degenerate (vertical look)"
+        warn = f"{fallback.warning}; {extra}" if fallback.warning else extra
+        return GeoReferenceResult(
+            ok=fallback.ok,
+            target_lat=fallback.target_lat,
+            target_lon=fallback.target_lon,
+            target_alt_m=fallback.target_alt_m,
+            horizontal_range_m=fallback.horizontal_range_m,
+            bearing_deg=fallback.bearing_deg,
+            depression_deg=fallback.depression_deg,
+            quality=fallback.quality,
+            warning=warn,
+            method=method,
+        )
+
+    # Horizontal normal from wall toward drone (opposite horizontal look direction).
+    n_n = -b_n / horiz_b
+    n_e = -b_e / horiz_b
+    anchor_n = slant * b_n
+    anchor_e = slant * b_e
+    anchor_d = slant * b_d
+    plane_dot = n_n * anchor_n + n_e * anchor_e
+
+    denom = n_n * c_n + n_e * c_e
+    if abs(denom) < 1e-5:
+        return GeoReferenceResult(
+            ok=False,
+            warning="click ray parallel to facade plane",
+            method=method,
+        )
+
+    t_m = plane_dot / denom
+    if t_m < 0.5:
+        return GeoReferenceResult(
+            ok=False,
+            warning="facade intersection behind camera",
+            method=method,
+        )
+
+    north_m = t_m * c_n
+    east_m = t_m * c_e
+    down_m = t_m * c_d
+    horiz = math.hypot(north_m, east_m)
+    depression = math.degrees(math.atan2(down_m, max(1e-6, horiz)))
+    bearing = (math.degrees(math.atan2(east_m, north_m)) + 360.0) % 360.0
+    tgt_lat, tgt_lon = _offset_lat_lon(float(vehicle_lat), float(vehicle_lon), north_m, east_m)
+    tgt_alt: float | None = None
+    if vehicle_alt_msl_m is not None:
+        tgt_alt = float(vehicle_alt_msl_m) - down_m
+
+    quality, warn = _quality_label(
+        gps_fix_type=int(gps_fix_type or 0),
+        gps_hdop=gps_hdop,
+        has_gimbal=not gimbal_assumed,
+        depression_deg=depression,
+        range_m=horiz,
+    )
+    if gimbal_assumed:
+        extra = "gimbal attitude assumed level (0°, 0°)"
+        warn = f"{warn}; {extra}" if warn else extra
+    extra = "facade plane (LRF anchor at boresight)"
+    if depression < 3.0:
+        extra += "; near-horizon wall geometry"
+    warn = f"{warn}; {extra}" if warn else extra
+    if quality == "insufficient":
+        quality = "fair"
+
+    return GeoReferenceResult(
+        ok=True,
+        target_lat=tgt_lat,
+        target_lon=tgt_lon,
+        target_alt_m=tgt_alt,
+        horizontal_range_m=horiz,
+        depression_deg=depression,
+        quality=quality,
+        warning=warn,
+        method=method,
+        bearing_deg=bearing,
+    )
+
+
 def enrich_video_mark_target_altitude(row: dict[str, object]) -> None:
     """
     Resolve ``target_alt_m`` for video marks: DEM ground vs ray-derived facade height.
@@ -703,6 +895,20 @@ def enrich_video_mark_target_altitude(row: dict[str, object]) -> None:
 
     method = "terrain_dem"
     resolved: float | None = dem_val
+
+    geo_method = str(row.get("geo_method") or "").strip().lower()
+    if geo_method == "lrf_facade_plane":
+        try:
+            plane_alt = float(row.get("target_alt_m")) if row.get("target_alt_m") is not None else None
+        except (TypeError, ValueError):
+            plane_alt = None
+        if plane_alt is not None:
+            resolved = plane_alt
+            method = "lrf_facade_plane"
+            row["target_alt_method"] = method
+            if resolved is not None:
+                row["target_alt_m"] = resolved
+            return
 
     try:
         y_norm = float(row.get("video_y_norm")) if row.get("video_y_norm") is not None else 0.55
