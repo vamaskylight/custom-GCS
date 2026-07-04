@@ -940,6 +940,10 @@ class VideoMarkTrackingMixin:
         """Gimbal pan — overlay follows via GAC scales (not GPS geo projection)."""
         if track.get("ref_att") is None and track.get("pin_ref_att") is None:
             return False
+        # Gun ground pick (no facade lock yet): track every frame — GAC is the only
+        # reliable signal; waiting for a deadband left the mark screen-pinned while panning.
+        if track.get("ground_video_pick") and not self._facade_session_freezes_setup_marks():
+            return True
         deadband = self._dooaf_mark_attitude_track_deadband_deg(track)
         return self._gimbal_moved_since_mark_lock(track, deadband_deg=deadband)
 
@@ -960,6 +964,10 @@ class VideoMarkTrackingMixin:
         self, track: dict[str, object], stored_uv: tuple[float, float]
     ) -> tuple[float, float] | None:
         """World-fixed overlay: GAC attitude when panning, geo when the drone shifts."""
+        if self._dooaf_mark_attitude_track_active(track):
+            att_disp = self._dooaf_mark_attitude_display_uv(track, stored_uv)
+            if att_disp is not None:
+                return att_disp
         if self._dooaf_mark_vehicle_geo_active(track):
             geo_disp = self._dooaf_mark_geo_display_uv(track)
             if geo_disp is not None:
@@ -967,10 +975,6 @@ class VideoMarkTrackingMixin:
                 if self._mark_uv_on_screen(u, v):
                     return (u, v)
                 return None
-        if self._dooaf_mark_attitude_track_active(track):
-            att_disp = self._dooaf_mark_attitude_display_uv(track, stored_uv)
-            if att_disp is not None:
-                return att_disp
         return None
 
     def _dooaf_mark_geo_track_active(self, track: dict[str, object]) -> bool:
