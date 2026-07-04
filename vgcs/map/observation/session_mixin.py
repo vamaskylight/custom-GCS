@@ -186,7 +186,7 @@ class ObservationSessionMixin:
                     if alt_m is not None:
                         row["target_alt_m"] = float(alt_m)
                     row["geo_quality"] = "fair"
-                    row["geo_method"] = "lrf_facade_uv"
+                    row["geo_method"] = "lrf_facade_plane"
                     geo_warn = self._facade_geo_warning_from_uv(
                         float(video_x), float(video_y)
                     )

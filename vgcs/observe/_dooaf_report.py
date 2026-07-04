@@ -111,6 +111,9 @@ def format_geo_method_badge(method: object) -> str:
     elif m == "lrf_slant":
         tone = "badge-dem"
         label = "lrf_slant (C13 LRF)"
+    elif m in {"lrf_facade_plane", "lrf_facade_uv"}:
+        tone = "badge-dem"
+        label = "lrf_facade_plane (wall)"
     return f"<span class='badge {tone}'>{_html_esc(label)}</span>"
 
 def observation_report_html_style() -> str:

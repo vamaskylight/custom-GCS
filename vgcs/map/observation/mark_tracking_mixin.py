@@ -1034,7 +1034,7 @@ class VideoMarkTrackingMixin:
                 if self._mark_uv_on_screen(u, v):
                     return (u, v)
                 return None
-        if str(row.get("geo_method") or "") == "lrf_facade_uv":
+        if str(row.get("geo_method") or "") in {"lrf_facade_uv", "lrf_facade_plane"}:
             frozen = self._facade_frozen_mark_uv(float(stored_u), float(stored_v))
             if frozen is not None:
                 return frozen
