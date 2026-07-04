@@ -303,7 +303,7 @@ class VideoMarkTrackingMixin:
         if track.get("facade_uv_pick"):
             return False
         if track.get("ground_video_pick"):
-            return False
+            return self._dooaf_mark_geo_track_active(track)
         if track.get("lrf_boresight_geo"):
             return False
         if track.get("click_pin"):
@@ -574,7 +574,9 @@ class VideoMarkTrackingMixin:
     def _mark_track_screen_frozen_uv(
         self, track: dict[str, object]
     ) -> tuple[float, float] | None:
-        """UV for ground / facade UV picks — always stay at operator click."""
+        """UV for ground / facade UV picks — stay at click until gimbal pans away."""
+        if track.get("ground_video_pick") and self._dooaf_mark_geo_track_active(track):
+            return None
         if not (track.get("ground_video_pick") or track.get("facade_uv_pick")):
             return None
         pin = track.get("pin_uv")
@@ -627,7 +629,10 @@ class VideoMarkTrackingMixin:
                 return frozen
         if track is not None:
             fu = track.get("frozen_uv")
-            if isinstance(fu, tuple):
+            if isinstance(fu, tuple) and not (
+                track.get("ground_video_pick")
+                and self._dooaf_mark_geo_track_active(track)
+            ):
                 return (float(fu[0]), float(fu[1]))
         if track is not None:
             pinned = self._mark_track_pinned_uv(track)
@@ -644,6 +649,27 @@ class VideoMarkTrackingMixin:
                     att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
                     if att_uv is not None:
                         return att_uv
+            if track.get("ground_video_pick") and self._dooaf_mark_geo_track_active(
+                track
+            ):
+                glat = track.get("geo_lat")
+                glon = track.get("geo_lon")
+                if glat is not None and glon is not None:
+                    galt = track.get("geo_alt_m")
+                    alt: float | None = None
+                    if galt is not None:
+                        try:
+                            alt = float(galt)
+                        except (TypeError, ValueError):
+                            alt = None
+                    geo_uv = self._project_geo_to_video_norm(
+                        float(glat),
+                        float(glon),
+                        alt_m=alt,
+                        pose_store=track,
+                    )
+                    if geo_uv is not None:
+                        return (float(geo_uv[0]), float(geo_uv[1]))
             pin = track.get("pin_uv")
             if isinstance(pin, tuple):
                 return (float(pin[0]), float(pin[1]))
@@ -845,7 +871,7 @@ class VideoMarkTrackingMixin:
         if track.get("lrf_boresight_geo") or track.get("facade_uv_pick"):
             return False
         if track.get("ground_video_pick"):
-            return False
+            return self._gimbal_moved_since_mark_lock(track)
         return self._gimbal_moved_since_mark_lock(track)
 
     def _dooaf_mark_geo_display_uv(
@@ -911,8 +937,20 @@ class VideoMarkTrackingMixin:
         # After gun LRF lock: gun + target facade picks share one slant/pose — do not
         # reproject marks from jittery gimbal/GPS while the operator sets up DOOAF.
         if track is not None:
+            if track.get("ground_video_pick") and self._dooaf_mark_geo_track_active(
+                track
+            ):
+                geo_disp = self._dooaf_mark_geo_display_uv(track)
+                if geo_disp is not None:
+                    u, v = geo_disp
+                    if self._mark_uv_on_screen(u, v):
+                        return (u, v)
+                    return None
             fu = track.get("frozen_uv")
-            if isinstance(fu, tuple):
+            if isinstance(fu, tuple) and not (
+                track.get("ground_video_pick")
+                and self._dooaf_mark_geo_track_active(track)
+            ):
                 u, v = float(fu[0]), float(fu[1])
                 if self._mark_uv_on_screen(u, v):
                     return (u, v)
