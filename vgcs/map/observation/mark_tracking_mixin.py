@@ -18,6 +18,8 @@ _LRF_MARK_PIN_ATT_DEADBAND_DEG = 1.25
 # mark frozen until the operator pans deliberately.
 _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG = 8.0
 _DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
+# Loiter drift in wind — anchor ground picks to saved geo once the drone shifts.
+_DOOAF_GEO_TRACK_VEHICLE_SHIFT_M = 2.0
 
 
 class VideoMarkTrackingMixin:
@@ -842,6 +844,32 @@ class VideoMarkTrackingMixin:
         dyaw, dpitch = self._gimbal_att_delta_deg(lock_att, cur)
         return dyaw >= float(deadband_deg) or dpitch >= float(deadband_deg)
 
+    def _vehicle_shift_since_mark_lock(
+        self,
+        track: dict[str, object],
+        *,
+        deadband_m: float = _DOOAF_GEO_TRACK_VEHICLE_SHIFT_M,
+    ) -> bool:
+        """True when loiter/wind moved the drone from the pose at pick."""
+        lock_lat = track.get("lock_vehicle_lat")
+        lock_lon = track.get("lock_vehicle_lon")
+        if lock_lat is None or lock_lon is None:
+            return False
+        ctx = self._observation_context()
+        clat = ctx.get("vehicle_lat")
+        clon = ctx.get("vehicle_lon")
+        if clat is None or clon is None:
+            return False
+        try:
+            shift = float(
+                haversine_m(
+                    float(lock_lat), float(lock_lon), float(clat), float(clon)
+                )
+            )
+        except (TypeError, ValueError):
+            return False
+        return shift >= float(deadband_m)
+
     def _dooaf_mark_pan_track_active(
         self,
         track: dict[str, object],
@@ -871,7 +899,10 @@ class VideoMarkTrackingMixin:
         if track.get("lrf_boresight_geo") or track.get("facade_uv_pick"):
             return False
         if track.get("ground_video_pick"):
-            return self._gimbal_moved_since_mark_lock(track)
+            return (
+                self._gimbal_moved_since_mark_lock(track)
+                or self._vehicle_shift_since_mark_lock(track)
+            )
         return self._gimbal_moved_since_mark_lock(track)
 
     def _dooaf_mark_geo_display_uv(
