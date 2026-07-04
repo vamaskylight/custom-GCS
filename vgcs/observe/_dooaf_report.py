@@ -2570,27 +2570,115 @@ def format_client_fire_correction_html(session: DooafSession) -> str:
         subtitle="Diagrams show where the round missed and what to add next.",
     )
 
+def _format_video_x_html(row: dict[str, Any] | None) -> str:
+    if row is None:
+        return "<span class='muted'>—</span>"
+    vx = row.get("video_x_norm")
+    if vx is None:
+        return "<span class='muted'>—</span>"
+    try:
+        return _html_esc(f"{float(vx):.3f}")
+    except (TypeError, ValueError):
+        return "<span class='muted'>—</span>"
+
+
+def _format_video_y_html(row: dict[str, Any] | None) -> str:
+    if row is None:
+        return "<span class='muted'>—</span>"
+    vy = row.get("video_y_norm")
+    if vy is None:
+        return "<span class='muted'>—</span>"
+    try:
+        return _html_esc(f"{float(vy):.3f}")
+    except (TypeError, ValueError):
+        return "<span class='muted'>—</span>"
+
+
+def _mark_theta_bearing_deg(
+    row: dict[str, Any] | None,
+    *,
+    pt: GeoPoint | None = None,
+    origin: GeoPoint | None = None,
+) -> float | None:
+    """Compass bearing θ for a mark: geo bearing from row, else gun→point."""
+    if row is not None:
+        brg = row.get("geo_bearing_deg")
+        if brg is not None:
+            try:
+                return float(brg)
+            except (TypeError, ValueError):
+                pass
+        hdg = row.get("vehicle_heading_deg")
+        if hdg is not None and pt is None:
+            try:
+                return float(hdg)
+            except (TypeError, ValueError):
+                pass
+    if origin is not None and pt is not None:
+        try:
+            return float(
+                initial_bearing_deg(origin.lat, origin.lon, pt.lat, pt.lon)
+            )
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _format_theta_bearing_html(
+    row: dict[str, Any] | None,
+    *,
+    pt: GeoPoint | None = None,
+    origin: GeoPoint | None = None,
+) -> str:
+    brg = _mark_theta_bearing_deg(row, pt=pt, origin=origin)
+    if brg is None:
+        return "<span class='muted'>—</span>"
+    return _html_esc(f"{brg:.1f}°")
+
+
+def _latest_drone_observation_row(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for row in reversed(rows):
+        if row.get("vehicle_lat") is not None and row.get("vehicle_lon") is not None:
+            return row
+    return None
+
+
 def format_dooaf_html_summary(
     session: DooafSession,
     *,
     observation_row: dict[str, Any] | None = None,
+    observation_rows: list[dict[str, Any]] | None = None,
 ) -> str:
+    rows = list(observation_rows or [])
+    gun_row = latest_mark_row(rows, DOOAF_ROLE_GUN)
+    intended_row = latest_mark_row(rows, DOOAF_ROLE_INTENDED)
+    impact_row = latest_mark_row(rows, DOOAF_ROLE_IMPACT)
+    drone_row = _latest_drone_observation_row(rows)
+
     def _pt(
         label: str,
         pt: GeoPoint | None,
+        mark_row: dict[str, Any] | None = None,
         *,
         row_class: str = "",
+        bearing_origin: GeoPoint | None = None,
     ) -> str:
-        if pt is None:
-            cls = f" class='{row_class}'" if row_class else ""
-            return f"<tr{cls}><td>{label}</td><td colspan='4'>—</td></tr>"
-        gr = format_grid_reference(pt.lat, pt.lon) or "—"
         cls = f" class='{row_class}'" if row_class else ""
+        if pt is None:
+            return f"<tr{cls}><td>{label}</td><td colspan='7'>—</td></tr>"
+        gr = format_grid_reference(pt.lat, pt.lon) or "—"
+        origin = bearing_origin if bearing_origin is not None else session.gun
         return (
             f"<tr{cls}><td>{label}</td>"
             f"<td>{pt.lat:.7f}</td><td>{pt.lon:.7f}</td>"
             f"<td><span class='mgrs-badge'>{_html_esc(gr)}</span></td>"
-            f"<td>{_format_elev_msl_html(pt.alt_m)}</td></tr>"
+            f"<td>{_format_elev_msl_html(pt.alt_m)}</td>"
+            f"<td>{_format_video_x_html(mark_row)}</td>"
+            f"<td>{_format_video_y_html(mark_row)}</td>"
+            f"<td>{_format_theta_bearing_html(mark_row, pt=pt, origin=origin)}</td>"
+            f"</tr>"
         )
 
     corr_rows = ""
@@ -2691,21 +2779,28 @@ def format_dooaf_html_summary(
     session_table = (
         "<table class='data-table'>"
         "<thead><tr><th>Variable</th><th>Lat</th><th>Lon</th>"
-        "<th>Grid ref (MGRS)</th><th>Elevation (MSL)</th></tr></thead>"
+        "<th>Grid ref (MGRS)</th><th>Elevation (MSL)</th>"
+        "<th>Video X</th><th>Video Y</th>"
+        "<th>θ (bearing)</th></tr></thead>"
         "<tbody>"
-        + _pt(dooaf_role_display(DOOAF_ROLE_GUN), session.gun)
+        + _pt(dooaf_role_display(DOOAF_ROLE_GUN), session.gun, gun_row)
         + _pt(
             dooaf_role_display(DOOAF_ROLE_INTENDED),
             session.intended,
+            intended_row,
             row_class="dooaf-target-coords",
         )
-        + _pt("Drone (last obs)", session.drone)
+        + _pt("Drone (last obs)", session.drone, drone_row, bearing_origin=None)
         + _pt(
             dooaf_role_display(DOOAF_ROLE_IMPACT),
             session.impact,
+            impact_row,
             row_class="dooaf-impact-coords",
         )
         + "</tbody></table>"
+        "<p class='log-hint'>Video X/Y are normalized click coordinates on the companion "
+        "feed (0–1). θ is compass bearing: geo bearing from the drone when logged, otherwise "
+        "bearing from the gun position to the mark.</p>"
     )
     session_body = map_block + (
         "<details class='report-collapsible'>"
@@ -2918,6 +3013,28 @@ def _log_summary_rows(row: dict[str, object], cell_fn: Any) -> list[str]:
     if not _is_missing_cell(row.get("geo_quality")):
         rows.append(
             _log_detail_row("Geo quality", format_geo_quality_badge(row.get("geo_quality")))
+        )
+
+    if not _is_missing_cell(row.get("video_x_norm"), cell_fn):
+        rows.append(
+            _log_detail_row(
+                "Video X",
+                _format_scalar_cell(row.get("video_x_norm"), cell_fn),
+            )
+        )
+    if not _is_missing_cell(row.get("video_y_norm"), cell_fn):
+        rows.append(
+            _log_detail_row(
+                "Video Y",
+                _format_scalar_cell(row.get("video_y_norm"), cell_fn),
+            )
+        )
+    if not _is_missing_cell(row.get("geo_bearing_deg"), cell_fn):
+        rows.append(
+            _log_detail_row(
+                "θ (bearing)",
+                _format_deg_html(row.get("geo_bearing_deg"), cell_fn),
+            )
         )
 
     if not _is_missing_cell(row.get("segment_distance_m"), cell_fn):
