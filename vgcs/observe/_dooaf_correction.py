@@ -109,6 +109,101 @@ def _pair_prefers_facade_geometry(
     return left_pref or right_pref
 
 
+def _c13_lrf_vfov_deg(hfov_deg: float) -> float:
+    try:
+        from vgcs.skydroid.adapter import _LRF_FOV_V_DEG as vfov  # type: ignore[attr-defined]
+
+        return float(vfov)
+    except Exception:
+        return float(hfov_deg) * 0.5625
+
+
+def _facade_intended_impact_vertical_m(
+    intended_row: dict[str, Any] | None,
+    impact_row: dict[str, Any] | None,
+    *,
+    hfov_deg: float,
+) -> float | None:
+    """Signed target−impact vertical separation (m) on a shared LRF facade lock."""
+    if intended_row is None or impact_row is None:
+        return None
+    if intended_row.get("video_y_norm") is None or impact_row.get("video_y_norm") is None:
+        return None
+    slants: list[float] = []
+    for row in (intended_row, impact_row):
+        try:
+            s = float(row.get("lrf_slant_range_m") or 0)
+        except (TypeError, ValueError):
+            continue
+        if s >= 8.0:
+            slants.append(s)
+    if not slants:
+        return None
+    from vgcs.observe.facade_plane import facade_intended_impact_vertical_m
+
+    return facade_intended_impact_vertical_m(
+        intended_row,
+        impact_row,
+        hfov_deg=float(hfov_deg),
+        camera_vfov_deg=_c13_lrf_vfov_deg(float(hfov_deg)),
+    )
+
+
+def _apply_facade_vertical_to_points(
+    intended: GeoPoint,
+    impact: GeoPoint,
+    *,
+    intended_row: dict[str, Any] | None,
+    impact_row: dict[str, Any] | None,
+    hfov_deg: float,
+) -> tuple[GeoPoint, GeoPoint]:
+    """Reconcile intended/impact MSL using video Y + LRF slant vertical separation."""
+    vert = _facade_intended_impact_vertical_m(
+        intended_row,
+        impact_row,
+        hfov_deg=hfov_deg,
+    )
+    if vert is None or abs(float(vert)) < 0.05:
+        return intended, impact
+    v = float(vert)
+    if impact.alt_m is not None:
+        return GeoPoint(intended.lat, intended.lon, float(impact.alt_m) + v), impact
+    if intended.alt_m is not None:
+        return intended, GeoPoint(impact.lat, impact.lon, float(intended.alt_m) - v)
+    return intended, impact
+
+
+def _facade_target_impact_separation_m(
+    intended_row: dict[str, Any] | None,
+    impact_row: dict[str, Any] | None,
+    *,
+    hfov_deg: float,
+) -> float | None:
+    """Wall-surface chord (m) from shared LRF slant + two video UV picks."""
+    if intended_row is None or impact_row is None:
+        return None
+    if intended_row.get("video_x_norm") is None or impact_row.get("video_x_norm") is None:
+        return None
+    slants: list[float] = []
+    for row in (intended_row, impact_row):
+        try:
+            s = float(row.get("lrf_slant_range_m") or 0)
+        except (TypeError, ValueError):
+            continue
+        if s >= 8.0:
+            slants.append(s)
+    if not slants:
+        return None
+    from vgcs.observe.facade_plane import facade_slant_uv_separation_m
+
+    return facade_slant_uv_separation_m(
+        intended_row,
+        impact_row,
+        hfov_deg=float(hfov_deg),
+        camera_vfov_deg=_c13_lrf_vfov_deg(float(hfov_deg)),
+    )
+
+
 def compute_fire_correction(
     gun: GeoPoint,
     intended: GeoPoint,
@@ -175,22 +270,28 @@ def compute_fire_correction(
     miss_n, miss_e = latlon_delta_to_ne_m(
         intended.lat, intended.lon, impact.lat, impact.lon
     )
-    impact_to_intended_m = haversine_m(
+    map_footprint_miss_m = haversine_m(
         intended.lat, intended.lon, impact.lat, impact.lon
     )
-    if use_facade_ti and intended_row is not None and impact_row is not None:
-        from vgcs.observe.facade_plane import facade_slant_uv_separation_m
-
-        ti_facade = facade_slant_uv_separation_m(
-            intended_row,
-            impact_row,
-            hfov_deg=camera_hfov_deg,
-        )
-        if ti_facade is not None and ti_facade > 0.5:
-            impact_to_intended_m = float(ti_facade)
+    impact_to_intended_m = map_footprint_miss_m
+    ti_facade = _facade_target_impact_separation_m(
+        intended_row,
+        impact_row,
+        hfov_deg=camera_hfov_deg,
+    )
+    if ti_facade is not None and ti_facade >= 0.0:
+        impact_to_intended_m = float(ti_facade)
+    facade_vert = _facade_intended_impact_vertical_m(
+        intended_row,
+        impact_row,
+        hfov_deg=camera_hfov_deg,
+    )
     miss_vertical: float | None = None
     elev_correction: float | None = None
-    if intended.alt_m is not None and impact.alt_m is not None:
+    if facade_vert is not None:
+        miss_vertical = float(facade_vert)
+        elev_correction = float(facade_vert)
+    elif intended.alt_m is not None and impact.alt_m is not None:
         miss_vertical = float(intended.alt_m) - float(impact.alt_m)
         elev_correction = miss_vertical
     return FireCorrection(
@@ -1697,6 +1798,25 @@ def build_dooaf_session(
             impact,
             ground_row=ground_row,
         )
+        hfov_resolve = 62.0
+        for src in (impact_row, intended_row, ground_row):
+            if src is not None and src.get("camera_hfov_deg") is not None:
+                try:
+                    hfov_resolve = float(src["camera_hfov_deg"])
+                except (TypeError, ValueError):
+                    pass
+                break
+        intended, impact = _apply_facade_vertical_to_points(
+            intended,
+            impact,
+            intended_row=intended_row,
+            impact_row=impact_row,
+            hfov_deg=hfov_resolve,
+        )
+        if building_height_m is None and intended.alt_m is not None and impact.alt_m is not None:
+            bh = abs(float(intended.alt_m) - float(impact.alt_m))
+            if bh >= 0.05:
+                building_height_m = bh
         if (
             gun is not None
             and ground_row is not None

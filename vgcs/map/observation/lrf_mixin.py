@@ -7,7 +7,7 @@ from PySide6.QtCore import QThreadPool, QTimer
 from vgcs.map.native_video_overlay import VideoOverlayLrfLock
 from vgcs.map.observation.types import LrfLockBridge, LrfLockTask, PendingLrfVideoPick
 from vgcs.observe.dooaf import DOOAF_ROLE_GUN, DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED
-from vgcs.observe.geo_reference import compute_lrf_slant_geo
+from vgcs.observe.geo_reference import compute_lrf_facade_plane_geo, compute_lrf_slant_geo
 from vgcs.skydroid.protocol import format_slr_display_m
 from vgcs.video.pipeline import notify_companion_lrf_lock
 
@@ -172,6 +172,8 @@ class LrfVideoLockMixin:
         self._lrf_lock_lon = None
         self._lrf_lock_alt_m = None
         self._lrf_lock_geo_label = ""
+        self._lrf_lock_hold_gimbal = None
+        self._lrf_lock_hold_slant_boresight = False
         try:
             nm = self._native_map
             if nm is not None and hasattr(nm, "set_lrf_lock_marker"):
@@ -193,6 +195,37 @@ class LrfVideoLockMixin:
         except Exception:
             return 83.4, 46.9
 
+    def _lrf_lock_use_facade_plane_geo(self) -> bool:
+        """True when LRF preview should use wall-plane geo (DOOAF facade lock)."""
+        if bool(getattr(self, "_lrf_lock_hold_slant_boresight", False)):
+            return True
+        pending = getattr(self, "_pending_lrf_video_pick", None)
+        if pending is not None:
+            role = str(getattr(pending, "pick_role", "") or "")
+            if role in (DOOAF_ROLE_INTENDED, DOOAF_ROLE_IMPACT):
+                return True
+        session = getattr(self, "_dooaf_facade_session", None)
+        return session is not None and session.has_lock
+
+    def _lrf_facade_geo_context(self, ctx: dict[str, object]) -> dict[str, object]:
+        """Prefer facade-lock pose for stable wall geo after LRF lock."""
+        session = getattr(self, "_dooaf_facade_session", None)
+        lock = getattr(session, "_lock", None) if session is not None else None
+        if lock is None:
+            return ctx
+        out = dict(ctx)
+        out["vehicle_lat"] = lock.vehicle_lat
+        out["vehicle_lon"] = lock.vehicle_lon
+        out["vehicle_heading_deg"] = lock.vehicle_heading_deg
+        out["vehicle_roll_deg"] = lock.vehicle_roll_deg
+        out["vehicle_pitch_deg"] = lock.vehicle_pitch_deg
+        out["vehicle_alt_msl_m"] = lock.vehicle_alt_msl_m
+        out["gimbal_yaw_deg"] = lock.gimbal_yaw_deg
+        out["gimbal_pitch_deg"] = lock.gimbal_pitch_deg
+        out["gps_fix_type"] = lock.gps_fix_type
+        out["gps_hdop"] = lock.gps_hdop
+        return out
+
     def _update_lrf_lock_geo(self, distance_m: float | None) -> None:
         """Estimate locked target lat/lon from vehicle pose, gimbal, and LRF slant range."""
         if distance_m is None:
@@ -206,6 +239,9 @@ class LrfVideoLockMixin:
         ctx = self._observation_context()
         if ctx.get("gimbal_yaw_deg") is None:
             return
+        facade_mode = self._lrf_lock_use_facade_plane_geo()
+        if facade_mode:
+            ctx = self._lrf_facade_geo_context(ctx)
         in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
         click_uv = getattr(self, "_lrf_click_uv", None)
         use_click = (
@@ -214,13 +250,22 @@ class LrfVideoLockMixin:
             and not self._c13_lrf_is_locked()
             and getattr(self, "_lrf_lock_distance_m", None) is None
         )
-        if use_click:
+        if facade_mode:
+            # LRF reads along crosshair; click UV is the wall point on the facade plane.
+            bore_u, bore_v = 0.5, 0.5
+            if click_uv is not None:
+                video_u, video_v = float(click_uv[0]), float(click_uv[1])
+            else:
+                video_u, video_v = 0.5, 0.5
+        elif use_click:
             video_u, video_v = float(click_uv[0]), float(click_uv[1])
+            bore_u, bore_v = video_u, video_v
         else:
             # After slew: SLR measures along gimbal boresight (frame centre).
             video_u, video_v = 0.5, 0.5
+            bore_u, bore_v = 0.5, 0.5
         hfov, vfov = self._c13_lrf_geo_fov()
-        geo = compute_lrf_slant_geo(
+        geo_kw = dict(
             vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
             vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
             vehicle_heading_deg=ctx.get("vehicle_heading_deg"),  # type: ignore[arg-type]
@@ -237,10 +282,19 @@ class LrfVideoLockMixin:
             camera_hfov_deg=hfov,
             camera_vfov_deg=vfov,
         )
-        if not geo.ok or geo.target_lat is None or geo.target_lon is None:
-            print(
-                f"[VGCS:lrf] geo unavailable — {geo.warning or geo.quality}"
+        if facade_mode:
+            geo = compute_lrf_facade_plane_geo(
+                **geo_kw,
+                boresight_u=bore_u,
+                boresight_v=bore_v,
             )
+        else:
+            geo = compute_lrf_slant_geo(**geo_kw)
+        if not geo.ok or geo.target_lat is None or geo.target_lon is None:
+            if not facade_mode:
+                print(
+                    f"[VGCS:lrf] geo unavailable — {geo.warning or geo.quality}"
+                )
             return
         self._lrf_lock_lat = float(geo.target_lat)
         self._lrf_lock_lon = float(geo.target_lon)
@@ -258,8 +312,9 @@ class LrfVideoLockMixin:
                 nm.set_lrf_lock_marker(float(geo.target_lat), float(geo.target_lon))
         except Exception:
             pass
+        tag = "facade target geo" if facade_mode else "target geo"
         print(
-            f"[VGCS:lrf] target geo=({float(geo.target_lat):.6f},"
+            f"[VGCS:lrf] {tag}=({float(geo.target_lat):.6f},"
             f"{float(geo.target_lon):.6f}) q={geo.quality} "
             f"range={slant:.1f} m"
         )
@@ -499,6 +554,8 @@ class LrfVideoLockMixin:
         self._lrf_lock_in_progress = True
         self._capture_lrf_lock_start_vehicle_pose()
         self._clear_lrf_lock_geo()
+        self._lrf_lock_hold_gimbal = hold_gimbal
+        self._lrf_lock_hold_slant_boresight = bool(hold_slant_boresight)
         notify_companion_lrf_lock(active=True)
         self._notify_companion_gimbal_motion(duration_s=120.0)
         self._capture_lrf_track_ref(float(u), float(v))
