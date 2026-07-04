@@ -98,6 +98,28 @@ def notify_companion_feed_switch(*, duration_s: float = 12.0) -> None:
         pass
 
 
+_companion_report_viewer_until: float = 0.0
+
+
+def notify_companion_report_viewer_opened(*, duration_s: float = 180.0) -> None:
+    """HTML report opened in an external browser — hold RTSP steady while operator reads it."""
+    global _companion_report_viewer_until
+    hold = max(60.0, float(duration_s))
+    _companion_report_viewer_until = time.monotonic() + hold
+    notify_companion_feed_switch(duration_s=hold)
+    try:
+        print(
+            f"[VGCS:video] companion RTSP: report viewer open "
+            f"(hold decode {hold:.0f}s — VGCS stays running in background)"
+        )
+    except Exception:
+        pass
+
+
+def companion_report_viewer_active() -> bool:
+    return time.monotonic() < float(_companion_report_viewer_until or 0.0)
+
+
 def _companion_feed_switch_active() -> bool:
     return time.monotonic() < float(_companion_feed_switch_until or 0.0)
 

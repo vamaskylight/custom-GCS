@@ -2019,9 +2019,9 @@ def _fire_correction_miss_consistency_warning_html(c: FireCorrection) -> str:
         f"components is <strong>{en:.1f} m</strong> "
         f"(gap <strong>{gap:.1f} m</strong>, threshold "
         f"{FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M:.0f} m). "
-        "This usually means gun, target, or impact were picked with mixed geometry "
-        "(e.g. ground ray vs facade/LRF). Re-pick marks with the same method or "
-        "verify coordinates in the audit log.</p>"
+        "For facade/LRF sessions this can mean wall-surface distance and map East/North "
+        "were computed from different geometry. Sync the latest VGCS build and re-export; "
+        "otherwise re-pick marks with the same method or verify coordinates in the audit log.</p>"
         "</div>"
     )
 

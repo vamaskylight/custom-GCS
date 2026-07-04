@@ -55,6 +55,7 @@ def main() -> int:
     apply_qt_scale_override()
     configure_high_dpi_policy()
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     ui_scale = 1.0
     profile = select_font_profile()
     app.setFont(build_base_font(profile, ui_scale=ui_scale))

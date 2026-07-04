@@ -716,6 +716,20 @@ class VideoPipelineMixin:
         return [keys[0]]
 
     def _refresh_companion_video_after_foreground(self, *, elapsed_bg_s: float) -> None:
+        try:
+            from vgcs.video.pipeline import companion_report_viewer_active
+
+            if companion_report_viewer_active():
+                try:
+                    print(
+                        "[VGCS:video] foreground refresh skipped — "
+                        "HTML report open in external browser"
+                    )
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
         last = float(getattr(self, "_last_foreground_video_refresh_mono", 0.0) or 0.0)
         if time.monotonic() - last < 6.0:
             return

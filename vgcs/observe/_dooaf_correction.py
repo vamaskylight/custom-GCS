@@ -279,8 +279,15 @@ def compute_fire_correction(
         impact_row,
         hfov_deg=camera_hfov_deg,
     )
-    if ti_facade is not None and ti_facade >= 0.0:
+    if use_facade_ti and ti_facade is not None and ti_facade >= 0.0:
         impact_to_intended_m = float(ti_facade)
+        en_raw = math.hypot(miss_n, miss_e)
+        if en_raw > 0.01:
+            # Facade wall chord vs flat lat/lon footprint often diverge slightly;
+            # scale E/N to the facade miss so report total matches compass/bars.
+            scale = impact_to_intended_m / en_raw
+            miss_n *= scale
+            miss_e *= scale
     facade_vert = _facade_intended_impact_vertical_m(
         intended_row,
         impact_row,
