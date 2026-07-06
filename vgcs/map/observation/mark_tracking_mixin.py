@@ -114,14 +114,30 @@ class VideoMarkTrackingMixin:
         dpitch = abs(pitch - pitch0)
         return float(dyaw), float(dpitch)
 
+    def _facade_lrf_gac_scales(self) -> tuple[float, float]:
+        """Calibrated GAC→image scales from the facade LRF lock (shared by all marks)."""
+        return (
+            float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0),
+            float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0),
+        )
+
+    def _sync_all_dooaf_setup_marks_gac_scales(self) -> None:
+        """After LRF lock, every setup mark uses the same calibrated GAC scales."""
+        h_scale, v_scale = self._facade_lrf_gac_scales()
+        for built in self._dooaf_setup_mark_track.values():
+            built["h_scale"] = h_scale
+            built["v_scale"] = v_scale
+
     def _sync_dooaf_setup_track_from_lrf_lock(
         self, role: str, *, final_uv: tuple[float, float] | None = None
     ) -> None:
         """Copy post-lock LRF calibration into one DOOAF setup mark track."""
-        h_scale = float(getattr(self, "_lrf_track_gac_h_scale", 1.0) or 1.0)
-        v_scale = float(getattr(self, "_lrf_track_gac_v_scale", 1.0) or 1.0)
+        h_scale, v_scale = self._facade_lrf_gac_scales()
+        self._sync_all_dooaf_setup_marks_gac_scales()
         built = self._dooaf_setup_mark_track.get(str(role))
-        if not built or not built.get("lrf_slew"):
+        if not built:
+            return
+        if not built.get("lrf_slew"):
             return
         built["h_scale"] = h_scale
         built["v_scale"] = v_scale
@@ -465,6 +481,10 @@ class VideoMarkTrackingMixin:
         row["video_mark_track_ref_pitch"] = float(ref_att_out[1])
         row["video_mark_track_h_scale"] = float(built["h_scale"])
         row["video_mark_track_v_scale"] = float(built["v_scale"])
+        if self._facade_session_freezes_setup_marks():
+            gh, gv = self._facade_lrf_gac_scales()
+            row["video_mark_track_h_scale"] = gh
+            row["video_mark_track_v_scale"] = gv
         row["video_mark_lrf_slew"] = bool(used_lrf_slew)
         row["video_mark_frozen_u"] = float(ref_uv[0])
         row["video_mark_frozen_v"] = float(ref_uv[1])
@@ -596,12 +616,18 @@ class VideoMarkTrackingMixin:
         try:
             from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
+            h_scale = float(track.get("h_scale", 1.0) or 1.0)
+            v_scale = float(track.get("v_scale", 1.0) or 1.0)
+            if self._facade_session_freezes_setup_marks():
+                gh, gv = self._facade_lrf_gac_scales()
+                h_scale = gh
+                v_scale = gv
             u, v = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
                 (float(ref_uv[0]), float(ref_uv[1])),
                 (float(ref_att[0]), float(ref_att[1])),
                 cur,
-                gac_h_scale=float(track.get("h_scale", 1.0) or 1.0),
-                gac_v_scale=float(track.get("v_scale", 1.0) or 1.0),
+                gac_h_scale=h_scale,
+                gac_v_scale=v_scale,
                 clamp=False,
             )
             return (float(u), float(v))
@@ -937,12 +963,12 @@ class VideoMarkTrackingMixin:
         return _DOOAF_ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG
 
     def _dooaf_mark_attitude_track_active(self, track: dict[str, object]) -> bool:
-        """Gimbal pan — overlay follows via GAC scales (not GPS geo projection)."""
+        """Gimbal pan — overlay follows via GAC scales (same math as LRF reticle)."""
         if track.get("ref_att") is None and track.get("pin_ref_att") is None:
             return False
-        # Gun ground pick (no facade lock yet): track every frame — GAC is the only
-        # reliable signal; waiting for a deadband left the mark screen-pinned while panning.
-        if track.get("ground_video_pick") and not self._facade_session_freezes_setup_marks():
+        if track.get("ground_video_pick") or track.get("facade_uv_pick"):
+            return True
+        if track.get("video_mark_track_ref_u") is not None:
             return True
         deadband = self._dooaf_mark_attitude_track_deadband_deg(track)
         return self._gimbal_moved_since_mark_lock(track, deadband_deg=deadband)
@@ -1107,20 +1133,8 @@ class VideoMarkTrackingMixin:
     def _observation_mark_display_uv(
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
-        """Screen UV for logged observations — pinned at pick; report geo is separate."""
+        """Screen UV for logged observations — GAC track when gimbal moves; report geo is separate."""
         role = str(row.get("dooaf_role") or "")
-        fu_u = row.get("video_mark_frozen_u")
-        fu_v = row.get("video_mark_frozen_v")
-        if fu_u is not None and fu_v is not None:
-            u, v = float(fu_u), float(fu_v)
-            if self._mark_uv_on_screen(u, v):
-                return (u, v)
-            return None
-        if role == DOOAF_ROLE_IMPACT:
-            u, v = float(stored_u), float(stored_v)
-            if self._mark_uv_on_screen(u, v):
-                return (u, v)
-            return None
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
             return (float(stored_u), float(stored_v))
@@ -1150,28 +1164,21 @@ class VideoMarkTrackingMixin:
             pin_pitch = row.get("video_mark_track_ref_pitch")
             if pin_yaw is not None and pin_pitch is not None:
                 track["pin_ref_att"] = (float(pin_yaw), float(pin_pitch))
-            for key in (
-                "lock_vehicle_lat",
-                "lock_vehicle_lon",
-                "lock_vehicle_heading_deg",
-            ):
-                if row.get(key) is not None:
-                    track[key] = row.get(key)
-            for sk in (
-                "smooth_vehicle_lat",
-                "smooth_vehicle_lon",
-                "smooth_vehicle_heading_deg",
-            ):
-                if row.get(sk) is not None:
-                    track[sk] = row.get(sk)
-            slant = row.get("lrf_slant_range_m")
-            if slant is not None:
-                try:
-                    track["lrf_slant_range_m"] = float(slant)
-                except (TypeError, ValueError):
-                    pass
+            track["click_pin"] = True
+            track["pin_uv"] = track["ref_uv"]
+            if str(row.get("geo_method") or "") in {
+                "lrf_facade_uv",
+                "lrf_facade_plane",
+            }:
+                track["facade_uv_pick"] = True
         except (TypeError, ValueError):
             return (float(stored_u), float(stored_v))
+        anchor = self._dooaf_mark_world_anchor_display_uv(
+            track, (float(stored_u), float(stored_v))
+        )
+        if anchor is not None:
+            self._persist_mark_track_smooth_keys(track, row)
+            return anchor
         if self._dooaf_mark_geo_track_active(track):
             geo_disp = self._dooaf_mark_geo_display_uv(track)
             if geo_disp is not None:
@@ -1179,10 +1186,13 @@ class VideoMarkTrackingMixin:
                 if self._mark_uv_on_screen(u, v):
                     return (u, v)
                 return None
-        if str(row.get("geo_method") or "") in {"lrf_facade_uv", "lrf_facade_plane"}:
-            frozen = self._facade_frozen_mark_uv(float(stored_u), float(stored_v))
-            if frozen is not None:
-                return frozen
+        fu_u = row.get("video_mark_frozen_u")
+        fu_v = row.get("video_mark_frozen_v")
+        if fu_u is not None and fu_v is not None:
+            u, v = float(fu_u), float(fu_v)
+            if self._mark_uv_on_screen(u, v):
+                return (u, v)
+            return None
         uv = self._tracked_uv_from_store(track, (float(stored_u), float(stored_v)))
         self._persist_mark_track_smooth_keys(track, row)
         return uv
