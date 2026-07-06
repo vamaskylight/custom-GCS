@@ -90,6 +90,9 @@ class LrfVideoLockMixin:
                 print(
                     f"[VGCS:lrf] track calibrate gac_scale=({h_new:.3f},{v_new:.3f})"
                 )
+            sync_gac = getattr(self, "_sync_all_dooaf_setup_marks_gac_scales", None)
+            if callable(sync_gac):
+                sync_gac()
             u_chk, v_chk = SkydroidTopUdpAdapter.lrf_track_uv_from_attitude(
                 ref_uv,
                 ref_att,
