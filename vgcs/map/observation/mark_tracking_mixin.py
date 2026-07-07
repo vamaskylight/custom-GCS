@@ -35,11 +35,17 @@ class VideoMarkTrackingMixin:
         *,
         used_lrf_slew: bool,
     ) -> dict[str, object] | None:
+        track_uv = (float(ref_uv[0]), float(ref_uv[1]))
         if ref_att is None:
-            return None
+            return {
+                "ref_uv": track_uv,
+                "h_scale": 1.0,
+                "v_scale": 1.0,
+                "lrf_slew": bool(used_lrf_slew),
+                "pin_only_att": True,
+            }
         from vgcs.skydroid.adapter import SkydroidTopUdpAdapter
 
-        track_uv = (float(ref_uv[0]), float(ref_uv[1]))
         track_att = (float(ref_att[0]), float(ref_att[1]))
         h_scale = 1.0
         v_scale = 1.0
@@ -625,7 +631,10 @@ class VideoMarkTrackingMixin:
         track: dict[str, object],
         stored_uv: tuple[float, float],
     ) -> tuple[float, float] | None:
-        cur = self._read_gimbal_attitude_pair()
+        if track.get("ground_video_pick") or track.get("pin_only_att"):
+            cur = self._read_top_gimbal_attitude_pair()
+        else:
+            cur = self._read_gimbal_attitude_pair()
         if cur is None:
             return None
         ref_uv = track.get("ref_uv")
@@ -939,7 +948,12 @@ class VideoMarkTrackingMixin:
         deadband_deg: float = _DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG,
     ) -> bool:
         lock_att = self._mark_lock_attitude(track)
-        cur = self._current_gimbal_attitude_pair()
+        if track.get("ground_video_pick") or track.get("pin_only_att"):
+            cur = self._read_top_gimbal_attitude_pair()
+            if cur is None:
+                return False
+        else:
+            cur = self._current_gimbal_attitude_pair()
         if lock_att is None or cur is None:
             return False
         dyaw, dpitch = self._gimbal_att_delta_deg(lock_att, cur)
@@ -1001,9 +1015,13 @@ class VideoMarkTrackingMixin:
 
     def _dooaf_mark_attitude_track_active(self, track: dict[str, object]) -> bool:
         """Gimbal pan — overlay follows via GAC scales (same math as LRF reticle)."""
+        if track.get("pin_only_att"):
+            return False
         if track.get("ref_att") is None and track.get("pin_ref_att") is None:
             return False
-        if track.get("ground_video_pick") or track.get("facade_uv_pick"):
+        if track.get("ground_video_pick"):
+            return self._read_top_gimbal_attitude_pair() is not None
+        if track.get("facade_uv_pick"):
             return True
         if track.get("video_mark_track_ref_u") is not None:
             return True
@@ -1023,29 +1041,58 @@ class VideoMarkTrackingMixin:
             track
         ) or self._dooaf_mark_attitude_track_active(track)
 
+    def _dooaf_mark_click_pin_uv(
+        self, track: dict[str, object]
+    ) -> tuple[float, float] | None:
+        """Hold mark at operator click when tracking inputs are missing or unreliable."""
+        pin = track.get("pin_uv")
+        if not isinstance(pin, tuple):
+            pin = track.get("ref_uv")
+        if not isinstance(pin, tuple):
+            return None
+        u, v = float(pin[0]), float(pin[1])
+        if self._mark_uv_on_screen(u, v):
+            return (u, v)
+        return None
+
+    def _gimbal_attitude_usable_for_mark_track(self) -> bool:
+        return self._read_top_gimbal_attitude_pair() is not None
+
     def _dooaf_mark_world_anchor_display_uv(
         self, track: dict[str, object], stored_uv: tuple[float, float]
     ) -> tuple[float, float] | None:
-        """World-fixed overlay: geo reproject when possible, else GAC attitude when panning."""
+        """World-fixed overlay: pin at click until pan/shift, then GAC or geo."""
+        pin_hold = self._dooaf_mark_click_pin_uv(track)
+        gimbal_moved = self._gimbal_moved_since_mark_lock(
+            track, deadband_deg=_DOOAF_ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG
+        )
+        vehicle_moved = self._dooaf_mark_vehicle_geo_active(track)
+        if not gimbal_moved and not vehicle_moved and pin_hold is not None:
+            return pin_hold
+
         has_geo = track.get("geo_lat") is not None and track.get("geo_lon") is not None
-        if has_geo and (
-            track.get("facade_uv_pick") or track.get("ground_video_pick")
-        ):
+        if has_geo and track.get("facade_uv_pick"):
             geo_disp = self._dooaf_mark_geo_display_uv(track)
             if geo_disp is not None:
-                return geo_disp
-        if self._dooaf_mark_attitude_track_active(track):
+                if pin_hold is not None and not vehicle_moved:
+                    du = abs(float(geo_disp[0]) - float(pin_hold[0]))
+                    dv = abs(float(geo_disp[1]) - float(pin_hold[1]))
+                    if du > 0.12 or dv > 0.12:
+                        geo_disp = None
+                if geo_disp is not None:
+                    return geo_disp
+        if gimbal_moved and self._dooaf_mark_attitude_track_active(track):
             att_disp = self._dooaf_mark_attitude_display_uv(track, stored_uv)
             if att_disp is not None:
                 return att_disp
-        if self._dooaf_mark_vehicle_geo_active(track) and has_geo:
+        if has_geo and track.get("ground_video_pick") and vehicle_moved:
             geo_disp = self._dooaf_mark_geo_display_uv(track)
             if geo_disp is not None:
                 u, v = geo_disp
                 if self._mark_uv_on_screen(u, v):
                     return (u, v)
                 return None
-        return None
+        return pin_hold
 
     def _dooaf_mark_geo_track_active(self, track: dict[str, object]) -> bool:
         """World-anchor overlay when the aircraft has moved (not gimbal pan)."""
@@ -1066,8 +1113,13 @@ class VideoMarkTrackingMixin:
             except (TypeError, ValueError):
                 alt = None
         use_lock_pose = False
-        if track.get("facade_uv_pick") or track.get("ground_video_pick"):
+        if track.get("facade_uv_pick"):
             use_lock_pose = not self._vehicle_shift_since_mark_lock(track)
+        elif track.get("ground_video_pick"):
+            # Ground gun/target overlay uses geo only after the drone shifts — never on pan.
+            if not self._vehicle_shift_since_mark_lock(track):
+                return None
+            use_lock_pose = False
         elif self._facade_session_freezes_setup_marks():
             use_lock_pose = not self._vehicle_shift_since_mark_lock(track)
         geo_uv = self._project_geo_to_video_norm(

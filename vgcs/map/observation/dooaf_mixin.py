@@ -298,7 +298,7 @@ class DooafOperationsMixin:
             mark_v, pick_role=pick_role, label=label
         )
         self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
-        ref_att = self._read_gimbal_attitude_pair()
+        ref_att = self._read_top_gimbal_attitude_pair()
         self._register_dooaf_setup_mark_track(
             pick_role,
             ref_uv=(mark_u, mark_v),
@@ -325,6 +325,11 @@ class DooafOperationsMixin:
         print(
             f"[VGCS:observe] dooaf ground video pick ok role={pick_role} "
             f"lat={lat:.7f} lon={lon:.7f} alt={alt_m} video=({mark_u:.3f},{mark_v:.3f})"
+            + (
+                " pin_only=yes (TOP gimbal unavailable — mark stays at click)"
+                if ref_att is None
+                else ""
+            )
         )
         if callable(cb):
             try:
