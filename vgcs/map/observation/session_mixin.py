@@ -267,7 +267,8 @@ class ObservationSessionMixin:
                     print(
                         f"[VGCS:observe] impact facade uv pick ok "
                         f"lat={lat:.7f} lon={lon:.7f} "
-                        f"video=({float(video_x):.3f},{float(video_y):.3f})"
+                        f"video=({float(video_x):.3f},{float(video_y):.3f}) "
+                        f"screen_pin=yes (impact overlay fixed at click)"
                     )
                     return
                 print(
@@ -312,7 +313,8 @@ class ObservationSessionMixin:
                 print(
                     f"[VGCS:observe] impact ground video pick ok "
                     f"lat={row.get('target_lat')} lon={row.get('target_lon')} "
-                    f"video=({float(video_x):.3f},{float(video_y):.3f})"
+                    f"video=({float(video_x):.3f},{float(video_y):.3f}) "
+                    f"screen_pin=yes (impact overlay fixed at click)"
                 )
                 return
             self._pending_lrf_video_pick = PendingLrfVideoPick(
