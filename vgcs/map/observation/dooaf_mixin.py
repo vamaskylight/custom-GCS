@@ -1046,7 +1046,8 @@ class DooafOperationsMixin:
         slant_note = f" facade LRF {float(slant):.1f} m" if slant is not None else ""
         print(
             f"[VGCS:observe] dooaf facade uv pick ok role={pick_role} "
-            f"lat={lat:.7f} lon={lon:.7f} video=({mark_u:.3f},{mark_v:.3f}){slant_note}"
+            f"lat={lat:.7f} lon={lon:.7f} video=({mark_u:.3f},{mark_v:.3f})"
+            f"{slant_note} screen_pin=yes (facade setup — overlay fixed at click)"
         )
         self._end_dooaf_map_pick(restore_target_mode=True)
         if cb is not None:

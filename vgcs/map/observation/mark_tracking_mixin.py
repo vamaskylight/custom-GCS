@@ -404,14 +404,37 @@ class VideoMarkTrackingMixin:
             slant_range_m=slant_m,
         )
 
-    def _dooaf_ground_mark_is_screen_pinned(self, track: dict[str, object]) -> bool:
-        """DOOAF ground gun/target setup: fixed at click UV.
+    def _dooaf_setup_mark_is_screen_pinned(self, track: dict[str, object]) -> bool:
+        """DOOAF setup overlays fixed at click UV (gun ground + facade target).
 
         GAC attitude track drifts horizontally in LOITER when camera FOLLOW yaws with
-        the aircraft — geo is also noisy under high HDOP. Saved lat/lon stays in the
-        report; only the on-video overlay is screen-pinned until target LRF lock.
+        the aircraft. Saved lat/lon stays in the report; on-video overlay is pinned.
         """
-        return bool(track.get("ground_video_pick"))
+        return bool(track.get("ground_video_pick") or track.get("facade_uv_pick"))
+
+    def _dooaf_ground_mark_is_screen_pinned(self, track: dict[str, object]) -> bool:
+        return self._dooaf_setup_mark_is_screen_pinned(track)
+
+    def _observation_mark_is_screen_pinned(self, row: dict[str, object]) -> bool:
+        """Fall-of-shot (impact) overlay — pin at operator click in LOITER/FOLLOW."""
+        return str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
+
+    def _observation_mark_screen_pin_uv(
+        self, row: dict[str, object]
+    ) -> tuple[float, float] | None:
+        fu_u = row.get("video_mark_frozen_u")
+        fu_v = row.get("video_mark_frozen_v")
+        if fu_u is not None and fu_v is not None:
+            u, v = float(fu_u), float(fu_v)
+        else:
+            vx = row.get("video_x_norm")
+            vy = row.get("video_y_norm")
+            if vx is None or vy is None:
+                return None
+            u, v = float(vx), float(vy)
+        if not self._mark_uv_on_screen(u, v):
+            return None
+        return (max(0.0, min(1.0, u)), max(0.0, min(1.0, v)))
 
     def _dooaf_ground_mark_screen_pin_uv(
         self, track: dict[str, object], stored_uv: tuple[float, float]
@@ -431,11 +454,14 @@ class VideoMarkTrackingMixin:
             return True
         tracks = getattr(self, "_dooaf_setup_mark_track", None) or {}
         for track in tracks.values():
-            if not self._dooaf_ground_mark_is_screen_pinned(track):
+            if not self._dooaf_setup_mark_is_screen_pinned(track):
                 return True
         for row in self._observations:
-            if row.get("video_mark_track_ref_u") is not None:
-                return True
+            if row.get("video_mark_track_ref_u") is None:
+                continue
+            if self._observation_mark_is_screen_pinned(row):
+                continue
+            return True
         return False
 
     def _sync_video_mark_track_timer(self) -> None:
@@ -752,7 +778,7 @@ class VideoMarkTrackingMixin:
         track: dict[str, object] | None,
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
-        if track is not None and self._dooaf_ground_mark_is_screen_pinned(track):
+        if track is not None and self._dooaf_setup_mark_is_screen_pinned(track):
             pinned = self._dooaf_ground_mark_screen_pin_uv(track, stored_uv)
             if pinned is not None:
                 return pinned
@@ -1056,9 +1082,7 @@ class VideoMarkTrackingMixin:
         if track.get("ref_att") is None and track.get("pin_ref_att") is None:
             return False
         if track.get("facade_uv_pick"):
-            return True
-        if track.get("video_mark_track_ref_u") is not None:
-            return True
+            return False
         deadband = self._dooaf_mark_attitude_track_deadband_deg(track)
         return self._gimbal_moved_since_mark_lock(track, deadband_deg=deadband)
 
@@ -1185,7 +1209,7 @@ class VideoMarkTrackingMixin:
     ) -> tuple[float, float] | None:
         """Screen UV for a DOOAF setup mark — frozen at pick; hidden when off-screen."""
         track = self._dooaf_setup_mark_track.get(str(role))
-        if track is not None and self._dooaf_ground_mark_is_screen_pinned(track):
+        if track is not None and self._dooaf_setup_mark_is_screen_pinned(track):
             return self._dooaf_ground_mark_screen_pin_uv(track, stored_uv)
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             pending = getattr(self, "_pending_lrf_video_pick", None)
@@ -1273,6 +1297,11 @@ class VideoMarkTrackingMixin:
         self, row: dict[str, object], stored_u: float, stored_v: float
     ) -> tuple[float, float] | None:
         """Screen UV for logged observations — GAC track when gimbal moves; report geo is separate."""
+        if self._observation_mark_is_screen_pinned(row):
+            pinned = self._observation_mark_screen_pin_uv(row)
+            if pinned is not None:
+                return pinned
+            return (float(stored_u), float(stored_v))
         role = str(row.get("dooaf_role") or "")
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
