@@ -328,7 +328,7 @@ class DooafOperationsMixin:
             + (
                 " pin_only=yes (TOP gimbal unavailable — mark stays at click)"
                 if ref_att is None
-                else ""
+                else " screen_pin=yes (ground setup — overlay fixed at click)"
             )
         )
         if callable(cb):
