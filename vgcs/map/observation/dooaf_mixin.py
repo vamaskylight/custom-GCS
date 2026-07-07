@@ -997,13 +997,24 @@ class DooafOperationsMixin:
             return False
         lat, lon, alt_m = geo
         slant = getattr(self._dooaf_facade_session, "slant_range_m", None)
-        lock_att = self._facade_lock_gimbal_att()
+        pick_att = self._read_gimbal_attitude_pair()
+        click_att = getattr(self, "_lrf_click_att", None)
+        if isinstance(click_att, tuple):
+            ref_att: tuple[float, float] | None = (
+                float(click_att[0]),
+                float(click_att[1]),
+            )
+        elif pick_att is not None:
+            ref_att = pick_att
+        else:
+            ref_att = self._facade_lock_gimbal_att()
+        lock_att = pick_att if pick_att is not None else ref_att
         mark_u, mark_v = float(video_x), float(video_y)
         self._dooaf_setup_video_marks[pick_role] = (mark_u, mark_v)
         self._register_dooaf_setup_mark_track(
             pick_role,
             ref_uv=(mark_u, mark_v),
-            ref_att=lock_att,
+            ref_att=ref_att,
             lock_att=lock_att,
             used_lrf_slew=False,
             facade_uv_pick=True,
@@ -1012,6 +1023,9 @@ class DooafOperationsMixin:
             geo_alt_m=alt_m,
             lrf_slant_range_m=float(slant) if slant is not None else None,
         )
+        sync_gac = getattr(self, "_sync_all_dooaf_setup_marks_gac_scales", None)
+        if callable(sync_gac):
+            sync_gac()
         try:
             write_dooaf_setup_video_mark(
                 self._dooaf_settings_store(),
