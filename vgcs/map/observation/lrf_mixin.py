@@ -44,6 +44,28 @@ class LrfVideoLockMixin:
         except Exception:
             return None
 
+    def _read_top_gimbal_attitude_pair(self) -> tuple[float, float] | None:
+        """C13 TOP UDP gimbal only — not MAVLink mount fallback (wrong for video GAC)."""
+        cc = getattr(self, "_camera_control", None)
+        if cc is None:
+            return None
+        try:
+            from vgcs.video.camera_control import SkydroidCameraControl, resolve_camera_control_primary
+
+            primary = resolve_camera_control_primary(cc)
+            if not isinstance(primary, SkydroidCameraControl):
+                return None
+            st = primary.get_gimbal_status()
+            if st is None or not bool(getattr(st, "supported", False)):
+                return None
+            yaw = getattr(st, "yaw_deg", None)
+            pitch = getattr(st, "pitch_deg", None)
+            if yaw is None or pitch is None:
+                return None
+            return float(yaw), float(pitch)
+        except Exception:
+            return None
+
     def _lrf_reticle_tracking_active(self) -> bool:
         if getattr(self, "_lrf_track_ref_uv", None) is None:
             return False
