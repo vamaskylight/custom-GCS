@@ -1005,10 +1005,16 @@ class VideoMarkTrackingMixin:
             return (u, v)
         return None
 
+    def _dooaf_ground_mark_pan_deadband_deg(self) -> float:
+        """Ground picks stay pinned until deliberate operator pan (C13 yaw jitters 1–4° in hover)."""
+        return _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
+
     def _dooaf_mark_attitude_track_deadband_deg(
         self, track: dict[str, object]
     ) -> float:
         """Facade picks defer attitude track until GAC settles after LRF lock."""
+        if track.get("ground_video_pick"):
+            return self._dooaf_ground_mark_pan_deadband_deg()
         if track.get("facade_uv_pick") or self._facade_session_freezes_setup_marks():
             return _LRF_MARK_PIN_ATT_DEADBAND_DEG
         return _DOOAF_ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG
@@ -1020,7 +1026,11 @@ class VideoMarkTrackingMixin:
         if track.get("ref_att") is None and track.get("pin_ref_att") is None:
             return False
         if track.get("ground_video_pick"):
-            return self._read_top_gimbal_attitude_pair() is not None
+            if self._read_top_gimbal_attitude_pair() is None:
+                return False
+            return self._gimbal_moved_since_mark_lock(
+                track, deadband_deg=self._dooaf_ground_mark_pan_deadband_deg()
+            )
         if track.get("facade_uv_pick"):
             return True
         if track.get("video_mark_track_ref_u") is not None:
@@ -1034,6 +1044,13 @@ class VideoMarkTrackingMixin:
             return False
         if track.get("lrf_boresight_geo"):
             return False
+        if track.get("ground_video_pick"):
+            try:
+                hdop = self._observation_context().get("gps_hdop")
+                if hdop is not None and float(hdop) > 2.0:
+                    return False
+            except (TypeError, ValueError):
+                pass
         return self._vehicle_shift_since_mark_lock(track)
 
     def _dooaf_mark_world_tracking_active(self, track: dict[str, object]) -> bool:
@@ -1063,8 +1080,9 @@ class VideoMarkTrackingMixin:
     ) -> tuple[float, float] | None:
         """World-fixed overlay: pin at click until pan/shift, then GAC or geo."""
         pin_hold = self._dooaf_mark_click_pin_uv(track)
+        gimbal_deadband = self._dooaf_mark_attitude_track_deadband_deg(track)
         gimbal_moved = self._gimbal_moved_since_mark_lock(
-            track, deadband_deg=_DOOAF_ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG
+            track, deadband_deg=gimbal_deadband
         )
         vehicle_moved = self._dooaf_mark_vehicle_geo_active(track)
         if not gimbal_moved and not vehicle_moved and pin_hold is not None:
