@@ -311,7 +311,9 @@ class ObservationExportTask(QRunnable):
                 for row in export_rows:
                     w.writerow({k: row.get(k) for k in fields})
             detailed_log = format_observation_detailed_log_html(
-                export_rows, self._obs_cell_fn
+                export_rows,
+                self._obs_cell_fn,
+                dem_available=bool(getattr(session, "dem_available", False)),
             )
             dooaf_summary = format_dooaf_html_summary(
                 session,

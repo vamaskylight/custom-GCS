@@ -89,6 +89,7 @@ class DooafSession:
     intended_dem_alt_m: float | None = None
     impact_dem_alt_m: float | None = None
     height_correction_m: float | None = None
+    dem_available: bool = False
 
 @dataclass(frozen=True)
 class DooafSettings:
