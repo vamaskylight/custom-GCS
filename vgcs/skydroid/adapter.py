@@ -2009,6 +2009,25 @@ class SkydroidTopUdpAdapter:
                 ordered.append(p)
         return tuple(ordered)
 
+    def _slr_probe_targets(self) -> tuple[tuple[str, int], ...]:
+        """(host, port) pairs to try for SLR: active host first, then other known
+        hosts. The RC-relay endpoint forwards GAC attitude but often NOT the laser
+        rangefinder, so the direct camera IP must be tried even when GAC is on relay."""
+        active_host = str(self._active_host or self._transport._host or "").strip()
+        hosts: list[str] = []
+        if active_host:
+            hosts.append(active_host)
+        for h in list(getattr(self, "_hosts", []) or []):
+            hs = str(h or "").strip()
+            if hs and hs not in hosts:
+                hosts.append(hs)
+        ports = self._slr_probe_ports()
+        targets: list[tuple[str, int]] = []
+        for h in hosts:
+            for p in ports:
+                targets.append((h, int(p)))
+        return tuple(targets)
+
     def _fire_slr_trigger(self, *, dest: str = _LRF_SLR_DEST_LASER) -> None:
         try:
             self._transport.send_and_receive(
@@ -3088,6 +3107,7 @@ class SkydroidTopUdpAdapter:
         """SLR read: E-class laser module first, D-class fallback (PROTOCAL §2.2.2 / §4.22)."""
         self._ensure_active_transport()
         active_port = int(self._transport._port)
+        active_host = str(self._transport._host)
         laser_q = build_slr_query(dest=_LRF_SLR_DEST_LASER)
         system_q = build_slr_query(dest=_LRF_SLR_DEST_SYSTEM)
         trigger = bool(fresh and self._slr_use_trigger())
@@ -3097,7 +3117,8 @@ class SkydroidTopUdpAdapter:
         laser_reply: bytes | None = None
         system_reply: bytes | None = None
         try:
-            for port in self._slr_probe_ports():
+            for host, port in self._slr_probe_targets():
+                self._transport._host = str(host)
                 self._transport._port = int(port)
                 if trigger:
                     self._fire_slr_trigger(dest=_LRF_SLR_DEST_LASER)
@@ -3117,15 +3138,20 @@ class SkydroidTopUdpAdapter:
                 )
                 dist_m = self._pick_slr_readings(laser_m, system_m, log=log)
                 if dist_m is not None:
-                    if log and int(port) != int(active_port):
+                    if log and (int(port) != int(active_port) or str(host) != active_host):
                         print(
-                            f"[VGCS:lrf] SLR ok on port {int(port)} "
-                            f"(active gimbal port {int(active_port)})"
+                            f"[VGCS:lrf] SLR ok on {host}:{int(port)} "
+                            f"(active gimbal {active_host}:{int(active_port)})"
                         )
                     break
             if dist_m is None:
                 if log:
-                    print("[VGCS:lrf] SLR read failed — no valid E/D reply")
+                    print(
+                        "[VGCS:lrf] SLR read failed — no valid E/D reply. "
+                        "Laser not answering on this link (RC relay forwards gimbal "
+                        "attitude but not the rangefinder). Connect the PC directly to "
+                        "the camera (Ethernet to 192.168.144.108) for LRF."
+                    )
                 return None
             dist_m = self._calibrate_slr_m(float(dist_m))
             if log:
@@ -3143,6 +3169,7 @@ class SkydroidTopUdpAdapter:
         except Exception:
             return None
         finally:
+            self._transport._host = active_host
             self._transport._port = active_port
 
     def unlock_lrf(self) -> None:
