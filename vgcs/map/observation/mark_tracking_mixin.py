@@ -1087,9 +1087,10 @@ class VideoMarkTrackingMixin:
         return self._gimbal_moved_since_mark_lock(track, deadband_deg=deadband)
 
     def _dooaf_mark_vehicle_geo_active(self, track: dict[str, object]) -> bool:
-        """Loiter/wind moved the drone — reproject saved lat/lon."""
-        if track.get("ground_video_pick"):
-            return False
+        """Loiter/wind moved the drone — reproject saved lat/lon so the overlay dot
+        stays on the target. Applies to gun (ground pick) and target/impact (facade
+        UV) alike; only triggers once the drone has shifted past the deadband, so
+        small hover jitter keeps the dot pinned."""
         if track.get("geo_lat") is None or track.get("geo_lon") is None:
             return False
         if track.get("lrf_boresight_geo"):
@@ -1210,6 +1211,13 @@ class VideoMarkTrackingMixin:
         """Screen UV for a DOOAF setup mark — frozen at pick; hidden when off-screen."""
         track = self._dooaf_setup_mark_track.get(str(role))
         if track is not None and self._dooaf_setup_mark_is_screen_pinned(track):
+            # Wind drift: once the drone has moved from the pose at pick, re-anchor
+            # the dot to its saved GPS point so it stays on the target. Small gimbal
+            # jitter with no vehicle shift keeps it pinned (no nervous movement).
+            if self._dooaf_mark_vehicle_geo_active(track):
+                anchor = self._dooaf_mark_world_anchor_display_uv(track, stored_uv)
+                if anchor is not None:
+                    return anchor
             return self._dooaf_ground_mark_screen_pin_uv(track, stored_uv)
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             pending = getattr(self, "_pending_lrf_video_pick", None)
@@ -1298,10 +1306,25 @@ class VideoMarkTrackingMixin:
     ) -> tuple[float, float] | None:
         """Screen UV for logged observations — GAC track when gimbal moves; report geo is separate."""
         if self._observation_mark_is_screen_pinned(row):
-            pinned = self._observation_mark_screen_pin_uv(row)
-            if pinned is not None:
-                return pinned
-            return (float(stored_u), float(stored_v))
+            # Wind drift: if the drone has moved from the pose at pick, re-anchor the
+            # impact dot to its saved GPS point so it stays on the target. Otherwise
+            # (small hover jitter) keep it pinned at the click pixel.
+            drift_probe = {
+                "geo_lat": row.get("video_mark_geo_lat"),
+                "geo_lon": row.get("video_mark_geo_lon"),
+                "lock_vehicle_lat": row.get("lock_vehicle_lat"),
+                "lock_vehicle_lon": row.get("lock_vehicle_lon"),
+            }
+            drifted = (
+                drift_probe["geo_lat"] is not None
+                and drift_probe["geo_lon"] is not None
+                and self._dooaf_mark_vehicle_geo_active(drift_probe)
+            )
+            if not drifted:
+                pinned = self._observation_mark_screen_pin_uv(row)
+                if pinned is not None:
+                    return pinned
+                return (float(stored_u), float(stored_v))
         role = str(row.get("dooaf_role") or "")
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
@@ -1328,6 +1351,14 @@ class VideoMarkTrackingMixin:
                 galt = row.get("video_mark_geo_alt_m")
                 if galt is not None:
                     track["geo_alt_m"] = float(galt)
+            llat = row.get("lock_vehicle_lat")
+            llon = row.get("lock_vehicle_lon")
+            if llat is not None and llon is not None:
+                track["lock_vehicle_lat"] = float(llat)
+                track["lock_vehicle_lon"] = float(llon)
+            lhdg = row.get("lock_vehicle_heading_deg")
+            if lhdg is not None:
+                track["lock_vehicle_heading_deg"] = float(lhdg)
             pin_yaw = row.get("video_mark_track_ref_yaw")
             pin_pitch = row.get("video_mark_track_ref_pitch")
             if pin_yaw is not None and pin_pitch is not None:

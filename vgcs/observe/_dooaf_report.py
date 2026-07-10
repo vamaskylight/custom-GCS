@@ -3018,8 +3018,13 @@ def _position_section_title(row: dict[str, object]) -> str:
         return "Video mark (ground)"
     return "Map mark"
 
-def _log_summary_rows(row: dict[str, object], cell_fn: Any) -> list[str]:
+def _log_summary_rows(
+    row: dict[str, object], cell_fn: Any, *, dem_available: bool = True
+) -> list[str]:
     """Top-of-entry summary fields in the same table layout as coordinate rows."""
+    ground_dem_label = (
+        "Ground height (DEM)" if dem_available else "Ground height (est., no DEM)"
+    )
     rows: list[str] = [_log_detail_section("Summary")]
 
     mgrs = str(row.get("target_grid_ref") or row.get("map_grid_ref") or "").strip()
@@ -3150,7 +3155,9 @@ def _format_observation_log_entry(
         cell_fn,
     )
 
-    detail_rows: list[str] = _log_summary_rows(row, cell_fn)
+    detail_rows: list[str] = _log_summary_rows(
+        row, cell_fn, dem_available=dem_available
+    )
 
     if map_ok and tgt_ok and same_pos:
         detail_rows.append(_log_detail_section(_position_section_title(row)))
