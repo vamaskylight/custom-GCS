@@ -22,6 +22,11 @@ _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG = 8.0
 _DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
 # Loiter drift in wind — anchor ground picks to saved geo once the drone shifts.
 _DOOAF_GEO_TRACK_VEHICLE_SHIFT_M = 2.0
+# Freeze-while-holding: once world-anchored, only recompute the on-screen point when
+# the gimbal slews past this angle or the drone drifts past this distance. Keeps the
+# dot perfectly still while the operator aims (no sensor-noise tremble).
+_WA_HOLD_STILL_DEG = 0.6
+_WA_HOLD_STILL_M = 0.75
 
 
 class VideoMarkTrackingMixin:
@@ -1200,6 +1205,13 @@ class VideoMarkTrackingMixin:
             return None
         return (float(geo_uv[0]), float(geo_uv[1]))
 
+    def _mark_current_gimbal_att(
+        self, track: dict[str, object]
+    ) -> tuple[float, float] | None:
+        if track.get("ground_video_pick") or track.get("pin_only_att"):
+            return self._read_top_gimbal_attitude_pair()
+        return self._current_gimbal_attitude_pair()
+
     def _dooaf_mark_geo_uv_current_pose(
         self, track: dict[str, object]
     ) -> tuple[float, float] | None:
@@ -1207,11 +1219,56 @@ class VideoMarkTrackingMixin:
 
         Uses the absolute vehicle+gimbal pose, so it stays on the real point even in
         LOITER/FOLLOW (heading and gimbal yaw combine to the true camera azimuth).
+
+        Freeze-while-holding: the screen point is only recomputed when the gimbal is
+        actually slewing or the drone has really drifted. While the camera is steady
+        the last computed point is returned unchanged, so the dot does not tremble with
+        gimbal-encoder / GPS / heading sensor noise while the operator is aiming.
         """
         glat = track.get("geo_lat")
         glon = track.get("geo_lon")
         if glat is None or glon is None:
             return None
+        cur_att = self._mark_current_gimbal_att(track)
+        ctx = self._observation_context()
+        cur_vlat = ctx.get("vehicle_lat")
+        cur_vlon = ctx.get("vehicle_lon")
+        last_att = track.get("_wa_hold_att")
+        last_uv = track.get("_wa_hold_uv")
+        if (
+            cur_att is not None
+            and isinstance(last_att, tuple)
+            and isinstance(last_uv, tuple)
+        ):
+            dyaw, dpitch = self._gimbal_att_delta_deg(last_att, cur_att)
+            gimbal_still = (
+                dyaw < _WA_HOLD_STILL_DEG and dpitch < _WA_HOLD_STILL_DEG
+            )
+            vehicle_still = True
+            last_vlat = track.get("_wa_hold_vlat")
+            last_vlon = track.get("_wa_hold_vlon")
+            if (
+                cur_vlat is not None
+                and cur_vlon is not None
+                and last_vlat is not None
+                and last_vlon is not None
+            ):
+                try:
+                    vehicle_still = (
+                        float(
+                            haversine_m(
+                                float(last_vlat),
+                                float(last_vlon),
+                                float(cur_vlat),
+                                float(cur_vlon),
+                            )
+                        )
+                        < _WA_HOLD_STILL_M
+                    )
+                except (TypeError, ValueError):
+                    vehicle_still = True
+            if gimbal_still and vehicle_still:
+                return (float(last_uv[0]), float(last_uv[1]))
         galt = track.get("geo_alt_m")
         alt: float | None = None
         if galt is not None:
@@ -1229,7 +1286,14 @@ class VideoMarkTrackingMixin:
         )
         if geo_uv is None:
             return None
-        return (float(geo_uv[0]), float(geo_uv[1]))
+        out = (float(geo_uv[0]), float(geo_uv[1]))
+        if cur_att is not None:
+            track["_wa_hold_att"] = (float(cur_att[0]), float(cur_att[1]))
+            track["_wa_hold_uv"] = out
+            if cur_vlat is not None and cur_vlon is not None:
+                track["_wa_hold_vlat"] = float(cur_vlat)
+                track["_wa_hold_vlon"] = float(cur_vlon)
+        return out
 
     def _facade_session_freezes_setup_marks(self) -> bool:
         """True while a facade LRF lock exists — setup marks stay at pick UV on screen."""
