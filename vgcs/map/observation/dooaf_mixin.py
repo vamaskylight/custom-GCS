@@ -1215,14 +1215,16 @@ class DooafOperationsMixin:
             label=label,
             pick_role=pick_role,
         )
-        # Slew gimbal to the click so LRF measures the facade, not distant background.
-        # Screen-pinned setup marks stay at pick UV during/after lock (mark_tracking_mixin).
+        # Facade LRF: HOLD the gimbal and lock the range the laser reads at the
+        # crosshair. At shallow look angles the laser hit — not software — is ground
+        # truth, so we never slew (that overshoots onto background AND drags the
+        # screen-pinned gun mark). Operator aims the building at the centre, then clicks.
         self._begin_c13_lrf_video_lock_for_pick(
             float(video_x),
             float(video_y),
             label=label,
-            hold_gimbal=False,
-            hold_slant_boresight=False,
+            hold_gimbal=True,
+            hold_slant_boresight=True,
         )
         return True
 
