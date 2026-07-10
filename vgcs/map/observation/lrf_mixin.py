@@ -251,6 +251,33 @@ class LrfVideoLockMixin:
         out["gps_hdop"] = lock.gps_hdop
         return out
 
+    def _lrf_slant_plausible_for_context(self, slant_m: float) -> bool:
+        """Reject obvious background LRF hits at low AGL with near-level gimbal."""
+        try:
+            slant = float(slant_m)
+        except (TypeError, ValueError):
+            return True
+        ctx = self._observation_context()
+        agl_raw = ctx.get("measure_agl_m") or ctx.get("ekf_rel_alt_m")
+        if agl_raw is None:
+            return True
+        try:
+            agl = float(agl_raw)
+        except (TypeError, ValueError):
+            return True
+        att = self._read_gimbal_attitude_pair()
+        pitch_abs = abs(float(att[1])) if att is not None else None
+        if pitch_abs is not None and agl < 30.0 and pitch_abs < 8.0 and slant > max(
+            50.0, agl * 12.0
+        ):
+            print(
+                f"[VGCS:lrf] lock rejected — SLR {slant:.1f} m implausible at "
+                f"AGL {agl:.1f} m with pitch {pitch_abs:.1f}° (likely background); "
+                f"retry after camera slews to the building"
+            )
+            return False
+        return True
+
     def _update_lrf_lock_geo(self, distance_m: float | None) -> None:
         """Estimate locked target lat/lon from vehicle pose, gimbal, and LRF slant range."""
         if distance_m is None:
@@ -669,6 +696,10 @@ class LrfVideoLockMixin:
                     slant_m = float(dist)
                 except (TypeError, ValueError):
                     slant_m = None
+            if slant_m is not None and not self._lrf_slant_plausible_for_context(
+                float(slant_m)
+            ):
+                slant_m = None
             if slant_m is not None:
                 self._lrf_lock_distance_m = slant_m
                 self._lrf_lock_failed = False
@@ -723,10 +754,25 @@ class LrfVideoLockMixin:
             else:
                 self._lrf_lock_uv = (float(u), float(v))
                 self._lrf_lock_failed = True
+                self._lrf_lock_distance_m = None
+                self._clear_lrf_lock_geo()
+                try:
+                    unlock = getattr(
+                        getattr(self, "_camera_control", None), "unlock_lrf", None
+                    )
+                    if callable(unlock):
+                        unlock()
+                except Exception:
+                    pass
                 try:
                     self._obstacle_radar.set_c13_lrf_lock_failed()
                 except Exception:
                     pass
+                if pending.purpose == "dooaf_setup":
+                    self._set_status(
+                        "LRF lock failed — range looks wrong (background hit). "
+                        "Retry TARGET click on the building."
+                    )
             self._refresh_lrf_lock_overlay()
             return
         try:
