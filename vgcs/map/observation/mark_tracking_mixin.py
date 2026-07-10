@@ -1200,6 +1200,37 @@ class VideoMarkTrackingMixin:
             return None
         return (float(geo_uv[0]), float(geo_uv[1]))
 
+    def _dooaf_mark_geo_uv_current_pose(
+        self, track: dict[str, object]
+    ) -> tuple[float, float] | None:
+        """Reproject the locked GPS to the CURRENT camera pose (world-anchor on pan).
+
+        Uses the absolute vehicle+gimbal pose, so it stays on the real point even in
+        LOITER/FOLLOW (heading and gimbal yaw combine to the true camera azimuth).
+        """
+        glat = track.get("geo_lat")
+        glon = track.get("geo_lon")
+        if glat is None or glon is None:
+            return None
+        galt = track.get("geo_alt_m")
+        alt: float | None = None
+        if galt is not None:
+            try:
+                alt = float(galt)
+            except (TypeError, ValueError):
+                alt = None
+        geo_uv = self._project_geo_to_video_norm(
+            float(glat),
+            float(glon),
+            alt_m=alt,
+            pose_store=track,
+            smooth_pose=self._vehicle_airborne_for_mark_track(),
+            use_lock_vehicle_pose=False,
+        )
+        if geo_uv is None:
+            return None
+        return (float(geo_uv[0]), float(geo_uv[1]))
+
     def _facade_session_freezes_setup_marks(self) -> bool:
         """True while a facade LRF lock exists — setup marks stay at pick UV on screen."""
         session = getattr(self, "_dooaf_facade_session", None)
@@ -1210,14 +1241,41 @@ class VideoMarkTrackingMixin:
     ) -> tuple[float, float] | None:
         """Screen UV for a DOOAF setup mark — frozen at pick; hidden when off-screen."""
         track = self._dooaf_setup_mark_track.get(str(role))
-        if track is not None and self._dooaf_setup_mark_is_screen_pinned(track):
-            # Wind drift: once the drone has moved from the pose at pick, re-anchor
-            # the dot to its saved GPS point so it stays on the target. Small gimbal
-            # jitter with no vehicle shift keeps it pinned (no nervous movement).
-            if self._dooaf_mark_vehicle_geo_active(track):
-                anchor = self._dooaf_mark_world_anchor_display_uv(track, stored_uv)
-                if anchor is not None:
-                    return anchor
+        lock_in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
+        if (
+            track is not None
+            and self._dooaf_setup_mark_is_screen_pinned(track)
+            and not lock_in_progress
+        ):
+            # World-anchor: once the operator deliberately pans the gimbal (past the
+            # pan deadband) or the drone drifts, reproject the locked GPS to the CURRENT
+            # camera pose so the dot stays on the real gun/target — and slides off the
+            # edge (hidden, edge hint cues it) when it leaves the frame. It never chases
+            # the camera. Small hover/gimbal jitter (within the deadband) keeps it pinned
+            # at the click so there is no nervous movement. Requires a GPS anchor; a pick
+            # with no geo (or a lock in progress) stays frozen at the click.
+            has_geo = (
+                track.get("geo_lat") is not None
+                and track.get("geo_lon") is not None
+            )
+            if has_geo:
+                gimbal_panned = self._gimbal_moved_since_mark_lock(
+                    track, deadband_deg=_DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
+                )
+                vehicle_moved = self._dooaf_mark_vehicle_geo_active(track)
+                if gimbal_panned or vehicle_moved:
+                    geo_uv = self._dooaf_mark_geo_uv_current_pose(track)
+                    if geo_uv is not None:
+                        u, v = geo_uv
+                        if self._mark_uv_on_screen(u, v):
+                            return (max(0.0, min(1.0, u)), max(0.0, min(1.0, v)))
+                        return None
+                    if vehicle_moved:
+                        anchor = self._dooaf_mark_world_anchor_display_uv(
+                            track, stored_uv
+                        )
+                        if anchor is not None:
+                            return anchor
             return self._dooaf_ground_mark_screen_pin_uv(track, stored_uv)
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             pending = getattr(self, "_pending_lrf_video_pick", None)

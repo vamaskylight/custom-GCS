@@ -128,10 +128,20 @@ class NativeVideoOverlayLayer(QWidget):
         self._lrf_lock: VideoOverlayLrfLock | None = None
         self._lrf_armed_hint = False
         self._facade_hint: VideoOverlayFacadeHint | None = None
+        # Boresight (camera-centre) crosshair — the exact point the LRF measures.
+        # Aim this at the gun/target before locking so the ranged point is under it.
+        self._center_reticle_enabled = True
 
     def set_content_rect(self, rect: dict[str, float] | None) -> None:
         self._content_rect = dict(rect) if rect else None
         self.update()
+
+    def set_center_reticle_enabled(self, enabled: bool) -> None:
+        """Show/hide the boresight crosshair at the frame centre."""
+        val = bool(enabled)
+        if val != self._center_reticle_enabled:
+            self._center_reticle_enabled = val
+            self.update()
 
     def set_detections(self, items: list[VideoOverlayDetection] | list[dict[str, Any]]) -> None:
         out: list[VideoOverlayDetection] = []
@@ -459,6 +469,30 @@ class NativeVideoOverlayLayer(QWidget):
         p.setPen(QColor(224, 242, 254))
         p.drawText(tx + 5, ty + metrics.ascent() + 3, caption)
 
+    def _draw_center_reticle(
+        self, p: QPainter, cl: float, ct: float, cw: float, ch: float
+    ) -> None:
+        """Boresight crosshair at frame centre — where the LRF measures.
+
+        Aim this at the gun (camera tilted down) or the target, then lock the LRF so
+        the ranged point is exactly under it.
+        """
+        cx = cl + 0.5 * cw
+        cy = ct + 0.5 * ch
+        gap = 5.0
+        arm = 15.0
+        shadow = QPen(QColor(0, 0, 0, 150), 3.0)
+        line = QPen(QColor(90, 220, 255, 225), 1.6)
+        for pen in (shadow, line):
+            p.setPen(pen)
+            p.drawLine(int(cx - arm), int(cy), int(cx - gap), int(cy))
+            p.drawLine(int(cx + gap), int(cy), int(cx + arm), int(cy))
+            p.drawLine(int(cx), int(cy - arm), int(cx), int(cy - gap))
+            p.drawLine(int(cx), int(cy + gap), int(cx), int(cy + arm))
+        p.setPen(QPen(QColor(90, 220, 255, 235), 1.4))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), 2.2, 2.2)
+
     def _draw_lrf_lock_reticle(
         self,
         p: QPainter,
@@ -603,11 +637,15 @@ class NativeVideoOverlayLayer(QWidget):
             and self._lrf_lock is None
             and not self._lrf_armed_hint
             and self._facade_hint is None
+            and not self._center_reticle_enabled
         ):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         cl, ct, cw, ch = self._content_qrect()
+
+        if self._center_reticle_enabled:
+            self._draw_center_reticle(p, cl, ct, cw, ch)
 
         banner_y = float(ct + 8.0)
         if self._lrf_armed_hint and self._lrf_lock is None:
