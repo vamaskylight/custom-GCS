@@ -251,32 +251,37 @@ class LrfVideoLockMixin:
         out["gps_hdop"] = lock.gps_hdop
         return out
 
-    def _lrf_slant_plausible_for_context(self, slant_m: float) -> bool:
-        """Reject obvious background LRF hits at low AGL with near-level gimbal."""
+    def _lrf_slant_warn_for_context(self, slant_m: float) -> str | None:
+        """Non-blocking hint when the locked range looks long for the current AGL.
+
+        We DO NOT reject: at shallow look angles the laser hit at the crosshair is
+        ground truth and a tall building can legitimately be far. We only surface a
+        hint so the operator can re-aim if the range does not match the target.
+        """
         try:
             slant = float(slant_m)
         except (TypeError, ValueError):
-            return True
+            return None
         ctx = self._observation_context()
         agl_raw = ctx.get("measure_agl_m") or ctx.get("ekf_rel_alt_m")
-        if agl_raw is None:
-            return True
         try:
-            agl = float(agl_raw)
+            agl = float(agl_raw) if agl_raw is not None else None
         except (TypeError, ValueError):
-            return True
+            agl = None
         att = self._read_gimbal_attitude_pair()
         pitch_abs = abs(float(att[1])) if att is not None else None
-        if pitch_abs is not None and agl < 30.0 and pitch_abs < 8.0 and slant > max(
-            50.0, agl * 12.0
+        if (
+            agl is not None
+            and pitch_abs is not None
+            and agl < 30.0
+            and pitch_abs < 5.0
+            and slant > max(120.0, agl * 15.0)
         ):
-            print(
-                f"[VGCS:lrf] lock rejected — SLR {slant:.1f} m implausible at "
-                f"AGL {agl:.1f} m with pitch {pitch_abs:.1f}° (likely background); "
-                f"retry after camera slews to the building"
+            return (
+                f"LRF {slant:.0f} m at {pitch_abs:.0f}° tilt — confirm the crosshair "
+                f"is on the target, not distant background"
             )
-            return False
-        return True
+        return None
 
     def _update_lrf_lock_geo(self, distance_m: float | None) -> None:
         """Estimate locked target lat/lon from vehicle pose, gimbal, and LRF slant range."""
@@ -696,10 +701,11 @@ class LrfVideoLockMixin:
                     slant_m = float(dist)
                 except (TypeError, ValueError):
                     slant_m = None
-            if slant_m is not None and not self._lrf_slant_plausible_for_context(
-                float(slant_m)
-            ):
-                slant_m = None
+            lrf_range_hint: str | None = None
+            if slant_m is not None:
+                lrf_range_hint = self._lrf_slant_warn_for_context(float(slant_m))
+                if lrf_range_hint:
+                    print(f"[VGCS:lrf] hint — {lrf_range_hint}")
             if slant_m is not None:
                 self._lrf_lock_distance_m = slant_m
                 self._lrf_lock_failed = False
@@ -770,10 +776,12 @@ class LrfVideoLockMixin:
                     pass
                 if pending.purpose == "dooaf_setup":
                     self._set_status(
-                        "LRF lock failed — range looks wrong (background hit). "
-                        "Retry TARGET click on the building."
+                        "LRF lock failed — no stable range. Aim the target at the "
+                        "centre crosshair, then click again."
                     )
             self._refresh_lrf_lock_overlay()
+            if lrf_range_hint:
+                self._set_status(lrf_range_hint)
             return
         try:
             if dist is None:

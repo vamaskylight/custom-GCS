@@ -1202,36 +1202,6 @@ class SkydroidTopUdpAdapter:
         )
         return bool(ok), float(u_chk), float(v_chk)
 
-    def _hold_slant_slr_plausible(
-        self,
-        att: tuple[float, float] | None,
-        slant_m: float,
-        click_offset_deg: float,
-        *,
-        dpitch_image: float = 0.0,
-    ) -> bool:
-        """Reject hold-slant locks when the laser likely hit distant background."""
-        if att is None:
-            return True
-        pitch = float(att[1])
-        slant = float(slant_m)
-        dpitch = abs(float(dpitch_image)) if dpitch_image else abs(float(click_offset_deg))
-        pitch_trusted = self._gac_pitch_trusted(pitch, dpitch)
-        if not pitch_trusted and slant > 45.0:
-            print(
-                f"[VGCS:lrf] hold-slant rejected — SLR {slant:.1f} m with "
-                f"untrusted pitch {pitch:.1f}° (likely distant background); "
-                f"aim crosshair at the building or use click-to-aim"
-            )
-            return False
-        if abs(pitch) < 5.0 and slant > 80.0:
-            print(
-                f"[VGCS:lrf] hold-slant rejected — SLR {slant:.1f} m at "
-                f"near-horizontal pitch {pitch:.1f}° — aim at the building first"
-            )
-            return False
-        return True
-
     @staticmethod
     def _slr_plausible_after_slew(
         pre_slr: float | None,
@@ -2432,14 +2402,8 @@ class SkydroidTopUdpAdapter:
                 return None
             return float(stable)
         if hold_slant_boresight and hold_gimbal and unchanged:
-            # DOOAF facade: SLR reads along crosshair; click UV marks the wall point.
-            att_now = self._attitude_from_cache() or self._read_gimbal_attitude_deg()
-            if not self._hold_slant_slr_plausible(
-                att_now,
-                float(stable),
-                float(click_offset_deg),
-            ):
-                return None
+            # DOOAF facade: the laser hit at the crosshair is ground truth — trust it.
+            # (Do not reject on heuristics; that fights the operator and ping-pongs.)
             print(
                 f"[VGCS:lrf] hold-slant lock ok — stable SLR {float(stable):.1f} m "
                 f"at crosshair (click {float(click_offset_deg):.1f}° off marks facade UV)"
