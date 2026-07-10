@@ -1215,15 +1215,14 @@ class DooafOperationsMixin:
             label=label,
             pick_role=pick_role,
         )
-        # Facade slant lock: read range along the laser without slewing the gimbal.
-        # Operator aims the building at the crosshair first; gun/target marks stay frozen.
-        hold_gimbal = pick_role == DOOAF_ROLE_INTENDED
+        # Slew gimbal to the click so LRF measures the facade, not distant background.
+        # Screen-pinned setup marks stay at pick UV during/after lock (mark_tracking_mixin).
         self._begin_c13_lrf_video_lock_for_pick(
             float(video_x),
             float(video_y),
             label=label,
-            hold_gimbal=hold_gimbal,
-            hold_slant_boresight=hold_gimbal,
+            hold_gimbal=False,
+            hold_slant_boresight=False,
         )
         return True
 
