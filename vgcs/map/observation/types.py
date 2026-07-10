@@ -40,6 +40,7 @@ class PendingLrfVideoPick:
     v: float
     label: str = ""
     pick_role: str = ""
+    used_slew: bool = False  # gimbal slewed the click onto boresight before lock
     observation_row: dict[str, object] | None = None
     obs_kind: str = ""
     obs_map_lat: float | None = None

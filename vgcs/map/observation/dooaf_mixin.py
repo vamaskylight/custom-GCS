@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtWidgets import QDialog, QMessageBox
 
@@ -59,6 +61,11 @@ from vgcs.video.camera_control import NoopCameraControl
 
 class DooafOperationsMixin:
     """Extracted from MapWidget — uses host widget state via self."""
+
+    # Click this far (deg) off the laser boresight => slew to the click before
+    # firing the C13 rangefinder; nearer clicks are treated as already aimed and
+    # measured in place. Matches the adapter's off-centre SLR gate (3.0°).
+    _FACADE_SLEW_OFFSET_DEG = 3.0
 
     def _dooaf_setup_is_ground_workflow(self) -> bool:
         """GUN+TARGET from ground video picks with no facade session for fast impact."""
@@ -581,7 +588,13 @@ class DooafOperationsMixin:
         self._refresh_dooaf_facade_overlay_after_change()
         slant_note = f"LRF {float(slant_m):.1f} m"
         if pick_role == DOOAF_ROLE_INTENDED:
-            video_x, video_y = float(pending.u), float(pending.v)
+            # If the gimbal slewed the click onto the boresight, the target now sits
+            # at frame centre and the laser measured it there — geo/mark must use the
+            # boresight, not the pre-slew click UV (that would re-add the offset).
+            if bool(getattr(pending, "used_slew", False)):
+                video_x, video_y = 0.5, 0.5
+            else:
+                video_x, video_y = float(pending.u), float(pending.v)
             if self._complete_dooaf_setup_facade_uv_pick(
                 pick_role,
                 video_x,
@@ -1206,25 +1219,61 @@ class DooafOperationsMixin:
             self._dooaf_setup_mark_track.pop(pick_role, None)
         self._sync_video_mark_track_timer()
         self._schedule_video_marks_overlay_refresh()
+        hold_gimbal_decision = not self._facade_click_needs_slew(
+            float(video_x), float(video_y)
+        )
         self._pending_lrf_video_pick = PendingLrfVideoPick(
             purpose="dooaf_setup",
             u=float(video_x),
             v=float(video_y),
             label=label,
             pick_role=pick_role,
+            used_slew=not hold_gimbal_decision,
         )
-        # Facade LRF: HOLD the gimbal and lock the range the laser reads at the
-        # crosshair. At shallow look angles the laser hit — not software — is ground
-        # truth, so we never slew (that overshoots onto background AND drags the
-        # screen-pinned gun mark). Operator aims the building at the centre, then clicks.
+        # The C13 laser only measures along the boresight (frame centre). So the
+        # decision is purely geometric, based on how far the click is off-centre:
+        #   • Click already on the crosshair  -> HOLD (measure now, no overshoot).
+        #   • Click clearly off-centre (e.g. building lower in frame at a level
+        #     look angle) -> SLEW the gimbal to put that point on the boresight,
+        #     then measure the building the operator actually clicked — otherwise
+        #     the laser reads straight through to distant background (the 440 m bug).
         self._begin_c13_lrf_video_lock_for_pick(
             float(video_x),
             float(video_y),
             label=label,
-            hold_gimbal=True,
-            hold_slant_boresight=True,
+            hold_gimbal=hold_gimbal_decision,
+            hold_slant_boresight=hold_gimbal_decision,
         )
         return True
+
+    def _facade_click_offset_deg(self, video_x: float, video_y: float) -> float:
+        """Angular offset of a video click from the laser boresight (frame centre)."""
+        fov_fn = getattr(self, "_c13_lrf_geo_fov", None)
+        if callable(fov_fn):
+            hfov, vfov = fov_fn()
+        else:
+            hfov, vfov = 83.4, 46.9
+        az_off = (float(video_x) - 0.5) * float(hfov)
+        el_off = (float(video_y) - 0.5) * float(vfov)
+        return float(math.hypot(az_off, el_off))
+
+    def _facade_click_needs_slew(self, video_x: float, video_y: float) -> bool:
+        """True when the click is too far off boresight to measure without slewing.
+
+        The C13 rangefinder fires along the crosshair only. If the operator clicks
+        a building that is well off-centre, holding the gimbal would measure the
+        background under the crosshair, not the target. Slew to bring the click to
+        the boresight first. Near-centre clicks are already aimed, so we hold to
+        avoid a needless slew (which can overshoot when the aim was already good).
+        """
+        offset = self._facade_click_offset_deg(float(video_x), float(video_y))
+        needs = offset >= self._FACADE_SLEW_OFFSET_DEG
+        print(
+            f"[VGCS:observe] facade target click offset {offset:.1f}° -> "
+            f"{'SLEW to click' if needs else 'HOLD at crosshair'} "
+            f"(threshold {self._FACADE_SLEW_OFFSET_DEG:.1f}°)"
+        )
+        return needs
 
     def _prepare_dooaf_video_pick(self) -> None:
         try:
