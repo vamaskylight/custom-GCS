@@ -2428,12 +2428,24 @@ def format_elevation_summary_html(session: DooafSession) -> str:
     imp = session.impact
     if tgt is None and imp is None:
         return ""
+    dem_ok = bool(getattr(session, "dem_available", False))
+    dem_label = "DEM elevation" if dem_ok else "ground (est.)"
+    tgt_dem_note = (
+        "(terrain at target footprint)"
+        if dem_ok
+        else "(no DEM loaded — relative to launch, not true MSL)"
+    )
+    imp_dem_note = (
+        "(terrain at impact footprint)"
+        if dem_ok
+        else "(no DEM loaded — relative to launch, not true MSL)"
+    )
     rows: list[str] = []
     if session.intended_dem_alt_m is not None:
         rows.append(
-            f"<tr><td class='label-col'>Target DEM elevation</td>"
+            f"<tr><td class='label-col'>Target {dem_label}</td>"
             f"<td>{_format_elev_msl_html(session.intended_dem_alt_m)} "
-            "<span class='muted'>(terrain at target footprint)</span></td></tr>"
+            f"<span class='muted'>{tgt_dem_note}</span></td></tr>"
         )
     if tgt is not None and tgt.alt_m is not None:
         dem = session.intended_dem_alt_m
@@ -2451,9 +2463,9 @@ def format_elevation_summary_html(session: DooafSession) -> str:
             )
     if session.impact_dem_alt_m is not None:
         rows.append(
-            f"<tr><td class='label-col'>Impact DEM elevation</td>"
+            f"<tr><td class='label-col'>Impact {dem_label}</td>"
             f"<td>{_format_elev_msl_html(session.impact_dem_alt_m)} "
-            "<span class='muted'>(terrain at impact footprint)</span></td></tr>"
+            f"<span class='muted'>{imp_dem_note}</span></td></tr>"
         )
     if imp is not None and imp.alt_m is not None:
         dem = session.impact_dem_alt_m
@@ -2486,13 +2498,25 @@ def format_elevation_summary_html(session: DooafSession) -> str:
         )
     if not rows:
         return ""
-    return _report_section_card(
-        "Elevation & height (DEM)",
-        (
+    if dem_ok:
+        intro = (
             "<p class='log-hint'>Green target vs red impact: DEM ground at each "
             "footprint, corrected elevations for elevated points, and vertical "
             "separation between the two marks.</p>"
-            "<table class='data-table dooaf-elevation-summary'><tbody>"
+        )
+    else:
+        intro = (
+            "<p class='log-hint'>No terrain DEM is loaded, so the absolute "
+            "elevations below are measured relative to the launch point (home = 0) "
+            "and are <strong>not true MSL</strong>. The vertical separation "
+            "(height correction) between the two marks is still valid because it is "
+            "a relative measurement.</p>"
+        )
+    return _report_section_card(
+        "Elevation & height" + ("" if dem_ok else " (no DEM — relative)"),
+        (
+            intro
+            + "<table class='data-table dooaf-elevation-summary'><tbody>"
             + "".join(rows)
             + "</tbody></table>"
         ),
@@ -3075,7 +3099,7 @@ def _log_summary_rows(row: dict[str, object], cell_fn: Any) -> list[str]:
     if not _is_missing_cell(dem_ground, cell_fn):
         rows.append(
             _log_detail_row(
-                "Ground height (DEM)",
+                ground_dem_label,
                 _format_alt_m_html(dem_ground, cell_fn),
             )
         )
@@ -3105,7 +3129,13 @@ def _format_observation_log_entry(
     idx: int,
     row: dict[str, object],
     cell_fn: Any,
+    *,
+    dem_available: bool = True,
 ) -> str:
+    dem_alt_label = "DEM" if dem_available else "est. (no DEM)"
+    ground_dem_label = (
+        "Ground height (DEM)" if dem_available else "Ground height (est., no DEM)"
+    )
     is_impact = str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
     entry_cls = "log-entry log-entry-impact" if is_impact else "log-entry"
     warn = str(row.get("geo_warning") or "").strip()
@@ -3243,7 +3273,7 @@ def _format_observation_log_entry(
         if not _is_missing_cell(row.get("dem_ground_agl_m"), cell_fn):
             detail_rows.append(
                 _log_detail_row(
-                    "Ground height (DEM)",
+                    ground_dem_label,
                     _format_alt_m_html(row.get("dem_ground_agl_m"), cell_fn),
                 )
             )
@@ -3277,14 +3307,14 @@ def _format_observation_log_entry(
         if not _is_missing_cell(row.get("dooaf_target_dem_alt_m"), cell_fn):
             detail_rows.append(
                 _log_detail_row(
-                    "Target DEM elevation",
+                    f"Target {dem_alt_label} elevation",
                     _format_alt_m_html(row.get("dooaf_target_dem_alt_m"), cell_fn),
                 )
             )
         if not _is_missing_cell(row.get("dooaf_impact_dem_alt_m"), cell_fn):
             detail_rows.append(
                 _log_detail_row(
-                    "Impact DEM elevation",
+                    f"Impact {dem_alt_label} elevation",
                     _format_alt_m_html(row.get("dooaf_impact_dem_alt_m"), cell_fn),
                 )
             )
@@ -3416,6 +3446,8 @@ def _format_observation_log_entry(
 def format_observation_detailed_log_html(
     export_rows: list[dict[str, object]],
     cell_fn: Any,
+    *,
+    dem_available: bool = True,
 ) -> str:
     """Card-based detailed log — grouped fields instead of a wide scroll table."""
     if not export_rows:
@@ -3428,7 +3460,9 @@ def format_observation_detailed_log_html(
         )
 
     entries = "".join(
-        _format_observation_log_entry(idx, row, cell_fn)
+        _format_observation_log_entry(
+            idx, row, cell_fn, dem_available=dem_available
+        )
         for idx, row in enumerate(export_rows, start=1)
     )
     hint = (

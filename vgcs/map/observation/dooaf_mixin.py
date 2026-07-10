@@ -937,20 +937,26 @@ class DooafOperationsMixin:
             return False
         return bool(session.uv_pick_valid(self._observation_context()))
 
-    def _geo_from_facade_uv_pick(
-        self, video_x: float, video_y: float
-    ) -> tuple[float, float, float | None] | None:
+    def _facade_geo_result_from_uv(self, video_x: float, video_y: float):
+        """Full facade-plane GeoReferenceResult for a video UV (or None)."""
         session = getattr(self, "_dooaf_facade_session", None)
         if session is None or not session.has_lock:
             return None
         hfov, vfov = self._c13_lrf_geo_fov()
-        geo = session.geo_from_uv(
+        return session.geo_from_uv(
             float(video_x),
             float(video_y),
             hfov_deg=hfov,
             vfov_deg=vfov,
             ctx=self._observation_context(),
         )
+
+    def _geo_from_facade_uv_pick(
+        self, video_x: float, video_y: float
+    ) -> tuple[float, float, float | None] | None:
+        geo = self._facade_geo_result_from_uv(video_x, video_y)
+        if geo is None:
+            return None
         if geo.target_lat is None or geo.target_lon is None:
             return None
         # Field facade shots are often near-horizon: slant geo still has coordinates
@@ -968,17 +974,9 @@ class DooafOperationsMixin:
         self, video_x: float, video_y: float
     ) -> str:
         """Warning text for a facade UV geo estimate (empty when none)."""
-        session = getattr(self, "_dooaf_facade_session", None)
-        if session is None or not session.has_lock:
+        geo = self._facade_geo_result_from_uv(video_x, video_y)
+        if geo is None:
             return ""
-        hfov, vfov = self._c13_lrf_geo_fov()
-        geo = session.geo_from_uv(
-            float(video_x),
-            float(video_y),
-            hfov_deg=hfov,
-            vfov_deg=vfov,
-            ctx=self._observation_context(),
-        )
         return str(geo.warning or geo.quality or "").strip()
 
     def _facade_lock_gimbal_att(self) -> tuple[float, float] | None:

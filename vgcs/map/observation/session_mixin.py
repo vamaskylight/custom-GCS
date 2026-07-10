@@ -213,18 +213,42 @@ class ObservationSessionMixin:
                 return
             if self._dooaf_facade_session_has_lock():
                 row.update(self._observation_context())
-                geo = self._geo_from_facade_uv_pick(float(video_x), float(video_y))
+                facade_geo = self._facade_geo_result_from_uv(
+                    float(video_x), float(video_y)
+                )
+                geo = None
+                if (
+                    facade_geo is not None
+                    and facade_geo.target_lat is not None
+                    and facade_geo.target_lon is not None
+                ):
+                    geo = (
+                        float(facade_geo.target_lat),
+                        float(facade_geo.target_lon),
+                        float(facade_geo.target_alt_m)
+                        if facade_geo.target_alt_m is not None
+                        else None,
+                    )
                 if geo is not None:
                     lat, lon, alt_m = geo
                     row["target_lat"] = float(lat)
                     row["target_lon"] = float(lon)
                     if alt_m is not None:
                         row["target_alt_m"] = float(alt_m)
-                    row["geo_quality"] = "fair"
+                    row["geo_quality"] = str(facade_geo.quality or "fair")
                     row["geo_method"] = "lrf_facade_plane"
-                    geo_warn = self._facade_geo_warning_from_uv(
-                        float(video_x), float(video_y)
-                    )
+                    # Store facade-consistent range/bearing/depression so the report
+                    # shows the shallow look angle to the wall — NOT a ground-ray angle
+                    # synthesized later from AGL (which is wrong for a vertical facade).
+                    if facade_geo.horizontal_range_m is not None:
+                        row["geo_range_m"] = float(facade_geo.horizontal_range_m)
+                    if facade_geo.bearing_deg is not None:
+                        row["geo_bearing_deg"] = float(facade_geo.bearing_deg)
+                    if facade_geo.depression_deg is not None:
+                        row["geo_depression_deg"] = float(facade_geo.depression_deg)
+                    geo_warn = str(
+                        facade_geo.warning or facade_geo.quality or ""
+                    ).strip()
                     stale = not self._dooaf_facade_uv_pick_ready()
                     parts: list[str] = []
                     if geo_warn:
@@ -1143,7 +1167,11 @@ class ObservationSessionMixin:
                 observation_row=obs_row,
                 observation_rows=list(self._observations),
             ),
-            format_observation_detailed_log_html(export_rows, self._obs_cell),
+            format_observation_detailed_log_html(
+                export_rows,
+                self._obs_cell,
+                dem_available=bool(getattr(session, "dem_available", False)),
+            ),
             session=session,
         )
         Path(path).write_text(html, encoding="utf-8")

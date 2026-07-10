@@ -703,6 +703,11 @@ def _enrich_mark_row_ray_geometry(
     dem_path: str | Path | None = None,
 ) -> None:
     """Fill per-click ray range/bearing on observation rows when enrich dropped them."""
+    # Facade-plane marks measure a vertical wall via LRF slant; a ground-ray
+    # synthesis would inject a steep depression that contradicts the shallow
+    # look angle to the wall. Leave facade geometry untouched.
+    if str(row.get("geo_method") or "") in {"lrf_facade_plane", "lrf_facade_uv"}:
+        return
     if row.get("geo_range_m") is not None and row.get("geo_bearing_deg") is not None:
         return
     vx = row.get("video_x_norm")
@@ -1872,7 +1877,26 @@ def build_dooaf_session(
         intended_dem_alt_m=intended_dem,
         impact_dem_alt_m=impact_dem,
         height_correction_m=height_correction_m,
+        dem_available=_dem_terrain_available(dem_path),
     )
+
+def _dem_terrain_available(dem_path: str | Path | None) -> bool:
+    """True only when a real DEM file is loaded and active.
+
+    Without a DEM the terrain elevations shown in the report are derived from a
+    home-relative reference (launch = 0), so they must be labelled as estimates
+    rather than presented as authoritative MSL values.
+    """
+    path = str(dem_path or "").strip() or _default_observe_dem_path()
+    if not path:
+        return False
+    try:
+        from vgcs.observe.dem import get_shared_dem_model
+
+        model = get_shared_dem_model(path)
+        return bool(model is not None and model.active)
+    except Exception:
+        return False
 
 def format_fire_correction(corr: FireCorrection) -> str:
     return (
