@@ -70,6 +70,30 @@ class DooafOperationsMixin:
     _FACADE_BELOW_CROSSHAIR_DEG = 4.0
     _FACADE_BACKGROUND_SLANT_M = 150.0
 
+    # A ground (gun) pick needs the camera tilted DOWN onto the gun. At a near-level
+    # look angle a video click can't be projected to a ground point — it collapses
+    # toward the drone's own position, so the gun distance comes out wrong. Refuse
+    # such picks and steer the operator to "Pick on map" (exact) or a downward tilt.
+    _GROUND_PICK_MIN_DOWN_PITCH_DEG = 15.0
+
+    def _dooaf_ground_pick_gimbal_pitch_deg(self) -> float | None:
+        """Current gimbal pitch (deg) for validating a ground pick, or None if unknown."""
+        reader = getattr(self, "_read_top_gimbal_attitude_pair", None)
+        if not callable(reader):
+            reader = getattr(self, "_read_gimbal_attitude_pair", None)
+        if not callable(reader):
+            return None
+        try:
+            att = reader()
+        except Exception:
+            return None
+        if not att:
+            return None
+        try:
+            return float(att[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+
     def _dooaf_setup_is_ground_workflow(self) -> bool:
         """GUN+TARGET from ground video picks with no facade session for fast impact."""
         if self._dooaf_facade_uv_pick_ready():
@@ -290,6 +314,26 @@ class DooafOperationsMixin:
         label: str,
     ) -> bool:
         """GPS + DEM ray at click UV — mark stays where the operator clicked."""
+        pitch_deg = self._dooaf_ground_pick_gimbal_pitch_deg()
+        if (
+            pitch_deg is not None
+            and abs(pitch_deg) < self._GROUND_PICK_MIN_DOWN_PITCH_DEG
+        ):
+            # Near-level camera: a video ground pick would land near the drone, not on
+            # the gun. Refuse rather than save a guessed position; the operator marks
+            # the gun on the map (exact) or tilts the gimbal down onto it.
+            print(
+                f"[VGCS:observe] ground pick blocked — camera near level "
+                f"(pitch {pitch_deg:+.1f}°, need |pitch| ≥ "
+                f"{self._GROUND_PICK_MIN_DOWN_PITCH_DEG:.0f}°) role={pick_role}"
+            )
+            self._dooaf_video_pick_failed(
+                f"{label}: the camera is almost level ({pitch_deg:+.0f}°), so a video "
+                'ground pick would land near the drone, not on the gun. Mark the GUN '
+                'with "Pick on map" (exact), or tilt the gimbal DOWN onto the gun '
+                "(about 30° or more) and click again."
+            )
+            return True
         geo = self._compute_video_pick_geo(video_x, video_y)
         if geo is None:
             row: dict[str, object] = {
