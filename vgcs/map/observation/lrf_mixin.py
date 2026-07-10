@@ -701,6 +701,53 @@ class LrfVideoLockMixin:
                     slant_m = float(dist)
                 except (TypeError, ValueError):
                     slant_m = None
+            over_bg = getattr(self, "_facade_crosshair_over_background", None)
+            if (
+                slant_m is not None
+                and pending.purpose == "dooaf_setup"
+                and pick_role == DOOAF_ROLE_INTENDED
+                and callable(over_bg)
+                and over_bg(float(pending.u), float(pending.v), float(slant_m))
+            ):
+                # Crosshair aimed past the target onto distant background — do NOT
+                # seed the facade plane or drop a DEM-fallback target. Abort cleanly
+                # and tell the operator to tilt down so the target is on the crosshair.
+                print(
+                    f"[VGCS:lrf] facade target rejected — crosshair over background "
+                    f"(SLR {float(slant_m):.1f} m, target below crosshair)"
+                )
+                self._lrf_lock_uv = (float(u), float(v))
+                self._lrf_lock_failed = True
+                self._lrf_lock_distance_m = None
+                self._clear_lrf_lock_geo()
+                try:
+                    unlock = getattr(
+                        getattr(self, "_camera_control", None), "unlock_lrf", None
+                    )
+                    if callable(unlock):
+                        unlock()
+                except Exception:
+                    pass
+                try:
+                    self._obstacle_radar.set_c13_lrf_lock_failed()
+                except Exception:
+                    pass
+                try:
+                    marks = getattr(self, "_dooaf_setup_video_marks", None)
+                    if isinstance(marks, dict):
+                        marks.pop(pick_role, None)
+                    tracks = getattr(self, "_dooaf_setup_mark_track", None)
+                    if isinstance(tracks, dict):
+                        tracks.pop(pick_role, None)
+                except Exception:
+                    pass
+                self._refresh_lrf_lock_overlay()
+                self._dooaf_video_pick_failed(
+                    "Target is below the crosshair — the laser hit distant "
+                    "background. Tilt the camera DOWN so the target sits on the "
+                    "centre crosshair, then click to lock."
+                )
+                return
             lrf_range_hint: str | None = None
             if slant_m is not None:
                 lrf_range_hint = self._lrf_slant_warn_for_context(float(slant_m))
