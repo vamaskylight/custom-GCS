@@ -410,12 +410,19 @@ class VideoMarkTrackingMixin:
         )
 
     def _dooaf_setup_mark_is_screen_pinned(self, track: dict[str, object]) -> bool:
-        """DOOAF setup overlays fixed at click UV (gun ground + facade target).
+        """DOOAF setup overlays fixed at click UV (gun ground/LRF + facade target).
 
         GAC attitude track drifts horizontally in LOITER when camera FOLLOW yaws with
-        the aircraft. Saved lat/lon stays in the report; on-video overlay is pinned.
+        the aircraft. Saved lat/lon stays in the report; on-video overlay is pinned
+        while the camera is steady, and world-anchors to its GPS on a deliberate pan.
+        The LRF-locked gun (``lrf_boresight_geo``) uses the same stable path as the
+        facade target, so it does not tremble on the sub-degree GAC settle after lock.
         """
-        return bool(track.get("ground_video_pick") or track.get("facade_uv_pick"))
+        return bool(
+            track.get("ground_video_pick")
+            or track.get("facade_uv_pick")
+            or track.get("lrf_boresight_geo")
+        )
 
     def _dooaf_ground_mark_is_screen_pinned(self, track: dict[str, object]) -> bool:
         return self._dooaf_setup_mark_is_screen_pinned(track)
