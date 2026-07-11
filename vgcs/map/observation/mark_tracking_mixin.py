@@ -468,6 +468,16 @@ class VideoMarkTrackingMixin:
         for track in tracks.values():
             if not self._dooaf_setup_mark_is_screen_pinned(track):
                 return True
+            # Screen-pinned setup marks (gun LRF/ground, facade target) are NOT static:
+            # they world-anchor to their saved GPS on a deliberate gimbal pan or vehicle
+            # drift. They need the periodic refresh to reproject / hide when the camera
+            # moves — without it the dot freezes at the click pixel and appears glued to
+            # the video (moves with the camera).
+            if (
+                track.get("geo_lat") is not None
+                and track.get("geo_lon") is not None
+            ):
+                return True
         for row in self._observations:
             if row.get("video_mark_track_ref_u") is None:
                 continue
