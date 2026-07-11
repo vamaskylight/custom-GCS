@@ -33,10 +33,10 @@ _WA_HOLD_STILL_M = 0.75
 # magnitude alone cannot tell a deliberate slew from an involuntary LOITER/FOLLOW yaw
 # swing (both look the same), which is why pinning to the click glued the mark to the
 # camera during the operator's slew to the next point. When such a command fires we
-# RELEASE pinned setup/impact marks: they no longer sit where the camera points, so the
-# video dot is hidden (the edge arrow cues direction, the map keeps the true position)
-# until the camera returns to essentially the pose the mark was locked at.
-_MARK_RETURN_TO_LOCK_DEADBAND_DEG = 2.5
+# RELEASE pinned setup/impact marks: world-anchoring kicks in immediately (no pan
+# deadband) so the dot tracks its real world point from the first degree of travel —
+# staying visible while it is on screen and hiding (edge arrow cues direction, the map
+# keeps the true position) only once it leaves the frame.
 
 
 class VideoMarkTrackingMixin:
@@ -68,12 +68,6 @@ class VideoMarkTrackingMixin:
     @staticmethod
     def _mark_cmd_slew_released(track: dict[str, object]) -> bool:
         return bool(track.get("cmd_slew_released"))
-
-    def _mark_camera_returned_to_lock(self, track: dict[str, object]) -> bool:
-        """True when the camera is essentially back at the pose this mark was locked at."""
-        return not self._gimbal_moved_since_mark_lock(
-            track, deadband_deg=_MARK_RETURN_TO_LOCK_DEADBAND_DEG
-        )
 
     def _build_video_mark_track(
         self,
@@ -844,12 +838,10 @@ class VideoMarkTrackingMixin:
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
         if track is not None and self._dooaf_setup_mark_is_screen_pinned(track):
-            # A released (app-slewed) mark that has left the lock pose must report its
-            # world/attitude-projected UV — usually off-screen — so the off-screen hint
-            # can draw the edge arrow while the dot itself is hidden.
-            if self._mark_cmd_slew_released(track) and not self._mark_camera_returned_to_lock(
-                track
-            ):
+            # A released (app-slewed) mark reports its world-projected UV so that when it
+            # leaves the frame the off-screen hint can draw the edge arrow (and while it is
+            # still on screen the projected UV matches the dot the display path draws).
+            if self._mark_cmd_slew_released(track):
                 if (
                     track.get("geo_lat") is not None
                     and track.get("geo_lon") is not None
@@ -1387,27 +1379,23 @@ class VideoMarkTrackingMixin:
             and self._dooaf_setup_mark_is_screen_pinned(track)
             and not lock_in_progress
         ):
-            # Deliberate app-commanded slew: the operator moved the camera off this mark,
-            # so hide the dot (edge arrow cues direction) until the camera returns to the
-            # lock pose. This is what stops the previously-set mark from riding the camera
-            # centre while the operator slews to pick the next point.
-            if self._mark_cmd_slew_released(track) and not self._mark_camera_returned_to_lock(
-                track
-            ):
-                return None
-            # World-anchor: once the operator deliberately pans the gimbal (past the
-            # pan deadband) or the drone drifts, reproject the locked GPS to the CURRENT
-            # camera pose so the dot stays on the real gun/target — and slides off the
-            # edge (hidden, edge hint cues it) when it leaves the frame. It never chases
-            # the camera. Small hover/gimbal jitter (within the deadband) keeps it pinned
-            # at the click so there is no nervous movement. Requires a GPS anchor; a pick
-            # with no geo (or a lock in progress) stays frozen at the click.
+            # World-anchor: reproject the locked GPS to the CURRENT camera pose so the dot
+            # stays on the real gun/target while it is on screen, and slides off the edge
+            # (hidden, edge arrow cues it) when it leaves the frame. It never chases the
+            # camera centre. Small hover/gimbal jitter (within the pan deadband) keeps it
+            # pinned at the click so there is no nervous movement — EXCEPT once the operator
+            # commands a slew via the GCS (``cmd_slew_released``): then world-anchoring kicks
+            # in immediately with no deadband, so the mark tracks the real point from the
+            # first degree of travel instead of glueing to the click while the camera moves.
+            # Requires a GPS anchor; a pick with no geo (or a lock in progress) stays frozen.
             has_geo = (
                 track.get("geo_lat") is not None
                 and track.get("geo_lon") is not None
             )
             if has_geo:
-                gimbal_panned = self._gimbal_moved_since_mark_lock(
+                gimbal_panned = self._mark_cmd_slew_released(
+                    track
+                ) or self._gimbal_moved_since_mark_lock(
                     track, deadband_deg=_DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
                 )
                 vehicle_moved = self._dooaf_mark_vehicle_geo_active(track)
@@ -1512,16 +1500,46 @@ class VideoMarkTrackingMixin:
     ) -> tuple[float, float] | None:
         """Screen UV for logged observations — GAC track when gimbal moves; report geo is separate."""
         if self._observation_mark_is_screen_pinned(row):
-            # Deliberate app-commanded slew: hide the fall-of-shot dot while the camera is
-            # slewed away from it (edge arrow cues direction), reappearing when it returns.
+            # Deliberate app-commanded slew: world-anchor the fall-of-shot dot immediately
+            # (no deadband) — it stays on the real impact point while on screen and hides
+            # (edge arrow cues direction) once the camera slews it out of frame.
             if bool(row.get("cmd_slew_released")):
-                ry = row.get("video_mark_track_ref_yaw")
-                rp = row.get("video_mark_track_ref_pitch")
-                lock_probe: dict[str, object] = {}
-                if ry is not None and rp is not None:
-                    lock_probe["pin_ref_att"] = (float(ry), float(rp))
-                if not self._mark_camera_returned_to_lock(lock_probe):
-                    return None
+                glat = row.get("video_mark_geo_lat")
+                glon = row.get("video_mark_geo_lon")
+                if glat is not None and glon is not None:
+                    probe: dict[str, object] = {
+                        "geo_lat": float(glat),
+                        "geo_lon": float(glon),
+                        "ref_uv": (float(stored_u), float(stored_v)),
+                    }
+                    galt = row.get("video_mark_geo_alt_m")
+                    if galt is not None:
+                        try:
+                            probe["geo_alt_m"] = float(galt)
+                        except (TypeError, ValueError):
+                            pass
+                    for k in (
+                        "_wa_hold_att",
+                        "_wa_hold_uv",
+                        "_wa_hold_vlat",
+                        "_wa_hold_vlon",
+                    ):
+                        if k in row:
+                            probe[k] = row[k]
+                    geo_uv = self._dooaf_mark_geo_uv_current_pose(probe)
+                    for k in (
+                        "_wa_hold_att",
+                        "_wa_hold_uv",
+                        "_wa_hold_vlat",
+                        "_wa_hold_vlon",
+                    ):
+                        if k in probe:
+                            row[k] = probe[k]
+                    if geo_uv is not None:
+                        u, v = geo_uv
+                        if self._mark_uv_on_screen(u, v):
+                            return (max(0.0, min(1.0, u)), max(0.0, min(1.0, v)))
+                        return None
             # Wind drift: if the drone has moved from the pose at pick, re-anchor the
             # impact dot to its saved GPS point so it stays on the target. Otherwise
             # (small hover jitter) keep it pinned at the click pixel.
