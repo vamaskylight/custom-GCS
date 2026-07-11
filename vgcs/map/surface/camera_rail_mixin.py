@@ -424,6 +424,7 @@ class CameraRailMixin:
         self._native_gimbal_speed_start(axis[0], axis[1])
 
     def _native_gimbal_speed_start(self, dx: int, dy: int) -> None:
+        self._note_app_gimbal_slew_command()
         self._notify_companion_gimbal_motion(duration_s=2.5)
         cc = getattr(self, "_camera_control", None)
         if cc is None:
@@ -462,6 +463,7 @@ class CameraRailMixin:
         QTimer.singleShot(400, self._trigger_gimbal_stop_autofocus)
 
     def _native_gimbal_center(self) -> None:
+        self._note_app_gimbal_slew_command()
         self._notify_companion_gimbal_motion(duration_s=4.0)
         self._gimbal_hold_axis = None
         if self._gimbal_hold_timer.isActive():
@@ -479,6 +481,7 @@ class CameraRailMixin:
             self._set_status("Gimbal center failed")
 
     def _native_gimbal_point_down(self) -> None:
+        self._note_app_gimbal_slew_command()
         self._notify_companion_gimbal_motion(duration_s=6.0)
         self._gimbal_hold_axis = None
         if self._gimbal_hold_timer.isActive():

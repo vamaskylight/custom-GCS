@@ -28,9 +28,52 @@ _DOOAF_GEO_TRACK_VEHICLE_SHIFT_M = 2.0
 _WA_HOLD_STILL_DEG = 0.6
 _WA_HOLD_STILL_M = 0.75
 
+# An app-commanded gimbal slew (operator deliberately moved the camera via the GCS —
+# on-screen controls / keys) is the one reliable "deliberate pan" signal: gimbal-angle
+# magnitude alone cannot tell a deliberate slew from an involuntary LOITER/FOLLOW yaw
+# swing (both look the same), which is why pinning to the click glued the mark to the
+# camera during the operator's slew to the next point. When such a command fires we
+# RELEASE pinned setup/impact marks: they no longer sit where the camera points, so the
+# video dot is hidden (the edge arrow cues direction, the map keeps the true position)
+# until the camera returns to essentially the pose the mark was locked at.
+_MARK_RETURN_TO_LOCK_DEADBAND_DEG = 2.5
+
 
 class VideoMarkTrackingMixin:
     """Extracted from MapWidget — uses host widget state via self."""
+
+    def _note_app_gimbal_slew_command(self) -> None:
+        """Operator commanded a gimbal slew via the GCS — release pinned setup/impact marks.
+
+        Called from the camera-rail slew initiators. This is a deliberate-intent signal
+        (unlike raw gimbal attitude), so it is safe to unpin marks immediately: they are
+        hidden on video while the camera is slewed away and reappear if it returns.
+        """
+        tracks = getattr(self, "_dooaf_setup_mark_track", None) or {}
+        for track in tracks.values():
+            if isinstance(track, dict):
+                track["cmd_slew_released"] = True
+        for row in getattr(self, "_observations", None) or []:
+            if isinstance(row, dict) and str(row.get("kind") or "") == "video_mark":
+                row["cmd_slew_released"] = True
+        # Hide the dot promptly (the ~20 Hz timer also keeps it in sync during the slew).
+        for name in ("_sync_video_mark_track_timer", "_schedule_video_marks_overlay_refresh"):
+            fn = getattr(self, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _mark_cmd_slew_released(track: dict[str, object]) -> bool:
+        return bool(track.get("cmd_slew_released"))
+
+    def _mark_camera_returned_to_lock(self, track: dict[str, object]) -> bool:
+        """True when the camera is essentially back at the pose this mark was locked at."""
+        return not self._gimbal_moved_since_mark_lock(
+            track, deadband_deg=_MARK_RETURN_TO_LOCK_DEADBAND_DEG
+        )
 
     def _build_video_mark_track(
         self,
@@ -801,6 +844,22 @@ class VideoMarkTrackingMixin:
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
         if track is not None and self._dooaf_setup_mark_is_screen_pinned(track):
+            # A released (app-slewed) mark that has left the lock pose must report its
+            # world/attitude-projected UV — usually off-screen — so the off-screen hint
+            # can draw the edge arrow while the dot itself is hidden.
+            if self._mark_cmd_slew_released(track) and not self._mark_camera_returned_to_lock(
+                track
+            ):
+                if (
+                    track.get("geo_lat") is not None
+                    and track.get("geo_lon") is not None
+                ):
+                    geo_uv = self._dooaf_mark_geo_uv_current_pose(track)
+                    if geo_uv is not None:
+                        return (float(geo_uv[0]), float(geo_uv[1]))
+                att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
+                if att_uv is not None:
+                    return att_uv
             pinned = self._dooaf_ground_mark_screen_pin_uv(track, stored_uv)
             if pinned is not None:
                 return pinned
@@ -1328,6 +1387,14 @@ class VideoMarkTrackingMixin:
             and self._dooaf_setup_mark_is_screen_pinned(track)
             and not lock_in_progress
         ):
+            # Deliberate app-commanded slew: the operator moved the camera off this mark,
+            # so hide the dot (edge arrow cues direction) until the camera returns to the
+            # lock pose. This is what stops the previously-set mark from riding the camera
+            # centre while the operator slews to pick the next point.
+            if self._mark_cmd_slew_released(track) and not self._mark_camera_returned_to_lock(
+                track
+            ):
+                return None
             # World-anchor: once the operator deliberately pans the gimbal (past the
             # pan deadband) or the drone drifts, reproject the locked GPS to the CURRENT
             # camera pose so the dot stays on the real gun/target — and slides off the
@@ -1445,6 +1512,16 @@ class VideoMarkTrackingMixin:
     ) -> tuple[float, float] | None:
         """Screen UV for logged observations — GAC track when gimbal moves; report geo is separate."""
         if self._observation_mark_is_screen_pinned(row):
+            # Deliberate app-commanded slew: hide the fall-of-shot dot while the camera is
+            # slewed away from it (edge arrow cues direction), reappearing when it returns.
+            if bool(row.get("cmd_slew_released")):
+                ry = row.get("video_mark_track_ref_yaw")
+                rp = row.get("video_mark_track_ref_pitch")
+                lock_probe: dict[str, object] = {}
+                if ry is not None and rp is not None:
+                    lock_probe["pin_ref_att"] = (float(ry), float(rp))
+                if not self._mark_camera_returned_to_lock(lock_probe):
+                    return None
             # Wind drift: if the drone has moved from the pose at pick, re-anchor the
             # impact dot to its saved GPS point so it stays on the target. Otherwise
             # (small hover jitter) keep it pinned at the click pixel.
