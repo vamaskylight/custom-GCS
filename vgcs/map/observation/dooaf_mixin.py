@@ -836,25 +836,19 @@ class DooafOperationsMixin:
         mark_u, mark_v = float(video_x), float(video_y)
         display_uv: tuple[float, float] | None = None
         if used_lrf and lat is not None and lon is not None:
-            proj = self._project_geo_to_video_norm(
-                float(lat), float(lon), alt_m=alt_m
+            # The C13 laser measures ONLY along the boresight (frame centre): the locked
+            # point IS at the crosshair, so pin the on-screen mark there. Do NOT reproject
+            # the LRF geo to place it — that round-trips badly at short range / steep pitch
+            # (the LRF-geo altitude and the reprojection disagree, so v lands far off, e.g.
+            # 1.13 for a dead-centre click), which put the gun mark off-screen and made it
+            # jump when the gimbal moved. World-anchoring on later camera moves is calibrated
+            # to this boresight in _register_dooaf_setup_mark_track (geo_proj_offset).
+            display_uv = (0.5, 0.5)
+            print(
+                f"[VGCS:observe] gun locked at frame centre (0.500,0.500) — "
+                f"you clicked ({video_x:.3f},{video_y:.3f}); "
+                f"LRF range is along the laser at centre"
             )
-            if proj is not None:
-                display_uv = (float(proj[0]), float(proj[1]))
-            else:
-                display_uv = (0.5, 0.5)
-            du, dv = display_uv
-            if abs(float(du) - 0.5) < 0.06 and abs(float(dv) - 0.5) < 0.06:
-                print(
-                    f"[VGCS:observe] gun locked at frame centre ({du:.3f},{dv:.3f}) "
-                    f"after slew — you clicked ({video_x:.3f},{video_y:.3f}); "
-                    f"LRF range is along the laser at centre"
-                )
-            else:
-                print(
-                    f"[VGCS:observe] gun mark at ({du:.3f},{dv:.3f}) from LRF geo "
-                    f"(operator click was {video_x:.3f},{video_y:.3f})"
-                )
         overlay_uv = display_uv if display_uv is not None else (mark_u, mark_v)
         self._dooaf_setup_video_marks[pick_role] = overlay_uv
         self._register_dooaf_setup_mark_track(

@@ -343,8 +343,44 @@ class VideoMarkTrackingMixin:
             except (TypeError, ValueError):
                 pass
         self._apply_calibrated_gac_scales_to_track(built)
+        self._calibrate_geo_proj_offset(built)
         self._dooaf_setup_mark_track[key] = built
         self._sync_video_mark_track_timer()
+
+    def _calibrate_geo_proj_offset(self, track: dict[str, object]) -> None:
+        """Anchor world-projection to the pinned display point at the lock pose.
+
+        The C13 LRF-geo -> video round-trip is biased at short range / steep pitch (almost
+        entirely vertical), which would make a world-anchored mark jump off-screen the
+        instant the camera moves. Record the miss between the raw reprojection and the
+        pinned display UV at THIS (lock) pose; ``_dooaf_mark_geo_uv_current_pose`` adds it
+        back so the mark starts exactly on its pin and then tracks only the (reliable)
+        projection delta as the camera or aircraft moves.
+        """
+        glat = track.get("geo_lat")
+        glon = track.get("geo_lon")
+        if glat is None or glon is None:
+            return
+        pin = track.get("pin_uv")
+        if not isinstance(pin, tuple):
+            pin = track.get("ref_uv")
+        if not isinstance(pin, tuple):
+            return
+        galt = track.get("geo_alt_m")
+        try:
+            alt = float(galt) if galt is not None else None
+        except (TypeError, ValueError):
+            alt = None
+        try:
+            raw = self._project_geo_to_video_norm(float(glat), float(glon), alt_m=alt)
+        except Exception:
+            raw = None
+        if raw is None:
+            return
+        track["geo_proj_offset"] = (
+            float(pin[0]) - float(raw[0]),
+            float(pin[1]) - float(raw[1]),
+        )
 
     def _apply_calibrated_gac_scales_to_track(self, track: dict[str, object]) -> None:
         """Apply post-LRF GAC calibration to any setup mark track."""
@@ -1354,6 +1390,15 @@ class VideoMarkTrackingMixin:
         )
         if geo_uv is None:
             return None
+        # Calibrated world-anchoring: add back the lock-pose reprojection miss so the mark
+        # starts exactly on its pin and only the (reliable) projection delta moves it —
+        # kills the near-field vertical jump that made the gun mark fly off the frame.
+        off = track.get("geo_proj_offset")
+        if isinstance(off, tuple) and len(off) == 2:
+            geo_uv = (
+                float(geo_uv[0]) + float(off[0]),
+                float(geo_uv[1]) + float(off[1]),
+            )
         out = (float(geo_uv[0]), float(geo_uv[1]))
         if cur_att is not None:
             track["_wa_hold_att"] = (float(cur_att[0]), float(cur_att[1]))
