@@ -33,6 +33,7 @@ from vgcs.observe.dooaf import (
     dooaf_settings_kwargs,
     enrich_dooaf_settings_elevation_from_dem,
     format_dooaf_status,
+    clear_dooaf_facade_slant_range_m,
     latest_mark,
     merge_dooaf_settings,
     merge_setup_video_marks,
@@ -1585,10 +1586,32 @@ class DooafOperationsMixin:
         self._sync_dooaf_settings_from_dialog(
             dlg, gun=clear_gun, target=clear_target
         )
+        if clear_gun or clear_target:
+            # The facade LRF lock backs the setup's rapid UV picks; once the operator clears
+            # coordinates that lock no longer corresponds to a live setup, so drop it and
+            # hide the "Facade locked" banner (otherwise it lingers, claiming a stale lock).
+            self._clear_dooaf_facade_lock()
         self._refresh_dooaf_map_overlay()
         if clear_gun or clear_target:
             self._flush_video_marks_overlay()
         self._sync_video_mark_track_timer()
+
+    def _clear_dooaf_facade_lock(self) -> None:
+        """Drop the facade LRF lock (in-memory + persisted) and hide its banner."""
+        session = getattr(self, "_dooaf_facade_session", None)
+        if session is not None:
+            try:
+                session.clear()
+            except Exception:
+                pass
+        try:
+            clear_dooaf_facade_slant_range_m(self._dooaf_settings_store())
+        except Exception:
+            pass
+        try:
+            self._refresh_dooaf_facade_overlay_hint()
+        except Exception:
+            pass
 
     def _show_dooaf_setup_dialog(self) -> None:
         pending = self._dooaf_pick_dialog
