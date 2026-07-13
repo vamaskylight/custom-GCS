@@ -75,6 +75,38 @@ class VideoMarkTrackingMixin:
     def _mark_cmd_slew_released(track: dict[str, object]) -> bool:
         return bool(track.get("cmd_slew_released"))
 
+    def _setup_mark_panned_off(self, track: dict[str, object]) -> bool:
+        """True when the camera has panned off this DOOAF setup mark (hide the dot).
+
+        Compares the live gimbal attitude to the mark's OWN pick attitude
+        (pin_ref_att/ref_att) — never the shared facade-session lock, which a later lock
+        (e.g. the target) overwrites; that shared fallback made the gun think it was still
+        on-aim at the target pose and re-appear on top of the target (overlapping points).
+        The dot is never reprojected through the noisy in-flight pose, so it can only be
+        steady on its point or hidden — never moving wildly.
+        """
+        lock_att: tuple[float, float] | None = None
+        for key in ("pin_ref_att", "ref_att"):
+            a = track.get(key)
+            if isinstance(a, tuple) and len(a) == 2:
+                lock_att = (float(a[0]), float(a[1]))
+                break
+        if lock_att is None:
+            return False
+        if track.get("ground_video_pick") or track.get("pin_only_att"):
+            cur = self._read_top_gimbal_attitude_pair()
+        else:
+            cur = self._current_gimbal_attitude_pair()
+        if cur is None:
+            return False
+        _dyaw, dpitch = self._gimbal_att_delta_deg(lock_att, cur)
+        # PITCH only. In camera-FOLLOW the gimbal YAW changes on its own as the aircraft
+        # yaws in LOITER (the camera can still be on the point), so keying the hide on yaw
+        # would make marks flicker/vanish without operator input. Pitch is FOLLOW-immune and
+        # is what the operator changes to look between a ground gun (steep down) and a facade
+        # target (near level), so pitch cleanly separates the marks and hides on a real pan.
+        return dpitch >= _DOOAF_BORESIGHT_HIDE_DEG
+
     def _build_video_mark_track(
         self,
         ref_uv: tuple[float, float],
@@ -883,14 +915,12 @@ class VideoMarkTrackingMixin:
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
         if track is not None and self._dooaf_setup_mark_is_screen_pinned(track):
-            # LRF-boresight gun: once the operator pans off the gun the dot is hidden, so
-            # report a stable ATTITUDE-DELTA off-screen UV for the edge arrow (never the
-            # noisy absolute geo reprojection, which would make the arrow jitter). While the
-            # camera is on the gun this returns the on-screen pin, so no arrow is drawn.
-            if track.get("lrf_boresight_geo"):
-                if self._gimbal_moved_since_mark_lock(
-                    track, deadband_deg=_DOOAF_BORESIGHT_HIDE_DEG
-                ):
+            # Facade marks (gun / target / impact): once the operator pans off, the dot is
+            # hidden, so report a stable ATTITUDE-DELTA off-screen UV for the edge arrow
+            # (never the noisy absolute geo reprojection, which would make the arrow jitter).
+            # While the camera is on the mark this returns the on-screen pin, so no arrow.
+            if track.get("lrf_boresight_geo") or track.get("facade_uv_pick"):
+                if self._setup_mark_panned_off(track):
                     att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
                     if att_uv is not None:
                         return att_uv
@@ -1447,26 +1477,20 @@ class VideoMarkTrackingMixin:
             and self._dooaf_setup_mark_is_screen_pinned(track)
             and not lock_in_progress
         ):
-            # LRF-boresight gun: STABLE freeze + hide, NO reprojection of the dot while the
-            # camera moves. Keeping the dot glued to the gun needs the camera's absolute
-            # orientation (vehicle heading + gimbal yaw/pitch + roll + altitude); on the C13
-            # in LOITER with camera-FOLLOW those inputs are too noisy, so reprojecting every
-            # frame makes the dot jump around ("moves wildly"). Instead: show the dot rock-
-            # steady on the crosshair while the gimbal is essentially at the lock pose, and
-            # hide it (edge arrow cues direction; exact position stays on the map + report)
-            # the moment the operator pans off the gun. The show/hide test uses ONLY the
-            # gimbal attitude — the one stable in-flight signal — never the noisy vehicle pose.
-            if track.get("lrf_boresight_geo"):
-                if self._gimbal_moved_since_mark_lock(
-                    track, deadband_deg=_DOOAF_BORESIGHT_HIDE_DEG
-                ):
+            # Facade marks (gun LRF-boresight + target/impact facade-UV) use the SAME stable
+            # rule: shown steady at their pick point while the camera is on them, hidden
+            # (edge arrow) the moment the operator pans off — keyed to each mark's OWN pick
+            # attitude, so they can never collapse onto one another. The dot is NEVER
+            # reprojected through the noisy in-flight pose (vehicle heading + gimbal +
+            # altitude), which on the C13 in LOITER/FOLLOW made it jump around; the show/hide
+            # test uses only the stable gimbal attitude. Exact positions stay on map + report.
+            if track.get("lrf_boresight_geo") or track.get("facade_uv_pick"):
+                if self._setup_mark_panned_off(track):
                     return None
                 return self._dooaf_ground_mark_screen_pin_uv(track, stored_uv)
-            # World-anchor (facade-UV / ground picks): reproject the locked GPS to the
-            # CURRENT camera pose so the dot stays on the real target while on screen, and
-            # slides off the edge (hidden, edge arrow) when it leaves the frame. A GCS slew
-            # releases it immediately; otherwise the pan deadband keeps it pinned through
-            # small hover jitter. A pick with no GPS anchor (or a lock in progress) stays frozen.
+            # Ground picks keep the world-anchor path (unchanged): reproject the locked GPS
+            # to the current pose while on screen, hide when off screen; a GCS slew releases
+            # immediately, else the pan deadband holds it through small hover jitter.
             has_geo = (
                 track.get("geo_lat") is not None
                 and track.get("geo_lon") is not None
@@ -1496,6 +1520,12 @@ class VideoMarkTrackingMixin:
             pending = getattr(self, "_pending_lrf_video_pick", None)
             active_role = self._pending_lrf_dooaf_pick_role(pending)
             if active_role and str(role) != active_role:
+                # A different mark's LRF lock is in progress (e.g. the target). Hide THIS
+                # mark if the camera has panned off it — otherwise the gun stays glued at
+                # its pin near centre while the target locks at the same spot, and the two
+                # points overlap the instant the target dot is placed.
+                if track is not None and self._setup_mark_panned_off(track):
+                    return None
                 for key in ("frozen_uv", "pin_uv", "ref_uv"):
                     if track is not None:
                         pin = track.get(key)
@@ -1579,65 +1609,25 @@ class VideoMarkTrackingMixin:
     ) -> tuple[float, float] | None:
         """Screen UV for logged observations — GAC track when gimbal moves; report geo is separate."""
         if self._observation_mark_is_screen_pinned(row):
-            # Deliberate app-commanded slew: world-anchor the fall-of-shot dot immediately
-            # (no deadband) — it stays on the real impact point while on screen and hides
-            # (edge arrow cues direction) once the camera slews it out of frame.
-            if bool(row.get("cmd_slew_released")):
-                glat = row.get("video_mark_geo_lat")
-                glon = row.get("video_mark_geo_lon")
-                if glat is not None and glon is not None:
-                    probe: dict[str, object] = {
-                        "geo_lat": float(glat),
-                        "geo_lon": float(glon),
-                        "ref_uv": (float(stored_u), float(stored_v)),
-                    }
-                    galt = row.get("video_mark_geo_alt_m")
-                    if galt is not None:
-                        try:
-                            probe["geo_alt_m"] = float(galt)
-                        except (TypeError, ValueError):
-                            pass
-                    for k in (
-                        "_wa_hold_att",
-                        "_wa_hold_uv",
-                        "_wa_hold_vlat",
-                        "_wa_hold_vlon",
-                    ):
-                        if k in row:
-                            probe[k] = row[k]
-                    geo_uv = self._dooaf_mark_geo_uv_current_pose(probe)
-                    for k in (
-                        "_wa_hold_att",
-                        "_wa_hold_uv",
-                        "_wa_hold_vlat",
-                        "_wa_hold_vlon",
-                    ):
-                        if k in probe:
-                            row[k] = probe[k]
-                    if geo_uv is not None:
-                        u, v = geo_uv
-                        if self._mark_uv_on_screen(u, v):
-                            return (max(0.0, min(1.0, u)), max(0.0, min(1.0, v)))
-                        return None
-            # Wind drift: if the drone has moved from the pose at pick, re-anchor the
-            # impact dot to its saved GPS point so it stays on the target. Otherwise
-            # (small hover jitter) keep it pinned at the click pixel.
-            drift_probe = {
-                "geo_lat": row.get("video_mark_geo_lat"),
-                "geo_lon": row.get("video_mark_geo_lon"),
-                "lock_vehicle_lat": row.get("lock_vehicle_lat"),
-                "lock_vehicle_lon": row.get("lock_vehicle_lon"),
-            }
-            drifted = (
-                drift_probe["geo_lat"] is not None
-                and drift_probe["geo_lon"] is not None
-                and self._dooaf_mark_vehicle_geo_active(drift_probe)
-            )
-            if not drifted:
-                pinned = self._observation_mark_screen_pin_uv(row)
-                if pinned is not None:
-                    return pinned
-                return (float(stored_u), float(stored_v))
+            # Same stable freeze + hide as the DOOAF setup marks: the fall-of-shot dot is
+            # shown steady at its pick point while the camera is on it, and hidden (edge
+            # arrow) once the operator pans off — keyed to its OWN pick attitude, so it can
+            # never collapse onto the gun/target. Never reprojected, so it cannot move wildly.
+            ry = row.get("video_mark_track_ref_yaw")
+            rp = row.get("video_mark_track_ref_pitch")
+            if ry is not None and rp is not None:
+                pin_probe: dict[str, object] = {"pin_ref_att": (float(ry), float(rp))}
+                if str(row.get("geo_method") or "") in {
+                    "lrf_facade_uv",
+                    "lrf_facade_plane",
+                }:
+                    pin_probe["facade_uv_pick"] = True
+                if self._setup_mark_panned_off(pin_probe):
+                    return None
+            pinned = self._observation_mark_screen_pin_uv(row)
+            if pinned is not None:
+                return pinned
+            return (float(stored_u), float(stored_v))
         role = str(row.get("dooaf_role") or "")
         ref_u = row.get("video_mark_track_ref_u")
         if ref_u is None:
