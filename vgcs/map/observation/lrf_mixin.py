@@ -20,7 +20,13 @@ class LrfVideoLockMixin:
     """Extracted from MapWidget — uses host widget state via self."""
 
     def _reset_c13_lrf_for_observe_reset(self) -> None:
-        """OBSERVE Reset also clears C13 LRF lock / armed / failed reticle."""
+        """OBSERVE Reset also clears C13 LRF lock / armed / failed reticle + facade lock."""
+        clear_facade = getattr(self, "_clear_dooaf_facade_lock", None)
+        if callable(clear_facade):
+            try:
+                clear_facade()
+            except Exception:
+                pass
         try:
             if self._c13_lrf_is_locked():
                 self._unlock_c13_lrf()

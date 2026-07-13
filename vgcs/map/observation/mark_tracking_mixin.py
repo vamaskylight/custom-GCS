@@ -15,6 +15,7 @@ from vgcs.observe.target_measure import haversine_m
 from vgcs.observe.dooaf_tuning import (  # noqa: E402
     ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG as _DOOAF_ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG,
     BORESIGHT_HIDE_DEG as _DOOAF_BORESIGHT_HIDE_DEG,
+    BORESIGHT_YAW_HIDE_DEG as _DOOAF_BORESIGHT_YAW_HIDE_DEG,
     GEO_TRACK_VEHICLE_SHIFT_M as _DOOAF_GEO_TRACK_VEHICLE_SHIFT_M,
     LRF_MARK_PIN_ATT_DEADBAND_DEG as _LRF_MARK_PIN_ATT_DEADBAND_DEG,
     NEAR_FIELD_LRF_PIN_SLANT_M as _NEAR_FIELD_LRF_PIN_SLANT_M,
@@ -34,6 +35,11 @@ _DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
 # deadband) so the dot tracks its real world point from the first degree of travel —
 # staying visible while it is on screen and hiding (edge arrow cues direction, the map
 # keeps the true position) only once it leaves the frame.
+
+# Facade marks all pin near the crosshair, so two (e.g. gun + target both locked at centre)
+# can resolve to the same screen spot. When two markers fall within this normalized distance
+# we draw only the one the camera is aimed at, so the target never sits on top of the gun.
+_MARK_OVERLAP_UV = 0.05
 
 
 class VideoMarkTrackingMixin:
@@ -66,15 +72,52 @@ class VideoMarkTrackingMixin:
     def _mark_cmd_slew_released(track: dict[str, object]) -> bool:
         return bool(track.get("cmd_slew_released"))
 
+    def _setup_mark_aim_delta_deg(self, track: dict[str, object]) -> float:
+        """Angular gap (pitch + bearing) between the CURRENT camera pose and this mark's lock
+        pose. Used only to decide which of two OVERLAPPING marks the operator is aimed at, so
+        the closer one is kept — a relative comparison at one instant, robust to FOLLOW."""
+        lock_att: tuple[float, float] | None = None
+        for key in ("pin_ref_att", "ref_att"):
+            a = track.get(key)
+            if isinstance(a, tuple) and len(a) == 2:
+                lock_att = (float(a[0]), float(a[1]))
+                break
+        if lock_att is None:
+            return 999.0
+        if track.get("ground_video_pick") or track.get("pin_only_att"):
+            cur = self._read_top_gimbal_attitude_pair()
+        else:
+            cur = self._current_gimbal_attitude_pair()
+        if cur is None:
+            return 999.0
+        dyaw_gimbal, dpitch = self._gimbal_att_delta_deg(lock_att, cur)
+        lock_hdg = _num_or_none(track.get("lock_vehicle_heading_deg"))
+        cur_hdg = _num_or_none(self._observation_context().get("vehicle_heading_deg"))
+        if lock_hdg is not None and cur_hdg is not None:
+            lock_az = lock_hdg + float(lock_att[0])
+            cur_az = cur_hdg + float(cur[0])
+            dyaw = abs(((cur_az - lock_az) + 180.0) % 360.0 - 180.0)
+        else:
+            dyaw = float(dyaw_gimbal)
+        return float(dpitch) + float(dyaw)
+
     def _setup_mark_panned_off(self, track: dict[str, object]) -> bool:
         """True when the camera has panned off this DOOAF setup mark (hide the dot).
 
-        Compares the live gimbal attitude to the mark's OWN pick attitude
-        (pin_ref_att/ref_att) — never the shared facade-session lock, which a later lock
-        (e.g. the target) overwrites; that shared fallback made the gun think it was still
-        on-aim at the target pose and re-appear on top of the target (overlapping points).
+        Compares the live camera pose to the mark's OWN pick pose (pin_ref_att/ref_att +
+        lock heading) — never the shared facade-session lock, which a later lock overwrites.
         The dot is never reprojected through the noisy in-flight pose, so it can only be
         steady on its point or hidden — never moving wildly.
+
+        Two independent tests, EITHER of which hides the mark:
+          * PITCH ≥ BORESIGHT_HIDE_DEG — a real up/down tilt off the mark.
+          * YAW ≥ BORESIGHT_YAW_HIDE_DEG — a bearing pan off the mark. Gimbal yaw is
+            body-relative (the system combines it with vehicle heading for absolute azimuth),
+            so in camera-FOLLOW it stays ~constant while HOLDING on a point — it does not
+            flicker in loiter — yet it separates two marks the operator pointed at with
+            different gimbal yaw. Pitch alone could not separate marks at similar elevation,
+            so they used to overlap; adding yaw fixes that. The yaw threshold is well above
+            the ~3–4° settle-drift after a lock.
         """
         lock_att: tuple[float, float] | None = None
         for key in ("pin_ref_att", "ref_att"):
@@ -90,13 +133,11 @@ class VideoMarkTrackingMixin:
             cur = self._current_gimbal_attitude_pair()
         if cur is None:
             return False
-        _dyaw, dpitch = self._gimbal_att_delta_deg(lock_att, cur)
-        # PITCH only. In camera-FOLLOW the gimbal YAW changes on its own as the aircraft
-        # yaws in LOITER (the camera can still be on the point), so keying the hide on yaw
-        # would make marks flicker/vanish without operator input. Pitch is FOLLOW-immune and
-        # is what the operator changes to look between a ground gun (steep down) and a facade
-        # target (near level), so pitch cleanly separates the marks and hides on a real pan.
-        return dpitch >= _DOOAF_BORESIGHT_HIDE_DEG
+        dyaw, dpitch = self._gimbal_att_delta_deg(lock_att, cur)
+        return (
+            dpitch >= _DOOAF_BORESIGHT_HIDE_DEG
+            or dyaw >= _DOOAF_BORESIGHT_YAW_HIDE_DEG
+        )
 
     def _build_video_mark_track(
         self,
@@ -1751,15 +1792,35 @@ class VideoMarkTrackingMixin:
                 continue
         return out
 
+    def _observation_mark_aim_delta_deg(self, row: dict[str, object]) -> float:
+        """Aim delta for a logged (impact) mark — see _setup_mark_aim_delta_deg."""
+        ry = row.get("video_mark_track_ref_yaw")
+        rp = row.get("video_mark_track_ref_pitch")
+        if ry is None or rp is None:
+            return 999.0
+        probe: dict[str, object] = {"pin_ref_att": (float(ry), float(rp))}
+        lh = _num_or_none(row.get("lock_vehicle_heading_deg"))
+        if lh is not None:
+            probe["lock_vehicle_heading_deg"] = lh
+        if str(row.get("geo_method") or "") in {"lrf_facade_uv", "lrf_facade_plane"}:
+            probe["facade_uv_pick"] = True
+        return self._setup_mark_aim_delta_deg(probe)
+
     def _video_overlay_marks(self) -> list[VideoOverlayMark]:
-        """Video clicks: DOOAF Setup picks (green target) + observation fall-of-shot (red)."""
-        out: list[VideoOverlayMark] = []
-        seen: set[tuple[float, float]] = set()
+        """Video clicks: DOOAF Setup picks (green target) + observation fall-of-shot (red).
+
+        Facade marks all pin near the crosshair, so two can resolve to the same screen spot
+        (e.g. gun + target both locked at centre). We collect every shown mark, then draw them
+        closest-aim first and drop any that would overlap one already drawn — so the target can
+        never sit on top of the gun; only the mark the camera is aimed at is kept.
+        """
         in_slew = bool(getattr(self, "_lrf_lock_in_progress", False))
         pending = getattr(self, "_pending_lrf_video_pick", None)
         slew_role = (
             self._pending_lrf_dooaf_pick_role(pending) if in_slew else None
         )
+        # (uv, role, index, aim_delta)
+        candidates: list[tuple[tuple[float, float], str, int, float]] = []
         for role, pt in self._dooaf_setup_video_marks.items():
             if slew_role and str(role) == slew_role:
                 continue
@@ -1767,17 +1828,14 @@ class VideoMarkTrackingMixin:
                 disp = self._dooaf_mark_display_uv(str(role), pt)
                 if disp is None:
                     continue
-                key = (round(float(disp[0]), 4), round(float(disp[1]), 4))
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append(
-                    VideoOverlayMark(
-                        x=float(disp[0]),
-                        y=float(disp[1]),
-                        role=str(role),
-                        index=0,
-                    )
+                track = self._dooaf_setup_mark_track.get(str(role))
+                aim = (
+                    self._setup_mark_aim_delta_deg(track)
+                    if isinstance(track, dict)
+                    else 999.0
+                )
+                candidates.append(
+                    ((float(disp[0]), float(disp[1])), str(role), 0, aim)
                 )
             except (TypeError, ValueError, IndexError):
                 continue
@@ -1792,15 +1850,28 @@ class VideoMarkTrackingMixin:
                 disp = self._observation_mark_display_uv(row, float(vx), float(vy))
                 if disp is None:
                     continue
-                out.append(
-                    VideoOverlayMark(
-                        x=float(disp[0]),
-                        y=float(disp[1]),
-                        role=str(row.get("dooaf_role") or ""),
-                        index=idx + 1,
+                candidates.append(
+                    (
+                        (float(disp[0]), float(disp[1])),
+                        str(row.get("dooaf_role") or ""),
+                        idx + 1,
+                        self._observation_mark_aim_delta_deg(row),
                     )
                 )
-                seen.add((round(float(disp[0]), 4), round(float(disp[1]), 4)))
             except (TypeError, ValueError):
                 continue
+        candidates.sort(key=lambda c: c[3])
+        out: list[VideoOverlayMark] = []
+        placed: list[tuple[float, float]] = []
+        for uv, role, index, _aim in candidates:
+            if any(
+                abs(uv[0] - p[0]) < _MARK_OVERLAP_UV
+                and abs(uv[1] - p[1]) < _MARK_OVERLAP_UV
+                for p in placed
+            ):
+                continue
+            placed.append(uv)
+            out.append(
+                VideoOverlayMark(x=uv[0], y=uv[1], role=role, index=index)
+            )
         return out

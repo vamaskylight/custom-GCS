@@ -17,9 +17,15 @@ from __future__ import annotations
 # LRF-boresight gun / facade marks: show the dot steady on its pick point while the gimbal
 # PITCH is within this of the lock pose, then hide it (edge arrow). Small so the dot leaves
 # cleanly the moment the operator tilts toward the next point, but above the ~1.3° gimbal
-# drift seen during a hold-lock so it does not flicker. Camera-FOLLOW moves YAW, not pitch,
-# so the hide is keyed to pitch only — see mark_tracking_mixin._setup_mark_panned_off.
+# drift seen during a hold-lock so it does not flicker. This is the PITCH half of the
+# on/off-mark test (pitch is FOLLOW-immune) — see mark_tracking_mixin._setup_mark_panned_off.
 BORESIGHT_HIDE_DEG = 3.0
+
+# The bearing (yaw) half of the on/off-mark test, measured on the ABSOLUTE camera azimuth
+# (vehicle heading + gimbal yaw) so it survives camera-FOLLOW and separates two marks at
+# similar pitch but different bearing (pitch alone cannot — they would overlap). Larger than
+# the ~3–4° gimbal settle-drift after a lock so a held mark does not flicker.
+BORESIGHT_YAW_HIDE_DEG = 8.0
 
 # Ground / facade-UV picks world-anchor only after a deliberate pan past this. In LOITER with
 # camera-FOLLOW the C13 GAC yaw settles 4–8° after lock with no operator input; this deadband
