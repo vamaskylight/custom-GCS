@@ -3496,6 +3496,52 @@ def format_observation_detailed_log_html(
         subtitle="Full field dump for engineers.",
     )
 
+_TRUST_BANNER_STYLE = {
+    "good": ("#065f46", "#ecfdf5", "#6ee7b7", "✓"),
+    "caution": ("#92400e", "#fffbeb", "#fcd34d", "!"),
+    "low": ("#9a3412", "#fff7ed", "#fdba74", "!!"),
+    "unusable": ("#991b1b", "#fef2f2", "#fca5a5", "✕"),
+}
+
+
+def format_dooaf_trust_banner_html(session: DooafSession | None) -> str:
+    """Prominent 'how much to trust this' banner at the top of the report."""
+    from vgcs.observe.dooaf_trust import (
+        SEVERITY_INFO,
+        assess_dooaf_trust,
+        confidence_label,
+    )
+
+    trust = assess_dooaf_trust(session)
+    if not trust.findings and trust.confidence == "good":
+        # Nothing to caveat — a small green confirmation only.
+        return (
+            "<div style='margin:0 0 18px;padding:12px 16px;border-radius:12px;"
+            "border:1px solid #6ee7b7;background:#ecfdf5;color:#065f46;font-weight:600;"
+            "font-size:13px'>✓ Good confidence — no data-quality issues detected.</div>"
+        )
+    fg, bg, border, icon = _TRUST_BANNER_STYLE.get(
+        trust.confidence, _TRUST_BANNER_STYLE["caution"]
+    )
+    items = []
+    for f in trust.findings:
+        weight = "500" if f.severity == SEVERITY_INFO else "600"
+        opacity = "0.85" if f.severity == SEVERITY_INFO else "1"
+        items.append(
+            f"<li style='margin:4px 0;font-weight:{weight};opacity:{opacity}'>"
+            f"{_html_esc(f.message)}</li>"
+        )
+    return (
+        f"<div style='margin:0 0 18px;padding:14px 18px;border-radius:12px;"
+        f"border:1px solid {border};background:{bg};color:{fg}'>"
+        f"<div style='font-size:15px;font-weight:800;margin-bottom:6px'>"
+        f"{icon} {_html_esc(confidence_label(trust.confidence))}</div>"
+        f"<ul style='margin:0;padding-left:1.2rem;font-size:13px;line-height:1.5'>"
+        + "".join(items)
+        + "</ul></div>"
+    )
+
+
 def assemble_observation_report_html(
     entry_count: int,
     dooaf_summary_html: str,
@@ -3507,6 +3553,7 @@ def assemble_observation_report_html(
     return (
         observation_report_html_head(title=title)
         + format_observation_report_header(entry_count, title=title, session=session)
+        + format_dooaf_trust_banner_html(session)
         + dooaf_summary_html
         + detailed_log_html
         + observation_report_html_footer()
