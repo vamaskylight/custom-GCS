@@ -90,6 +90,10 @@ class DooafSession:
     impact_dem_alt_m: float | None = None
     height_correction_m: float | None = None
     dem_available: bool = False
+    # False when the DEM terrain-at-footprint elevations are untrustworthy — facade (wall)
+    # geometry or a near-horizon look angle, where the ground footprint is ill-defined. The
+    # report then hides those DEM rows and keeps only the facade-corrected elevations.
+    dem_footprint_reliable: bool = True
 
 @dataclass(frozen=True)
 class DooafSettings:
