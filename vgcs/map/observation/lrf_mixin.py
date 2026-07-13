@@ -7,6 +7,10 @@ from PySide6.QtCore import QThreadPool, QTimer
 from vgcs.map.native_video_overlay import VideoOverlayLrfLock
 from vgcs.map.observation.types import LrfLockBridge, LrfLockTask, PendingLrfVideoPick
 from vgcs.observe.dooaf import DOOAF_ROLE_GUN, DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED
+from vgcs.observe.dooaf_flight_session import (
+    format_lrf_range_label,
+    slant_to_ground_range_m,
+)
 from vgcs.observe.geo_reference import compute_lrf_facade_plane_geo, compute_lrf_slant_geo
 from vgcs.skydroid.protocol import format_slr_display_m
 from vgcs.video.pipeline import notify_companion_lrf_lock
@@ -855,11 +859,16 @@ class LrfVideoLockMixin:
             self._update_lrf_lock_geo(dm)
             self._companion_laser_range_m = dm
             self._try_record_dooaf_facade_session(dm)
-            self._obstacle_radar.set_c13_lrf_locked(
-                dm, geo_label=str(getattr(self, "_lrf_lock_geo_label", "") or "")
-            )
+            # Ground (map) distance = slant × cos(pitch): what the operator/map compares to.
+            _att = self._read_gimbal_attitude_pair()
+            _ground_m = slant_to_ground_range_m(dm, _att[1] if _att else None)
+            _geo_label = str(getattr(self, "_lrf_lock_geo_label", "") or "")
+            if _ground_m is not None:
+                _rng_label = f"{_ground_m:.0f} m ground"
+                _geo_label = f"{_rng_label} · {_geo_label}" if _geo_label else _rng_label
+            self._obstacle_radar.set_c13_lrf_locked(dm, geo_label=_geo_label)
             self._refresh_lrf_lock_overlay()
-            status = f"C13 LRF locked · {format_slr_display_m(dm)}"
+            status = f"C13 LRF locked · {format_lrf_range_label(dm, _ground_m)}"
             if getattr(self, "_lrf_lock_geo_label", ""):
                 status += f" · {self._lrf_lock_geo_label}"
             self._set_status(f"{status} — cyan box on video")

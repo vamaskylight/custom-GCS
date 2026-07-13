@@ -44,7 +44,11 @@ from vgcs.observe.dooaf import (
     write_dooaf_settings,
     write_dooaf_setup_video_mark,
 )
-from vgcs.observe.dooaf_flight_session import build_facade_overlay_hint
+from vgcs.observe.dooaf_flight_session import (
+    build_facade_overlay_hint,
+    format_lrf_range_label,
+    slant_to_ground_range_m,
+)
 from vgcs.observe.geo_reference import (
     apply_geo_reference_result_to_video_row,
     compute_geo_reference,
@@ -874,11 +878,14 @@ class DooafOperationsMixin:
             pass
         self._schedule_video_marks_overlay_refresh()
         self._end_dooaf_map_pick(restore_target_mode=True)
-        lrf_note = (
-            f" LRF {float(slant_m):.1f} m"
-            if used_lrf and slant_m is not None
-            else " (DEM estimate)"
-        )
+        if used_lrf and slant_m is not None:
+            _att = self._read_gimbal_attitude_pair()
+            _ground = slant_to_ground_range_m(
+                float(slant_m), _att[1] if _att else None
+            )
+            lrf_note = f" — {format_lrf_range_label(float(slant_m), _ground)}"
+        else:
+            lrf_note = " (DEM estimate)"
         print(
             f"[VGCS:observe] dooaf video pick ok lat={float(lat):.7f} lon={float(lon):.7f} "
             f"alt={alt_m} video=({overlay_uv[0]:.3f},{overlay_uv[1]:.3f}) "
@@ -961,6 +968,7 @@ class DooafOperationsMixin:
             slant_range_m=session.slant_range_m,
             uv_pick_ready=ready,
             pending_roles=self._dooaf_facade_pending_pick_labels(),
+            ground_range_m=session.ground_range_m,
         )
         if text is None:
             ly.set_facade_hint(None)
