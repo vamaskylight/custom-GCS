@@ -49,6 +49,15 @@ class DooafFacadeSession:
             return None
         return float(self._lock.slant_range_m)
 
+    @property
+    def ground_range_m(self) -> float | None:
+        """Horizontal (map) distance to the locked point — slant corrected for tilt."""
+        if self._lock is None:
+            return None
+        return slant_to_ground_range_m(
+            self._lock.slant_range_m, self._lock.gimbal_pitch_deg
+        )
+
     def clear(self) -> None:
         self._lock = None
 
@@ -154,18 +163,54 @@ class DooafFacadeSession:
         )
 
 
+def slant_to_ground_range_m(
+    slant_range_m: float | None, pitch_deg: float | None
+) -> float | None:
+    """Horizontal (map) distance from a laser slant range and gimbal pitch.
+
+    ``ground = slant × cos(pitch)``. The C13 laser returns the SLANT (line-of-sight)
+    range; at a steep down-look that is much longer than the distance along the ground.
+    The ground distance is what matches the map and the operator's eye. Returns the raw
+    slant when the pitch is unknown.
+    """
+    try:
+        s = float(slant_range_m)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if pitch_deg is None:
+        return s
+    try:
+        p = math.radians(float(pitch_deg))
+    except (TypeError, ValueError):
+        return s
+    return abs(s * math.cos(p))
+
+
+def format_lrf_range_label(
+    slant_range_m: float | None, ground_range_m: float | None
+) -> str:
+    """'35 m ground · LRF 44.8 m' — lead with the map distance, keep slant for reference."""
+    if slant_range_m is None:
+        return ""
+    slant_txt = f"{float(slant_range_m):.1f} m"
+    if ground_range_m is not None:
+        return f"{float(ground_range_m):.0f} m ground · LRF {slant_txt}"
+    return f"LRF {slant_txt}"
+
+
 def build_facade_overlay_hint(
     *,
     slant_range_m: float | None,
     uv_pick_ready: bool,
     pending_roles: list[str],
+    ground_range_m: float | None = None,
 ) -> tuple[str, str] | None:
     """Title + subtitle for the in-video facade lock banner."""
     if slant_range_m is None:
         return None
-    slant_txt = f"{float(slant_range_m):.1f} m"
+    rng_txt = format_lrf_range_label(slant_range_m, ground_range_m)
     if uv_pick_ready:
-        title = f"Facade locked — LRF {slant_txt}"
+        title = f"Facade locked — {rng_txt}"
         if pending_roles:
             labels = " · ".join(str(r) for r in pending_roles)
             subtitle = f"Click on video (fast pick): {labels}"
@@ -173,7 +218,7 @@ def build_facade_overlay_hint(
             subtitle = "All marks set — confirm DOOAF Setup or export REPORT"
         return title, subtitle
     title = "Facade stale — re-lock LRF on building"
-    subtitle = f"Last LRF {slant_txt}; gimbal or drone moved too far"
+    subtitle = f"Last {rng_txt}; gimbal or drone moved too far"
     return title, subtitle
 
 
