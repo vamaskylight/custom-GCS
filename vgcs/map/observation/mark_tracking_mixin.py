@@ -19,6 +19,12 @@ _DOOAF_ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG = 0.5
 # C13 GAC yaw often settles 4–8° after lock without operator input — keep the
 # mark frozen until the operator pans deliberately.
 _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG = 8.0
+# LRF-boresight gun: show the dot steady on the crosshair while the gimbal is within this
+# of the lock pose, then hide it (edge arrow). Small so the dot leaves cleanly the moment
+# the operator pans toward the target, but above the ~1.3° gimbal drift seen during a
+# hold-lock so it does not flicker while the operator holds on the gun. A deliberate pan
+# to the target is tens of degrees, far above this, so the separation is clean.
+_DOOAF_BORESIGHT_HIDE_DEG = 3.0
 _DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
 # Loiter drift in wind — anchor ground picks to saved geo once the drone shifts.
 _DOOAF_GEO_TRACK_VEHICLE_SHIFT_M = 2.0
@@ -722,18 +728,21 @@ class VideoMarkTrackingMixin:
         smooth_pose: bool = False,
         use_lock_vehicle_pose: bool = False,
     ) -> tuple[float, float] | None:
-        if use_lock_vehicle_pose:
-            prefer_lock = True
-            if pose_store is not None and self._vehicle_shift_since_mark_lock(
-                pose_store
-            ):
-                prefer_lock = False
-            ctx = self._dooaf_mark_projection_context(
-                pose_store, prefer_lock_vehicle=prefer_lock
-            )
-        else:
-            ctx = self._observation_context()
-        hfov, vfov = self._c13_lrf_geo_fov()
+        try:
+            if use_lock_vehicle_pose:
+                prefer_lock = True
+                if pose_store is not None and self._vehicle_shift_since_mark_lock(
+                    pose_store
+                ):
+                    prefer_lock = False
+                ctx = self._dooaf_mark_projection_context(
+                    pose_store, prefer_lock_vehicle=prefer_lock
+                )
+            else:
+                ctx = self._observation_context()
+            hfov, vfov = self._c13_lrf_geo_fov()
+        except Exception:
+            return None
         vlat = ctx.get("vehicle_lat")
         vlon = ctx.get("vehicle_lon")
         vhdg = ctx.get("vehicle_heading_deg")
@@ -874,6 +883,20 @@ class VideoMarkTrackingMixin:
         stored_uv: tuple[float, float],
     ) -> tuple[float, float]:
         if track is not None and self._dooaf_setup_mark_is_screen_pinned(track):
+            # LRF-boresight gun: once the operator pans off the gun the dot is hidden, so
+            # report a stable ATTITUDE-DELTA off-screen UV for the edge arrow (never the
+            # noisy absolute geo reprojection, which would make the arrow jitter). While the
+            # camera is on the gun this returns the on-screen pin, so no arrow is drawn.
+            if track.get("lrf_boresight_geo"):
+                if self._gimbal_moved_since_mark_lock(
+                    track, deadband_deg=_DOOAF_BORESIGHT_HIDE_DEG
+                ):
+                    att_uv = self._attitude_mark_uv_from_track(track, stored_uv)
+                    if att_uv is not None:
+                        return att_uv
+                pinned = self._dooaf_ground_mark_screen_pin_uv(track, stored_uv)
+                if pinned is not None:
+                    return pinned
             # A released (app-slewed) mark reports its world-projected UV so that when it
             # leaves the frame the off-screen hint can draw the edge arrow (and while it is
             # still on screen the projected UV matches the dot the display path draws).
@@ -1424,15 +1447,26 @@ class VideoMarkTrackingMixin:
             and self._dooaf_setup_mark_is_screen_pinned(track)
             and not lock_in_progress
         ):
-            # World-anchor: reproject the locked GPS to the CURRENT camera pose so the dot
-            # stays on the real gun/target while it is on screen, and slides off the edge
-            # (hidden, edge arrow cues it) when it leaves the frame. It never chases the
-            # camera centre. Small hover/gimbal jitter (within the pan deadband) keeps it
-            # pinned at the click so there is no nervous movement — EXCEPT once the operator
-            # commands a slew via the GCS (``cmd_slew_released``): then world-anchoring kicks
-            # in immediately with no deadband, so the mark tracks the real point from the
-            # first degree of travel instead of glueing to the click while the camera moves.
-            # Requires a GPS anchor; a pick with no geo (or a lock in progress) stays frozen.
+            # LRF-boresight gun: STABLE freeze + hide, NO reprojection of the dot while the
+            # camera moves. Keeping the dot glued to the gun needs the camera's absolute
+            # orientation (vehicle heading + gimbal yaw/pitch + roll + altitude); on the C13
+            # in LOITER with camera-FOLLOW those inputs are too noisy, so reprojecting every
+            # frame makes the dot jump around ("moves wildly"). Instead: show the dot rock-
+            # steady on the crosshair while the gimbal is essentially at the lock pose, and
+            # hide it (edge arrow cues direction; exact position stays on the map + report)
+            # the moment the operator pans off the gun. The show/hide test uses ONLY the
+            # gimbal attitude — the one stable in-flight signal — never the noisy vehicle pose.
+            if track.get("lrf_boresight_geo"):
+                if self._gimbal_moved_since_mark_lock(
+                    track, deadband_deg=_DOOAF_BORESIGHT_HIDE_DEG
+                ):
+                    return None
+                return self._dooaf_ground_mark_screen_pin_uv(track, stored_uv)
+            # World-anchor (facade-UV / ground picks): reproject the locked GPS to the
+            # CURRENT camera pose so the dot stays on the real target while on screen, and
+            # slides off the edge (hidden, edge arrow) when it leaves the frame. A GCS slew
+            # releases it immediately; otherwise the pan deadband keeps it pinned through
+            # small hover jitter. A pick with no GPS anchor (or a lock in progress) stays frozen.
             has_geo = (
                 track.get("geo_lat") is not None
                 and track.get("geo_lon") is not None
