@@ -1878,7 +1878,26 @@ def build_dooaf_session(
         impact_dem_alt_m=impact_dem,
         height_correction_m=height_correction_m,
         dem_available=_dem_terrain_available(dem_path),
+        dem_footprint_reliable=_dem_footprint_reliable(intended_row, impact_row),
     )
+
+
+def _dem_footprint_reliable(
+    intended_row: dict[str, Any] | None, impact_row: dict[str, Any] | None
+) -> bool:
+    """False when the DEM terrain-at-footprint elevations should not be trusted.
+
+    Facade (wall) picks and near-horizon look angles put the ground footprint far from
+    the actual point, so the DEM elevation there is meaningless (it can even imply the
+    opposite vertical direction). In those cases the report hides the DEM rows.
+    """
+    for row in (intended_row, impact_row):
+        if _row_prefers_facade_geometry(row):
+            return False
+        dep = _float_or_none((row or {}).get("geo_depression_deg"))
+        if dep is not None and abs(dep) < 8.0:
+            return False
+    return True
 
 def _dem_terrain_available(dem_path: str | Path | None) -> bool:
     """True only when a real DEM file is loaded and active.

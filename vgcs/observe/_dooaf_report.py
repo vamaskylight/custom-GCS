@@ -2440,8 +2440,9 @@ def format_elevation_summary_html(session: DooafSession) -> str:
         if dem_ok
         else "(no DEM loaded — relative to launch, not true MSL)"
     )
+    dem_footprint_ok = bool(getattr(session, "dem_footprint_reliable", True))
     rows: list[str] = []
-    if session.intended_dem_alt_m is not None:
+    if session.intended_dem_alt_m is not None and dem_footprint_ok:
         rows.append(
             f"<tr><td class='label-col'>Target {dem_label}</td>"
             f"<td>{_format_elev_msl_html(session.intended_dem_alt_m)} "
@@ -2461,7 +2462,7 @@ def format_elevation_summary_html(session: DooafSession) -> str:
                 f"<td>{_format_elev_msl_html(tgt.alt_m)} "
                 "<span class='muted'>(same as terrain DEM at footprint)</span></td></tr>"
             )
-    if session.impact_dem_alt_m is not None:
+    if session.impact_dem_alt_m is not None and dem_footprint_ok:
         rows.append(
             f"<tr><td class='label-col'>Impact {dem_label}</td>"
             f"<td>{_format_elev_msl_html(session.impact_dem_alt_m)} "
@@ -2498,7 +2499,16 @@ def format_elevation_summary_html(session: DooafSession) -> str:
         )
     if not rows:
         return ""
-    if dem_ok:
+    if dem_ok and not dem_footprint_ok:
+        intro = (
+            "<p class='log-hint'>Facade (wall) / near-level shot: the DEM "
+            "terrain-at-footprint elevations are unreliable at this look angle "
+            "(the ground footprint is far from the actual point), so they are "
+            "omitted here. The <strong>corrected elevations</strong> below and the "
+            "vertical separation come from the facade geometry (video Y × LRF "
+            "slant) and are what the elevation correction uses.</p>"
+        )
+    elif dem_ok:
         intro = (
             "<p class='log-hint'>Green target vs red impact: DEM ground at each "
             "footprint, corrected elevations for elevated points, and vertical "
