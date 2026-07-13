@@ -1879,7 +1879,30 @@ def build_dooaf_session(
         height_correction_m=height_correction_m,
         dem_available=_dem_terrain_available(dem_path),
         dem_footprint_reliable=_dem_footprint_reliable(intended_row, impact_row),
+        **_session_trust_signals(impact_row),
     )
+
+
+def _session_trust_signals(impact_row: dict[str, Any] | None) -> dict[str, Any]:
+    """Trust-relevant fields lifted from the impact mark for confidence assessment."""
+    row = impact_row or {}
+    fix_raw = row.get("gps_fix_type")
+    try:
+        fix = int(fix_raw) if fix_raw is not None else None
+    except (TypeError, ValueError):
+        fix = None
+    return {
+        "impact_geo_quality": (str(row.get("geo_quality")) or None)
+        if row.get("geo_quality") is not None
+        else None,
+        "impact_geo_method": (str(row.get("geo_method")) or None)
+        if row.get("geo_method") is not None
+        else None,
+        "impact_depression_deg": _float_or_none(row.get("geo_depression_deg")),
+        "impact_ekf_rel_alt_m": _float_or_none(row.get("ekf_rel_alt_m")),
+        "gps_fix_type": fix,
+        "gps_hdop": _float_or_none(row.get("gps_hdop")),
+    }
 
 
 def _dem_footprint_reliable(

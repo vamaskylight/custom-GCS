@@ -94,6 +94,14 @@ class DooafSession:
     # geometry or a near-horizon look angle, where the ground footprint is ill-defined. The
     # report then hides those DEM rows and keeps only the facade-corrected elevations.
     dem_footprint_reliable: bool = True
+    # Trust signals (from the impact mark) so a result's confidence can be assessed anywhere
+    # the session is available — see vgcs.observe.dooaf_trust.assess_dooaf_trust.
+    impact_geo_quality: str | None = None
+    impact_geo_method: str | None = None
+    impact_depression_deg: float | None = None
+    impact_ekf_rel_alt_m: float | None = None
+    gps_fix_type: int | None = None
+    gps_hdop: float | None = None
 
 @dataclass(frozen=True)
 class DooafSettings:

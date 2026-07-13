@@ -10,29 +10,20 @@ from vgcs.observe.dooaf_flight_session import mark_track_use_geo_in_flight
 from vgcs.observe.geo_reference import project_wgs84_to_video_norm, should_project_lrf_mark_via_geo
 from vgcs.observe.target_measure import haversine_m
 
-# Match should_project_lrf_mark_via_geo min_slant_for_airborne_geo_m — below this,
-# GPS geo projection jitters; pin the overlay until the gimbal pans meaningfully.
-_NEAR_FIELD_LRF_PIN_SLANT_M = 25.0
-_LRF_MARK_PIN_ATT_DEADBAND_DEG = 1.25
-# Gimbal pan — track overlay via GAC (same math as LRF reticle), not GPS geo projection.
-_DOOAF_ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG = 0.5
-# C13 GAC yaw often settles 4–8° after lock without operator input — keep the
-# mark frozen until the operator pans deliberately.
-_DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG = 8.0
-# LRF-boresight gun: show the dot steady on the crosshair while the gimbal is within this
-# of the lock pose, then hide it (edge arrow). Small so the dot leaves cleanly the moment
-# the operator pans toward the target, but above the ~1.3° gimbal drift seen during a
-# hold-lock so it does not flicker while the operator holds on the gun. A deliberate pan
-# to the target is tens of degrees, far above this, so the separation is clean.
-_DOOAF_BORESIGHT_HIDE_DEG = 3.0
+# Tracking tuning constants live in one documented module (vgcs.observe.dooaf_tuning);
+# they are imported here under their historic private names so behaviour is unchanged.
+from vgcs.observe.dooaf_tuning import (  # noqa: E402
+    ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG as _DOOAF_ATTITUDE_TRACK_GIMBAL_DEADBAND_DEG,
+    BORESIGHT_HIDE_DEG as _DOOAF_BORESIGHT_HIDE_DEG,
+    GEO_TRACK_VEHICLE_SHIFT_M as _DOOAF_GEO_TRACK_VEHICLE_SHIFT_M,
+    LRF_MARK_PIN_ATT_DEADBAND_DEG as _LRF_MARK_PIN_ATT_DEADBAND_DEG,
+    NEAR_FIELD_LRF_PIN_SLANT_M as _NEAR_FIELD_LRF_PIN_SLANT_M,
+    PAN_TRACK_GIMBAL_DEADBAND_DEG as _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG,
+    WA_HOLD_STILL_DEG as _WA_HOLD_STILL_DEG,
+    WA_HOLD_STILL_M as _WA_HOLD_STILL_M,
+)
+
 _DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
-# Loiter drift in wind — anchor ground picks to saved geo once the drone shifts.
-_DOOAF_GEO_TRACK_VEHICLE_SHIFT_M = 2.0
-# Freeze-while-holding: once world-anchored, only recompute the on-screen point when
-# the gimbal slews past this angle or the drone drifts past this distance. Keeps the
-# dot perfectly still while the operator aims (no sensor-noise tremble).
-_WA_HOLD_STILL_DEG = 0.6
-_WA_HOLD_STILL_M = 0.75
 
 # An app-commanded gimbal slew (operator deliberately moved the camera via the GCS —
 # on-screen controls / keys) is the one reliable "deliberate pan" signal: gimbal-angle
