@@ -470,6 +470,50 @@ class SkydroidCameraControl:
         except Exception:
             return
 
+    def start_target_track_at_video_norm(
+        self,
+        u: float,
+        v: float,
+        *,
+        frame_w: int = 1280,
+        frame_h: int = 720,
+    ) -> bool:
+        try:
+            fn = getattr(self._adapter, "start_visual_track_at_norm", None)
+            if callable(fn):
+                return bool(
+                    fn(float(u), float(v), frame_w=int(frame_w), frame_h=int(frame_h))
+                )
+        except Exception:
+            return False
+        return False
+
+    def stop_target_track(self) -> None:
+        try:
+            fn = getattr(self._adapter, "stop_visual_track", None)
+            if callable(fn):
+                fn()
+        except Exception:
+            pass
+
+    def is_target_track_active(self) -> bool:
+        try:
+            fn = getattr(self._adapter, "is_visual_track_active", None)
+            if callable(fn):
+                return bool(fn())
+        except Exception:
+            return False
+        return False
+
+    def query_slr_distance_m(self) -> float | None:
+        try:
+            fn = getattr(self._adapter, "query_slr_distance_m", None)
+            if callable(fn):
+                return fn()
+        except Exception:
+            return None
+        return None
+
     def gimbal_center(self) -> None:
         try:
             self.ptz("center")

@@ -470,6 +470,10 @@ class LrfVideoLockMixin:
                 QTimer.singleShot(0, self._layout_native_hud)
         except Exception:
             pass
+        try:
+            self.enable_m13_track_ui(bool(enabled))
+        except Exception:
+            pass
 
     def _c13_lrf_is_locked(self) -> bool:
         cc = getattr(self, "_camera_control", None)
@@ -528,6 +532,12 @@ class LrfVideoLockMixin:
                 pass
 
     def _arm_c13_lrf_lock(self) -> None:
+        stop_m13 = getattr(self, "_stop_m13_track", None)
+        if callable(stop_m13) and self._m13_track_is_active():
+            try:
+                stop_m13()
+            except Exception:
+                pass
         self._lrf_lock_armed = True
         self._lrf_lock_failed = False
         self._lrf_lock_uv = None

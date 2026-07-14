@@ -536,7 +536,7 @@ class MainWindowTelemetryMixin:
         self._maybe_refresh_map_web_overlays()
 
     def _refresh_c13_lrf_display(self) -> None:
-        """Poll C13 TOP SLR when LRF armed or locked."""
+        """Poll C13 TOP SLR when LRF armed or locked, or during M13 visual track."""
         if not bool(getattr(self, "_heartbeat_seen", False)):
             return
         provider = str(self._settings.value("camera/provider", "mavlink") or "mavlink").strip().lower()
@@ -547,6 +547,25 @@ class MainWindowTelemetryMixin:
             self._map_widget.enable_c13_lrf_ui(True)
         except Exception:
             pass
+        m13_active = False
+        try:
+            m13_active = bool(self._map_widget.is_m13_track_active())
+        except Exception:
+            pass
+        if m13_active:
+            try:
+                latlon = self._map_widget.get_m13_track_latlon()
+                dist = getattr(self._map_widget, "_m13_track_range_m", None)
+                if latlon is not None:
+                    text = f"{float(dist):.1f} m (M13 track)" if dist is not None else "M13 track"
+                    text = f"{text} · {latlon[0]:.6f}, {latlon[1]:.6f}"
+                else:
+                    text = "M13 track — computing position…"
+                self._fields["rangefinder"].setText(text)
+                self._apply_state_style(self._fields["rangefinder"], "ok")
+            except Exception:
+                pass
+            return
         armed = False
         locking = False
         try:

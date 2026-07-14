@@ -98,6 +98,19 @@ class VideoOverlayLrfLock:
 
 
 @dataclass(frozen=True)
+class VideoOverlayM13Track:
+    """M13 moving-target track — bracket at boresight while firmware follows."""
+
+    x: float
+    y: float
+    distance_m: float | None = None
+    pending: bool = False
+    failed: bool = False
+    active: bool = False
+    geo_label: str = ""
+
+
+@dataclass(frozen=True)
 class VideoOverlayFacadeHint:
     """DOOAF facade session — rapid UV picks without re-slewing LRF."""
 
@@ -127,6 +140,8 @@ class NativeVideoOverlayLayer(QWidget):
         self._measure_segments: list[tuple[float, float, float, float, str]] = []
         self._lrf_lock: VideoOverlayLrfLock | None = None
         self._lrf_armed_hint = False
+        self._m13_track: VideoOverlayM13Track | None = None
+        self._m13_track_armed = False
         self._facade_hint: VideoOverlayFacadeHint | None = None
         # Boresight (camera-centre) crosshair — the exact point the LRF measures.
         # Aim this at the gun/target before locking so the ranged point is under it.
@@ -284,6 +299,19 @@ class NativeVideoOverlayLayer(QWidget):
         self._lrf_armed_hint = bool(armed)
         self.update()
 
+    def set_m13_track(self, item: VideoOverlayM13Track | None) -> None:
+        self._m13_track = item
+        self.update()
+
+    def set_m13_track_armed(self, armed: bool) -> None:
+        self._m13_track_armed = bool(armed)
+        self.update()
+
+    def clear_m13_track(self) -> None:
+        self._m13_track = None
+        self._m13_track_armed = False
+        self.update()
+
     def set_facade_hint(
         self,
         hint: VideoOverlayFacadeHint | dict[str, object] | tuple[str, str] | None,
@@ -327,6 +355,8 @@ class NativeVideoOverlayLayer(QWidget):
         self._measure_segments.clear()
         self._lrf_lock = None
         self._lrf_armed_hint = False
+        self._m13_track = None
+        self._m13_track_armed = False
         self._facade_hint = None
         self.update()
 
@@ -493,6 +523,82 @@ class NativeVideoOverlayLayer(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(QPointF(cx, cy), 2.2, 2.2)
 
+    def _draw_m13_track_reticle(
+        self,
+        p: QPainter,
+        cx: float,
+        cy: float,
+        ct: float,
+        cw: float,
+        ch: float,
+        *,
+        distance_m: float | None,
+        pending: bool,
+        failed: bool = False,
+        active: bool = False,
+        geo_label: str = "",
+    ) -> None:
+        """Orange/violet brackets for M13 visual track (distinct from cyan LRF)."""
+        span = max(32.0, min(cw, ch) * 0.16)
+        half = span / 2.0
+        x0, y0 = cx - half, cy - half
+        x1, y1 = cx + half, cy + half
+        arm = max(12.0, span * 0.30)
+        if failed:
+            color = QColor(248, 113, 113, 240)
+            fill = QColor(248, 113, 113, 24)
+        elif pending:
+            color = QColor(251, 191, 36, 240)
+            fill = QColor(251, 191, 36, 24)
+        elif active:
+            color = QColor(251, 146, 60, 245)
+            fill = QColor(251, 146, 60, 36)
+        else:
+            color = QColor(167, 139, 250, 240)
+            fill = QColor(167, 139, 250, 28)
+        pen = QPen(color, 3)
+        p.setPen(pen)
+        p.setBrush(fill)
+        p.drawRect(int(x0), int(y0), int(span), int(span))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for ax, ay, dx, dy in (
+            (x0, y0, arm, 0),
+            (x0, y0, 0, arm),
+            (x1, y0, -arm, 0),
+            (x1, y0, 0, arm),
+            (x0, y1, arm, 0),
+            (x0, y1, 0, -arm),
+            (x1, y1, -arm, 0),
+            (x1, y1, 0, -arm),
+        ):
+            p.drawLine(int(ax), int(ay), int(ax + dx), int(ay + dy))
+        p.setPen(QPen(color, 2))
+        p.drawLine(int(cx - half - 8), int(cy), int(cx + half + 8), int(cy))
+        p.drawLine(int(cx), int(cy - half - 8), int(cx), int(cy + half + 8))
+        if failed:
+            caption = "Track failed — retry"
+        elif pending:
+            caption = "Starting track…"
+        elif active:
+            if distance_m is not None:
+                caption = f"TRACK {format_slr_display_m(distance_m)}"
+            else:
+                caption = "TRACK active"
+        else:
+            caption = "Track"
+        if geo_label and active and not pending and not failed:
+            caption = f"{caption} · {geo_label}"
+        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        p.setFont(font)
+        metrics = p.fontMetrics()
+        tw = metrics.horizontalAdvance(caption) + 12
+        th = metrics.height() + 8
+        tx = int(cx - tw / 2.0)
+        ty = int(ct + ch - th - 10.0)
+        p.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 210))
+        p.setPen(color)
+        p.drawText(tx + 6, ty + metrics.ascent() + 4, caption)
+
     def _draw_lrf_lock_reticle(
         self,
         p: QPainter,
@@ -636,6 +742,8 @@ class NativeVideoOverlayLayer(QWidget):
             and not self._measure_segments
             and self._lrf_lock is None
             and not self._lrf_armed_hint
+            and self._m13_track is None
+            and not self._m13_track_armed
             and self._facade_hint is None
             and not self._center_reticle_enabled
         ):
@@ -660,6 +768,20 @@ class NativeVideoOverlayLayer(QWidget):
                 fill=QColor(8, 20, 36, 210),
                 title_color=QColor(255, 236, 179),
                 subtitle_color=QColor(255, 236, 179),
+            ) + 6.0
+
+        if self._m13_track_armed and self._m13_track is None:
+            banner_y = self._draw_top_banner(
+                p,
+                cl=cl,
+                ct=ct,
+                cw=cw,
+                y_top=banner_y,
+                title="M13 track — click target on video to lock and follow",
+                border=QColor(167, 139, 250, 230),
+                fill=QColor(24, 16, 48, 215),
+                title_color=QColor(233, 213, 255),
+                subtitle_color=QColor(216, 180, 254),
             ) + 6.0
 
         if self._facade_hint is not None:
@@ -694,6 +816,24 @@ class NativeVideoOverlayLayer(QWidget):
                 pending=bool(lk.pending),
                 failed=bool(lk.failed),
                 geo_label=str(lk.geo_label or ""),
+            )
+
+        if self._m13_track is not None:
+            tr = self._m13_track
+            cx = cl + float(tr.x) * cw
+            cy = ct + float(tr.y) * ch
+            self._draw_m13_track_reticle(
+                p,
+                cx,
+                cy,
+                ct,
+                cw,
+                ch,
+                distance_m=tr.distance_m,
+                pending=bool(tr.pending),
+                failed=bool(tr.failed),
+                active=bool(tr.active),
+                geo_label=str(tr.geo_label or ""),
             )
 
         for det in self._detections:

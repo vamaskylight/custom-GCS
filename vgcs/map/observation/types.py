@@ -49,6 +49,42 @@ class PendingLrfVideoPick:
     obs_capture_snapshot: bool = True
 
 
+class M13TrackBridge(QObject):
+    started = Signal(bool, float, float)  # ok, u, v
+
+
+class M13TrackStartTask(QRunnable):
+    """GOT + SUM confirm on worker thread (M13 visual track)."""
+
+    def __init__(self, cc: object, u: float, v: float, bridge: M13TrackBridge) -> None:
+        super().__init__()
+        self._cc = cc
+        self._u = float(u)
+        self._v = float(v)
+        self._bridge = bridge
+
+    def run(self) -> None:
+        ok = False
+        try:
+            start_fn = getattr(self._cc, "start_target_track_at_video_norm", None)
+            if callable(start_fn):
+                ok = bool(
+                    start_fn(
+                        self._u,
+                        self._v,
+                        frame_w=1280,
+                        frame_h=720,
+                    )
+                )
+        except Exception as exc:
+            print(f"[VGCS:m13] track start failed: {exc}")
+            ok = False
+        try:
+            self._bridge.started.emit(bool(ok), self._u, self._v)
+        except Exception:
+            pass
+
+
 class LrfLockBridge(QObject):
     finished = Signal(object, float, float)  # distance_m | None, u, v
     progress = Signal(float)  # live SLR sample while locking
@@ -344,6 +380,8 @@ class ObservationExportTask(QRunnable):
 __all__ = [
     "LrfLockBridge",
     "LrfLockTask",
+    "M13TrackBridge",
+    "M13TrackStartTask",
     "ObservationExportBridge",
     "ObservationExportTask",
     "ObservationSnapshotBridge",

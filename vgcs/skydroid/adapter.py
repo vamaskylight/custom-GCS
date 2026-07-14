@@ -110,6 +110,8 @@ _LRF_BORESIGHT_TOL_V = 0.018
 _LRF_BORESIGHT_LOCK_TOL_U = 0.016
 _LRF_BORESIGHT_LOCK_TOL_V = 0.018
 _LRF_BORESIGHT_NEAR_LOCK_U = 0.055
+# C13 LRF uses GOT mark-only (no SUM) so gimbal does not slew on observation picks.
+_LRF_GOT_MARK_ONLY = True
 _LRF_ALIGN_STEEP_PITCH_DEG = 12.0
 _LRF_ALIGN_BORESIGHT_YAW_DEG = 4.5
 _LRF_ALIGN_BORESIGHT_COMBINED_DEG = 5.0
@@ -214,6 +216,7 @@ class SkydroidTopUdpAdapter:
         self._lrf_lock_x = 0
         self._lrf_lock_y = 0
         self._lrf_locked_distance_m: float | None = None
+        self._visual_track_active = False
         self._active_port = int(port)
         self._transport.set_datagram_handler(self._maybe_update_status)
 
@@ -310,8 +313,88 @@ class SkydroidTopUdpAdapter:
         with self._status_lock:
             return bool(self._lrf_locked)
 
+    def is_visual_track_active(self) -> bool:
+        with self._status_lock:
+            return bool(self._visual_track_active)
+
+    def start_visual_track_at_norm(
+        self,
+        u: float,
+        v: float,
+        *,
+        frame_w: int = _LRF_FRAME_W,
+        frame_h: int = _LRF_FRAME_H,
+    ) -> bool:
+        """M13 — GOT + SUM confirm; firmware keeps the target centered on video."""
+        if not self.gimbal_telemetry_ok():
+            return False
+        fw = max(1, int(frame_w))
+        fh = max(1, int(frame_h))
+        u_in, v_in = float(u), float(v)
+        if self._lrf_flip_x():
+            u, v = self.normalize_lrf_click_uv(u_in, v_in)
+        else:
+            u, v = u_in, v_in
+        x_px = max(0, min(fw, int(round(max(0.0, min(1.0, float(u))) * fw))))
+        y_px = max(0, min(fh, int(round(max(0.0, min(1.0, float(v))) * fh))))
+        self._ensure_active_transport()
+        try:
+            stop = build_sum_track(confirm=False)
+            self._transport.send_and_receive(
+                stop, expect_reply=False, log=False, timeout_s=0.08
+            )
+            time.sleep(0.08)
+            got = build_got_target(x_px, y_px, frame_w=fw, frame_h=fh)
+            self._transport.send_and_receive(
+                got, expect_reply=False, log=True, timeout_s=0.08
+            )
+            time.sleep(0.12)
+            confirm = build_sum_track(confirm=True)
+            self._transport.send_and_receive(
+                confirm, expect_reply=False, log=True, timeout_s=0.08
+            )
+            with self._status_lock:
+                self._visual_track_active = True
+            print(
+                f"[VGCS:m13] visual track start px=({x_px},{y_px}) "
+                f"click=({u_in:.3f},{v_in:.3f}) frame=({u:.3f},{v:.3f})"
+            )
+            return True
+        except Exception as exc:
+            print(f"[VGCS:m13] visual track start failed: {exc}")
+            with self._status_lock:
+                self._visual_track_active = False
+            return False
+
+    def stop_visual_track(self) -> None:
+        """M13 — SUM stop (does not clear LRF lock state)."""
+        active_port = int(self._transport._port)
+        try:
+            stop = build_sum_track(confirm=False)
+            self._transport.send_and_receive(
+                stop, expect_reply=False, log=True, timeout_s=0.08
+            )
+        except Exception:
+            pass
+        finally:
+            self._transport._port = active_port
+        with self._status_lock:
+            self._visual_track_active = False
+
+    def query_slr_distance_m(self, *, log: bool = False) -> float | None:
+        """Fresh SLR read for M13 coordinate updates (independent of LRF arm/lock)."""
+        if not self.gimbal_telemetry_ok():
+            return None
+        self._ensure_active_transport()
+        try:
+            return self._query_slr_distance_m(log=log, fresh=True)
+        except Exception:
+            return None
+
     def _send_got_mark_only(self, x_px: int, y_px: int, *, frame_w: int, frame_h: int) -> None:
         """Mark click on video for overlay — stop track, no SUM confirm (avoids gimbal slew)."""
+        with self._status_lock:
+            self._visual_track_active = False
         stop = build_sum_track(confirm=False)
         self._transport.send_and_receive(
             stop, expect_reply=False, log=False, timeout_s=0.08
@@ -3174,6 +3257,7 @@ class SkydroidTopUdpAdapter:
 
     def unlock_lrf(self) -> None:
         """Stop visual track and clear locked LRF reading."""
+        self.stop_visual_track()
         active_port = int(self._transport._port)
         try:
             stop = build_sum_track(confirm=False)
