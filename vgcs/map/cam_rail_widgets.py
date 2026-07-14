@@ -215,6 +215,30 @@ class CamObserveBlock(QWidget):
         return DOOAF_ROLE_IMPACT
 
 
+class CamM13TrackBlock(QWidget):
+    """M13 moving-target track — arm, click video, gimbal follow."""
+
+    def __init__(self, track_btn: QWidget, parent=None) -> None:
+        super().__init__(parent)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        track_btn.setObjectName("m13Track")
+        track_btn.setToolTip(
+            "Arm visual track — click a target on the day video feed. "
+            "C13 firmware follows via GOT+SUM; map coords computed in GCS."
+        )
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        row.addWidget(track_btn, 1)
+        hint = QLabel("Track ON → click target on video · gimbal follow · map trail")
+        hint.setObjectName("m13TrackHint")
+        hint.setWordWrap(True)
+        v.addLayout(row)
+        v.addWidget(hint)
+
+
 class CamRailBiSlider(QWidget):
     """
     Dark horizontal track + **white circular thumb** (reference UI).

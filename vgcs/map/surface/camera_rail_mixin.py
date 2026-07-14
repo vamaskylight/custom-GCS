@@ -50,6 +50,18 @@ class CameraRailMixin:
             pass
         self._sync_native_camera_rail_toggles()
         try:
+            from vgcs.video.camera_control import NoopCameraControl, uses_skydroid_top_camera
+
+            if isinstance(control, NoopCameraControl):
+                reset_m13 = getattr(self, "_reset_m13_track_for_disconnect", None)
+                if callable(reset_m13):
+                    reset_m13()
+                self.enable_m13_track_ui(False)
+            else:
+                self.enable_m13_track_ui(uses_skydroid_top_camera(control))
+        except Exception:
+            pass
+        try:
             if bool(getattr(self, "_web_ready", False)) and self._video_preview_should_run():
                 QTimer.singleShot(
                     400,

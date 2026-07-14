@@ -7,6 +7,7 @@ from vgcs.map.observation.dooaf_mixin import DooafOperationsMixin
 from vgcs.map.observation.lrf_mixin import LrfVideoLockMixin
 from vgcs.map.observation.mark_tracking_mixin import VideoMarkTrackingMixin
 from vgcs.map.observation.session_mixin import ObservationSessionMixin
+from vgcs.map.observation.track_mixin import M13MovingTargetTrackMixin
 from vgcs.map.observation.types import PendingLrfVideoPick
 
 class MapObservationMixins(
@@ -15,6 +16,7 @@ class MapObservationMixins(
     DooafOperationsMixin,
     ObservationSessionMixin,
     LrfVideoLockMixin,
+    M13MovingTargetTrackMixin,
 ):
     """Composable mixins mixed into :class:`vgcs.map.map_widget.MapWidget`."""
 
@@ -22,6 +24,7 @@ class MapObservationMixins(
 __all__ = [
     "DooafOperationsMixin",
     "LrfVideoLockMixin",
+    "M13MovingTargetTrackMixin",
     "MapObservationMixins",
     "ObservationContextMixin",
     "ObservationSessionMixin",

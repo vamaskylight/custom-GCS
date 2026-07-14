@@ -485,6 +485,8 @@ class NativeTileMapView(QWidget):
         # Consecutive ground targets (lat, lon) for measure lines + distance labels.
         self._target_track: list[tuple[float, float]] = []
         self._target_track_labels: list[str] = []
+        self._m13_track_marker: tuple[float, float] | None = None
+        self._m13_track_path: list[tuple[float, float]] = []
         self._pending_timer = QTimer(self)
         self._pending_timer.setSingleShot(True)
         self._pending_timer.setInterval(32)
@@ -737,6 +739,25 @@ class NativeTileMapView(QWidget):
             self._lrf_lock_marker = None
         self.update()
 
+    def set_m13_track_marker(self, lat: float | None, lon: float | None) -> None:
+        """M13 — current moving-target position on the map."""
+        try:
+            if lat is None or lon is None:
+                self._m13_track_marker = None
+            else:
+                self._m13_track_marker = (float(lat), float(lon))
+        except Exception:
+            self._m13_track_marker = None
+        self.update()
+
+    def set_m13_track_path(self, points: list[tuple[float, float]]) -> None:
+        """M13 — ground trail of computed track positions."""
+        try:
+            self._m13_track_path = [(float(a), float(b)) for a, b in points]
+        except Exception:
+            self._m13_track_path = []
+        self.update()
+
     def set_observation_target_track(
         self,
         points: list[tuple[float, float]],
@@ -784,6 +805,8 @@ class NativeTileMapView(QWidget):
             self._lrf_lock_marker = None
             self._target_track.clear()
             self._target_track_labels.clear()
+            self._m13_track_marker = None
+            self._m13_track_path.clear()
         except Exception:
             pass
         self.update()
@@ -1222,6 +1245,40 @@ class NativeTileMapView(QWidget):
                 ty = int(c.y()) - th - 8
                 painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 210))
                 painter.setPen(QColor(120, 220, 255))
+                painter.drawText(tx + 4, ty + metrics.ascent() + 2, caption)
+            except Exception:
+                pass
+
+        # M13 moving-target trail (orange) + current marker.
+        if len(self._m13_track_path) >= 2:
+            pen = QPen(QColor(251, 146, 60, 200), 2, Qt.PenStyle.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for i in range(1, len(self._m13_track_path)):
+                la, lo = self._m13_track_path[i - 1]
+                lb, lob = self._m13_track_path[i]
+                c0 = self._project(la, lo, z, fx, fy, w, h)
+                c1 = self._project(lb, lob, z, fx, fy, w, h)
+                painter.drawLine(c0, c1)
+        if self._m13_track_marker is not None:
+            try:
+                lat, lon = self._m13_track_marker
+                c = self._project(lat, lon, z, fx, fy, w, h)
+                painter.setPen(QPen(QColor(251, 146, 60, 250), 3))
+                painter.setBrush(QColor(251, 146, 60, 100))
+                painter.drawEllipse(c, 10, 10)
+                painter.drawLine(int(c.x() - 16), int(c.y()), int(c.x() + 16), int(c.y()))
+                painter.drawLine(int(c.x()), int(c.y() - 16), int(c.x()), int(c.y() + 16))
+                caption = f"TRACK {float(lat):.6f}, {float(lon):.6f}"
+                font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+                painter.setFont(font)
+                metrics = painter.fontMetrics()
+                tw = metrics.horizontalAdvance(caption) + 8
+                th = metrics.height() + 4
+                tx = int(c.x()) + 12
+                ty = int(c.y()) - th - 8
+                painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 210))
+                painter.setPen(QColor(255, 200, 140))
                 painter.drawText(tx + 4, ty + metrics.ascent() + 2, caption)
             except Exception:
                 pass

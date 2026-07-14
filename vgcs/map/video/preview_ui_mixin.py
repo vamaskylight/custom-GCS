@@ -68,6 +68,17 @@ class VideoPreviewUiMixin:
                 print(f"[VGCS:lrf] video pick failed: {e}")
                 self._set_status(f"LRF lock failed: {e}")
             return
+        if self._m13_track_mode_active() and not self._m13_track_is_active():
+            try:
+                if event is not None:
+                    event.accept()
+                pos = event.position()
+                xn, yn = self._native_video_click_norm(pos)
+                self._begin_m13_video_track(float(xn), float(yn))
+            except Exception as e:
+                print(f"[VGCS:m13] video track failed: {e}")
+                self._set_status(f"M13 track failed: {e}")
+            return
         if self._observation_mark_active():
             try:
                 if event is not None:
@@ -506,7 +517,7 @@ class VideoPreviewUiMixin:
                 ov.raise_()
             # Target ON (map-main PiP only): lift video above the map so PiP clicks reach the preview.
             # Fullscreen swap keeps the camera rail above video — do not raise video over the rail.
-            if (self._observation_mark_active() or bool(getattr(self, "_lrf_lock_armed", False))) and preview_on and not swapped:
+            if (self._observation_mark_active() or bool(getattr(self, "_lrf_lock_armed", False)) or self._m13_track_mode_active()) and preview_on and not swapped:
                 pv = getattr(self, "_native_video_preview", None)
                 if pv is not None and pv.isVisible():
                     pv.raise_()

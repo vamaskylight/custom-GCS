@@ -190,6 +190,7 @@ from vgcs.map.sensor_obstacle_widget import ObstacleRadarPanel
 from vgcs.map.map_3d_marker_overlay import Map3dLayer, Map3dMarkerOverlay
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_url, create_map_3d_web_view
 from vgcs.map.cam_rail_widgets import (
+    CamM13TrackBlock,
     CamObserveBlock,
     CamRailGimbalPad,
     CamRailShowHandle,
@@ -771,6 +772,7 @@ from vgcs.map.surface.tile_probe import _TileProbeBridge, _TileProbeTask
 from vgcs.map.observation.types import (
     LrfLockBridge,
     LrfLockTask,
+    M13TrackBridge,
     ObservationExportBridge,
     ObservationSnapshotBridge,
     PendingLrfVideoPick,
@@ -906,6 +908,20 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._obs_export_quick = False
         self._obs_marks_overlay_timer: QTimer | None = None
         self._video_mark_track_timer: QTimer | None = None
+        self._m13_track_armed = False
+        self._m13_track_active = False
+        self._m13_track_click_uv: tuple[float, float] | None = None
+        self._m13_track_ref_att: tuple[float, float] | None = None
+        self._m13_track_lat: float | None = None
+        self._m13_track_lon: float | None = None
+        self._m13_track_alt_m: float | None = None
+        self._m13_track_geo_label = ""
+        self._m13_track_range_m: float | None = None
+        self._m13_track_path: list[tuple[float, float]] = []
+        self._m13_track_geo_mono = 0.0
+        self._m13_track_timer: QTimer | None = None
+        self._m13_track_bridge = M13TrackBridge(self)
+        self._m13_track_bridge.started.connect(self._on_m13_track_started)
         self._video_ui_render_mono = 0.0
         self._split_ui_render_mono = 0.0
         self._split_cache_mono: dict[str, float] = {}
@@ -1154,6 +1170,9 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_native_report.setObjectName("observeReport")
         self._btn_native_reset = QPushButton("Reset")
         self._btn_native_reset.setObjectName("observeReset")
+        self._btn_native_m13_track = QPushButton("Track")
+        self._btn_native_m13_track.setCheckable(True)
+        self._btn_native_m13_track.hide()
         for b in (
             self._btn_native_gimbal_up,
             self._btn_native_gimbal_down,
@@ -1197,6 +1216,9 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
             self._btn_native_reset,
         )
         self._native_observe_body = observe_body
+        m13_track_body = CamM13TrackBlock(self._btn_native_m13_track)
+        self._native_m13_track_body = m13_track_body
+        m13_track_body.hide()
 
         self._native_hud_right_layout.addWidget(_cam_rail_sep())
         self._native_hud_right_layout.addWidget(
@@ -1212,6 +1234,9 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         )
         self._native_hud_right_layout.addWidget(
             _cam_rail_inline_row("OBSERVE", observe_body)
+        )
+        self._native_hud_right_layout.addWidget(
+            _cam_rail_inline_row("TRACK", m13_track_body)
         )
 
         self._native_hud_right.setMinimumWidth(_NATIVE_CAM_RAIL_CONTENT_MIN_WIDTH_PX)
@@ -1481,6 +1506,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         def _obs_reset() -> None:
             print("[VGCS:cam_rail] OBSERVE Reset clicked")
             self._reset_c13_lrf_for_observe_reset()
+            self._stop_m13_track()
             self._clear_observations()
 
         def _obs_dooaf_setup() -> None:
@@ -1492,6 +1518,13 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_native_report.clicked.connect(_obs_report)
         self._btn_native_reset.clicked.connect(_obs_reset)
         observe_body.setup_clicked.connect(_obs_dooaf_setup)
+
+        def _m13_track_toggle(on: bool) -> None:
+            if not on:
+                self._stop_m13_track()
+            self._set_m13_track_armed(bool(on))
+
+        self._btn_native_m13_track.toggled.connect(_m13_track_toggle)
 
         self._status = QLabel("Map status: waiting for telemetry")
         self._status.setObjectName("telemetryValue")
