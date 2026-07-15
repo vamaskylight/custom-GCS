@@ -2719,7 +2719,11 @@ class RtspSource(QObject):
                                 if (now - last_emit_mono) < min_emit_dt:
                                     continue
                                 motion_preview = (
-                                    companion_rtsp and _companion_preview_motion_active()
+                                    companion_rtsp
+                                    and (
+                                        _companion_preview_motion_active()
+                                        or _companion_gimbal_session_active()
+                                    )
                                 )
                                 if (
                                     companion_rtsp
