@@ -2823,6 +2823,12 @@ class RtspSource(QObject):
                                                 motion_preview=motion_preview,
                                                 thermal=thermal_feed,
                                             )
+                                        if (
+                                            companion_rtsp
+                                            and _companion_gimbal_session_active()
+                                        ):
+                                            hide = False
+                                            why = ""
                                         if hide:
                                             corrupt_skip_streak += 1
                                             if last_good_arr is not None:

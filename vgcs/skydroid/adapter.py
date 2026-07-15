@@ -331,6 +331,35 @@ class SkydroidTopUdpAdapter:
             "on",
         )
 
+    def _m13_should_center_before_track(self, dyaw: float, dpitch: float) -> bool:
+        """Center gimbal on click before GOT+SUM (C13 follow needs target near boresight)."""
+        if str(os.environ.get("VGCS_M13_NO_CENTER", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return False
+        if self._m13_pre_slew_enabled():
+            return True
+        return self._expected_offset_deg(dyaw, dpitch) >= 1.5
+
+    def _m13_sum_confirm_only(self, *, log: bool = False) -> None:
+        confirm = build_sum_track(confirm=True)
+        self._transport.send_and_receive(
+            confirm, expect_reply=False, log=bool(log), timeout_s=0.06
+        )
+
+    def refresh_visual_track_keepalive(self) -> None:
+        """Re-send SUM confirm so C13 firmware keeps visual follow alive."""
+        if not self.is_visual_track_active():
+            return
+        try:
+            self._ensure_active_transport()
+            self._m13_sum_confirm_only(log=False)
+        except Exception:
+            pass
+
     def _m13_arm_visual_track_at_pixel(
         self,
         x_px: int,
@@ -339,29 +368,32 @@ class SkydroidTopUdpAdapter:
         *,
         fw: int,
         fh: int,
+        got_x: int | None = None,
+        got_y: int | None = None,
     ) -> bool:
-        """GOT at click + SUM confirm — C13 firmware slews and follows (PROTOCAL §3.3.4–5)."""
+        """GOT + SUM confirm — C13 firmware tracks and follows."""
+        gx = int(got_x if got_x is not None else x_px)
+        gy = int(got_y if got_y is not None else y_px)
         try:
-            stop = build_sum_track(confirm=False)
-            self._transport.send_and_receive(
-                stop, expect_reply=False, log=False, timeout_s=0.06
-            )
-            time.sleep(0.05)
-            got = build_got_target(x_px, y_px, frame_w=fw, frame_h=fh)
+            if self.is_visual_track_active():
+                stop = build_sum_track(confirm=False)
+                self._transport.send_and_receive(
+                    stop, expect_reply=False, log=False, timeout_s=0.06
+                )
+                time.sleep(0.05)
+            got = build_got_target(gx, gy, frame_w=fw, frame_h=fh)
             self._transport.send_and_receive(
                 got, expect_reply=False, log=True, timeout_s=0.06
             )
             time.sleep(0.08)
-            confirm = build_sum_track(confirm=True)
-            self._transport.send_and_receive(
-                confirm, expect_reply=False, log=True, timeout_s=0.06
-            )
+            self._m13_sum_confirm_only(log=True)
             with self._status_lock:
                 self._visual_track_active = True
                 self._visual_track_lock_att = att_now
                 self._visual_track_start_mono = time.monotonic()
             print(
-                f"[VGCS:m13] visual track armed GOT=({x_px},{y_px}) att={att_now}"
+                f"[VGCS:m13] visual track armed GOT=({gx},{gy}) "
+                f"click=({x_px},{y_px}) att={att_now}"
             )
             return True
         except Exception as exc:
@@ -471,26 +503,38 @@ class SkydroidTopUdpAdapter:
         self._ensure_active_transport()
         att_now = self._read_gimbal_attitude_deg()
         dyaw, dpitch = self._pixel_boresight_offset_deg(x_px, y_px, fw=fw, fh=fh)
+        center_first = self._m13_should_center_before_track(dyaw, dpitch)
         print(
             f"[VGCS:m13] track start px=({x_px},{y_px}) "
             f"click=({u_in:.3f},{v_in:.3f}) frame=({u:.3f},{v:.3f}) "
             f"att={att_now} offset=({dyaw:.1f}°,{dpitch:.1f}°) "
-            f"pre_slew={self._m13_pre_slew_enabled()}"
+            f"center_first={center_first}"
         )
-        if self._m13_pre_slew_enabled() and (
-            abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2
-        ):
+        got_x = x_px
+        got_y = y_px
+        if center_first and (abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2):
             att_after, aim_ok = self._m13_slew_gimbal_to_click(x_px, y_px, att_now)
-            if not aim_ok:
+            if aim_ok:
+                att_now = att_after or att_now
+                got_x = fw // 2
+                got_y = fh // 2
                 print(
-                    "[VGCS:m13] pre-slew failed — arming track at click anyway "
-                    f"(set VGCS_M13_PRE_SLEW=0 to skip slew)"
+                    f"[VGCS:m13] centered on target — GOT will use boresight "
+                    f"({got_x},{got_y})"
                 )
             else:
-                att_now = att_after or att_now
+                print(
+                    "[VGCS:m13] center slew incomplete — arming GOT at click pixel"
+                )
             time.sleep(0.06)
         return self._m13_arm_visual_track_at_pixel(
-            x_px, y_px, att_now, fw=fw, fh=fh
+            x_px,
+            y_px,
+            att_now,
+            fw=fw,
+            fh=fh,
+            got_x=got_x,
+            got_y=got_y,
         )
 
     def stop_visual_track(self) -> None:

@@ -19,6 +19,7 @@ _M13_GEO_MIN_INTERVAL_S = 1.0
 _M13_SLR_FRESH_INTERVAL_S = 3.0
 _M13_FOLLOW_WARN_AFTER_S = 6.0
 _M13_FOLLOW_MOVE_DEG = 0.8
+_M13_SUM_KEEPALIVE_TICKS = 10  # 200ms timer → 2s
 
 
 class M13MovingTargetTrackMixin:
@@ -153,6 +154,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_follow_seen = False
         self._m13_track_follow_warned = False
         self._m13_track_slr_fresh_mono = 0.0
+        self._m13_track_keepalive_ticks = 0
         self._sync_m13_track_button()
         self._refresh_m13_track_overlay()
         QTimer.singleShot(0, lambda: self._update_m13_track_geo(force=True))
@@ -228,6 +230,16 @@ class M13MovingTargetTrackMixin:
             self._sync_m13_track_button()
             return
         notify_companion_preview_motion(duration_s=120.0)
+        ticks = int(getattr(self, "_m13_track_keepalive_ticks", 0) or 0) + 1
+        self._m13_track_keepalive_ticks = ticks
+        if ticks >= _M13_SUM_KEEPALIVE_TICKS:
+            self._m13_track_keepalive_ticks = 0
+            keep_fn = getattr(cc, "refresh_visual_track_keepalive", None)
+            if callable(keep_fn):
+                try:
+                    keep_fn()
+                except Exception:
+                    pass
         self._update_m13_track_geo(force=False)
         self._m13_check_gimbal_follow()
         self._refresh_m13_track_overlay()
@@ -424,9 +436,7 @@ class M13MovingTargetTrackMixin:
             return
         click = getattr(self, "_m13_track_click_uv", None)
         u, v = (0.5, 0.5)
-        if active:
-            u, v = 0.5, 0.5
-        elif isinstance(click, tuple):
+        if isinstance(click, tuple):
             u, v = float(click[0]), float(click[1])
         dist = getattr(self, "_m13_track_range_m", None)
         label = str(getattr(self, "_m13_track_geo_label", "") or "")

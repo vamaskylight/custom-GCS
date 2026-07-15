@@ -514,6 +514,14 @@ class SkydroidCameraControl:
             return False
         return False
 
+    def refresh_visual_track_keepalive(self) -> None:
+        try:
+            fn = getattr(self._adapter, "refresh_visual_track_keepalive", None)
+            if callable(fn):
+                fn()
+        except Exception:
+            pass
+
     def query_slr_distance_m(self, *, fresh: bool = True) -> float | None:
         try:
             fn = getattr(self._adapter, "query_slr_distance_m", None)
