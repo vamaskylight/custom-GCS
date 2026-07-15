@@ -35,6 +35,8 @@ _companion_decode_gate: Callable[[str], bool] | None = None
 
 # LRF click-to-aim — block RTSP reconnect churn for the full lock (often 30–60s).
 _companion_lrf_lock_session: bool = False
+# M13 visual track — same RTSP/motion guard while gimbal slews and follows.
+_companion_visual_track_session: bool = False
 
 
 def notify_companion_lrf_lock(*, active: bool) -> None:
@@ -45,8 +47,20 @@ def notify_companion_lrf_lock(*, active: bool) -> None:
         notify_companion_preview_motion(duration_s=120.0)
 
 
+def notify_companion_visual_track(*, active: bool) -> None:
+    """Hold RTSP steady while M13 slews gimbal and firmware tracks the target."""
+    global _companion_visual_track_session
+    _companion_visual_track_session = bool(active)
+    if active:
+        notify_companion_preview_motion(duration_s=180.0)
+
+
 def _companion_lrf_lock_active() -> bool:
     return bool(_companion_lrf_lock_session)
+
+
+def _companion_gimbal_session_active() -> bool:
+    return _companion_lrf_lock_active() or bool(_companion_visual_track_session)
 
 
 def notify_companion_preview_motion(*, duration_s: float = 2.5) -> None:
@@ -2833,7 +2847,7 @@ class RtspSource(QObject):
                                                 _companion_stale_preview_reconnect_enabled()
                                                 and bool(self._ffmpeg_had_frame)
                                                 and not motion_preview
-                                                and not _companion_lrf_lock_active()
+                                                and not _companion_gimbal_session_active()
                                                 and not _companion_app_is_background()
                                                 and corrupt_skip_streak >= stale_thr
                                                 and stale_now
@@ -2884,7 +2898,7 @@ class RtspSource(QObject):
                                                 _companion_corrupt_streak_reconnect_enabled()
                                                 and bool(self._ffmpeg_had_frame)
                                                 and not motion_preview
-                                                and not _companion_lrf_lock_active()
+                                                and not _companion_gimbal_session_active()
                                                 and not _companion_app_is_background()
                                                 and corrupt_skip_streak >= corrupt_thr
                                                 and stale_now - corrupt_last >= corrupt_cooldown
