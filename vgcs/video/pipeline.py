@@ -52,7 +52,7 @@ def notify_companion_visual_track(*, active: bool) -> None:
     global _companion_visual_track_session
     _companion_visual_track_session = bool(active)
     if active:
-        notify_companion_preview_motion(duration_s=180.0)
+        notify_companion_preview_motion(duration_s=600.0)
 
 
 def _companion_lrf_lock_active() -> bool:

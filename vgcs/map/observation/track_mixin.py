@@ -55,6 +55,7 @@ class M13MovingTargetTrackMixin:
             btn.blockSignals(False)
         self._refresh_m13_track_overlay()
         if on and not self._m13_track_is_active():
+            notify_companion_preview_motion(duration_s=120.0)
             self._set_status("M13 track — click target on video to lock and follow")
             QTimer.singleShot(0, self._raise_flight_hud_above_video)
         elif not on and not self._m13_track_is_active():
@@ -80,6 +81,11 @@ class M13MovingTargetTrackMixin:
         if bool(getattr(self, "_m13_track_starting", False)):
             self._set_status("M13 track — wait for current lock to finish")
             return
+        cc = getattr(self, "_camera_control", None)
+        busy_fn = getattr(cc, "is_m13_track_start_in_progress", None)
+        if callable(busy_fn) and bool(busy_fn()):
+            self._set_status("M13 track — wait for current lock to finish")
+            return
         if self._m13_track_is_active():
             self._stop_m13_track()
         if self._c13_lrf_is_locked():
@@ -94,10 +100,12 @@ class M13MovingTargetTrackMixin:
         self._m13_track_starting = True
         self._m13_track_generation = int(getattr(self, "_m13_track_generation", 0) or 0) + 1
         gen = int(self._m13_track_generation)
+        self._m13_track_inflight_gen = gen
         self._sync_m13_track_button()
         self._refresh_m13_track_overlay(pending=True)
         notify_companion_visual_track(active=True)
-        self._set_status("M13 track — slewing gimbal and locking target…")
+        notify_companion_preview_motion(duration_s=300.0)
+        self._set_status("M13 track — locking target on C13…")
         cc = getattr(self, "_camera_control", None)
         bridge = getattr(self, "_m13_track_bridge", None)
         if cc is None or bridge is None:
@@ -109,13 +117,17 @@ class M13MovingTargetTrackMixin:
         QThreadPool.globalInstance().start(task)
 
     def _on_m13_track_started(self, ok: bool, u: float, v: float, generation: int = 0) -> None:
-        if int(generation or 0) != int(getattr(self, "_m13_track_generation", 0) or 0):
+        gen = int(generation or 0)
+        inflight = int(getattr(self, "_m13_track_inflight_gen", 0) or 0)
+        current = int(getattr(self, "_m13_track_generation", 0) or 0)
+        if gen == inflight:
+            self._m13_track_starting = False
+        if gen != current:
             print(
-                f"[VGCS:m13] ignoring stale track result gen={generation} "
-                f"current={getattr(self, '_m13_track_generation', 0)}"
+                f"[VGCS:m13] ignoring stale track result gen={gen} "
+                f"current={current} inflight={inflight}"
             )
             return
-        self._m13_track_starting = False
         if not ok:
             self._m13_track_active = False
             notify_companion_visual_track(active=False)
@@ -143,7 +155,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_slr_fresh_mono = 0.0
         self._sync_m13_track_button()
         self._refresh_m13_track_overlay()
-        self._update_m13_track_geo(force=True)
+        QTimer.singleShot(0, lambda: self._update_m13_track_geo(force=True))
         self._sync_m13_track_timer()
         self._set_status("M13 tracking — gimbal follow active")
 
@@ -215,7 +227,8 @@ class M13MovingTargetTrackMixin:
             self._refresh_m13_track_overlay()
             self._sync_m13_track_button()
             return
-        self._update_m13_track_geo()
+        notify_companion_preview_motion(duration_s=120.0)
+        self._update_m13_track_geo(force=False)
         self._m13_check_gimbal_follow()
         self._refresh_m13_track_overlay()
 

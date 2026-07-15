@@ -320,6 +320,57 @@ class SkydroidTopUdpAdapter:
         with self._status_lock:
             return bool(self._visual_track_active)
 
+    def m13_track_start_in_progress(self) -> bool:
+        return bool(self._m13_track_start_lock.locked())
+
+    def _m13_pre_slew_enabled(self) -> bool:
+        return str(os.environ.get("VGCS_M13_PRE_SLEW", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _m13_arm_visual_track_at_pixel(
+        self,
+        x_px: int,
+        y_px: int,
+        att_now: tuple[float, float] | None,
+        *,
+        fw: int,
+        fh: int,
+    ) -> bool:
+        """GOT at click + SUM confirm — C13 firmware slews and follows (PROTOCAL §3.3.4–5)."""
+        try:
+            stop = build_sum_track(confirm=False)
+            self._transport.send_and_receive(
+                stop, expect_reply=False, log=False, timeout_s=0.06
+            )
+            time.sleep(0.05)
+            got = build_got_target(x_px, y_px, frame_w=fw, frame_h=fh)
+            self._transport.send_and_receive(
+                got, expect_reply=False, log=True, timeout_s=0.06
+            )
+            time.sleep(0.08)
+            confirm = build_sum_track(confirm=True)
+            self._transport.send_and_receive(
+                confirm, expect_reply=False, log=True, timeout_s=0.06
+            )
+            with self._status_lock:
+                self._visual_track_active = True
+                self._visual_track_lock_att = att_now
+                self._visual_track_start_mono = time.monotonic()
+            print(
+                f"[VGCS:m13] visual track armed GOT=({x_px},{y_px}) att={att_now}"
+            )
+            return True
+        except Exception as exc:
+            print(f"[VGCS:m13] visual track arm failed: {exc}")
+            with self._status_lock:
+                self._visual_track_active = False
+                self._visual_track_lock_att = None
+            return False
+
     def _m13_slew_gimbal_to_click(
         self,
         x_px: int,
@@ -423,59 +474,24 @@ class SkydroidTopUdpAdapter:
         print(
             f"[VGCS:m13] track start px=({x_px},{y_px}) "
             f"click=({u_in:.3f},{v_in:.3f}) frame=({u:.3f},{v:.3f}) "
-            f"att={att_now} offset=({dyaw:.1f}°,{dpitch:.1f}°)"
+            f"att={att_now} offset=({dyaw:.1f}°,{dpitch:.1f}°) "
+            f"pre_slew={self._m13_pre_slew_enabled()}"
         )
-        if abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2:
+        if self._m13_pre_slew_enabled() and (
+            abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2
+        ):
             att_after, aim_ok = self._m13_slew_gimbal_to_click(x_px, y_px, att_now)
             if not aim_ok:
                 print(
-                    "[VGCS:m13] track aborted — gimbal could not aim at click "
-                    "(use rail arrows to verify gimbal motion, then retry)"
+                    "[VGCS:m13] pre-slew failed — arming track at click anyway "
+                    f"(set VGCS_M13_PRE_SLEW=0 to skip slew)"
                 )
-                with self._status_lock:
-                    self._visual_track_active = False
-                    self._visual_track_lock_att = None
-                return False
-            att_now = att_after or att_now
-            time.sleep(0.1)
-            self._gimbal_stop_hard()
-            time.sleep(0.08)
-        else:
-            print("[VGCS:m13] target near boresight — skipping pre-track slew")
-        got_x = x_px
-        got_y = y_px
-        if abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2:
-            got_x = fw // 2
-            got_y = fh // 2
-        try:
-            stop = build_sum_track(confirm=False)
-            self._transport.send_and_receive(
-                stop, expect_reply=False, log=False, timeout_s=0.08
-            )
-            time.sleep(0.08)
-            got = build_got_target(got_x, got_y, frame_w=fw, frame_h=fh)
-            self._transport.send_and_receive(
-                got, expect_reply=False, log=True, timeout_s=0.08
-            )
-            time.sleep(0.12)
-            confirm = build_sum_track(confirm=True)
-            self._transport.send_and_receive(
-                confirm, expect_reply=False, log=True, timeout_s=0.08
-            )
-            with self._status_lock:
-                self._visual_track_active = True
-                self._visual_track_lock_att = att_now
-                self._visual_track_start_mono = time.monotonic()
-            print(
-                f"[VGCS:m13] visual track armed GOT=({got_x},{got_y}) att={att_now}"
-            )
-            return True
-        except Exception as exc:
-            print(f"[VGCS:m13] visual track start failed: {exc}")
-            with self._status_lock:
-                self._visual_track_active = False
-                self._visual_track_lock_att = None
-            return False
+            else:
+                att_now = att_after or att_now
+            time.sleep(0.06)
+        return self._m13_arm_visual_track_at_pixel(
+            x_px, y_px, att_now, fw=fw, fh=fh
+        )
 
     def stop_visual_track(self) -> None:
         """M13 — SUM stop (does not clear LRF lock state)."""
