@@ -8,7 +8,10 @@ from vgcs.map.native_video_overlay import VideoOverlayM13Track
 from vgcs.map.observation.types import M13TrackBridge, M13TrackStartTask
 from vgcs.observe.geo_reference import compute_lrf_slant_geo
 from vgcs.video.camera_control import uses_skydroid_top_camera
-from vgcs.video.pipeline import notify_companion_visual_track
+from vgcs.video.pipeline import (
+    notify_companion_preview_motion,
+    notify_companion_visual_track,
+)
 
 
 _M13_PATH_MAX_POINTS = 400
@@ -89,6 +92,8 @@ class M13MovingTargetTrackMixin:
         self._m13_track_ref_att = att
         self._m13_track_armed = True
         self._m13_track_starting = True
+        self._m13_track_generation = int(getattr(self, "_m13_track_generation", 0) or 0) + 1
+        gen = int(self._m13_track_generation)
         self._sync_m13_track_button()
         self._refresh_m13_track_overlay(pending=True)
         notify_companion_visual_track(active=True)
@@ -100,10 +105,16 @@ class M13MovingTargetTrackMixin:
             notify_companion_visual_track(active=False)
             self._set_status("M13 track failed — no camera control")
             return
-        task = M13TrackStartTask(cc, float(u), float(v), bridge)
+        task = M13TrackStartTask(cc, float(u), float(v), bridge, generation=gen)
         QThreadPool.globalInstance().start(task)
 
-    def _on_m13_track_started(self, ok: bool, u: float, v: float) -> None:
+    def _on_m13_track_started(self, ok: bool, u: float, v: float, generation: int = 0) -> None:
+        if int(generation or 0) != int(getattr(self, "_m13_track_generation", 0) or 0):
+            print(
+                f"[VGCS:m13] ignoring stale track result gen={generation} "
+                f"current={getattr(self, '_m13_track_generation', 0)}"
+            )
+            return
         self._m13_track_starting = False
         if not ok:
             self._m13_track_active = False
@@ -195,6 +206,7 @@ class M13MovingTargetTrackMixin:
         if not self._m13_track_is_active():
             self._sync_m13_track_timer()
             return
+        notify_companion_preview_motion(duration_s=60.0)
         cc = getattr(self, "_camera_control", None)
         active_fn = getattr(cc, "is_target_track_active", None)
         if callable(active_fn) and not bool(active_fn()):
@@ -225,6 +237,7 @@ class M13MovingTargetTrackMixin:
             return
         if dy > _M13_FOLLOW_MOVE_DEG or dp > _M13_FOLLOW_MOVE_DEG:
             self._m13_track_follow_seen = True
+            notify_companion_preview_motion(duration_s=60.0)
         start_mono = float(getattr(self, "_m13_track_start_mono", 0.0) or 0.0)
         if start_mono <= 0.0:
             return
@@ -276,7 +289,7 @@ class M13MovingTargetTrackMixin:
             return
         self._m13_track_geo_mono = now
         last_fresh = float(getattr(self, "_m13_track_slr_fresh_mono", 0.0) or 0.0)
-        want_fresh = bool(force) or (now - last_fresh) >= _M13_SLR_FRESH_INTERVAL_S
+        want_fresh = bool(force) and (now - last_fresh) >= _M13_SLR_FRESH_INTERVAL_S
         if want_fresh:
             self._m13_track_slr_fresh_mono = now
         dist = self._query_m13_track_range_m(fresh=want_fresh)

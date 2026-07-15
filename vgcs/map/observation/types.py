@@ -50,18 +50,27 @@ class PendingLrfVideoPick:
 
 
 class M13TrackBridge(QObject):
-    started = Signal(bool, float, float)  # ok, u, v
+    started = Signal(bool, float, float, int)  # ok, u, v, generation
 
 
 class M13TrackStartTask(QRunnable):
     """GOT + SUM confirm on worker thread (M13 visual track)."""
 
-    def __init__(self, cc: object, u: float, v: float, bridge: M13TrackBridge) -> None:
+    def __init__(
+        self,
+        cc: object,
+        u: float,
+        v: float,
+        bridge: M13TrackBridge,
+        *,
+        generation: int = 0,
+    ) -> None:
         super().__init__()
         self._cc = cc
         self._u = float(u)
         self._v = float(v)
         self._bridge = bridge
+        self._generation = int(generation)
 
     def run(self) -> None:
         ok = False
@@ -80,7 +89,9 @@ class M13TrackStartTask(QRunnable):
             print(f"[VGCS:m13] track start failed: {exc}")
             ok = False
         try:
-            self._bridge.started.emit(bool(ok), self._u, self._v)
+            self._bridge.started.emit(
+                bool(ok), self._u, self._v, int(self._generation)
+            )
         except Exception:
             pass
 

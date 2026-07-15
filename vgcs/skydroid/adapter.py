@@ -219,6 +219,7 @@ class SkydroidTopUdpAdapter:
         self._visual_track_active = False
         self._visual_track_lock_att: tuple[float, float] | None = None
         self._visual_track_start_mono: float = 0.0
+        self._m13_track_start_lock = threading.Lock()
         self._active_port = int(port)
         self._transport.set_datagram_handler(self._maybe_update_status)
 
@@ -325,29 +326,56 @@ class SkydroidTopUdpAdapter:
         y_px: int,
         att_now: tuple[float, float] | None,
     ) -> tuple[tuple[float, float] | None, bool]:
-        """Slew to click via GSY/GSP/GAY/GAP — C13 field units ignore GAM."""
+        """Fast slew for M13 — bulk GAY/GAP + GSY/GSP bursts (not full LRF align loop)."""
         if att_now is None:
             att_now = self._read_gimbal_attitude_deg()
         if att_now is None:
             print("[VGCS:m13] slew skipped — no GAC attitude")
             return None, False
+        att_start = att_now
+        dyaw, dpitch = self._pixel_boresight_offset_deg(x_px, y_px)
+        need = self._expected_offset_deg(dyaw, dpitch)
+        if need < 0.25:
+            return att_start, True
+        yaw_tgt = self._gimbal_yaw_target_deg(float(att_start[0]), float(dyaw))
+        pitch_tgt = self._gimbal_pitch_target_deg(float(att_start[1]), float(dpitch))
         print(
-            f"[VGCS:m13] slew to click px=({x_px},{y_px}) "
-            f"att={att_now} (GSY/GSP align, not GAM)"
+            f"[VGCS:m13] fast slew px=({x_px},{y_px}) att={att_start} "
+            f"-> ({yaw_tgt:.1f},{pitch_tgt:.1f}) offset=({dyaw:.1f}°,{dpitch:.1f}°)"
         )
-        att_after, ok, _, _ = self._align_laser_boresight_to_pixel(
-            x_px, y_px, att_now
+        att_work: tuple[float, float] = att_start
+        if need >= float(_LRF_ALIGN_BULK_MIN_DEG):
+            att_work = self._align_bulk_goto(
+                float(yaw_tgt), float(pitch_tgt), att_work, spd=8.0
+            )
+        self._drop_pending_motion_commands()
+        att_after = self._slew_gimbal_open_loop_offset(
+            float(dyaw), float(dpitch), att_work, speed_dps=5.0
         )
-        move = (
-            self._gimbal_total_move_deg(att_now, att_after)
-            if att_after is not None
-            else 0.0
+        self._gimbal_stop_hard()
+        att_final = att_after or att_work
+        click_u, click_v = self._click_uv_from_px(x_px, y_px)
+        bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
+            click_u,
+            click_v,
+            att_start,
+            att_final,
+            dpitch_image=float(dpitch),
+            dyaw_image=float(dyaw),
         )
+        u_tol, v_tol = self._boresight_tol_for_click(
+            float(dpitch), dyaw_image=float(dyaw)
+        )
+        ok = bool(bore_ok) or (
+            abs(float(u_chk) - 0.5) <= float(u_tol) * 2.5
+            and abs(float(v_chk) - 0.5) <= float(v_tol) * 2.5
+        )
+        move = self._gimbal_total_move_deg(att_start, att_final)
         print(
-            f"[VGCS:m13] slew done att={att_now}->{att_after} "
-            f"move={move:.1f}° ok={ok}"
+            f"[VGCS:m13] fast slew done att={att_start}->{att_final} "
+            f"move={move:.1f}° verify=({u_chk:.3f},{v_chk:.3f}) ok={ok}"
         )
-        return att_after, bool(ok)
+        return att_final, bool(ok)
 
     def start_visual_track_at_norm(
         self,
@@ -358,6 +386,25 @@ class SkydroidTopUdpAdapter:
         frame_h: int = _LRF_FRAME_H,
     ) -> bool:
         """M13 — slew gimbal to click, then GOT + SUM confirm for firmware follow."""
+        if not self._m13_track_start_lock.acquire(blocking=False):
+            print("[VGCS:m13] track start skipped — another track lock in progress")
+            return False
+        try:
+            return self._start_visual_track_at_norm_locked(
+                u, v, frame_w=frame_w, frame_h=frame_h
+            )
+        finally:
+            self._m13_track_start_lock.release()
+
+    def _start_visual_track_at_norm_locked(
+        self,
+        u: float,
+        v: float,
+        *,
+        frame_w: int = _LRF_FRAME_W,
+        frame_h: int = _LRF_FRAME_H,
+    ) -> bool:
+        """M13 track body — caller must hold ``_m13_track_start_lock``."""
         if not self.gimbal_telemetry_ok():
             print("[VGCS:m13] track skipped — no gimbal telemetry (GAC)")
             return False
@@ -395,15 +442,18 @@ class SkydroidTopUdpAdapter:
             time.sleep(0.08)
         else:
             print("[VGCS:m13] target near boresight — skipping pre-track slew")
-        cx = fw // 2
-        cy = fh // 2
+        got_x = x_px
+        got_y = y_px
+        if abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2:
+            got_x = fw // 2
+            got_y = fh // 2
         try:
             stop = build_sum_track(confirm=False)
             self._transport.send_and_receive(
                 stop, expect_reply=False, log=False, timeout_s=0.08
             )
             time.sleep(0.08)
-            got = build_got_target(cx, cy, frame_w=fw, frame_h=fh)
+            got = build_got_target(got_x, got_y, frame_w=fw, frame_h=fh)
             self._transport.send_and_receive(
                 got, expect_reply=False, log=True, timeout_s=0.08
             )
@@ -417,7 +467,7 @@ class SkydroidTopUdpAdapter:
                 self._visual_track_lock_att = att_now
                 self._visual_track_start_mono = time.monotonic()
             print(
-                f"[VGCS:m13] visual track armed GOT=({cx},{cy}) att={att_now}"
+                f"[VGCS:m13] visual track armed GOT=({got_x},{got_y}) att={att_now}"
             )
             return True
         except Exception as exc:
