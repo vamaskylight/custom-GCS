@@ -20,6 +20,8 @@ _M13_SLR_FRESH_INTERVAL_S = 3.0
 _M13_FOLLOW_WARN_AFTER_S = 6.0
 _M13_FOLLOW_MOVE_DEG = 0.8
 _M13_SUM_KEEPALIVE_TICKS = 10  # 200ms timer → 2s
+_M13_VIDEO_STALL_S = 2.5
+_M13_VIDEO_NUDGE_MIN_S = 8.0
 
 
 class M13MovingTargetTrackMixin:
@@ -242,7 +244,55 @@ class M13MovingTargetTrackMixin:
                     pass
         self._update_m13_track_geo(force=False)
         self._m13_check_gimbal_follow()
+        self._m13_nudge_video_during_track()
         self._refresh_m13_track_overlay()
+
+    def _m13_nudge_video_during_track(self) -> None:
+        if not self._m13_track_is_active():
+            return
+        import time
+
+        now = time.monotonic()
+        last_nudge = float(getattr(self, "_m13_video_nudge_mono", 0.0) or 0.0)
+        if now - last_nudge < _M13_VIDEO_NUDGE_MIN_S:
+            return
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(
+            self, "_video", None
+        )
+        if vp is None:
+            return
+        stale_age = 0.0
+        stale_src = None
+        try:
+            for sid in ("day",):
+                src = vp.sources().get(sid)
+                if src is None:
+                    continue
+                last_frame = float(getattr(src, "_ffmpeg_last_frame_mono", 0.0) or 0.0)
+                if last_frame <= 0.0:
+                    continue
+                age = now - last_frame
+                if age >= _M13_VIDEO_STALL_S and age > stale_age:
+                    stale_age = age
+                    stale_src = src
+        except Exception:
+            return
+        if stale_src is None:
+            return
+        self._m13_video_nudge_mono = now
+        notify_companion_preview_motion(duration_s=180.0)
+        try:
+            print(
+                f"[VGCS:m13] video stall during track ({stale_age:.1f}s) "
+                "— RTSP decode refresh"
+            )
+        except Exception:
+            pass
+        try:
+            if hasattr(stale_src, "restart_decode"):
+                stale_src.restart_decode(delay_ms=600)
+        except Exception:
+            pass
 
     def _m13_check_gimbal_follow(self) -> None:
         if not self._m13_track_is_active():

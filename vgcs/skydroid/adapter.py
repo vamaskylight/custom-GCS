@@ -435,7 +435,7 @@ class SkydroidTopUdpAdapter:
         att_after = self._slew_gimbal_open_loop_offset(
             float(dyaw), float(dpitch), att_work, speed_dps=5.0
         )
-        self._gimbal_stop_hard()
+        self._m13_gimbal_stop_light()
         att_final = att_after or att_work
         click_u, click_v = self._click_uv_from_px(x_px, y_px)
         bore_ok, u_chk, v_chk = self._verify_click_on_boresight(
@@ -459,6 +459,19 @@ class SkydroidTopUdpAdapter:
             f"move={move:.1f}° verify=({u_chk:.3f},{v_chk:.3f}) ok={ok}"
         )
         return att_final, bool(ok)
+
+    def _m13_gimbal_stop_light(self) -> None:
+        """Brief GSM stop after M13 slew — avoid long stop bursts that stall C13 RTSP."""
+        self._ensure_active_transport()
+        stop = build_gimbal_speed(0.0, 0.0)
+        for _ in range(2):
+            try:
+                self._transport.send_and_receive(
+                    stop, expect_reply=False, log=False, timeout_s=0.04
+                )
+            except Exception:
+                pass
+            time.sleep(0.04)
 
     def start_visual_track_at_norm(
         self,
