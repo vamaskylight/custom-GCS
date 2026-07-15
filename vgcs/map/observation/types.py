@@ -96,6 +96,46 @@ class M13TrackStartTask(QRunnable):
             pass
 
 
+class M13RangeBridge(QObject):
+    ready = Signal(object, int)  # slant_range_m | None, generation
+
+
+class M13RangeTask(QRunnable):
+    """Fire/read the C13 SLR off the GUI thread during an M13 track.
+
+    The laser distance register only advances when re-triggered (fresh=True), so
+    a moving target needs periodic fresh shots. Doing the trigger + settle sleeps
+    inline on the 200 ms GUI timer would stall the video/map, so the read runs on
+    a worker and the range is posted back for the geo update.
+    """
+
+    def __init__(
+        self,
+        range_fn,
+        bridge: "M13RangeBridge",
+        *,
+        fresh: bool,
+        generation: int,
+    ) -> None:
+        super().__init__()
+        self._range_fn = range_fn
+        self._bridge = bridge
+        self._fresh = bool(fresh)
+        self._generation = int(generation)
+
+    def run(self) -> None:
+        dist = None
+        try:
+            dist = self._range_fn(fresh=self._fresh)
+        except Exception as exc:
+            print(f"[VGCS:m13] range fetch failed: {exc}")
+            dist = None
+        try:
+            self._bridge.ready.emit(dist, int(self._generation))
+        except Exception:
+            pass
+
+
 class LrfLockBridge(QObject):
     finished = Signal(object, float, float)  # distance_m | None, u, v
     progress = Signal(float)  # live SLR sample while locking
@@ -391,6 +431,8 @@ class ObservationExportTask(QRunnable):
 __all__ = [
     "LrfLockBridge",
     "LrfLockTask",
+    "M13RangeBridge",
+    "M13RangeTask",
     "M13TrackBridge",
     "M13TrackStartTask",
     "ObservationExportBridge",

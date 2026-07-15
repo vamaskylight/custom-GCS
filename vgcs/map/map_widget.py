@@ -772,6 +772,7 @@ from vgcs.map.surface.tile_probe import _TileProbeBridge, _TileProbeTask
 from vgcs.map.observation.types import (
     LrfLockBridge,
     LrfLockTask,
+    M13RangeBridge,
     M13TrackBridge,
     ObservationExportBridge,
     ObservationSnapshotBridge,
@@ -917,11 +918,16 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._m13_track_alt_m: float | None = None
         self._m13_track_geo_label = ""
         self._m13_track_range_m: float | None = None
+        self._m13_track_range_att: tuple[float, float] | None = None
+        self._m13_track_geo_uncertain = False
         self._m13_track_path: list[tuple[float, float]] = []
         self._m13_track_geo_mono = 0.0
         self._m13_track_timer: QTimer | None = None
         self._m13_track_bridge = M13TrackBridge(self)
         self._m13_track_bridge.started.connect(self._on_m13_track_started)
+        self._m13_range_bridge = M13RangeBridge(self)
+        self._m13_range_bridge.ready.connect(self._on_m13_range_ready)
+        self._m13_range_task_inflight = False
         self._video_ui_render_mono = 0.0
         self._split_ui_render_mono = 0.0
         self._split_cache_mono: dict[str, float] = {}
