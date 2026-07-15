@@ -526,6 +526,8 @@ class SkydroidTopUdpAdapter:
         got_x = x_px
         got_y = y_px
         if center_first and (abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2):
+            yaw_tgt = self._gimbal_yaw_target_deg(float(att_now[0]), float(dyaw))
+            pitch_tgt = self._gimbal_pitch_target_deg(float(att_now[1]), float(dpitch))
             att_after, aim_ok = self._m13_slew_gimbal_to_click(x_px, y_px, att_now)
             if aim_ok:
                 att_now = att_after or att_now
@@ -536,8 +538,14 @@ class SkydroidTopUdpAdapter:
                     f"({got_x},{got_y})"
                 )
             else:
+                att_now = att_after or att_now
+                got_x, got_y = self._m13_residual_pixel(
+                    yaw_tgt, pitch_tgt, att_now, fw=fw, fh=fh
+                )
                 print(
-                    "[VGCS:m13] center slew incomplete — arming GOT at click pixel"
+                    "[VGCS:m13] center slew incomplete — re-aiming GOT at "
+                    f"estimated pixel ({got_x},{got_y}) after partial slew "
+                    f"(was click pixel ({x_px},{y_px}))"
                 )
             time.sleep(0.06)
         return self._m13_arm_visual_track_at_pixel(
@@ -615,6 +623,36 @@ class SkydroidTopUdpAdapter:
         dyaw = ox * (_LRF_FOV_H_DEG / 2.0)
         dpitch = oy * (_LRF_FOV_V_DEG / 2.0)
         return float(dyaw), float(dpitch)
+
+    @staticmethod
+    def _m13_residual_pixel(
+        yaw_tgt: float,
+        pitch_tgt: float,
+        att_final: tuple[float, float],
+        *,
+        fw: int,
+        fh: int,
+    ) -> tuple[int, int]:
+        """Where the clicked target likely sits in the CURRENT frame after a
+        center-slew that did not fully converge (C13 has no track-box feedback,
+        so we cannot ask the firmware). Re-derives the pixel geometrically from
+        how far short of (yaw_tgt, pitch_tgt) the gimbal actually landed, rather
+        than reusing the pre-slew click pixel — which is wrong as soon as the
+        camera has moved at all, since the video frame has shifted under it.
+
+        Inverse of ``_pixel_boresight_offset_deg`` / ``_gimbal_*_target_deg``:
+        if the gimbal fully converged, the residual is 0 and this returns frame
+        centre; if it did not move at all, this returns the original click pixel.
+        """
+        dyaw_residual = float(att_final[0]) - float(yaw_tgt)
+        dpitch_residual = float(att_final[1]) - float(pitch_tgt)
+        ox = dyaw_residual / (_LRF_FOV_H_DEG / 2.0)
+        oy = dpitch_residual / (_LRF_FOV_V_DEG / 2.0)
+        rx = (float(fw) / 2.0) + ox * (float(fw) / 2.0)
+        ry = (float(fh) / 2.0) + oy * (float(fh) / 2.0)
+        x_px = max(0, min(int(fw), int(round(rx))))
+        y_px = max(0, min(int(fh), int(round(ry))))
+        return x_px, y_px
 
     def _ensure_active_transport(self) -> None:
         host = str(self._active_host or self._hosts[0] or "").strip()
