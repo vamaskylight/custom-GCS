@@ -68,6 +68,17 @@ def _companion_track_video_guard_active() -> bool:
     return bool(_companion_visual_track_session)
 
 
+def _companion_low_latency_drain_enabled() -> bool:
+    """Drop backlogged pipe frames so companion preview stays real-time.
+
+    On by default; set VGCS_COMPANION_LOWLATENCY_DRAIN=0 to disable (fall back to
+    reading every frame sequentially, which can drift behind real-time).
+    """
+    return str(
+        os.environ.get("VGCS_COMPANION_LOWLATENCY_DRAIN", "1") or "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
 def notify_companion_preview_motion(*, duration_s: float = 2.5) -> None:
     """Extend motion-preview window (gimbal slew — show live frames, do not hold stale preview)."""
     global _companion_preview_motion_until
@@ -1315,7 +1326,17 @@ def _ffmpeg_preflags_before_input(
                     ]
                 )
         if _rtsp_url_is_companion_rtsp(u):
-            out.extend(["-thread_queue_size", "512", "-max_delay", "500000"])
+            # -max_delay bounds the demux reorder window. 500ms added visible lag on
+            # the C13 live feed; 200ms still absorbs network jitter without the
+            # half-second baseline delay. Override with VGCS_COMPANION_MAX_DELAY_US.
+            try:
+                max_delay_us = int(
+                    str(os.environ.get("VGCS_COMPANION_MAX_DELAY_US", "200000") or "200000").strip()
+                )
+            except Exception:
+                max_delay_us = 200000
+            max_delay_us = max(0, min(1_000_000, max_delay_us))
+            out.extend(["-thread_queue_size", "512", "-max_delay", str(max_delay_us)])
             # Decoder opts must be before `-i` (after `-i` they apply to rawvideo output and fail).
             out.extend(["-threads", "1"])
         if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
@@ -2239,6 +2260,76 @@ class RtspSource(QObject):
             buf.extend(chunk)
         return bytes(buf) if len(buf) == n else None
 
+    def _pipe_bytes_available(self, stream) -> int:
+        """Best-effort count of bytes already buffered in the FFmpeg stdout pipe.
+
+        Used to drop backlogged frames so preview stays real-time (bounded
+        latency) instead of drifting behind — critical during M13 track, where
+        RTSP reconnect (which would otherwise flush the backlog) is disabled.
+        Returns 0 when it cannot be determined (never blocks).
+        """
+        try:
+            fileno = stream.fileno()
+        except Exception:
+            return 0
+        # Windows: PeekNamedPipe on the underlying OS handle.
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                import msvcrt
+
+                handle = msvcrt.get_osfhandle(fileno)
+                avail = wintypes.DWORD(0)
+                ok = ctypes.windll.kernel32.PeekNamedPipe(
+                    wintypes.HANDLE(handle),
+                    None,
+                    0,
+                    None,
+                    ctypes.byref(avail),
+                    None,
+                )
+                if not ok:
+                    return 0
+                return int(avail.value)
+            except Exception:
+                return 0
+        # POSIX: select with zero timeout only tells us readable, not count.
+        # Use FIONREAD ioctl for an actual byte count.
+        try:
+            import fcntl
+            import termios
+            import array
+
+            buf = array.array("i", [0])
+            fcntl.ioctl(fileno, termios.FIONREAD, buf, True)
+            return int(buf[0])
+        except Exception:
+            return 0
+
+    def _drain_stale_frames(self, stream, frame_bytes: int, *, max_drop: int = 8) -> bytes | None:
+        """Discard whole backlogged frames, returning the newest fully-buffered one.
+
+        Only consumes frames that are *already* sitting in the pipe buffer, so it
+        never blocks waiting for the camera. Bounds preview latency to ~1 frame
+        even when the decoder/UI briefly falls behind the stream FPS.
+        """
+        newest: bytes | None = None
+        dropped = 0
+        while dropped < max_drop and not self._ffmpeg_stop.is_set():
+            if self._pipe_bytes_available(stream) < frame_bytes:
+                break
+            frame = self._read_exact(stream, frame_bytes)
+            if frame is None:
+                return newest
+            newest = frame
+            dropped += 1
+        if dropped:
+            self._ffmpeg_drained_frames = int(
+                getattr(self, "_ffmpeg_drained_frames", 0) or 0
+            ) + dropped
+        return newest
+
     def _start_ffmpeg_stall_watchdog(
         self,
         proc: subprocess.Popen[bytes],
@@ -2678,6 +2769,18 @@ class RtspSource(QObject):
                                         continue
                                     break
                                 read_fail_streak = 0
+                                # Real-time preview: if FFmpeg has already buffered
+                                # newer frames in the pipe (decoder/UI fell behind the
+                                # stream FPS), skip to the newest one so latency stays
+                                # bounded. This is essential during M13 track, when the
+                                # RTSP reconnect that would otherwise flush a backlog is
+                                # intentionally disabled to protect the single client.
+                                if _companion_low_latency_drain_enabled():
+                                    newest = self._drain_stale_frames(
+                                        p.stdout, frame_bytes
+                                    )
+                                    if newest is not None:
+                                        raw = newest
                                 now_decode = time.monotonic()
                                 self._ffmpeg_last_decode_mono = now_decode
                                 try:
