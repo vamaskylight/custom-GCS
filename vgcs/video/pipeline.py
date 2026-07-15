@@ -63,6 +63,11 @@ def _companion_gimbal_session_active() -> bool:
     return _companion_lrf_lock_active() or bool(_companion_visual_track_session)
 
 
+def _companion_track_video_guard_active() -> bool:
+    """Live preview required during M13 track (never hold last frame)."""
+    return bool(_companion_visual_track_session)
+
+
 def notify_companion_preview_motion(*, duration_s: float = 2.5) -> None:
     """Extend motion-preview window (gimbal slew — show live frames, do not hold stale preview)."""
     global _companion_preview_motion_until
@@ -2441,7 +2446,7 @@ class RtspSource(QObject):
                     "[VGCS:video] companion HEVC: corrupt-streak reconnect enabled "
                     f"(streak>={_companion_corrupt_streak_reconnect_threshold()}, "
                     f"cooldown={_companion_corrupt_reconnect_cooldown_s():.0f}s; "
-                    "blocked during LRF lock; set VGCS_COMPANION_CORRUPT_RECONNECT=0 to disable)"
+                    "blocked during LRF/M13 track; set VGCS_COMPANION_CORRUPT_RECONNECT=0 to disable)"
                 )
             else:
                 print(
@@ -2725,9 +2730,14 @@ class RtspSource(QObject):
                                         or _companion_gimbal_session_active()
                                     )
                                 )
+                                track_video_guard = (
+                                    companion_rtsp
+                                    and _companion_track_video_guard_active()
+                                )
                                 if (
                                     companion_rtsp
                                     and not motion_preview
+                                    and not track_video_guard
                                     and now
                                     < float(hevc_glitch_hold.get("until_mono", 0.0) or 0.0)
                                 ):
@@ -2745,6 +2755,9 @@ class RtspSource(QObject):
                                     assert np is not None
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
                                     if companion_rtsp and not _companion_hevc_showall_enabled():
+                                        if track_video_guard:
+                                            session_gop_ready = True
+                                            corrupt_skip_streak = 0
                                         if not session_gop_ready:
                                             warmup_timeout = _companion_gop_warmup_timeout_frames(
                                                 source_id=self.source_id, url=url
@@ -2825,7 +2838,10 @@ class RtspSource(QObject):
                                             )
                                         if (
                                             companion_rtsp
-                                            and _companion_gimbal_session_active()
+                                            and (
+                                                _companion_gimbal_session_active()
+                                                or track_video_guard
+                                            )
                                         ):
                                             hide = False
                                             why = ""
