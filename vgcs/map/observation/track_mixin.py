@@ -5,7 +5,11 @@ from __future__ import annotations
 from PySide6.QtCore import QThreadPool, QTimer
 
 from vgcs.map.native_video_overlay import VideoOverlayM13Track
-from vgcs.map.observation.types import M13TrackBridge, M13TrackStartTask
+from vgcs.map.observation.types import (
+    M13RangeTask,
+    M13TrackBridge,
+    M13TrackStartTask,
+)
 from vgcs.observe.geo_reference import compute_lrf_slant_geo
 from vgcs.video.camera_control import uses_skydroid_top_camera
 from vgcs.video.pipeline import (
@@ -22,6 +26,12 @@ _M13_FOLLOW_MOVE_DEG = 0.8
 _M13_SUM_KEEPALIVE_TICKS = 10  # 200ms timer → 2s
 _M13_VIDEO_STALL_S = 2.5
 _M13_VIDEO_NUDGE_MIN_S = 8.0
+# The C13 firmware reports no track-box, so the geo assumes the target sits on
+# boresight. When the gimbal has slewed more than this (deg) since the range was
+# measured, the range and the current look direction disagree — the target is
+# likely off-centre and the plotted position is only approximate. We cannot
+# correct it (no tracked-pixel feedback), so we flag it instead.
+_M13_SLEW_UNCERTAIN_DEG = 1.0
 
 
 class M13MovingTargetTrackMixin:
@@ -136,7 +146,8 @@ class M13MovingTargetTrackMixin:
             notify_companion_visual_track(active=False)
             self._refresh_m13_track_overlay(failed=True)
             self._set_status(
-                "M13 track failed — gimbal did not slew to target (check C13 motion)"
+                "M13 track failed — could not lock target on C13 "
+                "(check gimbal telemetry and C13 link)"
             )
             self._sync_m13_track_button()
             return
@@ -163,11 +174,23 @@ class M13MovingTargetTrackMixin:
         self._sync_m13_track_timer()
         self._set_status("M13 tracking — gimbal follow active")
 
+    def _m13_invalidate_inflight_start(self) -> None:
+        """Bump the track generation so a still-running M13TrackStartTask cannot
+        re-activate the track after it was stopped/reset.
+
+        ``_on_m13_track_started`` discards any callback whose generation != the
+        current generation. Only ``_begin_m13_video_track`` bumps the generation,
+        so without this a late worker success (which re-arms the C13 firmware)
+        would flip ``_m13_track_active`` back on after the operator turned it off.
+        """
+        self._m13_track_generation = int(getattr(self, "_m13_track_generation", 0) or 0) + 1
+        self._m13_track_starting = False
+
     def _stop_m13_track(self) -> None:
         was = self._m13_track_is_active() or self._m13_track_mode_active()
+        self._m13_invalidate_inflight_start()
         self._m13_track_active = False
         self._m13_track_armed = False
-        self._m13_track_starting = False
         notify_companion_visual_track(active=False)
         cc = getattr(self, "_camera_control", None)
         stop_fn = getattr(cc, "stop_target_track", None)
@@ -184,9 +207,9 @@ class M13MovingTargetTrackMixin:
             self._set_status("M13 track stopped")
 
     def _reset_m13_track_for_disconnect(self) -> None:
+        self._m13_invalidate_inflight_start()
         self._m13_track_active = False
         self._m13_track_armed = False
-        self._m13_track_starting = False
         notify_companion_visual_track(active=False)
         self._m13_track_click_uv = None
         self._m13_track_ref_att = None
@@ -359,16 +382,80 @@ class M13MovingTargetTrackMixin:
         import time
 
         now = time.monotonic()
+        # Fire a fresh SLR shot on a cadence, off the GUI thread. The laser
+        # register only advances when re-triggered, so a moving (especially
+        # radially moving) target needs periodic fresh shots — otherwise the
+        # plotted position freezes at the start-time range. The trigger+settle
+        # sleeps would stall the video/map if done inline on this 200 ms timer,
+        # so the read runs on a worker and posts back via _on_m13_range_ready.
+        last_fresh = float(getattr(self, "_m13_track_slr_fresh_mono", 0.0) or 0.0)
+        if force or (now - last_fresh) >= _M13_SLR_FRESH_INTERVAL_S:
+            self._dispatch_m13_range_fetch(fresh=True)
         last = float(getattr(self, "_m13_track_geo_mono", 0.0) or 0.0)
         if not force and (now - last) < _M13_GEO_MIN_INTERVAL_S:
             return
         self._m13_track_geo_mono = now
-        last_fresh = float(getattr(self, "_m13_track_slr_fresh_mono", 0.0) or 0.0)
-        want_fresh = bool(force) and (now - last_fresh) >= _M13_SLR_FRESH_INTERVAL_S
-        if want_fresh:
-            self._m13_track_slr_fresh_mono = now
-        dist = self._query_m13_track_range_m(fresh=want_fresh)
-        self._m13_track_range_m = dist
+        # Recompute from the last fetched range with LIVE gimbal attitude, so the
+        # marker still updates between range shots as the gimbal follows.
+        self._recompute_m13_track_geo()
+
+    def _dispatch_m13_range_fetch(self, *, fresh: bool) -> None:
+        """Queue an off-GUI-thread SLR read; one at a time (no overlapping shots)."""
+        if bool(getattr(self, "_m13_range_task_inflight", False)):
+            return
+        cc = getattr(self, "_camera_control", None)
+        bridge = getattr(self, "_m13_range_bridge", None)
+        if cc is None or bridge is None:
+            return
+        import time
+
+        self._m13_range_task_inflight = True
+        self._m13_track_slr_fresh_mono = time.monotonic()
+        # Remember where the gimbal was aimed when this shot fired, so the geo can
+        # tell whether the range still matches the current look direction.
+        self._m13_track_range_att = self._read_gimbal_attitude_pair()
+        gen = int(getattr(self, "_m13_track_generation", 0) or 0)
+        task = M13RangeTask(
+            self._query_m13_track_range_m, bridge, fresh=bool(fresh), generation=gen
+        )
+        QThreadPool.globalInstance().start(task)
+
+    def _on_m13_range_ready(self, range_m: object, generation: int = 0) -> None:
+        self._m13_range_task_inflight = False
+        if int(generation or 0) != int(getattr(self, "_m13_track_generation", 0) or 0):
+            return  # stale — track was stopped/restarted while this shot was in flight
+        if not self._m13_track_is_active():
+            return
+        if range_m is not None:
+            try:
+                self._m13_track_range_m = float(range_m)
+            except (TypeError, ValueError):
+                pass
+        self._recompute_m13_track_geo()
+
+    @staticmethod
+    def _m13_geo_uncertain_from_att(range_att: object, cur_att: object) -> bool:
+        """True when the gimbal moved past the slew threshold since the range shot.
+
+        Diffs two same-source attitude samples, so any constant convention offset
+        cancels. Signals that the boresight-range geo is only approximate because
+        the target has likely drifted off-centre (no track-box feedback to correct).
+        """
+        if not (isinstance(range_att, tuple) and isinstance(cur_att, tuple)):
+            return False
+        if len(range_att) < 2 or len(cur_att) < 2:
+            return False
+        try:
+            dyaw = abs(float(cur_att[0]) - float(range_att[0]))
+            dpitch = abs(float(cur_att[1]) - float(range_att[1]))
+        except (TypeError, ValueError):
+            return False
+        return max(dyaw, dpitch) > _M13_SLEW_UNCERTAIN_DEG
+
+    def _recompute_m13_track_geo(self) -> None:
+        if not self._m13_track_is_active():
+            return
+        dist = getattr(self, "_m13_track_range_m", None)
         ctx = self._observation_context()
         if ctx.get("gimbal_yaw_deg") is None or dist is None:
             self._refresh_m13_track_map_marker()
@@ -408,11 +495,17 @@ class M13MovingTargetTrackMixin:
         self._m13_track_alt_m = (
             float(geo.target_alt_m) if geo.target_alt_m is not None else None
         )
-        self._m13_track_geo_label = (
-            f"{self._m13_track_lat:.6f}, {self._m13_track_lon:.6f}"
-        )
+        label = f"{self._m13_track_lat:.6f}, {self._m13_track_lon:.6f}"
         if geo.range_m is not None:
-            self._m13_track_geo_label += f" · {float(geo.range_m):.0f} m"
+            label += f" · {float(geo.range_m):.0f} m"
+        uncertain = self._m13_geo_uncertain_from_att(
+            getattr(self, "_m13_track_range_att", None),
+            self._read_gimbal_attitude_pair(),
+        )
+        self._m13_track_geo_uncertain = bool(uncertain)
+        if uncertain:
+            label += " · approx (following)"
+        self._m13_track_geo_label = label
         path = list(getattr(self, "_m13_track_path", None) or [])
         pt = (self._m13_track_lat, self._m13_track_lon)
         if not path or path[-1] != pt:

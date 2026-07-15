@@ -556,9 +556,12 @@ class MainWindowTelemetryMixin:
             try:
                 latlon = self._map_widget.get_m13_track_latlon()
                 dist = getattr(self._map_widget, "_m13_track_range_m", None)
+                approx = bool(getattr(self._map_widget, "_m13_track_geo_uncertain", False))
                 if latlon is not None:
                     text = f"{float(dist):.1f} m (M13 track)" if dist is not None else "M13 track"
                     text = f"{text} · {latlon[0]:.6f}, {latlon[1]:.6f}"
+                    if approx:
+                        text += " · ~approx (following)"
                 else:
                     text = "M13 track — computing position…"
                 self._fields["rangefinder"].setText(text)
