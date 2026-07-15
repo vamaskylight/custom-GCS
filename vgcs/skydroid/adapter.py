@@ -319,6 +319,36 @@ class SkydroidTopUdpAdapter:
         with self._status_lock:
             return bool(self._visual_track_active)
 
+    def _m13_slew_gimbal_to_click(
+        self,
+        x_px: int,
+        y_px: int,
+        att_now: tuple[float, float] | None,
+    ) -> tuple[tuple[float, float] | None, bool]:
+        """Slew to click via GSY/GSP/GAY/GAP — C13 field units ignore GAM."""
+        if att_now is None:
+            att_now = self._read_gimbal_attitude_deg()
+        if att_now is None:
+            print("[VGCS:m13] slew skipped — no GAC attitude")
+            return None, False
+        print(
+            f"[VGCS:m13] slew to click px=({x_px},{y_px}) "
+            f"att={att_now} (GSY/GSP align, not GAM)"
+        )
+        att_after, ok, _, _ = self._align_laser_boresight_to_pixel(
+            x_px, y_px, att_now
+        )
+        move = (
+            self._gimbal_total_move_deg(att_now, att_after)
+            if att_after is not None
+            else 0.0
+        )
+        print(
+            f"[VGCS:m13] slew done att={att_now}->{att_after} "
+            f"move={move:.1f}° ok={ok}"
+        )
+        return att_after, bool(ok)
+
     def start_visual_track_at_norm(
         self,
         u: float,
@@ -349,11 +379,11 @@ class SkydroidTopUdpAdapter:
             f"att={att_now} offset=({dyaw:.1f}°,{dpitch:.1f}°)"
         )
         if abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2:
-            att_after, aim_ok = self._point_gimbal_at_pixel_gam(x_px, y_px, att_now)
+            att_after, aim_ok = self._m13_slew_gimbal_to_click(x_px, y_px, att_now)
             if not aim_ok:
                 print(
                     "[VGCS:m13] track aborted — gimbal could not aim at click "
-                    "(try gimbal sticks or a closer target)"
+                    "(use rail arrows to verify gimbal motion, then retry)"
                 )
                 with self._status_lock:
                     self._visual_track_active = False

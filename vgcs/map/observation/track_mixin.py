@@ -110,7 +110,7 @@ class M13MovingTargetTrackMixin:
             notify_companion_visual_track(active=False)
             self._refresh_m13_track_overlay(failed=True)
             self._set_status(
-                "M13 track failed — check C13 link, gimbal telemetry, and aim"
+                "M13 track failed — gimbal did not slew to target (check C13 motion)"
             )
             self._sync_m13_track_button()
             return
