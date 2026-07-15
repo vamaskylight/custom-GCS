@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import QThreadPool, QTimer
 
 from vgcs.map.native_video_overlay import VideoOverlayM13Track
@@ -21,6 +23,22 @@ from vgcs.video.pipeline import (
 _M13_PATH_MAX_POINTS = 400
 _M13_GEO_MIN_INTERVAL_S = 1.0
 _M13_SLR_FRESH_INTERVAL_S = 3.0
+
+
+def _m13_slr_fresh_interval_s() -> float:
+    """Cadence for re-firing the SLR laser during a track — firing the laser is a
+    real hardware event (unlike a data-only command), and is one candidate for a
+    field-reported ~0.1-0.2s video stutter during tracking. Override for A/B
+    testing without a rebuild: set 0 to disable the periodic re-fire entirely
+    (range then freezes at the start-time value again, trading accuracy for a
+    clean signal on whether the laser trigger is the stutter's cause)."""
+    try:
+        return float(
+            os.environ.get("VGCS_M13_SLR_FRESH_INTERVAL_S", "")
+            or _M13_SLR_FRESH_INTERVAL_S
+        )
+    except ValueError:
+        return float(_M13_SLR_FRESH_INTERVAL_S)
 _M13_FOLLOW_WARN_AFTER_S = 6.0
 _M13_FOLLOW_MOVE_DEG = 0.8
 _M13_SUM_KEEPALIVE_TICKS = 10  # 200ms timer → 2s
@@ -388,8 +406,14 @@ class M13MovingTargetTrackMixin:
         # plotted position freezes at the start-time range. The trigger+settle
         # sleeps would stall the video/map if done inline on this 200 ms timer,
         # so the read runs on a worker and posts back via _on_m13_range_ready.
+        # Setting VGCS_M13_SLR_FRESH_INTERVAL_S=0 disables only the PERIODIC
+        # re-fire (for isolating whether it causes the video stutter); the
+        # one-time fetch on track start (force=True) still runs so a position
+        # is always available.
+        fresh_interval = _m13_slr_fresh_interval_s()
         last_fresh = float(getattr(self, "_m13_track_slr_fresh_mono", 0.0) or 0.0)
-        if force or (now - last_fresh) >= _M13_SLR_FRESH_INTERVAL_S:
+        want_periodic = fresh_interval > 0.0 and (now - last_fresh) >= fresh_interval
+        if force or want_periodic:
             self._dispatch_m13_range_fetch(fresh=True)
         last = float(getattr(self, "_m13_track_geo_mono", 0.0) or 0.0)
         if not force and (now - last) < _M13_GEO_MIN_INTERVAL_S:
