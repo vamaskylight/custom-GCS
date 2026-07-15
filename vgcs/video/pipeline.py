@@ -146,6 +146,12 @@ def _companion_feed_switch_active() -> bool:
 def _companion_app_is_background() -> bool:
     if _companion_feed_switch_active():
         return False
+    # Never treat the app as "background" (i.e. never pause the decode) while an
+    # LRF lock or M13 visual track is active. Reconnecting the single-client C13
+    # RTSP mid-track drops the feed and breaks the firmware follow — so a live
+    # gimbal session always keeps video flowing regardless of window focus.
+    if _companion_gimbal_session_active():
+        return False
     return float(_companion_app_background_mono or 0.0) > 0.0
 
 

@@ -197,30 +197,46 @@ class MainWindowLifecycleMixin:
         mw = getattr(self, "_map_widget", None)
         if mw is None:
             return
+        # NOTE: Only pause the companion RTSP decode when the app is genuinely
+        # hidden/suspended by the OS. ``ApplicationInactive`` on Windows fires on
+        # any focus loss (clicking another window, a popup, a second monitor, or
+        # even internal focus shifts while the GCS window is still fully visible).
+        # Treating that as "background" froze the single-client C13 video every
+        # time the operator interacted with other UI — the exact cause of "video
+        # stops while tracking". Minimize/hide is handled authoritatively in
+        # ``changeEvent`` (WindowStateChange) instead.
         if state == Qt.ApplicationState.ApplicationActive:
             try:
                 mw.on_application_foreground()
             except Exception:
                 pass
-        elif state in (
-            Qt.ApplicationState.ApplicationInactive,
-            Qt.ApplicationState.ApplicationSuspended,
-        ):
-            try:
-                mw.on_application_background()
-            except Exception:
-                pass
+        elif state == Qt.ApplicationState.ApplicationSuspended:
+            # Real OS suspend (e.g. sleep) — but if the window is still visible
+            # and not minimized, keep decoding. Only pause when actually hidden.
+            if self.isMinimized() or not self.isVisible():
+                try:
+                    mw.on_application_background()
+                except Exception:
+                    pass
 
     def changeEvent(self, event) -> None:  # noqa: N802 — Qt API
+        # Minimize/restore is the *authoritative* signal for pausing the
+        # single-client companion RTSP decode. We deliberately do NOT pause on
+        # mere focus loss (see _on_application_state_changed) — only when the
+        # window is truly minimized does the feed need to be released.
         if event.type() == QEvent.Type.WindowStateChange:
             mw = getattr(self, "_map_widget", None)
             if mw is not None:
                 if self.isMinimized():
+                    self._companion_decode_minimized = True
                     try:
                         mw.on_application_background()
                     except Exception:
                         pass
-                elif self.isActiveWindow():
+                elif getattr(self, "_companion_decode_minimized", False):
+                    # Only resume if we were previously minimized — avoids
+                    # spurious foreground refreshes on normal window-state flaps.
+                    self._companion_decode_minimized = False
                     try:
                         mw.on_application_foreground()
                     except Exception:
