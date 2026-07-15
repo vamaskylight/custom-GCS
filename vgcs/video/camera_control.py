@@ -505,6 +505,15 @@ class SkydroidCameraControl:
             return False
         return False
 
+    def is_m13_track_start_in_progress(self) -> bool:
+        try:
+            fn = getattr(self._adapter, "m13_track_start_in_progress", None)
+            if callable(fn):
+                return bool(fn())
+        except Exception:
+            return False
+        return False
+
     def query_slr_distance_m(self, *, fresh: bool = True) -> float | None:
         try:
             fn = getattr(self._adapter, "query_slr_distance_m", None)
