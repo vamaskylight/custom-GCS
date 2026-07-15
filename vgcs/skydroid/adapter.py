@@ -217,6 +217,8 @@ class SkydroidTopUdpAdapter:
         self._lrf_lock_y = 0
         self._lrf_locked_distance_m: float | None = None
         self._visual_track_active = False
+        self._visual_track_lock_att: tuple[float, float] | None = None
+        self._visual_track_start_mono: float = 0.0
         self._active_port = int(port)
         self._transport.set_datagram_handler(self._maybe_update_status)
 
@@ -325,8 +327,9 @@ class SkydroidTopUdpAdapter:
         frame_w: int = _LRF_FRAME_W,
         frame_h: int = _LRF_FRAME_H,
     ) -> bool:
-        """M13 — GOT + SUM confirm; firmware keeps the target centered on video."""
+        """M13 — slew gimbal to click, then GOT + SUM confirm for firmware follow."""
         if not self.gimbal_telemetry_ok():
+            print("[VGCS:m13] track skipped — no gimbal telemetry (GAC)")
             return False
         fw = max(1, int(frame_w))
         fh = max(1, int(frame_h))
@@ -338,13 +341,39 @@ class SkydroidTopUdpAdapter:
         x_px = max(0, min(fw, int(round(max(0.0, min(1.0, float(u))) * fw))))
         y_px = max(0, min(fh, int(round(max(0.0, min(1.0, float(v))) * fh))))
         self._ensure_active_transport()
+        att_now = self._read_gimbal_attitude_deg()
+        dyaw, dpitch = self._pixel_boresight_offset_deg(x_px, y_px, fw=fw, fh=fh)
+        print(
+            f"[VGCS:m13] track start px=({x_px},{y_px}) "
+            f"click=({u_in:.3f},{v_in:.3f}) frame=({u:.3f},{v:.3f}) "
+            f"att={att_now} offset=({dyaw:.1f}°,{dpitch:.1f}°)"
+        )
+        if abs(dyaw) >= 0.2 or abs(dpitch) >= 0.2:
+            att_after, aim_ok = self._point_gimbal_at_pixel_gam(x_px, y_px, att_now)
+            if not aim_ok:
+                print(
+                    "[VGCS:m13] track aborted — gimbal could not aim at click "
+                    "(try gimbal sticks or a closer target)"
+                )
+                with self._status_lock:
+                    self._visual_track_active = False
+                    self._visual_track_lock_att = None
+                return False
+            att_now = att_after or att_now
+            time.sleep(0.1)
+            self._gimbal_stop_hard()
+            time.sleep(0.08)
+        else:
+            print("[VGCS:m13] target near boresight — skipping pre-track slew")
+        cx = fw // 2
+        cy = fh // 2
         try:
             stop = build_sum_track(confirm=False)
             self._transport.send_and_receive(
                 stop, expect_reply=False, log=False, timeout_s=0.08
             )
             time.sleep(0.08)
-            got = build_got_target(x_px, y_px, frame_w=fw, frame_h=fh)
+            got = build_got_target(cx, cy, frame_w=fw, frame_h=fh)
             self._transport.send_and_receive(
                 got, expect_reply=False, log=True, timeout_s=0.08
             )
@@ -355,15 +384,17 @@ class SkydroidTopUdpAdapter:
             )
             with self._status_lock:
                 self._visual_track_active = True
+                self._visual_track_lock_att = att_now
+                self._visual_track_start_mono = time.monotonic()
             print(
-                f"[VGCS:m13] visual track start px=({x_px},{y_px}) "
-                f"click=({u_in:.3f},{v_in:.3f}) frame=({u:.3f},{v:.3f})"
+                f"[VGCS:m13] visual track armed GOT=({cx},{cy}) att={att_now}"
             )
             return True
         except Exception as exc:
             print(f"[VGCS:m13] visual track start failed: {exc}")
             with self._status_lock:
                 self._visual_track_active = False
+                self._visual_track_lock_att = None
             return False
 
     def stop_visual_track(self) -> None:
@@ -380,14 +411,15 @@ class SkydroidTopUdpAdapter:
             self._transport._port = active_port
         with self._status_lock:
             self._visual_track_active = False
+            self._visual_track_lock_att = None
 
-    def query_slr_distance_m(self, *, log: bool = False) -> float | None:
+    def query_slr_distance_m(self, *, log: bool = False, fresh: bool = True) -> float | None:
         """Fresh SLR read for M13 coordinate updates (independent of LRF arm/lock)."""
         if not self.gimbal_telemetry_ok():
             return None
         self._ensure_active_transport()
         try:
-            return self._query_slr_distance_m(log=log, fresh=True)
+            return self._query_slr_distance_m(log=log, fresh=bool(fresh))
         except Exception:
             return None
 

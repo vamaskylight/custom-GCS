@@ -8,10 +8,14 @@ from vgcs.map.native_video_overlay import VideoOverlayM13Track
 from vgcs.map.observation.types import M13TrackBridge, M13TrackStartTask
 from vgcs.observe.geo_reference import compute_lrf_slant_geo
 from vgcs.video.camera_control import uses_skydroid_top_camera
+from vgcs.video.pipeline import notify_companion_visual_track
 
 
 _M13_PATH_MAX_POINTS = 400
-_M13_GEO_MIN_INTERVAL_S = 0.18
+_M13_GEO_MIN_INTERVAL_S = 1.0
+_M13_SLR_FRESH_INTERVAL_S = 3.0
+_M13_FOLLOW_WARN_AFTER_S = 6.0
+_M13_FOLLOW_MOVE_DEG = 0.8
 
 
 class M13MovingTargetTrackMixin:
@@ -70,6 +74,9 @@ class M13MovingTargetTrackMixin:
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             self._set_status("Wait for LRF lock to finish before starting track")
             return
+        if bool(getattr(self, "_m13_track_starting", False)):
+            self._set_status("M13 track — wait for current lock to finish")
+            return
         if self._m13_track_is_active():
             self._stop_m13_track()
         if self._c13_lrf_is_locked():
@@ -81,24 +88,34 @@ class M13MovingTargetTrackMixin:
         att = self._read_gimbal_attitude_pair()
         self._m13_track_ref_att = att
         self._m13_track_armed = True
+        self._m13_track_starting = True
         self._sync_m13_track_button()
         self._refresh_m13_track_overlay(pending=True)
-        self._set_status("M13 track — sending lock to C13…")
+        notify_companion_visual_track(active=True)
+        self._set_status("M13 track — slewing gimbal and locking target…")
         cc = getattr(self, "_camera_control", None)
         bridge = getattr(self, "_m13_track_bridge", None)
         if cc is None or bridge is None:
+            self._m13_track_starting = False
+            notify_companion_visual_track(active=False)
             self._set_status("M13 track failed — no camera control")
             return
         task = M13TrackStartTask(cc, float(u), float(v), bridge)
         QThreadPool.globalInstance().start(task)
 
     def _on_m13_track_started(self, ok: bool, u: float, v: float) -> None:
+        self._m13_track_starting = False
         if not ok:
             self._m13_track_active = False
+            notify_companion_visual_track(active=False)
             self._refresh_m13_track_overlay(failed=True)
-            self._set_status("M13 track failed — check C13 link and gimbal telemetry")
+            self._set_status(
+                "M13 track failed — check C13 link, gimbal telemetry, and aim"
+            )
             self._sync_m13_track_button()
             return
+        import time
+
         self._m13_track_active = True
         self._m13_track_armed = True
         self._m13_track_click_uv = (float(u), float(v))
@@ -108,6 +125,11 @@ class M13MovingTargetTrackMixin:
         self._m13_track_alt_m = None
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
+        self._m13_track_lock_att = self._read_gimbal_attitude_pair()
+        self._m13_track_start_mono = time.monotonic()
+        self._m13_track_follow_seen = False
+        self._m13_track_follow_warned = False
+        self._m13_track_slr_fresh_mono = 0.0
         self._sync_m13_track_button()
         self._refresh_m13_track_overlay()
         self._update_m13_track_geo(force=True)
@@ -118,6 +140,8 @@ class M13MovingTargetTrackMixin:
         was = self._m13_track_is_active() or self._m13_track_mode_active()
         self._m13_track_active = False
         self._m13_track_armed = False
+        self._m13_track_starting = False
+        notify_companion_visual_track(active=False)
         cc = getattr(self, "_camera_control", None)
         stop_fn = getattr(cc, "stop_target_track", None)
         if callable(stop_fn):
@@ -135,6 +159,8 @@ class M13MovingTargetTrackMixin:
     def _reset_m13_track_for_disconnect(self) -> None:
         self._m13_track_active = False
         self._m13_track_armed = False
+        self._m13_track_starting = False
+        notify_companion_visual_track(active=False)
         self._m13_track_click_uv = None
         self._m13_track_ref_att = None
         self._m13_track_lat = None
@@ -178,18 +204,57 @@ class M13MovingTargetTrackMixin:
             self._sync_m13_track_button()
             return
         self._update_m13_track_geo()
+        self._m13_check_gimbal_follow()
         self._refresh_m13_track_overlay()
 
-    def _query_m13_track_range_m(self) -> float | None:
+    def _m13_check_gimbal_follow(self) -> None:
+        if not self._m13_track_is_active():
+            return
+        import time
+
+        lock_att = getattr(self, "_m13_track_lock_att", None)
+        if not isinstance(lock_att, tuple) or len(lock_att) < 2:
+            return
+        att = self._read_gimbal_attitude_pair()
+        if att is None:
+            return
+        try:
+            dy = abs(float(att[0]) - float(lock_att[0]))
+            dp = abs(float(att[1]) - float(lock_att[1]))
+        except (TypeError, ValueError):
+            return
+        if dy > _M13_FOLLOW_MOVE_DEG or dp > _M13_FOLLOW_MOVE_DEG:
+            self._m13_track_follow_seen = True
+        start_mono = float(getattr(self, "_m13_track_start_mono", 0.0) or 0.0)
+        if start_mono <= 0.0:
+            return
+        if (
+            not getattr(self, "_m13_track_follow_warned", False)
+            and not getattr(self, "_m13_track_follow_seen", False)
+            and (time.monotonic() - start_mono) >= _M13_FOLLOW_WARN_AFTER_S
+        ):
+            self._m13_track_follow_warned = True
+            self._set_status(
+                "M13 track — gimbal not moving; check C13 follow mode or re-click target"
+            )
+
+    def _query_m13_track_range_m(self, *, fresh: bool = False) -> float | None:
         cc = getattr(self, "_camera_control", None)
         if cc is None:
             return None
         fn = getattr(cc, "query_slr_distance_m", None)
         if callable(fn):
             try:
-                dist = fn()
+                dist = fn(fresh=bool(fresh))
                 if dist is not None:
                     return float(dist)
+            except TypeError:
+                try:
+                    dist = fn()
+                    if dist is not None:
+                        return float(dist)
+                except Exception:
+                    pass
             except Exception:
                 pass
         raw = getattr(self, "_companion_laser_range_m", None)
@@ -210,7 +275,11 @@ class M13MovingTargetTrackMixin:
         if not force and (now - last) < _M13_GEO_MIN_INTERVAL_S:
             return
         self._m13_track_geo_mono = now
-        dist = self._query_m13_track_range_m()
+        last_fresh = float(getattr(self, "_m13_track_slr_fresh_mono", 0.0) or 0.0)
+        want_fresh = bool(force) or (now - last_fresh) >= _M13_SLR_FRESH_INTERVAL_S
+        if want_fresh:
+            self._m13_track_slr_fresh_mono = now
+        dist = self._query_m13_track_range_m(fresh=want_fresh)
         self._m13_track_range_m = dist
         ctx = self._observation_context()
         if ctx.get("gimbal_yaw_deg") is None or dist is None:

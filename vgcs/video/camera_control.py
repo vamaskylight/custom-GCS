@@ -505,11 +505,16 @@ class SkydroidCameraControl:
             return False
         return False
 
-    def query_slr_distance_m(self) -> float | None:
+    def query_slr_distance_m(self, *, fresh: bool = True) -> float | None:
         try:
             fn = getattr(self._adapter, "query_slr_distance_m", None)
             if callable(fn):
+                return fn(fresh=bool(fresh))
+        except TypeError:
+            try:
                 return fn()
+            except Exception:
+                return None
         except Exception:
             return None
         return None
