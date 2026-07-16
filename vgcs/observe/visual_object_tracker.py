@@ -73,7 +73,15 @@ class VisualObjectTracker:
                 frame_bgr,
                 (int(bbox.x), int(bbox.y), int(bbox.w), int(bbox.h)),
             )
-        except Exception:
+        except Exception as ex:
+            # This exception was previously swallowed with no trace at all —
+            # a missing opencv-contrib-python-headless install (the tracker
+            # module isn't in plain opencv-python) fails silently here with
+            # zero console output, indistinguishable from any other cause.
+            try:
+                print(f"[VGCS:m14] tracker init failed: {ex!r}")
+            except Exception:
+                pass
             return False
         if ok is False:
             return False

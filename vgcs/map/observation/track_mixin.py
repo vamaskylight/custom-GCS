@@ -197,6 +197,7 @@ class M13MovingTargetTrackMixin:
         img = self._preview_image_copy_for_snapshot()
         frame_bgr = qimage_to_bgr_array(img) if img is not None else None
         if frame_bgr is None:
+            print("[VGCS:m14] track start failed: no preview frame available to track from")
             self._m13_track_active = False
             notify_companion_visual_track(active=False)
             self._refresh_m13_track_overlay(failed=True)
@@ -211,15 +212,21 @@ class M13MovingTargetTrackMixin:
             cx, cy, box_w=_M14_TRACK_BOX_SIZE_PX, box_h=_M14_TRACK_BOX_SIZE_PX,
             frame_w=fw, frame_h=fh,
         )
+        print(
+            f"[VGCS:m14] track start click=({u:.3f},{v:.3f}) frame={fw}x{fh} "
+            f"bbox=({bbox.x:.0f},{bbox.y:.0f},{bbox.w:.0f},{bbox.h:.0f})"
+        )
         tracker = VisualObjectTracker()
         ok = tracker.start(frame_bgr, bbox)
         if not ok:
+            print("[VGCS:m14] track start failed: tracker.start() returned False (see init error above)")
             self._m13_track_active = False
             notify_companion_visual_track(active=False)
             self._refresh_m13_track_overlay(failed=True)
             self._set_status("M13 track failed — could not initialize tracker on that spot")
             self._sync_m13_track_button()
             return
+        print("[VGCS:m14] track armed — CSRT tracker initialized, gimbal follow starting")
         import time
 
         self._m14_tracker = tracker
