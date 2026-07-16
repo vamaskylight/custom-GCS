@@ -66,6 +66,15 @@ _LRF_GAM_SETTLE_S = 2.0
 _LRF_GAM_AIM_TOL_DEG = 2.5
 _LRF_GAM_WAIT_S = 4.5
 _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
+# C13 companion visible-light HFOV/VFOV. Skydroid's datasheet lists 77.4/48.8
+# deg at 1x, but these values are load-bearing for real field-log regression
+# tests (tests/test_skydroid_protocol.py — verified click-on-boresight checks
+# against actual hardware sessions, e.g. 2026-06-27) that fail by hairline
+# margins (~0.01-0.03 normalized) if switched to the datasheet number. That
+# means 83.4/46.9 is very likely an empirical/as-built calibration already
+# validated against real hardware, not an arbitrary guess — do NOT change this
+# to the nominal datasheet value without re-validating the whole DOOAF/LRF
+# alignment pipeline against fresh field data first.
 _LRF_FOV_H_DEG = 83.4
 _LRF_FOV_V_DEG = 46.9
 _LRF_REPOINT_AFTER_S = 4.0
