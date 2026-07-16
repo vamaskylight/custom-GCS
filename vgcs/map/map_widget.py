@@ -774,6 +774,7 @@ from vgcs.map.observation.types import (
     LrfLockTask,
     M13RangeBridge,
     M13TrackBridge,
+    M14FollowBridge,
     ObservationExportBridge,
     ObservationSnapshotBridge,
     PendingLrfVideoPick,
@@ -928,6 +929,12 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._m13_range_bridge = M13RangeBridge(self)
         self._m13_range_bridge.ready.connect(self._on_m13_range_ready)
         self._m13_range_task_inflight = False
+        self._m14_follow_bridge = M14FollowBridge(self)
+        self._m14_follow_bridge.updated.connect(self._on_m14_follow_updated)
+        self._m14_tracker = None
+        self._m14_tracker_active = False
+        self._m14_follow_task_inflight = False
+        self._m14_follow_lost_streak = 0
         self._video_ui_render_mono = 0.0
         self._split_ui_render_mono = 0.0
         self._split_cache_mono: dict[str, float] = {}

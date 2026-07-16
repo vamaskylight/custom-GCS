@@ -10,6 +10,9 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 from PySide6.QtGui import QImage
 
 from vgcs.map.image_io import save_qimage_to_path
+from vgcs.map.video.frame_convert import qimage_to_bgr_array
+from vgcs.observe.gimbal_follow_control import FollowGains, follow_speed_command, target_offset_deg
+from vgcs.observe.visual_object_tracker import VisualObjectTracker
 from vgcs.observe.dooaf import (
     DOOAF_ROLE_IMPACT,
     assemble_observation_report_html,
@@ -132,6 +135,82 @@ class M13RangeTask(QRunnable):
             dist = None
         try:
             self._bridge.ready.emit(dist, int(self._generation))
+        except Exception:
+            pass
+
+
+class M14FollowBridge(QObject):
+    # ok, u_norm, v_norm, yaw_speed_dps, pitch_speed_dps, lost_streak, generation
+    updated = Signal(bool, float, float, float, float, int, int)
+
+
+class M14FollowTask(QRunnable):
+    """M14 — one CSRT tracker update + follow-speed computation, off the GUI
+    thread (CSRT's per-frame update is real image-processing work, not free).
+
+    Runs entirely against a copy of the tracker + frame handed in at dispatch
+    time; only emits results back — the GUI thread applies the gimbal speed
+    command and any UI/geo updates, same division of labor as M13RangeTask.
+    """
+
+    def __init__(
+        self,
+        tracker: VisualObjectTracker,
+        frame_bgr,
+        bridge: "M14FollowBridge",
+        *,
+        frame_w: int,
+        frame_h: int,
+        fov_h_deg: float,
+        fov_v_deg: float,
+        gains: FollowGains | None,
+        generation: int,
+    ) -> None:
+        super().__init__()
+        self._tracker = tracker
+        self._frame_bgr = frame_bgr
+        self._bridge = bridge
+        self._frame_w = int(frame_w)
+        self._frame_h = int(frame_h)
+        self._fov_h_deg = float(fov_h_deg)
+        self._fov_v_deg = float(fov_v_deg)
+        self._gains = gains
+        self._generation = int(generation)
+
+    def run(self) -> None:
+        ok = False
+        u_norm = v_norm = 0.5
+        yaw_spd = pitch_spd = 0.0
+        lost_streak = 0
+        try:
+            ok, box = self._tracker.update(self._frame_bgr)
+            lost_streak = self._tracker.lost_streak()
+            if ok and box is not None:
+                cx, cy = box.center_xy
+                u_norm = max(0.0, min(1.0, cx / max(1.0, float(self._frame_w))))
+                v_norm = max(0.0, min(1.0, cy / max(1.0, float(self._frame_h))))
+                dyaw, dpitch = target_offset_deg(
+                    cx,
+                    cy,
+                    frame_w=self._frame_w,
+                    frame_h=self._frame_h,
+                    fov_h_deg=self._fov_h_deg,
+                    fov_v_deg=self._fov_v_deg,
+                )
+                yaw_spd, pitch_spd = follow_speed_command(dyaw, dpitch, gains=self._gains)
+        except Exception as exc:
+            print(f"[VGCS:m14] tracker update failed: {exc}")
+            ok = False
+        try:
+            self._bridge.updated.emit(
+                bool(ok),
+                float(u_norm),
+                float(v_norm),
+                float(yaw_spd),
+                float(pitch_spd),
+                int(lost_streak),
+                int(self._generation),
+            )
         except Exception:
             pass
 
@@ -431,6 +510,8 @@ class ObservationExportTask(QRunnable):
 __all__ = [
     "LrfLockBridge",
     "LrfLockTask",
+    "M14FollowBridge",
+    "M14FollowTask",
     "M13RangeBridge",
     "M13RangeTask",
     "M13TrackBridge",

@@ -15,3 +15,10 @@ mgrs>=1.4,<2
 
 # M8 optional GeoTIFF DEM (CSV/ESRI .asc work without rasterio).
 rasterio>=1.3,<2
+
+# M14 — software-side visual object tracking for continuous gimbal-follow
+# (C12/C13 firmware has no confirmed continuous-follow capability of its own;
+# see DOCS/SKYDROID-TOP-PROTOCOL.md). Needs the *contrib* build specifically —
+# plain opencv-python(-headless) does not include the tracker algorithms
+# (CSRT/KCF/MOSSE live in the contrib/legacy module).
+opencv-contrib-python-headless>=4.9,<6
