@@ -794,6 +794,21 @@ def _companion_corrupt_reconnect_cooldown_s() -> float:
         return 45.0
 
 
+def _companion_hevc_glitch_backoff_cap_s() -> float:
+    """Max cooldown after consecutive companion-link HEVC glitches (sustained packet
+    loss). A single isolated glitch reconnects fast (~2s, catches the next IDR), but
+    without a cap that same short cooldown repeats forever on a sustained bad link —
+    hammering a new RTSP SETUP every ~2s instead of giving the radio room to recover.
+    Override with VGCS_COMPANION_HEVC_GLITCH_BACKOFF_MAX_S."""
+    raw = str(
+        os.environ.get("VGCS_COMPANION_HEVC_GLITCH_BACKOFF_MAX_S", "12.0") or "12.0"
+    ).strip()
+    try:
+        return max(2.0, min(30.0, float(raw)))
+    except ValueError:
+        return 12.0
+
+
 def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
     """Full-frame HEVC decode collapse — patchy 8×8 tile chaos across the whole image."""
     if not HAS_NUMPY or np is None:
@@ -1201,9 +1216,12 @@ def _siyi_session_cooldown_s(tail_b: bytes, reconnect_delay: float) -> float:
     if _siyi_hevc_glitch_tail(tail_b):
         raw = str(os.environ.get("VGCS_SIYI_HEVC_RECONNECT_S", "2.0") or "2.0").strip()
         try:
-            return max(0.8, min(5.0, float(raw)))
+            floor = max(0.8, min(5.0, float(raw)))
         except ValueError:
-            return 2.0
+            floor = 2.0
+        # Respect the caller's escalated delay (consecutive-glitch backoff) instead of
+        # always clamping back down to the single-glitch floor.
+        return max(floor, min(_companion_hevc_glitch_backoff_cap_s(), float(reconnect_delay)))
     tl = tail_b.lower() if tail_b else b""
     if (
         b"-138" in tl
@@ -3260,6 +3278,19 @@ class RtspSource(QObject):
                             hevc_glitch = companion_rtsp and _siyi_hevc_glitch_tail(
                                 tail_b
                             )
+                            if companion_rtsp:
+                                if hevc_glitch:
+                                    self._companion_hevc_glitch_streak = (
+                                        int(
+                                            getattr(
+                                                self, "_companion_hevc_glitch_streak", 0
+                                            )
+                                            or 0
+                                        )
+                                        + 1
+                                    )
+                                else:
+                                    self._companion_hevc_glitch_streak = 0
                             print(
                                 f"[VGCS:video] decode session ended (frames={frames_this_session}), "
                                 f"reconnecting same transport={tr_label} rc={rc!r}"
@@ -3272,11 +3303,21 @@ class RtspSource(QObject):
                                 siyi_hw = False
                                 try:
                                     if hevc_glitch:
+                                        streak = int(
+                                            getattr(
+                                                self, "_companion_hevc_glitch_streak", 1
+                                            )
+                                            or 1
+                                        )
+                                        reconnect_delay = min(
+                                            _companion_hevc_glitch_backoff_cap_s(),
+                                            2.5 + 2.0 * min(streak - 1, 5),
+                                        )
                                         print(
                                             "[VGCS:video] companion HEVC glitch: reopening RTSP "
-                                            "(hold last frame in preview)"
+                                            f"(hold last frame in preview, consecutive={streak}, "
+                                            f"cooldown={reconnect_delay:.1f}s)"
                                         )
-                                        reconnect_delay = 2.5
                                     elif cooldown >= 6.0:
                                         print(
                                             f"[VGCS:video] companion RTSP: cooldown {cooldown:.0f}s "
