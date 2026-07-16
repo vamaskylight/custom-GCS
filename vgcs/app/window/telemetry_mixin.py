@@ -285,10 +285,19 @@ class MainWindowTelemetryMixin:
             self._top_flight_mode.setText(mode_text)
             self._map_widget.set_header_mode(mode_text)
             # Keep mode dropdown aligned with the vehicle (dialog copies this combo at open).
-            if mode_text and self._mode_combo.findText(mode_text) >= 0:
+            # Only resync when the FC's actual mode changed, not on every heartbeat that
+            # reaches here via an unrelated ui_key field (system_status/prearm flicker) —
+            # otherwise a pending-but-not-yet-sent operator selection gets silently
+            # overwritten back to the current mode before they click "Set mode".
+            if (
+                mode_text
+                and mode_text != getattr(self, "_last_synced_mode_text", None)
+                and self._mode_combo.findText(mode_text) >= 0
+            ):
                 self._mode_combo.blockSignals(True)
                 self._mode_combo.setCurrentText(mode_text)
                 self._mode_combo.blockSignals(False)
+                self._last_synced_mode_text = mode_text
             ap = int(data.get("autopilot", 0) or 0)
             vt = int(data.get("vehicle_type", 0) or 0)
             self._map_widget.set_plan_vehicle_info(

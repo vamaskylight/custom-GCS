@@ -383,6 +383,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._btn_apply_fence.clicked.connect(self._on_upload_fence)
         self._btn_params_refresh.clicked.connect(self._on_params_refresh)
         self._btn_param_set.clicked.connect(self._on_param_set)
+        self._param_name_combo.currentTextChanged.connect(self._on_param_name_changed)
         self._btn_tiles_online.clicked.connect(self._on_tiles_online)
         self._btn_tiles_offline.clicked.connect(self._on_tiles_offline)
         self._btn_apply_acro.clicked.connect(self._on_apply_acro_options)

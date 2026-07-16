@@ -47,7 +47,7 @@ def _coord_edit(value: float | None = None) -> QLineEdit:
 
 
 def _parse_coord(text: str) -> float | None:
-    t = str(text or "").strip()
+    t = str(text or "").strip().replace(",", ".")
     if not t:
         return None
     try:
@@ -105,11 +105,15 @@ def settings_from_edits(
     has_gun = glat is not None and glon is not None
     has_tgt = tlat is not None and tlon is not None
     return DooafSettings(
-        gun_lat=glat if has_gun else None,
-        gun_lon=glon if has_gun else None,
+        # Keep whichever of lat/lon parsed even if its sibling didn't, so
+        # validate_dooaf_settings' "needs both latitude and longitude" check
+        # can actually see and report the partial input instead of it being
+        # silently nulled out here first.
+        gun_lat=glat,
+        gun_lon=glon,
         gun_alt_m=_optional_alt_value(gun_alt) if has_gun else None,
-        target_lat=tlat if has_tgt else None,
-        target_lon=tlon if has_tgt else None,
+        target_lat=tlat,
+        target_lon=tlon,
         target_alt_m=_optional_alt_value(tgt_alt) if has_tgt else None,
     )
 
@@ -369,13 +373,11 @@ class DooafSetupDialog(QDialog):
         if role == DOOAF_PICK_GUN:
             self._gun_lat.setText(text_lat)
             self._gun_lon.setText(text_lon)
-            if alt_m is not None:
-                _set_optional_alt(self._gun_alt, float(alt_m))
+            _set_optional_alt(self._gun_alt, float(alt_m) if alt_m is not None else None)
         elif role == DOOAF_PICK_TARGET:
             self._tgt_lat.setText(text_lat)
             self._tgt_lon.setText(text_lon)
-            if alt_m is not None:
-                _set_optional_alt(self._tgt_alt, float(alt_m))
+            _set_optional_alt(self._tgt_alt, float(alt_m) if alt_m is not None else None)
 
     def _on_accept(self) -> None:
         err = validate_dooaf_settings(self.result_settings())

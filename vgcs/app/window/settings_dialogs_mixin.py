@@ -372,6 +372,7 @@ class MainWindowSettingsDialogsMixin:
         skydroid_profile = QComboBox()
         skydroid_profile.addItem("C13 Default (GAA/GSY/GAY)", "c13_default")
         skydroid_profile.addItem("C13 Alternate (GAC/GSP/GAP)", "c13_alt")
+        skydroid_profile.addItem("C12 Default (AI follow)", "c12_default")
         skydroid_grid.addWidget(QLabel("Host / IP"), 0, 0)
         skydroid_grid.addWidget(skydroid_host, 0, 1)
         skydroid_grid.addWidget(QLabel("UDP port"), 1, 0)
@@ -948,6 +949,12 @@ class MainWindowSettingsDialogsMixin:
         p_row.addWidget(QLabel("Value"))
         p_row.addWidget(dlg_spin, 1)
         adv_inner.addLayout(p_row)
+
+        def _on_param_combo_dlg_changed(_text: str = "") -> None:
+            name = param_combo_dlg.currentText().strip().upper()
+            dlg_spin.setValue(float(self._last_params.get(name, 0.0)))
+
+        param_combo_dlg.currentTextChanged.connect(_on_param_combo_dlg_changed)
 
         p_btns = QHBoxLayout()
         btn_params_dlg = QPushButton("Refresh params")

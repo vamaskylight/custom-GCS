@@ -316,6 +316,7 @@ class MainWindowLinkMixin:
         self._arm_ready_confirmed = False
         self._hb_connected_since_mono = None
         self._last_hb_ui_key = None
+        self._last_synced_mode_text = None
         self._hb_armed = False
         self._hb_arm_ready = False
         self._hb_system_status = 0
