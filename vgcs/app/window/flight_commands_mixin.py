@@ -199,7 +199,7 @@ class MainWindowFlightCommandsMixin:
         cfg = {
             "radius_m": float(self._geofence_radius_spin.value()),
             "alt_max_m": float(self._geofence_alt_max_spin.value()),
-            "action": float(self._geofence_action_combo.currentData() or 1.0),
+            "action": float(self._geofence_action_combo.currentData()),
         }
         self._thread.queue_geofence_upload(cfg)
         self._append_log(

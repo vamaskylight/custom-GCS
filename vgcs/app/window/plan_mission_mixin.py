@@ -132,12 +132,17 @@ class MainWindowPlanMissionMixin:
             if lat_item is None or lon_item is None or alt_item is None or spd_item is None:
                 continue
             try:
-                lat = float(lat_item.text().strip())
-                lon = float(lon_item.text().strip())
-                alt = float(alt_item.text().strip())
-                spd = float(spd_item.text().strip())
+                lat = float(lat_item.text().strip().replace(",", "."))
+                lon = float(lon_item.text().strip().replace(",", "."))
+                alt = float(alt_item.text().strip().replace(",", "."))
+                spd = float(spd_item.text().strip().replace(",", "."))
             except ValueError:
-                continue
+                # Match the out-of-range case below: abort and tell the operator
+                # instead of silently dropping this waypoint from the mission.
+                self._append_log(
+                    f"Invalid waypoint at row {r + 1}: could not parse lat/lon/alt/speed, edit ignored."
+                )
+                return
             if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
                 self._append_log(
                     f"Invalid waypoint at row {r + 1}: lat/lon out of range, edit ignored."

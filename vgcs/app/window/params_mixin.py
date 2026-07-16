@@ -106,6 +106,10 @@ class MainWindowParamsMixin:
         self._thread.queue_params_fetch(names)
         self._append_log("Param fetch queued")
 
+    def _on_param_name_changed(self, _text: str = "") -> None:
+        name = self._param_name_combo.currentText().strip().upper()
+        self._param_value_spin.setValue(float(self._last_params.get(name, 0.0)))
+
     def _on_param_set(self) -> None:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before parameter set.")

@@ -1075,7 +1075,7 @@ class PlanFlightPanel(QWidget):
         lbody = self._launch_section.body_layout()
         lbody.addWidget(self._field_label("Altitude"))
         self._launch_alt = self._unit_input("0.0", "m")
-        self._launch_alt.textChanged.connect(lambda _t: self._schedule_emit())
+        self._launch_alt.textChanged.connect(self._on_launch_alt_changed)
         lbody.addWidget(self._launch_alt)
         help_lbl = QLabel("Actual position set by vehicle at flight time.")
         help_lbl.setProperty("class", "planHelpMuted")
@@ -1404,6 +1404,7 @@ class PlanFlightPanel(QWidget):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
+        self._wp_start_alt_in = None
         n = self._waypoint_count
         self._wp_details_box.setVisible(n > 0)
         if n <= 0:
@@ -1457,17 +1458,38 @@ class PlanFlightPanel(QWidget):
             spd_in.textChanged.connect(
                 lambda _t, ix=idx, w=spd_in: self._on_wp_field_changed(ix, "speed_mps", w.text())
             )
+            spd_in.editingFinished.connect(
+                lambda ix=idx, w=spd_in: self._on_wp_field_editing_finished(ix, "speed_mps", w)
+            )
             alt_in.textChanged.connect(
                 lambda _t, ix=idx, w=alt_in: self._on_wp_field_changed(ix, "alt_m", w.text())
+            )
+            alt_in.editingFinished.connect(
+                lambda ix=idx, w=alt_in: self._on_wp_field_editing_finished(ix, "alt_m", w)
             )
         else:
             hint = QLabel("Takeoff / launch altitude (0 = use WP1 for takeoff).")
             hint.setStyleSheet("QLabel { color: rgba(232, 234, 239, 170); font-size: 11px; }")
             hint.setWordWrap(True)
             h.addWidget(hint, 1)
+            self._wp_start_alt_in = alt_in
             alt_in.textChanged.connect(self._on_start_alt_changed)
         h.addStretch(1)
         return row
+
+    def _on_launch_alt_changed(self, text: str) -> None:
+        # Mirror direct edits to the Launch Position altitude field into the Start
+        # row's own alt QLineEdit — they're separate widget instances (the Start row
+        # is rebuilt by _render_waypoint_rows), so without this the Start row keeps
+        # showing a stale value until something else happens to trigger a re-render.
+        start_in = getattr(self, "_wp_start_alt_in", None)
+        if start_in is not None and start_in.text() != text:
+            start_in.blockSignals(True)
+            try:
+                start_in.setText(text)
+            finally:
+                start_in.blockSignals(False)
+        self._schedule_emit()
 
     def _on_start_alt_changed(self, text: str) -> None:
         if self._suppress_emit:
@@ -1491,6 +1513,27 @@ class PlanFlightPanel(QWidget):
         elif key == "speed_mps":
             self._wp_meta[idx]["speed_mps"] = max(0.1, _unit_speed_to_mps(value))
         self._schedule_emit()
+
+    def _on_wp_field_editing_finished(self, idx: int, key: str, widget: QLineEdit) -> None:
+        # Normalize the visible text to the actually-clamped/transmitted value once the
+        # operator finishes editing (Enter/focus-out), so a rejected value like a negative
+        # altitude doesn't keep showing on screen while a different value ships in the mission.
+        if idx < 0 or idx >= len(self._wp_meta):
+            return
+        meta = self._wp_meta[idx]
+        if key == "alt_m":
+            display_value = _m_to_unit(meta.get("alt_m", 0.0))
+        elif key == "speed_mps":
+            display_value = _mps_to_unit_speed(meta.get("speed_mps", 0.0))
+        else:
+            return
+        text = f"{display_value:.1f}"
+        if widget.text() != text:
+            widget.blockSignals(True)
+            try:
+                widget.setText(text)
+            finally:
+                widget.blockSignals(False)
 
     # ------------------------------------------------------------------ Emit
     def _schedule_emit(self) -> None:
