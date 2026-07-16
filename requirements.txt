@@ -21,4 +21,9 @@ rasterio>=1.3,<2
 # see DOCS/SKYDROID-TOP-PROTOCOL.md). Needs the *contrib* build specifically —
 # plain opencv-python(-headless) does not include the tracker algorithms
 # (CSRT/KCF/MOSSE live in the contrib/legacy module).
-opencv-contrib-python-headless>=4.9,<6
+# Capped below 5.x: field-reproduced native crash (cv2.error "Unknown C++
+# exception from OpenCV code" on TrackerCSRT.init()) on 5.0.0.93 / Python
+# 3.14 / Windows, in a verified single-package, correct-interpreter install —
+# not reproducible locally, so treat as hardware/build-specific until 5.x
+# gets more field validation. Stay on the well-established 4.x line.
+opencv-contrib-python-headless>=4.9,<5
