@@ -387,6 +387,16 @@ class SkydroidCameraControl:
         except Exception:
             return
 
+    def active_camera_profile(self):
+        """The active SkydroidCommandProfile (frame size, FOV, command tags)
+        for whichever camera is actually connected — M14's AI-follow control
+        loop needs this to use the right FOV, unlike the older GOT/SUM aim
+        math which still reads C13's hardcoded module constants."""
+        try:
+            return self._adapter._profile
+        except Exception:
+            return None
+
     def camera_trigger_photo(self) -> None:
         try:
             self._adapter.camera_photo()

@@ -11,13 +11,23 @@ from vgcs.map.observation.types import (
     M13RangeTask,
     M13TrackBridge,
     M13TrackStartTask,
+    M14FollowTask,
 )
+from vgcs.map.video.frame_convert import qimage_to_bgr_array
 from vgcs.observe.geo_reference import compute_lrf_slant_geo
+from vgcs.observe.visual_object_tracker import VisualObjectTracker, bbox_around_point
 from vgcs.video.camera_control import uses_skydroid_top_camera
 from vgcs.video.pipeline import (
     notify_companion_preview_motion,
     notify_companion_visual_track,
 )
+
+# Cameras where GOT/SUM has no confirmed continuous-follow capability (or,
+# for C12, is simply not yet wired through — see DOCS/SKYDROID-TOP-PROTOCOL.md),
+# so M13 tracks the target itself in software instead of trusting firmware.
+_M14_AI_FOLLOW_PROFILE_IDS = {"c12_default"}
+_M14_TRACK_BOX_SIZE_PX = 60
+_M14_LOST_STREAK_STOP = 15  # ~3s at the 200ms tick rate
 
 
 _M13_PATH_MAX_POINTS = 400
@@ -57,6 +67,28 @@ class M13MovingTargetTrackMixin:
 
     def _m13_track_supported(self) -> bool:
         return uses_skydroid_top_camera(getattr(self, "_camera_control", None))
+
+    def _m14_active_profile(self):
+        cc = getattr(self, "_camera_control", None)
+        fn = getattr(cc, "active_camera_profile", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    def _m14_should_use_ai_follow(self) -> bool:
+        """True when the connected camera has no confirmed continuous-follow
+        capability of its own (see DOCS/SKYDROID-TOP-PROTOCOL.md) — M13 then
+        tracks the target in software (vgcs/observe/visual_object_tracker.py)
+        and drives the gimbal itself instead of sending GOT+SUM and hoping."""
+        profile = self._m14_active_profile()
+        pid = str(getattr(profile, "profile_id", "") or "")
+        return pid in _M14_AI_FOLLOW_PROFILE_IDS
+
+    def _m14_ai_follow_active(self) -> bool:
+        return bool(getattr(self, "_m14_tracker_active", False))
 
     def _m13_track_mode_active(self) -> bool:
         return bool(getattr(self, "_m13_track_armed", False))
@@ -136,6 +168,9 @@ class M13MovingTargetTrackMixin:
         self._refresh_m13_track_overlay(pending=True)
         notify_companion_visual_track(active=True)
         notify_companion_preview_motion(duration_s=300.0)
+        if self._m14_should_use_ai_follow():
+            self._m14_start_ai_follow(float(u), float(v), gen)
+            return
         self._set_status("M13 track — locking target on C13…")
         cc = getattr(self, "_camera_control", None)
         bridge = getattr(self, "_m13_track_bridge", None)
@@ -146,6 +181,68 @@ class M13MovingTargetTrackMixin:
             return
         task = M13TrackStartTask(cc, float(u), float(v), bridge, generation=gen)
         QThreadPool.globalInstance().start(task)
+
+    def _m14_start_ai_follow(self, u: float, v: float, generation: int) -> None:
+        """M14 — start software tracking instead of firmware GOT+SUM.
+
+        Runs synchronously on the GUI thread: grabbing the current preview
+        frame and initializing CSRT on a small crop is fast (single-digit ms),
+        unlike the GOT+SUM path's UDP round trip, so this doesn't need a
+        worker thread the way M13TrackStartTask does.
+        """
+        self._m13_track_starting = False
+        profile = self._m14_active_profile()
+        frame_w = int(getattr(profile, "frame_w", 1280) or 1280)
+        frame_h = int(getattr(profile, "frame_h", 720) or 720)
+        img = self._preview_image_copy_for_snapshot()
+        frame_bgr = qimage_to_bgr_array(img) if img is not None else None
+        if frame_bgr is None:
+            self._m13_track_active = False
+            notify_companion_visual_track(active=False)
+            self._refresh_m13_track_overlay(failed=True)
+            self._set_status("M13 track failed — no video frame to track from")
+            self._sync_m13_track_button()
+            return
+        # frame_bgr's actual shape may differ slightly from the profile's
+        # nominal frame_w/h (decode scaling) — use the real array shape.
+        fh, fw = frame_bgr.shape[0], frame_bgr.shape[1]
+        cx, cy = float(u) * fw, float(v) * fh
+        bbox = bbox_around_point(
+            cx, cy, box_w=_M14_TRACK_BOX_SIZE_PX, box_h=_M14_TRACK_BOX_SIZE_PX,
+            frame_w=fw, frame_h=fh,
+        )
+        tracker = VisualObjectTracker()
+        ok = tracker.start(frame_bgr, bbox)
+        if not ok:
+            self._m13_track_active = False
+            notify_companion_visual_track(active=False)
+            self._refresh_m13_track_overlay(failed=True)
+            self._set_status("M13 track failed — could not initialize tracker on that spot")
+            self._sync_m13_track_button()
+            return
+        import time
+
+        self._m14_tracker = tracker
+        self._m14_tracker_active = True
+        self._m14_tracker_frame_wh = (fw, fh)
+        self._m14_follow_task_inflight = False
+        self._m14_follow_lost_streak = 0
+        self._m13_track_active = True
+        self._m13_track_armed = True
+        self._m13_track_click_uv = (float(u), float(v))
+        self._m13_track_path = []
+        self._m13_track_lat = None
+        self._m13_track_lon = None
+        self._m13_track_alt_m = None
+        self._m13_track_geo_label = ""
+        self._m13_track_range_m = None
+        self._m13_track_start_mono = time.monotonic()
+        self._m13_track_slr_fresh_mono = 0.0
+        self._sync_m13_track_button()
+        self._refresh_m13_track_overlay()
+        QTimer.singleShot(0, lambda: self._update_m13_track_geo(force=True))
+        self._sync_m13_track_timer()
+        self._set_status("M13 tracking (software AI follow) — gimbal follow active")
 
     def _on_m13_track_started(self, ok: bool, u: float, v: float, generation: int = 0) -> None:
         gen = int(generation or 0)
@@ -204,9 +301,31 @@ class M13MovingTargetTrackMixin:
         self._m13_track_generation = int(getattr(self, "_m13_track_generation", 0) or 0) + 1
         self._m13_track_starting = False
 
+    def _m14_stop_ai_follow(self) -> None:
+        """Stop the software tracker and command a zero-speed gimbal stop —
+        without this, the last non-zero follow speed keeps the gimbal
+        slewing after the track ends."""
+        was_active = self._m14_ai_follow_active()
+        tracker = getattr(self, "_m14_tracker", None)
+        if tracker is not None:
+            tracker.stop()
+        self._m14_tracker = None
+        self._m14_tracker_active = False
+        self._m14_follow_task_inflight = False
+        self._m14_follow_lost_streak = 0
+        if was_active:
+            cc = getattr(self, "_camera_control", None)
+            set_speed = getattr(cc, "set_gimbal_speed", None)
+            if callable(set_speed):
+                try:
+                    set_speed(0.0, 0.0)
+                except Exception:
+                    pass
+
     def _stop_m13_track(self) -> None:
         was = self._m13_track_is_active() or self._m13_track_mode_active()
         self._m13_invalidate_inflight_start()
+        self._m14_stop_ai_follow()
         self._m13_track_active = False
         self._m13_track_armed = False
         notify_companion_visual_track(active=False)
@@ -226,6 +345,7 @@ class M13MovingTargetTrackMixin:
 
     def _reset_m13_track_for_disconnect(self) -> None:
         self._m13_invalidate_inflight_start()
+        self._m14_stop_ai_follow()
         self._m13_track_active = False
         self._m13_track_armed = False
         notify_companion_visual_track(active=False)
@@ -263,6 +383,9 @@ class M13MovingTargetTrackMixin:
         if not self._m13_track_is_active():
             self._sync_m13_track_timer()
             return
+        if self._m14_ai_follow_active():
+            self._m14_track_timer_tick()
+            return
         notify_companion_preview_motion(duration_s=60.0)
         cc = getattr(self, "_camera_control", None)
         active_fn = getattr(cc, "is_target_track_active", None)
@@ -287,6 +410,76 @@ class M13MovingTargetTrackMixin:
         self._m13_check_gimbal_follow()
         self._m13_nudge_video_during_track()
         self._refresh_m13_track_overlay()
+
+    def _m14_track_timer_tick(self) -> None:
+        """AI-follow tick: update the software tracker, drive the gimbal from
+        its result, and still run the shared video-stall nudge + overlay."""
+        notify_companion_preview_motion(duration_s=60.0)
+        self._m14_dispatch_follow_update()
+        self._m13_nudge_video_during_track()
+        self._refresh_m13_track_overlay()
+
+    def _m14_dispatch_follow_update(self) -> None:
+        if bool(getattr(self, "_m14_follow_task_inflight", False)):
+            return  # one update in flight at a time — no overlapping CSRT runs
+        tracker = getattr(self, "_m14_tracker", None)
+        bridge = getattr(self, "_m14_follow_bridge", None)
+        if tracker is None or bridge is None or not tracker.is_active():
+            return
+        img = self._preview_image_copy_for_snapshot()
+        frame_bgr = qimage_to_bgr_array(img) if img is not None else None
+        if frame_bgr is None:
+            return
+        profile = self._m14_active_profile()
+        fov_h = float(getattr(profile, "fov_h_deg", 83.4) or 83.4)
+        fov_v = float(getattr(profile, "fov_v_deg", 46.9) or 46.9)
+        fw, fh = frame_bgr.shape[1], frame_bgr.shape[0]
+        gen = int(getattr(self, "_m13_track_generation", 0) or 0)
+        self._m14_follow_task_inflight = True
+        task = M14FollowTask(
+            tracker,
+            frame_bgr,
+            bridge,
+            frame_w=fw,
+            frame_h=fh,
+            fov_h_deg=fov_h,
+            fov_v_deg=fov_v,
+            gains=None,
+            generation=gen,
+        )
+        QThreadPool.globalInstance().start(task)
+
+    def _on_m14_follow_updated(
+        self,
+        ok: bool,
+        u_norm: float,
+        v_norm: float,
+        yaw_speed_dps: float,
+        pitch_speed_dps: float,
+        lost_streak: int,
+        generation: int,
+    ) -> None:
+        self._m14_follow_task_inflight = False
+        if int(generation or 0) != int(getattr(self, "_m13_track_generation", 0) or 0):
+            return  # stale — track was stopped/restarted while this update was in flight
+        if not self._m14_ai_follow_active():
+            return
+        if not ok:
+            self._m14_follow_lost_streak = int(lost_streak)
+            if int(lost_streak) >= _M14_LOST_STREAK_STOP:
+                self._set_status("M13 track — target lost, tracker stopped")
+                self._stop_m13_track()
+            return
+        self._m14_follow_lost_streak = 0
+        self._m13_track_click_uv = (float(u_norm), float(v_norm))
+        cc = getattr(self, "_camera_control", None)
+        set_speed = getattr(cc, "set_gimbal_speed", None)
+        if callable(set_speed):
+            try:
+                set_speed(float(yaw_speed_dps), float(pitch_speed_dps))
+            except Exception:
+                pass
+        self._update_m13_track_geo(force=False)
 
     def _m13_nudge_video_during_track(self) -> None:
         if not self._m13_track_is_active():
@@ -492,7 +685,18 @@ class M13MovingTargetTrackMixin:
         if slant < 0.5:
             self._refresh_m13_track_map_marker()
             return
-        hfov, vfov = self._c13_lrf_geo_fov()
+        ai_follow = self._m14_ai_follow_active()
+        if ai_follow:
+            # Real tracked pixel from our own tracker — not a boresight guess
+            # — and the ACTIVE camera's real FOV, not C13's hardcoded fallback.
+            profile = self._m14_active_profile()
+            hfov = float(getattr(profile, "fov_h_deg", 83.4) or 83.4)
+            vfov = float(getattr(profile, "fov_v_deg", 46.9) or 46.9)
+            click = getattr(self, "_m13_track_click_uv", None)
+            video_x, video_y = (click if isinstance(click, tuple) else (0.5, 0.5))
+        else:
+            hfov, vfov = self._c13_lrf_geo_fov()
+            video_x, video_y = 0.5, 0.5
         geo = compute_lrf_slant_geo(
             vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
             vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
@@ -503,8 +707,8 @@ class M13MovingTargetTrackMixin:
             gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
             gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             slant_range_m=slant,
-            video_x_norm=0.5,
-            video_y_norm=0.5,
+            video_x_norm=float(video_x),
+            video_y_norm=float(video_y),
             gps_fix_type=int(ctx.get("gps_fix_type") or 0),
             gps_hdop=ctx.get("gps_hdop"),  # type: ignore[arg-type]
             camera_hfov_deg=hfov,
@@ -522,10 +726,14 @@ class M13MovingTargetTrackMixin:
         label = f"{self._m13_track_lat:.6f}, {self._m13_track_lon:.6f}"
         if geo.range_m is not None:
             label += f" · {float(geo.range_m):.0f} m"
-        uncertain = self._m13_geo_uncertain_from_att(
-            getattr(self, "_m13_track_range_att", None),
-            self._read_gimbal_attitude_pair(),
-        )
+        if ai_follow:
+            # Real tracked pixel every frame — no boresight-drift guess needed.
+            uncertain = False
+        else:
+            uncertain = self._m13_geo_uncertain_from_att(
+                getattr(self, "_m13_track_range_att", None),
+                self._read_gimbal_attitude_pair(),
+            )
         self._m13_track_geo_uncertain = bool(uncertain)
         if uncertain:
             label += " · approx (following)"
