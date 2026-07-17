@@ -382,6 +382,7 @@ class VisualObjectTracker:
     def __init__(self) -> None:
         self._proc = None
         self._resp_queue = None
+        self._send_queue = None
         self._active = False
         self._lost_streak = 0
         self._algo_used = ""
@@ -407,6 +408,7 @@ class VisualObjectTracker:
             return False
         self._proc = proc
         self._resp_queue = self._start_reader(proc)
+        self._send_queue = self._start_writer(proc)
         resp = self._request(("start", _encode_frame(frame_bgr), bbox), _M14_WORKER_START_TIMEOUT_S)
         if resp is None:
             if proc.poll() is not None:
@@ -452,17 +454,19 @@ class VisualObjectTracker:
 
     def stop(self) -> None:
         proc = self._proc
+        send_q = self._send_queue
         self._proc = None
         self._resp_queue = None
+        self._send_queue = None
         self._active = False
         self._lost_streak = 0
         self._algo_used = ""
         if proc is None:
             return
         try:
-            if proc.stdin is not None:
-                _send_framed(proc.stdin, ("stop",))
-                proc.stdin.close()
+            if send_q is not None:
+                send_q.put(("stop",))
+                send_q.put(None)  # tells the writer thread to exit after flushing "stop"
         except Exception:
             pass
         try:
@@ -504,22 +508,63 @@ class VisualObjectTracker:
         threading.Thread(target=_reader, daemon=True).start()
         return q
 
-    def _request(self, msg: tuple, timeout_s: float) -> tuple | None:
-        """Send ``msg`` and wait up to ``timeout_s`` for a response.
+    def _start_writer(self, proc):
+        """Background thread that owns every write to the worker's stdin —
+        decouples a slow/stuck pipe from the calling thread.
 
-        Returns None on ANY failure to get a well-formed reply — dead worker,
-        broken pipe, or timeout are all treated identically by the caller.
+        Field-confirmed bug this fixes: without this, ``_request()`` wrote
+        directly on the CALLING thread (``M14FollowTask.run()``, a
+        QThreadPool worker) with NO timeout on the write itself — only the
+        response read had one. If the worker ever fell behind draining its
+        stdin (real CSRT computation on real camera frames is slower than
+        the synthetic-square timing measured earlier, especially at the
+        100ms M14 tick rate pushing a ~1.5MB frame every cycle), the write
+        blocked indefinitely. Once blocked, ``_m14_follow_task_inflight``
+        never got reset (the call that resets it never returned), so every
+        later tick silently no-op'd on that guard forever — tracking showed
+        "active" but nothing ever moved again, with zero error output,
+        exactly the field-reported symptom. Routing writes through a queue
+        here means a stuck pipe can only ever delay this thread, never block
+        the caller past ``_request()``'s own read-side timeout.
+        """
+        import queue
+        import threading
+
+        q: "queue.Queue" = queue.Queue()
+
+        def _writer() -> None:
+            try:
+                while True:
+                    msg = q.get()
+                    if msg is None:
+                        break
+                    if not _send_framed(proc.stdin, msg):
+                        break
+            except Exception:
+                pass
+
+        threading.Thread(target=_writer, daemon=True).start()
+        return q
+
+    def _request(self, msg: tuple, timeout_s: float) -> tuple | None:
+        """Enqueue ``msg`` for the writer thread and wait up to ``timeout_s``
+        for a response. Returns None on ANY failure to get a well-formed
+        reply — dead worker, broken pipe, or timeout are all treated
+        identically by the caller.
         """
         proc = self._proc
-        q = self._resp_queue
-        if proc is None or q is None or proc.stdin is None:
+        resp_q = self._resp_queue
+        send_q = self._send_queue
+        if proc is None or resp_q is None or send_q is None:
             return None
         import queue
 
-        if not _send_framed(proc.stdin, msg):
+        try:
+            send_q.put(msg)
+        except Exception:
             return None
         try:
-            return q.get(timeout=timeout_s)
+            return resp_q.get(timeout=timeout_s)
         except queue.Empty:
             return None
 
