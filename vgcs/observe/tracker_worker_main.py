@@ -38,6 +38,7 @@ def _run() -> None:
 
     from vgcs.observe.visual_object_tracker import (
         _InProcessTracker,
+        _decode_frame,
         _recv_framed,
         _send_framed,
     )
@@ -50,13 +51,13 @@ def _run() -> None:
                 break
             cmd = msg[0]
             if cmd == "start":
-                _, frame_bgr, bbox = msg
-                ok = engine.start(frame_bgr, bbox)
+                _, encoded_frame, bbox = msg
+                ok = engine.start(_decode_frame(encoded_frame), bbox)
                 if not _send_framed(raw_out, ("started", ok, engine.algo_used)):
                     break
             elif cmd == "update":
-                _, frame_bgr = msg
-                ok, box = engine.update(frame_bgr)
+                _, encoded_frame = msg
+                ok, box = engine.update(_decode_frame(encoded_frame))
                 if not _send_framed(raw_out, ("updated", ok, box, engine.lost_streak())):
                     break
             elif cmd == "stop":
