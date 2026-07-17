@@ -532,9 +532,29 @@ class M13MovingTargetTrackMixin:
         tick = int(getattr(self, "_m14_follow_log_tick", 0) or 0) + 1
         self._m14_follow_log_tick = tick
         if tick % 10 == 1:
+            # Field-reported: commanded yaw/pitch speed stays substantial and
+            # nonzero for many consecutive ticks with the tracked box's
+            # position never converging — consistent with either the gimbal
+            # genuinely not moving, or it having hit a mechanical travel
+            # limit. Logging the gimbal's OWN reported attitude (independent
+            # ground truth from telemetry, not inferred from box position)
+            # settles which it is directly in the next field log.
+            att_str = "unsupported"
+            try:
+                get_status = getattr(cc, "get_gimbal_status", None)
+                st = get_status() if callable(get_status) else None
+                if st is not None and bool(getattr(st, "supported", False)):
+                    att_str = (
+                        f"yaw={float(st.yaw_deg):.1f} pitch={float(st.pitch_deg):.1f}"
+                        if st.yaw_deg is not None and st.pitch_deg is not None
+                        else "no-reading"
+                    )
+            except Exception:
+                pass
             print(
                 f"[VGCS:m14] follow uv=({u_norm:.3f},{v_norm:.3f}) "
                 f"yaw_spd={float(yaw_speed_dps):.2f}dps pitch_spd={float(pitch_speed_dps):.2f}dps "
+                f"gimbal_att=({att_str}) "
                 f"cc={type(cc).__name__ if cc is not None else None} "
                 f"has_set_speed={callable(set_speed)}"
             )
