@@ -3865,6 +3865,16 @@ class SkydroidTopUdpAdapter:
                     pass
                 continue
             self._ensure_active_transport()
+            # Field-found: a background endpoint probe or zoom-burst on
+            # another thread can repoint the shared self._transport._host/
+            # _port between _ensure_active_transport() above and the actual
+            # send below (a real motion command was field-observed going out
+            # on port 9003 — a probe-only port — instead of 5000). Capture
+            # the known-good endpoint locally and pass it explicitly so this
+            # send is immune to that race regardless of what other threads
+            # do to the transport's shared state in the meantime.
+            send_host = self._active_host
+            send_port = self._active_port
             for command in commands:
                 frame = build_top_frame(command, params)
                 try:
@@ -3873,6 +3883,8 @@ class SkydroidTopUdpAdapter:
                         expect_reply=expect_reply,
                         log=True,
                         timeout_s=0.08 if not expect_reply else None,
+                        host=send_host,
+                        port=send_port,
                     )
                     if expect_reply and reply:
                         self._maybe_update_status(reply)
@@ -3882,7 +3894,7 @@ class SkydroidTopUdpAdapter:
                         if tick % 10 == 1:  # ~once/second at M14's 100ms tick rate
                             print(
                                 f"[VGCS:skydroid] motion command {command} sent OK "
-                                f"params={params} host={self._transport._host}:{self._transport._port}"
+                                f"params={params} host={send_host}:{send_port}"
                             )
                     break
                 except Exception as ex:
@@ -3895,7 +3907,7 @@ class SkydroidTopUdpAdapter:
                     try:
                         print(
                             f"[VGCS:skydroid] motion command {command} send failed: "
-                            f"{ex!r} host={self._transport._host}:{self._transport._port}"
+                            f"{ex!r} host={send_host}:{send_port}"
                         )
                     except Exception:
                         pass
@@ -3914,24 +3926,30 @@ class SkydroidTopUdpAdapter:
         `_drop_pending_motion_commands`).
         """
         self._ensure_active_transport()
+        # Same explicit-endpoint fix as the main send loop — see the comment
+        # there for why relying on self._transport's shared _host/_port at
+        # send time is unsafe against a concurrent probe/zoom-burst.
+        send_host = self._active_host
+        send_port = self._active_port
         for command, params in (("GSY", {"yaw": float(yaw)}), ("GSP", {"pitch": float(pitch)})):
             frame = build_top_frame(command, params)
             try:
                 self._transport.send_and_receive(
-                    frame, expect_reply=False, log=True, timeout_s=0.08
+                    frame, expect_reply=False, log=True, timeout_s=0.08,
+                    host=send_host, port=send_port,
                 )
                 tick = int(getattr(self, "_motion_send_log_tick", 0) or 0) + 1
                 self._motion_send_log_tick = tick
                 if tick % 10 == 1:
                     print(
                         f"[VGCS:skydroid] motion command {command} (split) sent OK "
-                        f"params={params} host={self._transport._host}:{self._transport._port}"
+                        f"params={params} host={send_host}:{send_port}"
                     )
             except Exception as ex:
                 try:
                     print(
                         f"[VGCS:skydroid] motion command {command} (split) send failed: "
-                        f"{ex!r} host={self._transport._host}:{self._transport._port}"
+                        f"{ex!r} host={send_host}:{send_port}"
                     )
                 except Exception:
                     pass

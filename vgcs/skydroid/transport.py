@@ -162,10 +162,24 @@ class TopUdpTransport:
         *,
         log: bool = True,
         timeout_s: float | None = None,
+        host: str | None = None,
+        port: int | None = None,
     ) -> bytes:
+        """``host``/``port`` override the instance's own ``_host``/``_port``
+        for this call only. Field-reported: a background endpoint probe or
+        zoom-burst on another thread temporarily repoints the shared
+        ``_host``/``_port`` (e.g. to try an alternate port) with no
+        synchronization against a concurrent send here — a real motion
+        command could silently go out on the wrong port mid-probe. Callers on
+        a hot/real-time path (gimbal motion) should pass the destination
+        explicitly so this call is self-contained and immune to that race,
+        rather than relying on the shared, frequently-mutated instance state.
+        """
         self.open()
         last_error: Exception | None = None
         attempts = self._retries + 1
+        target_host = self._host if host is None else str(host)
+        target_port = self._port if port is None else int(port)
         with self._lock:
             self._listener_paused = True
             try:
@@ -176,14 +190,14 @@ class TopUdpTransport:
                 try:
                     for _attempt in range(attempts):
                         try:
-                            self._sock.sendto(payload, (self._host, self._port))
+                            self._sock.sendto(payload, (target_host, target_port))
                             if log:
-                                self._append_log("TX", payload)
+                                self._append_log("TX", payload, target=f"{target_host}:{target_port}")
                             if not expect_reply:
                                 return b""
                             data, _addr = self._sock.recvfrom(4096)
                             if log:
-                                self._append_log("RX", data)
+                                self._append_log("RX", data, target=f"{target_host}:{target_port}")
                             return data
                         except Exception as e:
                             last_error = e
@@ -195,7 +209,11 @@ class TopUdpTransport:
                         pass
             finally:
                 self._listener_paused = False
-        self._append_log("ERR", str(last_error or "unknown").encode("ascii", errors="ignore"))
+        self._append_log(
+            "ERR",
+            str(last_error or "unknown").encode("ascii", errors="ignore"),
+            target=f"{target_host}:{target_port}",
+        )
         raise RuntimeError(f"TOP UDP request failed: {last_error}")
 
     def receive_matching(
@@ -244,7 +262,7 @@ class TopUdpTransport:
                 self._listener_paused = False
         return None
 
-    def _append_log(self, direction: str, payload: bytes) -> None:
+    def _append_log(self, direction: str, payload: bytes, *, target: str | None = None) -> None:
         if not self._log_path:
             return
         try:
@@ -252,7 +270,7 @@ class TopUdpTransport:
             path.parent.mkdir(parents=True, exist_ok=True)
             text = (payload or b"").decode("ascii", errors="ignore").strip()
             ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            target = f"{self._host}:{self._port}"
+            target = target or f"{self._host}:{self._port}"
             line = f"{ts}  {direction:5}  {target}  {text}\n"
             with path.open("a", encoding="utf-8") as f:
                 f.write(line)
