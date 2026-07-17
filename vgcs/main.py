@@ -77,14 +77,6 @@ def _apply_webengine_chromium_flags_from_env() -> None:
 
 
 def main() -> int:
-    import multiprocessing
-
-    # No-op unless frozen (PyInstaller etc.) — must be the very first call if
-    # it ever does matter. M14's tracker now runs in a child process
-    # (vgcs/observe/visual_object_tracker.py) so a native cv2 crash can't
-    # take the whole GCS down; this is standard multiprocessing hygiene for
-    # a future frozen build, cheap insurance today.
-    multiprocessing.freeze_support()
     _enable_crash_diagnostics()
     _apply_webengine_chromium_flags_from_env()
     # Must happen before QApplication to affect Qt layout metrics.
