@@ -242,6 +242,7 @@ class M13MovingTargetTrackMixin:
         self._m14_tracker_frame_wh = (fw, fh)
         self._m14_follow_task_inflight = False
         self._m14_follow_lost_streak = 0
+        self._m14_follow_ticks_skipped = 0
         self._m13_track_active = True
         self._m13_track_armed = True
         self._m13_track_click_uv = (float(u), float(v))
@@ -328,6 +329,7 @@ class M13MovingTargetTrackMixin:
         self._m14_tracker_active = False
         self._m14_follow_task_inflight = False
         self._m14_follow_lost_streak = 0
+        self._m14_follow_ticks_skipped = 0
         if was_active:
             cc = getattr(self, "_camera_control", None)
             set_speed = getattr(cc, "set_gimbal_speed", None)
@@ -438,7 +440,21 @@ class M13MovingTargetTrackMixin:
 
     def _m14_dispatch_follow_update(self) -> None:
         if bool(getattr(self, "_m14_follow_task_inflight", False)):
-            return  # one update in flight at a time — no overlapping CSRT runs
+            # Previous tick's CSRT round trip hasn't returned yet — this tick
+            # is dropped, not queued. If this happens repeatedly the real
+            # follow rate is silently falling below the nominal 100ms tick
+            # (visible on-screen as gimbal reacting late to target motion).
+            # Log the first drop in a streak immediately, then throttle.
+            skipped = int(getattr(self, "_m14_follow_ticks_skipped", 0) or 0) + 1
+            self._m14_follow_ticks_skipped = skipped
+            if skipped == 1 or skipped % 10 == 0:
+                print(
+                    f"[VGCS:m14] follow tick dropped — previous CSRT update "
+                    f"still in flight ({skipped} dropped in a row)"
+                )
+            return
+        if int(getattr(self, "_m14_follow_ticks_skipped", 0) or 0):
+            self._m14_follow_ticks_skipped = 0
         tracker = getattr(self, "_m14_tracker", None)
         bridge = getattr(self, "_m14_follow_bridge", None)
         if tracker is None or bridge is None or not tracker.is_active():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -183,7 +184,20 @@ class M14FollowTask(QRunnable):
         yaw_spd = pitch_spd = 0.0
         lost_streak = 0
         try:
+            t0 = time.perf_counter()
             ok, box = self._tracker.update(self._frame_bgr)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if elapsed_ms > 150.0:
+                # M14 ticks at 100ms; the child-process CSRT round trip
+                # (real camera frame, not a synthetic test frame) taking
+                # meaningfully longer than that silently degrades the
+                # effective follow rate — _m14_dispatch_follow_update skips
+                # any tick while one is still in flight, with no separate
+                # log, so this is the only place that lag becomes visible.
+                print(
+                    f"[VGCS:m14] tracker.update() took {elapsed_ms:.0f}ms "
+                    f"(tick budget 100ms) — follow is lagging behind real time"
+                )
             lost_streak = self._tracker.lost_streak()
             if ok and box is not None:
                 cx, cy = box.center_xy
