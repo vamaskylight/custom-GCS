@@ -83,6 +83,37 @@ def _weak_tracker_fallback_allowed() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+_M14_CSRT_SEARCH_PADDING = 4.5  # cv2 default is 3.0
+
+
+def _create_csrt_modern():
+    """CSRT via the modern Tracking module, with a widened search region.
+
+    Field-confirmed failure mode: the tracker locks onto the person
+    correctly at click time, then loses them the moment they start moving
+    and silently drifts onto a nearby static background feature instead —
+    CSRT still reports "confident" on the wrong target, so none of our own
+    lost-track detection ever fires either, and the gimbal correctly stops
+    correcting for a "target" that (from its perspective) isn't moving.
+    CSRT's ``padding`` parameter directly controls how far around the last
+    known position it searches on the next frame — the default (3.0) is a
+    general-purpose value not tuned for a walking human's apparent screen
+    speed at this box size (``_M14_TRACK_BOX_SIZE_PX``) and tick rate.
+    Widening it gives CSRT more room to still find the real target instead
+    of snapping to whatever nearby static feature correlates next-best.
+    Falls back to CSRT's own default Params if building a custom one fails
+    for any reason on some build.
+    """
+    import cv2
+
+    try:
+        params = cv2.TrackerCSRT_Params()
+        params.padding = _M14_CSRT_SEARCH_PADDING
+        return cv2.TrackerCSRT_create(params)
+    except Exception:
+        return cv2.TrackerCSRT_create()
+
+
 def _tracker_candidates() -> list[tuple[str, "object"]]:
     """Ordered (label, factory) list of tracker constructors to try.
 
@@ -112,7 +143,7 @@ def _tracker_candidates() -> list[tuple[str, "object"]]:
 
     candidates: list[tuple[str, "object"]] = []
     if hasattr(cv2, "TrackerCSRT_create"):
-        candidates.append(("CSRT", cv2.TrackerCSRT_create))
+        candidates.append(("CSRT", _create_csrt_modern))
     if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
         candidates.append(("CSRT-legacy", cv2.legacy.TrackerCSRT_create))
     if _weak_tracker_fallback_allowed():
