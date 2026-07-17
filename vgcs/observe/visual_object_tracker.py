@@ -30,20 +30,40 @@ class TrackBox:
         return (self.x + self.w / 2.0, self.y + self.h / 2.0)
 
 
-def _create_cv2_tracker(*, prefer_legacy: bool = False):
+def _tracker_candidates() -> list[tuple[str, "object"]]:
+    """Ordered (label, factory) list of tracker constructors to try.
+
+    CSRT (Channel and Spatial Reliability Tracking) is the accurate,
+    occlusion-robust default — both its modern and legacy implementations
+    are tried first. KCF and MOSSE are simpler, lighter-weight correlation
+    trackers used ONLY as a last-resort fallback: field-confirmed case where
+    CSRT (both implementations, on a machine with every CPU SIMD extension
+    this build could use, and where basic cv2 ops work fine) still throws a
+    bare native C++ exception at init() — pointing at something specific to
+    CSRT's own HOG/FFT-heavy code path on that machine, not fixable from
+    here. Falling further back trades tracking robustness (worse under
+    partial occlusion / scale change) for actually having a working tracker
+    at all, which beats no tracker.
+    """
     import cv2
 
-    has_legacy = hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create")
-    if prefer_legacy and has_legacy:
-        return cv2.legacy.TrackerCSRT_create()
+    candidates: list[tuple[str, "object"]] = []
     if hasattr(cv2, "TrackerCSRT_create"):
-        return cv2.TrackerCSRT_create()
-    if has_legacy:
-        return cv2.legacy.TrackerCSRT_create()
-    raise RuntimeError(
-        "cv2 has no TrackerCSRT — install opencv-contrib-python-headless, "
-        "not plain opencv-python(-headless), which lacks the tracker module"
-    )
+        candidates.append(("CSRT", cv2.TrackerCSRT_create))
+    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
+        candidates.append(("CSRT-legacy", cv2.legacy.TrackerCSRT_create))
+    if hasattr(cv2, "TrackerKCF_create"):
+        candidates.append(("KCF", cv2.TrackerKCF_create))
+    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
+        candidates.append(("KCF-legacy", cv2.legacy.TrackerKCF_create))
+    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
+        candidates.append(("MOSSE-legacy", cv2.legacy.TrackerMOSSE_create))
+    if not candidates:
+        raise RuntimeError(
+            "cv2 has no tracker algorithms — install opencv-contrib-python-headless, "
+            "not plain opencv-python(-headless), which lacks the tracker module"
+        )
+    return candidates
 
 
 def _cv2_diagnostic_report() -> list[str]:
@@ -102,20 +122,28 @@ def _cv2_diagnostic_report() -> list[str]:
 
 
 class VisualObjectTracker:
-    """Wraps a single OpenCV CSRT tracker instance for one active track session.
+    """Wraps a single OpenCV correlation tracker instance for one active track session.
 
-    CSRT (Channel and Spatial Reliability Tracking) is a classical correlation-
-    filter tracker: accurate and reasonably robust to partial occlusion/scale
-    change for a single object once initialized on a bounding box, without
-    needing a trained detection model. It has no notion of object *class* — it
-    tracks "whatever was in this box," which is exactly the click-to-track
-    semantics this feature needs.
+    Prefers CSRT (Channel and Spatial Reliability Tracking) — accurate and
+    reasonably robust to partial occlusion/scale change for a single object
+    once initialized on a bounding box, without needing a trained detection
+    model. Falls back to KCF/MOSSE only if CSRT itself fails to initialize
+    (see ``_tracker_candidates()``). None of these have a notion of object
+    *class* — they track "whatever was in this box," which is exactly the
+    click-to-track semantics this feature needs. Check ``algo_used`` after a
+    successful ``start()`` to see which one actually initialized.
     """
 
     def __init__(self) -> None:
         self._tracker = None
         self._active = False
         self._lost_streak = 0
+        self._algo_used = ""
+
+    @property
+    def algo_used(self) -> str:
+        """Which tracker algorithm actually initialized (e.g. 'CSRT', 'KCF-legacy')."""
+        return self._algo_used
 
     def start(self, frame_bgr: np.ndarray, bbox: TrackBox) -> bool:
         """Initialize tracking on ``bbox`` within ``frame_bgr``. Returns success.
@@ -123,17 +151,22 @@ class VisualObjectTracker:
         cv2's init() takes an integer (x, y, w, h) tuple — passing floats
         raises a cv2.error — and returns None on success rather than True, so
         "no exception and not an explicit False" is what counts as success.
+
+        Tries every algorithm in ``_tracker_candidates()`` in order (CSRT
+        first, weaker trackers only as fallback) — a native crash in one
+        implementation/algorithm isn't necessarily present in another.
         """
         self.stop()
         int_bbox = (int(bbox.x), int(bbox.y), int(bbox.w), int(bbox.h))
         last_ex: Exception | None = None
-        # Try the modern Tracking-module CSRT first, then fall back to the
-        # legacy module's separate C++ implementation on failure — a native
-        # crash in one code path isn't necessarily present in the other, and
-        # this costs nothing when the modern path already works fine.
-        for prefer_legacy in (False, True):
+        try:
+            candidates = _tracker_candidates()
+        except Exception as ex:
+            print(f"[VGCS:m14] tracker init failed: {ex!r}")
+            return False
+        for label, factory in candidates:
             try:
-                tracker = _create_cv2_tracker(prefer_legacy=prefer_legacy)
+                tracker = factory()
                 ok = tracker.init(frame_bgr, int_bbox)
             except Exception as ex:
                 last_ex = ex
@@ -143,14 +176,15 @@ class VisualObjectTracker:
             self._tracker = tracker
             self._active = True
             self._lost_streak = 0
-            if prefer_legacy:
-                print("[VGCS:m14] modern TrackerCSRT failed, legacy TrackerCSRT succeeded")
+            self._algo_used = label
+            if label != candidates[0][0]:
+                print(f"[VGCS:m14] {candidates[0][0]} failed, fell back to {label} tracker")
             return True
-        # Both attempts failed — this used to be swallowed with no trace at
+        # Every candidate failed — this used to be swallowed with no trace at
         # all (a missing opencv-contrib-python-headless install fails here
         # with zero console output, indistinguishable from any other cause).
         try:
-            print(f"[VGCS:m14] tracker init failed: {last_ex!r}")
+            print(f"[VGCS:m14] tracker init failed (tried {[c[0] for c in candidates]}): {last_ex!r}")
             for line in _cv2_diagnostic_report():
                 print(f"[VGCS:m14] diag: {line}")
         except Exception:
@@ -182,6 +216,7 @@ class VisualObjectTracker:
         self._tracker = None
         self._active = False
         self._lost_streak = 0
+        self._algo_used = ""
 
 
 def bbox_around_point(
