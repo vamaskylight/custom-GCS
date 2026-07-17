@@ -491,11 +491,28 @@ class M13MovingTargetTrackMixin:
         self._m13_track_click_uv = (float(u_norm), float(v_norm))
         cc = getattr(self, "_camera_control", None)
         set_speed = getattr(cc, "set_gimbal_speed", None)
+        # Field-reported: box tracks the person correctly, but the gimbal
+        # never physically moves, with zero error output anywhere. Every
+        # link in this chain (this call -> SkydroidCameraControl.set_gimbal_
+        # speed -> adapter.set_speed -> command queue) silently swallows
+        # exceptions, so a failure at any point is invisible. Throttled
+        # (~1/s at the 100ms tick rate) so this is diagnostic, not log spam.
+        tick = int(getattr(self, "_m14_follow_log_tick", 0) or 0) + 1
+        self._m14_follow_log_tick = tick
+        if tick % 10 == 1:
+            print(
+                f"[VGCS:m14] follow uv=({u_norm:.3f},{v_norm:.3f}) "
+                f"yaw_spd={float(yaw_speed_dps):.2f}dps pitch_spd={float(pitch_speed_dps):.2f}dps "
+                f"cc={type(cc).__name__ if cc is not None else None} "
+                f"has_set_speed={callable(set_speed)}"
+            )
         if callable(set_speed):
             try:
                 set_speed(float(yaw_speed_dps), float(pitch_speed_dps))
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"[VGCS:m14] set_gimbal_speed raised: {ex!r}")
+        else:
+            print("[VGCS:m14] set_gimbal_speed not callable on camera control — gimbal command NOT sent")
         self._update_m13_track_geo(force=False)
 
     def _m13_nudge_video_during_track(self) -> None:

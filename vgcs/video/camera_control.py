@@ -384,7 +384,8 @@ class SkydroidCameraControl:
     def set_gimbal_speed(self, yaw: float, pitch: float) -> None:
         try:
             self._adapter.set_speed(yaw=float(yaw), pitch=float(pitch))
-        except Exception:
+        except Exception as ex:
+            print(f"[VGCS:skydroid] set_gimbal_speed failed: {ex!r}")
             return
 
     def active_camera_profile(self):
