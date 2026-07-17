@@ -27,7 +27,15 @@ from vgcs.video.pipeline import (
 # so M13 tracks the target itself in software instead of trusting firmware.
 _M14_AI_FOLLOW_PROFILE_IDS = {"c12_default"}
 _M14_TRACK_BOX_SIZE_PX = 60
-_M14_LOST_STREAK_STOP = 15  # ~3s at the 200ms tick rate
+# M14 ticks faster than the legacy GOT+SUM path (100ms vs 200ms): CSRT's own
+# search window is what actually limits how far a target can move between
+# updates before tracking is lost — field-observed losing track on a sudden,
+# sharp reversal — so sampling twice as often halves that worst-case jump
+# distance. Measured round trip to the isolated tracker process is ~3.6ms
+# (see visual_object_tracker.py), far under either interval's budget.
+_M13_TRACK_INTERVAL_MS = 200
+_M14_TRACK_INTERVAL_MS = 100
+_M14_LOST_STREAK_STOP = 30  # ~3s at the 100ms M14 tick rate
 
 
 _M13_PATH_MAX_POINTS = 400
@@ -380,9 +388,11 @@ class M13MovingTargetTrackMixin:
         t = getattr(self, "_m13_track_timer", None)
         if t is None:
             t = QTimer(self)
-            t.setInterval(200)
             t.timeout.connect(self._m13_track_timer_tick)
             self._m13_track_timer = t
+        interval = _M14_TRACK_INTERVAL_MS if self._m14_ai_follow_active() else _M13_TRACK_INTERVAL_MS
+        if t.interval() != interval:
+            t.setInterval(interval)
         if not t.isActive():
             t.start()
 
