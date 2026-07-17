@@ -440,17 +440,17 @@ class M13MovingTargetTrackMixin:
 
     def _m14_dispatch_follow_update(self) -> None:
         if bool(getattr(self, "_m14_follow_task_inflight", False)):
-            # Previous tick's CSRT round trip hasn't returned yet — this tick
-            # is dropped, not queued. If this happens repeatedly the real
-            # follow rate is silently falling below the nominal 100ms tick
-            # (visible on-screen as gimbal reacting late to target motion).
-            # Log the first drop in a streak immediately, then throttle.
+            # Normal now that updates self-chain off completion (see
+            # _on_m14_follow_updated): the 100ms QTimer's own call to this
+            # method will usually find a chained cycle already in flight —
+            # that's expected, not a problem. Only warn on a genuine stall
+            # (no progress for ~2s+, e.g. the worker subprocess died).
             skipped = int(getattr(self, "_m14_follow_ticks_skipped", 0) or 0) + 1
             self._m14_follow_ticks_skipped = skipped
-            if skipped == 1 or skipped % 10 == 0:
+            if skipped == 20 or (skipped > 20 and skipped % 20 == 0):
                 print(
-                    f"[VGCS:m14] follow tick dropped — previous CSRT update "
-                    f"still in flight ({skipped} dropped in a row)"
+                    f"[VGCS:m14] follow appears stalled — no update in "
+                    f"{skipped * 0.1:.1f}s (previous CSRT round trip never returned)"
                 )
             return
         if int(getattr(self, "_m14_follow_ticks_skipped", 0) or 0):
@@ -510,6 +510,14 @@ class M13MovingTargetTrackMixin:
                 )
                 self._set_status("M13 track — target lost, tracker stopped")
                 self._stop_m13_track()
+                return
+            # Field-measured: the real CSRT round trip (real camera frame +
+            # isolated-subprocess IPC) reliably runs a bit longer than the
+            # 100ms tick, so waiting for the next fixed-interval QTimer tick
+            # wastes up to a full tick doing nothing every single cycle —
+            # this is what field logs showed as "gimbal reacts late". Chain
+            # the next update immediately instead of polling for it.
+            self._m14_dispatch_follow_update()
             return
         self._m14_follow_lost_streak = 0
         self._m13_track_click_uv = (float(u_norm), float(v_norm))
@@ -538,6 +546,10 @@ class M13MovingTargetTrackMixin:
         else:
             print("[VGCS:m14] set_gimbal_speed not callable on camera control — gimbal command NOT sent")
         self._update_m13_track_geo(force=False)
+        # Chain immediately (see comment above) rather than waiting for the
+        # next 100ms QTimer tick — runs the loop back-to-back at whatever
+        # rate the real hardware/subprocess round trip actually sustains.
+        self._m14_dispatch_follow_update()
 
     def _m13_nudge_video_during_track(self) -> None:
         if not self._m13_track_is_active():
