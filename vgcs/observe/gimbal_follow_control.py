@@ -36,16 +36,22 @@ def target_offset_deg(
     fov_h_deg: float,
     fov_v_deg: float,
 ) -> tuple[float, float]:
-    """Yaw/pitch offset (deg) of a tracked box's center from frame center.
+    """Yaw/pitch offset (deg) of a tracked box's center from frame center,
+    in the real Skydroid GSY/GSP hardware sign convention: positive yaw =
+    slew right, positive pitch = tilt up (matching the field-proven manual
+    hold-button wiring in map_widget.py — UP button sends dy=+1 -> +pitch —
+    and adapter.py's _gsp_pitch_rate_for_image_offset, which sends a
+    NEGATIVE GSP rate to chase a target that is below frame center).
 
-    Same normalized-offset formula as adapter.py's _pixel_boresight_offset_deg,
-    but takes fov_h_deg/fov_v_deg as parameters (the active camera profile's
-    real values) instead of reading a hardcoded module constant.
+    dyaw keeps the image-space sign (target right of center -> positive,
+    matching _pixel_boresight_offset_deg), but dpitch is the NEGATION of the
+    raw image-space offset: a target below center (larger pixel y) needs the
+    gimbal to tilt DOWN to converge on it, which is a negative pitch command.
     """
     ox = (float(box_center_x) - frame_w / 2.0) / max(1.0, frame_w / 2.0)
     oy = (float(box_center_y) - frame_h / 2.0) / max(1.0, frame_h / 2.0)
     dyaw = ox * (float(fov_h_deg) / 2.0)
-    dpitch = oy * (float(fov_v_deg) / 2.0)
+    dpitch = -oy * (float(fov_v_deg) / 2.0)
     return float(dyaw), float(dpitch)
 
 
@@ -60,9 +66,11 @@ def follow_speed_command(
     dyaw_deg: float, dpitch_deg: float, *, gains: FollowGains | None = None
 ) -> tuple[float, float]:
     """(yaw_speed_dps, pitch_speed_dps) to re-center a target offset by
-    (dyaw_deg, dpitch_deg). Positive dyaw/dpitch = target right/below center,
-    matching _pixel_boresight_offset_deg's convention, so the gimbal should
-    slew toward positive yaw/pitch to re-center it (same sign as the offset)."""
+    (dyaw_deg, dpitch_deg), where dyaw/dpitch are already in the real
+    hardware sign convention from target_offset_deg (positive yaw = slew
+    right, positive pitch = tilt up). The commanded speed keeps the same
+    sign as the offset, since target_offset_deg already accounts for the
+    pitch-axis inversion."""
     g = gains or FollowGains()
     return (
         _speed_for_error_deg(float(dyaw_deg), g),
