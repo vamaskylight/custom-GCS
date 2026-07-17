@@ -30,17 +30,51 @@ class TrackBox:
         return (self.x + self.w / 2.0, self.y + self.h / 2.0)
 
 
-def _create_cv2_tracker():
+def _create_cv2_tracker(*, prefer_legacy: bool = False):
     import cv2
 
+    has_legacy = hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create")
+    if prefer_legacy and has_legacy:
+        return cv2.legacy.TrackerCSRT_create()
     if hasattr(cv2, "TrackerCSRT_create"):
         return cv2.TrackerCSRT_create()
-    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
+    if has_legacy:
         return cv2.legacy.TrackerCSRT_create()
     raise RuntimeError(
         "cv2 has no TrackerCSRT — install opencv-contrib-python-headless, "
         "not plain opencv-python(-headless), which lacks the tracker module"
     )
+
+
+def _cv2_cpu_support_summary() -> str:
+    """Best-effort CPU SIMD dispatch summary for diagnosing native crashes.
+
+    A bare "Unknown C++ exception from OpenCV code" at tracker init (not at
+    import) is consistent with a prebuilt wheel's SIMD-optimized code path
+    (CSRT's HOG/FFT machinery) hitting an instruction set the CPU doesn't
+    actually have — this surfaces that instead of leaving it a mystery.
+    """
+    try:
+        import cv2
+
+        flags = {
+            "AVX": getattr(cv2, "CPU_AVX", None),
+            "AVX2": getattr(cv2, "CPU_AVX2", None),
+            "AVX512_SKX": getattr(cv2, "CPU_AVX512_SKX", None),
+            "SSE4_2": getattr(cv2, "CPU_SSE4_2", None),
+            "FMA3": getattr(cv2, "CPU_FMA3", None),
+        }
+        parts = []
+        for name, flag in flags.items():
+            if flag is None:
+                continue
+            try:
+                parts.append(f"{name}={bool(cv2.checkHardwareSupport(flag))}")
+            except Exception:
+                pass
+        return ", ".join(parts) if parts else "unavailable"
+    except Exception:
+        return "unavailable"
 
 
 class VisualObjectTracker:
@@ -67,28 +101,36 @@ class VisualObjectTracker:
         "no exception and not an explicit False" is what counts as success.
         """
         self.stop()
-        try:
-            tracker = _create_cv2_tracker()
-            ok = tracker.init(
-                frame_bgr,
-                (int(bbox.x), int(bbox.y), int(bbox.w), int(bbox.h)),
-            )
-        except Exception as ex:
-            # This exception was previously swallowed with no trace at all —
-            # a missing opencv-contrib-python-headless install (the tracker
-            # module isn't in plain opencv-python) fails silently here with
-            # zero console output, indistinguishable from any other cause.
+        int_bbox = (int(bbox.x), int(bbox.y), int(bbox.w), int(bbox.h))
+        last_ex: Exception | None = None
+        # Try the modern Tracking-module CSRT first, then fall back to the
+        # legacy module's separate C++ implementation on failure — a native
+        # crash in one code path isn't necessarily present in the other, and
+        # this costs nothing when the modern path already works fine.
+        for prefer_legacy in (False, True):
             try:
-                print(f"[VGCS:m14] tracker init failed: {ex!r}")
-            except Exception:
-                pass
-            return False
-        if ok is False:
-            return False
-        self._tracker = tracker
-        self._active = True
-        self._lost_streak = 0
-        return True
+                tracker = _create_cv2_tracker(prefer_legacy=prefer_legacy)
+                ok = tracker.init(frame_bgr, int_bbox)
+            except Exception as ex:
+                last_ex = ex
+                continue
+            if ok is False:
+                continue
+            self._tracker = tracker
+            self._active = True
+            self._lost_streak = 0
+            if prefer_legacy:
+                print("[VGCS:m14] modern TrackerCSRT failed, legacy TrackerCSRT succeeded")
+            return True
+        # Both attempts failed — this used to be swallowed with no trace at
+        # all (a missing opencv-contrib-python-headless install fails here
+        # with zero console output, indistinguishable from any other cause).
+        try:
+            print(f"[VGCS:m14] tracker init failed: {last_ex!r}")
+            print(f"[VGCS:m14] cv2 CPU support: {_cv2_cpu_support_summary()}")
+        except Exception:
+            pass
+        return False
 
     def update(self, frame_bgr: np.ndarray) -> tuple[bool, TrackBox | None]:
         """Advance the tracker one frame. Returns (ok, box) — box is None if lost."""
