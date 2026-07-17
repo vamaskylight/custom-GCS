@@ -11,6 +11,7 @@ firmware does or doesn't support.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,20 +31,46 @@ class TrackBox:
         return (self.x + self.w / 2.0, self.y + self.h / 2.0)
 
 
+def _weak_tracker_fallback_allowed() -> bool:
+    """Off by default — see the field incident recorded in ``_tracker_candidates``.
+
+    A crashed tracker.init() is recoverable (caught cleanly, "track failed"
+    status, GCS keeps running). A crashed tracker.update() on some machines
+    is NOT recoverable the same way: it took the whole application down with
+    no exception, no traceback, mid-operation — losing all telemetry/control
+    visibility, not just tracking. Until that's understood, defaulting to
+    "fail cleanly, no track" is the safe choice over "silently run a tracker
+    that might kill the GCS." Set VGCS_M14_ALLOW_WEAK_TRACKER_FALLBACK=1 to
+    opt back in for a supervised/ground test.
+    """
+    raw = str(
+        os.environ.get("VGCS_M14_ALLOW_WEAK_TRACKER_FALLBACK", "0") or "0"
+    ).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _tracker_candidates() -> list[tuple[str, "object"]]:
     """Ordered (label, factory) list of tracker constructors to try.
 
     CSRT (Channel and Spatial Reliability Tracking) is the accurate,
     occlusion-robust default — both its modern and legacy implementations
-    are tried first. KCF and MOSSE are simpler, lighter-weight correlation
-    trackers used ONLY as a last-resort fallback: field-confirmed case where
-    CSRT (both implementations, on a machine with every CPU SIMD extension
-    this build could use, and where basic cv2 ops work fine) still throws a
-    bare native C++ exception at init() — pointing at something specific to
-    CSRT's own HOG/FFT-heavy code path on that machine, not fixable from
-    here. Falling further back trades tracking robustness (worse under
-    partial occlusion / scale change) for actually having a working tracker
-    at all, which beats no tracker.
+    are tried first.
+
+    KCF/MOSSE were added as a further fallback after a field case where CSRT
+    (both implementations, on a machine with every CPU SIMD extension this
+    build could use, and where basic cv2 ops like resize worked fine) still
+    threw a bare native C++ exception at init() every time. That part is
+    safe — a failed init() is a caught, recoverable Python exception.
+
+    But on that same machine, once KCF's init() *succeeded*, the whole GCS
+    process crashed a couple seconds into tracking (right when the periodic
+    update() calls would have started) — no exception, no traceback, just
+    gone. A hard native crash inside update() can't be caught with
+    try/except the way init() failures can, and taking down the entire GCS
+    (losing telemetry/control visibility, not just tracking) is a much
+    worse failure than "tracking doesn't start." So KCF/MOSSE are gated
+    behind ``_weak_tracker_fallback_allowed()`` (default OFF) until this is
+    understood — see [[m13-track-state]] memory / DOCS for the incident.
     """
     import cv2
 
@@ -52,12 +79,13 @@ def _tracker_candidates() -> list[tuple[str, "object"]]:
         candidates.append(("CSRT", cv2.TrackerCSRT_create))
     if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
         candidates.append(("CSRT-legacy", cv2.legacy.TrackerCSRT_create))
-    if hasattr(cv2, "TrackerKCF_create"):
-        candidates.append(("KCF", cv2.TrackerKCF_create))
-    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
-        candidates.append(("KCF-legacy", cv2.legacy.TrackerKCF_create))
-    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
-        candidates.append(("MOSSE-legacy", cv2.legacy.TrackerMOSSE_create))
+    if _weak_tracker_fallback_allowed():
+        if hasattr(cv2, "TrackerKCF_create"):
+            candidates.append(("KCF", cv2.TrackerKCF_create))
+        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
+            candidates.append(("KCF-legacy", cv2.legacy.TrackerKCF_create))
+        if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
+            candidates.append(("MOSSE-legacy", cv2.legacy.TrackerMOSSE_create))
     if not candidates:
         raise RuntimeError(
             "cv2 has no tracker algorithms — install opencv-contrib-python-headless, "
