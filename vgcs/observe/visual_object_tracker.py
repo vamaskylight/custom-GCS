@@ -294,78 +294,72 @@ class _InProcessTracker:
         self._algo_used = ""
 
 
-_M14_WORKER_START_TIMEOUT_S = 5.0
+_M14_WORKER_START_TIMEOUT_S = 8.0
 _M14_WORKER_UPDATE_TIMEOUT_S = 1.0
 
 
-def _tracker_worker_main(conn) -> None:
-    """Entry point for the isolated tracker child process.
+def _read_exactly(stream, n: int) -> bytes | None:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            return None  # EOF — other end closed/died
+        buf.extend(chunk)
+    return bytes(buf)
 
-    Owns exactly one ``_InProcessTracker`` and drives it from commands
-    received over ``conn``. A native crash (access violation) anywhere in
-    here kills only THIS process — the parent (``VisualObjectTracker``
-    below) detects the dead process / broken pipe and treats it as a
-    recoverable "tracker failed" or "track lost", never crashing itself.
-    This is the actual fix for the field incident where a native crash
-    inside cv2's tracker code took the entire GCS down with no exception,
-    no traceback, mid-operation: no in-process mitigation (algorithm choice,
-    disabling Intel IPP) could fully rule that out, because a genuinely
-    unstable native library can crash unpredictably — sometimes the exact
-    same call throws a clean, catchable cv2.error, sometimes it doesn't.
-    Only an OS process boundary survives that reliably.
-    """
-    engine = _InProcessTracker()
+
+def _send_framed(stream, obj) -> bool:
+    """Length-prefixed pickle frame. Returns False (never raises) on failure —
+    a broken pipe here just means the worker is gone, not a caller-facing error."""
+    import pickle
+
     try:
-        while True:
-            try:
-                msg = conn.recv()
-            except (EOFError, OSError):
-                break
-            if not msg:
-                break
-            cmd = msg[0]
-            if cmd == "start":
-                _, frame_bgr, bbox = msg
-                ok = engine.start(frame_bgr, bbox)
-                try:
-                    conn.send(("started", ok, engine.algo_used))
-                except Exception:
-                    break
-            elif cmd == "update":
-                _, frame_bgr = msg
-                ok, box = engine.update(frame_bgr)
-                try:
-                    conn.send(("updated", ok, box, engine.lost_streak()))
-                except Exception:
-                    break
-            elif cmd == "stop":
-                engine.stop()
-                break
+        data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        stream.write(len(data).to_bytes(4, "little"))
+        stream.write(data)
+        stream.flush()
+        return True
     except Exception:
-        pass
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        return False
+
+
+def _recv_framed(stream):
+    """Inverse of ``_send_framed``. Returns None on EOF/any failure."""
+    import pickle
+
+    header = _read_exactly(stream, 4)
+    if header is None:
+        return None
+    n = int.from_bytes(header, "little")
+    data = _read_exactly(stream, n)
+    if data is None:
+        return None
+    try:
+        return pickle.loads(data)
+    except Exception:
+        return None
 
 
 class VisualObjectTracker:
     """Process-isolated tracker: same public interface as ``_InProcessTracker``
     (``start``/``update``/``stop``/``is_active``/``lost_streak``/``algo_used``),
-    but every actual cv2 call happens in a disposable child process. If that
-    process dies — for ANY reason, including a hard native crash that no
-    Python try/except could ever catch — this class reports it as a normal
-    tracking failure ("track failed" / "target lost") instead of the crash
-    propagating into the GCS. A fresh worker process is spawned on each
-    ``start()``, so a new click-to-track attempt always gets a clean process,
-    not one carrying over whatever state (possibly corrupted) an earlier
-    attempt left behind.
+    but every actual cv2 call happens in a disposable child process (`python
+    -m vgcs.observe.tracker_worker_main`, launched via ``subprocess.Popen``
+    with stdin/stdout pipes — the same proven mechanism this codebase
+    already uses for the FFmpeg video decode subprocess, deliberately NOT
+    ``multiprocessing.Process``; see ``tracker_worker_main.py`` for why). If
+    that process dies — for ANY reason, including a hard native crash that
+    no Python try/except could ever catch — this class reports it as a
+    normal tracking failure ("track failed" / "target lost") instead of the
+    crash propagating into the GCS. A fresh worker process is spawned on
+    each ``start()``, so a new click-to-track attempt always gets a clean
+    process, not one carrying over whatever state (possibly corrupted) an
+    earlier attempt left behind.
     """
 
     def __init__(self) -> None:
         self._proc = None
-        self._conn = None
+        self._resp_queue = None
         self._active = False
         self._lost_streak = 0
         self._algo_used = ""
@@ -377,19 +371,23 @@ class VisualObjectTracker:
     def start(self, frame_bgr: np.ndarray, bbox: TrackBox) -> bool:
         self.stop()
         try:
-            import multiprocessing as mp
+            import subprocess
+            import sys
 
-            parent_conn, child_conn = mp.Pipe()
-            proc = mp.Process(target=_tracker_worker_main, args=(child_conn,), daemon=True)
-            proc.start()
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "vgcs.observe.tracker_worker_main"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,  # inherit console — worker's own diagnostic prints stay visible
+            )
         except Exception as ex:
             print(f"[VGCS:m14] tracker worker process failed to start: {ex!r}")
             return False
         self._proc = proc
-        self._conn = parent_conn
+        self._resp_queue = self._start_reader(proc)
         resp = self._request(("start", frame_bgr, bbox), _M14_WORKER_START_TIMEOUT_S)
         if resp is None:
-            if not proc.is_alive():
+            if proc.poll() is not None:
                 print("[VGCS:m14] tracker worker crashed during init (contained - GCS unaffected)")
             else:
                 print("[VGCS:m14] tracker worker did not respond to init in time")
@@ -405,16 +403,16 @@ class VisualObjectTracker:
         return True
 
     def update(self, frame_bgr: np.ndarray) -> tuple[bool, TrackBox | None]:
-        if not self._active or self._proc is None or self._conn is None:
+        if not self._active or self._proc is None:
             return False, None
-        if not self._proc.is_alive():
+        if self._proc.poll() is not None:
             print("[VGCS:m14] tracker worker process died (contained - GCS unaffected)")
             self._active = False
             self._lost_streak += 1
             return False, None
         resp = self._request(("update", frame_bgr), _M14_WORKER_UPDATE_TIMEOUT_S)
         if resp is None:
-            if not self._proc.is_alive():
+            if self._proc.poll() is not None:
                 print("[VGCS:m14] tracker worker process died during update (contained - GCS unaffected)")
             self._lost_streak += 1
             return False, None
@@ -431,31 +429,58 @@ class VisualObjectTracker:
         return int(self._lost_streak)
 
     def stop(self) -> None:
-        proc, conn = self._proc, self._conn
+        proc = self._proc
         self._proc = None
-        self._conn = None
+        self._resp_queue = None
         self._active = False
         self._lost_streak = 0
         self._algo_used = ""
-        if conn is not None:
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                _send_framed(proc.stdin, ("stop",))
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1.5)
+        except Exception:
             try:
-                conn.send(("stop",))
+                proc.kill()
             except Exception:
                 pass
+
+    def _start_reader(self, proc):
+        """Background thread continuously reading framed responses off the
+        worker's stdout into a queue — mirrors the existing `_drain_stderr`
+        pattern already used for the FFmpeg subprocess in pipeline.py. A
+        sentinel `None` is pushed when the stream ends (worker died/closed),
+        so `_request`'s `queue.get()` never blocks forever on a dead worker
+        beyond its explicit timeout.
+        """
+        import queue
+        import threading
+
+        q: "queue.Queue" = queue.Queue()
+
+        def _reader() -> None:
             try:
-                conn.close()
+                while True:
+                    resp = _recv_framed(proc.stdout)
+                    if resp is None:
+                        break
+                    q.put(resp)
             except Exception:
                 pass
-        if proc is not None:
-            try:
-                proc.join(timeout=1.0)
-            except Exception:
-                pass
-            try:
-                if proc.is_alive():
-                    proc.terminate()
-            except Exception:
-                pass
+            finally:
+                try:
+                    q.put(None)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_reader, daemon=True).start()
+        return q
 
     def _request(self, msg: tuple, timeout_s: float) -> tuple | None:
         """Send ``msg`` and wait up to ``timeout_s`` for a response.
@@ -463,15 +488,17 @@ class VisualObjectTracker:
         Returns None on ANY failure to get a well-formed reply — dead worker,
         broken pipe, or timeout are all treated identically by the caller.
         """
-        conn = self._conn
-        if conn is None:
+        proc = self._proc
+        q = self._resp_queue
+        if proc is None or q is None or proc.stdin is None:
+            return None
+        import queue
+
+        if not _send_framed(proc.stdin, msg):
             return None
         try:
-            conn.send(msg)
-            if not conn.poll(timeout_s):
-                return None
-            return conn.recv()
-        except Exception:
+            return q.get(timeout=timeout_s)
+        except queue.Empty:
             return None
 
 
