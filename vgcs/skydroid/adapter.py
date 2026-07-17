@@ -3837,8 +3837,29 @@ class SkydroidTopUdpAdapter:
                     )
                     if expect_reply and reply:
                         self._maybe_update_status(reply)
+                    if command in ("GSY", "GSP", "GSM"):
+                        tick = int(getattr(self, "_motion_send_log_tick", 0) or 0) + 1
+                        self._motion_send_log_tick = tick
+                        if tick % 10 == 1:  # ~once/second at M14's 100ms tick rate
+                            print(
+                                f"[VGCS:skydroid] motion command {command} sent OK "
+                                f"params={params} host={self._transport._host}:{self._transport._port}"
+                            )
                     break
-                except Exception:
+                except Exception as ex:
+                    # Field-reported: M14 follow computes correct nonzero
+                    # yaw/pitch speeds and calls all the way down to here
+                    # with no exception anywhere upstream, yet the physical
+                    # gimbal never moves. This was the last unlogged link —
+                    # a UDP send failure for a motion command (GSY/GSP/GSM)
+                    # used to be silently swallowed right here.
+                    try:
+                        print(
+                            f"[VGCS:skydroid] motion command {command} send failed: "
+                            f"{ex!r} host={self._transport._host}:{self._transport._port}"
+                        )
+                    except Exception:
+                        pass
                     if not expect_reply:
                         break
                     continue
