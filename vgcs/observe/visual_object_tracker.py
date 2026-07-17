@@ -31,6 +31,40 @@ class TrackBox:
         return (self.x + self.w / 2.0, self.y + self.h / 2.0)
 
 
+_ipp_disabled = False
+
+
+def _disable_ipp_if_needed() -> None:
+    """Turn off OpenCV's Intel IPP acceleration, once per process.
+
+    Root cause of the field CSRT crash: this wheel is built with Intel IPP
+    bundled in (`cv2.getBuildInformation()` shows "Intel IPP: 2022.2.0").
+    IPP is a well-documented source of exactly this failure signature — a
+    bare, non-descriptive native exception, only on some non-Intel-genuine
+    CPUs, only in IPP-accelerated code paths (CSRT's internal DFT-based
+    correlation is exactly that kind of path; simpler ops like cv2.resize
+    either don't hit the same IPP routine or hit a more robust one, which is
+    why `basic native op (cv2.resize) OK` didn't rule this out earlier).
+    `cv2.ipp.setUseIPP(False)` is OpenCV's own supported switch for this —
+    confirmed locally that CSRT still initializes and tracks correctly with
+    IPP off (just loses IPP's speed optimization, not correctness), and cv2
+    is used ONLY in this module in this codebase, so this has zero blast
+    radius elsewhere. Safe to apply unconditionally, not just for the
+    affected machine.
+    """
+    global _ipp_disabled
+    if _ipp_disabled:
+        return
+    _ipp_disabled = True
+    try:
+        import cv2
+
+        if hasattr(cv2, "ipp") and hasattr(cv2.ipp, "setUseIPP"):
+            cv2.ipp.setUseIPP(False)
+    except Exception:
+        pass
+
+
 def _weak_tracker_fallback_allowed() -> bool:
     """Off by default — see the field incident recorded in ``_tracker_candidates``.
 
@@ -73,6 +107,8 @@ def _tracker_candidates() -> list[tuple[str, "object"]]:
     understood — see [[m13-track-state]] memory / DOCS for the incident.
     """
     import cv2
+
+    _disable_ipp_if_needed()
 
     candidates: list[tuple[str, "object"]] = []
     if hasattr(cv2, "TrackerCSRT_create"):
@@ -134,6 +170,14 @@ def _cv2_diagnostic_report() -> list[str]:
         lines.append(f"CPU count: {cv2.getNumberOfCPUs()}")
     except Exception as ex:
         lines.append(f"getCPUFeaturesLine() failed: {ex!r}")
+
+    try:
+        if hasattr(cv2, "ipp") and hasattr(cv2.ipp, "useIPP"):
+            lines.append(f"Intel IPP active: {cv2.ipp.useIPP()} (should be False - disabled at startup)")
+        else:
+            lines.append("Intel IPP: cv2.ipp.useIPP() not available in this build")
+    except Exception as ex:
+        lines.append(f"IPP status check failed: {ex!r}")
 
     try:
         info = cv2.getBuildInformation()
