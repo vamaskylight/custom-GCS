@@ -16,15 +16,24 @@ from dataclasses import dataclass
 class FollowGains:
     """Proportional-control tuning for the follow loop.
 
-    Conservative defaults: small deadband so the gimbal doesn't dither around
-    dead-center, gain chosen so a target near the frame edge (large error)
-    saturates at max_speed_dps rather than commanding an extreme rate. These
-    are starting points for field tuning, not validated against real hardware.
+    Small deadband so the gimbal doesn't dither around dead-center; gain
+    chosen so a target near the frame edge (large error) saturates at
+    max_speed_dps rather than commanding an extreme rate.
+
+    max_speed_dps raised 20 -> 40 on 2026-07-17: first confirmed-working
+    field session showed yaw pinned at the old 20dps ceiling for many
+    consecutive ticks while the target kept drifting further toward the
+    frame edge rather than being reeled back in — the cap itself, not the
+    gain or deadband, was the bottleneck (manual hold-button speed, 5dps
+    default, is an unrelated slow/precise-aiming UI convenience, not a
+    hardware ceiling — the gimbal was already sustaining 20dps commands
+    fine). Gain/deadband left untouched so field results are attributable
+    to this one change.
     """
 
     deadband_deg: float = 0.5
     gain_dps_per_deg: float = 2.5
-    max_speed_dps: float = 20.0
+    max_speed_dps: float = 40.0
 
 
 def target_offset_deg(

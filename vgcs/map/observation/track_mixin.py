@@ -484,6 +484,14 @@ class M13MovingTargetTrackMixin:
         if not ok:
             self._m14_follow_lost_streak = int(lost_streak)
             if int(lost_streak) >= _M14_LOST_STREAK_STOP:
+                # Intentional safety stop (CSRT lost the target for
+                # ~_M14_LOST_STREAK_STOP ticks) — logged so this doesn't look
+                # like an unexplained crash/hang from the console alone; the
+                # GUI status bar message alone was easy to miss mid-flight.
+                print(
+                    f"[VGCS:m14] follow mode auto-stopped — target lost for "
+                    f"{int(lost_streak)} consecutive ticks (re-click to reacquire)"
+                )
                 self._set_status("M13 track — target lost, tracker stopped")
                 self._stop_m13_track()
             return
