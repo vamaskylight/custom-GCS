@@ -46,35 +46,59 @@ def _create_cv2_tracker(*, prefer_legacy: bool = False):
     )
 
 
-def _cv2_cpu_support_summary() -> str:
-    """Best-effort CPU SIMD dispatch summary for diagnosing native crashes.
+def _cv2_diagnostic_report() -> list[str]:
+    """Multi-line diagnostic dump for when tracker init fails natively.
 
     A bare "Unknown C++ exception from OpenCV code" at tracker init (not at
-    import) is consistent with a prebuilt wheel's SIMD-optimized code path
-    (CSRT's HOG/FFT machinery) hitting an instruction set the CPU doesn't
-    actually have — this surfaces that instead of leaving it a mystery.
+    import) could mean a prebuilt wheel's SIMD-optimized code path (CSRT's
+    HOG/FFT machinery) is hitting a CPU instruction set that isn't actually
+    there — or it could mean the whole native cv2 runtime is broken on this
+    machine, unrelated to tracking specifically. Every check below is
+    independently wrapped so one failing check doesn't hide the others, and
+    every failure prints the real exception instead of swallowing it — the
+    previous version of this function returned the single word "unavailable"
+    on ANY internal error, which itself turned out to be a dead end in the
+    field: it gave no way to tell "no CPU flags to report" apart from
+    "checking CPU flags itself crashed."
     """
+    lines: list[str] = []
     try:
         import cv2
 
-        flags = {
-            "AVX": getattr(cv2, "CPU_AVX", None),
-            "AVX2": getattr(cv2, "CPU_AVX2", None),
-            "AVX512_SKX": getattr(cv2, "CPU_AVX512_SKX", None),
-            "SSE4_2": getattr(cv2, "CPU_SSE4_2", None),
-            "FMA3": getattr(cv2, "CPU_FMA3", None),
-        }
-        parts = []
-        for name, flag in flags.items():
-            if flag is None:
-                continue
-            try:
-                parts.append(f"{name}={bool(cv2.checkHardwareSupport(flag))}")
-            except Exception:
-                pass
-        return ", ".join(parts) if parts else "unavailable"
-    except Exception:
-        return "unavailable"
+        lines.append(f"cv2 {cv2.__version__} @ {cv2.__file__}")
+    except Exception as ex:
+        lines.append(f"cv2 import/version check failed: {ex!r}")
+        return lines
+
+    # Does ANY native cv2 op work, or is the whole runtime broken (not a
+    # CSRT-specific issue at all)?
+    try:
+        tiny = np.zeros((8, 8, 3), dtype=np.uint8)
+        cv2.resize(tiny, (4, 4))
+        lines.append("basic native op (cv2.resize) OK - runtime works, failure is tracker-specific")
+    except Exception as ex:
+        lines.append(f"basic native op (cv2.resize) ALSO FAILED: {ex!r} - native runtime is broken, not just CSRT")
+
+    try:
+        # '*'-prefixed entries are detected/available on this CPU; the rest
+        # are compiled-in dispatch targets the CPU does NOT have.
+        lines.append(f"detected CPU features: {cv2.getCPUFeaturesLine()!r}")
+        lines.append(f"CPU count: {cv2.getNumberOfCPUs()}")
+    except Exception as ex:
+        lines.append(f"getCPUFeaturesLine() failed: {ex!r}")
+
+    try:
+        info = cv2.getBuildInformation()
+        idx = info.find("CPU/HW features")
+        if idx >= 0:
+            excerpt = info[idx : idx + 700].strip()
+            lines.append("build info (CPU/HW features):\n" + excerpt)
+        else:
+            lines.append("build info: no 'CPU/HW features' section found")
+    except Exception as ex:
+        lines.append(f"getBuildInformation() failed: {ex!r}")
+
+    return lines
 
 
 class VisualObjectTracker:
@@ -127,7 +151,8 @@ class VisualObjectTracker:
         # with zero console output, indistinguishable from any other cause).
         try:
             print(f"[VGCS:m14] tracker init failed: {last_ex!r}")
-            print(f"[VGCS:m14] cv2 CPU support: {_cv2_cpu_support_summary()}")
+            for line in _cv2_diagnostic_report():
+                print(f"[VGCS:m14] diag: {line}")
         except Exception:
             pass
         return False
