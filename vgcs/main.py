@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
@@ -13,6 +14,32 @@ from vgcs.app.runtime_ui import (
     configure_high_dpi_policy,
     select_font_profile,
 )
+
+# Kept open for the process lifetime — faulthandler needs a live file object.
+_crash_log_file = None
+
+
+def _enable_crash_diagnostics() -> None:
+    """Dump a C-level traceback to logs/crash_trace.log on a hard native crash
+    (segfault / access violation) instead of the process just vanishing with
+    zero output — which is what a native cv2 tracker crash looked like in the
+    field (see vgcs/observe/visual_object_tracker.py): click track, "track
+    armed" printed, then the whole app closed with no exception, no
+    traceback, nothing. A plain try/except cannot catch that class of
+    failure — it terminates the process below Python's exception machinery —
+    but faulthandler installs a low-level fault handler that can still write
+    out what was running at the moment of the crash before the OS kills it.
+    """
+    global _crash_log_file
+    try:
+        import faulthandler
+
+        log_dir = Path.cwd() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        _crash_log_file = open(log_dir / "crash_trace.log", "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_log_file, all_threads=True)
+    except Exception:
+        pass
 
 
 def _merge_unique_chromium_flag_tokens(*chunks: str) -> str:
@@ -50,6 +77,7 @@ def _apply_webengine_chromium_flags_from_env() -> None:
 
 
 def main() -> int:
+    _enable_crash_diagnostics()
     _apply_webengine_chromium_flags_from_env()
     # Must happen before QApplication to affect Qt layout metrics.
     apply_qt_scale_override()
