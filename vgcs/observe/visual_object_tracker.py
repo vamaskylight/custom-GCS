@@ -193,8 +193,11 @@ def _cv2_diagnostic_report() -> list[str]:
     return lines
 
 
-class VisualObjectTracker:
-    """Wraps a single OpenCV correlation tracker instance for one active track session.
+class _InProcessTracker:
+    """The actual OpenCV correlation-tracker wrapper — runs the real cv2 calls
+    in-process. NEVER instantiate this directly outside a worker process (see
+    ``VisualObjectTracker`` below) — a native crash inside any of its methods
+    takes down whatever process it's running in.
 
     Prefers CSRT (Channel and Spatial Reliability Tracking) — accurate and
     reasonably robust to partial occlusion/scale change for a single object
@@ -289,6 +292,187 @@ class VisualObjectTracker:
         self._active = False
         self._lost_streak = 0
         self._algo_used = ""
+
+
+_M14_WORKER_START_TIMEOUT_S = 5.0
+_M14_WORKER_UPDATE_TIMEOUT_S = 1.0
+
+
+def _tracker_worker_main(conn) -> None:
+    """Entry point for the isolated tracker child process.
+
+    Owns exactly one ``_InProcessTracker`` and drives it from commands
+    received over ``conn``. A native crash (access violation) anywhere in
+    here kills only THIS process — the parent (``VisualObjectTracker``
+    below) detects the dead process / broken pipe and treats it as a
+    recoverable "tracker failed" or "track lost", never crashing itself.
+    This is the actual fix for the field incident where a native crash
+    inside cv2's tracker code took the entire GCS down with no exception,
+    no traceback, mid-operation: no in-process mitigation (algorithm choice,
+    disabling Intel IPP) could fully rule that out, because a genuinely
+    unstable native library can crash unpredictably — sometimes the exact
+    same call throws a clean, catchable cv2.error, sometimes it doesn't.
+    Only an OS process boundary survives that reliably.
+    """
+    engine = _InProcessTracker()
+    try:
+        while True:
+            try:
+                msg = conn.recv()
+            except (EOFError, OSError):
+                break
+            if not msg:
+                break
+            cmd = msg[0]
+            if cmd == "start":
+                _, frame_bgr, bbox = msg
+                ok = engine.start(frame_bgr, bbox)
+                try:
+                    conn.send(("started", ok, engine.algo_used))
+                except Exception:
+                    break
+            elif cmd == "update":
+                _, frame_bgr = msg
+                ok, box = engine.update(frame_bgr)
+                try:
+                    conn.send(("updated", ok, box, engine.lost_streak()))
+                except Exception:
+                    break
+            elif cmd == "stop":
+                engine.stop()
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+class VisualObjectTracker:
+    """Process-isolated tracker: same public interface as ``_InProcessTracker``
+    (``start``/``update``/``stop``/``is_active``/``lost_streak``/``algo_used``),
+    but every actual cv2 call happens in a disposable child process. If that
+    process dies — for ANY reason, including a hard native crash that no
+    Python try/except could ever catch — this class reports it as a normal
+    tracking failure ("track failed" / "target lost") instead of the crash
+    propagating into the GCS. A fresh worker process is spawned on each
+    ``start()``, so a new click-to-track attempt always gets a clean process,
+    not one carrying over whatever state (possibly corrupted) an earlier
+    attempt left behind.
+    """
+
+    def __init__(self) -> None:
+        self._proc = None
+        self._conn = None
+        self._active = False
+        self._lost_streak = 0
+        self._algo_used = ""
+
+    @property
+    def algo_used(self) -> str:
+        return self._algo_used
+
+    def start(self, frame_bgr: np.ndarray, bbox: TrackBox) -> bool:
+        self.stop()
+        try:
+            import multiprocessing as mp
+
+            parent_conn, child_conn = mp.Pipe()
+            proc = mp.Process(target=_tracker_worker_main, args=(child_conn,), daemon=True)
+            proc.start()
+        except Exception as ex:
+            print(f"[VGCS:m14] tracker worker process failed to start: {ex!r}")
+            return False
+        self._proc = proc
+        self._conn = parent_conn
+        resp = self._request(("start", frame_bgr, bbox), _M14_WORKER_START_TIMEOUT_S)
+        if resp is None:
+            if not proc.is_alive():
+                print("[VGCS:m14] tracker worker crashed during init (contained - GCS unaffected)")
+            else:
+                print("[VGCS:m14] tracker worker did not respond to init in time")
+            self.stop()
+            return False
+        _, ok, algo = resp
+        if not ok:
+            self.stop()
+            return False
+        self._active = True
+        self._lost_streak = 0
+        self._algo_used = str(algo)
+        return True
+
+    def update(self, frame_bgr: np.ndarray) -> tuple[bool, TrackBox | None]:
+        if not self._active or self._proc is None or self._conn is None:
+            return False, None
+        if not self._proc.is_alive():
+            print("[VGCS:m14] tracker worker process died (contained - GCS unaffected)")
+            self._active = False
+            self._lost_streak += 1
+            return False, None
+        resp = self._request(("update", frame_bgr), _M14_WORKER_UPDATE_TIMEOUT_S)
+        if resp is None:
+            if not self._proc.is_alive():
+                print("[VGCS:m14] tracker worker process died during update (contained - GCS unaffected)")
+            self._lost_streak += 1
+            return False, None
+        _, ok, box, lost = resp
+        self._lost_streak = int(lost)
+        if not ok or box is None:
+            return False, None
+        return True, box
+
+    def is_active(self) -> bool:
+        return bool(self._active)
+
+    def lost_streak(self) -> int:
+        return int(self._lost_streak)
+
+    def stop(self) -> None:
+        proc, conn = self._proc, self._conn
+        self._proc = None
+        self._conn = None
+        self._active = False
+        self._lost_streak = 0
+        self._algo_used = ""
+        if conn is not None:
+            try:
+                conn.send(("stop",))
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if proc is not None:
+            try:
+                proc.join(timeout=1.0)
+            except Exception:
+                pass
+            try:
+                if proc.is_alive():
+                    proc.terminate()
+            except Exception:
+                pass
+
+    def _request(self, msg: tuple, timeout_s: float) -> tuple | None:
+        """Send ``msg`` and wait up to ``timeout_s`` for a response.
+
+        Returns None on ANY failure to get a well-formed reply — dead worker,
+        broken pipe, or timeout are all treated identically by the caller.
+        """
+        conn = self._conn
+        if conn is None:
+            return None
+        try:
+            conn.send(msg)
+            if not conn.poll(timeout_s):
+                return None
+            return conn.recv()
+        except Exception:
+            return None
 
 
 def bbox_around_point(
