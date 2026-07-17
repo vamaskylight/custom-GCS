@@ -298,6 +298,28 @@ _M14_WORKER_START_TIMEOUT_S = 8.0
 _M14_WORKER_UPDATE_TIMEOUT_S = 1.0
 
 
+def _encode_frame(frame_bgr: np.ndarray) -> tuple:
+    """(shape, dtype-name, raw-bytes) instead of the ndarray itself.
+
+    Field-confirmed crash point: pickling a raw numpy.ndarray (inside
+    numpy's own C-level __reduce__/pickling code) hard-crashed the PARENT
+    process on one client machine — an access violation, not a catchable
+    exception — even though the array itself was a perfectly ordinary,
+    freshly-built 960x540x3 uint8 frame. Whatever is wrong with that
+    machine's native-code environment (the same one that crashed cv2's own
+    tracker init and multiprocessing's spawn bootstrap), pickling plain
+    ``bytes`` is about as simple as serialization gets and avoids numpy's
+    array-pickling code path entirely.
+    """
+    arr = np.ascontiguousarray(frame_bgr)
+    return (arr.shape, str(arr.dtype), arr.tobytes())
+
+
+def _decode_frame(encoded: tuple) -> np.ndarray:
+    shape, dtype_name, raw = encoded
+    return np.frombuffer(raw, dtype=np.dtype(dtype_name)).reshape(shape)
+
+
 def _read_exactly(stream, n: int) -> bytes | None:
     buf = bytearray()
     while len(buf) < n:
@@ -385,7 +407,7 @@ class VisualObjectTracker:
             return False
         self._proc = proc
         self._resp_queue = self._start_reader(proc)
-        resp = self._request(("start", frame_bgr, bbox), _M14_WORKER_START_TIMEOUT_S)
+        resp = self._request(("start", _encode_frame(frame_bgr), bbox), _M14_WORKER_START_TIMEOUT_S)
         if resp is None:
             if proc.poll() is not None:
                 print("[VGCS:m14] tracker worker crashed during init (contained - GCS unaffected)")
@@ -410,7 +432,7 @@ class VisualObjectTracker:
             self._active = False
             self._lost_streak += 1
             return False, None
-        resp = self._request(("update", frame_bgr), _M14_WORKER_UPDATE_TIMEOUT_S)
+        resp = self._request(("update", _encode_frame(frame_bgr)), _M14_WORKER_UPDATE_TIMEOUT_S)
         if resp is None:
             if self._proc.poll() is not None:
                 print("[VGCS:m14] tracker worker process died during update (contained - GCS unaffected)")
