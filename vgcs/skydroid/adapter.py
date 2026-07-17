@@ -154,8 +154,26 @@ _MOTION_COMMANDS = frozenset(
         "PTZ_STOP",
         "ZMC",
         "FCC",
+        "GSY_GSP_SPLIT",
     }
 )
+
+
+def _m14_split_axis_speed_enabled() -> bool:
+    """Off by default — see ``SkydroidTopUdpAdapter._send_split_axis_speed``.
+
+    Field hypothesis, not yet confirmed: GSM (combined yaw+pitch speed) has
+    likely never been exercised on this hardware outside M14 — manual
+    gimbal control only ever moves one axis at a time (separate mouse
+    buttons, physically can't click two at once), so only GSY/GSP
+    individually are field-confirmed working. M14 almost always needs both
+    axes at once (a walking person is rarely on exactly one axis), so it
+    hits GSM on nearly every tick. Set VGCS_M14_SPLIT_AXIS_SPEED=1 to make
+    M14 send GSY then GSP as two separate, already-proven commands instead
+    of one combined GSM, to test this directly.
+    """
+    raw = str(os.environ.get("VGCS_M14_SPLIT_AXIS_SPEED", "0") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -3555,6 +3573,18 @@ class SkydroidTopUdpAdapter:
     def set_speed(self, yaw: float, pitch: float) -> None:
         y = float(yaw)
         p = float(pitch)
+        if (
+            _m14_split_axis_speed_enabled()
+            and abs(y) >= 1e-6
+            and abs(p) >= 1e-6
+        ):
+            # See _m14_split_axis_speed_enabled() / _send_split_axis_speed —
+            # sends GSY+GSP (proven single-axis) instead of GSM (unproven
+            # combined) as one atomic queue item, not two separate enqueue
+            # calls (which the motion-command coalescing logic would drop
+            # one half of — see _drop_pending_motion_commands).
+            self._enqueue(["GSY_GSP_SPLIT"], {"yaw": y, "pitch": p}, False)
+            return
         commands = self._speed_commands_for(y, p)
         if not commands:
             return
@@ -3825,6 +3855,15 @@ class SkydroidTopUdpAdapter:
                 except Exception:
                     pass
                 continue
+            if commands and commands[0] == "GSY_GSP_SPLIT":
+                try:
+                    self._send_split_axis_speed(
+                        float(params.get("yaw", 0.0) or 0.0),
+                        float(params.get("pitch", 0.0) or 0.0),
+                    )
+                except Exception:
+                    pass
+                continue
             self._ensure_active_transport()
             for command in commands:
                 frame = build_top_frame(command, params)
@@ -3863,6 +3902,39 @@ class SkydroidTopUdpAdapter:
                     if not expect_reply:
                         break
                     continue
+
+    def _send_split_axis_speed(self, yaw: float, pitch: float) -> None:
+        """Send GSY then GSP as two separate, already-field-confirmed single-
+        axis commands, instead of one combined GSM — see
+        _m14_split_axis_speed_enabled() for why. Handled as a single atomic
+        worker-loop item specifically so the two sends can never be split
+        apart by the motion-command coalescing logic (two separate
+        `_enqueue()` calls would let the second call's coalescing drop the
+        first, since both are motion commands — see
+        `_drop_pending_motion_commands`).
+        """
+        self._ensure_active_transport()
+        for command, params in (("GSY", {"yaw": float(yaw)}), ("GSP", {"pitch": float(pitch)})):
+            frame = build_top_frame(command, params)
+            try:
+                self._transport.send_and_receive(
+                    frame, expect_reply=False, log=True, timeout_s=0.08
+                )
+                tick = int(getattr(self, "_motion_send_log_tick", 0) or 0) + 1
+                self._motion_send_log_tick = tick
+                if tick % 10 == 1:
+                    print(
+                        f"[VGCS:skydroid] motion command {command} (split) sent OK "
+                        f"params={params} host={self._transport._host}:{self._transport._port}"
+                    )
+            except Exception as ex:
+                try:
+                    print(
+                        f"[VGCS:skydroid] motion command {command} (split) send failed: "
+                        f"{ex!r} host={self._transport._host}:{self._transport._port}"
+                    )
+                except Exception:
+                    pass
 
     def _send_zoom_burst(self, level: float) -> None:
         """C13 absolute zoom: DZM + MUL on active host and alternate UDP ports."""
