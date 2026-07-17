@@ -522,6 +522,26 @@ class M13MovingTargetTrackMixin:
             return
         self._m13_video_nudge_mono = now
         notify_companion_preview_motion(duration_s=180.0)
+        if self._m14_ai_follow_active():
+            # M14's video feed IS the tracking input (unlike GOT+SUM, which
+            # tracks entirely in C13 firmware — a stale GCS preview there is
+            # only cosmetic). Reconnecting costs several seconds of zero
+            # frames (decode restart + GOP warmup) with NOTHING for the CSRT
+            # tracker to update on — actively worse for continuous follow
+            # than tolerating the gap, consistent with how a stall this
+            # short is already treated as normal everywhere else in the
+            # video pipeline (the general stall watchdog is disabled by
+            # default with that exact reasoning). M14's own lost-streak
+            # safety net (_M14_LOST_STREAK_STOP, ~3s) still stops tracking
+            # if the target is genuinely gone, so this isn't unguarded.
+            try:
+                print(
+                    f"[VGCS:m13] video stall during M14 track ({stale_age:.1f}s) "
+                    "— tolerating, not reconnecting (would interrupt follow)"
+                )
+            except Exception:
+                pass
+            return
         try:
             print(
                 f"[VGCS:m13] video stall during track ({stale_age:.1f}s) "
