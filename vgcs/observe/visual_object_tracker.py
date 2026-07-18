@@ -124,6 +124,32 @@ def _create_csrt_modern():
     try:
         params = cv2.TrackerCSRT_Params()
         params.padding = _M14_CSRT_SEARCH_PADDING
+        # Field-confirmed 2026-07-17 via the new box-size diagnostic
+        # (track_mixin.py logs TrackBox w/h each tick): the tracked box
+        # monotonically shrank from the initial 60x60 click size down to
+        # ~36x36 (a ~40% shrink) over roughly a dozen ticks — a few seconds
+        # — then lost lock on the very next large/reversing motion. That's
+        # too fast to be a real person walking meaningfully farther from
+        # the camera; it's CSRT's own scale-search (cv2 default explores 33
+        # candidate scales per update) drifting the box size, which is a
+        # known CSRT weakness independent of padding. This matters beyond
+        # cosmetics: `padding` is a MULTIPLIER on box size, so a shrinking
+        # box also shrinks the absolute search radius in real pixels over
+        # the course of a track — directly explaining the client's paired
+        # report that the same track works fine at first, then fails
+        # specifically once the target reverses direction (a shrunk box's
+        # smaller absolute search window can no longer cover a reversal
+        # that the original 60px box's search window would have). Setting
+        # number_of_scales=1 disables CSRT's scale search entirely — the
+        # box tracks POSITION only and stays locked to the size it was
+        # clicked at for the whole track, removing this failure mode. Real
+        # tradeoff, stated plainly: a target that genuinely changes apparent
+        # size a lot (walking much closer/farther over a long track) will
+        # progressively correlate worse against a stale-sized box — but for
+        # the multi-second tracking windows seen in this feature's actual
+        # field use so far, a locked box size removing a confirmed, fast,
+        # repeatable failure mode is the better trade.
+        params.number_of_scales = 1
         return cv2.TrackerCSRT_create(params)
     except Exception:
         return cv2.TrackerCSRT_create()
