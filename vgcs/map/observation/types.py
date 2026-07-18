@@ -141,8 +141,11 @@ class M13RangeTask(QRunnable):
 
 
 class M14FollowBridge(QObject):
-    # ok, u_norm, v_norm, yaw_speed_dps, pitch_speed_dps, lost_streak, generation
-    updated = Signal(bool, float, float, float, float, int, int)
+    # ok, u_norm, v_norm, yaw_speed_dps, pitch_speed_dps, lost_streak,
+    # generation, box_w_px, box_h_px (box size added 2026-07-17 — diagnostic
+    # only, to tell apart a shrinking/growing box drifting onto the wrong
+    # feature from a stable box that abruptly loses lock on real motion)
+    updated = Signal(bool, float, float, float, float, int, int, float, float)
 
 
 class M14FollowTask(QRunnable):
@@ -182,6 +185,7 @@ class M14FollowTask(QRunnable):
         ok = False
         u_norm = v_norm = 0.5
         yaw_spd = pitch_spd = 0.0
+        box_w = box_h = 0.0
         lost_streak = 0
         try:
             t0 = time.perf_counter()
@@ -203,6 +207,7 @@ class M14FollowTask(QRunnable):
                 cx, cy = box.center_xy
                 u_norm = max(0.0, min(1.0, cx / max(1.0, float(self._frame_w))))
                 v_norm = max(0.0, min(1.0, cy / max(1.0, float(self._frame_h))))
+                box_w, box_h = float(box.w), float(box.h)
                 dyaw, dpitch = target_offset_deg(
                     cx,
                     cy,
@@ -224,6 +229,8 @@ class M14FollowTask(QRunnable):
                 float(pitch_spd),
                 int(lost_streak),
                 int(self._generation),
+                float(box_w),
+                float(box_h),
             )
         except Exception:
             pass
