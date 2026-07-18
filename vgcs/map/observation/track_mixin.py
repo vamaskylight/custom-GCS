@@ -243,6 +243,10 @@ class M13MovingTargetTrackMixin:
         self._m14_follow_task_inflight = False
         self._m14_follow_lost_streak = 0
         self._m14_follow_ticks_skipped = 0
+        for axis in ("yaw", "pitch"):
+            setattr(self, f"_m14_att_stuck_last_{axis}", None)
+            setattr(self, f"_m14_att_stuck_streak_{axis}", 0)
+            setattr(self, f"_m14_att_stuck_reported_{axis}", False)
         self._m13_track_active = True
         self._m13_track_armed = True
         self._m13_track_click_uv = (float(u), float(v))
@@ -482,6 +486,58 @@ class M13MovingTargetTrackMixin:
         )
         QThreadPool.globalInstance().start(task)
 
+    _M14_ATT_STUCK_EPS_DEG = 0.3
+    _M14_ATT_STUCK_SPEED_DPS = 5.0
+    _M14_ATT_STUCK_TICKS = 20  # ~2s of real ticks before flagging (not a one-shot)
+
+    def _m14_att_stuck_check(
+        self,
+        att_yaw: float | None,
+        att_pitch: float | None,
+        yaw_speed_dps: float,
+        pitch_speed_dps: float,
+    ) -> None:
+        """Flag (console only) a gimbal axis whose real telemetry has
+        stopped changing for ~2s despite a sustained, non-trivial commanded
+        speed — the signature of a real mechanical travel limit (target
+        clicked further than the gimbal can physically reach), not a
+        software bug. Distinct from the frozen-from-the-start case (already
+        separately diagnosable): this only fires after genuine motion was
+        already observed, so it needs its own per-axis streak counter."""
+        for axis, att, spd in (
+            ("yaw", att_yaw, yaw_speed_dps),
+            ("pitch", att_pitch, pitch_speed_dps),
+        ):
+            last_attr = f"_m14_att_stuck_last_{axis}"
+            streak_attr = f"_m14_att_stuck_streak_{axis}"
+            reported_attr = f"_m14_att_stuck_reported_{axis}"
+            if att is None:
+                setattr(self, streak_attr, 0)
+                setattr(self, reported_attr, False)
+                continue
+            last = getattr(self, last_attr, None)
+            setattr(self, last_attr, att)
+            if last is None:
+                continue
+            moving_enough = abs(float(spd)) >= self._M14_ATT_STUCK_SPEED_DPS
+            barely_changed = abs(att - float(last)) < self._M14_ATT_STUCK_EPS_DEG
+            if moving_enough and barely_changed:
+                streak = int(getattr(self, streak_attr, 0) or 0) + 1
+                setattr(self, streak_attr, streak)
+                if streak >= self._M14_ATT_STUCK_TICKS and not bool(
+                    getattr(self, reported_attr, False)
+                ):
+                    setattr(self, reported_attr, True)
+                    print(
+                        f"[VGCS:m14] {axis} appears stuck at {att:.1f}deg — "
+                        f"commanding {spd:.1f}dps but real attitude hasn't moved "
+                        f"in ~{streak * 0.1:.1f}s. Likely a mechanical travel "
+                        f"limit for this target position, not a software issue."
+                    )
+            else:
+                setattr(self, streak_attr, 0)
+                setattr(self, reported_attr, False)
+
     def _on_m14_follow_updated(
         self,
         ok: bool,
@@ -533,26 +589,34 @@ class M13MovingTargetTrackMixin:
         # (~1/s at the 100ms tick rate) so this is diagnostic, not log spam.
         tick = int(getattr(self, "_m14_follow_log_tick", 0) or 0) + 1
         self._m14_follow_log_tick = tick
+        # Real gimbal attitude, fetched every tick (not just the throttled
+        # print below) so the stuck-at-limit check right after has a fresh
+        # sample to compare each cycle, not a once-a-second snapshot.
+        att_yaw = att_pitch = None
+        att_str = "unsupported"
+        try:
+            get_status = getattr(cc, "get_gimbal_status", None)
+            st = get_status() if callable(get_status) else None
+            if st is not None and bool(getattr(st, "supported", False)):
+                if st.yaw_deg is not None and st.pitch_deg is not None:
+                    att_yaw, att_pitch = float(st.yaw_deg), float(st.pitch_deg)
+                    att_str = f"yaw={att_yaw:.1f} pitch={att_pitch:.1f}"
+                else:
+                    att_str = "no-reading"
+        except Exception:
+            pass
+        # Field-found: a large, sustained commanded speed on one axis with
+        # the tracked box never converging can mean the gimbal genuinely
+        # isn't moving OR that it physically CAN'T move any further (a real
+        # mechanical travel limit) — e.g. a target clicked near the top of
+        # frame needing more pitch-up travel than the unit has. The signature
+        # is distinctive: real telemetry keeps changing right up to a point,
+        # then goes flat while the command stays large — unlike a frozen-
+        # from-the-start reading (already-diagnosed separately), this only
+        # shows up after genuine motion, so it needs its own check across
+        # consecutive ticks, not a one-shot comparison.
+        self._m14_att_stuck_check(att_yaw, att_pitch, yaw_speed_dps, pitch_speed_dps)
         if tick % 10 == 1:
-            # Field-reported: commanded yaw/pitch speed stays substantial and
-            # nonzero for many consecutive ticks with the tracked box's
-            # position never converging — consistent with either the gimbal
-            # genuinely not moving, or it having hit a mechanical travel
-            # limit. Logging the gimbal's OWN reported attitude (independent
-            # ground truth from telemetry, not inferred from box position)
-            # settles which it is directly in the next field log.
-            att_str = "unsupported"
-            try:
-                get_status = getattr(cc, "get_gimbal_status", None)
-                st = get_status() if callable(get_status) else None
-                if st is not None and bool(getattr(st, "supported", False)):
-                    att_str = (
-                        f"yaw={float(st.yaw_deg):.1f} pitch={float(st.pitch_deg):.1f}"
-                        if st.yaw_deg is not None and st.pitch_deg is not None
-                        else "no-reading"
-                    )
-            except Exception:
-                pass
             print(
                 f"[VGCS:m14] follow uv=({u_norm:.3f},{v_norm:.3f}) "
                 f"yaw_spd={float(yaw_speed_dps):.2f}dps pitch_spd={float(pitch_speed_dps):.2f}dps "
