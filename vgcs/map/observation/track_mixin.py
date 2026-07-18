@@ -491,6 +491,8 @@ class M13MovingTargetTrackMixin:
         pitch_speed_dps: float,
         lost_streak: int,
         generation: int,
+        box_w: float = 0.0,
+        box_h: float = 0.0,
     ) -> None:
         self._m14_follow_task_inflight = False
         if int(generation or 0) != int(getattr(self, "_m13_track_generation", 0) or 0):
@@ -554,7 +556,7 @@ class M13MovingTargetTrackMixin:
             print(
                 f"[VGCS:m14] follow uv=({u_norm:.3f},{v_norm:.3f}) "
                 f"yaw_spd={float(yaw_speed_dps):.2f}dps pitch_spd={float(pitch_speed_dps):.2f}dps "
-                f"gimbal_att=({att_str}) "
+                f"gimbal_att=({att_str}) box=({float(box_w):.0f}x{float(box_h):.0f}) "
                 f"cc={type(cc).__name__ if cc is not None else None} "
                 f"has_set_speed={callable(set_speed)}"
             )

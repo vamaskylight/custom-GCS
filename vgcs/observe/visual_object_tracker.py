@@ -83,7 +83,22 @@ def _weak_tracker_fallback_allowed() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
-_M14_CSRT_SEARCH_PADDING = 4.5  # cv2 default is 3.0
+_M14_CSRT_SEARCH_PADDING = 5.5  # cv2 default is 3.0; was 4.5, raised again 2026-07-17
+# Now that the gimbal-movement bug (GSM dropping yaw) is fixed, remaining
+# field-reported track loss splits into two patterns: (1) a long, real,
+# successful chase that eventually loses lock, and (2) an abrupt loss within
+# a few ticks of a fresh click. A wider search window helps (1) — CSRT can
+# still find real fast motion instead of falling outside its search radius —
+# but a WIDER window is a genuine, not free, tradeoff: it also increases the
+# chance of drifting onto nearby background clutter, which historically
+# looked like a possible cause of (1)'s "converges suspiciously exactly to
+# frame center, then loses" pattern too. This bump is a calculated, testable
+# step (this direction has already helped once, 3.0->4.5), not a guaranteed
+# fix — see TrackBox w/h now logged alongside follow updates (track_mixin.py)
+# specifically to tell these two failure patterns apart from the NEXT field
+# log (a shrinking/growing box before loss suggests drift; a stable box
+# right up to an abrupt loss suggests real motion/occlusion outrunning this
+# padding) rather than guessing again blind.
 
 
 def _create_csrt_modern():
