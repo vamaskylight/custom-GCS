@@ -160,19 +160,20 @@ _MOTION_COMMANDS = frozenset(
 
 
 def _m14_split_axis_speed_enabled() -> bool:
-    """Off by default — see ``SkydroidTopUdpAdapter._send_split_axis_speed``.
-
-    Field hypothesis, not yet confirmed: GSM (combined yaw+pitch speed) has
-    likely never been exercised on this hardware outside M14 — manual
-    gimbal control only ever moves one axis at a time (separate mouse
-    buttons, physically can't click two at once), so only GSY/GSP
-    individually are field-confirmed working. M14 almost always needs both
-    axes at once (a walking person is rarely on exactly one axis), so it
-    hits GSM on nearly every tick. Set VGCS_M14_SPLIT_AXIS_SPEED=1 to make
-    M14 send GSY then GSP as two separate, already-proven commands instead
-    of one combined GSM, to test this directly.
+    """On by default — field-CONFIRMED on 2026-07-17 (see m13-track-state
+    memory / project history): GSM (combined yaw+pitch speed) reliably
+    dropped/ignored the yaw component on the client's C12 unit while pitch
+    responded normally, in the same session, same command cadence — yaw
+    telemetry stayed frozen at ~0° through 20+ ticks pinned at the 40dps
+    ceiling in both directions under GSM, then moved 50+ real degrees and
+    converged/held a stable centered lock under split GSY+GSP. Manual
+    gimbal control only ever moves one axis at a time anyway (separate
+    mouse buttons), so GSY/GSP individually were always the field-proven
+    path — GSM combined was the one that was never validated, and turned
+    out to be the bug. Set VGCS_M14_SPLIT_AXIS_SPEED=0 to force the old
+    combined-GSM behavior back on, if ever needed for comparison/rollback.
     """
-    raw = str(os.environ.get("VGCS_M14_SPLIT_AXIS_SPEED", "0") or "0").strip().lower()
+    raw = str(os.environ.get("VGCS_M14_SPLIT_AXIS_SPEED", "1") or "1").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
