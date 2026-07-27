@@ -677,6 +677,34 @@ def resolve_siyi_host(settings, *, default: str = "192.168.144.25") -> str:
     return str(default)
 
 
+@dataclass(frozen=True)
+class SiyiCameraProfile:
+    """Frame size + lens FOV for M13/M14's pixel<->angle aim math — the SIYI
+    counterpart of ``SkydroidCommandProfile`` (see command_map.py), minus the
+    command-tag fields since the SIYI SDK is a binary frame protocol, not
+    string commands.
+
+    FOV is from the ZR10 manual (DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md):
+    vendor-stated diagonal 79.5° / horizontal 71.5° at 1x (widest) zoom.
+    fov_v_deg is *derived* from those two via the rectilinear diag/H/V
+    relation (tan(D/2)^2 = tan(H/2)^2 + tan(V/2)^2), not vendor-stated
+    directly — hence frame_specs_confirmed=False, same honesty flag
+    SkydroidCommandProfile uses for unmeasured camera specs.
+
+    ZR10 has a real 10x OPTICAL zoom (unlike C13's fixed lens): this FOV
+    only holds at 1x zoom. The aim-correction math has no zoom-level input
+    yet, so gimbal follow will under/over-correct at higher zoom levels
+    until FOV is made zoom-aware — a known limitation, not a bug.
+    """
+
+    profile_id: str = "zr10_default"
+    frame_w: int = 1920
+    frame_h: int = 1080
+    fov_h_deg: float = 71.5
+    fov_v_deg: float = 45.2
+    frame_specs_confirmed: bool = False
+
+
 class SiyiCameraControl:
     """SIYI Gimbal SDK over UDP (ZR10 / ZT6 / A8 mini — port 37260)."""
 
@@ -694,10 +722,15 @@ class SiyiCameraControl:
             timeout_s=timeout_s,
             retries=retries,
         )
+        self._profile = SiyiCameraProfile()
         self._adapter.start()
 
     def close(self) -> None:
         self._adapter.stop()
+
+    def active_camera_profile(self) -> SiyiCameraProfile:
+        """Frame size + FOV for M13/M14's aim math — see SiyiCameraProfile."""
+        return self._profile
 
     def set_zoom(self, level: float) -> None:
         del level
@@ -811,6 +844,32 @@ def resolve_camera_control_primary(control: object | None) -> object | None:
 def uses_skydroid_top_camera(control: object | None) -> bool:
     """True when C13/TOP UDP is the active camera backend (not MAVLink mount zoom)."""
     return isinstance(resolve_camera_control_primary(control), SkydroidCameraControl)
+
+
+def uses_siyi_camera(control: object | None) -> bool:
+    """True when the SIYI SDK UDP backend (ZR10/ZT6/A8 mini) is active."""
+    return isinstance(resolve_camera_control_primary(control), SiyiCameraControl)
+
+
+def supports_m13_track(control: object | None) -> bool:
+    """Cameras M13 click-to-track can arm on: Skydroid TOP (firmware GOT+SUM,
+    or C12's software AI-follow) and SIYI SDK (always software AI-follow —
+    the SIYI SDK has no onboard track/GOT command to fall back to; see
+    DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md)."""
+    primary = resolve_camera_control_primary(control)
+    return isinstance(primary, (SkydroidCameraControl, SiyiCameraControl))
+
+
+def camera_has_laser_rangefinder(control: object | None) -> bool:
+    """False only for camera backends confirmed to have no onboard rangefinder
+    (SIYI ZR10 — confirmed absent from its spec sheet). Every other backend,
+    including unknown/test doubles, defaults True: the safe assumption is
+    "try the SLR fetch", not "assume it's missing", since a fetch that comes
+    back empty is harmless while skipping a real rangefinder would silently
+    degrade M13 geo-reference accuracy. SIYI ZR10 instead falls back to the
+    ray/DEM ground-intersection method
+    (vgcs.observe.geo_reference.compute_geo_reference)."""
+    return not isinstance(resolve_camera_control_primary(control), SiyiCameraControl)
 
 
 def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:

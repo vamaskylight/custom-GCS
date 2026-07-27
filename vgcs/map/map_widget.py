@@ -774,6 +774,7 @@ from vgcs.map.observation.types import (
     LrfLockTask,
     M13RangeBridge,
     M13TrackBridge,
+    M14DetectBridge,
     M14FollowBridge,
     ObservationExportBridge,
     ObservationSnapshotBridge,
@@ -935,6 +936,12 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._m14_tracker_active = False
         self._m14_follow_task_inflight = False
         self._m14_follow_lost_streak = 0
+        self._m14_detect_bridge = M14DetectBridge(self)
+        self._m14_detect_bridge.detected.connect(self._on_m14_detect_result)
+        self._m14_detect_task_inflight = False
+        self._m14_detect_generation = 0
+        self._m14_threat_zone_streak = 0
+        self._m14_threat_zone_reported = False
         self._video_ui_render_mono = 0.0
         self._split_ui_render_mono = 0.0
         self._split_cache_mono: dict[str, float] = {}
@@ -1577,6 +1584,11 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_obs_clip = QPushButton("Short Clip")
         self._btn_obs_export = QPushButton("Export Obs")
         self._btn_obs_clear = QPushButton("Clear Obs")
+        self._btn_m14_detect = QPushButton("Detect")
+        self._btn_m14_detect.setToolTip(
+            "Run on-demand object + license-plate-region detection on the "
+            "current video frame (M14)"
+        )
         self._perf_mode = QComboBox()
         self._perf_mode.setMinimumWidth(92)
         self._perf_mode.addItems(["Perf: Auto", "Perf: Low", "Perf: High"])
@@ -1680,6 +1692,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         tools.addWidget(self._btn_obs_clip, 2, 15)
         tools.addWidget(self._btn_obs_export, 2, 16)
         tools.addWidget(self._btn_obs_clear, 2, 17)
+        tools.addWidget(self._btn_m14_detect, 2, 18)
         toolbar.setLayout(tools)
         self._toolbar = toolbar
 
@@ -1725,6 +1738,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_obs_clip.clicked.connect(self._capture_observation_clip)
         self._btn_obs_export.clicked.connect(self._export_observations)
         self._btn_obs_clear.clicked.connect(self._clear_observations)
+        self._btn_m14_detect.clicked.connect(self._m14_run_detection)
         self._perf_mode.currentIndexChanged.connect(self._on_perf_mode_changed)
         self._wp_selector.currentIndexChanged.connect(self._on_wp_selected)
         self._btn_apply_wp_alt.clicked.connect(self._apply_altitude_to_selected)

@@ -13,6 +13,7 @@ from PySide6.QtGui import QImage
 from vgcs.map.image_io import save_qimage_to_path
 from vgcs.map.video.frame_convert import qimage_to_bgr_array
 from vgcs.observe.gimbal_follow_control import FollowGains, follow_speed_command, target_offset_deg
+from vgcs.observe.object_detector import Detection, VisualObjectDetector
 from vgcs.observe.visual_object_tracker import VisualObjectTracker
 from vgcs.observe.dooaf import (
     DOOAF_ROLE_IMPACT,
@@ -232,6 +233,46 @@ class M14FollowTask(QRunnable):
                 float(box_w),
                 float(box_h),
             )
+        except Exception:
+            pass
+
+
+class M14DetectBridge(QObject):
+    # ok, detections (list[Detection]), generation
+    detected = Signal(bool, object, int)
+
+
+class M14DetectTask(QRunnable):
+    """M14 — one on-demand object/plate-region detection pass, off the GUI
+    thread (cv2.dnn inference is real image-processing work, and this runs
+    against an isolated subprocess, same division of labor as M14FollowTask
+    / M13RangeTask: worker computes, GUI thread applies the result)."""
+
+    def __init__(
+        self,
+        detector: VisualObjectDetector,
+        frame_bgr,
+        bridge: "M14DetectBridge",
+        *,
+        generation: int,
+    ) -> None:
+        super().__init__()
+        self._detector = detector
+        self._frame_bgr = frame_bgr
+        self._bridge = bridge
+        self._generation = int(generation)
+
+    def run(self) -> None:
+        ok = False
+        dets: list[Detection] = []
+        try:
+            dets = self._detector.detect(self._frame_bgr)
+            ok = True
+        except Exception as exc:
+            print(f"[VGCS:m14detect] detection task failed: {exc}")
+            ok = False
+        try:
+            self._bridge.detected.emit(bool(ok), dets, int(self._generation))
         except Exception:
             pass
 
@@ -531,6 +572,8 @@ class ObservationExportTask(QRunnable):
 __all__ = [
     "LrfLockBridge",
     "LrfLockTask",
+    "M14DetectBridge",
+    "M14DetectTask",
     "M14FollowBridge",
     "M14FollowTask",
     "M13RangeBridge",

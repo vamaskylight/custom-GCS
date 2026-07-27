@@ -1,22 +1,26 @@
-"""M13 — Moving target tracking (C13 GOT + SUM, GCS-computed map coordinates)."""
+"""M13 — Moving target tracking (C13 GOT+SUM or SIYI/C12 software AI-follow,
+GCS-computed map coordinates)."""
 
 from __future__ import annotations
 
 import os
+import sys
 
 from PySide6.QtCore import QThreadPool, QTimer
 
-from vgcs.map.native_video_overlay import VideoOverlayM13Track
+from vgcs.map.native_video_overlay import VideoOverlayDetection, VideoOverlayM13Track
 from vgcs.map.observation.types import (
     M13RangeTask,
     M13TrackBridge,
     M13TrackStartTask,
+    M14DetectTask,
     M14FollowTask,
 )
 from vgcs.map.video.frame_convert import qimage_to_bgr_array
-from vgcs.observe.geo_reference import compute_lrf_slant_geo
+from vgcs.observe.geo_reference import compute_geo_reference, compute_lrf_slant_geo
+from vgcs.observe.object_detector import VisualObjectDetector
 from vgcs.observe.visual_object_tracker import VisualObjectTracker, bbox_around_point
-from vgcs.video.camera_control import uses_skydroid_top_camera
+from vgcs.video.camera_control import camera_has_laser_rangefinder, supports_m13_track
 from vgcs.video.pipeline import (
     notify_companion_preview_motion,
     notify_companion_visual_track,
@@ -24,8 +28,10 @@ from vgcs.video.pipeline import (
 
 # Cameras where GOT/SUM has no confirmed continuous-follow capability (or,
 # for C12, is simply not yet wired through — see DOCS/SKYDROID-TOP-PROTOCOL.md),
-# so M13 tracks the target itself in software instead of trusting firmware.
-_M14_AI_FOLLOW_PROFILE_IDS = {"c12_default"}
+# or where there is no firmware GOT+SUM equivalent at all (SIYI SDK — see
+# DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md), so M13 tracks the target itself in
+# software instead of trusting firmware.
+_M14_AI_FOLLOW_PROFILE_IDS = {"c12_default", "zr10_default"}
 _M14_TRACK_BOX_SIZE_PX = 60
 # M14 ticks faster than the legacy GOT+SUM path (100ms vs 200ms): CSRT's own
 # search window is what actually limits how far a target can move between
@@ -36,6 +42,36 @@ _M14_TRACK_BOX_SIZE_PX = 60
 _M13_TRACK_INTERVAL_MS = 200
 _M14_TRACK_INTERVAL_MS = 100
 _M14_LOST_STREAK_STOP = 30  # ~3s at the 100ms M14 tick rate
+
+# M14 — zone/rule-based threat alert: fires when the M13/M14 tracked target's
+# computed geo position comes within this many meters of the vehicle's own
+# position. Untuned default — flagged for client input, same honesty pattern
+# used throughout this project for values with no field data yet.
+_M14_THREAT_ZONE_RADIUS_M = 100.0
+_M14_THREAT_ZONE_STREAK_TICKS = 3  # a few consecutive samples, not one noisy geo fix
+
+
+def _play_m14_threat_alert_sound() -> None:
+    """Best-effort audible cue for the threat alert — the "optional sound"
+    half of REQ-22's "notifications, log, optional sound" (the status-bar
+    banner above is the notification; the console print in
+    ``_m14_threat_zone_check`` is the log).
+
+    ``winsound.MessageBeep`` triggers the OS's own asynchronous system-sound
+    playback and returns immediately — it does not block waiting for
+    playback to finish, so this is safe to call straight from the GUI
+    thread. Windows-only (stdlib, no new dependency); a no-op everywhere
+    else. Never allowed to raise: a broken/missing sound device must not
+    take down the alert it's decorating.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import winsound
+
+        winsound.MessageBeep(winsound.MB_ICONHAND)
+    except Exception:
+        pass
 
 
 _M13_PATH_MAX_POINTS = 400
@@ -71,10 +107,12 @@ _M13_SLEW_UNCERTAIN_DEG = 1.0
 
 
 class M13MovingTargetTrackMixin:
-    """Click-to-track on C13 day video; map coords from GPS + gimbal + SLR."""
+    """Click-to-track on Skydroid C13/C12 or SIYI ZR10 video; map coords from
+    GPS + gimbal + (Skydroid SLR range, or ray/DEM ground intersection when
+    the camera has no rangefinder — see camera_has_laser_rangefinder)."""
 
     def _m13_track_supported(self) -> bool:
-        return uses_skydroid_top_camera(getattr(self, "_camera_control", None))
+        return supports_m13_track(getattr(self, "_camera_control", None))
 
     def _m14_active_profile(self):
         cc = getattr(self, "_camera_control", None)
@@ -107,7 +145,7 @@ class M13MovingTargetTrackMixin:
     def _set_m13_track_armed(self, armed: bool) -> None:
         on = bool(armed)
         if on and not self._m13_track_supported():
-            self._set_status("M13 track needs Skydroid C13 camera control")
+            self._set_status("M13 track needs Skydroid C13/C12 or SIYI ZR10 camera control")
             btn = getattr(self, "_btn_native_m13_track", None)
             if btn is not None:
                 btn.blockSignals(True)
@@ -144,7 +182,7 @@ class M13MovingTargetTrackMixin:
 
     def _begin_m13_video_track(self, u: float, v: float) -> None:
         if not self._m13_track_supported():
-            self._set_status("M13 track unavailable — connect Skydroid C13")
+            self._set_status("M13 track unavailable — connect Skydroid C13/C12 or SIYI ZR10")
             return
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             self._set_status("Wait for LRF lock to finish before starting track")
@@ -343,10 +381,149 @@ class M13MovingTargetTrackMixin:
                 except Exception:
                     pass
 
+    def _m14_run_detection(self) -> None:
+        """M14 — on-demand object + license-plate-region detection on the
+        current video frame. Independent of M13/M14 tracking — works whether
+        or not a track is active, since it's a one-shot snapshot analysis,
+        not a continuous per-tick feature (see M14 planning discussion,
+        2026-07-20, for why on-demand was chosen over continuous)."""
+        if bool(getattr(self, "_m14_detect_task_inflight", False)):
+            self._set_status("Detect already running…")
+            return
+        bridge = getattr(self, "_m14_detect_bridge", None)
+        if bridge is None:
+            return
+        img = self._preview_image_copy_for_snapshot()
+        frame_bgr = qimage_to_bgr_array(img) if img is not None else None
+        if frame_bgr is None:
+            self._set_status("Detect failed — no video frame available")
+            return
+        self._m14_detect_frame_wh = (frame_bgr.shape[1], frame_bgr.shape[0])
+        self._m14_detect_task_inflight = True
+        gen = int(getattr(self, "_m14_detect_generation", 0) or 0) + 1
+        self._m14_detect_generation = gen
+        self._set_status("Detecting…")
+        detector = VisualObjectDetector()
+        task = M14DetectTask(detector, frame_bgr, bridge, generation=gen)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_m14_detect_result(self, ok: bool, detections: object, generation: int) -> None:
+        self._m14_detect_task_inflight = False
+        if int(generation or 0) != int(getattr(self, "_m14_detect_generation", 0) or 0):
+            return  # stale — a newer Detect click superseded this one
+        overlay = getattr(self, "_native_video_overlay", None)
+        if not ok:
+            self._set_status("Detect failed — see console for details")
+            if overlay is not None:
+                overlay.clear_detections()
+            return
+        dets = list(detections or [])
+        fw, fh = getattr(self, "_m14_detect_frame_wh", (0, 0)) or (0, 0)
+        if overlay is not None:
+            if fw > 0 and fh > 0:
+                items: list[VideoOverlayDetection] = []
+                for d in dets:
+                    items.append(
+                        VideoOverlayDetection(
+                            x=d.x / fw, y=d.y / fh, w=d.w / fw, h=d.h / fh,
+                            label=d.label, score=d.confidence,
+                        )
+                    )
+                    if d.plate_box is not None:
+                        px, py, pw, ph = d.plate_box
+                        items.append(
+                            VideoOverlayDetection(
+                                x=px / fw, y=py / fh, w=pw / fw, h=ph / fh,
+                                label="plate", score=None,
+                            )
+                        )
+                overlay.set_detections(items)
+            else:
+                overlay.clear_detections()
+        counts: dict[str, int] = {}
+        for d in dets:
+            counts[d.label] = counts.get(d.label, 0) + 1
+        plate_count = sum(1 for d in dets if d.plate_box is not None)
+        if not dets:
+            self._set_status("Detect: nothing found")
+            return
+        parts = [f"{n} {label}" for label, n in counts.items()]
+        if plate_count:
+            parts.append(f"{plate_count} plate region" + ("s" if plate_count != 1 else ""))
+        self._set_status("Detected: " + ", ".join(parts))
+
+    def _m14_threat_zone_check(self) -> None:
+        """Zone/rule-based threat alert: fires when the tracked target's own
+        computed geo position (already produced by M13's existing
+        ``_recompute_m13_track_geo``) comes within ``_M14_THREAT_ZONE_RADIUS_M``
+        of the vehicle. Same streak-counter/reported-guard shape as
+        ``_m14_att_stuck_check`` — fires once per episode, clears when the
+        target moves back out of the zone or tracking stops."""
+        lat = getattr(self, "_m13_track_lat", None)
+        lon = getattr(self, "_m13_track_lon", None)
+        if lat is None or lon is None:
+            self._m14_reset_threat_zone_state()
+            return
+        ctx = self._observation_context()
+        v_lat, v_lon = ctx.get("vehicle_lat"), ctx.get("vehicle_lon")
+        if v_lat is None or v_lon is None:
+            self._m14_reset_threat_zone_state()
+            return
+        try:
+            dist_m = self._haversine_m(float(v_lat), float(v_lon), float(lat), float(lon))
+        except (TypeError, ValueError):
+            return
+        if dist_m < _M14_THREAT_ZONE_RADIUS_M:
+            streak = int(getattr(self, "_m14_threat_zone_streak", 0) or 0) + 1
+            self._m14_threat_zone_streak = streak
+            if streak >= _M14_THREAT_ZONE_STREAK_TICKS and not bool(
+                getattr(self, "_m14_threat_zone_reported", False)
+            ):
+                self._m14_threat_zone_reported = True
+                print(
+                    f"[VGCS:m14] threat alert — tracked target within "
+                    f"{dist_m:.0f}m of vehicle (zone radius "
+                    f"{_M14_THREAT_ZONE_RADIUS_M:.0f}m)"
+                )
+                self._show_m14_threat_alert(dist_m)
+        else:
+            if bool(getattr(self, "_m14_threat_zone_reported", False)):
+                self._clear_m14_threat_alert()
+            self._m14_reset_threat_zone_state()
+
+    def _m14_reset_threat_zone_state(self) -> None:
+        self._m14_threat_zone_streak = 0
+        self._m14_threat_zone_reported = False
+
+    def _show_m14_threat_alert(self, dist_m: float) -> None:
+        """Non-modal — must never block active flight-control interaction.
+        Held until ``_clear_m14_threat_alert`` fires (target leaves the
+        zone or tracking stops), unlike the transient status-flash pattern
+        used elsewhere (e.g. photo-capture feedback)."""
+        status = getattr(self, "_status", None)
+        if status is not None:
+            try:
+                status.setStyleSheet("background-color: #7a1414; color: white; font-weight: bold;")
+            except Exception:
+                pass
+        _play_m14_threat_alert_sound()
+        self._set_status(f"⚠ THREAT — tracked target {dist_m:.0f} m from vehicle")
+
+    def _clear_m14_threat_alert(self) -> None:
+        status = getattr(self, "_status", None)
+        if status is not None:
+            try:
+                status.setStyleSheet("")
+            except Exception:
+                pass
+
     def _stop_m13_track(self) -> None:
         was = self._m13_track_is_active() or self._m13_track_mode_active()
         self._m13_invalidate_inflight_start()
         self._m14_stop_ai_follow()
+        if bool(getattr(self, "_m14_threat_zone_reported", False)):
+            self._clear_m14_threat_alert()
+        self._m14_reset_threat_zone_state()
         self._m13_track_active = False
         self._m13_track_armed = False
         notify_companion_visual_track(active=False)
@@ -367,6 +544,9 @@ class M13MovingTargetTrackMixin:
     def _reset_m13_track_for_disconnect(self) -> None:
         self._m13_invalidate_inflight_start()
         self._m14_stop_ai_follow()
+        if bool(getattr(self, "_m14_threat_zone_reported", False)):
+            self._clear_m14_threat_alert()
+        self._m14_reset_threat_zone_state()
         self._m13_track_active = False
         self._m13_track_armed = False
         notify_companion_visual_track(active=False)
@@ -430,6 +610,7 @@ class M13MovingTargetTrackMixin:
                 except Exception:
                     pass
         self._update_m13_track_geo(force=False)
+        self._m14_threat_zone_check()
         self._m13_check_gimbal_follow()
         self._m13_nudge_video_during_track()
         self._refresh_m13_track_overlay()
@@ -632,6 +813,7 @@ class M13MovingTargetTrackMixin:
         else:
             print("[VGCS:m14] set_gimbal_speed not callable on camera control — gimbal command NOT sent")
         self._update_m13_track_geo(force=False)
+        self._m14_threat_zone_check()
         # Chain immediately (see comment above) rather than waiting for the
         # next 100ms QTimer tick — runs the loop back-to-back at whatever
         # rate the real hardware/subprocess round trip actually sustains.
@@ -779,11 +961,15 @@ class M13MovingTargetTrackMixin:
         # re-fire (for isolating whether it causes the video stutter); the
         # one-time fetch on track start (force=True) still runs so a position
         # is always available.
-        fresh_interval = _m13_slr_fresh_interval_s()
-        last_fresh = float(getattr(self, "_m13_track_slr_fresh_mono", 0.0) or 0.0)
-        want_periodic = fresh_interval > 0.0 and (now - last_fresh) >= fresh_interval
-        if force or want_periodic:
-            self._dispatch_m13_range_fetch(fresh=True)
+        # Cameras with no onboard rangefinder (SIYI ZR10) have nothing to fetch
+        # here — _recompute_m13_track_geo falls back to ray/DEM geo instead, so
+        # skip queuing a range task that would only ever come back empty.
+        if camera_has_laser_rangefinder(getattr(self, "_camera_control", None)):
+            fresh_interval = _m13_slr_fresh_interval_s()
+            last_fresh = float(getattr(self, "_m13_track_slr_fresh_mono", 0.0) or 0.0)
+            want_periodic = fresh_interval > 0.0 and (now - last_fresh) >= fresh_interval
+            if force or want_periodic:
+                self._dispatch_m13_range_fetch(fresh=True)
         last = float(getattr(self, "_m13_track_geo_mono", 0.0) or 0.0)
         if not force and (now - last) < _M13_GEO_MIN_INTERVAL_S:
             return
@@ -845,12 +1031,86 @@ class M13MovingTargetTrackMixin:
             return False
         return max(dyaw, dpitch) > _M13_SLEW_UNCERTAIN_DEG
 
+    def _recompute_m13_track_geo_ray(self, ctx: dict[str, object]) -> None:
+        """No-rangefinder geo fallback (SIYI ZR10 has no onboard LRF) — ray/DEM
+        ground intersection through the tracked pixel, same method M8 uses for
+        video marks on cameras without a rangefinder (see
+        vgcs.observe.geo_reference.compute_geo_reference /
+        DOOAF_OO_orientation_mixin._enrich_observation_geo_reference).
+
+        Lower accuracy than a laser return: assumes the ray hits open/DEM-known
+        ground under the tracked pixel, and needs vehicle relative altitude
+        (EKF or DEM) to be known. Does NOT write ``_m13_track_range_m`` — that
+        field means "measured slant range" elsewhere in this class and would
+        wrongly route the next tick into the LRF-slant branch above.
+        """
+        click = getattr(self, "_m13_track_click_uv", None)
+        video_x, video_y = (click if isinstance(click, tuple) else (0.5, 0.5))
+        profile = self._m14_active_profile()
+        hfov = float(getattr(profile, "fov_h_deg", 62.0) or 62.0)
+        vfov_raw = getattr(profile, "fov_v_deg", None)
+        vfov = float(vfov_raw) if vfov_raw else None
+        dem_path = self._observe_dem_path()
+        geo = compute_geo_reference(
+            vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
+            vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
+            vehicle_heading_deg=ctx.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+            vehicle_roll_deg=ctx.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+            vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+            vehicle_rel_alt_m=ctx.get("vehicle_rel_alt_m"),  # type: ignore[arg-type]
+            vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+            rangefinder_down_m=ctx.get("rangefinder_down_m"),  # type: ignore[arg-type]
+            gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+            video_x_norm=float(video_x),
+            video_y_norm=float(video_y),
+            gps_fix_type=int(ctx.get("gps_fix_type") or 0),
+            gps_hdop=ctx.get("gps_hdop"),  # type: ignore[arg-type]
+            camera_hfov_deg=hfov,
+            camera_vfov_deg=vfov,
+            dem_path=dem_path,
+        )
+        if geo is None or not geo.ok or geo.target_lat is None or geo.target_lon is None:
+            self._m13_track_geo_label = (
+                geo.warning if geo is not None else "Computing track position…"
+            )
+            self._refresh_m13_track_map_marker()
+            return
+        self._m13_track_lat = float(geo.target_lat)
+        self._m13_track_lon = float(geo.target_lon)
+        self._m13_track_alt_m = (
+            float(geo.target_alt_m) if geo.target_alt_m is not None else None
+        )
+        label = f"{self._m13_track_lat:.6f}, {self._m13_track_lon:.6f}"
+        if geo.horizontal_range_m is not None:
+            label += f" · ~{float(geo.horizontal_range_m):.0f} m (no rangefinder, est.)"
+        self._m13_track_geo_uncertain = str(geo.quality or "") != "good"
+        if self._m13_track_geo_uncertain:
+            label += " · approx"
+        self._m13_track_geo_label = label
+        path = list(getattr(self, "_m13_track_path", None) or [])
+        pt = (self._m13_track_lat, self._m13_track_lon)
+        if not path or path[-1] != pt:
+            path.append(pt)
+            if len(path) > _M13_PATH_MAX_POINTS:
+                path = path[-_M13_PATH_MAX_POINTS:]
+            self._m13_track_path = path
+        self._refresh_m13_track_map_marker()
+
     def _recompute_m13_track_geo(self) -> None:
         if not self._m13_track_is_active():
             return
         dist = getattr(self, "_m13_track_range_m", None)
         ctx = self._observation_context()
-        if ctx.get("gimbal_yaw_deg") is None or dist is None:
+        ai_follow = self._m14_ai_follow_active()
+        if dist is None:
+            cc = getattr(self, "_camera_control", None)
+            if ai_follow and not camera_has_laser_rangefinder(cc):
+                self._recompute_m13_track_geo_ray(ctx)
+            else:
+                self._refresh_m13_track_map_marker()
+            return
+        if ctx.get("gimbal_yaw_deg") is None:
             self._refresh_m13_track_map_marker()
             return
         try:
@@ -861,7 +1121,6 @@ class M13MovingTargetTrackMixin:
         if slant < 0.5:
             self._refresh_m13_track_map_marker()
             return
-        ai_follow = self._m14_ai_follow_active()
         if ai_follow:
             # Real tracked pixel from our own tracker — not a boresight guess
             # — and the ACTIVE camera's real FOV, not C13's hardcoded fallback.
