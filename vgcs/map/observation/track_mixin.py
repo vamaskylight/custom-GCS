@@ -281,6 +281,7 @@ class M13MovingTargetTrackMixin:
         self._m14_follow_task_inflight = False
         self._m14_follow_lost_streak = 0
         self._m14_follow_ticks_skipped = 0
+        self._m14_follow_stale_hold_logged = False
         for axis in ("yaw", "pitch"):
             setattr(self, f"_m14_att_stuck_last_{axis}", None)
             setattr(self, f"_m14_att_stuck_streak_{axis}", 0)
@@ -644,6 +645,12 @@ class M13MovingTargetTrackMixin:
         bridge = getattr(self, "_m14_follow_bridge", None)
         if tracker is None or bridge is None or not tracker.is_active():
             return
+        if self._m14_video_frame_is_stale():
+            self._m14_hold_follow_for_stale_video()
+            return
+        if bool(getattr(self, "_m14_follow_stale_hold_logged", False)):
+            self._m14_follow_stale_hold_logged = False
+            print("[VGCS:m14] video resumed — follow re-engaged")
         img = self._preview_image_copy_for_snapshot()
         frame_bgr = qimage_to_bgr_array(img) if img is not None else None
         if frame_bgr is None:
@@ -666,6 +673,53 @@ class M13MovingTargetTrackMixin:
             generation=gen,
         )
         QThreadPool.globalInstance().start(task)
+
+    def _m14_video_frame_is_stale(self) -> bool:
+        """True when no genuinely new decoded frame has reached the GUI
+        preview cache in over ``_M13_VIDEO_STALL_S`` — the same threshold
+        ``_m13_nudge_video_during_track`` already uses to recognize a video
+        stall, checked here against ``_native_video_last_frame_mono``
+        (set only on a real decoded frame — the HEVC glitch-hold path in
+        pipeline.py explicitly skips emitting a frame while it holds the
+        last good one, so this timestamp genuinely stops advancing during a
+        stall instead of refreshing on a repeated/duplicate image)."""
+        last_frame = float(getattr(self, "_native_video_last_frame_mono", 0.0) or 0.0)
+        if last_frame <= 0.0:
+            return False
+        import time
+
+        return (time.monotonic() - last_frame) >= _M13_VIDEO_STALL_S
+
+    def _m14_hold_follow_for_stale_video(self) -> None:
+        """Field-confirmed failure mode: when the video preview stalls (RTSP
+        decode glitch or a dropped stream), the cached frame CSRT reads from
+        stops changing, but ``_m14_dispatch_follow_update`` used to keep
+        running CSRT on that identical frame anyway — it always "found" the
+        target (nothing in the image had changed) and kept re-deriving the
+        SAME offset, which kept re-sending the SAME saturated gimbal speed
+        command every ~100ms tick with no visual feedback to ever correct
+        it. The existing lost-streak safety net never caught this because
+        CSRT reported success (``ok=True``) the whole time — only the
+        gimbal's own attitude telemetry eventually revealed the problem,
+        once it had already run to a mechanical travel limit (see
+        ``_m14_att_stuck_check``). Command an explicit stop instead of
+        repeating a blind command, and stand down until fresh video
+        confirms the loop again — the 100ms QTimer keeps calling this
+        method regardless, so follow resumes on its own, no operator
+        action needed."""
+        if not bool(getattr(self, "_m14_follow_stale_hold_logged", False)):
+            self._m14_follow_stale_hold_logged = True
+            print(
+                "[VGCS:m14] video stalled — holding gimbal instead of "
+                "following on a stale frame (will resume once new frames arrive)"
+            )
+        cc = getattr(self, "_camera_control", None)
+        set_speed = getattr(cc, "set_gimbal_speed", None)
+        if callable(set_speed):
+            try:
+                set_speed(0.0, 0.0)
+            except Exception:
+                pass
 
     _M14_ATT_STUCK_EPS_DEG = 0.3
     _M14_ATT_STUCK_SPEED_DPS = 5.0
