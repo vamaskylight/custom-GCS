@@ -3,6 +3,7 @@ GCS-computed map coordinates)."""
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -282,6 +283,8 @@ class M13MovingTargetTrackMixin:
         self._m14_follow_lost_streak = 0
         self._m14_follow_ticks_skipped = 0
         self._m14_follow_stale_hold_logged = False
+        self._m14_conv_ref_att_yaw = None
+        self._m14_conv_ticks = 0
         for axis in ("yaw", "pitch"):
             setattr(self, f"_m14_att_stuck_last_{axis}", None)
             setattr(self, f"_m14_att_stuck_streak_{axis}", 0)
@@ -773,6 +776,87 @@ class M13MovingTargetTrackMixin:
                 setattr(self, streak_attr, 0)
                 setattr(self, reported_attr, False)
 
+    _M14_CONVERGENCE_CHECK_TICKS = 30  # ~3s window at the 100ms M14 tick rate
+    _M14_CONVERGENCE_MIN_ATT_MOVE_DEG = 5.0
+    _M14_CONVERGENCE_MIN_OFFSET_SHRINK_NORM = 0.03  # ~3% of frame
+
+    def _m14_convergence_check(
+        self,
+        att_yaw: float | None,
+        att_pitch: float | None,
+        u_norm: float,
+        v_norm: float,
+    ) -> bool:
+        """Detects a DIFFERENT field-confirmed failure mode than
+        ``_m14_att_stuck_check`` above: instead of the gimbal freezing while
+        the tracker keeps commanding motion, the gimbal keeps moving for
+        real (telemetry genuinely changes) while the tracked box's offset
+        from frame-center never shrinks. That's the signature of CSRT
+        silently drifting onto a static background feature instead of the
+        real target (see visual_object_tracker.py's ``_create_csrt_modern``
+        docstring — CSRT still reports high confidence on the wrong patch,
+        so neither ``ok`` nor the lost-streak counter ever reflects it).
+        Left unchecked, this drives the gimbal all the way to a mechanical
+        travel limit chasing a "target" that was never actually there —
+        exactly what ``_m14_att_stuck_check`` eventually reports, just too
+        late, after the travel limit is already hit (field-confirmed twice:
+        pitch ran from ~-22deg to -90deg over a full track before that
+        check ever fired). This checks convergence directly and stops the
+        track before that happens, instead of only diagnosing it afterward.
+
+        Compares a checkpoint every ``_M14_CONVERGENCE_CHECK_TICKS`` ticks:
+        if the gimbal genuinely moved (rules out the separately-handled
+        stuck-at-limit case) but the on-screen offset from center did not
+        shrink by at least ``_M14_CONVERGENCE_MIN_OFFSET_SHRINK_NORM``,
+        the lock is presumed lost. Real tradeoff, stated plainly: a target
+        that keeps a roughly constant apparent offset because it's genuinely
+        moving in lockstep with the gimbal's own tracking rate would also
+        trip this — considered acceptable since letting the gimbal run to
+        its hardware limit is worse than asking the operator to re-click.
+        """
+        if att_yaw is None or att_pitch is None:
+            self._m14_conv_ref_att_yaw = None
+            self._m14_conv_ticks = 0
+            return False
+        if getattr(self, "_m14_conv_ref_att_yaw", None) is None:
+            self._m14_conv_ref_att_yaw = att_yaw
+            self._m14_conv_ref_att_pitch = att_pitch
+            self._m14_conv_ref_u = u_norm
+            self._m14_conv_ref_v = v_norm
+            self._m14_conv_ticks = 0
+            return False
+        ticks = int(getattr(self, "_m14_conv_ticks", 0) or 0) + 1
+        self._m14_conv_ticks = ticks
+        if ticks < self._M14_CONVERGENCE_CHECK_TICKS:
+            return False
+        ref_att_yaw = float(self._m14_conv_ref_att_yaw)
+        ref_att_pitch = float(self._m14_conv_ref_att_pitch)
+        ref_u = float(self._m14_conv_ref_u)
+        ref_v = float(self._m14_conv_ref_v)
+        att_moved = max(abs(att_yaw - ref_att_yaw), abs(att_pitch - ref_att_pitch))
+        offset_before = math.hypot(ref_u - 0.5, ref_v - 0.5)
+        offset_now = math.hypot(u_norm - 0.5, v_norm - 0.5)
+        shrank = (offset_before - offset_now) >= self._M14_CONVERGENCE_MIN_OFFSET_SHRINK_NORM
+        # Reset the checkpoint for the next window regardless of outcome.
+        self._m14_conv_ref_att_yaw = att_yaw
+        self._m14_conv_ref_att_pitch = att_pitch
+        self._m14_conv_ref_u = u_norm
+        self._m14_conv_ref_v = v_norm
+        self._m14_conv_ticks = 0
+        if (
+            att_moved >= self._M14_CONVERGENCE_MIN_ATT_MOVE_DEG
+            and not shrank
+            and offset_now > self._M14_CONVERGENCE_MIN_OFFSET_SHRINK_NORM
+        ):
+            print(
+                f"[VGCS:m14] target lock lost — gimbal moved {att_moved:.1f}deg "
+                f"but tracked offset from center didn't shrink (was "
+                f"{offset_before:.3f}, now {offset_now:.3f}); likely tracking "
+                "background clutter, not the real target. Stopping follow."
+            )
+            return True
+        return False
+
     def _on_m14_follow_updated(
         self,
         ok: bool,
@@ -851,6 +935,18 @@ class M13MovingTargetTrackMixin:
         # shows up after genuine motion, so it needs its own check across
         # consecutive ticks, not a one-shot comparison.
         self._m14_att_stuck_check(att_yaw, att_pitch, yaw_speed_dps, pitch_speed_dps)
+        if self._m14_convergence_check(att_yaw, att_pitch, float(u_norm), float(v_norm)):
+            if callable(set_speed):
+                try:
+                    set_speed(0.0, 0.0)
+                except Exception:
+                    pass
+            self._set_status(
+                "M13 track stopped — target lock lost (gimbal moved but the "
+                "view didn't converge; likely tracking background — re-click target)"
+            )
+            self._stop_m13_track()
+            return
         if tick % 10 == 1:
             print(
                 f"[VGCS:m14] follow uv=({u_norm:.3f},{v_norm:.3f}) "
