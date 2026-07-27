@@ -16,6 +16,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from vgcs.observe.worker_ipc import (
+    decode_frame as _decode_frame,
+    encode_frame as _encode_frame,
+    read_exactly as _read_exactly,
+    recv_framed as _recv_framed,
+    send_framed as _send_framed,
+)
+from vgcs.observe import worker_ipc
+
 
 @dataclass(frozen=True)
 class TrackBox:
@@ -370,70 +379,6 @@ _M14_WORKER_START_TIMEOUT_S = 8.0
 _M14_WORKER_UPDATE_TIMEOUT_S = 1.0
 
 
-def _encode_frame(frame_bgr: np.ndarray) -> tuple:
-    """(shape, dtype-name, raw-bytes) instead of the ndarray itself.
-
-    Field-confirmed crash point: pickling a raw numpy.ndarray (inside
-    numpy's own C-level __reduce__/pickling code) hard-crashed the PARENT
-    process on one client machine — an access violation, not a catchable
-    exception — even though the array itself was a perfectly ordinary,
-    freshly-built 960x540x3 uint8 frame. Whatever is wrong with that
-    machine's native-code environment (the same one that crashed cv2's own
-    tracker init and multiprocessing's spawn bootstrap), pickling plain
-    ``bytes`` is about as simple as serialization gets and avoids numpy's
-    array-pickling code path entirely.
-    """
-    arr = np.ascontiguousarray(frame_bgr)
-    return (arr.shape, str(arr.dtype), arr.tobytes())
-
-
-def _decode_frame(encoded: tuple) -> np.ndarray:
-    shape, dtype_name, raw = encoded
-    return np.frombuffer(raw, dtype=np.dtype(dtype_name)).reshape(shape)
-
-
-def _read_exactly(stream, n: int) -> bytes | None:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = stream.read(n - len(buf))
-        if not chunk:
-            return None  # EOF — other end closed/died
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def _send_framed(stream, obj) -> bool:
-    """Length-prefixed pickle frame. Returns False (never raises) on failure —
-    a broken pipe here just means the worker is gone, not a caller-facing error."""
-    import pickle
-
-    try:
-        data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-        stream.write(len(data).to_bytes(4, "little"))
-        stream.write(data)
-        stream.flush()
-        return True
-    except Exception:
-        return False
-
-
-def _recv_framed(stream):
-    """Inverse of ``_send_framed``. Returns None on EOF/any failure."""
-    import pickle
-
-    header = _read_exactly(stream, 4)
-    if header is None:
-        return None
-    n = int.from_bytes(header, "little")
-    data = _read_exactly(stream, n)
-    if data is None:
-        return None
-    try:
-        return pickle.loads(data)
-    except Exception:
-        return None
-
-
 class VisualObjectTracker:
     """Process-isolated tracker: same public interface as ``_InProcessTracker``
     (``start``/``update``/``stop``/``is_active``/``lost_streak``/``algo_used``),
@@ -550,95 +495,13 @@ class VisualObjectTracker:
                 pass
 
     def _start_reader(self, proc):
-        """Background thread continuously reading framed responses off the
-        worker's stdout into a queue — mirrors the existing `_drain_stderr`
-        pattern already used for the FFmpeg subprocess in pipeline.py. A
-        sentinel `None` is pushed when the stream ends (worker died/closed),
-        so `_request`'s `queue.get()` never blocks forever on a dead worker
-        beyond its explicit timeout.
-        """
-        import queue
-        import threading
-
-        q: "queue.Queue" = queue.Queue()
-
-        def _reader() -> None:
-            try:
-                while True:
-                    resp = _recv_framed(proc.stdout)
-                    if resp is None:
-                        break
-                    q.put(resp)
-            except Exception:
-                pass
-            finally:
-                try:
-                    q.put(None)
-                except Exception:
-                    pass
-
-        threading.Thread(target=_reader, daemon=True).start()
-        return q
+        return worker_ipc.start_reader(proc)
 
     def _start_writer(self, proc):
-        """Background thread that owns every write to the worker's stdin —
-        decouples a slow/stuck pipe from the calling thread.
-
-        Field-confirmed bug this fixes: without this, ``_request()`` wrote
-        directly on the CALLING thread (``M14FollowTask.run()``, a
-        QThreadPool worker) with NO timeout on the write itself — only the
-        response read had one. If the worker ever fell behind draining its
-        stdin (real CSRT computation on real camera frames is slower than
-        the synthetic-square timing measured earlier, especially at the
-        100ms M14 tick rate pushing a ~1.5MB frame every cycle), the write
-        blocked indefinitely. Once blocked, ``_m14_follow_task_inflight``
-        never got reset (the call that resets it never returned), so every
-        later tick silently no-op'd on that guard forever — tracking showed
-        "active" but nothing ever moved again, with zero error output,
-        exactly the field-reported symptom. Routing writes through a queue
-        here means a stuck pipe can only ever delay this thread, never block
-        the caller past ``_request()``'s own read-side timeout.
-        """
-        import queue
-        import threading
-
-        q: "queue.Queue" = queue.Queue()
-
-        def _writer() -> None:
-            try:
-                while True:
-                    msg = q.get()
-                    if msg is None:
-                        break
-                    if not _send_framed(proc.stdin, msg):
-                        break
-            except Exception:
-                pass
-
-        threading.Thread(target=_writer, daemon=True).start()
-        return q
+        return worker_ipc.start_writer(proc)
 
     def _request(self, msg: tuple, timeout_s: float) -> tuple | None:
-        """Enqueue ``msg`` for the writer thread and wait up to ``timeout_s``
-        for a response. Returns None on ANY failure to get a well-formed
-        reply — dead worker, broken pipe, or timeout are all treated
-        identically by the caller.
-        """
-        proc = self._proc
-        resp_q = self._resp_queue
-        send_q = self._send_queue
-        if proc is None or resp_q is None or send_q is None:
-            return None
-        import queue
-
-        try:
-            send_q.put(msg)
-        except Exception:
-            return None
-        try:
-            return resp_q.get(timeout=timeout_s)
-        except queue.Empty:
-            return None
+        return worker_ipc.request(self._proc, self._resp_queue, self._send_queue, msg, timeout_s)
 
 
 def bbox_around_point(

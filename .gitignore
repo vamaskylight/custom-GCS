@@ -7,6 +7,9 @@ DOCS/
 # Local dev / analysis scripts (not part of product source)
 tools/
 
+# Model provenance notes (internal — not for the client-facing repo)
+vgcs/assets/models/MODEL_SOURCE.md
+
 # Python
 __pycache__/
 *.py[cod]
