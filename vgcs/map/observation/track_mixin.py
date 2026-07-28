@@ -33,7 +33,32 @@ from vgcs.video.pipeline import (
 # DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md), so M13 tracks the target itself in
 # software instead of trusting firmware.
 _M14_AI_FOLLOW_PROFILE_IDS = {"c12_default", "zr10_default"}
-_M14_TRACK_BOX_SIZE_PX = 60
+# Click-time CSRT box size — LOCKED for the whole track (see
+# visual_object_tracker.py's _create_csrt_modern: number_of_scales=1, a
+# deliberate earlier fix for box-size drift), so this is also what the
+# overlay's white "size of the object" rectangle shows for the whole track.
+# Raised from a 60x60 square (field-reported: both too small to visually
+# read as "the object" per client screenshots, AND too tight a crop to give
+# CSRT much distinctive texture to lock onto — a plausible contributor to
+# the immediate mislock-onto-background failure mode _m14_convergence_check
+# exists to catch) to a taller, human-proportioned default. Still a guess,
+# not measured against real footage at a known zoom/altitude — override via
+# VGCS_M14_TRACK_BOX_W_PX / VGCS_M14_TRACK_BOX_H_PX for field tuning without
+# a rebuild, same pattern as _m13_slr_fresh_interval_s().
+_M14_TRACK_BOX_W_PX = 100
+_M14_TRACK_BOX_H_PX = 220
+
+
+def _m14_track_box_size_px() -> tuple[float, float]:
+    try:
+        w = float(os.environ.get("VGCS_M14_TRACK_BOX_W_PX", "") or _M14_TRACK_BOX_W_PX)
+    except ValueError:
+        w = float(_M14_TRACK_BOX_W_PX)
+    try:
+        h = float(os.environ.get("VGCS_M14_TRACK_BOX_H_PX", "") or _M14_TRACK_BOX_H_PX)
+    except ValueError:
+        h = float(_M14_TRACK_BOX_H_PX)
+    return w, h
 # M14 ticks faster than the legacy GOT+SUM path (100ms vs 200ms): CSRT's own
 # search window is what actually limits how far a target can move between
 # updates before tracking is lost — field-observed losing track on a sudden,
@@ -255,8 +280,9 @@ class M13MovingTargetTrackMixin:
         # nominal frame_w/h (decode scaling) — use the real array shape.
         fh, fw = frame_bgr.shape[0], frame_bgr.shape[1]
         cx, cy = float(u) * fw, float(v) * fh
+        box_w_px, box_h_px = _m14_track_box_size_px()
         bbox = bbox_around_point(
-            cx, cy, box_w=_M14_TRACK_BOX_SIZE_PX, box_h=_M14_TRACK_BOX_SIZE_PX,
+            cx, cy, box_w=box_w_px, box_h=box_h_px,
             frame_w=fw, frame_h=fh,
         )
         print(
@@ -788,6 +814,16 @@ class M13MovingTargetTrackMixin:
     _M14_CONVERGENCE_MIN_ATT_MOVE_DEG = 5.0
     _M14_CONVERGENCE_MAX_BOX_MOVE_NORM = 0.02  # "frozen" ceiling, ~2% of frame
     _M14_CONVERGENCE_MIN_OFFSET_NORM = 0.05  # must be meaningfully off-center to matter
+    # Fast path — an unambiguous, much stricter version of the same check
+    # (bit-for-bit frozen box, not just "under 2%") that doesn't need to wait
+    # out the full 3s window: field-reported the gimbal visibly "moving on
+    # its own" for the whole slow window before the loop finally caught up
+    # and stopped it. A box that hasn't moved AT ALL despite ANY real
+    # gimbal motion is a much stronger signal than "hasn't moved much" and
+    # is safe to act on within ~1s instead of ~3s.
+    _M14_CONVERGENCE_FAST_CHECK_TICKS = 8  # ~0.8-1s
+    _M14_CONVERGENCE_FAST_MAX_BOX_MOVE_NORM = 0.003  # bit-for-bit frozen
+    _M14_CONVERGENCE_FAST_MIN_ATT_MOVE_DEG = 2.0  # lower bar — any real motion counts
 
     def _m14_convergence_check(
         self,
@@ -858,7 +894,7 @@ class M13MovingTargetTrackMixin:
             return False
         ticks = int(getattr(self, "_m14_conv_ticks", 0) or 0) + 1
         self._m14_conv_ticks = ticks
-        if ticks < self._M14_CONVERGENCE_CHECK_TICKS:
+        if ticks < self._M14_CONVERGENCE_FAST_CHECK_TICKS:
             return False
         ref_att_yaw = float(self._m14_conv_ref_att_yaw)
         ref_att_pitch = float(self._m14_conv_ref_att_pitch)
@@ -867,6 +903,32 @@ class M13MovingTargetTrackMixin:
         att_moved = max(abs(att_yaw - ref_att_yaw), abs(att_pitch - ref_att_pitch))
         box_moved = math.hypot(u_norm - ref_u, v_norm - ref_v)
         offset_now = math.hypot(u_norm - 0.5, v_norm - 0.5)
+        # Fast path: checked every tick once the short window elapses, using
+        # the SAME still-accumulating reference (not reset yet) — a bit-for-
+        # bit frozen box this early is unambiguous, no need to wait out the
+        # full slow window.
+        if (
+            att_moved >= self._M14_CONVERGENCE_FAST_MIN_ATT_MOVE_DEG
+            and box_moved < self._M14_CONVERGENCE_FAST_MAX_BOX_MOVE_NORM
+            and offset_now >= self._M14_CONVERGENCE_MIN_OFFSET_NORM
+        ):
+            self._m14_conv_ref_att_yaw = att_yaw
+            self._m14_conv_ref_att_pitch = att_pitch
+            self._m14_conv_ref_u = u_norm
+            self._m14_conv_ref_v = v_norm
+            self._m14_conv_ticks = 0
+            print(
+                f"[VGCS:m14] target lock lost — gimbal moved {att_moved:.1f}deg "
+                f"in ~{ticks * 0.1:.1f}s but the tracked box hasn't moved at all "
+                f"({box_moved:.3f}, still {offset_now:.3f} off-center); likely "
+                "tracking background clutter, not the real target. Stopping follow."
+            )
+            return True
+        if ticks < self._M14_CONVERGENCE_CHECK_TICKS:
+            return False
+        # Slow path: the full window elapsed without tripping the fast,
+        # unambiguous case above — a looser bar (moved SOME but not enough to
+        # actually converge) still counts over this much longer observation.
         # Reset the checkpoint for the next window regardless of outcome.
         self._m14_conv_ref_att_yaw = att_yaw
         self._m14_conv_ref_att_pitch = att_pitch

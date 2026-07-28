@@ -122,7 +122,8 @@ def _create_csrt_modern():
     CSRT's ``padding`` parameter directly controls how far around the last
     known position it searches on the next frame — the default (3.0) is a
     general-purpose value not tuned for a walking human's apparent screen
-    speed at this box size (``_M14_TRACK_BOX_SIZE_PX``) and tick rate.
+    speed at this box size (``_m14_track_box_size_px()`` in track_mixin.py)
+    and tick rate.
     Widening it gives CSRT more room to still find the real target instead
     of snapping to whatever nearby static feature correlates next-best.
     Falls back to CSRT's own default Params if building a custom one fails
