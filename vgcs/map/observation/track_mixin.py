@@ -778,7 +778,8 @@ class M13MovingTargetTrackMixin:
 
     _M14_CONVERGENCE_CHECK_TICKS = 30  # ~3s window at the 100ms M14 tick rate
     _M14_CONVERGENCE_MIN_ATT_MOVE_DEG = 5.0
-    _M14_CONVERGENCE_MIN_OFFSET_SHRINK_NORM = 0.03  # ~3% of frame
+    _M14_CONVERGENCE_MAX_BOX_MOVE_NORM = 0.02  # "frozen" ceiling, ~2% of frame
+    _M14_CONVERGENCE_MIN_OFFSET_NORM = 0.05  # must be meaningfully off-center to matter
 
     def _m14_convergence_check(
         self,
@@ -790,41 +791,53 @@ class M13MovingTargetTrackMixin:
         """Detects a DIFFERENT field-confirmed failure mode than
         ``_m14_att_stuck_check`` above: instead of the gimbal freezing while
         the tracker keeps commanding motion, the gimbal keeps moving for
-        real (telemetry genuinely changes) while the tracked box's offset
-        from frame-center never shrinks. That's the signature of CSRT
-        silently drifting onto a static background feature instead of the
-        real target (see visual_object_tracker.py's ``_create_csrt_modern``
-        docstring — CSRT still reports high confidence on the wrong patch,
-        so neither ``ok`` nor the lost-streak counter ever reflects it).
-        Left unchecked, this drives the gimbal all the way to a mechanical
-        travel limit chasing a "target" that was never actually there —
-        exactly what ``_m14_att_stuck_check`` eventually reports, just too
-        late, after the travel limit is already hit (field-confirmed twice:
-        pitch ran from ~-22deg to -90deg over a full track before that
-        check ever fired). This checks convergence directly and stops the
-        track before that happens, instead of only diagnosing it afterward.
+        real (telemetry genuinely changes) while the tracked box's ON-SCREEN
+        POSITION stays essentially frozen at a meaningfully off-center spot.
+        That's the signature of CSRT silently drifting onto a static
+        background feature instead of the real target (see
+        visual_object_tracker.py's ``_create_csrt_modern`` docstring — CSRT
+        still reports high confidence on the wrong patch, so neither ``ok``
+        nor the lost-streak counter ever reflects it). Left unchecked, this
+        drives the gimbal all the way to a mechanical travel limit chasing
+        a "target" that was never actually there — exactly what
+        ``_m14_att_stuck_check`` eventually reports, just too late, after
+        the travel limit is already hit (field-confirmed twice: once
+        pitch ran from ~-22deg to -90deg, once yaw ran to -90deg AND pitch
+        to 45deg, both over a full track before that check ever fired).
+        This checks convergence directly and stops the track before that
+        happens, instead of only diagnosing it afterward.
 
-        Compares a checkpoint every ``_M14_CONVERGENCE_CHECK_TICKS`` ticks:
-        if the gimbal genuinely moved (rules out the separately-handled
-        stuck-at-limit case) but the on-screen offset from center did not
-        shrink by at least ``_M14_CONVERGENCE_MIN_OFFSET_SHRINK_NORM``,
-        the lock is presumed lost. Real tradeoff, stated plainly: a target
-        that keeps a roughly constant apparent offset because it's genuinely
-        moving in lockstep with the gimbal's own tracking rate would also
-        trip this — considered acceptable since letting the gimbal run to
-        its hardware limit is worse than asking the operator to re-click.
+        Checks the BOX'S OWN MOVEMENT, not whether its offset from center
+        shrank — an earlier version used "offset didn't shrink" and produced
+        a field-reported false positive: a real, actively-tracked target
+        that simply reversed direction (client: "when an object moves in
+        the right direction the camera moves; when the object changes
+        direction, follow mode automatically disables"). A target reversing
+        or briefly outrunning the follow loop legitimately grows its offset
+        for a few seconds while the gimbal catches up — that's normal
+        transient control-loop behavior, not a lost lock, and the box
+        position itself moves a lot in that case (CSRT is genuinely
+        tracking something that's moving). A lock silently drifted onto
+        static background clutter does the opposite: the box stays glued
+        to nearly the same pixels tick after tick, no matter how far the
+        real world (and the gimbal chasing it) has actually moved on. Also
+        requires the offset to be non-trivially large at the checkpoint —
+        without that guard, a target correctly held dead-center while the
+        gimbal continuously counter-slews for platform motion (e.g. the
+        vehicle itself circling a stationary target) would false-positive
+        too: the box legitimately stays still there, but because tracking
+        is working, not because it's broken.
 
-        Field-confirmed bug this fixes: a first version reset the whole
-        multi-second accumulation window on ANY single missing telemetry
-        sample (``att_yaw``/``att_pitch`` momentarily None). Real UDP gimbal
-        telemetry drops the odd sample routinely — a field log showed one
-        ``gimbal_att=(unsupported)`` in a run where the box was frozen
-        bit-for-bit for 90+ seconds while both axes ran to their mechanical
-        limit, and the reset-on-any-miss version never once completed a
-        full window, so it never fired at all. A transient miss now just
-        skips that tick's count instead of discarding everything accumulated
-        so far — only a genuinely absent/unsupported feed (never seeded to
-        begin with) leaves this permanently inert.
+        Field-confirmed bug this also fixes: a first version reset the
+        whole multi-second accumulation window on ANY single missing
+        telemetry sample (``att_yaw``/``att_pitch`` momentarily None). Real
+        UDP gimbal telemetry drops the odd sample routinely — a field log
+        showed one ``gimbal_att=(unsupported)`` mid-track, and the
+        reset-on-any-miss version never once completed a full window, so it
+        never fired at all. A transient miss now just skips that tick's
+        count instead of discarding everything accumulated so far — only a
+        genuinely absent/unsupported feed (never seeded to begin with)
+        leaves this permanently inert.
         """
         if att_yaw is None or att_pitch is None:
             return False  # transient telemetry miss — keep accumulated progress
@@ -844,9 +857,8 @@ class M13MovingTargetTrackMixin:
         ref_u = float(self._m14_conv_ref_u)
         ref_v = float(self._m14_conv_ref_v)
         att_moved = max(abs(att_yaw - ref_att_yaw), abs(att_pitch - ref_att_pitch))
-        offset_before = math.hypot(ref_u - 0.5, ref_v - 0.5)
+        box_moved = math.hypot(u_norm - ref_u, v_norm - ref_v)
         offset_now = math.hypot(u_norm - 0.5, v_norm - 0.5)
-        shrank = (offset_before - offset_now) >= self._M14_CONVERGENCE_MIN_OFFSET_SHRINK_NORM
         # Reset the checkpoint for the next window regardless of outcome.
         self._m14_conv_ref_att_yaw = att_yaw
         self._m14_conv_ref_att_pitch = att_pitch
@@ -855,13 +867,13 @@ class M13MovingTargetTrackMixin:
         self._m14_conv_ticks = 0
         if (
             att_moved >= self._M14_CONVERGENCE_MIN_ATT_MOVE_DEG
-            and not shrank
-            and offset_now > self._M14_CONVERGENCE_MIN_OFFSET_SHRINK_NORM
+            and box_moved < self._M14_CONVERGENCE_MAX_BOX_MOVE_NORM
+            and offset_now >= self._M14_CONVERGENCE_MIN_OFFSET_NORM
         ):
             print(
                 f"[VGCS:m14] target lock lost — gimbal moved {att_moved:.1f}deg "
-                f"but tracked offset from center didn't shrink (was "
-                f"{offset_before:.3f}, now {offset_now:.3f}); likely tracking "
+                f"but the tracked box barely moved on-screen ({box_moved:.3f}, "
+                f"still {offset_now:.3f} off-center); likely tracking "
                 "background clutter, not the real target. Stopping follow."
             )
             return True
