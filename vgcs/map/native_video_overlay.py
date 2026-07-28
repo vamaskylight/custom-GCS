@@ -99,7 +99,16 @@ class VideoOverlayLrfLock:
 
 @dataclass(frozen=True)
 class VideoOverlayM13Track:
-    """M13 moving-target track — bracket at boresight while firmware follows."""
+    """M13 moving-target track — bracket at boresight while firmware follows.
+
+    ``box_w``/``box_h`` (normalized 0..1, same convention as ``x``/``y``) are
+    the REAL tracked box size reported by CSRT (M14 software AI-follow only —
+    legacy C13 GOT+SUM firmware tracking has no track-box feedback at all, so
+    these stay None there). When present, the active-track marker is drawn at
+    this true size instead of a fixed decorative span — client-requested: a
+    plain white rectangle the size of the actual tracked object, not a
+    stylized bracket disconnected from what's really being tracked.
+    """
 
     x: float
     y: float
@@ -108,6 +117,8 @@ class VideoOverlayM13Track:
     failed: bool = False
     active: bool = False
     geo_label: str = ""
+    box_w: float | None = None
+    box_h: float | None = None
 
 
 @dataclass(frozen=True)
@@ -537,44 +548,72 @@ class NativeVideoOverlayLayer(QWidget):
         failed: bool = False,
         active: bool = False,
         geo_label: str = "",
+        box_w_norm: float | None = None,
+        box_h_norm: float | None = None,
     ) -> None:
-        """Orange/violet brackets for M13 visual track (distinct from cyan LRF)."""
-        span = max(32.0, min(cw, ch) * 0.16)
-        half = span / 2.0
-        x0, y0 = cx - half, cy - half
-        x1, y1 = cx + half, cy + half
-        arm = max(12.0, span * 0.30)
-        if failed:
-            color = QColor(248, 113, 113, 240)
-            fill = QColor(248, 113, 113, 24)
-        elif pending:
-            color = QColor(251, 191, 36, 240)
-            fill = QColor(251, 191, 36, 24)
-        elif active:
-            color = QColor(251, 146, 60, 245)
-            fill = QColor(251, 146, 60, 36)
-        else:
-            color = QColor(167, 139, 250, 240)
-            fill = QColor(167, 139, 250, 28)
-        pen = QPen(color, 3)
-        p.setPen(pen)
-        p.setBrush(fill)
-        p.drawRect(int(x0), int(y0), int(span), int(span))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        for ax, ay, dx, dy in (
-            (x0, y0, arm, 0),
-            (x0, y0, 0, arm),
-            (x1, y0, -arm, 0),
-            (x1, y0, 0, arm),
-            (x0, y1, arm, 0),
-            (x0, y1, 0, -arm),
-            (x1, y1, -arm, 0),
-            (x1, y1, 0, -arm),
+        """M13 visual track marker.
+
+        While actively tracking with a REAL box size available (M14 software
+        AI-follow — CSRT reports true tracked pixels every frame), draws a
+        plain white rectangle at that true size — client-requested: the box
+        should reflect what's actually being tracked, not a fixed decorative
+        span. Starting/failed states, and legacy C13 GOT+SUM firmware
+        tracking (no track-box feedback at all, so no real size to show),
+        keep the orange/amber/red bracket reticle as before.
+        """
+        color: QColor
+        if (
+            active
+            and not pending
+            and not failed
+            and box_w_norm is not None
+            and box_h_norm is not None
         ):
-            p.drawLine(int(ax), int(ay), int(ax + dx), int(ay + dy))
-        p.setPen(QPen(color, 2))
-        p.drawLine(int(cx - half - 8), int(cy), int(cx + half + 8), int(cy))
-        p.drawLine(int(cx), int(cy - half - 8), int(cx), int(cy + half + 8))
+            half_w = max(12.0, float(box_w_norm) * cw) / 2.0
+            half_h = max(12.0, float(box_h_norm) * ch) / 2.0
+            x0, y0 = cx - half_w, cy - half_h
+            color = QColor(255, 255, 255, 235)
+            p.setPen(QPen(color, 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(int(x0), int(y0), int(half_w * 2.0), int(half_h * 2.0))
+            half = max(half_w, half_h)
+        else:
+            span = max(32.0, min(cw, ch) * 0.16)
+            half = span / 2.0
+            x0, y0 = cx - half, cy - half
+            x1, y1 = cx + half, cy + half
+            arm = max(12.0, span * 0.30)
+            if failed:
+                color = QColor(248, 113, 113, 240)
+                fill = QColor(248, 113, 113, 24)
+            elif pending:
+                color = QColor(251, 191, 36, 240)
+                fill = QColor(251, 191, 36, 24)
+            elif active:
+                color = QColor(251, 146, 60, 245)
+                fill = QColor(251, 146, 60, 36)
+            else:
+                color = QColor(167, 139, 250, 240)
+                fill = QColor(167, 139, 250, 28)
+            pen = QPen(color, 3)
+            p.setPen(pen)
+            p.setBrush(fill)
+            p.drawRect(int(x0), int(y0), int(span), int(span))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for ax, ay, dx, dy in (
+                (x0, y0, arm, 0),
+                (x0, y0, 0, arm),
+                (x1, y0, -arm, 0),
+                (x1, y0, 0, arm),
+                (x0, y1, arm, 0),
+                (x0, y1, 0, -arm),
+                (x1, y1, -arm, 0),
+                (x1, y1, 0, -arm),
+            ):
+                p.drawLine(int(ax), int(ay), int(ax + dx), int(ay + dy))
+            p.setPen(QPen(color, 2))
+            p.drawLine(int(cx - half - 8), int(cy), int(cx + half + 8), int(cy))
+            p.drawLine(int(cx), int(cy - half - 8), int(cx), int(cy + half + 8))
         if failed:
             caption = "Track failed — retry"
         elif pending:
@@ -834,6 +873,8 @@ class NativeVideoOverlayLayer(QWidget):
                 failed=bool(tr.failed),
                 active=bool(tr.active),
                 geo_label=str(tr.geo_label or ""),
+                box_w_norm=tr.box_w,
+                box_h_norm=tr.box_h,
             )
 
         for det in self._detections:

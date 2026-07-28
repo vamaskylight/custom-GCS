@@ -279,6 +279,9 @@ class M13MovingTargetTrackMixin:
         self._m14_tracker = tracker
         self._m14_tracker_active = True
         self._m14_tracker_frame_wh = (fw, fh)
+        # Seed immediately from the click bbox so the overlay shows the real
+        # tracked size right away, not just from the first follow tick.
+        self._m13_track_box_wh_norm = (float(bbox.w) / float(fw), float(bbox.h) / float(fh))
         self._m14_follow_task_inflight = False
         self._m14_follow_lost_streak = 0
         self._m14_follow_ticks_skipped = 0
@@ -339,6 +342,9 @@ class M13MovingTargetTrackMixin:
         self._m13_track_alt_m = None
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
+        # C13 GOT+SUM firmware tracking has no track-box feedback at all —
+        # the overlay falls back to its fixed-size bracket reticle for this path.
+        self._m13_track_box_wh_norm = None
         self._m13_track_lock_att = self._read_gimbal_attitude_pair()
         self._m13_track_start_mono = time.monotonic()
         self._m13_track_follow_seen = False
@@ -530,6 +536,7 @@ class M13MovingTargetTrackMixin:
         self._m14_reset_threat_zone_state()
         self._m13_track_active = False
         self._m13_track_armed = False
+        self._m13_track_box_wh_norm = None
         notify_companion_visual_track(active=False)
         cc = getattr(self, "_camera_control", None)
         stop_fn = getattr(cc, "stop_target_track", None)
@@ -562,6 +569,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
         self._m13_track_path = []
+        self._m13_track_box_wh_norm = None
         t = getattr(self, "_m13_track_timer", None)
         if t is not None:
             t.stop()
@@ -920,6 +928,14 @@ class M13MovingTargetTrackMixin:
             return
         self._m14_follow_lost_streak = 0
         self._m13_track_click_uv = (float(u_norm), float(v_norm))
+        # Real CSRT-tracked box size (px), normalized against the frame it was
+        # measured on — feeds the overlay's true-size marker (see
+        # _refresh_m13_track_overlay / VideoOverlayM13Track.box_w/box_h).
+        fw, fh = getattr(self, "_m14_tracker_frame_wh", (0, 0)) or (0, 0)
+        if box_w > 0.0 and box_h > 0.0 and fw > 0 and fh > 0:
+            self._m13_track_box_wh_norm = (float(box_w) / float(fw), float(box_h) / float(fh))
+        else:
+            self._m13_track_box_wh_norm = None
         cc = getattr(self, "_camera_control", None)
         set_speed = getattr(cc, "set_gimbal_speed", None)
         # Field-reported: box tracks the person correctly, but the gimbal
@@ -1422,6 +1438,8 @@ class M13MovingTargetTrackMixin:
             u, v = float(click[0]), float(click[1])
         dist = getattr(self, "_m13_track_range_m", None)
         label = str(getattr(self, "_m13_track_geo_label", "") or "")
+        box_wh = getattr(self, "_m13_track_box_wh_norm", None)
+        box_w, box_h = (box_wh if isinstance(box_wh, tuple) else (None, None))
         overlay = VideoOverlayM13Track(
             x=float(u),
             y=float(v),
@@ -1430,6 +1448,8 @@ class M13MovingTargetTrackMixin:
             failed=bool(failed),
             active=bool(active),
             geo_label=label,
+            box_w=float(box_w) if box_w is not None else None,
+            box_h=float(box_h) if box_h is not None else None,
         )
         try:
             ly.set_m13_track_armed(bool(armed))
