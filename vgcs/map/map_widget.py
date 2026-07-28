@@ -940,6 +940,14 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._m14_detect_bridge.detected.connect(self._on_m14_detect_result)
         self._m14_detect_task_inflight = False
         self._m14_detect_generation = 0
+        # Dedicated bridge for sizing the M13/M14 click-to-track box from a
+        # real object detection — separate from _m14_detect_bridge (the
+        # on-demand "Detect" button) so the two async flows never cross-talk.
+        self._m14_track_init_detect_bridge = M14DetectBridge(self)
+        self._m14_track_init_detect_bridge.detected.connect(self._on_m14_track_init_detect_result)
+        self._m14_track_init_pending_gen = None
+        self._m14_track_init_frame_bgr = None
+        self._m14_track_init_click_uv = None
         self._m14_threat_zone_streak = 0
         self._m14_threat_zone_reported = False
         self._video_ui_render_mono = 0.0

@@ -20,7 +20,7 @@ from vgcs.map.observation.types import (
 from vgcs.map.video.frame_convert import qimage_to_bgr_array
 from vgcs.observe.geo_reference import compute_geo_reference, compute_lrf_slant_geo
 from vgcs.observe.object_detector import VisualObjectDetector
-from vgcs.observe.visual_object_tracker import VisualObjectTracker, bbox_around_point
+from vgcs.observe.visual_object_tracker import TrackBox, VisualObjectTracker, bbox_around_point
 from vgcs.video.camera_control import camera_has_laser_rangefinder, supports_m13_track
 from vgcs.video.pipeline import (
     notify_companion_preview_motion,
@@ -33,18 +33,19 @@ from vgcs.video.pipeline import (
 # DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md), so M13 tracks the target itself in
 # software instead of trusting firmware.
 _M14_AI_FOLLOW_PROFILE_IDS = {"c12_default", "zr10_default"}
-# Click-time CSRT box size — LOCKED for the whole track (see
-# visual_object_tracker.py's _create_csrt_modern: number_of_scales=1, a
-# deliberate earlier fix for box-size drift), so this is also what the
-# overlay's white "size of the object" rectangle shows for the whole track.
-# Raised from a 60x60 square (field-reported: both too small to visually
-# read as "the object" per client screenshots, AND too tight a crop to give
-# CSRT much distinctive texture to lock onto — a plausible contributor to
-# the immediate mislock-onto-background failure mode _m14_convergence_check
-# exists to catch) to a taller, human-proportioned default. Still a guess,
-# not measured against real footage at a known zoom/altitude — override via
-# VGCS_M14_TRACK_BOX_W_PX / VGCS_M14_TRACK_BOX_H_PX for field tuning without
-# a rebuild, same pattern as _m13_slr_fresh_interval_s().
+# FALLBACK click-time CSRT box size, used only when no object detection is
+# available under the click (detector timed out/failed, or nothing was
+# detected there). Client-requested: the tracked box should match the REAL
+# detected object's size — of ANY class the YOLOX detector knows (not just
+# people) — see _m14_detection_at_click / _on_m14_track_init_detect_result.
+# LOCKED for the whole track once chosen (see visual_object_tracker.py's
+# _create_csrt_modern: number_of_scales=1, a deliberate earlier fix for
+# box-size drift) — this fallback size is also what the overlay's white
+# "size of the object" rectangle shows for the rest of that track. Still a
+# guess for the no-detection case, not measured against real footage at a
+# known zoom/altitude — override via VGCS_M14_TRACK_BOX_W_PX /
+# VGCS_M14_TRACK_BOX_H_PX for field tuning without a rebuild, same pattern
+# as _m13_slr_fresh_interval_s().
 _M14_TRACK_BOX_W_PX = 100
 _M14_TRACK_BOX_H_PX = 220
 
@@ -59,6 +60,49 @@ def _m14_track_box_size_px() -> tuple[float, float]:
     except ValueError:
         h = float(_M14_TRACK_BOX_H_PX)
     return w, h
+
+
+# How long to wait for a real object-detection box before falling back to
+# the fixed-size guess above. The detector's own worst-case timeout (8s,
+# object_detector.py) is far too long for an interactive click-to-track UX
+# on a MOVING target — its worker subprocess spawns fresh and reloads the
+# ONNX model every single call, so by the time an 8s-worst-case detection
+# returned, the real target would likely already be somewhere else on
+# screen. Untuned against real field hardware — override via
+# VGCS_M14_TRACK_INIT_DETECT_TIMEOUT_S.
+_M14_TRACK_INIT_DETECT_TIMEOUT_S = 2.5
+
+
+def _m14_track_init_detect_timeout_s() -> float:
+    try:
+        return float(
+            os.environ.get("VGCS_M14_TRACK_INIT_DETECT_TIMEOUT_S", "")
+            or _M14_TRACK_INIT_DETECT_TIMEOUT_S
+        )
+    except ValueError:
+        return float(_M14_TRACK_INIT_DETECT_TIMEOUT_S)
+
+
+def _m14_detection_at_click(detections, cx: float, cy: float):
+    """Smallest-area detection whose box contains the click point (cx, cy,
+    pixel space), or None if none does. Deliberately class-agnostic — ANY
+    of the YOLOX detector's 80 COCO classes qualifies (car, dog, backpack,
+    ...), not just "person" — client-requested: an object is not limited to
+    people. Smallest-area rather than first-match so a smaller object
+    nested inside/overlapping a larger one (e.g. a person standing in front
+    of a truck) picks the more specific box, not whichever the detector
+    happened to list first."""
+    best = None
+    best_area: float | None = None
+    for d in detections or []:
+        if d.x <= cx <= d.x + d.w and d.y <= cy <= d.y + d.h:
+            area = float(d.w) * float(d.h)
+            if best_area is None or area < best_area:
+                best = d
+                best_area = area
+    return best
+
+
 # M14 ticks faster than the legacy GOT+SUM path (100ms vs 200ms): CSRT's own
 # search window is what actually limits how far a target can move between
 # updates before tracking is lost — field-observed losing track on a sudden,
@@ -257,18 +301,21 @@ class M13MovingTargetTrackMixin:
     def _m14_start_ai_follow(self, u: float, v: float, generation: int) -> None:
         """M14 — start software tracking instead of firmware GOT+SUM.
 
-        Runs synchronously on the GUI thread: grabbing the current preview
-        frame and initializing CSRT on a small crop is fast (single-digit ms),
-        unlike the GOT+SUM path's UDP round trip, so this doesn't need a
-        worker thread the way M13TrackStartTask does.
+        Grabs the current preview frame synchronously (fast, single-digit
+        ms) but the tracked box's SIZE comes from a real object-detection
+        pass over that same frame, run off-thread — client-requested: the
+        tracked box should match the actual size of whatever was clicked
+        (ANY of the detector's classes, not just people — see
+        _m14_detection_at_click), not a fixed guess. Bounded by
+        _m14_track_init_detect_timeout_s() so a slow/failed detection can
+        never block tracking from starting — it just falls back to the
+        fixed-size guess (_m14_track_box_size_px), same as this method
+        always did before detection was wired in.
         """
-        self._m13_track_starting = False
-        profile = self._m14_active_profile()
-        frame_w = int(getattr(profile, "frame_w", 1280) or 1280)
-        frame_h = int(getattr(profile, "frame_h", 720) or 720)
         img = self._preview_image_copy_for_snapshot()
         frame_bgr = qimage_to_bgr_array(img) if img is not None else None
         if frame_bgr is None:
+            self._m13_track_starting = False
             print("[VGCS:m14] track start failed: no preview frame available to track from")
             self._m13_track_active = False
             notify_companion_visual_track(active=False)
@@ -276,21 +323,94 @@ class M13MovingTargetTrackMixin:
             self._set_status("M13 track failed — no video frame to track from")
             self._sync_m13_track_button()
             return
-        # frame_bgr's actual shape may differ slightly from the profile's
-        # nominal frame_w/h (decode scaling) — use the real array shape.
+        gen = int(generation)
+        self._m14_track_init_frame_bgr = frame_bgr
+        self._m14_track_init_click_uv = (float(u), float(v))
+        self._m14_track_init_pending_gen = gen
+        self._set_status("M13 track — sizing object…")
+        bridge = getattr(self, "_m14_track_init_detect_bridge", None)
+        if bridge is None:
+            # Should not happen outside tests — fall back immediately
+            # rather than hang waiting for a result that will never arrive.
+            self._m14_track_init_detect_timeout(gen)
+            return
+        detector = VisualObjectDetector()
+        timeout_s = _m14_track_init_detect_timeout_s()
+        task = M14DetectTask(detector, frame_bgr, bridge, generation=gen, timeout_s=timeout_s)
+        QThreadPool.globalInstance().start(task)
+        QTimer.singleShot(
+            int(timeout_s * 1000.0),
+            lambda g=gen: self._m14_track_init_detect_timeout(g),
+        )
+
+    def _on_m14_track_init_detect_result(self, ok: bool, detections: object, generation: int) -> None:
+        gen = int(generation or 0)
+        if gen != int(getattr(self, "_m14_track_init_pending_gen", -1) or -1):
+            return  # already resolved (timeout fallback already fired) or a cancelled track
+        if gen != int(getattr(self, "_m13_track_generation", 0) or 0):
+            self._m14_track_init_pending_gen = None
+            return  # track was stopped/restarted while detection was in flight
+        self._m14_track_init_pending_gen = None
+        frame_bgr = getattr(self, "_m14_track_init_frame_bgr", None)
+        click = getattr(self, "_m14_track_init_click_uv", None)
+        if frame_bgr is None or not isinstance(click, tuple):
+            return
+        u, v = click
+        fh, fw = frame_bgr.shape[0], frame_bgr.shape[1]
+        cx, cy = float(u) * fw, float(v) * fh
+        det = _m14_detection_at_click(list(detections or []), cx, cy) if ok else None
+        if det is not None and float(det.w) >= 8.0 and float(det.h) >= 8.0:
+            box = TrackBox(float(det.x), float(det.y), float(det.w), float(det.h))
+            print(
+                f"[VGCS:m14] track start — using detected '{det.label}' box "
+                f"({box.w:.0f}x{box.h:.0f}, {det.confidence:.0%} confidence) under click"
+            )
+        else:
+            box_w_px, box_h_px = _m14_track_box_size_px()
+            box = bbox_around_point(cx, cy, box_w=box_w_px, box_h=box_h_px, frame_w=fw, frame_h=fh)
+            reason = "no object detected under click" if ok else "object-size detection failed"
+            print(f"[VGCS:m14] track start — {reason}, using default box size ({box.w:.0f}x{box.h:.0f})")
+        self._m14_finish_ai_follow_start(u, v, gen, frame_bgr, box)
+
+    def _m14_track_init_detect_timeout(self, generation: int) -> None:
+        gen = int(generation or 0)
+        if gen != int(getattr(self, "_m14_track_init_pending_gen", -1) or -1):
+            return  # already resolved by a detection result that arrived in time
+        if gen != int(getattr(self, "_m13_track_generation", 0) or 0):
+            self._m14_track_init_pending_gen = None
+            return  # track was stopped/restarted while waiting
+        self._m14_track_init_pending_gen = None
+        frame_bgr = getattr(self, "_m14_track_init_frame_bgr", None)
+        click = getattr(self, "_m14_track_init_click_uv", None)
+        if frame_bgr is None or not isinstance(click, tuple):
+            return
+        u, v = click
         fh, fw = frame_bgr.shape[0], frame_bgr.shape[1]
         cx, cy = float(u) * fw, float(v) * fh
         box_w_px, box_h_px = _m14_track_box_size_px()
-        bbox = bbox_around_point(
-            cx, cy, box_w=box_w_px, box_h=box_h_px,
-            frame_w=fw, frame_h=fh,
+        box = bbox_around_point(cx, cy, box_w=box_w_px, box_h=box_h_px, frame_w=fw, frame_h=fh)
+        print(
+            f"[VGCS:m14] track start — object-size detection timed out after "
+            f"{_m14_track_init_detect_timeout_s():.1f}s, using default box size "
+            f"({box.w:.0f}x{box.h:.0f})"
         )
+        self._m14_finish_ai_follow_start(u, v, gen, frame_bgr, box)
+
+    def _m14_finish_ai_follow_start(
+        self, u: float, v: float, generation: int, frame_bgr, box: TrackBox
+    ) -> None:
+        """Common tail for both the detected-box and fallback-box paths —
+        actually initializes CSRT and the rest of the track state. Was the
+        entire body of _m14_start_ai_follow before object-size detection
+        made that method two-phase (detect first, then finish here)."""
+        self._m13_track_starting = False
+        fh, fw = frame_bgr.shape[0], frame_bgr.shape[1]
         print(
             f"[VGCS:m14] track start click=({u:.3f},{v:.3f}) frame={fw}x{fh} "
-            f"bbox=({bbox.x:.0f},{bbox.y:.0f},{bbox.w:.0f},{bbox.h:.0f})"
+            f"bbox=({box.x:.0f},{box.y:.0f},{box.w:.0f},{box.h:.0f})"
         )
         tracker = VisualObjectTracker()
-        ok = tracker.start(frame_bgr, bbox)
+        ok = tracker.start(frame_bgr, box)
         if not ok:
             print("[VGCS:m14] track start failed: tracker.start() returned False (see init error above)")
             self._m13_track_active = False
@@ -305,9 +425,9 @@ class M13MovingTargetTrackMixin:
         self._m14_tracker = tracker
         self._m14_tracker_active = True
         self._m14_tracker_frame_wh = (fw, fh)
-        # Seed immediately from the click bbox so the overlay shows the real
-        # tracked size right away, not just from the first follow tick.
-        self._m13_track_box_wh_norm = (float(bbox.w) / float(fw), float(bbox.h) / float(fh))
+        # Seed immediately from the resolved box so the overlay shows the
+        # real tracked size right away, not just from the first follow tick.
+        self._m13_track_box_wh_norm = (float(box.w) / float(fw), float(box.h) / float(fh))
         self._m14_follow_task_inflight = False
         self._m14_follow_lost_streak = 0
         self._m14_follow_ticks_skipped = 0
@@ -563,6 +683,9 @@ class M13MovingTargetTrackMixin:
         self._m13_track_active = False
         self._m13_track_armed = False
         self._m13_track_box_wh_norm = None
+        self._m14_track_init_pending_gen = None
+        self._m14_track_init_frame_bgr = None
+        self._m14_track_init_click_uv = None
         notify_companion_visual_track(active=False)
         cc = getattr(self, "_camera_control", None)
         stop_fn = getattr(cc, "stop_target_track", None)
@@ -596,6 +719,9 @@ class M13MovingTargetTrackMixin:
         self._m13_track_range_m = None
         self._m13_track_path = []
         self._m13_track_box_wh_norm = None
+        self._m14_track_init_pending_gen = None
+        self._m14_track_init_frame_bgr = None
+        self._m14_track_init_click_uv = None
         t = getattr(self, "_m13_track_timer", None)
         if t is not None:
             t.stop()
