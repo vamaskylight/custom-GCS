@@ -255,18 +255,23 @@ class M14DetectTask(QRunnable):
         bridge: "M14DetectBridge",
         *,
         generation: int,
+        timeout_s: float | None = None,
     ) -> None:
         super().__init__()
         self._detector = detector
         self._frame_bgr = frame_bgr
         self._bridge = bridge
         self._generation = int(generation)
+        self._timeout_s = timeout_s
 
     def run(self) -> None:
         ok = False
         dets: list[Detection] = []
         try:
-            dets = self._detector.detect(self._frame_bgr)
+            if self._timeout_s is not None:
+                dets = self._detector.detect(self._frame_bgr, timeout_s=float(self._timeout_s))
+            else:
+                dets = self._detector.detect(self._frame_bgr)
             ok = True
         except Exception as exc:
             print(f"[VGCS:m14detect] detection task failed: {exc}")
