@@ -813,11 +813,21 @@ class M13MovingTargetTrackMixin:
         moving in lockstep with the gimbal's own tracking rate would also
         trip this — considered acceptable since letting the gimbal run to
         its hardware limit is worse than asking the operator to re-click.
+
+        Field-confirmed bug this fixes: a first version reset the whole
+        multi-second accumulation window on ANY single missing telemetry
+        sample (``att_yaw``/``att_pitch`` momentarily None). Real UDP gimbal
+        telemetry drops the odd sample routinely — a field log showed one
+        ``gimbal_att=(unsupported)`` in a run where the box was frozen
+        bit-for-bit for 90+ seconds while both axes ran to their mechanical
+        limit, and the reset-on-any-miss version never once completed a
+        full window, so it never fired at all. A transient miss now just
+        skips that tick's count instead of discarding everything accumulated
+        so far — only a genuinely absent/unsupported feed (never seeded to
+        begin with) leaves this permanently inert.
         """
         if att_yaw is None or att_pitch is None:
-            self._m14_conv_ref_att_yaw = None
-            self._m14_conv_ticks = 0
-            return False
+            return False  # transient telemetry miss — keep accumulated progress
         if getattr(self, "_m14_conv_ref_att_yaw", None) is None:
             self._m14_conv_ref_att_yaw = att_yaw
             self._m14_conv_ref_att_pitch = att_pitch
