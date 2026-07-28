@@ -40,6 +40,72 @@ class TrackBox:
         return (self.x + self.w / 2.0, self.y + self.h / 2.0)
 
 
+# Field-measured: real camera frames (960x540) with a real-sized tracked box
+# (e.g. a full-body detection ~115x318px, see track_mixin.py's object-size
+# detection) took 150-280ms per tracker.update() call on client hardware —
+# 1.5-3x the 100ms M14 tick budget, on EVERY tick, not just occasionally.
+# CSRT's own search region is the tracked box scaled by its padding
+# multiplier (visual_object_tracker.py's _M14_CSRT_SEARCH_PADDING = 5.5x) —
+# for a 318px-tall box that's a ~1750px-tall search request, which clips to
+# nearly the FULL frame height (540px) since it can't exceed the image
+# bounds. In other words CSRT is already processing something close to a
+# full-frame-sized region on real footage, so its cost scales with the
+# FRAME's resolution, not just the box size.
+#
+# Decimating (plain integer-stride slicing — no cv2, no interpolation, so
+# this stays crash-isolated: the parent process never touches cv2, only the
+# worker does, unchanged) the frame before it ever reaches the tracker
+# shrinks that same search region proportionally, cutting CSRT's real
+# per-tick cost, AND shrinks the pickled IPC payload sent to the worker
+# every tick. The box returned by the worker is in decimated-frame
+# coordinates and gets scaled back up by the same stride before this class
+# hands it to the caller — real-world pixel coordinates in, real-world
+# pixel coordinates out; the decimation is entirely an internal
+# implementation detail of this class.
+#
+# Real accuracy tradeoff, stated plainly: nearest-pixel decimation (not a
+# smoothed resize) at, say, stride=2 discards every other row/column, which
+# can shift the tracked position by up to ~1 decimated pixel (~2 real
+# pixels at stride=2) versus running at full resolution — negligible next
+# to the 150-280ms/tick problem it fixes, but real. Untested against real
+# field footage at this exact setting — override via
+# VGCS_M14_TRACKER_MAX_DIM_PX for tuning without a rebuild (larger = more
+# accurate but slower per tick; smaller = faster but coarser).
+_M14_TRACKER_MAX_DIM_PX = 480
+
+
+def _m14_tracker_max_dim_px() -> int:
+    try:
+        return int(os.environ.get("VGCS_M14_TRACKER_MAX_DIM_PX", "") or _M14_TRACKER_MAX_DIM_PX)
+    except ValueError:
+        return int(_M14_TRACKER_MAX_DIM_PX)
+
+
+def _m14_tracker_decimation_stride(frame_w: int, frame_h: int) -> int:
+    """Smallest integer stride that brings the larger frame dimension at or
+    under the configured max — 1 (no-op) if the frame is already small
+    enough. Integer-only so scaling a coordinate down then back up is exact
+    (``x // stride`` and ``x * stride`` round-trip cleanly), unlike an
+    arbitrary float scale factor."""
+    largest = max(int(frame_w), int(frame_h))
+    max_dim = max(1, _m14_tracker_max_dim_px())
+    if largest <= max_dim:
+        return 1
+    return max(1, -(-largest // max_dim))  # ceil division, stdlib-free
+
+
+def _decimate_frame(frame_bgr: np.ndarray, stride: int) -> np.ndarray:
+    if stride <= 1:
+        return frame_bgr
+    return np.ascontiguousarray(frame_bgr[::stride, ::stride])
+
+
+def _scale_track_box(box: "TrackBox | None", factor: float) -> "TrackBox | None":
+    if box is None:
+        return None
+    return TrackBox(box.x * factor, box.y * factor, box.w * factor, box.h * factor)
+
+
 _ipp_disabled = False
 
 
@@ -404,6 +470,7 @@ class VisualObjectTracker:
         self._active = False
         self._lost_streak = 0
         self._algo_used = ""
+        self._stride = 1
 
     @property
     def algo_used(self) -> str:
@@ -411,6 +478,14 @@ class VisualObjectTracker:
 
     def start(self, frame_bgr: np.ndarray, bbox: TrackBox) -> bool:
         self.stop()
+        # Decimate once, from the frame's real dimensions, and reuse the
+        # same stride for every later update() — CSRT's internal state is
+        # tied to whatever coordinate space it was initialized in, so this
+        # cannot change mid-track (see _m14_tracker_decimation_stride).
+        fh, fw = frame_bgr.shape[0], frame_bgr.shape[1]
+        stride = _m14_tracker_decimation_stride(fw, fh)
+        small_frame = _decimate_frame(frame_bgr, stride)
+        small_bbox = TrackBox(bbox.x / stride, bbox.y / stride, bbox.w / stride, bbox.h / stride)
         try:
             import subprocess
             import sys
@@ -427,7 +502,9 @@ class VisualObjectTracker:
         self._proc = proc
         self._resp_queue = self._start_reader(proc)
         self._send_queue = self._start_writer(proc)
-        resp = self._request(("start", _encode_frame(frame_bgr), bbox), _M14_WORKER_START_TIMEOUT_S)
+        resp = self._request(
+            ("start", _encode_frame(small_frame), small_bbox), _M14_WORKER_START_TIMEOUT_S
+        )
         if resp is None:
             if proc.poll() is not None:
                 print("[VGCS:m14] tracker worker crashed during init (contained - GCS unaffected)")
@@ -439,9 +516,16 @@ class VisualObjectTracker:
         if not ok:
             self.stop()
             return False
+        self._stride = stride
         self._active = True
         self._lost_streak = 0
         self._algo_used = str(algo)
+        if stride > 1:
+            print(
+                f"[VGCS:m14] tracker running at 1/{stride} scale "
+                f"({fw}x{fh} -> {small_frame.shape[1]}x{small_frame.shape[0]}) "
+                "to keep per-tick CSRT cost bounded"
+            )
         return True
 
     def update(self, frame_bgr: np.ndarray) -> tuple[bool, TrackBox | None]:
@@ -452,7 +536,8 @@ class VisualObjectTracker:
             self._active = False
             self._lost_streak += 1
             return False, None
-        resp = self._request(("update", _encode_frame(frame_bgr)), _M14_WORKER_UPDATE_TIMEOUT_S)
+        small_frame = _decimate_frame(frame_bgr, self._stride)
+        resp = self._request(("update", _encode_frame(small_frame)), _M14_WORKER_UPDATE_TIMEOUT_S)
         if resp is None:
             if self._proc.poll() is not None:
                 print("[VGCS:m14] tracker worker process died during update (contained - GCS unaffected)")
@@ -462,7 +547,10 @@ class VisualObjectTracker:
         self._lost_streak = int(lost)
         if not ok or box is None:
             return False, None
-        return True, box
+        # box came back in decimated-frame coordinates — scale up to real
+        # pixel coordinates before handing it to the caller (see the stride
+        # comment above TrackBox / _m14_tracker_decimation_stride).
+        return True, _scale_track_box(box, float(self._stride))
 
     def is_active(self) -> bool:
         return bool(self._active)
@@ -479,6 +567,7 @@ class VisualObjectTracker:
         self._active = False
         self._lost_streak = 0
         self._algo_used = ""
+        self._stride = 1
         if proc is None:
             return
         try:
