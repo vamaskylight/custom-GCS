@@ -856,15 +856,25 @@ def resolve_viewpro_host(settings, *, default: str = "192.168.2.119") -> str:
 class ViewproCameraControl:
     """Viewpro/ViewLink gimbal — TCP control port (default 2000).
 
-    Video (RTSP) and network/IP settings are fully documented in the
-    ViewLink manual and work like any other RTSP camera. Gimbal PTZ/zoom/
-    focus/photo/record control is NOT implemented: the manual describes the
-    GUI behavior but does not publish the underlying command bytes — see
-    DOCS/VIEWPRO-CAMERA-REFERENCE.md "Known gaps". Those methods log a
-    one-time diagnostic instead of silently doing nothing forever, and
-    ``send_raw_command`` exposes the one fully-specified capability (the
-    software's own "Extended Command" debug channel) for future protocol
-    work.
+    Video (RTSP) and network/IP settings work like any other RTSP camera.
+    Gimbal PTZ (speed + absolute angle), zoom, focus, photo, and record are
+    implemented against the real ViewLink wire protocol (obtained from
+    Viewpro after-sales support, 2026-07) — see
+    vgcs/viewpro/protocol.py for the byte-level encode/decode (verified
+    against the vendor's own worked examples) and
+    DOCS/VIEWPRO-CAMERA-REFERENCE.md for what's confirmed vs. still
+    uncertain (notably: which physical direction Focus+/Focus- move the
+    lens has not been field-verified — the vendor doc's own worked examples
+    for that pair are internally inconsistent with its command table).
+
+    Absolute zoom/digital-zoom-level and absolute focus-level setpoints
+    (``set_zoom``/``set_focus``) are not implemented — only relative
+    step/hold control, matching the SIYI adapter's own scope.
+
+    ``send_raw_command`` remains available as a debug/integration escape
+    hatch (mirrors the ViewLink app's own "Extended Command" panel) for
+    protocol features not yet wired in here (e.g. absolute zoom-to-level,
+    tracking, OSD).
     """
 
     def __init__(
@@ -902,9 +912,15 @@ class ViewproCameraControl:
         has_pitch = cmd.pitch_deg is not None and abs(float(cmd.pitch_deg)) >= 1e-6
         if not has_yaw and not has_pitch:
             return
-        self._adapter.set_angle(
-            yaw=float(cmd.yaw_deg or 0.0), pitch=float(cmd.pitch_deg or 0.0)
-        )
+        try:
+            st = self._adapter.get_status()
+            base_yaw = float(st.yaw_deg) if st.yaw_deg is not None else 0.0
+            base_pitch = float(st.pitch_deg) if st.pitch_deg is not None else 0.0
+            yaw_tgt = base_yaw + (float(cmd.yaw_deg) if has_yaw else 0.0)
+            pitch_tgt = base_pitch + (float(cmd.pitch_deg) if has_pitch else 0.0)
+            self._adapter.set_angle(yaw=yaw_tgt, pitch=pitch_tgt)
+        except Exception:
+            return
 
     def ptz(self, action: str) -> None:
         self._adapter.ptz(str(action or ""))
@@ -922,10 +938,10 @@ class ViewproCameraControl:
         return self._adapter.get_status()
 
     def gimbal_center(self) -> None:
-        self._adapter.ptz("center")
+        self._adapter.center()
 
     def gimbal_point_down(self) -> None:
-        self._adapter.set_angle(yaw=0.0, pitch=gimbal_nadir_pitch_deg())
+        self._adapter.look_down()
 
     def send_raw_command(self, payload: bytes) -> bytes:
         """Debug/integration escape hatch — see class docstring."""

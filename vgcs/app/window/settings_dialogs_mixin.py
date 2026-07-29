@@ -418,9 +418,8 @@ class MainWindowSettingsDialogsMixin:
         viewpro_grid.addWidget(QLabel("Timeout (ms)"), 2, 0)
         viewpro_grid.addWidget(viewpro_timeout, 2, 1)
         viewpro_note = QLabel(
-            "Video (RTSP) and network settings are fully supported. Gimbal PTZ/zoom/focus/photo/"
-            "record are not yet implemented — the Viewpro manual doesn't publish the command "
-            "protocol bytes. See DOCS/VIEWPRO-CAMERA-REFERENCE.md."
+            "Gimbal PTZ (speed + turn-to-angle), zoom, focus, photo, and record are supported. "
+            "Absolute zoom/focus level and onboard tracking are not. See DOCS/VIEWPRO-CAMERA-REFERENCE.md."
         )
         viewpro_note.setWordWrap(True)
         viewpro_note.setStyleSheet("color: #c8d0e0; font-size: 12px;")
@@ -447,8 +446,8 @@ class MainWindowSettingsDialogsMixin:
             ),
             "viewpro": (
                 "Viewpro/ViewLink gimbal: TCP control port 2000 (default) on the camera IP — "
-                "usually the same host as your RTSP URL. Video-only today; PTZ/zoom/focus/photo/"
-                "record need the Viewpro command protocol (not in the software manual)."
+                "usually the same host as your RTSP URL. Gimbal speed/angle, zoom, focus, "
+                "photo, and record are supported."
             ),
         }
         _CAMERA_STACK_INDEX = {"mavlink": 0, "siyi": 1, "skydroid": 2, "viewpro": 3}

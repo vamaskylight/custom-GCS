@@ -281,10 +281,7 @@ class MainWindowLinkMixin:
                 timeout_s=max(0.05, float(timeout_ms) / 1000.0),
             )
             self._wire_camera_control(cc)
-            self._append_log(
-                f"Camera control: Viewpro TCP {host}:{port} "
-                "(video-only — PTZ/zoom/focus not implemented, see DOCS/VIEWPRO-CAMERA-REFERENCE.md)"
-            )
+            self._append_log(f"Camera control: Viewpro TCP {host}:{port} (ViewLink protocol)")
             return
         cc = MavlinkCameraControl(self._thread)
         self._wire_camera_control(cc)

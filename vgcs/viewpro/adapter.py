@@ -1,31 +1,31 @@
 """Viewpro/ViewLink gimbal — TCP control-port client.
 
-The ViewLink Software User Manual (V4.0.9, 2025-11-17) documents the network
-transport (TCP port 2000 by default, §3.2.1(7)) and shows one example raw
-frame for its "M-packet" protocol (§3.7 Extended Command), but does not
-publish the command-ID table for pan/tilt/zoom/focus/photo/record/track
-control — those bytes are not in this manual. See
-DOCS/VIEWPRO-CAMERA-REFERENCE.md "Known gaps" for what's missing and why
-PTZ/zoom/focus/photo/record are deliberately left as diagnostic no-ops below
-rather than guessed at.
+Implements the protocol from two vendor documents (obtained 2026-07 via
+Viewpro after-sales support):
+- "TCP control.pdf" — TCP envelope wrapping the serial protocol.
+- "Viewpro Viewlink Serial Command Communication Protocol" V3.4.9 — the
+  ViewLink serial frame format and command tables.
 
-``send_raw_command`` is the one fully-specified capability this manual gives:
-it mirrors the software's own "Extended Command" debug panel (§3.7) — send
-arbitrary bytes to the gimbal's TCP control port. Useful once the real
-command bytes are known (from Viewpro's protocol/SDK doc) or for capturing
-ViewLink's own traffic to reverse-engineer specific commands.
+See vgcs/viewpro/protocol.py for the wire-format encode/decode, verified
+byte-for-byte against every worked example in those documents (checksum
+algorithm, gimbal speed/angle encoding, zoom/photo/record C1 bit-packing,
+and B1/D1 status decoding all independently confirmed — see that module's
+docstrings and DOCS/VIEWPRO-CAMERA-REFERENCE.md for what's confirmed vs.
+still uncertain, notably the Focus+/Focus- direction).
 """
 
 from __future__ import annotations
 
+import threading
+import time
+
 from vgcs.skydroid import GimbalStatus
+from vgcs.viewpro import protocol as vp
 from vgcs.viewpro.transport import ViewproTcpTransport
 
-_NOT_IMPLEMENTED_HINT = (
-    "not yet implemented — the ViewLink software manual does not publish the "
-    "PTZ/zoom/focus/photo/record command bytes (only an example M-packet frame). "
-    "See DOCS/VIEWPRO-CAMERA-REFERENCE.md."
-)
+_DEFAULT_SLEW_DPS = 10.0  # matches the manual's own worked speed-control examples
+_ZOOM_SPEED = 7  # 1 (slowest) ~ 7 (fastest) per protocol doc
+_FOCUS_SPEED = 4  # mid-range; protocol doc has no stated default
 
 
 class ViewproGimbalTcpAdapter:
@@ -37,59 +37,171 @@ class ViewproGimbalTcpAdapter:
         host: str,
         port: int = 2000,
         timeout_s: float = 1.0,
+        poll_hz: float = 2.0,
     ) -> None:
         self._transport = ViewproTcpTransport(host, port, timeout_s=timeout_s)
-        self._warned_actions: set[str] = set()
+        self._status = GimbalStatus()
+        self._status_lock = threading.Lock()
+        self._recording = False
+        self._last_range_m: float | None = None
+        self._running = False
+        self._poller: threading.Thread | None = None
+        self._poll_dt = 1.0 / max(0.5, float(poll_hz))
 
     def start(self) -> None:
-        # Lazy-connect on first use (matches SiyiGimbalUdpAdapter/transport
-        # style) rather than blocking construction on a TCP handshake.
-        return
+        if self._running:
+            return
+        self._running = True
+        self._poller = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poller.start()
 
     def stop(self) -> None:
+        self._running = False
         self._transport.close()
 
     def get_status(self) -> GimbalStatus:
-        """No attitude telemetry parsing implemented — see module docstring."""
-        return GimbalStatus(supported=False)
+        with self._status_lock:
+            return self._status
+
+    def is_recording(self) -> bool:
+        return self._recording
 
     def send_raw_command(self, payload: bytes) -> bytes:
-        """Send raw bytes to the gimbal's TCP control port; returns whatever
-        reply arrives within the transport timeout (possibly empty — many
-        commands are fire-and-forget). Mirrors the ViewLink "Extended
-        Command" debug panel (manual §3.7)."""
+        """Debug/integration escape hatch — send arbitrary already-framed bytes."""
         return self._transport.send_and_receive(payload)
 
-    def _not_implemented(self, action: str) -> None:
-        # ptz() in particular is called continuously while a jog key/button is
-        # held — print once per action kind per adapter lifetime, not per call.
-        if action in self._warned_actions:
+    # ---- Status ----
+
+    def request_status(self) -> GimbalStatus | None:
+        pkt = vp.encode_heartbeat()
+        try:
+            reply = self._transport.send_and_receive(pkt)
+        except Exception:
+            return None
+        self._update_from_reply(reply)
+        return self.get_status()
+
+    def _update_from_reply(self, reply: bytes) -> None:
+        if not reply:
             return
-        self._warned_actions.add(action)
-        print(f"[VGCS:viewpro] {action} {_NOT_IMPLEMENTED_HINT}")
+        parsed = vp.find_status_frame(reply)
+        if parsed is None:
+            return
+        st = GimbalStatus(
+            yaw_deg=parsed.get("yaw_deg"),
+            pitch_deg=parsed.get("pitch_deg"),
+            supported=True,
+            updated_mono=time.monotonic(),
+        )
+        with self._status_lock:
+            self._status = st
+        rec = parsed.get("record_status")
+        if rec is not None:
+            self._recording = rec == 1
+        if "range_m" in parsed:
+            self._last_range_m = parsed["range_m"]
 
-    def camera_photo(self) -> None:
-        self._not_implemented("photo")
+    def _poll_loop(self) -> None:
+        while self._running:
+            self.request_status()
+            time.sleep(self._poll_dt)
 
-    def camera_record_toggle(self) -> None:
-        self._not_implemented("record toggle")
+    def _send(self, **kwargs) -> None:
+        pkt = vp.encode_gimbal_camera_command(**kwargs)
+        try:
+            reply = self._transport.send_and_receive(pkt)
+            self._update_from_reply(reply)
+        except Exception:
+            pass
 
-    def camera_zoom(self, direction: int) -> None:
-        del direction
-        self._not_implemented("zoom")
-
-    def camera_focus_step(self, direction: int) -> None:
-        del direction
-        self._not_implemented("focus")
+    # ---- Gimbal servo (A1) ----
 
     def ptz(self, action: str) -> None:
-        del action
-        self._not_implemented("gimbal move (PTZ)")
+        action_l = str(action or "").strip().lower()
+        raw = vp.speed_dps_to_raw(_DEFAULT_SLEW_DPS)
+        if action_l in ("up", "pitch_up"):
+            self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p2=-raw)
+        elif action_l in ("down", "pitch_down"):
+            self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p2=raw)
+        elif action_l in ("left", "yaw_left"):
+            self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p1=-raw)
+        elif action_l in ("right", "yaw_right"):
+            self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p1=raw)
+        elif action_l == "stop":
+            self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p1=0, servo_p2=0)
+        elif action_l in ("center", "home"):
+            self._send(servo=vp.SERVO_HOME_POSITION)
 
     def set_angle(self, yaw: float, pitch: float) -> None:
-        del yaw, pitch
-        self._not_implemented("gimbal angle")
+        """Absolute angle, home position as 0 (servo 0x0B) — a single one-shot
+        "turn to" command, not for continuous/high-frequency sends (doc's
+        own caveat on this servo mode)."""
+        self._send(
+            servo=vp.SERVO_MANUAL_ABSOLUTE_ANGLE,
+            servo_p1=vp.angle_deg_to_raw(yaw),
+            servo_p2=vp.angle_deg_to_raw(pitch),
+        )
 
     def set_rotation_speed(self, yaw: float, pitch: float) -> None:
-        del yaw, pitch
-        self._not_implemented("gimbal speed")
+        self._send(
+            servo=vp.SERVO_MANUAL_SPEED,
+            servo_p1=vp.speed_dps_to_raw(yaw),
+            servo_p2=vp.speed_dps_to_raw(pitch),
+        )
+
+    def center(self) -> None:
+        self._send(servo=vp.SERVO_HOME_POSITION)
+
+    def look_down(self) -> None:
+        self._send(servo=vp.SERVO_LOOK_DOWN)
+
+    # ---- Camera / optical (C1) ----
+
+    def camera_zoom(self, direction: int) -> None:
+        d = int(direction)
+        if d > 0:
+            self._send(c1_op=vp.C1_OP_FOV_MINUS_ZOOM_IN, c1_zoom_speed=_ZOOM_SPEED)
+        elif d < 0:
+            self._send(c1_op=vp.C1_OP_FOV_PLUS_ZOOM_OUT, c1_zoom_speed=_ZOOM_SPEED)
+        else:
+            self._send(c1_op=vp.C1_OP_STOP)
+
+    def camera_focus_step(self, direction: int) -> None:
+        d = int(direction)
+        if d > 0:
+            self._send(c1_op=vp.C1_OP_FOCUS_PLUS, c1_zoom_speed=_FOCUS_SPEED)
+        elif d < 0:
+            self._send(c1_op=vp.C1_OP_FOCUS_MINUS, c1_zoom_speed=_FOCUS_SPEED)
+        else:
+            self._send(c1_op=vp.C1_OP_STOP)
+
+    def camera_auto_focus(self) -> None:
+        self._send(c1_op=vp.C1_OP_AUTO_FOCUS)
+
+    def camera_photo(self) -> None:
+        self._send(c1_op=vp.C1_OP_TAKE_PICTURE)
+
+    def camera_record_toggle(self) -> None:
+        if self._recording:
+            self._send(c1_op=vp.C1_OP_STOP_RECORD)
+        else:
+            self._send(c1_op=vp.C1_OP_START_RECORD)
+        # Optimistic local flip; corrected from real device state (D1 record
+        # status) on the next status reply if it disagrees.
+        self._recording = not self._recording
+
+    # ---- Laser rangefinder (only meaningful on LRF-equipped models) ----
+
+    def laser_range_once(self) -> None:
+        self._send(c1_lrf=vp.C1_LRF_SINGLE)
+
+    def laser_range_start(self) -> None:
+        self._send(c1_lrf=vp.C1_LRF_CONTINUOUS_START)
+
+    def laser_range_stop(self) -> None:
+        self._send(c1_lrf=vp.C1_LRF_STOP)
+
+    def query_range_m(self) -> float | None:
+        """Last known LRF range from periodic status (D1) — None if the
+        connected gimbal has no rangefinder or hasn't reported one yet."""
+        return self._last_range_m
