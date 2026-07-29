@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from vgcs.skydroid import GimbalStatus, SkydroidTopUdpAdapter
 from vgcs.skydroid.transport import begin_skydroid_session_log
 from vgcs.siyi import SiyiGimbalUdpAdapter
+from vgcs.viewpro import ViewproGimbalTcpAdapter
 
 
 @dataclass(frozen=True)
@@ -831,6 +832,104 @@ class SiyiCameraControl:
             return self._adapter.request_attitude()
         except Exception:
             return None
+
+
+def resolve_viewpro_host(settings, *, default: str = "192.168.2.119") -> str:
+    """Viewpro/ViewLink gimbal IP from settings or RTSP stream URL hostname.
+
+    192.168.2.119 is the factory-default gimbal IP printed on the unit's
+    label per the ViewLink manual (§2.2.3) — same fallback pattern as
+    resolve_siyi_host/resolve_skydroid_host.
+    """
+    host = str(settings.value("camera/viewpro_host", "") or "").strip()
+    if host:
+        return host
+    for key in ("video/rtsp_day", "video/rtsp_thermal"):
+        url = str(settings.value(key, "") or "").strip()
+        if url.lower().startswith("rtsp://"):
+            parsed = urlparse(url)
+            if parsed.hostname:
+                return str(parsed.hostname)
+    return str(default)
+
+
+class ViewproCameraControl:
+    """Viewpro/ViewLink gimbal — TCP control port (default 2000).
+
+    Video (RTSP) and network/IP settings are fully documented in the
+    ViewLink manual and work like any other RTSP camera. Gimbal PTZ/zoom/
+    focus/photo/record control is NOT implemented: the manual describes the
+    GUI behavior but does not publish the underlying command bytes — see
+    DOCS/VIEWPRO-CAMERA-REFERENCE.md "Known gaps". Those methods log a
+    one-time diagnostic instead of silently doing nothing forever, and
+    ``send_raw_command`` exposes the one fully-specified capability (the
+    software's own "Extended Command" debug channel) for future protocol
+    work.
+    """
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int = 2000,
+        timeout_s: float = 1.0,
+    ) -> None:
+        self._adapter = ViewproGimbalTcpAdapter(host=host, port=port, timeout_s=timeout_s)
+        self._adapter.start()
+
+    def close(self) -> None:
+        self._adapter.stop()
+
+    def set_zoom(self, level: float) -> None:
+        del level
+        return
+
+    def handle_zoom_step(self, step: int, ui_level: float) -> None:
+        del ui_level
+        if int(step) != 0:
+            self._adapter.camera_zoom(int(step))
+
+    def handle_focus_step(self, step: int) -> None:
+        if int(step) != 0:
+            self._adapter.camera_focus_step(int(step))
+
+    def set_focus(self, level: float) -> None:
+        del level
+        return
+
+    def set_gimbal(self, cmd: GimbalCommand) -> None:
+        has_yaw = cmd.yaw_deg is not None and abs(float(cmd.yaw_deg)) >= 1e-6
+        has_pitch = cmd.pitch_deg is not None and abs(float(cmd.pitch_deg)) >= 1e-6
+        if not has_yaw and not has_pitch:
+            return
+        self._adapter.set_angle(
+            yaw=float(cmd.yaw_deg or 0.0), pitch=float(cmd.pitch_deg or 0.0)
+        )
+
+    def ptz(self, action: str) -> None:
+        self._adapter.ptz(str(action or ""))
+
+    def set_gimbal_speed(self, yaw: float, pitch: float) -> None:
+        self._adapter.set_rotation_speed(yaw=float(yaw), pitch=float(pitch))
+
+    def camera_trigger_photo(self) -> None:
+        self._adapter.camera_photo()
+
+    def camera_toggle_record(self) -> None:
+        self._adapter.camera_record_toggle()
+
+    def get_gimbal_status(self) -> GimbalStatus | None:
+        return self._adapter.get_status()
+
+    def gimbal_center(self) -> None:
+        self._adapter.ptz("center")
+
+    def gimbal_point_down(self) -> None:
+        self._adapter.set_angle(yaw=0.0, pitch=gimbal_nadir_pitch_deg())
+
+    def send_raw_command(self, payload: bytes) -> bytes:
+        """Debug/integration escape hatch — see class docstring."""
+        return self._adapter.send_raw_command(payload)
 
 
 def resolve_camera_control_primary(control: object | None) -> object | None:
