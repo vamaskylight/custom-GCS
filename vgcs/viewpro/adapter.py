@@ -26,6 +26,7 @@ from vgcs.viewpro.transport import ViewproTcpTransport
 _DEFAULT_SLEW_DPS = 10.0  # matches the manual's own worked speed-control examples
 _ZOOM_SPEED = 7  # 1 (slowest) ~ 7 (fastest) per protocol doc
 _FOCUS_SPEED = 4  # mid-range; protocol doc has no stated default
+_FAILURE_LOG_INTERVAL_S = 5.0  # throttle: jog fires every 80ms, don't flood the console
 
 
 class ViewproGimbalTcpAdapter:
@@ -39,6 +40,8 @@ class ViewproGimbalTcpAdapter:
         timeout_s: float = 1.0,
         poll_hz: float = 2.0,
     ) -> None:
+        self._host = str(host or "")
+        self._port = int(port)
         self._transport = ViewproTcpTransport(host, port, timeout_s=timeout_s)
         self._status = GimbalStatus()
         self._status_lock = threading.Lock()
@@ -47,6 +50,24 @@ class ViewproGimbalTcpAdapter:
         self._running = False
         self._poller: threading.Thread | None = None
         self._poll_dt = 1.0 / max(0.5, float(poll_hz))
+        self._last_failure_log_mono = 0.0
+        self._logged_first_failure = False
+        self._logged_first_success = False
+
+    def _log_failure(self, where: str, exc: Exception) -> None:
+        """Throttled diagnostic — without this, a bad host/port or a dead
+        camera link fails completely silently (jog fires every 80ms; an
+        unthrottled print per failure would flood the console)."""
+        now = time.monotonic()
+        if not self._logged_first_failure or (now - self._last_failure_log_mono) >= _FAILURE_LOG_INTERVAL_S:
+            print(f"[VGCS:viewpro] TCP {where} to {self._host}:{self._port} failed: {exc!r}")
+            self._last_failure_log_mono = now
+            self._logged_first_failure = True
+
+    def _log_first_success(self) -> None:
+        if not self._logged_first_success:
+            self._logged_first_success = True
+            print(f"[VGCS:viewpro] TCP control link to {self._host}:{self._port} is up")
 
     def start(self) -> None:
         if self._running:
@@ -76,8 +97,10 @@ class ViewproGimbalTcpAdapter:
         pkt = vp.encode_heartbeat()
         try:
             reply = self._transport.send_and_receive(pkt)
-        except Exception:
+        except Exception as exc:
+            self._log_failure("status poll", exc)
             return None
+        self._log_first_success()
         self._update_from_reply(reply)
         return self.get_status()
 
@@ -118,8 +141,8 @@ class ViewproGimbalTcpAdapter:
         pkt = vp.encode_gimbal_camera_command(**kwargs)
         try:
             self._transport.send(pkt)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_failure("command send", exc)
 
     # ---- Gimbal servo (A1) ----
 
