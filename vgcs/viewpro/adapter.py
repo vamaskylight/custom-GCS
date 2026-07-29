@@ -107,10 +107,17 @@ class ViewproGimbalTcpAdapter:
             time.sleep(self._poll_dt)
 
     def _send(self, **kwargs) -> None:
+        """Fire-and-forget — gimbal jog (set_gimbal_speed) fires every 80ms
+        from a GUI-thread timer while a hold button is pressed
+        (map_widget.py's _gimbal_hold_timer). Waiting for a TCP reply here
+        (as SIYI's adapter learned the hard way for its own UDP jog path)
+        would block the GUI thread up to the transport timeout on every
+        tick. Status/attitude/record-state instead comes solely from the
+        background poll loop's heartbeat (request_status), which runs off
+        the GUI thread and can afford to block on a reply."""
         pkt = vp.encode_gimbal_camera_command(**kwargs)
         try:
-            reply = self._transport.send_and_receive(pkt)
-            self._update_from_reply(reply)
+            self._transport.send(pkt)
         except Exception:
             pass
 
