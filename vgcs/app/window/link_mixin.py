@@ -79,9 +79,11 @@ from vgcs.video.camera_control import (
     poll_companion_laser_range_m,
     SiyiCameraControl,
     SkydroidCameraControl,
+    ViewproCameraControl,
     resolve_siyi_host,
     resolve_skydroid_control_hosts,
     resolve_skydroid_host,
+    resolve_viewpro_host,
 )
 
 
@@ -268,6 +270,21 @@ class MainWindowLinkMixin:
                 )
 
             QTimer.singleShot(4000, _skydroid_gimbal_hint)
+            return
+        if provider == "viewpro":
+            host = resolve_viewpro_host(self._settings)
+            port = int(self._settings.value("camera/viewpro_port", 2000) or 2000)
+            timeout_ms = int(self._settings.value("camera/viewpro_timeout_ms", 1000) or 1000)
+            cc = ViewproCameraControl(
+                host=host,
+                port=port,
+                timeout_s=max(0.05, float(timeout_ms) / 1000.0),
+            )
+            self._wire_camera_control(cc)
+            self._append_log(
+                f"Camera control: Viewpro TCP {host}:{port} "
+                "(video-only — PTZ/zoom/focus not implemented, see DOCS/VIEWPRO-CAMERA-REFERENCE.md)"
+            )
             return
         cc = MavlinkCameraControl(self._thread)
         self._wire_camera_control(cc)

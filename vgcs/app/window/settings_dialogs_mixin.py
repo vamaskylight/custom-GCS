@@ -79,9 +79,11 @@ from vgcs.video.camera_control import (
     poll_companion_laser_range_m,
     SiyiCameraControl,
     SkydroidCameraControl,
+    ViewproCameraControl,
     resolve_siyi_host,
     resolve_skydroid_control_hosts,
     resolve_skydroid_host,
+    resolve_viewpro_host,
 )
 
 
@@ -298,6 +300,8 @@ class MainWindowSettingsDialogsMixin:
         rb_siyi.setProperty("provider_id", "siyi")
         rb_skydroid = QRadioButton("C13 Gimbal Camera (UDP)")
         rb_skydroid.setProperty("provider_id", "skydroid")
+        rb_viewpro = QRadioButton("Viewpro Gimbal Camera (TCP)")
+        rb_viewpro.setProperty("provider_id", "viewpro")
         provider_wrap = QWidget()
         provider_wrap.setObjectName("cameraProviderWrap")
         provider_lay = QVBoxLayout(provider_wrap)
@@ -306,7 +310,7 @@ class MainWindowSettingsDialogsMixin:
         provider_title = QLabel("Control provider")
         provider_title.setStyleSheet("font-weight: 600; color: #dbe1ee;")
         provider_lay.addWidget(provider_title)
-        for rb in (rb_mavlink, rb_siyi, rb_skydroid):
+        for rb in (rb_mavlink, rb_siyi, rb_skydroid, rb_viewpro):
             provider_group.addButton(rb)
             provider_lay.addWidget(rb)
         provider_wrap.setStyleSheet(
@@ -394,10 +398,40 @@ class MainWindowSettingsDialogsMixin:
         skydroid_gimbal_tap_deg = None
         skydroid_grid.setColumnStretch(1, 1)
 
+        viewpro_panel = QWidget()
+        viewpro_grid = QGridLayout(viewpro_panel)
+        viewpro_grid.setContentsMargins(0, 4, 0, 0)
+        viewpro_grid.setHorizontalSpacing(12)
+        viewpro_grid.setVerticalSpacing(8)
+        viewpro_host = QLineEdit()
+        viewpro_host.setPlaceholderText("Empty = RTSP hostname or 192.168.2.119")
+        viewpro_port = QSpinBox()
+        viewpro_port.setRange(1, 65535)
+        viewpro_port.setValue(2000)
+        viewpro_timeout = QSpinBox()
+        viewpro_timeout.setRange(50, 5000)
+        viewpro_timeout.setValue(1000)
+        viewpro_grid.addWidget(QLabel("Host / IP"), 0, 0)
+        viewpro_grid.addWidget(viewpro_host, 0, 1)
+        viewpro_grid.addWidget(QLabel("TCP port"), 1, 0)
+        viewpro_grid.addWidget(viewpro_port, 1, 1)
+        viewpro_grid.addWidget(QLabel("Timeout (ms)"), 2, 0)
+        viewpro_grid.addWidget(viewpro_timeout, 2, 1)
+        viewpro_note = QLabel(
+            "Video (RTSP) and network settings are fully supported. Gimbal PTZ/zoom/focus/photo/"
+            "record are not yet implemented — the Viewpro manual doesn't publish the command "
+            "protocol bytes. See DOCS/VIEWPRO-CAMERA-REFERENCE.md."
+        )
+        viewpro_note.setWordWrap(True)
+        viewpro_note.setStyleSheet("color: #c8d0e0; font-size: 12px;")
+        viewpro_grid.addWidget(viewpro_note, 3, 0, 1, 2)
+        viewpro_grid.setColumnStretch(1, 1)
+
         camera_stack = QStackedWidget()
         camera_stack.addWidget(mavlink_panel)
         camera_stack.addWidget(siyi_panel)
         camera_stack.addWidget(skydroid_panel)
+        camera_stack.addWidget(viewpro_panel)
         cam_outer.addWidget(camera_stack)
 
         _CAMERA_PROVIDER_HINTS: dict[str, str] = {
@@ -411,23 +445,29 @@ class MainWindowSettingsDialogsMixin:
                 "C13 gimbal TOP (PROTOCAL): UDP 192.168.144.108 port 5000 (#TP frames). "
                 "RTSP: rtsp://192.168.144.108:554/stream=1. PC Ethernet 192.168.144.10/24."
             ),
+            "viewpro": (
+                "Viewpro/ViewLink gimbal: TCP control port 2000 (default) on the camera IP — "
+                "usually the same host as your RTSP URL. Video-only today; PTZ/zoom/focus/photo/"
+                "record need the Viewpro command protocol (not in the software manual)."
+            ),
         }
-        _CAMERA_STACK_INDEX = {"mavlink": 0, "siyi": 1, "skydroid": 2}
+        _CAMERA_STACK_INDEX = {"mavlink": 0, "siyi": 1, "skydroid": 2, "viewpro": 3}
         _RTSP_PLACEHOLDER = {
             "mavlink": "rtsp://host/stream or udp://0.0.0.0:5600",
             "siyi": "ZR10: rtsp://192.168.144.25:8554/main.264",
             "skydroid": "C13: rtsp://192.168.144.108:554/stream=1",
+            "viewpro": "Viewpro: rtsp://192.168.2.119:554/stream0",
         }
 
         def _camera_provider_id() -> str:
-            for rb in (rb_mavlink, rb_siyi, rb_skydroid):
+            for rb in (rb_mavlink, rb_siyi, rb_skydroid, rb_viewpro):
                 if rb.isChecked():
                     return str(rb.property("provider_id") or "mavlink")
             return "mavlink"
 
         def _set_camera_provider_id(pid: str) -> None:
             want = str(pid or "mavlink").strip().lower()
-            for rb in (rb_mavlink, rb_siyi, rb_skydroid):
+            for rb in (rb_mavlink, rb_siyi, rb_skydroid, rb_viewpro):
                 rb.setChecked(str(rb.property("provider_id") or "") == want)
 
         def _sync_camera_provider_ui() -> None:
@@ -622,6 +662,15 @@ class MainWindowSettingsDialogsMixin:
             siyi_timeout.setValue(int(s.value("camera/siyi_timeout_ms", 250) or 250))
         except Exception:
             siyi_timeout.setValue(250)
+        viewpro_host.setText(str(s.value("camera/viewpro_host", "") or ""))
+        try:
+            viewpro_port.setValue(int(s.value("camera/viewpro_port", 2000) or 2000))
+        except Exception:
+            viewpro_port.setValue(2000)
+        try:
+            viewpro_timeout.setValue(int(s.value("camera/viewpro_timeout_ms", 1000) or 1000))
+        except Exception:
+            viewpro_timeout.setValue(1000)
         _sync_camera_provider_ui()
         dem_path_edit.setText(
             str(
@@ -708,6 +757,9 @@ class MainWindowSettingsDialogsMixin:
                 s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))
                 s.setValue("camera/skydroid_gimbal_speed_yaw", float(skydroid_gimbal_speed_yaw.value()))
                 s.setValue("camera/skydroid_gimbal_speed_pitch", float(skydroid_gimbal_speed_yaw.value()))
+                s.setValue("camera/viewpro_host", str(viewpro_host.text()).strip())
+                s.setValue("camera/viewpro_port", int(viewpro_port.value()))
+                s.setValue("camera/viewpro_timeout_ms", int(viewpro_timeout.value()))
                 dem_p = str(dem_path_edit.text()).strip()
                 s.setValue("observe/dem_path", dem_p)
                 s.setValue("observe/dem_csv", dem_p)
