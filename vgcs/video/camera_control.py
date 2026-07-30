@@ -257,7 +257,7 @@ class CompositeGimbalCameraControl:
         setter = getattr(self._primary, "set_zoom", None)
         if callable(setter):
             setter(float(level))
-        if not uses_skydroid_top_camera(self):
+        if not uses_skydroid_top_camera(self) and not uses_viewpro_camera(self):
             self._queue_mavlink_zoom_level(float(level))
 
     def handle_zoom_step(self, step: int, ui_level: float) -> None:
@@ -268,6 +268,7 @@ class CompositeGimbalCameraControl:
             self._mavlink is not None
             and int(step) != 0
             and not uses_skydroid_top_camera(self)
+            and not uses_viewpro_camera(self)
         ):
             try:
                 self._mavlink.queue_camera_zoom_step(int(step))
