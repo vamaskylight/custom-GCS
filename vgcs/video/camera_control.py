@@ -909,6 +909,12 @@ class ViewproCameraControl:
         return
 
     def set_gimbal(self, cmd: GimbalCommand) -> None:
+        """cmd.pitch_deg is a nudge in the app-wide "positive = tilt UP"
+        convention (matches Skydroid GSP / SIYI natively, and MavlinkCameraControl's
+        queue_gimbal_nudge) — Viewpro's own wire format is the opposite (positive
+        pitch = DOWN, confirmed from the vendor's worked angle-control examples;
+        see ``ptz()`` below, which already negates for its up/down actions), so
+        the nudge must be subtracted, not added, from the device-native base_pitch."""
         has_yaw = cmd.yaw_deg is not None and abs(float(cmd.yaw_deg)) >= 1e-6
         has_pitch = cmd.pitch_deg is not None and abs(float(cmd.pitch_deg)) >= 1e-6
         if not has_yaw and not has_pitch:
@@ -918,7 +924,7 @@ class ViewproCameraControl:
             base_yaw = float(st.yaw_deg) if st.yaw_deg is not None else 0.0
             base_pitch = float(st.pitch_deg) if st.pitch_deg is not None else 0.0
             yaw_tgt = base_yaw + (float(cmd.yaw_deg) if has_yaw else 0.0)
-            pitch_tgt = base_pitch + (float(cmd.pitch_deg) if has_pitch else 0.0)
+            pitch_tgt = base_pitch - (float(cmd.pitch_deg) if has_pitch else 0.0)
             self._adapter.set_angle(yaw=yaw_tgt, pitch=pitch_tgt)
         except Exception:
             return
@@ -927,7 +933,13 @@ class ViewproCameraControl:
         self._adapter.ptz(str(action or ""))
 
     def set_gimbal_speed(self, yaw: float, pitch: float) -> None:
-        self._adapter.set_rotation_speed(yaw=float(yaw), pitch=float(pitch))
+        """See set_gimbal's docstring — the caller (camera_rail_mixin's
+        continuous hold-speed jog) passes pitch in the "positive = UP" app
+        convention; Viewpro's wire format wants the opposite, so negate it
+        here (this is the path an on-screen jog button hold actually uses —
+        unlike ptz(), which already negates correctly but is currently
+        unreachable from the UI's continuous-hold path)."""
+        self._adapter.set_rotation_speed(yaw=float(yaw), pitch=-float(pitch))
 
     def camera_trigger_photo(self) -> None:
         self._adapter.camera_photo()
