@@ -61,6 +61,7 @@ class ViewproGimbalTcpAdapter:
         self._logged_first_failure = False
         self._logged_first_success = False
         self._zoom_stop_timer: threading.Timer | None = None
+        self._last_gimbal_log_mono = 0.0
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -149,11 +150,31 @@ class ViewproGimbalTcpAdapter:
         tick. Status/attitude/record-state instead comes solely from the
         background poll loop's heartbeat (request_status), which runs off
         the GUI thread and can afford to block on a reply."""
+        self._log_gimbal_command(kwargs)
         pkt = vp.encode_gimbal_camera_command(**kwargs)
         try:
             self._transport.send(pkt)
         except Exception as exc:
             self._log_failure("command send", exc)
+
+    def _log_gimbal_command(self, kwargs: dict) -> None:
+        """Throttled visibility into every A1 servo (gimbal-moving) command this
+        process actually sends — added because a field report of the gimbal
+        "moving on its own" turned up no VGCS-issued zoom/gimbal command at all
+        in the session log; this makes the next repro conclusive either way
+        (a VGCS command will show up here, or its absence points at the
+        camera's own onboard behavior instead)."""
+        servo = kwargs.get("servo", vp.SERVO_NO_CHANGE)
+        if servo == vp.SERVO_NO_CHANGE:
+            return
+        now = time.monotonic()
+        if now - self._last_gimbal_log_mono < 1.0:
+            return
+        self._last_gimbal_log_mono = now
+        print(
+            f"[VGCS:viewpro] gimbal cmd servo=0x{int(servo):02X} "
+            f"p1={kwargs.get('servo_p1', 0)} p2={kwargs.get('servo_p2', 0)}"
+        )
 
     # ---- Gimbal servo (A1) ----
 
