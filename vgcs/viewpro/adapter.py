@@ -62,6 +62,7 @@ class ViewproGimbalTcpAdapter:
         self._logged_first_success = False
         self._zoom_stop_timer: threading.Timer | None = None
         self._last_gimbal_log_mono = 0.0
+        self._last_gimbal_log_sig: tuple[int, int, int] | None = None
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -158,22 +159,30 @@ class ViewproGimbalTcpAdapter:
             self._log_failure("command send", exc)
 
     def _log_gimbal_command(self, kwargs: dict) -> None:
-        """Throttled visibility into every A1 servo (gimbal-moving) command this
-        process actually sends — added because a field report of the gimbal
-        "moving on its own" turned up no VGCS-issued zoom/gimbal command at all
-        in the session log; this makes the next repro conclusive either way
-        (a VGCS command will show up here, or its absence points at the
-        camera's own onboard behavior instead)."""
+        """Visibility into every A1 servo (gimbal-moving) command this process
+        actually sends — added because a field report of the gimbal "moving on
+        its own" turned up no VGCS-issued gimbal command at all in the session
+        log.
+
+        Every *change* in the command is logged; only identical repeats are
+        rate-limited. The first version of this throttled purely on time, which
+        swallowed the stop (p1=0 p2=0) that follows ~80ms after a jog — making
+        the logs ambiguous about whether a slew was ever stopped, which is the
+        single most important thing to know when diagnosing a runaway.
+        """
         servo = kwargs.get("servo", vp.SERVO_NO_CHANGE)
         if servo == vp.SERVO_NO_CHANGE:
             return
+        sig = (int(servo), int(kwargs.get("servo_p1", 0)), int(kwargs.get("servo_p2", 0)))
         now = time.monotonic()
-        if now - self._last_gimbal_log_mono < 1.0:
+        changed = sig != self._last_gimbal_log_sig
+        if not changed and now - self._last_gimbal_log_mono < 1.0:
             return
         self._last_gimbal_log_mono = now
+        self._last_gimbal_log_sig = sig
         print(
-            f"[VGCS:viewpro] gimbal cmd servo=0x{int(servo):02X} "
-            f"p1={kwargs.get('servo_p1', 0)} p2={kwargs.get('servo_p2', 0)}"
+            f"[VGCS:viewpro] gimbal cmd servo=0x{sig[0]:02X} p1={sig[1]} p2={sig[2]}"
+            + ("" if changed else " (held)")
         )
 
     # ---- Gimbal servo (A1) ----
