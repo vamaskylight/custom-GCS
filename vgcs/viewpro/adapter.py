@@ -179,12 +179,17 @@ class ViewproGimbalTcpAdapter:
     # ---- Gimbal servo (A1) ----
 
     def ptz(self, action: str) -> None:
+        """Pitch sign fixed 2026-07-30 from a field test of the equivalent
+        SERVO_MANUAL_SPEED path in ViewproCameraControl.set_gimbal_speed: raw
+        positive pitch drives the gimbal UP on this real unit (the vendor doc's
+        absolute-angle worked example says positive = DOWN, but that doesn't
+        hold for this velocity command in practice) — up=+raw, down=-raw."""
         action_l = str(action or "").strip().lower()
         raw = vp.speed_dps_to_raw(_DEFAULT_SLEW_DPS)
         if action_l in ("up", "pitch_up"):
-            self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p2=-raw)
-        elif action_l in ("down", "pitch_down"):
             self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p2=raw)
+        elif action_l in ("down", "pitch_down"):
+            self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p2=-raw)
         elif action_l in ("left", "yaw_left"):
             self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p1=-raw)
         elif action_l in ("right", "yaw_right"):
