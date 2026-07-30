@@ -19,6 +19,18 @@ class CameraRailMixin:
     _GIMBAL_HOLD_SPEED_YAW_DPS = 5.0
     _GIMBAL_HOLD_SPEED_PITCH_DPS = 5.0
 
+    # Runaway guard for the hold-jog refresh timer. The timer re-sends the speed
+    # command every 80ms and used to stop ONLY on the button's `released` signal —
+    # so any press whose release never arrives (window deactivated or mouse grab
+    # lost mid-press) slewed the gimbal forever. A 2026-07-30 Viewpro field log
+    # showed exactly that: one yaw-right hold still refreshing 70+ seconds later
+    # (~350 deg of unrequested rotation), reported as "gimbal moving by itself".
+    # Two independent guards now cover it: the tick re-checks that the source
+    # button is still physically down, and this hard cap stops the slew even if
+    # Qt still believes the button is pressed. Generous enough for a real
+    # operator sweep (12s ~ 60 deg at the 5 deg/s default) — re-press to continue.
+    _GIMBAL_HOLD_MAX_S = 12.0
+
     def set_camera_control(self, control) -> None:
         """Inject a camera control backend (MAVLink/SDK)."""
         try:
@@ -422,6 +434,8 @@ class CameraRailMixin:
         def _start() -> None:
             self._native_gimbal_speed_stop()
             self._gimbal_hold_axis = (int(dx), int(dy))
+            self._gimbal_hold_button = btn
+            self._gimbal_hold_started_mono = time.monotonic()
             self._native_gimbal_speed_start(dx, dy)
             if self._native_gimbal_uses_ptz_hold():
                 return
@@ -430,17 +444,51 @@ class CameraRailMixin:
 
         def _stop() -> None:
             self._gimbal_hold_axis = None
+            self._gimbal_hold_button = None
+            self._gimbal_hold_started_mono = 0.0
             self._gimbal_hold_timer.stop()
             self._native_gimbal_speed_stop()
 
         btn.pressed.connect(_start)
         btn.released.connect(_stop)
 
+    def _gimbal_hold_runaway_reason(self) -> str:
+        """Why an in-progress hold-jog must be aborted, '' if it's still legitimate.
+
+        See _GIMBAL_HOLD_MAX_S — a hold whose `released` signal never arrives would
+        otherwise keep the 80ms refresh timer slewing the gimbal indefinitely.
+        """
+        btn = getattr(self, "_gimbal_hold_button", None)
+        if btn is not None:
+            try:
+                if not btn.isDown():
+                    return "button no longer held (release event lost)"
+            except RuntimeError:
+                # Underlying C++ widget already deleted — nothing legitimate can be holding it.
+                return "hold button no longer exists"
+        started = float(getattr(self, "_gimbal_hold_started_mono", 0.0) or 0.0)
+        if started > 0.0:
+            held_s = time.monotonic() - started
+            if held_s >= float(self._GIMBAL_HOLD_MAX_S):
+                return f"exceeded {self._GIMBAL_HOLD_MAX_S:.0f}s safety cap (held {held_s:.1f}s)"
+        return ""
+
     def _on_gimbal_hold_tick(self) -> None:
         axis = self._gimbal_hold_axis
         if axis is None:
             return
         if self._native_gimbal_uses_ptz_hold():
+            return
+        reason = self._gimbal_hold_runaway_reason()
+        if reason:
+            # Logged, not silent: a runaway that self-heals invisibly is a bug that
+            # comes back as "the gimbal moves on its own" with nothing in the log.
+            print(f"[VGCS:cam_rail] gimbal hold aborted — {reason}")
+            self._gimbal_hold_axis = None
+            self._gimbal_hold_button = None
+            self._gimbal_hold_started_mono = 0.0
+            self._gimbal_hold_timer.stop()
+            self._native_gimbal_speed_stop()
             return
         self._notify_companion_gimbal_motion(duration_s=1.2)
         self._native_gimbal_speed_start(axis[0], axis[1])
