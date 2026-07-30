@@ -16,6 +16,7 @@ still uncertain, notably the Focus+/Focus- direction).
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -34,6 +35,28 @@ _FAILURE_LOG_INTERVAL_S = 5.0  # throttle: jog fires every 80ms, don't flood the
 # This duration is a starting point, not field-calibrated against a real lens —
 # tune it (faster lens = shorter pulse) once verified against hardware.
 _ZOOM_STEP_PULSE_S = 0.15
+# Post-jog position hold. SERVO_MANUAL_SPEED (0x01) is a *rate* mode: velocity 0
+# means "no commanded motion", NOT "hold this position" — it leaves the gimbal in
+# rate mode with no position lock, so it slowly drifts on gyro bias. Field report
+# 2026-07-30 matched this exactly: no drift on connect (gimbal still in its own
+# stabilised mode), drift starting only after the jog buttons had been used and
+# then left idle, with VGCS provably sending nothing during the drift.
+# The fix is to hand the gimbal an explicit position target once the jog settles.
+# SERVO_MANUAL_RELATIVE_ANGLE (0x09) with all-zero params ("move by 0 degrees from
+# where you are") is used rather than the absolute-angle servo (0x0B) on purpose:
+# relative-zero needs no knowledge of the angle reference frame or of the
+# pitch-sign convention, so it cannot jump the gimbal. Worst case it is a no-op.
+# The delay lets the gimbal finish decelerating so the hold pins its true resting
+# position. Set VGCS_VIEWPRO_POST_JOG_HOLD=0 to disable.
+_POST_JOG_HOLD_DELAY_S = 0.35
+
+
+def _post_jog_hold_enabled() -> bool:
+    return os.environ.get("VGCS_VIEWPRO_POST_JOG_HOLD", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
 
 
 class ViewproGimbalTcpAdapter:
@@ -63,6 +86,7 @@ class ViewproGimbalTcpAdapter:
         self._zoom_stop_timer: threading.Timer | None = None
         self._last_gimbal_log_mono = 0.0
         self._last_gimbal_log_sig: tuple[int, int, int] | None = None
+        self._position_hold_timer: threading.Timer | None = None
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -91,6 +115,7 @@ class ViewproGimbalTcpAdapter:
         if self._zoom_stop_timer is not None:
             self._zoom_stop_timer.cancel()
             self._zoom_stop_timer = None
+        self._cancel_position_hold()
         self._transport.close()
 
     def get_status(self) -> GimbalStatus:
@@ -188,13 +213,16 @@ class ViewproGimbalTcpAdapter:
     # ---- Gimbal servo (A1) ----
 
     def ptz(self, action: str) -> None:
-        """Pitch sign fixed 2026-07-30 from a field test of the equivalent
+        """Any operator-driven move supersedes a pending post-jog hold.
+
+        Pitch sign fixed 2026-07-30 from a field test of the equivalent
         SERVO_MANUAL_SPEED path in ViewproCameraControl.set_gimbal_speed: raw
         positive pitch drives the gimbal UP on this real unit (the vendor doc's
         absolute-angle worked example says positive = DOWN, but that doesn't
         hold for this velocity command in practice) — up=+raw, down=-raw."""
         action_l = str(action or "").strip().lower()
         raw = vp.speed_dps_to_raw(_DEFAULT_SLEW_DPS)
+        self._cancel_position_hold()
         if action_l in ("up", "pitch_up"):
             self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p2=raw)
         elif action_l in ("down", "pitch_down"):
@@ -205,6 +233,7 @@ class ViewproGimbalTcpAdapter:
             self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p1=raw)
         elif action_l == "stop":
             self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p1=0, servo_p2=0)
+            self._schedule_position_hold()
         elif action_l in ("center", "home"):
             self._send(servo=vp.SERVO_HOME_POSITION)
 
@@ -212,6 +241,7 @@ class ViewproGimbalTcpAdapter:
         """Absolute angle, home position as 0 (servo 0x0B) — a single one-shot
         "turn to" command, not for continuous/high-frequency sends (doc's
         own caveat on this servo mode)."""
+        self._cancel_position_hold()
         self._send(
             servo=vp.SERVO_MANUAL_ABSOLUTE_ANGLE,
             servo_p1=vp.angle_deg_to_raw(yaw),
@@ -219,16 +249,50 @@ class ViewproGimbalTcpAdapter:
         )
 
     def set_rotation_speed(self, yaw: float, pitch: float) -> None:
+        self._cancel_position_hold()
+        yaw_raw = vp.speed_dps_to_raw(yaw)
+        pitch_raw = vp.speed_dps_to_raw(pitch)
         self._send(
             servo=vp.SERVO_MANUAL_SPEED,
-            servo_p1=vp.speed_dps_to_raw(yaw),
-            servo_p2=vp.speed_dps_to_raw(pitch),
+            servo_p1=yaw_raw,
+            servo_p2=pitch_raw,
         )
+        if yaw_raw == 0 and pitch_raw == 0:
+            # Jog finished — don't leave the gimbal parked in rate mode (see
+            # _POST_JOG_HOLD_DELAY_S: that is what makes it drift when idle).
+            self._schedule_position_hold()
+
+    def _cancel_position_hold(self) -> None:
+        timer = self._position_hold_timer
+        if timer is not None:
+            timer.cancel()
+            self._position_hold_timer = None
+
+    def _schedule_position_hold(self) -> None:
+        if not _post_jog_hold_enabled():
+            return
+        self._cancel_position_hold()
+        timer = threading.Timer(_POST_JOG_HOLD_DELAY_S, self._apply_position_hold)
+        timer.daemon = True
+        self._position_hold_timer = timer
+        timer.start()
+
+    def _apply_position_hold(self) -> None:
+        """Pin the gimbal at its current position after a jog (see _POST_JOG_HOLD_DELAY_S).
+
+        A relative move of zero, so it needs no attitude readback and no knowledge
+        of the angle reference frame or pitch-sign convention — it cannot move the
+        gimbal, only give it something to hold onto.
+        """
+        self._position_hold_timer = None
+        self._send(servo=vp.SERVO_MANUAL_RELATIVE_ANGLE)
 
     def center(self) -> None:
+        self._cancel_position_hold()
         self._send(servo=vp.SERVO_HOME_POSITION)
 
     def look_down(self) -> None:
+        self._cancel_position_hold()
         self._send(servo=vp.SERVO_LOOK_DOWN)
 
     # ---- Camera / optical (C1) ----
