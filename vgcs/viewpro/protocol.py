@@ -36,6 +36,11 @@ CMD_STATUS_T1F1B1D1 = 0x40  # payload -> console periodic status (41B body: T1 2
 # --- A1 servo control (9 bytes: servo(1) + 4x signed int16 params, big-endian) ---
 SERVO_MOTOR_ON_OFF = 0x00
 SERVO_MANUAL_SPEED = 0x01  # params1/2 = yaw/pitch velocity, 1bit=0.01 deg/s, signed
+# params1/3 = yaw/pitch velocity (0=default), params2/4 = yaw/pitch angle x360/65536,
+# measured FROM THE CURRENT POSITION. Sent with all-zero params it is a "move by 0
+# degrees" request, which hands the gimbal a position target at exactly where it
+# already is — see ViewproGimbalTcpAdapter._apply_position_hold for why that matters.
+SERVO_MANUAL_RELATIVE_ANGLE = 0x09
 SERVO_HOME_POSITION = 0x04
 SERVO_MANUAL_ABSOLUTE_ANGLE = 0x0B  # home position as 0; NOT for high-frequency/continuous sends per doc
 SERVO_LOOK_DOWN = 0x12  # "pitch orthographic", look straight down
