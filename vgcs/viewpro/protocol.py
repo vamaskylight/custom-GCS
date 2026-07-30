@@ -183,8 +183,18 @@ def encode_heartbeat() -> bytes:
 
 
 def angle_deg_to_raw(deg: float) -> int:
-    """1bit = 360/65536 degree, signed int16."""
-    return int(round(float(deg) * 65536.0 / 360.0))
+    """1bit = 360/65536 degree, signed int16.
+
+    The wire field is circular (-180..+180, wrapping at the ends — same
+    physical point at +180 and -180), so wrap the input into that range
+    first. Without this, an absolute-angle target computed as
+    ``base_yaw + delta`` (see ``ViewproCameraControl.set_gimbal``) that
+    lands past +-180 gets silently clamped to the nearest int16 edge by
+    ``_i16`` instead of wrapping — the gimbal then appears to hard-stop at
+    +-180 even though it can rotate continuously through 360 degrees.
+    """
+    wrapped = ((float(deg) + 180.0) % 360.0) - 180.0
+    return int(round(wrapped * 65536.0 / 360.0))
 
 
 def angle_raw_to_deg(raw: int) -> float:
