@@ -27,6 +27,13 @@ _DEFAULT_SLEW_DPS = 10.0  # matches the manual's own worked speed-control exampl
 _ZOOM_SPEED = 7  # 1 (slowest) ~ 7 (fastest) per protocol doc
 _FOCUS_SPEED = 4  # mid-range; protocol doc has no stated default
 _FAILURE_LOG_INTERVAL_S = 5.0  # throttle: jog fires every 80ms, don't flood the console
+# C1 zoom (0x08/0x09) is a continuous start command, not a discrete step — the
+# protocol has no absolute zoom-to-level command (see DOCS/VIEWPRO-CAMERA-REFERENCE.md).
+# The UI's Zoom +/- is a single click with no release event, so without an
+# auto-stop a click would run the lens to its physical zoom limit in one shot.
+# This duration is a starting point, not field-calibrated against a real lens —
+# tune it (faster lens = shorter pulse) once verified against hardware.
+_ZOOM_STEP_PULSE_S = 0.15
 
 
 class ViewproGimbalTcpAdapter:
@@ -53,6 +60,7 @@ class ViewproGimbalTcpAdapter:
         self._last_failure_log_mono = 0.0
         self._logged_first_failure = False
         self._logged_first_success = False
+        self._zoom_stop_timer: threading.Timer | None = None
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -78,6 +86,9 @@ class ViewproGimbalTcpAdapter:
 
     def stop(self) -> None:
         self._running = False
+        if self._zoom_stop_timer is not None:
+            self._zoom_stop_timer.cancel()
+            self._zoom_stop_timer = None
         self._transport.close()
 
     def get_status(self) -> GimbalStatus:
@@ -188,6 +199,12 @@ class ViewproGimbalTcpAdapter:
     # ---- Camera / optical (C1) ----
 
     def camera_zoom(self, direction: int) -> None:
+        """Pulse the continuous zoom-in/out command then auto-stop shortly after,
+        so one UI click reads as a single zoom step instead of running the lens
+        to its end of travel (see ``_ZOOM_STEP_PULSE_S``)."""
+        if self._zoom_stop_timer is not None:
+            self._zoom_stop_timer.cancel()
+            self._zoom_stop_timer = None
         d = int(direction)
         if d > 0:
             self._send(c1_op=vp.C1_OP_FOV_MINUS_ZOOM_IN, c1_zoom_speed=_ZOOM_SPEED)
@@ -195,6 +212,11 @@ class ViewproGimbalTcpAdapter:
             self._send(c1_op=vp.C1_OP_FOV_PLUS_ZOOM_OUT, c1_zoom_speed=_ZOOM_SPEED)
         else:
             self._send(c1_op=vp.C1_OP_STOP)
+            return
+        timer = threading.Timer(_ZOOM_STEP_PULSE_S, lambda: self._send(c1_op=vp.C1_OP_STOP))
+        timer.daemon = True
+        self._zoom_stop_timer = timer
+        timer.start()
 
     def camera_focus_step(self, direction: int) -> None:
         d = int(direction)
