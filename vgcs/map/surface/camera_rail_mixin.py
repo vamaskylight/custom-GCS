@@ -62,6 +62,16 @@ class CameraRailMixin:
         except Exception:
             pass
         try:
+            from vgcs.video.camera_control import uses_viewpro_camera
+
+            overlay = getattr(self, "_native_video_overlay", None)
+            if overlay is not None:
+                # Viewpro draws its own centre marker in the video feed (camera-side OSD) —
+                # don't duplicate it with our boresight crosshair overlay.
+                overlay.set_center_reticle_enabled(not uses_viewpro_camera(control))
+        except Exception:
+            pass
+        try:
             if bool(getattr(self, "_web_ready", False)) and self._video_preview_should_run():
                 QTimer.singleShot(
                     400,

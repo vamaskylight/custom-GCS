@@ -966,6 +966,17 @@ def uses_siyi_camera(control: object | None) -> bool:
     return isinstance(resolve_camera_control_primary(control), SiyiCameraControl)
 
 
+def uses_viewpro_camera(control: object | None) -> bool:
+    """True when the Viewpro/ViewLink TCP backend is active.
+
+    Viewpro cameras draw their own centre marker in the video feed itself
+    (camera-side OSD), so the software's boresight crosshair overlay would
+    duplicate it — see ``set_center_reticle_enabled`` on
+    ``NativeVideoOverlayLayer``.
+    """
+    return isinstance(resolve_camera_control_primary(control), ViewproCameraControl)
+
+
 def supports_m13_track(control: object | None) -> bool:
     """Cameras M13 click-to-track can arm on: Skydroid TOP (firmware GOT+SUM,
     or C12's software AI-follow) and SIYI SDK (always software AI-follow —
@@ -1014,6 +1025,8 @@ def camera_preview_applies_digital_zoom(
     C13 day: hardware ZMC/DZM steps drive the lens; preview can mirror the rail
     (``VGCS_C13_SOFTWARE_PREVIEW_ZOOM=0`` for RTSP-only once hardware is confirmed).
     Thermal: wide RTSP — always software magnify.
+    Viewpro: C1 zoom command drives the real lens and its RTSP already carries
+    the optical magnification — cropping on top of that would double-zoom.
     """
     primary = resolve_camera_control_primary(control)
     if isinstance(primary, SkydroidCameraControl):
@@ -1022,6 +1035,8 @@ def camera_preview_applies_digital_zoom(
             return True
         if sid in ("", "day") and _c13_software_preview_zoom_enabled():
             return True
+        return False
+    if isinstance(primary, ViewproCameraControl):
         return False
     return True
 
