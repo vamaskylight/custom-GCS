@@ -31,6 +31,17 @@ class CameraRailMixin:
     # operator sweep (12s ~ 60 deg at the 5 deg/s default) — re-press to continue.
     _GIMBAL_HOLD_MAX_S = 12.0
 
+    # Minimum motion per press. The jog is a *velocity* command, so the gimbal only
+    # moves for as long as the button is held — at the 5 deg/s default a ~150ms tap
+    # is ~0.75 deg, which an operator reads as "the button does nothing" (field
+    # report 2026-07-30: "gimbal slightly moving", "pitch up button not working
+    # well"). If a press is released sooner than this, the stop is deferred until it
+    # elapses, so one tap = one consistent visible step, while a genuine press-and-
+    # hold still slews continuously and stops as soon as it is released. Same shape
+    # as the Viewpro zoom-click pulse (_ZOOM_STEP_PULSE_S in vgcs/viewpro/adapter.py).
+    # Tune for feel; must stay well under _GIMBAL_HOLD_MAX_S.
+    _GIMBAL_JOG_MIN_S = 0.4
+
     def set_camera_control(self, control) -> None:
         """Inject a camera control backend (MAVLink/SDK)."""
         try:
@@ -432,7 +443,17 @@ class CameraRailMixin:
         """Press/hold = PTZ once on C13 (PT_RIGHT…); GSY/GSP refresh on other backends."""
 
         def _start() -> None:
-            self._native_gimbal_speed_stop()
+            # No stop-then-go here. This used to call _native_gimbal_speed_stop()
+            # first, which made every press command "velocity 0" and then the real
+            # velocity — visible in a 2026-07-30 field log as an unbroken
+            # (0,0),(0,500),(0,0),(0,500)... ladder, i.e. the gimbal being told to
+            # stop and go again on every tap. A speed command already carries both
+            # axes, so it fully supersedes any previous hold on its own; the extra
+            # stop only added a motion hitch and (via that stop's autofocus
+            # scheduling) queued two redundant AF pulses per press.
+            # Supersede any pending min-duration pulse from a previous tap: this
+            # press is driving the gimbal now, and its own release will stop it.
+            self._gimbal_jog_generation = int(getattr(self, "_gimbal_jog_generation", 0)) + 1
             self._gimbal_hold_axis = (int(dx), int(dy))
             self._gimbal_hold_button = btn
             self._gimbal_hold_started_mono = time.monotonic()
@@ -443,14 +464,41 @@ class CameraRailMixin:
                 self._gimbal_hold_timer.start()
 
         def _stop() -> None:
+            started = float(getattr(self, "_gimbal_hold_started_mono", 0.0) or 0.0)
+            # started == 0.0 means the hold was already torn down (e.g. the runaway
+            # guard fired) — treat as "long enough" so the stop goes out immediately.
+            held_s = (time.monotonic() - started) if started > 0.0 else float(self._GIMBAL_JOG_MIN_S)
             self._gimbal_hold_axis = None
             self._gimbal_hold_button = None
             self._gimbal_hold_started_mono = 0.0
             self._gimbal_hold_timer.stop()
-            self._native_gimbal_speed_stop()
+            remaining_s = float(self._GIMBAL_JOG_MIN_S) - held_s
+            if remaining_s <= 0.0 or self._native_gimbal_uses_ptz_hold():
+                self._native_gimbal_speed_stop()
+                return
+            # Quick tap: let the commanded velocity run to the minimum step, then stop.
+            gen = int(getattr(self, "_gimbal_jog_generation", 0)) + 1
+            self._gimbal_jog_generation = gen
+            QTimer.singleShot(
+                int(remaining_s * 1000.0),
+                lambda: self._finish_min_jog_pulse(gen),
+            )
 
         btn.pressed.connect(_start)
         btn.released.connect(_stop)
+
+    def _finish_min_jog_pulse(self, generation: int) -> None:
+        """Stop the gimbal at the end of a min-duration tap pulse (_GIMBAL_JOG_MIN_S).
+
+        Skipped if a newer press has taken over since this pulse was scheduled —
+        that press owns the gimbal and its own release will stop it. Two
+        independent checks so a stale pulse can never cut a live hold short.
+        """
+        if int(getattr(self, "_gimbal_jog_generation", 0)) != int(generation):
+            return
+        if getattr(self, "_gimbal_hold_axis", None) is not None:
+            return
+        self._native_gimbal_speed_stop()
 
     def _gimbal_hold_runaway_reason(self) -> str:
         """Why an in-progress hold-jog must be aborted, '' if it's still legitimate.
