@@ -87,6 +87,7 @@ class ViewproGimbalTcpAdapter:
         self._last_gimbal_log_mono = 0.0
         self._last_gimbal_log_sig: tuple[int, int, int] | None = None
         self._position_hold_timer: threading.Timer | None = None
+        self._last_servo_mode: int | None = None
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -156,11 +157,35 @@ class ViewproGimbalTcpAdapter:
         )
         with self._status_lock:
             self._status = st
+        self._note_servo_mode(parsed.get("servo_status"))
         rec = parsed.get("record_status")
         if rec is not None:
             self._recording = rec == 1
         if "range_m" in parsed:
             self._last_range_m = parsed["range_m"]
+
+    def _note_servo_mode(self, status: object) -> None:
+        """Log the gimbal's own reported servo mode whenever it changes.
+
+        The B1 status block carries the mode the gimbal believes it is in (2 Hz),
+        and it was being decoded and discarded. Several modes move the gimbal with
+        no command from us — azimuth scan, onboard tracking, manual RC (a
+        transmitter stick), and manual-speed (a rate mode with no position lock).
+        A field report of the gimbal drifting while idle is otherwise unfalsifiable
+        from this end, since the logs already prove VGCS sends nothing during the
+        drift; this says which mode it is actually sitting in.
+        """
+        if status is None:
+            return
+        mode = int(status) & 0x0F
+        if mode == self._last_servo_mode:
+            return
+        prev = self._last_servo_mode
+        self._last_servo_mode = mode
+        prev_txt = (
+            f" (was 0x{prev:02X} {vp.servo_mode_name(prev)})" if prev is not None else " (first report)"
+        )
+        print(f"[VGCS:viewpro] gimbal mode 0x{mode:02X} {vp.servo_mode_name(mode)}{prev_txt}")
 
     def _poll_loop(self) -> None:
         while self._running:

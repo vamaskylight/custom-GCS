@@ -49,6 +49,35 @@ SERVO_NO_CHANGE = 0x0F  # "do not change servo state" — use when only sending 
 # Sign convention confirmed from worked examples (Right 90/Down 90 -> +yaw/+pitch;
 # Left 90/Up 30 -> -yaw/-pitch): yaw positive = right, pitch positive = down.
 
+# The gimbal reports which of these modes it is currently in, in the top 4 bits of
+# the B1 status block (see decode_b1) — so it can be asked directly rather than
+# inferred. Several of these move the gimbal with no command from us at all:
+# azimuth scan sweeps, tracking mode chases the onboard tracker's lock, manual RC
+# mode follows a transmitter stick, and manual-speed is a rate mode with no
+# position lock (it drifts on gyro bias). Only 4 bits are reported, so 0x00-0x0F.
+SERVO_MODE_NAMES = {
+    0x00: "motor on/off",
+    0x01: "manual speed (rate mode - no position lock)",
+    0x02: "follow geo location",
+    0x03: "follow yaw",
+    0x04: "home position",
+    0x05: "AZIMUTH SCAN (sweeps by itself)",
+    0x06: "TRACKING (onboard tracker drives the gimbal)",
+    0x07: "tilt scan",
+    0x08: "point to target",
+    0x09: "manual relative angle",
+    0x0A: "follow yaw disabled",
+    0x0B: "manual absolute angle",
+    0x0C: "follow-up space angle",
+    0x0D: "MANUAL RC MODE (transmitter stick drives the gimbal)",
+    0x0E: "pointing movement",
+    0x0F: "no change",
+}
+
+
+def servo_mode_name(status: int) -> str:
+    return SERVO_MODE_NAMES.get(int(status) & 0x0F, "unknown")
+
 # --- C1 optical control (2 bytes, bit-packed) ---
 # bit15-13: LRF cmd (3b) | bit12-6: operation command (7b) | bit5-3: zoom/param speed (3b) | bit2-0: sensor select (3b)
 C1_OP_STOP = 0x01  # stop focus, stop zoom
