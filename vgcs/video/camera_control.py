@@ -887,6 +887,7 @@ class ViewproCameraControl:
     ) -> None:
         self._adapter = ViewproGimbalTcpAdapter(host=host, port=port, timeout_s=timeout_s)
         self._lrf_locked = False
+        self._lrf_lock_error = ""
         self._adapter.start()
 
     def close(self) -> None:
@@ -1003,6 +1004,19 @@ class ViewproCameraControl:
     def is_lrf_locked(self) -> bool:
         return bool(getattr(self, "_lrf_locked", False))
 
+    def last_lrf_lock_error(self) -> str:
+        """Human-readable reason the most recent lock_lrf_at_video_norm declined,
+        '' on success. The generic CameraControl interface only propagates a
+        distance-or-None through a worker-thread signal (see LrfLockTask), which
+        collapses every decline into the same "LRF failed — retry" caption — fine
+        for the C13, where a decline means the alignment slew itself failed, but
+        misleading here, where the far more common cause is simply "the pick
+        wasn't under the centre crosshair" (this camera has no offset laser to
+        align, so it never slews). lrf_mixin's failure handling checks for this
+        method and appends the result to the status text when present.
+        """
+        return str(getattr(self, "_lrf_lock_error", "") or "")
+
     def lock_lrf_at_video_norm(
         self,
         u: float,
@@ -1021,13 +1035,20 @@ class ViewproCameraControl:
         behaviour, which does not apply to a centre-boresighted laser.
         """
         del frame_w, frame_h, hold_gimbal, hold_slant_boresight
+        # Kept short on purpose: this string doubles as the on-video overlay
+        # caption's second line (native_video_overlay.py), which has no text
+        # wrapping — a full explanation there renders an oversized box over the
+        # video. The full explanation goes to the console print below instead.
+        self._lrf_lock_error = ""
         try:
             du = float(u) - 0.5
             dv = float(v) - 0.5
         except (TypeError, ValueError):
+            self._lrf_lock_error = "Invalid pick"
             return None
         offset = (du * du + dv * dv) ** 0.5
         if offset > self._LRF_BORESIGHT_TOLERANCE_NORM:
+            self._lrf_lock_error = "Aim gimbal so target is under crosshair, then click"
             print(
                 f"[VGCS:viewpro] LRF pick {offset:.2f} off centre (max "
                 f"{self._LRF_BORESIGHT_TOLERANCE_NORM:.2f}) — laser is boresighted to "
@@ -1039,8 +1060,10 @@ class ViewproCameraControl:
             self._adapter.laser_range_once()
             dist = self._adapter.query_range_m()
         except Exception:
+            self._lrf_lock_error = "Laser command failed — check TCP link"
             return None
         if dist is None:
+            self._lrf_lock_error = "No range reported — rangefinder may be absent"
             return None
         self._lrf_locked = True
         if on_sample is not None:
