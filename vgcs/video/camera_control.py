@@ -992,13 +992,37 @@ class ViewproCameraControl:
     # rather than genuinely waiting. This runs on LrfLockTask's worker thread
     # (map/observation/types.py), never the GUI thread, so blocking here is safe
     # — the same reason the C13 lock path's own (longer) alignment wait is safe.
-    _LRF_RANGE_WAIT_S = 1.2
+    # Field bug 2026-08-03 (round 2): passively waiting for the background poll
+    # thread's OWN 2 Hz schedule was intermittent — that thread's status request
+    # can itself block up to the transport's 1.0s socket timeout on a slow reply,
+    # so a single poll cycle occasionally takes ~1.5s, comfortably longer than the
+    # wait window below, with ZERO completed cycles in that time. That explains
+    # logs where three locks succeeded with consistent ranges (31.6/31.7/33.0m,
+    # same target) while other attempts in between timed out under identical
+    # conditions — pure timing luck, not a logic bug. Fixed by actively driving
+    # request_status() from this wait loop instead of depending on the
+    # independent background thread's schedule (safe here — see _wait_for_fresh_range).
+    _LRF_RANGE_WAIT_S = 3.0
     _LRF_RANGE_POLL_INTERVAL_S = 0.15
 
     def _wait_for_fresh_range(self) -> float | None:
+        """Block (worker thread only — see lock_lrf_at_video_norm's docstring)
+        until a range timestamped after this call started is available.
+
+        Actively calls request_status() each iteration rather than passively
+        polling the cache: that call already invokes the same status-parsing
+        path the background poll thread uses (see ViewproGimbalTcpAdapter),
+        properly serializing against it through the transport's own lock, so
+        this doesn't race the background thread — it just also drives requests
+        itself instead of waiting on that thread's independent timing.
+        """
         start = time.monotonic()
         deadline = start + self._LRF_RANGE_WAIT_S
         while True:
+            try:
+                self._adapter.request_status()
+            except Exception:
+                pass
             try:
                 fresh_since = float(self._adapter.last_range_updated_mono())
             except Exception:
