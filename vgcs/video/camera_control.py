@@ -886,6 +886,7 @@ class ViewproCameraControl:
         timeout_s: float = 1.0,
     ) -> None:
         self._adapter = ViewproGimbalTcpAdapter(host=host, port=port, timeout_s=timeout_s)
+        self._lrf_locked = False
         self._adapter.start()
 
     def close(self) -> None:
@@ -959,6 +960,103 @@ class ViewproCameraControl:
     def gimbal_point_down(self) -> None:
         self._adapter.look_down()
 
+    # ---- Laser rangefinder (DOOAF / M8 geo-reference) ----
+    #
+    # Viewpro's laser fires along the camera boresight (frame centre) — the same
+    # "aim the centre crosshair at the target, then lock" workflow the overlay
+    # already documents. Unlike the C13 there is no offset laser to iteratively
+    # align, so there is no gimbal slewing here at all.
+    #
+    # LRF is a per-model option on Viewpro and the protocol has no capability
+    # query, so this self-detects: a unit without the hardware never reports a
+    # range, get_laser_range_m() stays None, and DOOAF falls back to the ray/DEM
+    # ground-intersection method exactly as it does today. No regression either way.
+
+    # How far off frame centre a pick may be and still be measured by the laser.
+    # Beyond this the boresight is simply not looking at the picked point, and
+    # returning the centre's range for it would silently feed DOOAF a distance
+    # belonging to a different piece of ground — an unacceptable failure mode in a
+    # fire-correction system, so we decline and let the ray/DEM path handle it.
+    _LRF_BORESIGHT_TOLERANCE_NORM = 0.12
+
+    def get_laser_range_m(self) -> float | None:
+        try:
+            return self._adapter.query_range_m()
+        except Exception:
+            return None
+
+    def poll_live_laser_range_m(self) -> float | None:
+        return self.get_laser_range_m()
+
+    def set_lrf_armed(self, armed: bool) -> None:
+        try:
+            self._adapter.set_lrf_armed(bool(armed))
+        except Exception:
+            return
+
+    def is_lrf_armed(self) -> bool:
+        try:
+            return bool(self._adapter.is_lrf_armed())
+        except Exception:
+            return False
+
+    def is_lrf_locked(self) -> bool:
+        return bool(getattr(self, "_lrf_locked", False))
+
+    def lock_lrf_at_video_norm(
+        self,
+        u: float,
+        v: float,
+        *,
+        frame_w: int = 1280,
+        frame_h: int = 720,
+        on_sample: Callable[[float], None] | None = None,
+        hold_gimbal: bool | None = None,
+        hold_slant_boresight: bool = False,
+    ) -> float | None:
+        """Range the picked point, or None if it is not under the boresight.
+
+        ``frame_w``/``frame_h``/``hold_gimbal``/``hold_slant_boresight`` exist for
+        interface parity with the C13 path; they describe its gimbal-alignment
+        behaviour, which does not apply to a centre-boresighted laser.
+        """
+        del frame_w, frame_h, hold_gimbal, hold_slant_boresight
+        try:
+            du = float(u) - 0.5
+            dv = float(v) - 0.5
+        except (TypeError, ValueError):
+            return None
+        offset = (du * du + dv * dv) ** 0.5
+        if offset > self._LRF_BORESIGHT_TOLERANCE_NORM:
+            print(
+                f"[VGCS:viewpro] LRF pick {offset:.2f} off centre (max "
+                f"{self._LRF_BORESIGHT_TOLERANCE_NORM:.2f}) — laser is boresighted to "
+                "frame centre; aim the target under the centre marker, then lock. "
+                "Falling back to ray/DEM for this pick."
+            )
+            return None
+        try:
+            self._adapter.laser_range_once()
+            dist = self._adapter.query_range_m()
+        except Exception:
+            return None
+        if dist is None:
+            return None
+        self._lrf_locked = True
+        if on_sample is not None:
+            try:
+                on_sample(float(dist))
+            except Exception:
+                pass
+        return float(dist)
+
+    def unlock_lrf(self) -> None:
+        self._lrf_locked = False
+        try:
+            self._adapter.set_lrf_armed(False)
+        except Exception:
+            return
+
     def send_raw_command(self, payload: bytes) -> bytes:
         """Debug/integration escape hatch — see class docstring."""
         return self._adapter.send_raw_command(payload)
@@ -991,6 +1089,24 @@ def uses_viewpro_camera(control: object | None) -> bool:
     ``NativeVideoOverlayLayer``.
     """
     return isinstance(resolve_camera_control_primary(control), ViewproCameraControl)
+
+
+def camera_reports_payload_gimbal_attitude(control: object | None) -> bool:
+    """True when the backend reads attitude straight off the payload gimbal.
+
+    The distinction that matters for video geo-referencing is payload-direct vs.
+    the MAVLink mount fallback — mount attitude does not describe where the
+    camera is actually looking, so using it to anchor video marks puts them in
+    the wrong place. Skydroid (TOP UDP), SIYI (SDK UDP) and Viewpro (ViewLink
+    TCP B1) all report the real gimbal attitude; MAVLink/Noop do not.
+
+    Unknown backends return False on purpose: falling back to the generic
+    attitude path is harmless, while wrongly trusting a mount angle is not.
+    """
+    return isinstance(
+        resolve_camera_control_primary(control),
+        (SkydroidCameraControl, SiyiCameraControl, ViewproCameraControl),
+    )
 
 
 def supports_m13_track(control: object | None) -> bool:

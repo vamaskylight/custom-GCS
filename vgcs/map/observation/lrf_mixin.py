@@ -55,16 +55,23 @@ class LrfVideoLockMixin:
             return None
 
     def _read_top_gimbal_attitude_pair(self) -> tuple[float, float] | None:
-        """C13 TOP UDP gimbal only — not MAVLink mount fallback (wrong for video GAC)."""
+        """Payload-gimbal attitude only — never the MAVLink mount fallback, whose
+        angles do not describe where the camera is actually looking (wrong for
+        video GAC). Was hard-coded to Skydroid; Viewpro and SIYI report real
+        payload attitude too, so the check is now the capability rather than the
+        vendor — see camera_reports_payload_gimbal_attitude."""
         cc = getattr(self, "_camera_control", None)
         if cc is None:
             return None
         try:
-            from vgcs.video.camera_control import SkydroidCameraControl, resolve_camera_control_primary
+            from vgcs.video.camera_control import (
+                camera_reports_payload_gimbal_attitude,
+                resolve_camera_control_primary,
+            )
 
-            primary = resolve_camera_control_primary(cc)
-            if not isinstance(primary, SkydroidCameraControl):
+            if not camera_reports_payload_gimbal_attitude(cc):
                 return None
+            primary = resolve_camera_control_primary(cc)
             st = primary.get_gimbal_status()
             if st is None or not bool(getattr(st, "supported", False)):
                 return None
