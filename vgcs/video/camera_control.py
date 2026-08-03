@@ -1184,6 +1184,18 @@ def camera_recording_applies_digital_zoom(source_id: str, control: object | None
     return str(source_id or "").strip().lower() == "thermal"
 
 
+def camera_supports_lrf_lock(control: object | None) -> bool:
+    """True when the active backend implements the video-pick LRF lock
+    (currently Skydroid and Viewpro). Used to gate the PROXIMITY panel's LRF
+    arm/lock UI — that panel was hardcoded to `camera/provider == "skydroid"`,
+    which kept it disabled for Viewpro even after ViewproCameraControl grew a
+    real lock_lrf_at_video_norm. SIYI (no confirmed rangefinder on ZR10 — see
+    camera_has_laser_rangefinder) and MAVLink/Noop correctly stay excluded
+    since neither implements the method at all.
+    """
+    return callable(getattr(resolve_camera_control_primary(control), "lock_lrf_at_video_norm", None))
+
+
 def read_companion_laser_range_m(control: object | None) -> float | None:
     """C13 TOP SLR distance in metres (live when armed, frozen when locked)."""
     primary = resolve_camera_control_primary(control)

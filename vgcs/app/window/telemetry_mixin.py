@@ -75,6 +75,7 @@ from vgcs.video.camera_control import (
     CompositeGimbalCameraControl,
     MavlinkCameraControl,
     NoopCameraControl,
+    camera_supports_lrf_lock,
     read_companion_laser_range_m,
     poll_companion_laser_range_m,
     SiyiCameraControl,
@@ -545,13 +546,19 @@ class MainWindowTelemetryMixin:
         self._maybe_refresh_map_web_overlays()
 
     def _refresh_c13_lrf_display(self) -> None:
-        """Poll C13 TOP SLR when LRF armed or locked, or during M13 visual track."""
+        """Poll the active backend's LRF (C13 TOP SLR / Viewpro boresight laser)
+        when armed or locked, or during M13 visual track.
+
+        Was hardcoded to `camera/provider == "skydroid"`, which kept the
+        PROXIMITY panel's LRF arm/lock UI disabled for Viewpro even after
+        ViewproCameraControl grew a real lock_lrf_at_video_norm — see
+        camera_supports_lrf_lock for why this is now a capability check.
+        """
         if not bool(getattr(self, "_heartbeat_seen", False)):
             return
-        provider = str(self._settings.value("camera/provider", "mavlink") or "mavlink").strip().lower()
-        if provider != "skydroid":
-            return
         cc = self._camera_control_backend
+        if not camera_supports_lrf_lock(cc):
+            return
         try:
             self._map_widget.enable_c13_lrf_ui(True)
         except Exception:
