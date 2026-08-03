@@ -77,6 +77,7 @@ class ViewproGimbalTcpAdapter:
         self._status_lock = threading.Lock()
         self._recording = False
         self._last_range_m: float | None = None
+        self._last_range_mono = 0.0
         self._running = False
         self._poller: threading.Thread | None = None
         self._poll_dt = 1.0 / max(0.5, float(poll_hz))
@@ -164,6 +165,7 @@ class ViewproGimbalTcpAdapter:
             self._recording = rec == 1
         if "range_m" in parsed:
             self._last_range_m = parsed["range_m"]
+            self._last_range_mono = time.monotonic()
 
     def _note_servo_mode(self, status: object) -> None:
         """Log the gimbal's own reported servo mode whenever it changes.
@@ -384,9 +386,22 @@ class ViewproGimbalTcpAdapter:
 
         Cached rather than freshly polled on purpose: the background poll thread
         refreshes it at 2 Hz, so this is at most ~0.5s old, and reading the cache
-        keeps LRF reads off the blocking send_and_receive path (this is called
-        from the GUI thread during a lock)."""
+        keeps this call itself non-blocking. It is used two ways with different
+        freshness needs: the PROXIMITY panel's periodic display poll
+        (`_refresh_c13_lrf_display`, GUI thread, 2 Hz) is fine with "at most
+        0.5s old". A one-shot lock is NOT — `laser_range_once()` is
+        fire-and-forget, so reading this immediately after firing can return
+        `None` (nothing measured yet) or a STALE value from a previous, different
+        target; see `last_range_updated_mono()` for how the lock path (which
+        does run on a worker thread, not the GUI thread — see LrfLockTask) waits
+        for a genuinely fresh reading instead of trusting this alone."""
         return self._last_range_m
+
+    def last_range_updated_mono(self) -> float:
+        """time.monotonic() timestamp of the last range update, 0.0 if none yet.
+        Lets a caller confirm a reading is fresh (i.e. arrived after some marker
+        time) rather than just non-None — see query_range_m's docstring."""
+        return self._last_range_mono
 
     def set_lrf_armed(self, armed: bool) -> None:
         """Arm = continuous ranging, so the D1 status carries a live distance the

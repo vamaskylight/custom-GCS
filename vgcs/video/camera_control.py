@@ -983,6 +983,35 @@ class ViewproCameraControl:
     # fire-correction system, so we decline and let the ray/DEM path handle it.
     _LRF_BORESIGHT_TOLERANCE_NORM = 0.12
 
+    # How long to wait, after firing a single-shot range, for the background poll
+    # thread to actually report a fresh distance before giving up. Field bug
+    # 2026-08-03: laser_range_once() is fire-and-forget (see adapter docstring —
+    # never blocks the GUI thread), so reading query_range_m() immediately after
+    # firing raced the camera's own measurement — it returned None on a fresh
+    # session, or a stale distance left over from a previous, different target,
+    # rather than genuinely waiting. This runs on LrfLockTask's worker thread
+    # (map/observation/types.py), never the GUI thread, so blocking here is safe
+    # — the same reason the C13 lock path's own (longer) alignment wait is safe.
+    _LRF_RANGE_WAIT_S = 1.2
+    _LRF_RANGE_POLL_INTERVAL_S = 0.15
+
+    def _wait_for_fresh_range(self) -> float | None:
+        start = time.monotonic()
+        deadline = start + self._LRF_RANGE_WAIT_S
+        while True:
+            try:
+                fresh_since = float(self._adapter.last_range_updated_mono())
+            except Exception:
+                fresh_since = 0.0
+            if fresh_since >= start:
+                try:
+                    return self._adapter.query_range_m()
+                except Exception:
+                    return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(self._LRF_RANGE_POLL_INTERVAL_S)
+
     def get_laser_range_m(self) -> float | None:
         try:
             return self._adapter.query_range_m()
@@ -1080,12 +1109,17 @@ class ViewproCameraControl:
             return None
         try:
             self._adapter.laser_range_once()
-            dist = self._adapter.query_range_m()
         except Exception:
             self._lrf_lock_error = "Laser command failed — check TCP link"
             return None
+        dist = self._wait_for_fresh_range()
         if dist is None:
             self._lrf_lock_error = "No range reported — rangefinder may be absent"
+            print(
+                f"[VGCS:viewpro] LRF fired but no fresh range within "
+                f"{self._LRF_RANGE_WAIT_S:.1f}s — camera may lack a rangefinder, "
+                "or its status frame isn't reaching us in time."
+            )
             return None
         self._lrf_locked = True
         if on_sample is not None:
