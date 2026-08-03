@@ -209,6 +209,26 @@ class LrfVideoLockMixin:
         except Exception:
             pass
 
+    def _lrf_backend_lock_error(self) -> str:
+        """Backend-specific reason the last lock_lrf_at_video_norm call declined.
+
+        The generic CameraControl interface only propagates a distance-or-None
+        through a worker-thread signal (LrfLockTask), collapsing every decline
+        into the same caption — a decline means something different per backend
+        (C13's alignment slew genuinely failed; Viewpro's boresight-only laser
+        just wasn't aimed at the pick), so ask the backend directly rather than
+        guessing at a one-size-fits-all message. Optional: only ViewproCameraControl
+        implements last_lrf_lock_error() today; other backends return ''.
+        """
+        try:
+            cc = getattr(self, "_camera_control", None)
+            getter = getattr(cc, "last_lrf_lock_error", None)
+            if callable(getter):
+                return str(getter() or "")
+        except Exception:
+            pass
+        return ""
+
     def _clear_lrf_lock_geo(self) -> None:
         self._lrf_lock_lat = None
         self._lrf_lock_lon = None
@@ -836,6 +856,13 @@ class LrfVideoLockMixin:
                 self._lrf_lock_failed = True
                 self._lrf_lock_distance_m = None
                 self._clear_lrf_lock_geo()
+                backend_reason = self._lrf_backend_lock_error()
+                if backend_reason:
+                    # Overrides the clear-to-"" above — geo_label doubles as the
+                    # overlay caption's second line (see native_video_overlay.py's
+                    # "LRF failed — retry" + geo_label), and this is genuinely more
+                    # useful than a geo label while the lock has failed.
+                    self._lrf_lock_geo_label = backend_reason
                 try:
                     unlock = getattr(
                         getattr(self, "_camera_control", None), "unlock_lrf", None
@@ -850,7 +877,8 @@ class LrfVideoLockMixin:
                     pass
                 if pending.purpose == "dooaf_setup":
                     self._set_status(
-                        "LRF lock failed — no stable range. Aim the target at the "
+                        backend_reason
+                        or "LRF lock failed — no stable range. Aim the target at the "
                         "centre crosshair, then click again."
                     )
             self._refresh_lrf_lock_overlay()
@@ -863,13 +891,19 @@ class LrfVideoLockMixin:
                 self._lrf_lock_distance_m = None
                 self._lrf_lock_failed = True
                 self._lrf_lock_armed = False
+                backend_reason = self._lrf_backend_lock_error()
+                # geo_label doubles as the overlay caption's second line under
+                # "LRF failed — retry" (native_video_overlay.py) — surfacing the
+                # actual decline reason there, not just in the bottom status bar,
+                # since that overlay text is the only thing visible over the video.
+                self._lrf_lock_geo_label = backend_reason
                 self._refresh_lrf_lock_overlay()
                 try:
                     self._obstacle_radar.set_c13_lrf_lock_failed()
                 except Exception:
                     pass
                 self._set_status(
-                    "LRF lock failed — retry click or tap ◎ to re-arm"
+                    backend_reason or "LRF lock failed — retry click or tap ◎ to re-arm"
                 )
                 QTimer.singleShot(2500, self._clear_lrf_failed_reticle)
                 return
