@@ -983,25 +983,40 @@ class ViewproCameraControl:
     # fire-correction system, so we decline and let the ray/DEM path handle it.
     _LRF_BORESIGHT_TOLERANCE_NORM = 0.12
 
-    # How long to wait, after firing a single-shot range, for the background poll
-    # thread to actually report a fresh distance before giving up. Field bug
-    # 2026-08-03: laser_range_once() is fire-and-forget (see adapter docstring —
-    # never blocks the GUI thread), so reading query_range_m() immediately after
-    # firing raced the camera's own measurement — it returned None on a fresh
-    # session, or a stale distance left over from a previous, different target,
-    # rather than genuinely waiting. This runs on LrfLockTask's worker thread
-    # (map/observation/types.py), never the GUI thread, so blocking here is safe
-    # — the same reason the C13 lock path's own (longer) alignment wait is safe.
-    # Field bug 2026-08-03 (round 2): passively waiting for the background poll
-    # thread's OWN 2 Hz schedule was intermittent — that thread's status request
-    # can itself block up to the transport's 1.0s socket timeout on a slow reply,
-    # so a single poll cycle occasionally takes ~1.5s, comfortably longer than the
-    # wait window below, with ZERO completed cycles in that time. That explains
-    # logs where three locks succeeded with consistent ranges (31.6/31.7/33.0m,
-    # same target) while other attempts in between timed out under identical
-    # conditions — pure timing luck, not a logic bug. Fixed by actively driving
-    # request_status() from this wait loop instead of depending on the
-    # independent background thread's schedule (safe here — see _wait_for_fresh_range).
+    # How long to wait, after starting continuous ranging, for the background
+    # poll thread to report a fresh distance before giving up.
+    #
+    # Field bug 2026-08-03: laser_range_once() (single-shot) is fire-and-forget
+    # (see adapter docstring — never blocks the GUI thread), so reading
+    # query_range_m() immediately after firing raced the camera's own
+    # measurement — it returned None on a fresh session, or a stale distance
+    # left over from a previous, different target, rather than genuinely
+    # waiting. This runs on LrfLockTask's worker thread (map/observation/types.py),
+    # never the GUI thread, so blocking here is safe — the same reason the C13
+    # lock path's own (longer) alignment wait is safe. Added a wait loop for this.
+    #
+    # Field bug 2026-08-03 (round 2, REVERTED): tried having the wait loop
+    # actively call request_status() itself every ~0.15s (on the theory that
+    # passively waiting on the background poll thread's own ~2 Hz schedule was
+    # racy — that thread's own status request can block up to the transport's
+    # 1.0s socket timeout, so a poll cycle occasionally took ~1.5s). The NEXT
+    # field log showed EVERY attempt failing (previously ~50% succeeded) followed
+    # by the TCP link being reset by the remote host — correlated closely enough
+    # with adding up to ~20 extra requests per lock attempt that this was reverted.
+    # Not proven the extra traffic caused the reset (the RTSP video link glitched
+    # around the same time too, suggesting a possible broader Wi-Fi hiccup), but
+    # a stable link is worth more than a faster lock, so err conservative: back to
+    # zero extra requests, passive cache-reads only.
+    #
+    # Field bug 2026-08-03 (round 3): the REAL fix — lock_lrf_at_video_norm was
+    # firing laser_range_once() (single-shot). set_lrf_armed's own docstring
+    # already said "Arm = continuous ranging, so the D1 status carries a live
+    # distance the lock can read immediately" — continuous mode is what actually
+    # makes the range show up reliably. The PROXIMITY panel's arm button uses
+    # continuous mode and had partial success; this path used single-shot and
+    # went 0-for-many in one full session. Switched to starting continuous
+    # ranging (see lock_lrf_at_video_norm) instead, so the passive wait below
+    # should now have something worth waiting for.
     _LRF_RANGE_WAIT_S = 3.0
     _LRF_RANGE_POLL_INTERVAL_S = 0.15
 
@@ -1009,20 +1024,12 @@ class ViewproCameraControl:
         """Block (worker thread only — see lock_lrf_at_video_norm's docstring)
         until a range timestamped after this call started is available.
 
-        Actively calls request_status() each iteration rather than passively
-        polling the cache: that call already invokes the same status-parsing
-        path the background poll thread uses (see ViewproGimbalTcpAdapter),
-        properly serializing against it through the transport's own lock, so
-        this doesn't race the background thread — it just also drives requests
-        itself instead of waiting on that thread's independent timing.
+        Passively polls the cache — does NOT call request_status() itself; see
+        the "round 2, REVERTED" note above for why.
         """
         start = time.monotonic()
         deadline = start + self._LRF_RANGE_WAIT_S
         while True:
-            try:
-                self._adapter.request_status()
-            except Exception:
-                pass
             try:
                 fresh_since = float(self._adapter.last_range_updated_mono())
             except Exception:
@@ -1131,12 +1138,31 @@ class ViewproCameraControl:
                 "Falling back to ray/DEM for this pick."
             )
             return None
+        # Field bug 2026-08-03 (round 3): fired laser_range_once() (single-shot)
+        # here, but set_lrf_armed()'s own docstring already said the quiet part —
+        # "Arm = continuous ranging, so the D1 status carries a live distance the
+        # lock can read immediately". The PROXIMITY panel's arm button uses
+        # continuous mode and had partial success; this path used single-shot and,
+        # in one full field session, never once got a reading — strong evidence
+        # single-shot alone doesn't reliably populate D1 the way continuous does.
+        # Start continuous ranging (only if not already armed by the operator),
+        # wait, then stop it again — leaving it running unless the operator
+        # already had it on, since it's an eye-safety-relevant emitter, not just
+        # a sensor (see set_lrf_armed's docstring).
+        was_armed = self.is_lrf_armed()
         try:
-            self._adapter.laser_range_once()
+            self._adapter.laser_range_start()
         except Exception:
             self._lrf_lock_error = "Laser command failed — check TCP link"
             return None
-        dist = self._wait_for_fresh_range()
+        try:
+            dist = self._wait_for_fresh_range()
+        finally:
+            if not was_armed:
+                try:
+                    self._adapter.laser_range_stop()
+                except Exception:
+                    pass
         if dist is None:
             self._lrf_lock_error = "No range reported — rangefinder may be absent"
             print(
