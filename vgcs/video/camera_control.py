@@ -973,10 +973,13 @@ class ViewproCameraControl:
     # range, get_laser_range_m() stays None, and DOOAF falls back to the ray/DEM
     # ground-intersection method exactly as it does today. No regression either way.
 
-    # How far off frame centre a pick may be and still be measured by the laser.
-    # Beyond this the boresight is simply not looking at the picked point, and
-    # returning the centre's range for it would silently feed DOOAF a distance
-    # belonging to a different piece of ground — an unacceptable failure mode in a
+    # How far off frame centre a pick may be and still be measured by the laser,
+    # as a fraction of frame WIDTH (converted to a real pixel-space radius in
+    # lock_lrf_at_video_norm — see there for why width specifically, not a
+    # fraction of the diagonal or of each axis independently). Beyond this the
+    # boresight is simply not looking at the picked point, and returning the
+    # centre's range for it would silently feed DOOAF a distance belonging to a
+    # different piece of ground — an unacceptable failure mode in a
     # fire-correction system, so we decline and let the ray/DEM path handle it.
     _LRF_BORESIGHT_TOLERANCE_NORM = 0.12
 
@@ -1030,11 +1033,13 @@ class ViewproCameraControl:
     ) -> float | None:
         """Range the picked point, or None if it is not under the boresight.
 
-        ``frame_w``/``frame_h``/``hold_gimbal``/``hold_slant_boresight`` exist for
-        interface parity with the C13 path; they describe its gimbal-alignment
-        behaviour, which does not apply to a centre-boresighted laser.
+        ``hold_gimbal``/``hold_slant_boresight`` exist for interface parity with
+        the C13 path only; they describe its gimbal-alignment behaviour, which
+        does not apply to a centre-boresighted laser. ``frame_w``/``frame_h`` ARE
+        used, to keep the tolerance check aspect-ratio-correct — see the offset
+        calculation below.
         """
-        del frame_w, frame_h, hold_gimbal, hold_slant_boresight
+        del hold_gimbal, hold_slant_boresight
         # Kept short on purpose: this string doubles as the on-video overlay
         # caption's second line (native_video_overlay.py), which has no text
         # wrapping — a full explanation there renders an oversized box over the
@@ -1046,12 +1051,29 @@ class ViewproCameraControl:
         except (TypeError, ValueError):
             self._lrf_lock_error = "Invalid pick"
             return None
-        offset = (du * du + dv * dv) ** 0.5
-        if offset > self._LRF_BORESIGHT_TOLERANCE_NORM:
+        # Video is 16:9, not square — comparing raw normalized (0..1) du/dv treats
+        # a pixel offset below the crosshair as ~1.78x "further" than the same
+        # pixel offset beside it (720 tall vs 1280 wide, e.g.), so a click that
+        # looks dead-centre to the eye can fail here purely from being a bit
+        # vertically off. Field report 2026-08-03: an operator's click that
+        # looked accurate still declined at 0.27 off (worse than three earlier,
+        # less careful attempts) — this is why. Scale into real pixels using the
+        # actual frame dimensions before comparing, so the tolerance is round in
+        # screen space, matching what the crosshair actually looks like on screen.
+        try:
+            fw = max(1.0, float(frame_w))
+            fh = max(1.0, float(frame_h))
+        except (TypeError, ValueError):
+            fw, fh = 1280.0, 720.0
+        du_px = du * fw
+        dv_px = dv * fh
+        offset_px = (du_px * du_px + dv_px * dv_px) ** 0.5
+        tolerance_px = self._LRF_BORESIGHT_TOLERANCE_NORM * fw
+        if offset_px > tolerance_px:
             self._lrf_lock_error = "Aim gimbal so target is under crosshair, then click"
             print(
-                f"[VGCS:viewpro] LRF pick {offset:.2f} off centre (max "
-                f"{self._LRF_BORESIGHT_TOLERANCE_NORM:.2f}) — laser is boresighted to "
+                f"[VGCS:viewpro] LRF pick {offset_px:.0f}px off centre (dx={du_px:+.0f} "
+                f"dy={dv_px:+.0f}, max {tolerance_px:.0f}px) — laser is boresighted to "
                 "frame centre; aim the target under the centre marker, then lock. "
                 "Falling back to ray/DEM for this pick."
             )
