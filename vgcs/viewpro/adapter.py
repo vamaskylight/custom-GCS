@@ -88,6 +88,7 @@ class ViewproGimbalTcpAdapter:
         self._last_gimbal_log_sig: tuple[int, int, int] | None = None
         self._position_hold_timer: threading.Timer | None = None
         self._last_servo_mode: int | None = None
+        self._lrf_armed = False
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -379,5 +380,32 @@ class ViewproGimbalTcpAdapter:
 
     def query_range_m(self) -> float | None:
         """Last known LRF range from periodic status (D1) — None if the
-        connected gimbal has no rangefinder or hasn't reported one yet."""
+        connected gimbal has no rangefinder or hasn't reported one yet.
+
+        Cached rather than freshly polled on purpose: the background poll thread
+        refreshes it at 2 Hz, so this is at most ~0.5s old, and reading the cache
+        keeps LRF reads off the blocking send_and_receive path (this is called
+        from the GUI thread during a lock)."""
         return self._last_range_m
+
+    def set_lrf_armed(self, armed: bool) -> None:
+        """Arm = continuous ranging, so the D1 status carries a live distance the
+        lock can read immediately. Disarm stops the laser rather than leaving it
+        firing (it is an eye-safety-relevant emitter, not just a sensor)."""
+        want = bool(armed)
+        if want:
+            self.laser_range_start()
+        else:
+            self.laser_range_stop()
+        self._lrf_armed = want
+
+    def is_lrf_armed(self) -> bool:
+        return bool(self._lrf_armed)
+
+    def has_rangefinder(self) -> bool:
+        """True once the gimbal has actually reported a range in its status.
+
+        Runtime detection, because LRF is a per-model option on Viewpro and the
+        protocol gives no capability query — a unit without the hardware simply
+        never populates the D1 range field."""
+        return self._last_range_m is not None
