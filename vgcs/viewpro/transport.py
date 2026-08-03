@@ -56,14 +56,41 @@ class ViewproTcpTransport:
         self.open()
         with self._lock:
             assert self._sock is not None
-            self._sock.sendall(payload)
+            try:
+                self._sock.sendall(payload)
+            except OSError:
+                self._reset_broken_socket_locked()
+                raise
 
     def send_and_receive(self, payload: bytes, *, max_bytes: int = 4096) -> bytes:
         self.open()
         with self._lock:
             assert self._sock is not None
-            self._sock.sendall(payload)
             try:
+                self._sock.sendall(payload)
                 return self._sock.recv(max_bytes)
             except socket.timeout:
                 return b""
+            except OSError:
+                self._reset_broken_socket_locked()
+                raise
+
+    def _reset_broken_socket_locked(self) -> None:
+        """Called (with ``self._lock`` already held) when a send/recv fails at
+        the OS level — e.g. the peer reset the connection. The socket object is
+        now permanently unusable, but without this, ``open()`` would never
+        reconnect: it only creates a new socket when ``self._sock is None``, so
+        every future call would keep retrying the SAME dead socket forever.
+
+        Field-observed 2026-08-03: once a single ConnectionResetError happened,
+        this had no recovery for the rest of the session — dozens of identical
+        errors on every retry, and the camera (gimbal/zoom/LRF, everything)
+        stayed dead until the operator disconnected and reconnected the whole
+        link by hand. Clearing the socket here lets the *next* call's
+        ``open()`` establish a fresh connection instead.
+        """
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+        self._sock = None
