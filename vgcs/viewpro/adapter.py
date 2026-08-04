@@ -163,8 +163,20 @@ class ViewproGimbalTcpAdapter:
         rec = parsed.get("record_status")
         if rec is not None:
             self._recording = rec == 1
-        if "range_m" in parsed:
-            self._last_range_m = parsed["range_m"]
+        # Only record an ACTUAL measurement. decode_d1 always includes the
+        # "range_m" key but sets it to None when the laser hasn't measured
+        # anything (raw value 0), so testing `"range_m" in parsed` bumped the
+        # timestamp on every status frame at 2 Hz regardless. That made
+        # _wait_for_fresh_range() (see ViewproCameraControl) think a fresh
+        # reading had arrived ~0.5s after firing — on the next routine poll —
+        # and return None instead of waiting for the laser. Field-observed
+        # 2026-08-04 as "sometimes I have to mark twice before LRF shows data":
+        # the first click gave up early, the laser finished a moment later and
+        # the camera held that value in D1, so the second click found it
+        # already there and succeeded instantly.
+        range_m = parsed.get("range_m")
+        if range_m is not None:
+            self._last_range_m = range_m
             self._last_range_mono = time.monotonic()
 
     def _note_servo_mode(self, status: object) -> None:

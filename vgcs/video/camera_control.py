@@ -1022,10 +1022,17 @@ class ViewproCameraControl:
 
     def _wait_for_fresh_range(self) -> float | None:
         """Block (worker thread only — see lock_lrf_at_video_norm's docstring)
-        until a range timestamped after this call started is available.
+        until an actual range measurement timestamped after this call started
+        is available.
 
         Passively polls the cache — does NOT call request_status() itself; see
         the "round 2, REVERTED" note above for why.
+
+        Keeps waiting rather than returning a None reading: the adapter now
+        only timestamps real measurements, but treating "fresh timestamp" and
+        "usable distance" as the same thing is exactly what broke this before
+        (see the adapter's _update_from_reply comment), so don't give up until
+        there is a genuine value or the deadline passes.
         """
         start = time.monotonic()
         deadline = start + self._LRF_RANGE_WAIT_S
@@ -1036,9 +1043,11 @@ class ViewproCameraControl:
                 fresh_since = 0.0
             if fresh_since >= start:
                 try:
-                    return self._adapter.query_range_m()
+                    dist = self._adapter.query_range_m()
                 except Exception:
-                    return None
+                    dist = None
+                if dist is not None:
+                    return dist
             if time.monotonic() >= deadline:
                 return None
             time.sleep(self._LRF_RANGE_POLL_INTERVAL_S)
