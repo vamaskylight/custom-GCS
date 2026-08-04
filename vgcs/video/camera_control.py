@@ -1017,10 +1017,24 @@ class ViewproCameraControl:
     # went 0-for-many in one full session. Switched to starting continuous
     # ranging (see lock_lrf_at_video_norm) instead, so the passive wait below
     # should now have something worth waiting for.
+    # Budget for a shot whose laser is already streaming (warm) vs one that had
+    # to start it (cold). Field data 2026-08-04: at a flat 3.0s the session was a
+    # near coin-flip, with failures clustering on attempts after a pause and
+    # rapid repeat clicks nearly always succeeding — continuous ranging takes a
+    # variable time to produce its first measurement, so a cold shot needs a
+    # longer budget than a warm one. Kept off the warm path so a genuine
+    # no-return (sky, glass, too far) still fails promptly instead of hanging
+    # the operator for six seconds.
     _LRF_RANGE_WAIT_S = 3.0
+    _LRF_RANGE_WAIT_COLD_S = 6.0
     _LRF_RANGE_POLL_INTERVAL_S = 0.15
+    # If a cold shot has produced nothing by here, re-send the start command once
+    # in case it was dropped in transit. Deliberately ONE extra command, not the
+    # ~20 the reverted round-2 active-polling added — a dropped command is a real
+    # possibility on this link, hammering it is not the way to find out.
+    _LRF_RESTART_AFTER_S = 2.0
 
-    def _wait_for_fresh_range(self) -> float | None:
+    def _wait_for_fresh_range(self, *, cold_start: bool = True) -> float | None:
         """Block (worker thread only — see lock_lrf_at_video_norm's docstring)
         until an actual range measurement timestamped after this call started
         is available.
@@ -1035,7 +1049,9 @@ class ViewproCameraControl:
         there is a genuine value or the deadline passes.
         """
         start = time.monotonic()
-        deadline = start + self._LRF_RANGE_WAIT_S
+        budget = self._LRF_RANGE_WAIT_COLD_S if cold_start else self._LRF_RANGE_WAIT_S
+        deadline = start + budget
+        restart_at = (start + self._LRF_RESTART_AFTER_S) if cold_start else None
         while True:
             try:
                 fresh_since = float(self._adapter.last_range_updated_mono())
@@ -1048,7 +1064,14 @@ class ViewproCameraControl:
                     dist = None
                 if dist is not None:
                     return dist
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if restart_at is not None and now >= restart_at:
+                restart_at = None
+                try:
+                    self._adapter.laser_range_start()
+                except Exception:
+                    pass
+            if now >= deadline:
                 return None
             time.sleep(self._LRF_RANGE_POLL_INTERVAL_S)
 
@@ -1160,26 +1183,37 @@ class ViewproCameraControl:
         # a sensor (see set_lrf_armed's docstring).
         was_armed = self.is_lrf_armed()
         try:
-            self._adapter.laser_range_start()
+            already_streaming = bool(self._adapter.laser_range_begin_session())
         except Exception:
             self._lrf_lock_error = "Laser command failed — check TCP link"
             return None
+        fired_at = time.monotonic()
         try:
-            dist = self._wait_for_fresh_range()
+            dist = self._wait_for_fresh_range(cold_start=not already_streaming)
         finally:
             if not was_armed:
                 try:
-                    self._adapter.laser_range_stop()
+                    # Delayed stop, not immediate — see _LRF_IDLE_STOP_S in the
+                    # adapter for why the stream is kept warm between locks.
+                    self._adapter.laser_range_end_session()
                 except Exception:
                     pass
+        waited_s = time.monotonic() - fired_at
+        laser_state = "warm" if already_streaming else "cold"
         if dist is None:
-            self._lrf_lock_error = "No range reported — rangefinder may be absent"
+            self._lrf_lock_error = "No range reported — aim at a solid surface and retry"
+            # Reports the ACTUAL wait and whether the laser was already streaming:
+            # cold-vs-warm is the distinction that separates "laser still spinning
+            # up" from "this surface genuinely returns nothing" (sky, glass, too
+            # far), and a previous version of this message quoted a fixed timeout
+            # it hadn't really waited, which sent the diagnosis the wrong way.
             print(
-                f"[VGCS:viewpro] LRF fired but no fresh range within "
-                f"{self._LRF_RANGE_WAIT_S:.1f}s — camera may lack a rangefinder, "
-                "or its status frame isn't reaching us in time."
+                f"[VGCS:viewpro] LRF no range after {waited_s:.1f}s ({laser_state} laser) — "
+                "no return from this surface (sky/glass/too far), or the camera "
+                "has no rangefinder."
             )
             return None
+        print(f"[VGCS:viewpro] LRF range {float(dist):.1f} m in {waited_s:.1f}s ({laser_state} laser)")
         self._lrf_locked = True
         if on_sample is not None:
             try:

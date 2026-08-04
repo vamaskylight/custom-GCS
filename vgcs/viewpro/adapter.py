@@ -49,6 +49,31 @@ _ZOOM_STEP_PULSE_S = 0.15
 # The delay lets the gimbal finish decelerating so the hold pins its true resting
 # position. Set VGCS_VIEWPRO_POST_JOG_HOLD=0 to disable.
 _POST_JOG_HOLD_DELAY_S = 0.35
+# How long continuous ranging keeps running after a lock finishes.
+#
+# Field data 2026-08-04: with the laser stopped immediately after every lock,
+# results were a near coin-flip (~15 successes / ~12 timeouts in one session on
+# a healthy link) — but the failures clustered on attempts made after a pause,
+# while rapid repeat clicks (33.8/33.9/33.9/34.1/33.9 m back-to-back) almost
+# always succeeded. That is the signature of continuous ranging taking a
+# variable time to produce its FIRST measurement: stopping the laser after each
+# lock made every single click pay that cold-start again.
+#
+# So don't stop instantly — leave it streaming briefly so a follow-up lock reads
+# from an already-running stream, and auto-stop once genuinely idle (it is an
+# eye-safety-relevant emitter, so "leave it on forever" is not an option).
+# Set VGCS_VIEWPRO_LRF_IDLE_STOP_S to tune; 0 restores stop-immediately.
+_LRF_IDLE_STOP_S = 10.0
+
+
+def _lrf_idle_stop_s() -> float:
+    raw = os.environ.get("VGCS_VIEWPRO_LRF_IDLE_STOP_S", "").strip()
+    if not raw:
+        return _LRF_IDLE_STOP_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _LRF_IDLE_STOP_S
 
 
 def _post_jog_hold_enabled() -> bool:
@@ -90,6 +115,8 @@ class ViewproGimbalTcpAdapter:
         self._position_hold_timer: threading.Timer | None = None
         self._last_servo_mode: int | None = None
         self._lrf_armed = False
+        self._lrf_streaming = False
+        self._lrf_idle_stop_timer: threading.Timer | None = None
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -119,6 +146,7 @@ class ViewproGimbalTcpAdapter:
             self._zoom_stop_timer.cancel()
             self._zoom_stop_timer = None
         self._cancel_position_hold()
+        self._cancel_lrf_idle_stop()
         self._transport.close()
 
     def get_status(self) -> GimbalStatus:
@@ -390,7 +418,51 @@ class ViewproGimbalTcpAdapter:
         self._send(c1_lrf=vp.C1_LRF_CONTINUOUS_START)
 
     def laser_range_stop(self) -> None:
+        self._cancel_lrf_idle_stop()
+        self._lrf_streaming = False
         self._send(c1_lrf=vp.C1_LRF_STOP)
+
+    def laser_range_begin_session(self) -> bool:
+        """Start continuous ranging for a lock, or keep an already-running
+        stream going. Returns True if it was ALREADY streaming (so the caller
+        knows this shot didn't have to pay the laser's cold-start time).
+
+        See _LRF_IDLE_STOP_S for why the stream is kept warm between locks.
+        """
+        self._cancel_lrf_idle_stop()
+        if self._lrf_streaming:
+            return True
+        self._lrf_streaming = True
+        self.laser_range_start()
+        return False
+
+    def laser_range_end_session(self) -> None:
+        """Finish a lock without killing the laser immediately — schedule the
+        stop after an idle grace period so a follow-up lock reads from the
+        already-running stream instead of cold-starting again."""
+        idle_s = _lrf_idle_stop_s()
+        if idle_s <= 0.0:
+            self.laser_range_stop()
+            return
+        self._cancel_lrf_idle_stop()
+        timer = threading.Timer(idle_s, self._on_lrf_idle_timeout)
+        timer.daemon = True
+        self._lrf_idle_stop_timer = timer
+        timer.start()
+
+    def _on_lrf_idle_timeout(self) -> None:
+        self._lrf_idle_stop_timer = None
+        if self._lrf_armed:
+            # Operator armed it explicitly via the PROXIMITY panel — theirs to stop.
+            return
+        self._lrf_streaming = False
+        self._send(c1_lrf=vp.C1_LRF_STOP)
+
+    def _cancel_lrf_idle_stop(self) -> None:
+        timer = self._lrf_idle_stop_timer
+        if timer is not None:
+            timer.cancel()
+            self._lrf_idle_stop_timer = None
 
     def query_range_m(self) -> float | None:
         """Last known LRF range from periodic status (D1) — None if the
@@ -420,11 +492,13 @@ class ViewproGimbalTcpAdapter:
         lock can read immediately. Disarm stops the laser rather than leaving it
         firing (it is an eye-safety-relevant emitter, not just a sensor)."""
         want = bool(armed)
+        self._lrf_armed = want  # set first: _on_lrf_idle_timeout checks it
         if want:
+            self._cancel_lrf_idle_stop()  # operator's session outlives any lock grace period
+            self._lrf_streaming = True
             self.laser_range_start()
         else:
             self.laser_range_stop()
-        self._lrf_armed = want
 
     def is_lrf_armed(self) -> bool:
         return bool(self._lrf_armed)
