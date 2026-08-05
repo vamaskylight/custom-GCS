@@ -15,8 +15,16 @@ class Waypoint:
     speed_mps: float = 5.0
 
 
-def save_waypoints_json(path: str | Path, waypoints: list[Waypoint]) -> None:
-    payload = {"version": 2, "waypoints": [asdict(wp) for wp in waypoints]}
+def save_waypoints_json(
+    path: str | Path, waypoints: list[Waypoint], *, end_action: str | None = None
+) -> None:
+    """Write the plan file. ``end_action`` (hold/rtl/land) is stored when given."""
+    payload: dict[str, object] = {
+        "version": 3,
+        "waypoints": [asdict(wp) for wp in waypoints],
+    }
+    if end_action:
+        payload["end_action"] = str(end_action)
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -56,4 +64,14 @@ def load_waypoints_json(path: str | Path) -> list[Waypoint]:
             )
         )
     return out
+
+
+def load_mission_end_action(path: str | Path) -> str | None:
+    """End action stored alongside a plan file, or ``None`` for pre-v3 files."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    value = raw.get("end_action") if isinstance(raw, dict) else None
+    return str(value) if value else None
 

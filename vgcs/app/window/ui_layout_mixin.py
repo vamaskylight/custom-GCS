@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import struct
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -963,7 +964,20 @@ class MainWindowUiLayoutMixin:
 
     def _append_log(self, line: str) -> None:
         # Dashboard log panel can be hidden in map-only mode; always mirror to console.
-        print(line, flush=True)
+        # A Windows console is cp1252: printing a character it cannot encode raises
+        # UnicodeEncodeError from inside the signal handler and takes the caller down
+        # with it. Vehicle STATUSTEXT is not guaranteed to be Latin-1, so degrade the
+        # console copy instead of letting it kill the log line.
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            try:
+                encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+                print(str(line).encode(encoding, "replace").decode(encoding), flush=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
         s = str(line or "")
         if s.startswith("HEARTBEAT"):
             # Serial link + companion HB lines flood QTextEdit and stall the GUI thread.

@@ -298,6 +298,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._mission_table.horizontalHeader().setSectionResizeMode(3, self._mission_table.horizontalHeader().ResizeMode.ResizeToContents)
         self._mission_table.horizontalHeader().setSectionResizeMode(4, self._mission_table.horizontalHeader().ResizeMode.ResizeToContents)
         self._mission_table.itemChanged.connect(self._on_mission_table_item_changed)
+        self._mission_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._mission_table.customContextMenuRequested.connect(self._on_mission_table_context_menu)
         self._top_dashboard = self._build_m2_top_dashboard()
 
         self._log = QTextEdit()
@@ -407,6 +409,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._map_widget.toggle_3d_requested.connect(self._on_map_toggle_3d_requested)
         self._map_widget.map_3d_mode_changed.connect(self._on_map_3d_mode_changed)
         self._map_widget.mission_start_requested.connect(self._on_map_mission_start_requested)
+        self._map_widget.mission_pause_requested.connect(self._on_map_mission_pause_requested)
+        self._map_widget.mission_resume_requested.connect(self._on_map_mission_resume_requested)
 
         app = QGuiApplication.instance()
         if app is not None:

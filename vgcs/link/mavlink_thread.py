@@ -17,6 +17,12 @@ from PySide6.QtCore import QThread, Signal
 from pymavlink import mavutil
 from pymavlink.dialects.v20 import ardupilotmega as mav_apm
 
+from vgcs.mission import (
+    DEFAULT_MISSION_END_ACTION,
+    MissionPlan,
+    build_mission_plan,
+    normalize_end_action,
+)
 from vgcs.skydroid.adapter import GimbalStatus
 
 # ArduPilot dialect IDs (default pymavlink dialect omits OBSTACLE_DISTANCE).
@@ -35,7 +41,9 @@ class MavlinkThread(QThread):
     telemetry = Signal(str, object)  # msg_type, field dictionary
     link_timeout = Signal(float)  # seconds without messages
     mission_uploaded = Signal(int)  # waypoint count
-    mission_downloaded = Signal(object)  # list of dict waypoints
+    mission_downloaded = Signal(object)  # list of dict mission items (raw, incl. command/params)
+    # {"seq", "wp_index" (0-based or None), "waypoint_count", "label", "reached"}
+    mission_progress = Signal(object)
     mode_changed = Signal(str, bool)  # mode_name, success
     action_result = Signal(str, bool, str)  # action, success, detail
     geofence_result = Signal(bool, str)  # success, detail
@@ -75,6 +83,11 @@ class MavlinkThread(QThread):
             "RANGEFINDER": 0.15,
         }
         self._last_hb_log_mono = 0.0
+        # Last mission built/downloaded. MISSION_CURRENT / MISSION_ITEM_REACHED report a
+        # raw MAVLink seq; only this plan can translate that into "WP 3 of 8".
+        self._mission_plan: MissionPlan | None = None
+        self._last_mission_seq_reported: int | None = None
+        self._vehicle_armed = False
         self._prox_streams_last_request_mono = 0.0
         self._proximity_log_once: set[str] = set()
         self._gimbal_lock = threading.Lock()
@@ -117,9 +130,13 @@ class MavlinkThread(QThread):
         self._telemetry_last_emit_mono[throttle_key] = now
         self.telemetry.emit(msg_type, payload)
 
-    def queue_mission_upload(self, waypoints: list[dict]) -> None:
+    def queue_mission_upload(
+        self, waypoints: list[dict], end_action: str = DEFAULT_MISSION_END_ACTION
+    ) -> None:
         with self._cmd_lock:
-            self._cmd_queue.append(("mission_upload", waypoints))
+            self._cmd_queue.append(
+                ("mission_upload", {"waypoints": waypoints, "end_action": end_action})
+            )
 
     def queue_mission_download(self) -> None:
         with self._cmd_lock:
@@ -128,6 +145,21 @@ class MavlinkThread(QThread):
     def queue_mission_start(self) -> None:
         with self._cmd_lock:
             self._cmd_queue.append(("mission_start", None))
+
+    def queue_mission_pause(self) -> None:
+        """Hold position mid-mission (BRAKE, falling back to LOITER)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("mission_pause", None))
+
+    def queue_mission_resume(self) -> None:
+        """Return to AUTO and continue from the vehicle's current mission item."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("mission_resume", None))
+
+    def queue_mission_set_current_wp(self, wp_index: int) -> None:
+        """Jump the running mission to a 0-based operator waypoint index."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("mission_set_current_wp", int(wp_index)))
 
     def queue_arm(self, arm: bool = True) -> None:
         with self._cmd_lock:
@@ -374,6 +406,9 @@ class MavlinkThread(QThread):
                         f"HEARTBEAT sys={msg.get_srcSystem()} comp={msg.get_srcComponent()}"
                     )
                 armed = bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                if primary:
+                    # Mission start must never force a flying vehicle into STABILIZE.
+                    self._vehicle_armed = armed
                 mode_text = ""
                 try:
                     # Uses pymavlink's autopilot-aware decoder (PX4/ArduPilot/etc.) instead of
@@ -410,10 +445,12 @@ class MavlinkThread(QThread):
                             pass
                         self._prox_streams_last_request_mono = now_req
             elif msg_type == "MISSION_CURRENT":
-                self._emit_telemetry_payload(
-                    "MISSION_CURRENT",
-                    {"seq": int(getattr(msg, "seq", 0) or 0)},
-                )
+                cur_seq = int(getattr(msg, "seq", 0) or 0)
+                self._emit_telemetry_payload("MISSION_CURRENT", {"seq": cur_seq})
+                self._emit_mission_progress(cur_seq, reached=False)
+            elif msg_type == "MISSION_ITEM_REACHED":
+                # Fires once per completed item — the only reliable "WP N done" event.
+                self._emit_mission_progress(int(getattr(msg, "seq", 0) or 0), reached=True)
             elif msg_type == "STATUSTEXT":
                 self._emit_telemetry_payload(
                     "STATUSTEXT",
@@ -639,11 +676,24 @@ class MavlinkThread(QThread):
             cmd, payload = self._cmd_queue.popleft()
         try:
             if cmd == "mission_upload":
-                self._mission_upload(payload if isinstance(payload, list) else [])
+                if isinstance(payload, dict):
+                    self._mission_upload(
+                        payload.get("waypoints") if isinstance(payload.get("waypoints"), list) else [],
+                        str(payload.get("end_action", DEFAULT_MISSION_END_ACTION)),
+                    )
+                else:
+                    # Legacy call shape: a bare waypoint list.
+                    self._mission_upload(payload if isinstance(payload, list) else [])
             elif cmd == "mission_download":
                 self._mission_download()
             elif cmd == "mission_start":
                 self._mission_start()
+            elif cmd == "mission_pause":
+                self._mission_pause()
+            elif cmd == "mission_resume":
+                self._mission_resume()
+            elif cmd == "mission_set_current_wp":
+                self._mission_set_current_wp(int(payload or 0))
             elif cmd == "arm":
                 self._arm_disarm(bool(payload))
             elif cmd == "emergency_motor_stop":
@@ -1067,6 +1117,26 @@ class MavlinkThread(QThread):
                 0.0,
                 0.0,
             )
+            # MISSION_ITEM_REACHED is event-driven, not streamed; ask for it explicitly so
+            # the mission progress readout gets a "WP N done" edge rather than inferring
+            # completion from MISSION_CURRENT alone.
+            try:
+                self._master.mav.command_long_send(
+                    ts,
+                    tc,
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,
+                    float(mavutil.mavlink.MAVLINK_MSG_ID_MISSION_ITEM_REACHED),
+                    float(slow_interval_us),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+            except Exception:
+                pass
             # Battery/GPS UI depends on these; request explicitly for real vehicles.
             self._master.mav.command_long_send(
                 ts,
@@ -1204,7 +1274,9 @@ class MavlinkThread(QThread):
                 continue
             break
 
-    def _mission_upload(self, waypoints: list[dict]) -> None:
+    def _mission_upload(
+        self, waypoints: list[dict], end_action: str = DEFAULT_MISSION_END_ACTION
+    ) -> None:
         if self._master is None:
             self.error.emit("Mission upload: link not ready")
             return
@@ -1212,66 +1284,26 @@ class MavlinkThread(QThread):
             self.error.emit("Mission upload: no waypoints")
             return
 
-        # ArduPilot AP_Mission: MAVLink index 0 is reserved for HOME — uploads to seq 0
-        # are not stored as mission nav commands. The first real nav command is index 1
-        # (AP_MISSION_FIRST_REAL_COMMAND). Put NAV_TAKEOFF at seq 1 or AUTO reports
-        # "Missing Takeoff Cmd".
-        mission_items: list[dict] = []
+        # Item layout (home slot / takeoff at seq 1 / speed changes / terminal action)
+        # is decided by vgcs.mission.build_mission_plan — see that module for the
+        # ArduPilot AP_Mission rules it encodes.
         first = waypoints[0]
-        first_nav_alt = max(1.0, float(first.get("alt_m", 20.0)))
-        # Optional: climb target for NAV_TAKEOFF (start / launch altitude), distinct from WP1 cruise alt.
-        to_m = first.get("takeoff_alt_m", None)
-        if to_m is None:
-            takeoff_alt_m = first_nav_alt
-        else:
-            takeoff_alt_m = max(1.0, float(to_m))
-        mission_items.append(
-            {
-                "cmd": int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT),
-                "lat": float(first.get("lat", 0.0)),
-                "lon": float(first.get("lon", 0.0)),
-                "alt_m": first_nav_alt,
-            }
+        # Callers pass dicts over the queue, but tolerate Waypoint-like objects too.
+        takeoff_alt_m = (
+            first.get("takeoff_alt_m", None)
+            if isinstance(first, dict)
+            else getattr(first, "takeoff_alt_m", None)
         )
-        mission_items.append(
-            {
-                "cmd": int(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF),
-                "lat": 0.0,
-                "lon": 0.0,
-                "alt_m": takeoff_alt_m,
-            }
+        plan = build_mission_plan(
+            waypoints,
+            takeoff_alt_m=None if takeoff_alt_m is None else float(takeoff_alt_m),
+            end_action=end_action,
         )
-        for wp in waypoints:
-            spd = float(wp.get("speed_mps", 5.0) or 5.0)
-            mission_items.append(
-                {
-                    "cmd": int(mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED),
-                    "lat": 0.0,
-                    "lon": 0.0,
-                    "alt_m": 0.0,
-                    # param1: 1=groundspeed, param2: speed (m/s), param3: throttle (-1 no change)
-                    "p1": 1.0,
-                    "p2": max(0.1, spd),
-                    "p3": -1.0,
-                    "p4": 0.0,
-                }
-            )
-            mission_items.append(
-                {
-                    "cmd": int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT),
-                    "lat": float(wp.get("lat", 0.0)),
-                    "lon": float(wp.get("lon", 0.0)),
-                    "alt_m": max(1.0, float(wp.get("alt_m", 20.0))),
-                    "p1": 0.0,
-                    "p2": 0.0,
-                    "p3": 0.0,
-                    "p4": 0.0,
-                }
-            )
-
+        mission_items = plan.items
         count = len(mission_items)
         self.log_line.emit(
-            f"Mission upload start: {len(waypoints)} WPs ({count} mission items incl. home slot + takeoff)"
+            f"Mission upload start: {len(waypoints)} WPs -> {count} mission items "
+            f"(home slot + takeoff {plan.takeoff_alt_m:.0f} m, end={plan.end_action})"
         )
         self._sync_link_targets()
         self._mission_clear_for_upload_best_effort()
@@ -1330,30 +1362,22 @@ class MavlinkThread(QThread):
             if seq < 0 or seq >= count:
                 continue
             item = mission_items[seq]
-            lat = float(item.get("lat", 0.0))
-            lon = float(item.get("lon", 0.0))
-            alt = float(item.get("alt_m", 20.0))
-            cmd = int(item.get("cmd", int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT)))
-            p1 = float(item.get("p1", 0.0))
-            p2 = float(item.get("p2", 0.0))
-            p3 = float(item.get("p3", 0.0))
-            p4 = float(item.get("p4", 0.0))
             try:
                 self._master.mav.mission_item_int_send(
                     self._target_sysid,
                     self._target_compid,
                     seq,
-                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                    cmd,
+                    item.frame,
+                    item.command,
                     0,
                     1,
-                    p1,
-                    p2,
-                    p3,
-                    p4,
-                    int(lat * 1e7),
-                    int(lon * 1e7),
-                    alt,
+                    item.p1,
+                    item.p2,
+                    item.p3,
+                    item.p4,
+                    int(item.lat * 1e7),
+                    int(item.lon * 1e7),
+                    item.alt_m,
                     mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
                 )
             except TypeError:
@@ -1361,30 +1385,42 @@ class MavlinkThread(QThread):
                     self._target_sysid,
                     self._target_compid,
                     seq,
-                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                    cmd,
+                    item.frame,
+                    item.command,
                     0,
                     1,
-                    p1,
-                    p2,
-                    p3,
-                    p4,
-                    int(lat * 1e7),
-                    int(lon * 1e7),
-                    alt,
+                    item.p1,
+                    item.p2,
+                    item.p3,
+                    item.p4,
+                    int(item.lat * 1e7),
+                    int(item.lon * 1e7),
+                    item.alt_m,
                 )
             sent = max(sent, seq + 1)
 
-        ack = self._master.recv_match(
-            type=["MISSION_ACK"],
-            blocking=True,
-            timeout=5.0,
-        )
+        # The vehicle may re-request items right up to the ACK; only a MISSION-type
+        # ACK ends the transfer (a fence/rally ACK on the same link must not).
+        ack = None
+        ack_deadline = time.monotonic() + 5.0
+        while time.monotonic() < ack_deadline and self._running and self._master is not None:
+            self._maybe_send_gcs_heartbeat()
+            msg = self._master.recv_match(type=["MISSION_ACK"], blocking=True, timeout=0.5)
+            if msg is None:
+                continue
+            mt = int(getattr(msg, "mission_type", 0) or 0)
+            if mt != int(mavutil.mavlink.MAV_MISSION_TYPE_MISSION):
+                continue
+            ack = msg
+            break
         if ack is None:
             raise TimeoutError("mission upload timeout waiting ACK")
         ack_type = int(getattr(ack, "type", mavutil.mavlink.MAV_MISSION_ERROR))
         if ack_type != int(mavutil.mavlink.MAV_MISSION_ACCEPTED):
             raise RuntimeError(f"mission upload ACK type={ack_type}")
+        # Remember the layout so mission progress can name the right waypoint.
+        self._mission_plan = plan
+        self._last_mission_seq_reported = None
         self.log_line.emit(f"Mission upload complete: {count} mission items")
         self.mission_uploaded.emit(len(waypoints))
 
@@ -1442,7 +1478,22 @@ class MavlinkThread(QThread):
                 lat = float(getattr(itm, "x", 0.0))
                 lon = float(getattr(itm, "y", 0.0))
                 alt = float(getattr(itm, "z", 20.0))
-            items.append({"lat": lat, "lon": lon, "alt_m": alt})
+            # command and params must survive: without them the home slot, the takeoff
+            # item and every DO_CHANGE_SPEED (all at lat/lon 0,0) look like waypoints.
+            items.append(
+                {
+                    "seq": int(getattr(itm, "seq", seq) or 0),
+                    "command": int(getattr(itm, "command", mavutil.mavlink.MAV_CMD_NAV_WAYPOINT) or 0),
+                    "frame": int(getattr(itm, "frame", 0) or 0),
+                    "lat": lat,
+                    "lon": lon,
+                    "alt_m": alt,
+                    "p1": float(getattr(itm, "param1", 0.0) or 0.0),
+                    "p2": float(getattr(itm, "param2", 0.0) or 0.0),
+                    "p3": float(getattr(itm, "param3", 0.0) or 0.0),
+                    "p4": float(getattr(itm, "param4", 0.0) or 0.0),
+                }
+            )
         try:
             self._master.mav.mission_ack_send(
                 self._target_sysid,
@@ -1456,8 +1507,93 @@ class MavlinkThread(QThread):
                 self._target_compid,
                 mavutil.mavlink.MAV_MISSION_ACCEPTED,
             )
-        self.log_line.emit(f"Mission download complete: {len(items)} WPs")
+        # Rebuild the seq -> waypoint mapping from what the vehicle actually holds, so
+        # progress stays correct for a mission this GCS did not upload.
+        self._mission_plan = self._plan_from_downloaded_items(items)
+        self._last_mission_seq_reported = None
+        self.log_line.emit(f"Mission download complete: {len(items)} mission items")
         self.mission_downloaded.emit(items)
+
+    @staticmethod
+    def _plan_from_downloaded_items(items: list[dict]) -> MissionPlan:
+        """Map downloaded mission items onto operator waypoint numbers."""
+        from vgcs.mission.mission_plan import MissionItem, parse_downloaded_mission
+
+        plan = MissionPlan(items=[], waypoint_count=0)
+        wps, end_action = parse_downloaded_mission(items)
+        plan.waypoint_count = len(wps)
+        plan.end_action = end_action
+        wp_index = 0
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            seq = int(row.get("seq", 0) or 0)
+            cmd = int(row.get("command", 0) or 0)
+            lat = float(row.get("lat", 0.0) or 0.0)
+            lon = float(row.get("lon", 0.0) or 0.0)
+            positioned = abs(lat) > 1e-9 or abs(lon) > 1e-9
+            is_wp = (
+                seq != 0
+                and positioned
+                and cmd
+                in (
+                    int(mavutil.mavlink.MAV_CMD_NAV_WAYPOINT),
+                    int(mavutil.mavlink.MAV_CMD_NAV_SPLINE_WAYPOINT),
+                    int(mavutil.mavlink.MAV_CMD_NAV_LOITER_UNLIM),
+                    int(mavutil.mavlink.MAV_CMD_NAV_LOITER_TURNS),
+                    int(mavutil.mavlink.MAV_CMD_NAV_LOITER_TIME),
+                )
+            )
+            idx = wp_index if is_wp else None
+            if is_wp:
+                label = f"WP {wp_index + 1}"
+                wp_index += 1
+            elif seq == 0:
+                label = "Home"
+            elif cmd == int(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF):
+                label = "Takeoff"
+            elif cmd == int(mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED):
+                label = "Speed change"
+            elif cmd == int(mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH):
+                label = "Return to launch"
+            elif cmd == int(mavutil.mavlink.MAV_CMD_NAV_LAND):
+                label = "Land"
+            else:
+                label = f"CMD {cmd}"
+            plan.items.append(
+                MissionItem(
+                    seq=seq,
+                    command=cmd,
+                    lat=lat,
+                    lon=lon,
+                    alt_m=float(row.get("alt_m", 0.0) or 0.0),
+                    wp_index=idx,
+                    label=label,
+                )
+            )
+        return plan
+
+    def _emit_mission_progress(self, seq: int, *, reached: bool) -> None:
+        """Translate a raw MAVLink mission seq into an operator-facing waypoint."""
+        plan = self._mission_plan
+        try:
+            s = int(seq)
+        except (TypeError, ValueError):
+            return
+        if not reached:
+            # MISSION_CURRENT streams continuously; only report real changes.
+            if self._last_mission_seq_reported == s:
+                return
+            self._last_mission_seq_reported = s
+        payload = {
+            "seq": s,
+            "wp_index": plan.waypoint_index_for_seq(s) if plan is not None else None,
+            "waypoint_count": int(plan.waypoint_count) if plan is not None else 0,
+            "label": plan.label_for_seq(s) if plan is not None else "",
+            "end_action": plan.end_action if plan is not None else "",
+            "reached": bool(reached),
+        }
+        self.mission_progress.emit(payload)
 
     def _mode_change(self, mode_name: str) -> None:
         if self._master is None:
@@ -1479,6 +1615,11 @@ class MavlinkThread(QThread):
     def _ensure_armable_mode_before_arm(self) -> None:
         """ArduCopter rejects arming in AUTO; switch to a manual mode first (SITL/GCS)."""
         if self._master is None:
+            return
+        if self._vehicle_armed:
+            # Already armed means it may be airborne. STABILIZE hands throttle back to the
+            # (possibly absent) RC stick — never do that to a flying aircraft.
+            self.log_line.emit("Pre-arm mode switch skipped: vehicle already armed")
             return
         for mode in ("STABILIZE", "ALT_HOLD", "LOITER"):
             try:
@@ -1516,21 +1657,24 @@ class MavlinkThread(QThread):
             return
         try:
             self._sync_link_targets()
-            self._ensure_armable_mode_before_arm()
-            self._send_command_long(
-                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                p1=1.0,
-            )
-            if not self._wait_vehicle_armed():
-                # ArduPilot SITL: force-arm magic in param2 when pre-arm checks block normal arm.
-                self.log_line.emit("Mission start: retry ARM with force override (param2=21196)")
+            if self._vehicle_armed:
+                self.log_line.emit("Mission start: vehicle already armed — skipping arm step")
+            else:
+                self._ensure_armable_mode_before_arm()
                 self._send_command_long(
                     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                     p1=1.0,
-                    p2=21196.0,
                 )
-                if not self._wait_vehicle_armed(6.0):
-                    raise TimeoutError("arm timeout (still disarmed after arm command)")
+                if not self._wait_vehicle_armed():
+                    # ArduPilot SITL: force-arm magic in param2 when pre-arm checks block normal arm.
+                    self.log_line.emit("Mission start: retry ARM with force override (param2=21196)")
+                    self._send_command_long(
+                        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                        p1=1.0,
+                        p2=21196.0,
+                    )
+                    if not self._wait_vehicle_armed(6.0):
+                        raise TimeoutError("arm timeout (still disarmed after arm command)")
             # Start at first *stored* nav command (seq 1); seq 0 is home-only in ArduPilot.
             self._master.mav.mission_set_current_send(
                 self._target_sysid,
@@ -1548,6 +1692,82 @@ class MavlinkThread(QThread):
         except Exception as e:
             self.action_result.emit("mission_start", False, str(e))
             self.error.emit(f"Mission start failed: {e}")
+
+    def _mission_pause(self) -> None:
+        """Stop and hold mid-mission. BRAKE stops fastest; LOITER is the fallback.
+
+        ArduCopter remembers the mission item it was on, so switching back to AUTO
+        (see :meth:`_mission_resume`) continues from where it paused.
+        """
+        if self._master is None:
+            self.action_result.emit("mission_pause", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        for mode in ("BRAKE", "LOITER", "POSHOLD"):
+            try:
+                self._master.set_mode(mode)
+            except Exception:
+                continue
+            self.action_result.emit("mission_pause", True, f"{mode} — holding position")
+            self.log_line.emit(f"Mission paused: switched to {mode}")
+            return
+        self.action_result.emit("mission_pause", False, "No hold mode accepted (BRAKE/LOITER/POSHOLD)")
+        self.error.emit("Mission pause failed: vehicle rejected BRAKE/LOITER/POSHOLD")
+
+    def _mission_resume(self) -> None:
+        """Back to AUTO, continuing from the vehicle's current mission item."""
+        if self._master is None:
+            self.action_result.emit("mission_resume", False, "Link not ready")
+            return
+        self._sync_link_targets()
+        try:
+            self._master.set_mode("AUTO")
+            # No mission_set_current here: that would restart the mission. AUTO alone
+            # resumes at the item the vehicle was on when it was paused.
+            self._send_command_long(
+                mavutil.mavlink.MAV_CMD_MISSION_START,
+                p1=0.0,
+                p2=0.0,
+            )
+            self.action_result.emit("mission_resume", True, "AUTO resumed")
+            self.log_line.emit("Mission resumed (AUTO)")
+        except Exception as e:
+            self.action_result.emit("mission_resume", False, str(e))
+            self.error.emit(f"Mission resume failed: {e}")
+
+    def _mission_set_current_wp(self, wp_index: int) -> None:
+        """Jump to a 0-based operator waypoint, translating through the plan layout."""
+        if self._master is None:
+            self.action_result.emit("mission_set_current_wp", False, "Link not ready")
+            return
+        plan = self._mission_plan
+        if plan is None:
+            self.action_result.emit(
+                "mission_set_current_wp",
+                False,
+                "No mission layout known — upload or download the mission first.",
+            )
+            return
+        seq = plan.seq_for_waypoint_index(int(wp_index))
+        if seq is None:
+            self.action_result.emit(
+                "mission_set_current_wp", False, f"WP {int(wp_index) + 1} is not in the mission"
+            )
+            return
+        self._sync_link_targets()
+        try:
+            self._master.mav.mission_set_current_send(
+                self._target_sysid,
+                self._target_compid,
+                int(seq),
+            )
+            self.action_result.emit(
+                "mission_set_current_wp", True, f"Jumped to WP {int(wp_index) + 1} (seq {seq})"
+            )
+            self.log_line.emit(f"Mission jump: WP {int(wp_index) + 1} -> mission seq {seq}")
+        except Exception as e:
+            self.action_result.emit("mission_set_current_wp", False, str(e))
+            self.error.emit(f"Mission jump failed: {e}")
 
     def _arm_disarm(self, arm: bool) -> None:
         if self._master is None:

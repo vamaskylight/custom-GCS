@@ -534,6 +534,21 @@ class MapTilesMixin:
 
         one()
 
+    def center_on(self, lat: float, lon: float) -> None:
+        """Recenter the map on an arbitrary position (e.g. a mission waypoint)."""
+        try:
+            la = float(lat)
+            lo = float(lon)
+        except (TypeError, ValueError):
+            return
+        # The 3D globe page has no arbitrary-position centering hook, so this is a
+        # native-2D affordance only; in 3D the call is a no-op rather than a JS error.
+        if bool(getattr(self, "_is_3d_mode", False)):
+            return
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            nm.set_center(la, lo)
+
     def center_on_vehicle(self) -> None:
         """Recenter the map on the vehicle (native: `set_center` from widget coords, else native vehicle)."""
         if bool(getattr(self, "_is_3d_mode", False)):

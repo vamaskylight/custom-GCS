@@ -268,6 +268,10 @@ class MainWindowFlightCommandsMixin:
                 "No waypoints available. Create/import waypoints first.",
             )
             return
+        if not self._confirm_mission_plan_is_sane(model, title="Mission Start"):
+            return
+        if not self._confirm_vehicle_ready_for_auto():
+            return
         armed_text = self._fields.get("armed").text().strip().lower()
         if armed_text != "yes":
             QMessageBox.information(
@@ -275,12 +279,57 @@ class MainWindowFlightCommandsMixin:
                 "Mission Start",
                 "Vehicle is not armed.\nThe link will switch to an armable mode, arm, then run AUTO + mission start.",
             )
-        payload = [{"lat": float(wp.lat), "lon": float(wp.lon), "alt_m": float(wp.alt_m)} for wp in model]
-        takeoff_m = self._plan_takeoff_alt_m_from_launch_settings()
-        if takeoff_m is not None and payload:
-            payload[0] = {**payload[0], "takeoff_alt_m": float(takeoff_m)}
-        self._thread.queue_mission_upload(payload)
+        # Reuses the upload payload builder so per-waypoint speed is not dropped here —
+        # Start Mission used to upload every waypoint at the 5 m/s default.
+        payload = self._mission_payload_from_waypoints(model)
+        end_action = self._map_widget.get_mission_end_action()
+        self._mission_upload_pending = True
+        self._thread.queue_mission_upload(payload, end_action)
         self._thread.queue_mission_start()
         self._append_log(
-            f"Mission start queued: upload {len(payload)} WPs (+TAKEOFF item) + AUTO start"
+            f"Mission start queued: upload {len(payload)} WPs (+TAKEOFF, end={end_action}) + AUTO start"
         )
+
+    def _confirm_vehicle_ready_for_auto(self) -> bool:
+        """AUTO needs a position solution. Warn on a weak one rather than blocking."""
+        problems: list[str] = []
+        if self._map_widget.get_vehicle_position() is None:
+            problems.append("No vehicle GPS position has been received yet.")
+        fix_type = int(getattr(self, "_last_gps_fix_type", 0) or 0)
+        sats = int(getattr(self, "_last_gps_sats", 0) or 0)
+        # GPS_FIX_TYPE_3D_FIX == 3; anything below that cannot hold a waypoint.
+        if fix_type < 3:
+            problems.append(f"GPS fix type {fix_type} — AUTO needs a 3D fix (3 or better).")
+        if 0 < sats < 6:
+            problems.append(f"Only {sats} satellites — marginal for autonomous navigation.")
+        if not self._heartbeat_seen:
+            problems.append("No MAVLink heartbeat has been seen on this link.")
+        if not problems:
+            return True
+        detail = "\n".join(f"• {p}" for p in problems)
+        for p in problems:
+            self._append_log(f"Mission start check: {p}")
+        answer = QMessageBox.question(
+            self,
+            "Mission Start",
+            f"The vehicle may not be ready for AUTO:\n\n{detail}\n\nStart the mission anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _on_map_mission_pause_requested(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before pausing the mission.")
+            return
+        self._thread.queue_mission_pause()
+        self._append_log("Mission pause queued (BRAKE/LOITER hold)")
+        self._set_top_vehicle_msg("Pausing mission…")
+
+    def _on_map_mission_resume_requested(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before resuming the mission.")
+            return
+        self._thread.queue_mission_resume()
+        self._append_log("Mission resume queued (AUTO from current item)")
+        self._set_top_vehicle_msg("Resuming mission…")

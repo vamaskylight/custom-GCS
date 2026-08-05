@@ -113,6 +113,7 @@ class MainWindowLinkMixin:
         self._thread.link_timeout.connect(self._on_link_timeout)
         self._thread.mission_uploaded.connect(self._on_mission_uploaded)
         self._thread.mission_downloaded.connect(self._on_mission_downloaded)
+        self._thread.mission_progress.connect(self._on_mission_progress)
         self._thread.mode_changed.connect(self._on_mode_change_result)
         self._thread.action_result.connect(self._on_action_result)
         self._thread.geofence_result.connect(self._on_geofence_result)
@@ -337,6 +338,11 @@ class MainWindowLinkMixin:
         self._hb_mode_text = "—"
         self._rid_live_available = False
         self._mission_upload_pending = False
+        # A stale "Flying to WP 4 of 8" after the link drops reads as live progress.
+        try:
+            self._map_widget.clear_mission_progress()
+        except Exception:
+            pass
         self._status.setText("Disconnected")
         self._apply_state_style(self._status, "bad")
         self._hb.setText("—")

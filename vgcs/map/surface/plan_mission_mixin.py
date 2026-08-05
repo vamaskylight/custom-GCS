@@ -14,7 +14,15 @@ from vgcs.map.surface.settings_keys import (
     _KEY_PLAN_LAST_MISSION_JSON_LEGACY,
     _KEY_TOOLBAR_EXPORT_MISSION_JSON,
 )
-from vgcs.mission import Waypoint, load_waypoints_json, save_waypoints_json, save_waypoints_kml
+from vgcs.mission import (
+    DEFAULT_MISSION_END_ACTION,
+    Waypoint,
+    load_mission_end_action,
+    load_waypoints_json,
+    normalize_end_action,
+    save_waypoints_json,
+    save_waypoints_kml,
+)
 
 
 class PlanMissionMixin:
@@ -203,6 +211,40 @@ class PlanMissionMixin:
         if panel is not None:
             panel.set_vehicle_info(str(firmware or ""), str(vehicle or ""))
 
+    def get_mission_end_action(self) -> str:
+        """What the vehicle does after the last waypoint: hold / rtl / land."""
+        return normalize_end_action(getattr(self, "_mission_end_action", DEFAULT_MISSION_END_ACTION))
+
+    def set_mission_end_action(self, action: str) -> None:
+        value = normalize_end_action(action)
+        if value == getattr(self, "_mission_end_action", None):
+            return
+        self._mission_end_action = value
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_mission_end_action(value)
+
+    def set_mission_progress(self, payload: object) -> None:
+        """Live AUTO progress from the vehicle (see MavlinkThread.mission_progress)."""
+        data = payload if isinstance(payload, dict) else {}
+        raw_index = data.get("wp_index", None)
+        wp_index = None if raw_index is None else int(raw_index)
+        self._mission_progress_wp_index = wp_index
+        total = int(data.get("waypoint_count", 0) or 0)
+        label = str(data.get("label", "") or "")
+        panel = getattr(self, "_plan_flight_panel", None)
+        if panel is not None:
+            panel.set_mission_progress(wp_index, total, label)
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            try:
+                nm.set_active_waypoint_index(wp_index)
+            except Exception:
+                pass
+
+    def clear_mission_progress(self) -> None:
+        self.set_mission_progress({"wp_index": None, "waypoint_count": 0, "label": ""})
+
     def get_default_waypoint_alt_m(self) -> float:
         return float(self._default_alt.value())
 
@@ -319,28 +361,43 @@ class PlanMissionMixin:
         self._set_status(f"Mission upload requested ({len(wps)} WPs)")
 
     def _waypoints_from_map_json(self, payload: str | None) -> list[Waypoint]:
+        """Rebuild the model from the map's lat/lon rows, keeping per-WP alt/speed.
+
+        The map only stores positions, so altitude and speed have to be carried over
+        from the previous model. Matching them **by index** silently shifted every
+        later waypoint's altitude up by one when the operator deleted a waypoint from
+        the middle of the plan, so entries are aligned by position instead.
+        """
         if not payload:
             return []
         try:
             rows = json.loads(payload)
         except Exception:
             return []
+
+        previous = list(self._waypoints_model)
+        cursor = 0
         waypoints: list[Waypoint] = []
-        for idx, row in enumerate(rows):
+        for row in rows:
             if not (isinstance(row, list) and len(row) >= 2):
                 continue
             lat = float(row[0])
             lon = float(row[1])
-            alt = (
-                self._waypoints_model[idx].alt_m
-                if idx < len(self._waypoints_model)
-                else float(self._default_alt.value())
-            )
-            spd = (
-                float(getattr(self._waypoints_model[idx], "speed_mps", 5.0))
-                if idx < len(self._waypoints_model)
-                else float(self._default_speed.value())
-            )
+            match = None
+            # Scan forward from the cursor: deleted waypoints are skipped over, and a
+            # re-appearing position is never matched backwards onto an earlier row.
+            for probe in range(cursor, len(previous)):
+                prev = previous[probe]
+                if abs(float(prev.lat) - lat) < 1e-9 and abs(float(prev.lon) - lon) < 1e-9:
+                    match = prev
+                    cursor = probe + 1
+                    break
+            if match is not None:
+                alt = float(match.alt_m)
+                spd = float(getattr(match, "speed_mps", 5.0))
+            else:
+                alt = float(self._default_alt.value())
+                spd = float(self._default_speed.value())
             waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt, speed_mps=spd))
         return waypoints
 
@@ -383,7 +440,7 @@ class PlanMissionMixin:
             if not path:
                 return
         try:
-            save_waypoints_json(path, wps)
+            save_waypoints_json(path, wps, end_action=self.get_mission_end_action())
         except Exception:
             self._set_status("Save failed")
             QMessageBox.warning(self, "Plan Flight", "Could not save the mission file.")
@@ -469,6 +526,9 @@ class PlanMissionMixin:
         except Exception:
             self._set_status("Import failed")
             return
+        stored_end = load_mission_end_action(path)
+        if stored_end:
+            self.set_mission_end_action(stored_end)
         rows = [[wp.lat, wp.lon] for wp in waypoints]
         self._waypoints_model = list(waypoints)
         js = f"setWaypoints({json.dumps(rows)});"
