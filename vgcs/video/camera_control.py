@@ -1075,6 +1075,25 @@ class ViewproCameraControl:
                 return None
             time.sleep(self._LRF_RANGE_POLL_INTERVAL_S)
 
+    def reported_fov_deg(self) -> tuple[float, float] | None:
+        """Live (hfov, vfov) in degrees straight from the camera's status frame.
+
+        The C13 has a fixed lens, so DOOAF's single ``observe/camera_hfov_deg``
+        setting is always right for it. This camera has a large optical zoom and
+        reports its true current FOV continuously, so the static setting is only
+        correct at one zoom level — see camera_reported_fov_deg.
+        """
+        try:
+            return self._adapter.query_fov_deg()
+        except Exception:
+            return None
+
+    def reported_zoom_x(self) -> float | None:
+        try:
+            return self._adapter.query_zoom_x()
+        except Exception:
+            return None
+
     def get_laser_range_m(self) -> float | None:
         try:
             return self._adapter.query_range_m()
@@ -1261,6 +1280,38 @@ def uses_viewpro_camera(control: object | None) -> bool:
     ``NativeVideoOverlayLayer``.
     """
     return isinstance(resolve_camera_control_primary(control), ViewproCameraControl)
+
+
+def camera_reported_fov_deg(control: object | None) -> tuple[float, float] | None:
+    """Live (hfov, vfov) degrees from the camera itself, or None if it can't report it.
+
+    DOOAF's pixel->angle geo-referencing takes FOV from the single
+    ``observe/camera_hfov_deg`` setting. That is exact for a FIXED lens (C13),
+    but a zoom lens only matches it at one zoom level — a Viewpro field
+    screenshot showed the camera's own OSD reading 70.2 deg at 1.00x while the
+    setting default is 62.0, i.e. already wrong before zooming at all, and
+    progressively worse zoomed in.
+
+    Backends that genuinely know their current FOV should expose
+    ``reported_fov_deg()``; callers fall back to the setting when this is None,
+    so nothing changes for cameras that can't report it.
+    """
+    getter = getattr(resolve_camera_control_primary(control), "reported_fov_deg", None)
+    if not callable(getter):
+        return None
+    try:
+        fov = getter()
+    except Exception:
+        return None
+    if not fov:
+        return None
+    try:
+        hfov, vfov = float(fov[0]), float(fov[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if hfov <= 0.0 or vfov <= 0.0 or hfov >= 180.0 or vfov >= 180.0:
+        return None
+    return (hfov, vfov)
 
 
 def camera_reports_payload_gimbal_attitude(control: object | None) -> bool:

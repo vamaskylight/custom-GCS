@@ -117,6 +117,9 @@ class ViewproGimbalTcpAdapter:
         self._lrf_armed = False
         self._lrf_streaming = False
         self._lrf_idle_stop_timer: threading.Timer | None = None
+        self._last_hfov_deg: float | None = None
+        self._last_vfov_deg: float | None = None
+        self._last_zoom_x: float | None = None
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -206,6 +209,19 @@ class ViewproGimbalTcpAdapter:
         if range_m is not None:
             self._last_range_m = range_m
             self._last_range_mono = time.monotonic()
+        # Live optics state. Unlike the C13's fixed lens, this camera has a big
+        # optical zoom AND reports its true current FOV in every status frame, so
+        # DOOAF's geo-referencing can use the real value instead of one static
+        # setting. Guarded because a 0 here means "not reported" (and a zero FOV
+        # would silently divide the pixel->angle maths into nonsense).
+        hfov = parsed.get("hfov_deg")
+        vfov = parsed.get("vfov_deg")
+        if hfov is not None and vfov is not None and float(hfov) > 0.0 and float(vfov) > 0.0:
+            self._last_hfov_deg = float(hfov)
+            self._last_vfov_deg = float(vfov)
+        zoom_x = parsed.get("zoom_x")
+        if zoom_x is not None and float(zoom_x) > 0.0:
+            self._last_zoom_x = float(zoom_x)
 
     def _note_servo_mode(self, status: object) -> None:
         """Log the gimbal's own reported servo mode whenever it changes.
@@ -502,6 +518,21 @@ class ViewproGimbalTcpAdapter:
 
     def is_lrf_armed(self) -> bool:
         return bool(self._lrf_armed)
+
+    def query_fov_deg(self) -> tuple[float, float] | None:
+        """Live (horizontal, vertical) FOV in degrees as the camera reports it in
+        its D1 status block, or None if it hasn't reported usable values yet.
+
+        This tracks the optical zoom, which is exactly what DOOAF's pixel->angle
+        maths needs and what a single static FOV setting cannot provide on a
+        zoom lens."""
+        if self._last_hfov_deg is None or self._last_vfov_deg is None:
+            return None
+        return (self._last_hfov_deg, self._last_vfov_deg)
+
+    def query_zoom_x(self) -> float | None:
+        """Live optical zoom factor as reported by the camera, or None."""
+        return self._last_zoom_x
 
     def has_rangefinder(self) -> bool:
         """True once the gimbal has actually reported a range in its status.
