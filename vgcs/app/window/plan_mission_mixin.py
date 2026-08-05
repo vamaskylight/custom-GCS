@@ -64,7 +64,13 @@ from vgcs.app.window.helpers import (
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
-from vgcs.mission import Waypoint
+from vgcs.mission import (
+    DEFAULT_MISSION_END_ACTION,
+    Waypoint,
+    normalize_end_action,
+    parse_downloaded_mission,
+    validate_waypoints,
+)
 from vgcs.map import MapWidget
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
@@ -181,13 +187,8 @@ class MainWindowPlanMissionMixin:
         else:
             self._append_log("Mission speed updated from table.")
 
-    def _on_mission_upload_requested(self, waypoints: list) -> None:
-        if self._thread is None or not self._thread.isRunning():
-            QMessageBox.warning(self, "VGCS", "Connect vehicle before mission upload.")
-            return
-        if self._mission_upload_pending:
-            self._append_log("Mission upload already in progress…")
-            return
+    def _mission_payload_from_waypoints(self, waypoints: list) -> list[dict]:
+        """Wire payload for the link thread — every per-waypoint field must survive."""
         payload = [
             {
                 "lat": float(getattr(wp, "lat", 0.0)),
@@ -200,9 +201,99 @@ class MainWindowPlanMissionMixin:
         takeoff_m = self._plan_takeoff_alt_m_from_launch_settings()
         if takeoff_m is not None and payload:
             payload[0] = {**payload[0], "takeoff_alt_m": float(takeoff_m)}
+        return payload
+
+    def _confirm_mission_plan_is_sane(self, waypoints: list, *, title: str) -> bool:
+        """Block an unflyable plan; let the operator accept merely unusual ones."""
+        home = self._map_widget.get_vehicle_position()
+        errors, warnings = validate_waypoints(waypoints, home=home)
+        if errors:
+            detail = "\n".join(f"• {e}" for e in errors[:8])
+            QMessageBox.critical(
+                self,
+                title,
+                f"This mission cannot be uploaded:\n\n{detail}\n\nFix the plan and try again.",
+            )
+            for e in errors:
+                self._append_log(f"Mission validation error: {e}")
+            return False
+        if warnings:
+            detail = "\n".join(f"• {w}" for w in warnings[:8])
+            for w in warnings:
+                self._append_log(f"Mission validation warning: {w}")
+            answer = QMessageBox.question(
+                self,
+                title,
+                f"Check this mission before flying:\n\n{detail}\n\nUpload anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._append_log("Mission upload cancelled by operator after validation warnings.")
+                return False
+        return True
+
+    def _on_mission_table_context_menu(self, pos: QPoint) -> None:
+        """Row actions the table had no way to reach: delete, insert-after, fly-to."""
+        row = self._mission_table.rowAt(pos.y())
+        model = list(getattr(self._map_widget, "_waypoints_model", []) or [])
+        if row < 0 or row >= len(model):
+            return
+        menu = QMenu(self._mission_table)
+        act_center = menu.addAction(f"Center map on WP {row + 1}")
+        act_fly = menu.addAction(f"Fly to WP {row + 1} now (jump mission)")
+        menu.addSeparator()
+        act_dup = menu.addAction(f"Duplicate WP {row + 1}")
+        act_del = menu.addAction(f"Delete WP {row + 1}")
+        link_live = self._thread is not None and self._thread.isRunning()
+        act_fly.setEnabled(link_live)
+        if not link_live:
+            act_fly.setToolTip("Connect the vehicle to jump the running mission.")
+        chosen = menu.exec(self._mission_table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_center:
+            wp = model[row]
+            self._map_widget.center_on(float(wp.lat), float(wp.lon))
+            return
+        if chosen is act_fly:
+            if QMessageBox.question(
+                self,
+                "Jump mission",
+                f"Send the vehicle to WP {row + 1} now?\n"
+                "This skips any waypoints between the current one and this.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self._thread.queue_mission_set_current_wp(row)
+            self._append_log(f"Mission jump requested: WP {row + 1}")
+            return
+        if chosen is act_dup:
+            wp = model[row]
+            model.insert(row + 1, Waypoint(lat=wp.lat, lon=wp.lon, alt_m=wp.alt_m, speed_mps=wp.speed_mps))
+            self._map_widget.set_waypoints(model)
+            self._append_log(f"Duplicated WP {row + 1}")
+            return
+        if chosen is act_del:
+            del model[row]
+            self._map_widget.set_waypoints(model)
+            self._append_log(f"Deleted WP {row + 1} ({len(model)} remaining)")
+
+    def _on_mission_upload_requested(self, waypoints: list) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before mission upload.")
+            return
+        if self._mission_upload_pending:
+            self._append_log("Mission upload already in progress…")
+            return
+        if not self._confirm_mission_plan_is_sane(waypoints, title="Mission Upload"):
+            return
+        payload = self._mission_payload_from_waypoints(waypoints)
+        end_action = self._map_widget.get_mission_end_action()
         self._mission_upload_pending = True
-        self._thread.queue_mission_upload(payload)
-        self._append_log(f"Mission upload queued: {len(payload)} WPs")
+        self._thread.queue_mission_upload(payload, end_action)
+        self._append_log(f"Mission upload queued: {len(payload)} WPs (end={end_action})")
         self._set_top_vehicle_msg(f"Uploading mission ({len(payload)} WPs)…")
 
     def _on_mission_download_requested(self) -> None:
@@ -222,20 +313,35 @@ class MainWindowPlanMissionMixin:
 
     def _on_mission_downloaded(self, items: object) -> None:
         rows = items if isinstance(items, list) else []
-        self._append_log(f"Mission download success: {len(rows)} WPs")
-        from vgcs.mission import Waypoint
-
-        wps = [
-            Waypoint(
-                lat=float(row.get("lat", 0.0)),
-                lon=float(row.get("lon", 0.0)),
-                alt_m=float(row.get("alt_m", 20.0)),
-            )
-            for row in rows
-            if isinstance(row, dict)
-        ]
+        # Downloaded items include the home slot, NAV_TAKEOFF and every DO_CHANGE_SPEED —
+        # all at lat/lon 0,0. Showing those as waypoints scattered the plan into the ocean.
+        wps, end_action = parse_downloaded_mission(rows)
+        self._append_log(
+            f"Mission download success: {len(rows)} mission items -> {len(wps)} waypoints "
+            f"(end={end_action})"
+        )
+        self._map_widget.set_mission_end_action(end_action)
+        self._settings.setValue("plan_mission_end_action", end_action)
         self._map_widget.set_waypoints(wps, clear_plan_current_file=True)
-        self._set_top_vehicle_msg(f"Mission downloaded ({len(wps)})")
+        self._set_top_vehicle_msg(f"Mission downloaded ({len(wps)} WPs)")
+
+    def _on_mission_progress(self, payload: object) -> None:
+        """Live AUTO progress from the vehicle (MISSION_CURRENT / MISSION_ITEM_REACHED)."""
+        data = payload if isinstance(payload, dict) else {}
+        self._map_widget.set_mission_progress(data)
+        wp_index = data.get("wp_index", None)
+        total = int(data.get("waypoint_count", 0) or 0)
+        label = str(data.get("label", "") or "")
+        if bool(data.get("reached", False)):
+            if wp_index is not None:
+                self._append_log(f"Mission: reached WP {int(wp_index) + 1} of {total}")
+            elif label:
+                self._append_log(f"Mission: completed {label}")
+            return
+        if wp_index is not None:
+            self._set_top_vehicle_msg(f"AUTO · WP {int(wp_index) + 1} of {total}")
+        elif label:
+            self._set_top_vehicle_msg(f"AUTO · {label}")
 
     def _sync_plan_flight_chrome(self) -> None:
         """Enable/disable Plan Flight upload/save buttons from link + waypoint state."""
@@ -305,8 +411,12 @@ class MainWindowPlanMissionMixin:
             "patternRowSpacingM": float(s.value("plan_pattern_row_spacing_m", 20.0) or 20.0),
             "patternPassWidthM": float(s.value("plan_pattern_pass_width_m", 80.0) or 80.0),
             "patternPassDepthM": float(s.value("plan_pattern_pass_depth_m", 60.0) or 60.0),
+            "endAction": normalize_end_action(
+                s.value("plan_mission_end_action", DEFAULT_MISSION_END_ACTION)
+            ),
         }
         self._map_widget.apply_plan_mission_panel_state(state)
+        self._map_widget.set_mission_end_action(str(state["endAction"]))
         self._apply_plan_mission_panel_to_model(state)
 
     def _ensure_plan_launch_from_vehicle_if_empty(self) -> None:
@@ -363,6 +473,10 @@ class MainWindowPlanMissionMixin:
             "plan_pattern_pass_depth_m",
             float(data.get("patternPassDepthM", 60.0) or 60.0),
         )
+        if "endAction" in data:
+            end_action = normalize_end_action(data.get("endAction"))
+            s.setValue("plan_mission_end_action", end_action)
+            self._map_widget.set_mission_end_action(end_action)
         self._apply_plan_mission_panel_to_model(data)
 
     def _default_wp_alt_m_for_plan_state(self, state: dict[str, object]) -> float:
@@ -561,6 +675,7 @@ class MainWindowPlanMissionMixin:
                 == QMessageBox.StandardButton.Yes
             ):
                 self._map_widget.clear_map_waypoints()
+                self._map_widget.clear_mission_progress()
                 self._map_widget.set_plan_mission_start_stack(False)
                 self._map_widget.set_plan_sequence_template("")
             return
@@ -574,6 +689,7 @@ class MainWindowPlanMissionMixin:
                 == QMessageBox.StandardButton.Yes
             ):
                 self._map_widget.clear_map_waypoints()
+                self._map_widget.clear_mission_progress()
                 self._map_widget.set_plan_mission_start_stack(False)
                 self._map_widget.set_plan_sequence_template("")
             return

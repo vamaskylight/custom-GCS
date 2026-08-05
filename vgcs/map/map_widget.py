@@ -147,6 +147,7 @@ from vgcs.observe.target_measure import (
     video_mark_span_norm,
 )
 from vgcs.mission import (
+    DEFAULT_MISSION_END_ACTION,
     Waypoint,
     load_waypoints_json,
     save_waypoints_json,
@@ -799,6 +800,8 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     toggle_3d_requested = Signal()
     map_3d_mode_changed = Signal()  # _is_3d_mode updated (async load / JS / back to 2D)
     mission_start_requested = Signal()
+    mission_pause_requested = Signal()
+    mission_resume_requested = Signal()
     plan_mission_panel_changed = Signal(object)
     video_follow_enabled_changed = Signal(bool)
 
@@ -824,6 +827,10 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._heading: float | None = None
         self._waypoint_count = 0
         self._waypoints_model: list[Waypoint] = []
+        # What the vehicle does after the last waypoint (hold / rtl / land).
+        self._mission_end_action = DEFAULT_MISSION_END_ACTION
+        # Live AUTO progress, as reported by the vehicle (see mission_progress).
+        self._mission_progress_wp_index: int | None = None
         self._web_ready = False
         self._is_3d_mode = False
         self._web_3d_view = None
@@ -1405,6 +1412,8 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._plan_flight_panel.tool_requested.connect(self._on_plan_panel_tool)
         self._plan_flight_panel.mission_panel_changed.connect(self._on_plan_panel_mission_changed)
         self._plan_flight_panel.mission_start_requested.connect(self.mission_start_requested.emit)
+        self._plan_flight_panel.mission_pause_requested.connect(self.mission_pause_requested.emit)
+        self._plan_flight_panel.mission_resume_requested.connect(self.mission_resume_requested.emit)
         self._plan_flight_panel.return_requested.connect(self.return_requested.emit)
         self._plan_flight_panel.set_launch_to_map_center_requested.connect(
             self._on_plan_panel_set_launch_to_map_center

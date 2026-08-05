@@ -445,6 +445,8 @@ class PlanFlightPanel(QWidget):
     tool_requested = Signal(str)
     mission_panel_changed = Signal(object)
     mission_start_requested = Signal()
+    mission_pause_requested = Signal()
+    mission_resume_requested = Signal()
     return_requested = Signal()
     set_launch_to_map_center_requested = Signal()
 
@@ -1009,12 +1011,69 @@ class PlanFlightPanel(QWidget):
         self._seq_rtl_btn = QPushButton("Return To Launch")
         self._seq_rtl_btn.hide()
 
+        # End of mission — what the vehicle does after the last waypoint. Without an
+        # explicit terminal command ArduCopter simply holds position at the final
+        # waypoint until the battery failsafe fires, so this is a safety control.
+        self._end_action_frame = QFrame()
+        ea = QGridLayout(self._end_action_frame)
+        ea.setContentsMargins(0, 6, 0, 0)
+        ea.setHorizontalSpacing(8)
+        ea.setVerticalSpacing(4)
+        ea_title = QLabel("After last waypoint")
+        ea_title.setStyleSheet("QLabel { color: #ffffff; font-size: 12px; font-weight: 700; }")
+        ea.addWidget(ea_title, 0, 0, 1, 2)
+        self._end_action_combo = QComboBox()
+        self._end_action_combo.setProperty("class", "planPatternSpin")
+        self._end_action_combo.addItem("Return to launch (RTL)", "rtl")
+        self._end_action_combo.addItem("Land at last waypoint", "land")
+        self._end_action_combo.addItem("Hold position", "hold")
+        self._end_action_combo.setToolTip(
+            "Appended as the final mission command.\n"
+            "RTL: climb to RTL_ALT, fly home and land.\n"
+            "Land: descend and land where the last waypoint is.\n"
+            "Hold: no terminal command — the vehicle hovers at the last waypoint."
+        )
+        self._end_action_combo.currentIndexChanged.connect(lambda _i: self._schedule_emit())
+        ea.addWidget(self._field_label("On finish"), 1, 0)
+        ea.addWidget(self._end_action_combo, 1, 1)
+        body_v.addWidget(self._end_action_frame)
+
         # Start Mission
         self._start_mission_btn = QPushButton("Start Mission")
         self._start_mission_btn.setObjectName("planStartMissionBtn")
         self._start_mission_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._start_mission_btn.clicked.connect(self.mission_start_requested.emit)
         body_v.addWidget(self._start_mission_btn)
+
+        # Live AUTO progress + in-flight controls. Hidden until the vehicle reports
+        # it is running a mission item.
+        self._mission_run_frame = QFrame()
+        mr = QVBoxLayout(self._mission_run_frame)
+        mr.setContentsMargins(0, 6, 0, 0)
+        mr.setSpacing(4)
+        self._mission_progress_label = QLabel("Mission idle")
+        self._mission_progress_label.setStyleSheet(
+            "QLabel { color: #ffd27a; font-size: 12px; font-weight: 700; }"
+        )
+        mr.addWidget(self._mission_progress_label)
+        run_row = QHBoxLayout()
+        run_row.setContentsMargins(0, 0, 0, 0)
+        run_row.setSpacing(6)
+        self._mission_pause_btn = QPushButton("Pause")
+        self._mission_pause_btn.setToolTip(
+            "Hold position (BRAKE/LOITER). The vehicle keeps its place in the mission."
+        )
+        self._mission_pause_btn.clicked.connect(self.mission_pause_requested.emit)
+        self._mission_resume_btn = QPushButton("Resume")
+        self._mission_resume_btn.setToolTip("Back to AUTO, continuing from the current mission item.")
+        self._mission_resume_btn.clicked.connect(self.mission_resume_requested.emit)
+        run_row.addWidget(self._mission_pause_btn)
+        run_row.addWidget(self._mission_resume_btn)
+        run_wrap = QWidget()
+        run_wrap.setLayout(run_row)
+        mr.addWidget(run_wrap)
+        body_v.addWidget(self._mission_run_frame)
+        self._mission_run_frame.setVisible(False)
 
         # Waypoint details
         self._wp_details_box = QFrame()
@@ -1309,6 +1368,40 @@ class PlanFlightPanel(QWidget):
         self._fw_value.setText(firmware or "\u2014")
         self._veh_value.setText(vehicle or "\u2014")
 
+    def mission_end_action(self) -> str:
+        data = self._end_action_combo.currentData()
+        return str(data or "rtl")
+
+    def set_mission_end_action(self, action: str) -> None:
+        want = str(action or "rtl").strip().lower()
+        for i in range(self._end_action_combo.count()):
+            if str(self._end_action_combo.itemData(i)) == want:
+                if self._end_action_combo.currentIndex() == i:
+                    return
+                self._suppress_emit = True
+                try:
+                    self._end_action_combo.setCurrentIndex(i)
+                finally:
+                    self._suppress_emit = False
+                return
+
+    def set_mission_progress(self, wp_index: int | None, total: int, label: str = "") -> None:
+        """Show which waypoint the vehicle is flying to during AUTO."""
+        n_total = max(0, int(total or 0))
+        if wp_index is None and not label:
+            self._mission_progress_label.setText("Mission idle")
+            self._mission_run_frame.setVisible(False)
+            return
+        if wp_index is None:
+            # On a non-waypoint item: takeoff, a speed change or the terminal RTL/land.
+            text = label or "Mission running"
+        elif n_total > 0:
+            text = f"Flying to WP {int(wp_index) + 1} of {n_total}"
+        else:
+            text = f"Flying to WP {int(wp_index) + 1}"
+        self._mission_progress_label.setText(text)
+        self._mission_run_frame.setVisible(True)
+
     def apply_panel_state(self, state: dict[str, Any]) -> None:
         if not isinstance(state, dict):
             return
@@ -1355,6 +1448,12 @@ class PlanFlightPanel(QWidget):
             self._pattern_pass_depth_spin.setValue(
                 float(state.get("patternPassDepthM", 60.0) or 60.0)
             )
+            end_action = str(state.get("endAction", "") or "").strip().lower()
+            if end_action:
+                for i in range(self._end_action_combo.count()):
+                    if str(self._end_action_combo.itemData(i)) == end_action:
+                        self._end_action_combo.setCurrentIndex(i)
+                        break
         finally:
             self._suppress_emit = False
 
@@ -1555,6 +1654,7 @@ class PlanFlightPanel(QWidget):
             "patternRowSpacingM": float(self._pattern_row_spacing_spin.value()),
             "patternPassWidthM": float(self._pattern_pass_width_spin.value()),
             "patternPassDepthM": float(self._pattern_pass_depth_spin.value()),
+            "endAction": self.mission_end_action(),
         }
         self.mission_panel_changed.emit(payload)
 

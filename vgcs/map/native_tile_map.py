@@ -448,6 +448,8 @@ class NativeTileMapView(QWidget):
         self._fence_circle: tuple[float, float, float] | None = None  # lat, lon, radius_m
         self._track: list[tuple[float, float]] = []
         self._mission_nav_seq = 0
+        # Plan index (0-based) of the waypoint the vehicle is flying to, or None.
+        self._active_wp_index: int | None = None
         self._add_wp_mode = False
         self._fence_draw_mode = False
         self._tile_template = (
@@ -632,6 +634,7 @@ class NativeTileMapView(QWidget):
         self._waypoints.clear()
         # Match legacy `clearWaypoints()` — stale MISSION_CURRENT.seq would otherwise trim the polyline wrong.
         self._mission_nav_seq = 0
+        self._active_wp_index = None
         self.update()
 
     def clear_fence_points(self) -> None:
@@ -666,6 +669,20 @@ class NativeTileMapView(QWidget):
             self._mission_nav_seq = max(0, int(seq))
         except Exception:
             self._mission_nav_seq = 0
+        self.update()
+
+    def set_active_waypoint_index(self, index: int | None) -> None:
+        """Highlight the waypoint the vehicle is flying to (plan index, not MAVLink seq)."""
+        if index is None:
+            new_index = None
+        else:
+            try:
+                new_index = max(0, int(index))
+            except (TypeError, ValueError):
+                new_index = None
+        if new_index == self._active_wp_index:
+            return
+        self._active_wp_index = new_index
         self.update()
 
     def set_tile_source(self, template: str, _attribution: str, max_z: int) -> None:
@@ -1112,13 +1129,23 @@ class NativeTileMapView(QWidget):
             if len(pts) >= 3:
                 painter.drawLine(pts[-1], pts[0])
 
-        # Waypoint markers
+        # Waypoint markers. The waypoint the vehicle is currently flying to (reported via
+        # MISSION_CURRENT and translated to a plan index by MissionPlan) is drawn larger
+        # and amber, so the operator can see mission progress on the map during AUTO.
+        active_wp = self._active_wp_index
         painter.setPen(QPen(QColor(255, 255, 255), 1))
         for i, (lat, lon) in enumerate(self._waypoints):
             c = self._project(lat, lon, z, fx, fy, w, h)
-            painter.setBrush(QColor(40, 130, 255, 220))
-            painter.drawEllipse(c, 7, 7)
-            painter.setPen(QPen(QColor(255, 255, 255)))
+            is_active = active_wp is not None and i == active_wp
+            if is_active:
+                painter.setPen(QPen(QColor(255, 210, 90), 2))
+                painter.setBrush(QColor(255, 170, 30, 235))
+                painter.drawEllipse(c, 10, 10)
+            else:
+                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                painter.setBrush(QColor(40, 130, 255, 220))
+                painter.drawEllipse(c, 7, 7)
+            painter.setPen(QPen(QColor(20, 24, 30) if is_active else QColor(255, 255, 255)))
             painter.drawText(QRectF(c.x() - 16, c.y() - 8, 32, 16), Qt.AlignmentFlag.AlignCenter, str(i + 1))
 
         # DOOAF fixed points (military gun / target / impact)
@@ -1402,6 +1429,7 @@ class NativeTileMapView(QWidget):
             self._waypoints.pop(idx)
             # Editing the plan invalidates raw MISSION_CURRENT.seq until the next downlink.
             self._mission_nav_seq = 0
+            self._active_wp_index = None
             self.update()
             self.user_waypoints_changed.emit()
 
@@ -1740,6 +1768,7 @@ class NativeTileMapView(QWidget):
                 lat, lon = self._add_wp_press_geo
                 self._waypoints.append((lat, lon))
                 self._mission_nav_seq = 0
+                self._active_wp_index = None
                 self.update()
                 self.user_waypoints_changed.emit()
             self._add_wp_press_candidate = False
