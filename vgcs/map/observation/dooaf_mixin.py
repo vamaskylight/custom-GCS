@@ -1695,6 +1695,18 @@ class DooafOperationsMixin:
             hfov = float(st.value("observe/camera_hfov_deg", 62.0) or 62.0)
         except Exception:
             hfov = 62.0
+        # Prefer what the camera actually reports. The setting is exact for a
+        # fixed lens (C13) but only right at one zoom level on a zoom lens, and
+        # geo-referencing a video pick with the wrong FOV mis-places the mark.
+        # Falls back to the setting for backends that can't report it.
+        try:
+            from vgcs.video.camera_control import camera_reported_fov_deg
+
+            live_fov = camera_reported_fov_deg(getattr(self, "_camera_control", None))
+            if live_fov is not None:
+                hfov = float(live_fov[0])
+        except Exception:
+            pass
         dem = (
             str(st.value("observe/dem_path", "") or st.value("observe/dem_csv", "") or "")
             .strip()
