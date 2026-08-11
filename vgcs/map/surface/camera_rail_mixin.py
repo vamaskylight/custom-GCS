@@ -73,7 +73,7 @@ class CameraRailMixin:
             pass
         self._sync_native_camera_rail_toggles()
         try:
-            from vgcs.video.camera_control import NoopCameraControl, uses_skydroid_top_camera
+            from vgcs.video.camera_control import NoopCameraControl, supports_m13_track
 
             if isinstance(control, NoopCameraControl):
                 reset_m13 = getattr(self, "_reset_m13_track_for_disconnect", None)
@@ -81,7 +81,13 @@ class CameraRailMixin:
                     reset_m13()
                 self.enable_m13_track_ui(False)
             else:
-                self.enable_m13_track_ui(uses_skydroid_top_camera(control))
+                # supports_m13_track unwraps the CompositeGimbalCameraControl
+                # wrapper `control` actually is — deliberately UNLIKE
+                # _native_gimbal_uses_ptz_hold below, which isinstance-tests the
+                # wrapper directly and is therefore dead for every backend
+                # (isinstance does not see through __getattr__). Do not copy
+                # that pattern here.
+                self.enable_m13_track_ui(supports_m13_track(control))
         except Exception:
             pass
         try:

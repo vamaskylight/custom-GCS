@@ -286,6 +286,34 @@ def decode_d1(data: bytes) -> dict | None:
     }
 
 
+TRACK_STATUS_NAMES = {
+    0: "stopped",
+    1: "searching",
+    2: "TRACKING",
+    3: "target lost",
+}
+
+
+def decode_f1(byte: int) -> dict:
+    """Decode the 1-byte F1 tracking-status block.
+
+    Read-only telemetry: VGCS runs M13/M14 as GCS-side software tracking and
+    never commands this camera's onboard tracker, so a non-zero status here
+    means something ELSE started it (an RC transmitter, the vendor app, or
+    firmware doing it by itself) — which is exactly the kind of thing worth
+    seeing in a log rather than inferring later from odd gimbal behaviour.
+
+    Bit layout is from the vendor command table only (no worked example to
+    verify against), hence decode-and-log rather than anything acting on it.
+    """
+    b = int(byte) & 0xFF
+    return {
+        "track_source": b & 0x07,
+        "track_status": (b >> 3) & 0x03,
+        "track_target_type": (b >> 5) & 0x07,
+    }
+
+
 def decode_status_frame(data: bytes) -> dict | None:
     """Decode a CMD_STATUS_T1F1B1D1 (0x40) body -> gimbal attitude + camera status."""
     if len(data) < _B1_OFFSET + _B1_LEN:
@@ -295,6 +323,10 @@ def decode_status_frame(data: bytes) -> dict | None:
         return None
     yaw, pitch, roll, servo_status = decoded_b1
     out = {"yaw_deg": yaw, "pitch_deg": pitch, "roll_deg": roll, "servo_status": servo_status}
+    # F1 sits between T1 and B1. The guard above already requires the body to
+    # reach _B1_OFFSET + _B1_LEN (29 bytes), so index _T1_LEN (22) is always in
+    # range on any frame whose B1 decoded at all.
+    out.update(decode_f1(data[_T1_LEN]))
     d1 = decode_d1(data[_D1_OFFSET : _D1_OFFSET + _D1_LEN])
     if d1 is not None:
         out.update(d1)
