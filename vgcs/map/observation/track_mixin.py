@@ -32,21 +32,47 @@ from vgcs.video.pipeline import (
 )
 
 # Cameras where M13 tracks the target itself in software rather than handing
-# the job to the camera's firmware. Reasons differ per camera:
-#  - c12_default: GOT/SUM continuous follow is simply not wired through yet
+# the job to the camera's firmware:
+#  - c12_default: GOT/SUM continuous follow is not wired through yet
 #    (see DOCS/SKYDROID-TOP-PROTOCOL.md).
 #  - zr10_default: the SIYI SDK has no firmware track command at all
 #    (see DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md).
-#  - viewpro_default: the camera DOES have an onboard AI tracker (E1/E2
-#    packets), but this project deliberately does not drive it — the whole
-#    command path is vendor-table-only with no worked example, its pixel space
-#    (+-960/+-540) has an unstated sign convention, and this integration has
-#    already been burned once by trusting a Viewpro doc's sign (see the pitch
-#    note in ViewproCameraControl.set_gimbal_speed). Its transport is also
-#    one-recv-per-request fire-and-forget, which cannot honestly satisfy the
-#    `-> bool` "did the track start" contract the firmware path expects.
-#    See DOCS/VIEWPRO-CAMERA-REFERENCE.md for the full deferral rationale.
-_M14_AI_FOLLOW_PROFILE_IDS = {"c12_default", "zr10_default", "viewpro_default"}
+#
+# Viewpro is NOT in this set: at the client's request it uses the camera's own
+# onboard AI tracker. That path is self-verifying — it only counts as engaged
+# once the camera reports F1 status 2 in a sample decoded after the command
+# went out — and falls back to software tracking automatically when it does
+# not. Set VGCS_VIEWPRO_ONBOARD_TRACK=0 to put Viewpro back on the software
+# path with no rebuild. See DOCS/VIEWPRO-CAMERA-REFERENCE.md.
+_M14_AI_FOLLOW_PROFILE_IDS = {"c12_default", "zr10_default"}
+
+
+def _viewpro_onboard_track_enabled() -> bool:
+    return os.environ.get("VGCS_VIEWPRO_ONBOARD_TRACK", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _m14_ai_follow_profile_ids() -> set[str]:
+    """Profiles that take the software path, honouring the Viewpro kill switch."""
+    if _viewpro_onboard_track_enabled():
+        return _M14_AI_FOLLOW_PROFILE_IDS
+    return _M14_AI_FOLLOW_PROFILE_IDS | {"viewpro_default"}
+
+
+def _m13_software_fallback_enabled() -> bool:
+    """Whether a failed onboard track may fall back to software tracking.
+
+    On by default: the fallback is the guarantee that enabling the onboard
+    tracker cannot leave an operator worse off than the software path they had.
+    """
+    return os.environ.get("VGCS_M13_TRACK_SOFTWARE_FALLBACK", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
 # FALLBACK click-time CSRT box size, used only when no object detection is
 # available under the click (detector timed out/failed, or nothing was
 # detected there). Client-requested: the tracked box should match the REAL
@@ -227,7 +253,7 @@ class M13MovingTargetTrackMixin:
         if profile is None:
             return False
         pid = str(getattr(profile, "profile_id", "") or "")
-        if pid in _M14_AI_FOLLOW_PROFILE_IDS:
+        if pid in _m14_ai_follow_profile_ids():
             return True
         cc = getattr(self, "_camera_control", None)
         return not callable(getattr(cc, "start_target_track_at_video_norm", None))
@@ -482,6 +508,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
         self._m13_track_range_mono = 0.0
+        self._m13_track_range_aged_out = False
         self._m13_track_start_mono = time.monotonic()
         self._m13_track_slr_fresh_mono = 0.0
         self._sync_m13_track_button()
@@ -489,6 +516,42 @@ class M13MovingTargetTrackMixin:
         QTimer.singleShot(0, lambda: self._update_m13_track_geo(force=True))
         self._sync_m13_track_timer()
         self._set_status("M13 tracking (software AI follow) — gimbal follow active")
+
+    def _m13_try_software_fallback(
+        self, u: float, v: float, generation: int, reason: str
+    ) -> bool:
+        """Hand a failed onboard track over to software tracking. True if taken.
+
+        This is the guarantee that turning the onboard tracker on cannot leave
+        an operator worse off than the software path that shipped before it.
+        Disable with VGCS_M13_TRACK_SOFTWARE_FALLBACK=0 to see raw onboard
+        behaviour when diagnosing.
+        """
+        if not _m13_software_fallback_enabled():
+            return False
+        if int(generation) != int(getattr(self, "_m13_track_generation", 0) or 0):
+            return False  # a newer track superseded this one
+        cc = getattr(self, "_camera_control", None)
+        # Release the camera's tracker first — it may be half-engaged, and two
+        # trackers steering one gimbal is worse than either alone.
+        stop = getattr(cc, "stop_target_track", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+        print(f"[VGCS:m13] onboard track fell back to software tracking — {reason}")
+        # _m14_start_ai_follow re-enters the start sequence, so the in-progress
+        # flag has to go back up or the next tick treats this as a finished start.
+        self._m13_track_starting = True
+        self._set_status("M13 track — following target (software tracking)")
+        try:
+            self._m14_start_ai_follow(float(u), float(v), int(generation))
+        except Exception as exc:
+            print(f"[VGCS:m13] software fallback failed to start: {exc!r}")
+            self._m13_track_starting = False
+            return False
+        return True
 
     def _on_m13_track_started(self, ok: bool, u: float, v: float, generation: int = 0) -> None:
         gen = int(generation or 0)
@@ -503,12 +566,20 @@ class M13MovingTargetTrackMixin:
             )
             return
         if not ok:
+            # The camera did not confirm it engaged. Hand off to software
+            # tracking rather than failing outright: enabling the onboard
+            # tracker must never leave the operator worse off than the software
+            # path they had before it.
+            if self._m13_try_software_fallback(
+                u, v, gen, "camera did not confirm the track engaged"
+            ):
+                return
             self._m13_track_active = False
             notify_companion_visual_track(active=False)
             self._refresh_m13_track_overlay(failed=True)
             self._set_status(
-                "M13 track failed — could not lock target on C13 "
-                "(check gimbal telemetry and C13 link)"
+                "M13 track failed — camera could not lock the target "
+                "(check gimbal telemetry and the camera link)"
             )
             self._sync_m13_track_button()
             return
@@ -516,7 +587,14 @@ class M13MovingTargetTrackMixin:
 
         self._m13_track_active = True
         self._m13_track_armed = True
-        self._m13_track_click_uv = (float(u), float(v))
+        # On a boresight-constrained camera the tracking servo holds the target
+        # on the optical centre, so the tracked pixel IS the centre — using the
+        # original click would leave every downstream geo/range calculation
+        # pointing where the operator first clicked rather than where the camera
+        # is now looking.
+        self._m13_track_click_uv = (
+            (0.5, 0.5) if self._m13_range_gate_is_constrained() else (float(u), float(v))
+        )
         self._m13_track_path = []
         self._m13_track_lat = None
         self._m13_track_lon = None
@@ -524,6 +602,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
         self._m13_track_range_mono = 0.0
+        self._m13_track_range_aged_out = False
         # C13 GOT+SUM firmware tracking has no track-box feedback at all —
         # the overlay falls back to its fixed-size bracket reticle for this path.
         self._m13_track_box_wh_norm = None
@@ -740,6 +819,15 @@ class M13MovingTargetTrackMixin:
     def _reset_m13_track_for_disconnect(self) -> None:
         self._m13_invalidate_inflight_start()
         self._m14_stop_ai_follow()
+        # Also release the camera's OWN tracker. Without this a camera left
+        # tracking keeps steering the gimbal after VGCS has torn the track down,
+        # with nothing on screen to say why it is still moving.
+        stop_track = getattr(getattr(self, "_camera_control", None), "stop_target_track", None)
+        if callable(stop_track):
+            try:
+                stop_track()
+            except Exception:
+                pass
         if bool(getattr(self, "_m14_threat_zone_reported", False)):
             self._clear_m14_threat_alert()
         self._m14_reset_threat_zone_state()
@@ -754,6 +842,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
         self._m13_track_range_mono = 0.0
+        self._m13_track_range_aged_out = False
         self._m13_track_path = []
         self._m13_track_box_wh_norm = None
         self._m14_track_init_pending_gen = None
@@ -794,10 +883,22 @@ class M13MovingTargetTrackMixin:
         cc = getattr(self, "_camera_control", None)
         active_fn = getattr(cc, "is_target_track_active", None)
         if callable(active_fn) and not bool(active_fn()):
+            # The camera gave the target up. Try software tracking from the
+            # boresight before tearing the whole track down — the operator asked
+            # to follow something, and losing the camera's lock is not by itself
+            # a reason to stop following it.
+            gen = int(getattr(self, "_m13_track_generation", 0) or 0)
+            if self._m13_try_software_fallback(
+                0.5, 0.5, gen, "camera reported the target lost"
+            ):
+                return
             self._m13_track_active = False
             self._sync_m13_track_timer()
             self._refresh_m13_track_overlay()
             self._sync_m13_track_button()
+            # Previously silent — the track just vanished from the UI with no
+            # explanation of why.
+            self._set_status("M13 track stopped — camera lost the target")
             return
         notify_companion_preview_motion(duration_s=120.0)
         ticks = int(getattr(self, "_m13_track_keepalive_ticks", 0) or 0) + 1
@@ -1394,11 +1495,23 @@ class M13MovingTargetTrackMixin:
         # who-knows-when. Keyed on _m13_track_range_mono (stamped on SUCCESS),
         # never on _m13_track_slr_fresh_mono — that one is stamped at DISPATCH,
         # so it advances on every attempt and could never detect a failing one.
-        fresh_interval = _m13_slr_fresh_interval_s()
-        if fresh_interval > 0.0 and getattr(self, "_m13_track_range_m", None) is not None:
-            got = float(getattr(self, "_m13_track_range_mono", 0.0) or 0.0)
-            if got > 0.0 and (now - got) > (3.0 * fresh_interval):
-                self._m13_track_range_m = None
+        #
+        # ONLY for backends whose laser has a boresight constraint. An earlier
+        # revision ran this for every camera and regressed C13/C12: after ~9s of
+        # failed shots their last-known range was discarded, and because neither
+        # fallback term below applies to them the marker then FROZE at its last
+        # position while still looking live — strictly worse than the shipped
+        # behaviour of re-projecting the old slant against live attitude.
+        if self._m13_range_gate_is_constrained():
+            fresh_interval = _m13_slr_fresh_interval_s()
+            if fresh_interval > 0.0 and getattr(self, "_m13_track_range_m", None) is not None:
+                got = float(getattr(self, "_m13_track_range_mono", 0.0) or 0.0)
+                if got > 0.0 and (now - got) > (3.0 * fresh_interval):
+                    self._m13_track_range_m = None
+                    # Route the recompute below into ray/DEM rather than letting
+                    # it fall through to a bare marker refresh, which would just
+                    # re-plot the stale position and recompute nothing.
+                    self._m13_track_range_aged_out = True
         last = float(getattr(self, "_m13_track_geo_mono", 0.0) or 0.0)
         if not force and (now - last) < _M13_GEO_MIN_INTERVAL_S:
             return
@@ -1406,6 +1519,22 @@ class M13MovingTargetTrackMixin:
         # Recompute from the last fetched range with LIVE gimbal attitude, so the
         # marker still updates between range shots as the gimbal follows.
         self._recompute_m13_track_geo()
+
+    def _m13_range_gate_is_constrained(self) -> bool:
+        """True only for backends whose laser is actually boresight-limited.
+
+        Everything keyed on this must leave C13/C12/SIYI provably untouched —
+        they either have a steerable laser or none at all, so a boresight gate
+        and its staleness ageing are meaningless for them and applying either
+        would change shipped behaviour.
+        """
+        try:
+            from vgcs.video.camera_control import resolve_camera_control_primary
+
+            primary = resolve_camera_control_primary(getattr(self, "_camera_control", None))
+            return callable(getattr(primary, "lrf_can_measure_video_norm", None))
+        except Exception:
+            return False
 
     def _m13_track_range_pixel_ok(self) -> bool:
         """True when the tracked pixel is somewhere this camera's laser can reach.
@@ -1469,6 +1598,19 @@ class M13MovingTargetTrackMixin:
         if not self._m13_track_is_active():
             return
         if range_m is not None:
+            # A boresight-only laser measured whatever was at frame CENTRE when
+            # the shot fired. The reply can land ~1-6s later (see
+            # _LRF_RANGE_WAIT_COLD_S), by which time the tracked target may have
+            # left the beam — accepting it then would attribute a distance
+            # belonging to different ground to the target. Re-validate for
+            # constrained backends only, so C13/C12/SIYI are untouched.
+            if self._m13_range_gate_is_constrained() and not self._m13_track_range_pixel_ok():
+                print(
+                    "[VGCS:m13] range discarded — target left the laser boresight "
+                    "while the shot was in flight"
+                )
+                self._recompute_m13_track_geo()
+                return
             try:
                 self._m13_track_range_m = float(range_m)
             except (TypeError, ValueError):
@@ -1480,6 +1622,7 @@ class M13MovingTargetTrackMixin:
                 import time
 
                 self._m13_track_range_mono = time.monotonic()
+                self._m13_track_range_aged_out = False
         self._recompute_m13_track_geo()
 
     @staticmethod
@@ -1581,8 +1724,14 @@ class M13MovingTargetTrackMixin:
             # — in both cases waiting for a range would wait forever. The
             # `ai_follow and` term is preserved: the firmware path's behaviour
             # of holding out for a real measurement is unchanged.
-            if ai_follow and (
-                not camera_has_laser_rangefinder(cc) or not self._m13_track_range_pixel_ok()
+            # The _m13_range_gate_is_constrained() term makes this reachable on
+            # the Viewpro ONBOARD path too (where ai_follow is now False) —
+            # without it, a boresight-only camera with no usable range would sit
+            # waiting for one forever instead of using the ray/DEM estimate.
+            if (ai_follow or self._m13_range_gate_is_constrained()) and (
+                not camera_has_laser_rangefinder(cc)
+                or not self._m13_track_range_pixel_ok()
+                or bool(getattr(self, "_m13_track_range_aged_out", False))
             ):
                 self._recompute_m13_track_geo_ray(ctx)
             else:

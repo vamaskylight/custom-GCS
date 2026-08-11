@@ -105,6 +105,71 @@ C1_LRF_SINGLE = 0x01
 C1_LRF_CONTINUOUS_START = 0x02
 C1_LRF_STOP = 0x05
 
+# --- E1 tracking control (3 bytes), frame CMD_E1_ONLY ---
+# byte1: bits0-2 tracking source, bits3-7 param1 | byte2: command | byte3: param2
+#
+# Framing is vendor-anchored: the doc's own literal §4.12 frames for the E2-only
+# frame ID reproduce byte-for-byte through build_serial_frame (locked in by
+# tests/test_viewpro_protocol.py). The COMMAND SEMANTICS below are from the
+# command table only — no worked example demonstrates a tracking start — which
+# is why every use of these is verified against the F1 status readback rather
+# than assumed to have worked. See DOCS/VIEWPRO-CAMERA-REFERENCE.md.
+CMD_E1_ONLY = 0x1E
+CMD_E2_ONLY = 0x2E
+
+E1_SOURCE_EO1 = 0x01
+E1_SOURCE_IR = 0x02
+E1_SOURCE_EO2 = 0x03
+
+E1_CMD_NO_ACTION = 0x00
+E1_CMD_STOP = 0x01
+E1_CMD_SEARCH = 0x02
+E1_CMD_START_TRACK = 0x03
+E1_CMD_SECONDARY_CROSSHAIR = 0x04
+E1_CMD_AI_RECOGNITION_TOGGLE = 0x05
+
+# --- E2 tracking control (5 bytes), frame CMD_E2_ONLY ---
+# byte1: command | bytes2-3: param1 | bytes4-5: param2
+E2_CMD_TRACK_OSD_ON = 0x01
+E2_CMD_TRACK_POINT = 0x0A  # params: yaw px -960..960, pitch px -540..540
+E2_CMD_TRACK_BOX_TOP_LEFT = 0x0B
+E2_CMD_TRACK_BOX_BOTTOM_RIGHT = 0x0C
+
+# The tracker's pixel space. The doc states the RANGE but never the sign
+# convention, and this integration has already been burned once by trusting a
+# Viewpro doc's sign (see ViewproCameraControl.set_gimbal_speed's pitch note).
+# Unlike a wrong laser range — which silently yields a wrong target coordinate —
+# a wrong sign here is VISIBLE: the track box lands on the wrong object and the
+# operator sees it immediately. That is why this is shipped with a runtime
+# override rather than blocked on hardware confirmation.
+E2_TRACK_PIXEL_X_MAX = 960
+E2_TRACK_PIXEL_Y_MAX = 540
+# Default sign mapping from VGCS's normalized video coords (origin top-left,
+# +x right, +y DOWN) into the tracker's pixel space. +1/+1 assumes the tracker
+# uses the same directions. Overridable at runtime — see _track_sign_x/_y in
+# adapter.py — because this is the one semantic the vendor never states, and a
+# 30-second env flip beats another field round-trip if it turns out inverted.
+_TRACK_PX_X_SIGN = 1
+_TRACK_PX_Y_SIGN = 1
+
+
+def track_point_from_norm(
+    u: float, v: float, *, x_sign: int = _TRACK_PX_X_SIGN, y_sign: int = _TRACK_PX_Y_SIGN
+) -> tuple[int, int]:
+    """Normalized video coords (0..1) -> tracker pixel offsets from frame centre.
+
+    The tracker's space is a FIXED +-960/+-540 regardless of the actual decoded
+    frame size, so this scales by 1920x1080 rather than by the caller's frame
+    dimensions. Clamped to the documented range, NOT to int16 — a value past
+    +-960 must saturate at the edge of the tracker's space, not wrap.
+    """
+    x = int(round(x_sign * (float(u) - 0.5) * 1920.0))
+    y = int(round(y_sign * (float(v) - 0.5) * 1080.0))
+    return (
+        max(-E2_TRACK_PIXEL_X_MAX, min(E2_TRACK_PIXEL_X_MAX, x)),
+        max(-E2_TRACK_PIXEL_Y_MAX, min(E2_TRACK_PIXEL_Y_MAX, y)),
+    )
+
 _T1_LEN = 22
 _F1_LEN = 1
 _B1_LEN = 6
@@ -186,6 +251,70 @@ def encode_a1(servo: int, p1: int = 0, p2: int = 0, p3: int = 0, p4: int = 0) ->
 def encode_c1(*, op: int = 0, zoom_speed: int = 0, sensor: int = 0, lrf: int = 0) -> bytes:
     value = ((lrf & 0x7) << 13) | ((op & 0x7F) << 6) | ((zoom_speed & 0x7) << 3) | (sensor & 0x7)
     return _u16(value)
+
+
+def encode_e1(*, command: int, source: int = E1_SOURCE_EO1, param1: int = 0, param2: int = 0) -> bytes:
+    """Ready-to-send TCP bytes for a standalone E1 tracking-control frame (0x1E).
+
+    Sent as its own frame rather than by parameterising the A1+C1+E1 combo: the
+    combo's E1 block stays hardcoded to "no action" so that every ordinary
+    gimbal/zoom command remains provably incapable of disturbing the tracker.
+    """
+    e1 = bytes(
+        [
+            ((int(param1) & 0x1F) << 3) | (int(source) & 0x07),
+            int(command) & 0xFF,
+            int(param2) & 0xFF,
+        ]
+    )
+    return wrap_tcp(build_serial_frame(CMD_E1_ONLY, e1))
+
+
+def encode_e2(*, command: int, param1: int = 0, param2: int = 0) -> bytes:
+    """Ready-to-send TCP bytes for a standalone E2 tracking-control frame (0x2E).
+
+    Frame construction here is vendor-anchored — the doc's own literal §4.12
+    frames reproduce byte-for-byte through this path (see
+    tests/test_viewpro_protocol.py).
+    """
+    e2 = bytes([int(command) & 0xFF]) + _i16(param1) + _i16(param2)
+    return wrap_tcp(build_serial_frame(CMD_E2_ONLY, e2))
+
+
+def encode_track_point(x_px: int, y_px: int) -> bytes:
+    """E2 "tracking point moves to command position", clamped to the doc's range.
+
+    ``x_px``/``y_px`` are offsets FROM FRAME CENTRE in the tracker's own pixel
+    space (±960 / ±540). The sign convention is not stated by the vendor — see
+    E2_TRACK_PIXEL_X_MAX — so callers should route through the adapter, which
+    applies the runtime sign override.
+    """
+    x = max(-E2_TRACK_PIXEL_X_MAX, min(E2_TRACK_PIXEL_X_MAX, int(x_px)))
+    y = max(-E2_TRACK_PIXEL_Y_MAX, min(E2_TRACK_PIXEL_Y_MAX, int(y_px)))
+    return encode_e2(command=E2_CMD_TRACK_POINT, param1=x, param2=y)
+
+
+def decode_f2(data: bytes) -> dict | None:
+    """Decode a 15-byte F2 extended tracking-status block.
+
+    Byte1 mirrors F1. Bytes8-9/10-11 are the tracking box width/height in px;
+    bytes12-13/14-15 are the azimuth/tilt pixel difference from the target —
+    i.e. a live tracking error signal, which is what VGCS needs to draw the real
+    box and geo-locate what the camera is actually tracking.
+
+    NOT reached by the current status poll: F2 is only delivered in packet
+    combinations VGCS does not request, and enabling an asynchronous stream
+    would desync the one-recv-per-request transport. Decoder provided so the
+    parsing is written and tested ahead of any decision to request it.
+    """
+    if len(data) < 15:
+        return None
+    out = dict(decode_f1(data[0]))
+    out["track_box_w"] = int.from_bytes(data[7:9], "big")
+    out["track_box_h"] = int.from_bytes(data[9:11], "big")
+    out["track_dx_px"] = int.from_bytes(data[11:13], "big", signed=True)
+    out["track_dy_px"] = int.from_bytes(data[13:15], "big", signed=True)
+    return out
 
 
 def encode_gimbal_camera_command(
@@ -297,11 +426,12 @@ TRACK_STATUS_NAMES = {
 def decode_f1(byte: int) -> dict:
     """Decode the 1-byte F1 tracking-status block.
 
-    Read-only telemetry: VGCS runs M13/M14 as GCS-side software tracking and
-    never commands this camera's onboard tracker, so a non-zero status here
-    means something ELSE started it (an RC transmitter, the vendor app, or
-    firmware doing it by itself) — which is exactly the kind of thing worth
-    seeing in a log rather than inferring later from odd gimbal behaviour.
+    This is the confirmation channel for M13's onboard-tracker path: a track
+    command is only treated as having engaged once F1 reports status 2 in a
+    sample decoded AFTER the command was sent (see
+    ViewproGimbalTcpAdapter.start_visual_track_at_norm). A status 2 that was
+    already there before we asked proves nothing — the RC transmitter or the
+    vendor app can start this tracker independently of VGCS.
 
     Bit layout is from the vendor command table only (no worked example to
     verify against), hence decode-and-log rather than anything acting on it.
