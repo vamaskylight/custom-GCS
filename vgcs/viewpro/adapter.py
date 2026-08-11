@@ -76,6 +76,37 @@ def _lrf_idle_stop_s() -> float:
         return _LRF_IDLE_STOP_S
 
 
+# --- Onboard AI tracker (M13/M14) ---
+# How long to wait for the camera to CONFIRM a track actually engaged, via a
+# fresh F1 status 2. Nothing is re-sent during the wait: camera_control.py's
+# _LRF_RANGE_WAIT_S notes a field regression where ~20 extra status requests per
+# lock correlated with the camera resetting the TCP connection, so the confirm
+# loop reads the 2 Hz poller's own decodes and issues zero extra traffic.
+_TRACK_CONFIRM_BUDGET_S = 2.5
+_TRACK_CONFIRM_POLL_S = 0.1
+# Let the point command land before the start command — E1 start carries no
+# coordinate of its own, so it tracks whatever the point was last set to.
+_TRACK_POINT_SETTLE_S = 0.08
+# Beyond this, a cached F1/servo sample says nothing about the present.
+_TRACK_STATUS_STALE_S = 3.0
+# F1 status 1 (searching) and 3 (lost) are both normal mid-reacquisition, so a
+# single non-tracking sample must not tear the track down.
+_TRACK_LOST_GRACE_S = 2.5
+
+
+def _track_sign(axis: str) -> int:
+    raw = os.environ.get(f"VGCS_VIEWPRO_TRACK_SIGN_{axis.upper()}", "").strip()
+    return -1 if raw in ("-1", "-") else 1
+
+
+def _track_sign_x() -> int:
+    return _track_sign("x")
+
+
+def _track_sign_y() -> int:
+    return _track_sign("y")
+
+
 def _post_jog_hold_enabled() -> bool:
     return os.environ.get("VGCS_VIEWPRO_POST_JOG_HOLD", "1").strip().lower() not in (
         "0",
@@ -121,6 +152,12 @@ class ViewproGimbalTcpAdapter:
         self._last_vfov_deg: float | None = None
         self._last_zoom_x: float | None = None
         self._last_tracker_status: tuple[int, int] | None = None
+        self._last_tracker_status_mono = 0.0
+        self._last_servo_mode_mono = 0.0
+        self._track_engaged = False
+        self._track_start_lock = threading.Lock()
+        self._track_lost_since_mono = 0.0
+        self._track_hold_suppress_logged = False
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -151,6 +188,12 @@ class ViewproGimbalTcpAdapter:
             self._zoom_stop_timer = None
         self._cancel_position_hold()
         self._cancel_lrf_idle_stop()
+        # Stop the tracker BEFORE closing the socket — otherwise a camera left
+        # tracking keeps driving the gimbal after VGCS has disconnected, with
+        # nothing left able to tell it to stop.
+        if self._track_engaged:
+            self._track_engaged = False
+            self._send_frame(vp.encode_e1(command=vp.E1_CMD_STOP), "track stop (shutdown)")
         self._transport.close()
 
     def get_status(self) -> GimbalStatus:
@@ -226,20 +269,186 @@ class ViewproGimbalTcpAdapter:
         self._note_tracker_status(parsed.get("track_status"), parsed.get("track_target_type"))
 
     def _note_tracker_status(self, status: object, target_type: object) -> None:
-        """Log the onboard tracker's state whenever it changes.
+        """Record the onboard tracker's state, logging only on change.
 
-        VGCS never commands this tracker, so any transition away from "stopped"
-        means something else started it. Modelled on _note_servo_mode: decoded
-        at 2 Hz, logged only on change so transitions stand out.
+        The TIMESTAMP advances on every decode, not only on transitions —
+        start_visual_track_at_norm needs to distinguish "the camera reported
+        TRACKING in a sample taken after we asked" from "it was already
+        tracking before we asked" (the RC transmitter and the vendor app can
+        both start this tracker independently). Stamping only on change would
+        make an already-tracking camera instantly 'confirm' a command that
+        never took effect. It also means a dead link stops advancing the age
+        instead of freezing a stale status as though it were current.
         """
         if status is None:
             return
+        self._last_tracker_status_mono = time.monotonic()
         sig = (int(status) & 0x03, int(target_type or 0) & 0x07)
         if sig == self._last_tracker_status:
             return
         self._last_tracker_status = sig
         name = vp.TRACK_STATUS_NAMES.get(sig[0], "unknown")
         print(f"[VGCS:viewpro] onboard tracker {name} (status={sig[0]} target_type={sig[1]})")
+
+    def _send_frame(self, pkt: bytes, what: str) -> None:
+        """Send an already-framed packet that is NOT the A1+C1+E1 combo.
+
+        Sibling of _send, which is hardwired to encode_gimbal_camera_command and
+        cannot emit a 0x1E/0x2E frame. Logged unconditionally (unlike the jog
+        path's throttled logging) because these are rare, deliberate commands
+        and their absence from a field log is itself diagnostic.
+        """
+        print(f"[VGCS:viewpro] {what}")
+        try:
+            self._transport.send(pkt)
+        except Exception as exc:
+            self._log_failure(f"{what} send", exc)
+
+    def tracker_status_age_s(self) -> float:
+        """Seconds since the last F1 decode, or a large number if never."""
+        if self._last_tracker_status_mono <= 0.0:
+            return float("inf")
+        return time.monotonic() - self._last_tracker_status_mono
+
+    def query_servo_mode(self) -> int | None:
+        return self._last_servo_mode
+
+    def start_visual_track_at_norm(self, u: float, v: float) -> bool:
+        """Start the camera's onboard tracker at a normalized video point.
+
+        **Worker-thread only** — blocks up to _TRACK_CONFIRM_BUDGET_S. Returns
+        True ONLY when the camera reports F1 status 2 in a sample decoded after
+        the start command went out. That is a strictly stronger contract than
+        the Skydroid equivalent, which returns True whenever the send did not
+        raise; here a send that the firmware ignores must not look like success,
+        because the caller uses False to fall back to software tracking.
+
+        Self-cleaning: on timeout it sends an explicit E1 stop, so a command the
+        firmware half-accepted cannot leave the camera tracking something the
+        operator did not ask for.
+        """
+        if not self._track_start_lock.acquire(blocking=False):
+            return False
+        try:
+            # The camera is about to drive the gimbal; our own position hold
+            # would fight it. Cancelled BEFORE any send so a hold already in
+            # flight cannot land mid-engagement.
+            self._cancel_position_hold()
+            self._track_engaged = True
+            self._track_lost_since_mono = 0.0
+            self._track_hold_suppress_logged = False
+            x_px, y_px = vp.track_point_from_norm(
+                u, v, x_sign=_track_sign_x(), y_sign=_track_sign_y()
+            )
+            self._send_frame(
+                vp.encode_track_point(x_px, y_px),
+                f"track point -> ({x_px:+d},{y_px:+d}) px from centre (u={u:.3f} v={v:.3f})",
+            )
+            time.sleep(_TRACK_POINT_SETTLE_S)
+            sent_mono = time.monotonic()
+            self._send_frame(vp.encode_e1(command=vp.E1_CMD_START_TRACK), "track start")
+            deadline = sent_mono + _TRACK_CONFIRM_BUDGET_S
+            while time.monotonic() < deadline:
+                time.sleep(_TRACK_CONFIRM_POLL_S)
+                if self._last_tracker_status_mono < sent_mono:
+                    continue  # only samples decoded AFTER we asked can confirm
+                status = (self._last_tracker_status or (0, 0))[0]
+                if status == 2:
+                    servo = self._last_servo_mode
+                    print(
+                        f"[VGCS:viewpro] onboard track ENGAGED (F1 status=2, "
+                        f"servo mode=0x{servo:02X})" if servo is not None
+                        else "[VGCS:viewpro] onboard track ENGAGED (F1 status=2)"
+                    )
+                    return True
+            last = self._last_tracker_status
+            age = self.tracker_status_age_s()
+            print(
+                f"[VGCS:viewpro] onboard track did NOT engage within "
+                f"{_TRACK_CONFIRM_BUDGET_S:.1f}s (last F1={last}, age={age:.1f}s) — "
+                "stopping it and falling back to software tracking"
+            )
+            self._track_engaged = False
+            self._send_frame(vp.encode_e1(command=vp.E1_CMD_STOP), "track stop (start failed)")
+            return False
+        except Exception as exc:
+            self._track_engaged = False
+            self._log_failure("track start", exc)
+            return False
+        finally:
+            self._track_start_lock.release()
+
+    def stop_visual_track(self) -> None:
+        """Stop the onboard tracker and re-pin the gimbal.
+
+        Order matters: the engaged flag is cleared FIRST so that
+        _apply_position_hold's suppression check does not swallow the very hold
+        that re-pins the gimbal — otherwise stopping a track would leave it in a
+        rate mode with no position lock, reintroducing the idle-drift bug
+        through a new door.
+        """
+        was = self._track_engaged
+        self._track_engaged = False
+        self._track_lost_since_mono = 0.0
+        if was:
+            self._send_frame(vp.encode_e1(command=vp.E1_CMD_STOP), "track stop")
+        self._apply_position_hold()
+
+    def is_visual_track_active(self) -> bool:
+        """Whether the camera is still tracking, with a grace period.
+
+        F1 status 1 (searching) and 3 (lost) are both normal while the tracker
+        reacquires, and the caller's check is an undebounced single-sample kill
+        switch — so a momentary non-2 must not tear the track down. A stale
+        status means we simply do not know, which is reported as not-active.
+        """
+        if not self._track_engaged:
+            return False
+        if self.tracker_status_age_s() > _TRACK_STATUS_STALE_S:
+            return False
+        status = (self._last_tracker_status or (0, 0))[0]
+        if status == 2:
+            self._track_lost_since_mono = 0.0
+            return True
+        now = time.monotonic()
+        if self._track_lost_since_mono <= 0.0:
+            self._track_lost_since_mono = now
+            return True
+        return (now - self._track_lost_since_mono) < _TRACK_LOST_GRACE_S
+
+    def track_start_in_progress(self) -> bool:
+        return self._track_start_lock.locked()
+
+    def _release_track_for_operator_move(self) -> None:
+        """Hand the gimbal back when the operator aims it themselves.
+
+        An operator jogging, centring or pointing the gimbal is an unambiguous
+        instruction that they are aiming now — leaving the camera's tracker
+        engaged would have the two fighting for the same axes. Cheap no-op when
+        no track is running, so every operator-move entry point can call it
+        unconditionally.
+
+        Deliberately does NOT go through stop_visual_track(): that applies a
+        position hold, which is exactly what the move about to happen does not
+        want.
+        """
+        if not self._track_engaged:
+            return
+        self._track_engaged = False
+        self._track_lost_since_mono = 0.0
+        self._send_frame(
+            vp.encode_e1(command=vp.E1_CMD_STOP), "track stop (operator took manual control)"
+        )
+
+    def _camera_owns_gimbal(self) -> bool:
+        """True when the CAMERA is driving the gimbal, so we must not."""
+        if self._track_engaged:
+            return True
+        if self._last_servo_mode == 0x06:
+            return self._last_servo_mode_mono > 0.0 and (
+                time.monotonic() - self._last_servo_mode_mono
+            ) <= _TRACK_STATUS_STALE_S
+        return False
 
     def query_tracker_status(self) -> tuple[int, int] | None:
         """(track_status, track_target_type) as last reported, or None."""
@@ -258,6 +467,10 @@ class ViewproGimbalTcpAdapter:
         """
         if status is None:
             return
+        # Stamped every decode, not only on change — see _note_tracker_status.
+        # Servo mode 0x06 (TRACKING) corroborates the F1 confirm, and a stale
+        # 0x06 must not be mistaken for the camera currently owning the gimbal.
+        self._last_servo_mode_mono = time.monotonic()
         mode = int(status) & 0x0F
         if mode == self._last_servo_mode:
             return
@@ -319,7 +532,10 @@ class ViewproGimbalTcpAdapter:
     # ---- Gimbal servo (A1) ----
 
     def ptz(self, action: str) -> None:
-        """Any operator-driven move supersedes a pending post-jog hold.
+        """Any operator-driven move supersedes a pending post-jog hold, and
+        releases the onboard tracker — the operator taking manual control is an
+        unambiguous instruction that they, not the camera, are now aiming.
+
 
         Pitch sign fixed 2026-07-30 from a field test of the equivalent
         SERVO_MANUAL_SPEED path in ViewproCameraControl.set_gimbal_speed: raw
@@ -329,6 +545,7 @@ class ViewproGimbalTcpAdapter:
         action_l = str(action or "").strip().lower()
         raw = vp.speed_dps_to_raw(_DEFAULT_SLEW_DPS)
         self._cancel_position_hold()
+        self._release_track_for_operator_move()
         if action_l in ("up", "pitch_up"):
             self._send(servo=vp.SERVO_MANUAL_SPEED, servo_p2=raw)
         elif action_l in ("down", "pitch_down"):
@@ -347,6 +564,7 @@ class ViewproGimbalTcpAdapter:
         """Absolute angle, home position as 0 (servo 0x0B) — a single one-shot
         "turn to" command, not for continuous/high-frequency sends (doc's
         own caveat on this servo mode)."""
+        self._release_track_for_operator_move()
         self._cancel_position_hold()
         self._send(
             servo=vp.SERVO_MANUAL_ABSOLUTE_ANGLE,
@@ -355,6 +573,7 @@ class ViewproGimbalTcpAdapter:
         )
 
     def set_rotation_speed(self, yaw: float, pitch: float) -> None:
+        self._release_track_for_operator_move()
         self._cancel_position_hold()
         yaw_raw = vp.speed_dps_to_raw(yaw)
         pitch_raw = vp.speed_dps_to_raw(pitch)
@@ -377,6 +596,8 @@ class ViewproGimbalTcpAdapter:
     def _schedule_position_hold(self) -> None:
         if not _post_jog_hold_enabled():
             return
+        if self._camera_owns_gimbal():
+            return
         self._cancel_position_hold()
         timer = threading.Timer(_POST_JOG_HOLD_DELAY_S, self._apply_position_hold)
         timer.daemon = True
@@ -391,13 +612,23 @@ class ViewproGimbalTcpAdapter:
         gimbal, only give it something to hold onto.
         """
         self._position_hold_timer = None
+        # Re-checked AT FIRE TIME, not just at schedule time: a track can engage
+        # during the 0.35s delay, and a hold landing then would yank the gimbal
+        # off the target the camera is steering toward.
+        if self._camera_owns_gimbal():
+            if not self._track_hold_suppress_logged:
+                self._track_hold_suppress_logged = True
+                print("[VGCS:viewpro] position hold suppressed — camera owns the gimbal")
+            return
         self._send(servo=vp.SERVO_MANUAL_RELATIVE_ANGLE)
 
     def center(self) -> None:
+        self._release_track_for_operator_move()
         self._cancel_position_hold()
         self._send(servo=vp.SERVO_HOME_POSITION)
 
     def look_down(self) -> None:
+        self._release_track_for_operator_move()
         self._cancel_position_hold()
         self._send(servo=vp.SERVO_LOOK_DOWN)
 

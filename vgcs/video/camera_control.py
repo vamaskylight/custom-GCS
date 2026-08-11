@@ -1368,20 +1368,47 @@ class ViewproCameraControl:
         except Exception:
             return
 
-    def stop_target_track(self) -> None:
-        """Explicit no-op — there is no firmware track to stop.
+    def start_target_track_at_video_norm(
+        self,
+        u: float,
+        v: float,
+        *,
+        frame_w: int = 1280,
+        frame_h: int = 720,
+    ) -> bool:
+        """Start the camera's ONBOARD AI tracker at a normalized video point.
 
-        VGCS never drives this camera's onboard tracker (protocol.py hardcodes
-        the E1 tracking block to three zero bytes = "no action"), so M13 runs
-        entirely as GCS-side software follow. Teardown is handled by
-        ``_m14_stop_ai_follow``, which already commands set_gimbal_speed(0, 0).
+        Returns True only once the camera confirms it engaged (see the adapter);
+        a False return is the caller's cue to fall back to software tracking.
 
-        Defined rather than left absent on purpose: ``_stop_m13_track`` reaches
-        this through a getattr guard, where a missing attribute is
-        indistinguishable from an oversight. This says "nothing to do, and that
-        is intended".
+        ``frame_w``/``frame_h`` are accepted for interface parity and ignored:
+        the tracker's coordinate space is a fixed ±960/±540 regardless of the
+        decoded frame size, so the caller's nominal dimensions are irrelevant.
         """
-        return
+        del frame_w, frame_h
+        try:
+            return bool(self._adapter.start_visual_track_at_norm(float(u), float(v)))
+        except Exception:
+            return False
+
+    def is_target_track_active(self) -> bool:
+        try:
+            return bool(self._adapter.is_visual_track_active())
+        except Exception:
+            return False
+
+    def is_m13_track_start_in_progress(self) -> bool:
+        try:
+            return bool(self._adapter.track_start_in_progress())
+        except Exception:
+            return False
+
+    def stop_target_track(self) -> None:
+        """Stop the onboard tracker and re-pin the gimbal."""
+        try:
+            self._adapter.stop_visual_track()
+        except Exception:
+            return
 
     def _lrf_pick_offset_px(
         self, u: float, v: float, frame_w: object, frame_h: object
@@ -1414,19 +1441,46 @@ class ViewproCameraControl:
         tolerance_px = self._LRF_BORESIGHT_TOLERANCE_NORM * fw
         return offset_px, tolerance_px, du_px, dv_px
 
+    # Tolerance for the AUTOMATIC M13 range gate — deliberately much tighter
+    # than _LRF_BORESIGHT_TOLERANCE_NORM (0.12), which is operator-click slop
+    # for a human aiming a crosshair by hand and works out to roughly 8 degrees
+    # at this lens's wide end. That is far too loose to assert "the laser hit
+    # the tracked object": at 0.12 the beam could be measuring something
+    # metres away from the target and M13 would label the distance as the
+    # target's. A tracking loop holds its subject to a few thousandths of
+    # centre, so this only has to absorb tracking jitter.
+    # NOT field-calibrated against the real beam divergence — tune with
+    # VGCS_VIEWPRO_M13_RANGE_TOLERANCE_NORM once measured on hardware.
+    _M13_RANGE_TOLERANCE_NORM = 0.02
+
+    def _m13_range_tolerance_norm(self) -> float:
+        raw = os.environ.get("VGCS_VIEWPRO_M13_RANGE_TOLERANCE_NORM", "").strip()
+        if raw:
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pass
+        return float(self._M13_RANGE_TOLERANCE_NORM)
+
     def lrf_can_measure_video_norm(
         self, u: float, v: float, *, frame_w: int = 1280, frame_h: int = 720
     ) -> bool:
-        """True when a pick at (u, v) is close enough to boresight to be ranged.
+        """True when (u, v) is close enough to boresight for an AUTOMATIC shot.
 
-        Same rule ``lock_lrf_at_video_norm`` enforces, exposed so M13 can ask
-        BEFORE firing rather than discovering it from a declined shot. Silent
-        (no logging) — the follow loop asks this every tick.
+        Shares ``lock_lrf_at_video_norm``'s aspect-corrected geometry but NOT
+        its tolerance — see _M13_RANGE_TOLERANCE_NORM for why the automatic
+        gate must be far tighter than the operator-click one. Silent (no
+        logging): the follow loop asks this every tick.
         """
         measured = self._lrf_pick_offset_px(u, v, frame_w, frame_h)
         if measured is None:
             return False
-        return measured[0] <= measured[1]
+        offset_px, _click_tol_px, _du, _dv = measured
+        try:
+            fw = max(1.0, float(frame_w))
+        except (TypeError, ValueError):
+            fw = 1280.0
+        return offset_px <= (self._m13_range_tolerance_norm() * fw)
 
     def lrf_boresight_tolerance_norm(self) -> float:
         """How far off frame centre a pick may be and still be measured.
