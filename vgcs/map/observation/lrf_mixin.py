@@ -497,10 +497,11 @@ class LrfVideoLockMixin:
                 QTimer.singleShot(0, self._layout_native_hud)
         except Exception:
             pass
-        try:
-            self.enable_m13_track_ui(bool(enabled))
-        except Exception:
-            pass
+        # The M13 Track button is NOT driven from here any more. It is owned
+        # solely by set_camera_control -> supports_m13_track. This 2 Hz LRF
+        # display path used to also toggle it, which meant the button's state
+        # depended on whichever path ran last — and let a display refresh call
+        # _reset_m13_track_for_disconnect() on a live track.
 
     def _c13_lrf_is_locked(self) -> bool:
         cc = getattr(self, "_camera_control", None)

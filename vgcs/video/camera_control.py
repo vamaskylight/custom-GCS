@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -707,6 +708,45 @@ class SiyiCameraProfile:
     frame_specs_confirmed: bool = False
 
 
+@dataclass(frozen=True)
+class ViewproCameraProfile:
+    """Frame size + lens FOV for M13/M14's pixel<->angle aim math, Viewpro side.
+
+    **The values below are the COLD-START FALLBACK ONLY.** Unlike the C13 (fixed
+    lens) and the ZR10 (fixed profile that is only correct at 1x), this camera
+    reports its true current FOV in every D1 status block, so
+    ``ViewproCameraControl.active_camera_profile()`` rebuilds this dataclass from
+    the live values on every call and these defaults are used only until the
+    first status frame lands. That is what ``fov_is_live`` distinguishes.
+
+    Provenance of the fallback numbers, weakest first:
+    - ``fov_h_deg = 70.2`` is the field-observed reading from the camera's OWN
+      on-screen display at 1.00x zoom (the same observation already cited in
+      ``camera_reported_fov_deg``'s docstring), not a vendor spec.
+    - ``fov_v_deg = 43.1`` is *derived* from it assuming a 16:9 sensor:
+      2*atan(tan(35.1 deg) * 9/16) = 43.14 deg. That is a weaker derivation than
+      ``SiyiCameraProfile``'s, which at least combines two vendor-stated numbers.
+    - ``frame_w``/``frame_h`` are carried for contract parity with the other two
+      profiles only; nothing in the M13/M14 runtime path reads them from here,
+      and 1920x1080 is UNVERIFIED for this model.
+
+    ``frame_specs_confirmed`` means something DIFFERENT here than on the other
+    two profiles: it is True when the numbers came from the camera itself rather
+    than from these defaults. ``fov_is_live`` exists so that distinction stays
+    explicit rather than being inferred from a flag whose meaning shifted.
+    """
+
+    profile_id: str = "viewpro_default"
+    frame_w: int = 1920
+    frame_h: int = 1080
+    fov_h_deg: float = 70.2
+    fov_v_deg: float = 43.1
+    frame_specs_confirmed: bool = False
+    # Viewpro-only, no counterpart on the other profiles.
+    zoom_x: float | None = None
+    fov_is_live: bool = False
+
+
 class SiyiCameraControl:
     """SIYI Gimbal SDK over UDP (ZR10 / ZT6 / A8 mini — port 37260)."""
 
@@ -1094,6 +1134,72 @@ class ViewproCameraControl:
         except Exception:
             return None
 
+    def active_camera_profile(self) -> ViewproCameraProfile:
+        """Frame/FOV profile for M13's aim math and M14's follow loop.
+
+        **Rebuilt on every call, deliberately.** ``SiyiCameraControl`` snapshots
+        its profile once in ``__init__`` because the ZR10 profile is a static
+        vendor spec; doing that here would go stale the instant the operator
+        zooms, while still passing any naive ``profile_id`` test.
+        ``SkydroidCameraControl.active_camera_profile`` sets the precedent for a
+        dynamic accessor — it returns the adapter's currently-live profile.
+
+        Cost is two cached float reads plus a dataclass construction: no I/O and
+        no lock, which matters because the follow loop calls this every dispatch.
+
+        Goes through the module-level ``camera_reported_fov_deg`` rather than
+        ``self._adapter.query_fov_deg()`` because that helper is the single place
+        the 0 < fov < 180 sanity check lives — a zero FOV would divide the
+        pixel->angle math into nonsense. Never raises: on any failure the caller
+        gets the static fallback, which is wrong-but-sane, rather than an
+        exception on the follow path.
+        """
+        try:
+            live = camera_reported_fov_deg(self)
+        except Exception:
+            live = None
+        if live is None:
+            return ViewproCameraProfile()
+        try:
+            zoom = self.reported_zoom_x()
+        except Exception:
+            zoom = None
+        hfov, vfov = float(live[0]), float(live[1])
+        self._log_optics_once(hfov, vfov, zoom)
+        return ViewproCameraProfile(
+            fov_h_deg=hfov,
+            fov_v_deg=vfov,
+            zoom_x=zoom,
+            frame_specs_confirmed=True,
+            fov_is_live=True,
+        )
+
+    def _log_optics_once(self, hfov: float, vfov: float, zoom: float | None) -> None:
+        """Log the optics triple whenever it changes.
+
+        The "implied wide hfov" is the point of this line. hfov and zoom_x come
+        from the same D1 block, so if our decode of both is right then
+        ``2*atan(tan(hfov/2) * zoom)`` should stay ~constant near the lens's true
+        wide-end FOV across every zoom level. That makes a single field session
+        enough to confirm the assumption this whole feature rests on — instead of
+        discovering a bad decode later as a follow loop that mis-steers.
+        """
+        sig = (round(hfov, 2), round(vfov, 2), None if zoom is None else round(zoom, 2))
+        if sig == getattr(self, "_last_logged_optics", None):
+            return
+        self._last_logged_optics = sig
+        implied = ""
+        if zoom is not None and zoom > 0.0 and 0.0 < hfov < 180.0:
+            try:
+                wide = 2.0 * math.degrees(math.atan(math.tan(math.radians(hfov / 2.0)) * zoom))
+                implied = f" (implied wide hfov={wide:.1f})"
+            except (ValueError, OverflowError):
+                implied = ""
+        zoom_txt = "?" if zoom is None else f"{zoom:.1f}"
+        print(
+            f"[VGCS:viewpro] optics zoom={zoom_txt}x hfov={hfov:.1f} vfov={vfov:.1f}{implied}"
+        )
+
     def get_laser_range_m(self) -> float | None:
         try:
             return self._adapter.query_range_m()
@@ -1102,6 +1208,39 @@ class ViewproCameraControl:
 
     def poll_live_laser_range_m(self) -> float | None:
         return self.get_laser_range_m()
+
+    def query_slr_distance_m(self, *, fresh: bool = True) -> float | None:
+        """Slant range for M13's tracked target.
+
+        **Worker-thread only.** ``fresh=True`` blocks up to
+        ``_LRF_RANGE_WAIT_COLD_S`` (6.0s cold) / ``_LRF_RANGE_WAIT_S`` (3.0s
+        warm) waiting for a genuinely new measurement, so it must never run on
+        the GUI thread — M13 calls it from ``M13RangeTask`` on a QThreadPool
+        worker, which is why this is safe there.
+
+        Adds exactly two commands per shot (session begin + end), reusing the
+        warm-laser session so a track that ranges repeatedly does not pay the
+        cold-start cost every tick. The laser is left running only if the
+        operator had already armed it — a track shot must not silently take
+        ownership of an emitter the operator did not switch on.
+
+        ``fresh=False`` returns the cached value and sends nothing.
+        """
+        if not fresh:
+            return self.get_laser_range_m()
+        was_armed = self.is_lrf_armed()
+        try:
+            already_streaming = bool(self._adapter.laser_range_begin_session())
+        except Exception:
+            return None
+        try:
+            return self._wait_for_fresh_range(cold_start=not already_streaming)
+        finally:
+            if not was_armed:
+                try:
+                    self._adapter.laser_range_end_session()
+                except Exception:
+                    pass
 
     def set_lrf_armed(self, armed: bool) -> None:
         try:
@@ -1156,30 +1295,11 @@ class ViewproCameraControl:
         # wrapping — a full explanation there renders an oversized box over the
         # video. The full explanation goes to the console print below instead.
         self._lrf_lock_error = ""
-        try:
-            du = float(u) - 0.5
-            dv = float(v) - 0.5
-        except (TypeError, ValueError):
+        measured = self._lrf_pick_offset_px(u, v, frame_w, frame_h)
+        if measured is None:
             self._lrf_lock_error = "Invalid pick"
             return None
-        # Video is 16:9, not square — comparing raw normalized (0..1) du/dv treats
-        # a pixel offset below the crosshair as ~1.78x "further" than the same
-        # pixel offset beside it (720 tall vs 1280 wide, e.g.), so a click that
-        # looks dead-centre to the eye can fail here purely from being a bit
-        # vertically off. Field report 2026-08-03: an operator's click that
-        # looked accurate still declined at 0.27 off (worse than three earlier,
-        # less careful attempts) — this is why. Scale into real pixels using the
-        # actual frame dimensions before comparing, so the tolerance is round in
-        # screen space, matching what the crosshair actually looks like on screen.
-        try:
-            fw = max(1.0, float(frame_w))
-            fh = max(1.0, float(frame_h))
-        except (TypeError, ValueError):
-            fw, fh = 1280.0, 720.0
-        du_px = du * fw
-        dv_px = dv * fh
-        offset_px = (du_px * du_px + dv_px * dv_px) ** 0.5
-        tolerance_px = self._LRF_BORESIGHT_TOLERANCE_NORM * fw
+        offset_px, tolerance_px, du_px, dv_px = measured
         if offset_px > tolerance_px:
             self._lrf_lock_error = "Aim gimbal so target is under crosshair, then click"
             print(
@@ -1248,6 +1368,75 @@ class ViewproCameraControl:
         except Exception:
             return
 
+    def stop_target_track(self) -> None:
+        """Explicit no-op — there is no firmware track to stop.
+
+        VGCS never drives this camera's onboard tracker (protocol.py hardcodes
+        the E1 tracking block to three zero bytes = "no action"), so M13 runs
+        entirely as GCS-side software follow. Teardown is handled by
+        ``_m14_stop_ai_follow``, which already commands set_gimbal_speed(0, 0).
+
+        Defined rather than left absent on purpose: ``_stop_m13_track`` reaches
+        this through a getattr guard, where a missing attribute is
+        indistinguishable from an oversight. This says "nothing to do, and that
+        is intended".
+        """
+        return
+
+    def _lrf_pick_offset_px(
+        self, u: float, v: float, frame_w: object, frame_h: object
+    ) -> tuple[float, float, float, float] | None:
+        """(offset_px, tolerance_px, du_px, dv_px) for a pick, or None if invalid.
+
+        ONE definition of this calculation, deliberately — it encodes a
+        field-learned lesson and must not be duplicated. Video is 16:9, not
+        square, so comparing raw normalized (0..1) du/dv treats a pixel offset
+        BELOW the crosshair as ~1.78x "further" than the same pixel offset
+        beside it (720 tall vs 1280 wide). Field report 2026-08-03: an
+        operator's click that looked accurate still declined at 0.27 "off"
+        while three sloppier ones passed — that asymmetry was why. Scaling into
+        real pixels first makes the tolerance round in screen space, matching
+        what the crosshair actually looks like to the operator.
+        """
+        try:
+            du = float(u) - 0.5
+            dv = float(v) - 0.5
+        except (TypeError, ValueError):
+            return None
+        try:
+            fw = max(1.0, float(frame_w))
+            fh = max(1.0, float(frame_h))
+        except (TypeError, ValueError):
+            fw, fh = 1280.0, 720.0
+        du_px = du * fw
+        dv_px = dv * fh
+        offset_px = (du_px * du_px + dv_px * dv_px) ** 0.5
+        tolerance_px = self._LRF_BORESIGHT_TOLERANCE_NORM * fw
+        return offset_px, tolerance_px, du_px, dv_px
+
+    def lrf_can_measure_video_norm(
+        self, u: float, v: float, *, frame_w: int = 1280, frame_h: int = 720
+    ) -> bool:
+        """True when a pick at (u, v) is close enough to boresight to be ranged.
+
+        Same rule ``lock_lrf_at_video_norm`` enforces, exposed so M13 can ask
+        BEFORE firing rather than discovering it from a declined shot. Silent
+        (no logging) — the follow loop asks this every tick.
+        """
+        measured = self._lrf_pick_offset_px(u, v, frame_w, frame_h)
+        if measured is None:
+            return False
+        return measured[0] <= measured[1]
+
+    def lrf_boresight_tolerance_norm(self) -> float:
+        """How far off frame centre a pick may be and still be measured.
+
+        Exposed so the M13 range gate stays capability-shaped instead of
+        vendor-testing, leaving backends without a boresight constraint
+        provably untouched.
+        """
+        return float(self._LRF_BORESIGHT_TOLERANCE_NORM)
+
     def send_raw_command(self, payload: bytes) -> bytes:
         """Debug/integration escape hatch — see class docstring."""
         return self._adapter.send_raw_command(payload)
@@ -1280,6 +1469,25 @@ def uses_viewpro_camera(control: object | None) -> bool:
     ``NativeVideoOverlayLayer``.
     """
     return isinstance(resolve_camera_control_primary(control), ViewproCameraControl)
+
+
+def camera_lrf_can_measure_video_norm(
+    control: object | None, u: float, v: float, *, frame_w: int = 1280, frame_h: int = 720
+) -> bool:
+    """Whether this backend's laser can actually measure the point at (u, v).
+
+    Only cameras whose laser is constrained to boresight implement
+    ``lrf_can_measure_video_norm``; everything else (the C13's steerable laser,
+    any backend with no such limit) returns True here and is provably
+    untouched by the M13 range gate.
+    """
+    fn = getattr(resolve_camera_control_primary(control), "lrf_can_measure_video_norm", None)
+    if not callable(fn):
+        return True
+    try:
+        return bool(fn(float(u), float(v), frame_w=int(frame_w), frame_h=int(frame_h)))
+    except Exception:
+        return True
 
 
 def camera_reported_fov_deg(control: object | None) -> tuple[float, float] | None:
@@ -1333,12 +1541,35 @@ def camera_reports_payload_gimbal_attitude(control: object | None) -> bool:
 
 
 def supports_m13_track(control: object | None) -> bool:
-    """Cameras M13 click-to-track can arm on: Skydroid TOP (firmware GOT+SUM,
-    or C12's software AI-follow) and SIYI SDK (always software AI-follow —
-    the SIYI SDK has no onboard track/GOT command to fall back to; see
-    DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md)."""
+    """Cameras M13 click-to-track can arm on.
+
+    M13 needs three things from a backend, and this checks for exactly those
+    rather than naming vendors:
+      1. real payload-gimbal attitude — not the MAVLink mount fallback, whose
+         angles do not describe where the camera is actually looking;
+      2. a rate command (``set_gimbal_speed``) for the follow loop to actuate;
+      3. a profile stating the lens FOV (``active_camera_profile``), without
+         which the pixel<->angle math silently inherits another camera's lens.
+
+    The attitude whitelist is the FIRST conjunct on purpose. Probing for
+    capabilities alone would grant M13 to any test double — ``MagicMock``
+    auto-creates every attribute, so all three probes would succeed — and to
+    unknown future backends. Same conservative stance
+    ``camera_reports_payload_gimbal_attitude`` documents: falling back is
+    harmless, wrongly claiming the capability is not.
+
+    Currently true for Skydroid TOP (firmware GOT+SUM, or C12's software
+    AI-follow), SIYI SDK and Viewpro (both always software AI-follow — neither
+    has an onboard track command this project drives).
+    """
     primary = resolve_camera_control_primary(control)
-    return isinstance(primary, (SkydroidCameraControl, SiyiCameraControl))
+    if primary is None:
+        return False
+    if not camera_reports_payload_gimbal_attitude(primary):
+        return False
+    return callable(getattr(primary, "set_gimbal_speed", None)) and callable(
+        getattr(primary, "active_camera_profile", None)
+    )
 
 
 def camera_has_laser_rangefinder(control: object | None) -> bool:

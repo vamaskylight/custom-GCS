@@ -21,18 +21,32 @@ from vgcs.map.video.frame_convert import qimage_to_bgr_array
 from vgcs.observe.geo_reference import compute_geo_reference, compute_lrf_slant_geo
 from vgcs.observe.object_detector import VisualObjectDetector
 from vgcs.observe.visual_object_tracker import TrackBox, VisualObjectTracker, bbox_around_point
-from vgcs.video.camera_control import camera_has_laser_rangefinder, supports_m13_track
+from vgcs.video.camera_control import (
+    camera_has_laser_rangefinder,
+    camera_lrf_can_measure_video_norm,
+    supports_m13_track,
+)
 from vgcs.video.pipeline import (
     notify_companion_preview_motion,
     notify_companion_visual_track,
 )
 
-# Cameras where GOT/SUM has no confirmed continuous-follow capability (or,
-# for C12, is simply not yet wired through — see DOCS/SKYDROID-TOP-PROTOCOL.md),
-# or where there is no firmware GOT+SUM equivalent at all (SIYI SDK — see
-# DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md), so M13 tracks the target itself in
-# software instead of trusting firmware.
-_M14_AI_FOLLOW_PROFILE_IDS = {"c12_default", "zr10_default"}
+# Cameras where M13 tracks the target itself in software rather than handing
+# the job to the camera's firmware. Reasons differ per camera:
+#  - c12_default: GOT/SUM continuous follow is simply not wired through yet
+#    (see DOCS/SKYDROID-TOP-PROTOCOL.md).
+#  - zr10_default: the SIYI SDK has no firmware track command at all
+#    (see DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md).
+#  - viewpro_default: the camera DOES have an onboard AI tracker (E1/E2
+#    packets), but this project deliberately does not drive it — the whole
+#    command path is vendor-table-only with no worked example, its pixel space
+#    (+-960/+-540) has an unstated sign convention, and this integration has
+#    already been burned once by trusting a Viewpro doc's sign (see the pitch
+#    note in ViewproCameraControl.set_gimbal_speed). Its transport is also
+#    one-recv-per-request fire-and-forget, which cannot honestly satisfy the
+#    `-> bool` "did the track start" contract the firmware path expects.
+#    See DOCS/VIEWPRO-CAMERA-REFERENCE.md for the full deferral rationale.
+_M14_AI_FOLLOW_PROFILE_IDS = {"c12_default", "zr10_default", "viewpro_default"}
 # FALLBACK click-time CSRT box size, used only when no object detection is
 # available under the click (detector timed out/failed, or nothing was
 # detected there). Client-requested: the tracked box should match the REAL
@@ -177,7 +191,9 @@ _M13_SLEW_UNCERTAIN_DEG = 1.0
 
 
 class M13MovingTargetTrackMixin:
-    """Click-to-track on Skydroid C13/C12 or SIYI ZR10 video; map coords from
+    """Click-to-track on any camera whose backend reports payload-gimbal
+    attitude and a lens FOV (see supports_m13_track) — currently Skydroid
+    C13/C12, SIYI ZR10 and Viewpro. Map coords from
     GPS + gimbal + (Skydroid SLR range, or ray/DEM ground intersection when
     the camera has no rangefinder — see camera_has_laser_rangefinder)."""
 
@@ -198,10 +214,23 @@ class M13MovingTargetTrackMixin:
         """True when the connected camera has no confirmed continuous-follow
         capability of its own (see DOCS/SKYDROID-TOP-PROTOCOL.md) — M13 then
         tracks the target in software (vgcs/observe/visual_object_tracker.py)
-        and drives the gimbal itself instead of sending GOT+SUM and hoping."""
+        and drives the gimbal itself instead of sending GOT+SUM and hoping.
+
+        A backend with no profile at all still returns False (the firmware
+        path), unchanged. But a backend that HAS a profile whose id is not in
+        the set, and which does not implement the firmware start command, also
+        gets software follow: the old membership-only test failed OPEN, routing
+        such a camera into a firmware path it cannot execute and surfacing a
+        C13-worded error to the operator.
+        """
         profile = self._m14_active_profile()
+        if profile is None:
+            return False
         pid = str(getattr(profile, "profile_id", "") or "")
-        return pid in _M14_AI_FOLLOW_PROFILE_IDS
+        if pid in _M14_AI_FOLLOW_PROFILE_IDS:
+            return True
+        cc = getattr(self, "_camera_control", None)
+        return not callable(getattr(cc, "start_target_track_at_video_norm", None))
 
     def _m14_ai_follow_active(self) -> bool:
         return bool(getattr(self, "_m14_tracker_active", False))
@@ -215,7 +244,10 @@ class M13MovingTargetTrackMixin:
     def _set_m13_track_armed(self, armed: bool) -> None:
         on = bool(armed)
         if on and not self._m13_track_supported():
-            self._set_status("M13 track needs Skydroid C13/C12 or SIYI ZR10 camera control")
+            self._set_status(
+                "M13 track needs a camera with gimbal control — "
+                "Skydroid C13/C12, SIYI ZR10 or Viewpro"
+            )
             btn = getattr(self, "_btn_native_m13_track", None)
             if btn is not None:
                 btn.blockSignals(True)
@@ -252,7 +284,9 @@ class M13MovingTargetTrackMixin:
 
     def _begin_m13_video_track(self, u: float, v: float) -> None:
         if not self._m13_track_supported():
-            self._set_status("M13 track unavailable — connect Skydroid C13/C12 or SIYI ZR10")
+            self._set_status(
+                "M13 track unavailable — connect Skydroid C13/C12, SIYI ZR10 or Viewpro"
+            )
             return
         if bool(getattr(self, "_lrf_lock_in_progress", False)):
             self._set_status("Wait for LRF lock to finish before starting track")
@@ -447,6 +481,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_alt_m = None
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
+        self._m13_track_range_mono = 0.0
         self._m13_track_start_mono = time.monotonic()
         self._m13_track_slr_fresh_mono = 0.0
         self._sync_m13_track_button()
@@ -488,6 +523,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_alt_m = None
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
+        self._m13_track_range_mono = 0.0
         # C13 GOT+SUM firmware tracking has no track-box feedback at all —
         # the overlay falls back to its fixed-size bracket reticle for this path.
         self._m13_track_box_wh_norm = None
@@ -717,6 +753,7 @@ class M13MovingTargetTrackMixin:
         self._m13_track_alt_m = None
         self._m13_track_geo_label = ""
         self._m13_track_range_m = None
+        self._m13_track_range_mono = 0.0
         self._m13_track_path = []
         self._m13_track_box_wh_norm = None
         self._m14_track_init_pending_gen = None
@@ -1340,12 +1377,28 @@ class M13MovingTargetTrackMixin:
         # Cameras with no onboard rangefinder (SIYI ZR10) have nothing to fetch
         # here — _recompute_m13_track_geo falls back to ray/DEM geo instead, so
         # skip queuing a range task that would only ever come back empty.
-        if camera_has_laser_rangefinder(getattr(self, "_camera_control", None)):
+        # ...and cameras whose laser only measures boresight (Viewpro) have
+        # nothing to fetch while the tracked target has drifted off centre —
+        # firing there would range whatever happens to be under the crosshair
+        # and label that distance as the target's.
+        if camera_has_laser_rangefinder(
+            getattr(self, "_camera_control", None)
+        ) and self._m13_track_range_pixel_ok():
             fresh_interval = _m13_slr_fresh_interval_s()
             last_fresh = float(getattr(self, "_m13_track_slr_fresh_mono", 0.0) or 0.0)
             want_periodic = fresh_interval > 0.0 and (now - last_fresh) >= fresh_interval
             if force or want_periodic:
                 self._dispatch_m13_range_fetch(fresh=True)
+        # Age out a range that has stopped being refreshed, so the marker falls
+        # back to ray/DEM instead of plotting the target at a distance measured
+        # who-knows-when. Keyed on _m13_track_range_mono (stamped on SUCCESS),
+        # never on _m13_track_slr_fresh_mono — that one is stamped at DISPATCH,
+        # so it advances on every attempt and could never detect a failing one.
+        fresh_interval = _m13_slr_fresh_interval_s()
+        if fresh_interval > 0.0 and getattr(self, "_m13_track_range_m", None) is not None:
+            got = float(getattr(self, "_m13_track_range_mono", 0.0) or 0.0)
+            if got > 0.0 and (now - got) > (3.0 * fresh_interval):
+                self._m13_track_range_m = None
         last = float(getattr(self, "_m13_track_geo_mono", 0.0) or 0.0)
         if not force and (now - last) < _M13_GEO_MIN_INTERVAL_S:
             return
@@ -1353,6 +1406,40 @@ class M13MovingTargetTrackMixin:
         # Recompute from the last fetched range with LIVE gimbal attitude, so the
         # marker still updates between range shots as the gimbal follows.
         self._recompute_m13_track_geo()
+
+    def _m13_track_range_pixel_ok(self) -> bool:
+        """True when the tracked pixel is somewhere this camera's laser can reach.
+
+        Recomputed per tick from the LIVE tracked pixel on purpose: a converged
+        track sits within a few thousandths of boresight while a target that has
+        just broken away does not, and a static per-backend property could not
+        tell those apart. Cameras with a steerable laser (C13) or no boresight
+        constraint answer True unconditionally, so their behaviour is unchanged.
+        """
+        uv = getattr(self, "_m13_track_click_uv", None)
+        try:
+            u, v = (float(uv[0]), float(uv[1])) if uv else (0.5, 0.5)
+        except (TypeError, ValueError, IndexError):
+            u, v = 0.5, 0.5
+        wh = getattr(self, "_m14_tracker_frame_wh", None)
+        fw = fh = None
+        if wh:
+            try:
+                fw, fh = int(wh[0]), int(wh[1])
+            except (TypeError, ValueError, IndexError):
+                fw = fh = None
+        if not fw or not fh:
+            profile = self._m14_active_profile()
+            try:
+                fw = int(getattr(profile, "frame_w", 0) or 0)
+                fh = int(getattr(profile, "frame_h", 0) or 0)
+            except (TypeError, ValueError):
+                fw = fh = 0
+        if not fw or not fh:
+            fw, fh = 1280, 720
+        return camera_lrf_can_measure_video_norm(
+            getattr(self, "_camera_control", None), u, v, frame_w=fw, frame_h=fh
+        )
 
     def _dispatch_m13_range_fetch(self, *, fresh: bool) -> None:
         """Queue an off-GUI-thread SLR read; one at a time (no overlapping shots)."""
@@ -1386,6 +1473,13 @@ class M13MovingTargetTrackMixin:
                 self._m13_track_range_m = float(range_m)
             except (TypeError, ValueError):
                 pass
+            else:
+                # Stamped ONLY here, on a genuinely successful conversion — this
+                # is what the staleness check in _update_m13_track_geo ages
+                # against. Do not move it next to the dispatch-time stamp.
+                import time
+
+                self._m13_track_range_mono = time.monotonic()
         self._recompute_m13_track_geo()
 
     @staticmethod
@@ -1481,7 +1575,15 @@ class M13MovingTargetTrackMixin:
         ai_follow = self._m14_ai_follow_active()
         if dist is None:
             cc = getattr(self, "_camera_control", None)
-            if ai_follow and not camera_has_laser_rangefinder(cc):
+            # No range available. Use the ray/DEM estimate when the camera has
+            # no laser at all (SIYI), or when it has one that cannot reach the
+            # tracked pixel (Viewpro's boresight-only laser, target off centre)
+            # — in both cases waiting for a range would wait forever. The
+            # `ai_follow and` term is preserved: the firmware path's behaviour
+            # of holding out for a real measurement is unchanged.
+            if ai_follow and (
+                not camera_has_laser_rangefinder(cc) or not self._m13_track_range_pixel_ok()
+            ):
                 self._recompute_m13_track_geo_ray(ctx)
             else:
                 self._refresh_m13_track_map_marker()

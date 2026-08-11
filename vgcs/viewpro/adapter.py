@@ -120,6 +120,7 @@ class ViewproGimbalTcpAdapter:
         self._last_hfov_deg: float | None = None
         self._last_vfov_deg: float | None = None
         self._last_zoom_x: float | None = None
+        self._last_tracker_status: tuple[int, int] | None = None
 
     def _log_failure(self, where: str, exc: Exception) -> None:
         """Throttled diagnostic — without this, a bad host/port or a dead
@@ -222,6 +223,27 @@ class ViewproGimbalTcpAdapter:
         zoom_x = parsed.get("zoom_x")
         if zoom_x is not None and float(zoom_x) > 0.0:
             self._last_zoom_x = float(zoom_x)
+        self._note_tracker_status(parsed.get("track_status"), parsed.get("track_target_type"))
+
+    def _note_tracker_status(self, status: object, target_type: object) -> None:
+        """Log the onboard tracker's state whenever it changes.
+
+        VGCS never commands this tracker, so any transition away from "stopped"
+        means something else started it. Modelled on _note_servo_mode: decoded
+        at 2 Hz, logged only on change so transitions stand out.
+        """
+        if status is None:
+            return
+        sig = (int(status) & 0x03, int(target_type or 0) & 0x07)
+        if sig == self._last_tracker_status:
+            return
+        self._last_tracker_status = sig
+        name = vp.TRACK_STATUS_NAMES.get(sig[0], "unknown")
+        print(f"[VGCS:viewpro] onboard tracker {name} (status={sig[0]} target_type={sig[1]})")
+
+    def query_tracker_status(self) -> tuple[int, int] | None:
+        """(track_status, track_target_type) as last reported, or None."""
+        return self._last_tracker_status
 
     def _note_servo_mode(self, status: object) -> None:
         """Log the gimbal's own reported servo mode whenever it changes.
