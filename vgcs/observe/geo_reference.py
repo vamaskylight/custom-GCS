@@ -227,7 +227,22 @@ def _quality_label(
     has_gimbal: bool,
     depression_deg: float,
     range_m: float,
+    range_is_measured: bool = False,
 ) -> tuple[str, str]:
+    """Grade a geo fix. ``range_is_measured`` when the distance came from a
+    rangefinder rather than from intersecting the look ray with the ground.
+
+    That distinction decides whether a shallow look angle is disqualifying.
+    Intersecting a ray with the ground divides by tan(depression), so near the
+    horizon the answer explodes — at 3 m AGL, 0.3° vs 0.5° of depression moves
+    the estimate by ~230 m, which is why anything under 1° is refused outright.
+    A MEASURED range has no such term: the target sits at a known distance
+    along the ray, and the same 0.3°-to-0.5° change moves it by well under a
+    millimetre. Applying the ray-method's gate to a laser measurement threw
+    away perfectly good fixes (field-observed 2026-08-17: a drone at 2.99 m AGL
+    ranging a wall at 10-22 m could not place a DOOAF point at all, despite a
+    3D GPS fix, 16 satellites and the laser returning clean ranges).
+    """
     warnings: list[str] = []
     if gps_fix_type < 3:
         warnings.append(f"GPS fix={gps_fix_type} (need 3D fix for best accuracy)")
@@ -240,7 +255,8 @@ def _quality_label(
     if range_m > 5000.0:
         warnings.append("range > 5 km (flat-ground assumption weak)")
 
-    if gps_fix_type < 2 or not has_gimbal or depression_deg < 1.0:
+    shallow_is_fatal = (not range_is_measured) and depression_deg < 1.0
+    if gps_fix_type < 2 or not has_gimbal or shallow_is_fatal:
         return "insufficient", "; ".join(warnings) or "insufficient telemetry"
 
     if warnings:
@@ -674,6 +690,8 @@ def compute_lrf_slant_geo(
         has_gimbal=not gimbal_assumed,
         depression_deg=depression,
         range_m=horiz,
+        # Laser measurement — a shallow look angle does not degrade it.
+        range_is_measured=True,
     )
     if gimbal_assumed:
         extra = "gimbal attitude assumed level (0°, 0°)"
@@ -835,6 +853,8 @@ def compute_lrf_facade_plane_geo(
         has_gimbal=not gimbal_assumed,
         depression_deg=depression,
         range_m=horiz,
+        # Laser measurement — a shallow look angle does not degrade it.
+        range_is_measured=True,
     )
     if gimbal_assumed:
         extra = "gimbal attitude assumed level (0°, 0°)"

@@ -1066,7 +1066,14 @@ class ViewproCameraControl:
     # no-return (sky, glass, too far) still fails promptly instead of hanging
     # the operator for six seconds.
     _LRF_RANGE_WAIT_S = 3.0
-    _LRF_RANGE_WAIT_COLD_S = 6.0
+    # Cold budget raised 6.0 -> 10.0 on field data (2026-08-17). That session's
+    # SUCCESSFUL cold shots came back at 2.0s, 3.6s, 4.7s and 5.6s — the slowest
+    # landing inside 0.4s of the old 6.0s limit — while five other attempts
+    # timed out at it. With the spread running that close to the deadline, some
+    # of those timeouts were the budget expiring rather than the surface giving
+    # no return. Warm stays 3.0s so repeat picks remain snappy; only the
+    # first-shot-after-idle pays this.
+    _LRF_RANGE_WAIT_COLD_S = 10.0
     _LRF_RANGE_POLL_INTERVAL_S = 0.15
     # If a cold shot has produced nothing by here, re-send the start command once
     # in case it was dropped in transit. Deliberately ONE extra command, not the
