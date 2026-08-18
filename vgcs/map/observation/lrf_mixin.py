@@ -19,6 +19,22 @@ from vgcs.video.pipeline import notify_companion_lrf_lock
 class LrfVideoLockMixin:
     """Extracted from MapWidget — uses host widget state via self."""
 
+    def _set_lrf_session_hold(self, enable: bool) -> None:
+        """Hold the camera's laser warm while an observation session is open.
+
+        The laser idle-stops well before an operator has aimed the gimbal and
+        worked the dialog for their next pick, so without this every DOOAF range
+        pays a 5-7s cold start (field log 2026-08-18: every range that session
+        was cold and two of them timed out). Best-effort and capability-gated —
+        backends with no such concept simply ignore it.
+        """
+        try:
+            from vgcs.video.camera_control import set_camera_lrf_session_hold
+
+            set_camera_lrf_session_hold(getattr(self, "_camera_control", None), bool(enable))
+        except Exception:
+            return
+
     def _reset_c13_lrf_for_observe_reset(self) -> None:
         """OBSERVE Reset also clears C13 LRF lock / armed / failed reticle + facade lock."""
         clear_facade = getattr(self, "_clear_dooaf_facade_lock", None)
