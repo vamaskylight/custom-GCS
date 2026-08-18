@@ -2741,19 +2741,33 @@ def format_dooaf_html_summary(
     corr_rows = ""
     c = session.correction
     elev_delta_row = ""
-    if (
+    # Subtract two elevations only when they share a vertical reference. The
+    # marks' own alt_m can come from DIFFERENT sources — a DEM lookup for one,
+    # laser range + GPS altitude for the other — and where GPS altitude is not
+    # orthometric those differ by the local geoid separation. Field report
+    # 2026-08-18 (~20.4N 72.88E): the same report showed the height correction
+    # as +2.4 m (DEM vs DEM, correct) and this row as -38.2 m, ~40 m apart,
+    # because this one had crossed the two references.
+    _elev_pair = None
+    if session.intended_dem_alt_m is not None and session.impact_dem_alt_m is not None:
+        _elev_pair = (session.intended_dem_alt_m, session.impact_dem_alt_m)
+    elif (
         session.intended is not None
         and session.impact is not None
         and session.intended.alt_m is not None
         and session.impact.alt_m is not None
+        and session.dem_footprint_reliable
     ):
+        # Both from the ray/DEM path — same reference, safe to subtract.
+        _elev_pair = (session.intended.alt_m, session.impact.alt_m)
+    if _elev_pair is not None:
         try:
-            elev_delta = float(session.intended.alt_m) - float(session.impact.alt_m)
+            elev_delta = float(_elev_pair[0]) - float(_elev_pair[1])
             elev_delta_row = (
                 f"<tr><td class='label-col'>Target − impact elevation</td>"
-                f"<td>{elev_delta:+.1f} m MSL "
-                f"(target {_format_elev_msl_html(session.intended.alt_m)}, "
-                f"impact {_format_elev_msl_html(session.impact.alt_m)})</td></tr>"
+                f"<td>{elev_delta:+.1f} m "
+                f"(target {_format_elev_msl_html(_elev_pair[0])}, "
+                f"impact {_format_elev_msl_html(_elev_pair[1])})</td></tr>"
             )
         except (TypeError, ValueError):
             elev_delta_row = ""
