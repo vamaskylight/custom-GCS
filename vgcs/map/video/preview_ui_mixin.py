@@ -27,9 +27,16 @@ from vgcs.video.pipeline import (
     VideoFrame,
     notify_companion_feed_switch,
     notify_companion_preview_motion,
+    release_all_companion_rtsp_hosts,
     release_companion_rtsp_host,
     set_companion_decode_gate,
 )
+
+# An in-stream EO/IR change alters the stream format, so the running decoder
+# must be restarted. Two changes in quick succession left the camera unable to
+# serve RTSP at all (field log 2026-08-18), hence the minimum gap.
+_SENSOR_SWITCH_MIN_GAP_S = 6.0
+_SENSOR_SWITCH_SETTLE_MS = 3200
 
 
 class VideoPreviewUiMixin:
@@ -1272,6 +1279,64 @@ class VideoPreviewUiMixin:
 
         QTimer.singleShot(2800, _finish_switch)
 
+    def _restart_decode_for_sensor_switch(self, sensor: str) -> None:
+        """Clean decode restart after an in-stream EO/IR change.
+
+        Same shape as _companion_switch_active_feed's handoff — hard-stop,
+        release the RTSP host, settle, restart — because the problem is the
+        same: the decoder is holding parameters for a stream that no longer
+        looks like that. The difference is only that the URL does not change.
+        """
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is None:
+            return
+        try:
+            notify_companion_feed_switch(duration_s=14.0)
+            notify_companion_preview_motion(duration_s=10.0)
+        except Exception:
+            pass
+        try:
+            sources = vp.sources()
+        except Exception:
+            sources = {}
+        for _sid, src in sources.items():
+            try:
+                if hasattr(src, "companion_hard_stop_decode"):
+                    src.companion_hard_stop_decode(join_s=2.5)
+                else:
+                    src.stop()
+            except Exception:
+                pass
+        try:
+            release_all_companion_rtsp_hosts()
+        except Exception:
+            pass
+        self._last_video_pushed = ""
+        try:
+            self._video_gui_logged_frame = False
+        except Exception:
+            pass
+
+        def _resume() -> None:
+            vp2 = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+            if vp2 is None:
+                return
+            try:
+                self._connect_video_pipeline_frame_slots(vp2)
+            except Exception:
+                pass
+            try:
+                self._start_video_decode_sources(vp2)
+            except Exception:
+                pass
+            self._sync_native_thermal_feed_button()
+            self._set_status(
+                f"Camera sensor: {'Thermal IR' if sensor == 'ir' else 'Day (EO)'} "
+                "(one stream — gimbal unchanged)"
+            )
+
+        QTimer.singleShot(_SENSOR_SWITCH_SETTLE_MS, _resume)
+
     def _sync_native_thermal_feed_button(self) -> None:
         btn = getattr(self, "_btn_native_thermal", None)
         if btn is None:
@@ -1356,11 +1421,32 @@ class VideoPreviewUiMixin:
 
             cc = getattr(self, "_camera_control", None)
             if camera_switches_sensor_in_stream(cc):
+                import time as _t
+
+                # Debounce. The sensor change alters the stream's format, and
+                # two of them in quick succession left the camera's RTSP server
+                # unable to serve at all — field log 2026-08-18 ends with four
+                # consecutive "Invalid data found when processing input" and no
+                # video for the rest of the session.
+                last = float(getattr(self, "_last_sensor_switch_mono", 0.0) or 0.0)
+                now_mono = _t.monotonic()
+                if now_mono - last < _SENSOR_SWITCH_MIN_GAP_S:
+                    self._sync_native_thermal_feed_button()
+                    self._set_status("Sensor switch ignored — wait a moment between changes")
+                    return
+                self._last_sensor_switch_mono = now_mono
+
                 now = toggle_camera_video_sensor(cc)
                 if now:
                     self._set_status(
-                        f"Camera sensor → {'thermal IR' if now == 'ir' else 'day (EO)'}"
+                        f"Camera sensor → {'thermal IR' if now == 'ir' else 'day (EO)'} "
+                        "— restarting video for the new format…"
                     )
+                    # The stream keeps the same URL but changes format, so the
+                    # running decoder's parameters go stale. Tear it down and
+                    # restart cleanly rather than letting it limp until it dies
+                    # and then retry-storm against a camera still settling.
+                    self._restart_decode_for_sensor_switch(now)
                     return
                 self._set_status("Sensor switch failed — check the camera TCP link")
                 self._sync_native_thermal_feed_button()
