@@ -781,10 +781,33 @@ class DooafOperationsMixin:
                     "confirm or re-pick with LRF for better accuracy"
                 )
                 return
-            self._dooaf_video_pick_failed(
-                "LRF lock failed — gimbal aimed at click but rangefinder did not "
-                "confirm; retry the pick or choose a surface with a clear laser return"
-            )
+            # Say WHY it declined. The backend already knows — a boresight-only
+            # laser that simply wasn't aimed at the pick is a different problem
+            # from a surface giving no return, and needs the opposite action
+            # from the operator. Field report 2026-08-18: four picks in a row
+            # declined for being ~170px off centre (tolerance 154px) while the
+            # dialog told the operator to "choose a surface with a clear laser
+            # return" — sending them to re-aim at different surfaces when the
+            # fix was to centre the gimbal on the one they already had.
+            backend_reason = ""
+            getter = getattr(self, "_lrf_backend_lock_error", None)
+            if callable(getter):
+                try:
+                    backend_reason = str(getter() or "")
+                except Exception:
+                    backend_reason = ""
+            if backend_reason:
+                self._dooaf_video_pick_failed(
+                    f"LRF lock failed — {backend_reason}. "
+                    "The ray/DEM fallback could not place this pick either "
+                    "(look angle too near the horizon).",
+                    boresight_hint=True,
+                )
+            else:
+                self._dooaf_video_pick_failed(
+                    "LRF lock failed — gimbal aimed at click but rangefinder did not "
+                    "confirm; retry the pick or choose a surface with a clear laser return"
+                )
             return
         preserve_gun = getattr(self, "_dooaf_facade_slant_preserve_track", None)
         slant_only = (
@@ -906,7 +929,9 @@ class DooafOperationsMixin:
             + (" · lrf_slant" if method == "lrf_slant" else "")
         )
 
-    def _dooaf_video_pick_failed(self, reason: str) -> None:
+    def _dooaf_video_pick_failed(
+        self, reason: str, *, boresight_hint: bool = False
+    ) -> None:
         dlg = self._dooaf_pick_dialog
         self._end_dooaf_map_pick(restore_target_mode=True)
         detail = (reason or "").strip() or "Could not compute a ground position."
@@ -926,7 +951,19 @@ class DooafOperationsMixin:
                     (
                         f"{detail}\n\n"
                         "Tips:\n"
-                        "• Actual target: click roof / aim point on the building.\n"
+                        # Lead with the boresight instruction when that is what
+                        # actually failed. The generic tips below are about WHAT
+                        # to click; read after an off-centre decline they send
+                        # the operator to a different surface rather than to the
+                        # centre marker, which is the only thing that fixes it.
+                        + (
+                            "• This laser measures ONLY at the centre of the frame. "
+                            "Slew the gimbal until the target sits under the centre "
+                            "marker, then click it there.\n"
+                            if boresight_hint
+                            else ""
+                        )
+                        + "• Actual target: click roof / aim point on the building.\n"
                         "• Impact Target: click ground in the lower part of the video (not sky).\n"
                         "• Wait for mavlink GPS fix (3D GPS helps).\n"
                         "• Pitch gimbal down if the scene is oblique.\n"
