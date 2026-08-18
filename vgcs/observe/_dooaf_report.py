@@ -8,6 +8,8 @@ from typing import Any
 
 from vgcs.observe._dooaf_correction import (
     FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M,
+    fire_correction_gunline_gap_m,
+    fire_correction_gunline_miss_m,
     _float_or_none,
     build_dooaf_session,
     fire_correction_en_miss_m,
@@ -2006,11 +2008,32 @@ def _executive_miss_map_svg(session: DooafSession, c: FireCorrection) -> str:
     return "".join(parts)
 
 def _fire_correction_miss_consistency_warning_html(c: FireCorrection) -> str:
-    if fire_correction_miss_is_consistent(c):
+    # Two independent cross-checks. The E/N one is weak (the facade rescale can
+    # force both sides equal); the gun-line one is derived from ranges and
+    # bearings instead, so it still sees a broken headline. Warn on EITHER.
+    gunline_gap = fire_correction_gunline_gap_m(c)
+    gunline_bad = gunline_gap > FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M
+    if fire_correction_miss_is_consistent(c) and not gunline_bad:
         return ""
+    horiz = float(c.impact_to_intended_m)
+    if gunline_bad:
+        return (
+            "<div class='report-sanity-warn' role='alert'>"
+            "<strong>Distance consistency warning</strong>"
+            "<p>Reported target&rarr;impact horizontal miss is "
+            f"<strong>{horiz:.1f} m</strong>, but the gun-line pair "
+            f"(along {float(c.miss_along_m):+.1f} m, right "
+            f"{float(c.miss_right_m):+.1f} m) implies "
+            f"<strong>{fire_correction_gunline_miss_m(c):.1f} m</strong> "
+            f"(gap <strong>{gunline_gap:.1f} m</strong>, threshold "
+            f"{FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M:.0f} m). These are computed "
+            "by separate routes, so one of them is wrong &mdash; treat the "
+            "correction as unverified and check the coordinates in the audit log "
+            "before firing on it.</p>"
+            "</div>"
+        )
     en = fire_correction_en_miss_m(c)
     gap = fire_correction_miss_consistency_gap_m(c)
-    horiz = float(c.impact_to_intended_m)
     return (
         "<div class='report-sanity-warn' role='alert'>"
         "<strong>Distance consistency warning</strong>"
