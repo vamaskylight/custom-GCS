@@ -236,6 +236,11 @@ class LrfVideoLockMixin:
         guessing at a one-size-fits-all message. Optional: only ViewproCameraControl
         implements last_lrf_lock_error() today; other backends return ''.
         """
+        # Prefer the reason captured with the result that actually failed. The
+        # live backend field is a fallback for callers outside the task path.
+        captured = str(getattr(self, "_lrf_last_lock_reason", "") or "")
+        if captured:
+            return captured
         try:
             cc = getattr(self, "_camera_control", None)
             getter = getattr(cc, "last_lrf_lock_error", None)
@@ -708,6 +713,9 @@ class LrfVideoLockMixin:
             )
         except Exception:
             pass
+        # Bound the captured reason to THIS attempt — otherwise a later failure
+        # whose own reason is empty would surface a stale one from before.
+        self._lrf_last_lock_reason = ""
         fw, fh = 1280, 720
         task = LrfLockTask(
             cc,
@@ -748,7 +756,11 @@ class LrfVideoLockMixin:
         except (TypeError, ValueError):
             pass
 
-    def _on_c13_lrf_lock_finished(self, dist: object, u: float, v: float) -> None:
+    def _on_c13_lrf_lock_finished(
+        self, dist: object, u: float, v: float, reason: str = ""
+    ) -> None:
+        # Captured on the worker alongside THIS lock's result; see LrfLockBridge.
+        self._lrf_last_lock_reason = str(reason or "")
         self._lrf_lock_in_progress = False
         notify_companion_lrf_lock(active=False)
         self._notify_companion_gimbal_motion(duration_s=15.0)

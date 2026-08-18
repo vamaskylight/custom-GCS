@@ -1278,10 +1278,23 @@ class VideoPreviewUiMixin:
             return
         show = self._companion_show_ir_button()
         dual = self._companion_has_dual_feed()
+        in_stream = False
+        try:
+            from vgcs.video.camera_control import camera_switches_sensor_in_stream
+
+            in_stream = camera_switches_sensor_in_stream(getattr(self, "_camera_control", None))
+        except Exception:
+            in_stream = False
+        dual = bool(dual or in_stream)
         try:
             btn.setVisible(bool(show))
             btn.setEnabled(bool(dual))
-            if dual:
+            if in_stream:
+                btn.setToolTip(
+                    "Thermal IR — switches the camera sensor feeding the video "
+                    "stream (gimbal unchanged)"
+                )
+            elif dual:
                 btn.setToolTip(
                     "Thermal IR feed (C13: switches day ↔ thermal — one RTSP stream at a time; "
                     "gimbal unchanged)"
@@ -1330,6 +1343,30 @@ class VideoPreviewUiMixin:
                 pass
 
     def _on_native_thermal_feed_toggled(self, on: bool) -> None:
+        # Single-stream cameras (Viewpro) switch which SENSOR fills the one feed
+        # rather than switching between two RTSP URLs, so there is no feed to
+        # change here — just tell the camera. Checked first because such a
+        # camera never has a "dual feed" and would otherwise fall into the
+        # configure-your-URLs message for a setting that does not apply to it.
+        try:
+            from vgcs.video.camera_control import (
+                camera_switches_sensor_in_stream,
+                toggle_camera_video_sensor,
+            )
+
+            cc = getattr(self, "_camera_control", None)
+            if camera_switches_sensor_in_stream(cc):
+                now = toggle_camera_video_sensor(cc)
+                if now:
+                    self._set_status(
+                        f"Camera sensor → {'thermal IR' if now == 'ir' else 'day (EO)'}"
+                    )
+                    return
+                self._set_status("Sensor switch failed — check the camera TCP link")
+                self._sync_native_thermal_feed_button()
+                return
+        except Exception:
+            pass
         if not self._companion_has_dual_feed():
             self._sync_native_thermal_feed_button()
             self._set_status(

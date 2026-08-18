@@ -100,6 +100,18 @@ C1_OP_TAKE_PICTURE = 0x13
 C1_OP_START_RECORD = 0x14
 C1_OP_STOP_RECORD = 0x15
 
+# C1 sensor select (bits2-0). The Viewpro streams ONE RTSP feed and switches
+# which sensor fills it — unlike the C13/SIYI model of two separate RTSP URLs.
+# Values from Viewpro Viewlink Serial Command Protocol V3.4.9; TABLE-ONLY, but
+# the failure mode is self-evident on screen (the picture either changes or it
+# does not), so this is safe to ship unverified in a way a sign convention or a
+# range value would not be.
+C1_SENSOR_NO_ACTION = 0x00
+C1_SENSOR_EO1 = 0x01
+C1_SENSOR_IR = 0x02
+C1_SENSOR_EO1_IR_PIP = 0x03
+C1_SENSOR_IR_EO1_PIP = 0x04
+
 C1_LRF_NONE = 0x00
 C1_LRF_SINGLE = 0x01
 C1_LRF_CONTINUOUS_START = 0x02

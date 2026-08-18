@@ -1255,6 +1255,24 @@ class ViewproCameraControl:
         except Exception:
             return
 
+    def toggle_video_sensor(self) -> str:
+        """Flip the single video feed between EO (day) and IR (thermal).
+
+        This camera has one RTSP stream and switches which sensor fills it, so
+        there is no second URL to point at — which is exactly why the IR button
+        stayed disabled for Viewpro (field report 2026-08-18).
+        """
+        try:
+            return str(self._adapter.toggle_video_sensor())
+        except Exception:
+            return "eo"
+
+    def video_sensor(self) -> str:
+        try:
+            return str(self._adapter.video_sensor())
+        except Exception:
+            return "eo"
+
     def set_lrf_session_hold(self, enable: bool) -> None:
         """Keep the laser warm for the duration of an observation session.
 
@@ -1710,6 +1728,34 @@ def camera_recording_applies_digital_zoom(source_id: str, control: object | None
     """
     _ = control
     return str(source_id or "").strip().lower() == "thermal"
+
+
+def camera_switches_sensor_in_stream(control: object | None) -> bool:
+    """True when the backend switches EO/IR *within one video stream* rather
+    than by pointing at a second RTSP URL.
+
+    The IR button is gated on having two configured feed URLs, which is right
+    for C13/SIYI but leaves it permanently disabled on a single-stream camera
+    that switches sensor by command.
+    """
+    primary = resolve_camera_control_primary(control)
+    if primary is None:
+        return False
+    return callable(getattr(primary, "toggle_video_sensor", None))
+
+
+def toggle_camera_video_sensor(control: object | None) -> str:
+    """Flip EO/IR on a single-stream backend. Returns '' if unsupported."""
+    primary = resolve_camera_control_primary(control)
+    if primary is None:
+        return ""
+    fn = getattr(primary, "toggle_video_sensor", None)
+    if not callable(fn):
+        return ""
+    try:
+        return str(fn() or "")
+    except Exception:
+        return ""
 
 
 def set_camera_lrf_session_hold(control: object | None, enable: bool) -> bool:

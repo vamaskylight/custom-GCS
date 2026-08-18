@@ -63,6 +63,33 @@ def _companion_gimbal_session_active() -> bool:
     return _companion_lrf_lock_active() or bool(_companion_visual_track_session)
 
 
+_companion_recording_session = False
+
+
+def notify_companion_recording(*, active: bool) -> None:
+    """Tell the pipeline a recording is running so it stops tearing the stream
+    down underneath it.
+
+    The auto-reconnects (stale preview, corrupt streak) exist to recover a
+    wedged preview, and already stand down for LRF locks and M13 tracks. Nothing
+    told them about recording, so a reconnect mid-capture ended the decode
+    session and with it the recording — field report 2026-08-18, where the log
+    shows "decode session ended (frames=779)" about half a minute after RECORD
+    start, and the operator saw a recording that had stopped on its own.
+
+    A brief run of corrupt frames in the saved file is a far better outcome than
+    a recording that silently ends.
+    """
+    global _companion_recording_session
+    _companion_recording_session = bool(active)
+
+
+def _companion_stream_continuity_required() -> bool:
+    """True while something is consuming the stream that a reconnect would
+    break — a gimbal-precision session, or an in-progress recording."""
+    return _companion_gimbal_session_active() or bool(_companion_recording_session)
+
+
 def _companion_track_video_guard_active() -> bool:
     """Live preview required during M13 track (never hold last frame)."""
     return bool(_companion_visual_track_session)
@@ -3000,7 +3027,7 @@ class RtspSource(QObject):
                                                 _companion_stale_preview_reconnect_enabled()
                                                 and bool(self._ffmpeg_had_frame)
                                                 and not motion_preview
-                                                and not _companion_gimbal_session_active()
+                                                and not _companion_stream_continuity_required()
                                                 and not _companion_app_is_background()
                                                 and corrupt_skip_streak >= stale_thr
                                                 and stale_now
@@ -3051,7 +3078,7 @@ class RtspSource(QObject):
                                                 _companion_corrupt_streak_reconnect_enabled()
                                                 and bool(self._ffmpeg_had_frame)
                                                 and not motion_preview
-                                                and not _companion_gimbal_session_active()
+                                                and not _companion_stream_continuity_required()
                                                 and not _companion_app_is_background()
                                                 and corrupt_skip_streak >= corrupt_thr
                                                 and stale_now - corrupt_last >= corrupt_cooldown
