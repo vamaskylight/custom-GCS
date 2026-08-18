@@ -171,6 +171,7 @@ class ViewproGimbalTcpAdapter:
         self._lrf_streaming = False
         self._lrf_session_hold = False
         self._lrf_session_hold_mono = 0.0
+        self._sensor_is_ir = False
         self._lrf_idle_stop_timer: threading.Timer | None = None
         self._last_hfov_deg: float | None = None
         self._last_vfov_deg: float | None = None
@@ -696,6 +697,28 @@ class ViewproGimbalTcpAdapter:
 
     def camera_auto_focus(self) -> None:
         self._send(c1_op=vp.C1_OP_AUTO_FOCUS)
+
+    # ---- Sensor (EO / IR) selection ----
+    #
+    # This camera streams ONE RTSP feed and switches which sensor fills it, so
+    # IR is a camera command here — not the second RTSP URL that the C13/SIYI
+    # backends use. The IR button stayed permanently disabled for Viewpro until
+    # this existed, because the UI gated it on having two feed URLs.
+
+    def video_sensor(self) -> str:
+        """'eo' or 'ir' — what we last asked the camera to display."""
+        return "ir" if self._sensor_is_ir else "eo"
+
+    def set_video_sensor(self, sensor: str) -> None:
+        want_ir = str(sensor).strip().lower() in ("ir", "thermal")
+        print(f"[VGCS:viewpro] video sensor -> {'IR thermal' if want_ir else 'EO day'}")
+        self._send(c1_sensor=vp.C1_SENSOR_IR if want_ir else vp.C1_SENSOR_EO1)
+        self._sensor_is_ir = want_ir
+
+    def toggle_video_sensor(self) -> str:
+        """Flip EO <-> IR; returns the sensor now selected."""
+        self.set_video_sensor("eo" if self._sensor_is_ir else "ir")
+        return self.video_sensor()
 
     def camera_photo(self) -> None:
         self._send(c1_op=vp.C1_OP_TAKE_PICTURE)

@@ -228,8 +228,23 @@ class WebBridgeMixin:
                             f"vgcs_recording{tag}_{int(time.time())}.{self._video_record_suffix()}"
                         )
                         self._sync_payload_hardware_recording(True)
+                        # Before starting: an auto-reconnect between here and
+                        # the first frame would kill the capture immediately.
+                        try:
+                            from vgcs.video.pipeline import notify_companion_recording
+
+                            notify_companion_recording(active=True)
+                        except Exception:
+                            pass
                         ok = bool(src.start_recording(str(tmp)))
                         self._video_recording = bool(ok)
+                        if not ok:
+                            try:
+                                from vgcs.video.pipeline import notify_companion_recording
+
+                                notify_companion_recording(active=False)
+                            except Exception:
+                                pass
                         self._video_recording_tmp_path = str(tmp) if ok else ""
                         self._video_recording_source_id = rec_sid if ok else ""
                         if ok and rec_sid:
@@ -256,6 +271,12 @@ class WebBridgeMixin:
                             pass
                         self._video_recording = False
                         self._video_recording_source_id = ""
+                        try:
+                            from vgcs.video.pipeline import notify_companion_recording
+
+                            notify_companion_recording(active=False)
+                        except Exception:
+                            pass
                         self._stop_native_cam_recording_tick_timer()
                         tmp_path = str(getattr(self, "_video_recording_tmp_path", "") or "")
                         self._video_recording_tmp_path = ""

@@ -283,7 +283,14 @@ class M14DetectTask(QRunnable):
 
 
 class LrfLockBridge(QObject):
-    finished = Signal(object, float, float)  # distance_m | None, u, v
+    # The decline REASON travels with the result rather than being read off the
+    # backend afterwards. `_lrf_lock_error` is a single mutable field reset at
+    # the top of every lock, so a second lock starting before the GUI thread
+    # handled the first one blanked it — field report 2026-08-18: an operator
+    # retrying four times in a row saw the generic "choose a surface with a
+    # clear laser return" every time, when the real (and correctly logged)
+    # reason was that the pick sat ~170px off the boresight centre.
+    finished = Signal(object, float, float, str)  # distance_m | None, u, v, reason
     progress = Signal(float)  # live SLR sample while locking
 
 
@@ -335,8 +342,19 @@ class LrfLockTask(QRunnable):
                 )
         except Exception as exc:
             print(f"[VGCS:lrf] lock failed: {exc}")
+        # Read the reason HERE, still on this worker, immediately after our own
+        # lock returned — not later on the GUI thread, where a newer lock may
+        # already have cleared it.
+        reason = ""
+        if dist is None:
+            try:
+                getter = getattr(self._cc, "last_lrf_lock_error", None)
+                if callable(getter):
+                    reason = str(getter() or "")
+            except Exception:
+                reason = ""
         try:
-            self._bridge.finished.emit(dist, self._u, self._v)
+            self._bridge.finished.emit(dist, self._u, self._v, reason)
         except Exception:
             pass
 
