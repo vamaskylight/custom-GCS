@@ -1255,6 +1255,19 @@ class ViewproCameraControl:
         except Exception:
             return
 
+    def set_lrf_session_hold(self, enable: bool) -> None:
+        """Keep the laser warm for the duration of an observation session.
+
+        Without this every DOOAF pick pays the laser's cold start: the idle stop
+        fires long before the operator has aimed the gimbal and worked the
+        dialog for the next one (field log 2026-08-18 — every range that session
+        was cold, two timed out).
+        """
+        try:
+            self._adapter.set_lrf_session_hold(bool(enable))
+        except Exception:
+            return
+
     def is_lrf_armed(self) -> bool:
         try:
             return bool(self._adapter.is_lrf_armed())
@@ -1697,6 +1710,27 @@ def camera_recording_applies_digital_zoom(source_id: str, control: object | None
     """
     _ = control
     return str(source_id or "").strip().lower() == "thermal"
+
+
+def set_camera_lrf_session_hold(control: object | None, enable: bool) -> bool:
+    """Ask the active backend to hold its laser warm across an observation
+    session. Returns True if a backend took the request.
+
+    Capability-gated rather than vendor-gated (project convention): any backend
+    that grows the method participates, and the ones that have no such concept
+    are simply skipped instead of needing to be listed here.
+    """
+    primary = resolve_camera_control_primary(control)
+    if primary is None:
+        return False
+    fn = getattr(primary, "set_lrf_session_hold", None)
+    if not callable(fn):
+        return False
+    try:
+        fn(bool(enable))
+        return True
+    except Exception:
+        return False
 
 
 def camera_supports_lrf_lock(control: object | None) -> bool:

@@ -65,6 +65,28 @@ _POST_JOG_HOLD_DELAY_S = 0.35
 # Set VGCS_VIEWPRO_LRF_IDLE_STOP_S to tune; 0 restores stop-immediately.
 _LRF_IDLE_STOP_S = 10.0
 
+# While a DOOAF/observation session is open the operator takes several ranges
+# minutes apart (aiming the gimbal, working the dialog), so _LRF_IDLE_STOP_S
+# expires between every one and each pick pays the laser's 5-7s cold start —
+# field log 2026-08-18 shows EVERY range that session marked "(cold laser)",
+# with two 10s timeouts. A session hold keeps the stream alive across the whole
+# workflow so follow-up picks read from a running laser.
+#
+# Capped, because this is a firing laser: an operator who leaves the dialog open
+# and walks away must not leave it emitting indefinitely. The cap releases the
+# hold and the normal idle stop then shuts the laser down.
+_LRF_SESSION_HOLD_MAX_S = 300.0
+
+
+def _lrf_session_hold_max_s() -> float:
+    raw = os.environ.get("VGCS_VIEWPRO_LRF_SESSION_HOLD_S", "").strip()
+    if not raw:
+        return _LRF_SESSION_HOLD_MAX_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _LRF_SESSION_HOLD_MAX_S
+
 
 def _lrf_idle_stop_s() -> float:
     raw = os.environ.get("VGCS_VIEWPRO_LRF_IDLE_STOP_S", "").strip()
@@ -147,6 +169,8 @@ class ViewproGimbalTcpAdapter:
         self._last_servo_mode: int | None = None
         self._lrf_armed = False
         self._lrf_streaming = False
+        self._lrf_session_hold = False
+        self._lrf_session_hold_mono = 0.0
         self._lrf_idle_stop_timer: threading.Timer | None = None
         self._last_hfov_deg: float | None = None
         self._last_vfov_deg: float | None = None
@@ -188,6 +212,13 @@ class ViewproGimbalTcpAdapter:
             self._zoom_stop_timer = None
         self._cancel_position_hold()
         self._cancel_lrf_idle_stop()
+        # Release the laser explicitly. Cancelling the idle timer alone would
+        # leave a held session's laser emitting with the socket closed and
+        # nothing left able to stop it.
+        self._lrf_session_hold = False
+        if self._lrf_streaming:
+            self._lrf_streaming = False
+            self._send(c1_lrf=vp.C1_LRF_STOP)
         # Stop the tracker BEFORE closing the socket — otherwise a camera left
         # tracking keeps driving the gimbal after VGCS has disconnected, with
         # nothing left able to tell it to stop.
@@ -709,9 +740,40 @@ class ViewproGimbalTcpAdapter:
         """Finish a lock without killing the laser immediately — schedule the
         stop after an idle grace period so a follow-up lock reads from the
         already-running stream instead of cold-starting again."""
+        if _lrf_idle_stop_s() <= 0.0 and not self._lrf_session_hold_active():
+            self.laser_range_stop()
+            return
+        self._schedule_lrf_idle_stop()
+
+    def _on_lrf_idle_timeout(self) -> None:
+        self._lrf_idle_stop_timer = None
+        if self._lrf_armed:
+            # Operator armed it explicitly via the PROXIMITY panel — theirs to stop.
+            return
+        if self._lrf_session_hold_active():
+            # A DOOAF session is open and more picks are expected; keep the
+            # laser warm and re-check after another idle period.
+            self._schedule_lrf_idle_stop()
+            return
+        self._lrf_streaming = False
+        self._send(c1_lrf=vp.C1_LRF_STOP)
+
+    def _lrf_session_hold_active(self) -> bool:
+        if not self._lrf_session_hold:
+            return False
+        max_s = _lrf_session_hold_max_s()
+        if max_s > 0.0 and (time.monotonic() - self._lrf_session_hold_mono) > max_s:
+            self._lrf_session_hold = False
+            print(
+                f"[VGCS:viewpro] LRF session hold expired after {max_s:.0f}s — "
+                "letting the laser idle-stop (re-open the dialog to hold again)"
+            )
+            return False
+        return True
+
+    def _schedule_lrf_idle_stop(self) -> None:
         idle_s = _lrf_idle_stop_s()
         if idle_s <= 0.0:
-            self.laser_range_stop()
             return
         self._cancel_lrf_idle_stop()
         timer = threading.Timer(idle_s, self._on_lrf_idle_timeout)
@@ -719,13 +781,27 @@ class ViewproGimbalTcpAdapter:
         self._lrf_idle_stop_timer = timer
         timer.start()
 
-    def _on_lrf_idle_timeout(self) -> None:
-        self._lrf_idle_stop_timer = None
-        if self._lrf_armed:
-            # Operator armed it explicitly via the PROXIMITY panel — theirs to stop.
+    def set_lrf_session_hold(self, enable: bool) -> None:
+        """Hold the laser warm across a whole observation session.
+
+        Turning it OFF does not stop the laser outright — it just lets the
+        normal idle grace period take over, so a pick already in flight is not
+        cut off mid-measurement.
+        """
+        want = bool(enable)
+        if want == self._lrf_session_hold:
+            if want:
+                self._lrf_session_hold_mono = time.monotonic()  # refresh the cap
             return
-        self._lrf_streaming = False
-        self._send(c1_lrf=vp.C1_LRF_STOP)
+        self._lrf_session_hold = want
+        self._lrf_session_hold_mono = time.monotonic()
+        print(f"[VGCS:viewpro] LRF session hold {'ON — keeping laser warm' if want else 'OFF'}")
+        if want:
+            if not self._lrf_streaming:
+                self._lrf_streaming = True
+                self.laser_range_start()
+        elif self._lrf_streaming and not self._lrf_armed:
+            self._schedule_lrf_idle_stop()
 
     def _cancel_lrf_idle_stop(self) -> None:
         timer = self._lrf_idle_stop_timer

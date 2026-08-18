@@ -300,12 +300,35 @@ def compute_fire_correction(
     )
     miss_vertical: float | None = None
     elev_correction: float | None = None
-    if facade_vert is not None:
+    # The facade vertical comes from the VIDEO-Y DIFFERENCE between the two
+    # picks, so on a boresight-only rangefinder — where both picks are pinned to
+    # frame centre and the operator slews the gimbal instead — it collapses to
+    # ~0 regardless of the true height difference. Same degeneracy as the
+    # horizontal chord; see _facade_separation_agrees_with_geo.
+    alt_vertical: float | None = None
+    alt_pair_rejected = False
+    if intended.alt_m is not None and impact.alt_m is not None:
+        if mark_alt_is_physically_possible(
+            intended_row, intended.alt_m
+        ) and mark_alt_is_physically_possible(impact_row, impact.alt_m):
+            alt_vertical = float(intended.alt_m) - float(impact.alt_m)
+        else:
+            # Altitudes exist but at least one is not physically credible, so we
+            # cannot use them AND we cannot use them to vet the facade value
+            # either. If the facade has also collapsed, the honest answer is
+            # "unknown" — reporting 0.0 would state the heights match, which is
+            # a claim we have no measurement to support.
+            alt_pair_rejected = True
+    if (
+        facade_vert is not None
+        and not (alt_pair_rejected and abs(float(facade_vert)) <= _FACADE_VERT_DEGENERATE_M)
+        and _facade_vertical_is_usable(facade_vert, alt_vertical)
+    ):
         miss_vertical = float(facade_vert)
         elev_correction = float(facade_vert)
-    elif intended.alt_m is not None and impact.alt_m is not None:
-        miss_vertical = float(intended.alt_m) - float(impact.alt_m)
-        elev_correction = miss_vertical
+    elif alt_vertical is not None:
+        miss_vertical = alt_vertical
+        elev_correction = alt_vertical
     return FireCorrection(
         range_correction_m=-along,
         deflection_correction_m=-right,
@@ -323,12 +346,63 @@ def compute_fire_correction(
 
 FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M = 2.0
 
+def mark_alt_is_physically_possible(row: dict[str, Any] | None, alt_msl_m: float | None) -> bool:
+    """Can a laser-ranged mark really sit at this altitude?
+
+    A point measured by the rangefinder is at most ``slant_range`` away from the
+    aircraft in ANY direction, so its height above (or below) the aircraft can
+    never exceed that range. This bound holds whatever vertical datum is in use,
+    which is what makes it useful: it catches an altitude that was built by
+    mixing references without needing to know which one is right.
+
+    Field report 2026-08-18: a mark 56.6 m away by laser was published at 60.1 m
+    above the aircraft — impossible. The cause was a ~39.9 m geoid separation
+    (western India): the mark's altitude came from the aircraft's GPS altitude
+    while the target it was subtracted from came from the DEM. The resulting
+    "height correction" read -37.7 m when the real difference was about +2 m.
+    Subtracting elevations across datums is silently wrong, so refuse to publish
+    a height correction built on an altitude that fails this bound.
+    """
+    if row is None or alt_msl_m is None:
+        return True  # nothing to check against — not our call to make here
+    try:
+        slant = float(row.get("lrf_slant_range_m") or 0.0)
+        drone_alt = row.get("vehicle_alt_msl_m")
+        if drone_alt is None or slant < 8.0:
+            return True
+        rise = abs(float(alt_msl_m) - float(drone_alt))
+    except (TypeError, ValueError):
+        return True
+    # The bound rise <= slant is exact geometry (equality only when looking
+    # straight up or down), so it needs a noise margin, not a percentage.
+    return rise <= slant + 2.0
+
+
 # Below this the coordinate-derived miss is itself ~zero, so a zero facade
 # estimate agrees with it rather than contradicting it.
 _FACADE_TI_MIN_GEO_M = 1.0
 # The facade chord may REFINE the coordinate miss (wall chord vs flat footprint
 # "diverge slightly" — the original intent); it may not replace it wholesale.
 _FACADE_TI_AGREE_FRACTION = 0.35
+# Below this the facade vertical is indistinguishable from the boresight-pinned
+# degenerate case, so it may not override a non-zero altitude difference.
+_FACADE_VERT_DEGENERATE_M = 0.5
+
+def _facade_vertical_is_usable(facade_vert_m: float, alt_vert_m: float | None) -> bool:
+    """Does the facade vertical carry information, or has it collapsed to zero?
+
+    A near-zero value is only meaningful if the altitudes agree that the two
+    marks really are at the same height. When altitudes say otherwise, the zero
+    is the boresight degeneracy (both picks pinned to frame centre), not a
+    measurement — publishing it would report "height difference negligible" for
+    marks at genuinely different heights.
+    """
+    if alt_vert_m is None:
+        return True  # nothing to contradict it
+    if abs(float(facade_vert_m)) > _FACADE_VERT_DEGENERATE_M:
+        return True  # a real reading
+    return abs(float(alt_vert_m)) <= _FACADE_VERT_DEGENERATE_M
+
 
 
 def _facade_separation_agrees_with_geo(ti_facade_m: float, en_raw_m: float) -> bool:
@@ -1934,7 +2008,17 @@ def build_dooaf_session(
     height_correction_m: float | None = None
     if intended is not None and impact is not None:
         if intended.alt_m is not None and impact.alt_m is not None:
-            height_correction_m = float(intended.alt_m) - float(impact.alt_m)
+            # Only subtract these if BOTH are physically credible. An altitude
+            # that fails the slant-range bound was built on a different vertical
+            # reference than its partner, and differencing across datums yields a
+            # confident, badly wrong number (see mark_alt_is_physically_possible).
+            if mark_alt_is_physically_possible(
+                intended_row, intended.alt_m
+            ) and mark_alt_is_physically_possible(impact_row, impact.alt_m):
+                height_correction_m = float(intended.alt_m) - float(impact.alt_m)
+            elif intended_dem is not None and impact_dem is not None:
+                # Both from the DEM: one reference, so the difference is sound.
+                height_correction_m = float(intended_dem) - float(impact_dem)
     return DooafSession(
         gun=gun,
         intended=intended,

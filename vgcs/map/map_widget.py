@@ -1529,6 +1529,9 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_native_gimbal_nadir.clicked.connect(self._native_gimbal_point_down)
         def _obs_target(on: bool) -> None:
             print(f"[VGCS:cam_rail] OBSERVE Target toggled={bool(on)}")
+            # Marking impacts means repeated ranges; hold the laser warm so each
+            # one does not pay the cold start.
+            self._set_lrf_session_hold(bool(on))
             self._set_observation_mark_mode(on)
 
         def _obs_clip() -> None:
@@ -1542,12 +1545,15 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
 
         def _obs_reset() -> None:
             print("[VGCS:cam_rail] OBSERVE Reset clicked")
+            self._set_lrf_session_hold(False)
             self._reset_c13_lrf_for_observe_reset()
             self._stop_m13_track()
             self._clear_observations()
 
         def _obs_dooaf_setup() -> None:
             print("[VGCS:cam_rail] OBSERVE DOOAF Setup clicked")
+            # Gun and target picks come in quick succession from this dialog.
+            self._set_lrf_session_hold(True)
             QTimer.singleShot(0, self._show_dooaf_setup_dialog)
 
         self._btn_native_target.toggled.connect(_obs_target)
