@@ -279,9 +279,14 @@ def compute_fire_correction(
         impact_row,
         hfov_deg=camera_hfov_deg,
     )
-    if use_facade_ti and ti_facade is not None and ti_facade >= 0.0:
+    en_raw = math.hypot(miss_n, miss_e)
+    if (
+        use_facade_ti
+        and ti_facade is not None
+        and ti_facade >= 0.0
+        and _facade_separation_agrees_with_geo(float(ti_facade), en_raw)
+    ):
         impact_to_intended_m = float(ti_facade)
-        en_raw = math.hypot(miss_n, miss_e)
         if en_raw > 0.01:
             # Facade wall chord vs flat lat/lon footprint often diverge slightly;
             # scale E/N to the facade miss so report total matches compass/bars.
@@ -318,6 +323,42 @@ def compute_fire_correction(
 
 FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M = 2.0
 
+# Below this the coordinate-derived miss is itself ~zero, so a zero facade
+# estimate agrees with it rather than contradicting it.
+_FACADE_TI_MIN_GEO_M = 1.0
+# The facade chord may REFINE the coordinate miss (wall chord vs flat footprint
+# "diverge slightly" — the original intent); it may not replace it wholesale.
+_FACADE_TI_AGREE_FRACTION = 0.35
+
+
+def _facade_separation_agrees_with_geo(ti_facade_m: float, en_raw_m: float) -> bool:
+    """Is the facade wall-chord separation close enough to the coordinate one to
+    refine it, rather than replace it with something else entirely?
+
+    The facade estimate comes from the ANGLE BETWEEN TWO VIDEO PICKS times the
+    laser slant. It only carries information when the two picks sit at different
+    places in the frame. On a boresight-only rangefinder (Viewpro) every LRF pick
+    is pinned to frame centre and the operator slews the gimbal between marks
+    instead — so both picks read (0.5, 0.5), the angle between them is zero, and
+    the facade chord collapses to 0 m no matter how far apart the marks really
+    are. The real separation is then carried entirely by the coordinates.
+
+    Without this guard that 0 m became the scale factor for East/North, erasing a
+    genuine miss: field report 2026-08-18 shipped a report reading "Miss 0.0 m"
+    for marks 42.7 m apart, while the along/right pair — computed from ranges and
+    bearings rather than from the pick geometry — correctly showed 18.5 m short
+    and 38.5 m right. Refine only when the two agree; never let a degenerate
+    facade estimate overwrite a coordinate-derived miss.
+    """
+    if en_raw_m <= _FACADE_TI_MIN_GEO_M:
+        return True  # both ~zero (a direct hit): nothing to contradict
+    gap = abs(float(ti_facade_m) - float(en_raw_m))
+    return gap <= max(
+        FIRE_CORRECTION_MISS_CONSISTENCY_TOL_M,
+        _FACADE_TI_AGREE_FRACTION * float(en_raw_m),
+    )
+
+
 
 def fire_correction_en_miss_m(c: FireCorrection) -> float:
     """Horizontal miss from East/North components: √(E² + N²)."""
@@ -325,8 +366,35 @@ def fire_correction_en_miss_m(c: FireCorrection) -> float:
 
 
 def fire_correction_miss_consistency_gap_m(c: FireCorrection) -> float:
-    """|target→impact horizontal miss − √(E²+N²)|."""
+    """|target→impact horizontal miss − √(E²+N²)|.
+
+    NOTE this is a WEAK check: when the facade refinement applies it rescales
+    E/N to the headline miss, so the two sides are equal by construction. Use
+    :func:`fire_correction_gunline_gap_m` for an independent cross-check.
+    """
     return abs(float(c.impact_to_intended_m) - fire_correction_en_miss_m(c))
+
+
+def fire_correction_gunline_miss_m(c: FireCorrection) -> float:
+    """Horizontal miss implied by the gun-line pair: √(along² + right²)."""
+    return math.hypot(float(c.miss_along_m), float(c.miss_right_m))
+
+
+def fire_correction_gunline_gap_m(c: FireCorrection) -> float:
+    """|headline horizontal miss − √(along² + right²)|.
+
+    The along/right pair is derived from gun→target and gun→impact RANGES AND
+    BEARINGS, never from the East/North delta or the video pick geometry, so it
+    is a genuinely independent estimate of the same quantity. Any disagreement
+    means one of the two pipelines is wrong.
+
+    This is the check that would have caught the 2026-08-18 field report, where
+    a degenerate facade estimate zeroed the headline miss and East/North while
+    along/right still correctly read 18.5 m short and 38.5 m right — a 42.7 m
+    gap that the √(E²+N²) check could not see, because the same rescale that
+    broke the headline had also forced E/N to match it.
+    """
+    return abs(float(c.impact_to_intended_m) - fire_correction_gunline_miss_m(c))
 
 
 def fire_correction_miss_is_consistent(
