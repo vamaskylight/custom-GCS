@@ -94,7 +94,12 @@ def assess_dooaf_trust(session: DooafSession | None) -> DooafTrust:
 
     # --- completeness: the three marks + a computed correction --------------------------
     missing = []
-    if session.gun is None:
+    # A deliberately un-surveyed gun is not a missing one. In assumed-direction
+    # mode `session.gun` is None on purpose (so nothing publishes a fabricated
+    # coordinate) while the correction is still fully computed from the firing
+    # bearing — blocking here would mark a perfectly good report "Not usable".
+    gun_assumed = bool(getattr(session, "gun_is_assumed", False))
+    if session.gun is None and not gun_assumed:
         missing.append("gun")
     if session.intended is None:
         missing.append("target")
