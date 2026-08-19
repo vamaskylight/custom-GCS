@@ -65,6 +65,11 @@ _POST_JOG_HOLD_DELAY_S = 0.35
 # Set VGCS_VIEWPRO_LRF_IDLE_STOP_S to tune; 0 restores stop-immediately.
 _LRF_IDLE_STOP_S = 10.0
 
+# A stabilised gimbal holds roll within a fraction of a degree; past this the
+# picture is visibly tilted and it is worth saying so once rather than at 2 Hz.
+_GIMBAL_ROLL_LEVEL_DEG = 3.0
+_GIMBAL_ROLL_LOG_INTERVAL_S = 10.0
+
 # While a DOOAF/observation session is open the operator takes several ranges
 # minutes apart (aiming the gimbal, working the dialog), so _LRF_IDLE_STOP_S
 # expires between every one and each pick pays the laser's 5-7s cold start —
@@ -171,6 +176,9 @@ class ViewproGimbalTcpAdapter:
         self._lrf_streaming = False
         self._lrf_session_hold = False
         self._lrf_session_hold_mono = 0.0
+        self._last_roll_deg: float | None = None
+        self._gimbal_roll_was_level = True
+        self._last_roll_log_mono = 0.0
         self._sensor_is_ir = False
         self._lrf_idle_stop_timer: threading.Timer | None = None
         self._last_hfov_deg: float | None = None
@@ -266,6 +274,7 @@ class ViewproGimbalTcpAdapter:
         )
         with self._status_lock:
             self._status = st
+        self._note_gimbal_roll(parsed.get("roll_deg"))
         self._note_servo_mode(parsed.get("servo_status"))
         rec = parsed.get("record_status")
         if rec is not None:
@@ -485,6 +494,39 @@ class ViewproGimbalTcpAdapter:
     def query_tracker_status(self) -> tuple[int, int] | None:
         """(track_status, track_target_type) as last reported, or None."""
         return self._last_tracker_status
+
+    def _note_gimbal_roll(self, roll_deg: float | None) -> None:
+        """Log the gimbal's own roll angle when it stops holding level.
+
+        The camera reports roll in B1 and we decode it, but nothing ever looked
+        at it. Field report 2026-08-19: "the camera feed rotates while the drone
+        is flying" — VGCS never rotates the frame (the preview path is
+        fromImage -> scaled -> setPixmap), so a tilted picture means the gimbal
+        itself is rolled. Without this there was no way to tell that from the
+        log, only from a screenshot.
+        """
+        try:
+            roll = float(roll_deg)
+        except (TypeError, ValueError):
+            return
+        self._last_roll_deg = roll
+        level = abs(roll) <= _GIMBAL_ROLL_LEVEL_DEG
+        was_level = bool(getattr(self, "_gimbal_roll_was_level", True))
+        now = time.monotonic()
+        if level:
+            if not was_level:
+                print(f"[VGCS:viewpro] gimbal roll back to level ({roll:+.1f} deg)")
+            self._gimbal_roll_was_level = True
+            return
+        self._gimbal_roll_was_level = False
+        if now - float(getattr(self, "_last_roll_log_mono", 0.0) or 0.0) < _GIMBAL_ROLL_LOG_INTERVAL_S:
+            return
+        self._last_roll_log_mono = now
+        print(
+            f"[VGCS:viewpro] gimbal ROLLED {roll:+.1f} deg — the picture will look "
+            "tilted by this much; VGCS does not rotate the video, so this is the "
+            "gimbal's roll axis not holding level"
+        )
 
     def _note_servo_mode(self, status: object) -> None:
         """Log the gimbal's own reported servo mode whenever it changes.

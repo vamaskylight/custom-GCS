@@ -258,6 +258,26 @@ class WebBridgeMixin:
                         else:
                             self._sync_payload_hardware_recording(False)
                             self._stop_native_cam_recording_tick_timer()
+                            # Say so. This failed silently — the button un-checked
+                            # itself and the timer sat at 00:00:00 with no reason
+                            # given, so the operator had no way to tell a failed
+                            # start from a recording in progress. Field report
+                            # 2026-08-19: "I click recording, video should save on
+                            # the PC, that's not shown".
+                            reason = (
+                                "no live video — recording captures the preview stream, "
+                                "so wait for the feed to come back and retry"
+                            )
+                            try:
+                                if shutil.which("ffmpeg") is None:
+                                    reason = "ffmpeg not found on this PC (required for recording)"
+                            except Exception:
+                                pass
+                            try:
+                                print(f"[VGCS:cam_rail] RECORD start FAILED — {reason}")
+                            except Exception:
+                                pass
+                            self._set_status(f"Recording did not start — {reason}")
                     if (not want_on) and bool(getattr(self, "_video_recording", False)):
                         stop_sid = str(getattr(self, "_video_recording_source_id", "") or "").strip()
                         stop_src = self._video_source_by_id(stop_sid) if stop_sid else src
