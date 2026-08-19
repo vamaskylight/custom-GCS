@@ -353,6 +353,23 @@ class MavlinkThread(QThread):
                             " — No MAVLink peer on that endpoint yet (start SITL or the vehicle stack; "
                             "confirm serial vs UDP; for listen-first links try udpin:0.0.0.0:14550)."
                         )
+                    elif not isinstance(e, OSError):
+                        # Not a link/socket problem — something in message
+                        # handling threw, and the bare message is unlocatable.
+                        # Field log 2026-08-19 closed the link on "'NoneType'
+                        # object does not support item assignment" with nothing
+                        # to say where; a traceback makes the next one findable.
+                        import traceback
+
+                        try:
+                            print(
+                                "[VGCS:link] message handling failed — closing link\n"
+                                + "".join(
+                                    traceback.format_exception(type(e), e, e.__traceback__)
+                                )
+                            )
+                        except Exception:
+                            pass
                     self.error.emit(detail)
                 break
 

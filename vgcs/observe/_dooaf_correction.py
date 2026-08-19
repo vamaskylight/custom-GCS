@@ -7,6 +7,8 @@ import math
 from typing import Any
 
 from vgcs.observe._dooaf_types import (
+    ASSUMED_GUN_DIRECTIONS,
+    DEFAULT_ASSUMED_GUN_BEARING_DEG,
     DOOAF_ROLE_GUN,
     DOOAF_ROLE_IMPACT,
     DOOAF_ROLE_INTENDED,
@@ -1288,13 +1290,13 @@ def dooaf_export_blockers(
     # A missing gun is only a problem when one was supposed to be surveyed. In
     # assumed-direction mode the operator deliberately marks target and impact
     # only, so warning about it would be telling them off for using the feature.
-    gun_required = assumed_gun_bearing_deg is None
-    if gun_required and (gun_lat is None or gun_lon is None):
+    if gun_lat is None or gun_lon is None:
         warnings.append(
-            "DOOAF Setup incomplete (gun and/or target missing). "
-            "Fire correction will be partial."
+            "No artillery position — correction is relative to an assumed "
+            f"{_assumed_gun_direction_phrase(assumed_gun_bearing_deg)} firing line. "
+            "Set the gun in DOOAF Setup for a surveyed correction."
         )
-    elif target_lat is None or target_lon is None:
+    if target_lat is None or target_lon is None:
         warnings.append(
             "DOOAF Setup incomplete (target missing). Fire correction will be partial."
         )
@@ -1818,6 +1820,19 @@ def write_dooaf_settings(st: Any, settings: DooafSettings) -> None:
 _ASSUMED_GUN_STANDOFF_M = 3000.0
 
 
+def _assumed_gun_direction_phrase(firing_bearing_deg: float | None) -> str:
+    """Short "south of target" style phrase for status and warning text."""
+    brg = (
+        DEFAULT_ASSUMED_GUN_BEARING_DEG
+        if firing_bearing_deg is None
+        else float(firing_bearing_deg)
+    ) % 360.0
+    for name, deg in ASSUMED_GUN_DIRECTIONS:
+        if abs((brg - deg + 180.0) % 360.0 - 180.0) < 1.0:
+            return name.split(" (")[0].lower()
+    return f"{brg:.0f}°"
+
+
 def _assumed_gun_point(target: GeoPoint, firing_bearing_deg: float) -> GeoPoint | None:
     """A notional gun `firing_bearing_deg` BEHIND the target.
 
@@ -1899,9 +1914,23 @@ def build_dooaf_session(
     # against. The standoff distance is arbitrary and provably does not change
     # the answer (see _ASSUMED_GUN_STANDOFF_M), but the resulting coordinate is
     # fiction and the session is flagged so the report never shows it.
-    if assumed_gun_bearing_deg is not None and gun is None and intended is not None:
-        gun = _assumed_gun_point(intended, float(assumed_gun_bearing_deg))
+    if gun is None and intended is not None:
+        # No direction configured either? Fall back to the default rather than
+        # producing no correction at all. Field report 2026-08-20: the operator
+        # marked target and impact, got a report with no correction and every
+        # direction field blank, and asked "our artillery gun is default at 0
+        # degree right??" — they expect marking two points to be enough. This is
+        # safe to default because a SURVEYED gun always wins (checked above) and
+        # the report states plainly that the position was assumed, not measured.
+        bearing = (
+            float(assumed_gun_bearing_deg)
+            if assumed_gun_bearing_deg is not None
+            else DEFAULT_ASSUMED_GUN_BEARING_DEG
+        )
+        gun = _assumed_gun_point(intended, bearing)
         gun_is_assumed = gun is not None
+        if gun_is_assumed:
+            assumed_gun_bearing_deg = bearing
     impact = latest_mark(rows, DOOAF_ROLE_IMPACT)
     if impact is None and impact_row is not None:
         apply_dooaf_impact_geo_fallback(

@@ -131,6 +131,10 @@ class DooafSettings:
     assumed_gun_bearing_deg: float | None = None
 
 
+# Used when no gun is surveyed and no direction was chosen — artillery to the
+# south firing north, which is the deployment convention this was built for.
+DEFAULT_ASSUMED_GUN_BEARING_DEG = 0.0
+
 # Where the artillery is taken to sit relative to the target, and the resulting
 # gun→target firing bearing. South-of-target fires north (0°), and so on.
 ASSUMED_GUN_DIRECTIONS: tuple[tuple[str, float], ...] = (
