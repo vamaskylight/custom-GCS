@@ -1471,8 +1471,14 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
     span_e = max(max(east_vals) - min(east_vals), 20.0)
     span_n = max(max(north_vals) - min(north_vals), 20.0)
     c = session.correction
-    range_gt = float(c.range_gun_to_intended_m) if c else 0.0
-    range_gi = float(c.range_gun_to_impact_m) if c else 0.0
+    # With no surveyed gun these two are measured from the synthetic standoff
+    # point, i.e. they are the invented number. Zero suppresses both the footer
+    # lines and the on-map callouts below (`if range_gt > 0`). Field report
+    # 2026-08-20: this map printed "gun→target 3000.0 m" directly above a
+    # technical table that correctly said the distance was unknown.
+    gun_assumed = bool(getattr(session, "gun_is_assumed", False))
+    range_gt = float(c.range_gun_to_intended_m) if (c and not gun_assumed) else 0.0
+    range_gi = float(c.range_gun_to_impact_m) if (c and not gun_assumed) else 0.0
     miss_ti = float(c.impact_to_intended_m) if c else 0.0
     drone_dist = ""
     if session.drone is not None and session.intended is not None:
@@ -1483,7 +1489,13 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
             session.drone.lon,
         )
         drone_dist = f"{math.hypot(d_n, d_e):.1f} m"
-    dist_lines = [f"gun→target {range_gt:.1f} m", f"gun→impact {range_gi:.1f} m"]
+    dist_lines: list[str] = []
+    if range_gt > 0:
+        dist_lines.append(f"gun→target {range_gt:.1f} m")
+    if range_gi > 0:
+        dist_lines.append(f"gun→impact {range_gi:.1f} m")
+    if gun_assumed:
+        dist_lines.append("gun not surveyed")
     if drone_dist:
         dist_lines.append(f"target→drone {drone_dist}")
     miss_lines = [f"target→impact {miss_ti:.1f} m"] if miss_ti > 0 else ["—"]
