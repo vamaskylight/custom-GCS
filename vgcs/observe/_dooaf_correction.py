@@ -40,6 +40,9 @@ _QS_TARGET_LON = "dooaf/target_lon"
 
 _QS_TARGET_ALT = "dooaf/target_alt_m"
 
+# Gun→target firing bearing used when the artillery is not surveyed at all.
+_QS_ASSUMED_GUN_BEARING = "dooaf/assumed_gun_bearing_deg"
+
 _QS_PRESETS_JSON = "dooaf/presets_json"
 
 _QS_SETUP_VIDEO_MARKS_JSON = "dooaf/setup_video_marks_json"
@@ -1261,6 +1264,7 @@ def dooaf_export_blockers(
     target_lon: float | None = None,
     setup_video_marks: dict[str, tuple[float, float]] | None = None,
     dem_path: str | Path | None = None,
+    assumed_gun_bearing_deg: float | None = None,
 ) -> list[str]:
     """Human-readable export warnings after impact geo fallback attempts."""
     warnings: list[str] = []
@@ -1281,10 +1285,18 @@ def dooaf_export_blockers(
             "Arm, hover at least 3 m, wait for GPS, then mark fall of shot again."
         )
         return warnings
-    if gun_lat is None or gun_lon is None or target_lat is None or target_lon is None:
+    # A missing gun is only a problem when one was supposed to be surveyed. In
+    # assumed-direction mode the operator deliberately marks target and impact
+    # only, so warning about it would be telling them off for using the feature.
+    gun_required = assumed_gun_bearing_deg is None
+    if gun_required and (gun_lat is None or gun_lon is None):
         warnings.append(
             "DOOAF Setup incomplete (gun and/or target missing). "
             "Fire correction will be partial."
+        )
+    elif target_lat is None or target_lon is None:
+        warnings.append(
+            "DOOAF Setup incomplete (target missing). Fire correction will be partial."
         )
     q = str(impact_row.get("geo_quality") or "")
     if q in ("insufficient", ""):
@@ -1436,6 +1448,7 @@ def read_dooaf_settings(st: Any) -> DooafSettings:
         target_lat=_qs_float(st, _QS_TARGET_LAT),
         target_lon=_qs_float(st, _QS_TARGET_LON),
         target_alt_m=_qs_float(st, _QS_TARGET_ALT),
+        assumed_gun_bearing_deg=_qs_float(st, _QS_ASSUMED_GUN_BEARING),
     )
 
 def read_dooaf_setup_video_marks(st: Any) -> dict[str, tuple[float, float]]:
@@ -1710,6 +1723,7 @@ def enrich_dooaf_settings_elevation_from_dem(
         target_lat=settings.target_lat,
         target_lon=settings.target_lon,
         target_alt_m=tgt_alt,
+        assumed_gun_bearing_deg=settings.assumed_gun_bearing_deg,
     )
 
 def apply_map_pick_to_settings(
@@ -1729,6 +1743,7 @@ def apply_map_pick_to_settings(
             target_lat=base.target_lat,
             target_lon=base.target_lon,
             target_alt_m=base.target_alt_m,
+            assumed_gun_bearing_deg=base.assumed_gun_bearing_deg,
         )
     if role == DOOAF_ROLE_INTENDED:
         tgt_alt = float(alt_m) if alt_m is not None else base.target_alt_m
@@ -1739,6 +1754,7 @@ def apply_map_pick_to_settings(
             target_lat=float(lat),
             target_lon=float(lon),
             target_alt_m=tgt_alt,
+            assumed_gun_bearing_deg=base.assumed_gun_bearing_deg,
         )
     return base
 
@@ -1765,6 +1781,7 @@ def resolved_dooaf_settings(
         target_alt_m=base.target_alt_m
         if base.target_alt_m is not None
         else (tgt.alt_m if tgt else None),
+        assumed_gun_bearing_deg=base.assumed_gun_bearing_deg,
     )
 
 def dooaf_settings_kwargs(settings: DooafSettings) -> dict[str, float | None]:
@@ -1775,6 +1792,7 @@ def dooaf_settings_kwargs(settings: DooafSettings) -> dict[str, float | None]:
         "target_lat": settings.target_lat,
         "target_lon": settings.target_lon,
         "target_alt_m": settings.target_alt_m,
+        "assumed_gun_bearing_deg": settings.assumed_gun_bearing_deg,
     }
 
 def write_dooaf_settings(st: Any, settings: DooafSettings) -> None:
@@ -1785,11 +1803,41 @@ def write_dooaf_settings(st: Any, settings: DooafSettings) -> None:
         (_QS_TARGET_LAT, settings.target_lat),
         (_QS_TARGET_LON, settings.target_lon),
         (_QS_TARGET_ALT, settings.target_alt_m),
+        (_QS_ASSUMED_GUN_BEARING, settings.assumed_gun_bearing_deg),
     ):
         if val is None:
             st.remove(key)
         else:
             st.setValue(key, float(val))
+
+# How far "up-range" the notional gun is placed when it is not surveyed. The
+# value is arbitrary: along/right come out of the gun→target BEARING, and the
+# standoff cancels in the decomposition — 0.5 km and 50 km agree to 0.02 m,
+# which is haversine-vs-flat-earth rounding, not a standoff effect. Kept at a
+# plausible artillery range so any debug dump looks sane rather than absurd.
+_ASSUMED_GUN_STANDOFF_M = 3000.0
+
+
+def _assumed_gun_point(target: GeoPoint, firing_bearing_deg: float) -> GeoPoint | None:
+    """A notional gun `firing_bearing_deg` BEHIND the target.
+
+    ``firing_bearing_deg`` is gun→target, so the gun sits on the reciprocal:
+    firing north (0°) puts the gun due south, which is the configuration the
+    client asked for.
+    """
+    try:
+        lat = float(target.lat)
+        lon = float(target.lon)
+        brg = math.radians((float(firing_bearing_deg) + 180.0) % 360.0)
+    except (TypeError, ValueError):
+        return None
+    north = _ASSUMED_GUN_STANDOFF_M * math.cos(brg)
+    east = _ASSUMED_GUN_STANDOFF_M * math.sin(brg)
+    from vgcs.observe.geo_reference import _offset_lat_lon
+
+    g_lat, g_lon = _offset_lat_lon(lat, lon, north, east)
+    return GeoPoint(g_lat, g_lon, target.alt_m)
+
 
 def validate_dooaf_settings(settings: DooafSettings) -> str | None:
     """Return error message, or None when coordinates are valid."""
@@ -1821,6 +1869,7 @@ def build_dooaf_session(
     dem_path: str | Path | None = None,
     setup_video_marks: dict[str, tuple[float, float]] | None = None,
     facade_slant_range_m: float | None = None,
+    assumed_gun_bearing_deg: float | None = None,
 ) -> DooafSession:
     setup_video_marks = merge_setup_video_marks(setup_video_marks)
     if not _setup_video_marks_complete(setup_video_marks):
@@ -1840,10 +1889,19 @@ def build_dooaf_session(
         gun_lat=gun_lat, gun_lon=gun_lon, gun_alt_m=gun_alt_m
     )
     gun = _fill_point_alt_m(gun, gun_row, gun_alt_m, dem_path=dem_path)
+    gun_is_assumed = False
     intended = latest_mark(rows, DOOAF_ROLE_INTENDED) or point_from_latlon(
         lat=target_lat, lon=target_lon, alt_m=target_alt_m
     )
     intended = _fill_point_alt_m(intended, intended_row, target_alt_m, dem_path=dem_path)
+    # No surveyed gun: place one on the far side of the target along the given
+    # firing bearing purely so the along/right decomposition has a line to work
+    # against. The standoff distance is arbitrary and provably does not change
+    # the answer (see _ASSUMED_GUN_STANDOFF_M), but the resulting coordinate is
+    # fiction and the session is flagged so the report never shows it.
+    if assumed_gun_bearing_deg is not None and gun is None and intended is not None:
+        gun = _assumed_gun_point(intended, float(assumed_gun_bearing_deg))
+        gun_is_assumed = gun is not None
     impact = latest_mark(rows, DOOAF_ROLE_IMPACT)
     if impact is None and impact_row is not None:
         apply_dooaf_impact_geo_fallback(
@@ -2020,7 +2078,12 @@ def build_dooaf_session(
                 # Both from the DEM: one reference, so the difference is sound.
                 height_correction_m = float(intended_dem) - float(impact_dem)
     return DooafSession(
-        gun=gun,
+        # A synthesised gun exists only to give the correction a firing line.
+        # Publishing it would put a fabricated coordinate on the map, in the
+        # coordinate table and in every gun→x distance, indistinguishable from a
+        # surveyed one. Leaving it None makes every existing `if session.gun is
+        # not None` render nothing, which is exactly right.
+        gun=None if gun_is_assumed else gun,
         intended=intended,
         impact=impact,
         drone=drone,
@@ -2031,6 +2094,10 @@ def build_dooaf_session(
         height_correction_m=height_correction_m,
         dem_available=_dem_terrain_available(dem_path),
         dem_footprint_reliable=_dem_footprint_reliable(intended_row, impact_row),
+        gun_is_assumed=gun_is_assumed,
+        assumed_gun_bearing_deg=(
+            float(assumed_gun_bearing_deg) if gun_is_assumed else None
+        ),
         **_session_trust_signals(impact_row),
     )
 
