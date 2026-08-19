@@ -300,6 +300,27 @@ body{
 .exec-story-lead .exec-big{font-size:1.35rem;font-weight:800;color:#065f46;}
 .exec-visual-row{display:grid;grid-template-columns:minmax(220px,300px) 1fr;gap:18px;align-items:start;margin-top:16px;}
 .report-collapsible{margin-top:14px;border:1px solid var(--border-light);border-radius:var(--radius-sm);background:#fafbfc;}
+/* Foldable section cards — supporting detail is kept but folded away, so the
+   answer is not buried under sections nobody opened. The summary IS the card
+   heading, so it must look identical to a normal one. */
+.section-foldable .section-fold>summary{
+  cursor:pointer;list-style:none;user-select:none;position:relative;
+  padding-right:40px;transition:background .15s;
+}
+.section-foldable .section-fold>summary::-webkit-details-marker{display:none;}
+.section-foldable .section-fold>summary:hover{background:#f1f5f9;}
+.section-foldable .section-fold>summary::after{
+  content:'A';position:absolute;right:20px;top:50%;
+  transform:translateY(-50%) rotate(90deg);transition:transform .18s ease;
+  color:var(--muted);font-size:20px;line-height:1;font-weight:700;
+}
+.section-foldable .section-fold[open]>summary::after{transform:translateY(-50%) rotate(-90deg);}
+.section-foldable .section-fold[open]>summary{border-bottom:1px solid var(--border-light);}
+.exec-story-sub{color:#0f766e;opacity:.85;}
+@media print{
+  .section-foldable .section-fold>summary::after{display:none;}
+  .section-foldable .section-fold>.section-body{display:block!important;}
+}
 .report-collapsible summary{
   cursor:pointer;padding:14px 16px;font-weight:600;font-size:13px;color:#475569;
   list-style:none;user-select:none;transition:background .15s;
@@ -331,75 +352,42 @@ body{
   padding:14px 16px;margin-top:16px;
 }
 .next-round-box h4{margin:0 0 10px;font-size:.8rem;color:#047857;text-transform:uppercase;letter-spacing:.05em;font-weight:700;}
-.reading-guide{
   background:#fff;border:1px solid var(--border-light);border-radius:var(--radius);
   margin-bottom:18px;box-shadow:var(--shadow-sm);overflow:hidden;
 }
-.reading-guide-head{padding:16px 20px;background:linear-gradient(90deg,#f0f9ff 0%,#fff 100%);
   border-bottom:1px solid var(--border-light);}
-.reading-guide h3{margin:0;font-size:1rem;color:#0369a1;font-weight:800;}
-.reading-guide-intro{margin:6px 0 0;font-size:13px;color:var(--muted);line-height:1.45;}
-.guide-flow{
   display:flex;flex-wrap:wrap;align-items:center;gap:6px 4px;padding:14px 20px;
   background:#f8fafc;border-bottom:1px solid var(--border-light);
 }
-.guide-flow-label{
   font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
   color:var(--muted);margin-right:8px;
 }
-.guide-flow-step{
   display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:999px;
   background:#fff;border:1px solid var(--border);font-size:12px;font-weight:600;
   color:var(--text);text-decoration:none;transition:all .15s ease;
 }
-.guide-flow-step:hover{background:var(--accent);border-color:var(--accent);color:#fff;}
-.guide-flow-step:hover .guide-flow-num{background:rgba(255,255,255,.25);color:#fff;}
-.guide-flow-num{
   width:20px;height:20px;border-radius:50%;background:#e2e8f0;color:#475569;
   font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;line-height:1;
 }
-.guide-flow-arrow{color:#94a3b8;font-size:12px;font-weight:700;padding:0 2px;}
-.guide-cards{
   display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px 20px 20px;
 }
-.guide-card{
   display:flex;flex-direction:column;gap:10px;padding:14px 14px 12px;
   background:#fff;border:1px solid var(--border-light);border-radius:var(--radius-sm);
   text-decoration:none;color:inherit;transition:transform .15s ease,box-shadow .15s ease,border-color .15s;
   min-height:120px;
 }
-.guide-card:hover{
   transform:translateY(-2px);box-shadow:0 8px 20px rgba(15,23,42,.08);
   border-color:#cbd5e1;
 }
-.guide-card-top{display:flex;align-items:flex-start;gap:10px;}
-.guide-card-icon{
   flex-shrink:0;width:40px;height:40px;border-radius:10px;display:flex;
   align-items:center;justify-content:center;font-size:18px;line-height:1;
 }
-.guide-card-icon svg{width:28px;height:28px;display:block;}
-.guide-card--summary .guide-card-icon{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;}
-.guide-card--story .guide-card-icon{background:#fff7ed;color:#c2410c;border:1px solid #fed7aa;}
-.guide-card--diagrams .guide-card-icon{background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe;}
-.guide-card--tables .guide-card-icon{background:#f1f5f9;color:#475569;border:1px solid #e2e8f0;}
-.guide-card--map .guide-card-icon{background:#f5f3ff;color:#7c3aed;border:1px solid #ddd6fe;}
-.guide-card--nav .guide-card-icon{background:#f0f9ff;color:#0369a1;border:1px solid #bae6fd;}
-.guide-card-title{display:block;font-size:13px;font-weight:700;color:var(--text);line-height:1.25;}
-.guide-card-desc{display:block;font-size:11px;color:var(--muted);line-height:1.4;margin-top:2px;}
-.guide-card-link{
   font-size:10px;font-weight:700;color:var(--accent);margin-top:auto;
   text-transform:uppercase;letter-spacing:.04em;
 }
-.guide-card:hover .guide-card-link{color:#1d4ed8;}
-.guide-preview{
   height:36px;border-radius:6px;background:#fafbfc;border:1px dashed var(--border);
   display:flex;align-items:center;justify-content:center;gap:4px;padding:4px 8px;
 }
-.guide-preview-dot{width:8px;height:8px;border-radius:50%;}
-.guide-preview-bar{height:6px;border-radius:3px;background:linear-gradient(90deg,#fb923c,#ea580c);}
-.guide-preview-bar-corr{background:linear-gradient(90deg,#2dd4bf,#0d9488);}
-@media (max-width:900px){.guide-cards{grid-template-columns:repeat(2,1fr);}}
-@media (max-width:560px){.guide-cards{grid-template-columns:1fr;}.guide-flow{justify-content:flex-start;}}
 .report-glossary details{border:1px solid var(--border-light);border-radius:var(--radius-sm);padding:12px 16px;background:#fafbfc;}
 .report-glossary summary{cursor:pointer;font-weight:600;color:#475569;font-size:.9rem;}
 .report-glossary dl{margin:12px 0 0;font-size:.85rem;}

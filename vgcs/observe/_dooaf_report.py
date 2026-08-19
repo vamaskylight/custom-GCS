@@ -65,7 +65,14 @@ def _report_section_card(
     extra_class: str = "",
     section_id: str = "",
     subtitle: str = "",
+    collapsed: bool = False,
 ) -> str:
+    """One card. `collapsed=True` folds it behind its own heading.
+
+    Supporting detail (elevation, gimbal angles, full geometry) is worth keeping
+    but not worth scrolling past to reach the answer, so those sections fold and
+    the reader opens the one they want.
+    """
     cls = "section-card"
     if extra_class:
         cls += f" {extra_class}"
@@ -75,6 +82,18 @@ def _report_section_card(
         if subtitle
         else ""
     )
+    if collapsed:
+        return (
+            f"<section class='{cls} section-foldable'{sid}>"
+            "<details class='section-fold'>"
+            "<summary class='section-head'>"
+            f"<h3 class='section-title'>{_html_esc(title)}</h3>"
+            f"{sub}"
+            "</summary>"
+            f"<div class='section-body'>{body}</div>"
+            "</details>"
+            "</section>"
+        )
     return (
         f"<section class='{cls}'{sid}>"
         "<div class='section-head'>"
@@ -136,12 +155,10 @@ def _report_nav_link(section_id: str, label: str) -> str:
 
 def format_report_nav_html(session: DooafSession | None = None) -> str:
     has_corr = session is not None and session.correction is not None
-    links = [
-        _report_nav_link("summary", "Summary"),
-        _report_nav_link("guide", "Guide"),
-    ]
+    # No "Guide" entry — the reading guide it pointed at is gone.
+    links = [_report_nav_link("summary", "Summary")]
     if has_corr:
-        links.append(_report_nav_link("correction", "Correction"))
+        links.append(_report_nav_link("correction", "Numbers"))
     links.extend(
         [
             _report_nav_link("positions", "Map"),
@@ -239,7 +256,9 @@ def format_camera_orientation_html(row: dict[str, Any] | None) -> str:
         "</div>"
         "</div>"
     )
-    return _report_section_card("Camera / gimbal at observation", body, extra_class="dooaf-camera")
+    return _report_section_card(
+        "Camera / gimbal at observation", body, extra_class="dooaf-camera", collapsed=True
+    )
 
 def format_dooaf_status(session: DooafSession) -> str:
     parts: list[str] = []
@@ -2103,7 +2122,8 @@ def _executive_summary_visual_html(session: DooafSession) -> str:
         + "<span class='fc-dot fc-dot-drone'></span> Drone · "
         "<span class='lr-icon lr-pos'>+</span>/<span class='lr-icon lr-neg'>−</span> direction"
         "</p>"
-        + _executive_miss_chips_html(c)
+        # Chips removed: the compass immediately above already labels the
+        # same two components on its own axes.
         + "</div></div>"
     )
     bridge = (
@@ -2262,16 +2282,21 @@ def format_executive_summary_html(session: DooafSession) -> str:
 
     horiz = float(c.impact_to_intended_m)
     range_line = _plain_range_sentence(c)
+    # One sentence. The magnitude is already the hero KPI and the compass, and
+    # the range line ("landed 7.3 m short") restates the along-line figure the
+    # correction cards carry — so prose says only the thing prose says best:
+    # which way it went. Measured 2026-08-20: this number appeared 5 times
+    # inside the summary alone.
     story_parts = [
         "<div class='exec-story-lead'>",
-        f"<p><span class='exec-big'>{horiz:.1f} m</span> total miss from the intended target.</p>",
-        f"<p>Impact was <strong>{_plain_horizontal_miss_sentence(c)}</strong>.</p>",
-        f"<p>{range_line}</p>",
+        f"<p><span class='exec-big'>{horiz:.1f} m</span> miss — impact was "
+        f"<strong>{_plain_horizontal_miss_sentence(c)}</strong>.</p>",
     ]
     vert = _plain_vertical_sentence(c)
     if vert:
-        story_parts.append(f"<p>{vert}</p>")
+        story_parts.append(f"<p class='exec-story-sub'>{vert}</p>")
     story_parts.append("</div>")
+    del range_line
     story_lead = "".join(story_parts)
 
     return (
@@ -2585,6 +2610,7 @@ def format_elevation_summary_html(session: DooafSession) -> str:
             + "</tbody></table>"
         ),
         extra_class="dooaf-elevation-summary",
+        collapsed=True,
     )
 
 def format_client_fire_correction_html(session: DooafSession) -> str:
@@ -2633,13 +2659,17 @@ def format_client_fire_correction_html(session: DooafSession) -> str:
             f"<td>{_format_signed_correction_dir(up_down, pos_label='Up', neg_label='Down')}</td></tr>"
         )
 
+    # The five diagrams that used to sit here (3-step story, plan view, gun
+    # line, compass, bar chart) all redrew the same target→impact vector the
+    # summary compass already shows, and the bar chart restated numbers printed
+    # a few centimetres above. Measured before this change: 8 diagrams, the
+    # range correction printed 14 times, the deflection 13 — which is why the
+    # report needed a 6-card guide explaining how to read it.
     return _report_section_card(
-        "Fire correction",
+        "Exact numbers",
         (
-            "<p class='log-hint'>Visual explanation first — open tables below for exact numbers.</p>"
-            + format_fire_correction_diagram_html(session)
-            + "<details class='report-collapsible'>"
-            "<summary>Exact miss & correction numbers (tables)</summary>"
+            "<details class='report-collapsible'>"
+            "<summary>Miss &amp; correction — full figures</summary>"
             "<div class='report-collapsible-body'>"
             "<table class='data-table dooaf-client-corr'>"
             "<thead><tr><th colspan='2'>Miss — impact relative to target</th></tr></thead>"
@@ -2655,7 +2685,7 @@ def format_client_fire_correction_html(session: DooafSession) -> str:
         ),
         extra_class="dooaf-client-corr",
         section_id="correction",
-        subtitle="Diagrams show where the round missed and what to add next.",
+        subtitle="The same figures as above, written out.",
     )
 
 def _format_video_x_html(row: dict[str, Any] | None) -> str:
@@ -2902,6 +2932,7 @@ def format_dooaf_html_summary(
             extra_class="dooaf-fire-corr section-technical",
             section_id="technical",
             subtitle="Detailed geometry for engineers and audit.",
+            collapsed=True,
         )
     obs_row = observation_row or None
     positions_map = _fire_correction_positions_svg(session)
@@ -2954,15 +2985,18 @@ def format_dooaf_html_summary(
         f"<div class='report-collapsible-body'>{session_table}</div>"
         "</details>"
     )
+    # Order is deliberate: the answer, then one picture of it, then everything
+    # else folded away. The reading guide is gone — a report that needs six
+    # cards explaining how to read it is telling you it is too complicated, and
+    # the fix is the report, not the instructions.
     return (
         format_executive_summary_html(session)
-        + format_report_reading_guide_html()
         + format_client_fire_correction_html(session)
         + _report_section_card(
             "Positions",
             session_body,
             section_id="positions",
-            subtitle="Gun, target, Impact Target, and drone — map plus coordinate table.",
+            subtitle="Coordinates for every mark.",
         )
         + format_elevation_summary_html(session)
         + format_camera_orientation_html(obs_row)
