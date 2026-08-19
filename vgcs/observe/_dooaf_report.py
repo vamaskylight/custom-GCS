@@ -23,6 +23,7 @@ from vgcs.observe._dooaf_correction import (
     latest_mark_row,
 )
 from vgcs.observe._dooaf_types import (
+    ASSUMED_GUN_DIRECTIONS,
     DOOAF_ROLE_GUN,
     DOOAF_ROLE_IMPACT,
     DOOAF_ROLE_INTENDED,
@@ -2702,6 +2703,50 @@ def _latest_drone_observation_row(
     return None
 
 
+def _assumed_gun_direction_label(firing_bearing_deg: float | None) -> str:
+    """Where the gun is taken to sit, phrased for an operator."""
+    try:
+        brg = float(firing_bearing_deg) % 360.0
+    except (TypeError, ValueError):
+        return "an assumed direction"
+    for name, deg in ASSUMED_GUN_DIRECTIONS:
+        if abs((brg - deg + 180.0) % 360.0 - 180.0) < 1.0:
+            return name
+    return f"an assumed firing bearing of {brg:.0f}°"
+
+
+def _gun_geometry_rows_html(session: DooafSession, c: FireCorrection) -> str:
+    """Gun-relative geometry rows — or an honest statement when there is no gun.
+
+    With no surveyed gun the position is synthesised purely to fix the firing
+    direction, so every gun→x distance is fiction. Printing them would be the
+    same class of error as the mixed-datum elevations: a number that looks
+    measured and is not. The along/right decomposition IS real — it depends only
+    on the bearing — so that stays.
+    """
+    if bool(getattr(session, "gun_is_assumed", False)):
+        where = _assumed_gun_direction_label(getattr(session, "assumed_gun_bearing_deg", None))
+        return (
+            "<tr><td class='label-col'>Artillery position</td>"
+            f"<td><strong>Not surveyed</strong> — assumed {_html_esc(where)}. "
+            "Range and deflection below are relative to that firing line; "
+            "gun-to-target and gun-to-impact distances are unknown and are "
+            "therefore not shown.</td></tr>"
+            f"<tr><td class='label-col'>Assumed firing bearing</td>"
+            f"<td>{float(c.bearing_gun_to_intended_deg):.0f}° "
+            "<span class='muted'>(direction the gun fires, not gimbal)</span></td></tr>"
+        )
+    return (
+        f"<tr><td class='label-col'>Gun → target range</td>"
+        f"<td>{c.range_gun_to_intended_m:.1f} m</td></tr>"
+        f"<tr><td class='label-col'>Gun → impact range</td>"
+        f"<td>{c.range_gun_to_impact_m:.1f} m</td></tr>"
+        f"<tr><td class='label-col'>Gun → target bearing</td>"
+        f"<td>{c.bearing_gun_to_intended_deg:.1f}° "
+        "<span class='muted'>(compass from gun to target, not gimbal)</span></td></tr>"
+    )
+
+
 def format_dooaf_html_summary(
     session: DooafSession,
     *,
@@ -2818,13 +2863,7 @@ def format_dooaf_html_summary(
                 f"<tr><td class='label-col'>Miss right</td><td>{c.miss_right_m:+.1f} m</td></tr>"
                 f"<tr><td class='label-col'>Miss north / east</td>"
                 f"<td>{c.miss_north_m:+.1f} m / {c.miss_east_m:+.1f} m</td></tr>"
-                f"<tr><td class='label-col'>Gun → target range</td>"
-                f"<td>{c.range_gun_to_intended_m:.1f} m</td></tr>"
-                f"<tr><td class='label-col'>Gun → impact range</td>"
-                f"<td>{c.range_gun_to_impact_m:.1f} m</td></tr>"
-                f"<tr><td class='label-col'>Gun → target bearing</td>"
-                f"<td>{c.bearing_gun_to_intended_deg:.1f}° "
-                "<span class='muted'>(compass from gun to target, not gimbal)</span></td></tr>"
+                + _gun_geometry_rows_html(session, c)
                 + building_row
                 + elev_corr_row
                 + elev_delta_row

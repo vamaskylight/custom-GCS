@@ -102,6 +102,12 @@ class DooafSession:
     impact_ekf_rel_alt_m: float | None = None
     gps_fix_type: int | None = None
     gps_hdop: float | None = None
+    # True when no gun was surveyed and its position was synthesised purely to
+    # fix the firing direction (see assumed_gun_bearing_deg). The gun's lat/lon
+    # and every gun→x range are then MEANINGLESS and must not be reported as if
+    # measured — only the along/right decomposition is real.
+    gun_is_assumed: bool = False
+    assumed_gun_bearing_deg: float | None = None
 
 @dataclass(frozen=True)
 class DooafSettings:
@@ -113,6 +119,27 @@ class DooafSettings:
     target_lat: float | None = None
     target_lon: float | None = None
     target_alt_m: float | None = None
+    # Compass bearing FROM GUN TO TARGET, used when the gun is not surveyed at
+    # all — the operator marks only target and impact and the artillery is taken
+    # as sitting on a known side. Client request 2026-08-19: "they directly mark
+    # on Target and impact point, artillery position fixed by South direction …
+    # so that we get fire correction data from the north direction" — a gun to
+    # the SOUTH firing NORTH, which is 0.0 here.
+    #
+    # None = normal mode: the gun is picked and the bearing derived from it.
+    # Any other value means gun_lat/gun_lon are not required.
+    assumed_gun_bearing_deg: float | None = None
+
+
+# Where the artillery is taken to sit relative to the target, and the resulting
+# gun→target firing bearing. South-of-target fires north (0°), and so on.
+ASSUMED_GUN_DIRECTIONS: tuple[tuple[str, float], ...] = (
+    ("South of target (fires north)", 0.0),
+    ("West of target (fires east)", 90.0),
+    ("North of target (fires south)", 180.0),
+    ("East of target (fires west)", 270.0),
+)
+
 
 @dataclass(frozen=True)
 class DooafPreset:

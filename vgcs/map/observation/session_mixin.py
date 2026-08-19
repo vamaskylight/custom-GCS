@@ -552,7 +552,11 @@ class ObservationSessionMixin:
             msg += f" — {format_dooaf_status(session)}"
             if dooaf_role == DOOAF_ROLE_IMPACT:
                 rs = self._resolved_dooaf_settings()
-                if rs.gun_lat is None or rs.target_lat is None:
+                if rs.assumed_gun_bearing_deg is not None:
+                    # Gun deliberately not surveyed — only the target is outstanding.
+                    if rs.target_lat is None:
+                        msg += " — set the target in DOOAF Setup for correction"
+                elif rs.gun_lat is None or rs.target_lat is None:
                     msg += " — complete DOOAF Setup (gun + target) for correction"
                 elif seg_m is not None:
                     msg += f" (miss {float(seg_m):.0f} m)"
@@ -1025,6 +1029,7 @@ class ObservationSessionMixin:
             target_lon=dooaf.get("target_lon"),  # type: ignore[arg-type]
             setup_video_marks=dooaf.get("setup_video_marks"),  # type: ignore[arg-type]
             dem_path=dooaf.get("dem_path"),  # type: ignore[arg-type]
+            assumed_gun_bearing_deg=dooaf.get("assumed_gun_bearing_deg"),  # type: ignore[arg-type]
         )
         self._obs_export_warnings = export_warnings
         if export_warnings:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QSettings, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from vgcs.observe.dooaf import (
+    ASSUMED_GUN_DIRECTIONS,
     DooafPreset,
     DooafSettings,
     delete_dooaf_preset,
@@ -93,6 +95,7 @@ def settings_from_edits(
     tgt_lat: QLineEdit,
     tgt_lon: QLineEdit,
     tgt_alt: QDoubleSpinBox,
+    assumed_gun_bearing_deg: float | None = None,
 ) -> DooafSettings:
     glat = _parse_coord(gun_lat.text())
     glon = _parse_coord(gun_lon.text())
@@ -104,6 +107,12 @@ def settings_from_edits(
         tlat = None
     has_gun = glat is not None and glon is not None
     has_tgt = tlat is not None and tlon is not None
+    if assumed_gun_bearing_deg is not None:
+        # The gun is not being surveyed; drop any coordinate left in the fields
+        # so a stale one from an earlier session cannot silently win over the
+        # assumed direction in build_dooaf_session.
+        glat = glon = None
+        has_gun = False
     return DooafSettings(
         # Keep whichever of lat/lon parsed even if its sibling didn't, so
         # validate_dooaf_settings' "needs both latitude and longitude" check
@@ -115,6 +124,7 @@ def settings_from_edits(
         target_lat=tlat,
         target_lon=tlon,
         target_alt_m=_optional_alt_value(tgt_alt) if has_tgt else None,
+        assumed_gun_bearing_deg=assumed_gun_bearing_deg,
     )
 
 
@@ -172,6 +182,25 @@ class DooafSetupDialog(QDialog):
 
         gun_box = QGroupBox("Artillery position (gun origin)")
         gun_form = QFormLayout(gun_box)
+        # Skip the gun survey entirely: mark only target and impact and take the
+        # artillery as sitting on a known side. Client request 2026-08-19 — the
+        # gun is fixed to the south, firing north, so range/deflection come out
+        # as north-south / east-west without a gun pick.
+        self._gun_assumed_chk = QCheckBox("No gun position — artillery is:")
+        self._gun_assumed_chk.setToolTip(
+            "Mark only the target and the impact. The artillery is taken to sit on "
+            "the chosen side, and range/deflection are given along that firing line.\n"
+            "Gun-to-target distance is unknown in this mode and is not reported."
+        )
+        self._gun_assumed_dir = QComboBox()
+        for label, deg in ASSUMED_GUN_DIRECTIONS:
+            self._gun_assumed_dir.addItem(label, float(deg))
+        assumed_row = QHBoxLayout()
+        assumed_row.setContentsMargins(0, 0, 0, 0)
+        assumed_row.setSpacing(6)
+        assumed_row.addWidget(self._gun_assumed_chk)
+        assumed_row.addWidget(self._gun_assumed_dir, 1)
+        gun_form.addRow("", assumed_row)
         self._gun_lat = _coord_edit(s.gun_lat)
         self._gun_lon = _coord_edit(s.gun_lon)
         self._gun_alt = _optional_alt_spin()
@@ -213,6 +242,23 @@ class DooafSetupDialog(QDialog):
         gun_actions.addStretch(1)
         gun_form.addRow("", gun_actions)
         root.addWidget(gun_box)
+
+        self._gun_coord_widgets = (
+            self._gun_lat,
+            self._gun_lon,
+            self._gun_alt,
+            btn_pick_gun,
+            btn_pick_gun_vid,
+            btn_pick_gun_lrf,
+            btn_clear_gun,
+        )
+        self._gun_assumed_chk.toggled.connect(self._on_gun_assumed_toggled)
+        if s.assumed_gun_bearing_deg is not None:
+            idx = self._gun_assumed_dir.findData(float(s.assumed_gun_bearing_deg))
+            if idx >= 0:
+                self._gun_assumed_dir.setCurrentIndex(idx)
+            self._gun_assumed_chk.setChecked(True)
+        self._on_gun_assumed_toggled(self._gun_assumed_chk.isChecked())
 
         tgt_box = QGroupBox("Actual target point (officer coordinates)")
         tgt_form = QFormLayout(tgt_box)
@@ -321,6 +367,7 @@ class DooafSetupDialog(QDialog):
             tgt_lat=self._tgt_lat,
             tgt_lon=self._tgt_lon,
             tgt_alt=self._tgt_alt,
+            assumed_gun_bearing_deg=self._assumed_gun_bearing_deg(),
         )
         err = validate_dooaf_settings(settings)
         if err:
@@ -338,6 +385,30 @@ class DooafSetupDialog(QDialog):
             return
         delete_dooaf_preset(self._settings_store(), name)
         self._reload_presets()
+
+    def _assumed_gun_bearing_deg(self) -> float | None:
+        """Gun→target firing bearing, or None when a real gun is being surveyed."""
+        try:
+            if not self._gun_assumed_chk.isChecked():
+                return None
+            val = self._gun_assumed_dir.currentData()
+            return None if val is None else float(val)
+        except Exception:
+            return None
+
+    def _on_gun_assumed_toggled(self, on: bool) -> None:
+        """Grey out the gun coordinate entry when it is not being used.
+
+        Leaving those fields live would let an operator type a gun position that
+        is then silently discarded, which reads as the app ignoring their input.
+        """
+        assumed = bool(on)
+        try:
+            self._gun_assumed_dir.setEnabled(assumed)
+            for w in getattr(self, "_gun_coord_widgets", ()):
+                w.setEnabled(not assumed)
+        except Exception:
+            pass
 
     def _clear_gun(self) -> None:
         self._gun_lat.clear()
@@ -394,4 +465,5 @@ class DooafSetupDialog(QDialog):
             tgt_lat=self._tgt_lat,
             tgt_lon=self._tgt_lon,
             tgt_alt=self._tgt_alt,
+            assumed_gun_bearing_deg=self._assumed_gun_bearing_deg(),
         )
