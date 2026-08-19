@@ -220,6 +220,18 @@ class WebBridgeMixin:
                 rec_sid = self._operator_preview_source_id()
                 src = self._operator_preview_video_source()
                 rec = src.recorder() if src is not None and hasattr(src, "recorder") else None
+                if src is None and want_on:
+                    # No video source at all — most often because the stream is
+                    # mid-collapse and being reopened. Previously this fell
+                    # straight through and the press vanished without a word.
+                    try:
+                        print("[VGCS:cam_rail] RECORD start FAILED — no active video source")
+                    except Exception:
+                        pass
+                    self._set_status(
+                        "Recording did not start — no video source yet; "
+                        "wait for the picture and retry"
+                    )
                 # RTSP sources use ffmpeg recording.
                 if src is not None and hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
                     if want_on and not bool(getattr(self, "_video_recording", False)):

@@ -241,6 +241,22 @@ class VideoRecordingMixin:
         self._on_web_title_changed("VGCS_CAM_PHOTO_REQUEST:0")
 
     def _on_native_record_toggled(self, on: bool) -> None:
-        if getattr(self, "_camera_rail_ui_mode", "video") != "video":
+        # Always say the press arrived. Every branch below used to be able to
+        # swallow it, so "recording button is not working" (field report
+        # 2026-08-20) produced a log with no RECORD line of any kind — leaving
+        # no way to tell a press that never reached Python from one that was
+        # discarded here.
+        mode = str(getattr(self, "_camera_rail_ui_mode", "video"))
+        try:
+            print(f"[VGCS:cam_rail] RECORD button toggled={bool(on)} rail_mode={mode!r}")
+        except Exception:
+            pass
+        if mode != "video":
+            # Photo mode repurposes this button as the shutter, so a record
+            # press here is meaningless — but silently doing nothing looks
+            # identical to a broken button.
+            self._set_status(
+                "Recording is video mode only — switch the camera rail from Photo to Video"
+            )
             return
         self._on_web_title_changed(f"VGCS_CAM_RECORD_TOGGLE:{1 if on else 0}:0")

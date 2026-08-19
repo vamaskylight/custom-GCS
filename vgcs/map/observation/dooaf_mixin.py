@@ -64,6 +64,13 @@ from vgcs.observe.target_measure import (
 from vgcs.video.camera_control import NoopCameraControl
 
 
+
+# Below this height above ground a video pick needs a laser return, because the
+# ray/DEM solution divides by tan(depression) and runs away to hundreds of
+# metres at the shallow look angles that go with being this low. Field report
+# 2026-08-20: five retries at 4.5 m, on the ground, where nothing could work.
+_DOOAF_VIDEO_PICK_MIN_AGL_M = 8.0
+
 class DooafOperationsMixin:
     """Extracted from MapWidget — uses host widget state via self."""
 
@@ -701,6 +708,37 @@ class DooafOperationsMixin:
             return True
         return False
 
+    def _dooaf_video_pick_geometry_blocker(self) -> str:
+        """Explain a pick that no retry can fix, or "" when retrying is sensible.
+
+        A video pick needs either a laser range or a look ray that meets the
+        ground. Low above ground AND looking near level denies both at once —
+        the ray solution runs away to hundreds of metres (it divides by
+        tan(depression)), and the laser is usually pointing at nothing useful.
+        That is a place-you-are-standing problem, not an aim problem, so say so
+        and name the route that does work.
+        """
+        try:
+            ctx = self._observation_context()
+        except Exception:
+            return ""
+        agl = ctx.get("agl_m")
+        if agl is None:
+            agl = ctx.get("vehicle_rel_alt_m")
+        try:
+            agl_m = float(agl)
+        except (TypeError, ValueError):
+            return ""
+        if agl_m > _DOOAF_VIDEO_PICK_MIN_AGL_M:
+            return ""
+        return (
+            f"Cannot place this pick from {agl_m:.0f} m above ground with the "
+            "camera near level — the laser has nothing to range and the ground "
+            "estimate needs a downward look angle. Climb and pitch the gimbal "
+            "down, or set this point with “Pick on map” / by typing the "
+            "coordinates."
+        )
+
     def _complete_pending_dooaf_setup_lrf_pick(
         self,
         slant_m: float | None,
@@ -796,7 +834,17 @@ class DooafOperationsMixin:
                     backend_reason = str(getter() or "")
                 except Exception:
                     backend_reason = ""
-            if backend_reason:
+            # If the geometry itself rules out BOTH methods, lead with that.
+            # Field report 2026-08-20: an operator on the ground (READY TO ARM,
+            # 4.5 m, camera near level) retried five times against a message
+            # offering laser advice — "aim at a solid surface" — when no laser
+            # return and no ray/DEM solution were both inevitable from where
+            # they were standing. Neither retry nor a different surface could
+            # ever have worked; picking on the map would have.
+            geometry_note = self._dooaf_video_pick_geometry_blocker()
+            if geometry_note:
+                self._dooaf_video_pick_failed(geometry_note, boresight_hint=False)
+            elif backend_reason:
                 self._dooaf_video_pick_failed(
                     f"LRF lock failed — {backend_reason}. "
                     "The ray/DEM fallback could not place this pick either "
