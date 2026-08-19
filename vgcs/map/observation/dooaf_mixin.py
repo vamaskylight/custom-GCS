@@ -759,7 +759,11 @@ class DooafOperationsMixin:
             lon_fb = row.get("target_lon")
             if lat_fb is not None and lon_fb is not None:
                 print(
-                    "[VGCS:observe] LRF lock failed — using DEM/ray geo estimate "
+                    # Reads as an outcome, not a failure: the pick SUCCEEDED, the
+                    # laser just did not contribute. Saying "LRF lock failed" on
+                    # a line that also carries a good position is what made the
+                    # operator ask why they got coordinates and an error at once.
+                    "[VGCS:observe] pick placed from terrain estimate (no laser range) "
                     f"lat={float(lat_fb):.7f} lon={float(lon_fb):.7f}"
                 )
                 alt_raw = row.get("target_alt_m")
@@ -814,9 +818,21 @@ class DooafOperationsMixin:
                         alt_m=alt_fb,
                     )
                 self._end_dooaf_map_pick(restore_target_mode=True)
+                # The laser declined, but the pick SUCCEEDED via the ray/DEM
+                # fallback — so clear the red "LRF failed" reticle the decline
+                # left on the video. Field report 2026-08-20: "when I locked
+                # target then I got latlong as well as LRF failed error". Both
+                # were true and that is exactly the problem; the operator cannot
+                # tell whether the position they are looking at is usable.
+                clear_failed = getattr(self, "_clear_lrf_failed_reticle", None)
+                if callable(clear_failed):
+                    try:
+                        clear_failed()
+                    except Exception:
+                        pass
                 self._set_status(
-                    f"DOOAF {pending.label} saved (DEM estimate) — "
-                    "confirm or re-pick with LRF for better accuracy"
+                    f"DOOAF {pending.label} saved — laser gave no range, "
+                    "position from terrain estimate (re-pick with LRF for better accuracy)"
                 )
                 return
             # Say WHY it declined. The backend already knows — a boresight-only

@@ -1445,6 +1445,15 @@ def _fire_correction_aim_story_svg(
         ]
     )
 
+def _session_gun_is_assumed(session: DooafSession | None) -> bool:
+    """True when there is no surveyed gun and the correction used an assumed
+    firing line. Every gun marker, legend entry, coordinate row and distance in
+    the report keys off this — a report with no gun should not mention one."""
+    if session is None:
+        return False
+    return session.gun is None and bool(getattr(session, "gun_is_assumed", False))
+
+
 def _fire_correction_positions_svg(session: DooafSession) -> str:
     """All marks on one map: gun, target, impact, drone."""
     entries: list[tuple[str, GeoPoint, str, str]] = []
@@ -1476,7 +1485,7 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
     # lines and the on-map callouts below (`if range_gt > 0`). Field report
     # 2026-08-20: this map printed "gun→target 3000.0 m" directly above a
     # technical table that correctly said the distance was unknown.
-    gun_assumed = bool(getattr(session, "gun_is_assumed", False))
+    gun_assumed = _session_gun_is_assumed(session)
     range_gt = float(c.range_gun_to_intended_m) if (c and not gun_assumed) else 0.0
     range_gi = float(c.range_gun_to_impact_m) if (c and not gun_assumed) else 0.0
     miss_ti = float(c.impact_to_intended_m) if c else 0.0
@@ -1500,7 +1509,12 @@ def _fire_correction_positions_svg(session: DooafSession) -> str:
         dist_lines.append(f"target→drone {drone_dist}")
     miss_lines = [f"target→impact {miss_ti:.1f} m"] if miss_ti > 0 else ["—"]
     footer_columns = [
-        ("Marks", ["G Gun · T Target", "I Impact · D Drone"], "#64748b"),
+        (
+            "Marks",
+            (["G Gun · T Target"] if not gun_assumed else ["T Target"])
+            + ["I Impact · D Drone"],
+            "#64748b",
+        ),
         ("Distances", dist_lines, "#64748b"),
         ("Miss", miss_lines, "#ea580c"),
     ]
@@ -2081,8 +2095,12 @@ def _executive_summary_visual_html(session: DooafSession) -> str:
         + "<p class='exec-visual-caption'>"
         "<span class='fc-dot fc-dot-target'></span> Target · "
         "<span class='fc-dot fc-dot-impact'></span> Impact · "
-        "<span class='fc-dot fc-dot-gun'></span> Artillery · "
-        "<span class='fc-dot fc-dot-drone'></span> Drone · "
+        + (
+            ""
+            if _session_gun_is_assumed(session)
+            else "<span class='fc-dot fc-dot-gun'></span> Artillery · "
+        )
+        + "<span class='fc-dot fc-dot-drone'></span> Drone · "
         "<span class='lr-icon lr-pos'>+</span>/<span class='lr-icon lr-neg'>−</span> direction"
         "</p>"
         + _executive_miss_chips_html(c)
@@ -2142,8 +2160,8 @@ def format_fire_correction_diagram_html(session: DooafSession) -> str:
 
     return (
         "<div class='fc-legend'>"
-        "<span><i class='fc-dot fc-dot-gun'></i>Gun</span>"
-        "<span><i class='fc-dot fc-dot-target'></i>Actual target</span>"
+        + ("" if _session_gun_is_assumed(session) else "<span><i class='fc-dot fc-dot-gun'></i>Gun</span>")
+        + "<span><i class='fc-dot fc-dot-target'></i>Actual target</span>"
         "<span><i class='fc-dot fc-dot-impact'></i>Impact Target</span>"
         "<span><i class='fc-dot fc-dot-drone'></i>Drone</span>"
         "</div>"
@@ -2905,7 +2923,13 @@ def format_dooaf_html_summary(
         "<th>Video X</th><th>Video Y</th>"
         "<th>θ (bearing)</th></tr></thead>"
         "<tbody>"
-        + _pt(dooaf_role_display(DOOAF_ROLE_GUN), session.gun, gun_row)
+        # No surveyed gun means no gun row at all. An "Artillery (gun) —" line
+        # of dashes just asks the reader whether something failed to load.
+        + (
+            ""
+            if session.gun is None and bool(getattr(session, "gun_is_assumed", False))
+            else _pt(dooaf_role_display(DOOAF_ROLE_GUN), session.gun, gun_row)
+        )
         + _pt(
             dooaf_role_display(DOOAF_ROLE_INTENDED),
             session.intended,
