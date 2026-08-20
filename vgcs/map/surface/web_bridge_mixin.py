@@ -577,6 +577,14 @@ class WebBridgeMixin:
                 except Exception:
                     pass
                 self._set_status("3D unavailable (Cesium blocked/unreachable)")
+            elif "leaflet" in reason:
+                # Leaflet ships inside the install now, so this is no longer a
+                # network problem and "check internet/proxy/firewall" would send
+                # the operator hunting for a connection they do not need.
+                self._set_status(
+                    "Map library missing from this build "
+                    "(vgcs/assets/vendor/leaflet) — re-install; the 2D map still works"
+                )
             else:
                 self._set_status("Map assets failed to load (check internet/proxy/firewall)")
             try:

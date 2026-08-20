@@ -3,7 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" onerror="document.title='VGCS_ASSET_ERROR:leaflet_css:'+Date.now()"/>
+  <!-- Vendored locally so the map works with no internet: this page used to pull
+       Leaflet from unpkg.com, so in the field it threw "Leaflet missing" and the
+       whole view went black (field report 2026-08-20). The CDN link stays only as
+       a fallback for a build where the vendored copy is missing. -->
+  <link rel="stylesheet" href="__LEAFLET_CSS_SRC__" onerror="this.onerror=null;this.href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'"/>
   <link rel="stylesheet" href="https://unpkg.com/cesium@1.125/Build/Cesium/Widgets/widgets.css" onerror="document.title='VGCS_ASSET_ERROR:cesium_css:'+Date.now()"/>
   <style>
     html, body, #mapWrap, #map2d, #map3d { height:100%; margin:0; background:#1a1d24; }
@@ -1947,7 +1951,7 @@
       </div>
     </div>
   </div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" onerror="document.title='VGCS_ASSET_ERROR:leaflet_js:'+Date.now()"></script>
+  <script src="__LEAFLET_JS_SRC__" onerror="document.title='VGCS_ASSET_ERROR:leaflet_local_missing:'+Date.now();var s=document.createElement('script');s.src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';s.onerror=function(){document.title='VGCS_ASSET_ERROR:leaflet_js:'+Date.now();};document.head.appendChild(s);"></script>
   <script src="https://unpkg.com/cesium@1.125/Build/Cesium/Cesium.js" onerror="document.title='VGCS_ASSET_ERROR:cesium_js:'+Date.now()"></script>
   <script>
     // Fail fast with a clear signal if core assets are blocked/unreachable.
@@ -1966,6 +1970,26 @@
     /* preferCanvas false: tile/img renderer composites more reliably with plan HTML overlays in Qt WebEngine. */
     if (typeof L === 'undefined') {
       document.title = 'VGCS_ASSET_ERROR:leaflet_missing:' + Date.now();
+      // Say what happened instead of dying silently. Throwing here left the
+      // operator staring at a black rectangle with nothing to act on — the
+      // field report was simply "offline map not loading, I see a black
+      // screen", which is all the page gave them to go on.
+      try {
+        var el = document.getElementById('map2d') || document.body;
+        el.style.background = '#0f172a';
+        el.style.color = '#e2e8f0';
+        el.style.font = '14px Segoe UI, system-ui, sans-serif';
+        el.style.padding = '28px';
+        el.innerHTML =
+          "<div style='max-width:560px;margin:40px auto;line-height:1.6'>" +
+          "<div style='font-size:17px;font-weight:700;margin-bottom:10px'>Map library did not load</div>" +
+          "<p style='margin:0 0 10px'>The 3D view needs <code>leaflet.js</code>, which ships inside " +
+          "<code>vgcs/assets/vendor/leaflet/</code>. That file is missing from this build, so the map " +
+          "cannot start.</p>" +
+          "<p style='margin:0 0 10px'>The normal 2D map is unaffected — switch back to it and carry on.</p>" +
+          "<p style='margin:0;color:#94a3b8'>Re-installing or re-pulling VGCS restores the missing file.</p>" +
+          "</div>";
+      } catch (e) {}
       throw new Error('Leaflet missing');
     }
     const map = L.map('map2d', {

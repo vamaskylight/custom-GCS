@@ -85,7 +85,26 @@ def build_leaflet_html() -> str:
         "__PLAN_TPL_STRUCTURE_SRC__": src_under_assets(stru_p) if stru_p.is_file() else "",
     }
 
+    # Leaflet is vendored under assets/vendor so the map renders with no
+    # internet. If the vendored copy is somehow absent, leave the CDN URL in
+    # place rather than an empty src — the page's own onerror then falls back.
+    leaflet_dir = assets_dir / "vendor" / "leaflet"
+    leaflet_js = leaflet_dir / "leaflet.js"
+    leaflet_css = leaflet_dir / "leaflet.css"
+    js_src = (
+        src_under_assets(leaflet_js)
+        if leaflet_js.is_file()
+        else "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    )
+    css_src = (
+        src_under_assets(leaflet_css)
+        if leaflet_css.is_file()
+        else "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    )
+
     html = _template().replace("__LOGO_SRC__", logo_src)
+    html = html.replace("__LEAFLET_JS_SRC__", js_src)
+    html = html.replace("__LEAFLET_CSS_SRC__", css_src)
     for token, data_uri in icon_data.items():
         html = html.replace(token, data_uri)
     for token, data_uri in plan_tpl_images.items():

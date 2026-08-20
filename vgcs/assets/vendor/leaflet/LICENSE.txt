@@ -1,0 +1,8 @@
+Leaflet 1.9.4 — https://leafletjs.com/
+Copyright (c) 2010-2023, Volodymyr Agafonkin
+Copyright (c) 2010-2011, CloudMade
+All rights reserved.
+
+Redistributed under the BSD 2-Clause License. Vendored into VGCS so the map
+works with no internet connection; see vgcs/map/legacy_leaflet_map.html.
+Upstream: https://github.com/Leaflet/Leaflet/blob/main/LICENSE
