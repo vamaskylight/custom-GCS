@@ -259,6 +259,16 @@ class MainWindowMapChromeMixin:
         self._map_widget.activate_online_tiles()
         self._append_log("Map tiles: online source selected")
 
+    def _on_tiles_cache_area(self) -> None:
+        fn = getattr(self._map_widget, "cache_current_area_for_offline", None)
+        if not callable(fn):
+            return
+        fn()
+        self._append_log(
+            "Map tiles: caching the current area for offline use "
+            "(keep internet until it finishes)"
+        )
+
     def _on_tiles_offline(self) -> None:
         root = QFileDialog.getExistingDirectory(
             self,

@@ -247,6 +247,15 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._btn_param_set.setEnabled(False)
         self._btn_tiles_online = QPushButton("Online tiles")
         self._btn_tiles_offline = QPushButton("Offline tiles…")
+        # Stock up an area while still on wifi. Without this, tiles exist offline
+        # only where the operator happened to look while connected — which is why
+        # a new site showed a blank map (field report 2026-08-20).
+        self._btn_tiles_cache_area = QPushButton("Cache area offline")
+        self._btn_tiles_cache_area.setToolTip(
+            "Download map tiles around the current view for offline use.
+"
+            "Run this while you still have internet, before going to the site."
+        )
         self._last_params: dict[str, float] = {}
 
         self._airmode_check = QCheckBox("AirMode (ACRO_OPTIONS bit0)")
@@ -388,6 +397,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._param_name_combo.currentTextChanged.connect(self._on_param_name_changed)
         self._btn_tiles_online.clicked.connect(self._on_tiles_online)
         self._btn_tiles_offline.clicked.connect(self._on_tiles_offline)
+        self._btn_tiles_cache_area.clicked.connect(self._on_tiles_cache_area)
         self._btn_apply_acro.clicked.connect(self._on_apply_acro_options)
         self._btn_apply_simple.clicked.connect(self._on_apply_simple_options)
         self._timeout_spin.valueChanged.connect(self._on_timeout_changed)

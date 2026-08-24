@@ -56,6 +56,11 @@ _ESRI_WORLD_IMAGERY_MAX_ZOOM = 19
 _TILE_PLACEHOLDER_MAX_RETRIES = 3
 _TILE_MEMORY_CAP = 640
 _TILE_CACHE_ROOT = (Path.home() / ".vgcs" / "tile-cache").resolve()
+
+# Tile count quadruples per zoom level, so pre-caching must be bounded or it
+# looks like a hang. ~4000 tiles is a few hundred MB at most and covers a
+# 3 km radius across three zoom levels comfortably.
+_OFFLINE_CACHE_MAX_TILES = 4000
 _HTTP_OPENER = build_opener()
 _BUNDLED_SEED_ROOT = (Path(__file__).resolve().parents[1] / "assets" / "companion_tile_seed").resolve()
 _TILE_FETCH_ERRORS_LOGGED = 0
@@ -1581,6 +1586,73 @@ class NativeTileMapView(QWidget):
             )
         except Exception:
             self._tiles_inflight.discard(key)
+
+    def cache_area_for_offline(
+        self,
+        *,
+        radius_km: float = 3.0,
+        extra_zoom: int = 2,
+        max_tiles: int = _OFFLINE_CACHE_MAX_TILES,
+    ) -> tuple[int, int]:
+        """Download tiles around the current centre into the on-disk cache.
+
+        Returns ``(queued, skipped_over_cap)``.
+
+        `prefetch_viewport_tiles` only ever fetches what is on screen at the
+        current zoom, so tiles exist offline only for places the operator
+        happened to look at while connected. Field report 2026-08-20: the crew
+        drove to a new site with no signal and got a blank map — the bundled
+        seed covers one 49-tile patch 116 km away, and nothing else had ever
+        been cached. This is the missing step: stock up an area while you still
+        have a connection.
+
+        Bounded on purpose. Tile count quadruples per zoom level, so an
+        unbounded "cache everything" would silently queue hundreds of thousands
+        of requests and look like a hang.
+        """
+        if self._tile_template == "{local}":
+            return (0, 0)          # already offline; nothing to download
+        z0 = int(self._zoom)
+        lat, lon = float(self._center_lat), float(self._center_lon)
+        # Latitude degrees are ~constant; longitude shrinks with latitude.
+        dlat = float(radius_km) / 111.32
+        dlon = float(radius_km) / (111.32 * max(0.05, math.cos(math.radians(lat))))
+
+        wanted: list[tuple[int, int, int]] = []
+        for dz in range(0, max(0, int(extra_zoom)) + 1):
+            z = z0 + dz
+            if z > _max_zoom_for_template(self._tile_template, z):
+                break
+            x_lo, y_hi = _tile_xy(lat - dlat, lon - dlon, z)
+            x_hi, y_lo = _tile_xy(lat + dlat, lon + dlon, z)
+            n = 1 << z
+            for tx in range(int(math.floor(min(x_lo, x_hi))), int(math.ceil(max(x_lo, x_hi))) + 1):
+                for ty in range(int(math.floor(min(y_lo, y_hi))), int(math.ceil(max(y_lo, y_hi))) + 1):
+                    if 0 <= tx < n and 0 <= ty < n:
+                        wanted.append((z, tx, ty))
+
+        queued = 0
+        for z, tx, ty in wanted:
+            if queued >= int(max_tiles):
+                break
+            if _disk_cache_path(self._tile_source_id, z, tx, ty).is_file():
+                continue      # already on disk from an earlier session
+            self._queue_tile_fetch(z, tx, ty)
+            queued += 1
+        return (queued, max(0, len(wanted) - int(max_tiles)))
+
+    def offline_tiles_cover_current_view(self) -> bool:
+        """True when the current centre has a tile on disk (bundled or cached).
+
+        Used to tell the operator that a blank map is an empty cache rather than
+        a broken app.
+        """
+        z = int(self._zoom)
+        cx, cy = _tile_xy(self._center_lat, self._center_lon, z)
+        tx, ty = int(cx), int(cy)
+        if _disk_cache_path(self._tile_source_id, z, tx, ty).is_file():
+            return True
+        return (_BUNDLED_SEED_ROOT / str(z) / str(tx) / f"{ty}.png").is_file()
 
     def prefetch_viewport_tiles(self) -> None:
         """Queue HTTP/disk fetches for visible tiles (call after pan/recenter/follow)."""

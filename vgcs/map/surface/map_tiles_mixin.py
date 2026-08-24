@@ -848,6 +848,61 @@ class MapTilesMixin:
         self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Tiles © Esri', 19);")
         self._set_status("Satellite imagery active (Esri World Imagery)")
 
+    def cache_current_area_for_offline(self, *, radius_km: float = 3.0) -> None:
+        """Download the surrounding area into the on-disk tile cache.
+
+        The point is to run this on wifi BEFORE driving to a site. Tiles the
+        operator never looked at online simply do not exist offline, which is
+        why a new site shows a blank map.
+        """
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            self._set_status("Offline cache: map not ready")
+            return
+        fn = getattr(nm, "cache_area_for_offline", None)
+        if not callable(fn):
+            return
+        try:
+            queued, skipped = fn(radius_km=float(radius_km))
+        except Exception:
+            self._set_status("Offline cache failed — check the tile source")
+            return
+        if queued == 0 and skipped == 0:
+            self._set_status(
+                "Offline cache: this area is already stored (or an offline "
+                "folder is already selected)"
+            )
+            return
+        msg = (
+            f"Caching ~{queued} map tiles for {radius_km:.0f} km around here — "
+            "keep the internet connection until it settles"
+        )
+        if skipped:
+            msg += f" ({skipped} beyond the limit were skipped — zoom out and repeat for a wider area)"
+        self._set_status(msg)
+
+    def warn_if_no_offline_tiles_here(self) -> bool:
+        """Say plainly when a blank map is an empty cache, not a fault.
+
+        Returns True when a warning was shown. Without this the operator sees an
+        empty grey map and cannot tell whether VGCS is broken, the tiles are
+        missing, or the network is down — field report 2026-08-20.
+        """
+        nm = getattr(self, "_native_map", None)
+        fn = getattr(nm, "offline_tiles_cover_current_view", None) if nm is not None else None
+        if not callable(fn):
+            return False
+        try:
+            if fn():
+                return False
+        except Exception:
+            return False
+        self._set_status(
+            "No map tiles stored for this area — the map will stay blank without "
+            "internet. Connect, then use “Cache area offline”."
+        )
+        return True
+
     def activate_offline_tiles(self, root: str) -> None:
         root = str(root or "").strip()
         if not root or not Path(root).is_dir():
