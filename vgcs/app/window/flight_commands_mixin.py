@@ -101,10 +101,10 @@ class MainWindowFlightCommandsMixin:
     def _on_mode_change_result(self, mode_name: str, ok: bool) -> None:
         if ok:
             self._append_log(f"Mode change requested: {mode_name}")
-            self._set_top_vehicle_msg(f"Mode cmd: {mode_name}")
+            self._post_gcs_notice(f"Mode cmd: {mode_name}")
         else:
             self._append_log(f"Mode change failed: {mode_name}")
-            self._set_top_vehicle_msg("Mode change failed")
+            self._post_gcs_notice("Mode change failed")
 
     def _takeoff_altitude_m(self, *, from_plan_rail: bool) -> float:
         """Target climb (m) for NAV_TAKEOFF: plan launch alt when set on rail; else dashboard spin."""
@@ -324,7 +324,7 @@ class MainWindowFlightCommandsMixin:
             return
         self._thread.queue_mission_pause()
         self._append_log("Mission pause queued (BRAKE/LOITER hold)")
-        self._set_top_vehicle_msg("Pausing mission…")
+        self._post_gcs_notice("Pausing mission…")
 
     def _on_map_mission_resume_requested(self) -> None:
         if self._thread is None or not self._thread.isRunning():
@@ -332,4 +332,4 @@ class MainWindowFlightCommandsMixin:
             return
         self._thread.queue_mission_resume()
         self._append_log("Mission resume queued (AUTO from current item)")
-        self._set_top_vehicle_msg("Resuming mission…")
+        self._post_gcs_notice("Resuming mission…")

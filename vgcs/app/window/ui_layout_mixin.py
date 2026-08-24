@@ -111,6 +111,13 @@ class MainWindowUiLayoutMixin:
 
     def _apply_responsive_layout(self, width: int) -> None:
         narrow = width < 1120
+        self._vehicle_msg_elide_px = self._vehicle_msg_budget_px(width)
+        board = getattr(self, "_vehicle_msg_board", None)
+        if board is not None:
+            # Re-elide against the new budget rather than waiting for the next
+            # message; a resize should widen what is already on screen.
+            board.invalidate_render()
+            self._publish_vehicle_msg_cell()
 
         while self._link_grid.count():
             self._link_grid.takeAt(0)
@@ -304,11 +311,37 @@ class MainWindowUiLayoutMixin:
         """One-line GPS summary for popups/exports (sat line + HDOP line)."""
         return f"{self._top_gps_sat.text()} / {self._top_gps_hdop.text()}"
 
+    def _post_gcs_notice(self, message: object) -> None:
+        """Show GCS-generated action feedback in the MESSAGE cell.
+
+        Goes through the board so it cannot bury a live vehicle fault and does
+        not linger once the action is over. Direct label writes are reserved
+        for the board itself.
+        """
+        self._vehicle_msg_board.push_notice(str(message or ""))
+        self._publish_vehicle_msg_cell()
+
+    def _vehicle_msg_elide_floor_px(self) -> int:
+        return 170 if self._compact_ui else 240
+
+    def _vehicle_msg_budget_px(self, window_width: int) -> int:
+        """How much of a vehicle message the header cell may show.
+
+        A fixed 240 px budget cut "PreArm: GPS 1: Bad fix" down to
+        "PreArm: GPS 1…" on a 1080p screen — the half that matters. The header
+        is a scrolling strip of pills and this is the only one with variable
+        text, so let it take the slack a wider window provides.
+        """
+        floor_px = self._vehicle_msg_elide_floor_px()
+        return int(max(floor_px, min(640, int(window_width) * 0.34)))
+
     def _set_top_vehicle_msg(self, message: object) -> None:
         """Allow truncation only for MESSAGE cell; keep full text in tooltip."""
         txt = str(message or "—")
         lbl = self._top_vehicle_msg
-        max_px = 170 if self._compact_ui else 240
+        max_px = int(
+            getattr(self, "_vehicle_msg_elide_px", 0) or self._vehicle_msg_elide_floor_px()
+        )
         elided = lbl.fontMetrics().elidedText(txt, Qt.TextElideMode.ElideRight, max_px)
         lbl.setText(elided)
         lbl.setToolTip(txt if elided != txt else "")

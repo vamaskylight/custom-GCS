@@ -31,6 +31,27 @@ _MAV_MSG_ID_DISTANCE_SENSOR = int(mav_apm.MAVLINK_MSG_ID_DISTANCE_SENSOR)
 _MAV_MSG_ID_RANGEFINDER = int(mav_apm.MAVLINK_MSG_ID_RANGEFINDER)
 _PROX_STREAM_RESEND_S = 20.0
 
+# Messages that describe the *vehicle* and must come from the autopilot alone.
+# Anything else that shares the link — companion computer, gimbal, air unit,
+# a second autopilot — also emits SYS_STATUS and STATUSTEXT, and letting those
+# through made the battery header flip between two packs and the vehicle
+# message alternate between two senders. Deliberately excludes RADIO_STATUS
+# (the telemetry radio is its own node) and the proximity/gimbal/RemoteID
+# messages, which legitimately originate off the flight controller.
+_AUTOPILOT_ONLY_MESSAGES = frozenset(
+    {
+        "SYS_STATUS",
+        "BATTERY_STATUS",
+        "STATUSTEXT",
+        "GLOBAL_POSITION_INT",
+        "GPS_RAW_INT",
+        "VFR_HUD",
+        "ATTITUDE",
+        "MISSION_CURRENT",
+        "MISSION_ITEM_REACHED",
+    }
+)
+
 
 class MavlinkThread(QThread):
     """Connect to a MAVLink stream and report link/heartbeat/telemetry state."""
@@ -73,6 +94,7 @@ class MavlinkThread(QThread):
             "ATTITUDE": 0.05,
             "VFR_HUD": 0.1,
             "SYS_STATUS": 0.12,
+            "BATTERY_STATUS": 0.4,
             "GPS_RAW_INT": 0.2,
             "MISSION_CURRENT": 0.15,
             "STATUSTEXT": 0.05,
@@ -390,6 +412,8 @@ class MavlinkThread(QThread):
             timeout_notified = False
 
             msg_type = msg.get_type()
+            if msg_type in _AUTOPILOT_ONLY_MESSAGES and not self._is_primary_source(msg):
+                continue
             if msg_type == "HEARTBEAT":
                 src_sys = int(msg.get_srcSystem())
                 src_comp = int(msg.get_srcComponent())
@@ -572,6 +596,9 @@ class MavlinkThread(QThread):
                 self._emit_telemetry_payload(
                     "SYS_STATUS",
                     {
+                        # Raw mV as well: UINT16_MAX means "unknown", and that
+                        # sentinel is lost once it has been divided by 1000.
+                        "voltage_mv": int(getattr(msg, "voltage_battery", 0) or 0),
                         "voltage_v": float(getattr(msg, "voltage_battery", 0) or 0) / 1000.0,
                         "current_a": float(getattr(msg, "current_battery", -1) or -1) / 100.0,
                         "battery_remaining": int(getattr(msg, "battery_remaining", -1) or -1),
@@ -584,6 +611,35 @@ class MavlinkThread(QThread):
                         "sensors_health": int(
                             getattr(msg, "onboard_control_sensors_health", 0) or 0
                         ),
+                    },
+                )
+            elif msg_type == "BATTERY_STATUS":
+                # Never reached the UI before: the handler in telemetry_mixin
+                # had no producer, so a vehicle whose SYS_STATUS carries no
+                # battery data showed nothing at all.
+                batt_id = int(getattr(msg, "id", 0) or 0)
+                if batt_id != 0:
+                    # ArduPilot round-robins every configured instance. Only the
+                    # primary pack drives the header; a payload or backup
+                    # battery must not overwrite it.
+                    continue
+                cells: list[int] = []
+                for attr in ("voltages", "voltages_ext"):
+                    raw_cells = getattr(msg, attr, None) or []
+                    for cell in raw_cells:
+                        try:
+                            cells.append(int(cell))
+                        except (TypeError, ValueError):
+                            continue
+                self._emit_telemetry_payload(
+                    "BATTERY_STATUS",
+                    {
+                        "id": batt_id,
+                        # Per MAVLink, the pack voltage is the sum of the cells
+                        # that are neither 0 (absent) nor UINT16_MAX (unknown).
+                        "voltages_mv": cells,
+                        "current_a": float(getattr(msg, "current_battery", -1) or -1) / 100.0,
+                        "battery_remaining": int(getattr(msg, "battery_remaining", -1) or -1),
                     },
                 )
             elif msg_type == "RADIO_STATUS":
@@ -957,6 +1013,30 @@ class MavlinkThread(QThread):
         ):
             return src_comp in (0, 1)
         return True
+
+    def _is_primary_source(self, msg) -> bool:
+        """Whether a message came from the autopilot this link is bound to.
+
+        Falls open while the target is still unknown, so nothing is dropped
+        before the first HEARTBEAT has identified the flight controller.
+        """
+        target_sys = int(self._target_sysid)
+        if target_sys <= 0:
+            return True
+        if int(msg.get_srcSystem()) != target_sys:
+            return False
+        target_comp = int(self._target_compid)
+        if target_comp <= 0:
+            return True
+        src_comp = int(msg.get_srcComponent())
+        if src_comp == target_comp:
+            return True
+        # MAV_COMP_ID_ALL (0) and MAV_COMP_ID_AUTOPILOT1 (1) are both the flight
+        # controller on every stack this talks to, and _target_compid pins
+        # itself to 1 once seen — so accept either rather than risk blanking a
+        # vehicle that announces itself as component 0. The peripherals this
+        # exists to exclude (companion 191, gimbal 154, radio 68) never do.
+        return src_comp in (0, 1)
 
     def _sync_link_targets(self) -> None:
         """Align pymavlink routing with the last vehicle HEARTBEAT (sys/comp)."""

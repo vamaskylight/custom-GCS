@@ -61,7 +61,10 @@ from vgcs.app.window.helpers import (
     _mavlink_vehicle_type_label,
     _settings_truthy,
 )
+from vgcs.app.arm_readiness import parse_prearm_health
+from vgcs.app.battery_tracker import pack_voltage_v_from_cells, voltage_v_from_mv
 from vgcs.app.gcs_style import gcs_stylesheet
+from vgcs.app.vehicle_messages import SEVERITY_INFO
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
@@ -131,8 +134,41 @@ class MainWindowTelemetryMixin:
                     return txt
         return ""
 
+    def _publish_battery_reading(self) -> None:
+        """Paint the one battery number everywhere it appears.
+
+        Header and dashboard row show the same filtered value so they can never
+        disagree; the unfiltered sample stays one hover away in the tooltip.
+        """
+        header = self._battery.header_text()
+        self._top_battery.setText(header)
+        self._map_widget.set_header_battery(header)
+        field = self._fields["battery"]
+        field.setText(self._battery.detail_text())
+        field.setToolTip(self._battery.detail_tooltip())
+
+    def _publish_vehicle_msg_cell(self) -> None:
+        """Sole writer of the MESSAGE cell (dashboard label + map header pill).
+
+        Repaints only on an actual text change: this runs off the 20 Hz
+        dashboard refresh, and unconditional writes here are what made the cell
+        flicker and drop vehicle messages.
+        """
+        text = self._vehicle_msg_board.take_render()
+        if text is None:
+            return
+        self._set_top_vehicle_msg(text)
+        try:
+            self._map_widget.set_header_vehicle_msg(text)
+        except Exception:
+            pass
+
     def _reset_telemetry_fields(self) -> None:
         self._armed_since = None
+        self._battery.reset()
+        self._vehicle_msg_board.reset()
+        self._prearm_health = None
+        self._fields["battery"].setToolTip("")
         self._map_rel_alt_m = 0.0
         self._map_msl_alt_m = 0.0
         self._map_groundspeed_mps = 0.0
@@ -177,9 +213,8 @@ class MainWindowTelemetryMixin:
         self._top_flight_mode.setText("—")
         self._top_battery.setText("—")
         self._top_remote_id.setText("N/A")
-        self._set_top_vehicle_msg("—")
+        self._publish_vehicle_msg_cell()
         self._map_widget.set_header_mode("—")
-        self._map_widget.set_header_vehicle_msg("—")
         self._map_widget.set_header_gps(0, "N/A")
         self._map_widget.set_header_battery("N/A")
         self._map_widget.set_header_remote_id("N/A")
@@ -251,12 +286,7 @@ class MainWindowTelemetryMixin:
             self._hb_system_status = system_status
             self._hb_arm_ready = arm_ready
             self._hb_mode_text = mode_text
-            if arm_ready:
-                self._fields["arm_ready"].setText("Likely ready")
-            elif self._prearm_block_reason:
-                self._fields["arm_ready"].setText(f"PreArm: {self._prearm_block_reason}")
-            else:
-                self._fields["arm_ready"].setText(f"System status {system_status}")
+            self._fields["arm_ready"].setText(self._arm_ready_field_text())
             self._apply_state_style(self._fields["arm_ready"], "ok" if arm_ready else "warn")
             if arm_ready:
                 # Do not clear _arm_not_ready_alert_shown here: brief STANDBY in a flickering
@@ -445,24 +475,39 @@ class MainWindowTelemetryMixin:
                     if alt_msl:
                         self._map_msl_alt_m = alt_msl
         elif msg_type == "SYS_STATUS":
+            now = time.monotonic()
             pct = int(data.get("battery_remaining", -1))
-            pct_text = "N/A" if pct < 0 else f"{pct}%"
-            voltage = float(data.get("voltage_v", 0.0))
             current = float(data.get("current_a", -1.0))
-            current_text = "N/A" if current < 0 else f"{current:.1f} A"
-            self._fields["battery"].setText(
-                f"{voltage:.2f} V, {current_text}, {pct_text}"
+            # Prefer the raw mV field: UINT16_MAX ("unknown") and 0 ("not
+            # measured") both used to render as data (65.54 V / 0.00 V).
+            volts = voltage_v_from_mv(data.get("voltage_mv"))
+            if volts is None and "voltage_mv" not in data:
+                legacy = float(data.get("voltage_v", 0.0) or 0.0)
+                volts = legacy if legacy > 0.1 else None
+            self._battery.update(
+                source="SYS_STATUS",
+                now=now,
+                voltage_v=volts,
+                current_a=current if current >= 0.0 else None,
+                remaining_pct=pct if pct >= 0 else None,
             )
-            # Always show voltage in the header; percent alone is not actionable for operators.
-            # Use 2 decimals so small real-time changes are visible (e.g. 11.80 -> 11.74).
-            bat_header = (
-                f"{voltage:.2f}V ({pct_text})" if pct_text != "N/A" else f"{voltage:.2f}V"
-            )
-            self._top_battery.setText(bat_header)
-            self._map_widget.set_header_battery(bat_header)
+            self._publish_battery_reading()
             sensors_present = int(data.get("sensors_present", 0))
             sensors_enabled = int(data.get("sensors_enabled", 0))
             sensors_health = int(data.get("sensors_health", 0))
+            # The autopilot PreArm verdict — the only trustworthy source of
+            # "ready to arm". See vgcs.app.arm_readiness.
+            self._prearm_health = parse_prearm_health(
+                sensors_present=sensors_present,
+                sensors_enabled=sensors_enabled,
+                sensors_health=sensors_health,
+                now=now,
+            )
+            if self._prearm_health.reported and self._prearm_health.passing:
+                # An authoritative pass clears a PreArm reason the vehicle has
+                # since resolved but never retracted by STATUSTEXT.
+                self._clear_prearm_block()
+            self._refresh_dashboard_flight_state()
             battery_mask = int(mavutil.mavlink.MAV_SYS_STATUS_SENSOR_BATTERY)
             rc_mask = int(mavutil.mavlink.MAV_SYS_STATUS_SENSOR_RC_RECEIVER)
             battery_monitored = bool(sensors_present & battery_mask and sensors_enabled & battery_mask)
@@ -477,29 +522,19 @@ class MainWindowTelemetryMixin:
                 self._fields["failsafe_rc"].setText("N/A")
                 self._apply_state_style(self._fields["failsafe_rc"], "na")
         elif msg_type == "BATTERY_STATUS":
-            # Real vehicles often report pack voltage here (Mission Planner simulator may not).
-            # MAVLink: voltages[] in mV, battery_remaining in % (or -1).
+            # Fallback source: some monitors leave SYS_STATUS.voltage_battery at
+            # 0 and report only here. The tracker ignores this while SYS_STATUS
+            # is live, so the two can never fight over the header.
             pct = int(data.get("battery_remaining", -1))
-            pct_text = "N/A" if pct < 0 else f"{pct}%"
-            v_mv = None
-            try:
-                v_arr = data.get("voltages")
-                if isinstance(v_arr, (list, tuple)) and v_arr:
-                    v0 = int(v_arr[0] or 0)
-                    if v0 > 0:
-                        v_mv = v0
-            except Exception:
-                v_mv = None
-            voltage_v = float(data.get("voltage_v", 0.0) or 0.0)
-            if (not voltage_v or voltage_v <= 0.1) and v_mv is not None:
-                voltage_v = float(v_mv) / 1000.0
-            if voltage_v <= 0.1:
-                return
-            bat_header = (
-                f"{voltage_v:.2f}V ({pct_text})" if pct_text != "N/A" else f"{voltage_v:.2f}V"
+            current = float(data.get("current_a", -1.0))
+            self._battery.update(
+                source="BATTERY_STATUS",
+                now=time.monotonic(),
+                voltage_v=pack_voltage_v_from_cells(data.get("voltages_mv")),
+                current_a=current if current >= 0.0 else None,
+                remaining_pct=pct if pct >= 0 else None,
             )
-            self._top_battery.setText(bat_header)
-            self._map_widget.set_header_battery(bat_header)
+            self._publish_battery_reading()
         elif msg_type == "OBSTACLE_DISTANCE":
             self._map_widget.set_obstacle_distance(data)
             prox, _ = self._map_widget.get_obstacle_sensor_summary()
@@ -524,10 +559,14 @@ class MainWindowTelemetryMixin:
         elif msg_type == "STATUSTEXT":
             text = str(data.get("text", "")).strip()
             if text:
+                severity = int(data.get("severity", SEVERITY_INFO) or SEVERITY_INFO)
                 self._recent_statustext.append(text)
-                self._update_prearm_gate_from_statustext(text)
-                self._set_top_vehicle_msg(text)
-                self._map_widget.set_header_vehicle_msg(text)
+                self._update_prearm_gate_from_statustext(text, severity=severity)
+                # The board decides whether this line takes the MESSAGE cell.
+                # Nothing else writes there any more, so it is no longer
+                # overwritten by the link banner on the next position packet.
+                self._vehicle_msg_board.push_vehicle_message(text, severity=severity)
+                self._publish_vehicle_msg_cell()
                 self._refresh_dashboard_flight_state()
                 # STATUSTEXT can burst during param download; logging each line hammers QTextEdit.
                 now = time.monotonic()

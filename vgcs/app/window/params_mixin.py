@@ -122,12 +122,12 @@ class MainWindowParamsMixin:
     def _on_action_result(self, action: str, ok: bool, detail: str) -> None:
         msg = f"{action.upper()} {'OK' if ok else 'FAIL'}: {detail}"
         self._append_log(msg)
-        self._set_top_vehicle_msg(msg[:80])
+        self._post_gcs_notice(msg[:80])
 
     def _on_geofence_result(self, ok: bool, detail: str) -> None:
         msg = f"Fence {'OK' if ok else 'FAIL'}: {detail}"
         self._append_log(msg)
-        self._set_top_vehicle_msg(msg[:80])
+        self._post_gcs_notice(msg[:80])
 
     def _on_params_snapshot(self, payload: object) -> None:
         data = dict(payload) if isinstance(payload, dict) else {}
@@ -220,9 +220,9 @@ class MainWindowParamsMixin:
                 if cur == key:
                     self._param_value_spin.setValue(v)
                 self._refresh_acro_options_ui()
-            self._set_top_vehicle_msg(msg[:80])
+            self._post_gcs_notice(msg[:80])
         else:
-            self._set_top_vehicle_msg(msg[:80])
+            self._post_gcs_notice(msg[:80])
 
     def _sync_mode_options_for_vehicle(self, vehicle_type: int) -> None:
         if self._last_vehicle_type == vehicle_type:

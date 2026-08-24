@@ -60,7 +60,10 @@ from PySide6.QtWidgets import (
 )
 from pymavlink import mavutil
 
+from vgcs.app.arm_readiness import PrearmHealth
+from vgcs.app.battery_tracker import BatteryTracker
 from vgcs.app.gcs_style import gcs_stylesheet
+from vgcs.app.vehicle_messages import VehicleMessageBoard
 from vgcs.app.window import MainWindowMixins
 from vgcs.app.window.helpers import _settings_truthy
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
@@ -130,6 +133,13 @@ class MainWindow(MainWindowMixins, QMainWindow):
         # avoid a blocking modal until it persists (reduces false alarms on SITL/real vehicles).
         self._arm_not_ready_since_mono: float | None = None
         self._recent_statustext: deque[str] = deque(maxlen=16)
+        # Single owner of the header MESSAGE cell — see vgcs.app.vehicle_messages.
+        self._vehicle_msg_board = VehicleMessageBoard()
+        self._vehicle_msg_elide_px = 0
+        # Smoothed / sentinel-checked pack voltage — see vgcs.app.battery_tracker.
+        self._battery = BatteryTracker()
+        # Vehicle-reported PreArm verdict from SYS_STATUS; None until one arrives.
+        self._prearm_health: PrearmHealth | None = None
         self._rid_live_available = False
         self._map_rel_alt_m = 0.0
         self._map_msl_alt_m = 0.0
@@ -252,8 +262,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         # a new site showed a blank map (field report 2026-08-20).
         self._btn_tiles_cache_area = QPushButton("Cache area offline")
         self._btn_tiles_cache_area.setToolTip(
-            "Download map tiles around the current view for offline use.
-"
+            "Download map tiles around the current view for offline use.\n"
             "Run this while you still have internet, before going to the site."
         )
         self._last_params: dict[str, float] = {}

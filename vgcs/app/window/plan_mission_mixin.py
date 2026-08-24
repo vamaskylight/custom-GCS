@@ -294,7 +294,7 @@ class MainWindowPlanMissionMixin:
         self._mission_upload_pending = True
         self._thread.queue_mission_upload(payload, end_action)
         self._append_log(f"Mission upload queued: {len(payload)} WPs (end={end_action})")
-        self._set_top_vehicle_msg(f"Uploading mission ({len(payload)} WPs)…")
+        self._post_gcs_notice(f"Uploading mission ({len(payload)} WPs)…")
 
     def _on_mission_download_requested(self) -> None:
         if self._thread is None or not self._thread.isRunning():
@@ -306,7 +306,7 @@ class MainWindowPlanMissionMixin:
     def _on_mission_uploaded(self, count: int) -> None:
         self._mission_upload_pending = False
         self._append_log(f"Mission upload success: {count} WPs")
-        self._set_top_vehicle_msg(f"Mission uploaded ({count})")
+        self._post_gcs_notice(f"Mission uploaded ({count})")
         QMessageBox.information(
             self, "Mission Upload", f"Mission uploaded successfully ({count} waypoints)."
         )
@@ -323,7 +323,7 @@ class MainWindowPlanMissionMixin:
         self._map_widget.set_mission_end_action(end_action)
         self._settings.setValue("plan_mission_end_action", end_action)
         self._map_widget.set_waypoints(wps, clear_plan_current_file=True)
-        self._set_top_vehicle_msg(f"Mission downloaded ({len(wps)} WPs)")
+        self._post_gcs_notice(f"Mission downloaded ({len(wps)} WPs)")
 
     def _on_mission_progress(self, payload: object) -> None:
         """Live AUTO progress from the vehicle (MISSION_CURRENT / MISSION_ITEM_REACHED)."""
@@ -339,9 +339,9 @@ class MainWindowPlanMissionMixin:
                 self._append_log(f"Mission: completed {label}")
             return
         if wp_index is not None:
-            self._set_top_vehicle_msg(f"AUTO · WP {int(wp_index) + 1} of {total}")
+            self._post_gcs_notice(f"AUTO · WP {int(wp_index) + 1} of {total}")
         elif label:
-            self._set_top_vehicle_msg(f"AUTO · {label}")
+            self._post_gcs_notice(f"AUTO · {label}")
 
     def _sync_plan_flight_chrome(self) -> None:
         """Enable/disable Plan Flight upload/save buttons from link + waypoint state."""

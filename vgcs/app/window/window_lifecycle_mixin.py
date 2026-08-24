@@ -157,18 +157,16 @@ class MainWindowLifecycleMixin:
         self._append_log("UI defaults restored.")
 
     def _on_flight_timer_tick(self) -> None:
+        # This used to stamp "Gimbal Y/P: <yaw>/<pitch>" into the map header
+        # vehicle-message pill once a second, so a real STATUSTEXT was visible
+        # for at most a second before gimbal telemetry buried it — half of the
+        # "vehicle msg is not shown" report. Gimbal attitude is not a vehicle
+        # message and no longer shares that cell; it stays available to the
+        # camera/DOOAF paths through get_gimbal_status().
+        # Keep the cell current here too: it is the only tick that runs when
+        # telemetry is quiet, and an ageing message needs its age stamp updated.
         try:
-            cc = self._camera_control_backend
-            if cc is not None:
-                get_status = getattr(cc, "get_gimbal_status", None)
-                if callable(get_status):
-                    st = get_status()
-                    if st is not None and bool(getattr(st, "supported", False)):
-                        yaw = getattr(st, "yaw_deg", None)
-                        pitch = getattr(st, "pitch_deg", None)
-                        ys = "?" if yaw is None else f"{float(yaw):.1f}"
-                        ps = "?" if pitch is None else f"{float(pitch):.1f}"
-                        self._map_widget.set_header_vehicle_msg(f"Gimbal Y/P: {ys}/{ps}")
+            self._publish_vehicle_msg_cell()
         except Exception:
             pass
         if self._armed_since is None:
