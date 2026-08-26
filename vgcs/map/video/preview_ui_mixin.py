@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 import time
 
 from PySide6.QtCore import QPointF, Qt, QTimer
@@ -25,10 +26,11 @@ from vgcs.video.camera_control import (
 )
 from vgcs.video.pipeline import (
     VideoFrame,
+    companion_rtsp_port_ready,
     notify_companion_feed_switch,
     notify_companion_preview_motion,
     release_all_companion_rtsp_hosts,
-    release_companion_rtsp_host,
+    reset_companion_rtsp_backoff,
     set_companion_decode_gate,
 )
 
@@ -36,7 +38,48 @@ from vgcs.video.pipeline import (
 # must be restarted. Two changes in quick succession left the camera unable to
 # serve RTSP at all (field log 2026-08-18), hence the minimum gap.
 _SENSOR_SWITCH_MIN_GAP_S = 6.0
+# Fallback settle for a camera we cannot probe (non-companion URL). A camera on
+# the companion subnet is asked directly instead — see `_schedule_rtsp_resume`.
 _SENSOR_SWITCH_SETTLE_MS = 3200
+# The camera needs a beat to actually act on the sensor command before its RTSP
+# port means anything; probing sooner just reads the still-open old listener.
+_SENSOR_SWITCH_MIN_SETTLE_S = 0.7
+# Give up probing and restart blind. A Viewpro sensor change took the camera's
+# network stack down for ~15 s in the 2026-08-26 log; this is well past that.
+_SENSOR_SWITCH_MAX_WAIT_S = 20.0
+_SENSOR_SWITCH_PROBE_GAP_S = 0.3
+
+
+def _wait_for_rtsp_ready(
+    url: str,
+    *,
+    is_superseded,
+    probe=companion_rtsp_port_ready,
+    sleep=time.sleep,
+    now=time.monotonic,
+    min_settle_s: float = _SENSOR_SWITCH_MIN_SETTLE_S,
+    max_wait_s: float = _SENSOR_SWITCH_MAX_WAIT_S,
+    gap_s: float = _SENSOR_SWITCH_PROBE_GAP_S,
+) -> float:
+    """Block until the camera answers on RTSP again.
+
+    Returns the monotonic time it answered, ``-1.0`` if it never did within
+    *max_wait_s* (the caller reopens blind rather than leaving the operator
+    with no video at all), or ``0.0`` if a newer switch superseded this one.
+
+    Runs on a worker thread — a probe against a camera that is down blocks for
+    the socket timeout, and this must never be the GUI thread.
+    """
+    t0 = now()
+    sleep(max(0.0, float(min_settle_s)))
+    deadline = t0 + max(0.0, float(max_wait_s))
+    while now() < deadline:
+        if is_superseded():
+            return 0.0
+        if probe(url, timeout_s=0.6):
+            return float(now())
+        sleep(max(0.05, float(gap_s)))
+    return -1.0
 
 
 class VideoPreviewUiMixin:
@@ -1206,27 +1249,9 @@ class VideoPreviewUiMixin:
             print(f"[VGCS:video] companion feed switch {cur!r} -> {sid!r} ({reason})")
         except Exception:
             pass
-        try:
-            notify_companion_feed_switch(duration_s=12.0)
-            notify_companion_preview_motion(duration_s=8.0)
-        except Exception:
-            pass
-        for _osid, src in sources.items():
-            try:
-                if hasattr(src, "companion_hard_stop_decode"):
-                    src.companion_hard_stop_decode(join_s=2.5)
-                else:
-                    src.stop()
-                    release_companion_rtsp_host(
-                        str(getattr(src, "source_id", "") or ""),
-                        str(getattr(src, "_url", "") or ""),
-                    )
-            except Exception:
-                pass
-        try:
-            release_all_companion_rtsp_hosts()
-        except Exception:
-            pass
+        url = self._begin_rtsp_handoff(
+            vp, hold_s=_SENSOR_SWITCH_MAX_WAIT_S + 6.0, probe_source_id=sid
+        )
         self._split_fullscreen_source_id = sid
         self._native_pip_last_source_frame = QImage()
         self._last_video_pushed = ""
@@ -1277,29 +1302,44 @@ class VideoPreviewUiMixin:
             except Exception:
                 pass
 
-        QTimer.singleShot(2800, _finish_switch)
+        self._schedule_rtsp_resume(url, _finish_switch)
 
-    def _restart_decode_for_sensor_switch(self, sensor: str) -> None:
-        """Clean decode restart after an in-stream EO/IR change.
+    def _begin_rtsp_handoff(self, vp, *, hold_s: float, probe_source_id: str = "") -> str:
+        """Tear the decode down for a deliberate switch. Returns the RTSP URL
+        to wait on — the source we are switching *to*, when they differ.
 
-        Same shape as _companion_switch_active_feed's handoff — hard-stop,
-        release the RTSP host, settle, restart — because the problem is the
-        same: the decoder is holding parameters for a stream that no longer
-        looks like that. The difference is only that the URL does not change.
+        Everything here is about handing the camera's single RTSP slot back
+        cleanly and starting the reopen from zero: the FFmpeg session is ended
+        (with a TEARDOWN, so the camera frees the slot now rather than on its
+        own timeout), the host lock is dropped, and every accumulated -138
+        penalty is cleared. Those penalties reach 11–25 s and are meant to slow
+        an unattended retry loop — inheriting them here is what put an 11 s
+        "throttling open" in front of an operator's IR press on 2026-08-26.
         """
-        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
-        if vp is None:
-            return
         try:
-            notify_companion_feed_switch(duration_s=14.0)
+            notify_companion_feed_switch(duration_s=float(hold_s))
             notify_companion_preview_motion(duration_s=10.0)
+            reset_companion_rtsp_backoff()
         except Exception:
             pass
         try:
             sources = vp.sources()
         except Exception:
             sources = {}
+        want_sid = str(probe_source_id or "").strip().lower()
+        url = ""
         for _sid, src in sources.items():
+            try:
+                src_url = str(getattr(src, "_url", "") or "").strip()
+                if src_url and (not url or str(_sid).strip().lower() == want_sid):
+                    url = src_url
+            except Exception:
+                pass
+            try:
+                if hasattr(src, "reset_companion_open_backoff"):
+                    src.reset_companion_open_backoff()
+            except Exception:
+                pass
             try:
                 if hasattr(src, "companion_hard_stop_decode"):
                     src.companion_hard_stop_decode(join_s=2.5)
@@ -1311,6 +1351,114 @@ class VideoPreviewUiMixin:
             release_all_companion_rtsp_hosts()
         except Exception:
             pass
+        return url
+
+    def _schedule_rtsp_resume(self, url: str, resume) -> None:
+        """Run *resume* as soon as the camera is answering on RTSP again.
+
+        A fixed settle cannot be right: the camera's recovery time is the one
+        number we do not know, and the cost of guessing runs in both
+        directions. Guess short and FFmpeg opens against a camera that is still
+        down, which costs an 8 s connect timeout and an escalating backoff per
+        attempt — the 40 s switches in the 2026-08-26 report. Guess long and
+        every switch pays for the worst case.
+
+        So ask instead. One cheap TCP connect to the RTSP port answers in
+        milliseconds, and the reopen happens on the first probe that succeeds.
+        The probe runs off the GUI thread (a connect attempt against a camera
+        that is down blocks for its full timeout); a GUI-thread timer watches
+        the result so the restart itself stays on the GUI thread.
+
+        Superseded by the next switch via `_sensor_switch_gen`: without that, a
+        pending resume from an abandoned switch would start a second decoder
+        against a camera that allows one client, and both would starve.
+        """
+        gen = int(getattr(self, "_sensor_switch_gen", 0) or 0) + 1
+        self._sensor_switch_gen = gen
+
+        def _superseded() -> bool:
+            return int(getattr(self, "_sensor_switch_gen", 0) or 0) != gen
+
+        if not url or "192.168.144." not in url.lower():
+            QTimer.singleShot(
+                _SENSOR_SWITCH_SETTLE_MS,
+                lambda: None if _superseded() else resume(),
+            )
+            return
+
+        # 0.0 = still waiting, >0 = camera answered (monotonic), <0 = gave up.
+        outcome = [0.0]
+        t0 = time.monotonic()
+
+        def _probe() -> None:
+            outcome[0] = _wait_for_rtsp_ready(url, is_superseded=_superseded)
+
+        try:
+            threading.Thread(target=_probe, daemon=True).start()
+        except Exception:
+            QTimer.singleShot(_SENSOR_SWITCH_SETTLE_MS, resume)
+            return
+
+        try:
+            timer = QTimer(self)
+        except Exception:
+            QTimer.singleShot(_SENSOR_SWITCH_SETTLE_MS, resume)
+            return
+        timer.setInterval(120)
+
+        def _tick() -> None:
+            if _superseded():
+                timer.stop()
+                return
+            result = float(outcome[0])
+            if result == 0.0:
+                # A camera that takes 15 s to come back leaves the preview black
+                # for 15 s. Say so — "it hung" and "it is still coming back" look
+                # identical otherwise, and the operator's fix for the first one
+                # (press it again) is the worst thing to do to the second.
+                waiting = time.monotonic() - t0
+                if waiting >= 2.0:
+                    try:
+                        self._set_status(
+                            f"Waiting for camera video to come back… {waiting:.0f}s"
+                        )
+                    except Exception:
+                        pass
+                return
+            timer.stop()
+            waited = time.monotonic() - t0
+            try:
+                if result < 0.0:
+                    print(
+                        "[VGCS:video] companion RTSP: camera still not answering after "
+                        f"{waited:.1f}s — reopening anyway"
+                    )
+                else:
+                    print(
+                        f"[VGCS:video] companion RTSP: camera back after {waited:.1f}s "
+                        "— reopening decode"
+                    )
+            except Exception:
+                pass
+            resume()
+
+        timer.timeout.connect(_tick)
+        self._sensor_switch_resume_timer = timer
+        timer.start()
+
+    def _restart_decode_for_sensor_switch(self, sensor: str) -> None:
+        """Clean decode restart after an in-stream EO/IR change.
+
+        Same shape as _companion_switch_active_feed's handoff — hard-stop,
+        release the RTSP host, wait for the camera, restart — because the
+        problem is the same: the decoder is holding parameters for a stream
+        that no longer looks like that. The difference is only that the URL
+        does not change.
+        """
+        vp = getattr(self, "_video_pipeline_shared", None) or getattr(self, "_video", None)
+        if vp is None:
+            return
+        url = self._begin_rtsp_handoff(vp, hold_s=_SENSOR_SWITCH_MAX_WAIT_S + 6.0)
         self._last_video_pushed = ""
         try:
             self._video_gui_logged_frame = False
@@ -1335,7 +1483,7 @@ class VideoPreviewUiMixin:
                 "(one stream — gimbal unchanged)"
             )
 
-        QTimer.singleShot(_SENSOR_SWITCH_SETTLE_MS, _resume)
+        self._schedule_rtsp_resume(url, _resume)
 
     def _sync_native_thermal_feed_button(self) -> None:
         btn = getattr(self, "_btn_native_thermal", None)

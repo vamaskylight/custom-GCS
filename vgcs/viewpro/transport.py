@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
+
+# How long a failed connect suppresses further connect attempts from the
+# fire-and-forget `send` path. The background poll loop keeps trying throughout,
+# so the link still comes back on its own — this only stops the GUI thread from
+# queueing up one blocking connect per command while the camera is away.
+_CONNECT_RETRY_COOLDOWN_S = 2.0
 
 
 class ViewproTcpTransport:
@@ -28,14 +35,41 @@ class ViewproTcpTransport:
         self._timeout_s = max(0.1, float(timeout_s))
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
+        self._connect_blocked_until = 0.0
 
-    def open(self) -> None:
+    def open(self, *, respect_cooldown: bool = False) -> None:
+        """Connect if not already connected.
+
+        ``respect_cooldown`` is for callers on the GUI thread. A connect to an
+        absent camera blocks for the full socket timeout, and the gimbal jog
+        path fires every 80 ms while a hold button is down — so with the camera
+        away (a Viewpro sensor change takes its network stack down for seconds:
+        field log 2026-08-26 shows port 2000 resetting and then timing out for
+        ~40 s) every one of those ticks stalled the UI for a second. Once a
+        connect has failed, those callers skip straight to the same failure the
+        blocking attempt would have produced, and the background poll loop —
+        which reconnects without the flag — brings the link back.
+        """
         with self._lock:
             if self._sock is not None:
                 return
+            if respect_cooldown and time.monotonic() < self._connect_blocked_until:
+                raise ConnectionError(
+                    f"{self._host}:{self._port} unreachable "
+                    "(waiting on the status poll to reconnect)"
+                )
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self._timeout_s)
-            sock.connect((self._host, self._port))
+            try:
+                sock.connect((self._host, self._port))
+            except OSError:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                self._connect_blocked_until = time.monotonic() + _CONNECT_RETRY_COOLDOWN_S
+                raise
+            self._connect_blocked_until = 0.0
             self._sock = sock
 
     def close(self) -> None:
@@ -53,7 +87,9 @@ class ViewproTcpTransport:
             return self._sock is not None
 
     def send(self, payload: bytes) -> None:
-        self.open()
+        # Fire-and-forget, called from the GUI thread — never block it on a
+        # connect to a camera that has already refused one. See `open`.
+        self.open(respect_cooldown=True)
         with self._lock:
             assert self._sock is not None
             try:

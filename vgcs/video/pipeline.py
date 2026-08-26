@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import ipaddress
 import os
 from pathlib import Path
+import socket
 import threading
 import time
 import json
@@ -29,6 +30,12 @@ _companion_preview_motion_until: float = 0.0
 _companion_app_background_mono: float = 0.0
 # Day ↔ thermal IR switch — never block decode on background flicker during handoff.
 _companion_feed_switch_until: float = 0.0
+# Narrower than the window above: an operator pressed a button and is watching a
+# black preview *right now*, so the -138 backoffs stand down. Kept separate
+# because the background-hold window is also claimed by things that are not a
+# switch at all (an open report can hold it for three minutes), and clamping the
+# retry brakes for that long would let an unattended loop hammer the camera.
+_companion_switch_handoff_until: float = 0.0
 
 # MapWidget registers which source ids may open FFmpeg (single view = day only).
 _companion_decode_gate: Callable[[str], bool] | None = None
@@ -142,10 +149,19 @@ def notify_companion_app_foreground() -> None:
             pass
 
 
-def notify_companion_feed_switch(*, duration_s: float = 12.0) -> None:
-    """Day ↔ thermal handoff — keep decode alive despite brief window inactive states."""
+def notify_companion_hold_decode(*, duration_s: float = 12.0) -> None:
+    """Keep decode alive despite brief window-inactive states. Not a switch."""
     global _companion_feed_switch_until
-    _companion_feed_switch_until = time.monotonic() + max(2.0, float(duration_s))
+    until = time.monotonic() + max(2.0, float(duration_s))
+    if until > _companion_feed_switch_until:
+        _companion_feed_switch_until = until
+
+
+def notify_companion_feed_switch(*, duration_s: float = 12.0) -> None:
+    """Day ↔ thermal handoff — an operator is waiting on this reopen."""
+    global _companion_switch_handoff_until
+    notify_companion_hold_decode(duration_s=duration_s)
+    _companion_switch_handoff_until = time.monotonic() + max(2.0, float(duration_s))
     try:
         print(
             f"[VGCS:video] companion feed switch: RTSP handoff "
@@ -153,6 +169,67 @@ def notify_companion_feed_switch(*, duration_s: float = 12.0) -> None:
         )
     except Exception:
         pass
+
+
+def _companion_switch_handoff_active() -> bool:
+    """True while an operator is waiting on a deliberate day ↔ IR reopen."""
+    return time.monotonic() < float(_companion_switch_handoff_until or 0.0)
+
+
+def reset_companion_rtsp_backoff() -> None:
+    """Forget every accumulated RTSP penalty before a *deliberate* reopen.
+
+    The -138 backoffs (open throttle, camera-release sleep, session cooldown)
+    escalate to 11–25 s so an unattended retry loop stops hammering a camera
+    that is not answering. They are the right shape for a loop nobody asked
+    for — and exactly the wrong shape for an operator pressing IR, who then
+    waits out a penalty earned by the *previous* stream's trouble. Field
+    report 2026-08-26: "sometimes 5 sec sometimes 40 sec", with
+    "throttling open (11.0s)" in the log immediately after the button press.
+
+    Called at the start of every user-initiated feed/sensor switch.
+    """
+    global _COMPANION_RTSP_LAST_OPEN_MONO
+    with _COMPANION_RTSP_OPEN_LOCK:
+        _COMPANION_RTSP_LAST_OPEN_MONO = 0.0
+
+
+def companion_rtsp_port_ready(url: str, *, timeout_s: float = 0.6) -> bool:
+    """True when the camera's RTSP port accepts a TCP connection right now.
+
+    A Viewpro sensor change takes the camera's whole network service down for
+    a few seconds — the 2026-08-26 log shows the ViewLink control port (2000)
+    resetting and then timing out alongside RTSP (554). Guessing how long that
+    lasts is what produced the 5 s / 40 s spread: a fixed settle is either too
+    long or too short, and every FFmpeg open attempt aimed at a camera that is
+    still down costs a full 8 s connect timeout plus an escalating backoff.
+
+    Asking the camera directly costs one cheap socket and answers in
+    milliseconds, so the decoder can restart the moment the camera is back
+    rather than on a timer that knows nothing about it.
+    """
+    u = str(url or "").strip()
+    host = _companion_rtsp_host(u)
+    if not host:
+        return True
+    port = 554
+    try:
+        port = int(urlparse(u).port or 554)
+    except Exception:
+        port = 554
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(max(0.1, float(timeout_s)))
+        return sock.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
 
 
 _companion_report_viewer_until: float = 0.0
@@ -163,7 +240,7 @@ def notify_companion_report_viewer_opened(*, duration_s: float = 180.0) -> None:
     global _companion_report_viewer_until
     hold = max(60.0, float(duration_s))
     _companion_report_viewer_until = time.monotonic() + hold
-    notify_companion_feed_switch(duration_s=hold)
+    notify_companion_hold_decode(duration_s=hold)
     try:
         print(
             f"[VGCS:video] companion RTSP: report viewer open "
@@ -193,8 +270,15 @@ def _companion_app_is_background() -> bool:
     return float(_companion_app_background_mono or 0.0) > 0.0
 
 
-def _companion_wait_until_foreground(*, poll_s: float = 0.5) -> None:
+def _companion_wait_until_foreground(
+    *, poll_s: float = 0.5, should_stop: Callable[[], bool] | None = None
+) -> None:
+    """Park while the app is minimised. ``should_stop`` lets a decode thread
+    that has since been superseded leave instead of waiting for a foreground
+    event it no longer cares about."""
     while _companion_app_is_background():
+        if should_stop is not None and should_stop():
+            return
         time.sleep(max(0.2, float(poll_s)))
 
 
@@ -1210,7 +1294,11 @@ def _siyi_hevc_glitch_release_sleep(*, brief_session: bool = False) -> None:
 
 
 def _siyi_camera_release_sleep(
-    tail_b: bytes, empty_sessions: int, *, fail_streak: int = 0
+    tail_b: bytes,
+    empty_sessions: int,
+    *,
+    fail_streak: int = 0,
+    sleeper: Callable[[float], bool] | None = None,
 ) -> None:
     """ZR10 often needs a few seconds to release the single RTSP client slot."""
     if not _siyi_rtsp_camera_busy(tail_b):
@@ -1224,6 +1312,10 @@ def _siyi_camera_release_sleep(
         20.0,
         base + 0.5 * max(0, int(empty_sessions) - 1) + 1.5 * max(0, int(fail_streak)),
     )
+    if _companion_switch_handoff_active():
+        # An operator is waiting on this reopen. The escalation is for an
+        # unattended loop; here it is just dead time in front of a button press.
+        delay = min(delay, 1.5)
     try:
         print(
             f"[VGCS:video] companion RTSP: waiting {delay:.1f}s for camera RTSP slot "
@@ -1231,7 +1323,10 @@ def _siyi_camera_release_sleep(
         )
     except Exception:
         pass
-    time.sleep(delay)
+    if sleeper is not None:
+        sleeper(delay)
+    else:
+        time.sleep(delay)
 
 
 def _siyi_session_cooldown_s(tail_b: bytes, reconnect_delay: float) -> float:
@@ -1256,6 +1351,10 @@ def _siyi_session_cooldown_s(tail_b: bytes, reconnect_delay: float) -> float:
         or b"error number -138" in tl
         or b"error number -10054" in tl
     ):
+        if _companion_switch_handoff_active():
+            # Mid-handoff the camera is expected to refuse for a moment; the
+            # readiness probe decides when to come back, not an 8 s floor.
+            return min(2.0, max(0.5, float(reconnect_delay)))
         return max(8.0, float(reconnect_delay))
     return min(3.0, max(1.0, float(reconnect_delay)))
 
@@ -1629,6 +1728,10 @@ class RtspSource(QObject):
         self._ffmpeg_proc: subprocess.Popen[bytes] | None = None
         self._ffmpeg_thread: Optional[threading.Thread] = None
         self._ffmpeg_stop = threading.Event()
+        # Bumped by every stop/restart. A decode thread that outlives its own
+        # generation must exit even if `_ffmpeg_stop` has since been cleared for
+        # its replacement — see `_decode_session_ended`.
+        self._ffmpeg_gen: int = 0
         self._ffmpeg_dims: tuple[int, int] | None = None
         self._ffmpeg_last_frame_mono: float = 0.0
         self._ffmpeg_last_decode_mono: float = 0.0
@@ -1774,6 +1877,7 @@ class RtspSource(QObject):
     @Slot()
     def _deferred_companion_ffmpeg_restart(self) -> None:
         """Companion/SIYI: restart FFmpeg without stop()/start() tearing down preview state."""
+        self._next_decode_generation()
         try:
             self._ffmpeg_stop.set()
         except Exception:
@@ -1857,6 +1961,7 @@ class RtspSource(QObject):
         if not self._running:
             return
         self._running = False
+        self._next_decode_generation()
         # Wake the decode thread immediately; never block the GUI thread on
         # `QMediaPlayer.stop()`, pipe teardown, or subprocess cleanup — those
         # routinely stall for seconds on Windows when RTSP is unreachable.
@@ -1877,6 +1982,7 @@ class RtspSource(QObject):
         """Stop FFmpeg and release the C13 RTSP slot (day ↔ thermal IR switch)."""
         url = str(self._url or "").strip()
         self._running = False
+        self._next_decode_generation()
         try:
             self._ffmpeg_stop.set()
         except Exception:
@@ -2118,6 +2224,9 @@ class RtspSource(QObject):
             return
         if self._ffmpeg_thread is not None and self._ffmpeg_thread.is_alive():
             # Prior stop() may still be in ffprobe/teardown; end it before a new session.
+            # The join can time out, so the old thread is also retired by
+            # generation — clearing `_ffmpeg_stop` below must not revive it.
+            self._next_decode_generation()
             try:
                 self._ffmpeg_stop.set()
             except Exception:
@@ -2130,6 +2239,14 @@ class RtspSource(QObject):
                 self._ffmpeg_thread.join(timeout=3.0)
             except Exception:
                 pass
+            if self._ffmpeg_thread is not None and self._ffmpeg_thread.is_alive():
+                try:
+                    print(
+                        "[VGCS:video] decode thread did not exit in time — "
+                        "superseded by a new session (it will drop out on its own)"
+                    )
+                except Exception:
+                    pass
             self._ffmpeg_thread = None
             try:
                 self._ffmpeg_stop.clear()
@@ -2159,7 +2276,10 @@ class RtspSource(QObject):
             except Exception:
                 pass
         self._ffmpeg_stop.clear()
-        self._ffmpeg_thread = threading.Thread(target=self._ffmpeg_loop, daemon=True)
+        gen = self._next_decode_generation()
+        self._ffmpeg_thread = threading.Thread(
+            target=self._ffmpeg_loop, args=(gen,), daemon=True
+        )
         self._ffmpeg_thread.start()
         self.started.emit()
 
@@ -2196,6 +2316,151 @@ class RtspSource(QObject):
     def _qt_close_ffmpeg_decode_proc(self) -> None:
         self._close_ffmpeg_decode_proc()
 
+    def reset_companion_open_backoff(self) -> None:
+        """Clear this source's -138 penalty before a deliberate reopen.
+
+        See `reset_companion_rtsp_backoff` — the streak is a brake on an
+        unattended retry loop, not something an operator should have to wait
+        out after pressing a button.
+        """
+        self._siyi_138_fail_streak = 0
+        self._siyi_last_open_tail = b""
+        self._companion_transport_override = None
+
+    def _next_decode_generation(self) -> int:
+        """Retire the running decode session; returns the new generation."""
+        try:
+            self._ffmpeg_gen = int(self._ffmpeg_gen) + 1
+        except Exception:
+            self._ffmpeg_gen = 1
+        return int(self._ffmpeg_gen)
+
+    def _decode_session_ended(self, gen: int) -> bool:
+        """True when the decode thread running as *gen* must stop.
+
+        `_ffmpeg_stop` alone is not enough. Every restart path sets it, joins
+        the old thread with a timeout, then clears it for the replacement — so
+        a thread that missed its join window (parked in a backoff sleep) came
+        back to a cleared flag and kept decoding. Two threads then competed for
+        the single RTSP client slot this camera allows, and neither ever got a
+        frame: the "camera feed stuck" of the 2026-08-26 field report, which no
+        amount of waiting recovers from because the app is the thing holding
+        the slot against itself.
+
+        The generation is per-session and never reused, so a superseded thread
+        stays superseded no matter what the shared flag does afterwards.
+        """
+        if not self._running:
+            return True
+        if int(self._ffmpeg_gen) != int(gen):
+            return True
+        return self._ffmpeg_stop.is_set()
+
+    def _decode_sleep(self, seconds: float, gen: int) -> bool:
+        """Backoff sleep that gives the session up promptly when superseded.
+
+        Returns False if the wait was cut short. The retry backoffs reach 20 s;
+        sleeping them straight through is what let a stopped thread miss its
+        join and become the zombie described in `_decode_session_ended`.
+        """
+        end = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if self._decode_session_ended(gen):
+                return False
+            remaining = end - time.monotonic()
+            if remaining <= 0.0:
+                return True
+            time.sleep(min(0.2, remaining))
+
+    def _end_decode_session_proc(self, proc: "subprocess.Popen[bytes]") -> None:
+        """End one decode session's FFmpeg, releasing the camera's RTSP slot.
+
+        Used by the in-loop reconnects (frozen frames, stale preview, corrupt
+        streak). They reconnect *to the same single-client camera*, so leaving
+        the old session orphaned guarantees the reconnect they just decided to
+        make will be refused.
+        """
+        try:
+            if proc.poll() is not None:
+                return
+            if self._quit_ffmpeg_gracefully(proc):
+                return
+            proc.kill()
+        except Exception:
+            pass
+
+    def _quit_ffmpeg_gracefully(self, proc: "subprocess.Popen[bytes]") -> bool:
+        """Ask FFmpeg to quit so it sends RTSP TEARDOWN. True if it exited.
+
+        Killing FFmpeg leaves the camera holding a session that nobody is
+        reading. These companion cameras serve one RTSP client, and they only
+        reclaim an abandoned session on their own (long) timeout — so the very
+        next open is refused with -138, and the app reads its own orphaned
+        session as "camera busy, close VLC". Every reconnect path did this:
+        the switch teardown, the stale-preview reconnect, the corrupt-streak
+        reconnect. Writing "q" to stdin makes FFmpeg tear the session down
+        properly and the slot is free immediately.
+
+        Windows has no SIGTERM equivalent (`terminate()` is `TerminateProcess`,
+        identical to `kill()`), which is why this goes through FFmpeg's own
+        stdin quit key rather than a signal.
+
+        Best-effort with a short grace: a decode child that ignores it is
+        killed by the caller as before. FFmpeg reads a piped stdin on every
+        platform it ships for, but rather than trust that of an unknown field
+        build, a couple of consecutive failures disable this for the session —
+        so the worst case is the old kill-only behaviour, never a grace period
+        added to every teardown for nothing.
+        """
+        if not _rtsp_url_is_companion_rtsp(str(self._url or "").strip()):
+            return False
+        if bool(getattr(self, "_ffmpeg_graceful_quit_unavailable", False)):
+            return False
+        try:
+            grace = float(
+                str(os.environ.get("VGCS_COMPANION_TEARDOWN_S", "0.6") or "0.6").strip()
+            )
+        except ValueError:
+            grace = 0.6
+        grace = max(0.0, min(3.0, grace))
+        if grace <= 0.0:
+            return False
+        sin = None
+        try:
+            sin = proc.stdin
+        except Exception:
+            sin = None
+        if sin is None:
+            return False
+        try:
+            sin.write(b"q")
+            sin.flush()
+        except Exception:
+            return False
+        finally:
+            try:
+                sin.close()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=grace)
+            self._ffmpeg_graceful_quit_misses = 0
+            return True
+        except Exception:
+            misses = int(getattr(self, "_ffmpeg_graceful_quit_misses", 0) or 0) + 1
+            self._ffmpeg_graceful_quit_misses = misses
+            if misses >= 2:
+                self._ffmpeg_graceful_quit_unavailable = True
+                try:
+                    print(
+                        "[VGCS:video] companion RTSP: this FFmpeg build ignores the stdin "
+                        "quit key — falling back to kill (camera may hold its RTSP slot "
+                        "longer between reconnects)"
+                    )
+                except Exception:
+                    pass
+            return False
+
     def _close_ffmpeg_decode_proc(self) -> None:
         """Terminate the continuous decode child only (does not set `_ffmpeg_stop`)."""
         p = self._ffmpeg_proc
@@ -2206,24 +2471,26 @@ class RtspSource(QObject):
         # Kill first so the reader thread wakes, then close the handle.
         try:
             if p.poll() is None:
-                try:
-                    p.kill()
-                except Exception:
+                if not self._quit_ffmpeg_gracefully(p):
                     try:
-                        p.terminate()
+                        p.kill()
+                    except Exception:
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        for pipe_name in ("stdout", "stdin"):
+            try:
+                pipe = getattr(p, pipe_name, None)
+                if pipe is not None:
+                    try:
+                        pipe.close()
                     except Exception:
                         pass
-        except Exception:
-            pass
-        try:
-            out = p.stdout
-            if out is not None:
-                try:
-                    out.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     def _ffprobe_dims(
         self, url: str, *, rtsp_transport: str | None = None, udp_input_format: str = ""
@@ -2431,16 +2698,29 @@ class RtspSource(QObject):
         t.start()
         return t
 
-    def _siyi_throttle_before_rtsp_open(self, url: str, tail_hint: bytes = b"") -> None:
+    def _siyi_throttle_before_rtsp_open(
+        self,
+        url: str,
+        tail_hint: bytes = b"",
+        *,
+        sleeper: Callable[[float], bool] | None = None,
+    ) -> None:
         """Minimum gap between FFmpeg RTSP opens (reduces companion -138 / busy slot storms)."""
         if not _rtsp_url_is_companion_rtsp(url):
             return
         global _COMPANION_RTSP_LAST_OPEN_MONO
         streak = int(getattr(self, "_siyi_138_fail_streak", 0) or 0)
+        switching = _companion_switch_handoff_active()
         min_gap = 5.0
-        if _companion_feed_switch_active():
-            min_gap = 2.0
-        if streak >= 2 or _siyi_rtsp_camera_busy(tail_hint):
+        if switching:
+            # Deliberate day ↔ IR handoff: hold the gap at the small value the
+            # camera needs to drop the old session and no more. The streak
+            # escalation below deliberately does NOT apply — it exists to slow
+            # an unattended retry loop, and applying it here made the operator
+            # wait out the previous stream's penalty (11 s in the 2026-08-26
+            # log) on top of the switch itself.
+            min_gap = 1.0
+        elif streak >= 2 or _siyi_rtsp_camera_busy(tail_hint):
             min_gap = min(25.0, 8.0 + streak * 2.0)
         with _COMPANION_RTSP_OPEN_LOCK:
             now = time.monotonic()
@@ -2454,7 +2734,10 @@ class RtspSource(QObject):
                     )
                 except Exception:
                     pass
-                time.sleep(wait)
+                if sleeper is not None:
+                    sleeper(wait)
+                else:
+                    time.sleep(wait)
             _COMPANION_RTSP_LAST_OPEN_MONO = time.monotonic()
 
     def _siyi_mark_rtsp_open_result(self, frames: int, tail: bytes) -> None:
@@ -2476,11 +2759,20 @@ class RtspSource(QObject):
                 except Exception:
                     pass
 
-    def _ffmpeg_loop(self) -> None:
+    def _ffmpeg_loop(self, gen: int | None = None) -> None:
         try:
             print(f"[VGCS:video] pipeline rev={_VIDEO_PIPELINE_REV}")
         except Exception:
             pass
+        # This thread owns exactly one decode generation; a newer one supersedes it.
+        my_gen = int(self._ffmpeg_gen) if gen is None else int(gen)
+
+        def _ended() -> bool:
+            return self._decode_session_ended(my_gen)
+
+        def _backoff(seconds: float) -> bool:
+            return self._decode_sleep(seconds, my_gen)
+
         url = _normalize_companion_rtsp_url(str(self._url or "").strip())
         transport_for_probe = _rtsp_transport_sequence(url, self._transport)
         dims: tuple[int, int] | None = None
@@ -2608,19 +2900,19 @@ class RtspSource(QObject):
                 mode = "hwaccel=auto" if siyi_hw else "sw (auto codec)"
                 print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
 
-        while self._running and not self._ffmpeg_stop.is_set():
+        while not _ended():
             transport_seq = _rtsp_transport_sequence_with_override(
                 url, self._transport, self._companion_transport_override
             )
             round_ok = False
             url_fatal = False
             for transport in transport_seq:
-                if self._ffmpeg_stop.is_set() or not self._running:
+                if _ended():
                     break
                 transport_got_frames = False
                 demux_try = self._udp_demux_try_sequence(url)
                 for demux_fmt in demux_try:
-                    if self._ffmpeg_stop.is_set() or not self._running:
+                    if _ended():
                         break
                     # Only skip extra demux variants on this transport — never skip UDP
                     # because TCP worked earlier in the same round (fixes -138 stuck on TCP).
@@ -2648,9 +2940,9 @@ class RtspSource(QObject):
                     empty_sessions = 0
                     tcp_138_streak = 0
 
-                    while self._running and not self._ffmpeg_stop.is_set() and not url_fatal:
+                    while not _ended() and not url_fatal:
                         if companion_rtsp and _companion_app_is_background():
-                            _companion_wait_until_foreground()
+                            _companion_wait_until_foreground(should_stop=_ended)
                         if companion_rtsp:
                             if not _companion_decode_permitted(self.source_id, url):
                                 break
@@ -2660,7 +2952,9 @@ class RtspSource(QObject):
                         tr_label = str(use_transport) if use_transport is not None else "n/a"
                         if companion_rtsp:
                             self._siyi_throttle_before_rtsp_open(
-                                url, getattr(self, "_siyi_last_open_tail", b"") or b""
+                                url,
+                                getattr(self, "_siyi_last_open_tail", b"") or b"",
+                                sleeper=_backoff,
                             )
                         if siyi_url and (
                             transport_got_frames or self._companion_transport_override
@@ -2705,7 +2999,10 @@ class RtspSource(QObject):
                                 cmd_base,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
-                                stdin=subprocess.DEVNULL,
+                                # A real pipe, not DEVNULL, so teardown can send
+                                # FFmpeg's "q" and get an RTSP TEARDOWN out of it
+                                # (see `_quit_ffmpeg_gracefully`).
+                                stdin=subprocess.PIPE,
                             )
                             self._ffmpeg_proc = p
 
@@ -2756,7 +3053,7 @@ class RtspSource(QObject):
                             empty_sessions += 1
                             if empty_sessions >= empty_session_limit:
                                 break
-                            time.sleep(reconnect_delay)
+                            _backoff(reconnect_delay)
                             continue
 
                         if p.stdout is None:
@@ -2764,7 +3061,7 @@ class RtspSource(QObject):
                             empty_sessions += 1
                             if empty_sessions >= empty_session_limit:
                                 break
-                            time.sleep(reconnect_delay)
+                            _backoff(reconnect_delay)
                             continue
 
                         frames_this_session = 0
@@ -2792,7 +3089,7 @@ class RtspSource(QObject):
                             )
                         read_fail_streak = 0
                         try:
-                            while self._running and not self._ffmpeg_stop.is_set():
+                            while not _ended():
                                 if (
                                     frames_this_session == 0
                                     and not waiting_logged
@@ -2850,11 +3147,7 @@ class RtspSource(QObject):
                                                 )
                                             except Exception:
                                                 pass
-                                        try:
-                                            if p.poll() is None:
-                                                p.kill()
-                                        except Exception:
-                                            pass
+                                        self._end_decode_session_proc(p)
                                         break
                                 with self._rec_lock:
                                     recp = self._rec_proc
@@ -3053,11 +3346,7 @@ class RtspSource(QObject):
                                                 session_gop_ready = False
                                                 clean_warmup_streak = 0
                                                 last_good_arr = None
-                                                try:
-                                                    if p.poll() is None:
-                                                        p.kill()
-                                                except Exception:
-                                                    pass
+                                                self._end_decode_session_proc(p)
                                                 self._companion_last_stale_reconnect_mono = stale_now
                                                 break
                                             corrupt_thr = (
@@ -3110,11 +3399,7 @@ class RtspSource(QObject):
                                                         )
                                                     except Exception:
                                                         pass
-                                                try:
-                                                    if p.poll() is None:
-                                                        p.kill()
-                                                except Exception:
-                                                    pass
+                                                self._end_decode_session_proc(p)
                                                 session_gop_ready = False
                                                 clean_warmup_streak = 0
                                                 last_good_arr = None
@@ -3265,6 +3550,17 @@ class RtspSource(QObject):
                                 if (
                                     str(use_transport or "").lower() == "tcp"
                                     and tcp_138_streak >= 3
+                                    # -rtsp_transport only picks how the MEDIA
+                                    # travels; RTSP's own control channel is TCP
+                                    # either way. When the camera is not
+                                    # answering on 554 at all — which is what a
+                                    # -138 during a sensor handoff means — the
+                                    # UDP round fails identically and costs
+                                    # another full connect timeout. Field log
+                                    # 2026-08-26 shows exactly that: the UDP
+                                    # attempt's stderr is still
+                                    # "Connection to tcp://…:554 failed".
+                                    and not _companion_switch_handoff_active()
                                 ):
                                     try:
                                         print(
@@ -3280,14 +3576,14 @@ class RtspSource(QObject):
                                 self._siyi_mark_rtsp_open_result(frames_this_session, tail)
                         self._close_ffmpeg_decode_proc()
 
-                        if self._ffmpeg_stop.is_set() or not self._running:
+                        if _ended():
                             break
 
                         if url_fatal:
                             print(
                                 "[VGCS:video] stopping RTSP retries for this URL (404 / not found)"
                             )
-                            time.sleep(15.0)
+                            _backoff(15.0)
                             break
 
                         if frames_this_session > 0:
@@ -3325,7 +3621,7 @@ class RtspSource(QObject):
                             )
                             cooldown = _siyi_session_cooldown_s(tail_b, reconnect_delay)
                             if companion_rtsp:
-                                _companion_wait_until_foreground()
+                                _companion_wait_until_foreground(should_stop=_ended)
                             if companion_rtsp:
                                 siyi_hw = False
                                 try:
@@ -3367,7 +3663,7 @@ class RtspSource(QObject):
                                         except Exception:
                                             pass
                                     # Short cooldown only — reconnect mid-GOP causes more POC loss.
-                                    time.sleep(
+                                    _backoff(
                                         _siyi_session_cooldown_s(tail_b, reconnect_delay)
                                     )
                                 elif _siyi_rtsp_camera_busy(tail_b):
@@ -3377,11 +3673,12 @@ class RtspSource(QObject):
                                         fail_streak=int(
                                             getattr(self, "_siyi_138_fail_streak", 0) or 0
                                         ),
+                                        sleeper=_backoff,
                                     )
                                 else:
-                                    time.sleep(cooldown)
+                                    _backoff(cooldown)
                             else:
-                                time.sleep(cooldown)
+                                _backoff(cooldown)
                             if companion_rtsp:
                                 self._siyi_mark_rtsp_open_result(frames_this_session, tail_b)
                             continue
@@ -3394,7 +3691,7 @@ class RtspSource(QObject):
                             pass
                         if transport_got_frames and empty_sessions < 5:
                             # SIYI often drops RTSP after ~60s; keep retrying same transport.
-                            time.sleep(max(reconnect_delay, 2.0))
+                            _backoff(max(reconnect_delay, 2.0))
                             continue
                         if empty_sessions >= empty_session_limit:
                             print(
@@ -3409,19 +3706,20 @@ class RtspSource(QObject):
                                 fail_streak=int(
                                     getattr(self, "_siyi_138_fail_streak", 0) or 0
                                 ),
+                                sleeper=_backoff,
                             )
                             self._siyi_mark_rtsp_open_result(0, tail_empty)
                         else:
-                            time.sleep(reconnect_delay)
+                            _backoff(reconnect_delay)
                             if companion_rtsp and tail_empty:
                                 self._siyi_mark_rtsp_open_result(0, tail_empty)
 
-                if self._ffmpeg_stop.is_set() or not self._running:
+                if _ended():
                     break
                 if url_fatal:
                     break
 
-            if self._ffmpeg_stop.is_set() or not self._running:
+            if _ended():
                 break
             if round_ok:
                 round_backoff_s = 0.6
@@ -3430,7 +3728,7 @@ class RtspSource(QObject):
                     f"[VGCS:video] all transports exhausted for this pass; "
                     f"cooling down {round_backoff_s:.1f}s before retry"
                 )
-                time.sleep(round_backoff_s)
+                _backoff(round_backoff_s)
                 round_backoff_s = min(max_round_backoff_s, round_backoff_s * 1.35)
 
         # User called stop() or thread tear-down; only close the child.
