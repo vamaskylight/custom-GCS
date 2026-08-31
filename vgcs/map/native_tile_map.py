@@ -1469,10 +1469,15 @@ class NativeTileMapView(QWidget):
         if int(z) != int(self._view_z):
             return
         if img is None or not isinstance(img, QImage) or img.isNull():
-            self._schedule_placeholder_retry(z, x, y)
+            # A null image means the FETCH failed (offline, DNS, timeout) — it
+            # says nothing about the tile already on disk. Deleting that would
+            # destroy the offline map, so only retry.
+            self._schedule_placeholder_retry(z, x, y, drop_cached=False)
             return
         if _tile_image_is_placeholder(img, zoom=z):
-            self._schedule_placeholder_retry(z, x, y)
+            # Decoded fine but the server sent its "no imagery here" tile. That
+            # one IS worth dropping so a later fetch can replace it.
+            self._schedule_placeholder_retry(z, x, y, drop_cached=True)
             return
         self._tiles[key] = _prepare_tile_image(img)
         self._preview_tiles.pop(key, None)
@@ -1480,8 +1485,18 @@ class NativeTileMapView(QWidget):
         self._tile_retry_count.pop(key, None)
         self._schedule_repaint()
 
-    def _schedule_placeholder_retry(self, z: int, x: int, y: int) -> None:
-        """Esri placeholder or miss — keep parent upscale visible and retry later."""
+    def _schedule_placeholder_retry(
+        self, z: int, x: int, y: int, *, drop_cached: bool = True
+    ) -> None:
+        """Esri placeholder or miss — keep parent upscale visible and retry later.
+
+        `drop_cached` must be False when the fetch merely failed. This method
+        used to unlink the on-disk tile unconditionally, so the first time the
+        crew ran without internet every cached tile they had was deleted as its
+        request failed — the offline map erased itself exactly when it was
+        needed. Field report 2026-08-31: "with the internet I can see, without
+        the internet not working", after caching had supposedly been fixed.
+        """
         key = (int(z), int(x), int(y))
         self._tiles.pop(key, None)
         self._preview_tiles.pop(key, None)
@@ -1494,11 +1509,12 @@ class NativeTileMapView(QWidget):
         if now < wait:
             return
         self._tile_retry_after[key] = now + 2.0
-        try:
-            cp = _disk_cache_path(self._tile_source_id, key[0], key[1], key[2])
-            cp.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if drop_cached:
+            try:
+                cp = _disk_cache_path(self._tile_source_id, key[0], key[1], key[2])
+                cp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         def _retry() -> None:
             if int(z) != int(self._view_z):
