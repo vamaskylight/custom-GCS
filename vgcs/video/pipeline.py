@@ -2411,6 +2411,16 @@ class RtspSource(QObject):
         build, a couple of consecutive failures disable this for the session —
         so the worst case is the old kill-only behaviour, never a grace period
         added to every teardown for nothing.
+
+        That disable is now RECOVERABLE. It used to be permanent, and the two
+        misses that trip it are far more likely to be the RF link dying (FFmpeg
+        cannot complete an RTSP TEARDOWN over a dead link) than a build that
+        ignores stdin. Field log 2026-08-31: the link dropped, the graceful quit
+        missed twice, and every reconnect for the rest of that flight used kill
+        — leaving the camera holding its single RTSP slot and producing an
+        unrecoverable "-138 busy" storm with backoff climbing past 15 s. The
+        first session that decodes frames proves both the link and this FFmpeg
+        are fine, and clears the flag (see the frames_this_session == 1 branch).
         """
         if not _rtsp_url_is_companion_rtsp(str(self._url or "").strip()):
             return False
@@ -2453,9 +2463,9 @@ class RtspSource(QObject):
                 self._ffmpeg_graceful_quit_unavailable = True
                 try:
                     print(
-                        "[VGCS:video] companion RTSP: this FFmpeg build ignores the stdin "
-                        "quit key — falling back to kill (camera may hold its RTSP slot "
-                        "longer between reconnects)"
+                        "[VGCS:video] companion RTSP: graceful teardown timed out twice — "
+                        "falling back to kill (camera may hold its RTSP slot longer between "
+                        "reconnects); re-enabled automatically once a session decodes frames"
                     )
                 except Exception:
                     pass
@@ -3431,6 +3441,13 @@ class RtspSource(QObject):
                                             else "first"
                                         )
                                         self._ffmpeg_had_frame = True
+                                        # A session that produced frames proves the
+                                        # link and this FFmpeg are both fine, so any
+                                        # earlier graceful-quit misses were the
+                                        # outage, not the build. Re-enable it — see
+                                        # _quit_ffmpeg_gracefully.
+                                        self._ffmpeg_graceful_quit_misses = 0
+                                        self._ffmpeg_graceful_quit_unavailable = False
                                         try:
                                             print(
                                                 f"[VGCS:video] {tag} frame ok "
