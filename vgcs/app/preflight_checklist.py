@@ -114,8 +114,26 @@ def build_preflight_checks(
     # --- advisory rows ---------------------------------------------------- #
     checks.append(_gps_check(gps_fix_type, gps_sats, gps_hdop))
     checks.append(_battery_check(battery_voltage_v, battery_remaining_pct))
-    checks.append(_motors_check(sensors_present, sensors_enabled, sensors_health))
+    # Motors need to know whether the pack is on: ESCs are powered from the
+    # flight battery, so on USB alone their health bit describes nothing.
+    checks.append(
+        _motors_check(
+            sensors_present,
+            sensors_enabled,
+            sensors_health,
+            battery_powered=_battery_is_present(battery_voltage_v),
+        )
+    )
     return checks
+
+
+def _battery_is_present(voltage_v) -> bool | None:
+    """True / False / None-for-unknown. Three states on purpose: "no voltage
+    reading yet" is not the same claim as "no battery"."""
+    v = _f(voltage_v)
+    if v is None:
+        return None
+    return v >= BATTERY_MIN_PLAUSIBLE_V
 
 
 def _gps_check(fix_type, sats, hdop) -> PreflightCheck:
@@ -181,7 +199,7 @@ def _battery_check(voltage_v, remaining_pct) -> PreflightCheck:
     )
 
 
-def _motors_check(present, enabled, health) -> PreflightCheck:
+def _motors_check(present, enabled, health, *, battery_powered=None) -> PreflightCheck:
     """Motor / ESC output health, as the vehicle reports it.
 
     Requested 2026-09-02: "like battery, GPS, motor test should be there in the
@@ -195,6 +213,17 @@ def _motors_check(present, enabled, health) -> PreflightCheck:
     belongs on its own control, not in a popup that opens by itself next to an
     armed aircraft.
     """
+    # ESCs run off the flight pack. With only USB on the flight controller they
+    # are unpowered and cannot report anything — yet ArduPilot leaves the output
+    # health bit set, so this row showed a tick with no battery attached (field
+    # report 2026-09-02: "connected FC via USB, so motor test should be not
+    # completed"). Same shape of mistake as the battery percentage: a status bit
+    # that does not know its own precondition.
+    if battery_powered is False:
+        return PreflightCheck(
+            "motors", "Motors / ESCs", STATUS_UNKNOWN,
+            "ESCs are unpowered on USB — connect the flight battery to check them",
+        )
     p, e, h = _i(present), _i(enabled), _i(health)
     if p is None or e is None or h is None:
         return PreflightCheck(
