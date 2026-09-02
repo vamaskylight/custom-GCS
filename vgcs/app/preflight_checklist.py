@@ -43,6 +43,11 @@ BATTERY_MIN_PLAUSIBLE_V = 5.0
 MAV_SYS_STATUS_SENSOR_MOTOR_OUTPUTS = 0x00008000
 MAV_SYS_STATUS_SENSOR_PROPULSION = 0x40000000
 
+# Shown on every row when there is no vehicle on the other end. A checklist
+# describing a link that is down must say so on each line, not leave the last
+# reading sat there looking current.
+NO_LINK_DETAIL = "No link to the vehicle"
+
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
 STATUS_UNKNOWN = "unknown"
@@ -79,8 +84,25 @@ def build_preflight_checks(
     sensors_present: int | None = None,
     sensors_enabled: int | None = None,
     sensors_health: int | None = None,
+    link_ok: bool = True,
 ) -> list[PreflightCheck]:
     """Assemble the checklist rows. Pure — no Qt, no telemetry plumbing."""
+    if not link_ok:
+        # Every value below is the last thing the vehicle said before it went
+        # quiet. Rendering those is how the window in the 2026-09-02 screenshot
+        # came to show a green tick beside "Motors / ESCs" with the link closed
+        # and no aircraft attached. Nothing here is current, so nothing here
+        # gets a verdict.
+        return [
+            PreflightCheck(
+                "prearm", "Vehicle arming checks", STATUS_UNKNOWN, NO_LINK_DETAIL,
+                authoritative=True,
+            ),
+            PreflightCheck("gps", "GPS", STATUS_UNKNOWN, NO_LINK_DETAIL),
+            PreflightCheck("battery", "Battery", STATUS_UNKNOWN, NO_LINK_DETAIL),
+            PreflightCheck("motors", "Motors / ESCs", STATUS_UNKNOWN, NO_LINK_DETAIL),
+        ]
+
     checks: list[PreflightCheck] = []
 
     # --- the vehicle's verdict: the only row that decides anything --------- #
@@ -269,6 +291,8 @@ def checklist_summary(checks: list[PreflightCheck]) -> str:
     for c in checks:
         if c.authoritative and c.status == STATUS_FAIL:
             return f"Not ready to arm — {c.detail}"
+        if c.authoritative and c.detail == NO_LINK_DETAIL:
+            return "No link to the vehicle — nothing to check"
     return "Arm readiness unknown — waiting for the autopilot"
 
 

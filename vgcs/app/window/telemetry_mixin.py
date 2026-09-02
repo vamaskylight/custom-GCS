@@ -257,7 +257,28 @@ class MainWindowTelemetryMixin:
             "sensors_present": flags[0],
             "sensors_enabled": flags[1],
             "sensors_health": flags[2],
+            "link_ok": self._preflight_link_is_live(),
         }
+
+    def _preflight_link_is_live(self) -> bool:
+        """Is anything still talking to us?
+
+        Without this the checklist keeps rendering the last values the vehicle
+        sent, which is how a green tick beside "Motors / ESCs" survived the link
+        closing (2026-09-02 screenshot). Heartbeats arrive at 1 Hz, and the
+        watchdog timeout is the threshold the rest of the UI already calls
+        "lost", so use the same one rather than inventing a second answer.
+        """
+        import time as _t
+
+        thread = getattr(self, "_thread", None)
+        if thread is None or not thread.isRunning():
+            return False
+        stamp = getattr(self, "_last_heartbeat_mono", None)
+        if stamp is None:
+            return False
+        timeout = float(getattr(self, "_timeout_s", 0.0) or 0.0)
+        return (_t.monotonic() - float(stamp)) <= max(3.0, timeout)
 
     def _show_preflight_dialog(self) -> None:
         existing = getattr(self, "_preflight_dialog", None)
@@ -277,7 +298,28 @@ class MainWindowTelemetryMixin:
         except Exception:
             self._preflight_dialog = None
 
+    def _close_preflight_dialog(self) -> None:
+        """Shut the popup and forget it.
+
+        A QDialog with a parent is still a top-level window: closing the main
+        window does not close it, and while it is open Qt will not quit the
+        application. Reported 2026-09-02 - "i closed VGCS then also this PreArm
+        popup I can see". It also stops any motor test still running, which is
+        the more important half.
+        """
+        dlg = getattr(self, "_preflight_dialog", None)
+        self._preflight_dialog = None
+        if dlg is None:
+            return
+        try:
+            dlg.close()
+            dlg.deleteLater()
+        except Exception:
+            pass
+
     def _on_heartbeat(self, sysid: int, compid: int, mav_ver: int) -> None:
+        # Freshness, for anything that must not render a stale reading as fact.
+        self._last_heartbeat_mono = time.monotonic()
         if not self._heartbeat_seen:
             self._heartbeat_seen = True
             self._hb_connected_since_mono = time.monotonic()

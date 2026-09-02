@@ -167,6 +167,10 @@ class MainWindowLinkMixin:
         self._thread.start()
 
     def _on_disconnect(self) -> None:
+        # The popup describes a vehicle the operator has just let go of, and it
+        # can spin motors. Both reasons to close it rather than leave it
+        # showing the last thing the aircraft said.
+        self._close_preflight_dialog()
         if hasattr(self, "_hdr_disconnect_btn"):
             self._hdr_disconnect_btn.setEnabled(False)
         self._stop_camera_control_backend()

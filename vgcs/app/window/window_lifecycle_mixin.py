@@ -242,6 +242,9 @@ class MainWindowLifecycleMixin:
         super().changeEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt API
+        # Before anything else: the pre-flight popup is a top-level window, so
+        # it survives this one and keeps the application alive with it.
+        self._close_preflight_dialog()
         self._on_disconnect()
         self._settings.setValue("window_geometry", self.saveGeometry())
         super().closeEvent(event)

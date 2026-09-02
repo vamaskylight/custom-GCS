@@ -61,6 +61,7 @@ _MOTOR_TEST_TOOLTIP = (
 _MOTOR_TEST_NO_BATTERY = (
     "Connect the flight battery first - the ESCs are unpowered on USB."
 )
+_MOTOR_TEST_NO_LINK = "No link to the vehicle."
 
 
 class PreflightDialog(QDialog):
@@ -182,13 +183,13 @@ class PreflightDialog(QDialog):
                 pass
         self._set_motor_test_running(False)
 
-    def _set_motor_test_available(self, available: bool) -> None:
+    def _set_motor_test_available(
+        self, available: bool, *, reason: str = _MOTOR_TEST_NO_BATTERY
+    ) -> None:
         if self._motor_test_running:
             return                      # never disable the abort mid-run
         self._motor_test_btn.setEnabled(bool(available))
-        self._motor_test_btn.setToolTip(
-            _MOTOR_TEST_TOOLTIP if available else _MOTOR_TEST_NO_BATTERY
-        )
+        self._motor_test_btn.setToolTip(_MOTOR_TEST_TOOLTIP if available else reason)
 
     def _set_motor_test_running(self, running: bool) -> None:
         self._motor_test_running = bool(running)
@@ -206,9 +207,13 @@ class PreflightDialog(QDialog):
         # ESCs run off the flight pack, so on USB alone the test would command
         # motors that have no power to turn. Say that instead of letting the
         # operator press it and conclude the motors are dead.
-        self._set_motor_test_available(
-            battery_is_present(kwargs.get("battery_voltage_v")) is not False
-        )
+        if not bool(kwargs.get("link_ok", True)):
+            self._set_motor_test_available(False, reason=_MOTOR_TEST_NO_LINK)
+        else:
+            self._set_motor_test_available(
+                battery_is_present(kwargs.get("battery_voltage_v")) is not False,
+                reason=_MOTOR_TEST_NO_BATTERY,
+            )
         self._render(checks)
 
     def _render(self, checks: list[PreflightCheck]) -> None:
