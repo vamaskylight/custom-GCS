@@ -181,6 +181,17 @@ class MainWindowTelemetryMixin:
         self._home_rel_alt_baseline_m = None
         self._last_gps_lat = None
         self._last_gps_lon = None
+        # The header chips above are being blanked; these back the pre-flight
+        # popup off the same GPS_RAW_INT and were being left behind, so on
+        # reconnect the popup showed the PREVIOUS session's satellites and HDOP,
+        # with a green tick, beside a window showing nothing. Reported
+        # 2026-09-02: "Drone GPS not showing HDOP and Sats ... but in the PreArm
+        # popup i can see right infront of GPS".
+        self._last_gps_fix_type = None
+        self._last_gps_sats = None
+        self._last_gps_hdop = None
+        self._last_sensor_flags = None
+        self._last_heartbeat_mono = None
         self._fields["armed"].setText("No")
         self._apply_state_style(self._fields["armed"], "warn")
         self._fields["flight_time"].setText("00:00")
@@ -298,6 +309,54 @@ class MainWindowTelemetryMixin:
         except Exception:
             self._preflight_dialog = None
 
+    def _show_arm_not_ready_alert(self, system_status: int) -> None:
+        """Tell the operator why the vehicle will not arm.
+
+        This used to recite "check calibration, GPS/EKF, and other PreArm
+        messages" whether or not the autopilot had already said what was wrong.
+        On 2026-09-02 that put two windows on screen at once: this one pointing
+        at GPS, and the pre-flight popup showing GPS with a green tick, 11
+        satellites and HDOP 0.93. The actual blocker, "PreArm: Mount: not
+        healthy", was a bullet underneath the guesswork.
+
+        So when the vehicle has given a reason, that reason IS the message. The
+        generic advice is for the case where it has not.
+        """
+        reason = str(getattr(self, "_prearm_block_reason", "") or "").strip()
+        if reason:
+            body = (
+                "The autopilot is refusing to arm:\n\n"
+                f"    {reason}\n\n"
+                "Fix that and the vehicle will report ready. The other readings on "
+                "the dashboard are not what is blocking it."
+            )
+        else:
+            body = (
+                "Vehicle connected, but the autopilot heartbeat still reports "
+                f"system_status={system_status} (not STANDBY / ready yet).\n\n"
+                "This often clears within a few seconds while the vehicle boots. "
+                "If it does not clear, check calibration, GPS/EKF, and other PreArm "
+                "messages."
+            )
+        extra = self._format_recent_vehicle_msgs_for_alert()
+        if extra:
+            body = f"{body}\n\n{extra}"
+
+        # The pre-flight popup already carries this verdict, live and without
+        # taking control away. A modal box stacked on top of it says the same
+        # thing worse, and blocks the map and the flight controls to do it.
+        dlg = getattr(self, "_preflight_dialog", None)
+        if dlg is not None:
+            try:
+                if dlg.isVisible():
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    self._append_log("Not ready to arm: " + (reason or "see pre-flight check"))
+                    return
+            except Exception:
+                pass
+        QMessageBox.warning(self, "Vehicle Msg", body)
+
     def _close_preflight_dialog(self) -> None:
         """Shut the popup and forget it.
 
@@ -397,16 +456,7 @@ class MainWindowTelemetryMixin:
                     and (now - self._arm_not_ready_since_mono) >= 5.0
                 ):
                     self._arm_not_ready_alert_shown = True
-                    extra = self._format_recent_vehicle_msgs_for_alert()
-                    body = (
-                        "Vehicle connected, but the autopilot heartbeat still reports "
-                        f"system_status={system_status} (not STANDBY / ready yet).\n\n"
-                        "This often clears within a few seconds while the vehicle boots. "
-                        "If it does not clear, check calibration, GPS/EKF, and other PreArm messages."
-                    )
-                    if extra:
-                        body = f"{body}\n\n{extra}"
-                    QMessageBox.warning(self, "Vehicle Msg", body)
+                    self._show_arm_not_ready_alert(system_status)
             self._refresh_dashboard_flight_state()
             self._sync_mode_options_for_vehicle(int(data.get("vehicle_type", 0) or 0))
             self._top_flight_mode.setText(mode_text)
