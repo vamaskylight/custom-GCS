@@ -518,9 +518,12 @@ class PlanFlightPanel(QWidget):
         )
         # Breathing room: selected-WP metrics vs mission totals.
         h.addSpacing(32)
+        # "incl. return" is load-bearing, not decoration: the figure covers the
+        # whole flight including getting home, and an operator sizing a battery
+        # against a one-way number is the mistake this wording prevents.
         self._pf_mission = self._add_metric_group(
             h,
-            "Total Mission",
+            "Total Mission (incl. return)",
             [("Distance:", "0 m"), ("Time:", "00:00:00")],
         )
         h.addSpacing(24)

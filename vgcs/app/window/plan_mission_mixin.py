@@ -567,6 +567,33 @@ class MainWindowPlanMissionMixin:
         self._plan_hover_speed_mps = max(0.5, speed_mps)
         self._maybe_refresh_map_web_overlays()
 
+    def _estimate_plan_timing(self, model: list):
+        """Leg-by-leg timing at each waypoint's own speed, including the return.
+
+        Falls back to an empty timing on any error — a wrong number in the plan
+        bar is worse than a blank one, because an operator sizes a battery
+        against it.
+        """
+        from vgcs.mission.mission_timing import MissionTiming, estimate_mission_time
+
+        try:
+            start = self._map_widget.get_vehicle_position()
+        except Exception:
+            start = None
+        try:
+            end_action = self._map_widget.get_mission_end_action()
+        except Exception:
+            end_action = "hold"
+        try:
+            return estimate_mission_time(
+                model,
+                start=start,
+                end_action=end_action,
+                default_speed_mps=max(0.5, float(self._plan_hover_speed_mps)),
+            )
+        except Exception:
+            return MissionTiming()
+
     def _refresh_plan_flight_metrics(self) -> None:
         # M2 plan bar live values (best-effort from real telemetry).
         heading_val = float(getattr(self, "_heading", 0.0) or 0.0)
@@ -576,20 +603,21 @@ class MainWindowPlanMissionMixin:
         heading = f"{int(round(heading_val))}"
         dist_prev_wp_m = "0.0 m"
 
-        mission_distance_m = 0.0
         model = list(getattr(self._map_widget, "_waypoints_model", []))
-        for i in range(1, len(model)):
-            a = model[i - 1]
-            b = model[i]
-            mission_distance_m += self._haversine_m(float(a.lat), float(a.lon), float(b.lat), float(b.lon))
+        timing = self._estimate_plan_timing(model)
+        # Total, not outbound. The old figure covered waypoint-to-waypoint travel
+        # only — no leg out to WP 1 and no way home — so a 10 km plan read 15
+        # minutes for what is half an hour of flying. Field report 2026-09-02.
+        mission_distance_m = timing.total_m
         mission_distance_text = f"{mission_distance_m:.0f} m"
 
         if self._armed_since is not None:
             elapsed = int(time.monotonic() - self._armed_since)
             mission_time = f"{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}"
-        elif mission_distance_m > 1.0 and self._plan_hover_speed_mps > 0.5:
-            eta_s = int(mission_distance_m / self._plan_hover_speed_mps)
-            mission_time = f"{eta_s // 3600:02d}:{(eta_s % 3600) // 60:02d}:{eta_s % 60:02d}"
+        elif timing.total_s > 0.5:
+            from vgcs.mission.mission_timing import format_hms
+
+            mission_time = format_hms(timing.total_s)
         else:
             mission_time = "00:00:00"
 
