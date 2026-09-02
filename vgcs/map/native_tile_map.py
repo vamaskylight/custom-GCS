@@ -428,6 +428,23 @@ class _DiskTileWarmTask(QRunnable):
                     pass
 
 
+def _inspect_caption_origin(
+    cx: float, cy: float, r: float, tw: float, th: float, w: int, h: int
+) -> tuple[float, float]:
+    """Top-left of the coordinate caption, kept inside the widget.
+
+    Beside the marker by default; flipped to its other side when it would run
+    off the right edge, and clamped vertically. Pulled out of the paint code so
+    the placement can be checked without rendering anything.
+    """
+    tx = cx + r + 8
+    if tx + tw > w - 4:
+        tx = cx - r - 8 - tw
+    tx = max(4.0, min(tx, max(4.0, w - tw - 4.0)))
+    ty = min(max(cy - th / 2.0, 4.0), max(4.0, h - th - 4.0))
+    return tx, ty
+
+
 class NativeTileMapView(QWidget):
     """Minimal interactive map: HTTP tiles, drag pan, wheel zoom, markers."""
 
@@ -470,6 +487,12 @@ class NativeTileMapView(QWidget):
         self._tile_subdomains = "abc"
         self._offline_root: str | None = None
         self._inspect_press_screen = None
+        # Where the operator last asked "what is that?", and the caption to
+        # draw beside it. Kept on the map rather than a status line because
+        # VGCS always runs in dashboard mode and the status line is hidden
+        # there - see _draw_inspected_point.
+        self._inspected_point: tuple[float, float] | None = None
+        self._inspected_caption: str = ""
         self._tiles: dict[tuple[int, int, int], QImage] = {}
         self._preview_tiles: dict[tuple[int, int, int], QImage] = {}
         self._tiles_inflight: set[tuple[int, int, int]] = set()
@@ -733,6 +756,10 @@ class NativeTileMapView(QWidget):
     def set_observation_mark_mode(self, on: bool) -> None:
         """When True, a short click (no drag) on the map emits ``observation_map_click``."""
         self._obs_mark_mode = bool(on)
+        if self._obs_mark_mode:
+            # As above: an observation mark and a coordinate crosshair look far
+            # too alike to leave both on the map.
+            self.set_inspected_point(None, None)
         if not self._obs_mark_mode:
             self._obs_click_candidate = False
             self._press_for_obs = None
@@ -985,12 +1012,18 @@ class NativeTileMapView(QWidget):
             self._clear_pending_plan_map_taps()
             self._add_wp_mode = True
             self._fence_draw_mode = False
+            # A leftover coordinate crosshair reads as a placed point once a
+            # tool is live.
+            self.set_inspected_point(None, None)
             return
         if p.startswith("enableFencePolygon"):
             self._clear_pending_plan_map_taps()
             self._fence_draw_mode = True
             self._add_wp_mode = False
             self.clear_fence_points()
+            # A leftover coordinate crosshair reads as a placed point once a
+            # tool is live.
+            self.set_inspected_point(None, None)
             return
         if p.startswith("clearWaypoints"):
             self.clear_waypoints()
@@ -1399,7 +1432,78 @@ class NativeTileMapView(QWidget):
 
             painter.resetTransform()
 
+        self._draw_inspected_point(painter, z, fx, fy, w, h)
+
         painter.end()
+
+    def set_inspected_point(self, lat, lon, caption: str = "") -> None:
+        """Mark the point the operator clicked, with its coordinates.
+
+        Requested 2026-09-01: "when I click on the map any point or object then
+        latlong or GR should be visible". It was built, and it reported into the
+        map status line - which `set_dashboard_mode` hides, and VGCS turns
+        dashboard mode on unconditionally at startup. So the answer was written
+        to a label that is never on screen (reported 2026-09-02, "LATLONG and GR
+        not visible after clicking on the map").
+
+        Drawing it on the map is not just a way round that. It is the better
+        answer: the coordinates appear next to the thing that was clicked,
+        rather than in a corner where they cannot be matched to a point.
+        """
+        if lat is None or lon is None:
+            self._inspected_point = None
+            self._inspected_caption = ""
+        else:
+            try:
+                self._inspected_point = (float(lat), float(lon))
+            except (TypeError, ValueError):
+                return
+            self._inspected_caption = str(caption or "")
+        self.update()
+
+    def _draw_inspected_point(self, painter, z: int, fx: float, fy: float, w: int, h: int) -> None:
+        """Crosshair at the clicked point, caption beside it.
+
+        Drawn last so nothing paints over the one thing the operator just asked
+        for, and flipped to the other side of the marker when it would run off
+        the edge of the widget.
+        """
+        if self._inspected_point is None:
+            return
+        lat, lon = self._inspected_point
+        c = self._project(lat, lon, z, fx, fy, w, h)
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        r = 7.0
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(0, 0, 0, 200), 4))
+        painter.drawEllipse(c, r, r)
+        painter.drawLine(QPointF(c.x() - r - 5, c.y()), QPointF(c.x() + r + 5, c.y()))
+        painter.drawLine(QPointF(c.x(), c.y() - r - 5), QPointF(c.x(), c.y() + r + 5))
+        painter.setPen(QPen(QColor(255, 235, 120, 255), 2))
+        painter.drawEllipse(c, r, r)
+        painter.drawLine(QPointF(c.x() - r - 5, c.y()), QPointF(c.x() + r + 5, c.y()))
+        painter.drawLine(QPointF(c.x(), c.y() - r - 5), QPointF(c.x(), c.y() + r + 5))
+
+        lines = [ln for ln in self._inspected_caption.splitlines() if ln.strip()]
+        if not lines:
+            return
+        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        metrics = painter.fontMetrics()
+        tw = max(metrics.horizontalAdvance(ln) for ln in lines) + 12
+        th = metrics.height() * len(lines) + 8
+
+        tx, ty = _inspect_caption_origin(c.x(), c.y(), r, tw, th, w, h)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 215))
+        painter.drawRoundedRect(QRectF(tx, ty, tw, th), 4, 4)
+        painter.setPen(QColor(255, 235, 120))
+        for i, line in enumerate(lines):
+            painter.drawText(
+                int(tx + 6), int(ty + 4 + metrics.ascent() + i * metrics.height()), line
+            )
 
     def _project(self, lat: float, lon: float, z: int, fx: float, fy: float, w: int, h: int) -> QPointF:
         px = _lon_to_x(lon, z) * 256.0 - fx

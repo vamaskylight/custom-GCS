@@ -915,15 +915,28 @@ class MapTilesMixin:
             la, lo = float(lat), float(lon)
         except (TypeError, ValueError):
             return
-        text = f"{la:.7f}, {lo:.7f}"
+        coords = f"{la:.7f}, {lo:.7f}"
+        grid = ""
         try:
             from vgcs.observe.grid_reference import latlon_to_mgrs
 
             grid = str(latlon_to_mgrs(la, lo) or "")
-            if grid:
-                text += f"   ·   {grid}"
         except Exception:
-            pass
+            grid = ""
+
+        # On the map, next to the point, because that is where it can be read
+        # against the thing that was clicked - and because the status line below
+        # is hidden in dashboard mode, which is the only mode VGCS runs in.
+        native = getattr(self, "_native_map", None)
+        setter = getattr(native, "set_inspected_point", None)
+        if callable(setter):
+            caption = coords + ((chr(10) + grid) if grid else "")
+            try:
+                setter(la, lo, caption)
+            except Exception:
+                pass
+
+        text = coords + (f"   ·   {grid}" if grid else "")
         try:
             self._set_status(text)
         except Exception:
