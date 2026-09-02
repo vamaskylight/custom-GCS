@@ -59,6 +59,18 @@ _AUTOPILOT_ONLY_MESSAGES = frozenset(
 # them by passing a larger number.
 _MOTOR_TEST_MAX_THROTTLE_PCT = 15.0
 _MOTOR_TEST_MAX_DURATION_S = 5.0
+# ArduPilot arms the motor outputs for the duration of a motor test, and reports
+# that in HEARTBEAT base_mode like any other armed state - over a 1 Hz link. So
+# mid-sequence the vehicle looks ARMED to us, and stays looking armed for up to
+# a second after each motor has stopped. Judging the next motor on that flag
+# refused it on a disarmed aircraft: field report 2026-09-02, "1 and 2 motor
+# number rotate 3 & 4 motor not rotating", with the refusal landing on a
+# different motor each run as the heartbeat drifted against the sequence.
+#
+# So the armed check is made once, before the first motor turns, against the
+# state the vehicle was actually in. It then holds for the rest of the
+# sequence, and this is how long past the last accepted command that lasts.
+_MOTOR_TEST_SEQUENCE_SLACK_S = 4.0
 
 
 class MavlinkThread(QThread):
@@ -233,7 +245,12 @@ class MavlinkThread(QThread):
             self._cmd_queue.append(("param_set", {"name": name, "value": float(value)}))
 
     def queue_motor_test(
-        self, *, motor: int, throttle_pct: float, duration_s: float
+        self,
+        *,
+        motor: int,
+        throttle_pct: float,
+        duration_s: float,
+        sequence_start: bool = True,
     ) -> None:
         """Spin one motor. Requested 2026-09-02 for the pre-flight checklist.
 
@@ -251,6 +268,7 @@ class MavlinkThread(QThread):
                         "motor": int(motor),
                         "throttle_pct": float(throttle_pct),
                         "duration_s": float(duration_s),
+                        "sequence_start": bool(sequence_start),
                     },
                 )
             )
@@ -1945,14 +1963,27 @@ class MavlinkThread(QThread):
     def _motor_test(self, cfg: dict) -> None:
         """Send MAV_CMD_DO_MOTOR_TEST for a single motor.
 
-        Refuses while armed. A motor test on an armed vehicle either does
-        nothing or fights the flight controller for the output, and neither is
-        something to find out about with a propeller turning.
+        Refuses on an aircraft that was armed before the run started. A motor
+        test on an armed vehicle either does nothing or fights the flight
+        controller for the output, and neither is something to find out about
+        with a propeller turning.
+
+        That check is deliberately made once per run and not per motor: during a
+        test ArduPilot arms the outputs itself, so from the second motor onward
+        the armed flag is reporting our own command back to us.
         """
         if self._master is None:
             self.action_result.emit("motor_test", False, "Link not ready")
             return
-        if bool(getattr(self, "_vehicle_armed", False)):
+        now = time.monotonic()
+        # Only the first motor of a run is judged on the armed flag. After that
+        # the flag is describing our own test, not the operator's aircraft.
+        in_sequence = (
+            not bool(cfg.get("sequence_start", True))
+            and now <= float(getattr(self, "_motor_test_window_until", 0.0) or 0.0)
+        )
+        if not in_sequence and bool(getattr(self, "_vehicle_armed", False)):
+            self._motor_test_window_until = 0.0
             self.action_result.emit(
                 "motor_test", False, "Refused: vehicle is armed — disarm before testing motors"
             )
@@ -1972,6 +2003,9 @@ class MavlinkThread(QThread):
                 p5=0.0,                   # motor count: 0 = this motor only
                 p6=2.0,                   # test order: 2 = board/output order
             )
+            # Hold the sequence open past this motor, so the next one is not
+            # refused on the armed state this command is about to cause.
+            self._motor_test_window_until = now + duration + _MOTOR_TEST_SEQUENCE_SLACK_S
             self.action_result.emit(
                 "motor_test", True, f"motor {motor} at {throttle:.0f}% for {duration:.0f}s"
             )

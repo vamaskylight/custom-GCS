@@ -217,19 +217,41 @@ class MainWindowFlightCommandsMixin:
             timer.setSingleShot(True)
             timer.setInterval(delay_ms)
             timer.timeout.connect(
-                lambda m=motor, t=thread: self._spin_one_motor(t, m, throttle, each_s)
+                lambda m=motor, t=thread, first=(i == 0), last=(i == count - 1):
+                self._spin_one_motor(t, m, throttle, each_s, first=first, last=last)
             )
             self._motor_test_timers.append(timer)
             timer.start()
         # How long the caller should treat the sequence as running.
         return count * each_s + max(0, count - 1) * MOTOR_TEST_GAP_S
 
-    def _spin_one_motor(self, thread, motor: int, throttle: float, seconds: float) -> None:
+    def _spin_one_motor(
+        self,
+        thread,
+        motor: int,
+        throttle: float,
+        seconds: float,
+        *,
+        first: bool = True,
+        last: bool = True,
+    ) -> None:
+        """Command one motor. ``first`` is what tells the link thread this is a
+        fresh run and the armed state is the operator's, not our own."""
         self._append_log(f"Motor test: motor {motor}")
         try:
-            thread.queue_motor_test(motor=motor, throttle_pct=throttle, duration_s=seconds)
+            thread.queue_motor_test(
+                motor=motor,
+                throttle_pct=throttle,
+                duration_s=seconds,
+                sequence_start=first,
+            )
         except Exception as e:
             self._append_log(f"Motor test: motor {motor} failed ({e})")
+        if last:
+            # The run is over. Forget the timers so stop_motor_test() knows
+            # there is nothing to halt -- otherwise the next run opens by
+            # sending a stop command nobody asked for.
+            self._motor_test_timers = []
 
     def stop_motor_test(self, *, quiet: bool = False) -> None:
         """Abort the sequence.
@@ -259,7 +281,12 @@ class MainWindowFlightCommandsMixin:
         thread = getattr(self, "_thread", None)
         if thread is not None and thread.isRunning():
             try:
-                thread.queue_motor_test(motor=1, throttle_pct=0.0, duration_s=0.5)
+                # sequence_start=False: this belongs to the run being aborted,
+                # so it must not be judged on an armed flag that the run itself
+                # caused, or the abort would be refused exactly when it matters.
+                thread.queue_motor_test(
+                    motor=1, throttle_pct=0.0, duration_s=0.5, sequence_start=False
+                )
             except Exception:
                 pass
         if not quiet:
