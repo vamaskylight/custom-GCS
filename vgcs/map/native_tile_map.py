@@ -57,6 +57,9 @@ _TILE_PLACEHOLDER_MAX_RETRIES = 3
 _TILE_MEMORY_CAP = 640
 _TILE_CACHE_ROOT = (Path.home() / ".vgcs" / "tile-cache").resolve()
 
+# A press-to-release movement bigger than this was a pan, not a click.
+_INSPECT_CLICK_SLOP_PX = 4.0
+
 # Tile count quadruples per zoom level, so pre-caching must be bounded or it
 # looks like a hang. ~4000 tiles is a few hundred MB at most and covers a
 # 3 km radius across three zoom levels comfortably.
@@ -431,6 +434,10 @@ class NativeTileMapView(QWidget):
     user_waypoints_changed = Signal()
     user_fence_changed = Signal()
     observation_map_click = Signal(float, float)
+    # A plain click on the map with no tool active — "what are the coordinates
+    # of that?". Requested 2026-09-01: "when I click on the map any point or
+    # object then latlong or GR should be visible".
+    map_point_inspected = Signal(float, float)
     zoom_changed = Signal(float)
 
     def __init__(self, parent=None) -> None:
@@ -462,6 +469,7 @@ class NativeTileMapView(QWidget):
         )
         self._tile_subdomains = "abc"
         self._offline_root: str | None = None
+        self._inspect_press_screen = None
         self._tiles: dict[tuple[int, int, int], QImage] = {}
         self._preview_tiles: dict[tuple[int, int, int], QImage] = {}
         self._tiles_inflight: set[tuple[int, int, int]] = set()
@@ -1815,6 +1823,9 @@ class NativeTileMapView(QWidget):
                 return
             self._dragging = True
             self._drag_last = pos
+            # Candidate for a coordinate read-out, resolved on release: only a
+            # click that did not turn into a pan should report a position.
+            self._inspect_press_screen = QPointF(pos)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -1886,11 +1897,40 @@ class NativeTileMapView(QWidget):
                 latlon = self._screen_to_lat_lon(self._press_for_obs)
                 if latlon is not None:
                     self.observation_map_click.emit(float(latlon[0]), float(latlon[1]))
+            self._emit_inspect_click_if_stationary(event)
             self._obs_click_candidate = False
             self._press_for_obs = None
             self._dragging = False
             self._drag_last = None
         super().mouseReleaseEvent(event)
+
+    def _emit_inspect_click_if_stationary(self, event: QMouseEvent) -> None:
+        """Report coordinates for a click that did not become a pan.
+
+        Panning the map is a drag, and a drag must not be read as "tell me where
+        that is" — otherwise every pan spams the status bar. `_INSPECT_CLICK_
+        SLOP_PX` is the wobble allowed between press and release.
+        """
+        press = getattr(self, "_inspect_press_screen", None)
+        self._inspect_press_screen = None
+        if press is None:
+            return
+        # Any active tool owns the click; this is only for a bare map.
+        if self._obs_mark_mode or self._add_wp_mode or self._fence_draw_mode:
+            return
+        try:
+            rel = QPointF(event.position())
+            if (
+                abs(rel.x() - press.x()) > _INSPECT_CLICK_SLOP_PX
+                or abs(rel.y() - press.y()) > _INSPECT_CLICK_SLOP_PX
+            ):
+                return
+            latlon = self._screen_to_lat_lon(press)
+        except Exception:
+            return
+        if latlon is None:
+            return
+        self.map_point_inspected.emit(float(latlon[0]), float(latlon[1]))
 
     def _screen_to_lat_lon(self, pos: QPointF) -> tuple[float, float] | None:
         w, h = self.width(), self.height()

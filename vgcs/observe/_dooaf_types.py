@@ -108,6 +108,11 @@ class DooafSession:
     # measured — only the along/right decomposition is real.
     gun_is_assumed: bool = False
     assumed_gun_bearing_deg: float | None = None
+    # Set when more than one impact was marked against the same target: the
+    # bias to correct for and the scatter that no correction removes. See
+    # vgcs.observe.dooaf_average — a single round leaves this None because one
+    # round says nothing about dispersion.
+    averaged: object | None = None
 
 @dataclass(frozen=True)
 class DooafSettings:

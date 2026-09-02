@@ -1402,6 +1402,33 @@ def latest_mark(rows: list[dict[str, Any]], role: str) -> GeoPoint | None:
             return pt
     return None
 
+def _average_impacts(rows, intended):
+    """Bias and dispersion over every impact marked against this target.
+
+    Returns None for fewer than two impacts — a single round has no scatter to
+    report, and pretending otherwise would suggest a precision that one
+    observation cannot support.
+    """
+    if intended is None:
+        return None
+    pts: list[tuple[float, float]] = []
+    for row in rows or []:
+        if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
+            continue
+        pt = point_from_row(row)
+        if pt is None:
+            continue
+        pts.append((pt.lat, pt.lon))
+    if len(pts) < 2:
+        return None
+    try:
+        from vgcs.observe.dooaf_average import average_rounds, rounds_from_marks
+
+        return average_rounds(rounds_from_marks(pts, (intended.lat, intended.lon)))
+    except Exception:
+        return None
+
+
 def latest_mark_row(
     rows: list[dict[str, Any]], role: str
 ) -> dict[str, Any] | None:
@@ -2090,6 +2117,7 @@ def build_dooaf_session(
             impact_row=impact_row,
             camera_hfov_deg=hfov,
         )
+    averaged = _average_impacts(rows, intended)
     intended_dem = dem_alt_msl_at_mark(intended_row, intended, dem_path=dem_path)
     impact_dem = dem_alt_msl_at_mark(impact_row, impact, dem_path=dem_path)
     height_correction_m: float | None = None
@@ -2121,6 +2149,7 @@ def build_dooaf_session(
         intended_dem_alt_m=intended_dem,
         impact_dem_alt_m=impact_dem,
         height_correction_m=height_correction_m,
+        averaged=averaged,
         dem_available=_dem_terrain_available(dem_path),
         dem_footprint_reliable=_dem_footprint_reliable(intended_row, impact_row),
         gun_is_assumed=gun_is_assumed,

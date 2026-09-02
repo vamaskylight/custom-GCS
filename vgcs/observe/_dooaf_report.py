@@ -2613,6 +2613,85 @@ def format_elevation_summary_html(session: DooafSession) -> str:
         collapsed=True,
     )
 
+def format_multi_round_average_html(session: DooafSession) -> str:
+    """Bias and dispersion across several rounds, when more than one was marked.
+
+    Two numbers, kept apart on purpose. The **bias** is systematic and is what
+    the correction cancels. The **dispersion** is scatter; correcting for it
+    makes the next round worse, because the operator ends up chasing their own
+    noise. Client request 2026-08-31.
+    """
+    avg = getattr(session, "averaged", None)
+    if avg is None:
+        return ""
+    try:
+        rounds = int(avg.rounds)
+        mean_n, mean_e = float(avg.mean_north_m), float(avg.mean_east_m)
+        spread = float(avg.dispersion_m)
+        mean_miss = float(avg.mean_miss_m)
+    except Exception:
+        return ""
+
+    per_round = ""
+    try:
+        cells = "".join(
+            f"<tr><td class='label-col'>{_html_esc(r.label or 'Round')}</td>"
+            f"<td>{_signed_ns(float(r.north_m))} · {_signed_ew(float(r.east_m))}"
+            f"  <span class='muted'>({float(r.distance_m):.1f} m)</span></td></tr>"
+            for r in avg.per_round
+        )
+        per_round = (
+            "<details class='report-collapsible'>"
+            f"<summary>Each round ({rounds})</summary>"
+            "<div class='report-collapsible-body'>"
+            "<table class='data-table'><tbody>" + cells + "</tbody></table>"
+            "</div></details>"
+        )
+    except Exception:
+        per_round = ""
+
+    body = (
+        "<div class='metrics-grid'>"
+        "<div class='metric-card'>"
+        "<div class='metric-label'>Average miss (bias)</div>"
+        f"<div class='metric-value'>{mean_miss:.1f} m</div>"
+        f"<div class='metric-sub'>{_signed_ns(mean_n)} · {_signed_ew(mean_e)}</div>"
+        "</div>"
+        "<div class='metric-card'>"
+        "<div class='metric-label'>Correction to add</div>"
+        f"<div class='metric-value'>{_signed_ns(-mean_n)}</div>"
+        f"<div class='metric-sub'>and {_signed_ew(-mean_e)}</div>"
+        "</div>"
+        "<div class='metric-card'>"
+        "<div class='metric-label'>Spread (dispersion)</div>"
+        f"<div class='metric-value'>{spread:.1f} m</div>"
+        "<div class='metric-sub'>scatter — not correctable</div>"
+        "</div>"
+        "</div>"
+        "<p class='log-hint'>The correction cancels the <strong>average</strong> "
+        "miss. The spread is how far individual rounds sit from that average; "
+        "it is normal scatter and adjusting for it makes the next round worse. "
+        "Averaging the miss <em>distances</em> instead of their directions would "
+        "give a larger, meaningless number.</p>"
+        + per_round
+    )
+    return _report_section_card(
+        f"Average of {rounds} rounds",
+        body,
+        extra_class="dooaf-client-corr",
+        section_id="average",
+        subtitle="Systematic bias to correct for, and the scatter you cannot.",
+    )
+
+
+def _signed_ns(v: float) -> str:
+    return f"{abs(v):.1f} m {'north' if v >= 0 else 'south'}"
+
+
+def _signed_ew(v: float) -> str:
+    return f"{abs(v):.1f} m {'east' if v >= 0 else 'west'}"
+
+
 def format_client_fire_correction_html(session: DooafSession) -> str:
     """Client summary: East/West, North/South, Left/Right, Up/Down corrections."""
     c = session.correction
@@ -2991,6 +3070,7 @@ def format_dooaf_html_summary(
     # the fix is the report, not the instructions.
     return (
         format_executive_summary_html(session)
+        + format_multi_round_average_html(session)
         + format_client_fire_correction_html(session)
         + _report_section_card(
             "Positions",

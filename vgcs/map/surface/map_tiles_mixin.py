@@ -602,6 +602,7 @@ class MapTilesMixin:
             pass
         self._native_map.user_waypoints_changed.connect(self._on_native_user_waypoints_changed)
         self._native_map.observation_map_click.connect(self._on_native_observation_map_click)
+        self._native_map.map_point_inspected.connect(self._on_map_point_inspected)
         self._native_map.zoom_changed.connect(self._sync_native_map_zoom_label)
         try:
             self._sync_native_map_zoom_label(float(getattr(self._native_map, "_zoom", 16.0)))
@@ -902,6 +903,31 @@ class MapTilesMixin:
             "internet. Connect, then use “Cache area offline”."
         )
         return True
+
+    def _on_map_point_inspected(self, lat: float, lon: float) -> None:
+        """Show coordinates and grid reference for a plain click on the map.
+
+        Requested 2026-09-01. Both halves already existed — the map knew the
+        lat/lon of a click and grid_reference.py could convert it — they were
+        simply never connected outside DOOAF marking.
+        """
+        try:
+            la, lo = float(lat), float(lon)
+        except (TypeError, ValueError):
+            return
+        text = f"{la:.7f}, {lo:.7f}"
+        try:
+            from vgcs.observe.grid_reference import latlon_to_mgrs
+
+            grid = str(latlon_to_mgrs(la, lo) or "")
+            if grid:
+                text += f"   ·   {grid}"
+        except Exception:
+            pass
+        try:
+            self._set_status(text)
+        except Exception:
+            pass
 
     def activate_offline_tiles(self, root: str) -> None:
         root = str(root or "").strip()

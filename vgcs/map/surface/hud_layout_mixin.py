@@ -462,6 +462,32 @@ class NativeHudLayoutMixin:
             if b is not None:
                 b.setEnabled(ok)
 
+    def _announce_last_known_position(self) -> None:
+        """Print and show the last fix when the link drops.
+
+        Printed as well as shown because the status bar is transient and the
+        console is what gets copied into a chat when something goes wrong.
+        """
+        try:
+            fn = getattr(self, "last_known_vehicle_position", None)
+            pos = fn() if callable(fn) else None
+        except Exception:
+            pos = None
+        if pos is None:
+            return
+        try:
+            line = pos.describe()
+        except Exception:
+            return
+        try:
+            print(f"[VGCS:map] LINK LOST — last known position {line}")
+        except Exception:
+            pass
+        try:
+            self._set_status(f"Link lost — last known position: {line}")
+        except Exception:
+            pass
+
     def set_link_connected(self, connected: bool) -> None:
         c = bool(connected)
         if self._last_link_connected == c:
@@ -493,6 +519,10 @@ class NativeHudLayoutMixin:
             except Exception:
                 pass
         if not c:
+            # Say where it was, the moment contact is lost — not after someone
+            # thinks to go looking. Field report 2026-08-31: an aircraft was lost
+            # and the operator had nothing to search from.
+            self._announce_last_known_position()
             # Keep camera controls hidden until MAVLink link-up (heartbeat).
             try:
                 self._native_hud_right.hide()

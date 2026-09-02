@@ -76,6 +76,23 @@ class VehicleTelemetryMixin:
                 pass
         self._schedule_vehicle_pose_js(immediate=False)
 
+    def _last_known_store(self):
+        store = getattr(self, "_last_known_position_store", None)
+        if store is None:
+            from vgcs.map.last_known_position import LastKnownPositionStore
+
+            store = LastKnownPositionStore()
+            store.load()          # carry over a fix from a previous run
+            self._last_known_position_store = store
+        return store
+
+    def last_known_vehicle_position(self):
+        """Newest fix, live or restored from a previous run. None if never seen."""
+        try:
+            return self._last_known_store().current()
+        except Exception:
+            return None
+
     def set_vehicle_position(
         self,
         lat: float,
@@ -87,6 +104,18 @@ class VehicleTelemetryMixin:
         first_fix = self._lat is None or self._lon is None
         self._lat = lat
         self._lon = lon
+        # Remember it. VGCS had this five times a second for a whole flight and
+        # kept none of it, so when the aircraft went down on 2026-08-31 nobody
+        # could say where to look.
+        try:
+            self._last_known_store().record(
+                lat,
+                lon,
+                alt_msl_m=getattr(self, "_vehicle_alt_msl_m", None),
+                rel_alt_m=relative_alt_m,
+            )
+        except Exception:
+            pass
         if groundspeed_mps is not None:
             self._update_map_motion_state(float(groundspeed_mps))
         gs = float(self._last_groundspeed_mps)

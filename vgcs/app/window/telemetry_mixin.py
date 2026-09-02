@@ -227,6 +227,52 @@ class MainWindowTelemetryMixin:
         self._refresh_footer_summary()
         self._sync_plan_flight_chrome()
 
+    def preflight_check_inputs(self) -> dict:
+        """Telemetry the checklist needs, in one place.
+
+        Kept separate from the dialog so the verdict logic stays testable
+        without Qt, and so nothing in the dialog reaches into window internals.
+        """
+        import time as _t
+
+        health = getattr(self, "_prearm_health", None)
+        authoritative = False
+        if health is not None:
+            try:
+                authoritative = bool(health.is_authoritative(_t.monotonic()))
+            except Exception:
+                authoritative = False
+        battery = getattr(self, "_battery", None)
+        return {
+            "prearm_reported": bool(getattr(health, "reported", False)),
+            "prearm_passing": bool(getattr(health, "passing", False)),
+            "prearm_authoritative": authoritative,
+            "prearm_message": str(getattr(self, "_prearm_block_reason", "") or ""),
+            "gps_fix_type": getattr(self, "_last_gps_fix_type", None),
+            "gps_sats": getattr(self, "_last_gps_sats", None),
+            "gps_hdop": getattr(self, "_last_gps_hdop", None),
+            "battery_voltage_v": getattr(battery, "voltage_v", None),
+            "battery_remaining_pct": getattr(battery, "remaining_pct", None),
+        }
+
+    def _show_preflight_dialog(self) -> None:
+        existing = getattr(self, "_preflight_dialog", None)
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                return
+            except Exception:
+                self._preflight_dialog = None
+        try:
+            from vgcs.app.preflight_dialog import PreflightDialog
+
+            dlg = PreflightDialog(self.preflight_check_inputs, self)
+            self._preflight_dialog = dlg
+            dlg.show()
+        except Exception:
+            self._preflight_dialog = None
+
     def _on_heartbeat(self, sysid: int, compid: int, mav_ver: int) -> None:
         if not self._heartbeat_seen:
             self._heartbeat_seen = True
@@ -236,6 +282,10 @@ class MainWindowTelemetryMixin:
             self._apply_state_style(self._status, "ok")
             self._set_dashboard_flight_status("yellow", "Connected - validating arm checks")
             self._map_widget.set_link_connected(True)
+            # Requested 2026-09-01: a readiness popup on connect. Fired here, on
+            # the first heartbeat, rather than at port-open — an open serial port
+            # with no vehicle behind it has nothing to report.
+            self._show_preflight_dialog()
         self._hb.setText(f"sys {sysid} · comp {compid} · mav {mav_ver}")
         self._apply_state_style(self._hb, "ok")
         if not self._rid_live_available:
@@ -447,6 +497,7 @@ class MainWindowTelemetryMixin:
             fix_type = int(data.get("fix_type", 0) or 0)
             self._last_gps_fix_type = fix_type
             self._last_gps_sats = sat
+            self._last_gps_hdop = None if hdop is None else float(hdop)
             self._fields["gps"].setText(
                 f"fix={fix_type} sat={sat} hdop={hdop_text}"
             )

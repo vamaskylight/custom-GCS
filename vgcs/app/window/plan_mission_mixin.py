@@ -207,6 +207,12 @@ class MainWindowPlanMissionMixin:
         """Block an unflyable plan; let the operator accept merely unusual ones."""
         home = self._map_widget.get_vehicle_position()
         errors, warnings = validate_waypoints(waypoints, home=home)
+        # Beyond visual range the failure modes change: a failsafe that lands
+        # the aircraft where it stands is survivable at 200 m and loses the
+        # airframe at 10 km. See vgcs/mission/long_range_safety.py.
+        lr_errors, lr_warnings, lr_unchecked = self._long_range_findings(waypoints, home)
+        errors = list(errors) + lr_errors
+        warnings = list(warnings) + lr_warnings
         if errors:
             detail = "\n".join(f"• {e}" for e in errors[:8])
             QMessageBox.critical(
@@ -231,7 +237,60 @@ class MainWindowPlanMissionMixin:
             if answer != QMessageBox.StandardButton.Yes:
                 self._append_log("Mission upload cancelled by operator after validation warnings.")
                 return False
+        for u in lr_unchecked:
+            self._append_log(f"Mission check skipped: {u}")
         return True
+
+    def _long_range_findings(self, waypoints: list, home) -> tuple[list, list, list]:
+        """Long-range safety findings, or nothing if the check cannot run.
+
+        Deliberately swallows its own failures: a fault in the checker must not
+        stop an otherwise valid mission from being uploaded.
+        """
+        try:
+            from vgcs.mission.long_range_safety import check_long_range_mission
+
+            report = check_long_range_mission(
+                waypoints,
+                home=home,
+                params=dict(getattr(self, "_last_params", {}) or {}),
+                dem_elevation_fn=self._plan_dem_elevation_fn(),
+                endurance_min=self._plan_endurance_min(),
+            )
+        except Exception:
+            return ([], [], [])
+        if report.is_long_range:
+            self._append_log(
+                f"Long-range mission: {report.farthest_m / 1000.0:.1f} km out, "
+                f"{report.round_trip_m / 1000.0:.1f} km round trip."
+            )
+        return (list(report.errors), list(report.warnings), list(report.unchecked))
+
+    def _plan_dem_elevation_fn(self):
+        """The DEM the observation tools already load, reused for terrain."""
+        try:
+            from PySide6.QtCore import QSettings
+
+            from vgcs.observe.dem import load_dem_model
+
+            st = QSettings("VGCS", "VGCS")
+            path = str(st.value("observe/dem_path", "") or "").strip()
+            if not path:
+                return None
+            model = load_dem_model(path)
+            return None if model is None else model.elevation_m
+        except Exception:
+            return None
+
+    def _plan_endurance_min(self):
+        try:
+            from PySide6.QtCore import QSettings
+
+            raw = QSettings("VGCS", "VGCS").value("plan/endurance_min", "")
+            text = str(raw or "").strip()
+            return float(text) if text else None
+        except Exception:
+            return None
 
     def _on_mission_table_context_menu(self, pos: QPoint) -> None:
         """Row actions the table had no way to reach: delete, insert-after, fly-to."""
