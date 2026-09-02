@@ -53,6 +53,14 @@ _AUTOPILOT_ONLY_MESSAGES = frozenset(
 )
 
 
+# A pre-flight motor test only has to prove each motor turns and turns the
+# right way. Anything more is thrust, and thrust with props on a bench moves the
+# airframe. These caps are enforced in the link thread so no caller can raise
+# them by passing a larger number.
+_MOTOR_TEST_MAX_THROTTLE_PCT = 15.0
+_MOTOR_TEST_MAX_DURATION_S = 5.0
+
+
 class MavlinkThread(QThread):
     """Connect to a MAVLink stream and report link/heartbeat/telemetry state."""
 
@@ -223,6 +231,29 @@ class MavlinkThread(QThread):
     def queue_param_set(self, name: str, value: float) -> None:
         with self._cmd_lock:
             self._cmd_queue.append(("param_set", {"name": name, "value": float(value)}))
+
+    def queue_motor_test(
+        self, *, motor: int, throttle_pct: float, duration_s: float
+    ) -> None:
+        """Spin one motor. Requested 2026-09-02 for the pre-flight checklist.
+
+        This turns a propeller, so it is queued only on an explicit operator
+        action and is refused below when the vehicle is armed. The refusal lives
+        in the link thread rather than the dialog because that is the one place
+        that knows the live armed state — a UI guard alone can be bypassed by any
+        future caller.
+        """
+        with self._cmd_lock:
+            self._cmd_queue.append(
+                (
+                    "motor_test",
+                    {
+                        "motor": int(motor),
+                        "throttle_pct": float(throttle_pct),
+                        "duration_s": float(duration_s),
+                    },
+                )
+            )
 
     def queue_preflight_calibration(self, kind: str) -> None:
         """Queue a sensor calibration request (best-effort, autopilot-dependent)."""
@@ -788,6 +819,8 @@ class MavlinkThread(QThread):
             elif cmd == "param_set":
                 data = payload if isinstance(payload, dict) else {}
                 self._param_set(str(data.get("name", "")), float(data.get("value", 0.0)))
+            elif cmd == "motor_test":
+                self._motor_test(payload if isinstance(payload, dict) else {})
             elif cmd == "preflight_calibration":
                 self._preflight_calibration(str(payload or ""))
             elif cmd == "camera_zoom":
@@ -1908,6 +1941,42 @@ class MavlinkThread(QThread):
         except Exception as e:
             self.action_result.emit("emergency_stop", False, str(e))
             self.error.emit(f"Emergency stop failed: {e}")
+
+    def _motor_test(self, cfg: dict) -> None:
+        """Send MAV_CMD_DO_MOTOR_TEST for a single motor.
+
+        Refuses while armed. A motor test on an armed vehicle either does
+        nothing or fights the flight controller for the output, and neither is
+        something to find out about with a propeller turning.
+        """
+        if self._master is None:
+            self.action_result.emit("motor_test", False, "Link not ready")
+            return
+        if bool(getattr(self, "_vehicle_armed", False)):
+            self.action_result.emit(
+                "motor_test", False, "Refused: vehicle is armed — disarm before testing motors"
+            )
+            return
+        motor = max(1, int(cfg.get("motor", 1) or 1))
+        throttle = max(0.0, min(_MOTOR_TEST_MAX_THROTTLE_PCT, float(cfg.get("throttle_pct", 5.0))))
+        duration = max(0.5, min(_MOTOR_TEST_MAX_DURATION_S, float(cfg.get("duration_s", 2.0))))
+        self._sync_link_targets()
+        try:
+            m = mavutil.mavlink
+            self._send_command_long(
+                m.MAV_CMD_DO_MOTOR_TEST,
+                p1=float(motor),          # motor instance, 1-based
+                p2=0.0,                   # throttle type: 0 = percent
+                p3=float(throttle),
+                p4=float(duration),
+                p5=0.0,                   # motor count: 0 = this motor only
+                p6=2.0,                   # test order: 2 = board/output order
+            )
+            self.action_result.emit(
+                "motor_test", True, f"motor {motor} at {throttle:.0f}% for {duration:.0f}s"
+            )
+        except Exception as e:
+            self.action_result.emit("motor_test", False, str(e))
 
     def _send_command_long(
         self,

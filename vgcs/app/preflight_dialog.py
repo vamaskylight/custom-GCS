@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -39,6 +40,7 @@ from vgcs.app.preflight_checklist import (
     STATUS_FAIL,
     STATUS_PASS,
     PreflightCheck,
+    battery_is_present,
     build_preflight_checks,
     checklist_is_ready,
     checklist_summary,
@@ -51,6 +53,14 @@ _TICK_STYLE = {
     STATUS_FAIL: ("✖", "#dc2626"),
 }
 _TICK_UNKNOWN = ("…", "#94a3b8")
+
+_MOTOR_TEST_TOOLTIP = (
+    "Spins each motor briefly at low throttle, in board output order."
+    + chr(10) + "REMOVE PROPELLERS FIRST."
+)
+_MOTOR_TEST_NO_BATTERY = (
+    "Connect the flight battery first - the ESCs are unpowered on USB."
+)
 
 
 class PreflightDialog(QDialog):
@@ -93,6 +103,17 @@ class PreflightDialog(QDialog):
         root.addWidget(note)
 
         buttons = QHBoxLayout()
+        # Spinning motors is an operator decision, never a side effect of the
+        # popup opening. Requested 2026-09-02: "when it comes motor/ESC check
+        # then motor should rotate accordingly".
+        self._motor_test_btn = QPushButton("Test motors...")
+        self._motor_test_btn.setToolTip(_MOTOR_TEST_TOOLTIP)
+        self._motor_test_btn.clicked.connect(self._on_motor_test_clicked)
+        self._motor_test_running = False
+        self._motor_test_end = QTimer(self)
+        self._motor_test_end.setSingleShot(True)
+        self._motor_test_end.timeout.connect(lambda: self._set_motor_test_running(False))
+        buttons.addWidget(self._motor_test_btn)
         buttons.addStretch(1)
         close = QPushButton("Close")
         close.clicked.connect(self.close)
@@ -107,6 +128,72 @@ class PreflightDialog(QDialog):
 
     # ---------------------------------------------------------------- #
 
+    def _on_motor_test_clicked(self) -> None:
+        """Confirm, then spin each motor in turn — or stop a run in progress.
+
+        The confirmation is not a formality. This is the only control in VGCS
+        that makes the aircraft move on the ground, and the person pressing it
+        is usually stood over it. While the sequence runs the same button
+        becomes the abort, because that is where the operator is already
+        looking when they see a motor turn the wrong way.
+        """
+        if self._motor_test_running:
+            self._stop_motor_test()
+            return
+        parent = self.parent()
+        runner = getattr(parent, "run_motor_test", None)
+        if not callable(runner):
+            QMessageBox.information(
+                self, "Motor test", "Motor test is not available on this link."
+            )
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Motor test - remove propellers",
+            "This will spin each motor in turn at low throttle.\n\n"
+            "REMOVE THE PROPELLERS before continuing, and keep clear of the "
+            "aircraft.\n\nWatch that each motor turns, in the right order and "
+            "the right direction.\n\nStart the test?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            seconds = float(runner() or 0.0)
+        except Exception as e:
+            QMessageBox.critical(self, "Motor test", f"Could not start the test:\n{e}")
+            return
+        if seconds <= 0.0:
+            return
+        self._set_motor_test_running(True)
+        # Return the button to its idle state when the sequence has finished,
+        # so a stale "Stop" never suggests motors are still turning.
+        self._motor_test_end.setInterval(int(seconds * 1000) + 500)
+        self._motor_test_end.start()
+
+    def _stop_motor_test(self) -> None:
+        self._motor_test_end.stop()
+        stopper = getattr(self.parent(), "stop_motor_test", None)
+        if callable(stopper):
+            try:
+                stopper()
+            except Exception:
+                pass
+        self._set_motor_test_running(False)
+
+    def _set_motor_test_available(self, available: bool) -> None:
+        if self._motor_test_running:
+            return                      # never disable the abort mid-run
+        self._motor_test_btn.setEnabled(bool(available))
+        self._motor_test_btn.setToolTip(
+            _MOTOR_TEST_TOOLTIP if available else _MOTOR_TEST_NO_BATTERY
+        )
+
+    def _set_motor_test_running(self, running: bool) -> None:
+        self._motor_test_running = bool(running)
+        self._motor_test_btn.setText("Stop motor test" if running else "Test motors...")
+
     def refresh(self) -> None:
         try:
             kwargs = dict(self._provider() or {})
@@ -116,6 +203,12 @@ class PreflightDialog(QDialog):
             checks = build_preflight_checks(**kwargs)
         except Exception:
             return
+        # ESCs run off the flight pack, so on USB alone the test would command
+        # motors that have no power to turn. Say that instead of letting the
+        # operator press it and conclude the motors are dead.
+        self._set_motor_test_available(
+            battery_is_present(kwargs.get("battery_voltage_v")) is not False
+        )
         self._render(checks)
 
     def _render(self, checks: list[PreflightCheck]) -> None:
@@ -165,4 +258,11 @@ class PreflightDialog(QDialog):
             self._timer.stop()
         except Exception:
             pass
+        # Closing the window must not leave motors spinning with no visible
+        # control to stop them.
+        if self._motor_test_running:
+            try:
+                self._stop_motor_test()
+            except Exception:
+                pass
         super().closeEvent(event)

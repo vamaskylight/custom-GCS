@@ -85,6 +85,13 @@ from vgcs.video.camera_control import (
 )
 
 
+# Low and brief: a pre-flight test only has to show each motor turns and which
+# way. The link thread clamps these again, so a mistake here cannot produce
+# thrust. See MavlinkThread._motor_test.
+MOTOR_TEST_THROTTLE_PCT = 8.0
+MOTOR_TEST_DURATION_S = 2.0
+MOTOR_TEST_GAP_S = 1.0
+
 class MainWindowFlightCommandsMixin:
     """Extracted from MainWindow — uses host state via self."""
 
@@ -167,6 +174,121 @@ class MainWindowFlightCommandsMixin:
             return
         self._thread.queue_emergency_motor_stop()
         self._append_log("EMERGENCY STOP queued: forced motor stop")
+
+    def run_motor_test(self, *, motors: int = 0) -> float:
+        """Spin each motor in turn, one at a time.
+
+        Requested 2026-09-02: "when it comes motor/ESC check then motor should
+        rotate accordingly". The checklist row before this read a SYS_STATUS
+        health bit, which cannot tell a reversed motor from a correct one.
+
+        Sequential on purpose. The point is to see WHICH motor turns, in what
+        order and which direction; spinning them together proves only that
+        something moved. Motors are numbered in board output order, so motor 1
+        is the output labelled 1 on the autopilot, not a position on the frame.
+
+        Reached from the pre-flight dialog behind an explicit confirmation. The
+        armed-state refusal lives in the link thread, which is the one place
+        that knows the live armed state.
+
+        Returns how many seconds the sequence will take, so a caller can show
+        it as running; 0.0 when nothing was started.
+        """
+        thread = getattr(self, "_thread", None)
+        if thread is None or not thread.isRunning():
+            self._append_log("Motor test: connect the vehicle first")
+            return 0.0
+        self.stop_motor_test(quiet=True)   # never overlap two sequences
+
+        count = int(motors) if int(motors) > 0 else self._motor_test_count()
+        throttle = MOTOR_TEST_THROTTLE_PCT
+        each_s = MOTOR_TEST_DURATION_S
+        self._append_log(
+            f"Motor test: {count} motors, {throttle:.0f}% for {each_s:.0f}s each, "
+            "in board output order - PROPELLERS SHOULD BE OFF"
+        )
+        self._motor_test_timers = []
+        for i in range(count):
+            motor = i + 1
+            # Spaced by the test duration plus a gap, so the operator can tell
+            # one motor from the next instead of watching them blur together.
+            delay_ms = int(i * (each_s + MOTOR_TEST_GAP_S) * 1000)
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(delay_ms)
+            timer.timeout.connect(
+                lambda m=motor, t=thread: self._spin_one_motor(t, m, throttle, each_s)
+            )
+            self._motor_test_timers.append(timer)
+            timer.start()
+        # How long the caller should treat the sequence as running.
+        return count * each_s + max(0, count - 1) * MOTOR_TEST_GAP_S
+
+    def _spin_one_motor(self, thread, motor: int, throttle: float, seconds: float) -> None:
+        self._append_log(f"Motor test: motor {motor}")
+        try:
+            thread.queue_motor_test(motor=motor, throttle_pct=throttle, duration_s=seconds)
+        except Exception as e:
+            self._append_log(f"Motor test: motor {motor} failed ({e})")
+
+    def stop_motor_test(self, *, quiet: bool = False) -> None:
+        """Abort the sequence.
+
+        Cancelling the pending timers is the part that matters: if the operator
+        sees something wrong on motor 1 they must be able to stop the remaining
+        motors before they spin. The zero-throttle command cuts the one already
+        turning; ArduPilot's motor test honours a new command for the same
+        output. A motor still running after this is what the emergency stop is
+        for.
+        """
+        timers = getattr(self, "_motor_test_timers", None) or []
+        self._motor_test_timers = []
+        if not timers:
+            # Nothing was running. Say nothing and, in particular, send nothing:
+            # run_motor_test() calls this first, and a stray command on every
+            # start would be a motor command the operator never asked for.
+            return
+        pending = 0
+        for timer in timers:
+            try:
+                if timer.isActive():
+                    pending += 1
+                timer.stop()
+            except Exception:
+                pass
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread.isRunning():
+            try:
+                thread.queue_motor_test(motor=1, throttle_pct=0.0, duration_s=0.5)
+            except Exception:
+                pass
+        if not quiet:
+            self._append_log(f"Motor test stopped ({pending} motors not run)")
+
+    def _motor_test_count(self) -> int:
+        """Motor count from FRAME_CLASS when the parameter has been read.
+
+        Falls back to a quadrotor's four rather than refusing: testing four
+        outputs on a hexacopter still turns four real motors and tells the
+        operator something, and an over-count simply fails on outputs that are
+        not there.
+        """
+        try:
+            frame = int(float(self._last_params.get("FRAME_CLASS", 0) or 0))
+        except Exception:
+            frame = 0
+        # ArduCopter FRAME_CLASS -> motor outputs.
+        return {
+            1: 4,    # Quad
+            2: 6,    # Hexa
+            3: 8,    # Octa
+            4: 8,    # OctaQuad
+            5: 6,    # Y6
+            7: 3,    # Tri
+            10: 2,   # BiCopter
+            12: 12,  # DodecaHexa
+            14: 10,  # Deca
+        }.get(frame, 4)
 
     def _on_apply_m1_failsafes(self) -> None:
         if self._thread is None or not self._thread.isRunning():

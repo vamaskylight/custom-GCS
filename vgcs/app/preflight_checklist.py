@@ -121,13 +121,13 @@ def build_preflight_checks(
             sensors_present,
             sensors_enabled,
             sensors_health,
-            battery_powered=_battery_is_present(battery_voltage_v),
+            battery_powered=battery_is_present(battery_voltage_v),
         )
     )
     return checks
 
 
-def _battery_is_present(voltage_v) -> bool | None:
+def battery_is_present(voltage_v) -> bool | None:
     """True / False / None-for-unknown. Three states on purpose: "no voltage
     reading yet" is not the same claim as "no battery"."""
     v = _f(voltage_v)
