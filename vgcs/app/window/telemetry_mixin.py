@@ -243,6 +243,7 @@ class MainWindowTelemetryMixin:
             except Exception:
                 authoritative = False
         battery = getattr(self, "_battery", None)
+        flags = getattr(self, "_last_sensor_flags", None) or (None, None, None)
         return {
             "prearm_reported": bool(getattr(health, "reported", False)),
             "prearm_passing": bool(getattr(health, "passing", False)),
@@ -253,6 +254,9 @@ class MainWindowTelemetryMixin:
             "gps_hdop": getattr(self, "_last_gps_hdop", None),
             "battery_voltage_v": getattr(battery, "voltage_v", None),
             "battery_remaining_pct": getattr(battery, "remaining_pct", None),
+            "sensors_present": flags[0],
+            "sensors_enabled": flags[1],
+            "sensors_health": flags[2],
         }
 
     def _show_preflight_dialog(self) -> None:
@@ -548,6 +552,9 @@ class MainWindowTelemetryMixin:
             sensors_health = int(data.get("sensors_health", 0))
             # The autopilot PreArm verdict — the only trustworthy source of
             # "ready to arm". See vgcs.app.arm_readiness.
+            # Kept whole: the pre-arm parse reads one bit out of this triplet,
+            # but the motor/ESC row needs others from the same message.
+            self._last_sensor_flags = (sensors_present, sensors_enabled, sensors_health)
             self._prearm_health = parse_prearm_health(
                 sensors_present=sensors_present,
                 sensors_enabled=sensors_enabled,

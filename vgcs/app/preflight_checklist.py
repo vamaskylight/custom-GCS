@@ -30,6 +30,18 @@ GPS_MIN_SATS_ADVISORY = 6          # ArduPilot's own GPS_MIN_SATS default
 GPS_FIX_3D = 3                     # GPS_FIX_TYPE_3D_FIX
 HDOP_ADVISORY_MAX = 2.0            # above this, position quality is poor
 BATTERY_REMAINING_ADVISORY_PCT = 30.0
+# Below this, no flight pack is attached — the autopilot is running on USB and
+# whatever the voltage sense reads is not a battery. Even a 2S pack sits above
+# 6 V, so 5 V cannot be a real one.
+BATTERY_MIN_PLAUSIBLE_V = 5.0
+
+# ArduPilot publishes motor/ESC health in the same SYS_STATUS sensor triplet as
+# everything else. MOTOR_OUTPUTS covers the servo/ESC output path; PROPULSION is
+# reported by firmware with ESC telemetry and says more when present, so it is
+# preferred. Neither is a substitute for actually spinning the motors — see
+# _motors_check.
+MAV_SYS_STATUS_SENSOR_MOTOR_OUTPUTS = 0x00008000
+MAV_SYS_STATUS_SENSOR_PROPULSION = 0x40000000
 
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
@@ -64,6 +76,9 @@ def build_preflight_checks(
     gps_hdop: float | None = None,
     battery_voltage_v: float | None = None,
     battery_remaining_pct: float | None = None,
+    sensors_present: int | None = None,
+    sensors_enabled: int | None = None,
+    sensors_health: int | None = None,
 ) -> list[PreflightCheck]:
     """Assemble the checklist rows. Pure — no Qt, no telemetry plumbing."""
     checks: list[PreflightCheck] = []
@@ -99,6 +114,7 @@ def build_preflight_checks(
     # --- advisory rows ---------------------------------------------------- #
     checks.append(_gps_check(gps_fix_type, gps_sats, gps_hdop))
     checks.append(_battery_check(battery_voltage_v, battery_remaining_pct))
+    checks.append(_motors_check(sensors_present, sensors_enabled, sensors_health))
     return checks
 
 
@@ -128,17 +144,33 @@ def _gps_check(fix_type, sats, hdop) -> PreflightCheck:
 
 
 def _battery_check(voltage_v, remaining_pct) -> PreflightCheck:
+    """Battery row.
+
+    The percentage cannot be trusted on its own. ArduPilot derives
+    ``battery_remaining`` from consumed mAh against ``BATT_CAPACITY``, so with
+    nothing drawn it reports ~full — including when there is no pack at all.
+    Field report 2026-09-02: USB only, no battery connected, and this row showed
+    a green tick beside "0.39 V · 99%".
+
+    So voltage is checked first, as the test of whether a battery is even
+    present, and the percentage is only meaningful once it is.
+    """
     v = _f(voltage_v)
     pct = _f(remaining_pct)
     if v is None and pct is None:
         return PreflightCheck("battery", "Battery", STATUS_UNKNOWN, "No battery telemetry yet")
+
+    if v is not None and v < BATTERY_MIN_PLAUSIBLE_V:
+        detail = f"No battery connected ({v:.2f} V)"
+        if pct is not None:
+            detail += f" — the {pct:.0f}% reading is not meaningful on USB power"
+        return PreflightCheck("battery", "Battery", STATUS_FAIL, detail)
+
     bits: list[str] = []
     if v is not None:
         bits.append(f"{v:.2f} V")
     if pct is not None:
         bits.append(f"{pct:.0f}%")
-    # Percentage is the autopilot's own estimate against its configured pack, so
-    # prefer it. Voltage alone cannot be judged without knowing the cell count.
     if pct is not None:
         ok = pct >= BATTERY_REMAINING_ADVISORY_PCT
     else:
@@ -146,6 +178,44 @@ def _battery_check(voltage_v, remaining_pct) -> PreflightCheck:
         bits.append("no capacity estimate — voltage only")
     return PreflightCheck(
         "battery", "Battery", STATUS_PASS if ok else STATUS_FAIL, " · ".join(bits)
+    )
+
+
+def _motors_check(present, enabled, health) -> PreflightCheck:
+    """Motor / ESC output health, as the vehicle reports it.
+
+    Requested 2026-09-02: "like battery, GPS, motor test should be there in the
+    PreArm check".
+
+    This is a HEALTH READOUT, not a motor test. It says the autopilot's output
+    path and ESCs are reporting themselves healthy; it does not spin anything,
+    so it cannot detect a reversed motor, a swapped output or a bad prop. A row
+    claiming "motors tested" on the strength of a status bit would be a lie an
+    operator might fly on. Spinning motors is a deliberate, guarded action and
+    belongs on its own control, not in a popup that opens by itself next to an
+    armed aircraft.
+    """
+    p, e, h = _i(present), _i(enabled), _i(health)
+    if p is None or e is None or h is None:
+        return PreflightCheck(
+            "motors", "Motors / ESCs", STATUS_UNKNOWN, "No motor telemetry yet"
+        )
+    for bit, label in (
+        (MAV_SYS_STATUS_SENSOR_PROPULSION, "Propulsion"),
+        (MAV_SYS_STATUS_SENSOR_MOTOR_OUTPUTS, "Motor outputs"),
+    ):
+        if (p & bit) and (e & bit):
+            healthy = bool(h & bit)
+            return PreflightCheck(
+                "motors",
+                "Motors / ESCs",
+                STATUS_PASS if healthy else STATUS_FAIL,
+                f"{label} reported {'healthy' if healthy else 'UNHEALTHY'} "
+                "(status only — motors not spun)",
+            )
+    return PreflightCheck(
+        "motors", "Motors / ESCs", STATUS_UNKNOWN,
+        "This autopilot does not report motor health",
     )
 
 
