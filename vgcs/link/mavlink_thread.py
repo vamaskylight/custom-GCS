@@ -7,6 +7,7 @@ Runs blocking pymavlink I/O off the GUI thread and emits decoded telemetry.
 from __future__ import annotations
 
 import math
+import os
 import re
 import threading
 import time
@@ -57,6 +58,20 @@ _AUTOPILOT_ONLY_MESSAGES = frozenset(
 # right way. Anything more is thrust, and thrust with props on a bench moves the
 # airframe. These caps are enforced in the link thread so no caller can raise
 # them by passing a larger number.
+# ArduPilot's force-arm magic number. Sending it arms the vehicle with EVERY
+# pre-arm check bypassed - compass, EKF, GPS, "Need Position Estimate", all of
+# it. That is a reasonable thing to want in SITL and an appalling thing to do by
+# accident on an aircraft: the checks it skips are the ones that stop a copter
+# taking off with a yaw estimate it cannot trust. So it is opt-in, per session,
+# and never a silent retry. Set VGCS_ALLOW_FORCE_ARM=1 for simulator work.
+_ARM_FORCE_MAGIC = 21196.0
+_FORCE_ARM_ENV = "VGCS_ALLOW_FORCE_ARM"
+
+
+def _force_arm_allowed() -> bool:
+    return str(os.environ.get(_FORCE_ARM_ENV, "")).strip() in ("1", "true", "TRUE", "yes")
+
+
 _MOTOR_TEST_MAX_THROTTLE_PCT = 15.0
 _MOTOR_TEST_MAX_DURATION_S = 5.0
 # ArduPilot arms the motor outputs for the duration of a motor test, and reports
@@ -1814,12 +1829,19 @@ class MavlinkThread(QThread):
                     p1=1.0,
                 )
                 if not self._wait_vehicle_armed():
-                    # ArduPilot SITL: force-arm magic in param2 when pre-arm checks block normal arm.
-                    self.log_line.emit("Mission start: retry ARM with force override (param2=21196)")
+                    if not _force_arm_allowed():
+                        raise RuntimeError(
+                            "the vehicle refused to arm - fix the pre-arm message it "
+                            "reported rather than forcing it into the air"
+                        )
+                    self.log_line.emit(
+                        f"Mission start: FORCE ARM ({_FORCE_ARM_ENV} is set) - "
+                        "every pre-arm check is being bypassed"
+                    )
                     self._send_command_long(
                         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                         p1=1.0,
-                        p2=21196.0,
+                        p2=_ARM_FORCE_MAGIC,
                     )
                     if not self._wait_vehicle_armed(6.0):
                         raise TimeoutError("arm timeout (still disarmed after arm command)")
@@ -2084,11 +2106,19 @@ class MavlinkThread(QThread):
                 p1=1.0,
             )
             if not self._wait_vehicle_armed():
-                self.log_line.emit("Auto takeoff: retry ARM with force override (param2=21196)")
+                if not _force_arm_allowed():
+                    raise RuntimeError(
+                        "the vehicle refused to arm - fix the pre-arm message it "
+                        "reported rather than forcing it into the air"
+                    )
+                self.log_line.emit(
+                    f"Auto takeoff: FORCE ARM ({_FORCE_ARM_ENV} is set) - "
+                    "every pre-arm check is being bypassed"
+                )
                 self._send_command_long(
                     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                     p1=1.0,
-                    p2=21196.0,
+                    p2=_ARM_FORCE_MAGIC,
                 )
                 if not self._wait_vehicle_armed(6.0):
                     raise TimeoutError("arm timeout (still disarmed after arm command)")
