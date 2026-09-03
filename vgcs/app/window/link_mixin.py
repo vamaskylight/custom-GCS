@@ -429,6 +429,20 @@ class MainWindowLinkMixin:
         self._append_log(
             f"GCS link watchdog triggered: no messages for {elapsed_s:.1f}s"
         )
+        # A radio dropout in flight leaves the serial port wide open, so
+        # _on_link_down never runs and nothing said where the aircraft was. The
+        # watchdog is the ONLY thing that notices, and on 2026-09-03 all it
+        # printed was two lines that then scrolled away under video retries -
+        # during an AUTO mission whose telemetry never came back. Latched, so a
+        # long outage does not repeat this every two seconds.
+        if not getattr(self, "_link_timeout_announced", False):
+            self._link_timeout_announced = True
+            try:
+                self._map_widget.announce_last_known_position(
+                    armed=bool(getattr(self, "_hb_armed", False))
+                )
+            except Exception:
+                pass
         if self._connect_attempt_active and not self._heartbeat_seen:
             self._connect_attempt_active = False
             QMessageBox.warning(

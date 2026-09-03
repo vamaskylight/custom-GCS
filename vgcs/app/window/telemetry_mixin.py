@@ -379,6 +379,8 @@ class MainWindowTelemetryMixin:
     def _on_heartbeat(self, sysid: int, compid: int, mav_ver: int) -> None:
         # Freshness, for anything that must not render a stale reading as fact.
         self._last_heartbeat_mono = time.monotonic()
+        # Contact is back, so the next outage gets announced again.
+        self._link_timeout_announced = False
         if not self._heartbeat_seen:
             self._heartbeat_seen = True
             self._hb_connected_since_mono = time.monotonic()

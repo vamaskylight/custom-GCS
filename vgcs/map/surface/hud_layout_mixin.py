@@ -462,11 +462,23 @@ class NativeHudLayoutMixin:
             if b is not None:
                 b.setEnabled(ok)
 
-    def _announce_last_known_position(self) -> None:
+    def announce_last_known_position(self, *, armed: bool = False) -> None:
+        """Public entry point, for callers outside this widget.
+
+        The watchdog needs this as much as a closed port does - arguably more.
+        See _announce_last_known_position.
+        """
+        self._announce_last_known_position(armed=armed)
+
+    def _announce_last_known_position(self, *, armed: bool = False) -> None:
         """Print and show the last fix when the link drops.
 
         Printed as well as shown because the status bar is transient and the
         console is what gets copied into a chat when something goes wrong.
+
+        ``armed`` is the difference between a radio blip on the bench and an
+        aircraft that is airborne and no longer talking to anyone, so it changes
+        how loudly this says it.
         """
         try:
             fn = getattr(self, "last_known_vehicle_position", None)
@@ -479,12 +491,18 @@ class NativeHudLayoutMixin:
             line = pos.describe()
         except Exception:
             return
+        head = "LINK LOST WHILE ARMED" if armed else "LINK LOST"
         try:
-            print(f"[VGCS:map] LINK LOST — last known position {line}")
+            print(f"[VGCS:map] {head} — last known position {line}")
+            if armed:
+                print(
+                    "[VGCS:map] the aircraft is airborne and out of contact - "
+                    "it will keep flying its mission unless a failsafe brings it back"
+                )
         except Exception:
             pass
         try:
-            self._set_status(f"Link lost — last known position: {line}")
+            self._set_status(f"{head} — last known position: {line}")
         except Exception:
             pass
 
