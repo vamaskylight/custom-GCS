@@ -64,6 +64,14 @@ _INSPECT_CLICK_SLOP_PX = 4.0
 # looks like a hang. ~4000 tiles is a few hundred MB at most and covers a
 # 3 km radius across three zoom levels comfortably.
 _OFFLINE_CACHE_MAX_TILES = 4000
+# Failed fetches in a row before the map stops expecting a real tile to turn up
+# and starts filling gaps from whatever it already has. Small, because the cost
+# of being wrong is a blurred square for a moment; the cost of waiting is a
+# black screen over the area the operator is trying to click.
+_TILE_OFFLINE_FAILURES = 3
+# Furthest out to borrow from: 5 levels is a 32x upscale, coarse but still
+# recognisable ground. Past that it is flat colour and worth nothing.
+_MAX_PREVIEW_UPSCALE_DEPTH = 5
 _HTTP_OPENER = build_opener()
 _BUNDLED_SEED_ROOT = (Path(__file__).resolve().parents[1] / "assets" / "companion_tile_seed").resolve()
 _TILE_FETCH_ERRORS_LOGGED = 0
@@ -486,6 +494,9 @@ class NativeTileMapView(QWidget):
         )
         self._tile_subdomains = "abc"
         self._offline_root: str | None = None
+        # Consecutive tile fetches that came back with nothing. Used only to
+        # decide how hard to work at filling a gap - see _parent_tile_child.
+        self._tile_fetch_failures = 0
         self._inspect_press_screen = None
         # Where the operator last asked "what is that?", and the caption to
         # draw beside it. Kept on the map rather than a status line because
@@ -1584,6 +1595,7 @@ class NativeTileMapView(QWidget):
             # A null image means the FETCH failed (offline, DNS, timeout) — it
             # says nothing about the tile already on disk. Deleting that would
             # destroy the offline map, so only retry.
+            self._tile_fetch_failures = getattr(self, "_tile_fetch_failures", 0) + 1
             self._schedule_placeholder_retry(z, x, y, drop_cached=False)
             return
         if _tile_image_is_placeholder(img, zoom=z):
@@ -1591,6 +1603,7 @@ class NativeTileMapView(QWidget):
             # one IS worth dropping so a later fetch can replace it.
             self._schedule_placeholder_retry(z, x, y, drop_cached=True)
             return
+        self._tile_fetch_failures = 0
         self._tiles[key] = _prepare_tile_image(img)
         self._preview_tiles.pop(key, None)
         self._tile_retry_after.pop(key, None)
@@ -1659,8 +1672,7 @@ class NativeTileMapView(QWidget):
         preview = self._preview_tiles.get(key)
         if preview is not None and not preview.isNull():
             return preview
-        # At high zoom, only 1 parent level (2×) — deeper upscales look blocky and stay visible too long.
-        max_depth = 1 if z >= 17 or z >= int(self._max_zoom) - 1 else 3
+        max_depth = self._preview_upscale_depth(z)
         for depth in range(1, max_depth + 1):
             pz = z - depth
             if pz < 3:
@@ -1690,6 +1702,28 @@ class NativeTileMapView(QWidget):
             except Exception:
                 continue
         return None
+
+    def _preview_upscale_depth(self, z: int) -> int:
+        """How many zoom levels out to look for something to draw in a gap.
+
+        Shallow while tiles are arriving: a blocky 8x upscale that lingers is
+        worse than a blank square filled a moment later by the real thing, and
+        that is doubly true at high zoom where the blur is most obvious.
+
+        But that trade only holds if the real tile IS coming. With no network,
+        or on a stored offline map that was never cached this deep, the choice
+        is not "blocky now or sharp shortly" - it is blocky or black, forever.
+        Reported 2026-09-03: zooming past 17 with no internet gave "only black
+        interface", and the operator could not place a waypoint. A blurred
+        upscale of the tile one level out still shows the roads and fields they
+        are aiming at, and the click read-out gives exact coordinates anyway.
+        """
+        offline = getattr(self, "_tile_fetch_failures", 0) >= _TILE_OFFLINE_FAILURES
+        if self._offline_root or offline:
+            return _MAX_PREVIEW_UPSCALE_DEPTH
+        if z >= 17 or z >= int(self._max_zoom) - 1:
+            return 1
+        return 3
 
     def _queue_tile_fetch(self, z: int, x: int, y: int) -> None:
         key = (z, x, y)
