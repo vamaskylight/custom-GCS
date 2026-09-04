@@ -64,6 +64,11 @@ NOTICE_HOLD_S = 6.0
 # having posted it.
 NOTICE_STATUS = 0
 NOTICE_EVENT = 1
+# An event notice may show over a held vehicle message only when that message
+# is at or below this severity, i.e. routine chatter. Severity numbers run the
+# other way (0 EMERGENCY … 7 DEBUG), so this admits NOTICE, INFO and DEBUG and
+# excludes WARNING and everything worse.
+_EVENT_OUTRANKS_ABOVE_SEVERITY = SEVERITY_NOTICE
 # Long enough to be read on a glance away from the screen, short enough that a
 # mission with closely spaced waypoints does not queue up stale ones.
 EVENT_NOTICE_HOLD_S = 5.0
@@ -182,10 +187,24 @@ class VehicleMessageBoard:
         """The text the cell should show right now."""
         now_f = time.monotonic() if now is None else float(now)
         held = self._held
-        if held is not None and now_f < held.expires_mono:
-            return held.text
         notice = self._notice
-        if notice is not None and now_f < notice.expires_mono:
+        notice_live = notice is not None and now_f < notice.expires_mono
+
+        if held is not None and now_f < held.expires_mono:
+            # A one-off mission event beats routine chatter, and only chatter.
+            # Field report 2026-09-04: the arrival notice never appeared at any
+            # waypoint, because this vehicle emits "Field Elevation Set: 0m" at
+            # about 5 Hz, every repeat refreshes that hold, and the cell was
+            # therefore occupied by an INFO line for the whole flight. Anything
+            # at WARNING or worse still wins: burying a fault to say a waypoint
+            # was made would be a straight downgrade.
+            if not (
+                notice_live
+                and self._notice_kind >= NOTICE_EVENT
+                and held.severity >= _EVENT_OUTRANKS_ABOVE_SEVERITY
+            ):
+                return held.text
+        if notice_live:
             return notice.text
         if held is not None:
             # Keep the information, but never let it read as current.
