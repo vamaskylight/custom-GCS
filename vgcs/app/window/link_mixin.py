@@ -435,7 +435,12 @@ class MainWindowLinkMixin:
         # printed was two lines that then scrolled away under video retries -
         # during an AUTO mission whose telemetry never came back. Latched, so a
         # long outage does not repeat this every two seconds.
-        if not getattr(self, "_link_timeout_announced", False):
+        # Only when contact existed and was lost. On a connection that never
+        # came up there is nothing to have lost, and the stored fix can be
+        # hours old: a 2026-09-04 log announced "LINK LOST - last known
+        # position ... 3h 4m ago" while the operator was simply trying UDP
+        # settings on a parked aircraft.
+        if self._heartbeat_seen and not getattr(self, "_link_timeout_announced", False):
             self._link_timeout_announced = True
             try:
                 self._map_widget.announce_last_known_position(
