@@ -311,14 +311,17 @@ class MainWindowUiLayoutMixin:
         """One-line GPS summary for popups/exports (sat line + HDOP line)."""
         return f"{self._top_gps_sat.text()} / {self._top_gps_hdop.text()}"
 
-    def _post_gcs_notice(self, message: object) -> None:
+    def _post_gcs_notice(self, message: object, **kw) -> None:
         """Show GCS-generated action feedback in the MESSAGE cell.
 
         Goes through the board so it cannot bury a live vehicle fault and does
         not linger once the action is over. Direct label writes are reserved
         for the board itself.
+
+        ``kind`` and ``hold_s`` pass through to the board: see push_notice for
+        why a one-off event must not be overwritten by rolling status.
         """
-        self._vehicle_msg_board.push_notice(str(message or ""))
+        self._vehicle_msg_board.push_notice(str(message or ""), **kw)
         self._publish_vehicle_msg_cell()
 
     def _vehicle_msg_elide_floor_px(self) -> int:

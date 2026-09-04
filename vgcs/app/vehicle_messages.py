@@ -56,6 +56,18 @@ _DEFAULT_HOLD_S = 10.0
 # GCS action feedback ("Mission uploaded (5)") — not something the vehicle said.
 NOTICE_HOLD_S = 6.0
 
+# Notices divide into two kinds, and the difference decides which one the cell
+# keeps. A STATUS notice restates something that is continuously true ("AUTO ·
+# WP 3 of 5") and is posted again a moment later, so losing one costs nothing.
+# An EVENT notice happens once ("Waypoint 2 of 5 reached"); if a status notice
+# overwrites it the operator simply never sees it, which is the whole point of
+# having posted it.
+NOTICE_STATUS = 0
+NOTICE_EVENT = 1
+# Long enough to be read on a glance away from the screen, short enough that a
+# mission with closely spaced waypoints does not queue up stale ones.
+EVENT_NOTICE_HOLD_S = 5.0
+
 PLACEHOLDER = "—"
 
 
@@ -89,6 +101,7 @@ class VehicleMessageBoard:
     def reset(self) -> None:
         self._held: HeldMessage | None = None
         self._notice: HeldMessage | None = None
+        self._notice_kind: int = NOTICE_STATUS
         self._last_rendered: str | None = None
 
     # -- ingest ---------------------------------------------------------
@@ -131,18 +144,38 @@ class VehicleMessageBoard:
         text: str,
         *,
         hold_s: float = NOTICE_HOLD_S,
+        kind: int = NOTICE_STATUS,
         now: float | None = None,
-    ) -> None:
-        """Post GCS-generated action feedback (mission upload, mode command)."""
+    ) -> bool:
+        """Post GCS-generated action feedback (mission upload, mode command).
+
+        ``kind`` decides what may overwrite what. A status notice will not
+        replace an event notice that is still on screen: in AUTO the vehicle
+        reports the next waypoint within a fraction of a second of reaching the
+        last one, so "AUTO · WP 3 of 5" would wipe "Waypoint 2 of 5 reached"
+        before anyone could read it.
+
+        Returns whether the cell took it.
+        """
         msg = str(text or "").strip()
         if not msg:
-            return
+            return False
         now_f = time.monotonic() if now is None else float(now)
+        live = self._notice
+        if (
+            int(kind) < self._notice_kind
+            and live is not None
+            and now_f < live.expires_mono
+        ):
+            return False
         self._notice = HeldMessage(msg, SEVERITY_NOTICE, now_f, now_f + float(hold_s))
+        self._notice_kind = int(kind)
+        return True
 
     def clear_vehicle_message(self) -> None:
         self._held = None
         self._notice = None
+        self._notice_kind = NOTICE_STATUS
 
     # -- read -----------------------------------------------------------
     def current(self, now: float | None = None) -> str:

@@ -63,6 +63,7 @@ from vgcs.app.window.helpers import (
 )
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
+from vgcs.app.vehicle_messages import EVENT_NOTICE_HOLD_S, NOTICE_EVENT
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import (
     DEFAULT_MISSION_END_ACTION,
@@ -364,6 +365,10 @@ class MainWindowPlanMissionMixin:
 
     def _on_mission_uploaded(self, count: int) -> None:
         self._mission_upload_pending = False
+        # A new plan renumbers everything, so the last announced item no longer
+        # refers to anything. Without this, re-flying the same mission would
+        # skip announcing its first waypoint.
+        self._last_reached_seq_announced = None
         self._append_log(f"Mission upload success: {count} WPs")
         self._post_gcs_notice(f"Mission uploaded ({count})")
         QMessageBox.information(
@@ -396,11 +401,40 @@ class MainWindowPlanMissionMixin:
                 self._append_log(f"Mission: reached WP {int(wp_index) + 1} of {total}")
             elif label:
                 self._append_log(f"Mission: completed {label}")
+            self._announce_waypoint_reached(data, wp_index, total, label)
             return
         if wp_index is not None:
             self._post_gcs_notice(f"AUTO · WP {int(wp_index) + 1} of {total}")
         elif label:
             self._post_gcs_notice(f"AUTO · {label}")
+
+    def _announce_waypoint_reached(self, data, wp_index, total, label) -> None:
+        """Say so on screen each time the vehicle makes a point.
+
+        Requested 2026-09-04: "when the vehicle reaches one point then there is
+        a small pop-up that should come like 1 point reached, likewise other
+        points also".
+
+        The message board rather than a dialog. A modal box over a GCS blocks
+        the map and the flight controls, and this one fires at every waypoint,
+        so it would be in the way for the entire mission.
+        """
+        seq = data.get("seq") if isinstance(data, dict) else None
+        # Once per item. MISSION_ITEM_REACHED can arrive more than once for the
+        # same seq on a lossy link, and a notice that repeats itself is one the
+        # operator stops reading.
+        if seq is not None and seq == getattr(self, "_last_reached_seq_announced", None):
+            return
+        self._last_reached_seq_announced = seq
+
+        if wp_index is not None:
+            n = int(wp_index) + 1
+            text = f"Waypoint {n} of {total} reached" if total else f"Waypoint {n} reached"
+        elif label:
+            text = f"{label} complete"
+        else:
+            return
+        self._post_gcs_notice(text, kind=NOTICE_EVENT, hold_s=EVENT_NOTICE_HOLD_S)
 
     def _sync_plan_flight_chrome(self) -> None:
         """Enable/disable Plan Flight upload/save buttons from link + waypoint state."""
