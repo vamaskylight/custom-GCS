@@ -326,6 +326,16 @@ class MainWindowLinkMixin:
         self._sync_plan_flight_chrome()
 
     def _on_link_down(self) -> None:
+        # Before anything below resets _heartbeat_seen. Only a link that was up
+        # can be lost; closing a port that never carried a heartbeat has lost
+        # nothing, and the stored fix can be hours old.
+        if self._heartbeat_seen:
+            try:
+                self._map_widget.announce_last_known_position(
+                    armed=bool(getattr(self, "_hb_armed", False))
+                )
+            except Exception:
+                pass
         self._map_widget.clear_flight_track()
         self._map_widget.set_mission_nav_seq(0)
         self._auto_center_pending = True

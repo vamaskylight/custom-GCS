@@ -537,10 +537,13 @@ class NativeHudLayoutMixin:
             except Exception:
                 pass
         if not c:
-            # Say where it was, the moment contact is lost — not after someone
-            # thinks to go looking. Field report 2026-08-31: an aircraft was lost
-            # and the operator had nothing to search from.
-            self._announce_last_known_position()
+            # Deliberately NOT announcing the last known position here. This
+            # runs on the way UP as well as down: _on_link_up marks the map
+            # disconnected until a heartbeat arrives, so every connect attempt
+            # printed "LINK LOST - last known position ... 3h 20m ago" while
+            # the operator was only trying UDP settings (2026-09-04 log). The
+            # announcement belongs to the two events that mean it: _on_link_down
+            # and the watchdog, both of which check contact existed first.
             # Keep camera controls hidden until MAVLink link-up (heartbeat).
             try:
                 self._native_hud_right.hide()
