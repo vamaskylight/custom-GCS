@@ -60,6 +60,12 @@ _TILE_CACHE_ROOT = (Path.home() / ".vgcs" / "tile-cache").resolve()
 # A press-to-release movement bigger than this was a pan, not a click.
 _INSPECT_CLICK_SLOP_PX = 4.0
 
+# How far a press on an existing waypoint must travel before it counts as a
+# drag rather than a click. Larger than the inspect slop: a waypoint disc is a
+# small target and people wobble on the way to pressing it, and the cost of
+# reading a wobble as a drag is a plan that has silently moved.
+_WP_DRAG_SLOP_PX = 6.0
+
 # Tile count quadruples per zoom level, so pre-caching must be bounded or it
 # looks like a hang. ~4000 tiles is a few hundred MB at most and covers a
 # 3 km radius across three zoom levels comfortably.
@@ -489,6 +495,13 @@ class NativeTileMapView(QWidget):
         self._active_wp_index: int | None = None
         self._add_wp_mode = False
         self._fence_draw_mode = False
+        # Dragging an existing waypoint. Requested 2026-09-04: "I'm not able to
+        # drag that particular point ... I can remove points but not drag."
+        # Pressing a waypoint used to do nothing at all, so that a new point
+        # could not be stacked on an existing one.
+        self._wp_drag_index: int | None = None
+        self._wp_drag_press_screen: QPointF | None = None
+        self._wp_dragging = False
         self._tile_template = (
             "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
         )
@@ -1552,6 +1565,24 @@ class NativeTileMapView(QWidget):
                 best_i = i
         return best_i
 
+    def _move_waypoint_index(self, idx: int, lat: float, lon: float) -> None:
+        """Move one waypoint to a new position, keeping its place in the plan.
+
+        Only the coordinates change. The altitude and speed the operator typed
+        live in the plan table against this index, so moving a point on the map
+        must not reorder or replace it.
+
+        Repainted here so the drag looks live; the plan itself is told once, on
+        release. See mouseReleaseEvent.
+        """
+        if not (0 <= idx < len(self._waypoints)):
+            return
+        try:
+            self._waypoints[idx] = (float(lat), float(lon))
+        except (TypeError, ValueError):
+            return
+        self.update()
+
     def _remove_waypoint_index(self, idx: int) -> None:
         if 0 <= idx < len(self._waypoints):
             self._waypoints.pop(idx)
@@ -1937,7 +1968,13 @@ class NativeTileMapView(QWidget):
                 if self._add_wp_mode:
                     hit = self._waypoint_hit_index(pos)
                     if hit is not None:
-                        # Avoid stacking a new WP on top of an existing marker (Leaflet markers were non-bubbling).
+                        # A press on an existing point moves it. It must never
+                        # stack a new waypoint on top of the old one, which is
+                        # why this branch existed before; now the press is put
+                        # to use instead of being thrown away.
+                        self._wp_drag_index = hit
+                        self._wp_drag_press_screen = QPointF(pos)
+                        self._wp_dragging = False
                         super().mousePressEvent(event)
                         return
                     # Defer placement to release — small movement starts a pan instead (same idea as OBSERVE marks).
@@ -1968,6 +2005,21 @@ class NativeTileMapView(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         cur = QPointF(event.position())
+        if self._wp_drag_index is not None and self._wp_drag_press_screen is not None:
+            if (
+                not self._wp_dragging
+                and (cur - self._wp_drag_press_screen).manhattanLength() > _WP_DRAG_SLOP_PX
+            ):
+                self._wp_dragging = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self._wp_dragging:
+                latlon = self._screen_to_lat_lon(cur)
+                if latlon is not None:
+                    self._move_waypoint_index(self._wp_drag_index, latlon[0], latlon[1])
+            # Never pan while a point is being moved: the map sliding under the
+            # cursor would drag the waypoint away from where it is being put.
+            super().mouseMoveEvent(event)
+            return
         if self._obs_click_candidate and self._press_for_obs is not None:
             if (cur - self._press_for_obs).manhattanLength() > 10.0:
                 self._obs_click_candidate = False
@@ -1997,6 +2049,26 @@ class NativeTileMapView(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._wp_drag_index is not None:
+                moved = self._wp_dragging
+                self._wp_drag_index = None
+                self._wp_drag_press_screen = None
+                self._wp_dragging = False
+                self.unsetCursor()
+                # This path returns early, so it has to do the pan cleanup the
+                # normal release below would have done. Left set, the map would
+                # pan on the next mouse move with no button held.
+                self._dragging = False
+                self._drag_last = None
+                if moved:
+                    # Told once, at the end. Emitting on every mouse move would
+                    # rewrite the plan table dozens of times across one drag.
+                    self._mission_nav_seq = 0
+                    self._active_wp_index = None
+                    self.update()
+                    self.user_waypoints_changed.emit()
+                event.accept()
+                return
             if (
                 self._add_wp_press_candidate
                 and self._add_wp_press_geo is not None
