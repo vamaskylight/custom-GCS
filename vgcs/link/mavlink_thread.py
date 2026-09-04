@@ -67,6 +67,12 @@ _AUTOPILOT_ONLY_MESSAGES = frozenset(
 _ARM_FORCE_MAGIC = 21196.0
 _FORCE_ARM_ENV = "VGCS_ALLOW_FORCE_ARM"
 
+# pymavlink occasionally throws decoding a single message. One bad packet must
+# never cost the link, but a stream where nothing decodes is not a link worth
+# holding open, and retrying it flat out would peg a core. Any good message
+# resets the count.
+_MAX_CONSECUTIVE_DECODE_ERRORS = 20
+
 
 def _force_arm_allowed() -> bool:
     return str(os.environ.get(_FORCE_ARM_ENV, "")).strip() in ("1", "true", "TRUE", "yes")
@@ -461,6 +467,9 @@ class MavlinkThread(QThread):
         last_hb = 0.0
         last_msg = time.monotonic()
         timeout_notified = False
+        # Consecutive messages pymavlink failed to decode. Reset by any good
+        # one, so a single bad packet never counts toward the give-up limit.
+        decode_errors = 0
         while self._running and self._master is not None:
             self._process_pending_commands()
             self._maybe_send_gcs_heartbeat()
@@ -470,38 +479,56 @@ class MavlinkThread(QThread):
                     timeout=1.0,
                 )
             except Exception as e:
-                if self._running:
-                    detail = str(e)
-                    # Windows: UDP recv can raise WSAECONNRESET (10054) when ICMP "port unreachable"
-                    # is returned — typically nothing is listening / sending MAVLink on that host:port.
-                    low = detail.lower()
-                    if "10054" in detail or "forcibly closed" in low:
-                        detail += (
-                            " — No MAVLink peer on that endpoint yet (start SITL or the vehicle stack; "
-                            "confirm serial vs UDP; for listen-first links try udpin:0.0.0.0:14550)."
-                        )
-                    elif not isinstance(e, OSError):
-                        # Not a link/socket problem — something in message
-                        # handling threw, and the bare message is unlocatable.
-                        # Field log 2026-08-19 closed the link on "'NoneType'
-                        # object does not support item assignment" with nothing
-                        # to say where; a traceback makes the next one findable.
-                        import traceback
-
-                        try:
-                            print(
-                                "[VGCS:link] message handling failed — closing link\n"
-                                + "".join(
-                                    traceback.format_exception(type(e), e, e.__traceback__)
-                                )
-                            )
-                        except Exception:
-                            pass
+                if not self._running:
+                    break
+                detail = str(e)
+                low = detail.lower()
+                # Windows: UDP recv can raise WSAECONNRESET (10054) when ICMP "port unreachable"
+                # is returned — typically nothing is listening / sending MAVLink on that host:port.
+                if "10054" in detail or "forcibly closed" in low:
+                    self.error.emit(
+                        detail
+                        + " — No MAVLink peer on that endpoint yet (start SITL or the vehicle stack; "
+                        "confirm serial vs UDP; for listen-first links try udpin:0.0.0.0:14550)."
+                    )
+                    break
+                if isinstance(e, OSError):
                     self.error.emit(detail)
-                break
+                    break
+
+                # Not the link — pymavlink threw while decoding one message.
+                # Skipping it costs one packet; closing the link costs the
+                # aircraft. Field logs 2026-08-19 and 2026-09-04 both dropped a
+                # live link on "'NoneType' object does not support item
+                # assignment" raised inside pymavlink's own post_message, the
+                # second time while telemetry was actually flowing.
+                decode_errors += 1
+                if decode_errors == 1:
+                    import traceback
+
+                    try:
+                        print(
+                            "[VGCS:link] skipping a message pymavlink could not "
+                            "handle — the link stays up\n"
+                            + "".join(
+                                traceback.format_exception(type(e), e, e.__traceback__)
+                            )
+                        )
+                    except Exception:
+                        pass
+                    self.log_line.emit(f"Skipped an undecodable message: {detail}")
+                if decode_errors >= _MAX_CONSECUTIVE_DECODE_ERRORS:
+                    # Every message failing is a broken stream, not one bad
+                    # packet, and spinning on it would peg a core.
+                    self.error.emit(
+                        f"{detail} — {decode_errors} unreadable messages in a row, closing the link"
+                    )
+                    break
+                continue
 
             if not self._running:
                 break
+            decode_errors = 0
 
             if msg is None:
                 elapsed = time.monotonic() - last_msg
