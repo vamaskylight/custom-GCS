@@ -1280,26 +1280,13 @@ class MavlinkThread(QThread):
                 0.0,
                 0.0,
             )
-            # MISSION_ITEM_REACHED is event-driven, not streamed; ask for it explicitly so
-            # the mission progress readout gets a "WP N done" edge rather than inferring
-            # completion from MISSION_CURRENT alone.
-            try:
-                self._master.mav.command_long_send(
-                    ts,
-                    tc,
-                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                    0,
-                    float(mavutil.mavlink.MAVLINK_MSG_ID_MISSION_ITEM_REACHED),
-                    float(slow_interval_us),
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                )
-            except Exception:
-                pass
+            # MISSION_ITEM_REACHED is deliberately NOT requested here. It is an
+            # event, and ArduPilot sends it unprompted when an item completes.
+            # Asking for it with SET_MESSAGE_INTERVAL adds it to the streaming
+            # set instead, so the vehicle re-sends the LAST event at that rate
+            # forever: field log 2026-09-04 carried several hundred identical
+            # "Mission: completed Speed 5.0 m/s" lines, still repeating minutes
+            # after the mission had finished and the aircraft was in RTL.
             # Battery/GPS UI depends on these; request explicitly for real vehicles.
             self._master.mav.command_long_send(
                 ts,

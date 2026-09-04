@@ -397,18 +397,37 @@ class MainWindowPlanMissionMixin:
         total = int(data.get("waypoint_count", 0) or 0)
         label = str(data.get("label", "") or "")
         if bool(data.get("reached", False)):
+            # Both the log and the notice are once-per-item. A repeat carries no
+            # new information, and the log is what gets pasted into a chat when
+            # something goes wrong, so filling it is not harmless.
+            if not self._is_new_reached_item(data):
+                return
             if wp_index is not None:
                 self._append_log(f"Mission: reached WP {int(wp_index) + 1} of {total}")
             elif label:
                 self._append_log(f"Mission: completed {label}")
-            self._announce_waypoint_reached(data, wp_index, total, label)
+            self._announce_waypoint_reached(wp_index, total, label)
             return
         if wp_index is not None:
             self._post_gcs_notice(f"AUTO · WP {int(wp_index) + 1} of {total}")
         elif label:
             self._post_gcs_notice(f"AUTO · {label}")
 
-    def _announce_waypoint_reached(self, data, wp_index, total, label) -> None:
+    def _is_new_reached_item(self, data) -> bool:
+        """True the first time an item reports itself reached.
+
+        MISSION_ITEM_REACHED repeats: on a lossy link as a retransmit, and on a
+        vehicle that has been asked to stream it as the same event over and
+        over. VGCS used to ask for exactly that, which is how one completed
+        speed-change filled a whole field log (2026-09-04).
+        """
+        seq = data.get("seq") if isinstance(data, dict) else None
+        if seq is not None and seq == getattr(self, "_last_reached_seq_announced", None):
+            return False
+        self._last_reached_seq_announced = seq
+        return True
+
+    def _announce_waypoint_reached(self, wp_index, total, label) -> None:
         """Say so on screen each time the vehicle makes a point.
 
         Requested 2026-09-04: "when the vehicle reaches one point then there is
@@ -419,14 +438,6 @@ class MainWindowPlanMissionMixin:
         the map and the flight controls, and this one fires at every waypoint,
         so it would be in the way for the entire mission.
         """
-        seq = data.get("seq") if isinstance(data, dict) else None
-        # Once per item. MISSION_ITEM_REACHED can arrive more than once for the
-        # same seq on a lossy link, and a notice that repeats itself is one the
-        # operator stops reading.
-        if seq is not None and seq == getattr(self, "_last_reached_seq_announced", None):
-            return
-        self._last_reached_seq_announced = seq
-
         if wp_index is not None:
             n = int(wp_index) + 1
             text = f"Waypoint {n} of {total} reached" if total else f"Waypoint {n} reached"
