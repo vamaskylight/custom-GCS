@@ -72,6 +72,50 @@ def _force_arm_allowed() -> bool:
     return str(os.environ.get(_FORCE_ARM_ENV, "")).strip() in ("1", "true", "TRUE", "yes")
 
 
+def connection_failure_hint(error: object, connection: str) -> str:
+    """Turn a socket or serial error into something an operator can act on.
+
+    Field report 2026-09-04: `udp:192.168.144.20:19856` failed with "[WinError
+    10049] The requested address is not valid in its context", which says
+    nothing about what to type instead. In pymavlink a bare ``udp:`` **binds**
+    to that address, so it has to be an address on this PC - which is why
+    127.0.0.1 worked and the aircraft's address did not.
+    """
+    txt = str(error or "").lower()
+    conn = str(connection or "").strip()
+    if not txt:
+        return ""
+
+    if "10049" in txt or "not valid in its context" in txt or "cannot assign requested" in txt:
+        host = ""
+        m = re.match(r"^udp(?:in)?:([^:]+):(\d+)$", conn, flags=re.IGNORECASE)
+        if m:
+            host, port = m.group(1), m.group(2)
+            return (
+                f" — 'udp:' listens on an address belonging to THIS computer, and "
+                f"{host} is not one of them. To listen for the vehicle use "
+                f"udp:0.0.0.0:{port}; to send to it use udpout:{host}:{port}."
+            )
+        return (
+            " — that address does not belong to this computer. 'udp:' listens "
+            "locally; use 'udpout:' to send to a remote device."
+        )
+
+    if "10065" in txt or "unreachable" in txt:
+        return (
+            " — this computer has no route to that network. Check it is on the "
+            "same subnet as the vehicle, and that the datalink adapter is up."
+        )
+
+    if "10061" in txt or "refused" in txt:
+        return " — nothing is listening on that port at the other end."
+
+    if any(k in txt for k in ("access is denied", "permission", "busy", "in use")):
+        return " (port may be busy; close Mission Planner/QGC and retry)"
+
+    return ""
+
+
 _MOTOR_TEST_MAX_THROTTLE_PCT = 15.0
 _MOTOR_TEST_MAX_DURATION_S = 5.0
 # ArduPilot arms the motor outputs for the duration of a motor test, and reports
@@ -398,10 +442,7 @@ class MavlinkThread(QThread):
 
         if self._master is None:
             preferred_error = first_error if first_error is not None else last_error
-            hint = ""
-            txt = str(preferred_error).lower() if preferred_error is not None else ""
-            if any(k in txt for k in ("access is denied", "permission", "busy", "in use")):
-                hint = " (port may be busy; close Mission Planner/QGC and retry)"
+            hint = connection_failure_hint(preferred_error, raw)
             self.error.emit(
                 f"Failed to open MAVLink connection. First error: {preferred_error}{hint}"
             )
