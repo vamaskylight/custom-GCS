@@ -363,10 +363,21 @@ class PlanMissionMixin:
     def _waypoints_from_map_json(self, payload: str | None) -> list[Waypoint]:
         """Rebuild the model from the map's lat/lon rows, keeping per-WP alt/speed.
 
-        The map only stores positions, so altitude and speed have to be carried over
-        from the previous model. Matching them **by index** silently shifted every
-        later waypoint's altitude up by one when the operator deleted a waypoint from
-        the middle of the plan, so entries are aligned by position instead.
+        The map stores only positions, so altitude and speed have to be carried
+        over from the previous model, and how they are matched decides which
+        edits survive.
+
+        **Same number of points: match by index.** The positions changed but the
+        plan did not, which is what a drag is. Matching by position here is what
+        made a dragged waypoint silently revert to 20 m and 5 m/s: its new
+        coordinates matched nothing, so it fell through to the toolbar defaults
+        — spin boxes the operator cannot even see, because dashboard mode hides
+        that toolbar. Reported 2026-09-04 and again 2026-09-06 as "I set 12 m/s
+        but VGCS says 5 m/s".
+
+        **Count changed: match by position.** An add or a delete renumbers the
+        rows, and matching by index there shifted every later waypoint's
+        altitude up by one when a point was deleted from the middle.
         """
         if not payload:
             return []
@@ -375,23 +386,27 @@ class PlanMissionMixin:
         except Exception:
             return []
 
+        rows = [r for r in rows if isinstance(r, list) and len(r) >= 2]
         previous = list(self._waypoints_model)
+        by_index = len(rows) == len(previous)
+
         cursor = 0
         waypoints: list[Waypoint] = []
-        for row in rows:
-            if not (isinstance(row, list) and len(row) >= 2):
-                continue
+        for idx, row in enumerate(rows):
             lat = float(row[0])
             lon = float(row[1])
             match = None
-            # Scan forward from the cursor: deleted waypoints are skipped over, and a
-            # re-appearing position is never matched backwards onto an earlier row.
-            for probe in range(cursor, len(previous)):
-                prev = previous[probe]
-                if abs(float(prev.lat) - lat) < 1e-9 and abs(float(prev.lon) - lon) < 1e-9:
-                    match = prev
-                    cursor = probe + 1
-                    break
+            if by_index:
+                match = previous[idx]
+            else:
+                # Scan forward from the cursor: deleted waypoints are skipped over, and a
+                # re-appearing position is never matched backwards onto an earlier row.
+                for probe in range(cursor, len(previous)):
+                    prev = previous[probe]
+                    if abs(float(prev.lat) - lat) < 1e-9 and abs(float(prev.lon) - lon) < 1e-9:
+                        match = prev
+                        cursor = probe + 1
+                        break
             if match is not None:
                 alt = float(match.alt_m)
                 spd = float(getattr(match, "speed_mps", 5.0))
