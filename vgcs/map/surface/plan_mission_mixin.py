@@ -119,7 +119,15 @@ class PlanMissionMixin:
                     mar.hide()
             except Exception:
                 pass
-            self._set_map_footer_hud_visible(False)
+            # The compass and telemetry stay up while planning. Requested
+            # 2026-09-07: "while setting waypoint I'm not able to see the
+            # compass and other telemetry data ... we want this compass in
+            # waypoint interface". Planning happens with the aircraft powered
+            # and often already in the air, so heading, altitude and speed are
+            # exactly as relevant here as anywhere else. The panel is masked to
+            # its own two columns, so they show through the rest of the map;
+            # _layout_native_hud keeps the compass clear of the right column.
+            self._set_map_footer_hud_visible(True)
         else:
             try:
                 nm = getattr(self, "_native_map", None)

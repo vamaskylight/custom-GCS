@@ -354,8 +354,10 @@ class VideoPreviewUiMixin:
             return
         if not bool(getattr(self, "_web_ready", False)):
             return
-        if self._plan_flight_layer_obscures_native_camera_ui():
-            return
+        # The PiP used to be suppressed while the plan layer was up. It sits
+        # bottom-left, which the plan panel's mask leaves clear, and the
+        # operator asked for the camera feed while setting waypoints
+        # (2026-09-07: "the left part is the camera feed").
         try:
             self._read_video_settings()
         except Exception:

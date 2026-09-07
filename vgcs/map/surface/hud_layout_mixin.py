@@ -274,15 +274,19 @@ class NativeHudLayoutMixin:
         try:
             plan_on = self._plan_flight_layer_obscures_native_camera_ui()
             if plan_on:
+                # Only what would sit UNDER the plan panel's own two columns is
+                # hidden. The camera rail is top-right, exactly where the 340px
+                # mission panel goes; the minimap and radar are top-left, under
+                # the tool rail. The compass, telemetry strip, video PiP and
+                # zoom control all live along the bottom, which the panel's
+                # mask leaves clear, so they stay (2026-09-07 request).
                 try:
                     self._native_rail_layer.hide()
                     self._native_hud_right.hide()
                     self._btn_camera_rail_show.hide()
-                    self._native_video_preview.hide()
                     self._native_minimap_wrap.hide()
                     self._btn_native_minimap_plus.hide()
                     self._btn_native_minimap_minus.hide()
-                    self._native_map_zoom_ctrl.hide()
                     self._obstacle_radar.hide()
                 except Exception:
                     pass
@@ -336,6 +340,12 @@ class NativeHudLayoutMixin:
             margin_r, margin_b = 10, 2
             cx = max(0, w - margin_r - comp_w)
             cy = max(0, h - margin_b - comp_h)
+            # While planning, slide the compass in front of the mission column
+            # rather than under it. On a tall window the column already stops
+            # well above the compass and nothing moves; on a short one this is
+            # what keeps it readable instead of half-covered.
+            if plan_on:
+                cx = self._compass_x_clear_of_plan_panel(cx, cy, comp_w, comp_h)
             po = self._map_canvas.mapTo(self._panel, QPoint(0, 0))
             self._native_compass.setGeometry(po.x() + cx, po.y() + cy, comp_w, comp_h)
             self._native_telemetry.updateGeometry()
@@ -365,7 +375,9 @@ class NativeHudLayoutMixin:
                 )
             swapped = bool(getattr(self, "_video_swapped", False))
             preview_on = bool(getattr(self, "_video_preview_enabled", False))
-            preview_maps = preview_on and not plan_on
+            # The PiP is bottom-left, clear of the plan panel's columns, and the
+            # operator asked for the camera feed while planning.
+            preview_maps = preview_on
             mz_ctrl = getattr(self, "_native_map_zoom_ctrl", None)
             if mz_ctrl is not None:
                 try:
@@ -380,7 +392,7 @@ class NativeHudLayoutMixin:
                     _px, pip_y, _pw, pip_h = self._mini_video_pip_rect(w, h)
                     ctrl_y = min(ctrl_y, max(8, int(pip_y) - ctrl_h - 8))
                 mz_ctrl.setGeometry(po.x() + ctrl_x, po.y() + ctrl_y, ctrl_w, ctrl_h)
-                if plan_on or not bool(getattr(self, "_web_ready", False)):
+                if not bool(getattr(self, "_web_ready", False)):
                     mz_ctrl.hide()
                 else:
                     mz_ctrl.show()
@@ -673,6 +685,27 @@ class NativeHudLayoutMixin:
             panel.setGeometry(origin.x(), origin.y(), w, h)
         except Exception:
             pass
+
+    def _compass_x_clear_of_plan_panel(self, cx: int, cy: int, cw: int, ch: int) -> int:
+        """Move the compass left of the plan panel's mission column if it would
+        otherwise sit underneath it.
+
+        Only the horizontal position changes: the compass belongs at the bottom
+        of the map, and the operator asked for it on the right.
+        """
+        panel = getattr(self, "_plan_flight_panel", None)
+        right = getattr(panel, "_right_panel", None) if panel is not None else None
+        try:
+            if right is None or not right.isVisible():
+                return cx
+            r = right.geometry()          # plan panel spans the canvas, so these
+            if cy + ch <= r.y() or cy >= r.y() + r.height():
+                return cx                 # vertically clear already
+            if cx + cw <= r.x():
+                return cx                 # horizontally clear already
+            return max(8, r.x() - 12 - cw)
+        except Exception:
+            return cx
 
     def _plan_flight_layer_obscures_native_camera_ui(self) -> bool:
         """True while Plan Flight covers the map — hide PiP / camera rail so planning stays uncluttered."""
