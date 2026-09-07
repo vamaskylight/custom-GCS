@@ -9,7 +9,9 @@ _MAP_ACTION_RAIL_LEFT_PX = 10
 _MAP_ACTION_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _NATIVE_CAM_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _MAP_HUD_MARGIN_PX = 12
-_MAP_ACTION_RAIL_HEIGHT_PX = 54 + 8 + 54
+# Takeoff + Return + the shorter "Go to" button (2026-09-08). The obstacle
+# radar is placed directly below this, so it has to match the real rail.
+_MAP_ACTION_RAIL_HEIGHT_PX = 54 + 8 + 54 + 8 + 34
 _OBSTACLE_PANEL_TOP_PX = _MAP_ACTION_RAIL_TOP_PX + _MAP_ACTION_RAIL_HEIGHT_PX + 8
 _OBSTACLE_PANEL_MAX_H_PX = 360
 

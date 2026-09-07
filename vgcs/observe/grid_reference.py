@@ -85,5 +85,42 @@ def format_grid_reference(
     return format_mgrs_display(mgrs)
 
 
+def mgrs_to_latlon(grid: str | None) -> tuple[float, float] | None:
+    """A grid reference back to WGS84 decimal degrees.
+
+    The inverse of :func:`latlon_to_mgrs`, for typing in a GR that came over the
+    radio and seeing where it is (requested 2026-09-08). Spaces are optional, so
+    both ``43QBC7707662276`` and ``43Q BC 77076 62276`` work.
+    """
+    raw = str(grid or "").strip().replace(" ", "").upper()
+    if not raw or _MGRS is None:
+        return None
+    # Reject anything that is not a grid reference before handing it over: the
+    # library raises on some inputs and silently misreads others.
+    #
+    # Digits are required. "43QBC" is a legal MGRS *square*, but it names a
+    # 100 km area, and the library resolves it to that square's corner - up to
+    # 70 km from wherever the operator meant. A position needs at least one
+    # easting and one northing digit.
+    if not re.match(r"^\d{1,2}[C-HJ-NP-X][A-HJ-NP-Z]{2}\d{2,10}$", raw):
+        return None
+    digits = re.sub(r"^\d{1,2}[C-HJ-NP-X][A-HJ-NP-Z]{2}", "", raw)
+    if len(digits) % 2 != 0:
+        return None            # easting and northing must be the same length
+    try:
+        lat, lon = _MGRS.toLatLon(raw)
+    except Exception:
+        return None
+    try:
+        la, lo = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(la) and math.isfinite(lo)):
+        return None
+    if not (-90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0):
+        return None
+    return la, lo
+
+
 def grid_reference_available() -> bool:
     return _MGRS is not None

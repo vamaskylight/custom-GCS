@@ -1057,6 +1057,53 @@ class MapTilesMixin:
         )
         return True
 
+    def goto_location(self, text: str) -> bool:
+        """Centre the map on a typed position and mark it.
+
+        Requested 2026-09-08: "if I put the lat long then I can see that
+        particular location on the map". Accepts decimal degrees, degrees /
+        minutes / seconds, or a grid reference, because a position reaching
+        this crew over the radio arrives in whichever of those the sender
+        happened to use.
+
+        Marked with the same crosshair a map click leaves, so "where is this
+        grid reference" and "what is the grid reference of that" produce the
+        same thing on screen rather than two different conventions.
+        """
+        from vgcs.map.coordinate_input import parse_location
+
+        found = parse_location(text)
+        if found is None:
+            self._set_status(
+                "Could not read that position — try 20.4101472, 72.8798915 "
+                "or a grid reference like 43QBC7707662276"
+            )
+            return False
+        nm = getattr(self, "_native_map", None)
+        try:
+            if nm is not None:
+                nm.set_center(found.lat, found.lon)
+        except Exception:
+            pass
+        # Reuse the click read-out so the caption, and the way it is cleared by
+        # the next tool, are identical.
+        self._on_map_point_inspected(found.lat, found.lon)
+        return True
+
+    def prompt_goto_location(self) -> None:
+        """Ask for a position, then go there."""
+        from PySide6.QtWidgets import QInputDialog
+
+        from vgcs.map.coordinate_input import describe_formats
+
+        text, ok = QInputDialog.getText(
+            self,
+            "Go to position",
+            "Latitude and longitude, or a grid reference:\n\n" + describe_formats(),
+        )
+        if ok and str(text or "").strip():
+            self.goto_location(text)
+
     def _on_map_point_inspected(self, lat: float, lon: float) -> None:
         """Show coordinates and grid reference for a plain click on the map.
 

@@ -55,6 +55,7 @@ from PySide6.QtGui import (
     QFont,
     QIcon,
     QImage,
+    QKeySequence,
     QPainter,
     QPainterPath,
     QPen,
@@ -62,6 +63,7 @@ from PySide6.QtGui import (
     QPolygonF,
     QColor,
     QRadialGradient,
+    QShortcut,
 )
 from vgcs.map.native_video_overlay import (
     NativeVideoOverlayLayer,
@@ -1395,13 +1397,53 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         _re_lay.addWidget(_re_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
         self._map_action_return_btn.setLayout(_re_lay)
         self._map_action_return_btn.setStyleSheet(_return_ss)
+        # Type a position and go there. Requested 2026-09-08: "if I put the lat
+        # long then I can see that particular location on the map". Unlike the
+        # two above it needs no vehicle, so it is never disabled.
+        _goto_ss = (
+            _map_action_btn_base_ss.replace("mapActionTakeoffBtn", "mapActionGotoBtn")
+            .replace("mapActionReturnBtn", "mapActionGotoBtn")
+            + "QPushButton#mapActionGotoBtn {"
+            "border-top-left-radius:0px; border-bottom-left-radius:8px;"
+            "border-top-right-radius:0px; border-bottom-right-radius:8px;"
+            "}"
+        )
+        self._map_action_goto_btn = QPushButton(self._map_action_rail)
+        self._map_action_goto_btn.setObjectName("mapActionGotoBtn")
+        self._map_action_goto_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._map_action_goto_btn.setFlat(True)
+        self._map_action_goto_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._map_action_goto_btn.setToolTip(
+            "Go to a position you type in: latitude and longitude, or a grid\n"
+            "reference. Also on Ctrl+G, which works while planning too."
+        )
+        _go_lay = QVBoxLayout()
+        _go_lay.setContentsMargins(3, 5, 3, 5)
+        _go_lay.setSpacing(1)
+        _go_lbl = QLabel("Go to", self._map_action_goto_btn)
+        _go_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _go_lbl.setStyleSheet(
+            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
+        )
+        _go_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        _go_lay.addWidget(_go_lbl, 0, Qt.AlignmentFlag.AlignCenter)
+        self._map_action_goto_btn.setLayout(_go_lay)
+        self._map_action_goto_btn.setStyleSheet(_goto_ss)
+
         ar_l.addWidget(self._map_action_takeoff_btn)
         ar_l.addWidget(self._map_action_return_btn)
+        ar_l.addWidget(self._map_action_goto_btn)
         self._map_action_takeoff_btn.setEnabled(False)
         self._map_action_return_btn.setEnabled(False)
         self._map_action_takeoff_btn.clicked.connect(lambda: self.takeoff_requested.emit())
         self._map_action_return_btn.clicked.connect(lambda: self.return_requested.emit())
-        self._map_action_rail.setFixedSize(54, 54 + 8 + 54)
+        self._map_action_goto_btn.clicked.connect(self.prompt_goto_location)
+        # Ctrl+G reaches it from the plan view too, where the action rail is
+        # hidden behind the plan tool rail.
+        self._goto_shortcut = QShortcut(QKeySequence("Ctrl+G"), self)
+        self._goto_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._goto_shortcut.activated.connect(self.prompt_goto_location)
+        self._map_action_rail.setFixedSize(54, 54 + 8 + 54 + 8 + 34)
         self._map_action_rail.show()
         self._map_action_rail.raise_()
 
