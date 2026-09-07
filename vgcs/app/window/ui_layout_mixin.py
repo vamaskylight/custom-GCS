@@ -790,6 +790,8 @@ class MainWindowUiLayoutMixin:
         lay.addWidget(self._btn_tiles_online, 3, 0, 1, 2)
         lay.addWidget(self._btn_tiles_offline, 3, 2, 1, 2)
         lay.addWidget(self._btn_tiles_cache_area, 3, 4, 1, 2)
+        lay.addWidget(self._btn_tiles_export_pack, 3, 6, 1, 2)
+        lay.addWidget(self._btn_tiles_import_pack, 3, 8, 1, 2)
         lay.addWidget(QLabel("Acro"), 4, 0)
         lay.addWidget(self._airmode_check, 4, 1, 1, 2)
         lay.addWidget(self._acro_trainer_combo, 4, 3)

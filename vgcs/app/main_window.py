@@ -262,8 +262,21 @@ class MainWindow(MainWindowMixins, QMainWindow):
         # a new site showed a blank map (field report 2026-08-20).
         self._btn_tiles_cache_area = QPushButton("Cache area offline")
         self._btn_tiles_cache_area.setToolTip(
-            "Download map tiles around the current view for offline use.\n"
-            "Run this while you still have internet, before going to the site."
+            "Download map tiles for the current mission plan, at every zoom level,\n"
+            "into this PC's own cache. Run it while you still have internet."
+        )
+        # For a PC that will never be online: build the pack on any connected
+        # machine, carry the folder across on a USB stick, import it there.
+        # Field constraint 2026-09-07: "Never connect to the internet."
+        self._btn_tiles_export_pack = QPushButton("Export tile pack…")
+        self._btn_tiles_export_pack.setToolTip(
+            "Download the mission's map tiles into a folder you can copy to\n"
+            "another computer (for example on a USB stick)."
+        )
+        self._btn_tiles_import_pack = QPushButton("Import tile pack…")
+        self._btn_tiles_import_pack.setToolTip(
+            "Load a tile pack made on another computer, so the map works here\n"
+            "with no internet at all."
         )
         self._last_params: dict[str, float] = {}
 
@@ -407,6 +420,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._btn_tiles_online.clicked.connect(self._on_tiles_online)
         self._btn_tiles_offline.clicked.connect(self._on_tiles_offline)
         self._btn_tiles_cache_area.clicked.connect(self._on_tiles_cache_area)
+        self._btn_tiles_export_pack.clicked.connect(self._on_tiles_export_pack)
+        self._btn_tiles_import_pack.clicked.connect(self._on_tiles_import_pack)
         self._btn_apply_acro.clicked.connect(self._on_apply_acro_options)
         self._btn_apply_simple.clicked.connect(self._on_apply_simple_options)
         self._timeout_spin.valueChanged.connect(self._on_timeout_changed)

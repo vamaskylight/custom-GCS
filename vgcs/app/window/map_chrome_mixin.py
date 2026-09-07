@@ -260,14 +260,74 @@ class MainWindowMapChromeMixin:
         self._append_log("Map tiles: online source selected")
 
     def _on_tiles_cache_area(self) -> None:
-        fn = getattr(self._map_widget, "cache_current_area_for_offline", None)
-        if not callable(fn):
+        """Stock this PC's own cache with the plan's tiles, every zoom level."""
+        plan = self._confirmed_tile_pack_plan("Cache area offline")
+        if plan is None:
             return
-        fn()
-        self._append_log(
-            "Map tiles: caching the current area for offline use "
-            "(keep internet until it finishes)"
+        fn = getattr(self._map_widget, "cache_current_area_for_offline", None)
+        if callable(fn):
+            fn()
+            self._append_log(
+                f"Map tiles: caching {plan.count} tiles for the current plan "
+                "(keep internet until it finishes)"
+            )
+
+    def _confirmed_tile_pack_plan(self, title: str):
+        """Show what a pack would fetch and ask before fetching it.
+
+        Thousands of HTTP requests are not something to fire on a misclick,
+        and the count is the operator's only warning that the plan is far
+        larger than they thought.
+        """
+        planner = getattr(self._map_widget, "plan_offline_tile_pack", None)
+        describe = getattr(self._map_widget, "describe_tile_pack_plan", None)
+        if not callable(planner) or not callable(describe):
+            return None
+        try:
+            plan = planner()
+        except Exception as e:
+            QMessageBox.warning(self, title, f"Could not work out the area to cover:\n{e}")
+            return None
+        if plan.count == 0:
+            QMessageBox.information(self, title, "Nothing to download for this area.")
+            return None
+        basis = "the current mission plan" if getattr(plan, "bbox", None) else "the map view"
+        answer = QMessageBox.question(
+            self,
+            title,
+            f"Download {describe(plan)} covering {basis}?\n\n"
+            "Keep the internet connection until it finishes.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
         )
+        return plan if answer == QMessageBox.StandardButton.Yes else None
+
+    def _on_tiles_export_pack(self) -> None:
+        """Download a tile pack into a folder, to carry to a PC that is never
+        online. See vgcs/map/tile_pack.py."""
+        plan = self._confirmed_tile_pack_plan("Export tile pack")
+        if plan is None:
+            return
+        dest = QFileDialog.getExistingDirectory(
+            self, "Folder to save the tile pack in (use a USB stick)", ""
+        )
+        if not dest:
+            return
+        fn = getattr(self._map_widget, "start_offline_tile_pack", None)
+        if callable(fn) and fn(dest, plan):
+            self._append_log(f"Map tiles: exporting a {plan.count}-tile pack to {dest}")
+
+    def _on_tiles_import_pack(self) -> None:
+        """Bring a tile pack made on another PC into this one's cache."""
+        src = QFileDialog.getExistingDirectory(
+            self, "Select the tile pack folder (contains pack.json and z/x/y.png)", ""
+        )
+        if not src:
+            return
+        fn = getattr(self._map_widget, "import_offline_tile_pack", None)
+        if callable(fn):
+            fn(src)
+            self._append_log(f"Map tiles: imported tile pack from {src}")
 
     def _on_tiles_offline(self) -> None:
         root = QFileDialog.getExistingDirectory(

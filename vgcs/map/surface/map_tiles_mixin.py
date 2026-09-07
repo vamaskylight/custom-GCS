@@ -849,37 +849,190 @@ class MapTilesMixin:
         self._run_js(f"setTileSource({json.dumps(tmpl)}, 'Tiles © Esri', 19);")
         self._set_status("Satellite imagery active (Esri World Imagery)")
 
-    def cache_current_area_for_offline(self, *, radius_km: float = 3.0) -> None:
-        """Download the surrounding area into the on-disk tile cache.
+    # ------------------------------------------------------------------ #
+    # Offline tile packs. See vgcs/map/tile_pack.py for why these exist.
+    # ------------------------------------------------------------------ #
 
-        The point is to run this on wifi BEFORE driving to a site. Tiles the
-        operator never looked at online simply do not exist offline, which is
-        why a new site shows a blank map.
+    _ESRI_IMAGERY_TEMPLATE = (
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+    )
+
+    def _pack_source_template(self) -> str:
+        """The online source a pack should be fetched from.
+
+        A pack can only be downloaded from an HTTP source. If the map is on an
+        offline folder right now, the satellite source is what that folder
+        was made from, so use it.
         """
         nm = getattr(self, "_native_map", None)
-        if nm is None:
-            self._set_status("Offline cache: map not ready")
-            return
-        fn = getattr(nm, "cache_area_for_offline", None)
-        if not callable(fn):
-            return
+        tmpl = str(getattr(nm, "_tile_template", "") or "")
+        if tmpl.startswith("http://") or tmpl.startswith("https://"):
+            return tmpl
+        return self._ESRI_IMAGERY_TEMPLATE
+
+    def plan_offline_tile_pack(self, *, radius_km: float = 3.0):
+        """Decide what a pack should cover: the mission if there is one, else
+        a square around the current view.
+
+        A plan is the honest basis. "Around the current view" was how the old
+        cache button worked, and an operator who planned a 10 km sortie then
+        pressed it cached the launch field and nothing along the route.
+        """
+        from vgcs.map.tile_pack import plan_pack_for_area, plan_pack_for_waypoints
+
+        template = self._pack_source_template()
+        points: list[tuple[float, float]] = []
         try:
-            queued, skipped = fn(radius_km=float(radius_km))
+            for wp in self._plan_waypoints_snapshot():
+                points.append((float(wp.lat), float(wp.lon)))
         except Exception:
-            self._set_status("Offline cache failed — check the tile source")
+            points = []
+        try:
+            home = self.get_vehicle_position()
+            if home is not None:
+                points.append((float(home[0]), float(home[1])))
+        except Exception:
+            pass
+        plan = plan_pack_for_waypoints(points, template=template) if points else None
+        if plan is not None:
+            return plan
+        nm = getattr(self, "_native_map", None)
+        lat = float(getattr(nm, "_center_lat", 0.0) or 0.0)
+        lon = float(getattr(nm, "_center_lon", 0.0) or 0.0)
+        return plan_pack_for_area(lat, lon, radius_km=radius_km, template=template)
+
+    def describe_tile_pack_plan(self, plan) -> str:
+        zs = f"zoom {plan.zooms[0]}-{plan.zooms[-1]}" if plan.zooms else "no zoom levels"
+        text = f"{plan.count} tiles, about {plan.approx_mb:.0f} MB, {zs}"
+        if plan.over_cap:
+            text += f" ({plan.over_cap} more were beyond the limit and left out)"
+        return text
+
+    def start_offline_tile_pack(self, dest, plan=None) -> bool:
+        """Download a pack into ``dest`` in the background. False if busy."""
+        from PySide6.QtCore import QThreadPool
+
+        from vgcs.map.surface.tile_pack_task import TilePackBridge, TilePackTask
+        import threading
+
+        if getattr(self, "_tile_pack_cancel", None) is not None:
+            self._set_status("A tile pack is already downloading")
+            return False
+        if plan is None:
+            plan = self.plan_offline_tile_pack()
+        if plan.count == 0:
+            self._set_status("Nothing to download for this area")
+            return False
+
+        bridge = TilePackBridge(self)
+        cancel = threading.Event()
+        self._tile_pack_bridge = bridge
+        self._tile_pack_cancel = cancel
+        self._tile_pack_dest = str(dest)
+        bridge.progress.connect(self._on_tile_pack_progress)
+        bridge.finished.connect(self._on_tile_pack_finished)
+        QThreadPool.globalInstance().start(TilePackTask(plan, Path(dest), bridge, cancel))
+        self._set_status(
+            f"Downloading tile pack: {self.describe_tile_pack_plan(plan)} — "
+            "keep the internet connection until it finishes"
+        )
+        return True
+
+    def cancel_offline_tile_pack(self) -> None:
+        ev = getattr(self, "_tile_pack_cancel", None)
+        if ev is not None:
+            ev.set()
+
+    def _on_tile_pack_progress(self, done: int, total: int, stored: int, failed: int) -> None:
+        pct = int(100.0 * done / total) if total else 100
+        msg = f"Tile pack {pct}% — {done} of {total} checked, {stored} stored"
+        if failed:
+            msg += f", {failed} failed"
+        self._set_status(msg)
+
+    def _on_tile_pack_finished(self, result, dest: str) -> None:
+        self._tile_pack_cancel = None
+        self._tile_pack_bridge = None
+        if result.cancelled:
+            msg = f"Tile pack cancelled: {result.stored} tiles stored in {dest}"
+        else:
+            msg = f"Tile pack done: {result.stored} new, {result.skipped_existing} already there"
+            if result.placeholders:
+                msg += f", {result.placeholders} had no imagery"
+            if result.failed:
+                msg += f", {result.failed} FAILED — run it again to fill the gaps"
+            msg += f" — {dest}"
+        self._set_status(msg)
+        # The pack may have landed in the live cache: show it now, not on the
+        # next pan.
+        nm = getattr(self, "_native_map", None)
+        try:
+            if nm is not None:
+                nm._tiles_inflight.clear()
+                nm._tile_retry_after.clear()
+                nm._warm_disk_tiles_for_viewport()
+                nm.update()
+        except Exception:
+            pass
+        fn = getattr(self, "tile_pack_finished", None)
+        if fn is not None:
+            try:
+                fn.emit(msg)
+            except Exception:
+                pass
+
+    def cache_current_area_for_offline(self, *, radius_km: float = 3.0) -> None:
+        """Stock the on-disk cache with the current plan's tiles, all zooms.
+
+        This used to hand the job to the interactive tile loader, which drops
+        every request not at the current view zoom - so only ONE zoom level was
+        ever cached, and zooming in offline went blurry, then black. It now
+        downloads a pack straight into the cache folder the map already reads.
+        """
+        from vgcs.map import native_tile_map as _ntm
+
+        plan = self.plan_offline_tile_pack(radius_km=radius_km)
+        dest = _ntm._TILE_CACHE_ROOT / plan.source_id
+        self.start_offline_tile_pack(dest, plan)
+
+    def import_offline_tile_pack(self, src) -> None:
+        """Bring a pack made elsewhere into this machine's cache.
+
+        For the client that will never be online: download on any PC, carry the
+        folder over, import here. No mode switch - the map keeps its normal
+        source and simply finds the tiles on disk.
+        """
+        from vgcs.map.tile_pack import import_tile_pack
+
+        nm = getattr(self, "_native_map", None)
+        fallback = str(getattr(nm, "_tile_source_id", "") or "")
+        try:
+            result, source_id = import_tile_pack(Path(src), fallback_source_id=fallback)
+        except Exception as e:
+            self._set_status(f"Tile pack import failed: {e}")
             return
-        if queued == 0 and skipped == 0:
-            self._set_status(
-                "Offline cache: this area is already stored (or an offline "
-                "folder is already selected)"
-            )
+        if result.total_present == 0:
+            self._set_status("Tile pack import: no z/x/y.png tiles found in that folder")
             return
         msg = (
-            f"Caching ~{queued} map tiles for {radius_km:.0f} km around here — "
-            "keep the internet connection until it settles"
+            f"Tile pack imported: {result.stored} new tiles, "
+            f"{result.skipped_existing} already present"
         )
-        if skipped:
-            msg += f" ({skipped} beyond the limit were skipped — zoom out and repeat for a wider area)"
+        if result.failed:
+            msg += f", {result.failed} failed"
+        # Whatever source the pack was for, that is what it should be showing
+        # through. If the map is on something else, switch so the tiles are
+        # visible immediately rather than after the operator works out why not.
+        try:
+            if nm is not None and str(getattr(nm, "_tile_source_id", "")) != source_id:
+                self.activate_satellite_tiles()
+            if nm is not None:
+                nm._tiles_inflight.clear()
+                nm._tile_retry_after.clear()
+                nm._warm_disk_tiles_for_viewport()
+                nm.update()
+        except Exception:
+            pass
         self._set_status(msg)
 
     def warn_if_no_offline_tiles_here(self) -> bool:
