@@ -23,6 +23,11 @@ from vgcs.map.surface.settings_keys import (
 )
 from vgcs.map.surface.tile_probe import _TileProbeBridge, _TileProbeTask
 
+# Going to a position zooms in at least this far. Below it the crosshair is a
+# few pixels on a view covering tens of kilometres, which is how a position the
+# map had genuinely moved to still read as "I cannot see it".
+_GOTO_MIN_ZOOM = 16.0
+
 
 class MapTilesMixin:
     """Extracted from MapWidget — uses host widget state via self."""
@@ -1080,30 +1085,66 @@ class MapTilesMixin:
                 "or a grid reference like 43QBC7707662276"
             )
             return False
+        self.show_location_on_map(found.lat, found.lon)
+        return True
+
+    def show_location_on_map(self, lat: float, lon: float) -> None:
+        """Put a position on screen and leave it there.
+
+        Reported 2026-09-08: "I add the latlong but I'm not able to see the
+        latlong after click on ok button". Centring alone was not enough:
+
+        - Following the aircraft is switched on for you every time the link
+          connects, and it re-centres the map on the aircraft on the next
+          position message. In flight that is a quarter of a second, so the
+          typed position appeared and was gone. Asking to go somewhere is a
+          statement that you want to look somewhere else, so it stops following
+          until you turn following back on.
+        - A reconnect re-centres on the aircraft as well, and their link had
+          just cleared a GCS failsafe.
+        - The zoom was left alone, so on a wide view the marker was a few
+          pixels of crosshair somewhere off to the side.
+        """
+        try:
+            self.set_video_follow_enabled(False)
+        except Exception:
+            pass
+        # Cleared for the same reason: the next position message must not undo
+        # what the operator just asked for.
+        try:
+            win = self.window()
+            if getattr(win, "_auto_center_pending", False):
+                win._auto_center_pending = False
+        except Exception:
+            pass
         nm = getattr(self, "_native_map", None)
         try:
             if nm is not None:
-                nm.set_center(found.lat, found.lon)
+                nm.set_center(float(lat), float(lon))
+                # Close enough to see what is there, and never zooming out from
+                # a closer view the operator had already set up.
+                if float(nm.zoom_level()) < _GOTO_MIN_ZOOM:
+                    nm.set_zoom(_GOTO_MIN_ZOOM)
         except Exception:
             pass
         # Reuse the click read-out so the caption, and the way it is cleared by
         # the next tool, are identical.
-        self._on_map_point_inspected(found.lat, found.lon)
-        return True
+        self._on_map_point_inspected(float(lat), float(lon))
 
     def prompt_goto_location(self) -> None:
-        """Ask for a position, then go there."""
-        from PySide6.QtWidgets import QInputDialog
+        """Ask for a position, then go there or make a waypoint of it.
 
-        from vgcs.map.coordinate_input import describe_formats
+        Requested 2026-09-08: "we want to add the latlong then we can see the
+        latlong and I should select that latlong in the waypoint 1 or 2 etc" —
+        so the same typed position that the map jumps to can be dropped into
+        the mission without hunting for the spot again by hand.
+        """
+        from vgcs.map.goto_dialog import GotoLocationDialog
 
-        text, ok = QInputDialog.getText(
-            self,
-            "Go to position",
-            "Latitude and longitude, or a grid reference:\n\n" + describe_formats(),
-        )
-        if ok and str(text or "").strip():
-            self.goto_location(text)
+        dlg = GotoLocationDialog(self)
+        dlg.go_requested.connect(self.goto_location)
+        dlg.waypoint_requested.connect(self.add_waypoint_from_text)
+        dlg.exec()
 
     def _on_map_point_inspected(self, lat: float, lon: float) -> None:
         """Show coordinates and grid reference for a plain click on the map.

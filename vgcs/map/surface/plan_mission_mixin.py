@@ -643,6 +643,47 @@ class PlanMissionMixin:
             self._wp_speed.setValue(float(getattr(self._waypoints_model[index], "speed_mps", 5.0)))
         self.plan_waypoint_selection_changed.emit(self.selected_waypoint_index())
 
+    def add_waypoint_from_text(self, text: str) -> bool:
+        """Append a waypoint at a typed position and select it.
+
+        Requested 2026-09-08: "we want to add the latlong then we can see the
+        latlong and I should select that latlong in the waypoint 1 or 2 etc."
+        Placing a point by eye on the map cannot hit a position given to seven
+        decimal places, and a grid reference read off the radio has nowhere to
+        go at all without this.
+        """
+        from vgcs.map.coordinate_input import parse_location
+
+        found = parse_location(text)
+        if found is None:
+            self._set_status(
+                "Could not read that position — try 20.4101472, 72.8798915 "
+                "or a grid reference like 43QBC7707662276"
+            )
+            return False
+        self.add_waypoint_at(found.lat, found.lon)
+        return True
+
+    def add_waypoint_at(self, lat: float, lon: float) -> int:
+        """Append a waypoint at an exact position; returns its index."""
+        alt = 20.0
+        speed = 5.0
+        try:
+            alt = float(self._default_alt.value())
+            speed = float(self._default_speed.value())
+        except Exception:
+            pass
+        plan = list(self._plan_waypoints_snapshot())
+        plan.append(Waypoint(lat=float(lat), lon=float(lon), alt_m=alt, speed_mps=speed))
+        self.set_waypoints(plan)
+        index = len(plan) - 1
+        # Shown and selected, so the new point can be given its own altitude and
+        # speed straight away and the plan bar describes it.
+        self.show_location_on_map(float(lat), float(lon))
+        self.select_waypoint_index(index)
+        self._set_status(f"Added WP {index + 1} at {lat:.7f}, {lon:.7f}")
+        return index
+
     def selected_waypoint_index(self) -> int:
         """Index of the waypoint the plan bar describes, or -1 when there is none."""
         try:
