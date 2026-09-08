@@ -508,13 +508,17 @@ class PlanFlightPanel(QWidget):
         h.addWidget(self._bar_upload, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._pf_alt_diff = self._add_metric_group(
-            h, "Selected Waypoint", [("Alt diff:", "0.0 m"), ("Gradient:", "-.-")]
+            h, "Selected Waypoint", [("Alt diff:", "-.- m"), ("Gradient:", "-.-")]
         )
+        # "Bearing" is the way to the selected point from where the aircraft is
+        # now. It used to read "Heading" and carried the aircraft's own compass
+        # heading, which the compass rose already shows: two labels, one number,
+        # and nothing about the waypoint. Field report 2026-09-08.
         self._pf_azimuth = self._add_metric_group(
-            h, "", [("Azimuth:", "0"), ("Heading:", "nan")]
+            h, "", [("Azimuth:", "---"), ("Bearing:", "---")]
         )
         self._pf_dist = self._add_metric_group(
-            h, "", [("Dist prev WP:", "0.0 m"), ("", "")]
+            h, "", [("Dist prev WP:", "-.- m"), ("", "")]
         )
         # Breathing room: selected-WP metrics vs mission totals.
         h.addSpacing(32)
@@ -1309,12 +1313,12 @@ class PlanFlightPanel(QWidget):
         if not isinstance(payload, dict):
             return
         p = {str(k): str(v) for k, v in payload.items()}
-        self._set_metric(self._pf_alt_diff, "alt diff", p.get("altDiffM", p.get("altDiffFt", "0.0 m")))
+        self._set_metric(self._pf_alt_diff, "alt diff", p.get("altDiffM", p.get("altDiffFt", "-.- m")))
         self._set_metric(self._pf_alt_diff, "gradient", p.get("gradient", "-.-"))
-        self._set_metric(self._pf_azimuth, "azimuth", p.get("azimuth", "0"))
-        self._set_metric(self._pf_azimuth, "heading", p.get("heading", "nan"))
+        self._set_metric(self._pf_azimuth, "azimuth", p.get("azimuth", "---"))
+        self._set_metric(self._pf_azimuth, "bearing", p.get("bearing", "---"))
         self._set_metric(
-            self._pf_dist, "dist prev wp", p.get("distPrevWpM", p.get("distPrevWpFt", "0.0 m"))
+            self._pf_dist, "dist prev wp", p.get("distPrevWpM", p.get("distPrevWpFt", "-.- m"))
         )
         self._set_metric(
             self._pf_mission, "distance", p.get("missionDistanceM", p.get("missionDistanceFt", "0 m"))

@@ -155,7 +155,7 @@ class PlanMissionMixin:
         alt_diff_m: str,
         gradient: str,
         azimuth: str,
-        heading: str,
+        bearing: str,
         dist_prev_wp_m: str,
         mission_distance_m: str,
         mission_time: str,
@@ -165,7 +165,7 @@ class PlanMissionMixin:
             "altDiffM": alt_diff_m,
             "gradient": gradient,
             "azimuth": azimuth,
-            "heading": heading,
+            "bearing": bearing,
             "distPrevWpM": dist_prev_wp_m,
             "missionDistanceM": mission_distance_m,
             "missionTime": mission_time,
@@ -641,6 +641,28 @@ class PlanMissionMixin:
         if 0 <= index < len(self._waypoints_model):
             self._wp_alt.setValue(float(self._waypoints_model[index].alt_m))
             self._wp_speed.setValue(float(getattr(self._waypoints_model[index], "speed_mps", 5.0)))
+        self.plan_waypoint_selection_changed.emit(self.selected_waypoint_index())
+
+    def selected_waypoint_index(self) -> int:
+        """Index of the waypoint the plan bar describes, or -1 when there is none."""
+        try:
+            idx = int(self._wp_selector.currentIndex())
+        except Exception:
+            return -1
+        return idx if 0 <= idx < len(self._waypoints_model) else -1
+
+    def select_waypoint_index(self, index: int) -> None:
+        """Select a waypoint from outside the panel (e.g. a click on the map)."""
+        idx = int(index)
+        if not (0 <= idx < len(self._waypoints_model)):
+            return
+        self._wp_selector.blockSignals(True)
+        self._wp_selector.setCurrentIndex(idx)
+        self._wp_selector.blockSignals(False)
+        # Announced here rather than left to currentIndexChanged: that signal
+        # stays quiet when the same point is picked twice, and the plan bar has
+        # to be refreshed for that too.
+        self._on_wp_selected(idx)
 
     def _apply_altitude_to_selected(self) -> None:
         idx = self._wp_selector.currentIndex()

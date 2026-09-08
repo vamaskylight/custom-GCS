@@ -603,6 +603,7 @@ class MapTilesMixin:
         self._native_map.user_waypoints_changed.connect(self._on_native_user_waypoints_changed)
         self._native_map.observation_map_click.connect(self._on_native_observation_map_click)
         self._native_map.map_point_inspected.connect(self._on_map_point_inspected)
+        self._native_map.waypoint_picked.connect(self.select_waypoint_index)
         self._native_map.zoom_changed.connect(self._sync_native_map_zoom_label)
         try:
             self._sync_native_map_zoom_label(float(getattr(self._native_map, "_zoom", 16.0)))

@@ -469,6 +469,7 @@ class NativeTileMapView(QWidget):
     # of that?". Requested 2026-09-01: "when I click on the map any point or
     # object then latlong or GR should be visible".
     map_point_inspected = Signal(float, float)
+    waypoint_picked = Signal(int)  # left-click on an existing waypoint, no drag
     zoom_changed = Signal(float)
 
     def __init__(self, parent=None) -> None:
@@ -2051,6 +2052,7 @@ class NativeTileMapView(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             if self._wp_drag_index is not None:
                 moved = self._wp_dragging
+                picked = int(self._wp_drag_index)
                 self._wp_drag_index = None
                 self._wp_drag_press_screen = None
                 self._wp_dragging = False
@@ -2067,6 +2069,11 @@ class NativeTileMapView(QWidget):
                     self._active_wp_index = None
                     self.update()
                     self.user_waypoints_changed.emit()
+                else:
+                    # A press that never moved is a pick, not a move: the point
+                    # the operator touched becomes the selected one, so the
+                    # plan bar describes the waypoint under their finger.
+                    self.waypoint_picked.emit(picked)
                 event.accept()
                 return
             if (

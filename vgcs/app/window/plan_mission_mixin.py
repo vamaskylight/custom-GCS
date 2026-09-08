@@ -639,16 +639,48 @@ class MainWindowPlanMissionMixin:
         except Exception:
             return MissionTiming()
 
+    def _on_plan_waypoint_selection_changed(self, index: int) -> None:
+        self._refresh_plan_flight_metrics()
+
+    def _selected_waypoint_metrics(self, model: list):
+        """Plan-bar figures for the selected waypoint, from real positions.
+
+        These four used to be filled with the aircraft's own compass heading
+        (twice) and a hardcoded zero distance, under a heading that says
+        "Selected Waypoint" — so selecting WP 1 or WP 2 changed nothing on
+        screen. Field report 2026-09-08.
+        """
+        from vgcs.mission.waypoint_metrics import WaypointMetrics, selected_waypoint_metrics
+
+        try:
+            index = int(self._map_widget.selected_waypoint_index())
+        except Exception:
+            return WaypointMetrics()
+        try:
+            vehicle_pos = self._map_widget.get_vehicle_position()
+        except Exception:
+            vehicle_pos = None
+        try:
+            vehicle_alt_m = float(self._map_rel_alt_m)
+        except (TypeError, ValueError):
+            vehicle_alt_m = None
+        try:
+            return selected_waypoint_metrics(
+                model, index, vehicle_pos=vehicle_pos, vehicle_alt_m=vehicle_alt_m
+            )
+        except Exception:
+            return WaypointMetrics()
+
     def _refresh_plan_flight_metrics(self) -> None:
         # M2 plan bar live values (best-effort from real telemetry).
-        heading_val = float(getattr(self, "_heading", 0.0) or 0.0)
-        alt_diff_m = f"{self._map_rel_alt_m:.1f} m"
-        gradient = "-.-"
-        azimuth = f"{int(round(heading_val))}"
-        heading = f"{int(round(heading_val))}"
-        dist_prev_wp_m = "0.0 m"
-
         model = list(getattr(self._map_widget, "_waypoints_model", []))
+        selected = self._selected_waypoint_metrics(model)
+        alt_diff_m = selected.alt_diff_m
+        gradient = selected.gradient
+        azimuth = selected.azimuth
+        bearing = selected.bearing
+        dist_prev_wp_m = selected.dist_prev_wp_m
+
         timing = self._estimate_plan_timing(model)
         # Total, not outbound. The old figure covered waypoint-to-waypoint travel
         # only — no leg out to WP 1 and no way home — so a 10 km plan read 15
@@ -671,7 +703,7 @@ class MainWindowPlanMissionMixin:
             alt_diff_m=alt_diff_m,
             gradient=gradient,
             azimuth=azimuth,
-            heading=heading,
+            bearing=bearing,
             dist_prev_wp_m=dist_prev_wp_m,
             mission_distance_m=mission_distance_text,
             mission_time=mission_time,

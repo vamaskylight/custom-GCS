@@ -805,6 +805,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     mission_pause_requested = Signal()
     mission_resume_requested = Signal()
     plan_mission_panel_changed = Signal(object)
+    plan_waypoint_selection_changed = Signal(int)  # selected WP index, -1 for none
     video_follow_enabled_changed = Signal(bool)
 
     def __init__(self, parent=None, *, video_pipeline: VideoPipeline | None = None) -> None:

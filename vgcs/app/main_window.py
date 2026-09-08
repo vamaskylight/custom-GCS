@@ -440,6 +440,12 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._map_widget.waypoints_changed.connect(self._sync_plan_flight_chrome)
         self._map_widget.map_page_ready.connect(self._on_map_page_ready)
         self._map_widget.plan_mission_panel_changed.connect(self._on_plan_mission_panel_changed)
+        # Redraw the plan bar the moment a different point is picked. Waiting for
+        # the next telemetry tick would leave the previous waypoint's bearing on
+        # screen, and with no link there is no next tick at all.
+        self._map_widget.plan_waypoint_selection_changed.connect(
+            self._on_plan_waypoint_selection_changed
+        )
         self._map_widget.toggle_3d_requested.connect(self._on_map_toggle_3d_requested)
         self._map_widget.map_3d_mode_changed.connect(self._on_map_3d_mode_changed)
         self._map_widget.mission_start_requested.connect(self._on_map_mission_start_requested)
