@@ -195,12 +195,13 @@ class VideoPipelineMixin:
             self._video_preview_enabled = True
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
-            if not self._plan_flight_layer_obscures_native_camera_ui():
-                if not bool(getattr(self, "_video_swap_user_map_main", False)):
-                    self._video_swapped = False
-                self._native_video_preview.show()
-                self._layout_native_video_preview()
-                self._stack_native_overlays_above_tile_map()
+            # As in _companion_wire_preview_ui: the feed appears while planning
+            # too, as the bottom-left PiP.
+            if not bool(getattr(self, "_video_swap_user_map_main", False)):
+                self._video_swapped = False
+            self._native_video_preview.show()
+            self._layout_native_video_preview()
+            self._stack_native_overlays_above_tile_map()
         except Exception:
             pass
         if self._should_defer_companion_rtsp_decode():

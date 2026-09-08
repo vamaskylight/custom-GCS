@@ -419,12 +419,11 @@ class VideoPreviewUiMixin:
                 return
             if not bool(getattr(self, "_video_preview_enabled", False)):
                 return
-            if self._plan_flight_layer_obscures_native_camera_ui():
-                try:
-                    self._native_video_preview.hide()
-                except Exception:
-                    pass
-                return
+            # No plan-layer check here any more. This runs on every layout and
+            # resize, so it was the one that kept re-hiding the PiP during
+            # planning however it was shown (2026-09-08: "camera feed not
+            # getting while waypoint navigation"). The PiP is bottom-left,
+            # which the plan panel's mask leaves clear.
             host = self._map_canvas
             if host is None:
                 return
@@ -506,8 +505,10 @@ class VideoPreviewUiMixin:
         """Video Pro (fullscreen video): keep camera rail, compass, telemetry, and action buttons visible."""
         if not bool(getattr(self, "_web_ready", False)):
             return
-        if self._plan_flight_layer_obscures_native_camera_ui():
-            return
+        planning = self._plan_flight_layer_obscures_native_camera_ui()
+        # The bottom HUD is wanted in both views. What follows it - camera
+        # rail, radar, action rail - sits under the plan panel's columns, so
+        # only that half is skipped while planning.
         try:
             self._native_compass.show()
             self._native_telemetry.show()
@@ -516,18 +517,19 @@ class VideoPreviewUiMixin:
                 mz.show()
         except Exception:
             pass
-        if bool(getattr(self, "_last_link_connected", False)):
-            try:
-                self._sync_camera_rail_panel_visibility()
-                self._obstacle_radar.show()
-            except Exception:
-                pass
-        mar = getattr(self, "_map_action_rail", None)
-        if mar is not None:
-            try:
-                mar.show()
-            except Exception:
-                pass
+        if not planning:
+            if bool(getattr(self, "_last_link_connected", False)):
+                try:
+                    self._sync_camera_rail_panel_visibility()
+                    self._obstacle_radar.show()
+                except Exception:
+                    pass
+            mar = getattr(self, "_map_action_rail", None)
+            if mar is not None:
+                try:
+                    mar.show()
+                except Exception:
+                    pass
         self._raise_flight_hud_above_video()
 
     def _raise_flight_hud_above_video(self) -> None:
@@ -1689,12 +1691,14 @@ class VideoPreviewUiMixin:
             self._video_preview_enabled = True
             self._run_js("if (window.setNativeVideoOverlayMode) setNativeVideoOverlayMode(true);")
             self._run_js("if (window.setNativeHudMode) setNativeHudMode(true);")
-            if not self._plan_flight_layer_obscures_native_camera_ui():
-                if not bool(getattr(self, "_video_swap_user_map_main", False)):
-                    self._video_swapped = False
-                self._native_video_preview.show()
-                self._layout_native_video_preview()
-                self._stack_native_overlays_above_tile_map()
+            # Shown while planning too. The map stays the main surface there,
+            # so the feed comes up as the bottom-left PiP rather than
+            # fullscreen, which is what was asked for.
+            if not bool(getattr(self, "_video_swap_user_map_main", False)):
+                self._video_swapped = False
+            self._native_video_preview.show()
+            self._layout_native_video_preview()
+            self._stack_native_overlays_above_tile_map()
         except Exception:
             pass
         try:
