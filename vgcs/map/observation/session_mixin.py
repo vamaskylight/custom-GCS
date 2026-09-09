@@ -177,18 +177,21 @@ class ObservationSessionMixin:
         dooaf_role = self._current_observe_dooaf_role()
         if kind in ("video_mark", "map_mark") and not self._warn_gps_unavailable_for_pick():
             return
-        if (
-            dooaf_role == DOOAF_ROLE_IMPACT
-            and kind in ("video_mark", "map_mark")
-            and latest_mark(self._observations, DOOAF_ROLE_IMPACT) is not None
-        ):
-            QMessageBox.warning(
-                self,
-                "DOOAF",
-                "Only one Impact Target is allowed per session.\n\n"
-                "Press Reset to clear the previous mark and try again.",
-            )
-            return
+        # A second fall of shot used to be refused outright: "Only one Impact
+        # Target is allowed per session. Press Reset to clear the previous mark
+        # and try again." That made the multi-round averaging built on
+        # 2026-09-01 unreachable, for a question the client had asked directly
+        # ("if we did the 2 DOOAF test then how can we calculate the average"),
+        # and it made adjusting round after round in one shoot impossible.
+        #
+        # Rounds accumulate now. The correction still comes off the newest
+        # round, which is how fire is adjusted; the earlier ones give the bias
+        # and dispersion across the shoot. The round number goes in the status
+        # line so a stray second click reads as a new round rather than
+        # silently rewriting the correction.
+        # The round number is appended in _log_observation_after_geo, once this
+        # row is actually in the session, because that is where the status line
+        # is assembled.
         row: dict[str, object] = {
             "timestamp_utc": ts,
             "kind": str(kind),
@@ -590,6 +593,12 @@ class ObservationSessionMixin:
                 msg += f" — {warn}"
                 if dooaf_role == DOOAF_ROLE_IMPACT and row.get("target_lat") is None:
                     msg += " — no HIT on map (click ground in lower video, not sky/horizon)"
+        if dooaf_role == DOOAF_ROLE_IMPACT and kind in ("video_mark", "map_mark"):
+            # Only from the second onwards: saying "round 1" on a single-round
+            # shoot would imply more are expected.
+            rounds = self._impact_round_count()
+            if rounds > 1:
+                msg += f" — round {rounds}"
         self._set_status(msg)
         self._refresh_observation_measure_overlays()
         self._refresh_dooaf_map_overlay()
@@ -604,6 +613,18 @@ class ObservationSessionMixin:
                     nm.add_observation_map_marker(float(map_lat), float(map_lon))
             except Exception:
                 pass
+
+    def _impact_round_count(self) -> int:
+        """How many rounds have been marked in this session so far."""
+        n = 0
+        for row in getattr(self, "_observations", None) or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
+                continue
+            if str(row.get("kind") or "") in ("video_mark", "map_mark"):
+                n += 1
+        return n
 
     def _schedule_video_marks_overlay_refresh(self) -> None:
         """Coalesce overlay repaints when the operator places several Target marks quickly."""
