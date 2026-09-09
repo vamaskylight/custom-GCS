@@ -267,7 +267,8 @@ class LrfVideoLockMixin:
     def _format_lrf_geo_label(self, lat: float, lon: float) -> str:
         return f"{float(lat):.6f}, {float(lon):.6f}"
 
-    def _c13_lrf_geo_fov(self) -> tuple[float, float]:
+    def _camera_wide_fov_deg(self) -> tuple[float, float]:
+        """The lens at 1x, before any zoom is applied."""
         try:
             from vgcs.skydroid.adapter import (
                 _LRF_FOV_H_DEG as hfov,
@@ -277,6 +278,48 @@ class LrfVideoLockMixin:
             return float(hfov), float(vfov)
         except Exception:
             return 83.4, 46.9
+
+    def _camera_commanded_zoom_x(self) -> float:
+        """The zoom level we last asked the camera for.
+
+        The C13 accepts zoom commands and reports nothing back, so this is the
+        only zoom the GCS knows. It is right whenever the operator zooms from
+        VGCS and blind if they zoom on the handset instead, which is why the
+        source is recorded on the mark rather than presented as measured.
+        """
+        try:
+            return float(getattr(self, "_video_zoom", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _camera_geo_fov(self):
+        """Field of view for pixel-to-angle geo, at the camera's current zoom.
+
+        Requested after the crew confirmed the C13 is a 30x optical zoom
+        (2026-09-09). Converting an off-centre click with the wide-angle figure
+        while the lens is zoomed in overstates every angle by the zoom factor,
+        which at 10x puts a mark near the frame edge kilometres out.
+        """
+        from vgcs.observe.camera_fov import resolve_camera_fov
+
+        wide_h, wide_v = self._camera_wide_fov_deg()
+        reported = None
+        try:
+            from vgcs.video.camera_control import camera_reported_fov_deg
+
+            reported = camera_reported_fov_deg(getattr(self, "_camera_control", None))
+        except Exception:
+            reported = None
+        return resolve_camera_fov(
+            wide_hfov_deg=wide_h,
+            wide_vfov_deg=wide_v,
+            reported=reported,
+            zoom_x=self._camera_commanded_zoom_x(),
+        )
+
+    def _c13_lrf_geo_fov(self) -> tuple[float, float]:
+        fov = self._camera_geo_fov()
+        return float(fov.hfov_deg), float(fov.vfov_deg)
 
     def _lrf_lock_use_facade_plane_geo(self) -> bool:
         """True when LRF preview should use wall-plane geo (DOOAF facade lock)."""

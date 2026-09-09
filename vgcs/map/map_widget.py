@@ -1444,6 +1444,11 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._goto_shortcut = QShortcut(QKeySequence("Ctrl+G"), self)
         self._goto_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         self._goto_shortcut.activated.connect(self.prompt_goto_location)
+        # Map and camera side by side. Reachable from the plan view too, where
+        # the action rail is hidden, same as Ctrl+G.
+        self._split_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
+        self._split_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._split_shortcut.activated.connect(self.toggle_map_video_split)
         self._map_action_rail.setFixedSize(54, 54 + 8 + 54 + 8 + 34)
         self._map_action_rail.show()
         self._map_action_rail.raise_()

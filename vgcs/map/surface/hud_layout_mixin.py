@@ -292,7 +292,14 @@ class NativeHudLayoutMixin:
                     pass
             else:
                 self._sync_camera_rail_panel_visibility()
-            w = max(1, self._map_canvas.width())
+            # The map's own width, which is narrower than the canvas while the
+            # camera has a pane beside it. Everything anchored to the right
+            # edge below (compass, telemetry, rails) then lands on the map
+            # rather than underneath the camera feed.
+            try:
+                w = max(1, self._map_video_split_map_width(self._map_canvas.width()))
+            except Exception:
+                w = max(1, self._map_canvas.width())
             h = max(1, self._map_canvas.height())
             rail = self._native_hud_right
             ly = getattr(self, "_native_rail_layer", None)

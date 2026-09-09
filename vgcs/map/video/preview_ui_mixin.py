@@ -37,6 +37,11 @@ from vgcs.video.pipeline import (
 # An in-stream EO/IR change alters the stream format, so the running decoder
 # must be restarted. Two changes in quick succession left the camera unable to
 # serve RTSP at all (field log 2026-08-18), hence the minimum gap.
+# Side-by-side map | camera. Neither pane is allowed below this, because half
+# of a small window is two panes too small to aim in.
+_MAP_VIDEO_SPLIT_MIN_PANE_PX = 220
+_MAP_VIDEO_SPLIT_RATIO = 0.5
+
 _SENSOR_SWITCH_MIN_GAP_S = 6.0
 # Fallback settle for a camera we cannot probe (non-companion URL). A camera on
 # the companion subnet is asked directly instead — see `_schedule_rtsp_resume`.
@@ -332,6 +337,95 @@ class VideoPreviewUiMixin:
         except Exception:
             pass
 
+    # --- map | camera side by side -------------------------------------- #
+    # Requested 2026-09-09 after the crew described a competitor's DOOAF
+    # screen: "they are split map and camera feed vertically on the screen then
+    # when they are set actual target and impact Target from the video so
+    # simultaneously both target showing in the map also". Divider left to
+    # right, confirmed. VGCS had only map-with-a-small-camera or
+    # camera-with-a-small-map, so one of the two was always too small to work
+    # in while the other was full size.
+
+    def map_video_split_enabled(self) -> bool:
+        return bool(getattr(self, "_map_video_split", False))
+
+    def set_map_video_split(self, enabled: bool) -> None:
+        """Show the map and the camera as two panes, or go back to the PiP."""
+        want = bool(enabled)
+        if want == self.map_video_split_enabled():
+            return
+        self._map_video_split = want
+        if want:
+            # Fullscreen video and a half-and-half split are two answers to the
+            # same question, so turning one on settles the other.
+            self._video_swapped = False
+        self._apply_map_video_split_inset()
+        try:
+            self._layout_native_video_preview()
+            self._layout_native_hud()
+            self._stack_native_overlays_above_tile_map()
+        except Exception:
+            pass
+
+    def toggle_map_video_split(self) -> None:
+        self.set_map_video_split(not self.map_video_split_enabled())
+
+    def _map_video_split_video_width(self, canvas_w: int) -> int:
+        """Width of the camera pane, in `_map_canvas` coordinates.
+
+        Both panes are kept above a floor. Half of a narrow window is two
+        useless panes, and at that point the operator is better served by the
+        PiP, so the split simply does not engage.
+        """
+        cw = max(1, int(canvas_w))
+        if cw < _MAP_VIDEO_SPLIT_MIN_PANE_PX * 2:
+            return 0
+        ratio = float(getattr(self, "_map_video_split_ratio", _MAP_VIDEO_SPLIT_RATIO))
+        ratio = max(0.25, min(0.75, ratio))
+        vw = int(round(cw * ratio))
+        vw = max(_MAP_VIDEO_SPLIT_MIN_PANE_PX, min(cw - _MAP_VIDEO_SPLIT_MIN_PANE_PX, vw))
+        return vw
+
+    def _map_video_split_rect(self, canvas_w: int, canvas_h: int):
+        """Camera pane rect, or None when the split cannot be honoured."""
+        vw = self._map_video_split_video_width(canvas_w)
+        if vw <= 0:
+            return None
+        cw = max(1, int(canvas_w))
+        ch = max(1, int(canvas_h))
+        return (cw - vw, 0, vw, ch)
+
+    def _map_video_split_map_width(self, canvas_w: int) -> int:
+        """How much width the map keeps. The whole canvas when not split."""
+        cw = max(1, int(canvas_w))
+        if not self.map_video_split_enabled():
+            return cw
+        vw = self._map_video_split_video_width(cw)
+        return cw - vw if vw > 0 else cw
+
+    def _apply_map_video_split_inset(self) -> None:
+        """Squeeze the tile map into its own pane so the camera is beside it, not over it."""
+        layout = getattr(self, "_map_canvas_layout", None)
+        host = getattr(self, "_map_canvas", None)
+        if layout is None or host is None:
+            return
+        right = 0
+        if self.map_video_split_enabled() and self._video_preview_is_showing():
+            right = self._map_video_split_video_width(host.width())
+        try:
+            layout.setContentsMargins(0, 0, max(0, int(right)), 0)
+        except Exception:
+            pass
+
+    def _video_preview_is_showing(self) -> bool:
+        """True when there is actually a camera pane to make room for."""
+        try:
+            if not self._mini_video_pip_allowed():
+                return False
+        except Exception:
+            return False
+        return bool(getattr(self, "_video_preview_enabled", False))
+
     def _mini_video_pip_rect(self, w: int, h: int) -> tuple[int, int, int, int]:
         """Bottom-left PiP size in `_map_canvas` coordinates."""
         pw = min(_MINI_VIDEO_PIP_W_PX, max(200, int(w * 0.22)))
@@ -416,8 +510,12 @@ class VideoPreviewUiMixin:
                     self._native_video_preview.hide()
                 except Exception:
                     pass
+                # Give the map its full width back; a pane held open for a
+                # camera that is not there is just a missing strip of map.
+                self._apply_map_video_split_inset()
                 return
             if not bool(getattr(self, "_video_preview_enabled", False)):
+                self._apply_map_video_split_inset()
                 return
             # No plan-layer check here any more. This runs on every layout and
             # resize, so it was the one that kept re-hiding the PiP during
@@ -429,7 +527,28 @@ class VideoPreviewUiMixin:
                 return
             cw = max(1, host.width())
             ch = max(1, host.height())
-            if bool(getattr(self, "_video_swapped", False)):
+            split_rect = (
+                self._map_video_split_rect(cw, ch)
+                if self.map_video_split_enabled()
+                else None
+            )
+            if split_rect is not None:
+                px, py, pw, ph = split_rect
+                # A divider rather than a floating card: only the edge facing
+                # the map is drawn, so the two panes read as one screen.
+                self._native_video_preview.setStyleSheet(
+                    "QLabel#nativeVideoPreview {"
+                    "background: #000;"
+                    "border: none;"
+                    "border-left: 1px solid rgba(206, 220, 242, 0.55);"
+                    "border-radius: 0px;"
+                    "}"
+                )
+                try:
+                    self._native_video_preview.setText("")
+                except Exception:
+                    pass
+            elif bool(getattr(self, "_video_swapped", False)):
                 px, py, pw, ph = 0, 0, cw, ch
                 self._native_video_preview.setStyleSheet(
                     "QLabel#nativeVideoPreview {"
@@ -456,6 +575,9 @@ class VideoPreviewUiMixin:
                         "border-radius: 8px;"
                         "}"
                     )
+            # Done before the geometry so the map has already yielded the
+            # space; otherwise the camera pane spends a frame on top of tiles.
+            self._apply_map_video_split_inset()
             gx, gy, gw, gh = self._map_canvas_rect_on_panel(px, py, pw, ph)
             self._native_video_preview.setGeometry(gx, gy, gw, gh)
             self._native_video_preview.show()

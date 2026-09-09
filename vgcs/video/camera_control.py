@@ -1125,10 +1125,12 @@ class ViewproCameraControl:
     def reported_fov_deg(self) -> tuple[float, float] | None:
         """Live (hfov, vfov) in degrees straight from the camera's status frame.
 
-        The C13 has a fixed lens, so DOOAF's single ``observe/camera_hfov_deg``
-        setting is always right for it. This camera has a large optical zoom and
-        reports its true current FOV continuously, so the static setting is only
-        correct at one zoom level — see camera_reported_fov_deg.
+        Both cameras have a large optical zoom, so a static FOV setting is only
+        correct at one zoom level — see camera_reported_fov_deg. This one
+        reports its true current FOV continuously and should be believed. The
+        C13 (30x optical, confirmed by the crew 2026-09-09, correcting an
+        earlier note here that called it a fixed lens) reports nothing, so its
+        FOV is derived from the commanded zoom in vgcs/observe/camera_fov.py.
         """
         try:
             return self._adapter.query_fov_deg()
@@ -1586,11 +1588,12 @@ def camera_reported_fov_deg(control: object | None) -> tuple[float, float] | Non
     """Live (hfov, vfov) degrees from the camera itself, or None if it can't report it.
 
     DOOAF's pixel->angle geo-referencing takes FOV from the single
-    ``observe/camera_hfov_deg`` setting. That is exact for a FIXED lens (C13),
-    but a zoom lens only matches it at one zoom level — a Viewpro field
-    screenshot showed the camera's own OSD reading 70.2 deg at 1.00x while the
-    setting default is 62.0, i.e. already wrong before zooming at all, and
-    progressively worse zoomed in.
+    ``observe/camera_hfov_deg`` setting, which matches a zoom lens at exactly
+    one zoom level — a Viewpro field screenshot showed the camera's own OSD
+    reading 70.2 deg at 1.00x while the setting default is 62.0, i.e. already
+    wrong before zooming at all, and progressively worse zoomed in. Neither
+    camera here is fixed: the C13 is 30x optical and the Viewpro 20x optical
+    plus 12x digital.
 
     Backends that genuinely know their current FOV should expose
     ``reported_fov_deg()``; callers fall back to the setting when this is None,

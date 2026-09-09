@@ -491,6 +491,14 @@ class DooafOperationsMixin:
             f"{float(geo.target_lon):.7f}) slant={slant:.1f} m "
             f"q={geo.quality} method={geo.method}"
         )
+        # Same look vector, terrain instead of laser, so the two can be compared
+        # inside laser range before the crew has to rely on terrain beyond it.
+        self._record_terrain_estimate_alongside_laser(
+            row,
+            ctx,
+            0.5 if boresight_after_slew else float(video_x),
+            0.5 if boresight_after_slew else float(video_y),
+        )
         try:
             nm = getattr(self, "_native_map", None)
             if nm is not None and hasattr(nm, "add_geo_referenced_marker"):
@@ -500,6 +508,81 @@ class DooafOperationsMixin:
         except Exception:
             pass
         return True
+
+    def _record_terrain_estimate_alongside_laser(
+        self,
+        row: dict[str, object],
+        ctx: dict[str, object],
+        video_x: float,
+        video_y: float,
+    ) -> None:
+        """Also work out where the terrain method would have put this mark.
+
+        Asked for on 2026-09-09 to size up flying beyond laser range. The laser
+        reaches 1 km on the C13 and 3 km on the Viewpro; past that a pick is
+        placed by cutting the camera's look vector against the terrain, and
+        nobody knows how good that is in this ground.
+
+        So whenever the laser does give an answer, the terrain answer is worked
+        out for the same look vector and both are kept. The gap between them is
+        the terrain method's error measured against a trusted reference, which
+        is the number the field test needs and cannot get any other way.
+
+        Never allowed to disturb the mark: the laser position stays the mark's
+        position, and a failure here writes nothing.
+        """
+        try:
+            _, dem_path, dem_terrain = self._m8_geo_settings()
+            fov = self._m8_geo_fov()
+            geo = compute_geo_reference(
+                vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
+                vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
+                vehicle_heading_deg=ctx.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+                vehicle_roll_deg=ctx.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+                vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+                vehicle_rel_alt_m=ctx.get("ekf_rel_alt_m"),  # type: ignore[arg-type]
+                vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
+                rangefinder_down_m=ctx.get("rangefinder_down_m"),  # type: ignore[arg-type]
+                gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+                gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+                video_x_norm=float(video_x),
+                video_y_norm=float(video_y),
+                gps_fix_type=int(ctx.get("gps_fix_type") or 0),
+                gps_hdop=ctx.get("gps_hdop"),  # type: ignore[arg-type]
+                camera_hfov_deg=float(fov.hfov_deg),
+                camera_vfov_deg=float(fov.vfov_deg),
+                dem_path=dem_path,
+                dem_terrain=dem_terrain,
+            )
+        except Exception:
+            return
+        if not getattr(geo, "ok", False):
+            return
+        t_lat = getattr(geo, "target_lat", None)
+        t_lon = getattr(geo, "target_lon", None)
+        if t_lat is None or t_lon is None:
+            return
+        row["terrain_lat"] = float(t_lat)
+        row["terrain_lon"] = float(t_lon)
+        row["terrain_alt_m"] = getattr(geo, "target_alt_m", None)
+        row["terrain_method"] = str(getattr(geo, "method", "") or "")
+        row["terrain_quality"] = str(getattr(geo, "quality", "") or "")
+        laser_lat = row.get("target_lat")
+        laser_lon = row.get("target_lon")
+        if laser_lat is None or laser_lon is None:
+            return
+        try:
+            gap = haversine_m(
+                float(laser_lat), float(laser_lon), float(t_lat), float(t_lon)
+            )
+        except (TypeError, ValueError):
+            return
+        row["terrain_vs_laser_m"] = float(gap)
+        print(
+            f"[VGCS:observe] terrain estimate=({float(t_lat):.7f},{float(t_lon):.7f}) "
+            f"is {gap:.1f} m from the laser fix "
+            f"(zoom {float(fov.zoom_x):.1f}x from {fov.source})"
+        )
 
     def _append_lrf_fallback_warning(self, row: dict[str, object], note: str) -> None:
         prev = str(row.get("geo_warning") or "").strip()
@@ -1790,24 +1873,43 @@ class DooafOperationsMixin:
         except Exception:
             return None
 
-    def _m8_geo_settings(self) -> tuple[float, str | None, bool]:
+    def _m8_geo_fov(self):
+        """Field of view for a video pick, at whatever zoom the camera is on.
+
+        Prefers what the camera reports, because that accounts for the real
+        lens. Falls back to the configured wide angle narrowed by the zoom we
+        commanded, which is the only zoom the C13 gives us. The 62 degree
+        default is a setting, not a measurement, so it is treated as the lens
+        wide open and narrowed the same way.
+        """
+        from vgcs.observe.camera_fov import resolve_camera_fov
+
         st = QSettings(QS_ORG, QS_APP)
         try:
-            hfov = float(st.value("observe/camera_hfov_deg", 62.0) or 62.0)
+            wide_h = float(st.value("observe/camera_hfov_deg", 62.0) or 62.0)
         except Exception:
-            hfov = 62.0
-        # Prefer what the camera actually reports. The setting is exact for a
-        # fixed lens (C13) but only right at one zoom level on a zoom lens, and
-        # geo-referencing a video pick with the wrong FOV mis-places the mark.
-        # Falls back to the setting for backends that can't report it.
+            wide_h = 62.0
+        reported = None
         try:
             from vgcs.video.camera_control import camera_reported_fov_deg
 
-            live_fov = camera_reported_fov_deg(getattr(self, "_camera_control", None))
-            if live_fov is not None:
-                hfov = float(live_fov[0])
+            reported = camera_reported_fov_deg(getattr(self, "_camera_control", None))
         except Exception:
-            pass
+            reported = None
+        zoom_x = 1.0
+        try:
+            zoom_x = float(getattr(self, "_video_zoom", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            zoom_x = 1.0
+        return resolve_camera_fov(
+            wide_hfov_deg=wide_h,
+            reported=reported,
+            zoom_x=zoom_x,
+        )
+
+    def _m8_geo_settings(self) -> tuple[float, str | None, bool]:
+        st = QSettings(QS_ORG, QS_APP)
+        hfov = float(self._m8_geo_fov().hfov_deg)
         dem = (
             str(st.value("observe/dem_path", "") or st.value("observe/dem_csv", "") or "")
             .strip()
@@ -1843,6 +1945,15 @@ class DooafOperationsMixin:
             row["geo_warning"] = "video click missing"
             return
         hfov, dem_path, dem_terrain = self._m8_geo_settings()
+        # The zoom the angle conversion assumed, and whether the camera told us
+        # or we only asked. An operator zooming on the handset leaves us on the
+        # commanded value, so the report has to be able to say which it was.
+        cam_fov = self._m8_geo_fov()
+        vfov = float(cam_fov.vfov_deg)
+        row["camera_hfov_deg"] = float(cam_fov.hfov_deg)
+        row["camera_vfov_deg"] = vfov
+        row["camera_zoom_x"] = float(cam_fov.zoom_x)
+        row["camera_fov_source"] = str(cam_fov.source)
         from vgcs.observe.target_measure import resolve_ray_agl_for_geo
 
         ray_agl, ray_src = resolve_ray_agl_for_geo(
@@ -1873,6 +1984,9 @@ class DooafOperationsMixin:
             gps_fix_type=int(row.get("gps_fix_type") or 0),
             gps_hdop=row.get("gps_hdop"),  # type: ignore[arg-type]
             camera_hfov_deg=hfov,
+            # Passed rather than left to the 16:9 guess inside compute_geo_reference.
+            # Viewpro reports 70.2 x 41.3, which that guess turns into 39.5.
+            camera_vfov_deg=vfov,
             dem_path=dem_path,
             dem_terrain=dem_terrain,
         )
