@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 
-from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT
+from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED
 from vgcs.observe.target_measure import dem_ground_agl_m, resolve_ray_agl_for_geo, sanitize_dem_ground_agl_m
 
 
@@ -69,9 +69,17 @@ class ObservationContextMixin:
         except Exception:
             pass
         if enabled:
+            # Says which point the next click sets, now that the rail can
+            # choose. Telling them it is always the fall of shot was the old
+            # behaviour and would now be wrong half the time.
+            what = (
+                "actual target"
+                if self._current_observe_dooaf_role() == DOOAF_ROLE_INTENDED
+                else "fall of shot"
+            )
             self._set_status(
-                "Target ON: mark fall of shot on video (red) — "
-                "set actual target in DOOAF Setup (Pick on map / Pick on video)"
+                f"Target ON: click the video or map to set the {what} — "
+                "Set TGT / Set HIT on the camera rail chooses which"
             )
             try:
                 if bool(getattr(self, "_video_swapped", False)):
@@ -164,5 +172,23 @@ class ObservationContextMixin:
         }
 
     def _current_observe_dooaf_role(self) -> str:
-        """Observation Target clicks are always fall of shot (use DOOAF Setup → Pick on video for actual target)."""
+        """What the next video or map click marks.
+
+        This used to be the fall of shot and nothing else, so the actual target
+        could only be placed through the DOOAF Setup dialog: two different ways
+        to mark two points the operator thinks of as one action. The camera
+        rail now carries a Set TGT / Set HIT choice, and this reads it.
+
+        Still defaults to the fall of shot, which is the common case and what
+        every existing habit expects.
+        """
+        block = getattr(self, "_native_observe_body", None)
+        getter = getattr(block, "current_dooaf_role", None)
+        if callable(getter):
+            try:
+                role = str(getter() or "")
+            except Exception:
+                role = ""
+            if role in (DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED):
+                return role
         return DOOAF_ROLE_IMPACT

@@ -599,6 +599,7 @@ class ObservationSessionMixin:
             rounds = self._impact_round_count()
             if rounds > 1:
                 msg += f" — round {rounds}"
+        self._show_dooaf_mark_popup(dooaf_role, kind)
         self._set_status(msg)
         self._refresh_observation_measure_overlays()
         self._refresh_dooaf_map_overlay()
@@ -613,6 +614,43 @@ class ObservationSessionMixin:
                     nm.add_observation_map_marker(float(map_lat), float(map_lon))
             except Exception:
                 pass
+
+    def dooaf_popup_enabled(self) -> bool:
+        """On by default; the crew asked for the read-out on every mark."""
+        raw = QSettings(QS_ORG, QS_APP).value("dooaf/mark_popup", True)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+    def _show_dooaf_mark_popup(self, dooaf_role: str, kind: str) -> None:
+        """Put the marked point, its grid reference and the correction on screen.
+
+        Everything here already went to the map status line, which dashboard
+        mode hides, so in practice it went nowhere. Requested 2026-09-09.
+        """
+        if kind not in ("video_mark", "map_mark"):
+            return
+        if dooaf_role not in (DOOAF_ROLE_INTENDED, DOOAF_ROLE_IMPACT):
+            return
+        if not self.dooaf_popup_enabled():
+            return
+        try:
+            from vgcs.map.dooaf_popup import DooafPopup, dooaf_popup_text, gun_note
+
+            session = build_dooaf_session(
+                self._observations, **self._dooaf_session_kwargs()
+            )
+            text = dooaf_popup_text(session)
+            if not text:
+                return
+            popup = getattr(self, "_dooaf_popup", None)
+            if popup is None:
+                popup = DooafPopup(self)
+                self._dooaf_popup = popup
+            popup.show_text(text, gun_note(session))
+        except Exception:
+            # A read-out must never take the mark down with it.
+            pass
 
     def _impact_round_count(self) -> int:
         """How many rounds have been marked in this session so far."""

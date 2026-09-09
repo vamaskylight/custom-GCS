@@ -10,6 +10,7 @@ from __future__ import annotations
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT
+from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED
 
 
 class CamRailShowHandle(QFrame):
@@ -164,6 +165,7 @@ class CamObserveBlock(QWidget):
     """DOOAF observe: Target / Clip / Report / Reset + Setup."""
 
     setup_clicked = Signal()
+    dooaf_role_changed = Signal(str)
 
     def __init__(
         self,
@@ -199,20 +201,61 @@ class CamObserveBlock(QWidget):
         row_setup.setContentsMargins(0, 0, 0, 0)
         row_setup.setSpacing(4)
         row_setup.addWidget(self.setup_btn, 1)
-        hint = QLabel("DOOAF Setup: Pick on video for target · Target ON = Impact Target (red)")
+
+        # What a click on the video sets. It used to be the fall of shot and
+        # nothing else, so the actual target could only be placed through the
+        # DOOAF Setup dialog: two different ways to mark two points that the
+        # operator thinks of as the same action. Requested 2026-09-09 after the
+        # crew described a competitor setting both from the video.
+        row_role = QHBoxLayout()
+        row_role.setContentsMargins(0, 0, 0, 0)
+        row_role.setSpacing(4)
+        self.role_target_btn = QPushButton("Set TGT")
+        self.role_target_btn.setObjectName("observeRoleTarget")
+        self.role_target_btn.setCheckable(True)
+        self.role_target_btn.setToolTip("A video or map click sets the actual target")
+        self.role_impact_btn = QPushButton("Set HIT")
+        self.role_impact_btn.setObjectName("observeRoleImpact")
+        self.role_impact_btn.setCheckable(True)
+        self.role_impact_btn.setChecked(True)
+        self.role_impact_btn.setToolTip("A video or map click sets the fall of shot")
+        self._role_group = QButtonGroup(self)
+        self._role_group.setExclusive(True)
+        self._role_group.addButton(self.role_target_btn)
+        self._role_group.addButton(self.role_impact_btn)
+        self.role_target_btn.toggled.connect(self._on_role_toggled)
+        self.role_impact_btn.toggled.connect(self._on_role_toggled)
+        row_role.addWidget(self.role_target_btn, 1)
+        row_role.addWidget(self.role_impact_btn, 1)
+
+        hint = QLabel("Target ON, then click the video. Set TGT or Set HIT chooses which point.")
         hint.setObjectName("observeDooafHint")
         hint.setWordWrap(True)
         hint.setToolTip(
-            "Set gun and actual target in DOOAF Setup (Pick on map or Pick on video). "
-            "Then turn Target ON and click Impact Target on the video feed."
+            "Turn Target ON, pick Set TGT or Set HIT, then click the point on the "
+            "video feed or the map. DOOAF Setup still takes typed grid references."
         )
         v.addLayout(row1)
         v.addLayout(row2)
+        v.addLayout(row_role)
         v.addLayout(row_setup)
         v.addWidget(hint)
 
+    def _on_role_toggled(self, _checked: bool) -> None:
+        self.dooaf_role_changed.emit(self.current_dooaf_role())
+
+    def set_dooaf_role(self, role: str) -> None:
+        want_target = str(role) == DOOAF_ROLE_INTENDED
+        btn = self.role_target_btn if want_target else self.role_impact_btn
+        if not btn.isChecked():
+            btn.setChecked(True)
+
     def current_dooaf_role(self) -> str:
-        return DOOAF_ROLE_IMPACT
+        return (
+            DOOAF_ROLE_INTENDED
+            if self.role_target_btn.isChecked()
+            else DOOAF_ROLE_IMPACT
+        )
 
 
 class CamM13TrackBlock(QWidget):
