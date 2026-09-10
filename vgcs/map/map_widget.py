@@ -795,6 +795,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     menu_requested = Signal(int, int)
     takeoff_requested = Signal()
     return_requested = Signal()
+    land_requested = Signal()
     plan_tool_requested = Signal(str)
     plan_action_requested = Signal(str)
     plan_flight_exited = Signal()
@@ -1398,6 +1399,38 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         _re_lay.addWidget(_re_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
         self._map_action_return_btn.setLayout(_re_lay)
         self._map_action_return_btn.setStyleSheet(_return_ss)
+        # Land belongs beside Takeoff and Return. Requested 2026-09-10, where
+        # the whole flight is described from these buttons: "user can click on
+        # the take off button ... after that same for land or return button".
+        # Land existed only on the dashboard, so the one screen an operator
+        # flies from could start a flight but not finish one.
+        _land_ss = _map_action_btn_base_ss.replace(
+            "mapActionTakeoffBtn", "mapActionLandBtn"
+        ).replace("mapActionReturnBtn", "mapActionLandBtn")
+        self._map_action_land_btn = QPushButton(self._map_action_rail)
+        self._map_action_land_btn.setObjectName("mapActionLandBtn")
+        self._map_action_land_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._map_action_land_btn.setFlat(True)
+        self._map_action_land_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._map_action_land_btn.setToolTip(
+            "Land where the aircraft is now (same as dashboard Land)."
+        )
+        _la_lay = QVBoxLayout()
+        _la_lay.setContentsMargins(3, 5, 3, 5)
+        _la_lay.setSpacing(1)
+        _la_ic = TelemetryStripIcon(
+            "down", self._map_action_land_btn, icon_size=_MAP_ACTION_ICON_LOGICAL_PX
+        )
+        _la_lbl = QLabel("Land", self._map_action_land_btn)
+        _la_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        _la_lbl.setStyleSheet(
+            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
+        )
+        _la_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        _la_lay.addWidget(_la_ic, 0, Qt.AlignmentFlag.AlignHCenter)
+        _la_lay.addWidget(_la_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._map_action_land_btn.setLayout(_la_lay)
+        self._map_action_land_btn.setStyleSheet(_land_ss)
         # Type a position and go there. Requested 2026-09-08: "if I put the lat
         # long then I can see that particular location on the map". Unlike the
         # two above it needs no vehicle, so it is never disabled.
@@ -1432,11 +1465,14 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._map_action_goto_btn.setStyleSheet(_goto_ss)
 
         ar_l.addWidget(self._map_action_takeoff_btn)
+        ar_l.addWidget(self._map_action_land_btn)
         ar_l.addWidget(self._map_action_return_btn)
         ar_l.addWidget(self._map_action_goto_btn)
         self._map_action_takeoff_btn.setEnabled(False)
+        self._map_action_land_btn.setEnabled(False)
         self._map_action_return_btn.setEnabled(False)
         self._map_action_takeoff_btn.clicked.connect(lambda: self.takeoff_requested.emit())
+        self._map_action_land_btn.clicked.connect(lambda: self.land_requested.emit())
         self._map_action_return_btn.clicked.connect(lambda: self.return_requested.emit())
         self._map_action_goto_btn.clicked.connect(self.prompt_goto_location)
         # Ctrl+G reaches it from the plan view too, where the action rail is
@@ -1449,7 +1485,12 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._split_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
         self._split_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         self._split_shortcut.activated.connect(self.toggle_map_video_split)
-        self._map_action_rail.setFixedSize(54, 54 + 8 + 54 + 8 + 34)
+        # Height from the layout rather than arithmetic over the button sizes.
+        # Adding Land by hand-summing 54 + 8 + 54 + 8 + 54 + 8 + 34 came out six
+        # pixels short and pushed Go to outside its own parent, where it is
+        # simply not drawn.
+        ar_l.activate()
+        self._map_action_rail.setFixedSize(54, max(158, ar_l.sizeHint().height()))
         self._map_action_rail.show()
         self._map_action_rail.raise_()
 

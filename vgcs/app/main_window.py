@@ -434,6 +434,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._map_widget.connect_requested.connect(self._on_map_connect_requested)
         self._map_widget.takeoff_requested.connect(self._on_takeoff)
         self._map_widget.return_requested.connect(self._on_map_return_requested)
+        self._map_widget.land_requested.connect(self._on_land)
         self._map_widget.plan_tool_requested.connect(self._on_plan_tool_requested)
         self._map_widget.plan_action_requested.connect(self._on_plan_flight_action)
         self._map_widget.plan_flight_exited.connect(self._on_plan_flight_exited)

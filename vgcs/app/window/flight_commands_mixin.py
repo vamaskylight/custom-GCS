@@ -144,32 +144,45 @@ class MainWindowFlightCommandsMixin:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before takeoff command.")
             return
-        alt = max(1.0, float(alt_m))
-        # One click used to be one command that quietly did nothing. One click
-        # is now arming and flight, which is worth a question first.
-        answer = QMessageBox.question(
-            self,
-            "Takeoff",
-            f"Arm the aircraft and take off to {alt:.1f} m?\n\n"
-            "Propellers will spin and the aircraft will climb.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        from vgcs.app.flight_action_dialogs import ask_takeoff_altitude
+
+        # The popup takes the height rather than only confirming one set on
+        # another screen, which is what "one popup should come for adding
+        # altitude" asked for on 2026-09-10.
+        alt = ask_takeoff_altitude(self, float(alt_m))
+        if alt is None:
             self._append_log("Takeoff cancelled")
             return
-        self._thread.queue_auto_takeoff(alt)
+        # Remembered, so the dashboard control and the popup never disagree
+        # about the height the aircraft was last sent to.
+        try:
+            self._takeoff_alt_spin.setValue(float(alt))
+        except Exception:
+            pass
+        self._thread.queue_auto_takeoff(float(alt))
         self._append_log(f"Takeoff queued: arm + climb to {alt:.1f} m")
 
     def _on_takeoff(self) -> None:
         self._request_takeoff(self._takeoff_altitude_m(from_plan_rail=False))
 
     def _on_land(self) -> None:
+        """Say what will happen, then land in LAND mode.
+
+        Same defect as Takeoff had (2026-09-10): this sent a bare NAV_LAND,
+        which the vehicle can refuse without VGCS ever knowing, since no
+        COMMAND_ACK is read anywhere. queue_auto_land sets LAND mode and falls
+        back to NAV_LAND, which is the path that actually brings it down.
+        """
+        from vgcs.app.flight_action_dialogs import confirm_land
+
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before land command.")
             return
-        self._thread.queue_land()
-        self._append_log("Land queued")
+        if not confirm_land(self):
+            self._append_log("Land cancelled")
+            return
+        self._thread.queue_auto_land()
+        self._append_log("Land queued: LAND mode")
 
     def _on_auto_takeoff(self) -> None:
         if self._thread is None or not self._thread.isRunning():
@@ -431,8 +444,19 @@ class MainWindowFlightCommandsMixin:
         self._on_connect()
 
     def _on_map_return_requested(self) -> None:
+        """Say what will happen, then RTL.
+
+        RTL was always the right command. What it lacked was the popup saying
+        the aircraft is about to climb to its return altitude and fly home,
+        which is not obvious from a button labelled Return.
+        """
+        from vgcs.app.flight_action_dialogs import confirm_return
+
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before return command.")
+            return
+        if not confirm_return(self):
+            self._append_log("Return cancelled")
             return
         self._thread.queue_mode_change("RTL")
         self._append_log("Mode change queued: RTL")
