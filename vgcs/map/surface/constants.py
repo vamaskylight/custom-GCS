@@ -9,9 +9,16 @@ _MAP_ACTION_RAIL_LEFT_PX = 10
 _MAP_ACTION_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _NATIVE_CAM_RAIL_TOP_PX = _MAP_HUD_TOP_PX
 _MAP_HUD_MARGIN_PX = 12
-# Takeoff + Return + the shorter "Go to" button (2026-09-08). The obstacle
-# radar is placed directly below this, so it has to match the real rail.
-_MAP_ACTION_RAIL_HEIGHT_PX = 54 + 8 + 54 + 8 + 34
+# Fallback only. The obstacle radar sits directly below the action rail, and
+# this constant used to decide where. It was hand-summed and wrong: the buttons
+# are 56 px with borders, not 54, so three of them plus spacing needed 184 and
+# got 158. Adding Land made the gap obvious - the radar covered Return's label
+# and hid "Go to" completely (reported 2026-09-10 with a screenshot).
+#
+# The layout now measures the rail instead, so this is only used before the
+# rail exists. Do not go back to arithmetic here; the two drift apart every
+# time a button is added.
+_MAP_ACTION_RAIL_HEIGHT_PX = 56 + 8 + 56 + 8 + 56 + 8 + 36
 _OBSTACLE_PANEL_TOP_PX = _MAP_ACTION_RAIL_TOP_PX + _MAP_ACTION_RAIL_HEIGHT_PX + 8
 _OBSTACLE_PANEL_MAX_H_PX = 360
 

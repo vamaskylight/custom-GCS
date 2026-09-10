@@ -1440,6 +1440,11 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
             + "QPushButton#mapActionGotoBtn {"
             "border-top-left-radius:0px; border-bottom-left-radius:8px;"
             "border-top-right-radius:0px; border-bottom-right-radius:8px;"
+            # It carries a label and no icon, so it does not need a full tile.
+            # The base rule clamps every rail button to 54, which is why the
+            # "shorter Go to button" the old constant described was never
+            # actually shorter. Four full tiles crowd the left edge.
+            "min-height:34px; max-height:34px;"
             "}"
         )
         self._map_action_goto_btn = QPushButton(self._map_action_rail)

@@ -411,7 +411,14 @@ class NativeHudLayoutMixin:
                 obr_w = int(obr.sizeHint().width())
                 obr_h = min(_OBSTACLE_PANEL_MAX_H_PX, int(obr.sizeHint().height()))
                 obr_x = margin
+                # Measured off the rail that is actually on screen, not off a
+                # constant somebody has to remember to update. The rail was
+                # laid out a few lines above, so its height is current.
                 obr_y = _OBSTACLE_PANEL_TOP_PX
+                if mar is not None:
+                    obr_y = max(
+                        obr_y, _MAP_ACTION_RAIL_TOP_PX + int(mar.height()) + 8
+                    )
                 # Keep the card above the bottom-left video PiP when both are visible.
                 if preview_maps and not swapped:
                     _px, pip_y, _pw, pip_h = self._mini_video_pip_rect(w, h)
