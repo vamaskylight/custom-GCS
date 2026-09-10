@@ -2126,11 +2126,26 @@ class MavlinkThread(QThread):
         )
 
     def _takeoff(self, altitude_m: float) -> None:
+        """Bare NAV_TAKEOFF. The vehicle must already be armed and in GUIDED.
+
+        No command result is read back anywhere in this class, so this cannot
+        report whether the aircraft accepted it. It used to say "Target alt
+        20.0 m" as a success, which reads as "it is climbing" when the usual
+        outcome from a disarmed vehicle in LOITER is a silent rejection.
+        Operator-facing takeoff goes through _auto_takeoff, which arms and then
+        confirms the vehicle really is armed before committing.
+        """
         alt = max(1.0, float(altitude_m))
         try:
             self._send_nav_takeoff(alt)
-            self.action_result.emit("takeoff", True, f"Target alt {alt:.1f} m")
-            self.log_line.emit(f"Takeoff command sent: alt={alt:.1f}m")
+            self.action_result.emit(
+                "takeoff",
+                True,
+                f"NAV_TAKEOFF {alt:.1f} m sent (needs the vehicle armed and in GUIDED)",
+            )
+            self.log_line.emit(
+                f"NAV_TAKEOFF sent: alt={alt:.1f}m - not confirmed by the vehicle"
+            )
         except Exception as e:
             self.action_result.emit("takeoff", False, str(e))
             self.error.emit(f"Takeoff failed: {e}")

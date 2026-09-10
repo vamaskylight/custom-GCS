@@ -923,7 +923,7 @@ class MainWindowPlanMissionMixin:
             return
         if tool == "takeoff":
             self._append_log("Plan tool: Takeoff")
-            self._queue_nav_takeoff(self._takeoff_altitude_m(from_plan_rail=True))
+            self._request_takeoff(self._takeoff_altitude_m(from_plan_rail=True))
             return
         if tool == "waypoint":
             self._append_log("Plan tool: Waypoint mode")

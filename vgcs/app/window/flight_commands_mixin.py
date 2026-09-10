@@ -121,16 +121,48 @@ class MainWindowFlightCommandsMixin:
                 return max(1.0, float(plan_alt))
         return max(1.0, float(self._takeoff_alt_spin.value()))
 
-    def _queue_nav_takeoff(self, alt_m: float) -> None:
+    def _request_takeoff(self, alt_m: float) -> None:
+        """Arm if needed, then take off. Confirmed first, because it flies.
+
+        Reported 2026-09-10: "this takeoff and return button might be not
+        working ... After I click on the takeoff button the drone will take off
+        automatically right??" It did not, and could not.
+
+        The button sent a bare MAV_CMD_NAV_TAKEOFF and nothing else. ArduPilot
+        accepts that only from an armed vehicle already in GUIDED, and their
+        screenshot shows LOITER and READY TO ARM, so the aircraft rejected it
+        every time. Worse, no command result was ever read back, so VGCS
+        reported "Takeoff command sent" and a success either way. A rejected
+        command that reports success is how an operator learns to distrust the
+        screen.
+
+        VGCS already had the sequence that works, wired to a different button
+        under a different name: mode, arm, wait for the vehicle to actually
+        report armed, then take off. Two takeoffs that behave differently is
+        the trap, so the button now does what its label says.
+        """
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before takeoff command.")
             return
         alt = max(1.0, float(alt_m))
-        self._thread.queue_takeoff(alt)
-        self._append_log(f"Takeoff queued: {alt:.1f}m")
+        # One click used to be one command that quietly did nothing. One click
+        # is now arming and flight, which is worth a question first.
+        answer = QMessageBox.question(
+            self,
+            "Takeoff",
+            f"Arm the aircraft and take off to {alt:.1f} m?\n\n"
+            "Propellers will spin and the aircraft will climb.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._append_log("Takeoff cancelled")
+            return
+        self._thread.queue_auto_takeoff(alt)
+        self._append_log(f"Takeoff queued: arm + climb to {alt:.1f} m")
 
     def _on_takeoff(self) -> None:
-        self._queue_nav_takeoff(self._takeoff_altitude_m(from_plan_rail=False))
+        self._request_takeoff(self._takeoff_altitude_m(from_plan_rail=False))
 
     def _on_land(self) -> None:
         if self._thread is None or not self._thread.isRunning():
