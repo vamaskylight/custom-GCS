@@ -141,8 +141,12 @@ class DooafSetupDialog(QDialog):
         parent=None,
         *,
         settings: DooafSettings | None = None,
+        artillery_lock=None,
     ) -> None:
         super().__init__(parent)
+        # None means no gate, which is what tests and any caller that has not
+        # opted in get. The map widget always passes one.
+        self._artillery_lock = artillery_lock
         self.setWindowTitle("DOOAF Setup")
         self.setModal(True)
         self.resize(480, 380)
@@ -252,6 +256,23 @@ class DooafSetupDialog(QDialog):
             btn_pick_gun_lrf,
             btn_clear_gun,
         )
+        # Password gate on the artillery position. Requested 2026-09-10: "when a
+        # user is trying to select the artillery one popup should come and
+        # password is required." Everything that could move the gun is locked
+        # until the popup is answered, including the direction-only mode, which
+        # decides the firing line the whole correction is measured along.
+        self._artillery_locked_widgets = tuple(self._gun_coord_widgets) + (
+            self._gun_assumed_chk,
+            self._gun_assumed_dir,
+        )
+        self._btn_artillery_unlock = QPushButton("Unlock")
+        self._btn_artillery_unlock.setObjectName("artilleryUnlockBtn")
+        self._btn_artillery_unlock.setToolTip(
+            "The artillery position is password protected. "
+            "Unlocking lasts until VGCS is closed."
+        )
+        self._btn_artillery_unlock.clicked.connect(self._on_artillery_unlock_clicked)
+        gun_actions.addWidget(self._btn_artillery_unlock)
         self._gun_assumed_chk.toggled.connect(self._on_gun_assumed_toggled)
         if s.assumed_gun_bearing_deg is not None:
             idx = self._gun_assumed_dir.findData(float(s.assumed_gun_bearing_deg))
@@ -259,6 +280,7 @@ class DooafSetupDialog(QDialog):
                 self._gun_assumed_dir.setCurrentIndex(idx)
             self._gun_assumed_chk.setChecked(True)
         self._on_gun_assumed_toggled(self._gun_assumed_chk.isChecked())
+        self._sync_artillery_lock_ui()
 
         tgt_box = QGroupBox("Actual target point (officer coordinates)")
         tgt_form = QFormLayout(tgt_box)
@@ -327,14 +349,52 @@ class DooafSetupDialog(QDialog):
             self._preset_combo.addItem(preset.name, preset.name)
         self._preset_combo.blockSignals(False)
 
+    # ------------------------------------------------------------ artillery lock
+    def _artillery_is_unlocked(self) -> bool:
+        lock = getattr(self, "_artillery_lock", None)
+        return True if lock is None else bool(lock.is_unlocked)
+
+    def _sync_artillery_lock_ui(self) -> None:
+        """Everything that could move the gun follows the lock."""
+        unlocked = self._artillery_is_unlocked()
+        for w in getattr(self, "_artillery_locked_widgets", ()):  # noqa: B007
+            try:
+                w.setEnabled(bool(unlocked))
+            except Exception:
+                pass
+        btn = getattr(self, "_btn_artillery_unlock", None)
+        if btn is not None:
+            btn.setVisible(not unlocked)
+        if unlocked:
+            # The assumed-direction combo has its own rule about being on only
+            # when the checkbox is; re-apply it so unlocking does not enable a
+            # control the form wants disabled for a different reason.
+            try:
+                self._on_gun_assumed_toggled(self._gun_assumed_chk.isChecked())
+            except Exception:
+                pass
+
+    def _on_artillery_unlock_clicked(self) -> None:
+        lock = getattr(self, "_artillery_lock", None)
+        if lock is None:
+            return
+        from vgcs.app.dooaf_auth_dialog import request_artillery_unlock
+
+        request_artillery_unlock(lock, self)
+        self._sync_artillery_lock_ui()
+
     def _apply_settings_to_form(self, settings: DooafSettings) -> None:
-        self._gun_lat.setText(
-            f"{float(settings.gun_lat):.7f}" if settings.gun_lat is not None else ""
-        )
-        self._gun_lon.setText(
-            f"{float(settings.gun_lon):.7f}" if settings.gun_lon is not None else ""
-        )
-        _set_optional_alt(self._gun_alt, settings.gun_alt_m)
+        # A saved position carries a gun as well as a target, so restoring one
+        # while locked would put an artillery position in without the password.
+        # The target still loads; only the gun is held back.
+        if self._artillery_is_unlocked():
+            self._gun_lat.setText(
+                f"{float(settings.gun_lat):.7f}" if settings.gun_lat is not None else ""
+            )
+            self._gun_lon.setText(
+                f"{float(settings.gun_lon):.7f}" if settings.gun_lon is not None else ""
+            )
+            _set_optional_alt(self._gun_alt, settings.gun_alt_m)
         self._tgt_lat.setText(
             f"{float(settings.target_lat):.7f}" if settings.target_lat is not None else ""
         )

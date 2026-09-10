@@ -509,6 +509,21 @@ class DooafOperationsMixin:
             pass
         return True
 
+    def _artillery_lock(self):
+        """One lock for the whole session, so unlocking once is enough.
+
+        Held on the widget rather than rebuilt per dialog: a lock that forgets
+        every time the dialog closes would ask for the password on each pick,
+        which trains people to type it without reading.
+        """
+        lock = getattr(self, "_artillery_lock_obj", None)
+        if lock is None:
+            from vgcs.app.dooaf_auth import ArtilleryLock
+
+            lock = ArtilleryLock(self._dooaf_settings_store())
+            self._artillery_lock_obj = lock
+        return lock
+
     def _record_terrain_estimate_alongside_laser(
         self,
         row: dict[str, object],
@@ -1547,6 +1562,15 @@ class DooafOperationsMixin:
         alt_m: float | None = None,
     ) -> None:
         """Write gun/target coords to QSettings and refresh the setup dialog fields."""
+        # Second line behind the disabled controls. The buttons that start a
+        # gun pick are already switched off while locked, so nothing should
+        # arrive here; if a pick is ever started another way, the artillery
+        # still does not move without the password.
+        if str(pick_role) in (DOOAF_ROLE_GUN, "gun_origin", DOOAF_PICK_GUN):
+            lock = getattr(self, "_artillery_lock_obj", None)
+            if lock is not None and not lock.is_unlocked:
+                self._set_status("Artillery position is locked — unlock it in DOOAF Setup")
+                return
         pick_alt = alt_m
         if pick_alt is None:
             pick_alt = self._dem_elevation_at(float(lat), float(lon))
@@ -1809,7 +1833,11 @@ class DooafOperationsMixin:
                 pass
             return
         st = self._dooaf_settings_store()
-        dlg = DooafSetupDialog(self, settings=self._resolved_dooaf_settings())
+        dlg = DooafSetupDialog(
+            self,
+            settings=self._resolved_dooaf_settings(),
+            artillery_lock=self._artillery_lock(),
+        )
         dlg.pick_point_requested.connect(
             lambda role: self._begin_dooaf_map_pick(role, dlg)
         )
