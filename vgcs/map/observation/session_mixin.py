@@ -210,6 +210,7 @@ class ObservationSessionMixin:
             and video_x is not None
             and video_y is not None
             and self._dooaf_lrf_geo_enabled()
+            and self._impact_uses_lrf()
         ):
             if self._lrf_lock_in_progress or self._pending_lrf_video_pick is not None:
                 self._set_status("LRF lock in progress — wait before marking impact…")
@@ -651,6 +652,24 @@ class ObservationSessionMixin:
         except Exception:
             # A read-out must never take the mark down with it.
             pass
+
+    def _impact_uses_lrf(self) -> bool:
+        """Whether marking a fall of shot goes through the laser at all.
+
+        Off by default. Requested 2026-09-11: "for impact Target we don't want
+        to use the LRF". With it off, an impact pick is placed from GPS, gimbal
+        angle and terrain, the same geometry as a ground-workflow pick, and the
+        camera never slews. The actual target is untouched by this and can
+        still be laser-locked, which is what they asked for.
+
+        Kept as a setting rather than deleted, because the laser is the more
+        accurate of the two when the aircraft is holding still and pointed at a
+        face, and a crew that wants that back should not need a new build.
+        """
+        raw = self._dooaf_settings_store().value("dooaf/impact_uses_lrf", False)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
     def _impact_round_count(self) -> int:
         """How many rounds have been marked in this session so far."""

@@ -97,6 +97,50 @@ def correction_block(correction: object) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def mean_correction_block(session: object) -> str:
+    """The correction averaged over every round marked so far.
+
+    Requested 2026-09-11: "we should be able to mark 2 impact Target and get
+    the mean of that two correction in the final popup."
+
+    Averaged as components along the firing line, never as Left and Add
+    magnitudes. Two rounds 19 m and 13 m out average to 16 m by that method,
+    but if they missed in opposite directions the real bias is nearer 3, and
+    correcting by 16 would throw the next round further out than doing nothing.
+
+    The spread is printed beside it because the two demand opposite responses.
+    The mean is bias, and the correction cancels it. The spread is scatter, it
+    is not correctable, and an operator who adjusts for it is chasing noise.
+    """
+    averaged = getattr(session, "averaged", None)
+    if averaged is None:
+        return ""
+    rounds = int(getattr(averaged, "rounds", 0) or 0)
+    if rounds < 2:
+        # One round says nothing about a mean, and labelling it as one would
+        # suggest a confidence a single observation cannot carry.
+        return ""
+    correction = getattr(session, "correction", None)
+    bearing = getattr(correction, "bearing_gun_to_intended_deg", None)
+    try:
+        along, right = averaged.along_across(float(bearing or 0.0))
+    except Exception:
+        return ""
+    # The stored values are the miss; the correction is its opposite, exactly
+    # as FireCorrection derives range_correction_m = -along.
+    corr_along = -float(along)
+    corr_right = -float(right)
+    lines = [f"Mean of {rounds} rounds:"]
+    lines.append(
+        f"{'Right' if corr_right >= 0 else 'Left'}: {abs(corr_right):.0f} m"
+    )
+    lines.append(f"{'Add' if corr_along >= 0 else 'Drop'}: {abs(corr_along):.0f} m")
+    spread = getattr(averaged, "dispersion_m", None)
+    if spread is not None:
+        lines.append(f"Spread: {float(spread):.0f} m")
+    return "\n".join(lines)
+
+
 def dooaf_popup_text(session: object) -> str:
     """Everything known so far: target, fall of shot, and the correction.
 
@@ -110,6 +154,9 @@ def dooaf_popup_text(session: object) -> str:
         point_block(TARGET_HEADING, getattr(session, "intended", None)),
         point_block(IMPACT_HEADING, getattr(session, "impact", None)),
         correction_block(getattr(session, "correction", None)),
+        # Last, because the correction above is the newest round and is what
+        # gets applied now; the mean is the shoot as a whole.
+        mean_correction_block(session),
     ]
     return "\n\n".join(b for b in blocks if b)
 
