@@ -613,6 +613,8 @@ class MavlinkThread(QThread):
                 except Exception:
                     mode_text = ""
                 if primary:
+                    self._remember_vehicle_mode(mode_text)
+                if primary:
                     self._emit_telemetry_payload(
                         "HEARTBEAT",
                         {
@@ -1979,6 +1981,44 @@ class MavlinkThread(QThread):
                 return True
         return False
 
+    def _remember_vehicle_mode(self, mode_text: str) -> None:
+        """Keep the mode the vehicle reports, so a failed takeoff can restore it.
+
+        A blank is ignored rather than stored: pymavlink returns one when it
+        cannot decode the mode, and forgetting where the aircraft was is worse
+        than keeping a slightly old answer.
+        """
+        name = str(mode_text or "").strip()
+        if name:
+            self._vehicle_mode_name = name
+
+    def _current_mode_name(self) -> str | None:
+        """The mode the vehicle last reported, by name."""
+        name = str(getattr(self, "_vehicle_mode_name", "") or "").strip()
+        return name or None
+
+    def _restore_mode_after_failed_takeoff(self, mode: str | None) -> None:
+        """Put the aircraft back in the mode it was in before a takeoff that did not happen.
+
+        Leaving it in GUIDED after a refusal is a trap. GUIDED declines arming
+        from the transmitter unless its AllowArmingFromTX option is set, so the
+        crew's habit of arming on the sticks silently stopped working the
+        moment a takeoff failed (2026-09-11: "Arm: Guided mode not armable",
+        which was their RC, not us).
+
+        Never done while armed. The vehicle may be airborne, and a mode change
+        under it is not something to do on the way out of an error path.
+        """
+        if not mode or bool(getattr(self, "_vehicle_armed", False)):
+            return
+        if self._current_mode_name() == mode:
+            return
+        try:
+            self._master.set_mode(mode)
+        except Exception:
+            return
+        self.log_line.emit(f"Takeoff did not happen — mode put back to {mode}")
+
     def _wait_mode(self, mode: str, timeout_s: float = _MODE_CONFIRM_TIMEOUT_S) -> bool:
         """Confirm the vehicle really entered a mode.
 
@@ -2340,6 +2380,10 @@ class MavlinkThread(QThread):
             self.action_result.emit("auto_takeoff", False, "Link not ready")
             self.error.emit("Auto takeoff: link not ready")
             return
+        # Noted before anything is changed, so a refusal can undo the mode
+        # switch instead of leaving the aircraft somewhere the operator did not
+        # put it.
+        mode_before = self._current_mode_name()
         try:
             self._sync_link_targets()
             # GUIDED, for two reasons. NAV_TAKEOFF is only accepted in GUIDED
@@ -2376,6 +2420,7 @@ class MavlinkThread(QThread):
             self.action_result.emit("auto_takeoff", True, f"Armed + takeoff {alt:.1f} m")
             self.log_line.emit(f"Auto takeoff: armed + NAV_TAKEOFF {alt:.1f} m")
         except Exception as e:
+            self._restore_mode_after_failed_takeoff(mode_before)
             self.action_result.emit("auto_takeoff", False, str(e))
             self.error.emit(f"Auto takeoff failed: {e}")
 
