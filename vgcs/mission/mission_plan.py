@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 
 from pymavlink import mavutil
 
-from vgcs.mission.waypoint_store import Waypoint
+from vgcs.mission.waypoint_store import MAX_WP_HOVER_S, Waypoint, clamp_hover_seconds
 
 __all__ = [
     "MISSION_END_ACTIONS",
@@ -40,6 +40,7 @@ __all__ = [
     "validate_waypoints",
     "normalize_end_action",
     "haversine_m",
+    "MAX_WP_HOVER_S",
 ]
 
 _m = mavutil.mavlink
@@ -96,6 +97,10 @@ class MissionPlan:
     # How many payload releases this mission carries, so the upload can say so
     # out loud. A servo command that fires unexpectedly is a dropped payload.
     drop_count: int = 0
+    # Total seconds the aircraft will spend holding position at waypoints. This
+    # is flight time that does not appear in the plan's distance, so it belongs
+    # in the upload log next to the item count.
+    hover_total_s: int = 0
 
     def __len__(self) -> int:
         return len(self.items)
@@ -257,6 +262,13 @@ def _wp_drop_payload(wp: object) -> bool:
     return bool(getattr(wp, "drop_payload", False))
 
 
+def _wp_hover_s(wp: object) -> int:
+    """Seconds to hold position at this waypoint, clamped to whole seconds."""
+    if isinstance(wp, dict):
+        return clamp_hover_seconds(wp.get("hover_s", 0))
+    return clamp_hover_seconds(getattr(wp, "hover_s", 0))
+
+
 @dataclass(frozen=True)
 class PayloadServo:
     """How the payload release is wired on this aircraft.
@@ -351,6 +363,16 @@ def build_mission_plan(
             seq += 1
             commanded_speed = spd
 
+        # Hover on arrival. NAV_WAYPOINT param1 is ArduCopter's own hold time
+        # in whole seconds (ModeAuto::do_nav_wp stores it as loiter_time_max),
+        # so this needs no extra mission item and no extra seq to shift.
+        #
+        # It does move two things later, both correctly: MISSION_ITEM_REACHED
+        # is sent when verify_nav_wp finally returns true, which is at the END
+        # of the hold, so the map crosses the point off when the aircraft
+        # actually leaves it. And a payload drop, being a DO_ command after
+        # this one, fires at the end of the hover too: arrive, settle, release.
+        hover_s = _wp_hover_s(wp)
         plan.items.append(
             MissionItem(
                 seq=seq,
@@ -358,11 +380,13 @@ def build_mission_plan(
                 lat=_wp_field(wp, "lat", 0.0),
                 lon=_wp_field(wp, "lon", 0.0),
                 alt_m=max(MIN_WP_ALT_M, _wp_field(wp, "alt_m", 20.0)),
+                p1=float(hover_s),
                 wp_index=idx,
-                label=f"WP {idx + 1}",
+                label=f"WP {idx + 1}" + (f" (hover {hover_s} s)" if hover_s else ""),
             )
         )
         seq += 1
+        plan.hover_total_s += hover_s
 
         # Payload drop, immediately after arriving at this point. Requested
         # 2026-09-11. DO_ commands run once the preceding NAV command has been
@@ -504,12 +528,19 @@ def parse_downloaded_mission(
         if abs(lat) < 1e-9 and abs(lon) < 1e-9:
             continue
         alt = float(row.get("alt_m", 20.0) or 0.0)
+        # NAV_WAYPOINT param1 is the hold time. NAV_LOITER_TIME uses param1 the
+        # same way, and for the other loiter commands param1 is turns or a
+        # radius, which is not a hover and must not be read as one.
+        hover = 0
+        if cmd in (int(_m.MAV_CMD_NAV_WAYPOINT), int(_m.MAV_CMD_NAV_LOITER_TIME)):
+            hover = clamp_hover_seconds(row.get("p1", row.get("param1", 0)))
         waypoints.append(
             Waypoint(
                 lat=lat,
                 lon=lon,
                 alt_m=max(MIN_WP_ALT_M, alt),
                 speed_mps=max(MIN_WP_SPEED_MPS, speed),
+                hover_s=hover,
             )
         )
 

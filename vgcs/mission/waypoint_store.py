@@ -7,6 +7,20 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
+# ArduPilot stores a NAV_WAYPOINT hold time in a uint16, and a plan that parks
+# the aircraft for longer than this is a typo rather than an intention.
+MAX_WP_HOVER_S = 3600
+
+
+def clamp_hover_seconds(raw: object) -> int:
+    """Whole, non-negative seconds. Anything unreadable means no hover."""
+    try:
+        n = int(float(raw))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(MAX_WP_HOVER_S, n))
+
+
 @dataclass
 class Waypoint:
     lat: float
@@ -17,6 +31,11 @@ class Waypoint:
     # servo in our drone so if i plot the 5 waypoint ... suppose drone is
     # arrived point 1 then servo payload will drop".
     drop_payload: bool = False
+    # Seconds to hold position on arrival before flying on. Requested
+    # 2026-09-11: "before upload the mission i will set the hover time like 5s
+    # or 10s that means drone will hover every point". Whole seconds, because
+    # ArduPilot stores a NAV_WAYPOINT hold time as a uint16 of seconds.
+    hover_s: int = 0
 
 
 def save_waypoints_json(
@@ -68,6 +87,9 @@ def load_waypoints_json(path: str | Path) -> list[Waypoint]:
                 # Absent in plans saved before payload drops existed, which
                 # must load as "no drop" rather than dropping unexpectedly.
                 drop_payload=bool(row.get("drop_payload", False)),
+                # Likewise absent in older plans, which must load as "do not
+                # hover" rather than stalling the mission at every point.
+                hover_s=clamp_hover_seconds(row.get("hover_s", 0)),
             )
         )
     return out

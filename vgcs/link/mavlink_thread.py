@@ -1574,9 +1574,14 @@ class MavlinkThread(QThread):
             if plan.drop_count
             else ""
         )
+        # Hover is flight time that the plan's distance does not account for,
+        # so it is said out loud before the mission is uploaded rather than
+        # discovered as an aircraft sitting still over a waypoint.
+        hover = f", {plan.hover_total_s} s hovering" if plan.hover_total_s else ""
         self.log_line.emit(
             f"Mission upload start: {len(waypoints)} WPs -> {count} mission items "
-            f"(home slot + takeoff {plan.takeoff_alt_m:.0f} m, end={plan.end_action}{drops})"
+            f"(home slot + takeoff {plan.takeoff_alt_m:.0f} m, "
+            f"end={plan.end_action}{drops}{hover})"
         )
         self._sync_link_targets()
         self._mission_clear_for_upload_best_effort()

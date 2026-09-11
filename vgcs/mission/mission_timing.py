@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from vgcs.mission.mission_plan import haversine_m
+from vgcs.mission.waypoint_store import clamp_hover_seconds
 
 __all__ = ["MissionTiming", "estimate_mission_time"]
 
@@ -40,6 +41,11 @@ class MissionTiming:
     return_m: float = 0.0
     """Straight-line distance from the last waypoint back to the start."""
     return_s: float = 0.0
+    hover_s: float = 0.0
+    """Time spent holding position at waypoints, already included in
+    ``outbound_s``. Hovering adds no distance, so a plan whose duration is
+    derived from its length alone under-reports it — which is the mistake this
+    module exists to stop."""
     mission_returns_home: bool = False
     """True when the plan itself flies home (end action RTL). When False the
     return legs are still populated — the aircraft must get back regardless, and
@@ -78,13 +84,16 @@ def estimate_mission_time(
 
     legs: list[tuple[float, float]] = []   # (metres, speed for that leg)
     prev = start
-    for lat, lon, speed in pts:
+    for lat, lon, speed, _hold in pts:
         if prev is not None:
             legs.append((haversine_m(prev[0], prev[1], lat, lon), speed))
         prev = (lat, lon)
 
     out_m = sum(d for d, _ in legs)
-    out_s = sum(d / s for d, s in legs if s > 0.0)
+    # Hover at every waypoint, the last one included: the aircraft holds there
+    # before whatever the end action is, and the battery pays for it.
+    hover_s = float(sum(hold for _, _, _, hold in pts))
+    out_s = sum(d / s for d, s in legs if s > 0.0) + hover_s
 
     ret_m = 0.0
     ret_s = 0.0
@@ -100,6 +109,7 @@ def estimate_mission_time(
         outbound_s=out_s,
         return_m=ret_m,
         return_s=ret_s,
+        hover_s=hover_s,
         mission_returns_home=str(end_action or "").strip().lower() == "rtl",
     )
 
@@ -109,8 +119,8 @@ def format_hms(seconds: float) -> str:
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
-def _points(waypoints) -> list[tuple[float, float, float]]:
-    out: list[tuple[float, float, float]] = []
+def _points(waypoints) -> list[tuple[float, float, float, int]]:
+    out: list[tuple[float, float, float, int]] = []
     for wp in waypoints or []:
         lat = _f(_attr(wp, "lat"))
         lon = _f(_attr(wp, "lon"))
@@ -119,7 +129,8 @@ def _points(waypoints) -> list[tuple[float, float, float]]:
         if abs(lat) < 1e-9 and abs(lon) < 1e-9:
             continue
         spd = _f(_attr(wp, "speed_mps"))
-        out.append((lat, lon, spd if spd and spd > 0.0 else DEFAULT_SPEED_MPS))
+        hold = clamp_hover_seconds(_attr(wp, "hover_s") or 0)
+        out.append((lat, lon, spd if spd and spd > 0.0 else DEFAULT_SPEED_MPS, hold))
     return out
 
 

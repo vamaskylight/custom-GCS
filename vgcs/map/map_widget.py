@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QDialog,
     QPushButton,
+    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -151,6 +152,7 @@ from vgcs.observe.target_measure import (
 )
 from vgcs.mission import (
     DEFAULT_MISSION_END_ACTION,
+    MAX_WP_HOVER_S,
     Waypoint,
     load_waypoints_json,
     save_waypoints_json,
@@ -1814,6 +1816,24 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
             "mission/payload_servo_*."
         )
         self._btn_apply_all_speed = QPushButton("Set All Speed")
+        # Hover on arrival, set before upload. Requested 2026-09-11: "before
+        # upload the mission i will set the hover time like 5s or 10s that
+        # means drone will hover every point which i set the hover time".
+        self._wp_hover = QSpinBox()
+        self._wp_hover.setRange(0, MAX_WP_HOVER_S)
+        self._wp_hover.setSingleStep(1)
+        self._wp_hover.setValue(0)
+        # The label lives in the box: row 2 of this grid has three free cells
+        # before the tile buttons, and the two Set buttons need two of them.
+        self._wp_hover.setPrefix("Hover ")
+        self._wp_hover.setSuffix(" s")
+        self._wp_hover.setToolTip(
+            "Seconds to hold position on arrival before flying to the next\n"
+            "waypoint. 0 flies straight through. A waypoint that also drops\n"
+            "the payload releases at the end of its hover."
+        )
+        self._btn_apply_wp_hover = QPushButton("Set WP Hover")
+        self._btn_apply_all_hover = QPushButton("Set All Hover")
         tools.addWidget(self._btn_add_wp, 0, 0)
         tools.addWidget(self._btn_clear_wp, 0, 1)
         tools.addWidget(self._btn_upload, 0, 2)
@@ -1846,6 +1866,9 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         tools.addWidget(self._btn_apply_wp_speed, 2, 2)
         tools.addWidget(self._btn_apply_all_speed, 2, 3)
         tools.addWidget(self._wp_drop_payload, 2, 4)
+        tools.addWidget(self._wp_hover, 2, 5)
+        tools.addWidget(self._btn_apply_wp_hover, 2, 6)
+        tools.addWidget(self._btn_apply_all_hover, 2, 7)
         tools.addWidget(self._btn_tiles_esri, 2, 8)
         tools.addWidget(self._btn_tiles_osm, 2, 9)
         tools.addWidget(self._btn_tiles_sat, 2, 10)
@@ -1909,6 +1932,8 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_apply_wp_alt.clicked.connect(self._apply_altitude_to_selected)
         self._btn_apply_all_alt.clicked.connect(self._apply_altitude_to_all)
         self._btn_apply_wp_speed.clicked.connect(self._apply_speed_to_selected)
+        self._btn_apply_wp_hover.clicked.connect(self._apply_hover_to_selected)
+        self._btn_apply_all_hover.clicked.connect(self._apply_hover_to_all)
         self._btn_apply_all_speed.clicked.connect(self._apply_speed_to_all)
 
         self._wp_poll = QTimer(self)

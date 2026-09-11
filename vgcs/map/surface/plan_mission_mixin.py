@@ -17,6 +17,7 @@ from vgcs.map.surface.settings_keys import (
 from vgcs.mission import (
     DEFAULT_MISSION_END_ACTION,
     Waypoint,
+    clamp_hover_seconds,
     load_mission_end_action,
     load_waypoints_json,
     normalize_end_action,
@@ -441,13 +442,20 @@ class PlanMissionMixin:
                 # and a payload flag lost the same way is a drop that does not
                 # happen.
                 drop = bool(getattr(match, "drop_payload", False))
+                hover = int(getattr(match, "hover_s", 0) or 0)
             else:
                 alt = float(self._default_alt.value())
                 spd = float(self._default_speed.value())
                 drop = False
+                hover = 0
             waypoints.append(
                 Waypoint(
-                    lat=lat, lon=lon, alt_m=alt, speed_mps=spd, drop_payload=drop
+                    lat=lat,
+                    lon=lon,
+                    alt_m=alt,
+                    speed_mps=spd,
+                    drop_payload=drop,
+                    hover_s=hover,
                 )
             )
         return waypoints
@@ -680,6 +688,11 @@ class PlanMissionMixin:
                 drop.blockSignals(True)
                 drop.setChecked(bool(getattr(wp, "drop_payload", False)))
                 drop.blockSignals(False)
+            hover = getattr(self, "_wp_hover", None)
+            if hover is not None:
+                # Unlike alt and speed, which are applied with a button, this
+                # box is also read back on selection, so show what is stored.
+                hover.setValue(int(getattr(wp, "hover_s", 0) or 0))
         self.plan_waypoint_selection_changed.emit(self.selected_waypoint_index())
 
     def _on_wp_drop_payload_toggled(self, checked: bool) -> None:
@@ -797,3 +810,25 @@ class PlanMissionMixin:
             setattr(wp, "speed_mps", spd)
         self.waypoints_changed.emit(list(self._waypoints_model))
         self._set_status(f"Updated all waypoint speeds to {spd:.1f} m/s")
+
+    def _apply_hover_to_selected(self) -> None:
+        """Hold time at the selected waypoint. Requested 2026-09-11."""
+        idx = self._wp_selector.currentIndex()
+        if idx < 0 or idx >= len(self._waypoints_model):
+            self._set_status("No waypoint selected")
+            return
+        hover = clamp_hover_seconds(self._wp_hover.value())
+        setattr(self._waypoints_model[idx], "hover_s", hover)
+        self.waypoints_changed.emit(list(self._waypoints_model))
+        self._set_status(f"Updated WP {idx + 1} hover to {hover} s")
+
+    def _apply_hover_to_all(self) -> None:
+        """The usual case: one hold time at every point in the plan."""
+        if not self._waypoints_model:
+            self._set_status("No waypoints available")
+            return
+        hover = clamp_hover_seconds(self._wp_hover.value())
+        for wp in self._waypoints_model:
+            setattr(wp, "hover_s", hover)
+        self.waypoints_changed.emit(list(self._waypoints_model))
+        self._set_status(f"Updated all waypoint hover times to {hover} s")

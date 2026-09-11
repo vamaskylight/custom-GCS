@@ -197,6 +197,7 @@ class MainWindowPlanMissionMixin:
                 "alt_m": float(getattr(wp, "alt_m", 20.0)),
                 "speed_mps": float(getattr(wp, "speed_mps", 5.0)),
                 "drop_payload": bool(getattr(wp, "drop_payload", False)),
+                "hover_s": int(getattr(wp, "hover_s", 0) or 0),
             }
             for wp in waypoints
         ]
@@ -340,6 +341,7 @@ class MainWindowPlanMissionMixin:
                     alt_m=wp.alt_m,
                     speed_mps=wp.speed_mps,
                     drop_payload=bool(getattr(wp, "drop_payload", False)),
+                    hover_s=int(getattr(wp, "hover_s", 0) or 0),
                 ),
             )
             self._map_widget.set_waypoints(model)
