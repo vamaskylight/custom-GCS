@@ -78,6 +78,11 @@ _MAX_CONSECUTIVE_DECODE_ERRORS = 20
 # message sends the operator after the wrong fault.
 _PREARM_REASON_MAX_AGE_S = 30.0
 
+# How long to wait for a heartbeat confirming a commanded mode change. set_mode
+# is fire and forget, and arming in a mode the vehicle never entered is how a
+# takeoff ends up sent into the wrong mode.
+_MODE_CONFIRM_TIMEOUT_S = 3.0
+
 # How the vehicle answers an arm request. "Denied" and "temporarily rejected"
 # call for opposite responses from the operator, so they are never collapsed
 # into one "failed".
@@ -1844,23 +1849,34 @@ class MavlinkThread(QThread):
             self.mode_changed.emit(mode_name, False)
             self.error.emit(f"Mode change failed: {e}")
 
-    def _ensure_armable_mode_before_arm(self) -> None:
-        """ArduCopter rejects arming in AUTO; switch to a manual mode first (SITL/GCS)."""
+    def _ensure_armable_mode_before_arm(self, prefer: tuple[str, ...] = ()) -> str | None:
+        """Switch to a mode that can arm. Returns the mode that took, or None.
+
+        ArduCopter rejects arming in AUTO, so a mode change is needed first.
+        ``prefer`` goes in front of the usual list: a GCS takeoff wants GUIDED,
+        which is not just about the takeoff working. ArduCopter skips the
+        throttle-stick check when a GCS arms in GUIDED or AUTO, and applies it
+        everywhere else. Arming in STABILIZE is why the crew had to hold the
+        throttle down on the RC to take off from the ground station
+        (2026-09-11), which rather defeats the point of a ground station.
+        """
         if self._master is None:
-            return
+            return None
         if self._vehicle_armed:
             # Already armed means it may be airborne. STABILIZE hands throttle back to the
             # (possibly absent) RC stick — never do that to a flying aircraft.
             self.log_line.emit("Pre-arm mode switch skipped: vehicle already armed")
-            return
-        for mode in ("STABILIZE", "ALT_HOLD", "LOITER"):
+            return None
+        for mode in tuple(prefer) + ("STABILIZE", "ALT_HOLD", "LOITER"):
             try:
                 self._master.set_mode(mode)
-                self.log_line.emit(f"Pre-arm: switched to {mode} (required to arm)")
-                time.sleep(0.15)
-                return
             except Exception:
                 continue
+            if self._wait_mode(mode):
+                self.log_line.emit(f"Pre-arm: switched to {mode} (required to arm)")
+                return mode
+            self.log_line.emit(f"Pre-arm: {mode} did not take — trying the next mode")
+        return None
 
     def _remember_prearm_reason(self, text: str) -> None:
         """Keep the vehicle's own PreArm line so a refusal can quote it.
@@ -1873,7 +1889,12 @@ class MavlinkThread(QThread):
         showing it to them.
         """
         line = str(text or "").strip()
-        if not line.lower().startswith("prearm"):
+        # ArduPilot says "PreArm: ..." for the pre-arm checks and "Arm: ..."
+        # for the ones run at the moment of arming, and it was the second kind
+        # the crew actually hit: "Arm: Throttle too high", "Arm: Yaw (RC4) is
+        # not neutral". Matching only the first left those unreported.
+        low = line.lower()
+        if not (low.startswith("prearm") or low.startswith("arm:")):
             return
         self._last_prearm_reason = line
         self._last_prearm_reason_mono = time.monotonic()
@@ -1918,9 +1939,24 @@ class MavlinkThread(QThread):
         handled here now, and forwarded on so the rest of the app still sees
         them.
         """
+        return self._pump_link_until(
+            lambda m: bool(
+                getattr(m, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            ),
+            timeout_s,
+        )
+
+    def _pump_link_until(self, predicate, timeout_s: float) -> bool:
+        """Read from the link until ``predicate`` accepts a heartbeat, or time runs out.
+
+        Every wait in this class goes through here, so that STATUSTEXT and
+        COMMAND_ACK are handled rather than silently consumed. A wait with a
+        narrower filter destroys exactly the messages that explain why the wait
+        is failing, which is the bug this replaced.
+        """
         if self._master is None:
             return False
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + float(timeout_s)
         while self._running and self._master is not None and time.monotonic() < deadline:
             self._maybe_send_gcs_heartbeat()
             msg = self._master.recv_match(
@@ -1939,9 +1975,30 @@ class MavlinkThread(QThread):
             if msg_type == "COMMAND_ACK":
                 self._remember_arm_ack(msg)
                 continue
-            if bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+            if predicate(msg):
                 return True
         return False
+
+    def _wait_mode(self, mode: str, timeout_s: float = _MODE_CONFIRM_TIMEOUT_S) -> bool:
+        """Confirm the vehicle really entered a mode.
+
+        set_mode is fire and forget. Believing it means arming in a mode the
+        vehicle never took, and the takeoff that follows is then sent into
+        whatever mode it is actually in.
+        """
+        try:
+            mapping = self._master.mode_mapping() or {}
+            want = mapping.get(str(mode))
+        except Exception:
+            want = None
+        if want is None:
+            # Nothing to compare against on this firmware; give it a moment and
+            # take the mode change on trust rather than refusing to fly at all.
+            time.sleep(0.15)
+            return True
+        return self._pump_link_until(
+            lambda m: int(getattr(m, "custom_mode", -1)) == int(want), timeout_s
+        )
 
     def _handle_statustext(self, msg) -> None:
         """Keep a pre-arm line and pass the text on to the rest of the app."""
@@ -2285,7 +2342,17 @@ class MavlinkThread(QThread):
             return
         try:
             self._sync_link_targets()
-            self._ensure_armable_mode_before_arm()
+            # GUIDED, for two reasons. NAV_TAKEOFF is only accepted in GUIDED
+            # or AUTO, so arming anywhere else gives an aircraft that arms and
+            # then sits there. And ArduCopter skips the throttle-stick check
+            # when a GCS arms in GUIDED, which is what let the crew take off
+            # without holding the throttle down on the RC.
+            mode = self._ensure_armable_mode_before_arm(prefer=("GUIDED",))
+            if mode != "GUIDED":
+                raise RuntimeError(
+                    "could not enter GUIDED, which takeoff needs (it usually "
+                    f"means no GPS position yet){'' if mode is None else f'; stayed in {mode}'}"
+                )
             self._send_command_long(
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                 p1=1.0,
