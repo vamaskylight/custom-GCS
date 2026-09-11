@@ -78,6 +78,19 @@ _MAX_CONSECUTIVE_DECODE_ERRORS = 20
 # message sends the operator after the wrong fault.
 _PREARM_REASON_MAX_AGE_S = 30.0
 
+# How the vehicle answers an arm request. "Denied" and "temporarily rejected"
+# call for opposite responses from the operator, so they are never collapsed
+# into one "failed".
+_ARM_ACK_RESULTS = {
+    0: "the vehicle accepted the arm command",
+    1: "temporarily rejected, the vehicle is busy - try again in a moment",
+    2: "denied, a pre-arm check is failing",
+    3: "unsupported, this vehicle does not accept the arm command",
+    4: "failed, the vehicle could not carry it out",
+    5: "in progress",
+    6: "cancelled",
+}
+
 
 def _force_arm_allowed() -> bool:
     return str(os.environ.get(_FORCE_ARM_ENV, "")).strip() in ("1", "true", "TRUE", "yes")
@@ -630,15 +643,9 @@ class MavlinkThread(QThread):
                 # Fires once per completed item — the only reliable "WP N done" event.
                 self._emit_mission_progress(int(getattr(msg, "seq", 0) or 0), reached=True)
             elif msg_type == "STATUSTEXT":
-                status_text = str(getattr(msg, "text", "") or "").strip()
-                self._remember_prearm_reason(status_text)
-                self._emit_telemetry_payload(
-                    "STATUSTEXT",
-                    {
-                        "severity": int(getattr(msg, "severity", 0) or 0),
-                        "text": status_text,
-                    },
-                )
+                self._handle_statustext(msg)
+            elif msg_type == "COMMAND_ACK":
+                self._remember_arm_ack(msg)
             elif msg_type == "VFR_HUD":
                 self._emit_telemetry_payload(
                     "VFR_HUD",
@@ -1878,25 +1885,46 @@ class MavlinkThread(QThread):
         # A pre-arm line from ten minutes ago may already have been cleared, so
         # an old one is not presented as the cause of this refusal.
         fresh = reason and (time.monotonic() - seen_mono) <= _PREARM_REASON_MAX_AGE_S
+        ack = self._arm_ack_text()
         if fresh:
             return (
                 f"the vehicle refused to arm - {reason}. Fix that rather than "
                 "forcing it into the air"
             )
+        if ack:
+            # No PreArm line, but the vehicle still answered the command, and
+            # "denied" versus "temporarily rejected" is the whole difference
+            # between a fault to fix and a moment to wait.
+            return (
+                f"the vehicle refused to arm - {ack}. Check the vehicle "
+                "messages rather than forcing it into the air"
+            )
         return (
-            "the vehicle refused to arm, and reported no pre-arm reason - check "
-            "the vehicle messages rather than forcing it into the air"
+            "the vehicle refused to arm and said nothing at all - check the link "
+            "and the vehicle's pre-arm messages rather than forcing it into the air"
         )
 
     def _wait_vehicle_armed(self, timeout_s: float = 8.0) -> bool:
-        """Poll HEARTBEAT until vehicle reports SAFETY_ARMED or timeout."""
+        """Wait for SAFETY_ARMED, listening to what the vehicle says meanwhile.
+
+        This used to filter on HEARTBEAT alone. For the whole eight seconds of
+        the wait, every STATUSTEXT and COMMAND_ACK the vehicle sent was
+        consumed by the parser and dropped, and that is precisely the window in
+        which ArduPilot explains why it will not arm.
+
+        So the refusal reason was being destroyed by the code trying to report
+        it (2026-09-11: "the vehicle refused to arm, and reported no pre-arm
+        reason", on a vehicle that had certainly said one). The messages are
+        handled here now, and forwarded on so the rest of the app still sees
+        them.
+        """
         if self._master is None:
             return False
         deadline = time.monotonic() + timeout_s
         while self._running and self._master is not None and time.monotonic() < deadline:
             self._maybe_send_gcs_heartbeat()
             msg = self._master.recv_match(
-                type=["HEARTBEAT"],
+                type=["HEARTBEAT", "STATUSTEXT", "COMMAND_ACK"],
                 blocking=True,
                 timeout=0.35,
             )
@@ -1904,9 +1932,59 @@ class MavlinkThread(QThread):
                 continue
             if int(msg.get_srcSystem()) != int(self._target_sysid):
                 continue
+            msg_type = msg.get_type()
+            if msg_type == "STATUSTEXT":
+                self._handle_statustext(msg)
+                continue
+            if msg_type == "COMMAND_ACK":
+                self._remember_arm_ack(msg)
+                continue
             if bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
                 return True
         return False
+
+    def _handle_statustext(self, msg) -> None:
+        """Keep a pre-arm line and pass the text on to the rest of the app."""
+        text = str(getattr(msg, "text", "") or "").strip()
+        self._remember_prearm_reason(text)
+        self._emit_telemetry_payload(
+            "STATUSTEXT",
+            {
+                "severity": int(getattr(msg, "severity", 0) or 0),
+                "text": text,
+            },
+        )
+
+    def _remember_arm_ack(self, msg) -> None:
+        """Record how the vehicle answered the arm command.
+
+        Nothing in this class read a COMMAND_ACK before. The vehicle answers
+        every arm request with a result code, and that code is the difference
+        between "the checks failed" and "it is busy, try again", which the
+        operator otherwise has to guess at.
+        """
+        try:
+            command = int(getattr(msg, "command", -1))
+        except (TypeError, ValueError):
+            return
+        if command != int(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM):
+            return
+        try:
+            result = int(getattr(msg, "result", -1))
+        except (TypeError, ValueError):
+            return
+        self._last_arm_ack_result = result
+        self._last_arm_ack_mono = time.monotonic()
+
+    def _arm_ack_text(self) -> str:
+        """The vehicle's answer to the arm command, in words, or empty."""
+        result = getattr(self, "_last_arm_ack_result", None)
+        seen = float(getattr(self, "_last_arm_ack_mono", 0.0) or 0.0)
+        if result is None:
+            return ""
+        if (time.monotonic() - seen) > _PREARM_REASON_MAX_AGE_S:
+            return ""
+        return _ARM_ACK_RESULTS.get(int(result), f"vehicle answered result {int(result)}")
 
     def _mission_start(self) -> None:
         if self._master is None:

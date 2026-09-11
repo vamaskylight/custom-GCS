@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import time
@@ -156,8 +157,29 @@ def _fetch_http_bytes_qt(url: str, *, timeout_s: float = 5.0) -> bytes:
     raise OSError(err[0] if err else "timeout")
 
 
+def network_is_blocked() -> bool:
+    """True when this process must not make outbound requests.
+
+    Every tile fetch and the startup tile probe go through
+    ``fetch_tile_http_bytes``, so one switch covers both. Set
+    ``VGCS_NO_NETWORK=1`` for a run that must stay off the wire. The test suite
+    sets it for every test: building a MapWidget used to reach
+    server.arcgisonline.com from the operator's own machine, which is not
+    something a unit test gets to decide to do, and a stalled probe once looked
+    exactly like a hung test run.
+    """
+    return str(os.environ.get("VGCS_NO_NETWORK", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def fetch_tile_http_bytes(url: str, *, timeout_s: float = 5.0) -> bytes:
     """Fetch tile bytes — urllib first (worker-safe), then Qt network on the main thread path."""
+    if network_is_blocked():
+        raise OSError("network disabled (VGCS_NO_NETWORK)")
     if url.startswith("http://") or url.startswith("https://"):
         try:
             return _fetch_http_bytes_urllib(url, timeout_s=timeout_s)
