@@ -73,6 +73,11 @@ _FORCE_ARM_ENV = "VGCS_ALLOW_FORCE_ARM"
 # resets the count.
 _MAX_CONSECUTIVE_DECODE_ERRORS = 20
 
+# A PreArm line older than this is not quoted as the reason for a refusal that
+# just happened: the condition may already have cleared, and blaming a stale
+# message sends the operator after the wrong fault.
+_PREARM_REASON_MAX_AGE_S = 30.0
+
 
 def _force_arm_allowed() -> bool:
     return str(os.environ.get(_FORCE_ARM_ENV, "")).strip() in ("1", "true", "TRUE", "yes")
@@ -625,11 +630,13 @@ class MavlinkThread(QThread):
                 # Fires once per completed item — the only reliable "WP N done" event.
                 self._emit_mission_progress(int(getattr(msg, "seq", 0) or 0), reached=True)
             elif msg_type == "STATUSTEXT":
+                status_text = str(getattr(msg, "text", "") or "").strip()
+                self._remember_prearm_reason(status_text)
                 self._emit_telemetry_payload(
                     "STATUSTEXT",
                     {
                         "severity": int(getattr(msg, "severity", 0) or 0),
-                        "text": str(getattr(msg, "text", "") or "").strip(),
+                        "text": status_text,
                     },
                 )
             elif msg_type == "VFR_HUD":
@@ -1848,6 +1855,39 @@ class MavlinkThread(QThread):
             except Exception:
                 continue
 
+    def _remember_prearm_reason(self, text: str) -> None:
+        """Keep the vehicle's own PreArm line so a refusal can quote it.
+
+        Reported 2026-09-11: the crew pressed Takeoff, got "the vehicle refused
+        to arm - fix the pre-arm message it reported", and concluded the
+        problem was that no propellers were fitted. The actual reason, "PreArm:
+        GPS positions differ by 56.1m", had gone past in the console minutes
+        earlier. Telling someone to go and read a message is not the same as
+        showing it to them.
+        """
+        line = str(text or "").strip()
+        if not line.lower().startswith("prearm"):
+            return
+        self._last_prearm_reason = line
+        self._last_prearm_reason_mono = time.monotonic()
+
+    def _arm_refusal_message(self) -> str:
+        """Why the vehicle would not arm, in its own words where we have them."""
+        reason = str(getattr(self, "_last_prearm_reason", "") or "").strip()
+        seen_mono = float(getattr(self, "_last_prearm_reason_mono", 0.0) or 0.0)
+        # A pre-arm line from ten minutes ago may already have been cleared, so
+        # an old one is not presented as the cause of this refusal.
+        fresh = reason and (time.monotonic() - seen_mono) <= _PREARM_REASON_MAX_AGE_S
+        if fresh:
+            return (
+                f"the vehicle refused to arm - {reason}. Fix that rather than "
+                "forcing it into the air"
+            )
+        return (
+            "the vehicle refused to arm, and reported no pre-arm reason - check "
+            "the vehicle messages rather than forcing it into the air"
+        )
+
     def _wait_vehicle_armed(self, timeout_s: float = 8.0) -> bool:
         """Poll HEARTBEAT until vehicle reports SAFETY_ARMED or timeout."""
         if self._master is None:
@@ -1885,10 +1925,7 @@ class MavlinkThread(QThread):
                 )
                 if not self._wait_vehicle_armed():
                     if not _force_arm_allowed():
-                        raise RuntimeError(
-                            "the vehicle refused to arm - fix the pre-arm message it "
-                            "reported rather than forcing it into the air"
-                        )
+                        raise RuntimeError(self._arm_refusal_message())
                     self.log_line.emit(
                         f"Mission start: FORCE ARM ({_FORCE_ARM_ENV} is set) - "
                         "every pre-arm check is being bypassed"
@@ -2177,10 +2214,7 @@ class MavlinkThread(QThread):
             )
             if not self._wait_vehicle_armed():
                 if not _force_arm_allowed():
-                    raise RuntimeError(
-                        "the vehicle refused to arm - fix the pre-arm message it "
-                        "reported rather than forcing it into the air"
-                    )
+                    raise RuntimeError(self._arm_refusal_message())
                 self.log_line.emit(
                     f"Auto takeoff: FORCE ARM ({_FORCE_ARM_ENV} is set) - "
                     "every pre-arm check is being bypassed"
