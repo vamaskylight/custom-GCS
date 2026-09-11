@@ -93,6 +93,9 @@ class MissionPlan:
     waypoint_count: int = 0
     end_action: str = DEFAULT_MISSION_END_ACTION
     takeoff_alt_m: float = 0.0
+    # How many payload releases this mission carries, so the upload can say so
+    # out loud. A servo command that fires unexpectedly is a dropped payload.
+    drop_count: int = 0
 
     def __len__(self) -> int:
         return len(self.items)
@@ -247,12 +250,37 @@ def validate_waypoints(
     return (errors, warnings)
 
 
+def _wp_drop_payload(wp: object) -> bool:
+    """Whether this waypoint releases the payload on arrival."""
+    if isinstance(wp, dict):
+        return bool(wp.get("drop_payload", False))
+    return bool(getattr(wp, "drop_payload", False))
+
+
+@dataclass(frozen=True)
+class PayloadServo:
+    """How the payload release is wired on this aircraft.
+
+    Nothing here can be guessed from the plan: which output the servo is on and
+    what pulse widths open and close it are properties of the airframe. They
+    are settings, and a mission is built without any servo items at all when
+    none is configured, so an unconfigured aircraft never gets a command it
+    cannot honour.
+    """
+
+    channel: int = 9
+    release_pwm: int = 1900
+    reset_pwm: int = 1100
+    hold_s: float = 1.0
+
+
 def build_mission_plan(
     waypoints: list[object],
     *,
     takeoff_alt_m: float | None = None,
     end_action: str = DEFAULT_MISSION_END_ACTION,
     default_speed_mps: float = 5.0,
+    servo: PayloadServo | None = None,
 ) -> MissionPlan:
     """Translate operator waypoints into the MAVLink mission item list.
 
@@ -335,6 +363,49 @@ def build_mission_plan(
             )
         )
         seq += 1
+
+        # Payload drop, immediately after arriving at this point. Requested
+        # 2026-09-11. DO_ commands run once the preceding NAV command has been
+        # reached, so placing them here is what makes the servo fire on arrival
+        # rather than on the way.
+        #
+        # These carry no wp_index on purpose: they are plumbing, and
+        # waypoint_index_for_seq must keep translating MISSION_ITEM_REACHED to
+        # the operator's waypoint number rather than to a servo command.
+        if _wp_drop_payload(wp) and servo is not None:
+            plan.items.append(
+                MissionItem(
+                    seq=seq,
+                    command=int(_m.MAV_CMD_DO_SET_SERVO),
+                    p1=float(servo.channel),
+                    p2=float(servo.release_pwm),
+                    label=f"Drop payload at WP {idx + 1}",
+                )
+            )
+            seq += 1
+            plan.drop_count += 1
+            if servo.hold_s > 0.0:
+                # Without the delay the servo is closed again in the same
+                # instant it opened and the payload never clears the hatch.
+                plan.items.append(
+                    MissionItem(
+                        seq=seq,
+                        command=int(_m.MAV_CMD_CONDITION_DELAY),
+                        p1=float(servo.hold_s),
+                        label=f"Hold {servo.hold_s:.1f} s",
+                    )
+                )
+                seq += 1
+                plan.items.append(
+                    MissionItem(
+                        seq=seq,
+                        command=int(_m.MAV_CMD_DO_SET_SERVO),
+                        p1=float(servo.channel),
+                        p2=float(servo.reset_pwm),
+                        label="Close payload servo",
+                    )
+                )
+                seq += 1
 
     if action == "rtl":
         plan.items.append(

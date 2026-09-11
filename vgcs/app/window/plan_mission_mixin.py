@@ -196,6 +196,7 @@ class MainWindowPlanMissionMixin:
                 "lon": float(getattr(wp, "lon", 0.0)),
                 "alt_m": float(getattr(wp, "alt_m", 20.0)),
                 "speed_mps": float(getattr(wp, "speed_mps", 5.0)),
+                "drop_payload": bool(getattr(wp, "drop_payload", False)),
             }
             for wp in waypoints
         ]
@@ -331,7 +332,16 @@ class MainWindowPlanMissionMixin:
             return
         if chosen is act_dup:
             wp = model[row]
-            model.insert(row + 1, Waypoint(lat=wp.lat, lon=wp.lon, alt_m=wp.alt_m, speed_mps=wp.speed_mps))
+            model.insert(
+                row + 1,
+                Waypoint(
+                    lat=wp.lat,
+                    lon=wp.lon,
+                    alt_m=wp.alt_m,
+                    speed_mps=wp.speed_mps,
+                    drop_payload=bool(getattr(wp, "drop_payload", False)),
+                ),
+            )
             self._map_widget.set_waypoints(model)
             self._append_log(f"Duplicated WP {row + 1}")
             return

@@ -1513,6 +1513,34 @@ class MavlinkThread(QThread):
                 continue
             break
 
+    def _payload_servo_config(self):
+        """How the payload release is wired, from settings.
+
+        Which output the servo is on, and the pulse widths that open and close
+        it, are properties of the airframe and cannot be inferred from a plan.
+        They are read here so a mission built on a machine that has never been
+        told gets the documented defaults rather than silence.
+        """
+        from PySide6.QtCore import QSettings
+
+        from vgcs.map.app_settings import QS_APP, QS_ORG
+        from vgcs.mission.mission_plan import PayloadServo
+
+        st = QSettings(QS_ORG, QS_APP)
+
+        def _num(key, default, cast):
+            try:
+                return cast(st.value(key, default))
+            except (TypeError, ValueError):
+                return cast(default)
+
+        return PayloadServo(
+            channel=_num("mission/payload_servo_channel", 9, int),
+            release_pwm=_num("mission/payload_servo_release_pwm", 1900, int),
+            reset_pwm=_num("mission/payload_servo_reset_pwm", 1100, int),
+            hold_s=_num("mission/payload_servo_hold_s", 1.0, float),
+        )
+
     def _mission_upload(
         self, waypoints: list[dict], end_action: str = DEFAULT_MISSION_END_ACTION
     ) -> None:
@@ -1537,12 +1565,18 @@ class MavlinkThread(QThread):
             waypoints,
             takeoff_alt_m=None if takeoff_alt_m is None else float(takeoff_alt_m),
             end_action=end_action,
+            servo=self._payload_servo_config(),
         )
         mission_items = plan.items
         count = len(mission_items)
+        drops = (
+            f", {plan.drop_count} payload drop{'' if plan.drop_count == 1 else 's'}"
+            if plan.drop_count
+            else ""
+        )
         self.log_line.emit(
             f"Mission upload start: {len(waypoints)} WPs -> {count} mission items "
-            f"(home slot + takeoff {plan.takeoff_alt_m:.0f} m, end={plan.end_action})"
+            f"(home slot + takeoff {plan.takeoff_alt_m:.0f} m, end={plan.end_action}{drops})"
         )
         self._sync_link_targets()
         self._mission_clear_for_upload_best_effort()

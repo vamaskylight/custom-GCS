@@ -33,6 +33,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
@@ -1803,6 +1804,15 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_apply_wp_alt = QPushButton("Set WP Alt")
         self._btn_apply_all_alt = QPushButton("Set All Alt")
         self._btn_apply_wp_speed = QPushButton("Set WP Speed")
+        # Payload drop on arrival at the selected waypoint. Requested
+        # 2026-09-11: "if i plot the 5 waypoint ... suppose drone is arrived
+        # point 1 then servo payload will drop".
+        self._wp_drop_payload = QCheckBox("Drop payload here")
+        self._wp_drop_payload.setToolTip(
+            "Release the payload servo when the aircraft reaches this waypoint.\n"
+            "The servo output and its pulse widths are set in QSettings under\n"
+            "mission/payload_servo_*."
+        )
         self._btn_apply_all_speed = QPushButton("Set All Speed")
         tools.addWidget(self._btn_add_wp, 0, 0)
         tools.addWidget(self._btn_clear_wp, 0, 1)
@@ -1835,6 +1845,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         tools.addWidget(self._wp_speed, 2, 1)
         tools.addWidget(self._btn_apply_wp_speed, 2, 2)
         tools.addWidget(self._btn_apply_all_speed, 2, 3)
+        tools.addWidget(self._wp_drop_payload, 2, 4)
         tools.addWidget(self._btn_tiles_esri, 2, 8)
         tools.addWidget(self._btn_tiles_osm, 2, 9)
         tools.addWidget(self._btn_tiles_sat, 2, 10)
@@ -1894,6 +1905,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_m14_detect.clicked.connect(self._m14_run_detection)
         self._perf_mode.currentIndexChanged.connect(self._on_perf_mode_changed)
         self._wp_selector.currentIndexChanged.connect(self._on_wp_selected)
+        self._wp_drop_payload.toggled.connect(self._on_wp_drop_payload_toggled)
         self._btn_apply_wp_alt.clicked.connect(self._apply_altitude_to_selected)
         self._btn_apply_all_alt.clicked.connect(self._apply_altitude_to_all)
         self._btn_apply_wp_speed.clicked.connect(self._apply_speed_to_selected)

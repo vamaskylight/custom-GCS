@@ -243,14 +243,32 @@ class PlanMissionMixin:
         panel = getattr(self, "_plan_flight_panel", None)
         if panel is not None:
             panel.set_mission_progress(wp_index, total, label)
+        # A point the vehicle has flown to is crossed off and stays crossed off
+        # for the rest of the run. Requested 2026-09-11: "in vgcs it should be
+        # show cross mark that means that point mission is completed".
+        if bool(data.get("reached", False)) and wp_index is not None:
+            done = set(getattr(self, "_completed_wp_indices", ()) or ())
+            done.add(int(wp_index))
+            self._completed_wp_indices = done
         nm = getattr(self, "_native_map", None)
         if nm is not None:
             try:
                 nm.set_active_waypoint_index(wp_index)
             except Exception:
                 pass
+            try:
+                nm.set_completed_waypoints(getattr(self, "_completed_wp_indices", ()))
+            except Exception:
+                pass
 
     def clear_mission_progress(self) -> None:
+        """Forget the run so far, crosses included.
+
+        Called on a new mission and on link loss. Leaving old crosses up would
+        tell an operator that points on a plan they have not flown are already
+        done.
+        """
+        self._completed_wp_indices = set()
         self.set_mission_progress({"wp_index": None, "waypoint_count": 0, "label": ""})
 
     def get_default_waypoint_alt_m(self) -> float:
@@ -418,10 +436,20 @@ class PlanMissionMixin:
             if match is not None:
                 alt = float(match.alt_m)
                 spd = float(getattr(match, "speed_mps", 5.0))
+                # Carried over with the rest. This rebuild is what silently
+                # reset every waypoint's speed to the default in 2026-09-04,
+                # and a payload flag lost the same way is a drop that does not
+                # happen.
+                drop = bool(getattr(match, "drop_payload", False))
             else:
                 alt = float(self._default_alt.value())
                 spd = float(self._default_speed.value())
-            waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt, speed_mps=spd))
+                drop = False
+            waypoints.append(
+                Waypoint(
+                    lat=lat, lon=lon, alt_m=alt, speed_mps=spd, drop_payload=drop
+                )
+            )
         return waypoints
 
     def _request_download(self) -> None:
@@ -568,6 +596,9 @@ class PlanMissionMixin:
         if clear_plan_current_file:
             self.clear_plan_current_mission_path()
         rows = [[wp.lat, wp.lon] for wp in waypoints]
+        # A different plan means the old crosses describe points that are no
+        # longer there, or are somewhere else entirely.
+        self.clear_mission_progress()
         self._waypoints_model = list(waypoints)
         nm = getattr(self, "_native_map", None)
         if nm is not None and not bool(getattr(self, "_is_3d_mode", False)):
@@ -639,9 +670,32 @@ class PlanMissionMixin:
 
     def _on_wp_selected(self, index: int) -> None:
         if 0 <= index < len(self._waypoints_model):
-            self._wp_alt.setValue(float(self._waypoints_model[index].alt_m))
-            self._wp_speed.setValue(float(getattr(self._waypoints_model[index], "speed_mps", 5.0)))
+            wp = self._waypoints_model[index]
+            self._wp_alt.setValue(float(wp.alt_m))
+            self._wp_speed.setValue(float(getattr(wp, "speed_mps", 5.0)))
+            drop = getattr(self, "_wp_drop_payload", None)
+            if drop is not None:
+                # Blocked: this is showing the selected point's setting, not
+                # the operator changing it, and the toggle writes back.
+                drop.blockSignals(True)
+                drop.setChecked(bool(getattr(wp, "drop_payload", False)))
+                drop.blockSignals(False)
         self.plan_waypoint_selection_changed.emit(self.selected_waypoint_index())
+
+    def _on_wp_drop_payload_toggled(self, checked: bool) -> None:
+        """Arm or disarm the payload release for the selected waypoint."""
+        idx = self.selected_waypoint_index()
+        if idx < 0:
+            self._set_status("No waypoint selected")
+            return
+        wp = self._waypoints_model[idx]
+        if bool(getattr(wp, "drop_payload", False)) == bool(checked):
+            return
+        wp.drop_payload = bool(checked)
+        self.waypoints_changed.emit(list(self._waypoints_model))
+        self._set_status(
+            f"WP {idx + 1}: payload drop {'on' if checked else 'off'}"
+        )
 
     def add_waypoint_from_text(self, text: str) -> bool:
         """Append a waypoint at a typed position and select it.

@@ -516,6 +516,10 @@ class NativeTileMapView(QWidget):
         self._mission_nav_seq = 0
         # Plan index (0-based) of the waypoint the vehicle is flying to, or None.
         self._active_wp_index: int | None = None
+        # Waypoints the vehicle has already reached, drawn with a cross.
+        # Requested 2026-09-11: "in vgcs it should be show cross mark that means
+        # that point mission is completed".
+        self._completed_wp_indices: set[int] = set()
         self._add_wp_mode = False
         self._fence_draw_mode = False
         # Dragging an existing waypoint. Requested 2026-09-04: "I'm not able to
@@ -767,6 +771,24 @@ class NativeTileMapView(QWidget):
             return
         self._active_wp_index = new_index
         self.update()
+
+    def set_completed_waypoints(self, indices) -> None:
+        """Mark waypoints the vehicle has reached, so the map crosses them off."""
+        want: set[int] = set()
+        for raw in indices or ():
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if n >= 0:
+                want.add(n)
+        if want == self._completed_wp_indices:
+            return
+        self._completed_wp_indices = want
+        self.update()
+
+    def clear_completed_waypoints(self) -> None:
+        self.set_completed_waypoints(())
 
     def set_tile_source(self, template: str, _attribution: str, max_z: int) -> None:
         t = str(template or "").strip()
@@ -1226,20 +1248,46 @@ class NativeTileMapView(QWidget):
         # MISSION_CURRENT and translated to a plan index by MissionPlan) is drawn larger
         # and amber, so the operator can see mission progress on the map during AUTO.
         active_wp = self._active_wp_index
+        done = self._completed_wp_indices
         painter.setPen(QPen(QColor(255, 255, 255), 1))
         for i, (lat, lon) in enumerate(self._waypoints):
             c = self._project(lat, lon, z, fx, fy, w, h)
             is_active = active_wp is not None and i == active_wp
+            is_done = i in done
             if is_active:
                 painter.setPen(QPen(QColor(255, 210, 90), 2))
                 painter.setBrush(QColor(255, 170, 30, 235))
                 painter.drawEllipse(c, 10, 10)
+            elif is_done:
+                # Muted, because a finished point is history: it must stay
+                # readable without competing with the one being flown to.
+                painter.setPen(QPen(QColor(150, 230, 160), 2))
+                painter.setBrush(QColor(30, 90, 45, 200))
+                painter.drawEllipse(c, 8, 8)
             else:
                 painter.setPen(QPen(QColor(255, 255, 255), 1))
                 painter.setBrush(QColor(40, 130, 255, 220))
                 painter.drawEllipse(c, 7, 7)
-            painter.setPen(QPen(QColor(20, 24, 30) if is_active else QColor(255, 255, 255)))
-            painter.drawText(QRectF(c.x() - 16, c.y() - 8, 32, 16), Qt.AlignmentFlag.AlignCenter, str(i + 1))
+            if is_done:
+                # The cross goes over the disc rather than replacing the number,
+                # so an operator can still tell which point it was.
+                painter.setPen(QPen(QColor(190, 255, 200), 2))
+                r = 5.0
+                painter.drawLine(
+                    QPointF(c.x() - r, c.y() - r), QPointF(c.x() + r, c.y() + r)
+                )
+                painter.drawLine(
+                    QPointF(c.x() - r, c.y() + r), QPointF(c.x() + r, c.y() - r)
+                )
+            else:
+                painter.setPen(
+                    QPen(QColor(20, 24, 30) if is_active else QColor(255, 255, 255))
+                )
+                painter.drawText(
+                    QRectF(c.x() - 16, c.y() - 8, 32, 16),
+                    Qt.AlignmentFlag.AlignCenter,
+                    str(i + 1),
+                )
 
         # DOOAF fixed points (military gun / target / impact)
         def _dooaf_label_tag(painter: QPainter, cx: float, cy: float, tag: str, *, above: float) -> None:

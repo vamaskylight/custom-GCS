@@ -13,6 +13,10 @@ class Waypoint:
     lon: float
     alt_m: float = 20.0
     speed_mps: float = 5.0
+    # Release the payload servo on arrival. Requested 2026-09-11: "i integrated
+    # servo in our drone so if i plot the 5 waypoint ... suppose drone is
+    # arrived point 1 then servo payload will drop".
+    drop_payload: bool = False
 
 
 def save_waypoints_json(
@@ -61,6 +65,9 @@ def load_waypoints_json(path: str | Path) -> list[Waypoint]:
                 lon=float(row["lon"]),
                 alt_m=float(row.get("alt_m", 20.0)),
                 speed_mps=float(row.get("speed_mps", 5.0)),
+                # Absent in plans saved before payload drops existed, which
+                # must load as "no drop" rather than dropping unexpectedly.
+                drop_payload=bool(row.get("drop_payload", False)),
             )
         )
     return out
