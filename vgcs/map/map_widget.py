@@ -796,6 +796,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     takeoff_requested = Signal()
     return_requested = Signal()
     land_requested = Signal()
+    disarm_requested = Signal()
     plan_tool_requested = Signal(str)
     plan_action_requested = Signal(str)
     plan_flight_exited = Signal()
@@ -1432,6 +1433,38 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._map_action_land_btn.setLayout(_la_lay)
         self._map_action_land_btn.setStyleSheet(_land_ss)
         # Type a position and go there. Requested 2026-09-08: "if I put the lat
+        # Stop the motors after a normal landing. Requested 2026-09-11: until
+        # now the only disarm in VGCS was EMERGENCY STOP, which forces past
+        # every check and is meant for a runaway. Short like Go to, because it
+        # carries a label and no icon.
+        _disarm_ss = (
+            _map_action_btn_base_ss.replace("mapActionTakeoffBtn", "mapActionDisarmBtn")
+            .replace("mapActionReturnBtn", "mapActionDisarmBtn")
+            + "QPushButton#mapActionDisarmBtn {"
+            "min-height:34px; max-height:34px;"
+            "}"
+        )
+        self._map_action_disarm_btn = QPushButton(self._map_action_rail)
+        self._map_action_disarm_btn.setObjectName("mapActionDisarmBtn")
+        self._map_action_disarm_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._map_action_disarm_btn.setFlat(True)
+        self._map_action_disarm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._map_action_disarm_btn.setToolTip(
+            "Stop the motors after landing. The aircraft refuses this while it\n"
+            "still believes it is flying; use EMERGENCY STOP for a runaway."
+        )
+        _di_lay = QVBoxLayout()
+        _di_lay.setContentsMargins(3, 5, 3, 5)
+        _di_lay.setSpacing(1)
+        _di_lbl = QLabel("Disarm", self._map_action_disarm_btn)
+        _di_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _di_lbl.setStyleSheet(
+            "color:#c8d3ea; font-weight:600; font-size:11px; background:transparent; border:none;"
+        )
+        _di_lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        _di_lay.addWidget(_di_lbl, 0, Qt.AlignmentFlag.AlignCenter)
+        self._map_action_disarm_btn.setLayout(_di_lay)
+        self._map_action_disarm_btn.setStyleSheet(_disarm_ss)
         # long then I can see that particular location on the map". Unlike the
         # two above it needs no vehicle, so it is never disabled.
         _goto_ss = (
@@ -1471,13 +1504,16 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
 
         ar_l.addWidget(self._map_action_takeoff_btn)
         ar_l.addWidget(self._map_action_land_btn)
+        ar_l.addWidget(self._map_action_disarm_btn)
         ar_l.addWidget(self._map_action_return_btn)
         ar_l.addWidget(self._map_action_goto_btn)
         self._map_action_takeoff_btn.setEnabled(False)
         self._map_action_land_btn.setEnabled(False)
+        self._map_action_disarm_btn.setEnabled(False)
         self._map_action_return_btn.setEnabled(False)
         self._map_action_takeoff_btn.clicked.connect(lambda: self.takeoff_requested.emit())
         self._map_action_land_btn.clicked.connect(lambda: self.land_requested.emit())
+        self._map_action_disarm_btn.clicked.connect(lambda: self.disarm_requested.emit())
         self._map_action_return_btn.clicked.connect(lambda: self.return_requested.emit())
         self._map_action_goto_btn.clicked.connect(self.prompt_goto_location)
         # Ctrl+G reaches it from the plan view too, where the action rail is

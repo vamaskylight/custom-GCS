@@ -18,7 +18,7 @@ _MAP_HUD_MARGIN_PX = 12
 # The layout now measures the rail instead, so this is only used before the
 # rail exists. Do not go back to arithmetic here; the two drift apart every
 # time a button is added.
-_MAP_ACTION_RAIL_HEIGHT_PX = 56 + 8 + 56 + 8 + 56 + 8 + 36
+_MAP_ACTION_RAIL_HEIGHT_PX = 56 + 8 + 56 + 8 + 36 + 8 + 56 + 8 + 36
 _OBSTACLE_PANEL_TOP_PX = _MAP_ACTION_RAIL_TOP_PX + _MAP_ACTION_RAIL_HEIGHT_PX + 8
 _OBSTACLE_PANEL_MAX_H_PX = 360
 

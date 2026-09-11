@@ -1948,6 +1948,33 @@ class MavlinkThread(QThread):
             timeout_s,
         )
 
+    def _wait_vehicle_disarmed(self, timeout_s: float = 5.0) -> bool:
+        """Wait for the vehicle to actually report the motors off."""
+        return self._pump_link_until(
+            lambda m: not bool(
+                getattr(m, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            ),
+            timeout_s,
+        )
+
+    def _disarm_refusal_message(self) -> str:
+        """Why the vehicle would not disarm, in its own words where we have them.
+
+        The usual answer is that it still thinks it is flying: ArduPilot
+        refuses a GCS disarm unless land_complete is set. That is a good
+        refusal, and the operator needs to know it is why, not be told the
+        command was sent and left to wonder.
+        """
+        reason = str(getattr(self, "_last_prearm_reason", "") or "").strip()
+        seen = float(getattr(self, "_last_prearm_reason_mono", 0.0) or 0.0)
+        if reason and (time.monotonic() - seen) <= _PREARM_REASON_MAX_AGE_S:
+            return f"the vehicle refused to disarm - {reason}"
+        return (
+            "the vehicle would not disarm - it usually means it does not yet "
+            "believe it has landed. Lower the throttle and let it settle, or "
+            "use EMERGENCY STOP if the motors must stop now"
+        )
+
     def _pump_link_until(self, predicate, timeout_s: float) -> bool:
         """Read from the link until ``predicate`` accepts a heartbeat, or time runs out.
 
@@ -2219,8 +2246,19 @@ class MavlinkThread(QThread):
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                 p1=1.0 if arm else 0.0,
             )
-            self.action_result.emit("arm", True, "ARM sent" if arm else "DISARM sent")
-            self.log_line.emit("Arm command sent" if arm else "Disarm command sent")
+            if arm:
+                self.action_result.emit("arm", True, "ARM sent")
+                self.log_line.emit("Arm command sent")
+                return
+            # Checked rather than assumed. ArduPilot refuses a GCS disarm while
+            # it believes it is flying, and says so; reporting "DISARM sent" as
+            # a success would leave the operator thinking the motors are off.
+            if self._wait_vehicle_disarmed():
+                self.action_result.emit("arm", True, "Disarmed")
+                self.log_line.emit("Disarmed")
+                return
+            self.action_result.emit("arm", False, self._disarm_refusal_message())
+            self.error.emit(f"Disarm failed: {self._disarm_refusal_message()}")
         except Exception as e:
             self.action_result.emit("arm", False, str(e))
             self.error.emit(f"Arm failed: {e}")

@@ -443,6 +443,29 @@ class MainWindowFlightCommandsMixin:
         self._append_log(f"Manual connect requested: {connection_string}")
         self._on_connect()
 
+    def _on_disarm(self) -> None:
+        """Stop the motors after a normal landing.
+
+        Requested 2026-09-11: "please add disarm button also it will helpful to
+        us." Until now the only way to stop the motors from VGCS was EMERGENCY
+        STOP, which forces the disarm past every check and is meant for a
+        runaway, not for the end of a flight.
+
+        This sends the plain command with no force override, so ArduPilot's own
+        rule applies: it refuses a GCS disarm while it believes it is flying.
+        The aircraft, not this button, is what keeps a spinning rotor spinning.
+        """
+        from vgcs.app.flight_action_dialogs import confirm_disarm
+
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before disarm command.")
+            return
+        if not confirm_disarm(self):
+            self._append_log("Disarm cancelled")
+            return
+        self._thread.queue_arm(False)
+        self._append_log("Disarm queued")
+
     def _on_map_return_requested(self) -> None:
         """Say what will happen, then RTL.
 

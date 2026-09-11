@@ -484,6 +484,7 @@ class NativeHudLayoutMixin:
         for b in (
             getattr(self, "_map_action_takeoff_btn", None),
             getattr(self, "_map_action_land_btn", None),
+            getattr(self, "_map_action_disarm_btn", None),
             getattr(self, "_map_action_return_btn", None),
         ):
             if b is not None:

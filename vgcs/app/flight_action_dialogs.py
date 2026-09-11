@@ -159,3 +159,16 @@ def confirm_return(parent) -> bool:
 
 def confirm_land(parent) -> bool:
     return _confirm(parent, "Land", land_message(), "Land here")
+
+
+def disarm_message() -> str:
+    return (
+        "The motors will stop and the aircraft will be disarmed.\n\n"
+        "The aircraft refuses this while it still believes it is flying, so it "
+        "is for after landing. To stop the motors in an emergency, use "
+        "EMERGENCY STOP instead."
+    )
+
+
+def confirm_disarm(parent) -> bool:
+    return _confirm(parent, "Disarm", disarm_message(), "Disarm")
