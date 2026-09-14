@@ -624,20 +624,27 @@ class PlanMissionMixin:
             )
         self._set_status(f"Mission loaded ({len(waypoints)} WPs)")
 
-    def get_waypoint_meta(self) -> list[dict[str, float]]:
-        """Per-waypoint meta for the Plan Flight right panel."""
-        out: list[dict[str, float]] = []
+    def get_waypoint_meta(self) -> list[dict]:
+        """Per-waypoint settings for the Plan Flight right panel.
+
+        Every editable per-waypoint field belongs here. Plan Flight hides the
+        map toolbar, so a field this dict omits is a field the operator cannot
+        reach at all in the view they plan missions in.
+        """
+        out: list[dict] = []
         for wp in self._waypoints_model:
             out.append(
                 {
                     "alt_m": float(getattr(wp, "alt_m", 20.0)),
                     "speed_mps": float(getattr(wp, "speed_mps", 5.0)),
+                    "hover_s": clamp_hover_seconds(getattr(wp, "hover_s", 0) or 0),
+                    "drop_payload": bool(getattr(wp, "drop_payload", False)),
                 }
             )
         return out
 
     def apply_waypoint_meta(self, meta: list[object]) -> None:
-        """Apply per-waypoint alt/speed edits from Plan Flight panel."""
+        """Apply per-waypoint edits from the Plan Flight panel."""
         if not self._waypoints_model:
             return
         changed = False
@@ -646,19 +653,32 @@ class PlanMissionMixin:
                 break
             if not isinstance(row, dict):
                 continue
+            wp = self._waypoints_model[i]
             try:
-                alt_m = float(row.get("alt_m", self._waypoints_model[i].alt_m))
-                spd = float(row.get("speed_mps", getattr(self._waypoints_model[i], "speed_mps", 5.0)))
+                alt_m = float(row.get("alt_m", wp.alt_m))
+                spd = float(row.get("speed_mps", getattr(wp, "speed_mps", 5.0)))
             except Exception:
                 continue
             alt_m = max(1.0, alt_m)
             spd = max(0.1, spd)
-            if float(self._waypoints_model[i].alt_m) != alt_m:
-                self._waypoints_model[i].alt_m = alt_m
+            if float(wp.alt_m) != alt_m:
+                wp.alt_m = alt_m
                 changed = True
-            if float(getattr(self._waypoints_model[i], "speed_mps", 5.0)) != spd:
-                setattr(self._waypoints_model[i], "speed_mps", spd)
+            if float(getattr(wp, "speed_mps", 5.0)) != spd:
+                setattr(wp, "speed_mps", spd)
                 changed = True
+            # A row that never carried these keeps what the waypoint has, so a
+            # panel from an older build cannot silently clear a hold or a drop.
+            if "hover_s" in row:
+                hover = clamp_hover_seconds(row.get("hover_s", 0) or 0)
+                if int(getattr(wp, "hover_s", 0) or 0) != hover:
+                    setattr(wp, "hover_s", hover)
+                    changed = True
+            if "drop_payload" in row:
+                drop = bool(row.get("drop_payload", False))
+                if bool(getattr(wp, "drop_payload", False)) != drop:
+                    setattr(wp, "drop_payload", drop)
+                    changed = True
         if changed:
             self.waypoints_changed.emit(list(self._waypoints_model))
 

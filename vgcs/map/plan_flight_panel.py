@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QMouseEvent, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFrame,
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from vgcs.mission import clamp_hover_seconds
 
 
 _TOOLS: tuple[tuple[str, str], ...] = (
@@ -465,7 +468,11 @@ class PlanFlightPanel(QWidget):
         self._template_id = ""
         self._mission_start_stack_on = False
         self._survey_label = "Survey"
-        self._wp_meta: list[dict[str, float]] = []
+        self._wp_meta: list[dict] = []
+        # Per-row handles for the second-line controls, keyed by waypoint index.
+        # Rebuilt with the rows; declared here so it exists before the first
+        # render, when there are no rows at all.
+        self._wp_row_fields: dict[int, tuple] = {}
         self._emit_timer = QTimer(self)
         self._emit_timer.setInterval(120)
         self._emit_timer.setSingleShot(True)
@@ -1435,16 +1442,9 @@ class PlanFlightPanel(QWidget):
             if isinstance(wp_meta, list):
                 self._wp_meta = []
                 for row in wp_meta:
-                    if isinstance(row, dict):
-                        try:
-                            self._wp_meta.append(
-                                {
-                                    "alt_m": float(row.get("alt_m", 0.0) or 0.0),
-                                    "speed_mps": float(row.get("speed_mps", 0.0) or 0.0),
-                                }
-                            )
-                        except Exception:
-                            continue
+                    got = self._clean_wp_meta_row(row)
+                    if got is not None:
+                        self._wp_meta.append(got)
                 self._render_waypoint_rows()
             self._pattern_row_spacing_spin.setValue(
                 float(state.get("patternRowSpacingM", 20.0) or 20.0)
@@ -1473,24 +1473,45 @@ class PlanFlightPanel(QWidget):
         base_alt_m = _unit_to_m(self._float(self._initial_wp_alt.text(), 164.0))
         base_spd_mps = _unit_speed_to_mps(self._float(self._hover_input.text(), 11.18))
         while len(self._wp_meta) < n:
-            self._wp_meta.append({"alt_m": base_alt_m, "speed_mps": base_spd_mps})
+            # A new point does not hover and does not drop until asked to.
+            self._wp_meta.append(
+                {
+                    "alt_m": base_alt_m,
+                    "speed_mps": base_spd_mps,
+                    "hover_s": 0,
+                    "drop_payload": False,
+                }
+            )
         if len(self._wp_meta) > n:
             self._wp_meta = self._wp_meta[:n]
         self._render_waypoint_rows()
 
+    @staticmethod
+    def _clean_wp_meta_row(row: object) -> dict | None:
+        """One waypoint's panel meta, or None if it cannot be read.
+
+        Every per-waypoint field is rebuilt here and in nowhere else, because a
+        field missed by a rebuild like this one is silently lost: that is how a
+        dragged waypoint's speed reverted to the default in the field.
+        """
+        if not isinstance(row, dict):
+            return None
+        try:
+            return {
+                "alt_m": float(row.get("alt_m", 0.0) or 0.0),
+                "speed_mps": float(row.get("speed_mps", 0.0) or 0.0),
+                "hover_s": clamp_hover_seconds(row.get("hover_s", 0) or 0),
+                "drop_payload": bool(row.get("drop_payload", False)),
+            }
+        except Exception:
+            return None
+
     def set_waypoint_meta(self, meta: list[dict[str, float]]) -> None:
-        cleaned: list[dict[str, float]] = []
+        cleaned: list[dict] = []
         for row in meta or []:
-            if isinstance(row, dict):
-                try:
-                    cleaned.append(
-                        {
-                            "alt_m": float(row.get("alt_m", 0.0) or 0.0),
-                            "speed_mps": float(row.get("speed_mps", 0.0) or 0.0),
-                        }
-                    )
-                except Exception:
-                    continue
+            got = self._clean_wp_meta_row(row)
+            if got is not None:
+                cleaned.append(got)
         self._wp_meta = cleaned
         self._waypoint_count = len(cleaned)
         self._refresh_chrome()
@@ -1511,6 +1532,8 @@ class PlanFlightPanel(QWidget):
                 w.setParent(None)
                 w.deleteLater()
         self._wp_start_alt_in = None
+        # The rows are destroyed and rebuilt, so the handles go with them.
+        self._wp_row_fields = {}
         n = self._waypoint_count
         self._wp_details_box.setVisible(n > 0)
         if n <= 0:
@@ -1522,10 +1545,18 @@ class PlanFlightPanel(QWidget):
             launch_ft = 0.0
         self._wp_rows_layout.addWidget(self._build_wp_row(-1, launch_ft, None, is_start=True))
         for i in range(n):
-            meta = self._wp_meta[i] if i < len(self._wp_meta) else {"alt_m": 0.0, "speed_mps": 0.0}
+            meta = self._wp_meta[i] if i < len(self._wp_meta) else {}
             alt_ft = _m_to_unit(meta.get("alt_m", 0.0))
             spd_mph = _mps_to_unit_speed(meta.get("speed_mps", 0.0))
-            self._wp_rows_layout.addWidget(self._build_wp_row(i, alt_ft, spd_mph))
+            self._wp_rows_layout.addWidget(
+                self._build_wp_row(
+                    i,
+                    alt_ft,
+                    spd_mph,
+                    hover_s=clamp_hover_seconds(meta.get("hover_s", 0) or 0),
+                    drop=bool(meta.get("drop_payload", False)),
+                )
+            )
 
     def _build_wp_row(
         self,
@@ -1533,13 +1564,27 @@ class PlanFlightPanel(QWidget):
         alt_ft: float,
         speed_mph: float | None,
         *,
+        hover_s: int = 0,
+        drop: bool = False,
         is_start: bool = False,
     ) -> QFrame:
+        """One waypoint's editable settings.
+
+        Two lines rather than one: this panel is 340 px wide and the altitude
+        and speed fields already fill it, so hover and the payload drop go
+        underneath rather than off the edge. They are here at all because the
+        Plan Flight view hides the map toolbar carrying the same controls, and
+        Plan Flight is where an operator plans a mission.
+        """
         row = QFrame()
         row.setProperty("class", "planWpRow")
-        h = QHBoxLayout(row)
-        h.setContentsMargins(8, 6, 8, 6)
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+        h = QHBoxLayout()
+        h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(8)
+        outer.addLayout(h)
         title = QLabel("Start" if is_start else f"WP {idx + 1}")
         title.setProperty("class", "planWpLabel")
         title.setFixedWidth(54)
@@ -1573,6 +1618,42 @@ class PlanFlightPanel(QWidget):
             alt_in.editingFinished.connect(
                 lambda ix=idx, w=alt_in: self._on_wp_field_editing_finished(ix, "alt_m", w)
             )
+            h.addStretch(1)
+
+            h2 = QHBoxLayout()
+            h2.setContentsMargins(0, 0, 0, 0)
+            h2.setSpacing(8)
+            outer.addLayout(h2)
+            h2.addSpacing(54)  # line up under the alt/speed fields above
+            hover_in = QLineEdit()
+            hover_in.setProperty("class", "planWpField")
+            hover_in.setText(str(int(hover_s)))
+            hover_in.setFixedWidth(56)
+            hover_in.setToolTip(
+                "Seconds to hold position on arrival before flying to the next"
+                "\nwaypoint. 0 flies straight through."
+            )
+            h2.addWidget(hover_in)
+            unit_hover = QLabel("s hover")
+            unit_hover.setProperty("class", "planWpUnit")
+            h2.addWidget(unit_hover)
+            drop_cb = QCheckBox("Drop payload")
+            drop_cb.setChecked(bool(drop))
+            drop_cb.setToolTip(
+                "Release the payload servo on arrival. A point that also hovers"
+                "\nreleases at the end of its hover."
+            )
+            h2.addWidget(drop_cb)
+            h2.addStretch(1)
+            self._wp_row_fields[idx] = (hover_in, drop_cb)
+
+            hover_in.textChanged.connect(
+                lambda _t, ix=idx, w=hover_in: self._on_wp_field_changed(ix, "hover_s", w.text())
+            )
+            hover_in.editingFinished.connect(
+                lambda ix=idx, w=hover_in: self._on_wp_field_editing_finished(ix, "hover_s", w)
+            )
+            drop_cb.toggled.connect(lambda on, ix=idx: self._on_wp_drop_toggled(ix, on))
         else:
             hint = QLabel("Takeoff / launch altitude (0 = use WP1 for takeoff).")
             hint.setStyleSheet("QLabel { color: rgba(232, 234, 239, 170); font-size: 11px; }")
@@ -1580,7 +1661,7 @@ class PlanFlightPanel(QWidget):
             h.addWidget(hint, 1)
             self._wp_start_alt_in = alt_in
             alt_in.textChanged.connect(self._on_start_alt_changed)
-        h.addStretch(1)
+            h.addStretch(1)
         return row
 
     def _on_launch_alt_changed(self, text: str) -> None:
@@ -1618,6 +1699,16 @@ class PlanFlightPanel(QWidget):
             self._wp_meta[idx]["alt_m"] = max(0.3, _unit_to_m(value))
         elif key == "speed_mps":
             self._wp_meta[idx]["speed_mps"] = max(0.1, _unit_speed_to_mps(value))
+        elif key == "hover_s":
+            self._wp_meta[idx]["hover_s"] = clamp_hover_seconds(value)
+        self._schedule_emit()
+
+    def _on_wp_drop_toggled(self, idx: int, checked: bool) -> None:
+        if self._suppress_emit:
+            return
+        if idx < 0 or idx >= len(self._wp_meta):
+            return
+        self._wp_meta[idx]["drop_payload"] = bool(checked)
         self._schedule_emit()
 
     def _on_wp_field_editing_finished(self, idx: int, key: str, widget: QLineEdit) -> None:
@@ -1631,6 +1722,17 @@ class PlanFlightPanel(QWidget):
             display_value = _m_to_unit(meta.get("alt_m", 0.0))
         elif key == "speed_mps":
             display_value = _mps_to_unit_speed(meta.get("speed_mps", 0.0))
+        elif key == "hover_s":
+            # Whole seconds and no decimal point: the vehicle stores a hold as
+            # a uint16 of seconds, so "7.5" is not a value it can keep.
+            text = str(clamp_hover_seconds(meta.get("hover_s", 0)))
+            if widget.text() != text:
+                widget.blockSignals(True)
+                try:
+                    widget.setText(text)
+                finally:
+                    widget.blockSignals(False)
+            return
         else:
             return
         text = f"{display_value:.1f}"
