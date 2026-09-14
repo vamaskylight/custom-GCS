@@ -1996,7 +1996,7 @@ class MavlinkThread(QThread):
             timeout_s,
         )
 
-    def _disarm_refusal_message(self) -> str:
+    def _disarm_refusal_message(self, since_mono: float | None = None) -> str:
         """Why the vehicle would not disarm, in its own words where we have them.
 
         The usual answer is that it still thinks it is flying: ArduPilot
@@ -2008,10 +2008,19 @@ class MavlinkThread(QThread):
         seen = float(getattr(self, "_last_prearm_reason_mono", 0.0) or 0.0)
         if reason and (time.monotonic() - seen) <= _PREARM_REASON_MAX_AGE_S:
             return f"the vehicle refused to disarm - {reason}"
+        # AP_Arming_Copter::disarm refuses a GCS disarm with a bare `return
+        # false` when land_complete is not set: no STATUSTEXT, nothing but the
+        # COMMAND_ACK. That ack is the only thing the vehicle actually said, so
+        # it is worth repeating rather than guessing on its behalf.
+        ack = self._arm_ack_text(since_mono)
+        advice = (
+            "ArduPilot refuses a disarm from the ground while it does not "
+            "believe it has landed. Land first, then disarm"
+        )
+        if ack:
+            return f"the vehicle refused to disarm - {ack}. {advice}"
         return (
-            "the vehicle would not disarm - it usually means it does not yet "
-            "believe it has landed. Lower the throttle and let it settle, or "
-            "use EMERGENCY STOP if the motors must stop now"
+            f"the vehicle would not disarm and said nothing at all - {advice}"
         )
 
     def _pump_link_until(self, predicate, timeout_s: float) -> bool:
@@ -2034,7 +2043,15 @@ class MavlinkThread(QThread):
             )
             if msg is None:
                 continue
-            if int(msg.get_srcSystem()) != int(self._target_sysid):
+            # The flight controller, not merely its system id. A gimbal (154),
+            # a companion (191) and a telemetry radio (68) all heartbeat on the
+            # vehicle's own system with base_mode 0, which reads as "disarmed"
+            # — so filtering on the system alone made _wait_vehicle_disarmed
+            # return true off a peripheral's heartbeat within milliseconds and
+            # report a flying, armed aircraft as disarmed (2026-09-14: "using
+            # DisArm Button i'm not able to DisArm Drone", three times, each
+            # answered "Disarmed" while the header still read ARMED).
+            if not self._is_primary_source(msg):
                 continue
             msg_type = msg.get_type()
             if msg_type == "STATUSTEXT":
@@ -2139,13 +2156,22 @@ class MavlinkThread(QThread):
         self._last_arm_ack_result = result
         self._last_arm_ack_mono = time.monotonic()
 
-    def _arm_ack_text(self) -> str:
-        """The vehicle's answer to the arm command, in words, or empty."""
+    def _arm_ack_text(self, since_mono: float | None = None) -> str:
+        """The vehicle's answer to the arm command, in words, or empty.
+
+        ``since_mono`` is when the command being reported on was sent. Arm and
+        disarm share one MAVLink command, so they share one stored ack, and a
+        refusal explained with the ack from the *previous* request reads as
+        "refused to disarm - the command was accepted". Anything older than the
+        request is therefore not an answer to it.
+        """
         result = getattr(self, "_last_arm_ack_result", None)
         seen = float(getattr(self, "_last_arm_ack_mono", 0.0) or 0.0)
         if result is None:
             return ""
         if (time.monotonic() - seen) > _PREARM_REASON_MAX_AGE_S:
+            return ""
+        if since_mono is not None and seen < float(since_mono):
             return ""
         return _ARM_ACK_RESULTS.get(int(result), f"vehicle answered result {int(result)}")
 
@@ -2281,6 +2307,7 @@ class MavlinkThread(QThread):
         try:
             if arm:
                 self._ensure_armable_mode_before_arm()
+            sent_at = time.monotonic()
             self._send_command_long(
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                 p1=1.0 if arm else 0.0,
@@ -2296,8 +2323,9 @@ class MavlinkThread(QThread):
                 self.action_result.emit("arm", True, "Disarmed")
                 self.log_line.emit("Disarmed")
                 return
-            self.action_result.emit("arm", False, self._disarm_refusal_message())
-            self.error.emit(f"Disarm failed: {self._disarm_refusal_message()}")
+            why = self._disarm_refusal_message(sent_at)
+            self.action_result.emit("arm", False, why)
+            self.error.emit(f"Disarm failed: {why}")
         except Exception as e:
             self.action_result.emit("arm", False, str(e))
             self.error.emit(f"Arm failed: {e}")
