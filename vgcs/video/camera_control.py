@@ -1775,6 +1775,41 @@ def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:
     return (ZOOM_MIN, ZOOM_MAX_PREVIEW, ZOOM_STEP_PREVIEW)
 
 
+def camera_control_host_mismatch_warning(
+    provider: str, control_host: str, settings
+) -> str:
+    """One line for the log when camera control and video point at different cameras.
+
+    Field log 2026-09-18: video played from the Skydroid at 192.168.144.108
+    while camera control was left on "Viewpro" at 192.168.144.119 from an
+    earlier camera. Every gimbal command timed out against a host that did not
+    exist and nothing said why. Returns "" when there is nothing to say.
+    """
+    host = str(control_host or "").strip().lower()
+    if not host:
+        return ""
+    rtsp_hosts: list[str] = []
+    for key in ("video/rtsp_day", "video/rtsp_thermal"):
+        try:
+            url = str(settings.value(key, "") or "").strip()
+        except Exception:
+            url = ""
+        if url.lower().startswith("rtsp://"):
+            h = urlparse(url).hostname
+            if h and h.lower() not in rtsp_hosts:
+                rtsp_hosts.append(h.lower())
+    if not rtsp_hosts or host in rtsp_hosts:
+        return ""
+    names = {"viewpro": "Viewpro", "siyi": "SIYI", "skydroid": "Skydroid"}
+    prov = names.get(str(provider or "").strip().lower(), str(provider or "camera"))
+    return (
+        f"Camera control is {prov} at {control_host}, but the video comes from "
+        f"{' / '.join(rtsp_hosts)}. If that is a different camera, gimbal commands go "
+        "nowhere: Settings > Video > camera control - pick the provider for the camera "
+        "you are flying (Skydroid C12/C13/C14 Pro = 'Skydroid', host 192.168.144.108)."
+    )
+
+
 def camera_video_pick_block_reason(control: object | None) -> str:
     """Operator-facing reason a video click must not become a coordinate now.
 

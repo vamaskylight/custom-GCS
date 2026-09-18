@@ -708,12 +708,20 @@ class VideoMarkTrackingMixin:
             self._sync_video_mark_track_timer()
             return
         ref_uv = built["ref_uv"]
-        ref_att_out = built["ref_att"]
-        assert isinstance(ref_uv, tuple) and isinstance(ref_att_out, tuple)
+        assert isinstance(ref_uv, tuple)
         row["video_mark_track_ref_u"] = float(ref_uv[0])
         row["video_mark_track_ref_v"] = float(ref_uv[1])
-        row["video_mark_track_ref_yaw"] = float(ref_att_out[0])
-        row["video_mark_track_ref_pitch"] = float(ref_att_out[1])
+        ref_att_out = built.get("ref_att")
+        if isinstance(ref_att_out, tuple):
+            row["video_mark_track_ref_yaw"] = float(ref_att_out[0])
+            row["video_mark_track_ref_pitch"] = float(ref_att_out[1])
+        else:
+            # No gimbal attitude at click time (camera control unreachable or
+            # not yet answering): the mark is pinned to the click pixel only.
+            # Field log 2026-09-18 - this raised KeyError and the observation
+            # was lost entirely; the readers all .get() these keys.
+            row.pop("video_mark_track_ref_yaw", None)
+            row.pop("video_mark_track_ref_pitch", None)
         row["video_mark_track_h_scale"] = float(built["h_scale"])
         row["video_mark_track_v_scale"] = float(built["v_scale"])
         if self._facade_session_freezes_setup_marks():

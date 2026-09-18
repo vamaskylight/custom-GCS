@@ -239,6 +239,7 @@ class MainWindowLinkMixin:
             )
             self._wire_camera_control(cc)
             self._append_log(f"Camera control: SIYI SDK UDP {host}:{port} (gimbal attitude 0x0D)")
+            self._warn_camera_control_host_mismatch("siyi", host)
             return
         if provider == "skydroid":
             hosts = resolve_skydroid_control_hosts(self._settings)
@@ -287,10 +288,31 @@ class MainWindowLinkMixin:
             )
             self._wire_camera_control(cc)
             self._append_log(f"Camera control: Viewpro TCP {host}:{port} (ViewLink protocol)")
+            self._warn_camera_control_host_mismatch("viewpro", host)
             return
         cc = MavlinkCameraControl(self._thread)
         self._wire_camera_control(cc)
         self._append_log("Camera control: MAVLink mount / gimbal attitude")
+
+    def _warn_camera_control_host_mismatch(self, provider: str, host: str) -> None:
+        """Say so, loudly, when gimbal control targets a host the video does not come from."""
+        try:
+            from vgcs.video.camera_control import camera_control_host_mismatch_warning
+
+            msg = camera_control_host_mismatch_warning(provider, host, self._settings)
+        except Exception:
+            msg = ""
+        if not msg:
+            return
+        self._append_log(f"WARNING: {msg}")
+        try:
+            print(f"[VGCS:camera] WARNING: {msg}")
+        except Exception:
+            pass
+        try:
+            self._map_widget._set_status(msg)
+        except Exception:
+            pass
 
     def _on_link_up(self) -> None:
         self._map_widget.clear_flight_track()
