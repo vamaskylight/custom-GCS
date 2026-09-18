@@ -1,9 +1,11 @@
 """VGCS application entrypoint."""
 
 import os
+import signal
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QCoreApplication, QTimer
 from PySide6.QtWidgets import QApplication
 
 from vgcs.app.gcs_style import gcs_stylesheet
@@ -76,6 +78,48 @@ def _apply_webengine_chromium_flags_from_env() -> None:
         os.environ[key] = base
 
 
+def install_ctrl_c_handler(app, win, *, tick_ms: int = 250) -> "QTimer | None":
+    """Make Ctrl+C in the console close VGCS cleanly.
+
+    Two things stop it from working on its own. Python only notices a pending
+    SIGINT while it is executing Python code, and inside ``app.exec()`` the
+    process sits in Qt's C++ event loop, so the keypress waits for the next
+    slot to run - and a KeyboardInterrupt raised inside a Qt slot does not stop
+    the loop anyway. So: a handler that closes the window (disconnect, save
+    geometry, stop the camera backend) and quits the app, plus a timer whose
+    only job is to hand control back to Python often enough for the handler to
+    run. A second Ctrl+C while shutdown is still in progress exits hard.
+    """
+    state = {"presses": 0}
+
+    def _on_sigint(_signum, _frame) -> None:
+        state["presses"] += 1
+        if state["presses"] >= 2:
+            print("[VGCS] Ctrl+C again - exiting now", flush=True)
+            os._exit(130)
+        print("[VGCS] Ctrl+C - closing VGCS", flush=True)
+        try:
+            win.close()
+        except Exception:
+            pass
+        try:
+            app.quit()
+        except Exception:
+            pass
+
+    try:
+        signal.signal(signal.SIGINT, _on_sigint)
+    except (ValueError, OSError):
+        return None  # not the main thread / unsupported: leave the default
+    if QCoreApplication.instance() is None:
+        return None
+    timer = QTimer()
+    timer.setInterval(max(50, int(tick_ms)))
+    timer.timeout.connect(lambda: None)
+    timer.start()
+    return timer
+
+
 def main() -> int:
     _enable_crash_diagnostics()
     _apply_webengine_chromium_flags_from_env()
@@ -91,6 +135,7 @@ def main() -> int:
     app.setStyleSheet(gcs_stylesheet(mono_family=profile.mono_family, ui_scale=ui_scale))
     win = MainWindow()
     win.show()
+    _ctrl_c_tick = install_ctrl_c_handler(app, win)  # keep a reference: a dropped QTimer stops
     return app.exec()
 
 
