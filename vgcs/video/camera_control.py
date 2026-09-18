@@ -328,9 +328,25 @@ class SkydroidCameraControl:
             profile_id=profile_id,
         )
         self._adapter.start()
+        # The video pipeline does not know which camera is connected; tell it
+        # which artifact checks suit this one's picture (C14 Pro: colour only).
+        try:
+            from vgcs.video.pipeline import set_companion_qc_mode
+
+            mode = set_companion_qc_mode(getattr(self._adapter._profile, "video_qc_mode", "full"))
+            print(f"[VGCS:video] companion QC mode={mode} (camera profile {profile_id})")
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._adapter.stop()
+        # Never leave this camera's leniency behind for the next one.
+        try:
+            from vgcs.video.pipeline import set_companion_qc_mode
+
+            set_companion_qc_mode("full")
+        except Exception:
+            pass
 
     def set_zoom(self, level: float) -> None:
         try:

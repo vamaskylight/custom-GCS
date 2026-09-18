@@ -752,6 +752,61 @@ def _companion_hevc_showall_enabled() -> bool:
     return raw in ("1", "on", "true", "yes")
 
 
+# Which artifact checks the companion gate may use, chosen per camera:
+#   "full"   - colour tears + texture/contrast heuristics (soup, seam, lower-band
+#              noise, vs-last-good). Tuned on C13 field captures; C13 default.
+#   "colour" - colour tears only (magenta / green macroblock bands, the one
+#              unambiguous signature of a broken HEVC decode). For cameras whose
+#              clean picture is sharp and high-contrast enough to trip the
+#              texture heuristics all the time (C14 Pro, 2026-09-18: frames hidden
+#              at zoom step 0 with the gimbal still, VLC clean on the same PC).
+#   "off"    - show every decoded frame.
+# Set by the camera backend when it starts (SkydroidCameraControl); overridden
+# by VGCS_COMPANION_QC_MODE=full|colour|off. VGCS_COMPANION_QC_GATE=0 == "off".
+QC_MODE_FULL = "full"
+QC_MODE_COLOUR = "colour"
+QC_MODE_OFF = "off"
+_companion_qc_mode: str = QC_MODE_FULL
+
+
+def set_companion_qc_mode(mode: str | None) -> str:
+    """Select the artifact checks for the connected camera; returns what is in force."""
+    global _companion_qc_mode
+    m = str(mode or "").strip().lower()
+    if m in ("color", "colours", "colors"):
+        m = QC_MODE_COLOUR
+    _companion_qc_mode = m if m in (QC_MODE_FULL, QC_MODE_COLOUR, QC_MODE_OFF) else QC_MODE_FULL
+    return _companion_qc_mode
+
+
+def _companion_qc_mode_active() -> str:
+    env = str(os.environ.get("VGCS_COMPANION_QC_MODE", "") or "").strip().lower()
+    if env in ("color", "colours", "colors"):
+        env = QC_MODE_COLOUR
+    if env in (QC_MODE_FULL, QC_MODE_COLOUR, QC_MODE_OFF):
+        return env
+    if not _companion_qc_gate_enabled():
+        return QC_MODE_OFF
+    return _companion_qc_mode
+
+
+def _companion_colour_tear(sample: "np.ndarray") -> bool:
+    """The colour-only check: neon magenta / green macroblock bands, wide thresholds."""
+    return _rgb_frame_region_has_decode_artifacts(
+        sample, strict=False, regional=False, colors_only=True
+    )
+
+
+def _companion_cold_start_hide(sample: "np.ndarray") -> bool:
+    """First frame of a session: only total collapse is rejected - per QC mode."""
+    mode = _companion_qc_mode_active()
+    if mode == QC_MODE_OFF:
+        return False
+    if mode == QC_MODE_COLOUR:
+        return _companion_colour_tear(sample)
+    return _rgb_frame_looks_like_macroblock_soup(sample)
+
+
 def _companion_qc_gate_enabled() -> bool:
     """VGCS_COMPANION_QC_GATE=0 shows every decoded frame, artifacts included.
 
@@ -961,6 +1016,8 @@ def _companion_gop_warmup_frame_ok(
         return not _rgb_frame_region_has_decode_artifacts(
             sample, strict=False, regional=False, colors_only=True
         )
+    if _companion_qc_mode_active() == QC_MODE_COLOUR:
+        return not _companion_colour_tear(sample)
     hide, _ = _companion_frame_should_hide(sample, None, motion_preview=False, thermal=False)
     return not hide
 
@@ -1358,6 +1415,13 @@ def _companion_frame_should_hide(
 ) -> tuple[bool, str]:
     """Return (hide, reason) for companion preview quality gate."""
     sample = _companion_rgb_sample_for_qc(arr)
+    mode = _companion_qc_mode_active()
+    if mode == QC_MODE_OFF:
+        return False, ""
+    if mode == QC_MODE_COLOUR and not thermal:
+        # Texture heuristics (soup, seam, lower-band noise, vs-last-good) are
+        # off for this camera: on a sharp picture they fire on scenery.
+        return (True, "artifact") if _companion_colour_tear(sample) else (False, "")
     if thermal:
         if _rgb_frame_region_has_decode_artifacts(
             sample, strict=False, regional=False, colors_only=True
@@ -3346,7 +3410,7 @@ class RtspSource(QObject):
                                     if (
                                         companion_rtsp
                                         and not _companion_hevc_showall_enabled()
-                                        and _companion_qc_gate_enabled()
+                                        and _companion_qc_mode_active() != QC_MODE_OFF
                                     ):
                                         if track_video_guard:
                                             session_gop_ready = True
@@ -3427,9 +3491,7 @@ class RtspSource(QObject):
                                         )
                                         if cold_start:
                                             sample = _companion_rgb_sample_for_qc(arr)
-                                            hide = _rgb_frame_looks_like_macroblock_soup(
-                                                sample
-                                            )
+                                            hide = _companion_cold_start_hide(sample)
                                             why = "artifact" if hide else ""
                                         else:
                                             hide, why = _companion_frame_should_hide(

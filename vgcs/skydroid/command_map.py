@@ -81,6 +81,10 @@ class SkydroidCommandProfile:
     # upper-case #TP header the vendor document requires for all G-class frames.
     # False = the lower-case #tp VGCS has always sent, which C13 accepts.
     g_frames_upper_header: bool = False
+    # Which artifact checks the companion video gate may use on this camera's
+    # picture: "full" (C13-tuned texture + colour heuristics) or "colour" (colour
+    # tears only). See vgcs/video/pipeline.py set_companion_qc_mode.
+    video_qc_mode: str = "full"
     # Profile the endpoint probe retries with when this one gets no attitude.
     # "" disables the retry - it must for any camera whose optics differ from
     # C13, or a successful retry would swap this camera onto C13's lens.
@@ -244,6 +248,10 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         # Follow the document to the letter on a camera nobody here has driven
         # yet; VGCS_TOP_G_HEADER=lower reverts it in the field.
         g_frames_upper_header=True,
+        # 48 MP sensor downscaled to 720p: sharp, high-contrast frames that the
+        # C13-tuned texture heuristics mistook for decoder garbage all session
+        # long (field logs 2026-09-18, VLC clean on the same PC).
+        video_qc_mode="colour",
         probe_fallback_profile_id="",
     ),
 }
