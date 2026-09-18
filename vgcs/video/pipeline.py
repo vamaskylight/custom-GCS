@@ -920,8 +920,26 @@ def _companion_hevc_glitch_backoff_cap_s() -> float:
         return 12.0
 
 
+# A chaotic decode tile is noise: neighbouring pixels are unrelated, so the mean
+# absolute step between neighbours is about as large as the tile's own spread
+# (ratio ~1.1 for random content). A high-contrast tile from a real scene - a
+# window edge, a roofline against sky - gets its spread from one or two edges
+# and is smooth everywhere else (ratio ~0.3-0.4 measured on a C14 Pro frame of
+# a white building with rows of dark windows, 2026-09-18). Below this the
+# "busy" tiles are structure, not soup.
+_SOUP_TILE_ROUGHNESS_MIN = 0.6
+_SOUP_TILE_ROUGHNESS_MIN_TILES = 6
+
+
 def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
-    """Full-frame HEVC decode collapse — patchy 8×8 tile chaos across the whole image."""
+    """Full-frame HEVC decode collapse — patchy 8×8 tile chaos across the whole image.
+
+    Only the spread of per-tile contrast is measured here, and that cannot tell a
+    torn building from a building: a client's C14 Pro feed (2026-09-18) froze on a
+    perfectly clean courtyard scene because its upper half - white walls, dark
+    windows, bright sky - has exactly the patchy contrast this looks for. The
+    roughness veto below separates the two; see _SOUP_TILE_ROUGHNESS_MIN.
+    """
     if not HAS_NUMPY or np is None:
         return False
     h, w, _ = arr.shape
@@ -932,18 +950,34 @@ def _rgb_frame_looks_like_macroblock_soup(arr: "np.ndarray") -> bool:
     b = arr[:, :, 2].astype(np.float32)
     gray = 0.299 * r + 0.587 * g + 0.114 * b
     block_stds: list[float] = []
+    block_rough: list[float] = []
     step = 16
     for y in range(0, h - 8, step):
         for x in range(0, w - 8, step):
-            block_stds.append(float(gray[y : y + 8, x : x + 8].std()))
+            tile = gray[y : y + 8, x : x + 8]
+            s = float(tile.std())
+            block_stds.append(s)
+            grad = (
+                float(np.abs(np.diff(tile, axis=1)).mean())
+                + float(np.abs(np.diff(tile, axis=0)).mean())
+            ) * 0.5
+            block_rough.append(grad / (s + 1e-6))
     if len(block_stds) < 12:
         return False
     med = float(np.median(block_stds))
     std_of_stds = float(np.std(block_stds))
-    hi = sum(1 for s in block_stds if s > max(24.0, med * 2.4))
+    hi_thr = max(24.0, med * 2.4)
+    hi_rough = [rg for s, rg in zip(block_stds, block_rough) if s > hi_thr]
+    hi = len(hi_rough)
     lo = sum(1 for s in block_stds if s < max(6.0, med * 0.35))
     ratio = hi / float(len(block_stds))
     lo_ratio = lo / float(len(block_stds))
+    if (
+        hi >= _SOUP_TILE_ROUGHNESS_MIN_TILES
+        and float(np.median(hi_rough)) < _SOUP_TILE_ROUGHNESS_MIN
+    ):
+        # The busy tiles are edges and texture with smooth interiors: scenery.
+        return False
     # Patchy macroblock soup: mix of flat tiles and chaotic tiles (classic HEVC tear).
     if ratio > 0.28 and lo_ratio > 0.20 and med > 12.0:
         return True
