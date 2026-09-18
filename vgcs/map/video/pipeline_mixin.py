@@ -237,6 +237,16 @@ class VideoPipelineMixin:
         if not _skip_pv_reset and not from_start:
             self._video_preview_enabled = False
 
+        # A recording in progress must be finalised before its source goes away,
+        # or the file is left without its trailer and the operator never gets a
+        # save dialog (field report 2026-09-18). Deferred so the dialog does not
+        # open in the middle of a backend rebuild.
+        try:
+            if bool(getattr(self, "_video_recording", False)):
+                self._finish_video_recording(reason="video restarted", prompt=False)
+                QTimer.singleShot(0, self._offer_unsaved_recording)
+        except Exception:
+            pass
         self._video: VideoPipeline | None = None
         self._video_active_source = None
         # Do not clear `_video_split_enabled` / `_video_follow_enabled` here: the native rail

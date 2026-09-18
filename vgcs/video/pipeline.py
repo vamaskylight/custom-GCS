@@ -17,7 +17,7 @@ from typing import Callable, Optional, Protocol
 _COMPANION_RTSP_IPV4 = ipaddress.ip_network("192.168.144.0/24")
 
 # Bump when SIYI / RTSP decode behaviour changes (printed once per RtspSource decode thread).
-_VIDEO_PIPELINE_REV = "2026-06-24-companion-stable-preview5"
+_VIDEO_PIPELINE_REV = "2026-09-18-c14pro-qc-diag2"
 
 # C13 / SIYI: one RTSP client slot — serialize opens across day/thermal sources.
 _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
@@ -750,6 +750,104 @@ def _companion_hevc_showall_enabled() -> bool:
     """Opt-in: FFmpeg +showall emits partial HEVC frames (macroblock garbage). Default off."""
     raw = str(os.environ.get("VGCS_COMPANION_SHOWALL", "0") or "0").strip().lower()
     return raw in ("1", "on", "true", "yes")
+
+
+def _companion_qc_gate_enabled() -> bool:
+    """VGCS_COMPANION_QC_GATE=0 shows every decoded frame, artifacts included.
+
+    A field escape hatch for when the artifact heuristics misjudge a camera's
+    picture (C14 Pro, 2026-09-18): the operator sees the raw decode instead of a
+    frozen "last good" frame, and no stale/corrupt reconnects fire. Unlike
+    VGCS_COMPANION_SHOWALL it leaves FFmpeg's own flags alone.
+    """
+    raw = str(os.environ.get("VGCS_COMPANION_QC_GATE", "1") or "1").strip().lower()
+    return raw not in ("0", "off", "false", "no")
+
+
+# Hidden frames are written to logs/qc_hidden/ so a false positive can be seen
+# and re-run through the heuristics offline, instead of guessed at from a log
+# line. Capped per process; VGCS_COMPANION_QC_DUMP=0 disables.
+_QC_DUMP_MAX_PER_RUN = 16
+_qc_dump_count = 0
+_qc_dump_lock = threading.Lock()
+
+
+def _companion_qc_dump_enabled() -> bool:
+    raw = str(os.environ.get("VGCS_COMPANION_QC_DUMP", "1") or "1").strip().lower()
+    return raw not in ("0", "off", "false", "no")
+
+
+def _companion_qc_dump_dir() -> Path:
+    return Path(os.environ.get("VGCS_COMPANION_QC_DUMP_DIR", "") or (Path.cwd() / "logs" / "qc_hidden"))
+
+
+def _dump_hidden_frame(arr: "np.ndarray", *, why: str, detail: str, streak: int, tag: str = "day") -> str:
+    """Save one hidden frame as PNG; returns the path or "" (never raises)."""
+    global _qc_dump_count
+    if not _companion_qc_dump_enabled() or not HAS_NUMPY or np is None:
+        return ""
+    with _qc_dump_lock:
+        if _qc_dump_count >= _QC_DUMP_MAX_PER_RUN:
+            return ""
+        _qc_dump_count += 1
+        n = _qc_dump_count
+    try:
+        h, w, _ = arr.shape
+        buf = np.ascontiguousarray(arr, dtype=np.uint8)
+        img = QImage(buf.data, int(w), int(h), int(w * 3), QImage.Format.Format_RGB888).copy()
+        out_dir = _companion_qc_dump_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (detail or why or "hidden"))
+        path = out_dir / f"{time.strftime('%Y%m%d_%H%M%S')}_{n:02d}_{tag}_streak{int(streak)}_{safe}.png"
+        if img.save(str(path), "PNG"):
+            return str(path)
+    except Exception:
+        pass
+    return ""
+
+
+def _rgb_frame_decode_artifact_reason(arr: "np.ndarray", *, strict: bool = True) -> str:
+    """Which sub-check of the artifact gate fires first, or "" - for logs only.
+
+    Mirrors _rgb_frame_has_decode_artifacts step by step; it is called only on
+    the rare hide path (at streak 1/30/90/180), never per frame.
+    """
+    if not HAS_NUMPY or np is None:
+        return ""
+    h, w, _ = arr.shape
+    if h < 8 or w < 8:
+        return ""
+    if _rgb_frame_region_has_decode_artifacts(arr, strict=strict, colors_only=True):
+        return "colour-tear"
+    if _rgb_frame_region_has_decode_artifacts(arr, strict=strict):
+        return "full-frame-noise"
+    band = max(8, int(h * 0.45))
+    if band < h and _rgb_frame_region_has_decode_artifacts(arr[h - band :, :, :], strict=strict, regional=True):
+        return "lower-band"
+    if _rgb_frame_has_structural_tear(arr):
+        return "structural-tear"
+    top_h = max(32, int(h * 0.45))
+    if top_h < h and _rgb_frame_looks_like_macroblock_soup(arr[:top_h, :, :]):
+        return "soup-top45"
+    if _rgb_frame_looks_like_macroblock_soup(arr):
+        return "soup-full"
+    return ""
+
+
+def _companion_hide_detail(arr: "np.ndarray", last_good: "np.ndarray | None", why: str) -> str:
+    """Human-readable cause of a hide decision, for the log line and dump name."""
+    try:
+        sample = _companion_rgb_sample_for_qc(arr)
+        if why == "corrupt":
+            return "vs-last-good"
+        reason = _rgb_frame_decode_artifact_reason(sample, strict=True)
+        if reason:
+            return reason
+        if _rgb_frame_looks_like_macroblock_soup(sample):
+            return "soup-coldstart"
+        return why or "unknown"
+    except Exception:
+        return why or "unknown"
 
 
 def _companion_decode_max_dims(url: str) -> tuple[int, int]:
@@ -3245,7 +3343,11 @@ class RtspSource(QObject):
                                 try:
                                     assert np is not None
                                     arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
-                                    if companion_rtsp and not _companion_hevc_showall_enabled():
+                                    if (
+                                        companion_rtsp
+                                        and not _companion_hevc_showall_enabled()
+                                        and _companion_qc_gate_enabled()
+                                    ):
                                         if track_video_guard:
                                             session_gop_ready = True
                                             corrupt_skip_streak = 0
@@ -3279,10 +3381,19 @@ class RtspSource(QObject):
                                                 corrupt_skip_streak += 1
                                                 if corrupt_skip_streak in (1, 30, 90):
                                                     try:
+                                                        detail = _companion_hide_detail(arr, None, "artifact")
+                                                        dumped = _dump_hidden_frame(
+                                                            arr, why="warmup", detail=detail,
+                                                            streak=corrupt_skip_streak,
+                                                            tag="thermal" if thermal_feed else "day",
+                                                        )
                                                         print(
                                                             "[VGCS:video] companion HEVC: "
                                                             "waiting for clean GOP before preview "
-                                                            f"(skipped={corrupt_skip_streak})"
+                                                            f"(skipped={corrupt_skip_streak}, "
+                                                            f"check={detail}"
+                                                            + (f", saved={dumped}" if dumped else "")
+                                                            + ")"
                                                         )
                                                     except Exception:
                                                         pass
@@ -3349,11 +3460,19 @@ class RtspSource(QObject):
                                                     last_good_arr = None
                                             if corrupt_skip_streak in (1, 30, 90, 180):
                                                 try:
+                                                    detail = _companion_hide_detail(arr, last_good_arr, why)
+                                                    dumped = _dump_hidden_frame(
+                                                        arr, why=why, detail=detail,
+                                                        streak=corrupt_skip_streak,
+                                                        tag="thermal" if thermal_feed else "day",
+                                                    )
                                                     print(
                                                         "[VGCS:video] companion HEVC: "
                                                         f"hiding {why} frame "
                                                         f"(streak={corrupt_skip_streak}, "
-                                                        "hold last good preview)"
+                                                        f"check={detail}, hold last good preview"
+                                                        + (f", saved={dumped}" if dumped else "")
+                                                        + ")"
                                                     )
                                                 except Exception:
                                                     pass

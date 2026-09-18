@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import time
 
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from vgcs.map.image_io import save_qimage_to_path
 from vgcs.video.camera_control import NoopCameraControl
@@ -214,6 +216,144 @@ class VideoRecordingMixin:
             self._ensure_native_cam_recording_tick_timer().start()
         except Exception:
             pass
+
+    # --- finishing a recording, whatever state the video backend is in -------
+    #
+    # Field report 2026-09-18 (C14 Pro session): "after stop the recording timer
+    # disappears" and no save window. Two ways that happened:
+    #  1. The stop press looked up the *current* preview source first; while the
+    #     stream was being reopened there was none, so the press fell through to
+    #     "nothing is recording" - no stop_recording(), no save dialog, temp
+    #     file orphaned.
+    #  2. Any video-backend restart (camera control re-set, settings applied,
+    #     link reconnect) cleared the recording flags in _ensure_video_preview_backend
+    #     without stopping the recorder, so the next stop press had nothing to
+    #     finish and the file was never finalised.
+    # Both now go through _finish_video_recording, which finds the recorder by
+    # the source id captured at start, finalises the file, and always offers
+    # the save dialog when there is a file worth saving.
+
+    def _recording_source_for_stop(self):
+        """The source that is recording: by the id captured at start, else the active one."""
+        sid = str(getattr(self, "_video_recording_source_id", "") or "").strip()
+        src = None
+        if sid:
+            try:
+                src = self._video_source_by_id(sid)
+            except Exception:
+                src = None
+        if src is None:
+            try:
+                src = self._operator_preview_video_source()
+            except Exception:
+                src = None
+        if src is None:
+            src = getattr(self, "_video_active_source", None)
+        return src
+
+    def _finish_video_recording(self, *, reason: str = "", prompt: bool = True) -> bool:
+        """Stop a running recording and offer to save it. True if one was running.
+
+        Safe to call when nothing is recording (returns False, touches nothing).
+        ``reason`` is shown when the stop was not the operator's own press.
+        """
+        if not bool(getattr(self, "_video_recording", False)):
+            return False
+        src = self._recording_source_for_stop()
+        try:
+            self._sync_payload_hardware_recording(False)
+        except Exception:
+            pass
+        stop_fn = getattr(src, "stop_recording", None)
+        if callable(stop_fn):
+            try:
+                stop_fn()
+            except Exception:
+                pass
+        else:
+            # QMediaRecorder-backed source (non-RTSP): stop it the old way.
+            rec = None
+            try:
+                rec = src.recorder() if src is not None and hasattr(src, "recorder") else None
+            except Exception:
+                rec = None
+            if rec is not None:
+                try:
+                    rec.stop()
+                except Exception:
+                    pass
+                try:
+                    wait_qmedia_recorder_stopped(rec, timeout_s=25.0)
+                except Exception:
+                    pass
+        self._video_recording = False
+        self._video_recording_source_id = ""
+        tmp_path = str(getattr(self, "_video_recording_tmp_path", "") or "")
+        self._video_recording_tmp_path = ""
+        try:
+            from vgcs.video.pipeline import notify_companion_recording
+
+            notify_companion_recording(active=False)
+        except Exception:
+            pass
+        self._stop_native_cam_recording_tick_timer()
+        if src is None:
+            try:
+                print("[VGCS:cam_rail] RECORD stop: video source already gone; keeping the file")
+            except Exception:
+                pass
+        if reason:
+            try:
+                print(f"[VGCS:cam_rail] RECORD stopped — {reason}")
+            except Exception:
+                pass
+        if prompt:
+            self._prompt_save_recording(tmp_path, reason=reason)
+        else:
+            self._video_recording_unsaved_path = tmp_path
+        return True
+
+    def _offer_unsaved_recording(self) -> None:
+        """Save dialog for a recording that a backend restart had to stop."""
+        path = str(getattr(self, "_video_recording_unsaved_path", "") or "")
+        self._video_recording_unsaved_path = ""
+        if path:
+            self._prompt_save_recording(path, reason="video restarted")
+
+    def _prompt_save_recording(self, tmp_path: str, *, reason: str = "") -> None:
+        """Save dialog for a finished recording; says why when there is nothing to save."""
+        path = str(tmp_path or "").strip()
+        size = 0
+        try:
+            size = os.path.getsize(path) if path and os.path.exists(path) else 0
+        except Exception:
+            size = 0
+        if size <= 0:
+            msg = "Recording stopped but the file is empty — no frames were captured"
+            if reason:
+                msg += f" ({reason})"
+            try:
+                print(f"[VGCS:cam_rail] RECORD save skipped — {msg}")
+            except Exception:
+                pass
+            self._set_status(msg)
+            return
+        if reason:
+            self._set_status(f"Recording stopped — {reason}. Choose where to save it.")
+        save_to, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save recording",
+            suggested_recording_save_path(),
+            "Video (*.mp4 *.mov *.mkv)",
+        )
+        if not save_to:
+            self._set_status("Recording discarded (no file name chosen)")
+            return
+        try:
+            shutil.move(path, str(save_to))
+            self._set_status(f"Recording saved: {save_to}")
+        except Exception as e:
+            self._set_status(f"Could not save recording: {e}")
 
     def _stop_native_cam_recording_tick_timer(self, *, reset_label: bool = True) -> None:
         t = getattr(self, "_native_cam_recording_tick_timer", None)

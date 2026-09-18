@@ -224,6 +224,12 @@ class WebBridgeMixin:
             except Exception:
                 want_on = False
             try:
+                # STOP is handled before anything can reset the recording state
+                # and without needing a live source: the recorder is found by the
+                # id captured at start. See VideoRecordingMixin._finish_video_recording.
+                if not want_on and self._finish_video_recording():
+                    self._run_js("document.title = 'VGCS Map';")
+                    return
                 self._ensure_video_preview_backend()
                 rec_sid = self._operator_preview_source_id()
                 src = self._operator_preview_video_source()
@@ -479,6 +485,15 @@ class WebBridgeMixin:
                 pass
             try:
                 self._reapply_preview_zoom_now()
+            except Exception:
+                pass
+            try:
+                # A zoom step changes the whole picture as abruptly as a gimbal
+                # slew, and the quality gate compared those frames against the
+                # pre-zoom "last good" one and hid them (C14 Pro field log
+                # 2026-09-18: "feed stuck when I increase the zoom"). Open the
+                # same motion window a slew gets: live frames, no stale hold.
+                self._notify_companion_gimbal_motion(duration_s=2.5)
             except Exception:
                 pass
             try:
