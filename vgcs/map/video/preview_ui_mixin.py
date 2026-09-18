@@ -22,7 +22,10 @@ from vgcs.map.video.helpers import _format_video_zoom_label
 from vgcs.video.camera_control import (
     camera_preview_applies_digital_zoom,
     camera_recording_applies_digital_zoom,
+    camera_video_pick_block_reason,
+    camera_zoom_label,
     camera_zoom_limits,
+    camera_zoom_ui_level,
 )
 from vgcs.video.pipeline import (
     VideoFrame,
@@ -90,6 +93,39 @@ def _wait_for_rtsp_ready(
 class VideoPreviewUiMixin:
     """Extracted from MapWidget — uses host widget state via self."""
 
+    def _video_pick_wanted(self) -> bool:
+        """True when the next click on the video would become a coordinate."""
+        try:
+            if self._dooaf_pick_complete is not None and bool(
+                getattr(self, "_dooaf_pick_from_video", False)
+            ):
+                return True
+            if bool(getattr(self, "_lrf_lock_armed", False)):
+                return True
+            if self._m13_track_mode_active() and not self._m13_track_is_active():
+                return True
+            return bool(self._observation_mark_active())
+        except Exception:
+            return False
+
+    def _video_pick_blocked(self) -> bool:
+        """Refuse a video pick the camera cannot convert to an angle honestly.
+
+        True (and a status line for the operator) when the active camera says
+        its field of view is unknown right now - today only a zoomed C14 Pro,
+        whose zoom formula the vendor document leaves blank. A wrong FOV yields
+        a wrong DOOAF coordinate that looks normal, so the click is dropped
+        rather than converted. Every other camera answers "" and is untouched.
+        """
+        reason = camera_video_pick_block_reason(getattr(self, "_camera_control", None))
+        if not reason:
+            return False
+        try:
+            self._set_status(reason)
+        except Exception:
+            pass
+        return True
+
     def _on_native_video_click(self, event) -> None:
         try:
             if event is not None and hasattr(event, "button"):
@@ -98,6 +134,13 @@ class VideoPreviewUiMixin:
                     return
         except Exception:
             pass
+        if self._video_pick_wanted() and self._video_pick_blocked():
+            try:
+                if event is not None:
+                    event.accept()
+            except Exception:
+                pass
+            return
         if self._dooaf_pick_complete is not None and bool(
             getattr(self, "_dooaf_pick_from_video", False)
         ):
@@ -749,6 +792,23 @@ class VideoPreviewUiMixin:
             sid = self._operator_preview_source_id()
         self._apply_video_recording_preview_transform(sid)
 
+    def _resync_zoom_from_camera(self) -> None:
+        """Pull the rail onto the zoom position the camera reports (C14 Pro).
+
+        Scheduled a moment after a zoom click, once the camera has answered the
+        step read that follows the command. No-op for cameras that report
+        nothing (C12/C13), whose rail keeps its own count as before.
+        """
+        level = camera_zoom_ui_level(getattr(self, "_camera_control", None))
+        if level is None:
+            return
+        try:
+            zmin, zmax, _ = self._video_zoom_limits()
+            self._video_zoom = round(max(zmin, min(zmax, float(level))), 1)
+        except Exception:
+            return
+        self._sync_native_video_zoom_label()
+
     def _sync_native_video_zoom_label(self) -> None:
         lbl = getattr(self, "_lbl_camera_top_zoom", None)
         if lbl is None:
@@ -758,7 +818,10 @@ class VideoPreviewUiMixin:
         except Exception:
             z = 1.0
         try:
-            lbl.setText(_format_video_zoom_label(z))
+            # A DZM-step camera (C14 Pro) labels itself by lens + step ("W0",
+            # "T85"): its rail level is a counter, and "3.4x" would be a lie.
+            text = camera_zoom_label(getattr(self, "_camera_control", None))
+            lbl.setText(text or _format_video_zoom_label(z))
         except Exception:
             pass
 

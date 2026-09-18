@@ -8,9 +8,17 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from vgcs.skydroid.command_map import SkydroidCommandProfile, get_profile
+from vgcs.skydroid.command_map import (
+    ZOOM_MODEL_DZM_STEP,
+    SkydroidCommandProfile,
+    get_profile,
+)
 from vgcs.skydroid.protocol import (
     build_c13_zoom_step_frames,
+    build_dzm_home_frames,
+    build_dzm_lens_select,
+    build_dzm_query,
+    build_dzm_step_frames,
     build_gac_query,
     build_gimbal_speed,
     build_got_target,
@@ -24,6 +32,8 @@ from vgcs.skydroid.protocol import (
     parse_slr_distance_from_payload,
     slr_raw_hex,
     parse_top_frame,
+    set_g_class_upper_header,
+    set_slr_max_range_m,
     _LRF_FRAME_H,
     _LRF_FRAME_W,
 )
@@ -75,8 +85,54 @@ _LRF_GIMBAL_MOVE_MIN_DEG = 0.35
 # validated against real hardware, not an arbitrary guess — do NOT change this
 # to the nominal datasheet value without re-validating the whole DOOAF/LRF
 # alignment pipeline against fresh field data first.
-_LRF_FOV_H_DEG = 83.4
-_LRF_FOV_V_DEG = 46.9
+_C13_AIM_FOV_H_DEG = 83.4
+_C13_AIM_FOV_V_DEG = 46.9
+# The FOV the aim math below actually uses. These two names are read directly
+# at ~25 call sites here (many of them @staticmethods with no camera instance)
+# and imported by lrf_mixin / facade_plane / _dooaf_correction, so a camera with
+# a different lens is supported by REBINDING them when its adapter is created
+# (apply_profile_optics) rather than by threading a parameter through trusted,
+# field-validated LRF/DOOAF code. One camera is connected at a time, and
+# C12/C13 profiles always rebind to the C13 values above - i.e. no change.
+_LRF_FOV_H_DEG = _C13_AIM_FOV_H_DEG
+_LRF_FOV_V_DEG = _C13_AIM_FOV_V_DEG
+
+
+def apply_profile_optics(profile: SkydroidCommandProfile | None) -> tuple[float, float]:
+    """Point the aim math at ``profile``'s lens; returns the (hfov, vfov) applied.
+
+    Only profiles that opt in with ``aim_fov_from_profile`` move the numbers.
+    Anything else - including None or a nonsense FOV - restores C13's, so a
+    C14 Pro session can never leave its lens behind for the next C13 one.
+    """
+    global _LRF_FOV_H_DEG, _LRF_FOV_V_DEG
+    hfov, vfov = _C13_AIM_FOV_H_DEG, _C13_AIM_FOV_V_DEG
+    if profile is not None and bool(getattr(profile, "aim_fov_from_profile", False)):
+        try:
+            ph = float(profile.fov_h_deg)
+            pv = float(profile.fov_v_deg)
+        except (TypeError, ValueError, AttributeError):
+            ph = pv = 0.0
+        if 1.0 < ph < 179.0 and 1.0 < pv < 179.0:
+            hfov, vfov = ph, pv
+    _LRF_FOV_H_DEG, _LRF_FOV_V_DEG = hfov, vfov
+    # The other two pieces of per-camera module state ride along, so one call
+    # fully (re)configures the protocol layer for whichever camera is connected.
+    set_slr_max_range_m(getattr(profile, "laser_max_m", None) if profile is not None else None)
+    set_g_class_upper_header(bool(getattr(profile, "g_frames_upper_header", False)))
+    return hfov, vfov
+
+
+# DZM-step cameras (C14 Pro): how the zoom-step readback is paced. The read
+# shares one UDP socket with the 5 Hz attitude push and every gimbal command,
+# so it is short, infrequent, and backs off hard if the camera never answers.
+_DZM_POLL_INTERVAL_S = 2.0
+_DZM_POLL_BACKOFF_S = 15.0
+_DZM_POLL_BACKOFF_AFTER = 5
+_DZM_POLL_TIMEOUT_S = 0.25
+_DZM_POLL_AFTER_CMD_S = 0.35
+# A reported step older than this no longer vouches for where the zoom is.
+_DZM_STEP_FRESH_S = 10.0
 _LRF_REPOINT_AFTER_S = 4.0
 _LRF_GIMBAL_SLEW_SPEED_DPS = 2.0
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
@@ -218,6 +274,25 @@ class SkydroidTopUdpAdapter:
         self._status_lock = threading.Lock()
         self._profile: SkydroidCommandProfile = get_profile(profile_id)
         self._profile_id = str(profile_id or "c13_default")
+        fov_h, fov_v = apply_profile_optics(self._profile)
+        if self._profile.aim_fov_from_profile:
+            try:
+                print(
+                    f"[VGCS:skydroid] profile={self._profile.profile_id} aim optics "
+                    f"hfov={fov_h:.1f} vfov={fov_v:.1f} "
+                    f"laser_max={float(self._profile.laser_max_m):.0f} m "
+                    f"zoom_model={self._profile.zoom_model}"
+                )
+            except Exception:
+                pass
+        # DZM-step zoom state (C14 Pro); inert for C12/C13.
+        self._zoom_lock = threading.Lock()
+        self._zoom_step_reported: int | None = None
+        self._zoom_step_reported_mono: float = 0.0
+        self._zoom_cmd_net_steps: int = 0
+        self._zoom_poll_due_mono: float = 0.0
+        self._zoom_poll_failures: int = 0
+        self._zoom_block_logged: str = ""
         port_i = int(port)
         if port_i not in _C13_PROBE_PORTS:
             try:
@@ -3636,10 +3711,245 @@ class SkydroidTopUdpAdapter:
         self._enqueue(self._profile.camera_commands.get("photo", []), {}, True)
 
     def camera_zoom(self, level: float) -> None:
+        if self.zoom_is_dzm_step():
+            # No absolute zoom on a DZM-step camera: a "level" is not a step
+            # and the step->magnification formula is unknown. The one absolute
+            # state we can command is the wide end.
+            if float(level) <= 1.0 + 1e-6:
+                self.camera_zoom_home()
+            return
         self._enqueue(["ZOOM_BURST"], {"level": float(level)}, False)
 
     def camera_zoom_step(self, direction: int) -> None:
+        if self.zoom_is_dzm_step():
+            d = 1 if int(direction) > 0 else (-1 if int(direction) < 0 else 0)
+            if d == 0:
+                return
+            with self._zoom_lock:
+                top = max(0, int(self._profile.zoom_step_max))
+                self._zoom_cmd_net_steps = max(0, min(top, self._zoom_cmd_net_steps + d))
+            self._enqueue(["DZM_STEP"], {"direction": d}, False)
+            return
         self._enqueue(["C13_ZOOM_STEP"], {"direction": int(direction)}, False)
+
+    # --- DZM-step zoom (C14 Pro) ---------------------------------------------
+
+    def zoom_is_dzm_step(self) -> bool:
+        return str(getattr(self._profile, "zoom_model", "") or "") == ZOOM_MODEL_DZM_STEP
+
+    def camera_zoom_home(self) -> None:
+        """Short-focus lens at 1x - the one zoom state whose FOV is known."""
+        if not self.zoom_is_dzm_step():
+            return
+        with self._zoom_lock:
+            self._zoom_cmd_net_steps = 0
+        self._enqueue(["DZM_HOME"], {}, False)
+
+    def camera_select_lens(self, lens: str) -> None:
+        """Jump to the ``"short"`` or ``"long"`` visible lens (DZM 0D / 0C)."""
+        if not self.zoom_is_dzm_step():
+            return
+        name = str(lens or "").strip().lower()
+        target = next((ln for ln in self._profile.lenses if ln.name == name), None)
+        if target is None:
+            return
+        with self._zoom_lock:
+            self._zoom_cmd_net_steps = int(target.dzm_step_min)
+        self._enqueue(["DZM_LENS"], {"lens": name}, False)
+
+    def zoom_step_reported(self, *, max_age_s: float = _DZM_STEP_FRESH_S) -> int | None:
+        """The DZM step the camera last reported, or None if never / too old."""
+        with self._zoom_lock:
+            step = self._zoom_step_reported
+            ts = float(self._zoom_step_reported_mono or 0.0)
+        if step is None or ts <= 0.0:
+            return None
+        if (time.monotonic() - ts) > max(0.5, float(max_age_s)):
+            return None
+        return int(step)
+
+    def zoom_step_best(self) -> tuple[int, bool]:
+        """``(step, reported)``: the camera's own figure when fresh, else our count.
+
+        The fallback is the same trust model C13 runs on all the time (the level
+        we commanded); it is blind to zooming done on the handset.
+        """
+        step = self.zoom_step_reported()
+        if step is not None:
+            return int(step), True
+        with self._zoom_lock:
+            return int(self._zoom_cmd_net_steps), False
+
+    def zoom_label(self) -> str:
+        """Rail label for a DZM-step camera: lens + step, never a fake "x"."""
+        if not self.zoom_is_dzm_step():
+            return ""
+        step, reported = self.zoom_step_best()
+        lens = self._profile.lens_for_dzm_step(step)
+        tag = {"short": "W", "long": "T"}.get(getattr(lens, "name", ""), "Z")
+        return f"{tag}{int(step)}" + ("" if reported else "?")
+
+    def video_pick_block_reason(self) -> str:
+        """Why a click on the video must NOT be turned into an angle right now.
+
+        Empty string = go ahead. Non-empty only for a camera whose field of view
+        away from the wide end is unknown (``zoom_fov_confirmed`` False): there a
+        zoomed click would convert with the wrong angle and yield a DOOAF
+        coordinate / fire correction that looks perfectly normal. Refusing is
+        the only failure the operator can see.
+        """
+        prof = self._profile
+        if bool(getattr(prof, "zoom_fov_confirmed", True)) or not self.zoom_is_dzm_step():
+            return ""
+        step, reported = self.zoom_step_best()
+        if int(step) == 0:
+            return ""
+        lens = prof.lens_for_dzm_step(step)
+        lens_txt = f"{lens.name}-focus lens, " if lens is not None else ""
+        name = str(getattr(prof, "display_name", "") or prof.profile_id)
+        reason = (
+            f"{name} is zoomed ({lens_txt}step {int(step)}"
+            f"{'' if reported else ', by our count'}). Video picks need the widest "
+            f"view until the zoom formula is confirmed - zoom fully out, then pick again."
+        )
+        sig = f"{int(step)}:{int(reported)}"
+        if sig != self._zoom_block_logged:
+            self._zoom_block_logged = sig
+            try:
+                print(f"[VGCS:skydroid] video pick refused: {reason}")
+            except Exception:
+                pass
+        return reason
+
+    def _note_zoom_command_sent(self) -> None:
+        """A zoom frame just went out: the last reported step is now stale."""
+        with self._zoom_lock:
+            self._zoom_step_reported_mono = 0.0
+            self._zoom_poll_due_mono = time.monotonic() + _DZM_POLL_AFTER_CMD_S
+
+    def _send_dzm_frames(self, frames: list[bytes], *, what: str) -> None:
+        """DZM-step zoom frames go to the active endpoint only.
+
+        Unlike _send_zoom_burst there is no spray across 9003/19853: those are
+        C13 field-firmware ports, and V1.2.0 documents only UDP 5000.
+        """
+        if not frames:
+            return
+        self._ensure_active_transport()
+        send_host = self._active_host
+        send_port = self._active_port
+        try:
+            print(f"[VGCS:skydroid] zoom DZM {what} frames={len(frames)} host={send_host}:{send_port}")
+        except Exception:
+            pass
+        for frame in frames:
+            try:
+                self._transport.send_and_receive(
+                    frame, expect_reply=False, log=True, timeout_s=0.05,
+                    host=send_host, port=send_port,
+                )
+            except Exception:
+                continue
+        self._note_zoom_command_sent()
+
+    @staticmethod
+    def _payload_is_dzm_read_reply(payload: bytes) -> bool:
+        dec = parse_top_frame(payload)
+        return bool(dec is not None and dec.command == "DZM" and "dzm_step" in dec.params)
+
+    def _zoom_poll_busy(self) -> bool:
+        """True while a timing-critical sequence owns the shared UDP socket."""
+        # Armed counts too: an LRF lock drains the socket for its SLR reply,
+        # and a zoom read landing in that window would cost it a retry.
+        if bool(self._visual_track_active) or bool(self._lrf_locked) or bool(self._lrf_armed):
+            return True
+        try:
+            return bool(self._m13_track_start_lock.locked())
+        except Exception:
+            return False
+
+    def _poll_zoom_step_if_due(self) -> None:
+        """Ask the camera where its zoom is (DZM read). Status-loop thread only."""
+        if not self.zoom_is_dzm_step() or not self.gimbal_telemetry_ok():
+            return
+        now = time.monotonic()
+        with self._zoom_lock:
+            if now < float(self._zoom_poll_due_mono or 0.0):
+                return
+        if self._zoom_poll_busy():
+            return
+        self._ensure_active_transport()
+        reply: bytes | None = None
+        try:
+            self._transport.send_and_receive(
+                build_dzm_query(), expect_reply=False, log=False, timeout_s=0.05,
+                host=self._active_host, port=self._active_port,
+            )
+
+            def _match(payload: bytes) -> bool:
+                if self._payload_is_dzm_read_reply(payload):
+                    return True
+                # receive_matching discards what it does not want; hand the
+                # attitude pushes that arrive meanwhile to the normal handler
+                # so the zoom poll never costs a gimbal sample.
+                try:
+                    self._maybe_update_status(payload)
+                except Exception:
+                    pass
+                return False
+
+            reply = self._transport.receive_matching(_match, timeout_s=_DZM_POLL_TIMEOUT_S, log=False)
+        except Exception:
+            reply = None
+        now = time.monotonic()
+        if reply is not None:
+            self._maybe_update_status(reply)
+            with self._zoom_lock:
+                self._zoom_poll_failures = 0
+                self._zoom_poll_due_mono = now + _DZM_POLL_INTERVAL_S
+            return
+        with self._zoom_lock:
+            self._zoom_poll_failures += 1
+            failures = int(self._zoom_poll_failures)
+            backoff = failures >= _DZM_POLL_BACKOFF_AFTER
+            self._zoom_poll_due_mono = now + (_DZM_POLL_BACKOFF_S if backoff else _DZM_POLL_INTERVAL_S)
+        if failures == _DZM_POLL_BACKOFF_AFTER:
+            try:
+                print(
+                    "[VGCS:skydroid] camera does not answer the DZM zoom-step read - "
+                    "falling back to counting our own zoom commands (blind to handset zoom)"
+                )
+            except Exception:
+                pass
+
+    def _maybe_update_zoom_step(self, dec) -> bool:
+        """Cache a DZM *read* reply. True if ``dec`` was a DZM frame at all."""
+        if dec is None or dec.command != "DZM":
+            return False
+        raw = dec.params.get("dzm_step")
+        if raw is None:
+            return True  # a write echo: ours to swallow, nothing to learn
+        try:
+            step = int(raw)
+        except (TypeError, ValueError):
+            return True
+        with self._zoom_lock:
+            changed = step != self._zoom_step_reported
+            self._zoom_step_reported = step
+            self._zoom_step_reported_mono = time.monotonic()
+            # Re-seat our own count on the truth, so a later fallback starts
+            # from where the camera really was.
+            self._zoom_cmd_net_steps = max(0, step)
+        if changed:
+            lens = self._profile.lens_for_dzm_step(step)
+            try:
+                print(
+                    f"[VGCS:skydroid] zoom step reported={step} "
+                    f"lens={getattr(lens, 'name', '?')}"
+                )
+            except Exception:
+                pass
+        return True
 
     def camera_focus_step(self, direction: int) -> None:
         key = "focus_in" if int(direction) < 0 else "focus_out"
@@ -3709,8 +4019,12 @@ class SkydroidTopUdpAdapter:
             if int(p) not in ports:
                 ports.append(int(p))
         profiles: list[SkydroidCommandProfile] = [self._profile]
-        if self._profile.profile_id != "c13_alt":
-            profiles.append(get_profile("c13_alt"))
+        # Retrying under another profile swaps self._profile - and with it the
+        # lens the aim math believes in - so a camera whose optics differ from
+        # C13 opts out (probe_fallback_profile_id == "").
+        fallback_id = str(getattr(self._profile, "probe_fallback_profile_id", "c13_alt") or "")
+        if fallback_id and self._profile.profile_id != fallback_id:
+            profiles.append(get_profile(fallback_id))
         tried: list[str] = []
         for profile in profiles:
             prev = self._profile
@@ -3725,6 +4039,7 @@ class SkydroidTopUdpAdapter:
                         self._active_host = host
                         self._active_port = int(port)
                         self._profile_id = profile.profile_id
+                        apply_profile_optics(profile)
                         print(
                             f"[VGCS:skydroid] gimbal OK via {host}:{port} profile={profile.profile_id}"
                         )
@@ -3853,6 +4168,21 @@ class SkydroidTopUdpAdapter:
             if commands and commands[0] == "C13_ZOOM_STEP":
                 try:
                     self._send_zoom_step(int(params.get("direction", 0) or 0))
+                except Exception:
+                    pass
+                continue
+            if commands and commands[0] in ("DZM_STEP", "DZM_HOME", "DZM_LENS"):
+                try:
+                    if commands[0] == "DZM_STEP":
+                        d = int(params.get("direction", 0) or 0)
+                        self._send_dzm_frames(
+                            build_dzm_step_frames(d), what=f"step {'+' if d > 0 else '-'}1"
+                        )
+                    elif commands[0] == "DZM_HOME":
+                        self._send_dzm_frames(build_dzm_home_frames(), what="home (short lens, 1x)")
+                    else:
+                        lens = str(params.get("lens", "") or "")
+                        self._send_dzm_frames([build_dzm_lens_select(lens)], what=f"lens {lens}")
                 except Exception:
                     pass
                 continue
@@ -4027,6 +4357,10 @@ class SkydroidTopUdpAdapter:
             if not self._probe_finished.wait(timeout=0.25):
                 continue
             self._poll_active_endpoint_once()
+            try:
+                self._poll_zoom_step_if_due()
+            except Exception:
+                pass
             interval = 1.0 if not self.gimbal_telemetry_ok() else 0.5
             time.sleep(interval)
 
@@ -4054,6 +4388,8 @@ class SkydroidTopUdpAdapter:
             return
         if dec.command == "SLR":
             self._maybe_update_slr(payload)
+            return
+        if self._maybe_update_zoom_step(dec):
             return
         yaw, pitch = extract_attitude_deg(dec)
         if yaw is None and pitch is None:

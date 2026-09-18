@@ -272,7 +272,7 @@ class M13MovingTargetTrackMixin:
         if on and not self._m13_track_supported():
             self._set_status(
                 "M13 track needs a camera with gimbal control — "
-                "Skydroid C13/C12, SIYI ZR10 or Viewpro"
+                "Skydroid C12/C13/C14 Pro, SIYI ZR10 or Viewpro"
             )
             btn = getattr(self, "_btn_native_m13_track", None)
             if btn is not None:

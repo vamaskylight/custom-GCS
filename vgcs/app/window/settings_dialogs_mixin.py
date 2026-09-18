@@ -298,7 +298,7 @@ class MainWindowSettingsDialogsMixin:
         rb_mavlink.setProperty("provider_id", "mavlink")
         rb_siyi = QRadioButton("ZR Gimbal Camera (UDP)")
         rb_siyi.setProperty("provider_id", "siyi")
-        rb_skydroid = QRadioButton("C13 Gimbal Camera (UDP)")
+        rb_skydroid = QRadioButton("Skydroid C12 / C13 / C14 Pro (UDP)")
         rb_skydroid.setProperty("provider_id", "skydroid")
         rb_viewpro = QRadioButton("Viewpro Gimbal Camera (TCP)")
         rb_viewpro.setProperty("provider_id", "viewpro")
@@ -377,6 +377,7 @@ class MainWindowSettingsDialogsMixin:
         skydroid_profile.addItem("C13 Default (GAA/GSY/GAY)", "c13_default")
         skydroid_profile.addItem("C13 Alternate (GAC/GSP/GAP)", "c13_alt")
         skydroid_profile.addItem("C12 Default (AI follow)", "c12_default")
+        skydroid_profile.addItem("C14 Pro (dual lens, zoom by step)", "c14pro_default")
         skydroid_grid.addWidget(QLabel("Host / IP"), 0, 0)
         skydroid_grid.addWidget(skydroid_host, 0, 1)
         skydroid_grid.addWidget(QLabel("UDP port"), 1, 0)
@@ -441,8 +442,11 @@ class MainWindowSettingsDialogsMixin:
                 "ZR-series gimbal SDK (ZR10, ZT6, A8 mini): UDP port 37260 on the camera IP — usually the same host as your RTSP URL."
             ),
             "skydroid": (
-                "C13 gimbal TOP (PROTOCAL): UDP 192.168.144.108 port 5000 (#TP frames). "
-                "RTSP: rtsp://192.168.144.108:554/stream=1. PC Ethernet 192.168.144.10/24."
+                "Skydroid gimbal TOP (PROTOCAL): UDP 192.168.144.108 port 5000 (#TP frames). "
+                "RTSP: rtsp://192.168.144.108:554/stream=1 (thermal :555/stream=2). "
+                "PC Ethernet 192.168.144.10/24. Pick the camera model under Firmware profile - "
+                "it sets the lens the aim math uses. C14 Pro: video picks work at the widest "
+                "view only until Skydroid confirms its zoom formula."
             ),
             "viewpro": (
                 "Viewpro/ViewLink gimbal: TCP control port 2000 (default) on the camera IP — "
@@ -454,7 +458,7 @@ class MainWindowSettingsDialogsMixin:
         _RTSP_PLACEHOLDER = {
             "mavlink": "rtsp://host/stream or udp://0.0.0.0:5600",
             "siyi": "ZR10: rtsp://192.168.144.25:8554/main.264",
-            "skydroid": "C13: rtsp://192.168.144.108:554/stream=1",
+            "skydroid": "C12/C13/C14 Pro: rtsp://192.168.144.108:554/stream=1",
             "viewpro": "Viewpro: rtsp://192.168.2.119:554/stream0",
         }
 

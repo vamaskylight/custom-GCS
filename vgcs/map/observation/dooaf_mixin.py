@@ -1929,6 +1929,14 @@ class DooafOperationsMixin:
             zoom_x = float(getattr(self, "_video_zoom", 1.0) or 1.0)
         except (TypeError, ValueError):
             zoom_x = 1.0
+        try:
+            # C14 Pro: the rail level is a DZM step counter, not a
+            # magnification, so it must never narrow the field of view.
+            from vgcs.video.camera_control import camera_geo_zoom_x
+
+            zoom_x = float(camera_geo_zoom_x(getattr(self, "_camera_control", None), zoom_x))
+        except Exception:
+            pass
         return resolve_camera_fov(
             wide_hfov_deg=wide_h,
             reported=reported,

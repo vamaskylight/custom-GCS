@@ -288,9 +288,17 @@ class LrfVideoLockMixin:
         source is recorded on the mark rather than presented as measured.
         """
         try:
-            return float(getattr(self, "_video_zoom", 1.0) or 1.0)
+            ui_zoom = float(getattr(self, "_video_zoom", 1.0) or 1.0)
         except (TypeError, ValueError):
             return 1.0
+        try:
+            # C14 Pro: the rail level is a DZM step counter, not a
+            # magnification, so it must never narrow the field of view.
+            from vgcs.video.camera_control import camera_geo_zoom_x
+
+            return float(camera_geo_zoom_x(getattr(self, "_camera_control", None), ui_zoom))
+        except Exception:
+            return ui_zoom
 
     def _camera_geo_fov(self):
         """Field of view for pixel-to-angle geo, at the camera's current zoom.

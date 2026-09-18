@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Mapping
@@ -12,6 +13,34 @@ def tp_checksum(body_without_crc: str) -> str:
     """ASCII sum of all bytes before checksum, as two uppercase hex digits."""
     total = sum(ord(ch) for ch in body_without_crc) & 0xFF
     return f"{total:02X}"
+
+
+# TOP V1.0.6+ ("G 类命令帧头修改"; V1.2.0 section 2.2.2: "G-class frames all use
+# #TP, including variable-length ones") wants an UPPER-case header on every
+# gimbal frame. VGCS has always sent variable-length gimbal frames (GSM, GAY,
+# GAP, GAM, GOT) with the lower-case #tp, and C13 field firmware accepts that, so
+# the default stays lower-case. A camera whose profile asks for the documented
+# form (C14 Pro) flips it via set_g_class_upper_header. Module state for the same
+# reason as _slr_dm_max_active: frames are built by pure functions with no
+# camera context, and one camera is connected at a time.
+_g_class_upper_header: bool = False
+
+
+def set_g_class_upper_header(enabled: bool) -> bool:
+    """Header case for variable-length G-class frames; returns what is in force.
+
+    ``VGCS_TOP_G_HEADER=upper|lower`` overrides the profile so the field can
+    flip it without a rebuild.
+    """
+    global _g_class_upper_header
+    env = str(os.environ.get("VGCS_TOP_G_HEADER", "") or "").strip().lower()
+    if env in ("upper", "tp_upper", "1"):
+        _g_class_upper_header = True
+    elif env in ("lower", "tp_lower", "0"):
+        _g_class_upper_header = False
+    else:
+        _g_class_upper_header = bool(enabled)
+    return _g_class_upper_header
 
 
 def build_tp_frame(
@@ -39,7 +68,7 @@ def build_tp_frame(
     data_s = str(data or "")
     use_var = variable if variable is not None else len(data_s) > 2
     if use_var:
-        header = "#tp"
+        header = "#TP" if (dest_c == "G" and _g_class_upper_header) else "#tp"
         if len(data_s) > 0x0F:
             raise ValueError("variable #tp data length max 15 chars")
         length_ch = format(len(data_s), "X")[:1].upper()
@@ -191,6 +220,27 @@ def build_sum_track(*, confirm: bool) -> bytes:
 # SLR data field: four hex ASCII chars; value is decimeters (分米), range 0x0032–0x2710 (5–1000 m).
 _SLR_DM_MIN = 0x0032
 _SLR_DM_MAX = 0x2710
+# The ceiling actually applied. It is the documented 1000 m unless the connected
+# camera's profile raises it (C14 Pro: 1200 m laser) via set_slr_max_range_m.
+# Module state rather than a parameter because SLR replies are decoded inside
+# parse_tp_frame, which has no camera context; there is only ever one camera.
+_slr_dm_max_active: int = _SLR_DM_MAX
+
+
+def set_slr_max_range_m(max_m: float | None) -> float:
+    """Set the longest SLR reading accepted as real; returns the value applied.
+
+    None, junk or anything below the documented 1000 m restores the default, so
+    a camera can only ever widen the window, never narrow C13's.
+    """
+    global _slr_dm_max_active
+    try:
+        dm = int(round(float(max_m) * 10.0))
+    except (TypeError, ValueError):
+        dm = _SLR_DM_MAX
+    # 0xFFFE keeps 0xFFFF (a common "no echo" filler) rejected.
+    _slr_dm_max_active = max(_SLR_DM_MAX, min(0xFFFE, dm))
+    return _slr_dm_max_active / 10.0
 
 
 def decode_slr_decimeters(data_field: str) -> int | None:
@@ -202,7 +252,7 @@ def decode_slr_decimeters(data_field: str) -> int | None:
         dm = int(s, 16)
     except ValueError:
         return None
-    if dm < _SLR_DM_MIN or dm > _SLR_DM_MAX:
+    if dm < _SLR_DM_MIN or dm > _slr_dm_max_active:
         return None
     return dm
 
@@ -331,6 +381,67 @@ def build_dzm_zoom_step_v47(action: str) -> bytes:
     if code is None:
         raise ValueError(f"unsupported DZM §4.7 step {action!r}")
     return build_tp_frame(dest="D", src="U", control="w", tag="DZM", data=code, variable=False)
+
+
+# --- TOP V1.2.0 section 4.6 DZM, as documented for C14 Pro -------------------
+# On this camera DZM is a *step* across both visible lenses, not a multiplier:
+# [0, 70) short-focus, [70, 140] long-focus. Not to be confused with
+# build_dzm_step_zoom below, which is the older pod-style "00 0C/0D" data and
+# means something else entirely.
+_DZM_LENS_SELECT_CODES = {"long": "0C", "tele": "0C", "short": "0D", "wide": "0D"}
+
+
+def build_dzm_query() -> bytes:
+    """Read the current DZM zoom step (``#TPUD2rDZM004F``)."""
+    return build_tp_frame(dest="D", src="U", control="r", tag="DZM", data="00", variable=False)
+
+
+def build_dzm_lens_select(lens: str) -> bytes:
+    """Jump to a lens: 0C = long-focus, 0D = short-focus (section 4.6.1)."""
+    code = _DZM_LENS_SELECT_CODES.get(str(lens or "").strip().lower())
+    if code is None:
+        raise ValueError(f"unsupported DZM lens {lens!r}")
+    return build_tp_frame(dest="D", src="U", control="w", tag="DZM", data=code, variable=False)
+
+
+def build_dzm_preset(multiplier: int) -> bytes:
+    """Section 4.6.1 presets 01..04 = 1x..4x."""
+    n = int(multiplier)
+    if n < 1 or n > 4:
+        raise ValueError(f"DZM preset must be 1..4, got {multiplier!r}")
+    return build_tp_frame(dest="D", src="U", control="w", tag="DZM", data=f"{n:02X}", variable=False)
+
+
+def build_dzm_step_frames(direction: int) -> list[bytes]:
+    """One zoom click for a DZM-step camera: 0A = Zoom+, 0B = Zoom-.
+
+    Deliberately not build_c13_zoom_step_frames: that also sends M-class ZMC
+    lens frames, which V1.2.0 documents for no model at all.
+    """
+    if int(direction) == 0:
+        return []
+    return [build_dzm_zoom_step_v47("in" if int(direction) > 0 else "out")]
+
+
+def build_dzm_home_frames() -> list[bytes]:
+    """Back to the widest view: short-focus lens, then the 1x preset."""
+    return [build_dzm_lens_select("short"), build_dzm_preset(1)]
+
+
+def decode_dzm_step(data_field: str) -> int | None:
+    """DZM read reply data (two hex chars) as a step, or None if not a step.
+
+    A *write* is echoed back unchanged (section 2.3.1), and its data is an
+    action code such as 0A, not a step - callers must only feed this the data
+    of a read reply. parse_tp_frame enforces that.
+    """
+    s = re.sub(r"[^0-9A-Fa-f]", "", str(data_field or ""))
+    if len(s) != 2:
+        return None
+    try:
+        return int(s, 16)
+    except ValueError:
+        return None
 
 
 def build_c13_zoom_step_frames(direction: int) -> list[bytes]:
@@ -560,7 +671,7 @@ def parse_tp_frame(raw: bytes) -> DecodedTopFrame | None:
         return None
     _addr, _length, _ctrl, tag, data, _crc = m.groups()
     tag_u = tag.upper()
-    params: dict[str, str] = {"tag": tag_u}
+    params: dict[str, str] = {"tag": tag_u, "ctrl": str(_ctrl).lower()}
     if tag_u == "GAC" and len(data) >= 12:
         params["yaw_hex"] = data[0:4]
         params["pitch_hex"] = data[4:8]
@@ -580,6 +691,11 @@ def parse_tp_frame(raw: bytes) -> DecodedTopFrame | None:
         if dm is not None:
             params["slr_dm"] = str(dm)
             params["slr_m"] = f"{dm / 10.0:.3f}"
+    elif tag_u == "DZM" and data and str(_ctrl).lower() == "r":
+        # Read replies only: a write echo carries an action code, not a step.
+        step = decode_dzm_step(data)
+        if step is not None:
+            params["dzm_step"] = str(step)
     return DecodedTopFrame(command=tag_u, params=params, raw=text, protocol="tp")
 
 

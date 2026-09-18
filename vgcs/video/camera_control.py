@@ -291,6 +291,9 @@ ZOOM_MAX_SKYDROID = 30.0
 ZOOM_STEP_PREVIEW = 0.25
 # C13 MUL optical zoom uses 0.1× absolute steps on the lens (PROTOCAL M-address).
 ZOOM_STEP_SKYDROID = 0.1
+# DZM-step cameras (C14 Pro): the rail level is only a position counter, one
+# ZOOM_STEP_SKYDROID per DZM step. It is never shown as a magnification and
+# never used as one - see SkydroidCameraControl.zoom_ui_level.
 
 
 class SkydroidCameraControl:
@@ -339,6 +342,16 @@ class SkydroidCameraControl:
     def handle_zoom_step(self, step: int, ui_level: float) -> None:
         try:
             if int(step) == 0:
+                return
+            if self._adapter.zoom_is_dzm_step():
+                # C14 Pro: one DZM step per click and nothing else. There is no
+                # absolute level to sync - a rail level is not a magnification
+                # here. Reaching the bottom of the rail re-asserts the wide end,
+                # the one state whose field of view is known.
+                if int(step) < 0 and float(ui_level) <= ZOOM_MIN + 1e-6:
+                    self._adapter.camera_zoom_home()
+                else:
+                    self._adapter.camera_zoom_step(int(step))
                 return
             # PROTOCAL §4.7 / ZMC step per click (not fractional absolute DZM).
             self._adapter.camera_zoom_step(int(step))
@@ -400,6 +413,81 @@ class SkydroidCameraControl:
             return self._adapter._profile
         except Exception:
             return None
+
+    # --- DZM-step zoom cameras (C14 Pro). All inert on C12/C13. --------------
+
+    def zoom_limits(self) -> tuple[float, float, float]:
+        """``(min, max, step)`` for the rail; one rail step per DZM step."""
+        try:
+            if self._adapter.zoom_is_dzm_step():
+                top = max(1, int(self._adapter._profile.zoom_step_max))
+                return (ZOOM_MIN, ZOOM_MIN + top * ZOOM_STEP_SKYDROID, ZOOM_STEP_SKYDROID)
+        except Exception:
+            pass
+        return (ZOOM_MIN, ZOOM_MAX_SKYDROID, ZOOM_STEP_SKYDROID)
+
+    def zoom_ui_level(self) -> float | None:
+        """Where the rail should believe the zoom is, or None to keep its own count.
+
+        A DZM-step camera reports its step, so the rail follows the camera
+        instead of drifting from it - otherwise a zoom made on the handset
+        leaves the rail pinned at its floor and the operator unable to zoom
+        back out from here.
+        """
+        try:
+            if not self._adapter.zoom_is_dzm_step():
+                return None
+            step, _reported = self._adapter.zoom_step_best()
+            return ZOOM_MIN + max(0, int(step)) * ZOOM_STEP_SKYDROID
+        except Exception:
+            return None
+
+    def zoom_label(self) -> str:
+        try:
+            return str(self._adapter.zoom_label() or "")
+        except Exception:
+            return ""
+
+    def zoom_home(self) -> None:
+        try:
+            self._adapter.camera_zoom_home()
+        except Exception:
+            return
+
+    def select_lens(self, lens: str) -> None:
+        try:
+            self._adapter.camera_select_lens(str(lens or ""))
+        except Exception:
+            return
+
+    def geo_zoom_x(self, ui_zoom: float) -> float:
+        """Zoom factor the pixel->angle geo math may narrow the wide FOV by.
+
+        C12/C13: the commanded rail level, as before. DZM-step camera: always 1
+        - its rail level is a step counter, not a magnification, and
+        video_pick_block_reason only lets a pick through at the wide end.
+        """
+        try:
+            if self._adapter.zoom_is_dzm_step():
+                return 1.0
+        except Exception:
+            pass
+        try:
+            return float(ui_zoom)
+        except (TypeError, ValueError):
+            return 1.0
+
+    def preview_carries_zoom(self) -> bool:
+        try:
+            return bool(getattr(self._adapter._profile, "preview_carries_zoom", False))
+        except Exception:
+            return False
+
+    def video_pick_block_reason(self) -> str:
+        try:
+            return str(self._adapter.video_pick_block_reason() or "")
+        except Exception:
+            return ""
 
     def camera_trigger_photo(self) -> None:
         try:
@@ -1683,8 +1771,73 @@ def camera_zoom_limits(control: object | None) -> tuple[float, float, float]:
     """Return ``(min, max, step)`` for the camera rail zoom UI."""
     primary = resolve_camera_control_primary(control)
     if isinstance(primary, SkydroidCameraControl):
-        return (ZOOM_MIN, ZOOM_MAX_SKYDROID, ZOOM_STEP_SKYDROID)
+        return primary.zoom_limits()
     return (ZOOM_MIN, ZOOM_MAX_PREVIEW, ZOOM_STEP_PREVIEW)
+
+
+def camera_video_pick_block_reason(control: object | None) -> str:
+    """Operator-facing reason a video click must not become a coordinate now.
+
+    Capability-gated like the rest of this module: only a backend that knows of
+    a state where its field of view is untrustworthy implements
+    ``video_pick_block_reason``. Everything else returns "" and is untouched.
+    """
+    fn = getattr(resolve_camera_control_primary(control), "video_pick_block_reason", None)
+    if not callable(fn):
+        return ""
+    try:
+        return str(fn() or "")
+    except Exception:
+        return ""
+
+
+def camera_zoom_ui_level(control: object | None) -> float | None:
+    """Rail level reported by the camera, or None when the rail keeps its own."""
+    fn = getattr(resolve_camera_control_primary(control), "zoom_ui_level", None)
+    if not callable(fn):
+        return None
+    try:
+        lvl = fn()
+        return None if lvl is None else float(lvl)
+    except Exception:
+        return None
+
+
+def camera_zoom_label(control: object | None) -> str:
+    """Rail label override ("W0", "T85"), or "" for the default "1.0x" text."""
+    fn = getattr(resolve_camera_control_primary(control), "zoom_label", None)
+    if not callable(fn):
+        return ""
+    try:
+        return str(fn() or "")
+    except Exception:
+        return ""
+
+
+def camera_zoom_home(control: object | None) -> bool:
+    """Send the camera to its widest view. True if a backend took the request."""
+    fn = getattr(resolve_camera_control_primary(control), "zoom_home", None)
+    if not callable(fn):
+        return False
+    try:
+        fn()
+        return True
+    except Exception:
+        return False
+
+
+def camera_geo_zoom_x(control: object | None, ui_zoom: float) -> float:
+    """Zoom factor for narrowing the wide FOV in pixel->angle geo-referencing."""
+    fn = getattr(resolve_camera_control_primary(control), "geo_zoom_x", None)
+    if callable(fn):
+        try:
+            return float(fn(float(ui_zoom)))
+        except Exception:
+            pass
+    try:
+        return float(ui_zoom)
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def _c13_software_preview_zoom_enabled() -> bool:
@@ -1714,6 +1867,11 @@ def camera_preview_applies_digital_zoom(
         sid = str(source_id or "").strip().lower()
         if sid == "thermal":
             return True
+        if primary.preview_carries_zoom():
+            # C14 Pro: DZM zooms in the camera's encoder, and the rail level is
+            # a step counter - cropping the preview by it would magnify twice,
+            # by a number that is not a magnification.
+            return False
         if sid in ("", "day") and _c13_software_preview_zoom_enabled():
             return True
         return False

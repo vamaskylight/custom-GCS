@@ -14,7 +14,11 @@ from PySide6.QtCore import QPoint, QSettings, QTimer, Qt, QUrl
 from PySide6.QtWidgets import QFileDialog
 
 from vgcs.map.app_settings import QS_APP, QS_ORG
-from vgcs.video.camera_control import NoopCameraControl
+from vgcs.video.camera_control import (
+    NoopCameraControl,
+    camera_zoom_home,
+    camera_zoom_ui_level,
+)
 from vgcs.video.pipeline import (
     QS_KEY_LAST_PHOTO_SAVE_DIR,
     notify_companion_app_background,
@@ -101,7 +105,11 @@ class WebBridgeMixin:
                 x = float(parts[1]) if len(parts) >= 2 else None
                 y = float(parts[2]) if len(parts) >= 3 else None
                 if x is not None and y is not None:
-                    if self._handle_dooaf_video_pick(float(x), float(y)):
+                    if self._video_pick_blocked():
+                        # Zoomed C14 Pro: FOV unknown, so no coordinate from
+                        # this click - see VideoPreviewUiMixin._video_pick_blocked.
+                        pass
+                    elif self._handle_dooaf_video_pick(float(x), float(y)):
                         pass
                     else:
                         self._log_observation("video_mark", video_x=x, video_y=y)
@@ -438,9 +446,26 @@ class WebBridgeMixin:
                 prev = float(getattr(self, "_video_zoom", 1.0))
             except Exception:
                 prev = 1.0
+            # A camera that reports its zoom position (C14 Pro) moves the rail,
+            # not the other way round: step from where the camera really is.
+            cam_level = camera_zoom_ui_level(getattr(self, "_camera_control", None))
+            if cam_level is not None:
+                prev = float(cam_level)
             zmin, zmax, zstep = self._video_zoom_limits()
+            prev = max(zmin, min(zmax, prev))
             cur = round(max(zmin, min(zmax, prev + zstep * float(step))), 1)
             if abs(cur - prev) < 1e-6:
+                if cam_level is not None:
+                    self._video_zoom = cur
+                    if int(step) < 0:
+                        # "-" at the floor re-asserts the widest view, so the
+                        # operator can always get back to a pickable state.
+                        camera_zoom_home(getattr(self, "_camera_control", None))
+                        QTimer.singleShot(1300, self._resync_zoom_from_camera)
+                    try:
+                        self._sync_native_video_zoom_label()
+                    except Exception:
+                        pass
                 self._run_js("document.title = 'VGCS Map';")
                 return
             self._video_zoom = cur
@@ -461,6 +486,10 @@ class WebBridgeMixin:
                 self._camera_control.handle_zoom_step(int(step), float(cur))
             except Exception:
                 pass
+            if cam_level is not None:
+                # The camera answers a step read shortly after the command;
+                # show what it really did rather than what we asked for.
+                QTimer.singleShot(1300, self._resync_zoom_from_camera)
             self._run_js("document.title = 'VGCS Map';")
             return
         if title.startswith("VGCS_CAM_FOLLOW_TOGGLE:"):
