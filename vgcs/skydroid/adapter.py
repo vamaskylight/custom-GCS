@@ -3781,13 +3781,33 @@ class SkydroidTopUdpAdapter:
             return int(self._zoom_cmd_net_steps), False
 
     def zoom_label(self) -> str:
-        """Rail label for a DZM-step camera: lens + step, never a fake "x"."""
+        """Rail label for a DZM-step camera.
+
+        With the zoom formula known this is a real magnification ("W2.4x",
+        "T12.5x"); without it, the raw step, because a made-up "x" on a camera
+        whose zoom curve we do not have would be a lie. "?" means the figure is
+        our own count, not the camera's report.
+        """
         if not self.zoom_is_dzm_step():
             return ""
         step, reported = self.zoom_step_best()
         lens = self._profile.lens_for_dzm_step(step)
         tag = {"short": "W", "long": "T"}.get(getattr(lens, "name", ""), "Z")
-        return f"{tag}{int(step)}" + ("" if reported else "?")
+        zoom_x = self._profile.zoom_x_at_dzm_step(step) if self._profile.zoom_fov_confirmed else None
+        body = f"{float(zoom_x):.1f}x" if zoom_x is not None else f"{int(step)}"
+        return f"{tag}{body}" + ("" if reported else "?")
+
+    def current_fov_deg(self) -> tuple[float, float] | None:
+        """(hfov, vfov) for the lens and zoom the camera is on now, or None.
+
+        None for C12/C13 (single lens, no readback) and for any camera whose
+        zoom optics are still unconfirmed - callers then fall back to the
+        commanded-zoom estimate exactly as before.
+        """
+        if not self.zoom_is_dzm_step():
+            return None
+        step, _reported = self.zoom_step_best()
+        return self._profile.fov_at_dzm_step(step)
 
     def video_pick_block_reason(self) -> str:
         """Why a click on the video must NOT be turned into an angle right now.
@@ -3799,19 +3819,34 @@ class SkydroidTopUdpAdapter:
         the only failure the operator can see.
         """
         prof = self._profile
-        if bool(getattr(prof, "zoom_fov_confirmed", True)) or not self.zoom_is_dzm_step():
+        if not self.zoom_is_dzm_step():
             return ""
         step, reported = self.zoom_step_best()
         if int(step) == 0:
             return ""
+        confirmed = bool(getattr(prof, "zoom_fov_confirmed", True))
+        if confirmed and reported:
+            # The camera itself says where the zoom is and the optics for that
+            # step are known: the pick converts with the real field of view.
+            return ""
         lens = prof.lens_for_dzm_step(step)
         lens_txt = f"{lens.name}-focus lens, " if lens is not None else ""
         name = str(getattr(prof, "display_name", "") or prof.profile_id)
-        reason = (
-            f"{name} is zoomed ({lens_txt}step {int(step)}"
-            f"{'' if reported else ', by our count'}). Video picks need the widest "
-            f"view until the zoom formula is confirmed - zoom fully out, then pick again."
-        )
+        if confirmed:
+            # Zoomed, but the figure is our own command count - the operator may
+            # have zoomed on the handset, and a wrong field of view here is a
+            # wrong coordinate that looks right.
+            reason = (
+                f"{name} zoom position is not confirmed by the camera "
+                f"({lens_txt}step {int(step)} by our count). Zoom fully out, or wait for "
+                f"the camera to report its zoom, then pick again."
+            )
+        else:
+            reason = (
+                f"{name} is zoomed ({lens_txt}step {int(step)}"
+                f"{'' if reported else ', by our count'}). Video picks need the widest "
+                f"view until the zoom formula is confirmed - zoom fully out, then pick again."
+            )
         sig = f"{int(step)}:{int(reported)}"
         if sig != self._zoom_block_logged:
             self._zoom_block_logged = sig
@@ -3940,16 +3975,36 @@ class SkydroidTopUdpAdapter:
             # Re-seat our own count on the truth, so a later fallback starts
             # from where the camera really was.
             self._zoom_cmd_net_steps = max(0, step)
+        fov = self._profile.fov_at_dzm_step(step)
+        if fov is not None:
+            # The aim math reads module-level FOV; follow the zoom so a
+            # click-to-aim slew, an LRF lock and a DOOAF pick all convert pixels
+            # with the field of view the frame was actually taken at. Applied on
+            # every read, not only on a change: an endpoint probe re-runs
+            # apply_profile_optics and would otherwise leave the wide-open value
+            # in place until the operator next touched the zoom.
+            self._apply_zoom_optics(fov)
         if changed:
             lens = self._profile.lens_for_dzm_step(step)
             try:
+                extra = f" hfov={fov[0]:.1f} vfov={fov[1]:.1f}" if fov is not None else ""
                 print(
                     f"[VGCS:skydroid] zoom step reported={step} "
-                    f"lens={getattr(lens, 'name', '?')}"
+                    f"lens={getattr(lens, 'name', '?')}{extra}"
                 )
             except Exception:
                 pass
         return True
+
+    def _apply_zoom_optics(self, fov: tuple[float, float]) -> None:
+        """Point the aim math at the current zoom's field of view."""
+        global _LRF_FOV_H_DEG, _LRF_FOV_V_DEG
+        try:
+            h, v = float(fov[0]), float(fov[1])
+        except (TypeError, ValueError, IndexError):
+            return
+        if 0.0 < h < 179.0 and 0.0 < v < 179.0:
+            _LRF_FOV_H_DEG, _LRF_FOV_V_DEG = h, v
 
     def camera_focus_step(self, direction: int) -> None:
         key = "focus_in" if int(direction) < 0 else "focus_out"

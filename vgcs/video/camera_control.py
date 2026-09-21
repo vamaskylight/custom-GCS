@@ -464,6 +464,18 @@ class SkydroidCameraControl:
         except Exception:
             return ""
 
+    def reported_fov_deg(self) -> tuple[float, float] | None:
+        """Live (hfov, vfov) for the current lens and zoom step, or None.
+
+        Present for the same reason Viewpro has it: DOOAF and LRF geo-referencing
+        believe a camera that knows its own field of view over any arithmetic on
+        a commanded zoom level. C12/C13 return None and keep the old path.
+        """
+        try:
+            return self._adapter.current_fov_deg()
+        except Exception:
+            return None
+
     def zoom_home(self) -> None:
         try:
             self._adapter.camera_zoom_home()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # How the GCS knows the camera's zoom, which decides how far the pixel<->angle
@@ -22,6 +23,11 @@ class SkydroidLens:
 
     ``dzm_step_min``/``dzm_step_max`` are the inclusive DZM step range the vendor
     document assigns to this lens.
+
+    Zoom on these cameras is a centred crop of the sensor readout, so each step
+    removes ``crop_step_w``/``crop_step_h`` pixels from ``sensor_w``/``sensor_h``
+    (Skydroid, C14 zoom formula, 2026-09-19). Field of view follows the tangent
+    of the half angle, not the angle, so it is scaled by the crop ratio there.
     """
 
     name: str
@@ -29,6 +35,33 @@ class SkydroidLens:
     fov_v_deg: float
     dzm_step_min: int
     dzm_step_max: int
+    sensor_w: int = 3840
+    sensor_h: int = 2160
+    crop_step_w: int = 36
+    crop_step_h: int = 20
+
+    def crop_px_at_step(self, step: int) -> tuple[int, int]:
+        """Sensor pixels still in frame at ``step``, clamped to this lens's range."""
+        n = max(int(self.dzm_step_min), min(int(self.dzm_step_max), int(step)))
+        m = n - int(self.dzm_step_min)
+        w = int(self.sensor_w) - int(self.crop_step_w) * m
+        h = int(self.sensor_h) - int(self.crop_step_h) * m
+        return max(1, w), max(1, h)
+
+    def fov_at_step(self, step: int) -> tuple[float, float]:
+        """(hfov, vfov) in degrees at this DZM step."""
+        w, h = self.crop_px_at_step(step)
+
+        def _narrow(fov0: float, part: int, whole: int) -> float:
+            half = math.atan(math.tan(math.radians(float(fov0)) / 2.0) * (part / float(whole)))
+            return max(0.01, math.degrees(half) * 2.0)
+
+        return _narrow(self.fov_h_deg, w, self.sensor_w), _narrow(self.fov_v_deg, h, self.sensor_h)
+
+    def magnification_at_step(self, step: int) -> float:
+        """Linear magnification vs this lens wide open (1.0 at its first step)."""
+        w, _h = self.crop_px_at_step(step)
+        return float(self.sensor_w) / float(w)
 
 
 @dataclass(frozen=True)
@@ -89,6 +122,40 @@ class SkydroidCommandProfile:
     # "" disables the retry - it must for any camera whose optics differ from
     # C13, or a successful retry would swap this camera onto C13's lens.
     probe_fallback_profile_id: str = "c13_alt"
+
+    def fov_at_dzm_step(self, step: int | None) -> tuple[float, float] | None:
+        """(hfov, vfov) at ``step``, or None when this camera's zoom optics are unknown.
+
+        None for a single-lens camera (C12/C13 keep the commanded-zoom path) and
+        for any profile whose ``zoom_fov_confirmed`` is still False.
+        """
+        if not self.zoom_fov_confirmed:
+            return None
+        lens = self.lens_for_dzm_step(step)
+        if lens is None:
+            return None
+        return lens.fov_at_step(int(step))
+
+    def zoom_x_at_dzm_step(self, step: int | None) -> float | None:
+        """Magnification vs the widest lens at its widest step, for the operator's label.
+
+        The factor between lenses is derived from their own fields of view rather
+        than hard-coded: it reproduces the ratio Skydroid states (25.0 mm / 5.4 mm
+        = 4.63) to within 1%.
+        """
+        lens = self.lens_for_dzm_step(step)
+        if lens is None or not self.lenses:
+            return None
+        widest = self.lenses[0]
+        factor = 1.0
+        if lens is not widest:
+            try:
+                factor = math.tan(math.radians(widest.fov_h_deg) / 2.0) / math.tan(
+                    math.radians(lens.fov_h_deg) / 2.0
+                )
+            except (ValueError, ZeroDivisionError):
+                factor = 1.0
+        return float(lens.magnification_at_step(int(step)) * factor)
 
     def lens_for_dzm_step(self, step: int | None) -> SkydroidLens | None:
         """The lens a DZM step selects, or None if unknown / single-lens."""
@@ -230,14 +297,19 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         frame_specs_confirmed=True,
         aim_fov_from_profile=True,
         zoom_model=ZOOM_MODEL_DZM_STEP,
+        # Step ranges are Skydroid's 2026-09-19 note, NOT the [0,70)/[70,140] in
+        # the V1.2.0 body we first coded: short focus is [0,85], long (85,184].
         lenses=(
-            SkydroidLens("short", 61.4, 47.9, 0, 69),
-            SkydroidLens("long", 14.7, 11.1, 70, 140),
+            SkydroidLens("short", 61.4, 47.9, 0, 85),
+            SkydroidLens("long", 14.7, 11.1, 86, 184),
         ),
-        # The C14 line of the DZM step->magnification formula is empty in
-        # V1.2.0 (asked of Skydroid 2026-09-17). Flip to True only together
-        # with code that turns a step into a field of view.
-        zoom_fov_confirmed=False,
+        # Zoom formula received from Skydroid 2026-09-19: a centred crop of a
+        # 3840x2160 readout, 36 px per step wide and 20 px high, restarting at
+        # the lens change. Their stated inter-lens factor Rx=Ry=2500/540=4.63
+        # equals 25.0 mm / 5.4 mm and matches the tangent ratio of the two
+        # lenses' published fields of view (4.60 H, 4.57 V) to within 1%, which
+        # independently confirms both the formula and our FOV numbers.
+        zoom_fov_confirmed=True,
         preview_carries_zoom=True,
         thermal_fov_h_deg=32.84,
         thermal_fov_v_deg=26.35,
