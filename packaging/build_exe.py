@@ -168,8 +168,6 @@ def read_stamp() -> tuple[str, str, bool]:
 
 def make_single_file(icon: Path) -> Path:
     """Pack dist/VGCS into one dist/VGCS.exe that unpacks itself once per version."""
-    if not CSC.is_file():
-        sys.exit(f"The C# compiler of the .NET Framework is missing: {CSC}")
     work = BUILD / "single"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
@@ -191,24 +189,37 @@ def make_single_file(icon: Path) -> Path:
         f'static class BuildInfo {{ public const string Id = "{ident}"; }}\n',
         encoding="utf-8",
     )
-    shutil.copy2(PACKAGING / "single_file_launcher.cs", work)
     shutil.copy2(icon, work / "vgcs.ico")
-    # Run in build/single with plain file names: the compiler then never sees a path with spaces.
+    exe = DIST / "VGCS.exe"
+    shutil.move(str(compile_launcher(work)), exe)
+    payload.unlink()  # it is inside VGCS.exe now
+    return exe
+
+
+def compile_launcher(work: Path) -> Path:
+    """Compile single_file_launcher.cs in `work`, which holds payload.zip and BuildInfo.cs.
+
+    tests/test_single_file_launcher.py uses this too, so the tests build the
+    launcher exactly like a release. A windowed program: no console window.
+    """
+    if not CSC.is_file():
+        sys.exit(f"The C# compiler of the .NET Framework is missing: {CSC}")
+    shutil.copy2(PACKAGING / "single_file_launcher.cs", work)
+    icon = ["/win32icon:vgcs.ico"] if (work / "vgcs.ico").is_file() else []
+    # Run in the work folder with plain file names: the compiler then never sees a path with spaces.
     run(
         [
-            CSC, "/nologo", "/target:exe", "/platform:x64", "/optimize+",
-            "/out:VGCS.exe", "/win32icon:vgcs.ico", "/resource:payload.zip,VGCS.payload.zip",
+            CSC, "/nologo", "/target:winexe", "/platform:x64", "/optimize+",
+            "/out:VGCS.exe", *icon, "/resource:payload.zip,VGCS.payload.zip",
             "/reference:System.IO.Compression.dll",
             "/reference:System.IO.Compression.FileSystem.dll",
             "/reference:System.Windows.Forms.dll",
+            "/reference:System.Drawing.dll",
             "single_file_launcher.cs", "BuildInfo.cs",
         ],
         cwd=work,
     )
-    exe = DIST / "VGCS.exe"
-    shutil.move(str(work / "VGCS.exe"), exe)
-    payload.unlink()  # it is inside VGCS.exe now
-    return exe
+    return work / "VGCS.exe"
 
 
 def make_zip() -> Path:
@@ -220,9 +231,17 @@ def make_zip() -> Path:
 
 def run_selfcheck(exe: Path) -> None:
     print(f"\n> {exe} --selfcheck", flush=True)
-    result = subprocess.run([str(exe), "--selfcheck"], cwd=exe.parent)
-    if result.returncode != 0:
-        sys.exit(f"\nSelf-check failed ({result.returncode} check(s)). This build is not ready to ship.")
+    # Read the output through a pipe. That is how the single VGCS.exe knows a
+    # script is watching: it then prints here, instead of writing its log file
+    # and showing a message box.
+    with subprocess.Popen(
+        [str(exe), "--selfcheck"], cwd=exe.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+    ) as proc:
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+    if proc.returncode != 0:
+        sys.exit(f"\nSelf-check failed ({proc.returncode} check(s)). This build is not ready to ship.")
 
 
 def main() -> int:
@@ -242,6 +261,7 @@ def main() -> int:
     args = parser.parse_args()
     if os.name != "nt":
         sys.exit("VGCS.exe can only be built on Windows.")
+    sys.stdout.reconfigure(errors="replace")  # the self-check output may hold characters the console lacks
 
     prepare_venv(install=not args.skip_install)
     ffmpeg_dir = None if args.no_ffmpeg else (args.ffmpeg_dir or prepare_ffmpeg())

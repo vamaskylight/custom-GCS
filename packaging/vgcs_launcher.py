@@ -56,6 +56,20 @@ def run_module_from_argv(argv: list[str]) -> int | None:
     return 0
 
 
+def make_output_safe_for_pipes() -> None:
+    """Write stdout and stderr as UTF-8, one line at a time, when they are pipes.
+
+    The single VGCS.exe runs VGCS without a console and sends its output
+    through a pipe into a log file. Python would then encode as cp1252, and a
+    print with a character outside it (pipeline.py prints an arrow) would
+    raise inside VGCS. It would also hold output back in a buffer, which a
+    crash would lose.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure") and not stream.isatty():
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace", line_buffering=True)
+
+
 def put_bundled_ffmpeg_on_path() -> Path | None:
     """Put the bundled FFmpeg first on PATH and return its folder.
 
@@ -111,6 +125,7 @@ def _is_writable_dir(folder: Path) -> bool:
 
 
 def main() -> int:
+    make_output_safe_for_pipes()
     # Worker processes come first: they must start fast and need nothing else.
     code = run_module_from_argv(sys.argv)
     if code is not None:

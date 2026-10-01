@@ -6,16 +6,24 @@
 // starts only check that the unpacked files are all there, so they start as
 // fast as the folder build. Old versions are deleted once no VGCS uses them.
 //
+// It shows no console window. VGCS runs with a hidden console, which FFmpeg
+// and the tracker workers share, so none of them opens a window either.
+// What VGCS prints goes to Documents\VGCS\logs\VGCS-<date>_<time>.log. When a
+// script or a test starts VGCS.exe and reads its output, the output goes to
+// that reader instead, and no window or message box ever waits for a click.
+//
 // packaging/build_exe.py compiles this with the C# compiler that comes with
 // the .NET Framework in Windows. Nothing needs installing, to build it or to
 // run it. That compiler supports C# 5, so this file uses nothing newer.
 
 using System;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -32,14 +40,19 @@ static class SingleFileLauncher
     // with the terminating zero), which is a little stricter than the file one.
     const int MaxPathLength = 247;
 
+    const int LogsToKeep = 30;
+
     [DllImport("kernel32.dll")]
-    static extern uint GetConsoleProcessList(uint[] processList, uint processCount);
+    static extern IntPtr GetStdHandle(int stdHandle);
+
+    [DllImport("kernel32.dll")]
+    static extern uint GetFileType(IntPtr file);
 
     [STAThread]
     static int Main()
     {
-        // Ctrl+C is for VGCS, which shares this console. The launcher only waits.
-        Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs e) { e.Cancel = true; };
+        Application.EnableVisualStyles();
+        bool captured = OutputIsCaptured();
 
         // VGCS_UNPACK_DIR moves the unpacked copies, for example off a small C: drive.
         string root = Environment.GetEnvironmentVariable("VGCS_UNPACK_DIR");
@@ -58,26 +71,34 @@ static class SingleFileLauncher
             catch (AbandonedMutexException) { }  // a launcher died holding it; it is ours now
             try
             {
-                PrepareAppFolder(root, appDir);
+                PrepareAppFolder(root, appDir, captured);
                 inUse = new FileStream(
                     Path.Combine(appDir, InUseLock), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
                 RemoveOtherVersions(root, BuildInfo.Id);
             }
             catch (Exception ex)
             {
-                return Fail("VGCS could not unpack itself to\n" + appDir + "\n\n" + ex.Message);
+                return Fail("VGCS could not unpack itself to\n" + appDir + "\n\n" + ex.Message, captured);
             }
             finally
             {
                 folders.ReleaseMutex();
             }
         }
-        int code = RunVgcs(Path.Combine(appDir, "VGCS.exe"));
+        int code = RunVgcs(Path.Combine(appDir, "VGCS.exe"), captured);
         GC.KeepAlive(inUse);
         return code;
     }
 
-    static void PrepareAppFolder(string root, string appDir)
+    // True when whoever started VGCS.exe reads its output: a script, a test,
+    // or "VGCS.exe > file". A double-click gives it no output at all.
+    static bool OutputIsCaptured()
+    {
+        uint type = GetFileType(GetStdHandle(-11));  // STD_OUTPUT_HANDLE
+        return type == 1 || type == 3;  // FILE_TYPE_DISK or FILE_TYPE_PIPE
+    }
+
+    static void PrepareAppFolder(string root, string appDir, bool captured)
     {
         using (Stream payload = Assembly.GetExecutingAssembly().GetManifestResourceStream(PayloadResource))
         {
@@ -89,9 +110,22 @@ static class SingleFileLauncher
             {
                 CheckPathLengths(zip, root);
                 Directory.CreateDirectory(root);
-                if (!IsComplete(zip, appDir))
+                if (IsComplete(zip, appDir))
                 {
-                    Unpack(zip, root, appDir);
+                    return;
+                }
+                bool repair = Directory.Exists(appDir);
+                Console.WriteLine(repair
+                    ? "VGCS: some unpacked files are missing or damaged. Unpacking again, to " + appDir
+                    : "VGCS: first start of this version. Unpacking it once, to " + appDir);
+                if (captured)
+                {
+                    Unpack(zip, root, appDir, delegate(int percent) { Console.Write("\rVGCS: unpacking {0,3}%", percent); });
+                    Console.WriteLine();
+                }
+                else
+                {
+                    UnpackShowingProgress(zip, root, appDir, repair);
                 }
             }
         }
@@ -154,28 +188,82 @@ static class SingleFileLauncher
         return true;
     }
 
-    static void Unpack(ZipArchive zip, string root, string appDir)
+    // The first start takes about half a minute. With no console, show that
+    // something is happening, or people start VGCS.exe again and again.
+    static void UnpackShowingProgress(ZipArchive zip, string root, string appDir, bool repair)
+    {
+        Exception failure = null;
+        Thread worker = null;
+        using (Form window = new Form())
+        {
+            window.Text = "VGCS";
+            window.FormBorderStyle = FormBorderStyle.FixedDialog;
+            window.ControlBox = false;  // it closes by itself when the unpack is done
+            window.StartPosition = FormStartPosition.CenterScreen;
+            window.ClientSize = new Size(440, 96);
+            try
+            {
+                window.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            }
+            catch (Exception)
+            {
+                // No icon is fine.
+            }
+            Label text = new Label();
+            text.SetBounds(14, 12, 412, 40);
+            text.Text = repair
+                ? "Some VGCS files were missing. Unpacking them again."
+                : "Preparing VGCS for its first start.\nThis happens once for each new version.";
+            ProgressBar bar = new ProgressBar();
+            bar.SetBounds(14, 60, 412, 22);
+            window.Controls.Add(text);
+            window.Controls.Add(bar);
+            window.Shown += delegate
+            {
+                worker = new Thread(delegate()
+                {
+                    try
+                    {
+                        Unpack(zip, root, appDir, delegate(int percent)
+                        {
+                            window.BeginInvoke((MethodInvoker)delegate { bar.Value = percent; });
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        failure = ex;
+                    }
+                    window.BeginInvoke((MethodInvoker)delegate { window.Close(); });
+                });
+                worker.IsBackground = true;
+                worker.Start();
+            };
+            Application.Run(window);
+        }
+        if (worker != null)
+        {
+            worker.Join();
+        }
+        if (failure != null)
+        {
+            throw failure;
+        }
+    }
+
+    static void Unpack(ZipArchive zip, string root, string appDir, Action<int> progress)
     {
         long total = 0;
         foreach (ZipArchiveEntry entry in zip.Entries)
         {
             total += entry.Length;
         }
-        long free = new DriveInfo(Path.GetPathRoot(root)).AvailableFreeSpace;
+        long free = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(root))).AvailableFreeSpace;
         long needed = total + (100L << 20);
         if (free < needed)
         {
             throw new IOException(string.Format(
                 "Not enough free disk space. VGCS needs {0} MB there, and {1} MB is free.",
                 needed >> 20, free >> 20));
-        }
-        if (Directory.Exists(appDir))
-        {
-            Console.WriteLine("VGCS: some unpacked files are missing or damaged. Unpacking again, to " + appDir);
-        }
-        else
-        {
-            Console.WriteLine("VGCS: first start of this version. Unpacking it once, to " + appDir);
         }
 
         // Unpack beside the final folder, then rename: a half-unpacked copy is
@@ -206,11 +294,10 @@ static class SingleFileLauncher
             int percent = (int)(done * 100 / Math.Max(1L, total));
             if (percent != shown)
             {
-                Console.Write("\rVGCS: unpacking {0,3}%", percent);
+                progress(percent);
                 shown = percent;
             }
         }
-        Console.WriteLine();
         if (Directory.Exists(appDir))
         {
             // An earlier copy of this version lost files: replace it.
@@ -291,14 +378,156 @@ static class SingleFileLauncher
         }
     }
 
-    static int RunVgcs(string exe)
+    static int RunVgcs(string exe, bool captured)
     {
-        ProcessStartInfo start = new ProcessStartInfo(exe, ArgumentsAfterProgramName());
-        start.UseShellExecute = false;  // share this console, so the VGCS log shows here
-        using (Process vgcs = Process.Start(start))
+        string logPath = null;
+        TextWriter output;
+        TextWriter errors;
+        if (captured)
         {
-            vgcs.WaitForExit();
-            return vgcs.ExitCode;
+            output = Writer(Console.OpenStandardOutput());
+            errors = Writer(Console.OpenStandardError());
+        }
+        else
+        {
+            output = OpenLogFile(out logPath);
+            errors = output;
+        }
+        ProcessStartInfo start = new ProcessStartInfo(exe, ArgumentsAfterProgramName());
+        start.UseShellExecute = false;
+        // A hidden console: VGCS, FFmpeg and the workers share it, so none of
+        // them shows a console window.
+        start.CreateNoWindow = true;
+        start.RedirectStandardOutput = true;
+        start.RedirectStandardError = true;
+        start.StandardOutputEncoding = Encoding.UTF8;
+        start.StandardErrorEncoding = Encoding.UTF8;
+        object gate = new object();
+        int code;
+        try
+        {
+            using (Process vgcs = new Process())
+            {
+                vgcs.StartInfo = start;
+                vgcs.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null)
+                    {
+                        lock (gate) { output.WriteLine(e.Data); }
+                    }
+                };
+                vgcs.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null)
+                    {
+                        lock (gate) { errors.WriteLine(e.Data); }
+                    }
+                };
+                vgcs.Start();
+                vgcs.BeginOutputReadLine();
+                vgcs.BeginErrorReadLine();
+                vgcs.WaitForExit();  // without a timeout this also waits until all output is read
+                code = vgcs.ExitCode;
+            }
+        }
+        catch (Exception ex)
+        {
+            // For example an antivirus program that blocks the unpacked VGCS.exe.
+            return Fail("VGCS could not start\n" + exe + "\n\n" + ex.Message, captured);
+        }
+        lock (gate)
+        {
+            output.Flush();
+            errors.Flush();
+        }
+        if (!captured)
+        {
+            output.Dispose();
+            ReportOutcome(code, logPath);
+        }
+        return code;
+    }
+
+    static TextWriter Writer(Stream stream)
+    {
+        StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false));
+        writer.AutoFlush = true;
+        return writer;
+    }
+
+    // Documents\VGCS\logs, beside VGCS's other logs. LOCALAPPDATA when
+    // Documents is not writable. VGCS_LOG_DIR overrides both.
+    static TextWriter OpenLogFile(out string path)
+    {
+        string[] places =
+        {
+            Environment.GetEnvironmentVariable("VGCS_LOG_DIR"),
+            LogsUnder(Environment.SpecialFolder.MyDocuments),
+            LogsUnder(Environment.SpecialFolder.LocalApplicationData),
+        };
+        foreach (string folder in places)
+        {
+            if (string.IsNullOrEmpty(folder))
+            {
+                continue;
+            }
+            try
+            {
+                Directory.CreateDirectory(folder);
+                RemoveOldLogs(folder);
+                path = Path.Combine(folder, "VGCS-" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".log");
+                StreamWriter writer = new StreamWriter(path, true, new UTF8Encoding(false));
+                writer.AutoFlush = true;  // the log stays complete even if VGCS.exe is killed
+                return writer;
+            }
+            catch (Exception)
+            {
+                // Try the next place.
+            }
+        }
+        path = null;
+        return TextWriter.Null;
+    }
+
+    static string LogsUnder(Environment.SpecialFolder folder)
+    {
+        string basePath = Environment.GetFolderPath(folder);
+        return string.IsNullOrEmpty(basePath) ? null : Path.Combine(basePath, "VGCS", "logs");
+    }
+
+    // Keeps the newest logs; the new one makes it LogsToKeep again.
+    static void RemoveOldLogs(string folder)
+    {
+        string[] logs = Directory.GetFiles(folder, "VGCS-*.log");
+        Array.Sort(logs, StringComparer.OrdinalIgnoreCase);  // the names sort by date and time
+        for (int i = 0; i < logs.Length - (LogsToKeep - 1); i++)
+        {
+            try
+            {
+                File.Delete(logs[i]);
+            }
+            catch (Exception)
+            {
+                // In use by another VGCS: keep it.
+            }
+        }
+    }
+
+    // With no console, VGCS that stopped with an error would just vanish.
+    static void ReportOutcome(int code, string logPath)
+    {
+        string where = logPath == null ? "" : "\n\nThe log is in\n" + logPath;
+        if (Array.IndexOf(Environment.GetCommandLineArgs(), "--selfcheck") > 0)
+        {
+            string result = code == 0 ? "All checks passed." : code + " check(s) failed.";
+            MessageBox.Show(result + where, "VGCS self-check", MessageBoxButtons.OK,
+                code == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        }
+        else if (code != 0)
+        {
+            MessageBox.Show("VGCS stopped with an error (code " + code + ")." + where +
+                "\n\nPlease send this log when you report the problem.", "VGCS",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -322,13 +551,10 @@ static class SingleFileLauncher
         return line.Substring(i).TrimStart();
     }
 
-    static int Fail(string message)
+    static int Fail(string message, bool captured)
     {
         Console.Error.WriteLine("VGCS: " + message.Replace("\n\n", " ").Replace("\n", " "));
-        // A double-clicked VGCS.exe has a console of its own, which closes at
-        // once, so show the message in a window too. Started from a terminal,
-        // the console is shared and the message stays readable there.
-        if (GetConsoleProcessList(new uint[2], 2) == 1)
+        if (!captured)
         {
             MessageBox.Show(message, "VGCS", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
