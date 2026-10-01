@@ -350,6 +350,8 @@ You should see the **VGCS** window: connection settings, status chips, telemetry
 
 - **Disconnect** is disabled until you connect (depending on state); after a successful connect cycle, you can disconnect cleanly.
 
+To build a standalone Windows program (`VGCS.exe`) that needs no Python, see [packaging/README.md](packaging/README.md).
+
 
 
 ---

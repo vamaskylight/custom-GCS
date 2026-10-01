@@ -248,3 +248,9 @@ class MainWindowLifecycleMixin:
         self._on_disconnect()
         self._settings.setValue("window_geometry", self.saveGeometry())
         super().closeEvent(event)
+        # main.py turns off quit-on-last-window-closed (06a4a57: viewing a report
+        # must not end VGCS). Since then nothing ended VGCS when this window
+        # closed: the window went away and the process kept running, hidden.
+        # Closing the main window is the one close that must quit.
+        if event.isAccepted():
+            QApplication.quit()

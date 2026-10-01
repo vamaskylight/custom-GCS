@@ -1,0 +1,4 @@
+# Tools needed only to build VGCS.exe. Running VGCS from source does not need them.
+pyinstaller==6.22.3
+# Turns the logo into the exe icon.
+pillow>=10

@@ -53,6 +53,16 @@ class _TileProbeTask(QRunnable):
             return "placeholder_suspected"
         return "ok"
 
+    def _report(self, outcome: str, detail: str) -> None:
+        try:
+            self._bridge.result.emit(self._provider_label, outcome, detail)
+        except RuntimeError:
+            # "Signal source has been deleted": VGCS closed while this probe was
+            # still downloading, and the bridge went with the map. Nobody is
+            # waiting for the result. Checking first would still race, because
+            # the bridge is deleted on the GUI thread.
+            pass
+
     def run(self) -> None:  # pragma: no cover - network dependent
         url = self._url
         try:
@@ -60,28 +70,12 @@ class _TileProbeTask(QRunnable):
             code = 200
             ctype = "image"
             if int(code) >= 400:
-                self._bridge.result.emit(
-                    self._provider_label,
-                    f"http_{int(code)}",
-                    f"url={url} content_type={ctype}".strip(),
-                )
+                self._report(f"http_{int(code)}", f"url={url} content_type={ctype}".strip())
                 return
             if not raw:
-                self._bridge.result.emit(
-                    self._provider_label,
-                    "empty_body",
-                    f"url={url} content_type={ctype}".strip(),
-                )
+                self._report("empty_body", f"url={url} content_type={ctype}".strip())
                 return
             outcome = self._classify_image(raw)
-            self._bridge.result.emit(
-                self._provider_label,
-                outcome,
-                f"url={url} bytes={len(raw)} content_type={ctype}".strip(),
-            )
+            self._report(outcome, f"url={url} bytes={len(raw)} content_type={ctype}".strip())
         except Exception as e:
-            self._bridge.result.emit(
-                self._provider_label,
-                f"error:{type(e).__name__}",
-                f"url={url}",
-            )
+            self._report(f"error:{type(e).__name__}", f"url={url}")

@@ -1,0 +1,33 @@
+# Exact package versions VGCS.exe is built with.
+# These are the versions VGCS is developed and tested on (Python 3.14).
+# requirements.txt keeps the allowed ranges. This file freezes one tested set,
+# so a rebuild never picks up a new, untested release by accident.
+# To upgrade a package: change its pin here, rebuild, and check that
+# "VGCS.exe --selfcheck" still passes.
+
+# Direct dependencies (requirements.txt)
+PySide6==6.11.1
+PySide6_Essentials==6.11.1
+PySide6_Addons==6.11.1
+shiboken6==6.11.1
+pymavlink==2.4.49
+pyserial==3.5
+numpy==2.5.0
+mgrs==1.5.4
+rasterio==1.5.0
+opencv-contrib-python-headless==4.13.0.92
+
+# Their dependencies. These matter at runtime too:
+# pymavlink computes MAVLink checksums with fastcrc,
+# mgrs finds its native library with packaging,
+# and rasterio maps pixels to coordinates with affine.
+fastcrc==0.3.6
+lxml==6.1.1
+packaging==26.2
+affine==2.4.0
+attrs==26.1.0
+certifi==2026.6.17
+click==8.4.2
+cligj==0.7.2
+colorama==0.4.6
+pyparsing==3.3.2
