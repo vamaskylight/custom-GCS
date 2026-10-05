@@ -1,0 +1,4 @@
+# QGroundControl release the VAMA APK is built on.
+# fetch_qgc.ps1 reads the first line that is not a comment.
+# Pinned 2026-10-05 (stable release of 2026-10-01).
+v5.1.5

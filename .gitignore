@@ -1,39 +1,42 @@
 # Reference-only legacy GCS (not part of VGCS product source)
-Ground-Control-Station-for-UAV/
+/Ground-Control-Station-for-UAV/
 
 # Internal planning / milestones (keep local or private; omit from client-facing checkouts)
-DOCS/
+/DOCS/
 
 # Local dev / analysis scripts (not part of product source)
-tools/
+/tools/
 
 # Model provenance notes (internal — not for the client-facing repo)
 vgcs/assets/models/MODEL_SOURCE.md
 
 # Python
+# Folder rules start with "/" so they match only at the repo root.
+# Without it they also hide folders with the same name inside apk/
+# (for example apk/custom/tools/ or apk/custom/lib/).
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 venv/
 .venv/
-env/
+/env/
 .env/
 
 # IDE / OS
@@ -44,7 +47,7 @@ env/
 Thumbs.db
 
 # Testing / coverage
-tests/
+/tests/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -57,3 +60,14 @@ secrets/
 
 # Local ArduPilot checkout
 /ardupilot/
+
+# VAMA APK (white label QGroundControl, see apk/README.md)
+# QGC source is downloaded by apk/fetch_qgc.ps1 and never committed.
+/apk/qgc-src/
+/apk/build/
+*.apk
+*.aab
+*.idsig
+# Android signing keys must never be committed.
+*.jks
+*.keystore

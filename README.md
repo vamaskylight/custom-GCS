@@ -60,7 +60,20 @@
 
 
 
+This repository holds two products:
+
+- **VGCS** (`VGCS.exe`): the Windows ground station with DOOAF, written in Python.
+- **VAMA APK**: an Android ground station built on QGroundControl (C++), without DOOAF.
+
+They share no code. VGCS stays at the repository root, so `python -m vgcs` works as before.
+
+
+
 - **`vgcs/`** — the active application: Qt main window, MAVLink worker thread, entrypoint (`python -m vgcs`).
+
+- **`packaging/`**: builds the standalone Windows program `VGCS.exe` (see [packaging/README.md](packaging/README.md)).
+
+- **`apk/`**: the VAMA APK, an Android app built on QGroundControl for customers who do not need DOOAF (see [apk/README.md](apk/README.md)).
 
 - **`Ground-Control-Station-for-UAV/`** — **legacy / reference-only** material; not part of the new VGCS codebase and is **gitignored** for normal work.
 
@@ -453,6 +466,10 @@ GCS/                          # repository root
   requirements.txt            # Python dependencies
 
   README.md                   # this file
+
+  packaging/                  # VGCS.exe build (see packaging/README.md)
+
+  apk/                        # VAMA APK, QGroundControl custom build (see apk/README.md)
 
   vgcs/
 

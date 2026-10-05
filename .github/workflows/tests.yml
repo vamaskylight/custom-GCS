@@ -9,7 +9,12 @@ name: tests
 on:
   push:
     branches: [master, main]
+    # The APK (apk/) is C++ QGroundControl code and cannot affect the Python tests.
+    paths-ignore:
+      - "apk/**"
   pull_request:
+    paths-ignore:
+      - "apk/**"
 
 jobs:
   pytest:
