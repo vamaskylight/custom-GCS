@@ -12,25 +12,12 @@
         <file alias="microSD.svg">res/Images/microSD.svg</file>
         <file alias="odometer.svg">res/Images/odometer.svg</file>
         <file alias="vertical_speed.svg">res/Images/vertical_speed.svg</file>
-        <file alias="dronecode-black.svg">res/Images/dronecode-black.svg</file>
-        <file alias="dronecode-white.svg">res/Images/dronecode-white.svg</file>
-    </qresource>
-    <qresource prefix="/Custom/qmlimages">
-        <file alias="PaperPlane.svg">res/Images/CustomVehicleIcon.svg</file>
     </qresource>
     <qresource prefix="/Custom/qml">
-        <file alias="QGroundControl/FlyView/CustomGuidedActionsController.qml">src/CustomGuidedActionsController.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewCustomLayer.qml">src/FlyViewCustomLayer.qml</file>
-        <file alias="QGroundControl/FlyView/FlyViewToolStripActionList.qml">src/FlyViewToolStripActionList.qml</file>
     </qresource>
     <qresource prefix="/Custom/res">
         <file alias="QGCLogoFull.svg">res/Images/QGCLogoFull.svg</file>
         <file alias="qgroundcontrol.ico">res/icons/custom_qgroundcontrol.ico</file>
-    </qresource>
-    <qresource prefix="/res">
-        <file alias="gear-white.svg">../resources/gear-white.svg</file>
-    </qresource>
-    <qresource prefix="/json">
-        <file alias="PerimeterScan.SettingsGroup.json">res/json/PerimeterScan.SettingsGroup.json</file>
     </qresource>
 </RCC>

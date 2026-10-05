@@ -1,23 +1,13 @@
-# QGroundControl Ground Control Station
+# VAMA GCS custom build
 
-## Custom Build Example
+This folder is our QGroundControl custom build.
+It started from QGC's `custom-example` (v5.1.5) and was changed for VAMA:
 
-To build this sample custom version:
+- ArduPilot only. QGC's own ArduPilot support is on, PX4 is off.
+- App name "VAMA GCS" (build name `VAMA-GCS`), Android package `com.vama.gcs`.
+- Icons and logo come from `vgcs/assets/Vama Logo.png`. Regenerate them with `python apk/make_icons.py`.
+- The example's PX4 plugins, PerimeterScan mission item, demo button and custom instrument panel were removed, so the normal QGC fly view shows.
 
-1. Clean your build directory of any previous build.
-2. Rename `custom-example` to `custom`.
-3. `cd custom` and build QGC.
+Still from the example, for later use: the `Custom.Widgets` QML module in `res/Custom/Widgets` and the colour palette in `src/CustomPlugin.cc`.
 
-![Custom Build Screenshot](README.jpg)
-
-See the [QGC Dev Guide](https://dev.qgroundcontrol.com/en/custom_build/custom_build.html) for what a
-custom build is and how to create your own.
-
-This example demonstrates:
-
-- **Off-the-shelf commercial vehicle** — most vehicle setup is hidden (pre-configured by the vendor),
-  giving a simpler UI; the full experience stays available in **Advanced Mode**.
-- **Custom branding** — images and color palette matching a corporate identity.
-- **Custom interface** — e.g. a custom instrument widget replacing the standard QGC UI (see screenshot).
-- **Overridden application settings** — hides options users shouldn't change and adjusts defaults.
-- **Fully commented source** explaining what it does and why.
+Build steps and rules are in `apk/README.md`.

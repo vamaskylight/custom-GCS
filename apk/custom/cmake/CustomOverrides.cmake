@@ -1,13 +1,22 @@
 # ============================================================================
-# Custom Build Configuration Overrides
-# Template for customizing QGroundControl branding and feature set
+# VAMA GCS: branding and feature set
+# Started from QGC's custom-example (v5.1.5).
 # ============================================================================
 
 # ----------------------------------------------------------------------------
 # Application Branding
 # ----------------------------------------------------------------------------
-set(QGC_APP_NAME "Custom-QGroundControl" CACHE STRING "App Name" FORCE)
-set(QGC_ANDROID_PACKAGE_NAME "org.mavlink.customqgroundcontrol" CACHE STRING "Android package identifier" FORCE)
+# QGC_APP_NAME becomes the CMake project and target name, so it must not
+# contain spaces. The name shown on the phone is the label in
+# android/AndroidManifest.xml ("VAMA GCS").
+set(QGC_APP_NAME "VAMA-GCS" CACHE STRING "App Name" FORCE)
+set(QGC_APP_DESCRIPTION "VAMA ground control station" CACHE STRING "Application description" FORCE)
+set(QGC_ORG_NAME "VAMA" CACHE STRING "Organization name" FORCE)
+set(QGC_ORG_DOMAIN "vama.local" CACHE STRING "Organization domain" FORCE)
+# The Android package id is permanent once the app is installed on customer
+# devices: changing it later makes it a different app. Confirm before release.
+set(QGC_PACKAGE_NAME "com.vama.gcs" CACHE STRING "Package identifier" FORCE)
+set(QGC_ANDROID_PACKAGE_NAME "com.vama.gcs" CACHE STRING "Android package identifier" FORCE)
 
 # ----------------------------------------------------------------------------
 # Custom Icons and Graphics
@@ -37,10 +46,9 @@ endif()
 # Feature Set Customization
 # ----------------------------------------------------------------------------
 
-# Single flight stack UI: only register the custom PX4-based plugin factory.
-# All firmware plugin code is always compiled; UI adapts at runtime via
+# Our drones run ArduPilot. Keep QGC's own ArduPilot support (all its flight
+# modes and setup pages) and turn PX4 off, so the app shows one flight stack.
+# All firmware plugin code is still compiled; the UI adapts at runtime via
 # FirmwarePluginManager::supportedFirmwareClasses().
-set(QGC_DISABLE_APM_PLUGIN_FACTORY ON CACHE BOOL "Disable APM Plugin Factory" FORCE)
-
-# Implement custom PX4 plugin factory
+set(QGC_DISABLE_APM_PLUGIN_FACTORY OFF CACHE BOOL "Disable APM Plugin Factory" FORCE)
 set(QGC_DISABLE_PX4_PLUGIN_FACTORY ON CACHE BOOL "Disable PX4 Plugin Factory" FORCE)

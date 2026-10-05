@@ -13,6 +13,8 @@ apk/
   README.md         this file
   qgc-version.txt   the one QGC release we build on
   fetch_qgc.ps1     downloads that release into apk/qgc-src and links apk/custom into it
+  build_android.ps1 builds the signed APK (arm64-v8a and armeabi-v7a)
+  make_icons.py     makes every icon and logo from vgcs/assets/Vama Logo.png
   custom/           OUR CODE: branding, Skydroid controls, screens (in git)
   qgc-src/          QGC source, downloaded by fetch_qgc.ps1 (gitignored, never committed)
   build/            build output (gitignored)
@@ -56,23 +58,53 @@ Check that file again whenever `qgc-version.txt` changes.
 | GStreamer for Android | 1.28.4 (for video) |
 
 The app needs **Android 9 or newer** (minimum SDK 28).
-Check the Android version of the RC or tablet before promising it to a customer.
+Customer devices run Android 10 to 14 and newer, so this is fine.
 
-The exact build commands are in QGC's own CI files:
+## Build the APK
 
-- `apk/qgc-src/.github/workflows/android.yml` (Android build)
-- `apk/qgc-src/.github/workflows/custom-build.yml` (custom build)
+```powershell
+powershell -ExecutionPolicy Bypass -File apk\build_android.ps1
+```
+
+It uses the same CMake settings as QGC's own Android CI on a Windows host
+(`apk/qgc-src/.github/workflows/android.yml`).
+The APK is built for both 64 bit (`arm64-v8a`) and 32 bit (`armeabi-v7a`) devices.
+Use `-Abis arm64-v8a` for a faster test build.
+
+The repo path has a space and Android builds make very deep paths, so the build runs in `C:\vama-apk`:
+
+- `C:\vama-apk\src` is a link to `apk\qgc-src`.
+- `C:\vama-apk\build-Release` holds the build output and the APK.
+
+Test builds are signed with a development key, `%USERPROFILE%\.android\vama-dev.keystore`, created on the first build.
+The release key for customers is a separate key (see Signing keys).
+
+Tools on the dev PC: Qt in `C:\Qt\6.11.1`, JDK 21 in `%LOCALAPPDATA%\Programs\Eclipse Adoptium`, the Android SDK in `%LOCALAPPDATA%\Android\Sdk` with NDK 27.2.12479018, and CMake and Ninja from the Android SDK.
+
+Qt was installed with the aqtinstall commit that QGC pins for Windows hosts (`apk/qgc-src/.github/scripts/android_matrix.py`), because older aqtinstall does not know the Qt 6.11 Windows folder layout.
 
 QGC's custom build guide: https://dev.qgroundcontrol.com/en/custom_build/custom_build.html
 
-## First tasks in apk/custom
+## Tests on this PC (no camera or phone needed)
 
-The example we started from is not ours yet.
+```powershell
+powershell -ExecutionPolicy Bypass -File apk\custom\test\run_tests.ps1
+powershell -ExecutionPolicy Bypass -File apk\custom\test\run_link_test.ps1
+```
 
-1. It is set up for PX4. Our drones run ArduPilot, so the firmware plugin must be changed.
-2. It is still named "Custom-QGroundControl" with package `org.mavlink.customqgroundcontrol`.
-   Set the VAMA name and package in `custom/cmake/CustomOverrides.cmake`, and replace the icons.
-3. Remove the example parts we do not need (for example the PerimeterScan mission item).
+- `run_tests.ps1` checks the camera protocol (`SkydroidTop`) and the laser target maths (`LaserGeo`) against values made by the VGCS Python code. After changing either side, regenerate them with `gen_skydroid_vectors.py` and `gen_laser_vectors.py` (run with `py -3.14`, which has the VGCS packages).
+- `run_link_test.ps1` runs the real camera link (`SkydroidLink`) against a fake camera, with stand-ins for QGC's vehicle classes (`test/link/stubs`).
+- They need MinGW 13.1 (`C:\Qt\Tools\mingw1310_64`) and, for the link test, the Qt 6.11.1 MinGW kit (`C:\Qt\6.11.1\mingw_64`).
+
+## What changed from the example
+
+Done on 2026-10-06 (details in `apk/custom/README.md`):
+
+1. ArduPilot only. QGC's own ArduPilot support is on, PX4 is off.
+2. Name "VAMA GCS" (build name `VAMA-GCS`), Android package `com.vama.gcs`, VAMA icons.
+3. Example parts removed: PX4 plugins, PerimeterScan, demo button, custom instrument panel.
+
+The Android package id is permanent once customers install the app, so confirm it before the first release.
 
 ## Moving to a new QGC release
 
@@ -84,6 +116,7 @@ The example we started from is not ours yet.
 
 **Always remove the link before deleting `apk\qgc-src`.**
 Some delete tools follow the link and would also delete `apk\custom`.
+The same goes for `C:\vama-apk`: remove its link first with `cmd /c rmdir C:\vama-apk\src`.
 Also do not use `git clean -x` in this repo.
 It deletes every ignored folder, which includes `apk\qgc-src` and local folders such as `DOCS` and `tests`.
 

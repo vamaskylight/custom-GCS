@@ -6,9 +6,6 @@
 #include "QGCCorePlugin.h"
 #include "QGCOptions.h"
 
-class ComplexMissionItem;
-class PlanCreator;
-
 class CustomOptions;
 class CustomPlugin;
 class CustomSettings;
@@ -23,11 +20,9 @@ class CustomFlyViewOptions : public QGCFlyViewOptions
 public:
     explicit CustomFlyViewOptions(CustomOptions *options, QObject *parent = nullptr);
 
-    // Overrides from CustomFlyViewOptions
+    // Overrides from QGCFlyViewOptions
 
-    /// This custom build has it's own custom instrument panel. Don't show regular one.
-    bool showInstrumentPanel() const final { return false; }
-    /// This custom build does not support conecting multiple vehicles to it.
+    /// This app flies one vehicle at a time.
     /// This in turn simplifies various parts of the QGC ui.
     bool showMultiVehicleList() const final { return false; }
 };
@@ -74,16 +69,6 @@ public:
     QQmlApplicationEngine *createQmlApplicationEngine(QObject *parent) final;
     /// Releases the url interceptor attached in createQmlApplicationEngine before the engine is destroyed
     void destroyQmlApplicationEngine(QQmlApplicationEngine *qmlEngine) final;
-
-    /// Adds the Perimeter Scan item to the complex-item menu.
-    QVariantList complexMissionItemNames(Vehicle *vehicle) final;
-    /// Factory: creates PerimeterScanComplexItem for our custom type, falls back to base for built-ins.
-    ComplexMissionItem *createComplexMissionItem(const QString &complexItemType,
-                                                 PlanMasterController *masterController,
-                                                 bool flyView,
-                                                 const QString &kmlOrShpFile = QString()) final;
-    /// Adds the Perimeter Scan plan creator to the New Plan dialog.
-    QList<PlanCreator *> planCreators(PlanMasterController *planMasterController) final;
 
 private slots:
     void _advancedChanged(bool advanced);

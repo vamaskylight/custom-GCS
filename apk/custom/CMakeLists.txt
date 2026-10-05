@@ -1,6 +1,5 @@
 # ============================================================================
-# QGroundControl Custom Plugin Example
-# Template for building custom QGroundControl plugins
+# VAMA GCS custom build (started from QGroundControl's custom-example)
 # ============================================================================
 
 message(STATUS "QGC: Adding Custom Plugin")
@@ -83,43 +82,18 @@ qt_add_qml_module(CustomModule
 )
 
 # ============================================================================
-# Custom Plan Module (PerimeterScan map visual + editor)
-# ============================================================================
-
-qt_add_library(CustomPlanModule STATIC)
-
-qgc_set_qt_resource_alias(
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/PlanView/PerimeterScanMapVisual.qml
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/PlanView/PerimeterScanEditor.qml
-)
-
-qt_add_qml_module(CustomPlanModule
-    URI Custom.Plan
-    VERSION 1.0
-    RESOURCE_PREFIX /qml
-    QML_FILES
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/PlanView/PerimeterScanMapVisual.qml
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/PlanView/PerimeterScanEditor.qml
-    NO_PLUGIN
-)
-
-# ============================================================================
 # Custom Plugin Sources
 # ============================================================================
 
 set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/CustomPlugin.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/CustomPlugin.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/AutoPilotPlugin/CustomAutoPilotPlugin.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/AutoPilotPlugin/CustomAutoPilotPlugin.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/FirmwarePlugin/CustomFirmwarePlugin.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/FirmwarePlugin/CustomFirmwarePlugin.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/FirmwarePlugin/CustomFirmwarePluginFactory.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/FirmwarePlugin/CustomFirmwarePluginFactory.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/MissionManager/PerimeterScanComplexItem.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/MissionManager/PerimeterScanComplexItem.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/MissionManager/PerimeterScanPlanCreator.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/MissionManager/PerimeterScanPlanCreator.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidTop.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidTop.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidLink.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidLink.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.h
     CACHE INTERNAL "" FORCE
 )
 
@@ -129,15 +103,12 @@ set(CUSTOM_SOURCES
 
 set(CUSTOM_LIBRARIES
     CustomModule
-    CustomPlanModule
     CACHE INTERNAL "" FORCE
 )
 
 set(CUSTOM_INCLUDE_DIRECTORIES
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/AutoPilotPlugin
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/FirmwarePlugin
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/MissionManager
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid
     CACHE INTERNAL "" FORCE
 )
 
@@ -150,5 +121,6 @@ set(CUSTOM_DEFINITIONS
 
 set(CUSTOM_QT_COMPONENTS
     Core
+    Network
     CACHE INTERNAL "" FORCE
 )
