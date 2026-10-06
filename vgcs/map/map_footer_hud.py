@@ -21,7 +21,10 @@ from PySide6.QtWidgets import (
 )
 
 # Shared with native `#cameraRail` QSS in map_widget.py — keep in sync for HUD typography.
-TELEMETRY_STRIP_VALUE_STYLE = "color: #dce5f5; font-size: 15px; font-weight: 600;"
+TELEMETRY_STRIP_VALUE_COLOR = "#dce5f5"
+TELEMETRY_STRIP_VALUE_STYLE = f"color: {TELEMETRY_STRIP_VALUE_COLOR}; font-size: 15px; font-weight: 600;"
+# A value that is over its warning level (the wind line).
+TELEMETRY_STRIP_WARN_COLOR = "#fbbf24"
 
 
 class TelemetryStripIcon(QWidget):
@@ -107,6 +110,19 @@ class TelemetryStripIcon(QWidget):
             path.lineTo(5.0, h - 5.0)
             p.drawPath(path)
             p.drawLine(QPointF(5.0, h - 5.0), QPointF(10.0, h - 9.0))
+        elif k == "wind":
+            # Three streaks of air; the top and bottom ones curl at the end.
+            x0 = 2.5
+            curl = min(w, h) * 0.13
+            for y, x_end, turn in ((h * 0.30, w * 0.62, -1.0), (h * 0.52, w - 3.0, 0.0), (h * 0.74, w * 0.50, 1.0)):
+                path = QPainterPath()
+                path.moveTo(x0, y)
+                path.lineTo(x_end, y)
+                if turn:
+                    # A hook away from the middle streak: the circle sits above the top
+                    # streak and below the bottom one, and the line runs into it.
+                    path.arcTo(QRectF(x_end - curl, y - curl + turn * curl, 2 * curl, 2 * curl), 90.0 * turn, -200.0 * turn)
+                p.drawPath(path)
 
 
 class MapFooterCompass(QWidget):
@@ -290,7 +306,34 @@ class MapFooterTelemetryStrip(QFrame):
         self._row2_mph.setText("0.0 m/s")
         self._row2_alt.setText("0.0 m")
 
+        # Third line: the vehicle's wind estimate. Hidden until there is one,
+        # so the strip looks as before on an aircraft that sends none.
+        self._wind_cell, self._wind_text = _cell("wind")
+        self._wind_cell.setObjectName("mapTelemetryWind")
+        grid.addWidget(self._wind_cell, 2, 0, 1, 3)
+        self._wind_cell.hide()
+        self._wind_level = "ok"
+
         self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Minimum)
+
+    def set_wind(self, text: str, level: str = "ok") -> bool:
+        """Show the wind line (empty text hides it). Returns True when the strip changed size."""
+        shown = bool(text)
+        if shown:
+            self._wind_text.setText(text)
+        if level != self._wind_level:
+            self._wind_level = level
+            colour = TELEMETRY_STRIP_WARN_COLOR if level == "warn" else TELEMETRY_STRIP_VALUE_COLOR
+            self._wind_text.setStyleSheet(TELEMETRY_STRIP_VALUE_STYLE.replace(TELEMETRY_STRIP_VALUE_COLOR, colour))
+        # isHidden(), not isVisible(): the strip itself is hidden until the link is up.
+        if shown == (not self._wind_cell.isHidden()):
+            return False
+        self._wind_cell.setVisible(shown)
+        return True
+
+    def wind_text(self) -> str:
+        """The wind line as shown, or empty when it is hidden."""
+        return "" if self._wind_cell.isHidden() else self._wind_text.text()
 
     def set_values(
         self,

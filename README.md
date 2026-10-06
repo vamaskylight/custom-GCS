@@ -75,6 +75,8 @@ They share no code. VGCS stays at the repository root, so `python -m vgcs` works
 
 - **`apk/`**: the VAMA APK, an Android app built on QGroundControl for customers who do not need DOOAF (see [apk/README.md](apk/README.md)).
 
+- **`drone/`**: what runs on the drone itself, such as the high wind failsafe script for the flight controller (see [drone/README.md](drone/README.md)).
+
 - **`Ground-Control-Station-for-UAV/`** — **legacy / reference-only** material; not part of the new VGCS codebase and is **gitignored** for normal work.
 
 
@@ -470,6 +472,8 @@ GCS/                          # repository root
   packaging/                  # VGCS.exe build (see packaging/README.md)
 
   apk/                        # VAMA APK, QGroundControl custom build (see apk/README.md)
+
+  drone/                      # scripts for the flight controller, with simulator tests (see drone/README.md)
 
   vgcs/
 

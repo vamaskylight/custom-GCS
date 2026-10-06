@@ -1,0 +1,3 @@
+# These run on Linux (WSL) and on the flight controller: keep Unix line ends.
+*.sh text eol=lf
+*.lua text eol=lf

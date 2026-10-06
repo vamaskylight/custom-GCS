@@ -924,6 +924,7 @@ class MainWindowUiLayoutMixin:
         row_sys("RC link", "rc_link", "Video link", "video_link")
         row_sys("Obstacle (prox)", "obstacle_prox", "LRF", "rangefinder")
         row_sys("Battery failsafe", "failsafe_battery", "RC failsafe", "failsafe_rc")
+        row_sys("Wind", "wind", "Wind failsafe", "wind_failsafe")
         la = QLabel("Arm readiness")
         la.setStyleSheet("color: #7d869c;")
         sg.addWidget(la, sr, 0)
@@ -937,6 +938,7 @@ class MainWindowUiLayoutMixin:
         self._apply_state_style(self._fields["video_link"], "na")
         self._apply_state_style(self._fields["obstacle_prox"], "na")
         self._apply_state_style(self._fields["rangefinder"], "na")
+        self._publish_wind()
 
         col = QWidget()
         v = QVBoxLayout()

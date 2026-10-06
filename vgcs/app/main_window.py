@@ -64,6 +64,7 @@ from vgcs.app.arm_readiness import PrearmHealth
 from vgcs.app.battery_tracker import BatteryTracker
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.vehicle_messages import VehicleMessageBoard
+from vgcs.app.wind_monitor import DEFAULT_WARN_MPS, KEY_WIND_WARN_MPS, WindMonitor
 from vgcs.app.window import MainWindowMixins
 from vgcs.app.window.helpers import _settings_truthy
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
@@ -138,6 +139,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._vehicle_msg_elide_px = 0
         # Smoothed / sentinel-checked pack voltage — see vgcs.app.battery_tracker.
         self._battery = BatteryTracker()
+        # Wind estimate and onboard wind failsafe status (see vgcs.app.wind_monitor).
+        self._wind = WindMonitor(self._settings.value(KEY_WIND_WARN_MPS, DEFAULT_WARN_MPS))
         # Vehicle-reported PreArm verdict from SYS_STATUS; None until one arrives.
         self._prearm_health: PrearmHealth | None = None
         self._rid_live_available = False

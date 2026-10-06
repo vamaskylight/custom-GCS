@@ -50,8 +50,17 @@ _AUTOPILOT_ONLY_MESSAGES = frozenset(
         "ATTITUDE",
         "MISSION_CURRENT",
         "MISSION_ITEM_REACHED",
+        # The wind estimate, and the readings of the onboard wind failsafe
+        # script, both describe this aircraft and nothing else on the link.
+        "WIND",
+        "NAMED_VALUE_FLOAT",
     }
 )
+
+# NAMED_VALUE_FLOAT is a free-for-all: PID tuning, other scripts and companion
+# computers all use it, some at high rate. Only these names reach the UI.
+_NAMED_VALUE_PREFIXES = ("WFS_",)
+_MAV_MSG_ID_WIND = int(mav_apm.MAVLINK_MSG_ID_WIND)
 
 
 # A pre-flight motor test only has to prove each motor turns and turns the
@@ -95,6 +104,17 @@ _ARM_ACK_RESULTS = {
     5: "in progress",
     6: "cancelled",
 }
+
+
+def named_value_name(raw: object) -> str:
+    """The name of a NAMED_VALUE_FLOAT as plain text.
+
+    The field is 10 characters with no room for a terminator, and pymavlink
+    hands it over as str or as bytes depending on the version and the dialect.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw).decode("ascii", errors="ignore")
+    return str(raw or "").split("\x00", 1)[0].strip().upper()
 
 
 def _force_arm_allowed() -> bool:
@@ -211,6 +231,7 @@ class MavlinkThread(QThread):
             "OBSTACLE_DISTANCE": 0.1,
             "DISTANCE_SENSOR": 0.15,
             "RANGEFINDER": 0.15,
+            "WIND": 0.4,
         }
         self._last_hb_log_mono = 0.0
         # Last mission built/downloaded. MISSION_CURRENT / MISSION_ITEM_REACHED report a
@@ -664,6 +685,24 @@ class MavlinkThread(QThread):
                         "climb": float(getattr(msg, "climb", 0.0) or 0.0),
                     },
                 )
+            elif msg_type == "WIND":
+                # ArduCopter sends this only with the EKF drag parameters set.
+                # direction is where the wind comes FROM, -180 to 180 degrees.
+                self._emit_telemetry_payload(
+                    "WIND",
+                    {
+                        "direction_deg": float(getattr(msg, "direction", 0.0) or 0.0),
+                        "speed_mps": float(getattr(msg, "speed", 0.0) or 0.0),
+                        "speed_z_mps": float(getattr(msg, "speed_z", 0.0) or 0.0),
+                    },
+                )
+            elif msg_type == "NAMED_VALUE_FLOAT":
+                name = named_value_name(getattr(msg, "name", ""))
+                if name.startswith(_NAMED_VALUE_PREFIXES):
+                    self._emit_telemetry_payload(
+                        "NAMED_VALUE_FLOAT",
+                        {"name": name, "value": float(getattr(msg, "value", 0.0) or 0.0)},
+                    )
             elif msg_type == "ATTITUDE":
                 self._emit_telemetry_payload(
                     "ATTITUDE",
@@ -1412,6 +1451,24 @@ class MavlinkThread(QThread):
                 0,
                 float(mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS),
                 float(slow_interval_us),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+            # ArduCopter keeps WIND in the EXTRA3 stream, which is not requested
+            # above, so it has to be asked for by name. It stays silent anyway
+            # on an aircraft without the EKF drag parameters. Once a second is
+            # plenty for a wind estimate.
+            self._master.mav.command_long_send(
+                ts,
+                tc,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                float(_MAV_MSG_ID_WIND),
+                1_000_000.0,
                 0.0,
                 0.0,
                 0.0,

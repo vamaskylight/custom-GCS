@@ -63,6 +63,7 @@ from vgcs.app.window.helpers import (
 )
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
+from vgcs.app.wind_monitor import DEFAULT_WARN_MPS, KEY_WIND_WARN_MPS, MAX_WARN_MPS, clamp_warn_mps
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
 from vgcs.map import MapWidget
@@ -187,6 +188,31 @@ class MainWindowSettingsDialogsMixin:
         g.setContentsMargins(12, 12, 12, 12)
         g.setSpacing(10)
         g.addWidget(QLabel("General settings are available in the main window (Connection + Theme)."))
+
+        wind_group = QGroupBox("Wind warning")
+        wg = QGridLayout()
+        wg.addWidget(QLabel("Warn at wind speed (m/s)"), 0, 0)
+        wind_warn = QDoubleSpinBox()
+        wind_warn.setObjectName("windWarnSpin")
+        wind_warn.setRange(0.0, MAX_WARN_MPS)
+        wind_warn.setDecimals(1)
+        wind_warn.setSingleStep(0.5)
+        wind_warn.setSpecialValueText("Off")
+        wind_warn.setValue(clamp_warn_mps(self._settings.value(KEY_WIND_WARN_MPS, DEFAULT_WARN_MPS)))
+        wg.addWidget(wind_warn, 0, 1)
+        wind_hint = QLabel(
+            "VGCS warns when the drone's own wind estimate reaches this speed. 0 turns the warning off. "
+            "The drone sends a wind estimate only when its drag parameters are set "
+            "(EK3_DRAG_BCOEF_X, EK3_DRAG_BCOEF_Y, EK3_DRAG_MCOEF). Without them the Wind value reads N/A. "
+            "This is a warning on this screen only. The failsafe that brings the drone home runs on the drone."
+        )
+        wind_hint.setWordWrap(True)
+        wind_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        wg.addWidget(wind_hint, 1, 0, 1, 2)
+        wg.setColumnStretch(1, 1)
+        wind_group.setLayout(wg)
+        g.addWidget(wind_group)
+
         g.addStretch(1)
         stack.addWidget(general)
 
@@ -768,6 +794,9 @@ class MainWindowSettingsDialogsMixin:
                 s.setValue("observe/dem_csv", dem_p)
                 s.setValue("observe/dem_terrain_enabled", bool(dem_enabled.isChecked()))
                 s.setValue("observe/camera_hfov_deg", float(observe_hfov.value()))
+                s.setValue(KEY_WIND_WARN_MPS, float(wind_warn.value()))
+                self._wind.set_warn_mps(wind_warn.value())
+                self._publish_wind()
                 try:
                     from vgcs.observe.dem import clear_dem_cache
 

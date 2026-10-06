@@ -322,6 +322,24 @@ class VehicleTelemetryMixin:
             return float(self._lat), float(self._lon)
         return None
 
+    def set_wind_readout(self, text: str, level: str = "ok") -> None:
+        """Show the wind estimate under the flight values, or hide it.
+
+        ``text`` is empty when the vehicle sends no estimate. The line is then
+        removed, not shown as zero: most aircraft send none, and a strip that
+        said "0 m/s" would be read as calm air.
+        """
+        sig = f"{text}|{level}"
+        if sig == getattr(self, "_last_wind_readout_sig", None):
+            return
+        self._last_wind_readout_sig = sig
+        try:
+            if self._native_telemetry.set_wind(str(text or ""), str(level or "ok")):
+                # The strip grew or shrank by a line: place it again.
+                QTimer.singleShot(0, self._layout_native_hud)
+        except Exception:
+            pass
+
     def set_flight_telemetry(
         self,
         *,

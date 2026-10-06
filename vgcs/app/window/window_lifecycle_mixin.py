@@ -169,6 +169,12 @@ class MainWindowLifecycleMixin:
             self._publish_vehicle_msg_cell()
         except Exception:
             pass
+        # Same reason for the wind readings: they expire, and this is the tick
+        # that notices when the messages have stopped.
+        try:
+            self._publish_wind()
+        except Exception:
+            pass
         if self._armed_since is None:
             self._sync_visible_map_overlay_metrics()
             return

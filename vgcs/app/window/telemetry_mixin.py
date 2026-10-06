@@ -64,7 +64,7 @@ from vgcs.app.window.helpers import (
 from vgcs.app.arm_readiness import parse_prearm_health
 from vgcs.app.battery_tracker import pack_voltage_v_from_cells, voltage_v_from_mv
 from vgcs.app.gcs_style import gcs_stylesheet
-from vgcs.app.vehicle_messages import SEVERITY_INFO
+from vgcs.app.vehicle_messages import SEVERITY_INFO, SEVERITY_WARNING
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
@@ -163,9 +163,50 @@ class MainWindowTelemetryMixin:
         except Exception:
             pass
 
+    def _publish_wind(self) -> None:
+        """Paint the wind estimate and the wind failsafe status everywhere they appear.
+
+        Called on every wind message and once a second from the flight timer,
+        because both readings expire: a wind estimate that stopped arriving must
+        go back to "N/A", and a failsafe script that stopped must read "Not
+        running", without waiting for another message that will never come.
+        """
+        wind = self._wind
+        now = time.monotonic()
+        field = self._fields["wind"]
+        text = wind.field_text(now)
+        if field.text() != text:
+            field.setText(text)
+        level = wind.wind_level(now)
+        if str(field.property("state_role") or "") != level:
+            self._apply_state_style(field, level)
+        field.setToolTip(wind.field_tooltip(now))
+
+        fs_field = self._fields["wind_failsafe"]
+        fs_text = wind.failsafe_text(now)
+        if fs_field.text() != fs_text:
+            fs_field.setText(fs_text)
+        fs_level = wind.failsafe_level(now)
+        if str(fs_field.property("state_role") or "") != fs_level:
+            self._apply_state_style(fs_field, fs_level)
+        fs_field.setToolTip(wind.failsafe_tooltip(now))
+
+        try:
+            self._map_widget.set_wind_readout(wind.strip_text(now), level)
+        except Exception:
+            pass
+
+        warning = wind.take_warning(now)
+        if warning:
+            # Shown like a vehicle warning, so routine chatter cannot bury it.
+            self._vehicle_msg_board.push_vehicle_message(warning, severity=SEVERITY_WARNING)
+            self._publish_vehicle_msg_cell()
+            self._append_log(f"WIND: {warning}")
+
     def _reset_telemetry_fields(self) -> None:
         self._armed_since = None
         self._battery.reset()
+        self._wind.reset()
         self._vehicle_msg_board.reset()
         self._prearm_health = None
         self._fields["battery"].setToolTip("")
@@ -224,6 +265,7 @@ class MainWindowTelemetryMixin:
         self._top_flight_mode.setText("—")
         self._top_battery.setText("—")
         self._top_remote_id.setText("N/A")
+        self._publish_wind()
         self._publish_vehicle_msg_cell()
         self._map_widget.set_header_mode("—")
         self._map_widget.set_header_gps(0, "N/A")
@@ -254,6 +296,7 @@ class MainWindowTelemetryMixin:
             except Exception:
                 authoritative = False
         battery = getattr(self, "_battery", None)
+        wind = getattr(self, "_wind", None)
         flags = getattr(self, "_last_sensor_flags", None) or (None, None, None)
         return {
             "prearm_reported": bool(getattr(health, "reported", False)),
@@ -268,6 +311,7 @@ class MainWindowTelemetryMixin:
             "sensors_present": flags[0],
             "sensors_enabled": flags[1],
             "sensors_health": flags[2],
+            "wind_failsafe_action": wind.failsafe_action() if wind is not None else None,
             "link_ok": self._preflight_link_is_live(),
         }
 
@@ -687,6 +731,12 @@ class MainWindowTelemetryMixin:
                 remaining_pct=pct if pct >= 0 else None,
             )
             self._publish_battery_reading()
+        elif msg_type == "WIND":
+            if self._wind.update_wind(data.get("speed_mps"), data.get("direction_deg")):
+                self._publish_wind()
+        elif msg_type == "NAMED_VALUE_FLOAT":
+            if self._wind.update_failsafe_value(data.get("name"), data.get("value")):
+                self._publish_wind()
         elif msg_type == "OBSTACLE_DISTANCE":
             self._map_widget.set_obstacle_distance(data)
             prox, _ = self._map_widget.get_obstacle_sensor_summary()

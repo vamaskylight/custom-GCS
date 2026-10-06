@@ -43,6 +43,13 @@ BATTERY_MIN_PLAUSIBLE_V = 5.0
 MAV_SYS_STATUS_SENSOR_MOTOR_OUTPUTS = 0x00008000
 MAV_SYS_STATUS_SENSOR_PROPULSION = 0x40000000
 
+# WFS_ACTION values of the onboard wind failsafe script
+# (drone/scripts/vama_wind_failsafe.lua).
+WIND_FAILSAFE_OFF = 0
+WIND_FAILSAFE_WARN = 1
+WIND_FAILSAFE_RTL = 2
+WIND_FAILSAFE_LAND = 3
+
 # Shown on every row when there is no vehicle on the other end. A checklist
 # describing a link that is down must say so on each line, not leave the last
 # reading sat there looking current.
@@ -84,6 +91,7 @@ def build_preflight_checks(
     sensors_present: int | None = None,
     sensors_enabled: int | None = None,
     sensors_health: int | None = None,
+    wind_failsafe_action: int | None = None,
     link_ok: bool = True,
 ) -> list[PreflightCheck]:
     """Assemble the checklist rows. Pure — no Qt, no telemetry plumbing."""
@@ -101,6 +109,7 @@ def build_preflight_checks(
             PreflightCheck("gps", "GPS", STATUS_UNKNOWN, NO_LINK_DETAIL),
             PreflightCheck("battery", "Battery", STATUS_UNKNOWN, NO_LINK_DETAIL),
             PreflightCheck("motors", "Motors / ESCs", STATUS_UNKNOWN, NO_LINK_DETAIL),
+            PreflightCheck("wind_failsafe", "Wind failsafe", STATUS_UNKNOWN, NO_LINK_DETAIL),
         ]
 
     checks: list[PreflightCheck] = []
@@ -146,6 +155,7 @@ def build_preflight_checks(
             battery_powered=battery_is_present(battery_voltage_v),
         )
     )
+    checks.append(_wind_failsafe_check(wind_failsafe_action))
     return checks
 
 
@@ -267,6 +277,45 @@ def _motors_check(present, enabled, health, *, battery_powered=None) -> Prefligh
     return PreflightCheck(
         "motors", "Motors / ESCs", STATUS_UNKNOWN,
         "This autopilot does not report motor health",
+    )
+
+
+def _wind_failsafe_check(action) -> PreflightCheck:
+    """What the onboard wind failsafe is set to do, as its script reports it.
+
+    Agreed 2026-09-16: the failsafe runs on the drone (a script), so that it
+    works with any ground station and with the link down. That also means
+    nothing on the ground can see it unless it says so, and a script that is
+    missing after a firmware update or a new SD card looks exactly like one
+    that is working. So the script reports its setting all the time
+    (``WFS_ACT``), and this row shows it before take-off.
+
+    "Warning only" is how the script is installed, on purpose, so it is not
+    marked as a fault. Turned off is.
+    """
+    a = _i(action)
+    if a is None:
+        return PreflightCheck(
+            "wind_failsafe", "Wind failsafe", STATUS_UNKNOWN,
+            "Not running on this drone (script not installed, or scripting is off)",
+        )
+    if a == WIND_FAILSAFE_RTL:
+        return PreflightCheck(
+            "wind_failsafe", "Wind failsafe", STATUS_PASS,
+            "On. Returns home in wind it cannot hold",
+        )
+    if a == WIND_FAILSAFE_LAND:
+        return PreflightCheck(
+            "wind_failsafe", "Wind failsafe", STATUS_PASS,
+            "On. Lands in wind it cannot hold",
+        )
+    if a == WIND_FAILSAFE_WARN:
+        return PreflightCheck(
+            "wind_failsafe", "Wind failsafe", STATUS_UNKNOWN,
+            "Warning only. It reports strong wind but does not act (WFS_ACTION 1)",
+        )
+    return PreflightCheck(
+        "wind_failsafe", "Wind failsafe", STATUS_FAIL, "Turned off (WFS_ACTION 0)"
     )
 
 
