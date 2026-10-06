@@ -79,6 +79,12 @@ def check_bundled_files() -> str:
         root / "header_icons" / "gps.svg",
         root / "menu_icons" / "plan_flight.svg",
         root / "vendor" / "leaflet" / "leaflet.js",
+        # The 3D view: the library, one of its workers, its styles, and the
+        # small world picture it draws with no internet.
+        root / "vendor" / "cesium" / "Cesium.js",
+        root / "vendor" / "cesium" / "Workers" / "createVerticesFromHeightmap.js",
+        root / "vendor" / "cesium" / "Widgets" / "widgets.css",
+        root / "vendor" / "cesium" / "Assets" / "Textures" / "NaturalEarthII" / "tilemapresource.xml",
         _YOLOX_MODEL_PATH,
         _LPD_MODEL_PATH,
     ]
@@ -305,9 +311,10 @@ def check_qt_and_map_page() -> str:
     from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineUrlRequestInterceptor
 
     class OfflineOnly(QWebEngineUrlRequestInterceptor):
-        """Block the network. The page falls back to a CDN copy of Leaflet, so
-        without this the check would pass online even if the bundled copy is
-        missing. Blocked, it proves the map works offline, as in the field."""
+        """Block the network. The page falls back to a CDN copy of Leaflet and
+        of Cesium, so without this the check would pass online even if the
+        bundled copies are missing. Blocked, it proves the map works offline,
+        as in the field."""
 
         def interceptRequest(self, info) -> None:
             if info.requestUrl().scheme() in ("http", "https"):
@@ -337,13 +344,23 @@ def check_qt_and_map_page() -> str:
             raise RuntimeError("the map page's JavaScript did not answer in 20 s")
         if result["leaflet"] != "object":
             raise RuntimeError(f"Leaflet did not load from the bundled files (typeof L = {result['leaflet']!r})")
+        page.runJavaScript("typeof Cesium", 0, lambda value: result.setdefault("cesium", value))
+        if not _wait_for(app, lambda: "cesium" in result, 20.0):
+            raise RuntimeError("the map page's JavaScript did not answer in 20 s")
+        if result["cesium"] != "object":
+            raise RuntimeError(
+                f"Cesium (the 3D view) did not load from the bundled files (typeof Cesium = {result['cesium']!r})"
+            )
     finally:
         # The page must go before its profile, or Qt WebEngine complains at exit.
         page.deleteLater()
         _wait_for(app, lambda: False, 0.3)
         profile.deleteLater()
         _wait_for(app, lambda: False, 0.3)
-    return f"Qt {qVersion()}, png/jpg/svg images, map page loads the bundled Leaflet with the network blocked"
+    return (
+        f"Qt {qVersion()}, png/jpg/svg images, map page loads the bundled Leaflet and Cesium (3D) "
+        "with the network blocked"
+    )
 
 
 def run_selfcheck(build: str = "VGCS from source", data_dir: Path | None = None) -> int:

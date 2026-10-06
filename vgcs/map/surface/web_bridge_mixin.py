@@ -620,7 +620,12 @@ class WebBridgeMixin:
                     self._btn_3d.setEnabled(False)
                 except Exception:
                     pass
-                self._set_status("3D unavailable (Cesium blocked/unreachable)")
+                # Cesium ships inside the install now, like Leaflet, so this is
+                # a broken install and not a network problem.
+                self._set_status(
+                    "3D library missing from this build "
+                    "(vgcs/assets/vendor/cesium). Re-install it. The 2D map still works."
+                )
             elif "leaflet" in reason:
                 # Leaflet ships inside the install now, so this is no longer a
                 # network problem and "check internet/proxy/firewall" would send

@@ -8,7 +8,9 @@
        whole view went black (field report 2026-08-20). The CDN link stays only as
        a fallback for a build where the vendored copy is missing. -->
   <link rel="stylesheet" href="__LEAFLET_CSS_SRC__" onerror="this.onerror=null;this.href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'"/>
-  <link rel="stylesheet" href="https://unpkg.com/cesium@1.125/Build/Cesium/Widgets/widgets.css" onerror="document.title='VGCS_ASSET_ERROR:cesium_css:'+Date.now()"/>
+  <!-- Cesium (the 3D view) is vendored for the same reason: the client's laptops
+       never go online, and from unpkg.com the 3D view could not start there. -->
+  <link rel="stylesheet" href="__CESIUM_CSS_SRC__" onerror="this.onerror=function(){document.title='VGCS_ASSET_ERROR:cesium_css:'+Date.now();};this.href='https://unpkg.com/cesium@1.125/Build/Cesium/Widgets/widgets.css'"/>
   <style>
     html, body, #mapWrap, #map2d, #map3d { height:100%; margin:0; background:#1a1d24; }
     /* Single scroll/compositor root; avoid promoted layers that confuse WebEngine on Windows. */
@@ -1952,7 +1954,13 @@
     </div>
   </div>
   <script src="__LEAFLET_JS_SRC__" onerror="document.title='VGCS_ASSET_ERROR:leaflet_local_missing:'+Date.now();var s=document.createElement('script');s.src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';s.onerror=function(){document.title='VGCS_ASSET_ERROR:leaflet_js:'+Date.now();};document.head.appendChild(s);"></script>
-  <script src="https://unpkg.com/cesium@1.125/Build/Cesium/Cesium.js" onerror="document.title='VGCS_ASSET_ERROR:cesium_js:'+Date.now()"></script>
+  <script>
+    // Filled in by legacy_leaflet_build.py: where Cesium finds its workers and
+    // textures, and the map tiles already on this computer for the 3D view.
+    window.CESIUM_BASE_URL = '__CESIUM_BASE_URL__';
+    window.__VGCS_LOCAL_TILE_TEMPLATES = __VGCS_LOCAL_TILE_TEMPLATES_JSON__;
+  </script>
+  <script src="__CESIUM_JS_SRC__" onerror="window.CESIUM_BASE_URL='https://unpkg.com/cesium@1.125/Build/Cesium/';var s=document.createElement('script');s.src=window.CESIUM_BASE_URL+'Cesium.js';s.onerror=function(){document.title='VGCS_ASSET_ERROR:cesium_js:'+Date.now();};document.head.appendChild(s);"></script>
   <script>
     // Fail fast with a clear signal if core assets are blocked/unreachable.
     setTimeout(() => {
@@ -4202,6 +4210,44 @@
       } catch (e1) {}
     }
 
+    // A failed tile is normal in the 3D view (no internet, or a tile that was
+    // never stored): Cesium then draws the next coarser tile it has. A listener
+    // on the error event stops it writing one console line per missing tile.
+    function __vgcsQuietTiles(provider) {
+      try { provider.errorEvent.addEventListener(function() {}); } catch (e) {}
+      return provider;
+    }
+
+    // Imagery that needs no internet, drawn under the online layers: the small
+    // world picture that ships with Cesium, then the tiles the 2D map already
+    // has on this computer (its cache with any imported tile pack, the bundled
+    // seed, an offline folder). Offline, the online layers fail and these show.
+    function __vgcsAddOffline3dImagery() {
+      try {
+        const world = Cesium.ImageryLayer.fromProviderAsync(
+          Cesium.TileMapServiceImageryProvider.fromUrl(
+            Cesium.buildModuleUrl('Assets/Textures/NaturalEarthII')
+          )
+        );
+        try { world.errorEvent.addEventListener(function() {}); } catch (eW) {}
+        viewer3d.imageryLayers.add(world);
+      } catch (e0) {}
+      const templates = Array.isArray(window.__VGCS_LOCAL_TILE_TEMPLATES)
+        ? window.__VGCS_LOCAL_TILE_TEMPLATES : [];
+      templates.forEach(function(tmpl) {
+        try {
+          viewer3d.imageryLayers.addImageryProvider(
+            __vgcsQuietTiles(new Cesium.UrlTemplateImageryProvider({
+              url: String(tmpl),
+              maximumLevel: 19,
+              enablePickFeatures: false,
+              credit: ''
+            }))
+          );
+        } catch (e1) {}
+      });
+    }
+
     function ensure3D() {
       if (viewer3d) {
         __apply3dCameraControls();
@@ -4227,9 +4273,9 @@
           infoBox: false,
           selectionIndicator: false,
           terrainProvider: new Cesium.EllipsoidTerrainProvider(),
-          imageryProvider: new Cesium.OpenStreetMapImageryProvider({
-            url: 'https://tile.openstreetmap.org/'
-          })
+          // No default layer: Cesium's own default asks Cesium ion on the
+          // internet. The layers are added further down.
+          baseLayer: false
         });
         // Make sure the vehicle marker stays visible on top of imagery/terrain.
         try { viewer3d.scene.globe.depthTestAgainstTerrain = false; } catch (e) {}
@@ -4307,29 +4353,31 @@
         // Force a known imagery layer for stable no-key rendering in WebEngine.
         try {
           viewer3d.imageryLayers.removeAll();
+          __vgcsAddOffline3dImagery();
           viewer3d.imageryLayers.addImageryProvider(
-            new Cesium.UrlTemplateImageryProvider({
+            __vgcsQuietTiles(new Cesium.UrlTemplateImageryProvider({
               url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
               credit: 'Tiles © Esri'
-            })
+            }))
           );
           // Overlay: borders + place labels (transparent) to match client reference.
           try {
             viewer3d.imageryLayers.addImageryProvider(
-              new Cesium.UrlTemplateImageryProvider({
+              __vgcsQuietTiles(new Cesium.UrlTemplateImageryProvider({
                 url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
                 credit: ''
-              })
+              }))
             );
           } catch (e2) {}
         } catch (e) {
           // Fallback to OSM if ArcGIS provider fails.
           try {
             viewer3d.imageryLayers.removeAll();
+            __vgcsAddOffline3dImagery();
             viewer3d.imageryLayers.addImageryProvider(
-              new Cesium.OpenStreetMapImageryProvider({
+              __vgcsQuietTiles(new Cesium.OpenStreetMapImageryProvider({
                 url: 'https://tile.openstreetmap.org/'
-              })
+              }))
             );
           } catch (e2) {}
         }

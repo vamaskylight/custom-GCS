@@ -4,13 +4,26 @@ from __future__ import annotations
 
 import json
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSettings, QTimer
 
+from vgcs.map.app_settings import QS_APP, QS_ORG
 from vgcs.map.legacy_leaflet_build import build_leaflet_html
 from vgcs.map.map_3d_marker_overlay import Map3dLayer, Map3dMarkerOverlay
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_url, create_map_3d_web_view
 from vgcs.map.surface.helpers import _web_2d_fallback_allowed
+from vgcs.map.surface.settings_keys import _KEY_MAP_OFFLINE_TILE_ROOT
 from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT, latest_mark
+
+
+def _offline_tile_root_setting() -> str:
+    """The operator's offline tile folder (Offline Tiles...), or "" when none is set.
+
+    The 3D view draws those tiles too, like the 2D map does.
+    """
+    try:
+        return str(QSettings(QS_ORG, QS_APP).value(_KEY_MAP_OFFLINE_TILE_ROOT, "") or "").strip()
+    except Exception:
+        return ""
 
 
 class Map3dMixin:
@@ -234,7 +247,7 @@ class Map3dMixin:
             import vgcs.map.legacy_leaflet_build as _llb
 
             _llb._leaflet_template = None  # noqa: SLF001 — pick up HTML edits (vehicle overlay export)
-            html = build_leaflet_html()
+            html = build_leaflet_html(_offline_tile_root_setting())
             w.loadFinished.connect(self._on_web_3d_load_finished)
             w.titleChanged.connect(self._on_web_title_changed)
             w.setHtml(html, assets_base_url())
@@ -366,7 +379,7 @@ class Map3dMixin:
                         _llb._leaflet_template = None  # noqa: SLF001
                         self._web_3d_ready = False
                         self._pending_3d_activate = True
-                        w3.setHtml(build_leaflet_html(), assets_base_url())
+                        w3.setHtml(build_leaflet_html(_offline_tile_root_setting()), assets_base_url())
                     except Exception:
                         pass
                     return
