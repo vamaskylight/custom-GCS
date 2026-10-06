@@ -15,9 +15,18 @@
 //    times a second while motion is asked for, then stop. This is what VGCS
 //    sends. PTZ arrows run at the camera's own fixed speed (much too fast) and
 //    did not move yaw at all in the field test.
+//  - The long gimbal frames (angles GAY/GAP, GSM, GOT) must start with an
+//    upper-case "#TP", as Skydroid's TOP documents say. VGCS sends them to the
+//    C12/C13 with a lower-case "#tp", and the third test build found the V13
+//    ignoring the angle commands sent that way (0 and 90 degree buttons).
 //
 // Motion comes from a finger dragging on the video (setTouchMotion) or from
 // RC wheels, read from the RC channels the flight controller reports.
+//
+// Object lock (lockAt) uses the camera's own tracker, as VGCS M13 does. It
+// never worked on a C13 in VGCS, and TOP V1.1.6 lists GOT and SUM for the C12
+// only; V1.2.0 adds the C13 and the C14 Pro. The camera reports nothing about
+// the lock, so the gimbal angles are the only sign that it follows.
 //
 // One shared instance; QML uses it as the singleton "SkydroidLink" from the
 // QGC module.
@@ -96,6 +105,18 @@ class SkydroidLink : public QObject
     Q_PROPERTY(double targetHorizontalM READ targetHorizontalM NOTIFY targetChanged)
     Q_PROPERTY(double targetBearingDeg READ targetBearingDeg NOTIFY targetChanged)
     Q_PROPERTY(QString targetMessage READ targetMessage NOTIFY targetChanged)
+
+    // Object lock with the camera's own tracker (GOT and SUM). The camera never
+    // reports what it tracks, so the gimbal angles show whether it follows.
+    /// True while the camera turns to the object, before the lock starts.
+    Q_PROPERTY(bool lockBusy READ lockBusy NOTIFY lockChanged)
+    /// True while the camera is told to follow the object.
+    Q_PROPERTY(bool lockActive READ lockActive NOTIFY lockChanged)
+    /// How far the camera has turned by itself since the lock started, in degrees.
+    Q_PROPERTY(double lockTurnedDeg READ lockTurnedDeg NOTIFY lockChanged)
+    /// True once the camera has turned by itself during this lock (it follows).
+    Q_PROPERTY(bool lockFollowSeen READ lockFollowSeen NOTIFY lockChanged)
+    Q_PROPERTY(QString lockMessage READ lockMessage NOTIFY lockChanged)
 
     // RC channels from the flight controller (index 0 is channel 1)
     Q_PROPERTY(QVariantList rcChannels READ rcChannels NOTIFY rcChannelsChanged)
@@ -181,6 +202,11 @@ public:
     double targetHorizontalM() const { return _target.horizontalRangeM; }
     double targetBearingDeg() const { return _target.bearingDeg; }
     QString targetMessage() const { return _targetMessage; }
+    bool lockBusy() const { return _lockBusy; }
+    bool lockActive() const { return _lockActive; }
+    double lockTurnedDeg() const { return _lockTurnedDeg; }
+    bool lockFollowSeen() const { return _lockFollowSeen; }
+    QString lockMessage() const { return _lockMessage; }
     QVariantList rcChannels() const;
     QString detectingWheel() const { return _detectAxis; }
 
@@ -202,6 +228,12 @@ public:
     /// Turn the camera to a point tapped on the video, then measure it with
     /// the laser. u and v run from 0 to 1 across and down the picture.
     Q_INVOKABLE void aimAndMeasure(double u, double v);
+    /// Lock on the object at a point of the video (u, v as for aimAndMeasure):
+    /// turn the camera to it, then tell the camera to follow it (GOT, then SUM
+    /// confirm), and measure it with the laser every few seconds. Moving the
+    /// camera by hand ends the lock.
+    Q_INVOKABLE void lockAt(double u, double v);
+    Q_INVOKABLE void stopLock();
     /// The picture's field of view now, in degrees, zoom included.
     void currentFov(double &horizontalDeg, double &verticalDeg) const;
     Q_INVOKABLE void takePhoto();
@@ -234,6 +266,7 @@ signals:
     void zoomChanged();
     void recordingChanged();
     void targetChanged();
+    void lockChanged();
     void rcChannelsChanged();
     void detectingWheelChanged();
     /// Result of detectWheel: the channel now used, or 0 when no wheel moved.
@@ -250,6 +283,8 @@ private slots:
     void _sendWheelAngles();
     void _zoomOutTick();
     void _aimTick();
+    void _lockTick();
+    void _sendLockConfirm();
 
 private:
     // Plain functions, not slots: a slot taking Vehicle* would need the full
@@ -278,6 +313,9 @@ private:
     void _setActive(const Endpoint &endpoint);
     void _sendTo(const Endpoint &endpoint, const std::string &frame);
     void _send(const std::string &frame) { _sendTo(_active, frame); }
+    /// A long gimbal frame: the upper-case "#TP" form first, then the lower-case
+    /// form VGCS uses, when the camera's frames are lower-case (C12, C13).
+    void _sendGimbal(const std::string &frame);
     void _handleFrame(const skydroid::top::DecodedFrame &frame, const Endpoint &from);
     Endpoint _knownEndpointFor(const QHostAddress &address, quint16 port) const;
     bool _attitudeFresh() const;
@@ -291,6 +329,23 @@ private:
     /// Drone position and attitude now, from QGC. False when there is no usable GPS fix.
     bool _sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &why) const;
     void _computeTarget();
+    /// keepLastResult: a refresh during a lock keeps showing the last result until the new one arrives.
+    void _fireLaser(bool keepLastResult);
+
+    // Tap aiming and the lock
+    /// Sets the angles to turn to for a point of the picture. Returns how far
+    /// the point is from the picture centre, in degrees (the larger axis).
+    double _setAimFor(double u, double v);
+    /// Sends the aim angles and starts watching the turn.
+    void _startTurn();
+    /// Where the aimed point is in the picture now, from the gimbal angles.
+    void _aimPointInPicture(double &u, double &v) const;
+    void _armLock(double u, double v);
+    /// Stops the lock (SUM stop) and shows the message.
+    void _endLock(const QString &message);
+    /// The operator moved the camera: the lock must not fight them.
+    void _endLockByHand();
+    void _setLockMessage(const QString &message);
 
     // Motion
     void _desiredSpeed(double &yawDps, double &pitchDps);
@@ -335,11 +390,27 @@ private:
     // Tap aiming
     bool _aimBusy = false;
     bool _aimResent = false;
-    double _aimYaw = 0.0;
+    double _aimYaw = 0.0;      // the angles sent (inside the gimbal's limits)
     double _aimPitch = 0.0;
+    double _aimPointYaw = 0.0;    // where the point is, which can be past a limit
+    double _aimPointPitch = 0.0;
     QTimer _aimTimer;
     QElapsedTimer _aimElapsed;
     QElapsedTimer _aimSettled;
+
+    // Object lock
+    bool _lockBusy = false;
+    bool _lockActive = false;
+    bool _lockFollowSeen = false;
+    bool _lockWarned = false;
+    double _lockTurnedDeg = 0.0;
+    double _lockStartYaw = 0.0;
+    double _lockStartPitch = 0.0;
+    QString _lockMessage;
+    QTimer _lockTimer;
+    QElapsedTimer _lockElapsed;
+    qint64 _lockNextConfirmMs = 0;
+    qint64 _lockNextLaserMs = 0;
 
     bool _answering = false;
     bool _attitudeValid = false;

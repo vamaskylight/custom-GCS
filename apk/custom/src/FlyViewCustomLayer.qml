@@ -3,11 +3,13 @@
 //
 // Layout follows the Skydroid app the client uses (photo, 2026-10-06): the
 // video stays clear, with round icon buttons on both sides.
-//  - Left: photo, record, laser.
+//  - Left: photo, record, laser, lock, IR.
 //  - Right: yaw centre, gimbal centre, look down, zoom in, zoom out, zoom 1x.
 //  - Top right: camera status and settings.
 // The camera moves when a finger drags on the video (further = faster), or
-// with an RC wheel set up in the camera settings.
+// with an RC wheel set up in the camera settings. A tap on the video measures
+// that object. After the lock button, a box drawn around an object (or a tap
+// on it) locks the camera on it.
 
 import QtQuick
 import QtQuick.Controls
@@ -36,6 +38,16 @@ Item {
     property bool  _laserBoxHidden: false
     property bool  _hintShown:     false
     property string _detectResult: ""
+    // After the lock button: the next box or tap on the video picks the object.
+    property bool  _lockPicking:   false
+    property bool  _lockOn:        _link.lockActive || _link.lockBusy
+    property string _lockHiddenMessage: ""
+    // The lock state in one line: the message, and how far the camera has turned by itself.
+    property string _lockStateText: _link.lockMessage +
+                                    (_link.lockActive ? "  " + qsTr("(turned %1°)").arg(_fmt(_link.lockTurnedDeg, 1)) : "")
+    // Bottom hints are centred; this keeps them clear of the small map in the bottom corner.
+    readonly property real _bottomTextMaxWidth: Math.max(ScreenTools.defaultFontPixelWidth * 24,
+                                                         width - 2 * (parentToolInsets.leftEdgeBottomInset + _margin * 4))
 
     readonly property string _iconPath: "/custom/img/"
 
@@ -298,6 +310,7 @@ Item {
 
             IconButton {
                 id:        photoButton
+                objectName: "vamaPhotoButton"
                 icon:      _iconPath + "vama_photo.svg"
                 size:      _buttonSize
                 onClicked: { _link.takePhoto(); photoButton.flash() }
@@ -315,6 +328,23 @@ Item {
                 fill:      _link.laserBusy ? qgcPal.colorOrange : Qt.rgba(0, 0, 0, 0.55)
                 onClicked: _link.fireLaser()
             }
+            // Lock on an object: press, then draw a box around it on the video
+            // (or tap it). Orange while locked; press again to stop.
+            IconButton {
+                objectName: "vamaLockButton"
+                icon:       _iconPath + "vama_lock.svg"
+                size:       _buttonSize
+                enabled:    _videoIsMain || _lockOn
+                fill:       _lockOn ? qgcPal.colorOrange
+                                    : (_lockPicking ? Qt.rgba(1, 0.6, 0, 0.45) : Qt.rgba(0, 0, 0, 0.55))
+                onClicked: {
+                    if (_lockOn) {
+                        _link.stopLock()
+                    } else {
+                        _lockPicking = !_lockPicking
+                    }
+                }
+            }
             IconButton {
                 objectName: "vamaIrButton"
                 icon:       _iconPath + "vama_ir.svg"
@@ -326,10 +356,14 @@ Item {
     }
 
     // --- Laser result, top centre ---------------------------------------------------
+    // During a lock it is kept short and its last line is the lock state. On the
+    // RC's small screen (field video of test build 4) the full box with a second
+    // box for the lock reached down to the middle of the video and covered the
+    // object the operator had just locked.
     Rectangle {
         id:                       laserBox
-        visible:                  _link.enabled && !_laserBoxHidden &&
-                                  (_link.aimBusy || _link.laserBusy || _link.laserValid || _link.laserMessage !== "")
+        visible:                  _link.enabled && !_laserBoxHidden && !_lockPicking &&
+                                  (_link.aimBusy || _link.laserBusy || _link.laserValid || _link.laserMessage !== "" || _lockOn)
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top:              parent.top
         anchors.topMargin:        parentToolInsets.topEdgeCenterInset + _margin
@@ -337,6 +371,11 @@ Item {
         height:                   laserColumn.height + _margin * 2
         radius:                   _margin
         color:                    _panelColor
+        border.color:             _lockOn ? qgcPal.colorOrange : "transparent"
+        border.width:             2
+
+        // A lock measures again every few seconds; the last result stays up meanwhile.
+        readonly property bool _refreshing: _link.laserBusy && _link.lockActive && _link.laserValid
 
         Column {
             id:               laserColumn
@@ -346,13 +385,16 @@ Item {
 
             QGCLabel {
                 width:               parent.width
+                // Just locked and not measured yet: only the lock line shows.
+                visible:             _link.aimBusy || _link.lockBusy || _link.laserBusy || _link.laserValid || _link.laserMessage !== ""
                 horizontalAlignment: Text.AlignHCenter
                 color:               "white"
                 font.pointSize:      ScreenTools.largeFontPointSize
                 font.bold:           true
                 text:                _link.aimBusy ? qsTr("Turning to the point...")
-                                                   : (_link.laserBusy ? qsTr("Measuring...")
-                                                                      : (_link.laserValid ? qsTr("%1 m").arg(_fmt(_link.laserRangeM, 1)) : qsTr("No laser reading")))
+                                   : (_link.lockBusy ? qsTr("Turning to the object...")
+                                   : ((_link.laserBusy && !laserBox._refreshing) ? qsTr("Measuring...")
+                                   : (_link.laserValid ? qsTr("%1 m").arg(_fmt(_link.laserRangeM, 1)) : qsTr("No laser reading"))))
             }
             QGCLabel {
                 width:               parent.width
@@ -365,14 +407,14 @@ Item {
             }
             QGCLabel {
                 width:               parent.width
-                visible:             !_link.laserBusy && _link.targetValid
+                visible:             (!_link.laserBusy || laserBox._refreshing) && _link.targetValid
                 horizontalAlignment: Text.AlignHCenter
                 color:               "white"
-                text:                qsTr("Target %1, %2").arg(_fmt(_link.targetLat, 6)).arg(_fmt(_link.targetLon, 6))
+                text:                qsTr("Lat long %1, %2").arg(_fmt(_link.targetLat, 6)).arg(_fmt(_link.targetLon, 6))
             }
             QGCLabel {
                 width:               parent.width
-                visible:             !_link.laserBusy && _link.targetValid && _link.targetHasAlt
+                visible:             (!_link.laserBusy || laserBox._refreshing) && _link.targetValid && _link.targetHasAlt && !_lockOn
                 horizontalAlignment: Text.AlignHCenter
                 color:               "white"
                 font.pointSize:      ScreenTools.smallFontPointSize
@@ -381,12 +423,28 @@ Item {
             }
             QGCLabel {
                 width:               parent.width
-                visible:             !_link.laserBusy && _link.laserValid && _link.targetMessage !== ""
+                visible:             (!_link.laserBusy || laserBox._refreshing) && _link.laserValid && _link.targetMessage !== ""
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode:            Text.WordWrap
                 color:               qgcPal.colorOrange
-                font.pointSize:      ScreenTools.smallFontPointSize
+                // A note on a position that is shown stays small. The reason
+                // for no lat long at all is the main news, so it is full size.
+                font.pointSize:      (_link.targetValid || _lockOn) ? ScreenTools.smallFontPointSize
+                                                                    : ScreenTools.defaultFontPointSize
                 text:                _link.targetMessage
+            }
+            // The lock state. The camera reports nothing about a lock, so this is
+            // what the gimbal angles tell: whether it has turned by itself.
+            QGCLabel {
+                objectName:          "vamaLockLine"
+                width:               parent.width
+                visible:             _link.lockActive
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode:            Text.WordWrap
+                color:               "white"
+                font.bold:           true
+                font.pointSize:      ScreenTools.smallFontPointSize
+                text:                _lockStateText
             }
         }
 
@@ -394,6 +452,56 @@ Item {
         MouseArea {
             anchors.fill: parent
             onClicked:    _laserBoxHidden = true
+        }
+    }
+
+    // --- Object lock message ---------------------------------------------------------
+    // After a lock ends, or fails to start, its message shows here until tapped.
+    // During a lock the state is the last line of the box above, so this shows
+    // only when that box was tapped away: one line, and a tap brings the box back.
+    Rectangle {
+        id:                       lockChip
+        objectName:               "vamaLockChip"
+        visible:                  _link.enabled && !_lockPicking &&
+                                  (_lockOn ? !laserBox.visible
+                                           : (_link.lockMessage !== "" && _link.lockMessage !== _lockHiddenMessage))
+        anchors.horizontalCenter: parent.horizontalCenter
+        y:                        laserBox.visible ? laserBox.y + laserBox.height + _margin
+                                                   : parentToolInsets.topEdgeCenterInset + _margin
+        width:                    lockColumn.width + _margin * 3
+        height:                   lockColumn.height + _margin * 2
+        radius:                   _margin
+        color:                    _panelColor
+        border.color:             _lockOn ? qgcPal.colorOrange : "transparent"
+        border.width:             2
+
+        Column {
+            id:               lockColumn
+            anchors.centerIn: parent
+            width:            Math.min(ScreenTools.defaultFontPixelWidth * 34, _root.width * 0.45)
+            spacing:          _margin / 3
+
+            QGCLabel {
+                width:               parent.width
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode:            Text.WordWrap
+                color:               "white"
+                font.bold:           _link.lockActive
+                font.pointSize:      _lockOn ? ScreenTools.smallFontPointSize : ScreenTools.defaultFontPointSize
+                text:                _lockOn ? _lockStateText : _link.lockMessage
+            }
+        }
+
+        // Tap: hide a message, or during a lock bring the result box back.
+        MouseArea {
+            anchors.fill: parent
+            onClicked: {
+                if (_lockOn) {
+                    _laserBoxHidden = false
+                } else {
+                    _lockHiddenMessage = _link.lockMessage
+                }
+            }
         }
     }
 
@@ -424,10 +532,22 @@ Item {
         }
         function endDrag() {
             touchRefresh.stop()
-            if (_dragging) {
+            if (_dragging && !lockBox.drawing) {
                 _link.stopTouchMotion()
             }
+            lockBox.drawing = false
             _dragging = false
+        }
+
+        // Lock on the object at x, y (a tap, or the middle of a drawn box) if it is on the picture.
+        function _lockAt(x, y, boxWidth, boxHeight) {
+            const r = _videoRect()
+            if (x < r.x || x > r.x + r.width || y < r.y || y > r.y + r.height) {
+                return  // outside the picture: keep picking
+            }
+            lockBox.place(x, y, boxWidth, boxHeight)
+            _root._lockPicking = false
+            _link.lockAt((x - r.x) / r.width, (y - r.y) / r.height)
         }
 
         // Where the picture is drawn: the same sizes QGC's video view uses
@@ -457,14 +577,30 @@ Item {
             if (!_dragging && (Math.abs(mouse.x - _pressX) > _startDistance || Math.abs(mouse.y - _pressY) > _startDistance)) {
                 _dragging = true
                 _moved = true
-                touchRefresh.start()
+                if (!_root._lockPicking) {
+                    touchRefresh.start()
+                }
             }
-            if (_dragging) {
-                var d = _deflection()
-                _link.setTouchMotion(d[0], d[1])
+            if (!_dragging) {
+                return
             }
+            if (_root._lockPicking) {
+                // Drawing a box around the object: the camera stays still.
+                lockBox.drawFrom(_pressX, _pressY, mouse.x, mouse.y)
+                return
+            }
+            var d = _deflection()
+            _link.setTouchMotion(d[0], d[1])
         }
-        onReleased:      endDrag()
+        onReleased: {
+            if (_dragging && lockBox.drawing) {
+                _dragging = false
+                lockBox.drawing = false
+                _lockAt(lockBox.cx, lockBox.cy, lockBox.boxW, lockBox.boxH)
+                return
+            }
+            endDrag()
+        }
         onCanceled:      endDrag()
         onEnabledChanged: if (!enabled) endDrag()
         // A tap turns the camera to that point and measures it. It waits for the
@@ -493,6 +629,10 @@ Item {
                 if (tapX < r.x || tapX > r.x + r.width || tapY < r.y || tapY > r.y + r.height) {
                     return  // outside the picture
                 }
+                if (_root._lockPicking) {
+                    videoDrag._lockAt(tapX, tapY, lockBox.tapSize, lockBox.tapSize)
+                    return
+                }
                 tapMark.x = tapX - tapMark.width / 2
                 tapMark.y = tapY - tapMark.height / 2
                 tapMarkAnimation.restart()
@@ -515,6 +655,62 @@ Item {
                 PropertyAction  { target: tapMark; property: "opacity"; value: 1 }
                 PauseAnimation  { duration: 1200 }
                 NumberAnimation { target: tapMark; property: "opacity"; to: 0; duration: 600 }
+            }
+        }
+
+        // The box around the object to lock: drawn with the finger, kept where
+        // it was picked while the camera turns, then on the centre mark while
+        // locked (the camera keeps the object there when it follows).
+        Rectangle {
+            id:           lockBox
+            objectName:   "vamaLockBox"
+
+            property bool drawing: false
+            property bool jump:    false  // move without the slide
+            property real cx:      0
+            property real cy:      0
+            property real boxW:    tapSize
+            property real boxH:    tapSize
+            readonly property real minSize: ScreenTools.defaultFontPixelHeight * 1.5
+            readonly property real tapSize: ScreenTools.defaultFontPixelHeight * 4
+            readonly property bool centred: _link.lockActive && !drawing
+
+            function drawFrom(x0, y0, x1, y1) {
+                drawing = true
+                cx = (x0 + x1) / 2
+                cy = (y0 + y1) / 2
+                boxW = Math.max(minSize, Math.abs(x1 - x0))
+                boxH = Math.max(minSize, Math.abs(y1 - y0))
+            }
+            function place(x, y, w, h) {
+                jump = true
+                cx = x
+                cy = y
+                boxW = w
+                boxH = h
+                jump = false
+            }
+
+            visible:      _link.enabled && (drawing || _lockOn)
+            width:        boxW
+            height:       boxH
+            x:            (centred ? videoDrag.width / 2 : cx) - width / 2
+            y:            (centred ? videoDrag.height / 2 : cy) - height / 2
+            color:        "transparent"
+            border.color: qgcPal.colorOrange
+            border.width: 3
+
+            Behavior on x { enabled: !lockBox.drawing && !lockBox.jump; NumberAnimation { duration: 300 } }
+            Behavior on y { enabled: !lockBox.drawing && !lockBox.jump; NumberAnimation { duration: 300 } }
+
+            QGCLabel {
+                anchors.top:              parent.bottom
+                anchors.topMargin:        2
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible:                  !lockBox.drawing
+                color:                    qgcPal.colorOrange
+                font.bold:                true
+                text:                     _link.lockActive ? qsTr("LOCKED") : qsTr("TURNING")
             }
         }
 
@@ -545,7 +741,7 @@ Item {
 
         // Where the finger went down, and how far it has moved.
         Rectangle {
-            visible:      videoDrag._dragging
+            visible:      videoDrag._dragging && !lockBox.drawing
             x:            videoDrag._pressX - width / 2
             y:            videoDrag._pressY - height / 2
             width:        videoDrag._fullSpeedDistance * 2
@@ -556,7 +752,7 @@ Item {
             border.width: 2
         }
         Rectangle {
-            visible: videoDrag._dragging
+            visible: videoDrag._dragging && !lockBox.drawing
             width:   ScreenTools.defaultFontPixelHeight * 1.6
             height:  width
             radius:  width / 2
@@ -582,6 +778,9 @@ Item {
         QGCLabel {
             id:               hintLabel
             anchors.centerIn: parent
+            width:            Math.min(implicitWidth, _bottomTextMaxWidth)
+            wrapMode:         Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
             color:            "white"
             text:             qsTr("Drag on the video to move the camera. Tap an object to measure it.")
         }
@@ -594,18 +793,58 @@ Item {
         }
     }
 
+    // While the lock button waits for the object. At the top, in the place of the
+    // result box: on the RC the bottom centre is the middle of the video, and the
+    // hint lay over the object to draw the box around (field video, test build 4).
+    Rectangle {
+        id:                       lockHint
+        objectName:               "vamaLockHint"
+        visible:                  _lockPicking && _dragAvailable
+        z:                        1
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top:              parent.top
+        anchors.topMargin:        parentToolInsets.topEdgeCenterInset + _margin
+        width:                    lockHintLabel.width + _margin * 3
+        height:                   lockHintLabel.height + _margin * 1.5
+        radius:                   height / 2
+        color:                    _panelColor
+        border.color:             qgcPal.colorOrange
+        border.width:             2
+
+        QGCLabel {
+            id:               lockHintLabel
+            anchors.centerIn: parent
+            width:            Math.min(implicitWidth, ScreenTools.defaultFontPixelWidth * 34, _root.width * 0.45)
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode:         Text.WordWrap
+            color:            "white"
+            text:             qsTr("Draw a box around the object, or tap it. Press the lock button again to cancel.")
+        }
+    }
+
     property bool _dragAvailable: _link.enabled && _videoIsMain
     on_DragAvailableChanged: {
+        if (!_dragAvailable) {
+            _lockPicking = false  // picking needs the video
+        }
         if (_dragAvailable && !_hintShown) {
             _hintShown = true
             hintAnimation.restart()
         }
     }
 
+    on_LockOnChanged: {
+        if (_lockOn) {
+            _laserBoxHidden = false
+            _lockHiddenMessage = ""
+        }
+    }
+
     Connections {
         target: _link
         function onLaserBusyChanged() {
-            if (_link.laserBusy) {
+            // A lock measures every few seconds; that must not undo a tap that hid the box.
+            if (_link.laserBusy && !_link.lockActive) {
                 _laserBoxHidden = false
             }
         }

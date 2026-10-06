@@ -2,12 +2,13 @@
 // in the same process. Checks gimbal angles (GAA push and GAC questions), the
 // switch to another address when the configured one gives no angles, speed
 // motion from touch and RC wheels, the frames each button sends, the laser
-// sequence (laser module first, system address as fallback), and the target
-// position rules.
+// sequence (laser module first, system address as fallback), the target
+// position rules, and the object lock (turn, GOT, SUM confirm and stop).
 //
 // Every address used here is on this computer (127.0.0.x).
 
 #include <QtCore/QDir>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QSettings>
 #include <QtNetwork/QNetworkDatagram>
 #include <QtNetwork/QUdpSocket>
@@ -38,6 +39,8 @@ public:
         _socket.bind(QHostAddress::LocalHost, 0);
         connect(&_socket, &QUdpSocket::readyRead, this, &FakeCamera::_read);
         connect(&_pushTimer, &QTimer::timeout, this, &FakeCamera::_push);
+        connect(&_trackTimer, &QTimer::timeout, this, [this]() { yaw += trackDriftDps * 0.1; });
+        _clock.start();
     }
 
     quint16 port() const { return _socket.localPort(); }
@@ -45,13 +48,21 @@ public:
     bool answerGac = true;       // answer a GAC question
     bool pushAfterGaa = false;   // send angles on its own after GAA, like the camera's push
     bool followAngles = false;   // turn to GAY / GAP angle commands, like the real gimbal
+    // Act only on long frames that start with an upper-case "#TP", like the
+    // client's V13 (test build 3: angle commands sent as "#tp" did nothing).
+    bool upperCaseOnly = false;
     double yaw = 0.0;
     double pitch = -30.0;
     std::optional<std::string> slrE;  // SLR data field from the laser module
     std::optional<std::string> slrD;  // SLR data field from the system address
     std::optional<int> dzmStep;
     int laserModuleDelayMs = 0;  // answer E reads late
+    // After a SUM confirm the yaw drifts this fast, like a camera following an
+    // object, until a SUM stop.
+    double trackDriftDps = 0.0;
+    bool tracking = false;
     QStringList received;
+    QList<qint64> receivedAtMs;  // arrival time of each frame in received
 
     int countStartingWith(const QString &prefix) const
     {
@@ -64,7 +75,21 @@ public:
         return n;
     }
     int countEqual(const std::string &frame) const { return received.count(QString::fromStdString(frame)); }
-    void clear() { received.clear(); }
+    int indexOf(const std::string &frame) const { return received.indexOf(QString::fromStdString(frame)); }
+    int firstStartingWith(const QString &prefix) const
+    {
+        for (int i = 0; i < received.size(); ++i) {
+            if (received.at(i).startsWith(prefix)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    void clear()
+    {
+        received.clear();
+        receivedAtMs.clear();
+    }
 
 private slots:
     void _read()
@@ -73,14 +98,24 @@ private slots:
             const QNetworkDatagram d = _socket.receiveDatagram();
             const std::string raw(d.data().constData(), static_cast<size_t>(d.data().size()));
             received << QString::fromStdString(raw);
+            receivedAtMs << _clock.elapsed();
             const auto f = top::parseTpFrame(raw);
-            if (!f) {
+            if (!f || (upperCaseOnly && raw.rfind("#tp", 0) == 0)) {
                 continue;
             }
             if ((f->tag == "GAY" || f->tag == "GAP") && f->ctrl == 'w' && followAngles && f->data.size() >= 4) {
                 const auto angle = top::decodeAttitudeField4(f->data.substr(0, 4));
                 if (angle) {
                     (f->tag == "GAY" ? yaw : pitch) = *angle;
+                }
+                continue;
+            }
+            if (f->tag == "SUM" && f->ctrl == 'w') {
+                tracking = f->data == "01";
+                if (!tracking) {
+                    _trackTimer.stop();
+                } else if (trackDriftDps != 0.0 && !_trackTimer.isActive()) {
+                    _trackTimer.start(100);
                 }
                 continue;
             }
@@ -136,6 +171,8 @@ private:
 
     QUdpSocket _socket;
     QTimer _pushTimer;
+    QTimer _trackTimer;
+    QElapsedTimer _clock;
     QNetworkDatagram _pushTo;
 };
 
@@ -347,6 +384,66 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildPtz("stop")), 3, 2000);
     }
 
+    void gimbalFramesAlsoGoOutUpperCase()
+    {
+        // The V13 (C13) took no angle command in test build 3. Skydroid's TOP
+        // documents start every gimbal frame with "#TP"; VGCS sends the long
+        // ones as "#tp". So both go out, the documented one first.
+        _camera->upperCaseOnly = true;
+        _camera->followAngles = true;
+        _camera->yaw = 20.0;
+        _camera->pitch = -30.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        top::Options upper;
+        upper.gClassUpperHeader = true;
+
+        _link->pointDown();
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(_link->gimbalPitch() + 90.0) < 0.01, 2000);
+        const std::string downUpper = top::buildGimbalAngleAxis("GAP", -90.0, 30.0, upper);
+        const std::string downLower = top::buildGimbalAngleAxis("GAP", -90.0, 30.0);
+        QCOMPARE(downUpper.substr(0, 3), std::string("#TP"));
+        QCOMPARE(_camera->countEqual(downUpper), 1);
+        QCOMPARE(_camera->countEqual(downLower), 1);
+        QVERIFY(_camera->indexOf(downUpper) < _camera->indexOf(downLower));
+
+        _link->center();
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(_link->gimbalYaw()) < 0.01 && std::abs(_link->gimbalPitch()) < 0.01, 2000);
+        QCOMPARE(_camera->countEqual(top::buildGimbalAngleAxis("GAY", 0.0, 30.0, upper)), 1);
+        QCOMPARE(_camera->countEqual(top::buildGimbalAngleAxis("GAP", 0.0, 30.0, upper)), 1);
+
+        _link->setTouchMotion(0.8, 0.0);
+        _link->stopTouchMotion();
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeed(0.0, 0.0, upper)) >= 1, 2000);
+        QVERIFY(_camera->countEqual(top::buildGimbalSpeed(0.0, 0.0)) >= 1);
+
+        // The C14 Pro is upper-case already: one frame, not two.
+        _link->setModel("C14 Pro");
+        _camera->clear();
+        _link->pointDown();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(downUpper), 1, 2000);
+        QCOMPARE(_camera->countStartingWith("#tp"), 0);
+    }
+
+    void tapAndLockWorkOnACameraThatTakesOnlyUpperCase()
+    {
+        _camera->upperCaseOnly = true;
+        _camera->followAngles = true;
+        _camera->trackDriftDps = 5.0;
+        _camera->slrE = "01F4";
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->aimAndMeasure(0.75, 0.4);
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->aimBusy() && !_link->laserBusy(), 5000);
+        QVERIFY(_link->laserValid());
+        QVERIFY(std::abs(_link->gimbalYaw() + 20.85) < 0.01);
+        _link->lockAt(0.25, 0.5);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 5000);
+        top::Options upper;
+        upper.gClassUpperHeader = true;
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(640, 360, 1280, 720, upper)), 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 3000);
+        _link->stopLock();
+    }
+
     // --- Tap on an object: turn to it, then measure -----------------------------
 
     void fieldOfViewFollowsZoomAndLens()
@@ -429,6 +526,246 @@ private slots:
         _link->setReverseTapYaw(true);
         _link->aimAndMeasure(0.75, 0.4);
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAY", 20.85, 30.0)) >= 1, 2000);
+    }
+
+    // --- Object lock: turn to the object, GOT, SUM confirm -------------------------
+
+    void lockTurnsToTheObjectThenLocksIt()
+    {
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        _camera->followAngles = true;
+        _camera->slrE = "01F4";  // 50 m
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.75, 0.4);  // same point as the tap test: 20.85 right, 4.69 up
+        QVERIFY(_link->lockBusy());
+        QVERIFY(!_link->lockActive());
+        const std::string gay = top::buildGimbalAngleAxis("GAY", -20.85, 30.0);
+        const std::string got = top::buildGotTarget(640, 360);  // the object is under the cross now
+        const std::string confirm = top::buildSumTrack(true);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 5000);
+        QVERIFY(!_link->lockBusy());
+        QVERIFY(_link->lockMessage().contains("Locked"));
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(confirm) >= 1, 1000);
+        QVERIFY(_camera->tracking);
+        // Turn first, then GOT, then the confirm.
+        const int turn = _camera->received.indexOf(QString::fromStdString(gay));
+        const int lock = _camera->received.indexOf(QString::fromStdString(got));
+        const int conf = _camera->received.indexOf(QString::fromStdString(confirm));
+        QVERIFY(turn >= 0 && lock > turn && conf > lock);
+        // The laser measures the locked object, and the confirm is sent again.
+        QTRY_VERIFY_WITH_TIMEOUT(_link->laserValid(), 2000);
+        QCOMPARE(_link->laserRangeM(), 50.0);
+        QVERIFY(_link->targetValid());
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(confirm) >= 2, 3000);
+        // Stop: SUM stop, twice.
+        _link->stopLock();
+        QVERIFY(!_link->lockActive());
+        QVERIFY(_link->lockMessage().contains("stopped"));
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildSumTrack(false)), 2, 1000);
+        QVERIFY(!_camera->tracking);
+        // Nothing more once stopped.
+        const int confirms = _camera->countEqual(confirm);
+        QTest::qWait(2500);
+        QCOMPARE(_camera->countEqual(confirm), confirms);
+    }
+
+    void lockNearTheCentreLocksWithoutTurning()
+    {
+        _camera->yaw = 3.0;
+        _camera->pitch = -30.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        // 0.01 of the view is under 1.5 degrees: lock where it was picked (1280 x 720 frame).
+        _link->lockAt(0.51, 0.49);
+        QVERIFY(_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(653, 353)) == 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildSumTrack(true)) >= 1, 1000);
+        QCOMPARE(_camera->countStartingWith("#tpUG6wGAY"), 0);
+        QCOMPARE(_camera->countStartingWith("#tpUG6wGAP"), 0);
+    }
+
+    void lockAtAGimbalLimitPointsGotAtTheObject()
+    {
+        // The C13 tilts up to +10 only, and turns to +-90. An object past a
+        // limit stays off the cross after the turn, so GOT goes where it is.
+        _camera->yaw = -80.0;
+        _camera->pitch = 5.0;
+        _camera->followAngles = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        // 20.85 degrees right (C13 yaw -20.85): the object is at -100.85.
+        // 14.07 degrees up: the object is at +19.07.
+        _link->lockAt(0.75, 0.2);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAY", -90.0, 30.0)) >= 1, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAP", 10.0, 30.0)) >= 1, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 5000);
+        // Still right of the cross by 10.85 degrees, and above it by 9.07.
+        const double u = 0.5 + ((80.0 + 0.25 * 83.4) - 90.0) / 83.4;
+        const double v = 0.5 - ((5.0 + 0.3 * 46.9) - 10.0) / 46.9;
+        const int x = static_cast<int>(std::lround(u * 1280.0));
+        const int y = static_cast<int>(std::lround(v * 720.0));
+        QVERIFY(x > 760 && y < 300);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(x, y)), 1, 1000);
+    }
+
+    void lockNeverStartsIfTheCameraDoesNotTurn()
+    {
+        _camera->followAngles = false;  // the gimbal ignores the angles
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.9, 0.5);
+        QVERIFY(_link->lockBusy());
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->lockBusy(), 10000);
+        QVERIFY(!_link->lockActive());
+        QVERIFY(_link->lockMessage().contains("did not turn"));
+        QCOMPARE(_camera->countStartingWith("#tpUG8wGOT"), 0);
+        QCOMPARE(_camera->countEqual(top::buildSumTrack(true)), 0);
+    }
+
+    void lockWithoutGimbalAnglesSaysSo()
+    {
+        _camera->answerGac = false;
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(!_link->lockBusy() && !_link->lockActive());
+        QVERIFY(_link->lockMessage().contains("No gimbal angles"));
+        QTest::qWait(300);
+        QCOMPARE(_camera->countStartingWith("#tpUG8wGOT"), 0);
+    }
+
+    void lockSeesTheCameraFollow()
+    {
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        _camera->trackDriftDps = 5.0;  // the camera follows a moving object
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        QVERIFY(!_link->lockFollowSeen());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 3000);
+        QVERIFY(_link->lockTurnedDeg() > 0.8);
+        QVERIFY(_link->lockMessage().contains("following"));
+        _link->stopLock();
+    }
+
+    void lockSaysSoWhenTheCameraDoesNotFollow()
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);  // the camera never turns by itself
+        QVERIFY(_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockMessage().contains("has not turned"), 8000);
+        QVERIFY(!_link->lockFollowSeen());
+        QVERIFY(_link->lockActive());  // only a warning: the operator decides
+    }
+
+    void lockSaysSoWhenTheAnglesStop()
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        _camera->answerGac = false;  // no more angles: the app cannot see the camera turn
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockMessage().contains("no angles"), 8000);
+        QVERIFY(!_link->lockMessage().contains("not following"));
+    }
+
+    void movingTheCameraByHandEndsTheLock()
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        const std::string stop = top::buildSumTrack(false);
+
+        // A drag on the video.
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        _camera->clear();
+        _link->setTouchMotion(0.8, 0.0);
+        QVERIFY(!_link->lockActive());
+        QVERIFY(_link->lockMessage().contains("moved"));
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG2wGSY") >= 1, 2000);
+        // The camera hears the stop before the first speed command.
+        QVERIFY(_camera->indexOf(stop) >= 0);
+        QVERIFY(_camera->indexOf(stop) < _camera->firstStartingWith("#TPUG2wGSY"));
+        _link->stopTouchMotion();
+
+        // A gimbal button.
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        _link->pointDown();
+        QVERIFY(!_link->lockActive());
+
+        // An RC wheel.
+        _link->setWheelYawChannel(10);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        _vehicle.sendRc(_rc(10, 1900));
+        QVERIFY(!_link->lockActive());
+        _vehicle.sendRc(_rc(10, 1500));
+
+        // A tap to measure another point.
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        _link->aimAndMeasure(0.7, 0.5);
+        QVERIFY(!_link->lockActive());
+        QVERIFY(_link->aimBusy());
+    }
+
+    void turningTheLinkOffStopsTheLock()
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        _link->setEnabled(false);
+        QVERIFY(!_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildSumTrack(false)) >= 1, 1000);
+        QVERIFY(!_camera->tracking);
+    }
+
+    void aNewLockReplacesTheOldOne()
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        _camera->clear();
+        _link->lockAt(0.505, 0.5);
+        // The old lock stops first; the new GOT comes a moment later (VGCS waits 50 ms).
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 1000);
+        const std::string newGot = top::buildGotTarget(646, 360);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(newGot), 1, 1000);
+        const int stopAt = _camera->indexOf(top::buildSumTrack(false));
+        const int gotAt = _camera->indexOf(newGot);
+        QVERIFY(stopAt >= 0 && stopAt < gotAt);
+        QVERIFY(_camera->receivedAtMs.at(gotAt) - _camera->receivedAtMs.at(stopAt) >= 40);
+    }
+
+    void lockMeasuresAgainAndKeepsTheLastResultMeanwhile()
+    {
+        _camera->slrE = "01F4";
+        _camera->laserModuleDelayMs = 600;  // a slow laser makes the refresh window wide
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->laserValid() && !_link->laserBusy(), 3000);
+        QVERIFY(_link->targetValid());
+        const std::string shot = top::buildSlrTrigger('E');
+        const int shots = _camera->countEqual(shot);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(shot) > shots, 4000);
+        // The second shot is out; the first result stays up until the new one lands.
+        QVERIFY(_link->laserBusy());
+        QVERIFY(_link->laserValid());
+        QVERIFY(_link->targetValid());
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 2000);
+        QVERIFY(_link->laserValid());
+    }
+
+    void c14ProLockUsesItsHeader()
+    {
+        _link->setModel("C14 Pro");
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        top::Options options;
+        options.gClassUpperHeader = true;
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(640, 360, 1280, 720, options)), 1, 1000);
+        QVERIFY(_camera->countEqual(top::buildGotTarget(640, 360, 1280, 720, options)) == 1);
+        QCOMPARE(_camera->countStartingWith("#tpUG8wGOT"), 0);
+        // Changing the camera stops the lock, in the old camera's format.
+        _link->setModel("C13");
+        QVERIFY(!_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildSumTrack(false, options)) >= 1, 1000);
     }
 
     // --- RC wheels ---------------------------------------------------------------
@@ -676,7 +1013,23 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
         QVERIFY(_link->laserValid());
         QVERIFY(!_link->targetValid());
-        QVERIFY(_link->targetMessage().contains("GPS"));
+        // The distance stands; the text says only the lat long is missing, and why.
+        QCOMPARE(_link->laserRangeM(), 50.0);
+        QVERIFY(_link->targetMessage().startsWith("No lat long"));
+        QVERIFY(_link->targetMessage().contains("no GPS lock"));
+        QVERIFY(_link->targetMessage().contains("distance is still valid"));
+
+        _vehicle.gps.set("lock", 2);  // a 2D fix is not enough either
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(!_link->targetValid());
+        QVERIFY(_link->targetMessage().contains("2D GPS fix"));
+
+        _vehicle.gps.set("lock", 3);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(_link->targetValid());
+        QVERIFY(_link->targetMessage().isEmpty());
     }
 
     void noGimbalAnglesMeansNoTarget()
@@ -687,6 +1040,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
         QVERIFY(_link->laserValid());
         QVERIFY(!_link->targetValid());
+        QVERIFY(_link->targetMessage().startsWith("No lat long"));
         QVERIFY(_link->targetMessage().contains("gimbal"));
     }
 
@@ -699,7 +1053,8 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
         MultiVehicleManager::instance()->setActiveVehicle(&_vehicle);
         QVERIFY(!_link->targetValid());
-        QVERIFY(_link->targetMessage().contains("No drone"));
+        QVERIFY(_link->targetMessage().startsWith("No lat long"));
+        QVERIFY(_link->targetMessage().contains("no drone is connected"));
     }
 
     void videoAddressesHaveDefaultsAndSurvive()

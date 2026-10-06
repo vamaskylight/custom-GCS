@@ -95,6 +95,22 @@ constexpr int kAimResendMs = 1500;         // send the angles once more (UDP can
 constexpr int kAimTimeoutMs = 8000;
 constexpr double kPi = 3.14159265358979323846;
 
+// Object lock, as VGCS M13 does it (vgcs/skydroid/adapter.py and
+// vgcs/map/observation/track_mixin.py): turn to the object when it is 1.5
+// degrees or more from the centre, GOT where the object is in the picture
+// (the 1280 x 720 frame of TOP 3.3.5), SUM confirm 80 ms later, SUM confirm
+// again every 2 s, and SUM stop at the end. The camera follows once it has
+// turned more than 0.8 degrees by itself; VGCS warns after 6 s without that.
+constexpr double kLockTurnFirstDeg = 1.5;
+constexpr int kLockTickMs = 200;
+constexpr int kLockConfirmDelayMs = 80;
+constexpr int kLockAfterStopMs = 60;     // VGCS waits 50 ms between an old lock's stop and a new GOT
+constexpr int kLockConfirmEveryMs = 2000;
+constexpr int kLockFirstLaserMs = 400;
+constexpr int kLockLaserEveryMs = 3000;  // VGCS _M13_SLR_FRESH_INTERVAL_S
+constexpr double kLockFollowDeg = 0.8;
+constexpr int kLockFollowWarnMs = 6000;
+
 // Some C13 firmware takes zoom on these ports as well (VGCS _ZOOM_EXTRA_PORTS).
 const int kC13ZoomExtraPorts[] = {9003, 19853};
 
@@ -105,6 +121,17 @@ const int kC13ZoomExtraPorts[] = {9003, 19853};
 QStringList g_probeHosts = {QStringLiteral("192.168.144.108"), QStringLiteral("192.168.144.12"),
                             QStringLiteral("192.168.43.1")};
 QList<int> g_probePorts = {5000, 9003, 19856};
+
+/// The same frame with the upper-case "#TP" header that Skydroid's TOP
+/// documents use for every gimbal frame (the checksum covers the header).
+std::string withUpperHeader(const std::string &frame)
+{
+    if (frame.size() < 5 || frame.compare(0, 3, "#tp") != 0) {
+        return frame;
+    }
+    const std::string body = "#TP" + frame.substr(3, frame.size() - 5);
+    return body + top::checksum(body);
+}
 
 /// The value encodeSpeed2 sends, in 0.5 deg/s units.
 int speedUnits(double degPerSecond)
@@ -142,6 +169,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _detectTimer.setInterval(kDetectMs);
     _zoomOutTimer.setInterval(kZoomOutIntervalMs);
     _aimTimer.setInterval(100);
+    _lockTimer.setInterval(kLockTickMs);
 
     connect(&_pollTimer, &QTimer::timeout, this, &SkydroidLink::_poll);
     connect(&_answerTimer, &QTimer::timeout, this, &SkydroidLink::_checkAnswering);
@@ -152,6 +180,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_detectTimer, &QTimer::timeout, this, &SkydroidLink::_finishWheelDetect);
     connect(&_zoomOutTimer, &QTimer::timeout, this, &SkydroidLink::_zoomOutTick);
     connect(&_aimTimer, &QTimer::timeout, this, &SkydroidLink::_aimTick);
+    connect(&_lockTimer, &QTimer::timeout, this, &SkydroidLink::_lockTick);
 
     MultiVehicleManager *manager = MultiVehicleManager::instance();
     connect(manager, &MultiVehicleManager::activeVehicleChanged, this, &SkydroidLink::_activeVehicleChanged);
@@ -439,6 +468,10 @@ void SkydroidLink::setThermalVideoUrl(const QString &url)
 
 void SkydroidLink::_applyModel()
 {
+    // The lock's stop goes out in the old camera's format.
+    if (_lockActive || _lockBusy) {
+        _endLock(QString());
+    }
     _options = top::Options{};
     if (_model == QStringLiteral("C14 Pro")) {
         // Same choices as the VGCS c14pro_default profile.
@@ -458,6 +491,10 @@ void SkydroidLink::_applyModel()
 
 void SkydroidLink::_rebuildEndpoints()
 {
+    // The lock's stop goes to the camera that has the lock.
+    if (_lockActive || _lockBusy) {
+        _endLock(QString());
+    }
     _configured = Endpoint{QHostAddress(_host), static_cast<quint16>(_port)};
     _endpoints.clear();
     auto add = [this](const QHostAddress &address, int port) {
@@ -583,7 +620,11 @@ void SkydroidLink::_start()
 
 void SkydroidLink::_stop()
 {
-    // Never leave the gimbal turning when the link goes away.
+    // Never leave the camera following an object, or the gimbal turning, when
+    // the link goes away.
+    if (_lockActive || _lockBusy) {
+        _endLock(QString());
+    }
     if (_socket && (_moving || _stopRepeats > 0)) {
         _sendStop();
     }
@@ -630,6 +671,18 @@ void SkydroidLink::_sendTo(const Endpoint &endpoint, const std::string &frame)
         return;
     }
     _socket->writeDatagram(frame.data(), static_cast<qint64>(frame.size()), endpoint.address, endpoint.port);
+}
+
+void SkydroidLink::_sendGimbal(const std::string &frame)
+{
+    // Both forms, the documented one first: test build 3 showed the V13
+    // ignoring angle commands sent lower-case, as VGCS sends them. A camera
+    // that takes both gets the same command twice, which changes nothing.
+    const std::string upper = withUpperHeader(frame);
+    if (upper != frame) {
+        _send(upper);
+    }
+    _send(frame);
 }
 
 void SkydroidLink::_readPending()
@@ -750,6 +803,7 @@ double SkydroidLink::shapedSpeed(double deflection, double maxSpeed, double dead
 
 void SkydroidLink::ptz(const QString &action)
 {
+    _endLockByHand();
     const QString a = action.trimmed().toLower();
     const std::string frame = top::buildPtz(a.toStdString(), _options);
     // VGCS ptz_stop_burst: C13 can coast after a single stop.
@@ -764,6 +818,7 @@ void SkydroidLink::setTouchMotion(double x, double y)
     if (!_enabled || !_socket || _touchBlocked || !std::isfinite(x) || !std::isfinite(y)) {
         return;
     }
+    _endLockByHand();
     _touchX = std::clamp(x, -1.0, 1.0);
     _touchY = std::clamp(y, -1.0, 1.0);
     _touchLease.start();
@@ -787,6 +842,7 @@ void SkydroidLink::stopTouchMotion()
 
 void SkydroidLink::stopGimbal()
 {
+    stopLock();
     _touchActive = false;
     _touchX = 0.0;
     _touchY = 0.0;
@@ -905,7 +961,7 @@ void SkydroidLink::_sendStop()
     // gimbal stops whichever of these the firmware listens to.
     _send(top::buildGimbalSpeedAxis("GSY", 0.0, _options));
     _send(top::buildGimbalSpeedAxis("GSP", 0.0, _options));
-    _send(top::buildGimbalSpeed(0.0, 0.0, _options));
+    _sendGimbal(top::buildGimbalSpeed(0.0, 0.0, _options));
     _lastYawUnits = 0;
     _lastPitchUnits = 0;
     _yawZeroRepeats = 0;
@@ -914,22 +970,25 @@ void SkydroidLink::_sendStop()
 
 void SkydroidLink::center()
 {
+    _endLockByHand();
     // One axis per frame, like the speed commands (a combined frame dropped
     // yaw on a C12 in the field).
-    _send(top::buildGimbalAngleAxis("GAY", 0.0, kAngleMoveDps, _options));
-    _send(top::buildGimbalAngleAxis("GAP", 0.0, kAngleMoveDps, _options));
+    _sendGimbal(top::buildGimbalAngleAxis("GAY", 0.0, kAngleMoveDps, _options));
+    _sendGimbal(top::buildGimbalAngleAxis("GAP", 0.0, kAngleMoveDps, _options));
 }
 
 void SkydroidLink::centerYaw()
 {
-    _send(top::buildGimbalAngleAxis("GAY", 0.0, kCenterYawDps, _options));
+    _endLockByHand();
+    _sendGimbal(top::buildGimbalAngleAxis("GAY", 0.0, kCenterYawDps, _options));
 }
 
 void SkydroidLink::pointDown()
 {
+    _endLockByHand();
     // Pitch -90 is straight down: the C13 tilts from -90 to +10, and its
     // gimbal angles read negative when looking down (VGCS tries -90 first too).
-    _send(top::buildGimbalAngleAxis("GAP", -90.0, kAngleMoveDps, _options));
+    _sendGimbal(top::buildGimbalAngleAxis("GAP", -90.0, kAngleMoveDps, _options));
 }
 
 void SkydroidLink::currentFov(double &horizontalDeg, double &verticalDeg) const
@@ -957,6 +1016,8 @@ void SkydroidLink::aimAndMeasure(double u, double v)
     if (_laserBusy || _aimBusy || !std::isfinite(u) || !std::isfinite(v)) {
         return;
     }
+    // The camera turns away from a locked object, so the lock ends.
+    _endLockByHand();
     if (!_socket) {
         _laserValid = false;
         _laserMessage = tr("Camera link is off. Turn it on in the camera settings.");
@@ -973,6 +1034,16 @@ void SkydroidLink::aimAndMeasure(double u, double v)
         emit laserChanged();
         return;
     }
+    _setAimFor(u, v);
+    _aimBusy = true;
+    _startTurn();
+    _laserMessage = tr("Turning to the point...");
+    emit aimBusyChanged();
+    emit laserChanged();
+}
+
+double SkydroidLink::_setAimFor(double u, double v)
+{
     double hfov = 0.0;
     double vfov = 0.0;
     currentFov(hfov, vfov);
@@ -982,23 +1053,40 @@ void SkydroidLink::aimAndMeasure(double u, double v)
     const double yawLimit = _isZoomStepCamera() ? 120.0 : 90.0;
     const double pitchTop = (_model == QStringLiteral("C13")) ? kC13PitchMaxDeg
                           : (_isZoomStepCamera() ? 60.0 : kWheelPitchMaxDeg);
-    _aimYaw = std::clamp(_yaw + (negate ? -dyawImage : dyawImage), -yawLimit, yawLimit);
-    _aimPitch = std::clamp(_pitch - dpitchImage, -90.0, pitchTop);
-    _send(top::buildGimbalAngleAxis("GAY", _aimYaw, kAngleMoveDps, _options));
-    _send(top::buildGimbalAngleAxis("GAP", _aimPitch, kAngleMoveDps, _options));
-    _aimBusy = true;
+    _aimPointYaw = _yaw + (negate ? -dyawImage : dyawImage);
+    _aimPointPitch = _pitch - dpitchImage;
+    _aimYaw = std::clamp(_aimPointYaw, -yawLimit, yawLimit);
+    _aimPitch = std::clamp(_aimPointPitch, -90.0, pitchTop);
+    return std::max(std::abs(dyawImage), std::abs(dpitchImage));
+}
+
+void SkydroidLink::_startTurn()
+{
+    _sendGimbal(top::buildGimbalAngleAxis("GAY", _aimYaw, kAngleMoveDps, _options));
+    _sendGimbal(top::buildGimbalAngleAxis("GAP", _aimPitch, kAngleMoveDps, _options));
     _aimResent = false;
     _aimElapsed.start();
     _aimSettled.invalidate();
     _aimTimer.start();
-    _laserMessage = tr("Turning to the point...");
-    emit aimBusyChanged();
-    emit laserChanged();
+}
+
+void SkydroidLink::_aimPointInPicture(double &u, double &v) const
+{
+    // The aim maths backwards: the angle still to go, as a place in the picture.
+    double hfov = 0.0;
+    double vfov = 0.0;
+    currentFov(hfov, vfov);
+    const bool negate = kNegateImageYaw != _reverseTapYaw;
+    const double yawToGo = _aimPointYaw - _yaw;
+    const double dyawImage = negate ? -yawToGo : yawToGo;
+    const double dpitchImage = _pitch - _aimPointPitch;
+    u = std::clamp(0.5 + dyawImage / hfov, 0.0, 1.0);
+    v = std::clamp(0.5 + dpitchImage / vfov, 0.0, 1.0);
 }
 
 void SkydroidLink::_aimTick()
 {
-    if (!_aimBusy) {
+    if (!_aimBusy && !_lockBusy) {
         _aimTimer.stop();
         return;
     }
@@ -1008,9 +1096,18 @@ void SkydroidLink::_aimTick()
         if (!_aimSettled.isValid()) {
             _aimSettled.start();
         } else if (_aimSettled.elapsed() >= kAimSettleMs) {
+            _aimTimer.stop();
+            if (_lockBusy) {
+                // Stopped on the object, or at a gimbal limit short of it: lock
+                // where the object is in the picture now.
+                double u = 0.5;
+                double v = 0.5;
+                _aimPointInPicture(u, v);
+                _armLock(u, v);
+                return;
+            }
             // On the point: measure it, with the pose of this moment.
             _aimBusy = false;
-            _aimTimer.stop();
             emit aimBusyChanged();
             fireLaser();
             return;
@@ -1020,19 +1117,178 @@ void SkydroidLink::_aimTick()
     _aimSettled.invalidate();
     if (!_aimResent && _aimElapsed.elapsed() >= kAimResendMs) {
         _aimResent = true;
-        _send(top::buildGimbalAngleAxis("GAY", _aimYaw, kAngleMoveDps, _options));
-        _send(top::buildGimbalAngleAxis("GAP", _aimPitch, kAngleMoveDps, _options));
+        _sendGimbal(top::buildGimbalAngleAxis("GAY", _aimYaw, kAngleMoveDps, _options));
+        _sendGimbal(top::buildGimbalAngleAxis("GAP", _aimPitch, kAngleMoveDps, _options));
     }
     if (_aimElapsed.elapsed() >= kAimTimeoutMs) {
+        _aimTimer.stop();
+        if (_lockBusy) {
+            // Never lock on whatever the camera happens to look at.
+            _lockBusy = false;
+            _setLockMessage(tr("The camera did not turn to the object, so it was not locked. Try again."));
+            return;
+        }
         // Never measure a point the camera is not looking at.
         _aimBusy = false;
-        _aimTimer.stop();
         _laserValid = false;
         _laserMessage = tr("The camera did not turn to the point, so nothing was measured. "
                            "Try again, or put the cross on it and press the laser button.");
         emit aimBusyChanged();
         emit laserChanged();
     }
+}
+
+// --- Object lock ---------------------------------------------------------------
+
+void SkydroidLink::lockAt(double u, double v)
+{
+    if (_aimBusy || _lockBusy || !std::isfinite(u) || !std::isfinite(v)) {
+        return;
+    }
+    const bool wasLocked = _lockActive;
+    if (_lockActive) {
+        _endLock(QString());  // a new object replaces the old one
+    }
+    if (!_socket) {
+        _setLockMessage(tr("Camera link is off. Turn it on in the camera settings."));
+        return;
+    }
+    if (!_attitudeValid) {
+        _setLockMessage(tr("No gimbal angles from the camera, so it cannot turn to the object."));
+        return;
+    }
+    // A new object: the last measurement no longer applies.
+    _laserValid = false;
+    _laserMessage.clear();
+    emit laserChanged();
+    _target = skydroid::geo::LaserResult{};
+    _targetMessage.clear();
+    emit targetChanged();
+
+    _lockBusy = true;
+    if (_setAimFor(u, v) >= kLockTurnFirstDeg) {
+        _startTurn();
+        _setLockMessage(tr("Turning to the object..."));
+        return;
+    }
+    // Near the centre already: lock where it was picked, without turning.
+    if (!wasLocked) {
+        _armLock(u, v);
+        return;
+    }
+    _setLockMessage(tr("Locking..."));
+    QTimer::singleShot(kLockAfterStopMs, this, [this, u, v]() {
+        if (_lockBusy && !_aimTimer.isActive()) {
+            _armLock(u, v);
+        }
+    });
+}
+
+void SkydroidLink::_armLock(double u, double v)
+{
+    const int x = static_cast<int>(std::lround(std::clamp(u, 0.0, 1.0) * top::kLrfFrameW));
+    const int y = static_cast<int>(std::lround(std::clamp(v, 0.0, 1.0) * top::kLrfFrameH));
+    _sendGimbal(top::buildGotTarget(x, y, top::kLrfFrameW, top::kLrfFrameH, _options));
+    QTimer::singleShot(kLockConfirmDelayMs, this, &SkydroidLink::_sendLockConfirm);
+    _lockBusy = false;
+    _lockActive = true;
+    _lockFollowSeen = false;
+    _lockWarned = false;
+    _lockTurnedDeg = 0.0;
+    _lockStartYaw = _yaw;
+    _lockStartPitch = _pitch;
+    _lockElapsed.start();
+    _lockNextConfirmMs = kLockConfirmEveryMs;
+    _lockNextLaserMs = kLockFirstLaserMs;
+    _lockTimer.start();
+    _setLockMessage(tr("Locked. The camera should now follow the object."));
+}
+
+void SkydroidLink::_sendLockConfirm()
+{
+    if (_lockActive) {
+        _send(top::buildSumTrack(true, _options));
+    }
+}
+
+void SkydroidLink::_lockTick()
+{
+    if (!_lockActive || !_socket) {
+        _lockTimer.stop();
+        return;
+    }
+    const qint64 now = _lockElapsed.elapsed();
+    if (now >= _lockNextConfirmMs) {
+        // VGCS sends the confirm again every 2 s to keep the camera following.
+        _send(top::buildSumTrack(true, _options));
+        _lockNextConfirmMs = now + kLockConfirmEveryMs;
+    }
+    bool changed = false;
+    if (_attitudeFresh()) {
+        const double turned = std::max(std::abs(_yaw - _lockStartYaw), std::abs(_pitch - _lockStartPitch));
+        if (std::abs(turned - _lockTurnedDeg) >= 0.1) {
+            _lockTurnedDeg = turned;
+            changed = true;
+        }
+        if (!_lockFollowSeen && turned > kLockFollowDeg) {
+            _lockFollowSeen = true;
+            _lockMessage = tr("Locked. The camera is following the object.");
+            changed = true;
+        }
+    }
+    if (!_lockFollowSeen && !_lockWarned && now >= kLockFollowWarnMs) {
+        _lockWarned = true;
+        // Without angles the app cannot see the camera turn: say that, not "not following".
+        _lockMessage = _attitudeValid
+            ? tr("Locked, but the camera has not turned by itself yet. "
+                 "If the object moved, the camera is not following it.")
+            : tr("Locked, but the camera sends no angles, so the app cannot tell if it follows.");
+        changed = true;
+    }
+    if (changed) {
+        emit lockChanged();
+    }
+    if (now >= _lockNextLaserMs) {
+        _lockNextLaserMs = now + kLockLaserEveryMs;
+        // While the camera follows, the object stays under the cross.
+        _fireLaser(true);
+    }
+}
+
+void SkydroidLink::stopLock()
+{
+    if (_lockActive || _lockBusy) {
+        _endLock(tr("Lock stopped."));
+    }
+}
+
+void SkydroidLink::_endLock(const QString &message)
+{
+    if (_lockBusy) {
+        _lockBusy = false;
+        _aimTimer.stop();
+    }
+    if (_lockActive) {
+        _lockActive = false;
+        _lockTimer.stop();
+        // Twice, as UDP can drop one: a camera that kept following would fight the operator.
+        _send(top::buildSumTrack(false, _options));
+        _send(top::buildSumTrack(false, _options));
+    }
+    _setLockMessage(message);
+}
+
+void SkydroidLink::_endLockByHand()
+{
+    if (_lockActive || _lockBusy) {
+        _endLock(tr("Lock stopped, because the camera was moved."));
+    }
+}
+
+void SkydroidLink::_setLockMessage(const QString &message)
+{
+    _lockMessage = message;
+    emit lockChanged();
 }
 
 // --- RC wheels -----------------------------------------------------------------
@@ -1122,6 +1378,7 @@ void SkydroidLink::_rcChannelsReceived(QVector<int> values)
     const bool wheelTurned = speedUnits(shapedSpeed(_wheelDeflection(_wheelYawChannel), _maxSpeed, kWheelDeadZone)) != 0 ||
                              speedUnits(shapedSpeed(_wheelDeflection(_wheelPitchChannel), _maxSpeed, kWheelDeadZone)) != 0;
     if (wheelTurned) {
+        _endLockByHand();
         _startMotionTimer();
     }
 }
@@ -1162,6 +1419,7 @@ void SkydroidLink::_updateWheelAngles()
     if (!changed) {
         return;
     }
+    _endLockByHand();
     if (!_wheelSentAt.isValid() || _wheelSentAt.elapsed() >= kWheelAngleIntervalMs) {
         _sendWheelAngles();
     } else if (!_wheelAngleTimer.isActive()) {
@@ -1182,7 +1440,7 @@ void SkydroidLink::_sendWheelAngles()
         if (_wheelSent[a] && std::abs(*_wheelSent[a] - *_wheelTarget[a]) < kWheelAngleStepDeg) {
             continue;
         }
-        _send(top::buildGimbalAngleAxis(tags[a], *_wheelTarget[a], kWheelApproachDps, _options));
+        _sendGimbal(top::buildGimbalAngleAxis(tags[a], *_wheelTarget[a], kWheelApproachDps, _options));
         _wheelSent[a] = _wheelTarget[a];
     }
     _wheelSentAt.start();
@@ -1352,7 +1610,12 @@ QString SkydroidLink::zoomLabel() const
 
 void SkydroidLink::fireLaser()
 {
-    if (_laserBusy || _aimBusy) {  // a tap aim fires the laser itself when it arrives
+    _fireLaser(false);
+}
+
+void SkydroidLink::_fireLaser(bool keepLastResult)
+{
+    if (_laserBusy || _aimBusy || _lockBusy) {  // a tap aim or a lock fires the laser itself when it arrives
         return;
     }
     if (!_socket) {
@@ -1371,10 +1634,12 @@ void SkydroidLink::fireLaser()
     _shotGimbalValid = _attitudeValid;
     _shotPose.gimbalYawDeg = _yaw;
     _shotPose.gimbalPitchDeg = _pitch;
-    _target = skydroid::geo::LaserResult{};
-    _targetMessage.clear();
-    emit targetChanged();
-    _laserMessage = tr("Measuring...");
+    if (!keepLastResult) {
+        _target = skydroid::geo::LaserResult{};
+        _targetMessage.clear();
+        emit targetChanged();
+        _laserMessage = tr("Measuring...");
+    }
     emit laserBusyChanged();
     emit laserChanged();
 
@@ -1425,21 +1690,25 @@ void SkydroidLink::_laserFinish()
 
 bool SkydroidLink::_sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &why) const
 {
+    // The operator sees these under a distance that was measured fine (often
+    // indoors, with no GPS), so each one says that only the lat long is missing.
     Vehicle *vehicle = MultiVehicleManager::instance()->activeVehicle();
     if (!vehicle) {
-        why = tr("No drone connected, so no target position.");
+        why = tr("No lat long: no drone is connected. The distance is still valid.");
         return false;
     }
     const QGeoCoordinate position = vehicle->coordinate();
     if (!position.isValid()) {
-        why = tr("The drone has no position yet, so no target position.");
+        why = tr("No lat long: the drone has no GPS lock yet. The distance is still valid.");
         return false;
     }
     FactGroup *gps = vehicle->gpsFactGroup();
     const int lock = (gps && gps->factExists(QStringLiteral("lock")))
         ? gps->getFact(QStringLiteral("lock"))->rawValue().toInt() : 0;
     if (lock < 3) {
-        why = tr("The drone has no 3D GPS fix, so no target position.");
+        // QGC's lock value: 2 is a 2D fix, 3 and up are 3D.
+        why = (lock == 2) ? tr("No lat long: the drone has only a 2D GPS fix (it needs 3D). The distance is still valid.")
+                          : tr("No lat long: the drone has no GPS lock yet. The distance is still valid.");
         return false;
     }
     FactGroup *v = vehicle->vehicleFactGroup();
@@ -1456,7 +1725,7 @@ bool SkydroidLink::_sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &
     const double roll = value("roll");
     const double pitch = value("pitch");
     if (!std::isfinite(heading) || !std::isfinite(roll) || !std::isfinite(pitch)) {
-        why = tr("The drone attitude is not known yet, so no target position.");
+        why = tr("No lat long: the drone's heading is not known yet. The distance is still valid.");
         return false;
     }
     pose.vehicleLatDeg = position.latitude();
@@ -1474,10 +1743,10 @@ void SkydroidLink::_computeTarget()
 {
     _target = skydroid::geo::LaserResult{};
     if (!_laserValid) {
-        _targetMessage = tr("No laser range, so no target position.");
+        _targetMessage = tr("No laser range, so no lat long.");
     } else if (!_shotGimbalValid) {
         // Never place a target on assumed gimbal angles.
-        _targetMessage = tr("No gimbal angles from the camera, so no target position.");
+        _targetMessage = tr("No lat long: the camera sends no gimbal angles. The distance is still valid.");
     } else if (!_shotPoseValid) {
         _targetMessage = _shotPoseWhy;
     } else {

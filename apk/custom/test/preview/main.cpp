@@ -11,7 +11,15 @@
 //   5_settings_wheel.png  the same window scrolled to the RC wheel part
 //   6_camera_off.png      the camera link turned off
 //   7_ir_on.png           after the IR button: thermal stream, button lit
-// It also taps the IR button twice and checks QGC's video address each time.
+//   9_tap_aiming.png, 10_tap_result.png   a tap on an object: turn, then measure
+//   11_lock_pick.png      after the lock button: the hint to pick the object
+//   12_lock_drawing.png   a box being drawn around the object
+//   13_locked.png         locked: box on the centre mark, lock state under the laser result
+//   14_lock_following.png the camera follows (the fake camera turns by itself)
+//   15_lock_stopped.png   after the lock button again
+//   16_no_gps_lock.png    a laser shot while the drone has no GPS lock: distance, and why no lat long
+// It also taps the IR button twice and checks QGC's video address each time,
+// and checks the frames the camera got for the tap and the lock.
 // Every QML warning or error is printed; the exit code is 1 when there was one.
 
 #include <QtCore/QDir>
@@ -134,7 +142,8 @@ private:
     FakeVideoManager _videoManager;
 };
 
-/// Answers angle questions and laser reads like a C13.
+/// Answers angle questions and laser reads like the client's V13 (C13). Like it,
+/// it ignores long gimbal frames that start with a lower-case "#tp" (test build 3).
 class FakeCamera : public QObject
 {
     Q_OBJECT
@@ -144,25 +153,50 @@ public:
     {
         _socket.bind(QHostAddress::LocalHost, 0);
         connect(&_socket, &QUdpSocket::readyRead, this, &FakeCamera::_read);
+        connect(&_follow, &QTimer::timeout, this, [this]() { yaw += 0.3; });
     }
     quint16 port() const { return _socket.localPort(); }
 
     double yaw = -12.4;
     double pitch = -31.5;
     int angleCommands = 0;  // GAY and GAP frames received (tap aiming)
+    int gotFrames = 0;      // lock: GOT
+    int sumConfirms = 0;    // lock: SUM 01
+    int sumStops = 0;       // lock: SUM 00
 
 private slots:
     void _read()
     {
         while (_socket.hasPendingDatagrams()) {
             const QNetworkDatagram d = _socket.receiveDatagram();
-            const auto f = top::parseTpFrame(std::string(d.data().constData(), static_cast<size_t>(d.data().size())));
+            const std::string raw(d.data().constData(), static_cast<size_t>(d.data().size()));
+            if (raw.rfind("#tp", 0) == 0) {
+                continue;
+            }
+            const auto f = top::parseTpFrame(raw);
             // The gimbal turns to angle commands at once.
             if (f && (f->tag == "GAY" || f->tag == "GAP") && f->ctrl == 'w' && f->data.size() >= 4) {
                 if (const auto angle = top::decodeAttitudeField4(f->data.substr(0, 4))) {
                     (f->tag == "GAY" ? yaw : pitch) = *angle;
                 }
                 ++angleCommands;
+                continue;
+            }
+            if (f && f->tag == "GOT" && f->ctrl == 'w') {
+                ++gotFrames;
+                continue;
+            }
+            // After a SUM confirm the camera follows an object that moves slowly (3 deg/s).
+            if (f && f->tag == "SUM" && f->ctrl == 'w') {
+                if (f->data == "01") {
+                    ++sumConfirms;
+                    if (!_follow.isActive()) {
+                        _follow.start(100);
+                    }
+                } else {
+                    ++sumStops;
+                    _follow.stop();
+                }
                 continue;
             }
             if (!f || f->ctrl != 'r') {
@@ -186,6 +220,7 @@ private slots:
 
 private:
     QUdpSocket _socket;
+    QTimer _follow;
 };
 
 int main(int argc, char *argv[])
@@ -263,15 +298,16 @@ int main(int argc, char *argv[])
         }
     };
 
+    int anglesBeforeLock = 0;
+
     // The steps, one after another (delay in ms before each).
     const QList<std::pair<int, std::function<void()>>> steps = {
         {1500, [&]() {
              link.zoom(1);
              link.zoom(1);
              link.zoom(1);
-             // Tap the photo button (left column, top) to run its click handler.
-             mouse(QEvent::MouseButtonPress, QPointF(244, 336));
-             mouse(QEvent::MouseButtonRelease, QPointF(244, 336));
+             // Tap the photo button to run its click handler.
+             tap("vamaPhotoButton");
          }},
         {500, [&]() { shot("1_main.png"); link.fireLaser(); }},
         {1500, [&]() { shot("2_laser.png"); mouse(QEvent::MouseButtonPress, QPointF(1000, 560)); }},
@@ -304,6 +340,54 @@ int main(int argc, char *argv[])
              expect(link.laserValid() && link.targetValid(), "tap: the laser measured the point after the turn",
                     QStringLiteral("%1 m").arg(link.laserRangeM()));
              shot("10_tap_result.png");
+             // Almost level, as in the field video of test build 4: the result then
+             // carries the "less accurate" note, the tallest the box gets.
+             camera.pitch = 3.0;
+             tap("vamaLockButton");
+         }},
+        {400, [&]() {
+             shot("11_lock_pick.png");
+             anglesBeforeLock = camera.angleCommands;
+             // Draw a box around the light building, left of the centre.
+             mouse(QEvent::MouseButtonPress, QPointF(700, 380));
+         }},
+        {100, [&]() { mouse(QEvent::MouseMove, QPointF(760, 430)); }},
+        {100, [&]() { mouse(QEvent::MouseMove, QPointF(860, 520)); }},
+        {300, [&]() {
+             shot("12_lock_drawing.png");
+             expect(camera.angleCommands == anglesBeforeLock, "lock: drawing the box does not move the camera",
+                    QString::number(camera.angleCommands));
+             mouse(QEvent::MouseButtonRelease, QPointF(860, 520));
+         }},
+        {1800, [&]() {
+             expect(link.lockActive(), "lock: locked after the turn", link.lockMessage());
+             expect(camera.angleCommands >= anglesBeforeLock + 2, "lock: the camera turned to the box first (GAY and GAP)",
+                    QString::number(camera.angleCommands));
+             expect(camera.gotFrames == 1 && camera.sumConfirms >= 1, "lock: GOT, then SUM confirm",
+                    QStringLiteral("GOT %1, SUM 01 %2").arg(camera.gotFrames).arg(camera.sumConfirms));
+             shot("13_locked.png");
+         }},
+        {2500, [&]() {
+             expect(link.lockFollowSeen(), "lock: the camera is seen following",
+                    QStringLiteral("%1 deg").arg(link.lockTurnedDeg()));
+             expect(link.laserValid(), "lock: the laser measured the locked object",
+                    QStringLiteral("%1 m").arg(link.laserRangeM()));
+             shot("14_lock_following.png");
+             tap("vamaLockButton");
+         }},
+        {400, [&]() {
+             expect(!link.lockActive() && camera.sumStops >= 1, "lock: stopped with SUM stop",
+                    QStringLiteral("SUM 00 %1").arg(camera.sumStops));
+             shot("15_lock_stopped.png");
+             // Indoors: the drone has no GPS lock. The laser still measures.
+             vehicle.gps.set("lock", 0);
+             link.fireLaser();
+         }},
+        {1500, [&]() {
+             expect(link.laserValid() && !link.targetValid() && link.targetMessage().startsWith(QStringLiteral("No lat long")),
+                    "no GPS lock: distance shown, and the text says only the lat long is missing", link.targetMessage());
+             shot("16_no_gps_lock.png");
+             vehicle.gps.set("lock", 3);
          }},
         {300, [&]() {
              QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaCameraSettings"));
