@@ -12,6 +12,8 @@
 #include "MultiVehicleManager.h"
 #include "Vehicle.h"
 
+#include <algorithm>
+#include <climits>
 #include <cmath>
 #include <vector>
 
@@ -23,18 +25,84 @@ constexpr const char *kSettingsGroup = "VamaSkydroid";
 constexpr const char *kDefaultHost = "192.168.144.108";
 constexpr int kDefaultPort = 5000;
 constexpr const char *kDefaultModel = "C13";
+constexpr int kDefaultMaxSpeed = 20;     // deg/s at full deflection
+constexpr int kMinMaxSpeed = 5;
+constexpr int kMaxMaxSpeed = 60;         // GSY/GSP carry at most 63.5 deg/s
 
 constexpr int kPollIntervalMs = 200;     // gimbal angle query, 5 per second
+constexpr int kGaaHz = 5;                // VGCS turns the angle push on at 5 Hz
+constexpr int kGaaEveryPollsWhenQuiet = 5;  // GAA again every second while no angles arrive
+constexpr int kGaaEveryPolls = 50;          // and every 10 s anyway, in case the camera restarted
+constexpr int kProbeFirstPoll = 8;          // other addresses 1.6 s after start,
+constexpr int kProbeEveryPolls = 15;        // then every 3 s while no angles arrive
 constexpr int kZoomPollEvery = 10;       // C14 Pro zoom step query every 2 s
 constexpr int kAnswerCheckMs = 1000;
 constexpr int kAnswerTimeoutMs = 3000;   // no reply this long = camera not answering
+constexpr int kAttitudeFreshMs = 1500;   // older angles: send GAA again and try other addresses
 constexpr int kLaserShotSettleMs = 120;  // VGCS _LRF_SLR_SHOT_SETTLE_S
 constexpr int kLaserWaitMs = 1000;
-constexpr int kZoomQueryAfterCmdMs = 350; // VGCS _DZM_POLL_AFTER_CMD_S
+constexpr int kZoomQueryAfterCmdMs = 350;  // VGCS _DZM_POLL_AFTER_CMD_S
 constexpr double kC14ProLaserMaxM = 1500.0;
+// VGCS counts each C12/C13 zoom step as 0.1x (ZOOM_STEP_SKYDROID; the C13
+// has 30x digital zoom). Not measured on the camera yet: the camera's own
+// zoom report (zoomReport) is shown in the settings to check it.
+constexpr double kZoomPerStep = 0.1;
+constexpr int kZoomHomeExtraSteps = 5;   // "1x" steps out this many more than counted
+constexpr int kZoomOutIntervalMs = 60;
+
+constexpr int kMotionIntervalMs = 100;   // speed refresh, 10 per second (VGCS: 80 ms)
+constexpr int kTouchLeaseMs = 450;       // no setTouchMotion this long = the finger is gone
+constexpr int kTouchMaxMs = 20000;       // one touch never turns the gimbal longer than this
+constexpr double kTouchDeadZone = 0.05;
+constexpr double kWheelDeadZone = 0.08;
+constexpr int kRcCentre = 1500;
+constexpr int kRcHalfRange = 400;        // full speed at 1100 or 1900 us
+constexpr int kRcFreshMs = 1000;         // older RC values are ignored (RC link lost)
+constexpr int kRcMin = 800;              // outside 800..2200 us is not a real channel value
+constexpr int kRcMax = 2200;
+constexpr int kWheelMoveUs = 25;         // a hold-position wheel must move this much before it drives the gimbal
+constexpr double kWheelAngleStepDeg = 0.5;
+constexpr int kWheelAngleIntervalMs = 150;
+constexpr double kWheelApproachDps = 30.0;
+constexpr double kWheelPitchMinDeg = -90.0;  // wheel at 1000 us
+constexpr double kWheelPitchMaxDeg = 30.0;   // wheel at 2000 us (C13: +10, its limit)
+constexpr double kC13PitchMaxDeg = 10.0;
+constexpr double kWheelYawRangeDeg = 90.0;   // wheel at 1000 or 2000 us = -90 or +90 deg
+constexpr int kDetectMs = 5000;
+constexpr int kDetectMinSpanUs = 150;
+constexpr int kMaxRcChannel = 18;
+constexpr double kCenterYawDps = 30.0;
 
 // Some C13 firmware takes zoom on these ports as well (VGCS _ZOOM_EXTRA_PORTS).
 const int kC13ZoomExtraPorts[] = {9003, 19853};
+
+// What VGCS tries when the camera is quiet (vgcs/skydroid/adapter.py
+// _C13_PROBE_PORTS, vgcs/skydroid/targets.py): the camera itself, the RC
+// relay, and the RC hotspot gateway for a tablet on the RC's Wi-Fi.
+// The first host and port are the camera's own address (used for the laser).
+QStringList g_probeHosts = {QStringLiteral("192.168.144.108"), QStringLiteral("192.168.144.12"),
+                            QStringLiteral("192.168.43.1")};
+QList<int> g_probePorts = {5000, 9003, 19856};
+
+/// The value encodeSpeed2 sends, in 0.5 deg/s units.
+int speedUnits(double degPerSecond)
+{
+    return static_cast<int>(std::clamp<long long>(top::pyRound(degPerSecond / 0.5), -127, 127));
+}
+
+/// C14 Pro zoom for a reported DZM step, as VGCS labels it ("W2.9x", "T5.3x").
+/// From vgcs/skydroid/command_map.py c14pro_default: short lens steps 0..85
+/// (61.4 deg wide), long lens 86..184 (14.7 deg wide); each step crops 36 px
+/// of a 3840 px readout, restarting at the lens change (Skydroid, 2026-09-19).
+QString c14ProZoomLabel(int step)
+{
+    constexpr double kPi = 3.14159265358979323846;
+    const bool longLens = step >= 86;
+    const int m = longLens ? std::clamp(step - 86, 0, 98) : std::clamp(step, 0, 85);
+    const double crop = 3840.0 / std::max(1, 3840 - 36 * m);
+    const double lensFactor = longLens ? std::tan(61.4 * kPi / 360.0) / std::tan(14.7 * kPi / 360.0) : 1.0;
+    return QStringLiteral("%1%2x").arg(longLens ? QStringLiteral("T") : QStringLiteral("W")).arg(crop * lensFactor, 0, 'f', 1);
+}
 
 } // namespace
 
@@ -47,14 +115,28 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _laserShotTimer.setInterval(kLaserShotSettleMs);
     _laserTimeoutTimer.setSingleShot(true);
     _laserTimeoutTimer.setInterval(kLaserWaitMs);
+    _motionTimer.setInterval(kMotionIntervalMs);
+    _wheelAngleTimer.setSingleShot(true);
+    _detectTimer.setSingleShot(true);
+    _detectTimer.setInterval(kDetectMs);
+    _zoomOutTimer.setInterval(kZoomOutIntervalMs);
 
     connect(&_pollTimer, &QTimer::timeout, this, &SkydroidLink::_poll);
     connect(&_answerTimer, &QTimer::timeout, this, &SkydroidLink::_checkAnswering);
     connect(&_laserShotTimer, &QTimer::timeout, this, &SkydroidLink::_laserReadAfterShot);
     connect(&_laserTimeoutTimer, &QTimer::timeout, this, &SkydroidLink::_laserFinish);
+    connect(&_motionTimer, &QTimer::timeout, this, &SkydroidLink::_motionTick);
+    connect(&_wheelAngleTimer, &QTimer::timeout, this, &SkydroidLink::_sendWheelAngles);
+    connect(&_detectTimer, &QTimer::timeout, this, &SkydroidLink::_finishWheelDetect);
+    connect(&_zoomOutTimer, &QTimer::timeout, this, &SkydroidLink::_zoomOutTick);
+
+    MultiVehicleManager *manager = MultiVehicleManager::instance();
+    connect(manager, &MultiVehicleManager::activeVehicleChanged, this, &SkydroidLink::_activeVehicleChanged);
+    _activeVehicleChanged(manager->activeVehicle());
 
     _loadSettings();
     _applyModel();
+    _rebuildEndpoints();
     if (_enabled) {
         _start();
     }
@@ -85,6 +167,26 @@ QStringList SkydroidLink::models()
     return {QStringLiteral("C12"), QStringLiteral("C13"), QStringLiteral("C14 Pro")};
 }
 
+QStringList SkydroidLink::modelNames()
+{
+    // VAMA sells these Skydroid cameras under its own names (client, 2026-10-06).
+    // Only the screen uses them: the code, the saved settings and VGCS keep
+    // Skydroid's names, which the protocol notes are written against.
+    return {QStringLiteral("V12"), QStringLiteral("V13"), QStringLiteral("V14 Pro")};
+}
+
+QString SkydroidLink::modelName() const
+{
+    const qsizetype i = models().indexOf(_model);
+    return i >= 0 ? modelNames().at(i) : _model;
+}
+
+void SkydroidLink::setProbeTargets(const QStringList &hosts, const QList<int> &ports)
+{
+    g_probeHosts = hosts;
+    g_probePorts = ports;
+}
+
 // --- Settings --------------------------------------------------------------
 
 void SkydroidLink::_loadSettings()
@@ -95,6 +197,13 @@ void SkydroidLink::_loadSettings()
     _host = settings.value(QStringLiteral("host"), QString::fromLatin1(kDefaultHost)).toString().trimmed();
     _port = settings.value(QStringLiteral("port"), kDefaultPort).toInt();
     _model = settings.value(QStringLiteral("model"), QString::fromLatin1(kDefaultModel)).toString();
+    _maxSpeed = settings.value(QStringLiteral("maxSpeed"), kDefaultMaxSpeed).toInt();
+    _reverseYaw = settings.value(QStringLiteral("reverseYaw"), false).toBool();
+    _reversePitch = settings.value(QStringLiteral("reversePitch"), false).toBool();
+    _wheelPitchChannel = settings.value(QStringLiteral("wheelPitchChannel"), 0).toInt();
+    _wheelYawChannel = settings.value(QStringLiteral("wheelYawChannel"), 0).toInt();
+    _wheelHoldsPosition = settings.value(QStringLiteral("wheelHoldsPosition"), false).toBool();
+    _wheelReverse = settings.value(QStringLiteral("wheelReverse"), false).toBool();
     settings.endGroup();
     if (!models().contains(_model)) {
         _model = QString::fromLatin1(kDefaultModel);
@@ -102,6 +211,9 @@ void SkydroidLink::_loadSettings()
     if (_port <= 0 || _port > 65535) {
         _port = kDefaultPort;
     }
+    _maxSpeed = std::clamp(_maxSpeed, kMinMaxSpeed, kMaxMaxSpeed);
+    _wheelPitchChannel = std::clamp(_wheelPitchChannel, 0, kMaxRcChannel);
+    _wheelYawChannel = std::clamp(_wheelYawChannel, 0, kMaxRcChannel);
 }
 
 void SkydroidLink::_saveSettings() const
@@ -112,6 +224,13 @@ void SkydroidLink::_saveSettings() const
     settings.setValue(QStringLiteral("host"), _host);
     settings.setValue(QStringLiteral("port"), _port);
     settings.setValue(QStringLiteral("model"), _model);
+    settings.setValue(QStringLiteral("maxSpeed"), _maxSpeed);
+    settings.setValue(QStringLiteral("reverseYaw"), _reverseYaw);
+    settings.setValue(QStringLiteral("reversePitch"), _reversePitch);
+    settings.setValue(QStringLiteral("wheelPitchChannel"), _wheelPitchChannel);
+    settings.setValue(QStringLiteral("wheelYawChannel"), _wheelYawChannel);
+    settings.setValue(QStringLiteral("wheelHoldsPosition"), _wheelHoldsPosition);
+    settings.setValue(QStringLiteral("wheelReverse"), _wheelReverse);
     settings.endGroup();
 }
 
@@ -137,7 +256,7 @@ void SkydroidLink::setHost(const QString &host)
         return;
     }
     _host = h;
-    _address = QHostAddress(_host);
+    _rebuildEndpoints();
     _saveSettings();
     emit settingsChanged();
 }
@@ -148,6 +267,7 @@ void SkydroidLink::setPort(int port)
         return;
     }
     _port = port;
+    _rebuildEndpoints();
     _saveSettings();
     emit settingsChanged();
 }
@@ -163,6 +283,93 @@ void SkydroidLink::setModel(const QString &model)
     emit settingsChanged();
 }
 
+void SkydroidLink::setMaxSpeed(int degPerSecond)
+{
+    const int speed = std::clamp(degPerSecond, kMinMaxSpeed, kMaxMaxSpeed);
+    if (speed == _maxSpeed) {
+        return;
+    }
+    _maxSpeed = speed;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setReverseYaw(bool reverse)
+{
+    if (reverse == _reverseYaw) {
+        return;
+    }
+    _reverseYaw = reverse;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setReversePitch(bool reverse)
+{
+    if (reverse == _reversePitch) {
+        return;
+    }
+    _reversePitch = reverse;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setWheelPitchChannel(int channel)
+{
+    const int c = std::clamp(channel, 0, kMaxRcChannel);
+    if (c == _wheelPitchChannel) {
+        return;
+    }
+    _wheelPitchChannel = c;
+    _wheelStart[PitchAxis].reset();
+    _wheelMoved[PitchAxis] = false;
+    _wheelTarget[PitchAxis].reset();
+    _wheelSent[PitchAxis].reset();
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setWheelYawChannel(int channel)
+{
+    const int c = std::clamp(channel, 0, kMaxRcChannel);
+    if (c == _wheelYawChannel) {
+        return;
+    }
+    _wheelYawChannel = c;
+    _wheelStart[YawAxis].reset();
+    _wheelMoved[YawAxis] = false;
+    _wheelTarget[YawAxis].reset();
+    _wheelSent[YawAxis].reset();
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setWheelHoldsPosition(bool holds)
+{
+    if (holds == _wheelHoldsPosition) {
+        return;
+    }
+    _wheelHoldsPosition = holds;
+    for (int a = 0; a < 2; ++a) {
+        _wheelStart[a].reset();
+        _wheelMoved[a] = false;
+        _wheelTarget[a].reset();
+        _wheelSent[a].reset();
+    }
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setWheelReverse(bool reverse)
+{
+    if (reverse == _wheelReverse) {
+        return;
+    }
+    _wheelReverse = reverse;
+    _saveSettings();
+    emit settingsChanged();
+}
+
 void SkydroidLink::_applyModel()
 {
     _options = top::Options{};
@@ -171,10 +378,119 @@ void SkydroidLink::_applyModel()
         _options.gClassUpperHeader = true;
         _options.slrMaxDm = top::slrMaxDmForRange(kC14ProLaserMaxM);
     }
-    if (_zoomStep != -1) {
+    // Another camera: nothing known about its zoom yet.
+    if (_zoomStep != -1 || _zoomCount != 0 || !_zoomReport.isEmpty()) {
         _zoomStep = -1;
+        _zoomCount = 0;
+        _zoomReport.clear();
         emit zoomChanged();
     }
+}
+
+// --- Addresses -------------------------------------------------------------
+
+void SkydroidLink::_rebuildEndpoints()
+{
+    _configured = Endpoint{QHostAddress(_host), static_cast<quint16>(_port)};
+    _endpoints.clear();
+    auto add = [this](const QHostAddress &address, int port) {
+        if (address.isNull() || port <= 0 || port > 65535) {
+            return;
+        }
+        const Endpoint endpoint{address, static_cast<quint16>(port)};
+        if (!_endpoints.contains(endpoint)) {
+            _endpoints.append(endpoint);
+        }
+    };
+    QStringList hosts{_host};
+    for (const QString &h : g_probeHosts) {
+        if (!hosts.contains(h)) {
+            hosts.append(h);
+        }
+    }
+    QList<int> ports{_port};
+    for (int p : g_probePorts) {
+        if (!ports.contains(p)) {
+            ports.append(p);
+        }
+    }
+    for (const QString &h : hosts) {
+        for (int p : ports) {
+            add(QHostAddress(h), p);
+        }
+    }
+    _sinceAttitude.invalidate();
+    _setActive(_configured);
+}
+
+void SkydroidLink::_setActive(const Endpoint &endpoint)
+{
+    if (endpoint == _active) {
+        return;
+    }
+    _active = endpoint;
+    emit activeEndpointChanged();
+}
+
+QString SkydroidLink::activeEndpoint() const
+{
+    if (_active.address.isNull()) {
+        return QString();
+    }
+    return QStringLiteral("%1:%2").arg(_active.address.toString()).arg(_active.port);
+}
+
+SkydroidLink::Endpoint SkydroidLink::_knownEndpointFor(const QHostAddress &address, quint16 port) const
+{
+    const Endpoint exact{address, port};
+    if (_endpoints.contains(exact)) {
+        return exact;
+    }
+    // A relay can answer from another port. Keep using the address we send to on that host.
+    if (address.isEqual(_active.address)) {
+        return _active;
+    }
+    for (const Endpoint &endpoint : _endpoints) {
+        if (endpoint.address.isEqual(address)) {
+            return endpoint;
+        }
+    }
+    return exact;
+}
+
+bool SkydroidLink::_attitudeFresh() const
+{
+    return _sinceAttitude.isValid() && _sinceAttitude.elapsed() < kAttitudeFreshMs;
+}
+
+void SkydroidLink::_probe()
+{
+    // Only harmless questions go to the other addresses: angle push on, and angles.
+    const std::string gaa = top::buildGaaEnable(kGaaHz, _options);
+    const std::string gac = top::buildGacQuery(_options);
+    for (const Endpoint &endpoint : _endpoints) {
+        if (endpoint == _active) {
+            continue;
+        }
+        _sendTo(endpoint, gaa);
+        _sendTo(endpoint, gac);
+    }
+}
+
+QList<SkydroidLink::Endpoint> SkydroidLink::_laserEndpoints() const
+{
+    QList<Endpoint> list{_active};
+    if (!list.contains(_configured)) {
+        list.append(_configured);
+    }
+    // The camera's own address: an RC relay often passes the angles but not the laser.
+    if (!g_probeHosts.isEmpty() && !g_probePorts.isEmpty()) {
+        const Endpoint direct{QHostAddress(g_probeHosts.first()), static_cast<quint16>(g_probePorts.first())};
+        if (!direct.address.isNull() && !list.contains(direct)) {
+            list.append(direct);
+        }
+    }
+    return list;
 }
 
 // --- Socket ----------------------------------------------------------------
@@ -182,7 +498,6 @@ void SkydroidLink::_applyModel()
 void SkydroidLink::_start()
 {
     _stop();
-    _address = QHostAddress(_host);
     _socket = new QUdpSocket(this);
     if (!_socket->bind(QHostAddress::AnyIPv4, 0)) {
         _socket->deleteLater();
@@ -191,6 +506,8 @@ void SkydroidLink::_start()
     }
     connect(_socket, &QUdpSocket::readyRead, this, &SkydroidLink::_readPending);
     _sinceReply.invalidate();
+    _sinceAttitude.invalidate();
+    _setActive(_configured);
     _pollCount = 0;
     _pollTimer.start();
     _answerTimer.start();
@@ -199,6 +516,19 @@ void SkydroidLink::_start()
 
 void SkydroidLink::_stop()
 {
+    // Never leave the gimbal turning when the link goes away.
+    if (_socket && (_moving || _stopRepeats > 0)) {
+        _sendStop();
+    }
+    _motionTimer.stop();
+    _moving = false;
+    _stopRepeats = 0;
+    _touchActive = false;
+    _touchBlocked = false;
+    _wheelAngleTimer.stop();
+    _zoomOutTimer.stop();
+    _zoomOutLeft = 0;
+
     _pollTimer.stop();
     _answerTimer.stop();
     _laserShotTimer.stop();
@@ -222,12 +552,12 @@ void SkydroidLink::_stop()
     }
 }
 
-void SkydroidLink::_send(const std::string &frame)
+void SkydroidLink::_sendTo(const Endpoint &endpoint, const std::string &frame)
 {
-    if (!_socket || frame.empty() || _address.isNull()) {
+    if (!_socket || frame.empty() || endpoint.address.isNull() || endpoint.port == 0) {
         return;
     }
-    _socket->writeDatagram(frame.data(), static_cast<qint64>(frame.size()), _address, static_cast<quint16>(_port));
+    _socket->writeDatagram(frame.data(), static_cast<qint64>(frame.size()), endpoint.address, endpoint.port);
 }
 
 void SkydroidLink::_readPending()
@@ -237,12 +567,13 @@ void SkydroidLink::_readPending()
         const QByteArray data = datagram.data();
         const auto frame = top::parseTpFrame(std::string(data.constData(), static_cast<size_t>(data.size())), _options);
         if (frame) {
-            _handleFrame(*frame);
+            const quint16 port = datagram.senderPort() > 0 ? static_cast<quint16>(datagram.senderPort()) : 0;
+            _handleFrame(*frame, _knownEndpointFor(datagram.senderAddress(), port));
         }
     }
 }
 
-void SkydroidLink::_handleFrame(const top::DecodedFrame &frame)
+void SkydroidLink::_handleFrame(const top::DecodedFrame &frame, const Endpoint &from)
 {
     _sinceReply.start();
     if (!_answering) {
@@ -251,6 +582,15 @@ void SkydroidLink::_handleFrame(const top::DecodedFrame &frame)
     }
 
     if (frame.tag == "GAC" && frame.yaw && frame.pitch) {
+        if (!(from == _active)) {
+            // Angles from another address. Move there only when the current one
+            // has gone quiet, so two answering addresses never take turns.
+            if (_attitudeFresh()) {
+                return;
+            }
+            _setActive(from);
+        }
+        _sinceAttitude.start();
         _yaw = *frame.yaw;
         _pitch = *frame.pitch;
         _roll = frame.roll.value_or(0.0);
@@ -259,16 +599,28 @@ void SkydroidLink::_handleFrame(const top::DecodedFrame &frame)
     } else if (frame.tag == "SLR" && _laserBusy) {
         const char source = frame.address.empty() ? ' ' : frame.address[0];
         if (source == 'E') {
-            _laserFromE = frame.slrDm;
-            if (_laserFromE) {
+            if (frame.slrDm) {
+                _laserFromE = frame.slrDm;
                 _laserFinish();  // the laser module answered: no need to wait
             }
         } else if (source == 'D' && frame.slrDm) {
             _laserFromD = frame.slrDm;
         }
-    } else if (frame.tag == "DZM" && frame.dzmStep) {
-        if (*frame.dzmStep != _zoomStep) {
+    } else if (frame.tag == "DZM" && frame.ctrl == 'r') {
+        // A read reply (a write is only echoed back). Kept as sent, so the
+        // settings can show what a C12/C13 reports; only the C14 Pro's step
+        // is understood (VGCS c14pro_default).
+        bool changed = false;
+        const QString report = QString::fromStdString(frame.data);
+        if (report != _zoomReport) {
+            _zoomReport = report;
+            changed = true;
+        }
+        if (_isZoomStepCamera() && frame.dzmStep && *frame.dzmStep != _zoomStep) {
             _zoomStep = *frame.dzmStep;
+            changed = true;
+        }
+        if (changed) {
             emit zoomChanged();
         }
     }
@@ -276,21 +628,30 @@ void SkydroidLink::_handleFrame(const top::DecodedFrame &frame)
 
 void SkydroidLink::_poll()
 {
+    ++_pollCount;
+    const bool fresh = _attitudeFresh();
+    // VGCS order: angle push on (GAA), then the angle question (GAC).
+    if ((!fresh && (_pollCount % kGaaEveryPollsWhenQuiet) == 1) || (_pollCount % kGaaEveryPolls) == 0) {
+        _send(top::buildGaaEnable(kGaaHz, _options));
+    }
     _send(top::buildGacQuery(_options));
-    if (_isZoomStepCamera() && (_pollCount % kZoomPollEvery) == 0) {
+    if (_isZoomStepCamera() && (_pollCount % kZoomPollEvery) == 1) {
         _send(top::buildDzmQuery(_options));
     }
-    ++_pollCount;
+    if (!fresh && _pollCount >= kProbeFirstPoll && ((_pollCount - kProbeFirstPoll) % kProbeEveryPolls) == 0) {
+        _probe();
+    }
 }
 
 void SkydroidLink::_checkAnswering()
 {
-    const bool fresh = _sinceReply.isValid() && _sinceReply.elapsed() < kAnswerTimeoutMs;
-    if (!fresh && _answering) {
+    const bool replyFresh = _sinceReply.isValid() && _sinceReply.elapsed() < kAnswerTimeoutMs;
+    if (!replyFresh && _answering) {
         _answering = false;
         emit answeringChanged();
     }
-    if (!fresh && _attitudeValid) {
+    const bool attitudeFresh = _sinceAttitude.isValid() && _sinceAttitude.elapsed() < kAnswerTimeoutMs;
+    if (!attitudeFresh && _attitudeValid) {
         // Old angles must never be used to place a target.
         _attitudeValid = false;
         emit attitudeChanged();
@@ -299,43 +660,401 @@ void SkydroidLink::_checkAnswering()
 
 // --- Gimbal ------------------------------------------------------------------
 
+double SkydroidLink::shapedSpeed(double deflection, double maxSpeed, double deadZone)
+{
+    if (!std::isfinite(deflection) || !std::isfinite(maxSpeed)) {
+        return 0.0;
+    }
+    const double d = std::clamp(deflection, -1.0, 1.0);
+    const double a = std::abs(d);
+    if (a <= deadZone || deadZone >= 1.0) {
+        return 0.0;
+    }
+    // Squared, so half way gives a quarter of the speed: fine aim near the middle.
+    const double m = (a - deadZone) / (1.0 - deadZone);
+    const double speed = maxSpeed * m * m;
+    return d < 0.0 ? -speed : speed;
+}
+
 void SkydroidLink::ptz(const QString &action)
 {
     const QString a = action.trimmed().toLower();
-    if (a == QStringLiteral("stop")) {
-        stopGimbal();
-        return;
+    const std::string frame = top::buildPtz(a.toStdString(), _options);
+    // VGCS ptz_stop_burst: C13 can coast after a single stop.
+    const int repeats = (a == QStringLiteral("stop")) ? 3 : 1;
+    for (int i = 0; i < repeats; ++i) {
+        _send(frame);
     }
-    _send(top::buildPtz(a.toStdString(), _options));
 }
 
-void SkydroidLink::gimbalSpeed(double yawDegPerSecond, double pitchDegPerSecond)
+void SkydroidLink::setTouchMotion(double x, double y)
 {
-    // Same choice as VGCS _speed_commands_for: a single moving axis goes out
-    // as GSY or GSP, so a zero on the other axis cannot mask it.
-    const bool yawMoves = std::abs(yawDegPerSecond) >= 1e-6;
-    const bool pitchMoves = std::abs(pitchDegPerSecond) >= 1e-6;
-    if (yawMoves && !pitchMoves) {
-        _send(top::buildGimbalSpeedAxis("GSY", yawDegPerSecond, _options));
-    } else if (pitchMoves && !yawMoves) {
-        _send(top::buildGimbalSpeedAxis("GSP", pitchDegPerSecond, _options));
-    } else {
-        _send(top::buildGimbalSpeed(yawDegPerSecond, pitchDegPerSecond, _options));
+    if (!_enabled || !_socket || _touchBlocked || !std::isfinite(x) || !std::isfinite(y)) {
+        return;
+    }
+    _touchX = std::clamp(x, -1.0, 1.0);
+    _touchY = std::clamp(y, -1.0, 1.0);
+    _touchLease.start();
+    if (!_touchActive) {
+        _touchActive = true;
+        _touchStarted.start();
+    }
+    _startMotionTimer();
+}
+
+void SkydroidLink::stopTouchMotion()
+{
+    _touchActive = false;
+    _touchBlocked = false;
+    _touchX = 0.0;
+    _touchY = 0.0;
+    if (_motionTimer.isActive()) {
+        _motionTick();  // stop now, not on the next tick
     }
 }
 
 void SkydroidLink::stopGimbal()
 {
-    // VGCS ptz_stop_burst: C13 can coast after a single stop.
-    const std::string stop = top::buildPtz("stop", _options);
-    for (int i = 0; i < 3; ++i) {
-        _send(stop);
+    _touchActive = false;
+    _touchX = 0.0;
+    _touchY = 0.0;
+    if (!_socket) {
+        return;
     }
+    _sendStop();
+    _moving = false;
+    _stopRepeats = 1;  // once more on the next tick: UDP can drop one
+    if (!_motionTimer.isActive()) {
+        _motionTimer.start();
+    }
+}
+
+void SkydroidLink::_startMotionTimer()
+{
+    if (!_motionTimer.isActive()) {
+        _motionTimer.start();
+        _motionTick();  // answer the first input at once
+    }
+}
+
+void SkydroidLink::_desiredSpeed(double &yawDps, double &pitchDps)
+{
+    yawDps = 0.0;
+    pitchDps = 0.0;
+    if (_touchActive) {
+        if (!_touchLease.isValid() || _touchLease.elapsed() > kTouchLeaseMs) {
+            _touchActive = false;  // updates stopped: the finger is gone even if no release came
+        } else if (_touchStarted.elapsed() > kTouchMaxMs) {
+            _touchActive = false;  // runaway cap: lift the finger to move again
+            _touchBlocked = true;
+        } else {
+            yawDps = shapedSpeed(_touchX, _maxSpeed, kTouchDeadZone);
+            pitchDps = shapedSpeed(_touchY, _maxSpeed, kTouchDeadZone);
+        }
+    }
+    if (!_touchActive && !_wheelHoldsPosition) {
+        yawDps = shapedSpeed(_wheelDeflection(_wheelYawChannel), _maxSpeed, kWheelDeadZone);
+        pitchDps = shapedSpeed(_wheelDeflection(_wheelPitchChannel), _maxSpeed, kWheelDeadZone);
+    }
+    if (_reverseYaw) {
+        yawDps = -yawDps;
+    }
+    if (_reversePitch) {
+        pitchDps = -pitchDps;
+    }
+}
+
+void SkydroidLink::_motionTick()
+{
+    if (!_socket) {
+        _motionTimer.stop();
+        return;
+    }
+    double yaw = 0.0;
+    double pitch = 0.0;
+    _desiredSpeed(yaw, pitch);
+    if (speedUnits(yaw) != 0 || speedUnits(pitch) != 0) {
+        _sendSpeed(yaw, pitch);
+        _moving = true;
+        _stopRepeats = 0;
+        return;
+    }
+    if (_moving) {
+        _sendStop();
+        _moving = false;
+        _stopRepeats = 1;  // once more on the next tick: UDP can drop one
+        return;
+    }
+    if (_stopRepeats > 0) {
+        _sendStop();
+        --_stopRepeats;
+        return;
+    }
+    // Idle. RC wheel updates and touches start the timer again.
+    _motionTimer.stop();
+}
+
+void SkydroidLink::_sendSpeed(double yawDps, double pitchDps)
+{
+    // Like VGCS: one frame per moving axis (GSY yaw, GSP pitch), never the
+    // combined GSM, which dropped yaw on a C12 in the field.
+    const int yawUnits = speedUnits(yawDps);
+    const int pitchUnits = speedUnits(pitchDps);
+    // An axis that just stopped gets its zero on two ticks, so one dropped frame cannot leave it turning.
+    if (yawUnits != 0) {
+        _yawZeroRepeats = 0;
+    } else if (_lastYawUnits != 0) {
+        _yawZeroRepeats = 2;
+    }
+    if (pitchUnits != 0) {
+        _pitchZeroRepeats = 0;
+    } else if (_lastPitchUnits != 0) {
+        _pitchZeroRepeats = 2;
+    }
+    if (yawUnits != 0 || _yawZeroRepeats > 0) {
+        _send(top::buildGimbalSpeedAxis("GSY", yawUnits != 0 ? yawDps : 0.0, _options));
+        if (yawUnits == 0) {
+            --_yawZeroRepeats;
+        }
+    }
+    if (pitchUnits != 0 || _pitchZeroRepeats > 0) {
+        _send(top::buildGimbalSpeedAxis("GSP", pitchUnits != 0 ? pitchDps : 0.0, _options));
+        if (pitchUnits == 0) {
+            --_pitchZeroRepeats;
+        }
+    }
+    _lastYawUnits = yawUnits;
+    _lastPitchUnits = pitchUnits;
+}
+
+void SkydroidLink::_sendStop()
+{
+    // Each axis gets its own zero, then GSM zero (the stop VGCS sends), so the
+    // gimbal stops whichever of these the firmware listens to.
+    _send(top::buildGimbalSpeedAxis("GSY", 0.0, _options));
+    _send(top::buildGimbalSpeedAxis("GSP", 0.0, _options));
+    _send(top::buildGimbalSpeed(0.0, 0.0, _options));
+    _lastYawUnits = 0;
+    _lastPitchUnits = 0;
+    _yawZeroRepeats = 0;
+    _pitchZeroRepeats = 0;
 }
 
 void SkydroidLink::center()
 {
     _send(top::buildPtz("center", _options));
+}
+
+void SkydroidLink::centerYaw()
+{
+    _send(top::buildGimbalAngleAxis("GAY", 0.0, kCenterYawDps, _options));
+}
+
+void SkydroidLink::pointDown()
+{
+    // The camera's one-key look down. VGCS sends the same PTZ code first.
+    _send(top::buildPtz("nadir", _options));
+}
+
+// --- RC wheels -----------------------------------------------------------------
+
+void SkydroidLink::_activeVehicleChanged(Vehicle *vehicle)
+{
+    if (_vehicle) {
+        _vehicle->disconnect(this);
+    }
+    _vehicle = vehicle;
+    _rc.clear();
+    _rcAge.invalidate();
+    for (int a = 0; a < 2; ++a) {
+        _wheelStart[a].reset();
+        _wheelMoved[a] = false;
+        _wheelTarget[a].reset();
+    }
+    if (_vehicle) {
+        connect(_vehicle, &Vehicle::rcChannelsRawChanged, this, &SkydroidLink::_rcChannelsReceived);
+    }
+    emit rcChannelsChanged();
+}
+
+QVariantList SkydroidLink::rcChannels() const
+{
+    QVariantList list;
+    list.reserve(_rc.size());
+    for (int value : _rc) {
+        list.append(value);
+    }
+    return list;
+}
+
+std::optional<int> SkydroidLink::_rcValue(int channel) const
+{
+    if (channel < 1 || channel > _rc.size() || !_rcAge.isValid() || _rcAge.elapsed() > kRcFreshMs) {
+        return std::nullopt;
+    }
+    const int value = _rc.at(channel - 1);
+    if (value < kRcMin || value > kRcMax) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+double SkydroidLink::_wheelDeflection(int channel) const
+{
+    const std::optional<int> value = _rcValue(channel);
+    if (!value) {
+        return 0.0;
+    }
+    double d = static_cast<double>(*value - kRcCentre) / kRcHalfRange;
+    if (_wheelReverse) {
+        d = -d;
+    }
+    return std::clamp(d, -1.0, 1.0);
+}
+
+void SkydroidLink::_rcChannelsReceived(QVector<int> values)
+{
+    _rc = values;
+    _rcAge.start();
+    emit rcChannelsChanged();
+
+    if (!_detectAxis.isEmpty()) {
+        if (_detectMin.size() < values.size()) {
+            _detectMin.resize(values.size(), INT_MAX);
+            _detectMax.resize(values.size(), INT_MIN);
+        }
+        for (int i = 0; i < values.size(); ++i) {
+            const int v = values.at(i);
+            if (v < kRcMin || v > kRcMax) {
+                continue;
+            }
+            _detectMin[i] = std::min(_detectMin[i], v);
+            _detectMax[i] = std::max(_detectMax[i], v);
+        }
+    }
+
+    if (!_enabled || !_socket) {
+        return;
+    }
+    if (_wheelHoldsPosition) {
+        _updateWheelAngles();
+        return;
+    }
+    const bool wheelTurned = speedUnits(shapedSpeed(_wheelDeflection(_wheelYawChannel), _maxSpeed, kWheelDeadZone)) != 0 ||
+                             speedUnits(shapedSpeed(_wheelDeflection(_wheelPitchChannel), _maxSpeed, kWheelDeadZone)) != 0;
+    if (wheelTurned) {
+        _startMotionTimer();
+    }
+}
+
+void SkydroidLink::_updateWheelAngles()
+{
+    const int channels[2] = {_wheelYawChannel, _wheelPitchChannel};
+    bool changed = false;
+    for (int a = 0; a < 2; ++a) {
+        const std::optional<int> value = _rcValue(channels[a]);
+        if (!value) {
+            continue;
+        }
+        // Never move the gimbal only because the link started: wait until the wheel is turned.
+        if (!_wheelStart[a]) {
+            _wheelStart[a] = *value;
+            continue;
+        }
+        if (!_wheelMoved[a]) {
+            if (std::abs(*value - *_wheelStart[a]) < kWheelMoveUs) {
+                continue;
+            }
+            _wheelMoved[a] = true;
+        }
+        double t = std::clamp((*value - 1000) / 1000.0, 0.0, 1.0);
+        if (_wheelReverse) {
+            t = 1.0 - t;
+        }
+        const double pitchMax = (_model == QStringLiteral("C13")) ? kC13PitchMaxDeg : kWheelPitchMaxDeg;
+        const double angle = (a == PitchAxis)
+            ? kWheelPitchMinDeg + t * (pitchMax - kWheelPitchMinDeg)
+            : -kWheelYawRangeDeg + t * 2.0 * kWheelYawRangeDeg;
+        _wheelTarget[a] = angle;
+        if (!_wheelSent[a] || std::abs(*_wheelSent[a] - angle) >= kWheelAngleStepDeg) {
+            changed = true;
+        }
+    }
+    if (!changed) {
+        return;
+    }
+    if (!_wheelSentAt.isValid() || _wheelSentAt.elapsed() >= kWheelAngleIntervalMs) {
+        _sendWheelAngles();
+    } else if (!_wheelAngleTimer.isActive()) {
+        _wheelAngleTimer.start(static_cast<int>(kWheelAngleIntervalMs - _wheelSentAt.elapsed()));
+    }
+}
+
+void SkydroidLink::_sendWheelAngles()
+{
+    if (!_socket) {
+        return;
+    }
+    const char *const tags[2] = {"GAY", "GAP"};
+    for (int a = 0; a < 2; ++a) {
+        if (!_wheelTarget[a]) {
+            continue;
+        }
+        if (_wheelSent[a] && std::abs(*_wheelSent[a] - *_wheelTarget[a]) < kWheelAngleStepDeg) {
+            continue;
+        }
+        _send(top::buildGimbalAngleAxis(tags[a], *_wheelTarget[a], kWheelApproachDps, _options));
+        _wheelSent[a] = _wheelTarget[a];
+    }
+    _wheelSentAt.start();
+}
+
+void SkydroidLink::detectWheel(const QString &axis)
+{
+    if (axis != QStringLiteral("pitch") && axis != QStringLiteral("yaw")) {
+        return;
+    }
+    _detectAxis = axis;
+    _detectMin = QVector<int>(_rc.size(), INT_MAX);
+    _detectMax = QVector<int>(_rc.size(), INT_MIN);
+    for (int i = 0; i < _rc.size(); ++i) {
+        const int v = _rc.at(i);
+        if (v >= kRcMin && v <= kRcMax) {
+            _detectMin[i] = v;
+            _detectMax[i] = v;
+        }
+    }
+    _detectTimer.start();
+    emit detectingWheelChanged();
+}
+
+void SkydroidLink::_finishWheelDetect()
+{
+    const QString axis = _detectAxis;
+    _detectAxis.clear();
+    int best = 0;
+    int bestSpan = kDetectMinSpanUs - 1;
+    const int count = std::min<int>(std::min(_detectMin.size(), _detectMax.size()), kMaxRcChannel);
+    // Channel 5 and up: 1 to 4 are the sticks, which may be touched by accident.
+    for (int i = 4; i < count; ++i) {
+        if (_detectMin[i] == INT_MAX) {
+            continue;
+        }
+        const int span = _detectMax[i] - _detectMin[i];
+        if (span > bestSpan) {
+            bestSpan = span;
+            best = i + 1;
+        }
+    }
+    if (best > 0) {
+        if (axis == QStringLiteral("pitch")) {
+            setWheelPitchChannel(best);
+        } else {
+            setWheelYawChannel(best);
+        }
+    }
+    emit detectingWheelChanged();
+    emit wheelDetected(axis, best);
 }
 
 // --- Camera ------------------------------------------------------------------
@@ -357,27 +1076,23 @@ void SkydroidLink::zoom(int direction)
     if (direction == 0) {
         return;
     }
+    const int d = direction > 0 ? 1 : -1;
     if (_isZoomStepCamera()) {
-        for (const std::string &frame : top::buildDzmStepFrames(direction, _options)) {
+        for (const std::string &frame : top::buildDzmStepFrames(d, _options)) {
             _send(frame);
         }
         QTimer::singleShot(kZoomQueryAfterCmdMs, this, [this]() { _send(top::buildDzmQuery(_options)); });
         return;
     }
-    const std::vector<std::string> frames = top::buildC13ZoomStepFrames(direction, _options);
-    for (const std::string &frame : frames) {
-        _send(frame);
-    }
-    if (_socket && !_address.isNull()) {
-        for (int extraPort : kC13ZoomExtraPorts) {
-            if (extraPort == _port) {
-                continue;
-            }
-            for (const std::string &frame : frames) {
-                _socket->writeDatagram(frame.data(), static_cast<qint64>(frame.size()), _address,
-                                       static_cast<quint16>(extraPort));
-            }
-        }
+    // A tap ends a "back to 1x" run that is still stepping out.
+    _zoomOutLeft = 0;
+    _zoomOutTimer.stop();
+    _sendZoomStepFrames(d);
+    QTimer::singleShot(kZoomQueryAfterCmdMs, this, [this]() { _send(top::buildDzmQuery(_options)); });
+    const int count = std::clamp(_zoomCount + d, 0, _zoomStepsMax());
+    if (count != _zoomCount) {
+        _zoomCount = count;
+        emit zoomChanged();
     }
 }
 
@@ -390,9 +1105,68 @@ void SkydroidLink::zoomHome()
         QTimer::singleShot(kZoomQueryAfterCmdMs, this, [this]() { _send(top::buildDzmQuery(_options)); });
         return;
     }
-    for (const std::string &frame : top::buildOpticalZoomFrames(1.0, _options)) {
+    // The absolute 1x VGCS sends, and the 1x preset. Some C13 firmware ignores
+    // absolute zoom, so the zoom also steps back out as many steps as it went
+    // in (plus a few), one every 60 ms: steps are what zoomed in the field.
+    std::vector<std::string> frames = top::buildOpticalZoomFrames(1.0, _options);
+    frames.push_back(top::buildDzmPreset(1, _options));
+    _sendZoomFrames(frames);
+    _zoomOutLeft = _zoomCount + kZoomHomeExtraSteps;
+    _zoomOutTimer.start();
+    if (_zoomCount != 0) {
+        _zoomCount = 0;
+        emit zoomChanged();
+    }
+}
+
+void SkydroidLink::_zoomOutTick()
+{
+    if (_zoomOutLeft <= 0 || !_socket) {
+        _zoomOutLeft = 0;
+        _zoomOutTimer.stop();
+        QTimer::singleShot(kZoomQueryAfterCmdMs, this, [this]() { _send(top::buildDzmQuery(_options)); });
+        return;
+    }
+    _sendZoomStepFrames(-1);
+    --_zoomOutLeft;
+}
+
+void SkydroidLink::_sendZoomStepFrames(int direction)
+{
+    // One C12/C13 step as VGCS sends it: lens zoom start (ZMC), DZM step, lens stop.
+    _sendZoomFrames(top::buildC13ZoomStepFrames(direction, _options));
+}
+
+void SkydroidLink::_sendZoomFrames(const std::vector<std::string> &frames)
+{
+    for (const std::string &frame : frames) {
         _send(frame);
     }
+    for (int extraPort : kC13ZoomExtraPorts) {
+        if (extraPort == _active.port) {
+            continue;
+        }
+        const Endpoint extra{_active.address, static_cast<quint16>(extraPort)};
+        for (const std::string &frame : frames) {
+            _sendTo(extra, frame);
+        }
+    }
+}
+
+int SkydroidLink::_zoomStepsMax() const
+{
+    // C13: 30x digital zoom, C12: 4x (DOCS/SKYDROID-CAMERA-SPECS.md).
+    const double maxZoom = (_model == QStringLiteral("C12")) ? 4.0 : 30.0;
+    return static_cast<int>(std::lround((maxZoom - 1.0) / kZoomPerStep));
+}
+
+QString SkydroidLink::zoomLabel() const
+{
+    if (_isZoomStepCamera()) {
+        // The camera reports its step; until it does, show nothing rather than a guess.
+        return _zoomStep >= 0 ? c14ProZoomLabel(_zoomStep) : QString();
+    }
+    return QStringLiteral("%1x").arg(1.0 + _zoomCount * kZoomPerStep, 0, 'f', 1);
 }
 
 // --- Laser ---------------------------------------------------------------------
@@ -426,8 +1200,10 @@ void SkydroidLink::fireLaser()
     emit laserChanged();
 
     // VGCS order: fire the shot at the laser module (E), read, settle, read again.
-    _send(top::buildSlrTrigger('E', _options));
-    _send(top::buildSlrQuery('E', _options));
+    for (const Endpoint &endpoint : _laserEndpoints()) {
+        _sendTo(endpoint, top::buildSlrTrigger('E', _options));
+        _sendTo(endpoint, top::buildSlrQuery('E', _options));
+    }
     _laserShotTimer.start();
     _laserTimeoutTimer.start();
 }
@@ -437,8 +1213,10 @@ void SkydroidLink::_laserReadAfterShot()
     if (!_laserBusy) {
         return;
     }
-    _send(top::buildSlrQuery('E', _options));
-    _send(top::buildSlrQuery('D', _options));
+    for (const Endpoint &endpoint : _laserEndpoints()) {
+        _sendTo(endpoint, top::buildSlrQuery('E', _options));
+        _sendTo(endpoint, top::buildSlrQuery('D', _options));
+    }
 }
 
 void SkydroidLink::_laserFinish()

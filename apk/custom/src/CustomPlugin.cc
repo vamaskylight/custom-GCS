@@ -4,6 +4,7 @@
 #include "QGCPalette.h"
 #include "QGCMAVLink.h"
 #include "AppSettings.h"
+#include "APMMavlinkStreamRateSettings.h"
 
 #include <QtCore/QApplicationStatic>
 #include <QtQml/QQmlApplicationEngine>
@@ -77,6 +78,13 @@ void CustomPlugin::adjustSettingMetaData(const QString& settingsGroup, FactMetaD
         } else if (metaData.name() == AppSettings::offlineEditingVehicleClassName) {
             metaData.setRawDefaultValue(QGCMAVLink::VehicleClassMultiRotor);
             userVisible = false;
+            return;
+        }
+    } else if (settingsGroup == APMMavlinkStreamRateSettings::settingsGroup) {
+        // The RC wheel moves the camera (SkydroidLink), so RC channel values
+        // must arrive 10 times a second, not QGC's default 2.
+        if (metaData.name() == APMMavlinkStreamRateSettings::streamRateRCChannelsName) {
+            metaData.setRawDefaultValue(10);
             return;
         }
     }

@@ -1,0 +1,11 @@
+module QGroundControl.Controls
+singleton ScreenTools 1.0 ScreenTools.qml
+QGCPalette 1.0 QGCPalette.qml
+QGCToolInsets 1.0 QGCToolInsets.qml
+QGCLabel 1.0 QGCLabel.qml
+QGCButton 1.0 QGCButton.qml
+QGCCheckBox 1.0 QGCCheckBox.qml
+QGCComboBox 1.0 QGCComboBox.qml
+QGCTextField 1.0 QGCTextField.qml
+QGCFlickable 1.0 QGCFlickable.qml
+QGCColoredImage 1.0 QGCColoredImage.qml

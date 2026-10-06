@@ -12,12 +12,26 @@
         <file alias="microSD.svg">res/Images/microSD.svg</file>
         <file alias="odometer.svg">res/Images/odometer.svg</file>
         <file alias="vertical_speed.svg">res/Images/vertical_speed.svg</file>
+        <file alias="vama_center.svg">res/Images/vama_center.svg</file>
+        <file alias="vama_down.svg">res/Images/vama_down.svg</file>
+        <file alias="vama_laser.svg">res/Images/vama_laser.svg</file>
+        <file alias="vama_logo_white.svg">res/Images/vama_logo_white.svg</file>
+        <file alias="vama_photo.svg">res/Images/vama_photo.svg</file>
+        <file alias="vama_record.svg">res/Images/vama_record.svg</file>
+        <file alias="vama_settings.svg">res/Images/vama_settings.svg</file>
+        <file alias="vama_yaw_center.svg">res/Images/vama_yaw_center.svg</file>
+        <file alias="vama_zoom_in.svg">res/Images/vama_zoom_in.svg</file>
+        <file alias="vama_zoom_out.svg">res/Images/vama_zoom_out.svg</file>
+        <file alias="vama_zoom_reset.svg">res/Images/vama_zoom_reset.svg</file>
     </qresource>
     <qresource prefix="/Custom/qml">
         <file alias="QGroundControl/FlyView/FlyViewCustomLayer.qml">src/FlyViewCustomLayer.qml</file>
+        <file alias="QGroundControl/FlyView/FlyViewTopRightColumnLayout.qml">src/FlyViewTopRightColumnLayout.qml</file>
+        <file alias="QGroundControl/Toolbar/SelectViewDropdown.qml">src/SelectViewDropdown.qml</file>
     </qresource>
     <qresource prefix="/Custom/res">
         <file alias="QGCLogoFull.svg">res/Images/QGCLogoFull.svg</file>
+        <file alias="QGCLogoArrow.svg">res/Images/QGCLogoArrow.svg</file>
         <file alias="qgroundcontrol.ico">res/icons/custom_qgroundcontrol.ico</file>
     </qresource>
 </RCC>

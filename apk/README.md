@@ -90,11 +90,14 @@ QGC's custom build guide: https://dev.qgroundcontrol.com/en/custom_build/custom_
 ```powershell
 powershell -ExecutionPolicy Bypass -File apk\custom\test\run_tests.ps1
 powershell -ExecutionPolicy Bypass -File apk\custom\test\run_link_test.ps1
+powershell -ExecutionPolicy Bypass -File apk\custom\test\run_preview.ps1
 ```
 
 - `run_tests.ps1` checks the camera protocol (`SkydroidTop`) and the laser target maths (`LaserGeo`) against values made by the VGCS Python code. After changing either side, regenerate them with `gen_skydroid_vectors.py` and `gen_laser_vectors.py` (run with `py -3.14`, which has the VGCS packages).
-- `run_link_test.ps1` runs the real camera link (`SkydroidLink`) against a fake camera, with stand-ins for QGC's vehicle classes (`test/link/stubs`).
-- They need MinGW 13.1 (`C:\Qt\Tools\mingw1310_64`) and, for the link test, the Qt 6.11.1 MinGW kit (`C:\Qt\6.11.1\mingw_64`).
+- `run_link_test.ps1` runs the real camera link (`SkydroidLink`) against fake cameras on 127.0.0.1, with stand-ins for QGC's vehicle classes (`test/link/stubs`): angles, address search, touch and RC wheel motion, laser and target rules.
+- `run_preview.ps1` loads the real camera screen (`FlyViewCustomLayer.qml` from `custom.qrc`) with stand-ins for QGC's QML controls (`test/preview/stubs`) and a fake camera, prints every QML warning, and saves screenshots to `%TEMP%\vama-preview`. Run it after every QML change: the app only finds QML mistakes when it runs.
+- They need MinGW 13.1 (`C:\Qt\Tools\mingw1310_64`) and, for the link test and the preview, the Qt 6.11.1 MinGW kit (`C:\Qt\6.11.1\mingw_64`).
+- Tests and the preview use only 127.0.0.x addresses. `SkydroidLink::setProbeTargets` keeps the camera address search off the real network.
 
 ## What changed from the example
 
@@ -103,6 +106,7 @@ Done on 2026-10-06 (details in `apk/custom/README.md`):
 1. ArduPilot only. QGC's own ArduPilot support is on, PX4 is off.
 2. Name "VAMA GCS" (build name `VAMA-GCS`), Android package `com.vama.gcs`, VAMA icons.
 3. Example parts removed: PX4 plugins, PerimeterScan, demo button, custom instrument panel.
+4. Skydroid camera screen and link (`apk/custom/src`), and QGC's own photo and video buttons removed (see `apk/custom/README.md`).
 
 The Android package id is permanent once customers install the app, so confirm it before the first release.
 

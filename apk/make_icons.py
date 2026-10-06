@@ -19,7 +19,7 @@ import io
 import sys
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 Image.MAX_IMAGE_PIXELS = None  # the source logo is 15171 x 6793
 
@@ -62,6 +62,37 @@ def banner(mark: Image.Image, width: int, height: int) -> Image.Image:
     m = mark.resize((max(1, round(mark.width * scale)), max(1, round(mark.height * scale))), Image.LANCZOS)
     canvas.alpha_composite(m, ((width - m.width) // 2, (height - m.height) // 2))
     return canvas
+
+
+def white_mark(mark: Image.Image, width: int) -> Image.Image:
+    """The mark in plain white, keeping its shape (alpha).
+
+    QGC tints menu icons by their shape only, so the colour does not matter
+    there; white also works anywhere the icon is shown as it is.
+    """
+    m = mark.resize((width, round(mark.height * width / mark.width)), Image.LANCZOS)
+    white = Image.new("RGBA", m.size, (255, 255, 255, 0))
+    white.putalpha(m.getchannel("A"))
+    return white
+
+
+def position_arrow(mark: Image.Image, size: int) -> Image.Image:
+    """Map marker for the phone or RC position when its heading is known.
+
+    Same shape as QGC's QGCLogoArrow.svg (an arrowhead pointing up; QGC turns
+    it to the heading): dark fill, orange edge, the mark inside.
+    """
+    scale = 4  # draw large, then shrink, for smooth edges
+    s = size * scale
+    canvas = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    points = [(s * 0.50, s * 0.03), (s * 0.97, s * 0.97), (s * 0.50, s * 0.76), (s * 0.03, s * 0.97)]
+    edge = mark.getpixel((mark.width // 2, int(mark.height * 0.95)))  # the mark's orange
+    draw.polygon(points, fill=BACKGROUND, outline=edge[:3] + (255,), width=round(s * 0.035))
+    w = round(s * 0.46)
+    m = mark.resize((w, round(mark.height * w / mark.width)), Image.LANCZOS)
+    canvas.alpha_composite(m, ((s - w) // 2, round(s * 0.52) - m.height // 2))
+    return canvas.resize((size, size), Image.LANCZOS)
 
 
 def svg_wrapping(png: Image.Image) -> str:
@@ -111,6 +142,16 @@ def main() -> int:
     logo = mark.resize((600, round(mark.height * 600 / mark.width)), Image.LANCZOS)
     out = CUSTOM / "res" / "Images" / "QGCLogoFull.svg"
     out.write_text(svg_wrapping(logo), encoding="utf-8")
+    written.append(out)
+
+    # Menu icon in place of QGC's logo (Settings button; QGC tints it).
+    out = CUSTOM / "res" / "Images" / "vama_logo_white.svg"
+    out.write_text(svg_wrapping(white_mark(mark, 300)), encoding="utf-8")
+    written.append(out)
+
+    # Position marker with heading, in place of QGC's QGCLogoArrow.svg.
+    out = CUSTOM / "res" / "Images" / "QGCLogoArrow.svg"
+    out.write_text(svg_wrapping(position_arrow(mark, 160)), encoding="utf-8")
     written.append(out)
 
     out = CUSTOM / "deploy" / "windows" / "installheader.bmp"
