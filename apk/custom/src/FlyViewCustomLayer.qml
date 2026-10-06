@@ -39,6 +39,28 @@ Item {
 
     readonly property string _iconPath: "/custom/img/"
 
+    // IR: the thermal picture is a second RTSP stream, so the button switches
+    // QGC's video address between the day and thermal streams (as VGCS does).
+    property var  _videoSettings: QGroundControl.settingsManager.videoSettings
+    property bool _thermalOn:     _videoSettings ? _videoSettings.rtspUrl.rawValue === _link.thermalVideoUrl : false
+
+    function _toggleThermal() {
+        if (!_videoSettings) {
+            return
+        }
+        if (_thermalOn) {
+            _videoSettings.rtspUrl.rawValue = _link.dayVideoUrl
+            return
+        }
+        // The day address is whatever the user set in QGC's video settings.
+        const current = _videoSettings.rtspUrl.rawValue
+        if (_videoSettings.videoSource.rawValue === _videoSettings.rtspVideoSource && current !== "") {
+            _link.dayVideoUrl = current
+        }
+        _videoSettings.videoSource.rawValue = _videoSettings.rtspVideoSource
+        _videoSettings.rtspUrl.rawValue = _link.thermalVideoUrl
+    }
+
     QGCPalette { id: qgcPal; colorGroupEnabled: true }
 
     // Our two button columns sit on the left and right edges; tell QGC so its
@@ -293,6 +315,13 @@ Item {
                 fill:      _link.laserBusy ? qgcPal.colorOrange : Qt.rgba(0, 0, 0, 0.55)
                 onClicked: _link.fireLaser()
             }
+            IconButton {
+                objectName: "vamaIrButton"
+                icon:       _iconPath + "vama_ir.svg"
+                size:       _buttonSize
+                fill:       _thermalOn ? qgcPal.colorOrange : Qt.rgba(0, 0, 0, 0.55)
+                onClicked:  _toggleThermal()
+            }
         }
     }
 
@@ -300,7 +329,7 @@ Item {
     Rectangle {
         id:                       laserBox
         visible:                  _link.enabled && !_laserBoxHidden &&
-                                  (_link.laserBusy || _link.laserValid || _link.laserMessage !== "")
+                                  (_link.aimBusy || _link.laserBusy || _link.laserValid || _link.laserMessage !== "")
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top:              parent.top
         anchors.topMargin:        parentToolInsets.topEdgeCenterInset + _margin
@@ -321,12 +350,13 @@ Item {
                 color:               "white"
                 font.pointSize:      ScreenTools.largeFontPointSize
                 font.bold:           true
-                text:                _link.laserBusy ? qsTr("Measuring...")
-                                                     : (_link.laserValid ? qsTr("%1 m").arg(_fmt(_link.laserRangeM, 1)) : qsTr("No laser reading"))
+                text:                _link.aimBusy ? qsTr("Turning to the point...")
+                                                   : (_link.laserBusy ? qsTr("Measuring...")
+                                                                      : (_link.laserValid ? qsTr("%1 m").arg(_fmt(_link.laserRangeM, 1)) : qsTr("No laser reading")))
             }
             QGCLabel {
                 width:               parent.width
-                visible:             !_link.laserBusy && !_link.laserValid && _link.laserMessage !== ""
+                visible:             !_link.aimBusy && !_link.laserBusy && !_link.laserValid && _link.laserMessage !== ""
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode:            Text.WordWrap
                 color:               qgcPal.colorOrange
@@ -382,6 +412,7 @@ Item {
         property real _pressX:   0
         property real _pressY:   0
         property bool _dragging: false
+        property bool _moved:    false  // this press became a drag, so it is not a tap
         readonly property real _startDistance: ScreenTools.defaultFontPixelHeight * 0.6
         // Full speed when the finger is this far from where it went down.
         readonly property real _fullSpeedDistance: Math.min(width, height) * 0.2
@@ -399,14 +430,33 @@ Item {
             _dragging = false
         }
 
+        // Where the picture is drawn: the same sizes QGC's video view uses
+        // for its fit setting (FlightDisplayViewVideo.qml getWidth/getHeight).
+        function _videoRect() {
+            const ar = QGroundControl.videoManager.aspectRatio > 0 ? QGroundControl.videoManager.aspectRatio : 16 / 9
+            const fit = QGroundControl.settingsManager.videoSettings.videoFit.rawValue
+            const screenAr = width / height
+            let w = width
+            let h = height
+            if (fit === 1 || (fit === 2 && screenAr < ar) || (fit === 3 && screenAr > ar)) {
+                w = height * ar
+            }
+            if (fit === 0 || (fit === 2 && screenAr > ar) || (fit === 3 && screenAr < ar)) {
+                h = width / ar
+            }
+            return Qt.rect((width - w) / 2, (height - h) / 2, w, h)
+        }
+
         onPressed: (mouse) => {
             _pressX = mouse.x
             _pressY = mouse.y
             _dragging = false
+            _moved = false
         }
         onPositionChanged: (mouse) => {
             if (!_dragging && (Math.abs(mouse.x - _pressX) > _startDistance || Math.abs(mouse.y - _pressY) > _startDistance)) {
                 _dragging = true
+                _moved = true
                 touchRefresh.start()
             }
             if (_dragging) {
@@ -417,7 +467,56 @@ Item {
         onReleased:      endDrag()
         onCanceled:      endDrag()
         onEnabledChanged: if (!enabled) endDrag()
-        onDoubleClicked: QGroundControl.videoManager.fullScreen = !QGroundControl.videoManager.fullScreen
+        // A tap turns the camera to that point and measures it. It waits for the
+        // double-tap time first, so a double tap (full screen) never aims.
+        onClicked: (mouse) => {
+            if (_moved) {
+                return
+            }
+            tapTimer.tapX = mouse.x
+            tapTimer.tapY = mouse.y
+            tapTimer.restart()
+        }
+        onDoubleClicked: {
+            tapTimer.stop()
+            QGroundControl.videoManager.fullScreen = !QGroundControl.videoManager.fullScreen
+        }
+
+        Timer {
+            id:       tapTimer
+            objectName: "vamaTapTimer"
+            interval: Qt.styleHints.mouseDoubleClickInterval
+            property real tapX: 0
+            property real tapY: 0
+            onTriggered: {
+                const r = videoDrag._videoRect()
+                if (tapX < r.x || tapX > r.x + r.width || tapY < r.y || tapY > r.y + r.height) {
+                    return  // outside the picture
+                }
+                tapMark.x = tapX - tapMark.width / 2
+                tapMark.y = tapY - tapMark.height / 2
+                tapMarkAnimation.restart()
+                _link.aimAndMeasure((tapX - r.x) / r.width, (tapY - r.y) / r.height)
+            }
+        }
+
+        // Where the tap landed, fading out.
+        Rectangle {
+            id:           tapMark
+            width:        ScreenTools.defaultFontPixelHeight * 2
+            height:       width
+            radius:       width / 2
+            color:        "transparent"
+            border.color: qgcPal.colorOrange
+            border.width: 3
+            opacity:      0
+            SequentialAnimation {
+                id: tapMarkAnimation
+                PropertyAction  { target: tapMark; property: "opacity"; value: 1 }
+                PauseAnimation  { duration: 1200 }
+                NumberAnimation { target: tapMark; property: "opacity"; to: 0; duration: 600 }
+            }
+        }
 
         // The link stops on its own without updates, so keep sending while the finger is held still.
         Timer {
@@ -484,7 +583,7 @@ Item {
             id:               hintLabel
             anchors.centerIn: parent
             color:            "white"
-            text:             qsTr("Drag on the video to move the camera")
+            text:             qsTr("Drag on the video to move the camera. Tap an object to measure it.")
         }
 
         SequentialAnimation {
@@ -507,6 +606,11 @@ Item {
         target: _link
         function onLaserBusyChanged() {
             if (_link.laserBusy) {
+                _laserBoxHidden = false
+            }
+        }
+        function onAimBusyChanged() {
+            if (_link.aimBusy) {
                 _laserBoxHidden = false
             }
         }
@@ -643,7 +747,7 @@ Item {
                     Layout.fillWidth: true
                     wrapMode:         Text.WordWrap
                     font.pointSize:   ScreenTools.smallFontPointSize
-                    text:             qsTr("Drag on the video: the further you drag, the faster it turns. Let go to stop.")
+                    text:             qsTr("Drag on the video: the further you drag, the faster it turns. Let go to stop. Tap an object: the camera turns to it, and the laser measures its distance and position.")
                 }
 
                 GridLayout {
@@ -673,6 +777,11 @@ Item {
                     text:      qsTr("Reverse up and down")
                     checked:   _link.reversePitch
                     onClicked: _link.reversePitch = checked
+                }
+                QGCCheckBox {
+                    text:      qsTr("Reverse left and right when tapping an object")
+                    checked:   _link.reverseTapYaw
+                    onClicked: _link.reverseTapYaw = checked
                 }
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: qgcPal.text; opacity: 0.3 }
@@ -753,11 +862,35 @@ Item {
 
                 Rectangle { Layout.fillWidth: true; height: 1; color: qgcPal.text; opacity: 0.3 }
 
+                QGCLabel { text: qsTr("Video"); font.bold: true }
                 QGCLabel {
                     Layout.fillWidth: true
                     wrapMode:         Text.WordWrap
                     font.pointSize:   ScreenTools.smallFontPointSize
-                    text:             qsTr("Video: set the camera RTSP URL in Application Settings, Video.")
+                    text:             qsTr("The IR button switches the video between these two addresses. The day address is taken from Application Settings, Video, when you switch to IR.")
+                }
+
+                GridLayout {
+                    Layout.fillWidth: true
+                    columns:          2
+                    columnSpacing:    _margin
+                    rowSpacing:       _margin / 2
+
+                    QGCLabel { text: qsTr("Day video"); Layout.preferredWidth: settingsPopup._labelWidth }
+                    QGCTextField {
+                        id:                dayVideoField
+                        Layout.fillWidth:  true
+                        text:              _link.dayVideoUrl
+                        onEditingFinished: _link.dayVideoUrl = text
+                    }
+
+                    QGCLabel { text: qsTr("Thermal video"); Layout.preferredWidth: settingsPopup._labelWidth }
+                    QGCTextField {
+                        id:                thermalVideoField
+                        Layout.fillWidth:  true
+                        text:              _link.thermalVideoUrl
+                        onEditingFinished: _link.thermalVideoUrl = text
+                    }
                 }
 
                 QGCButton {
@@ -766,6 +899,8 @@ Item {
                     onClicked: {
                         _link.host = hostField.text
                         _link.port = parseInt(portField.text)
+                        _link.dayVideoUrl = dayVideoField.text
+                        _link.thermalVideoUrl = thermalVideoField.text
                         settingsPopup.close()
                     }
                 }

@@ -64,6 +64,42 @@ The PC needs 64-bit Windows 10 (version 1809 or newer) or Windows 11, and about 
   Click "Allow" and tick both private and public networks.
   If this is cancelled, MAVLink over UDP will not arrive.
 
+### License key
+
+VGCS.exe runs only with a license key made for that computer (asked by Abhi, 2026-10-05).
+It works offline.
+
+1. On the first start, a window shows the computer's **machine code**, for example `VXMW-RNMJ-TD54-QNJT`, with a Copy button.
+   `VGCS.exe --selfcheck` also prints it.
+2. The client sends the machine code to VAMA.
+3. VAMA makes a key for it (below) and sends it back.
+4. The client pastes the key and clicks Activate. VGCS saves it and does not ask again on that computer.
+
+A key made for one computer does not work on another, so a copied exe does not run elsewhere.
+The machine code comes from the computer's hardware ID (the firmware's system UUID), so reinstalling Windows does not change it.
+On the rare board without a usable UUID, the Windows installation ID is used instead, and that one changes when Windows is reinstalled.
+Quitting the key window closes VGCS without an error message.
+Running from source (`python -m vgcs`) has no key check; `VGCS_REQUIRE_LICENSE=1` turns it on there, to try it.
+
+What it does not stop: someone who changes the program itself, or who sets the computer's clock back to get past an end date.
+The rules and the key format are in `vgcs/app/license_key.py`.
+
+**Making keys** (whoever issues them, from the repo root):
+
+```powershell
+py -3.14 packaging\vgcs_license_tool.py make-key VXMW-RNMJ-TD54-QNJT --note "Pune lab laptop"
+py -3.14 packaging\vgcs_license_tool.py make-key VXMW-RNMJ-TD54-QNJT --expires 2027-03-31
+py -3.14 packaging\vgcs_license_tool.py check-key <key> --machine VXMW-RNMJ-TD54-QNJT
+py -3.14 packaging\vgcs_license_tool.py this-machine
+```
+
+- A mistyped machine code is refused (the code has a check).
+- Every key made is listed in `%USERPROFILE%\.vama\vgcs-licenses-issued.csv`, and serial numbers count up from that list.
+- The private key is `%USERPROFILE%\.vama\vgcs-license-private.key`, made once with `new-keypair` (2026-10-06).
+  **It must never be in the repo or sent around, and it needs a backup.**
+  Anyone who has it can make keys; without it, no new keys can be made for the exes already given out.
+  Its public half is `LICENSE_PUBLIC_KEY` in `vgcs/app/license_key.py`; changing that makes every key given out so far invalid.
+
 ### Where things are kept
 
 - The unpacked program: `%LOCALAPPDATA%\VGCS\app`.
@@ -73,6 +109,7 @@ The PC needs 64-bit Windows 10 (version 1809 or newer) or Windows 11, and about 
 - Captures and reports: `Documents\VGCS`.
 - Settings: the Windows registry (`HKEY_CURRENT_USER\Software\VGCS\VGCS`).
   These are the same settings as the source version on the same machine.
+  The license key is saved there too (`license/key`).
 - Map tile cache: `%USERPROFILE%\.vgcs\tile-cache`, as before.
 
 ## FFmpeg
@@ -117,7 +154,7 @@ VGCS.exe --selfcheck
 ```
 
 It checks the parts that break when packaging goes wrong:
-bundled files, MAVLink, serial ports, MGRS, GeoTIFF DEM (GDAL and PROJ), OpenCV,
+bundled files, the license window and this computer's machine code (WARN until a key is saved), MAVLink, serial ports, MGRS, GeoTIFF DEM (GDAL and PROJ), OpenCV,
 the tracker and detector worker processes, FFmpeg, and the Qt WebEngine map page (with the network blocked).
 It writes one line per check.
 FAIL means the build is broken.

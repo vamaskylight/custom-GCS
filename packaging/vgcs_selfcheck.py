@@ -91,6 +91,22 @@ def check_bundled_files() -> str:
     return f"{root} ({seed_tiles} offline seed tiles)"
 
 
+def check_license() -> str:
+    """The license window is bundled, this computer's machine code can be read,
+    and whether a valid key is saved (a warning, not a failure, when none is)."""
+    from vgcs.app import license_dialog  # noqa: F401  (bundled with its window)
+    from vgcs.app import license_key
+
+    fingerprint = license_key.machine_fingerprint()
+    if fingerprint is None:
+        raise RuntimeError("this computer's ID cannot be read, so no license key can be made for it")
+    code = license_key.machine_code(fingerprint)
+    result = license_key.check_stored_license(fingerprint=fingerprint)
+    if result.ok:
+        return f"machine code {code}, key OK ({license_key.describe(result.info)})"
+    raise CheckWarning(f"machine code {code}, no valid key saved ({result.status.value})")
+
+
 def check_mavlink() -> str:
     import pymavlink
     from pymavlink import mavutil  # noqa: F401  (loads the default dialect, like the app does)
@@ -335,6 +351,7 @@ def run_selfcheck(build: str = "VGCS from source", data_dir: Path | None = None)
     checks: list[tuple[str, Callable[[], str]]] = [
         ("data folder", lambda: check_data_dir(folder)),
         ("bundled files", check_bundled_files),
+        ("license", check_license),
         ("MAVLink", check_mavlink),
         ("serial ports", check_serial_ports),
         ("MGRS grid reference", check_grid_reference),

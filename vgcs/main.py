@@ -9,6 +9,7 @@ from PySide6.QtCore import QCoreApplication, QTimer
 from PySide6.QtWidgets import QApplication
 
 from vgcs.app.gcs_style import gcs_stylesheet
+from vgcs.app.license_key import license_required
 from vgcs.app.main_window import MainWindow
 from vgcs.app.runtime_ui import (
     apply_qt_scale_override,
@@ -133,6 +134,14 @@ def main() -> int:
     app.setFont(build_base_font(profile, ui_scale=ui_scale))
     app.setStyle("Fusion")
     app.setStyleSheet(gcs_stylesheet(mono_family=profile.mono_family, ui_scale=ui_scale))
+    # The packaged exe runs only with a license key for this computer
+    # (vgcs/app/license_key.py). Quitting the key window is not an error: exit 0,
+    # so the launcher shows no error box.
+    if license_required():
+        from vgcs.app.license_dialog import ensure_license
+
+        if not ensure_license():
+            return 0
     win = MainWindow()
     win.show()
     _ctrl_c_tick = install_ctrl_c_handler(app, win)  # keep a reference: a dropped QTimer stops

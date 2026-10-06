@@ -67,6 +67,9 @@ class SkydroidLink : public QObject
     Q_PROPERTY(int wheelYawChannel READ wheelYawChannel WRITE setWheelYawChannel NOTIFY settingsChanged)
     Q_PROPERTY(bool wheelHoldsPosition READ wheelHoldsPosition WRITE setWheelHoldsPosition NOTIFY settingsChanged)
     Q_PROPERTY(bool wheelReverse READ wheelReverse WRITE setWheelReverse NOTIFY settingsChanged)
+    Q_PROPERTY(bool reverseTapYaw READ reverseTapYaw WRITE setReverseTapYaw NOTIFY settingsChanged)
+    Q_PROPERTY(QString dayVideoUrl READ dayVideoUrl WRITE setDayVideoUrl NOTIFY settingsChanged)
+    Q_PROPERTY(QString thermalVideoUrl READ thermalVideoUrl WRITE setThermalVideoUrl NOTIFY settingsChanged)
 
     // Camera state
     Q_PROPERTY(bool answering READ answering NOTIFY answeringChanged)
@@ -76,6 +79,8 @@ class SkydroidLink : public QObject
     Q_PROPERTY(double gimbalPitch READ gimbalPitch NOTIFY attitudeChanged)
     Q_PROPERTY(double gimbalRoll READ gimbalRoll NOTIFY attitudeChanged)
     Q_PROPERTY(bool laserBusy READ laserBusy NOTIFY laserBusyChanged)
+    /// True while the camera turns to a tapped point, before the laser fires.
+    Q_PROPERTY(bool aimBusy READ aimBusy NOTIFY aimBusyChanged)
     Q_PROPERTY(bool laserValid READ laserValid NOTIFY laserChanged)
     Q_PROPERTY(double laserRangeM READ laserRangeM NOTIFY laserChanged)
     Q_PROPERTY(QString laserMessage READ laserMessage NOTIFY laserChanged)
@@ -136,6 +141,16 @@ public:
     void setWheelHoldsPosition(bool holds);
     bool wheelReverse() const { return _wheelReverse; }
     void setWheelReverse(bool reverse);
+    /// RTSP addresses of the day and thermal pictures. The IR button switches
+    /// QGC's video between them; an empty value means the camera's default.
+    /// Tap aiming turns the camera the other way left and right (for a camera
+    /// whose yaw angle runs the other way than VGCS found on the C13).
+    bool reverseTapYaw() const { return _reverseTapYaw; }
+    void setReverseTapYaw(bool reverse);
+    QString dayVideoUrl() const { return _dayVideoUrl; }
+    void setDayVideoUrl(const QString &url);
+    QString thermalVideoUrl() const { return _thermalVideoUrl; }
+    void setThermalVideoUrl(const QString &url);
 
     bool answering() const { return _answering; }
     /// The address the camera answers on, "host:port".
@@ -145,6 +160,7 @@ public:
     double gimbalPitch() const { return _pitch; }
     double gimbalRoll() const { return _roll; }
     bool laserBusy() const { return _laserBusy; }
+    bool aimBusy() const { return _aimBusy; }
     bool laserValid() const { return _laserValid; }
     double laserRangeM() const { return _laserRangeM; }
     QString laserMessage() const { return _laserMessage; }
@@ -177,12 +193,17 @@ public:
     Q_INVOKABLE void stopTouchMotion();
     /// Stop every gimbal motion now.
     Q_INVOKABLE void stopGimbal();
-    /// Yaw and pitch back to the middle (PTZ centre).
+    /// Yaw and pitch back to the middle (angle commands GAY 0 and GAP 0).
     Q_INVOKABLE void center();
     /// Yaw only back to the middle (GAY 0).
     Q_INVOKABLE void centerYaw();
-    /// The camera's one-key look down (PTZ 0A, as VGCS sends).
+    /// Straight down (GAP -90), yaw kept.
     Q_INVOKABLE void pointDown();
+    /// Turn the camera to a point tapped on the video, then measure it with
+    /// the laser. u and v run from 0 to 1 across and down the picture.
+    Q_INVOKABLE void aimAndMeasure(double u, double v);
+    /// The picture's field of view now, in degrees, zoom included.
+    void currentFov(double &horizontalDeg, double &verticalDeg) const;
     Q_INVOKABLE void takePhoto();
     Q_INVOKABLE void toggleRecord();
     /// +1 zoom in, -1 zoom out (one step).
@@ -208,6 +229,7 @@ signals:
     void activeEndpointChanged();
     void attitudeChanged();
     void laserBusyChanged();
+    void aimBusyChanged();
     void laserChanged();
     void zoomChanged();
     void recordingChanged();
@@ -227,6 +249,7 @@ private slots:
     void _finishWheelDetect();
     void _sendWheelAngles();
     void _zoomOutTick();
+    void _aimTick();
 
 private:
     // Plain functions, not slots: a slot taking Vehicle* would need the full
@@ -305,6 +328,18 @@ private:
     int _wheelYawChannel = 0;
     bool _wheelHoldsPosition = false;
     bool _wheelReverse = false;
+    bool _reverseTapYaw = false;
+    QString _dayVideoUrl;
+    QString _thermalVideoUrl;
+
+    // Tap aiming
+    bool _aimBusy = false;
+    bool _aimResent = false;
+    double _aimYaw = 0.0;
+    double _aimPitch = 0.0;
+    QTimer _aimTimer;
+    QElapsedTimer _aimElapsed;
+    QElapsedTimer _aimSettled;
 
     bool _answering = false;
     bool _attitudeValid = false;

@@ -44,6 +44,7 @@ public:
 
     bool answerGac = true;       // answer a GAC question
     bool pushAfterGaa = false;   // send angles on its own after GAA, like the camera's push
+    bool followAngles = false;   // turn to GAY / GAP angle commands, like the real gimbal
     double yaw = 0.0;
     double pitch = -30.0;
     std::optional<std::string> slrE;  // SLR data field from the laser module
@@ -74,6 +75,13 @@ private slots:
             received << QString::fromStdString(raw);
             const auto f = top::parseTpFrame(raw);
             if (!f) {
+                continue;
+            }
+            if ((f->tag == "GAY" || f->tag == "GAP") && f->ctrl == 'w' && followAngles && f->data.size() >= 4) {
+                const auto angle = top::decodeAttitudeField4(f->data.substr(0, 4));
+                if (angle) {
+                    (f->tag == "GAY" ? yaw : pitch) = *angle;
+                }
                 continue;
             }
             if (f->tag == "GAA" && f->ctrl == 'w' && pushAfterGaa) {
@@ -325,14 +333,102 @@ private slots:
 
     void buttonsSendTheirFrames()
     {
+        // Centre and look down use angle commands: the PTZ codes did nothing
+        // on the client's camera (test build 2), while yaw centre (GAY) worked.
         _link->center();
-        _link->centerYaw();
-        _link->pointDown();
-        _link->ptz("stop");
-        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildPtz("center")), 1, 2000);
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAY", 0.0, 30.0)), 1, 2000);
-        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildPtz("nadir")), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAP", 0.0, 30.0)), 1, 2000);
+        _link->centerYaw();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAY", 0.0, 30.0)), 2, 2000);
+        _link->pointDown();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAP", -90.0, 30.0)), 1, 2000);
+        QCOMPARE(_camera->countStartingWith("#TPUG2wPTZ"), 0);
+        _link->ptz("stop");
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildPtz("stop")), 3, 2000);
+    }
+
+    // --- Tap on an object: turn to it, then measure -----------------------------
+
+    void fieldOfViewFollowsZoomAndLens()
+    {
+        double h = 0.0;
+        double v = 0.0;
+        _link->currentFov(h, v);
+        QVERIFY(std::abs(h - 83.4) < 1e-9 && std::abs(v - 46.9) < 1e-9);  // VGCS's calibrated C13 view
+        for (int i = 0; i < 10; ++i) {
+            _link->zoom(1);  // 2.0x
+        }
+        _link->currentFov(h, v);
+        const double expectedH = 2.0 * std::atan(std::tan(83.4 * kPi / 360.0) / 2.0) * 180.0 / kPi;
+        QVERIFY(std::abs(h - expectedH) < 1e-9);
+        _link->setModel("C14 Pro");
+        _link->currentFov(h, v);
+        QVERIFY(std::abs(h - 61.4) < 1e-9 && std::abs(v - 47.9) < 1e-9);  // short lens, step 0
+        _camera->dzmStep = 86;
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomStep(), 86, 3000);
+        _link->currentFov(h, v);
+        QVERIFY(std::abs(h - 14.7) < 1e-9 && std::abs(v - 11.1) < 1e-9);  // long lens, first step
+    }
+
+    void tapTurnsTheCameraThenMeasures()
+    {
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        _camera->followAngles = true;
+        _camera->slrE = "01F4";  // 50 m
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        // Right of centre and a little up: 0.25 x 83.4 = 20.85 degrees right,
+        // which is GAC yaw -20.85 on the C13; 0.1 x 46.9 = 4.69 degrees up.
+        _link->aimAndMeasure(0.75, 0.4);
+        QVERIFY(_link->aimBusy());
+        const std::string gay = top::buildGimbalAngleAxis("GAY", -20.85, 30.0);
+        const std::string gap = top::buildGimbalAngleAxis("GAP", -25.31, 30.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(gay) >= 1 && _camera->countEqual(gap) >= 1, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->aimBusy() && !_link->laserBusy(), 5000);
+        QVERIFY(_link->laserValid());
+        QCOMPARE(_link->laserRangeM(), 50.0);
+        // The laser fired only after the camera turned.
+        const int turn = _camera->received.indexOf(QString::fromStdString(gay));
+        const int shot = _camera->received.indexOf(QString::fromStdString(top::buildSlrTrigger('E')));
+        QVERIFY(turn >= 0 && shot > turn);
+        // The target uses the angles at the shot, so it lies off to that side.
+        QVERIFY(_link->targetValid());
+        QVERIFY(std::abs(_link->gimbalYaw() + 20.85) < 0.01);
+    }
+
+    void tapNeverMeasuresIfTheCameraDoesNotTurn()
+    {
+        _camera->followAngles = false;  // the gimbal ignores the angles
+        _camera->slrE = "01F4";
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->aimAndMeasure(0.9, 0.5);
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->aimBusy(), 10000);
+        QVERIFY(_link->laserMessage().contains("did not turn"));
+        QVERIFY(!_link->laserValid());
+        QCOMPARE(_camera->countStartingWith("#TPUE2wSLR01"), 0);  // no shot at the wrong point
+        // The angles were sent twice (UDP can drop one).
+        QVERIFY(_camera->countStartingWith("#tpUG6wGAY") >= 2);
+    }
+
+    void tapWithoutGimbalAnglesSaysSo()
+    {
+        _camera->answerGac = false;
+        _link->aimAndMeasure(0.5, 0.5);
+        QVERIFY(!_link->aimBusy());
+        QVERIFY(_link->laserMessage().contains("No gimbal angles"));
+        QTest::qWait(300);
+        QCOMPARE(_camera->countStartingWith("#tpUG6wGAY"), 0);
+    }
+
+    void tapYawCanBeReversed()
+    {
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->setReverseTapYaw(true);
+        _link->aimAndMeasure(0.75, 0.4);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAY", 20.85, 30.0)) >= 1, 2000);
     }
 
     // --- RC wheels ---------------------------------------------------------------
@@ -604,6 +700,18 @@ private slots:
         MultiVehicleManager::instance()->setActiveVehicle(&_vehicle);
         QVERIFY(!_link->targetValid());
         QVERIFY(_link->targetMessage().contains("No drone"));
+    }
+
+    void videoAddressesHaveDefaultsAndSurvive()
+    {
+        QCOMPARE(_link->dayVideoUrl(), QString("rtsp://192.168.144.108:554/stream=1"));
+        QCOMPARE(_link->thermalVideoUrl(), QString("rtsp://192.168.144.108:555/stream=2"));
+        _link->setDayVideoUrl("  rtsp://10.0.0.5:554/main  ");
+        _link->setThermalVideoUrl("");  // empty = the camera's default
+        delete _link;
+        _link = new SkydroidLink;
+        QCOMPARE(_link->dayVideoUrl(), QString("rtsp://10.0.0.5:554/main"));
+        QCOMPARE(_link->thermalVideoUrl(), QString("rtsp://192.168.144.108:555/stream=2"));
     }
 
     void screenShowsVamaCameraNames()

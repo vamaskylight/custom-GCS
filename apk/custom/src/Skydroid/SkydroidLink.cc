@@ -25,6 +25,10 @@ constexpr const char *kSettingsGroup = "VamaSkydroid";
 constexpr const char *kDefaultHost = "192.168.144.108";
 constexpr int kDefaultPort = 5000;
 constexpr const char *kDefaultModel = "C13";
+// C12, C13 and C14 Pro: day picture on RTSP port 554, thermal on 555
+// (DOCS/SKYDROID-C13-OBSERVATION-SETUP.md; C14 Pro assumed the same).
+constexpr const char *kDefaultDayVideoUrl = "rtsp://192.168.144.108:554/stream=1";
+constexpr const char *kDefaultThermalVideoUrl = "rtsp://192.168.144.108:555/stream=2";
 constexpr int kDefaultMaxSpeed = 20;     // deg/s at full deflection
 constexpr int kMinMaxSpeed = 5;
 constexpr int kMaxMaxSpeed = 60;         // GSY/GSP carry at most 63.5 deg/s
@@ -72,6 +76,24 @@ constexpr int kDetectMs = 5000;
 constexpr int kDetectMinSpanUs = 150;
 constexpr int kMaxRcChannel = 18;
 constexpr double kCenterYawDps = 30.0;
+// Centre and look down use angle commands (GAY, GAP): the field test of test
+// build 2 found the PTZ centre and look-down codes did nothing on the client's
+// camera, while yaw centre (GAY) worked. Skydroid's TOP document does not list
+// PTZ for the C13 at all.
+constexpr double kAngleMoveDps = 30.0;
+
+// Tap aiming, from VGCS's LRF click aim (vgcs/skydroid/adapter.py):
+// offset in degrees = offset from the picture centre x half the field of view,
+// with the C13's calibrated 83.4 x 46.9 degree view (also used for the C12),
+// and the C13's GAC yaw running opposite to the picture (_LRF_C13_NEGATE_IMAGE_YAW).
+constexpr double kC13AimFovHDeg = 83.4;
+constexpr double kC13AimFovVDeg = 46.9;
+constexpr bool kNegateImageYaw = true;
+constexpr double kAimToleranceDeg = 1.0;  // close enough to the point to fire
+constexpr int kAimSettleMs = 400;          // held that close this long (VGCS waits 0.5 s)
+constexpr int kAimResendMs = 1500;         // send the angles once more (UDP can drop one)
+constexpr int kAimTimeoutMs = 8000;
+constexpr double kPi = 3.14159265358979323846;
 
 // Some C13 firmware takes zoom on these ports as well (VGCS _ZOOM_EXTRA_PORTS).
 const int kC13ZoomExtraPorts[] = {9003, 19853};
@@ -96,7 +118,6 @@ int speedUnits(double degPerSecond)
 /// of a 3840 px readout, restarting at the lens change (Skydroid, 2026-09-19).
 QString c14ProZoomLabel(int step)
 {
-    constexpr double kPi = 3.14159265358979323846;
     const bool longLens = step >= 86;
     const int m = longLens ? std::clamp(step - 86, 0, 98) : std::clamp(step, 0, 85);
     const double crop = 3840.0 / std::max(1, 3840 - 36 * m);
@@ -120,6 +141,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _detectTimer.setSingleShot(true);
     _detectTimer.setInterval(kDetectMs);
     _zoomOutTimer.setInterval(kZoomOutIntervalMs);
+    _aimTimer.setInterval(100);
 
     connect(&_pollTimer, &QTimer::timeout, this, &SkydroidLink::_poll);
     connect(&_answerTimer, &QTimer::timeout, this, &SkydroidLink::_checkAnswering);
@@ -129,6 +151,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_wheelAngleTimer, &QTimer::timeout, this, &SkydroidLink::_sendWheelAngles);
     connect(&_detectTimer, &QTimer::timeout, this, &SkydroidLink::_finishWheelDetect);
     connect(&_zoomOutTimer, &QTimer::timeout, this, &SkydroidLink::_zoomOutTick);
+    connect(&_aimTimer, &QTimer::timeout, this, &SkydroidLink::_aimTick);
 
     MultiVehicleManager *manager = MultiVehicleManager::instance();
     connect(manager, &MultiVehicleManager::activeVehicleChanged, this, &SkydroidLink::_activeVehicleChanged);
@@ -204,7 +227,16 @@ void SkydroidLink::_loadSettings()
     _wheelYawChannel = settings.value(QStringLiteral("wheelYawChannel"), 0).toInt();
     _wheelHoldsPosition = settings.value(QStringLiteral("wheelHoldsPosition"), false).toBool();
     _wheelReverse = settings.value(QStringLiteral("wheelReverse"), false).toBool();
+    _reverseTapYaw = settings.value(QStringLiteral("reverseTapYaw"), false).toBool();
+    _dayVideoUrl = settings.value(QStringLiteral("dayVideoUrl")).toString().trimmed();
+    _thermalVideoUrl = settings.value(QStringLiteral("thermalVideoUrl")).toString().trimmed();
     settings.endGroup();
+    if (_dayVideoUrl.isEmpty()) {
+        _dayVideoUrl = QString::fromLatin1(kDefaultDayVideoUrl);
+    }
+    if (_thermalVideoUrl.isEmpty()) {
+        _thermalVideoUrl = QString::fromLatin1(kDefaultThermalVideoUrl);
+    }
     if (!models().contains(_model)) {
         _model = QString::fromLatin1(kDefaultModel);
     }
@@ -231,6 +263,9 @@ void SkydroidLink::_saveSettings() const
     settings.setValue(QStringLiteral("wheelYawChannel"), _wheelYawChannel);
     settings.setValue(QStringLiteral("wheelHoldsPosition"), _wheelHoldsPosition);
     settings.setValue(QStringLiteral("wheelReverse"), _wheelReverse);
+    settings.setValue(QStringLiteral("reverseTapYaw"), _reverseTapYaw);
+    settings.setValue(QStringLiteral("dayVideoUrl"), _dayVideoUrl);
+    settings.setValue(QStringLiteral("thermalVideoUrl"), _thermalVideoUrl);
     settings.endGroup();
 }
 
@@ -366,6 +401,38 @@ void SkydroidLink::setWheelReverse(bool reverse)
         return;
     }
     _wheelReverse = reverse;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setReverseTapYaw(bool reverse)
+{
+    if (reverse == _reverseTapYaw) {
+        return;
+    }
+    _reverseTapYaw = reverse;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setDayVideoUrl(const QString &url)
+{
+    const QString u = url.trimmed().isEmpty() ? QString::fromLatin1(kDefaultDayVideoUrl) : url.trimmed();
+    if (u == _dayVideoUrl) {
+        return;
+    }
+    _dayVideoUrl = u;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setThermalVideoUrl(const QString &url)
+{
+    const QString u = url.trimmed().isEmpty() ? QString::fromLatin1(kDefaultThermalVideoUrl) : url.trimmed();
+    if (u == _thermalVideoUrl) {
+        return;
+    }
+    _thermalVideoUrl = u;
     _saveSettings();
     emit settingsChanged();
 }
@@ -528,6 +595,11 @@ void SkydroidLink::_stop()
     _wheelAngleTimer.stop();
     _zoomOutTimer.stop();
     _zoomOutLeft = 0;
+    _aimTimer.stop();
+    if (_aimBusy) {
+        _aimBusy = false;
+        emit aimBusyChanged();
+    }
 
     _pollTimer.stop();
     _answerTimer.stop();
@@ -842,7 +914,10 @@ void SkydroidLink::_sendStop()
 
 void SkydroidLink::center()
 {
-    _send(top::buildPtz("center", _options));
+    // One axis per frame, like the speed commands (a combined frame dropped
+    // yaw on a C12 in the field).
+    _send(top::buildGimbalAngleAxis("GAY", 0.0, kAngleMoveDps, _options));
+    _send(top::buildGimbalAngleAxis("GAP", 0.0, kAngleMoveDps, _options));
 }
 
 void SkydroidLink::centerYaw()
@@ -852,8 +927,112 @@ void SkydroidLink::centerYaw()
 
 void SkydroidLink::pointDown()
 {
-    // The camera's one-key look down. VGCS sends the same PTZ code first.
-    _send(top::buildPtz("nadir", _options));
+    // Pitch -90 is straight down: the C13 tilts from -90 to +10, and its
+    // gimbal angles read negative when looking down (VGCS tries -90 first too).
+    _send(top::buildGimbalAngleAxis("GAP", -90.0, kAngleMoveDps, _options));
+}
+
+void SkydroidLink::currentFov(double &horizontalDeg, double &verticalDeg) const
+{
+    auto narrow = [](double fovDeg, double ratio) {
+        return 2.0 * std::atan(std::tan(fovDeg * kPi / 360.0) * ratio) * 180.0 / kPi;
+    };
+    if (_isZoomStepCamera()) {
+        // C14 Pro: the lens and crop for the step it reported (VGCS c14pro_default).
+        const int step = _zoomStep >= 0 ? _zoomStep : 0;
+        const bool longLens = step >= 86;
+        const int m = longLens ? std::clamp(step - 86, 0, 98) : std::clamp(step, 0, 85);
+        horizontalDeg = narrow(longLens ? 14.7 : 61.4, (3840.0 - 36.0 * m) / 3840.0);
+        verticalDeg = narrow(longLens ? 11.1 : 47.9, (2160.0 - 20.0 * m) / 2160.0);
+        return;
+    }
+    // C12, C13: narrowed by the zoom we counted, as VGCS does (tan(fov/2) / zoom).
+    const double zoomX = 1.0 + _zoomCount * kZoomPerStep;
+    horizontalDeg = narrow(kC13AimFovHDeg, 1.0 / zoomX);
+    verticalDeg = narrow(kC13AimFovVDeg, 1.0 / zoomX);
+}
+
+void SkydroidLink::aimAndMeasure(double u, double v)
+{
+    if (_laserBusy || _aimBusy || !std::isfinite(u) || !std::isfinite(v)) {
+        return;
+    }
+    if (!_socket) {
+        _laserValid = false;
+        _laserMessage = tr("Camera link is off. Turn it on in the camera settings.");
+        emit laserChanged();
+        return;
+    }
+    // A new point: the last result no longer applies.
+    _laserValid = false;
+    _target = skydroid::geo::LaserResult{};
+    _targetMessage.clear();
+    emit targetChanged();
+    if (!_attitudeValid) {
+        _laserMessage = tr("No gimbal angles from the camera, so it cannot turn to the point.");
+        emit laserChanged();
+        return;
+    }
+    double hfov = 0.0;
+    double vfov = 0.0;
+    currentFov(hfov, vfov);
+    const double dyawImage = (std::clamp(u, 0.0, 1.0) - 0.5) * hfov;    // right is +
+    const double dpitchImage = (std::clamp(v, 0.0, 1.0) - 0.5) * vfov;  // down is +
+    const bool negate = kNegateImageYaw != _reverseTapYaw;
+    const double yawLimit = _isZoomStepCamera() ? 120.0 : 90.0;
+    const double pitchTop = (_model == QStringLiteral("C13")) ? kC13PitchMaxDeg
+                          : (_isZoomStepCamera() ? 60.0 : kWheelPitchMaxDeg);
+    _aimYaw = std::clamp(_yaw + (negate ? -dyawImage : dyawImage), -yawLimit, yawLimit);
+    _aimPitch = std::clamp(_pitch - dpitchImage, -90.0, pitchTop);
+    _send(top::buildGimbalAngleAxis("GAY", _aimYaw, kAngleMoveDps, _options));
+    _send(top::buildGimbalAngleAxis("GAP", _aimPitch, kAngleMoveDps, _options));
+    _aimBusy = true;
+    _aimResent = false;
+    _aimElapsed.start();
+    _aimSettled.invalidate();
+    _aimTimer.start();
+    _laserMessage = tr("Turning to the point...");
+    emit aimBusyChanged();
+    emit laserChanged();
+}
+
+void SkydroidLink::_aimTick()
+{
+    if (!_aimBusy) {
+        _aimTimer.stop();
+        return;
+    }
+    const bool close = _attitudeFresh() && std::abs(_yaw - _aimYaw) <= kAimToleranceDeg &&
+                       std::abs(_pitch - _aimPitch) <= kAimToleranceDeg;
+    if (close) {
+        if (!_aimSettled.isValid()) {
+            _aimSettled.start();
+        } else if (_aimSettled.elapsed() >= kAimSettleMs) {
+            // On the point: measure it, with the pose of this moment.
+            _aimBusy = false;
+            _aimTimer.stop();
+            emit aimBusyChanged();
+            fireLaser();
+            return;
+        }
+        return;
+    }
+    _aimSettled.invalidate();
+    if (!_aimResent && _aimElapsed.elapsed() >= kAimResendMs) {
+        _aimResent = true;
+        _send(top::buildGimbalAngleAxis("GAY", _aimYaw, kAngleMoveDps, _options));
+        _send(top::buildGimbalAngleAxis("GAP", _aimPitch, kAngleMoveDps, _options));
+    }
+    if (_aimElapsed.elapsed() >= kAimTimeoutMs) {
+        // Never measure a point the camera is not looking at.
+        _aimBusy = false;
+        _aimTimer.stop();
+        _laserValid = false;
+        _laserMessage = tr("The camera did not turn to the point, so nothing was measured. "
+                           "Try again, or put the cross on it and press the laser button.");
+        emit aimBusyChanged();
+        emit laserChanged();
+    }
 }
 
 // --- RC wheels -----------------------------------------------------------------
@@ -1173,7 +1352,7 @@ QString SkydroidLink::zoomLabel() const
 
 void SkydroidLink::fireLaser()
 {
-    if (_laserBusy) {
+    if (_laserBusy || _aimBusy) {  // a tap aim fires the laser itself when it arrives
         return;
     }
     if (!_socket) {

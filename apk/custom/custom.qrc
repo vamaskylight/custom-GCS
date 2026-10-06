@@ -14,6 +14,7 @@
         <file alias="vertical_speed.svg">res/Images/vertical_speed.svg</file>
         <file alias="vama_center.svg">res/Images/vama_center.svg</file>
         <file alias="vama_down.svg">res/Images/vama_down.svg</file>
+        <file alias="vama_ir.svg">res/Images/vama_ir.svg</file>
         <file alias="vama_laser.svg">res/Images/vama_laser.svg</file>
         <file alias="vama_logo_white.svg">res/Images/vama_logo_white.svg</file>
         <file alias="vama_photo.svg">res/Images/vama_photo.svg</file>
