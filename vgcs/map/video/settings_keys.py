@@ -8,3 +8,5 @@ KEY_VIDEO_RTSP_TRANSPORT = "video/rtsp_transport"
 KEY_VIDEO_LOW_LATENCY = "video/low_latency"
 KEY_VIDEO_RECORD_FORMAT = "video/record_format"
 KEY_VIDEO_DEFAULT_VIEW = "video/default_view"
+# Thermal colour mode (M12); a mode id from vgcs/video/thermal_palette.py.
+KEY_VIDEO_THERMAL_PALETTE = "video/thermal_palette"

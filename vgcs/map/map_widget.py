@@ -394,7 +394,7 @@ QPushButton#camPhotoBtn:checked {
   border: 1px solid rgba(214, 224, 241, 230);
   background: rgba(27, 33, 45, 245);
 }
-QPushButton#camSplitBtn, QPushButton#camFollowBtn, QPushButton#camThermalBtn {
+QPushButton#camSplitBtn, QPushButton#camFollowBtn, QPushButton#camThermalBtn, QPushButton#camPaletteBtn {
   width: 28px;
   height: 28px;
   min-width: 28px;
@@ -411,7 +411,8 @@ QPushButton#camSplitBtn, QPushButton#camFollowBtn, QPushButton#camThermalBtn {
   font-size: 11px;
   font-weight: 700;
 }
-QPushButton#camSplitBtn:hover, QPushButton#camFollowBtn:hover, QPushButton#camThermalBtn:hover {
+QPushButton#camSplitBtn:hover, QPushButton#camFollowBtn:hover, QPushButton#camThermalBtn:hover,
+QPushButton#camPaletteBtn:hover {
   background-color: rgba(40, 48, 62, 245);
   border-color: rgba(229, 237, 251, 85);
 }
@@ -420,7 +421,7 @@ QPushButton#camSplitBtn:checked, QPushButton#camFollowBtn:checked, QPushButton#c
   background-color: rgba(24, 52, 34, 250);
   color: #c8ffc8;
 }
-QPushButton#camThermalBtn:disabled {
+QPushButton#camThermalBtn:disabled, QPushButton#camPaletteBtn:disabled {
   opacity: 0.45;
 }
 /* Split is logically on but main canvas is a single zoomed channel (not the 2×2 composite): neutral chrome. */
@@ -1150,8 +1151,19 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_native_thermal.setText("IR")
         self._btn_native_thermal.hide()
 
+        # Thermal colour mode (M12): a strip of the mode in use; a click lists the others.
+        self._btn_native_palette = QPushButton()
+        self._btn_native_palette.setObjectName("camPaletteBtn")
+        self._btn_native_palette.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_palette.setFixedSize(28, 28)
+        self._btn_native_palette.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self._btn_native_palette.hide()
+
         ctr_layout.addWidget(self._btn_native_split, 0)
         ctr_layout.addWidget(self._btn_native_thermal, 0)
+        ctr_layout.addWidget(self._btn_native_palette, 0)
         ctr_layout.addWidget(self._btn_native_follow, 0)
         self._lbl_camera_top_zoom = QLabel(_format_video_zoom_label(1.0))
         self._lbl_camera_top_zoom.setObjectName("camMagnificationLabel")
@@ -1645,6 +1657,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._follow_rail_debounce.timeout.connect(self._commit_native_follow_rail_toggle)
         self._btn_native_split.toggled.connect(self._on_native_split_rail_toggled)
         self._btn_native_thermal.toggled.connect(self._on_native_thermal_feed_toggled)
+        self._btn_native_palette.clicked.connect(self._on_native_palette_clicked)
         self._btn_native_follow.toggled.connect(self._on_native_follow_rail_toggled)
         self._btn_native_record.clicked.connect(self._on_native_record_center_clicked)
         self._btn_native_record.toggled.connect(self._on_native_record_toggled)

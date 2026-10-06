@@ -8,9 +8,9 @@ import os
 import threading
 import time
 
-from PySide6.QtCore import QPointF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QLabel
+from PySide6.QtCore import QPoint, QPointF, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QLabel, QMenu
 
 from vgcs.map.native_video_overlay import NativeVideoOverlayLayer
 from vgcs.map.surface.constants import (
@@ -27,6 +27,7 @@ from vgcs.video.camera_control import (
     camera_zoom_limits,
     camera_zoom_ui_level,
 )
+from vgcs.video import thermal_palette
 from vgcs.video.pipeline import (
     VideoFrame,
     companion_rtsp_port_ready,
@@ -88,6 +89,19 @@ def _wait_for_rtsp_ready(
             return float(now())
         sleep(max(0.05, float(gap_s)))
     return -1.0
+
+
+def _thermal_palette_icon(palette_id: str, width: int, height: int) -> QIcon:
+    """A strip of a thermal colour mode, coldest on the left."""
+    colors = thermal_palette.swatch_colors(palette_id)
+    strip = QImage(max(1, int(width)), max(1, int(height)), QImage.Format.Format_RGB32)
+    painter = QPainter(strip)
+    last = max(1, strip.width() - 1)
+    for x in range(strip.width()):
+        r, g, b = colors[round(x * 255 / last)]
+        painter.fillRect(x, 0, 1, strip.height(), QColor(r, g, b))
+    painter.end()
+    return QIcon(QPixmap.fromImage(strip))
 
 
 class VideoPreviewUiMixin:
@@ -833,7 +847,9 @@ class VideoPreviewUiMixin:
                 return
             im = getattr(self, "_native_video_last", None)
             if isinstance(im, QImage) and not im.isNull():
-                self._render_native_video_preview(im)
+                self._render_native_video_preview(
+                    im, composed=bool(getattr(self, "_native_video_last_composed", False))
+                )
         except Exception:
             pass
 
@@ -928,11 +944,17 @@ class VideoPreviewUiMixin:
         except Exception:
             pass
 
-    def _render_native_video_preview(self, img: QImage) -> None:
+    def _render_native_video_preview(self, img: QImage, *, composed: bool = False) -> None:
+        """Draw one frame. ``composed`` marks the 2x2 grid, which arrives with
+        its thermal cell already coloured."""
         if img is None or img.isNull():
             return
         self._set_native_video_pip_placeholder(False)
+        # A repaint of the picture already on screen keeps what it was.
+        if img is getattr(self, "_native_video_last", None):
+            composed = composed or bool(getattr(self, "_native_video_last_composed", False))
         self._native_video_last = img
+        self._native_video_last_composed = bool(composed)
         split_on = bool(getattr(self, "_video_split_enabled", False))
         try:
             if not split_on:
@@ -940,7 +962,10 @@ class VideoPreviewUiMixin:
         except Exception:
             pass
         try:
-            pm = QPixmap.fromImage(img)
+            # The thermal colour mode goes on here, on the way to the screen;
+            # ``_native_video_last`` above keeps the camera's own picture.
+            shown = img if composed else self._thermal_palette_frame(self._operator_preview_source_id(), img)
+            pm = QPixmap.fromImage(shown)
             if pm.isNull():
                 return
             size = self._native_video_preview.size()
@@ -1067,7 +1092,7 @@ class VideoPreviewUiMixin:
                 f"{label}\nWaiting for stream…",
             )
             p.end()
-            self._render_native_video_preview(out)
+            self._render_native_video_preview(out, composed=True)  # text, not a camera frame
         except Exception:
             pass
 
@@ -1196,6 +1221,7 @@ class VideoPreviewUiMixin:
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.FastTransformation,
                     )
+                    scaled = self._thermal_palette_frame(str(sid or ""), scaled)
                     x0 = dx + max(0, (cw - scaled.width()) // 2)
                     y0 = dy + max(0, (ch - scaled.height()) // 2)
                     p.drawImage(x0, y0, scaled)
@@ -1253,7 +1279,7 @@ class VideoPreviewUiMixin:
                 "out_h": out_h,
                 "slot_source_ids": slot_ids[:4],
             }
-            self._render_native_video_preview(out)
+            self._render_native_video_preview(out, composed=True)
         except Exception:
             return
 
@@ -1688,6 +1714,7 @@ class VideoPreviewUiMixin:
         except Exception:
             in_stream = False
         dual = bool(dual or in_stream)
+        self._sync_native_palette_button(show=bool(show), enabled=bool(dual))
         try:
             btn.setVisible(bool(show))
             btn.setEnabled(bool(dual))
@@ -1743,6 +1770,61 @@ class VideoPreviewUiMixin:
                 btn.blockSignals(False)
             except Exception:
                 pass
+
+    def _sync_native_palette_button(self, *, show: bool | None = None, enabled: bool | None = None) -> None:
+        """The thermal colour button: shown and enabled with the IR button, and
+        drawn as a strip of the mode it is set to."""
+        btn = getattr(self, "_btn_native_palette", None)
+        if btn is None:
+            return
+        try:
+            if show is not None:
+                was_shown = not btn.isHidden()
+                btn.setVisible(bool(show))
+                if was_shown != bool(show):
+                    # One button more or less in the top row. The rail takes its
+                    # width from its content, so it has to be measured and laid
+                    # out again, or the row is squeezed and its last button
+                    # covers the zoom label. The cached sizes are dropped by
+                    # hand: Qt does not refresh them while the rail is hidden.
+                    for holder in (btn.parentWidget(), getattr(self, "_native_hud_right", None)):
+                        lay = holder.layout() if holder is not None else None
+                        if lay is not None:
+                            lay.invalidate()
+                    relayout = getattr(self, "_layout_native_hud", None)
+                    if callable(relayout):
+                        QTimer.singleShot(0, relayout)
+            if enabled is not None:
+                btn.setEnabled(bool(enabled))
+            pid = self.thermal_palette_id()
+            btn.setIcon(_thermal_palette_icon(pid, 18, 12))
+            btn.setIconSize(QSize(18, 12))
+            btn.setToolTip(
+                f"Thermal colours: {thermal_palette.palette_label(pid)}. "
+                "Click to choose another mode for the thermal picture."
+            )
+        except Exception:
+            pass
+
+    def _on_native_palette_clicked(self) -> None:
+        """A menu of the thermal colour modes, under the button."""
+        btn = getattr(self, "_btn_native_palette", None)
+        if btn is None:
+            return
+        menu = QMenu(btn)
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        current = self.thermal_palette_id()
+        for pid in thermal_palette.palette_ids():
+            act = QAction(_thermal_palette_icon(pid, 36, 14), thermal_palette.palette_label(pid), menu)
+            act.setCheckable(True)
+            act.setChecked(pid == current)
+            act.setData(pid)
+            group.addAction(act)
+            menu.addAction(act)
+        chosen = menu.exec(btn.mapToGlobal(QPoint(0, btn.height())))
+        if chosen is not None:
+            self.set_thermal_palette(str(chosen.data() or ""))
 
     def _on_native_thermal_feed_toggled(self, on: bool) -> None:
         # Single-stream cameras (Viewpro) switch which SENSOR fills the one feed

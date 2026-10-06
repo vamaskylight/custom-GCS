@@ -75,6 +75,9 @@ class VideoRecordingMixin:
             dest = photos_dir / f"photo_{stamp}.jpg"
 
         img = self._preview_image_copy_for_snapshot()
+        if img is not None:
+            # The photo shows what the operator sees, thermal colours included.
+            img = self._thermal_palette_frame(self._operator_preview_source_id(), img)
         if img is not None and _save_qimage_to_path(img, dest):
             return str(dest)
 

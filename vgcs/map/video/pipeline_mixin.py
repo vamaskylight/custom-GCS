@@ -23,7 +23,10 @@ from vgcs.map.video.settings_keys import (
     KEY_VIDEO_RTSP_THERMAL,
     KEY_VIDEO_RTSP_TRANSPORT,
     KEY_VIDEO_SOURCE,
+    KEY_VIDEO_THERMAL_PALETTE,
 )
+from vgcs.video import thermal_palette
+from vgcs.video.camera_control import resolve_camera_control_primary
 from vgcs.video.pipeline import (
     HAS_MULTIMEDIA,
     VideoFrame,
@@ -663,6 +666,79 @@ class VideoPipelineMixin:
         if src is not None:
             return str(getattr(src, "source_id", "") or "").strip()
         return ""
+
+    # ------------------------------------------------------------------ #
+    # Thermal colour modes (M12). See vgcs/video/thermal_palette.py.
+    # ------------------------------------------------------------------ #
+
+    def thermal_palette_id(self) -> str:
+        """The operator's thermal colour mode. It is kept between runs."""
+        pid = getattr(self, "_thermal_palette_id", None)
+        if pid is None:
+            try:
+                saved = QSettings(QS_ORG, QS_APP).value(KEY_VIDEO_THERMAL_PALETTE, "")
+            except Exception:
+                saved = ""
+            pid = thermal_palette.normalize_palette_id(saved)
+            self._thermal_palette_id = pid
+        return pid
+
+    def set_thermal_palette(self, palette_id: str) -> None:
+        """Change the thermal colour mode. The picture changes at once."""
+        pid = thermal_palette.normalize_palette_id(palette_id)
+        self._thermal_palette_id = pid
+        try:
+            QSettings(QS_ORG, QS_APP).setValue(KEY_VIDEO_THERMAL_PALETTE, pid)
+        except Exception:
+            pass
+        for refresh in ("_sync_native_palette_button", "_retry_native_video_pixmap"):
+            fn = getattr(self, refresh, None)
+            if callable(fn):
+                try:
+                    fn()  # the button's swatch, then the frame on screen
+                except Exception:
+                    pass
+        try:
+            self._set_status(f"Thermal colours: {thermal_palette.palette_label(pid)}")
+        except Exception:
+            pass
+
+    def _feed_is_thermal(self, source_id: str) -> bool:
+        """True when this feed shows the thermal sensor.
+
+        Two kinds of camera: one with a thermal stream of its own (Skydroid:
+        the feed is called "thermal"), and one that switches the sensor inside
+        its single stream (Viewpro: the feed keeps its name, so ask the camera).
+        """
+        if str(source_id or "").strip().lower() == "thermal":
+            return True
+        primary = resolve_camera_control_primary(getattr(self, "_camera_control", None))
+        sensor = getattr(primary, "video_sensor", None)
+        if callable(sensor):
+            try:
+                return str(sensor() or "").strip().lower() == "ir"
+            except Exception:
+                return False
+        return False
+
+    def _thermal_palette_frame(self, source_id: str, img: QImage) -> QImage:
+        """The frame as it is shown: the thermal feed in the operator's colour
+        mode, any other feed untouched.
+
+        Only for drawing and for the operator's photo. The stored frames stay
+        as the camera sent them, because the object tracker and the zoom work
+        from those, and a colour change in the middle of a track must not
+        change what the tracker sees.
+        """
+        pid = self.thermal_palette_id()
+        if pid == thermal_palette.AS_RECEIVED or img is None:
+            return img
+        try:
+            if not self._feed_is_thermal(source_id):
+                return img
+            return thermal_palette.apply_palette(img, pid)
+        except Exception:
+            return img
 
     def _video_source_by_id(self, source_id: str):
         sid = str(source_id or "").strip()
