@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from vgcs.app.rtk_status import fix_name
+
 # Advisory thresholds. These do NOT decide whether the aircraft may fly — the
 # autopilot does. They flag the obvious cases an operator would want to see
 # before walking out to the pad.
@@ -177,7 +179,8 @@ def _gps_check(fix_type, sats, hdop) -> PreflightCheck:
     if n is not None:
         bits.append(f"{n} satellites")
     if fix is not None:
-        bits.append("3D fix" if fix >= GPS_FIX_3D else f"fix type {fix} (no 3D fix)")
+        # 3 reads "3D fix", and above that the RTK state: "DGPS", "RTK Float", "RTK Fixed".
+        bits.append(fix_name(fix) if fix >= GPS_FIX_3D else f"fix type {fix} (no 3D fix)")
     h = _f(hdop)
     if h is not None:
         bits.append(f"HDOP {h:.2f}")

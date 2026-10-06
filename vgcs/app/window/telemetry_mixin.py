@@ -64,7 +64,7 @@ from vgcs.app.window.helpers import (
 from vgcs.app.arm_readiness import parse_prearm_health
 from vgcs.app.battery_tracker import pack_voltage_v_from_cells, voltage_v_from_mv
 from vgcs.app.gcs_style import gcs_stylesheet
-from vgcs.app.vehicle_messages import SEVERITY_INFO, SEVERITY_WARNING
+from vgcs.app.vehicle_messages import NOTICE_EVENT, SEVERITY_INFO, SEVERITY_WARNING
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
@@ -203,10 +203,55 @@ class MainWindowTelemetryMixin:
             self._publish_vehicle_msg_cell()
             self._append_log(f"WIND: {warning}")
 
+    def _publish_rtk(self) -> None:
+        """Paint the RTK status everywhere it appears (milestone M11).
+
+        Called on every GPS message and once a second from the flight timer,
+        because the readings expire: a fix that is no longer reported must not
+        stay on screen as "RTK Fixed".
+        """
+        rtk = self._rtk
+        now = time.monotonic()
+        field = self._fields["rtk"]
+        text = rtk.field_text(now)
+        if field.text() != text:
+            field.setText(text)
+        level = rtk.level(now)
+        if str(field.property("state_role") or "") != level:
+            self._apply_state_style(field, level)
+        field.setToolTip(rtk.field_tooltip(now))
+        accuracy = self._fields["gps_accuracy"]
+        accuracy_text = rtk.accuracy_text(now)
+        if accuracy.text() != accuracy_text:
+            accuracy.setText(accuracy_text)
+
+        # Header: the satellite count, and the RTK state beside it when there is one.
+        # Only once this link has reported a GPS state: before that the header
+        # keeps its placeholder (and it does not exist yet while the window is built).
+        sats = getattr(self, "_last_gps_sats", None)
+        header_line = getattr(self, "_top_gps_sat", None)
+        if rtk.has_report() and sats is not None and header_line is not None:
+            tag = rtk.header_tag(now)
+            header = f"{sats} {tag}" if tag else str(sats)
+            if header_line.text() != header:
+                header_line.setText(header)
+
+        event = rtk.take_event(now)
+        if isinstance(event, tuple):
+            message, is_warning = event
+            if is_warning:
+                # Losing RTK in flight matters: shown like a vehicle warning.
+                self._vehicle_msg_board.push_vehicle_message(message, severity=SEVERITY_WARNING)
+                self._publish_vehicle_msg_cell()
+            else:
+                self._post_gcs_notice(message, kind=NOTICE_EVENT)
+            self._append_log(f"GPS: {message}")
+
     def _reset_telemetry_fields(self) -> None:
         self._armed_since = None
         self._battery.reset()
         self._wind.reset()
+        self._rtk.reset()
         self._vehicle_msg_board.reset()
         self._prearm_health = None
         self._fields["battery"].setToolTip("")
@@ -266,6 +311,7 @@ class MainWindowTelemetryMixin:
         self._top_battery.setText("—")
         self._top_remote_id.setText("N/A")
         self._publish_wind()
+        self._publish_rtk()
         self._publish_vehicle_msg_cell()
         self._map_widget.set_header_mode("—")
         self._map_widget.set_header_gps(0, "N/A")
@@ -643,7 +689,11 @@ class MainWindowTelemetryMixin:
             self._fields["gps"].setText(
                 f"fix={fix_type} sat={sat} hdop={hdop_text}"
             )
-            self._top_gps_sat.setText(str(sat))
+            self._rtk.update_gps(
+                fix_type, satellites=sat, h_acc_m=data.get("h_acc_m"), v_acc_m=data.get("v_acc_m")
+            )
+            # Writes the satellite line of the header too, with the RTK state beside the count.
+            self._publish_rtk()
             self._top_gps_hdop.setText(hdop_text)
             self._map_widget.set_header_gps(sat, hdop_text, fix_type=fix_type)
             if hdop is not None:
@@ -731,6 +781,13 @@ class MainWindowTelemetryMixin:
                 remaining_pct=pct if pct >= 0 else None,
             )
             self._publish_battery_reading()
+        elif msg_type == "GPS_RTK":
+            self._rtk.update_rtk(
+                satellites=data.get("satellites"),
+                baseline_m=data.get("baseline_m"),
+                hypotheses=data.get("hypotheses"),
+            )
+            self._publish_rtk()
         elif msg_type == "WIND":
             if self._wind.update_wind(data.get("speed_mps"), data.get("direction_deg")):
                 self._publish_wind()

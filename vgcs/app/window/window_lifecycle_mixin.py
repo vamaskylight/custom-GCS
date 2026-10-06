@@ -175,6 +175,14 @@ class MainWindowLifecycleMixin:
             self._publish_wind()
         except Exception:
             pass
+        try:
+            self._publish_rtk()
+        except Exception:
+            pass
+        try:
+            self._publish_rtk_corrections()
+        except Exception:
+            pass
         if self._armed_since is None:
             self._sync_visible_map_overlay_metrics()
             return
@@ -251,6 +259,11 @@ class MainWindowLifecycleMixin:
         # Before anything else: the pre-flight popup is a top-level window, so
         # it survives this one and keeps the application alive with it.
         self._close_preflight_dialog()
+        # The base reader is a thread of its own: stop it, or it outlives the window.
+        try:
+            self._stop_rtk_base()
+        except Exception:
+            pass
         self._on_disconnect()
         self._settings.setValue("window_geometry", self.saveGeometry())
         super().closeEvent(event)

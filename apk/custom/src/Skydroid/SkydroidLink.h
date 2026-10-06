@@ -112,9 +112,12 @@ class SkydroidLink : public QObject
     Q_PROPERTY(bool lockBusy READ lockBusy NOTIFY lockChanged)
     /// True while the camera is told to follow the object.
     Q_PROPERTY(bool lockActive READ lockActive NOTIFY lockChanged)
-    /// How far the camera has turned by itself since the lock started, in degrees.
+    /// How far the camera has turned by itself since the lock settled, in degrees.
     Q_PROPERTY(double lockTurnedDeg READ lockTurnedDeg NOTIFY lockChanged)
-    /// True once the camera has turned by itself during this lock (it follows).
+    /// How far the camera moved in the first 2 s after the lock command, in degrees.
+    /// That first move is its tracker taking over. It does not count as following.
+    Q_PROPERTY(double lockJumpDeg READ lockJumpDeg NOTIFY lockChanged)
+    /// True once the camera has turned by itself after the lock settled (it follows).
     Q_PROPERTY(bool lockFollowSeen READ lockFollowSeen NOTIFY lockChanged)
     Q_PROPERTY(QString lockMessage READ lockMessage NOTIFY lockChanged)
 
@@ -205,6 +208,7 @@ public:
     bool lockBusy() const { return _lockBusy; }
     bool lockActive() const { return _lockActive; }
     double lockTurnedDeg() const { return _lockTurnedDeg; }
+    double lockJumpDeg() const { return _lockJumpDeg; }
     bool lockFollowSeen() const { return _lockFollowSeen; }
     QString lockMessage() const { return _lockMessage; }
     QVariantList rcChannels() const;
@@ -403,6 +407,9 @@ private:
     bool _lockActive = false;
     bool _lockFollowSeen = false;
     bool _lockWarned = false;
+    bool _lockSettled = false;   // the first 2 s after the lock command are over
+    bool _lockJumped = false;    // the camera moved in those 2 s
+    double _lockJumpDeg = 0.0;
     double _lockTurnedDeg = 0.0;
     double _lockStartYaw = 0.0;
     double _lockStartPitch = 0.0;

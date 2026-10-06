@@ -110,6 +110,11 @@ constexpr int kLockFirstLaserMs = 400;
 constexpr int kLockLaserEveryMs = 3000;  // VGCS _M13_SLR_FRESH_INTERVAL_S
 constexpr double kLockFollowDeg = 0.8;
 constexpr int kLockFollowWarnMs = 6000;
+// The camera's first move after the lock command is its tracker taking over,
+// not the camera following something. In the field video of test build 4 it
+// jumped 2.6 degrees within half a second beside a parked car, and the app
+// said "is following". So the angles to compare with are taken after this.
+constexpr int kLockSettleMs = 2000;
 
 // Some C13 firmware takes zoom on these ports as well (VGCS _ZOOM_EXTRA_PORTS).
 const int kC13ZoomExtraPorts[] = {9003, 19853};
@@ -1194,6 +1199,9 @@ void SkydroidLink::_armLock(double u, double v)
     _lockActive = true;
     _lockFollowSeen = false;
     _lockWarned = false;
+    _lockSettled = false;
+    _lockJumped = false;
+    _lockJumpDeg = 0.0;
     _lockTurnedDeg = 0.0;
     _lockStartYaw = _yaw;
     _lockStartPitch = _pitch;
@@ -1226,24 +1234,45 @@ void SkydroidLink::_lockTick()
     bool changed = false;
     if (_attitudeFresh()) {
         const double turned = std::max(std::abs(_yaw - _lockStartYaw), std::abs(_pitch - _lockStartPitch));
-        if (std::abs(turned - _lockTurnedDeg) >= 0.1) {
-            _lockTurnedDeg = turned;
-            changed = true;
-        }
-        if (!_lockFollowSeen && turned > kLockFollowDeg) {
-            _lockFollowSeen = true;
-            _lockMessage = tr("Locked. The camera is following the object.");
-            changed = true;
+        if (!_lockSettled) {
+            if (now >= kLockSettleMs) {
+                // From here on, a turn is the camera following. What it did before
+                // this is kept apart as the jump at the lock.
+                _lockSettled = true;
+                _lockJumpDeg = turned;
+                _lockStartYaw = _yaw;
+                _lockStartPitch = _pitch;
+                if (turned > kLockFollowDeg) {
+                    _lockJumped = true;
+                    _lockMessage = tr("Locked. The camera moved %1 degrees at the lock. "
+                                      "Check that the cross is on the object.").arg(turned, 0, 'f', 1);
+                }
+                changed = true;
+            }
+        } else {
+            if (std::abs(turned - _lockTurnedDeg) >= 0.1) {
+                _lockTurnedDeg = turned;
+                changed = true;
+            }
+            if (!_lockFollowSeen && turned > kLockFollowDeg) {
+                _lockFollowSeen = true;
+                _lockMessage = tr("Locked. The camera is following the object.");
+                changed = true;
+            }
         }
     }
     if (!_lockFollowSeen && !_lockWarned && now >= kLockFollowWarnMs) {
         _lockWarned = true;
-        // Without angles the app cannot see the camera turn: say that, not "not following".
-        _lockMessage = _attitudeValid
-            ? tr("Locked, but the camera has not turned by itself yet. "
-                 "If the object moved, the camera is not following it.")
-            : tr("Locked, but the camera sends no angles, so the app cannot tell if it follows.");
-        changed = true;
+        if (!_attitudeValid) {
+            // Without angles the app cannot see the camera turn: say that, not "not following".
+            _lockMessage = tr("Locked, but the camera sends no angles, so the app cannot tell if it follows.");
+            changed = true;
+        } else if (!_lockJumped) {
+            _lockMessage = tr("Locked, but the camera has not turned by itself yet. "
+                              "If the object moved, the camera is not following it.");
+            changed = true;
+        }
+        // After a jump the text already says what to check, and it stays.
     }
     if (changed) {
         emit lockChanged();

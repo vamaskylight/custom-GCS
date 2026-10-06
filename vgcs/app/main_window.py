@@ -63,6 +63,8 @@ from pymavlink import mavutil
 from vgcs.app.arm_readiness import PrearmHealth
 from vgcs.app.battery_tracker import BatteryTracker
 from vgcs.app.gcs_style import gcs_stylesheet
+from vgcs.app.rtk_corrections import CorrectionStream
+from vgcs.app.rtk_status import RtkStatus
 from vgcs.app.vehicle_messages import VehicleMessageBoard
 from vgcs.app.wind_monitor import DEFAULT_WARN_MPS, KEY_WIND_WARN_MPS, WindMonitor
 from vgcs.app.window import MainWindowMixins
@@ -141,6 +143,12 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._battery = BatteryTracker()
         # Wind estimate and onboard wind failsafe status (see vgcs.app.wind_monitor).
         self._wind = WindMonitor(self._settings.value(KEY_WIND_WARN_MPS, DEFAULT_WARN_MPS))
+        # RTK fix, accuracy and correction status of the vehicle's GPS (see vgcs.app.rtk_status).
+        self._rtk = RtkStatus()
+        # The RTK base station on this PC, and what is known about its corrections
+        # (see vgcs.app.window.rtk_base_mixin).
+        self._rtk_corrections = CorrectionStream()
+        self._rtk_base_thread = None
         # Vehicle-reported PreArm verdict from SYS_STATUS; None until one arrives.
         self._prearm_health: PrearmHealth | None = None
         self._rid_live_available = False
@@ -465,6 +473,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._flight_timer.setInterval(1000)
         self._flight_timer.timeout.connect(self._on_flight_timer_tick)
         self._flight_timer.start()
+        # A base station saved in the settings is read again from the start.
+        QTimer.singleShot(0, self._apply_rtk_base_setting)
         self._c13_lrf_timer = QTimer(self)
         self._c13_lrf_timer.setInterval(1000)
         self._c13_lrf_timer.timeout.connect(self._refresh_c13_lrf_display)

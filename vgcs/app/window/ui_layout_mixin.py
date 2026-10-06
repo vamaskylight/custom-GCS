@@ -925,6 +925,12 @@ class MainWindowUiLayoutMixin:
         row_sys("Obstacle (prox)", "obstacle_prox", "LRF", "rangefinder")
         row_sys("Battery failsafe", "failsafe_battery", "RC failsafe", "failsafe_rc")
         row_sys("Wind", "wind", "Wind failsafe", "wind_failsafe")
+        row_sys("RTK", "rtk", "GPS accuracy", "gps_accuracy")
+        lc = QLabel("RTK corrections")
+        lc.setStyleSheet("color: #7d869c;")
+        sg.addWidget(lc, sr, 0)
+        sg.addWidget(add_field("rtk_corrections"), sr, 1, 1, 3)
+        sr += 1
         la = QLabel("Arm readiness")
         la.setStyleSheet("color: #7d869c;")
         sg.addWidget(la, sr, 0)
@@ -939,6 +945,8 @@ class MainWindowUiLayoutMixin:
         self._apply_state_style(self._fields["obstacle_prox"], "na")
         self._apply_state_style(self._fields["rangefinder"], "na")
         self._publish_wind()
+        self._publish_rtk()
+        self._publish_rtk_corrections()
 
         col = QWidget()
         v = QVBoxLayout()

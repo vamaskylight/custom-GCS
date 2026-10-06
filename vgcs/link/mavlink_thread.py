@@ -24,6 +24,7 @@ from vgcs.mission import (
     build_mission_plan,
     normalize_end_action,
 )
+from vgcs.link.rtcm import MAVLINK_PIECE_LEN, to_mavlink_pieces
 from vgcs.skydroid.adapter import GimbalStatus
 
 # ArduPilot dialect IDs (default pymavlink dialect omits OBSTACLE_DISTANCE).
@@ -31,6 +32,8 @@ _MAV_MSG_ID_OBSTACLE_DISTANCE = int(mav_apm.MAVLINK_MSG_ID_OBSTACLE_DISTANCE)
 _MAV_MSG_ID_DISTANCE_SENSOR = int(mav_apm.MAVLINK_MSG_ID_DISTANCE_SENSOR)
 _MAV_MSG_ID_RANGEFINDER = int(mav_apm.MAVLINK_MSG_ID_RANGEFINDER)
 _PROX_STREAM_RESEND_S = 20.0
+# About ten seconds of corrections from a base that sends five messages a second.
+_RTCM_QUEUE_MAX = 50
 
 # Messages that describe the *vehicle* and must come from the autopilot alone.
 # Anything else that shares the link — companion computer, gimbal, air unit,
@@ -54,6 +57,8 @@ _AUTOPILOT_ONLY_MESSAGES = frozenset(
         # script, both describe this aircraft and nothing else on the link.
         "WIND",
         "NAMED_VALUE_FLOAT",
+        # RTK status of the aircraft's own GPS.
+        "GPS_RTK",
     }
 )
 
@@ -104,6 +109,15 @@ _ARM_ACK_RESULTS = {
     5: "in progress",
     6: "cancelled",
 }
+
+
+def _mm_to_m_or_none(raw: object) -> float | None:
+    """A MAVLink length in millimetres as metres. 0 and unreadable mean "not given"."""
+    try:
+        mm = float(raw or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return mm / 1000.0 if mm > 0.0 else None
 
 
 def named_value_name(raw: object) -> str:
@@ -232,6 +246,7 @@ class MavlinkThread(QThread):
             "DISTANCE_SENSOR": 0.15,
             "RANGEFINDER": 0.15,
             "WIND": 0.4,
+            "GPS_RTK": 0.4,
         }
         self._last_hb_log_mono = 0.0
         # Last mission built/downloaded. MISSION_CURRENT / MISSION_ITEM_REACHED report a
@@ -243,6 +258,13 @@ class MavlinkThread(QThread):
         self._proximity_log_once: set[str] = set()
         self._gimbal_lock = threading.Lock()
         self._gimbal_status = GimbalStatus()
+        # RTK corrections (RTCM 3) waiting to go to the vehicle. Kept apart from
+        # the command queue, so a stream of corrections can never hold up an
+        # arm, mode or mission command. Short on purpose: a correction that
+        # waited seconds is of no use to the GPS, so the oldest is dropped.
+        self._rtcm_queue: deque[bytes] = deque(maxlen=_RTCM_QUEUE_MAX)
+        self._rtcm_sequence = 0
+        self._rtcm_bytes_sent = 0
 
     def get_cached_gimbal_status(self) -> GimbalStatus | None:
         with self._gimbal_lock:
@@ -280,6 +302,42 @@ class MavlinkThread(QThread):
             return
         self._telemetry_last_emit_mono[throttle_key] = now
         self.telemetry.emit(msg_type, payload)
+
+    def queue_rtcm(self, data: bytes) -> None:
+        """Hand over RTK correction data (whole RTCM 3 messages) for the vehicle's GPS."""
+        if data:
+            self._rtcm_queue.append(bytes(data))
+
+    def rtcm_bytes_sent(self) -> int:
+        """How many bytes of corrections have gone to the vehicle on this link."""
+        return int(self._rtcm_bytes_sent)
+
+    def _send_pending_rtcm(self) -> None:
+        """Send the waiting corrections as GPS_RTCM_DATA (see vgcs.link.rtcm for the cutting rules)."""
+        if self._master is None or not self._rtcm_queue:
+            return
+        # Corrections are for the vehicle this link talks to, so not before it has
+        # been heard (the first heartbeat is also what sets the reply address).
+        if not self._streams_requested:
+            self._rtcm_queue.clear()
+            return
+        for _ in range(_RTCM_QUEUE_MAX):
+            try:
+                data = self._rtcm_queue.popleft()
+            except IndexError:
+                return
+            pieces, self._rtcm_sequence = to_mavlink_pieces(data, self._rtcm_sequence)
+            try:
+                for flags, piece in pieces:
+                    self._master.mav.gps_rtcm_data_send(flags, len(piece), piece.ljust(MAVLINK_PIECE_LEN, b"\x00"))
+            except Exception as e:
+                # One failed send must not cost the link. Say it once in a while.
+                now = time.monotonic()
+                if now - float(getattr(self, "_rtcm_error_log_mono", 0.0)) >= 10.0:
+                    self._rtcm_error_log_mono = now
+                    self.log_line.emit(f"RTK corrections could not be sent: {e}")
+                return
+            self._rtcm_bytes_sent += len(data)
 
     def queue_mission_upload(
         self, waypoints: list[dict], end_action: str = DEFAULT_MISSION_END_ACTION
@@ -517,10 +575,13 @@ class MavlinkThread(QThread):
         while self._running and self._master is not None:
             self._process_pending_commands()
             self._maybe_send_gcs_heartbeat()
+            self._send_pending_rtcm()
             try:
+                # Short wait while corrections flow, so they are not held back
+                # for up to a second on a link where the vehicle is quiet.
                 msg = self._master.recv_match(
                     blocking=True,
-                    timeout=1.0,
+                    timeout=0.2 if self._rtcm_bytes_sent else 1.0,
                 )
             except Exception as e:
                 if not self._running:
@@ -685,6 +746,22 @@ class MavlinkThread(QThread):
                         "climb": float(getattr(msg, "climb", 0.0) or 0.0),
                     },
                 )
+            elif msg_type == "GPS_RTK":
+                # Only the Septentrio, Swift and Emlid drivers send this. A
+                # u-blox sends nothing here: its fix type is all there is.
+                baseline_mm = math.sqrt(
+                    float(getattr(msg, "baseline_a_mm", 0) or 0) ** 2
+                    + float(getattr(msg, "baseline_b_mm", 0) or 0) ** 2
+                    + float(getattr(msg, "baseline_c_mm", 0) or 0) ** 2
+                )
+                self._emit_telemetry_payload(
+                    "GPS_RTK",
+                    {
+                        "satellites": int(getattr(msg, "nsats", 0) or 0),
+                        "baseline_m": baseline_mm / 1000.0,
+                        "hypotheses": int(getattr(msg, "iar_num_hypotheses", 0) or 0),
+                    },
+                )
             elif msg_type == "WIND":
                 # ArduCopter sends this only with the EKF drag parameters set.
                 # direction is where the wind comes FROM, -180 to 180 degrees.
@@ -777,6 +854,10 @@ class MavlinkThread(QThread):
                     "satellites_visible": int(getattr(msg, "satellites_visible", 0) or 0),
                     "fix_type": fix_type,
                     "hdop": hdop,
+                    # The receiver's own accuracy estimate (MAVLink 2 fields, in
+                    # mm). 0 means it gives none, which is not "0 m accurate".
+                    "h_acc_m": _mm_to_m_or_none(getattr(msg, "h_acc", 0)),
+                    "v_acc_m": _mm_to_m_or_none(getattr(msg, "v_acc", 0)),
                 }
                 # 2=2D fix, 3=3D fix, 4=DGPS, 5=RTK, etc. — use when EKF position not ready yet.
                 if fix_type >= 2 and (abs(raw_lat) > 1e-9 or abs(raw_lon) > 1e-9):

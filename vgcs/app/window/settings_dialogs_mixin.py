@@ -64,6 +64,7 @@ from vgcs.app.window.helpers import (
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.app.wind_monitor import DEFAULT_WARN_MPS, KEY_WIND_WARN_MPS, MAX_WARN_MPS, clamp_warn_mps
+from vgcs.app.window.rtk_base_mixin import KEY_RTK_BASE_SOURCE
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
 from vgcs.map import MapWidget
@@ -212,6 +213,26 @@ class MainWindowSettingsDialogsMixin:
         wg.setColumnStretch(1, 1)
         wind_group.setLayout(wg)
         g.addWidget(wind_group)
+
+        rtk_group = QGroupBox("RTK base station")
+        rg = QGridLayout()
+        rg.addWidget(QLabel("Port or address"), 0, 0)
+        rtk_base_edit = QLineEdit()
+        rtk_base_edit.setObjectName("rtkBaseEdit")
+        rtk_base_edit.setPlaceholderText("COM7:115200  or  192.168.1.50:2101  (empty: no base station)")
+        rtk_base_edit.setText(self._rtk_base_source_setting())
+        rg.addWidget(rtk_base_edit, 0, 1)
+        rtk_hint = QLabel(
+            "VGCS reads the corrections of an RTK base station here and passes them to the drone, "
+            "so that its GPS can reach RTK Float and RTK Fixed. The base must already send RTCM 3 messages "
+            "with its own position (1005 or 1006). The dashboard shows what arrives under RTK corrections."
+        )
+        rtk_hint.setWordWrap(True)
+        rtk_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        rg.addWidget(rtk_hint, 1, 0, 1, 2)
+        rg.setColumnStretch(1, 1)
+        rtk_group.setLayout(rg)
+        g.addWidget(rtk_group)
 
         g.addStretch(1)
         stack.addWidget(general)
@@ -797,6 +818,8 @@ class MainWindowSettingsDialogsMixin:
                 s.setValue(KEY_WIND_WARN_MPS, float(wind_warn.value()))
                 self._wind.set_warn_mps(wind_warn.value())
                 self._publish_wind()
+                s.setValue(KEY_RTK_BASE_SOURCE, str(rtk_base_edit.text()).strip())
+                self._apply_rtk_base_setting()
                 try:
                     from vgcs.observe.dem import clear_dem_cache
 

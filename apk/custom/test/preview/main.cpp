@@ -367,7 +367,7 @@ int main(int argc, char *argv[])
                     QStringLiteral("GOT %1, SUM 01 %2").arg(camera.gotFrames).arg(camera.sumConfirms));
              shot("13_locked.png");
          }},
-        {2500, [&]() {
+        {3500, [&]() {
              expect(link.lockFollowSeen(), "lock: the camera is seen following",
                     QStringLiteral("%1 deg").arg(link.lockTurnedDeg()));
              expect(link.laserValid(), "lock: the laser measured the locked object",

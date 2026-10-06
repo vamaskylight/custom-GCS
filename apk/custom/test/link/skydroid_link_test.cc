@@ -60,6 +60,10 @@ public:
     // After a SUM confirm the yaw drifts this fast, like a camera following an
     // object, until a SUM stop.
     double trackDriftDps = 0.0;
+    // Half a second after the first SUM confirm the yaw jumps once by this much,
+    // like the V13 in the field video of test build 4 (its tracker took over and
+    // moved the aim).
+    double lockJumpDeg = 0.0;
     bool tracking = false;
     QStringList received;
     QList<qint64> receivedAtMs;  // arrival time of each frame in received
@@ -111,7 +115,12 @@ private slots:
                 continue;
             }
             if (f->tag == "SUM" && f->ctrl == 'w') {
+                const bool wasTracking = tracking;
                 tracking = f->data == "01";
+                if (tracking && !wasTracking && lockJumpDeg != 0.0) {
+                    // Half a second later, as on the real camera.
+                    QTimer::singleShot(500, this, [this]() { yaw += lockJumpDeg; });
+                }
                 if (!tracking) {
                     _trackTimer.stop();
                 } else if (trackDriftDps != 0.0 && !_trackTimer.isActive()) {
@@ -440,7 +449,7 @@ private slots:
         top::Options upper;
         upper.gClassUpperHeader = true;
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(640, 360, 1280, 720, upper)), 1, 1000);
-        QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 5000);
         _link->stopLock();
     }
 
@@ -639,8 +648,54 @@ private slots:
         _link->lockAt(0.5, 0.5);
         QVERIFY(_link->lockActive());
         QVERIFY(!_link->lockFollowSeen());
+        // The first 2 s do not count: what the camera does then is its tracker
+        // taking over. It has already turned about 7 degrees here.
+        QTest::qWait(1500);
+        QVERIFY(!_link->lockFollowSeen());
+        QVERIFY(_link->lockTurnedDeg() < 0.1);
         QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 3000);
         QVERIFY(_link->lockTurnedDeg() > 0.8);
+        QVERIFY(_link->lockMessage().contains("following"));
+        _link->stopLock();
+    }
+
+    // Field video of test build 4 (2026-10-06 21:53): right after the lock the
+    // V13 moved 2.6 degrees by itself beside a parked car and then stood still.
+    // The app said "is following", and nothing was moving.
+    void aJumpAtTheLockIsNotFollowing()
+    {
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        _camera->lockJumpDeg = 2.6;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockMessage().contains("moved 2.6 degrees at the lock"), 4000);
+        QVERIFY(_link->lockMessage().contains("Check that the cross is on the object"));
+        QVERIFY(!_link->lockFollowSeen());
+        QVERIFY(std::abs(_link->lockJumpDeg() - 2.6) < 0.05);
+        QVERIFY(_link->lockTurnedDeg() < 0.1);
+        // Later the camera still stands still: the advice stays, and it never says "following".
+        QTest::qWait(5000);
+        QVERIFY(!_link->lockFollowSeen());
+        QVERIFY(_link->lockMessage().contains("Check that the cross is on the object"));
+        QVERIFY(!_link->lockMessage().contains("following"));
+        QVERIFY(_link->lockActive());
+        _link->stopLock();
+    }
+
+    void followingAfterAJumpIsStillSeen()
+    {
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        _camera->lockJumpDeg = 2.6;
+        _camera->trackDriftDps = 5.0;  // and then it follows a moving object
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 5000);
+        QVERIFY(_link->lockJumpDeg() > 2.6);          // the jump, plus what it followed in the first 2 s
+        QVERIFY(_link->lockTurnedDeg() > 0.8);        // counted from after those 2 s
         QVERIFY(_link->lockMessage().contains("following"));
         _link->stopLock();
     }
