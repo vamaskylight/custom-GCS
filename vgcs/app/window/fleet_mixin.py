@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 
 from vgcs.link.fleet import LINK_LOST, LINK_UP, LINK_WAITING, Fleet, row_cells
 
-FLEET_COLUMNS = ["Drone", "Link", "Mode", "Armed", "Height", "Battery", "GPS", "Mission", "Last message"]
+FLEET_COLUMNS = ["Drone", "Link", "Mode", "Armed", "Height", "Battery", "GPS", "Signing", "Mission", "Last message"]
 FLEET_REFRESH_MS = 500
 
 # The window slots each drone's link thread is wired to while it is active.
@@ -74,7 +74,7 @@ class MainWindowFleetMixin:
     """Fleet of drones for the main window. See the module docstring."""
 
     def _init_fleet(self) -> None:
-        self._fleet = Fleet()
+        self._fleet = Fleet(thread_factory=getattr(self, "_make_link_thread", None))
         self._fleet.alert.connect(self._on_fleet_alert)
         self._fleet_dialog = None
         self._fleet_table = None

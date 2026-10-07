@@ -611,8 +611,77 @@ def link_silence(version: str, r: Report) -> None:
         f.close()
 
 
+def signed_commands(version: str, r: Report) -> None:
+    """Command signing (M16): once the drone holds VGCS's key, another ground station without it cannot command it."""
+    from pymavlink import mavutil
+
+    f = Flight(version)
+    outsider = None
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        r.check(f.ready_to_fly(), "the drone is ready")
+        # Another ground station on the simulator's third port, without the key.
+        outsider = mavutil.mavlink_connection(f"tcp:127.0.0.1:{sim.port + 3}", source_system=250)
+        r.check(outsider.wait_heartbeat(timeout=20) is not None, "an outsider ground station is connected too")
+
+        def outsider_mode(name: str) -> None:
+            outsider.set_mode(outsider.mode_mapping()[name])
+
+        outsider_mode("GUIDED")
+        r.check(f.wait(lambda: sim.mode == "GUIDED", 15), f"without signing the outsider can change the mode ({sim.mode})")
+        outsider_mode("STABILIZE")
+        f.wait(lambda: sim.mode == "STABILIZE", 15)
+
+        def signing_state() -> str:
+            rows = rec.telemetry.get("SIGNING", [])
+            return rows[-1][1].get("state", "") if rows else ""
+
+        key = bytes(range(1, 33))
+        link.queue_signing_key(key, 9)
+        f.wait_real(lambda: signing_state() == "drone_unsigned", 8)
+        r.check(signing_state() == "drone_unsigned", f"VGCS signs, and sees that the drone does not yet ({signing_state()})")
+        since = rec.now()
+        link.queue_signing_to_drone(True)
+        f.wait_real(lambda: rec.action("signing", since) is not None, 10)
+        result = rec.action("signing", since)
+        r.check(result is not None and result[0], f"key sent: VGCS reports that the drone took it ({result})")
+        r.check(signing_state() == "drone_signs", f"the drone signs with VGCS's key ({signing_state()})")
+
+        for _ in range(4):
+            outsider_mode("GUIDED")
+            f.wait(lambda: False, 2)
+        r.check(sim.mode == "STABILIZE", f"the outsider's mode change is ignored now ({sim.mode})")
+        outsider.mav.command_long_send(1, 1, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
+        f.wait(lambda: False, 5)
+        r.check(not sim.armed, "and its arm command too")
+        outsider.mav.setup_signing_send(1, 1, bytes(32), 0)
+        f.wait(lambda: False, 5)
+        f.wait_real(lambda: False, 2)
+        r.check(signing_state() == "drone_signs", f"the outsider cannot take the key away ({signing_state()})")
+
+        since = rec.now()
+        link.queue_mode_change("LOITER")
+        r.check(f.wait(lambda: sim.mode == "LOITER", 15), f"VGCS's signed mode change is obeyed ({sim.mode})")
+        f.wait_real(lambda: any(m[0] >= since and m[1] == "LOITER" for m in rec.modes), 6)
+        said = [m for m in rec.modes if m[0] >= since and m[1] == "LOITER"]
+        r.check(bool(said) and said[-1][2], "and confirmed")
+
+        since = rec.now()
+        link.queue_signing_to_drone(False)
+        f.wait_real(lambda: rec.action("signing", since) is not None, 10)
+        result = rec.action("signing", since)
+        r.check(result is not None and result[0], f"key removed from the drone ({result})")
+        outsider_mode("ALT_HOLD")
+        r.check(f.wait(lambda: sim.mode == "ALT_HOLD", 15), f"without the key on the drone the outsider is obeyed again ({sim.mode})")
+        r.check(not [e for e in rec.errors if "Signing" in e[1]], f"no signing error {[e[1] for e in rec.errors if 'Signing' in e[1]][:2]}")
+    finally:
+        if outsider is not None:
+            outsider.close()
+        f.close()
+
+
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
-         mission_upload_and_download, mission_flight, takeoff_fence_and_land, link_silence]
+         mission_upload_and_download, mission_flight, takeoff_fence_and_land, link_silence, signed_commands]
 
 
 def write_report(path: pathlib.Path, results: list[tuple[str, Report, float]]) -> None:

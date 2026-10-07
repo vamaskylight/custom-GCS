@@ -32,25 +32,27 @@
 
 3. [Several drones (fleet)](#several-drones-fleet)
 
-4. [Requirements](#requirements)
+4. [Command signing (MAVLink 2)](#command-signing-mavlink-2)
 
-5. [Clone and first-time setup](#clone-and-first-time-setup)
+5. [Requirements](#requirements)
 
-6. [Setup — Windows](#setup--windows)
+6. [Clone and first-time setup](#clone-and-first-time-setup)
 
-7. [Setup — Linux](#setup--linux)
+7. [Setup — Windows](#setup--windows)
 
-8. [Run the application](#run-the-application)
+8. [Setup — Linux](#setup--linux)
 
-9. [Connect to ArduPilot SITL](#connect-to-arduopilot-sitl)
+9. [Run the application](#run-the-application)
 
-10. [Project layout](#project-layout)
+10. [Connect to ArduPilot SITL](#connect-to-arduopilot-sitl)
 
-11. [Architecture note](#architecture-note)
+11. [Project layout](#project-layout)
 
-12. [Troubleshooting](#troubleshooting)
+12. [Architecture note](#architecture-note)
 
-13. [For contributors](#for-contributors)
+13. [Troubleshooting](#troubleshooting)
+
+14. [For contributors](#for-contributors)
 
 
 
@@ -143,6 +145,23 @@ VGCS never sends one mission to several drones: the same route would fly them in
 Tested with three ArduCopter simulators at once, on 4.6.2 and 4.7.0 (`system_test/vgcs_fleet_test.py`).
 
 Not yet: the 3D view shows only the drone on screen, and the video and camera follow the camera settings, not the drone on screen.
+
+---
+
+## Command signing (MAVLink 2)
+
+VGCS can sign every command it sends (milestone M16, client requirement 29). A drone that holds the same key ignores commands from any ground station without it.
+
+1. Application Settings, General, **Command signing**: **Set passphrase...** (at least 8 characters, longer is safer).
+2. Connect the drone, disarmed, and press **Send key to the drone**. VGCS reports when the drone signs with the key.
+3. The dashboard value **Command signing** shows what the drone on screen does. The Fleet panel shows it for every drone.
+
+- The same passphrase works in the VAMA APK (QGroundControl's MAVLink signing keys): VGCS makes the key from it the same way.
+- The passphrase is never stored. The key is, encrypted for the Windows user (DPAPI).
+- A lost passphrase is not a lost drone: ArduPilot always accepts a new key over USB.
+- Signing proves who sent a command. It does not encrypt: telemetry and video can still be received.
+
+What is and is not protected: `DOCS/M16-SECURITY.md`. Tested against ArduCopter 4.6.2 and 4.7.0 in the simulator (`system_test/vgcs_sitl_test.py`, case `signed_commands`).
 
 ---
 

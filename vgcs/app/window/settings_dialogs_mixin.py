@@ -233,6 +233,9 @@ class MainWindowSettingsDialogsMixin:
         rg.setColumnStretch(1, 1)
         rtk_group.setLayout(rg)
         g.addWidget(rtk_group)
+        build_signing = getattr(self, "_build_signing_settings_group", None)
+        if build_signing is not None:
+            g.addWidget(build_signing())
 
         g.addStretch(1)
         stack.addWidget(general)

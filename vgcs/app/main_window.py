@@ -108,6 +108,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
 
         self._settings = QSettings("VGCS", "VGCS")
         self._thread: MavlinkThread | None = None
+        # Command signing (M16) before the fleet: every link the fleet opens signs.
+        self._init_signing()
         # Several drones (M15): every drone's link, with self._thread the one on screen.
         self._init_fleet()
         self._camera_control_backend: object | None = None

@@ -342,7 +342,9 @@ class _NativeTileLoader(QObject):
             # VGCS_NO_NETWORK=1 still fetched from server.arcgisonline.com
             # (window test against the simulator, 2026-10-07). Answered as a
             # failed fetch, so the map retries a few times and then stops.
-            QTimer.singleShot(0, lambda: self.loaded.emit(int(z), int(x), int(y), QImage()))
+            # Tied to this loader: if it is deleted first, Qt drops the call
+            # (an untied one raised "Signal source has been deleted").
+            QTimer.singleShot(0, self, lambda: self.loaded.emit(int(z), int(x), int(y), QImage()))
             return
         self._queue.append((float(distance), z, x, y, url, source_id, use_disk_cache))
         self._queue.sort(key=lambda e: e[0])
@@ -611,7 +613,7 @@ class NativeTileMapView(QWidget):
         # >1.0 enlarges the vehicle chevron (used when the map is mirrored into the small video-swap card).
         self._vehicle_arrow_scale = 1.0
         self._sync_view_zoom()
-        QTimer.singleShot(0, self._warm_disk_tiles_for_viewport)
+        QTimer.singleShot(0, self, self._warm_disk_tiles_for_viewport)   # dropped if the view is gone first
 
     def set_vehicle_arrow_scale(self, factor: float) -> None:
         """Scale the on-map vehicle icon (1.0 = default). Clamped for sane line widths."""
@@ -1858,7 +1860,8 @@ class NativeTileMapView(QWidget):
             self._tile_retry_after.pop(key, None)
             self._queue_tile_fetch(int(z), int(x), int(y))
 
-        QTimer.singleShot(2000, _retry)
+        # Tied to the view, so a retry never runs on a map that is gone.
+        QTimer.singleShot(2000, self, _retry)
 
     def _valid_cached_tile(self, key: tuple[int, int, int]) -> QImage | None:
         im = self._tiles.get(key)

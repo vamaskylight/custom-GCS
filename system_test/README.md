@@ -32,7 +32,7 @@ The same set-up as the wind failsafe tests, see [drone/README.md](../drone/READM
 From the repo root:
 
 ```powershell
-py system_test/vgcs_sitl_test.py                      # 8 cases on 4.6.2 and 4.7.0, about 4 minutes
+py system_test/vgcs_sitl_test.py                      # 9 cases on 4.6.2 and 4.7.0, about 5 minutes
 py system_test/vgcs_sitl_test.py 4.7.0 -k mission     # one version, only cases with "mission" in the name
 py system_test/vgcs_sitl_test.py --report results.md  # also write the results as Markdown
 
@@ -63,6 +63,7 @@ The simulated clock runs 10 times faster than real time.
 | mission_flight | start from the ground, pause, resume, skip a waypoint, return and land at home |
 | takeoff_fence_and_land | a 40 m fence with a 30 m height limit: the drone turns back at both, VGCS shows RTL and the drone's message, landing from VGCS |
 | link_silence | the radio goes quiet in flight (the simulator is frozen), VGCS reports it within its 2 second watchdog, and recovers by itself |
+| signed_commands | VGCS gives the drone its signing key: an outsider ground station (third port) can no longer change the mode, arm, or remove the key, VGCS still can, and after the key is removed the outsider is obeyed again |
 
 ## `vgcs_window_test.py`: the window, and how well it keeps up
 

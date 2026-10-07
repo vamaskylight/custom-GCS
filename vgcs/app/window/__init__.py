@@ -11,6 +11,7 @@ from vgcs.app.window.params_mixin import MainWindowParamsMixin
 from vgcs.app.window.plan_mission_mixin import MainWindowPlanMissionMixin
 from vgcs.app.window.rtk_base_mixin import MainWindowRtkBaseMixin
 from vgcs.app.window.settings_dialogs_mixin import MainWindowSettingsDialogsMixin
+from vgcs.app.window.signing_mixin import MainWindowSigningMixin
 from vgcs.app.window.telemetry_mixin import MainWindowTelemetryMixin
 from vgcs.app.window.ui_layout_mixin import MainWindowUiLayoutMixin
 from vgcs.app.window.window_lifecycle_mixin import MainWindowLifecycleMixin
@@ -24,6 +25,7 @@ class MainWindowMixins(
     MainWindowFlightStatusMixin,
     MainWindowLinkMixin,
     MainWindowFleetMixin,
+    MainWindowSigningMixin,
     MainWindowTelemetryMixin,
     MainWindowRtkBaseMixin,
     MainWindowFlightCommandsMixin,
@@ -45,6 +47,7 @@ __all__ = [
     "MainWindowPlanMissionMixin",
     "MainWindowRtkBaseMixin",
     "MainWindowSettingsDialogsMixin",
+    "MainWindowSigningMixin",
     "MainWindowTelemetryMixin",
     "MainWindowUiLayoutMixin",
 ]

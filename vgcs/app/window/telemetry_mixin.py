@@ -249,6 +249,9 @@ class MainWindowTelemetryMixin:
 
     def _reset_telemetry_fields(self) -> None:
         self._armed_since = None
+        publish_signing = getattr(self, "_publish_signing", None)
+        if publish_signing is not None:
+            publish_signing({})
         self._battery.reset()
         self._wind.reset()
         self._rtk.reset()
@@ -508,6 +511,9 @@ class MainWindowTelemetryMixin:
 
     def _on_telemetry(self, msg_type: str, payload: object) -> None:
         data = payload if isinstance(payload, dict) else {}
+        if msg_type == "SIGNING":
+            self._publish_signing(data)
+            return
         if msg_type == "HEARTBEAT":
             armed = bool(data.get("armed", False))
             system_status = int(data.get("system_status", 0))

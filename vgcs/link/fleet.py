@@ -60,6 +60,7 @@ class VehicleSummary:
     last_text: str = ""
     last_text_severity: int = 7
     last_result: str = ""
+    signing: str = ""               # vgcs/link/signing.py state, "" before the first report
     last_heard_mono: float = 0.0
     lost_since_mono: Optional[float] = None
     history: list = field(default_factory=list)   # recent alerts, newest last
@@ -100,8 +101,20 @@ def altitude_text(s: VehicleSummary) -> str:
     return "N/A" if s.alt_rel_m is None else f"{s.alt_rel_m:.1f} m"
 
 
+def signing_text(s: VehicleSummary) -> str:
+    """Whether only signed commands reach the drone (M16), in a word or two."""
+    return {
+        "off": "off",
+        "waiting": "waiting",
+        "drone_signs": "signed",
+        "drone_unsigned": "NOT signed",
+        "key_mismatch": "OTHER KEY",
+        "mavlink1": "MAVLink 1",
+    }.get(s.signing, "")
+
+
 def row_cells(s: VehicleSummary, now: float | None = None) -> list[str]:
-    """One fleet panel row: name, link, mode, armed, height, battery, GPS, mission, last message."""
+    """One fleet panel row: name, link, mode, armed, height, battery, GPS, signing, mission, last message."""
     return [
         s.name,
         link_text(s, now),
@@ -110,6 +123,7 @@ def row_cells(s: VehicleSummary, now: float | None = None) -> list[str]:
         altitude_text(s),
         battery_text(s),
         gps_text(s),
+        signing_text(s),
         s.mission_text or "",
         s.last_result or s.last_text or "",
     ]
@@ -213,6 +227,11 @@ class FleetVehicle(QObject):
         elif kind == "GPS_RAW_INT":
             s.gps_fix = int(d.get("fix_type", 0) or 0)
             s.satellites = int(d.get("satellites_visible", 0) or 0)
+        elif kind == "SIGNING":
+            was = s.signing
+            s.signing = str(d.get("state", "") or "")
+            if s.signing == "key_mismatch" and was != "key_mismatch":
+                self._alert("signs with another key: it ignores VGCS's commands")
         elif kind == "STATUSTEXT":
             text = str(d.get("text", "") or "").strip()
             # 0 is EMERGENCY, so not "or 7": that would hide the worst ones.

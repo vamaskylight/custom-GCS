@@ -25,6 +25,14 @@ from vgcs.mission import (
     normalize_end_action,
 )
 from vgcs.link.confirmations import ModeChange, ParamReads, ParamWrites, clean_name
+from vgcs.link.signing import (
+    KeyTransfer,
+    SigningMonitor,
+    fingerprint,
+    state_level,
+    state_text,
+    timestamp_now,
+)
 from vgcs.link.rtcm import MAVLINK_PIECE_LEN, to_mavlink_pieces
 from vgcs.skydroid.adapter import GimbalStatus
 
@@ -35,6 +43,10 @@ _MAV_MSG_ID_RANGEFINDER = int(mav_apm.MAVLINK_MSG_ID_RANGEFINDER)
 _PROX_STREAM_RESEND_S = 20.0
 # About ten seconds of corrections from a base that sends five messages a second.
 _RTCM_QUEUE_MAX = 50
+# The drone's messages (STATUSTEXT) are not rate limited like telemetry: they
+# come in bursts (two EKF lines, a list of PreArm reasons) a few milliseconds
+# apart. Only a flood is cut, at this many a second.
+_STATUSTEXT_PER_SECOND_MAX = 20
 
 # Messages that describe the *vehicle* and must come from the autopilot alone.
 # Anything else that shares the link — companion computer, gimbal, air unit,
@@ -240,7 +252,6 @@ class MavlinkThread(QThread):
             "BATTERY_STATUS": 0.4,
             "GPS_RAW_INT": 0.2,
             "MISSION_CURRENT": 0.15,
-            "STATUSTEXT": 0.05,
             "RADIO_STATUS": 0.2,
             "OPEN_DRONE_ID": 0.25,
             "OBSTACLE_DISTANCE": 0.1,
@@ -272,6 +283,16 @@ class MavlinkThread(QThread):
         self._param_writes = ParamWrites()
         self._param_reads = ParamReads()
         self._mode_request: ModeChange | None = None
+        # MAVLink 2 command signing (M16, vgcs/link/signing.py). The key comes
+        # from the window; pymavlink replaces its MAVLink object when the
+        # drone's first MAVLink 2 packet arrives, so signing is (re)applied
+        # to whichever object is current (_ensure_signing).
+        self._signing_key: bytes | None = None
+        self._signing_link_id = 1
+        self._signing_applied_mav = None
+        self._signing_monitor = SigningMonitor()
+        self._key_transfer: KeyTransfer | None = None
+        self._signing_last_report_mono = 0.0
 
     def get_cached_gimbal_status(self) -> GimbalStatus | None:
         with self._gimbal_lock:
@@ -298,6 +319,21 @@ class MavlinkThread(QThread):
 
     def _emit_telemetry_payload(self, msg_type: str, payload: dict) -> None:
         """Emit telemetry to the GUI at a capped rate for known high-frequency message types."""
+        if msg_type == "STATUSTEXT":
+            # Every message of a burst. A 50 ms limit used to pass only the
+            # first: "EKF3 IMU1 is using GPS", sent in the same instant as the
+            # IMU0 line, never reached the window (simulator test, 2026-10-07).
+            now = time.monotonic()
+            recent = getattr(self, "_statustext_times", None)
+            if recent is None:
+                recent = self._statustext_times = deque()
+            while recent and now - recent[0] > 1.0:
+                recent.popleft()
+            if len(recent) >= _STATUSTEXT_PER_SECOND_MAX:
+                return
+            recent.append(now)
+            self.telemetry.emit(msg_type, payload)
+            return
         throttle_key = "OPEN_DRONE_ID" if str(msg_type).startswith("OPEN_DRONE_ID_") else str(msg_type)
         interval = self._telemetry_emit_interval.get(throttle_key)
         if interval is None:
@@ -417,6 +453,18 @@ class MavlinkThread(QThread):
     def queue_param_set(self, name: str, value: float) -> None:
         with self._cmd_lock:
             self._cmd_queue.append(("param_set", {"name": name, "value": float(value)}))
+
+    def queue_signing_key(self, key: bytes | None, link_id: int = 1) -> None:
+        """Sign every packet with this 32-byte key from now on (None: stop signing)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(
+                ("signing_key", {"key": None if key is None else bytes(key), "link_id": int(link_id)})
+            )
+
+    def queue_signing_to_drone(self, enable: bool) -> None:
+        """Give the drone this laptop's key (enable), or switch its signing off."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("signing_to_drone", bool(enable)))
 
     def queue_motor_test(
         self,
@@ -583,6 +631,7 @@ class MavlinkThread(QThread):
             self._process_pending_commands()
             self._maybe_send_gcs_heartbeat()
             self._send_pending_rtcm()
+            self._ensure_signing()
             self._tick_confirmations()
             try:
                 # Short wait while corrections flow or a request waits for its
@@ -706,6 +755,7 @@ class MavlinkThread(QThread):
                 if primary:
                     self._remember_vehicle_mode(mode_text)
                     self._hear_mode(msg)
+                    self._hear_signature(msg)
                 if primary:
                     self._emit_telemetry_payload(
                         "HEARTBEAT",
@@ -1075,6 +1125,11 @@ class MavlinkThread(QThread):
             elif cmd == "param_set":
                 data = payload if isinstance(payload, dict) else {}
                 self._param_set(str(data.get("name", "")), float(data.get("value", 0.0)))
+            elif cmd == "signing_key":
+                data = payload if isinstance(payload, dict) else {}
+                self._set_signing_key(data.get("key"), int(data.get("link_id", 1) or 1))
+            elif cmd == "signing_to_drone":
+                self._signing_to_drone(bool(payload))
             elif cmd == "motor_test":
                 self._motor_test(payload if isinstance(payload, dict) else {})
             elif cmd == "preflight_calibration":
@@ -2154,6 +2209,7 @@ class MavlinkThread(QThread):
             self._param_writes.pending()
             or self._param_reads.pending()
             or self._mode_request is not None
+            or getattr(self, "_key_transfer", None) is not None
         )
 
     def _tick_confirmations(self) -> None:
@@ -2174,6 +2230,13 @@ class MavlinkThread(QThread):
                 except Exception:
                     pass
             self._drop_finished_mode_request()
+        transfer = getattr(self, "_key_transfer", None)
+        if transfer is not None:
+            if transfer.tick(now):
+                self._send_setup_signing(transfer.enable)
+                self.log_line.emit("Signing: no sign from the drone yet, key sent again")
+            if transfer.done:
+                self._key_transfer = None
 
     def _cancel_confirmations(self, reason: str) -> None:
         self._param_writes.cancel_all(reason)
@@ -2183,6 +2246,128 @@ class MavlinkThread(QThread):
         if request is not None and not request.done:
             request.done = True
             request.on_done(False, reason)
+        transfer = getattr(self, "_key_transfer", None)
+        self._key_transfer = None
+        if transfer is not None and not transfer.done:
+            transfer.done = True
+            transfer.on_done(False, reason)
+
+    # --- MAVLink 2 command signing (M16, vgcs/link/signing.py) -------------
+
+    def _set_signing_key(self, key: bytes | None, link_id: int = 1) -> None:
+        self._signing_key = bytes(key) if key else None
+        self._signing_link_id = max(1, min(255, int(link_id or 1)))
+        self._signing_applied_mav = None
+        self._signing_monitor.set_key(self._signing_key is not None)
+        if self._signing_key is None and self._master is not None:
+            try:
+                self._master.disable_signing()
+            except Exception:
+                pass
+            self.log_line.emit("Signing: off, VGCS no longer signs its commands")
+        self._ensure_signing()
+        self._report_signing(force=True)
+
+    def _ensure_signing(self) -> None:
+        """Sign with the key on the MAVLink object pymavlink uses right now."""
+        key = getattr(self, "_signing_key", None)
+        if key is None or self._master is None:
+            return
+        mav = getattr(self._master, "mav", None)
+        if mav is None or mav is self._signing_applied_mav:
+            return
+        # Signing needs MAVLink 2. pymavlink switches to it on the drone's
+        # first MAVLink 2 packet, and replaces its MAVLink object then.
+        if str(getattr(self._master, "WIRE_PROTOCOL_VERSION", "")) != "2.0":
+            return
+        self._master.setup_signing(
+            key,
+            sign_outgoing=True,
+            # Unsigned packets still come in (a gimbal, a radio, a drone without
+            # the key): the monitor says what the drone does, nothing is hidden.
+            allow_unsigned_callback=lambda _mav, _msg_id: True,
+            link_id=self._signing_link_id,
+        )
+        self._signing_applied_mav = mav
+        self.log_line.emit(f"Signing: VGCS signs its commands (key {fingerprint(key)})")
+
+    def _hear_signature(self, msg) -> None:
+        """A heartbeat from the flight controller: did it sign it, and with our key?"""
+        if getattr(self, "_signing_key", None) is None:
+            return
+        if str(getattr(self._master, "WIRE_PROTOCOL_VERSION", "2.0")) != "2.0":
+            self._signing_monitor.mavlink1()
+            self._report_signing()
+            return
+        try:
+            buf = msg.get_msgbuf()
+            present = len(buf) > 2 and buf[0] == 0xFD and bool(buf[2] & 0x01)
+        except Exception:
+            present = False
+        valid = bool(getattr(msg, "_signed", False))
+        changed = self._signing_monitor.note(present, valid)
+        transfer = getattr(self, "_key_transfer", None)
+        if transfer is not None:
+            transfer.heard(self._signing_monitor.state)
+            if transfer.done:
+                self._key_transfer = None
+        self._report_signing(force=changed)
+
+    def _report_signing(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._signing_last_report_mono < 2.0:
+            return
+        self._signing_last_report_mono = now
+        state = self._signing_monitor.state
+        key = getattr(self, "_signing_key", None)
+        fp = fingerprint(key) if key else ""
+        self._emit_telemetry_payload(
+            "SIGNING",
+            {"state": state, "text": state_text(state, fp), "level": state_level(state), "fingerprint": fp},
+        )
+
+    def _signing_to_drone(self, enable: bool) -> None:
+        def done(ok: bool, detail: str) -> None:
+            if ok:
+                self.log_line.emit(f"Signing: {detail}")
+            else:
+                self.error.emit(f"Signing: {detail}")
+            self.action_result.emit("signing", ok, detail)
+
+        if self._master is None:
+            done(False, "the link is not ready")
+            return
+        if getattr(self, "_signing_key", None) is None:
+            done(False, "there is no key on this laptop: set a passphrase first")
+            return
+        if self._vehicle_armed:
+            done(False, "the drone is armed. ArduPilot takes or removes a key only while disarmed")
+            return
+        self._ensure_signing()
+        if self._signing_applied_mav is None:
+            done(False, "no MAVLink 2 heartbeat from the drone yet (signing needs MAVLink 2)")
+            return
+        old = getattr(self, "_key_transfer", None)
+        if old is not None:
+            old.done = True
+        self._key_transfer = KeyTransfer(enable, time.monotonic(), done)
+        self._send_setup_signing(enable)
+        # Already there (the drone signs with this key, or no longer signs).
+        self._key_transfer.heard(self._signing_monitor.state)
+        if self._key_transfer.done:
+            self._key_transfer = None
+
+    def _send_setup_signing(self, enable: bool) -> None:
+        """SETUP_SIGNING: this laptop's key, or a zero key that switches the drone's signing off."""
+        try:
+            if enable:
+                key = self._signing_key or bytes(32)
+                stamp = max(timestamp_now(), int(getattr(self._master.mav.signing, "timestamp", 0) or 0))
+            else:
+                key, stamp = bytes(32), 0
+            self._master.mav.setup_signing_send(self._target_sysid, self._target_compid, key, stamp)
+        except Exception as e:
+            self.log_line.emit(f"Signing: could not send the key ({e})")
 
     def _ensure_armable_mode_before_arm(self, prefer: tuple[str, ...] = ()) -> str | None:
         """Switch to a mode that can arm. Returns the mode that took, or None.
@@ -2449,6 +2634,11 @@ class MavlinkThread(QThread):
         if request is not None:
             request.heard_text(text)
             self._drop_finished_mode_request()
+        transfer = getattr(self, "_key_transfer", None)
+        if transfer is not None:
+            transfer.heard_text(text)
+            if transfer.done:
+                self._key_transfer = None
         self._emit_telemetry_payload(
             "STATUSTEXT",
             {

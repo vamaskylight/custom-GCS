@@ -938,6 +938,11 @@ class MainWindowUiLayoutMixin:
         sg.addWidget(lc, sr, 0)
         sg.addWidget(add_field("rtk_corrections"), sr, 1, 1, 3)
         sr += 1
+        ls = QLabel("Command signing")
+        ls.setStyleSheet("color: #7d869c;")
+        sg.addWidget(ls, sr, 0)
+        sg.addWidget(add_field("signing"), sr, 1, 1, 3)
+        sr += 1
         la = QLabel("Arm readiness")
         la.setStyleSheet("color: #7d869c;")
         sg.addWidget(la, sr, 0)
@@ -948,6 +953,9 @@ class MainWindowUiLayoutMixin:
         self._fields["obstacle_prox"].setText("N/A")
         self._fields["rangefinder"].setText("N/A")
         self._fields["arm_ready"].setText("Best-effort from telemetry")
+        publish_signing = getattr(self, "_publish_signing", None)
+        if publish_signing is not None:
+            publish_signing({})
         self._apply_state_style(self._fields["video_link"], "na")
         self._apply_state_style(self._fields["obstacle_prox"], "na")
         self._apply_state_style(self._fields["rangefinder"], "na")
