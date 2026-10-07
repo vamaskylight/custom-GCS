@@ -541,6 +541,17 @@ class MainWindowFlightCommandsMixin:
             return
         if not self._confirm_vehicle_ready_for_auto():
             return
+        # Start Mission uploads the plan on the map first. Where the mission on
+        # the drone has more in it than the plan can hold (camera, servo or
+        # jump commands from another ground station), that would be their end.
+        as_it_is = False
+        not_kept = self._mission_not_kept_now()
+        if not_kept:
+            choice = self._ask_how_to_start(not_kept, self._plan_on_map_is_mission_on_drone())
+            if choice not in ("as_is", "upload"):
+                self._append_log("Mission start cancelled: the mission on the drone has more in it than the plan.")
+                return
+            as_it_is = choice == "as_is"
         armed_text = self._fields.get("armed").text().strip().lower()
         if armed_text != "yes":
             QMessageBox.information(
@@ -548,6 +559,12 @@ class MainWindowFlightCommandsMixin:
                 "Mission Start",
                 "Vehicle is not armed.\nThe link will switch to an armable mode, arm, then run AUTO + mission start.",
             )
+        if as_it_is:
+            # The link reads the mission again first, and starts nothing when
+            # it is no longer the one the Download showed.
+            self._thread.queue_mission_start(as_it_is=True)
+            self._append_log("Mission start queued: the mission as it is on the drone, nothing uploaded")
+            return
         # Reuses the upload payload builder so per-waypoint speed is not dropped here —
         # Start Mission used to upload every waypoint at the 5 m/s default.
         payload = self._mission_payload_from_waypoints(model)
@@ -558,6 +575,48 @@ class MainWindowFlightCommandsMixin:
         self._append_log(
             f"Mission start queued: upload {len(payload)} WPs (+TAKEOFF, end={end_action}) + AUTO start"
         )
+
+    def _start_choice_box(self, not_kept, can_start_as_is: bool):
+        """The question Start Mission asks when the drone's mission has more than the plan.
+
+        Returns the box and what each of its buttons means. Made apart from
+        showing it, so that what it offers can be checked without a screen.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Mission Start")
+        text = (
+            "The mission on the drone has more than this plan can hold:\n\n"
+            f"{self._not_kept_bullets(not_kept)}\n\n"
+        )
+        answers = {}
+        if can_start_as_is:
+            text += (
+                "Start Mission uploads the plan on the map first. That would replace the mission "
+                "on the drone, and these would be gone or changed."
+            )
+            answers[box.addButton("Start it as it is on the drone", QMessageBox.ButtonRole.AcceptRole)] = "as_is"
+        else:
+            text += (
+                "The plan on the map was changed after the Download, so it has to be uploaded to fly it. "
+                "That replaces the mission on the drone, and these are gone or changed."
+            )
+        answers[box.addButton("Upload this plan and start", QMessageBox.ButtonRole.DestructiveRole)] = "upload"
+        cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        answers[cancel] = "cancel"
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.setText(text)
+        return box, answers
+
+    def _ask_how_to_start(self, not_kept, can_start_as_is: bool) -> str:
+        """ "as_is", "upload" or "cancel"."""
+        box, answers = self._start_choice_box(not_kept, can_start_as_is)
+        try:
+            box.exec()
+            return answers.get(box.clickedButton(), "cancel")
+        finally:
+            box.deleteLater()
 
     def _confirm_vehicle_ready_for_auto(self) -> bool:
         """AUTO needs a position solution. Warn on a weak one rather than blocking."""

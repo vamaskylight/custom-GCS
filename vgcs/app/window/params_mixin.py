@@ -153,7 +153,10 @@ class MainWindowParamsMixin:
             # the header shows only a beginning. The whole text is in Plan
             # Flight, under the buttons the operator used.
             self._post_gcs_notice(str(detail))
-            self._map_widget.set_plan_mission_action_result(bool(ok), str(detail))
+            # "mission" is about the mission itself: not the one VGCS knows any
+            # more, not started, its upload failed. That stays on screen on the
+            # ground, until an Upload or a Download has worked.
+            self._map_widget.set_plan_mission_action_result(bool(ok), str(detail), action == "mission")
             return
         self._post_gcs_notice(msg[:80])
 

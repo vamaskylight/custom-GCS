@@ -36,6 +36,33 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "drone" / "test"))
 
+# --- the user's settings stay untouched ------------------------------------
+# The link reads the payload servo settings when it builds a mission.
+# QSettings("VGCS", "VGCS") is the Windows registry, the user's own settings:
+# here every QSettings is an INI file in a temporary folder, set up before
+# anything of VGCS is imported (the same as system_test/vgcs_window_test.py).
+import tempfile  # noqa: E402
+
+from PySide6 import QtCore  # noqa: E402
+
+SETTINGS_DIR = pathlib.Path(tempfile.mkdtemp(prefix="vgcs-sitl-test-"))
+_RealQSettings = QtCore.QSettings
+
+
+class _TestSettings(_RealQSettings):
+    def __init__(self, *args, **kwargs):
+        if args and isinstance(args[0], str) and not args[0].lower().endswith(".ini"):
+            org = args[0]
+            app = args[1] if len(args) > 1 and isinstance(args[1], str) else "default"
+            super().__init__(str(SETTINGS_DIR / f"{org}-{app}.ini"), _RealQSettings.Format.IniFormat)
+        elif not args:
+            super().__init__(str(SETTINGS_DIR / "default.ini"), _RealQSettings.Format.IniFormat)
+        else:
+            super().__init__(*args, **kwargs)
+
+
+QtCore.QSettings = _TestSettings
+
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -622,6 +649,329 @@ def mission_speeds(version: str, r: Report) -> None:
         f.close()
 
 
+def upload_as_another_station(sim: Sitl, items: list[tuple]) -> int | None:
+    """Send a mission on the checking connection, as another ground station would.
+
+    Each item: (frame, command, (p1, p2, p3, p4), lat, lon, height). Returns the
+    drone's answer (0 is accepted), or None when it never answered.
+    """
+    mav = sim.mav
+    mav.mav.mission_count_send(mav.target_system, mav.target_component, len(items))
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        msg = mav.recv_match(type=["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"], blocking=True, timeout=2)
+        if msg is None:
+            continue
+        if msg.get_type() == "MISSION_ACK":
+            return int(msg.type)
+        frame, command, p, lat, lon, height = items[int(msg.seq)]
+        mav.mav.mission_item_int_send(mav.target_system, mav.target_component, int(msg.seq), frame, command, 0, 1,
+                                      p[0], p[1], p[2], p[3], int(lat * 1e7), int(lon * 1e7), height)
+    return None
+
+
+def missions_as_they_come_back(version: str, r: Report) -> None:
+    """A Download shows the mission as it is: VGCS's own with its payload releases, and another station's with what a plan cannot hold named."""
+    from pymavlink import mavutil
+
+    from vgcs.app.vehicle_params import mission_speed_mps
+    from vgcs.link.payload_servo_settings import payload_servo_from_settings
+    from vgcs.mission import plan_signature, read_downloaded_mission
+
+    M = mavutil.mavlink
+    f = Flight(version)
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        r.check(f.ready_to_fly(), "the drone is ready")
+        servo = payload_servo_from_settings()
+        name = "WP_SPD" if version.startswith("4.7") else "WPNAV_SPEED"
+        own_speed = mission_speed_mps({name: sim.get_param(name)})
+        r.check(own_speed is not None, f"the drone's own mission speed is {own_speed} m/s ({name})")
+
+        def read(rows):
+            return read_downloaded_mission(rows, default_speed_mps=own_speed, servo=servo)
+
+        def items_of(rows) -> list[tuple]:
+            return [(row["command"], round(row["p1"], 3), round(row["p2"], 3), round(row["lat"], 6), round(row["lon"], 6),
+                     round(row["alt_m"], 2)) for row in rows[1:]]          # without the home slot
+
+        def download() -> list[dict]:
+            before = len(rec.downloaded)
+            link.queue_mission_download()
+            f.wait(lambda: len(rec.downloaded) > before, 60)
+            return rec.downloaded[-1] if len(rec.downloaded) > before else []
+
+        def same_waypoints(got, sent_rows) -> bool:
+            """The same plan after the trip over the radio, where a place is a whole number of 1e-7 degrees."""
+            if len(got) != len(sent_rows):
+                return False
+            for wp, row in zip(got, sent_rows):
+                if distance_m(wp.lat, wp.lon, row["lat"], row["lon"]) > 0.05:
+                    return False
+                if abs(wp.alt_m - row["alt_m"]) > 0.01 or abs(wp.speed_mps - row["speed_mps"]) > 0.01:
+                    return False
+                if wp.hover_s != row["hover_s"] or wp.drop_payload != row["drop_payload"]:
+                    return False
+            return True
+
+        # VGCS's own mission, with a hover and two payload releases.
+        sent = []
+        for (north, east), speed, hover, drop in (((60.0, 0.0), 6.0, 4, True), ((60.0, 120.0), 6.0, 0, False), ((0.0, 120.0), 9.0, 0, True)):
+            lat, lon = offset_to_lat_lon(north, east)
+            sent.append({"lat": lat, "lon": lon, "alt_m": 25.0, "speed_mps": speed, "hover_s": hover, "drop_payload": drop})
+        link.queue_mission_upload(sent, "rtl")
+        r.check(f.wait(lambda: len(rec.uploaded) == 1, 60), "VGCS's mission with two payload releases is on the drone")
+        first = download()
+        mission = read(first)
+        r.check([wp.drop_payload for wp in mission.waypoints] == [True, False, True],
+                f"download: the payload releases come back on their waypoints ({[wp.drop_payload for wp in mission.waypoints]})")
+        r.check(same_waypoints(mission.waypoints, sent) and mission.end_action == "rtl",
+                "and every other value: place, height, speed, hover, and the return at the end")
+        r.check(mission.not_kept == [], f"nothing is left that the plan cannot hold ({mission.not_kept})")
+        again = [{"lat": wp.lat, "lon": wp.lon, "alt_m": wp.alt_m, "speed_mps": wp.speed_mps, "hover_s": wp.hover_s,
+                  "drop_payload": wp.drop_payload} for wp in mission.waypoints]
+        link.queue_mission_upload(again, mission.end_action)
+        r.check(f.wait(lambda: len(rec.uploaded) == 2, 60), "the downloaded plan is uploaded again")
+        second = download()
+        r.check(items_of(second) == items_of(first) and len(first) == 14,
+                f"and the drone holds the same mission as before, item for item ({len(first)} items, {len(second)} after)")
+        # After a download the window tells the link which plan the mission is.
+        link.set_mission_on_drone(plan_signature(read(second).waypoints), ())
+
+        # Another ground station sends a mission of its own.
+        a, b, c = offset_to_lat_lon(80.0, 0.0), offset_to_lat_lon(80.0, 80.0), offset_to_lat_lon(0.0, 80.0)
+        rel, sea = M.MAV_FRAME_GLOBAL_RELATIVE_ALT, M.MAV_FRAME_GLOBAL
+        theirs = [
+            (rel, M.MAV_CMD_NAV_WAYPOINT, (0, 0, 0, 0), a[0], a[1], 0.0),              # the home slot
+            (rel, M.MAV_CMD_NAV_TAKEOFF, (0, 0, 0, 0), 0.0, 0.0, 30.0),
+            (rel, M.MAV_CMD_DO_SET_ROI, (0, 0, 0, 0), b[0], b[1], 0.0),
+            (rel, M.MAV_CMD_NAV_WAYPOINT, (3, 0, 0, 0), a[0], a[1], 30.0),
+            (rel, M.MAV_CMD_DO_DIGICAM_CONTROL, (0, 0, 0, 0), 0.0, 0.0, 0.0),
+            (rel, M.MAV_CMD_DO_SET_SERVO, (10, 1500, 0, 0), 0.0, 0.0, 0.0),
+            (sea, M.MAV_CMD_NAV_WAYPOINT, (0, 0, 0, 0), b[0], b[1], 640.0),            # height above sea level
+            (rel, M.MAV_CMD_NAV_SPLINE_WAYPOINT, (0, 0, 0, 0), c[0], c[1], 30.0),
+            (rel, M.MAV_CMD_DO_CHANGE_SPEED, (2, 1.5, -1, 0), 0.0, 0.0, 0.0),          # a climb speed
+            (rel, M.MAV_CMD_NAV_LOITER_TIME, (10, 0, 0, 0), a[0], a[1], 30.0),
+            (rel, M.MAV_CMD_DO_JUMP, (3, 1, 0, 0), 0.0, 0.0, 0.0),
+            (rel, M.MAV_CMD_NAV_LAND, (0, 0, 0, 0), b[0], b[1], 0.0),
+        ]
+        f.wait_real(lambda: False, 5.5)        # the answer to VGCS's own upload is long past
+        since = rec.now()
+        r.check(link.mission_on_drone() is not None, "before: VGCS knows the mission on the drone")
+        answer = upload_as_another_station(sim, theirs)
+        r.check(answer == 0, f"another ground station's mission is on the drone (the drone answered {answer})")
+        f.wait_real(lambda: rec.action("mission", since) is not None, 6)
+        told = rec.action("mission", since)
+        r.check(told is not None and not told[0] and "changed" in told[1] and "Download" in told[1],
+                f"VGCS notices (the drone reports another number of items) and says so ({told})")
+        r.check(link.mission_on_drone() is None, "and no longer takes its own plan for the mission on the drone")
+
+        rows = download()
+        mission = read(rows)
+        home_height = float(rows[0]["alt_m"]) if rows else 0.0
+        r.check(len(rows) == len(theirs), f"download: every item of it comes back ({len(rows)} of {len(theirs)})")
+        r.check(len(mission.waypoints) == 4 and mission.end_action == "land",
+                f"the plan shows its 4 waypoints and the landing ({len(mission.waypoints)}, {mission.end_action})")
+        heights = [round(wp.alt_m, 1) for wp in mission.waypoints]
+        r.check(heights == [30.0, round(640.0 - home_height, 1), 30.0, 30.0],
+                f"the height above sea level is shown above the launch point: {heights} (the drone's home is at {home_height:.1f} m)")
+        r.check([wp.speed_mps for wp in mission.waypoints] == [own_speed] * 4,
+                f"it sets no speed, so the plan shows the drone's own ({[wp.speed_mps for wp in mission.waypoints]})")
+        r.check(mission.waypoints[0].hover_s == 3 and mission.waypoints[3].hover_s == 10, "the hover times are kept")
+        want = ["1 x camera aim point (ROI)", "1 x camera trigger", "1 x servo command", "1 x climb or descent speed",
+                "1 x jump to another item"]
+        r.check(mission.not_kept[:5] == want, f"what the plan cannot hold is named: {mission.not_kept[:5]}")
+        rest = " | ".join(mission.not_kept[5:])
+        r.check("1 waypoint had its height above sea level" in rest and "2 waypoints of another kind" in rest
+                and "the landing is at another place" in rest and len(mission.not_kept) == 8,
+                f"and what it shows differently: {rest}")
+        r.check(not rec.errors, f"VGCS reported no error {[e[1] for e in rec.errors][:3]}")
+    finally:
+        f.close()
+
+
+def another_stations_mission(version: str, r: Report) -> None:
+    """Another ground station replaces the mission with one of the same size and VGCS is told nothing. VGCS finds out before it uses its own plan: at a start, at a jump, at a resume, and from the drone's word in flight."""
+    from pymavlink import mavutil
+
+    from vgcs.app.vehicle_params import mission_speed_mps
+    from vgcs.link.payload_servo_settings import payload_servo_from_settings
+    from vgcs.mission import plan_signature, read_downloaded_mission
+
+    M = mavutil.mavlink
+    f = Flight(version)
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        sim.current_item = None
+        take = sim._take
+
+        def taking(msg) -> None:
+            if msg.get_type() == "MISSION_CURRENT":
+                sim.current_item = int(msg.seq)
+            take(msg)
+
+        sim._take = taking      # the checking connection notes which item the drone is on
+
+        def speed() -> float:
+            return math.hypot(sim.vn, sim.ve)
+
+        def their_mission(places, leg_speed: float) -> list[tuple]:
+            """Eight items, always: home slot, take-off, one speed item, four waypoints, return."""
+            rel = M.MAV_FRAME_GLOBAL_RELATIVE_ALT
+            first = offset_to_lat_lon(*places[0])
+            items = [(rel, M.MAV_CMD_NAV_WAYPOINT, (0, 0, 0, 0), first[0], first[1], 0.0),
+                     (rel, M.MAV_CMD_NAV_TAKEOFF, (0, 0, 0, 0), 0.0, 0.0, 20.0),
+                     (rel, M.MAV_CMD_DO_CHANGE_SPEED, (1, leg_speed, -1, 0), 0.0, 0.0, 0.0)]
+            for north, east in places:
+                lat, lon = offset_to_lat_lon(north, east)
+                items.append((rel, M.MAV_CMD_NAV_WAYPOINT, (0, 0, 0, 0), lat, lon, 20.0))
+            items.append((rel, M.MAV_CMD_NAV_RETURN_TO_LAUNCH, (0, 0, 0, 0), 0.0, 0.0, 0.0))
+            return items
+
+        # Long legs: the drone is still on its first one at the end of every step.
+        north_east = ((1500.0, 0.0), (1500.0, 1500.0), (0.0, 1500.0), (-500.0, 1500.0))
+        south_west = ((-1500.0, 0.0), (-1500.0, -1500.0), (0.0, -1500.0), (500.0, -1500.0))
+
+        servo = payload_servo_from_settings()
+        name = "WP_SPD" if version.startswith("4.7") else "WPNAV_SPEED"
+        own_speed = mission_speed_mps({name: sim.get_param(name)})
+
+        def download_and_know() -> list[dict]:
+            """A Download, and what the window does with it: it tells the link which plan the mission is."""
+            before = len(rec.downloaded)
+            link.queue_mission_download()
+            f.wait(lambda: len(rec.downloaded) > before, 60)
+            rows = rec.downloaded[-1] if len(rec.downloaded) > before else []
+            plan = read_downloaded_mission(rows, default_speed_mps=own_speed, servo=servo)
+            link.set_mission_on_drone(plan_signature(plan.waypoints), tuple(plan.not_kept))
+            return rows
+
+        def replaced_without_a_word(places, leg_speed: float, what: str) -> float:
+            """The other station sends its mission. Returns the time just before."""
+            since = rec.now()
+            answer = upload_as_another_station(sim, their_mission(places, leg_speed))
+            f.wait_real(lambda: False, 3.0)
+            r.check(answer == 0 and rec.action("mission", since) is None and link.mission_on_drone() is not None,
+                    f"{what}: the other station replaces the mission with one of the same size (the drone answered "
+                    f"{answer}). VGCS is told nothing, and still takes the old one for the drone's")
+            return since
+
+        def said(action: str, since: float, seconds: float = 8.0):
+            f.wait_real(lambda: rec.action(action, since) is not None, seconds)
+            return rec.action(action, since)
+
+        not_the_one = "the mission on the drone is not the one VGCS knows"
+
+        r.check(f.ready_to_fly(), "the drone is ready")
+        r.check(upload_as_another_station(sim, their_mission(north_east, 5.0)) == 0,
+                "another ground station's mission is on the drone: four waypoints to the north and east, 5 m/s")
+        rows = download_and_know()
+        r.check(len(rows) == 8 and link.mission_on_drone() is not None, f"VGCS downloads it ({len(rows)} items)")
+
+        # --- "Start it as it is on the drone" ------------------------------------------------
+        since = replaced_without_a_word(south_west, 5.0, "on the ground")
+        link.queue_mission_start(as_it_is=True)
+        told = said("mission", since)
+        r.check(told is not None and not told[0] and told[1].startswith("Not started: the mission on the drone changed since the Download")
+                and "Download" in told[1], f"start as it is: VGCS reads the mission again, finds another one, and starts nothing ({told})")
+        f.wait(lambda: sim.armed, 8)
+        r.check(not sim.armed and sim.mode != "AUTO", f"the drone was not armed ({sim.mode})")
+        r.check(link.mission_on_drone() is None, "and VGCS no longer takes the old mission for the drone's")
+
+        rows = download_and_know()
+        since = rec.now()
+        link.queue_mission_start(as_it_is=True)
+        r.check(f.wait(lambda: sim.armed and sim.mode == "AUTO", 40),
+                f"after a new Download the same start works: armed and in AUTO ({sim.mode})")
+        r.check(any("still holds the downloaded mission" in line for when, line in rec.logs if when >= since),
+                "VGCS read all 8 items again and compared them before it armed")
+        r.check(f.wait(lambda: sim.alt > 18.0, 60), f"it took off ({sim.alt:.1f} m)")
+        f.wait(lambda: sim.vn < -4.0, 40)
+        r.check(sim.vn < -4.0 and abs(sim.ve) < 1.0, f"and flies south, to the first waypoint of the mission that is on the drone "
+                                                    f"(north {sim.vn:+.1f}, east {sim.ve:+.1f} m/s)")
+
+        # --- a jump --------------------------------------------------------------------------
+        link.queue_mission_pause()
+        r.check(f.wait(lambda: sim.mode in ("BRAKE", "LOITER", "POSHOLD"), 15), f"pause: the drone holds ({sim.mode})")
+        f.wait(lambda: speed() < 0.3, 20)
+        item_before = sim.current_item
+        since = replaced_without_a_word(north_east, 7.0, "while it holds")
+        since = rec.now()
+        link.queue_mission_set_current_wp(3)
+        told = said("mission_set_current_wp", since)
+        r.check(told is not None and not told[0] and told[1].startswith("WP 4 not taken") and not_the_one in told[1],
+                f"Fly to WP 4: VGCS asks the drone for the waypoint first, finds another one, and sends no jump ({told})")
+        f.wait(lambda: False, 5)
+        r.check(sim.mode != "AUTO" and speed() < 0.5 and sim.current_item == item_before,
+                f"the drone still holds and its next item is the same ({sim.mode}, {speed():.1f} m/s, mission item {sim.current_item})")
+        r.check(link.mission_on_drone() is None, "and VGCS no longer takes the old mission for the drone's")
+
+        # --- a resume ------------------------------------------------------------------------
+        rows = download_and_know()
+        since = replaced_without_a_word(south_west, 3.0, "while it holds, again")
+        since = rec.now()
+        link.queue_mission_resume()
+        r.check(f.wait(lambda: sim.mode == "AUTO", 15), "resume: back in AUTO")
+        told = said("mission_speed", since)
+        r.check(told is not None and not told[0] and told[1].startswith("Planned speed NOT set again") and not_the_one in told[1],
+                f"VGCS asks the drone for the waypoint first, finds another one, and sends no speed ({told})")
+        seen: list[float] = []
+        sim.fly(40, until=lambda: len(seen) >= 8 and all(abs(v - 10.0) < 0.5 for v in seen[-6:]),
+                each_second=lambda: seen.append(speed()))
+        last = seen[-6:] or [speed()]
+        r.check(len(last) == 6 and all(abs(v - 10.0) < 0.5 for v in last),
+                f"the drone flies at its own {min(last):.1f} to {max(last):.1f} m/s. The plan VGCS had says 7 m/s: that was not sent")
+        r.check(not any(ok for when, action, ok, _text in rec.actions if action == "mission_speed" and when >= since),
+                "and VGCS did not report a speed as set")
+
+        # --- the drone's own word, in flight ---------------------------------------------------
+        rows = download_and_know()
+        r.check(len(rows) == 8 and link.mission_on_drone() is not None, "VGCS downloads the mission the drone flies")
+        since = rec.now()
+        answer = upload_as_another_station(sim, their_mission(north_east, 5.0))
+        told = said("mission", since)
+        heard = [text for text in rec.texts(since) if text.lower().startswith("auto mission changed")]
+        r.check(answer == 0 and len(heard) >= 1,
+                f"in flight the other station replaces the mission again: this time the drone says so on every link ({len(heard)} x {heard[:1]})")
+        r.check(told is not None and not told[0] and told[1].startswith("Another ground station changed the mission")
+                and link.mission_on_drone() is None, f"VGCS drops its plan at once and says why ({told})")
+
+        # --- VGCS's own upload in flight is not another station's --------------------------------
+        mine = []
+        for north, east in north_east:
+            lat, lon = offset_to_lat_lon(north, east)
+            mine.append({"lat": lat, "lon": lon, "alt_m": 20.0, "speed_mps": 4.0})
+        uploads = len(rec.uploaded)
+        since = rec.now()
+        link.queue_mission_upload(mine, "rtl")
+        r.check(f.wait(lambda: len(rec.uploaded) > uploads, 60), "VGCS uploads a mission of its own while the drone flies")
+        f.wait_real(lambda: False, 4.0)
+        heard = [text for text in rec.texts(since) if text.lower().startswith("auto mission changed")]
+        r.check(rec.action("mission", since) is None and link.mission_on_drone() is not None,
+                f"the drone's word about that one ({len(heard)} x) is not taken for another station's: VGCS keeps its plan")
+        link.queue_mission_pause()
+        r.check(f.wait(lambda: sim.mode in ("BRAKE", "LOITER", "POSHOLD"), 15), f"pause: the drone holds ({sim.mode})")
+        f.wait(lambda: speed() < 0.3, 20)
+        since = rec.now()
+        link.queue_mission_resume()
+        r.check(f.wait(lambda: sim.mode == "AUTO", 15), "resume: back in AUTO")
+        told = said("mission_speed", since)
+        r.check(told is not None and told[0] and "4.0 m/s set again" in told[1],
+                f"the check finds VGCS's own mission on the drone, and the planned speed is set again ({told})")
+        seen = []
+        sim.fly(60, until=lambda: len(seen) >= 8 and all(abs(v - 4.0) < 0.5 for v in seen[-6:]),
+                each_second=lambda: seen.append(speed()))
+        last = seen[-6:] or [speed()]
+        r.check(len(last) == 6 and all(abs(v - 4.0) < 0.5 for v in last) and max(seen) < 4.7,
+                f"and the drone flies it: {min(last):.1f} to {max(last):.1f} m/s, {max(seen):.1f} m/s at most on the way")
+
+        expected = ("Mission start: not started", "Mission jump failed: WP 4 not taken")
+        others = [line for _when, line in rec.errors if not line.startswith(expected)]
+        r.check(not others, f"VGCS reported no other error than the start and the jump it refused {others[:3]}")
+    finally:
+        f.close()
+
+
 def takeoff_fence_and_land(version: str, r: Report) -> None:
     """Take-off from VGCS, a geofence that turns the drone back at its edge and at its height limit, and landing from VGCS."""
     # ArduCopter stops a GUIDED drone short of its fence by itself (fence
@@ -815,8 +1165,8 @@ def signed_commands(version: str, r: Report) -> None:
 
 
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
-         mission_upload_and_download, mission_flight, mission_speeds, takeoff_fence_and_land, link_silence,
-         signed_commands]
+         mission_upload_and_download, mission_flight, mission_speeds, missions_as_they_come_back,
+         another_stations_mission, takeoff_fence_and_land, link_silence, signed_commands]
 
 
 def write_report(path: pathlib.Path, results: list[tuple[str, Report, float]]) -> None:

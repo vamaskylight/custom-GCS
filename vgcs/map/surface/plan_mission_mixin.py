@@ -215,12 +215,15 @@ class PlanMissionMixin:
         if panel is not None:
             panel.set_chrome_state(bool(link_ok), max(0, int(waypoint_count)), bool(armed))
 
-    def set_plan_mission_action_result(self, ok: bool, text: str) -> None:
-        """What the drone answered to a mission action, shown in Plan Flight."""
+    def set_plan_mission_action_result(self, ok: bool, text: str, lasting: bool = False) -> None:
+        """What the drone answered to a mission action, shown in Plan Flight.
+
+        ``lasting``: it is about the mission itself and stays while the mission is idle.
+        """
         panel = getattr(self, "_plan_flight_panel", None)
         show = getattr(panel, "set_mission_action_result", None)
         if callable(show):
-            show(bool(ok), str(text or ""))
+            show(bool(ok), str(text or ""), bool(lasting))
 
     def plan_fence_settings(self) -> dict[str, float] | None:
         """The circle fence set in Plan Flight's Fence tab."""

@@ -326,6 +326,246 @@ class MissionReader:
                 if int(item.command) == 16 and seq > 0]
 
 
+class MissionSender:
+    """Sends a mission on the checking connection, as another ground station would.
+
+    Each item: (frame, command, (p1, p2, p3, p4), lat, lon, height). The drone
+    asks for them one by one. Its requests are read by the checking
+    connection's own thread, like everything else that arrives there.
+    """
+
+    def __init__(self, sim: Sitl) -> None:
+        self.sim = sim
+        self.items: list[tuple] = []
+        self.answer: int | None = None       # the drone's answer at the end: 0 is accepted
+        self.active = False
+        take = sim._take
+
+        def taking(msg) -> None:
+            kind = msg.get_type()
+            if self.active and kind in ("MISSION_REQUEST_INT", "MISSION_REQUEST"):
+                self._item(int(msg.seq))
+            elif self.active and kind == "MISSION_ACK":
+                self.answer = int(msg.type)
+                self.active = False
+            take(msg)
+
+        sim._take = taking
+
+    def _item(self, seq: int) -> None:
+        if not 0 <= seq < len(self.items):
+            return
+        frame, command, p, lat, lon, height = self.items[seq]
+        mav = self.sim.mav
+        mav.mav.mission_item_int_send(mav.target_system, mav.target_component, seq, frame, command, 0, 1,
+                                      p[0], p[1], p[2], p[3], int(lat * 1e7), int(lon * 1e7), height)
+
+    def send(self, items: list[tuple]) -> None:
+        self.items, self.answer, self.active = list(items), None, True
+        mav = self.sim.mav
+        mav.mav.mission_count_send(mav.target_system, mav.target_component, len(items))
+
+
+def press_in_the_next_box(button_text: str, seen: list[dict]) -> QTimer:
+    """Press a button of the next message box that comes up, as the operator would.
+
+    What the box says and offers is noted in ``seen``. A box with no such
+    button is closed (its Cancel), so a failed run never waits on one.
+    """
+    timer = QTimer()
+
+    def look() -> None:
+        box = next((x for x in QApplication.topLevelWidgets() if isinstance(x, QMessageBox) and x.isVisible()), None)
+        if box is None:
+            return
+        timer.stop()
+        buttons = {b.text(): b for b in box.buttons()}
+        seen.append({"text": box.text(), "buttons": list(buttons)})
+        button = buttons.get(button_text) or box.escapeButton()
+        if button is not None:
+            button.click()
+        else:
+            box.reject()
+
+    timer.timeout.connect(look)
+    timer.start(50)
+    return timer
+
+
+def the_mission_as_the_drone_holds_it(w, sim: Sitl, r: Report, popups: list[str], logs: list[str],
+                                      reader: "MissionReader", speedup: int) -> None:
+    """Download shows the mission the drone holds, and VGCS does not replace or start another one unasked.
+
+    Until 2026-10-08 a Download lost the "Drop payload" marks, and the next
+    Start Mission uploaded the plan without them: the payload was not released
+    any more. A mission made in another ground station lost its camera, servo
+    and jump commands the same way, without a word.
+    """
+    from PySide6.QtWidgets import QCheckBox, QLineEdit
+
+    mw = w._map_widget
+    panel = mw._plan_flight_panel
+    before = len(popups)
+
+    def result_line() -> str:
+        """The line under the mission buttons, as far as it is on screen."""
+        label = panel._mission_result_label
+        return label.text() if label.isVisible() else ""
+
+    def rows() -> list[tuple[float, float]]:
+        shown: list[tuple[float, float]] = []
+        while True:
+            n = len(shown) + 1
+            alt = panel.findChild(QLineEdit, f"planWpAlt{n}")
+            spd = panel.findChild(QLineEdit, f"planWpSpeed{n}")
+            if alt is None or spd is None:
+                return shown
+            shown.append((float(alt.text()), float(spd.text())))
+
+    def drop_boxes() -> list[bool]:
+        """The "Drop payload" box of each row, as the operator sees it."""
+        out: list[bool] = []
+        while True:
+            box = panel.findChild(QCheckBox, f"planWpDrop{len(out) + 1}")
+            if box is None:
+                return out
+            out.append(box.isChecked())
+
+    def count(text: str) -> int:
+        return sum(1 for line in logs if text in line)
+
+    def on_the_drone() -> list[tuple[int, float, float]]:
+        """(command, p1, p2) of every item the drone holds, read on the checking connection."""
+        reader.read()
+        wait_qt(lambda: reader.done, 20)
+        return [(int(i.command), round(float(i.param1), 1), round(float(i.param2), 1)) for _seq, i in sorted(reader.items.items())]
+
+    def download() -> list[str]:
+        """Press Download. Returns the popups it brought up (the question is answered yes)."""
+        seen = count("Mission download success")
+        panel._btn_vdown.click()
+        wait_qt(lambda: count("Mission download success") > seen, 30)
+        wait_qt(lambda: False, 0.5)
+        said = popups[before:]
+        del popups[before:]
+        return said
+
+    # --- VGCS's own mission, with a payload release --------------------------------------
+    panel.findChild(QCheckBox, "planWpDrop3").click()
+    wait_qt(lambda: False, 0.6)          # the panel sends an edit on after a short wait
+    seen = count("Mission upload success")
+    panel._bar_upload.click()
+    r.check(wait_qt(lambda: count("Mission upload success") > seen, 30), '"Drop payload" ticked on WP 3, and Upload: VGCS reports the mission uploaded')
+    del popups[before:]
+    held = on_the_drone()
+    release = [(183, 9.0, 1900.0), (183, 9.0, 1100.0)]
+    r.check([row for row in held if row[0] == 183] == release and [row[0] for row in held][-5:] == [16, 183, 112, 183, 20],
+            f"the drone holds the release after WP 3: servo 9 to 1900, a wait, servo 9 back to 1100 ({[row[0] for row in held]})")
+
+    panel.findChild(QCheckBox, "planWpDrop3").click()      # unticked on the map, and not uploaded
+    wait_qt(lambda: False, 0.6)
+    r.check(drop_boxes() == [False, False, False] and not mw._waypoints_model[2].drop_payload, "the box unticked on the map (not uploaded)")
+    said = download()
+    r.check(drop_boxes() == [False, False, True] and bool(mw._waypoints_model[2].drop_payload),
+            f'Download: the "Drop payload" box of WP 3 is ticked again, as the drone holds it ({drop_boxes()})')
+    r.check(len(said) == 1 and "from the drone" in said[0], f"it asked before it replaced the plan, and had nothing to warn about ({len(said)} popups)")
+    r.check([row for row in on_the_drone() if row[0] == 183] == release, "and the drone still holds its release")
+
+    # --- A mission made in another ground station -----------------------------------------
+    home_lat, home_lon = 20.4347, 72.8696            # where the simulated drone stands (sitl_session default)
+
+    def place(north_m: float, east_m: float) -> tuple[float, float]:
+        return home_lat + north_m / 111_320.0, home_lon + east_m / (111_320.0 * math.cos(math.radians(home_lat)))
+
+    a, b, c = place(400.0, 0.0), place(400.0, 400.0), place(400.0, 480.0)
+
+    def theirs(second) -> list[tuple]:
+        return [(3, 16, (0, 0, 0, 0), a[0], a[1], 0.0),             # the home slot
+                (3, 22, (0, 0, 0, 0), 0.0, 0.0, 30.0),              # take-off to 30 m
+                (3, 16, (3, 0, 0, 0), a[0], a[1], 30.0),            # a waypoint with a 3 s hover
+                (3, 203, (0, 0, 0, 0), 0.0, 0.0, 0.0),              # a camera trigger
+                (3, 183, (10, 1500, 0, 0), 0.0, 0.0, 0.0),          # a servo that is not the payload release
+                (3, 16, (0, 0, 0, 0), second[0], second[1], 30.0),
+                (3, 20, (0, 0, 0, 0), 0.0, 0.0, 0.0)]               # return to launch
+
+    sender = MissionSender(sim)
+    sender.send(theirs(b))
+    r.check(wait_qt(lambda: sender.answer == 0, 20), f"another ground station's mission is on the drone (the drone answered {sender.answer})")
+    r.check(wait_qt(lambda: "changed" in result_line() and "Download" in result_line(), 10),
+            f"VGCS sees another number of items and says so under the mission buttons ({result_line()!r})")
+    said = download()
+    r.check(len(said) == 2 and "more than this plan can hold" in said[1] and "1 x camera trigger" in said[1] and "1 x servo command" in said[1],
+            f"Download: VGCS says what the plan cannot hold ({said[1][:140] if len(said) > 1 else said!r})")
+    own = rows()[0][1] if rows() else 0.0
+    r.check(rows() == [(30.0, own), (30.0, own)] and own > 0.0,
+            f"the rows show its two waypoints at 30 m, at the drone's own speed since it sets none ({rows()})")
+
+    # Upload, answered no.
+    questions: list[str] = []
+    yes = QMessageBox.question
+    QMessageBox.question = staticmethod(lambda _p, title, text, *a, **k: questions.append(f"{title}: {text}") or QMessageBox.StandardButton.No)
+    seen = count("Mission upload success")
+    try:
+        panel._bar_upload.click()
+        wait_qt(lambda: False, 2.0)
+    finally:
+        QMessageBox.question = yes
+    r.check(len(questions) == 1 and "Upload anyway?" in questions[0] and "1 x camera trigger" in questions[0],
+            f"Upload asks first, and names what would be gone ({questions[0][:120] if questions else 'no question'!r})")
+    held = on_the_drone()
+    r.check(count("Mission upload success") == seen and (203, 0.0, 0.0) in held and len(held) == 7,
+            f"answered no: nothing is uploaded, the drone keeps its mission with the camera trigger ({[row[0] for row in held]})")
+    del popups[before:]
+
+    # Start Mission, left alone.
+    boxes: list[dict] = []
+    timer = press_in_the_next_box("Cancel", boxes)
+    panel._start_mission_btn.click()
+    timer.stop()
+    wait_qt(lambda: False, 1.5)
+    offered = sorted(boxes[0]["buttons"]) if boxes else []
+    r.check(offered == ["Cancel", "Start it as it is on the drone", "Upload this plan and start"] and "1 x camera trigger" in boxes[0]["text"],
+            f"Start Mission asks, and offers to start the mission as it is on the drone ({offered})")
+    r.check(not sim.armed and popups[before:] == [] and count("Mission upload success") == seen, "Cancel: nothing is uploaded and the drone is not armed")
+
+    # The other station changes its mission. The same number of items: the drone tells VGCS nothing.
+    line_before = result_line()
+    sender.send(theirs(c))
+    r.check(wait_qt(lambda: sender.answer == 0, 20), "the other station sends its mission again, with the second waypoint 80 m further east")
+    wait_qt(lambda: False, 3.0)
+    r.check(result_line() == line_before, "VGCS is told nothing of it: the map still shows the mission as it was")
+    boxes = []
+    timer = press_in_the_next_box("Start it as it is on the drone", boxes)
+    panel._start_mission_btn.click()
+    timer.stop()
+    wanted = "Not started: the mission on the drone changed since the Download"
+    r.check(wait_qt(lambda: result_line().startswith(wanted), 20) and "Download" in result_line(),
+            f"start as it is: VGCS reads the mission again, finds another one, starts nothing and says why ({result_line()!r})")
+    wait_qt(lambda: False, 3.0)
+    r.check(not sim.armed and sim.mode != "AUTO", f"the drone was not armed ({sim.mode})")
+    del popups[before:]
+
+    # After a new Download the same start flies it, with nothing uploaded.
+    said = download()
+    r.check(len(said) == 2 and "1 x camera trigger" in said[1], "a new Download shows the mission that is on the drone now")
+    boxes = []
+    timer = press_in_the_next_box("Start it as it is on the drone", boxes)
+    panel._start_mission_btn.click()
+    timer.stop()
+    r.check(wait_qt(lambda: sim.armed and sim.mode == "AUTO", 60), f"start as it is: armed and in AUTO ({sim.mode})")
+    r.check(wait_qt(lambda: sim.alt > 27.0, 90), f"it took off to the 30 m of that mission ({sim.alt:.1f} m)")
+    r.check(count("Mission upload success") == seen and (203, 0.0, 0.0) in on_the_drone(),
+            "nothing was uploaded: the drone flies its mission with the camera trigger in it")
+    said = popups[before:]
+    r.check(len(said) == 1 and "not armed" in said[0], f"the operator was told that it arms, and nothing else ({len(said)} popups)")
+    del popups[before:]
+
+    w._on_land()
+    r.check(wait_qt(lambda: sim.mode == "LAND", 10), f"Land: the drone is landing ({sim.mode})")
+    r.check(wait_qt(lambda: not sim.armed, 180 if speedup == 1 else 60), "Land: it landed and disarmed")
+    del popups[before:]
+
+
 def fly_the_plan(w, sim: Sitl, r: Report, popups: list[str], reader: "MissionReader",
                  want: list[tuple[float, float]], speedup: int) -> None:
     """Start Mission, then the mission controls in Plan Flight while it flies.
@@ -571,6 +811,7 @@ def plan_flight_mission(w, sim: Sitl, r: Report, popups: list[str], logs: list[s
     del popups[before:]
 
     fly_the_plan(w, sim, r, popups, reader, want, speedup)
+    the_mission_as_the_drone_holds_it(w, sim, r, popups, logs, reader, speedup)
 
     panel.exit_requested.emit()          # "Exit Plan"
     wait_qt(lambda: False, 0.3)

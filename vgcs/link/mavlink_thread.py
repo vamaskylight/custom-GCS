@@ -23,7 +23,6 @@ from vgcs.mission import (
     MissionPlan,
     build_mission_plan,
     normalize_end_action,
-    parse_downloaded_mission,
     plan_signature,
 )
 from vgcs.link.confirmations import ModeChange, ParamReads, ParamWrites, clean_name
@@ -113,9 +112,19 @@ _PREARM_REASON_MAX_AGE_S = 30.0
 # takeoff ends up sent into the wrong mode.
 _MODE_CONFIRM_TIMEOUT_S = 3.0
 
-# ArduPilot says "Flight plan received" to every ground station when it has
-# taken a new mission. Within this time after an upload from here, it is ours.
-_OWN_UPLOAD_ECHO_S = 10.0
+# ArduPilot says "Flight plan received" when it has taken a new mission, on
+# the link the mission came in on. The first one within this time after an
+# upload from here is the answer to ours. (It was ten seconds and any number
+# of them: a mission sent over the same link a few seconds later went
+# unnoticed.)
+_OWN_UPLOAD_ECHO_S = 5.0
+
+# A drone flying in AUTO says "Auto mission changed, restarted command" on
+# every link when the waypoints ahead of it are replaced, once for each item
+# written (seven times for one upload in the simulator, 2026-10-08). After an
+# upload from here they are about our own mission for this long. Texts wait in
+# a queue on the drone, so this is longer than the wait above.
+_OWN_UPLOAD_CHANGE_S = 10.0
 
 # How the vehicle answers an arm request. "Denied" and "temporarily rejected"
 # call for opposite responses from the operator, so they are never collapsed
@@ -296,7 +305,16 @@ class MavlinkThread(QThread):
         # The waypoints of the mission VGCS knows the drone holds: what it
         # uploaded or downloaded last (see mission_on_drone).
         self._mission_waypoints: tuple | None = None
-        self._own_mission_upload_mono = 0.0
+        # What the drone's mission has and that plan cannot hold (see
+        # mission_not_kept). Known after a download, empty after an upload.
+        self._mission_not_kept: tuple = ()
+        self._own_upload_echo_until = 0.0
+        self._own_upload_done_mono = 0.0
+        # True from the moment an upload starts to replace the drone's mission
+        # until the drone has acknowledged all of it. An upload that fails
+        # leaves it True: the drone then holds none of the mission, or the
+        # first items of it. A later upload or download that works clears it.
+        self._mission_in_doubt = False
         # MAVLink 2 command signing (M16, vgcs/link/signing.py). The key comes
         # from the window; pymavlink replaces its MAVLink object when the
         # drone's first MAVLink 2 packet arrives, so signing is (re)applied
@@ -408,9 +426,15 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("mission_download", None))
 
-    def queue_mission_start(self) -> None:
+    def queue_mission_start(self, as_it_is: bool = False) -> None:
+        """Arm if needed, AUTO, and start the mission the drone holds.
+
+        ``as_it_is``: nothing was uploaded before, the operator starts the
+        mission a Download showed. The link then reads the mission again and
+        compares it first, and starts nothing when it is another one by now.
+        """
         with self._cmd_lock:
-            self._cmd_queue.append(("mission_start", None))
+            self._cmd_queue.append(("mission_start", bool(as_it_is)))
 
     def queue_mission_pause(self) -> None:
         """Hold position mid-mission (BRAKE, falling back to LOITER)."""
@@ -810,6 +834,10 @@ class MavlinkThread(QThread):
             elif msg_type == "MISSION_ITEM_REACHED":
                 # Fires once per completed item — the only reliable "WP N done" event.
                 self._emit_mission_progress(int(getattr(msg, "seq", 0) or 0), reached=True)
+            elif msg_type in ("MISSION_ITEM_INT", "MISSION_ITEM"):
+                self._hear_mission_item(msg)
+            elif msg_type == "MISSION_ACK":
+                self._hear_mission_ack(msg)
             elif msg_type == "STATUSTEXT":
                 self._handle_statustext(msg)
             elif msg_type == "COMMAND_ACK":
@@ -1119,7 +1147,7 @@ class MavlinkThread(QThread):
             elif cmd == "mission_download":
                 self._mission_download()
             elif cmd == "mission_start":
-                self._mission_start()
+                self._mission_start(as_it_is=bool(payload))
             elif cmd == "mission_pause":
                 self._mission_pause()
             elif cmd == "mission_resume":
@@ -1750,36 +1778,45 @@ class MavlinkThread(QThread):
         They are read here so a mission built on a machine that has never been
         told gets the documented defaults rather than silence.
         """
-        from PySide6.QtCore import QSettings
+        from vgcs.link.payload_servo_settings import payload_servo_from_settings
 
-        from vgcs.map.app_settings import QS_APP, QS_ORG
-        from vgcs.mission.mission_plan import PayloadServo
-
-        st = QSettings(QS_ORG, QS_APP)
-
-        def _num(key, default, cast):
-            try:
-                return cast(st.value(key, default))
-            except (TypeError, ValueError):
-                return cast(default)
-
-        return PayloadServo(
-            channel=_num("mission/payload_servo_channel", 9, int),
-            release_pwm=_num("mission/payload_servo_release_pwm", 1900, int),
-            reset_pwm=_num("mission/payload_servo_reset_pwm", 1100, int),
-            hold_s=_num("mission/payload_servo_hold_s", 1.0, float),
-        )
+        return payload_servo_from_settings()
 
     def _mission_upload(
         self, waypoints: list[dict], end_action: str = DEFAULT_MISSION_END_ACTION
     ) -> None:
+        """Send the plan to the drone. A failure is said out loud, and nothing is started on what is left.
+
+        The drone's mission is cleared when the upload starts, and the items
+        are taken one by one. After an upload that broke off the drone may
+        hold no mission, or the first items of the new one: not the plan, and
+        maybe not the mission it had before. Until 2026-10-08 a failed upload was
+        written to the log only, and the Start Mission queued behind it armed
+        the drone and started whatever was left.
+        """
         if self._master is None:
             self.error.emit("Mission upload: link not ready")
             return
         if not waypoints:
             self.error.emit("Mission upload: no waypoints")
             return
+        try:
+            self._send_mission(waypoints, end_action)
+        except Exception as e:
+            if getattr(self, "_mission_in_doubt", False):
+                self._mission_plan_lost(
+                    f"Mission upload failed ({e}). The drone may hold no mission now, or only a part of it. "
+                    "Upload it again"
+                )
+            else:
+                self.action_result.emit(
+                    "mission", False, f"Mission upload failed ({e}). Nothing was sent to the drone"
+                )
+            raise
 
+    def _send_mission(
+        self, waypoints: list[dict], end_action: str = DEFAULT_MISSION_END_ACTION
+    ) -> None:
         # Item layout (home slot / takeoff at seq 1 / speed changes / terminal action)
         # is decided by vgcs.mission.build_mission_plan — see that module for the
         # ArduPilot AP_Mission rules it encodes.
@@ -1813,6 +1850,8 @@ class MavlinkThread(QThread):
             f"end={plan.end_action}{drops}{hover})"
         )
         self._sync_link_targets()
+        # From here on the drone's mission is being replaced.
+        self._mission_in_doubt = True
         self._mission_clear_for_upload_best_effort()
 
         def send_mission_count() -> None:
@@ -1928,17 +1967,44 @@ class MavlinkThread(QThread):
         # Remember the layout so mission progress can name the right waypoint.
         self._mission_plan = plan
         self._mission_waypoints = plan_signature(waypoints)
-        self._own_mission_upload_mono = time.monotonic()
+        self._mission_not_kept = ()
+        self._mission_in_doubt = False
+        self._own_upload_done_mono = time.monotonic()
+        self._own_upload_echo_until = self._own_upload_done_mono + _OWN_UPLOAD_ECHO_S
         self._last_mission_seq_reported = None
         self._legs().mission_changed()
         self.log_line.emit(f"Mission upload complete: {count} mission items")
         self.mission_uploaded.emit(len(waypoints))
 
-    def _mission_download(self) -> None:
-        if self._master is None:
-            self.error.emit("Mission download: link not ready")
-            return
-        self.log_line.emit("Mission download start")
+    @staticmethod
+    def _mission_item_row(itm, seq: int = 0) -> dict:
+        """A MISSION_ITEM_INT or MISSION_ITEM as the row the mission reader works with."""
+        if itm.get_type() == "MISSION_ITEM_INT":
+            lat = float(getattr(itm, "x", 0)) / 1e7
+            lon = float(getattr(itm, "y", 0)) / 1e7
+        else:
+            lat = float(getattr(itm, "x", 0.0))
+            lon = float(getattr(itm, "y", 0.0))
+        # command and params must survive: without them the home slot, the takeoff
+        # item and every DO_CHANGE_SPEED (all at lat/lon 0,0) look like waypoints.
+        return {
+            "seq": int(getattr(itm, "seq", seq) or 0),
+            "command": int(getattr(itm, "command", mavutil.mavlink.MAV_CMD_NAV_WAYPOINT) or 0),
+            "frame": int(getattr(itm, "frame", 0) or 0),
+            "lat": lat,
+            "lon": lon,
+            "alt_m": float(getattr(itm, "z", 20.0)),
+            "p1": float(getattr(itm, "param1", 0.0) or 0.0),
+            "p2": float(getattr(itm, "param2", 0.0) or 0.0),
+            "p3": float(getattr(itm, "param3", 0.0) or 0.0),
+            "p4": float(getattr(itm, "param4", 0.0) or 0.0),
+        }
+
+    def _read_mission_rows(self) -> list[dict]:
+        """Read the whole mission from the drone, item by item.
+
+        Raises TimeoutError when the drone stops answering.
+        """
         try:
             self._master.mav.mission_request_list_send(
                 self._target_sysid,
@@ -1973,37 +2039,28 @@ class MavlinkThread(QThread):
                     self._target_compid,
                     seq,
                 )
-            itm = self._master.recv_match(
-                type=["MISSION_ITEM_INT", "MISSION_ITEM"],
-                blocking=True,
-                timeout=3.0,
-            )
+            # Only the item asked for counts. VGCS also asks for single items
+            # (the check of its plan against the drone), and a late answer to
+            # one of those must not be taken for this one: the mission would
+            # be read with an item twice and another one missing.
+            itm = None
+            for _attempt in range(4):
+                got = self._master.recv_match(
+                    type=["MISSION_ITEM_INT", "MISSION_ITEM"],
+                    blocking=True,
+                    timeout=3.0,
+                )
+                if got is None:
+                    break
+                if int(getattr(got, "mission_type", 0) or 0) != int(mavutil.mavlink.MAV_MISSION_TYPE_MISSION):
+                    continue
+                if int(getattr(got, "seq", seq) or 0) != seq:
+                    continue
+                itm = got
+                break
             if itm is None:
                 raise TimeoutError(f"mission download timeout seq={seq}")
-            if itm.get_type() == "MISSION_ITEM_INT":
-                lat = float(getattr(itm, "x", 0)) / 1e7
-                lon = float(getattr(itm, "y", 0)) / 1e7
-                alt = float(getattr(itm, "z", 20.0))
-            else:
-                lat = float(getattr(itm, "x", 0.0))
-                lon = float(getattr(itm, "y", 0.0))
-                alt = float(getattr(itm, "z", 20.0))
-            # command and params must survive: without them the home slot, the takeoff
-            # item and every DO_CHANGE_SPEED (all at lat/lon 0,0) look like waypoints.
-            items.append(
-                {
-                    "seq": int(getattr(itm, "seq", seq) or 0),
-                    "command": int(getattr(itm, "command", mavutil.mavlink.MAV_CMD_NAV_WAYPOINT) or 0),
-                    "frame": int(getattr(itm, "frame", 0) or 0),
-                    "lat": lat,
-                    "lon": lon,
-                    "alt_m": alt,
-                    "p1": float(getattr(itm, "param1", 0.0) or 0.0),
-                    "p2": float(getattr(itm, "param2", 0.0) or 0.0),
-                    "p3": float(getattr(itm, "param3", 0.0) or 0.0),
-                    "p4": float(getattr(itm, "param4", 0.0) or 0.0),
-                }
-            )
+            items.append(self._mission_item_row(itm, seq))
         try:
             self._master.mav.mission_ack_send(
                 self._target_sysid,
@@ -2017,10 +2074,23 @@ class MavlinkThread(QThread):
                 self._target_compid,
                 mavutil.mavlink.MAV_MISSION_ACCEPTED,
             )
+        return items
+
+    def _mission_download(self) -> None:
+        if self._master is None:
+            self.error.emit("Mission download: link not ready")
+            return
+        self.log_line.emit("Mission download start")
+        items = self._read_mission_rows()
         # Rebuild the seq -> waypoint mapping from what the vehicle actually holds, so
         # progress stays correct for a mission this GCS did not upload.
         self._mission_plan = self._plan_from_downloaded_items(items)
-        self._mission_waypoints = plan_signature(parse_downloaded_mission(items)[0])
+        # Which plan this mission is on the map, the window says once it has
+        # read the items (set_mission_on_drone): it knows the drone's own
+        # speed, which a mission without a speed item is flown at.
+        self._mission_waypoints = None
+        self._mission_not_kept = ()
+        self._mission_in_doubt = False
         self._last_mission_seq_reported = None
         self._legs().mission_changed()
         self.log_line.emit(f"Mission download complete: {len(items)} mission items")
@@ -2072,6 +2142,12 @@ class MavlinkThread(QThread):
                 label = "Land"
             else:
                 label = f"CMD {cmd}"
+            # What the height is measured from. It is compared when an item is
+            # read from the drone again (MissionPlan.same_item).
+            try:
+                frame = int(row.get("frame", mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT))
+            except (TypeError, ValueError):
+                frame = int(mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT)
             plan.items.append(
                 MissionItem(
                     seq=seq,
@@ -2085,6 +2161,7 @@ class MavlinkThread(QThread):
                     p2=float(row.get("p2", 0.0) or 0.0),
                     p3=float(row.get("p3", 0.0) or 0.0),
                     p4=float(row.get("p4", 0.0) or 0.0),
+                    frame=frame,
                     wp_index=idx,
                     label=label,
                 )
@@ -2677,8 +2754,11 @@ class MavlinkThread(QThread):
         """Keep a pre-arm line and pass the text on to the rest of the app."""
         text = str(getattr(msg, "text", "") or "").strip()
         self._remember_prearm_reason(text)
-        if text.lower().startswith("flight plan received"):
+        low = text.lower()
+        if low.startswith("flight plan received"):
             self._hear_flight_plan_received()
+        elif low.startswith("auto mission changed"):
+            self._hear_mission_changed_in_flight()
         request = getattr(self, "_mode_request", None)
         if request is not None:
             request.heard_text(text)
@@ -2736,13 +2816,64 @@ class MavlinkThread(QThread):
             return ""
         return _ARM_ACK_RESULTS.get(int(result), f"vehicle answered result {int(result)}")
 
-    def _mission_start(self) -> None:
+    def _drone_still_holds_the_downloaded_mission(self) -> bool:
+        """Before "start it as it is on the drone": read the mission again and compare.
+
+        The operator starts what the map shows since the Download. Another
+        ground station can have replaced the mission in the meantime, and the
+        drone tells only the sender (simulator, 2026-10-08). So nothing is
+        started unless every item is still the one VGCS read.
+        """
+        plan = self._mission_plan
+        if plan is None:
+            self.action_result.emit("mission_start", False, "the mission on this drone is not known")
+            self.action_result.emit(
+                "mission", False,
+                "Not started: VGCS does not know the mission on this drone any more. Press Download in Plan Flight",
+            )
+            return False
+        try:
+            rows = self._read_mission_rows()
+        except Exception as e:
+            self.action_result.emit("mission_start", False, f"the mission could not be read again ({e})")
+            self.action_result.emit(
+                "mission", False,
+                f"Not started: VGCS could not read the mission from the drone to check it ({e}). Try again",
+            )
+            return False
+        different = plan.what_differs(rows)
+        if different:
+            self.action_result.emit("mission_start", False, "the mission on the drone changed since the Download")
+            self._mission_plan_lost(
+                f"Not started: the mission on the drone changed since the Download ({different}). "
+                "Press Download in Plan Flight"
+            )
+            return False
+        self.log_line.emit(
+            f"Mission start: the drone still holds the downloaded mission ({len(rows)} items read and compared)"
+        )
+        return True
+
+    def _mission_start(self, as_it_is: bool = False) -> None:
         if self._master is None:
             self.action_result.emit("mission_start", False, "Link not ready")
             self.error.emit("Mission start: link not ready")
             return
         try:
             self._sync_link_targets()
+            if as_it_is and not self._drone_still_holds_the_downloaded_mission():
+                self.error.emit("Mission start: not started, the mission on the drone could not be confirmed")
+                return
+            if not as_it_is and getattr(self, "_mission_in_doubt", False):
+                # Start Mission queues the upload and this start behind it.
+                self.action_result.emit("mission_start", False, "the mission upload before it failed")
+                self.action_result.emit(
+                    "mission", False,
+                    "Not started: the mission upload failed. The drone may hold no mission, or only a part of it. "
+                    "Upload it again",
+                )
+                self.error.emit("Mission start: not started, the mission upload before it failed")
+                return
             if self._vehicle_armed:
                 self.log_line.emit("Mission start: vehicle already armed — skipping arm step")
             else:
@@ -2879,6 +3010,7 @@ class MavlinkThread(QThread):
             legs = self._leg_speed = LegSpeed(
                 send_speed=self._send_speed_command,
                 send_jump=self._send_mission_set_current,
+                ask_item=self._send_mission_item_request,
                 say=lambda text: self.log_line.emit(text),
                 tell=lambda ok, text: self.action_result.emit("mission_speed", bool(ok), text),
                 get_plan=lambda: self._mission_plan,
@@ -2906,6 +3038,54 @@ class MavlinkThread(QThread):
             p3=-1.0,
         )
 
+    def _send_mission_item_request(self, seq: int) -> None:
+        """Ask the drone for one mission item. It answers at once, with no list request before."""
+        try:
+            self._master.mav.mission_request_int_send(
+                self._target_sysid,
+                self._target_compid,
+                int(seq),
+                mavutil.mavlink.MAV_MISSION_TYPE_MISSION,
+            )
+        except TypeError:
+            self._master.mav.mission_request_int_send(
+                self._target_sysid,
+                self._target_compid,
+                int(seq),
+            )
+
+    def _is_mission_answer_for_us(self, msg) -> bool:
+        """From the flight controller, about the mission (not the fence or the rally points), and sent to this station."""
+        if not self._is_primary_source(msg):
+            return False
+        if int(getattr(msg, "mission_type", 0) or 0) != int(mavutil.mavlink.MAV_MISSION_TYPE_MISSION):
+            return False
+        # Where several stations share one link, the answers to the others are heard too.
+        target = int(getattr(msg, "target_system", 0) or 0)
+        mine = getattr(getattr(self._master, "mav", None), "srcSystem", None)
+        return target == 0 or mine is None or int(mine) == target
+
+    def _hear_mission_item(self, msg) -> None:
+        """One mission item outside a download: an answer to the check of the plan against the drone."""
+        legs = getattr(self, "_leg_speed", None)
+        if legs is None or not legs.reading() or not self._is_mission_answer_for_us(msg):
+            return
+        row = self._mission_item_row(msg)
+        legs.heard_item(row["seq"], row, time.monotonic())
+
+    def _hear_mission_ack(self, msg) -> None:
+        """A MISSION_ACK outside an upload or a download.
+
+        While items are asked for, an error means the drone does not give one:
+        it has no such item, or a ground station is sending it a mission.
+        """
+        legs = getattr(self, "_leg_speed", None)
+        if legs is None or not legs.reading() or not self._is_mission_answer_for_us(msg):
+            return
+        result = int(getattr(msg, "type", 0) or 0)
+        if result != int(mavutil.mavlink.MAV_MISSION_ACCEPTED):
+            legs.heard_item_refused(result, time.monotonic())
+
     def _hear_command_ack(self, msg) -> None:
         """The flight controller's answer to a command sent from here."""
         if not self._is_primary_source(msg):
@@ -2918,23 +3098,55 @@ class MavlinkThread(QThread):
         self._legs().heard_ack(command, result, time.monotonic())
 
     def _hear_flight_plan_received(self) -> None:
-        """ArduPilot tells every ground station when it has taken a new mission.
+        """ "Flight plan received": the drone has taken a new mission.
 
         Right after an upload from here, that is ours. At any other time
         another ground station sent it, and the plan VGCS holds is no longer
         the drone's: its speeds and waypoint numbers must not be used.
+
+        The drone says this only on the link the mission came in on
+        (simulator, 2026-10-08). So it is heard here for another station's
+        mission only where both stations share one link. For every other case
+        the plan is checked against the drone before it is used
+        (vgcs/link/mission_speed.py).
         """
+        until = float(getattr(self, "_own_upload_echo_until", 0.0) or 0.0)
+        if until and time.monotonic() < until:
+            # The answer to our own upload. Only one: the next is someone else's.
+            self._own_upload_echo_until = 0.0
+            return
         if self._mission_plan is None:
             return
-        own = float(getattr(self, "_own_mission_upload_mono", 0.0) or 0.0)
-        if own and time.monotonic() - own < _OWN_UPLOAD_ECHO_S:
-            return
         self._mission_plan_lost("Another ground station sent the drone a new mission. Press Download in Plan Flight")
+
+    def _hear_mission_changed_in_flight(self) -> None:
+        """ "Auto mission changed, restarted command": the waypoints ahead of a flying drone were replaced.
+
+        The drone says this on every link (simulator, 2026-10-08), unlike
+        "Flight plan received". For some seconds after an upload from here it
+        is about our own mission. At any other time another ground station
+        changed what the drone flies, and the plan VGCS holds is no longer the
+        drone's.
+
+        Only a drone in AUTO says it. A mission replaced while it holds or
+        stands on the ground gives no word at all, so the plan is also checked
+        against the drone before it is used (vgcs/link/mission_speed.py).
+        """
+        done = float(getattr(self, "_own_upload_done_mono", 0.0) or 0.0)
+        if done and time.monotonic() - done < _OWN_UPLOAD_CHANGE_S:
+            return
+        if self._mission_plan is None:
+            return
+        self._mission_plan_lost(
+            "Another ground station changed the mission while the drone was flying it. "
+            "Press Download in Plan Flight"
+        )
 
     def _mission_plan_lost(self, text: str) -> None:
         """The mission on the drone is no longer the one VGCS knows."""
         self._mission_plan = None
         self._mission_waypoints = None
+        self._mission_not_kept = ()
         self._last_mission_seq_reported = None
         self._legs().mission_changed()
         self.log_line.emit(f"Mission: {text}")
@@ -2946,6 +3158,21 @@ class MavlinkThread(QThread):
         Read from the window's thread: the value is replaced whole, never changed in place.
         """
         return getattr(self, "_mission_waypoints", None)
+
+    def mission_not_kept(self) -> tuple:
+        """What the mission on the drone has and the plan on the map cannot hold, one line each.
+
+        Empty after an upload from here: then the drone holds exactly the plan.
+        """
+        return tuple(getattr(self, "_mission_not_kept", ()) or ())
+
+    def set_mission_on_drone(self, signature, not_kept=()) -> None:
+        """After a download: the plan the window made of it, and what that plan could not hold.
+
+        Called from the window's thread. Both values are replaced whole.
+        """
+        self._mission_waypoints = None if signature is None else tuple(signature)
+        self._mission_not_kept = tuple(str(line) for line in (not_kept or ()))
 
     def _arm_disarm(self, arm: bool) -> None:
         if self._master is None:

@@ -2,6 +2,7 @@
 
 from vgcs.mission.mission_plan import (
     DEFAULT_MISSION_END_ACTION,
+    DownloadedMission,
     MISSION_END_ACTIONS,
     MissionItem,
     MissionPlan,
@@ -10,6 +11,7 @@ from vgcs.mission.mission_plan import (
     normalize_end_action,
     parse_downloaded_mission,
     plan_signature,
+    read_downloaded_mission,
     validate_waypoints,
 )
 from vgcs.mission.waypoint_store import (
@@ -35,8 +37,10 @@ __all__ = [
     "load_mission_end_action",
     "load_waypoints_json",
     "normalize_end_action",
+    "DownloadedMission",
     "parse_downloaded_mission",
     "plan_signature",
+    "read_downloaded_mission",
     "save_waypoints_json",
     "save_waypoints_kml",
     "validate_waypoints",

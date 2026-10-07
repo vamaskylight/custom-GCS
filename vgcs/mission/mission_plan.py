@@ -36,7 +36,9 @@ __all__ = [
     "MissionItem",
     "MissionPlan",
     "build_mission_plan",
+    "DownloadedMission",
     "parse_downloaded_mission",
+    "read_downloaded_mission",
     "plan_signature",
     "validate_waypoints",
     "normalize_end_action",
@@ -64,6 +66,14 @@ MAX_WP_SPEED_MPS = 30.0
 MIN_LEG_LENGTH_M = 1.0
 # Warn (do not block) when the plan reaches further than this from waypoint 1.
 FAR_FROM_START_WARN_M = 5000.0
+
+# How close an item read from the drone must be to count as the plan's item.
+# The drone gives back what it stored: a place is a whole number of 1e-7
+# degrees (the rest is cut off at the upload), a height a whole number of
+# centimetres, and the other values are 32-bit numbers.
+_SAME_PLACE_DEG = 2e-7
+_SAME_HEIGHT_M = 0.02
+_SAME_VALUE = 0.01
 
 
 @dataclass
@@ -145,6 +155,15 @@ class MissionPlan:
         whenever it enters AUTO, and a jump skips the speed items in between,
         so the link sends this speed itself (simulator, 2026-10-07).
         """
+        item = self._speed_item_for_seq(seq)
+        return None if item is None else float(item.p2)
+
+    def speed_seq_for_seq(self, seq: int) -> int | None:
+        """The mission item that sets the speed for the waypoint at ``seq``, or ``None``."""
+        item = self._speed_item_for_seq(seq)
+        return None if item is None else int(item.seq)
+
+    def _speed_item_for_seq(self, seq: int) -> MissionItem | None:
         try:
             s = int(seq)
         except (TypeError, ValueError):
@@ -152,17 +171,17 @@ class MissionPlan:
         target = next((item for item in self.items if item.seq == s), None)
         if target is None or target.wp_index is None:
             return None
-        speed: float | None = None
-        latest = -1
+        found: MissionItem | None = None
         for item in self.items:
+            latest = -1 if found is None else found.seq
             if item.command != int(_m.MAV_CMD_DO_CHANGE_SPEED) or not (latest < item.seq < s):
                 continue
             # p1: 0 air speed, 1 ground speed (a copter flies both the same
             # way), 2 climb, 3 descent. p2 of zero or less means "no change".
             if int(item.p1) not in (0, 1) or float(item.p2) <= 0.0:
                 continue
-            speed, latest = float(item.p2), item.seq
-        return speed
+            found = item
+        return found
 
     def speed_for_waypoint_index(self, wp_index: int) -> float | None:
         seq = self.seq_for_waypoint_index(wp_index)
@@ -207,6 +226,109 @@ class MissionPlan:
             # MAVLink's nav commands end at 95 (MAV_CMD_NAV_LAST).
             return int(item.command) <= 95
         return False
+
+    # --- is this still the mission on the drone? -----------------------------
+    #
+    # The drone tells only the ground station that sent a mission that it has
+    # a new one. Another station can replace the mission and VGCS hears nothing
+    # (simulator, 2026-10-08), unless the number of items changes. So before
+    # VGCS sends anything that counts on this plan, it reads the items
+    # concerned from the drone and compares them with these.
+
+    def items_to_check_for_seq(self, seq: int) -> list[int]:
+        """The mission items the leg to the waypoint at ``seq`` depends on.
+
+        The waypoint itself and the speed item that sets its speed. Where the
+        plan says the leg can be started again (leg_can_start_again), also
+        everything from the nav item before it up to it: a payload release
+        there, put in by someone else, is what would make that unsafe.
+
+        Item 0 is never one of them: the drone writes its home there. Empty for
+        anything that is not one of the operator's waypoints.
+        """
+        try:
+            s = int(seq)
+        except (TypeError, ValueError):
+            return []
+        by_seq = {item.seq: item for item in self.items}
+        target = by_seq.get(s)
+        if target is None or target.wp_index is None:
+            return []
+        wanted = {s}
+        speed_seq = self.speed_seq_for_seq(s)
+        if speed_seq is not None:
+            wanted.add(speed_seq)
+        if self.leg_can_start_again(s):
+            before = s - 1
+            while before >= 1:
+                item = by_seq.get(before)
+                if item is None:
+                    break
+                wanted.add(before)
+                if item.command != int(_m.MAV_CMD_DO_CHANGE_SPEED):
+                    break         # the nav item before
+                before -= 1
+        return sorted(wanted)
+
+    def same_item(self, seq: int, row: object) -> bool:
+        """True when ``row``, an item read from the drone, is this plan's item at ``seq``.
+
+        ``row`` is what a download gives for one item: command, frame, lat,
+        lon, alt_m and p1 to p4. Compared are the command, its first two
+        values (hover time, speed, servo output and pulse), the place and the
+        height, and for an item with a place what its height is measured from.
+        """
+        try:
+            s = int(seq)
+        except (TypeError, ValueError):
+            return False
+        item = next((i for i in self.items if i.seq == s), None)
+        if item is None or not isinstance(row, dict):
+            return False
+
+        def number(key: str) -> float:
+            try:
+                return float(row.get(key, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return float("nan")
+
+        if int(number("command")) != int(item.command):
+            return False
+        # A comparison with "not a number" is never true, so a value that
+        # cannot be read counts as different.
+        if not (abs(number("p1") - float(item.p1)) <= _SAME_VALUE and abs(number("p2") - float(item.p2)) <= _SAME_VALUE):
+            return False
+        if not (abs(number("lat") - float(item.lat)) <= _SAME_PLACE_DEG
+                and abs(number("lon") - float(item.lon)) <= _SAME_PLACE_DEG):
+            return False
+        if not abs(number("alt_m") - float(item.alt_m)) <= _SAME_HEIGHT_M:
+            return False
+        has_place = abs(float(item.lat)) > 1e-9 or abs(float(item.lon)) > 1e-9
+        if has_place and int(number("frame")) != int(item.frame):
+            return False
+        return True
+
+    def what_differs(self, rows: object) -> str:
+        """In a few words, how the mission in ``rows`` differs from this one. Empty when it does not.
+
+        ``rows`` is a whole mission as a download gives it. Item 0 is not
+        compared: the drone writes its home there.
+        """
+        got = [row for row in (rows if isinstance(rows, list) else []) if isinstance(row, dict)]
+        if len(got) != len(self.items):
+            return f"it has {max(0, len(got) - 1)} items, VGCS knows {max(0, len(self.items) - 1)}"
+        by_seq: dict[int, dict] = {}
+        for row in got:
+            try:
+                by_seq[int(row.get("seq", -1))] = row
+            except (TypeError, ValueError):
+                continue
+        for item in self.items:
+            if item.seq == 0:
+                continue
+            if not self.same_item(item.seq, by_seq.get(item.seq)):
+                return f"mission item {item.seq} is different"
+        return ""
 
     def label_for_seq(self, seq: int) -> str:
         try:
@@ -567,80 +689,280 @@ _NAV_WAYPOINT_COMMANDS = frozenset(
 )
 
 
+# The height reference the drone reports for a mission item with a place.
+_FRAMES_ABOVE_SEA = frozenset({0, 5})        # MAV_FRAME_GLOBAL, and its _INT twin
+_FRAMES_ABOVE_GROUND = frozenset({10, 11})   # MAV_FRAME_GLOBAL_TERRAIN_ALT, and its _INT twin
+
+# Shown for a mission that sets no speed, when the drone's own default is not known.
+_UNKNOWN_SPEED_MPS = 5.0
+
+# A landing further than this from the last waypoint is at another place.
+_SAME_PLACE_M = 2.0
+
+# Commands a plan cannot hold, in the operator's words. Anything not listed is
+# reported by its number.
+_COMMAND_WORDS = {
+    195: "camera aim point (ROI)",
+    196: "camera aim point (ROI)",
+    197: "camera aim point (ROI)",
+    201: "camera aim point (ROI)",
+    202: "camera setting",
+    203: "camera trigger",
+    206: "camera trigger by distance",
+    2000: "camera trigger",
+    2001: "camera trigger",
+    2500: "video recording command",
+    2501: "video recording command",
+    204: "gimbal command",
+    205: "gimbal command",
+    1000: "gimbal command",
+    183: "servo command",
+    184: "servo command",
+    181: "relay command",
+    182: "relay command",
+    177: "jump to another item",
+    600: "jump to another item",
+    601: "jump to another item",
+    93: "delay",
+    112: "delay",
+    113: "height change",
+    30: "height change",
+    114: "wait for a distance",
+    115: "turn to a heading",
+    176: "mode change",
+    179: "new home position",
+    189: "landing start mark",
+    207: "fence switch",
+    208: "parachute command",
+    211: "gripper command",
+    92: "guided mode command",
+    222: "guided mode command",
+    94: "payload place",
+    42600: "winch command",
+}
+
+
+@dataclass
+class DownloadedMission:
+    """A mission read from the drone, as far as a plan can hold it."""
+
+    waypoints: list[Waypoint] = field(default_factory=list)
+    end_action: str = "hold"
+    # What the drone's mission has and the plan has not, one line each, in the
+    # operator's words. Empty when an upload of the plan is the same mission.
+    not_kept: list[str] = field(default_factory=list)
+
+
+def _count(n: int, one: str) -> str:
+    return f"1 {one}" if n == 1 else f"{n} {one}s"
+
+
+def read_downloaded_mission(
+    rows: list[object] | None,
+    *,
+    default_speed_mps: float | None = None,
+    servo: PayloadServo | None = None,
+) -> DownloadedMission:
+    """Rebuild the plan from downloaded mission items, and say what it cannot hold.
+
+    A plan holds waypoints (place, height above the launch point, speed, hover,
+    payload release) and what happens after the last one. A mission can hold
+    more. Until 2026-10-08 everything else was dropped without a word, and
+    Start Mission uploads the plan on the map: so after a Download the payload
+    was not released any more, and a mission made in another ground station
+    lost its camera, servo and jump commands.
+
+    ``servo`` is how the payload release is wired on this laptop. A servo
+    command is a release only when it is that output and that pulse: uploaded
+    again it is sent as exactly that, so anything else would move another
+    servo than the mission meant.
+
+    ``default_speed_mps`` is the drone's own mission speed (WPNAV_SPEED, or
+    WP_SPD on 4.7). A mission that sets no speed is flown at it. ``None`` means
+    it is not known.
+    """
+    mission = DownloadedMission()
+    waypoints = mission.waypoints
+    default_known = default_speed_mps is not None and float(default_speed_mps) > 0.0
+    speed = float(default_speed_mps) if default_known else _UNKNOWN_SPEED_MPS
+    speed_set = False
+    skipped: dict[str, int] = {}           # words -> how many, in the order first met
+    home_height: float | None = None       # the home's height above sea level, when the drone has a home
+    took_off = False
+    ended = False
+    after_end = 0
+    without_speed = 0
+    above_sea = above_sea_left = above_ground = other_kind = 0
+    landing_elsewhere = False
+    held_s: float | None = None            # the hold of a release, when it is not this laptop's
+    # A release is the servo opened, then (with a hold) a delay and the servo
+    # closed: 1 after the opening, 2 after the delay, 0 otherwise.
+    release_stage = 0
+    released = False                       # the last waypoint has its release
+
+    def skip(words: str) -> None:
+        skipped[words] = skipped.get(words, 0) + 1
+
+    def number(row: dict, key: str) -> float:
+        try:
+            return float(row.get(key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for row in rows or []:
+        if not isinstance(row, dict) or "command" not in row:
+            continue
+        try:
+            cmd = int(row.get("command") or 0)
+        except (TypeError, ValueError):
+            continue
+        lat, lon = number(row, "lat"), number(row, "lon")
+        placed = abs(lat) > 1e-9 or abs(lon) > 1e-9
+        # seq 0 is the vehicle's home position, never an operator waypoint.
+        try:
+            is_home = row.get("seq", None) is not None and int(row.get("seq")) == 0
+        except (TypeError, ValueError):
+            is_home = False
+        if is_home:
+            if placed:
+                home_height = number(row, "alt_m")
+            continue
+        if ended:
+            # Nothing after the return or the landing is flown as part of this plan.
+            after_end += 1
+            continue
+        p1, p2 = number(row, "p1"), number(row, "p2")
+        stage, release_stage = release_stage, 0
+
+        if cmd == int(_m.MAV_CMD_DO_CHANGE_SPEED):
+            # p1: 0 air speed, 1 ground speed, 2 climb, 3 descent.
+            if int(p1) in (0, 1):
+                # param2 <= 0 means "no change" in the MAVLink spec.
+                if p2 > 0.0:
+                    speed = p2
+                    speed_set = True
+            else:
+                skip("climb or descent speed")
+            continue
+        if cmd == int(_m.MAV_CMD_NAV_TAKEOFF):
+            if took_off or waypoints:
+                skip("take-off in the middle of the mission")
+            took_off = True
+            continue
+        if cmd == int(_m.MAV_CMD_NAV_RETURN_TO_LAUNCH):
+            mission.end_action = "rtl"
+            ended = True
+            continue
+        if cmd == int(_m.MAV_CMD_NAV_LAND):
+            mission.end_action = "land"
+            ended = True
+            if placed and waypoints:
+                last = waypoints[-1]
+                landing_elsewhere = haversine_m(last.lat, last.lon, lat, lon) > _SAME_PLACE_M
+            continue
+        if cmd in _NAV_WAYPOINT_COMMANDS:
+            if not placed:
+                skip("loiter without a place" if cmd != int(_m.MAV_CMD_NAV_WAYPOINT) else "waypoint without a place")
+                continue
+            alt = float(row.get("alt_m", 20.0) or 0.0)
+            try:
+                frame = int(row.get("frame", int(_m.MAV_FRAME_GLOBAL_RELATIVE_ALT)))
+            except (TypeError, ValueError):
+                frame = int(_m.MAV_FRAME_GLOBAL_RELATIVE_ALT)
+            if frame in _FRAMES_ABOVE_SEA:
+                if home_height is not None:
+                    alt -= home_height
+                    above_sea += 1
+                else:
+                    above_sea_left += 1
+            elif frame in _FRAMES_ABOVE_GROUND:
+                above_ground += 1
+            if cmd != int(_m.MAV_CMD_NAV_WAYPOINT):
+                other_kind += 1
+            # NAV_WAYPOINT param1 is the hold time. NAV_LOITER_TIME uses param1 the
+            # same way, and for the other loiter commands param1 is turns or a
+            # radius, which is not a hover and must not be read as one.
+            hover = 0
+            if cmd in (int(_m.MAV_CMD_NAV_WAYPOINT), int(_m.MAV_CMD_NAV_LOITER_TIME)):
+                hover = clamp_hover_seconds(row.get("p1", row.get("param1", 0)))
+            if not speed_set and not default_known:
+                without_speed += 1
+            waypoints.append(
+                Waypoint(
+                    lat=lat,
+                    lon=lon,
+                    alt_m=max(MIN_WP_ALT_M, alt),
+                    speed_mps=max(MIN_WP_SPEED_MPS, speed),
+                    hover_s=hover,
+                )
+            )
+            released = False
+            continue
+        if cmd == int(_m.MAV_CMD_DO_SET_SERVO) and servo is not None and waypoints and int(p1) == int(servo.channel):
+            if int(p2) == int(servo.release_pwm) and not released:
+                waypoints[-1].drop_payload = True
+                released = True
+                release_stage = 1
+                continue
+            if int(p2) == int(servo.reset_pwm) and stage in (1, 2):
+                continue
+        if cmd == int(_m.MAV_CMD_CONDITION_DELAY) and stage == 1:
+            release_stage = 2
+            if abs(p1 - float(servo.hold_s)) > 0.05:
+                held_s = p1
+            continue
+        skip(_COMMAND_WORDS.get(cmd, f"command {cmd}"))
+
+    notes = mission.not_kept
+    notes.extend(f"{n} x {words}" for words, n in skipped.items())
+    if held_s is not None and servo is not None:
+        notes.append(
+            f"the payload release is held open for {held_s:g} s on the drone, "
+            f"and for {float(servo.hold_s):g} s in the settings of this laptop"
+        )
+    if above_sea:
+        notes.append(
+            f"{_count(above_sea, 'waypoint')} had its height above sea level. It is shown above the launch point here, "
+            f"worked out with the height of the drone's home ({home_height:.0f} m)"
+        )
+    if above_sea_left:
+        notes.append(
+            f"{_count(above_sea_left, 'waypoint')} with a height above sea level, "
+            "shown as if it were above the launch point: check it"
+        )
+    if above_ground:
+        notes.append(
+            f"{_count(above_ground, 'waypoint')} with a height above the ground (terrain), "
+            "shown as if it were above the launch point"
+        )
+    if other_kind:
+        notes.append(f"{_count(other_kind, 'waypoint')} of another kind (spline or loiter), shown as plain waypoints")
+    if without_speed:
+        notes.append(
+            f"no speed is set for {_count(without_speed, 'waypoint')} at the start: the drone flies there "
+            f"at its own default speed, and the rows show {_UNKNOWN_SPEED_MPS:.1f} m/s"
+        )
+    if landing_elsewhere:
+        notes.append("the landing is at another place than the last waypoint")
+    if after_end:
+        notes.append(f"{_count(after_end, 'command')} after the return or landing")
+    return mission
+
+
 def parse_downloaded_mission(
     rows: list[object],
     *,
     default_speed_mps: float = 5.0,
+    servo: PayloadServo | None = None,
 ) -> tuple[list[Waypoint], str]:
-    """Rebuild operator waypoints from downloaded mission items.
+    """The waypoints and the end action of a downloaded mission.
 
-    Returns ``(waypoints, end_action)``.
-
-    Filters out everything that is not a positioned nav command, replays
-    ``DO_CHANGE_SPEED`` onto the waypoints that follow it, and recognises a
-    trailing RTL/LAND so the plan's end action survives a download.
+    Returns ``(waypoints, end_action)``. See :func:`read_downloaded_mission`,
+    which also says what the plan cannot hold.
 
     Without this, a mission downloaded straight back from the vehicle contains the
-    home slot, the takeoff item and every speed change — items whose lat/lon are
-    ``0,0`` — and the map fills with waypoints in the Gulf of Guinea.
+    home slot, the takeoff item and every speed change (items whose lat/lon are
+    ``0,0``), and the map fills with waypoints in the Gulf of Guinea.
     """
-    waypoints: list[Waypoint] = []
-    end_action = "hold"
-    speed = float(default_speed_mps)
-
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        try:
-            cmd = int(row.get("command", _m.MAV_CMD_NAV_WAYPOINT) or 0)
-        except (TypeError, ValueError):
-            continue
-        seq = row.get("seq", None)
-        # seq 0 is the vehicle's home position, never an operator waypoint.
-        try:
-            if seq is not None and int(seq) == 0:
-                continue
-        except (TypeError, ValueError):
-            pass
-
-        if cmd == int(_m.MAV_CMD_DO_CHANGE_SPEED):
-            try:
-                new_speed = float(row.get("p2", row.get("param2", 0.0)) or 0.0)
-            except (TypeError, ValueError):
-                new_speed = 0.0
-            # param2 <= 0 means "no change" in the MAVLink spec.
-            if new_speed > 0.0:
-                speed = new_speed
-            continue
-        if cmd == int(_m.MAV_CMD_NAV_RETURN_TO_LAUNCH):
-            end_action = "rtl"
-            continue
-        if cmd == int(_m.MAV_CMD_NAV_LAND):
-            end_action = "land"
-            continue
-        if cmd not in _NAV_WAYPOINT_COMMANDS:
-            continue
-
-        lat = float(row.get("lat", 0.0) or 0.0)
-        lon = float(row.get("lon", 0.0) or 0.0)
-        # A positioned nav command at exactly 0,0 is a placeholder, not a location.
-        if abs(lat) < 1e-9 and abs(lon) < 1e-9:
-            continue
-        alt = float(row.get("alt_m", 20.0) or 0.0)
-        # NAV_WAYPOINT param1 is the hold time. NAV_LOITER_TIME uses param1 the
-        # same way, and for the other loiter commands param1 is turns or a
-        # radius, which is not a hover and must not be read as one.
-        hover = 0
-        if cmd in (int(_m.MAV_CMD_NAV_WAYPOINT), int(_m.MAV_CMD_NAV_LOITER_TIME)):
-            hover = clamp_hover_seconds(row.get("p1", row.get("param1", 0)))
-        waypoints.append(
-            Waypoint(
-                lat=lat,
-                lon=lon,
-                alt_m=max(MIN_WP_ALT_M, alt),
-                speed_mps=max(MIN_WP_SPEED_MPS, speed),
-                hover_s=hover,
-            )
-        )
-
-    return waypoints, end_action
+    mission = read_downloaded_mission(rows, default_speed_mps=default_speed_mps, servo=servo)
+    return mission.waypoints, mission.end_action

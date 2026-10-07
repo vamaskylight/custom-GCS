@@ -32,7 +32,7 @@ The same set-up as the wind failsafe tests, see [drone/README.md](../drone/READM
 From the repo root:
 
 ```powershell
-py system_test/vgcs_sitl_test.py                      # 10 cases on 4.6.2 and 4.7.0, about 5 minutes
+py system_test/vgcs_sitl_test.py                      # 12 cases on 4.6.2 and 4.7.0, about 7 minutes
 py system_test/vgcs_sitl_test.py 4.7.0 -k mission     # one version, only cases with "mission" in the name
 py system_test/vgcs_sitl_test.py --report results.md  # also write the results as Markdown
 
@@ -80,6 +80,9 @@ The simulated clock runs 10 times faster than real time.
 | parameters | the settings VGCS reads exist on this firmware (4.6 and 4.7 names differ), a write is confirmed, a missing name is reported as not written |
 | mission_upload_and_download | a 4 waypoint mission goes up and comes back the same, to the centimetre |
 | mission_flight | start from the ground, pause, resume, skip a waypoint, return and land at home |
+| mission_speeds | each leg flown at the planned speed, also after Pause and Resume, after a jump forward and back, after a jump while paused, and after LOITER and AUTO from the mode list |
+| missions_as_they_come_back | a Download shows VGCS's own mission with its payload releases, and another station's mission with what a plan cannot hold named |
+| another_stations_mission | another station replaces the mission with one of the same size and VGCS is told nothing: "start it as it is" starts nothing, Fly to WP sends no jump, Resume sends no speed, and in flight the drone's own word drops the plan. VGCS's own upload in flight is not taken for another station's |
 | takeoff_fence_and_land | a 40 m fence with a 30 m height limit: the drone turns back at both, VGCS shows RTL and the drone's message, landing from VGCS |
 | link_silence | the radio goes quiet in flight (the simulator is frozen), VGCS reports it within its 2 second watchdog, and recovers by itself |
 | signed_commands | VGCS gives the drone its signing key: an outsider ground station (third port) can no longer change the mode, arm, or remove the key, VGCS still can, and after the key is removed the outsider is obeyed again |
@@ -89,6 +92,9 @@ The simulated clock runs 10 times faster than real time.
 Builds the real main window off-screen, types the simulator's address into the connection box and presses Connect.
 Then it flies through the window's own button handlers: a take-off the drone refuses, a real take-off, a mode change, a hover, a radio silence, and landing.
 The window's own labels are read to check what the operator would have seen, and the controls the operator needs are checked to be on screen (E-STOP, Disconnect while the link is lost, the Vehicle status window).
+
+After the landing it plans and flies a mission in Plan Flight: waypoints clicked on the map, rows edited, Upload, Download, Start Mission, Fly to WP, Pause and Resume.
+Then the mission as the drone holds it: a payload release ticked, uploaded, and brought back by a Download; a mission of another ground station (sent on the checking connection) with a camera and a servo command, the message that names them, Upload answered no, and Start Mission with "Start it as it is on the drone", once on a mission that was replaced in the meantime (nothing starts, and the reason is on screen) and once for real.
 
 During the hover it measures how late the window's event loop runs, the time spent in the telemetry handler, CPU and memory.
 The map's web view runs in separate QtWebEngine processes, which are not counted.
@@ -134,3 +140,8 @@ It checks the acceptance test of client requirement 14:
 - An empty mission counts 0 items on 4.6.2 and 1 (home) on 4.7.0.
 - Arming refuses "Throttle (RC3) is not neutral" while an RC override holds the throttle in the middle.
   Set the throttle to the middle after the take-off, not before.
+- "Flight plan received" goes only to the connection that sent the mission.
+  A mission sent on the checking connection is not heard by VGCS at all, unless it has another number of items (MISSION_CURRENT) or the drone is flying in AUTO ("Auto mission changed, restarted command", on every connection, once for each item written).
+- A mission replaced while the drone holds in BRAKE keeps its place: on the return to AUTO the drone flies to the new mission's item of the same number.
+- The window test reads the checking connection in its own thread.
+  A second exchange on it (a mission sent "as another station") has to be driven by the messages that thread reads, like `MissionReader` and `MissionSender`, not by a blocking wait.

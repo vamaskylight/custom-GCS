@@ -1139,15 +1139,21 @@ class PlanFlightPanel(QWidget):
         fly_row.addWidget(self._fly_to_btn, 1)
         mr.addWidget(self._fly_to_row)
         self._fly_to_row.setVisible(False)
+        body_v.addWidget(self._mission_run_frame)
+        self._mission_run_frame.setVisible(False)
         # What the drone answered, where the operator clicked. The header's
         # message field shows only the beginning of a text.
+        #
+        # Under the row of Pause and Resume, but not in it: that row is hidden
+        # on the ground, and "Not started: ..." or "The mission on the drone
+        # changed ..." is said exactly there. Until 2026-10-08 the line sat in
+        # the row, so on the ground such a reason was never on screen.
         self._mission_result_label = QLabel("")
         self._mission_result_label.setObjectName("planMissionResult")
         self._mission_result_label.setWordWrap(True)
         self._mission_result_label.setVisible(False)
-        mr.addWidget(self._mission_result_label)
-        body_v.addWidget(self._mission_run_frame)
-        self._mission_run_frame.setVisible(False)
+        self._mission_result_lasting = False
+        body_v.addWidget(self._mission_result_label)
 
         # Waypoint details
         self._wp_details_box = QFrame()
@@ -1507,10 +1513,17 @@ class PlanFlightPanel(QWidget):
             return
         self.mission_jump_requested.emit(int(index))
 
-    def set_mission_action_result(self, ok: bool, text: str) -> None:
-        """Show what the drone answered to a mission action, under Pause and Resume."""
+    def set_mission_action_result(self, ok: bool, text: str, lasting: bool = False) -> None:
+        """Show what the drone answered to a mission action, under Pause and Resume.
+
+        ``lasting``: the text is about the mission itself (it is not the one
+        VGCS knows any more, it was not started, its upload failed). It stays
+        when the mission is idle, until a newer text or an empty one replaces
+        it. The answer to a jump or a speed goes with the mission that ran.
+        """
         label = self._mission_result_label
         words = str(text or "").strip()
+        self._mission_result_lasting = bool(lasting) and bool(words)
         label.setText(words)
         label.setStyleSheet(
             "QLabel { color: %s; font-size: 12px; }" % ("#b6f0c0" if ok else "#ffb0a0")
@@ -1569,7 +1582,11 @@ class PlanFlightPanel(QWidget):
             self._mission_progress_label.setText("Mission idle")
             self._mission_run_frame.setVisible(False)
             # The answer to the last action belonged to the mission that ran.
-            self.set_mission_action_result(True, "")
+            # A text about the mission itself stays: the link names the item
+            # again right after it has dropped a plan, and on the ground that
+            # is "idle" (it wiped the reason the moment it was shown).
+            if not self._mission_result_lasting:
+                self.set_mission_action_result(True, "")
             return
         if wp_index is None:
             # On a non-waypoint item: takeoff, a speed change or the terminal RTL/land.

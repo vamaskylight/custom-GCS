@@ -368,6 +368,10 @@ class MissionJump:
         if int(seq) == self.seq:
             self._finish(True, "")
 
+    def give_up(self, reason: str) -> None:
+        """Nothing more can come (the link is gone, or the mission is another one)."""
+        self._finish(False, reason)
+
     def tick(self, now: float) -> bool:
         """True when the jump should be sent once more."""
         if self.done or now - self._last_send < self.resend_s:
@@ -413,6 +417,10 @@ class CommandAck:
             words = _COMMAND_RESULTS.get(result, "refused")
             self._finish(False, f"the drone refused it: {words} (result {result})")
 
+    def give_up(self, reason: str) -> None:
+        """Nothing more can come (the link is gone, or the mission is another one)."""
+        self._finish(False, reason)
+
     def tick(self, now: float) -> bool:
         """True when the command should be sent once more."""
         if self.done or now - self._last_send < self.resend_s:
@@ -423,3 +431,86 @@ class CommandAck:
         self._sent += 1
         self._last_send = float(now)
         return True
+
+
+# One mission item is asked for with MISSION_REQUEST_INT and comes back at once
+# (a few ms in the simulator). What has not come is asked for again after this
+# long, ITEM_READ_TRIES times in all.
+ITEM_READ_WAIT_S = 1.0
+ITEM_READ_TRIES = 3
+
+
+class ItemsRead:
+    """A few mission items asked for one by one, done once every one of them came.
+
+    The drone answers a single MISSION_REQUEST_INT at any time, with no list
+    request before it (simulator, 2026-10-08, ArduCopter 4.6.2 and 4.7.0).
+    For an item it does not have, and for any item while a ground station is
+    sending it a mission, it answers with a MISSION_ACK that carries an error.
+
+    on_done(items, refused, detail) runs exactly once:
+
+    - items is {seq: item} when every one came,
+    - items is None and refused is True when the drone answered with an error,
+    - items is None and refused is False when no answer came, or when it was
+      given up (given_up is True then). detail says which.
+    """
+
+    def __init__(self, seqs, now: float, on_done: Callable[[dict | None, bool, str], None],
+                 wait_s: float = ITEM_READ_WAIT_S, tries: int = ITEM_READ_TRIES) -> None:
+        self.wanted: list[int] = []
+        for seq in seqs:
+            if int(seq) not in self.wanted:
+                self.wanted.append(int(seq))
+        self.items: dict[int, object] = {}
+        self.on_done = on_done
+        self.done = False
+        self.given_up = False
+        self.wait_s = float(wait_s)
+        self.tries = max(1, int(tries))
+        self._sent = 1
+        self._last_send = float(now)
+
+    def missing(self) -> list[int]:
+        return [seq for seq in self.wanted if seq not in self.items]
+
+    def _finish(self, items: dict | None, refused: bool, detail: str) -> None:
+        if self.done:
+            return
+        self.done = True
+        self.on_done(items, refused, detail)
+
+    def heard_item(self, seq: int, item: object) -> None:
+        """A MISSION_ITEM_INT from the drone."""
+        if self.done:
+            return
+        try:
+            number = int(seq)
+        except (TypeError, ValueError):
+            return
+        if number not in self.wanted:
+            return
+        self.items[number] = item
+        if not self.missing():
+            self._finish(dict(self.items), False, "")
+
+    def heard_refusal(self, result: int) -> None:
+        """A MISSION_ACK from the drone with an error in it."""
+        self._finish(None, True, f"the drone answered a request for a mission item with an error (result {int(result)})")
+
+    def give_up(self, reason: str) -> None:
+        """Nothing more can come (the link is gone, or the mission is another one)."""
+        if not self.done:
+            self.given_up = True
+        self._finish(None, False, reason)
+
+    def tick(self, now: float) -> list[int]:
+        """Settle a read that ran out of tries. Returns the items to ask for again."""
+        if self.done or now - self._last_send < self.wait_s:
+            return []
+        if self._sent >= self.tries:
+            self._finish(None, False, f"no answer in {self._sent} tries")
+            return []
+        self._sent += 1
+        self._last_send = float(now)
+        return self.missing()

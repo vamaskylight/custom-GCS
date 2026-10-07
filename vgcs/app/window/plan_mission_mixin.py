@@ -68,9 +68,12 @@ from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_typ
 from vgcs.mission import (
     Waypoint,
     normalize_end_action,
-    parse_downloaded_mission,
+    plan_signature,
+    read_downloaded_mission,
     validate_waypoints,
 )
+from vgcs.app.vehicle_params import mission_speed_mps
+from vgcs.link.payload_servo_settings import payload_servo_from_settings
 from vgcs.map import MapWidget
 from vgcs.map.plan_flight_panel import DEFAULT_NEW_WP_ALT_M, DEFAULT_NEW_WP_SPEED_MPS
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
@@ -352,6 +355,8 @@ class MainWindowPlanMissionMixin:
             return
         if not self._confirm_mission_plan_is_sane(waypoints, title="Mission Upload"):
             return
+        if not self._confirm_upload_over_mission_not_kept("Mission Upload"):
+            return
         payload = self._mission_payload_from_waypoints(waypoints)
         end_action = self._map_widget.get_mission_end_action()
         self._mission_upload_pending = True
@@ -398,6 +403,8 @@ class MainWindowPlanMissionMixin:
 
     def _on_mission_uploaded(self, count: int) -> None:
         self._mission_upload_pending = False
+        # The drone holds the plan now: what was said about the old mission is over.
+        self._map_widget.set_plan_mission_action_result(True, "")
         # A new plan renumbers everything, so the last announced item no longer
         # refers to anything. Without this, re-flying the same mission would
         # skip announcing its first waypoint.
@@ -410,9 +417,20 @@ class MainWindowPlanMissionMixin:
 
     def _on_mission_downloaded(self, items: object) -> None:
         rows = items if isinstance(items, list) else []
-        # Downloaded items include the home slot, NAV_TAKEOFF and every DO_CHANGE_SPEED —
+        # Downloaded items include the home slot, NAV_TAKEOFF and every DO_CHANGE_SPEED,
         # all at lat/lon 0,0. Showing those as waypoints scattered the plan into the ocean.
-        wps, end_action = parse_downloaded_mission(rows)
+        #
+        # The plan is read with this laptop's payload servo settings, so the
+        # "Drop payload" marks come back, and with the drone's own speed, which
+        # a mission without a speed item is flown at. Until 2026-10-08 the
+        # marks were lost, and Start Mission then uploaded the plan without
+        # them: the payload was simply not released any more.
+        mission = read_downloaded_mission(
+            rows,
+            default_speed_mps=mission_speed_mps(getattr(self, "_last_params", None) or {}),
+            servo=payload_servo_from_settings(),
+        )
+        wps, end_action = mission.waypoints, mission.end_action
         self._append_log(
             f"Mission download success: {len(rows)} mission items -> {len(wps)} waypoints "
             f"(end={end_action})"
@@ -420,7 +438,77 @@ class MainWindowPlanMissionMixin:
         self._map_widget.set_mission_end_action(end_action)
         self._settings.setValue("plan_mission_end_action", end_action)
         self._map_widget.set_waypoints(wps, clear_plan_current_file=True)
+        # The map shows the drone's mission now: what was said about the old one is over.
+        self._map_widget.set_plan_mission_action_result(True, "")
+        # The link is told which plan this mission is on the map ("Fly to WP"
+        # compares the map with it), and what the plan could not hold.
+        tell = getattr(self._thread, "set_mission_on_drone", None)
+        if callable(tell):
+            tell(plan_signature(wps), tuple(mission.not_kept))
         self._post_gcs_notice(f"Mission downloaded ({len(wps)} WPs)")
+        if mission.not_kept:
+            for line in mission.not_kept:
+                self._append_log(f"Mission download: not in the plan: {line}")
+            QMessageBox.warning(
+                self,
+                "Mission Download",
+                "The mission on the drone has more than this plan can hold:\n\n"
+                f"{self._not_kept_bullets(mission.not_kept)}\n\n"
+                "All of it is still on the drone.\n"
+                "An upload of this plan would replace the mission on the drone, and these would be "
+                "gone or changed. VGCS asks before it does that.",
+            )
+
+    # --- a mission on the drone with more in it than the plan can hold ------
+    #
+    # A plan holds waypoints (place, height above the launch point, speed,
+    # hover, payload release) and what happens after the last one. A mission
+    # made in another ground station can hold camera, servo and jump commands
+    # too. A Download shows the waypoints, and an Upload of them replaces the
+    # mission on the drone: so the operator is told what would go, and asked.
+
+    @staticmethod
+    def _not_kept_bullets(lines) -> str:
+        shown = [f"• {line}" for line in list(lines)[:10]]
+        more = len(list(lines)) - len(shown)
+        if more > 0:
+            shown.append(f"• and {more} more")
+        return "\n".join(shown)
+
+    def _mission_not_kept_now(self) -> tuple:
+        """What the mission on the drone has and the plan cannot hold, as far as VGCS knows."""
+        ask = getattr(self._thread, "mission_not_kept", None)
+        try:
+            return tuple(ask()) if callable(ask) else ()
+        except Exception:
+            return ()
+
+    def _plan_on_map_is_mission_on_drone(self) -> bool:
+        """True while the plan on the map is what VGCS uploaded or downloaded last."""
+        ask = getattr(self._thread, "mission_on_drone", None)
+        on_drone = ask() if callable(ask) else None
+        if on_drone is None:
+            return False
+        return tuple(on_drone) == plan_signature(self._map_widget._plan_waypoints_snapshot())
+
+    def _confirm_upload_over_mission_not_kept(self, title: str) -> bool:
+        lines = self._mission_not_kept_now()
+        if not lines:
+            return True
+        answer = QMessageBox.question(
+            self,
+            title,
+            "The mission on the drone has more than this plan can hold:\n\n"
+            f"{self._not_kept_bullets(lines)}\n\n"
+            "An upload replaces the mission on the drone, and these are gone or changed.\n\n"
+            "Upload anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._append_log("Mission upload cancelled: it would have replaced a mission with more in it.")
+            return False
+        return True
 
     def _on_mission_progress(self, payload: object) -> None:
         """Live AUTO progress from the vehicle (MISSION_CURRENT / MISSION_ITEM_REACHED)."""

@@ -72,3 +72,20 @@ def editable_on_this_drone(known: dict) -> list[str]:
     if not keys.intersection(EDITABLE):
         return list(EDITABLE)
     return [name for name in EDITABLE if name in keys]
+
+
+def mission_speed_mps(known: dict) -> float | None:
+    """The drone's own mission speed in m/s, or None when it has not been read.
+
+    A mission that sets no speed is flown at it: WP_SPD on 4.7 (m/s), or
+    WPNAV_SPEED before that (cm/s).
+    """
+    values = {str(k).strip().upper(): v for k, v in (known or {}).items()}
+    for name, per_metre in (("WP_SPD", 1.0), ("WPNAV_SPEED", 100.0)):
+        try:
+            speed = float(values[name]) / per_metre
+        except (KeyError, TypeError, ValueError):
+            continue
+        if speed > 0.0:
+            return speed
+    return None
