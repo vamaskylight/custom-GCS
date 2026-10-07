@@ -154,7 +154,7 @@ VGCS can sign every command it sends (milestone M16, client requirement 29). A d
 
 1. Application Settings, General, **Command signing**: **Set passphrase...** (at least 8 characters, longer is safer).
 2. Connect the drone, disarmed, and press **Send key to the drone**. VGCS reports when the drone signs with the key.
-3. The dashboard value **Command signing** shows what the drone on screen does. The Fleet panel shows it for every drone.
+3. Menu, **Vehicle status**: **Command signing** shows what the drone on screen does. The Fleet panel shows it for every drone.
 
 - The same passphrase works in the VAMA APK (QGroundControl's MAVLink signing keys): VGCS makes the key from it the same way.
 - The passphrase is never stored. The key is, encrypted for the Windows user (DPAPI).

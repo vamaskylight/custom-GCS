@@ -290,6 +290,9 @@ def session(version: str, minutes: float, speedup: int, r: Report, profile_to: p
     popups: list[str] = []
     QMessageBox.warning = staticmethod(lambda _p, title, text, *a, **k: popups.append(f"{title}: {text}") or QMessageBox.StandardButton.Ok)
     QMessageBox.information = staticmethod(lambda _p, title, text, *a, **k: popups.append(f"{title}: {text}") or QMessageBox.StandardButton.Ok)
+    # Questions (closing or disconnecting with a drone armed) are answered yes
+    # and counted, so a failed run never waits on one.
+    QMessageBox.question = staticmethod(lambda _p, title, text, *a, **k: popups.append(f"{title}: {text}") or QMessageBox.StandardButton.Yes)
 
     # The map draws from a local tile folder, never the internet (see make_offline_tiles).
     from vgcs.map.app_settings import QS_APP, QS_ORG
@@ -345,6 +348,11 @@ def session(version: str, minutes: float, speedup: int, r: Report, profile_to: p
         r.check(wait_qt(lambda: w._heartbeat_seen, 30), f"Connect: the window says {w._status.text()!r}")
         r.check(wait_qt(lambda: w._top_flight_mode.text() == sim.mode, 10),
                 f"the header shows the drone's mode ({w._top_flight_mode.text()!r}, the drone is in {sim.mode})")
+        # On screen, not only computed (the map-first layout hid them until 2026-10-07).
+        r.check(w._hdr_estop_btn.isVisible() and w._hdr_estop_btn.isEnabled(), "E-STOP is in the header and works")
+        w._show_vehicle_status_dialog()
+        shown = [k for k in ("signing", "rtk", "gps_accuracy", "wind_failsafe", "arm_ready") if w._fields[k].isVisible()]
+        r.check(len(shown) == 5, f"Vehicle status shows signing, RTK, GPS accuracy, wind failsafe and arm readiness on screen ({shown})")
 
         # Too early: no position yet. The drone refuses, and the window must
         # say why without claiming the link is lost.
@@ -467,6 +475,8 @@ def session(version: str, minutes: float, speedup: int, r: Report, profile_to: p
         wsl("pkill -STOP -x arducopter")
         r.check(wait_qt(lambda: w._watchdog.text().startswith("Lost"), 8), f"silence: the window says the link is lost ({w._watchdog.text()!r})")
         r.check("Communication lost" in banner(w), f"and the banner says so ({banner(w)!r})")
+        r.check(w._hdr_banner_disconnect_btn.isVisible() and w._hdr_banner_disconnect_btn.isEnabled(),
+                "and the header still offers Disconnect")
         wait_qt(lambda: False, 4.0)
         wsl("pkill -CONT -x arducopter")
         r.check(wait_qt(lambda: not w._watchdog.text().startswith("Lost"), 15), f"back: the window shows the link again ({w._watchdog.text()!r})")
@@ -480,6 +490,8 @@ def session(version: str, minutes: float, speedup: int, r: Report, profile_to: p
 
         w._on_disconnect()
         r.check(wait_qt(lambda: w._thread is None or not w._thread.isRunning(), 10), "Disconnect: the link thread stopped")
+        r.check(wait_qt(lambda: banner(w).startswith("Disconnected"), 5),
+                f"and the banner says Disconnected, not that the link was lost ({banner(w)!r})")
         r.check(not popups, f"no unexpected popup came up {popups[:2]}")
         r.check(not internet, f"the map asked the internet for nothing, it drew from the offline tiles ({len(internet)} requests: {internet[:2]})")
     finally:

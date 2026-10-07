@@ -132,8 +132,8 @@ class MainWindowLinkMixin:
         QTimer.singleShot(0, _deferred_camera_after_connect)
 
         self._btn_connect.setEnabled(False)
-        if hasattr(self, "_hdr_connect_btn"):
-            self._hdr_connect_btn.setEnabled(False)
+        self._disconnect_requested = False
+        self._set_header_link_active(True)
         if hasattr(self, "_hdr_disconnect_btn"):
             self._hdr_disconnect_btn.setEnabled(False)
         self._conn_edit.setEnabled(False)
@@ -170,13 +170,52 @@ class MainWindowLinkMixin:
         self._set_dashboard_flight_status("yellow", "Connecting to vehicle...")
         self._thread.start()
 
+    def _on_disconnect_clicked(self) -> None:
+        """The header's Disconnect. Asks first while the drone on screen is
+        armed, as the Fleet panel does: it keeps flying without VGCS."""
+        if bool(getattr(self, "_hb_armed", False)):
+            answer = QMessageBox.question(
+                self,
+                "Disconnect",
+                "The drone is armed.\n\nDisconnect anyway? It keeps flying, and its own "
+                "failsafes decide what it does.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._append_log("Disconnect cancelled: the drone is armed")
+                return
+        self._on_disconnect()
+
+    def _set_header_link_active(self, active: bool, *, link_up: bool = False) -> None:
+        """The header's banner page offers Connect while no link runs, and
+        Disconnect while one does (the red states show that page). E-STOP works
+        while a link is up."""
+        connect = getattr(self, "_hdr_connect_btn", None)
+        if connect is not None:
+            connect.setVisible(not active)
+            connect.setEnabled(not active)
+        disconnect = getattr(self, "_hdr_banner_disconnect_btn", None)
+        if disconnect is not None:
+            disconnect.setVisible(active)
+            disconnect.setEnabled(active and link_up)
+        estop = getattr(self, "_hdr_estop_btn", None)
+        if estop is not None:
+            estop.setEnabled(active and link_up)
+
     def _on_disconnect(self) -> None:
         # The popup describes a vehicle the operator has just let go of, and it
         # can spin motors. Both reasons to close it rather than leave it
         # showing the last thing the aircraft said.
         self._close_preflight_dialog()
+        # Every call is the operator letting go (the Disconnect buttons, the
+        # Fleet panel, a new connection, closing VGCS). A link that dies by
+        # itself never comes here, so the banner can tell the two apart.
+        self._disconnect_requested = True
         if hasattr(self, "_hdr_disconnect_btn"):
             self._hdr_disconnect_btn.setEnabled(False)
+        if hasattr(self, "_hdr_banner_disconnect_btn"):
+            self._hdr_banner_disconnect_btn.setEnabled(False)
         self._stop_camera_control_backend()
         # A local reference: the thread's "finished" handler clears self._thread.
         thread = self._thread
@@ -327,8 +366,7 @@ class MainWindowLinkMixin:
         self._status.setText("Port open, waiting for heartbeat…")
         self._apply_state_style(self._status, "warn")
         self._btn_disconnect.setEnabled(True)
-        if hasattr(self, "_hdr_connect_btn"):
-            self._hdr_connect_btn.setEnabled(False)
+        self._set_header_link_active(True, link_up=True)
         if hasattr(self, "_hdr_disconnect_btn"):
             self._hdr_disconnect_btn.setEnabled(True)
         self._watchdog.setText(f"OK · {self._timeout_s:.1f}s")
@@ -354,6 +392,7 @@ class MainWindowLinkMixin:
         self._sync_plan_flight_chrome()
 
     def _on_link_down(self) -> None:
+        had_contact = bool(self._heartbeat_seen)
         # Before anything below resets _heartbeat_seen. Only a link that was up
         # can be lost; closing a port that never carried a heartbeat has lost
         # nothing, and the stored fix can be hours old.
@@ -395,8 +434,7 @@ class MainWindowLinkMixin:
         self._watchdog_lost = False
         self._compass.clear()
         self._btn_connect.setEnabled(True)
-        if hasattr(self, "_hdr_connect_btn"):
-            self._hdr_connect_btn.setEnabled(True)
+        self._set_header_link_active(False)
         if hasattr(self, "_hdr_disconnect_btn"):
             self._hdr_disconnect_btn.setEnabled(False)
         self._conn_edit.setEnabled(True)
@@ -418,10 +456,12 @@ class MainWindowLinkMixin:
         self._btn_apply_acro.setEnabled(False)
         self._btn_apply_simple.setEnabled(False)
         self._reset_telemetry_fields()
-        self._set_dashboard_flight_status(
-            "red",
-            "Communication lost - Not Ready to Arm",
-        )
+        if getattr(self, "_disconnect_requested", False):
+            # The operator let go of the link: nothing was lost.
+            self._set_dashboard_flight_status("", "Disconnected - press Connect")
+        else:
+            self._set_dashboard_flight_status("red", self._link_lost_banner_text(had_contact))
+        self._disconnect_requested = False
         self._map_widget.set_link_connected(False)
         self._set_preconnect_dashboard_mode(True)
         self._set_map_only_dashboard_mode(self._map_only_dashboard)
@@ -458,13 +498,30 @@ class MainWindowLinkMixin:
             return ""
         return "Recent vehicle messages:\n" + "\n".join(f"• {s}" for s in show)
 
+    def _link_lost_banner_text(self, had_contact: bool) -> str:
+        """The red banner while contact is lost, with the drone's last known
+        position when contact existed. In a red state the header shows only
+        this banner, and the map's own status line, where the position went,
+        is hidden in the map-first layout (found 2026-10-07)."""
+        text = "Communication lost - Not Ready to Arm"
+        if not had_contact:
+            return text
+        try:
+            fn = getattr(self._map_widget, "last_known_vehicle_position", None)
+            pos = fn() if callable(fn) else None
+            if pos is not None:
+                return f"Communication lost - last known position {pos.describe()}"
+        except Exception:
+            pass
+        return text
+
     def _on_link_timeout(self, elapsed_s: float) -> None:
         self._watchdog.setText(f"Lost · {elapsed_s:.1f}s no MAVLink")
         self._apply_state_style(self._watchdog, "bad")
         self._watchdog_lost = True   # cleared by the next heartbeat (_on_heartbeat)
         self._set_dashboard_flight_status(
             "red",
-            "Communication lost - Not Ready to Arm",
+            self._link_lost_banner_text(bool(self._heartbeat_seen)),
         )
         self._append_log(
             f"GCS link watchdog triggered: no messages for {elapsed_s:.1f}s"

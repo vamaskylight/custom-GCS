@@ -958,11 +958,21 @@ class MapTilesMixin:
         bridge.progress.connect(self._on_tile_pack_progress)
         bridge.finished.connect(self._on_tile_pack_finished)
         QThreadPool.globalInstance().start(TilePackTask(plan, Path(dest), bridge, cancel))
-        self._set_status(
+        msg = (
             f"Downloading tile pack: {self.describe_tile_pack_plan(plan)} — "
             "keep the internet connection until it finishes"
         )
+        self._set_status(msg)
+        self._emit_tile_pack("tile_pack_progress", msg)
         return True
+
+    def _emit_tile_pack(self, name: str, msg: str) -> None:
+        sig = getattr(self, name, None)
+        if sig is not None:
+            try:
+                sig.emit(msg)
+            except Exception:
+                pass
 
     def cancel_offline_tile_pack(self) -> None:
         ev = getattr(self, "_tile_pack_cancel", None)
@@ -975,6 +985,7 @@ class MapTilesMixin:
         if failed:
             msg += f", {failed} failed"
         self._set_status(msg)
+        self._emit_tile_pack("tile_pack_progress", msg)
 
     def _on_tile_pack_finished(self, result, dest: str) -> None:
         self._tile_pack_cancel = None
@@ -1036,9 +1047,11 @@ class MapTilesMixin:
             result, source_id = import_tile_pack(Path(src), fallback_source_id=fallback)
         except Exception as e:
             self._set_status(f"Tile pack import failed: {e}")
+            self._emit_tile_pack("tile_pack_finished", f"Tile pack import failed: {e}")
             return
         if result.total_present == 0:
             self._set_status("Tile pack import: no z/x/y.png tiles found in that folder")
+            self._emit_tile_pack("tile_pack_finished", "Tile pack import: no z/x/y.png tiles found in that folder")
             return
         msg = (
             f"Tile pack imported: {result.stored} new tiles, "
@@ -1060,6 +1073,7 @@ class MapTilesMixin:
         except Exception:
             pass
         self._set_status(msg)
+        self._emit_tile_pack("tile_pack_finished", msg)
 
     def warn_if_no_offline_tiles_here(self) -> bool:
         """Say plainly when a blank map is an empty cache, not a fault.

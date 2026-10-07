@@ -184,6 +184,12 @@ class PlanMissionMixin:
         if panel is not None:
             panel.set_chrome_state(bool(link_ok), max(0, int(waypoint_count)))
 
+    def plan_fence_settings(self) -> dict[str, float] | None:
+        """The circle fence set in Plan Flight's Fence tab."""
+        panel = getattr(self, "_plan_flight_panel", None)
+        fn = getattr(panel, "fence_settings", None)
+        return fn() if callable(fn) else None
+
     def set_plan_rail_tool(self, tool: str) -> None:
         t = (tool or "").strip()
         if not t:

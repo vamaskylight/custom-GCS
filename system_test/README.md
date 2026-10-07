@@ -48,6 +48,25 @@ py system_test/vgcs_fleet_test.py 4.6.2 --report fleet.md
 Only one simulator can run at a time (it always uses TCP port 5760).
 Do not run two of these scripts, or a wind failsafe test, at the same time.
 
+## Live demo: drones to fly by hand
+
+`demo_sitl.py` starts simulated drones in real time and leaves the flying to you.
+Connect VGCS (the exe or `py -m vgcs`) to the address it prints, and use VGCS as with a real drone.
+The demo plan for the client is `DOCS/M17-DEMO-PLAN.md`.
+
+```powershell
+py system_test/demo_sitl.py                            # one drone, 4.7.0: connect VGCS to tcp:127.0.0.1:5762
+py system_test/demo_sitl.py --drones 3                 # three drones 40 m apart, for the Fleet panel (5762, 5772, 5782)
+py system_test/demo_sitl.py --version 4.6.2
+py system_test/demo_sitl.py --wind 9 --wind-failsafe   # wind, and the wind failsafe script as installed (warning only)
+py system_test/demo_sitl.py --wind 14 --wind-failsafe --wind-action 2   # too much wind: the script sends the drone home
+py system_test/demo_sitl.py --minutes 30               # stops by itself after 30 minutes
+```
+
+It prints the drones' own messages as they come.
+Ctrl+C stops the drones.
+A second ground station can join on `tcp:127.0.0.1:5763` (for the command signing demo).
+
 ## `vgcs_sitl_test.py`: the link against the drone
 
 VGCS's `MavlinkThread` connects to the simulator's second port (`tcp:127.0.0.1:5762`), and every command goes through the same `queue_...` call the buttons use.
@@ -69,7 +88,7 @@ The simulated clock runs 10 times faster than real time.
 
 Builds the real main window off-screen, types the simulator's address into the connection box and presses Connect.
 Then it flies through the window's own button handlers: a take-off the drone refuses, a real take-off, a mode change, a hover, a radio silence, and landing.
-The window's own labels are read to check what the operator would have seen.
+The window's own labels are read to check what the operator would have seen, and the controls the operator needs are checked to be on screen (E-STOP, Disconnect while the link is lost, the Vehicle status window).
 
 During the hover it measures how late the window's event loop runs, the time spent in the telemetry handler, CPU and memory.
 The map's web view runs in separate QtWebEngine processes, which are not counted.

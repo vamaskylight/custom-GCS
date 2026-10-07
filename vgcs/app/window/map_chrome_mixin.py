@@ -179,9 +179,37 @@ class MainWindowMapChromeMixin:
         action_fleet = menu.addAction("Fleet (several drones)")
         action_fleet.setToolTip("Connect more drones, see them all, and choose the one on screen.")
         action_fleet.setIcon(self._menu_icon("flight_mode.svg"))
+        action_status = menu.addAction("Vehicle status")
+        action_status.setToolTip(
+            "Every live value of the drone on screen: flight data, GPS and RTK, battery, "
+            "failsafes, wind and wind failsafe, command signing."
+        )
+        action_status.setIcon(self._menu_icon("analyze_tools.svg"))
+        action_preflight = menu.addAction("Pre-flight check")
+        action_preflight.setToolTip(
+            "The pre-flight popup again: the drone's arming checks, GPS, battery, motors and "
+            "wind failsafe, and the motor test."
+        )
+        action_preflight.setIcon(self._menu_icon("vehicle_config.svg"))
         action_settings = menu.addAction("Application Settings")
         action_settings.setToolTip("GCS-specific preferences.")
         action_settings.setIcon(self._menu_icon("app_settings.svg"))
+        tiles_menu = menu.addMenu(self._menu_icon("plan_flight.svg"), "Map tiles")
+        tiles_menu.setToolTipsVisible(True)
+        action_tiles_online = tiles_menu.addAction("Online satellite map")
+        action_tiles_online.setToolTip("Satellite pictures from the internet (Esri), kept in this PC's cache.")
+        action_tiles_offline = tiles_menu.addAction("Offline map folder...")
+        action_tiles_offline.setToolTip("Use a folder of map tiles (z/x/y.png) made elsewhere.")
+        tiles_menu.addSeparator()
+        action_tiles_cache = tiles_menu.addAction("Download area for offline use")
+        action_tiles_cache.setToolTip(
+            "Download map tiles for the current mission plan, zoom levels 14 to 18, into this PC's "
+            "own cache. Run it while you still have internet."
+        )
+        action_tiles_export = tiles_menu.addAction("Export tile pack...")
+        action_tiles_export.setToolTip("Download the same tiles into a folder, to carry to a PC that is never online.")
+        action_tiles_import = tiles_menu.addAction("Import tile pack...")
+        action_tiles_import.setToolTip("Bring a tile pack made on another PC into this PC's cache.")
         action_toggle_3d = menu.addAction("Toggle 3D View")
         action_toggle_3d.setToolTip("Switch between 2D and 3D map view.")
         menu.addSeparator()
@@ -234,6 +262,22 @@ class MainWindowMapChromeMixin:
         elif picked is action_settings:
             self._append_log("Menu: Application Settings")
             self._show_application_settings_dialog()
+        elif picked is action_status:
+            self._append_log("Menu: Vehicle status")
+            self._show_vehicle_status_dialog()
+        elif picked is action_preflight:
+            self._append_log("Menu: Pre-flight check")
+            self._show_preflight_dialog()
+        elif picked is action_tiles_online:
+            self._on_tiles_online()
+        elif picked is action_tiles_offline:
+            self._on_tiles_offline()
+        elif picked is action_tiles_cache:
+            self._on_tiles_cache_area()
+        elif picked is action_tiles_export:
+            self._on_tiles_export_pack()
+        elif picked is action_tiles_import:
+            self._on_tiles_import_pack()
         elif picked is action_toggle_3d:
             current = bool(getattr(self._map_widget, "_is_3d_mode", False))
             self._on_toggle_map_3d(not current)
@@ -257,13 +301,25 @@ class MainWindowMapChromeMixin:
             f"GPS/HDOP: {gps}\n"
             f"Mission waypoints: {wp_count}\n"
             f"Max telemetry distance: {mission_distance_m} m\n\n"
-            "Use Plan Flight to edit/upload waypoints and use M2 controls for "
-            "mode, takeoff/land, geofence, params, and tile source."
+            "Plan Flight: the mission and the geofence. Vehicle Configuration: flight mode, "
+            "failsafes and parameters. Vehicle status: every live value. Map tiles: offline maps."
         )
 
     def _on_tiles_online(self) -> None:
-        self._map_widget.activate_online_tiles()
-        self._append_log("Map tiles: online source selected")
+        # activate_online_tiles() never existed: the button that called it was
+        # hidden, so nobody found out.
+        self._map_widget.activate_satellite_tiles()
+        self._append_log("Map tiles: online satellite source selected")
+
+    def _on_tile_pack_message(self, text: str) -> None:
+        self._post_gcs_notice(text)
+
+    def _on_tile_pack_done(self, text: str) -> None:
+        # Not a popup: a download can end in the middle of a flight.
+        from vgcs.app.vehicle_messages import NOTICE_EVENT
+
+        self._post_gcs_notice(text, kind=NOTICE_EVENT, hold_s=30.0)
+        self._append_log(f"Map tiles: {text}")
 
     def _on_tiles_cache_area(self) -> None:
         """Stock this PC's own cache with the plan's tiles, every zoom level."""

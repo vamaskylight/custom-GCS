@@ -260,7 +260,43 @@ class MainWindowLifecycleMixin:
                         pass
         super().changeEvent(event)
 
+    def _armed_drone_names(self) -> list[str]:
+        """The connected drones that are armed: the one on screen and, in a
+        fleet, the others. The one on screen counts from its own heartbeats
+        too, in case the fleet's copy of its state is a moment behind."""
+        names: list[str] = []
+        active_name = "The drone"
+        fleet = getattr(self, "_fleet", None)
+        if fleet is not None:
+            try:
+                names = [v.name for v in fleet.connected() if v.summary.armed]
+                active = fleet.active()
+                if active is not None:
+                    active_name = active.name
+            except Exception:
+                names = []
+        if bool(getattr(self, "_hb_armed", False)) and active_name not in names:
+            names.insert(0, active_name)
+        return names
+
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt API
+        # An armed drone keeps flying without VGCS, so ask first. Until
+        # 2026-10-07 closing was immediate, armed or not.
+        armed = self._armed_drone_names() if hasattr(self, "_armed_drone_names") else []
+        if armed:
+            names = ", ".join(armed)
+            answer = QMessageBox.question(
+                self,
+                "Close VGCS",
+                f"{names} {'is' if len(armed) == 1 else 'are'} armed.\n\n"
+                "Close VGCS anyway? Every link closes. The drones keep flying, and "
+                "their own failsafes decide what they do.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         # Before anything else: the pre-flight popup is a top-level window, so
         # it survives this one and keeps the application alive with it.
         self._close_preflight_dialog()

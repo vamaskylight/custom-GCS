@@ -148,9 +148,9 @@ The script also sends values for the ground station:
 
 - **Pre-flight popup**: a line "Wind failsafe". It says if the script runs and what it will do.
   "Not running on this drone" means the script is missing or scripting is off.
-- **Dashboard**: "Wind failsafe" with the action, the motor output and the lean angle.
+- **Vehicle status** (VGCS menu): "Wind failsafe" with the action, the motor output and the lean angle.
 - **Message line**: every `Wind failsafe:` message. Warnings and actions stay there for 15 to 25 seconds.
-- **Wind**: the drone's wind estimate on the map strip and on the dashboard, with a warning level
+- **Wind**: the drone's wind estimate on the map strip and in Vehicle status, with a warning level
   (Application Settings, General, Wind warning). It shows `N/A` until the drag parameters are set.
 
 ## The wind estimate

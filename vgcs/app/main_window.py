@@ -268,7 +268,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         # a new site showed a blank map (field report 2026-08-20).
         self._btn_tiles_cache_area = QPushButton("Cache area offline")
         self._btn_tiles_cache_area.setToolTip(
-            "Download map tiles for the current mission plan, at every zoom level,\n"
+            "Download map tiles for the current mission plan, zoom levels 14 to 18,\n"
             "into this PC's own cache. Run it while you still have internet."
         )
         # For a PC that will never be online: build the pack on any connected
@@ -442,6 +442,10 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._map_widget.return_requested.connect(self._on_map_return_requested)
         self._map_widget.land_requested.connect(self._on_land)
         self._map_widget.disarm_requested.connect(self._on_disarm)
+        # Offline map downloads run for minutes: say how far they got, and when
+        # they end, where the operator looks (the map's own status line is hidden).
+        self._map_widget.tile_pack_progress.connect(self._on_tile_pack_message)
+        self._map_widget.tile_pack_finished.connect(self._on_tile_pack_done)
         self._map_widget.plan_tool_requested.connect(self._on_plan_tool_requested)
         self._map_widget.plan_action_requested.connect(self._on_plan_flight_action)
         self._map_widget.plan_flight_exited.connect(self._on_plan_flight_exited)
@@ -486,7 +490,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         # Default `#linkBanner` CSS tint (git e48c1a7) — not the red “communication lost” palette.
         self._set_dashboard_flight_status(
             "",
-            "Disconnected - Click to manually connect 💬",
+            "Disconnected - press Connect",
         )
         # Skydroid/SIYI gimbal polling must run before MAVLink connect (M7 Target reports).
         QTimer.singleShot(800, self._set_runtime_camera_control)

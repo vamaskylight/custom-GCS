@@ -925,6 +925,12 @@ class MainWindowPlanMissionMixin:
             self._map_widget.set_plan_rail_tool("ROI")
             self._on_plan_tool_requested("roi")
             return
+        if a == "fence_upload_circle":
+            self._upload_fence_from_plan_panel()
+            return
+        if a == "fence_disable":
+            self._disable_fence_from_plan_panel()
+            return
 
     def _on_plan_tool_requested(self, tool_name: str) -> None:
         tool = (tool_name or "").strip().lower()

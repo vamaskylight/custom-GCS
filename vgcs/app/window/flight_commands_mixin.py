@@ -185,19 +185,14 @@ class MainWindowFlightCommandsMixin:
         self._append_log("Land queued: LAND mode")
 
     def _on_auto_takeoff(self) -> None:
-        if self._thread is None or not self._thread.isRunning():
-            QMessageBox.warning(self, "VGCS", "Connect vehicle before auto takeoff.")
-            return
-        alt = float(self._takeoff_alt_spin.value())
-        self._thread.queue_auto_takeoff(alt)
-        self._append_log(f"Auto takeoff queued: arm + takeoff {alt:.1f} m")
+        # The same take-off as the map's Takeoff button, popup included. Until
+        # 2026-10-07 this one armed and climbed without asking (see _request_takeoff
+        # on two take-offs that behave differently).
+        self._request_takeoff(float(self._takeoff_alt_spin.value()))
 
     def _on_auto_land(self) -> None:
-        if self._thread is None or not self._thread.isRunning():
-            QMessageBox.warning(self, "VGCS", "Connect vehicle before auto land.")
-            return
-        self._thread.queue_auto_land()
-        self._append_log("Auto land queued (LAND mode or NAV_LAND)")
+        # The same landing as the map's Land button, popup included.
+        self._on_land()
 
     def _on_emergency_motor_stop(self) -> None:
         if self._thread is None or not self._thread.isRunning():
@@ -366,6 +361,21 @@ class MainWindowFlightCommandsMixin:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before applying failsafes.")
             return
+        answer = QMessageBox.question(
+            self,
+            "Apply failsafes",
+            "This writes four failsafe settings to the drone on screen:\n\n"
+            "    Ground station link lost: return home (FS_GCS_ENABLE 1)\n"
+            "    RC link lost: return home (FS_THR_ENABLE 1)\n"
+            "    Battery low: return home (BATT_FS_LOW_ACT 2)\n"
+            "    Battery critical: land (BATT_FS_CRT_ACT 1)\n\n"
+            "The battery failsafe also needs its trigger level on the drone "
+            "(BATT_LOW_VOLT or BATT_LOW_MAH). Apply now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         # M1 baseline:
         # - GCS disconnect: RTL (FS_GCS_ENABLE=1)
         # - RC failsafe: RTL (FS_THR_ENABLE=1)
@@ -399,6 +409,37 @@ class MainWindowFlightCommandsMixin:
         self._append_log(
             f"Fence upload queued: r={cfg['radius_m']:.0f}m alt={cfg['alt_max_m']:.0f}m action={int(cfg['action'])}"
         )
+
+    def _upload_fence_from_plan_panel(self) -> None:
+        """Plan Flight, Fence tab: the circle fence. The same upload as the
+        dashboard's "Upload fence", which the map-first layout never showed."""
+        cfg = None
+        fn = getattr(self._map_widget, "plan_fence_settings", None)
+        if callable(fn):
+            cfg = fn()
+        if cfg:
+            self._geofence_radius_spin.setValue(float(cfg["radius_m"]))
+            self._geofence_alt_max_spin.setValue(float(cfg["alt_max_m"]))
+            i = self._geofence_action_combo.findData(float(cfg["action"]))
+            if i >= 0:
+                self._geofence_action_combo.setCurrentIndex(i)
+        self._on_upload_fence()
+
+    def _disable_fence_from_plan_panel(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before switching the fence off.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Switch fence off",
+            "Switch the geofence off on the drone on screen?\n\nIt can then fly anywhere.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._thread.queue_geofence_upload({"disable": True})
+        self._append_log("Fence off queued")
 
     def _on_map_geofence_requested(self, cfg: object) -> None:
         if self._thread is None or not self._thread.isRunning():

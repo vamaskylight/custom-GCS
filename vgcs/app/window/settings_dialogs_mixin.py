@@ -1039,6 +1039,35 @@ class MainWindowSettingsDialogsMixin:
         assist_group.setLayout(assist_lay)
         lay.addWidget(assist_group)
 
+        # Failsafes. "Apply M1 failsafes" was only in the M2 controls panel, which
+        # the map-first layout never shows, while the long-range mission checks
+        # tell the operator to press it.
+        fs_group = QGroupBox("Failsafes")
+        fs_lay = QVBoxLayout()
+        fs_lay.setSpacing(8)
+        known = getattr(self, "_last_params", None) or {}
+
+        def _fs_value(name: str) -> str:
+            v = known.get(name)
+            return "not read yet" if v is None else f"{float(v):g}"
+
+        fs_note = QLabel(
+            "Apply failsafes sets: ground station link lost, return home. RC link lost, return home. "
+            "Battery low, return home. Battery critical, land.\nOn the drone now: "
+            + ", ".join(f"{n} {_fs_value(n)}" for n in (
+                "FS_GCS_ENABLE", "FS_THR_ENABLE", "BATT_FS_LOW_ACT", "BATT_FS_CRT_ACT", "BATT_LOW_VOLT"))
+        )
+        fs_note.setWordWrap(True)
+        fs_lay.addWidget(fs_note)
+        btn_failsafes = QPushButton("Apply failsafes")
+        btn_failsafes.setObjectName("vehicleConfigApplyFailsafes")
+        btn_failsafes.setEnabled(can_send)
+        btn_failsafes.setToolTip("Writes the four failsafe settings to the drone on screen. Asks first.")
+        btn_failsafes.clicked.connect(self._on_apply_m1_failsafes)
+        fs_lay.addWidget(btn_failsafes)
+        fs_group.setLayout(fs_lay)
+        lay.addWidget(fs_group)
+
         # Advanced parameters (collapsed)
         adv_box = QGroupBox("Advanced parameters")
         adv_box.setCheckable(True)

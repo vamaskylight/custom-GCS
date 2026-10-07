@@ -550,6 +550,28 @@ class MainWindowUiLayoutMixin:
         self._hdr_map_mode_btn.setCursor(Qt.PointingHandCursor)
         self._hdr_map_mode_btn.clicked.connect(self._on_map_toggle_3d_requested)
 
+        # Emergency motor stop. It used to be only in the M2 controls panel,
+        # which the map-first layout never shows, while the Disarm popup told
+        # the operator to use it. In the header it shows in every state, also
+        # while Plan Flight hides the map's own buttons.
+        self._hdr_estop_btn = QPushButton("E-STOP")
+        self._hdr_estop_btn.setObjectName("hdrEstopBtn")
+        self._hdr_estop_btn.setFixedHeight(26)
+        self._hdr_estop_btn.setCursor(Qt.PointingHandCursor)
+        self._hdr_estop_btn.setToolTip(
+            "Emergency stop: the motors stop at once, also in the air, and the aircraft falls.\n"
+            "Only when the aircraft is a danger. You type STOP to confirm."
+        )
+        self._hdr_estop_btn.setStyleSheet(
+            "QPushButton#hdrEstopBtn { background: #b3261e; color: #ffffff; font-weight: 700;"
+            " border: 1px solid #ff8a80; border-radius: 4px; padding: 0px 10px; }"
+            "QPushButton#hdrEstopBtn:hover:enabled { background: #d32f2f; }"
+            "QPushButton#hdrEstopBtn:disabled { background: rgba(179, 38, 30, 0.35);"
+            " color: rgba(255, 255, 255, 0.5); border-color: rgba(255, 138, 128, 0.35); }"
+        )
+        self._hdr_estop_btn.setEnabled(False)
+        self._hdr_estop_btn.clicked.connect(self._on_emergency_motor_stop)
+
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -603,7 +625,7 @@ class MainWindowUiLayoutMixin:
         dd_lay = QHBoxLayout(self._banner_disconnected_wrap)
         dd_lay.setContentsMargins(0, 0, 0, 0)
         dd_lay.setSpacing(10)
-        self._link_banner_text = QLabel("Disconnected - Click to manually connect 💬")
+        self._link_banner_text = QLabel("Disconnected - press Connect")
         self._link_banner_text.setObjectName("linkBannerText")
         self._link_banner_text.setWordWrap(False)
         self._link_banner_text.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -617,6 +639,20 @@ class MainWindowUiLayoutMixin:
         self._hdr_connect_btn.setIconSize(QSize(14, 14))
         self._hdr_connect_btn.clicked.connect(self._on_map_connect_requested)
         dd_lay.addWidget(self._hdr_connect_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        # The red states (not ready to arm, an arm refused, the link lost) show
+        # this page too. While a link runs it offers Disconnect in place of the
+        # greyed-out Connect it had until 2026-10-07: no way to disconnect then.
+        self._hdr_banner_disconnect_btn = QPushButton("Disconnect")
+        self._hdr_banner_disconnect_btn.setObjectName("hdrDisconnectBtn")
+        self._hdr_banner_disconnect_btn.setCursor(Qt.PointingHandCursor)
+        self._hdr_banner_disconnect_btn.setFixedHeight(28)
+        self._hdr_banner_disconnect_btn.setMinimumWidth(112 if self._compact_ui else 124)
+        self._hdr_banner_disconnect_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton))
+        self._hdr_banner_disconnect_btn.setIconSize(QSize(14, 14))
+        self._hdr_banner_disconnect_btn.setEnabled(False)
+        self._hdr_banner_disconnect_btn.setVisible(False)
+        self._hdr_banner_disconnect_btn.clicked.connect(self._on_disconnect_clicked)
+        dd_lay.addWidget(self._hdr_banner_disconnect_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._banner_connected_wrap = QWidget()
         self._banner_connected_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -633,7 +669,7 @@ class MainWindowUiLayoutMixin:
         self._hdr_disconnect_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton))
         self._hdr_disconnect_btn.setIconSize(QSize(14, 14))
         self._hdr_disconnect_btn.setEnabled(False)
-        self._hdr_disconnect_btn.clicked.connect(self._on_disconnect)
+        self._hdr_disconnect_btn.clicked.connect(self._on_disconnect_clicked)
         cc_lay.addWidget(self._hdr_disconnect_btn, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._header_banner_stack = QStackedWidget()
@@ -643,6 +679,7 @@ class MainWindowUiLayoutMixin:
 
         header_outer.addWidget(left_panel, 0, Qt.AlignVCenter)
         header_outer.addWidget(self._header_banner_stack, 1, Qt.AlignVCenter)
+        header_outer.addWidget(self._hdr_estop_btn, 0, Qt.AlignVCenter)
         header_outer.addWidget(self._hdr_map_mode_btn, 0, Qt.AlignVCenter)
 
         # Web padding 8+8px; inner row chip_row_h — fixed total bar height.
@@ -970,6 +1007,39 @@ class MainWindowUiLayoutMixin:
         v.addWidget(systems)
         col.setLayout(v)
         return col
+
+    def _show_vehicle_status_dialog(self) -> None:
+        """Every live value of the drone on screen, in a window of its own.
+
+        The map-first layout (M2) never shows the panel above, so values added
+        to it later (RTK, GPS accuracy, RTK corrections, wind, wind failsafe,
+        command signing) had no place on screen. The panel is kept up to date
+        all the time; this window only shows it.
+        """
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QScrollArea
+
+        dlg = getattr(self, "_vehicle_status_dialog", None)
+        if dlg is None:
+            dlg = QDialog(self)
+            dlg.setObjectName("vehicleStatusDialog")
+            dlg.setWindowTitle("Vehicle status")
+            dlg.setModal(False)
+            dlg.resize(760, 620)
+            lay = QVBoxLayout(dlg)
+            note = QLabel("The drone on screen. The values update while this window is open.")
+            note.setWordWrap(True)
+            lay.addWidget(note)
+            scroll = QScrollArea(dlg)
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(self._telemetry_body)
+            lay.addWidget(scroll, 1)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dlg)
+            buttons.rejected.connect(dlg.close)
+            lay.addWidget(buttons)
+            self._vehicle_status_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _apply_state_style(self, label: QLabel, state: str) -> None:
         colors = self._theme_colors

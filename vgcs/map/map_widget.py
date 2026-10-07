@@ -813,6 +813,9 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     plan_mission_panel_changed = Signal(object)
     plan_waypoint_selection_changed = Signal(int)  # selected WP index, -1 for none
     video_follow_enabled_changed = Signal(bool)
+    # Offline map tile packs: progress, and the result (also of an import).
+    tile_pack_progress = Signal(str)
+    tile_pack_finished = Signal(str)
 
     def __init__(self, parent=None, *, video_pipeline: VideoPipeline | None = None) -> None:
         super().__init__(parent)
