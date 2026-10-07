@@ -11,6 +11,8 @@
 //   5_settings_wheel.png  the same window scrolled to the RC wheel part
 //   6_camera_off.png      the camera link turned off
 //   7_ir_on.png           after the IR button: thermal stream, button lit
+//   8_thermal_colours_menu.png  the list of thermal colour modes (button under IR)
+//   8_thermal_ironbow.png       the thermal picture in Ironbow
 //   9_tap_aiming.png, 10_tap_result.png   a tap on an object: turn, then measure
 //   11_lock_pick.png      after the lock button: the hint to pick the object
 //   12_lock_drawing.png   a box being drawn around the object
@@ -21,6 +23,10 @@
 //   17_app_settings.png   Application Settings: the VAMA mark on General, no Help page
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
+// With IR on it picks Ironbow in the thermal colour list, then checks every
+// mode against VGCS's colour table at 64 grey levels of the thermal picture,
+// and that the black bars beside the picture stay black. The video is QGC's
+// own address, answered by the VAMA copy (FlightDisplayViewVideoOutput.qml).
 // Application Settings is opened by QGC's own address, through the app's
 // override rule, and checked for the client feedback of 2026-10-07 (tasks E
 // and F in DOCS/APK-V1-DEV-PLAN.md).
@@ -51,6 +57,9 @@
 #include "SkydroidTop.h"
 #include "Vehicle.h"
 
+// VGCS's thermal colour modes (made by apk/make_thermal_palettes.py).
+#include "../thermal_palette_vectors.inc"
+
 namespace top = skydroid::top;
 
 namespace {
@@ -79,6 +88,7 @@ public:
 
 signals:
     void fullScreenChanged();
+    void imageFileChanged(const QString &filename);  // QGC's video snapshot
 };
 
 /// Stand-in for a QGC Fact: only rawValue.
@@ -436,6 +446,88 @@ int main(int argc, char *argv[])
     };
 
     // The steps, one after another (delay in ms before each).
+    // Thermal colours (client request 2026-10-07).
+    auto findItem = [&](const char *objectName) -> QQuickItem * {
+        QList<QQuickItem *> items;
+        collect(window->contentItem(), items);
+        for (QQuickItem *item : std::as_const(items)) {
+            if (item->objectName() == QLatin1String(objectName)) {
+                return item;
+            }
+        }
+        return nullptr;
+    };
+    auto tapItem = [&](QQuickItem *item) {
+        const QPointF centre = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+        mouse(QEvent::MouseButtonPress, centre);
+        mouse(QEvent::MouseButtonRelease, centre);
+    };
+    // The video alone: everything over it hidden for the grab.
+    auto grabVideo = [&]() {
+        window->setProperty("videoOnly", true);
+        const QImage image = window->grabWindow();
+        window->setProperty("videoOnly", false);
+        return image;
+    };
+    QImage thermalPlain;  // the thermal picture as the camera sends it
+    // The 64 grey bands of the stand-in's thermal picture against VGCS's table
+    // for the mode in use, and the black bar beside the picture.
+    auto checkThermalColours = [&]() {
+        QQuickItem *picture = findItem("previewThermalPicture");
+        QQuickItem *video = findItem("videoContent");
+        if (!picture || !video || thermalPlain.isNull()) {
+            std::fprintf(stderr, "thermal picture not found\n");
+            ++g_problems;
+            return;
+        }
+        // VGCS's row for the mode in use, found by its id: a link whose list
+        // drifted from VGCS's order would colour with the wrong row.
+        int index = -1;
+        for (int i = 0; i < kThermalPaletteCount; ++i) {
+            if (link.thermalPalette() == QLatin1String(kThermalPaletteIds[i])) {
+                index = i;
+            }
+        }
+        if (index < 0) {
+            std::fprintf(stderr, "thermal colours: %s is not a VGCS mode\n", qPrintable(link.thermalPalette()));
+            ++g_problems;
+            return;
+        }
+        const int row = video->property("_vamaPaletteRow").toInt();
+        const QImage now = grabVideo();
+        const qreal dpr = now.devicePixelRatio();
+        auto pixel = [&](const QImage &image, qreal x, qreal y) {
+            return image.pixelColor(qRound(x * dpr), qRound(y * dpr));
+        };
+        const QRectF r = picture->mapRectToScene(QRectF(0, 0, picture->width(), picture->height()));
+        int wrong = 0;
+        QString first;
+        for (int band = 0; band < 64; ++band) {
+            const qreal x = r.x() + (band + 0.5) * r.width() / 64;
+            const qreal y = r.y() + r.height() / 4;
+            const QColor plain = pixel(thermalPlain, x, y);
+            const QColor got = pixel(now, x, y);
+            const int level = plain.red();
+            const unsigned char *want = kThermalPaletteColours[index][level];
+            const bool grey = plain.green() == level && plain.blue() == level;
+            if (!grey || qAbs(got.red() - want[0]) > 1 || qAbs(got.green() - want[1]) > 1 ||
+                qAbs(got.blue() - want[2]) > 1) {
+                if (wrong++ == 0) {
+                    first = QStringLiteral("grey %1: %2 %3 %4, VGCS %5 %6 %7")
+                                .arg(level).arg(got.red()).arg(got.green()).arg(got.blue())
+                                .arg(want[0]).arg(want[1]).arg(want[2]);
+                }
+            }
+        }
+        const QColor bar = pixel(now, r.x() / 2, r.y() + r.height() / 2);
+        const bool barBlack = bar.red() == 0 && bar.green() == 0 && bar.blue() == 0;
+        const QByteArray what = "thermal colours: " + link.thermalPalette().toUtf8() +
+                                " is VGCS's table at 64 grey levels, the bars stay black";
+        expect(wrong == 0 && barBlack && row == index, what.constData(),
+               wrong ? QStringLiteral("%1 wrong, first %2").arg(wrong).arg(first)
+                     : QStringLiteral("row %1, bar %2 %3 %4").arg(row).arg(bar.red()).arg(bar.green()).arg(bar.blue()));
+    };
+
     const QList<std::pair<int, std::function<void()>>> steps = {
         {1500, [&]() {
              link.zoom(1);
@@ -457,11 +549,60 @@ int main(int argc, char *argv[])
              expect(link.dayVideoUrl() == QStringLiteral("rtsp://192.168.144.108:554/main"),
                     "IR on: day address learned from QGC", link.dayVideoUrl());
              shot("7_ir_on.png");
+             // Thermal colours: the button under IR shows only now, and opens the list.
+             thermalPlain = grabVideo();
+             // Beside IR, so the left column keeps its height (a sixth button in
+             // it reached the small map in the corner).
+             QQuickItem *button = findItem("vamaPaletteButton");
+             QQuickItem *ir = findItem("vamaIrButton");
+             const QRectF b = button ? button->mapRectToScene(QRectF(0, 0, button->width(), button->height())) : QRectF();
+             const QRectF i = ir ? ir->mapRectToScene(QRectF(0, 0, ir->width(), ir->height())) : QRectF();
+             expect(button && ir && button->isVisible() && qAbs(b.center().y() - i.center().y()) < 1 && b.left() > i.right(),
+                    "IR on: the thermal colour button shows, beside IR",
+                    QStringLiteral("button %1,%2 IR %3,%4").arg(b.x()).arg(b.y()).arg(i.x()).arg(i.y()));
+             if (button) {
+                 tapItem(button);
+             }
+         }},
+        {500, [&]() {
+             QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaPalettePopup"));
+             expect(popup && popup->property("opened").toBool(), "thermal colours: the button opens the list", QString());
+             shot("8_thermal_colours_menu.png");
+             QQuickItem *row = findItem("vamaPalette_ironbow");
+             if (row) {
+                 tapItem(row);
+             } else {
+                 std::fprintf(stderr, "vamaPalette_ironbow not found\n");
+                 ++g_problems;
+             }
+         }},
+        {500, [&]() {
+             QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaPalettePopup"));
+             expect(link.thermalPalette() == QStringLiteral("ironbow") && popup && !popup->property("visible").toBool(),
+                    "thermal colours: Ironbow picked in the list, the list closed", link.thermalPalette());
+             shot("8_thermal_ironbow.png");
+             checkThermalColours();
+             link.setThermalPalette(QStringLiteral("black_hot"));
+         }},
+        {300, [&]() { checkThermalColours(); link.setThermalPalette(QStringLiteral("rainbow")); }},
+        {300, [&]() { checkThermalColours(); link.setThermalPalette(QStringLiteral("red_hot")); }},
+        {300, [&]() { checkThermalColours(); link.setThermalPalette(QStringLiteral("green")); }},
+        {300, [&]() { checkThermalColours(); link.setThermalPalette(QStringLiteral("sepia")); }},
+        {300, [&]() { checkThermalColours(); link.setThermalPalette(QStringLiteral("camera")); }},
+        {300, [&]() {
+             checkThermalColours();  // as received: the picture untouched
+             // IR off with a colour mode chosen: the day picture must stay as it is.
+             link.setThermalPalette(QStringLiteral("ironbow"));
              tap("vamaIrButton");
          }},
         {300, [&]() {
              const QString url = global.settings.video.rtspUrlFact.rawValue().toString();
              expect(url == QStringLiteral("rtsp://192.168.144.108:554/main"), "IR off: QGC video is the day stream again", url);
+             QQuickItem *video = findItem("videoContent");
+             QQuickItem *button = findItem("vamaPaletteButton");
+             expect(video && video->property("_vamaPaletteRow").toInt() == 0 && button && !button->isVisible(),
+                    "IR off: the day picture is not coloured, and the colour button hides", link.thermalPalette());
+             link.setThermalPalette(QStringLiteral("camera"));
              // A single tap on the video, right of centre and up.
              mouse(QEvent::MouseButtonPress, QPointF(1300, 420));
              mouse(QEvent::MouseButtonRelease, QPointF(1300, 420));
@@ -556,13 +697,28 @@ int main(int argc, char *argv[])
         {1000, [&]() { checkAppSettings(); }},
         {100, [&]() { QCoreApplication::quit(); }},
     };
-    int delay = 0;
-    for (const auto &step : steps) {
-        delay += step.first;
-        QTimer::singleShot(delay, &app, step.second);
-    }
+    // Each step starts its delay when the step before it has finished. Timers
+    // counted from the start were "coarse" past 2 s (Qt allows 5 %), so late
+    // steps could swap: once the quit ran before the Application Settings check.
+    qsizetype stepsRun = 0;
+    std::function<void()> runNext = [&]() {
+        if (stepsRun >= steps.size()) {
+            return;
+        }
+        const auto &step = steps.at(stepsRun);
+        QTimer::singleShot(step.first, Qt::PreciseTimer, &app, [&, run = step.second]() {
+            ++stepsRun;
+            run();
+            runNext();
+        });
+    };
+    runNext();
 
     const int code = app.exec();
+    if (stepsRun != steps.size()) {
+        std::fprintf(stderr, "only %d of %d steps ran\n", int(stepsRun), int(steps.size()));
+        ++g_problems;
+    }
     std::fprintf(stderr, "QML problems: %d\n", g_problems);
     return (code == 0 && g_problems == 0) ? 0 : 1;
 }

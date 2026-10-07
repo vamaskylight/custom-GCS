@@ -25,9 +25,14 @@
         <file alias="vama_zoom_in.svg">res/Images/vama_zoom_in.svg</file>
         <file alias="vama_zoom_out.svg">res/Images/vama_zoom_out.svg</file>
         <file alias="vama_zoom_reset.svg">res/Images/vama_zoom_reset.svg</file>
+        <file alias="thermal_palettes.png">res/Images/thermal_palettes.png</file>
+    </qresource>
+    <qresource prefix="/custom/shaders">
+        <file alias="thermal_palette.frag.qsb">res/shaders/thermal_palette.frag.qsb</file>
     </qresource>
     <qresource prefix="/Custom/qml">
         <file alias="QGroundControl/Controls/AppSettings.qml">src/AppSettings.qml</file>
+        <file alias="QGroundControl/FlyView/FlightDisplayViewVideoOutput.qml">src/FlightDisplayViewVideoOutput.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewCustomLayer.qml">src/FlyViewCustomLayer.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewTopRightColumnLayout.qml">src/FlyViewTopRightColumnLayout.qml</file>
         <file alias="QGroundControl/Toolbar/SelectViewDropdown.qml">src/SelectViewDropdown.qml</file>

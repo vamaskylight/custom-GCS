@@ -79,6 +79,12 @@ class SkydroidLink : public QObject
     Q_PROPERTY(bool reverseTapYaw READ reverseTapYaw WRITE setReverseTapYaw NOTIFY settingsChanged)
     Q_PROPERTY(QString dayVideoUrl READ dayVideoUrl WRITE setDayVideoUrl NOTIFY settingsChanged)
     Q_PROPERTY(QString thermalVideoUrl READ thermalVideoUrl WRITE setThermalVideoUrl NOTIFY settingsChanged)
+    /// Thermal colour mode: an id of thermalPalettes().
+    Q_PROPERTY(QString thermalPalette READ thermalPalette WRITE setThermalPalette NOTIFY settingsChanged)
+    /// Its place in thermalPalettes() (0: as received), which is also its row in thermal_palettes.png.
+    Q_PROPERTY(int thermalPaletteIndex READ thermalPaletteIndex NOTIFY settingsChanged)
+    Q_PROPERTY(QStringList thermalPalettes READ thermalPalettes CONSTANT)
+    Q_PROPERTY(QStringList thermalPaletteNames READ thermalPaletteNames CONSTANT)
 
     // Camera state
     Q_PROPERTY(bool answering READ answering NOTIFY answeringChanged)
@@ -175,6 +181,17 @@ public:
     void setDayVideoUrl(const QString &url);
     QString thermalVideoUrl() const { return _thermalVideoUrl; }
     void setThermalVideoUrl(const QString &url);
+    /// Thermal colour modes, the same as VGCS (vgcs/video/thermal_palette.py):
+    /// its ids in its menu order. The first is the picture as the camera sends
+    /// it (white hot). While IR is on, FlightDisplayViewVideoOutput.qml draws
+    /// the picture through the chosen mode's colour table.
+    static QStringList thermalPalettes();
+    /// The names on screen (VGCS's), in the order of thermalPalettes().
+    static QStringList thermalPaletteNames();
+    QString thermalPalette() const { return _thermalPalette; }
+    /// An unknown id means the picture as received, as in VGCS.
+    void setThermalPalette(const QString &id);
+    int thermalPaletteIndex() const { return thermalPalettes().indexOf(_thermalPalette); }
 
     bool answering() const { return _answering; }
     /// The address the camera answers on, "host:port".
@@ -390,6 +407,7 @@ private:
     bool _reverseTapYaw = false;
     QString _dayVideoUrl;
     QString _thermalVideoUrl;
+    QString _thermalPalette;
 
     // Tap aiming
     bool _aimBusy = false;

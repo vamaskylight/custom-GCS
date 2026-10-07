@@ -1,0 +1,2 @@
+module QtMultimedia
+VideoOutput 6.0 VideoOutput.qml

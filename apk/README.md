@@ -15,6 +15,7 @@ apk/
   fetch_qgc.ps1     downloads that release into apk/qgc-src and links apk/custom into it
   build_android.ps1 builds the signed APK (arm64-v8a and armeabi-v7a)
   make_icons.py     makes every icon and logo from vgcs/assets/Vama Logo.png
+  make_thermal_palettes.py  makes the thermal colour table and shader from VGCS's colour modes
   custom/           OUR CODE: branding, Skydroid controls, screens (in git)
   qgc-src/          QGC source, downloaded by fetch_qgc.ps1 (gitignored, never committed)
   build/            build output (gitignored)
@@ -96,6 +97,7 @@ powershell -ExecutionPolicy Bypass -File apk\custom\test\run_preview.ps1
 - `run_tests.ps1` checks the camera protocol (`SkydroidTop`) and the laser target maths (`LaserGeo`) against values made by the VGCS Python code. After changing either side, regenerate them with `gen_skydroid_vectors.py` and `gen_laser_vectors.py` (run with `py -3.14`, which has the VGCS packages).
 - `run_link_test.ps1` runs the real camera link (`SkydroidLink`) against fake cameras on 127.0.0.1, with stand-ins for QGC's vehicle classes (`test/link/stubs`): angles, address search, touch and RC wheel motion, laser and target rules.
 - `run_preview.ps1` loads the real camera screen (`FlyViewCustomLayer.qml` from `custom.qrc`) with stand-ins for QGC's QML controls (`test/preview/stubs`) and a fake camera, prints every QML warning, and saves screenshots to `%TEMP%\vama-preview`. Run it after every QML change: the app only finds QML mistakes when it runs.
+- The preview also opens our copies of QGC's files by QGC's own addresses, the way the app does: the video (thermal colours checked against VGCS's tables at 64 grey levels) and Application Settings. After changing VGCS's colour modes or the shader, run `python apk/make_thermal_palettes.py` (needs Qt's `qsb`, from the `msvc2022_64` kit).
 - They need MinGW 13.1 (`C:\Qt\Tools\mingw1310_64`) and, for the link test and the preview, the Qt 6.11.1 MinGW kit (`C:\Qt\6.11.1\mingw_64`).
 - Tests and the preview use only 127.0.0.x addresses. `SkydroidLink::setProbeTargets` keeps the camera address search off the real network.
 
@@ -117,6 +119,7 @@ The Android package id is permanent once customers install the app, so confirm i
 3. Delete `apk\qgc-src`.
 4. Run `fetch_qgc.ps1` again.
 5. Compare the new `custom-example` with `apk/custom`, and bring over what changed.
+6. Compare our copies of QGC's QML files (`apk/custom/src`, listed in `apk/custom/README.md`) with the new release's files, and keep the parts marked "VAMA".
 
 **Always remove the link before deleting `apk\qgc-src`.**
 Some delete tools follow the link and would also delete `apk\custom`.

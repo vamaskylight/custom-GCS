@@ -3,7 +3,8 @@
 // switch to another address when the configured one gives no angles, speed
 // motion from touch and RC wheels, the frames each button sends, the laser
 // sequence (laser module first, system address as fallback), the target
-// position rules, and the object lock (turn, GOT, SUM confirm and stop).
+// position rules, the object lock (turn, GOT, SUM confirm and stop), and the
+// thermal colour mode setting.
 //
 // Every address used here is on this computer (127.0.0.x).
 
@@ -24,6 +25,9 @@
 #include "SkydroidLink.h"
 #include "SkydroidTop.h"
 #include "Vehicle.h"
+
+// VGCS's thermal colour modes (made by apk/make_thermal_palettes.py).
+#include "../thermal_palette_vectors.inc"
 
 namespace top = skydroid::top;
 
@@ -1136,6 +1140,52 @@ private slots:
         QCOMPARE(_link->modelName(), QString("V12"));
         _link->setModel("V13");  // not a model id: ignored
         QCOMPARE(_link->model(), QString("C12"));
+    }
+
+    // --- Thermal colour modes ------------------------------------------------
+
+    void thermalPalettesAreTheVgcsModes()
+    {
+        // The same ids, names and order as VGCS: the order is also the row of
+        // each mode in thermal_palettes.png.
+        QCOMPARE(SkydroidLink::thermalPalettes().size(), kThermalPaletteCount);
+        QCOMPARE(SkydroidLink::thermalPaletteNames().size(), kThermalPaletteCount);
+        for (int i = 0; i < kThermalPaletteCount; ++i) {
+            QCOMPARE(SkydroidLink::thermalPalettes().at(i), QString::fromUtf8(kThermalPaletteIds[i]));
+            QCOMPARE(SkydroidLink::thermalPaletteNames().at(i), QString::fromUtf8(kThermalPaletteNames[i]));
+        }
+    }
+
+    void thermalPaletteStartsAsReceivedAndSurvives()
+    {
+        QCOMPARE(_link->thermalPalette(), QString("camera"));
+        QCOMPARE(_link->thermalPaletteIndex(), 0);
+        QSignalSpy changed(_link, &SkydroidLink::settingsChanged);
+        _link->setThermalPalette("  Ironbow ");  // typed: any case, spaces
+        QCOMPARE(_link->thermalPalette(), QString("ironbow"));
+        QCOMPARE(_link->thermalPaletteIndex(), 2);
+        QCOMPARE(changed.size(), 1);
+        _link->setThermalPalette("ironbow");  // no change, no signal
+        QCOMPARE(changed.size(), 1);
+        delete _link;
+        _link = new SkydroidLink;
+        QCOMPARE(_link->thermalPalette(), QString("ironbow"));
+        _link->setThermalPalette("plasma");  // unknown: as received, like VGCS
+        QCOMPARE(_link->thermalPalette(), QString("camera"));
+        QCOMPARE(_link->thermalPaletteIndex(), 0);
+    }
+
+    void unknownSavedThermalPaletteLoadsAsReceived()
+    {
+        delete _link;
+        QSettings().setValue("VamaSkydroid/thermalPalette", "plasma");
+        _link = new SkydroidLink;
+        QCOMPARE(_link->thermalPalette(), QString("camera"));
+        delete _link;
+        QSettings().setValue("VamaSkydroid/thermalPalette", "SEPIA");
+        _link = new SkydroidLink;
+        QCOMPARE(_link->thermalPalette(), QString("sepia"));
+        QCOMPARE(_link->thermalPaletteIndex(), kThermalPaletteCount - 1);
     }
 
     void settingsSurviveARestart()

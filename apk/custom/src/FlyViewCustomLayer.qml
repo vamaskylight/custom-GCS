@@ -3,7 +3,9 @@
 //
 // Layout follows the Skydroid app the client uses (photo, 2026-10-06): the
 // video stays clear, with round icon buttons on both sides.
-//  - Left: photo, record, laser, lock, IR.
+//  - Left: photo, record, laser, lock, IR. While IR is on, the thermal
+//    colours sit beside IR (the modes of VGCS, drawn by
+//    FlightDisplayViewVideoOutput.qml).
 //  - Right: yaw centre, gimbal centre, look down, zoom in, zoom out, zoom 1x.
 //  - Top right: camera status and settings.
 // The camera moves when a finger drags on the video (further = faster), or
@@ -80,7 +82,9 @@ Item {
     QGCToolInsets {
         id:                     _toolInsets
         leftEdgeTopInset:       parentToolInsets.leftEdgeTopInset
-        leftEdgeCenterInset:    actionColumn.visible ? Math.max(parentToolInsets.leftEdgeCenterInset, actionColumn.x + actionColumn.width + _margin)
+        leftEdgeCenterInset:    actionColumn.visible ? Math.max(parentToolInsets.leftEdgeCenterInset,
+                                                        (paletteButton.visible ? paletteButton.x + paletteButton.width
+                                                                               : actionColumn.x + actionColumn.width) + _margin)
                                                      : parentToolInsets.leftEdgeCenterInset
         leftEdgeBottomInset:    parentToolInsets.leftEdgeBottomInset
         rightEdgeTopInset:      parentToolInsets.rightEdgeTopInset
@@ -161,6 +165,26 @@ Item {
                 interval = 120
                 button.clicked()
             }
+        }
+    }
+
+    // One thermal colour mode as a strip, coldest on the left: a row of the
+    // same table the video uses (FlightDisplayViewVideoOutput.qml).
+    component PaletteStrip: Item {
+        property int paletteIndex: 0
+
+        Image {
+            anchors.fill:   parent
+            source:         "qrc:/custom/img/thermal_palettes.png"
+            sourceClipRect: Qt.rect(0, parent.paletteIndex, 256, 1)
+            fillMode:       Image.Stretch
+            smooth:         true
+        }
+        Rectangle {
+            anchors.fill: parent
+            color:        "transparent"
+            border.color: Qt.rgba(1, 1, 1, 0.6)
+            border.width: 1
         }
     }
 
@@ -346,12 +370,33 @@ Item {
                 }
             }
             IconButton {
+                id:         irButton
                 objectName: "vamaIrButton"
                 icon:       _iconPath + "vama_ir.svg"
                 size:       _buttonSize
                 fill:       _thermalOn ? qgcPal.colorOrange : Qt.rgba(0, 0, 0, 0.55)
                 onClicked:  _toggleThermal()
             }
+        }
+    }
+
+    // Thermal colours, beside IR while the thermal picture shows (next to IR as
+    // in VGCS; a sixth button in the column would reach the small map). The
+    // strip is the mode in use; a press lists the modes.
+    IconButton {
+        id:         paletteButton
+        objectName: "vamaPaletteButton"
+        visible:    actionColumn.visible && _thermalOn
+        size:       _buttonSize
+        x:          actionColumn.x + actionColumn.width + _margin
+        y:          actionColumn.y + actionButtons.y + irButton.y
+        onClicked:  palettePopup.open()
+
+        PaletteStrip {
+            anchors.centerIn: parent
+            width:            parent.width * 0.56
+            height:           parent.height * 0.22
+            paletteIndex:     _link.thermalPaletteIndex
         }
     }
 
@@ -865,6 +910,75 @@ Item {
         function onStateChanged() {
             if (Qt.application.state !== Qt.ApplicationActive) {
                 videoDrag.endDrag()
+            }
+        }
+    }
+
+    // --- Thermal colours ---------------------------------------------------------
+    // Beside the colour button. A choice shows at once and is kept for next time.
+    Popup {
+        id:         palettePopup
+        objectName: "vamaPalettePopup"
+        x:          paletteButton.x + paletteButton.width + _margin
+        y:          Math.max(_margin, (_root.height - height) / 2)
+        modal:      true
+        focus:      true
+        padding:    _margin
+
+        background: Rectangle {
+            color:        qgcPal.window
+            radius:       ScreenTools.defaultBorderRadius
+            border.color: qgcPal.text
+        }
+
+        Column {
+            spacing: _margin / 2
+
+            QGCLabel {
+                text:      qsTr("Thermal colours")
+                font.bold: true
+            }
+
+            Repeater {
+                model: _link.thermalPalettes
+
+                Rectangle {
+                    id:           paletteRow
+                    objectName:   "vamaPalette_" + modelData
+                    width:        ScreenTools.defaultFontPixelWidth * 30
+                    height:       _buttonSize * 0.7
+                    radius:       ScreenTools.defaultBorderRadius
+                    color:        _chosen ? Qt.rgba(1, 0.6, 0, 0.25) : "transparent"
+                    border.color: _chosen ? qgcPal.colorOrange : "transparent"
+                    border.width: 2
+
+                    required property int    index
+                    required property string modelData
+                    readonly property bool   _chosen: index === _link.thermalPaletteIndex
+
+                    PaletteStrip {
+                        id:                     rowStrip
+                        anchors.left:           parent.left
+                        anchors.leftMargin:     _margin
+                        anchors.verticalCenter: parent.verticalCenter
+                        width:                  ScreenTools.defaultFontPixelWidth * 8
+                        height:                 parent.height * 0.45
+                        paletteIndex:           paletteRow.index
+                    }
+                    QGCLabel {
+                        anchors.left:           rowStrip.right
+                        anchors.leftMargin:     _margin
+                        anchors.verticalCenter: parent.verticalCenter
+                        text:                   _link.thermalPaletteNames[paletteRow.index]
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            _link.thermalPalette = paletteRow.modelData
+                            palettePopup.close()
+                        }
+                    }
+                }
             }
         }
     }

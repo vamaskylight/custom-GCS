@@ -4,10 +4,12 @@ Builds and runs the camera screen preview, and saves screenshots.
 
 .DESCRIPTION
 Loads the real FlyViewCustomLayer.qml and SkydroidLink with stand-ins for QGC
-and a fake camera on 127.0.0.1. Then opens Application Settings by QGC's own
-address and checks the VAMA copy of AppSettings.qml (VAMA mark on General, no
-Help page). Prints every QML warning and check, and saves screenshots
-(1_main.png to 17_app_settings.png) in -OutDir.
+and a fake camera on 127.0.0.1. The video is QGC's own address, answered by the
+VAMA copy of FlightDisplayViewVideoOutput.qml: with IR on, every thermal colour
+mode is checked against VGCS's colour table. Then it opens Application Settings
+by QGC's own address and checks the VAMA copy of AppSettings.qml (VAMA mark on
+General, no Help page). Prints every QML warning and check, and saves
+screenshots (1_main.png to 17_app_settings.png) in -OutDir.
 Needs the Qt 6.11.1 MinGW kit and MinGW 13.1, like run_link_test.ps1.
 
 .EXAMPLE

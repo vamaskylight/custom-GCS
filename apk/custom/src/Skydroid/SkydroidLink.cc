@@ -21,6 +21,15 @@ namespace top = skydroid::top;
 
 namespace {
 
+/// A saved or typed colour mode as a known id; anything else is the picture
+/// as received (VGCS's normalize_palette_id).
+QString normalizedThermalPalette(const QString &value)
+{
+    const QString id = value.trimmed().toLower();
+    const QStringList ids = SkydroidLink::thermalPalettes();
+    return ids.contains(id) ? id : ids.constFirst();
+}
+
 constexpr const char *kSettingsGroup = "VamaSkydroid";
 constexpr const char *kDefaultHost = "192.168.144.108";
 constexpr int kDefaultPort = 5000;
@@ -232,6 +241,21 @@ QStringList SkydroidLink::modelNames()
     return {QStringLiteral("V12"), QStringLiteral("V13"), QStringLiteral("V14 Pro")};
 }
 
+QStringList SkydroidLink::thermalPalettes()
+{
+    // VGCS's ids in its order, so the colour table made from VGCS
+    // (apk/make_thermal_palettes.py) has one row per entry, in this order.
+    return {QStringLiteral("camera"), QStringLiteral("black_hot"), QStringLiteral("ironbow"),
+            QStringLiteral("rainbow"), QStringLiteral("red_hot"), QStringLiteral("green"),
+            QStringLiteral("sepia")};
+}
+
+QStringList SkydroidLink::thermalPaletteNames()
+{
+    return {tr("White hot (as received)"), tr("Black hot"), tr("Ironbow"), tr("Rainbow"),
+            tr("Red hot"), tr("Green"), tr("Sepia")};
+}
+
 QString SkydroidLink::modelName() const
 {
     const qsizetype i = models().indexOf(_model);
@@ -264,6 +288,7 @@ void SkydroidLink::_loadSettings()
     _reverseTapYaw = settings.value(QStringLiteral("reverseTapYaw"), false).toBool();
     _dayVideoUrl = settings.value(QStringLiteral("dayVideoUrl")).toString().trimmed();
     _thermalVideoUrl = settings.value(QStringLiteral("thermalVideoUrl")).toString().trimmed();
+    _thermalPalette = normalizedThermalPalette(settings.value(QStringLiteral("thermalPalette")).toString());
     settings.endGroup();
     if (_dayVideoUrl.isEmpty()) {
         _dayVideoUrl = QString::fromLatin1(kDefaultDayVideoUrl);
@@ -300,6 +325,7 @@ void SkydroidLink::_saveSettings() const
     settings.setValue(QStringLiteral("reverseTapYaw"), _reverseTapYaw);
     settings.setValue(QStringLiteral("dayVideoUrl"), _dayVideoUrl);
     settings.setValue(QStringLiteral("thermalVideoUrl"), _thermalVideoUrl);
+    settings.setValue(QStringLiteral("thermalPalette"), _thermalPalette);
     settings.endGroup();
 }
 
@@ -467,6 +493,17 @@ void SkydroidLink::setThermalVideoUrl(const QString &url)
         return;
     }
     _thermalVideoUrl = u;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setThermalPalette(const QString &id)
+{
+    const QString palette = normalizedThermalPalette(id);
+    if (palette == _thermalPalette) {
+        return;
+    }
+    _thermalPalette = palette;
     _saveSettings();
     emit settingsChanged();
 }

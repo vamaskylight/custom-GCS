@@ -1,6 +1,8 @@
-// Stand-in for QGC's FlyView on the RC screen (1920x1080): a fake video, the
+// Stand-in for QGC's FlyView on the RC screen (1920x1080): the video, the
 // spots where QGC draws its own widgets (grey boxes), and our real camera
 // layer loaded from the custom resources, built the way FlyView.qml builds it.
+// The video is the VAMA copy of QGC's FlightDisplayViewVideoOutput.qml, over a
+// stand-in VideoOutput that plays a day or a thermal picture (stubs/QtMultimedia).
 
 import QtQuick
 import QtQuick.Window
@@ -17,26 +19,24 @@ Window {
 
     readonly property real _margin: ScreenTools.defaultFontPixelWidth * 0.75
 
+    // True hides everything over the video, so a check can read its pixels.
+    property bool videoOnly: false
+
     Item {
         id:           mapHolder
         anchors.fill: parent
 
-        // Fake camera picture: bright sky over darker ground, the hard case for white icons.
-        Rectangle {
+        // QGC's own address: the app's override rule (main.cpp) answers it with
+        // the VAMA copy. Without that copy nothing would load here.
+        Loader {
             anchors.fill: parent
-            gradient: Gradient {
-                GradientStop { position: 0.0;  color: "#dfeaf4" }
-                GradientStop { position: 0.45; color: "#b9cfe0" }
-                GradientStop { position: 0.46; color: "#7d8a6a" }
-                GradientStop { position: 1.0;  color: "#4f5a40" }
-            }
-            Rectangle { x: parent.width * 0.55; y: parent.height * 0.3; width: 260; height: 200; color: "#c9c2b5" }
-            Rectangle { x: parent.width * 0.18; y: parent.height * 0.36; width: 140; height: 120; color: "#efefef" }
+            source:       "qrc:/qml/QGroundControl/FlyView/FlightDisplayViewVideoOutput.qml"
         }
 
         // QGC's widget layer: tool strip top left, instruments bottom right.
         Item {
             id:                widgetLayer
+            visible:           !window.videoOnly
             anchors.fill:      parent
             anchors.margins:   _margin
             anchors.topMargin: toolbar.height + _margin
@@ -69,6 +69,7 @@ Window {
         // The map, small in the corner while the video is the main view.
         Rectangle {
             id: pip
+            visible: !window.videoOnly
             x: _margin; y: parent.height - height - _margin
             width: 430; height: 242; z: 100; color: "#6b8e5a"; border.color: "white"
             Text { anchors.centerIn: parent; color: "white"; text: "Map"; font.pixelSize: 30 }
@@ -77,6 +78,7 @@ Window {
 
     Rectangle {
         id: toolbar
+        visible: !window.videoOnly
         width: parent.width; height: 92; color: "#e0000000"
         Text { anchors.centerIn: parent; color: "white"; text: "QGC toolbar"; font.pixelSize: 30 }
     }
@@ -101,5 +103,6 @@ Window {
         layer = component.createObject(mapHolder, { parentToolInsets: widgetLayer.totalToolInsets, mapControl: fakeMap })
         layer.anchors.fill = widgetLayer
         layer.z = 2
+        layer.visible = Qt.binding(function() { return !window.videoOnly })
     }
 }
