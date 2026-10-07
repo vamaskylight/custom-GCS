@@ -530,6 +530,9 @@ class NativeTileMapView(QWidget):
         self._vehicle_lat: float | None = None
         self._vehicle_lon: float | None = None
         self._heading_deg = 0.0
+        # The other drones of a fleet (M15), and the active drone's name.
+        # Each item: lat, lon, heading_deg, label, link_ok, active.
+        self._fleet_items: list[dict] = []
         self._waypoints: list[tuple[float, float]] = []
         self._fence_points: list[tuple[float, float]] = []
         self._fence_circle: tuple[float, float, float] | None = None  # lat, lon, radius_m
@@ -699,6 +702,70 @@ class NativeTileMapView(QWidget):
 
     def set_vehicle(self, lat: float, lon: float) -> None:
         self.set_vehicle_filtered(lat, lon, append_track=True)
+
+    def set_fleet_vehicles(self, items: list[dict]) -> None:
+        """The drones of a fleet besides the one on screen (M15).
+
+        The active drone keeps its red arrow, drawn from set_vehicle as
+        always. Each other drone gets a smaller blue arrow with its name and
+        height, grey while its link is lost. An item marked active only adds
+        the name next to the red arrow, so the operator sees which drone the
+        buttons command. An empty list (one drone) draws nothing extra.
+        """
+        clean: list[dict] = []
+        for item in items or []:
+            try:
+                lat, lon = float(item["lat"]), float(item["lon"])
+            except (KeyError, TypeError, ValueError):
+                if not item.get("active"):
+                    continue
+                lat = lon = float("nan")
+            clean.append({
+                "lat": lat,
+                "lon": lon,
+                "heading_deg": float(item.get("heading_deg") or 0.0),
+                "label": str(item.get("label") or ""),
+                "link_ok": bool(item.get("link_ok", True)),
+                "active": bool(item.get("active", False)),
+            })
+        if clean != self._fleet_items:
+            self._fleet_items = clean
+            self.update()
+
+    def _draw_fleet_label(self, painter: QPainter, x: float, y: float, text: str, *, active: bool) -> None:
+        if not text:
+            return
+        metrics = painter.fontMetrics()
+        tw = metrics.horizontalAdvance(text) + 10
+        th = metrics.height() + 4
+        tx = int(x - tw / 2)
+        ty = int(y)
+        painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 200))
+        painter.setPen(QColor(255, 120, 120) if active else QColor(170, 210, 255))
+        painter.drawText(tx + 5, ty + metrics.ascent() + 2, text)
+
+    def _draw_fleet_vehicles(self, painter: QPainter, z: int, fx: float, fy: float, w: int, h: int) -> None:
+        for item in self._fleet_items:
+            if item["active"] or math.isnan(item["lat"]):
+                continue
+            c = self._project(item["lat"], item["lon"], z, fx, fy, w, h)
+            painter.save()
+            try:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.translate(c)
+                painter.rotate(item["heading_deg"])
+                arrow = QPainterPath()
+                arrow.moveTo(0.0, -20.0)
+                arrow.lineTo(-9.0, 11.0)
+                arrow.quadTo(0.0, 4.0, 9.0, 11.0)
+                arrow.closeSubpath()
+                fill = QColor(60, 140, 255) if item["link_ok"] else QColor(140, 140, 140)
+                painter.setBrush(fill)
+                painter.setPen(QPen(QColor(255, 255, 255), 2.0))
+                painter.drawPath(arrow)
+            finally:
+                painter.restore()
+            self._draw_fleet_label(painter, c.x(), c.y() + 16, item["label"], active=False)
 
     def set_vehicle_filtered(self, lat: float, lon: float, *, append_track: bool = True) -> None:
         lat_f, lon_f = float(lat), float(lon)
@@ -1509,6 +1576,10 @@ class NativeTileMapView(QWidget):
                 painter.setPen(QColor(255, 200, 240))
                 painter.drawText(tx + 5, ty + metrics.ascent() + 3, label)
 
+        # The other drones of a fleet, under the active drone's arrow.
+        if self._fleet_items:
+            self._draw_fleet_vehicles(painter, z, fx, fy, w, h)
+
         # Vehicle — navigation-style arrow (matches compass HUD: sharp tip, concave base,
         # thick white outline, red fill, center dot). Heading=0 points toward -Y.
         if self._vehicle_lat is not None and self._vehicle_lon is not None:
@@ -1555,6 +1626,9 @@ class NativeTileMapView(QWidget):
             painter.drawEllipse(QPointF(0.0, 1.0 * vb), dot_r, dot_r)
 
             painter.resetTransform()
+            active = next((i for i in self._fleet_items if i["active"]), None)
+            if active is not None:
+                self._draw_fleet_label(painter, c.x(), c.y() + 18.0 * vb, active["label"], active=True)
 
         self._draw_inspected_point(painter, z, fx, fy, w, h)
 

@@ -108,6 +108,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
 
         self._settings = QSettings("VGCS", "VGCS")
         self._thread: MavlinkThread | None = None
+        # Several drones (M15): every drone's link, with self._thread the one on screen.
+        self._init_fleet()
         self._camera_control_backend: object | None = None
         self._timeout_s = float(self._settings.value("watchdog_timeout_s", 2.0))
         self._armed_since: float | None = None

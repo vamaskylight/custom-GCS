@@ -489,8 +489,12 @@ class MainWindowTelemetryMixin:
             self._map_widget.set_link_connected(True)
             # Requested 2026-09-01: a readiness popup on connect. Fired here, on
             # the first heartbeat, rather than at port-open — an open serial port
-            # with no vehicle behind it has nothing to report.
-            self._show_preflight_dialog()
+            # with no vehicle behind it has nothing to report. Not after a switch
+            # to another drone of the fleet: that is not a new connection.
+            if getattr(self, "_suppress_preflight_popup", False):
+                self._suppress_preflight_popup = False
+            else:
+                self._show_preflight_dialog()
             # The settings the mission checks compare against. Answered in the
             # background, so the telemetry keeps flowing meanwhile.
             read_params = getattr(self, "_read_vehicle_params_on_connect", None)

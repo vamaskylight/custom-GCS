@@ -93,6 +93,20 @@ class VehicleTelemetryMixin:
         except Exception:
             return None
 
+    def set_fleet_vehicles(self, items: list) -> None:
+        """The other drones of a fleet on the 2D map (M15).
+
+        See NativeTileMapView.set_fleet_vehicles. The 3D view does not show
+        them yet.
+        """
+        nm = getattr(self, "_native_map", None)
+        if nm is None:
+            return
+        try:
+            nm.set_fleet_vehicles(items)
+        except Exception:
+            pass
+
     def set_vehicle_position(
         self,
         lat: float,

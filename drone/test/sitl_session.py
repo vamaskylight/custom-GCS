@@ -25,7 +25,7 @@ GPS_OFF = {"4.6": ("SIM_GPS_DISABLE", 1), "4.7": ("SIM_GPS1_ENABLE", 0)}
 
 
 def wsl(cmd: str, timeout: float = 60.0) -> str:
-    out = subprocess.run(["wsl.exe", "-d", DISTRO, "--", "bash", "-lc", cmd],
+    out = subprocess.run(["wsl.exe", "-d", DISTRO, "--exec", "bash", "-lc", cmd],
                          capture_output=True, text=True, timeout=timeout, errors="replace")
     return (out.stdout or "") + (out.stderr or "")
 
@@ -41,11 +41,19 @@ class Sitl:
 
     def __init__(self, version: str, scripts: dict[str, pathlib.Path], params: dict[str, float],
                  script_params: dict[str, float] | None = None, script_ready: str = "",
-                 speedup: int = 10, home: str = "20.4347,72.8696,30,0") -> None:
+                 speedup: int = 10, home: str = "20.4347,72.8696,30,0", instance: int = 0,
+                 sysid: int = 0) -> None:
         """params go into the start-up file. script_params are parameters that a script
-        creates, so they are set after the script has said `script_ready`."""
+        creates, so they are set after the script has said `script_ready`.
+
+        instance: several simulators at once (a fleet). Instance N listens on
+        TCP 5760 + 10 N (and 5762 + 10 N for a ground station). Start instance 0
+        first: it clears out any simulator still running, and closing it stops
+        them all."""
         self.version = version
         self.speedup = speedup
+        self.instance = int(instance)
+        self.port = 5760 + 10 * self.instance
         self.texts: list[tuple[float, str]] = []   # (simulated seconds, text)
         self.named: dict[str, float] = {}          # last NAMED_VALUE_FLOAT of each name
         self.named_at: dict[str, float] = {}       # and the simulated second it arrived
@@ -61,9 +69,9 @@ class Sitl:
         self.motors: list[int] = []                # PWM of motors 1 to 4
         self.wind_est = None
         self.ekf_flags = 0
-        run = f"{SITL_HOME}/run-{version}"
-        lines = ["(pkill -x arducopter 2>/dev/null; sleep 0.5; true)",
-                 f"rm -rf {run} && mkdir -p {run}/scripts"]
+        run = f"{SITL_HOME}/run-{version}" + (f"-i{self.instance}" if self.instance else "")
+        lines = [] if self.instance else ["(pkill -x arducopter 2>/dev/null; sleep 0.5; true)"]
+        lines.append(f"rm -rf {run} && mkdir -p {run}/scripts")
         for name, path in scripts.items():
             lines.append(f"cp '{wsl_path(path)}' {run}/scripts/{name}")
         extra = "\\n".join(f"{k} {v}" for k, v in params.items())
@@ -71,14 +79,21 @@ class Sitl:
         shown = wsl(" && ".join(lines)).strip()
         if shown:
             print(shown)
-        cmd = (f"cd {run} && {SITL_HOME}/{version}/arducopter --model quad --speedup {speedup} -w "
-               f"--defaults ../{version}/copter.parm,extra.parm --home {home} > sitl.log 2>&1; echo exit=$? >> sitl.log")
+        # The simulator's process id goes to arducopter.pid, so one instance of
+        # a fleet can be frozen (a radio silence) or stopped on its own.
+        inst = f" -I {self.instance}" if self.instance else ""
+        # The system id: SYSID_THISMAV on 4.6, MAV_SYSID on 4.7. --sysid sets either.
+        if sysid:
+            inst += f" --sysid {int(sysid)}"
+        cmd = (f"cd {run} && ({SITL_HOME}/{version}/arducopter --model quad --speedup {speedup} -w{inst} "
+               f"--defaults ../{version}/copter.parm,extra.parm --home {home} > sitl.log 2>&1 & "
+               f"echo $! > arducopter.pid; wait $!; echo exit=$? >> sitl.log)")
         # stdin stays open on purpose: wsl.exe ends the Linux side when its input closes.
-        self.proc = subprocess.Popen(["wsl.exe", "-d", DISTRO, "--", "bash", "-lc", cmd],
+        self.proc = subprocess.Popen(["wsl.exe", "-d", DISTRO, "--exec", "bash", "-lc", cmd],
                                      stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.run_dir = run
         time.sleep(2.0)
-        self.mav = mavutil.mavlink_connection("tcp:127.0.0.1:5760", source_system=255, retries=20)
+        self.mav = mavutil.mavlink_connection(f"tcp:127.0.0.1:{self.port}", source_system=255, retries=20)
         hb = self.mav.wait_heartbeat(timeout=60)
         if hb is None:
             raise RuntimeError("no heartbeat from the simulator")
@@ -258,7 +273,18 @@ class Sitl:
             self.proc.terminate()
         except Exception:
             pass
-        wsl("pkill -x arducopter 2>/dev/null; true")
+        if self.instance:
+            wsl(f"kill -CONT $(cat {self.run_dir}/arducopter.pid) 2>/dev/null; "
+                f"kill $(cat {self.run_dir}/arducopter.pid) 2>/dev/null; true")
+        else:
+            wsl("pkill -x arducopter 2>/dev/null; true")
+
+    def freeze(self) -> None:
+        """Stop this simulator where it is: its link goes silent, like a radio out of range."""
+        wsl(f"kill -STOP $(cat {self.run_dir}/arducopter.pid)")
+
+    def unfreeze(self) -> None:
+        wsl(f"kill -CONT $(cat {self.run_dir}/arducopter.pid)")
 
     def log_tail(self, lines: int = 15) -> str:
         return wsl(f"tail -n {lines} {self.run_dir}/sitl.log")

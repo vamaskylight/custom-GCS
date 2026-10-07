@@ -103,23 +103,22 @@ class MainWindowLinkMixin:
         self._timeout_s = float(self._timeout_spin.value())
         self._settings.setValue("watchdog_timeout_s", self._timeout_s)
         self._settings.setValue("last_connection_string", cs)
-        self._thread = MavlinkThread(cs, timeout_s=self._timeout_s)
-        self._thread.log_line.connect(self._append_log)
-        self._thread.error.connect(self._on_link_error)
-        self._thread.link_up.connect(self._on_link_up)
-        self._thread.link_down.connect(self._on_link_down)
-        self._thread.heartbeat.connect(self._on_heartbeat)
-        self._thread.telemetry.connect(self._on_telemetry)
-        self._thread.link_timeout.connect(self._on_link_timeout)
-        self._thread.mission_uploaded.connect(self._on_mission_uploaded)
-        self._thread.mission_downloaded.connect(self._on_mission_downloaded)
-        self._thread.mission_progress.connect(self._on_mission_progress)
-        self._thread.mode_changed.connect(self._on_mode_change_result)
-        self._thread.action_result.connect(self._on_action_result)
-        self._thread.geofence_result.connect(self._on_geofence_result)
-        self._thread.params_snapshot.connect(self._on_params_snapshot)
-        self._thread.param_set_result.connect(self._on_param_set_result)
-        self._thread.finished.connect(self._on_thread_finished)
+        # The drone on screen is one drone of the fleet (vgcs/link/fleet.py,
+        # M15). More drones are added in the Fleet panel.
+        try:
+            vehicle = self._fleet.add(
+                cs,
+                name=getattr(self, "_pending_fleet_name", ""),
+                timeout_s=self._timeout_s,
+                start=False,
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "VGCS", f"Not connected: {e}")
+            return
+        self._fleet.set_active(vehicle.vid)
+        self._thread = vehicle.thread
+        self._wire_link_signals(self._thread)
+        self._suppress_preflight_popup = False
         # Keep the click handler light: Skydroid / map camera wiring can touch sockets and QSettings.
         def _deferred_camera_after_connect() -> None:
             try:
@@ -179,10 +178,12 @@ class MainWindowLinkMixin:
         if hasattr(self, "_hdr_disconnect_btn"):
             self._hdr_disconnect_btn.setEnabled(False)
         self._stop_camera_control_backend()
-        if self._thread is not None:
-            self._thread.stop()
-            if self._thread.isRunning():
-                self._thread.wait(8000)
+        # A local reference: the thread's "finished" handler clears self._thread.
+        thread = self._thread
+        if thread is not None:
+            thread.stop()
+            if thread.isRunning():
+                thread.wait(8000)
         try:
             self._map_widget.set_camera_control(NoopCameraControl())
         except Exception:

@@ -202,6 +202,11 @@ class MainWindowLifecycleMixin:
         self._append_log("Dev reload applied (Ctrl+Shift+R).")
 
     def _on_thread_finished(self) -> None:
+        # Only the drone on screen: with a fleet (M15) the window may already
+        # show another drone when this queued call arrives.
+        sender = self.sender()
+        if sender is not None and self._thread is not None and sender is not self._thread:
+            return
         self._mission_upload_pending = False
         self._thread = None
 
@@ -265,6 +270,10 @@ class MainWindowLifecycleMixin:
         except Exception:
             pass
         self._on_disconnect()
+        # The other drones of a fleet have link threads of their own.
+        stop_fleet = getattr(self, "_stop_fleet", None)
+        if stop_fleet is not None:
+            stop_fleet()
         self._settings.setValue("window_geometry", self.saveGeometry())
         super().closeEvent(event)
         # main.py turns off quit-on-last-window-closed (06a4a57: viewing a report

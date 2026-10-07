@@ -30,25 +30,27 @@
 
 2. [Features (today)](#features-today)
 
-3. [Requirements](#requirements)
+3. [Several drones (fleet)](#several-drones-fleet)
 
-4. [Clone and first-time setup](#clone-and-first-time-setup)
+4. [Requirements](#requirements)
 
-5. [Setup — Windows](#setup--windows)
+5. [Clone and first-time setup](#clone-and-first-time-setup)
 
-6. [Setup — Linux](#setup--linux)
+6. [Setup — Windows](#setup--windows)
 
-7. [Run the application](#run-the-application)
+7. [Setup — Linux](#setup--linux)
 
-8. [Connect to ArduPilot SITL](#connect-to-arduopilot-sitl)
+8. [Run the application](#run-the-application)
 
-9. [Project layout](#project-layout)
+9. [Connect to ArduPilot SITL](#connect-to-arduopilot-sitl)
 
-10. [Architecture note](#architecture-note)
+10. [Project layout](#project-layout)
 
-11. [Troubleshooting](#troubleshooting)
+11. [Architecture note](#architecture-note)
 
-12. [For contributors](#for-contributors)
+12. [Troubleshooting](#troubleshooting)
+
+13. [For contributors](#for-contributors)
 
 
 
@@ -114,6 +116,35 @@ At **M2**, VGCS provides a **map-first GCS dashboard** with live telemetry overl
 ---
 
 
+
+## Several drones (fleet)
+
+VGCS can connect several drones at once (milestone M15, client requirement 14).
+
+- Each drone needs its own connection, for example its own UDP port (`udpin:0.0.0.0:14551`, `udpin:0.0.0.0:14552`) or its own address. Two drones sharing one radio link (one port, two system ids) are not supported yet.
+- Connect the first drone with **Connect**. Add the others in the logo menu: **Fleet (several drones)**, then **Connect drone**.
+- The window shows one drone in full: the drone on screen. Its buttons, the plan upload and the settings act on that drone only.
+- **Show and command it** in the Fleet panel puts another drone on screen. The other links stay open, so switching never drops a drone.
+- The map shows the other drones as smaller blue arrows with their name and height (grey while their link is lost). The window title names the drone on screen and the size of the fleet.
+- The Fleet panel lists every drone: link, mode, armed, height, battery, GPS, mission progress and last message.
+- A warning from a drone that is not on screen (link lost, battery, fence, EKF) shows in the message line and the log, with the drone's name.
+
+Which drone gets a command:
+
+| Command | Goes to |
+|---------|---------|
+| Plan and upload a mission | The drone on screen only |
+| Take-off, mode change, land, arm, fence, settings | The drone on screen only |
+| Hold, Return home, Land in the Fleet panel | The drone selected in the panel |
+| Hold all, Return home all, Land all | Every connected drone |
+
+VGCS never sends one mission to several drones: the same route would fly them into each other.
+
+Tested with three ArduCopter simulators at once, on 4.6.2 and 4.7.0 (`system_test/vgcs_fleet_test.py`).
+
+Not yet: the 3D view shows only the drone on screen, and the video and camera follow the camera settings, not the drone on screen.
+
+---
 
 ## Requirements
 

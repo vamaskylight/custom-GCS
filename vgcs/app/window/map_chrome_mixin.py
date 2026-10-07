@@ -176,6 +176,9 @@ class MainWindowMapChromeMixin:
         action_vehicle = menu.addAction("Vehicle Configuration")
         action_vehicle.setToolTip("Vehicle setup tools, including sensor calibration and quick controls.")
         action_vehicle.setIcon(self._menu_icon("flight_mode.svg"))
+        action_fleet = menu.addAction("Fleet (several drones)")
+        action_fleet.setToolTip("Connect more drones, see them all, and choose the one on screen.")
+        action_fleet.setIcon(self._menu_icon("flight_mode.svg"))
         action_settings = menu.addAction("Application Settings")
         action_settings.setToolTip("GCS-specific preferences.")
         action_settings.setIcon(self._menu_icon("app_settings.svg"))
@@ -225,6 +228,9 @@ class MainWindowMapChromeMixin:
         elif picked is action_vehicle:
             self._show_flight_controls_dialog()
             self._append_log("Menu: Vehicle Configuration")
+        elif picked is action_fleet:
+            self._append_log("Menu: Fleet")
+            self._show_fleet_dialog()
         elif picked is action_settings:
             self._append_log("Menu: Application Settings")
             self._show_application_settings_dialog()

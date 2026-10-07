@@ -40,6 +40,9 @@ py system_test/vgcs_window_test.py                    # the whole window, 4.7.0,
 py system_test/vgcs_window_test.py 4.6.2 --minutes 1
 py system_test/vgcs_window_test.py --speedup 10       # ten times the message rate: a stress test
 py system_test/vgcs_window_test.py --report window.md
+
+py system_test/vgcs_fleet_test.py                     # three drones at once, 4.7.0, about 1 minute
+py system_test/vgcs_fleet_test.py 4.6.2 --report fleet.md
 ```
 
 Only one simulator can run at a time (it always uses TCP port 5760).
@@ -77,6 +80,20 @@ Nothing is fetched from the internet.
 The map draws from an offline tile folder the test makes for itself (coloured squares around the start view and the simulator's home), and a check fails if the map asks for any internet tile.
 Do not remove that check: before 2026-10-07 VGCS's no-network switch did not cover the map, and a test run fetched satellite tiles and wrote them into `~/.vgcs/tile-cache`.
 
+## `vgcs_fleet_test.py`: several drones (M15)
+
+Three simulators run side by side (instances 0, 1 and 2 of `drone/test/sitl_session.py`, system ids 1, 2 and 3, homes 40 m apart).
+The real window connects drone 1 with the Connect button, and drones 2 and 3 the way the Fleet panel adds them.
+
+It checks the acceptance test of client requirement 14:
+
+- all three links are up, each reads its own drone, and the map and the Fleet panel show all three,
+- putting another drone on screen does not drop the others (both stay heard),
+- the window's take-off goes to the drone on screen only, and an uploaded mission lands on the drone on screen only,
+- return home to one drone, land to all,
+- one drone frozen (radio silence): only its link is lost, and the window names it,
+- disconnecting one drone leaves the others, and closing the window stops every link.
+
 ## Traps (each cost time once)
 
 - ArduCopter accepts any mode while it is disarmed: it checks the mode when it arms.
@@ -91,3 +108,9 @@ Do not remove that check: before 2026-10-07 VGCS's no-network switch did not cov
   Wait for VGCS results with `Flight.wait_real`, not `Flight.wait`.
 - Freezing the simulator (`pkill -STOP -x arducopter`) is a radio silence: the connection stays open and nothing arrives.
   Killing it is a closed TCP connection, which is a different case (see the test report).
+- `wsl.exe -- bash -lc "..."` lets the outer shell expand every `$` first (`$!` and `$x` came out empty).
+  `sitl_session.py` uses `wsl.exe --exec`, which passes the command on untouched.
+- ArduCopter 4.7 renamed SYSID_THISMAV to MAV_SYSID. The simulator's `--sysid` option sets either.
+- An empty mission counts 0 items on 4.6.2 and 1 (home) on 4.7.0.
+- Arming refuses "Throttle (RC3) is not neutral" while an RC override holds the throttle in the middle.
+  Set the throttle to the middle after the take-off, not before.
