@@ -463,6 +463,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._map_widget.mission_start_requested.connect(self._on_map_mission_start_requested)
         self._map_widget.mission_pause_requested.connect(self._on_map_mission_pause_requested)
         self._map_widget.mission_resume_requested.connect(self._on_map_mission_resume_requested)
+        self._map_widget.mission_jump_requested.connect(self._on_map_mission_jump_requested)
 
         app = QGuiApplication.instance()
         if app is not None:
@@ -494,6 +495,13 @@ class MainWindow(MainWindowMixins, QMainWindow):
         )
         # Skydroid/SIYI gimbal polling must run before MAVLink connect (M7 Target reports).
         QTimer.singleShot(800, self._set_runtime_camera_control)
+        # The map says "ready" while it is being built, before this window is
+        # connected to that signal, so the handler never ran: the saved Plan
+        # Flight settings were never put back. The panel showed its built-in
+        # values while the launch height and the pattern sizes were read from
+        # the saved ones (found 2026-10-07).
+        if bool(getattr(self._map_widget, "_web_ready", False)):
+            self._on_map_page_ready()
 
 
 

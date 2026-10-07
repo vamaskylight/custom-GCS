@@ -323,3 +323,103 @@ class ModeChange:
             self.resent = True
             return True
         return False
+
+
+# A jump is answered by MISSION_CURRENT, which the drone sends several times a
+# second. It is sent again when that still shows another item after this long.
+JUMP_RESEND_S = 1.5
+JUMP_TRIES = 3
+
+# A command is answered with COMMAND_ACK at once.
+COMMAND_RESEND_S = 1.5
+COMMAND_TRIES = 3
+
+_COMMAND_RESULTS = {1: "temporarily rejected", 2: "denied", 3: "not supported", 4: "failed", 6: "cancelled"}
+
+
+class MissionJump:
+    """A jump to another mission item, done once the drone reports that item.
+
+    MISSION_SET_CURRENT has no answer of its own. What shows that the drone
+    took it is MISSION_CURRENT. "Jumped to WP 4" used to be reported the moment
+    the message was sent.
+
+    on_done(ok, detail) runs exactly once.
+    """
+
+    def __init__(self, seq: int, now: float, on_done: Callable[[bool, str], None],
+                 resend_s: float = JUMP_RESEND_S, tries: int = JUMP_TRIES) -> None:
+        self.seq = int(seq)
+        self.on_done = on_done
+        self.done = False
+        self.resend_s = float(resend_s)
+        self.tries = max(1, int(tries))
+        self._sent = 1
+        self._last_send = float(now)
+
+    def _finish(self, ok: bool, detail: str) -> None:
+        if self.done:
+            return
+        self.done = True
+        self.on_done(ok, detail)
+
+    def heard_current(self, seq: int) -> None:
+        """A MISSION_CURRENT from the drone."""
+        if int(seq) == self.seq:
+            self._finish(True, "")
+
+    def tick(self, now: float) -> bool:
+        """True when the jump should be sent once more."""
+        if self.done or now - self._last_send < self.resend_s:
+            return False
+        if self._sent >= self.tries:
+            self._finish(False, f"the drone did not take it as its next item ({self._sent} tries)")
+            return False
+        self._sent += 1
+        self._last_send = float(now)
+        return True
+
+
+class CommandAck:
+    """A command sent as COMMAND_LONG, done once the drone acknowledges it.
+
+    on_done(ok, detail) runs exactly once: accepted, refused, or no answer.
+    """
+
+    def __init__(self, command: int, now: float, on_done: Callable[[bool, str], None],
+                 resend_s: float = COMMAND_RESEND_S, tries: int = COMMAND_TRIES) -> None:
+        self.command = int(command)
+        self.on_done = on_done
+        self.done = False
+        self.resend_s = float(resend_s)
+        self.tries = max(1, int(tries))
+        self._sent = 1
+        self._last_send = float(now)
+
+    def _finish(self, ok: bool, detail: str) -> None:
+        if self.done:
+            return
+        self.done = True
+        self.on_done(ok, detail)
+
+    def heard_ack(self, command: int, result: int) -> None:
+        """A COMMAND_ACK from the drone."""
+        if self.done or int(command) != self.command:
+            return
+        result = int(result)
+        if result == 0:
+            self._finish(True, "")
+        elif result != 5:                 # 5: in progress, the real answer follows
+            words = _COMMAND_RESULTS.get(result, "refused")
+            self._finish(False, f"the drone refused it: {words} (result {result})")
+
+    def tick(self, now: float) -> bool:
+        """True when the command should be sent once more."""
+        if self.done or now - self._last_send < self.resend_s:
+            return False
+        if self._sent >= self.tries:
+            self._finish(False, f"no answer from the drone ({self._sent} tries)")
+            return False
+        self._sent += 1
+        self._last_send = float(now)
+        return True

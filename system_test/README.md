@@ -32,11 +32,11 @@ The same set-up as the wind failsafe tests, see [drone/README.md](../drone/READM
 From the repo root:
 
 ```powershell
-py system_test/vgcs_sitl_test.py                      # 9 cases on 4.6.2 and 4.7.0, about 5 minutes
+py system_test/vgcs_sitl_test.py                      # 10 cases on 4.6.2 and 4.7.0, about 5 minutes
 py system_test/vgcs_sitl_test.py 4.7.0 -k mission     # one version, only cases with "mission" in the name
 py system_test/vgcs_sitl_test.py --report results.md  # also write the results as Markdown
 
-py system_test/vgcs_window_test.py                    # the whole window, 4.7.0, 3 minute hover, about 6 minutes
+py system_test/vgcs_window_test.py                    # the whole window, 4.7.0, 3 minute hover and a mission planned and flown, about 8 minutes
 py system_test/vgcs_window_test.py 4.6.2 --minutes 1
 py system_test/vgcs_window_test.py --speedup 10       # ten times the message rate: a stress test
 py system_test/vgcs_window_test.py --report window.md

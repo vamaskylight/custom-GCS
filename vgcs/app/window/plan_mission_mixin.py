@@ -66,13 +66,13 @@ from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.app.vehicle_messages import EVENT_NOTICE_HOLD_S, NOTICE_EVENT
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import (
-    DEFAULT_MISSION_END_ACTION,
     Waypoint,
     normalize_end_action,
     parse_downloaded_mission,
     validate_waypoints,
 )
 from vgcs.map import MapWidget
+from vgcs.map.plan_flight_panel import DEFAULT_NEW_WP_ALT_M, DEFAULT_NEW_WP_SPEED_MPS
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
@@ -319,17 +319,8 @@ class MainWindowPlanMissionMixin:
             self._map_widget.center_on(float(wp.lat), float(wp.lon))
             return
         if chosen is act_fly:
-            if QMessageBox.question(
-                self,
-                "Jump mission",
-                f"Send the vehicle to WP {row + 1} now?\n"
-                "This skips any waypoints between the current one and this.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            ) != QMessageBox.StandardButton.Yes:
-                return
-            self._thread.queue_mission_set_current_wp(row)
-            self._append_log(f"Mission jump requested: WP {row + 1}")
+            # The same checks and question as "Fly to WP" in Plan Flight.
+            self._on_map_mission_jump_requested(row)
             return
         if chosen is act_dup:
             wp = model[row]
@@ -368,9 +359,39 @@ class MainWindowPlanMissionMixin:
         self._append_log(f"Mission upload queued: {len(payload)} WPs (end={end_action})")
         self._post_gcs_notice(f"Uploading mission ({len(payload)} WPs)…")
 
+    def _confirm_replace_plan(self, with_what: str) -> bool:
+        """Ask before something takes the place of the waypoints on the map.
+
+        Until 2026-10-07 only Clear and "Empty Plan" asked. A click on a
+        template, on Pattern or on Download replaced a plan made by hand, and
+        there is no undo.
+        """
+        n = len(getattr(self._map_widget, "_waypoints_model", []) or [])
+        if n <= 0:
+            return True
+        count = "1 waypoint" if n == 1 else f"{n} waypoints"
+        answer = QMessageBox.question(
+            self,
+            "Plan Flight",
+            f"Replace the {count} on the map with {with_what}?\n\n"
+            "The plan on the map is lost unless you saved it.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _confirm_replace_plan_with_pattern(self, name: str) -> bool:
+        # Without the drone's position there is no pattern, and the caller says
+        # so. A question first would ask about something that will not happen.
+        if self._pattern_anchor_lat_lon() is None:
+            return True
+        return self._confirm_replace_plan(name)
+
     def _on_mission_download_requested(self) -> None:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before mission download.")
+            return
+        if not self._confirm_replace_plan("the mission from the drone"):
             return
         self._thread.queue_mission_download()
         self._append_log("Mission download queued")
@@ -467,7 +488,9 @@ class MainWindowPlanMissionMixin:
             and self._heartbeat_seen
         )
         n = len(getattr(self._map_widget, "_waypoints_model", []) or [])
-        self._map_widget.refresh_plan_flight_chrome(link_ok=link_ok, waypoint_count=n)
+        self._map_widget.refresh_plan_flight_chrome(
+            link_ok=link_ok, waypoint_count=n, armed=bool(getattr(self, "_hb_armed", False))
+        )
         if self._plan_flight_layer_wanted:
             self._map_widget.set_plan_flight_visible(True)
 
@@ -510,7 +533,22 @@ class MainWindowPlanMissionMixin:
     def _restore_plan_mission_panel_to_map(self) -> None:
         s = self._settings
         initial_wp_alt_m = float(
-            s.value("plan_initial_wp_alt_m", s.value("plan_initial_wp_alt_ft", 164.0)) or 164.0
+            s.value("plan_initial_wp_alt_m", s.value("plan_initial_wp_alt_ft", DEFAULT_NEW_WP_ALT_M))
+            or DEFAULT_NEW_WP_ALT_M
+        )
+        if not _settings_truthy(s.value("plan_new_wp_defaults_checked", False)):
+            # Once only. A saved 164.0 is the old default, not a choice: 164
+            # feet (50 m) from when this panel was in feet, read as metres
+            # since, and saved with any edit of the panel. A plan nobody edited
+            # flew at 20 m, so that is what it becomes. A 164 typed after this
+            # is a choice, and stays.
+            if abs(initial_wp_alt_m - 164.0) < 1e-6:
+                initial_wp_alt_m = DEFAULT_NEW_WP_ALT_M
+                s.setValue("plan_initial_wp_alt_m", initial_wp_alt_m)
+                s.setValue("plan_initial_wp_alt_ft", initial_wp_alt_m)
+            s.setValue("plan_new_wp_defaults_checked", True)
+        initial_wp_speed_mps = float(
+            s.value("plan_initial_wp_speed_mps", DEFAULT_NEW_WP_SPEED_MPS) or DEFAULT_NEW_WP_SPEED_MPS
         )
         hover_mps = float(
             s.value("plan_hover_speed_mps", s.value("plan_hover_speed_mph", 11.18)) or 11.18
@@ -519,6 +557,7 @@ class MainWindowPlanMissionMixin:
         state = {
             "altRef": str(s.value("plan_alt_ref", "rel") or "rel"),
             "initialWpAltM": initial_wp_alt_m,
+            "initialWpSpeedMps": initial_wp_speed_mps,
             "hoverMps": hover_mps,
             "launchAltM": launch_alt_m,
             "launchLat": str(s.value("plan_launch_lat_str", "") or ""),
@@ -527,12 +566,15 @@ class MainWindowPlanMissionMixin:
             "patternRowSpacingM": float(s.value("plan_pattern_row_spacing_m", 20.0) or 20.0),
             "patternPassWidthM": float(s.value("plan_pattern_pass_width_m", 80.0) or 80.0),
             "patternPassDepthM": float(s.value("plan_pattern_pass_depth_m", 60.0) or 60.0),
-            "endAction": normalize_end_action(
-                s.value("plan_mission_end_action", DEFAULT_MISSION_END_ACTION)
-            ),
+            # What happens after the last waypoint belongs to the plan: it is
+            # saved in the plan file and read back from the drone. It is never
+            # brought in from the settings, where a "land" or a "hold" left on
+            # another day would end today's mission somewhere unexpected. So a
+            # new session starts with return to launch, and putting the saved
+            # settings back (a template does) keeps what is on screen.
+            "endAction": self._map_widget.get_mission_end_action(),
         }
         self._map_widget.apply_plan_mission_panel_state(state)
-        self._map_widget.set_mission_end_action(str(state["endAction"]))
         self._apply_plan_mission_panel_to_model(state)
 
     def _ensure_plan_launch_from_vehicle_if_empty(self) -> None:
@@ -554,9 +596,16 @@ class MainWindowPlanMissionMixin:
             return
         s = self._settings
         s.setValue("plan_alt_ref", str(data.get("altRef", "rel") or "rel"))
-        initial_wp_alt_m = float(data.get("initialWpAltM", data.get("initialWpAltFt", 164.0)) or 164.0)
+        initial_wp_alt_m = float(
+            data.get("initialWpAltM", data.get("initialWpAltFt", DEFAULT_NEW_WP_ALT_M)) or DEFAULT_NEW_WP_ALT_M
+        )
         hover_mps = float(data.get("hoverMps", data.get("hoverMph", 11.18)) or 11.18)
         launch_alt_m = float(data.get("launchAltM", data.get("launchAltFt", 0.0)) or 0.0)
+        if "initialWpSpeedMps" in data:
+            s.setValue(
+                "plan_initial_wp_speed_mps",
+                max(0.1, float(data.get("initialWpSpeedMps") or DEFAULT_NEW_WP_SPEED_MPS)),
+            )
         s.setValue("plan_initial_wp_alt_m", initial_wp_alt_m)
         s.setValue("plan_hover_speed_mps", hover_mps)
         s.setValue("plan_launch_alt_m", launch_alt_m)
@@ -597,7 +646,9 @@ class MainWindowPlanMissionMixin:
 
     def _default_wp_alt_m_for_plan_state(self, state: dict[str, object]) -> float:
         ref = str(state.get("altRef", "rel") or "rel").strip().lower()
-        meters = float(state.get("initialWpAltM", state.get("initialWpAltFt", 164.0)) or 164.0)
+        meters = float(
+            state.get("initialWpAltM", state.get("initialWpAltFt", DEFAULT_NEW_WP_ALT_M)) or DEFAULT_NEW_WP_ALT_M
+        )
         target_m = meters
         home_amsl = self._home_amsl_m
         if ref == "amsl" and home_amsl is not None:
@@ -620,6 +671,10 @@ class MainWindowPlanMissionMixin:
 
     def _apply_plan_mission_panel_to_model(self, state: dict[str, object]) -> None:
         self._map_widget.set_default_waypoint_alt_m(self._default_wp_alt_m_for_plan_state(state))
+        if "initialWpSpeedMps" in state:
+            self._map_widget.set_default_waypoint_speed_mps(
+                float(state.get("initialWpSpeedMps") or DEFAULT_NEW_WP_SPEED_MPS)
+            )
         speed_mps = float(state.get("hoverMps", state.get("hoverMph", 11.18)) or 11.18)
         self._plan_hover_speed_mps = max(0.5, speed_mps)
         self._maybe_refresh_map_web_overlays()
@@ -764,6 +819,7 @@ class MainWindowPlanMissionMixin:
         rows = max(2, int(round(height_m / line_spacing_m)) + 1)
         waypoints: list[Waypoint] = []
         alt_m = float(self._map_widget.get_default_waypoint_alt_m())
+        spd = float(self._map_widget.get_default_waypoint_speed_mps())
         for row in range(rows):
             north = -half_h + row * line_spacing_m
             left = self._offset_lat_lon_m(lat0, lon0, -half_w, north)
@@ -773,7 +829,7 @@ class MainWindowPlanMissionMixin:
             else:
                 seq = (right, left)
             for lat, lon in seq:
-                waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt_m))
+                waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt_m, speed_mps=spd))
         return waypoints
 
     def _build_m2_corridor_pattern(self) -> list[Waypoint]:
@@ -788,6 +844,7 @@ class MainWindowPlanMissionMixin:
         half_span = (n_rows - 1) * line_spacing_m / 2.0
         waypoints: list[Waypoint] = []
         alt_m = float(self._map_widget.get_default_waypoint_alt_m())
+        spd = float(self._map_widget.get_default_waypoint_speed_mps())
         for row in range(n_rows):
             north = -half_span + row * line_spacing_m
             left = self._offset_lat_lon_m(lat0, lon0, -half_len, north)
@@ -797,7 +854,7 @@ class MainWindowPlanMissionMixin:
             else:
                 seq = (right, left)
             for lat, lon in seq:
-                waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt_m))
+                waypoints.append(Waypoint(lat=lat, lon=lon, alt_m=alt_m, speed_mps=spd))
         return waypoints
 
     def _build_m2_structure_pattern(self) -> list[Waypoint]:
@@ -814,8 +871,9 @@ class MainWindowPlanMissionMixin:
             self._offset_lat_lon_m(lat0, lon0, -hw, -hh),
         ]
         alt_m = float(self._map_widget.get_default_waypoint_alt_m())
-        waypoints = [Waypoint(lat=c[0], lon=c[1], alt_m=alt_m) for c in corners]
-        waypoints.append(Waypoint(lat=corners[0][0], lon=corners[0][1], alt_m=alt_m))
+        spd = float(self._map_widget.get_default_waypoint_speed_mps())
+        waypoints = [Waypoint(lat=c[0], lon=c[1], alt_m=alt_m, speed_mps=spd) for c in corners]
+        waypoints.append(Waypoint(lat=corners[0][0], lon=corners[0][1], alt_m=alt_m, speed_mps=spd))
         return waypoints
 
     def _on_plan_flight_action(self, action: str) -> None:
@@ -870,6 +928,8 @@ class MainWindowPlanMissionMixin:
                 self._map_widget.set_plan_sequence_template("")
             return
         if a == "template_survey":
+            if not self._confirm_replace_plan_with_pattern("a Survey pattern"):
+                return
             self._map_widget.set_plan_sequence_template("survey")
             self._append_log("Plan template: Survey")
             self._ensure_plan_launch_from_vehicle_if_empty()
@@ -888,6 +948,8 @@ class MainWindowPlanMissionMixin:
             self._append_log(f"Survey template: {len(wps)} waypoints (M2 grid)")
             return
         if a == "template_corridor":
+            if not self._confirm_replace_plan_with_pattern("a Corridor Scan pattern"):
+                return
             self._map_widget.set_plan_mission_start_stack(False)
             self._map_widget.set_plan_sequence_template("corridor")
             self._append_log("Plan template: Corridor scan")
@@ -905,6 +967,8 @@ class MainWindowPlanMissionMixin:
             self._append_log(f"Corridor template: {len(wps)} waypoints")
             return
         if a == "template_structure":
+            if not self._confirm_replace_plan_with_pattern("a Structure Scan pattern"):
+                return
             self._map_widget.set_plan_mission_start_stack(False)
             self._map_widget.set_plan_sequence_template("structure")
             self._append_log("Plan template: Structure scan (perimeter)")
@@ -952,6 +1016,8 @@ class MainWindowPlanMissionMixin:
             self._map_widget.start_roi_planning()
             return
         if tool == "pattern":
+            if not self._confirm_replace_plan_with_pattern("a grid pattern"):
+                return
             self._append_log("Plan tool: Pattern (M2 grid)")
             self._ensure_plan_launch_from_vehicle_if_empty()
             wps = self._build_m2_grid_pattern()

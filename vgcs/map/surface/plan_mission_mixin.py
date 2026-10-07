@@ -82,14 +82,38 @@ class PlanMissionMixin:
         self.plan_mission_panel_changed.emit(data)
 
     def _on_plan_panel_waypoints_changed(self, waypoints: object) -> None:
+        self._sync_plan_panel_rows()
+
+    def _sync_plan_panel_rows(self) -> None:
+        """The Plan Flight rows show the plan's own values.
+
+        The rows used to be told only how many waypoints there were, and filled
+        new ones with the panel's own defaults. So a waypoint stored at 20 m and
+        5 m/s showed as 164.0 m and 11.18 m/s, a plan opened from a file kept
+        the old rows, and the next edit pushed every displayed value into the
+        plan (found 2026-10-07; the client's "I set 12 m/s but VGCS says 5 m/s").
+        """
         panel = getattr(self, "_plan_flight_panel", None)
-        if panel is None:
-            return
-        try:
-            n = len(waypoints) if hasattr(waypoints, "__len__") else 0
-        except Exception:
-            n = 0
-        panel.set_waypoint_count(int(n))
+        if panel is not None:
+            panel.set_waypoint_meta(self.get_waypoint_meta())
+
+    def _flush_plan_panel_edits(self) -> None:
+        """Give the plan an edit that is still waiting for the panel's timer.
+
+        Called before the plan changes (a point added, moved or deleted, a
+        value set from elsewhere, or another plan put in its place), never
+        after: the rows are matched to waypoints by number, so after the change
+        they would be written onto the wrong waypoints, or onto another plan
+        altogether. A change that forgets this loses the waiting edit, which is
+        the smaller harm: that is why the refresh of the rows does not send it.
+        """
+        panel = getattr(self, "_plan_flight_panel", None)
+        flush = getattr(panel, "flush_pending_edits", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:
+                pass
 
     def _on_plan_panel_set_launch_to_map_center(self) -> None:
         nm = getattr(self, "_native_map", None)
@@ -111,7 +135,14 @@ class PlanMissionMixin:
         if visible:
             self._layout_plan_flight_panel()
             panel.set_rail_tool(self._plan_rail_tool_state or "File")
-            panel.set_waypoint_count(len(self._waypoints_model))
+            # The rows show the plan as it is now. Not while an edit is still
+            # waiting to go out: the window calls this on every heartbeat, and
+            # a refresh from the plan here took back a value typed a moment
+            # before (found by the simulator window test). The edit reaches
+            # the plan within a moment, and the next call refreshes.
+            has_pending = getattr(panel, "has_pending_edits", None)
+            if not (callable(has_pending) and has_pending()):
+                self._sync_plan_panel_rows()
             panel.show()
             panel.raise_()
             try:
@@ -179,10 +210,17 @@ class PlanMissionMixin:
         if panel is not None:
             panel.set_metrics(payload)
 
-    def refresh_plan_flight_chrome(self, *, link_ok: bool, waypoint_count: int) -> None:
+    def refresh_plan_flight_chrome(self, *, link_ok: bool, waypoint_count: int, armed: bool = False) -> None:
         panel = getattr(self, "_plan_flight_panel", None)
         if panel is not None:
-            panel.set_chrome_state(bool(link_ok), max(0, int(waypoint_count)))
+            panel.set_chrome_state(bool(link_ok), max(0, int(waypoint_count)), bool(armed))
+
+    def set_plan_mission_action_result(self, ok: bool, text: str) -> None:
+        """What the drone answered to a mission action, shown in Plan Flight."""
+        panel = getattr(self, "_plan_flight_panel", None)
+        show = getattr(panel, "set_mission_action_result", None)
+        if callable(show):
+            show(bool(ok), str(text or ""))
 
     def plan_fence_settings(self) -> dict[str, float] | None:
         """The circle fence set in Plan Flight's Fence tab."""
@@ -284,6 +322,12 @@ class PlanMissionMixin:
     def set_default_waypoint_alt_m(self, alt_m: float) -> None:
         self._default_alt.setValue(max(1.0, float(alt_m)))
 
+    def get_default_waypoint_speed_mps(self) -> float:
+        return float(self._default_speed.value())
+
+    def set_default_waypoint_speed_mps(self, speed_mps: float) -> None:
+        self._default_speed.setValue(max(0.1, float(speed_mps)))
+
     def request_mission_upload_from_map(self) -> None:
         self._request_upload()
 
@@ -357,6 +401,7 @@ class PlanMissionMixin:
         self._run_js("JSON.stringify(getWaypoints());", callback=self._on_waypoints_json)
 
     def _on_waypoints_json(self, payload: str | None) -> None:
+        self._flush_plan_panel_edits()
         if not payload:
             self.set_mission_waypoint_count(0)
             self._waypoints_model = []
@@ -594,10 +639,17 @@ class PlanMissionMixin:
         stored_end = load_mission_end_action(path)
         if stored_end:
             self.set_mission_end_action(stored_end)
+        self._flush_plan_panel_edits()
         rows = [[wp.lat, wp.lon] for wp in waypoints]
         self._waypoints_model = list(waypoints)
         js = f"setWaypoints({json.dumps(rows)});"
         self._run_js(js, callback=lambda _: self._after_waypoints_mutated())
+        # Said outright: a file with as many points as the plan before it
+        # changes no count, so nothing downstream heard about the new plan, and
+        # the rows, the table and the plan bar kept the old one's values.
+        self.set_mission_waypoint_count(len(waypoints))
+        self._rebuild_wp_selector()
+        self.waypoints_changed.emit(list(waypoints))
         s = QSettings(QS_ORG, QS_APP)
         s.setValue(_KEY_PLAN_CURRENT_MISSION_JSON, path)
         if s.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
@@ -609,6 +661,7 @@ class PlanMissionMixin:
     ) -> None:
         if clear_plan_current_file:
             self.clear_plan_current_mission_path()
+        self._flush_plan_panel_edits()
         rows = [[wp.lat, wp.lon] for wp in waypoints]
         # A different plan means the old crosses describe points that are no
         # longer there, or are somewhere else entirely.
@@ -617,17 +670,18 @@ class PlanMissionMixin:
         nm = getattr(self, "_native_map", None)
         if nm is not None and not bool(getattr(self, "_is_3d_mode", False)):
             nm.set_waypoint_rows(rows)
-            self.set_mission_waypoint_count(len(waypoints))
-            self._rebuild_wp_selector()
-            self.waypoints_changed.emit(list(waypoints))
-            panel = getattr(self, "_plan_flight_panel", None)
-            if panel is not None:
-                panel.set_waypoint_count(len(waypoints))
         else:
             self._run_js(
                 f"setWaypoints({json.dumps(rows)});",
                 callback=lambda _: self._after_waypoints_mutated(),
             )
+        # Said outright on both maps. The 3D map answers with a count only, so
+        # a plan with as many points as the one before it announced nothing
+        # there, and the rows, the table and the plan bar kept the old plan.
+        # The Plan Flight rows follow from this signal (_sync_plan_panel_rows).
+        self.set_mission_waypoint_count(len(waypoints))
+        self._rebuild_wp_selector()
+        self.waypoints_changed.emit(list(waypoints))
         self._set_status(f"Mission loaded ({len(waypoints)} WPs)")
 
     def get_waypoint_meta(self) -> list[dict]:
@@ -723,6 +777,7 @@ class PlanMissionMixin:
 
     def _on_wp_drop_payload_toggled(self, checked: bool) -> None:
         """Arm or disarm the payload release for the selected waypoint."""
+        self._flush_plan_panel_edits()
         idx = self.selected_waypoint_index()
         if idx < 0:
             self._set_status("No waypoint selected")
@@ -759,6 +814,8 @@ class PlanMissionMixin:
 
     def add_waypoint_at(self, lat: float, lon: float) -> int:
         """Append a waypoint at an exact position; returns its index."""
+        # Before the plan is copied below, so the copy holds the edit.
+        self._flush_plan_panel_edits()
         alt = 20.0
         speed = 5.0
         try:
@@ -799,6 +856,7 @@ class PlanMissionMixin:
         self._on_wp_selected(idx)
 
     def _apply_altitude_to_selected(self) -> None:
+        self._flush_plan_panel_edits()
         idx = self._wp_selector.currentIndex()
         if idx < 0 or idx >= len(self._waypoints_model):
             self._set_status("No waypoint selected")
@@ -808,6 +866,7 @@ class PlanMissionMixin:
         self._set_status(f"Updated WP {idx + 1} altitude to {self._wp_alt.value():.1f} m")
 
     def _apply_altitude_to_all(self) -> None:
+        self._flush_plan_panel_edits()
         if not self._waypoints_model:
             self._set_status("No waypoints available")
             return
@@ -818,6 +877,7 @@ class PlanMissionMixin:
         self._set_status(f"Updated all waypoint altitudes to {alt:.1f} m")
 
     def _apply_speed_to_selected(self) -> None:
+        self._flush_plan_panel_edits()
         idx = self._wp_selector.currentIndex()
         if idx < 0 or idx >= len(self._waypoints_model):
             self._set_status("No waypoint selected")
@@ -828,6 +888,7 @@ class PlanMissionMixin:
         self._set_status(f"Updated WP {idx + 1} speed to {spd:.1f} m/s")
 
     def _apply_speed_to_all(self) -> None:
+        self._flush_plan_panel_edits()
         if not self._waypoints_model:
             self._set_status("No waypoints available")
             return
@@ -839,6 +900,7 @@ class PlanMissionMixin:
 
     def _apply_hover_to_selected(self) -> None:
         """Hold time at the selected waypoint. Requested 2026-09-11."""
+        self._flush_plan_panel_edits()
         idx = self._wp_selector.currentIndex()
         if idx < 0 or idx >= len(self._waypoints_model):
             self._set_status("No waypoint selected")
@@ -850,6 +912,7 @@ class PlanMissionMixin:
 
     def _apply_hover_to_all(self) -> None:
         """The usual case: one hold time at every point in the plan."""
+        self._flush_plan_panel_edits()
         if not self._waypoints_model:
             self._set_status("No waypoints available")
             return

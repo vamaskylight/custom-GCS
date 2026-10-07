@@ -37,6 +37,7 @@ __all__ = [
     "MissionPlan",
     "build_mission_plan",
     "parse_downloaded_mission",
+    "plan_signature",
     "validate_waypoints",
     "normalize_end_action",
     "haversine_m",
@@ -126,10 +127,86 @@ class MissionPlan:
             idx = int(wp_index)
         except (TypeError, ValueError):
             return None
+        # Only nav items carry a waypoint number. In a mission made elsewhere
+        # and read from the drone that can be a spline or a loiter point too.
         for item in self.items:
-            if item.wp_index == idx and item.command == int(_m.MAV_CMD_NAV_WAYPOINT):
+            if item.wp_index == idx:
                 return item.seq
         return None
+
+    def speed_for_seq(self, seq: int) -> float | None:
+        """Ground speed (m/s) the plan asks for on the way to the waypoint at ``seq``.
+
+        It is the last DO_CHANGE_SPEED before that item. ``None`` for anything
+        that is not one of the operator's waypoints: the home slot, the
+        take-off and the final return or landing fly at the drone's own speeds.
+
+        Why this is needed at all: ArduCopter forgets the mission's speed
+        whenever it enters AUTO, and a jump skips the speed items in between,
+        so the link sends this speed itself (simulator, 2026-10-07).
+        """
+        try:
+            s = int(seq)
+        except (TypeError, ValueError):
+            return None
+        target = next((item for item in self.items if item.seq == s), None)
+        if target is None or target.wp_index is None:
+            return None
+        speed: float | None = None
+        latest = -1
+        for item in self.items:
+            if item.command != int(_m.MAV_CMD_DO_CHANGE_SPEED) or not (latest < item.seq < s):
+                continue
+            # p1: 0 air speed, 1 ground speed (a copter flies both the same
+            # way), 2 climb, 3 descent. p2 of zero or less means "no change".
+            if int(item.p1) not in (0, 1) or float(item.p2) <= 0.0:
+                continue
+            speed, latest = float(item.p2), item.seq
+        return speed
+
+    def speed_for_waypoint_index(self, wp_index: int) -> float | None:
+        seq = self.seq_for_waypoint_index(wp_index)
+        return None if seq is None else self.speed_for_seq(seq)
+
+    def position_for_seq(self, seq: int) -> tuple[float, float] | None:
+        """Where the waypoint at ``seq`` is, or ``None`` for an item that is not a waypoint."""
+        try:
+            s = int(seq)
+        except (TypeError, ValueError):
+            return None
+        for item in self.items:
+            if item.seq == s and item.wp_index is not None:
+                return float(item.lat), float(item.lon)
+        return None
+
+    def leg_can_start_again(self, seq: int) -> bool:
+        """True when starting the leg to the waypoint at ``seq`` again drops nothing.
+
+        Starting a leg again (MISSION_SET_CURRENT with its own item) makes the
+        drone drop what is still running from the waypoint before. A payload
+        release would be left open: its close command comes after a delay and
+        would never run. So this is only true when nothing but speed changes
+        sits between the nav item before and this one.
+        """
+        try:
+            s = int(seq)
+        except (TypeError, ValueError):
+            return False
+        by_seq = {item.seq: item for item in self.items}
+        target = by_seq.get(s)
+        if target is None or target.wp_index is None:
+            return False
+        before = s - 1
+        while before >= 0:
+            item = by_seq.get(before)
+            if item is None:
+                return False
+            if item.command == int(_m.MAV_CMD_DO_CHANGE_SPEED):
+                before -= 1
+                continue
+            # MAVLink's nav commands end at 95 (MAV_CMD_NAV_LAST).
+            return int(item.command) <= 95
+        return False
 
     def label_for_seq(self, seq: int) -> str:
         try:
@@ -267,6 +344,28 @@ def _wp_hover_s(wp: object) -> int:
     if isinstance(wp, dict):
         return clamp_hover_seconds(wp.get("hover_s", 0))
     return clamp_hover_seconds(getattr(wp, "hover_s", 0))
+
+
+def plan_signature(waypoints: list[object] | None) -> tuple[tuple[float, float, float, float, int, bool], ...]:
+    """What makes two plans the same flight: each waypoint's place, height, speed, hover and drop.
+
+    Used to tell whether the plan on the map is still the mission the drone
+    holds. A command that names a waypoint by its number means the same on
+    both sides only then.
+    """
+    rows = []
+    for wp in waypoints or []:
+        rows.append(
+            (
+                round(_wp_field(wp, "lat", 0.0), 7),
+                round(_wp_field(wp, "lon", 0.0), 7),
+                round(max(MIN_WP_ALT_M, _wp_field(wp, "alt_m", 20.0)), 2),
+                round(max(MIN_WP_SPEED_MPS, _wp_field(wp, "speed_mps", 5.0)), 2),
+                _wp_hover_s(wp),
+                _wp_drop_payload(wp),
+            )
+        )
+    return tuple(rows)
 
 
 @dataclass(frozen=True)

@@ -69,6 +69,7 @@ from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
 from vgcs.map import MapWidget
+from vgcs.map.plan_flight_panel import DEFAULT_NEW_WP_ALT_M
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
@@ -613,8 +614,8 @@ class MainWindowTelemetryMixin:
                 st = {
                     "altRef": str(s.value("plan_alt_ref", "rel") or "rel"),
                     "initialWpAltM": float(
-                        s.value("plan_initial_wp_alt_m", s.value("plan_initial_wp_alt_ft", 164.0))
-                        or 164.0
+                        s.value("plan_initial_wp_alt_m", s.value("plan_initial_wp_alt_ft", DEFAULT_NEW_WP_ALT_M))
+                        or DEFAULT_NEW_WP_ALT_M
                     ),
                 }
                 self._map_widget.set_default_waypoint_alt_m(

@@ -86,6 +86,12 @@ from vgcs.video.camera_control import (
 )
 
 
+# Results of these link actions are sentences for the operator (see
+# vgcs/link/mission_speed.py): a jump to a waypoint, a planned speed VGCS set
+# again by itself, and a mission that was changed from another ground station.
+_MISSION_ACTIONS_IN_WORDS = ("mission_set_current_wp", "mission_speed", "mission")
+
+
 class MainWindowParamsMixin:
     """Extracted from MainWindow — uses host state via self."""
 
@@ -142,6 +148,13 @@ class MainWindowParamsMixin:
     def _on_action_result(self, action: str, ok: bool, detail: str) -> None:
         msg = f"{action.upper()} {'OK' if ok else 'FAIL'}: {detail}"
         self._append_log(msg)
+        if action in _MISSION_ACTIONS_IN_WORDS:
+            # These come as whole sentences that begin with what matters, and
+            # the header shows only a beginning. The whole text is in Plan
+            # Flight, under the buttons the operator used.
+            self._post_gcs_notice(str(detail))
+            self._map_widget.set_plan_mission_action_result(bool(ok), str(detail))
+            return
         self._post_gcs_notice(msg[:80])
 
     def _on_geofence_result(self, ok: bool, detail: str) -> None:

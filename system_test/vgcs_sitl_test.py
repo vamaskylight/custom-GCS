@@ -478,6 +478,9 @@ def mission_flight(version: str, r: Report) -> None:
         # Skip waypoint 3: jump to waypoint 4.
         since = rec.now()
         link.queue_mission_set_current_wp(3)
+        f.wait_real(lambda: rec.action("mission_set_current_wp", since) is not None, 8)
+        result = rec.action("mission_set_current_wp", since)
+        r.check(result is not None and result[0] and "WP 4" in result[1], f"jump: VGCS reports it once the drone shows it ({result})")
         r.check(f.wait(lambda: 3 in reached(), 120), "jump: waypoint 4 reached")
         r.check(2 not in reached(), f"jump: waypoint 3 was skipped (reached: {[i + 1 for i in reached()]})")
 
@@ -486,6 +489,134 @@ def mission_flight(version: str, r: Report) -> None:
         home_off = math.hypot(sim.north, sim.east)
         r.check(home_off < 3.0, f"it landed at home ({home_off:.1f} m from the take-off point)")
         r.check(abs(held_at[0]) + abs(held_at[1]) > 1.0, "the pause happened away from home, in flight")
+        r.check(not rec.errors, f"VGCS reported no error {[e[1] for e in rec.errors][:3]}")
+    finally:
+        f.close()
+
+
+def mission_speeds(version: str, r: Report) -> None:
+    """The drone flies each leg at the speed the plan says: also after a pause, after a jump to another waypoint, and after a mode change."""
+    # Long legs, so a speed has time to settle and a jump always has far to go.
+    # North, north-east, east, south-east: two legs at 4 m/s, two at 9 m/s.
+    # The drone's own default (WP_SPD or WPNAV_SPEED) is 10 m/s.
+    planned = (4.0, 4.0, 9.0, 9.0)
+    mission = []
+    for (north, east), speed in zip(((300.0, 0.0), (300.0, 300.0), (0.0, 300.0), (-300.0, 300.0)), planned):
+        lat, lon = offset_to_lat_lon(north, east)
+        mission.append({"lat": lat, "lon": lon, "alt_m": 20.0, "speed_mps": speed})
+    f = Flight(version)
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        sim.current_item = None
+        take = sim._take
+
+        def taking(msg) -> None:
+            if msg.get_type() == "MISSION_CURRENT":
+                sim.current_item = int(msg.seq)
+            take(msg)
+
+        sim._take = taking      # the checking connection notes which item the drone is on
+
+        def speed() -> float:
+            return math.hypot(sim.vn, sim.ve)
+
+        def flies_at(want: float, what: str, never_faster: bool = False) -> None:
+            """The drone settles at this speed: six seconds in a row within half a metre per second of it.
+
+            Braking, turning and speeding up come first, so the speed on the
+            way there is reported, and judged only where the drone starts from
+            a standstill (never_faster): there it must not overshoot.
+            """
+            seen: list[float] = []
+
+            def settled() -> bool:
+                last = seen[-6:]
+                return len(last) == 6 and all(abs(v - want) < 0.5 for v in last)
+
+            sim.fly(70, until=settled, each_second=lambda: seen.append(speed()))
+            last = seen[-6:] or [speed()]
+            r.check(settled(), f"{what}: it settles at {min(last):.1f} to {max(last):.1f} m/s, the plan says {want:.0f} m/s "
+                               f"(after {len(seen)} s, {max(seen):.1f} m/s at most on the way)")
+            if never_faster:
+                # Measured without the fresh start of the leg: up to 6.3 m/s on a 4 m/s leg.
+                r.check(max(seen) < want + 0.7, f"{what}: and never faster than planned on the way ({max(seen):.1f} m/s at most)")
+
+        def on_its_way_to(number: int, what: str) -> None:
+            """The checking connection has its own message timing, so give it a moment."""
+            f.wait(lambda: sim.current_item == item_of[number], 6)
+            r.check(sim.current_item == item_of[number], f"{what} (mission item {sim.current_item})")
+
+        def result(name: str, since: float):
+            f.wait_real(lambda: rec.action(name, since) is not None, 8)
+            return rec.action(name, since)
+
+        # The layout VGCS sends: 0 home, 1 take-off, 2 speed, 3 WP1, 4 WP2, 5 speed, 6 WP3, 7 WP4, 8 return.
+        item_of = {1: 3, 2: 4, 3: 6, 4: 7}
+
+        r.check(f.ready_to_fly(), "the drone is ready")
+        link.queue_mission_upload(mission, "rtl")
+        r.check(f.wait(lambda: bool(rec.uploaded), 60), "the mission is on the drone: WP 1 and 2 at 4 m/s, WP 3 and 4 at 9 m/s")
+        link.queue_mission_start()
+        r.check(f.wait(lambda: sim.armed and sim.mode == "AUTO", 40), f"mission start: armed and in AUTO ({sim.mode})")
+        r.check(f.wait(lambda: sim.alt > 18.0, 60), f"it took off ({sim.alt:.1f} m)")
+        flies_at(4.0, "to WP 1")
+
+        # Pause and resume. Entering AUTO again, the drone forgets the mission's speed.
+        since = rec.now()
+        link.queue_mission_pause()
+        r.check(f.wait(lambda: sim.mode in ("BRAKE", "LOITER", "POSHOLD"), 15), f"pause: the drone holds ({sim.mode})")
+        f.wait(lambda: speed() < 0.3, 20)
+        since = rec.now()
+        link.queue_mission_resume()
+        r.check(f.wait(lambda: sim.mode == "AUTO", 15), "resume: back in AUTO")
+        flies_at(4.0, "to WP 1 after pause and resume", never_faster=True)
+        on_its_way_to(1, "and it is still on its way to WP 1")
+
+        # A jump forward, over the speed item of WP 3.
+        since = rec.now()
+        link.queue_mission_set_current_wp(2)
+        got = result("mission_set_current_wp", since)
+        r.check(got is not None and got[0] and "WP 3" in got[1] and "9.0 m/s" in got[1], f"jump to WP 3: VGCS reports it ({got})")
+        on_its_way_to(3, "and the drone really is on its way to WP 3")
+        flies_at(9.0, "to WP 3 after the jump")
+
+        # A jump back, to a slower waypoint.
+        since = rec.now()
+        link.queue_mission_set_current_wp(0)
+        got = result("mission_set_current_wp", since)
+        r.check(got is not None and got[0] and "WP 1" in got[1] and "4.0 m/s" in got[1], f"jump back to WP 1: VGCS reports it ({got})")
+        on_its_way_to(1, "and the drone is on its way to WP 1")
+        flies_at(4.0, "to WP 1 after the jump back")
+
+        # A jump while paused: the drone stays where it is, and goes there on resume.
+        link.queue_mission_pause()
+        r.check(f.wait(lambda: sim.mode in ("BRAKE", "LOITER", "POSHOLD"), 15), f"pause again: the drone holds ({sim.mode})")
+        f.wait(lambda: speed() < 0.3, 20)
+        since = rec.now()
+        link.queue_mission_set_current_wp(3)
+        got = result("mission_set_current_wp", since)
+        r.check(got is not None and got[0] and "WP 4" in got[1] and "Resume" in got[1],
+                f"jump to WP 4 while paused: VGCS says it flies there on Resume ({got})")
+        f.wait(lambda: False, 5)
+        r.check(sim.mode != "AUTO" and speed() < 0.5 and sim.current_item == item_of[4],
+                f"the drone still holds, with WP 4 as its next waypoint ({sim.mode}, {speed():.1f} m/s, mission item {sim.current_item})")
+        link.queue_mission_resume()
+        r.check(f.wait(lambda: sim.mode == "AUTO", 15), "resume: back in AUTO")
+        flies_at(9.0, "to WP 4 after the resume")
+
+        # Any other way out of AUTO and back, here the mode list.
+        link.queue_mode_change("LOITER")
+        r.check(f.wait(lambda: sim.mode == "LOITER", 15), "mode list: LOITER")
+        f.wait(lambda: speed() < 1.0, 25)
+        link.queue_mode_change("AUTO")
+        r.check(f.wait(lambda: sim.mode == "AUTO", 15), "mode list: AUTO again")
+        flies_at(9.0, "to WP 4 after LOITER and AUTO from the mode list")
+
+        again = [(ok, text) for _t, name, ok, text in rec.actions if name == "mission_speed"]
+        r.check(len(again) == 3 and all(ok for ok, _text in again),
+                f"VGCS told the operator each time it set the planned speed again ({len(again)} times, the last: {again[-1][1] if again else 'none'!r})")
+        restarted = [line for _t, line in rec.logs if "started again" in line]
+        r.check(len(restarted) == 3, f"and each time it started the leg again at that speed ({len(restarted)} times)")
         r.check(not rec.errors, f"VGCS reported no error {[e[1] for e in rec.errors][:3]}")
     finally:
         f.close()
@@ -645,6 +776,9 @@ def signed_commands(version: str, r: Report) -> None:
         f.wait_real(lambda: rec.action("signing", since) is not None, 10)
         result = rec.action("signing", since)
         r.check(result is not None and result[0], f"key sent: VGCS reports that the drone took it ({result})")
+        # The state comes in the link's next message, a moment after the result
+        # (read at once, this check failed in one run of several).
+        f.wait_real(lambda: signing_state() == "drone_signs", 5)
         r.check(signing_state() == "drone_signs", f"the drone signs with VGCS's key ({signing_state()})")
 
         for _ in range(4):
@@ -681,7 +815,8 @@ def signed_commands(version: str, r: Report) -> None:
 
 
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
-         mission_upload_and_download, mission_flight, takeoff_fence_and_land, link_silence, signed_commands]
+         mission_upload_and_download, mission_flight, mission_speeds, takeoff_fence_and_land, link_silence,
+         signed_commands]
 
 
 def write_report(path: pathlib.Path, results: list[tuple[str, Report, float]]) -> None:

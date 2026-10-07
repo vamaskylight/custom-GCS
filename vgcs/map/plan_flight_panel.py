@@ -9,6 +9,7 @@ keys — mirrors the legacy JS bridge so `main_window._on_plan_flight_action` an
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -330,6 +331,17 @@ QPushButton.planDetailsToggle:hover { color: #facc15; }
 """
 
 
+# What a new waypoint gets until the operator says otherwise: the map's own
+# defaults (its hidden toolbar's 20 m and 5 m/s), which is what a plan flew
+# when nobody had touched this panel.
+DEFAULT_NEW_WP_ALT_M = 20.0
+DEFAULT_NEW_WP_SPEED_MPS = 5.0
+# Their limits, the same as the map's own boxes. (At upload the plan check
+# refuses under 1 m or 0.1 m/s, and questions over 500 m or 30 m/s.)
+NEW_WP_ALT_RANGE_M = (1.0, 500.0)
+NEW_WP_SPEED_RANGE_MPS = (0.1, 50.0)
+
+
 def _unit_to_m(v: float) -> float:
     return float(v)
 
@@ -450,6 +462,7 @@ class PlanFlightPanel(QWidget):
     mission_start_requested = Signal()
     mission_pause_requested = Signal()
     mission_resume_requested = Signal()
+    mission_jump_requested = Signal(int)  # 0-based waypoint to fly to now
     return_requested = Signal()
     set_launch_to_map_center_requested = Signal()
 
@@ -939,11 +952,28 @@ class PlanFlightPanel(QWidget):
         self._alt_ref_combo.addItem("AMSL", "amsl")
         self._alt_ref_combo.addItem("AGL", "agl")
         self._alt_ref_combo.currentIndexChanged.connect(lambda _i: self._schedule_emit())
+        self._alt_ref_combo.currentIndexChanged.connect(lambda _i: self._show_initial_wp_values_in_use())
         tbv.addWidget(self._alt_ref_combo)
-        tbv.addWidget(self._field_label("Initial Waypoint Alt"))
-        self._initial_wp_alt = self._unit_input("164.0", "m")
+        # What a new waypoint gets. Both used to be hidden: the height showed
+        # here as 164.0 (164 feet, the old default, read as metres) and was
+        # applied only after some other edit, and the speed was a spin box on
+        # the map toolbar that this layout never shows.
+        # The unit is in the label: a number without one is how 164 feet came to
+        # be read as 164 metres.
+        tbv.addWidget(self._field_label("Initial Waypoint Alt (m)"))
+        self._initial_wp_alt = self._unit_input(f"{DEFAULT_NEW_WP_ALT_M:.1f}", "m")
+        self._initial_wp_alt.setObjectName("planInitialWpAlt")
+        self._initial_wp_alt.setToolTip("The height a new waypoint gets.")
         self._initial_wp_alt.textChanged.connect(lambda _t: self._schedule_emit())
+        self._initial_wp_alt.editingFinished.connect(self._show_initial_wp_values_in_use)
         tbv.addWidget(self._initial_wp_alt)
+        tbv.addWidget(self._field_label("Initial Waypoint Speed (m/s)"))
+        self._initial_wp_speed = self._unit_input(f"{DEFAULT_NEW_WP_SPEED_MPS:.1f}", "m/s")
+        self._initial_wp_speed.setObjectName("planInitialWpSpeed")
+        self._initial_wp_speed.setToolTip("The speed a new waypoint gets.")
+        self._initial_wp_speed.textChanged.connect(lambda _t: self._schedule_emit())
+        self._initial_wp_speed.editingFinished.connect(self._show_initial_wp_values_in_use)
+        tbv.addWidget(self._initial_wp_speed)
         tc.addWidget(self._takeoff_body)
         body_v.addWidget(self._takeoff_card)
 
@@ -1086,6 +1116,36 @@ class PlanFlightPanel(QWidget):
         run_wrap = QWidget()
         run_wrap.setLayout(run_row)
         mr.addWidget(run_wrap)
+        # Send the running mission to another waypoint. This was only in the
+        # menu of the mission table, which the window never shows. Shown while
+        # the drone is armed (set_chrome_state): from the ground a mission
+        # starts with its take-off whatever is chosen here.
+        self._fly_to_row = QWidget()
+        fly_row = QHBoxLayout(self._fly_to_row)
+        fly_row.setContentsMargins(0, 0, 0, 0)
+        fly_row.setSpacing(6)
+        self._fly_to_combo = QComboBox()
+        self._fly_to_combo.setObjectName("planFlyToCombo")
+        self._fly_to_combo.setProperty("class", "planPatternSpin")
+        self._fly_to_combo.setToolTip("The waypoint to fly to.")
+        self._fly_to_btn = QPushButton("Fly to WP")
+        self._fly_to_btn.setObjectName("planFlyToBtn")
+        self._fly_to_btn.setToolTip(
+            "Send the drone to this waypoint now. The mission goes on from there."
+            "\nVGCS asks before it is sent."
+        )
+        self._fly_to_btn.clicked.connect(self._on_fly_to_clicked)
+        fly_row.addWidget(self._fly_to_combo, 1)
+        fly_row.addWidget(self._fly_to_btn, 1)
+        mr.addWidget(self._fly_to_row)
+        self._fly_to_row.setVisible(False)
+        # What the drone answered, where the operator clicked. The header's
+        # message field shows only the beginning of a text.
+        self._mission_result_label = QLabel("")
+        self._mission_result_label.setObjectName("planMissionResult")
+        self._mission_result_label.setWordWrap(True)
+        self._mission_result_label.setVisible(False)
+        mr.addWidget(self._mission_result_label)
         body_v.addWidget(self._mission_run_frame)
         self._mission_run_frame.setVisible(False)
 
@@ -1399,9 +1459,10 @@ class PlanFlightPanel(QWidget):
         if group and key in group:
             group[key].setText(value)
 
-    def set_chrome_state(self, link_ok: bool, waypoint_count: int) -> None:
+    def set_chrome_state(self, link_ok: bool, waypoint_count: int, armed: bool = False) -> None:
         self._link_ok = bool(link_ok)
         self._waypoint_count = max(0, int(waypoint_count))
+        self._armed = bool(armed)
         self._refresh_chrome()
 
     def _refresh_chrome(self) -> None:
@@ -1413,6 +1474,48 @@ class PlanFlightPanel(QWidget):
         self._btn_save.setEnabled(has)
         self._btn_save_as.setEnabled(has)
         self._btn_kml.setEnabled(has)
+        self._refresh_fly_to()
+
+    def _refresh_fly_to(self) -> None:
+        """The waypoint list beside "Fly to WP", and whether the row is shown.
+
+        Runs on every heartbeat, so it changes nothing that is already right:
+        the operator's choice in the list stays.
+        """
+        combo = getattr(self, "_fly_to_combo", None)
+        if combo is None:
+            return
+        n = self._waypoint_count
+        if combo.count() != n:
+            keep = combo.currentIndex()
+            combo.blockSignals(True)
+            try:
+                combo.clear()
+                for i in range(n):
+                    combo.addItem(f"WP {i + 1}", i)
+                if n:
+                    combo.setCurrentIndex(min(max(keep, 0), n - 1))
+            finally:
+                combo.blockSignals(False)
+        show = bool(self._link_ok and getattr(self, "_armed", False) and n > 0)
+        if self._fly_to_row.isHidden() == show:
+            self._fly_to_row.setVisible(show)
+
+    def _on_fly_to_clicked(self) -> None:
+        index = self._fly_to_combo.currentData()
+        if index is None:
+            return
+        self.mission_jump_requested.emit(int(index))
+
+    def set_mission_action_result(self, ok: bool, text: str) -> None:
+        """Show what the drone answered to a mission action, under Pause and Resume."""
+        label = self._mission_result_label
+        words = str(text or "").strip()
+        label.setText(words)
+        label.setStyleSheet(
+            "QLabel { color: %s; font-size: 12px; }" % ("#b6f0c0" if ok else "#ffb0a0")
+        )
+        label.setVisible(bool(words))
 
     def set_sequence_template(self, template_id: str) -> None:
         tid = (template_id or "").strip().lower()
@@ -1465,6 +1568,8 @@ class PlanFlightPanel(QWidget):
         if wp_index is None and not label:
             self._mission_progress_label.setText("Mission idle")
             self._mission_run_frame.setVisible(False)
+            # The answer to the last action belonged to the mission that ran.
+            self.set_mission_action_result(True, "")
             return
         if wp_index is None:
             # On a non-waypoint item: takeoff, a speed change or the terminal RTL/land.
@@ -1488,8 +1593,10 @@ class PlanFlightPanel(QWidget):
                     break
             if "initialWpAltM" in state or "initialWpAltFt" in state:
                 self._initial_wp_alt.setText(
-                    str(state.get("initialWpAltM", state.get("initialWpAltFt")) or "164.0")
+                    str(state.get("initialWpAltM", state.get("initialWpAltFt")) or DEFAULT_NEW_WP_ALT_M)
                 )
+            if "initialWpSpeedMps" in state:
+                self._initial_wp_speed.setText(str(state.get("initialWpSpeedMps") or DEFAULT_NEW_WP_SPEED_MPS))
             if "hoverMps" in state or "hoverMph" in state:
                 self._hover_input.setText(str(state.get("hoverMps", state.get("hoverMph")) or "11.18"))
             if "launchAltM" in state or "launchAltFt" in state:
@@ -1523,6 +1630,8 @@ class PlanFlightPanel(QWidget):
                         break
         finally:
             self._suppress_emit = False
+        # A saved value that cannot be used is replaced on screen, and sent on.
+        self._show_initial_wp_values_in_use()
 
     def set_waypoint_count(self, count: int) -> None:
         n = max(0, int(count))
@@ -1530,8 +1639,12 @@ class PlanFlightPanel(QWidget):
             return
         self._waypoint_count = n
         self._refresh_chrome()
-        base_alt_m = _unit_to_m(self._float(self._initial_wp_alt.text(), 164.0))
-        base_spd_mps = _unit_speed_to_mps(self._float(self._hover_input.text(), 11.18))
+        # Only a stand-in until the plan's own values arrive (set_waypoint_meta).
+        # It used to be the last word: the row kept these numbers whatever the
+        # plan held, and the speed came from "Hover speed", which is for time
+        # estimates only.
+        base_alt_m = max(1.0, _unit_to_m(self._float(self._initial_wp_alt.text(), DEFAULT_NEW_WP_ALT_M)))
+        base_spd_mps = max(0.1, _unit_speed_to_mps(self._float(self._initial_wp_speed.text(), DEFAULT_NEW_WP_SPEED_MPS)))
         while len(self._wp_meta) < n:
             # A new point does not hover and does not drop until asked to.
             self._wp_meta.append(
@@ -1567,15 +1680,33 @@ class PlanFlightPanel(QWidget):
             return None
 
     def set_waypoint_meta(self, meta: list[dict[str, float]]) -> None:
+        """Show the plan's own values in the rows."""
         cleaned: list[dict] = []
         for row in meta or []:
             got = self._clean_wp_meta_row(row)
             if got is not None:
                 cleaned.append(got)
+        # Nothing new: leave the row widgets alone. They are rebuilt otherwise,
+        # which would take the cursor out of the field the operator is typing in
+        # every time their own edit comes back from the plan.
+        if cleaned == self._wp_meta and len(cleaned) == self._waypoint_count:
+            return
         self._wp_meta = cleaned
         self._waypoint_count = len(cleaned)
         self._refresh_chrome()
         self._render_waypoint_rows()
+
+    def flush_pending_edits(self) -> None:
+        """Send an edit that is still waiting for its timer, now. The map asks
+        for this before the plan changes, so a value typed a moment before a
+        waypoint is added still goes to the waypoint it was typed for."""
+        if self._emit_timer.isActive():
+            self._emit_timer.stop()
+            self._emit_mission_panel_state()
+
+    def has_pending_edits(self) -> bool:
+        """True while an edit is waiting for its timer and has not gone out yet."""
+        return bool(self._emit_timer.isActive())
 
     def get_waypoint_meta(self) -> list[dict[str, float]]:
         return [dict(m) for m in self._wp_meta]
@@ -1651,6 +1782,8 @@ class PlanFlightPanel(QWidget):
         h.addWidget(title)
         alt_in = QLineEdit()
         alt_in.setProperty("class", "planWpField")
+        # Named, so a test can read what is on screen (planWpAlt1, planWpSpeed1...).
+        alt_in.setObjectName("planStartAlt" if is_start else f"planWpAlt{idx + 1}")
         alt_in.setText(f"{alt_ft:.1f}")
         alt_in.setFixedWidth(76)
         h.addWidget(alt_in)
@@ -1660,6 +1793,7 @@ class PlanFlightPanel(QWidget):
         if not is_start:
             spd_in = QLineEdit()
             spd_in.setProperty("class", "planWpField")
+            spd_in.setObjectName(f"planWpSpeed{idx + 1}")
             spd_in.setText(f"{(speed_mph or 0.0):.1f}")
             spd_in.setFixedWidth(76)
             h.addWidget(spd_in)
@@ -1687,6 +1821,7 @@ class PlanFlightPanel(QWidget):
             h2.addSpacing(54)  # line up under the alt/speed fields above
             hover_in = QLineEdit()
             hover_in.setProperty("class", "planWpField")
+            hover_in.setObjectName(f"planWpHover{idx + 1}")
             hover_in.setText(str(int(hover_s)))
             hover_in.setFixedWidth(56)
             hover_in.setToolTip(
@@ -1698,6 +1833,7 @@ class PlanFlightPanel(QWidget):
             unit_hover.setProperty("class", "planWpUnit")
             h2.addWidget(unit_hover)
             drop_cb = QCheckBox("Drop payload")
+            drop_cb.setObjectName(f"planWpDrop{idx + 1}")
             drop_cb.setChecked(bool(drop))
             drop_cb.setToolTip(
                 "Release the payload servo on arrival. A point that also hovers"
@@ -1756,7 +1892,8 @@ class PlanFlightPanel(QWidget):
             return
         value = self._float(raw, 0.0)
         if key == "alt_m":
-            self._wp_meta[idx]["alt_m"] = max(0.3, _unit_to_m(value))
+            # The same floor as the plan (1 m), so the row and the plan agree.
+            self._wp_meta[idx]["alt_m"] = max(1.0, _unit_to_m(value))
         elif key == "speed_mps":
             self._wp_meta[idx]["speed_mps"] = max(0.1, _unit_speed_to_mps(value))
         elif key == "hover_s":
@@ -1803,6 +1940,47 @@ class PlanFlightPanel(QWidget):
             finally:
                 widget.blockSignals(False)
 
+    def _initial_wp_values(self) -> tuple[float, float]:
+        """The height and speed a new waypoint gets, from what is typed.
+
+        Nothing, a zero or a word is not a value, so the default stands in.
+        The limits are the map's own. A height above sea level is not limited
+        here: what it comes to depends on the launch height, which the window
+        knows.
+        """
+        alt = self._float(self._initial_wp_alt.text(), DEFAULT_NEW_WP_ALT_M)
+        if not math.isfinite(alt) or alt <= 0.0:
+            alt = DEFAULT_NEW_WP_ALT_M
+        if str(self._alt_ref_combo.currentData() or "rel") != "amsl":
+            alt = min(NEW_WP_ALT_RANGE_M[1], max(NEW_WP_ALT_RANGE_M[0], alt))
+        spd = self._float(self._initial_wp_speed.text(), DEFAULT_NEW_WP_SPEED_MPS)
+        if not math.isfinite(spd) or spd <= 0.0:
+            spd = DEFAULT_NEW_WP_SPEED_MPS
+        spd = min(NEW_WP_SPEED_RANGE_MPS[1], max(NEW_WP_SPEED_RANGE_MPS[0], spd))
+        # One decimal, rounded the way the map's boxes round, so this field and
+        # the new waypoint's row show the same digits.
+        return math.floor(alt * 10.0 + 0.5) / 10.0, math.floor(spd * 10.0 + 0.5) / 10.0
+
+    def _show_initial_wp_values_in_use(self) -> None:
+        """Once the operator leaves one of the two fields, it shows the value in
+        use, as the waypoint rows do: a "0" must not stay on screen while a new
+        waypoint gets 20 m."""
+        if self._suppress_emit:
+            return
+        alt, spd = self._initial_wp_values()
+        changed = False
+        for widget, value in ((self._initial_wp_alt, alt), (self._initial_wp_speed, spd)):
+            text = f"{value:.1f}"
+            if widget.text() != text:
+                widget.blockSignals(True)
+                try:
+                    widget.setText(text)
+                finally:
+                    widget.blockSignals(False)
+                changed = True
+        if changed:
+            self._schedule_emit()
+
     # ------------------------------------------------------------------ Emit
     def _schedule_emit(self) -> None:
         if self._suppress_emit:
@@ -1812,9 +1990,11 @@ class PlanFlightPanel(QWidget):
     def _emit_mission_panel_state(self) -> None:
         if self._suppress_emit:
             return
+        initial_alt_m, initial_speed_mps = self._initial_wp_values()
         payload: dict[str, Any] = {
             "altRef": str(self._alt_ref_combo.currentData() or "rel"),
-            "initialWpAltM": self._float(self._initial_wp_alt.text(), 164.0),
+            "initialWpAltM": initial_alt_m,
+            "initialWpSpeedMps": initial_speed_mps,
             "hoverMps": self._float(self._hover_input.text(), 11.18),
             "launchAltM": self._float(self._launch_alt.text(), 0.0),
             "launchLat": self._launch_lat_value.text().strip().replace("\u2014", ""),

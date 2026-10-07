@@ -64,7 +64,7 @@ from vgcs.app.window.helpers import (
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
-from vgcs.mission import Waypoint
+from vgcs.mission import Waypoint, plan_signature
 from vgcs.map import MapWidget
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
@@ -602,3 +602,83 @@ class MainWindowFlightCommandsMixin:
         self._thread.queue_mission_resume()
         self._append_log("Mission resume queued (AUTO from current item)")
         self._post_gcs_notice("Resuming mission…")
+
+    def _on_map_mission_jump_requested(self, wp_index: int) -> None:
+        """"Fly to WP" in Plan Flight: send the running mission to another waypoint.
+
+        A waypoint is named by its number, and the number means the same on
+        the map and on the drone only while the plan on the map is the mission
+        the drone holds. So that is checked first, and the question says where
+        the drone will go, how high and how fast.
+        """
+        title = "Fly to waypoint"
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, title, "Connect vehicle before sending it to a waypoint.")
+            return
+        if not bool(getattr(self, "_hb_armed", False)):
+            QMessageBox.information(
+                self,
+                title,
+                "The drone is not flying a mission.\n\nUse Start Mission to fly the plan from its take-off.",
+            )
+            return
+        plan = list(self._map_widget._plan_waypoints_snapshot())
+        index = int(wp_index)
+        if not (0 <= index < len(plan)):
+            return
+        number = index + 1
+        on_drone = self._thread.mission_on_drone()
+        if on_drone is None:
+            QMessageBox.warning(
+                self,
+                title,
+                "VGCS does not know the mission this drone holds.\n\n"
+                "Press Download (Plan Flight, File) to read it, then try again.",
+            )
+            return
+        if tuple(on_drone) != plan_signature(plan):
+            QMessageBox.warning(
+                self,
+                title,
+                "The plan on the map is not the mission the drone holds.\n\n"
+                f"It was changed after the last Upload or Download, so WP {number} here "
+                f"may not be WP {number} on the drone.\n\n"
+                "Upload the plan, or press Download, then try again.",
+            )
+            return
+        wp = plan[index]
+        where = f"{float(wp.alt_m):.0f} m and {float(getattr(wp, 'speed_mps', 5.0)):.1f} m/s"
+        mode = str(getattr(self, "_hb_mode_text", "") or "").strip()
+        if mode == "AUTO":
+            text = (
+                f"Send the drone to WP {number} now?\n\n"
+                f"It flies there in a straight line from where it is, at {where}. "
+                "The waypoints in between are skipped, and the mission goes on from there."
+            )
+        else:
+            text = (
+                f"Make WP {number} the next waypoint?\n\n"
+                f"The drone is in {mode or 'another mode'}, not in AUTO, and stays where it is. "
+                f"It flies to WP {number} ({where}) when you press Resume."
+            )
+        if any(bool(getattr(p, "drop_payload", False)) for p in plan):
+            # Measured in the simulator: a jump while the release servo is
+            # held open drops the rest of that release, and the servo stays
+            # open for the rest of the flight.
+            text += (
+                "\n\nThis plan releases a payload. Do not do this in the seconds after a release: "
+                "the release servo would stay open."
+            )
+        answer = QMessageBox.question(
+            self,
+            title,
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._thread.queue_mission_set_current_wp(index)
+        self._append_log(f"Mission jump requested: WP {number}")
+        self._post_gcs_notice(f"Sending the drone to WP {number}…")
+        self._map_widget.set_plan_mission_action_result(True, f"Sending the drone to WP {number}…")

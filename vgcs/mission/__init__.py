@@ -9,6 +9,7 @@ from vgcs.mission.mission_plan import (
     haversine_m,
     normalize_end_action,
     parse_downloaded_mission,
+    plan_signature,
     validate_waypoints,
 )
 from vgcs.mission.waypoint_store import (
@@ -35,6 +36,7 @@ __all__ = [
     "load_waypoints_json",
     "normalize_end_action",
     "parse_downloaded_mission",
+    "plan_signature",
     "save_waypoints_json",
     "save_waypoints_kml",
     "validate_waypoints",

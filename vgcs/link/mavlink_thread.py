@@ -23,8 +23,11 @@ from vgcs.mission import (
     MissionPlan,
     build_mission_plan,
     normalize_end_action,
+    parse_downloaded_mission,
+    plan_signature,
 )
 from vgcs.link.confirmations import ModeChange, ParamReads, ParamWrites, clean_name
+from vgcs.link.mission_speed import LegSpeed
 from vgcs.link.signing import (
     KeyTransfer,
     SigningMonitor,
@@ -109,6 +112,10 @@ _PREARM_REASON_MAX_AGE_S = 30.0
 # is fire and forget, and arming in a mode the vehicle never entered is how a
 # takeoff ends up sent into the wrong mode.
 _MODE_CONFIRM_TIMEOUT_S = 3.0
+
+# ArduPilot says "Flight plan received" to every ground station when it has
+# taken a new mission. Within this time after an upload from here, it is ours.
+_OWN_UPLOAD_ECHO_S = 10.0
 
 # How the vehicle answers an arm request. "Denied" and "temporarily rejected"
 # call for opposite responses from the operator, so they are never collapsed
@@ -283,6 +290,13 @@ class MavlinkThread(QThread):
         self._param_writes = ParamWrites()
         self._param_reads = ParamReads()
         self._mode_request: ModeChange | None = None
+        # The planned speed of each leg, kept across jumps and returns to AUTO
+        # (vgcs/link/mission_speed.py). Made on first use, see _legs().
+        self._leg_speed: LegSpeed | None = None
+        # The waypoints of the mission VGCS knows the drone holds: what it
+        # uploaded or downloaded last (see mission_on_drone).
+        self._mission_waypoints: tuple | None = None
+        self._own_mission_upload_mono = 0.0
         # MAVLink 2 command signing (M16, vgcs/link/signing.py). The key comes
         # from the window; pymavlink replaces its MAVLink object when the
         # drone's first MAVLink 2 packet arrives, so signing is (re)applied
@@ -786,8 +800,13 @@ class MavlinkThread(QThread):
                         self._prox_streams_last_request_mono = now_req
             elif msg_type == "MISSION_CURRENT":
                 cur_seq = int(getattr(msg, "seq", 0) or 0)
+                state = getattr(msg, "mission_state", None)
                 self._emit_telemetry_payload("MISSION_CURRENT", {"seq": cur_seq})
-                self._emit_mission_progress(cur_seq, reached=False)
+                if self._is_primary_source(msg):
+                    # First, so a mission that is no longer the one VGCS knows
+                    # is dropped before its progress is named.
+                    self._legs().heard_current(cur_seq, time.monotonic(), getattr(msg, "total", None), state)
+                self._emit_mission_progress(cur_seq, reached=False, state=state)
             elif msg_type == "MISSION_ITEM_REACHED":
                 # Fires once per completed item — the only reliable "WP N done" event.
                 self._emit_mission_progress(int(getattr(msg, "seq", 0) or 0), reached=True)
@@ -796,6 +815,7 @@ class MavlinkThread(QThread):
             elif msg_type == "COMMAND_ACK":
                 self._remember_arm_ack(msg)
                 self._hear_mode_ack(msg)
+                self._hear_command_ack(msg)
             elif msg_type == "PARAM_VALUE":
                 self._hear_param_value(msg)
             elif msg_type == "VFR_HUD":
@@ -874,6 +894,8 @@ class MavlinkThread(QThread):
                     gpi["hdg_deg"] = hdg_deg
                 if gt_deg is not None:
                     gpi["ground_track_deg"] = gt_deg
+                if self._is_primary_source(msg):
+                    self._legs().heard_position(float(gpi["lat"]), float(gpi["lon"]))
                 self._emit_telemetry_payload("GLOBAL_POSITION_INT", gpi)
             elif msg_type == "MOUNT_ORIENTATION":
                 yaw = float(getattr(msg, "yaw", float("nan")) or float("nan"))
@@ -1905,7 +1927,10 @@ class MavlinkThread(QThread):
             raise RuntimeError(f"mission upload ACK type={ack_type}")
         # Remember the layout so mission progress can name the right waypoint.
         self._mission_plan = plan
+        self._mission_waypoints = plan_signature(waypoints)
+        self._own_mission_upload_mono = time.monotonic()
         self._last_mission_seq_reported = None
+        self._legs().mission_changed()
         self.log_line.emit(f"Mission upload complete: {count} mission items")
         self.mission_uploaded.emit(len(waypoints))
 
@@ -1995,7 +2020,9 @@ class MavlinkThread(QThread):
         # Rebuild the seq -> waypoint mapping from what the vehicle actually holds, so
         # progress stays correct for a mission this GCS did not upload.
         self._mission_plan = self._plan_from_downloaded_items(items)
+        self._mission_waypoints = plan_signature(parse_downloaded_mission(items)[0])
         self._last_mission_seq_reported = None
+        self._legs().mission_changed()
         self.log_line.emit(f"Mission download complete: {len(items)} mission items")
         self.mission_downloaded.emit(items)
 
@@ -2052,29 +2079,43 @@ class MavlinkThread(QThread):
                     lat=lat,
                     lon=lon,
                     alt_m=float(row.get("alt_m", 0.0) or 0.0),
+                    # The values too: the speed of a DO_CHANGE_SPEED is what
+                    # speed_for_seq reads.
+                    p1=float(row.get("p1", 0.0) or 0.0),
+                    p2=float(row.get("p2", 0.0) or 0.0),
+                    p3=float(row.get("p3", 0.0) or 0.0),
+                    p4=float(row.get("p4", 0.0) or 0.0),
                     wp_index=idx,
                     label=label,
                 )
             )
         return plan
 
-    def _emit_mission_progress(self, seq: int, *, reached: bool) -> None:
+    def _emit_mission_progress(self, seq: int, *, reached: bool, state: object = None) -> None:
         """Translate a raw MAVLink mission seq into an operator-facing waypoint."""
         plan = self._mission_plan
         try:
             s = int(seq)
         except (TypeError, ValueError):
             return
+        # A mission VGCS does not know (sent from another ground station, or
+        # flying before VGCS started) still runs. Saying so keeps Pause and
+        # Resume on screen. 3 and 4: the drone reports it active or paused.
+        unknown_but_running = plan is None and s > 0 and state in (3, 4)
         if not reached:
             # MISSION_CURRENT streams continuously; only report real changes.
-            if self._last_mission_seq_reported == s:
+            key = (s, unknown_but_running)
+            if self._last_mission_seq_reported == key:
                 return
-            self._last_mission_seq_reported = s
+            self._last_mission_seq_reported = key
+        label = plan.label_for_seq(s) if plan is not None else ""
+        if unknown_but_running and not reached:
+            label = f"Mission item {s}"
         payload = {
             "seq": s,
             "wp_index": plan.waypoint_index_for_seq(s) if plan is not None else None,
             "waypoint_count": int(plan.waypoint_count) if plan is not None else 0,
-            "label": plan.label_for_seq(s) if plan is not None else "",
+            "label": label,
             "end_action": plan.end_action if plan is not None else "",
             "reached": bool(reached),
         }
@@ -2210,6 +2251,7 @@ class MavlinkThread(QThread):
             or self._param_reads.pending()
             or self._mode_request is not None
             or getattr(self, "_key_transfer", None) is not None
+            or self._legs().open()
         )
 
     def _tick_confirmations(self) -> None:
@@ -2237,6 +2279,7 @@ class MavlinkThread(QThread):
                 self.log_line.emit("Signing: no sign from the drone yet, key sent again")
             if transfer.done:
                 self._key_transfer = None
+        self._legs().tick(now)
 
     def _cancel_confirmations(self, reason: str) -> None:
         self._param_writes.cancel_all(reason)
@@ -2246,6 +2289,7 @@ class MavlinkThread(QThread):
         if request is not None and not request.done:
             request.done = True
             request.on_done(False, reason)
+        self._legs().cancel(reason)
         transfer = getattr(self, "_key_transfer", None)
         self._key_transfer = None
         if transfer is not None and not transfer.done:
@@ -2539,6 +2583,7 @@ class MavlinkThread(QThread):
             if msg_type == "COMMAND_ACK":
                 self._remember_arm_ack(msg)
                 self._hear_mode_ack(msg)
+                self._hear_command_ack(msg)
                 continue
             self._hear_mode(msg)
             self._remember_heartbeat_state(msg)
@@ -2577,6 +2622,8 @@ class MavlinkThread(QThread):
         name = str(mode_text or "").strip()
         if name:
             self._vehicle_mode_name = name
+            # A return to AUTO is where ArduCopter forgets the mission's speed.
+            self._legs().heard_mode(name)
 
     def _current_mode_name(self) -> str | None:
         """The mode the vehicle last reported, by name."""
@@ -2630,6 +2677,8 @@ class MavlinkThread(QThread):
         """Keep a pre-arm line and pass the text on to the rest of the app."""
         text = str(getattr(msg, "text", "") or "").strip()
         self._remember_prearm_reason(text)
+        if text.lower().startswith("flight plan received"):
+            self._hear_flight_plan_received()
         request = getattr(self, "_mode_request", None)
         if request is not None:
             request.heard_text(text)
@@ -2804,38 +2853,99 @@ class MavlinkThread(QThread):
             self.log_line.emit(f"Mission resume: MISSION_START not sent ({e})")
 
     def _mission_set_current_wp(self, wp_index: int) -> None:
-        """Jump to a 0-based operator waypoint, translating through the plan layout."""
+        """Fly to a 0-based operator waypoint now, translating through the plan layout.
+
+        Reported once the drone's MISSION_CURRENT shows that item. It used to
+        be reported as "Jumped" the moment the message was sent, and the drone
+        kept the speed of the leg before (see vgcs/link/mission_speed.py).
+        """
         if self._master is None:
             self.action_result.emit("mission_set_current_wp", False, "Link not ready")
             return
-        plan = self._mission_plan
-        if plan is None:
-            self.action_result.emit(
-                "mission_set_current_wp",
-                False,
-                "No mission layout known — upload or download the mission first.",
-            )
-            return
-        seq = plan.seq_for_waypoint_index(int(wp_index))
-        if seq is None:
-            self.action_result.emit(
-                "mission_set_current_wp", False, f"WP {int(wp_index) + 1} is not in the mission"
-            )
-            return
         self._sync_link_targets()
+
+        def done(ok: bool, text: str) -> None:
+            if not ok:
+                self.error.emit(f"Mission jump failed: {text}")
+            self.action_result.emit("mission_set_current_wp", bool(ok), text)
+
+        self._legs().jump(int(wp_index), time.monotonic(), done)
+
+    # --- the planned speed of each leg (vgcs/link/mission_speed.py) ---------
+
+    def _legs(self) -> LegSpeed:
+        legs = getattr(self, "_leg_speed", None)
+        if legs is None:
+            legs = self._leg_speed = LegSpeed(
+                send_speed=self._send_speed_command,
+                send_jump=self._send_mission_set_current,
+                say=lambda text: self.log_line.emit(text),
+                tell=lambda ok, text: self.action_result.emit("mission_speed", bool(ok), text),
+                get_plan=lambda: self._mission_plan,
+                is_armed=lambda: bool(getattr(self, "_vehicle_armed", False)),
+                plan_lost=self._mission_plan_lost,
+            )
+            # The mode may be known already (this is made on first use).
+            legs.heard_mode(str(getattr(self, "_vehicle_mode_name", "") or ""))
+        return legs
+
+    def _send_mission_set_current(self, seq: int) -> None:
+        self._master.mav.mission_set_current_send(
+            self._target_sysid,
+            self._target_compid,
+            int(seq),
+        )
+
+    def _send_speed_command(self, speed_mps: float) -> None:
+        # The same values as the mission's own speed item: 1 = ground speed,
+        # -1 = leave the throttle alone.
+        self._send_command_long(
+            mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+            p1=1.0,
+            p2=float(speed_mps),
+            p3=-1.0,
+        )
+
+    def _hear_command_ack(self, msg) -> None:
+        """The flight controller's answer to a command sent from here."""
+        if not self._is_primary_source(msg):
+            return
         try:
-            self._master.mav.mission_set_current_send(
-                self._target_sysid,
-                self._target_compid,
-                int(seq),
-            )
-            self.action_result.emit(
-                "mission_set_current_wp", True, f"Jumped to WP {int(wp_index) + 1} (seq {seq})"
-            )
-            self.log_line.emit(f"Mission jump: WP {int(wp_index) + 1} -> mission seq {seq}")
-        except Exception as e:
-            self.action_result.emit("mission_set_current_wp", False, str(e))
-            self.error.emit(f"Mission jump failed: {e}")
+            command = int(getattr(msg, "command", -1))
+            result = int(getattr(msg, "result", -1))
+        except (TypeError, ValueError):
+            return
+        self._legs().heard_ack(command, result, time.monotonic())
+
+    def _hear_flight_plan_received(self) -> None:
+        """ArduPilot tells every ground station when it has taken a new mission.
+
+        Right after an upload from here, that is ours. At any other time
+        another ground station sent it, and the plan VGCS holds is no longer
+        the drone's: its speeds and waypoint numbers must not be used.
+        """
+        if self._mission_plan is None:
+            return
+        own = float(getattr(self, "_own_mission_upload_mono", 0.0) or 0.0)
+        if own and time.monotonic() - own < _OWN_UPLOAD_ECHO_S:
+            return
+        self._mission_plan_lost("Another ground station sent the drone a new mission. Press Download in Plan Flight")
+
+    def _mission_plan_lost(self, text: str) -> None:
+        """The mission on the drone is no longer the one VGCS knows."""
+        self._mission_plan = None
+        self._mission_waypoints = None
+        self._last_mission_seq_reported = None
+        self._legs().mission_changed()
+        self.log_line.emit(f"Mission: {text}")
+        self.action_result.emit("mission", False, text)
+
+    def mission_on_drone(self) -> tuple | None:
+        """The waypoints of the mission VGCS knows this drone holds (plan_signature), or None.
+
+        Read from the window's thread: the value is replaced whole, never changed in place.
+        """
+        return getattr(self, "_mission_waypoints", None)
 
     def _arm_disarm(self, arm: bool) -> None:
         if self._master is None:

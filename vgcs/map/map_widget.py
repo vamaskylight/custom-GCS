@@ -810,6 +810,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     mission_start_requested = Signal()
     mission_pause_requested = Signal()
     mission_resume_requested = Signal()
+    mission_jump_requested = Signal(int)  # 0-based waypoint to fly to now
     plan_mission_panel_changed = Signal(object)
     plan_waypoint_selection_changed = Signal(int)  # selected WP index, -1 for none
     video_follow_enabled_changed = Signal(bool)
@@ -1562,6 +1563,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._plan_flight_panel.mission_start_requested.connect(self.mission_start_requested.emit)
         self._plan_flight_panel.mission_pause_requested.connect(self.mission_pause_requested.emit)
         self._plan_flight_panel.mission_resume_requested.connect(self.mission_resume_requested.emit)
+        self._plan_flight_panel.mission_jump_requested.connect(self.mission_jump_requested.emit)
         self._plan_flight_panel.return_requested.connect(self.return_requested.emit)
         self._plan_flight_panel.set_launch_to_map_center_requested.connect(
             self._on_plan_panel_set_launch_to_map_center
