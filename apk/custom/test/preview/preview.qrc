@@ -1,0 +1,34 @@
+<RCC>
+    <!-- QGC's icons that Application Settings shows, at QGC's addresses. -->
+    <qresource prefix="/res">
+        <file alias="QGCLogoWhite.svg">../../../qgc-src/resources/QGCLogoWhite.svg</file>
+    </qresource>
+    <qresource prefix="/qmlimages">
+        <file alias="PaperPlane.svg">../../../qgc-src/src/Toolbar/Images/PaperPlane.svg</file>
+        <file alias="Plan.svg">../../../qgc-src/src/Toolbar/Images/Plan.svg</file>
+        <file alias="RidIconManNoID.svg">../../../qgc-src/src/Toolbar/Images/RidIconManNoID.svg</file>
+    </qresource>
+    <qresource prefix="/qml/QGroundControl/Viewer3D">
+        <file alias="City3DMapIcon.svg">../../../qgc-src/src/Viewer3D/Viewer3DQml/Images/city_3d_map_icon.svg</file>
+    </qresource>
+    <qresource prefix="/InstrumentValueIcons">
+        <file alias="airplane.svg">../../../qgc-src/resources/InstrumentValueIcons/airplane.svg</file>
+        <file alias="bug.svg">../../../qgc-src/resources/InstrumentValueIcons/bug.svg</file>
+        <file alias="camera.svg">../../../qgc-src/resources/InstrumentValueIcons/camera.svg</file>
+        <file alias="cheveron-right.svg">../../../qgc-src/resources/InstrumentValueIcons/cheveron-right.svg</file>
+        <file alias="conversation.svg">../../../qgc-src/resources/InstrumentValueIcons/conversation.svg</file>
+        <file alias="drone.svg">../../../qgc-src/resources/InstrumentValueIcons/drone.svg</file>
+        <file alias="globe.svg">../../../qgc-src/resources/InstrumentValueIcons/globe.svg</file>
+        <file alias="inbox-download.svg">../../../qgc-src/resources/InstrumentValueIcons/inbox-download.svg</file>
+        <file alias="photo.svg">../../../qgc-src/resources/InstrumentValueIcons/photo.svg</file>
+        <file alias="question.svg">../../../qgc-src/resources/InstrumentValueIcons/question.svg</file>
+        <file alias="usb.svg">../../../qgc-src/resources/InstrumentValueIcons/usb.svg</file>
+    </qresource>
+    <!-- Stand-ins for the two QGC pages the check can open. QGC's
+         Controls/AppSettings.qml is left out on purpose: only the VAMA copy
+         can answer QGC's address. -->
+    <qresource prefix="/qml/QGroundControl/AppSettings">
+        <file alias="GeneralSettings.qml">pages/GeneralSettings.qml</file>
+        <file alias="HelpSettings.qml">pages/HelpSettings.qml</file>
+    </qresource>
+</RCC>

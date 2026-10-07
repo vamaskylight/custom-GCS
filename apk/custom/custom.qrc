@@ -27,6 +27,7 @@
         <file alias="vama_zoom_reset.svg">res/Images/vama_zoom_reset.svg</file>
     </qresource>
     <qresource prefix="/Custom/qml">
+        <file alias="QGroundControl/Controls/AppSettings.qml">src/AppSettings.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewCustomLayer.qml">src/FlyViewCustomLayer.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewTopRightColumnLayout.qml">src/FlyViewTopRightColumnLayout.qml</file>
         <file alias="QGroundControl/Toolbar/SelectViewDropdown.qml">src/SelectViewDropdown.qml</file>

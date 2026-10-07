@@ -1,25 +1,56 @@
+// Copy of QGC 5.1.5's src/QmlControls/QGCColoredImage.qml for the preview.
+// QGC's own tinting: main.cpp registers QGC's coloredsvg image provider.
+
 import QtQuick
 
-// The real one tints through QGC's "coloredsvg" image provider, which reads
-// "/path" and "qrc:/path" from the app resources. The VAMA icons are white
-// already, so this one only does the same path mapping.
+import QGroundControl
+
+// Tints an SVG (or raster) by routing through the `coloredsvg` C++ image provider,
+// which rasterizes the source and composites the tint over its alpha mask.
 Item {
     id: root
-    property color color: "white"
-    property url   source
 
-    readonly property string _resource: {
+    property color  color:  "white"
+    property url    source
+
+    property alias asynchronous:        image.asynchronous
+    property alias cache:               image.cache
+    property alias fillMode:            image.fillMode
+    property alias horizontalAlignment: image.horizontalAlignment
+    property alias mirror:              image.mirror
+    property alias paintedHeight:       image.paintedHeight
+    property alias paintedWidth:        image.paintedWidth
+    property alias progress:            image.progress
+    property alias mipmap:              image.mipmap
+    property alias sourceSize:          image.sourceSize
+    property alias status:              image.status
+    property alias verticalAlignment:   image.verticalAlignment
+
+    width:  image.width
+    height: image.height
+
+    // Strip qrc: scheme and ensure leading '/' so the provider URL stays well-formed.
+    readonly property string _path: {
         const s = source.toString()
-        if (s.startsWith("qrc:/")) return s
-        if (s.startsWith("/"))     return "qrc:" + s
-        return s.length > 0 ? "qrc:/" + s : ""
+        if (s.length === 0)        return ""
+        if (s.startsWith("qrc:/")) return s.substring(4)
+        if (s.startsWith("/"))     return s
+        return "/" + s
     }
+    // QColor in C++ parses "#" prefixes as URL fragments, so strip it.
+    readonly property string _hex: color.toString().replace("#", "")
 
     Image {
-        anchors.fill:      parent
-        source:            root._resource
-        sourceSize.height: height
-        fillMode:          Image.PreserveAspectFit
-        smooth:            true
+        id:                 image
+        smooth:             true
+        mipmap:             true
+        antialiasing:       true
+        asynchronous:       true
+        fillMode:           Image.PreserveAspectFit
+        anchors.fill:       parent
+        sourceSize.height:  height
+        source:             root._path.length > 0
+                            ? "image://coloredsvg" + root._path + "?color=" + root._hex
+                            : ""
     }
 }

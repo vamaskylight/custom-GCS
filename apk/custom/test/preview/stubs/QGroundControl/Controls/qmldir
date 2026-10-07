@@ -9,3 +9,6 @@ QGCComboBox 1.0 QGCComboBox.qml
 QGCTextField 1.0 QGCTextField.qml
 QGCFlickable 1.0 QGCFlickable.qml
 QGCColoredImage 1.0 QGCColoredImage.qml
+DeadMouseArea 1.0 DeadMouseArea.qml
+SettingsButton 1.0 SettingsButton.qml
+SidebarDivider 1.0 SidebarDivider.qml

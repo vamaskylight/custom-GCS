@@ -1,0 +1,2 @@
+module QGroundControl.AppSettings
+SettingsPagesModel 1.0 SettingsPagesModel.qml

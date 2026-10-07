@@ -18,11 +18,17 @@
 //   14_lock_following.png the camera follows (the fake camera turns by itself)
 //   15_lock_stopped.png   after the lock button again
 //   16_no_gps_lock.png    a laser shot while the drone has no GPS lock: distance, and why no lat long
+//   17_app_settings.png   Application Settings: the VAMA mark on General, no Help page
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
+// Application Settings is opened by QGC's own address, through the app's
+// override rule, and checked for the client feedback of 2026-10-07 (tasks E
+// and F in DOCS/APK-V1-DEV-PLAN.md).
 // Every QML warning or error is printed; the exit code is 1 when there was one.
 
 #include <QtCore/QDir>
+#include <QtCore/QFile>
+#include <QtCore/QLoggingCategory>
 #include <QtCore/QSettings>
 #include <QtCore/QTimer>
 #include <QtGui/QGuiApplication>
@@ -30,6 +36,7 @@
 #include <QtGui/QMouseEvent>
 #include <QtNetwork/QNetworkDatagram>
 #include <QtNetwork/QUdpSocket>
+#include <QtQml/QQmlAbstractUrlInterceptor>
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
@@ -38,6 +45,7 @@
 #include <functional>
 #include <utility>
 
+#include "ColoredSvgImageProvider.h"
 #include "MultiVehicleManager.h"
 #include "SkydroidLink.h"
 #include "SkydroidTop.h"
@@ -132,9 +140,11 @@ class FakeGlobal : public QObject
     Q_OBJECT
     Q_PROPERTY(QObject *videoManager READ videoManager CONSTANT)
     Q_PROPERTY(QObject *settingsManager READ settingsManager CONSTANT)
+    Q_PROPERTY(qreal zOrderTopMost READ zOrderTopMost CONSTANT)
 
 public:
     QObject *videoManager() { return &_videoManager; }
+    qreal zOrderTopMost() const { return 1000; }  // QGC's value
     QObject *settingsManager() { return &settings; }
     FakeSettingsManager settings;
 
@@ -223,10 +233,41 @@ private:
     QTimer _follow;
 };
 
+/// The app's override rule (CustomOverrideInterceptor in CustomPlugin.cc): a
+/// qrc address is answered by its copy under /Custom when custom.qrc has one.
+class OverrideInterceptor : public QQmlAbstractUrlInterceptor
+{
+public:
+    QUrl intercept(const QUrl &url, QQmlAbstractUrlInterceptor::DataType type) override
+    {
+        switch (type) {
+        case QQmlAbstractUrlInterceptor::QmlFile:
+        case QQmlAbstractUrlInterceptor::UrlString:
+            if (url.scheme() == QStringLiteral("qrc")) {
+                const QString origPath = url.path();
+                const QString overrideRes = QStringLiteral(":/Custom%1").arg(origPath);
+                if (QFile::exists(overrideRes)) {
+                    const QString relPath = overrideRes.mid(2);
+                    QUrl result;
+                    result.setScheme(QStringLiteral("qrc"));
+                    result.setPath('/' + relPath);
+                    return result;
+                }
+            }
+            break;
+        default:
+            break;
+        }
+        return url;
+    }
+};
+
 int main(int argc, char *argv[])
 {
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     qInstallMessageHandler(messageHandler);
+    // QGC's image provider logs every icon it draws.
+    QLoggingCategory::setFilterRules(QStringLiteral("QmlControls.ColoredSvgImageProvider.debug=false"));
     QGuiApplication app(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("VamaPreview"));
     QCoreApplication::setApplicationName(QStringLiteral("VamaPreview"));
@@ -256,7 +297,10 @@ int main(int argc, char *argv[])
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "SkydroidLink", &link);
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "QGroundControl", &global);
 
+    OverrideInterceptor interceptor;  // declared first: the engine must not outlive it
     QQmlApplicationEngine engine;
+    engine.addUrlInterceptor(&interceptor);
+    engine.addImageProvider(QLatin1String(ColoredSvgImageProvider::ProviderId), new ColoredSvgImageProvider);
     engine.addImportPath(QStringLiteral(VAMA_PREVIEW_DIR "/stubs"));
     engine.load(QUrl::fromLocalFile(QStringLiteral(VAMA_PREVIEW_DIR "/main.qml")));
     if (engine.rootObjects().isEmpty()) {
@@ -299,6 +343,97 @@ int main(int argc, char *argv[])
     };
 
     int anglesBeforeLock = 0;
+
+    // Application Settings (client feedback 2026-10-07, tasks E and F).
+    QQuickWindow *settingsWindow = nullptr;
+    std::function<void(QQuickItem *, QList<QQuickItem *> &)> collect = [&](QQuickItem *item, QList<QQuickItem *> &out) {
+        out.append(item);
+        for (QQuickItem *child : item->childItems()) {
+            collect(child, out);
+        }
+    };
+    auto openAppSettings = [&]() {
+        const qsizetype windows = engine.rootObjects().size();
+        engine.load(QUrl::fromLocalFile(QStringLiteral(VAMA_PREVIEW_DIR "/settings.qml")));
+        if (engine.rootObjects().size() == windows ||
+            !(settingsWindow = qobject_cast<QQuickWindow *>(engine.rootObjects().last()))) {
+            std::fprintf(stderr, "settings window not loaded\n");
+            ++g_problems;
+            return;
+        }
+        // As MainWindow.showSettingsTool() does: QGC's own address.
+        QMetaObject::invokeMethod(settingsWindow, "showSettingsTool", Q_ARG(QVariant, QVariant(QStringLiteral(""))));
+    };
+    auto checkAppSettings = [&]() {
+        if (!settingsWindow) {
+            return;
+        }
+        QList<QQuickItem *> items;
+        collect(settingsWindow->contentItem(), items);
+        QObject *screen = nullptr;
+        QQuickItem *general = nullptr;
+        QQuickItem *help = nullptr;
+        QStringList shown;
+        int dividers = 0;
+        for (QQuickItem *item : std::as_const(items)) {
+            const QString name = item->objectName();
+            if (name == QStringLiteral("toolDrawerLoader")) {
+                screen = item->property("item").value<QObject *>();
+            } else if (name.startsWith(QStringLiteral("settingsButton_"))) {
+                const QString page = name.mid(15);
+                if (page == QStringLiteral("General")) {
+                    general = item;
+                } else if (page == QStringLiteral("Help")) {
+                    help = item;
+                }
+                if (item->isVisible()) {
+                    shown.append(page);
+                }
+            } else if (name.startsWith(QStringLiteral("settingsDivider_")) && item->isVisible()) {
+                ++dividers;
+            }
+        }
+        // The preview has no QGC AppSettings.qml, so anything that loads is the copy.
+        expect(screen && screen->property("_vamaLeftOutPages").isValid(),
+               "settings: QGC's address opened the VAMA copy (custom.qrc)",
+               screen ? QString::fromLatin1(screen->metaObject()->className()) : QStringLiteral("nothing loaded"));
+        if (!screen) {
+            return;
+        }
+
+        // Task E: the General button shows the VAMA mark, drawn by QGC's tinting.
+        QQuickItem *content = general ? general->property("contentItem").value<QQuickItem *>() : nullptr;
+        QQuickItem *icon = (content && !content->childItems().isEmpty()) ? content->childItems().first() : nullptr;
+        QQuickItem *image = (icon && !icon->childItems().isEmpty()) ? icon->childItems().first() : nullptr;
+        const QString iconSource = icon ? icon->property("source").toUrl().toString() : QString();
+        const int imageStatus = image ? image->property("status").toInt() : -1;
+        expect(general && general->isVisible() && iconSource == QStringLiteral("/custom/img/vama_logo_white.svg") &&
+                   imageStatus == 1,
+               "settings: the General page shows the VAMA mark (task E)",
+               QStringLiteral("%1, image status %2").arg(iconSource).arg(imageStatus));
+
+        // Task F: no Help page, every other page of the release APK, and no
+        // divider left over around Help.
+        expect(help && !help->isVisible(), "settings: no Help page (task F)",
+               help ? (help->isVisible() ? QStringLiteral("shown") : QStringLiteral("hidden")) : QStringLiteral("no Help button"));
+        const QStringList pages = {
+            QStringLiteral("General"), QStringLiteral("Fly View"), QStringLiteral("3D View"), QStringLiteral("Plan View"),
+            QStringLiteral("ADSB Server"), QStringLiteral("Comm Links"), QStringLiteral("App Logging"),
+            QStringLiteral("App Log Viewer"), QStringLiteral("Maps"), QStringLiteral("NTRIP/RTK"),
+            QStringLiteral("Remote ID"), QStringLiteral("Telemetry"), QStringLiteral("Video")};
+        expect(shown == pages, "settings: QGC's other pages are all there", shown.join(QStringLiteral(", ")));
+        expect(dividers == 1, "settings: one divider, none left over by the Help page", QString::number(dividers));
+
+        const QImage picture = settingsWindow->grabWindow();
+        const QString path = outDir + QStringLiteral("/17_app_settings.png");
+        picture.save(path);
+        std::fprintf(stderr, "saved %s\n", qPrintable(path));
+
+        // Opening Help by name (showSettingsTool("Help")) must do nothing either.
+        QMetaObject::invokeMethod(settingsWindow, "showSettingsTool", Q_ARG(QVariant, QVariant(QStringLiteral("Help"))));
+        expect(screen->property("_selectedPageIndex").toInt() == 0, "settings: Help cannot be opened by name either",
+               QStringLiteral("page %1").arg(screen->property("_selectedPageIndex").toInt()));
+    };
 
     // The steps, one after another (delay in ms before each).
     const QList<std::pair<int, std::function<void()>>> steps = {
@@ -417,7 +552,8 @@ int main(int argc, char *argv[])
              }
              link.setEnabled(false);
          }},
-        {600, [&]() { shot("6_camera_off.png"); }},
+        {600, [&]() { shot("6_camera_off.png"); openAppSettings(); }},
+        {1000, [&]() { checkAppSettings(); }},
         {100, [&]() { QCoreApplication::quit(); }},
     };
     int delay = 0;
