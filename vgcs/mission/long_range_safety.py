@@ -65,6 +65,22 @@ _BATT_LOW_RETURNS_HOME = {2, 3}
 _RTL_ALT_CM_PER_M = 100.0
 
 
+def rtl_altitude_m(p: dict) -> tuple[float, str] | None:
+    """The RTL height in metres, and the setting it came from.
+
+    ArduCopter 4.7 replaced RTL_ALT (centimetres) with RTL_ALT_M (metres). A
+    4.7 drone has no RTL_ALT at all, so reading only that name left this check
+    "not read yet" on the client's 4.7 drone, every time.
+    """
+    metres = _f(p.get("RTL_ALT_M"))
+    if metres is not None:
+        return float(metres), "RTL_ALT_M"
+    centimetres = _f(p.get("RTL_ALT"))
+    if centimetres is not None:
+        return float(centimetres) / _RTL_ALT_CM_PER_M, "RTL_ALT"
+    return None
+
+
 @dataclass
 class LongRangeReport:
     """Findings, split by whether they should stop the upload."""
@@ -189,17 +205,17 @@ def _check_failsafes(report: LongRangeReport, p: dict) -> None:
 
 def _check_rtl_altitude(report, p: dict, home, pts, dem_elevation_fn) -> None:
     """RTL flies home with nobody watching, so it must clear the ground."""
-    rtl_alt_cm = _f(p.get("RTL_ALT"))
-    if rtl_alt_cm is None:
-        report.unchecked.append("RTL altitude (RTL_ALT not read yet)")
+    found = rtl_altitude_m(p)
+    if found is None:
+        report.unchecked.append("RTL altitude (RTL_ALT or RTL_ALT_M not read yet)")
         return
     if dem_elevation_fn is None:
         report.unchecked.append("Terrain along the route (no DEM loaded)")
         return
-    rtl_alt_m = float(rtl_alt_cm) / _RTL_ALT_CM_PER_M
+    rtl_alt_m, setting = found
     if rtl_alt_m <= 0.0:
         report.warnings.append(
-            "RTL_ALT is 0 — the aircraft returns at its current altitude, "
+            f"{setting} is 0, so the aircraft returns at its current altitude, "
             "whatever that happens to be."
         )
         return
@@ -216,9 +232,13 @@ def _check_rtl_altitude(report, p: dict, home, pts, dem_elevation_fn) -> None:
         report.errors.append(
             f"RTL altitude {rtl_alt_m:.0f} m is not enough to clear the ground on "
             f"the way home: terrain rises {rise:.0f} m above home near "
-            f"{peak_at[0]:.5f}, {peak_at[1]:.5f}. Set RTL_ALT to at least "
-            f"{rise + RTL_TERRAIN_CLEARANCE_M:.0f} m "
-            f"({(rise + RTL_TERRAIN_CLEARANCE_M) * _RTL_ALT_CM_PER_M:.0f} in RTL_ALT)."
+            f"{peak_at[0]:.5f}, {peak_at[1]:.5f}. Set {setting} to at least "
+            f"{rise + RTL_TERRAIN_CLEARANCE_M:.0f} m"
+            + (
+                f" ({(rise + RTL_TERRAIN_CLEARANCE_M) * _RTL_ALT_CM_PER_M:.0f} in RTL_ALT)."
+                if setting == "RTL_ALT"
+                else "."
+            )
         )
 
 

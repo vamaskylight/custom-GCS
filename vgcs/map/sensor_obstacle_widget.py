@@ -45,6 +45,9 @@ _NO_READING_CM = 0xFFFF
 
 _CARD_WIDTH_PX = 200
 _RADAR_PLOT_PX = 184
+# Idle sweep: 6.4 degrees every 90 ms, about 71 degrees a second.
+_SWEEP_FRAME_MS = 90
+_SWEEP_STEP_DEG = 6.4
 _PANEL_WIDTH_PX = _CARD_WIDTH_PX
 
 _HUD_TEXT = QColor(230, 238, 252)
@@ -193,15 +196,20 @@ class ObstacleRadarCanvas(QWidget):
         self._stale = True
         self._has_proximity = False
         self._sweep_deg = 0.0
+        # The idle sweep turns at about 71 degrees a second. It was drawn every
+        # 45 ms, and with its see-through corners each frame also redraws the
+        # map under it: the largest single cost on the window's thread in the
+        # window test against the simulator (2026-10-07). Every 90 ms, twice
+        # the step, turns it just as fast for half the drawing.
         self._anim = QTimer(self)
-        self._anim.setInterval(45)
+        self._anim.setInterval(_SWEEP_FRAME_MS)
         self._anim.timeout.connect(self._advance_sweep)
         self._anim.start()
 
     def _advance_sweep(self) -> None:
         if self._has_proximity:
             return
-        self._sweep_deg = (self._sweep_deg + 3.2) % 360.0
+        self._sweep_deg = (self._sweep_deg + _SWEEP_STEP_DEG) % 360.0
         self.update()
 
     def set_obstacle_state(self, state: ObstacleDistanceState) -> None:

@@ -66,6 +66,7 @@ from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.rtk_corrections import CorrectionStream
 from vgcs.app.rtk_status import RtkStatus
 from vgcs.app.vehicle_messages import VehicleMessageBoard
+from vgcs.app.vehicle_params import EDITABLE as EDITABLE_PARAMS
 from vgcs.app.wind_monitor import DEFAULT_WARN_MPS, KEY_WIND_WARN_MPS, WindMonitor
 from vgcs.app.window import MainWindowMixins
 from vgcs.app.window.helpers import _settings_truthy
@@ -246,19 +247,9 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._btn_apply_fence = QPushButton("Upload fence")
         self._btn_apply_fence.setEnabled(False)
         self._param_name_combo = QComboBox()
-        self._param_name_combo.addItems(
-            [
-                "WPNAV_SPEED",
-                "RTL_ALT",
-                "FENCE_ENABLE",
-                "FENCE_RADIUS",
-                "ARMING_CHECK",
-                "ACRO_OPTIONS",
-                "ACRO_TRAINER",
-                "SIMPLE",
-                "SUPER_SIMPLE",
-            ]
-        )
+        # Both firmware's names until the drone has answered; then only its own
+        # (vgcs/app/vehicle_params.py, _refresh_param_name_list).
+        self._param_name_combo.addItems(list(EDITABLE_PARAMS))
         self._param_value_spin = QDoubleSpinBox()
         self._param_value_spin.setRange(-100000.0, 100000.0)
         self._param_value_spin.setDecimals(3)

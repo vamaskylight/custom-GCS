@@ -471,6 +471,14 @@ class MainWindowTelemetryMixin:
         self._last_heartbeat_mono = time.monotonic()
         # Contact is back, so the next outage gets announced again.
         self._link_timeout_announced = False
+        # And the watchdog says so. It used to keep "Lost · 2.0s no MAVLink"
+        # after the radio came back, for the rest of the flight (window test
+        # against the simulator, 2026-10-07).
+        if getattr(self, "_watchdog_lost", False):
+            self._watchdog_lost = False
+            self._watchdog.setText(f"OK · {self._timeout_s:.1f}s")
+            self._apply_state_style(self._watchdog, "ok")
+            self._append_log("GCS link watchdog: messages are back")
         if not self._heartbeat_seen:
             self._heartbeat_seen = True
             self._hb_connected_since_mono = time.monotonic()
@@ -483,6 +491,11 @@ class MainWindowTelemetryMixin:
             # the first heartbeat, rather than at port-open — an open serial port
             # with no vehicle behind it has nothing to report.
             self._show_preflight_dialog()
+            # The settings the mission checks compare against. Answered in the
+            # background, so the telemetry keeps flowing meanwhile.
+            read_params = getattr(self, "_read_vehicle_params_on_connect", None)
+            if read_params is not None:
+                read_params()
         self._hb.setText(f"sys {sysid} · comp {compid} · mav {mav_ver}")
         self._apply_state_style(self._hb, "ok")
         if not self._rid_live_available:

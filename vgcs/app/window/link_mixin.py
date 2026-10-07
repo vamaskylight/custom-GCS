@@ -155,6 +155,11 @@ class MainWindowLinkMixin:
         self._btn_apply_simple.setEnabled(False)
         self._btn_reset.setEnabled(False)
         self._heartbeat_seen = False
+        # Settings read from the last drone are not this one's: a 4.6 and a
+        # 4.7 drone do not even share the names.
+        last_params = getattr(self, "_last_params", None)
+        if last_params is not None:
+            last_params.clear()
         self._connect_attempt_active = True
         self._arm_not_ready_alert_shown = False
         self._arm_not_ready_since_mono = None
@@ -386,6 +391,7 @@ class MainWindowLinkMixin:
         self._apply_state_style(self._hb, "na")
         self._watchdog.setText(f"Idle · {self._timeout_s:.1f}s")
         self._apply_state_style(self._watchdog, "warn")
+        self._watchdog_lost = False
         self._compass.clear()
         self._btn_connect.setEnabled(True)
         if hasattr(self, "_hdr_connect_btn"):
@@ -454,6 +460,7 @@ class MainWindowLinkMixin:
     def _on_link_timeout(self, elapsed_s: float) -> None:
         self._watchdog.setText(f"Lost · {elapsed_s:.1f}s no MAVLink")
         self._apply_state_style(self._watchdog, "bad")
+        self._watchdog_lost = True   # cleared by the next heartbeat (_on_heartbeat)
         self._set_dashboard_flight_status(
             "red",
             "Communication lost - Not Ready to Arm",
@@ -494,7 +501,11 @@ class MainWindowLinkMixin:
         t = str(text or "")
         if "mission_upload" in t or "Mission upload" in t or "mission upload" in t.lower():
             self._mission_upload_pending = False
-        self._set_dashboard_flight_status("red", "Communication lost - Not Ready to Arm")
+        # No "Communication lost" banner here. Most errors are a command the
+        # drone refused ("Auto takeoff failed: ... PreArm ..."), over a link
+        # that is fine, and the banner said the link was lost (window test
+        # against the simulator, 2026-10-07). A link that really fails ends in
+        # link_down or the watchdog, and both of those set the banner.
         if self._connect_attempt_active and not self._heartbeat_seen:
             self._connect_attempt_active = False
             QMessageBox.warning(self, "Connection failed", f"{text}")

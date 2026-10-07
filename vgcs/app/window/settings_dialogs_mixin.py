@@ -858,7 +858,8 @@ class MainWindowSettingsDialogsMixin:
             "group M2 controls (scroll down if needed):\n\n"
             "- Flight mode, takeoff/land (logo → Set Flight Mode when using map-only layout)\n"
             "- Geofence upload\n"
-            "- Parameter refresh/set (WPNAV_SPEED, RTL_ALT, fence, ARMING_CHECK)\n"
+            "- Parameter refresh/set (speed, RTL height, fence, arming checks; the list shows "
+            "this drone's own names, ArduCopter 4.7 renamed several)\n"
             "- Map tiles online/offline\n\n"
             "Tip: connect first, then use Refresh params / Set param.",
         )

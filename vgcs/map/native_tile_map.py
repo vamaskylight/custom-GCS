@@ -55,6 +55,9 @@ _TILE_MAX_ACTIVE_HTTP = 24
 # Esri World Imagery is reliable through 19; higher LODs often return placeholders and stall the UI.
 _ESRI_WORLD_IMAGERY_MAX_ZOOM = 19
 _TILE_PLACEHOLDER_MAX_RETRIES = 3
+# After the quick retries, a tile that still fails is asked for again at most
+# this often (the network may come back, or a cache may be filled meanwhile).
+_TILE_GIVE_UP_RETRY_S = 60.0
 _TILE_MEMORY_CAP = 640
 _TILE_CACHE_ROOT = (Path.home() / ".vgcs" / "tile-cache").resolve()
 
@@ -333,6 +336,14 @@ class _NativeTileLoader(QObject):
     ) -> None:
         if self._priority_z is not None and int(z) != self._priority_z:
             return
+        if network_is_blocked() and str(url).lower().startswith(("http://", "https://")):
+            # The switch must cover this path too: it is the one the map uses.
+            # It only guarded fetch_tile_http_bytes, so a run with
+            # VGCS_NO_NETWORK=1 still fetched from server.arcgisonline.com
+            # (window test against the simulator, 2026-10-07). Answered as a
+            # failed fetch, so the map retries a few times and then stops.
+            QTimer.singleShot(0, lambda: self.loaded.emit(int(z), int(x), int(y), QImage()))
+            return
         self._queue.append((float(distance), z, x, y, url, source_id, use_disk_cache))
         self._queue.sort(key=lambda e: e[0])
         self._drain()
@@ -350,31 +361,41 @@ class _NativeTileLoader(QObject):
             self._active += 1
 
             def _done(r=reply, zz=z, xx=x, yy=y, u=url, sid=source_id, udc=use_disk_cache) -> None:
-                self._active = max(0, self._active - 1)
                 try:
-                    if r.error() == QNetworkReply.NetworkError.NoError:
-                        raw = bytes(r.readAll())
-                        img = QImage.fromData(raw)
-                        if not img.isNull():
-                            accepted = _accept_map_tile(img, raw_byte_len=len(raw), zoom=zz)
-                            if accepted is not None:
-                                if udc and sid and raw:
-                                    try:
-                                        cp = _disk_cache_path(sid, zz, xx, yy)
-                                        cp.parent.mkdir(parents=True, exist_ok=True)
-                                        cp.write_bytes(raw)
-                                    except Exception:
-                                        pass
-                                self.loaded.emit(zz, xx, yy, accepted)
-                                self._drain()
-                                return
-                except Exception:
-                    pass
-                # Never block the GUI thread with a synchronous urllib/Qt refetch here.
-                self.loaded.emit(zz, xx, yy, QImage())
-                self._drain()
+                    self._reply_finished(r, zz, xx, yy, sid, udc)
+                finally:
+                    # Qt leaves a finished reply, and the tile bytes it holds,
+                    # to the caller to delete. Never deleted, every fetch stayed
+                    # in memory for good: about 5 MB a minute over a hover in
+                    # the window test against the simulator (2026-10-07).
+                    r.deleteLater()
 
             reply.finished.connect(_done)
+
+    def _reply_finished(self, r, zz: int, xx: int, yy: int, sid: str, udc: bool) -> None:
+        self._active = max(0, self._active - 1)
+        try:
+            if r.error() == QNetworkReply.NetworkError.NoError:
+                raw = bytes(r.readAll())
+                img = QImage.fromData(raw)
+                if not img.isNull():
+                    accepted = _accept_map_tile(img, raw_byte_len=len(raw), zoom=zz)
+                    if accepted is not None:
+                        if udc and sid and raw:
+                            try:
+                                cp = _disk_cache_path(sid, zz, xx, yy)
+                                cp.parent.mkdir(parents=True, exist_ok=True)
+                                cp.write_bytes(raw)
+                            except Exception:
+                                pass
+                        self.loaded.emit(zz, xx, yy, accepted)
+                        self._drain()
+                        return
+        except Exception:
+            pass
+        # Never block the GUI thread with a synchronous urllib/Qt refetch here.
+        self.loaded.emit(zz, xx, yy, QImage())
+        self._drain()
 
     def _start_worker_fallback(self) -> None:
         if not self._queue:
@@ -797,6 +818,14 @@ class NativeTileMapView(QWidget):
         self._offline_root = None
         if t.startswith("file:"):
             path = QUrl(t).toLocalFile()
+            # The offline folder arrives as a template, ".../tiles/{z}/{x}/{y}.png"
+            # (activate_offline_tiles). The folder is the part before {z}. Kept
+            # whole, no tile path ever matched: the map found "no tiles for this
+            # location" and fell back to Esri at every start (window test
+            # against the simulator, 2026-10-07).
+            cut = path.find("{z}")
+            if cut >= 0:
+                path = path[:cut]
             if path:
                 self._offline_root = str(Path(path).resolve())
                 self._tile_template = "{local}"
@@ -1729,9 +1758,15 @@ class NativeTileMapView(QWidget):
         self._preview_tiles.pop(key, None)
         retries = int(self._tile_retry_count.get(key, 0) or 0) + 1
         self._tile_retry_count[key] = retries
-        if retries > _TILE_PLACEHOLDER_MAX_RETRIES:
-            return
         now = time.monotonic()
+        if retries > _TILE_PLACEHOLDER_MAX_RETRIES:
+            # Out of quick retries. This used to return with no wait set, so
+            # the next repaint asked for the tile again, and every repaint
+            # after that: with no network, each missing tile was requested
+            # several times a second for as long as VGCS ran (about 1300
+            # requests a second in a 10 minute window test, 2026-10-07).
+            self._tile_retry_after[key] = now + _TILE_GIVE_UP_RETRY_S
+            return
         wait = float(self._tile_retry_after.get(key, 0.0) or 0.0)
         if now < wait:
             return

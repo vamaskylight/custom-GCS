@@ -1043,7 +1043,7 @@ class PlanFlightPanel(QWidget):
         self._end_action_combo.addItem("Hold position", "hold")
         self._end_action_combo.setToolTip(
             "Appended as the final mission command.\n"
-            "RTL: climb to RTL_ALT, fly home and land.\n"
+            "RTL: climb to the RTL height (RTL_ALT, or RTL_ALT_M on ArduCopter 4.7), fly home and land.\n"
             "Land: descend and land where the last waypoint is.\n"
             "Hold: no terminal command — the vehicle hovers at the last waypoint."
         )

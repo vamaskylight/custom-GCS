@@ -356,6 +356,13 @@ class MainWindowUiLayoutMixin:
         (idle disconnected). Use ``red`` only for the JS ``else`` branch (communication lost).
         """
         st = (state or "").strip().lower()
+        # setStyleSheet on the whole header bar re-polishes every widget in it,
+        # and the banner is refreshed several times a second with the same
+        # colour. Only a change of colour is applied (window test against the
+        # simulator, 2026-10-07: about 3 % of the window's thread went here).
+        if getattr(self, "_link_banner_palette_state", None) == st:
+            return
+        self._link_banner_palette_state = st
         if st == "green":
             bg = "rgba(24, 82, 38, 0.96)"
             bd = "rgba(94, 214, 119, 0.95)"
@@ -957,19 +964,24 @@ class MainWindowUiLayoutMixin:
         return col
 
     def _apply_state_style(self, label: QLabel, state: str) -> None:
-        label.setProperty("state_role", state)
         colors = self._theme_colors
         if state == "ok":
-            label.setStyleSheet(f"color: {colors['ok']}; font-weight: 600;")
+            sheet = f"color: {colors['ok']}; font-weight: 600;"
         elif state == "warn":
-            label.setStyleSheet(f"color: {colors['warn']}; font-weight: 600;")
+            sheet = f"color: {colors['warn']}; font-weight: 600;"
         elif state == "bad":
-            label.setStyleSheet(f"color: {colors['bad']}; font-weight: 600;")
+            sheet = f"color: {colors['bad']}; font-weight: 600;"
         elif state == "na":
-            label.setStyleSheet(f"color: {colors['na']};")
+            sheet = f"color: {colors['na']};"
         else:
-            label.setProperty("state_role", "")
-            label.setStyleSheet("")
+            state, sheet = "", ""
+        # This runs on most telemetry messages, nearly always with the style
+        # the label already has, and setStyleSheet re-polishes the widget even
+        # then. A theme change gives a different sheet, so it still applies.
+        if label.property("state_role") == state and label.styleSheet() == sheet:
+            return
+        label.setProperty("state_role", state)
+        label.setStyleSheet(sheet)
 
     def _build_theme_colors(self, theme_name: str) -> dict[str, str]:
         themes = {

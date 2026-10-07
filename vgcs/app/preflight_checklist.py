@@ -139,7 +139,11 @@ def build_preflight_checks(
             PreflightCheck(
                 "prearm", "Vehicle arming checks", STATUS_UNKNOWN,
                 "No verdict from the autopilot yet"
-                + (" (ARMING_CHECK may be disabled)" if prearm_reported is False else ""),
+                + (
+                    " (the arming checks may be switched off: ARMING_CHECK on 4.6, ARMING_SKIPCHK on 4.7)"
+                    if prearm_reported is False
+                    else ""
+                ),
                 authoritative=True,
             )
         )

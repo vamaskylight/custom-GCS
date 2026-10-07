@@ -1,0 +1,93 @@
+# VGCS system tests (milestone M17)
+
+These tests run VGCS against the real ArduCopter program in ArduPilot's simulator (SITL).
+The unit tests in `tests/` check pieces of VGCS one at a time.
+These check that the pieces work together with a real autopilot, on both firmware versions the client flies (4.6.2 and 4.7.0).
+
+Nothing goes over the network.
+The simulator runs in WSL on this computer, and VGCS talks to it through `127.0.0.1`.
+
+## What is real and what is simulated
+
+Real:
+
+- the ArduCopter program itself, the same code that flies the drones (built for the simulator),
+- VGCS's link code (`vgcs/link/mavlink_thread.py`), and in the window test the whole VGCS window.
+
+Simulated: the airframe, the motors, the sensors, the GPS and the wind.
+
+VGCS saying "done" is never taken as proof.
+A second, independent connection to the simulator (`drone/test/sitl_session.py`) checks what the drone really did.
+
+## Set up once
+
+The same set-up as the wind failsafe tests, see [drone/README.md](../drone/README.md):
+
+- Windows with WSL and the `Ubuntu-24.04` distribution,
+- `py` (Python on Windows) with `pymavlink` and `PySide6`,
+- the simulator programs, downloaded once with `drone/test/setup_sitl.sh`.
+
+## Run
+
+From the repo root:
+
+```powershell
+py system_test/vgcs_sitl_test.py                      # 8 cases on 4.6.2 and 4.7.0, about 4 minutes
+py system_test/vgcs_sitl_test.py 4.7.0 -k mission     # one version, only cases with "mission" in the name
+py system_test/vgcs_sitl_test.py --report results.md  # also write the results as Markdown
+
+py system_test/vgcs_window_test.py                    # the whole window, 4.7.0, 3 minute hover, about 6 minutes
+py system_test/vgcs_window_test.py 4.6.2 --minutes 1
+py system_test/vgcs_window_test.py --speedup 10       # ten times the message rate: a stress test
+py system_test/vgcs_window_test.py --report window.md
+```
+
+Only one simulator can run at a time (it always uses TCP port 5760).
+Do not run two of these scripts, or a wind failsafe test, at the same time.
+
+## `vgcs_sitl_test.py`: the link against the drone
+
+VGCS's `MavlinkThread` connects to the simulator's second port (`tcp:127.0.0.1:5762`), and every command goes through the same `queue_...` call the buttons use.
+The simulated clock runs 10 times faster than real time.
+
+| Case | What it flies |
+|------|---------------|
+| connect_and_telemetry | connect, every kind of data arrives, position, height, GPS, battery and the arm verdict match the drone |
+| modes_and_arming_on_the_ground | four mode changes confirmed by the drone, arm, disarm, emergency motor stop |
+| refusals_say_why | no GPS: take-off refused with the drone's reason and the mode put back; in the air LOITER refused "requires position"; landing without GPS |
+| parameters | the settings VGCS reads exist on this firmware (4.6 and 4.7 names differ), a write is confirmed, a missing name is reported as not written |
+| mission_upload_and_download | a 4 waypoint mission goes up and comes back the same, to the centimetre |
+| mission_flight | start from the ground, pause, resume, skip a waypoint, return and land at home |
+| takeoff_fence_and_land | a 40 m fence with a 30 m height limit: the drone turns back at both, VGCS shows RTL and the drone's message, landing from VGCS |
+| link_silence | the radio goes quiet in flight (the simulator is frozen), VGCS reports it within its 2 second watchdog, and recovers by itself |
+
+## `vgcs_window_test.py`: the window, and how well it keeps up
+
+Builds the real main window off-screen, types the simulator's address into the connection box and presses Connect.
+Then it flies through the window's own button handlers: a take-off the drone refuses, a real take-off, a mode change, a hover, a radio silence, and landing.
+The window's own labels are read to check what the operator would have seen.
+
+During the hover it measures how late the window's event loop runs, the time spent in the telemetry handler, CPU and memory.
+The map's web view runs in separate QtWebEngine processes, which are not counted.
+
+Your own VGCS settings are never touched.
+Every QSettings in the test process is sent to an INI file in a temporary folder before VGCS is imported.
+
+Nothing is fetched from the internet.
+The map draws from an offline tile folder the test makes for itself (coloured squares around the start view and the simulator's home), and a check fails if the map asks for any internet tile.
+Do not remove that check: before 2026-10-07 VGCS's no-network switch did not cover the map, and a test run fetched satellite tiles and wrote them into `~/.vgcs/tile-cache`.
+
+## Traps (each cost time once)
+
+- ArduCopter accepts any mode while it is disarmed: it checks the mode when it arms.
+  A "refused mode" has to be tested in the air.
+- ArduCopter refuses a fly-to point outside its fence, and in GUIDED it stops short of the fence by itself (`AVOID_ENABLE`).
+  To breach a fence on purpose, fly on speed commands with `AVOID_ENABLE 0`.
+- `SIM_GPS1_ENABLE 0` in the start-up file did not stop the simulated GPS on 4.7.0.
+  Set it by MAVLink after start-up (`Sitl.gps_off()`).
+- pymavlink sends a mode change as `MAV_CMD_DO_SET_MODE`.
+  ArduPilot answers it with an ack at once, and the STATUSTEXT with the reason comes a moment later.
+- VGCS's timers (retries, giving up) run on the PC's clock, the simulator's runs 10 times faster.
+  Wait for VGCS results with `Flight.wait_real`, not `Flight.wait`.
+- Freezing the simulator (`pkill -STOP -x arducopter`) is a radio silence: the connection stays open and nothing arrives.
+  Killing it is a closed TCP connection, which is a different case (see the test report).

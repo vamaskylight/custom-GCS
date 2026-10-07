@@ -63,6 +63,7 @@ from vgcs.app.window.helpers import (
 )
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
+from vgcs.app.vehicle_params import READ_ON_CONNECT, editable_on_this_drone
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
 from vgcs.map import MapWidget
@@ -92,19 +93,38 @@ class MainWindowParamsMixin:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before parameter fetch.")
             return
-        names = [
-            "WPNAV_SPEED",
-            "RTL_ALT",
-            "FENCE_ENABLE",
-            "FENCE_RADIUS",
-            "ARMING_CHECK",
-            "ACRO_OPTIONS",
-            "ACRO_TRAINER",
-            "SIMPLE",
-            "SUPER_SIMPLE",
-        ]
-        self._thread.queue_params_fetch(names)
+        # Both the ArduCopter 4.6 and 4.7 names (vgcs/app/vehicle_params.py).
+        self._thread.queue_params_fetch(list(READ_ON_CONNECT))
         self._append_log("Param fetch queued")
+
+    def _read_vehicle_params_on_connect(self) -> None:
+        """Read the settings VGCS checks, once the drone has answered.
+
+        The 10 km mission check compares the plan with the RTL height, the
+        fence and the failsafes, and it only had what "Refresh params" had
+        fetched by hand. Without that it reported them "not read yet" and
+        checked nothing (found during the M17 simulator test work, 2026-10-07).
+        """
+        thread = getattr(self, "_thread", None)
+        if thread is None or not thread.isRunning():
+            return
+        thread.queue_params_fetch(list(READ_ON_CONNECT))
+
+    def _refresh_param_name_list(self) -> None:
+        """Keep only the "Set param" names this drone has (4.6 and 4.7 differ)."""
+        combo = self._param_name_combo
+        names = editable_on_this_drone(self._last_params)
+        shown = [combo.itemText(i) for i in range(combo.count())]
+        if shown == names:
+            return
+        current = combo.currentText().strip().upper()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(names)
+        if current in names:
+            combo.setCurrentText(current)
+        combo.blockSignals(False)
+        self._on_param_name_changed()
 
     def _on_param_name_changed(self, _text: str = "") -> None:
         name = self._param_name_combo.currentText().strip().upper()
@@ -146,6 +166,7 @@ class MainWindowParamsMixin:
                 self._last_params[str(k).strip().upper()] = float(v)
             except Exception:
                 continue
+        self._refresh_param_name_list()
         cur = self._param_name_combo.currentText().strip().upper()
         if cur in data:
             self._param_value_spin.setValue(float(data[cur]))

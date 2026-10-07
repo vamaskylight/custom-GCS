@@ -120,14 +120,24 @@ class MapTilesMixin:
                 pass
             return
         self._native_tile_startup_retries = retries + 1
+        # An offline folder that has tiles for this place is kept. This check
+        # also runs at once from _ensure_native_map_visible, before any tile
+        # has had time to load, and it used to switch such a folder to Esri
+        # within the first second, every start (window test, 2026-10-07).
+        keep_local = "{local}" in tmpl and self._offline_folder_covers_view(nm)
         try:
             print(
                 f"[VGCS:map] native tiles still loading (loaded={n}) — "
-                f"{'switching to Esri' if '{local}' in tmpl else 'nudge fetch'}"
+                f"{'switching to Esri' if '{local}' in tmpl and not keep_local else 'nudge fetch'}"
             )
         except Exception:
             pass
-        if "{local}" in tmpl:
+        if keep_local:
+            try:
+                nm.prefetch_viewport_tiles()
+            except Exception:
+                pass
+        elif "{local}" in tmpl:
             try:
                 self.activate_satellite_tiles()
             except Exception:
@@ -148,6 +158,14 @@ class MapTilesMixin:
         except Exception:
             pass
 
+    @staticmethod
+    def _offline_folder_covers_view(nm) -> bool:
+        """Whether the offline tile folder has a tile where the map is looking."""
+        try:
+            return bool(nm.local_viewport_has_tiles())
+        except Exception:
+            return False
+
     def _native_tile_startup_check_final(self) -> None:
         if getattr(self, "_native_tile_fallback_done", False):
             return
@@ -165,6 +183,8 @@ class MapTilesMixin:
             return
         self._native_tile_fallback_done = True
         tmpl = str(getattr(nm, "_tile_template", "") or "").lower()
+        if "{local}" in tmpl and self._offline_folder_covers_view(nm):
+            return
         if "{local}" in tmpl or n <= 0:
             try:
                 print("[VGCS:map] tiles still missing — activating Esri World Imagery")

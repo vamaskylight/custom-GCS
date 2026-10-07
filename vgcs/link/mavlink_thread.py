@@ -24,6 +24,7 @@ from vgcs.mission import (
     build_mission_plan,
     normalize_end_action,
 )
+from vgcs.link.confirmations import ModeChange, ParamReads, ParamWrites, clean_name
 from vgcs.link.rtcm import MAVLINK_PIECE_LEN, to_mavlink_pieces
 from vgcs.skydroid.adapter import GimbalStatus
 
@@ -265,6 +266,12 @@ class MavlinkThread(QThread):
         self._rtcm_queue: deque[bytes] = deque(maxlen=_RTCM_QUEUE_MAX)
         self._rtcm_sequence = 0
         self._rtcm_bytes_sent = 0
+        # Settings and mode changes that are only done once the drone says so
+        # (see vgcs/link/confirmations.py). Answered from the main loop, so
+        # waiting for them never stops the telemetry.
+        self._param_writes = ParamWrites()
+        self._param_reads = ParamReads()
+        self._mode_request: ModeChange | None = None
 
     def get_cached_gimbal_status(self) -> GimbalStatus | None:
         with self._gimbal_lock:
@@ -576,12 +583,14 @@ class MavlinkThread(QThread):
             self._process_pending_commands()
             self._maybe_send_gcs_heartbeat()
             self._send_pending_rtcm()
+            self._tick_confirmations()
             try:
-                # Short wait while corrections flow, so they are not held back
-                # for up to a second on a link where the vehicle is quiet.
+                # Short wait while corrections flow or a request waits for its
+                # answer, so neither is held back for up to a second on a link
+                # where the vehicle is quiet.
                 msg = self._master.recv_match(
                     blocking=True,
-                    timeout=0.2 if self._rtcm_bytes_sent else 1.0,
+                    timeout=0.2 if (self._rtcm_bytes_sent or self._confirmations_open()) else 1.0,
                 )
             except Exception as e:
                 if not self._running:
@@ -696,6 +705,7 @@ class MavlinkThread(QThread):
                     mode_text = ""
                 if primary:
                     self._remember_vehicle_mode(mode_text)
+                    self._hear_mode(msg)
                 if primary:
                     self._emit_telemetry_payload(
                         "HEARTBEAT",
@@ -735,6 +745,9 @@ class MavlinkThread(QThread):
                 self._handle_statustext(msg)
             elif msg_type == "COMMAND_ACK":
                 self._remember_arm_ack(msg)
+                self._hear_mode_ack(msg)
+            elif msg_type == "PARAM_VALUE":
+                self._hear_param_value(msg)
             elif msg_type == "VFR_HUD":
                 self._emit_telemetry_payload(
                     "VFR_HUD",
@@ -1010,6 +1023,7 @@ class MavlinkThread(QThread):
         except Exception:
             pass
         self._master = None
+        self._cancel_confirmations("the link closed before the drone answered")
         self.link_down.emit()
         self.log_line.emit("Link closed.")
 
@@ -2020,13 +2034,155 @@ class MavlinkThread(QThread):
             self.mode_changed.emit(mode_name, False)
             self.error.emit("Mode change: empty mode")
             return
+        def done(ok: bool, detail: str) -> None:
+            # The reason first, so whoever reacts to the result finds it already said.
+            if ok:
+                self.log_line.emit(f"Mode change confirmed: {detail}")
+            else:
+                self.error.emit(f"Mode change failed: {detail}")
+            self.mode_changed.emit(mode_name, ok)
+
+        self._request_mode(mode_name, done)
+
+    # --- requests answered by the drone (vgcs/link/confirmations.py) -------
+
+    def _request_mode(self, mode_name: str, on_done) -> None:
+        """Ask for a mode. on_done(ok, detail) runs when the drone shows it, refuses it, or never answers.
+
+        set_mode alone is fire and forget, and it is silent even for a mode
+        name this firmware does not have (pymavlink prints "Unknown mode" and
+        sends nothing). Both used to read as done.
+        """
+        try:
+            mapping = self._master.mode_mapping() or {}
+        except Exception:
+            mapping = {}
+        want = mapping.get(str(mode_name))
+        if want is None:
+            on_done(
+                False,
+                f"this drone has no mode {mode_name}" if mapping else "no heartbeat from the drone yet",
+            )
+            return
+        old = getattr(self, "_mode_request", None)
+        if old is not None and not old.done:
+            # A newer request wins. The old one is not reported as failed,
+            # since the operator moved on, not the drone.
+            old.done = True
+            self.log_line.emit(f"Mode change to {old.mode} replaced by {mode_name}")
+        self._mode_request = ModeChange(mode_name, int(want), time.monotonic(), on_done)
         try:
             self._master.set_mode(mode_name)
-            self.log_line.emit(f"Mode change requested: {mode_name}")
-            self.mode_changed.emit(mode_name, True)
         except Exception as e:
-            self.mode_changed.emit(mode_name, False)
-            self.error.emit(f"Mode change failed: {e}")
+            self._mode_request.done = True
+            self._mode_request = None
+            on_done(False, f"could not send it: {e}")
+            return
+        self.log_line.emit(f"Mode change requested: {mode_name}")
+
+    def _hear_mode(self, msg) -> None:
+        """A heartbeat from the flight controller: does it show the mode asked for?"""
+        request = getattr(self, "_mode_request", None)
+        if request is None or msg.get_type() != "HEARTBEAT":
+            return
+        try:
+            request.heard_mode(int(getattr(msg, "custom_mode", -1)))
+        except (TypeError, ValueError):
+            return
+        self._drop_finished_mode_request()
+
+    def _hear_mode_ack(self, msg) -> None:
+        request = getattr(self, "_mode_request", None)
+        if request is None:
+            return
+        try:
+            command = int(getattr(msg, "command", -1))
+            result = int(getattr(msg, "result", -1))
+        except (TypeError, ValueError):
+            return
+        # pymavlink sends the mode change as DO_SET_MODE, and ArduPilot
+        # answers that with an ack at once. The SET_MODE message id is
+        # accepted too, for an autopilot that acks that message instead.
+        if command in (int(mavutil.mavlink.MAVLINK_MSG_ID_SET_MODE), int(mavutil.mavlink.MAV_CMD_DO_SET_MODE)):
+            request.heard_ack(result, time.monotonic())
+            self._drop_finished_mode_request()
+
+    def _drop_finished_mode_request(self) -> None:
+        request = getattr(self, "_mode_request", None)
+        if request is not None and request.done:
+            self._mode_request = None
+
+    def _hear_param_value(self, msg) -> None:
+        if not self._is_primary_source(msg):
+            return
+        name = clean_name(getattr(msg, "param_id", ""))
+        try:
+            value = float(getattr(msg, "param_value", 0.0))
+        except (TypeError, ValueError):
+            return
+        if not name:
+            return
+        self._param_writes.heard(name, value)
+        self._param_reads.heard(name, value)
+
+    def _write_params(self, values: dict[str, float], on_done) -> None:
+        """Send settings. on_done({name: (ok, detail)}) runs once the drone echoed or refused each."""
+        for name, value in self._param_writes.start(values, time.monotonic(), on_done):
+            self._send_param_set(name, value)
+
+    def _send_param_set(self, name: str, value: float) -> None:
+        try:
+            self._param_set_value(name, value)
+        except Exception as e:
+            # Not settled here: the next try goes out from _tick_confirmations,
+            # and after the last one the write is reported as not confirmed.
+            self.log_line.emit(f"Param set {name}: send failed ({e}), will try again")
+
+    def _send_param_request(self, name: str) -> None:
+        try:
+            self._master.mav.param_request_read_send(
+                self._target_sysid,
+                self._target_compid,
+                name.encode("ascii", "ignore"),
+                -1,
+            )
+        except Exception as e:
+            self.log_line.emit(f"Param read {name}: send failed ({e})")
+
+    def _confirmations_open(self) -> bool:
+        return bool(
+            self._param_writes.pending()
+            or self._param_reads.pending()
+            or self._mode_request is not None
+        )
+
+    def _tick_confirmations(self) -> None:
+        """Send again what got no answer, and settle what ran out of time."""
+        if self._master is None:
+            return
+        now = time.monotonic()
+        for name, value in self._param_writes.tick(now):
+            self._send_param_set(name, value)
+        for name in self._param_reads.tick(now):
+            self._send_param_request(name)
+        request = self._mode_request
+        if request is not None:
+            if request.tick(now):
+                try:
+                    self._master.set_mode(request.mode)
+                    self.log_line.emit(f"Mode change to {request.mode}: no answer yet, asked again")
+                except Exception:
+                    pass
+            self._drop_finished_mode_request()
+
+    def _cancel_confirmations(self, reason: str) -> None:
+        self._param_writes.cancel_all(reason)
+        self._param_reads.cancel_all()
+        request = self._mode_request
+        self._mode_request = None
+        if request is not None and not request.done:
+            request.done = True
+            request.on_done(False, reason)
 
     def _ensure_armable_mode_before_arm(self, prefer: tuple[str, ...] = ()) -> str | None:
         """Switch to a mode that can arm. Returns the mode that took, or None.
@@ -2197,10 +2353,34 @@ class MavlinkThread(QThread):
                 continue
             if msg_type == "COMMAND_ACK":
                 self._remember_arm_ack(msg)
+                self._hear_mode_ack(msg)
                 continue
+            self._hear_mode(msg)
+            self._remember_heartbeat_state(msg)
             if predicate(msg):
                 return True
         return False
+
+    def _remember_heartbeat_state(self, msg) -> None:
+        """Keep the mode and armed state current while a wait reads the heartbeats.
+
+        Only the main loop used to record them. A refused take-off switches to
+        GUIDED inside such a wait, so the remembered mode stayed the one before,
+        the "put the mode back" step compared that with itself, did nothing,
+        and left the drone in GUIDED (simulator test, 2026-10-07).
+        """
+        if msg.get_type() != "HEARTBEAT":
+            return
+        try:
+            self._remember_vehicle_mode(str(mavutil.mode_string_v10(msg) or ""))
+        except Exception:
+            pass
+        try:
+            self._vehicle_armed = bool(
+                int(getattr(msg, "base_mode", 0) or 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            )
+        except (TypeError, ValueError):
+            pass
 
     def _remember_vehicle_mode(self, mode_text: str) -> None:
         """Keep the mode the vehicle reports, so a failed takeoff can restore it.
@@ -2265,6 +2445,10 @@ class MavlinkThread(QThread):
         """Keep a pre-arm line and pass the text on to the rest of the app."""
         text = str(getattr(msg, "text", "") or "").strip()
         self._remember_prearm_reason(text)
+        request = getattr(self, "_mode_request", None)
+        if request is not None:
+            request.heard_text(text)
+            self._drop_finished_mode_request()
         self._emit_telemetry_payload(
             "STATUSTEXT",
             {
@@ -2348,13 +2532,20 @@ class MavlinkThread(QThread):
                 self._target_compid,
                 1,
             )
-            self._master.set_mode("AUTO")
+            def done(ok: bool, detail: str) -> None:
+                if ok:
+                    self.action_result.emit("mission_start", True, "AUTO mission started")
+                    self.log_line.emit("Mission start: the drone is in AUTO")
+                else:
+                    self.action_result.emit("mission_start", False, detail)
+                    self.error.emit(f"Mission start failed: {detail}")
+
+            self._request_mode("AUTO", done)
             self._send_command_long(
                 mavutil.mavlink.MAV_CMD_MISSION_START,
                 p1=0.0,
                 p2=0.0,
             )
-            self.action_result.emit("mission_start", True, "AUTO mission start sent")
             self.log_line.emit("Mission start command sent (AUTO)")
         except Exception as e:
             self.action_result.emit("mission_start", False, str(e))
@@ -2370,16 +2561,30 @@ class MavlinkThread(QThread):
             self.action_result.emit("mission_pause", False, "Link not ready")
             return
         self._sync_link_targets()
-        for mode in ("BRAKE", "LOITER", "POSHOLD"):
-            try:
-                self._master.set_mode(mode)
-            except Exception:
-                continue
-            self.action_result.emit("mission_pause", True, f"{mode} — holding position")
-            self.log_line.emit(f"Mission paused: switched to {mode}")
-            return
-        self.action_result.emit("mission_pause", False, "No hold mode accepted (BRAKE/LOITER/POSHOLD)")
-        self.error.emit("Mission pause failed: vehicle rejected BRAKE/LOITER/POSHOLD")
+        # The next hold mode is tried only when the drone has refused the one
+        # before. set_mode never raises for a refusal, so the old loop always
+        # stopped at BRAKE and reported it, taken or not.
+        holds = ["BRAKE", "LOITER", "POSHOLD"]
+        refusals: list[str] = []
+
+        def try_next() -> None:
+            mode = holds.pop(0)
+
+            def done(ok: bool, detail: str) -> None:
+                if ok:
+                    self.action_result.emit("mission_pause", True, f"{mode}, holding position")
+                    self.log_line.emit(f"Mission paused: the drone is in {mode}")
+                    return
+                refusals.append(detail)
+                if holds:
+                    try_next()
+                    return
+                self.action_result.emit("mission_pause", False, "No hold mode taken: " + "; ".join(refusals))
+                self.error.emit("Mission pause failed: " + "; ".join(refusals))
+
+            self._request_mode(mode, done)
+
+        try_next()
 
     def _mission_resume(self) -> None:
         """Back to AUTO, continuing from the vehicle's current mission item."""
@@ -2387,20 +2592,26 @@ class MavlinkThread(QThread):
             self.action_result.emit("mission_resume", False, "Link not ready")
             return
         self._sync_link_targets()
+
+        def done(ok: bool, detail: str) -> None:
+            if ok:
+                self.action_result.emit("mission_resume", True, "AUTO resumed")
+                self.log_line.emit("Mission resumed: the drone is in AUTO")
+            else:
+                self.action_result.emit("mission_resume", False, detail)
+                self.error.emit(f"Mission resume failed: {detail}")
+
+        # No mission_set_current here: that would restart the mission. AUTO alone
+        # resumes at the item the vehicle was on when it was paused.
+        self._request_mode("AUTO", done)
         try:
-            self._master.set_mode("AUTO")
-            # No mission_set_current here: that would restart the mission. AUTO alone
-            # resumes at the item the vehicle was on when it was paused.
             self._send_command_long(
                 mavutil.mavlink.MAV_CMD_MISSION_START,
                 p1=0.0,
                 p2=0.0,
             )
-            self.action_result.emit("mission_resume", True, "AUTO resumed")
-            self.log_line.emit("Mission resumed (AUTO)")
         except Exception as e:
-            self.action_result.emit("mission_resume", False, str(e))
-            self.error.emit(f"Mission resume failed: {e}")
+            self.log_line.emit(f"Mission resume: MISSION_START not sent ({e})")
 
     def _mission_set_current_wp(self, wp_index: int) -> None:
         """Jump to a 0-based operator waypoint, translating through the plan layout."""
@@ -2673,19 +2884,24 @@ class MavlinkThread(QThread):
             self.error.emit("Auto land: link not ready")
             return
         self._sync_link_targets()
-        try:
-            self._master.set_mode("LAND")
-            self.action_result.emit("auto_land", True, "LAND mode engaged")
-            self.log_line.emit("Auto land: LAND mode")
-        except Exception as e:
-            self.log_line.emit(f"Auto land: LAND mode failed ({e}); sending NAV_LAND")
+
+        def done(ok: bool, detail: str) -> None:
+            if ok:
+                self.action_result.emit("auto_land", True, "LAND mode engaged")
+                self.log_line.emit("Auto land: the drone is in LAND")
+                return
+            self.log_line.emit(f"Auto land: {detail}; sending NAV_LAND")
             try:
                 self._send_nav_land()
-                self.action_result.emit("auto_land", True, "NAV_LAND command sent")
-                self.log_line.emit("Auto land: NAV_LAND sent")
             except Exception as e2:
-                self.action_result.emit("auto_land", False, str(e2))
-                self.error.emit(f"Auto land failed: {e2}")
+                self.action_result.emit("auto_land", False, f"{detail}. NAV_LAND failed too: {e2}")
+                self.error.emit(f"Auto land failed: {detail}; NAV_LAND: {e2}")
+                return
+            # Not reported as landing: nothing has shown that it is. The mode
+            # display tells the operator whether NAV_LAND did what LAND did not.
+            self.action_result.emit("auto_land", False, f"{detail}. NAV_LAND sent instead, watch the mode")
+
+        self._request_mode("LAND", done)
 
     def _param_set_value(self, name: str, value: float) -> None:
         if self._master is None:
@@ -2698,16 +2914,26 @@ class MavlinkThread(QThread):
             mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
         )
 
+    def _fence_written(self, results: dict, ok_text: str) -> None:
+        """Report a fence only once the drone has echoed every one of its settings."""
+        failed = [f"{name}: {detail}" for name, (ok, detail) in results.items() if not ok]
+        if failed:
+            self.geofence_result.emit(False, "; ".join(failed))
+            self.error.emit("Geofence not set: " + "; ".join(failed))
+            return
+        self.geofence_result.emit(True, ok_text)
+        self.log_line.emit(f"Geofence confirmed by the drone: {ok_text}")
+
     def _geofence_upload(self, cfg: dict) -> None:
+        if self._master is None:
+            self.geofence_result.emit(False, "Link not ready")
+            return
         if bool(cfg.get("disable")):
-            try:
-                self._param_set_value("FENCE_ENABLE", 0.0)
-                self.geofence_result.emit(True, "Fence disabled")
-                return
-            except Exception as e:
-                self.geofence_result.emit(False, str(e))
-                self.error.emit(f"Geofence disable failed: {e}")
-                return
+            self._write_params(
+                {"FENCE_ENABLE": 0.0},
+                lambda results: self._fence_written(results, "Fence disabled"),
+            )
+            return
 
         points = cfg.get("points")
         if isinstance(points, list) and len(points) >= 3:
@@ -2721,24 +2947,24 @@ class MavlinkThread(QThread):
         # M2 subset fallback: configure ArduPilot circular fence parameters.
         radius_m = max(10.0, float(cfg.get("radius_m", 80.0)))
         alt_max_m = max(5.0, float(cfg.get("alt_max_m", 120.0)))
-        try:
-            self._param_set_value("FENCE_ENABLE", 1.0)
-            # Ensure there is an actual restriction on breach.
-            # Common ArduPilot meanings: 0=None, 1=RTL, 2=Land. Default to RTL.
-            self._param_set_value("FENCE_ACTION", float(cfg.get("action", 1.0)))
-            self._param_set_value("FENCE_TYPE", 2.0)  # circular fence
-            self._param_set_value("FENCE_RADIUS", radius_m)
-            self._param_set_value("FENCE_ALT_MAX", alt_max_m)
-            self.geofence_result.emit(
-                True,
-                f"Fence enabled: radius={radius_m:.0f}m alt_max={alt_max_m:.0f}m",
-            )
-            self.log_line.emit(
-                f"Geofence configured (radius={radius_m:.0f}m, alt={alt_max_m:.0f}m)"
-            )
-        except Exception as e:
-            self.geofence_result.emit(False, str(e))
-            self.error.emit(f"Geofence upload failed: {e}")
+        self._write_params(
+            {
+                "FENCE_ENABLE": 1.0,
+                # Ensure there is an actual restriction on breach.
+                # Common ArduPilot meanings: 0=None, 1=RTL, 2=Land. Default to RTL.
+                "FENCE_ACTION": float(cfg.get("action", 1.0)),
+                # Bit 1 is the height limit, bit 2 the circle. This was 2 (the
+                # circle alone), so FENCE_ALT_MAX was written but never
+                # enforced: the drone could climb through the operator's height
+                # limit (found by the simulator test, 2026-10-07).
+                "FENCE_TYPE": 3.0,
+                "FENCE_RADIUS": radius_m,
+                "FENCE_ALT_MAX": alt_max_m,
+            },
+            lambda results: self._fence_written(
+                results, f"Fence enabled: radius={radius_m:.0f}m alt_max={alt_max_m:.0f}m"
+            ),
+        )
 
     def _upload_polygon_fence(self, points: list[object]) -> None:
         if self._master is None:
@@ -2773,41 +2999,37 @@ class MavlinkThread(QThread):
         if self._master is None:
             self.error.emit("Params fetch: link not ready")
             return
-        out: dict[str, float] = {}
-        for raw in names:
-            name = str(raw).strip().upper()[:16]
-            if not name:
-                continue
-            try:
-                self._master.mav.param_request_read_send(
-                    self._target_sysid,
-                    self._target_compid,
-                    name.encode("ascii", "ignore"),
-                    -1,
-                )
-                msg = self._master.recv_match(
-                    type=["PARAM_VALUE"], blocking=True, timeout=1.0
-                )
-                if msg is None:
-                    continue
-                got_name = str(getattr(msg, "param_id", "") or "").strip("\x00").upper()
-                got_val = float(getattr(msg, "param_value", 0.0) or 0.0)
-                if got_name:
-                    out[got_name] = got_val
-            except Exception:
-                continue
-        self.params_snapshot.emit(out)
-        self.log_line.emit(f"Param fetch complete: {len(out)} values")
+        # Answered from the main loop. This used to wait up to a second per
+        # name with a PARAM_VALUE filter, and everything else the drone sent
+        # meanwhile (position, heartbeat, its messages) was thrown away.
+
+        def done(values: dict, missing: list) -> None:
+            self.params_snapshot.emit(values)
+            self.log_line.emit(
+                f"Param fetch complete: {len(values)} values"
+                + (f"; not on this drone: {', '.join(missing)}" if missing else "")
+            )
+
+        for name in self._param_reads.start(list(names), time.monotonic(), done):
+            self._send_param_request(name)
 
     def _param_set(self, name: str, value: float) -> None:
-        param = str(name).strip().upper()[:16]
+        param = clean_name(name)
         if not param:
             self.param_set_result.emit(name, False, "Empty param name")
             return
-        try:
-            self._param_set_value(param, float(value))
-            self.param_set_result.emit(param, True, f"{value}")
-            self.log_line.emit(f"Param set: {param}={value}")
-        except Exception as e:
-            self.param_set_result.emit(param, False, str(e))
-            self.error.emit(f"Param set failed: {param}: {e}")
+        if self._master is None:
+            self.param_set_result.emit(param, False, "Link not ready")
+            return
+
+        def done(results: dict) -> None:
+            ok, detail = results.get(param, (False, "no answer"))
+            # detail is the value the drone echoed when ok: the window reads it
+            # back as a number.
+            self.param_set_result.emit(param, ok, detail)
+            if ok:
+                self.log_line.emit(f"Param set: {param}={detail} (the drone confirmed it)")
+            else:
+                self.error.emit(f"Param set failed: {param}: {detail}")
+
+        self._write_params({param: float(value)}, done)
