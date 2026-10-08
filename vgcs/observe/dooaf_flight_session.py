@@ -12,7 +12,17 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from vgcs.observe.geo_reference import GeoReferenceResult, compute_lrf_facade_plane_geo
+from vgcs.observe.geo_reference import (
+    GeoReferenceResult,
+    _lrf_camera_dir_ned_unit,
+    compute_lrf_facade_plane_geo,
+)
+
+# A laser point is taken for a point in the air when it is this much higher
+# above the ground under the drone than it is far away from the drone. Ground
+# on a slope of 45 degrees is as high as it is far away, and the margin is for
+# the height itself, which is only known to some metres.
+_IN_THE_AIR_MARGIN_M = 15.0
 
 
 @dataclass
@@ -28,6 +38,9 @@ class FacadeLockSnapshot:
     vehicle_roll_deg: float | None = None
     vehicle_pitch_deg: float | None = None
     vehicle_alt_msl_m: float | None = None
+    # The height above the take-off point, for the check that the drone is
+    # still where the lock was made (uv_pick_valid).
+    vehicle_rel_alt_m: float | None = None
     gps_fix_type: int = 0
     gps_hdop: float | None = None
     # Which way gimbal_yaw_deg counts (GimbalStatus.yaw_left_positive).
@@ -93,6 +106,7 @@ class DooafFacadeSession:
             vehicle_roll_deg=_float_or_none(ctx.get("vehicle_roll_deg")),
             vehicle_pitch_deg=_float_or_none(ctx.get("vehicle_pitch_deg")),
             vehicle_alt_msl_m=_float_or_none(ctx.get("vehicle_alt_msl_m")),
+            vehicle_rel_alt_m=_float_or_none(ctx.get("ekf_rel_alt_m")),
             gps_fix_type=int(ctx.get("gps_fix_type") or 0),
             gps_hdop=_float_or_none(ctx.get("gps_hdop")),
         )
@@ -105,7 +119,12 @@ class DooafFacadeSession:
         max_vehicle_shift_m: float = 8.0,
         max_age_s: float = 600.0,
     ) -> bool:
-        """True when a UV-only pick can reuse the facade lock."""
+        """True when a UV-only pick can reuse the facade lock.
+
+        ``max_vehicle_shift_m`` counts up and down as well as sideways. It
+        counted sideways only, so a lock made on the ground stayed "locked"
+        through a take-off straight up, for ten minutes.
+        """
         lock = self._lock
         if lock is None:
             return False
@@ -129,7 +148,17 @@ class DooafFacadeSession:
             float(clat),
             float(clon),
         )
-        return shift <= float(max_vehicle_shift_m)
+        if shift > float(max_vehicle_shift_m):
+            return False
+        # The same height reference on both sides, the smoother one first.
+        for now_key, then in (
+            ("ekf_rel_alt_m", lock.vehicle_rel_alt_m),
+            ("vehicle_alt_msl_m", lock.vehicle_alt_msl_m),
+        ):
+            now = _float_or_none(ctx.get(now_key))
+            if now is not None and then is not None:
+                return abs(now - float(then)) <= float(max_vehicle_shift_m)
+        return True
 
     def geo_from_uv(
         self,
@@ -188,6 +217,115 @@ def slant_to_ground_range_m(
     except (TypeError, ValueError):
         return s
     return abs(s * math.cos(p))
+
+
+@dataclass(frozen=True)
+class LaserPointInTheAir:
+    """A laser range that cannot be a point on the ground."""
+
+    slant_range_m: float
+    drone_height_m: float  # above the ground under the drone, as far as VGCS knows it
+    point_height_m: float  # of the laser point above that same ground
+
+    def short_text(self) -> str:
+        """One line, for the caption on the video."""
+        return (
+            f"Laser {self.slant_range_m:.1f} m is in the air "
+            f"(drone {self.drone_height_m:.0f} m up)"
+        )
+
+    def _what_was_seen(self) -> str:
+        return (
+            f"The laser gave {self.slant_range_m:.1f} m, but the drone is "
+            f"{self.drone_height_m:.0f} m above the ground.\n"
+            f"A point that close is about {self.point_height_m:.0f} m up in the air, "
+            "not on the ground."
+        )
+
+    def question(self) -> str:
+        """Asked of the operator, who alone can see which of the two it is."""
+        return (
+            f"{self._what_was_seen()}\n\n"
+            "Is the target on a building or a tower right beside the drone?"
+        )
+
+    def not_set_text(self) -> str:
+        """After the operator said that it is not."""
+        return (
+            "The target is not set: the laser did not measure it.\n"
+            "Put the cross on the target and lock again, or fly closer."
+        )
+
+    def text(self) -> str:
+        """The whole of it, where nobody was asked."""
+        return (
+            f"{self._what_was_seen()}\n"
+            "So the laser did not measure the target.\n\n"
+            "Put the cross on the target and lock again, or fly closer."
+        )
+
+
+def laser_point_in_the_air(
+    slant_range_m: float | None, ctx: dict[str, Any]
+) -> LaserPointInTheAir | None:
+    """Say when a laser range cannot be a point on the ground, else None.
+
+    Seen on 2026-10-08: the client flew 83 m up over open ground, the camera
+    5 degrees under the horizon, and the laser lock gave 18.5 m. VGCS put the
+    target 18 m in front of the drone, 81 m up in the air, and worked out a
+    fire correction from there.
+
+    The point is where the look direction and the range put it. It is in the
+    air when it is higher above the ground under the drone than it is far away
+    from the drone, by more than a margin: no slope up to 45 degrees reaches
+    it. The drone's height is the lower of what the autopilot and the terrain
+    file say, so that a drone standing on a roof or a hill is not taken to be
+    high up. None also when the height is not known.
+
+    One thing looks the same and is right: a tower or a tall building right
+    beside the drone. Geometry cannot tell them apart, so the caller asks the
+    operator (DooafOperationsMixin._ask_whether_a_point_in_the_air_is_a_building).
+    """
+    try:
+        slant = float(slant_range_m)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    heights = [
+        h
+        for h in (_float_or_none(ctx.get(key)) for key in ("ekf_rel_alt_m", "measure_agl_m"))
+        if h is not None and math.isfinite(h)
+    ]
+    if not heights or not math.isfinite(slant) or slant < 0.5:
+        return None
+    drone_height = min(heights)
+    down: float | None = None
+    if ctx.get("gimbal_yaw_deg") is not None and ctx.get("gimbal_pitch_deg") is not None:
+        try:
+            ray = _lrf_camera_dir_ned_unit(
+                vehicle_heading_deg=ctx.get("vehicle_heading_deg"),  # type: ignore[arg-type]
+                vehicle_roll_deg=ctx.get("vehicle_roll_deg"),  # type: ignore[arg-type]
+                vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
+                gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+                gimbal_yaw_left_positive=ctx.get("gimbal_yaw_left_positive"),  # type: ignore[arg-type]
+                gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError):
+            ray = None
+        if ray is not None:
+            down = float(ray[0][2])
+    if down is None:
+        # The look direction is not known. Whatever it is, the point is no
+        # lower than straight down, and height minus distance is no less than this.
+        point_height = drone_height - slant
+        spare = drone_height - slant * math.sqrt(2.0)
+    else:
+        point_height = drone_height - slant * down
+        spare = point_height - slant * math.sqrt(max(0.0, 1.0 - down * down))
+    if spare <= _IN_THE_AIR_MARGIN_M:
+        return None
+    return LaserPointInTheAir(
+        slant_range_m=slant, drone_height_m=drone_height, point_height_m=point_height
+    )
 
 
 def format_lrf_range_label(

@@ -17,6 +17,8 @@ without a display.
 
 from __future__ import annotations
 
+import textwrap
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
@@ -29,6 +31,17 @@ from PySide6.QtWidgets import (
 TARGET_HEADING = "Target"
 IMPACT_HEADING = "Fall of Shot"
 UNKNOWN = "unknown"
+NOT_MARKED = "NOT MARKED"
+
+# Below this angle under the horizon the ground point of a click is not worked
+# out (target_measure.is_plausible_ground_range): one degree of error in the
+# camera's angle moves the point by more than a tenth of its distance.
+FLAT_LOOK_DEG = 8.0
+# Below this height the same rule refuses a point more than ten heights away.
+LOW_HEIGHT_M = 8.0
+WHAT_TO_DO = "Tilt the camera down, fly closer or higher, or mark the point on the map."
+# The longest line of a message in the DOOAF window, in letters.
+POPUP_LINE_LETTERS = 46
 
 
 def _grid_reference(lat: float, lon: float) -> str:
@@ -64,6 +77,77 @@ def point_block(heading: str, point: object) -> str:
         f"Alt: {float(alt):.0f} m MSL" if alt is not None else f"Alt: {UNKNOWN}"
     )
     return "\n".join(lines)
+
+
+def _number(row: object, key: str) -> float | None:
+    try:
+        value = row.get(key)  # type: ignore[union-attr]
+        return None if value is None else float(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def why_not_placed(row: object) -> str:
+    """Why a click on the video got no position, and what to do, in plain words.
+
+    The reason is worked out from the click's own numbers where they say it,
+    because the text of the geometry code is written for a log, not for
+    someone flying.
+    """
+    warning = ""
+    try:
+        warning = str(row.get("geo_warning") or "").strip()  # type: ignore[union-attr]
+    except AttributeError:
+        pass
+    low = warning.lower()
+    if "vehicle position missing" in low:
+        return "The drone's GPS position is not known."
+    if "altitude agl unknown" in low:
+        return "The drone's height above the ground is not known."
+    if "parallel to horizon" in low or "does not intersect ground" in low:
+        return f"The click is at the horizon or above it. There is no ground there.\n{WHAT_TO_DO}"
+    if "unrealistic" in low:
+        look = _number(row, "geo_depression_deg")
+        if look is not None and look < FLAT_LOOK_DEG:
+            return (
+                f"The camera looks too flat here: {look:.0f} degrees below the horizon.\n"
+                f"VGCS needs {FLAT_LOOK_DEG:.0f} degrees or more to place a point on the ground.\n"
+                f"{WHAT_TO_DO}"
+            )
+        height = _number(row, "measure_agl_m")
+        if height is None:
+            height = _number(row, "ekf_rel_alt_m")
+        if height is not None and height < LOW_HEIGHT_M:
+            return (
+                f"The drone is only {height:.0f} m above the ground, too low for a point that far away.\n"
+                "Fly higher, or mark the point on the map."
+            )
+        # Neither flat nor low: the ground at the click is much further than
+        # level ground would be (a valley in the terrain file).
+        return f"The ground at this click is too far away for the drone's height.\n{WHAT_TO_DO}"
+    if warning:
+        return f"{warning}\n{WHAT_TO_DO}"       # the log's own words, when nothing above fits
+    return f"VGCS could not work out where this point is.\n{WHAT_TO_DO}"
+
+
+def not_marked_text(heading: str, row: object, kept: str = "") -> str:
+    """The read-out for a click that got no position.
+
+    Shown in place of the numbers. A click that leaves the popup as it was
+    reads as a click that changed nothing, and a popup that still shows the
+    round before reads as this round's answer.
+
+    Broken into short lines here: the window does not wrap by itself, and it
+    should stay about as wide as it is with the numbers in it.
+    """
+    blocks = [f"{heading}: {NOT_MARKED}", _short_lines(why_not_placed(row))]
+    if kept:
+        blocks.append(_short_lines(str(kept)))
+    return "\n\n".join(blocks)
+
+
+def _short_lines(text: str) -> str:
+    return "\n".join(textwrap.fill(line, POPUP_LINE_LETTERS) for line in str(text).split("\n"))
 
 
 def correction_block(correction: object) -> str:

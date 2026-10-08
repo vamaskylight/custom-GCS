@@ -83,14 +83,18 @@ LaserResult computeLaserTarget(const LaserInput &in)
     const double u = std::max(0.0, std::min(1.0, in.videoXNorm));
     const double v = std::max(0.0, std::min(1.0, in.videoYNorm));
     const double azOff = (u - 0.5) * hfov;
-    const double elOff = (v - 0.5) * vfov;
+    // How far the point looks UP from the cross. The picture's v counts from
+    // the top, so a point below the cross looks further down. Until
+    // 2026-10-08 this had the other sign, here and in VGCS (_click_tilt_deg).
+    // The app only asks for the cross itself, where it makes no difference.
+    const double elTilt = -(v - 0.5) * vfov;
 
     const Mat nedBody = mul(rotZ(rad(in.vehicleHeadingDeg)),
                             mul(rotY(rad(in.vehiclePitchDeg)), rotX(rad(in.vehicleRollDeg))));
     // The camera's own number, turned so that right of the nose is positive.
     const double gimbalYawRight = in.gimbalYawLeftPositive ? -in.gimbalYawDeg : in.gimbalYawDeg;
     const Mat bodyGimbal = mul(rotZ(rad(gimbalYawRight)), rotY(rad(in.gimbalPitchDeg)));
-    const Mat gimbalCam = mul(rotY(rad(elOff)), rotZ(rad(azOff)));
+    const Mat gimbalCam = mul(rotY(rad(elTilt)), rotZ(rad(azOff)));
     const Mat nedCam = mul(nedBody, mul(bodyGimbal, gimbalCam));
     const Vec dir = mulVec(nedCam, {1.0, 0.0, 0.0});
     const double mag = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);

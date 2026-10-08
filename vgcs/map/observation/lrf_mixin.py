@@ -769,6 +769,9 @@ class LrfVideoLockMixin:
         # Bound the captured reason to THIS attempt — otherwise a later failure
         # whose own reason is empty would surface a stale one from before.
         self._lrf_last_lock_reason = ""
+        self._lrf_range_in_the_air = None
+        self._lrf_range_in_the_air_asked = False
+        self._lrf_in_the_air_accepted_m = None
         fw, fh = 1280, 720
         task = LrfLockTask(
             cc,
@@ -877,6 +880,38 @@ class LrfVideoLockMixin:
                     "centre crosshair, then click to lock."
                 )
                 return
+            # The camera answered with a range, but not one of a point on the
+            # ground (18.5 m from a drone 83 m up, client photo 2026-10-08).
+            # For a DOOAF point that is the same as no range: the pick goes on
+            # as it does when the laser declines, and the reason goes with it.
+            # A tower right beside the drone gives the same numbers and is
+            # right, so for a target or a gun the operator is asked.
+            in_the_air_fn = getattr(self, "_laser_range_in_the_air", None)
+            in_the_air = (
+                in_the_air_fn(slant_m)
+                if slant_m is not None and callable(in_the_air_fn)
+                else None
+            )
+            self._lrf_range_in_the_air = None
+            self._lrf_range_in_the_air_asked = False
+            self._lrf_in_the_air_accepted_m = None
+            if in_the_air is not None:
+                ask = getattr(self, "_ask_whether_a_point_in_the_air_is_a_building", None)
+                asked = pending.purpose == "dooaf_setup" and callable(ask)
+                if asked and ask(in_the_air):
+                    print(
+                        f"[VGCS:lrf] {in_the_air.short_text()}: used, the operator says "
+                        "the target is on a building or a tower beside the drone"
+                    )
+                    self._lrf_in_the_air_accepted_m = float(slant_m)
+                else:
+                    print(
+                        f"[VGCS:lrf] range not used for the DOOAF pick: {in_the_air.short_text()}"
+                    )
+                    self._lrf_range_in_the_air = in_the_air
+                    self._lrf_range_in_the_air_asked = bool(asked)
+                    self._lrf_last_lock_reason = in_the_air.short_text()
+                    slant_m = None
             lrf_range_hint: str | None = None
             if slant_m is not None:
                 lrf_range_hint = self._lrf_slant_warn_for_context(float(slant_m))
@@ -920,9 +955,12 @@ class LrfVideoLockMixin:
                     click_uv = getattr(self, "_lrf_click_uv", None)
                     self._sync_dooaf_setup_track_from_lrf_lock(
                         pick_role,
+                        # The lock's own click when the saved one is gone. This
+                        # read a name that did not exist ("final_uv"): a crash
+                        # the moment the saved click was not there.
                         final_uv=click_uv
                         if isinstance(click_uv, tuple)
-                        else final_uv,
+                        else (float(u), float(v)),
                     )
                 try:
                     self._obstacle_radar.set_c13_lrf_locked(

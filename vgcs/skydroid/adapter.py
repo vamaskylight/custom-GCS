@@ -168,6 +168,8 @@ _LRF_SLR_DEST_SYSTEM = "D"
 _LRF_SLR_DIVERGE_WARN_M = 2.0
 _LRF_SLR_JUMP_RATIO_MAX = 2.5
 _LRF_SLR_JUMP_MIN_M = 12.0
+# Two shots fired at one aim count as the same range within this part of it.
+_LRF_SHOTS_AGREE_FRACTION = 0.05
 _LRF_NEAR_FIELD_SUSPICIOUS_MAX_M = 12.0
 _LRF_BORESIGHT_TOL_U = 0.016
 _LRF_BORESIGHT_TOL_V = 0.018
@@ -324,6 +326,11 @@ class SkydroidTopUdpAdapter:
         self._laser_range_m: float | None = None
         self._laser_range_mono: float = 0.0
         self._last_slr_poll_mono: float = 0.0
+        # Where the laser last answered (host, port, class), and when a shot
+        # fired by VGCS last gave a range. A lock confirms its range with a
+        # shot fired at its own aim (_lock_range_from_a_fired_shot).
+        self._slr_answered_on: tuple[str, int, str] | None = None
+        self._slr_fired_ok_mono: float = 0.0
         self._lrf_locked = False
         self._lrf_armed = False
         self._lrf_lock_x = 0
@@ -3100,6 +3107,9 @@ class SkydroidTopUdpAdapter:
         dist_m: float | None = None
         samples: list[float] = []
         lock_started_mono = time.monotonic()
+        # When the camera last stopped turning for this lock. A range counts
+        # as measured for the lock when a shot was fired after it.
+        aim_final_mono = lock_started_mono
 
         def _emit_sample(value_m: float) -> None:
             if on_sample is None:
@@ -3216,7 +3226,14 @@ class SkydroidTopUdpAdapter:
                         f"[VGCS:lrf] fast lock ok range={float(reading):.1f} m "
                         f"(offset={float(click_offset_deg):.1f}°, t={elapsed:.1f}s)"
                     )
-                    dist_m = float(reading)
+                    dist_m = self._lock_range_from_a_fired_shot(
+                        float(reading), since_mono=lock_started_mono, on_sample=on_sample
+                    )
+                    if dist_m is None:
+                        with self._status_lock:
+                            self._laser_range_m = None
+                            self._laser_range_mono = 0.0
+                        return None
                     with self._status_lock:
                         self._lrf_locked = True
                         self._lrf_lock_x = x_px
@@ -3307,6 +3324,7 @@ class SkydroidTopUdpAdapter:
                 time.sleep(settle_s)
                 self._gimbal_stop_hard()
                 time.sleep(0.15)
+                aim_final_mono = time.monotonic()
                 att_refreshed = self._read_gimbal_attitude_deg_median(n=3, gap_s=0.06)
                 if att_refreshed is not None:
                     att_lock_ref = att_refreshed
@@ -3489,6 +3507,11 @@ class SkydroidTopUdpAdapter:
                     dist_m = float(fallback)
                     _emit_sample(dist_m)
 
+            if dist_m is not None:
+                dist_m = self._lock_range_from_a_fired_shot(
+                    float(dist_m), since_mono=aim_final_mono, on_sample=on_sample
+                )
+
             with self._status_lock:
                 if dist_m is not None:
                     self._lrf_locked = True
@@ -3573,6 +3596,13 @@ class SkydroidTopUdpAdapter:
                     )
                 return None
             dist_m = self._calibrate_slr_m(float(dist_m))
+            self._slr_answered_on = (
+                str(host),
+                int(port),
+                _LRF_SLR_DEST_LASER if laser_m is not None else _LRF_SLR_DEST_SYSTEM,
+            )
+            if trigger:
+                self._slr_fired_ok_mono = time.monotonic()
             if log:
                 hx = slr_raw_hex(laser_reply or system_reply or b"")
                 print(
@@ -3590,6 +3620,116 @@ class SkydroidTopUdpAdapter:
         finally:
             self._transport._host = active_host
             self._transport._port = active_port
+
+    def _fire_and_read_slr(self) -> float | None:
+        """Fire the laser once, now, and return what that shot measured.
+
+        The steps of a fresh _query_slr_distance_m (the shot, a read, a short
+        wait, the read that counts), on the address that last answered and
+        with fewer tries: a camera that gives nothing for the shot costs
+        about three seconds here, and not the half minute of a full query
+        over every address.
+        """
+        answered = getattr(self, "_slr_answered_on", None)
+        active_host = str(self._transport._host)
+        active_port = int(self._transport._port)
+        host, port, dest = answered or (active_host, active_port, _LRF_SLR_DEST_LASER)
+        query = build_slr_query(dest=str(dest))
+        try:
+            self._transport._host = str(host)
+            self._transport._port = int(port)
+            self._fire_slr_trigger(dest=_LRF_SLR_DEST_LASER)
+            self._transmit_slr_read(query, log=False, retries=1)
+            time.sleep(_LRF_SLR_SHOT_SETTLE_S)
+            reply = self._transmit_slr_read(query, log=True, retries=2)
+            dist = parse_slr_distance_from_payload(reply) if reply is not None else None
+            if dist is None:
+                return None
+            self._slr_fired_ok_mono = time.monotonic()
+            return float(self._calibrate_slr_m(float(dist)))
+        except Exception:
+            return None
+        finally:
+            self._transport._host = active_host
+            self._transport._port = active_port
+
+    @staticmethod
+    def _slr_shots_agree(a_m: float, b_m: float) -> bool:
+        """Two shots at one aim. At a long range and a flat angle the beam lies
+        along the ground, and shots a moment apart differ by some metres."""
+        return abs(float(a_m) - float(b_m)) <= max(
+            float(_LRF_MOVED_MIN_M), _LRF_SHOTS_AGREE_FRACTION * 0.5 * (float(a_m) + float(b_m))
+        )
+
+    def _lock_range_from_a_fired_shot(
+        self,
+        accepted_m: float,
+        *,
+        since_mono: float,
+        on_sample: Callable[[float], None] | None = None,
+    ) -> float | None:
+        """The range of a lock, backed by a laser shot fired at the lock's own aim.
+
+        A lock is made from reads of the camera's SLR value. A read returns
+        the value the camera holds, and the camera measures when it is told
+        to (the shot, "write 01"). The lock tries reads first and fires only
+        when the reads give nothing, so with a value left in the camera it
+        could finish without one shot. On 2026-10-08 a lock made in flight,
+        83 m up over open ground, gave 18.5 m.
+
+        So when no shot fired since ``since_mono`` has given a range, one is
+        fired now. A camera that gives nothing for the shot does not make the
+        lock fail: the value read is kept, and the log says that it is not
+        confirmed. None, no lock, only when the value held and two shots are
+        three different ranges: then the laser is not on one thing, and a lock
+        is a range that stands still. Not tried on a camera yet.
+        """
+        accepted = float(accepted_m)
+        if not self._slr_use_trigger():
+            return accepted
+        if float(getattr(self, "_slr_fired_ok_mono", 0.0) or 0.0) >= float(since_mono):
+            return accepted
+        shot = self._fire_and_read_slr()
+        if shot is None:
+            print(
+                f"[VGCS:lrf] lock range {accepted:.1f} m is the value the camera held: "
+                "a shot fired now gave no range (NOT confirmed)"
+            )
+            return accepted
+        if abs(shot - accepted) < _LRF_MOVED_MIN_M:
+            print(
+                f"[VGCS:lrf] lock range {accepted:.1f} m confirmed by a shot fired now "
+                f"({shot:.1f} m)"
+            )
+            return accepted
+        second = self._fire_and_read_slr()
+        if second is not None and abs(second - accepted) < _LRF_MOVED_MIN_M:
+            print(
+                f"[VGCS:lrf] lock range {accepted:.1f} m confirmed by the second of two "
+                f"shots fired now ({shot:.1f} m, {second:.1f} m)"
+            )
+            return accepted
+        if second is None:
+            # One shot measured now, at this aim, against a value of unknown age.
+            fired, second_text = shot, "nothing"
+        elif self._slr_shots_agree(shot, second):
+            fired, second_text = 0.5 * (shot + second), f"{second:.1f} m"
+        else:
+            print(
+                f"[VGCS:lrf] lock rejected — three ranges at one aim: the camera held "
+                f"{accepted:.1f} m, shots fired now gave {shot:.1f} m and {second:.1f} m"
+            )
+            return None
+        print(
+            f"[VGCS:lrf] lock range CORRECTED to {fired:.1f} m: the camera held "
+            f"{accepted:.1f} m, shots fired now gave {shot:.1f} m and {second_text}"
+        )
+        if on_sample is not None:
+            try:
+                on_sample(float(fired))
+            except Exception:
+                pass
+        return float(fired)
 
     def unlock_lrf(self) -> None:
         """Stop visual track and clear locked LRF reading."""

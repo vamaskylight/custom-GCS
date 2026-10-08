@@ -46,8 +46,10 @@ from vgcs.observe.dooaf import (
     write_dooaf_setup_video_mark,
 )
 from vgcs.observe.dooaf_flight_session import (
+    LaserPointInTheAir,
     build_facade_overlay_hint,
     format_lrf_range_label,
+    laser_point_in_the_air,
     slant_to_ground_range_m,
 )
 from vgcs.observe.geo_reference import (
@@ -355,8 +357,14 @@ class DooafOperationsMixin:
             }
             row.update(self._observation_context())
             self._enrich_observation_geo_reference(row)
-            reason = str(row.get("geo_warning") or row.get("geo_quality") or "")
-            self._dooaf_video_pick_failed(reason)
+            from vgcs.map.dooaf_popup import why_not_placed
+
+            print(
+                f"[VGCS:observe] ground pick not placed role={pick_role} "
+                f"reason={str(row.get('geo_warning') or row.get('geo_quality') or '')!r} "
+                f"look={row.get('geo_depression_deg')} agl={row.get('measure_agl_m')}"
+            )
+            self._dooaf_video_pick_failed(why_not_placed(row))
             return True
         lat, lon, alt_m = geo
         mark_u, mark_v = float(video_x), float(video_y)
@@ -932,6 +940,13 @@ class DooafOperationsMixin:
                         clear_failed()
                     except Exception:
                         pass
+                refused = getattr(self, "_lrf_range_in_the_air", None)
+                if refused is not None:
+                    self._set_status(
+                        f"DOOAF {pending.label} saved from the terrain estimate. "
+                        f"{refused.short_text()}"
+                    )
+                    return
                 self._set_status(
                     f"DOOAF {pending.label} saved — laser gave no range, "
                     "position from terrain estimate (re-pick with LRF for better accuracy)"
@@ -960,7 +975,17 @@ class DooafOperationsMixin:
             # they were standing. Neither retry nor a different surface could
             # ever have worked; picking on the map would have.
             geometry_note = self._dooaf_video_pick_geometry_blocker()
-            if geometry_note:
+            refused = getattr(self, "_lrf_range_in_the_air", None)
+            if refused is not None:
+                # The laser did answer, with a range that is not on the ground,
+                # and the terrain estimate found no point either. The operator
+                # needs the first of the two: it says what to do.
+                asked = bool(getattr(self, "_lrf_range_in_the_air_asked", False))
+                self._dooaf_video_pick_failed(
+                    refused.not_set_text() if asked else refused.text(),
+                    boresight_hint=False,
+                )
+            elif geometry_note:
                 self._dooaf_video_pick_failed(geometry_note, boresight_hint=False)
             elif backend_reason:
                 self._dooaf_video_pick_failed(
@@ -1350,6 +1375,39 @@ class DooafOperationsMixin:
         except (TypeError, ValueError):
             return None
 
+    def _laser_range_in_the_air(self, slant_m: float | None) -> LaserPointInTheAir | None:
+        """A laser range that cannot be a point on the ground, with the drone where it is now."""
+        try:
+            return laser_point_in_the_air(slant_m, self._observation_context())
+        except Exception:
+            return None
+
+    def _ask_whether_a_point_in_the_air_is_a_building(self, in_the_air: LaserPointInTheAir) -> bool:
+        """The one case where a laser range in the air is right: a tower or a
+        tall building right beside the drone. Only the operator sees which it is.
+
+        "No" is the answer when the box is closed without one.
+        """
+        try:
+            answer = QMessageBox.question(
+                self,
+                "Laser range",
+                in_the_air.question(),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return answer == QMessageBox.StandardButton.Yes
+        except Exception:
+            return False
+
+    def _laser_range_in_the_air_was_accepted(self, slant_m: float | None) -> bool:
+        """True for the range that the operator just said is a building."""
+        accepted = getattr(self, "_lrf_in_the_air_accepted_m", None)
+        try:
+            return accepted is not None and abs(float(accepted) - float(slant_m)) < 0.05  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+
     def _try_record_dooaf_facade_session(
         self,
         slant_m: float,
@@ -1357,6 +1415,14 @@ class DooafOperationsMixin:
         max_shift_m: float = 4.0,
     ) -> bool:
         """Store shared facade lock for rapid UV picks (pose at lock completion)."""
+        in_the_air = self._laser_range_in_the_air(slant_m)
+        if in_the_air is not None and not self._laser_range_in_the_air_was_accepted(slant_m):
+            # No "Facade locked" banner and no fast picks from a range that
+            # puts the point in the air: every pick made from it would land
+            # there too (client photo, 2026-10-08).
+            print(f"[VGCS:observe] facade session not recorded: {in_the_air.short_text()}")
+            self._set_status(in_the_air.short_text())
+            return False
         shift = self._vehicle_shift_during_lrf_lock_m()
         if shift is not None and shift > float(max_shift_m):
             print(

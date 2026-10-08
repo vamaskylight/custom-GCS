@@ -1182,8 +1182,8 @@ def apply_dooaf_impact_geo_fallback(
     """
     Fill impact footprint when the primary DEM ray fails (common on-ground / low EKF).
 
-    Tries a low-hover ray retry, then DOOAF Setup target footprint when video picks
-    align on the same facade column.
+    Tries a low-hover ray retry. When that gives no point either, the fall of
+    shot has no position, and the caller says so to the operator.
     """
     if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
         return False
@@ -1233,33 +1233,15 @@ def apply_dooaf_impact_geo_fallback(
     ):
         return True
 
-    if target_lat is None or target_lon is None:
-        return False
-    if DOOAF_ROLE_INTENDED not in marks:
-        return False
-    try:
-        vx_i, vy_i = marks[DOOAF_ROLE_INTENDED]
-        vx_p = float(vx)
-        vy_p = float(vy)
-    except (TypeError, ValueError):
-        return False
-    if abs(vx_p - float(vx_i)) > 0.18:
-        return False
-    if vy_p >= float(vy_i) + 0.08:
-        return False
-
-    row["target_lat"] = float(target_lat)
-    row["target_lon"] = float(target_lon)
-    row["geo_quality"] = "fair"
-    row["geo_method"] = "dooaf_setup_target_footprint"
-    row["geo_warning"] = (
-        "impact footprint from DOOAF target (primary ray failed — "
-        "hover ≥3 m with GPS for accurate ground geo)"
-    )
-    from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
-
-    enrich_video_mark_target_altitude(row)
-    return True
+    # Nothing placed this fall of shot, and it stays without a position.
+    #
+    # Until 2026-10-08 a click near the target's place in the picture was
+    # given the TARGET's own coordinates here ("dooaf_setup_target_footprint").
+    # A point that was not measured then read as a round that hit the target:
+    # the client flew at 83 m with the camera 5 degrees under the horizon, the
+    # ground ray was refused (891 m), and the popup said Right 0 m, Add 0 m,
+    # Miss 0 m. A correction of zero is an answer. Only a measurement may give it.
+    return False
 
 def dooaf_export_blockers(
     rows: list[dict[str, Any]],

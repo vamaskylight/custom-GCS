@@ -33,6 +33,12 @@ _EARTH_RADIUS_M = 6_371_000.0
 # EMA for mark-track vehicle pose (lat/lon/heading) — tames GPS jitter in flight.
 _MARK_TRACK_POSE_SMOOTH_ALPHA = 0.28
 
+# Below this height the ground point of a click is worked out as it was tuned
+# on the bench and in the low hover: the look angle may be guessed
+# (compute_geo_reference). From here up, above the take-off point, the drone
+# flies, and a camera that says its angle is believed.
+_GUESS_LOOK_BELOW_M = 25.0
+
 
 def smooth_vehicle_pose_ema(
     store: dict[str, object],
@@ -219,8 +225,25 @@ def project_wgs84_to_video_norm(
     vfov = float(camera_vfov_deg) if camera_vfov_deg is not None else hfov * 0.5625
     vfov = max(5.0, min(90.0, vfov))
     u = 0.5 + az_deg / hfov
-    v = 0.5 + el_deg / vfov
+    # A point above the cross is higher in the picture, and the picture's v
+    # counts from the top (see _click_tilt_deg).
+    v = 0.5 - el_deg / vfov
     return (float(u), float(v))
+
+
+def _click_tilt_deg(video_y_norm: float, vfov_deg: float) -> float:
+    """How far a click looks UP from the cross, in degrees (down is negative).
+
+    The picture's v counts from the top, so a click below the cross (v over
+    0.5) looks further down. Until 2026-10-08 this was the other way round in
+    the lat long math: a click below the cross was worked out as a look
+    further UP. On the ground that put a lower click further away, on a wall
+    higher up, and a mark drawn back on the video on the wrong side of the
+    cross when the camera tilted. The aiming and the mark overlay, tuned on
+    the camera in the field, always had it right (adapter._gimbal_pitch_target_deg,
+    lrf_track_uv_from_attitude), and the cross itself was never affected.
+    """
+    return -(float(video_y_norm) - 0.5) * float(vfov_deg)
 
 
 def _offset_lat_lon(lat_deg: float, lon_deg: float, north_m: float, east_m: float) -> tuple[float, float]:
@@ -390,39 +413,67 @@ def compute_geo_reference(
     g_yaw = _deg2rad(_gimbal_yaw_right_deg(float(gimbal_yaw_deg), gimbal_yaw_left_positive))
     g_pitch_deg = float(gimbal_pitch_deg)
     pitch_assumed = False
-    # C13/Skydroid often reports ~0° (level) while the scene is oblique; rangefinder
-    # DOWN confirms we are low — use a typical downward look for near-wall geo only.
-    if (
-        not long_range
-        and "rangefinder" in agl_src
-        and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0)
-    ):
-        g_pitch_deg = -35.0
-        pitch_assumed = True
-    # Missing gimbal or C13/Skydroid ~0° while scene is oblique: infer look from click.
-    gimbal_pitch_unreliable = gimbal_assumed or abs(g_pitch_deg) < 15.0
-    if (
-        gimbal_pitch_unreliable
-        and not long_range
-        and float(video_y_norm) > 0.55
-    ):
-        el_click = (float(video_y_norm) - 0.5) * vfov
-        g_pitch_deg = -min(55.0, max(12.0, el_click + 18.0))
-        pitch_assumed = True
-    elif (
-        gimbal_pitch_unreliable
-        and not long_range
-        and float(agl_m) < 25.0
-        and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0)
-    ):
-        # EKF-only AGL (no rangefinder): level gimbal read still needs downward look.
-        g_pitch_deg = -35.0
-        pitch_assumed = True
+    # A drone that flies, with a camera that says its angle: the angle is used
+    # as it is, and a click below the cross looks further down. The guesses
+    # below were made on the bench and in the low hover, where the C13 was
+    # seen to say 0 while it looked down. In a flight they replaced a true
+    # angle, anything within 15 degrees of level, by 18 or 35 degrees, and the
+    # point landed at a distance of its own (83 m up, 10 degrees down, a click
+    # below the cross: 255 m for a point that is 315 m away).
+    #
+    # "Flies" is the height above the take-off point, and not the height used
+    # for the ray: on a bench that one can be a rangefinder at its limit or a
+    # terrain file, 45 m for a drone that stands on a table.
+    try:
+        rel_alt_m = float(vehicle_rel_alt_m) if vehicle_rel_alt_m is not None else None
+    except (TypeError, ValueError):
+        rel_alt_m = None
+    angle_is_measured = (
+        not gimbal_assumed
+        and rel_alt_m is not None
+        and rel_alt_m >= _GUESS_LOOK_BELOW_M
+    )
+    if not angle_is_measured:
+        # C13/Skydroid often reports ~0° (level) while the scene is oblique; rangefinder
+        # DOWN confirms we are low — use a typical downward look for near-wall geo only.
+        if (
+            not long_range
+            and "rangefinder" in agl_src
+            and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0)
+        ):
+            g_pitch_deg = -35.0
+            pitch_assumed = True
+        # Missing gimbal or C13/Skydroid ~0° while scene is oblique: infer look from click.
+        gimbal_pitch_unreliable = gimbal_assumed or abs(g_pitch_deg) < 15.0
+        if (
+            gimbal_pitch_unreliable
+            and not long_range
+            and float(video_y_norm) > 0.55
+        ):
+            el_click = (float(video_y_norm) - 0.5) * vfov
+            g_pitch_deg = -min(55.0, max(12.0, el_click + 18.0))
+            pitch_assumed = True
+        elif (
+            gimbal_pitch_unreliable
+            and not long_range
+            and float(agl_m) < _GUESS_LOOK_BELOW_M
+            and (abs(g_pitch_deg) < 15.0 or g_pitch_deg > 10.0)
+        ):
+            # EKF-only AGL (no rangefinder): level gimbal read still needs downward look.
+            g_pitch_deg = -35.0
+            pitch_assumed = True
     g_pitch = _deg2rad(g_pitch_deg)
+    # The click's own tilt from the cross. In a flight up is up
+    # (_click_tilt_deg). Below that height the reversed sign stays for now,
+    # with everything else there: the guesses, and the results of the bench
+    # and roof sessions of June to August that are pinned in tests, were all
+    # tuned with it, and five of those tests move when it is turned round.
+    # To be decided with the developer, not changed on the way past.
+    el_tilt = _click_tilt_deg(v, vfov) if angle_is_measured else el_off
 
     r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
     r_body_gimbal = _mat_mul(_rot_z(g_yaw), _rot_y(g_pitch))
-    r_gimbal_cam = _mat_mul(_rot_y(_deg2rad(el_off)), _rot_z(_deg2rad(az_off)))
+    r_gimbal_cam = _mat_mul(_rot_y(_deg2rad(el_tilt)), _rot_z(_deg2rad(az_off)))
     r_ned_cam = _mat_mul(r_ned_body, _mat_mul(r_body_gimbal, r_gimbal_cam))
     dir_ned = _mat_vec(r_ned_cam, (1.0, 0.0, 0.0))
 
@@ -546,6 +597,9 @@ def compute_geo_reference(
             method=method,
             horizontal_range_m=range_m,
             bearing_deg=bearing,
+            # The angle goes with the refusal: it is the reason, and the
+            # operator is told it (dooaf_popup.why_not_placed).
+            depression_deg=depression,
         )
 
     tgt_lat, tgt_lon = _offset_lat_lon(float(vehicle_lat), float(vehicle_lon), north_m, east_m)
@@ -622,7 +676,7 @@ def _lrf_camera_dir_ned_unit(
     u = max(0.0, min(1.0, float(video_x_norm)))
     v = max(0.0, min(1.0, float(video_y_norm)))
     az_off = (u - 0.5) * hfov
-    el_off = (v - 0.5) * vfov
+    el_tilt = _click_tilt_deg(v, vfov)
 
     roll = _deg2rad(float(vehicle_roll_deg or 0.0))
     pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
@@ -632,7 +686,7 @@ def _lrf_camera_dir_ned_unit(
 
     r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
     r_body_gimbal = _mat_mul(_rot_z(g_yaw), _rot_y(g_pitch))
-    r_gimbal_cam = _mat_mul(_rot_y(_deg2rad(el_off)), _rot_z(_deg2rad(az_off)))
+    r_gimbal_cam = _mat_mul(_rot_y(_deg2rad(el_tilt)), _rot_z(_deg2rad(az_off)))
     r_ned_cam = _mat_mul(r_ned_body, _mat_mul(r_body_gimbal, r_gimbal_cam))
     dir_ned = _mat_vec(r_ned_cam, (1.0, 0.0, 0.0))
     mag = math.hypot(dir_ned[0], dir_ned[1], dir_ned[2])

@@ -451,6 +451,13 @@ class ObservationSessionMixin:
     ) -> None:
         """Append observation row after geo (DEM ray or LRF) is on ``row``."""
         dooaf_role = str(row.get("dooaf_role") or "")
+        if (
+            kind == "video_mark"
+            and dooaf_role in (DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED)
+            and observation_target_latlon(row) is None
+        ):
+            self._dooaf_click_not_placed(row, dooaf_role)
+            return
         track_before = target_track_from_observations(self._observations)
         seg_m = None
         pt = observation_target_latlon(row)
@@ -616,6 +623,57 @@ class ObservationSessionMixin:
             except Exception:
                 pass
 
+    def _dooaf_click_not_placed(self, row: dict[str, object], dooaf_role: str) -> None:
+        """A click on the video that got no position: say so, and keep no mark.
+
+        It used to be kept all the same: a mark on the video, a line in the
+        report, one more round in the count, and a popup that still showed the
+        round before. Nothing was measured, so nothing is recorded, and the
+        operator is told why and what to do (client photo, 2026-10-08).
+        """
+        from vgcs.map.dooaf_popup import (
+            IMPACT_HEADING,
+            NOT_MARKED,
+            TARGET_HEADING,
+            DooafPopup,
+            not_marked_text,
+            why_not_placed,
+        )
+
+        heading = TARGET_HEADING if dooaf_role == DOOAF_ROLE_INTENDED else IMPACT_HEADING
+        print(
+            f"[VGCS:observe] {heading} {NOT_MARKED} "
+            f"video=({row.get('video_x_norm')},{row.get('video_y_norm')}) "
+            f"reason={str(row.get('geo_warning') or row.get('geo_quality') or '')!r} "
+            f"look={row.get('geo_depression_deg')} agl={row.get('measure_agl_m')} "
+            f"gimbal=({row.get('gimbal_yaw_deg')},{row.get('gimbal_pitch_deg')})"
+        )
+        kept = ""
+        try:
+            if dooaf_role == DOOAF_ROLE_IMPACT:
+                rounds = self._impact_round_count()
+                if rounds == 1:
+                    kept = "The round marked before stays as it was."
+                elif rounds > 1:
+                    kept = f"The {rounds} rounds marked before stay as they were."
+            elif self._resolved_dooaf_settings().target_lat is not None:
+                kept = "The target set before stays as it was."
+        except Exception:
+            kept = ""
+        # Shown whether or not the read-out popup is switched on. That switch
+        # is for the numbers of a mark, and this is the news that there is no
+        # mark: the status line, the only other place, is hidden in flight.
+        try:
+            popup = getattr(self, "_dooaf_popup", None)
+            if popup is None:
+                popup = DooafPopup(self)
+                self._dooaf_popup = popup
+            popup.show_text(not_marked_text(heading, row, kept))
+        except Exception:
+            pass
+        why = why_not_placed(row).replace("\n", " ")
+        self._set_status(f"{heading} {NOT_MARKED}: {why}")
+
     def dooaf_popup_enabled(self) -> bool:
         """On by default; the crew asked for the read-out on every mark."""
         raw = QSettings(QS_ORG, QS_APP).value("dooaf/mark_popup", True)
@@ -679,7 +737,11 @@ class ObservationSessionMixin:
                 continue
             if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
                 continue
-            if str(row.get("kind") or "") in ("video_mark", "map_mark"):
+            if str(row.get("kind") or "") not in ("video_mark", "map_mark"):
+                continue
+            # A click that got no position is no round (a session saved before
+            # 2026-10-08 can still hold one).
+            if observation_target_latlon(row) is not None:
                 n += 1
         return n
 
