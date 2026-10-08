@@ -102,6 +102,10 @@ class DooafSession:
     impact_ekf_rel_alt_m: float | None = None
     gps_fix_type: int | None = None
     gps_hdop: float | None = None
+    # The oldest camera angle among the target and the impact mark, in seconds,
+    # or None when the camera does not say. An old angle was not measured when
+    # the point was marked: the camera link was slow or down.
+    gimbal_angle_age_s: float | None = None
     # True when no gun was surveyed and its position was synthesised purely to
     # fix the firing direction (see assumed_gun_bearing_deg). The gun's lat/lon
     # and every gun→x range are then MEANINGLESS and must not be reported as if

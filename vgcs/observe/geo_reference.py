@@ -96,6 +96,15 @@ def _deg2rad(d: float) -> float:
     return math.radians(float(d))
 
 
+def _gimbal_yaw_right_deg(gimbal_yaw_deg: float, left_positive: bool | None) -> float:
+    """The gimbal yaw as the math below needs it: to the right of the nose is positive.
+
+    ``left_positive`` says how the camera reports it (GimbalStatus.yaw_left_positive).
+    The Skydroid C12 and C13 count a turn to the left as positive.
+    """
+    return -float(gimbal_yaw_deg) if left_positive else float(gimbal_yaw_deg)
+
+
 def _rot_x(roll_rad: float) -> list[list[float]]:
     c, s = math.cos(roll_rad), math.sin(roll_rad)
     return [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
@@ -166,6 +175,7 @@ def project_wgs84_to_video_norm(
     vehicle_alt_msl_m: float | None = None,
     gimbal_yaw_deg: float | None,
     gimbal_pitch_deg: float | None,
+    gimbal_yaw_left_positive: bool | None = None,
     camera_hfov_deg: float = 83.4,
     camera_vfov_deg: float | None = None,
 ) -> tuple[float, float] | None:
@@ -191,7 +201,7 @@ def project_wgs84_to_video_norm(
     roll = _deg2rad(float(vehicle_roll_deg or 0.0))
     pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
     hdg = _deg2rad(float(vehicle_heading_deg or 0.0))
-    g_yaw = _deg2rad(float(gimbal_yaw_deg))
+    g_yaw = _deg2rad(_gimbal_yaw_right_deg(float(gimbal_yaw_deg), gimbal_yaw_left_positive))
     g_pitch = _deg2rad(float(gimbal_pitch_deg))
 
     r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
@@ -292,6 +302,7 @@ def compute_geo_reference(
     rangefinder_down_m: float | None = None,
     gimbal_yaw_deg: float | None,
     gimbal_pitch_deg: float | None,
+    gimbal_yaw_left_positive: bool | None = None,
     video_x_norm: float,
     video_y_norm: float,
     gps_fix_type: int = 0,
@@ -308,6 +319,10 @@ def compute_geo_reference(
 
     Body FRD (+X forward, +Y right, +Z down) and NED (+X north, +Y east, +Z down).
     Gimbal yaw about +Z, pitch about +Y (positive pitch = camera looks up).
+
+    ``gimbal_yaw_deg`` is the camera's own number. ``gimbal_yaw_left_positive``
+    says which way it counts (GimbalStatus.yaw_left_positive): the Skydroid
+    C12 and C13 count a turn to the left as positive.
     """
     if vehicle_lat is None or vehicle_lon is None:
         return GeoReferenceResult(ok=False, warning="vehicle position missing", method="none")
@@ -372,7 +387,7 @@ def compute_geo_reference(
     roll = _deg2rad(float(vehicle_roll_deg or 0.0))
     pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
     hdg = _deg2rad(float(vehicle_heading_deg or 0.0))
-    g_yaw = _deg2rad(float(gimbal_yaw_deg))
+    g_yaw = _deg2rad(_gimbal_yaw_right_deg(float(gimbal_yaw_deg), gimbal_yaw_left_positive))
     g_pitch_deg = float(gimbal_pitch_deg)
     pitch_assumed = False
     # C13/Skydroid often reports ~0° (level) while the scene is oblique; rangefinder
@@ -588,6 +603,7 @@ def _lrf_camera_dir_ned_unit(
     vehicle_pitch_deg: float | None = None,
     gimbal_yaw_deg: float | None,
     gimbal_pitch_deg: float | None,
+    gimbal_yaw_left_positive: bool | None = None,
     video_x_norm: float = 0.5,
     video_y_norm: float = 0.5,
     camera_hfov_deg: float = 83.4,
@@ -611,7 +627,7 @@ def _lrf_camera_dir_ned_unit(
     roll = _deg2rad(float(vehicle_roll_deg or 0.0))
     pitch = _deg2rad(float(vehicle_pitch_deg or 0.0))
     hdg = _deg2rad(float(vehicle_heading_deg or 0.0))
-    g_yaw = _deg2rad(gy)
+    g_yaw = _deg2rad(_gimbal_yaw_right_deg(gy, gimbal_yaw_left_positive))
     g_pitch = _deg2rad(gp)
 
     r_ned_body = _mat_mul(_rot_z(hdg), _mat_mul(_rot_y(pitch), _rot_x(roll)))
@@ -636,6 +652,7 @@ def compute_lrf_slant_geo(
     vehicle_alt_msl_m: float | None = None,
     gimbal_yaw_deg: float | None,
     gimbal_pitch_deg: float | None,
+    gimbal_yaw_left_positive: bool | None = None,
     slant_range_m: float,
     video_x_norm: float = 0.5,
     video_y_norm: float = 0.5,
@@ -663,6 +680,7 @@ def compute_lrf_slant_geo(
         vehicle_roll_deg=vehicle_roll_deg,
         vehicle_pitch_deg=vehicle_pitch_deg,
         gimbal_yaw_deg=gimbal_yaw_deg,
+        gimbal_yaw_left_positive=gimbal_yaw_left_positive,
         gimbal_pitch_deg=gimbal_pitch_deg,
         video_x_norm=video_x_norm,
         video_y_norm=video_y_norm,
@@ -726,6 +744,7 @@ def compute_lrf_facade_plane_geo(
     vehicle_alt_msl_m: float | None = None,
     gimbal_yaw_deg: float | None,
     gimbal_pitch_deg: float | None,
+    gimbal_yaw_left_positive: bool | None = None,
     slant_range_m: float,
     video_x_norm: float = 0.5,
     video_y_norm: float = 0.5,
@@ -759,6 +778,7 @@ def compute_lrf_facade_plane_geo(
         vehicle_roll_deg=vehicle_roll_deg,
         vehicle_pitch_deg=vehicle_pitch_deg,
         gimbal_yaw_deg=gimbal_yaw_deg,
+        gimbal_yaw_left_positive=gimbal_yaw_left_positive,
         gimbal_pitch_deg=gimbal_pitch_deg,
         camera_hfov_deg=camera_hfov_deg,
         camera_vfov_deg=camera_vfov_deg,
@@ -788,6 +808,7 @@ def compute_lrf_facade_plane_geo(
             vehicle_pitch_deg=vehicle_pitch_deg,
             vehicle_alt_msl_m=vehicle_alt_msl_m,
             gimbal_yaw_deg=gimbal_yaw_deg,
+            gimbal_yaw_left_positive=gimbal_yaw_left_positive,
             gimbal_pitch_deg=gimbal_pitch_deg,
             slant_range_m=slant,
             video_x_norm=video_x_norm,

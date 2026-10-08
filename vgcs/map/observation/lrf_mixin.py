@@ -355,6 +355,7 @@ class LrfVideoLockMixin:
         out["vehicle_pitch_deg"] = lock.vehicle_pitch_deg
         out["vehicle_alt_msl_m"] = lock.vehicle_alt_msl_m
         out["gimbal_yaw_deg"] = lock.gimbal_yaw_deg
+        out["gimbal_yaw_left_positive"] = bool(getattr(lock, "gimbal_yaw_left_positive", False))
         out["gimbal_pitch_deg"] = lock.gimbal_pitch_deg
         out["gps_fix_type"] = lock.gps_fix_type
         out["gps_hdop"] = lock.gps_hdop
@@ -439,6 +440,7 @@ class LrfVideoLockMixin:
             vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
             vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
             gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_yaw_left_positive=ctx.get("gimbal_yaw_left_positive"),  # type: ignore[arg-type]
             gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             slant_range_m=slant,
             video_x_norm=video_u,

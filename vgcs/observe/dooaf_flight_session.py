@@ -30,6 +30,8 @@ class FacadeLockSnapshot:
     vehicle_alt_msl_m: float | None = None
     gps_fix_type: int = 0
     gps_hdop: float | None = None
+    # Which way gimbal_yaw_deg counts (GimbalStatus.yaw_left_positive).
+    gimbal_yaw_left_positive: bool = False
     lock_mono: float = field(default_factory=time.monotonic)
 
 
@@ -86,6 +88,7 @@ class DooafFacadeSession:
             vehicle_lon=float(vlon),
             vehicle_heading_deg=float(hdg),
             gimbal_yaw_deg=float(gy),
+            gimbal_yaw_left_positive=bool(ctx.get("gimbal_yaw_left_positive") or False),
             gimbal_pitch_deg=float(gp),
             vehicle_roll_deg=_float_or_none(ctx.get("vehicle_roll_deg")),
             vehicle_pitch_deg=_float_or_none(ctx.get("vehicle_pitch_deg")),
@@ -152,6 +155,7 @@ class DooafFacadeSession:
             vehicle_pitch_deg=lock.vehicle_pitch_deg,
             vehicle_alt_msl_m=lock.vehicle_alt_msl_m,
             gimbal_yaw_deg=g_yaw,
+            gimbal_yaw_left_positive=bool(lock.gimbal_yaw_left_positive),
             gimbal_pitch_deg=g_pitch,
             slant_range_m=float(lock.slant_range_m),
             video_x_norm=float(u),

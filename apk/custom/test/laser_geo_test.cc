@@ -41,7 +41,8 @@ void checkLaser(int line, const LaserInput &in, bool ok, double lat, double lon,
 }
 
 LaserInput makeInput(double lat, double lon, double hdg, double roll, double pitch, std::optional<double> alt,
-                     double gy, double gp, double range, double u, double v, double hfov, std::optional<double> vfov)
+                     double gy, double gp, double range, double u, double v, double hfov, std::optional<double> vfov,
+                     bool yawLeftPositive = false)
 {
     LaserInput in;
     in.vehicleLatDeg = lat;
@@ -51,6 +52,7 @@ LaserInput makeInput(double lat, double lon, double hdg, double roll, double pit
     in.vehiclePitchDeg = pitch;
     in.vehicleAltMslM = alt;
     in.gimbalYawDeg = gy;
+    in.gimbalYawLeftPositive = yawLeftPositive;
     in.gimbalPitchDeg = gp;
     in.slantRangeM = range;
     in.videoXNorm = u;
@@ -67,6 +69,25 @@ int main()
 #include "laser_geo_vectors.inc"
 
     // Sanity checks that do not depend on the Python vectors.
+    {
+        // The drone faces north. A C13 turned 30 degrees to the right reports
+        // yaw -30. The target is to the north-east, on the side it looks at.
+        // (Read as right-positive it landed to the north-west: mirrored.)
+        LaserInput c13 = makeInput(20.0, 72.0, 0.0, 0.0, 0.0, 100.0, -30.0, -10.0, 500.0, 0.5, 0.5, 83.4, 46.9, true);
+        const LaserResult right = computeLaserTarget(c13);
+        ++g_checks;
+        if (!right.ok || !near(right.bearingDeg, 30.0, 1e-6) || !(right.targetLonDeg > 72.0)) {
+            ++g_failures;
+            std::printf("FAIL a camera that counts left as positive: bearing %.3f, want 30\n", right.bearingDeg);
+        }
+        c13.gimbalYawLeftPositive = false;
+        const LaserResult other = computeLaserTarget(c13);
+        ++g_checks;
+        if (!other.ok || !near(other.bearingDeg, 330.0, 1e-6)) {
+            ++g_failures;
+            std::printf("FAIL a camera that counts right as positive: bearing %.3f, want 330\n", other.bearingDeg);
+        }
+    }
     {
         // Straight down from 100 m: the target is under the drone, 100 m lower.
         LaserInput in = makeInput(20.0, 72.0, 0.0, 0.0, 0.0, 100.0, 0.0, -90.0, 100.0, 0.5, 0.5, 83.4, std::nullopt);

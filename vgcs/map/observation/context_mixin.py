@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import Qt
 
 from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED
@@ -94,6 +96,14 @@ class ObservationContextMixin:
     def _observation_context(self) -> dict[str, object]:
         gimbal_yaw = None
         gimbal_pitch = None
+        # Which way this camera counts its yaw. It travels with the number,
+        # into every row and lock, because the lat long math needs both.
+        gimbal_yaw_left_positive = False
+        # How old the camera's angle is. The last one is kept for as long as
+        # nothing newer arrives, so on a slow or broken camera link a point is
+        # placed with an angle that is seconds or minutes old. The age goes
+        # into the row, and the DOOAF report says so (dooaf_trust).
+        gimbal_attitude_age_s = None
         st = None
         try:
             st = self._camera_control.get_gimbal_status()
@@ -104,6 +114,13 @@ class ObservationContextMixin:
                 # layer applies downward pitch when rangefinder AGL is available.
                 if yaw is not None:
                     gimbal_yaw = float(yaw)
+                    gimbal_yaw_left_positive = bool(getattr(st, "yaw_left_positive", False))
+                    try:
+                        stamp = float(getattr(st, "updated_mono", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        stamp = 0.0
+                    if stamp > 0.0:          # zero: this camera does not say when
+                        gimbal_attitude_age_s = max(0.0, time.monotonic() - stamp)
                 if pitch is not None:
                     gimbal_pitch = float(pitch)
                 elif yaw is not None:
@@ -156,6 +173,8 @@ class ObservationContextMixin:
             "measure_agl_m": agl_m,
             "agl_source": agl_src,
             "gimbal_yaw_deg": gimbal_yaw,
+            "gimbal_yaw_left_positive": gimbal_yaw_left_positive,
+            "gimbal_attitude_age_s": gimbal_attitude_age_s,
             "gimbal_pitch_deg": gimbal_pitch,
             "gps_fix_type": int(getattr(self, "_gps_fix_type", 0) or 0),
             "gps_satellites": int(getattr(self, "_gps_satellites", 0) or 0),

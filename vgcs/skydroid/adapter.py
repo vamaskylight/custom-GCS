@@ -239,6 +239,16 @@ class GimbalStatus:
     pitch_deg: float | None = None
     supported: bool = False
     updated_mono: float = 0.0
+    # Which way yaw_deg counts. False: a turn to the RIGHT of the vehicle's
+    # nose is positive (clockwise seen from above). True: a turn to the LEFT is
+    # positive, which is how the Skydroid C12 and C13 report it (GAC).
+    #
+    # yaw_deg itself stays the camera's own number: the aiming and the mark
+    # overlay work with that. Whoever turns it into a direction on the map has
+    # to look here (vgcs/observe/geo_reference.py). Until 2026-10-08 the lat
+    # long math took the C13's number as right-positive, and every point
+    # measured with the camera turned to a side was mirrored about the nose line.
+    yaw_left_positive: bool = False
 
 
 class SkydroidTopUdpAdapter:
@@ -4456,4 +4466,6 @@ class SkydroidTopUdpAdapter:
                 pitch_deg=pitch,
                 supported=(yaw is not None or pitch is not None),
                 updated_mono=time.monotonic(),
+                # The same switch as the aiming uses: one camera, one direction.
+                yaw_left_positive=self._c13_negate_image_yaw(),
             )

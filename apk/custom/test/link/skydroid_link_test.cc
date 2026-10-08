@@ -502,9 +502,15 @@ private slots:
         const int turn = _camera->received.indexOf(QString::fromStdString(gay));
         const int shot = _camera->received.indexOf(QString::fromStdString(top::buildSlrTrigger('E')));
         QVERIFY(turn >= 0 && shot > turn);
-        // The target uses the angles at the shot, so it lies off to that side.
+        // The target uses the angles at the shot, so it lies off to that side:
+        // the drone faces north and the camera turned right, so north-east.
+        // (This used to check only that there was a target. It was on the
+        // other side of the nose line, and nothing noticed.)
         QVERIFY(_link->targetValid());
         QVERIFY(std::abs(_link->gimbalYaw() + 20.85) < 0.01);
+        QVERIFY2(std::abs(_link->targetBearingDeg() - 20.85) < 0.5,
+                 qPrintable(QStringLiteral("target bearing %1, the camera looks 20.85 degrees right of north")
+                                .arg(_link->targetBearingDeg())));
     }
 
     void tapNeverMeasuresIfTheCameraDoesNotTurn()
@@ -1018,6 +1024,42 @@ private slots:
 
     void gimbalYawTurnsTheTargetDirection()
     {
+        // The C13 counts a turn to the LEFT as positive yaw, and the tap
+        // aiming has always known it. The drone faces north and the camera
+        // reports +90: it looks west. Until 2026-10-08 this test expected
+        // east, the mirrored side, and so did the code.
+        _camera->yaw = 90.0;
+        _camera->pitch = -30.0;
+        _camera->slrE = "01F4";
+        _vehicle.vehicle.set("heading", 0.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && _link->gimbalYaw() == 90.0, 2000);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(_link->targetValid());
+        QVERIFY(std::abs(_link->targetBearingDeg() - 270.0) < 1e-6);
+        QVERIFY(_link->targetLon() < 72.0);
+    }
+
+    void aCameraTurnedRightPutsTheTargetOnTheRight()
+    {
+        // Turned 30 degrees to the right, the C13 reports -30.
+        _camera->yaw = -30.0;
+        _camera->pitch = -30.0;
+        _camera->slrE = "01F4";
+        _vehicle.vehicle.set("heading", 0.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && _link->gimbalYaw() == -30.0, 2000);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(_link->targetValid());
+        QVERIFY(std::abs(_link->targetBearingDeg() - 30.0) < 1e-6);
+        QVERIFY(_link->targetLon() > 72.0);
+    }
+
+    void aCameraSetToCountTheOtherWayTurnsTheTargetWithIt()
+    {
+        // "Reverse left and right" for the tap says the camera counts the
+        // other way round. It is the same camera, so the lat long follows.
+        _link->setReverseTapYaw(true);
         _camera->yaw = 90.0;
         _camera->pitch = -30.0;
         _camera->slrE = "01F4";

@@ -705,6 +705,7 @@ _SETUP_ROW_CONTEXT_KEYS = (
     "agl_source",
     "rangefinder_down_m",
     "gimbal_yaw_deg",
+    "gimbal_yaw_left_positive",
     "gimbal_pitch_deg",
     "gps_fix_type",
     "gps_hdop",
@@ -763,6 +764,7 @@ def _synthesize_setup_mark_row(
         vehicle_alt_msl_m=row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
         rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
         gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+        gimbal_yaw_left_positive=row.get("gimbal_yaw_left_positive"),  # type: ignore[arg-type]
         gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
         video_x_norm=float(video_x),
         video_y_norm=float(video_y),
@@ -808,6 +810,7 @@ def _synthesize_setup_mark_row(
             vehicle_alt_msl_m=row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
             rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
             gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_yaw_left_positive=row.get("gimbal_yaw_left_positive"),  # type: ignore[arg-type]
             gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             video_x_norm=float(video_x),
             video_y_norm=float(video_y),
@@ -964,6 +967,7 @@ def _forced_ray_geo_for_row(
         vehicle_alt_msl_m=vehicle_alt_msl_m or row.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
         rangefinder_down_m=row.get("rangefinder_down_m"),  # type: ignore[arg-type]
         gimbal_yaw_deg=row.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+        gimbal_yaw_left_positive=row.get("gimbal_yaw_left_positive"),  # type: ignore[arg-type]
         gimbal_pitch_deg=row.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
         video_x_norm=float(vx),
         video_y_norm=float(vy),
@@ -2156,13 +2160,22 @@ def build_dooaf_session(
         assumed_gun_bearing_deg=(
             float(assumed_gun_bearing_deg) if gun_is_assumed else None
         ),
-        **_session_trust_signals(impact_row),
+        **_session_trust_signals(impact_row, intended_row),
     )
 
 
-def _session_trust_signals(impact_row: dict[str, Any] | None) -> dict[str, Any]:
+def _session_trust_signals(
+    impact_row: dict[str, Any] | None, intended_row: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Trust-relevant fields lifted from the impact mark for confidence assessment."""
     row = impact_row or {}
+    ages = [
+        age
+        for age in (
+            _float_or_none(mark.get("gimbal_attitude_age_s")) for mark in (impact_row, intended_row) if mark
+        )
+        if age is not None
+    ]
     fix_raw = row.get("gps_fix_type")
     try:
         fix = int(fix_raw) if fix_raw is not None else None
@@ -2179,6 +2192,7 @@ def _session_trust_signals(impact_row: dict[str, Any] | None) -> dict[str, Any]:
         "impact_ekf_rel_alt_m": _float_or_none(row.get("ekf_rel_alt_m")),
         "gps_fix_type": fix,
         "gps_hdop": _float_or_none(row.get("gps_hdop")),
+        "gimbal_angle_age_s": max(ages) if ages else None,
     }
 
 
@@ -2224,14 +2238,19 @@ def format_fire_correction(corr: FireCorrection) -> str:
         f"miss {corr.impact_to_intended_m:.0f} m"
     )
 
-def format_gimbal_yaw_direction(yaw_deg: float | None) -> str:
-    """Human label for gimbal yaw (+ right, − left)."""
+def format_gimbal_yaw_direction(yaw_deg: float | None, left_positive: bool | None = False) -> str:
+    """Human label for gimbal yaw.
+
+    ``left_positive`` says which way the camera counts: by default a positive
+    number is a turn to the right. The Skydroid C12 and C13 count a turn to
+    the left as positive, and for them the label used to say the wrong side.
+    """
     if yaw_deg is None:
         return "N/A"
     y = float(yaw_deg)
     if abs(y) < 0.05:
         return "Yaw centre (0°)"
-    if y > 0:
+    if (y > 0) != bool(left_positive):
         return f"Yaw right {abs(y):.1f}°"
     return f"Yaw left {abs(y):.1f}°"
 

@@ -41,6 +41,11 @@ _NEAR_HORIZON_WARN_DEG = 3.0
 _HDOP_WARN = 2.0
 # Airborne floor — below this the vehicle pose / geo is unreliable.
 _NEAR_GROUND_WARN_M = 2.5
+# A camera angle older than this was not measured when the point was marked.
+# The camera sends its angle several times a second, so this is a link that
+# was slow or down (client logs, 2026-10-08: stretches of minutes without an
+# answer from the camera).
+_GIMBAL_ANGLE_OLD_S = 3.0
 
 
 @dataclass(frozen=True)
@@ -221,6 +226,18 @@ def assess_dooaf_trust(session: DooafSession | None) -> DooafTrust:
                 SEVERITY_WARN,
                 "near_ground",
                 f"Drone was near the ground (EKF {float(ekf):.1f} m) when marking — geo is weak.",
+            )
+        )
+
+    # --- the camera's angle: measured when the point was marked, or left over? ----------
+    age = getattr(session, "gimbal_angle_age_s", None)
+    if age is not None and float(age) > _GIMBAL_ANGLE_OLD_S:
+        add(
+            TrustFinding(
+                SEVERITY_WARN,
+                "gimbal_angle_old",
+                f"The camera's angle was {float(age):.0f} s old when a point was marked "
+                "(the camera link was slow or down). The position may be off: mark the point again.",
             )
         )
 

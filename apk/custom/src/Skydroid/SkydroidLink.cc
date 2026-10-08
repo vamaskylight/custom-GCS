@@ -1699,6 +1699,10 @@ void SkydroidLink::_fireLaser(bool keepLastResult)
     _shotPoseValid = _sampleVehiclePose(_shotPose, _shotPoseWhy);
     _shotGimbalValid = _attitudeValid;
     _shotPose.gimbalYawDeg = _yaw;
+    // Which way that yaw counts: the same switch as the tap aiming, because it
+    // is one camera. Without this the target landed on the wrong side of the
+    // drone's nose whenever the camera was turned (field video, 2026-10-06).
+    _shotPose.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
     _shotPose.gimbalPitchDeg = _pitch;
     if (!keepLastResult) {
         _target = skydroid::geo::LaserResult{};

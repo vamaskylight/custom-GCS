@@ -248,7 +248,7 @@ def format_camera_orientation_html(row: dict[str, Any] | None) -> str:
         "<div class='camera-grid'>"
         "<div class='camera-stat'>"
         "<div class='label'>Gimbal yaw</div>"
-        f"<div class='value'>{_html_esc(yaw_raw)} — {_html_esc(format_gimbal_yaw_direction(yaw))}</div>"
+        f"<div class='value'>{_html_esc(yaw_raw)} — {_html_esc(format_gimbal_yaw_direction(yaw, bool(row.get('gimbal_yaw_left_positive') or False)))}</div>"
         "</div>"
         "<div class='camera-stat'>"
         "<div class='label'>Gimbal pitch</div>"

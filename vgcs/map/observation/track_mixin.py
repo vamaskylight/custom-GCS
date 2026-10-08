@@ -1674,6 +1674,7 @@ class M13MovingTargetTrackMixin:
             vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
             rangefinder_down_m=ctx.get("rangefinder_down_m"),  # type: ignore[arg-type]
             gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_yaw_left_positive=ctx.get("gimbal_yaw_left_positive"),  # type: ignore[arg-type]
             gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             video_x_norm=float(video_x),
             video_y_norm=float(video_y),
@@ -1767,6 +1768,7 @@ class M13MovingTargetTrackMixin:
             vehicle_pitch_deg=ctx.get("vehicle_pitch_deg"),  # type: ignore[arg-type]
             vehicle_alt_msl_m=ctx.get("vehicle_alt_msl_m"),  # type: ignore[arg-type]
             gimbal_yaw_deg=ctx.get("gimbal_yaw_deg"),  # type: ignore[arg-type]
+            gimbal_yaw_left_positive=ctx.get("gimbal_yaw_left_positive"),  # type: ignore[arg-type]
             gimbal_pitch_deg=ctx.get("gimbal_pitch_deg"),  # type: ignore[arg-type]
             slant_range_m=slant,
             video_x_norm=float(video_x),

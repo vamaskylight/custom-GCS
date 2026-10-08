@@ -514,7 +514,8 @@ class ObservationExportTask(QRunnable):
             pitch = out.get("gimbal_pitch_deg")
             try:
                 out["gimbal_yaw_direction"] = format_gimbal_yaw_direction(
-                    float(yaw) if yaw is not None else None
+                    float(yaw) if yaw is not None else None,
+                    bool(out.get("gimbal_yaw_left_positive") or False),
                 )
             except (TypeError, ValueError):
                 out["gimbal_yaw_direction"] = "N/A"

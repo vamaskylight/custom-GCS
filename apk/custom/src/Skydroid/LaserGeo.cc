@@ -87,7 +87,9 @@ LaserResult computeLaserTarget(const LaserInput &in)
 
     const Mat nedBody = mul(rotZ(rad(in.vehicleHeadingDeg)),
                             mul(rotY(rad(in.vehiclePitchDeg)), rotX(rad(in.vehicleRollDeg))));
-    const Mat bodyGimbal = mul(rotZ(rad(in.gimbalYawDeg)), rotY(rad(in.gimbalPitchDeg)));
+    // The camera's own number, turned so that right of the nose is positive.
+    const double gimbalYawRight = in.gimbalYawLeftPositive ? -in.gimbalYawDeg : in.gimbalYawDeg;
+    const Mat bodyGimbal = mul(rotZ(rad(gimbalYawRight)), rotY(rad(in.gimbalPitchDeg)));
     const Mat gimbalCam = mul(rotY(rad(elOff)), rotZ(rad(azOff)));
     const Mat nedCam = mul(nedBody, mul(bodyGimbal, gimbalCam));
     const Vec dir = mulVec(nedCam, {1.0, 0.0, 0.0});
