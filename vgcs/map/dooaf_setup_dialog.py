@@ -246,6 +246,8 @@ class DooafSetupDialog(QDialog):
         gun_actions.addWidget(btn_clear_gun)
         gun_actions.addStretch(1)
         gun_form.addRow("", gun_actions)
+        self._gun_note = self._point_note_label()
+        gun_form.addRow("", self._gun_note)
         root.addWidget(gun_box)
 
         self._gun_coord_widgets = (
@@ -328,7 +330,18 @@ class DooafSetupDialog(QDialog):
         tgt_actions.addWidget(btn_clear_tgt)
         tgt_actions.addStretch(1)
         tgt_form.addRow("", tgt_actions)
+        self._tgt_note = self._point_note_label()
+        tgt_form.addRow("", self._tgt_note)
         root.addWidget(tgt_box)
+
+        # A position that is typed is no longer the one that was picked.
+        for edit, role in (
+            (self._gun_lat, DOOAF_PICK_GUN),
+            (self._gun_lon, DOOAF_PICK_GUN),
+            (self._tgt_lat, DOOAF_PICK_TARGET),
+            (self._tgt_lon, DOOAF_PICK_TARGET),
+        ):
+            edit.textEdited.connect(lambda _text, r=role: self.set_point_note(r, ""))
 
         buttons = QDialogButtonBox()
         btn_clear_all = buttons.addButton(
@@ -413,6 +426,8 @@ class DooafSetupDialog(QDialog):
         for preset in load_dooaf_presets(self._settings_store()):
             if preset.name == name:
                 self._apply_settings_to_form(preset.settings)
+                self.set_point_note(DOOAF_PICK_GUN, "")
+                self.set_point_note(DOOAF_PICK_TARGET, "")
                 self.coordinates_changed.emit("all")
                 break
 
@@ -477,12 +492,14 @@ class DooafSetupDialog(QDialog):
         self._gun_lat.clear()
         self._gun_lon.clear()
         _set_optional_alt(self._gun_alt, None)
+        self.set_point_note(DOOAF_PICK_GUN, "")
         self.coordinates_changed.emit("gun")
 
     def _clear_target(self) -> None:
         self._tgt_lat.clear()
         self._tgt_lon.clear()
         _set_optional_alt(self._tgt_alt, None)
+        self.set_point_note(DOOAF_PICK_TARGET, "")
         self.coordinates_changed.emit("target")
 
     def _clear_all(self) -> None:
@@ -492,7 +509,45 @@ class DooafSetupDialog(QDialog):
         self._tgt_lat.clear()
         self._tgt_lon.clear()
         _set_optional_alt(self._tgt_alt, None)
+        self.set_point_note(DOOAF_PICK_GUN, "")
+        self.set_point_note(DOOAF_PICK_TARGET, "")
         self.coordinates_changed.emit("all")
+
+    @staticmethod
+    def _point_note_label() -> QLabel:
+        label = QLabel("")
+        label.setObjectName("dooafPointNote")
+        label.setWordWrap(True)
+        label.setVisible(False)
+        return label
+
+    def set_point_note(self, role: str, text: str, *, warn: bool = False) -> None:
+        """How the point of this role was measured, said under its numbers.
+
+        By laser with the range, from the picture, on the wall of a lock, from
+        the map. ``warn``: the laser was asked for and did not give the point,
+        in bold. "" takes the line away (a position that was typed).
+
+        Until 2026-10-09 this was written to the map's status line, which is
+        not on the screen. A target that the laser did not measure looked the
+        same in this dialog as one that it did.
+        """
+        label = {DOOAF_PICK_GUN: self._gun_note, DOOAF_PICK_TARGET: self._tgt_note}.get(str(role))
+        if label is None:
+            return
+        said = str(text or "").strip()
+        label.setText(said)
+        label.setStyleSheet("font-weight: 600;" if (warn and said) else "")
+        label.setProperty("warn", bool(warn and said))
+        label.setVisible(bool(said))
+
+    def point_note(self, role: str) -> str:
+        label = {DOOAF_PICK_GUN: self._gun_note, DOOAF_PICK_TARGET: self._tgt_note}.get(str(role))
+        return "" if label is None or label.isHidden() else str(label.text())
+
+    def point_note_is_a_warning(self, role: str) -> bool:
+        label = {DOOAF_PICK_GUN: self._gun_note, DOOAF_PICK_TARGET: self._tgt_note}.get(str(role))
+        return bool(label is not None and not label.isHidden() and label.property("warn"))
 
     def set_point_coords(
         self,

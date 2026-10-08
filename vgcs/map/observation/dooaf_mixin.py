@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtWidgets import QDialog, QMessageBox
+from PySide6.QtWidgets import QMessageBox
 
 from vgcs.map.app_settings import QS_APP, QS_ORG
 from vgcs.map.dooaf_setup_dialog import (
@@ -86,30 +86,6 @@ class DooafOperationsMixin:
     # hits (never a real building clicked near or above the crosshair).
     _FACADE_BELOW_CROSSHAIR_DEG = 4.0
     _FACADE_BACKGROUND_SLANT_M = 150.0
-
-    # A ground (gun) pick needs the camera tilted DOWN onto the gun. At a near-level
-    # look angle a video click can't be projected to a ground point — it collapses
-    # toward the drone's own position, so the gun distance comes out wrong. Refuse
-    # such picks and steer the operator to "Pick on map" (exact) or a downward tilt.
-    _GROUND_PICK_MIN_DOWN_PITCH_DEG = 15.0
-
-    def _dooaf_ground_pick_gimbal_pitch_deg(self) -> float | None:
-        """Current gimbal pitch (deg) for validating a ground pick, or None if unknown."""
-        reader = getattr(self, "_read_top_gimbal_attitude_pair", None)
-        if not callable(reader):
-            reader = getattr(self, "_read_gimbal_attitude_pair", None)
-        if not callable(reader):
-            return None
-        try:
-            att = reader()
-        except Exception:
-            return None
-        if not att:
-            return None
-        try:
-            return float(att[1])
-        except (TypeError, ValueError, IndexError):
-            return None
 
     def _dooaf_setup_is_ground_workflow(self) -> bool:
         """GUN+TARGET from ground video picks with no facade session for fast impact."""
@@ -244,11 +220,113 @@ class DooafOperationsMixin:
             return
         self._log_observation("map_mark", map_lat=float(lat), map_lon=float(lon))
 
+    # --- What a DOOAF Setup pick shows the operator ----------------------------
+    #
+    # The map's status line (_set_status) is not on the screen: the window
+    # always runs map first, which hides it. What a Setup pick has to say is
+    # said on the video while it waits for the click, and in the dialog under
+    # the point's numbers once it is placed.
+
+    def _show_dooaf_pick_prompt(self, title: str | None, subtitle: str = "") -> None:
+        """What the pick waits for, on top of the video. None takes it away."""
+        try:
+            self._native_video_overlay.set_pick_prompt(title, subtitle)
+        except Exception:
+            pass
+
+    def _dooaf_pick_prompt_words(self, pick_role: str, mode: str) -> tuple[str, str]:
+        """(first line, second line) for a Setup pick on the video."""
+        what = "Gun" if pick_role == DOOAF_ROLE_GUN else "Target"
+        on_the_video = f"{what}: click it on the video"
+        from_the_picture = "It is placed from the picture, where the look meets the ground."
+        if mode == DOOAF_VIDEO_PICK_FACADE_LRF:
+            if not self._dooaf_lrf_geo_enabled():
+                return on_the_video, f"No laser on this camera. {from_the_picture}"
+            if pick_role == DOOAF_ROLE_GUN and self._dooaf_saved_ground_gun_track() is not None:
+                return (
+                    "Click the video: the laser measures the wall under the cross",
+                    "The gun stays where it was picked.",
+                )
+            return (
+                f"{what}: put the cross on it, then click it",
+                "The laser measures the point under the cross. The camera is not moved.",
+            )
+        if (
+            pick_role != DOOAF_ROLE_GUN
+            and self._dooaf_lrf_geo_enabled()
+            and self._dooaf_facade_uv_pick_ready()
+        ):
+            slant = getattr(getattr(self, "_dooaf_facade_session", None), "slant_range_m", None)
+            held = f" (LRF {float(slant):.1f} m)" if slant is not None else ""
+            return (
+                on_the_video,
+                f"A laser lock is still held{held}: VGCS asks whether the click is on its wall.",
+            )
+        return on_the_video, from_the_picture
+
+    def _say_how_the_pick_was_measured(self, text: str, *, warn: bool = False) -> None:
+        """Called by the code that places a Setup pick, just before it hands the point on.
+
+        ``warn``: the laser was asked for and did not give the point.
+        """
+        said = str(text or "").strip()
+        self._dooaf_pick_note = (said, bool(warn)) if said else None
+
+    def _take_the_pick_note(self, default: str = "") -> tuple[str, bool]:
+        note = getattr(self, "_dooaf_pick_note", None)
+        self._dooaf_pick_note = None
+        if isinstance(note, tuple) and len(note) == 2 and note[0]:
+            return str(note[0]), bool(note[1])
+        return str(default or ""), False
+
+    def _note_the_setup_point(
+        self, dlg: object, role: str, lat: float, lon: float, text: str, warn: bool
+    ) -> None:
+        """Show the line under the point's numbers, and keep it for a dialog opened again."""
+        notes = getattr(self, "_dooaf_point_notes", None)
+        if not isinstance(notes, dict):
+            notes = {}
+            self._dooaf_point_notes = notes
+        if text:
+            notes[str(role)] = (float(lat), float(lon), str(text), bool(warn))
+        else:
+            notes.pop(str(role), None)
+        try:
+            dlg.set_point_note(role, text, warn=warn)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    def _show_the_setup_point_notes(self, dlg: object) -> None:
+        """A dialog that is opened again says it too, while the position is the one that was picked."""
+        notes = getattr(self, "_dooaf_point_notes", None)
+        if not isinstance(notes, dict) or not notes:
+            return
+        try:
+            s = self._resolved_dooaf_settings()
+        except Exception:
+            return
+        for role, lat, lon in (
+            (DOOAF_PICK_GUN, s.gun_lat, s.gun_lon),
+            (DOOAF_PICK_TARGET, s.target_lat, s.target_lon),
+        ):
+            kept = notes.get(role)
+            if kept is None or lat is None or lon is None:
+                continue
+            # The dialog writes seven decimals, so a saved position comes back rounded.
+            if abs(float(lat) - kept[0]) > 2e-7 or abs(float(lon) - kept[1]) > 2e-7:
+                notes.pop(role, None)
+                continue
+            try:
+                dlg.set_point_note(role, kept[2], warn=kept[3])  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
     def _end_dooaf_map_pick(self, *, restore_target_mode: bool = True) -> None:
         self._dooaf_pick_complete = None
         self._dooaf_pick_dialog = None
         self._dooaf_pick_from_video = False
         self._dooaf_video_pick_mode = ""
+        self._show_dooaf_pick_prompt(None)
         try:
             if bool(getattr(self, "_dooaf_restore_target_after_pick", False)):
                 self._dooaf_restore_target_after_pick = False
@@ -333,27 +411,20 @@ class DooafOperationsMixin:
         *,
         label: str,
     ) -> bool:
-        """GPS + DEM ray at click UV — mark stays where the operator clicked."""
-        pitch_deg = self._dooaf_ground_pick_gimbal_pitch_deg()
-        if (
-            pitch_deg is not None
-            and abs(pitch_deg) < self._GROUND_PICK_MIN_DOWN_PITCH_DEG
-        ):
-            # Near-level camera: a video ground pick would land near the drone, not on
-            # the gun. Refuse rather than save a guessed position; the operator marks
-            # the gun on the map (exact) or tilts the gimbal down onto it.
-            print(
-                f"[VGCS:observe] ground pick blocked — camera near level "
-                f"(pitch {pitch_deg:+.1f}°, need |pitch| ≥ "
-                f"{self._GROUND_PICK_MIN_DOWN_PITCH_DEG:.0f}°) role={pick_role}"
-            )
-            self._dooaf_video_pick_failed(
-                f"{label}: the camera is almost level ({pitch_deg:+.0f}°), so a video "
-                'ground pick would land near the drone, not on the gun. Mark the GUN '
-                'with "Pick on map" (exact), or tilt the gimbal DOWN onto the gun '
-                "(about 30° or more) and click again."
-            )
-            return True
+        """GPS + DEM ray at click UV: the mark stays where the operator clicked.
+
+        Whether the point can be placed is one rule, the same as for a click
+        from the camera rail: it is measured (the camera's own angle, a
+        measured height, a look of 8 degrees or more at the click), or nothing
+        is set and the reason is said.
+
+        Until 2026-10-09 a second rule stood before it: a camera less than 15
+        degrees down was refused, whatever the click's own look was. It was
+        made in July against points that "collapsed toward the drone", which
+        was the made-up camera angle that the first rule now refuses. So a
+        target at 10 degrees was placed from the rail and refused here, with
+        "the camera is almost level ... tilt the gimbal DOWN onto the gun".
+        """
         geo = self._compute_video_pick_geo(video_x, video_y)
         if geo is None:
             row: dict[str, object] = {
@@ -370,7 +441,7 @@ class DooafOperationsMixin:
                 f"reason={str(row.get('geo_warning') or row.get('geo_quality') or '')!r} "
                 f"look={row.get('geo_depression_deg')} agl={row.get('measure_agl_m')}"
             )
-            self._dooaf_video_pick_failed(why_not_placed(row))
+            self._dooaf_video_pick_failed(why_not_placed(row), tips=False)
             return True
         lat, lon, alt_m = geo
         mark_u, mark_v = float(video_x), float(video_y)
@@ -412,6 +483,9 @@ class DooafOperationsMixin:
             )
         )
         if callable(cb):
+            from vgcs.map.dooaf_popup import SETUP_FROM_THE_PICTURE
+
+            self._say_how_the_pick_was_measured(SETUP_FROM_THE_PICTURE)
             try:
                 cb(float(lat), float(lon), alt_m)
             except TypeError:
@@ -660,9 +734,13 @@ class DooafOperationsMixin:
         self,
         preserve: dict[str, object],
         *,
-        slant_m: float,
+        slant_m: float | None,
     ) -> tuple[float, float, float | None] | None:
-        """Re-register ground gun after facade LRF slant-only lock."""
+        """Re-register ground gun after facade LRF slant-only lock.
+
+        ``slant_m`` None: the lock gave no range, and the gun's mark is put
+        back as it was.
+        """
         role_key = DOOAF_ROLE_GUN
         marks = getattr(self, "_dooaf_setup_video_marks", None) or {}
         uv = preserve.get("setup_uv")
@@ -697,7 +775,7 @@ class DooafOperationsMixin:
             geo_lat=lat,
             geo_lon=lon,
             geo_alt_m=alt_m,
-            lrf_slant_range_m=float(slant_m),
+            lrf_slant_range_m=float(slant_m) if slant_m is not None else None,
         )
         try:
             write_dooaf_setup_video_mark(
@@ -773,11 +851,23 @@ class DooafOperationsMixin:
                 # never placed from a lock that was made before.
                 return False
             video_x, video_y = float(pending.u), float(pending.v)
+            from vgcs.map.dooaf_popup import (
+                setup_by_laser_note,
+                setup_on_the_wall_under_the_cross_note,
+            )
+
+            # A click at the cross was moved onto it before the lock started.
+            at_the_cross = abs(video_x - 0.5) < 1e-6 and abs(video_y - 0.5) < 1e-6
             if self._complete_dooaf_setup_facade_uv_pick(
                 pick_role,
                 video_x,
                 video_y,
                 label=dooaf_role_display(pick_role),
+                how=(
+                    setup_by_laser_note(float(slant_m))
+                    if at_the_cross
+                    else setup_on_the_wall_under_the_cross_note(float(slant_m))
+                ),
             ):
                 print(
                     f"[VGCS:observe] facade slant-only lock {slant_note} — "
@@ -790,8 +880,19 @@ class DooafOperationsMixin:
                 return True
             print(
                 f"[VGCS:observe] facade slant-only lock {slant_note} — "
-                "target geo from click failed; use Pick on video"
+                "target geo from click failed"
             )
+            # The lock is stored, and the place of the click on its wall could
+            # not be worked out. That is said in a box. Until 2026-10-09 the
+            # dialog stayed away with nothing set, and the reason went to the
+            # status line, which is not on the screen.
+            self._dooaf_video_pick_failed(
+                f"The laser gave {float(slant_m):.1f} m, but the place of the click "
+                "on that wall could not be worked out.\n"
+                "Put the cross on the target, then click it.",
+                tips=False,
+            )
+            return True
         cb = self._dooaf_pick_complete
         self._end_dooaf_map_pick(restore_target_mode=True)
         if preserve_gun is not None and pick_role in (DOOAF_ROLE_GUN, "gun_origin"):
@@ -809,6 +910,9 @@ class DooafOperationsMixin:
                 f"gun kept at ground pick ({lat:.7f}, {lon:.7f})"
             )
             if callable(cb):
+                from vgcs.map.dooaf_popup import setup_gun_kept_note
+
+                self._say_how_the_pick_was_measured(setup_gun_kept_note(float(slant_m)))
                 try:
                     cb(float(lat), float(lon), alt_m)
                 except TypeError:
@@ -817,19 +921,6 @@ class DooafOperationsMixin:
                 f"Facade {slant_note} recorded — gun unchanged (ground). "
                 "Pick TARGET on the building face, then mark impact."
             )
-            return True
-        if pick_role == DOOAF_ROLE_INTENDED:
-            self._set_status(
-                f"Facade {slant_note} recorded — click TARGET on the same building face"
-            )
-            dlg = self._dooaf_pick_dialog
-            if dlg is not None:
-                try:
-                    dlg.show()
-                    dlg.raise_()
-                    dlg.activateWindow()
-                except Exception:
-                    pass
             return True
         return False
 
@@ -873,6 +964,50 @@ class DooafOperationsMixin:
         video_x, video_y = float(pending.u), float(pending.v)
         pick_role = str(pending.pick_role or DOOAF_ROLE_INTENDED)
         if slant_m is None:
+            from vgcs.map.dooaf_popup import (
+                laser_gave_no_point_line,
+                setup_from_the_picture_after_the_laser_note,
+                why_not_placed,
+            )
+
+            # What the laser said, once, for everything below: a range that is
+            # a point in the air, the camera's own reason, or that none came.
+            refused = getattr(self, "_lrf_range_in_the_air", None)
+            backend_reason = ""
+            getter = getattr(self, "_lrf_backend_lock_error", None)
+            if callable(getter):
+                try:
+                    backend_reason = str(getter() or "")
+                except Exception:
+                    backend_reason = ""
+            laser_said = laser_gave_no_point_line(
+                refused.short_text() if refused is not None else backend_reason
+            )
+
+            preserve_gun = getattr(self, "_dooaf_facade_slant_preserve_track", None)
+            if pick_role in (DOOAF_ROLE_GUN, "gun_origin") and isinstance(preserve_gun, dict):
+                # This lock was to measure the wall under the cross for a gun
+                # that keeps its ground pick. Without a range nothing changes.
+                # Until 2026-10-09 the gun was moved to where the look at the
+                # click meets the ground.
+                self._dooaf_facade_slant_preserve_track = None
+                self._dooaf_restore_preserved_ground_gun_track(preserve_gun, slant_m=None)
+                self._dooaf_video_pick_failed(
+                    f"{laser_said}\nThe gun stays where it was picked.", tips=False
+                )
+                return
+            at_the_cross = abs(video_x - 0.5) < 1e-6 and abs(video_y - 0.5) < 1e-6
+            if pick_role == DOOAF_ROLE_INTENDED and not at_the_cross:
+                # A lock is made beside the cross only for a click that the
+                # operator said is on the wall under the cross. Where its look
+                # meets the ground is behind that wall.
+                self._dooaf_video_pick_failed(
+                    f"{laser_said}\n"
+                    "The click is on a wall, so it is not placed on the ground.\n"
+                    "Put the cross on something solid and lock again.",
+                    tips=False,
+                )
+                return
             row: dict[str, object] = {
                 "kind": "video_mark",
                 "video_x_norm": video_x,
@@ -932,6 +1067,25 @@ class DooafOperationsMixin:
                     f"lat={float(lat_fb):.7f} lon={float(lon_fb):.7f} "
                     f"video=({mark_u:.3f},{mark_v:.3f})"
                 )
+                # The laser did not give this point, and it is placed all the
+                # same, from the picture. Field report 2026-08-20: "when I
+                # locked target then I got latlong as well as LRF failed
+                # error". Both were true, and the operator could not tell
+                # whether the position was usable.
+                #
+                # So the dialog says it under the point's numbers, and no red
+                # "LRF failed" mark is left on the video beside a position
+                # that was saved (the flag is read by the code that runs after
+                # this, _on_c13_lrf_lock_finished). The mark was cleared here
+                # in August, and that code put it back each time, with "LRF
+                # lock failed" in place of the line that said what was saved.
+                self._lrf_pick_placed_without_laser = True
+                self._say_how_the_pick_was_measured(
+                    setup_from_the_picture_after_the_laser_note(
+                        refused.short_text() if refused is not None else backend_reason
+                    ),
+                    warn=True,
+                )
                 if callable(cb):
                     try:
                         cb(float(lat_fb), float(lon_fb), alt_fb)
@@ -945,45 +1099,17 @@ class DooafOperationsMixin:
                         alt_m=alt_fb,
                     )
                 self._end_dooaf_map_pick(restore_target_mode=True)
-                # The laser declined, but the pick SUCCEEDED via the ray/DEM
-                # fallback — so clear the red "LRF failed" reticle the decline
-                # left on the video. Field report 2026-08-20: "when I locked
-                # target then I got latlong as well as LRF failed error". Both
-                # were true and that is exactly the problem; the operator cannot
-                # tell whether the position they are looking at is usable.
-                clear_failed = getattr(self, "_clear_lrf_failed_reticle", None)
-                if callable(clear_failed):
-                    try:
-                        clear_failed()
-                    except Exception:
-                        pass
-                refused = getattr(self, "_lrf_range_in_the_air", None)
-                if refused is not None:
-                    self._set_status(
-                        f"DOOAF {pending.label} saved from the terrain estimate. "
-                        f"{refused.short_text()}"
-                    )
-                    return
-                self._set_status(
-                    f"DOOAF {pending.label} saved — laser gave no range, "
-                    "position from terrain estimate (re-pick with LRF for better accuracy)"
+                self._set_status(f"DOOAF {pending.label} saved from the picture. {laser_said}")
+                return
+            if refused is not None:
+                # The laser did answer, with a range that is not on the ground,
+                # and the picture found no point either. The operator needs
+                # the first of the two: it says what to do.
+                asked = bool(getattr(self, "_lrf_range_in_the_air_asked", False))
+                self._dooaf_video_pick_failed(
+                    refused.not_set_text() if asked else refused.text(), tips=False
                 )
                 return
-            # Say WHY it declined. The backend already knows — a boresight-only
-            # laser that simply wasn't aimed at the pick is a different problem
-            # from a surface giving no return, and needs the opposite action
-            # from the operator. Field report 2026-08-18: four picks in a row
-            # declined for being ~170px off centre (tolerance 154px) while the
-            # dialog told the operator to "choose a surface with a clear laser
-            # return" — sending them to re-aim at different surfaces when the
-            # fix was to centre the gimbal on the one they already had.
-            backend_reason = ""
-            getter = getattr(self, "_lrf_backend_lock_error", None)
-            if callable(getter):
-                try:
-                    backend_reason = str(getter() or "")
-                except Exception:
-                    backend_reason = ""
             # If the geometry itself rules out BOTH methods, lead with that.
             # Field report 2026-08-20: an operator on the ground (READY TO ARM,
             # 4.5 m, camera near level) retried five times against a message
@@ -992,41 +1118,19 @@ class DooafOperationsMixin:
             # they were standing. Neither retry nor a different surface could
             # ever have worked; picking on the map would have.
             geometry_note = self._dooaf_video_pick_geometry_blocker()
-            guess_note = ""
-            if lat_fb is not None and lon_fb is not None:
-                # The picture did give a point, but one that rests on a guess
-                # (a drone on the ground, a camera near level in a low hover).
-                # Until 2026-10-08 such a point was saved as the target. Now
-                # the operator is told why it is none.
-                from vgcs.map.dooaf_popup import why_not_placed
-
-                guess_note = f"The laser gave no range.\n{why_not_placed(row)}"
-            refused = getattr(self, "_lrf_range_in_the_air", None)
-            if refused is not None:
-                # The laser did answer, with a range that is not on the ground,
-                # and the terrain estimate found no point either. The operator
-                # needs the first of the two: it says what to do.
-                asked = bool(getattr(self, "_lrf_range_in_the_air_asked", False))
-                self._dooaf_video_pick_failed(
-                    refused.not_set_text() if asked else refused.text(),
-                    boresight_hint=False,
-                )
-            elif guess_note:
-                self._dooaf_video_pick_failed(guess_note, boresight_hint=False)
-            elif geometry_note:
-                self._dooaf_video_pick_failed(geometry_note, boresight_hint=False)
-            elif backend_reason:
-                self._dooaf_video_pick_failed(
-                    f"LRF lock failed — {backend_reason}. "
-                    "The ray/DEM fallback could not place this pick either "
-                    "(look angle too near the horizon).",
-                    boresight_hint=True,
-                )
-            else:
-                self._dooaf_video_pick_failed(
-                    "LRF lock failed — gimbal aimed at click but rangefinder did not "
-                    "confirm; retry the pick or choose a surface with a clear laser return"
-                )
+            if geometry_note and (lat_fb is None or lon_fb is None):
+                self._dooaf_video_pick_failed(geometry_note, tips=False)
+                return
+            # The laser's own reason, then why the picture cannot place the
+            # point either, with what to do. Field report 2026-08-18: four
+            # picks in a row were declined for being off centre while the
+            # dialog said to "choose a surface with a clear laser return".
+            #
+            # Until 2026-10-09 a lock without a range, at a look too flat for
+            # the picture (the flight of 2026-10-08: 5 degrees), said "gimbal
+            # aimed at click but rangefinder did not confirm". The camera is
+            # not aimed at a click, and the reason of the picture was left out.
+            self._dooaf_video_pick_failed(f"{laser_said}\n{why_not_placed(row)}", tips=False)
             return
         preserve_gun = getattr(self, "_dooaf_facade_slant_preserve_track", None)
         slant_only = (
@@ -1071,9 +1175,11 @@ class DooafOperationsMixin:
         if not row_point_is_measured(row):
             # The laser's point could not be worked out, and what the picture
             # gives in its place rests on a guess. That is no gun and no target.
-            from vgcs.map.dooaf_popup import why_not_placed
+            from vgcs.map.dooaf_popup import LASER_POINT_NOT_WORKED_OUT, why_not_placed
 
-            self._dooaf_video_pick_failed(why_not_placed(row))
+            self._dooaf_video_pick_failed(
+                f"{LASER_POINT_NOT_WORKED_OUT}\n{why_not_placed(row)}", tips=False
+            )
             return
         alt_raw = row.get("target_alt_m")
         alt_m: float | None = None
@@ -1142,6 +1248,19 @@ class DooafOperationsMixin:
             f"click=({video_x:.3f},{video_y:.3f}){lrf_note}"
         )
         if callable(cb):
+            from vgcs.map.dooaf_popup import (
+                LASER_POINT_NOT_WORKED_OUT,
+                setup_by_laser_note,
+                setup_from_the_picture_after_the_laser_note,
+            )
+
+            if used_lrf and slant_m is not None:
+                self._say_how_the_pick_was_measured(setup_by_laser_note(float(slant_m)))
+            else:
+                self._say_how_the_pick_was_measured(
+                    setup_from_the_picture_after_the_laser_note(LASER_POINT_NOT_WORKED_OUT),
+                    warn=True,
+                )
             try:
                 cb(float(lat), float(lon), alt_m)
             except TypeError:
@@ -1156,8 +1275,15 @@ class DooafOperationsMixin:
         )
 
     def _dooaf_video_pick_failed(
-        self, reason: str, *, boresight_hint: bool = False
+        self, reason: str, *, boresight_hint: bool = False, tips: bool = True
     ) -> None:
+        """Nothing was set: the dialog comes back, and a box says why.
+
+        ``tips=False`` for a reason that says itself what to do. The list of
+        tips under it is from the days of the tests on a building ("click roof
+        / aim point on the building"), and is kept for the reasons that carry
+        no advice of their own.
+        """
         dlg = self._dooaf_pick_dialog
         self._end_dooaf_map_pick(restore_target_mode=True)
         detail = (reason or "").strip() or "Could not compute a ground position."
@@ -1170,6 +1296,12 @@ class DooafOperationsMixin:
                 dlg.activateWindow()
             except Exception:
                 pass
+            if not tips:
+                try:
+                    QMessageBox.warning(dlg, "Pick on video", detail)
+                except Exception:
+                    pass
+                return
             try:
                 QMessageBox.warning(
                     dlg,
@@ -1203,7 +1335,10 @@ class DooafOperationsMixin:
         """Short labels for marks still needed in the current DOOAF session."""
         missing: list[str] = []
         s = self._resolved_dooaf_settings()
-        if s.gun_lat is None or s.gun_lon is None:
+        # With "No gun position" ticked the gun is not missing: it is not set
+        # on purpose, and the banner on the video listed it all the same.
+        gun_is_wanted = getattr(s, "assumed_gun_bearing_deg", None) is None
+        if gun_is_wanted and (s.gun_lat is None or s.gun_lon is None):
             missing.append("Gun")
         if s.target_lat is None or s.target_lon is None:
             missing.append("Target")
@@ -1227,12 +1362,14 @@ class DooafOperationsMixin:
             ly.set_facade_hint(None)
             return
         ctx = self._observation_context()
-        ready = bool(session.uv_pick_valid(ctx))
+        ended_why = str(session.why_not_held(ctx))
+        ready = not ended_why
         text = build_facade_overlay_hint(
             slant_range_m=session.slant_range_m,
             uv_pick_ready=ready,
             pending_roles=self._dooaf_facade_pending_pick_labels(),
             ground_range_m=session.ground_range_m,
+            ended_why=ended_why,
         )
         if text is None:
             ly.set_facade_hint(None)
@@ -1313,8 +1450,13 @@ class DooafOperationsMixin:
         video_y: float,
         *,
         label: str,
+        how: str = "",
     ) -> bool:
-        """Place a DOOAF setup mark from facade session (no LRF slew)."""
+        """Place a DOOAF setup mark from facade session (no LRF slew).
+
+        ``how``: how the point was measured, for the line under its numbers
+        in the dialog.
+        """
         geo = self._geo_from_facade_uv_pick(video_x, video_y)
         if geo is None:
             return False
@@ -1369,6 +1511,7 @@ class DooafOperationsMixin:
         )
         self._end_dooaf_map_pick(restore_target_mode=True)
         if cb is not None:
+            self._say_how_the_pick_was_measured(how)
             try:
                 cb(float(lat), float(lon), alt_m)
             except TypeError:
@@ -1537,8 +1680,17 @@ class DooafOperationsMixin:
             # degrees down), and a target locked right after a gun was set on
             # the gun. A lock button makes a new lock now, every time.
             if self._ask_whether_the_click_is_on_the_wall_of_the_lock_before():
+                from vgcs.map.dooaf_popup import setup_on_the_wall_of_the_lock_before_note
+
+                held_m = getattr(
+                    getattr(self, "_dooaf_facade_session", None), "slant_range_m", None
+                )
                 if self._complete_dooaf_setup_facade_uv_pick(
-                    pick_role, float(video_x), float(video_y), label=label
+                    pick_role,
+                    float(video_x),
+                    float(video_y),
+                    label=label,
+                    how=setup_on_the_wall_of_the_lock_before_note(held_m),
                 ):
                     return True
                 print(
@@ -1586,7 +1738,7 @@ class DooafOperationsMixin:
                 self._dooaf_video_pick_failed(
                     f"{laser_not_at_the_cross_text(away_deg)} "
                     f"Put the cross on the {what}, then click it.",
-                    boresight_hint=True,
+                    tips=False,
                 )
                 return True
         if not use_facade_lrf:
@@ -1640,6 +1792,7 @@ class DooafOperationsMixin:
         # and chases imperfect clicks onto the background. The operator aims the
         # crosshair at the target, then clicks to lock — the click is projected onto
         # the facade plane defined by that crosshair range.
+        self._show_dooaf_pick_prompt(None)  # the click is made: the laser's mark says the rest
         self._begin_c13_lrf_video_lock_for_pick(
             float(video_x),
             float(video_y),
@@ -1689,18 +1842,30 @@ class DooafOperationsMixin:
         answer when the box is closed without one, and the click is then
         placed from the picture.
         """
-        slant = getattr(getattr(self, "_dooaf_facade_session", None), "slant_range_m", None)
+        session = getattr(self, "_dooaf_facade_session", None)
+        slant = getattr(session, "slant_range_m", None)
         try:
             held = f" (LRF {float(slant):.1f} m)"
         except (TypeError, ValueError):
             held = ""
+        # The wall pick takes the picture as it was at the lock. When the
+        # camera was turned since, the point is off by that turn (15 m after
+        # 6 degrees, 143 m away). What the camera itself reports is said.
+        turned = ""
+        try:
+            turn = session.camera_turn_since_lock_deg(self._observation_context())  # type: ignore[union-attr]
+            if turn is not None and float(turn) >= 1.0:
+                turned = f"\nThe camera reports a turn of {float(turn):.0f} degrees since that lock."
+        except Exception:
+            turned = ""
         try:
             answer = QMessageBox.question(
                 self,
                 "Laser pick",
-                f"A laser lock made before this click is still held{held}.\n\n"
+                f"A laser lock made before this click is still held{held}.{turned}\n\n"
                 "Is this click on the same wall or building face as that lock?\n\n"
-                "Yes: the click is placed on that wall.\n"
+                "Yes: the click is placed on that wall. "
+                "That is right only if the camera was not turned since that lock.\n"
                 "No: the click is placed from the picture. Over open ground answer No.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -1783,8 +1948,18 @@ class DooafOperationsMixin:
         lat: float,
         lon: float,
         alt_m: float | None = None,
-    ) -> None:
-        """Write gun/target coords to QSettings and refresh the setup dialog fields."""
+        dlg: object | None = None,
+    ) -> bool:
+        """Write gun/target coords to QSettings and refresh the setup dialog fields.
+
+        False when nothing was written (the artillery position is locked).
+
+        ``dlg``: the dialog of the pick. A pick is over (and its dialog
+        forgotten here) before its point is handed on, so since July the
+        dialog came back with the fields as they were before the pick: empty,
+        or with the position before. Only a pick that the laser did not
+        answer filled them.
+        """
         # Second line behind the disabled controls. The buttons that start a
         # gun pick are already switched off while locked, so nothing should
         # arrive here; if a pick is ever started another way, the artillery
@@ -1793,7 +1968,7 @@ class DooafOperationsMixin:
             lock = getattr(self, "_artillery_lock_obj", None)
             if lock is not None and not lock.is_unlocked:
                 self._set_status("Artillery position is locked — unlock it in DOOAF Setup")
-                return
+                return False
         pick_alt = alt_m
         if pick_alt is None:
             pick_alt = self._dem_elevation_at(float(lat), float(lon))
@@ -1809,16 +1984,20 @@ class DooafOperationsMixin:
             merged, self._observe_dem_path()
         )
         write_dooaf_settings(st, merged)
-        dlg = self._dooaf_pick_dialog
+        if dlg is None:
+            dlg = self._dooaf_pick_dialog
         if dlg is not None:
-            if merged.gun_lat is not None and merged.gun_lon is not None:
+            # The fields of the point that was picked, and of no other: what
+            # was typed for the other point and is not saved yet stays.
+            picked_the_gun = str(pick_role) in (DOOAF_ROLE_GUN, "gun_origin", DOOAF_PICK_GUN)
+            if picked_the_gun and merged.gun_lat is not None and merged.gun_lon is not None:
                 dlg.set_point_coords(
                     DOOAF_PICK_GUN,
                     float(merged.gun_lat),
                     float(merged.gun_lon),
                     alt_m=merged.gun_alt_m,
                 )
-            if merged.target_lat is not None and merged.target_lon is not None:
+            if not picked_the_gun and merged.target_lat is not None and merged.target_lon is not None:
                 dlg.set_point_coords(
                     DOOAF_PICK_TARGET,
                     float(merged.target_lat),
@@ -1826,6 +2005,7 @@ class DooafOperationsMixin:
                     alt_m=merged.target_alt_m,
                 )
         self._refresh_dooaf_map_overlay()
+        return True
 
     def _begin_dooaf_pick(
         self,
@@ -1855,9 +2035,15 @@ class DooafOperationsMixin:
             lon: float,
             alt_m: float | None = None,
         ) -> None:
-            self._apply_dooaf_setup_pick_to_settings(
-                pick_role, float(lat), float(lon), alt_m=alt_m
+            from vgcs.map.dooaf_popup import SETUP_FROM_THE_MAP
+
+            # How the point was measured: said by the code that placed it.
+            note, warn = self._take_the_pick_note("" if from_video else SETUP_FROM_THE_MAP)
+            written = self._apply_dooaf_setup_pick_to_settings(
+                pick_role, float(lat), float(lon), alt_m=alt_m, dlg=dlg
             )
+            if written is not False:
+                self._note_the_setup_point(dlg, role, float(lat), float(lon), note, warn)
             dlg.show()
             dlg.raise_()
             dlg.activateWindow()
@@ -1900,51 +2086,16 @@ class DooafOperationsMixin:
                 f"mode={self._dooaf_video_pick_mode} "
                 f"(Target paused={self._dooaf_restore_target_after_pick})"
             )
-            if self._dooaf_video_pick_mode == DOOAF_VIDEO_PICK_FACADE_LRF:
-                if self._dooaf_lrf_geo_enabled():
-                    # What the lock does, in the words of its button's tooltip.
-                    # These lines still told of a camera that turns to the
-                    # click, and of fast picks after one lock.
-                    if (
-                        pick_role == DOOAF_ROLE_GUN
-                        and self._dooaf_saved_ground_gun_track() is not None
-                    ):
-                        self._set_status(
-                            "Click the video: the laser measures the wall under "
-                            "the cross, and the gun stays where it was picked"
-                        )
-                    else:
-                        what = "target" if role == DOOAF_PICK_TARGET else "gun"
-                        self._set_status(
-                            f"Put the cross on the {what}, then click it: the laser "
-                            "measures the point under the cross (the camera is not moved)"
-                        )
-                else:
-                    self._set_status(
-                        f"LRF unavailable — use Pick on video (ground) or map for {label}"
-                    )
-            elif (
-                pick_role != DOOAF_ROLE_GUN
-                and self._dooaf_lrf_geo_enabled()
-                and self._dooaf_facade_uv_pick_ready()
-            ):
-                slant = getattr(
-                    getattr(self, "_dooaf_facade_session", None),
-                    "slant_range_m",
-                    None,
-                )
-                slant_note = (
-                    f" (LRF {float(slant):.1f} m)" if slant is not None else ""
-                )
-                self._set_status(
-                    f"Click {label} on the video. A laser lock is still held"
-                    f"{slant_note}: VGCS asks whether the click is on the same wall"
-                )
-            else:
-                self._set_status(
-                    f"Click {label} on video — mark stays at your click "
-                    "(GPS + DEM ray; open ground / hills)"
-                )
+            # What the click does, on top of the video until it is made. The
+            # dialog is hidden now, and its buttons' tooltips with it. These
+            # words went to the status line only, which is not on the screen,
+            # and still told of a camera that turns to the click and of fast
+            # picks after one lock.
+            title, subtitle = self._dooaf_pick_prompt_words(
+                pick_role, self._dooaf_video_pick_mode
+            )
+            self._show_dooaf_pick_prompt(title, subtitle)
+            self._set_status(f"{title}. {subtitle}")
         else:
             try:
                 nm = getattr(self, "_native_map", None)
@@ -1987,6 +2138,9 @@ class DooafOperationsMixin:
                 target_lat=partial.target_lat if target else cur.target_lat,
                 target_lon=partial.target_lon if target else cur.target_lon,
                 target_alt_m=partial.target_alt_m if target else cur.target_alt_m,
+                # The side of a gun that is not surveyed stays as it is stored
+                # until OK. It was left out here, so "Clear" took it away.
+                assumed_gun_bearing_deg=cur.assumed_gun_bearing_deg,
             ),
         )
 
@@ -1995,6 +2149,13 @@ class DooafOperationsMixin:
     ) -> None:
         clear_gun = scope in ("gun", "all")
         clear_target = scope in ("target", "all")
+        notes = getattr(self, "_dooaf_point_notes", None)
+        if isinstance(notes, dict):
+            # How a point was measured goes with the point.
+            if clear_gun:
+                notes.pop(DOOAF_PICK_GUN, None)
+            if clear_target:
+                notes.pop(DOOAF_PICK_TARGET, None)
         roles_remove: set[str] = set()
         if clear_gun:
             roles_remove.add(DOOAF_ROLE_GUN)
@@ -2082,11 +2243,20 @@ class DooafOperationsMixin:
         dlg.coordinates_changed.connect(
             lambda scope: self._on_dooaf_setup_coordinates_changed(scope, dlg)
         )
+        self._show_the_setup_point_notes(dlg)
         dlg.finished.connect(lambda _code: self._end_dooaf_map_pick())
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        saved_settings = dlg.result_settings()
-        QTimer.singleShot(0, lambda: self._commit_dooaf_setup_dialog(saved_settings))
+
+        def save_on_ok() -> None:
+            # By the dialog's own signal, and not by what exec() returns.
+            # Hiding the dialog for a pick ends exec(), and the dialog then
+            # comes back by itself. Until 2026-10-09 OK on a dialog that had
+            # come back saved nothing: a gun position typed after the target
+            # was picked was lost without a word.
+            saved_settings = dlg.result_settings()
+            QTimer.singleShot(0, lambda: self._commit_dooaf_setup_dialog(saved_settings))
+
+        dlg.accepted.connect(save_on_ok)
+        dlg.exec()
 
     def _commit_dooaf_setup_dialog(self, partial: DooafSettings) -> None:
         """Apply DOOAF Setup after the modal closes (keeps OK responsive)."""

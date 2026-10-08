@@ -191,6 +191,58 @@ def not_marked_text(heading: str, row: object, kept: str = "", advice: str = "")
     return "\n\n".join(blocks)
 
 
+def laser_gave_no_point_line(reason: str = "") -> str:
+    """Why the laser did not give a point, as one sentence.
+
+    The camera's own reason when it gave one, else that no range came.
+    """
+    said = str(reason or "").strip()
+    if not said:
+        return LASER_GAVE_NO_RANGE
+    return said if said.endswith((".", "!", "?")) else f"{said}."
+
+
+# --- DOOAF Setup: how a point was measured, said under its numbers ---------
+#
+# The dialog shows a latitude and a longitude. These lines say where they come
+# from. A target that the laser did not measure looked the same there as one
+# that it did: the difference was written to the map's status line, which is
+# not on the screen, and a red "LRF failed" mark stood beside a position that
+# had been saved (field report 2026-08-20).
+
+SETUP_FROM_THE_PICTURE = "From the picture."
+SETUP_FROM_THE_MAP = "From the map."
+
+
+def setup_by_laser_note(slant_m: float) -> str:
+    return f"By laser: {float(slant_m):.0f} m from the drone."
+
+
+def setup_on_the_wall_under_the_cross_note(slant_m: float) -> str:
+    """A click beside the cross that the operator said is on the wall the laser is on."""
+    return f"On the wall under the cross. The laser gave {float(slant_m):.0f} m at the cross."
+
+
+def setup_on_the_wall_of_the_lock_before_note(slant_m: float | None) -> str:
+    """"Pick on video" on the wall of a lock that was made before."""
+    if slant_m is None:
+        return "On the wall of the laser lock made before."
+    return f"On the wall of the laser lock made before (LRF {float(slant_m):.1f} m)."
+
+
+def setup_from_the_picture_after_the_laser_note(reason: str = "") -> str:
+    """The laser was asked for and did not give the point."""
+    return f"{SETUP_FROM_THE_PICTURE} {laser_gave_no_point_line(reason)}"
+
+
+def setup_gun_kept_note(slant_m: float) -> str:
+    """A lock for a gun that keeps its ground pick: it measured the wall, not the gun."""
+    return (
+        "Kept where it was picked. "
+        f"The laser measured the wall under the cross: {float(slant_m):.0f} m."
+    )
+
+
 def laser_not_at_the_cross_text(degrees_away: float) -> str:
     """For a click with the laser asked for, too far from the cross."""
     return (

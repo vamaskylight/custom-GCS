@@ -941,8 +941,9 @@ class LrfVideoLockMixin:
                 # that point's own measurement. It does not become the wall
                 # for "Pick on video": the banner stays with the lock of
                 # DOOAF Setup.
-            # Set by a click from the rail that was placed without the laser's
-            # range (session_mixin._complete_pending_observation_lrf_pick).
+            # Set by a pick that was placed without the laser's range: a click
+            # from the rail (session_mixin._complete_pending_observation_lrf_pick)
+            # or a pick of DOOAF Setup (_complete_pending_dooaf_setup_lrf_pick).
             self._lrf_pick_placed_without_laser = False
             try:
                 if pending.purpose == "dooaf_setup":
@@ -980,10 +981,11 @@ class LrfVideoLockMixin:
                 self._hide_lrf_video_reticle_keep_range()
                 self._schedule_video_marks_overlay_refresh()
             elif bool(getattr(self, "_lrf_pick_placed_without_laser", False)):
-                # "Laser TGT", "Laser HIT": the laser gave no range, and the
-                # point was placed all the same, from the picture. The DOOAF
-                # window says so and why. No red "LRF failed" mark is put
-                # beside a position (field report 2026-08-20, for a target:
+                # "Laser TGT", "Laser HIT", DOOAF Setup: the laser gave no
+                # range, and the point was placed all the same, from the
+                # picture. The DOOAF window, or the Setup dialog under the
+                # point's numbers, says so and why. No red "LRF failed" mark is
+                # put beside a position (field report 2026-08-20, for a target:
                 # "I got latlong as well as LRF failed error").
                 self._lrf_pick_placed_without_laser = False
                 self._lrf_lock_uv = None
@@ -1011,7 +1013,7 @@ class LrfVideoLockMixin:
                 if backend_reason:
                     # Overrides the clear-to-"" above — geo_label doubles as the
                     # overlay caption's second line (see native_video_overlay.py's
-                    # "LRF failed — retry" + geo_label), and this is genuinely more
+                    # "LRF failed: retry" + geo_label), and this is genuinely more
                     # useful than a geo label while the lock has failed.
                     self._lrf_lock_geo_label = backend_reason
                 try:

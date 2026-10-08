@@ -1752,12 +1752,24 @@ def merge_dooaf_settings(
     base: DooafSettings,
     update: DooafSettings,
 ) -> DooafSettings:
-    """Keep base values where update leaves a coordinate pair empty."""
-    gun = (
-        (update.gun_lat, update.gun_lon, update.gun_alt_m)
-        if update.gun_lat is not None and update.gun_lon is not None
-        else (base.gun_lat, base.gun_lon, base.gun_alt_m)
-    )
+    """Keep base values where update leaves a coordinate pair empty.
+
+    ``update`` is what DOOAF Setup holds when OK is pressed. Whether the gun
+    is surveyed, and on which side of the target it stands when it is not
+    ("No gun position"), is the update's own.
+
+    Until 2026-10-09 that side was left out here, so OK dropped it. The firing
+    line was then taken to the north whichever side was chosen, and a gun
+    position that was stored before came back in its place: a surveyed gun
+    wins over the side (build_dooaf_session).
+    """
+    assumed = update.assumed_gun_bearing_deg
+    if assumed is not None:
+        gun: tuple[float | None, float | None, float | None] = (None, None, None)
+    elif update.gun_lat is not None and update.gun_lon is not None:
+        gun = (update.gun_lat, update.gun_lon, update.gun_alt_m)
+    else:
+        gun = (base.gun_lat, base.gun_lon, base.gun_alt_m)
     target = (
         (update.target_lat, update.target_lon, update.target_alt_m)
         if update.target_lat is not None and update.target_lon is not None
@@ -1770,6 +1782,7 @@ def merge_dooaf_settings(
         target_lat=target[0],
         target_lon=target[1],
         target_alt_m=target[2],
+        assumed_gun_bearing_deg=float(assumed) if assumed is not None else None,
     )
 
 def enrich_dooaf_settings_elevation_from_dem(

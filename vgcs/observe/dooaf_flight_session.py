@@ -14,6 +14,7 @@ from typing import Any
 
 from vgcs.observe.geo_reference import (
     GeoReferenceResult,
+    _gimbal_yaw_right_deg,
     _lrf_camera_dir_ned_unit,
     compute_lrf_facade_plane_geo,
 )
@@ -124,6 +125,89 @@ class DooafFacadeSession:
             gps_hdop=_float_or_none(ctx.get("gps_hdop")),
         )
 
+    def camera_turn_since_lock_deg(self, ctx: dict[str, Any]) -> float | None:
+        """How far the camera's look has turned since the lock, in degrees.
+
+        The larger of the turn to a side and the turn up or down. None when
+        there is no lock, or the camera does not say its angles now.
+
+        To a side, the look is the drone's heading and the camera's yaw
+        together. A drone that turns with a camera that follows it has turned
+        the look. A camera that holds its look while the drone turns under it
+        has not. Until 2026-10-09 the camera's own yaw was compared alone: with
+        a camera that follows the drone, the drone could turn right round and
+        the lock was still held. Without a heading now it is compared alone,
+        as before.
+        """
+        lock = self._lock
+        if lock is None:
+            return None
+        yaw = _float_or_none(ctx.get("gimbal_yaw_deg"))
+        pitch = _float_or_none(ctx.get("gimbal_pitch_deg"))
+        if yaw is None or pitch is None:
+            return None
+        look_now = _gimbal_yaw_right_deg(yaw, bool(ctx.get("gimbal_yaw_left_positive") or False))
+        look_then = _gimbal_yaw_right_deg(
+            float(lock.gimbal_yaw_deg), bool(lock.gimbal_yaw_left_positive)
+        )
+        heading = _float_or_none(ctx.get("vehicle_heading_deg"))
+        if heading is not None:
+            look_now += heading
+            look_then += float(lock.vehicle_heading_deg)
+        to_a_side = abs((look_now - look_then + 180.0) % 360.0 - 180.0)
+        return max(to_a_side, abs(pitch - float(lock.gimbal_pitch_deg)))
+
+    def why_not_held(
+        self,
+        ctx: dict[str, Any],
+        *,
+        max_gimbal_delta_deg: float = 10.0,
+        max_vehicle_shift_m: float = 8.0,
+        max_age_s: float = 600.0,
+    ) -> str:
+        """Why the lock does not stand for another pick any more, or "" while it does.
+
+        In a few words, for the banner on the video.
+
+        ``max_vehicle_shift_m`` counts up and down as well as sideways. It
+        counted sideways only, so a lock made on the ground stayed "locked"
+        through a take-off straight up, for ten minutes.
+        """
+        lock = self._lock
+        if lock is None:
+            return "no lock was made"
+        if time.monotonic() - float(lock.lock_mono) > float(max_age_s):
+            return f"it is more than {float(max_age_s) / 60.0:.0f} minutes old"
+        turn = self.camera_turn_since_lock_deg(ctx)
+        if turn is None:
+            return "the camera does not say its angles"
+        if turn > float(max_gimbal_delta_deg):
+            return f"the camera was turned {turn:.0f} degrees"
+        clat = ctx.get("vehicle_lat")
+        clon = ctx.get("vehicle_lon")
+        if clat is None or clon is None:
+            return "the drone's position is not known"
+        shift = _haversine_m(
+            float(lock.vehicle_lat),
+            float(lock.vehicle_lon),
+            float(clat),
+            float(clon),
+        )
+        if shift > float(max_vehicle_shift_m):
+            return f"the drone has moved {shift:.0f} m"
+        # The same height reference on both sides, the smoother one first.
+        for now_key, then in (
+            ("ekf_rel_alt_m", lock.vehicle_rel_alt_m),
+            ("vehicle_alt_msl_m", lock.vehicle_alt_msl_m),
+        ):
+            now = _float_or_none(ctx.get(now_key))
+            if now is not None and then is not None:
+                moved = abs(now - float(then))
+                if moved > float(max_vehicle_shift_m):
+                    return f"the drone has moved {moved:.0f} m up or down"
+                return ""
+        return ""
+
     def uv_pick_valid(
         self,
         ctx: dict[str, Any],
@@ -132,46 +216,13 @@ class DooafFacadeSession:
         max_vehicle_shift_m: float = 8.0,
         max_age_s: float = 600.0,
     ) -> bool:
-        """True when a UV-only pick can reuse the facade lock.
-
-        ``max_vehicle_shift_m`` counts up and down as well as sideways. It
-        counted sideways only, so a lock made on the ground stayed "locked"
-        through a take-off straight up, for ten minutes.
-        """
-        lock = self._lock
-        if lock is None:
-            return False
-        if time.monotonic() - float(lock.lock_mono) > float(max_age_s):
-            return False
-        gy = ctx.get("gimbal_yaw_deg")
-        gp = ctx.get("gimbal_pitch_deg")
-        if gy is None or gp is None:
-            return False
-        dy = abs(float(gy) - float(lock.gimbal_yaw_deg))
-        dp = abs(float(gp) - float(lock.gimbal_pitch_deg))
-        if dy > float(max_gimbal_delta_deg) or dp > float(max_gimbal_delta_deg):
-            return False
-        clat = ctx.get("vehicle_lat")
-        clon = ctx.get("vehicle_lon")
-        if clat is None or clon is None:
-            return False
-        shift = _haversine_m(
-            float(lock.vehicle_lat),
-            float(lock.vehicle_lon),
-            float(clat),
-            float(clon),
+        """True when a UV-only pick can reuse the facade lock (see why_not_held)."""
+        return not self.why_not_held(
+            ctx,
+            max_gimbal_delta_deg=max_gimbal_delta_deg,
+            max_vehicle_shift_m=max_vehicle_shift_m,
+            max_age_s=max_age_s,
         )
-        if shift > float(max_vehicle_shift_m):
-            return False
-        # The same height reference on both sides, the smoother one first.
-        for now_key, then in (
-            ("ekf_rel_alt_m", lock.vehicle_rel_alt_m),
-            ("vehicle_alt_msl_m", lock.vehicle_alt_msl_m),
-        ):
-            now = _float_or_none(ctx.get(now_key))
-            if now is not None and then is not None:
-                return abs(now - float(then)) <= float(max_vehicle_shift_m)
-        return True
 
     def geo_from_uv(
         self,
@@ -359,13 +410,20 @@ def build_facade_overlay_hint(
     uv_pick_ready: bool,
     pending_roles: list[str],
     ground_range_m: float | None = None,
+    ended_why: str = "",
 ) -> tuple[str, str] | None:
-    """Title + subtitle for the in-video facade lock banner."""
+    """Title + subtitle for the banner of a laser lock on the video.
+
+    The words are for a lock on anything. Until 2026-10-09 they were "Facade
+    locked" and "Facade stale, re-lock LRF on building", from the days of the
+    tests on a building, also over open ground. ``ended_why``: why the lock
+    does not stand for another pick any more (DooafFacadeSession.why_not_held).
+    """
     if slant_range_m is None:
         return None
     rng_txt = format_lrf_range_label(slant_range_m, ground_range_m)
     if uv_pick_ready:
-        title = f"Facade locked — {rng_txt}"
+        title = f"Laser lock: {rng_txt}"
         if pending_roles:
             # What is still missing, and no word on how to set it. This line
             # said "Click on video (fast pick)". A gun was never placed from
@@ -375,10 +433,11 @@ def build_facade_overlay_hint(
             labels = " · ".join(str(r) for r in pending_roles)
             subtitle = f"Still to set: {labels}"
         else:
-            subtitle = "All marks set — confirm DOOAF Setup or export REPORT"
+            subtitle = "All marks set: confirm DOOAF Setup or export REPORT"
         return title, subtitle
-    title = "Facade stale — re-lock LRF on building"
-    subtitle = f"Last {rng_txt}; gimbal or drone moved too far"
+    title = "Laser lock ended"
+    why = str(ended_why or "").strip()
+    subtitle = f"Last {rng_txt}: {why}" if why else f"Last {rng_txt}"
     return title, subtitle
 
 

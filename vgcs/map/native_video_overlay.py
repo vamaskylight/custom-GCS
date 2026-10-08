@@ -85,6 +85,28 @@ class VideoOverlayOffscreenHint:
     index: int = 0
 
 
+def lrf_reticle_caption(
+    distance_m: float | None, *, pending: bool, failed: bool = False
+) -> str:
+    """The line under the laser mark on the video.
+
+    While the laser reads it said "LRF slewing…", also for a lock that holds
+    the camera still, which every lock of DOOAF is. "Measuring" is true for a
+    camera that turns to the click and for one that does not.
+    """
+    if failed:
+        if distance_m is not None:
+            return f"LRF {format_slr_display_m(distance_m)}: failed"
+        return "LRF failed: retry"
+    if distance_m is not None and not pending:
+        return f"LRF {format_slr_display_m(distance_m)}"
+    if pending:
+        if distance_m is not None:
+            return f"LRF {format_slr_display_m(distance_m)} …"
+        return "LRF measuring…"
+    return "LRF"
+
+
 @dataclass(frozen=True)
 class VideoOverlayLrfLock:
     """C13 LRF target lock — normalized point on video (0..1) + optional range label."""
@@ -154,6 +176,10 @@ class NativeVideoOverlayLayer(QWidget):
         self._m13_track: VideoOverlayM13Track | None = None
         self._m13_track_armed = False
         self._facade_hint: VideoOverlayFacadeHint | None = None
+        # DOOAF Setup waits for a click on the video: what to do, in words
+        # (title, second line). The map's status line, where this was written
+        # until 2026-10-09, is not on the operator's screen.
+        self._pick_prompt: tuple[str, str] | None = None
         # Boresight (camera-centre) crosshair — the exact point the LRF measures.
         # Aim this at the gun/target before locking so the ranged point is under it.
         self._center_reticle_enabled = True
@@ -350,6 +376,15 @@ class NativeVideoOverlayLayer(QWidget):
                 self._facade_hint = None
         self.update()
 
+    def set_pick_prompt(self, title: str | None, subtitle: str = "") -> None:
+        """What DOOAF Setup waits for, on top of the video until the click. None: nothing."""
+        text = str(title or "").strip()
+        self._pick_prompt = (text, str(subtitle or "").strip()) if text else None
+        self.update()
+
+    def pick_prompt(self) -> tuple[str, str] | None:
+        return self._pick_prompt
+
     def clear_lrf_overlay(self) -> None:
         self._lrf_lock = None
         self._lrf_armed_hint = False
@@ -369,6 +404,7 @@ class NativeVideoOverlayLayer(QWidget):
         self._m13_track = None
         self._m13_track_armed = False
         self._facade_hint = None
+        self._pick_prompt = None
         self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -689,20 +725,7 @@ class NativeVideoOverlayLayer(QWidget):
         p.setBrush(color)
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(int(cx) - 4, int(cy) - 4, 8, 8)
-        if failed:
-            if distance_m is not None:
-                caption = f"LRF {format_slr_display_m(distance_m)} — failed"
-            else:
-                caption = "LRF failed — retry"
-        elif distance_m is not None and not pending:
-            caption = f"LRF {format_slr_display_m(distance_m)}"
-        elif pending:
-            if distance_m is not None:
-                caption = f"LRF {format_slr_display_m(distance_m)} …"
-            else:
-                caption = "LRF slewing…"
-        else:
-            caption = "LRF"
+        caption = lrf_reticle_caption(distance_m, pending=pending, failed=failed)
         geo = str(geo_label or "").strip()
         lines = [caption]
         if geo:
@@ -784,6 +807,7 @@ class NativeVideoOverlayLayer(QWidget):
             and self._m13_track is None
             and not self._m13_track_armed
             and self._facade_hint is None
+            and self._pick_prompt is None
             and not self._center_reticle_enabled
         ):
             return
@@ -795,6 +819,22 @@ class NativeVideoOverlayLayer(QWidget):
             self._draw_center_reticle(p, cl, ct, cw, ch)
 
         banner_y = float(ct + 8.0)
+        if self._pick_prompt is not None:
+            # First, above the others: it is what the next click does.
+            banner_y = self._draw_top_banner(
+                p,
+                cl=cl,
+                ct=ct,
+                cw=cw,
+                y_top=banner_y,
+                title=self._pick_prompt[0],
+                subtitle=self._pick_prompt[1],
+                border=QColor(251, 191, 36, 230),
+                fill=QColor(8, 20, 36, 220),
+                title_color=QColor(255, 236, 179),
+                subtitle_color=QColor(253, 224, 171),
+            ) + 6.0
+
         if self._lrf_armed_hint and self._lrf_lock is None:
             banner_y = self._draw_top_banner(
                 p,
