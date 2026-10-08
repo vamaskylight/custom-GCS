@@ -40,6 +40,8 @@ FLAT_LOOK_DEG = 8.0
 # Below this height the same rule refuses a point more than ten heights away.
 LOW_HEIGHT_M = 8.0
 WHAT_TO_DO = "Tilt the camera down, fly closer or higher, or mark the point on the map."
+WHAT_TO_DO_LOW = "Fly at 3 m or more, or mark the point on the map."
+MEASURING_MARK_ONLY = "The click is kept as a measuring mark only."
 # The longest line of a message in the DOOAF window, in letters.
 POPUP_LINE_LETTERS = 46
 
@@ -93,10 +95,19 @@ def why_not_placed(row: object) -> str:
     The reason is worked out from the click's own numbers where they say it,
     because the text of the geometry code is written for a log, not for
     someone flying.
+
+    The same words for a click that did get a point, but one that rests on a
+    guess (GeoReferenceResult.measured): the reason is then why the click
+    could not be measured.
     """
     warning = ""
+    look_key = "geo_depression_deg"
     try:
-        warning = str(row.get("geo_warning") or "").strip()  # type: ignore[union-attr]
+        if row.get("geo_measured") is False:  # type: ignore[union-attr]
+            warning = str(row.get("geo_not_measured_why") or "").strip()  # type: ignore[union-attr]
+            look_key = "geo_not_measured_look_deg"
+        else:
+            warning = str(row.get("geo_warning") or "").strip()  # type: ignore[union-attr]
     except AttributeError:
         pass
     low = warning.lower()
@@ -104,13 +115,30 @@ def why_not_placed(row: object) -> str:
         return "The drone's GPS position is not known."
     if "altitude agl unknown" in low:
         return "The drone's height above the ground is not known."
+    if "camera angle not reported" in low:
+        return (
+            "The camera does not tell VGCS its angle.\n"
+            "A point cannot be placed from the picture without it. Mark the point on the map."
+        )
+    if "rangefinder at its limit" in low:
+        return (
+            "The drone's height above the ground is not known: the rangefinder under it is at its limit.\n"
+            f"{WHAT_TO_DO_LOW}"
+        )
+    if "height above ground not measured" in low:
+        return (
+            "The drone is on the ground, or too low for its height to be known.\n"
+            "A point on the ground cannot be placed from the picture from there.\n"
+            f"{WHAT_TO_DO_LOW}"
+        )
     if "parallel to horizon" in low or "does not intersect ground" in low:
         return f"The click is at the horizon or above it. There is no ground there.\n{WHAT_TO_DO}"
     if "unrealistic" in low:
-        look = _number(row, "geo_depression_deg")
+        look = _number(row, look_key)
         if look is not None and look < FLAT_LOOK_DEG:
+            degrees = "1 degree" if f"{look:.0f}" == "1" else f"{look:.0f} degrees"
             return (
-                f"The camera looks too flat here: {look:.0f} degrees below the horizon.\n"
+                f"The camera looks too flat here: {degrees} below the horizon.\n"
                 f"VGCS needs {FLAT_LOOK_DEG:.0f} degrees or more to place a point on the ground.\n"
                 f"{WHAT_TO_DO}"
             )

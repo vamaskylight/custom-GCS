@@ -483,6 +483,12 @@ class ObservationExportTask(QRunnable):
             "dooaf_target_dem_alt_m",
             "dooaf_impact_dem_alt_m",
             "dooaf_height_correction_m",
+            # Whether a point was measured or rests on a guess, and what a
+            # click that got no DOOAF role was clicked as (2026-10-08). At the
+            # end, so the columns before them stay where they were.
+            "geo_measured",
+            "geo_not_measured_why",
+            "dooaf_clicked_as",
         ]
         session = build_dooaf_session(
             self._rows,

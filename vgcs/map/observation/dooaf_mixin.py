@@ -56,6 +56,8 @@ from vgcs.observe.geo_reference import (
     apply_geo_reference_result_to_video_row,
     compute_geo_reference,
     compute_lrf_slant_geo,
+    note_whether_measured,
+    row_point_is_measured,
 )
 from vgcs.observe.target_measure import (
     haversine_m,
@@ -310,6 +312,9 @@ class DooafOperationsMixin:
         lon = row.get("target_lon")
         if lat is None or lon is None:
             return None
+        if not row_point_is_measured(row):
+            # A point that rests on a guess is no gun and no target.
+            return None
         alt_raw = row.get("target_alt_m")
         alt_m: float | None = None
         if alt_raw is not None:
@@ -560,6 +565,7 @@ class DooafOperationsMixin:
         try:
             _, dem_path, dem_terrain = self._m8_geo_settings()
             fov = self._m8_geo_fov()
+            lens = self._lens_fov_for_a_measured_click()
             geo = compute_geo_reference(
                 vehicle_lat=ctx.get("vehicle_lat"),  # type: ignore[arg-type]
                 vehicle_lon=ctx.get("vehicle_lon"),  # type: ignore[arg-type]
@@ -580,6 +586,8 @@ class DooafOperationsMixin:
                 camera_vfov_deg=float(fov.vfov_deg),
                 dem_path=dem_path,
                 dem_terrain=dem_terrain,
+                lens_hfov_deg=lens[0] if lens else None,
+                lens_vfov_deg=lens[1] if lens else None,
             )
         except Exception:
             return
@@ -867,7 +875,9 @@ class DooafOperationsMixin:
             self._enrich_observation_geo_reference(row)
             lat_fb = row.get("target_lat")
             lon_fb = row.get("target_lon")
-            if lat_fb is not None and lon_fb is not None:
+            # Only a measured point stands in for the laser. One that rests on
+            # a guess is said below, with the reason, and nothing is saved.
+            if lat_fb is not None and lon_fb is not None and row_point_is_measured(row):
                 print(
                     # Reads as an outcome, not a failure: the pick SUCCEEDED, the
                     # laser just did not contribute. Saying "LRF lock failed" on
@@ -975,6 +985,15 @@ class DooafOperationsMixin:
             # they were standing. Neither retry nor a different surface could
             # ever have worked; picking on the map would have.
             geometry_note = self._dooaf_video_pick_geometry_blocker()
+            guess_note = ""
+            if lat_fb is not None and lon_fb is not None:
+                # The picture did give a point, but one that rests on a guess
+                # (a drone on the ground, a camera near level in a low hover).
+                # Until 2026-10-08 such a point was saved as the target. Now
+                # the operator is told why it is none.
+                from vgcs.map.dooaf_popup import why_not_placed
+
+                guess_note = f"The laser gave no range.\n{why_not_placed(row)}"
             refused = getattr(self, "_lrf_range_in_the_air", None)
             if refused is not None:
                 # The laser did answer, with a range that is not on the ground,
@@ -985,6 +1004,8 @@ class DooafOperationsMixin:
                     refused.not_set_text() if asked else refused.text(),
                     boresight_hint=False,
                 )
+            elif guess_note:
+                self._dooaf_video_pick_failed(guess_note, boresight_hint=False)
             elif geometry_note:
                 self._dooaf_video_pick_failed(geometry_note, boresight_hint=False)
             elif backend_reason:
@@ -1039,6 +1060,13 @@ class DooafOperationsMixin:
         if lat is None or lon is None:
             reason = str(row.get("geo_warning") or row.get("geo_quality") or "")
             self._dooaf_video_pick_failed(reason)
+            return
+        if not row_point_is_measured(row):
+            # The laser's point could not be worked out, and what the picture
+            # gives in its place rests on a guess. That is no gun and no target.
+            from vgcs.map.dooaf_popup import why_not_placed
+
+            self._dooaf_video_pick_failed(why_not_placed(row))
             return
         alt_raw = row.get("target_alt_m")
         alt_m: float | None = None
@@ -2013,6 +2041,32 @@ class DooafOperationsMixin:
             zoom_x=zoom_x,
         )
 
+    def _lens_fov_for_a_measured_click(self) -> tuple[float, float] | None:
+        """The camera's own lens at its zoom, (hfov, vfov), or None when VGCS does not know it.
+
+        A measured point is worked out through it (compute_geo_reference). The
+        "Camera HFOV" setting of _m8_geo_fov stays what the bench's way and
+        the measuring marks use: they were tuned with it.
+        """
+        from vgcs.observe.camera_fov import FOV_SOURCE_CAMERA, resolve_camera_fov
+        from vgcs.video.camera_control import camera_lens_fov_deg
+
+        try:
+            by_setting = self._m8_geo_fov()
+            if str(by_setting.source) == FOV_SOURCE_CAMERA:
+                return float(by_setting.hfov_deg), float(by_setting.vfov_deg)
+            lens = camera_lens_fov_deg(getattr(self, "_camera_control", None))
+            if lens is None:
+                return None
+            at_zoom = resolve_camera_fov(
+                wide_hfov_deg=lens[0],
+                wide_vfov_deg=lens[1],
+                zoom_x=float(by_setting.zoom_x),
+            )
+            return float(at_zoom.hfov_deg), float(at_zoom.vfov_deg)
+        except Exception:
+            return None
+
     def _m8_geo_settings(self) -> tuple[float, str | None, bool]:
         st = QSettings(QS_ORG, QS_APP)
         hfov = float(self._m8_geo_fov().hfov_deg)
@@ -2060,6 +2114,12 @@ class DooafOperationsMixin:
         row["camera_vfov_deg"] = vfov
         row["camera_zoom_x"] = float(cam_fov.zoom_x)
         row["camera_fov_source"] = str(cam_fov.source)
+        # The camera's own lens, for a point that is measured. It goes into the
+        # row so that a second try works with the same lens. camera_hfov_deg
+        # above stays the setting: the measuring marks are worked out with it.
+        lens = self._lens_fov_for_a_measured_click()
+        row["lens_hfov_deg"] = lens[0] if lens else None
+        row["lens_vfov_deg"] = lens[1] if lens else None
         from vgcs.observe.target_measure import resolve_ray_agl_for_geo
 
         ray_agl, ray_src = resolve_ray_agl_for_geo(
@@ -2096,6 +2156,8 @@ class DooafOperationsMixin:
             camera_vfov_deg=vfov,
             dem_path=dem_path,
             dem_terrain=dem_terrain,
+            lens_hfov_deg=row["lens_hfov_deg"],  # type: ignore[arg-type]
+            lens_vfov_deg=row["lens_vfov_deg"],  # type: ignore[arg-type]
         )
         row["target_lat"] = geo.target_lat
         row["target_lon"] = geo.target_lon
@@ -2103,6 +2165,7 @@ class DooafOperationsMixin:
         row["geo_quality"] = geo.quality
         row["geo_warning"] = geo.warning
         row["geo_method"] = geo.method
+        note_whether_measured(row, geo)
         from vgcs.observe.target_measure import is_plausible_ground_range
 
         q = str(geo.quality or "")

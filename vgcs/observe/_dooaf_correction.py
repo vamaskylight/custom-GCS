@@ -710,6 +710,8 @@ _SETUP_ROW_CONTEXT_KEYS = (
     "gps_fix_type",
     "gps_hdop",
     "camera_hfov_deg",
+    "lens_hfov_deg",
+    "lens_vfov_deg",
 )
 
 def _synthesize_setup_mark_row(
@@ -773,6 +775,8 @@ def _synthesize_setup_mark_row(
         camera_hfov_deg=hfov,
         dem_path=dem_path,
         dem_terrain=True,
+        lens_hfov_deg=row.get("lens_hfov_deg"),  # type: ignore[arg-type]
+        lens_vfov_deg=row.get("lens_vfov_deg"),  # type: ignore[arg-type]
     )
     from vgcs.observe.target_measure import (
         low_hover_ray_agl_m,
@@ -820,6 +824,8 @@ def _synthesize_setup_mark_row(
             dem_path=dem_path,
             dem_terrain=False,
             force_agl_m=retry_agl,
+            lens_hfov_deg=row.get("lens_hfov_deg"),  # type: ignore[arg-type]
+            lens_vfov_deg=row.get("lens_vfov_deg"),  # type: ignore[arg-type]
         )
         if retry_geo.ok and retry_geo.target_lat is not None:
             geo = retry_geo
@@ -896,7 +902,10 @@ def _apply_geo_reference_to_mark_row(
     ray_agl: float | None,
     ray_src: str,
 ) -> None:
-    from vgcs.observe.geo_reference import enrich_video_mark_target_altitude
+    from vgcs.observe.geo_reference import (
+        enrich_video_mark_target_altitude,
+        note_whether_measured,
+    )
     from vgcs.observe.target_measure import is_plausible_ground_range
 
     row["target_lat"] = geo.target_lat
@@ -905,6 +914,7 @@ def _apply_geo_reference_to_mark_row(
     row["geo_quality"] = geo.quality
     row["geo_warning"] = geo.warning
     row["geo_method"] = geo.method
+    note_whether_measured(row, geo)
     if geo.depression_deg is not None:
         row["geo_depression_deg"] = geo.depression_deg
     else:
@@ -977,6 +987,9 @@ def _forced_ray_geo_for_row(
         dem_path=dem_path,
         dem_terrain=False,
         force_agl_m=float(agl),
+        # The lens the first try was worked out through, when the row has it.
+        lens_hfov_deg=row.get("lens_hfov_deg"),  # type: ignore[arg-type]
+        lens_vfov_deg=row.get("lens_vfov_deg"),  # type: ignore[arg-type]
     )
 
 def normalize_dooaf_setup_video_marks(
@@ -1033,8 +1046,16 @@ def refine_impact_geo_artillery_field(
 
     Common when the gun is in an open field (foreground video pick) and impact
     is at the building base on the same column as the roof target.
+
+    Never for a fall of shot that was measured (geo_measured, since
+    2026-10-08): this moves the point next to the target, and a round that
+    really fell far short on the line of fire meets every condition below.
+    The rows of the sessions recorded before carry no such note and are
+    treated as they were.
     """
     if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
+        return False
+    if row.get("geo_measured") is True:
         return False
     if gun_lat is None or gun_lon is None or target_lat is None or target_lon is None:
         return False
@@ -1122,8 +1143,13 @@ def refine_impact_geo_from_video_rays(
 ) -> bool:
     """
     Re-geo impact when it collapsed onto the setup target footprint but video Y differs.
+
+    Not for a fall of shot that was measured (geo_measured): a round within
+    2.5 m of the target is a hit, and is left where it was measured.
     """
     if str(row.get("dooaf_role") or "") != DOOAF_ROLE_IMPACT:
+        return False
+    if row.get("geo_measured") is True:
         return False
     if target_lat is None or target_lon is None:
         return False

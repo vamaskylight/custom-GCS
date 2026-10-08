@@ -476,6 +476,20 @@ class SkydroidCameraControl:
         except Exception:
             return None
 
+    def lens_fov_deg(self) -> tuple[float, float] | None:
+        """The lens wide open (hfov, vfov): the one the aiming uses.
+
+        The aiming turns the camera by the angle of a clicked point, and was
+        tuned on the cameras in the field (83.4 by 46.9 degrees for the C12
+        and C13, the camera's profile for the others). See camera_lens_fov_deg.
+        """
+        try:
+            from vgcs.skydroid import adapter as skydroid_adapter
+
+            return float(skydroid_adapter._LRF_FOV_H_DEG), float(skydroid_adapter._LRF_FOV_V_DEG)
+        except Exception:
+            return None
+
     def zoom_home(self) -> None:
         try:
             self._adapter.camera_zoom_home()
@@ -1727,6 +1741,32 @@ def camera_reported_fov_deg(control: object | None) -> tuple[float, float] | Non
     try:
         hfov, vfov = float(fov[0]), float(fov[1])
     except (TypeError, ValueError, IndexError):
+        return None
+    if hfov <= 0.0 or vfov <= 0.0 or hfov >= 180.0 or vfov >= 180.0:
+        return None
+    return (hfov, vfov)
+
+
+def camera_lens_fov_deg(control: object | None) -> tuple[float, float] | None:
+    """The camera's lens wide open (hfov, vfov), when VGCS knows it, else None.
+
+    Known for the Skydroid cameras. Their aiming and their laser points have
+    used it all along, and a click on the ground is the same picture through
+    the same lens. Until 2026-10-08 a ground click was worked out with the
+    "Camera HFOV" setting instead, which is 62 degrees unless somebody
+    changed it: with a C13 (83.4 degrees) a click away from the cross was
+    taken a quarter nearer to the cross than it was.
+
+    A camera that reports its field of view (camera_reported_fov_deg) needs
+    none of this, and for any other camera the setting is all there is.
+    """
+    getter = getattr(resolve_camera_control_primary(control), "lens_fov_deg", None)
+    if not callable(getter):
+        return None
+    try:
+        fov = getter()
+        hfov, vfov = float(fov[0]), float(fov[1])
+    except Exception:
         return None
     if hfov <= 0.0 or vfov <= 0.0 or hfov >= 180.0 or vfov >= 180.0:
         return None

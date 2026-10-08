@@ -39,6 +39,7 @@ from vgcs.observe.dooaf import (
     latest_mark,
     latest_mark_row,
 )
+from vgcs.observe.geo_reference import row_point_is_measured
 from vgcs.observe.grid_reference import format_grid_reference
 from vgcs.observe.target_measure import (
     MARKS_NOT_LEVEL_HINT,
@@ -451,13 +452,16 @@ class ObservationSessionMixin:
     ) -> None:
         """Append observation row after geo (DEM ray or LRF) is on ``row``."""
         dooaf_role = str(row.get("dooaf_role") or "")
-        if (
-            kind == "video_mark"
-            and dooaf_role in (DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED)
-            and observation_target_latlon(row) is None
-        ):
-            self._dooaf_click_not_placed(row, dooaf_role)
-            return
+        not_measured_note = ""
+        if kind == "video_mark" and dooaf_role in (DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED):
+            if observation_target_latlon(row) is None:
+                self._dooaf_click_not_placed(row, dooaf_role)
+                return
+            if not row_point_is_measured(row):
+                # The point rests on a guess: no target and no fall of shot.
+                # The click goes on from here as a measuring mark.
+                not_measured_note = self._dooaf_click_not_measured(row, dooaf_role)
+                dooaf_role = DOOAF_ROLE_SURVEY
         track_before = target_track_from_observations(self._observations)
         seg_m = None
         pt = observation_target_latlon(row)
@@ -608,7 +612,7 @@ class ObservationSessionMixin:
             if rounds > 1:
                 msg += f" — round {rounds}"
         self._show_dooaf_mark_popup(dooaf_role, kind)
-        self._set_status(msg)
+        self._set_status(f"{not_measured_note} | {msg}" if not_measured_note else msg)
         self._refresh_observation_measure_overlays()
         self._refresh_dooaf_map_overlay()
         if dooaf_role == DOOAF_ROLE_IMPACT:
@@ -635,7 +639,6 @@ class ObservationSessionMixin:
             IMPACT_HEADING,
             NOT_MARKED,
             TARGET_HEADING,
-            DooafPopup,
             not_marked_text,
             why_not_placed,
         )
@@ -660,19 +663,68 @@ class ObservationSessionMixin:
                 kept = "The target set before stays as it was."
         except Exception:
             kept = ""
-        # Shown whether or not the read-out popup is switched on. That switch
-        # is for the numbers of a mark, and this is the news that there is no
-        # mark: the status line, the only other place, is hidden in flight.
+        self._show_dooaf_not_marked(not_marked_text(heading, row, kept))
+        why = why_not_placed(row).replace("\n", " ")
+        self._set_status(f"{heading} {NOT_MARKED}: {why}")
+
+    def _show_dooaf_not_marked(self, text: str) -> None:
+        """Shown whether or not the read-out popup is switched on.
+
+        That switch is for the numbers of a mark, and this is the news that
+        there is no mark: the status line, the only other place, is hidden in
+        flight.
+        """
         try:
+            from vgcs.map.dooaf_popup import DooafPopup
+
             popup = getattr(self, "_dooaf_popup", None)
             if popup is None:
                 popup = DooafPopup(self)
                 self._dooaf_popup = popup
-            popup.show_text(not_marked_text(heading, row, kept))
+            popup.show_text(text)
         except Exception:
             pass
+
+    def _dooaf_click_not_measured(self, row: dict[str, object], dooaf_role: str) -> str:
+        """A click whose point rests on a guess: no DOOAF point, a measuring mark.
+
+        Below the flying height the ground point of a click is still worked
+        out the bench's way when the camera's own angle gives none: a camera
+        within 15 degrees of level is taken to look 18 or 35 degrees down, a
+        drone on the ground is taken to be half a metre up. The measuring
+        marks on the video were tuned with those points. As a target or a
+        fall of shot such a point read as a measurement: on the ground it
+        lies about one drone height in front of the drone whatever was
+        clicked, and the correction was worked out from there (the client's
+        "static mode", 2026-10-08).
+
+        So the click loses its DOOAF role and stays as a measuring mark. The
+        row keeps what it was clicked as, and the operator is told. Returns
+        the words for the status line.
+        """
+        from vgcs.map.dooaf_popup import (
+            IMPACT_HEADING,
+            MEASURING_MARK_ONLY,
+            NOT_MARKED,
+            TARGET_HEADING,
+            not_marked_text,
+            why_not_placed,
+        )
+
+        heading = TARGET_HEADING if dooaf_role == DOOAF_ROLE_INTENDED else IMPACT_HEADING
+        row["dooaf_clicked_as"] = dooaf_role
+        row["dooaf_role"] = DOOAF_ROLE_SURVEY
+        print(
+            f"[VGCS:observe] {heading} {NOT_MARKED} (point not measured, kept as a measuring mark) "
+            f"video=({row.get('video_x_norm')},{row.get('video_y_norm')}) "
+            f"why={str(row.get('geo_not_measured_why') or '')!r} "
+            f"look={row.get('geo_not_measured_look_deg')} agl={row.get('measure_agl_m')} "
+            f"gimbal=({row.get('gimbal_yaw_deg')},{row.get('gimbal_pitch_deg')}) "
+            f"guess=({row.get('target_lat')},{row.get('target_lon')}) by {row.get('geo_method')}"
+        )
+        self._show_dooaf_not_marked(not_marked_text(heading, row, MEASURING_MARK_ONLY))
         why = why_not_placed(row).replace("\n", " ")
-        self._set_status(f"{heading} {NOT_MARKED}: {why}")
+        return f"{heading} {NOT_MARKED}: {why} {MEASURING_MARK_ONLY}"
 
     def dooaf_popup_enabled(self) -> bool:
         """On by default; the crew asked for the read-out on every mark."""

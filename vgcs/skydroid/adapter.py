@@ -3716,7 +3716,7 @@ class SkydroidTopUdpAdapter:
             fired, second_text = 0.5 * (shot + second), f"{second:.1f} m"
         else:
             print(
-                f"[VGCS:lrf] lock rejected — three ranges at one aim: the camera held "
+                f"[VGCS:lrf] lock rejected: three ranges at one aim, the camera held "
                 f"{accepted:.1f} m, shots fired now gave {shot:.1f} m and {second:.1f} m"
             )
             return None
