@@ -1642,9 +1642,13 @@ def apply_facade_slant_to_mark_row(
 ) -> None:
     if row.get("lrf_slant_range_m") is not None:
         return
-    if _is_a_measured_fall_of_shot(row):
-        # From the picture: no laser measured it. Lending it the range of
-        # another lock made the row and the report say that one had.
+    if (
+        str(row.get("dooaf_role") or "") in (DOOAF_ROLE_IMPACT, DOOAF_ROLE_INTENDED)
+        and row.get("geo_measured") is True
+    ):
+        # A target or a fall of shot from the picture: no laser measured it.
+        # Lending it the range of another lock made the row and the report
+        # say that one had, and the check of its height was made against it.
         return
     try:
         slant = float(slant_m)

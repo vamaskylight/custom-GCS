@@ -166,10 +166,25 @@ class CamObserveBlock(QWidget):
 
     setup_clicked = Signal()
     dooaf_role_changed = Signal(str)
-    impact_by_laser_changed = Signal(bool)
+    laser_changed = Signal(str, bool)  # the role, and whether its clicks go to the laser
 
-    IMPACT_BY_PICTURE_TEXT = "Laser HIT: OFF"
-    IMPACT_BY_LASER_TEXT = "Laser HIT: ON"
+    # The switch under Set TGT and Set HIT: (off, on) for the role that is chosen.
+    LASER_TEXT = {
+        DOOAF_ROLE_INTENDED: ("Laser TGT: OFF", "Laser TGT: ON"),
+        DOOAF_ROLE_IMPACT: ("Laser HIT: OFF", "Laser HIT: ON"),
+    }
+    LASER_TOOLTIP = {
+        DOOAF_ROLE_INTENDED: (
+            "ON: put the cross on the target, then click it. "
+            "The laser measures that point.\n"
+            "OFF: the target is placed from the picture."
+        ),
+        DOOAF_ROLE_IMPACT: (
+            "ON: put the cross on the fall of shot, then click it. "
+            "The laser measures that point.\n"
+            "OFF: the fall of shot is placed from the picture."
+        ),
+    }
 
     def __init__(
         self,
@@ -232,37 +247,40 @@ class CamObserveBlock(QWidget):
         row_role.addWidget(self.role_target_btn, 1)
         row_role.addWidget(self.role_impact_btn, 1)
 
-        # How a click as Set HIT is measured. OFF: from the picture, which is
-        # what the crew asked for on 2026-09-11. ON: the laser measures the
-        # point under the cross. Until 2026-10-08 this was a setting with no
-        # place on the screen, so a fall of shot that the picture cannot
-        # measure (a drone on the ground, a look flatter than 8 degrees) could
-        # not be marked on the video at all. The text says the state, because
-        # a pressed button alone is easy to misread in the field.
-        self.impact_laser_btn = QPushButton(self.IMPACT_BY_PICTURE_TEXT)
-        self.impact_laser_btn.setObjectName("observeImpactLaser")
-        self.impact_laser_btn.setCheckable(True)
-        self.impact_laser_btn.setToolTip(
-            "ON: put the cross on the fall of shot, then click it. "
-            "The laser measures that point.\n"
-            "OFF: the fall of shot is placed from the picture."
-        )
-        self.impact_laser_btn.toggled.connect(self._on_impact_laser_toggled)
+        # How a click of the chosen role is measured. OFF: from the picture.
+        # ON: the laser measures the point under the cross. One button for the
+        # two roles, each with its own state: it shows the one of the role
+        # that is chosen, "Laser TGT" or "Laser HIT", so it always says what
+        # the next click does. Both start OFF: the crew asked on 2026-09-11
+        # for the fall of shot without the laser, and Set TGT has always been
+        # placed from the picture.
+        #
+        # Until 2026-10-08 the laser for the fall of shot was a setting with
+        # no place on the screen, so a point that the picture cannot measure
+        # (a drone on the ground, a look flatter than 8 degrees) could not be
+        # marked on the video at all. The text says the state, because a
+        # pressed button alone is easy to misread in the field.
+        self._laser_on = {DOOAF_ROLE_INTENDED: False, DOOAF_ROLE_IMPACT: False}
+        self.laser_btn = QPushButton(self.LASER_TEXT[DOOAF_ROLE_IMPACT][0])
+        self.laser_btn.setObjectName("observeLaser")
+        self.laser_btn.setCheckable(True)
+        self.laser_btn.setToolTip(self.LASER_TOOLTIP[DOOAF_ROLE_IMPACT])
+        self.laser_btn.toggled.connect(self._on_laser_toggled)
         row_laser = QHBoxLayout()
         row_laser.setContentsMargins(0, 0, 0, 0)
         row_laser.setSpacing(4)
-        row_laser.addWidget(self.impact_laser_btn, 1)
+        row_laser.addWidget(self.laser_btn, 1)
 
-        # One line: the row of "Laser HIT" above took the height of two, and
-        # on a screen 720 pixels high the rail has none to spare. The rest is
-        # in the tooltips.
+        # One line: the row of the laser switch above took the height of two,
+        # and on a screen 720 pixels high the rail has none to spare. The rest
+        # is in the tooltips.
         hint = QLabel("Target ON, then click the video.")
         hint.setObjectName("observeDooafHint")
         hint.setWordWrap(True)
         hint.setToolTip(
             "Turn Target ON, pick Set TGT or Set HIT, then click the point on the "
             "video feed or the map. DOOAF Setup still takes typed grid references.\n"
-            "Laser HIT: ON measures the fall of shot with the laser, under the cross."
+            "Laser TGT or Laser HIT: ON measures the point with the laser, under the cross."
         )
         v.addLayout(row1)
         v.addLayout(row2)
@@ -272,28 +290,36 @@ class CamObserveBlock(QWidget):
         v.addWidget(hint)
 
     def _on_role_toggled(self, _checked: bool) -> None:
+        self._show_laser_of_the_role()
         self.dooaf_role_changed.emit(self.current_dooaf_role())
 
-    def _on_impact_laser_toggled(self, checked: bool) -> None:
-        self._show_impact_by_laser(bool(checked))
-        self.impact_by_laser_changed.emit(bool(checked))
+    def _on_laser_toggled(self, checked: bool) -> None:
+        role = self.current_dooaf_role()
+        self._laser_on[role] = bool(checked)
+        self._show_laser_of_the_role()
+        self.laser_changed.emit(role, bool(checked))
 
-    def _show_impact_by_laser(self, on: bool) -> None:
-        self.impact_laser_btn.setText(
-            self.IMPACT_BY_LASER_TEXT if on else self.IMPACT_BY_PICTURE_TEXT
-        )
-
-    def set_impact_by_laser(self, on: bool) -> None:
-        """Show a state that was read from the settings: nobody is told."""
-        self.impact_laser_btn.blockSignals(True)
+    def _show_laser_of_the_role(self) -> None:
+        """The switch shows the state of the role that is chosen. Nobody is told."""
+        role = self.current_dooaf_role()
+        on = bool(self._laser_on.get(role, False))
+        self.laser_btn.blockSignals(True)
         try:
-            self.impact_laser_btn.setChecked(bool(on))
+            self.laser_btn.setChecked(on)
         finally:
-            self.impact_laser_btn.blockSignals(False)
-        self._show_impact_by_laser(bool(on))
+            self.laser_btn.blockSignals(False)
+        self.laser_btn.setText(self.LASER_TEXT[role][1 if on else 0])
+        self.laser_btn.setToolTip(self.LASER_TOOLTIP[role])
 
-    def impact_by_laser(self) -> bool:
-        return bool(self.impact_laser_btn.isChecked())
+    def set_laser_for(self, role: str, on: bool) -> None:
+        """A state that was read from the settings: shown, and nobody is told."""
+        if str(role) not in self._laser_on:
+            return
+        self._laser_on[str(role)] = bool(on)
+        self._show_laser_of_the_role()
+
+    def laser_for(self, role: str) -> bool:
+        return bool(self._laser_on.get(str(role), False))
 
     def set_dooaf_role(self, role: str) -> None:
         want_target = str(role) == DOOAF_ROLE_INTENDED

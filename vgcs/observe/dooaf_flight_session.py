@@ -24,6 +24,12 @@ from vgcs.observe.geo_reference import (
 # the height itself, which is only known to some metres.
 _IN_THE_AIR_MARGIN_M = 15.0
 
+# How far from the cross a click may be for the laser to stand for it. The
+# laser measures at the cross and nowhere else. This is the C13's own limit
+# for a lock with the camera held still (adapter._LRF_HOLD_MAX_CLICK_OFFSET_DEG).
+# The Viewpro's is wider.
+LASER_MAX_OFF_CROSS_DEG = 4.0
+
 
 @dataclass
 class FacadeLockSnapshot:
@@ -81,7 +87,14 @@ class DooafFacadeSession:
         slant_range_m: float,
         ctx: dict[str, Any],
     ) -> None:
-        """Store facade lock after a successful LRF lock."""
+        """Store facade lock after a successful LRF lock.
+
+        The new lock takes the place of the one before. When it cannot be
+        stored (no position, no camera angles), none is held: the one before
+        was kept, and a click made for the new lock was then placed from the
+        old one.
+        """
+        self._lock = None
         try:
             slant = float(slant_range_m)
         except (TypeError, ValueError):
@@ -354,8 +367,13 @@ def build_facade_overlay_hint(
     if uv_pick_ready:
         title = f"Facade locked — {rng_txt}"
         if pending_roles:
+            # What is still missing, and no word on how to set it. This line
+            # said "Click on video (fast pick)". A gun was never placed from
+            # this lock, a fall of shot is not since 2026-10-08, and a target
+            # is placed from it only on the wall of the lock, after the
+            # operator is asked.
             labels = " · ".join(str(r) for r in pending_roles)
-            subtitle = f"Click on video (fast pick): {labels}"
+            subtitle = f"Still to set: {labels}"
         else:
             subtitle = "All marks set — confirm DOOAF Setup or export REPORT"
         return title, subtitle

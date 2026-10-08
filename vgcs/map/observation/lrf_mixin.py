@@ -330,11 +330,15 @@ class LrfVideoLockMixin:
         return float(fov.hfov_deg), float(fov.vfov_deg)
 
     def _lrf_lock_use_facade_plane_geo(self) -> bool:
-        """True when LRF preview should use wall-plane geo (DOOAF facade lock)."""
-        if bool(getattr(self, "_lrf_lock_is_fall_of_shot", False)):
-            # "Laser HIT": a point of its own, under the cross, with the camera
-            # where it is now. The wall-plane read-out works from the pose of
-            # the target's lock, and the camera has been turned since.
+        """True when the read-out of a lock is the click's place on the wall under the cross.
+
+        That is a lock of DOOAF Setup, which holds the camera still. A lock
+        that was made before is no reason for it. Until 2026-10-09 it was:
+        every lock after a first one was read out on the wall plane of the
+        lock before it (see _update_lrf_lock_geo).
+        """
+        if bool(getattr(self, "_lrf_lock_is_from_the_rail", False)):
+            # "Laser TGT", "Laser HIT": a point of its own, under the cross.
             return False
         if bool(getattr(self, "_lrf_lock_hold_slant_boresight", False)):
             return True
@@ -343,28 +347,7 @@ class LrfVideoLockMixin:
             role = str(getattr(pending, "pick_role", "") or "")
             if role in (DOOAF_ROLE_INTENDED, DOOAF_ROLE_IMPACT):
                 return True
-        session = getattr(self, "_dooaf_facade_session", None)
-        return session is not None and session.has_lock
-
-    def _lrf_facade_geo_context(self, ctx: dict[str, object]) -> dict[str, object]:
-        """Prefer facade-lock pose for stable wall geo after LRF lock."""
-        session = getattr(self, "_dooaf_facade_session", None)
-        lock = getattr(session, "_lock", None) if session is not None else None
-        if lock is None:
-            return ctx
-        out = dict(ctx)
-        out["vehicle_lat"] = lock.vehicle_lat
-        out["vehicle_lon"] = lock.vehicle_lon
-        out["vehicle_heading_deg"] = lock.vehicle_heading_deg
-        out["vehicle_roll_deg"] = lock.vehicle_roll_deg
-        out["vehicle_pitch_deg"] = lock.vehicle_pitch_deg
-        out["vehicle_alt_msl_m"] = lock.vehicle_alt_msl_m
-        out["gimbal_yaw_deg"] = lock.gimbal_yaw_deg
-        out["gimbal_yaw_left_positive"] = bool(getattr(lock, "gimbal_yaw_left_positive", False))
-        out["gimbal_pitch_deg"] = lock.gimbal_pitch_deg
-        out["gps_fix_type"] = lock.gps_fix_type
-        out["gps_hdop"] = lock.gps_hdop
-        return out
+        return False
 
     def _lrf_slant_warn_for_context(self, slant_m: float) -> str | None:
         """Non-blocking hint when the locked range looks long for the current AGL.
@@ -411,9 +394,13 @@ class LrfVideoLockMixin:
         ctx = self._observation_context()
         if ctx.get("gimbal_yaw_deg") is None:
             return
+        # The drone and the camera as they are now, for every lock. Where a
+        # lock had been made before, its position and camera angles were put
+        # in here in place of today's, so the lat long, the mark on the map
+        # and the status line of a new lock were worked out along the old
+        # look: 62 m beside the laser's point after a turn of 25 degrees,
+        # 143 m away. The point that DOOAF Setup saved was not touched by it.
         facade_mode = self._lrf_lock_use_facade_plane_geo()
-        if facade_mode:
-            ctx = self._lrf_facade_geo_context(ctx)
         in_progress = bool(getattr(self, "_lrf_lock_in_progress", False))
         click_uv = getattr(self, "_lrf_click_uv", None)
         use_click = (
@@ -740,9 +727,10 @@ class LrfVideoLockMixin:
         self._clear_lrf_lock_geo()
         self._lrf_lock_hold_gimbal = hold_gimbal
         self._lrf_lock_hold_slant_boresight = bool(hold_slant_boresight)
-        # A lock for a fall of shot (the pick is set before the lock starts).
+        # A lock from the camera rail, for a target ("Laser TGT") or a fall of
+        # shot ("Laser HIT"). The pick is set before the lock starts.
         pending_pick = getattr(self, "_pending_lrf_video_pick", None)
-        self._lrf_lock_is_fall_of_shot = (
+        self._lrf_lock_is_from_the_rail = (
             str(getattr(pending_pick, "purpose", "") or "") == "observation"
         )
         notify_companion_lrf_lock(active=True)
@@ -907,7 +895,17 @@ class LrfVideoLockMixin:
             self._lrf_in_the_air_accepted_m = None
             if in_the_air is not None:
                 ask = getattr(self, "_ask_whether_a_point_in_the_air_is_a_building", None)
-                asked = pending.purpose == "dooaf_setup" and callable(ask)
+                # A target is a target, also when it is set from the camera
+                # rail ("Laser TGT") and not in DOOAF Setup.
+                obs_row = getattr(pending, "observation_row", None)
+                a_target_from_the_rail = (
+                    pending.purpose == "observation"
+                    and isinstance(obs_row, dict)
+                    and str(obs_row.get("dooaf_role") or "") == DOOAF_ROLE_INTENDED
+                )
+                asked = (
+                    pending.purpose == "dooaf_setup" or a_target_from_the_rail
+                ) and callable(ask)
                 if asked and ask(in_the_air):
                     print(
                         f"[VGCS:lrf] {in_the_air.short_text()}: used, the operator says "
@@ -939,11 +937,12 @@ class LrfVideoLockMixin:
                     DOOAF_ROLE_INTENDED,
                 ):
                     self._try_record_dooaf_facade_session(float(slant_m))
-                # A lock for a fall of shot ("Laser HIT") is that round's own
-                # measurement. It does not become the wall for fast picks: the
-                # banner and the fast picks stay with the lock of the target.
-            # Set by a fall of shot that was placed without the laser's range
-            # (session_mixin._complete_pending_observation_lrf_pick).
+                # A lock from the camera rail ("Laser TGT", "Laser HIT") is
+                # that point's own measurement. It does not become the wall
+                # for "Pick on video": the banner stays with the lock of
+                # DOOAF Setup.
+            # Set by a click from the rail that was placed without the laser's
+            # range (session_mixin._complete_pending_observation_lrf_pick).
             self._lrf_pick_placed_without_laser = False
             try:
                 if pending.purpose == "dooaf_setup":
@@ -955,8 +954,9 @@ class LrfVideoLockMixin:
                 if pending.purpose == "dooaf_setup":
                     self._dooaf_video_pick_failed(str(exc))
                 elif pending.purpose == "observation":
+                    # By the point's own name: a target comes this way too now.
                     self._set_status(
-                        f"Impact LRF pick failed — {exc}. Retry the click."
+                        f"{pending.label}: the laser pick failed ({exc}). Click again."
                     )
             if slant_m is not None:
                 if pending.purpose == "dooaf_setup":
@@ -980,11 +980,11 @@ class LrfVideoLockMixin:
                 self._hide_lrf_video_reticle_keep_range()
                 self._schedule_video_marks_overlay_refresh()
             elif bool(getattr(self, "_lrf_pick_placed_without_laser", False)):
-                # "Laser HIT": the laser gave no range, and the fall of shot was
-                # placed all the same, from the picture. The DOOAF window says
-                # so and why. No red "LRF failed" mark is put beside a position
-                # (field report 2026-08-20, for a target: "I got latlong as
-                # well as LRF failed error").
+                # "Laser TGT", "Laser HIT": the laser gave no range, and the
+                # point was placed all the same, from the picture. The DOOAF
+                # window says so and why. No red "LRF failed" mark is put
+                # beside a position (field report 2026-08-20, for a target:
+                # "I got latlong as well as LRF failed error").
                 self._lrf_pick_placed_without_laser = False
                 self._lrf_lock_uv = None
                 self._lrf_lock_failed = False

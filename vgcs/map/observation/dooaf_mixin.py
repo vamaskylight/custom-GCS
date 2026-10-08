@@ -46,6 +46,7 @@ from vgcs.observe.dooaf import (
     write_dooaf_setup_video_mark,
 )
 from vgcs.observe.dooaf_flight_session import (
+    LASER_MAX_OFF_CROSS_DEG,
     LaserPointInTheAir,
     build_facade_overlay_hint,
     format_lrf_range_label,
@@ -765,6 +766,12 @@ class DooafOperationsMixin:
         self._refresh_dooaf_facade_overlay_after_change()
         slant_note = f"LRF {float(slant_m):.1f} m"
         if pick_role == DOOAF_ROLE_INTENDED:
+            if not (recorded and self._dooaf_facade_session_has_lock()):
+                # This lock could not be stored (no position, no camera
+                # angles, a range that is refused at the second look). The
+                # caller works the laser's point out by itself. The click is
+                # never placed from a lock that was made before.
+                return False
             video_x, video_y = float(pending.u), float(pending.v)
             if self._complete_dooaf_setup_facade_uv_pick(
                 pick_role,
@@ -1496,24 +1503,54 @@ class DooafOperationsMixin:
         mode = str(
             getattr(self, "_dooaf_video_pick_mode", "") or DOOAF_VIDEO_PICK_GROUND
         )
-        if (
-            self._dooaf_lrf_geo_enabled()
-            and pick_role != DOOAF_ROLE_GUN
-            and self._dooaf_facade_uv_pick_ready()
-        ):
-            if self._complete_dooaf_setup_facade_uv_pick(
-                pick_role, float(video_x), float(video_y), label=label
-            ):
-                return True
-            print(
-                "[VGCS:observe] facade uv pick geo failed — "
-                "falling back to ground video pick"
-            )
+        # By laser, a point is what is under the cross. A click beside the cross
+        # is placed by a lock in one case only: the laser is on a wall, and the
+        # click is on that same wall. Whether there is such a wall, only the
+        # operator sees, so they are asked.
+        #
+        # Until 2026-10-09 that wall was taken for granted. Over open ground a
+        # target clicked 9 degrees above the cross was set at the cross's own
+        # lat long, 29 m up in the air (83 m up, the camera 30 degrees down),
+        # and a gun clicked beside the cross was set where the cross was.
+        away_deg = self._click_away_from_the_cross_deg(float(video_x), float(video_y))
+        at_the_cross = away_deg <= LASER_MAX_OFF_CROSS_DEG
         use_facade_lrf = (
             mode == DOOAF_VIDEO_PICK_FACADE_LRF
             and self._dooaf_lrf_geo_enabled()
             and pick_role in (DOOAF_ROLE_GUN, DOOAF_ROLE_INTENDED)
         )
+        if (
+            not use_facade_lrf
+            and self._dooaf_lrf_geo_enabled()
+            and pick_role != DOOAF_ROLE_GUN
+            and self._dooaf_facade_uv_pick_ready()
+        ):
+            # "Pick on video" while a lock made before is still held. That lock
+            # measured one point. A click is placed from it only when both are
+            # on one wall, wherever in the picture the click is: a lock is held
+            # while the camera is turned, up to 10 degrees.
+            #
+            # Until 2026-10-09 the lock made before was used without a word,
+            # by the target's lock button too. A second lock made after the
+            # camera was turned 6 degrees gave the first lock's point again,
+            # 15 m from what was under the cross (83 m up, the camera 30
+            # degrees down), and a target locked right after a gun was set on
+            # the gun. A lock button makes a new lock now, every time.
+            if self._ask_whether_the_click_is_on_the_wall_of_the_lock_before():
+                if self._complete_dooaf_setup_facade_uv_pick(
+                    pick_role, float(video_x), float(video_y), label=label
+                ):
+                    return True
+                print(
+                    "[VGCS:observe] facade uv pick geo failed: "
+                    "falling back to ground video pick"
+                )
+            else:
+                print(
+                    "[VGCS:observe] no wall, says the operator: the lock made "
+                    "before is not used for this click"
+                )
+        gun_keeps_its_ground_pick = False
         if use_facade_lrf and pick_role in (DOOAF_ROLE_GUN, "gun_origin"):
             preserved = self._dooaf_saved_ground_gun_track()
             if preserved is not None:
@@ -1522,8 +1559,36 @@ class DooafOperationsMixin:
                 if isinstance(uv, tuple) and len(uv) == 2:
                     preserved["setup_uv"] = (float(uv[0]), float(uv[1]))
             self._dooaf_facade_slant_preserve_track = preserved
+            # The gun stays where it was picked on the ground. This lock only
+            # measures the wall under the cross, so the click's own place
+            # does not matter.
+            gun_keeps_its_ground_pick = preserved is not None
         elif use_facade_lrf:
             self._dooaf_facade_slant_preserve_track = None
+        if use_facade_lrf and not gun_keeps_its_ground_pick:
+            if at_the_cross:
+                # The laser measures what is under the cross. That is the point,
+                # and that is where its mark belongs.
+                video_x, video_y = 0.5, 0.5
+            elif (
+                pick_role == DOOAF_ROLE_INTENDED
+                and self._ask_whether_the_click_is_on_the_wall_under_the_cross(away_deg)
+            ):
+                pass  # on the wall the laser is on: the click is placed on it, as before
+            else:
+                from vgcs.map.dooaf_popup import laser_not_at_the_cross_text
+
+                what = "gun" if pick_role in (DOOAF_ROLE_GUN, "gun_origin") else "target"
+                print(
+                    f"[VGCS:observe] no lock: click ({float(video_x):.3f},{float(video_y):.3f}) "
+                    f"is {away_deg:.1f} deg from the cross role={pick_role}"
+                )
+                self._dooaf_video_pick_failed(
+                    f"{laser_not_at_the_cross_text(away_deg)} "
+                    f"Put the cross on the {what}, then click it.",
+                    boresight_hint=True,
+                )
+                return True
         if not use_facade_lrf:
             return self._complete_dooaf_setup_ground_video_pick(
                 pick_role,
@@ -1583,6 +1648,66 @@ class DooafOperationsMixin:
             hold_slant_boresight=True,
         )
         return True
+
+    def _click_away_from_the_cross_deg(self, video_x: float, video_y: float) -> float:
+        """How far a click is from the cross, in degrees. 0 when that cannot be worked out."""
+        try:
+            return float(self._facade_click_offset_deg(float(video_x), float(video_y))[0])
+        except Exception:
+            return 0.0
+
+    def _ask_whether_the_click_is_on_the_wall_under_the_cross(self, away_deg: float) -> bool:
+        """The one case where a click beside the cross is placed by the laser.
+
+        The laser measures the point under the cross. A click beside it can be
+        placed from that one range only when both lie on one wall, which only
+        the operator sees. "No" is the answer when the box is closed without
+        one: over open ground there is no wall.
+        """
+        try:
+            answer = QMessageBox.question(
+                self,
+                "Laser pick",
+                "The laser measures the point under the cross, and the click is "
+                f"{float(away_deg):.0f} degrees away from it.\n\n"
+                "Is the click on the same wall or building face as the cross?\n\n"
+                "Yes: the click is placed on that wall.\n"
+                "No: the laser is not used for this click. Over open ground answer No.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return answer == QMessageBox.StandardButton.Yes
+        except Exception:
+            return False
+
+    def _ask_whether_the_click_is_on_the_wall_of_the_lock_before(self) -> bool:
+        """"Pick on video" while a lock made before is still held.
+
+        That lock measured the point that was under the cross then. This click
+        is placed from it only when both lie on one wall. The camera may have
+        been turned since, so this is asked wherever the click is. "No" is the
+        answer when the box is closed without one, and the click is then
+        placed from the picture.
+        """
+        slant = getattr(getattr(self, "_dooaf_facade_session", None), "slant_range_m", None)
+        try:
+            held = f" (LRF {float(slant):.1f} m)"
+        except (TypeError, ValueError):
+            held = ""
+        try:
+            answer = QMessageBox.question(
+                self,
+                "Laser pick",
+                f"A laser lock made before this click is still held{held}.\n\n"
+                "Is this click on the same wall or building face as that lock?\n\n"
+                "Yes: the click is placed on that wall.\n"
+                "No: the click is placed from the picture. Over open ground answer No.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return answer == QMessageBox.StandardButton.Yes
+        except Exception:
+            return False
 
     def _facade_click_offset_deg(self, video_x: float, video_y: float) -> tuple[float, float]:
         """(total, vertical) angular offset of a click from the boresight, in degrees.
@@ -1777,23 +1902,32 @@ class DooafOperationsMixin:
             )
             if self._dooaf_video_pick_mode == DOOAF_VIDEO_PICK_FACADE_LRF:
                 if self._dooaf_lrf_geo_enabled():
-                    if role == DOOAF_PICK_TARGET:
+                    # What the lock does, in the words of its button's tooltip.
+                    # These lines still told of a camera that turns to the
+                    # click, and of fast picks after one lock.
+                    if (
+                        pick_role == DOOAF_ROLE_GUN
+                        and self._dooaf_saved_ground_gun_track() is not None
+                    ):
                         self._set_status(
-                            "Aim the building at the crosshair, then click the face — "
-                            "LRF reads range in a few seconds (camera does not move; "
-                            "gun mark stays put)"
+                            "Click the video: the laser measures the wall under "
+                            "the cross, and the gun stays where it was picked"
                         )
                     else:
+                        what = "target" if role == DOOAF_PICK_TARGET else "gun"
                         self._set_status(
-                            f"Click a point on the building face for {label} — "
-                            "camera will slew to centre and one LRF lock starts "
-                            "facade session for fast TARGET picks"
+                            f"Put the cross on the {what}, then click it: the laser "
+                            "measures the point under the cross (the camera is not moved)"
                         )
                 else:
                     self._set_status(
                         f"LRF unavailable — use Pick on video (ground) or map for {label}"
                     )
-            elif self._dooaf_lrf_geo_enabled() and self._dooaf_facade_uv_pick_ready():
+            elif (
+                pick_role != DOOAF_ROLE_GUN
+                and self._dooaf_lrf_geo_enabled()
+                and self._dooaf_facade_uv_pick_ready()
+            ):
                 slant = getattr(
                     getattr(self, "_dooaf_facade_session", None),
                     "slant_range_m",
@@ -1803,8 +1937,8 @@ class DooafOperationsMixin:
                     f" (LRF {float(slant):.1f} m)" if slant is not None else ""
                 )
                 self._set_status(
-                    f"Click {label} on the same building face{slant_note} — "
-                    "fast pick reuses facade lock (no gimbal slew)"
+                    f"Click {label} on the video. A laser lock is still held"
+                    f"{slant_note}: VGCS asks whether the click is on the same wall"
                 )
             else:
                 self._set_status(

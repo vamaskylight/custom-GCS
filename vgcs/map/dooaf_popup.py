@@ -42,15 +42,18 @@ LOW_HEIGHT_M = 8.0
 WHAT_TO_DO = "Tilt the camera down, fly closer or higher, or mark the point on the map."
 WHAT_TO_DO_LOW = "Fly at 3 m or more, or mark the point on the map."
 MEASURING_MARK_ONLY = "The click is kept as a measuring mark only."
-# "Laser HIT" on the camera rail: why the laser did not give the fall of shot.
+# "Laser TGT" and "Laser HIT" on the camera rail: why the laser did not give the point.
 LASER_GAVE_NO_RANGE = "The laser gave no range."
 LASER_NOT_ON_THIS_CAMERA = "This camera has no laser that VGCS can use."
 LASER_POINT_NOT_WORKED_OUT = "The laser gave a range, but its point could not be worked out."
 LASER_HOW_TO = "Put the cross on the fall of shot, then click it."
+LASER_HOW_TO_TARGET = "Put the cross on the target, then click it."
 FROM_THE_PICTURE = "This fall of shot is from the picture."
-# Said under a fall of shot that the picture could not place, while the
-# switch is off and the camera has a laser: the way that is left.
+TARGET_FROM_THE_PICTURE = "This target is from the picture."
+# Said under a point that the picture could not place, while its switch is
+# off and the camera has a laser: the way that is left.
 LASER_ADVICE = "With the laser: switch Laser HIT on, put the cross on the fall of shot, then click it."
+LASER_ADVICE_TARGET = "With the laser: switch Laser TGT on, put the cross on the target, then click it."
 # The longest line of a message in the DOOAF window, in letters.
 POPUP_LINE_LETTERS = 46
 
@@ -189,15 +192,28 @@ def not_marked_text(heading: str, row: object, kept: str = "", advice: str = "")
 
 
 def laser_not_at_the_cross_text(degrees_away: float) -> str:
-    """For a click as Set HIT with "Laser HIT" on, too far from the cross."""
+    """For a click with the laser asked for, too far from the cross."""
     return (
         "The laser measures at the cross, and the click was "
         f"{float(degrees_away):.0f} degrees away from it."
     )
 
 
+def _is_a_target(row: object) -> bool:
+    """A click as Set TGT (also one that lost its role: dooaf_clicked_as)."""
+    try:
+        role = row.get("dooaf_clicked_as") or row.get("dooaf_role")  # type: ignore[union-attr]
+    except AttributeError:
+        return False
+    return str(role or "") == "intended_target"
+
+
+def laser_how_to(row: object) -> str:
+    return LASER_HOW_TO_TARGET if _is_a_target(row) else LASER_HOW_TO
+
+
 def laser_not_used_why(row: object) -> str:
-    """Why the laser did not give this fall of shot, or "" (it did, or it was not asked)."""
+    """Why the laser did not give this point, or "" (it did, or it was not asked)."""
     try:
         if not row.get("laser_asked"):  # type: ignore[union-attr]
             return ""
@@ -217,12 +233,12 @@ def why_not_marked(row: object) -> str:
     if not laser:
         return picture
     if _number(row, "laser_click_off_cross_deg") is not None:
-        laser = f"{laser} {LASER_HOW_TO}"
+        laser = f"{laser} {laser_how_to(row)}"
     return f"{laser}\n{picture}"
 
 
 def laser_note(row: object) -> str:
-    """How a marked fall of shot was measured, when "Laser HIT" was on for it.
+    """How a marked target or fall of shot was measured, when its laser switch was on.
 
     The operator asked for the laser. They are told whether the point is the
     laser's, with the range it gave (a range that cannot be right is seen at
@@ -233,13 +249,14 @@ def laser_note(row: object) -> str:
             return ""
     except AttributeError:
         return ""
+    target = _is_a_target(row)
     why = laser_not_used_why(row)
     if why:
-        return f"{why} {FROM_THE_PICTURE}"
+        return f"{why} {TARGET_FROM_THE_PICTURE if target else FROM_THE_PICTURE}"
     slant = _number(row, "lrf_slant_range_m")
     if slant is None:
         return ""
-    return f"Fall of shot by laser: {slant:.0f} m from the drone."
+    return f"{'Target' if target else 'Fall of shot'} by laser: {slant:.0f} m from the drone."
 
 
 def marked_without_the_laser_text(row: object) -> str:
@@ -250,7 +267,8 @@ def marked_without_the_laser_text(row: object) -> str:
     """
     if not laser_not_used_why(row):
         return ""
-    return f"{IMPACT_HEADING}: marked\n\n{_short_lines(laser_note(row))}"
+    heading = TARGET_HEADING if _is_a_target(row) else IMPACT_HEADING
+    return f"{heading}: marked\n\n{_short_lines(laser_note(row))}"
 
 
 def _short_lines(text: str) -> str:

@@ -230,9 +230,10 @@ class DooafSetupDialog(QDialog):
         )
         btn_pick_gun_lrf = QPushButton("LRF lock (facade)")
         btn_pick_gun_lrf.setToolTip(
-            "Click a point on a building face — camera slews to centre and "
-            "one LRF lock enables fast TARGET/IMPACT picks. If you already picked "
-            "the gun on open ground, the gun position is kept and only slant is stored."
+            "Put the cross on the gun, then click it. The camera is not moved, "
+            "and the laser measures the point under the cross.\n"
+            "If the gun was already picked on open ground, its position is kept: "
+            "the lock then only measures the wall under the cross."
         )
         btn_pick_gun_lrf.clicked.connect(
             lambda: self.pick_video_facade_lrf_requested.emit(DOOAF_PICK_GUN)
@@ -301,18 +302,20 @@ class DooafSetupDialog(QDialog):
         )
         btn_pick_tgt_vid = QPushButton("Pick on video")
         btn_pick_tgt_vid.setToolTip(
-            "Click target on the building face — mark at your click. "
-            "After a facade LRF lock: fast pick on the same face. "
-            "For open ground / hills only (not walls), use after LRF slant is set "
-            "or when no building is involved."
+            "Click the target on the video. It is placed from the picture, "
+            "where the look at the click meets the ground.\n"
+            "While a laser lock is still held, VGCS asks whether the click is on "
+            "the same wall as that lock. Over open ground it is not."
         )
         btn_pick_tgt_vid.clicked.connect(
             lambda: self.pick_video_requested.emit(DOOAF_PICK_TARGET)
         )
         btn_pick_tgt_lrf = QPushButton("LRF lock (facade slant)")
         btn_pick_tgt_lrf.setToolTip(
-            "Gun on open ground? Click the building face — one LRF lock records "
-            "slant range for fast TARGET/IMPACT picks without moving the gun mark."
+            "Put the cross on the target, then click it. The camera is not moved, "
+            "and the laser measures the point under the cross.\n"
+            "For a click beside the cross VGCS asks whether it is on the same wall "
+            "as the cross. Over open ground it is not."
         )
         btn_pick_tgt_lrf.clicked.connect(
             lambda: self.pick_video_facade_lrf_requested.emit(DOOAF_PICK_TARGET)

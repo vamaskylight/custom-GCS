@@ -613,7 +613,7 @@ QPushButton#observeDooafSetup:hover {
   background: rgba(52, 82, 128, 235);
   border-color: rgba(180, 210, 255, 120);
 }
-QPushButton#observeImpactLaser {
+QPushButton#observeLaser {
   min-height: 34px;
   font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
   font-size: 14px;
@@ -624,11 +624,11 @@ QPushButton#observeImpactLaser {
   color: #dce5f5;
   padding: 2px 6px;
 }
-QPushButton#observeImpactLaser:hover {
+QPushButton#observeLaser:hover {
   background: rgba(110, 123, 148, 45);
   border-color: rgba(229, 237, 251, 70);
 }
-QPushButton#observeImpactLaser:checked {
+QPushButton#observeLaser:checked {
   border-color: rgba(255, 196, 92, 230);
   background: rgba(92, 64, 18, 235);
   color: #ffe2a8;
@@ -1727,17 +1727,18 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
             self._set_lrf_session_hold(True)
             QTimer.singleShot(0, self._show_dooaf_setup_dialog)
 
-        def _obs_impact_by_laser(on: bool) -> None:
-            print(f"[VGCS:cam_rail] OBSERVE Laser HIT toggled={bool(on)}")
-            self._set_impact_uses_lrf(bool(on))
+        def _obs_laser(role: str, on: bool) -> None:
+            print(f"[VGCS:cam_rail] OBSERVE Laser toggled role={role} on={bool(on)}")
+            self._set_role_uses_lrf(str(role), bool(on))
 
         self._btn_native_target.toggled.connect(_obs_target)
         self._btn_native_clip.clicked.connect(_obs_clip)
         self._btn_native_report.clicked.connect(_obs_report)
         self._btn_native_reset.clicked.connect(_obs_reset)
         observe_body.setup_clicked.connect(_obs_dooaf_setup)
-        observe_body.set_impact_by_laser(self._impact_uses_lrf())
-        observe_body.impact_by_laser_changed.connect(_obs_impact_by_laser)
+        for role in (DOOAF_ROLE_INTENDED, DOOAF_ROLE_IMPACT):
+            observe_body.set_laser_for(role, self._role_uses_lrf(role))
+        observe_body.laser_changed.connect(_obs_laser)
 
         def _m13_track_toggle(on: bool) -> None:
             if not on:
