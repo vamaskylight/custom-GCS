@@ -42,6 +42,15 @@ LOW_HEIGHT_M = 8.0
 WHAT_TO_DO = "Tilt the camera down, fly closer or higher, or mark the point on the map."
 WHAT_TO_DO_LOW = "Fly at 3 m or more, or mark the point on the map."
 MEASURING_MARK_ONLY = "The click is kept as a measuring mark only."
+# "Laser HIT" on the camera rail: why the laser did not give the fall of shot.
+LASER_GAVE_NO_RANGE = "The laser gave no range."
+LASER_NOT_ON_THIS_CAMERA = "This camera has no laser that VGCS can use."
+LASER_POINT_NOT_WORKED_OUT = "The laser gave a range, but its point could not be worked out."
+LASER_HOW_TO = "Put the cross on the fall of shot, then click it."
+FROM_THE_PICTURE = "This fall of shot is from the picture."
+# Said under a fall of shot that the picture could not place, while the
+# switch is off and the camera has a laser: the way that is left.
+LASER_ADVICE = "With the laser: switch Laser HIT on, put the cross on the fall of shot, then click it."
 # The longest line of a message in the DOOAF window, in letters.
 POPUP_LINE_LETTERS = 46
 
@@ -158,20 +167,90 @@ def why_not_placed(row: object) -> str:
     return f"VGCS could not work out where this point is.\n{WHAT_TO_DO}"
 
 
-def not_marked_text(heading: str, row: object, kept: str = "") -> str:
+def not_marked_text(heading: str, row: object, kept: str = "", advice: str = "") -> str:
     """The read-out for a click that got no position.
 
     Shown in place of the numbers. A click that leaves the popup as it was
     reads as a click that changed nothing, and a popup that still shows the
     round before reads as this round's answer.
 
+    ``advice``: one more way to mark the point, said after the reason
+    (LASER_ADVICE). ``kept``: what stays as it was, said last.
+
     Broken into short lines here: the window does not wrap by itself, and it
     should stay about as wide as it is with the numbers in it.
     """
-    blocks = [f"{heading}: {NOT_MARKED}", _short_lines(why_not_placed(row))]
+    blocks = [f"{heading}: {NOT_MARKED}", _short_lines(why_not_marked(row))]
+    if advice:
+        blocks.append(_short_lines(str(advice)))
     if kept:
         blocks.append(_short_lines(str(kept)))
     return "\n\n".join(blocks)
+
+
+def laser_not_at_the_cross_text(degrees_away: float) -> str:
+    """For a click as Set HIT with "Laser HIT" on, too far from the cross."""
+    return (
+        "The laser measures at the cross, and the click was "
+        f"{float(degrees_away):.0f} degrees away from it."
+    )
+
+
+def laser_not_used_why(row: object) -> str:
+    """Why the laser did not give this fall of shot, or "" (it did, or it was not asked)."""
+    try:
+        if not row.get("laser_asked"):  # type: ignore[union-attr]
+            return ""
+        return str(row.get("laser_not_used_why") or "").strip()  # type: ignore[union-attr]
+    except AttributeError:
+        return ""
+
+
+def why_not_marked(row: object) -> str:
+    """why_not_placed, with the laser's own reason first when the laser was asked.
+
+    After a click that was away from the cross the way to use the laser is
+    said too: where the picture cannot place the point, the laser is the way.
+    """
+    picture = why_not_placed(row)
+    laser = laser_not_used_why(row)
+    if not laser:
+        return picture
+    if _number(row, "laser_click_off_cross_deg") is not None:
+        laser = f"{laser} {LASER_HOW_TO}"
+    return f"{laser}\n{picture}"
+
+
+def laser_note(row: object) -> str:
+    """How a marked fall of shot was measured, when "Laser HIT" was on for it.
+
+    The operator asked for the laser. They are told whether the point is the
+    laser's, with the range it gave (a range that cannot be right is seen at
+    once), or the picture's, and why.
+    """
+    try:
+        if not row.get("laser_asked"):  # type: ignore[union-attr]
+            return ""
+    except AttributeError:
+        return ""
+    why = laser_not_used_why(row)
+    if why:
+        return f"{why} {FROM_THE_PICTURE}"
+    slant = _number(row, "lrf_slant_range_m")
+    if slant is None:
+        return ""
+    return f"Fall of shot by laser: {slant:.0f} m from the drone."
+
+
+def marked_without_the_laser_text(row: object) -> str:
+    """What is still said when the read-out is switched off, or "".
+
+    That switch is for the numbers of a mark. That the laser was asked for
+    and the point is the picture's is news, like a point that was not marked.
+    """
+    if not laser_not_used_why(row):
+        return ""
+    return f"{IMPACT_HEADING}: marked\n\n{_short_lines(laser_note(row))}"
 
 
 def _short_lines(text: str) -> str:

@@ -489,6 +489,10 @@ class ObservationExportTask(QRunnable):
             "geo_measured",
             "geo_not_measured_why",
             "dooaf_clicked_as",
+            # "Laser HIT": whether the laser was asked for this fall of shot,
+            # and why it did not give the point when it did not.
+            "laser_asked",
+            "laser_not_used_why",
         ]
         session = build_dooaf_session(
             self._rows,

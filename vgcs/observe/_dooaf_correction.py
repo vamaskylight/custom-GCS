@@ -114,6 +114,29 @@ def _pair_prefers_facade_geometry(
     return left_pref or right_pref
 
 
+def _is_a_measured_fall_of_shot(row: dict[str, Any] | None) -> bool:
+    """A fall of shot whose point was measured: the row's note of 2026-10-08.
+
+    That is the laser's point, or a ground point worked out from the camera's
+    own angle and a measured height (geo_reference.note_whether_measured). Its
+    position and its height stand as they are, and the fire correction is
+    worked out from the three positions alone.
+
+    The wall geometry in this file (a range lent from another lock, the
+    distance between two marks from their places in the picture, a building
+    height from how much higher one mark is in the picture than the other) was
+    made on the bench, for marks on one building face whose points were
+    guessed. Over open ground it made a height difference of 16 m between a
+    target and a fall of shot on the same level ground (2026-10-08). It stays
+    for rows without the note: the sessions recorded before.
+    """
+    return (
+        isinstance(row, dict)
+        and str(row.get("dooaf_role") or "") == DOOAF_ROLE_IMPACT
+        and row.get("geo_measured") is True
+    )
+
+
 def _c13_lrf_vfov_deg(hfov_deg: float) -> float:
     try:
         from vgcs.skydroid.adapter import _LRF_FOV_V_DEG as vfov  # type: ignore[attr-defined]
@@ -233,9 +256,11 @@ def compute_fire_correction(
     """
     from vgcs.observe.target_measure import mark_pair_fire_range_m
 
-    use_ray_gt = _pair_prefers_facade_geometry(gun_row, intended_row)
-    use_ray_gi = _pair_prefers_facade_geometry(gun_row, impact_row)
-    use_facade_ti = _pair_prefers_facade_geometry(intended_row, impact_row)
+    # A measured fall of shot: the three positions and nothing else.
+    measured = _is_a_measured_fall_of_shot(impact_row)
+    use_ray_gt = not measured and _pair_prefers_facade_geometry(gun_row, intended_row)
+    use_ray_gi = not measured and _pair_prefers_facade_geometry(gun_row, impact_row)
+    use_facade_ti = not measured and _pair_prefers_facade_geometry(intended_row, impact_row)
 
     if impact_row is not None and (use_ray_gt or use_ray_gi or use_facade_ti):
         template = gun_row or intended_row
@@ -279,10 +304,14 @@ def compute_fire_correction(
         intended.lat, intended.lon, impact.lat, impact.lon
     )
     impact_to_intended_m = map_footprint_miss_m
-    ti_facade = _facade_target_impact_separation_m(
-        intended_row,
-        impact_row,
-        hfov_deg=camera_hfov_deg,
+    ti_facade = (
+        None
+        if measured
+        else _facade_target_impact_separation_m(
+            intended_row,
+            impact_row,
+            hfov_deg=camera_hfov_deg,
+        )
     )
     en_raw = math.hypot(miss_n, miss_e)
     if (
@@ -298,10 +327,14 @@ def compute_fire_correction(
             scale = impact_to_intended_m / en_raw
             miss_n *= scale
             miss_e *= scale
-    facade_vert = _facade_intended_impact_vertical_m(
-        intended_row,
-        impact_row,
-        hfov_deg=camera_hfov_deg,
+    facade_vert = (
+        None
+        if measured
+        else _facade_intended_impact_vertical_m(
+            intended_row,
+            impact_row,
+            hfov_deg=camera_hfov_deg,
+        )
     )
     miss_vertical: float | None = None
     elev_correction: float | None = None
@@ -1609,6 +1642,10 @@ def apply_facade_slant_to_mark_row(
 ) -> None:
     if row.get("lrf_slant_range_m") is not None:
         return
+    if _is_a_measured_fall_of_shot(row):
+        # From the picture: no laser measured it. Lending it the range of
+        # another lock made the row and the report say that one had.
+        return
     try:
         slant = float(slant_m)
     except (TypeError, ValueError):
@@ -2071,28 +2108,32 @@ def build_dooaf_session(
             impact = _fill_point_alt_m(impact, impact_row, None, dem_path=dem_path)
     building_height_m: float | None = None
     if intended is not None and impact is not None:
-        intended, impact, building_height_m = resolve_dooaf_mark_elevations(
-            intended_row,
-            impact_row,
-            intended,
-            impact,
-            ground_row=ground_row,
-        )
-        hfov_resolve = 62.0
-        for src in (impact_row, intended_row, ground_row):
-            if src is not None and src.get("camera_hfov_deg") is not None:
-                try:
-                    hfov_resolve = float(src["camera_hfov_deg"])
-                except (TypeError, ValueError):
-                    pass
-                break
-        intended, impact = _apply_facade_vertical_to_points(
-            intended,
-            impact,
-            intended_row=intended_row,
-            impact_row=impact_row,
-            hfov_deg=hfov_resolve,
-        )
+        if not _is_a_measured_fall_of_shot(impact_row):
+            # Heights from the marks' places in the picture, for two marks on
+            # one building face. A measured fall of shot keeps its own height,
+            # and so does the target it is compared with.
+            intended, impact, building_height_m = resolve_dooaf_mark_elevations(
+                intended_row,
+                impact_row,
+                intended,
+                impact,
+                ground_row=ground_row,
+            )
+            hfov_resolve = 62.0
+            for src in (impact_row, intended_row, ground_row):
+                if src is not None and src.get("camera_hfov_deg") is not None:
+                    try:
+                        hfov_resolve = float(src["camera_hfov_deg"])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            intended, impact = _apply_facade_vertical_to_points(
+                intended,
+                impact,
+                intended_row=intended_row,
+                impact_row=impact_row,
+                hfov_deg=hfov_resolve,
+            )
         if building_height_m is None and intended.alt_m is not None and impact.alt_m is not None:
             bh = abs(float(intended.alt_m) - float(impact.alt_m))
             if bh >= 0.05:

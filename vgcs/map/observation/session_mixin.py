@@ -63,6 +63,13 @@ from vgcs.observe.target_measure import (
 )
 
 
+# "Laser HIT": how far from the cross a click may be for the laser to stand
+# for it. The laser measures at the cross and nowhere else. This is the
+# C13's own limit for a lock with the camera held still
+# (adapter._LRF_HOLD_MAX_CLICK_OFFSET_DEG). The Viewpro's is wider.
+LASER_HIT_MAX_OFF_CROSS_DEG = 4.0
+
+
 def _open_path_in_system_viewer(path: str) -> None:
     """Open a file in the default OS viewer without routing through Qt URL handlers."""
     target = Path(path).resolve()
@@ -210,158 +217,52 @@ class ObservationSessionMixin:
             and dooaf_role == DOOAF_ROLE_IMPACT
             and video_x is not None
             and video_y is not None
-            and self._dooaf_lrf_geo_enabled()
             and self._impact_uses_lrf()
         ):
-            if self._lrf_lock_in_progress or self._pending_lrf_video_pick is not None:
-                self._set_status("LRF lock in progress — wait before marking impact…")
-                return
-            if self._dooaf_facade_session_has_lock():
-                row.update(self._observation_context())
-                facade_geo = self._facade_geo_result_from_uv(
-                    float(video_x), float(video_y)
-                )
-                geo = None
-                if (
-                    facade_geo is not None
-                    and facade_geo.target_lat is not None
-                    and facade_geo.target_lon is not None
-                ):
-                    geo = (
-                        float(facade_geo.target_lat),
-                        float(facade_geo.target_lon),
-                        float(facade_geo.target_alt_m)
-                        if facade_geo.target_alt_m is not None
-                        else None,
-                    )
-                if geo is not None:
-                    lat, lon, alt_m = geo
-                    row["target_lat"] = float(lat)
-                    row["target_lon"] = float(lon)
-                    if alt_m is not None:
-                        row["target_alt_m"] = float(alt_m)
-                    row["geo_quality"] = str(facade_geo.quality or "fair")
-                    row["geo_method"] = "lrf_facade_plane"
-                    # Store facade-consistent range/bearing/depression so the report
-                    # shows the shallow look angle to the wall — NOT a ground-ray angle
-                    # synthesized later from AGL (which is wrong for a vertical facade).
-                    if facade_geo.horizontal_range_m is not None:
-                        row["geo_range_m"] = float(facade_geo.horizontal_range_m)
-                    if facade_geo.bearing_deg is not None:
-                        row["geo_bearing_deg"] = float(facade_geo.bearing_deg)
-                    if facade_geo.depression_deg is not None:
-                        row["geo_depression_deg"] = float(facade_geo.depression_deg)
-                    geo_warn = str(
-                        facade_geo.warning or facade_geo.quality or ""
-                    ).strip()
-                    stale = not self._dooaf_facade_uv_pick_ready()
-                    parts: list[str] = []
-                    if geo_warn:
-                        parts.append(geo_warn)
-                    if stale:
-                        parts.append(
-                            "facade lock stale (gimbal/drone moved) — geo from lock pose"
-                        )
-                    row["geo_warning"] = "; ".join(parts)
-                    slant = self._dooaf_facade_session.slant_range_m
-                    if slant is not None:
-                        row["lrf_slant_range_m"] = float(slant)
-                    lock_att = self._facade_lock_gimbal_att()
-                    row["video_mark_frozen_u"] = float(video_x)
-                    row["video_mark_frozen_v"] = float(video_y)
-                    self._apply_video_mark_gimbal_track_to_row(
-                        row,
-                        float(video_x),
-                        float(video_y),
-                        ref_att=lock_att,
-                        lock_att=lock_att,
-                        used_lrf_slew=False,
-                    )
-                    glat = row.get("video_mark_geo_lat")
-                    if glat is None:
-                        row["video_mark_geo_lat"] = float(lat)
-                        row["video_mark_geo_lon"] = float(lon)
-                        if alt_m is not None:
-                            row["video_mark_geo_alt_m"] = float(alt_m)
-                    self._log_observation_after_geo(
-                        row,
-                        kind=kind,
-                        map_lat=map_lat,
-                        map_lon=map_lon,
-                        video_x=float(video_x),
-                        video_y=float(video_y),
-                        clip_path=clip_path,
-                        capture_snapshot=capture_snapshot,
-                    )
-                    print(
-                        f"[VGCS:observe] impact facade uv pick ok "
-                        f"lat={lat:.7f} lon={lon:.7f} "
-                        f"video=({float(video_x):.3f},{float(video_y):.3f}) "
-                        f"screen_pin=yes (impact overlay fixed at click)"
-                    )
+            # "Laser HIT" is on: the fall of shot is what the laser measures
+            # under the cross. One way, whatever was set up before.
+            #
+            # Until 2026-10-08 there were three, chosen by how the gun and the
+            # target had been set: the click put on the wall plane of an
+            # earlier lock, the picture alone, or a lock with the camera turned
+            # to the click. The first is right only on one wall face seen from
+            # an unmoved camera. Over open ground it puts a round that fell
+            # 100 m short at the target's own lat long, 10 m lower.
+            row["laser_asked"] = True
+            why_not = self._why_the_laser_cannot_take_this_click(
+                float(video_x), float(video_y), row
+            )
+            if why_not:
+                # No laser on this camera, or a click away from the cross:
+                # the click goes on from the picture, and the operator is told.
+                row["laser_not_used_why"] = why_not
+            else:
+                if self._lrf_lock_in_progress or self._pending_lrf_video_pick is not None:
+                    self._set_status("LRF lock in progress — wait before marking impact…")
                     return
-                print(
-                    "[VGCS:observe] impact blocked — facade lock active but geo "
-                    "missing; re-lock TARGET LRF on the building face"
+                self._pending_lrf_video_pick = PendingLrfVideoPick(
+                    purpose="observation",
+                    u=float(video_x),
+                    v=float(video_y),
+                    label="Impact Target",
+                    observation_row=row,
+                    obs_kind=str(kind),
+                    obs_map_lat=map_lat,
+                    obs_map_lon=map_lon,
+                    obs_clip_path=str(clip_path or "").strip(),
+                    obs_capture_snapshot=bool(capture_snapshot),
                 )
-                self._set_status(
-                    "Impact needs facade geo — re-lock TARGET on the building, "
-                    "then click impact (no gimbal slew)"
-                )
-                return
-            if self._dooaf_setup_is_ground_workflow():
-                row.update(self._observation_context())
-                if hasattr(self, "_warn_ground_pick_facade_risk"):
-                    self._warn_ground_pick_facade_risk(
-                        float(video_y),
-                        pick_role=DOOAF_ROLE_IMPACT,
-                        label="Impact Target",
-                    )
-                self._enrich_observation_geo_reference(row)
-                if str(row.get("geo_method") or "") in ("", "insufficient"):
-                    row["geo_method"] = "dooaf_ground_video"
-                att = self._read_gimbal_attitude_pair()
-                self._apply_video_mark_gimbal_track_to_row(
-                    row,
+                # The camera is held still and the laser reads along the
+                # cross: the same lock as "LRF lock (facade)" in DOOAF Setup,
+                # which is the one the crew use for the target.
+                self._begin_c13_lrf_video_lock_for_pick(
                     float(video_x),
                     float(video_y),
-                    ref_att=att,
-                    lock_att=att,
-                    used_lrf_slew=False,
-                )
-                self._log_observation_after_geo(
-                    row,
-                    kind=kind,
-                    map_lat=map_lat,
-                    map_lon=map_lon,
-                    video_x=float(video_x),
-                    video_y=float(video_y),
-                    clip_path=clip_path,
-                    capture_snapshot=capture_snapshot,
-                )
-                print(
-                    f"[VGCS:observe] impact ground video pick ok "
-                    f"lat={row.get('target_lat')} lon={row.get('target_lon')} "
-                    f"video=({float(video_x):.3f},{float(video_y):.3f}) "
-                    f"screen_pin=yes (impact overlay fixed at click)"
+                    label="Impact Target",
+                    hold_gimbal=True,
+                    hold_slant_boresight=True,
                 )
                 return
-            self._pending_lrf_video_pick = PendingLrfVideoPick(
-                purpose="observation",
-                u=float(video_x),
-                v=float(video_y),
-                label="Impact Target",
-                observation_row=row,
-                obs_kind=str(kind),
-                obs_map_lat=map_lat,
-                obs_map_lon=map_lon,
-                obs_clip_path=str(clip_path or "").strip(),
-                obs_capture_snapshot=bool(capture_snapshot),
-            )
-            self._begin_c13_lrf_video_lock_for_pick(
-                float(video_x), float(video_y), label="Impact Target"
-            )
-            return
         self._enrich_observation_geo_reference(row)
         if kind == "video_mark" and video_x is not None and video_y is not None:
             att = self._read_gimbal_attitude_pair()
@@ -405,6 +306,11 @@ class ObservationSessionMixin:
                 boresight_after_slew=True,
             )
         if not used_lrf:
+            # The point of this row is not the laser's. The laser's range does
+            # not stay on it as if it were, and the operator is told why the
+            # laser did not give the point (dooaf_popup.laser_note).
+            row["lrf_slant_range_m"] = None
+            row["laser_not_used_why"] = self._why_the_laser_gave_no_point(slant_m)
             self._enrich_observation_geo_reference(row)
             if slant_m is None:
                 self._append_lrf_fallback_warning(
@@ -416,6 +322,15 @@ class ObservationSessionMixin:
                     row,
                     "LRF geo failed — impact from DEM ray estimate",
                 )
+        else:
+            # The laser measured what is under the cross. That is where the
+            # mark belongs. The click, at most a few degrees from it, is kept.
+            row["laser_not_used_why"] = ""
+            row["click_x_norm"] = float(video_x)
+            row["click_y_norm"] = float(video_y)
+            video_x, video_y = 0.5, 0.5
+            row["video_x_norm"] = video_x
+            row["video_y_norm"] = video_y
         row["video_mark_frozen_u"] = float(video_x)
         row["video_mark_frozen_v"] = float(video_y)
         click_att = getattr(self, "_lrf_click_att", None)
@@ -437,6 +352,47 @@ class ObservationSessionMixin:
             clip_path=pending.obs_clip_path or None,
             capture_snapshot=bool(pending.obs_capture_snapshot),
         )
+        if observation_target_latlon(row) is not None and row_point_is_measured(row):
+            # The click was placed, with the laser or without it. No red
+            # "LRF failed" mark is put beside a position (lrf_mixin).
+            self._lrf_pick_placed_without_laser = not used_lrf
+
+    def _why_the_laser_cannot_take_this_click(
+        self, video_x: float, video_y: float, row: dict[str, object]
+    ) -> str:
+        """Why no laser lock is started for a click as Set HIT, or "" when one is."""
+        from vgcs.map.dooaf_popup import (
+            LASER_NOT_ON_THIS_CAMERA,
+            laser_not_at_the_cross_text,
+        )
+
+        if not self._dooaf_lrf_geo_enabled():
+            return LASER_NOT_ON_THIS_CAMERA
+        try:
+            away_deg, _down_deg = self._facade_click_offset_deg(video_x, video_y)
+        except Exception:
+            return ""
+        if float(away_deg) > LASER_HIT_MAX_OFF_CROSS_DEG:
+            row["laser_click_off_cross_deg"] = float(away_deg)
+            return laser_not_at_the_cross_text(float(away_deg))
+        return ""
+
+    def _why_the_laser_gave_no_point(self, slant_m: float | None) -> str:
+        """The words for a lock that did not give the fall of shot."""
+        from vgcs.map.dooaf_popup import (
+            LASER_GAVE_NO_RANGE,
+            LASER_POINT_NOT_WORKED_OUT,
+        )
+
+        if slant_m is not None:
+            return LASER_POINT_NOT_WORKED_OUT
+        in_the_air = getattr(self, "_lrf_range_in_the_air", None)
+        short_text = getattr(in_the_air, "short_text", None)
+        if callable(short_text):
+            # A range that is no point on the ground (lrf_mixin): "Laser 18.5 m
+            # is in the air (drone 83 m up)".
+            return f"{short_text()}."
+        return LASER_GAVE_NO_RANGE
 
     def _log_observation_after_geo(
         self,
@@ -640,7 +596,7 @@ class ObservationSessionMixin:
             NOT_MARKED,
             TARGET_HEADING,
             not_marked_text,
-            why_not_placed,
+            why_not_marked,
         )
 
         heading = TARGET_HEADING if dooaf_role == DOOAF_ROLE_INTENDED else IMPACT_HEADING
@@ -663,9 +619,28 @@ class ObservationSessionMixin:
                 kept = "The target set before stays as it was."
         except Exception:
             kept = ""
-        self._show_dooaf_not_marked(not_marked_text(heading, row, kept))
-        why = why_not_placed(row).replace("\n", " ")
+        self._show_dooaf_not_marked(
+            not_marked_text(heading, row, kept, self._laser_advice_for(row, dooaf_role))
+        )
+        why = why_not_marked(row).replace("\n", " ")
         self._set_status(f"{heading} {NOT_MARKED}: {why}")
+
+    def _laser_advice_for(self, row: dict[str, object], dooaf_role: str) -> str:
+        """The way that is left for a fall of shot the picture could not place.
+
+        Said only where it is true and new: the click was a fall of shot, the
+        switch "Laser HIT" was off, and this camera has a laser.
+        """
+        from vgcs.map.dooaf_popup import LASER_ADVICE
+
+        try:
+            if dooaf_role != DOOAF_ROLE_IMPACT or row.get("laser_asked"):
+                return ""
+            if str(row.get("kind") or "video_mark") != "video_mark":
+                return ""
+            return LASER_ADVICE if self._dooaf_lrf_geo_enabled() else ""
+        except Exception:
+            return ""
 
     def _show_dooaf_not_marked(self, text: str) -> None:
         """Shown whether or not the read-out popup is switched on.
@@ -708,7 +683,7 @@ class ObservationSessionMixin:
             NOT_MARKED,
             TARGET_HEADING,
             not_marked_text,
-            why_not_placed,
+            why_not_marked,
         )
 
         heading = TARGET_HEADING if dooaf_role == DOOAF_ROLE_INTENDED else IMPACT_HEADING
@@ -722,8 +697,12 @@ class ObservationSessionMixin:
             f"gimbal=({row.get('gimbal_yaw_deg')},{row.get('gimbal_pitch_deg')}) "
             f"guess=({row.get('target_lat')},{row.get('target_lon')}) by {row.get('geo_method')}"
         )
-        self._show_dooaf_not_marked(not_marked_text(heading, row, MEASURING_MARK_ONLY))
-        why = why_not_placed(row).replace("\n", " ")
+        self._show_dooaf_not_marked(
+            not_marked_text(
+                heading, row, MEASURING_MARK_ONLY, self._laser_advice_for(row, dooaf_role)
+            )
+        )
+        why = why_not_marked(row).replace("\n", " ")
         return f"{heading} {NOT_MARKED}: {why} {MEASURING_MARK_ONLY}"
 
     def dooaf_popup_enabled(self) -> bool:
@@ -744,9 +723,25 @@ class ObservationSessionMixin:
         if dooaf_role not in (DOOAF_ROLE_INTENDED, DOOAF_ROLE_IMPACT):
             return
         if not self.dooaf_popup_enabled():
+            if dooaf_role == DOOAF_ROLE_IMPACT:
+                try:
+                    from vgcs.map.dooaf_popup import marked_without_the_laser_text
+
+                    said = marked_without_the_laser_text(
+                        latest_mark_row(self._observations, DOOAF_ROLE_IMPACT)
+                    )
+                    if said:
+                        self._show_dooaf_not_marked(said)
+                except Exception:
+                    pass
             return
         try:
-            from vgcs.map.dooaf_popup import DooafPopup, dooaf_popup_text, gun_note
+            from vgcs.map.dooaf_popup import (
+                DooafPopup,
+                dooaf_popup_text,
+                gun_note,
+                laser_note,
+            )
 
             session = build_dooaf_session(
                 self._observations, **self._dooaf_session_kwargs()
@@ -758,28 +753,52 @@ class ObservationSessionMixin:
             if popup is None:
                 popup = DooafPopup(self)
                 self._dooaf_popup = popup
-            popup.show_text(text, gun_note(session))
+            # With "Laser HIT" on: whether the fall of shot shown is the
+            # laser's point, with its range, or the picture's, and why.
+            notes = [
+                gun_note(session),
+                laser_note(latest_mark_row(self._observations, DOOAF_ROLE_IMPACT)),
+            ]
+            popup.show_text(text, "\n".join(n for n in notes if n))
         except Exception:
             # A read-out must never take the mark down with it.
             pass
 
     def _impact_uses_lrf(self) -> bool:
-        """Whether marking a fall of shot goes through the laser at all.
+        """Whether a fall of shot is measured by the laser: "Laser HIT" on the camera rail.
 
         Off by default. Requested 2026-09-11: "for impact Target we don't want
         to use the LRF". With it off, an impact pick is placed from GPS, gimbal
-        angle and terrain, the same geometry as a ground-workflow pick, and the
-        camera never slews. The actual target is untouched by this and can
-        still be laser-locked, which is what they asked for.
+        angle and terrain, and the camera never slews. The actual target is
+        untouched by this and can still be laser-locked, which is what they
+        asked for.
 
-        Kept as a setting rather than deleted, because the laser is the more
-        accurate of the two when the aircraft is holding still and pointed at a
-        face, and a crew that wants that back should not need a new build.
+        The switch is for the fall of shot that the picture cannot measure: a
+        drone on the ground, a look flatter than 8 degrees. Until 2026-10-08
+        this was a setting with no place on the screen.
         """
         raw = self._dooaf_settings_store().value("dooaf/impact_uses_lrf", False)
         if isinstance(raw, bool):
             return raw
         return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+    def _set_impact_uses_lrf(self, on: bool) -> None:
+        """The operator pressed "Laser HIT" on the camera rail."""
+        try:
+            self._dooaf_settings_store().setValue("dooaf/impact_uses_lrf", bool(on))
+        except Exception:
+            pass
+        if not on:
+            self._set_status("Laser HIT off: the fall of shot is placed from the picture")
+        elif not self._dooaf_lrf_geo_enabled():
+            self._set_status(
+                "Laser HIT on, but this camera has no laser that VGCS can use: "
+                "the fall of shot is placed from the picture"
+            )
+        else:
+            self._set_status(
+                "Laser HIT on: put the cross on the fall of shot, then click it"
+            )
 
     def _impact_round_count(self) -> int:
         """How many rounds have been marked in this session so far."""

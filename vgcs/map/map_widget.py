@@ -613,6 +613,26 @@ QPushButton#observeDooafSetup:hover {
   background: rgba(52, 82, 128, 235);
   border-color: rgba(180, 210, 255, 120);
 }
+QPushButton#observeImpactLaser {
+  min-height: 34px;
+  font-family: "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 6px;
+  border: 1px solid rgba(196, 209, 230, 38);
+  background: rgba(18, 22, 32, 75);
+  color: #dce5f5;
+  padding: 2px 6px;
+}
+QPushButton#observeImpactLaser:hover {
+  background: rgba(110, 123, 148, 45);
+  border-color: rgba(229, 237, 251, 70);
+}
+QPushButton#observeImpactLaser:checked {
+  border-color: rgba(255, 196, 92, 230);
+  background: rgba(92, 64, 18, 235);
+  color: #ffe2a8;
+}
 QLabel#observeDooafHint {
   color: #8fa4c4;
   font-size: 11px;
@@ -1707,11 +1727,17 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
             self._set_lrf_session_hold(True)
             QTimer.singleShot(0, self._show_dooaf_setup_dialog)
 
+        def _obs_impact_by_laser(on: bool) -> None:
+            print(f"[VGCS:cam_rail] OBSERVE Laser HIT toggled={bool(on)}")
+            self._set_impact_uses_lrf(bool(on))
+
         self._btn_native_target.toggled.connect(_obs_target)
         self._btn_native_clip.clicked.connect(_obs_clip)
         self._btn_native_report.clicked.connect(_obs_report)
         self._btn_native_reset.clicked.connect(_obs_reset)
         observe_body.setup_clicked.connect(_obs_dooaf_setup)
+        observe_body.set_impact_by_laser(self._impact_uses_lrf())
+        observe_body.impact_by_laser_changed.connect(_obs_impact_by_laser)
 
         def _m13_track_toggle(on: bool) -> None:
             if not on:
