@@ -310,6 +310,8 @@ public:
     double yawRate = 0.0;
     double pitchRate = 0.0;
     int angleCommands = 0;  // GAY and GAP frames received (tap aiming)
+    int laserFrames = 0;    // SLR frames received: shots and reads
+    bool laserAnswers = true;  // false: too far, nothing comes back
     int speedCommands = 0;  // GSY and GSP frames with a speed in them
     int gotFrames = 0;      // the camera's own tracker: GOT
     QString lastGot;        // its data: where the point is, in the camera's count
@@ -397,8 +399,11 @@ private slots:
                                           top::encodeAttitudeField4(_yaw) + top::encodeAttitudeField4(_pitch) +
                                               top::encodeAttitudeField4(0.0),
                                           'G', 1);
-            } else if (f->tag == "SLR" && f->address.size() == 2 && f->address[1] == 'E') {
-                reply = top::buildTpFrame('U', 'r', "SLR", "03A0", 'E', 1);  // 92.8 m
+            } else if (f->tag == "SLR") {
+                ++laserFrames;
+                if (laserAnswers && f->address.size() == 2 && f->address[1] == 'E') {
+                    reply = top::buildTpFrame('U', 'r', "SLR", "03A0", 'E', 1);  // 92.8 m
+                }
             }
             if (!reply.empty()) {
                 _socket.writeDatagram(reply.data(), static_cast<qint64>(reply.size()), d.senderAddress(),
@@ -541,6 +546,8 @@ int main(int argc, char *argv[])
     };
 
     int anglesBeforeLock = 0;
+    int anglesBeforePoint = 0;  // a point from the picture: the camera must not be turned,
+    int lasersBeforePoint = 0;  // and the laser not asked
 
     // Application Settings (client feedback 2026-10-07, tasks E and F).
     QQuickWindow *settingsWindow = nullptr;
@@ -770,6 +777,7 @@ int main(int argc, char *argv[])
              // IR on: QGC shows the thermal stream, and the day address set in QGC is kept.
              const QString url = global.settings.video.rtspUrlFact.rawValue().toString();
              expect(url == link.thermalVideoUrl(), "IR on: QGC video is the thermal stream", url);
+             expect(link.thermalPicture(), "IR on: the link is told that the thermal picture shows (it has another lens)", QString());
              expect(link.dayVideoUrl() == QStringLiteral("rtsp://192.168.144.108:554/main"),
                     "IR on: day address learned from QGC", link.dayVideoUrl());
              shot("7_ir_on.png");
@@ -822,6 +830,7 @@ int main(int argc, char *argv[])
         {300, [&]() {
              const QString url = global.settings.video.rtspUrlFact.rawValue().toString();
              expect(url == QStringLiteral("rtsp://192.168.144.108:554/main"), "IR off: QGC video is the day stream again", url);
+             expect(!link.thermalPicture(), "IR off: the link is told that the day picture shows", QString());
              QQuickItem *video = findItem("videoContent");
              QQuickItem *button = findItem("vamaPaletteButton");
              expect(video && video->property("_vamaPaletteRow").toInt() == 0 && button && !button->isVisible(),
@@ -989,6 +998,87 @@ int main(int argc, char *argv[])
                     "no GPS lock: distance shown, and the text says only the lat long is missing", link.targetMessage());
              shot("16_no_gps_lock.png");
              vehicle.gps.set("lock", 3);
+         }},
+        {300, [&]() {
+             // A point from the picture, without the laser. It is chosen as the operator does, in
+             // the camera settings. The drone flies 60 m up and the camera looks 25 degrees down.
+             vehicle.vehicle.set("altitudeRelative", 60.0);
+             camera.setPitch(-25.0);
+             QObject *pointBox = window->findChild<QObject *>(QStringLiteral("vamaPointModeBox"));
+             expect(pointBox != nullptr, "picture point: the camera settings have the choice \"Tap on the video\"", QString());
+             if (pointBox) {
+                 QMetaObject::invokeMethod(pointBox, "activated", Q_ARG(int, 1));
+             }
+             expect(link.pointMode() == QStringLiteral("picture"), "picture point: choosing it in the camera settings sets it",
+                    link.pointMode());
+         }},
+        {500, [&]() {
+             anglesBeforePoint = camera.angleCommands;
+             lasersBeforePoint = camera.laserFrames;
+             // A tap right of the cross and below it.
+             mouse(QEvent::MouseButtonPress, QPointF(1300, 620));
+             mouse(QEvent::MouseButtonRelease, QPointF(1300, 620));
+         }},
+        {1100, [&]() {
+             QQuickItem *title = findItem("vamaResultTitle");
+             QQuickItem *note = findItem("vamaResultNote");
+             const QString titleText = title ? title->property("text").toString() : QString();
+             const QString noteText = note ? note->property("text").toString() : QString();
+             expect(link.targetValid() && link.targetFromPicture(), "picture point: a tap gives the position without the laser",
+                    link.laserMessage());
+             expect(camera.angleCommands == anglesBeforePoint && camera.laserFrames == lasersBeforePoint,
+                    "picture point: the camera was not turned and the laser was not asked",
+                    QStringLiteral("%1 turns, %2 laser frames").arg(camera.angleCommands - anglesBeforePoint)
+                        .arg(camera.laserFrames - lasersBeforePoint));
+             expect(title && title->isVisible() && titleText.startsWith(QStringLiteral("About ")),
+                    "picture point: the distance on the screen says \"About\"", titleText);
+             expect(note && note->isVisible() && noteText.contains(QStringLiteral("From the picture, not by laser")) &&
+                        noteText.contains(QStringLiteral("One degree of camera angle is")),
+                    "picture point: the result says it is from the picture, and how far to trust it", noteText);
+             shot("17a_picture_point.png");
+             // The operator taps the result away to see the video.
+             if (title) {
+                 const QPointF onTheBox = title->mapToScene(QPointF(title->width() / 2, title->height() / 2));
+                 mouse(QEvent::MouseButtonPress, onTheBox);
+                 mouse(QEvent::MouseButtonRelease, onTheBox);
+             }
+         }},
+        {300, [&]() {
+             QQuickItem *title = findItem("vamaResultTitle");
+             expect(title && !title->isVisible(), "picture point: a tap on the result hides it", QString());
+             // The drone on the ground: no position, and the reason. The next tap brings the result back.
+             vehicle.vehicle.set("altitudeRelative", 0.4);
+             mouse(QEvent::MouseButtonPress, QPointF(1300, 620));
+             mouse(QEvent::MouseButtonRelease, QPointF(1300, 620));
+         }},
+        {1100, [&]() {
+             QQuickItem *title = findItem("vamaResultTitle");
+             const QString titleText = title ? title->property("text").toString() : QString();
+             expect(!link.targetValid() && title && title->isVisible() && titleText == QStringLiteral("No position") &&
+                        link.laserMessage().contains(QStringLiteral("it needs 2.5 m")),
+                    "picture point: on the ground it says \"No position\" and why", titleText + QStringLiteral(" / ") + link.laserMessage());
+             shot("17b_picture_no_position.png");
+             // By laser again. The laser gives no reading (too far): the position comes from the
+             // picture, and the result says both.
+             QObject *pointBox = window->findChild<QObject *>(QStringLiteral("vamaPointModeBox"));
+             if (pointBox) {
+                 QMetaObject::invokeMethod(pointBox, "activated", Q_ARG(int, 0));
+             }
+             expect(link.pointMode() == QStringLiteral("laser"), "picture point: the laser can be chosen again", link.pointMode());
+             vehicle.vehicle.set("altitudeRelative", 60.0);
+             camera.laserAnswers = false;
+             link.fireLaser();
+         }},
+        {2500, [&]() {
+             QQuickItem *title = findItem("vamaResultTitle");
+             const QString titleText = title ? title->property("text").toString() : QString();
+             expect(!link.laserValid() && link.laserMessage() == QStringLiteral("No laser reading.") && link.targetValid() &&
+                        link.targetFromPicture() && titleText.startsWith(QStringLiteral("About ")),
+                    "no laser reading: the position comes from the picture, and the screen says both",
+                    titleText + QStringLiteral(" / ") + link.laserMessage() + QStringLiteral(" / ") + link.targetMessage());
+             shot("17c_no_laser_reading.png");
+             camera.laserAnswers = true;
+             vehicle.vehicle.remove("altitudeRelative");
          }},
         {300, [&]() {
              QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaCameraSettings"));

@@ -1,5 +1,6 @@
-// Port of vgcs/observe/geo_reference.py compute_lrf_slant_geo. Keep in step:
-// apk/custom/test checks this against the Python code.
+// Port of vgcs/observe/geo_reference.py: compute_lrf_slant_geo, and the measured
+// way of compute_geo_reference. Keep in step: apk/custom/test checks this
+// against the Python code.
 
 #include "LaserGeo.h"
 
@@ -62,6 +63,31 @@ Vec mulVec(const Mat &m, const Vec &v)
             m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]};
 }
 
+/// Where the camera looks to a point of the picture: north, east, down (not of length one).
+/// VGCS _lrf_camera_dir_ned_unit, and the same lines in compute_geo_reference.
+Vec lookDirection(const LaserInput &in)
+{
+    const double hfov = std::max(5.0, std::min(120.0, in.cameraHfovDeg));
+    double vfov = in.cameraVfovDeg ? *in.cameraVfovDeg : hfov * 0.5625;
+    vfov = std::max(5.0, std::min(90.0, vfov));
+    const double u = std::max(0.0, std::min(1.0, in.videoXNorm));
+    const double v = std::max(0.0, std::min(1.0, in.videoYNorm));
+    const double azOff = (u - 0.5) * hfov;
+    // How far the point looks UP from the cross. The picture's v counts from
+    // the top, so a point below the cross looks further down. Until
+    // 2026-10-08 this had the other sign, here and in VGCS (_click_tilt_deg).
+    const double elTilt = -(v - 0.5) * vfov;
+
+    const Mat nedBody = mul(rotZ(rad(in.vehicleHeadingDeg)),
+                            mul(rotY(rad(in.vehiclePitchDeg)), rotX(rad(in.vehicleRollDeg))));
+    // The camera's own number, turned so that right of the nose is positive.
+    const double gimbalYawRight = in.gimbalYawLeftPositive ? -in.gimbalYawDeg : in.gimbalYawDeg;
+    const Mat bodyGimbal = mul(rotZ(rad(gimbalYawRight)), rotY(rad(in.gimbalPitchDeg)));
+    const Mat gimbalCam = mul(rotY(rad(elTilt)), rotZ(rad(azOff)));
+    const Mat nedCam = mul(nedBody, mul(bodyGimbal, gimbalCam));
+    return mulVec(nedCam, {1.0, 0.0, 0.0});
+}
+
 } // namespace
 
 LaserResult computeLaserTarget(const LaserInput &in)
@@ -76,27 +102,7 @@ LaserResult computeLaserTarget(const LaserInput &in)
         return result;
     }
 
-    // _lrf_camera_dir_ned_unit
-    const double hfov = std::max(5.0, std::min(120.0, in.cameraHfovDeg));
-    double vfov = in.cameraVfovDeg ? *in.cameraVfovDeg : hfov * 0.5625;
-    vfov = std::max(5.0, std::min(90.0, vfov));
-    const double u = std::max(0.0, std::min(1.0, in.videoXNorm));
-    const double v = std::max(0.0, std::min(1.0, in.videoYNorm));
-    const double azOff = (u - 0.5) * hfov;
-    // How far the point looks UP from the cross. The picture's v counts from
-    // the top, so a point below the cross looks further down. Until
-    // 2026-10-08 this had the other sign, here and in VGCS (_click_tilt_deg).
-    // The app only asks for the cross itself, where it makes no difference.
-    const double elTilt = -(v - 0.5) * vfov;
-
-    const Mat nedBody = mul(rotZ(rad(in.vehicleHeadingDeg)),
-                            mul(rotY(rad(in.vehiclePitchDeg)), rotX(rad(in.vehicleRollDeg))));
-    // The camera's own number, turned so that right of the nose is positive.
-    const double gimbalYawRight = in.gimbalYawLeftPositive ? -in.gimbalYawDeg : in.gimbalYawDeg;
-    const Mat bodyGimbal = mul(rotZ(rad(gimbalYawRight)), rotY(rad(in.gimbalPitchDeg)));
-    const Mat gimbalCam = mul(rotY(rad(elTilt)), rotZ(rad(azOff)));
-    const Mat nedCam = mul(nedBody, mul(bodyGimbal, gimbalCam));
-    const Vec dir = mulVec(nedCam, {1.0, 0.0, 0.0});
+    const Vec dir = lookDirection(in);
     const double mag = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
     if (mag < 1e-9) {
         result.error = "invalid look direction";
@@ -121,6 +127,60 @@ LaserResult computeLaserTarget(const LaserInput &in)
     }
     result.nearHorizon = result.depressionDeg < 3.0;
     result.ok = true;
+    return result;
+}
+
+PictureResult computePictureTarget(const PictureInput &in)
+{
+    PictureResult result;
+    // _why_not_measured: the height has to be a measured one, and that of a hover at least.
+    if (!in.heightAboveGroundM || !std::isfinite(*in.heightAboveGroundM)) {
+        result.why = PictureWhy::HeightUnknown;
+        return result;
+    }
+    const double height = *in.heightAboveGroundM;
+    if (height < kPictureMinHeightM) {
+        result.why = PictureWhy::TooLow;
+        return result;
+    }
+
+    // compute_geo_reference, solve(believe_camera=True), over level ground.
+    const Vec dir = lookDirection(in.view);
+    const double level = std::hypot(dir[0], dir[1]);
+    const double down = dir[2];
+    result.lookDownDeg = degrees(std::atan2(down, level));
+    if (down <= 1e-4) {
+        result.why = PictureWhy::AtTheHorizon;
+        return result;
+    }
+    const double t = height / down;
+    const double north = t * dir[0];
+    const double east = t * dir[1];
+    const double range = std::hypot(north, east);
+    // VGCS is_plausible_ground_range. It has three rules, made for ground that
+    // rises and falls (its terrain file). Over level ground, from 2.5 m up,
+    // only this one can ever say no, so it is the one that is here: a look
+    // flatter than 8 degrees gives no point, unless the point is within 20 m.
+    if (result.lookDownDeg < kPictureMinLookDownDeg && range > kPictureFlatLookReachM) {
+        result.why = PictureWhy::TooFlat;
+        return result;
+    }
+
+    LaserResult &point = result.point;
+    point.horizontalRangeM = range;
+    point.depressionDeg = result.lookDownDeg;
+    point.bearingDeg = std::fmod(degrees(std::atan2(east, north)) + 360.0, 360.0);
+    const double latRad = rad(in.view.vehicleLatDeg);
+    point.targetLatDeg = in.view.vehicleLatDeg + degrees(north / kEarthRadiusM);
+    point.targetLonDeg = in.view.vehicleLonDeg + degrees(east / (kEarthRadiusM * std::max(1e-6, std::cos(latRad))));
+    if (in.view.vehicleAltMslM) {
+        point.targetAltMslM = *in.view.vehicleAltMslM - height;
+    }
+    point.ok = true;
+    result.slantRangeM = std::hypot(range, height);
+    // The range on the ground is height / tan(look down): one degree more or less moves it this far.
+    const double sine = std::sin(rad(result.lookDownDeg));
+    result.metresPerDegree = height / (sine * sine) * kPi / 180.0;
     return result;
 }
 

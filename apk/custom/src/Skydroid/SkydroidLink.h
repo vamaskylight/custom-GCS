@@ -125,6 +125,22 @@ class SkydroidLink : public QObject
     Q_PROPERTY(double targetHorizontalM READ targetHorizontalM NOTIFY targetChanged)
     Q_PROPERTY(double targetBearingDeg READ targetBearingDeg NOTIFY targetChanged)
     Q_PROPERTY(QString targetMessage READ targetMessage NOTIFY targetChanged)
+    /// The position that shows comes from the picture (the camera's angle and the
+    /// drone's height), not from a laser range.
+    Q_PROPERTY(bool targetFromPicture READ targetFromPicture NOTIFY targetChanged)
+    /// How far that point is from the drone, as the picture gives it.
+    Q_PROPERTY(double targetSlantM READ targetSlantM NOTIFY targetChanged)
+    /// The last measurement did not ask the laser at all (point mode "picture").
+    Q_PROPERTY(bool measuredByPicture READ measuredByPicture NOTIFY laserChanged)
+
+    // The position of a point.
+    /// "laser": a tap turns the camera to the point and the laser measures it.
+    /// "picture": a tap gives the point's position at once, without the laser.
+    Q_PROPERTY(QString pointMode READ pointMode WRITE setPointMode NOTIFY settingsChanged)
+    Q_PROPERTY(QStringList pointModes READ pointModes CONSTANT)
+    Q_PROPERTY(QStringList pointModeNames READ pointModeNames CONSTANT)
+    /// The screen says that the thermal picture shows: it has another lens.
+    Q_PROPERTY(bool thermalPicture READ thermalPicture WRITE setThermalPicture NOTIFY thermalPictureChanged)
 
     // Object lock.
     /// "app": the app follows the object in the video and turns the camera.
@@ -259,6 +275,17 @@ public:
     double targetHorizontalM() const { return _target.horizontalRangeM; }
     double targetBearingDeg() const { return _target.bearingDeg; }
     QString targetMessage() const { return _targetMessage; }
+    bool targetFromPicture() const { return _target.ok && _targetFromPicture; }
+    double targetSlantM() const { return _targetSlantM; }
+    bool measuredByPicture() const { return _measuredByPicture; }
+    static QStringList pointModes();
+    /// The names on screen, in the order of pointModes().
+    static QStringList pointModeNames();
+    QString pointMode() const { return _pointMode; }
+    /// An unknown mode means "laser".
+    void setPointMode(const QString &mode);
+    bool thermalPicture() const { return _thermalPicture; }
+    void setThermalPicture(bool thermal);
     static QStringList lockModes();
     /// The names on screen, in the order of lockModes().
     static QStringList lockModeNames();
@@ -299,8 +326,13 @@ public:
     Q_INVOKABLE void centerYaw();
     /// Straight down (GAP -90), yaw kept.
     Q_INVOKABLE void pointDown();
-    /// Turn the camera to a point tapped on the video, then measure it with
-    /// the laser. u and v run from 0 to 1 across and down the picture.
+    /// A point tapped on the video. u and v run from 0 to 1 across and down the picture.
+    ///  - Point mode "laser": the camera turns to the point, then the laser
+    ///    measures it. With no laser reading the position comes from the picture
+    ///    when the picture can give one.
+    ///  - Point mode "picture": the position comes from the picture at once (the
+    ///    camera's angle and the drone's height over level ground). The camera
+    ///    stays where it is and the laser is not fired.
     Q_INVOKABLE void aimAndMeasure(double u, double v);
     /// Lock on the object in a box of the video: its centre u, v (as for
     /// aimAndMeasure) and its size w, h, all in parts of the picture.
@@ -357,6 +389,7 @@ signals:
     void zoomChanged();
     void recordingChanged();
     void targetChanged();
+    void thermalPictureChanged();
     void lockChanged();
     void lockBoxChanged();
     void rcChannelsChanged();
@@ -420,7 +453,15 @@ private:
     int _zoomStepsMax() const;
     /// Drone position and attitude now, from QGC. False when there is no usable GPS fix.
     bool _sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &why) const;
+    /// The drone's height above its take-off point, when it is known.
+    std::optional<double> _sampleHeight() const;
     void _computeTarget();
+    /// Point mode "picture": the position of a point of the picture, now, without the laser.
+    void _measureFromPicture(double u, double v);
+    /// The object of a lock is under the cross: by laser, or from the picture in point mode "picture".
+    void _measureLockedObject();
+    /// Works the point out from the picture and shows it. False, with the reason, when the picture gives none.
+    bool _setTargetFromPicture(const skydroid::geo::LaserInput &view, std::optional<double> heightM, QString &whyNot);
     /// keepLastResult: a refresh during a lock keeps showing the last result until the new one arrives.
     void _fireLaser(bool keepLastResult);
 
@@ -564,8 +605,14 @@ private:
     bool _shotPoseValid = false;
     QString _shotPoseWhy;
     bool _shotGimbalValid = false;
+    std::optional<double> _shotHeightM;
     skydroid::geo::LaserResult _target;
     QString _targetMessage;
+    bool _targetFromPicture = false;
+    double _targetSlantM = 0.0;
+    bool _measuredByPicture = false;
+    QString _pointMode;
+    bool _thermalPicture = false;
 
     int _zoomStep = -1;
     int _zoomCount = 0;     // C12/C13: our zoom steps in from 1x

@@ -61,6 +61,8 @@ Item {
     // QGC's video address between the day and thermal streams (as VGCS does).
     property var  _videoSettings: QGroundControl.settingsManager.videoSettings
     property bool _thermalOn:     _videoSettings ? _videoSettings.rtspUrl.rawValue === _link.thermalVideoUrl : false
+    // A point from the picture needs the lens of the picture that shows.
+    Binding { target: _link; property: "thermalPicture"; value: _thermalOn }
 
     function _toggleThermal() {
         if (!_videoSettings) {
@@ -412,7 +414,8 @@ Item {
     Rectangle {
         id:                       laserBox
         visible:                  _link.enabled && !_laserBoxHidden && !_lockPicking &&
-                                  (_link.aimBusy || _link.laserBusy || _link.laserValid || _link.laserMessage !== "" || _lockOn)
+                                  (_link.aimBusy || _link.laserBusy || _link.laserValid || _link.laserMessage !== "" ||
+                                   _link.targetValid || _lockOn)
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top:              parent.top
         anchors.topMargin:        parentToolInsets.topEdgeCenterInset + _margin
@@ -433,17 +436,22 @@ Item {
             spacing:          _margin / 3
 
             QGCLabel {
+                objectName:          "vamaResultTitle"
                 width:               parent.width
                 // Just locked and not measured yet: only the lock line shows.
-                visible:             _link.aimBusy || _link.lockBusy || _link.laserBusy || _link.laserValid || _link.laserMessage !== ""
+                visible:             _link.aimBusy || _link.lockBusy || _link.laserBusy || _link.laserValid ||
+                                     _link.laserMessage !== "" || _link.targetValid
                 horizontalAlignment: Text.AlignHCenter
                 color:               "white"
                 font.pointSize:      ScreenTools.largeFontPointSize
                 font.bold:           true
+                // A distance by laser is a measurement. One from the picture says "about".
                 text:                _link.aimBusy ? qsTr("Turning to the point...")
                                    : (_link.lockBusy ? (_link.lockByApp ? qsTr("Locking...") : qsTr("Turning to the object..."))
                                    : ((_link.laserBusy && !laserBox._refreshing) ? qsTr("Measuring...")
-                                   : (_link.laserValid ? qsTr("%1 m").arg(_fmt(_link.laserRangeM, 1)) : qsTr("No laser reading"))))
+                                   : (_link.laserValid ? qsTr("%1 m").arg(_fmt(_link.laserRangeM, 1))
+                                   : (_link.targetFromPicture ? qsTr("About %1 m").arg(_fmt(_link.targetSlantM, 0))
+                                   : (_link.measuredByPicture ? qsTr("No position") : qsTr("No laser reading"))))))
             }
             QGCLabel {
                 width:               parent.width
@@ -471,8 +479,10 @@ Item {
                                          .arg(_fmt(_link.targetAltMsl, 0)).arg(_fmt(_link.targetHorizontalM, 0))
             }
             QGCLabel {
+                objectName:          "vamaResultNote"
                 width:               parent.width
-                visible:             (!_link.laserBusy || laserBox._refreshing) && _link.laserValid && _link.targetMessage !== ""
+                visible:             (!_link.laserBusy || laserBox._refreshing) && (_link.laserValid || _link.targetValid) &&
+                                     _link.targetMessage !== ""
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode:            Text.WordWrap
                 color:               qgcPal.colorOrange
@@ -699,6 +709,7 @@ Item {
                 tapMark.x = tapX - tapMark.width / 2
                 tapMark.y = tapY - tapMark.height / 2
                 tapMarkAnimation.restart()
+                _laserBoxHidden = false  // a tap asks for a result: the box shows it
                 _link.aimAndMeasure((tapX - r.x) / r.width, (tapY - r.y) / r.height)
             }
         }
@@ -1155,6 +1166,24 @@ Item {
                         currentIndex:     Math.max(0, _link.lockModes.indexOf(_link.lockMode))
                         onActivated:      (index) => { _link.lockMode = _link.lockModes[index] }
                     }
+
+                    QGCLabel { text: qsTr("Tap on the video"); Layout.preferredWidth: settingsPopup._labelWidth }
+                    QGCComboBox {
+                        objectName:       "vamaPointModeBox"
+                        Layout.fillWidth: true
+                        model:            _link.pointModeNames
+                        currentIndex:     Math.max(0, _link.pointModes.indexOf(_link.pointMode))
+                        onActivated:      (index) => { _link.pointMode = _link.pointModes[index] }
+                    }
+                }
+                QGCLabel {
+                    objectName:       "vamaPointModeNote"
+                    Layout.fillWidth: true
+                    wrapMode:         Text.WordWrap
+                    font.pointSize:   ScreenTools.smallFontPointSize
+                    text:             _link.pointMode === "picture"
+                                      ? qsTr("Tap on the video: the position of the point comes from the picture at once, without the laser (the camera's angle and the drone's height, level ground assumed). The camera stays where it is. It needs the drone 2.5 m up or more, and the point 8 degrees or more under the horizon.")
+                                      : qsTr("Tap on the video: the camera turns to the point and the laser measures it. With no laser reading, the position comes from the picture when that is possible, and the result says so.")
                 }
                 QGCLabel {
                     Layout.fillWidth: true

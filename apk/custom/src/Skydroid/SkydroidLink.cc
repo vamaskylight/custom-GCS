@@ -129,6 +129,14 @@ constexpr double kLockTurningDeg = 2.0;      // further off, the state says the 
 constexpr double kLockDefaultBox = 0.12;     // a tap: a square box of this share of the picture's height
 constexpr int kLockPictureMinSide = 64;      // a smaller picture is not looked at
 
+// A point from the picture, without the laser (point mode "picture").
+// The thermal lens is known for the C14 Pro only (VGCS c14pro_default). On the
+// thermal picture of another camera the app can place the cross and nothing
+// else: a tap this near the middle counts as the cross.
+constexpr double kC14ThermalFovHDeg = 32.84;
+constexpr double kC14ThermalFovVDeg = 26.35;
+constexpr double kCrossTapNorm = 0.06;
+
 // Object lock, mode "camera", as VGCS M13 does it (vgcs/skydroid/adapter.py and
 // vgcs/map/observation/track_mixin.py): turn to the object when it is 1.5
 // degrees or more from the centre, GOT where the object is in the picture
@@ -328,9 +336,13 @@ void SkydroidLink::_loadSettings()
     _thermalVideoUrl = settings.value(QStringLiteral("thermalVideoUrl")).toString().trimmed();
     _thermalPalette = normalizedThermalPalette(settings.value(QStringLiteral("thermalPalette")).toString());
     _lockMode = settings.value(QStringLiteral("lockMode"), QStringLiteral("app")).toString();
+    _pointMode = settings.value(QStringLiteral("pointMode"), QStringLiteral("laser")).toString();
     settings.endGroup();
     if (!lockModes().contains(_lockMode)) {
         _lockMode = QStringLiteral("app");
+    }
+    if (!pointModes().contains(_pointMode)) {
+        _pointMode = QStringLiteral("laser");
     }
     if (_dayVideoUrl.isEmpty()) {
         _dayVideoUrl = QString::fromLatin1(kDefaultDayVideoUrl);
@@ -369,6 +381,7 @@ void SkydroidLink::_saveSettings() const
     settings.setValue(QStringLiteral("thermalVideoUrl"), _thermalVideoUrl);
     settings.setValue(QStringLiteral("thermalPalette"), _thermalPalette);
     settings.setValue(QStringLiteral("lockMode"), _lockMode);
+    settings.setValue(QStringLiteral("pointMode"), _pointMode);
     settings.endGroup();
 }
 
@@ -1103,9 +1116,141 @@ void SkydroidLink::currentFov(double &horizontalDeg, double &verticalDeg) const
     verticalDeg = narrow(kC13AimFovVDeg, 1.0 / zoomX);
 }
 
+QStringList SkydroidLink::pointModes()
+{
+    return {QStringLiteral("laser"), QStringLiteral("picture")};
+}
+
+QStringList SkydroidLink::pointModeNames()
+{
+    return {tr("By laser (the camera turns to the point)"), tr("From the picture, without the laser")};
+}
+
+void SkydroidLink::setPointMode(const QString &mode)
+{
+    const QString m = pointModes().contains(mode) ? mode : QStringLiteral("laser");
+    if (m == _pointMode) {
+        return;
+    }
+    _pointMode = m;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+void SkydroidLink::setThermalPicture(bool thermal)
+{
+    if (thermal != _thermalPicture) {
+        _thermalPicture = thermal;
+        emit thermalPictureChanged();
+    }
+}
+
+void SkydroidLink::_measureFromPicture(double u, double v)
+{
+    // One result shows at a time: another point ends a lock, as a tap by laser does.
+    if (_lockActive || _lockBusy) {
+        _endLock(tr("Lock stopped, because another point was measured."));
+    }
+    _clearMeasurement();
+    _measuredByPicture = true;
+    QString whyNot;
+    skydroid::geo::LaserInput view;
+    if (!_socket) {
+        whyNot = tr("Camera link is off. Turn it on in the camera settings.");
+    } else if (!_attitudeValid) {
+        // Never place a point on assumed gimbal angles.
+        whyNot = tr("No position: the camera sends no gimbal angles.");
+    } else if (_sampleVehiclePose(view, whyNot)) {
+        double hfov = 0.0;
+        double vfov = 0.0;
+        currentFov(hfov, vfov);
+        bool lensKnown = true;
+        if (_thermalPicture) {
+            if (_isZoomStepCamera()) {
+                hfov = kC14ThermalFovHDeg;
+                vfov = kC14ThermalFovVDeg;
+            } else if (std::abs(u - 0.5) <= kCrossTapNorm && std::abs(v - 0.5) <= kCrossTapNorm) {
+                u = 0.5;
+                v = 0.5;
+            } else {
+                lensKnown = false;
+                whyNot = tr("On the thermal picture the app can place the cross only: the thermal lens of this camera "
+                            "is not known. Put the cross on the point, then tap the cross.");
+            }
+        }
+        if (lensKnown) {
+            view.gimbalYawDeg = _yaw;
+            view.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
+            view.gimbalPitchDeg = _pitch;
+            view.videoXNorm = std::clamp(u, 0.0, 1.0);
+            view.videoYNorm = std::clamp(v, 0.0, 1.0);
+            view.cameraHfovDeg = hfov;
+            view.cameraVfovDeg = vfov;
+            _setTargetFromPicture(view, _sampleHeight(), whyNot);
+        }
+    }
+    _laserMessage = whyNot;
+    emit laserChanged();
+    emit targetChanged();
+}
+
+bool SkydroidLink::_setTargetFromPicture(const skydroid::geo::LaserInput &view, std::optional<double> heightM,
+                                         QString &whyNot)
+{
+    skydroid::geo::PictureInput input;
+    input.view = view;
+    input.heightAboveGroundM = heightM;
+    const skydroid::geo::PictureResult result = skydroid::geo::computePictureTarget(input);
+    using skydroid::geo::PictureWhy;
+    switch (result.why) {
+    case PictureWhy::None:
+        break;
+    case PictureWhy::HeightUnknown:
+        whyNot = tr("No position from the picture: the drone's height is not known.");
+        return false;
+    case PictureWhy::TooLow:
+        whyNot = tr("No position from the picture: the drone is %1 m up, it needs %2 m. Take off first.")
+                     .arg(heightM.value_or(0.0), 0, 'f', 1).arg(skydroid::geo::kPictureMinHeightM, 0, 'f', 1);
+        return false;
+    case PictureWhy::AtTheHorizon:
+        whyNot = tr("No position from the picture: the point is at the horizon or above it. Tilt the camera down.");
+        return false;
+    case PictureWhy::TooFlat:
+        whyNot = tr("No position from the picture: the point is looked at %1 degrees down, it needs %2. "
+                    "Tilt the camera down, or fly nearer.")
+                     .arg(result.lookDownDeg, 0, 'f', 0).arg(skydroid::geo::kPictureMinLookDownDeg, 0, 'f', 0);
+        return false;
+    }
+    _target = result.point;
+    _targetFromPicture = true;
+    _targetSlantM = result.slantRangeM;
+    // How much the point can be trusted: it moves this far for one degree of camera angle.
+    _targetMessage = tr("From the picture, not by laser. Level ground is assumed. One degree of camera angle is %1 m here.")
+                         .arg(result.metresPerDegree, 0, 'f', result.metresPerDegree < 10.0 ? 1 : 0);
+    whyNot.clear();
+    return true;
+}
+
+std::optional<double> SkydroidLink::_sampleHeight() const
+{
+    Vehicle *vehicle = MultiVehicleManager::instance()->activeVehicle();
+    FactGroup *v = vehicle ? vehicle->vehicleFactGroup() : nullptr;
+    const QString name = QStringLiteral("altitudeRelative");
+    if (!v || !v->factExists(name)) {
+        return std::nullopt;
+    }
+    bool ok = false;
+    const double height = v->getFact(name)->rawValue().toDouble(&ok);
+    return (ok && std::isfinite(height)) ? std::optional<double>(height) : std::nullopt;
+}
+
 void SkydroidLink::aimAndMeasure(double u, double v)
 {
     if (_laserBusy || _aimBusy || !std::isfinite(u) || !std::isfinite(v)) {
+        return;
+    }
+    if (_pointMode == QStringLiteral("picture")) {
+        _measureFromPicture(u, v);
         return;
     }
     // The camera turns away from a locked object, so the lock ends.
@@ -1118,7 +1263,9 @@ void SkydroidLink::aimAndMeasure(double u, double v)
     }
     // A new point: the last result no longer applies.
     _laserValid = false;
+    _measuredByPicture = false;
     _target = skydroid::geo::LaserResult{};
+    _targetFromPicture = false;
     _targetMessage.clear();
     emit targetChanged();
     if (!_attitudeValid) {
@@ -1268,9 +1415,11 @@ double SkydroidLink::followSpeed(double offDeg, double maxDps)
 void SkydroidLink::_clearMeasurement()
 {
     _laserValid = false;
+    _measuredByPicture = false;
     _laserMessage.clear();
     emit laserChanged();
     _target = skydroid::geo::LaserResult{};
+    _targetFromPicture = false;
     _targetMessage.clear();
     emit targetChanged();
 }
@@ -1569,7 +1718,7 @@ void SkydroidLink::_lockTick()
         if (now >= _lockNextLaserMs && _lockSeen && _lockOffDeg <= kLockOnCrossDeg) {
             // The object is under the cross: measure it.
             _lockNextLaserMs = now + kLockLaserEveryMs;
-            _fireLaser(true);
+            _measureLockedObject();
         }
         return;
     }
@@ -1628,7 +1777,32 @@ void SkydroidLink::_lockTick()
     if (now >= _lockNextLaserMs) {
         _lockNextLaserMs = now + kLockLaserEveryMs;
         // While the camera follows, the object stays under the cross.
+        _measureLockedObject();
+    }
+}
+
+void SkydroidLink::_measureLockedObject()
+{
+    if (_pointMode != QStringLiteral("picture")) {
         _fireLaser(true);
+        return;
+    }
+    // Without the laser: where the cross is on the ground, from the picture.
+    // The last position stays up when this one cannot be worked out.
+    skydroid::geo::LaserInput view;
+    QString whyNot;
+    if (!_attitudeValid || !_sampleVehiclePose(view, whyNot)) {
+        return;
+    }
+    view.gimbalYawDeg = _yaw;
+    view.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
+    view.gimbalPitchDeg = _pitch;
+    if (_setTargetFromPicture(view, _sampleHeight(), whyNot)) {
+        _laserValid = false;
+        _measuredByPicture = true;
+        _laserMessage.clear();
+        emit laserChanged();
+        emit targetChanged();
     }
 }
 
@@ -2052,8 +2226,11 @@ void SkydroidLink::_fireLaser(bool keepLastResult)
     // drone's nose whenever the camera was turned (field video, 2026-10-06).
     _shotPose.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
     _shotPose.gimbalPitchDeg = _pitch;
+    _shotHeightM = _sampleHeight();
+    _measuredByPicture = false;
     if (!keepLastResult) {
         _target = skydroid::geo::LaserResult{};
+        _targetFromPicture = false;
         _targetMessage.clear();
         emit targetChanged();
         _laserMessage = tr("Measuring...");
@@ -2108,16 +2285,16 @@ void SkydroidLink::_laserFinish()
 
 bool SkydroidLink::_sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &why) const
 {
-    // The operator sees these under a distance that was measured fine (often
-    // indoors, with no GPS), so each one says that only the lat long is missing.
+    // Why there is no lat long. Under a laser distance that was measured fine
+    // (often indoors, with no GPS) the caller adds that the distance is still valid.
     Vehicle *vehicle = MultiVehicleManager::instance()->activeVehicle();
     if (!vehicle) {
-        why = tr("No lat long: no drone is connected. The distance is still valid.");
+        why = tr("No lat long: no drone is connected.");
         return false;
     }
     const QGeoCoordinate position = vehicle->coordinate();
     if (!position.isValid()) {
-        why = tr("No lat long: the drone has no GPS lock yet. The distance is still valid.");
+        why = tr("No lat long: the drone has no GPS lock yet.");
         return false;
     }
     FactGroup *gps = vehicle->gpsFactGroup();
@@ -2125,8 +2302,8 @@ bool SkydroidLink::_sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &
         ? gps->getFact(QStringLiteral("lock"))->rawValue().toInt() : 0;
     if (lock < 3) {
         // QGC's lock value: 2 is a 2D fix, 3 and up are 3D.
-        why = (lock == 2) ? tr("No lat long: the drone has only a 2D GPS fix (it needs 3D). The distance is still valid.")
-                          : tr("No lat long: the drone has no GPS lock yet. The distance is still valid.");
+        why = (lock == 2) ? tr("No lat long: the drone has only a 2D GPS fix (it needs 3D).")
+                          : tr("No lat long: the drone has no GPS lock yet.");
         return false;
     }
     FactGroup *v = vehicle->vehicleFactGroup();
@@ -2143,7 +2320,7 @@ bool SkydroidLink::_sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &
     const double roll = value("roll");
     const double pitch = value("pitch");
     if (!std::isfinite(heading) || !std::isfinite(roll) || !std::isfinite(pitch)) {
-        why = tr("No lat long: the drone's heading is not known yet. The distance is still valid.");
+        why = tr("No lat long: the drone's heading is not known yet.");
         return false;
     }
     pose.vehicleLatDeg = position.latitude();
@@ -2160,13 +2337,22 @@ bool SkydroidLink::_sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &
 void SkydroidLink::_computeTarget()
 {
     _target = skydroid::geo::LaserResult{};
+    _targetFromPicture = false;
     if (!_laserValid) {
-        _targetMessage = tr("No laser range, so no lat long.");
+        // No range from the laser (too far, or no answer). The picture may still say
+        // where the cross is on the ground: the pose of the shot, which is at the cross.
+        QString whyNot;
+        if (_shotGimbalValid && _shotPoseValid && _setTargetFromPicture(_shotPose, _shotHeightM, whyNot)) {
+            _laserMessage = tr("No laser reading.");
+            emit laserChanged();
+        } else {
+            _targetMessage = tr("No laser range, so no lat long.");
+        }
     } else if (!_shotGimbalValid) {
         // Never place a target on assumed gimbal angles.
         _targetMessage = tr("No lat long: the camera sends no gimbal angles. The distance is still valid.");
     } else if (!_shotPoseValid) {
-        _targetMessage = _shotPoseWhy;
+        _targetMessage = _shotPoseWhy + QLatin1Char(' ') + tr("The distance is still valid.");
     } else {
         skydroid::geo::LaserInput input = _shotPose;
         input.slantRangeM = _laserRangeM;

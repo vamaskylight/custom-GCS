@@ -217,6 +217,7 @@ private slots:
         _vehicle.vehicle.set("roll", 0.0);
         _vehicle.vehicle.set("pitch", 0.0);
         _vehicle.vehicle.set("altitudeAMSL", 100.0);
+        _vehicle.vehicle.remove("altitudeRelative");
 
         _camera = new FakeCamera;
         _link = new SkydroidLink;
@@ -1725,6 +1726,281 @@ private slots:
         QVERIFY(!_link->targetValid());
         QVERIFY(_link->targetMessage().startsWith("No lat long"));
         QVERIFY(_link->targetMessage().contains("no drone is connected"));
+    }
+
+    // --- A point from the picture, without the laser ------------------------------
+
+    /// Frames that turn the camera to an angle, or fire or read the laser.
+    int _turnsAndShots() const
+    {
+        int count = 0;
+        for (const QString &frame : _camera->received) {
+            count += (frame.contains("wGAY") || frame.contains("wGAP") || frame.contains("wSLR")) ? 1 : 0;
+        }
+        return count;
+    }
+
+    /// The drone 100 m up over level ground, 350 m above sea level, the camera 30 degrees down.
+    void _flyAtAHundredMetres()
+    {
+        _vehicle.vehicle.set("altitudeRelative", 100.0);
+        _vehicle.vehicle.set("altitudeAMSL", 350.0);
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && _link->gimbalPitch() == -30.0, 2000);
+    }
+
+    void theLaserIsTheUsualWayToAPointAndTheChoiceIsKept()
+    {
+        QCOMPARE(_link->pointMode(), QString("laser"));
+        QCOMPARE(SkydroidLink::pointModes(), QStringList({"laser", "picture"}));
+        QCOMPARE(SkydroidLink::pointModeNames().size(), 2);
+        QSignalSpy changed(_link, &SkydroidLink::settingsChanged);
+        _link->setPointMode("picture");
+        QCOMPARE(_link->pointMode(), QString("picture"));
+        QCOMPARE(changed.count(), 1);
+        _link->setPointMode("nonsense");  // an unknown choice is the laser
+        QCOMPARE(_link->pointMode(), QString("laser"));
+        _link->setPointMode("picture");
+        delete _link;
+        _link = new SkydroidLink;
+        QCOMPARE(_link->pointMode(), QString("picture"));
+    }
+
+    void aTapInPictureModeGivesThePositionAtOnceWithoutTheLaser()
+    {
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        _camera->slrE = "01F4";  // a laser that would answer 50 m: it is not asked
+        _camera->clear();
+        _link->aimAndMeasure(0.5, 0.5);
+        // At once: nothing to wait for.
+        QVERIFY(!_link->aimBusy() && !_link->laserBusy());
+        QVERIFY(_link->targetValid() && _link->targetFromPicture() && _link->measuredByPicture());
+        QVERIFY(!_link->laserValid());
+        QVERIFY(_link->laserMessage().isEmpty());
+        // 100 m up and 30 degrees down: 173.2 m north on the ground, 200 m from the drone, at the take-off height.
+        QVERIFY2(std::abs(_link->targetHorizontalM() - 173.205) < 0.01, qPrintable(QString::number(_link->targetHorizontalM())));
+        QVERIFY(std::abs(_link->targetSlantM() - 200.0) < 0.01);
+        QVERIFY(_link->targetLat() > 20.0 && std::abs(_link->targetLon() - 72.0) < 1e-9);
+        QVERIFY(_link->targetHasAlt() && std::abs(_link->targetAltMsl() - 250.0) < 1e-6);
+        // The result says how it was made and how far to trust it.
+        QVERIFY2(_link->targetMessage().contains("From the picture, not by laser"), qPrintable(_link->targetMessage()));
+        QVERIFY2(_link->targetMessage().contains("is 7.0 m here"), qPrintable(_link->targetMessage()));
+        // The camera was not turned and the laser was not fired.
+        QTest::qWait(500);
+        QCOMPARE(_turnsAndShots(), 0);
+        QVERIFY(_link->targetValid());
+    }
+
+    void aTapAwayFromTheCrossInPictureModeIsPlacedThroughTheLens()
+    {
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        // Right of the cross: to the right of north. Below the cross: nearer.
+        _link->aimAndMeasure(0.75, 0.5);
+        QVERIFY(_link->targetValid());
+        const double wide = _link->targetBearingDeg();
+        QVERIFY2(wide > 10.0 && wide < 40.0 && _link->targetLon() > 72.0, qPrintable(QString::number(wide)));
+        _link->aimAndMeasure(0.5, 0.75);
+        QVERIFY(_link->targetValid());
+        QVERIFY2(_link->targetHorizontalM() < 173.2 - 40.0, qPrintable(QString::number(_link->targetHorizontalM())));
+        // Zoomed in, the same place of the picture is nearer to the cross.
+        _link->zoom(1);
+        _link->zoom(1);
+        _link->aimAndMeasure(0.75, 0.5);
+        QVERIFY(_link->targetValid());
+        QVERIFY2(_link->targetBearingDeg() < wide - 2.0, qPrintable(QString("%1 after %2").arg(_link->targetBearingDeg()).arg(wide)));
+        // A camera turned to the right (the C13 says -30) puts the point on the right.
+        _camera->yaw = -30.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->gimbalYaw() == -30.0, 2000);
+        _link->aimAndMeasure(0.5, 0.5);
+        QVERIFY2(std::abs(_link->targetBearingDeg() - 30.0) < 1e-6, qPrintable(QString::number(_link->targetBearingDeg())));
+    }
+
+    void pictureModeSaysWhyThereIsNoPosition()
+    {
+        _link->setPointMode("picture");
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && _link->gimbalPitch() == -30.0, 2000);
+        const auto tapSays = [this](const char *words) {
+            _link->aimAndMeasure(0.5, 0.5);
+            const bool ok = !_link->targetValid() && !_link->targetFromPicture() && _link->measuredByPicture() &&
+                            !_link->laserValid() && _link->laserMessage().contains(words);
+            if (!ok) {
+                qWarning() << "wanted" << words << "got" << _link->laserMessage() << "target" << _link->targetValid();
+            }
+            return ok;
+        };
+        // The height of the drone is not known.
+        QVERIFY(tapSays("the drone's height is not known"));
+        // On the ground: no height to measure with.
+        _vehicle.vehicle.set("altitudeRelative", 1.2);
+        QVERIFY(tapSays("the drone is 1.2 m up, it needs 2.5 m"));
+        // The flight of 2026-10-08: 83 m up, the camera 5 degrees under the horizon.
+        _vehicle.vehicle.set("altitudeRelative", 82.7);
+        _camera->pitch = -5.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->gimbalPitch() == -5.0, 2000);
+        QVERIFY(tapSays("looked at 5 degrees down, it needs 8"));
+        _camera->pitch = 4.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->gimbalPitch() == 4.0, 2000);
+        QVERIFY(tapSays("at the horizon or above it"));
+        // No GPS lock: no lat long, and nothing is said about a distance that was never measured.
+        _camera->pitch = -30.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->gimbalPitch() == -30.0, 2000);
+        _vehicle.gps.set("lock", 1);
+        QVERIFY(tapSays("the drone has no GPS lock yet"));
+        QVERIFY(!_link->laserMessage().contains("distance"));
+        _vehicle.gps.set("lock", 3);
+        // And with all of it there, the same tap gives the position.
+        _link->aimAndMeasure(0.5, 0.5);
+        QVERIFY(_link->targetValid() && _link->laserMessage().isEmpty());
+    }
+
+    void pictureModeNeedsTheCamerasOwnAngles()
+    {
+        // The camera said "30 degrees down" a while ago and has been silent since. Those old
+        // angles would give a point that looks fine. None is placed.
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        _camera->answerGac = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->attitudeValid(), 8000);
+        _link->aimAndMeasure(0.5, 0.5);
+        QVERIFY(!_link->targetValid());
+        QVERIFY2(_link->laserMessage().contains("the camera sends no gimbal angles"), qPrintable(_link->laserMessage()));
+    }
+
+    void withNoLaserReadingThePositionComesFromThePicture()
+    {
+        // The usual way, by laser. The laser gives nothing (too far, or it did not answer).
+        _flyAtAHundredMetres();
+        _camera->clear();
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(_camera->countStartingWith("#TPUE2wSLR01") >= 1);  // the laser was asked
+        QVERIFY(!_link->laserValid());
+        QVERIFY(!_link->measuredByPicture());
+        QCOMPARE(_link->laserMessage(), QString("No laser reading."));
+        // Where the cross is on the ground, from the picture, and the result says so.
+        QVERIFY(_link->targetValid() && _link->targetFromPicture());
+        QVERIFY(std::abs(_link->targetHorizontalM() - 173.205) < 0.01);
+        QVERIFY(_link->targetMessage().contains("From the picture, not by laser"));
+    }
+
+    void withNoLaserReadingThePictureStillNeedsTheCamerasAnglesAndGps()
+    {
+        // The camera said "30 degrees down" a while ago and has been silent since: a point
+        // is never placed on angles as old as that.
+        _flyAtAHundredMetres();
+        _camera->answerGac = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->attitudeValid(), 8000);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(!_link->laserValid() && !_link->targetValid() && !_link->targetFromPicture());
+        QVERIFY(_link->laserMessage().contains("No laser reading"));
+        // The angles are there, the drone has no GPS lock: no position either.
+        _camera->answerGac = true;
+        _camera->pitch = -30.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && _link->gimbalPitch() == -30.0, 2000);
+        _vehicle.gps.set("lock", 1);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(!_link->laserValid() && !_link->targetValid() && !_link->targetFromPicture());
+        // With GPS it is there.
+        _vehicle.gps.set("lock", 3);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(_link->targetValid() && _link->targetFromPicture());
+    }
+
+    void aLaserRangeIsNeverReplacedByThePicture()
+    {
+        _flyAtAHundredMetres();
+        _camera->slrE = "01F4";  // 50 m: something nearer than the ground is under the cross
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(_link->laserValid());
+        QVERIFY(_link->targetValid() && !_link->targetFromPicture() && !_link->measuredByPicture());
+        QVERIFY(std::abs(_link->targetHorizontalM() - 50.0 * std::cos(30.0 * kPi / 180.0)) < 1e-6);
+        QVERIFY(_link->targetMessage().isEmpty());
+    }
+
+    void onTheThermalPictureOnlyTheCrossIsPlacedUnlessTheLensIsKnown()
+    {
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        QSignalSpy told(_link, &SkydroidLink::thermalPictureChanged);
+        _link->setThermalPicture(true);
+        QCOMPARE(told.count(), 1);
+        // C13: its thermal lens is not known. A tap away from the cross is refused, and says what to do.
+        _link->aimAndMeasure(0.8, 0.5);
+        QVERIFY(!_link->targetValid());
+        QVERIFY2(_link->laserMessage().contains("thermal") && _link->laserMessage().contains("tap the cross"),
+                 qPrintable(_link->laserMessage()));
+        // A tap on the cross (a finger is not exact) is the cross.
+        _link->aimAndMeasure(0.53, 0.47);
+        QVERIFY(_link->targetValid());
+        QVERIFY(std::abs(_link->targetHorizontalM() - 173.205) < 0.01);
+        const double bearing = _link->targetBearingDeg();
+        QVERIFY2(bearing < 1e-6 || bearing > 360.0 - 1e-6, qPrintable(QString::number(bearing)));
+        // The day picture again: the same tap away from the cross is placed.
+        _link->setThermalPicture(false);
+        _link->aimAndMeasure(0.8, 0.5);
+        QVERIFY(_link->targetValid());
+        // C14 Pro: its thermal lens is known (32.84 x 26.35 degrees; its day lens is 61.4 x 47.9).
+        // So a tap on the thermal picture is placed, and nearer to the cross than the same tap by day.
+        _link->setModel("C14 Pro");
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->aimAndMeasure(0.8, 0.5);
+        QVERIFY(_link->targetValid());
+        const double dayBearing = _link->targetBearingDeg();
+        _link->aimAndMeasure(0.5, 0.8);
+        QVERIFY(_link->targetValid());
+        const double dayRange = _link->targetHorizontalM();
+        _link->setThermalPicture(true);
+        _link->aimAndMeasure(0.8, 0.5);
+        QVERIFY2(_link->targetValid(), qPrintable(_link->laserMessage()));
+        QVERIFY2(_link->targetBearingDeg() > 3.0 && _link->targetBearingDeg() < 0.7 * dayBearing,
+                 qPrintable(QString("%1, by day %2").arg(_link->targetBearingDeg()).arg(dayBearing)));
+        // Below the cross: by day 14 degrees further down, on the thermal picture 8.
+        _link->aimAndMeasure(0.5, 0.8);
+        QVERIFY(_link->targetValid());
+        QVERIFY2(_link->targetHorizontalM() > dayRange + 15.0 && _link->targetHorizontalM() < 173.2,
+                 qPrintable(QString("%1 m, by day %2 m").arg(_link->targetHorizontalM()).arg(dayRange)));
+    }
+
+    void aLockInPictureModeIsMeasuredFromThePictureWithoutTheLaser()
+    {
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        _camera->slrE = "01F4";  // would answer 50 m: it is not asked
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _camera->clear();
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        for (int i = 0; i < 12 && !_link->targetValid(); ++i) {
+            QTest::qWait(90);
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        }
+        QVERIFY(_link->targetValid() && _link->targetFromPicture());
+        QVERIFY(std::abs(_link->targetHorizontalM() - 173.205) < 0.01);
+        QVERIFY(_link->lockActive());
+        QCOMPARE(_camera->countStartingWith("#TPUE2wSLR"), 0);
+        _link->stopLock();
+    }
+
+    void aTapInPictureModeEndsALockAndSaysWhy()
+    {
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        _link->aimAndMeasure(0.6, 0.6);
+        QVERIFY(!_link->lockActive());
+        QVERIFY2(_link->lockMessage().contains("another point was measured"), qPrintable(_link->lockMessage()));
+        QVERIFY(_link->targetValid() && _link->targetFromPicture());
     }
 
     void videoAddressesHaveDefaultsAndSurvive()
