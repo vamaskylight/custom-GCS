@@ -28,6 +28,8 @@ from vgcs.video.camera_control import (
     camera_zoom_ui_level,
 )
 from vgcs.video import thermal_palette
+from vgcs.video.ffmpeg_locator import MISSING_ON_SCREEN as FFMPEG_MISSING_ON_SCREEN
+from vgcs.video.ffmpeg_locator import ffmpeg_available
 from vgcs.video.pipeline import (
     VideoFrame,
     companion_rtsp_port_ready,
@@ -526,7 +528,7 @@ class VideoPreviewUiMixin:
         gx, gy, gw, gh = self._map_canvas_rect_on_panel(px, py, pw, ph)
         self._native_video_preview.setGeometry(gx, gy, gw, gh)
         if self._video_stream_configured():
-            hint = "Live video\n(connecting…)"
+            hint = self._video_connecting_hint()
         else:
             hint = "Live video\n(Settings → Video)"
         self._set_native_video_pip_placeholder(True, message=hint)
@@ -538,6 +540,23 @@ class VideoPreviewUiMixin:
             pass
         self._stack_native_overlays_above_tile_map()
 
+    @staticmethod
+    def _video_connecting_hint() -> str:
+        """What the video area says before the first picture.
+
+        Without FFmpeg there will be no picture, and "connecting" for ever
+        hid that (client log of 2026-10-09, a run from source on a new PC).
+        """
+        if not ffmpeg_available():
+            return FFMPEG_MISSING_ON_SCREEN
+        return "Live video\n(connecting…)"
+
+    def _video_no_picture_hint(self) -> str:
+        """The same words for the full-size video, which has no "connecting" hint."""
+        if self._native_video_last.isNull() and not ffmpeg_available():
+            return FFMPEG_MISSING_ON_SCREEN
+        return ""
+
     def _set_native_video_pip_placeholder(self, on: bool, *, message: str = "") -> None:
         """Hint in the PiP when preview is on but no decoded frame yet."""
         lab = getattr(self, "_native_video_preview", None)
@@ -546,7 +565,7 @@ class VideoPreviewUiMixin:
         if on and not bool(getattr(self, "_video_swapped", False)):
             lab.clear()
             lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            txt = str(message or "").strip() or "Live video\n(connecting…)"
+            txt = str(message or "").strip() or self._video_connecting_hint()
             lab.setText(txt)
             lab.setStyleSheet(
                 "QLabel#nativeVideoPreview {"
@@ -596,13 +615,14 @@ class VideoPreviewUiMixin:
                 self._native_video_preview.setStyleSheet(
                     "QLabel#nativeVideoPreview {"
                     "background: #000;"
+                    "color: #e6c07b;"
                     "border: none;"
                     "border-left: 1px solid rgba(206, 220, 242, 0.55);"
                     "border-radius: 0px;"
                     "}"
                 )
                 try:
-                    self._native_video_preview.setText("")
+                    self._native_video_preview.setText(self._video_no_picture_hint())
                 except Exception:
                     pass
             elif bool(getattr(self, "_video_swapped", False)):
@@ -610,13 +630,15 @@ class VideoPreviewUiMixin:
                 self._native_video_preview.setStyleSheet(
                     "QLabel#nativeVideoPreview {"
                     "background: #000;"
+                    "color: #e6c07b;"
                     "border: none;"
                     "border-radius: 0px;"
                     "}"
                 )
                 # PiP placeholder text must not persist when stretched to fullscreen.
+                # The one text that stays says why there is no picture at all.
                 try:
-                    self._native_video_preview.setText("")
+                    self._native_video_preview.setText(self._video_no_picture_hint())
                 except Exception:
                     pass
             else:

@@ -1,8 +1,9 @@
 // VAMA copy of QGC 5.1.5's src/FlyView/FlightDisplayViewVideoOutput.qml (the
 // video picture). custom.qrc serves it in place of QGC's file. Compare it with
 // QGC's file again after every QGC update. The changes are marked "VAMA": the
-// thermal colour modes of VGCS (client request 2026-10-07). QGC's comment on
-// orientation has a colon in place of its long dash.
+// thermal colour modes of VGCS (client request 2026-10-07), and the pictures
+// for the object lock (2026-10-09). QGC's comment on orientation has a colon
+// in place of its long dash.
 
 import QtQuick
 import QtMultimedia
@@ -31,6 +32,52 @@ VideoOutput {
                     console.error('Error capturing video frame');
                 }
             });
+        }
+    }
+
+    // VAMA: pictures for the object lock. While the app follows an object itself
+    // (SkydroidLink.lockWantsPictures), a small copy of the video picture goes to
+    // it about 12 times a second, with where the picture is inside this item
+    // (black bars beside a 5:4 thermal picture). grabToImage is what QGC uses
+    // above for its own video snapshot. One grab at a time: the next one starts
+    // when the last has come back.
+    Timer {
+        id:       lockPictures
+        objectName: "vamaLockPictures"
+        interval: 70
+        repeat:   true
+        running:  SkydroidLink.lockWantsPictures && videoOutput.visible && videoOutput.width > 0 && videoOutput.height > 0
+
+        property bool waiting: false
+        property int  skipped: 0
+        // How wide the copy is, in points: enough to find the object, quick to copy.
+        readonly property int copyWidth: 480
+
+        onRunningChanged: {
+            waiting = false
+            skipped = 0
+        }
+        onTriggered: {
+            // A grab that never comes back must not stop the pictures for good.
+            if (waiting && skipped < 8) {
+                skipped++
+                return
+            }
+            skipped = 0
+            const r = videoOutput.contentRect
+            if (r.width < 32 || r.height < 32) {
+                return
+            }
+            const w = Math.min(copyWidth, Math.round(videoOutput.width))
+            const h = Math.max(32, Math.round(w * videoOutput.height / videoOutput.width))
+            const px = r.x / videoOutput.width
+            const py = r.y / videoOutput.height
+            const pw = r.width / videoOutput.width
+            const ph = r.height / videoOutput.height
+            waiting = videoOutput.grabToImage(function(result) {
+                lockPictures.waiting = false
+                SkydroidLink.lockPicture(result.image, px, py, pw, ph)
+            }, Qt.size(w, h))
         }
     }
 

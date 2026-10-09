@@ -104,13 +104,49 @@ constexpr int kAimResendMs = 1500;         // send the angles once more (UDP can
 constexpr int kAimTimeoutMs = 8000;
 constexpr double kPi = 3.14159265358979323846;
 
-// Object lock, as VGCS M13 does it (vgcs/skydroid/adapter.py and
+// Object lock, mode "app": the app's own follow, after VGCS M14
+// (vgcs/observe/gimbal_follow_control.py), which was tuned on a Skydroid C12
+// in July 2026: nothing inside half a degree, 2.5 deg/s for each degree the
+// object is off the cross, at most 40 deg/s.
+constexpr double kFollowDeadbandDeg = 0.5;
+constexpr double kFollowGain = 2.5;
+constexpr double kFollowMaxDps = 40.0;
+constexpr double kFollowMinMaxDps = 10.0;
+// A picture is old when the app gets it (the video link, the decoder, the
+// grab), so the camera has already turned part of the way the picture still
+// shows. What it turned in that time is taken off before the speed is set.
+// Without this, a start 20 degrees off went 7 degrees past the object with
+// 0.3 s of delay, on paper; with it, about 2. A walking object is then
+// followed a little further behind (its speed times this time).
+constexpr double kFollowPictureAgeS = 0.30;
+constexpr int kFollowLeaseMs = 400;          // no picture this long: the camera stops turning
+constexpr int kFollowHistoryMs = 1000;
+constexpr int kLockPictureWaitMs = 1500;     // no picture at all after the lock: the app cannot follow
+constexpr int kLockNoPictureEndMs = 3000;    // the pictures stopped this long: the lock ends
+constexpr int kLockLostMs = 2000;            // the object not seen this long: the lock ends
+constexpr double kLockOnCrossDeg = 1.5;      // the laser measures the object only this near the cross
+constexpr double kLockTurningDeg = 2.0;      // further off, the state says the camera is turning to it
+constexpr double kLockDefaultBox = 0.12;     // a tap: a square box of this share of the picture's height
+constexpr int kLockPictureMinSide = 64;      // a smaller picture is not looked at
+
+// Object lock, mode "camera", as VGCS M13 does it (vgcs/skydroid/adapter.py and
 // vgcs/map/observation/track_mixin.py): turn to the object when it is 1.5
 // degrees or more from the centre, GOT where the object is in the picture
 // (the 1280 x 720 frame of TOP 3.3.5), SUM confirm 80 ms later, SUM confirm
-// again every 2 s, and SUM stop at the end. The camera follows once it has
-// turned more than 0.8 degrees by itself; VGCS warns after 6 s without that.
+// again every 2 s, and SUM stop at the end.
 constexpr double kLockTurnFirstDeg = 1.5;
+// Where the camera takes the middle of the picture to be, in GOT points. In
+// both field videos (a car at 21 m on 2026-10-06, a person at 8 m on
+// 2026-10-09) the V13 turned about 2.4 degrees left and 1.2 up within a second
+// of GOT at (640, 360), the middle of 1280 x 720, although the object was on
+// the cross. That is 32 points across and 18 down, the same share (2.5 %) of
+// both sides: as if GOT counted in a frame of 1344 x 756 of which the video
+// shows the middle. If so, the tracker was started beside the object both
+// times. So the GOT point is moved by that much. NOT proven on a camera.
+constexpr int kGotCentreX = 672;
+constexpr int kGotCentreY = 378;
+constexpr int kGotFrameW = 1344;
+constexpr int kGotFrameH = 756;
 constexpr int kLockTickMs = 200;
 constexpr int kLockConfirmDelayMs = 80;
 constexpr int kLockAfterStopMs = 60;     // VGCS waits 50 ms between an old lock's stop and a new GOT
@@ -123,6 +159,8 @@ constexpr int kLockFollowWarnMs = 6000;
 // not the camera following something. In the field video of test build 4 it
 // jumped 2.6 degrees within half a second beside a parked car, and the app
 // said "is following". So the angles to compare with are taken after this.
+// A turn after that is no proof either: in the video of test build 6 the
+// camera drifted 6 degrees in 17 s while the person walked 18 degrees.
 constexpr int kLockSettleMs = 2000;
 
 // Some C13 firmware takes zoom on these ports as well (VGCS _ZOOM_EXTRA_PORTS).
@@ -289,7 +327,11 @@ void SkydroidLink::_loadSettings()
     _dayVideoUrl = settings.value(QStringLiteral("dayVideoUrl")).toString().trimmed();
     _thermalVideoUrl = settings.value(QStringLiteral("thermalVideoUrl")).toString().trimmed();
     _thermalPalette = normalizedThermalPalette(settings.value(QStringLiteral("thermalPalette")).toString());
+    _lockMode = settings.value(QStringLiteral("lockMode"), QStringLiteral("app")).toString();
     settings.endGroup();
+    if (!lockModes().contains(_lockMode)) {
+        _lockMode = QStringLiteral("app");
+    }
     if (_dayVideoUrl.isEmpty()) {
         _dayVideoUrl = QString::fromLatin1(kDefaultDayVideoUrl);
     }
@@ -326,6 +368,7 @@ void SkydroidLink::_saveSettings() const
     settings.setValue(QStringLiteral("dayVideoUrl"), _dayVideoUrl);
     settings.setValue(QStringLiteral("thermalVideoUrl"), _thermalVideoUrl);
     settings.setValue(QStringLiteral("thermalPalette"), _thermalPalette);
+    settings.setValue(QStringLiteral("lockMode"), _lockMode);
     settings.endGroup();
 }
 
@@ -926,6 +969,13 @@ void SkydroidLink::_desiredSpeed(double &yawDps, double &pitchDps)
         yawDps = shapedSpeed(_wheelDeflection(_wheelYawChannel), _maxSpeed, kWheelDeadZone);
         pitchDps = shapedSpeed(_wheelDeflection(_wheelPitchChannel), _maxSpeed, kWheelDeadZone);
     }
+    // The app's own lock: the speeds set from the last picture, for as long as
+    // pictures keep coming. The lease runs only while that lock follows: a finger,
+    // a wheel or a button ends the lock first (_endLockByHand), and with it the lease.
+    if (_followLease.isValid() && _followLease.elapsed() <= kFollowLeaseMs) {
+        yawDps = _followYawDps;
+        pitchDps = _followPitchDps;
+    }
     if (_reverseYaw) {
         yawDps = -yawDps;
     }
@@ -1128,7 +1178,7 @@ void SkydroidLink::_aimPointInPicture(double &u, double &v) const
 
 void SkydroidLink::_aimTick()
 {
-    if (!_aimBusy && !_lockBusy) {
+    if (!_aimBusy && !(_lockBusy && !_lockByApp)) {
         _aimTimer.stop();
         return;
     }
@@ -1139,7 +1189,7 @@ void SkydroidLink::_aimTick()
             _aimSettled.start();
         } else if (_aimSettled.elapsed() >= kAimSettleMs) {
             _aimTimer.stop();
-            if (_lockBusy) {
+            if (_lockBusy && !_lockByApp) {
                 // Stopped on the object, or at a gimbal limit short of it: lock
                 // where the object is in the picture now.
                 double u = 0.5;
@@ -1164,7 +1214,7 @@ void SkydroidLink::_aimTick()
     }
     if (_aimElapsed.elapsed() >= kAimTimeoutMs) {
         _aimTimer.stop();
-        if (_lockBusy) {
+        if (_lockBusy && !_lockByApp) {
             // Never lock on whatever the camera happens to look at.
             _lockBusy = false;
             _setLockMessage(tr("The camera did not turn to the object, so it was not locked. Try again."));
@@ -1182,9 +1232,57 @@ void SkydroidLink::_aimTick()
 
 // --- Object lock ---------------------------------------------------------------
 
+QStringList SkydroidLink::lockModes()
+{
+    return {QStringLiteral("app"), QStringLiteral("camera")};
+}
+
+QStringList SkydroidLink::lockModeNames()
+{
+    return {tr("The app follows the object"), tr("The camera's own tracker")};
+}
+
+void SkydroidLink::setLockMode(const QString &mode)
+{
+    const QString m = lockModes().contains(mode) ? mode : QStringLiteral("app");
+    if (m == _lockMode) {
+        return;
+    }
+    if (_lockActive || _lockBusy) {
+        _endLock(tr("Lock stopped."));
+    }
+    _lockMode = m;
+    _saveSettings();
+    emit settingsChanged();
+}
+
+double SkydroidLink::followSpeed(double offDeg, double maxDps)
+{
+    if (!std::isfinite(offDeg) || !std::isfinite(maxDps) || std::abs(offDeg) <= kFollowDeadbandDeg) {
+        return 0.0;
+    }
+    const double limit = std::abs(maxDps);
+    return std::clamp(offDeg * kFollowGain, -limit, limit);
+}
+
+void SkydroidLink::_clearMeasurement()
+{
+    _laserValid = false;
+    _laserMessage.clear();
+    emit laserChanged();
+    _target = skydroid::geo::LaserResult{};
+    _targetMessage.clear();
+    emit targetChanged();
+}
+
 void SkydroidLink::lockAt(double u, double v)
 {
-    if (_aimBusy || _lockBusy || !std::isfinite(u) || !std::isfinite(v)) {
+    lockAtBox(u, v, 0.0, 0.0);
+}
+
+void SkydroidLink::lockAtBox(double u, double v, double w, double h)
+{
+    if (_aimBusy || _lockBusy || !std::isfinite(u) || !std::isfinite(v) || !std::isfinite(w) || !std::isfinite(h)) {
         return;
     }
     const bool wasLocked = _lockActive;
@@ -1195,18 +1293,47 @@ void SkydroidLink::lockAt(double u, double v)
         _setLockMessage(tr("Camera link is off. Turn it on in the camera settings."));
         return;
     }
+    if (_lockMode == QStringLiteral("camera")) {
+        _lockByCamera(u, v, wasLocked);
+        return;
+    }
+    // A new object: the last measurement no longer applies.
+    _clearMeasurement();
+    // The lock starts on the first picture that comes: the box is kept until then.
+    _pendingU = std::clamp(u, 0.0, 1.0);
+    _pendingV = std::clamp(v, 0.0, 1.0);
+    _pendingW = std::clamp(w, 0.0, 0.9);
+    _pendingH = std::clamp(h, 0.0, 0.9);
+    _lockByApp = true;
+    _lockBusy = true;
+    _lockSeen = false;
+    _lockBoxValid = false;
+    _lockOffDeg = 0.0;
+    _lockNumbers.clear();
+    _lockTurnedDeg = 0.0;
+    _lockJumpDeg = 0.0;
+    _lockFollowSeen = false;
+    _pictureAge.invalidate();
+    _lockLost.invalidate();
+    _followSent.clear();
+    _lockElapsed.start();
+    // The camera's own tracker must not pull against the app.
+    _send(top::buildSumTrack(false, _options));
+    _lockTimer.start();
+    emit lockBoxChanged();
+    _setLockMessage(tr("Locking..."));
+}
+
+void SkydroidLink::_lockByCamera(double u, double v, bool wasLocked)
+{
     if (!_attitudeValid) {
         _setLockMessage(tr("No gimbal angles from the camera, so it cannot turn to the object."));
         return;
     }
     // A new object: the last measurement no longer applies.
-    _laserValid = false;
-    _laserMessage.clear();
-    emit laserChanged();
-    _target = skydroid::geo::LaserResult{};
-    _targetMessage.clear();
-    emit targetChanged();
+    _clearMeasurement();
 
+    _lockByApp = false;
     _lockBusy = true;
     if (_setAimFor(u, v) >= kLockTurnFirstDeg) {
         _startTurn();
@@ -1220,7 +1347,7 @@ void SkydroidLink::lockAt(double u, double v)
     }
     _setLockMessage(tr("Locking..."));
     QTimer::singleShot(kLockAfterStopMs, this, [this, u, v]() {
-        if (_lockBusy && !_aimTimer.isActive()) {
+        if (_lockBusy && !_lockByApp && !_aimTimer.isActive()) {
             _armLock(u, v);
         }
     });
@@ -1228,10 +1355,12 @@ void SkydroidLink::lockAt(double u, double v)
 
 void SkydroidLink::_armLock(double u, double v)
 {
-    const int x = static_cast<int>(std::lround(std::clamp(u, 0.0, 1.0) * top::kLrfFrameW));
-    const int y = static_cast<int>(std::lround(std::clamp(v, 0.0, 1.0) * top::kLrfFrameH));
-    _sendGimbal(top::buildGotTarget(x, y, top::kLrfFrameW, top::kLrfFrameH, _options));
+    // The point in the camera's own count (see kGotCentre).
+    const int x = static_cast<int>(std::lround((std::clamp(u, 0.0, 1.0) - 0.5) * top::kLrfFrameW)) + kGotCentreX;
+    const int y = static_cast<int>(std::lround((std::clamp(v, 0.0, 1.0) - 0.5) * top::kLrfFrameH)) + kGotCentreY;
+    _sendGimbal(top::buildGotTarget(x, y, kGotFrameW, kGotFrameH, _options));
     QTimer::singleShot(kLockConfirmDelayMs, this, &SkydroidLink::_sendLockConfirm);
+    _lockByApp = false;
     _lockBusy = false;
     _lockActive = true;
     _lockFollowSeen = false;
@@ -1246,23 +1375,204 @@ void SkydroidLink::_armLock(double u, double v)
     _lockNextConfirmMs = kLockConfirmEveryMs;
     _lockNextLaserMs = kLockFirstLaserMs;
     _lockTimer.start();
-    _setLockMessage(tr("Locked. The camera should now follow the object."));
+    _setLockMessage(tr("Locked with the camera's own tracker. The app cannot see what the camera follows: watch the cross."));
 }
 
 void SkydroidLink::_sendLockConfirm()
 {
-    if (_lockActive) {
+    if (_lockActive && !_lockByApp) {
         _send(top::buildSumTrack(true, _options));
+    }
+}
+
+void SkydroidLink::lockPicture(const QImage &image, double pictureX, double pictureY, double pictureW,
+                               double pictureH)
+{
+    if (!lockWantsPictures() || image.isNull()) {
+        return;
+    }
+    // The tracker uses the colours: a grey image stays grey, anything else becomes three bytes a point.
+    const bool grey = image.format() == QImage::Format_Grayscale8;
+    const QImage pixels = grey || image.format() == QImage::Format_RGB888 ? image
+                                                                           : image.convertToFormat(QImage::Format_RGB888);
+    if (pixels.isNull()) {
+        return;
+    }
+    const skydroid::track::Picture picture{pixels.constBits(), pixels.width(), pixels.height(),
+                                           static_cast<int>(pixels.bytesPerLine()), grey ? 1 : 3};
+    // Where the video picture is inside this image.
+    const double left = std::clamp(pictureX, 0.0, 1.0) * pixels.width();
+    const double top = std::clamp(pictureY, 0.0, 1.0) * pixels.height();
+    const double width = std::clamp(pictureW, 0.0, 1.0) * pixels.width();
+    const double height = std::clamp(pictureH, 0.0, 1.0) * pixels.height();
+    if (!std::isfinite(left + top + width + height) || width < kLockPictureMinSide ||
+        height < kLockPictureMinSide / 2) {
+        return;  // too small to find anything in
+    }
+    if (_pictureAge.isValid()) {
+        const double seconds = std::clamp(_pictureAge.elapsed() / 1000.0, 0.02, 1.0);
+        _pictureRate = 0.8 * _pictureRate + 0.2 / seconds;
+    }
+    _pictureAge.start();
+
+    skydroid::track::Result result;
+    if (_lockBusy) {
+        skydroid::track::Box box;
+        box.cx = left + _pendingU * width;
+        box.cy = top + _pendingV * height;
+        box.h = _pendingH > 0.0 ? _pendingH * height : kLockDefaultBox * height;
+        box.w = _pendingW > 0.0 ? _pendingW * width : box.h;
+        if (!_tracker.start(picture, box)) {
+            _endLock(tr("The app cannot follow this: the box holds a plain area. Draw the box around the whole object."));
+            return;
+        }
+        _lockBusy = false;
+        _lockActive = true;
+        _lockElapsed.start();
+        _lockNextLaserMs = kLockFirstLaserMs;
+        _followSent.clear();
+        result.found = true;
+        result.box = _tracker.box();
+        result.alike = 1.0;
+    } else {
+        result = _tracker.update(picture);
+    }
+    _follow(result, left, top, width, height);
+}
+
+void SkydroidLink::_turnedSincePicture(double &yawDeg, double &pitchDeg) const
+{
+    yawDeg = 0.0;
+    pitchDeg = 0.0;
+    const qint64 now = _lockElapsed.elapsed();
+    const qint64 from = now - static_cast<qint64>(kFollowPictureAgeS * 1000.0);
+    // Each speed held from when it was set until the next one.
+    qint64 until = now;
+    for (auto it = _followSent.rbegin(); it != _followSent.rend(); ++it) {
+        const qint64 since = std::max(it->atMs, from);
+        if (until > since) {
+            const double seconds = (until - since) / 1000.0;
+            yawDeg += it->yawDps * seconds;
+            pitchDeg += it->pitchDps * seconds;
+        }
+        until = it->atMs;
+        if (it->atMs <= from) {
+            break;
+        }
+    }
+}
+
+void SkydroidLink::_setFollowSpeed(double yawDps, double pitchDps)
+{
+    _followYawDps = yawDps;
+    _followPitchDps = pitchDps;
+    _followLease.start();
+    const qint64 now = _lockElapsed.elapsed();
+    _followSent.push_back({now, yawDps, pitchDps});
+    while (!_followSent.empty() && _followSent.front().atMs < now - kFollowHistoryMs) {
+        _followSent.pop_front();
+    }
+    _startMotionTimer();
+}
+
+void SkydroidLink::_follow(const skydroid::track::Result &result, double left, double top, double width,
+                           double height)
+{
+    const bool wasSeen = _lockSeen;
+    _lockSeen = result.found;
+    _lockBoxValid = true;
+    _lockBoxU = (result.box.cx - left) / width;
+    _lockBoxV = (result.box.cy - top) / height;
+    _lockBoxW = result.box.w / width;
+    _lockBoxH = result.box.h / height;
+
+    QString message;
+    if (result.found) {
+        _lockLost.invalidate();
+        double hfov = 0.0;
+        double vfov = 0.0;
+        currentFov(hfov, vfov);
+        // Where the object is from the cross: right and up are +, as the speed commands count.
+        const double right = (_lockBoxU - 0.5) * hfov;
+        const double up = (0.5 - _lockBoxV) * vfov;
+        _lockOffDeg = std::max(std::abs(right), std::abs(up));
+        // The picture is old: the camera has turned part of that way since.
+        double turnedYaw = 0.0;
+        double turnedPitch = 0.0;
+        _turnedSincePicture(turnedYaw, turnedPitch);
+        // Never so fast that the object leaves the tracker's reach between two pictures.
+        const double maxYaw = std::clamp(0.5 * _lockBoxW * hfov * _pictureRate, kFollowMinMaxDps, kFollowMaxDps);
+        const double maxPitch = std::clamp(0.5 * _lockBoxH * vfov * _pictureRate, kFollowMinMaxDps, kFollowMaxDps);
+        _setFollowSpeed(followSpeed(right - turnedYaw, maxYaw), followSpeed(up - turnedPitch, maxPitch));
+        message = _lockOffDeg > kLockTurningDeg ? tr("Locked. Turning the camera to the object...")
+                                                : tr("Locked. The camera follows the object.");
+    } else {
+        // Not seen: the camera waits where it last saw the object. (Letting it turn on for a
+        // second, as the object was going, was tried on the test bench: no walk more was kept.)
+        _setFollowSpeed(0.0, 0.0);
+        if (!_lockLost.isValid()) {
+            _lockLost.start();
+        }
+        if (_lockLost.elapsed() >= kLockLostMs) {
+            _endLock(tr("Lock lost: the app does not see the object any more. Lock it again."));
+            return;
+        }
+        message = tr("Locked, but the object is not seen right now.");
+    }
+    _lockNumbers = QStringLiteral("off %1 deg, speed %2 / %3 deg/s, match %4, colours %5, %6 pictures/s")
+                       .arg(_lockOffDeg, 0, 'f', 1)
+                       .arg(_followYawDps, 0, 'f', 1)
+                       .arg(_followPitchDps, 0, 'f', 1)
+                       .arg(result.psr, 0, 'f', 0)
+                       .arg(result.alike, 0, 'f', 2)
+                       .arg(_pictureRate, 0, 'f', 0);
+    emit lockBoxChanged();
+    if (message != _lockMessage || wasSeen != _lockSeen) {
+        _lockMessage = message;
+        emit lockChanged();
     }
 }
 
 void SkydroidLink::_lockTick()
 {
-    if (!_lockActive || !_socket) {
+    if ((!_lockActive && !(_lockBusy && _lockByApp)) || !_socket) {
         _lockTimer.stop();
         return;
     }
     const qint64 now = _lockElapsed.elapsed();
+    if (_lockByApp) {
+        if (_lockBusy) {
+            // Waiting for the first picture. With none, the app cannot follow.
+            if (now >= kLockPictureWaitMs) {
+                const double u = _pendingU;
+                const double v = _pendingV;
+                _lockBusy = false;
+                _lockByApp = false;
+                emit lockChanged();
+                if (_attitudeValid) {
+                    _lockByCamera(u, v, false);
+                    if (_lockBusy || _lockActive) {
+                        _setLockMessage(tr("No picture of the video reaches the app, so the camera's own tracker is used. ") +
+                                        _lockMessage);
+                    }
+                } else {
+                    _lockTimer.stop();
+                    _setLockMessage(tr("No picture of the video reaches the app, so it cannot lock."));
+                }
+            }
+            return;
+        }
+        if (_pictureAge.isValid() && _pictureAge.elapsed() >= kLockNoPictureEndMs) {
+            _endLock(tr("Lock stopped: the video stopped."));
+            return;
+        }
+        if (now >= _lockNextLaserMs && _lockSeen && _lockOffDeg <= kLockOnCrossDeg) {
+            // The object is under the cross: measure it.
+            _lockNextLaserMs = now + kLockLaserEveryMs;
+            _fireLaser(true);
+        }
+        return;
+    }
     if (now >= _lockNextConfirmMs) {
         // VGCS sends the confirm again every 2 s to keep the camera following.
         _send(top::buildSumTrack(true, _options));
@@ -1273,15 +1583,14 @@ void SkydroidLink::_lockTick()
         const double turned = std::max(std::abs(_yaw - _lockStartYaw), std::abs(_pitch - _lockStartPitch));
         if (!_lockSettled) {
             if (now >= kLockSettleMs) {
-                // From here on, a turn is the camera following. What it did before
-                // this is kept apart as the jump at the lock.
+                // What the camera did before this is kept apart as the jump at the lock.
                 _lockSettled = true;
                 _lockJumpDeg = turned;
                 _lockStartYaw = _yaw;
                 _lockStartPitch = _pitch;
                 if (turned > kLockFollowDeg) {
                     _lockJumped = true;
-                    _lockMessage = tr("Locked. The camera moved %1 degrees at the lock. "
+                    _lockMessage = tr("Locked with the camera's own tracker. The camera moved %1 degrees at the lock. "
                                       "Check that the cross is on the object.").arg(turned, 0, 'f', 1);
                 }
                 changed = true;
@@ -1292,8 +1601,9 @@ void SkydroidLink::_lockTick()
                 changed = true;
             }
             if (!_lockFollowSeen && turned > kLockFollowDeg) {
+                // The camera turned by itself. The text does not say "is following":
+                // the app cannot see what the camera follows.
                 _lockFollowSeen = true;
-                _lockMessage = tr("Locked. The camera is following the object.");
                 changed = true;
             }
         }
@@ -1302,10 +1612,11 @@ void SkydroidLink::_lockTick()
         _lockWarned = true;
         if (!_attitudeValid) {
             // Without angles the app cannot see the camera turn: say that, not "not following".
-            _lockMessage = tr("Locked, but the camera sends no angles, so the app cannot tell if it follows.");
+            _lockMessage = tr("Locked with the camera's own tracker, but the camera sends no angles, "
+                              "so the app cannot tell if it turns.");
             changed = true;
         } else if (!_lockJumped) {
-            _lockMessage = tr("Locked, but the camera has not turned by itself yet. "
+            _lockMessage = tr("Locked with the camera's own tracker, but the camera has not turned by itself yet. "
                               "If the object moved, the camera is not following it.");
             changed = true;
         }
@@ -1330,16 +1641,43 @@ void SkydroidLink::stopLock()
 
 void SkydroidLink::_endLock(const QString &message)
 {
+    const bool byApp = _lockByApp;
     if (_lockBusy) {
         _lockBusy = false;
-        _aimTimer.stop();
+        if (!byApp) {
+            _aimTimer.stop();
+        }
     }
     if (_lockActive) {
         _lockActive = false;
-        _lockTimer.stop();
-        // Twice, as UDP can drop one: a camera that kept following would fight the operator.
-        _send(top::buildSumTrack(false, _options));
-        _send(top::buildSumTrack(false, _options));
+        if (!byApp) {
+            // Twice, as UDP can drop one: a camera that kept following would fight the operator.
+            _send(top::buildSumTrack(false, _options));
+            _send(top::buildSumTrack(false, _options));
+        }
+    }
+    _lockTimer.stop();
+    if (byApp) {
+        // The app's own lock: stop the gimbal where it is.
+        _tracker.stop();
+        _followYawDps = 0.0;
+        _followPitchDps = 0.0;
+        _followLease.invalidate();
+        _followSent.clear();
+        if (_socket && (_moving || _motionTimer.isActive())) {
+            _sendStop();
+            _moving = false;
+            _stopRepeats = 1;  // once more on the next tick: UDP can drop one
+            if (!_motionTimer.isActive()) {
+                _motionTimer.start();
+            }
+        }
+    }
+    _lockByApp = false;
+    _lockSeen = false;
+    if (_lockBoxValid) {
+        _lockBoxValid = false;
+        emit lockBoxChanged();
     }
     _setLockMessage(message);
 }
@@ -1348,6 +1686,14 @@ void SkydroidLink::_endLockByHand()
 {
     if (_lockActive || _lockBusy) {
         _endLock(tr("Lock stopped, because the camera was moved."));
+    }
+}
+
+void SkydroidLink::_endAppLockForZoom()
+{
+    // The app's tracker knows the object at one size: a zoom step changes it.
+    if (_lockByApp && (_lockActive || _lockBusy)) {
+        _endLock(tr("Lock stopped, because the zoom was changed. Lock the object again."));
     }
 }
 
@@ -1580,6 +1926,7 @@ void SkydroidLink::zoom(int direction)
         return;
     }
     const int d = direction > 0 ? 1 : -1;
+    _endAppLockForZoom();
     if (_isZoomStepCamera()) {
         for (const std::string &frame : top::buildDzmStepFrames(d, _options)) {
             _send(frame);
@@ -1601,6 +1948,7 @@ void SkydroidLink::zoom(int direction)
 
 void SkydroidLink::zoomHome()
 {
+    _endAppLockForZoom();
     if (_isZoomStepCamera()) {
         for (const std::string &frame : top::buildDzmHomeFrames(_options)) {
             _send(frame);

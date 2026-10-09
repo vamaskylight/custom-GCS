@@ -257,11 +257,21 @@ def main() -> int:
     )
     ffmpeg.add_argument("--no-ffmpeg", action="store_true", help="do not bundle FFmpeg")
     parser.add_argument("--skip-install", action="store_true", help="do not run pip (faster rebuilds)")
+    parser.add_argument(
+        "--ffmpeg-only", action="store_true",
+        help="only download the pinned FFmpeg into build\\ffmpeg, for running VGCS from source (py -m vgcs)",
+    )
     parser.add_argument("--no-zip", action="store_true", help="with --folder: do not zip dist/VGCS")
     args = parser.parse_args()
     if os.name != "nt":
         sys.exit("VGCS.exe can only be built on Windows.")
     sys.stdout.reconfigure(errors="replace")  # the self-check output may hold characters the console lacks
+
+    if args.ffmpeg_only:
+        folder = prepare_ffmpeg()
+        print(f"\nFFmpeg {FFMPEG_VERSION} is in {folder}")
+        print("VGCS finds it there when it is started from source (py -m vgcs).")
+        return 0
 
     prepare_venv(install=not args.skip_install)
     ffmpeg_dir = None if args.no_ffmpeg else (args.ffmpeg_dir or prepare_ffmpeg())

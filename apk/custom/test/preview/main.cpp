@@ -15,14 +15,24 @@
 //   8_thermal_ironbow.png       the thermal picture in Ironbow
 //   9_tap_aiming.png, 10_tap_result.png   a tap on an object: turn, then measure
 //   11_lock_pick.png      after the lock button: the hint to pick the object
-//   12_lock_drawing.png   a box being drawn around the object
-//   13_locked.png         locked: box on the centre mark, lock state under the laser result
-//   14_lock_following.png the camera follows (the fake camera turns by itself)
-//   15_lock_stopped.png   after the lock button again
+//   12_lock_drawing.png   a box being drawn around the walker
+//   13_locked.png         locked: the app turned the camera to the walker, the box is on it
+//   14_lock_following.png the walker walks and the app turns the camera after it
+//   14b_lock_on_the_cross.png  the walker stands: under the cross, measured by the laser
+//   14c_lock_not_seen.png      the walker is gone: the box turns red, the camera waits
+//   15_lock_lost.png      two seconds later the lock has ended and says why
+//   15b_camera_tracker.png     the same with the camera's own tracker (lock mode "camera")
+//   15c_lock_stopped.png  after the lock button again
 //   16_no_gps_lock.png    a laser shot while the drone has no GPS lock: distance, and why no lat long
 //   17_app_settings.png   Application Settings: the VAMA mark on General, no Help page
+//   18_warnings_small.png QGC's "No GPS Lock" and pre-arm texts, small at the bottom while the video is the main view
+//   19_warnings_map.png   the same texts as QGC shows them, with the map as the main view
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
+// The lock is tried for real: the day picture is a look into a world that
+// stands still (stubs/QtMultimedia/VideoOutput.qml), the fake camera turns at
+// the speeds it is told, and a walker walks through the world. The app has to
+// find the walker in the pictures it grabs and keep it under the cross.
 // With IR on it picks Ironbow in the thermal colour list, then checks every
 // mode against VGCS's colour table at 64 grey levels of the thermal picture,
 // and that the black bars beside the picture stay black. The video is QGC's
@@ -33,6 +43,7 @@
 // Every QML warning or error is printed; the exit code is 1 when there was one.
 
 #include <QtCore/QDir>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QFile>
 #include <QtCore/QLoggingCategory>
 #include <QtCore/QSettings>
@@ -44,11 +55,15 @@
 #include <QtNetwork/QUdpSocket>
 #include <QtQml/QQmlAbstractUrlInterceptor>
 #include <QtQml/QQmlApplicationEngine>
+#include <QtQml/QQmlContext>
 #include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <functional>
+#include <string>
 #include <utility>
 
 #include "ColoredSvgImageProvider.h"
@@ -145,18 +160,87 @@ public:
     FakeVideoSettings video;
 };
 
+/// One value that QML reads by name ("isValid", "supported").
+class FakeFlag : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool isValid READ value NOTIFY changed)
+    Q_PROPERTY(bool supported READ value NOTIFY changed)
+
+public:
+    explicit FakeFlag(bool value) : _value(value) {}
+    bool value() const { return _value; }
+    void set(bool value)
+    {
+        if (value != _value) {
+            _value = value;
+            emit changed();
+        }
+    }
+
+signals:
+    void changed();
+
+private:
+    bool _value;
+};
+
+/// What QGC's VehicleWarnings.qml reads of the active vehicle.
+class FakeQmlVehicle : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool requiresGpsFix READ requiresGpsFix CONSTANT)
+    Q_PROPERTY(bool armed READ armed CONSTANT)
+    Q_PROPERTY(QObject *coordinate READ coordinate CONSTANT)
+    Q_PROPERTY(QString prearmError READ prearmError NOTIFY prearmErrorChanged)
+    Q_PROPERTY(QObject *healthAndArmingCheckReport READ report CONSTANT)
+
+public:
+    bool requiresGpsFix() const { return true; }
+    bool armed() const { return false; }
+    QObject *coordinate() { return &position; }
+    QObject *report() { return &_report; }
+    QString prearmError() const { return _prearmError; }
+    void setPrearmError(const QString &text)
+    {
+        _prearmError = text;
+        emit prearmErrorChanged();
+    }
+    FakeFlag position{true};  // a GPS position: no warning
+
+signals:
+    void prearmErrorChanged();
+
+private:
+    FakeFlag _report{false};  // an ArduPilot that sends pre-arm texts, not the newer report
+    QString _prearmError;
+};
+
+class FakeQmlVehicleManager : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QObject *activeVehicle READ activeVehicle CONSTANT)
+
+public:
+    QObject *activeVehicle() { return &vehicle; }
+    FakeQmlVehicle vehicle;
+};
+
 class FakeGlobal : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QObject *videoManager READ videoManager CONSTANT)
     Q_PROPERTY(QObject *settingsManager READ settingsManager CONSTANT)
+    Q_PROPERTY(QObject *multiVehicleManager READ multiVehicleManager CONSTANT)
     Q_PROPERTY(qreal zOrderTopMost READ zOrderTopMost CONSTANT)
 
 public:
     QObject *videoManager() { return &_videoManager; }
     qreal zOrderTopMost() const { return 1000; }  // QGC's value
     QObject *settingsManager() { return &settings; }
+    QObject *multiVehicleManager() { return &vehicles; }
     FakeSettingsManager settings;
+    FakeQmlVehicleManager vehicles;
 
 private:
     FakeVideoManager _videoManager;
@@ -164,27 +248,93 @@ private:
 
 /// Answers angle questions and laser reads like the client's V13 (C13). Like it,
 /// it ignores long gimbal frames that start with a lower-case "#tp" (test build 3).
+/// It turns at the speeds it is told (GSY, GSP) and to the angles it is told
+/// (GAY, GAP), and the stand-in video shows what it looks at. Its yaw counts to
+/// the left, as the C13 reports it.
 class FakeCamera : public QObject
 {
     Q_OBJECT
+    Q_PROPERTY(double yaw READ yaw NOTIFY lookChanged)
+    Q_PROPERTY(double pitch READ pitch NOTIFY lookChanged)
+    // The walker in the stand-in video: where it is in the world, in degrees
+    // right of straight ahead and above the level line.
+    Q_PROPERTY(double walkerRight READ walkerRight NOTIFY walkerChanged)
+    Q_PROPERTY(double walkerUp READ walkerUp NOTIFY walkerChanged)
+    Q_PROPERTY(bool walkerVisible READ walkerVisible NOTIFY walkerChanged)
 
 public:
     FakeCamera()
     {
         _socket.bind(QHostAddress::LocalHost, 0);
         connect(&_socket, &QUdpSocket::readyRead, this, &FakeCamera::_read);
-        connect(&_follow, &QTimer::timeout, this, [this]() { yaw += 0.3; });
+        connect(&_follow, &QTimer::timeout, this, [this]() { setYaw(_yaw + 0.3); });
+        connect(&_motion, &QTimer::timeout, this, &FakeCamera::_move);
+        _clock.start();
+        _motion.start(20);
     }
     quint16 port() const { return _socket.localPort(); }
 
-    double yaw = -12.4;
-    double pitch = -31.5;
+    double yaw() const { return _yaw; }
+    double pitch() const { return _pitch; }
+    void setYaw(double degrees)
+    {
+        _yaw = std::clamp(degrees, -90.0, 90.0);
+        emit lookChanged();
+    }
+    void setPitch(double degrees)
+    {
+        _pitch = std::clamp(degrees, -90.0, 10.0);  // the C13 tilts from -90 to +10
+        emit lookChanged();
+    }
+    /// Where the camera looks, in degrees right of straight ahead.
+    double lookRight() const { return -_yaw; }
+
+    double walkerRight() const { return _walkerRight; }
+    double walkerUp() const { return _walkerUp; }
+    bool walkerVisible() const { return _walkerVisible; }
+    void placeWalker(double right, double up)
+    {
+        _walkerRight = right;
+        _walkerUp = up;
+        _walkerVisible = true;
+        emit walkerChanged();
+    }
+    void setWalkerVisible(bool visible)
+    {
+        _walkerVisible = visible;
+        emit walkerChanged();
+    }
+    double walkerSpeed = 0.0;  // degrees a second to the right
+
+    /// Degrees a second the camera turns now: to the right, and up.
+    double yawRate = 0.0;
+    double pitchRate = 0.0;
     int angleCommands = 0;  // GAY and GAP frames received (tap aiming)
-    int gotFrames = 0;      // lock: GOT
-    int sumConfirms = 0;    // lock: SUM 01
-    int sumStops = 0;       // lock: SUM 00
+    int speedCommands = 0;  // GSY and GSP frames with a speed in them
+    int gotFrames = 0;      // the camera's own tracker: GOT
+    QString lastGot;        // its data: where the point is, in the camera's count
+    int sumConfirms = 0;    // the camera's own tracker: SUM 01
+    int sumStops = 0;       // the camera's own tracker: SUM 00
+
+signals:
+    void lookChanged();
+    void walkerChanged();
 
 private slots:
+    void _move()
+    {
+        const double seconds = std::min(0.2, _clock.restart() / 1000.0);
+        if (yawRate != 0.0 || pitchRate != 0.0) {
+            _yaw = std::clamp(_yaw - yawRate * seconds, -90.0, 90.0);  // right is a smaller yaw
+            _pitch = std::clamp(_pitch + pitchRate * seconds, -90.0, 10.0);
+            emit lookChanged();
+        }
+        if (walkerSpeed != 0.0) {
+            _walkerRight += walkerSpeed * seconds;
+            emit walkerChanged();
+        }
+    }
+
     void _read()
     {
         while (_socket.hasPendingDatagrams()) {
@@ -197,16 +347,35 @@ private slots:
             // The gimbal turns to angle commands at once.
             if (f && (f->tag == "GAY" || f->tag == "GAP") && f->ctrl == 'w' && f->data.size() >= 4) {
                 if (const auto angle = top::decodeAttitudeField4(f->data.substr(0, 4))) {
-                    (f->tag == "GAY" ? yaw : pitch) = *angle;
+                    if (f->tag == "GAY") {
+                        setYaw(*angle);
+                    } else {
+                        setPitch(*angle);
+                    }
                 }
                 ++angleCommands;
                 continue;
             }
-            if (f && f->tag == "GOT" && f->ctrl == 'w') {
-                ++gotFrames;
+            // Speed commands: one signed byte for each axis, in half degrees a second.
+            if (f && (f->tag == "GSY" || f->tag == "GSP") && f->ctrl == 'w' && f->data.size() >= 2) {
+                const double speed = _speed(f->data.substr(0, 2));
+                (f->tag == "GSY" ? yawRate : pitchRate) = speed;
+                if (speed != 0.0) {
+                    ++speedCommands;
+                }
                 continue;
             }
-            // After a SUM confirm the camera follows an object that moves slowly (3 deg/s).
+            if (f && f->tag == "GSM" && f->ctrl == 'w' && f->data.size() >= 4) {
+                yawRate = _speed(f->data.substr(0, 2));
+                pitchRate = _speed(f->data.substr(2, 2));
+                continue;
+            }
+            if (f && f->tag == "GOT" && f->ctrl == 'w') {
+                ++gotFrames;
+                lastGot = QString::fromStdString(f->data);
+                continue;
+            }
+            // After a SUM confirm the camera turns slowly by itself (3 deg/s).
             if (f && f->tag == "SUM" && f->ctrl == 'w') {
                 if (f->data == "01") {
                     ++sumConfirms;
@@ -225,7 +394,7 @@ private slots:
             std::string reply;
             if (f->tag == "GAC") {
                 reply = top::buildTpFrame('U', 'r', "GAC",
-                                          top::encodeAttitudeField4(yaw) + top::encodeAttitudeField4(pitch) +
+                                          top::encodeAttitudeField4(_yaw) + top::encodeAttitudeField4(_pitch) +
                                               top::encodeAttitudeField4(0.0),
                                           'G', 1);
             } else if (f->tag == "SLR" && f->address.size() == 2 && f->address[1] == 'E') {
@@ -239,8 +408,26 @@ private slots:
     }
 
 private:
+    static double _speed(const std::string &twoHex)
+    {
+        int value = 0;
+        try {
+            value = std::stoi(twoHex, nullptr, 16);
+        } catch (...) {
+            return 0.0;
+        }
+        return (value > 127 ? value - 256 : value) * 0.5;
+    }
+
     QUdpSocket _socket;
     QTimer _follow;
+    QTimer _motion;
+    QElapsedTimer _clock;
+    double _yaw = -12.4;
+    double _pitch = -31.5;
+    double _walkerRight = 0.0;
+    double _walkerUp = 0.0;
+    bool _walkerVisible = false;
 };
 
 /// The app's override rule (CustomOverrideInterceptor in CustomPlugin.cc): a
@@ -312,6 +499,7 @@ int main(int argc, char *argv[])
     engine.addUrlInterceptor(&interceptor);
     engine.addImageProvider(QLatin1String(ColoredSvgImageProvider::ProviderId), new ColoredSvgImageProvider);
     engine.addImportPath(QStringLiteral(VAMA_PREVIEW_DIR "/stubs"));
+    engine.rootContext()->setContextProperty(QStringLiteral("previewCamera"), &camera);
     engine.load(QUrl::fromLocalFile(QStringLiteral(VAMA_PREVIEW_DIR "/main.qml")));
     if (engine.rootObjects().isEmpty()) {
         return 2;
@@ -469,6 +657,42 @@ int main(int argc, char *argv[])
         window->setProperty("videoOnly", false);
         return image;
     };
+    // The lock: where an item is on the screen, and how far the walker is from the cross.
+    auto sceneRect = [&](const char *objectName) -> QRectF {
+        QQuickItem *item = findItem(objectName);
+        return item ? item->mapRectToScene(QRectF(0, 0, item->width(), item->height())) : QRectF();
+    };
+    // In degrees: right of the cross and above it.
+    auto walkerOff = [&]() -> QPointF {
+        return QPointF(camera.walkerRight() - camera.lookRight(), camera.walkerUp() - camera.pitch());
+    };
+    auto offText = [&]() {
+        const QPointF off = walkerOff();
+        return QStringLiteral("%1 deg right, %2 deg up of the cross").arg(off.x(), 0, 'f', 1).arg(off.y(), 0, 'f', 1);
+    };
+    // The lock box on the screen against the walker on the screen.
+    auto boxOnWalker = [&]() -> bool {
+        const QRectF box = sceneRect("vamaLockBox");
+        const QRectF walker = sceneRect("previewWalker");
+        return !box.isEmpty() && !walker.isEmpty() && box.contains(walker.center()) &&
+               std::abs(box.center().x() - walker.center().x()) < walker.width() &&
+               std::abs(box.center().y() - walker.center().y()) < walker.height() / 2;
+    };
+    auto boxText = [&]() {
+        const QRectF box = sceneRect("vamaLockBox");
+        const QRectF walker = sceneRect("previewWalker");
+        return QStringLiteral("box centre %1, %2; walker centre %3, %4")
+            .arg(box.center().x(), 0, 'f', 0).arg(box.center().y(), 0, 'f', 0)
+            .arg(walker.center().x(), 0, 'f', 0).arg(walker.center().y(), 0, 'f', 0);
+    };
+    auto boxLabel = [&]() {
+        QQuickItem *label = findItem("vamaLockBoxLabel");
+        return label ? label->property("text").toString() : QString();
+    };
+    double lookAtLock = 0.0;
+    QRectF walkerOnScreen;
+    int speedsBefore = 0;
+
     QImage thermalPlain;  // the thermal picture as the camera sends it
     // The 64 grey bands of the stand-in's thermal picture against VGCS's table
     // for the mode in use, and the black bar beside the picture.
@@ -618,43 +842,144 @@ int main(int argc, char *argv[])
              shot("10_tap_result.png");
              // Almost level, as in the field video of test build 4: the result then
              // carries the "less accurate" note, the tallest the box gets.
-             camera.pitch = 3.0;
+             camera.setPitch(3.0);
+             // The walker stands 14 degrees right of where the camera looks, 4 below.
+             camera.placeWalker(camera.lookRight() + 14.0, camera.pitch() - 4.0);
              tap("vamaLockButton");
          }},
         {400, [&]() {
              shot("11_lock_pick.png");
              anglesBeforeLock = camera.angleCommands;
-             // Draw a box around the light building, left of the centre.
-             mouse(QEvent::MouseButtonPress, QPointF(700, 380));
+             speedsBefore = camera.speedCommands;
+             lookAtLock = camera.lookRight();
+             // Draw a box around the walker, a little larger than it.
+             walkerOnScreen = sceneRect("previewWalker");
+             expect(!walkerOnScreen.isEmpty() && walkerOnScreen.center().x() > 1000, "lock: the walker is in the picture, right of the cross",
+                    QStringLiteral("%1, %2").arg(walkerOnScreen.center().x()).arg(walkerOnScreen.center().y()));
+             mouse(QEvent::MouseButtonPress, walkerOnScreen.topLeft() - QPointF(14, 12));
          }},
-        {100, [&]() { mouse(QEvent::MouseMove, QPointF(760, 430)); }},
-        {100, [&]() { mouse(QEvent::MouseMove, QPointF(860, 520)); }},
+        {100, [&]() { mouse(QEvent::MouseMove, walkerOnScreen.center()); }},
+        {100, [&]() { mouse(QEvent::MouseMove, walkerOnScreen.bottomRight() + QPointF(14, 12)); }},
         {300, [&]() {
              shot("12_lock_drawing.png");
-             expect(camera.angleCommands == anglesBeforeLock, "lock: drawing the box does not move the camera",
-                    QString::number(camera.angleCommands));
-             mouse(QEvent::MouseButtonRelease, QPointF(860, 520));
+             expect(camera.angleCommands == anglesBeforeLock && camera.speedCommands == speedsBefore,
+                    "lock: drawing the box does not move the camera", QString::number(camera.speedCommands - speedsBefore));
+             mouse(QEvent::MouseButtonRelease, walkerOnScreen.bottomRight() + QPointF(14, 12));
          }},
-        {1800, [&]() {
-             expect(link.lockActive(), "lock: locked after the turn", link.lockMessage());
-             expect(camera.angleCommands >= anglesBeforeLock + 2, "lock: the camera turned to the box first (GAY and GAP)",
-                    QString::number(camera.angleCommands));
-             expect(camera.gotFrames == 1 && camera.sumConfirms >= 1, "lock: GOT, then SUM confirm",
+        {2000, [&]() {
+             expect(link.lockActive() && link.lockByApp() && link.lockSeen(), "lock: the app follows the object itself",
+                    link.lockMessage());
+             expect(camera.gotFrames == 0 && camera.sumConfirms == 0, "lock: the camera's own tracker is not used",
                     QStringLiteral("GOT %1, SUM 01 %2").arg(camera.gotFrames).arg(camera.sumConfirms));
+             expect(camera.angleCommands == anglesBeforeLock && camera.speedCommands > speedsBefore,
+                    "lock: the camera is turned with speed commands, not angle commands",
+                    QStringLiteral("%1 speed frames, %2 angle frames").arg(camera.speedCommands - speedsBefore)
+                        .arg(camera.angleCommands - anglesBeforeLock));
+             const QPointF off = walkerOff();
+             expect(std::abs(off.x()) < 1.5 && std::abs(off.y()) < 1.5, "lock: the camera turned until the walker was under the cross",
+                    offText());
+             expect(camera.lookRight() - lookAtLock > 11.0, "lock: it turned to the right, where the walker was",
+                    QStringLiteral("%1 deg").arg(camera.lookRight() - lookAtLock, 0, 'f', 1));
+             expect(boxOnWalker() && boxLabel() == QStringLiteral("LOCKED"), "lock: the box on the screen is on the walker",
+                    boxText() + QStringLiteral(", label ") + boxLabel());
+             const QRectF lockedBox = sceneRect("vamaLockBox");
+             expect(lockedBox.height() > lockedBox.width() * 1.5 && lockedBox.width() > walkerOnScreen.width() &&
+                        lockedBox.width() < walkerOnScreen.width() * 2.5,
+                    "lock: the box has the shape that was drawn (tall, a little larger than the walker)",
+                    QStringLiteral("%1 x %2, walker %3 x %4").arg(lockedBox.width(), 0, 'f', 0).arg(lockedBox.height(), 0, 'f', 0)
+                        .arg(walkerOnScreen.width(), 0, 'f', 0).arg(walkerOnScreen.height(), 0, 'f', 0));
              shot("13_locked.png");
+             camera.walkerSpeed = 4.0;  // the walker walks to the right
          }},
-        {3500, [&]() {
-             expect(link.lockFollowSeen(), "lock: the camera is seen following",
-                    QStringLiteral("%1 deg").arg(link.lockTurnedDeg()));
-             expect(link.laserValid(), "lock: the laser measured the locked object",
-                    QStringLiteral("%1 m").arg(link.laserRangeM()));
+        {3000, [&]() {
+             const QPointF off = walkerOff();
+             expect(link.lockActive() && link.lockSeen(), "lock: still locked while the walker walks", link.lockMessage());
+             expect(camera.lookRight() - lookAtLock > 22.0, "lock: the camera turned after the walking walker",
+                    QStringLiteral("%1 deg since the lock").arg(camera.lookRight() - lookAtLock, 0, 'f', 1));
+             // Behind a walking object by its speed over the gain, and by what the app takes off for the picture's age.
+             expect(off.x() > -0.5 && off.x() < 4.5 && std::abs(off.y()) < 1.5, "lock: the walker stays near the cross while walking",
+                    offText());
+             expect(boxOnWalker(), "lock: the box stays on the walker", boxText());
              shot("14_lock_following.png");
+             camera.walkerSpeed = 0.0;  // and stands
+         }},
+        {2600, [&]() {
+             const QPointF off = walkerOff();
+             expect(std::abs(off.x()) < 1.0 && std::abs(off.y()) < 1.0, "lock: the walker is under the cross once it stands", offText());
+             expect(link.lockMessage().contains(QStringLiteral("follows the object")), "lock: the state says the camera follows",
+                    link.lockMessage());
+             expect(link.laserValid() && link.targetValid(), "lock: the laser measured the walker under the cross",
+                    QStringLiteral("%1 m").arg(link.laserRangeM()));
+             QQuickItem *numbers = findItem("vamaLockNumbers");
+             expect(numbers && numbers->isVisible() && numbers->property("text").toString().contains(QStringLiteral("pictures/s")),
+                    "lock: the line of numbers for a field video shows", numbers ? numbers->property("text").toString() : QString());
+             shot("14b_lock_on_the_cross.png");
+             camera.setWalkerVisible(false);  // the walker is gone
+         }},
+        {700, [&]() {
+             expect(link.lockActive() && !link.lockSeen(), "lock: it says when the object is not seen", link.lockMessage());
+             expect(boxLabel() == QStringLiteral("NOT SEEN"), "lock: the box says NOT SEEN", boxLabel());
+             expect(camera.yawRate == 0.0 && camera.pitchRate == 0.0, "lock: the camera waits, it does not turn after nothing",
+                    QStringLiteral("%1 / %2 deg/s").arg(camera.yawRate).arg(camera.pitchRate));
+             shot("14c_lock_not_seen.png");
+         }},
+        {2200, [&]() {
+             expect(!link.lockActive() && link.lockMessage().contains(QStringLiteral("Lock lost")),
+                    "lock: after two seconds without the object the lock ends and says why", link.lockMessage());
+             QQuickItem *chip = findItem("vamaLockChip");
+             expect(chip && chip->isVisible(), "lock: the reason is on the screen", link.lockMessage());
+             shot("15_lock_lost.png");
+             // The camera's own tracker, as test builds 4 to 6 did it. It is chosen as the operator
+             // does, in the camera settings ("Object lock"). The walker stands 12 degrees left.
+             QObject *modeBox = window->findChild<QObject *>(QStringLiteral("vamaLockModeBox"));
+             expect(modeBox != nullptr, "camera's tracker: the camera settings have the choice \"Object lock\"", QString());
+             if (modeBox) {
+                 QMetaObject::invokeMethod(modeBox, "activated", Q_ARG(int, 1));
+             }
+             expect(link.lockMode() == QStringLiteral("camera"), "camera's tracker: choosing it in the camera settings sets it",
+                    link.lockMode());
+             camera.placeWalker(camera.lookRight() - 12.0, camera.pitch() - 2.0);
+             anglesBeforeLock = camera.angleCommands;
              tap("vamaLockButton");
          }},
         {400, [&]() {
-             expect(!link.lockActive() && camera.sumStops >= 1, "lock: stopped with SUM stop",
+             walkerOnScreen = sceneRect("previewWalker");
+             mouse(QEvent::MouseButtonPress, walkerOnScreen.topLeft() - QPointF(14, 12));
+         }},
+        {100, [&]() { mouse(QEvent::MouseMove, walkerOnScreen.center()); }},
+        {100, [&]() { mouse(QEvent::MouseMove, walkerOnScreen.bottomRight() + QPointF(14, 12)); }},
+        {200, [&]() { mouse(QEvent::MouseButtonRelease, walkerOnScreen.bottomRight() + QPointF(14, 12)); }},
+        {1800, [&]() {
+             expect(link.lockActive() && !link.lockByApp(), "camera's tracker: locked after the turn", link.lockMessage());
+             expect(camera.angleCommands >= anglesBeforeLock + 2, "camera's tracker: the camera turned to the box first (GAY and GAP)",
+                    QString::number(camera.angleCommands - anglesBeforeLock));
+             // The object is under the cross after the turn: the camera's own count for that is 672, 378.
+             expect(camera.gotFrames == 1 && camera.lastGot == QStringLiteral("02A0017A") && camera.sumConfirms >= 1,
+                    "camera's tracker: GOT at the camera's own middle (672, 378), then SUM confirm",
+                    QStringLiteral("GOT %1 (%2), SUM 01 %3").arg(camera.gotFrames).arg(camera.lastGot).arg(camera.sumConfirms));
+             expect(link.lockMessage().contains(QStringLiteral("camera's own tracker")) &&
+                        !link.lockMessage().contains(QStringLiteral("is following")),
+                    "camera's tracker: the text says whose tracker it is, and does not claim it follows", link.lockMessage());
+         }},
+        {3200, [&]() {
+             expect(link.lockFollowSeen(), "camera's tracker: the camera is seen turning by itself",
+                    QStringLiteral("%1 deg").arg(link.lockTurnedDeg()));
+             QQuickItem *line = findItem("vamaLockLine");
+             expect(line && line->property("text").toString().contains(QStringLiteral("(turned")),
+                    "camera's tracker: how far it turned is on the screen", line ? line->property("text").toString() : QString());
+             shot("15b_camera_tracker.png");
+             tap("vamaLockButton");
+         }},
+        {400, [&]() {
+             expect(!link.lockActive() && camera.sumStops >= 1, "camera's tracker: stopped with SUM stop",
                     QStringLiteral("SUM 00 %1").arg(camera.sumStops));
-             shot("15_lock_stopped.png");
+             shot("15c_lock_stopped.png");
+             QObject *modeBox = window->findChild<QObject *>(QStringLiteral("vamaLockModeBox"));
+             if (modeBox) {
+                 QMetaObject::invokeMethod(modeBox, "activated", Q_ARG(int, 0));
+             }
+             expect(link.lockMode() == QStringLiteral("app"), "camera's tracker: the app's own lock can be chosen again", link.lockMode());
+             camera.setWalkerVisible(false);
              // Indoors: the drone has no GPS lock. The laser still measures.
              vehicle.gps.set("lock", 0);
              link.fireLaser();
@@ -694,7 +1019,63 @@ int main(int argc, char *argv[])
              link.setEnabled(false);
          }},
         {600, [&]() { shot("6_camera_off.png"); openAppSettings(); }},
-        {1000, [&]() { checkAppSettings(); }},
+        {1000, [&]() {
+             checkAppSettings();
+             if (settingsWindow) {
+                 settingsWindow->close();
+             }
+             // QGC's warning texts (client video of test build 6): indoors, no GPS, a pre-arm error.
+             link.setEnabled(true);
+             global.vehicles.vehicle.position.set(false);
+             global.vehicles.vehicle.setPrearmError(QStringLiteral("PreArm: GPS blending unhealthy"));
+         }},
+        {500, [&]() {
+             QQuickItem *warnings = findItem("vamaVehicleWarnings");
+             QQuickItem *advice = findItem("vamaVehicleWarningsAdvice");
+             if (!warnings || !advice) {
+                 std::fprintf(stderr, "the warning texts did not load\n");
+                 ++g_problems;
+                 return;
+             }
+             // The box is drawn where its transform puts it.
+             const QRectF box = warnings->mapRectToScene(QRectF(0, 0, warnings->width(), warnings->height()));
+             const qreal middle = window->height() / 2.0;
+             expect(warnings->isVisible() && warnings->property("_small").toBool(),
+                    "warnings: with the video as the main view they are the small form", QString());
+             expect(box.top() > middle + window->height() * 0.08 && box.bottom() < window->height(),
+                    "warnings: they are in the lower part, clear of the middle of the picture",
+                    QStringLiteral("from %1 to %2 of %3").arg(box.top(), 0, 'f', 0).arg(box.bottom(), 0, 'f', 0).arg(window->height()));
+             expect(std::abs(box.center().x() - window->width() / 2.0) < 4, "warnings: still centred left to right",
+                    QString::number(box.center().x()));
+             expect(box.height() < window->height() * 0.15, "warnings: three short lines, not a third of the picture",
+                    QStringLiteral("%1 high").arg(box.height(), 0, 'f', 0));
+             expect(advice->property("text").toString() == QStringLiteral("Fix this before the vehicle can be armed."),
+                    "warnings: the advice is one short line", advice->property("text").toString());
+             shot("18_warnings_small.png");
+             window->setProperty("mapIsMain", true);
+         }},
+        {400, [&]() {
+             QQuickItem *warnings = findItem("vamaVehicleWarnings");
+             QQuickItem *advice = findItem("vamaVehicleWarningsAdvice");
+             if (!warnings || !advice) {
+                 return;
+             }
+             const QRectF box = warnings->mapRectToScene(QRectF(0, 0, warnings->width(), warnings->height()));
+             expect(!warnings->property("_small").toBool() && std::abs(box.center().y() - window->height() / 2.0) < window->height() * 0.06,
+                    "warnings: with the map as the main view they are as QGC shows them, in the middle",
+                    QStringLiteral("centre at %1").arg(box.center().y(), 0, 'f', 0));
+             expect(advice->property("text").toString().startsWith(QStringLiteral("The vehicle has failed a pre-arm check.")),
+                    "warnings: with QGC's own words", advice->property("text").toString());
+             shot("19_warnings_map.png");
+             window->setProperty("mapIsMain", false);
+             // With a GPS position and no pre-arm error there is nothing to show.
+             global.vehicles.vehicle.position.set(true);
+             global.vehicles.vehicle.setPrearmError(QString());
+         }},
+        {300, [&]() {
+             QQuickItem *warnings = findItem("vamaVehicleWarnings");
+             expect(warnings && !warnings->isVisible(), "warnings: nothing shows when there is nothing to warn of", QString());
+         }},
         {100, [&]() { QCoreApplication::quit(); }},
     };
     // Each step starts its delay when the step before it has finished. Timers

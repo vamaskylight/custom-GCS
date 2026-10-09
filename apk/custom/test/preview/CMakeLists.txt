@@ -23,6 +23,7 @@ add_executable(vama_preview
     ${CUSTOM_DIR}/src/Skydroid/SkydroidLink.h
     ${CUSTOM_DIR}/src/Skydroid/SkydroidTop.cc
     ${CUSTOM_DIR}/src/Skydroid/LaserGeo.cc
+    ${CUSTOM_DIR}/src/Skydroid/ObjectTracker.cc
     ${LINK_STUBS}/MultiVehicleManager.h
     ${LINK_STUBS}/Vehicle.h
     # The app's own resources: the QML override path and the icons.

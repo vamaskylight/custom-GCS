@@ -35,6 +35,7 @@
         <file alias="QGroundControl/FlyView/FlightDisplayViewVideoOutput.qml">src/FlightDisplayViewVideoOutput.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewCustomLayer.qml">src/FlyViewCustomLayer.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewTopRightColumnLayout.qml">src/FlyViewTopRightColumnLayout.qml</file>
+        <file alias="QGroundControl/FlyView/VehicleWarnings.qml">src/VehicleWarnings.qml</file>
         <file alias="QGroundControl/Toolbar/SelectViewDropdown.qml">src/SelectViewDropdown.qml</file>
     </qresource>
     <qresource prefix="/Custom/res">

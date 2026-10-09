@@ -23,10 +23,21 @@
 // Motion comes from a finger dragging on the video (setTouchMotion) or from
 // RC wheels, read from the RC channels the flight controller reports.
 //
-// Object lock (lockAt) uses the camera's own tracker, as VGCS M13 does. It
-// never worked on a C13 in VGCS, and TOP V1.1.6 lists GOT and SUM for the C12
-// only; V1.2.0 adds the C13 and the C14 Pro. The camera reports nothing about
-// the lock, so the gimbal angles are the only sign that it follows.
+// Object lock (lockAtBox). The app follows the object itself: it finds the
+// object in pictures of the video (ObjectTracker) and turns the camera with
+// speed commands until the object is under the cross. VGCS follows a Skydroid
+// camera the same way (its M14). The box on the screen is where the app sees
+// the object, so the operator can check it.
+//
+// The first lock (test builds 4 to 6) used the camera's own tracker (GOT and
+// SUM, as VGCS M13). In two field videos the V13 did not follow: a parked car
+// on 2026-10-06 and a walking person on 2026-10-09. Both times the camera
+// moved about 2.4 degrees left and 1.2 up right after the lock command, then
+// the object walked off and the camera only drifted. The camera reports
+// nothing about what it tracks. That way is kept as lock mode "camera", with
+// the lock point moved by that much (see kGotCentre in the .cc), to be tried
+// again. TOP V1.1.6 lists GOT and SUM for the C12 only; V1.2.0 adds the C13
+// and the C14 Pro.
 //
 // One shared instance; QML uses it as the singleton "SkydroidLink" from the
 // QGC module.
@@ -40,14 +51,17 @@
 #include <QtCore/QTimer>
 #include <QtCore/QVariantList>
 #include <QtCore/QVector>
+#include <QtGui/QImage>
 #include <QtNetwork/QHostAddress>
 #include <QtQmlIntegration/QtQmlIntegration>
 
+#include <deque>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "LaserGeo.h"
+#include "ObjectTracker.h"
 #include "SkydroidTop.h"
 
 class QJSEngine;
@@ -112,18 +126,41 @@ class SkydroidLink : public QObject
     Q_PROPERTY(double targetBearingDeg READ targetBearingDeg NOTIFY targetChanged)
     Q_PROPERTY(QString targetMessage READ targetMessage NOTIFY targetChanged)
 
-    // Object lock with the camera's own tracker (GOT and SUM). The camera never
-    // reports what it tracks, so the gimbal angles show whether it follows.
-    /// True while the camera turns to the object, before the lock starts.
+    // Object lock.
+    /// "app": the app follows the object in the video and turns the camera.
+    /// "camera": the camera's own tracker (GOT and SUM).
+    Q_PROPERTY(QString lockMode READ lockMode WRITE setLockMode NOTIFY settingsChanged)
+    Q_PROPERTY(QStringList lockModes READ lockModes CONSTANT)
+    Q_PROPERTY(QStringList lockModeNames READ lockModeNames CONSTANT)
+    /// True while a lock is being started: the app waits for its first picture,
+    /// or (camera mode) the camera turns to the object.
     Q_PROPERTY(bool lockBusy READ lockBusy NOTIFY lockChanged)
-    /// True while the camera is told to follow the object.
+    /// True while an object is locked.
     Q_PROPERTY(bool lockActive READ lockActive NOTIFY lockChanged)
+    /// True when this lock is the app's own (false: the camera's tracker).
+    Q_PROPERTY(bool lockByApp READ lockByApp NOTIFY lockChanged)
+    /// True while the app needs pictures of the video (lockPicture).
+    Q_PROPERTY(bool lockWantsPictures READ lockWantsPictures NOTIFY lockChanged)
+    /// True while the app sees the object in the pictures.
+    Q_PROPERTY(bool lockSeen READ lockSeen NOTIFY lockChanged)
+    /// The box around the object as the app sees it now, in parts of the picture (0 to 1): centre and size.
+    Q_PROPERTY(bool lockBoxValid READ lockBoxValid NOTIFY lockBoxChanged)
+    Q_PROPERTY(double lockBoxU READ lockBoxU NOTIFY lockBoxChanged)
+    Q_PROPERTY(double lockBoxV READ lockBoxV NOTIFY lockBoxChanged)
+    Q_PROPERTY(double lockBoxW READ lockBoxW NOTIFY lockBoxChanged)
+    Q_PROPERTY(double lockBoxH READ lockBoxH NOTIFY lockBoxChanged)
+    /// How far the object is from the cross, in degrees (the larger of across and up).
+    Q_PROPERTY(double lockOffDeg READ lockOffDeg NOTIFY lockBoxChanged)
+    /// For a field video: what the app measures and commands, in one line.
+    Q_PROPERTY(QString lockNumbers READ lockNumbers NOTIFY lockBoxChanged)
+    // Camera mode only: the camera never reports what it tracks, so the gimbal
+    // angles are all the app has.
     /// How far the camera has turned by itself since the lock settled, in degrees.
     Q_PROPERTY(double lockTurnedDeg READ lockTurnedDeg NOTIFY lockChanged)
     /// How far the camera moved in the first 2 s after the lock command, in degrees.
-    /// That first move is its tracker taking over. It does not count as following.
     Q_PROPERTY(double lockJumpDeg READ lockJumpDeg NOTIFY lockChanged)
-    /// True once the camera has turned by itself after the lock settled (it follows).
+    /// True once the camera has turned by itself after the lock settled. That is
+    /// not proof that it follows the object: on 2026-10-09 it was a slow drift.
     Q_PROPERTY(bool lockFollowSeen READ lockFollowSeen NOTIFY lockChanged)
     Q_PROPERTY(QString lockMessage READ lockMessage NOTIFY lockChanged)
 
@@ -222,8 +259,24 @@ public:
     double targetHorizontalM() const { return _target.horizontalRangeM; }
     double targetBearingDeg() const { return _target.bearingDeg; }
     QString targetMessage() const { return _targetMessage; }
+    static QStringList lockModes();
+    /// The names on screen, in the order of lockModes().
+    static QStringList lockModeNames();
+    QString lockMode() const { return _lockMode; }
+    /// An unknown mode means "app". Changing the mode ends a lock.
+    void setLockMode(const QString &mode);
     bool lockBusy() const { return _lockBusy; }
     bool lockActive() const { return _lockActive; }
+    bool lockByApp() const { return _lockByApp; }
+    bool lockWantsPictures() const { return _lockByApp && (_lockBusy || _lockActive); }
+    bool lockSeen() const { return _lockSeen; }
+    bool lockBoxValid() const { return _lockBoxValid; }
+    double lockBoxU() const { return _lockBoxU; }
+    double lockBoxV() const { return _lockBoxV; }
+    double lockBoxW() const { return _lockBoxW; }
+    double lockBoxH() const { return _lockBoxH; }
+    double lockOffDeg() const { return _lockOffDeg; }
+    QString lockNumbers() const { return _lockNumbers; }
     double lockTurnedDeg() const { return _lockTurnedDeg; }
     double lockJumpDeg() const { return _lockJumpDeg; }
     bool lockFollowSeen() const { return _lockFollowSeen; }
@@ -249,12 +302,29 @@ public:
     /// Turn the camera to a point tapped on the video, then measure it with
     /// the laser. u and v run from 0 to 1 across and down the picture.
     Q_INVOKABLE void aimAndMeasure(double u, double v);
-    /// Lock on the object at a point of the video (u, v as for aimAndMeasure):
-    /// turn the camera to it, then tell the camera to follow it (GOT, then SUM
-    /// confirm), and measure it with the laser every few seconds. Moving the
-    /// camera by hand ends the lock.
+    /// Lock on the object in a box of the video: its centre u, v (as for
+    /// aimAndMeasure) and its size w, h, all in parts of the picture.
+    ///  - Mode "app": the app follows the object in the pictures it is given
+    ///    (lockPicture) and turns the camera so the object comes under the
+    ///    cross and stays there.
+    ///  - Mode "camera": the camera turns to the point and is told to follow
+    ///    it (GOT, then SUM confirm).
+    /// The object is measured with the laser every few seconds while it is
+    /// under the cross. Moving the camera by hand ends the lock.
+    Q_INVOKABLE void lockAtBox(double u, double v, double w, double h);
+    /// The same with a box of the usual size (a tap).
     Q_INVOKABLE void lockAt(double u, double v);
     Q_INVOKABLE void stopLock();
+    /// A picture of the video for the lock (mode "app"), about 10 times a
+    /// second while lockWantsPictures is true. The picture itself may be a
+    /// part of the image (black bars beside a 5:4 thermal picture): its left
+    /// top corner and size, in parts of the image.
+    Q_INVOKABLE void lockPicture(const QImage &image, double pictureX, double pictureY, double pictureW,
+                                 double pictureH);
+    /// The speed to turn at, in degrees per second, for an object this far
+    /// from the cross: nothing inside half a degree, then in proportion, and
+    /// never faster than maxDps.
+    static double followSpeed(double offDeg, double maxDps);
     /// The picture's field of view now, in degrees, zoom included.
     void currentFov(double &horizontalDeg, double &verticalDeg) const;
     Q_INVOKABLE void takePhoto();
@@ -288,6 +358,7 @@ signals:
     void recordingChanged();
     void targetChanged();
     void lockChanged();
+    void lockBoxChanged();
     void rcChannelsChanged();
     void detectingWheelChanged();
     /// Result of detectWheel: the channel now used, or 0 when no wheel moved.
@@ -362,10 +433,20 @@ private:
     /// Where the aimed point is in the picture now, from the gimbal angles.
     void _aimPointInPicture(double &u, double &v) const;
     void _armLock(double u, double v);
-    /// Stops the lock (SUM stop) and shows the message.
+    /// Mode "camera": turn to the point, then GOT and SUM.
+    void _lockByCamera(double u, double v, bool wasLocked);
+    /// Mode "app": what to do with what the tracker found in a picture.
+    void _follow(const skydroid::track::Result &result, double left, double top, double width, double height);
+    /// How far the camera has turned since the picture was taken, from the speeds sent, in degrees.
+    void _turnedSincePicture(double &yawDeg, double &pitchDeg) const;
+    void _setFollowSpeed(double yawDps, double pitchDps);
+    void _clearMeasurement();
+    /// Stops the lock (the gimbal, or SUM stop) and shows the message.
     void _endLock(const QString &message);
     /// The operator moved the camera: the lock must not fight them.
     void _endLockByHand();
+    /// A zoom step changes the size of the object in the picture, which the app's tracker cannot take.
+    void _endAppLockForZoom();
     void _setLockMessage(const QString &message);
 
     // Motion
@@ -421,6 +502,34 @@ private:
     QElapsedTimer _aimSettled;
 
     // Object lock
+    QString _lockMode;
+    bool _lockByApp = false;
+    skydroid::track::ObjectTracker _tracker;
+    double _pendingU = 0.5;   // the box to lock, until the first picture comes
+    double _pendingV = 0.5;
+    double _pendingW = 0.0;   // 0: the usual size
+    double _pendingH = 0.0;
+    bool _lockSeen = false;
+    bool _lockBoxValid = false;
+    double _lockBoxU = 0.5;
+    double _lockBoxV = 0.5;
+    double _lockBoxW = 0.0;
+    double _lockBoxH = 0.0;
+    double _lockOffDeg = 0.0;
+    QString _lockNumbers;
+    QElapsedTimer _pictureAge;     // since the last picture for the tracker
+    double _pictureRate = 10.0;    // pictures a second, lately
+    QElapsedTimer _lockLost;       // since the object was last seen
+    double _followYawDps = 0.0;    // the speeds wanted now: right is +, up is +
+    double _followPitchDps = 0.0;
+    QElapsedTimer _followLease;    // since those speeds were set
+    struct FollowSent
+    {
+        qint64 atMs = 0;
+        double yawDps = 0.0;
+        double pitchDps = 0.0;
+    };
+    std::deque<FollowSent> _followSent;  // the last second of them
     bool _lockBusy = false;
     bool _lockActive = false;
     bool _lockFollowSeen = false;

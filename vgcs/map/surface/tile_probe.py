@@ -1,8 +1,10 @@
-"""HTTP tile probe used by map startup health checks."""
+"""Tile probe used by map startup health checks: one tile of the map source, fetched or read."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, QRunnable, Signal
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QRunnable, QUrl, Signal
 from PySide6.QtGui import QImage
 
 from vgcs.map.native_tile_map import fetch_tile_http_bytes
@@ -66,7 +68,17 @@ class _TileProbeTask(QRunnable):
     def run(self) -> None:  # pragma: no cover - network dependent
         url = self._url
         try:
-            raw = fetch_tile_http_bytes(url, timeout_s=5.0)
+            if url.lower().startswith("file:"):
+                # The offline folder: its tile is a file. The HTTP fetch refused the
+                # address, and every start with an offline map logged
+                # "error:ValueError" for a folder that was fine (2026-10-09).
+                tile = Path(QUrl(url).toLocalFile())
+                if not tile.is_file():
+                    self._report("no_tile_file", f"url={url}")
+                    return
+                raw = tile.read_bytes()
+            else:
+                raw = fetch_tile_http_bytes(url, timeout_s=5.0)
             code = 200
             ctype = "image"
             if int(code) >= 400:

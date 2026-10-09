@@ -123,6 +123,10 @@ def install_ctrl_c_handler(app, win, *, tick_ms: int = 250) -> "QTimer | None":
 
 def main() -> int:
     _enable_crash_diagnostics()
+    # A run from source uses the PC's FFmpeg. Look for one before the video starts.
+    from vgcs.video.ffmpeg_locator import ensure_ffmpeg_on_path
+
+    ensure_ffmpeg_on_path()
     _apply_webengine_chromium_flags_from_env()
     # Must happen before QApplication to affect Qt layout metrics.
     apply_qt_scale_override()

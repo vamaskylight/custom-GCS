@@ -21,6 +21,8 @@ Window {
 
     // True hides everything over the video, so a check can read its pixels.
     property bool videoOnly: false
+    // True makes the map the main view (QGC's "full" state), as after a tap on the small map.
+    property bool mapIsMain: false
 
     Item {
         id:           mapHolder
@@ -54,6 +56,9 @@ Window {
                 Text { anchors.centerIn: parent; color: "white"; text: "QGC telemetry and compass"; font.pixelSize: 26 }
             }
 
+            // QGC's widget layer knows the map; its warning texts read it from here.
+            property var mapControl: fakeMap
+
             property QtObject totalToolInsets: QGCToolInsets {
                 leftEdgeTopInset:      toolStrip.width + _margin
                 leftEdgeCenterInset:   toolStrip.width + _margin
@@ -86,7 +91,7 @@ Window {
     QtObject {
         id: fakeMap
         property QtObject pipState: QtObject {
-            property string state:              "pip"
+            property string state:              window.mapIsMain ? "full" : "pip"
             readonly property string fullState: "full"
         }
         function addMapItem(item) { }
@@ -104,5 +109,18 @@ Window {
         layer.anchors.fill = widgetLayer
         layer.z = 2
         layer.visible = Qt.binding(function() { return !window.videoOnly })
+
+        // QGC's warning texts ("No GPS Lock for Vehicle", pre-arm errors), by QGC's
+        // own address and placed as FlyViewWidgetLayer.qml places them: in the
+        // middle of the widget layer. The app's override rule answers with the
+        // VAMA copy (VehicleWarnings.qml).
+        var warnings = Qt.createComponent("qrc:/qml/QGroundControl/FlyView/VehicleWarnings.qml")
+        if (warnings.status !== Component.Ready) {
+            console.error("LOAD ERROR: " + warnings.errorString())
+            return
+        }
+        var warningsItem = warnings.createObject(widgetLayer, {})
+        warningsItem.anchors.centerIn = widgetLayer
+        warningsItem.z = QGroundControl.zOrderTopMost
     }
 }

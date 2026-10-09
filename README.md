@@ -187,6 +187,22 @@ What is and is not protected: `DOCS/M16-SECURITY.md`. Tested against ArduCopter 
 
 
 
+### FFmpeg (for the camera video)
+
+VGCS shows the camera video and records it with FFmpeg, a separate program.
+`VGCS.exe` has FFmpeg inside. A run from source (`python -m vgcs`) uses the FFmpeg of the PC.
+
+- VGCS looks for `ffmpeg` on `PATH`, then in `build\ffmpeg` of this folder, in a `VGCS.exe` that ran on this PC, and in the usual install places.
+- Without FFmpeg the video area says "No video: FFmpeg is not installed on this PC", and the console says how to get it.
+- To get it, use one of these:
+  - `winget install Gyan.FFmpeg`, then open a new terminal.
+  - `py packaging\build_exe.py --ffmpeg-only`: downloads the FFmpeg that VGCS is tested with (9.0.2, 115 MB) into `build\ffmpeg`.
+  - Set `VGCS_FFMPEG_DIR` to the folder that holds `ffmpeg.exe`.
+
+The window title names what is running: the build of the exe (`build e3ee0d1 (date)`), or `source` and the commit for a run from source.
+
+
+
 ### Hardware (for this project)
 
 
@@ -576,6 +592,8 @@ GCS/                          # repository root
 | `ModuleNotFoundError: PySide6` / `pymavlink` | Activate `.venv` and run `pip install -r requirements.txt` again from repo root. |
 
 | `python` not found (Windows) | Use `py -3` or reinstall Python with PATH enabled. |
+
+| No camera video, the video area says FFmpeg is not installed | Install FFmpeg, see [FFmpeg (for the camera video)](#ffmpeg-for-the-camera-video). |
 
 | Linux: Qt/XCB errors | Install the `apt` packages listed in [Setup — Linux](#setup--linux). |
 

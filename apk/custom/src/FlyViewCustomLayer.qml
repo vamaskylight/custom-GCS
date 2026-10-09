@@ -11,7 +11,10 @@
 // The camera moves when a finger drags on the video (further = faster), or
 // with an RC wheel set up in the camera settings. A tap on the video measures
 // that object. After the lock button, a box drawn around an object (or a tap
-// on it) locks the camera on it.
+// on it) locks the camera on it: the app then follows the object in the video
+// and turns the camera itself, and the box on the screen is where the app sees
+// the object. (The camera's own tracker, the first way, did not follow on the
+// V13. It can still be chosen in the camera settings.)
 
 import QtQuick
 import QtQuick.Controls
@@ -44,9 +47,10 @@ Item {
     property bool  _lockPicking:   false
     property bool  _lockOn:        _link.lockActive || _link.lockBusy
     property string _lockHiddenMessage: ""
-    // The lock state in one line: the message, and how far the camera has turned by itself.
+    // The lock state in one line. With the camera's own tracker the gimbal angles
+    // are all the app has, so how far the camera has turned by itself is added.
     property string _lockStateText: _link.lockMessage +
-                                    (_link.lockActive ? "  " + qsTr("(turned %1°)").arg(_fmt(_link.lockTurnedDeg, 1)) : "")
+                                    ((_link.lockActive && !_link.lockByApp) ? "  " + qsTr("(turned %1°)").arg(_fmt(_link.lockTurnedDeg, 1)) : "")
     // Bottom hints are centred; this keeps them clear of the small map in the bottom corner.
     readonly property real _bottomTextMaxWidth: Math.max(ScreenTools.defaultFontPixelWidth * 24,
                                                          width - 2 * (parentToolInsets.leftEdgeBottomInset + _margin * 4))
@@ -437,7 +441,7 @@ Item {
                 font.pointSize:      ScreenTools.largeFontPointSize
                 font.bold:           true
                 text:                _link.aimBusy ? qsTr("Turning to the point...")
-                                   : (_link.lockBusy ? qsTr("Turning to the object...")
+                                   : (_link.lockBusy ? (_link.lockByApp ? qsTr("Locking...") : qsTr("Turning to the object..."))
                                    : ((_link.laserBusy && !laserBox._refreshing) ? qsTr("Measuring...")
                                    : (_link.laserValid ? qsTr("%1 m").arg(_fmt(_link.laserRangeM, 1)) : qsTr("No laser reading"))))
             }
@@ -490,6 +494,19 @@ Item {
                 font.bold:           true
                 font.pointSize:      ScreenTools.smallFontPointSize
                 text:                _lockStateText
+            }
+            // For a video of a field test: what the app measures and what it tells
+            // the camera, in one small line.
+            QGCLabel {
+                objectName:          "vamaLockNumbers"
+                width:               parent.width
+                visible:             _link.lockActive && _link.lockByApp && _link.lockNumbers !== ""
+                horizontalAlignment: Text.AlignHCenter
+                elide:               Text.ElideRight
+                color:               "white"
+                opacity:             0.75
+                font.pointSize:      ScreenTools.smallFontPointSize * 0.8
+                text:                _link.lockNumbers
             }
         }
 
@@ -592,7 +609,8 @@ Item {
             }
             lockBox.place(x, y, boxWidth, boxHeight)
             _root._lockPicking = false
-            _link.lockAt((x - r.x) / r.width, (y - r.y) / r.height)
+            // The box as parts of the picture: the app follows what is inside it.
+            _link.lockAtBox((x - r.x) / r.width, (y - r.y) / r.height, boxWidth / r.width, boxHeight / r.height)
         }
 
         // Where the picture is drawn: the same sizes QGC's video view uses
@@ -703,9 +721,11 @@ Item {
             }
         }
 
-        // The box around the object to lock: drawn with the finger, kept where
-        // it was picked while the camera turns, then on the centre mark while
-        // locked (the camera keeps the object there when it follows).
+        // The box around the object to lock: drawn with the finger. While the
+        // app follows the object, the box is where the app sees it, picture by
+        // picture, so the operator can check that it is on the object. With the
+        // camera's own tracker the app sees nothing: the box is kept where it
+        // was picked while the camera turns, then on the centre mark.
         Rectangle {
             id:           lockBox
             objectName:   "vamaLockBox"
@@ -718,7 +738,10 @@ Item {
             property real boxH:    tapSize
             readonly property real minSize: ScreenTools.defaultFontPixelHeight * 1.5
             readonly property real tapSize: ScreenTools.defaultFontPixelHeight * 4
-            readonly property bool centred: _link.lockActive && !drawing
+            readonly property bool centred: _link.lockActive && !_link.lockByApp && !drawing
+            readonly property bool followed: _link.lockByApp && _link.lockBoxValid && !drawing
+            readonly property bool notSeen:  followed && _link.lockActive && !_link.lockSeen
+            readonly property rect picture:  videoDrag._videoRect()
 
             function drawFrom(x0, y0, x1, y1) {
                 drawing = true
@@ -737,25 +760,29 @@ Item {
             }
 
             visible:      _link.enabled && (drawing || _lockOn)
-            width:        boxW
-            height:       boxH
-            x:            (centred ? videoDrag.width / 2 : cx) - width / 2
-            y:            (centred ? videoDrag.height / 2 : cy) - height / 2
+            width:        followed ? Math.max(minSize / 2, _link.lockBoxW * picture.width) : boxW
+            height:       followed ? Math.max(minSize / 2, _link.lockBoxH * picture.height) : boxH
+            x:            (followed ? picture.x + _link.lockBoxU * picture.width : (centred ? videoDrag.width / 2 : cx)) - width / 2
+            y:            (followed ? picture.y + _link.lockBoxV * picture.height : (centred ? videoDrag.height / 2 : cy)) - height / 2
             color:        "transparent"
-            border.color: qgcPal.colorOrange
+            border.color: notSeen ? "red" : qgcPal.colorOrange
             border.width: 3
 
-            Behavior on x { enabled: !lockBox.drawing && !lockBox.jump; NumberAnimation { duration: 300 } }
-            Behavior on y { enabled: !lockBox.drawing && !lockBox.jump; NumberAnimation { duration: 300 } }
+            // The box of a followed object moves with every picture: a short slide between two of them.
+            Behavior on x { enabled: !lockBox.drawing && !lockBox.jump; NumberAnimation { duration: lockBox.followed ? 90 : 300 } }
+            Behavior on y { enabled: !lockBox.drawing && !lockBox.jump; NumberAnimation { duration: lockBox.followed ? 90 : 300 } }
 
             QGCLabel {
+                objectName:               "vamaLockBoxLabel"
                 anchors.top:              parent.bottom
                 anchors.topMargin:        2
                 anchors.horizontalCenter: parent.horizontalCenter
                 visible:                  !lockBox.drawing
-                color:                    qgcPal.colorOrange
+                color:                    lockBox.notSeen ? "red" : qgcPal.colorOrange
                 font.bold:                true
-                text:                     _link.lockActive ? qsTr("LOCKED") : qsTr("TURNING")
+                text:                     _link.lockByApp ? (_link.lockBusy ? qsTr("LOCKING")
+                                                                            : (_link.lockSeen ? qsTr("LOCKED") : qsTr("NOT SEEN")))
+                                                          : (_link.lockActive ? qsTr("LOCKED") : qsTr("TURNING"))
             }
         }
 
@@ -1119,6 +1146,23 @@ Item {
                         }
                         onActivated:      (index) => { _link.maxSpeed = settingsPopup._speeds[index] }
                     }
+
+                    QGCLabel { text: qsTr("Object lock"); Layout.preferredWidth: settingsPopup._labelWidth }
+                    QGCComboBox {
+                        objectName:       "vamaLockModeBox"
+                        Layout.fillWidth: true
+                        model:            _link.lockModeNames
+                        currentIndex:     Math.max(0, _link.lockModes.indexOf(_link.lockMode))
+                        onActivated:      (index) => { _link.lockMode = _link.lockModes[index] }
+                    }
+                }
+                QGCLabel {
+                    Layout.fillWidth: true
+                    wrapMode:         Text.WordWrap
+                    font.pointSize:   ScreenTools.smallFontPointSize
+                    text:             _link.lockMode === "camera"
+                                      ? qsTr("Object lock: the camera's own tracker is told to follow. The app cannot see what it follows. On the V13 it did not follow in the tests.")
+                                      : qsTr("Object lock: the app follows the object in the video and turns the camera. The box on the video is where the app sees the object.")
                 }
 
                 QGCCheckBox {

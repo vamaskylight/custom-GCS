@@ -94,6 +94,8 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidLink.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ObjectTracker.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ObjectTracker.h
     CACHE INTERNAL "" FORCE
 )
 

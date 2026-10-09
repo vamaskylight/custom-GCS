@@ -76,6 +76,7 @@ from vgcs.mission import Waypoint
 from vgcs.map import MapWidget
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
+from vgcs.app.build_info import window_title
 from vgcs.link.mavlink_thread import MavlinkThread
 from vgcs.video.pipeline import VideoPipeline
 from vgcs.video.widgets import CameraControlPanel
@@ -102,7 +103,8 @@ from vgcs.video.camera_control import (
 class MainWindow(MainWindowMixins, QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("VGCS — Ground Control Station")
+        # The title names the build, so a screenshot tells which VGCS is running.
+        self.setWindowTitle(window_title())
         self.resize(1024, 700)
         self.setMinimumSize(820, 560)
 

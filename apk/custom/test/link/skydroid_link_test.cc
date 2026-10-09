@@ -3,7 +3,8 @@
 // switch to another address when the configured one gives no angles, speed
 // motion from touch and RC wheels, the frames each button sends, the laser
 // sequence (laser module first, system address as fallback), the target
-// position rules, the object lock (turn, GOT, SUM confirm and stop), and the
+// position rules, the object lock (the app's own: pictures in, gimbal speeds
+// out; and the camera's own tracker: turn, GOT, SUM confirm and stop), and the
 // thermal colour mode setting.
 //
 // Every address used here is on this computer (127.0.0.x).
@@ -11,6 +12,7 @@
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QSettings>
+#include <QtGui/QImage>
 #include <QtNetwork/QNetworkDatagram>
 #include <QtNetwork/QUdpSocket>
 #include <QtTest/QSignalSpy>
@@ -19,6 +21,7 @@
 #include <cmath>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "LaserGeo.h"
 #include "MultiVehicleManager.h"
@@ -448,11 +451,12 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!_link->aimBusy() && !_link->laserBusy(), 5000);
         QVERIFY(_link->laserValid());
         QVERIFY(std::abs(_link->gimbalYaw() + 20.85) < 0.01);
+        _link->setLockMode("camera");
         _link->lockAt(0.25, 0.5);
         QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 5000);
         top::Options upper;
         upper.gClassUpperHeader = true;
-        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(640, 360, 1280, 720, upper)), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(_got(640, 360, upper)), 1, 1000);
         QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 5000);
         _link->stopLock();
     }
@@ -547,10 +551,11 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAY", 20.85, 30.0)) >= 1, 2000);
     }
 
-    // --- Object lock: turn to the object, GOT, SUM confirm -------------------------
+    // --- Object lock by the camera's own tracker (lock mode "camera"): turn to the object, GOT, SUM confirm ---
 
     void lockTurnsToTheObjectThenLocksIt()
     {
+        _link->setLockMode("camera");
         _camera->yaw = 0.0;
         _camera->pitch = -30.0;
         _camera->followAngles = true;
@@ -560,7 +565,7 @@ private slots:
         QVERIFY(_link->lockBusy());
         QVERIFY(!_link->lockActive());
         const std::string gay = top::buildGimbalAngleAxis("GAY", -20.85, 30.0);
-        const std::string got = top::buildGotTarget(640, 360);  // the object is under the cross now
+        const std::string got = _got(640, 360);  // the object is under the cross now
         const std::string confirm = top::buildSumTrack(true);
         QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 5000);
         QVERIFY(!_link->lockBusy());
@@ -591,13 +596,14 @@ private slots:
 
     void lockNearTheCentreLocksWithoutTurning()
     {
+        _link->setLockMode("camera");
         _camera->yaw = 3.0;
         _camera->pitch = -30.0;
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
         // 0.01 of the view is under 1.5 degrees: lock where it was picked (1280 x 720 frame).
         _link->lockAt(0.51, 0.49);
         QVERIFY(_link->lockActive());
-        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(653, 353)) == 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(_got(653, 353)) == 1, 1000);
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildSumTrack(true)) >= 1, 1000);
         QCOMPARE(_camera->countStartingWith("#tpUG6wGAY"), 0);
         QCOMPARE(_camera->countStartingWith("#tpUG6wGAP"), 0);
@@ -605,6 +611,7 @@ private slots:
 
     void lockAtAGimbalLimitPointsGotAtTheObject()
     {
+        _link->setLockMode("camera");
         // The C13 tilts up to +10 only, and turns to +-90. An object past a
         // limit stays off the cross after the turn, so GOT goes where it is.
         _camera->yaw = -80.0;
@@ -623,11 +630,12 @@ private slots:
         const int x = static_cast<int>(std::lround(u * 1280.0));
         const int y = static_cast<int>(std::lround(v * 720.0));
         QVERIFY(x > 760 && y < 300);
-        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(x, y)), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(_got(x, y)), 1, 1000);
     }
 
     void lockNeverStartsIfTheCameraDoesNotTurn()
     {
+        _link->setLockMode("camera");
         _camera->followAngles = false;  // the gimbal ignores the angles
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
         _link->lockAt(0.9, 0.5);
@@ -641,6 +649,7 @@ private slots:
 
     void lockWithoutGimbalAnglesSaysSo()
     {
+        _link->setLockMode("camera");
         _camera->answerGac = false;
         _link->lockAt(0.5, 0.5);
         QVERIFY(!_link->lockBusy() && !_link->lockActive());
@@ -649,8 +658,13 @@ private slots:
         QCOMPARE(_camera->countStartingWith("#tpUG8wGOT"), 0);
     }
 
-    void lockSeesTheCameraFollow()
+    // The camera turning by itself is all the app can see. It is told as a
+    // number, and never as "is following": in the field video of test build 6
+    // (2026-10-09) the V13 drifted 6 degrees in 17 s while the person it was
+    // locked on walked 18 degrees, and the app said "is following".
+    void lockSeesTheCameraTurnAndDoesNotCallItFollowing()
     {
+        _link->setLockMode("camera");
         _camera->yaw = 0.0;
         _camera->pitch = -30.0;
         _camera->trackDriftDps = 5.0;  // the camera follows a moving object
@@ -658,6 +672,7 @@ private slots:
         _link->lockAt(0.5, 0.5);
         QVERIFY(_link->lockActive());
         QVERIFY(!_link->lockFollowSeen());
+        QVERIFY(_link->lockMessage().contains("cannot see what the camera follows"));
         // The first 2 s do not count: what the camera does then is its tracker
         // taking over. It has already turned about 7 degrees here.
         QTest::qWait(1500);
@@ -665,7 +680,10 @@ private slots:
         QVERIFY(_link->lockTurnedDeg() < 0.1);
         QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 3000);
         QVERIFY(_link->lockTurnedDeg() > 0.8);
-        QVERIFY(_link->lockMessage().contains("following"));
+        QVERIFY(_link->lockMessage().contains("camera's own tracker"));
+        QVERIFY(!_link->lockMessage().contains("is following"));
+        QVERIFY(!_link->lockByApp());
+        QVERIFY(!_link->lockWantsPictures());
         _link->stopLock();
     }
 
@@ -674,6 +692,7 @@ private slots:
     // The app said "is following", and nothing was moving.
     void aJumpAtTheLockIsNotFollowing()
     {
+        _link->setLockMode("camera");
         _camera->yaw = 0.0;
         _camera->pitch = -30.0;
         _camera->lockJumpDeg = 2.6;
@@ -694,8 +713,9 @@ private slots:
         _link->stopLock();
     }
 
-    void followingAfterAJumpIsStillSeen()
+    void aTurnAfterAJumpIsStillSeen()
     {
+        _link->setLockMode("camera");
         _camera->yaw = 0.0;
         _camera->pitch = -30.0;
         _camera->lockJumpDeg = 2.6;
@@ -706,12 +726,14 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(_link->lockFollowSeen(), 5000);
         QVERIFY(_link->lockJumpDeg() > 2.6);          // the jump, plus what it followed in the first 2 s
         QVERIFY(_link->lockTurnedDeg() > 0.8);        // counted from after those 2 s
-        QVERIFY(_link->lockMessage().contains("following"));
+        QVERIFY(_link->lockMessage().contains("Check that the cross is on the object"));  // the advice stays
+        QVERIFY(!_link->lockMessage().contains("is following"));
         _link->stopLock();
     }
 
     void lockSaysSoWhenTheCameraDoesNotFollow()
     {
+        _link->setLockMode("camera");
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
         _link->lockAt(0.5, 0.5);  // the camera never turns by itself
         QVERIFY(_link->lockActive());
@@ -722,6 +744,7 @@ private slots:
 
     void lockSaysSoWhenTheAnglesStop()
     {
+        _link->setLockMode("camera");
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
         _link->lockAt(0.5, 0.5);
         QVERIFY(_link->lockActive());
@@ -732,6 +755,7 @@ private slots:
 
     void movingTheCameraByHandEndsTheLock()
     {
+        _link->setLockMode("camera");
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
         const std::string stop = top::buildSumTrack(false);
 
@@ -772,6 +796,7 @@ private slots:
 
     void turningTheLinkOffStopsTheLock()
     {
+        _link->setLockMode("camera");
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
         _link->lockAt(0.5, 0.5);
         QVERIFY(_link->lockActive());
@@ -783,6 +808,7 @@ private slots:
 
     void aNewLockReplacesTheOldOne()
     {
+        _link->setLockMode("camera");
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
         _link->lockAt(0.5, 0.5);
         QVERIFY(_link->lockActive());
@@ -790,7 +816,7 @@ private slots:
         _link->lockAt(0.505, 0.5);
         // The old lock stops first; the new GOT comes a moment later (VGCS waits 50 ms).
         QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 1000);
-        const std::string newGot = top::buildGotTarget(646, 360);
+        const std::string newGot = _got(646, 360);
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(newGot), 1, 1000);
         const int stopAt = _camera->indexOf(top::buildSumTrack(false));
         const int gotAt = _camera->indexOf(newGot);
@@ -800,6 +826,7 @@ private slots:
 
     void lockMeasuresAgainAndKeepsTheLastResultMeanwhile()
     {
+        _link->setLockMode("camera");
         _camera->slrE = "01F4";
         _camera->laserModuleDelayMs = 600;  // a slow laser makes the refresh window wide
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
@@ -819,18 +846,560 @@ private slots:
 
     void c14ProLockUsesItsHeader()
     {
+        _link->setLockMode("camera");
         _link->setModel("C14 Pro");
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
         _link->lockAt(0.5, 0.5);
         top::Options options;
         options.gClassUpperHeader = true;
-        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(640, 360, 1280, 720, options)), 1, 1000);
-        QVERIFY(_camera->countEqual(top::buildGotTarget(640, 360, 1280, 720, options)) == 1);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(_got(640, 360, options)), 1, 1000);
+        QVERIFY(_camera->countEqual(_got(640, 360, options)) == 1);
         QCOMPARE(_camera->countStartingWith("#tpUG8wGOT"), 0);
         // Changing the camera stops the lock, in the old camera's format.
         _link->setModel("C13");
         QVERIFY(!_link->lockActive());
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildSumTrack(false, options)) >= 1, 1000);
+    }
+
+    // The lock point for the camera's own tracker is not the middle of 1280 x 720.
+    // Both field videos (2026-10-06 and 2026-10-09) showed the V13 turn about
+    // 2.4 degrees left and 1.2 up right after GOT at (640, 360) with the object
+    // on the cross: 32 points across and 18 down. So the middle is sent as (672, 378).
+    void theCamerasOwnTrackerGetsThePointInItsOwnCount()
+    {
+        _link->setLockMode("camera");
+        _camera->yaw = 3.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGotTarget(672, 378, 1344, 756)), 1, 1000);
+        QCOMPARE(_camera->countEqual(top::buildGotTarget(640, 360)), 0);
+        // The far corner of the picture stays inside the camera's frame.
+        QCOMPARE(QString::fromStdString(_got(1280, 720)), QString::fromStdString(top::buildGotTarget(1312, 738, 1344, 756)));
+    }
+
+    // --- Object lock by the app (the usual lock mode): pictures in, gimbal speeds out -----
+
+    void theAppsOwnLockIsTheUsualOne()
+    {
+        QCOMPARE(_link->lockMode(), QString("app"));
+        QCOMPARE(SkydroidLink::lockModes(), QStringList({"app", "camera"}));
+        QCOMPARE(SkydroidLink::lockModeNames().size(), 2);
+        // An unknown mode is the app's own.
+        _link->setLockMode("camera");
+        _link->setLockMode("something else");
+        QCOMPARE(_link->lockMode(), QString("app"));
+        // The mode is kept for the next start.
+        _link->setLockMode("camera");
+        delete _link;
+        _link = new SkydroidLink;
+        QCOMPARE(_link->lockMode(), QString("camera"));
+    }
+
+    void followSpeedRule()
+    {
+        // Nothing inside half a degree, then 2.5 deg/s for each degree, in the direction of the object.
+        QCOMPARE(SkydroidLink::followSpeed(0.0, 40.0), 0.0);
+        QCOMPARE(SkydroidLink::followSpeed(0.5, 40.0), 0.0);
+        QCOMPARE(SkydroidLink::followSpeed(-0.5, 40.0), 0.0);
+        QCOMPARE(SkydroidLink::followSpeed(2.0, 40.0), 5.0);
+        QCOMPARE(SkydroidLink::followSpeed(-2.0, 40.0), -5.0);
+        QCOMPARE(SkydroidLink::followSpeed(10.0, 40.0), 25.0);
+        // Never faster than the limit.
+        QCOMPARE(SkydroidLink::followSpeed(30.0, 40.0), 40.0);
+        QCOMPARE(SkydroidLink::followSpeed(-30.0, 40.0), -40.0);
+        QCOMPARE(SkydroidLink::followSpeed(10.0, 12.0), 12.0);
+        QCOMPARE(SkydroidLink::followSpeed(10.0, -12.0), 12.0);
+        // Not a number: no motion.
+        QCOMPARE(SkydroidLink::followSpeed(std::nan(""), 40.0), 0.0);
+        QCOMPARE(SkydroidLink::followSpeed(5.0, std::nan("")), 0.0);
+    }
+
+    void appLockStartsOnTheFirstPictureAndNeedsNoAngles()
+    {
+        _camera->answerGac = false;  // the app's own lock does not use the gimbal angles
+        QVERIFY(!_link->lockWantsPictures());
+        _link->lockAtBox(0.7, 0.4, 0.06, 0.2);
+        QVERIFY(_link->lockBusy());
+        QVERIFY(!_link->lockActive());
+        QVERIFY(_link->lockByApp());
+        QVERIFY(_link->lockWantsPictures());
+        QVERIFY(!_link->lockBoxValid());
+        QCOMPARE(_link->lockMessage(), QString("Locking..."));
+        _link->lockPicture(_picture(0.7, 0.4), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QVERIFY(!_link->lockBusy());
+        QVERIFY(_link->lockSeen());
+        QVERIFY(_link->lockBoxValid());
+        QVERIFY(std::abs(_link->lockBoxU() - 0.7) < 0.005 && std::abs(_link->lockBoxV() - 0.4) < 0.005);
+        QVERIFY(std::abs(_link->lockBoxW() - 0.06) < 0.002 && std::abs(_link->lockBoxH() - 0.2) < 0.002);
+        QVERIFY(_link->lockMessage().contains("Turning the camera to the object"));
+        // The camera's own tracker is told to stop, and is never started.
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildSumTrack(false)) >= 1, 1000);
+        QTest::qWait(300);
+        QCOMPARE(_camera->countStartingWith("#TPUG8wGOT"), 0);
+        QCOMPARE(_camera->countStartingWith("#tpUG8wGOT"), 0);
+        QCOMPARE(_camera->countEqual(top::buildSumTrack(true)), 0);
+        QCOMPARE(_camera->countStartingWith("#tpUG6wGAY"), 0);  // no angle commands either
+        _link->stopLock();
+        QVERIFY(!_link->lockActive() && !_link->lockWantsPictures() && !_link->lockBoxValid());
+    }
+
+    void appLockTurnsTheCameraTowardsTheObject_data()
+    {
+        QTest::addColumn<double>("u");
+        QTest::addColumn<double>("v");
+        QTest::addColumn<int>("yawSign");
+        QTest::addColumn<int>("pitchSign");
+        // The speed commands count right and up as +.
+        QTest::newRow("object to the right") << 0.75 << 0.5 << 1 << 0;
+        QTest::newRow("object to the left") << 0.25 << 0.5 << -1 << 0;
+        QTest::newRow("object above") << 0.5 << 0.25 << 0 << 1;
+        QTest::newRow("object below") << 0.5 << 0.75 << 0 << -1;
+        QTest::newRow("right and below") << 0.7 << 0.7 << 1 << -1;
+    }
+
+    void appLockTurnsTheCameraTowardsTheObject()
+    {
+        QFETCH(double, u);
+        QFETCH(double, v);
+        QFETCH(int, yawSign);
+        QFETCH(int, pitchSign);
+        _link->lockAtBox(u, v, 0.08, 0.2);
+        _camera->clear();
+        _link->lockPicture(_picture(u, v), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        if (yawSign != 0) {
+            QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG2wGSY") >= 1, 1000);
+            const double yaw = _lastSpeed("GSY");
+            QVERIFY2(yaw * yawSign >= 10.0 && std::abs(yaw) <= 40.0, qPrintable(QString::number(yaw)));
+        }
+        if (pitchSign != 0) {
+            QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG2wGSP") >= 1, 1000);
+            const double pitch = _lastSpeed("GSP");
+            QVERIFY2(pitch * pitchSign >= 10.0 && std::abs(pitch) <= 40.0, qPrintable(QString::number(pitch)));
+        }
+        // An axis the object is centred on gets no speed.
+        if (yawSign == 0) {
+            QVERIFY(std::isnan(_lastSpeed("GSY")) || _lastSpeed("GSY") == 0.0);
+        }
+        if (pitchSign == 0) {
+            QVERIFY(std::isnan(_lastSpeed("GSP")) || _lastSpeed("GSP") == 0.0);
+        }
+        QVERIFY(_link->lockOffDeg() > 10.0);
+        _link->stopLock();
+        // The gimbal is stopped at the end of the lock.
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeed(0.0, 0.0)) >= 1, 1000);
+    }
+
+    // Between two pictures the object must not leave the tracker's reach: about
+    // half its own size. So a small object is turned to more slowly.
+    void appLockTurnsMoreSlowlyToASmallObject()
+    {
+        _link->lockAtBox(0.75, 0.5, 0.03, 0.2);  // 2.5 degrees wide, 20.85 degrees right of the cross
+        _camera->clear();
+        _link->lockPicture(_picture(0.75, 0.5, true, 12, 44), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        const double narrow = _lastSpeed("GSY");
+        // Half of 2.5 degrees, 10 pictures a second: 12.5 deg/s, not the 40 of a wide object.
+        QVERIFY2(narrow >= 10.0 && narrow <= 15.0, qPrintable(QString::number(narrow)));
+        _link->stopLock();
+        // The pitch limit comes from the box's height the same way.
+        _link->lockAtBox(0.5, 0.2, 0.2, 0.05);  // 2.3 degrees high, 14 degrees above the cross
+        _camera->clear();
+        _link->lockPicture(_picture(0.5, 0.2, true, 76, 10), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSP") > 0.0, 1000);  // the stop of the lock before is still on its way
+        const double low = _lastSpeed("GSP");
+        QVERIFY2(low >= 10.0 && low <= 15.0, qPrintable(QString::number(low)));
+        _link->stopLock();
+    }
+
+    void appLockNeverTurnsFasterThanFortyDegreesASecond()
+    {
+        // A wide box 25 degrees right of the cross: 2.5 x 25 would be 62 deg/s, and the box's
+        // width allows more than that. The limit of 40 holds.
+        _link->lockAtBox(0.8, 0.5, 0.3, 0.4);
+        _camera->clear();
+        _link->lockPicture(_picture(0.8, 0.5, true, 110, 80), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        const double speed = _lastSpeed("GSY");
+        QVERIFY2(std::abs(speed - 40.0) <= 0.5, qPrintable(QString::number(speed)));
+        _link->stopLock();
+    }
+
+    void appLockObeysTheReverseSettings()
+    {
+        // A camera whose yaw runs the other way is set so for the finger, and the lock uses the same setting.
+        _link->setReverseYaw(true);
+        _link->lockAtBox(0.75, 0.5, 0.08, 0.2);
+        _camera->clear();
+        _link->lockPicture(_picture(0.75, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG2wGSY") >= 1, 1000);
+        QVERIFY(_lastSpeed("GSY") <= -10.0);
+        _link->stopLock();
+    }
+
+    void appLockFollowsTheObjectFromPictureToPicture()
+    {
+        _link->lockAtBox(0.3, 0.5, 0.06, 0.2);
+        QSignalSpy boxes(_link, &SkydroidLink::lockBoxChanged);
+        _link->lockPicture(_picture(0.3, 0.5), 0.0, 0.0, 1.0, 1.0);
+        for (int i = 1; i <= 20; ++i) {
+            QTest::qWait(40);
+            _link->lockPicture(_picture(0.3 + 0.01 * i, 0.5 - 0.004 * i), 0.0, 0.0, 1.0, 1.0);
+            QVERIFY2(_link->lockSeen(), qPrintable(QString("picture %1: %2").arg(i).arg(_link->lockNumbers())));
+        }
+        QVERIFY(std::abs(_link->lockBoxU() - 0.5) < 0.01);
+        QVERIFY(std::abs(_link->lockBoxV() - 0.42) < 0.01);
+        QVERIFY(boxes.count() >= 20);  // the box on the screen moves with every picture
+        QVERIFY(_link->lockNumbers().contains("pictures/s"));
+        _link->stopLock();
+    }
+
+    void appLockHoldsStillWhenTheObjectIsUnderTheCrossAndMeasuresIt()
+    {
+        _camera->slrE = "01F4";  // 50 m
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _camera->clear();
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QVERIFY(_link->lockMessage().contains("The camera follows the object"));
+        QVERIFY(_link->lockOffDeg() < 0.5);
+        for (int i = 0; i < 12; ++i) {
+            QTest::qWait(90);
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        }
+        // No speed was ever asked for.
+        QVERIFY(std::isnan(_lastSpeed("GSY")) || _lastSpeed("GSY") == 0.0);
+        QVERIFY(std::isnan(_lastSpeed("GSP")) || _lastSpeed("GSP") == 0.0);
+        // The laser measures what is under the cross: the object.
+        QTRY_VERIFY_WITH_TIMEOUT(_link->laserValid(), 2000);
+        QCOMPARE(_link->laserRangeM(), 50.0);
+        QVERIFY(_link->targetValid());
+        _link->stopLock();
+    }
+
+    void appLockDoesNotMeasureWhileTheObjectIsOffTheCross()
+    {
+        // The laser measures the cross. With the object 12 degrees away it would measure something else.
+        _camera->slrE = "01F4";
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAtBox(0.65, 0.5, 0.06, 0.2);
+        _camera->clear();
+        for (int i = 0; i < 16; ++i) {
+            _link->lockPicture(_picture(0.65, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(90);
+        }
+        QVERIFY(_link->lockActive());
+        QCOMPARE(_camera->countEqual(top::buildSlrTrigger('E')), 0);
+        QVERIFY(!_link->laserValid());
+        _link->stopLock();
+    }
+
+    // The picture is old when the app gets it. What the camera has turned since is
+    // taken off, or it would run past the object: with the same picture coming
+    // again and again (a slow video), the speed asked for must come down.
+    void appLockTakesOffWhatTheCameraTurnedSinceThePicture()
+    {
+        _link->lockAtBox(0.56, 0.5, 0.2, 0.3);  // 5 degrees right; a wide box, so the speed limit is not in the way
+        _camera->clear();
+        _link->lockPicture(_picture(0.56, 0.5, true, 80, 70), 0.0, 0.0, 1.0, 1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG2wGSY") >= 1, 1000);
+        const double first = _lastSpeed("GSY");
+        QVERIFY2(std::abs(first - 12.5) <= 0.5, qPrintable(QString::number(first)));  // 5 degrees x 2.5
+        double lowest = first;
+        double highestLater = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            QTest::qWait(100);
+            _link->lockPicture(_picture(0.56, 0.5, true, 80, 70), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(20);
+            const double now = _lastSpeed("GSY");
+            lowest = std::min(lowest, now);
+            if (i >= 2) {
+                highestLater = std::max(highestLater, now);
+            }
+        }
+        // 0.3 s at about 10 deg/s has been turned, 3 of the 5 degrees: the speed
+        // falls to about half, and never comes back to the first. It does not
+        // fall to nothing either: a picture that still shows the object 5
+        // degrees off after that time means the camera is not there yet.
+        const QString speeds = QString("first %1, lowest %2, highest later %3").arg(first).arg(lowest).arg(highestLater);
+        QVERIFY2(lowest < 0.6 * first, qPrintable(speeds));
+        QVERIFY2(lowest > 0.2 * first, qPrintable(speeds));
+        QVERIFY2(highestLater < 0.85 * first, qPrintable(speeds));
+        _link->stopLock();
+    }
+
+    void appLockSaysWhenTheObjectIsNotSeenAndEndsAfterTwoSeconds()
+    {
+        _link->lockAtBox(0.7, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.7, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG2wGSY") >= 1, 1000);
+        QVERIFY(_lastSpeed("GSY") > 0.0);
+        // The object is gone from the picture.
+        _camera->clear();
+        QElapsedTimer gone;
+        gone.start();
+        _link->lockPicture(_picture(0.7, 0.5, false), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QVERIFY(!_link->lockSeen());
+        QVERIFY(_link->lockMessage().contains("not seen right now"));
+        // The camera waits: it does not keep turning after an object it does not see.
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeed(0.0, 0.0)) >= 1, 1000);
+        while (_link->lockActive() && gone.elapsed() < 4000) {
+            QTest::qWait(90);
+            _link->lockPicture(_picture(0.7, 0.5, false), 0.0, 0.0, 1.0, 1.0);
+        }
+        QVERIFY(!_link->lockActive());
+        QVERIFY2(gone.elapsed() >= 1900 && gone.elapsed() < 3000, qPrintable(QString::number(gone.elapsed())));
+        QVERIFY(_link->lockMessage().contains("Lock lost"));
+        QVERIFY(!_link->lockWantsPictures());
+        QVERIFY(!_link->lockBoxValid());
+        const double yaw = _lastSpeed("GSY");
+        QVERIFY(std::isnan(yaw) || yaw == 0.0);
+    }
+
+    void appLockFindsTheObjectAgainWhenItComesBack()
+    {
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        for (int i = 0; i < 6; ++i) {
+            QTest::qWait(60);
+            _link->lockPicture(_picture(0.5, 0.5, false), 0.0, 0.0, 1.0, 1.0);  // hidden for a moment
+        }
+        QVERIFY(_link->lockActive() && !_link->lockSeen());
+        QTest::qWait(60);
+        _link->lockPicture(_picture(0.52, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockSeen());
+        QVERIFY(_link->lockMessage().contains("Locked. "));
+        QVERIFY(!_link->lockMessage().contains("not seen"));
+        _link->stopLock();
+    }
+
+    void appLockStopsTheCameraWhenThePicturesStop()
+    {
+        _link->lockAtBox(0.7, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.7, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG2wGSY") >= 1, 1000);
+        // No more pictures (the video froze): within half a second the camera is told to stop.
+        _camera->clear();
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeed(0.0, 0.0)) >= 1, 900);
+        QVERIFY(_link->lockActive());
+        const int speedFrames = _camera->countStartingWith("#TPUG2wGSY2") + _camera->countStartingWith("#TPUG2wGSY1");
+        QTest::qWait(600);
+        QCOMPARE(_camera->countStartingWith("#TPUG2wGSY2") + _camera->countStartingWith("#TPUG2wGSY1"), speedFrames);
+        // After three seconds without a picture the lock ends and says why.
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->lockActive(), 4000);
+        QVERIFY(_link->lockMessage().contains("the video stopped"));
+    }
+
+    void appLockRefusesAPlainBox()
+    {
+        QImage plain(384, 216, QImage::Format_Grayscale8);
+        plain.fill(120);
+        _link->lockAtBox(0.5, 0.5, 0.1, 0.2);
+        _link->lockPicture(plain, 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(!_link->lockActive() && !_link->lockBusy());
+        QVERIFY(_link->lockMessage().contains("plain area"));
+        QVERIFY(!_link->lockWantsPictures());
+    }
+
+    void appLockTakesAColourPictureAndBlackBarsBesideIt()
+    {
+        // The thermal picture is 5:4 with black bars: the picture is the middle 0.6 of the image here.
+        const QImage inner = _picture(0.7, 0.4, true, 22, 44, 320, 256);
+        QImage wide(533, 256, QImage::Format_RGB32);
+        wide.fill(Qt::black);
+        const int left = (533 - 320) / 2;
+        for (int y = 0; y < 256; ++y) {
+            for (int x = 0; x < 320; ++x) {
+                const int g = inner.constScanLine(y)[x];
+                wide.setPixel(left + x, y, qRgb(g, g, g));
+            }
+        }
+        _link->lockAtBox(0.7, 0.4, 0.07, 0.17);
+        _link->lockPicture(wide, left / 533.0, 0.0, 320.0 / 533.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QVERIFY2(std::abs(_link->lockBoxU() - 0.7) < 0.01 && std::abs(_link->lockBoxV() - 0.4) < 0.01,
+                 qPrintable(QString("%1, %2").arg(_link->lockBoxU()).arg(_link->lockBoxV())));
+        // 0.2 of the picture right of the cross, not 0.2 of the image.
+        QVERIFY(std::abs(_link->lockOffDeg() - 0.2 * 83.4) < 1.0);
+        _link->stopLock();
+    }
+
+    // What the app really gets: a colour image, four bytes a point, with black bars beside the
+    // picture (the thermal picture is 5:4). The object must be followed in it, so the tracker
+    // has to read the points with their real size and look where the picture is in the image.
+    void appLockFollowsAColourObjectInAnImageWithBlackBars()
+    {
+        const int barLeft = (533 - 320) / 2;
+        const auto framed = [barLeft](double u, double v) {
+            const QImage inner = _picture(u, v, true, 22, 44, 320, 256);
+            QImage wide(533, 256, QImage::Format_RGB32);
+            wide.fill(Qt::black);
+            for (int y = 0; y < 256; ++y) {
+                const uchar *row = inner.constScanLine(y);
+                QRgb *out = reinterpret_cast<QRgb *>(wide.scanLine(y));
+                for (int x = 0; x < 320; ++x) {
+                    // The object's light and dark blocks get colours of their own; the ground stays grey.
+                    const int g = row[x];
+                    out[barLeft + x] = g >= 225 ? qRgb(230, 60, 40) : (g <= 25 ? qRgb(30, 40, 150) : qRgb(g, g, g));
+                }
+            }
+            return wide;
+        };
+        const double left = barLeft / 533.0;
+        const double width = 320.0 / 533.0;
+        _link->lockAtBox(0.3, 0.5, 0.09, 0.2);
+        _link->lockPicture(framed(0.3, 0.5), left, 0.0, width, 1.0);
+        QVERIFY2(_link->lockActive(), qPrintable(_link->lockMessage()));
+        for (int i = 1; i <= 20; ++i) {
+            QTest::qWait(40);
+            _link->lockPicture(framed(0.3 + 0.01 * i, 0.5), left, 0.0, width, 1.0);
+            QVERIFY2(_link->lockSeen(), qPrintable(QString("picture %1: %2").arg(i).arg(_link->lockNumbers())));
+        }
+        QVERIFY2(std::abs(_link->lockBoxU() - 0.5) < 0.015 && std::abs(_link->lockBoxV() - 0.5) < 0.015,
+                 qPrintable(QString("%1, %2").arg(_link->lockBoxU()).arg(_link->lockBoxV())));
+        _link->stopLock();
+    }
+
+    void appLockIgnoresPicturesItDidNotAskFor()
+    {
+        QSignalSpy boxes(_link, &SkydroidLink::lockBoxChanged);
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);  // no lock asked
+        QVERIFY(!_link->lockActive() && !_link->lockBusy());
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _link->lockPicture(QImage(), 0.0, 0.0, 1.0, 1.0);            // no picture at all
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 0.05, 0.05);  // a picture too small to see anything in
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 0.1, 1.0);    // too narrow: 38 points of the 64 it needs
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 0.1);    // too flat: 22 points of the 32 it needs
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->stopLock();
+        QVERIFY(!_link->lockBusy());
+        Q_UNUSED(boxes);
+    }
+
+    // On a device that gives the app no picture of the video, the lock must not
+    // wait for ever: the camera's own tracker is used, and the text says so.
+    void withNoPictureTheCamerasOwnTrackerIsUsed()
+    {
+        _camera->followAngles = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAtBox(0.75, 0.4, 0.06, 0.2);
+        QVERIFY(_link->lockBusy() && _link->lockByApp());
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->lockByApp(), 2500);
+        QVERIFY(_link->lockMessage().contains("No picture of the video reaches the app"));
+        QVERIFY(_link->lockMessage().contains("camera's own tracker"));
+        QVERIFY(!_link->lockWantsPictures());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(_got(640, 360)) == 1, 1000);  // after the turn, under the cross
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildSumTrack(true)) >= 1, 1000);
+        _link->stopLock();
+    }
+
+    void withNoPictureAndNoAnglesTheLockSaysItCannot()
+    {
+        _camera->answerGac = false;
+        _link->lockAtBox(0.75, 0.4, 0.06, 0.2);
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->lockBusy(), 2500);
+        QVERIFY(!_link->lockActive());
+        QVERIFY(_link->lockMessage().contains("so it cannot lock"));
+        QCOMPARE(_camera->countStartingWith("#tpUG8wGOT"), 0);
+    }
+
+    void movingTheCameraByHandEndsTheAppsLockToo()
+    {
+        const auto locked = [this]() {
+            _link->lockAtBox(0.6, 0.5, 0.06, 0.2);
+            _link->lockPicture(_picture(0.6, 0.5), 0.0, 0.0, 1.0, 1.0);
+            return _link->lockActive();
+        };
+        // A finger on the video: the finger's speed goes out, not the lock's.
+        QVERIFY(locked());
+        _link->setTouchMotion(-0.8, 0.0);
+        QVERIFY(!_link->lockActive());
+        QVERIFY(_link->lockMessage().contains("moved"));
+        _camera->clear();
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") < 0.0, 1000);  // to the left, as the finger asks
+        _link->stopTouchMotion();
+        // A gimbal button.
+        QVERIFY(locked());
+        _link->center();
+        QVERIFY(!_link->lockActive());
+        // A tap to measure another point.
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        QVERIFY(locked());
+        _link->aimAndMeasure(0.7, 0.5);
+        QVERIFY(!_link->lockActive());
+        _link->stopGimbal();
+        // An RC wheel.
+        _link->setWheelYawChannel(10);
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->aimBusy(), 10000);
+        QVERIFY(locked());
+        _camera->clear();
+        _vehicle.sendRc(_rc(10, 1900));
+        QVERIFY(!_link->lockActive());
+        // The wheel's speed goes out, not the lock's.
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeedAxis("GSY", 20.0)) >= 1, 2000);
+        _vehicle.sendRc(_rc(10, 1500));
+        // Turning the link off.
+        QVERIFY(locked());
+        _link->setEnabled(false);
+        QVERIFY(!_link->lockActive() && !_link->lockWantsPictures());
+    }
+
+    void aZoomStepEndsTheAppsLock()
+    {
+        // The tracker knows the object at one size.
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        _link->zoom(1);
+        QVERIFY(!_link->lockActive());
+        QVERIFY(_link->lockMessage().contains("zoom was changed"));
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        _link->zoomHome();
+        QVERIFY(!_link->lockActive());
+        // The camera's own tracker is not ended by a zoom step, as before.
+        _link->setLockMode("camera");
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive());
+        _link->zoom(1);
+        QVERIFY(_link->lockActive());
+        _link->stopLock();
+    }
+
+    void aNewAppLockReplacesTheOldOne()
+    {
+        _link->lockAtBox(0.3, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.3, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        _link->lockAtBox(0.7, 0.3, 0.06, 0.2);
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->lockPicture(_picture(0.7, 0.3), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QVERIFY(std::abs(_link->lockBoxU() - 0.7) < 0.01 && std::abs(_link->lockBoxV() - 0.3) < 0.01);
+        _link->stopLock();
+    }
+
+    void aTapLocksWithABoxOfTheUsualSize()
+    {
+        _link->lockAt(0.5, 0.5);  // no box: a tap
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        // A square in points: 0.12 of the picture's height.
+        QVERIFY(std::abs(_link->lockBoxH() - 0.12) < 0.005);
+        QVERIFY(std::abs(_link->lockBoxW() * 384.0 - _link->lockBoxH() * 216.0) < 1.0);
+        _link->stopLock();
     }
 
     // --- RC wheels ---------------------------------------------------------------
@@ -1257,6 +1826,79 @@ private:
         SkydroidLink::setProbeTargets(hosts, ports);
         _link = new SkydroidLink;
         QVERIFY(_link->enabled());
+    }
+
+    /// The lock frame for the camera's own tracker for a point of the 1280 x 720
+    /// picture: the camera counts 32 points further across and 18 further down.
+    static std::string _got(int x, int y, const top::Options &options = {})
+    {
+        return top::buildGotTarget(x + 32, y + 18, 1344, 756, options);
+    }
+
+    /// The speed of the last GSY or GSP frame the camera got, in degrees per second. Not a number when none came.
+    double _lastSpeed(const char *tag) const
+    {
+        const QString prefix = QStringLiteral("#TPUG2w") + QLatin1String(tag);
+        for (int i = _camera->received.size() - 1; i >= 0; --i) {
+            const QString &frame = _camera->received.at(i);
+            if (frame.startsWith(prefix) && frame.size() >= prefix.size() + 2) {
+                bool ok = false;
+                const int raw = frame.mid(prefix.size(), 2).toInt(&ok, 16);
+                if (ok) {
+                    return (raw > 127 ? raw - 256 : raw) * 0.5;
+                }
+            }
+        }
+        return std::nan("");
+    }
+
+    /// A picture of the video for the app's lock: ground with a pattern, and an
+    /// object (light and dark blocks) with its centre at u, v of the picture.
+    static QImage _picture(double u, double v, bool objectThere = true, int objectW = 22, int objectH = 44,
+                           int width = 384, int height = 216)
+    {
+        QImage image(width, height, QImage::Format_Grayscale8);
+        quint32 state = 12345;
+        const auto next = [&state]() {
+            state = state * 1664525u + 1013904223u;
+            return static_cast<int>((state >> 16) & 0xff);
+        };
+        const int cell = 12;
+        const int columns = width / cell + 1;
+        std::vector<int> ground(columns * (height / cell + 1));
+        for (int &g : ground) {
+            g = 70 + next() % 90;
+        }
+        for (int y = 0; y < height; ++y) {
+            uchar *row = image.scanLine(y);
+            for (int x = 0; x < width; ++x) {
+                row[x] = static_cast<uchar>(ground[(y / cell) * columns + x / cell]);
+            }
+        }
+        if (objectThere) {
+            const int block = 4;
+            const int blockColumns = objectW / block + 1;
+            std::vector<int> blocks(blockColumns * (objectH / block + 1));
+            quint32 objectState = 777;
+            for (int &b : blocks) {
+                objectState = objectState * 1664525u + 1013904223u;
+                b = ((objectState >> 16) & 1) ? 230 : 20;
+            }
+            const int left = static_cast<int>(std::lround(u * width - objectW / 2.0));
+            const int top = static_cast<int>(std::lround(v * height - objectH / 2.0));
+            for (int y = 0; y < objectH; ++y) {
+                if (top + y < 0 || top + y >= height) {
+                    continue;
+                }
+                uchar *row = image.scanLine(top + y);
+                for (int x = 0; x < objectW; ++x) {
+                    if (left + x >= 0 && left + x < width) {
+                        row[left + x] = static_cast<uchar>(blocks[(y / block) * blockColumns + x / block]);
+                    }
+                }
+            }
+        }
+        return image;
     }
 
     static QVector<int> _rc(int channel, int value)

@@ -38,7 +38,9 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # Each test: its own .cc file plus the source file it checks.
 $tests = @(
     @{ Name = 'skydroid_top_test'; Source = 'SkydroidTop.cc' },
-    @{ Name = 'laser_geo_test'; Source = 'LaserGeo.cc' }
+    @{ Name = 'laser_geo_test'; Source = 'LaserGeo.cc' },
+    @{ Name = 'object_tracker_test'; Source = 'ObjectTracker.cc' },
+    @{ Name = 'object_tracker_walk_test'; Source = 'ObjectTracker.cc' }
 )
 
 $failed = 0
@@ -46,7 +48,7 @@ foreach ($t in $tests) {
     $exe = Join-Path $OutDir "$($t.Name).exe"
     $saved = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & $Compiler -std=c++17 -O1 -Wall -Wextra -Werror -I $SrcDir `
+    & $Compiler -std=c++17 -O2 -Wall -Wextra -Werror -I $SrcDir `
         (Join-Path $TestDir "$($t.Name).cc") (Join-Path $SrcDir $t.Source) -o $exe | Out-Host
     $compileCode = $LASTEXITCODE
     $ErrorActionPreference = $saved
