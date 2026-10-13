@@ -1,0 +1,2 @@
+module QGroundControl.Viewer3D
+singleton QGCViewer3DManager 1.0 QGCViewer3DManager.qml

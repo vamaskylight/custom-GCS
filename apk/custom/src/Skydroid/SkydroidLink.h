@@ -39,6 +39,19 @@
 // again. TOP V1.1.6 lists GOT and SUM for the C12 only; V1.2.0 adds the C13
 // and the C14 Pro.
 //
+// Marked objects (ObjectMarks). While the lock button waits for an object, the
+// app marks the people and vehicles it finds in the video. Such a mark is some
+// tenths of a second old when the operator taps it, and a car has driven on by
+// then. So the lock does not start on the newest picture with the old box: the
+// last pictures are kept (keepPictures), the tracker starts on the kept picture
+// of the moment the object was found in, and goes through the pictures since
+// (lockAtFound). The box is then on the object where it is now.
+//
+// Follow Me (ObjectFollow) flies the drone after the object of the app's lock.
+// For that the link says where the object is on the ground, for every picture
+// it is found in (objectPlaced): the camera's angle to the object, and the
+// drone's height above the ground there.
+//
 // One shared instance; QML uses it as the singleton "SkydroidLink" from the
 // QGC module.
 
@@ -295,7 +308,7 @@ public:
     bool lockBusy() const { return _lockBusy; }
     bool lockActive() const { return _lockActive; }
     bool lockByApp() const { return _lockByApp; }
-    bool lockWantsPictures() const { return _lockByApp && (_lockBusy || _lockActive); }
+    bool lockWantsPictures() const { return _keepPictures || (_lockByApp && (_lockBusy || _lockActive)); }
     bool lockSeen() const { return _lockSeen; }
     bool lockBoxValid() const { return _lockBoxValid; }
     double lockBoxU() const { return _lockBoxU; }
@@ -346,6 +359,20 @@ public:
     Q_INVOKABLE void lockAtBox(double u, double v, double w, double h);
     /// The same with a box of the usual size (a tap).
     Q_INVOKABLE void lockAt(double u, double v);
+    /// While true, the last pictures given with lockPicture are kept (some two
+    /// seconds of them, and lockWantsPictures is true), so that a lock can start
+    /// on a picture of a moment ago. ObjectMarks turns this on while it marks objects.
+    void keepPictures(bool keep);
+    bool keepsPictures() const { return _keepPictures; }
+    /// The clock the kept pictures are timed with, in milliseconds.
+    qint64 pictureClockMs() const { return _pictureClock.elapsed(); }
+    /// The time of the newest kept picture on that clock, or -1 when none is kept.
+    qint64 newestKeptPictureMs() const { return _kept.empty() ? -1 : _kept.back().atMs; }
+    /// Lock on an object the app found in a picture taken at atMs of the picture
+    /// clock: the box it had then, as for lockAtBox. In mode "app" the lock starts
+    /// on the kept picture of that moment and goes through the pictures since.
+    /// With no kept picture of that moment (and in mode "camera") this is lockAtBox.
+    void lockAtFound(double u, double v, double w, double h, qint64 atMs);
     Q_INVOKABLE void stopLock();
     /// A picture of the video for the lock (mode "app"), about 10 times a
     /// second while lockWantsPictures is true. The picture itself may be a
@@ -359,6 +386,11 @@ public:
     static double followSpeed(double offDeg, double maxDps);
     /// The picture's field of view now, in degrees, zoom included.
     void currentFov(double &horizontalDeg, double &verticalDeg) const;
+    /// The field of view of the picture on the screen: the day lens (zoom
+    /// included) or, while the thermal picture shows, the thermal lens.
+    /// False when that lens is known only from a data sheet (the C12's and the
+    /// C13's thermal lens): good enough to turn the camera, not to place a point.
+    bool pictureFov(double &horizontalDeg, double &verticalDeg) const;
     Q_INVOKABLE void takePhoto();
     Q_INVOKABLE void toggleRecord();
     /// +1 zoom in, -1 zoom out (one step).
@@ -392,10 +424,17 @@ signals:
     void thermalPictureChanged();
     void lockChanged();
     void lockBoxChanged();
+    /// A zoom step was asked for: what was found in the pictures so far has another size now.
+    void zoomAsked();
     void rcChannelsChanged();
     void detectingWheelChanged();
     /// Result of detectWheel: the channel now used, or 0 when no wheel moved.
     void wheelDetected(const QString &axis, int channel);
+    /// The object of the app's lock, placed on the ground from a picture it was found in
+    /// (at most five a second). sigmaM: how sure the place is, one standard deviation.
+    /// belowM: how far the object is below the drone when the laser measured that, else
+    /// not a number (the ground is then taken as level). ageMs: how old the picture is.
+    void objectPlaced(double latDeg, double lonDeg, double sigmaM, double belowM, int ageMs);
 
 private slots:
     void _readPending();
@@ -476,11 +515,25 @@ private:
     void _armLock(double u, double v);
     /// Mode "camera": turn to the point, then GOT and SUM.
     void _lockByCamera(double u, double v, bool wasLocked);
+    /// Mode "app": one picture for the tracker (RGB888 or Grayscale8), with where the video
+    /// picture is inside it, in points. It starts a lock that waits, or finds the object
+    /// again. act false: the picture is an old one, and only the tracker learns from it.
+    void _trackPicture(const QImage &pixels, double left, double top, double width, double height, bool act);
+    void _keepPicture(const QImage &pixels, double left, double top, double width, double height);
     /// Mode "app": what to do with what the tracker found in a picture.
     void _follow(const skydroid::track::Result &result, double left, double top, double width, double height);
     /// How far the camera has turned since the picture was taken, from the speeds sent, in degrees.
     void _turnedSincePicture(double &yawDeg, double &pitchDeg) const;
     void _setFollowSpeed(double yawDps, double pitchDps);
+    /// Places the object of the app's lock on the ground, from the picture it was just found in:
+    /// where it is from the cross, in degrees (right and up are +), seen from where the camera
+    /// looks now, and the lens of that picture.
+    void _placeObject(double rightDeg, double upDeg, double hfovDeg, double vfovDeg);
+    /// A laser range on the locked object says how high the ground there is against the take-off point.
+    void _learnGround();
+    void _forgetGround();
+    /// True when the picture shows that the video has stopped (see kVideoStoppedMs).
+    bool _videoHasStopped(const QImage &pixels, int left, int top, int width, int height, int channels);
     void _clearMeasurement();
     /// Stops the lock (the gimbal, or SUM stop) and shows the message.
     void _endLock(const QString &message);
@@ -493,6 +546,8 @@ private:
     // Motion
     void _desiredSpeed(double &yawDps, double &pitchDps);
     void _sendSpeed(double yawDps, double pitchDps);
+    /// A turn to an angle on one axis ("GAY" or "GAP"). The camera goes on turning after it.
+    void _sendAngle(const char *axis, double degrees, double dps);
     void _sendStop();
     void _startMotionTimer();
     /// How far a speed-mode wheel is turned, -1 to 1, or 0 when it is off or has no fresh value.
@@ -508,6 +563,8 @@ private:
     QTimer _laserTimeoutTimer;
     QElapsedTimer _sinceReply;
     QElapsedTimer _sinceAttitude;
+    QElapsedTimer _cameraMovedAt;  // since the app last moved the camera, or saw its turn go on
+    QElapsedTimer _angleSentAt;    // since the last turn to an angle was asked for
     int _pollCount = 0;
 
     Endpoint _configured;
@@ -550,6 +607,19 @@ private:
     double _pendingV = 0.5;
     double _pendingW = 0.0;   // 0: the usual size
     double _pendingH = 0.0;
+    // The last pictures, for a lock that starts a moment ago (lockAtFound).
+    struct KeptPicture
+    {
+        QImage pixels;
+        double left = 0.0;  // where the video picture is inside it, in points
+        double top = 0.0;
+        double width = 0.0;
+        double height = 0.0;
+        qint64 atMs = 0;  // of _pictureClock
+    };
+    std::deque<KeptPicture> _kept;
+    bool _keepPictures = false;
+    QElapsedTimer _pictureClock;
     bool _lockSeen = false;
     bool _lockBoxValid = false;
     double _lockBoxU = 0.5;
@@ -571,6 +641,20 @@ private:
         double pitchDps = 0.0;
     };
     std::deque<FollowSent> _followSent;  // the last second of them
+    // For Follow Me: the object's place on the ground.
+    QElapsedTimer _placedAt;             // since the last place was given
+    bool _shotAtLockedObject = false;    // the laser shot under way is the lock's own, at the object
+    std::deque<double> _groundRises;     // from the last laser shots at the object, metres
+    bool _groundKnown = false;
+    double _groundRiseM = 0.0;           // the middle one of them
+    QElapsedTimer _groundAt;             // since the last of them
+    // A stopped video gives the same picture again and again.
+    quint64 _pictureSignature = 0;
+    QElapsedTimer _pictureSame;      // since the picture last changed
+    bool _pictureSameAngles = false;  // the gimbal angles then, if the camera sent them
+    double _pictureSameYaw = 0.0;
+    double _pictureSamePitch = 0.0;
+    bool _videoStopped = false;
     bool _lockBusy = false;
     bool _lockActive = false;
     bool _lockFollowSeen = false;

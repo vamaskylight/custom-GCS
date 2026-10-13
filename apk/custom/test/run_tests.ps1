@@ -40,7 +40,9 @@ $tests = @(
     @{ Name = 'skydroid_top_test'; Source = 'SkydroidTop.cc' },
     @{ Name = 'laser_geo_test'; Source = 'LaserGeo.cc' },
     @{ Name = 'object_tracker_test'; Source = 'ObjectTracker.cc' },
-    @{ Name = 'object_tracker_walk_test'; Source = 'ObjectTracker.cc' }
+    @{ Name = 'object_tracker_walk_test'; Source = 'ObjectTracker.cc' },
+    @{ Name = 'follow_guide_test'; Source = 'FollowGuide.cc' },
+    @{ Name = 'object_finder_test'; Source = 'ObjectFinder.cc' }
 )
 
 $failed = 0

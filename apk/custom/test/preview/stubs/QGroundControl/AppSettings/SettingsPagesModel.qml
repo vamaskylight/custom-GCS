@@ -32,6 +32,8 @@ ListModel {
         pageVisible: function() { return true }
     }
 
+    // On Android QGC hides this page (Viewer3DSettings); the VAMA plugin shows it again
+    // (CustomPlugin::init, client request 2026-10-08), so it is listed here.
     ListElement {
         name: qsTranslate("SettingsPages.json", "3D View")
         nameKey: "3D View"

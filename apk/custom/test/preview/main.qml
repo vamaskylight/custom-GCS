@@ -9,6 +9,7 @@ import QtQuick.Window
 
 import QGroundControl
 import QGroundControl.Controls
+import QGroundControl.Viewer3D
 
 Window {
     id:      window
@@ -23,6 +24,14 @@ Window {
     property bool videoOnly: false
     // True makes the map the main view (QGC's "full" state), as after a tap on the small map.
     property bool mapIsMain: false
+    // True is QGC's 3D view, as after the tool strip's "3D View" button (task H).
+    property bool view3D: false
+
+    Binding {
+        target:   QGCViewer3DManager
+        property: "displayMode"
+        value:    window.view3D ? QGCViewer3DManager.View3D : QGCViewer3DManager.Map
+    }
 
     Item {
         id:           mapHolder

@@ -61,6 +61,8 @@ public:
     // Overrides from QGCCorePlugin
 
     QGCOptions *options() final { return _options; }
+    /// Runs once the settings exist: shows QGC's 3D View settings page again on Android
+    void init() final;
     /// This allows you to override/hide QGC Application settings
     void adjustSettingMetaData(const QString &settingsGroup, FactMetaData &metaData, bool &userVisible) final;
     /// This modifies QGC colors palette to match possible custom corporate branding

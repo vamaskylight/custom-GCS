@@ -128,13 +128,72 @@ constexpr double kLockOnCrossDeg = 1.5;      // the laser measures the object on
 constexpr double kLockTurningDeg = 2.0;      // further off, the state says the camera is turning to it
 constexpr double kLockDefaultBox = 0.12;     // a tap: a square box of this share of the picture's height
 constexpr int kLockPictureMinSide = 64;      // a smaller picture is not looked at
+// A lock on a marked object starts on the picture the mark was found in. Pictures are kept
+// this long (a mark is not shown longer), and no more than this many of them. A kept picture
+// counts as "of that moment" when it is no further than this from it: at 14 pictures a
+// second the nearest one is at most 36 ms away.
+constexpr int kKeepPicturesMs = 2500;
+constexpr int kKeepPicturesMost = 40;
+constexpr int kFoundPictureGapMs = 120;
+// A video that has stopped still gives pictures: the last one, again and again. While the
+// camera turns, the picture must change. The same picture this long, while the gimbal turned
+// this far since it came (or, with no gimbal angles, while the app asks it to turn): the
+// video has stopped. A slow video shows a picture for less (a picture a second, or more).
+constexpr int kVideoStoppedMs = 500;
+constexpr double kVideoStoppedTurnDeg = 0.5;
+// A picture of one flat colour (each colour's bytes this near each other) is not a picture
+// of the scene: the video shows nothing (not started, a restart, or a phone that cannot copy
+// its video picture). The lock takes it as no picture at all.
+constexpr int kBlankPictureSpread = 2;
 
-// A point from the picture, without the laser (point mode "picture").
-// The thermal lens is known for the C14 Pro only (VGCS c14pro_default). On the
-// thermal picture of another camera the app can place the cross and nothing
-// else: a tap this near the middle counts as the cross.
+// Follow Me needs the locked object's place on the ground (objectPlaced), for the pictures
+// it is found in, at most five a second.
+constexpr int kPlaceEveryMs = 180;
+// How sure such a place is. The camera's angle to the object (the gimbal's angle, the lens,
+// the box) is good to about half a degree, and the height above the ground at the object to
+// about 2 m (the barometer, and ground that is not level). A laser range on the object takes
+// most of both away. No place is taken as surer than a metre.
+constexpr double kPlaceAngleSigmaDeg = 0.5;
+constexpr double kPlaceHeightSigmaM = 2.0;
+constexpr double kPlaceAngleSigmaLaserDeg = 0.25;
+constexpr double kPlaceHeightSigmaLaserM = 0.7;
+constexpr double kPlaceLeastSigmaM = 1.0;
+// How high the ground at the object is against the take-off point: the laser's range and the
+// camera's angle give how far the object is below the drone. The middle one of the last three
+// shots is taken, so one shot that missed the object changes nothing. It counts this long.
+// Only ground that is HIGHER than the take-off point is taken from the laser. Higher ground
+// means the object is nearer than level ground says, and that must be known. A shot that
+// passes the object and lands far behind it says "much lower ground", which would put the
+// object further away than it is, and the drone would be flown nearer to it.
+constexpr int kGroundShots = 3;
+constexpr int kGroundFreshMs = 15000;
+
+// A point from the picture is placed by the camera's angles of this moment, but the video
+// shows the scene a little late. So after the app moved the camera (a finger, a wheel, a
+// button, a turn to a tap, the lock), a tap for such a point waits this long.
+constexpr int kStillBeforePictureMs = 1000;
+// A turn to an angle goes on after its command (100 degrees take 3.3 s). For this long after
+// one, gimbal angles that still change count as that turn. Later changes are not the app's
+// doing (the drone turning under a steady camera) and do not hold a tap back.
+constexpr int kAngleTurnMaxMs = 5000;
+constexpr double kAngleTurnStepDeg = 0.1;
+
+// The thermal lens. The thermal stream is a picture of its own (the C13's is 640 x 512,
+// "hevc, 640x512" in the client's VGCS log of 2026-10-08), so a place in it is a place on
+// the thermal lens, and the day camera's zoom does not narrow it.
+// Known for the C14 Pro (VGCS c14pro_default). For the C13 only its data sheet gives it,
+// in two rows: "48.7 x 38.6" (used here) and "24.8 x 18.7", which is the lens of a
+// 256 x 192 sensor and stands on the C12's sheet too. Its 9.1 mm lens and 640 x 512 points
+// of 12 um give 45.8 x 37.3. The C12's sheet: 7 mm and 384 x 288 points of 12 um, so
+// 36.4 x 27.7. Those two are good enough to turn the camera (the laser measures where the
+// cross ends up) and to follow a locked object, not to place a point from the picture:
+// on their thermal picture that is the cross only. A tap this near the middle is the cross.
 constexpr double kC14ThermalFovHDeg = 32.84;
 constexpr double kC14ThermalFovVDeg = 26.35;
+constexpr double kC13ThermalFovHDeg = 48.7;
+constexpr double kC13ThermalFovVDeg = 38.6;
+constexpr double kC12ThermalFovHDeg = 36.4;
+constexpr double kC12ThermalFovVDeg = 27.7;
 constexpr double kCrossTapNorm = 0.06;
 
 // Object lock, mode "camera", as VGCS M13 does it (vgcs/skydroid/adapter.py and
@@ -230,6 +289,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _zoomOutTimer.setInterval(kZoomOutIntervalMs);
     _aimTimer.setInterval(100);
     _lockTimer.setInterval(kLockTickMs);
+    _pictureClock.start();
 
     connect(&_pollTimer, &QTimer::timeout, this, &SkydroidLink::_poll);
     connect(&_answerTimer, &QTimer::timeout, this, &SkydroidLink::_checkAnswering);
@@ -813,6 +873,10 @@ void SkydroidLink::_handleFrame(const top::DecodedFrame &frame, const Endpoint &
             }
             _setActive(from);
         }
+        if (_attitudeValid && _angleSentAt.isValid() && _angleSentAt.elapsed() < kAngleTurnMaxMs &&
+            std::max(std::abs(*frame.yaw - _yaw), std::abs(*frame.pitch - _pitch)) >= kAngleTurnStepDeg) {
+            _cameraMovedAt.start();  // the turn that was asked for is still going on
+        }
         _sinceAttitude.start();
         _yaw = *frame.yaw;
         _pitch = *frame.pitch;
@@ -1027,12 +1091,22 @@ void SkydroidLink::_motionTick()
     _motionTimer.stop();
 }
 
+void SkydroidLink::_sendAngle(const char *axis, double degrees, double dps)
+{
+    _sendGimbal(top::buildGimbalAngleAxis(axis, degrees, dps, _options));
+    _angleSentAt.start();
+    _cameraMovedAt.start();
+}
+
 void SkydroidLink::_sendSpeed(double yawDps, double pitchDps)
 {
     // Like VGCS: one frame per moving axis (GSY yaw, GSP pitch), never the
     // combined GSM, which dropped yaw on a C12 in the field.
     const int yawUnits = speedUnits(yawDps);
     const int pitchUnits = speedUnits(pitchDps);
+    if (yawUnits != 0 || pitchUnits != 0) {
+        _cameraMovedAt.start();
+    }
     // An axis that just stopped gets its zero on two ticks, so one dropped frame cannot leave it turning.
     if (yawUnits != 0) {
         _yawZeroRepeats = 0;
@@ -1078,14 +1152,14 @@ void SkydroidLink::center()
     _endLockByHand();
     // One axis per frame, like the speed commands (a combined frame dropped
     // yaw on a C12 in the field).
-    _sendGimbal(top::buildGimbalAngleAxis("GAY", 0.0, kAngleMoveDps, _options));
-    _sendGimbal(top::buildGimbalAngleAxis("GAP", 0.0, kAngleMoveDps, _options));
+    _sendAngle("GAY", 0.0, kAngleMoveDps);
+    _sendAngle("GAP", 0.0, kAngleMoveDps);
 }
 
 void SkydroidLink::centerYaw()
 {
     _endLockByHand();
-    _sendGimbal(top::buildGimbalAngleAxis("GAY", 0.0, kCenterYawDps, _options));
+    _sendAngle("GAY", 0.0, kCenterYawDps);
 }
 
 void SkydroidLink::pointDown()
@@ -1093,7 +1167,7 @@ void SkydroidLink::pointDown()
     _endLockByHand();
     // Pitch -90 is straight down: the C13 tilts from -90 to +10, and its
     // gimbal angles read negative when looking down (VGCS tries -90 first too).
-    _sendGimbal(top::buildGimbalAngleAxis("GAP", -90.0, kAngleMoveDps, _options));
+    _sendAngle("GAP", -90.0, kAngleMoveDps);
 }
 
 void SkydroidLink::currentFov(double &horizontalDeg, double &verticalDeg) const
@@ -1114,6 +1188,23 @@ void SkydroidLink::currentFov(double &horizontalDeg, double &verticalDeg) const
     const double zoomX = 1.0 + _zoomCount * kZoomPerStep;
     horizontalDeg = narrow(kC13AimFovHDeg, 1.0 / zoomX);
     verticalDeg = narrow(kC13AimFovVDeg, 1.0 / zoomX);
+}
+
+bool SkydroidLink::pictureFov(double &horizontalDeg, double &verticalDeg) const
+{
+    if (!_thermalPicture) {
+        currentFov(horizontalDeg, verticalDeg);
+        return true;
+    }
+    if (_isZoomStepCamera()) {
+        horizontalDeg = kC14ThermalFovHDeg;
+        verticalDeg = kC14ThermalFovVDeg;
+        return true;
+    }
+    const bool c12 = _model == QStringLiteral("C12");
+    horizontalDeg = c12 ? kC12ThermalFovHDeg : kC13ThermalFovHDeg;
+    verticalDeg = c12 ? kC12ThermalFovVDeg : kC13ThermalFovVDeg;
+    return false;
 }
 
 QStringList SkydroidLink::pointModes()
@@ -1149,7 +1240,7 @@ void SkydroidLink::_measureFromPicture(double u, double v)
 {
     // One result shows at a time: another point ends a lock, as a tap by laser does.
     if (_lockActive || _lockBusy) {
-        _endLock(tr("Lock stopped, because another point was measured."));
+        _endLock(tr("Lock stopped, because another point was tapped."));
     }
     _clearMeasurement();
     _measuredByPicture = true;
@@ -1160,22 +1251,22 @@ void SkydroidLink::_measureFromPicture(double u, double v)
     } else if (!_attitudeValid) {
         // Never place a point on assumed gimbal angles.
         whyNot = tr("No position: the camera sends no gimbal angles.");
+    } else if (_cameraMovedAt.isValid() && _cameraMovedAt.elapsed() < kStillBeforePictureMs) {
+        // The picture tapped is older than the angles: it shows where the camera looked before.
+        whyNot = tr("No position: the camera is still moving. Hold it still for a second, then tap again.");
     } else if (_sampleVehiclePose(view, whyNot)) {
         double hfov = 0.0;
         double vfov = 0.0;
-        currentFov(hfov, vfov);
-        bool lensKnown = true;
-        if (_thermalPicture) {
-            if (_isZoomStepCamera()) {
-                hfov = kC14ThermalFovHDeg;
-                vfov = kC14ThermalFovVDeg;
-            } else if (std::abs(u - 0.5) <= kCrossTapNorm && std::abs(v - 0.5) <= kCrossTapNorm) {
+        bool lensKnown = pictureFov(hfov, vfov);
+        if (!lensKnown) {
+            // The cross is the cross whatever the lens.
+            if (std::abs(u - 0.5) <= kCrossTapNorm && std::abs(v - 0.5) <= kCrossTapNorm) {
                 u = 0.5;
                 v = 0.5;
+                lensKnown = true;
             } else {
-                lensKnown = false;
                 whyNot = tr("On the thermal picture the app can place the cross only: the thermal lens of this camera "
-                            "is not known. Put the cross on the point, then tap the cross.");
+                            "is not known exactly. Put the cross on the point, then tap the cross.");
             }
         }
         if (lensKnown) {
@@ -1283,9 +1374,10 @@ void SkydroidLink::aimAndMeasure(double u, double v)
 
 double SkydroidLink::_setAimFor(double u, double v)
 {
+    // The lens of the picture tapped: on the thermal picture the thermal lens.
     double hfov = 0.0;
     double vfov = 0.0;
-    currentFov(hfov, vfov);
+    pictureFov(hfov, vfov);
     const double dyawImage = (std::clamp(u, 0.0, 1.0) - 0.5) * hfov;    // right is +
     const double dpitchImage = (std::clamp(v, 0.0, 1.0) - 0.5) * vfov;  // down is +
     const bool negate = kNegateImageYaw != _reverseTapYaw;
@@ -1301,8 +1393,8 @@ double SkydroidLink::_setAimFor(double u, double v)
 
 void SkydroidLink::_startTurn()
 {
-    _sendGimbal(top::buildGimbalAngleAxis("GAY", _aimYaw, kAngleMoveDps, _options));
-    _sendGimbal(top::buildGimbalAngleAxis("GAP", _aimPitch, kAngleMoveDps, _options));
+    _sendAngle("GAY", _aimYaw, kAngleMoveDps);
+    _sendAngle("GAP", _aimPitch, kAngleMoveDps);
     _aimResent = false;
     _aimElapsed.start();
     _aimSettled.invalidate();
@@ -1314,7 +1406,7 @@ void SkydroidLink::_aimPointInPicture(double &u, double &v) const
     // The aim maths backwards: the angle still to go, as a place in the picture.
     double hfov = 0.0;
     double vfov = 0.0;
-    currentFov(hfov, vfov);
+    pictureFov(hfov, vfov);
     const bool negate = kNegateImageYaw != _reverseTapYaw;
     const double yawToGo = _aimPointYaw - _yaw;
     const double dyawImage = negate ? -yawToGo : yawToGo;
@@ -1356,8 +1448,8 @@ void SkydroidLink::_aimTick()
     _aimSettled.invalidate();
     if (!_aimResent && _aimElapsed.elapsed() >= kAimResendMs) {
         _aimResent = true;
-        _sendGimbal(top::buildGimbalAngleAxis("GAY", _aimYaw, kAngleMoveDps, _options));
-        _sendGimbal(top::buildGimbalAngleAxis("GAP", _aimPitch, kAngleMoveDps, _options));
+        _sendAngle("GAY", _aimYaw, kAngleMoveDps);
+        _sendAngle("GAP", _aimPitch, kAngleMoveDps);
     }
     if (_aimElapsed.elapsed() >= kAimTimeoutMs) {
         _aimTimer.stop();
@@ -1463,8 +1555,11 @@ void SkydroidLink::lockAtBox(double u, double v, double w, double h)
     _lockJumpDeg = 0.0;
     _lockFollowSeen = false;
     _pictureAge.invalidate();
+    _pictureSame.invalidate();
+    _videoStopped = false;
     _lockLost.invalidate();
     _followSent.clear();
+    _forgetGround();  // another object: the ground under it is not known
     _lockElapsed.start();
     // The camera's own tracker must not pull against the app.
     _send(top::buildSumTrack(false, _options));
@@ -1534,6 +1629,30 @@ void SkydroidLink::_sendLockConfirm()
     }
 }
 
+// True for a picture of one flat colour (see kBlankPictureSpread).
+static bool pictureIsBlank(const QImage &pixels, int left, int top, int width, int height, int channels)
+{
+    const int x0 = std::clamp(left, 0, pixels.width());
+    const int y0 = std::clamp(top, 0, pixels.height());
+    const int x1 = std::clamp(left + width, x0, pixels.width());
+    const int y1 = std::clamp(top + height, y0, pixels.height());
+    int lowest[3] = {255, 255, 255};
+    int highest[3] = {0, 0, 0};
+    for (int y = y0; y < y1; ++y) {
+        const uchar *point = pixels.constScanLine(y) + static_cast<qsizetype>(x0) * channels;
+        for (int x = x0; x < x1; ++x, point += channels) {
+            for (int c = 0; c < channels; ++c) {
+                lowest[c] = std::min<int>(lowest[c], point[c]);
+                highest[c] = std::max<int>(highest[c], point[c]);
+                if (highest[c] - lowest[c] > kBlankPictureSpread) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void SkydroidLink::lockPicture(const QImage &image, double pictureX, double pictureY, double pictureW,
                                double pictureH)
 {
@@ -1547,8 +1666,6 @@ void SkydroidLink::lockPicture(const QImage &image, double pictureX, double pict
     if (pixels.isNull()) {
         return;
     }
-    const skydroid::track::Picture picture{pixels.constBits(), pixels.width(), pixels.height(),
-                                           static_cast<int>(pixels.bytesPerLine()), grey ? 1 : 3};
     // Where the video picture is inside this image.
     const double left = std::clamp(pictureX, 0.0, 1.0) * pixels.width();
     const double top = std::clamp(pictureY, 0.0, 1.0) * pixels.height();
@@ -1558,12 +1675,50 @@ void SkydroidLink::lockPicture(const QImage &image, double pictureX, double pict
         height < kLockPictureMinSide / 2) {
         return;  // too small to find anything in
     }
+    const int areaLeft = static_cast<int>(left);
+    const int areaTop = static_cast<int>(top);
+    const int areaWidth = static_cast<int>(width);
+    const int areaHeight = static_cast<int>(height);
+    const int channels = grey ? 1 : 3;
+    const bool blank = pictureIsBlank(pixels, areaLeft, areaTop, areaWidth, areaHeight, channels);
+    if (_keepPictures && !blank) {
+        _keepPicture(pixels, left, top, width, height);
+    }
+    if (!_lockByApp || !(_lockBusy || _lockActive)) {
+        return;  // no lock of the app's: the picture was for keeping only
+    }
+    if (blank && _lockBusy) {
+        // No picture of the scene yet. With none the camera's own tracker takes over (kLockPictureWaitMs).
+        return;
+    }
+    if (blank || _videoHasStopped(pixels, areaLeft, areaTop, areaWidth, areaHeight, channels)) {
+        // An old picture: the camera waits, as for an object not seen. With no new picture
+        // the lock ends (kLockNoPictureEndMs), so this picture does not count as one.
+        _setFollowSpeed(0.0, 0.0);
+        if (!_videoStopped) {
+            _videoStopped = true;
+            _lockSeen = false;  // the object is not seen anew: the box says so, and the laser waits
+            _lockMessage = tr("Locked, but the video has stopped. The camera waits.");
+            emit lockBoxChanged();
+            emit lockChanged();
+        }
+        return;
+    }
+    _videoStopped = false;
     if (_pictureAge.isValid()) {
         const double seconds = std::clamp(_pictureAge.elapsed() / 1000.0, 0.02, 1.0);
         _pictureRate = 0.8 * _pictureRate + 0.2 / seconds;
     }
     _pictureAge.start();
+    _trackPicture(pixels, left, top, width, height, true);
+}
 
+void SkydroidLink::_trackPicture(const QImage &pixels, double left, double top, double width, double height,
+                                 bool act)
+{
+    const skydroid::track::Picture picture{pixels.constBits(), pixels.width(), pixels.height(),
+                                           static_cast<int>(pixels.bytesPerLine()),
+                                           pixels.format() == QImage::Format_Grayscale8 ? 1 : 3};
     skydroid::track::Result result;
     if (_lockBusy) {
         skydroid::track::Box box;
@@ -1586,7 +1741,82 @@ void SkydroidLink::lockPicture(const QImage &image, double pictureX, double pict
     } else {
         result = _tracker.update(picture);
     }
-    _follow(result, left, top, width, height);
+    if (act) {
+        _follow(result, left, top, width, height);
+    }
+}
+
+void SkydroidLink::_keepPicture(const QImage &pixels, double left, double top, double width, double height)
+{
+    // Pictures of another size or shape (the thermal picture came on) are of another view.
+    if (!_kept.empty()) {
+        const KeptPicture &last = _kept.back();
+        if (last.pixels.size() != pixels.size() || last.pixels.format() != pixels.format() || last.left != left ||
+            last.top != top || last.width != width || last.height != height) {
+            _kept.clear();
+        }
+    }
+    KeptPicture kept;
+    kept.pixels = pixels.copy();  // its own bytes: the picture given may be gone by the time it is used
+    kept.left = left;
+    kept.top = top;
+    kept.width = width;
+    kept.height = height;
+    kept.atMs = _pictureClock.elapsed();
+    _kept.push_back(kept);
+    while (!_kept.empty() && (_kept.size() > static_cast<size_t>(kKeepPicturesMost) ||
+                              kept.atMs - _kept.front().atMs > kKeepPicturesMs)) {
+        _kept.pop_front();
+    }
+}
+
+void SkydroidLink::keepPictures(bool keep)
+{
+    if (keep == _keepPictures) {
+        return;
+    }
+    const bool wanted = lockWantsPictures();
+    _keepPictures = keep;
+    if (!keep) {
+        _kept.clear();
+    }
+    if (wanted != lockWantsPictures()) {
+        emit lockChanged();
+    }
+}
+
+void SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 atMs)
+{
+    if (_aimBusy || _lockBusy || !std::isfinite(u) || !std::isfinite(v) || !std::isfinite(w) || !std::isfinite(h)) {
+        return;
+    }
+    // The kept picture of that moment.
+    int from = -1;
+    qint64 nearest = kFoundPictureGapMs + 1;
+    for (size_t i = 0; i < _kept.size(); ++i) {
+        const qint64 gap = std::abs(_kept[i].atMs - atMs);
+        if (gap < nearest) {
+            nearest = gap;
+            from = static_cast<int>(i);
+        }
+    }
+    // Copies of the pictures since then (they share their bytes): a new lock may clear the kept ones.
+    const std::vector<KeptPicture> since(from < 0 ? _kept.end() : _kept.begin() + from, _kept.end());
+    lockAtBox(u, v, w, h);
+    if (since.empty() || !_lockByApp || !_lockBusy) {
+        return;  // mode "camera", no camera link, or no picture of that moment: locked as a drawn box is
+    }
+    // The tracker starts on the object where it was found, and follows it through the pictures
+    // since, as it would have then. The camera is turned for the last of them only: the newest.
+    for (size_t i = 0; i < since.size() && (_lockBusy || _lockActive); ++i) {
+        const KeptPicture &kept = since[i];
+        _trackPicture(kept.pixels, kept.left, kept.top, kept.width, kept.height, i + 1 == since.size());
+    }
+    if (_lockActive) {
+        // The newest of them is the last picture that came: if none follows, the lock ends
+        // as any lock does when the video stops (kLockNoPictureEndMs).
+        _pictureAge.start();
+    }
 }
 
 void SkydroidLink::_turnedSincePicture(double &yawDeg, double &pitchDeg) const
@@ -1609,6 +1839,50 @@ void SkydroidLink::_turnedSincePicture(double &yawDeg, double &pitchDeg) const
             break;
         }
     }
+}
+
+bool SkydroidLink::_videoHasStopped(const QImage &pixels, int left, int top, int width, int height, int channels)
+{
+    // A stopped video gives the very same bytes; a live one never does (its noise alone
+    // changes them). FNV-1a over the picture, without the bars beside it.
+    quint64 signature = 1469598103934665603ULL;
+    const int x0 = std::clamp(left, 0, pixels.width());
+    const int y0 = std::clamp(top, 0, pixels.height());
+    const int x1 = std::clamp(left + width, x0, pixels.width());
+    const int y1 = std::clamp(top + height, y0, pixels.height());
+    const qsizetype count = static_cast<qsizetype>(x1 - x0) * channels;
+    for (int y = y0; y < y1; ++y) {
+        const uchar *row = pixels.constScanLine(y) + static_cast<qsizetype>(x0) * channels;
+        for (qsizetype i = 0; i < count; ++i) {
+            signature = (signature ^ row[i]) * 1099511628211ULL;
+        }
+    }
+    if (!_pictureSame.isValid() || signature != _pictureSignature) {
+        _pictureSignature = signature;
+        _pictureSame.start();
+        _pictureSameAngles = _attitudeFresh();
+        _pictureSameYaw = _yaw;
+        _pictureSamePitch = _pitch;
+        return false;
+    }
+    if (_videoStopped) {
+        return true;  // still the same picture
+    }
+    if (!_pictureSameAngles && _attitudeFresh()) {
+        // The gimbal angles came after the picture: the turn counts from now.
+        _pictureSameAngles = true;
+        _pictureSameYaw = _yaw;
+        _pictureSamePitch = _pitch;
+    }
+    if (_lockBusy || _pictureSame.elapsed() < kVideoStoppedMs) {
+        return false;
+    }
+    if (_pictureSameAngles && _attitudeFresh()) {
+        // The gimbal turned, and the picture did not change.
+        return std::max(std::abs(_yaw - _pictureSameYaw), std::abs(_pitch - _pictureSamePitch)) >= kVideoStoppedTurnDeg;
+    }
+    // No gimbal angles: the app asks the camera to turn, and the picture does not change.
+    return _followYawDps != 0.0 || _followPitchDps != 0.0;
 }
 
 void SkydroidLink::_setFollowSpeed(double yawDps, double pitchDps)
@@ -1638,9 +1912,11 @@ void SkydroidLink::_follow(const skydroid::track::Result &result, double left, d
     QString message;
     if (result.found) {
         _lockLost.invalidate();
+        // The lens of the picture the object was found in: on the thermal picture the thermal
+        // lens (the day lens made the camera turn 1.7 to 1.9 times too fast there).
         double hfov = 0.0;
         double vfov = 0.0;
-        currentFov(hfov, vfov);
+        pictureFov(hfov, vfov);
         // Where the object is from the cross: right and up are +, as the speed commands count.
         const double right = (_lockBoxU - 0.5) * hfov;
         const double up = (0.5 - _lockBoxV) * vfov;
@@ -1653,6 +1929,7 @@ void SkydroidLink::_follow(const skydroid::track::Result &result, double left, d
         const double maxYaw = std::clamp(0.5 * _lockBoxW * hfov * _pictureRate, kFollowMinMaxDps, kFollowMaxDps);
         const double maxPitch = std::clamp(0.5 * _lockBoxH * vfov * _pictureRate, kFollowMinMaxDps, kFollowMaxDps);
         _setFollowSpeed(followSpeed(right - turnedYaw, maxYaw), followSpeed(up - turnedPitch, maxPitch));
+        _placeObject(right - turnedYaw, up - turnedPitch, hfov, vfov);
         message = _lockOffDeg > kLockTurningDeg ? tr("Locked. Turning the camera to the object...")
                                                 : tr("Locked. The camera follows the object.");
     } else {
@@ -1680,6 +1957,71 @@ void SkydroidLink::_follow(const skydroid::track::Result &result, double left, d
         _lockMessage = message;
         emit lockChanged();
     }
+}
+
+void SkydroidLink::_placeObject(double rightDeg, double upDeg, double hfovDeg, double vfovDeg)
+{
+    if (_placedAt.isValid() && _placedAt.elapsed() < kPlaceEveryMs) {
+        return;
+    }
+    // Never on old gimbal angles, and not without the drone's own place and height.
+    skydroid::geo::LaserInput view;
+    QString why;
+    const std::optional<double> height = _sampleHeight();
+    if (!_attitudeFresh() || !height || !_sampleVehiclePose(view, why)) {
+        return;
+    }
+    // The object's direction as a point of the picture the camera would give now. (What the
+    // camera has turned since the picture was taken is off already, as for its speeds.)
+    view.gimbalYawDeg = _yaw;
+    view.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
+    view.gimbalPitchDeg = _pitch;
+    view.videoXNorm = std::clamp(0.5 + rightDeg / hfovDeg, 0.0, 1.0);
+    view.videoYNorm = std::clamp(0.5 - upDeg / vfovDeg, 0.0, 1.0);
+    view.cameraHfovDeg = hfovDeg;
+    view.cameraVfovDeg = vfovDeg;
+    // The ground at the object: level with the take-off point, or as much higher as the laser found it.
+    const bool byLaser = _groundKnown && _groundAt.isValid() && _groundAt.elapsed() < kGroundFreshMs;
+    skydroid::geo::PictureInput input;
+    input.view = view;
+    input.heightAboveGroundM = *height - (byLaser ? std::max(0.0, _groundRiseM) : 0.0);
+    const skydroid::geo::PictureResult result = skydroid::geo::computePictureTarget(input);
+    if (result.why != skydroid::geo::PictureWhy::None) {
+        return;  // too flat a look, or too low: no place is better than a wrong one
+    }
+    // How far the place can be off: along the look, from the angle and from the height.
+    const double angleSigma = byLaser ? kPlaceAngleSigmaLaserDeg : kPlaceAngleSigmaDeg;
+    const double heightSigma = byLaser ? kPlaceHeightSigmaLaserM : kPlaceHeightSigmaM;
+    const double lookDown = std::max(1.0, result.lookDownDeg) * kPi / 180.0;
+    const double sigma = std::max(kPlaceLeastSigmaM, std::hypot(result.metresPerDegree * angleSigma, heightSigma / std::tan(lookDown)));
+    _placedAt.start();
+    emit objectPlaced(result.point.targetLatDeg, result.point.targetLonDeg, sigma,
+                      byLaser ? *height - _groundRiseM : std::nan(""), static_cast<int>(kFollowPictureAgeS * 1000.0));
+}
+
+void SkydroidLink::_learnGround()
+{
+    // The object is this far below the drone: the range along the look, and how steep the look is.
+    const double below = _laserRangeM * std::sin(_target.depressionDeg * kPi / 180.0);
+    _groundRises.push_back(*_shotHeightM - below);
+    while (_groundRises.size() > static_cast<size_t>(kGroundShots)) {
+        _groundRises.pop_front();
+    }
+    std::vector<double> sorted(_groundRises.begin(), _groundRises.end());
+    std::sort(sorted.begin(), sorted.end());
+    // The middle one. Of two, the lower: the one that brings the object less near.
+    _groundRiseM = sorted[(sorted.size() - 1) / 2];
+    _groundKnown = true;
+    _groundAt.start();
+}
+
+void SkydroidLink::_forgetGround()
+{
+    _groundRises.clear();
+    _groundKnown = false;
+    _groundRiseM = 0.0;
+    _groundAt.invalidate();
+    _placedAt.invalidate();
 }
 
 void SkydroidLink::_lockTick()
@@ -1865,6 +2207,9 @@ void SkydroidLink::_endLockByHand()
 
 void SkydroidLink::_endAppLockForZoom()
 {
+    // What was found, and the pictures kept, show the scene at the old size.
+    _kept.clear();
+    emit zoomAsked();
     // The app's tracker knows the object at one size: a zoom step changes it.
     if (_lockByApp && (_lockActive || _lockBusy)) {
         _endLock(tr("Lock stopped, because the zoom was changed. Lock the object again."));
@@ -2026,7 +2371,7 @@ void SkydroidLink::_sendWheelAngles()
         if (_wheelSent[a] && std::abs(*_wheelSent[a] - *_wheelTarget[a]) < kWheelAngleStepDeg) {
             continue;
         }
-        _sendGimbal(top::buildGimbalAngleAxis(tags[a], *_wheelTarget[a], kWheelApproachDps, _options));
+        _sendAngle(tags[a], *_wheelTarget[a], kWheelApproachDps);
         _wheelSent[a] = _wheelTarget[a];
     }
     _wheelSentAt.start();
@@ -2216,6 +2561,8 @@ void SkydroidLink::_fireLaser(bool keepLastResult)
     _laserFromE.reset();
     _laserFromD.reset();
 
+    // The lock's own shot goes to the object: it is under the cross and seen there.
+    _shotAtLockedObject = keepLastResult && _lockActive && _lockByApp && _lockSeen && _lockOffDeg <= kLockOnCrossDeg;
     // Pose and gimbal angles at the moment of the shot, not when the reply lands.
     _shotPose = skydroid::geo::LaserInput{};
     _shotPoseValid = _sampleVehiclePose(_shotPose, _shotPoseWhy);
@@ -2363,6 +2710,9 @@ void SkydroidLink::_computeTarget()
             _targetMessage = tr("The camera looks almost level, so this position is less accurate.");
         } else {
             _targetMessage.clear();
+        }
+        if (_target.ok && !_target.nearHorizon && _shotAtLockedObject && _lockActive && _lockByApp && _shotHeightM) {
+            _learnGround();
         }
     }
     emit targetChanged();

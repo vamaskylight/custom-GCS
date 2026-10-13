@@ -1,0 +1,5 @@
+# The network's two files must stay byte for byte as they came: the app checks
+# their hashes before it uses them (ObjectMarksNet.cc). The layer list is a text
+# file, and git would change its line ends on a Windows checkout without this.
+*.param binary
+*.bin binary

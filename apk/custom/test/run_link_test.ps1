@@ -1,10 +1,15 @@
 <#
 .SYNOPSIS
-Builds and runs the SkydroidLink host test (real Qt link code, fake camera).
+Builds and runs the host tests of the app's Qt code: the camera link with Follow Me
+and the marks on people and vehicles (real Qt code, fake camera, stand-in drone,
+stand-in network), the drone side of Follow Me (real MAVLink headers), and the object
+finder with its real network on pictures from the air.
 
 .DESCRIPTION
 Needs the Qt 6.11.1 MinGW desktop kit (C:\Qt\6.11.1\mingw_64), MinGW 13.1
 (C:\Qt\Tools\mingw1310_64), and CMake and Ninja from the Android SDK.
+The test with the real network also needs the ncnn library for this PC:
+    powershell -ExecutionPolicy Bypass -File apk\build_ncnn.ps1 -ForHost -Abis ''
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File apk\custom\test\run_link_test.ps1
@@ -53,8 +58,20 @@ $code = Invoke-Native (Join-Path $cmakeBin 'cmake.exe') @('--build', $build)
 if ($code -ne 0) { Write-Host 'ERROR: build failed.' -ForegroundColor Red; exit 1 }
 
 # QtTest output does not always reach a redirected console, so write it to a file.
-$result = Join-Path $build 'result.txt'
-Remove-Item -LiteralPath $result -ErrorAction SilentlyContinue
-$p = Start-Process -FilePath (Join-Path $build 'skydroid_link_test.exe') -ArgumentList @('-o', "$result,txt") -Wait -PassThru -NoNewWindow
-Get-Content -LiteralPath $result | Where-Object { $_ -match '^(FAIL|Totals)|failure location' } | ForEach-Object { Write-Host $_ }
-exit $p.ExitCode
+# follow_drone_test is there only when the MAVLink headers of an APK build were found,
+# marks_net_test only when the ncnn library was built for this PC.
+$failed = 0
+foreach ($test in 'skydroid_link_test', 'follow_drone_test', 'marks_net_test') {
+    $exe = Join-Path $build "$test.exe"
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Write-Host "$test was not built (see the configure output)." -ForegroundColor Yellow
+        continue
+    }
+    $result = Join-Path $build "result_$test.txt"
+    Remove-Item -LiteralPath $result -ErrorAction SilentlyContinue
+    $p = Start-Process -FilePath $exe -ArgumentList @('-o', "$result,txt") -Wait -PassThru -NoNewWindow
+    Write-Host "${test}:"
+    Get-Content -LiteralPath $result | Where-Object { $_ -match '^(FAIL|Totals)|failure location' } | ForEach-Object { Write-Host $_ }
+    $failed += $p.ExitCode
+}
+exit $failed

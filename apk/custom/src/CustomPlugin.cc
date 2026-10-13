@@ -5,6 +5,8 @@
 #include "QGCMAVLink.h"
 #include "AppSettings.h"
 #include "APMMavlinkStreamRateSettings.h"
+#include "SettingsManager.h"
+#include "Viewer3DSettings.h"
 
 #include <QtCore/QApplicationStatic>
 #include <QtQml/QQmlApplicationEngine>
@@ -43,6 +45,16 @@ CustomPlugin::CustomPlugin(QObject *parent)
 QGCCorePlugin *CustomPlugin::instance()
 {
     return _customPluginInstance();
+}
+
+void CustomPlugin::init()
+{
+    QGCCorePlugin::init();
+
+    // VAMA (client request 2026-10-08, task H): QGC 5.1.5 hides the whole "3D View"
+    // settings page on Android (Viewer3DSettings). It comes back here, so the 3D view
+    // can be tried on the remote control. Its switch: see adjustSettingMetaData.
+    SettingsManager::instance()->viewer3DSettings()->setUserVisible(true);
 }
 
 void CustomPlugin::_advancedChanged(bool changed)
@@ -85,6 +97,22 @@ void CustomPlugin::adjustSettingMetaData(const QString& settingsGroup, FactMetaD
         // must arrive 10 times a second, not QGC's default 2.
         if (metaData.name() == APMMavlinkStreamRateSettings::streamRateRCChannelsName) {
             metaData.setRawDefaultValue(10);
+            return;
+        }
+    } else if (settingsGroup == Viewer3DSettings::settingsGroup) {
+        // VAMA (task H): QGC turns the 3D view off on Android ("rendering is not yet
+        // reliable across Android GPUs and drivers") by hiding this switch, and a hidden
+        // switch also ignores a saved "on". The client asked for the 3D map, so the switch
+        // shows again, still off by default: a test, first on the ground. The 3D scene
+        // loads only when the operator presses "3D View".
+        if (metaData.name() == Viewer3DSettings::enabledName) {
+            userVisible = true;
+            return;
+        }
+        // Remote controls are short of memory, and the ground picture alone takes 64 MB
+        // or more. So the scene is dropped when the operator goes back to the map.
+        if (metaData.name() == Viewer3DSettings::keepSceneAliveName) {
+            metaData.setRawDefaultValue(false);
             return;
         }
     }

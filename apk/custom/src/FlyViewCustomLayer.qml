@@ -15,6 +15,12 @@
 // and turns the camera itself, and the box on the screen is where the app sees
 // the object. (The camera's own tracker, the first way, did not follow on the
 // V13. It can still be chosen in the camera settings.)
+//
+// Follow Me: while the app holds a lock, a follow button shows beside the lock
+// button. It asks first (what the drone will do, its two limits, and why it
+// cannot start when it cannot), then the drone flies after the locked object
+// (ObjectFollow). While it follows, its state is a line of the result box and
+// the button is green: a press stops it at once.
 
 import QtQuick
 import QtQuick.Controls
@@ -27,6 +33,7 @@ import QGroundControl
 import QGroundControl.Controls
 import QGroundControl.FlyView
 import QGroundControl.FlightMap
+import QGroundControl.Viewer3D
 
 Item {
     id: _root
@@ -36,10 +43,15 @@ Item {
     property var mapControl
 
     property var   _link:          SkydroidLink
+    property var   _follow:        ObjectFollow
+    property var   _marks:         ObjectMarks
     property real  _margin:        ScreenTools.defaultFontPixelWidth * 0.75
     property real  _buttonSize:    ScreenTools.defaultFontPixelHeight * 2.4
     property color _panelColor:    Qt.rgba(0, 0, 0, 0.4)
-    property bool  _videoIsMain:   mapControl ? mapControl.pipState.state !== mapControl.pipState.fullState : false
+    // VAMA (task H): QGC's 3D view covers the video and the map. A tap or a drag there is
+    // for the 3D view, so the video counts as the main view only outside it.
+    property bool  _is3DView:      QGCViewer3DManager.displayMode === QGCViewer3DManager.View3D
+    property bool  _videoIsMain:   mapControl ? (mapControl.pipState.state !== mapControl.pipState.fullState && !_is3DView) : false
     property bool  _laserBoxHidden: false
     property bool  _hintShown:     false
     property string _detectResult: ""
@@ -63,6 +75,8 @@ Item {
     property bool _thermalOn:     _videoSettings ? _videoSettings.rtspUrl.rawValue === _link.thermalVideoUrl : false
     // A point from the picture needs the lens of the picture that shows.
     Binding { target: _link; property: "thermalPicture"; value: _thermalOn }
+    // While the lock button waits for an object, the app marks the people and vehicles it finds.
+    Binding { target: _marks; property: "looking"; value: _lockPicking && _dragAvailable }
 
     function _toggleThermal() {
         if (!_videoSettings) {
@@ -89,8 +103,9 @@ Item {
         id:                     _toolInsets
         leftEdgeTopInset:       parentToolInsets.leftEdgeTopInset
         leftEdgeCenterInset:    actionColumn.visible ? Math.max(parentToolInsets.leftEdgeCenterInset,
-                                                        (paletteButton.visible ? paletteButton.x + paletteButton.width
-                                                                               : actionColumn.x + actionColumn.width) + _margin)
+                                                        ((paletteButton.visible || followButton.visible)
+                                                             ? paletteButton.x + paletteButton.width
+                                                             : actionColumn.x + actionColumn.width) + _margin)
                                                      : parentToolInsets.leftEdgeCenterInset
         leftEdgeBottomInset:    parentToolInsets.leftEdgeBottomInset
         rightEdgeTopInset:      parentToolInsets.rightEdgeTopInset
@@ -361,6 +376,7 @@ Item {
             // Lock on an object: press, then draw a box around it on the video
             // (or tap it). Orange while locked; press again to stop.
             IconButton {
+                id:         lockButton
                 objectName: "vamaLockButton"
                 icon:       _iconPath + "vama_lock.svg"
                 size:       _buttonSize
@@ -406,6 +422,27 @@ Item {
         }
     }
 
+    // Follow Me, beside the lock button while the app holds a lock: the drone flies
+    // after the locked object. A press asks first. Green while the drone follows:
+    // a press then stops it at once.
+    IconButton {
+        id:         followButton
+        objectName: "vamaFollowButton"
+        visible:    actionColumn.visible && (_follow.active || (_link.lockActive && _link.lockByApp))
+        size:       _buttonSize
+        x:          actionColumn.x + actionColumn.width + _margin
+        y:          actionColumn.y + actionButtons.y + lockButton.y
+        icon:       _iconPath + "vama_follow.svg"
+        fill:       _follow.active ? qgcPal.colorGreen : Qt.rgba(0, 0, 0, 0.55)
+        onClicked: {
+            if (_follow.active) {
+                _follow.stop()
+            } else {
+                followPopup.open()
+            }
+        }
+    }
+
     // --- Laser result, top centre ---------------------------------------------------
     // During a lock it is kept short and its last line is the lock state. On the
     // RC's small screen (field video of test build 4) the full box with a second
@@ -413,6 +450,7 @@ Item {
     // object the operator had just locked.
     Rectangle {
         id:                       laserBox
+        objectName:               "vamaResultBox"
         visible:                  _link.enabled && !_laserBoxHidden && !_lockPicking &&
                                   (_link.aimBusy || _link.laserBusy || _link.laserValid || _link.laserMessage !== "" ||
                                    _link.targetValid || _lockOn)
@@ -423,7 +461,7 @@ Item {
         height:                   laserColumn.height + _margin * 2
         radius:                   _margin
         color:                    _panelColor
-        border.color:             _lockOn ? qgcPal.colorOrange : "transparent"
+        border.color:             _follow.active ? qgcPal.colorGreen : (_lockOn ? qgcPal.colorOrange : "transparent")
         border.width:             2
 
         // A lock measures again every few seconds; the last result stays up meanwhile.
@@ -505,12 +543,27 @@ Item {
                 font.pointSize:      ScreenTools.smallFontPointSize
                 text:                _lockStateText
             }
+            // Follow Me. While the drone follows: what it does, and the speed it is
+            // asked. Afterwards: why it ended, until tapped.
+            QGCLabel {
+                objectName:          "vamaFollowLine"
+                width:               parent.width
+                visible:             _follow.message !== ""
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode:            Text.WordWrap
+                color:               (_follow.active && !_follow.waiting) ? qgcPal.colorGreen : qgcPal.colorOrange
+                font.bold:           true
+                font.pointSize:      ScreenTools.smallFontPointSize
+                text:                _follow.message +
+                                     ((_follow.active && !_follow.waiting) ? "  " + qsTr("Speed %1 m/s.").arg(_fmt(_follow.askedSpeedMps, 1)) : "")
+            }
             // For a video of a field test: what the app measures and what it tells
-            // the camera, in one small line.
+            // the camera, in one small line. (Not with a line of Follow Me: the box
+            // must stay short over the video.)
             QGCLabel {
                 objectName:          "vamaLockNumbers"
                 width:               parent.width
-                visible:             _link.lockActive && _link.lockByApp && _link.lockNumbers !== ""
+                visible:             _link.lockActive && _link.lockByApp && _link.lockNumbers !== "" && _follow.message === ""
                 horizontalAlignment: Text.AlignHCenter
                 elide:               Text.ElideRight
                 color:               "white"
@@ -520,10 +573,17 @@ Item {
             }
         }
 
-        // Tap to hide; the next laser shot shows it again.
+        // Tap to hide; the next laser shot shows it again. With the reason why Follow
+        // ended in it, the first tap takes that line away.
         MouseArea {
             anchors.fill: parent
-            onClicked:    _laserBoxHidden = true
+            onClicked: {
+                if (!_follow.active && _follow.message !== "") {
+                    _follow.clearMessage()
+                } else {
+                    _laserBoxHidden = true
+                }
+            }
         }
     }
 
@@ -560,7 +620,7 @@ Item {
                 color:               "white"
                 font.bold:           _link.lockActive
                 font.pointSize:      _lockOn ? ScreenTools.smallFontPointSize : ScreenTools.defaultFontPointSize
-                text:                _lockOn ? _lockStateText : _link.lockMessage
+                text:                _lockOn ? (_follow.active ? _follow.message : _lockStateText) : _link.lockMessage
             }
         }
 
@@ -577,11 +637,48 @@ Item {
         }
     }
 
+    // --- Follow Me message -----------------------------------------------------------
+    // Why Follow did not start, or why it ended, until tapped: here when the result
+    // box does not show. (When it shows, this is a line of it, as while the drone
+    // follows: a second box under it reached down to the object in the video.)
+    Rectangle {
+        id:                       followChip
+        objectName:               "vamaFollowChip"
+        visible:                  _link.enabled && !_follow.active && _follow.message !== "" && !laserBox.visible
+        anchors.horizontalCenter: parent.horizontalCenter
+        y:                        lockChip.visible ? lockChip.y + lockChip.height + _margin
+                                                   : (laserBox.visible ? laserBox.y + laserBox.height + _margin
+                                                                       : parentToolInsets.topEdgeCenterInset + _margin)
+        width:                    followChipLabel.width + _margin * 3
+        height:                   followChipLabel.height + _margin * 2
+        radius:                   _margin
+        color:                    _panelColor
+        border.color:             qgcPal.colorOrange
+        border.width:             2
+
+        QGCLabel {
+            id:                  followChipLabel
+            objectName:          "vamaFollowChipText"
+            anchors.centerIn:    parent
+            width:               Math.min(ScreenTools.defaultFontPixelWidth * 34, _root.width * 0.45)
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode:            Text.WordWrap
+            color:               "white"
+            text:                _follow.message
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked:    _follow.clearMessage()
+        }
+    }
+
     // --- Drag on the video to move the camera ---------------------------------------
     // Lives in the fly view's map and video holder, just above the video and
     // below QGC's widgets and our buttons, like QGC's own video mouse area.
     MouseArea {
         id:              videoDrag
+        objectName:      "vamaVideoDrag"
         parent:          _root.parent
         anchors.fill:    parent
         z:               1
@@ -593,6 +690,7 @@ Item {
         property real _pressY:   0
         property bool _dragging: false
         property bool _moved:    false  // this press became a drag, so it is not a tap
+        property real _markLockedAt: 0  // when a tap on a mark locked its object, in ms
         readonly property real _startDistance: ScreenTools.defaultFontPixelHeight * 0.6
         // Full speed when the finger is this far from where it went down.
         readonly property real _fullSpeedDistance: Math.min(width, height) * 0.2
@@ -621,6 +719,22 @@ Item {
             _root._lockPicking = false
             // The box as parts of the picture: the app follows what is inside it.
             _link.lockAtBox((x - r.x) / r.width, (y - r.y) / r.height, boxWidth / r.width, boxHeight / r.height)
+        }
+
+        // A tap on an object the app has marked: lock it. False when no mark is there.
+        function _lockMarkAt(x, y) {
+            const r = _videoRect()
+            if (!_marks.running || r.width <= 0 || r.height <= 0) {
+                return false
+            }
+            if (!_marks.lockAt((x - r.x) / r.width, (y - r.y) / r.height)) {
+                return false
+            }
+            _markLockedAt = Date.now()
+            // With the camera's own tracker the box stays where it was picked.
+            lockBox.place(x, y, lockBox.tapSize, lockBox.tapSize)
+            _root._lockPicking = false
+            return true
         }
 
         // Where the picture is drawn: the same sizes QGC's video view uses
@@ -669,6 +783,11 @@ Item {
             if (_dragging && lockBox.drawing) {
                 _dragging = false
                 lockBox.drawing = false
+                // A finger that slid a little on a mark still means the mark, not a small box drawn over it.
+                if (Math.abs(mouseX - _pressX) < 3 * _startDistance && Math.abs(mouseY - _pressY) < 3 * _startDistance &&
+                        _lockMarkAt(_pressX, _pressY)) {
+                    return
+                }
                 _lockAt(lockBox.cx, lockBox.cy, lockBox.boxW, lockBox.boxH)
                 return
             }
@@ -682,12 +801,20 @@ Item {
             if (_moved) {
                 return
             }
+            // A marked object is locked at once: the app does not wait to see if a second tap follows.
+            if (_root._lockPicking && _lockMarkAt(mouse.x, mouse.y)) {
+                tapTimer.stop()
+                return
+            }
             tapTimer.tapX = mouse.x
             tapTimer.tapY = mouse.y
             tapTimer.restart()
         }
         onDoubleClicked: {
             tapTimer.stop()
+            if (Date.now() - _markLockedAt < 2 * Qt.styleHints.mouseDoubleClickInterval) {
+                return  // the second of two taps on a mark: the object is locked, the view stays as it is
+            }
             QGroundControl.videoManager.fullScreen = !QGroundControl.videoManager.fullScreen
         }
 
@@ -729,6 +856,68 @@ Item {
                 PropertyAction  { target: tapMark; property: "opacity"; value: 1 }
                 PauseAnimation  { duration: 1200 }
                 NumberAnimation { target: tapMark; property: "opacity"; to: 0; duration: 600 }
+            }
+        }
+
+        // Where the app looks closest while it marks objects: the part of the picture
+        // it takes at its own size. A small object (a person far away) is found
+        // inside these corners only. No corners when that part is all of the picture.
+        Item {
+            id:         closeLook
+            objectName: "vamaCloseLook"
+
+            readonly property rect look: _marks.closeLook
+            readonly property real arm:  ScreenTools.defaultFontPixelHeight * 1.2
+            readonly property real line: 2
+
+            visible: _root._lockPicking && _marks.running && look.width > 0 && look.height > 0
+            x:       lockBox.picture.x + look.x * lockBox.picture.width
+            y:       lockBox.picture.y + look.y * lockBox.picture.height
+            width:   look.width * lockBox.picture.width
+            height:  look.height * lockBox.picture.height
+            opacity: 0.75
+
+            Rectangle { x: 0; y: 0; width: closeLook.arm; height: closeLook.line; color: "white" }
+            Rectangle { x: 0; y: 0; width: closeLook.line; height: closeLook.arm; color: "white" }
+            Rectangle { x: parent.width - closeLook.arm; y: 0; width: closeLook.arm; height: closeLook.line; color: "white" }
+            Rectangle { x: parent.width - closeLook.line; y: 0; width: closeLook.line; height: closeLook.arm; color: "white" }
+            Rectangle { x: 0; y: parent.height - closeLook.line; width: closeLook.arm; height: closeLook.line; color: "white" }
+            Rectangle { x: 0; y: parent.height - closeLook.arm; width: closeLook.line; height: closeLook.arm; color: "white" }
+            Rectangle { x: parent.width - closeLook.arm; y: parent.height - closeLook.line; width: closeLook.arm; height: closeLook.line; color: "white" }
+            Rectangle { x: parent.width - closeLook.line; y: parent.height - closeLook.arm; width: closeLook.line; height: closeLook.arm; color: "white" }
+        }
+
+        // The people and vehicles the app has found, while the lock button waits
+        // for an object: a thin box for each, where the object was in the picture
+        // it was found in (some tenths of a second ago). A tap on one locks it.
+        Repeater {
+            id:    markBoxes
+            model: _root._lockPicking ? _marks.marks : []
+
+            delegate: Rectangle {
+                objectName:   "vamaMark"
+
+                required property var modelData
+                readonly property bool person: modelData.kind === "person"
+
+                width:        Math.max(lockBox.minSize / 2, modelData.w * lockBox.picture.width)
+                height:       Math.max(lockBox.minSize / 2, modelData.h * lockBox.picture.height)
+                x:            lockBox.picture.x + modelData.u * lockBox.picture.width - width / 2
+                y:            lockBox.picture.y + modelData.v * lockBox.picture.height - height / 2
+                color:        "transparent"
+                border.color: person ? "#5CFF8A" : "#4FD8FF"
+                border.width: 2
+
+                QGCLabel {
+                    anchors.left:         parent.left
+                    anchors.bottom:       parent.top
+                    anchors.bottomMargin: 1
+                    font.pointSize:       ScreenTools.smallFontPointSize
+                    color:                parent.border.color
+                    style:                Text.Outline
+                    styleColor:           "black"
+                    text:                 parent.person ? qsTr("Person") : qsTr("Vehicle")
+                }
             }
         }
 
@@ -887,21 +1076,44 @@ Item {
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.top:              parent.top
         anchors.topMargin:        parentToolInsets.topEdgeCenterInset + _margin
-        width:                    lockHintLabel.width + _margin * 3
-        height:                   lockHintLabel.height + _margin * 1.5
-        radius:                   height / 2
+        width:                    lockHintColumn.width + _margin * 3
+        height:                   lockHintColumn.height + _margin * 1.5
+        radius:                   Math.min(height / 2, ScreenTools.defaultFontPixelHeight * 1.5)
         color:                    _panelColor
         border.color:             qgcPal.colorOrange
         border.width:             2
 
-        QGCLabel {
-            id:               lockHintLabel
+        Column {
+            id:               lockHintColumn
             anchors.centerIn: parent
-            width:            Math.min(implicitWidth, ScreenTools.defaultFontPixelWidth * 34, _root.width * 0.45)
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode:         Text.WordWrap
-            color:            "white"
-            text:             qsTr("Draw a box around the object, or tap it. Press the lock button again to cancel.")
+            spacing:          2
+
+            readonly property real _maxWidth: Math.min(ScreenTools.defaultFontPixelWidth * 34, _root.width * 0.45)
+
+            QGCLabel {
+                id:               lockHintLabel
+                objectName:       "vamaLockHintText"
+                anchors.horizontalCenter: parent.horizontalCenter
+                width:            Math.min(implicitWidth, lockHintColumn._maxWidth)
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode:         Text.WordWrap
+                color:            "white"
+                text:             _marks.running
+                                  ? qsTr("Tap a marked object, or draw a box around another one. Press the lock button again to cancel.")
+                                  : qsTr("Draw a box around the object, or tap it. Press the lock button again to cancel.")
+            }
+            // What the app has marked, and how long it takes to look (for a field video).
+            QGCLabel {
+                objectName:       "vamaMarksState"
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible:          text !== ""
+                width:            Math.min(implicitWidth, lockHintColumn._maxWidth)
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode:         Text.WordWrap
+                font.pointSize:   ScreenTools.smallFontPointSize
+                color:            "white"
+                text:             _marks.state
+            }
         }
     }
 
@@ -942,12 +1154,150 @@ Item {
         }
     }
 
-    // Never leave the camera turning when the app goes to the background.
+    // Never leave the camera turning when the app goes to the background. And the
+    // drone does not follow while the app is not on the screen: the operator must
+    // see what it follows. (A window over the app for a moment is not that.)
     Connections {
         target: Qt.application
         function onStateChanged() {
             if (Qt.application.state !== Qt.ApplicationActive) {
                 videoDrag.endDrag()
+            }
+            if (Qt.application.state === Qt.ApplicationSuspended || Qt.application.state === Qt.ApplicationHidden) {
+                _follow.stop()
+            }
+        }
+    }
+
+    // --- Follow Me -------------------------------------------------------------------
+    // Asked before the app flies the drone: what the drone will do, its two limits,
+    // and why Follow cannot start when it cannot.
+    Popup {
+        id:               followPopup
+        objectName:       "vamaFollowPopup"
+        anchors.centerIn: parent
+        modal:            true
+        focus:            true
+        padding:          _margin * 1.5
+        width:            Math.min(_root.width * 0.92, ScreenTools.defaultFontPixelWidth * 62)
+        height:           Math.min(_root.height * 0.96, followColumn.implicitHeight + padding * 2)
+
+        background: Rectangle {
+            color:        qgcPal.window
+            radius:       ScreenTools.defaultBorderRadius
+            border.color: qgcPal.text
+        }
+
+        readonly property var  _speeds:     [2, 4, 6, 8, 10, 12, 15]
+        readonly property var  _ranges:     [50, 100, 200, 500, 1000, 2000]
+        readonly property real _labelWidth: ScreenTools.defaultFontPixelWidth * 26
+
+        QGCFlickable {
+            anchors.fill:  parent
+            contentWidth:  width
+            contentHeight: followColumn.implicitHeight
+            clip:          true
+
+            ColumnLayout {
+                id:      followColumn
+                width:   parent.width
+                spacing: _margin
+
+                QGCLabel { text: qsTr("Follow the locked object"); font.bold: true }
+
+                QGCLabel {
+                    objectName:       "vamaFollowNotReady"
+                    Layout.fillWidth: true
+                    visible:          !_follow.ready
+                    wrapMode:         Text.WordWrap
+                    color:            qgcPal.colorOrange
+                    text:             _follow.notReadyText
+                }
+                QGCLabel {
+                    objectName:       "vamaFollowWhat"
+                    Layout.fillWidth: true
+                    visible:          _follow.ready
+                    wrapMode:         Text.WordWrap
+                    text:             qsTr("The drone will fly by itself and move with the object. It stays %1 m from it, as now, at its height of %2 m. It does not turn.")
+                                          .arg(_fmt(_follow.distanceM, 0)).arg(_fmt(_follow.heightM, 0))
+                }
+                QGCLabel {
+                    Layout.fillWidth: true
+                    wrapMode:         Text.WordWrap
+                    font.bold:        true
+                    text:             qsTr("The drone does not see obstacles. Fly higher than everything around.")
+                }
+
+                GridLayout {
+                    Layout.fillWidth: true
+                    columns:          2
+                    columnSpacing:    _margin
+                    rowSpacing:       _margin / 2
+
+                    QGCLabel { text: qsTr("Top speed of the drone"); Layout.preferredWidth: followPopup._labelWidth }
+                    QGCComboBox {
+                        objectName:       "vamaFollowSpeedBox"
+                        Layout.fillWidth: true
+                        model:            followPopup._speeds.map(function(s) { return qsTr("%1 m/s (%2 km/h)").arg(s).arg(Math.round(s * 3.6)) })
+                        currentIndex:     {
+                            var i = followPopup._speeds.indexOf(Math.round(_follow.speedLimit))
+                            return i >= 0 ? i : 3
+                        }
+                        onActivated:      (index) => { _follow.speedLimit = followPopup._speeds[index] }
+                    }
+
+                    QGCLabel { text: qsTr("Furthest from where it starts"); Layout.preferredWidth: followPopup._labelWidth }
+                    QGCComboBox {
+                        objectName:       "vamaFollowRangeBox"
+                        Layout.fillWidth: true
+                        model:            followPopup._ranges.map(function(r) { return qsTr("%1 m").arg(r) })
+                        currentIndex:     {
+                            var i = followPopup._ranges.indexOf(Math.round(_follow.rangeLimit))
+                            return i >= 0 ? i : 3
+                        }
+                        onActivated:      (index) => { _follow.rangeLimit = followPopup._ranges[index] }
+                    }
+                }
+
+                QGCLabel {
+                    objectName:       "vamaFollowRules"
+                    Layout.fillWidth: true
+                    wrapMode:         Text.WordWrap
+                    font.pointSize:   ScreenTools.smallFontPointSize
+                    text: {
+                        var lines = [qsTr("It never flies nearer to the object than %1 m. It stops when the lock is lost, and at the furthest distance.")
+                                         .arg(_fmt(_follow.minDistanceM, 0)),
+                                     qsTr("To take the drone back: change the flight mode on the remote control, or press the follow button again.")]
+                        if (_follow.fliesOnS > 0) {
+                            lines.push(qsTr("If the app or the radio link stops, the drone flies on for %1 s, then stops by itself.")
+                                           .arg(_fmt(_follow.fliesOnS, _follow.fliesOnS % 1 === 0 ? 0 : 1)))
+                        }
+                        lines.push(_follow.byLaser
+                                   ? qsTr("The laser has measured how far the object is below the drone.")
+                                   : qsTr("No laser reading on the object: its distance comes from the drone's height, and level ground is taken. Where the ground rises towards the object, the drone is nearer to it than shown."))
+                        return lines.join("\n")
+                    }
+                }
+
+                RowLayout {
+                    Layout.alignment: Qt.AlignRight
+                    spacing:          _margin
+
+                    QGCButton {
+                        objectName: "vamaFollowCancel"
+                        text:       qsTr("Cancel")
+                        onClicked:  followPopup.close()
+                    }
+                    QGCButton {
+                        objectName: "vamaFollowStart"
+                        text:       qsTr("Start following")
+                        enabled:    _follow.ready
+                        onClicked: {
+                            _follow.start()
+                            followPopup.close()
+                        }
+                    }
+                }
             }
         }
     }
@@ -1022,6 +1372,61 @@ Item {
     }
 
     // --- Camera settings -----------------------------------------------------
+    // The licences of the network that finds people and vehicles, and of the library that
+    // runs it: both ask that their notices go with the app.
+    Popup {
+        id:               noticesPopup
+        objectName:       "vamaNotices"
+        anchors.centerIn: parent
+        modal:            true
+        focus:            true
+        padding:          _margin * 1.5
+        width:            Math.min(_root.width * 0.92, ScreenTools.defaultFontPixelWidth * 84)
+        height:           _root.height * 0.9
+
+        property string _text: ""
+        onAboutToShow: {
+            if (_text === "") {
+                _text = _marks.notices()
+            }
+        }
+
+        background: Rectangle {
+            color:        qgcPal.window
+            radius:       ScreenTools.defaultBorderRadius
+            border.color: qgcPal.text
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing:      _margin
+
+            QGCFlickable {
+                Layout.fillWidth:  true
+                Layout.fillHeight: true
+                contentWidth:      width
+                contentHeight:     noticesLabel.implicitHeight
+                clip:              true
+
+                QGCLabel {
+                    id:             noticesLabel
+                    objectName:     "vamaNoticesText"
+                    width:          parent.width
+                    wrapMode:       Text.Wrap
+                    textFormat:     Text.PlainText
+                    font.pointSize: ScreenTools.smallFontPointSize
+                    text:           noticesPopup._text !== "" ? noticesPopup._text : qsTr("The notices are missing from this build.")
+                }
+            }
+            QGCButton {
+                objectName:       "vamaNoticesClose"
+                Layout.alignment: Qt.AlignRight
+                text:             qsTr("Close")
+                onClicked:        noticesPopup.close()
+            }
+        }
+    }
+
     Popup {
         id:               settingsPopup
         objectName:       "vamaCameraSettings"
@@ -1192,6 +1597,35 @@ Item {
                     text:             _link.lockMode === "camera"
                                       ? qsTr("Object lock: the camera's own tracker is told to follow. The app cannot see what it follows. On the V13 it did not follow in the tests.")
                                       : qsTr("Object lock: the app follows the object in the video and turns the camera. The box on the video is where the app sees the object.")
+                }
+                QGCCheckBox {
+                    objectName: "vamaMarksBox"
+                    text:       qsTr("Mark people and vehicles when locking")
+                    checked:    _marks.enabled
+                    enabled:    _marks.usable
+                    onClicked:  _marks.enabled = checked
+                }
+                QGCLabel {
+                    objectName:       "vamaMarksNote"
+                    Layout.fillWidth: true
+                    wrapMode:         Text.WordWrap
+                    font.pointSize:   ScreenTools.smallFontPointSize
+                    text:             !_marks.usable
+                                      ? _marks.state
+                                      : qsTr("After the lock button, the app marks the people and vehicles it finds in the video. Tap a mark to lock that object. A small object is found only inside the white corners in the middle of the picture: bring it there, or zoom in. The app does not find everything: draw a box around an object that it has not marked.")
+                }
+                QGCLabel {
+                    objectName:       "vamaFinderName"
+                    Layout.fillWidth: true
+                    wrapMode:         Text.WordWrap
+                    font.pointSize:   ScreenTools.smallFontPointSize
+                    visible:          text !== ""
+                    text:             _marks.finderName() !== "" ? qsTr("Object finder: %1.").arg(_marks.finderName()) : ""
+                }
+                QGCButton {
+                    objectName: "vamaNoticesButton"
+                    text:       qsTr("Licences of the object finder")
+                    onClicked:  noticesPopup.open()
                 }
 
                 QGCCheckBox {

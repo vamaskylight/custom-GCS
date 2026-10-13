@@ -1,9 +1,9 @@
 // VAMA copy of QGC 5.1.5's src/FlyView/FlightDisplayViewVideoOutput.qml (the
 // video picture). custom.qrc serves it in place of QGC's file. Compare it with
 // QGC's file again after every QGC update. The changes are marked "VAMA": the
-// thermal colour modes of VGCS (client request 2026-10-07), and the pictures
-// for the object lock (2026-10-09). QGC's comment on orientation has a colon
-// in place of its long dash.
+// thermal colour modes of VGCS (client request 2026-10-07), the pictures for
+// the object lock (2026-10-09), and the pictures for the object finder
+// (2026-10-13). QGC's comment on orientation has a colon in place of its long dash.
 
 import QtQuick
 import QtMultimedia
@@ -77,6 +77,55 @@ VideoOutput {
             waiting = videoOutput.grabToImage(function(result) {
                 lockPictures.waiting = false
                 SkydroidLink.lockPicture(result.image, px, py, pw, ph)
+            }, Qt.size(w, h))
+        }
+    }
+
+    // VAMA: pictures for the object finder. While the app marks people and
+    // vehicles (ObjectMarks.running), a picture of the video at the camera's own
+    // size goes to it whenever it asks for one: after each look, a few times a
+    // second at most. One grab at a time, as above.
+    Timer {
+        id:       markPictures
+        objectName: "vamaMarkPictures"
+        interval: 40
+        repeat:   true
+        running:  ObjectMarks.running && videoOutput.visible && videoOutput.width > 0 && videoOutput.height > 0
+
+        property bool waiting: false
+        property int  skipped: 0
+
+        onRunningChanged: {
+            waiting = false
+            skipped = 0
+        }
+        onTriggered: {
+            // A grab that never comes back must not stop the pictures for good.
+            if (waiting && skipped < 25) {
+                skipped++
+                return
+            }
+            skipped = 0
+            if (!ObjectMarks.wantsPicture()) {
+                return
+            }
+            const r = videoOutput.contentRect
+            if (r.width < 32 || r.height < 32) {
+                return
+            }
+            // The camera's own size, also when the video is shown smaller: what is
+            // small in the picture must not get smaller still.
+            const w = ObjectMarks.pictureWidth
+            const h = Math.max(32, Math.round(w * videoOutput.height / videoOutput.width))
+            const px = r.x / videoOutput.width
+            const py = r.y / videoOutput.height
+            const pw = r.width / videoOutput.width
+            const ph = r.height / videoOutput.height
+            const asked = Date.now()
+            waiting = videoOutput.grabToImage(function(result) {
+                markPictures.waiting = false
+                // How long the picture took to get is told on the screen, for a field video.
+                ObjectMarks.picture(result.image, px, py, pw, ph, Date.now() - asked)
             }, Qt.size(w, h))
         }
     }

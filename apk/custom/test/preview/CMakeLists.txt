@@ -24,6 +24,17 @@ add_executable(vama_preview
     ${CUSTOM_DIR}/src/Skydroid/SkydroidTop.cc
     ${CUSTOM_DIR}/src/Skydroid/LaserGeo.cc
     ${CUSTOM_DIR}/src/Skydroid/ObjectTracker.cc
+    # Follow Me, with a stand-in for the drone in main.cpp.
+    ${CUSTOM_DIR}/src/Skydroid/FollowDrone.h
+    ${CUSTOM_DIR}/src/Skydroid/FollowGuide.cc
+    ${CUSTOM_DIR}/src/Skydroid/ObjectFollow.cc
+    ${CUSTOM_DIR}/src/Skydroid/ObjectFollow.h
+    # The marks on people and vehicles, with a stand-in for the network in main.cpp.
+    ${CUSTOM_DIR}/src/Skydroid/ObjectFinder.cc
+    ${CUSTOM_DIR}/src/Skydroid/MarksWorker.cc
+    ${CUSTOM_DIR}/src/Skydroid/MarksWorker.h
+    ${CUSTOM_DIR}/src/Skydroid/ObjectMarks.cc
+    ${CUSTOM_DIR}/src/Skydroid/ObjectMarks.h
     ${LINK_STUBS}/MultiVehicleManager.h
     ${LINK_STUBS}/Vehicle.h
     # The app's own resources: the QML override path and the icons.

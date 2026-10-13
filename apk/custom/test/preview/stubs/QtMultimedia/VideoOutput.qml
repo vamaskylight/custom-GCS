@@ -5,7 +5,7 @@
 // says where the picture is, as in the real VideoOutput.
 //
 // The day picture is a look into a world that stands still: sky, ground, a few
-// buildings and a walker. Where the fake camera looks (previewCamera, set by
+// buildings, a walker and (when the preview places it) a car. Where the fake camera looks (previewCamera, set by
 // main.cpp) decides which part of it shows, so the picture moves when the
 // gimbal turns, as the real one does. The object lock is tried on this: the
 // app has to find the walker in the picture and turn the fake camera after it.
@@ -97,6 +97,22 @@ Item {
             }
             Rectangle { x: (12.4 - 30) * root._perDegX; y: -1 * root._perDegY; width: 7 * root._perDegX; height: 5 * root._perDegY; color: "#d8d2c4" }
             Rectangle { x: (12.4 + 22) * root._perDegX; y: 2 * root._perDegY;  width: 9 * root._perDegX; height: 4 * root._perDegY; color: "#9a948a" }
+
+            // A car, for the marks: 8 degrees long and 4.5 high, body, cabin and wheels.
+            Item {
+                objectName: "previewCar"
+                visible:    root._camera ? root._camera.carVisible : false
+                width:      8 * root._perDegX
+                height:     4.5 * root._perDegY
+                x:          (root._camera ? root._camera.carRight : 0) * root._perDegX - width / 2
+                y:          -(root._camera ? root._camera.carUp : 0) * root._perDegY - height / 2
+
+                Rectangle { x: 0;                    y: parent.height * 0.35; width: parent.width;        height: parent.height * 0.45; radius: 6; color: "#b3261e" }
+                Rectangle { x: parent.width * 0.22;  y: 0;                    width: parent.width * 0.5;  height: parent.height * 0.45; radius: 6; color: "#7d1a15" }
+                Rectangle { x: parent.width * 0.27;  y: parent.height * 0.08; width: parent.width * 0.4;  height: parent.height * 0.26; color: "#c9dcef" }
+                Rectangle { x: parent.width * 0.12;  y: parent.height * 0.68; width: parent.height * 0.32; height: width; radius: width / 2; color: "#1b1b1b" }
+                Rectangle { x: parent.width * 0.72;  y: parent.height * 0.68; width: parent.height * 0.32; height: width; radius: width / 2; color: "#1b1b1b" }
+            }
 
             // The walker: 3 degrees wide and 9 high, head, shirt and trousers.
             Item {

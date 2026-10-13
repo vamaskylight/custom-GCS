@@ -24,6 +24,14 @@
 //   15b_camera_tracker.png     the same with the camera's own tracker (lock mode "camera")
 //   15c_lock_stopped.png  after the lock button again
 //   16_no_gps_lock.png    a laser shot while the drone has no GPS lock: distance, and why no lat long
+//   20_follow_ask.png     Follow Me: the follow button beside the lock button, and the window that asks first
+//   21_following.png      the drone follows the walking walker: the green button, the state in the result box
+//   22_follow_stopped.png after the green button: why Follow ended
+//   23_follow_not_ready.png    the window when Follow cannot start (the drone too low): why, and no start
+//   24_marks.png          after the lock button: the walker and a car are marked, and corners show where the app looks closely
+//   25_mark_locked.png    after a tap on the walker's mark: locked, the box on the walker
+//   26_marks_setting.png  the switch for the marks in the camera settings
+//   27_notices.png        the licences of the object finder, as the app shows them
 //   17_app_settings.png   Application Settings: the VAMA mark on General, no Help page
 //   18_warnings_small.png QGC's "No GPS Lock" and pre-arm texts, small at the bottom while the video is the main view
 //   19_warnings_map.png   the same texts as QGC shows them, with the map as the main view
@@ -46,7 +54,10 @@
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QFile>
 #include <QtCore/QLoggingCategory>
+#include <QtCore/QMutex>
+#include <QtCore/QRegularExpression>
 #include <QtCore/QSettings>
+#include <QtCore/QThread>
 #include <QtCore/QTimer>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QImage>
@@ -63,11 +74,16 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "ColoredSvgImageProvider.h"
 #include "MultiVehicleManager.h"
+#include "FollowGuide.h"
+#include "ObjectFollow.h"
+#include "ObjectMarks.h"
 #include "SkydroidLink.h"
 #include "SkydroidTop.h"
 #include "Vehicle.h"
@@ -261,6 +277,10 @@ class FakeCamera : public QObject
     Q_PROPERTY(double walkerRight READ walkerRight NOTIFY walkerChanged)
     Q_PROPERTY(double walkerUp READ walkerUp NOTIFY walkerChanged)
     Q_PROPERTY(bool walkerVisible READ walkerVisible NOTIFY walkerChanged)
+    // A car, for the marks: where it stands in the world, as the walker.
+    Q_PROPERTY(double carRight READ carRight NOTIFY carChanged)
+    Q_PROPERTY(double carUp READ carUp NOTIFY carChanged)
+    Q_PROPERTY(bool carVisible READ carVisible NOTIFY carChanged)
 
 public:
     FakeCamera()
@@ -306,6 +326,22 @@ public:
     }
     double walkerSpeed = 0.0;  // degrees a second to the right
 
+    double carRight() const { return _carRight; }
+    double carUp() const { return _carUp; }
+    bool carVisible() const { return _carVisible; }
+    void placeCar(double right, double up)
+    {
+        _carRight = right;
+        _carUp = up;
+        _carVisible = true;
+        emit carChanged();
+    }
+    void setCarVisible(bool visible)
+    {
+        _carVisible = visible;
+        emit carChanged();
+    }
+
     /// Degrees a second the camera turns now: to the right, and up.
     double yawRate = 0.0;
     double pitchRate = 0.0;
@@ -321,6 +357,7 @@ public:
 signals:
     void lookChanged();
     void walkerChanged();
+    void carChanged();
 
 private slots:
     void _move()
@@ -433,10 +470,121 @@ private:
     double _walkerRight = 0.0;
     double _walkerUp = 0.0;
     bool _walkerVisible = false;
+    double _carRight = 0.0;
+    double _carUp = 0.0;
+    bool _carVisible = false;
 };
 
 /// The app's override rule (CustomOverrideInterceptor in CustomPlugin.cc): a
 /// qrc address is answered by its copy under /Custom when custom.qrc has one.
+/// A stand-in for the drone of Follow Me: the steps say what its telemetry is, and see what it is sent.
+class PreviewDrone : public FollowDrone
+{
+    Q_OBJECT
+
+public:
+    using FollowDrone::FollowDrone;
+
+    struct Sent
+    {
+        double northMps = 0.0;
+        double eastMps = 0.0;
+        double headingDeg = 0.0;
+    };
+
+    QString whyNot() const override { return QString(); }
+    QString modeName() const override { return mode; }
+    void askGuided() override { ++guidedAsked; }
+    void sendSpeed(double northMps, double eastMps, double headingDeg) override { sent.append({northMps, eastMps, headingDeg}); }
+    double fliesOnS() const override { return 3.0; }
+
+    void tell(const skydroid::follow::Drone &drone) { emit telemetry(drone); }
+
+    QString mode = QStringLiteral("Loiter");
+    int guidedAsked = 0;
+    QList<Sent> sent;
+};
+
+/// What ObjectFollow::instance() would fly in the app. The preview makes its own ObjectFollow.
+FollowDrone *vamaMakeFollowDrone(QObject *parent)
+{
+    return new PreviewDrone(parent);
+}
+
+/// A stand-in for the object finder's network: it "finds" the walker and the car of the
+/// stand-in video where they are on the screen (the preview notes that 30 times a second),
+/// and takes 0.12 s for a look of 640 x 384 points, longer for a larger one: a device of
+/// middle speed.
+class PreviewFinder : public PictureFinder
+{
+public:
+    struct Seen
+    {
+        QMutex mutex;
+        std::vector<skydroid::find::Found> things;  // in parts of the picture
+        int looks = 0;
+    };
+
+    explicit PreviewFinder(std::shared_ptr<Seen> seen) : _seen(std::move(seen)) {}
+
+    bool load(QString &) override { return true; }
+
+    std::vector<skydroid::find::Found> find(const skydroid::find::Picture &picture, const skydroid::find::Ask &ask,
+                                            QString &) const override
+    {
+        std::vector<skydroid::find::Found> things;
+        {
+            QMutexLocker lock(&_seen->mutex);
+            things = _seen->things;
+            ++_seen->looks;
+        }
+        skydroid::find::Area area = ask.area;
+        if (area.width <= 0 || area.height <= 0) {
+            area = skydroid::find::Area{0, 0, picture.width, picture.height};
+        }
+        const skydroid::find::Fit fit = skydroid::find::fitArea(area.width, area.height, ask.inputW, ask.inputH, ask.keepShape);
+        QThread::msleep(static_cast<unsigned long>(120.0 * fit.inputW * fit.inputH / (640.0 * 384.0)));
+        std::vector<skydroid::find::Found> found;
+        for (skydroid::find::Found thing : things) {
+            // In points of the picture, and what of it lies in the part looked at.
+            const double left = std::max((thing.cx - thing.w / 2.0) * picture.width, static_cast<double>(area.left));
+            const double right = std::min((thing.cx + thing.w / 2.0) * picture.width, static_cast<double>(area.left + area.width));
+            const double top = std::max((thing.cy - thing.h / 2.0) * picture.height, static_cast<double>(area.top));
+            const double bottom = std::min((thing.cy + thing.h / 2.0) * picture.height, static_cast<double>(area.top + area.height));
+            if (right - left < 8.0 || bottom - top < 8.0) {
+                continue;
+            }
+            thing.cx = (left + right) / 2.0;
+            thing.cy = (top + bottom) / 2.0;
+            thing.w = right - left;
+            thing.h = bottom - top;
+            found.push_back(thing);
+        }
+        return found;
+    }
+
+private:
+    std::shared_ptr<Seen> _seen;
+};
+
+/// What ObjectMarks::instance() would look with in the app. The preview makes its own ObjectMarks.
+PictureFinder *vamaMakePictureFinder()
+{
+    return new PreviewFinder(std::make_shared<PreviewFinder::Seen>());
+}
+
+QString vamaFinderName()
+{
+    return QStringLiteral("a stand-in for the preview");
+}
+
+/// The notices as the app reads them: from the app's own resources (custom.qrc is in the preview).
+QString vamaFinderNotices()
+{
+    QFile file(QStringLiteral(":/custom/ai/NOTICES.txt"));
+    return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+}
+
 class OverrideInterceptor : public QQmlAbstractUrlInterceptor
 {
 public:
@@ -476,6 +624,8 @@ int main(int argc, char *argv[])
     QSettings::setDefaultFormat(QSettings::IniFormat);
     QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, QDir::tempPath() + "/vama-preview-settings");
     QSettings().remove(QStringLiteral("VamaSkydroid"));
+    QSettings().remove(QStringLiteral("VamaFollow"));
+    QSettings().remove(QStringLiteral("VamaMarks"));
 
     const QString outDir = argc > 1 ? QString::fromLocal8Bit(argv[1]) : QDir::currentPath();
 
@@ -495,8 +645,34 @@ int main(int argc, char *argv[])
     link.setPort(camera.port());
     link.setEnabled(true);
 
+    // Follow Me, with a stand-in drone that hovers where the vehicle is, in Loiter, its nose
+    // to 40 degrees. Its telemetry comes five times a second while the timer runs.
+    auto *drone = new PreviewDrone;
+    ObjectFollow follow(&link, drone);
+    skydroid::follow::Drone telemetry;
+    telemetry.latDeg = vehicle.position.latitude();
+    telemetry.lonDeg = vehicle.position.longitude();
+    telemetry.heightM = 60.0;
+    telemetry.northMps = 0.0;
+    telemetry.eastMps = 0.0;
+    telemetry.headingDeg = 40.0;
+    telemetry.armed = true;
+    telemetry.flying = true;
+    telemetry.gps3d = true;
+    telemetry.mode = skydroid::follow::Mode::Holding;
+    QTimer telemetryTimer;
+    telemetryTimer.setInterval(200);
+    QObject::connect(&telemetryTimer, &QTimer::timeout, drone, [&]() { drone->tell(telemetry); });
+    int guidedBefore = 0;
+
+    // The marks on people and vehicles, with a stand-in finder on its own thread, as in the app.
+    auto seen = std::make_shared<PreviewFinder::Seen>();
+    ObjectMarks marks(&link, new PreviewFinder(seen), true);
+
     FakeGlobal global;
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "SkydroidLink", &link);
+    qmlRegisterSingletonInstance("QGroundControl", 1, 0, "ObjectFollow", &follow);
+    qmlRegisterSingletonInstance("QGroundControl", 1, 0, "ObjectMarks", &marks);
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "QGroundControl", &global);
 
     OverrideInterceptor interceptor;  // declared first: the engine must not outlive it
@@ -699,6 +875,76 @@ int main(int argc, char *argv[])
     double lookAtLock = 0.0;
     QRectF walkerOnScreen;
     int speedsBefore = 0;
+    QPointF slideFrom;  // where a finger went down that slides a little
+
+    // The marks. Every item with this name that shows on the screen.
+    auto findItems = [&](const char *objectName) -> QList<QQuickItem *> {
+        QList<QQuickItem *> items;
+        collect(window->contentItem(), items);
+        QList<QQuickItem *> named;
+        for (QQuickItem *item : std::as_const(items)) {
+            if (item->objectName() == QLatin1String(objectName) && item->isVisible()) {
+                named.append(item);
+            }
+        }
+        return named;
+    };
+    // The mark of a kind on the screen (the first one), or an empty rectangle.
+    auto markRect = [&](const char *kind) -> QRectF {
+        for (QQuickItem *mark : findItems("vamaMark")) {
+            if (mark->property("person").toBool() == (QLatin1String(kind) == QLatin1String("person"))) {
+                return mark->mapRectToScene(QRectF(0, 0, mark->width(), mark->height()));
+            }
+        }
+        return QRectF();
+    };
+    // A mark of this kind lies on the object: over its middle, and about its size.
+    auto markOn = [&](const char *objectName, const char *kind) -> bool {
+        const QRectF object = sceneRect(objectName);
+        const QRectF mark = markRect(kind);
+        return !object.isEmpty() && !mark.isEmpty() && mark.contains(object.center()) &&
+               mark.width() < object.width() * 1.5 && mark.height() < object.height() * 1.5 &&
+               mark.width() > object.width() * 0.6 && mark.height() > object.height() * 0.6;
+    };
+    auto marksText = [&]() {
+        const QRectF person = markRect("person");
+        const QRectF vehicle = markRect("vehicle");
+        const QRectF walker = sceneRect("previewWalker");
+        const QRectF car = sceneRect("previewCar");
+        return QStringLiteral("person mark %1, %2 (%3 x %4), walker %5, %6; vehicle mark %7, %8, car %9, %10")
+            .arg(person.center().x(), 0, 'f', 0).arg(person.center().y(), 0, 'f', 0).arg(person.width(), 0, 'f', 0)
+            .arg(person.height(), 0, 'f', 0).arg(walker.center().x(), 0, 'f', 0).arg(walker.center().y(), 0, 'f', 0)
+            .arg(vehicle.center().x(), 0, 'f', 0).arg(vehicle.center().y(), 0, 'f', 0).arg(car.center().x(), 0, 'f', 0)
+            .arg(car.center().y(), 0, 'f', 0);
+    };
+    // What the stand-in finder is to find: the walker and the car where they are on the screen now.
+    QQuickItem *walkerItem = findItem("previewWalker");
+    QQuickItem *carItem = findItem("previewCar");
+    QTimer seenTimer;
+    seenTimer.setInterval(30);
+    QObject::connect(&seenTimer, &QTimer::timeout, &app, [&]() {
+        std::vector<skydroid::find::Found> things;
+        const auto add = [&](QQuickItem *item, skydroid::find::Kind kind) {
+            if (!item || !item->isVisible() || window->width() <= 0 || window->height() <= 0) {
+                return;
+            }
+            const QRectF r = item->mapRectToScene(QRectF(0, 0, item->width(), item->height()));
+            skydroid::find::Found thing;
+            thing.kind = kind;
+            thing.label = kind == skydroid::find::Kind::Person ? 0 : 2;
+            thing.score = kind == skydroid::find::Kind::Person ? 0.8 : 0.7;
+            thing.cx = r.center().x() / window->width();
+            thing.cy = r.center().y() / window->height();
+            thing.w = r.width() / window->width();
+            thing.h = r.height() / window->height();
+            things.push_back(thing);
+        };
+        add(walkerItem, skydroid::find::Kind::Person);
+        add(carItem, skydroid::find::Kind::Vehicle);
+        QMutexLocker lock(&seen->mutex);
+        seen->things = things;
+    });
+    seenTimer.start();
 
     QImage thermalPlain;  // the thermal picture as the camera sends it
     // The 64 grey bands of the stand-in's thermal picture against VGCS's table
@@ -1000,6 +1246,405 @@ int main(int argc, char *argv[])
              vehicle.gps.set("lock", 3);
          }},
         {300, [&]() {
+             // Follow Me. The drone hovers 60 m up in Loiter, its nose to 40 degrees. The camera
+             // looks 40 degrees down at the walker, who stands 71 m away over the ground.
+             vehicle.vehicle.set("altitudeRelative", 60.0);
+             camera.setYaw(0.0);
+             camera.setPitch(-40.0);
+             camera.walkerSpeed = 0.0;
+             camera.placeWalker(camera.lookRight(), camera.pitch());
+             telemetryTimer.start();
+             QQuickItem *button = findItem("vamaFollowButton");
+             expect(button && !button->isVisible(), "follow: no follow button without a lock", QString());
+             tap("vamaLockButton");
+         }},
+        {500, [&]() {
+             walkerOnScreen = sceneRect("previewWalker");
+             mouse(QEvent::MouseButtonPress, walkerOnScreen.topLeft() - QPointF(14, 12));
+         }},
+        {100, [&]() { mouse(QEvent::MouseMove, walkerOnScreen.center()); }},
+        {100, [&]() { mouse(QEvent::MouseMove, walkerOnScreen.bottomRight() + QPointF(14, 12)); }},
+        {200, [&]() { mouse(QEvent::MouseButtonRelease, walkerOnScreen.bottomRight() + QPointF(14, 12)); }},
+        {5000, [&]() {
+             expect(link.lockActive() && link.lockByApp() && link.lockSeen(), "follow: the walker is locked by the app",
+                    link.lockMessage());
+             QQuickItem *button = findItem("vamaFollowButton");
+             const QRectF followRect = sceneRect("vamaFollowButton");
+             const QRectF lockRect = sceneRect("vamaLockButton");
+             expect(button && button->isVisible() && followRect.left() > lockRect.right() &&
+                        std::abs(followRect.center().y() - lockRect.center().y()) < 2.0,
+                    "follow: the follow button shows beside the lock button while the app holds a lock",
+                    QStringLiteral("at %1, %2; lock button at %3, %4").arg(followRect.center().x(), 0, 'f', 0)
+                        .arg(followRect.center().y(), 0, 'f', 0).arg(lockRect.center().x(), 0, 'f', 0).arg(lockRect.center().y(), 0, 'f', 0));
+             expect(follow.ready(), "follow: after a few seconds of lock the object's place is known", follow.notReadyText());
+             expect(drone->sent.isEmpty() && drone->guidedAsked == 0, "follow: nothing goes to the drone before the operator starts it",
+                    QStringLiteral("%1 speeds, %2 mode requests").arg(drone->sent.size()).arg(drone->guidedAsked));
+             tap("vamaFollowButton");
+         }},
+        {600, [&]() {
+             QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaFollowPopup"));
+             auto *what = window->findChild<QQuickItem *>(QStringLiteral("vamaFollowWhat"));
+             auto *rules = window->findChild<QQuickItem *>(QStringLiteral("vamaFollowRules"));
+             auto *start = window->findChild<QQuickItem *>(QStringLiteral("vamaFollowStart"));
+             expect(popup && popup->property("opened").toBool() && !follow.active() && drone->sent.isEmpty(),
+                    "follow: the button asks first, and nothing is sent yet", QString());
+             const QString text = what ? what->property("text").toString() : QString();
+             const QRegularExpressionMatch stays = QRegularExpression(QStringLiteral("It stays (\\d+) m from it")).match(text);
+             const int kept = stays.hasMatch() ? stays.captured(1).toInt() : -1;
+             expect(what && what->isVisible() && kept >= 69 && kept <= 73 && text.contains(QStringLiteral("at its height of 60 m")),
+                    "follow: the window says what the drone will do, with the distance (71 m) and the height (60 m) it keeps", text);
+             const QString rulesText = rules ? rules->property("text").toString() : QString();
+             expect(rulesText.contains(QStringLiteral("never flies nearer to the object than 15 m")) &&
+                        rulesText.contains(QStringLiteral("flies on for 3 s")) &&
+                        rulesText.contains(QStringLiteral("The laser has measured")),
+                    "follow: and its rules: the least distance, what happens when the link stops, where the distance comes from",
+                    rulesText);
+             expect(start && start->isEnabled(), "follow: \"Start following\" can be pressed", QString());
+             shot("20_follow_ask.png");
+             tap("vamaFollowStart");
+         }},
+        {700, [&]() {
+             QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaFollowPopup"));
+             expect(follow.active() && popup && !popup->property("opened").toBool(), "follow: \"Start following\" starts it",
+                    follow.message());
+             expect(drone->guidedAsked == 1, "follow: the drone is asked to change to Guided", QString::number(drone->guidedAsked));
+             // The drone changes to Guided, and the walker walks off to the right.
+             telemetry.mode = skydroid::follow::Mode::Guided;
+             drone->mode = QStringLiteral("Guided");
+             camera.walkerSpeed = 3.0;
+         }},
+        {3500, [&]() {
+             QQuickItem *line = findItem("vamaFollowLine");
+             const QString text = line ? line->property("text").toString() : QString();
+             expect(follow.active() && line && line->isVisible() && text.startsWith(QStringLiteral("Following. The object is")) &&
+                        text.contains(QStringLiteral("m/s")),
+                    "follow: the result box says that the drone follows, how far the object is and the speed asked", text);
+             QQuickItem *numbers = findItem("vamaLockNumbers");
+             expect(numbers && !numbers->isVisible(), "follow: the small line of lock numbers makes room for it", QString());
+             double most = 0.0;
+             for (const PreviewDrone::Sent &s : std::as_const(drone->sent)) {
+                 most = std::max(most, std::hypot(s.northMps, s.eastMps));
+             }
+             const PreviewDrone::Sent last = drone->sent.isEmpty() ? PreviewDrone::Sent{} : drone->sent.constLast();
+             const QString speed = QStringLiteral("%1 north, %2 east, heading %3; most %4 m/s")
+                                       .arg(last.northMps, 0, 'f', 2).arg(last.eastMps, 0, 'f', 2).arg(last.headingDeg).arg(most, 0, 'f', 2);
+             expect(!drone->sent.isEmpty() && std::hypot(last.northMps, last.eastMps) > 0.5 && most <= follow.speedLimit() + 1e-9 &&
+                        last.headingDeg == 40.0,
+                    "follow: the drone is sent speeds after the walking walker, with the heading to keep", speed);
+             // The walker walks to the right of where the camera looks, and the drone's nose is to 40
+             // degrees: that is towards 130 degrees, south-east.
+             expect(last.eastMps > 0.0 && last.northMps < 0.0, "follow: the speed points the way the walker walks (south-east)", speed);
+             shot("21_following.png");
+             camera.walkerSpeed = 0.0;
+             tap("vamaFollowButton");
+         }},
+        {500, [&]() {
+             QQuickItem *chip = findItem("vamaFollowChip");
+             QQuickItem *line = findItem("vamaFollowLine");
+             QQuickItem *box = findItem("vamaResultBox");
+             expect(!follow.active() && follow.message() == QStringLiteral("Follow stopped. The drone holds its place in Guided."),
+                    "follow: a press on the green button stops it at once", follow.message());
+             const PreviewDrone::Sent last = drone->sent.isEmpty() ? PreviewDrone::Sent{1.0, 1.0, 0.0} : drone->sent.constLast();
+             expect(std::hypot(last.northMps, last.eastMps) == 0.0, "follow: the drone is told to stop",
+                    QStringLiteral("%1 north, %2 east").arg(last.northMps).arg(last.eastMps));
+             // In the result box, which shows for the lock: not in a second box under it.
+             expect(box && box->isVisible() && line && line->isVisible() && line->property("text").toString() == follow.message() &&
+                        chip && !chip->isVisible(),
+                    "follow: why it ended is a line of the result box", line ? line->property("text").toString() : QString());
+             const QRectF lockBox = sceneRect("vamaLockBox");
+             const QRectF resultBox = sceneRect("vamaResultBox");
+             expect(resultBox.bottom() < lockBox.top(), "follow: and the box stays clear of the object in the video",
+                    QStringLiteral("box down to %1, object from %2").arg(resultBox.bottom(), 0, 'f', 0).arg(lockBox.top(), 0, 'f', 0));
+             expect(link.lockActive(), "follow: the camera stays locked on the walker", link.lockMessage());
+             shot("22_follow_stopped.png");
+             if (box) {
+                 tapItem(box);
+             }
+         }},
+        {300, [&]() {
+             QQuickItem *box = findItem("vamaResultBox");
+             QQuickItem *line = findItem("vamaFollowLine");
+             expect(follow.message().isEmpty() && line && !line->isVisible() && box && box->isVisible(),
+                    "follow: a tap takes that line away, and the box stays", follow.message());
+             // The drone has sunk to 6 m: Follow cannot start, and the window says why.
+             telemetry.heightM = 6.0;
+         }},
+        {700, [&]() { tap("vamaFollowButton"); }},
+        {600, [&]() {
+             auto *why = window->findChild<QQuickItem *>(QStringLiteral("vamaFollowNotReady"));
+             auto *what = window->findChild<QQuickItem *>(QStringLiteral("vamaFollowWhat"));
+             auto *start = window->findChild<QQuickItem *>(QStringLiteral("vamaFollowStart"));
+             const QString text = why ? why->property("text").toString() : QString();
+             expect(why && why->isVisible() && text.contains(QStringLiteral("the drone is 6 m up. It needs 10 m.")) && what &&
+                        !what->isVisible(),
+                    "follow: when it cannot start, the window says why", text);
+             expect(start && !start->isEnabled(), "follow: and \"Start following\" is greyed", QString());
+             shot("23_follow_not_ready.png");
+             guidedBefore = drone->guidedAsked;
+             tap("vamaFollowStart");
+         }},
+        {300, [&]() {
+             expect(!follow.active() && drone->guidedAsked == guidedBefore, "follow: a press on the greyed button starts nothing",
+                    follow.message());
+             tap("vamaFollowCancel");
+         }},
+        {300, [&]() {
+             QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaFollowPopup"));
+             expect(popup && !popup->property("opened").toBool(), "follow: Cancel closes the window", QString());
+             telemetry.heightM = 60.0;
+             tap("vamaLockButton");
+         }},
+        {400, [&]() {
+             QQuickItem *button = findItem("vamaFollowButton");
+             expect(!link.lockActive() && button && !button->isVisible(), "follow: with the lock gone the follow button is gone",
+                    link.lockMessage());
+             // With no result box on the screen, why Follow does not start shows in a box of its own.
+             QQuickItem *box = findItem("vamaResultBox");
+             if (box && box->isVisible()) {
+                 tapItem(box);
+             }
+             follow.start();
+         }},
+        {300, [&]() {
+             QQuickItem *box = findItem("vamaResultBox");
+             QQuickItem *chip = findItem("vamaFollowChip");
+             QQuickItem *chipText = findItem("vamaFollowChipText");
+             expect(box && !box->isVisible() && chip && chip->isVisible() && chipText &&
+                        chipText->property("text").toString().contains(QStringLiteral("Lock the object first")),
+                    "follow: without the result box, why it does not start shows in a box of its own",
+                    chipText ? chipText->property("text").toString() : QString());
+             if (chip) {
+                 tapItem(chip);
+             }
+         }},
+        {300, [&]() {
+             QQuickItem *chip = findItem("vamaFollowChip");
+             expect(follow.message().isEmpty() && chip && !chip->isVisible(), "follow: a tap takes it away", follow.message());
+             telemetryTimer.stop();
+             camera.setWalkerVisible(false);
+         }},
+        {300, [&]() {
+             // Marks on people and vehicles. The camera looks 40 degrees down. A walker stands 9
+             // degrees right of the cross and 5 below it, a car 15 degrees left of it and 14 below
+             // (clear of where the walker walks later: a walker in front of a car is another test).
+             camera.setYaw(0.0);
+             camera.setPitch(-40.0);
+             camera.walkerSpeed = 0.0;
+             camera.placeWalker(camera.lookRight() + 9.0, camera.pitch() - 5.0);
+             camera.placeCar(camera.lookRight() - 15.0, camera.pitch() - 14.0);
+             expect(marks.enabled() && marks.usable() && !marks.running() && marks.count() == 0,
+                    "marks: the switch is on, and nothing is looked at before the lock button", marks.state());
+             speedsBefore = camera.speedCommands;
+             tap("vamaLockButton");
+         }},
+        {1300, [&]() {
+             const QList<QQuickItem *> shown = findItems("vamaMark");
+             expect(marks.running() && marks.count() == 2 && shown.size() == 2,
+                    "marks: after the lock button the walker and the car are marked",
+                    QStringLiteral("%1 marks, %2 on the screen, %3").arg(marks.count()).arg(shown.size()).arg(marks.state()));
+             expect(markOn("previewWalker", "person") && markOn("previewCar", "vehicle"), "marks: each box is on its object, with its kind",
+                    marksText());
+             QQuickItem *hint = findItem("vamaLockHintText");
+             const QString hintText = hint ? hint->property("text").toString() : QString();
+             expect(hint && hint->isVisible() && hintText.startsWith(QStringLiteral("Tap a marked object, or draw a box")),
+                    "marks: the hint says to tap a marked object, or to draw a box", hintText);
+             QQuickItem *state = findItem("vamaMarksState");
+             const QString stateText = state ? state->property("text").toString() : QString();
+             expect(state && state->isVisible() && stateText.startsWith(QStringLiteral("Marked: 1 person, 1 vehicle. A look takes 0.3 s.")) &&
+                        stateText.contains(QStringLiteral("Getting a picture takes 0.")),
+                    "marks: a line says what is marked, how long a look takes, and how long a picture takes to get", stateText);
+             // This finder takes 0.12 s for a look of 640 x 384 points: the app looks closely at the
+             // middle 960 x 544 of the camera's 1280 x 720 points (0.26 s), and shows that part with corners.
+             // (Where the picture is on the screen is the lock box's own count, as for the marks.)
+             const QRectF corners = sceneRect("vamaCloseLook");
+             QQuickItem *cornersItem = findItem("vamaCloseLook");
+             QQuickItem *drag = findItem("vamaVideoDrag");
+             QQuickItem *lockBoxItem = findItem("vamaLockBox");
+             const QRectF picture = lockBoxItem ? lockBoxItem->property("picture").toRectF() : QRectF();
+             const QRectF look = marks.closeLook();
+             const QRectF want = drag ? drag->mapRectToScene(QRectF(picture.x() + look.x() * picture.width(),
+                                                                    picture.y() + look.y() * picture.height(),
+                                                                    look.width() * picture.width(),
+                                                                    look.height() * picture.height()))
+                                      : QRectF();
+             // Three quarters of the picture, each way, around its middle.
+             expect(std::abs(look.width() - 0.75) < 0.01 && std::abs(look.height() - 0.76) < 0.02 &&
+                        std::abs(look.center().x() - 0.5) < 0.01 && std::abs(look.center().y() - 0.5) < 0.01,
+                    "marks: on this device the app looks closely at the middle 960 x 544 of the camera's 1280 x 720 points",
+                    QStringLiteral("%1 x %2 of the picture").arg(look.width(), 0, 'f', 3).arg(look.height(), 0, 'f', 3));
+             expect(cornersItem && cornersItem->isVisible() && picture.width() > 1000.0 &&
+                        std::abs(corners.x() - want.x()) < 1.5 && std::abs(corners.y() - want.y()) < 1.5 &&
+                        std::abs(corners.width() - want.width()) < 1.5 && std::abs(corners.height() - want.height()) < 1.5,
+                    "marks: corners on the video show that part",
+                    QStringLiteral("%1 x %2 at %3, %4; that part is %5 x %6 at %7, %8")
+                        .arg(corners.width(), 0, 'f', 0).arg(corners.height(), 0, 'f', 0).arg(corners.center().x(), 0, 'f', 0)
+                        .arg(corners.center().y(), 0, 'f', 0).arg(want.width(), 0, 'f', 0).arg(want.height(), 0, 'f', 0)
+                        .arg(want.center().x(), 0, 'f', 0).arg(want.center().y(), 0, 'f', 0));
+             expect(!link.lockActive() && !link.lockBusy() && camera.speedCommands == speedsBefore,
+                    "marks: marking locks nothing and moves nothing", link.lockMessage());
+             shot("24_marks.png");
+             // A tap on the walker's mark.
+             const QPointF at = sceneRect("previewWalker").center();
+             mouse(QEvent::MouseButtonPress, at);
+             mouse(QEvent::MouseButtonRelease, at);
+         }},
+        {100, [&]() {
+             // At once: a mark is not a place to wait for a second tap.
+             expect(link.lockActive() && link.lockByApp(), "marks: a tap on a mark locks its object at once", link.lockMessage());
+             expect(!marks.running() && findItems("vamaMark").isEmpty(), "marks: the marks go when an object is locked",
+                    QString::number(findItems("vamaMark").size()));
+         }},
+        {1500, [&]() {
+             const QPointF off = walkerOff();
+             expect(link.lockActive() && link.lockSeen() && boxOnWalker(), "marks: the lock's box is on the walker", boxText());
+             expect(std::abs(off.x()) < 1.5 && std::abs(off.y()) < 1.5, "marks: and the camera has turned to the walker", offText());
+             const QRectF lockedBox = sceneRect("vamaLockBox");
+             const QRectF walker = sceneRect("previewWalker");
+             expect(lockedBox.width() < walker.width() * 1.6 && lockedBox.height() < walker.height() * 1.4,
+                    "marks: the box has the size of the mark, close around the walker",
+                    QStringLiteral("%1 x %2, walker %3 x %4").arg(lockedBox.width(), 0, 'f', 0).arg(lockedBox.height(), 0, 'f', 0)
+                        .arg(walker.width(), 0, 'f', 0).arg(walker.height(), 0, 'f', 0));
+             shot("25_mark_locked.png");
+             tap("vamaLockButton");  // the lock off again
+         }},
+        {400, [&]() {
+             // A walker who walks, 8 degrees a second to the right: the mark shows where they were
+             // a moment ago. A tap on the mark has to lock the walker where they are now.
+             expect(!link.lockActive(), "marks: the lock button stops the lock", link.lockMessage());
+             camera.setYaw(0.0);
+             camera.setPitch(-40.0);
+             camera.placeWalker(camera.lookRight() - 22.0, camera.pitch() - 5.0);
+             camera.walkerSpeed = 8.0;
+             tap("vamaLockButton");
+         }},
+        {1400, [&]() {
+             const QRectF mark = markRect("person");
+             const QRectF walker = sceneRect("previewWalker");
+             expect(!mark.isEmpty() && walker.center().x() - mark.center().x() > 8.0,
+                    "marks: the mark of a walking object is behind it (it shows where the object was)",
+                    QStringLiteral("mark at %1, walker at %2").arg(mark.center().x(), 0, 'f', 0).arg(walker.center().x(), 0, 'f', 0));
+             mouse(QEvent::MouseButtonPress, mark.center());
+             mouse(QEvent::MouseButtonRelease, mark.center());
+         }},
+        {150, [&]() {
+             // The box on the screen is where the app saw the walker in its last picture: within a
+             // walker's width of them. (A lock on the mark's old place would be 100 points behind and more.)
+             const QRectF box = sceneRect("vamaLockBox");
+             const QRectF walker = sceneRect("previewWalker");
+             expect(link.lockActive() && link.lockSeen() && !box.isEmpty() &&
+                        std::abs(box.center().x() - walker.center().x()) < walker.width(),
+                    "marks: a tap on that mark locks the walker where they are now", boxText());
+         }},
+        {1500, [&]() {
+             expect(link.lockActive() && link.lockSeen() && boxOnWalker(), "marks: and the lock stays on the walking walker", boxText());
+             camera.walkerSpeed = 0.0;
+             tap("vamaLockButton");
+         }},
+        {400, [&]() {
+             // A finger that slides a little while it taps a mark still means the mark, not a
+             // small box drawn over it. The walker stands 9 degrees right of the cross again.
+             camera.placeWalker(camera.lookRight() + 9.0, camera.pitch() - 5.0);
+             tap("vamaLockButton");
+         }},
+        {1300, [&]() {
+             slideFrom = sceneRect("previewWalker").center();
+             mouse(QEvent::MouseButtonPress, slideFrom);
+             mouse(QEvent::MouseMove, slideFrom + QPointF(18, 6));
+         }},
+        {80, [&]() { mouse(QEvent::MouseButtonRelease, slideFrom + QPointF(18, 6)); }},
+        {1300, [&]() {
+             const QRectF lockedBox = sceneRect("vamaLockBox");
+             const QRectF walker = sceneRect("previewWalker");
+             expect(link.lockActive() && link.lockSeen() && boxOnWalker() && lockedBox.height() > walker.height() * 0.7,
+                    "marks: a tap that slides a little still locks the marked object, with the mark's box",
+                    QStringLiteral("%1; box %2 x %3, walker %4 x %5").arg(boxText()).arg(lockedBox.width(), 0, 'f', 0)
+                        .arg(lockedBox.height(), 0, 'f', 0).arg(walker.width(), 0, 'f', 0).arg(walker.height(), 0, 'f', 0));
+             tap("vamaLockButton");
+         }},
+        {400, [&]() {
+             // A tap beside every mark, while the button waits: the place is locked as before the marks.
+             tap("vamaLockButton");
+         }},
+        {900, [&]() {
+             expect(marks.running() && marks.count() >= 1, "marks: marked again after the lock button", marks.state());
+             const QPointF ground = sceneRect("previewLightBuilding").center();
+             mouse(QEvent::MouseButtonPress, ground);
+             mouse(QEvent::MouseButtonRelease, ground);
+         }},
+        {900, [&]() {
+             expect(!marks.running() && (link.lockActive() || link.lockBusy() || link.lockMessage().contains(QStringLiteral("plain area"))),
+                    "marks: a tap beside every mark locks the place tapped, as before", link.lockMessage());
+             if (link.lockActive() || link.lockBusy()) {
+                 tap("vamaLockButton");
+             }
+         }},
+        {400, [&]() {
+             // The switch, in the camera settings.
+             QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaCameraSettings"));
+             if (popup) {
+                 QMetaObject::invokeMethod(popup, "open");
+             }
+         }},
+        {500, [&]() {
+             auto *box = window->findChild<QQuickItem *>(QStringLiteral("vamaMarksBox"));
+             auto *note = window->findChild<QQuickItem *>(QStringLiteral("vamaMarksNote"));
+             QObject *flick = window->findChild<QObject *>(QStringLiteral("vamaCameraSettingsFlick"));
+             expect(box && note && flick && box->property("checked").toBool() &&
+                        note->property("text").toString().contains(QStringLiteral("inside the white corners")),
+                    "marks: the camera settings have the switch, on, and say what it does", note ? note->property("text").toString() : QString());
+             auto *name = window->findChild<QQuickItem *>(QStringLiteral("vamaFinderName"));
+             expect(name && name->property("text").toString() == QStringLiteral("Object finder: a stand-in for the preview."),
+                    "marks: and which finder this build has", name ? name->property("text").toString() : QString());
+             if (box && flick) {
+                 auto *content = qobject_cast<QQuickItem *>(flick->property("contentItem").value<QObject *>());
+                 if (content) {
+                     flick->setProperty("contentY", qMax(0.0, box->mapToItem(content, QPointF(0, 0)).y() - 200.0));
+                 }
+             }
+         }},
+        {300, [&]() {
+             shot("26_marks_setting.png");
+             auto *box = window->findChild<QQuickItem *>(QStringLiteral("vamaMarksBox"));
+             if (box) {
+                 tapItem(box);
+             }
+         }},
+        {300, [&]() {
+             expect(!marks.enabled(), "marks: the switch turns them off", QString());
+             tap("vamaNoticesButton");
+         }},
+        {500, [&]() {
+             QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaNotices"));
+             auto *text = window->findChild<QQuickItem *>(QStringLiteral("vamaNoticesText"));
+             const QString notices = text ? text->property("text").toString() : QString();
+             expect(popup && popup->property("opened").toBool() && notices.contains(QStringLiteral("BSD 3-Clause License")) &&
+                        notices.contains(QStringLiteral("Apache License")) && notices.contains(QStringLiteral("NanoDet")),
+                    "marks: the licences of the finder can be read in the app", notices.left(60));
+             shot("27_notices.png");
+             tap("vamaNoticesClose");
+         }},
+        {300, [&]() {
+             QObject *notices = window->findChild<QObject *>(QStringLiteral("vamaNotices"));
+             expect(notices && !notices->property("opened").toBool(), "marks: Close closes them", QString());
+             QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaCameraSettings"));
+             if (popup) {
+                 QMetaObject::invokeMethod(popup, "close");
+             }
+         }},
+        {400, [&]() { tap("vamaLockButton"); }},
+        {900, [&]() {
+             QQuickItem *hint = findItem("vamaLockHintText");
+             const QString hintText = hint ? hint->property("text").toString() : QString();
+             QQuickItem *state = findItem("vamaMarksState");
+             expect(!marks.running() && marks.count() == 0 && findItems("vamaMark").isEmpty() &&
+                        hintText.startsWith(QStringLiteral("Draw a box around the object, or tap it.")) && state && !state->isVisible(),
+                    "marks: with the switch off the lock button marks nothing, and the hint is the old one", hintText);
+             tap("vamaLockButton");  // picking off
+             marks.setEnabled(true);
+             camera.setCarVisible(false);
+             camera.setWalkerVisible(false);
+         }},
+        {300, [&]() {
              // A point from the picture, without the laser. It is chosen as the operator does, in
              // the camera settings. The drone flies 60 m up and the camera looks 25 degrees down.
              vehicle.vehicle.set("altitudeRelative", 60.0);
@@ -1165,6 +1810,44 @@ int main(int argc, char *argv[])
         {300, [&]() {
              QQuickItem *warnings = findItem("vamaVehicleWarnings");
              expect(warnings && !warnings->isVisible(), "warnings: nothing shows when there is nothing to warn of", QString());
+             // QGC's 3D view (task H) with the video as the main view: the 3D scene covers the
+             // video, so a tap and a drag there are for the 3D view, never for the camera.
+             // (A MouseArea's own "enabled" is not Item.enabled: it is read as a property.)
+             QQuickItem *drag = findItem("vamaVideoDrag");
+             expect(drag && drag->property("enabled").toBool() && drag->isVisible(),
+                    "3D view: before it, the video takes taps and drags", QString());
+             window->setProperty("view3D", true);
+         }},
+        {300, [&]() {
+             QQuickItem *drag = findItem("vamaVideoDrag");
+             QObject *layer = window->property("layer").value<QObject *>();
+             QObject *manager = engine.singletonInstance<QObject *>("QGroundControl.Viewer3D", "QGCViewer3DManager");
+             expect(drag && !drag->property("enabled").toBool() && !drag->isVisible(), "3D view: the video's tap and drag area is off",
+                    QStringLiteral("display mode %1, the layer sees the 3D view: %2")
+                        .arg(manager ? manager->property("displayMode").toString() : QStringLiteral("no manager"))
+                        .arg(layer ? layer->property("_is3DView").toString() : QStringLiteral("no layer")));
+             anglesBeforePoint = camera.angleCommands;
+             lasersBeforePoint = camera.laserFrames;
+             speedsBefore = camera.speedCommands;
+             mouse(QEvent::MouseButtonPress, QPointF(1300, 620));
+             mouse(QEvent::MouseButtonRelease, QPointF(1300, 620));
+             mouse(QEvent::MouseButtonPress, QPointF(1000, 560));
+         }},
+        {100, [&]() { mouse(QEvent::MouseMove, QPointF(1040, 550)); }},
+        {100, [&]() { mouse(QEvent::MouseMove, QPointF(1150, 470)); }},
+        {300, [&]() { mouse(QEvent::MouseButtonRelease, QPointF(1150, 470)); }},
+        {1500, [&]() {
+             expect(camera.angleCommands == anglesBeforePoint && camera.laserFrames == lasersBeforePoint &&
+                        camera.speedCommands == speedsBefore && !link.aimBusy(),
+                    "3D view: a tap and a drag there do not turn the camera or fire the laser",
+                    QStringLiteral("%1 turns, %2 laser frames, %3 speed frames").arg(camera.angleCommands - anglesBeforePoint)
+                        .arg(camera.laserFrames - lasersBeforePoint).arg(camera.speedCommands - speedsBefore));
+             window->setProperty("view3D", false);
+         }},
+        {300, [&]() {
+             QQuickItem *drag = findItem("vamaVideoDrag");
+             expect(drag && drag->property("enabled").toBool() && drag->isVisible(),
+                    "3D view: back on the video, taps and drags work again", QString());
          }},
         {100, [&]() { QCoreApplication::quit(); }},
     };

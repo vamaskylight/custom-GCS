@@ -4,14 +4,20 @@
 // motion from touch and RC wheels, the frames each button sends, the laser
 // sequence (laser module first, system address as fallback), the target
 // position rules, the object lock (the app's own: pictures in, gimbal speeds
-// out; and the camera's own tracker: turn, GOT, SUM confirm and stop), and the
-// thermal colour mode setting.
+// out; and the camera's own tracker: turn, GOT, SUM confirm and stop), the
+// thermal colour mode setting, where a locked object is on the ground,
+// Follow Me (ObjectFollow with a stand-in drone: when it starts, what it sends,
+// when it ends and what it says), and the marks on people and vehicles
+// (ObjectMarks with a stand-in for the network: when it looks, what it shows,
+// and the lock that a tap on a mark starts on the picture of a moment ago).
 //
 // Every address used here is on this computer (127.0.0.x).
 
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
+#include <QtCore/QMutex>
 #include <QtCore/QSettings>
+#include <QtCore/QThread>
 #include <QtGui/QImage>
 #include <QtNetwork/QNetworkDatagram>
 #include <QtNetwork/QUdpSocket>
@@ -19,12 +25,17 @@
 #include <QtTest/QtTest>
 
 #include <cmath>
+#include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "FollowGuide.h"
 #include "LaserGeo.h"
 #include "MultiVehicleManager.h"
+#include "ObjectFollow.h"
+#include "ObjectMarks.h"
 #include "SkydroidLink.h"
 #include "SkydroidTop.h"
 #include "Vehicle.h"
@@ -47,6 +58,11 @@ public:
         connect(&_socket, &QUdpSocket::readyRead, this, &FakeCamera::_read);
         connect(&_pushTimer, &QTimer::timeout, this, &FakeCamera::_push);
         connect(&_trackTimer, &QTimer::timeout, this, [this]() { yaw += trackDriftDps * 0.1; });
+        connect(&_speedTimer, &QTimer::timeout, this, [this]() {
+            const double seconds = _speedClock.restart() / 1000.0;
+            yaw -= yawDps * seconds;
+            pitch = std::clamp(pitch + pitchDps * seconds, -90.0, 10.0);
+        });
         _clock.start();
     }
 
@@ -55,6 +71,11 @@ public:
     bool answerGac = true;       // answer a GAC question
     bool pushAfterGaa = false;   // send angles on its own after GAA, like the camera's push
     bool followAngles = false;   // turn to GAY / GAP angle commands, like the real gimbal
+    // Turn at the speeds of GSY, GSP and GSM, like the real gimbal. Right is + in the speed
+    // commands and - in the C13's yaw.
+    bool followSpeeds = false;
+    double yawDps = 0.0;
+    double pitchDps = 0.0;
     // Act only on long frames that start with an upper-case "#TP", like the
     // client's V13 (test build 3: angle commands sent as "#tp" did nothing).
     bool upperCaseOnly = false;
@@ -118,6 +139,23 @@ private slots:
                 const auto angle = top::decodeAttitudeField4(f->data.substr(0, 4));
                 if (angle) {
                     (f->tag == "GAY" ? yaw : pitch) = *angle;
+                }
+                continue;
+            }
+            if ((f->tag == "GSY" || f->tag == "GSP" || f->tag == "GSM") && f->ctrl == 'w' && followSpeeds) {
+                auto speed = [](const std::string &hex) {
+                    const int raw = std::stoi(hex, nullptr, 16);
+                    return (raw > 127 ? raw - 256 : raw) * 0.5;
+                };
+                if (f->tag == "GSM" && f->data.size() >= 4) {
+                    yawDps = speed(f->data.substr(0, 2));
+                    pitchDps = speed(f->data.substr(2, 2));
+                } else if (f->data.size() >= 2) {
+                    (f->tag == "GSY" ? yawDps : pitchDps) = speed(f->data.substr(0, 2));
+                }
+                if (!_speedTimer.isActive()) {
+                    _speedClock.start();
+                    _speedTimer.start(20);
                 }
                 continue;
             }
@@ -188,9 +226,176 @@ private:
     QUdpSocket _socket;
     QTimer _pushTimer;
     QTimer _trackTimer;
+    QTimer _speedTimer;
+    QElapsedTimer _speedClock;
     QElapsedTimer _clock;
     QNetworkDatagram _pushTo;
 };
+
+/// A stand-in for the drone of Follow Me: the test says what its telemetry is, and sees what it is sent.
+class FakeFollowDrone : public FollowDrone
+{
+    Q_OBJECT
+
+public:
+    explicit FakeFollowDrone(QObject *parent = nullptr) : FollowDrone(parent) { clock.start(); }
+
+    struct Sent
+    {
+        double northMps;
+        double eastMps;
+        double headingDeg;
+        qint64 atMs;
+    };
+
+    QString whyNot() const override { return whyNotText; }
+    QString modeName() const override { return mode; }
+    void askGuided() override { ++guidedAsked; }
+    void sendSpeed(double northMps, double eastMps, double headingDeg) override
+    {
+        sent.append({northMps, eastMps, headingDeg, clock.elapsed()});
+    }
+    double fliesOnS() const override { return fliesOn; }
+
+    void tell(const skydroid::follow::Drone &drone) { emit telemetry(drone); }
+
+    QString whyNotText;
+    QString mode = QStringLiteral("Loiter");
+    int guidedAsked = 0;
+    double fliesOn = 3.0;
+    QList<Sent> sent;
+    QElapsedTimer clock;
+};
+
+/// What ObjectFollow::instance() would fly in the app. No test uses that instance.
+FollowDrone *vamaMakeFollowDrone(QObject *parent)
+{
+    return new FakeFollowDrone(parent);
+}
+
+/// A stand-in for the object finder's network. It "finds" what the test says is in the
+/// picture, as far as a look can see it: only what lies in the part looked at (cut at its
+/// border), and of small objects only those in a look at the picture's own size.
+class FakePictureFinder : public PictureFinder
+{
+public:
+    /// What the test and the finder share. The marks own the finder, the test keeps this.
+    struct Seen
+    {
+        QMutex mutex;
+        std::vector<skydroid::find::Found> objects;  // in points of the image handed in
+        double smallBelow = 60.0;                    // objects lower than this are "small"
+        int sleepMs = 0;                             // how long one look takes
+        bool sleepBySize = false;                    // ... of 640 x 384 points: a larger look takes longer
+        bool troubleCloseOnly = false;               // the trouble comes from looks at the picture's own size only
+        double growWhenSmaller = 0.0;                // a box found in a picture made smaller is this much too large
+        bool canLoad = true;
+        QString whyNot;
+        QString trouble;
+        // What happened.
+        std::vector<skydroid::find::Ask> asks;
+        std::vector<QSize> sizes;
+        std::vector<Qt::HANDLE> threads;
+        int loads = 0;
+        int rests = 0;
+    };
+
+    explicit FakePictureFinder(std::shared_ptr<Seen> seen) : _seen(std::move(seen)) {}
+
+    bool load(QString &whyNot) override
+    {
+        QMutexLocker lock(&_seen->mutex);
+        ++_seen->loads;
+        whyNot = _seen->whyNot;
+        return _seen->canLoad;
+    }
+
+    void rest() override
+    {
+        QMutexLocker lock(&_seen->mutex);
+        ++_seen->rests;
+    }
+
+    std::vector<skydroid::find::Found> find(const skydroid::find::Picture &picture, const skydroid::find::Ask &ask,
+                                            QString &whyNot) const override
+    {
+        std::vector<skydroid::find::Found> objects;
+        double smallBelow = 0.0;
+        int sleepMs = 0;
+        bool sleepBySize = false;
+        bool troubleCloseOnly = false;
+        double growWhenSmaller = 0.0;
+        QString trouble;
+        {
+            QMutexLocker lock(&_seen->mutex);
+            _seen->asks.push_back(ask);
+            _seen->sizes.push_back(QSize(picture.width, picture.height));
+            _seen->threads.push_back(QThread::currentThreadId());
+            objects = _seen->objects;
+            smallBelow = _seen->smallBelow;
+            sleepMs = _seen->sleepMs;
+            sleepBySize = _seen->sleepBySize;
+            troubleCloseOnly = _seen->troubleCloseOnly;
+            growWhenSmaller = _seen->growWhenSmaller;
+            trouble = _seen->trouble;
+        }
+        skydroid::find::Area area = ask.area;
+        if (area.width <= 0 || area.height <= 0) {
+            area = skydroid::find::Area{0, 0, picture.width, picture.height};
+        }
+        const skydroid::find::Fit fit = skydroid::find::fitArea(area.width, area.height, ask.inputW, ask.inputH, ask.keepShape);
+        const bool ownSize = fit.scaleY >= 0.9;
+        whyNot = (!troubleCloseOnly || ownSize) ? trouble : QString();
+        if (sleepMs > 0) {
+            const double units = sleepBySize ? fit.inputW * fit.inputH / (640.0 * 384.0) : 1.0;
+            QThread::msleep(static_cast<unsigned long>(std::lround(sleepMs * units)));
+        }
+        std::vector<skydroid::find::Found> found;
+        for (const skydroid::find::Found &object : objects) {
+            if (fit.scaleY < 0.9 && object.h < smallBelow) {
+                continue;  // too small to be seen in a picture made smaller
+            }
+            const double left = std::max(object.cx - object.w / 2.0, static_cast<double>(area.left));
+            const double right = std::min(object.cx + object.w / 2.0, static_cast<double>(area.left + area.width));
+            const double top = std::max(object.cy - object.h / 2.0, static_cast<double>(area.top));
+            const double bottom = std::min(object.cy + object.h / 2.0, static_cast<double>(area.top + area.height));
+            if (right - left < 4.0 || bottom - top < 4.0) {
+                continue;  // not in this part of the picture
+            }
+            skydroid::find::Found f = object;
+            f.cx = (left + right) / 2.0;
+            f.cy = (top + bottom) / 2.0;
+            f.w = right - left + (ownSize ? 0.0 : growWhenSmaller);
+            f.h = bottom - top;
+            found.push_back(f);
+        }
+        return found;
+    }
+
+private:
+    std::shared_ptr<Seen> _seen;
+};
+
+/// What ObjectMarks::instance() would look with in the app. No test uses that instance.
+PictureFinder *vamaMakePictureFinder()
+{
+    return new FakePictureFinder(std::make_shared<FakePictureFinder::Seen>());
+}
+
+PictureFinder *vamaMakePictureFinderFrom(const QString &, const QString &)
+{
+    return vamaMakePictureFinder();
+}
+
+QString vamaFinderNotices()
+{
+    return QStringLiteral("the notices of the stand-in finder");
+}
+
+QString vamaFinderName()
+{
+    return QStringLiteral("a stand-in finder");
+}
 
 class SkydroidLinkTest : public QObject
 {
@@ -210,6 +415,8 @@ private slots:
     void init()
     {
         QSettings().remove("VamaSkydroid");
+        QSettings().remove("VamaFollow");
+        QSettings().remove("VamaMarks");
         SkydroidLink::setProbeTargets({}, {});
         _vehicle.position = QGeoCoordinate(20.0, 72.0);
         _vehicle.gps.set("lock", 3);
@@ -229,6 +436,12 @@ private slots:
 
     void cleanup()
     {
+        delete _marks;  // with its finder
+        _marks = nullptr;
+        _seen.reset();
+        delete _follow;  // with its drone
+        _follow = nullptr;
+        _drone = nullptr;
         delete _link;
         delete _camera;
         _link = nullptr;
@@ -486,6 +699,53 @@ private slots:
         QVERIFY(std::abs(h - 14.7) < 1e-9 && std::abs(v - 11.1) < 1e-9);  // long lens, first step
     }
 
+    void theLensOfThePictureIsTheThermalLensWhileTheThermalPictureShows()
+    {
+        double h = 0.0;
+        double v = 0.0;
+        QVERIFY(_link->pictureFov(h, v));  // the day picture: the day lens, known
+        QVERIFY(std::abs(h - 83.4) < 1e-9 && std::abs(v - 46.9) < 1e-9);
+        for (int i = 0; i < 10; ++i) {
+            _link->zoom(1);  // 2.0x on the day camera
+        }
+        // The C13's thermal picture: its data sheet's 48.7 x 38.6, not narrowed by the day
+        // zoom, and not known well enough to place a point.
+        _link->setThermalPicture(true);
+        QVERIFY(!_link->pictureFov(h, v));
+        QVERIFY(std::abs(h - 48.7) < 1e-9 && std::abs(v - 38.6) < 1e-9);
+        // C12: 36.4 x 27.7, from its 7 mm lens and 384 x 288 points of 12 um.
+        _link->setModel("C12");
+        QVERIFY(!_link->pictureFov(h, v));
+        QVERIFY(std::abs(h - 36.4) < 1e-9 && std::abs(v - 27.7) < 1e-9);
+        // C14 Pro: Skydroid's 32.84 x 26.35, known.
+        _link->setModel("C14 Pro");
+        QVERIFY(_link->pictureFov(h, v));
+        QVERIFY(std::abs(h - 32.84) < 1e-9 && std::abs(v - 26.35) < 1e-9);
+        _link->setThermalPicture(false);
+        QVERIFY(_link->pictureFov(h, v));
+        QVERIFY(std::abs(h - 61.4) < 1e-9 && std::abs(v - 47.9) < 1e-9);  // its day lens again
+    }
+
+    void aTapOnTheThermalPictureTurnsTheCameraByTheThermalLens()
+    {
+        _camera->yaw = 0.0;
+        _camera->pitch = -30.0;
+        _camera->followAngles = true;
+        _camera->slrE = "01F4";  // 50 m
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->setThermalPicture(true);
+        // 0.2 x 48.7 = 9.74 degrees right (C13 yaw -9.74), 0.1 x 38.6 = 3.86 up. By the
+        // day lens the camera turned 16.68 right and 4.69 up, past the object.
+        _link->aimAndMeasure(0.7, 0.4);
+        QVERIFY(_link->aimBusy());
+        const std::string gay = top::buildGimbalAngleAxis("GAY", -9.74, 30.0);
+        const std::string gap = top::buildGimbalAngleAxis("GAP", -26.14, 30.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(gay) >= 1 && _camera->countEqual(gap) >= 1, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->aimBusy() && !_link->laserBusy(), 5000);
+        QVERIFY(_link->laserValid());
+        QVERIFY(std::abs(_link->gimbalYaw() + 9.74) < 0.01);
+    }
+
     void tapTurnsTheCameraThenMeasures()
     {
         _camera->yaw = 0.0;
@@ -631,6 +891,31 @@ private slots:
         const int x = static_cast<int>(std::lround(u * 1280.0));
         const int y = static_cast<int>(std::lround(v * 720.0));
         QVERIFY(x > 760 && y < 300);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(_got(x, y)), 1, 1000);
+    }
+
+    void aLockAtAGimbalLimitOnTheThermalPictureUsesTheThermalLens()
+    {
+        _link->setLockMode("camera");
+        _link->setThermalPicture(true);
+        _camera->yaw = -80.0;
+        _camera->pitch = 5.0;
+        _camera->followAngles = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        // On the C13's thermal lens (48.7 x 38.6) the object is 12.175 degrees right and
+        // 11.58 up: past both limits.
+        _link->lockAt(0.75, 0.2);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAY", -90.0, 30.0)) >= 1, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAP", 10.0, 30.0)) >= 1, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->lockActive(), 5000);
+        // Still right of the cross by 2.175 degrees, and above it by 6.58: there in the picture.
+        // (The day lens put it at 807, 221. Which frame the camera's own tracker counts in on
+        // the thermal picture is not known; the place in the picture is what this checks.)
+        const double u = 0.5 + ((80.0 + 0.25 * 48.7) - 90.0) / 48.7;
+        const double v = 0.5 - ((5.0 + 0.3 * 38.6) - 10.0) / 38.6;
+        const int x = static_cast<int>(std::lround(u * 1280.0));
+        const int y = static_cast<int>(std::lround(v * 720.0));
+        QVERIFY(x < 720 && y > 230);
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(_got(x, y)), 1, 1000);
     }
 
@@ -1017,6 +1302,22 @@ private slots:
         _link->stopLock();
     }
 
+    void appLockOnTheThermalPictureCountsDegreesByTheThermalLens()
+    {
+        _link->setThermalPicture(true);
+        // 0.1 of the picture right of the cross is 4.87 degrees on the C13's thermal lens
+        // (8.34 by the day lens), so the camera turns at about 2.5 x 4.87 = 12 deg/s, not 21.
+        _link->lockAtBox(0.6, 0.5, 0.08, 0.2);
+        _camera->clear();
+        _link->lockPicture(_picture(0.6, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        QVERIFY2(std::abs(_link->lockOffDeg() - 4.87) < 0.3, qPrintable(QString::number(_link->lockOffDeg())));
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        const double speed = _lastSpeed("GSY");
+        QVERIFY2(speed >= 9.0 && speed <= 13.5, qPrintable(QString::number(speed)));
+        _link->stopLock();
+    }
+
     void appLockNeverTurnsFasterThanFortyDegreesASecond()
     {
         // A wide box 25 degrees right of the cross: 2.5 x 25 would be 62 deg/s, and the box's
@@ -1198,15 +1499,160 @@ private slots:
         QVERIFY(_link->lockMessage().contains("the video stopped"));
     }
 
+    // A stopped video still gives pictures: the last one, again and again. The gimbal turns
+    // (this fake one answers speed commands), the picture does not change: the camera stops,
+    // as for an object not seen, and the lock ends when no new picture comes.
+    void appLockStopsTheCameraWhenTheVideoStopsOnTheSamePicture()
+    {
+        _camera->followSpeeds = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAtBox(0.7, 0.5, 0.06, 0.2);
+        const QImage still = _picture(0.7, 0.5);
+        _link->lockPicture(still, 0.0, 0.0, 1.0, 1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        const double yawAtStart = _camera->yaw;
+        QElapsedTimer since;
+        since.start();
+        qint64 noticedMs = -1;
+        while (noticedMs < 0 && since.elapsed() < 1500) {
+            QTest::qWait(90);
+            _link->lockPicture(still, 0.0, 0.0, 1.0, 1.0);  // 11 pictures a second, all the same
+            if (_link->lockMessage().contains("video has stopped")) {
+                noticedMs = since.elapsed();
+            }
+        }
+        QVERIFY2(noticedMs >= 400 && noticedMs < 1000, qPrintable(QString::number(noticedMs)));
+        QVERIFY(_link->lockActive());
+        QVERIFY(!_link->lockSeen());  // the box says the object is not seen
+        // The camera is told to stop at once, not when the last speed runs out.
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") == 0.0, 250);
+        // It turned for about half a second (at about 25 degrees a second here), not on and on.
+        const double turned = std::abs(_camera->yaw - yawAtStart);
+        QVERIFY2(turned > 3.0 && turned < 20.0, qPrintable(QString::number(turned)));
+        QTest::qWait(300);
+        QVERIFY2(std::abs(std::abs(_camera->yaw - yawAtStart) - turned) < 0.5,
+                 qPrintable(QString("%1 then %2").arg(turned).arg(std::abs(_camera->yaw - yawAtStart))));
+        // No new picture for three seconds: the lock ends and says why.
+        while (_link->lockActive() && since.elapsed() < 5000) {
+            QTest::qWait(90);
+            _link->lockPicture(still, 0.0, 0.0, 1.0, 1.0);
+        }
+        QVERIFY(!_link->lockActive());
+        QVERIFY2(since.elapsed() > 2800, qPrintable(QString::number(since.elapsed())));
+        QVERIFY(_link->lockMessage().contains("the video stopped"));
+    }
+
+    // Without gimbal angles the same: the app asks the camera to turn, the picture stays.
+    void appLockStopsTheCameraWhenTheVideoStopsAndNoAnglesCome()
+    {
+        _camera->answerGac = false;
+        _link->lockAtBox(0.7, 0.5, 0.06, 0.2);
+        const QImage still = _picture(0.7, 0.5);
+        _link->lockPicture(still, 0.0, 0.0, 1.0, 1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        QElapsedTimer since;
+        since.start();
+        bool stoppedOnce = false;
+        int turnsAfter = 0;
+        while (since.elapsed() < 1500) {
+            QTest::qWait(90);
+            _link->lockPicture(still, 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+            const double yaw = _lastSpeed("GSY");
+            if (yaw == 0.0) {
+                stoppedOnce = true;
+            } else if (stoppedOnce) {
+                ++turnsAfter;  // once stopped, the same old picture must not start it again
+            }
+        }
+        QVERIFY(stoppedOnce);
+        QCOMPARE(turnsAfter, 0);
+        QVERIFY2(_link->lockMessage().contains("video has stopped"), qPrintable(_link->lockMessage()));
+        _link->stopLock();
+    }
+
+    // A slow video shows each picture for a while (here 0.3 s, three grabs each). That is not
+    // a stopped video: the camera keeps following.
+    void appLockKeepsFollowingASlowVideo()
+    {
+        _camera->followSpeeds = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->lockAtBox(0.7, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.7, 0.5), 0.0, 0.0, 1.0, 1.0);
+        for (int frame = 1; frame <= 6; ++frame) {
+            const QImage picture = _picture(0.7 - 0.01 * frame, 0.5);  // the camera catches up a little
+            for (int grab = 0; grab < 3; ++grab) {
+                QTest::qWait(100);
+                _link->lockPicture(picture, 0.0, 0.0, 1.0, 1.0);
+                QVERIFY2(!_link->lockMessage().contains("video has stopped"),
+                         qPrintable(QString("picture %1, grab %2: %3").arg(frame).arg(grab).arg(_link->lockMessage())));
+            }
+        }
+        QVERIFY(_link->lockActive() && _link->lockSeen());
+        QVERIFY2(_lastSpeed("GSY") > 0.0, qPrintable(QString::number(_lastSpeed("GSY"))));
+        _link->stopLock();
+    }
+
     void appLockRefusesAPlainBox()
     {
-        QImage plain(384, 216, QImage::Format_Grayscale8);
-        plain.fill(120);
+        // Ground all over, and a plain patch (sky, a white wall) where the box is drawn.
+        QImage picture = _picture(0.5, 0.5, false);
+        for (int y = 60; y < 156; ++y) {
+            uchar *row = picture.scanLine(y);
+            for (int x = 140; x < 244; ++x) {
+                row[x] = 120;
+            }
+        }
         _link->lockAtBox(0.5, 0.5, 0.1, 0.2);
-        _link->lockPicture(plain, 0.0, 0.0, 1.0, 1.0);
+        _link->lockPicture(picture, 0.0, 0.0, 1.0, 1.0);
         QVERIFY(!_link->lockActive() && !_link->lockBusy());
         QVERIFY(_link->lockMessage().contains("plain area"));
         QVERIFY(!_link->lockWantsPictures());
+    }
+
+    // A phone that cannot copy its video picture gives the app black pictures. That is no
+    // picture: the camera's own tracker is used and the text says so. (It used to say "draw
+    // the box around the whole object", which sends the operator the wrong way.)
+    void aBlackPictureIsNoPictureForTheLock()
+    {
+        _camera->followAngles = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        QImage black(384, 216, QImage::Format_RGB888);
+        black.fill(Qt::black);
+        _link->lockAtBox(0.75, 0.4, 0.06, 0.2);
+        QElapsedTimer since;
+        since.start();
+        while (_link->lockByApp() && since.elapsed() < 2500) {
+            _link->lockPicture(black, 0.0, 0.0, 1.0, 1.0);
+            QVERIFY2(!_link->lockMessage().contains("plain area"), qPrintable(_link->lockMessage()));
+            QVERIFY(!_link->lockActive());
+            // Not locked yet, so nothing "has stopped" either: it is still waiting for a picture.
+            QVERIFY2(!_link->lockByApp() || _link->lockMessage() == QString("Locking..."), qPrintable(_link->lockMessage()));
+            QTest::qWait(90);
+        }
+        QVERIFY(!_link->lockByApp());
+        QVERIFY2(_link->lockMessage().contains("No picture of the video reaches the app"), qPrintable(_link->lockMessage()));
+        _link->stopLock();
+    }
+
+    // The video goes black during a lock (the stream starts again): the camera waits and the
+    // lock says the video has stopped, not that the object went out of sight.
+    void appLockSaysTheVideoStoppedWhenThePictureGoesBlack()
+    {
+        _link->lockAtBox(0.7, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.7, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        QImage black(384, 216, QImage::Format_Grayscale8);
+        black.fill(0);
+        _link->lockPicture(black, 0.0, 0.0, 1.0, 1.0);
+        QVERIFY2(_link->lockMessage().contains("video has stopped"), qPrintable(_link->lockMessage()));
+        QVERIFY(_link->lockActive() && !_link->lockSeen());
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") == 0.0, 250);
+        // The video comes back: the lock goes on.
+        _link->lockPicture(_picture(0.69, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockSeen());
+        QVERIFY2(!_link->lockMessage().contains("video has stopped"), qPrintable(_link->lockMessage()));
+        _link->stopLock();
     }
 
     void appLockTakesAColourPictureAndBlackBarsBesideIt()
@@ -1990,6 +2436,63 @@ private slots:
         _link->stopLock();
     }
 
+    // The video shows the scene a little late. Right after the operator moved the camera, the
+    // picture tapped is from before the move, and the angles are from after it.
+    void aTapInPictureModeWaitsUntilTheCameraIsStill()
+    {
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        _link->setTouchMotion(0.8, 0.0);  // a finger drags the camera to the right
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(_lastSpeed("GSY")) > 0.0, 1000);
+        _link->stopTouchMotion();
+        QTest::qWait(300);
+        _link->aimAndMeasure(0.6, 0.6);
+        QVERIFY(!_link->targetValid());
+        QVERIFY2(_link->laserMessage().contains("still moving"), qPrintable(_link->laserMessage()));
+        // A second after the camera stopped the same tap is placed.
+        QTest::qWait(1000);
+        _link->aimAndMeasure(0.6, 0.6);
+        QVERIFY2(_link->targetValid() && _link->targetFromPicture(), qPrintable(_link->laserMessage()));
+    }
+
+    // A button turns the camera to an angle, and the turn goes on for seconds after the tap
+    // on the button. A point from the picture waits until the gimbal's angles stand still.
+    void aTapInPictureModeWaitsWhileAButtonTurnGoesOn()
+    {
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        _link->pointDown();
+        _link->aimAndMeasure(0.5, 0.5);  // at once, before the gimbal has even begun
+        QVERIFY(!_link->targetValid());
+        QVERIFY2(_link->laserMessage().contains("still moving"), qPrintable(_link->laserMessage()));
+        // The gimbal takes two seconds to get there (30 degrees a second).
+        for (int i = 1; i <= 20; ++i) {
+            QTest::qWait(100);
+            _camera->pitch = -30.0 - 3.0 * i;
+        }
+        QTRY_VERIFY_WITH_TIMEOUT(_link->gimbalPitch() == -90.0, 1000);
+        _link->aimAndMeasure(0.5, 0.5);  // more than two seconds after the button, just arrived
+        QVERIFY(!_link->targetValid());
+        QVERIFY2(_link->laserMessage().contains("still moving"), qPrintable(_link->laserMessage()));
+        QTest::qWait(1100);
+        _link->aimAndMeasure(0.5, 0.5);
+        QVERIFY2(_link->targetValid() && _link->targetFromPicture(), qPrintable(_link->laserMessage()));
+    }
+
+    // Angles that change long after the last command are not the app's doing (the drone turns
+    // under a steady camera): they do not hold a tap back.
+    void aTapInPictureModeDoesNotWaitForATurnTheAppDidNotAskFor()
+    {
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        _link->centerYaw();  // the gimbal is at 0 already: nothing moves
+        QTest::qWait(5300);
+        _camera->yaw = 3.0;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->gimbalYaw() == 3.0, 1000);
+        _link->aimAndMeasure(0.5, 0.5);
+        QVERIFY2(_link->targetValid() && _link->targetFromPicture(), qPrintable(_link->laserMessage()));
+    }
+
     void aTapInPictureModeEndsALockAndSaysWhy()
     {
         _link->setPointMode("picture");
@@ -1999,7 +2502,7 @@ private slots:
         QVERIFY(_link->lockActive());
         _link->aimAndMeasure(0.6, 0.6);
         QVERIFY(!_link->lockActive());
-        QVERIFY2(_link->lockMessage().contains("another point was measured"), qPrintable(_link->lockMessage()));
+        QVERIFY2(_link->lockMessage().contains("another point was tapped"), qPrintable(_link->lockMessage()));
         QVERIFY(_link->targetValid() && _link->targetFromPicture());
     }
 
@@ -2094,7 +2597,2043 @@ private slots:
         QVERIFY(_link->enabled());
     }
 
+    // --- Follow Me: where the locked object is on the ground ---------------------
+
+    void aLockedObjectUnderTheCrossIsPlacedOnTheGround()
+    {
+        _flyAtAHundredMetres();
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QCOMPARE(placed.count(), 1);
+        const QList<QVariant> place = placed.constFirst();
+        // 100 m up and 30 degrees down: 173.2 m north of the drone.
+        const QGeoCoordinate object(place.at(0).toDouble(), place.at(1).toDouble());
+        QVERIFY2(std::abs(_vehicle.position.distanceTo(object) - 173.2) < 0.5,
+                 qPrintable(QString::number(_vehicle.position.distanceTo(object))));
+        QVERIFY(object.latitude() > 20.0 && std::abs(object.longitude() - 72.0) < 1e-7);
+        // Such a place is sure to about 5 m: half a degree of camera angle is 3.5 m here, and so are 2 m of height.
+        QVERIFY2(std::abs(place.at(2).toDouble() - 4.92) < 0.1, qPrintable(QString::number(place.at(2).toDouble())));
+        QVERIFY(std::isnan(place.at(3).toDouble()));  // no laser range: the ground is taken as level
+        QCOMPARE(place.at(4).toInt(), 300);           // the picture is 0.3 s old
+        _link->stopLock();
+    }
+
+    void aLockedObjectBesideTheCrossIsPlacedThroughTheLens()
+    {
+        _flyAtAHundredMetres();
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.62, 0.4, 0.06, 0.2);
+        _link->lockPicture(_picture(0.62, 0.4), 0.0, 0.0, 1.0, 1.0);
+        QCOMPARE(placed.count(), 1);
+        // The same point as a tap on the box's middle gives without the laser.
+        skydroid::geo::PictureInput input;
+        input.view.vehicleLatDeg = 20.0;
+        input.view.vehicleLonDeg = 72.0;
+        input.view.gimbalYawLeftPositive = true;
+        input.view.gimbalPitchDeg = -30.0;
+        input.view.videoXNorm = _link->lockBoxU();
+        input.view.videoYNorm = _link->lockBoxV();
+        input.view.cameraHfovDeg = 83.4;
+        input.view.cameraVfovDeg = 46.9;
+        input.heightAboveGroundM = 100.0;
+        const skydroid::geo::PictureResult want = skydroid::geo::computePictureTarget(input);
+        QVERIFY(want.point.ok && want.point.targetLonDeg > 72.0001);  // right of the cross is east of north here
+        QVERIFY(std::abs(placed.constFirst().at(0).toDouble() - want.point.targetLatDeg) < 1e-7);
+        QVERIFY(std::abs(placed.constFirst().at(1).toDouble() - want.point.targetLonDeg) < 1e-7);
+        _link->stopLock();
+    }
+
+    void aLockedObjectIsNotPlacedOnAGuess_data()
+    {
+        QTest::addColumn<QString>("missing");
+        QTest::newRow("the drone's height is not known") << "height";
+        QTest::newRow("the drone has no 3D GPS position") << "gps";
+        QTest::newRow("the camera's angles are old") << "angles";
+        QTest::newRow("the camera looks too flat") << "flat";
+    }
+
+    void aLockedObjectIsNotPlacedOnAGuess()
+    {
+        QFETCH(QString, missing);
+        _flyAtAHundredMetres();
+        if (missing == "angles") {
+            // The camera has gone quiet: its last angles (30 degrees down) are 2 s old.
+            _camera->answerGac = false;
+            QTest::qWait(2000);
+            QCOMPARE(_link->gimbalPitch(), -30.0);
+        }
+        if (missing == "height") {
+            _vehicle.vehicle.remove("altitudeRelative");
+        } else if (missing == "gps") {
+            _vehicle.gps.set("lock", 2);
+        } else if (missing == "flat") {
+            _camera->pitch = -5.0;  // 5 degrees under the horizon: the point runs away with every part of a degree
+            QTRY_VERIFY_WITH_TIMEOUT(_link->gimbalPitch() == -5.0, 2000);
+        }
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _goOn(700);
+        QVERIFY(_link->lockActive() && _link->lockSeen());  // the camera is locked on it all the same
+        QCOMPARE(placed.count(), 0);
+        _link->stopLock();
+    }
+
+    void aPlaceTakesOffWhatTheCameraHasTurnedSinceThePicture()
+    {
+        // The object is 10 degrees right of the cross, so the app turns the camera to it, at 25 degrees a
+        // second. A picture is 0.3 s old: when the next one comes, the camera has turned part of the way
+        // that picture still shows. (This camera's video never shows the turn: the same picture again.)
+        _flyAtAHundredMetres();
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.62, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.62, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QCOMPARE(placed.count(), 1);
+        QTest::qWait(250);
+        _link->lockPicture(_picture(0.62, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QCOMPARE(placed.count(), 2);
+        const double first = placed.at(0).at(1).toDouble();
+        const double second = placed.at(1).at(1).toDouble();
+        // Right of the cross is east here. 10 degrees are 35 m at this range; after 6 degrees of turn, 12 m.
+        QVERIFY2(first > 72.00030 && first < 72.00037, qPrintable(QString::number(first, 'f', 6)));
+        QVERIFY2(second > 72.00005 && second < 72.00018, qPrintable(QString::number(second, 'f', 6)));
+        _link->stopLock();
+    }
+
+    void placesOfTheLockedObjectComeFiveTimesASecondAtTheMost()
+    {
+        _flyAtAHundredMetres();
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QElapsedTimer clock;
+        clock.start();
+        int pictures = 0;
+        while (clock.elapsed() < 1000) {
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            ++pictures;
+            QTest::qWait(30);
+        }
+        QVERIFY(pictures >= 15);
+        QVERIFY2(placed.count() >= 4 && placed.count() <= 6, qPrintable(QString::number(placed.count())));
+        _link->stopLock();
+    }
+
+    void aLaserRangeOnTheLockedObjectTellsOfHigherGroundThere()
+    {
+        // 100 m up, 30 degrees down. Over level ground the laser would say 200 m. It says 150 m: the object
+        // is 75 m below the drone, on ground 25 m higher than the take-off point, and so 129.9 m away, not 173.2.
+        _flyAtAHundredMetres();
+        _camera->slrE = "05DC";
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QVERIFY(_goOnUntil([this]() { return _link->laserValid(); }, 3000));
+        QCOMPARE(_link->laserRangeM(), 150.0);
+        placed.clear();
+        _goOn(500);
+        QVERIFY(placed.count() >= 1);
+        const QList<QVariant> place = placed.constLast();
+        const double away = _vehicle.position.distanceTo(QGeoCoordinate(place.at(0).toDouble(), place.at(1).toDouble()));
+        QVERIFY2(std::abs(away - 129.9) < 0.5, qPrintable(QString::number(away)));
+        QVERIFY2(std::abs(place.at(3).toDouble() - 75.0) < 0.2, qPrintable(QString::number(place.at(3).toDouble())));
+        // And the place is surer than without the laser (4.9 m).
+        QVERIFY2(place.at(2).toDouble() < 2.2, qPrintable(QString::number(place.at(2).toDouble())));
+        _link->stopLock();
+    }
+
+    void aLaserRangeThatTellsOfLowerGroundDoesNotPutTheObjectFurtherAway()
+    {
+        // The laser says 250 m: ground 25 m lower than the take-off point, and the object 216.5 m away. But a
+        // shot that passes the object and lands behind it says the same. An object taken as further away than
+        // it is would have the drone flown nearer to it. So the object stays where level ground puts it.
+        _flyAtAHundredMetres();
+        _camera->slrE = "09C4";
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QVERIFY(_goOnUntil([this]() { return _link->laserValid(); }, 3000));
+        QCOMPARE(_link->laserRangeM(), 250.0);
+        placed.clear();
+        _goOn(500);
+        QVERIFY(placed.count() >= 1);
+        const QList<QVariant> place = placed.constLast();
+        const double away = _vehicle.position.distanceTo(QGeoCoordinate(place.at(0).toDouble(), place.at(1).toDouble()));
+        QVERIFY2(std::abs(away - 173.2) < 0.5, qPrintable(QString::number(away)));
+        // How far the object is below the drone is said as it was measured.
+        QVERIFY2(std::abs(place.at(3).toDouble() - 125.0) < 0.2, qPrintable(QString::number(place.at(3).toDouble())));
+        _link->stopLock();
+    }
+
+    void aLaserRangeOnTheLockedObjectCountsForFifteenSeconds()
+    {
+        // Later the object may stand on other ground, and the drone be elsewhere.
+        _flyAtAHundredMetres();
+        _camera->slrE = "05DC";  // 150 m: ground 25 m higher
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QVERIFY(_goOnUntil([this]() { return _link->laserValid(); }, 3000));
+        _camera->slrE.reset();  // from now on the laser gives nothing
+        const auto away = [this, &placed]() {
+            const QList<QVariant> place = placed.constLast();
+            return _vehicle.position.distanceTo(QGeoCoordinate(place.at(0).toDouble(), place.at(1).toDouble()));
+        };
+        _goOn(11500);
+        placed.clear();
+        _goOn(400);
+        QVERIFY(placed.count() >= 1);
+        QVERIFY2(std::abs(away() - 129.9) < 0.5, qPrintable(QString::number(away())));  // 12 s later it still counts
+        _goOn(4000);
+        placed.clear();
+        _goOn(400);
+        QVERIFY(placed.count() >= 1);
+        QVERIFY2(std::abs(away() - 173.2) < 0.5, qPrintable(QString::number(away())));  // 16 s later: level ground again
+        QVERIFY(std::isnan(placed.constLast().at(3).toDouble()));
+        _link->stopLock();
+    }
+
+    void oneOddLaserShotDoesNotMoveTheLockedObject()
+    {
+        // Three shots of the lock, 3 s apart: 200 m (level ground), then twice 100 m (ground 50 m higher,
+        // or something in the way). The first odd one changes nothing. Two of three are believed.
+        _flyAtAHundredMetres();
+        _camera->slrE = "07D0";
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QVERIFY(_goOnUntil([this]() { return _link->laserValid() && _link->laserRangeM() == 200.0; }, 3000));
+        const auto away = [this, &placed]() {
+            const QList<QVariant> place = placed.constLast();
+            return _vehicle.position.distanceTo(QGeoCoordinate(place.at(0).toDouble(), place.at(1).toDouble()));
+        };
+        _camera->slrE = "03E8";
+        QVERIFY(_goOnUntil([this]() { return _link->laserValid() && _link->laserRangeM() == 100.0 && !_link->laserBusy(); }, 5000));
+        placed.clear();
+        _goOn(500);
+        QVERIFY(placed.count() >= 1);
+        QVERIFY2(std::abs(away() - 173.2) < 0.5, qPrintable(QString::number(away())));
+        // The next shot says 100 m again.
+        QSignalSpy shots(_link, &SkydroidLink::laserBusyChanged);
+        QVERIFY(_goOnUntil([&shots]() { return shots.count() >= 2; }, 5000));  // busy, and done
+        placed.clear();
+        _goOn(500);
+        QVERIFY(placed.count() >= 1);
+        QVERIFY2(std::abs(away() - 86.6) < 0.5, qPrintable(QString::number(away())));
+        QVERIFY(std::abs(placed.constLast().at(3).toDouble() - 50.0) < 0.2);
+        _link->stopLock();
+    }
+
+    void aNewLockForgetsTheGroundUnderTheLastObject()
+    {
+        _flyAtAHundredMetres();
+        _camera->slrE = "05DC";  // 150 m: ground 25 m higher
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QVERIFY(_goOnUntil([this]() { return _link->laserValid(); }, 3000));
+        _camera->slrE.reset();  // for the next object the laser gives nothing
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        placed.clear();
+        _goOn(300);
+        QVERIFY(placed.count() >= 1);
+        const QList<QVariant> place = placed.constLast();
+        const double away = _vehicle.position.distanceTo(QGeoCoordinate(place.at(0).toDouble(), place.at(1).toDouble()));
+        QVERIFY2(std::abs(away - 173.2) < 0.5, qPrintable(QString::number(away)));
+        QVERIFY(std::isnan(place.at(3).toDouble()));
+        _link->stopLock();
+    }
+
+    void theLaserButtonDoesNotTellOfTheGroundUnderTheLockedObject()
+    {
+        // The operator's own shot can be at anything. (Point mode "picture": the lock fires no shots of its own.)
+        _link->setPointMode("picture");
+        _flyAtAHundredMetres();
+        _camera->slrE = "05DC";
+        QSignalSpy placed(_link, &SkydroidLink::objectPlaced);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _goOn(700);  // past the lock's first look at the object (from the picture, in this mode)
+        _link->fireLaser();
+        QVERIFY(_goOnUntil([this]() { return _link->laserValid(); }, 3000));
+        QCOMPARE(_link->laserRangeM(), 150.0);
+        placed.clear();
+        _goOn(500);
+        QVERIFY(placed.count() >= 1);
+        const QList<QVariant> place = placed.constLast();
+        const double away = _vehicle.position.distanceTo(QGeoCoordinate(place.at(0).toDouble(), place.at(1).toDouble()));
+        QVERIFY2(std::abs(away - 173.2) < 0.5, qPrintable(QString::number(away)));
+        QVERIFY(std::isnan(place.at(3).toDouble()));
+        _link->stopLock();
+    }
+
+    // --- Follow Me: the drone flies after the locked object ----------------------
+
+    void followStartsOnALockedObjectAndFliesTheDrone()
+    {
+        _withFollow();
+        QVERIFY(!_follow->ready() && !_follow->active());
+        QVERIFY2(_follow->notReadyText().contains("Lock the object first"), qPrintable(_follow->notReadyText()));
+        QCOMPARE(_follow->fliesOnS(), 3.0);
+        _lockAndKnowTheObject();
+        QVERIFY(_follow->notReadyText().isEmpty());
+        // 100 m up and 60 degrees down: the object is 57.7 m away.
+        QVERIFY2(std::abs(_follow->distanceM() - 57.7) < 1.0, qPrintable(QString::number(_follow->distanceM())));
+        QCOMPARE(_follow->heightM(), 100.0);
+        QVERIFY(!_follow->byLaser());
+        // Nothing goes to the drone before the operator starts Follow.
+        QVERIFY(_drone->sent.isEmpty());
+        QCOMPARE(_drone->guidedAsked, 0);
+
+        QSignalSpy changed(_follow, &ObjectFollow::changed);
+        _follow->start();
+        QVERIFY(_follow->active() && !_follow->waiting() && !_follow->ready());
+        QVERIFY(changed.count() >= 1);
+        QCOMPARE(_drone->guidedAsked, 1);  // it was in Loiter
+        QVERIFY2(_follow->message() == "Following. The object is 58 m away.", qPrintable(_follow->message()));
+        _follow->clearMessage();  // a tap on it while the drone follows does not take the state away
+        QVERIFY(_follow->message().startsWith("Following."));
+        QVERIFY(std::abs(_follow->keptDistanceM() - 57.7) < 1.0);
+        _nowGuided();
+        _drone->sent.clear();
+        _goOn(1000);
+        // A speed five times a second, each with the heading to keep. The object stands, so the speed is none.
+        QVERIFY2(_drone->sent.size() >= 4 && _drone->sent.size() <= 6, qPrintable(QString::number(_drone->sent.size())));
+        for (const FakeFollowDrone::Sent &s : std::as_const(_drone->sent)) {
+            QCOMPARE(s.headingDeg, 35.0);
+            QCOMPARE(s.northMps, 0.0);
+            QCOMPARE(s.eastMps, 0.0);
+        }
+        QVERIFY(_follow->active());
+        QCOMPARE(_drone->guidedAsked, 1);
+        _follow->stop();
+    }
+
+    void followDoesNotAskForGuidedWhenTheDroneIsInGuided()
+    {
+        _withFollow();
+        _nowGuided();
+        _lockAndKnowTheObject();
+        _follow->start();
+        QVERIFY(_follow->active());
+        QCOMPARE(_drone->guidedAsked, 0);
+        _follow->stop();
+    }
+
+    void followFliesAfterAnObjectThatMoves()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _follow->setSpeedLimit(6.0);
+        // The camera follows the object to the right: 20 degrees in 4 s are 21 m at this range, 5 m/s to the east.
+        QElapsedTimer clock;
+        clock.start();
+        int n = 0;
+        while (clock.elapsed() < 4000) {
+            _camera->yaw = -20.0 * clock.elapsed() / 4000.0;  // the C13 counts a turn to the right as minus
+            // A live video: no two pictures are the same.
+            _link->lockPicture(_picture(0.5 + 0.003 * (n % 2), 0.5), 0.0, 0.0, 1.0, 1.0);
+            if ((n++ % 2) == 0) {
+                _drone->tell(_telemetry);
+            }
+            QTest::qWait(90);
+        }
+        QVERIFY2(_follow->active(), qPrintable(_follow->message()));
+        QVERIFY(!_drone->sent.isEmpty());
+        const FakeFollowDrone::Sent last = _drone->sent.constLast();
+        QVERIFY2(last.eastMps > 2.0 && std::abs(last.northMps) < 2.5,
+                 qPrintable(QString("%1 north, %2 east").arg(last.northMps).arg(last.eastMps)));
+        double most = 0.0;
+        for (const FakeFollowDrone::Sent &s : std::as_const(_drone->sent)) {
+            most = std::max(most, std::hypot(s.northMps, s.eastMps));
+        }
+        QVERIFY2(most <= 6.0 + 1e-9, qPrintable(QString::number(most)));  // the speed limit holds
+        QVERIFY(_follow->askedSpeedMps() > 2.0);
+        _follow->stop();
+    }
+
+    void aPlaceIsAsOldAsItsPicture()
+    {
+        // A place holds for the moment its picture was taken. An object at 10 m/s whose place is taken as a
+        // second newer than it is would be put 10 m behind where it is.
+        _withFollow();
+        _hoverAt(100.0, -60.0);
+        _vehicle.vehicle.remove("altitudeRelative");  // so that the link gives no places of its own here
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QElapsedTimer clock;
+        clock.start();
+        int n = 0;
+        while (clock.elapsed() < 4500) {
+            // The object runs north, 100 m from the drone at first. Its picture is 1 s old: it shows it 10 m back.
+            const double northNow = 100.0 + 10.0 * clock.elapsed() / 1000.0;
+            const QGeoCoordinate shown = _vehicle.position.atDistanceAndAzimuth(northNow - 10.0, 0.0);
+            emit _link->objectPlaced(shown.latitude(), shown.longitude(), 1.5, std::nan(""), 1000);
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            if ((n++ % 2) == 0) {
+                _drone->tell(_telemetry);
+            }
+            QTest::qWait(90);
+        }
+        const double northNow = 100.0 + 10.0 * clock.elapsed() / 1000.0;
+        // Where the object is now (within what it runs between two looks at the clock), not where its picture showed it.
+        QVERIFY2(std::abs(_follow->distanceM() - northNow) < 4.0,
+                 qPrintable(QString("%1 m shown, the object is %2 m away").arg(_follow->distanceM()).arg(northNow)));
+        _link->stopLock();
+    }
+
+    void followEndsAndStopsTheDroneWhenTheLockEnds()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        _drone->sent.clear();
+        const qint64 endedAt = _drone->clock.elapsed();
+        _link->stopLock();
+        // At once, not on the next tick.
+        QVERIFY(!_follow->active());
+        QCOMPARE(_drone->sent.size(), 1);
+        QVERIFY2(_follow->message() == "Follow ended: the lock ended. The drone holds its place in Guided.",
+                 qPrintable(_follow->message()));
+        // "Stop" goes on for a second and a half, then nothing more is sent.
+        QTest::qWait(2400);
+        const qsizetype stops = _drone->sent.size();
+        QVERIFY2(stops >= 6 && stops <= 10, qPrintable(QString::number(stops)));
+        for (const FakeFollowDrone::Sent &s : std::as_const(_drone->sent)) {
+            QCOMPARE(s.northMps, 0.0);
+            QCOMPARE(s.eastMps, 0.0);
+            QCOMPARE(s.headingDeg, 35.0);
+        }
+        QVERIFY2(_drone->sent.constLast().atMs - endedAt < 1900, qPrintable(QString::number(_drone->sent.constLast().atMs - endedAt)));
+        QTest::qWait(600);
+        QCOMPARE(_drone->sent.size(), stops);
+        // Its message stays until it is tapped away.
+        QVERIFY(_follow->message().startsWith("Follow ended"));
+        _follow->clearMessage();
+        QVERIFY(_follow->message().isEmpty());
+    }
+
+    void followEndsWhenTheOperatorMovesTheCamera()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        _drone->sent.clear();
+        _link->setTouchMotion(1.0, 0.0);  // a finger on the video: the lock ends
+        QVERIFY(!_link->lockActive());
+        QVERIFY(!_follow->active());
+        QVERIFY(_follow->message().startsWith("Follow ended: the lock ended."));
+        QCOMPARE(_drone->sent.size(), 1);
+        QCOMPARE(std::hypot(_drone->sent.constLast().northMps, _drone->sent.constLast().eastMps), 0.0);
+        _link->stopTouchMotion();
+    }
+
+    void aNewLockEndsFollow()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);  // another object
+        QVERIFY(!_follow->active());
+        QVERIFY(_follow->message().startsWith("Follow ended: the lock ended."));
+        // The new object's place is not known from the old one's.
+        _goOn(600);
+        QVERIFY(_link->lockActive());
+        QVERIFY(!_follow->ready());
+        QVERIFY2(_follow->notReadyText().contains("not known well enough"), qPrintable(_follow->notReadyText()));
+        _link->stopLock();
+    }
+
+    void followStopsOnTheOperatorsWordAndTheCameraStaysLocked()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        _drone->sent.clear();
+        _follow->stop();
+        QVERIFY(!_follow->active());
+        QCOMPARE(_drone->sent.size(), 1);
+        QCOMPARE(std::hypot(_drone->sent.constLast().northMps, _drone->sent.constLast().eastMps), 0.0);
+        QCOMPARE(_follow->message(), QString("Follow stopped. The drone holds its place in Guided."));
+        QVERIFY(_link->lockActive());
+        // It can be started again on the same object.
+        _goOn(2000);
+        QVERIFY2(_follow->ready(), qPrintable(_follow->notReadyText()));
+        _follow->start();
+        QVERIFY(_follow->active());
+        QCOMPARE(_drone->guidedAsked, 1);  // only the first time: it is in Guided now
+        _follow->stop();
+        _link->stopLock();
+    }
+
+    void followDoesNotStartWithoutALockThatTheAppHolds()
+    {
+        _withFollow();
+        _hoverAt(100.0, -60.0);
+        _goOnTelemetry(500);
+        _follow->start();
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message().contains("Lock the object first"), qPrintable(_follow->message()));
+        // The camera's own tracker tells nothing of where the object is.
+        _link->setLockMode("camera");
+        _link->lockAt(0.5, 0.5);
+        QVERIFY(_link->lockActive() && !_link->lockByApp());
+        _goOnTelemetry(500);
+        QVERIFY(!_follow->ready());
+        _follow->start();
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message().contains("Follow needs the app's own lock"), qPrintable(_follow->message()));
+        QVERIFY(_follow->notReadyText().contains("Follow needs the app's own lock"));
+        QCOMPARE(_drone->guidedAsked, 0);
+        QVERIFY(_drone->sent.isEmpty());
+        _link->stopLock();
+    }
+
+    void followDoesNotStartWhenTheDroneIsNotReadyForIt()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        const auto refused = [this](const char *why) {
+            _goOn(450);
+            const bool notReady = !_follow->ready() && _follow->notReadyText().contains(why);
+            _follow->start();
+            return notReady && !_follow->active() && _follow->message().contains(why) && _drone->guidedAsked == 0 &&
+                   _drone->sent.isEmpty();
+        };
+        _telemetry.heightM = 9.0;
+        QVERIFY2(refused("the drone is 9 m up. It needs 10 m."), qPrintable(_follow->message()));
+        _telemetry.heightM = 100.0;
+        _telemetry.flying = false;
+        QVERIFY2(refused("the drone is not flying"), qPrintable(_follow->message()));
+        _telemetry.flying = true;
+        _telemetry.armed = false;
+        QVERIFY2(refused("the drone is not flying"), qPrintable(_follow->message()));
+        _telemetry.armed = true;
+        _telemetry.gps3d = false;
+        QVERIFY2(refused("no 3D GPS position"), qPrintable(_follow->message()));
+        _telemetry.gps3d = true;
+        _telemetry.mode = skydroid::follow::Mode::Other;
+        _drone->mode = "Auto";
+        QVERIFY2(refused("The drone is in Auto."), qPrintable(_follow->message()));
+        _telemetry.mode = skydroid::follow::Mode::Holding;
+        _drone->mode = "Loiter";
+        _drone->whyNotText = "Follow works with an ArduPilot multicopter only.";
+        QVERIFY2(refused("ArduPilot multicopter only"), qPrintable(_follow->message()));
+        _drone->whyNotText.clear();
+        // No telemetry for a while: where the drone is, is not known.
+        _tellTelemetry = false;
+        _goOn(2300);
+        QVERIFY2(refused("the drone sends no position"), qPrintable(_follow->message()));
+        _tellTelemetry = true;
+        // All is well again: it starts.
+        _goOn(450);
+        QVERIFY2(_follow->ready(), qPrintable(_follow->notReadyText()));
+        _follow->start();
+        QVERIFY(_follow->active());
+        QCOMPARE(_drone->guidedAsked, 1);
+        _follow->stop();
+    }
+
+    void followDoesNotStartNearerThanTwentyMetres()
+    {
+        _withFollow();
+        // 100 m up and 80 degrees down: the object is 17.6 m away over the ground.
+        _hoverAt(100.0, -80.0);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QVERIFY(_goOnUntil([this]() { return _follow->notReadyText().contains("m away"); }, 8000));
+        _follow->start();
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message() == "Follow cannot start: the object is 18 m away. It needs 20 m or more.",
+                 qPrintable(_follow->message()));
+        QVERIFY(_drone->sent.isEmpty());
+        _link->stopLock();
+    }
+
+    void followDoesNotStartBeforeTheObjectsPlaceIsKnown()
+    {
+        _withFollow();
+        _hoverAt(100.0, -60.0);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _goOn(1000);
+        _follow->start();
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message().contains("the object's position is not known well enough"), qPrintable(_follow->message()));
+        QVERIFY(_follow->distanceM() < 0.0);  // and no distance is shown yet
+        _link->stopLock();
+    }
+
+    void followDoesNotStartOverGroundThatIsTooHigh()
+    {
+        _withFollow();
+        // 30 m up, 30 degrees down, and the laser says 16 m: the object is 8 m below the drone.
+        _hoverAt(30.0, -30.0);
+        _camera->slrE = "00A0";
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QVERIFY(_goOnUntil([this]() { return _follow->byLaser() && _follow->notReadyText().contains("above the object"); }, 8000));
+        _follow->start();
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message() == "Follow cannot start: the drone is only 8 m above the object. It needs 10 m.",
+                 qPrintable(_follow->message()));
+        _link->stopLock();
+    }
+
+    void followSaysWhenTheLaserGaveTheHeightAboveTheObject()
+    {
+        _withFollow();
+        _hoverAt(100.0, -60.0);
+        _camera->slrE = "0483";  // 115.5 m: level ground
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _goOn(250);
+        QVERIFY(!_follow->byLaser());
+        QVERIFY(_goOnUntil([this]() { return _follow->byLaser(); }, 3000));
+        _link->stopLock();
+        QVERIFY(!_follow->byLaser());
+    }
+
+    void followEndsWhenThePilotChangesTheFlightMode()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        QVERIFY(_follow->active());
+        _telemetry.mode = skydroid::follow::Mode::Holding;
+        _drone->mode = "Loiter";
+        _drone->tell(_telemetry);
+        _drone->sent.clear();
+        _goOn(700);
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message() == "Follow ended: the flight mode was changed to Loiter.", qPrintable(_follow->message()));
+        // The drone is the pilot's: nothing at all is sent to it, not even a stop.
+        QVERIFY2(_drone->sent.isEmpty(), qPrintable(QString::number(_drone->sent.size())));
+        QVERIFY(_link->lockActive());  // the camera stays on the object
+        _link->stopLock();
+    }
+
+    void followEndsWithoutAWordWhenAnotherDroneBecomesTheActiveOne()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        _drone->sent.clear();
+        emit _drone->otherDrone();
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message() == "Follow ended: another drone is the active one now.", qPrintable(_follow->message()));
+        // Where the drone before was says nothing of this one: Follow cannot start until it has said where it is.
+        QVERIFY(!_follow->ready());
+        QVERIFY2(_follow->notReadyText().contains("the drone sends no position"), qPrintable(_follow->notReadyText()));
+        _tellTelemetry = false;
+        _goOn(700);
+        // Nothing is sent to it, not even a stop: it may be doing something else.
+        QVERIFY2(_drone->sent.isEmpty(), qPrintable(QString::number(_drone->sent.size())));
+        QVERIFY(!_follow->ready());
+        _tellTelemetry = true;
+        _goOn(700);
+        QVERIFY2(_follow->ready(), qPrintable(_follow->notReadyText()));
+        _link->stopLock();
+    }
+
+    void followEndsWhenTheDroneIsTooLow()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        // The drone sinks to 7 m.
+        _telemetry.heightM = 7.0;
+        _goOn(700);
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message() == "Follow ended: the drone is lower than 8 m. The drone holds its place in Guided.",
+                 qPrintable(_follow->message()));
+        QCOMPARE(std::hypot(_drone->sent.constLast().northMps, _drone->sent.constLast().eastMps), 0.0);
+        _link->stopLock();
+    }
+
+    void followEndsWhenTheGroundUnderTheObjectIsTooNear()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        QVERIFY(_follow->active());
+        // The laser's next shot finds the object 8 m away along the look, 60 degrees down: 6.9 m below
+        // the drone, which is 100 m above its take-off point. The ground there has come up.
+        _camera->slrE = "0050";
+        QVERIFY(_goOnUntil([this]() { return !_follow->active(); }, 5000));
+        QVERIFY2(_follow->message() == "Follow ended: the drone is less than 8 m above the object. The drone holds its place in Guided.",
+                 qPrintable(_follow->message()));
+        _link->stopLock();
+    }
+
+    void followGivesUpWhenTheDroneDoesNotChangeToGuided()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        QCOMPARE(_drone->guidedAsked, 1);
+        _goOn(3000);
+        QVERIFY(_follow->active());  // it has 4 s
+        _goOn(1600);
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message() == "Follow ended: the drone did not change to Guided. It is in Loiter.",
+                 qPrintable(_follow->message()));
+        _link->stopLock();
+    }
+
+    void followWaitsWhileTheObjectIsNotSeenAndEndsWithTheLock()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        // The object is hidden.
+        _drone->sent.clear();
+        _goOn(900, 0.5, 0.5, false);
+        QVERIFY(_follow->active() && _follow->waiting());
+        QVERIFY2(_follow->message() == "Follow waits: the object is not seen. The drone stands.", qPrintable(_follow->message()));
+        QVERIFY(_drone->sent.size() >= 3);
+        for (const FakeFollowDrone::Sent &s : std::as_const(_drone->sent)) {
+            QCOMPARE(std::hypot(s.northMps, s.eastMps), 0.0);
+        }
+        // It comes back: Follow goes on.
+        _goOn(700);
+        QVERIFY(_follow->active() && !_follow->waiting());
+        QVERIFY(_follow->message().startsWith("Following."));
+        // Hidden for good: the lock ends after 2 s, and Follow with it.
+        _goOn(2600, 0.5, 0.5, false);
+        QVERIFY(!_link->lockActive());
+        QVERIFY(!_follow->active());
+        QVERIFY(_follow->message().startsWith("Follow ended: the lock ended."));
+    }
+
+    void followEndsWhenTheDroneGoesSilent()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        _tellTelemetry = false;
+        _goOn(1500);
+        // After a second without telemetry the drone is told to stand.
+        QVERIFY(_follow->active() && _follow->waiting());
+        QVERIFY2(_follow->message() == "Follow waits: the drone's data is late. The drone stands.", qPrintable(_follow->message()));
+        _goOn(1000);
+        QVERIFY(!_follow->active());
+        QVERIFY2(_follow->message() == "Follow ended: the drone sends no data. It stops by itself.", qPrintable(_follow->message()));
+        _link->stopLock();
+    }
+
+    void followSettingsAreKeptAndStayInTheirRange()
+    {
+        _withFollow();
+        QCOMPARE(_follow->speedLimit(), 8.0);
+        QCOMPARE(_follow->rangeLimit(), 500.0);
+        QCOMPARE(_follow->minDistanceM(), 15.0);
+        QCOMPARE(_follow->startDistanceM(), 20.0);
+        QCOMPARE(_follow->minHeightM(), 10.0);
+        QSignalSpy changed(_follow, &ObjectFollow::settingsChanged);
+        _follow->setSpeedLimit(12.0);
+        _follow->setRangeLimit(200.0);
+        QCOMPARE(changed.count(), 2);
+        _follow->setSpeedLimit(12.0);  // no change, no signal
+        QCOMPARE(changed.count(), 2);
+        _follow->setSpeedLimit(99.0);
+        QCOMPARE(_follow->speedLimit(), 15.0);
+        _follow->setRangeLimit(1.0);
+        QCOMPARE(_follow->rangeLimit(), 50.0);
+        _follow->setSpeedLimit(12.0);
+        _follow->setRangeLimit(200.0);
+        // Another run of the app.
+        delete _follow;
+        _drone = new FakeFollowDrone;
+        _follow = new ObjectFollow(_link, _drone);
+        QCOMPARE(_follow->speedLimit(), 12.0);
+        QCOMPARE(_follow->rangeLimit(), 200.0);
+        // A settings file with nonsense in it gives the usual values.
+        delete _follow;
+        QSettings().setValue("VamaFollow/speedLimit", "fast");
+        QSettings().setValue("VamaFollow/rangeLimit", -3);
+        _drone = new FakeFollowDrone;
+        _follow = new ObjectFollow(_link, _drone);
+        QCOMPARE(_follow->speedLimit(), 8.0);  // no number at all: the usual one
+        QCOMPARE(_follow->rangeLimit(), 50.0);  // a number out of the range: the nearest in it
+    }
+
+    void followNeverLeavesTheDroneFlyingWhenItGoesAway()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _follow->start();
+        _nowGuided();
+        _goOn(600);
+        // The app closes while Follow runs: a stop goes out. (ArduCopter would stop by itself as well.)
+        QPointer<FakeFollowDrone> drone = _drone;
+        QList<FakeFollowDrone::Sent> *sent = &_drone->sent;
+        const qsizetype before = sent->size();
+        _drone->setParent(nullptr);  // so that the test still has it afterwards
+        delete _follow;
+        _follow = nullptr;
+        QVERIFY(drone);
+        QCOMPARE(sent->size(), before + 1);
+        QCOMPARE(std::hypot(sent->constLast().northMps, sent->constLast().eastMps), 0.0);
+        delete _drone;
+        _drone = nullptr;
+        _link->stopLock();
+    }
+
+    // --- A lock on a marked object: the link's part ---------------------------------
+
+    void picturesAreKeptOnlyWhenAskedFor()
+    {
+        QVERIFY(!_link->keepsPictures() && !_link->lockWantsPictures());
+        QCOMPARE(_link->newestKeptPictureMs(), qint64(-1));
+        QSignalSpy changed(_link, &SkydroidLink::lockChanged);
+        _link->keepPictures(true);
+        QVERIFY(_link->keepsPictures() && _link->lockWantsPictures());  // QML is to send pictures now
+        QCOMPARE(changed.count(), 1);
+        _link->keepPictures(true);
+        QCOMPARE(changed.count(), 1);
+        // Kept pictures lock nothing.
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(!_link->lockActive() && !_link->lockBusy() && !_link->lockBoxValid());
+        const qint64 kept = _link->newestKeptPictureMs();
+        QVERIFY(kept >= 0);
+        _link->keepPictures(false);
+        QVERIFY(!_link->keepsPictures() && !_link->lockWantsPictures());
+        QCOMPARE(_link->newestKeptPictureMs(), qint64(-1));
+        QCOMPARE(changed.count(), 2);
+        // What was kept is gone: keeping again starts with nothing.
+        _link->keepPictures(true);
+        _link->lockAtFound(0.5, 0.5, 0.06, 0.2, kept);
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->stopLock();
+    }
+
+    void aBlackPictureIsNotKept()
+    {
+        // No picture of the scene (the video restarts): nothing a lock could start on.
+        _link->keepPictures(true);
+        QImage black(384, 216, QImage::Format_RGB888);
+        black.fill(Qt::black);
+        for (int i = 0; i < 3; ++i) {
+            _link->lockPicture(black, 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        _link->lockAtFound(0.5, 0.5, 0.06, 0.2, _link->pictureClockMs() - 30);
+        QVERIFY(_link->lockBusy() && !_link->lockActive());  // it waits for a picture, as for a drawn box
+        _link->stopLock();
+    }
+
+    void theKeptPictureIsTheLinksOwnCopy()
+    {
+        // The screen may use the bytes of a picture again once it has handed it over.
+        _link->keepPictures(true);
+        const QImage first = _picture(0.3, 0.5);
+        std::vector<uchar> bytes(first.constBits(), first.constBits() + first.sizeInBytes());
+        const QImage handed(bytes.data(), first.width(), first.height(), static_cast<int>(first.bytesPerLine()),
+                            QImage::Format_Grayscale8);
+        _link->lockPicture(handed, 0.0, 0.0, 1.0, 1.0);
+        const qint64 found = _link->newestKeptPictureMs();
+        std::fill(bytes.begin(), bytes.end(), static_cast<uchar>(120));  // the bytes are used for something else
+        QTest::qWait(30);
+        _link->lockPicture(_picture(0.3, 0.5), 0.0, 0.0, 1.0, 1.0);
+        _link->lockAtFound(0.3, 0.5, 0.06, 0.2, found);
+        QVERIFY2(_link->lockActive() && _link->lockSeen(), qPrintable(_link->lockMessage()));
+        QVERIFY(std::abs(_link->lockBoxU() - 0.3) < 0.015);
+        _link->stopLock();
+    }
+
+    void aLockOnAFoundObjectStartsOnThePictureItWasFoundIn()
+    {
+        _link->keepPictures(true);
+        // The object walks from 0.30 to 0.62 of the picture's width while the pictures come.
+        qint64 foundAtMs = 0;
+        for (int i = 0; i <= 16; ++i) {
+            _link->lockPicture(_picture(0.30 + 0.02 * i, 0.5), 0.0, 0.0, 1.0, 1.0);
+            if (i == 0) {
+                foundAtMs = _link->newestKeptPictureMs();
+                QVERIFY(foundAtMs >= 0 && foundAtMs <= _link->pictureClockMs());
+            }
+            QTest::qWait(30);
+        }
+        QVERIFY(!_link->lockActive() && !_link->lockBusy());
+        QSignalSpy boxes(_link, &SkydroidLink::lockBoxChanged);
+        // The object was found in the first picture, at 0.30. The operator taps its mark now.
+        _link->lockAtFound(0.30, 0.5, 0.06, 0.2, foundAtMs);
+        QVERIFY(_link->lockActive() && !_link->lockBusy() && _link->lockByApp());
+        QVERIFY2(_link->lockSeen(), qPrintable(_link->lockNumbers()));
+        QVERIFY2(std::abs(_link->lockBoxU() - 0.62) < 0.015 && std::abs(_link->lockBoxV() - 0.5) < 0.02,
+                 qPrintable(QString("box at %1, %2").arg(_link->lockBoxU()).arg(_link->lockBoxV())));
+        // The box on the screen goes straight to where the object is now, not through the old pictures.
+        QVERIFY2(boxes.count() <= 2, qPrintable(QString::number(boxes.count())));
+        // The camera is turned for the newest picture: the object is right of the cross.
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        // And the lock goes on with the pictures that come.
+        _link->lockPicture(_picture(0.64, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockSeen() && std::abs(_link->lockBoxU() - 0.64) < 0.015);
+        _link->stopLock();
+        QVERIFY(_link->lockWantsPictures());  // still kept, for the next mark
+    }
+
+    void theSameBoxLockedAsADrawnOneMissesAnObjectThatWalkedOn()
+    {
+        // What lockAtFound is for. The box of a moment ago, on the newest picture, holds ground.
+        _link->lockAtBox(0.30, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.62, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(!_link->lockActive() || std::abs(_link->lockBoxU() - 0.62) > 0.1);
+    }
+
+    void aFoundObjectWithNoPictureOfItsMomentIsLockedAsADrawnBox()
+    {
+        // Nothing kept: the lock waits for the next picture, as for a drawn box.
+        _link->lockAtFound(0.4, 0.5, 0.06, 0.2, _link->pictureClockMs());
+        QVERIFY(_link->lockBusy() && !_link->lockActive() && _link->lockByApp());
+        _link->lockPicture(_picture(0.4, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive() && std::abs(_link->lockBoxU() - 0.4) < 0.01);
+        _link->stopLock();
+        // Pictures are kept, but none of that moment: it is 0.3 s before the first of them.
+        _link->keepPictures(true);
+        const qint64 before = _link->pictureClockMs();
+        QTest::qWait(300);
+        for (int i = 0; i < 4; ++i) {
+            _link->lockPicture(_picture(0.4, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        _link->lockAtFound(0.4, 0.5, 0.06, 0.2, before);
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->stopLock();
+        // A box that is no box is not locked at all.
+        _link->lockAtFound(std::nan(""), 0.5, 0.06, 0.2, _link->pictureClockMs());
+        QVERIFY(!_link->lockBusy() && !_link->lockActive());
+    }
+
+    void aFoundObjectIsLockedByTheCamerasOwnTrackerInThatMode()
+    {
+        _link->setLockMode("camera");
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _link->keepPictures(true);
+        for (int i = 0; i < 3; ++i) {
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        _link->lockAtFound(0.5, 0.5, 0.06, 0.2, _link->pictureClockMs());
+        QVERIFY(!_link->lockByApp());
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG8wGOT") >= 1, 2000);
+        _link->stopLock();
+        // An object off the cross: the camera turns to it first. The app's own tracker stays out of it.
+        QTest::qWait(100);
+        _link->lockPicture(_picture(0.85, 0.5), 0.0, 0.0, 1.0, 1.0);
+        _link->lockAtFound(0.85, 0.5, 0.06, 0.2, _link->pictureClockMs());
+        QVERIFY2(_link->lockBusy() && !_link->lockActive() && !_link->lockByApp(), qPrintable(_link->lockMessage()));
+        _link->stopLock();
+    }
+
+    void aZoomStepForgetsTheKeptPictures()
+    {
+        _link->keepPictures(true);
+        QSignalSpy asked(_link, &SkydroidLink::zoomAsked);
+        for (int i = 0; i < 3; ++i) {
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        const qint64 found = _link->pictureClockMs();
+        _link->zoom(1);
+        QCOMPARE(asked.count(), 1);
+        // The pictures from before the zoom show the object at another size: none is used.
+        _link->lockAtFound(0.5, 0.5, 0.06, 0.2, found);
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->stopLock();
+        _link->zoomHome();
+        QCOMPARE(asked.count(), 2);
+        _link->zoom(0);  // no step
+        QCOMPARE(asked.count(), 2);
+    }
+
+    void keptPicturesOfAnotherShapeAreDropped()
+    {
+        _link->keepPictures(true);
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        const qint64 found = _link->pictureClockMs();
+        QTest::qWait(200);
+        // The thermal picture comes on: the image is as large, the picture inside it narrower.
+        _link->lockPicture(_picture(0.5, 0.5), 0.1, 0.0, 0.8, 1.0);
+        _link->lockAtFound(0.5, 0.5, 0.06, 0.2, found);
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->stopLock();
+    }
+
+    void noMoreThanFortyPicturesAreKept()
+    {
+        _link->keepPictures(true);
+        _link->lockPicture(_picture(0.3, 0.5), 0.0, 0.0, 1.0, 1.0);
+        const qint64 first = _link->pictureClockMs();
+        for (int i = 0; i < 45; ++i) {
+            QTest::qWait(30);
+            _link->lockPicture(_picture(0.3, 0.5), 0.0, 0.0, 1.0, 1.0);
+        }
+        // 45 more pictures in less than the 2.5 s they are kept for: the count pushed the first ones out.
+        QVERIFY2(_link->pictureClockMs() - first < 2400, qPrintable(QString::number(_link->pictureClockMs() - first)));
+        _link->lockAtFound(0.3, 0.5, 0.06, 0.2, first);
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->stopLock();
+    }
+
+    void picturesOlderThanTwoAndAHalfSecondsAreNotKept()
+    {
+        _link->keepPictures(true);
+        _link->lockPicture(_picture(0.3, 0.5), 0.0, 0.0, 1.0, 1.0);
+        const qint64 old = _link->pictureClockMs();
+        QTest::qWait(2400);
+        // 2.4 s on, the first picture is still there.
+        _link->lockAtFound(0.3, 0.5, 0.06, 0.2, old);
+        QVERIFY(_link->lockActive());
+        _link->stopLock();
+        QTest::qWait(250);
+        _link->lockPicture(_picture(0.3, 0.5), 0.0, 0.0, 1.0, 1.0);  // 2.65 s on: this one pushes it out
+        _link->lockAtFound(0.3, 0.5, 0.06, 0.2, old);
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->stopLock();
+    }
+
+    void aFoundBoxOverPlainGroundEndsTheLockAndSaysWhy()
+    {
+        _link->keepPictures(true);
+        QImage picture = _picture(0.5, 0.5, false);
+        for (int y = 60; y < 156; ++y) {
+            uchar *row = picture.scanLine(y);
+            for (int x = 140; x < 244; ++x) {
+                row[x] = 120;
+            }
+        }
+        for (int i = 0; i < 3; ++i) {
+            _link->lockPicture(picture, 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        _link->lockAtFound(0.5, 0.5, 0.1, 0.2, _link->pictureClockMs() - 60);
+        QVERIFY(!_link->lockActive() && !_link->lockBusy());
+        QVERIFY(_link->lockMessage().contains("plain area"));
+    }
+
+    void aSecondTapOnAMarkWhileTheFirstLockStartsIsNotTaken()
+    {
+        // Pictures are kept, and a lock waits for its first picture. A lock on a found object
+        // asked for now must not start the tracker on a kept picture with the waiting lock's box.
+        _link->keepPictures(true);
+        for (int i = 0; i < 3; ++i) {
+            _link->lockPicture(_picture(0.7, 0.3), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        const qint64 found = _link->newestKeptPictureMs();
+        _link->lockAtBox(0.3, 0.5, 0.06, 0.2);  // waits for the next picture
+        QVERIFY(_link->lockBusy() && !_link->lockActive());
+        _link->lockAtFound(0.7, 0.3, 0.06, 0.2, found);
+        QVERIFY2(_link->lockBusy() && !_link->lockActive(), "the kept pictures started the lock that was waiting");
+        _link->stopLock();
+    }
+
+    void aLockOnAFoundObjectEndsWhenNoPictureComesAfterIt()
+    {
+        // The video dies at the moment of the tap: the lock started on the kept pictures, and no
+        // picture follows. It must end as any lock does, three seconds after the last picture.
+        _link->keepPictures(true);
+        for (int i = 0; i < 4; ++i) {
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        _link->lockAtFound(0.5, 0.5, 0.06, 0.2, _link->pictureClockMs() - 60);
+        QVERIFY(_link->lockActive());
+        QTest::qWait(2500);
+        QVERIFY(_link->lockActive());
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->lockActive(), 1500);
+        QVERIFY2(_link->lockMessage().contains("the video stopped"), qPrintable(_link->lockMessage()));
+    }
+
+    void aLockOnAFoundObjectReplacesTheLockThatIsOn()
+    {
+        _link->keepPictures(true);
+        _link->lockAtBox(0.3, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.3, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive() && std::abs(_link->lockBoxU() - 0.3) < 0.01);
+        QTest::qWait(30);
+        // The same pictures are kept while a lock is on. Another object is found in the next one.
+        _link->lockPicture(_picture(0.7, 0.3), 0.0, 0.0, 1.0, 1.0);
+        const qint64 found = _link->newestKeptPictureMs();
+        QTest::qWait(30);
+        _link->lockPicture(_picture(0.72, 0.3), 0.0, 0.0, 1.0, 1.0);
+        _link->lockAtFound(0.7, 0.3, 0.06, 0.2, found);
+        QVERIFY(_link->lockActive() && _link->lockSeen());
+        QVERIFY(std::abs(_link->lockBoxU() - 0.72) < 0.015 && std::abs(_link->lockBoxV() - 0.3) < 0.02);
+        _link->stopLock();
+    }
+
+    // --- The marks on people and vehicles -------------------------------------------
+
+    void marksRunWhileTheLockButtonWaitsAndTheSwitchIsOn()
+    {
+        _withMarks();
+        QVERIFY(_marks->enabled() && _marks->usable());
+        QVERIFY(!_marks->running() && !_marks->wantsPicture() && _marks->state().isEmpty());
+        QVERIFY(!_link->keepsPictures());
+        QSignalSpy running(_marks, &ObjectMarks::runningChanged);
+        _marks->setLooking(true);
+        QVERIFY(_marks->running() && _marks->wantsPicture());
+        // The link keeps the pictures that a lock on a mark starts with.
+        QVERIFY(_link->keepsPictures() && _link->lockWantsPictures());
+        QCOMPARE(_marks->state(), QString("Looking for people and vehicles..."));
+        QCOMPARE(running.count(), 1);
+        _marks->setEnabled(false);
+        QVERIFY(!_marks->running() && !_marks->wantsPicture() && !_link->keepsPictures());
+        QVERIFY(_marks->state().isEmpty());
+        _marks->setEnabled(true);
+        QVERIFY(_marks->running());
+        _marks->setLooking(false);
+        QVERIFY(!_marks->running() && !_link->keepsPictures());
+        QCOMPARE(running.count(), 4);
+        // A picture that nobody asked for is not looked at, and the network is not even loaded.
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0);
+        QTest::qWait(60);
+        QCOMPARE(_asks(), 0);
+        QCOMPARE(_seen->loads, 0);
+    }
+
+    void theMarksSwitchIsKeptForTheNextStart()
+    {
+        _withMarks();
+        QSignalSpy changed(_marks, &ObjectMarks::enabledChanged);
+        _marks->setEnabled(false);
+        _marks->setEnabled(false);
+        QCOMPARE(changed.count(), 1);
+        delete _marks;
+        _withMarks();
+        QVERIFY(!_marks->enabled());
+        _marks->setLooking(true);
+        QVERIFY(!_marks->running());  // off stays off
+        _marks->setEnabled(true);
+        QVERIFY(_marks->running());
+        delete _marks;
+        _withMarks();
+        QVERIFY(_marks->enabled());
+    }
+
+    void whatTheFinderFindsIsMarked()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0, 0.9), _thing(Kind::Vehicle, 200.0, 600.0, 128.0, 72.0, 0.7)});
+        _marks->setLooking(true);
+        QSignalSpy changed(_marks, &ObjectMarks::marksChanged);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 2);
+        QVERIFY(changed.count() >= 1);
+        QCOMPARE(_seen->loads, 1);
+        const QVariantList marks = _marks->marks();
+        QCOMPARE(marks.size(), 2);
+        // The surest first, in parts of the picture.
+        const QVariantMap person = marks.at(0).toMap();
+        QCOMPARE(person.value("kind").toString(), QString("person"));
+        QVERIFY(_near(person.value("u").toDouble(), 0.5) && _near(person.value("v").toDouble(), 0.5));
+        QVERIFY(_near(person.value("w").toDouble(), 32.0 / 1280.0) && _near(person.value("h").toDouble(), 0.1));
+        const QVariantMap vehicle = marks.at(1).toMap();
+        QCOMPARE(vehicle.value("kind").toString(), QString("vehicle"));
+        QVERIFY(_near(vehicle.value("u").toDouble(), 200.0 / 1280.0) && _near(vehicle.value("v").toDouble(), 600.0 / 720.0));
+        QVERIFY(_near(vehicle.value("w").toDouble(), 0.1) && _near(vehicle.value("h").toDouble(), 0.1));
+        QVERIFY2(_marks->state().startsWith("Marked: 1 person, 1 vehicle. A look takes "), qPrintable(_marks->state()));
+    }
+
+    void theStateLineCountsWhatIsMarked()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QVERIFY2(_marks->state().startsWith("No person or vehicle found. A look takes "), qPrintable(_marks->state()));
+        _see({_thing(Kind::Vehicle, 200.0, 600.0, 128.0, 72.0)});
+        QVERIFY(_lookAgain());
+        QVERIFY2(_marks->state().startsWith("Marked: 1 vehicle. "), qPrintable(_marks->state()));
+        _see({_thing(Kind::Person, 200.0, 200.0, 32.0, 72.0), _thing(Kind::Person, 600.0, 200.0, 32.0, 72.0),
+              _thing(Kind::Vehicle, 200.0, 600.0, 128.0, 72.0), _thing(Kind::Vehicle, 600.0, 600.0, 128.0, 72.0),
+              _thing(Kind::Vehicle, 1000.0, 600.0, 128.0, 72.0)});
+        QVERIFY(_lookAgain());
+        QVERIFY2(_marks->state().startsWith("Marked: 2 people, 3 vehicles. "), qPrintable(_marks->state()));
+        QCOMPARE(_marks->count(), 5);
+        _see({_thing(Kind::Person, 200.0, 200.0, 32.0, 72.0)});
+        QVERIFY(_lookAgain());
+        QVERIFY(_lookAgain());  // the others were held for one look
+        QVERIFY2(_marks->state().startsWith("Marked: 1 person. "), qPrintable(_marks->state()));
+        QVERIFY(_marks->state().endsWith(" s."));
+    }
+
+    void aPictureGetsTwoLooksTheWholeOfItAndItsMiddle()
+    {
+        _withMarks();
+        _seen->sleepMs = 2;
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_asks(), 2);
+        QCOMPARE(_seen->sizes.at(0), QSize(1280, 720));
+        // All of the picture, in 640 x 384 points.
+        QVERIFY(_isArea(_ask(0).area, 0, 0, 1280, 720) && _ask(0).inputW == 640 && _ask(0).inputH == 384 && _ask(0).keepShape);
+        // And its middle 640 x 384 points at their own size: how fast the device is, is not known yet.
+        QVERIFY(_isArea(_ask(1).area, 320, 168, 640, 384) && _ask(1).inputW == 640 && _ask(1).inputH == 384);
+        QVERIFY(_near(_marks->closeLook().x(), 0.25) && _near(_marks->closeLook().width(), 0.5));
+        QVERIFY(_near(_marks->closeLook().y(), 168.0 / 720.0) && _near(_marks->closeLook().height(), 384.0 / 720.0));
+        // This finder answered in a few milliseconds: a fast device. From now on all of the
+        // picture is looked at at its own size too, and no part is told to the screen as the close one.
+        QVERIFY(_lookAgain());
+        QCOMPARE(_asks(), 4);
+        QVERIFY(_isArea(_ask(2).area, 0, 0, 1280, 720) && _ask(2).inputW == 640);
+        QVERIFY(_isArea(_ask(3).area, 0, 0, 1280, 720) && _ask(3).inputW == 1280 && _ask(3).inputH == 736);
+        QVERIFY(_marks->closeLook().isEmpty());
+    }
+
+    void aSlowDeviceKeepsToTheMiddle()
+    {
+        _withMarks();
+        _seen->sleepMs = 300;  // 0.3 s for a look of 640 x 384 points
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QVERIFY(_lookAgain());
+        QCOMPARE(_asks(), 4);
+        QVERIFY(_isArea(_ask(3).area, 320, 168, 640, 384) && _ask(3).inputW == 640 && _ask(3).inputH == 384);
+        QVERIFY(_near(_marks->closeLook().width(), 0.5));
+        QVERIFY(_marks->lookMs() >= 590.0);  // one look after the other in this test
+        QVERIFY2(_marks->state().contains("A look takes 0.6 s.") || _marks->state().contains("A look takes 0.7 s."),
+                 qPrintable(_marks->state()));
+    }
+
+    void theMiddleStaysTheSizeTheDeviceHasTimeFor()
+    {
+        _withMarks();
+        _seen->sleepMs = 150;  // for a look of 640 x 384 points; a larger look takes longer in proportion
+        _seen->sleepBySize = true;
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        // 0.15 s for 640 x 384 points: the middle 960 x 544 takes 0.32 s, all of the picture would take 0.57 s.
+        for (int i = 1; i <= 5; ++i) {
+            QVERIFY(_lookAgain());
+            const skydroid::find::Ask middle = _ask(2 * i + 1);
+            QVERIFY2(_isArea(middle.area, 160, 88, 960, 544),
+                     qPrintable(QString("look %1: a middle of %2 x %3").arg(i).arg(middle.area.width).arg(middle.area.height)));
+        }
+        QVERIFY(_near(_marks->closeLook().width(), 0.75) && _near(_marks->closeLook().x(), 0.125));
+    }
+
+    void atThePicturesOwnSideTheCloseLooksBoxIsTheOneKept()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _seen->growWhenSmaller = 6.0;  // a box found in the picture made smaller is 6 points too wide
+        // The thermal picture starts 190 points into its image. A car stands at its left side.
+        _see({_thing(Kind::Vehicle, 190.0 + 60.0, 360.0, 120.0, 70.0)});
+        _marks->setLooking(true);
+        const QRectF thermal(190.0 / 1280.0, 0.0, 900.0 / 1280.0, 1.0);
+        QVERIFY(_look(thermal));
+        QVERIFY(_lookAgain(thermal));  // a fast device: all of the picture at its own size now
+        QVERIFY(_isArea(_ask(3).area, 190, 0, 900, 720));
+        QCOMPARE(_marks->count(), 1);
+        // The picture's own side cuts nothing: the close look's box is the one shown, not the wider one.
+        QVERIFY2(_near(_marks->marksNow().at(0).box.w, 120.0 / 900.0),
+                 qPrintable(QString::number(_marks->marksNow().at(0).box.w * 900.0)));
+    }
+
+    void aThermalPictureIsLookedAtInsideItsBars()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        // The 5:4 thermal picture in the middle of a 16:9 image: 900 of its 1280 points.
+        _see({_thing(Kind::Person, 640.0, 360.0, 36.0, 72.0), _thing(Kind::Person, 100.0, 360.0, 36.0, 72.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look(QRectF(190.0 / 1280.0, 0.0, 900.0 / 1280.0, 1.0)));
+        QCOMPARE(_asks(), 2);
+        QVERIFY(_isArea(_ask(0).area, 190, 0, 900, 720) && _ask(0).inputW == 480 && _ask(0).inputH == 384);
+        QVERIFY(_isArea(_ask(1).area, 320, 168, 640, 384));
+        // The person in the bar beside the picture is not marked, the one in its middle is: at
+        // half of the picture, not of the image.
+        QCOMPARE(_marks->count(), 1);
+        const skydroid::find::Found box = _marks->marksNow().at(0).box;
+        QVERIFY(_near(box.cx, 0.5) && _near(box.cy, 0.5) && _near(box.w, 36.0 / 900.0) && _near(box.h, 0.1));
+        QVERIFY(_near(_marks->closeLook().x(), 130.0 / 900.0) && _near(_marks->closeLook().width(), 640.0 / 900.0));
+    }
+
+    void aTapBesideASmallMarkCountsByThePicturesShape()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        // A small person in the middle of the thermal picture (5 to 4): 9 x 27 of its 900 x 720 points.
+        _see({_thing(Kind::Person, 640.0, 360.0, 9.0, 27.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look(QRectF(190.0 / 1280.0, 0.0, 900.0 / 1280.0, 1.0)));
+        QCOMPARE(_marks->count(), 1);
+        const double below = 0.5 + 27.0 / 720.0 / 2.0;  // the mark's lower side, in parts of the picture
+        // A finger's width is 0.012 of the picture's width: that is 0.015 of its height here
+        // (it would be 0.021 in the camera's 16 to 9 picture).
+        QVERIFY(!_marks->lockAt(0.5, below + 0.018));
+        QVERIFY(!_link->lockBusy() && !_link->lockActive());
+        QVERIFY(_marks->lockAt(0.5, below + 0.013));
+        QVERIFY(_link->lockBusy() || _link->lockActive());
+        _link->stopLock();
+    }
+
+    void anObjectInBothLooksIsOneMark()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        // Large enough for the whole picture's look, and in the middle: both looks find it.
+        _see({_thing(Kind::Vehicle, 640.0, 360.0, 150.0, 80.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);
+        // A car across the middle's left border: the middle sees half of it, the whole picture all.
+        _see({_thing(Kind::Vehicle, 320.0, 360.0, 150.0, 80.0)});
+        delete _marks;
+        _withMarks();
+        _see({_thing(Kind::Vehicle, 320.0, 360.0, 150.0, 80.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);
+        QVERIFY(_near(_marks->marksNow().at(0).box.w, 150.0 / 1280.0));
+    }
+
+    void aSmallObjectIsMarkedOnlyWhereTheAppLooksClosely()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 300;  // a slow device: only the middle is looked at at its own size
+        // Two people 30 points tall: one in the middle of the picture, one near its corner.
+        _see({_thing(Kind::Person, 640.0, 360.0, 13.0, 30.0), _thing(Kind::Person, 100.0, 100.0, 13.0, 30.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);
+        QVERIFY(_near(_marks->marksNow().at(0).box.cx, 0.5));
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marks->count(), 1);
+    }
+
+    void onAFastDeviceSmallObjectsAreMarkedEverywhere()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _see({_thing(Kind::Person, 640.0, 360.0, 13.0, 30.0), _thing(Kind::Person, 100.0, 100.0, 13.0, 30.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);  // the first picture: the speed is not known yet
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marks->count(), 2);
+    }
+
+    void aMarkStaysForOneMoreLookWhenItsObjectIsMissed()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 2;
+        const skydroid::find::Found person = _thing(Kind::Person, 640.0, 360.0, 32.0, 72.0);
+        const skydroid::find::Found car = _thing(Kind::Vehicle, 300.0, 600.0, 120.0, 70.0);
+        _see({person, car});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 2);
+        const qint64 firstSeen = _marks->marksNow().at(0).atMs;
+        // The next look misses the person: their mark stays, with the time of the picture they were found in.
+        _see({car});
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marked(Kind::Person), 1);
+        QCOMPARE(_marked(Kind::Vehicle), 1);
+        for (const ObjectMarks::Mark &mark : _marks->marksNow()) {
+            if (mark.box.kind == Kind::Person) {
+                QCOMPARE(mark.atMs, firstSeen);
+                QCOMPARE(mark.missed, 1);
+            } else {
+                QVERIFY(mark.atMs > firstSeen);
+                QCOMPARE(mark.missed, 0);
+            }
+        }
+        // Missed again: the mark goes.
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marked(Kind::Person), 0);
+        QCOMPARE(_marked(Kind::Vehicle), 1);
+        // Found again: marked again.
+        _see({person, car});
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marks->count(), 2);
+    }
+
+    void aMarkGoesWithItsObjectAndLeavesNoSecondOneBehind()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);
+        // Between two looks the walker goes on by more than their own width: the boxes do not even touch.
+        _see({_thing(Kind::Person, 690.0, 362.0, 32.0, 72.0)});
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marks->count(), 1);
+        QVERIFY(_near(_marks->marksNow().at(0).box.cx, 690.0 / 1280.0));
+        QCOMPARE(_marks->marksNow().at(0).missed, 0);
+        // Someone else, far from the first: the first one's mark is held as missed, not taken over.
+        _see({_thing(Kind::Person, 200.0, 362.0, 32.0, 72.0)});
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marks->count(), 2);
+        // A vehicle where the person was is no person.
+        delete _marks;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        _see({_thing(Kind::Vehicle, 650.0, 360.0, 120.0, 72.0)});
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marked(Kind::Person), 1);
+        QCOMPARE(_marked(Kind::Vehicle), 1);
+    }
+
+    void whatTakesThePlaceOfAnOldMark()
+    {
+        using skydroid::find::Kind;
+        const skydroid::find::Found old = _thing(Kind::Person, 0.5, 0.5, 0.02, 0.1);
+        QVERIFY(ObjectMarks::takesThePlaceOf(_thing(Kind::Person, 0.5, 0.5, 0.02, 0.1), old));
+        QVERIFY(ObjectMarks::takesThePlaceOf(_thing(Kind::Person, 0.539, 0.5, 0.02, 0.1), old));   // two widths on
+        QVERIFY(!ObjectMarks::takesThePlaceOf(_thing(Kind::Person, 0.541, 0.5, 0.02, 0.1), old));  // a little more
+        QVERIFY(ObjectMarks::takesThePlaceOf(_thing(Kind::Person, 0.5, 0.699, 0.02, 0.1), old));   // two heights down
+        QVERIFY(!ObjectMarks::takesThePlaceOf(_thing(Kind::Person, 0.5, 0.701, 0.02, 0.1), old));
+        QVERIFY(!ObjectMarks::takesThePlaceOf(_thing(Kind::Vehicle, 0.5, 0.5, 0.02, 0.1), old));   // another kind
+    }
+
+    void marksGoAwayWhenNoLookComesForTooLong()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);
+        QTest::qWait(1900);
+        QCOMPARE(_marks->count(), 1);  // 1.9 s old: still shown
+        QSignalSpy changed(_marks, &ObjectMarks::marksChanged);
+        QTRY_COMPARE_WITH_TIMEOUT(_marks->count(), 0, 1000);  // 2.2 s: gone
+        QVERIFY(changed.count() >= 1);
+        QVERIFY2(_marks->state().startsWith("No person or vehicle found."), qPrintable(_marks->state()));
+    }
+
+    void marksGoAwayWhenTheLockButtonNoLongerWaits()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);
+        QSignalSpy changed(_marks, &ObjectMarks::marksChanged);
+        _marks->setLooking(false);
+        QCOMPARE(_marks->count(), 0);
+        QVERIFY(_marks->marks().isEmpty());
+        QCOMPARE(changed.count(), 1);
+        QVERIFY(_marks->closeLook().isEmpty());
+        QVERIFY(!_marks->lockAt(0.5, 0.5));  // and a tap is not theirs any more
+    }
+
+    void anAnswerFromBeforeTheButtonWasPressedIsNotShown()
+    {
+        using skydroid::find::Kind;
+        _withMarks(true);  // on its own thread: the look goes on while the operator presses
+        _seen->sleepMs = 100;
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QSignalSpy done(_marks, &ObjectMarks::lookDone);
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0);  // a look is under way
+        QTest::qWait(10);
+        _marks->setLooking(false);  // the operator cancels
+        QTest::qWait(10);
+        _marks->setLooking(true);   // and presses again
+        QVERIFY(!_marks->wantsPicture());  // the old look is not over
+        QVERIFY(done.wait(3000));
+        QCOMPARE(_marks->count(), 0);  // its picture is from before the button was pressed
+        QCOMPARE(_marks->state(), QString("Looking for people and vehicles..."));
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marks->count(), 1);
+    }
+
+    void anAnswerThatComesAfterMarkingStoppedIsDropped()
+    {
+        using skydroid::find::Kind;
+        _withMarks(true);  // on its own thread: the look goes on while the operator presses
+        _seen->sleepMs = 100;
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QSignalSpy done(_marks, &ObjectMarks::lookDone);
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0);
+        QTest::qWait(10);
+        _marks->setLooking(false);  // the operator cancels while the finder looks
+        QSignalSpy changed(_marks, &ObjectMarks::marksChanged);
+        QVERIFY(done.wait(3000));
+        QCOMPARE(_marks->count(), 0);
+        QVERIFY(_marks->marks().isEmpty());
+        QCOMPARE(changed.count(), 0);
+        QVERIFY(!_marks->lockAt(0.5, 0.5));
+        QVERIFY(!_link->lockBusy() && !_link->lockActive());
+    }
+
+    void aFinderThatWasNeverLoadedHasNothingToGiveBack()
+    {
+        _withMarks();
+        _marks->setIdleRestMs(100);
+        _marks->setLooking(true);
+        _marks->setLooking(false);  // pressed and cancelled before a picture came
+        QTest::qWait(350);
+        QCOMPARE(_seen->loads, 0);
+        QCOMPARE(_seen->rests, 0);
+    }
+
+    void aBlackPictureIsSaidToBeNoVideoAndIsNotLookedAt()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);
+        const int asked = _asks();
+        // The video goes black (it restarts, or this device cannot copy its video picture).
+        QImage black(1280, 720, QImage::Format_ARGB32_Premultiplied);
+        black.fill(Qt::black);
+        QVERIFY(_lookAgain(QRectF(0.0, 0.0, 1.0, 1.0), &black));
+        QCOMPARE(_asks(), asked);  // the finder is not asked about nothing
+        QCOMPARE(_marks->count(), 0);  // and no mark is held over a black picture
+        QCOMPARE(_marks->state(), QString("The video picture does not reach the app (it is black), so nothing can be marked."));
+        QVERIFY(_marks->running() && _marks->usable());
+        // The next picture is asked for half a second later, not at once: getting one costs the screen time.
+        QTest::qWait(300);
+        QVERIFY(!_marks->wantsPicture());
+        QTRY_VERIFY_WITH_TIMEOUT(_marks->wantsPicture(), 1000);
+        // One flat grey is no video either. A dark picture with something in it is one.
+        QImage grey(1280, 720, QImage::Format_RGB888);
+        grey.fill(QColor(40, 41, 42));
+        QVERIFY(_look(QRectF(0.0, 0.0, 1.0, 1.0), &grey));
+        QCOMPARE(_asks(), asked);
+        QVERIFY(_marks->state().contains("does not reach the app"));
+        QImage dark = grey;
+        for (int x = 600; x < 680; ++x) {
+            dark.setPixelColor(x, 360, QColor(48, 41, 42));
+        }
+        QVERIFY(_lookAgain(QRectF(0.0, 0.0, 1.0, 1.0), &dark));
+        QVERIFY(_asks() > asked);
+        QCOMPARE(_marks->count(), 1);
+        QVERIFY2(_marks->state().startsWith("Marked: 1 person."), qPrintable(_marks->state()));
+        // Only the video picture counts, not what is beside it in the image.
+        QImage beside(1280, 720, QImage::Format_RGB888);
+        beside.fill(Qt::black);
+        for (int y = 0; y < 720; ++y) {
+            uchar *row = beside.scanLine(y);
+            for (int x = 0; x < 160; ++x) {
+                row[3 * x] = static_cast<uchar>(120 + (x % 16) * 8);
+                row[3 * x + 1] = 200;
+            }
+        }
+        const int before = _asks();
+        QVERIFY(_lookAgain(QRectF(190.0 / 1280.0, 0.0, 900.0 / 1280.0, 1.0), &beside));
+        QCOMPARE(_asks(), before);
+        QVERIFY(_marks->state().contains("does not reach the app"));
+    }
+
+    void theStateLineTellsHowLongAPictureTakesToGet()
+    {
+        _withMarks();
+        _seen->sleepMs = 2;
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QVERIFY2(_marks->state().endsWith(" s.") && !_marks->state().contains("Getting a picture"), qPrintable(_marks->state()));
+        // The screen says how long its picture took: 48 ms.
+        QTRY_VERIFY_WITH_TIMEOUT(_marks->wantsPicture(), 2000);
+        QSignalSpy done(_marks, &ObjectMarks::lookDone);
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0, 48.0);
+        QVERIFY(done.wait(3000));
+        QVERIFY2(_marks->state().endsWith("Getting a picture takes 0.05 s."), qPrintable(_marks->state()));
+        // A time that is none is not told.
+        QTRY_VERIFY_WITH_TIMEOUT(_marks->wantsPicture(), 2000);
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0, std::numeric_limits<double>::infinity());
+        QVERIFY(done.wait(3000));
+        QVERIFY2(!_marks->state().contains("Getting a picture"), qPrintable(_marks->state()));
+    }
+
+    void aZoomStepOrTheOtherLensDropsTheMarks()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 1);
+        _link->zoom(1);
+        QCOMPARE(_marks->count(), 0);
+        QVERIFY(_lookAgain());
+        QCOMPARE(_marks->count(), 1);
+        _link->setThermalPicture(true);
+        QCOMPARE(_marks->count(), 0);
+        QVERIFY(_marks->running());  // it goes on looking
+    }
+
+    void aTapOnAMarkLocksItsObjectWhereItIsNow()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _marks->setLooking(true);
+        // A person walks across the picture: at 0.30 of its width first, 0.02 further with every picture.
+        const auto at = [](int i) { return 0.30 + 0.02 * i; };
+        for (int i = 0; i <= 14; ++i) {
+            _link->lockPicture(_picture(at(i), 0.5), 0.0, 0.0, 1.0, 1.0);
+            if (i == 2) {
+                // The finder looks at this moment's picture, and finds the walker there.
+                _see({_thing(Kind::Person, at(2) * 1280.0, 360.0, 0.06 * 1280.0, 0.2 * 720.0)});
+                QVERIFY(_look());
+                QCOMPARE(_marks->count(), 1);
+            }
+            QTest::qWait(70);  // as the screen gives them: 14 pictures a second
+        }
+        // The mark is where the walker was. The operator taps it.
+        QVERIFY(_near(_marks->marksNow().at(0).box.cx, at(2)));
+        QVERIFY(_marks->lockAt(at(2), 0.5));
+        QVERIFY(_link->lockActive() && _link->lockByApp());
+        QVERIFY2(_link->lockSeen(), qPrintable(_link->lockNumbers()));
+        // The lock is on the walker, twelve pictures on.
+        QVERIFY2(std::abs(_link->lockBoxU() - at(14)) < 0.015,
+                 qPrintable(QString("box at %1, walker at %2").arg(_link->lockBoxU()).arg(at(14))));
+        _link->stopLock();
+    }
+
+    void aTapBesideAllMarksLocksNothing()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QVERIFY(!_marks->lockAt(0.9, 0.9));
+        QVERIFY(!_marks->lockAt(std::nan(""), 0.5));
+        QVERIFY(!_link->lockBusy() && !_link->lockActive());
+        // On the mark: the lock is asked for (no picture was kept here, so it waits for one).
+        QVERIFY(_marks->lockAt(0.5, 0.5));
+        QVERIFY(_link->lockBusy() || _link->lockActive());
+        _link->stopLock();
+    }
+
+    void whichMarkATapMeans()
+    {
+        using skydroid::find::Kind;
+        const double shape = 16.0 / 9.0;
+        const std::vector<ObjectMarks::Mark> marks = {_mark(Kind::Vehicle, 0.5, 0.5, 0.2, 0.2),
+                                                      _mark(Kind::Person, 0.52, 0.5, 0.02, 0.08),
+                                                      _mark(Kind::Person, 0.8, 0.2, 0.01, 0.04)};
+        QCOMPARE(ObjectMarks::markAt(marks, 0.45, 0.45, shape), 0);  // inside the vehicle
+        QCOMPARE(ObjectMarks::markAt(marks, 0.52, 0.5, shape), 1);   // inside both: the smaller, the rider
+        // Beside a small mark: a finger's width still means it (0.012 of the picture's width).
+        QCOMPARE(ObjectMarks::markAt(marks, 0.8 + 0.005 + 0.010, 0.2, shape), 2);
+        QCOMPARE(ObjectMarks::markAt(marks, 0.8 + 0.005 + 0.014, 0.2, shape), -1);
+        QCOMPARE(ObjectMarks::markAt(marks, 0.8, 0.2 + 0.02 + 0.020, shape), 2);  // the same on the screen, downwards
+        QCOMPARE(ObjectMarks::markAt(marks, 0.8, 0.2 + 0.02 + 0.023, shape), -1);
+        // Beside a large mark: three tenths of its size.
+        QCOMPARE(ObjectMarks::markAt(marks, 0.35, 0.5, shape), 0);
+        QCOMPARE(ObjectMarks::markAt(marks, 0.33, 0.5, shape), -1);
+        // Between two marks: the nearer.
+        const std::vector<ObjectMarks::Mark> two = {_mark(Kind::Person, 0.40, 0.5, 0.02, 0.08),
+                                                    _mark(Kind::Person, 0.44, 0.5, 0.02, 0.08)};
+        QCOMPARE(ObjectMarks::markAt(two, 0.418, 0.5, shape), 0);
+        QCOMPARE(ObjectMarks::markAt(two, 0.424, 0.5, shape), 1);
+        QCOMPARE(ObjectMarks::markAt(two, 0.4205, 0.5, shape), 1);  // a finger's width from both: the second is nearer
+        QCOMPARE(ObjectMarks::markAt(two, 0.4195, 0.5, shape), 0);
+        QCOMPARE(ObjectMarks::markAt({}, 0.5, 0.5, shape), -1);
+        QCOMPARE(ObjectMarks::markAt(marks, std::nan(""), 0.5, shape), -1);
+        QCOMPARE(ObjectMarks::markAt(marks, 0.45, 0.45, std::nan("")), 0);  // a shape that is none: 16 to 9
+    }
+
+    void howLongTheFinderRests()
+    {
+        QCOMPARE(ObjectMarks::restAfter(0.0), 60);
+        QCOMPARE(ObjectMarks::restAfter(100.0), 60);
+        QCOMPARE(ObjectMarks::restAfter(200.0), 60);
+        QCOMPARE(ObjectMarks::restAfter(300.0), 90);
+        QCOMPARE(ObjectMarks::restAfter(1000.0), 300);
+        QCOMPARE(ObjectMarks::restAfter(-5.0), 60);
+        QCOMPARE(ObjectMarks::restAfter(std::nan("")), 60);
+        QCOMPARE(ObjectMarks::restAfter(1.0e12), 18000);
+        QCOMPARE(ObjectMarks::restAfter(std::numeric_limits<double>::infinity()), 60);  // no number: the least rest
+    }
+
+    void theFinderRestsBetweenItsLooks()
+    {
+        _withMarks();
+        _seen->sleepMs = 100;
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QVERIFY(!_marks->wantsPicture());  // resting
+        QVERIFY2(_marks->lookMs() >= 195.0 && _marks->lookMs() < 400.0, qPrintable(QString::number(_marks->lookMs())));
+        const int rest = ObjectMarks::restAfter(_marks->lookMs());
+        QVERIFY(rest >= 60);
+        QElapsedTimer clock;
+        clock.start();
+        QTRY_VERIFY_WITH_TIMEOUT(_marks->wantsPicture(), 2000);
+        QVERIFY2(clock.elapsed() >= rest - 30 && clock.elapsed() <= rest + 400, qPrintable(QString::number(clock.elapsed())));
+    }
+
+    void oneLookAtATime()
+    {
+        _withMarks();
+        _seen->sleepMs = 80;
+        _marks->setLooking(true);
+        QSignalSpy done(_marks, &ObjectMarks::lookDone);
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(!_marks->wantsPicture());
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0);  // pictures that come anyway are not looked at
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(done.wait(3000));
+        QTest::qWait(250);
+        QCOMPARE(done.count(), 1);
+        QCOMPARE(_asks(), 2);  // one picture: its two looks
+        // A picture that is none is not looked at either.
+        QTRY_VERIFY_WITH_TIMEOUT(_marks->wantsPicture(), 2000);
+        _marks->picture(QImage(), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_marks->wantsPicture());
+        // And one with no room for a picture in it gives no marks, and no trouble.
+        QVERIFY(_look(QRectF(0.0, 0.0, 0.01, 0.01)));
+        QCOMPARE(_asks(), 2);
+        QCOMPARE(_marks->count(), 0);
+        // (It is not taken for a black video: that message would send the operator the wrong way.)
+        QVERIFY2(_marks->state().startsWith("No person or vehicle found."), qPrintable(_marks->state()));
+        QVERIFY(_lookAgain(QRectF(0.0, 0.0, std::nan(""), 1.0)));  // nor one whose place is no number
+        QCOMPARE(_asks(), 2);
+        QVERIFY(_lookAgain(QRectF(std::nan(""), 0.0, 1.0, 1.0)));
+        QCOMPARE(_asks(), 2);
+        QVERIFY(_lookAgain(QRectF(0.0, std::numeric_limits<double>::infinity(), 1.0, 1.0)));
+        QCOMPARE(_asks(), 2);
+        QVERIFY2(_marks->state().startsWith("No person or vehicle found.") && !_marks->state().contains("trouble"),
+                 qPrintable(_marks->state()));
+    }
+
+    void aFinderThatCannotWorkSaysSoAndIsLeftAlone()
+    {
+        _withMarks();
+        _seen->canLoad = false;
+        _seen->whyNot = "this build has no object finding in it";
+        _marks->setLooking(true);
+        QSignalSpy state(_marks, &ObjectMarks::stateChanged);
+        QVERIFY(_look());
+        QVERIFY(!_marks->usable() && !_marks->running() && !_marks->wantsPicture());
+        QCOMPARE(_marks->state(), QString("People and vehicles cannot be marked: this build has no object finding in it."));
+        QVERIFY(state.count() >= 1);
+        QVERIFY(!_link->keepsPictures());
+        QCOMPARE(_seen->loads, 1);
+        QCOMPARE(_asks(), 0);
+        // It is not tried again, whatever the operator presses.
+        _marks->setLooking(false);
+        _marks->setLooking(true);
+        QVERIFY(!_marks->running());
+        _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0);
+        QTest::qWait(60);
+        QCOMPARE(_seen->loads, 1);
+        QVERIFY(!_marks->lockAt(0.5, 0.5));
+    }
+
+    void aLookThatFailsIsToldInTheStateLine()
+    {
+        _withMarks();
+        _seen->sleepMs = 2;
+        _seen->trouble = "no memory for the picture";
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QVERIFY(_marks->usable() && _marks->running());
+        QVERIFY2(_marks->state().contains("The finder has trouble: no memory for the picture."), qPrintable(_marks->state()));
+        // A look that failed says nothing of how fast the device is: the next one is as careful
+        // as the first (the whole picture, and the smallest middle).
+        QVERIFY(_lookAgain());
+        QCOMPARE(_asks(), 4);
+        QVERIFY(_isArea(_ask(3).area, 320, 168, 640, 384));
+        {
+            QMutexLocker lock(&_seen->mutex);
+            _seen->trouble.clear();
+        }
+        QVERIFY(_lookAgain());
+        QVERIFY(!_marks->state().contains("trouble"));
+        // Trouble with the close look alone is told too.
+        {
+            QMutexLocker lock(&_seen->mutex);
+            _seen->trouble = "no memory for the picture";
+            _seen->troubleCloseOnly = true;
+        }
+        QVERIFY(_lookAgain());
+        QVERIFY2(_marks->state().contains("The finder has trouble: no memory for the picture."), qPrintable(_marks->state()));
+    }
+
+    void theFinderGivesItsMemoryBackWhenItIsNotUsed()
+    {
+        _withMarks();
+        _marks->setIdleRestMs(150);
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_seen->loads, 1);
+        QTest::qWait(300);
+        QCOMPARE(_seen->rests, 0);  // in use: nothing is given back
+        _marks->setLooking(false);
+        QTRY_COMPARE_WITH_TIMEOUT(_seen->rests, 1, 2000);
+        QTest::qWait(300);
+        QCOMPARE(_seen->rests, 1);  // once
+        // The next look loads it again.
+        _marks->setLooking(true);
+        QVERIFY(_lookAgain());
+        QCOMPARE(_seen->loads, 2);
+        // Pressed again before the time was up: it stays loaded.
+        _marks->setLooking(false);
+        QTest::qWait(60);
+        _marks->setLooking(true);
+        QTest::qWait(300);
+        QCOMPARE(_seen->rests, 1);
+    }
+
+    void theNoticesComeWithTheFinder()
+    {
+        _withMarks();
+        QCOMPARE(_marks->notices(), QString("the notices of the stand-in finder"));
+        QCOMPARE(_marks->finderName(), QString("a stand-in finder"));
+        QCOMPARE(_marks->pictureWidth(), 1280);
+    }
+
+    void theLooksRunOnAThreadOfTheirOwn()
+    {
+        using skydroid::find::Kind;
+        _withMarks(true);
+        _seen->sleepMs = 120;
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0), _thing(Kind::Vehicle, 200.0, 600.0, 128.0, 72.0)});
+        _marks->setLooking(true);
+        QElapsedTimer clock;
+        clock.start();
+        while (_marks->count() < 2 && clock.elapsed() < 5000) {
+            if (_marks->wantsPicture()) {
+                _marks->picture(_markPicture, 0.0, 0.0, 1.0, 1.0);
+            }
+            QTest::qWait(10);
+        }
+        QCOMPARE(_marks->count(), 2);
+        QMutexLocker lock(&_seen->mutex);
+        QVERIFY(_seen->threads.size() >= 2);
+        for (const Qt::HANDLE thread : _seen->threads) {
+            QVERIFY(thread != QThread::currentThreadId());
+        }
+        if (QThread::idealThreadCount() >= 4) {
+            // Side by side: the two looks at a picture on two threads, and done in the time of one
+            // (0.12 s each: one after the other they would take 0.24 s).
+            QVERIFY(_seen->threads.at(0) != _seen->threads.at(1));
+            QVERIFY2(_marks->lookMs() < 215.0, qPrintable(QString::number(_marks->lookMs())));
+        }
+    }
+
 private:
+
+    /// The marks on this link, with a stand-in for the network: it finds what the test puts into
+    /// _seen. ownThread: the looks run on a thread of their own, as in the app.
+    void _withMarks(bool ownThread = false)
+    {
+        _seen = std::make_shared<FakePictureFinder::Seen>();
+        _marks = new ObjectMarks(_link, new FakePictureFinder(_seen), ownThread);
+        if (_markPicture.isNull()) {
+            // Ground with a pattern. (A picture of one flat colour counts as no video.)
+            _markPicture = QImage(1280, 720, QImage::Format_RGB888);
+            for (int y = 0; y < 720; ++y) {
+                uchar *row = _markPicture.scanLine(y);
+                for (int x = 0; x < 1280; ++x) {
+                    const uchar grey = static_cast<uchar>(70 + ((x / 16) * 37 + (y / 16) * 91) % 90);
+                    row[3 * x] = grey;
+                    row[3 * x + 1] = static_cast<uchar>(grey + 8);
+                    row[3 * x + 2] = static_cast<uchar>(grey / 2);
+                }
+            }
+        }
+    }
+
+    /// What is in the picture from now on, in points of the 1280 x 720 image the finder gets.
+    void _see(const std::vector<skydroid::find::Found> &objects)
+    {
+        QMutexLocker lock(&_seen->mutex);
+        _seen->objects = objects;
+    }
+
+    static skydroid::find::Found _thing(skydroid::find::Kind kind, double cx, double cy, double w, double h,
+                                        double score = 0.8)
+    {
+        skydroid::find::Found f;
+        f.kind = kind;
+        f.label = kind == skydroid::find::Kind::Person ? 0 : 2;
+        f.score = score;
+        f.cx = cx;
+        f.cy = cy;
+        f.w = w;
+        f.h = h;
+        return f;
+    }
+
+    static ObjectMarks::Mark _mark(skydroid::find::Kind kind, double u, double v, double w, double h)
+    {
+        ObjectMarks::Mark mark;
+        mark.box = _thing(kind, u, v, w, h);
+        return mark;
+    }
+
+    /// Gives the marks one picture for the finder (1280 x 720 points; pictureRect: where the video
+    /// picture is inside it) and waits for the answer. False when no picture was wanted, or no
+    /// answer came.
+    bool _look(const QRectF &pictureRect = QRectF(0.0, 0.0, 1.0, 1.0), const QImage *image = nullptr)
+    {
+        if (!_marks->wantsPicture()) {
+            return false;
+        }
+        QSignalSpy done(_marks, &ObjectMarks::lookDone);
+        _marks->picture(image ? *image : _markPicture, pictureRect.x(), pictureRect.y(), pictureRect.width(),
+                        pictureRect.height());
+        return done.count() > 0 || done.wait(5000);
+    }
+
+    /// Waits until the finder has rested, then looks.
+    bool _lookAgain(const QRectF &pictureRect = QRectF(0.0, 0.0, 1.0, 1.0), const QImage *image = nullptr)
+    {
+        QElapsedTimer clock;
+        clock.start();
+        while (!_marks->wantsPicture() && clock.elapsed() < 5000) {
+            QTest::qWait(5);
+        }
+        return _look(pictureRect, image);
+    }
+
+    int _asks() const
+    {
+        QMutexLocker lock(&_seen->mutex);
+        return static_cast<int>(_seen->asks.size());
+    }
+
+    skydroid::find::Ask _ask(int i) const
+    {
+        QMutexLocker lock(&_seen->mutex);
+        return _seen->asks.at(static_cast<std::size_t>(i));
+    }
+
+    static bool _isArea(const skydroid::find::Area &area, int left, int top, int width, int height)
+    {
+        return area.left == left && area.top == top && area.width == width && area.height == height;
+    }
+
+    static bool _near(double a, double b, double by = 1e-6)
+    {
+        return std::abs(a - b) <= by;
+    }
+
+    /// How many marks of a kind are shown.
+    int _marked(skydroid::find::Kind kind) const
+    {
+        int n = 0;
+        for (const ObjectMarks::Mark &mark : _marks->marksNow()) {
+            n += mark.box.kind == kind ? 1 : 0;
+        }
+        return n;
+    }
+
+    /// Follow Me on this link, with a stand-in for the drone: it hovers where the test's vehicle is,
+    /// in Loiter, its nose to 35 degrees.
+    void _withFollow()
+    {
+        _drone = new FakeFollowDrone;
+        _follow = new ObjectFollow(_link, _drone);
+        _telemetry = skydroid::follow::Drone{};
+        _telemetry.latDeg = _vehicle.position.latitude();
+        _telemetry.lonDeg = _vehicle.position.longitude();
+        _telemetry.heightM = 100.0;
+        _telemetry.northMps = 0.0;
+        _telemetry.eastMps = 0.0;
+        _telemetry.headingDeg = 35.0;
+        _telemetry.armed = true;
+        _telemetry.flying = true;
+        _telemetry.gps3d = true;
+        _telemetry.mode = skydroid::follow::Mode::Holding;
+        _tellTelemetry = true;
+    }
+
+    /// The drone has changed to Guided, as Follow asked.
+    void _nowGuided()
+    {
+        _telemetry.mode = skydroid::follow::Mode::Guided;
+        _drone->mode = "Guided";
+        _drone->tell(_telemetry);
+    }
+
+    /// The drone hovers this high over level ground, the camera this far down, straight ahead (north).
+    void _hoverAt(double heightM, double pitchDeg)
+    {
+        _vehicle.vehicle.set("altitudeRelative", heightM);
+        _vehicle.vehicle.set("altitudeAMSL", 250.0 + heightM);
+        _telemetry.heightM = heightM;
+        _camera->yaw = 0.0;
+        _camera->pitch = pitchDeg;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && _link->gimbalPitch() == pitchDeg, 2000);
+    }
+
+    /// The video goes on until `done`, or for this long: a picture every 90 ms with the object at u, v (or
+    /// without it), and the drone's telemetry with every other picture.
+    template <typename Done>
+    bool _goOnUntil(Done done, int timeoutMs, double u = 0.5, double v = 0.5, bool objectThere = true)
+    {
+        QElapsedTimer clock;
+        clock.start();
+        int n = 0;
+        while (clock.elapsed() < timeoutMs) {
+            if (done()) {
+                return true;
+            }
+            _link->lockPicture(_picture(u, v, objectThere), 0.0, 0.0, 1.0, 1.0);
+            if (_drone && _tellTelemetry && (n++ % 2) == 0) {
+                _drone->tell(_telemetry);
+            }
+            QTest::qWait(90);
+        }
+        return done();
+    }
+
+    void _goOn(int ms, double u = 0.5, double v = 0.5, bool objectThere = true)
+    {
+        _goOnUntil([]() { return false; }, ms, u, v, objectThere);
+    }
+
+    /// Telemetry only, with no lock to give pictures to.
+    void _goOnTelemetry(int ms)
+    {
+        QElapsedTimer clock;
+        clock.start();
+        while (clock.elapsed() < ms) {
+            _drone->tell(_telemetry);
+            QTest::qWait(180);
+        }
+    }
+
+    /// A lock on an object under the cross, 57.7 m north of a drone that hovers 100 m up (the camera 60
+    /// degrees down), held until Follow would start.
+    void _lockAndKnowTheObject()
+    {
+        _hoverAt(100.0, -60.0);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        QVERIFY2(_goOnUntil([this]() { return _follow->ready(); }, 8000), qPrintable(_follow->notReadyText()));
+    }
+
     /// A new link with the same saved settings, trying these addresses when quiet.
     void _restartWithProbeTargets(const QStringList &hosts, const QList<int> &ports)
     {
@@ -2187,6 +4726,15 @@ private:
     Vehicle _vehicle;
     FakeCamera *_camera = nullptr;
     SkydroidLink *_link = nullptr;
+    // Follow Me, in the tests that call _withFollow().
+    FakeFollowDrone *_drone = nullptr;
+    ObjectFollow *_follow = nullptr;
+    skydroid::follow::Drone _telemetry;
+    bool _tellTelemetry = true;
+    // The marks, in the tests that call _withMarks().
+    ObjectMarks *_marks = nullptr;
+    std::shared_ptr<FakePictureFinder::Seen> _seen;
+    QImage _markPicture;
 };
 
 QTEST_GUILESS_MAIN(SkydroidLinkTest)
