@@ -22,6 +22,7 @@ from vgcs.map.video.helpers import _format_video_zoom_label
 from vgcs.video.camera_control import (
     camera_preview_applies_digital_zoom,
     camera_recording_applies_digital_zoom,
+    camera_set_picture_thermal,
     camera_video_pick_block_reason,
     camera_zoom_label,
     camera_zoom_limits,
@@ -875,6 +876,22 @@ class VideoPreviewUiMixin:
         except Exception:
             pass
 
+    def _sync_camera_picture_lens(self) -> None:
+        """Tell the camera whether the picture on the screen is its thermal one.
+
+        Its aim math turns a click into an angle through the lens of that
+        picture. Asked with every frame, so the lens is the one of the picture
+        the operator sees, also after a reconnect or a feed switch; the camera
+        acts only on a change.
+        """
+        try:
+            cc = getattr(self, "_camera_control", None)
+            if cc is None:
+                return
+            camera_set_picture_thermal(cc, self._feed_is_thermal(self._operator_preview_source_id()))
+        except Exception:
+            pass
+
     def _native_video_click_mirror_x(self) -> bool:
         """Optional horizontal flip for click coords (off by default — reticle and gimbal share same u,v)."""
         env = str(os.environ.get("VGCS_VIDEO_MIRROR_X", "") or "").strip().lower()
@@ -987,6 +1004,7 @@ class VideoPreviewUiMixin:
             # The thermal colour mode goes on here, on the way to the screen;
             # ``_native_video_last`` above keeps the camera's own picture.
             shown = img if composed else self._thermal_palette_frame(self._operator_preview_source_id(), img)
+            self._sync_camera_picture_lens()
             pm = QPixmap.fromImage(shown)
             if pm.isNull():
                 return

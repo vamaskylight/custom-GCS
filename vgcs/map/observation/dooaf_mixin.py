@@ -1657,6 +1657,24 @@ class DooafOperationsMixin:
         # and a gun clicked beside the cross was set where the cross was.
         away_deg = self._click_away_from_the_cross_deg(float(video_x), float(video_y))
         at_the_cross = away_deg <= LASER_MAX_OFF_CROSS_DEG
+        # Off the cross a pick is turned into a point through the lens. The C12
+        # and C13 thermal lenses are known from data sheets only, and a zoom on
+        # the thermal picture is not known at all: a lens a few per cent off
+        # gives a point that is off and looks right. At the cross the lens
+        # plays no part. (The APK does the same since test build 8.)
+        lens_doubt = self._thermal_lens_doubt()
+        if lens_doubt and not at_the_cross:
+            from vgcs.map.dooaf_popup import thermal_lens_not_known_text
+
+            print(
+                f"[VGCS:observe] no pick: click ({float(video_x):.3f},{float(video_y):.3f}) "
+                f"is {away_deg:.1f} deg from the cross on the thermal picture ({lens_doubt})"
+            )
+            self._dooaf_video_pick_failed(
+                thermal_lens_not_known_text(away_deg, zoomed=lens_doubt == "zoomed"),
+                tips=False,
+            )
+            return True
         use_facade_lrf = (
             mode == DOOAF_VIDEO_PICK_FACADE_LRF
             and self._dooaf_lrf_geo_enabled()
@@ -1801,6 +1819,30 @@ class DooafOperationsMixin:
             hold_slant_boresight=True,
         )
         return True
+
+    def _thermal_lens_doubt(self) -> str:
+        """Why the lens of the picture on the screen is not known exactly, or "".
+
+        "data sheet": the thermal picture of a camera whose thermal lens VGCS
+        knows from a data sheet only (C12, C13). "zoomed": the thermal picture
+        with the camera zoomed in (VGCS does not know whether a zoom narrows it).
+        """
+        try:
+            from vgcs.video.camera_control import (
+                camera_picture_lens_is_estimate,
+                camera_thermal_picture_lens_deg,
+            )
+
+            cc = getattr(self, "_camera_control", None)
+            if camera_picture_lens_is_estimate(cc):
+                return "data sheet"
+            if camera_thermal_picture_lens_deg(cc) is not None:
+                zoom = float(getattr(self, "_video_zoom", 1.0) or 1.0)
+                if zoom > 1.01:
+                    return "zoomed"
+        except Exception:
+            return ""
+        return ""
 
     def _click_away_from_the_cross_deg(self, video_x: float, video_y: float) -> float:
         """How far a click is from the cross, in degrees. 0 when that cannot be worked out."""
@@ -2314,6 +2356,16 @@ class DooafOperationsMixin:
         """
         from vgcs.observe.camera_fov import resolve_camera_fov
 
+        try:
+            from vgcs.video.camera_control import camera_thermal_picture_lens_deg
+
+            thermal = camera_thermal_picture_lens_deg(getattr(self, "_camera_control", None))
+        except Exception:
+            thermal = None
+        if thermal is not None:
+            # The thermal picture: its own lens, with no zoom VGCS knows of. The
+            # "Camera HFOV" setting is the day camera's (2026-10-14).
+            return resolve_camera_fov(wide_hfov_deg=thermal[0], wide_vfov_deg=thermal[1], zoom_x=1.0)
         st = QSettings(QS_ORG, QS_APP)
         try:
             wide_h = float(st.value("observe/camera_hfov_deg", 62.0) or 62.0)

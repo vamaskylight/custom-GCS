@@ -490,6 +490,28 @@ class SkydroidCameraControl:
         except Exception:
             return None
 
+    def set_picture_thermal(self, on: bool) -> bool:
+        """The picture on the screen is the thermal camera's (True), or the day camera's. See camera_set_picture_thermal."""
+        try:
+            return bool(self._adapter.set_picture_thermal(bool(on)))
+        except Exception:
+            return False
+
+    def thermal_picture_lens_deg(self) -> tuple[float, float] | None:
+        """The thermal lens (hfov, vfov) while the thermal picture is on the screen and VGCS knows its lens, else None."""
+        try:
+            if not self._adapter.picture_is_thermal():
+                return None
+            return self._adapter.thermal_lens_deg()
+        except Exception:
+            return None
+
+    def picture_lens_is_estimate(self) -> bool:
+        try:
+            return bool(self._adapter.picture_lens_is_estimate())
+        except Exception:
+            return False
+
     def zoom_home(self) -> None:
         try:
             self._adapter.camera_zoom_home()
@@ -508,7 +530,14 @@ class SkydroidCameraControl:
         C12/C13: the commanded rail level, as before. DZM-step camera: always 1
         - its rail level is a step counter, not a magnification, and
         video_pick_block_reason only lets a pick through at the wide end.
+        On the thermal picture: 1. The zoom is the day camera's, and the
+        thermal lens is the aim lens then (as in the APK).
         """
+        try:
+            if self._adapter.picture_is_thermal():
+                return 1.0
+        except Exception:
+            pass
         try:
             if self._adapter.zoom_is_dzm_step():
                 return 1.0
@@ -1771,6 +1800,51 @@ def camera_lens_fov_deg(control: object | None) -> tuple[float, float] | None:
     if hfov <= 0.0 or vfov <= 0.0 or hfov >= 180.0 or vfov >= 180.0:
         return None
     return (hfov, vfov)
+
+
+def camera_set_picture_thermal(control: object | None, on: bool) -> bool:
+    """Tell the camera whether the picture on the screen is its thermal one.
+
+    A click is turned into an angle through the lens of the picture it was made
+    on: the Skydroid cameras' aim lens follows this. Other cameras report their
+    own field of view (Viewpro) or have one picture, and are left alone.
+    Returns True when the lens changed.
+    """
+    fn = getattr(resolve_camera_control_primary(control), "set_picture_thermal", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(bool(on)))
+    except Exception:
+        return False
+
+
+def camera_thermal_picture_lens_deg(control: object | None) -> tuple[float, float] | None:
+    """The thermal lens (hfov, vfov) while the thermal picture is on the screen and VGCS knows it, else None."""
+    fn = getattr(resolve_camera_control_primary(control), "thermal_picture_lens_deg", None)
+    if not callable(fn):
+        return None
+    try:
+        lens = fn()
+        if lens is None:
+            return None
+        hfov, vfov = float(lens[0]), float(lens[1])
+    except Exception:
+        return None
+    if hfov <= 0.0 or vfov <= 0.0 or hfov >= 180.0 or vfov >= 180.0:
+        return None
+    return (hfov, vfov)
+
+
+def camera_picture_lens_is_estimate(control: object | None) -> bool:
+    """True on the thermal picture of a camera whose thermal lens VGCS knows from a data sheet only, or not at all."""
+    fn = getattr(resolve_camera_control_primary(control), "picture_lens_is_estimate", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False
 
 
 def camera_reports_payload_gimbal_attitude(control: object | None) -> bool:

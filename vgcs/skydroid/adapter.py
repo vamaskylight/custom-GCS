@@ -98,12 +98,27 @@ _LRF_FOV_H_DEG = _C13_AIM_FOV_H_DEG
 _LRF_FOV_V_DEG = _C13_AIM_FOV_V_DEG
 
 
-def apply_profile_optics(profile: SkydroidCommandProfile | None) -> tuple[float, float]:
+def thermal_lens_of(profile: SkydroidCommandProfile | None) -> tuple[float, float] | None:
+    """The thermal camera's lens (hfov, vfov) of ``profile``, or None when it has none that makes sense."""
+    try:
+        h = float(getattr(profile, "thermal_fov_h_deg", None))
+        v = float(getattr(profile, "thermal_fov_v_deg", None))
+    except (TypeError, ValueError):
+        return None
+    if 1.0 < h < 179.0 and 1.0 < v < 179.0:
+        return h, v
+    return None
+
+
+def apply_profile_optics(profile: SkydroidCommandProfile | None, *, thermal: bool = False) -> tuple[float, float]:
     """Point the aim math at ``profile``'s lens; returns the (hfov, vfov) applied.
 
     Only profiles that opt in with ``aim_fov_from_profile`` move the numbers.
     Anything else - including None or a nonsense FOV - restores C13's, so a
     C14 Pro session can never leave its lens behind for the next C13 one.
+
+    ``thermal``: the picture on the screen is the thermal camera's, so its lens
+    counts, when the profile has one (thermal_lens_of).
     """
     global _LRF_FOV_H_DEG, _LRF_FOV_V_DEG
     hfov, vfov = _C13_AIM_FOV_H_DEG, _C13_AIM_FOV_V_DEG
@@ -115,6 +130,9 @@ def apply_profile_optics(profile: SkydroidCommandProfile | None) -> tuple[float,
             ph = pv = 0.0
         if 1.0 < ph < 179.0 and 1.0 < pv < 179.0:
             hfov, vfov = ph, pv
+    lens = thermal_lens_of(profile) if thermal else None
+    if lens is not None:
+        hfov, vfov = lens
     _LRF_FOV_H_DEG, _LRF_FOV_V_DEG = hfov, vfov
     # The other two pieces of per-camera module state ride along, so one call
     # fully (re)configures the protocol layer for whichever camera is connected.
@@ -287,6 +305,9 @@ class SkydroidTopUdpAdapter:
         self._profile: SkydroidCommandProfile = get_profile(profile_id)
         self._profile_id = str(profile_id or "c13_default")
         fov_h, fov_v = apply_profile_optics(self._profile)
+        # The picture on the screen is the day camera's until the window says
+        # otherwise (set_picture_thermal).
+        self._picture_thermal = False
         if self._profile.aim_fov_from_profile:
             try:
                 print(
@@ -3947,13 +3968,59 @@ class SkydroidTopUdpAdapter:
         body = f"{float(zoom_x):.1f}x" if zoom_x is not None else f"{int(step)}"
         return f"{tag}{body}" + ("" if reported else "?")
 
+    def set_picture_thermal(self, on: bool) -> bool:
+        """The picture on the screen is the thermal camera's (True), or the day camera's.
+
+        A click is turned into an angle through the lens of the picture it was
+        made on. Until 2026-10-14 that was the day lens on the thermal picture
+        too: on the C13 a click near the edge of the thermal picture turned the
+        camera about 1.7 times too far, and a follow turned it too fast. The APK
+        has used the thermal lens since test build 8. Returns True when the
+        lens changed.
+        """
+        on = bool(on)
+        if on == self.picture_is_thermal():
+            return False
+        self._picture_thermal = on
+        hfov, vfov = apply_profile_optics(self._profile, thermal=on)
+        note = ""
+        if on and thermal_lens_of(self._profile) is None:
+            note = " (no thermal lens known for this camera: the day lens)"
+        elif on and bool(getattr(self._profile, "thermal_fov_estimated", False)):
+            note = " (from the data sheet)"
+        print(
+            f"[VGCS:skydroid] the picture is the {'thermal' if on else 'day'} camera's: "
+            f"aim lens {hfov:.1f} x {vfov:.1f} deg{note}",
+            flush=True,
+        )
+        return True
+
+    def picture_is_thermal(self) -> bool:
+        return bool(getattr(self, "_picture_thermal", False))
+
+    def thermal_lens_deg(self) -> tuple[float, float] | None:
+        """The thermal camera's lens (hfov, vfov) as VGCS knows it, or None."""
+        return thermal_lens_of(self._profile)
+
+    def picture_lens_is_estimate(self) -> bool:
+        """True on the thermal picture of a camera whose thermal lens VGCS knows from a data sheet only, or not at all."""
+        if not self.picture_is_thermal():
+            return False
+        if thermal_lens_of(self._profile) is None:
+            return True
+        return bool(getattr(self._profile, "thermal_fov_estimated", False))
+
     def current_fov_deg(self) -> tuple[float, float] | None:
         """(hfov, vfov) for the lens and zoom the camera is on now, or None.
 
         None for C12/C13 (single lens, no readback) and for any camera whose
         zoom optics are still unconfirmed - callers then fall back to the
-        commanded-zoom estimate exactly as before.
+        commanded-zoom estimate exactly as before. None on the thermal picture
+        too: the zoom steps are the day lenses', and the thermal lens is the
+        aim lens then (set_picture_thermal).
         """
+        if self.picture_is_thermal():
+            return None
         if not self.zoom_is_dzm_step():
             return None
         step, _reported = self.zoom_step_best()
@@ -4147,8 +4214,15 @@ class SkydroidTopUdpAdapter:
         return True
 
     def _apply_zoom_optics(self, fov: tuple[float, float]) -> None:
-        """Point the aim math at the current zoom's field of view."""
+        """Point the aim math at the current zoom's field of view.
+
+        On the thermal picture at the thermal lens instead: the zoom steps are
+        the day lenses' (set_picture_thermal).
+        """
         global _LRF_FOV_H_DEG, _LRF_FOV_V_DEG
+        if self.picture_is_thermal():
+            apply_profile_optics(self._profile, thermal=True)
+            return
         try:
             h, v = float(fov[0]), float(fov[1])
         except (TypeError, ValueError, IndexError):
@@ -4244,7 +4318,7 @@ class SkydroidTopUdpAdapter:
                         self._active_host = host
                         self._active_port = int(port)
                         self._profile_id = profile.profile_id
-                        apply_profile_optics(profile)
+                        apply_profile_optics(profile, thermal=self.picture_is_thermal())
                         print(
                             f"[VGCS:skydroid] gimbal OK via {host}:{port} profile={profile.profile_id}"
                         )

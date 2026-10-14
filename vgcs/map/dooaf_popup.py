@@ -251,6 +251,20 @@ def laser_not_at_the_cross_text(degrees_away: float) -> str:
     )
 
 
+def thermal_lens_not_known_text(degrees_away: float, *, zoomed: bool) -> str:
+    """For a click beside the cross on a thermal picture whose lens VGCS does not know exactly."""
+    if zoomed:
+        why = "On the zoomed thermal picture VGCS does not know the lens"
+        what_to_do = "Zoom out, or put the cross on the point, then click it."
+    else:
+        why = "On this thermal picture VGCS knows the lens from the data sheet only"
+        what_to_do = "Put the cross on the point, then click it, or pick on the day picture."
+    return (
+        f"{why}, so a point is taken at the cross only. The click was "
+        f"{float(degrees_away):.0f} degrees away from it. {what_to_do}"
+    )
+
+
 def _is_a_target(row: object) -> bool:
     """A click as Set TGT (also one that lost its role: dooaf_clicked_as)."""
     try:

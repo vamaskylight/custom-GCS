@@ -105,8 +105,14 @@ class SkydroidCommandProfile:
     # True when the camera applies zoom in its own encoder, so the RTSP picture
     # is already magnified and the preview must not crop on top of it.
     preview_carries_zoom: bool = False
+    # The thermal camera's lens (hfov, vfov). On the thermal picture a click is
+    # turned into an angle through it (adapter.set_picture_thermal).
     thermal_fov_h_deg: float | None = None
     thermal_fov_v_deg: float | None = None
+    # True = the thermal lens above comes from a data sheet or from the sensor's
+    # size, not from the maker's own figure or a measurement. Then DOOAF takes a
+    # point on the thermal picture at the cross only (2026-10-14).
+    thermal_fov_estimated: bool = False
     # Longest SLR reading accepted as real. 1000 m is the C13 laser and the
     # documented SLR field limit (0x2710 dm).
     laser_max_m: float = 1000.0
@@ -199,6 +205,14 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
             "focus_in": ["CAM_FOCUS_NEAR", "CAM_FN", "FOCUS_NEAR"],
             "focus_out": ["CAM_FOCUS_FAR", "CAM_FF", "FOCUS_FAR"],
         },
+        # The thermal stream is 640 x 512 (the client's VGCS log of 2026-10-08).
+        # The data sheet has two rows for its lens: 48.7 x 38.6, and 24.8 x 18.7,
+        # which is the lens of a 256 x 192 sensor and stands on the C12 sheet as
+        # well. From the sensor (640 x 512, 12 um, 9.1 mm) it is 45.8 x 37.3.
+        # The APK uses 48.7 x 38.6 too.
+        thermal_fov_h_deg=48.7,
+        thermal_fov_v_deg=38.6,
+        thermal_fov_estimated=True,
     ),
     "c13_alt": SkydroidCommandProfile(
         profile_id="c13_alt",
@@ -222,6 +236,10 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
             "focus_in": ["CAM_FOCUS_NEAR", "CAM_FN", "FOCUS_NEAR"],
             "focus_out": ["CAM_FOCUS_FAR", "CAM_FF", "FOCUS_FAR"],
         },
+        # The same camera as c13_default.
+        thermal_fov_h_deg=48.7,
+        thermal_fov_v_deg=38.6,
+        thermal_fov_estimated=True,
     ),
     "c12_default": SkydroidCommandProfile(
         profile_id="c12_default",
@@ -257,6 +275,10 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         fov_h_deg=100.0,
         fov_v_deg=52.0,
         frame_specs_confirmed=True,
+        # From the sensor: 384 x 288, 12 um, 7 mm. The APK uses the same.
+        thermal_fov_h_deg=36.4,
+        thermal_fov_v_deg=27.7,
+        thermal_fov_estimated=True,
     ),
     "c14pro_default": SkydroidCommandProfile(
         profile_id="c14pro_default",

@@ -236,6 +236,24 @@ class M13MovingTargetTrackMixin:
         except Exception:
             return None
 
+    def _m14_picture_fov(self, profile) -> tuple[float, float]:
+        """The lens (hfov, vfov) of the picture on the screen, for the follow and its marker.
+
+        The camera profile's lens, or on the thermal picture the thermal lens:
+        with the day lens a follow on the C13's thermal picture turned the
+        camera about 1.7 times too fast (2026-10-14).
+        """
+        try:
+            from vgcs.video.camera_control import camera_thermal_picture_lens_deg
+
+            thermal = camera_thermal_picture_lens_deg(getattr(self, "_camera_control", None))
+        except Exception:
+            thermal = None
+        if thermal is not None:
+            return float(thermal[0]), float(thermal[1])
+        return (float(getattr(profile, "fov_h_deg", 83.4) or 83.4),
+                float(getattr(profile, "fov_v_deg", 46.9) or 46.9))
+
     def _m14_should_use_ai_follow(self) -> bool:
         """True when the connected camera has no confirmed continuous-follow
         capability of its own (see DOCS/SKYDROID-TOP-PROTOCOL.md) — M13 then
@@ -956,9 +974,7 @@ class M13MovingTargetTrackMixin:
         frame_bgr = qimage_to_bgr_array(img) if img is not None else None
         if frame_bgr is None:
             return
-        profile = self._m14_active_profile()
-        fov_h = float(getattr(profile, "fov_h_deg", 83.4) or 83.4)
-        fov_v = float(getattr(profile, "fov_v_deg", 46.9) or 46.9)
+        fov_h, fov_v = self._m14_picture_fov(self._m14_active_profile())
         fw, fh = frame_bgr.shape[1], frame_bgr.shape[0]
         gen = int(getattr(self, "_m13_track_generation", 0) or 0)
         self._m14_follow_task_inflight = True
@@ -1752,9 +1768,7 @@ class M13MovingTargetTrackMixin:
         if ai_follow:
             # Real tracked pixel from our own tracker — not a boresight guess
             # — and the ACTIVE camera's real FOV, not C13's hardcoded fallback.
-            profile = self._m14_active_profile()
-            hfov = float(getattr(profile, "fov_h_deg", 83.4) or 83.4)
-            vfov = float(getattr(profile, "fov_v_deg", 46.9) or 46.9)
+            hfov, vfov = self._m14_picture_fov(self._m14_active_profile())
             click = getattr(self, "_m13_track_click_uv", None)
             video_x, video_y = (click if isinstance(click, tuple) else (0.5, 0.5))
         else:
