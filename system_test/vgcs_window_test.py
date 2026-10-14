@@ -33,6 +33,7 @@ process is sent to an INI file in a temporary folder before VGCS is imported.
 from __future__ import annotations
 
 import ctypes
+import gc
 import math
 import os
 import pathlib
@@ -1061,6 +1062,13 @@ def banner(w) -> str:
 
 def session(version: str, minutes: float, speedup: int, r: Report, profile_to: pathlib.Path | None = None) -> None:
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    # Python's garbage collection as VGCS's own start sets it up (vgcs/main.py), and every
+    # collection written down with the thread it ran in.
+    from vgcs.app.main_thread_gc import collect_in_main_thread_only
+
+    collector = collect_in_main_thread_only(app)
+    collections: list[str] = []
+    gc.callbacks.append(lambda phase, _info: collections.append(threading.current_thread().name) if phase == "start" else None)
     import vgcs.app.flight_action_dialogs as dialogs
     from vgcs.app.main_window import MainWindow
     from vgcs.app.vehicle_params import RENAMED_IN_4_7
@@ -1278,6 +1286,15 @@ def session(version: str, minutes: float, speedup: int, r: Report, profile_to: p
                 f"and the banner says Disconnected, not that the link was lost ({banner(w)!r})")
         r.check(not popups, f"no unexpected popup came up {popups[:2]}")
         r.check(not internet, f"the map asked the internet for nothing, it drew from the offline tiles ({len(internet)} requests: {internet[:2]})")
+        # A collection in the link thread or a tile task destroys Qt objects there (vgcs/app/main_thread_gc.py).
+        outside = sorted({name for name in collections if name != "MainThread"})
+        elsewhere = sum(1 for name in collections if name != "MainThread")
+        r.check(collector is not None and bool(collections) and not outside,
+                f"Python's garbage collection ran in the main thread only ({len(collections) - elsewhere} collections "
+                f"there, {elsewhere} elsewhere{' ' + str(outside) if outside else ''})")
+        if collector is not None:
+            r.note(f"garbage collections: {collector.collections[0]} young, {collector.collections[1]} middle, "
+                   f"{collector.collections[2]} full, the longest {collector.longest_ms:.0f} ms")
     finally:
         lag.timer.stop()
         try:

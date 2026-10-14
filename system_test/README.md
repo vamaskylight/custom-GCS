@@ -99,6 +99,7 @@ Then the mission as the drone holds it: a payload release ticked, uploaded, and 
 Then the polygon fence in the Fence tab: corners clicked on the map, Upload polygon fence, the corners read off the drone on the checking connection, a corner dragged, Read fence from drone, a fence beside the drone (asked about, answered no and then yes), the take-off the drone then refuses, and Switch fence off.
 
 During the hover it measures how late the window's event loop runs, the time spent in the telemetry handler, CPU and memory.
+It starts Python's garbage collection the way VGCS's own start does (in the main thread only, `vgcs/app/main_thread_gc.py`), writes down the thread of every collection, and fails if one ran in another thread.
 The map's web view runs in separate QtWebEngine processes, which are not counted.
 
 Your own VGCS settings are never touched.
@@ -151,4 +152,5 @@ It checks the acceptance test of client requirement 14:
 - A fence that does not hold a flying drone makes it turn back (4.6.2) or land (4.7.0) at once.
   The polygon case checks that VGCS refuses to send one, and never sends one itself in flight.
 - The window test reads the checking connection in its own thread.
+- The window test's timing checks need a quiet PC. On 2026-10-14 another program used 10 of the PC's cores, every handler ran twice as slow, and the two timing checks failed (the worst late tick 257 ms).
   A second exchange on it (a mission sent "as another station") has to be driven by the messages that thread reads, like `MissionReader` and `MissionSender`, not by a blocking wait.

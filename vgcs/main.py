@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.license_key import license_required
+from vgcs.app.main_thread_gc import collect_in_main_thread_only
 from vgcs.app.main_window import MainWindow
 from vgcs.app.runtime_ui import (
     apply_qt_scale_override,
@@ -133,6 +134,10 @@ def main() -> int:
     configure_high_dpi_policy()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    # Python's garbage collection in the main thread only, before any other
+    # thread runs: a collection in the link thread or a map tile task destroys
+    # Qt objects there (vgcs/app/main_thread_gc.py, 2026-10-14).
+    collect_in_main_thread_only(app)
     ui_scale = 1.0
     profile = select_font_profile()
     app.setFont(build_base_font(profile, ui_scale=ui_scale))
