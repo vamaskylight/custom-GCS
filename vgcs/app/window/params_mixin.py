@@ -66,10 +66,12 @@ from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.app.vehicle_params import READ_ON_CONNECT, editable_on_this_drone
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import Waypoint
+from vgcs.mission.payload_release import servo_function_param
 from vgcs.map import MapWidget
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
+from vgcs.link.payload_servo_settings import payload_servo_from_settings
 from vgcs.video.pipeline import VideoPipeline
 from vgcs.video.widgets import CameraControlPanel
 from vgcs.video.camera_control import (
@@ -100,7 +102,7 @@ class MainWindowParamsMixin:
             QMessageBox.warning(self, "VGCS", "Connect vehicle before parameter fetch.")
             return
         # Both the ArduCopter 4.6 and 4.7 names (vgcs/app/vehicle_params.py).
-        self._thread.queue_params_fetch(list(READ_ON_CONNECT))
+        self._thread.queue_params_fetch(self._vehicle_params_to_read())
         self._append_log("Param fetch queued")
 
     def _read_vehicle_params_on_connect(self) -> None:
@@ -114,7 +116,15 @@ class MainWindowParamsMixin:
         thread = getattr(self, "_thread", None)
         if thread is None or not thread.isRunning():
             return
-        thread.queue_params_fetch(list(READ_ON_CONNECT))
+        thread.queue_params_fetch(self._vehicle_params_to_read())
+
+    def _vehicle_params_to_read(self) -> list[str]:
+        """READ_ON_CONNECT, and what the servo output of the payload release is used for.
+
+        The check before Upload needs that (vgcs/mission/payload_release.py).
+        Only the output set is read, not all 32, so the read stays small.
+        """
+        return list(READ_ON_CONNECT) + [servo_function_param(payload_servo_from_settings().channel)]
 
     def _refresh_param_name_list(self) -> None:
         """Keep only the "Set param" names this drone has (4.6 and 4.7 differ)."""

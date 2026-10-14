@@ -217,7 +217,10 @@ class MainWindowPlanMissionMixin:
         # the aircraft where it stands is survivable at 200 m and loses the
         # airframe at 10 km. See vgcs/mission/long_range_safety.py.
         lr_errors, lr_warnings, lr_unchecked = self._long_range_findings(waypoints, home)
-        errors = list(errors) + lr_errors
+        # A drop on a servo output the drone keeps for something else does
+        # nothing. See vgcs/mission/payload_release.py.
+        drop_errors, drop_unchecked = self._payload_release_findings(waypoints)
+        errors = list(errors) + lr_errors + drop_errors
         warnings = list(warnings) + lr_warnings
         if errors:
             detail = "\n".join(f"• {e}" for e in errors[:8])
@@ -243,7 +246,7 @@ class MainWindowPlanMissionMixin:
             if answer != QMessageBox.StandardButton.Yes:
                 self._append_log("Mission upload cancelled by operator after validation warnings.")
                 return False
-        for u in lr_unchecked:
+        for u in list(lr_unchecked) + drop_unchecked:
             self._append_log(f"Mission check skipped: {u}")
         return True
 
@@ -272,6 +275,18 @@ class MainWindowPlanMissionMixin:
                 f"{report.round_trip_m / 1000.0:.1f} km round trip."
             )
         return (list(report.errors), list(report.warnings), list(report.unchecked))
+
+    def _payload_release_findings(self, waypoints: list) -> tuple[list, list]:
+        """Payload release findings (errors, unchecked), or nothing if the check cannot run.
+
+        Swallows its own failures, as _long_range_findings does.
+        """
+        try:
+            from vgcs.mission.payload_release import check_payload_release
+
+            return check_payload_release(waypoints, payload_servo_from_settings(), self._last_params)
+        except Exception:
+            return ([], [])
 
     def _plan_fence_polygon(self):
         """The polygon fence the drone on screen holds, as VGCS sent or read it. None when not known.

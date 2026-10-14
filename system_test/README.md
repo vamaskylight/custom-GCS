@@ -79,6 +79,7 @@ The simulated clock runs 10 times faster than real time.
 | refusals_say_why | no GPS: take-off refused with the drone's reason and the mode put back; in the air LOITER refused "requires position"; landing without GPS |
 | parameters | the settings VGCS reads exist on this firmware (4.6 and 4.7 names differ), a write is confirmed, a missing name is reported as not written |
 | mission_upload_and_download | a 4 waypoint mission goes up and comes back the same, to the centimetre |
+| mission_transfer_keeps_telemetry | a 200 waypoint mission goes up and comes back, and the drone's position keeps reaching VGCS the whole time (until 2026-10-14 it stood still while a transfer ran) |
 | mission_flight | start from the ground, pause, resume, skip a waypoint, return and land at home |
 | mission_speeds | each leg flown at the planned speed, also after Pause and Resume, after a jump forward and back, after a jump while paused, and after LOITER and AUTO from the mode list |
 | missions_as_they_come_back | a Download shows VGCS's own mission with its payload releases, and another station's mission with what a plan cannot hold named |
@@ -92,10 +93,11 @@ The simulated clock runs 10 times faster than real time.
 
 Builds the real main window off-screen, types the simulator's address into the connection box and presses Connect.
 Then it flies through the window's own button handlers: a take-off the drone refuses, a real take-off, a mode change, a hover, a radio silence, and landing.
+Before the take-off it checks the settings VGCS read on connect, under this firmware's names, and what the servo output of the payload release is used for.
 The window's own labels are read to check what the operator would have seen, and the controls the operator needs are checked to be on screen (E-STOP, Disconnect while the link is lost, the Vehicle status window).
 
 After the landing it plans and flies a mission in Plan Flight: waypoints clicked on the map, rows edited, Upload, Download, Start Mission, Fly to WP, Pause and Resume.
-Then the mission as the drone holds it: a payload release ticked, uploaded, and brought back by a Download; a mission of another ground station (sent on the checking connection) with a camera and a servo command, the message that names them, Upload answered no, and Start Mission with "Start it as it is on the drone", once on a mission that was replaced in the meantime (nothing starts, and the reason is on screen) and once for real.
+Then the mission as the drone holds it: a payload release ticked; the release set to output 1, which the simulated quad uses for motor 1, and Upload refused with that reason while the drone keeps its mission; set back to output 9, uploaded, and brought back by a Download; a mission of another ground station (sent on the checking connection) with a camera and a servo command, the message that names them, Upload answered no, and Start Mission with "Start it as it is on the drone", once on a mission that was replaced in the meantime (nothing starts, and the reason is on screen) and once for real.
 Then the polygon fence in the Fence tab: corners clicked on the map, Upload polygon fence, the corners read off the drone on the checking connection, a corner dragged, Read fence from drone, a fence beside the drone (asked about, answered no and then yes), the take-off the drone then refuses, and Switch fence off.
 
 During the hover it measures how late the window's event loop runs, the time spent in the telemetry handler, CPU and memory.

@@ -236,7 +236,7 @@ class MainWindowSigningMixin:
             "With a key, VGCS signs every command it sends (256-bit key, MAVLink 2 signing). A drone that holds "
             "the key ignores commands that are not signed with it, so nobody else in radio range can arm it, "
             "change its mode or its mission. It does not encrypt: telemetry and video can still be received. "
-            "The same passphrase works in the VAMA APK (Application Settings, MAVLink signing keys). "
+            "The same passphrase works in the VAMA APK (Settings, Telemetry, MAVLink 2 Signing, Add Signing Key). "
             "The passphrase is not stored. The key is, encrypted for this Windows user."
         )
         hint.setWordWrap(True)

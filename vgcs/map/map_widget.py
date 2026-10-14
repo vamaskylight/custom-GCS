@@ -1860,8 +1860,8 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._wp_drop_payload = QCheckBox("Drop payload here")
         self._wp_drop_payload.setToolTip(
             "Release the payload servo when the aircraft reaches this waypoint.\n"
-            "The servo output and its pulse widths are set in QSettings under\n"
-            "mission/payload_servo_*."
+            "The servo output and its pulse widths: Application Settings,\n"
+            "General, Payload release."
         )
         self._btn_apply_all_speed = QPushButton("Set All Speed")
         # Hover on arrival, set before upload. Requested 2026-09-11: "before

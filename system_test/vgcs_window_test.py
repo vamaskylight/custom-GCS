@@ -401,8 +401,12 @@ def the_mission_as_the_drone_holds_it(w, sim: Sitl, r: Report, popups: list[str]
     Start Mission uploaded the plan without them: the payload was not released
     any more. A mission made in another ground station lost its camera, servo
     and jump commands the same way, without a word.
+
+    Since 2026-10-14 the servo output of the release is set in Application
+    Settings, and a release on an output the drone uses for a motor is not
+    uploaded: the drone would not move that output.
     """
-    from PySide6.QtWidgets import QCheckBox, QLineEdit
+    from PySide6.QtWidgets import QCheckBox, QLineEdit, QSpinBox
 
     mw = w._map_widget
     panel = mw._plan_flight_panel
@@ -454,6 +458,32 @@ def the_mission_as_the_drone_holds_it(w, sim: Sitl, r: Report, popups: list[str]
     # --- VGCS's own mission, with a payload release --------------------------------------
     panel.findChild(QCheckBox, "planWpDrop3").click()
     wait_qt(lambda: False, 0.6)          # the panel sends an edit on after a short wait
+
+    def release_output(channel: int) -> None:
+        """Application Settings, General, Payload release: the servo output, as Apply keeps it."""
+        group, save = w._build_payload_release_group()
+        group.findChild(QSpinBox, "payloadServoChannel").setValue(channel)
+        save()
+
+    # The release on output 1, which the simulated quad uses for motor 1: not uploaded.
+    release_output(1)
+    r.check(wait_qt(lambda: "SERVO1_FUNCTION" in w._last_params, 20),
+            f"payload release set to output 1: VGCS asks the drone what output 1 is used for "
+            f"(SERVO1_FUNCTION = {w._last_params.get('SERVO1_FUNCTION')})")
+    held = on_the_drone()
+    seen = count("Mission upload success")
+    boxes: list[dict] = []
+    timer = press_in_the_next_box("OK", boxes)
+    panel._bar_upload.click()
+    wait_qt(lambda: bool(boxes), 10)
+    timer.stop()
+    said = boxes[0]["text"] if boxes else ""
+    r.check("Servo output 1 is used for motor 1" in said and "WP 3" in said,
+            f"Upload: refused, the drone uses output 1 for motor 1 ({said[:110]!r})")
+    wait_qt(lambda: False, 1.0)
+    r.check(count("Mission upload success") == seen and on_the_drone() == held, "nothing was uploaded")
+    release_output(9)
+
     seen = count("Mission upload success")
     panel._bar_upload.click()
     r.check(wait_qt(lambda: count("Mission upload success") > seen, 30), '"Drop payload" ticked on WP 3, and Upload: VGCS reports the mission uploaded')
@@ -1165,6 +1195,9 @@ def session(version: str, minutes: float, speedup: int, r: Report, profile_to: p
         has = [n for n in (RENAMED_IN_4_7.values() if new_names else RENAMED_IN_4_7.keys())]
         r.check(wait_qt(lambda: all(n in w._last_params for n in has) and "FS_GCS_ENABLE" in w._last_params, 20),
                 f"the settings VGCS checks were read on connect ({', '.join(has)}, FS_GCS_ENABLE ...)")
+        r.check(wait_qt(lambda: "SERVO9_FUNCTION" in w._last_params, 20),
+                f"and what servo output 9, the payload release, is used for "
+                f"(SERVO9_FUNCTION = {w._last_params.get('SERVO9_FUNCTION')})")
         listed = [w._param_name_combo.itemText(i) for i in range(w._param_name_combo.count())]
         wrong = [n for n in listed if n not in w._last_params]
         r.check(not wrong, f"the 'Set param' list has only this drone's names ({len(listed)} names)" + (f", not {wrong}" if wrong else ""))

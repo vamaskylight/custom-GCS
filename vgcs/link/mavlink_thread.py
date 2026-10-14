@@ -292,6 +292,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
             "GPS_RTK": 0.4,
         }
         self._last_hb_log_mono = 0.0
+        self._last_hb_emit_mono = 0.0
         # Last mission built/downloaded. MISSION_CURRENT / MISSION_ITEM_REACHED report a
         # raw MAVLink seq; only this plan can translate that into "WP 3 of 8".
         self._mission_plan: MissionPlan | None = None
@@ -325,6 +326,11 @@ class MavlinkThread(FenceLinkMixin, QThread):
         self._mission_not_kept: tuple = ()
         self._own_upload_echo_until = 0.0
         self._own_upload_done_mono = 0.0
+        # While an upload from here runs, the drone's words about a new mission
+        # are about it: the waits hand the drone's messages on as they come
+        # (_read_while_waiting, 2026-10-14).
+        self._own_upload_in_progress = False
+        self._own_upload_echo_heard = False
         # True from the moment an upload starts to replace the drone's mission
         # until the drone has acknowledged all of it. An upload that fails
         # leaves it True: the drone then holds none of the mission, or the
@@ -683,7 +689,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
         except Exception:
             pass
 
-        last_hb = 0.0
+        self._last_hb_emit_mono = 0.0
         last_msg = time.monotonic()
         timeout_notified = False
         # Consecutive messages pymavlink failed to decode. Reset by any good
@@ -768,387 +774,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
             last_msg = time.monotonic()
             timeout_notified = False
 
-            msg_type = msg.get_type()
-            if msg_type in _AUTOPILOT_ONLY_MESSAGES and not self._is_primary_source(msg):
-                continue
-            if msg_type == "HEARTBEAT":
-                src_sys = int(msg.get_srcSystem())
-                src_comp = int(msg.get_srcComponent())
-                if self._heartbeat_updates_link_target(msg):
-                    self._target_sysid = src_sys
-                    # Prefer autopilot component (1) over generic component (0) so
-                    # mode/status come from a stable source and do not flicker/swap.
-                    if int(self._target_compid) <= 0:
-                        self._target_compid = src_comp
-                    elif src_comp == 1:
-                        self._target_compid = 1
-                    elif int(self._target_compid) != 1:
-                        self._target_compid = src_comp
-                now = time.monotonic()
-                # Avoid flooding UI if vehicle sends HB fast
-                if now - last_hb >= 0.5:
-                    last_hb = now
-                    self.heartbeat.emit(
-                        int(msg.get_srcSystem()),
-                        int(msg.get_srcComponent()),
-                        int(getattr(msg, "mavlink_version", 0) or 0),
-                    )
-                hb_now = time.monotonic()
-                primary = (
-                    (int(self._target_sysid) <= 0 or src_sys == int(self._target_sysid))
-                    and (int(self._target_compid) <= 0 or src_comp == int(self._target_compid))
-                )
-                if primary and hb_now - self._last_hb_log_mono >= 5.0:
-                    self._last_hb_log_mono = hb_now
-                    self.log_line.emit(
-                        f"HEARTBEAT sys={msg.get_srcSystem()} comp={msg.get_srcComponent()}"
-                    )
-                armed = bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                if primary:
-                    # Mission start must never force a flying vehicle into STABILIZE.
-                    self._vehicle_armed = armed
-                mode_text = ""
-                try:
-                    # Uses pymavlink's autopilot-aware decoder (PX4/ArduPilot/etc.) instead of
-                    # relying only on raw custom_mode integer mappings.
-                    mode_text = str(mavutil.mode_string_v10(msg) or "").strip()
-                except Exception:
-                    mode_text = ""
-                if primary:
-                    self._remember_vehicle_mode(mode_text)
-                    self._hear_mode(msg)
-                    self._hear_signature(msg)
-                if primary:
-                    self._emit_telemetry_payload(
-                        "HEARTBEAT",
-                        {
-                            "armed": armed,
-                            "system_status": int(getattr(msg, "system_status", 0) or 0),
-                            "custom_mode": int(getattr(msg, "custom_mode", 0) or 0),
-                            "base_mode": int(getattr(msg, "base_mode", 0) or 0),
-                            "vehicle_type": int(getattr(msg, "type", 0) or 0),
-                            "autopilot": int(getattr(msg, "autopilot", 0) or 0),
-                            "mode_text": mode_text,
-                        },
-                    )
-                if int(self._target_sysid) > 0:
-                    now_req = time.monotonic()
-                    if not self._streams_requested:
-                        self._streams_requested = True
-                        try:
-                            self._request_telemetry_streams()
-                        except Exception:
-                            pass
-                        self._prox_streams_last_request_mono = now_req
-                    elif now_req - float(self._prox_streams_last_request_mono) >= _PROX_STREAM_RESEND_S:
-                        try:
-                            self._request_proximity_streams()
-                        except Exception:
-                            pass
-                        self._prox_streams_last_request_mono = now_req
-            elif msg_type == "MISSION_CURRENT":
-                cur_seq = int(getattr(msg, "seq", 0) or 0)
-                state = getattr(msg, "mission_state", None)
-                self._emit_telemetry_payload("MISSION_CURRENT", {"seq": cur_seq})
-                if self._is_primary_source(msg):
-                    # First, so a mission that is no longer the one VGCS knows
-                    # is dropped before its progress is named.
-                    self._legs().heard_current(cur_seq, time.monotonic(), getattr(msg, "total", None), state)
-                self._emit_mission_progress(cur_seq, reached=False, state=state)
-            elif msg_type == "MISSION_ITEM_REACHED":
-                # Fires once per completed item — the only reliable "WP N done" event.
-                self._emit_mission_progress(int(getattr(msg, "seq", 0) or 0), reached=True)
-            elif msg_type in ("MISSION_ITEM_INT", "MISSION_ITEM"):
-                if not self._hear_fence_item(msg):
-                    self._hear_mission_item(msg)
-            elif msg_type == "MISSION_ACK":
-                if not self._hear_fence_ack(msg):
-                    self._hear_mission_ack(msg)
-            elif msg_type in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
-                self._hear_fence_request(msg)
-            elif msg_type == "MISSION_COUNT":
-                self._hear_fence_count(msg)
-            elif msg_type == "HOME_POSITION":
-                self._hear_home_position(msg)
-            elif msg_type == "STATUSTEXT":
-                self._handle_statustext(msg)
-            elif msg_type == "COMMAND_ACK":
-                self._remember_arm_ack(msg)
-                self._hear_mode_ack(msg)
-                self._hear_command_ack(msg)
-            elif msg_type == "PARAM_VALUE":
-                self._hear_param_value(msg)
-            elif msg_type == "VFR_HUD":
-                self._emit_telemetry_payload(
-                    "VFR_HUD",
-                    {
-                        "airspeed": float(getattr(msg, "airspeed", 0.0) or 0.0),
-                        "groundspeed": float(getattr(msg, "groundspeed", 0.0) or 0.0),
-                        "heading": int(getattr(msg, "heading", 0) or 0),
-                        "throttle": int(getattr(msg, "throttle", 0) or 0),
-                        "climb": float(getattr(msg, "climb", 0.0) or 0.0),
-                    },
-                )
-            elif msg_type == "GPS_RTK":
-                # Only the Septentrio, Swift and Emlid drivers send this. A
-                # u-blox sends nothing here: its fix type is all there is.
-                baseline_mm = math.sqrt(
-                    float(getattr(msg, "baseline_a_mm", 0) or 0) ** 2
-                    + float(getattr(msg, "baseline_b_mm", 0) or 0) ** 2
-                    + float(getattr(msg, "baseline_c_mm", 0) or 0) ** 2
-                )
-                self._emit_telemetry_payload(
-                    "GPS_RTK",
-                    {
-                        "satellites": int(getattr(msg, "nsats", 0) or 0),
-                        "baseline_m": baseline_mm / 1000.0,
-                        "hypotheses": int(getattr(msg, "iar_num_hypotheses", 0) or 0),
-                    },
-                )
-            elif msg_type == "WIND":
-                # ArduCopter sends this only with the EKF drag parameters set.
-                # direction is where the wind comes FROM, -180 to 180 degrees.
-                self._emit_telemetry_payload(
-                    "WIND",
-                    {
-                        "direction_deg": float(getattr(msg, "direction", 0.0) or 0.0),
-                        "speed_mps": float(getattr(msg, "speed", 0.0) or 0.0),
-                        "speed_z_mps": float(getattr(msg, "speed_z", 0.0) or 0.0),
-                    },
-                )
-            elif msg_type == "NAMED_VALUE_FLOAT":
-                name = named_value_name(getattr(msg, "name", ""))
-                if name.startswith(_NAMED_VALUE_PREFIXES):
-                    self._emit_telemetry_payload(
-                        "NAMED_VALUE_FLOAT",
-                        {"name": name, "value": float(getattr(msg, "value", 0.0) or 0.0)},
-                    )
-            elif msg_type == "ATTITUDE":
-                self._emit_telemetry_payload(
-                    "ATTITUDE",
-                    {
-                        "roll_deg": float(getattr(msg, "roll", 0.0) or 0.0) * 57.2958,
-                        "pitch_deg": float(getattr(msg, "pitch", 0.0) or 0.0) * 57.2958,
-                        "yaw_deg": float(getattr(msg, "yaw", 0.0) or 0.0) * 57.2958,
-                    },
-                )
-            elif msg_type == "GLOBAL_POSITION_INT":
-                vx = float(getattr(msg, "vx", 0) or 0)
-                vy = float(getattr(msg, "vy", 0) or 0)
-                spd_cm = math.hypot(vx, vy)
-                gt_deg: float | None = None
-                if spd_cm > 50.0:
-                    gt_deg = (math.degrees(math.atan2(vy, vx)) + 360.0) % 360.0
-                raw_hdg = int(getattr(msg, "hdg", 0) or 0)
-                hdg_deg: float | None = None
-                if raw_hdg != 65535:
-                    hdg_deg = (raw_hdg / 100.0) % 360.0
-                gpi: dict[str, object] = {
-                    "lat": float(getattr(msg, "lat", 0) or 0) / 1e7,
-                    "lon": float(getattr(msg, "lon", 0) or 0) / 1e7,
-                    "relative_alt_m": float(getattr(msg, "relative_alt", 0) or 0) / 1000.0,
-                    "alt_msl_m": float(getattr(msg, "alt", 0) or 0) / 1000.0,
-                    "groundspeed_mps": spd_cm / 100.0,
-                }
-                if hdg_deg is not None:
-                    gpi["hdg_deg"] = hdg_deg
-                if gt_deg is not None:
-                    gpi["ground_track_deg"] = gt_deg
-                if self._is_primary_source(msg):
-                    self._legs().heard_position(float(gpi["lat"]), float(gpi["lon"]))
-                    self._note_position(float(gpi["lat"]), float(gpi["lon"]), float(gpi["relative_alt_m"]))
-                self._emit_telemetry_payload("GLOBAL_POSITION_INT", gpi)
-            elif msg_type == "MOUNT_ORIENTATION":
-                yaw = float(getattr(msg, "yaw", float("nan")) or float("nan"))
-                pitch = float(getattr(msg, "pitch", float("nan")) or float("nan"))
-                yaw_v = None if math.isnan(yaw) else yaw
-                pitch_v = None if math.isnan(pitch) else pitch
-                self._update_gimbal_cache(yaw_v, pitch_v)
-            elif msg_type == "GIMBAL_DEVICE_ATTITUDE_STATUS":
-                q = getattr(msg, "q", None) or []
-                if len(q) >= 4:
-                    try:
-                        w, x, y, z = (
-                            float(q[0]),
-                            float(q[1]),
-                            float(q[2]),
-                            float(q[3]),
-                        )
-                        sinr_cosp = 2.0 * (w * x + y * z)
-                        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-                        roll = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
-                        sinp = 2.0 * (w * y - z * x)
-                        pitch = (
-                            math.copysign(90.0, sinp)
-                            if abs(sinp) >= 1.0
-                            else math.degrees(math.asin(sinp))
-                        )
-                        siny_cosp = 2.0 * (w * z + x * y)
-                        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-                        yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
-                        self._update_gimbal_cache(yaw, pitch)
-                    except Exception:
-                        pass
-            elif msg_type == "GPS_RAW_INT":
-                eph_raw = int(getattr(msg, "eph", 0xFFFF) or 0xFFFF)
-                hdop = None if eph_raw >= 0xFFFF else float(eph_raw) / 100.0
-                fix_type = int(getattr(msg, "fix_type", 0) or 0)
-                raw_lat = float(getattr(msg, "lat", 0) or 0) / 1e7
-                raw_lon = float(getattr(msg, "lon", 0) or 0) / 1e7
-                raw_alt_mm = int(getattr(msg, "alt", 0) or 0)
-                gps_payload: dict[str, object] = {
-                    "satellites_visible": int(getattr(msg, "satellites_visible", 0) or 0),
-                    "fix_type": fix_type,
-                    "hdop": hdop,
-                    # The receiver's own accuracy estimate (MAVLink 2 fields, in
-                    # mm). 0 means it gives none, which is not "0 m accurate".
-                    "h_acc_m": _mm_to_m_or_none(getattr(msg, "h_acc", 0)),
-                    "v_acc_m": _mm_to_m_or_none(getattr(msg, "v_acc", 0)),
-                }
-                # 2=2D fix, 3=3D fix, 4=DGPS, 5=RTK, etc. — use when EKF position not ready yet.
-                if fix_type >= 2 and (abs(raw_lat) > 1e-9 or abs(raw_lon) > 1e-9):
-                    gps_payload["lat"] = raw_lat
-                    gps_payload["lon"] = raw_lon
-                    gps_payload["alt_msl_m"] = float(raw_alt_mm) / 1000.0
-                self._emit_telemetry_payload("GPS_RAW_INT", gps_payload)
-            elif msg_type == "SYS_STATUS":
-                self._emit_telemetry_payload(
-                    "SYS_STATUS",
-                    {
-                        # Raw mV as well: UINT16_MAX means "unknown", and that
-                        # sentinel is lost once it has been divided by 1000.
-                        "voltage_mv": int(getattr(msg, "voltage_battery", 0) or 0),
-                        "voltage_v": float(getattr(msg, "voltage_battery", 0) or 0) / 1000.0,
-                        "current_a": float(getattr(msg, "current_battery", -1) or -1) / 100.0,
-                        "battery_remaining": int(getattr(msg, "battery_remaining", -1) or -1),
-                        "sensors_present": int(
-                            getattr(msg, "onboard_control_sensors_present", 0) or 0
-                        ),
-                        "sensors_enabled": int(
-                            getattr(msg, "onboard_control_sensors_enabled", 0) or 0
-                        ),
-                        "sensors_health": int(
-                            getattr(msg, "onboard_control_sensors_health", 0) or 0
-                        ),
-                    },
-                )
-            elif msg_type == "BATTERY_STATUS":
-                # Never reached the UI before: the handler in telemetry_mixin
-                # had no producer, so a vehicle whose SYS_STATUS carries no
-                # battery data showed nothing at all.
-                batt_id = int(getattr(msg, "id", 0) or 0)
-                if batt_id != 0:
-                    # ArduPilot round-robins every configured instance. Only the
-                    # primary pack drives the header; a payload or backup
-                    # battery must not overwrite it.
-                    continue
-                cells: list[int] = []
-                for attr in ("voltages", "voltages_ext"):
-                    raw_cells = getattr(msg, attr, None) or []
-                    for cell in raw_cells:
-                        try:
-                            cells.append(int(cell))
-                        except (TypeError, ValueError):
-                            continue
-                self._emit_telemetry_payload(
-                    "BATTERY_STATUS",
-                    {
-                        "id": batt_id,
-                        # Per MAVLink, the pack voltage is the sum of the cells
-                        # that are neither 0 (absent) nor UINT16_MAX (unknown).
-                        "voltages_mv": cells,
-                        "current_a": float(getattr(msg, "current_battery", -1) or -1) / 100.0,
-                        "battery_remaining": int(getattr(msg, "battery_remaining", -1) or -1),
-                    },
-                )
-            elif msg_type == "RADIO_STATUS":
-                self._emit_telemetry_payload(
-                    "RADIO_STATUS",
-                    {
-                        "rssi": int(getattr(msg, "rssi", 0) or 0),
-                        "remrssi": int(getattr(msg, "remrssi", 0) or 0),
-                        "noise": int(getattr(msg, "noise", 0) or 0),
-                        "remnoise": int(getattr(msg, "remnoise", 0) or 0),
-                    },
-                )
-            elif msg_type == "OBSTACLE_DISTANCE":
-                raw_dists = getattr(msg, "distances", None) or []
-                distances_cm: list[int] = []
-                for i in range(72):
-                    try:
-                        distances_cm.append(int(raw_dists[i]))
-                    except (IndexError, TypeError, ValueError):
-                        distances_cm.append(0xFFFF)
-                increment = float(getattr(msg, "increment", 0) or 0)
-                increment_f = float(getattr(msg, "increment_f", 0) or 0)
-                increment_deg = increment_f if increment_f > 0 else (increment if increment > 0 else 5.0)
-                angle_raw = float(getattr(msg, "angle_offset", 0) or 0)
-                # ArduPilot v2: degrees; legacy builds used centidegrees.
-                angle_off = angle_raw / 100.0 if abs(angle_raw) > 360.0 else angle_raw
-                sensor_type = int(getattr(msg, "sensor_type", getattr(msg, "type", 0)) or 0)
-                payload = {
-                    "sensor_type": sensor_type,
-                    "distances_cm": distances_cm,
-                    "increment_deg": increment_deg,
-                    "angle_offset_deg": angle_off,
-                    "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
-                    "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
-                    "frame": int(getattr(msg, "frame", 0) or 0),
-                }
-                self._log_proximity_once(msg_type, payload)
-                self._emit_telemetry_payload("OBSTACLE_DISTANCE", payload)
-            elif msg_type == "DISTANCE_SENSOR":
-                cur_cm = int(getattr(msg, "current_distance", 0xFFFF) or 0xFFFF)
-                cur_m: float | None = None
-                if 0 < cur_cm < 0xFFFF:
-                    cur_m = float(cur_cm) / 100.0
-                payload = {
-                    "sensor_type": int(getattr(msg, "type", 0) or 0),
-                    "orientation": int(getattr(msg, "orientation", 0) or 0),
-                    "current_distance_m": cur_m,
-                    "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
-                    "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
-                    "id": int(getattr(msg, "id", 0) or 0),
-                }
-                self._log_proximity_once(msg_type, payload)
-                self._emit_telemetry_payload("DISTANCE_SENSOR", payload)
-            elif msg_type == "RANGEFINDER":
-                dist_raw = float(getattr(msg, "distance", 0.0) or 0.0)
-                cur_m = dist_raw if dist_raw > 0 else None
-                payload = {
-                    "sensor_type": int(mav_apm.MAV_DISTANCE_SENSOR_LASER),
-                    "orientation": int(mav_apm.MAV_SENSOR_ROTATION_PITCH_270),
-                    "current_distance_m": cur_m,
-                    "min_distance_m": 0.0,
-                    "max_distance_m": 30.0,
-                    "id": 0,
-                    "legacy_rangefinder": True,
-                }
-                self._log_proximity_once(msg_type, payload)
-                self._emit_telemetry_payload("DISTANCE_SENSOR", payload)
-            elif msg_type.startswith("OPEN_DRONE_ID_"):
-                payload: dict[str, object] = {}
-                try:
-                    raw = msg.to_dict()
-                    if isinstance(raw, dict):
-                        payload = raw
-                except Exception:
-                    payload = {}
-                # Best-effort normalize of common byte-array identifier fields.
-                for key in ("id_or_mac", "uas_id", "operator_id", "self_id"):
-                    if key not in payload:
-                        continue
-                    value = payload.get(key)
-                    if isinstance(value, (bytes, bytearray)):
-                        payload[key] = value.decode("ascii", errors="ignore").strip("\x00 ").strip()
-                    elif isinstance(value, list):
-                        try:
-                            payload[key] = bytes(int(v) & 0xFF for v in value).decode(
-                                "ascii", errors="ignore"
-                            ).strip("\x00 ").strip()
-                        except Exception:
-                            pass
-                self._emit_telemetry_payload(msg_type, payload)
+            self._handle_message(msg)
 
         try:
             if self._master is not None:
@@ -1159,6 +785,394 @@ class MavlinkThread(FenceLinkMixin, QThread):
         self._cancel_confirmations("the link closed before the drone answered")
         self.link_down.emit()
         self.log_line.emit("Link closed.")
+
+    def _handle_message(self, msg) -> None:
+        """What the link does with one message from the drone.
+
+        The main loop hands every message here. The waits hand on what is not
+        theirs (_read_while_waiting, 2026-10-14).
+        """
+        msg_type = msg.get_type()
+        if msg_type in _AUTOPILOT_ONLY_MESSAGES and not self._is_primary_source(msg):
+            return
+        if msg_type == "HEARTBEAT":
+            src_sys = int(msg.get_srcSystem())
+            src_comp = int(msg.get_srcComponent())
+            if self._heartbeat_updates_link_target(msg):
+                self._target_sysid = src_sys
+                # Prefer autopilot component (1) over generic component (0) so
+                # mode/status come from a stable source and do not flicker/swap.
+                if int(self._target_compid) <= 0:
+                    self._target_compid = src_comp
+                elif src_comp == 1:
+                    self._target_compid = 1
+                elif int(self._target_compid) != 1:
+                    self._target_compid = src_comp
+            now = time.monotonic()
+            # Avoid flooding UI if vehicle sends HB fast
+            if now - self._last_hb_emit_mono >= 0.5:
+                self._last_hb_emit_mono = now
+                self.heartbeat.emit(
+                    int(msg.get_srcSystem()),
+                    int(msg.get_srcComponent()),
+                    int(getattr(msg, "mavlink_version", 0) or 0),
+                )
+            hb_now = time.monotonic()
+            primary = (
+                (int(self._target_sysid) <= 0 or src_sys == int(self._target_sysid))
+                and (int(self._target_compid) <= 0 or src_comp == int(self._target_compid))
+            )
+            if primary and hb_now - self._last_hb_log_mono >= 5.0:
+                self._last_hb_log_mono = hb_now
+                self.log_line.emit(
+                    f"HEARTBEAT sys={msg.get_srcSystem()} comp={msg.get_srcComponent()}"
+                )
+            armed = bool(getattr(msg, "base_mode", 0) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            if primary:
+                # Mission start must never force a flying vehicle into STABILIZE.
+                self._vehicle_armed = armed
+            mode_text = ""
+            try:
+                # Uses pymavlink's autopilot-aware decoder (PX4/ArduPilot/etc.) instead of
+                # relying only on raw custom_mode integer mappings.
+                mode_text = str(mavutil.mode_string_v10(msg) or "").strip()
+            except Exception:
+                mode_text = ""
+            if primary:
+                self._remember_vehicle_mode(mode_text)
+                self._hear_mode(msg)
+                self._hear_signature(msg)
+            if primary:
+                self._emit_telemetry_payload(
+                    "HEARTBEAT",
+                    {
+                        "armed": armed,
+                        "system_status": int(getattr(msg, "system_status", 0) or 0),
+                        "custom_mode": int(getattr(msg, "custom_mode", 0) or 0),
+                        "base_mode": int(getattr(msg, "base_mode", 0) or 0),
+                        "vehicle_type": int(getattr(msg, "type", 0) or 0),
+                        "autopilot": int(getattr(msg, "autopilot", 0) or 0),
+                        "mode_text": mode_text,
+                    },
+                )
+            if int(self._target_sysid) > 0:
+                now_req = time.monotonic()
+                if not self._streams_requested:
+                    self._streams_requested = True
+                    try:
+                        self._request_telemetry_streams()
+                    except Exception:
+                        pass
+                    self._prox_streams_last_request_mono = now_req
+                elif now_req - float(self._prox_streams_last_request_mono) >= _PROX_STREAM_RESEND_S:
+                    try:
+                        self._request_proximity_streams()
+                    except Exception:
+                        pass
+                    self._prox_streams_last_request_mono = now_req
+        elif msg_type == "MISSION_CURRENT":
+            cur_seq = int(getattr(msg, "seq", 0) or 0)
+            state = getattr(msg, "mission_state", None)
+            self._emit_telemetry_payload("MISSION_CURRENT", {"seq": cur_seq})
+            if self._is_primary_source(msg):
+                # First, so a mission that is no longer the one VGCS knows
+                # is dropped before its progress is named.
+                self._legs().heard_current(cur_seq, time.monotonic(), getattr(msg, "total", None), state)
+            self._emit_mission_progress(cur_seq, reached=False, state=state)
+        elif msg_type == "MISSION_ITEM_REACHED":
+            # Fires once per completed item: the only reliable "WP N done" event.
+            self._emit_mission_progress(int(getattr(msg, "seq", 0) or 0), reached=True)
+        elif msg_type in ("MISSION_ITEM_INT", "MISSION_ITEM"):
+            if not self._hear_fence_item(msg):
+                self._hear_mission_item(msg)
+        elif msg_type == "MISSION_ACK":
+            if not self._hear_fence_ack(msg):
+                self._hear_mission_ack(msg)
+        elif msg_type in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+            self._hear_fence_request(msg)
+        elif msg_type == "MISSION_COUNT":
+            self._hear_fence_count(msg)
+        elif msg_type == "HOME_POSITION":
+            self._hear_home_position(msg)
+        elif msg_type == "STATUSTEXT":
+            self._handle_statustext(msg)
+        elif msg_type == "COMMAND_ACK":
+            self._remember_arm_ack(msg)
+            self._hear_mode_ack(msg)
+            self._hear_command_ack(msg)
+        elif msg_type == "PARAM_VALUE":
+            self._hear_param_value(msg)
+        elif msg_type == "VFR_HUD":
+            self._emit_telemetry_payload(
+                "VFR_HUD",
+                {
+                    "airspeed": float(getattr(msg, "airspeed", 0.0) or 0.0),
+                    "groundspeed": float(getattr(msg, "groundspeed", 0.0) or 0.0),
+                    "heading": int(getattr(msg, "heading", 0) or 0),
+                    "throttle": int(getattr(msg, "throttle", 0) or 0),
+                    "climb": float(getattr(msg, "climb", 0.0) or 0.0),
+                },
+            )
+        elif msg_type == "GPS_RTK":
+            # Only the Septentrio, Swift and Emlid drivers send this. A
+            # u-blox sends nothing here: its fix type is all there is.
+            baseline_mm = math.sqrt(
+                float(getattr(msg, "baseline_a_mm", 0) or 0) ** 2
+                + float(getattr(msg, "baseline_b_mm", 0) or 0) ** 2
+                + float(getattr(msg, "baseline_c_mm", 0) or 0) ** 2
+            )
+            self._emit_telemetry_payload(
+                "GPS_RTK",
+                {
+                    "satellites": int(getattr(msg, "nsats", 0) or 0),
+                    "baseline_m": baseline_mm / 1000.0,
+                    "hypotheses": int(getattr(msg, "iar_num_hypotheses", 0) or 0),
+                },
+            )
+        elif msg_type == "WIND":
+            # ArduCopter sends this only with the EKF drag parameters set.
+            # direction is where the wind comes FROM, -180 to 180 degrees.
+            self._emit_telemetry_payload(
+                "WIND",
+                {
+                    "direction_deg": float(getattr(msg, "direction", 0.0) or 0.0),
+                    "speed_mps": float(getattr(msg, "speed", 0.0) or 0.0),
+                    "speed_z_mps": float(getattr(msg, "speed_z", 0.0) or 0.0),
+                },
+            )
+        elif msg_type == "NAMED_VALUE_FLOAT":
+            name = named_value_name(getattr(msg, "name", ""))
+            if name.startswith(_NAMED_VALUE_PREFIXES):
+                self._emit_telemetry_payload(
+                    "NAMED_VALUE_FLOAT",
+                    {"name": name, "value": float(getattr(msg, "value", 0.0) or 0.0)},
+                )
+        elif msg_type == "ATTITUDE":
+            self._emit_telemetry_payload(
+                "ATTITUDE",
+                {
+                    "roll_deg": float(getattr(msg, "roll", 0.0) or 0.0) * 57.2958,
+                    "pitch_deg": float(getattr(msg, "pitch", 0.0) or 0.0) * 57.2958,
+                    "yaw_deg": float(getattr(msg, "yaw", 0.0) or 0.0) * 57.2958,
+                },
+            )
+        elif msg_type == "GLOBAL_POSITION_INT":
+            vx = float(getattr(msg, "vx", 0) or 0)
+            vy = float(getattr(msg, "vy", 0) or 0)
+            spd_cm = math.hypot(vx, vy)
+            gt_deg: float | None = None
+            if spd_cm > 50.0:
+                gt_deg = (math.degrees(math.atan2(vy, vx)) + 360.0) % 360.0
+            raw_hdg = int(getattr(msg, "hdg", 0) or 0)
+            hdg_deg: float | None = None
+            if raw_hdg != 65535:
+                hdg_deg = (raw_hdg / 100.0) % 360.0
+            gpi: dict[str, object] = {
+                "lat": float(getattr(msg, "lat", 0) or 0) / 1e7,
+                "lon": float(getattr(msg, "lon", 0) or 0) / 1e7,
+                "relative_alt_m": float(getattr(msg, "relative_alt", 0) or 0) / 1000.0,
+                "alt_msl_m": float(getattr(msg, "alt", 0) or 0) / 1000.0,
+                "groundspeed_mps": spd_cm / 100.0,
+            }
+            if hdg_deg is not None:
+                gpi["hdg_deg"] = hdg_deg
+            if gt_deg is not None:
+                gpi["ground_track_deg"] = gt_deg
+            if self._is_primary_source(msg):
+                self._legs().heard_position(float(gpi["lat"]), float(gpi["lon"]))
+                self._note_position(float(gpi["lat"]), float(gpi["lon"]), float(gpi["relative_alt_m"]))
+            self._emit_telemetry_payload("GLOBAL_POSITION_INT", gpi)
+        elif msg_type == "MOUNT_ORIENTATION":
+            yaw = float(getattr(msg, "yaw", float("nan")) or float("nan"))
+            pitch = float(getattr(msg, "pitch", float("nan")) or float("nan"))
+            yaw_v = None if math.isnan(yaw) else yaw
+            pitch_v = None if math.isnan(pitch) else pitch
+            self._update_gimbal_cache(yaw_v, pitch_v)
+        elif msg_type == "GIMBAL_DEVICE_ATTITUDE_STATUS":
+            q = getattr(msg, "q", None) or []
+            if len(q) >= 4:
+                try:
+                    w, x, y, z = (
+                        float(q[0]),
+                        float(q[1]),
+                        float(q[2]),
+                        float(q[3]),
+                    )
+                    sinr_cosp = 2.0 * (w * x + y * z)
+                    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+                    roll = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
+                    sinp = 2.0 * (w * y - z * x)
+                    pitch = (
+                        math.copysign(90.0, sinp)
+                        if abs(sinp) >= 1.0
+                        else math.degrees(math.asin(sinp))
+                    )
+                    siny_cosp = 2.0 * (w * z + x * y)
+                    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+                    yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+                    self._update_gimbal_cache(yaw, pitch)
+                except Exception:
+                    pass
+        elif msg_type == "GPS_RAW_INT":
+            eph_raw = int(getattr(msg, "eph", 0xFFFF) or 0xFFFF)
+            hdop = None if eph_raw >= 0xFFFF else float(eph_raw) / 100.0
+            fix_type = int(getattr(msg, "fix_type", 0) or 0)
+            raw_lat = float(getattr(msg, "lat", 0) or 0) / 1e7
+            raw_lon = float(getattr(msg, "lon", 0) or 0) / 1e7
+            raw_alt_mm = int(getattr(msg, "alt", 0) or 0)
+            gps_payload: dict[str, object] = {
+                "satellites_visible": int(getattr(msg, "satellites_visible", 0) or 0),
+                "fix_type": fix_type,
+                "hdop": hdop,
+                # The receiver's own accuracy estimate (MAVLink 2 fields, in
+                # mm). 0 means it gives none, which is not "0 m accurate".
+                "h_acc_m": _mm_to_m_or_none(getattr(msg, "h_acc", 0)),
+                "v_acc_m": _mm_to_m_or_none(getattr(msg, "v_acc", 0)),
+            }
+            # 2=2D fix, 3=3D fix, 4=DGPS, 5=RTK, etc. Used when the EKF position is not ready yet.
+            if fix_type >= 2 and (abs(raw_lat) > 1e-9 or abs(raw_lon) > 1e-9):
+                gps_payload["lat"] = raw_lat
+                gps_payload["lon"] = raw_lon
+                gps_payload["alt_msl_m"] = float(raw_alt_mm) / 1000.0
+            self._emit_telemetry_payload("GPS_RAW_INT", gps_payload)
+        elif msg_type == "SYS_STATUS":
+            self._emit_telemetry_payload(
+                "SYS_STATUS",
+                {
+                    # Raw mV as well: UINT16_MAX means "unknown", and that
+                    # sentinel is lost once it has been divided by 1000.
+                    "voltage_mv": int(getattr(msg, "voltage_battery", 0) or 0),
+                    "voltage_v": float(getattr(msg, "voltage_battery", 0) or 0) / 1000.0,
+                    "current_a": float(getattr(msg, "current_battery", -1) or -1) / 100.0,
+                    "battery_remaining": int(getattr(msg, "battery_remaining", -1) or -1),
+                    "sensors_present": int(
+                        getattr(msg, "onboard_control_sensors_present", 0) or 0
+                    ),
+                    "sensors_enabled": int(
+                        getattr(msg, "onboard_control_sensors_enabled", 0) or 0
+                    ),
+                    "sensors_health": int(
+                        getattr(msg, "onboard_control_sensors_health", 0) or 0
+                    ),
+                },
+            )
+        elif msg_type == "BATTERY_STATUS":
+            # Never reached the UI before: the handler in telemetry_mixin
+            # had no producer, so a vehicle whose SYS_STATUS carries no
+            # battery data showed nothing at all.
+            batt_id = int(getattr(msg, "id", 0) or 0)
+            if batt_id != 0:
+                # ArduPilot round-robins every configured instance. Only the
+                # primary pack drives the header; a payload or backup
+                # battery must not overwrite it.
+                return
+            cells: list[int] = []
+            for attr in ("voltages", "voltages_ext"):
+                raw_cells = getattr(msg, attr, None) or []
+                for cell in raw_cells:
+                    try:
+                        cells.append(int(cell))
+                    except (TypeError, ValueError):
+                        continue
+            self._emit_telemetry_payload(
+                "BATTERY_STATUS",
+                {
+                    "id": batt_id,
+                    # Per MAVLink, the pack voltage is the sum of the cells
+                    # that are neither 0 (absent) nor UINT16_MAX (unknown).
+                    "voltages_mv": cells,
+                    "current_a": float(getattr(msg, "current_battery", -1) or -1) / 100.0,
+                    "battery_remaining": int(getattr(msg, "battery_remaining", -1) or -1),
+                },
+            )
+        elif msg_type == "RADIO_STATUS":
+            self._emit_telemetry_payload(
+                "RADIO_STATUS",
+                {
+                    "rssi": int(getattr(msg, "rssi", 0) or 0),
+                    "remrssi": int(getattr(msg, "remrssi", 0) or 0),
+                    "noise": int(getattr(msg, "noise", 0) or 0),
+                    "remnoise": int(getattr(msg, "remnoise", 0) or 0),
+                },
+            )
+        elif msg_type == "OBSTACLE_DISTANCE":
+            raw_dists = getattr(msg, "distances", None) or []
+            distances_cm: list[int] = []
+            for i in range(72):
+                try:
+                    distances_cm.append(int(raw_dists[i]))
+                except (IndexError, TypeError, ValueError):
+                    distances_cm.append(0xFFFF)
+            increment = float(getattr(msg, "increment", 0) or 0)
+            increment_f = float(getattr(msg, "increment_f", 0) or 0)
+            increment_deg = increment_f if increment_f > 0 else (increment if increment > 0 else 5.0)
+            angle_raw = float(getattr(msg, "angle_offset", 0) or 0)
+            # ArduPilot v2: degrees; legacy builds used centidegrees.
+            angle_off = angle_raw / 100.0 if abs(angle_raw) > 360.0 else angle_raw
+            sensor_type = int(getattr(msg, "sensor_type", getattr(msg, "type", 0)) or 0)
+            payload = {
+                "sensor_type": sensor_type,
+                "distances_cm": distances_cm,
+                "increment_deg": increment_deg,
+                "angle_offset_deg": angle_off,
+                "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
+                "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
+                "frame": int(getattr(msg, "frame", 0) or 0),
+            }
+            self._log_proximity_once(msg_type, payload)
+            self._emit_telemetry_payload("OBSTACLE_DISTANCE", payload)
+        elif msg_type == "DISTANCE_SENSOR":
+            cur_cm = int(getattr(msg, "current_distance", 0xFFFF) or 0xFFFF)
+            cur_m: float | None = None
+            if 0 < cur_cm < 0xFFFF:
+                cur_m = float(cur_cm) / 100.0
+            payload = {
+                "sensor_type": int(getattr(msg, "type", 0) or 0),
+                "orientation": int(getattr(msg, "orientation", 0) or 0),
+                "current_distance_m": cur_m,
+                "min_distance_m": float(getattr(msg, "min_distance", 0) or 0) / 100.0,
+                "max_distance_m": float(getattr(msg, "max_distance", 0) or 0) / 100.0,
+                "id": int(getattr(msg, "id", 0) or 0),
+            }
+            self._log_proximity_once(msg_type, payload)
+            self._emit_telemetry_payload("DISTANCE_SENSOR", payload)
+        elif msg_type == "RANGEFINDER":
+            dist_raw = float(getattr(msg, "distance", 0.0) or 0.0)
+            cur_m = dist_raw if dist_raw > 0 else None
+            payload = {
+                "sensor_type": int(mav_apm.MAV_DISTANCE_SENSOR_LASER),
+                "orientation": int(mav_apm.MAV_SENSOR_ROTATION_PITCH_270),
+                "current_distance_m": cur_m,
+                "min_distance_m": 0.0,
+                "max_distance_m": 30.0,
+                "id": 0,
+                "legacy_rangefinder": True,
+            }
+            self._log_proximity_once(msg_type, payload)
+            self._emit_telemetry_payload("DISTANCE_SENSOR", payload)
+        elif msg_type.startswith("OPEN_DRONE_ID_"):
+            payload: dict[str, object] = {}
+            try:
+                raw = msg.to_dict()
+                if isinstance(raw, dict):
+                    payload = raw
+            except Exception:
+                payload = {}
+            # Best-effort normalize of common byte-array identifier fields.
+            for key in ("id_or_mac", "uas_id", "operator_id", "self_id"):
+                if key not in payload:
+                    continue
+                value = payload.get(key)
+                if isinstance(value, (bytes, bytearray)):
+                    payload[key] = value.decode("ascii", errors="ignore").strip("\x00 ").strip()
+                elif isinstance(value, list):
+                    try:
+                        payload[key] = bytes(int(v) & 0xFF for v in value).decode(
+                            "ascii", errors="ignore"
+                        ).strip("\x00 ").strip()
+                    except Exception:
+                        pass
+            self._emit_telemetry_payload(msg_type, payload)
 
     def _process_pending_commands(self) -> None:
         if self._master is None:
@@ -1803,11 +1817,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline and self._running and self._master is not None:
             self._maybe_send_gcs_heartbeat()
-            ack = self._master.recv_match(
-                type=["MISSION_ACK"],
-                blocking=True,
-                timeout=0.35,
-            )
+            ack = self._read_while_waiting(("MISSION_ACK",), 0.35)
             if ack is None:
                 continue
             mt = int(getattr(ack, "mission_type", 0) or 0)
@@ -1845,6 +1855,8 @@ class MavlinkThread(FenceLinkMixin, QThread):
         if not waypoints:
             self.error.emit("Mission upload: no waypoints")
             return
+        self._own_upload_in_progress = True
+        self._own_upload_echo_heard = False
         try:
             self._send_mission(waypoints, end_action)
         except Exception as e:
@@ -1858,6 +1870,8 @@ class MavlinkThread(FenceLinkMixin, QThread):
                     "mission", False, f"Mission upload failed ({e}). Nothing was sent to the drone"
                 )
             raise
+        finally:
+            self._own_upload_in_progress = False
 
     def _send_mission(
         self, waypoints: list[dict], end_action: str = DEFAULT_MISSION_END_ACTION
@@ -1927,11 +1941,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 last_count_tx = now
                 self.log_line.emit("Mission upload: resend MISSION_COUNT (waiting vehicle request)")
 
-            req = self._master.recv_match(
-                type=["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"],
-                blocking=True,
-                timeout=1.0,
-            )
+            req = self._read_while_waiting(("MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"), 1.0)
             if req is None:
                 if time.monotonic() - started > 25.0:
                     raise TimeoutError("mission upload timeout waiting request")
@@ -1996,7 +2006,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
         ack_deadline = time.monotonic() + 5.0
         while time.monotonic() < ack_deadline and self._running and self._master is not None:
             self._maybe_send_gcs_heartbeat()
-            msg = self._master.recv_match(type=["MISSION_ACK"], blocking=True, timeout=0.5)
+            msg = self._read_while_waiting(("MISSION_ACK",), 0.5)
             if msg is None:
                 continue
             mt = int(getattr(msg, "mission_type", 0) or 0)
@@ -2015,7 +2025,11 @@ class MavlinkThread(FenceLinkMixin, QThread):
         self._mission_not_kept = ()
         self._mission_in_doubt = False
         self._own_upload_done_mono = time.monotonic()
-        self._own_upload_echo_until = self._own_upload_done_mono + _OWN_UPLOAD_ECHO_S
+        # The drone's "Flight plan received" for this upload may have come
+        # already, while the upload ran. Then the next one is another station's.
+        self._own_upload_echo_until = (
+            0.0 if getattr(self, "_own_upload_echo_heard", False) else self._own_upload_done_mono + _OWN_UPLOAD_ECHO_S
+        )
         self._last_mission_seq_reported = None
         self._legs().mission_changed()
         self.log_line.emit(f"Mission upload complete: {count} mission items")
@@ -2061,11 +2075,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 self._target_sysid,
                 self._target_compid,
             )
-        cnt_msg = self._master.recv_match(
-            type=["MISSION_COUNT"],
-            blocking=True,
-            timeout=5.0,
-        )
+        cnt_msg = self._read_while_waiting(("MISSION_COUNT",), 5.0)
         if cnt_msg is None:
             raise TimeoutError("mission download timeout waiting count")
         count = int(getattr(cnt_msg, "count", 0) or 0)
@@ -2090,11 +2100,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
             # be read with an item twice and another one missing.
             itm = None
             for _attempt in range(4):
-                got = self._master.recv_match(
-                    type=["MISSION_ITEM_INT", "MISSION_ITEM"],
-                    blocking=True,
-                    timeout=3.0,
-                )
+                got = self._read_while_waiting(("MISSION_ITEM_INT", "MISSION_ITEM"), 3.0)
                 if got is None:
                     break
                 if int(getattr(got, "mission_type", 0) or 0) != int(mavutil.mavlink.MAV_MISSION_TYPE_MISSION):
@@ -2673,24 +2679,56 @@ class MavlinkThread(FenceLinkMixin, QThread):
             f"the vehicle would not disarm and said nothing at all - {advice}"
         )
 
+    def _read_while_waiting(self, wanted: tuple[str, ...], timeout_s: float):
+        """The next message of a type in ``wanted``, or None when ``timeout_s`` has passed.
+
+        Everything else the drone sends meanwhile is handled as the main loop
+        handles it (_handle_message): the position, the battery, the
+        heartbeat, the drone's messages, settings answers. The waits used to
+        read only their own answers, and pymavlink threw the rest away: during
+        a mission upload or download the map and the battery stood still, and
+        a settings read open at the same time lost its answers (2026-10-14).
+        Messages of the mission protocol that a wait does not want are left
+        alone, as before: they belong to a transfer the wait is not part of,
+        or come late.
+        """
+        deadline = time.monotonic() + float(timeout_s)
+        while self._running and self._master is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            self._maybe_send_gcs_heartbeat()
+            msg = self._master.recv_match(blocking=True, timeout=min(remaining, 0.35))
+            if msg is None:
+                continue
+            msg_type = msg.get_type()
+            if msg_type in wanted:
+                return msg
+            if not msg_type.startswith("MISSION_"):
+                self._handle_message(msg)
+        return None
+
     def _pump_link_until(self, predicate, timeout_s: float) -> bool:
         """Read from the link until ``predicate`` accepts a heartbeat, or time runs out.
 
-        Every wait in this class goes through here, so that STATUSTEXT and
-        COMMAND_ACK are handled rather than silently consumed. A wait with a
-        narrower filter destroys exactly the messages that explain why the wait
-        is failing, which is the bug this replaced.
+        The waits for the arm, the disarm and a mode go through here, so that
+        STATUSTEXT and COMMAND_ACK are handled rather than silently consumed. A
+        wait with a narrower filter destroys exactly the messages that explain
+        why the wait is failing, which is the bug this replaced.
+
+        Everything else goes on as in the main loop (_read_while_waiting,
+        2026-10-14). A take-off pressed right after connect waited up to eight
+        seconds here for the arm, and the answers to the settings read at
+        connect that came in that time were thrown away: in the window test
+        on the simulator, FRAME_CLASS and SERVO9_FUNCTION were reported "not
+        on this drone".
         """
         if self._master is None:
             return False
         deadline = time.monotonic() + float(timeout_s)
         while self._running and self._master is not None and time.monotonic() < deadline:
             self._maybe_send_gcs_heartbeat()
-            msg = self._master.recv_match(
-                type=["HEARTBEAT", "STATUSTEXT", "COMMAND_ACK"],
-                blocking=True,
-                timeout=0.35,
-            )
+            msg = self._read_while_waiting(("HEARTBEAT", "STATUSTEXT", "COMMAND_ACK"), 0.35)
             if msg is None:
                 continue
             # The flight controller, not merely its system id. A gimbal (154),
@@ -3161,6 +3199,10 @@ class MavlinkThread(FenceLinkMixin, QThread):
         the plan is checked against the drone before it is used
         (vgcs/link/mission_speed.py).
         """
+        if getattr(self, "_own_upload_in_progress", False):
+            # Said while the upload from here runs: the answer to it.
+            self._own_upload_echo_heard = True
+            return
         until = float(getattr(self, "_own_upload_echo_until", 0.0) or 0.0)
         if until and time.monotonic() < until:
             # The answer to our own upload. Only one: the next is someone else's.
@@ -3183,6 +3225,8 @@ class MavlinkThread(FenceLinkMixin, QThread):
         stands on the ground gives no word at all, so the plan is also checked
         against the drone before it is used (vgcs/link/mission_speed.py).
         """
+        if getattr(self, "_own_upload_in_progress", False):
+            return            # said for each item of the upload from here
         done = float(getattr(self, "_own_upload_done_mono", 0.0) or 0.0)
         if done and time.monotonic() - done < _OWN_UPLOAD_CHANGE_S:
             return

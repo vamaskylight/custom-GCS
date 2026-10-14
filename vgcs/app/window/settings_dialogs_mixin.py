@@ -184,9 +184,19 @@ class MainWindowSettingsDialogsMixin:
         outer.addLayout(content_row, 1)
 
         # General page (keep as pointer to main UI, matching our app architecture).
+        # In a scroll area like the other pages: with the payload release it is
+        # taller than the dialog (2026-10-14).
         general = QWidget()
-        g = QVBoxLayout(general)
-        g.setContentsMargins(12, 12, 12, 12)
+        general_outer = QVBoxLayout(general)
+        general_outer.setContentsMargins(12, 12, 12, 12)
+        general_scroll = QScrollArea()
+        general_scroll.setWidgetResizable(True)
+        general_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        general_outer.addWidget(general_scroll, 1)
+        general_body = QWidget()
+        general_scroll.setWidget(general_body)
+        g = QVBoxLayout(general_body)
+        g.setContentsMargins(0, 0, 0, 0)
         g.setSpacing(10)
         g.addWidget(QLabel("General settings are available in the main window (Connection + Theme)."))
 
@@ -233,6 +243,8 @@ class MainWindowSettingsDialogsMixin:
         rg.setColumnStretch(1, 1)
         rtk_group.setLayout(rg)
         g.addWidget(rtk_group)
+        payload_group, save_payload_release = self._build_payload_release_group()
+        g.addWidget(payload_group)
         build_signing = getattr(self, "_build_signing_settings_group", None)
         if build_signing is not None:
             g.addWidget(build_signing())
@@ -823,6 +835,7 @@ class MainWindowSettingsDialogsMixin:
                 self._publish_wind()
                 s.setValue(KEY_RTK_BASE_SOURCE, str(rtk_base_edit.text()).strip())
                 self._apply_rtk_base_setting()
+                save_payload_release()
                 try:
                     from vgcs.observe.dem import clear_dem_cache
 
@@ -852,6 +865,88 @@ class MainWindowSettingsDialogsMixin:
         finally:
             if self._map_widget is not None:
                 self._map_widget.restore_floating_overlays(overlay_restore)
+
+    def _build_payload_release_group(self):
+        """Application Settings, General: the servo output of the payload release, and its pulses.
+
+        Until 2026-10-14 there was no place on screen for them (only the
+        settings file), so the release went to output 9 on every drone.
+        Returns the group, and the function that keeps what it holds.
+        """
+        from vgcs.link.payload_servo_settings import (
+            CHANNEL_RANGE,
+            HOLD_RANGE_S,
+            PWM_RANGE_US,
+            payload_servo_from_settings,
+            save_payload_servo,
+        )
+        from vgcs.mission.mission_plan import PayloadServo
+        from vgcs.mission.payload_release import servo_function_param
+
+        servo = payload_servo_from_settings()
+        group = QGroupBox("Payload release")
+        grid = QGridLayout()
+        channel = QSpinBox()
+        channel.setObjectName("payloadServoChannel")
+        channel.setRange(*CHANNEL_RANGE)
+        channel.setValue(int(servo.channel))
+        release = QSpinBox()
+        release.setObjectName("payloadServoRelease")
+        release.setRange(*PWM_RANGE_US)
+        release.setSingleStep(10)
+        release.setSuffix(" us")
+        release.setValue(int(servo.release_pwm))
+        close = QSpinBox()
+        close.setObjectName("payloadServoClose")
+        close.setRange(*PWM_RANGE_US)
+        close.setSingleStep(10)
+        close.setSuffix(" us")
+        close.setValue(int(servo.reset_pwm))
+        hold = QDoubleSpinBox()
+        hold.setObjectName("payloadServoHold")
+        hold.setRange(*HOLD_RANGE_S)
+        hold.setDecimals(1)
+        hold.setSingleStep(0.5)
+        hold.setSuffix(" s")
+        hold.setSpecialValueText("Stays open")
+        hold.setValue(float(servo.hold_s))
+        for row, (words, box) in enumerate((
+            ("Servo output", channel),
+            ("Release pulse", release),
+            ("Close pulse", close),
+            ("Close after", hold),
+        )):
+            grid.addWidget(QLabel(words), row, 0)
+            grid.addWidget(box, row, 1)
+        hint = QLabel(
+            "A waypoint with \"Drop payload\" moves this servo output when the drone gets there: the release "
+            "pulse, then after the time set the close pulse. The drone moves an output for a mission only when "
+            "the output is free (SERVOn_FUNCTION 0, for example). Upload and Start Mission check that once the "
+            "drone's settings are read. A mission read back from the drone is read with these values too."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        grid.addWidget(hint, 4, 0, 1, 2)
+        grid.setColumnStretch(1, 1)
+        group.setLayout(grid)
+
+        def save() -> None:
+            chosen = PayloadServo(
+                channel=int(channel.value()),
+                release_pwm=int(release.value()),
+                reset_pwm=int(close.value()),
+                hold_s=float(hold.value()),
+            )
+            if chosen == servo:
+                return
+            save_payload_servo(chosen)
+            thread = getattr(self, "_thread", None)
+            if chosen.channel != servo.channel and thread is not None and thread.isRunning():
+                # The drone's settings were read for the output set before;
+                # the check before Upload needs the new one's.
+                thread.queue_params_fetch([servo_function_param(chosen.channel)])
+
+        return group, save
 
     def _show_vehicle_configuration_help(self) -> None:
         QMessageBox.information(

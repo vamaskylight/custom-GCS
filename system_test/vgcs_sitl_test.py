@@ -460,6 +460,53 @@ def mission_upload_and_download(version: str, r: Report) -> None:
         f.close()
 
 
+def mission_transfer_keeps_telemetry(version: str, r: Report) -> None:
+    """While a mission goes up or comes back, the drone's position keeps reaching VGCS (added 2026-10-14).
+
+    The waits of a transfer read only their own answers, and pymavlink threw
+    the rest away: the position, the battery and the heartbeat stood still for
+    as long as the transfer took, and VGCS sent no heartbeat of its own during
+    a download. 200 waypoints, so that the transfer takes long enough to see:
+    60 went up in 0.2 s, time for only two positions (2026-10-14).
+    """
+    f = Flight(version)
+    try:
+        rec, link = f.rec, f.link
+        r.check(f.ready_to_fly(), "the drone is ready")
+        mission = []
+        for i in range(200):
+            lat, lon = offset_to_lat_lon(20.0 * (i // 10), 20.0 * (i % 10))
+            mission.append({"lat": lat, "lon": lon, "alt_m": 20.0, "speed_mps": 5.0})
+
+        def logged(text: str, since: float) -> float | None:
+            return next((when for when, line in rec.logs if when >= since and line.startswith(text)), None)
+
+        def during(what: str, since: float) -> None:
+            start, end = logged(f"Mission {what} start", since), logged(f"Mission {what} complete", since)
+            if start is None or end is None:
+                r.check(False, f"the {what} began and ended ({start}, {end})")
+                return
+            times = [when for when, _p in rec.telemetry.get("GLOBAL_POSITION_INT", []) if start <= when <= end]
+            gaps = [b - a for a, b in zip([start, *times], [*times, end])]
+            r.check(len(times) >= 4 and max(gaps) < 0.25,
+                    f"while the mission {'went up' if what == 'upload' else 'came back'} ({end - start:.2f} s), the position "
+                    f"reached VGCS {len(times)} times, the longest gap {max(gaps):.2f} s")
+
+        since = rec.now()
+        link.queue_mission_upload(mission, "rtl")
+        r.check(f.wait(lambda: bool(rec.uploaded), 120), f"upload: VGCS reports {rec.uploaded[-1] if rec.uploaded else 0} waypoints sent")
+        during("upload", since)
+        since = rec.now()
+        link.queue_mission_download()
+        r.check(f.wait(lambda: bool(rec.downloaded), 120), "download: the mission came back")
+        during("download", since)
+        waypoints = [i for i in (rec.downloaded[-1] if rec.downloaded else []) if i.get("command") == 16 and i.get("seq", 0) > 0]
+        r.check(len(waypoints) == len(mission), f"the drone holds {len(waypoints)} waypoints (sent {len(mission)})")
+        r.check(not rec.errors, f"VGCS reported no error {[e[1] for e in rec.errors][:3]}")
+    finally:
+        f.close()
+
+
 def mission_flight(version: str, r: Report) -> None:
     """A whole mission: start from the ground, pause, resume, skip a waypoint, return home and land."""
     f = Flight(version)
@@ -1396,7 +1443,7 @@ def signed_commands(version: str, r: Report) -> None:
 
 
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
-         mission_upload_and_download, mission_flight, mission_speeds, missions_as_they_come_back,
+         mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_speeds, missions_as_they_come_back,
          another_stations_mission, takeoff_fence_and_land, polygon_fence, link_silence, signed_commands]
 
 

@@ -2005,7 +2005,8 @@ class PlanFlightPanel(QWidget):
             drop_cb.setChecked(bool(drop))
             drop_cb.setToolTip(
                 "Release the payload servo on arrival. A point that also hovers"
-                "\nreleases at the end of its hover."
+                "\nreleases at the end of its hover. The servo output and its pulses:"
+                "\nApplication Settings, General, Payload release."
             )
             h2.addWidget(drop_cb)
             h2.addStretch(1)
