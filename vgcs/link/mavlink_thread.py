@@ -413,8 +413,12 @@ class MavlinkThread(FenceLinkMixin, QThread):
         return int(self._rtcm_bytes_sent)
 
     def _send_pending_rtcm(self) -> None:
-        """Send the waiting corrections as GPS_RTCM_DATA (see vgcs.link.rtcm for the cutting rules)."""
-        if self._master is None or not self._rtcm_queue:
+        """Send the waiting corrections as GPS_RTCM_DATA (see vgcs.link.rtcm for the cutting rules).
+
+        From the main loop, and from every wait (_read_while_waiting), so that
+        a mission upload or an arm does not hold them back (2026-10-14).
+        """
+        if self._master is None or not getattr(self, "_rtcm_queue", None):
             return
         # Corrections are for the vehicle this link talks to, so not before it has
         # been heard (the first heartbeat is also what sets the reply address).
@@ -2690,7 +2694,8 @@ class MavlinkThread(FenceLinkMixin, QThread):
         a settings read open at the same time lost its answers (2026-10-14).
         Messages of the mission protocol that a wait does not want are left
         alone, as before: they belong to a transfer the wait is not part of,
-        or come late.
+        or come late. VGCS's own heartbeat and the RTK corrections go out
+        meanwhile, as from the main loop.
         """
         deadline = time.monotonic() + float(timeout_s)
         while self._running and self._master is not None:
@@ -2698,6 +2703,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
             if remaining <= 0.0:
                 return None
             self._maybe_send_gcs_heartbeat()
+            self._send_pending_rtcm()
             msg = self._master.recv_match(blocking=True, timeout=min(remaining, 0.35))
             if msg is None:
                 continue

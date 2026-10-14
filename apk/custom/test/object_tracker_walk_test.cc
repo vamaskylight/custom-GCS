@@ -331,8 +331,13 @@ enum Camera { kStill = 0, kFollowsExactly = 1, kTurnedByTracker = 2 };
 const char *kCameraNames[] = {"camera still", "camera follows exactly", "camera turned by the tracker"};
 
 // What is in the figure's way.
-enum Way { kOpen = 0, kPost = 1, kWidePost = 2, kCross = 3, kWall = 4, kShadow = 5 };
-const char *kWayNames[] = {"walk", "post", "wide post", "cross", "wall", "shadow"};
+enum Way { kOpen = 0, kPost = 1, kWidePost = 2, kCross = 3, kWall = 4, kShadow = 5, kLookalike = 6 };
+const char *kWayNames[] = {"walk", "post", "wide post", "cross", "wall", "shadow", "look-alike"};
+
+// kLookalike: where the patch in the figure's colours lies, by place, from where the figure went
+// behind the cover, in boxes across and down. Task Q (client video, 2026-10-14): a person walked
+// behind a parked car, and the box went onto a dark tree about one box above it and stayed there.
+const double kLookalikeAt[6][2] = {{0.5, -0.5}, {0.5, 0.0}, {0.8, -1.0}, {0.3, -0.5}, {1.0, 0.0}, {0.5, -0.8}};
 
 struct Outcome
 {
@@ -364,7 +369,8 @@ struct Outcome
 // walks, stops and turns back.
 //  kPost: a dark post half as wide as the figure stands in the way; kWidePost: one and a half times.
 //  kCross: another figure comes the other way and passes in front. kWall: the figure walks behind a
-//  wall and stays there. kShadow: it walks into a deep shadow.
+//  wall and stays there. kShadow: it walks into a deep shadow. kLookalike: as kWall, and on the
+//  wall a patch in the figure's own colours, as large as the figure but without its shape.
 Outcome walk(const std::vector<Rgb> &world, int kind, int place, const BoxOnFigure &b, Camera camera, Way way)
 {
     Outcome out;
@@ -441,9 +447,10 @@ Outcome walk(const std::vector<Rgb> &world, int kind, int place, const BoxOnFigu
             drawFigure(frame, seen.other, seen.otherX - seen.camX, figY - camY + 2);
         }
         bool hidden = false;
-        if (post > 0 || way == kWall) {
-            const double from = way == kWall ? edgeX : postX - post / 2.0;
-            const double to = way == kWall ? edgeX + 4000 : postX + post / 2.0;
+        const bool wall = way == kWall || way == kLookalike;
+        if (post > 0 || wall) {
+            const double from = wall ? edgeX : postX - post / 2.0;
+            const double to = wall ? edgeX + 4000 : postX + post / 2.0;
             const Rgb dark = kind == kThermal ? Rgb{70, 70, 70} : Rgb{64, 52, 44};
             const int worldLeft = static_cast<int>(std::lround(seen.camX));
             for (int py = 0; py < kFrameH; ++py) {
@@ -452,6 +459,20 @@ Outcome walk(const std::vector<Rgb> &world, int kind, int place, const BoxOnFigu
                 }
             }
             hidden = seen.figX - 0.15 * b.height > from && seen.figX + 0.15 * b.height < to;
+        }
+        if (way == kLookalike) {
+            // The shirt over the trousers, as on the bench (bench_main.cc of the tracker bench).
+            const double *at = kLookalikeAt[place % 6];
+            const double pcx = edgeX + at[0] * b.boxW - seen.camX;
+            const double pcy = figY - camY + at[1] * b.boxH;
+            const double pw = 0.26 * b.height;
+            const double ph = 0.95 * b.height;
+            for (int py = static_cast<int>(pcy - ph / 2.0); py < static_cast<int>(pcy + ph / 2.0); ++py) {
+                for (int px = static_cast<int>(pcx - pw / 2.0); px < static_cast<int>(pcx + pw / 2.0); ++px) {
+                    const bool top = py < pcy - ph / 2.0 + 0.45 * ph;
+                    frame.put(px, py, scaled(top ? f.shirt : f.trousers, blotch(px + static_cast<int>(std::lround(seen.camX)), py)));
+                }
+            }
         }
         if (way == kShadow) {
             const int from = std::max(0, static_cast<int>(edgeX - seen.camX));
@@ -531,7 +552,7 @@ struct Tally
 // not seen for a while. Behind a wall for good, it is good when the tracker says "not seen".
 bool good(const Outcome &o, const BoxOnFigure &b, Way way)
 {
-    if (way == kWall) {
+    if (way == kWall || way == kLookalike) {
         return !o.refused && o.foundWhileHidden * 10 <= o.hiddenPictures;
     }
     return o.kept(b, way == kPost || way == kWidePost || way == kCross);
@@ -541,7 +562,7 @@ bool add(Tally &t, const Outcome &o, const BoxOnFigure &b, Way way, int kind, in
 {
     ++t.cases;
     const bool ok = good(o, b, way);
-    const bool wrong = !ok && way != kWall && o.foundLately >= 6;
+    const bool wrong = !ok && way != kWall && way != kLookalike && o.foundLately >= 6;
     t.kept += ok ? 1 : 0;
     t.wrong += wrong ? 1 : 0;
     t.foundWhileHidden += o.foundWhileHidden;
@@ -588,8 +609,10 @@ int main(int argc, char **argv)
                 }
             }
         }
+        // Since task Q (2026-10-15) the tracker is careful after a weak spell: three of these
+        // walks end with the figure not seen (one before), none on something else.
         std::snprintf(detail, sizeof detail, "(kept in %d of %d walks, %d ended on something else)", all.kept, all.cases, all.wrong);
-        check(all.kept >= all.cases - 2 && all.wrong <= 1, "a walking, turning figure: the camera is turned to it in nearly every walk", detail);
+        check(all.kept >= all.cases - 3 && all.wrong == 0, "a walking, turning figure: the camera is turned to it in nearly every walk", detail);
     }
     {
         // The first second of every lock: the camera has not turned yet, and the figure walks
@@ -620,6 +643,23 @@ int main(int argc, char **argv)
                       all.hiddenPictures);
         check(all.hiddenPictures > 0 && all.foundWhileHidden * 10 <= all.hiddenPictures,
               "a figure that walks behind a wall is reported as not seen", detail);
+    }
+    {
+        // Task Q: behind the cover, with a patch in the figure's own colours above it (the tree
+        // above the car of the client's video). The app must say "not seen", not follow the patch.
+        // Before the careful lock it said "found" in half of these pictures (204 of 408). A patch
+        // right in the figure's path at its height (places 1 and 4) can still take the box: a known limit.
+        const BoxOnFigure *boxes[] = {&kNearHeadAndChest, &kMiddleWhole};
+        Tally all;
+        for (const BoxOnFigure *b : boxes) {
+            for (int place : {0, 2, 3, 5}) {
+                run(all, Walk{kLookalike, kStandOut, kStill, b, place});
+            }
+        }
+        std::snprintf(detail, sizeof detail, "(good in %d of %d walks, said found in %d of %d pictures while the figure was hidden)", all.kept,
+                      all.cases, all.foundWhileHidden, all.hiddenPictures);
+        check(all.kept == all.cases && all.foundWhileHidden * 20 <= all.hiddenPictures,
+              "a figure hidden next to something in its colours is reported as not seen", detail);
     }
 
     // Single walks of the bench, each of them decided by one rule of the tracker: good as the

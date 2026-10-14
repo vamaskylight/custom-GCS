@@ -692,6 +692,56 @@ int main(int argc, char **argv)
               "a picture with two bytes a point is refused");
     }
 
+    // --- Started again -----------------------------------------------------------
+    {
+        // The app keeps one tracker and starts it again for every lock. Started again, it must
+        // follow the new object exactly as a new tracker does: nothing of the lock before may
+        // stay. Here that lock ended while its object was matched only weakly (it turned away
+        // in a grainy picture, so the tracker was in doubt), after more than its first pictures.
+        // The new object is the 4 point one that moves 6 points a picture: it needs the rules
+        // of a lock's first pictures, and in doubt it would be lost.
+        World own;  // its own grain: the weak end of the first lock does not hang on the tests before
+        int differ = 0;
+        int weakEnds = 0;
+        for (int place = 0; place < 6; ++place) {
+            ObjectTracker used;
+            own.setObject(24, 44, 61);
+            own.otherLook = makeObject(24, 44, 62, 4);
+            own.otherShare = 0.0;
+            own.render(400, 200, 120, 110);
+            used.start(own.frame.data(), kFrameW, kFrameH, kFrameW, Box{120, 110, 24, 44});
+            int weakInARow = 0;
+            for (int i = 1; i <= 22; ++i) {
+                const bool turned = i > 20;
+                own.otherShare = turned ? 0.8 : 0.0;
+                own.render(400, 200, 120.0 + 2.0 * i, 110, true, 1.0, 0.0, turned ? 30 : 0);
+                const Result r = used.update(own.frame.data(), kFrameW, kFrameH, kFrameW);
+                weakInARow = (r.found && r.psr < ObjectTracker::kPsrFirm) ? weakInARow + 1 : 0;
+            }
+            weakEnds += weakInARow >= ObjectTracker::kDoubtWeak ? 1 : 0;
+            own.otherShare = 0.0;
+            own.otherLook.clear();
+
+            ObjectTracker fresh;
+            own.setObject(4, 4, 23 + place, 2);
+            const double camX = 300 + 90.0 * place;
+            const double camY = 100 + 40.0 * place;
+            own.render(camX, camY, 60.0, 100.0);
+            used.start(own.frame.data(), kFrameW, kFrameH, kFrameW, Box{60.0, 100.0, 4, 4});
+            fresh.start(own.frame.data(), kFrameW, kFrameH, kFrameW, Box{60.0, 100.0, 4, 4});
+            for (int i = 1; i < 40; ++i) {
+                own.render(camX, camY, 60.0 + 6.0 * i, 100.0);
+                const Result a = used.update(own.frame.data(), kFrameW, kFrameH, kFrameW);
+                const Result b = fresh.update(own.frame.data(), kFrameW, kFrameH, kFrameW);
+                differ += (a.found == b.found && a.box.cx == b.box.cx && a.box.cy == b.box.cy && a.psr == b.psr) ? 0 : 1;
+            }
+        }
+        char detail[120];
+        std::snprintf(detail, sizeof detail, "(the first lock ended in doubt at %d of 6 places; not the same in %d of 234 pictures)",
+                      weakEnds, differ);
+        check(weakEnds == 6 && differ == 0, "a tracker started again follows a new object exactly as a new tracker does", detail);
+    }
+
     // How long one picture takes (told, not judged: the test PC is not the remote).
     {
         ObjectTracker tracker;

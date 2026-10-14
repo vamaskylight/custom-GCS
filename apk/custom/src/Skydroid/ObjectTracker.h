@@ -27,8 +27,15 @@
 //    (each axis by its own factor, so a tall person fills the patch as a car does),
 //  - the filter is asked first where the object should be by now; when its answer
 //    is not sharp, also half a box to each side and where the object was last seen,
-//  - a sharp match (PSR) is believed where it is. A weaker one only where the object
-//    should be: over ground, the highest of the filter's answers lies anywhere,
+//  - a firm match (PSR) is believed where it is. A weaker one only where the object
+//    should be: over ground, the highest of the filter's answers lies anywhere
+//    (in the first pictures of a lock a sharp match counts as firm: how fast the
+//    object moves is not known yet),
+//  - in doubt (the object was not seen in the picture before, or matched only weakly
+//    for two pictures), a match away from where it should be must be sure, and the
+//    colours may not move the box away either: something in its colours next to where
+//    it went out of sight is not the object (task Q: a person walked behind a car and
+//    the box went onto a dark tree above it, match 11, and stayed there),
 //  - when the colours tell the object from the ground, the box must also hold enough
 //    of them. When the layout is not sure, the colours are asked where they are,
 //  - the colours and the filter keep learning, fully from sharp matches and a
@@ -40,11 +47,15 @@
 // On a test bench (a drawn walking figure; in colour, in the colours of the
 // ground, in a grey thermal and a grey day picture; the camera still, following,
 // or turned by this tracker as the app does) a box drawn around the figure was
-// kept in 339 of 360 walks. Each rule above was measured there with the rule
-// taken out, and the walks it decides are in object_tracker_walk_test.cc.
+// kept in 317 of 360 walks. That was 339 before the doubt of task Q, which costs
+// walks where the figure comes out from behind a wide post or turns. Hidden behind
+// a cover with a patch in its colours next to it, the figure was reported as not
+// seen in 312 of 576 walks (124 before). Each rule above was measured there with
+// the rule taken out, and the walks it decides are in object_tracker_walk_test.cc.
 // Known limits, seen there too: a wall or a post in the object's colours (or, in
-// a grey picture, in its grey levels) can take the box, and then the app says it
-// follows something that is not the object. Watch the box.
+// a grey picture, in its grey levels) can take the box, most of all one right in
+// the object's path at its height. Then the app says it follows something that is
+// not the object. Watch the box.
 //
 // No Qt in here: the host test (apk/custom/test/object_tracker_test.cc) builds
 // this file alone.
@@ -89,8 +100,11 @@ public:
     static constexpr double kPadding = 2.0;      // the patch covers the box times this
     static constexpr double kMinBox = 12.0;      // a smaller box is widened to this, in picture points
     static constexpr double kPsrFound = 6.0;     // at least this sharp: the object may be there
-    static constexpr double kPsrLearn = 10.0;    // sharp: believed anywhere in reach, and learned from fully
-    static constexpr double kPsrSure = 20.0;     // this sharp: it is the object, whatever its colours say
+    static constexpr double kPsrLearn = 10.0;    // sharp: learned from fully
+    static constexpr double kPsrFirm = 13.0;     // firm: believed anywhere in reach. Under it a match is weak for the doubt
+    static constexpr double kPsrSure = 20.0;     // this sharp: it is the object, whatever its colours say; in doubt, needed away from the guess
+    static constexpr int kDoubtWeak = 2;         // weak matches in a row that put the tracker in doubt (as one picture not seen does)
+    static constexpr int kSettlePictures = 5;    // the first pictures of a lock: how fast the object moves is not known yet
     static constexpr double kAlikeFound = 0.15;  // the box holds at least this much of the object's colours
     static constexpr double kAlikeLearn = 0.5;   // colours found by themselves: at least this much of them
     static constexpr double kMinContrast = 2.0;  // grey levels: a flatter box holds nothing to follow
@@ -156,6 +170,8 @@ private:
     double _seenX = 0.0;  // where the object was last seen
     double _seenY = 0.0;
     int _missed = 0;
+    int _weakRun = 0;  // pictures in a row with a match that is not firm
+    int _pictures = 0; // pictures since the start, counted up to kSettlePictures + 1
     std::vector<float> _window;  // Hann window, kSize * kSize
     Field _target;               // the wanted answer (one peak at the centre), as a spectrum
     Field _layout;               // the filter is (_layout, _colour) / (_power + small)

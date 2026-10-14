@@ -532,6 +532,8 @@ bool ObjectTracker::start(const Picture &picture, const Box &box)
     _seenX = _box.cx;
     _seenY = _box.cy;
     _missed = 0;
+    _weakRun = 0;
+    _pictures = 0;
     _active = true;
     return true;
 }
@@ -592,6 +594,17 @@ Result ObjectTracker::update(const Picture &picture)
     // Where the layout says the object is, and whether the colours there are the object's.
     const bool tells = _coloursTell();
     const bool sharp = best.psr >= kPsrLearn;
+    // In doubt: the object was not seen in the picture before, or it was matched only weakly
+    // for a while. It may be hidden, and something near it in its colours then matches about
+    // as well as it did (task Q, 2026-10-14: the box went from a person behind a car onto a
+    // dark tree above it, match 11, learned the tree and said it follows).
+    const bool doubt = _missed > 0 || _weakRun >= kDoubtWeak;
+    // In the first pictures how fast the object moves is not known yet, and a moving object
+    // is away from the guess: there a sharp match counts as firm, as it did before.
+    if (_pictures <= kSettlePictures) {
+        ++_pictures;
+    }
+    const double firm = _pictures <= kSettlePictures ? kPsrLearn : kPsrFirm;
     // A match that is not sharp is followed, but little is learned from it. An object that
     // turns keeps its new look, so the match gets sharp again; a wall that covers it does
     // not look like it for long enough to be learned.
@@ -606,8 +619,10 @@ Result ObjectTracker::update(const Picture &picture)
         x = std::clamp(bestCx + best.dx * (_box.w * kPadding / N), 0.0, width - 1.0);
         y = std::clamp(bestCy + best.dy * (_box.h * kPadding / N), 0.0, height - 1.0);
         // Over ground that is not the object, the highest of the filter's answers lies
-        // anywhere. So a match that is not sharp counts only where the object should be.
-        if (!sharp && (std::abs(x - guessX) > kWeakReach * _box.w || std::abs(y - guessY) > kWeakReach * _box.h)) {
+        // anywhere. So a match that is not firm counts only where the object should be, and
+        // in doubt away from it only a sure one.
+        const bool far = std::abs(x - guessX) > kWeakReach * _box.w || std::abs(y - guessY) > kWeakReach * _box.h;
+        if (far && best.psr < (doubt ? kPsrSure : firm)) {
             candidate = false;
             x = guessX;
             y = guessY;
@@ -642,7 +657,10 @@ Result ObjectTracker::update(const Picture &picture)
         Look shifted;
         if (_shiftToColours(picture, x, y, shiftedX, shiftedY) && _sample(picture, shiftedX, shiftedY, shifted)) {
             const double alike = _alike(shifted);
-            if (alike >= kAlikeLearn) {
+            // In doubt the colours may not move the box away from where the object should be.
+            const bool near = std::abs(shiftedX - guessX) <= kWeakReach * _box.w &&
+                              std::abs(shiftedY - guessY) <= kWeakReach * _box.h;
+            if (alike >= kAlikeLearn && (!doubt || near)) {
                 found = true;  // the object's colours are there: it changed its look
                 x = shiftedX;
                 y = shiftedY;
@@ -661,6 +679,7 @@ Result ObjectTracker::update(const Picture &picture)
         _seenX = x;
         _seenY = y;
         _missed = 0;
+        _weakRun = best.psr >= firm ? 0 : _weakRun + 1;
         if (colourRate > 0.0f) {
             _learnColours(look, colourRate);
             double inside = 0.0;
