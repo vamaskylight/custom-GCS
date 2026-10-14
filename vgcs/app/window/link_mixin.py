@@ -424,6 +424,12 @@ class MainWindowLinkMixin:
             self._map_widget.clear_mission_progress()
         except Exception:
             pass
+        # And a fence shown as "on the drone" is only known for the drone that
+        # was on screen (this also runs when another drone is put on screen).
+        try:
+            self._map_widget.forget_fence_on_drone()
+        except Exception:
+            pass
         self._status.setText("Disconnected")
         self._apply_state_style(self._status, "bad")
         self._hb.setText("—")

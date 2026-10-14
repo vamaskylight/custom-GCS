@@ -871,6 +871,9 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._web_3d_ready = False
         self._pending_3d_activate = False
         self._fence_radius_m = 80.0
+        # What the link has reported about the fence of the drone on screen
+        # (vgcs/map/surface/fence_mixin.py). Empty: nothing is known.
+        self._fence_drone_state: dict = {}
         self._last_plan_flight_metrics_payload: dict[str, object] | None = None
         self._vehicle_pose_timer = QTimer(self)
         self._vehicle_pose_timer.setSingleShot(True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from vgcs.map.surface.camera_rail_mixin import CameraRailMixin
+from vgcs.map.surface.fence_mixin import FenceMixin
 from vgcs.map.surface.hud_layout_mixin import NativeHudLayoutMixin
 from vgcs.map.surface.map_3d_mixin import Map3dMixin
 from vgcs.map.surface.map_tiles_mixin import MapTilesMixin
@@ -15,6 +16,7 @@ class MapSurfaceMixins(
     NativeHudLayoutMixin,
     MapTilesMixin,
     PlanMissionMixin,
+    FenceMixin,
     VehicleTelemetryMixin,
     Map3dMixin,
     WebBridgeMixin,
@@ -25,6 +27,7 @@ class MapSurfaceMixins(
 
 __all__ = [
     "CameraRailMixin",
+    "FenceMixin",
     "Map3dMixin",
     "MapSurfaceMixins",
     "MapTilesMixin",

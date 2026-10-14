@@ -32,7 +32,7 @@ The same set-up as the wind failsafe tests, see [drone/README.md](../drone/READM
 From the repo root:
 
 ```powershell
-py system_test/vgcs_sitl_test.py                      # 12 cases on 4.6.2 and 4.7.0, about 7 minutes
+py system_test/vgcs_sitl_test.py                      # 13 cases on 4.6.2 and 4.7.0, about 7 minutes
 py system_test/vgcs_sitl_test.py 4.7.0 -k mission     # one version, only cases with "mission" in the name
 py system_test/vgcs_sitl_test.py --report results.md  # also write the results as Markdown
 
@@ -84,6 +84,7 @@ The simulated clock runs 10 times faster than real time.
 | missions_as_they_come_back | a Download shows VGCS's own mission with its payload releases, and another station's mission with what a plan cannot hold named |
 | another_stations_mission | another station replaces the mission with one of the same size and VGCS is told nothing: "start it as it is" starts nothing, Fly to WP sends no jump, Resume sends no speed, and in flight the drone's own word drops the plan. VGCS's own upload in flight is not taken for another station's |
 | takeoff_fence_and_land | a 40 m fence with a 30 m height limit: the drone turns back at both, VGCS shows RTL and the drone's message, landing from VGCS |
+| polygon_fence | a polygon fence: the drone holds its corners to the last digit (read on the checking connection), it turns back at the edge and at the height limit, a fence that does not hold the flying drone is not sent, a larger one is taken in flight, Read fence from drone, another station's areas named and asked about, the circle fence in its place |
 | link_silence | the radio goes quiet in flight (the simulator is frozen), VGCS reports it within its 2 second watchdog, and recovers by itself |
 | signed_commands | VGCS gives the drone its signing key: an outsider ground station (third port) can no longer change the mode, arm, or remove the key, VGCS still can, and after the key is removed the outsider is obeyed again |
 
@@ -95,6 +96,7 @@ The window's own labels are read to check what the operator would have seen, and
 
 After the landing it plans and flies a mission in Plan Flight: waypoints clicked on the map, rows edited, Upload, Download, Start Mission, Fly to WP, Pause and Resume.
 Then the mission as the drone holds it: a payload release ticked, uploaded, and brought back by a Download; a mission of another ground station (sent on the checking connection) with a camera and a servo command, the message that names them, Upload answered no, and Start Mission with "Start it as it is on the drone", once on a mission that was replaced in the meantime (nothing starts, and the reason is on screen) and once for real.
+Then the polygon fence in the Fence tab: corners clicked on the map, Upload polygon fence, the corners read off the drone on the checking connection, a corner dragged, Read fence from drone, a fence beside the drone (asked about, answered no and then yes), the take-off the drone then refuses, and Switch fence off.
 
 During the hover it measures how late the window's event loop runs, the time spent in the telemetry handler, CPU and memory.
 The map's web view runs in separate QtWebEngine processes, which are not counted.
@@ -143,5 +145,10 @@ It checks the acceptance test of client requirement 14:
 - "Flight plan received" goes only to the connection that sent the mission.
   A mission sent on the checking connection is not heard by VGCS at all, unless it has another number of items (MISSION_CURRENT) or the drone is flying in AUTO ("Auto mission changed, restarted command", on every connection, once for each item written).
 - A mission replaced while the drone holds in BRAKE keeps its place: on the return to AUTO the drone flies to the new mission's item of the same number.
+- A fence is sent and read with the mission protocol and mission type 1, which only MAVLink 2 has.
+  ArduCopter asks for the items with MISSION_REQUEST, not MISSION_REQUEST_INT.
+- The reason for a fence the drone does not take ("Invalid vertex count (2)") comes in a STATUSTEXT after the MISSION_ACK.
+- A fence that does not hold a flying drone makes it turn back (4.6.2) or land (4.7.0) at once.
+  The polygon case checks that VGCS refuses to send one, and never sends one itself in flight.
 - The window test reads the checking connection in its own thread.
   A second exchange on it (a mission sent "as another station") has to be driven by the messages that thread reads, like `MissionReader` and `MissionSender`, not by a blocking wait.

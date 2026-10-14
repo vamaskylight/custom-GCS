@@ -587,6 +587,16 @@ class NativeTileMapView(QWidget):
         self._fence_press_candidate = False
         self._fence_press_geo: tuple[float, float] | None = None
         self._fence_press_screen: QPointF | None = None
+        # How the fence polygon is drawn: green and solid when the drone has
+        # confirmed this very polygon and uses it, amber and dashed for a
+        # drawing. The words beside it say which. Both are set by the map
+        # widget, which knows what the drone answered.
+        self._fence_on_drone = False
+        self._fence_tag = ""
+        # Dragging a corner of the fence, while the fence tool is on.
+        self._fence_drag_index: int | None = None
+        self._fence_drag_press_screen: QPointF | None = None
+        self._fence_dragging = False
         self._obs_mark_mode = False
         self._obs_click_candidate = False
         self._press_for_obs: QPointF | None = None
@@ -818,13 +828,53 @@ class NativeTileMapView(QWidget):
         self._fence_points.clear()
         self.update()
 
+    def fence_points(self) -> list[tuple[float, float]]:
+        """The corners of the fence polygon on the map, in the order they were given."""
+        return list(self._fence_points)
+
+    def set_fence_points(self, points) -> None:
+        """Show a fence polygon that did not come from clicks here (read from the drone)."""
+        corners: list[tuple[float, float]] = []
+        for row in points or []:
+            try:
+                corners.append((float(row[0]), float(row[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        self._fence_points = corners
+        self._fence_drag_index = None
+        self._fence_dragging = False
+        self.update()
+
+    def remove_last_fence_point(self) -> bool:
+        """Take back the corner added last. False when there is none."""
+        if not self._fence_points:
+            return False
+        self._fence_points.pop()
+        self.update()
+        return True
+
+    def set_fence_look(self, on_drone: bool, tag: str = "") -> None:
+        """Green and solid for the fence the drone uses, amber and dashed for a drawing, with the words for it."""
+        on_drone, tag = bool(on_drone), str(tag or "")
+        if on_drone == self._fence_on_drone and tag == self._fence_tag:
+            return
+        self._fence_on_drone = on_drone
+        self._fence_tag = tag
+        self.update()
+
+    def fence_draw_mode(self) -> bool:
+        return bool(self._fence_draw_mode)
+
     def disable_plan_edit_modes(self) -> None:
-        """Match legacy JS `disablePlanEditModes`: turn off waypoint/fence placement modes."""
+        """Match legacy JS `disablePlanEditModes`: turn off waypoint/fence placement modes.
+
+        The corners drawn so far stay, also when they are only one or two (they
+        used to be thrown away here, without a word, when the operator went to
+        another tool for a moment). "Clear polygon" removes them.
+        """
         self._clear_pending_plan_map_taps()
         self._add_wp_mode = False
         self._fence_draw_mode = False
-        if 0 < len(self._fence_points) < 3:
-            self.clear_fence_points()
         self.update()
 
     def _clear_pending_plan_map_taps(self) -> None:
@@ -835,6 +885,9 @@ class NativeTileMapView(QWidget):
         self._fence_press_candidate = False
         self._fence_press_geo = None
         self._fence_press_screen = None
+        self._fence_drag_index = None
+        self._fence_drag_press_screen = None
+        self._fence_dragging = False
 
     def clear_fence_visual(self) -> None:
         self._fence_points.clear()
@@ -1187,10 +1240,13 @@ class NativeTileMapView(QWidget):
             self._clear_pending_plan_map_taps()
             self._fence_draw_mode = True
             self._add_wp_mode = False
-            self.clear_fence_points()
+            # The corners that are there stay: the tool goes on with them.
+            # (It used to start from nothing every time, so a fence could not
+            # be changed, only drawn again.)
             # A leftover coordinate crosshair reads as a placed point once a
             # tool is live.
             self.set_inspected_point(None, None)
+            self.update()
             return
         if p.startswith("clearWaypoints"):
             self.clear_waypoints()
@@ -1331,16 +1387,50 @@ class NativeTileMapView(QWidget):
             except Exception:
                 pass
 
-        # Fence polygon
-        if len(self._fence_points) >= 2:
-            pen = QPen(QColor(66, 200, 255, 200))
-            pen.setWidth(2)
+        # Fence polygon. Green and solid: the drone has confirmed this very
+        # polygon and uses it. Amber and dashed: a drawing, or a polygon the
+        # drone holds but does not use. The words beside it say which.
+        if self._fence_points:
+            painter.save()
+            on_drone = bool(self._fence_on_drone)
+            colour = QColor(90, 230, 140, 240) if on_drone else QColor(255, 196, 60, 240)
+            pen = QPen(colour)
+            pen.setWidth(3 if on_drone else 2)
+            if not on_drone:
+                pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             pts = [self._project(a, b, z, fx, fy, w, h) for a, b in self._fence_points]
             for i in range(1, len(pts)):
                 painter.drawLine(pts[i - 1], pts[i])
             if len(pts) >= 3:
                 painter.drawLine(pts[-1], pts[0])
+            # The corners, numbered while the fence tool is on: the order is
+            # what makes the shape.
+            corner_pen = QPen(colour)
+            corner_pen.setWidth(2)
+            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            numbered = self._fence_draw_mode and len(pts) <= 60
+            for i, pt in enumerate(pts):
+                painter.setPen(corner_pen)
+                painter.setBrush(QColor(20, 24, 30, 235))
+                painter.drawRect(QRectF(pt.x() - 5.0, pt.y() - 5.0, 10.0, 10.0))
+                if numbered:
+                    label = QRectF(pt.x() + 8.0, pt.y() - 17.0, 30.0, 15.0)
+                    painter.fillRect(label, QColor(0, 0, 0, 170))
+                    painter.setPen(QColor(255, 255, 255))
+                    painter.drawText(label, Qt.AlignmentFlag.AlignCenter, str(i + 1))
+            if self._fence_tag:
+                top = min(pts, key=lambda p: p.y())
+                metrics = painter.fontMetrics()
+                tw = metrics.horizontalAdvance(self._fence_tag) + 10
+                th = metrics.height() + 4
+                tx = max(4.0, min(float(top.x()) - tw / 2.0, float(w) - tw - 4.0))
+                ty = max(4.0, float(top.y()) - th - (24.0 if numbered else 10.0))
+                painter.fillRect(QRectF(tx, ty, tw, th), QColor(0, 0, 0, 215))
+                painter.setPen(colour)
+                painter.drawText(QRectF(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, self._fence_tag)
+            painter.restore()
 
         # Waypoint markers. The waypoint the vehicle is currently flying to (reported via
         # MISSION_CURRENT and translated to a plan index by MissionPlan) is drawn larger
@@ -1768,6 +1858,25 @@ class NativeTileMapView(QWidget):
             self.update()
             self.user_waypoints_changed.emit()
 
+    def _fence_hit_index(self, pos: QPointF) -> int | None:
+        """The fence corner under the pointer, or None."""
+        vf = self._view_frame()
+        if vf is None or not self._fence_points:
+            return None
+        z, fx, fy, w, h = vf
+        hit_r2 = 14.0 * 14.0
+        best_i: int | None = None
+        best_d2 = hit_r2 + 1.0
+        for i, (lat, lon) in enumerate(self._fence_points):
+            c = self._project(lat, lon, z, fx, fy, w, h)
+            dx = float(pos.x() - c.x())
+            dy = float(pos.y() - c.y())
+            d2 = dx * dx + dy * dy
+            if d2 <= hit_r2 and d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+        return best_i
+
     def _tile_url(self, z: int, x: int, y: int) -> str:
         tmpl = self._tile_template
         if tmpl == "{local}" and self._offline_root:
@@ -2123,7 +2232,9 @@ class NativeTileMapView(QWidget):
         self.set_zoom(self._zoom + step)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
-        if event.button() == Qt.MouseButton.LeftButton:
+        # Not while the fence tool is on: a second click near a waypoint is
+        # then about the fence, and must not delete the waypoint under it.
+        if event.button() == Qt.MouseButton.LeftButton and not self._fence_draw_mode:
             idx = self._waypoint_hit_index(QPointF(event.position()))
             if idx is not None:
                 self._remove_waypoint_index(idx)
@@ -2135,6 +2246,16 @@ class NativeTileMapView(QWidget):
         pos = QPointF(event.position())
         if event.button() == Qt.MouseButton.RightButton:
             self._clear_pending_plan_map_taps()
+            if self._fence_draw_mode:
+                # The fence tool is on: a right-click is about the fence, and
+                # never deletes a waypoint that lies under a corner.
+                corner = self._fence_hit_index(pos)
+                if corner is not None:
+                    self._fence_points.pop(corner)
+                    self.update()
+                    self.user_fence_changed.emit()
+                event.accept()
+                return
             idx = self._waypoint_hit_index(pos)
             if idx is not None:
                 self._remove_waypoint_index(idx)
@@ -2167,6 +2288,15 @@ class NativeTileMapView(QWidget):
                     super().mousePressEvent(event)
                     return
                 if self._fence_draw_mode:
+                    corner = self._fence_hit_index(pos)
+                    if corner is not None:
+                        # A press on a corner moves it. It never puts a new
+                        # corner on top of the old one.
+                        self._fence_drag_index = corner
+                        self._fence_drag_press_screen = QPointF(pos)
+                        self._fence_dragging = False
+                        super().mousePressEvent(event)
+                        return
                     self._fence_press_candidate = True
                     self._fence_press_geo = (lat, lon)
                     self._fence_press_screen = QPointF(pos)
@@ -2201,6 +2331,20 @@ class NativeTileMapView(QWidget):
                     self._move_waypoint_index(self._wp_drag_index, latlon[0], latlon[1])
             # Never pan while a point is being moved: the map sliding under the
             # cursor would drag the waypoint away from where it is being put.
+            super().mouseMoveEvent(event)
+            return
+        if self._fence_drag_index is not None and self._fence_drag_press_screen is not None:
+            if (
+                not self._fence_dragging
+                and (cur - self._fence_drag_press_screen).manhattanLength() > _WP_DRAG_SLOP_PX
+            ):
+                self._fence_dragging = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self._fence_dragging and 0 <= self._fence_drag_index < len(self._fence_points):
+                latlon = self._screen_to_lat_lon(cur)
+                if latlon is not None:
+                    self._fence_points[self._fence_drag_index] = (float(latlon[0]), float(latlon[1]))
+                    self.update()
             super().mouseMoveEvent(event)
             return
         if self._obs_click_candidate and self._press_for_obs is not None:
@@ -2256,6 +2400,22 @@ class NativeTileMapView(QWidget):
                     # the operator touched becomes the selected one, so the
                     # plan bar describes the waypoint under their finger.
                     self.waypoint_picked.emit(picked)
+                event.accept()
+                return
+            if self._fence_drag_index is not None:
+                moved = self._fence_dragging
+                self._fence_drag_index = None
+                self._fence_drag_press_screen = None
+                self._fence_dragging = False
+                self.unsetCursor()
+                # As for a waypoint above: this path returns early, so it does
+                # the pan cleanup itself.
+                self._dragging = False
+                self._drag_last = None
+                if moved:
+                    # Told once, at the end of the move.
+                    self.update()
+                    self.user_fence_changed.emit()
                 event.accept()
                 return
             if (

@@ -58,6 +58,8 @@ _LINK_SLOTS = (
     ("mode_changed", "_on_mode_change_result"),
     ("action_result", "_on_action_result"),
     ("geofence_result", "_on_geofence_result"),
+    ("fence_state", "_on_fence_state"),
+    ("fence_question", "_on_fence_question"),
     ("params_snapshot", "_on_params_snapshot"),
     ("param_set_result", "_on_param_set_result"),
     ("finished", "_on_thread_finished"),

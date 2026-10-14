@@ -126,6 +126,8 @@ class Recorder:
         self.params: list[dict] = []
         self.param_sets: list[tuple[str, bool, str]] = []
         self.fences: list[tuple[bool, str]] = []
+        self.fence_states: list[dict] = []
+        self.fence_questions: list[dict] = []
         self.link_events: list[tuple[float, str]] = []
         direct = Qt.ConnectionType.DirectConnection
         link.telemetry.connect(lambda kind, payload: self.telemetry.setdefault(kind, []).append((self.now(), dict(payload))), direct)
@@ -139,6 +141,8 @@ class Recorder:
         link.params_snapshot.connect(lambda values: self.params.append(dict(values)), direct)
         link.param_set_result.connect(lambda name, ok, detail: self.param_sets.append((name, bool(ok), detail)), direct)
         link.geofence_result.connect(lambda ok, detail: self.fences.append((bool(ok), detail)), direct)
+        link.fence_state.connect(lambda state: self.fence_states.append(dict(state)), direct)
+        link.fence_question.connect(lambda question: self.fence_questions.append(dict(question)), direct)
         link.link_up.connect(lambda: self.link_events.append((self.now(), "up")), direct)
         link.link_down.connect(lambda: self.link_events.append((self.now(), "down")), direct)
         link.link_timeout.connect(lambda seconds: self.link_events.append((self.now(), f"timeout {seconds:.1f}")), direct)
@@ -1048,6 +1052,233 @@ def takeoff_fence_and_land(version: str, r: Report) -> None:
         f.close()
 
 
+def fence_as_another_station(sim: Sitl, items: list[tuple]) -> int | None:
+    """Send fence items on the checking connection, as another ground station would.
+
+    Each item: (command, param1, lat, lon). Returns the drone's answer (0 is
+    accepted), or None when it never answered.
+    """
+    mav = sim.mav
+    mav.mav.mission_count_send(mav.target_system, mav.target_component, len(items), 1)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        msg = mav.recv_match(type=["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"], blocking=True, timeout=2)
+        if msg is None or int(getattr(msg, "mission_type", 0)) != 1:
+            continue
+        if msg.get_type() == "MISSION_ACK":
+            return int(msg.type)
+        command, p1, lat, lon = items[int(msg.seq)]
+        mav.mav.mission_item_int_send(mav.target_system, mav.target_component, int(msg.seq), 0, command, 0, 1,
+                                      p1, 0, 0, 0, int(round(lat * 1e7)), int(round(lon * 1e7)), 0, 1)
+    return None
+
+
+def fence_on_the_drone(sim: Sitl) -> list[tuple] | None:
+    """The fence items the drone holds, read on the checking connection: (command, param1, lat e7, lon e7)."""
+    mav = sim.mav
+    for _attempt in range(3):
+        mav.mav.mission_request_list_send(mav.target_system, mav.target_component, 1)
+        count = None
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline and count is None:
+            msg = mav.recv_match(type=["MISSION_COUNT"], blocking=True, timeout=1)
+            if msg is not None and int(getattr(msg, "mission_type", 0)) == 1:
+                count = int(msg.count)
+        if count is None:
+            continue
+        rows: list[tuple] = []
+        for seq in range(count):
+            mav.mav.mission_request_int_send(mav.target_system, mav.target_component, seq, 1)
+            got = None
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline and got is None:
+                msg = mav.recv_match(type=["MISSION_ITEM_INT"], blocking=True, timeout=1)
+                if msg is not None and int(getattr(msg, "mission_type", 0)) == 1 and int(msg.seq) == seq:
+                    got = msg
+            if got is None:
+                break
+            rows.append((int(got.command), float(got.param1), int(got.x), int(got.y)))
+        mav.mav.mission_ack_send(mav.target_system, mav.target_component, 0, 1)
+        if len(rows) == count:
+            return rows
+    return None
+
+
+def square_fence(half_m: float, north_m: float = 0.0, east_m: float = 0.0) -> list[list[float]]:
+    return [list(offset_to_lat_lon(north_m + n, east_m + e))
+            for n, e in ((half_m, -half_m), (half_m, half_m), (-half_m, half_m), (-half_m, -half_m))]
+
+
+def as_stored(points: list[list[float]], command: int = 5001) -> list[tuple]:
+    return [(command, float(len(points)), int(round(lat * 1e7)), int(round(lon * 1e7))) for lat, lon in points]
+
+
+def polygon_fence(version: str, r: Report) -> None:
+    """A polygon fence from VGCS: stored to the last digit, the drone turns back at its edge, a fence that does not hold the drone is not sent, and the drone's fence is read back."""
+    f = Flight(version, params={"AVOID_ENABLE": 0})
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        r.check(f.ready_to_fly(), "the drone is ready")
+        r.check(fence_on_the_drone(sim) == [], "the drone starts with no fence items")
+
+        def ask(cfg: dict, seconds: float = 25.0) -> tuple[bool, str] | None:
+            """Queue a fence request and wait for VGCS's answer to it."""
+            n = len(rec.fences)
+            link.queue_geofence_upload(cfg)
+            f.wait_real(lambda: len(rec.fences) > n, seconds)
+            return rec.fences[-1] if len(rec.fences) > n else None
+
+        # --- a shape that is no fence ---------------------------------------
+        a, b, c, d = square_fence(40.0)
+        answer = ask({"points": [a, c, b, d], "alt_max_m": 30.0, "action": 1.0})
+        r.check(answer is not None and not answer[0] and "crosses" in answer[1],
+                f"sides that cross: VGCS does not send it ({answer})")
+        r.check(fence_on_the_drone(sim) == [], "and the drone holds nothing")
+
+        # --- on the ground: the fence goes up ---------------------------------
+        small = square_fence(40.0)
+        answer = ask({"points": small, "alt_max_m": 30.0, "action": 1.0})
+        r.check(answer is not None and answer[0], f"a square of 80 m: VGCS reports it on ({answer})")
+        r.check(fence_on_the_drone(sim) == as_stored(small),
+                "the drone holds its four corners, the same to the last digit (read on another connection)")
+        kinds = int(sim.get_param("FENCE_TYPE") or 0)
+        r.check(kinds == 5, f"height limit and polygon are switched on, the circle is not (FENCE_TYPE {kinds})")
+        r.check(sim.get_param("FENCE_ENABLE") == 1.0 and sim.get_param("FENCE_ALT_MAX") == 30.0
+                and sim.get_param("FENCE_ACTION") == 1.0, "the fence is on, with the 30 m limit and return to launch")
+        state = rec.fence_states[-1] if rec.fence_states else {}
+        r.check(state.get("source") == "upload" and len(state.get("polygon") or []) == 4,
+                "VGCS tells its window which polygon the drone holds")
+
+        # --- on the ground, a fence somewhere else: the operator is asked ------
+        n_questions, n_fences = len(rec.fence_questions), len(rec.fences)
+        link.queue_geofence_upload({"points": square_fence(20.0, north_m=200.0), "alt_max_m": 30.0, "action": 1.0})
+        f.wait_real(lambda: len(rec.fence_questions) > n_questions, 10)
+        asked = rec.fence_questions[-1] if len(rec.fence_questions) > n_questions else {}
+        r.check(asked.get("kind") == "outside" and "will not arm" in str(asked.get("text", "")),
+                f"a fence 200 m away: VGCS asks first ({str(asked.get('text', ''))[:70]!r})")
+        r.check(len(rec.fences) == n_fences and fence_on_the_drone(sim) == as_stored(small),
+                "and sends nothing before the answer")
+
+        # --- in flight: the edge ----------------------------------------------
+        since = rec.now()
+        link.queue_auto_takeoff(15.0)
+        r.check(f.wait(lambda: sim.armed, 40), f"take-off inside the fence: armed {sim.texts_with('fence')[-1:]}")
+        r.check(f.wait(lambda: sim.alt > 14.5, 60), f"climbed to 15 m ({sim.alt:.1f} m)")
+        f.wait(lambda: False, 5)
+        text_since = rec.now()
+        out = sim.fly(60, until=lambda: sim.mode == "RTL", each_second=lambda: fly_at(sim, 4.0, 0.0, 0.0))
+        r.check(out, f"flown north by hand: the drone turned back by itself ({sim.mode}) at {sim.north:.0f} m")
+        far = [abs(sim.north)]
+        sim.fly(8, until=lambda: far.__setitem__(0, max(far[0], abs(sim.north))) or False)
+        r.check(far[0] < 52.0, f"it did not get far past the 40 m edge ({far[0]:.0f} m)")
+        r.check(f.wait(lambda: rec.mode_text() == "RTL", 10), "VGCS shows RTL")
+        f.wait(lambda: False, 3)
+        r.check(any("fence" in t.lower() for t in rec.texts(text_since)),
+                f"the drone's message reached VGCS {[t for t in rec.texts(text_since) if 'ence' in t][:2]}")
+        r.check(f.wait(lambda: math.hypot(sim.north, sim.east) < 6.0, 90), "it came back over home")
+
+        # --- in flight: a fence that does not hold the drone is not sent -------
+        link.queue_mode_change("GUIDED")
+        r.check(f.wait(lambda: sim.mode == "GUIDED", 15), f"VGCS switched it to GUIDED ({sim.mode})")
+        f.wait(lambda: False, 3)
+        answer = ask({"points": square_fence(20.0, north_m=200.0), "alt_max_m": 30.0, "action": 1.0})
+        r.check(answer is not None and not answer[0] and "outside this fence" in answer[1] and "Not sent" in answer[1],
+                f"a fence 200 m away, in flight: VGCS refuses it ({answer})")
+        answer = ask({"points": square_fence(40.0, north_m=37.0), "alt_max_m": 30.0, "action": 1.0})
+        r.check(answer is not None and not answer[0] and "only" in answer[1] and "inside this fence" in answer[1],
+                f"a fence whose edge is 3 m from the drone: refused ({answer})")
+        answer = ask({"points": square_fence(80.0), "alt_max_m": 12.0, "action": 1.0})
+        r.check(answer is not None and not answer[0] and "max height is 12 m" in answer[1],
+                f"a fence whose height limit is below the drone: refused ({answer})")
+        answer = ask({"points": square_fence(20.0, north_m=200.0), "alt_max_m": 30.0, "action": 1.0,
+                      "allow_outside": True})
+        r.check(answer is not None and not answer[0] and "Not sent" in answer[1],
+                "and a yes to the question on the ground does not count in flight")
+        f.wait(lambda: False, 5)
+        r.check(sim.mode == "GUIDED" and sim.armed, f"through all of that the drone flew on undisturbed ({sim.mode})")
+        r.check(fence_on_the_drone(sim) == as_stored(small), "and its fence is still the first one")
+
+        # --- in flight: a larger fence that holds the drone and its home ------
+        large = square_fence(80.0)
+        answer = ask({"points": large, "alt_max_m": 30.0, "action": 1.0})
+        r.check(answer is not None and answer[0], f"a square of 160 m, in flight: VGCS reports it on ({answer})")
+        r.check(fence_on_the_drone(sim) == as_stored(large), "the drone holds the larger fence")
+        f.wait(lambda: False, 5)
+        r.check(sim.mode == "GUIDED", f"and it did not turn back ({sim.mode})")
+        out = sim.fly(40, until=lambda: sim.mode == "RTL" or sim.north > 60.0,
+                      each_second=lambda: fly_at(sim, 4.0, 0.0, 0.0))
+        r.check(sim.north > 60.0 and sim.mode == "GUIDED",
+                f"it now flies past the old 40 m edge ({sim.north:.0f} m, {sim.mode})")
+        out = sim.fly(60, until=lambda: sim.mode == "RTL", each_second=lambda: fly_at(sim, 4.0, 0.0, 0.0))
+        r.check(out and sim.north < 95.0, f"and turns back at the new one ({sim.mode}) at {sim.north:.0f} m")
+        r.check(f.wait(lambda: math.hypot(sim.north, sim.east) < 6.0, 120), "back over home")
+
+        # --- the height limit, with a polygon ----------------------------------
+        link.queue_mode_change("GUIDED")
+        f.wait(lambda: sim.mode == "GUIDED", 15)
+        top = [0.0]
+        out = sim.fly(60, until=lambda: top.__setitem__(0, max(top[0], sim.alt)) or sim.mode == "RTL",
+                      each_second=lambda: fly_at(sim, 0.0, 0.0, 2.0))
+        sim.fly(10, until=lambda: top.__setitem__(0, max(top[0], sim.alt)) or False)
+        r.check(out and top[0] < 36.0, f"height limit: the drone turned back by itself, highest {top[0]:.1f} m")
+
+        since = rec.now()
+        link.queue_auto_land()
+        r.check(f.wait(lambda: not sim.armed, 150), "landed and disarmed")
+
+        # --- reading the drone's fence -----------------------------------------
+        def read() -> tuple[dict, tuple[bool, str] | None]:
+            n_states, n = len(rec.fence_states), len(rec.fences)
+            link.queue_geofence_download()
+            f.wait_real(lambda: len(rec.fences) > n, 20)
+            return (rec.fence_states[-1] if len(rec.fence_states) > n_states else {},
+                    rec.fences[-1] if len(rec.fences) > n else None)
+
+        state, answer = read()
+        shown = [(int(round(lat * 1e7)), int(round(lon * 1e7))) for lat, lon in state.get("polygon") or []]
+        r.check(shown == [(row[2], row[3]) for row in as_stored(large)],
+                "Read fence from drone: VGCS shows the drone's four corners")
+        r.check(state.get("enabled") is True and state.get("kinds") == 5 and state.get("alt_max_m") == 30.0,
+                f"and its settings ({answer[1] if answer else None})")
+
+        # --- another ground station's areas --------------------------------------
+        hole = square_fence(10.0, north_m=30.0)
+        sent = fence_as_another_station(sim, as_rows(large) + as_rows(hole, 5002) + [(5003, 55.0, HOME[0], HOME[1])])
+        r.check(sent == 0, f"another station adds an area to stay out of and a circle ({sent})")
+        f.wait(lambda: False, 2)
+        state, answer = read()
+        r.check(state.get("other") == ["an area to stay out of (4 corners)", "a circle to stay inside (55 m)"],
+                f"Read names what VGCS does not show ({state.get('other')})")
+        n_questions, n_fences = len(rec.fence_questions), len(rec.fences)
+        link.queue_geofence_upload({"points": small, "alt_max_m": 30.0, "action": 1.0})
+        f.wait_real(lambda: len(rec.fence_questions) > n_questions, 15)
+        asked = rec.fence_questions[-1] if len(rec.fence_questions) > n_questions else {}
+        r.check(asked.get("kind") == "other" and "an area to stay out of" in str(asked.get("text", "")),
+                f"an upload from VGCS would remove them: it asks first ({str(asked.get('text', ''))[:60]!r})")
+        r.check(len(rec.fences) == n_fences and len(fence_on_the_drone(sim) or []) == 9, "and the drone still holds all nine items")
+        answer = ask(dict(asked.get("cfg") or {}))
+        r.check(answer is not None and answer[0], f"after the yes the fence goes up ({answer})")
+        r.check(fence_on_the_drone(sim) == as_stored(small), "and the drone holds VGCS's four corners only")
+
+        # --- the circle fence takes the polygon's place, and off -----------------
+        answer = ask({"radius_m": 60.0, "alt_max_m": 30.0, "action": 1.0})
+        r.check(answer is not None and answer[0] and int(sim.get_param("FENCE_TYPE") or 0) == 3,
+                f"the circle fence is uploaded: the polygon is no longer in use (FENCE_TYPE {sim.get_param('FENCE_TYPE')})")
+        state, answer = read()
+        r.check(answer is not None and "not in use" in answer[1] and "circle of 60 m" in answer[1],
+                f"Read says so ({answer[1] if answer else None})")
+        answer = ask({"disable": True})
+        r.check(answer is not None and answer[0] and sim.get_param("FENCE_ENABLE") == 0.0, "fence switched off")
+        errors = [e[1] for e in rec.errors if not e[1].startswith("Geofence: ")]
+        r.check(not errors, f"VGCS reported no error but the fences it refused {errors[:3]}")
+    finally:
+        f.close()
+
+
+def as_rows(points: list[list[float]], command: int = 5001) -> list[tuple]:
+    return [(command, float(len(points)), lat, lon) for lat, lon in points]
+
+
 def link_silence(version: str, r: Report) -> None:
     """The radio link goes silent in flight, then comes back. VGCS must notice within its watchdog time and recover by itself."""
     f = Flight(version)
@@ -1166,7 +1397,7 @@ def signed_commands(version: str, r: Report) -> None:
 
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
          mission_upload_and_download, mission_flight, mission_speeds, missions_as_they_come_back,
-         another_stations_mission, takeoff_fence_and_land, link_silence, signed_commands]
+         another_stations_mission, takeoff_fence_and_land, polygon_fence, link_silence, signed_commands]
 
 
 def write_report(path: pathlib.Path, results: list[tuple[str, Report, float]]) -> None:

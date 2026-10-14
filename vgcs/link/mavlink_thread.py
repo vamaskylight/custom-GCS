@@ -26,6 +26,7 @@ from vgcs.mission import (
     plan_signature,
 )
 from vgcs.link.confirmations import ModeChange, ParamReads, ParamWrites, clean_name
+from vgcs.link.fence_link import FenceLinkMixin
 from vgcs.link.mission_speed import LegSpeed
 from vgcs.link.signing import (
     KeyTransfer,
@@ -224,7 +225,16 @@ _MOTOR_TEST_MAX_DURATION_S = 5.0
 _MOTOR_TEST_SEQUENCE_SLACK_S = 4.0
 
 
-class MavlinkThread(QThread):
+# Commands that talk the mission protocol with the drone. While a fence is sent
+# or read they wait in the queue: two such exchanges on one link would answer
+# each other's questions. Everything else (a mode change, the emergency stop)
+# goes out at once, also then.
+_USES_MISSION_PROTOCOL = frozenset(
+    {"mission_upload", "mission_download", "mission_start", "geofence_upload", "geofence_download"}
+)
+
+
+class MavlinkThread(FenceLinkMixin, QThread):
     """Connect to a MAVLink stream and report link/heartbeat/telemetry state."""
 
     link_up = Signal()
@@ -239,6 +249,11 @@ class MavlinkThread(QThread):
     mode_changed = Signal(str, bool)  # mode_name, success
     action_result = Signal(str, bool, str)  # action, success, detail
     geofence_result = Signal(bool, str)  # success, detail
+    # What the drone's fence is, once the drone has confirmed it or it was read:
+    # {"source", "enabled", "kinds", "alt_max_m", "action", "radius_m", "polygon", "other", "problem"}
+    fence_state = Signal(object)
+    # A fence that is not sent before the operator has said yes: {"kind", "cfg", "text"}
+    fence_question = Signal(object)
     params_snapshot = Signal(object)  # dict[name] = value
     param_set_result = Signal(str, bool, str)  # name, success, detail
     error = Signal(str)
@@ -325,6 +340,10 @@ class MavlinkThread(QThread):
         self._signing_monitor = SigningMonitor()
         self._key_transfer: KeyTransfer | None = None
         self._signing_last_report_mono = 0.0
+        # The geofence request that is open, and the drone's last position
+        # for its checks (vgcs/link/fence_link.py).
+        self._fence_job = None
+        self._fence_last_position = None
 
     def get_cached_gimbal_status(self) -> GimbalStatus | None:
         with self._gimbal_lock:
@@ -483,6 +502,11 @@ class MavlinkThread(QThread):
     def queue_geofence_upload(self, cfg: dict) -> None:
         with self._cmd_lock:
             self._cmd_queue.append(("geofence_upload", cfg))
+
+    def queue_geofence_download(self) -> None:
+        """Read the fence the drone holds (fence_state, then geofence_result)."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("geofence_download", None))
 
     def queue_params_fetch(self, names: list[str]) -> None:
         with self._cmd_lock:
@@ -835,9 +859,17 @@ class MavlinkThread(QThread):
                 # Fires once per completed item — the only reliable "WP N done" event.
                 self._emit_mission_progress(int(getattr(msg, "seq", 0) or 0), reached=True)
             elif msg_type in ("MISSION_ITEM_INT", "MISSION_ITEM"):
-                self._hear_mission_item(msg)
+                if not self._hear_fence_item(msg):
+                    self._hear_mission_item(msg)
             elif msg_type == "MISSION_ACK":
-                self._hear_mission_ack(msg)
+                if not self._hear_fence_ack(msg):
+                    self._hear_mission_ack(msg)
+            elif msg_type in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+                self._hear_fence_request(msg)
+            elif msg_type == "MISSION_COUNT":
+                self._hear_fence_count(msg)
+            elif msg_type == "HOME_POSITION":
+                self._hear_home_position(msg)
             elif msg_type == "STATUSTEXT":
                 self._handle_statustext(msg)
             elif msg_type == "COMMAND_ACK":
@@ -924,6 +956,7 @@ class MavlinkThread(QThread):
                     gpi["ground_track_deg"] = gt_deg
                 if self._is_primary_source(msg):
                     self._legs().heard_position(float(gpi["lat"]), float(gpi["lon"]))
+                    self._note_position(float(gpi["lat"]), float(gpi["lon"]), float(gpi["relative_alt_m"]))
                 self._emit_telemetry_payload("GLOBAL_POSITION_INT", gpi)
             elif msg_type == "MOUNT_ORIENTATION":
                 yaw = float(getattr(msg, "yaw", float("nan")) or float("nan"))
@@ -1133,7 +1166,17 @@ class MavlinkThread(QThread):
         with self._cmd_lock:
             if not self._cmd_queue:
                 return
-            cmd, payload = self._cmd_queue.popleft()
+            if getattr(self, "_fence_job", None) is None:
+                cmd, payload = self._cmd_queue.popleft()
+            else:
+                index = next(
+                    (i for i, (name, _p) in enumerate(self._cmd_queue) if name not in _USES_MISSION_PROTOCOL),
+                    None,
+                )
+                if index is None:
+                    return
+                cmd, payload = self._cmd_queue[index]
+                del self._cmd_queue[index]
         try:
             if cmd == "mission_upload":
                 if isinstance(payload, dict):
@@ -1170,6 +1213,8 @@ class MavlinkThread(QThread):
                 self._auto_land()
             elif cmd == "geofence_upload":
                 self._geofence_upload(payload if isinstance(payload, dict) else {})
+            elif cmd == "geofence_download":
+                self._geofence_download()
             elif cmd == "params_fetch":
                 self._params_fetch(payload if isinstance(payload, list) else [])
             elif cmd == "param_set":
@@ -2329,6 +2374,7 @@ class MavlinkThread(QThread):
             or self._mode_request is not None
             or getattr(self, "_key_transfer", None) is not None
             or self._legs().open()
+            or self._fence_job_open()
         )
 
     def _tick_confirmations(self) -> None:
@@ -2357,6 +2403,7 @@ class MavlinkThread(QThread):
             if transfer.done:
                 self._key_transfer = None
         self._legs().tick(now)
+        self._tick_fence(now)
 
     def _cancel_confirmations(self, reason: str) -> None:
         self._param_writes.cancel_all(reason)
@@ -2372,6 +2419,9 @@ class MavlinkThread(QThread):
         if transfer is not None and not transfer.done:
             transfer.done = True
             transfer.on_done(False, reason)
+        # After the settings above: a fence that was at its settings step has
+        # reported through them.
+        self._cancel_fence(reason)
 
     # --- MAVLink 2 command signing (M16, vgcs/link/signing.py) -------------
 
@@ -2768,6 +2818,7 @@ class MavlinkThread(QThread):
             transfer.heard_text(text)
             if transfer.done:
                 self._key_transfer = None
+        self._hear_fence_text(text)
         self._emit_telemetry_payload(
             "STATUSTEXT",
             {
@@ -3440,87 +3491,6 @@ class MavlinkThread(QThread):
             float(value),
             mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
         )
-
-    def _fence_written(self, results: dict, ok_text: str) -> None:
-        """Report a fence only once the drone has echoed every one of its settings."""
-        failed = [f"{name}: {detail}" for name, (ok, detail) in results.items() if not ok]
-        if failed:
-            self.geofence_result.emit(False, "; ".join(failed))
-            self.error.emit("Geofence not set: " + "; ".join(failed))
-            return
-        self.geofence_result.emit(True, ok_text)
-        self.log_line.emit(f"Geofence confirmed by the drone: {ok_text}")
-
-    def _geofence_upload(self, cfg: dict) -> None:
-        if self._master is None:
-            self.geofence_result.emit(False, "Link not ready")
-            return
-        if bool(cfg.get("disable")):
-            self._write_params(
-                {"FENCE_ENABLE": 0.0},
-                lambda results: self._fence_written(results, "Fence disabled"),
-            )
-            return
-
-        points = cfg.get("points")
-        if isinstance(points, list) and len(points) >= 3:
-            try:
-                self._upload_polygon_fence(points)
-                self.geofence_result.emit(True, f"Polygon uploaded ({len(points)} pts)")
-                return
-            except Exception as e:
-                self.error.emit(f"Polygon fence upload failed; fallback to circle: {e}")
-
-        # M2 subset fallback: configure ArduPilot circular fence parameters.
-        radius_m = max(10.0, float(cfg.get("radius_m", 80.0)))
-        alt_max_m = max(5.0, float(cfg.get("alt_max_m", 120.0)))
-        self._write_params(
-            {
-                "FENCE_ENABLE": 1.0,
-                # Ensure there is an actual restriction on breach.
-                # Common ArduPilot meanings: 0=None, 1=RTL, 2=Land. Default to RTL.
-                "FENCE_ACTION": float(cfg.get("action", 1.0)),
-                # Bit 1 is the height limit, bit 2 the circle. This was 2 (the
-                # circle alone), so FENCE_ALT_MAX was written but never
-                # enforced: the drone could climb through the operator's height
-                # limit (found by the simulator test, 2026-10-07).
-                "FENCE_TYPE": 3.0,
-                "FENCE_RADIUS": radius_m,
-                "FENCE_ALT_MAX": alt_max_m,
-            },
-            lambda results: self._fence_written(
-                results, f"Fence enabled: radius={radius_m:.0f}m alt_max={alt_max_m:.0f}m"
-            ),
-        )
-
-    def _upload_polygon_fence(self, points: list[object]) -> None:
-        if self._master is None:
-            raise RuntimeError("Link not ready")
-        norm: list[tuple[float, float]] = []
-        for row in points:
-            if not (isinstance(row, list) or isinstance(row, tuple)) or len(row) < 2:
-                continue
-            lat = float(row[0])
-            lon = float(row[1])
-            norm.append((lat, lon))
-        if len(norm) < 3:
-            raise RuntimeError("Polygon requires >=3 points")
-        self._param_set_value("FENCE_ENABLE", 1.0)
-        # Ensure there is an actual restriction on breach (default RTL).
-        self._param_set_value("FENCE_ACTION", 1.0)
-        self._param_set_value("FENCE_TYPE", 4.0)  # polygon fence
-        self._param_set_value("FENCE_TOTAL", float(len(norm)))
-        for idx, (lat, lon) in enumerate(norm):
-            self._master.mav.fence_point_send(
-                self._target_sysid,
-                self._target_compid,
-                idx,
-                len(norm),
-                lat,
-                lon,
-            )
-            time.sleep(0.02)
-        self.log_line.emit(f"Polygon geofence points sent: {len(norm)}")
 
     def _params_fetch(self, names: list[str]) -> None:
         if self._master is None:

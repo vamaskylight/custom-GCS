@@ -164,6 +164,9 @@ class MainWindowParamsMixin:
         msg = f"Fence {'OK' if ok else 'FAIL'}: {detail}"
         self._append_log(msg)
         self._post_gcs_notice(msg[:80])
+        # The whole text, where the operator pressed the button: the header
+        # shows a beginning, and a refusal's reason is at its end.
+        self._map_widget.set_plan_fence_result(bool(ok), str(detail))
 
     def _on_params_snapshot(self, payload: object) -> None:
         data = dict(payload) if isinstance(payload, dict) else {}

@@ -441,6 +441,94 @@ class MainWindowFlightCommandsMixin:
         self._thread.queue_geofence_upload({"disable": True})
         self._append_log("Fence off queued")
 
+    def _upload_polygon_fence_from_plan_panel(self) -> None:
+        """Plan Flight, Fence tab: the polygon drawn on the map, with the tab's max height and action.
+
+        The link checks it against the drone (is the drone inside, what does
+        the drone hold now) and may come back with a question first.
+        """
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before fence upload.")
+            return
+        from vgcs.mission.fence import check_polygon
+
+        cfg = self._map_widget.plan_polygon_fence_cfg()
+        corners, problem = check_polygon(cfg["points"])
+        if problem:
+            # Said here, without a round trip. (The link says the same if asked.)
+            self._map_widget.set_plan_fence_result(False, f"{problem} Not sent.")
+            return
+        self._thread.queue_geofence_upload(cfg)
+        self._map_widget.set_plan_fence_result(
+            None, f"Sending a polygon of {len(corners)} corners to the drone, and reading it back...")
+        self._append_log(
+            f"Polygon fence upload queued: {len(corners)} corners alt={cfg['alt_max_m']:.0f}m "
+            f"action={int(cfg['action'])}"
+        )
+
+    def _read_fence_from_plan_panel(self) -> None:
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before reading its fence.")
+            return
+        if self._map_widget.fence_drawing_not_on_drone():
+            answer = QMessageBox.question(
+                self,
+                "Read fence from drone",
+                "The polygon on the map is not on the drone.\n\n"
+                "If the drone holds a polygon, it takes the place of the one on the map. Read it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._thread.queue_geofence_download()
+        self._map_widget.set_plan_fence_result(None, "Reading the fence from the drone...")
+        self._append_log("Fence read queued")
+
+    def _on_fence_state(self, state: object) -> None:
+        """The link reports what the fence of the drone on screen is now."""
+        if not isinstance(state, dict):
+            return
+        self._map_widget.apply_fence_state(state)
+        # The mission check reads the fence from the settings VGCS holds. A
+        # fence VGCS itself just changed or read is news for it. (Until
+        # 2026-10-14 only "Refresh params" brought it in: after "Upload fence"
+        # the check still saw the fence as it was at connect.)
+        for key, name in (("enabled", "FENCE_ENABLE"), ("kinds", "FENCE_TYPE"), ("alt_max_m", "FENCE_ALT_MAX"),
+                          ("action", "FENCE_ACTION"), ("radius_m", "FENCE_RADIUS")):
+            value = state.get(key)
+            if value is not None:
+                try:
+                    self._last_params[name] = float(value)
+                except (TypeError, ValueError):
+                    pass
+
+    def _on_fence_question(self, question: object) -> None:
+        """The link did not send a fence: it needs the operator's yes first."""
+        data = question if isinstance(question, dict) else {}
+        text = str(data.get("text") or "")
+        cfg = data.get("cfg")
+        if not text or not isinstance(cfg, dict):
+            return
+        self._map_widget.set_plan_fence_result(None, "Not sent yet: VGCS asks first.")
+        answer = QMessageBox.question(
+            self,
+            "Polygon fence",
+            text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._map_widget.set_plan_fence_result(False, "Not sent: the fence on the drone is unchanged.")
+            self._append_log("Polygon fence: not sent (the operator answered no)")
+            return
+        if self._thread is None or not self._thread.isRunning():
+            self._map_widget.set_plan_fence_result(False, "Not sent: the link is gone.")
+            return
+        self._thread.queue_geofence_upload(dict(cfg))
+        self._map_widget.set_plan_fence_result(None, "Sending the polygon to the drone, and reading it back...")
+        self._append_log("Polygon fence upload queued again (the operator answered yes)")
+
     def _on_map_geofence_requested(self, cfg: object) -> None:
         if self._thread is None or not self._thread.isRunning():
             return

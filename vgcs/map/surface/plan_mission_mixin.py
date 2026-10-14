@@ -36,6 +36,7 @@ class PlanMissionMixin:
                 nm.disable_plan_edit_modes()
         except Exception:
             pass
+        self._refresh_fence_view()
         panel = getattr(self, "_plan_flight_panel", None)
         if panel is not None:
             panel.hide()
@@ -58,16 +59,17 @@ class PlanMissionMixin:
         tl = (tool or "").strip().lower()
         if tl == "waypoint":
             self._enable_add_waypoint_mode()
-            return
-        if tl == "roi":
+        elif tl == "roi":
             self._enable_fence_polygon_mode()
-            return
-        try:
-            nm = getattr(self, "_native_map", None)
-            if nm is not None:
-                nm.disable_plan_edit_modes()
-        except Exception:
-            pass
+        else:
+            try:
+                nm = getattr(self, "_native_map", None)
+                if nm is not None:
+                    nm.disable_plan_edit_modes()
+            except Exception:
+                pass
+        # The Fence tab's Draw button shows whether clicks add fence corners now.
+        self._refresh_fence_view()
 
     def _on_plan_panel_tool(self, tool: str) -> None:
         t = (tool or "").strip()
@@ -161,12 +163,17 @@ class PlanMissionMixin:
             # _layout_native_hud keeps the compass clear of the right column.
             self._set_map_footer_hud_visible(True)
         else:
+            was_drawing = False
             try:
                 nm = getattr(self, "_native_map", None)
                 if nm is not None:
+                    was_drawing = bool(nm.fence_draw_mode())
                     nm.disable_plan_edit_modes()
             except Exception:
                 pass
+            if was_drawing:
+                # (Only then: the window calls this on every heartbeat.)
+                self._refresh_fence_view()
             panel.hide()
             try:
                 mar = getattr(self, "_map_action_rail", None)

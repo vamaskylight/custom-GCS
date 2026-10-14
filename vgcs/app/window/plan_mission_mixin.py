@@ -262,6 +262,7 @@ class MainWindowPlanMissionMixin:
                 params=dict(getattr(self, "_last_params", {}) or {}),
                 dem_elevation_fn=self._plan_dem_elevation_fn(),
                 endurance_min=self._plan_endurance_min(),
+                fence_polygon=self._plan_fence_polygon(),
             )
         except Exception:
             return ([], [], [])
@@ -271,6 +272,17 @@ class MainWindowPlanMissionMixin:
                 f"{report.round_trip_m / 1000.0:.1f} km round trip."
             )
         return (list(report.errors), list(report.warnings), list(report.unchecked))
+
+    def _plan_fence_polygon(self):
+        """The polygon fence the drone on screen holds, as VGCS sent or read it. None when not known.
+
+        Asked for on its own: a fault here leaves the polygon "not known" (the
+        check then says so), and the other checks still run.
+        """
+        try:
+            return self._map_widget.fence_polygon_on_drone()
+        except Exception:
+            return None
 
     def _plan_dem_elevation_fn(self):
         """The DEM the observation tools already load, reused for terrain."""
@@ -1082,6 +1094,24 @@ class MainWindowPlanMissionMixin:
             return
         if a == "fence_disable":
             self._disable_fence_from_plan_panel()
+            return
+        if a == "fence_draw_on":
+            self._map_widget.start_fence_drawing()
+            return
+        if a == "fence_draw_off":
+            self._map_widget.stop_fence_drawing()
+            return
+        if a == "fence_undo":
+            self._map_widget.remove_last_fence_corner()
+            return
+        if a == "fence_clear":
+            self._map_widget.clear_fence_polygon()
+            return
+        if a == "fence_upload_polygon":
+            self._upload_polygon_fence_from_plan_panel()
+            return
+        if a == "fence_download":
+            self._read_fence_from_plan_panel()
             return
 
     def _on_plan_tool_requested(self, tool_name: str) -> None:

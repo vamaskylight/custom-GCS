@@ -33,6 +33,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from vgcs.mission.fence import ON_EDGE_M, TYPE_ALT_MAX, TYPE_CIRCLE, TYPE_POLYGON, distance_inside_m, leaves
 from vgcs.mission.mission_plan import haversine_m
 
 __all__ = [
@@ -111,11 +112,15 @@ def check_long_range_mission(
     dem_elevation_fn=None,
     endurance_min: float | None = None,
     cruise_speed_mps: float | None = None,
+    fence_polygon: list | None = None,
 ) -> LongRangeReport:
     """Assess a mission for the failure modes that lose distant aircraft.
 
     ``params`` is the vehicle parameter cache; missing keys are reported as
     unchecked rather than assumed safe.
+
+    ``fence_polygon`` is the polygon fence the vehicle holds, as (lat, lon)
+    corners: what VGCS sent or read. None when VGCS does not know it.
     """
     report = LongRangeReport()
     pts = _points(waypoints)
@@ -130,7 +135,7 @@ def check_long_range_mission(
     report.round_trip_m = sum(legs) + haversine_m(home[0], home[1], pts[-1][0], pts[-1][1])
 
     p = {str(k).upper(): v for k, v in (params or {}).items()}
-    _check_fence(report, p)
+    _check_fence(report, p, home, waypoints, fence_polygon)
     if report.is_long_range:
         _check_failsafes(report, p)
         _check_rtl_altitude(report, p, home, pts, dem_elevation_fn)
@@ -141,22 +146,125 @@ def check_long_range_mission(
 # --------------------------------------------------------------------------- #
 
 
-def _check_fence(report: LongRangeReport, p: dict) -> None:
+def _check_fence(report: LongRangeReport, p: dict, start, waypoints, fence_polygon) -> None:
+    """Does the mission stay inside the fence the vehicle uses?
+
+    FENCE_TYPE says which limits are in use: 1 the max height, 2 the circle
+    around home, 4 the polygon. Until 2026-10-14 only FENCE_RADIUS was looked
+    at. On a vehicle that uses a polygon the radius is not in use, and a
+    mission was refused for a fence that was not there, while the max height
+    and the polygon were never looked at.
+    """
     enable = _f(p.get("FENCE_ENABLE"))
     radius = _f(p.get("FENCE_RADIUS"))
-    if enable is None or radius is None:
+    kinds = _f(p.get("FENCE_TYPE"))
+    if enable is None:
         report.unchecked.append("Geofence (FENCE_ENABLE / FENCE_RADIUS not read yet)")
         return
     if enable < 0.5:
         return  # fence off; nothing to breach
-    if radius <= 0.0:
+    # Without FENCE_TYPE the circle is taken to be in use, as before: in
+    # ArduPilot's own defaults every limit is on.
+    bits = None if kinds is None else int(round(kinds))
+    if bits is None or bits & TYPE_CIRCLE:
+        if radius is None:
+            report.unchecked.append("Geofence (FENCE_ENABLE / FENCE_RADIUS not read yet)")
+        elif radius > 0.0 and report.farthest_m > radius:
+            report.errors.append(
+                f"Mission reaches {report.farthest_m / 1000.0:.2f} km from home but the "
+                f"geofence radius is {radius:.0f} m. The vehicle will hit the fence "
+                "mid-mission. Raise FENCE_RADIUS or shorten the route."
+            )
+    if bits is None:
         return
-    if report.farthest_m > radius:
+    if bits & TYPE_ALT_MAX:
+        _check_fence_height(report, p, waypoints)
+    if bits & TYPE_POLYGON:
+        _check_fence_polygon(report, start, waypoints, fence_polygon)
+
+
+def _numbers(numbers: list[int]) -> str:
+    """"Waypoint 3", "Waypoints 2 and 5", "Waypoints 1, 2, 3 and 9 more"."""
+    shown = [str(n) for n in numbers[:3]]
+    more = len(numbers) - len(shown)
+    if more > 0:
+        return f"Waypoints {', '.join(shown)} and {more} more"
+    if len(shown) == 1:
+        return f"Waypoint {shown[0]}"
+    return f"Waypoints {', '.join(shown[:-1])} and {shown[-1]}"
+
+
+def _check_fence_height(report: LongRangeReport, p: dict, waypoints) -> None:
+    alt_max = _f(p.get("FENCE_ALT_MAX"))
+    if alt_max is None:
+        report.unchecked.append("Fence max height (FENCE_ALT_MAX not read yet)")
+        return
+    if alt_max <= 0.0:
+        return
+    high: list[tuple[int, float]] = []
+    for number, wp in enumerate(waypoints or [], start=1):
+        alt = _f(_attr(wp, "alt_m"))
+        # At the limit counts: the vehicle breaches when it reaches it.
+        if alt is not None and alt >= alt_max:
+            high.append((number, alt))
+    if high:
+        several = len(high) > 1
         report.errors.append(
-            f"Mission reaches {report.farthest_m / 1000.0:.2f} km from home but the "
-            f"geofence radius is {radius:.0f} m. The vehicle will hit the fence "
-            "mid-mission. Raise FENCE_RADIUS or shorten the route."
+            f"{_numbers([n for n, _alt in high])} {'are' if several else 'is'} planned at "
+            f"{max(alt for _n, alt in high):.0f} m, but the fence's max height is {alt_max:.0f} m. "
+            "The vehicle will hit the fence mid-mission. Lower the waypoint, or raise Max height "
+            "(Plan Flight, Fence)."
         )
+
+
+def _check_fence_polygon(report: LongRangeReport, start, waypoints, fence_polygon) -> None:
+    if fence_polygon is None:
+        # A warning, not a line in the log: one press reads the fence.
+        report.warnings.append(
+            "The fence on the vehicle may include a polygon that VGCS has not read, so this mission is "
+            "not checked against it. Press Read fence from drone (Plan Flight, Fence) first."
+        )
+        return
+    corners: list[tuple[float, float]] = []
+    for row in fence_polygon:
+        try:
+            corners.append((float(row[0]), float(row[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    if len(corners) < 3:
+        return  # the polygon is chosen as a limit, but the vehicle holds none
+    places: list[tuple[int, tuple[float, float]]] = []
+    for number, wp in enumerate(waypoints or [], start=1):
+        la, lo = _wp_latlon(wp)
+        if la is None or lo is None or (abs(la) < 1e-7 and abs(lo) < 1e-7):
+            continue
+        places.append((number, (la, lo)))
+    outside = [(n, distance_inside_m(corners, la, lo)) for n, (la, lo) in places]
+    # On the fence counts: the vehicle breaches the moment it is there.
+    outside = [(n, inside) for n, inside in outside if inside < ON_EDGE_M]
+    if outside:
+        several = len(outside) > 1
+        far = max(abs(inside) for _n, inside in outside)
+        where = (f"outside the polygon fence (by up to {far:.0f} m)" if far >= 0.5
+                 else "on the edge of the polygon fence")
+        report.errors.append(
+            f"{_numbers([n for n, _inside in outside])} {'are' if several else 'is'} {where}. "
+            "The vehicle will hit the fence mid-mission. Move the "
+            f"waypoint{'s' if several else ''}, or upload a larger fence."
+        )
+        return
+    # Every waypoint is inside. A fence with a dent can still lie between two of them.
+    route: list[tuple[str, tuple[float, float]]] = []
+    if start is not None and distance_inside_m(corners, start[0], start[1]) >= 0.0:
+        route.append(("the vehicle", (float(start[0]), float(start[1]))))
+    route += [(f"waypoint {n}", place) for n, place in places]
+    for (name_a, a), (name_b, b) in zip(route, route[1:]):
+        if leaves(corners, a, b):
+            report.errors.append(
+                f"The straight way from {name_a} to {name_b} leaves the polygon fence and comes back in. "
+                "The vehicle will hit the fence there. Add a waypoint to go around, or upload another fence."
+            )
+            return
 
 
 def _check_failsafes(report: LongRangeReport, p: dict) -> None:

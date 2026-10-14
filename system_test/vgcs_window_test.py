@@ -812,10 +812,244 @@ def plan_flight_mission(w, sim: Sitl, r: Report, popups: list[str], logs: list[s
 
     fly_the_plan(w, sim, r, popups, reader, want, speedup)
     the_mission_as_the_drone_holds_it(w, sim, r, popups, logs, reader, speedup)
+    the_polygon_fence(w, sim, r, popups, logs)
 
     panel.exit_requested.emit()          # "Exit Plan"
     wait_qt(lambda: False, 0.3)
     r.check(not panel.isVisible(), "Exit Plan closes Plan Flight")
+
+
+class FenceReader:
+    """Reads the fence off the drone on the checking connection, as another ground station would."""
+
+    def __init__(self, sim: Sitl) -> None:
+        self.sim = sim
+        self.count: int | None = None
+        self.items: dict[int, object] = {}
+        self.done = False
+        self.active = False
+        take = sim._take
+
+        def taking(msg) -> None:
+            if self.active and int(getattr(msg, "mission_type", 0) or 0) == 1:
+                kind = msg.get_type()
+                if kind == "MISSION_COUNT" and self.count is None:
+                    self.count = int(msg.count)
+                    self._next(0)
+                elif kind == "MISSION_ITEM_INT" and self.count is not None and int(msg.seq) == len(self.items):
+                    self.items[int(msg.seq)] = msg
+                    self._next(int(msg.seq) + 1)
+            take(msg)
+
+        sim._take = taking
+
+    def _next(self, seq: int) -> None:
+        mav = self.sim.mav
+        if self.count is not None and seq < self.count:
+            mav.mav.mission_request_int_send(mav.target_system, mav.target_component, seq, 1)
+        else:
+            mav.mav.mission_ack_send(mav.target_system, mav.target_component, 0, 1)
+            self.done, self.active = True, False
+
+    def read(self) -> None:
+        self.count, self.items, self.done, self.active = None, {}, False, True
+        mav = self.sim.mav
+        mav.mav.mission_request_list_send(mav.target_system, mav.target_component, 1)
+
+    def corners(self) -> list[tuple[int, float, int, int]]:
+        """(command, corner count, lat e7, lon e7) of each item, in order."""
+        return [(int(i.command), float(i.param1), int(i.x), int(i.y)) for _seq, i in sorted(self.items.items())]
+
+
+class ParamAsker:
+    """Asks the drone for settings on the checking connection. The answers come in through its own thread."""
+
+    def __init__(self, sim: Sitl) -> None:
+        self.sim = sim
+        self.values: dict[str, float] = {}
+        take = sim._take
+
+        def taking(msg) -> None:
+            if msg.get_type() == "PARAM_VALUE":
+                self.values[str(msg.param_id).strip("\x00")] = float(msg.param_value)
+            take(msg)
+
+        sim._take = taking
+
+    def ask(self, *names: str) -> None:
+        mav = self.sim.mav
+        for name in names:
+            self.values.pop(name, None)
+        for name in names:
+            mav.mav.param_request_read_send(mav.target_system, mav.target_component, name.encode(), -1)
+
+
+def the_polygon_fence(w, sim: Sitl, r: Report, popups: list[str], logs: list[str]) -> None:
+    """The polygon fence through the Fence tab's own buttons.
+
+    Until 2026-10-14 the tab said "Polygon Fences: not available yet". What is
+    checked here: the fence is drawn by clicks on the map, it is green (the
+    drone's) only once the drone has confirmed it, a change makes it a drawing
+    again, Read fence from drone brings the drone's own back, and a fence that
+    does not hold the drone is asked about first.
+    """
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QLabel, QPushButton
+
+    mw = w._map_widget
+    panel = mw._plan_flight_panel
+    nm = mw._native_map
+    before = len(popups)
+
+    def button(name: str) -> QPushButton:
+        return panel.findChild(QPushButton, name)
+
+    def says(name: str) -> str:
+        return panel.findChild(QLabel, name).text()
+
+    def tool(name: str) -> None:
+        next(b for b in panel._tool_buttons if b.text().split("\n")[-1].strip() == name).click()
+
+    def click_map(dx: int, dy: int) -> None:
+        QTest.mouseClick(nm, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                         nm.rect().center() + QPoint(dx, dy))
+        wait_qt(lambda: False, 0.3)
+
+    def mouse(kind, pos: QPoint) -> None:
+        held = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseButtonRelease else Qt.MouseButton.LeftButton
+        QApplication.sendEvent(nm, QMouseEvent(kind, QPointF(pos), QPointF(nm.mapToGlobal(pos)), Qt.MouseButton.LeftButton,
+                                               held, Qt.KeyboardModifier.NoModifier))
+
+    def as_stored(points) -> list[tuple[int, float, int, int]]:
+        return [(5001, float(len(points)), int(round(lat * 1e7)), int(round(lon * 1e7))) for lat, lon in points]
+
+    def on_the_drone() -> list[tuple[int, float, int, int]]:
+        checker.read()
+        wait_qt(lambda: checker.done, 20)
+        return checker.corners()
+
+    def settings(*names: str) -> dict[str, float]:
+        asker.ask(*names)
+        wait_qt(lambda: all(n in asker.values for n in names), 10)
+        return {n: asker.values.get(n) for n in names}
+
+    checker = FenceReader(sim)
+    asker = ParamAsker(sim)
+
+    panel._tab_buttons["fence"].click()
+    wait_qt(lambda: False, 0.3)
+    draw, upload = button("planFenceDraw"), button("planFencePolygonUpload")
+    r.check(draw.isVisible() and not draw.visibleRegion().isEmpty() and upload.isVisible(),
+            "the Fence tab shows the polygon fence, with Draw on the map on screen")
+    r.check(says("planFencePolygonStatus").startswith("No polygon yet") and not upload.isEnabled(),
+            "with nothing drawn it says so, and Upload polygon fence cannot be pressed")
+
+    # --- drawn by clicks, sent, and only then the drone's ---------------------------
+    tool("Center")
+    wait_qt(lambda: False, 0.5)
+    draw.click()
+    r.check(nm.fence_draw_mode() and draw.text() == "Drawing: click the map", "Draw on the map: the button shows that clicks add corners now")
+    for dx, dy in ((-220, -160), (220, -160), (220, 160), (-220, 160)):
+        click_map(dx, dy)
+    drawn = list(mw.fence_polygon())
+    r.check(len(drawn) == 4 and says("planFencePolygonStatus") == "4 corners. Not on the drone yet: press Upload polygon fence."
+            and upload.isEnabled(), f"four clicks around the drone make four corners ({says('planFencePolygonStatus')!r})")
+    r.check(nm._fence_on_drone is False and nm._fence_tag == "Fence: not on the drone", "on the map it is amber: a drawing")
+    draw.click()
+    r.check(not nm.fence_draw_mode() and draw.text() == "Draw on the map", "Draw pressed again: clicks add no more corners")
+
+    upload.click()
+    r.check(wait_qt(lambda: says("planFenceResult").startswith("Polygon fence on: 4 corners"), 30),
+            f"Upload polygon fence: VGCS reports it on ({says('planFenceResult')!r})")
+    r.check(nm._fence_on_drone is True and nm._fence_tag == "Fence: on the drone"
+            and says("planFencePolygonStatus") == "4 corners. This fence is on the drone and switched on.",
+            "and only now the map shows it green, as the drone's")
+    r.check(on_the_drone() == as_stored(drawn), "the checking connection reads the same four corners off the drone, to the last digit")
+    held = settings("FENCE_ENABLE", "FENCE_TYPE", "FENCE_ALT_MAX")
+    r.check(held == {"FENCE_ENABLE": 1.0, "FENCE_TYPE": 5.0, "FENCE_ALT_MAX": float(panel.fence_settings()["alt_max_m"])},
+            f"and the drone's fence is on, with the polygon and the tab's max height ({held})")
+    r.check(popups[before:] == [], f"no question was needed: the drone stands inside ({popups[before:]})")
+
+    # --- a corner dragged: a drawing again --------------------------------------------
+    draw.click()
+    start = nm.rect().center() + QPoint(220, 160)
+    mouse(QEvent.Type.MouseButtonPress, start)
+    for i in range(1, 6):
+        mouse(QEvent.Type.MouseMove, start + QPoint(8 * i, 6 * i))
+    mouse(QEvent.Type.MouseButtonRelease, start + QPoint(40, 30))
+    wait_qt(lambda: False, 0.3)
+    draw.click()
+    moved = list(mw.fence_polygon())
+    r.check(len(moved) == 4 and moved[2] != drawn[2] and moved[:2] == drawn[:2],
+            "a corner dragged on the map moved, and no corner was added")
+    r.check(nm._fence_on_drone is False and nm._fence_tag == "Fence: not on the drone"
+            and says("planFencePolygonStatus").endswith("Not on the drone yet: press Upload polygon fence."),
+            "it is amber again: the drone holds another polygon than the map shows")
+
+    # --- Read fence from drone ------------------------------------------------------------
+    button("planFenceDownload").click()
+    said = popups[before:]
+    r.check(len(said) == 1 and "not on the drone" in said[0], f"Read fence from drone asks before it replaces the drawing ({said})")
+    del popups[before:]
+    r.check(wait_qt(lambda: says("planFenceResult").startswith("The drone's fence is switched on"), 20),
+            f"and VGCS says what the drone holds ({says('planFenceResult')!r})")
+    back = [(int(round(lat * 1e7)), int(round(lon * 1e7))) for lat, lon in mw.fence_polygon()]
+    r.check(back == [(row[2], row[3]) for row in as_stored(drawn)] and nm._fence_on_drone is True,
+            "the map shows the four corners the drone holds, green again")
+
+    # --- a fence that does not hold the drone ------------------------------------------------
+    button("planFenceClear").click()
+    r.check(mw.fence_polygon() == [] and says("planFencePolygonStatus").startswith("No polygon yet"), "Clear polygon empties the map")
+    draw.click()
+    for dx, dy in ((260, -120), (420, -120), (420, 120)):
+        click_map(dx, dy)
+    draw.click()
+    away = list(mw.fence_polygon())
+    answer = [QMessageBox.StandardButton.Cancel]
+    session_question = QMessageBox.question
+    QMessageBox.question = staticmethod(lambda _p, title, text, *a, **k: popups.append(f"{title}: {text}") or answer[0])
+    try:
+        upload.click()
+        r.check(wait_qt(lambda: len(popups) > before, 20) and "outside this fence" in popups[-1]
+                and "Send this fence anyway?" in popups[-1], f"a fence beside the drone: VGCS asks first ({popups[before:]})")
+        wait_qt(lambda: says("planFenceResult").startswith("Not sent"), 5)
+        r.check(says("planFenceResult") == "Not sent: the fence on the drone is unchanged.", "answered no: it says that nothing was sent")
+        r.check(on_the_drone() == as_stored(drawn), "and the drone still holds the first fence")
+        del popups[before:]
+        answer[0] = QMessageBox.StandardButton.Yes
+        upload.click()
+        r.check(wait_qt(lambda: says("planFenceResult").startswith("Polygon fence on: 3 corners"), 30)
+                and "it will not arm until it is" in says("planFenceResult"),
+                f"answered yes: the fence goes up, and VGCS says what follows ({says('planFenceResult')!r})")
+        r.check(on_the_drone() == as_stored(away), "the drone holds the three corners")
+        del popups[before:]
+    finally:
+        QMessageBox.question = session_question
+
+    # What follows, in the drone's own words.
+    seen = len(logs)
+    w._on_takeoff()
+    wait_qt(lambda: any("AUTO_TAKEOFF FAIL" in line for line in logs[seen:]), 30)
+    refused = [line for line in logs[seen:] if "AUTO_TAKEOFF FAIL" in line]
+    r.check(bool(refused) and "ence" in refused[-1] and not sim.armed,
+            f"a take-off outside the fence is refused, in the drone's words: {refused[-1][:110] if refused else 'nothing'!r}")
+    wait_qt(lambda: False, 2.0)
+    del popups[before:]
+
+    # --- off ------------------------------------------------------------------------------
+    button("planFenceOff").click()          # it asks first, and the test answers yes
+    r.check(wait_qt(lambda: says("planFenceResult") == "Fence disabled", 20), "Switch fence off: VGCS reports it off")
+    r.check(settings("FENCE_ENABLE") == {"FENCE_ENABLE": 0.0}, "and it is off in the drone")
+    r.check(nm._fence_on_drone is False and nm._fence_tag == "Fence: on the drone, not in use",
+            "the map says that the drone holds the polygon and does not use it")
+    said = popups[before:]
+    r.check(len(said) == 1 and "Switch the geofence off" in said[0], f"it asked once, about switching off ({said})")
+    del popups[before:]
+    button("planFenceClear").click()
+    panel._tab_buttons["mission"].click()
+    wait_qt(lambda: False, 0.3)
 
 
 def banner(w) -> str:

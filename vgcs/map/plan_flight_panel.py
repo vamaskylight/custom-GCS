@@ -13,7 +13,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QMouseEvent, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from vgcs.mission import clamp_hover_seconds
+from vgcs.mission.fence import NO_POLYGON_WORDS
 
 
 _TOOLS: tuple[tuple[str, str], ...] = (
@@ -54,7 +55,10 @@ _TOOL_HINTS: dict[str, str] = {
     "Waypoint": (
         "Click on the map to place waypoints. Right-click or double-click a waypoint marker to remove it."
     ),
-    "ROI": "Click on the map to add fence polygon vertices.",
+    "ROI": (
+        "Fence corners: click on the map to add a corner, drag a corner to move it, right-click a corner "
+        "to remove it. Upload the fence in the Fence tab."
+    ),
     "Pattern": "Pattern templates use Mission → Pattern size (m). Pick Survey / Corridor / Structure again after changing spacing.",
     "Center": "Centers the map on the vehicle.",
 }
@@ -428,6 +432,24 @@ class _CollapsibleSection(QFrame):
         self._body.setVisible(bool(checked))
         arrow = "\u25BC" if checked else "\u25B6"
         self._toggle.setText(f"{self._title}   {arrow}")
+
+
+class _TallScrollArea(QScrollArea):
+    """A scroll area that asks for the height of what it holds.
+
+    Qt's own asks for 24 lines of text at most. The panel around the Fence tab
+    is as tall as its tabs ask for, so it stayed short on a tall screen, and
+    most of the tab was below its edge. The scroll bar still comes when the
+    window is too low for all of it.
+    """
+
+    def sizeHint(self) -> QSize:  # noqa: N802 (Qt naming)
+        inner = self.widget()
+        if inner is None:
+            return super().sizeHint()
+        frame = 2 * self.frameWidth()
+        hint = inner.sizeHint()
+        return QSize(hint.width() + frame, hint.height() + frame)
 
 
 class PlanTemplateCard(QFrame):
@@ -1264,42 +1286,108 @@ class PlanFlightPanel(QWidget):
         header.setProperty("class", "planSectionHeader")
         v.addWidget(header)
 
+        # The tab is taller than a small laptop screen since the polygon fence.
+        scroll = _TallScrollArea()
+        scroll.setObjectName("planFenceScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: #14151a; }")
+
         host = QWidget()
-        host.setStyleSheet("QWidget { background: #14151a; color: #e8eaef; }")
+        # The buttons' colours are said here as well: a rule on this widget
+        # wins over the panel's own, so with the background alone every button
+        # was a black box, and a pressed Draw button looked like the others.
+        host.setStyleSheet(
+            "QWidget { background: #14151a; color: #e8eaef; }"
+            "QPushButton.planGeoBtn { background: #3d414d; color: #f3f4f6; min-height: 22px; padding: 6px 10px; }"
+            "QPushButton.planGeoBtn:hover:!disabled { background: #4a4f5e; }"
+            "QPushButton.planGeoBtn:disabled { background: #2a2c35; color: rgba(243, 244, 246, 110); }"
+            "QPushButton.planGeoBtn:checked { background: #f5e6a0; color: #111827; }"
+        )
         bv = QVBoxLayout(host)
-        bv.setContentsMargins(12, 12, 12, 12)
-        bv.setSpacing(14)
+        bv.setContentsMargins(12, 10, 12, 10)
+        bv.setSpacing(10)
 
         lead = QLabel(
-            "GeoFencing keeps the drone inside an area. On a breach the drone does what "
-            "you choose below. The drone itself enforces it, also without VGCS."
+            "A fence keeps the drone inside an area and under a height. "
+            "The drone itself enforces it, also without VGCS."
         )
         lead.setProperty("class", "planGeoLead")
         lead.setWordWrap(True)
         bv.addWidget(lead)
 
-        # The circle fence is what VGCS sends today (checked in the ArduCopter
-        # simulator, M17). Its only button used to be on the hidden dashboard,
-        # which this tab told the operator to use.
+        bv.addWidget(self._fence_limits_section())
+        # The circle fence was the only one VGCS could send until 2026-10-14.
+        # Its button used to be on the hidden dashboard only.
         bv.addWidget(self._circle_fence_section())
-
-        bv.addWidget(self._geo_section("Polygon Fences", [
-            ("Polygon Fence", "", False),
-        ]))
-        self._geo_poly_status = QLabel(
-            "Not available yet: VGCS sends polygons with an old message type. Use the circle fence."
-        )
-        self._geo_poly_status.setProperty("class", "planGeoStatus")
-        self._geo_poly_status.setWordWrap(True)
-        bv.addWidget(self._geo_poly_status)
-
-        bv.addWidget(self._geo_section("Breach Return Point", [
-            ("Add Breach Return Point", "", False),
-        ]))
+        bv.addWidget(self._polygon_fence_section())
+        bv.addWidget(self._fence_on_drone_section())
 
         bv.addStretch(1)
-        v.addWidget(host, 1)
+        scroll.setWidget(host)
+        v.addWidget(scroll, 1)
+
+        # The drone's answer in full, under the tab's own scrolling part, so
+        # it is on screen wherever the tab is scrolled to. The header's
+        # message field shows only the beginning of a text, and a refusal's
+        # reason is at its end.
+        self._fence_result_label = QLabel("The drone's answer shows here.")
+        self._fence_result_label.setObjectName("planFenceResult")
+        self._fence_result_label.setWordWrap(True)
+        self._fence_result_label.setStyleSheet(self._fence_result_style("#e8eaef"))
+        v.addWidget(self._fence_result_label)
         return body
+
+    @staticmethod
+    def _fence_result_style(colour: str) -> str:
+        return ("QLabel { color: %s; font-size: 12px; background: #1b1d24; "
+                "border-top: 1px solid rgba(110, 118, 135, 160); padding: 8px 12px 10px 12px; }" % colour)
+
+    def _geo_button(self, text: str, name: str, tip: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setObjectName(name)
+        b.setProperty("class", "planGeoBtn")
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setToolTip(tip)
+        return b
+
+    def _geo_note(self, text: str) -> QLabel:
+        note = QLabel(text)
+        note.setProperty("class", "planGeoStatus")
+        note.setWordWrap(True)
+        return note
+
+    def _fence_limits_section(self) -> QWidget:
+        """Max height and what happens on a breach: they go with either shape."""
+        host = QWidget()
+        g = QGridLayout(host)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        title = QLabel("For the circle and for the polygon")
+        title.setProperty("class", "planGeoTitle")
+        g.addWidget(title, 0, 0, 1, 2)
+        self._fence_alt_spin = QDoubleSpinBox()
+        self._fence_alt_spin.setObjectName("planFenceMaxHeight")
+        self._fence_alt_spin.setProperty("class", "planPatternSpin")
+        self._fence_alt_spin.setRange(5.0, 2000.0)
+        self._fence_alt_spin.setDecimals(0)
+        self._fence_alt_spin.setSingleStep(5.0)
+        self._fence_alt_spin.setValue(120.0)
+        self._fence_alt_spin.setSuffix(" m")
+        self._fence_alt_spin.setToolTip("How high above home the drone may climb.")
+        self._fence_action_combo = QComboBox()
+        self._fence_action_combo.setObjectName("planFenceAction")
+        self._fence_action_combo.addItem("Return to launch (RTL)", 1.0)
+        self._fence_action_combo.addItem("Land", 2.0)
+        self._fence_action_combo.addItem("Warn only", 0.0)
+        self._fence_action_combo.setToolTip("What the drone does when it reaches the fence.")
+        g.addWidget(self._field_label("Max height"), 1, 0)
+        g.addWidget(self._fence_alt_spin, 1, 1)
+        g.addWidget(self._field_label("On breach"), 2, 0)
+        g.addWidget(self._fence_action_combo, 2, 1)
+        return host
 
     def _circle_fence_section(self) -> QWidget:
         host = QWidget()
@@ -1319,72 +1407,120 @@ class PlanFlightPanel(QWidget):
         self._fence_radius_spin.setValue(80.0)
         self._fence_radius_spin.setSuffix(" m")
         self._fence_radius_spin.setToolTip("How far from its home point the drone may fly.")
-        self._fence_alt_spin = QDoubleSpinBox()
-        self._fence_alt_spin.setObjectName("planFenceMaxHeight")
-        self._fence_alt_spin.setProperty("class", "planPatternSpin")
-        self._fence_alt_spin.setRange(5.0, 2000.0)
-        self._fence_alt_spin.setDecimals(0)
-        self._fence_alt_spin.setSingleStep(5.0)
-        self._fence_alt_spin.setValue(120.0)
-        self._fence_alt_spin.setSuffix(" m")
-        self._fence_alt_spin.setToolTip("How high above home the drone may climb.")
-        self._fence_action_combo = QComboBox()
-        self._fence_action_combo.setObjectName("planFenceAction")
-        self._fence_action_combo.addItem("Return to launch (RTL)", 1.0)
-        self._fence_action_combo.addItem("Land", 2.0)
-        self._fence_action_combo.addItem("Warn only", 0.0)
-        self._fence_action_combo.setToolTip("What the drone does when it reaches the fence.")
         g.addWidget(self._field_label("Radius"), 1, 0)
         g.addWidget(self._fence_radius_spin, 1, 1)
-        g.addWidget(self._field_label("Max height"), 2, 0)
-        g.addWidget(self._fence_alt_spin, 2, 1)
-        g.addWidget(self._field_label("On breach"), 3, 0)
-        g.addWidget(self._fence_action_combo, 3, 1)
-        upload = QPushButton("Upload fence")
-        upload.setObjectName("planFenceUpload")
-        upload.setProperty("class", "planGeoBtn")
-        upload.setCursor(Qt.CursorShape.PointingHandCursor)
-        upload.setToolTip("Send this fence to the drone on screen and switch it on.")
+        upload = self._geo_button(
+            "Upload circle fence", "planFenceUpload",
+            "Send this fence to the drone on screen and switch it on. It takes the place of a polygon fence.")
         upload.clicked.connect(lambda: self.action_requested.emit("fence_upload_circle"))
-        off = QPushButton("Switch fence off")
-        off.setObjectName("planFenceOff")
-        off.setProperty("class", "planGeoBtn")
-        off.setCursor(Qt.CursorShape.PointingHandCursor)
-        off.setToolTip("Switch the fence off on the drone on screen. Asks first.")
+        g.addWidget(upload, 2, 0, 1, 2)
+        return host
+
+    def _polygon_fence_section(self) -> QWidget:
+        host = QWidget()
+        g = QGridLayout(host)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        title = QLabel("Polygon fence")
+        title.setProperty("class", "planGeoTitle")
+        g.addWidget(title, 0, 0, 1, 2)
+        self._fence_draw_btn = self._geo_button(
+            "Draw on the map", "planFenceDraw",
+            "Click the map at each corner, in order around the area. Drag a corner to move it, "
+            "right-click a corner to remove it. Press again when the shape is done.")
+        self._fence_draw_btn.setCheckable(True)
+        self._fence_draw_btn.clicked.connect(
+            lambda on=False: self.action_requested.emit("fence_draw_on" if on else "fence_draw_off"))
+        g.addWidget(self._fence_draw_btn, 1, 0, 1, 2)
+        self._fence_undo_btn = self._geo_button("Remove last corner", "planFenceUndo", "Take back the corner added last.")
+        self._fence_undo_btn.clicked.connect(lambda: self.action_requested.emit("fence_undo"))
+        self._fence_clear_btn = self._geo_button(
+            "Clear polygon", "planFenceClear",
+            "Remove the polygon from the map. The fence on the drone stays as it is.")
+        self._fence_clear_btn.clicked.connect(lambda: self.action_requested.emit("fence_clear"))
+        g.addWidget(self._fence_undo_btn, 2, 0)
+        g.addWidget(self._fence_clear_btn, 2, 1)
+        self._fence_polygon_status = self._geo_note("")
+        self._fence_polygon_status.setObjectName("planFencePolygonStatus")
+        g.addWidget(self._fence_polygon_status, 3, 0, 1, 2)
+        self._fence_polygon_upload_btn = self._geo_button(
+            "Upload polygon fence", "planFencePolygonUpload",
+            "Send this polygon to the drone on screen and switch it on, with the max height and the "
+            "action above. It takes the place of the circle fence.")
+        self._fence_polygon_upload_btn.clicked.connect(lambda: self.action_requested.emit("fence_upload_polygon"))
+        g.addWidget(self._fence_polygon_upload_btn, 4, 0, 1, 2)
+        self.set_fence_polygon_state(NO_POLYGON_WORDS, can_upload=False, corners=0)
+        return host
+
+    def _fence_on_drone_section(self) -> QWidget:
+        host = QWidget()
+        g = QGridLayout(host)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        title = QLabel("The fence on the drone")
+        title.setProperty("class", "planGeoTitle")
+        g.addWidget(title, 0, 0, 1, 2)
+        read = self._geo_button(
+            "Read fence from drone", "planFenceDownload",
+            "Ask the drone on screen for its fence: whether it is on, its limits, and its polygon.")
+        read.clicked.connect(lambda: self.action_requested.emit("fence_download"))
+        off = self._geo_button("Switch fence off", "planFenceOff",
+                               "Switch the fence off on the drone on screen. Asks first.")
         off.clicked.connect(lambda: self.action_requested.emit("fence_disable"))
-        g.addWidget(upload, 4, 0, 1, 2)
-        g.addWidget(off, 5, 0, 1, 2)
-        self._geo_circle_status = QLabel("The drone reports the result in the message field at the top.")
-        self._geo_circle_status.setProperty("class", "planGeoStatus")
-        self._geo_circle_status.setWordWrap(True)
-        g.addWidget(self._geo_circle_status, 6, 0, 1, 2)
+        g.addWidget(read, 1, 0, 1, 2)
+        g.addWidget(off, 2, 0, 1, 2)
         return host
 
     def fence_settings(self) -> dict[str, float]:
-        """The circle fence as set in the Fence tab."""
+        """The circle fence as set in the Fence tab, with the max height and the action of both kinds."""
         return {
             "radius_m": float(self._fence_radius_spin.value()),
             "alt_max_m": float(self._fence_alt_spin.value()),
             "action": float(self._fence_action_combo.currentData()),
         }
 
-    def _geo_section(self, title: str, buttons: list[tuple[str, str, bool]]) -> QWidget:
-        host = QWidget()
-        v = QVBoxLayout(host)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(6)
-        lbl = QLabel(title)
-        lbl.setProperty("class", "planGeoTitle")
-        v.addWidget(lbl)
-        for label, action_id, enabled in buttons:
-            b = QPushButton(label)
-            b.setProperty("class", "planGeoBtn")
-            b.setEnabled(bool(enabled))
-            b.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ForbiddenCursor)
-            if action_id:
-                b.clicked.connect(lambda _c=False, a=action_id: self.action_requested.emit(a))
-            v.addWidget(b)
-        return host
+    def set_fence_settings(self, *, alt_max_m=None, action=None, radius_m=None) -> None:
+        """Show the limits read from the drone. A value the fields cannot hold is left out, not bent to fit."""
+        def fits(spin: QDoubleSpinBox, value) -> bool:
+            try:
+                return spin.minimum() <= float(value) <= spin.maximum()
+            except (TypeError, ValueError):
+                return False
+
+        if fits(self._fence_alt_spin, alt_max_m):
+            self._fence_alt_spin.setValue(float(alt_max_m))
+        if fits(self._fence_radius_spin, radius_m):
+            self._fence_radius_spin.setValue(float(radius_m))
+        try:
+            index = self._fence_action_combo.findData(float(action))
+        except (TypeError, ValueError):
+            index = -1
+        if index >= 0:
+            self._fence_action_combo.setCurrentIndex(index)
+
+    def set_fence_polygon_state(self, text: str, *, can_upload: bool, corners: int) -> None:
+        """What the polygon on the map is, and which of its buttons make sense now."""
+        self._fence_polygon_status.setText(str(text or ""))
+        self._fence_polygon_upload_btn.setEnabled(bool(can_upload))
+        self._fence_undo_btn.setEnabled(int(corners) > 0)
+        self._fence_clear_btn.setEnabled(int(corners) > 0)
+
+    def set_fence_drawing(self, on: bool) -> None:
+        """Show whether clicks on the map add fence corners now. Emits nothing."""
+        btn = self._fence_draw_btn
+        if btn.isChecked() != bool(on):
+            btn.blockSignals(True)
+            btn.setChecked(bool(on))
+            btn.blockSignals(False)
+        btn.setText("Drawing: click the map" if on else "Draw on the map")
+
+    def set_fence_result(self, ok, text: str) -> None:
+        """The drone's answer to a fence request. ok None: it is still on its way."""
+        colour = "#e8eaef" if ok is None else ("#b6f0c0" if ok else "#ffb0a0")
+        self._fence_result_label.setStyleSheet(self._fence_result_style(colour))
+        self._fence_result_label.setText(str(text or ""))
 
     def _build_rally_tab(self) -> QWidget:
         body = QFrame()

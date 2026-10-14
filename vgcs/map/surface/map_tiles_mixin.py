@@ -626,6 +626,7 @@ class MapTilesMixin:
         except Exception:
             pass
         self._native_map.user_waypoints_changed.connect(self._on_native_user_waypoints_changed)
+        self._native_map.user_fence_changed.connect(self._on_native_user_fence_changed)
         self._native_map.observation_map_click.connect(self._on_native_observation_map_click)
         self._native_map.map_point_inspected.connect(self._on_map_point_inspected)
         self._native_map.waypoint_picked.connect(self.select_waypoint_index)
@@ -799,7 +800,7 @@ class MapTilesMixin:
 
     def _enable_fence_polygon_mode(self) -> None:
         self._run_js("enableFencePolygon();")
-        self._set_status("Fence polygon mode: click map to add points")
+        self._set_status("Fence polygon: click the map to add a corner, drag a corner to move it")
 
     def _set_esri_street_tiles(self) -> None:
         self.activate_esri_street_tiles()
