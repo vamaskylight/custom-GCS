@@ -54,6 +54,23 @@ RTL_TERRAIN_CLEARANCE_M = 30.0
 # Fraction of endurance the round trip may consume before it is called tight.
 ENDURANCE_WARN_FRACTION = 0.8
 
+# The drone's flight time on one battery, in minutes, as the operator enters it
+# in Plan Flight (the Mission tab). Stored under this key. Until 2026-10-14
+# nothing on screen set it, so the check could only say it had no figure.
+FLIGHT_TIME_SETTING = "plan/endurance_min"
+FLIGHT_TIME_RANGE_MIN = (1.0, 300.0)
+
+
+def flight_time_from_setting(raw) -> float | None:
+    """The flight time (minutes) a stored setting holds, or None when it holds none that makes sense."""
+    try:
+        value = float(str(raw if raw is not None else "").strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if not FLIGHT_TIME_RANGE_MIN[0] <= value <= FLIGHT_TIME_RANGE_MIN[1]:
+        return None
+    return value
+
 # --- ArduCopter parameter values ------------------------------------------ #
 # FS_GCS_ENABLE / FS_THR_ENABLE: the actions that bring the aircraft home.
 # Anything else either lands it where it stands or does nothing at all.
@@ -139,6 +156,10 @@ def check_long_range_mission(
     if report.is_long_range:
         _check_failsafes(report, p)
         _check_rtl_altitude(report, p, home, pts, dem_elevation_fn)
+        _check_endurance(report, endurance_min, cruise_speed_mps, waypoints)
+    elif (_f(endurance_min) or 0.0) > 0.0:
+        # A flight time that was given holds for any mission: a short one can
+        # hover long (2026-10-14).
         _check_endurance(report, endurance_min, cruise_speed_mps, waypoints)
     return report
 
@@ -355,25 +376,39 @@ def _check_endurance(report, endurance_min, cruise_speed_mps, waypoints) -> None
     if speed is None or speed <= 0.0:
         report.unchecked.append("Flight time (no cruise speed available)")
         return
-    minutes = (report.round_trip_m / speed) / 60.0
+    flying = (report.round_trip_m / speed) / 60.0
+    # The hover at the waypoints counts too. Until 2026-10-14 it did not.
+    hovering = _planned_hover_s(waypoints) / 60.0
+    minutes = flying + hovering
+    how = f"at {speed:.1f} m/s" + (f", with {hovering:.0f} min of hovering" if hovering >= 0.5 else "")
     endur = _f(endurance_min)
     if endur is None or endur <= 0.0:
         report.warnings.append(
-            f"Round trip is {report.round_trip_m / 1000.0:.1f} km, about "
-            f"{minutes:.0f} min at {speed:.1f} m/s. Confirm the battery covers "
-            "that with reserve — VGCS has no endurance figure to check against."
+            f"Round trip is {report.round_trip_m / 1000.0:.1f} km, about {minutes:.0f} min {how}. "
+            "Confirm the battery covers that with reserve. VGCS has no flight time to check it against: "
+            "enter it in Plan Flight, Mission tab, \"Flight time on one battery (min)\"."
         )
         return
     if minutes > endur:
         report.errors.append(
-            f"Round trip needs about {minutes:.0f} min at {speed:.1f} m/s but "
-            f"endurance is {endur:.0f} min. The aircraft cannot get home."
+            f"Round trip needs about {minutes:.0f} min {how}, but the flight time on one battery is "
+            f"{endur:.0f} min. The aircraft cannot get home."
         )
     elif minutes > endur * ENDURANCE_WARN_FRACTION:
         report.warnings.append(
-            f"Round trip needs about {minutes:.0f} min of {endur:.0f} min "
-            "endurance — very little reserve for wind or a diversion."
+            f"Round trip needs about {minutes:.0f} min of the {endur:.0f} min flight time. "
+            "That leaves very little reserve for wind or a diversion."
         )
+
+
+def _planned_hover_s(waypoints) -> float:
+    """The hover time of all waypoints together, in seconds."""
+    total = 0.0
+    for wp in waypoints or []:
+        hover = _f(_attr(wp, "hover_s"))
+        if hover is not None and math.isfinite(hover) and hover > 0.0:
+            total += hover
+    return total
 
 
 # --------------------------------------------------------------------------- #

@@ -13,7 +13,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, Signal, QTimer
+from PySide6.QtCore import QSettings, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QMouseEvent, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from vgcs.mission import clamp_hover_seconds
 from vgcs.mission.fence import NO_POLYGON_WORDS
+from vgcs.mission.long_range_safety import FLIGHT_TIME_SETTING, flight_time_from_setting
 
 
 _TOOLS: tuple[tuple[str, str], ...] = (
@@ -996,6 +997,20 @@ class PlanFlightPanel(QWidget):
         self._initial_wp_speed.textChanged.connect(lambda _t: self._schedule_emit())
         self._initial_wp_speed.editingFinished.connect(self._show_initial_wp_values_in_use)
         tbv.addWidget(self._initial_wp_speed)
+        # The drone's flight time, for the mission check of Upload and Start
+        # Mission (vgcs/mission/long_range_safety.py). Until 2026-10-14 there was
+        # no place for it, and the check could only say that it had none.
+        tbv.addWidget(self._field_label("Flight time on one battery (min)"))
+        self._flight_time = self._unit_input("", "min")
+        self._flight_time.setPlaceholderText("not set")
+        self._flight_time.setObjectName("planFlightTime")
+        self._flight_time.setToolTip(
+            "From take-off until the battery failsafe acts, with the load you fly. "
+            "Upload and Start Mission check a mission against it. Empty: not checked."
+        )
+        self._flight_time.editingFinished.connect(self._save_flight_time)
+        tbv.addWidget(self._flight_time)
+        self._show_flight_time_in_use()
         tc.addWidget(self._takeoff_body)
         body_v.addWidget(self._takeoff_card)
 
@@ -2113,6 +2128,41 @@ class PlanFlightPanel(QWidget):
         # One decimal, rounded the way the map's boxes round, so this field and
         # the new waypoint's row show the same digits.
         return math.floor(alt * 10.0 + 0.5) / 10.0, math.floor(spd * 10.0 + 0.5) / 10.0
+
+    @staticmethod
+    def _flight_time_in_use() -> float | None:
+        """The flight time on one battery (minutes) the mission check uses, or None when it is not set."""
+        try:
+            return flight_time_from_setting(QSettings("VGCS", "VGCS").value(FLIGHT_TIME_SETTING, ""))
+        except Exception:
+            return None
+
+    def _save_flight_time(self) -> None:
+        """Leaving the field: a flight time is kept, an empty field or 0 is "not set", anything else is undone."""
+        text = self._flight_time.text().strip().replace(",", ".")
+        try:
+            settings = QSettings("VGCS", "VGCS")
+            if not text or self._float(text, -1.0) == 0.0:
+                settings.remove(FLIGHT_TIME_SETTING)
+            else:
+                value = flight_time_from_setting(text)
+                if value is not None:
+                    settings.setValue(FLIGHT_TIME_SETTING, f"{value:g}")
+            settings.sync()
+        except Exception:
+            pass
+        self._show_flight_time_in_use()
+
+    def _show_flight_time_in_use(self) -> None:
+        """The field shows the flight time in use: a word or a 500 does not stay on screen while nothing checks it."""
+        value = self._flight_time_in_use()
+        text = "" if value is None else f"{value:g}"
+        if self._flight_time.text() != text:
+            self._flight_time.blockSignals(True)
+            try:
+                self._flight_time.setText(text)
+            finally:
+                self._flight_time.blockSignals(False)
 
     def _show_initial_wp_values_in_use(self) -> None:
         """Once the operator leaves one of the two fields, it shows the value in

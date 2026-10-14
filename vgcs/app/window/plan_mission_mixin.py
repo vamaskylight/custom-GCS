@@ -301,12 +301,13 @@ class MainWindowPlanMissionMixin:
             return None
 
     def _plan_endurance_min(self):
+        """The flight time on one battery (minutes) entered in Plan Flight, or None."""
         try:
             from PySide6.QtCore import QSettings
 
-            raw = QSettings("VGCS", "VGCS").value("plan/endurance_min", "")
-            text = str(raw or "").strip()
-            return float(text) if text else None
+            from vgcs.mission.long_range_safety import FLIGHT_TIME_SETTING, flight_time_from_setting
+
+            return flight_time_from_setting(QSettings("VGCS", "VGCS").value(FLIGHT_TIME_SETTING, ""))
         except Exception:
             return None
 
