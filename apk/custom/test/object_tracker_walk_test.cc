@@ -539,6 +539,97 @@ Outcome walk(const std::vector<Rgb> &world, int kind, int place, const BoxOnFigu
     return out;
 }
 
+// A lock that starts away from the cross, as most locks in the app do (a tap on a mark, or a box
+// drawn anywhere). In every walk above with the camera turned by the tracker, the figure starts
+// under the cross. Here it starts offX points to the side (8 points are a degree) and walks on, and
+// the camera is turned to it as in walk(): it swings over, and the figure rushes across the picture
+// before the tracker knows how fast. Task Q, 2026-10-15.
+Outcome swingStart(const std::vector<Rgb> &world, int kind, int place, const BoxOnFigure &b, double offX)
+{
+    Outcome out;
+    ObjectTracker tracker;
+    Random grain(17);
+    Frame frame;
+    frame.reset(kind >= kThermal ? 1 : 3);
+    Figure f;
+    f.height = b.height;
+    dress(f, kind, place);
+    f.side = 1.0;
+    f.swing = 1.0;
+    const int noise = place % 2 ? 6 : 0;
+    const double camY = 100 + 40.0 * place;
+    double camX = 300 + 90.0 * place;
+    double figX = camX + kFrameW / 2.0 + offX;
+    const double figY = camY + 108.0;
+    const double speed = 0.057 * b.height;
+    const int total = 56;  // 4 s
+    struct State
+    {
+        double figX;
+        double camX;
+        Figure f;
+    };
+    std::deque<State> history;
+    std::deque<double> moves;
+    const int delay = 4;
+    for (int i = 0; i < total; ++i) {
+        if (i > 0) {
+            f.phase += 0.42;
+            figX += speed;
+        }
+        history.push_back(State{figX, camX, f});
+        if (static_cast<int>(history.size()) > delay + 1) {
+            history.pop_front();
+        }
+        const State &seen = history.front();
+        renderWorld(frame, world, seen.camX, camY);
+        drawFigure(frame, seen.f, seen.figX - seen.camX, figY - camY);
+        if (noise > 0) {
+            for (std::uint8_t &v : frame.data) {
+                v = static_cast<std::uint8_t>(std::clamp(static_cast<int>(v) + grain.below(2 * noise + 1) - noise, 0, 255));
+            }
+        }
+        const double wantX = seen.figX - seen.camX + b.dx;
+        const double wantY = figY - camY + b.dy;
+        if (i == 0) {
+            if (!tracker.start(frame.picture(), Box{wantX, wantY, b.boxW, b.boxH})) {
+                out.refused = true;
+                return out;
+            }
+            moves.push_back(0.0);
+            continue;
+        }
+        const Result r = tracker.update(frame.picture());
+        ++out.pictures;
+        out.lost += r.found ? 0 : 1;
+        out.endDx = std::abs(r.box.cx - wantX);
+        out.endDy = std::abs(r.box.cy - wantY);
+        out.outOfPicture = wantX < 0 || wantX > kFrameW;
+        if (i >= total - 8) {
+            out.foundLately += r.found ? 1 : 0;
+        }
+        // The camera, as in walk().
+        double turned = 0.0;
+        for (double m : moves) {
+            turned += m;
+        }
+        double move = 0.0;
+        if (r.found) {
+            const double offPoints = (r.box.cx - b.dx) - kFrameW / 2.0 - turned;
+            const double most = std::clamp(0.5 * b.boxW * kPicturesPerSecond, 80.0, 320.0) / kPicturesPerSecond;
+            if (std::abs(offPoints) > 4.0) {
+                move = std::clamp(2.5 * offPoints / kPicturesPerSecond, -most, most);
+            }
+        }
+        camX += move;
+        moves.push_back(move);
+        if (static_cast<int>(moves.size()) > 4) {
+            moves.pop_front();
+        }
+    }
+    return out;
+}
+
 struct Tally
 {
     int kept = 0;
@@ -665,6 +756,38 @@ int main(int argc, char **argv)
         check(all.kept >= all.cases - 2 && all.foundWhileHidden * 3 <= all.hiddenPictures,
               "a figure hidden next to something in its colours is mostly reported as not seen", detail);
     }
+    {
+        // Task Q: a lock that starts 9 degrees to either side of the cross, the figure walking on, and
+        // the camera swinging over to it (swingStart). Task Q's rules alone (a match away from where
+        // the figure should be must be firm, the colours may not pull the box away) kept 9 of these
+        // 24 walks, and 6 ended on something else. So the first pictures of a lock keep the old rules
+        // (the soft start). On the tracker bench, of 1152 such starts a walking figure was kept in
+        // 1082 (the tracker of build 9 1083, task Q's rules alone 637).
+        const BoxOnFigure *boxes[] = {&kMiddleWhole, &kMiddleBody};
+        int kept = 0;
+        int wrong = 0;
+        int cases = 0;
+        for (int kind : {kStandOut, kThermal}) {
+            for (const BoxOnFigure *b : boxes) {
+                for (int place = 0; place < 3; ++place) {
+                    for (double off : {-72.0, 72.0}) {
+                        const Outcome o = swingStart(worldFor(kind, place), kind, place, *b, off);
+                        const bool ok = o.kept(*b, false);
+                        ++cases;
+                        kept += ok ? 1 : 0;
+                        wrong += o.wrong(*b, false) ? 1 : 0;
+                        if (g_verbose) {
+                            std::printf("     swing     %-44s %+4.0f points %-44s place %d: %s (not found %3d of %3d, at the end %.1f across, %.1f down)\n",
+                                        kKindNames[kind], off, b->name, place, ok ? "good " : (o.wrong(*b, false) ? "WRONG" : "lost "), o.lost,
+                                        o.pictures, o.endDx, o.endDy);
+                        }
+                    }
+                }
+            }
+        }
+        std::snprintf(detail, sizeof detail, "(kept in %d of %d walks, %d ended on something else)", kept, cases, wrong);
+        check(kept == cases && wrong == 0, "a lock that starts away from the cross is kept while the camera swings over", detail);
+    }
 
     // Single walks of the bench, each of them decided by one rule of the tracker: good as the
     // tracker is, and not good with that rule taken out (the bench found them). They pin the
@@ -728,10 +851,10 @@ int main(int argc, char **argv)
          }},
         {"a sure layout is believed whatever the colours say",
          {
-             Walk{kShadow, kThermal, kStill, &kFarWhole, 3},
-             Walk{kShadow, kGreyDay, kFollowsExactly, &kMiddleBody, 4},
-             Walk{kCross, kStandOut, kFollowsExactly, &kMiddleBody, 5},
-             Walk{kWall, kGreyDay, kStill, &kNearWhole, 3},
+             Walk{kShadow, kThermal, kStill, &kFarWhole, 2},
+             Walk{kShadow, kGreyDay, kStill, &kMiddleBody, 0},
+             Walk{kLookalike, kGreyDay, kFollowsExactly, &kNearHeadAndChest, 5},
+             Walk{kWidePost, kGreyDay, kStill, &kMiddleTap, 1},
          }},
         {"the colours must find enough of the object to say it is there",
          {
@@ -763,17 +886,17 @@ int main(int argc, char **argv)
          }},
         {"away from where the object should be, sharp is not enough: the match must be firm",
          {
-             Walk{kCross, kGroundColours, kStill, &kMiddleWhole, 2},
-             Walk{kCross, kGreyDay, kFollowsExactly, &kMiddleWhole, 3},
-             Walk{kPost, kGreyDay, kFollowsExactly, &kMiddleWhole, 3},
-             Walk{kWidePost, kGreyDay, kFollowsExactly, &kMiddleWhole, 3},
+             Walk{kWidePost, kStandOut, kStill, &kMiddleWhole, 5},
+             Walk{kWidePost, kThermal, kStill, &kMiddleWhole, 3},
+             Walk{kShadow, kGroundColours, kStill, &kFarWhole, 1},
+             Walk{kWidePost, kGroundColours, kStill, &kNearTap, 3},
          }},
         {"after the first pictures a match must be firm",
          {
-             Walk{kCross, kGroundColours, kStill, &kMiddleWhole, 2},
-             Walk{kCross, kGreyDay, kFollowsExactly, &kMiddleWhole, 3},
-             Walk{kPost, kGreyDay, kFollowsExactly, &kMiddleWhole, 3},
-             Walk{kWidePost, kGreyDay, kFollowsExactly, &kMiddleWhole, 3},
+             Walk{kCross, kGreyDay, kStill, &kMiddleBody, 0},
+             Walk{kLookalike, kStandOut, kStill, &kMiddleBody, 3},
+             Walk{kLookalike, kGroundColours, kStill, &kMiddleBody, 1},
+             Walk{kLookalike, kThermal, kStill, &kFarWhole, 5},
          }},
         {"not seen: the box goes on as the object was moving",
          {
