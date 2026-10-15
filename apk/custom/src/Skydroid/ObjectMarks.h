@@ -115,8 +115,9 @@ public:
     /// grabMs: how long the screen took to get it, when it knows (the state line tells it).
     Q_INVOKABLE void picture(const QImage &image, double pictureX, double pictureY, double pictureW, double pictureH,
                              double grabMs = 0.0);
-    /// A tap at u, v of the video picture. When a mark is there, the lock is
-    /// started on its object and true comes back. False: no mark there.
+    /// A tap at u, v of the video picture. When a mark is there, a lock on its
+    /// object is asked for and true comes back (when the link cannot lock now,
+    /// its lock message says why). False: no mark there.
     Q_INVOKABLE bool lockAt(double u, double v);
     /// The licences of the network and of the library that runs it, to show in the app.
     Q_INVOKABLE QString notices() const;

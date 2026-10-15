@@ -630,6 +630,103 @@ Outcome swingStart(const std::vector<Rgb> &world, int kind, int place, const Box
     return out;
 }
 
+// A figure that stands under the cross for 3 s (42 pictures) and then turns to the side and walks
+// off, fast times the walk's speed, to the left (dir -1) or the right (+1), the camera turned to it as
+// in walk(). In the walks above the figure stands for 8 pictures only, inside the soft start of a lock.
+// Client videos 2026-10-15 23:13: a person locked while standing was lost when they walked off.
+Outcome standWalk(const std::vector<Rgb> &world, int kind, int place, const BoxOnFigure &b, double fast, int dir)
+{
+    Outcome out;
+    ObjectTracker tracker;
+    Random grain(17);
+    Frame frame;
+    frame.reset(kind >= kThermal ? 1 : 3);
+    Figure f;
+    f.height = b.height;
+    dress(f, kind, place);
+    const int noise = place % 2 ? 6 : 0;
+    const double camY = 100 + 40.0 * place;
+    double camX = 300 + 90.0 * place;
+    double figX = camX + kFrameW / 2.0;
+    const double figY = camY + 108.0;
+    const double speed = fast * 0.057 * b.height;
+    const int stand = 42;
+    const int turnPictures = 6;
+    const int total = stand + turnPictures + 42;
+    struct State
+    {
+        double figX;
+        double camX;
+        Figure f;
+    };
+    std::deque<State> history;
+    std::deque<double> moves;
+    const int delay = 4;
+    for (int i = 0; i < total; ++i) {
+        double moving = 0.0;
+        if (i >= stand && i < stand + turnPictures) {
+            f.side = (i - stand + 1) / static_cast<double>(turnPictures);
+            moving = f.side;
+        } else if (i >= stand + turnPictures) {
+            f.side = 1.0;
+            moving = 1.0;
+        }
+        f.swing = moving;
+        f.phase += 0.42 * moving;
+        figX += dir * speed * moving;
+        history.push_back(State{figX, camX, f});
+        if (static_cast<int>(history.size()) > delay + 1) {
+            history.pop_front();
+        }
+        const State &seen = history.front();
+        renderWorld(frame, world, seen.camX, camY);
+        drawFigure(frame, seen.f, seen.figX - seen.camX, figY - camY);
+        if (noise > 0) {
+            for (std::uint8_t &v : frame.data) {
+                v = static_cast<std::uint8_t>(std::clamp(static_cast<int>(v) + grain.below(2 * noise + 1) - noise, 0, 255));
+            }
+        }
+        const double wantX = seen.figX - seen.camX + b.dx;
+        const double wantY = figY - camY + b.dy;
+        if (i == 0) {
+            if (!tracker.start(frame.picture(), Box{wantX, wantY, b.boxW, b.boxH})) {
+                out.refused = true;
+                return out;
+            }
+            moves.push_back(0.0);
+            continue;
+        }
+        const Result r = tracker.update(frame.picture());
+        ++out.pictures;
+        out.lost += r.found ? 0 : 1;
+        out.endDx = std::abs(r.box.cx - wantX);
+        out.endDy = std::abs(r.box.cy - wantY);
+        out.outOfPicture = wantX < 0 || wantX > kFrameW;
+        if (i >= total - 8) {
+            out.foundLately += r.found ? 1 : 0;
+        }
+        // The camera, as in walk().
+        double turned = 0.0;
+        for (double m : moves) {
+            turned += m;
+        }
+        double move = 0.0;
+        if (r.found) {
+            const double offPoints = (r.box.cx - b.dx) - kFrameW / 2.0 - turned;
+            const double most = std::clamp(0.5 * b.boxW * kPicturesPerSecond, 80.0, 320.0) / kPicturesPerSecond;
+            if (std::abs(offPoints) > 4.0) {
+                move = std::clamp(2.5 * offPoints / kPicturesPerSecond, -most, most);
+            }
+        }
+        camX += move;
+        moves.push_back(move);
+        if (static_cast<int>(moves.size()) > 4) {
+            moves.pop_front();
+        }
+    }
+    return out;
+}
+
 struct Tally
 {
     int kept = 0;
@@ -788,11 +885,60 @@ int main(int argc, char **argv)
         std::snprintf(detail, sizeof detail, "(kept in %d of %d walks, %d ended on something else)", kept, cases, wrong);
         check(kept == cases && wrong == 0, "a lock that starts away from the cross is kept while the camera swings over", detail);
     }
+    {
+        // A figure that stood under the cross for 3 s and walks off (standWalk; client videos of
+        // 2026-10-15 23:13). Matches that are not firm may then lie further ahead while the figure
+        // speeds up. The first 16 walks were lost by the tracker of test build 10 (task Q's rules
+        // refused the walking figure's weak matches a fifth of a box ahead of the guess), the last 8
+        // were kept by both. On the bench, of 1152 such walks 966 were kept (build 10: 924).
+        struct StandWalk
+        {
+            int kind;
+            const BoxOnFigure *box;
+            int place;
+            double fast;
+            int dir;
+        };
+        const StandWalk walks[] = {
+            {kStandOut, &kNearHeadAndChest, 0, 2.2, -1}, {kStandOut, &kNearHeadAndChest, 0, 2.2, +1},
+            {kStandOut, &kNearHeadAndChest, 5, 2.2, -1}, {kStandOut, &kNearWhole, 3, 1.6, -1},
+            {kStandOut, &kNearWhole, 3, 2.2, -1},        {kStandOut, &kMiddleWhole, 1, 2.2, +1},
+            {kStandOut, &kMiddleBody, 0, 1.6, +1},       {kStandOut, &kMiddleBody, 1, 1.6, -1},
+            {kStandOut, &kMiddleBody, 1, 2.2, -1},       {kStandOut, &kMiddleBody, 3, 2.2, -1},
+            {kStandOut, &kMiddleBody, 3, 2.2, +1},       {kStandOut, &kNearTap, 5, 2.2, +1},
+            {kThermal, &kMiddleBody, 0, 2.2, -1},        {kThermal, &kMiddleBody, 1, 2.2, -1},
+            {kThermal, &kNearTap, 1, 2.2, -1},           {kThermal, &kNearTap, 2, 2.2, -1},
+            // Kept by both trackers.
+            {kStandOut, &kMiddleWhole, 0, 1.6, +1},      {kStandOut, &kMiddleTap, 3, 1.6, -1},
+            {kThermal, &kNearHeadAndChest, 4, 1.6, -1},  {kThermal, &kNearWhole, 1, 1.0, +1},
+            {kThermal, &kNearWhole, 2, 1.6, +1},         {kThermal, &kFarWhole, 0, 1.0, -1},
+            {kThermal, &kFarWhole, 1, 1.6, +1},          {kThermal, &kFarWhole, 5, 1.6, +1},
+        };
+        int kept = 0;
+        int wrong = 0;
+        int cases = 0;
+        for (const StandWalk &w : walks) {
+            const Outcome o = standWalk(worldFor(w.kind, w.place), w.kind, w.place, *w.box, w.fast, w.dir);
+            const bool ok = o.kept(*w.box, false);
+            ++cases;
+            kept += ok ? 1 : 0;
+            wrong += o.wrong(*w.box, false) ? 1 : 0;
+            if (g_verbose) {
+                std::printf("     stand     %-44s %s %.1f %+d %-44s place %d: %s (not found %3d of %3d, at the end %.1f across, %.1f down)\n",
+                            kKindNames[w.kind], "speed", w.fast, w.dir, w.box->name, w.place,
+                            ok ? "good " : (o.wrong(*w.box, false) ? "WRONG" : "lost "), o.lost, o.pictures, o.endDx, o.endDy);
+            }
+        }
+        std::snprintf(detail, sizeof detail, "(kept in %d of %d walks, %d ended on something else)", kept, cases, wrong);
+        check(kept == cases && wrong == 0, "a figure that stood and walks off is kept", detail);
+    }
 
     // Single walks of the bench, each of them decided by one rule of the tracker: good as the
     // tracker is, and not good with that rule taken out (the bench found them). They pin the
-    // rules that the sums above do not need. Chosen on 2026-10-09, and on 2026-10-15 for the rules
-    // that the careful lock (task Q) changed or added.
+    // rules that the sums above do not need. Chosen on 2026-10-09, on 2026-10-15 for the rules
+    // that the careful lock (task Q) changed or added, and on 2026-10-16 for the reach that grows
+    // ahead while the object speeds up (and for "a sure match with other colours", whose walks
+    // that change turned).
     struct Rule
     {
         const char *name;
@@ -830,10 +976,10 @@ int main(int argc, char **argv)
          }},
         {"a sure match with other colours: the light changed, the colours are learned anew fast",
          {
-             Walk{kShadow, kThermal, kStill, &kFarWhole, 2},
+             Walk{kLookalike, kThermal, kStill, &kNearHeadAndChest, 5},
+             Walk{kShadow, kThermal, kStill, &kMiddleWhole, 4},
              Walk{kShadow, kGreyDay, kStill, &kMiddleBody, 0},
-             Walk{kWall, kStandOut, kFollowsExactly, &kNearHeadAndChest, 5},
-             Walk{kWidePost, kGreyDay, kStill, &kMiddleTap, 1},
+             Walk{kLookalike, kGreyDay, kFollowsExactly, &kNearHeadAndChest, 5},
          }},
         {"a colour is spread to its neighbours in the table",
          {
@@ -890,6 +1036,41 @@ int main(int argc, char **argv)
              Walk{kWidePost, kThermal, kStill, &kMiddleWhole, 3},
              Walk{kShadow, kGroundColours, kStill, &kFarWhole, 1},
              Walk{kWidePost, kGroundColours, kStill, &kNearTap, 3},
+         }},
+        {"while the object speeds up, a match that is not firm may lie further ahead",
+         {
+             Walk{kCross, kStandOut, kStill, &kMiddleBody, 5},
+             Walk{kCross, kGreyDay, kStill, &kMiddleBody, 5},
+             Walk{kPost, kStandOut, kStill, &kMiddleBody, 5},
+             Walk{kPost, kGreyDay, kStill, &kMiddleBody, 5},
+         }},
+        {"the reach grows only while the object is seen",
+         {
+             Walk{kLookalike, kStandOut, kFollowsExactly, &kNearWhole, 3},
+             Walk{kLookalike, kGreyDay, kFollowsExactly, &kMiddleWhole, 2},
+             Walk{kWall, kGroundColours, kFollowsExactly, &kNearHeadAndChest, 0},
+             Walk{kLookalike, kStandOut, kFollowsExactly, &kMiddleTap, 5},
+         }},
+        {"the reach grows by the speeding up, not by the whole speed",
+         {
+             Walk{kShadow, kStandOut, kStill, &kFarWhole, 5},
+             Walk{kWall, kGreyDay, kStill, &kNearWhole, 4},
+             Walk{kLookalike, kStandOut, kStill, &kNearHeadAndChest, 5},
+             Walk{kShadow, kThermal, kFollowsExactly, &kNearWhole, 0},
+         }},
+        {"the reach grows only ahead, where the object goes",
+         {
+             Walk{kCross, kGroundColours, kStill, &kNearWhole, 3},
+             Walk{kLookalike, kStandOut, kStill, &kMiddleWhole, 4},
+             Walk{kLookalike, kGreyDay, kStill, &kMiddleBody, 3},
+             Walk{kPost, kGroundColours, kStill, &kNearWhole, 3},
+         }},
+        {"the slow speed follows the speed",
+         {
+             Walk{kShadow, kStandOut, kStill, &kFarWhole, 5},
+             Walk{kWall, kGreyDay, kStill, &kNearWhole, 4},
+             Walk{kLookalike, kStandOut, kStill, &kNearHeadAndChest, 5},
+             Walk{kShadow, kThermal, kFollowsExactly, &kNearWhole, 0},
          }},
         {"after the first pictures a match must be firm",
          {

@@ -10,6 +10,8 @@ mode is checked against VGCS's colour table. Then it opens Application Settings
 by QGC's own address and checks the VAMA copy of AppSettings.qml (VAMA mark on
 General, no Help page). Prints every QML warning and check, and saves
 screenshots (1_main.png to 17_app_settings.png) in -OutDir.
+With -Touch every press, move and release is a touch of one finger, as on the
+remote control, instead of a mouse.
 Needs the Qt 6.11.1 MinGW kit and MinGW 13.1, like run_link_test.ps1.
 
 .EXAMPLE
@@ -21,10 +23,12 @@ param(
     [string]$MinGW = 'C:\Qt\Tools\mingw1310_64',
     [string]$AndroidSdk = (Join-Path $env:LOCALAPPDATA 'Android\Sdk'),
     [string]$BuildDir = (Join-Path $env:TEMP 'vama-preview-build'),
-    [string]$OutDir = (Join-Path $env:TEMP 'vama-preview')
+    [string]$OutDir = (Join-Path $env:TEMP 'vama-preview'),
+    [switch]$Touch
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Touch) { $env:VAMA_PREVIEW_TOUCH = '1' } else { Remove-Item Env:VAMA_PREVIEW_TOUCH -ErrorAction SilentlyContinue }
 
 function Invoke-Native([string]$Exe, [string[]]$Arguments) {
     $saved = $ErrorActionPreference

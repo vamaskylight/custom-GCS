@@ -91,6 +91,7 @@ struct Result
     Box box;             // where it is (where it was last seen when not found)
     double psr = 0.0;    // how sharp the match is
     double alike = 0.0;  // how much of the box has the object's colours: 1 as lately, 0 none (1 when the colours do not tell)
+    bool starting = false;  // one of the first pictures of a lock: the rules of before task Q held
 };
 
 class ObjectTracker
@@ -119,6 +120,10 @@ public:
     bool start(const std::uint8_t *gray, int width, int height, int stride, const Box &box);
     Result update(const std::uint8_t *gray, int width, int height, int stride);
     void stop();
+    /// The pictures so far were played back (a lock on a mark found in an older picture, followed
+    /// through the pictures since). The camera swings over to the object only now, so the first
+    /// pictures' rules hold again from the next picture: the play-back must not use them up.
+    void settleAgain();
 
     bool active() const { return _active; }
     const Box &box() const { return _box; }
@@ -166,6 +171,8 @@ private:
     Box _box;
     double _vx = 0.0;  // how far the object moved per picture, lately
     double _vy = 0.0;
+    double _calmX = 0.0;  // the same, slowly: a speed above it is a start, or a speeding up
+    double _calmY = 0.0;
     double _seenX = 0.0;  // where the object was last seen
     double _seenY = 0.0;
     int _missed = 0;

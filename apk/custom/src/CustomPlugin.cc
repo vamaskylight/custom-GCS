@@ -5,6 +5,7 @@
 #include "QGCMAVLink.h"
 #include "AppSettings.h"
 #include "APMMavlinkStreamRateSettings.h"
+#include "FlightMapSettings.h"
 #include "SettingsManager.h"
 #include "Viewer3DSettings.h"
 
@@ -113,6 +114,16 @@ void CustomPlugin::adjustSettingMetaData(const QString& settingsGroup, FactMetaD
         // or more. So the scene is dropped when the operator goes back to the map.
         if (metaData.name() == Viewer3DSettings::keepSceneAliveName) {
             metaData.setRawDefaultValue(false);
+            return;
+        }
+    } else if (settingsGroup == FlightMapSettings::settingsGroup) {
+        // VAMA (client video and photos 2026-10-14, task R): QGC's default map, Bing, has
+        // no detail past zoom 18 at the client's place (19 is soft, 20 and up have no
+        // picture), so the map and the 3D view's ground looked blurred. Google has zoom 20
+        // there. Only the default changes: a map the operator chose stays chosen (QGC saves
+        // a setting only when it is changed). The map type stays QGC's "Hybrid".
+        if (metaData.name() == FlightMapSettings::mapProviderName) {
+            metaData.setRawDefaultValue(QStringLiteral("Google"));
             return;
         }
     }

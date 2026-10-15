@@ -32,6 +32,7 @@
 //   25_mark_locked.png    after a tap on the walker's mark: locked, the box on the walker
 //   26_marks_setting.png  the switch for the marks in the camera settings
 //   27_notices.png        the licences of the object finder, as the app shows them
+//   28_picking_stopped.png the lock button pressed again while it waits: the lock box says nothing was locked, and why
 //   17_app_settings.png   Application Settings: the VAMA mark on General, no Help page
 //   18_warnings_small.png QGC's "No GPS Lock" and pre-arm texts, small at the bottom while the video is the main view
 //   19_warnings_map.png   the same texts as QGC shows them, with the map as the main view
@@ -58,6 +59,7 @@
 #include <QtCore/QRegularExpression>
 #include <QtCore/QSettings>
 #include <QtCore/QThread>
+#include <QtCore/QEventLoop>
 #include <QtCore/QTimer>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QImage>
@@ -69,6 +71,7 @@
 #include <QtQml/QQmlContext>
 #include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
+#include <QtTest/QTest>
 
 #include <algorithm>
 #include <cmath>
@@ -100,6 +103,11 @@ int g_problems = 0;
 void messageHandler(QtMsgType type, const QMessageLogContext &, const QString &message)
 {
     std::fprintf(stderr, "%s\n", qPrintable(message));
+    // Windows says this when another program holds the clipboard at that moment: about the PC,
+    // not the app (it cost one run of six a problem, 2026-10-15).
+    if (message == QLatin1String("Retrying to obtain clipboard.")) {
+        return;
+    }
     if (type != QtDebugMsg && type != QtInfoMsg) {
         ++g_problems;
     }
@@ -362,6 +370,10 @@ signals:
 private slots:
     void _move()
     {
+        // At most 0.2 s a tick: on a busy PC this stand-in world slows down with the app, so the
+        // preview checks what the app does, not how it fares when it gets too little of the CPU.
+        // (Counted in full, 2026-10-15: with 12 busy processes the stand-in camera swung at full
+        // speed while the app got few pictures, and mark locks were lost in 4 of 6 runs.)
         const double seconds = std::min(0.2, _clock.restart() / 1000.0);
         if (yawRate != 0.0 || pitchRate != 0.0) {
             _yaw = std::clamp(_yaw - yawRate * seconds, -90.0, 90.0);  // right is a smaller yaw
@@ -696,7 +708,21 @@ int main(int argc, char *argv[])
         image.save(path);
         std::fprintf(stderr, "saved %s\n", qPrintable(path));
     };
+    // With VAMA_PREVIEW_TOUCH set (run_preview.ps1 -Touch), every press, move and release is a
+    // touch of one finger, as on the remote control, through Qt's own touch path. (Client video
+    // 2026-10-15, a tap on a mark that locked nothing: every check passed with touches too.)
+    QPointingDevice *touchScreen = qEnvironmentVariableIsSet("VAMA_PREVIEW_TOUCH") ? QTest::createTouchDevice() : nullptr;
     auto mouse = [&](QEvent::Type type, QPointF pos) {
+        if (touchScreen) {
+            if (type == QEvent::MouseButtonPress) {
+                QTest::touchEvent(window, touchScreen).press(0, pos.toPoint(), window);
+            } else if (type == QEvent::MouseMove) {
+                QTest::touchEvent(window, touchScreen).move(0, pos.toPoint(), window);
+            } else {
+                QTest::touchEvent(window, touchScreen).release(0, pos.toPoint(), window);
+            }
+            return;
+        }
         const Qt::MouseButtons buttons = type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton;
         const Qt::MouseButton button = type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton;
         QMouseEvent event(type, pos, window->mapToGlobal(pos), button, buttons, Qt::NoModifier);
@@ -833,6 +859,79 @@ int main(int argc, char *argv[])
         mouse(QEvent::MouseButtonPress, centre);
         mouse(QEvent::MouseButtonRelease, centre);
     };
+    // Steps run on fixed timers, but the app works in real time: on a busy PC a picture, a
+    // grab or a turn of the stand-in camera comes later. waitFor lets events run (as QTest's
+    // qWaitFor does) until ready() is true, at most maxMs. It says whether ready() came true.
+    auto waitFor = [&](const std::function<bool()> &ready, int maxMs) -> bool {
+        QElapsedTimer waited;
+        waited.start();
+        while (!ready()) {
+            if (waited.elapsed() >= maxMs) {
+                return false;
+            }
+            QEventLoop slice;
+            QTimer::singleShot(20, &slice, &QEventLoop::quit);
+            slice.exec();
+        }
+        return true;
+    };
+    // The lock button toggles: with a lock on it stops it, without one it starts or ends
+    // picking (the hint shows while it picks). One press in the wrong state turned every press
+    // after it the other way: a whole run failed with 34 problems (2026-10-15). So each press
+    // says what it is for, finds the state it needs (and says so when a step before left
+    // another one), and waits for the result.
+    auto picking = [&]() {
+        QQuickItem *hint = findItem("vamaLockHint");
+        return hint && hint->isVisible();
+    };
+    auto lockState = [&]() {
+        return QStringLiteral("lock %1, busy %2, picking %3: %4")
+            .arg(link.lockActive()).arg(link.lockBusy()).arg(picking()).arg(link.lockMessage());
+    };
+    // Press the lock button to pick an object: no lock and no picking before, picking after.
+    auto pressLockToPick = [&](const char *what) {
+        if (link.lockActive() || link.lockBusy() || picking()) {
+            expect(false, what, QStringLiteral("before the press: ") + lockState());
+            link.stopLock();
+            if (picking()) {
+                tap("vamaLockButton");
+            }
+            waitFor([&]() { return !link.lockActive() && !link.lockBusy() && !picking(); }, 1000);
+        }
+        tap("vamaLockButton");
+        if (!waitFor(picking, 1000)) {
+            expect(false, what, QStringLiteral("after the press: ") + lockState());
+        }
+    };
+    // Press the lock button to stop the lock: a lock before, none after.
+    auto pressLockToStop = [&](const char *what) {
+        if (!link.lockActive() && !link.lockBusy()) {
+            expect(false, what, QStringLiteral("before the press, no lock: ") + lockState());
+            if (picking()) {
+                tap("vamaLockButton");
+            }
+            return;
+        }
+        tap("vamaLockButton");
+        if (!waitFor([&]() { return !link.lockActive() && !link.lockBusy(); }, 1000)) {
+            expect(false, what, QStringLiteral("after the press: ") + lockState());
+        }
+    };
+    // Press the lock button to end picking: picking before, none after.
+    auto pressLockToEndPicking = [&](const char *what) {
+        if (!picking() || link.lockActive() || link.lockBusy()) {
+            expect(false, what, QStringLiteral("before the press: ") + lockState());
+            link.stopLock();
+            if (picking()) {
+                tap("vamaLockButton");
+            }
+            return;
+        }
+        tap("vamaLockButton");
+        if (!waitFor([&]() { return !picking(); }, 1000)) {
+            expect(false, what, QStringLiteral("after the press: ") + lockState());
+        }
+    };
     // The video alone: everything over it hidden for the grab.
     auto grabVideo = [&]() {
         window->setProperty("videoOnly", true);
@@ -876,6 +975,7 @@ int main(int argc, char *argv[])
     QRectF walkerOnScreen;
     int speedsBefore = 0;
     QPointF slideFrom;  // where a finger went down that slides a little
+    QPointF lockButtonAt;  // the middle of the lock button, for a long press
 
     // The marks. Every item with this name that shows on the screen.
     auto findItems = [&](const char *objectName) -> QList<QQuickItem *> {
@@ -1100,7 +1200,7 @@ int main(int argc, char *argv[])
              camera.setPitch(3.0);
              // The walker stands 14 degrees right of where the camera looks, 4 below.
              camera.placeWalker(camera.lookRight() + 14.0, camera.pitch() - 4.0);
-             tap("vamaLockButton");
+             pressLockToPick("lock: the lock button starts picking");
          }},
         {400, [&]() {
              shot("11_lock_pick.png");
@@ -1195,7 +1295,7 @@ int main(int argc, char *argv[])
                     link.lockMode());
              camera.placeWalker(camera.lookRight() - 12.0, camera.pitch() - 2.0);
              anglesBeforeLock = camera.angleCommands;
-             tap("vamaLockButton");
+             pressLockToPick("camera's tracker: the lock button starts picking");
          }},
         {400, [&]() {
              walkerOnScreen = sceneRect("previewWalker");
@@ -1223,7 +1323,7 @@ int main(int argc, char *argv[])
              expect(line && line->property("text").toString().contains(QStringLiteral("(turned")),
                     "camera's tracker: how far it turned is on the screen", line ? line->property("text").toString() : QString());
              shot("15b_camera_tracker.png");
-             tap("vamaLockButton");
+             pressLockToStop("camera's tracker: the lock button stops the lock");
          }},
         {400, [&]() {
              expect(!link.lockActive() && camera.sumStops >= 1, "camera's tracker: stopped with SUM stop",
@@ -1256,7 +1356,7 @@ int main(int argc, char *argv[])
              telemetryTimer.start();
              QQuickItem *button = findItem("vamaFollowButton");
              expect(button && !button->isVisible(), "follow: no follow button without a lock", QString());
-             tap("vamaLockButton");
+             pressLockToPick("follow: the lock button starts picking");
          }},
         {500, [&]() {
              walkerOnScreen = sceneRect("previewWalker");
@@ -1392,7 +1492,7 @@ int main(int argc, char *argv[])
              QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaFollowPopup"));
              expect(popup && !popup->property("opened").toBool(), "follow: Cancel closes the window", QString());
              telemetry.heightM = 60.0;
-             tap("vamaLockButton");
+             pressLockToStop("follow: the lock button stops the lock");
          }},
         {400, [&]() {
              QQuickItem *button = findItem("vamaFollowButton");
@@ -1435,9 +1535,11 @@ int main(int argc, char *argv[])
              expect(marks.enabled() && marks.usable() && !marks.running() && marks.count() == 0,
                     "marks: the switch is on, and nothing is looked at before the lock button", marks.state());
              speedsBefore = camera.speedCommands;
-             tap("vamaLockButton");
+             pressLockToPick("marks: the lock button starts picking, with the marks");
          }},
         {1300, [&]() {
+             // The stand-in finder's looks take real time: on a busy PC the first marks come later.
+             waitFor([&]() { return marks.count() == 2 && findItems("vamaMark").size() == 2; }, 4000);
              const QList<QQuickItem *> shown = findItems("vamaMark");
              expect(marks.running() && marks.count() == 2 && shown.size() == 2,
                     "marks: after the lock button the walker and the car are marked",
@@ -1450,7 +1552,9 @@ int main(int argc, char *argv[])
                     "marks: the hint says to tap a marked object, or to draw a box", hintText);
              QQuickItem *state = findItem("vamaMarksState");
              const QString stateText = state ? state->property("text").toString() : QString();
-             expect(state && state->isVisible() && stateText.startsWith(QStringLiteral("Marked: 1 person, 1 vehicle. A look takes 0.3 s.")) &&
+             // A look of the stand-in finder takes about 0.3 s, more on a busy PC.
+             static const QRegularExpression lookLine(QStringLiteral("^Marked: 1 person, 1 vehicle\\. A look takes 0\\.\\d s\\."));
+             expect(state && state->isVisible() && lookLine.match(stateText).hasMatch() &&
                         stateText.contains(QStringLiteral("Getting a picture takes 0.")),
                     "marks: a line says what is marked, how long a look takes, and how long a picture takes to get", stateText);
              // This finder takes 0.12 s for a look of 640 x 384 points: the app looks closely at the
@@ -1505,7 +1609,7 @@ int main(int argc, char *argv[])
                     QStringLiteral("%1 x %2, walker %3 x %4").arg(lockedBox.width(), 0, 'f', 0).arg(lockedBox.height(), 0, 'f', 0)
                         .arg(walker.width(), 0, 'f', 0).arg(walker.height(), 0, 'f', 0));
              shot("25_mark_locked.png");
-             tap("vamaLockButton");  // the lock off again
+             pressLockToStop("marks: the lock button stops the lock on the mark");
          }},
         {400, [&]() {
              // A walker who walks, 8 degrees a second to the right: the mark shows where they were
@@ -1515,7 +1619,7 @@ int main(int argc, char *argv[])
              camera.setPitch(-40.0);
              camera.placeWalker(camera.lookRight() - 22.0, camera.pitch() - 5.0);
              camera.walkerSpeed = 8.0;
-             tap("vamaLockButton");
+             pressLockToPick("marks: the lock button starts picking for the walking walker");
          }},
         {1400, [&]() {
              const QRectF mark = markRect("person");
@@ -1528,23 +1632,30 @@ int main(int argc, char *argv[])
          }},
         {150, [&]() {
              // The box on the screen is where the app saw the walker in its last picture: within a
-             // walker's width of them. (A lock on the mark's old place would be 100 points behind and more.)
-             const QRectF box = sceneRect("vamaLockBox");
-             const QRectF walker = sceneRect("previewWalker");
-             expect(link.lockActive() && link.lockSeen() && !box.isEmpty() &&
-                        std::abs(box.center().x() - walker.center().x()) < walker.width(),
-                    "marks: a tap on that mark locks the walker where they are now", boxText());
+             // walker's width of them. (A lock on the mark's old place would be 100 points behind and
+             // more, and stay on the ground there.) On a busy PC that picture comes later, and the
+             // stand-in camera turns less than the app counts: the box is drawn ahead of the walker
+             // until the next pictures come (2 of 4 runs with the CPU loaded). So up to 1 s.
+             auto onWalker = [&]() {
+                 const QRectF box = sceneRect("vamaLockBox");
+                 const QRectF walker = sceneRect("previewWalker");
+                 return link.lockActive() && link.lockSeen() && !box.isEmpty() &&
+                        std::abs(box.center().x() - walker.center().x()) < walker.width();
+             };
+             waitFor(onWalker, 850);
+             expect(onWalker(), "marks: a tap on that mark locks the walker where they are now",
+                    boxText() + QStringLiteral("; ") + lockState() + QStringLiteral("; ") + link.lockNumbers());
          }},
         {1500, [&]() {
              expect(link.lockActive() && link.lockSeen() && boxOnWalker(), "marks: and the lock stays on the walking walker", boxText());
              camera.walkerSpeed = 0.0;
-             tap("vamaLockButton");
+             pressLockToStop("marks: the lock button stops the lock on the walking walker");
          }},
         {400, [&]() {
              // A finger that slides a little while it taps a mark still means the mark, not a
              // small box drawn over it. The walker stands 9 degrees right of the cross again.
              camera.placeWalker(camera.lookRight() + 9.0, camera.pitch() - 5.0);
-             tap("vamaLockButton");
+             pressLockToPick("marks: the lock button starts picking for the sliding tap");
          }},
         {1300, [&]() {
              slideFrom = sceneRect("previewWalker").center();
@@ -1559,11 +1670,11 @@ int main(int argc, char *argv[])
                     "marks: a tap that slides a little still locks the marked object, with the mark's box",
                     QStringLiteral("%1; box %2 x %3, walker %4 x %5").arg(boxText()).arg(lockedBox.width(), 0, 'f', 0)
                         .arg(lockedBox.height(), 0, 'f', 0).arg(walker.width(), 0, 'f', 0).arg(walker.height(), 0, 'f', 0));
-             tap("vamaLockButton");
+             pressLockToStop("marks: the lock button stops the lock of the sliding tap");
          }},
         {400, [&]() {
              // A tap beside every mark, while the button waits: the place is locked as before the marks.
-             tap("vamaLockButton");
+             pressLockToPick("marks: the lock button starts picking for a tap beside the marks");
          }},
         {900, [&]() {
              expect(marks.running() && marks.count() >= 1, "marks: marked again after the lock button", marks.state());
@@ -1575,7 +1686,7 @@ int main(int argc, char *argv[])
              expect(!marks.running() && (link.lockActive() || link.lockBusy() || link.lockMessage().contains(QStringLiteral("plain area"))),
                     "marks: a tap beside every mark locks the place tapped, as before", link.lockMessage());
              if (link.lockActive() || link.lockBusy()) {
-                 tap("vamaLockButton");
+                 pressLockToStop("marks: the lock button stops the lock on the place tapped");
              }
          }},
         {400, [&]() {
@@ -1631,7 +1742,7 @@ int main(int argc, char *argv[])
                  QMetaObject::invokeMethod(popup, "close");
              }
          }},
-        {400, [&]() { tap("vamaLockButton"); }},
+        {400, [&]() { pressLockToPick("marks: with the switch off the lock button still starts picking"); }},
         {900, [&]() {
              QQuickItem *hint = findItem("vamaLockHintText");
              const QString hintText = hint ? hint->property("text").toString() : QString();
@@ -1639,10 +1750,58 @@ int main(int argc, char *argv[])
              expect(!marks.running() && marks.count() == 0 && findItems("vamaMark").isEmpty() &&
                         hintText.startsWith(QStringLiteral("Draw a box around the object, or tap it.")) && state && !state->isVisible(),
                     "marks: with the switch off the lock button marks nothing, and the hint is the old one", hintText);
-             tap("vamaLockButton");  // picking off
+             pressLockToEndPicking("marks: the lock button ends picking");
              marks.setEnabled(true);
              camera.setCarVisible(false);
              camera.setWalkerVisible(false);
+         }},
+        {200, [&]() {
+             // Picking that ends without a lock says so in the lock box, with why and what the
+             // video got meanwhile. (Client video 2026-10-15: picking ended at a tap on a mark,
+             // nothing was locked, and the box still said "Lock stopped." of the lock before.)
+             QQuickItem *chip = findItem("vamaLockChip");
+             QQuickItem *chipText = findItem("vamaLockChipText");
+             const QString text = chipText ? chipText->property("text").toString() : QString();
+             expect(chip && chip->isVisible() &&
+                        text == QStringLiteral("No object locked: the lock button was pressed again. Touches on the video meanwhile: none."),
+                    "picking: when the lock button ends it, the lock box says no object was locked, and why", text);
+             shot("28_picking_stopped.png");
+             pressLockToPick("picking: the lock button starts it again");
+         }},
+        {300, [&]() {
+             // A touch on the video that the system cuts off (as Android does when another
+             // window takes the screen), then the map becomes the main view.
+             mouse(QEvent::MouseButtonPress, QPointF(700, 700));
+             if (QQuickItem *drag = findItem("vamaVideoDrag")) {
+                 drag->ungrabMouse();
+             }
+             window->setProperty("mapIsMain", true);
+         }},
+        {200, [&]() {
+             QQuickItem *chipText = findItem("vamaLockChipText");
+             const QString text = chipText ? chipText->property("text").toString() : QString();
+             expect(!picking() && text == QStringLiteral("No object locked: the video was no longer the main view. "
+                                                         "Touches on the video meanwhile: 1, the last one cut off by the system."),
+                    "picking: when the video is no longer the main view it ends, and the box says why and what the video got",
+                    text);
+             window->setProperty("mapIsMain", false);
+             mouse(QEvent::MouseButtonRelease, QPointF(700, 700));  // the finger lifts: nothing has it any more
+         }},
+        {300, [&]() {
+             pressLockToPick("picking: and again, for a long press on the lock button");
+             lockButtonAt = sceneRect("vamaLockButton").center();
+         }},
+        {300, [&]() { mouse(QEvent::MouseButtonPress, lockButtonAt); }},
+        {1300, [&]() { mouse(QEvent::MouseButtonRelease, lockButtonAt); }},
+        {200, [&]() {
+             // A press held this long is no tap: a finger resting on the button, or a touch the
+             // screen did not end, would end picking like this. The box says how long it was.
+             QQuickItem *chipText = findItem("vamaLockChipText");
+             const QString text = chipText ? chipText->property("text").toString() : QString();
+             static const QRegularExpression held(QStringLiteral(
+                 "^No object locked: the lock button was held down for [1-9]\\d*\\.\\d s\\. Touches on the video meanwhile: none\\.$"));
+             expect(!picking() && held.match(text).hasMatch(),
+                    "picking: a long press on the lock button ends it, and the box says how long the button was held", text);
          }},
         {300, [&]() {
              // A point from the picture, without the laser. It is chosen as the operator does, in

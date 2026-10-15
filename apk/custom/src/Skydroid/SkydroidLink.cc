@@ -1516,15 +1516,21 @@ void SkydroidLink::_clearMeasurement()
     emit targetChanged();
 }
 
-void SkydroidLink::lockAt(double u, double v)
+bool SkydroidLink::lockAt(double u, double v)
 {
-    lockAtBox(u, v, 0.0, 0.0);
+    return lockAtBox(u, v, 0.0, 0.0);
 }
 
-void SkydroidLink::lockAtBox(double u, double v, double w, double h)
+bool SkydroidLink::lockAtBox(double u, double v, double w, double h)
 {
-    if (_aimBusy || _lockBusy || !std::isfinite(u) || !std::isfinite(v) || !std::isfinite(w) || !std::isfinite(h)) {
-        return;
+    if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(w) || !std::isfinite(h) || _lockBusy) {
+        return false;  // (while a lock starts the lock button stops it, so no tap gets here then)
+    }
+    if (_aimBusy) {
+        // VAMA (client video 2026-10-15): the screen must say why a tap locked nothing.
+        // Before, this went back without a word, and the tap looked lost.
+        _setLockMessage(tr("The camera is still turning to the point you tapped. Lock again when it has stopped."));
+        return false;
     }
     const bool wasLocked = _lockActive;
     if (_lockActive) {
@@ -1532,11 +1538,10 @@ void SkydroidLink::lockAtBox(double u, double v, double w, double h)
     }
     if (!_socket) {
         _setLockMessage(tr("Camera link is off. Turn it on in the camera settings."));
-        return;
+        return false;
     }
     if (_lockMode == QStringLiteral("camera")) {
-        _lockByCamera(u, v, wasLocked);
-        return;
+        return _lockByCamera(u, v, wasLocked);
     }
     // A new object: the last measurement no longer applies.
     _clearMeasurement();
@@ -1566,13 +1571,14 @@ void SkydroidLink::lockAtBox(double u, double v, double w, double h)
     _lockTimer.start();
     emit lockBoxChanged();
     _setLockMessage(tr("Locking..."));
+    return true;
 }
 
-void SkydroidLink::_lockByCamera(double u, double v, bool wasLocked)
+bool SkydroidLink::_lockByCamera(double u, double v, bool wasLocked)
 {
     if (!_attitudeValid) {
         _setLockMessage(tr("No gimbal angles from the camera, so it cannot turn to the object."));
-        return;
+        return false;
     }
     // A new object: the last measurement no longer applies.
     _clearMeasurement();
@@ -1582,12 +1588,12 @@ void SkydroidLink::_lockByCamera(double u, double v, bool wasLocked)
     if (_setAimFor(u, v) >= kLockTurnFirstDeg) {
         _startTurn();
         _setLockMessage(tr("Turning to the object..."));
-        return;
+        return true;
     }
     // Near the centre already: lock where it was picked, without turning.
     if (!wasLocked) {
         _armLock(u, v);
-        return;
+        return true;
     }
     _setLockMessage(tr("Locking..."));
     QTimer::singleShot(kLockAfterStopMs, this, [this, u, v]() {
@@ -1595,6 +1601,7 @@ void SkydroidLink::_lockByCamera(double u, double v, bool wasLocked)
             _armLock(u, v);
         }
     });
+    return true;
 }
 
 void SkydroidLink::_armLock(double u, double v)
@@ -1785,11 +1792,8 @@ void SkydroidLink::keepPictures(bool keep)
     }
 }
 
-void SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 atMs)
+bool SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 atMs)
 {
-    if (_aimBusy || _lockBusy || !std::isfinite(u) || !std::isfinite(v) || !std::isfinite(w) || !std::isfinite(h)) {
-        return;
-    }
     // The kept picture of that moment.
     int from = -1;
     qint64 nearest = kFoundPictureGapMs + 1;
@@ -1802,9 +1806,11 @@ void SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 at
     }
     // Copies of the pictures since then (they share their bytes): a new lock may clear the kept ones.
     const std::vector<KeptPicture> since(from < 0 ? _kept.end() : _kept.begin() + from, _kept.end());
-    lockAtBox(u, v, w, h);
+    if (!lockAtBox(u, v, w, h)) {
+        return false;  // no lock now: the lock message says why
+    }
     if (since.empty() || !_lockByApp || !_lockBusy) {
-        return;  // mode "camera", no camera link, or no picture of that moment: locked as a drawn box is
+        return true;  // mode "camera", or no picture of that moment: locked as a drawn box is
     }
     // The tracker starts on the object where it was found, and follows it through the pictures
     // since, as it would have then. The camera is turned for the last of them only: the newest.
@@ -1812,11 +1818,16 @@ void SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 at
         const KeptPicture &kept = since[i];
         _trackPicture(kept.pixels, kept.left, kept.top, kept.width, kept.height, i + 1 == since.size());
     }
+    // The camera swings over to the object only now. The tracker's first pictures (task Q's soft
+    // start) are for that swing: the play-back, up to kKeepPicturesMost pictures, must not use
+    // them up. A slow finder (as on the remote control) makes the mark older and the play-back longer.
+    _tracker.settleAgain();
     if (_lockActive) {
         // The newest of them is the last picture that came: if none follows, the lock ends
         // as any lock does when the video stops (kLockNoPictureEndMs).
         _pictureAge.start();
     }
+    return true;
 }
 
 void SkydroidLink::_turnedSincePicture(double &yawDeg, double &pitchDeg) const
@@ -1951,7 +1962,9 @@ void SkydroidLink::_follow(const skydroid::track::Result &result, double left, d
                        .arg(_followPitchDps, 0, 'f', 1)
                        .arg(result.psr, 0, 'f', 0)
                        .arg(result.alike, 0, 'f', 2)
-                       .arg(_pictureRate, 0, 'f', 0);
+                       .arg(_pictureRate, 0, 'f', 0) +
+                   // The first pictures of a lock, with the tracker's rules of before task Q.
+                   (result.starting ? QStringLiteral(", lock start") : QString());
     emit lockBoxChanged();
     if (message != _lockMessage || wasSeen != _lockSeen) {
         _lockMessage = message;

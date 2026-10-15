@@ -735,6 +735,35 @@ int main(int argc, char **argv)
         std::snprintf(detail, sizeof detail, "(not the same in %d of 234 pictures)", differ);
         check(differ == 0, "a tracker started again follows a new object exactly as a new tracker does", detail);
     }
+    {
+        // A lock on a mark plays the pictures since the mark back first, and only then does the
+        // camera swing over to the object. settleAgain() gives that swing the lock's first
+        // pictures (task Q's soft start) again: the play-back must not use them up.
+        World own;
+        own.setObject(20, 40);
+        ObjectTracker tracker;
+        own.render(400, 200, 190, 110);
+        tracker.start(own.frame.data(), kFrameW, kFrameH, kFrameW, Box{190, 110, 20, 40});
+        int startingInPlayBack = 0;
+        for (int i = 0; i < 30; ++i) {
+            own.render(400, 200, 190, 110);
+            startingInPlayBack += tracker.update(own.frame.data(), kFrameW, kFrameH, kFrameW).starting ? 1 : 0;
+        }
+        tracker.settleAgain();
+        int startingAfter = 0;
+        bool lastStarting = true;
+        for (int i = 0; i < ObjectTracker::kSettlePictures + 1; ++i) {
+            own.render(400, 200, 190, 110);
+            const Result r = tracker.update(own.frame.data(), kFrameW, kFrameH, kFrameW);
+            startingAfter += r.starting ? 1 : 0;
+            lastStarting = r.starting;
+        }
+        char detail[120];
+        std::snprintf(detail, sizeof detail, "(first pictures: %d of the 30 played back, %d of the %d after settleAgain, the last %s)",
+                      startingInPlayBack, startingAfter, ObjectTracker::kSettlePictures + 1, lastStarting ? "too" : "not");
+        check(startingInPlayBack == ObjectTracker::kSettlePictures && startingAfter == ObjectTracker::kSettlePictures && !lastStarting,
+              "after a play-back, settleAgain gives the lock its first pictures again", detail);
+    }
 
     // How long one picture takes (told, not judged: the test PC is not the remote).
     {

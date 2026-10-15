@@ -37,6 +37,11 @@ constexpr int kShiftSteps = 8;         // how often the window is moved to the m
 constexpr double kShiftLeast = 0.25;   // of the object's colours as the box held them: with less in sight it is not there
 constexpr double kCoastKeep = 0.9;     // of its speed, each picture the object is not seen
 constexpr double kWeakReach = 0.2;     // of the box: a match that is not sharp is believed only this near where the object should be
+// While the object speeds up, that reach grows: a person who stood and starts to walk (client videos
+// 2026-10-15 23:13: the box fell behind such a person, turned red, and the lock ended). It grows by how much
+// the speed is above its slow average, so not at a steady speed.
+constexpr double kCalmRate = 0.1;      // how fast the slow speed follows the speed, each picture
+constexpr double kReachSpeedUp = 1.0;  // the reach grows by this much of the speed above the slow speed
 
 /// One colour of a point at a place between points, with the edge value outside the picture.
 inline float sampleBilinear(const Picture &p, int channel, double x, double y)
@@ -602,6 +607,7 @@ Result ObjectTracker::update(const Picture &picture)
         ++_pictures;
     }
     const bool settling = _pictures <= kSettlePictures;
+    result.starting = settling;
     const double firm = settling ? kPsrLearn : kPsrFirm;
     // A match that is not sharp is followed, but little is learned from it. An object that
     // turns keeps its new look, so the match gets sharp again; a wall that covers it does
@@ -612,14 +618,31 @@ Result ObjectTracker::update(const Picture &picture)
     float colourRate = 0.0f;
     double x = guessX;
     double y = guessY;
+    // How near the guess a match that is not firm must be: a fifth of the box, and more while the object
+    // is seen and speeds up, as a person who starts to walk (its next step is known less well). Not at a
+    // steady speed, and not after a picture without it: something in its colours further along its way is
+    // then likely not the object (the look-alike walks of the bench). On the bench a figure that stood 3 s
+    // and walked off was kept in 966 of 1152 walks (924 before), look-alike walks said NOT SEEN as they
+    // should in 297 of 576 (299 before), and the walks of a drawn box were kept in 1583 of 1800 (1572).
+    // The colours keep the fifth of a box: letting them pull as far too kept fewer look-alike walks.
+    const double speedUpX = _missed == 0 ? std::max(0.0, std::abs(_vx) - _calmX) : 0.0;
+    const double speedUpY = _missed == 0 ? std::max(0.0, std::abs(_vy) - _calmY) : 0.0;
+    const double reachX = kWeakReach * _box.w + kReachSpeedUp * speedUpX;
+    const double reachY = kWeakReach * _box.h + kReachSpeedUp * speedUpY;
     bool candidate = best.psr >= kPsrFound;
     if (candidate) {
         x = std::clamp(bestCx + best.dx * (_box.w * kPadding / N), 0.0, width - 1.0);
         y = std::clamp(bestCy + best.dy * (_box.h * kPadding / N), 0.0, height - 1.0);
         // Over ground that is not the object, the highest of the filter's answers lies
         // anywhere. So a match that is not firm counts only where the object should be
-        // (task Q: the tree the box jumped to matched 11).
-        const bool far = std::abs(x - guessX) > kWeakReach * _box.w || std::abs(y - guessY) > kWeakReach * _box.h;
+        // (task Q: the tree the box jumped to matched 11). The wider reach holds only ahead,
+        // where the object goes: a match beside it or behind it is not its next step. (Ahead and
+        // to the sides alike kept more walks that start, 986 of the 1152, but in the look-alike
+        // walks 282 said NOT SEEN as they should, and one more walk of the walk test's tree case
+        // ended on the patch. The developer chose this one, 2026-10-16.)
+        const double reachAheadX = (x - guessX) * _vx > 0.0 ? reachX : kWeakReach * _box.w;
+        const double reachAheadY = (y - guessY) * _vy > 0.0 ? reachY : kWeakReach * _box.h;
+        const bool far = std::abs(x - guessX) > reachAheadX || std::abs(y - guessY) > reachAheadY;
         if (far && best.psr < firm) {
             candidate = false;
             x = guessX;
@@ -678,6 +701,8 @@ Result ObjectTracker::update(const Picture &picture)
     if (found) {
         _vx = 0.5 * _vx + 0.5 * (x - _box.cx);
         _vy = 0.5 * _vy + 0.5 * (y - _box.cy);
+        _calmX = (1.0 - kCalmRate) * _calmX + kCalmRate * std::abs(_vx);
+        _calmY = (1.0 - kCalmRate) * _calmY + kCalmRate * std::abs(_vy);
         _box.cx = x;
         _box.cy = y;
         _seenX = x;
@@ -703,6 +728,8 @@ Result ObjectTracker::update(const Picture &picture)
         _box.cy = std::clamp(_box.cy + _vy, 0.0, height - 1.0);
         _vx *= kCoastKeep;
         _vy *= kCoastKeep;
+        _calmX *= kCoastKeep;
+        _calmY *= kCoastKeep;
     }
     result.found = found;
     result.box = _box;
@@ -715,6 +742,13 @@ void ObjectTracker::stop()
     _missed = 0;
     _vx = 0.0;
     _vy = 0.0;
+    _calmX = 0.0;
+    _calmY = 0.0;
+}
+
+void ObjectTracker::settleAgain()
+{
+    _pictures = 0;
 }
 
 } // namespace skydroid::track

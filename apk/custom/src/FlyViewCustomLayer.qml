@@ -59,6 +59,16 @@ Item {
     property bool  _lockPicking:   false
     property bool  _lockOn:        _link.lockActive || _link.lockBusy
     property string _lockHiddenMessage: ""
+    // Picking can stop without a lock. Then the lock message box says why, and how many
+    // touches the video got meanwhile, in place of the message of the lock before. (Client
+    // video 2026-10-15: picking stopped at a tap on a mark and nothing was locked, while the
+    // box went on saying "Lock stopped." of the lock before. The next video must show why.)
+    property string _pickingNote:   ""
+    property int    _pickTouches:   0   // presses on the video while picking
+    property string _pickLastTouch: ""  // the last of them, in words
+    // The lock message box: during a lock its state, else why picking stopped, or the last lock message.
+    readonly property string _lockChipText: _lockOn ? (_follow.active ? _follow.message : _lockStateText)
+                                                    : (_pickingNote !== "" ? _pickingNote : _link.lockMessage)
     // The lock state in one line. With the camera's own tracker the gimbal angles
     // are all the app has, so how far the camera has turned by itself is added.
     property string _lockStateText: _link.lockMessage +
@@ -124,6 +134,26 @@ Item {
         return Number(value).toFixed(decimals)
     }
 
+    function _startPicking() {
+        _pickingNote = ""
+        _pickTouches = 0
+        _pickLastTouch = ""
+        _lockPicking = true
+    }
+
+    // Picking stops, and no object is locked: say why. (A lock on the picked object
+    // ends picking in videoDrag, and the link's lock message says how that went.)
+    function _stopPicking(why) {
+        if (!_lockPicking) {
+            return
+        }
+        _lockPicking = false
+        const touches = _pickTouches === 0 ? qsTr("none")
+                                            : qsTr("%1, the last one %2").arg(_pickTouches).arg(_pickLastTouch)
+        _pickingNote = qsTr("No object locked: %1. Touches on the video meanwhile: %2.").arg(why).arg(touches)
+        console.log("VAMA lock: " + _pickingNote)
+    }
+
     // Round icon button. "repeat" keeps clicking while held (zoom).
     component IconButton: Item {
         id: button
@@ -132,6 +162,8 @@ Item {
         property color fill:   Qt.rgba(0, 0, 0, 0.55)
         property bool  repeat: false
         property real  size:   ScreenTools.defaultFontPixelHeight * 2.4
+        property real  heldMs: 0  // how long the press of the last click was held
+        property real  _pressedAt: 0
 
         signal clicked()
 
@@ -168,8 +200,8 @@ Item {
         MouseArea {
             id:           mouseArea
             anchors.fill: parent
-            onClicked:    { if (!button.repeat) button.clicked() }
-            onPressed:    { if (button.repeat) { button.clicked(); repeatTimer.interval = 400; repeatTimer.start() } }
+            onClicked:    { button.heldMs = Date.now() - button._pressedAt; if (!button.repeat) button.clicked() }
+            onPressed:    { button._pressedAt = Date.now(); if (button.repeat) { button.clicked(); repeatTimer.interval = 400; repeatTimer.start() } }
             onReleased:   repeatTimer.stop()
             onCanceled:   repeatTimer.stop()
         }
@@ -386,8 +418,13 @@ Item {
                 onClicked: {
                     if (_lockOn) {
                         _link.stopLock()
+                    } else if (_lockPicking) {
+                        // A long press is told: a finger resting on the button, or a touch that
+                        // the screen did not end, would stop picking just like this.
+                        _stopPicking(heldMs >= 1000 ? qsTr("the lock button was held down for %1 s").arg(_fmt(heldMs / 1000, 1))
+                                                    : qsTr("the lock button was pressed again"))
                     } else {
-                        _lockPicking = !_lockPicking
+                        _startPicking()
                     }
                 }
             }
@@ -596,7 +633,7 @@ Item {
         objectName:               "vamaLockChip"
         visible:                  _link.enabled && !_lockPicking &&
                                   (_lockOn ? !laserBox.visible
-                                           : (_link.lockMessage !== "" && _link.lockMessage !== _lockHiddenMessage))
+                                           : (_lockChipText !== "" && _lockChipText !== _lockHiddenMessage))
         anchors.horizontalCenter: parent.horizontalCenter
         y:                        laserBox.visible ? laserBox.y + laserBox.height + _margin
                                                    : parentToolInsets.topEdgeCenterInset + _margin
@@ -614,13 +651,14 @@ Item {
             spacing:          _margin / 3
 
             QGCLabel {
+                objectName:          "vamaLockChipText"
                 width:               parent.width
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode:            Text.WordWrap
                 color:               "white"
                 font.bold:           _link.lockActive
                 font.pointSize:      _lockOn ? ScreenTools.smallFontPointSize : ScreenTools.defaultFontPointSize
-                text:                _lockOn ? (_follow.active ? _follow.message : _lockStateText) : _link.lockMessage
+                text:                _lockChipText
             }
         }
 
@@ -631,7 +669,7 @@ Item {
                 if (_lockOn) {
                     _laserBoxHidden = false
                 } else {
-                    _lockHiddenMessage = _link.lockMessage
+                    _lockHiddenMessage = _lockChipText
                 }
             }
         }
@@ -759,6 +797,10 @@ Item {
             _pressY = mouse.y
             _dragging = false
             _moved = false
+            if (_root._lockPicking) {
+                _root._pickTouches += 1
+                _root._pickLastTouch = qsTr("still held down")
+            }
         }
         onPositionChanged: (mouse) => {
             if (!_dragging && (Math.abs(mouse.x - _pressX) > _startDistance || Math.abs(mouse.y - _pressY) > _startDistance)) {
@@ -780,6 +822,9 @@ Item {
             _link.setTouchMotion(d[0], d[1])
         }
         onReleased: {
+            if (_root._lockPicking) {
+                _root._pickLastTouch = _dragging ? qsTr("a slide") : qsTr("a tap")
+            }
             if (_dragging && lockBox.drawing) {
                 _dragging = false
                 lockBox.drawing = false
@@ -793,7 +838,12 @@ Item {
             }
             endDrag()
         }
-        onCanceled:      endDrag()
+        onCanceled: {
+            if (_root._lockPicking) {
+                _root._pickLastTouch = qsTr("cut off by the system")
+            }
+            endDrag()
+        }
         onEnabledChanged: if (!enabled) endDrag()
         // A tap turns the camera to that point and measures it. It waits for the
         // double-tap time first, so a double tap (full screen) never aims.
@@ -811,6 +861,9 @@ Item {
             tapTimer.restart()
         }
         onDoubleClicked: {
+            if (_root._lockPicking) {
+                _root._pickLastTouch = qsTr("a double tap")
+            }
             tapTimer.stop()
             if (Date.now() - _markLockedAt < 2 * Qt.styleHints.mouseDoubleClickInterval) {
                 return  // the second of two taps on a mark: the object is locked, the view stays as it is
@@ -1120,7 +1173,7 @@ Item {
     property bool _dragAvailable: _link.enabled && _videoIsMain
     on_DragAvailableChanged: {
         if (!_dragAvailable) {
-            _lockPicking = false  // picking needs the video
+            _stopPicking(qsTr("the video was no longer the main view"))  // picking needs the video
         }
         if (_dragAvailable && !_hintShown) {
             _hintShown = true
@@ -1132,6 +1185,7 @@ Item {
         if (_lockOn) {
             _laserBoxHidden = false
             _lockHiddenMessage = ""
+            _pickingNote = ""
         }
     }
 

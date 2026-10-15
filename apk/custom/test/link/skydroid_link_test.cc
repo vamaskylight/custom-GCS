@@ -3484,6 +3484,36 @@ private slots:
         QVERIFY(_link->lockWantsPictures());  // still kept, for the next mark
     }
 
+    void aLockOnAFoundObjectKeepsItsFirstPicturesForTheSwing()
+    {
+        // Task Q's soft start: the tracker's first pictures of a lock (20) keep its old rules
+        // while the camera swings over to the object. A lock on a mark first plays the pictures
+        // since the mark back (up to 40, here 30): that must not use the soft start up.
+        // (The object stands under the cross: no turn is asked, so the same picture again and
+        // again is no stopped video.)
+        _link->keepPictures(true);
+        qint64 foundAtMs = 0;
+        for (int i = 0; i < 30; ++i) {
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            if (i == 0) {
+                foundAtMs = _link->newestKeptPictureMs();
+            }
+            QTest::qWait(30);
+        }
+        _link->lockAtFound(0.5, 0.5, 0.06, 0.2, foundAtMs);
+        QVERIFY(_link->lockActive() && _link->lockByApp());
+        // The first picture after the play-back is one of the lock's first ones.
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY2(_link->lockSeen() && _link->lockNumbers().endsWith(", lock start"), qPrintable(_link->lockNumbers()));
+        // And the soft start ends after its 20 pictures, as on a drawn box.
+        for (int i = 1; i <= 20; ++i) {
+            QTest::qWait(30);
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        }
+        QVERIFY2(_link->lockSeen() && !_link->lockNumbers().contains("lock start"), qPrintable(_link->lockNumbers()));
+        _link->stopLock();
+    }
+
     void theSameBoxLockedAsADrawnOneMissesAnObjectThatWalkedOn()
     {
         // What lockAtFound is for. The box of a moment ago, on the newest picture, holds ground.
@@ -4214,6 +4244,113 @@ private slots:
         // The lock is on the walker, twelve pictures on.
         QVERIFY2(std::abs(_link->lockBoxU() - at(14)) < 0.015,
                  qPrintable(QString("box at %1, walker at %2").arg(_link->lockBoxU()).arg(at(14))));
+        _link->stopLock();
+    }
+
+    void aMarkLockWorksWhileTheCameraDoesNotAnswer()
+    {
+        // Client video 2026-10-15 20:18: "No camera reply" on the screen, a tap on a mark, and
+        // nothing locked. The app's own lock needs no answer from the camera: it locks the
+        // walker where they are now, as with a camera that answers.
+        using skydroid::find::Kind;
+        _camera->answerGac = false;
+        _withMarks();
+        _seen->sleepMs = 2;
+        _marks->setLooking(true);
+        const auto at = [](int i) { return 0.30 + 0.02 * i; };
+        for (int i = 0; i <= 14; ++i) {
+            _link->lockPicture(_picture(at(i), 0.5), 0.0, 0.0, 1.0, 1.0);
+            if (i == 2) {
+                _see({_thing(Kind::Person, at(2) * 1280.0, 360.0, 0.06 * 1280.0, 0.2 * 720.0)});
+                QVERIFY(_look());
+                QCOMPARE(_marks->count(), 1);
+            }
+            QTest::qWait(70);
+        }
+        QVERIFY(!_link->answering() && !_link->attitudeValid());
+        QVERIFY(_marks->lockAt(at(2), 0.5));
+        QVERIFY2(_link->lockActive() && _link->lockByApp() && _link->lockSeen(), qPrintable(_link->lockMessage()));
+        QVERIFY2(std::abs(_link->lockBoxU() - at(14)) < 0.015,
+                 qPrintable(QString("box at %1, walker at %2").arg(_link->lockBoxU()).arg(at(14))));
+        _link->stopLock();
+    }
+
+    void aMarkLocksAfterALockWithoutAReadingWasStopped()
+    {
+        // The rest of the screen in that video: "No laser reading" and "Lock stopped.". A lock
+        // measured the object under the cross with no reading and was stopped. Then the lock
+        // button again, and a tap on a mark: that locks.
+        using skydroid::find::Kind;
+        _camera->answerGac = false;
+        _withMarks();
+        _seen->sleepMs = 2;
+        const auto markTheCar = [this]() {
+            for (int i = 0; i <= 6; ++i) {
+                _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+                if (i == 2) {
+                    _see({_thing(Kind::Vehicle, 0.5 * 1280.0, 360.0, 0.06 * 1280.0, 0.2 * 720.0)});
+                    QVERIFY(_lookAgain());
+                }
+                QTest::qWait(70);
+            }
+        };
+        _marks->setLooking(true);
+        markTheCar();
+        QVERIFY(_marks->lockAt(0.5, 0.5));
+        _marks->setLooking(false);
+        QVERIFY2(_link->lockActive(), qPrintable(_link->lockMessage()));
+        // The object is under the cross: the laser measures it, and gets no reading.
+        for (int i = 0; i < 100 && !_link->laserMessage().startsWith("No laser reading."); ++i) {
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(70);
+        }
+        QVERIFY2(_link->laserMessage().startsWith("No laser reading."), qPrintable(_link->laserMessage()));
+        _link->stopLock();
+        QCOMPARE(_link->lockMessage(), QString("Lock stopped."));
+        QVERIFY(!_link->aimBusy() && !_link->lockBusy() && !_link->lockActive() && !_link->answering());
+        // The lock button again, and a tap on the mark.
+        _marks->setLooking(true);
+        markTheCar();
+        QVERIFY(_marks->lockAt(0.5, 0.5));
+        QVERIFY2(_link->lockActive() && _link->lockByApp(), qPrintable(_link->lockMessage()));
+        _link->stopLock();
+    }
+
+    void aLockThatCannotStartNowSaysWhy()
+    {
+        // While the camera turns to a point that was tapped, no lock can start. That went back
+        // without a word: a tap on a mark then ended picking and locked nothing, with no reason
+        // on the screen. Now the lock message says why, and the caller is told.
+        using skydroid::find::Kind;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        _withMarks();
+        _seen->sleepMs = 2;
+        _see({_thing(Kind::Person, 640.0, 360.0, 64.0, 144.0)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        _link->aimAndMeasure(0.75, 0.4);  // this camera does not turn yet: the aim goes on
+        QVERIFY(_link->aimBusy());
+        QVERIFY(!_link->lockAtBox(0.5, 0.5, 0.1, 0.1));
+        QVERIFY(!_link->lockBusy() && !_link->lockActive());
+        const QString why("The camera is still turning to the point you tapped. Lock again when it has stopped.");
+        QCOMPARE(_link->lockMessage(), why);
+        QVERIFY(!_link->lockAtFound(0.5, 0.5, 0.1, 0.2, _link->pictureClockMs()));
+        QVERIFY(!_link->lockBusy() && !_link->lockActive());
+        _link->stopLock();  // (no lock: changes nothing)
+        // A tap on the mark at that moment: the mark is there, so the tap is taken (the screen
+        // ends picking), and the lock message says why nothing was locked.
+        QVERIFY(_marks->lockAt(0.5, 0.5));
+        QVERIFY(!_link->lockBusy() && !_link->lockActive());
+        QCOMPARE(_link->lockMessage(), why);
+        // Numbers that are not numbers: no lock, and no new message.
+        QVERIFY(!_link->lockAtBox(std::nan(""), 0.5, 0.1, 0.1));
+        QCOMPARE(_link->lockMessage(), why);
+        // When the camera has turned and the aim is over, a tap on the mark locks.
+        _camera->followAngles = true;  // (the aim sends its angles once more)
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->aimBusy(), 5000);
+        QVERIFY(_lookAgain());  // a mark is shown some two seconds
+        QVERIFY(_marks->lockAt(0.5, 0.5));
+        QVERIFY2(_link->lockBusy() || _link->lockActive(), qPrintable(_link->lockMessage()));
         _link->stopLock();
     }
 

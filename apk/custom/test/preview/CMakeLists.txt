@@ -11,7 +11,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 Positioning Svg)
+# Test: QTest's touches, for a run with -Touch (run_preview.ps1).
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 Positioning Svg Test)
 
 set(CUSTOM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 set(QGC_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../../qgc-src/src)
@@ -51,5 +52,5 @@ target_compile_definitions(vama_preview PRIVATE
     VAMA_PREVIEW_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )
 target_link_libraries(vama_preview PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Positioning Qt6::Svg
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Positioning Qt6::Svg Qt6::Test
 )

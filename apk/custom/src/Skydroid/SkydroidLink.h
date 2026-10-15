@@ -356,9 +356,13 @@ public:
     ///    it (GOT, then SUM confirm).
     /// The object is measured with the laser every few seconds while it is
     /// under the cross. Moving the camera by hand ends the lock.
-    Q_INVOKABLE void lockAtBox(double u, double v, double w, double h);
+    /// True when a lock was started. False when none was: the lock message says
+    /// why (the camera is still turning to a point that was tapped, the camera
+    /// link is off, or in mode "camera" no gimbal angles). Also false, without a
+    /// word, while a lock is starting, and for numbers that are not numbers.
+    Q_INVOKABLE bool lockAtBox(double u, double v, double w, double h);
     /// The same with a box of the usual size (a tap).
-    Q_INVOKABLE void lockAt(double u, double v);
+    Q_INVOKABLE bool lockAt(double u, double v);
     /// While true, the last pictures given with lockPicture are kept (some two
     /// seconds of them, and lockWantsPictures is true), so that a lock can start
     /// on a picture of a moment ago. ObjectMarks turns this on while it marks objects.
@@ -372,7 +376,8 @@ public:
     /// clock: the box it had then, as for lockAtBox. In mode "app" the lock starts
     /// on the kept picture of that moment and goes through the pictures since.
     /// With no kept picture of that moment (and in mode "camera") this is lockAtBox.
-    void lockAtFound(double u, double v, double w, double h, qint64 atMs);
+    /// True when a lock was started, as for lockAtBox.
+    bool lockAtFound(double u, double v, double w, double h, qint64 atMs);
     Q_INVOKABLE void stopLock();
     /// A picture of the video for the lock (mode "app"), about 10 times a
     /// second while lockWantsPictures is true. The picture itself may be a
@@ -513,8 +518,8 @@ private:
     /// Where the aimed point is in the picture now, from the gimbal angles.
     void _aimPointInPicture(double &u, double &v) const;
     void _armLock(double u, double v);
-    /// Mode "camera": turn to the point, then GOT and SUM.
-    void _lockByCamera(double u, double v, bool wasLocked);
+    /// Mode "camera": turn to the point, then GOT and SUM. False without gimbal angles (the lock message says so).
+    bool _lockByCamera(double u, double v, bool wasLocked);
     /// Mode "app": one picture for the tracker (RGB888 or Grayscale8), with where the video
     /// picture is inside it, in points. It starts a lock that waits, or finds the object
     /// again. act false: the picture is an old one, and only the tracker learns from it.
