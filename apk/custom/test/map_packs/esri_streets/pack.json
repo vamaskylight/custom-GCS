@@ -1,0 +1,15 @@
+{
+  "format": "vgcs-tile-pack/1",
+  "template": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+  "source_id": "5f9ea9e9fd9c0ad1",
+  "zooms": [
+    15
+  ],
+  "bbox": [
+    20.442206755300035,
+    72.85956517290967,
+    20.449393244699962,
+    72.86723482709033
+  ],
+  "tiles": 4
+}

@@ -2,8 +2,9 @@
 .SYNOPSIS
 Builds and runs the host tests of the app's Qt code: the camera link with Follow Me
 and the marks on people and vehicles (real Qt code, fake camera, stand-in drone,
-stand-in network), the drone side of Follow Me (real MAVLink headers), and the object
-finder with its real network on pictures from the air.
+stand-in network), the drone side of Follow Me (real MAVLink headers), the object
+finder with its real network on pictures from the air, and the map packs from VGCS
+with QGC's own tile store code.
 
 .DESCRIPTION
 Needs the Qt 6.11.1 MinGW desktop kit (C:\Qt\6.11.1\mingw_64), MinGW 13.1
@@ -59,9 +60,10 @@ if ($code -ne 0) { Write-Host 'ERROR: build failed.' -ForegroundColor Red; exit 
 
 # QtTest output does not always reach a redirected console, so write it to a file.
 # follow_drone_test is there only when the MAVLink headers of an APK build were found,
-# marks_net_test only when the ncnn library was built for this PC.
+# marks_net_test only when the ncnn library was built for this PC, the two map pack tests
+# only when the QGC source is in apk/qgc-src.
 $failed = 0
-foreach ($test in 'skydroid_link_test', 'follow_drone_test', 'marks_net_test') {
+foreach ($test in 'skydroid_link_test', 'follow_drone_test', 'marks_net_test', 'map_pack_test', 'map_pack_loader_test') {
     $exe = Join-Path $build "$test.exe"
     if (-not (Test-Path -LiteralPath $exe)) {
         Write-Host "$test was not built (see the configure output)." -ForegroundColor Yellow

@@ -152,6 +152,10 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ObjectMarks.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ObjectMarksNet.cc
     ${VAMA_FINDER_SOURCE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Maps/MapPack.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Maps/MapPack.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Maps/MapPackLoader.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Maps/MapPackLoader.h
     CACHE INTERNAL "" FORCE
 )
 
@@ -168,6 +172,7 @@ set(CUSTOM_LIBRARIES
 set(CUSTOM_INCLUDE_DIRECTORIES
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Maps
     CACHE INTERNAL "" FORCE
 )
 

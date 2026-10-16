@@ -1,0 +1,15 @@
+{
+  "format": "vgcs-tile-pack/1",
+  "template": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+  "source_id": "cb86c922aac4256b",
+  "zooms": [
+    15
+  ],
+  "bbox": [
+    20.442206755300035,
+    72.85956517290967,
+    20.449393244699962,
+    72.86723482709033
+  ],
+  "tiles": 4
+}

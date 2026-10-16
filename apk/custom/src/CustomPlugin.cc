@@ -6,6 +6,7 @@
 #include "AppSettings.h"
 #include "APMMavlinkStreamRateSettings.h"
 #include "FlightMapSettings.h"
+#include "MapPackLoader.h"
 #include "SettingsManager.h"
 #include "Viewer3DSettings.h"
 
@@ -56,6 +57,11 @@ void CustomPlugin::init()
     // settings page on Android (Viewer3DSettings). It comes back here, so the 3D view
     // can be tried on the remote control. Its switch: see adjustSettingMetaData.
     SettingsManager::instance()->viewer3DSettings()->setUserVisible(true);
+
+    // VAMA (client 2026-10-15, task U): the map packs made by VGCS load by themselves, so the
+    // map shows the place on a remote control that is never online.
+    _mapPacks = new MapPackLoader(this);
+    _mapPacks->start();
 }
 
 void CustomPlugin::_advancedChanged(bool changed)

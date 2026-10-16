@@ -9,6 +9,7 @@
 class CustomOptions;
 class CustomPlugin;
 class CustomSettings;
+class MapPackLoader;
 class QQmlApplicationEngine;
 
 Q_DECLARE_LOGGING_CATEGORY(CustomLog)
@@ -61,7 +62,8 @@ public:
     // Overrides from QGCCorePlugin
 
     QGCOptions *options() final { return _options; }
-    /// Runs once the settings exist: shows QGC's 3D View settings page again on Android
+    /// Runs once the settings exist: shows QGC's 3D View settings page again on Android,
+    /// and loads the map packs from VGCS (MapPackLoader.h)
     void init() final;
     /// This allows you to override/hide QGC Application settings
     void adjustSettingMetaData(const QString &settingsGroup, FactMetaData &metaData, bool &userVisible) final;
@@ -80,6 +82,7 @@ private:
 
     CustomOptions *_options = nullptr;
     QQmlApplicationEngine *_qmlEngine = nullptr;
+    MapPackLoader *_mapPacks = nullptr;
     class CustomOverrideInterceptor *_urlInterceptor = nullptr;
     QVariantList _customSettingsList; // Not to be mixed up with QGCCorePlugin implementation
 };

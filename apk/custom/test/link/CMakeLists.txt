@@ -98,3 +98,60 @@ if(EXISTS "${MAVLINK_INCLUDE}/all/mavlink.h")
 else()
     message(WARNING "follow_drone_test is left out: no MAVLink headers in ${MAVLINK_INCLUDE}")
 endif()
+
+# The map packs (task U): the app's pack code, with QGC's own tile store code (the code the
+# app runs) from the QGC copy that apk/fetch_qgc.ps1 makes. Without that copy this test is
+# left out. map_stubs stands in for QGC's logging and for the bodies of its UrlFactory.
+set(QGC_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../../qgc-src" CACHE PATH "QGC's source (apk/qgc-src)")
+set(MAPS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src/Maps CACHE PATH "Folder with the map pack sources")
+if(EXISTS "${QGC_SRC}/src/QtLocationPlugin/QGCTileCacheDatabase.cpp")
+    find_package(Qt6 REQUIRED COMPONENTS Sql)
+    add_executable(map_pack_test
+        map_pack_test.cc
+        ${MAPS_SRC}/MapPack.cc
+        ${QGC_SRC}/src/QtLocationPlugin/QGCTileCacheDatabase.cpp
+        ${QGC_SRC}/src/Utilities/Database/QGCSqlHelper.cc
+        map_stubs/UrlFactory.cc
+    )
+    # map_stubs first: its QGCLoggingCategory.h is the one this test means.
+    target_include_directories(map_pack_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/map_stubs
+        ${MAPS_SRC}
+        ${QGC_SRC}/src/QtLocationPlugin
+        ${QGC_SRC}/src/Utilities/Database
+    )
+    target_compile_definitions(map_pack_test PRIVATE
+        VAMA_MAP_PACKS="${CMAKE_CURRENT_SOURCE_DIR}/../map_packs"
+        VAMA_QGC_SRC="${QGC_SRC}"
+    )
+    target_link_libraries(map_pack_test PRIVATE Qt6::Core Qt6::Sql Qt6::Test)
+
+    # What the app does at its start with the packs it finds (MapPackLoader), with stand-ins for
+    # the QGC parts it talks to: the map engine runs the tasks against QGC's real tile store.
+    add_executable(map_pack_loader_test
+        map_pack_loader_test.cc
+        ${MAPS_SRC}/MapPack.cc
+        ${MAPS_SRC}/MapPackLoader.cc
+        ${MAPS_SRC}/MapPackLoader.h
+        ${QGC_SRC}/src/QtLocationPlugin/QGCTileCacheDatabase.cpp
+        ${QGC_SRC}/src/Utilities/Database/QGCSqlHelper.cc
+        # QGC's map tasks, listed so AUTOMOC sees them. Their two destructors are in the stand-in.
+        ${QGC_SRC}/src/QtLocationPlugin/QGCMapTaskBase.h
+        ${QGC_SRC}/src/QtLocationPlugin/QGCMapTasks.h
+        map_stubs/QGCMapTasksStub.cc
+        map_stubs/QGCMapEngine.cc
+        map_stubs/UrlFactory.cc
+    )
+    target_include_directories(map_pack_loader_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/map_stubs
+        ${MAPS_SRC}
+        ${QGC_SRC}/src/QtLocationPlugin
+        ${QGC_SRC}/src/Utilities/Database
+    )
+    target_compile_definitions(map_pack_loader_test PRIVATE
+        VAMA_MAP_PACKS="${CMAKE_CURRENT_SOURCE_DIR}/../map_packs"
+    )
+    target_link_libraries(map_pack_loader_test PRIVATE Qt6::Core Qt6::Sql Qt6::Test)
+else()
+    message(WARNING "map_pack_test and map_pack_loader_test are left out: no QGC source in ${QGC_SRC} (apk/fetch_qgc.ps1 makes it)")
+endif()
