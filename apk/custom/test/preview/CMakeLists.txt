@@ -22,6 +22,7 @@ add_executable(vama_preview
     main.cpp
     ${CUSTOM_DIR}/src/Skydroid/SkydroidLink.cc
     ${CUSTOM_DIR}/src/Skydroid/SkydroidLink.h
+    ${CUSTOM_DIR}/src/Skydroid/CameraProfile.cc
     ${CUSTOM_DIR}/src/Skydroid/SkydroidTop.cc
     ${CUSTOM_DIR}/src/Skydroid/LaserGeo.cc
     ${CUSTOM_DIR}/src/Skydroid/ObjectTracker.cc

@@ -133,6 +133,8 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/AdminPassword.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidTop.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidTop.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/CameraProfile.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/CameraProfile.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidLink.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidLink.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.cc

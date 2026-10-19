@@ -18,6 +18,7 @@ add_executable(skydroid_link_test
     skydroid_link_test.cc
     ${SKYDROID_SRC}/SkydroidLink.cc
     ${SKYDROID_SRC}/SkydroidLink.h
+    ${SKYDROID_SRC}/CameraProfile.cc
     ${SKYDROID_SRC}/SkydroidTop.cc
     ${SKYDROID_SRC}/LaserGeo.cc
     ${SKYDROID_SRC}/ObjectTracker.cc
@@ -155,6 +156,16 @@ if(EXISTS "${QGC_SRC}/src/QtLocationPlugin/QGCTileCacheDatabase.cpp")
 else()
     message(WARNING "map_pack_test and map_pack_loader_test are left out: no QGC source in ${QGC_SRC} (apk/fetch_qgc.ps1 makes it)")
 endif()
+
+# The camera profiles (task AA): the built-in cameras against the link's old formulas, the
+# camera files and their folder.
+add_executable(camera_profile_test
+    camera_profile_test.cc
+    ${SKYDROID_SRC}/CameraProfile.cc
+    ${SKYDROID_SRC}/CameraProfile.h
+)
+target_include_directories(camera_profile_test PRIVATE ${SKYDROID_SRC})
+target_link_libraries(camera_profile_test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
 
 # The admin password for Advanced Mode (task Z). admin_password_test is built as a test build
 # (the test password), admin_password_team_test as a customer build: it reads the team's salt

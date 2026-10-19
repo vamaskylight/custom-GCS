@@ -38,6 +38,9 @@
 //   19_warnings_map.png   the same texts as QGC shows them, with the map as the main view
 //   29_admin_password.png the app menu after the hidden Advanced Mode tap: it asks for the admin password (task Z)
 //   30_admin_wrong.png    after a wrong password: the wait before the next try
+//   31_cameras.png        the camera editor (task AA): the built-in cameras, to copy
+//   32_camera_form.png    a copy of the V13 being made into a camera without laser, photo, recording, zoom or IR
+//   33_plain_camera.png   that camera in use: its buttons only
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
 // The lock is tried for real: the day picture is a look into a world that
@@ -690,6 +693,8 @@ public:
 
 int main(int argc, char *argv[])
 {
+    // Every line reaches the log at once: a crash must not take the last lines with it.
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     qInstallMessageHandler(messageHandler);
     // QGC's image provider logs every icon it draws.
@@ -716,6 +721,10 @@ int main(int argc, char *argv[])
 
     FakeCamera camera;
     SkydroidLink::setProbeTargets({}, {});  // no real network from a preview
+    // Added cameras (task AA) in a folder of the preview's own, empty at the start.
+    const QString cameraFolder = QDir::tempPath() + QStringLiteral("/vama-preview-cameras");
+    QDir(cameraFolder).removeRecursively();
+    SkydroidLink::setCameraFolder(cameraFolder);
     SkydroidLink link(nullptr);
     link.setHost(QStringLiteral("127.0.0.1"));
     link.setPort(camera.port());
@@ -978,10 +987,42 @@ int main(int argc, char *argv[])
         }
         return nullptr;
     };
+    // An item's property set, or a problem when the item is not there.
+    auto setOn = [&](const char *objectName, const char *property, const QVariant &value) {
+        QQuickItem *item = findItem(objectName);
+        if (!item) {
+            std::fprintf(stderr, "%s not found\n", objectName);
+            ++g_problems;
+            return;
+        }
+        item->setProperty(property, value);
+    };
+    // A button's press as the button itself gives it (clicked), for a button that can be outside
+    // the visible part of a window that scrolls.
+    auto press = [&](const char *objectName) {
+        QQuickItem *item = findItem(objectName);
+        if (!item) {
+            std::fprintf(stderr, "%s not found\n", objectName);
+            ++g_problems;
+            return;
+        }
+        QMetaObject::invokeMethod(item, "clicked");
+    };
     auto tapItem = [&](QQuickItem *item) {
         const QPointF centre = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
         mouse(QEvent::MouseButtonPress, centre);
         mouse(QEvent::MouseButtonRelease, centre);
+    };
+    // A tap on an item found among the window's items (the rows of a Repeater are not found by
+    // their QObject parents).
+    auto tapFound = [&](const char *objectName) {
+        QQuickItem *item = findItem(objectName);
+        if (!item) {
+            std::fprintf(stderr, "%s not found\n", objectName);
+            ++g_problems;
+            return;
+        }
+        tapItem(item);
     };
     // Steps run on fixed timers, but the app works in real time: on a busy PC a picture, a
     // grab or a turn of the stand-in camera comes later. waitFor lets events run (as QTest's
@@ -2264,6 +2305,125 @@ int main(int argc, char *argv[])
                     "admin: in Advanced Mode the tap asks QGC's question to turn it off, with no password",
                     QStringLiteral("%1 questions").arg(menuWindow->property("offQuestions").toInt()));
              menuWindow->close();
+             // The cameras the admin adds (task AA), from the camera settings.
+             global.core.setShowAdvancedUI(false);
+             QMetaObject::invokeMethod(window->findChild<QObject *>(QStringLiteral("vamaCameraSettings")), "open");
+         }},
+        {400, [&]() {
+             QQuickItem *button = findItem("vamaCamerasButton");
+             expect(button && !button->isVisible(), "cameras: no Cameras button outside Advanced Mode", QString());
+             global.core.setShowAdvancedUI(true);
+         }},
+        {300, [&]() {
+             QQuickItem *button = findItem("vamaCamerasButton");
+             expect(button && button->isVisible(), "cameras: in Advanced Mode the camera settings have a Cameras button", QString());
+             // The window was left scrolled down by an earlier step: back to its top, where the button is.
+             QObject *flick = window->findChild<QObject *>(QStringLiteral("vamaCameraSettingsFlick"));
+             if (flick) {
+                 flick->setProperty("contentY", 0);
+             }
+         }},
+        {200, [&]() { tap("vamaCamerasButton"); }},
+        {500, [&]() {
+             QObject *editor = window->findChild<QObject *>(QStringLiteral("vamaCameraEditor"));
+             expect(editor && editor->property("opened").toBool(), "cameras: the button opens the camera editor", QString());
+             QQuickItem *copy = findItem("vamaCameraCopy_C13");
+             QQuickItem *change = findItem("vamaCameraEdit_C13");
+             QQuickItem *remove = findItem("vamaCameraDelete_C13");
+             expect(copy && copy->isVisible() && change && !change->isVisible() && remove && !remove->isVisible(),
+                    "cameras: a built-in camera can be copied, not changed or deleted", QString());
+             shot("31_cameras.png");
+             tapFound("vamaCameraCopy_C13");
+         }},
+        {400, [&]() {
+             QQuickItem *name = findItem("vamaCameraName");
+             expect(name && name->isVisible() && name->property("text").toString() == QStringLiteral("V13 copy"),
+                    "cameras: Copy opens the form with the V13's values", name ? name->property("text").toString() : QStringLiteral("no form"));
+             if (!name) {
+                 return;
+             }
+             // A camera without laser, photo, recording, zoom, thermal picture or tracker of its own,
+             // at the preview's fake camera. The port is wrong first.
+             name->setProperty("text", QStringLiteral("Plain cam"));
+             setOn("vamaCameraHost", "text", QStringLiteral("127.0.0.1"));
+             setOn("vamaCameraPort", "text", QStringLiteral("0"));
+             setOn("vamaCameraDayVideo", "text", QStringLiteral("rtsp://127.0.0.1:8554/plain"));
+             setOn("vamaCameraThermalVideo", "text", QString());
+             setOn("vamaCameraZoom", "currentIndex", 0);
+             for (const char *box : {"vamaCameraLaser", "vamaCameraPhoto", "vamaCameraRecord", "vamaCameraOwnTracker"}) {
+                 setOn(box, "checked", false);
+             }
+             // The buttons at the end of the form can be below the visible part: pressed as the button does.
+             press("vamaCameraSave");
+         }},
+        {300, [&]() {
+             QQuickItem *problem = findItem("vamaCameraProblem");
+             const QString says = problem ? problem->property("text").toString() : QString();
+             expect(problem && problem->isVisible() && says.contains(QStringLiteral("control port")) && !link.models().contains(QStringLiteral("plain-cam")),
+                    "cameras: a wrong value is not saved, and the form says why", says);
+             setOn("vamaCameraPort", "text", QString::number(camera.port()));
+             shot("32_camera_form.png");
+             press("vamaCameraSave");
+         }},
+        {400, [&]() {
+             expect(link.models().contains(QStringLiteral("plain-cam")) && QFile::exists(cameraFolder + QStringLiteral("/plain-cam.json")),
+                    "cameras: Save adds the camera, as a file", link.models().join(QStringLiteral(", ")));
+             QQuickItem *change = findItem("vamaCameraEdit_plain-cam");
+             QQuickItem *remove = findItem("vamaCameraDelete_plain-cam");
+             expect(change && change->isVisible() && remove && remove->isVisible(), "cameras: an added camera can be changed and deleted", QString());
+             press("vamaCameraEditorClose");
+         }},
+        {300, [&]() {
+             // Chosen in the camera settings' list, as the user does.
+             QQuickItem *box = findItem("vamaCameraModelBox");
+             if (box) {
+                 QMetaObject::invokeMethod(box, "activated", Q_ARG(int, int(link.models().indexOf(QStringLiteral("plain-cam")))));
+             } else {
+                 expect(false, "cameras: the camera settings have the camera list", QString());
+             }
+         }},
+        {500, [&]() {
+             expect(link.model() == QStringLiteral("plain-cam") && link.host() == QStringLiteral("127.0.0.1") && link.port() == camera.port() &&
+                        link.dayVideoUrl() == QStringLiteral("rtsp://127.0.0.1:8554/plain") && link.thermalVideoUrl().isEmpty(),
+                    "cameras: choosing it uses it, with its addresses",
+                    QStringLiteral("%1 at %2:%3, %4").arg(link.model(), link.host()).arg(link.port()).arg(link.dayVideoUrl()));
+             const QString video = global.settings.video.rtspUrlFact.rawValue().toString();
+             expect(video == QStringLiteral("rtsp://127.0.0.1:8554/plain"), "cameras: QGC's video is its day picture", video);
+             QMetaObject::invokeMethod(window->findChild<QObject *>(QStringLiteral("vamaCameraSettings")), "close");
+             // Its thermal address is empty: an empty video address must not count as IR.
+             global.settings.video.rtspUrlFact.setRawValue(QString());
+         }},
+        {300, [&]() {
+             QQuickItem *palette = findItem("vamaPaletteButton");
+             expect(!link.thermalPicture() && palette && !palette->isVisible(),
+                    "cameras: with no thermal picture, an empty video address is not IR", QString());
+             global.settings.video.rtspUrlFact.setRawValue(QStringLiteral("rtsp://127.0.0.1:8554/plain"));
+         }},
+        {400, [&]() {
+             QStringList shown;
+             for (const char *button : {"vamaLaserButton", "vamaPhotoButton", "vamaRecordButton", "vamaIrButton", "vamaZoomInButton"}) {
+                 QQuickItem *item = findItem(button);
+                 if (!item || item->isVisible()) {
+                     shown.append(QString::fromLatin1(button));
+                 }
+             }
+             QQuickItem *lock = findItem("vamaLockButton");
+             expect(shown.isEmpty() && lock && lock->isVisible(),
+                    "cameras: its screen has no laser, photo, record, IR or zoom button, and still the lock", shown.join(QStringLiteral(", ")));
+             shot("33_plain_camera.png");
+             // Deleted while in use: the V13 again, with the addresses as they are.
+             QMetaObject::invokeMethod(window->property("layer").value<QObject *>(), "_openCameraEditor");
+         }},
+        {400, [&]() { tapFound("vamaCameraDelete_plain-cam"); }},
+        {300, [&]() { tapFound("vamaCameraDeleteYes"); }},
+        {400, [&]() {
+             expect(link.model() == QStringLiteral("C13") && !link.models().contains(QStringLiteral("plain-cam")) &&
+                        !QFile::exists(cameraFolder + QStringLiteral("/plain-cam.json")) && link.host() == QStringLiteral("127.0.0.1"),
+                    "cameras: deleting the camera in use: the file is gone, the V13 is used, the addresses stay",
+                    QStringLiteral("%1 at %2").arg(link.model(), link.host()));
+             QQuickItem *laser = findItem("vamaLaserButton");
+             expect(laser && laser->isVisible(), "cameras: the V13's buttons are back", QString());
+             press("vamaCameraEditorClose");
          }},
         {100, [&]() { QCoreApplication::quit(); }},
     };

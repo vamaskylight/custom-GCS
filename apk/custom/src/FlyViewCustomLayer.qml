@@ -86,7 +86,9 @@ Item {
     // IR: the thermal picture is a second RTSP stream, so the button switches
     // QGC's video address between the day and thermal streams (as VGCS does).
     property var  _videoSettings: QGroundControl.settingsManager.videoSettings
-    property bool _thermalOn:     _videoSettings ? _videoSettings.rtspUrl.rawValue === _link.thermalVideoUrl : false
+    // (A camera without a thermal picture has an empty address: then IR is never on.)
+    property bool _thermalOn:     _videoSettings && _link.camera.thermal && _link.thermalVideoUrl !== ""
+                                  ? _videoSettings.rtspUrl.rawValue === _link.thermalVideoUrl : false
     // A point from the picture needs the lens of the picture that shows.
     Binding { target: _link; property: "thermalPicture"; value: _thermalOn }
     // While the lock button waits for an object, the app marks the people and vehicles it finds.
@@ -107,6 +109,38 @@ Item {
         }
         _videoSettings.videoSource.rawValue = _videoSettings.rtspVideoSource
         _videoSettings.rtspUrl.rawValue = _link.thermalVideoUrl
+    }
+
+    // VAMA (task AA): another camera, with its addresses, and QGC's video on its day picture.
+    function _chooseCamera(id) {
+        if (id === _link.model) {
+            return
+        }
+        _link.chooseCamera(id)
+        hostField.text = _link.host
+        portField.text = _link.port
+        dayVideoField.text = _link.dayVideoUrl
+        thermalVideoField.text = _link.thermalVideoUrl
+        if (_videoSettings) {
+            _videoSettings.videoSource.rawValue = _videoSettings.rtspVideoSource
+            _videoSettings.rtspUrl.rawValue = _link.dayVideoUrl
+        }
+    }
+
+    // VAMA (task AA): the camera editor, for the admin. Made here when first asked for: this
+    // layer lives as long as the app, so the window does too (a window made from a page that
+    // closes stops working, see VamaAdminPasswordPanel.qml).
+    property var _cameraEditor: null
+    function _openCameraEditor() {
+        if (!_cameraEditor) {
+            var component = Qt.createComponent("qrc:/Custom/qml/QGroundControl/FlyView/VamaCameraEditor.qml")
+            _cameraEditor = component.createObject(_root)
+            if (!_cameraEditor) {
+                console.warn("VAMA: the camera editor did not load:", component.errorString())
+                return
+            }
+        }
+        _cameraEditor.open()
     }
 
     QGCPalette { id: qgcPal; colorGroupEnabled: true }
@@ -344,18 +378,19 @@ Item {
             anchors.centerIn: parent
             spacing:          _margin / 2
 
+            // VAMA (task AA): a camera without zoom has the left column only.
             GridLayout {
                 id:            panelGrid
-                columns:       2
+                columns:       _link.camera.zoom !== "none" ? 2 : 1
                 rowSpacing:    _margin
                 columnSpacing: _margin
 
                 IconButton { icon: _iconPath + "vama_yaw_center.svg"; size: _buttonSize; onClicked: _link.centerYaw() }
-                IconButton { icon: _iconPath + "vama_zoom_in.svg";    size: _buttonSize; repeat: true; onClicked: _link.zoom(1) }
+                IconButton { objectName: "vamaZoomInButton"; visible: _link.camera.zoom !== "none"; icon: _iconPath + "vama_zoom_in.svg"; size: _buttonSize; repeat: true; onClicked: _link.zoom(1) }
                 IconButton { icon: _iconPath + "vama_center.svg";     size: _buttonSize; onClicked: _link.center() }
-                IconButton { icon: _iconPath + "vama_zoom_out.svg";   size: _buttonSize; repeat: true; onClicked: _link.zoom(-1) }
+                IconButton { visible: _link.camera.zoom !== "none"; icon: _iconPath + "vama_zoom_out.svg"; size: _buttonSize; repeat: true; onClicked: _link.zoom(-1) }
                 IconButton { icon: _iconPath + "vama_down.svg";       size: _buttonSize; onClicked: _link.pointDown() }
-                IconButton { icon: _iconPath + "vama_zoom_reset.svg"; size: _buttonSize; onClicked: _link.zoomHome() }
+                IconButton { visible: _link.camera.zoom !== "none"; icon: _iconPath + "vama_zoom_reset.svg"; size: _buttonSize; onClicked: _link.zoomHome() }
             }
 
             // The zoom now, under the zoom column.
@@ -389,14 +424,18 @@ Item {
             anchors.centerIn: parent
             spacing:          _margin
 
+            // VAMA (task AA): each button only for a camera that can do it.
             IconButton {
                 id:        photoButton
                 objectName: "vamaPhotoButton"
+                visible:   _link.camera.photo
                 icon:      _iconPath + "vama_photo.svg"
                 size:      _buttonSize
                 onClicked: { _link.takePhoto(); photoButton.flash() }
             }
             IconButton {
+                objectName: "vamaRecordButton"
+                visible:   _link.camera.record
                 icon:      _iconPath + "vama_record.svg"
                 size:      _buttonSize
                 fill:      _link.recording ? Qt.rgba(0.85, 0.12, 0.12, 0.9) : Qt.rgba(0, 0, 0, 0.55)
@@ -407,6 +446,7 @@ Item {
             // there a press measures, as before.
             IconButton {
                 objectName: "vamaLaserButton"
+                visible:    _link.camera.laser
                 icon:       _iconPath + "vama_laser.svg"
                 size:       _buttonSize
                 enabled:    !_link.laserBusy
@@ -447,6 +487,7 @@ Item {
             IconButton {
                 id:         irButton
                 objectName: "vamaIrButton"
+                visible:    _link.camera.thermal
                 icon:       _iconPath + "vama_ir.svg"
                 size:       _buttonSize
                 fill:       _thermalOn ? qgcPal.colorOrange : Qt.rgba(0, 0, 0, 0.55)
@@ -1564,10 +1605,21 @@ Item {
 
                     QGCLabel { text: qsTr("Camera model"); Layout.preferredWidth: settingsPopup._labelWidth }
                     QGCComboBox {
+                        objectName:       "vamaCameraModelBox"
                         Layout.fillWidth: true
-                        model:            _link.modelNames  // V12, V13, V14 Pro on screen
+                        model:            _link.modelNames  // V12, V13, V14 Pro on screen, then the added cameras
                         currentIndex:     _link.models.indexOf(_link.model)
-                        onActivated:      (index) => { _link.model = _link.models[index] }
+                        onActivated:      (index) => { _chooseCamera(_link.models[index]) }
+                    }
+
+                    // VAMA (task AA): the admin adds and changes cameras (Advanced Mode, after the admin password).
+                    Item { width: 1; height: 1; visible: camerasButton.visible }
+                    QGCButton {
+                        id:         camerasButton
+                        objectName: "vamaCamerasButton"
+                        visible:    QGroundControl.corePlugin.showAdvancedUI
+                        text:       qsTr("Cameras...")
+                        onClicked:  _openCameraEditor()
                     }
 
                     QGCLabel { text: qsTr("Camera IP address"); Layout.preferredWidth: settingsPopup._labelWidth }
@@ -1633,19 +1685,22 @@ Item {
                         onActivated:      (index) => { _link.maxSpeed = settingsPopup._speeds[index] }
                     }
 
-                    QGCLabel { text: qsTr("Object lock"); Layout.preferredWidth: settingsPopup._labelWidth }
+                    // VAMA (task AA): a camera without a tracker of its own, or without a laser, has no choice there.
+                    QGCLabel { text: qsTr("Object lock"); Layout.preferredWidth: settingsPopup._labelWidth; visible: _link.camera.ownTracker }
                     QGCComboBox {
                         objectName:       "vamaLockModeBox"
                         Layout.fillWidth: true
+                        visible:          _link.camera.ownTracker
                         model:            _link.lockModeNames
                         currentIndex:     Math.max(0, _link.lockModes.indexOf(_link.lockMode))
                         onActivated:      (index) => { _link.lockMode = _link.lockModes[index] }
                     }
 
-                    QGCLabel { text: qsTr("Tap on the video"); Layout.preferredWidth: settingsPopup._labelWidth }
+                    QGCLabel { text: qsTr("Tap on the video"); Layout.preferredWidth: settingsPopup._labelWidth; visible: _link.camera.laser }
                     QGCComboBox {
                         objectName:       "vamaPointModeBox"
                         Layout.fillWidth: true
+                        visible:          _link.camera.laser
                         model:            _link.pointModeNames
                         currentIndex:     Math.max(0, _link.pointModes.indexOf(_link.pointMode))
                         onActivated:      (index) => { _link.pointMode = _link.pointModes[index] }
@@ -1656,15 +1711,17 @@ Item {
                     Layout.fillWidth: true
                     wrapMode:         Text.WordWrap
                     font.pointSize:   ScreenTools.smallFontPointSize
-                    text:             _link.pointMode === "picture"
-                                      ? qsTr("Tap on the video: the position of the point comes from the picture at once, without the laser (the camera's angle and the drone's height, level ground assumed). The camera stays where it is. It needs the drone 2.5 m up or more, and the point 8 degrees or more under the horizon.")
-                                      : qsTr("Tap on the video: the camera turns to the point and the laser measures it. With no laser reading, the position comes from the picture when that is possible, and the result says so.")
+                    text:             !_link.camera.laser
+                                      ? qsTr("This camera has no laser. Tap on the video: the position of the point comes from the picture (the camera's angle and the drone's height, level ground assumed). It needs the drone 2.5 m up or more, and the point 8 degrees or more under the horizon.")
+                                      : (_link.pointMode === "picture"
+                                         ? qsTr("Tap on the video: the position of the point comes from the picture at once, without the laser (the camera's angle and the drone's height, level ground assumed). The camera stays where it is. It needs the drone 2.5 m up or more, and the point 8 degrees or more under the horizon.")
+                                         : qsTr("Tap on the video: the camera turns to the point and the laser measures it. With no laser reading, the position comes from the picture when that is possible, and the result says so."))
                 }
                 QGCLabel {
                     Layout.fillWidth: true
                     wrapMode:         Text.WordWrap
                     font.pointSize:   ScreenTools.smallFontPointSize
-                    text:             _link.lockMode === "camera"
+                    text:             (_link.lockMode === "camera" && _link.camera.ownTracker)
                                       ? qsTr("Object lock: the camera's own tracker is told to follow. The app cannot see what it follows. On the V13 it did not follow in the tests.")
                                       : qsTr("Object lock: the app follows the object in the video and turns the camera. The box on the video is where the app sees the object.")
                 }
@@ -1797,7 +1854,9 @@ Item {
                     Layout.fillWidth: true
                     wrapMode:         Text.WordWrap
                     font.pointSize:   ScreenTools.smallFontPointSize
-                    text:             qsTr("The IR button switches the video between these two addresses. The day address is taken from Application Settings, Video, when you switch to IR.")
+                    text:             _link.camera.thermal
+                                      ? qsTr("The IR button switches the video between these two addresses. The day address is taken from Application Settings, Video, when you switch to IR.")
+                                      : qsTr("This camera has no thermal picture, so there is no IR button.")
                 }
 
                 GridLayout {
@@ -1814,10 +1873,11 @@ Item {
                         onEditingFinished: _link.dayVideoUrl = text
                     }
 
-                    QGCLabel { text: qsTr("Thermal video"); Layout.preferredWidth: settingsPopup._labelWidth }
+                    QGCLabel { text: qsTr("Thermal video"); Layout.preferredWidth: settingsPopup._labelWidth; visible: _link.camera.thermal }
                     QGCTextField {
                         id:                thermalVideoField
                         Layout.fillWidth:  true
+                        visible:           _link.camera.thermal
                         text:              _link.thermalVideoUrl
                         onEditingFinished: _link.thermalVideoUrl = text
                     }

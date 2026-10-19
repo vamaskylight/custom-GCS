@@ -52,6 +52,12 @@
 // it is found in (objectPlaced): the camera's angle to the object, and the
 // drone's height above the ground there.
 //
+// The camera (CameraProfile.h, task AA): its lens, zoom, limits, laser and
+// features come from the camera in use, one of the built-in ones (V12, V13,
+// V14 Pro) or one the admin added in the camera editor (a file in the app's
+// folder "Cameras"). Choosing another camera (chooseCamera) also sets its
+// addresses. setModel changes the camera alone, as it always did.
+//
 // One shared instance; QML uses it as the singleton "SkydroidLink" from the
 // QGC module.
 
@@ -63,6 +69,7 @@
 #include <QtCore/QStringList>
 #include <QtCore/QTimer>
 #include <QtCore/QVariantList>
+#include <QtCore/QVariantMap>
 #include <QtCore/QVector>
 #include <QtGui/QImage>
 #include <QtNetwork/QHostAddress>
@@ -73,6 +80,7 @@
 #include <string>
 #include <vector>
 
+#include "CameraProfile.h"
 #include "LaserGeo.h"
 #include "ObjectTracker.h"
 #include "SkydroidTop.h"
@@ -93,9 +101,18 @@ class SkydroidLink : public QObject
     Q_PROPERTY(QString host READ host WRITE setHost NOTIFY settingsChanged)
     Q_PROPERTY(int port READ port WRITE setPort NOTIFY settingsChanged)
     Q_PROPERTY(QString model READ model WRITE setModel NOTIFY settingsChanged)
-    Q_PROPERTY(QStringList models READ models CONSTANT)
-    Q_PROPERTY(QStringList modelNames READ modelNames CONSTANT)
+    Q_PROPERTY(QStringList models READ models NOTIFY camerasChanged)
+    Q_PROPERTY(QStringList modelNames READ modelNames NOTIFY camerasChanged)
     Q_PROPERTY(QString modelName READ modelName NOTIFY settingsChanged)
+    /// The camera in use as the camera editor shows it (the fields of its file, with "id",
+    /// "builtIn" and "thermal"). Its features decide which buttons the screen shows.
+    Q_PROPERTY(QVariantMap camera READ camera NOTIFY settingsChanged)
+    /// Every camera, for the camera editor: "id", "name" and "builtIn" of each.
+    Q_PROPERTY(QVariantList cameras READ cameras NOTIFY camerasChanged)
+    /// Where added cameras are kept: one file each.
+    Q_PROPERTY(QString cameraFolder READ cameraFolder CONSTANT)
+    /// Files in that folder that were not read, each with why.
+    Q_PROPERTY(QStringList cameraNotes READ cameraNotes NOTIFY camerasChanged)
     Q_PROPERTY(int maxSpeed READ maxSpeed WRITE setMaxSpeed NOTIFY settingsChanged)
     Q_PROPERTY(bool reverseYaw READ reverseYaw WRITE setReverseYaw NOTIFY settingsChanged)
     Q_PROPERTY(bool reversePitch READ reversePitch WRITE setReversePitch NOTIFY settingsChanged)
@@ -217,13 +234,38 @@ public:
     void setHost(const QString &host);
     int port() const { return _port; }
     void setPort(int port);
-    /// Skydroid's name (C12, C13, C14 Pro): what the code and saved settings use.
-    QString model() const { return _model; }
+    /// The id of the camera in use: Skydroid's name for a built-in one (C12, C13, C14 Pro),
+    /// which the code and the saved settings use, or an added camera's file name.
+    QString model() const { return _camera.id; }
+    /// Uses another camera, with the addresses as they are. An unknown id is ignored.
     void setModel(const QString &model);
-    static QStringList models();
-    /// The names VAMA shows for the same cameras (V12, V13, V14 Pro), in the order of models().
-    static QStringList modelNames();
-    QString modelName() const;
+    /// The ids of every camera: the built-in ones, then the added ones.
+    QStringList models() const;
+    /// The names on screen, in the order of models(): VAMA's for the built-in cameras (V12,
+    /// V13, V14 Pro), the admin's for the added ones.
+    QStringList modelNames() const;
+    QString modelName() const { return _camera.name; }
+    QVariantMap camera() const;
+    QVariantList cameras() const;
+    QString cameraFolder() const { return _cameraStore.folder(); }
+    QStringList cameraNotes() const { return _cameraStore.notes(); }
+    /// Another camera, chosen on the screen: setModel, and that camera's addresses (camera IP,
+    /// control port, day and thermal video). Choosing the camera in use changes nothing.
+    Q_INVOKABLE void chooseCamera(const QString &id);
+    /// A camera's fields for the editor (as camera), or nothing for an unknown id.
+    Q_INVOKABLE QVariantMap cameraProfile(const QString &id) const;
+    /// Saves a camera from the editor's fields: an added one keeps its file, anything else (a
+    /// copy of a built-in camera) becomes a new one. "problem": what is wrong (then nothing is
+    /// saved), else empty; "id": the camera's id. The camera in use is used as saved, with its
+    /// addresses.
+    Q_INVOKABLE QVariantMap saveCamera(const QVariantMap &fields);
+    /// Deletes an added camera's file. The problem, or empty. When it was in use, the V13 is.
+    Q_INVOKABLE QString deleteCamera(const QString &id);
+    /// Reads the camera folder again (files copied in while the app runs).
+    Q_INVOKABLE void reloadCameras();
+    /// The folder of added cameras. Tests and the screen preview give a folder of their own;
+    /// else it is the app's own folder "Cameras" (Android/data/com.vama.gcs/files/Cameras).
+    static void setCameraFolder(const QString &folder);
     /// Gimbal speed in degrees per second at full deflection.
     int maxSpeed() const { return _maxSpeed; }
     void setMaxSpeed(int degPerSecond);
@@ -423,6 +465,8 @@ public:
 signals:
     void enabledChanged();
     void settingsChanged();
+    /// A camera was added, changed or deleted (the camera editor), or the folder read again.
+    void camerasChanged();
     void answeringChanged();
     void activeEndpointChanged();
     void attitudeChanged();
@@ -483,6 +527,8 @@ private:
     void _stop();
     void _loadSettings();
     void _saveSettings() const;
+    /// Uses this camera: its lens, zoom, limits and features, and with withAddresses its addresses.
+    void _useCamera(const skydroid::camera::Profile &profile, bool withAddresses);
     void _applyModel();
     void _rebuildEndpoints();
     void _setActive(const Endpoint &endpoint);
@@ -496,7 +542,7 @@ private:
     bool _attitudeFresh() const;
     void _probe();
     QList<Endpoint> _laserEndpoints() const;
-    bool _isZoomStepCamera() const { return _model == QStringLiteral("C14 Pro"); }
+    bool _isZoomStepCamera() const { return _camera.zoom == skydroid::camera::Zoom::Reported; }
     void _sendZoomStepFrames(int direction);
     /// To the control port, and to the other ports some C13 firmware takes zoom on.
     void _sendZoomFrames(const std::vector<std::string> &frames);
@@ -586,7 +632,8 @@ private:
     bool _enabled = false;
     QString _host;
     int _port = 5000;
-    QString _model;
+    skydroid::camera::Store _cameraStore;
+    skydroid::camera::Profile _camera;  // the camera in use
     int _maxSpeed = 20;
     bool _reverseYaw = false;
     bool _reversePitch = false;

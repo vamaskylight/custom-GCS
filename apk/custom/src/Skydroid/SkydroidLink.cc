@@ -2,10 +2,17 @@
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QSettings>
+#include <QtCore/QStandardPaths>
 #include <QtNetwork/QNetworkDatagram>
 #include <QtNetwork/QUdpSocket>
 #include <QtPositioning/QGeoCoordinate>
 #include <QtQml/QJSEngine>
+
+#ifdef Q_OS_ANDROID
+#include <QtCore/QJniEnvironment>
+#include <QtCore/QJniObject>
+#include <QtCore/qcoreapplication_platform.h>
+#endif
 
 #include "Fact.h"
 #include "FactGroup.h"
@@ -19,6 +26,7 @@
 #include <vector>
 
 namespace top = skydroid::top;
+namespace camera = skydroid::camera;
 
 namespace {
 
@@ -34,11 +42,9 @@ QString normalizedThermalPalette(const QString &value)
 constexpr const char *kSettingsGroup = "VamaSkydroid";
 constexpr const char *kDefaultHost = "192.168.144.108";
 constexpr int kDefaultPort = 5000;
-constexpr const char *kDefaultModel = "C13";
-// C12, C13 and C14 Pro: day picture on RTSP port 554, thermal on 555
-// (DOCS/SKYDROID-C13-OBSERVATION-SETUP.md; C14 Pro assumed the same).
-constexpr const char *kDefaultDayVideoUrl = "rtsp://192.168.144.108:554/stream=1";
-constexpr const char *kDefaultThermalVideoUrl = "rtsp://192.168.144.108:555/stream=2";
+// The added cameras: a file each, in this folder of the app's own folder (as the map packs).
+constexpr const char *kCameraFolder = "Cameras";
+QString g_cameraFolder;  // given by tests and the screen preview
 constexpr int kDefaultMaxSpeed = 20;     // deg/s at full deflection
 constexpr int kMinMaxSpeed = 5;
 constexpr int kMaxMaxSpeed = 60;         // GSY/GSP carry at most 63.5 deg/s
@@ -49,18 +55,13 @@ constexpr int kGaaEveryPollsWhenQuiet = 5;  // GAA again every second while no a
 constexpr int kGaaEveryPolls = 50;          // and every 10 s anyway, in case the camera restarted
 constexpr int kProbeFirstPoll = 8;          // other addresses 1.6 s after start,
 constexpr int kProbeEveryPolls = 15;        // then every 3 s while no angles arrive
-constexpr int kZoomPollEvery = 10;       // C14 Pro zoom step query every 2 s
+constexpr int kZoomPollEvery = 10;       // zoom step query every 2 s (a camera that reports it: C14 Pro)
 constexpr int kAnswerCheckMs = 1000;
 constexpr int kAnswerTimeoutMs = 3000;   // no reply this long = camera not answering
 constexpr int kAttitudeFreshMs = 1500;   // older angles: send GAA again and try other addresses
 constexpr int kLaserShotSettleMs = 120;  // VGCS _LRF_SLR_SHOT_SETTLE_S
 constexpr int kLaserWaitMs = 1000;
 constexpr int kZoomQueryAfterCmdMs = 350;  // VGCS _DZM_POLL_AFTER_CMD_S
-constexpr double kC14ProLaserMaxM = 1500.0;
-// VGCS counts each C12/C13 zoom step as 0.1x (ZOOM_STEP_SKYDROID; the C13
-// has 30x digital zoom). Not measured on the camera yet: the camera's own
-// zoom report (zoomReport) is shown in the settings to check it.
-constexpr double kZoomPerStep = 0.1;
 constexpr int kZoomHomeExtraSteps = 5;   // "1x" steps out this many more than counted
 constexpr int kZoomOutIntervalMs = 60;
 
@@ -78,9 +79,9 @@ constexpr int kWheelMoveUs = 25;         // a hold-position wheel must move this
 constexpr double kWheelAngleStepDeg = 0.5;
 constexpr int kWheelAngleIntervalMs = 150;
 constexpr double kWheelApproachDps = 30.0;
+// A hold-position wheel's range, inside the camera's own limits (the C13 tilts up to +10).
 constexpr double kWheelPitchMinDeg = -90.0;  // wheel at 1000 us
-constexpr double kWheelPitchMaxDeg = 30.0;   // wheel at 2000 us (C13: +10, its limit)
-constexpr double kC13PitchMaxDeg = 10.0;
+constexpr double kWheelPitchMaxDeg = 30.0;   // wheel at 2000 us
 constexpr double kWheelYawRangeDeg = 90.0;   // wheel at 1000 or 2000 us = -90 or +90 deg
 constexpr int kDetectMs = 5000;
 constexpr int kDetectMinSpanUs = 150;
@@ -94,10 +95,9 @@ constexpr double kAngleMoveDps = 30.0;
 
 // Tap aiming, from VGCS's LRF click aim (vgcs/skydroid/adapter.py):
 // offset in degrees = offset from the picture centre x half the field of view,
-// with the C13's calibrated 83.4 x 46.9 degree view (also used for the C12),
-// and the C13's GAC yaw running opposite to the picture (_LRF_C13_NEGATE_IMAGE_YAW).
-constexpr double kC13AimFovHDeg = 83.4;
-constexpr double kC13AimFovVDeg = 46.9;
+// with the camera's view (CameraProfile.h; for the C12 and C13 the C13's
+// calibrated 83.4 x 46.9 degrees), and the C13's GAC yaw running opposite to
+// the picture (_LRF_C13_NEGATE_IMAGE_YAW).
 constexpr bool kNegateImageYaw = true;
 constexpr double kAimToleranceDeg = 1.0;  // close enough to the point to fire
 constexpr int kAimSettleMs = 400;          // held that close this long (VGCS waits 0.5 s)
@@ -181,20 +181,11 @@ constexpr double kAngleTurnStepDeg = 0.1;
 
 // The thermal lens. The thermal stream is a picture of its own (the C13's is 640 x 512,
 // "hevc, 640x512" in the client's VGCS log of 2026-10-08), so a place in it is a place on
-// the thermal lens, and the day camera's zoom does not narrow it.
-// Known for the C14 Pro (VGCS c14pro_default). For the C13 only its data sheet gives it,
-// in two rows: "48.7 x 38.6" (used here) and "24.8 x 18.7", which is the lens of a
-// 256 x 192 sensor and stands on the C12's sheet too. Its 9.1 mm lens and 640 x 512 points
-// of 12 um give 45.8 x 37.3. The C12's sheet: 7 mm and 384 x 288 points of 12 um, so
-// 36.4 x 27.7. Those two are good enough to turn the camera (the laser measures where the
-// cross ends up) and to follow a locked object, not to place a point from the picture:
-// on their thermal picture that is the cross only. A tap this near the middle is the cross.
-constexpr double kC14ThermalFovHDeg = 32.84;
-constexpr double kC14ThermalFovVDeg = 26.35;
-constexpr double kC13ThermalFovHDeg = 48.7;
-constexpr double kC13ThermalFovVDeg = 38.6;
-constexpr double kC12ThermalFovHDeg = 36.4;
-constexpr double kC12ThermalFovVDeg = 27.7;
+// the thermal lens, and the day camera's zoom does not narrow it. Each camera's thermal lens
+// is in its profile (CameraProfile.cc). When it is known only from a data sheet (the C12's
+// and the C13's), it is good enough to turn the camera and to follow a locked object, not to
+// place a point from the picture: on its thermal picture that is the cross only. A tap this
+// near the middle is the cross.
 constexpr double kCrossTapNorm = 0.06;
 
 // Object lock, mode "camera", as VGCS M13 does it (vgcs/skydroid/adapter.py and
@@ -259,17 +250,43 @@ int speedUnits(double degPerSecond)
     return static_cast<int>(std::clamp<long long>(top::pyRound(degPerSecond / 0.5), -127, 127));
 }
 
-/// C14 Pro zoom for a reported DZM step, as VGCS labels it ("W2.9x", "T5.3x").
-/// From vgcs/skydroid/command_map.py c14pro_default: short lens steps 0..85
-/// (61.4 deg wide), long lens 86..184 (14.7 deg wide); each step crops 36 px
-/// of a 3840 px readout, restarting at the lens change (Skydroid, 2026-09-19).
-QString c14ProZoomLabel(int step)
+#ifdef Q_OS_ANDROID
+QString pathOf(const QJniObject &file)
 {
-    const bool longLens = step >= 86;
-    const int m = longLens ? std::clamp(step - 86, 0, 98) : std::clamp(step, 0, 85);
-    const double crop = 3840.0 / std::max(1, 3840 - 36 * m);
-    const double lensFactor = longLens ? std::tan(61.4 * kPi / 360.0) / std::tan(14.7 * kPi / 360.0) : 1.0;
-    return QStringLiteral("%1%2x").arg(longLens ? QStringLiteral("T") : QStringLiteral("W")).arg(crop * lensFactor, 0, 'f', 1);
+    if (!file.isValid()) {
+        return QString();
+    }
+    return file.callObjectMethod("getAbsolutePath", "()Ljava/lang/String;").toString();
+}
+#endif
+
+/// The app's folder of added cameras: on Android Android/data/com.vama.gcs/files/Cameras,
+/// which a PC reaches by USB without any permission (as the map packs, MapPackLoader).
+QString appCameraFolder()
+{
+    QString own;
+#ifdef Q_OS_ANDROID
+    QJniEnvironment env;
+    const QJniObject context = QNativeInterface::QAndroidApplication::context();
+    if (context.isValid()) {
+        own = pathOf(context.callObjectMethod("getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;", static_cast<jobject>(nullptr)));
+    }
+    (void) env.checkAndClearExceptions();
+#endif
+    if (own.isEmpty()) {
+        own = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    }
+    return own + QLatin1Char('/') + QLatin1String(kCameraFolder);
+}
+
+/// A camera for the camera editor and the screen: the fields of its file, and more.
+QVariantMap cameraMap(const camera::Profile &profile)
+{
+    QVariantMap map = camera::toJson(profile).toVariantMap();
+    map.insert(QStringLiteral("id"), profile.id);
+    map.insert(QStringLiteral("builtIn"), profile.builtIn);
+    map.insert(QStringLiteral("thermal"), profile.hasThermal());
+    return map;
 }
 
 } // namespace
@@ -307,6 +324,9 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(manager, &MultiVehicleManager::activeVehicleChanged, this, &SkydroidLink::_activeVehicleChanged);
     _activeVehicleChanged(manager->activeVehicle());
 
+    // The cameras first: the saved camera can be an added one.
+    _cameraStore.setFolder(g_cameraFolder.isEmpty() ? appCameraFolder() : g_cameraFolder);
+    _cameraStore.load();
     _loadSettings();
     _applyModel();
     _rebuildEndpoints();
@@ -340,17 +360,111 @@ SkydroidLink *SkydroidLink::create(QQmlEngine *qmlEngine, QJSEngine *jsEngine)
 static_assert(!std::is_default_constructible_v<SkydroidLink>,
               "QML would make its own SkydroidLink instead of using SkydroidLink::create()");
 
-QStringList SkydroidLink::models()
+QStringList SkydroidLink::models() const
 {
-    return {QStringLiteral("C12"), QStringLiteral("C13"), QStringLiteral("C14 Pro")};
+    QStringList ids;
+    for (const camera::Profile &p : _cameraStore.profiles()) {
+        ids.append(p.id);
+    }
+    return ids;
 }
 
-QStringList SkydroidLink::modelNames()
+QStringList SkydroidLink::modelNames() const
 {
-    // VAMA sells these Skydroid cameras under its own names (client, 2026-10-06).
-    // Only the screen uses them: the code, the saved settings and VGCS keep
-    // Skydroid's names, which the protocol notes are written against.
-    return {QStringLiteral("V12"), QStringLiteral("V13"), QStringLiteral("V14 Pro")};
+    // VAMA sells the built-in Skydroid cameras under its own names (client, 2026-10-06).
+    // Only the screen uses them: the code, the saved settings and VGCS keep Skydroid's
+    // names, which the protocol notes are written against.
+    QStringList names;
+    for (const camera::Profile &p : _cameraStore.profiles()) {
+        names.append(p.name);
+    }
+    return names;
+}
+
+QVariantMap SkydroidLink::camera() const
+{
+    return cameraMap(_camera);
+}
+
+QVariantList SkydroidLink::cameras() const
+{
+    QVariantList list;
+    for (const camera::Profile &p : _cameraStore.profiles()) {
+        QVariantMap row;
+        row.insert(QStringLiteral("id"), p.id);
+        row.insert(QStringLiteral("name"), p.name);
+        row.insert(QStringLiteral("builtIn"), p.builtIn);
+        list.append(row);
+    }
+    return list;
+}
+
+QVariantMap SkydroidLink::cameraProfile(const QString &id) const
+{
+    const camera::Profile *p = _cameraStore.find(id);
+    return p ? cameraMap(*p) : QVariantMap();
+}
+
+void SkydroidLink::chooseCamera(const QString &id)
+{
+    const camera::Profile *p = _cameraStore.find(id);
+    if (!p || id == _camera.id) {
+        return;
+    }
+    _useCamera(*p, true);
+}
+
+QVariantMap SkydroidLink::saveCamera(const QVariantMap &fields)
+{
+    QVariantMap result;
+    QString why;
+    QString id;
+    const std::optional<camera::Profile> profile = camera::fromFields(QJsonObject::fromVariantMap(fields), &why);
+    if (profile) {
+        why = _cameraStore.save(*profile, &id);
+    }
+    if (why.isEmpty()) {
+        if (id == _camera.id) {
+            // The camera in use was changed: it is used as saved, with its addresses.
+            _useCamera(*_cameraStore.find(id), true);
+        }
+        emit camerasChanged();
+    }
+    result.insert(QStringLiteral("problem"), why);
+    result.insert(QStringLiteral("id"), id);
+    return result;
+}
+
+QString SkydroidLink::deleteCamera(const QString &id)
+{
+    const QString why = _cameraStore.remove(id);
+    if (!why.isEmpty()) {
+        return why;
+    }
+    if (id == _camera.id) {
+        // The camera in use is gone: the V13, with the addresses as they are.
+        _useCamera(*_cameraStore.find(camera::defaultId()), false);
+    }
+    emit camerasChanged();
+    return QString();
+}
+
+void SkydroidLink::reloadCameras()
+{
+    _cameraStore.load();
+    const camera::Profile *p = _cameraStore.find(_camera.id);
+    if (!p) {
+        p = _cameraStore.find(camera::defaultId());  // its file is gone
+    }
+    if (p->id != _camera.id || camera::toJson(*p) != camera::toJson(_camera)) {
+        _useCamera(*p, false);
+    }
+    emit camerasChanged();
+}
+
+void SkydroidLink::setCameraFolder(const QString &folder)
+{
+    g_cameraFolder = folder;
 }
 
 QStringList SkydroidLink::thermalPalettes()
@@ -368,12 +482,6 @@ QStringList SkydroidLink::thermalPaletteNames()
             tr("Red hot"), tr("Green"), tr("Sepia")};
 }
 
-QString SkydroidLink::modelName() const
-{
-    const qsizetype i = models().indexOf(_model);
-    return i >= 0 ? modelNames().at(i) : _model;
-}
-
 void SkydroidLink::setProbeTargets(const QStringList &hosts, const QList<int> &ports)
 {
     g_probeHosts = hosts;
@@ -386,10 +494,12 @@ void SkydroidLink::_loadSettings()
 {
     QSettings settings;
     settings.beginGroup(kSettingsGroup);
+    // An unknown camera (an added one whose file is gone) is the V13.
+    const camera::Profile *saved = _cameraStore.find(settings.value(QStringLiteral("model"), camera::defaultId()).toString());
+    _camera = saved ? *saved : *_cameraStore.find(camera::defaultId());
     _enabled = settings.value(QStringLiteral("enabled"), false).toBool();
     _host = settings.value(QStringLiteral("host"), QString::fromLatin1(kDefaultHost)).toString().trimmed();
     _port = settings.value(QStringLiteral("port"), kDefaultPort).toInt();
-    _model = settings.value(QStringLiteral("model"), QString::fromLatin1(kDefaultModel)).toString();
     _maxSpeed = settings.value(QStringLiteral("maxSpeed"), kDefaultMaxSpeed).toInt();
     _reverseYaw = settings.value(QStringLiteral("reverseYaw"), false).toBool();
     _reversePitch = settings.value(QStringLiteral("reversePitch"), false).toBool();
@@ -410,14 +520,12 @@ void SkydroidLink::_loadSettings()
     if (!pointModes().contains(_pointMode)) {
         _pointMode = QStringLiteral("laser");
     }
+    // Empty: the camera's own.
     if (_dayVideoUrl.isEmpty()) {
-        _dayVideoUrl = QString::fromLatin1(kDefaultDayVideoUrl);
+        _dayVideoUrl = _camera.dayVideoUrl;
     }
     if (_thermalVideoUrl.isEmpty()) {
-        _thermalVideoUrl = QString::fromLatin1(kDefaultThermalVideoUrl);
-    }
-    if (!models().contains(_model)) {
-        _model = QString::fromLatin1(kDefaultModel);
+        _thermalVideoUrl = _camera.thermalVideoUrl;
     }
     if (_port <= 0 || _port > 65535) {
         _port = kDefaultPort;
@@ -434,7 +542,7 @@ void SkydroidLink::_saveSettings() const
     settings.setValue(QStringLiteral("enabled"), _enabled);
     settings.setValue(QStringLiteral("host"), _host);
     settings.setValue(QStringLiteral("port"), _port);
-    settings.setValue(QStringLiteral("model"), _model);
+    settings.setValue(QStringLiteral("model"), _camera.id);
     settings.setValue(QStringLiteral("maxSpeed"), _maxSpeed);
     settings.setValue(QStringLiteral("reverseYaw"), _reverseYaw);
     settings.setValue(QStringLiteral("reversePitch"), _reversePitch);
@@ -491,11 +599,27 @@ void SkydroidLink::setPort(int port)
 
 void SkydroidLink::setModel(const QString &model)
 {
-    if (model == _model || !models().contains(model)) {
+    const camera::Profile *p = _cameraStore.find(model);
+    if (!p || model == _camera.id) {
         return;
     }
-    _model = model;
+    _useCamera(*p, false);
+}
+
+void SkydroidLink::_useCamera(const camera::Profile &profile, bool withAddresses)
+{
+    _camera = profile;
     _applyModel();
+    if (withAddresses) {
+        _host = profile.host;
+        _port = profile.port;
+        _dayVideoUrl = profile.dayVideoUrl;
+        _thermalVideoUrl = profile.thermalVideoUrl;
+        _rebuildEndpoints();
+    } else if (_thermalVideoUrl.isEmpty()) {
+        // From a camera without a thermal picture: this one's, if it has one.
+        _thermalVideoUrl = profile.thermalVideoUrl;
+    }
     _saveSettings();
     emit settingsChanged();
 }
@@ -599,7 +723,7 @@ void SkydroidLink::setReverseTapYaw(bool reverse)
 
 void SkydroidLink::setDayVideoUrl(const QString &url)
 {
-    const QString u = url.trimmed().isEmpty() ? QString::fromLatin1(kDefaultDayVideoUrl) : url.trimmed();
+    const QString u = url.trimmed().isEmpty() ? _camera.dayVideoUrl : url.trimmed();
     if (u == _dayVideoUrl) {
         return;
     }
@@ -610,7 +734,7 @@ void SkydroidLink::setDayVideoUrl(const QString &url)
 
 void SkydroidLink::setThermalVideoUrl(const QString &url)
 {
-    const QString u = url.trimmed().isEmpty() ? QString::fromLatin1(kDefaultThermalVideoUrl) : url.trimmed();
+    const QString u = url.trimmed().isEmpty() ? _camera.thermalVideoUrl : url.trimmed();
     if (u == _thermalVideoUrl) {
         return;
     }
@@ -636,12 +760,10 @@ void SkydroidLink::_applyModel()
     if (_lockActive || _lockBusy) {
         _endLock(QString());
     }
+    // As VGCS's profiles: g_frames_upper_header and laser_max_m (the C14 Pro's choices).
     _options = top::Options{};
-    if (_model == QStringLiteral("C14 Pro")) {
-        // Same choices as the VGCS c14pro_default profile.
-        _options.gClassUpperHeader = true;
-        _options.slrMaxDm = top::slrMaxDmForRange(kC14ProLaserMaxM);
-    }
+    _options.gClassUpperHeader = _camera.upperGimbalHeader;
+    _options.slrMaxDm = top::slrMaxDmForRange(_camera.laserMaxM);
     // Another camera: nothing known about its zoom yet.
     if (_zoomStep != -1 || _zoomCount != 0 || !_zoomReport.isEmpty()) {
         _zoomStep = -1;
@@ -1178,22 +1300,9 @@ void SkydroidLink::pointDown()
 
 void SkydroidLink::currentFov(double &horizontalDeg, double &verticalDeg) const
 {
-    auto narrow = [](double fovDeg, double ratio) {
-        return 2.0 * std::atan(std::tan(fovDeg * kPi / 360.0) * ratio) * 180.0 / kPi;
-    };
-    if (_isZoomStepCamera()) {
-        // C14 Pro: the lens and crop for the step it reported (VGCS c14pro_default).
-        const int step = _zoomStep >= 0 ? _zoomStep : 0;
-        const bool longLens = step >= 86;
-        const int m = longLens ? std::clamp(step - 86, 0, 98) : std::clamp(step, 0, 85);
-        horizontalDeg = narrow(longLens ? 14.7 : 61.4, (3840.0 - 36.0 * m) / 3840.0);
-        verticalDeg = narrow(longLens ? 11.1 : 47.9, (2160.0 - 20.0 * m) / 2160.0);
-        return;
-    }
-    // C12, C13: narrowed by the zoom we counted, as VGCS does (tan(fov/2) / zoom).
-    const double zoomX = 1.0 + _zoomCount * kZoomPerStep;
-    horizontalDeg = narrow(kC13AimFovHDeg, 1.0 / zoomX);
-    verticalDeg = narrow(kC13AimFovVDeg, 1.0 / zoomX);
+    // The lens and crop for the step the camera reported (C14 Pro), or narrowed by the zoom
+    // we counted (C12, C13), as VGCS does.
+    camera::dayFov(_camera, _zoomCount, _zoomStep, horizontalDeg, verticalDeg);
 }
 
 bool SkydroidLink::pictureFov(double &horizontalDeg, double &verticalDeg) const
@@ -1202,15 +1311,9 @@ bool SkydroidLink::pictureFov(double &horizontalDeg, double &verticalDeg) const
         currentFov(horizontalDeg, verticalDeg);
         return true;
     }
-    if (_isZoomStepCamera()) {
-        horizontalDeg = kC14ThermalFovHDeg;
-        verticalDeg = kC14ThermalFovVDeg;
-        return true;
-    }
-    const bool c12 = _model == QStringLiteral("C12");
-    horizontalDeg = c12 ? kC12ThermalFovHDeg : kC13ThermalFovHDeg;
-    verticalDeg = c12 ? kC12ThermalFovVDeg : kC13ThermalFovVDeg;
-    return false;
+    horizontalDeg = _camera.thermalFovHDeg;
+    verticalDeg = _camera.thermalFovVDeg;
+    return _camera.thermalFovSure;
 }
 
 QStringList SkydroidLink::pointModes()
@@ -1346,7 +1449,8 @@ void SkydroidLink::aimAndMeasure(double u, double v)
     if (_laserBusy || _aimBusy || !std::isfinite(u) || !std::isfinite(v)) {
         return;
     }
-    if (_pointMode == QStringLiteral("picture")) {
+    // A camera without a laser: always from the picture.
+    if (_pointMode == QStringLiteral("picture") || !_camera.laser) {
         _measureFromPicture(u, v);
         return;
     }
@@ -1387,13 +1491,11 @@ double SkydroidLink::_setAimFor(double u, double v)
     const double dyawImage = (std::clamp(u, 0.0, 1.0) - 0.5) * hfov;    // right is +
     const double dpitchImage = (std::clamp(v, 0.0, 1.0) - 0.5) * vfov;  // down is +
     const bool negate = kNegateImageYaw != _reverseTapYaw;
-    const double yawLimit = _isZoomStepCamera() ? 120.0 : 90.0;
-    const double pitchTop = (_model == QStringLiteral("C13")) ? kC13PitchMaxDeg
-                          : (_isZoomStepCamera() ? 60.0 : kWheelPitchMaxDeg);
+    // The camera's own limits (C13: up to +10, C12: +30, C14 Pro: +60 and 120 either way).
     _aimPointYaw = _yaw + (negate ? -dyawImage : dyawImage);
     _aimPointPitch = _pitch - dpitchImage;
-    _aimYaw = std::clamp(_aimPointYaw, -yawLimit, yawLimit);
-    _aimPitch = std::clamp(_aimPointPitch, -90.0, pitchTop);
+    _aimYaw = std::clamp(_aimPointYaw, -_camera.yawLimitDeg, _camera.yawLimitDeg);
+    _aimPitch = std::clamp(_aimPointPitch, _camera.pitchMinDeg, _camera.pitchMaxDeg);
     return std::max(std::abs(dyawImage), std::abs(dpitchImage));
 }
 
@@ -1546,7 +1648,8 @@ bool SkydroidLink::lockAtBox(double u, double v, double w, double h)
         _setLockMessage(tr("Camera link is off. Turn it on in the camera settings."));
         return false;
     }
-    if (_lockMode == QStringLiteral("camera")) {
+    // A camera without a tracker of its own: the app follows, whatever the setting says.
+    if (_lockMode == QStringLiteral("camera") && _camera.ownTracker) {
         return _lockByCamera(u, v, wasLocked);
     }
     // A new object: the last measurement no longer applies.
@@ -2144,7 +2247,7 @@ void SkydroidLink::_lockTick()
 
 void SkydroidLink::_measureLockedObject()
 {
-    if (_pointMode != QStringLiteral("picture")) {
+    if (_pointMode != QStringLiteral("picture") && _camera.laser) {
         _fireLaser(true);
         return;
     }
@@ -2357,10 +2460,13 @@ void SkydroidLink::_updateWheelAngles()
         if (_wheelReverse) {
             t = 1.0 - t;
         }
-        const double pitchMax = (_model == QStringLiteral("C13")) ? kC13PitchMaxDeg : kWheelPitchMaxDeg;
+        // The wheel's range, inside what the camera can do.
+        const double pitchMin = std::max(_camera.pitchMinDeg, kWheelPitchMinDeg);
+        const double pitchMax = std::min(_camera.pitchMaxDeg, kWheelPitchMaxDeg);
+        const double yawRange = std::min(_camera.yawLimitDeg, kWheelYawRangeDeg);
         const double angle = (a == PitchAxis)
-            ? kWheelPitchMinDeg + t * (pitchMax - kWheelPitchMinDeg)
-            : -kWheelYawRangeDeg + t * 2.0 * kWheelYawRangeDeg;
+            ? pitchMin + t * (pitchMax - pitchMin)
+            : -yawRange + t * 2.0 * yawRange;
         _wheelTarget[a] = angle;
         if (!_wheelSent[a] || std::abs(*_wheelSent[a] - angle) >= kWheelAngleStepDeg) {
             changed = true;
@@ -2448,11 +2554,17 @@ void SkydroidLink::_finishWheelDetect()
 
 void SkydroidLink::takePhoto()
 {
+    if (!_camera.photo) {
+        return;
+    }
     _send(top::buildPhoto(_options));
 }
 
 void SkydroidLink::toggleRecord()
 {
+    if (!_camera.record) {
+        return;
+    }
     _send(top::buildRecord(_options));
     _recording = !_recording;
     emit recordingChanged();
@@ -2460,7 +2572,7 @@ void SkydroidLink::toggleRecord()
 
 void SkydroidLink::zoom(int direction)
 {
-    if (direction == 0) {
+    if (direction == 0 || _camera.zoom == camera::Zoom::None) {
         return;
     }
     const int d = direction > 0 ? 1 : -1;
@@ -2486,6 +2598,9 @@ void SkydroidLink::zoom(int direction)
 
 void SkydroidLink::zoomHome()
 {
+    if (_camera.zoom == camera::Zoom::None) {
+        return;
+    }
     _endAppLockForZoom();
     if (_isZoomStepCamera()) {
         for (const std::string &frame : top::buildDzmHomeFrames(_options)) {
@@ -2545,17 +2660,13 @@ void SkydroidLink::_sendZoomFrames(const std::vector<std::string> &frames)
 int SkydroidLink::_zoomStepsMax() const
 {
     // C13: 30x digital zoom, C12: 4x (DOCS/SKYDROID-CAMERA-SPECS.md).
-    const double maxZoom = (_model == QStringLiteral("C12")) ? 4.0 : 30.0;
-    return static_cast<int>(std::lround((maxZoom - 1.0) / kZoomPerStep));
+    return camera::countedStepsMax(_camera);
 }
 
 QString SkydroidLink::zoomLabel() const
 {
-    if (_isZoomStepCamera()) {
-        // The camera reports its step; until it does, show nothing rather than a guess.
-        return _zoomStep >= 0 ? c14ProZoomLabel(_zoomStep) : QString();
-    }
-    return QStringLiteral("%1x").arg(1.0 + _zoomCount * kZoomPerStep, 0, 'f', 1);
+    // A camera that reports its step: until it does, nothing rather than a guess.
+    return camera::zoomLabel(_camera, _zoomCount, _zoomStep);
 }
 
 // --- Laser ---------------------------------------------------------------------
@@ -2570,9 +2681,10 @@ void SkydroidLink::_fireLaser(bool keepLastResult)
     if (_laserBusy || _aimBusy || _lockBusy) {  // a tap aim or a lock fires the laser itself when it arrives
         return;
     }
-    if (!_socket) {
+    if (!_socket || !_camera.laser) {
         _laserValid = false;
-        _laserMessage = tr("Camera link is off. Turn it on in the camera settings.");
+        _laserMessage = !_socket ? tr("Camera link is off. Turn it on in the camera settings.")
+                                 : tr("This camera has no laser.");
         emit laserChanged();
         return;
     }
