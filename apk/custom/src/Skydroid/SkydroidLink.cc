@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <type_traits>
 #include <vector>
 
 namespace top = skydroid::top;
@@ -333,6 +334,11 @@ SkydroidLink *SkydroidLink::create(QQmlEngine *qmlEngine, QJSEngine *jsEngine)
     QJSEngine::setObjectOwnership(link, QJSEngine::CppOwnership);
     return link;
 }
+
+// QML calls create() only for a singleton that cannot be made without an argument (see the
+// constructor in SkydroidLink.h). Else the screen gets a link of its own.
+static_assert(!std::is_default_constructible_v<SkydroidLink>,
+              "QML would make its own SkydroidLink instead of using SkydroidLink::create()");
 
 QStringList SkydroidLink::models()
 {

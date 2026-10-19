@@ -21,6 +21,10 @@
 #include <QtGui/QImage>
 #include <QtNetwork/QNetworkDatagram>
 #include <QtNetwork/QUdpSocket>
+#include <QtQml/QQmlComponent>
+#include <QtQml/QQmlEngine>
+#include <QtQml/qqml.h>
+#include <QtQml/qqmlprivate.h>
 #include <QtTest/QSignalSpy>
 #include <QtTest/QtTest>
 
@@ -427,7 +431,7 @@ private slots:
         _vehicle.vehicle.remove("altitudeRelative");
 
         _camera = new FakeCamera;
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         _link->setHost("127.0.0.1");
         _link->setPort(_camera->port());
         _link->setModel("C13");
@@ -1178,7 +1182,7 @@ private slots:
         // The mode is kept for the next start.
         _link->setLockMode("camera");
         delete _link;
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         QCOMPARE(_link->lockMode(), QString("camera"));
     }
 
@@ -2209,7 +2213,7 @@ private slots:
         QCOMPARE(_link->pointMode(), QString("laser"));
         _link->setPointMode("picture");
         delete _link;
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         QCOMPARE(_link->pointMode(), QString("picture"));
     }
 
@@ -2513,7 +2517,7 @@ private slots:
         _link->setDayVideoUrl("  rtsp://10.0.0.5:554/main  ");
         _link->setThermalVideoUrl("");  // empty = the camera's default
         delete _link;
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         QCOMPARE(_link->dayVideoUrl(), QString("rtsp://10.0.0.5:554/main"));
         QCOMPARE(_link->thermalVideoUrl(), QString("rtsp://192.168.144.108:555/stream=2"));
     }
@@ -2558,7 +2562,7 @@ private slots:
         _link->setThermalPalette("ironbow");  // no change, no signal
         QCOMPARE(changed.size(), 1);
         delete _link;
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         QCOMPARE(_link->thermalPalette(), QString("ironbow"));
         _link->setThermalPalette("plasma");  // unknown: as received, like VGCS
         QCOMPARE(_link->thermalPalette(), QString("camera"));
@@ -2569,11 +2573,11 @@ private slots:
     {
         delete _link;
         QSettings().setValue("VamaSkydroid/thermalPalette", "plasma");
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         QCOMPARE(_link->thermalPalette(), QString("camera"));
         delete _link;
         QSettings().setValue("VamaSkydroid/thermalPalette", "SEPIA");
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         QCOMPARE(_link->thermalPalette(), QString("sepia"));
         QCOMPARE(_link->thermalPaletteIndex(), kThermalPaletteCount - 1);
     }
@@ -2587,7 +2591,7 @@ private slots:
         _link->setWheelPitchChannel(9);
         _link->setWheelHoldsPosition(true);
         delete _link;
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         QCOMPARE(_link->model(), QString("C14 Pro"));
         QCOMPARE(_link->host(), QString("127.0.0.2"));
         QCOMPARE(_link->maxSpeed(), 35);
@@ -2713,7 +2717,10 @@ private slots:
             ++pictures;
             QTest::qWait(30);
         }
-        QVERIFY(pictures >= 15);
+        // The pictures must come faster than the places (180 ms apart), or this proves nothing: with 7
+        // or more, a missing limit gives more than 6 places. Alone this debug build gets 16 to 23 in the
+        // second, and fewer than 15 twice in a full run (2026-10-17 and 19), so 10, with room.
+        QVERIFY2(pictures >= 10, qPrintable(QString::number(pictures)));
         QVERIFY2(placed.count() >= 4 && placed.count() <= 6, qPrintable(QString::number(placed.count())));
         _link->stopLock();
     }
@@ -3161,6 +3168,110 @@ private slots:
         QVERIFY(!_follow->active());
         QVERIFY2(_follow->message().contains("the object's position is not known well enough"), qPrintable(_follow->message()));
         QVERIFY(_follow->distanceM() < 0.0);  // and no distance is shown yet
+        _link->stopLock();
+    }
+
+    // Task X (client video 2026-10-16 21:13, build 10): the app's lock was on and saw the object
+    // ("LOCKED", match 82, 10 pictures a second), and the Follow window said "Follow needs a locked
+    // object that the app sees. Lock the object first." The Follow tests above all lock a drawn box
+    // on a Follow made before the lock. These lock the other ways the app does. (They all passed:
+    // the cause was the second link, see theAppsSingletonsAreMadeByTheirCreate.)
+
+    void theAppsSingletonsAreMadeByTheirCreate()
+    {
+        // The cause of task X, and of task V (a tap on a mark locked nothing): QML makes a singleton
+        // with a constructor that needs no argument when the class has one, and with its create() only
+        // when it has none (Qt's qqmlprivate.h, singletonConstructionMode). SkydroidLink had one (its
+        // parent had a default). So in builds 9 and 10 QML made a link of its own for the screen, while
+        // Follow Me and the marks used SkydroidLink::instance(): a second link, never locked. The tests
+        // and the preview hand the same link to all, so they never saw it.
+        using Mode = QQmlPrivate::SingletonConstructionMode;
+        QCOMPARE(int(QQmlPrivate::singletonConstructionMode<SkydroidLink, SkydroidLink>()), int(Mode::Factory));
+        QCOMPARE(int(QQmlPrivate::singletonConstructionMode<ObjectFollow, ObjectFollow>()), int(Mode::Factory));
+        QCOMPARE(int(QQmlPrivate::singletonConstructionMode<ObjectMarks, ObjectMarks>()), int(Mode::Factory));
+    }
+
+    void followIsReadyForAnObjectLockedByItsMark()
+    {
+        // Since build 9 objects are mostly locked by a tap on their mark.
+        using skydroid::find::Kind;
+        _withFollow();
+        _withMarks();
+        _seen->sleepMs = 2;
+        _hoverAt(100.0, -60.0);
+        _marks->setLooking(true);
+        for (int i = 0; i <= 8; ++i) {
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            _drone->tell(_telemetry);
+            if (i == 2) {
+                _see({_thing(Kind::Person, 0.5 * 1280.0, 360.0, 0.06 * 1280.0, 0.2 * 720.0)});
+                QVERIFY(_look());
+            }
+            QTest::qWait(70);
+        }
+        QVERIFY(_marks->lockAt(0.5, 0.5));
+        _marks->setLooking(false);
+        QVERIFY2(_link->lockActive() && _link->lockByApp(), qPrintable(_link->lockMessage()));
+        QVERIFY2(_goOnUntil([this]() { return _follow->ready(); }, 8000), qPrintable(_follow->notReadyText()));
+        _link->stopLock();
+    }
+
+    void followIsReadyAfterTheLockWasReplaced()
+    {
+        _withFollow();
+        _lockAndKnowTheObject();
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);  // another object, with Follow not running
+        QVERIFY(!_follow->ready());
+        QVERIFY2(_goOnUntil([this]() { return _follow->ready(); }, 8000), qPrintable(_follow->notReadyText()));
+        _link->stopLock();
+    }
+
+    void followIsReadyAfterAMarkLockReplacedALock()
+    {
+        // The lock button again while locked, and a tap on a mark.
+        using skydroid::find::Kind;
+        _withFollow();
+        _withMarks();
+        _seen->sleepMs = 2;
+        _lockAndKnowTheObject();
+        _marks->setLooking(true);
+        for (int i = 0; i <= 8; ++i) {
+            _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            _drone->tell(_telemetry);
+            if (i == 2) {
+                _see({_thing(Kind::Person, 0.5 * 1280.0, 360.0, 0.06 * 1280.0, 0.2 * 720.0)});
+                QVERIFY(_lookAgain());
+            }
+            QTest::qWait(70);
+        }
+        QVERIFY(_marks->lockAt(0.5, 0.5));
+        _marks->setLooking(false);
+        QVERIFY2(_goOnUntil([this]() { return _follow->ready(); }, 8000), qPrintable(_follow->notReadyText()));
+        _link->stopLock();
+    }
+
+    void followMadeWhileALockIsOnIsReady()
+    {
+        // The app makes Follow when its screen first asks for it, maybe while a lock is on.
+        _hoverAt(100.0, -60.0);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _goOn(600);
+        QVERIFY(_link->lockActive());
+        _withFollow();
+        QVERIFY2(_goOnUntil([this]() { return _follow->ready(); }, 8000), qPrintable(_follow->notReadyText()));
+        _link->stopLock();
+    }
+
+    void followIsReadyWhenTheDroneConnectsDuringTheLock()
+    {
+        _withFollow();
+        _drone->whyNotText = QStringLiteral("Follow cannot start: no drone is connected.");
+        _hoverAt(100.0, -60.0);
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _goOn(1500);
+        QCOMPARE(_follow->notReadyText(), _drone->whyNotText);
+        _drone->whyNotText.clear();
+        QVERIFY2(_goOnUntil([this]() { return _follow->ready(); }, 8000), qPrintable(_follow->notReadyText()));
         _link->stopLock();
     }
 
@@ -4578,6 +4689,46 @@ private slots:
         }
     }
 
+    // Keep this the last test: it makes the app's own link, Follow and marks (their instance()),
+    // and those stay for the rest of the run.
+    void qmlGetsTheAppsOneLinkAndFollowSeesItsLock()
+    {
+        // Task X and task V on a real QML engine, with the types registered as the app's build
+        // registers them (vama-gcs_qmltyperegistrations.cpp: qmlRegisterTypesAndRevisions<...>).
+        qmlRegisterTypesAndRevisions<SkydroidLink>("VamaLinkTest", 1);
+        qmlRegisterTypesAndRevisions<ObjectFollow>("VamaLinkTest", 1);
+        qmlRegisterTypesAndRevisions<ObjectMarks>("VamaLinkTest", 1);
+        qmlRegisterModule("VamaLinkTest", 1, 0);
+        QQmlEngine engine;
+        QQmlComponent component(&engine);
+        component.setData("import QtQml\nimport VamaLinkTest\n"
+                          "QtObject { readonly property var link: SkydroidLink; "
+                          "readonly property var follow: ObjectFollow; readonly property var marks: ObjectMarks }",
+                          QUrl());
+        std::unique_ptr<QObject> screen(component.create());
+        QVERIFY2(screen, qPrintable(component.errorString()));
+        // The screen, Follow Me and the marks all have the app's one link (the instance() link
+        // reads the settings this test's link saved: the stand-in camera on this computer).
+        SkydroidLink *const link = SkydroidLink::instance();
+        ObjectFollow *const follow = ObjectFollow::instance();
+        QCOMPARE(screen->property("link").value<QObject *>(), static_cast<QObject *>(link));
+        QCOMPARE(screen->property("follow").value<QObject *>(), static_cast<QObject *>(follow));
+        QCOMPARE(screen->property("marks").value<QObject *>(), static_cast<QObject *>(ObjectMarks::instance()));
+        // A lock that the screen starts is the lock Follow sees.
+        QVERIFY(follow->notReadyText().contains("Lock the object first"));
+        QVERIFY(link->lockAtBox(0.5, 0.5, 0.06, 0.2));
+        QElapsedTimer clock;
+        clock.start();
+        while (!(link->lockActive() && link->lockSeen()) && clock.elapsed() < 3000) {
+            link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(90);
+        }
+        QVERIFY2(link->lockActive() && link->lockByApp() && link->lockSeen(), qPrintable(link->lockMessage()));
+        QTRY_VERIFY2_WITH_TIMEOUT(!follow->notReadyText().contains("Lock the object first"), qPrintable(follow->notReadyText()), 2000);
+        link->stopLock();
+        link->setEnabled(false);
+    }
+
 private:
 
     /// The marks on this link, with a stand-in for the network: it finds what the test puts into
@@ -4776,7 +4927,7 @@ private:
     {
         delete _link;
         SkydroidLink::setProbeTargets(hosts, ports);
-        _link = new SkydroidLink;
+        _link = new SkydroidLink(nullptr);
         QVERIFY(_link->enabled());
     }
 

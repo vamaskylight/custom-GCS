@@ -199,9 +199,15 @@ class SkydroidLink : public QObject
     Q_PROPERTY(QString detectingWheel READ detectingWheel NOTIFY detectingWheelChanged)
 
 public:
-    explicit SkydroidLink(QObject *parent = nullptr);
+    /// No default for the parent, on purpose. QML makes a singleton (QML_SINGLETON) with a
+    /// constructor that needs no argument when there is one, and with create() only when there
+    /// is none (Qt's qqmlprivate.h, singletonConstructionMode). With a default here, QML made
+    /// a link of its own for the screen, and Follow Me and the marks used instance(), a second
+    /// link that was never locked (tasks X and V, builds 9 and 10).
+    explicit SkydroidLink(QObject *parent);
     ~SkydroidLink() override;
 
+    /// The app's one link. QML gets it too (create()).
     static SkydroidLink *instance();
     static SkydroidLink *create(QQmlEngine *qmlEngine, QJSEngine *jsEngine);
 

@@ -652,7 +652,7 @@ int main(int argc, char *argv[])
 
     FakeCamera camera;
     SkydroidLink::setProbeTargets({}, {});  // no real network from a preview
-    SkydroidLink link;
+    SkydroidLink link(nullptr);
     link.setHost(QStringLiteral("127.0.0.1"));
     link.setPort(camera.port());
     link.setEnabled(true);
