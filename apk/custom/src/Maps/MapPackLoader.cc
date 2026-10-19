@@ -252,6 +252,9 @@ void MapPackLoader::_write(const MapPack::Pack &pack)
     const int mapId = UrlFactory::getQtMapIdFromProviderType(pack.mapName);
     const QString mapName = pack.mapName;
     qCInfo(MapPackLog) << "Loading" << pack.folder << "with" << pack.tiles.size() << "pictures," << (pack.bytes >> 10) << "KB";
+    // A big pack takes minutes: said at once, so an empty map is not taken for a failure.
+    _setLoading(tr("Loading map pack \"%1\": %2 map pictures, zoom %3 to %4. The map shows them when this is done.")
+                    .arg(pack.name).arg(pack.tiles.size()).arg(pack.minZoom).arg(pack.maxZoom));
     _runInThread([this, pack, file, setName, mapId, mapName]() {
         const MapPack::Written written = MapPack::writeTileFile(
             pack, file, setName, mapId,
@@ -303,6 +306,8 @@ void MapPackLoader::_imported()
     }
     _keep(key, kept);
     _loadedMap = _importing.mapName;
+    _loadedLatitude = (_importing.north + _importing.south) / 2.0;
+    _loadedLongitude = (_importing.west + _importing.east) / 2.0;
     QString line = tr("Map pack \"%1\" is loaded: %2 map pictures, zoom %3 to %4. The map shows this place without the internet.")
                        .arg(_importing.name).arg(_importWritten.tiles).arg(_importing.minZoom).arg(_importing.maxZoom);
     if (_importWritten.skipped > 0) {
@@ -324,7 +329,9 @@ void MapPackLoader::_importFailed(const QString &error)
 
 void MapPackLoader::_finish()
 {
-    if (!_loadedMap.isEmpty()) {
+    _setLoading(QString());
+    const bool loaded = !_loadedMap.isEmpty();
+    if (loaded) {
         // QGC keeps pictures per map, so the map that shows the pack's pictures is chosen.
         FlightMapSettings *const settings = SettingsManager::instance()->flightMapSettings();
         const QString current = settings->mapProvider()->rawValue().toString() + QLatin1Char(' ') + settings->mapType()->rawValue().toString();
@@ -347,7 +354,18 @@ void MapPackLoader::_finish()
         qgcApp()->showAppMessage(_lines.join(QStringLiteral("\n\n")), tr("Offline maps"));
         _lines.clear();
     }
+    if (loaded) {
+        emit packLoaded(_loadedLatitude, _loadedLongitude);
+    }
     emit done();
+}
+
+void MapPackLoader::_setLoading(const QString &line)
+{
+    if (line != _loading) {
+        _loading = line;
+        emit loadingChanged();
+    }
 }
 
 void MapPackLoader::_report(const MapPack::Pack &pack, const QString &problem)

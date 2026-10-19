@@ -49,6 +49,7 @@ __all__ = [
     "import_tile_pack",
     "pack_manifest_path",
     "PACK_MAX_TILES",
+    "OVERVIEW_PACK_ZOOMS",
 ]
 
 # A 10 km mission at zoom 14-18 is roughly 7000 tiles / 150 MB. This cap leaves
@@ -59,6 +60,12 @@ PACK_MAX_TILES = 25_000
 # home, is still on imagery. In kilometres.
 PACK_MARGIN_KM = 1.0
 DEFAULT_PACK_ZOOMS = (14, 15, 16, 17, 18)
+# Zoomed out, a pack of zoom 14 to 18 alone is an empty map: on the remote control the
+# operator saw nothing at the zoom the map was at, and took the pack for broken (field test
+# of APK build 11, 2026-10-19). A few dozen pictures of zoom 10 to 13 around the area show
+# where it is. They cover a wider square: the area, plus this much each way.
+OVERVIEW_PACK_ZOOMS = (10, 11, 12, 13)
+OVERVIEW_MARGIN_KM = 5.0
 _MANIFEST = "pack.json"
 _KM_PER_DEG_LAT = 111.32
 
@@ -115,11 +122,18 @@ def plan_pack_for_bbox(
     zooms: Iterable[int] = DEFAULT_PACK_ZOOMS,
     margin_km: float = PACK_MARGIN_KM,
     max_tiles: int = PACK_MAX_TILES,
+    overview_zooms: Iterable[int] = (),
+    overview_margin_km: float = OVERVIEW_MARGIN_KM,
 ) -> PackPlan:
     """Every tile covering the box (plus margin) at each zoom, capped.
 
     The cap is applied shallow-first: if the plan must be cut, it loses the
     deepest zoom's outer tiles, never the overview that shows where you are.
+
+    ``overview_zooms`` (OVERVIEW_PACK_ZOOMS for a pack) add the zoomed-out
+    pictures of a wider square, ``overview_margin_km`` more each way. They come
+    first, so the cap never cuts them. A zoom in both lists is planned once,
+    over the wider square. ``bbox`` stays the box of the detail.
     """
     lo_lat, hi_lat = sorted((float(lat0), float(lat1)))
     lo_lon, hi_lon = sorted((float(lon0), float(lon1)))
@@ -134,14 +148,26 @@ def plan_pack_for_bbox(
     zs = tuple(sorted({int(z) for z in zooms if 3 <= int(z) <= 22}))
     max_z = _ntm._max_zoom_for_template(template, max(zs) if zs else 19)
     zs = tuple(z for z in zs if z <= max_z)
+    ovz = tuple(sorted({int(z) for z in overview_zooms if 3 <= int(z) <= max_z}))
+    zs = tuple(z for z in zs if z not in ovz)
 
-    wanted: list[tuple[int, int, int]] = []
-    for z in zs:
-        x_lo, y_hi = _ntm._tile_xy(lo_lat, lo_lon, z)
-        x_hi, y_lo = _ntm._tile_xy(hi_lat, hi_lon, z)
+    def box_tiles(z: int, s: float, w: float, n: float, e: float) -> Iterable[tuple[int, int, int]]:
+        x_lo, y_hi = _ntm._tile_xy(s, w, z)
+        x_hi, y_lo = _ntm._tile_xy(n, e, z)
         for tx in range(min(x_lo, x_hi), max(x_lo, x_hi) + 1):
             for ty in range(min(y_lo, y_hi), max(y_lo, y_hi) + 1):
-                wanted.append((z, tx, ty))
+                yield (z, tx, ty)
+
+    wanted: list[tuple[int, int, int]] = []
+    if ovz:
+        odlat = float(overview_margin_km) / _KM_PER_DEG_LAT
+        odlon = float(overview_margin_km) / (_KM_PER_DEG_LAT * max(0.05, math.cos(math.radians(mid_lat))))
+        o_lat_lo = max(-85.0, lo_lat - odlat)
+        o_lat_hi = min(85.0, hi_lat + odlat)
+        for z in ovz:
+            wanted.extend(box_tiles(z, o_lat_lo, lo_lon - odlon, o_lat_hi, hi_lon + odlon))
+    for z in zs:
+        wanted.extend(box_tiles(z, lo_lat, lo_lon, hi_lat, hi_lon))
 
     cap = max(0, int(max_tiles))
     over = max(0, len(wanted) - cap)
@@ -164,6 +190,7 @@ def plan_pack_for_area(
     template: str,
     zooms: Iterable[int] = DEFAULT_PACK_ZOOMS,
     max_tiles: int = PACK_MAX_TILES,
+    overview_zooms: Iterable[int] = (),
 ) -> PackPlan:
     """A square ``radius_km`` around one point. For a site with no plan yet."""
     r = max(0.1, float(radius_km))
@@ -172,6 +199,7 @@ def plan_pack_for_area(
     return plan_pack_for_bbox(
         lat - dlat, lon - dlon, lat + dlat, lon + dlon,
         template=template, zooms=zooms, margin_km=0.0, max_tiles=max_tiles,
+        overview_zooms=overview_zooms,
     )
 
 
@@ -182,6 +210,7 @@ def plan_pack_for_waypoints(
     zooms: Iterable[int] = DEFAULT_PACK_ZOOMS,
     margin_km: float = PACK_MARGIN_KM,
     max_tiles: int = PACK_MAX_TILES,
+    overview_zooms: Iterable[int] = (),
 ) -> PackPlan | None:
     """The box around a mission's points. ``None`` when there are none."""
     pts = [(float(a), float(b)) for a, b in points if a is not None and b is not None]
@@ -193,6 +222,7 @@ def plan_pack_for_waypoints(
     return plan_pack_for_bbox(
         min(lats), min(lons), max(lats), max(lons),
         template=template, zooms=zooms, margin_km=margin_km, max_tiles=max_tiles,
+        overview_zooms=overview_zooms,
     )
 
 

@@ -24,6 +24,10 @@
 //    pictures): QGC keeps pictures per map, so only that map shows them.
 //  - One message says what was loaded, and what was not and why. Nothing is said when
 //    there was nothing new.
+//  - While a pack loads, loading() says so (the fly view shows it), and when a pack was loaded,
+//    packLoaded() gives the middle of its area: with no position from the drone, the fly view
+//    moves the map there. (Task AB, field test of build 11: a pack of 2,374 pictures took
+//    minutes, the app said nothing meanwhile, and the map stayed on another place.)
 //
 // The pack folders are only read, never changed.
 
@@ -60,9 +64,15 @@ public:
     /// The folders looked in for packs. The first is the app's own.
     static QStringList folders();
 
+    /// While a pack is being loaded, a line that says which. Empty otherwise.
+    QString loading() const { return _loading; }
+
 signals:
     /// All packs were looked at, and the message (if any) was shown.
     void done();
+    void loadingChanged();
+    /// A pack was loaded in this start: the middle of its area (of the last one, with several).
+    void packLoaded(double latitude, double longitude);
 
 private:
     // What the settings keep of a pack, by its folder.
@@ -84,6 +94,7 @@ private:
     void _importFailed(const QString &error);
     void _finish();
     void _report(const MapPack::Pack &pack, const QString &problem);
+    void _setLoading(const QString &line);
     void _runInThread(std::function<void()> work);
     bool _addTask(QGCMapTask *task);
     void _retryLater();
@@ -107,7 +118,10 @@ private:
     QStringList _roots;      // folders(), as they were at the start
     QString _workFolder;     // the go-between files
     QStringList _lines;      // the message, line by line
+    QString _loading;        // loading()
     QString _loadedMap;      // the map of the last pack loaded
+    double _loadedLatitude = 0.0;   // the middle of its area
+    double _loadedLongitude = 0.0;
     bool _downloadHint = false;
     int _retries = 0;
     QTimer _retryTimer;

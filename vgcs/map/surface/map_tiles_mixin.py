@@ -904,8 +904,11 @@ class MapTilesMixin:
         A plan is the honest basis. "Around the current view" was how the old
         cache button worked, and an operator who planned a 10 km sortie then
         pressed it cached the launch field and nothing along the route.
+
+        It also holds a zoomed-out overview of a wider square (zoom 10 to 13,
+        a few dozen pictures), so a map that is not zoomed in is not empty.
         """
-        from vgcs.map.tile_pack import plan_pack_for_area, plan_pack_for_waypoints
+        from vgcs.map.tile_pack import OVERVIEW_PACK_ZOOMS, plan_pack_for_area, plan_pack_for_waypoints
 
         template = self._pack_source_template()
         points: list[tuple[float, float]] = []
@@ -920,13 +923,18 @@ class MapTilesMixin:
                 points.append((float(home[0]), float(home[1])))
         except Exception:
             pass
-        plan = plan_pack_for_waypoints(points, template=template) if points else None
+        plan = (
+            plan_pack_for_waypoints(points, template=template, overview_zooms=OVERVIEW_PACK_ZOOMS)
+            if points else None
+        )
         if plan is not None:
             return plan
         nm = getattr(self, "_native_map", None)
         lat = float(getattr(nm, "_center_lat", 0.0) or 0.0)
         lon = float(getattr(nm, "_center_lon", 0.0) or 0.0)
-        return plan_pack_for_area(lat, lon, radius_km=radius_km, template=template)
+        return plan_pack_for_area(
+            lat, lon, radius_km=radius_km, template=template, overview_zooms=OVERVIEW_PACK_ZOOMS
+        )
 
     def describe_tile_pack_plan(self, plan) -> str:
         zs = f"zoom {plan.zooms[0]}-{plan.zooms[-1]}" if plan.zooms else "no zoom levels"

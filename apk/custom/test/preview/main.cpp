@@ -41,6 +41,7 @@
 //   31_cameras.png        the camera editor (task AA): the built-in cameras, to copy
 //   32_camera_form.png    a copy of the V13 being made into a camera without laser, photo, recording, zoom or IR
 //   33_plain_camera.png   that camera in use: its buttons only
+//   34_map_pack_loading.png  a map pack loading: the fly view says so (task AB)
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
 // The lock is tried for real: the day picture is a look into a world that
@@ -298,13 +299,24 @@ public:
     }
     Q_INVOKABLE int adminWaitSeconds() const { return _password.waitSeconds(nowMs); }
 
+    // CustomPlugin's map pack line and signal (task AB).
+    Q_PROPERTY(QString mapPackLoading MEMBER mapPackLoading NOTIFY mapPackLoadingChanged)
+    void setMapPackLoading(const QString &line)
+    {
+        mapPackLoading = line;
+        emit mapPackLoadingChanged();
+    }
+
     bool showTouchAreas = false;
     qint64 nowMs = 0;
     int tries = 0;  // passwords checked
+    QString mapPackLoading;
 
 signals:
     void showAdvancedUIChanged(bool on);
     void showTouchAreasChanged();
+    void mapPackLoadingChanged();
+    void mapPackLoaded(double latitude, double longitude);
 
 private:
     FakeCoreOptions _options;
@@ -321,6 +333,9 @@ class FakeGlobal : public QObject
     Q_PROPERTY(QObject *corePlugin READ corePlugin CONSTANT)
     Q_PROPERTY(QString qgcVersion READ qgcVersion CONSTANT)
     Q_PROPERTY(qreal zOrderTopMost READ zOrderTopMost CONSTANT)
+    // QGC's saved map position and zoom (QGroundControlQmlGlobal).
+    Q_PROPERTY(QGeoCoordinate flightMapPosition MEMBER flightMapPosition NOTIFY flightMapChanged)
+    Q_PROPERTY(double flightMapZoom MEMBER flightMapZoom NOTIFY flightMapChanged)
 
 public:
     QObject *videoManager() { return &_videoManager; }
@@ -332,6 +347,11 @@ public:
     FakeSettingsManager settings;
     FakeQmlVehicleManager vehicles;
     FakeCorePlugin core;
+    QGeoCoordinate flightMapPosition;
+    double flightMapZoom = 16.0;
+
+signals:
+    void flightMapChanged();
 
 private:
     FakeVideoManager _videoManager;
@@ -2424,6 +2444,48 @@ int main(int argc, char *argv[])
              QQuickItem *laser = findItem("vamaLaserButton");
              expect(laser && laser->isVisible(), "cameras: the V13's buttons are back", QString());
              press("vamaCameraEditorClose");
+             // A map pack loading, then loaded (task AB).
+             global.core.setMapPackLoading(QStringLiteral("Loading map pack \"kalol\": 2374 map pictures, zoom 10 to 18. "
+                                                          "The map shows them when this is done."));
+         }},
+        {300, [&]() {
+             QQuickItem *chip = findItem("vamaMapPackLoading");
+             QQuickItem *text = findItem("vamaMapPackLoadingText");
+             expect(chip && chip->isVisible() && text && text->property("text").toString().startsWith(QStringLiteral("Loading map pack \"kalol\"")),
+                    "map pack: while it loads, the fly view says so", text ? text->property("text").toString() : QString());
+             shot("34_map_pack_loading.png");
+             global.core.setMapPackLoading(QString());
+             // Loaded, and the drone has no position: the map goes to the pack.
+             global.vehicles.vehicle.position.set(false);
+             emit global.core.mapPackLoaded(20.4458, 72.8634);
+         }},
+        {300, [&]() {
+             QQuickItem *chip = findItem("vamaMapPackLoading");
+             expect(chip && !chip->isVisible(), "map pack: the line goes when loading has ended", QString());
+             QObject *layer = window->property("layer").value<QObject *>();
+             QObject *map = layer ? layer->property("mapControl").value<QObject *>() : nullptr;
+             const QGeoCoordinate centre = map ? map->property("center").value<QGeoCoordinate>() : QGeoCoordinate();
+             expect(map && std::abs(centre.latitude() - 20.4458) < 1e-9 && std::abs(centre.longitude() - 72.8634) < 1e-9 &&
+                        map->property("zoomLevel").toDouble() == 12.0,
+                    "map pack: with no position from the drone, the small map goes to the pack, 3 zooms out",
+                    QStringLiteral("%1, %2 at zoom %3").arg(centre.latitude(), 0, 'f', 4).arg(centre.longitude(), 0, 'f', 4)
+                        .arg(map ? map->property("zoomLevel").toDouble() : 0.0));
+             expect(std::abs(global.flightMapPosition.latitude() - 20.4458) < 1e-9 && global.flightMapZoom == 15.0,
+                    "map pack: and QGC's map position is the pack's, at zoom 15",
+                    QStringLiteral("zoom %1").arg(global.flightMapZoom));
+             // With a position from the drone, QGC's map stays with the drone.
+             global.vehicles.vehicle.position.set(true);
+             if (map) {
+                 map->setProperty("center", QVariant::fromValue(QGeoCoordinate(18.52, 73.85)));
+             }
+             emit global.core.mapPackLoaded(20.4458, 72.8634);
+         }},
+        {300, [&]() {
+             QObject *layer = window->property("layer").value<QObject *>();
+             QObject *map = layer ? layer->property("mapControl").value<QObject *>() : nullptr;
+             const QGeoCoordinate centre = map ? map->property("center").value<QGeoCoordinate>() : QGeoCoordinate();
+             expect(map && std::abs(centre.latitude() - 18.52) < 1e-9, "map pack: with a position from the drone, the map is not moved",
+                    QStringLiteral("%1").arg(centre.latitude(), 0, 'f', 4));
          }},
         {100, [&]() { QCoreApplication::quit(); }},
     };

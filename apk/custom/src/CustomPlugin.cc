@@ -62,7 +62,14 @@ void CustomPlugin::init()
     // VAMA (client 2026-10-15, task U): the map packs made by VGCS load by themselves, so the
     // map shows the place on a remote control that is never online.
     _mapPacks = new MapPackLoader(this);
+    (void) connect(_mapPacks, &MapPackLoader::loadingChanged, this, &CustomPlugin::mapPackLoadingChanged);
+    (void) connect(_mapPacks, &MapPackLoader::packLoaded, this, &CustomPlugin::mapPackLoaded);
     _mapPacks->start();
+}
+
+QString CustomPlugin::mapPackLoading() const
+{
+    return _mapPacks ? _mapPacks->loading() : QString();
 }
 
 void CustomPlugin::_advancedChanged(bool changed)

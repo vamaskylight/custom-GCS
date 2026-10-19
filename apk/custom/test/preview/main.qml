@@ -99,10 +99,15 @@ Window {
 
     QtObject {
         id: fakeMap
+        objectName: "fakeMap"
         property QtObject pipState: QtObject {
             property string state:              window.mapIsMain ? "full" : "pip"
             readonly property string fullState: "full"
         }
+        // QGC's FlyViewMap: where it looks, how close, and whether it is the small map.
+        property var  center:    null
+        property real zoomLevel: 16
+        property bool pipMode:   !window.mapIsMain
         function addMapItem(item) { }
     }
 

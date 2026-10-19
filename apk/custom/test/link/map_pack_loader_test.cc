@@ -143,6 +143,22 @@ private slots:
         QCOMPARE(QDir(_own + QStringLiteral("/kalol/16")).entryList(QDir::Dirs | QDir::NoDotAndDotDot).size(), 3);
     }
 
+    void aPackSaysWhileItLoadsAndWhereItIs()
+    {
+        // Task AB (field test of build 11): a big pack took minutes, the app said nothing, and the
+        // map stayed on another place.
+        QVERIFY(copyFolder(packFolder(QStringLiteral("esri_satellite")), _own + QStringLiteral("/kalol")));
+        QVERIFY(run());
+        QCOMPARE(_loadingSeen, QStringList({QStringLiteral("Loading map pack \"kalol\": 17 map pictures, zoom 14 to 16. "
+                                                          "The map shows them when this is done."),
+                                           QString()}));
+        QCOMPARE(_loadingAtEnd, QString());
+        // The middle of the area its pack.json gives (VGCS's bbox), once.
+        QCOMPARE(_loadedAt.size(), 1);
+        QCOMPARE(_loadedAt.constFirst().x(), (20.442206755300035 + 20.449393244699962) / 2.0);
+        QCOMPARE(_loadedAt.constFirst().y(), (72.85956517290967 + 72.86723482709033) / 2.0);
+    }
+
     void aLoadedPackIsOnlyChecked()
     {
         QVERIFY(copyFolder(packFolder(QStringLiteral("esri_satellite")), _own + QStringLiteral("/kalol")));
@@ -153,6 +169,9 @@ private slots:
         QCOMPARE(_fetches, 3);
         QCOMPARE(_imports, 0);
         QCOMPARE(namedSets().size(), 1);
+        // Nothing loading, and the map is not moved.
+        QVERIFY(_loadingSeen.isEmpty());
+        QVERIFY(_loadedAt.isEmpty());
     }
 
     void aPackWhosePicturesWereClearedIsLoadedAgain()
@@ -329,6 +348,10 @@ private slots:
         QCOMPARE(qgcApp()->messages.constFirst().second, QStringLiteral("No map pack was loaded: the map store of the app does not work."));
         QCOMPARE(map(), QStringLiteral("Google Hybrid"));
         QCOMPARE(QDir(_work).entryList(QDir::Files).size(), 0);
+        // It said it was loading, and that ended. The map is not moved.
+        QCOMPARE(_loadingSeen.size(), 2);
+        QCOMPARE(_loadingAtEnd, QString());
+        QVERIFY(_loadedAt.isEmpty());
         // When the store works again, the pack loads.
         getQGCMapEngine()->state = QGCMapEngine::State::Working;
         QVERIFY(run());
@@ -364,6 +387,8 @@ private slots:
                  QStringLiteral("Map pack \"kalol\" was not loaded: the map store did not take it (Error opening import database)."));
         QCOMPARE(_imports, 1);
         QCOMPARE(map(), QStringLiteral("Google Hybrid"));
+        QCOMPARE(_loadingAtEnd, QString());
+        QVERIFY(_loadedAt.isEmpty());
         QCOMPARE(QDir(_work).entryList(QDir::Files).size(), 0);
         // Not kept as loaded: the next start loads it.
         getQGCMapEngine()->state = QGCMapEngine::State::Working;
@@ -414,12 +439,20 @@ private:
         const int imports = engine->imports;
         MapPackLoader loader({_own, _shared}, _work);
         QSignalSpy done(&loader, &MapPackLoader::done);
+        // What the fly view is told: each loading line, and where a loaded pack is.
+        _loadingSeen.clear();
+        _loadedAt.clear();
+        (void) connect(&loader, &MapPackLoader::loadingChanged, &loader, [this, &loader]() { _loadingSeen.append(loader.loading()); });
+        (void) connect(&loader, &MapPackLoader::packLoaded, &loader, [this](double latitude, double longitude) {
+            _loadedAt.append(QPointF(latitude, longitude));
+        });
         loader.start();
         const bool finished = done.count() > 0 || done.wait(timeoutMs);
         // Nothing more may happen once it is done: work still on its way would show here.
         QTest::qWait(200);
         _fetches = engine->fetches - fetches;
         _imports = engine->imports - imports;
+        _loadingAtEnd = loader.loading();
         return finished && done.count() == 1;
     }
 
@@ -450,6 +483,9 @@ private:
     std::unique_ptr<QGCTileCacheDatabase> _store;
     int _fetches = 0;
     int _imports = 0;
+    QStringList _loadingSeen;  // loading() at each change, in the last run
+    QString _loadingAtEnd;     // loading() when it was done
+    QList<QPointF> _loadedAt;  // packLoaded(): latitude, longitude
 };
 
 QTEST_GUILESS_MAIN(MapPackLoaderTest)

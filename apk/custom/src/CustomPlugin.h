@@ -56,6 +56,9 @@ class CustomPlugin : public QGCCorePlugin
 {
     Q_OBJECT
 
+    /// While a map pack loads, a line that says which (MapPackLoader::loading). The fly view shows it.
+    Q_PROPERTY(QString mapPackLoading READ mapPackLoading NOTIFY mapPackLoadingChanged)
+
 public:
     explicit CustomPlugin(QObject *parent = nullptr);
 
@@ -81,6 +84,14 @@ public:
     Q_INVOKABLE bool unlockAdvanced(const QString &password);
     /// Seconds until the next password may be tried (after a wrong one). 0: now.
     Q_INVOKABLE int adminWaitSeconds() const;
+
+    QString mapPackLoading() const;
+
+signals:
+    void mapPackLoadingChanged();
+    /// A map pack was loaded at this start: the middle of its area (task AB). With no position
+    /// from the drone, the fly view moves the map there.
+    void mapPackLoaded(double latitude, double longitude);
 
 private slots:
     void _advancedChanged(bool advanced);

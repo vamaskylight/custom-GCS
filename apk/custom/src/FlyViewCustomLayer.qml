@@ -1175,6 +1175,56 @@ Item {
         }
     }
 
+    // VAMA (task AB, field test of build 11): a map pack is loading. A big pack takes minutes, and
+    // the map stays empty meanwhile: this says so. At the top, under the lock hint when that shows.
+    readonly property string _mapPackLoading: QGroundControl.corePlugin.mapPackLoading || ""
+    Rectangle {
+        id:                       mapPackChip
+        objectName:               "vamaMapPackLoading"
+        visible:                  _mapPackLoading !== ""
+        z:                        1
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top:              parent.top
+        anchors.topMargin:        parentToolInsets.topEdgeCenterInset + _margin + (lockHint.visible ? lockHint.height + _margin : 0)
+        width:                    mapPackLabel.width + _margin * 3
+        height:                   mapPackLabel.height + _margin * 1.5
+        radius:                   Math.min(height / 2, ScreenTools.defaultFontPixelHeight * 1.5)
+        color:                    _panelColor
+
+        QGCLabel {
+            id:                  mapPackLabel
+            objectName:          "vamaMapPackLoadingText"
+            anchors.centerIn:    parent
+            width:               Math.min(implicitWidth, Math.min(ScreenTools.defaultFontPixelWidth * 40, _root.width * 0.5))
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode:            Text.WordWrap
+            color:               "white"
+            font.pointSize:      ScreenTools.smallFontPointSize
+            text:                _mapPackLoading
+        }
+    }
+
+    // VAMA (task AB): a map pack was just loaded. With no position from the drone, the map goes to
+    // the pack's place, at a zoom the pack has (QGC's map position, and the map's own: QGC's code
+    // sets the map's centre, so a binding to the position is not enough).
+    readonly property int _mapPackZoom: 15
+    Connections {
+        target: QGroundControl.corePlugin
+        function onMapPackLoaded(latitude, longitude) {
+            var vehicle = QGroundControl.multiVehicleManager.activeVehicle
+            if (vehicle && vehicle.coordinate.isValid) {
+                return
+            }
+            var place = QtPositioning.coordinate(latitude, longitude)
+            if (mapControl) {
+                mapControl.center = place
+                // The small map is 3 zooms out, as QGC's FlyViewMap.qml has it.
+                mapControl.zoomLevel = mapControl.pipMode ? _mapPackZoom - 3 : _mapPackZoom
+            }
+            QGroundControl.flightMapZoom = _mapPackZoom
+        }
+    }
+
     // While the lock button waits for the object. At the top, in the place of the
     // result box: on the RC the bottom centre is the middle of the video, and the
     // hint lay over the object to draw the box around (field video, test build 4).
