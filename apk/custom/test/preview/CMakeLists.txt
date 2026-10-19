@@ -38,6 +38,9 @@ add_executable(vama_preview
     ${CUSTOM_DIR}/src/Skydroid/ObjectMarks.h
     ${LINK_STUBS}/MultiVehicleManager.h
     ${LINK_STUBS}/Vehicle.h
+    # The admin password for Advanced Mode (task Z), with the test build's password.
+    ${CUSTOM_DIR}/src/AdminPassword.cc
+    ${CUSTOM_DIR}/src/AdminPassword.h
     # The app's own resources: the QML override path and the icons.
     ${CUSTOM_DIR}/custom.qrc
     # QGC's tinting for QGCColoredImage, as in the app.
@@ -47,7 +50,7 @@ add_executable(vama_preview
     preview.qrc
 )
 
-target_include_directories(vama_preview PRIVATE ${LINK_STUBS} ${CUSTOM_DIR}/src/Skydroid ${QGC_SRC}/QmlControls)
+target_include_directories(vama_preview PRIVATE ${LINK_STUBS} ${CUSTOM_DIR}/src/Skydroid ${QGC_SRC}/QmlControls ${CUSTOM_DIR}/src)
 target_compile_definitions(vama_preview PRIVATE
     VAMA_PREVIEW_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
 )

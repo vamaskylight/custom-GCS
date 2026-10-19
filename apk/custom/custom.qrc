@@ -43,6 +43,7 @@
         <file alias="QGroundControl/FlyView/FlyViewTopRightColumnLayout.qml">src/FlyViewTopRightColumnLayout.qml</file>
         <file alias="QGroundControl/FlyView/VehicleWarnings.qml">src/VehicleWarnings.qml</file>
         <file alias="QGroundControl/Toolbar/SelectViewDropdown.qml">src/SelectViewDropdown.qml</file>
+        <file alias="QGroundControl/Toolbar/VamaAdminPasswordPanel.qml">src/VamaAdminPasswordPanel.qml</file>
     </qresource>
     <qresource prefix="/Custom/res">
         <file alias="QGCLogoFull.svg">res/Images/QGCLogoFull.svg</file>

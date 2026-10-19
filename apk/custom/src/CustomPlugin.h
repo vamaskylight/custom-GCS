@@ -1,8 +1,10 @@
 #pragma once
 
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QTranslator>
 #include <QtQml/QQmlAbstractUrlInterceptor>
 
+#include "AdminPassword.h"
 #include "QGCCorePlugin.h"
 #include "QGCOptions.h"
 
@@ -74,6 +76,12 @@ public:
     /// Releases the url interceptor attached in createQmlApplicationEngine before the engine is destroyed
     void destroyQmlApplicationEngine(QQmlApplicationEngine *qmlEngine) final;
 
+    /// Advanced Mode (with Parameters) needs the admin password (task Z, AdminPassword.h).
+    /// True: the password was right, and Advanced Mode is on.
+    Q_INVOKABLE bool unlockAdvanced(const QString &password);
+    /// Seconds until the next password may be tried (after a wrong one). 0: now.
+    Q_INVOKABLE int adminWaitSeconds() const;
+
 private slots:
     void _advancedChanged(bool advanced);
 
@@ -83,6 +91,9 @@ private:
     CustomOptions *_options = nullptr;
     QQmlApplicationEngine *_qmlEngine = nullptr;
     MapPackLoader *_mapPacks = nullptr;
+    vama::AdminPassword _adminPassword{vama::builtInAdminSecret()};
+    QElapsedTimer _adminClock;
+    bool _adminUnlocked = false;  // Advanced Mode was turned on with the password
     class CustomOverrideInterceptor *_urlInterceptor = nullptr;
     QVariantList _customSettingsList; // Not to be mixed up with QGCCorePlugin implementation
 };

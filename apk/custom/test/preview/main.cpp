@@ -36,6 +36,8 @@
 //   17_app_settings.png   Application Settings: the VAMA mark on General, no Help page
 //   18_warnings_small.png QGC's "No GPS Lock" and pre-arm texts, small at the bottom while the video is the main view
 //   19_warnings_map.png   the same texts as QGC shows them, with the map as the main view
+//   29_admin_password.png the app menu after the hidden Advanced Mode tap: it asks for the admin password (task Z)
+//   30_admin_wrong.png    after a wrong password: the wait before the next try
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
 // The lock is tried for real: the day picture is a look into a world that
@@ -82,6 +84,7 @@
 #include <utility>
 #include <vector>
 
+#include "AdminPassword.h"
 #include "ColoredSvgImageProvider.h"
 #include "MultiVehicleManager.h"
 #include "FollowGuide.h"
@@ -250,12 +253,70 @@ public:
     FakeQmlVehicle vehicle;
 };
 
+/// What the app menu reads of QGC's options.
+class FakeCoreOptions : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool combineSettingsAndSetup READ combineSettingsAndSetup CONSTANT)
+
+public:
+    bool combineSettingsAndSetup() const { return false; }  // QGC's default
+};
+
+/// QGC's core plugin as the app menu and the admin password panel use it (task Z). The password
+/// is checked as CustomPlugin does it, by the app's own AdminPassword with the test build's
+/// password, on a clock that the preview moves (nowMs).
+class FakeCorePlugin : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(bool showAdvancedUI READ showAdvancedUI WRITE setShowAdvancedUI NOTIFY showAdvancedUIChanged)
+    Q_PROPERTY(bool showTouchAreas MEMBER showTouchAreas NOTIFY showTouchAreasChanged)
+    Q_PROPERTY(QObject *options READ options CONSTANT)
+
+public:
+    bool showAdvancedUI() const { return _advanced; }
+    void setShowAdvancedUI(bool on)
+    {
+        if (on != _advanced) {
+            _advanced = on;
+            emit showAdvancedUIChanged(on);
+        }
+    }
+    QObject *options() { return &_options; }
+
+    Q_INVOKABLE bool unlockAdvanced(const QString &password)
+    {
+        ++tries;
+        if (_password.check(password, nowMs) != vama::AdminPassword::Result::Right) {
+            return false;
+        }
+        setShowAdvancedUI(true);
+        return true;
+    }
+    Q_INVOKABLE int adminWaitSeconds() const { return _password.waitSeconds(nowMs); }
+
+    bool showTouchAreas = false;
+    qint64 nowMs = 0;
+    int tries = 0;  // passwords checked
+
+signals:
+    void showAdvancedUIChanged(bool on);
+    void showTouchAreasChanged();
+
+private:
+    FakeCoreOptions _options;
+    vama::AdminPassword _password{vama::builtInAdminSecret()};
+    bool _advanced = false;
+};
+
 class FakeGlobal : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QObject *videoManager READ videoManager CONSTANT)
     Q_PROPERTY(QObject *settingsManager READ settingsManager CONSTANT)
     Q_PROPERTY(QObject *multiVehicleManager READ multiVehicleManager CONSTANT)
+    Q_PROPERTY(QObject *corePlugin READ corePlugin CONSTANT)
+    Q_PROPERTY(QString qgcVersion READ qgcVersion CONSTANT)
     Q_PROPERTY(qreal zOrderTopMost READ zOrderTopMost CONSTANT)
 
 public:
@@ -263,8 +324,11 @@ public:
     qreal zOrderTopMost() const { return 1000; }  // QGC's value
     QObject *settingsManager() { return &settings; }
     QObject *multiVehicleManager() { return &vehicles; }
+    QObject *corePlugin() { return &core; }
+    QString qgcVersion() const { return QStringLiteral("v5.1.5"); }
     FakeSettingsManager settings;
     FakeQmlVehicleManager vehicles;
+    FakeCorePlugin core;
 
 private:
     FakeVideoManager _videoManager;
@@ -712,22 +776,23 @@ int main(int argc, char *argv[])
     // touch of one finger, as on the remote control, through Qt's own touch path. (Client video
     // 2026-10-15, a tap on a mark that locked nothing: every check passed with touches too.)
     QPointingDevice *touchScreen = qEnvironmentVariableIsSet("VAMA_PREVIEW_TOUCH") ? QTest::createTouchDevice() : nullptr;
-    auto mouse = [&](QEvent::Type type, QPointF pos) {
+    auto mouseOn = [&](QQuickWindow *target, QEvent::Type type, QPointF pos) {
         if (touchScreen) {
             if (type == QEvent::MouseButtonPress) {
-                QTest::touchEvent(window, touchScreen).press(0, pos.toPoint(), window);
+                QTest::touchEvent(target, touchScreen).press(0, pos.toPoint(), target);
             } else if (type == QEvent::MouseMove) {
-                QTest::touchEvent(window, touchScreen).move(0, pos.toPoint(), window);
+                QTest::touchEvent(target, touchScreen).move(0, pos.toPoint(), target);
             } else {
-                QTest::touchEvent(window, touchScreen).release(0, pos.toPoint(), window);
+                QTest::touchEvent(target, touchScreen).release(0, pos.toPoint(), target);
             }
             return;
         }
         const Qt::MouseButtons buttons = type == QEvent::MouseButtonRelease ? Qt::NoButton : Qt::LeftButton;
         const Qt::MouseButton button = type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton;
-        QMouseEvent event(type, pos, window->mapToGlobal(pos), button, buttons, Qt::NoModifier);
-        QCoreApplication::sendEvent(window, &event);
+        QMouseEvent event(type, pos, target->mapToGlobal(pos), button, buttons, Qt::NoModifier);
+        QCoreApplication::sendEvent(target, &event);
     };
+    auto mouse = [&](QEvent::Type type, QPointF pos) { mouseOn(window, type, pos); };
     // Press and release in the middle of the item with this objectName.
     auto tap = [&](const char *objectName) {
         auto *item = window->findChild<QQuickItem *>(QString::fromLatin1(objectName));
@@ -750,6 +815,7 @@ int main(int argc, char *argv[])
     int anglesBeforeLock = 0;
     int anglesBeforePoint = 0;  // a point from the picture: the camera must not be turned,
     int lasersBeforePoint = 0;  // and the laser not asked
+    int laserFramesBefore = 0;  // the laser button's steps (task Y)
 
     // Application Settings (client feedback 2026-10-07, tasks E and F).
     QQuickWindow *settingsWindow = nullptr;
@@ -840,6 +906,64 @@ int main(int argc, char *argv[])
         QMetaObject::invokeMethod(settingsWindow, "showSettingsTool", Q_ARG(QVariant, QVariant(QStringLiteral("Help"))));
         expect(screen->property("_selectedPageIndex").toInt() == 0, "settings: Help cannot be opened by name either",
                QStringLiteral("page %1").arg(screen->property("_selectedPageIndex").toInt()));
+    };
+
+    // The app menu with the admin password for Advanced Mode (task Z): menu.qml is QGC's drawer
+    // around the real SelectViewDropdown.qml, made when it opens and destroyed when it closes.
+    QQuickWindow *menuWindow = nullptr;
+    auto openMenu = [&]() {
+        if (!menuWindow) {
+            const qsizetype windows = engine.rootObjects().size();
+            engine.load(QUrl::fromLocalFile(QStringLiteral(VAMA_PREVIEW_DIR "/menu.qml")));
+            if (engine.rootObjects().size() == windows ||
+                !(menuWindow = qobject_cast<QQuickWindow *>(engine.rootObjects().last()))) {
+                std::fprintf(stderr, "menu window not loaded\n");
+                ++g_problems;
+                return;
+            }
+        }
+        QMetaObject::invokeMethod(menuWindow, "openMenu");
+    };
+    auto menuOpen = [&]() { return menuWindow && menuWindow->property("menuOpen").toBool(); };
+    auto menuItem = [&](const char *objectName) -> QQuickItem * {
+        return menuWindow ? menuWindow->findChild<QQuickItem *>(QString::fromLatin1(objectName)) : nullptr;
+    };
+    auto menuTapAt = [&](QPointF pos) {
+        mouseOn(menuWindow, QEvent::MouseButtonPress, pos);
+        mouseOn(menuWindow, QEvent::MouseButtonRelease, pos);
+    };
+    auto menuTap = [&](const char *objectName) {
+        QQuickItem *item = menuItem(objectName);
+        if (!item) {
+            std::fprintf(stderr, "%s not found in the menu\n", objectName);
+            ++g_problems;
+            return;
+        }
+        menuTapAt(item->mapToScene(QPointF(item->width() / 2, item->height() / 2)));
+    };
+    // Keys as the keyboard sends them to the text field.
+    auto typeInto = [&](QQuickItem *field, const QString &text) {
+        for (const QChar c : text) {
+            QKeyEvent press(QEvent::KeyPress, 0, Qt::NoModifier, QString(c));
+            QCoreApplication::sendEvent(field, &press);
+            QKeyEvent release(QEvent::KeyRelease, 0, Qt::NoModifier, QString(c));
+            QCoreApplication::sendEvent(field, &release);
+        }
+    };
+    auto pressEnter = [&](QQuickItem *field) {
+        QKeyEvent press(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+        QCoreApplication::sendEvent(field, &press);
+        QKeyEvent release(QEvent::KeyRelease, Qt::Key_Return, Qt::NoModifier);
+        QCoreApplication::sendEvent(field, &release);
+    };
+    auto shotOf = [&](QQuickWindow *target, const char *name) {
+        const QString path = outDir + "/" + QString::fromLatin1(name);
+        target->grabWindow().save(path);
+        std::fprintf(stderr, "saved %s\n", qPrintable(path));
+    };
+    auto menuText = [&](const char *objectName) {
+        QQuickItem *item = menuItem(objectName);
+        return item ? item->property("text").toString() : QStringLiteral("not there");
     };
 
     // The steps, one after another (delay in ms before each).
@@ -1113,6 +1237,32 @@ int main(int argc, char *argv[])
              // Tap the photo button to run its click handler.
              tap("vamaPhotoButton");
          }},
+        // The laser button (task Y, Nish 2026-10-16): a press measures and shows the reading, the
+        // next press hides it without a shot, and the press after that measures again.
+        {500, [&]() {
+             laserFramesBefore = camera.laserFrames;
+             tap("vamaLaserButton");
+         }},
+        {1200, [&]() {
+             QQuickItem *box = findItem("vamaResultBox");
+             expect(link.laserValid() && box && box->isVisible() && camera.laserFrames > laserFramesBefore,
+                    "laser button: a press measures and shows the reading", QStringLiteral("%1 m").arg(link.laserRangeM()));
+             laserFramesBefore = camera.laserFrames;
+             tap("vamaLaserButton");
+         }},
+        {500, [&]() {
+             QQuickItem *box = findItem("vamaResultBox");
+             expect(box && !box->isVisible() && camera.laserFrames == laserFramesBefore,
+                    "laser button: the next press hides the reading, and does not measure",
+                    QStringLiteral("%1 laser frames").arg(camera.laserFrames - laserFramesBefore));
+             tap("vamaLaserButton");
+         }},
+        {1200, [&]() {
+             QQuickItem *box = findItem("vamaResultBox");
+             expect(link.laserValid() && box && box->isVisible() && camera.laserFrames > laserFramesBefore,
+                    "laser button: the press after that measures again, and shows it", QString());
+             tap("vamaLaserButton");  // hidden again for the steps after
+         }},
         {500, [&]() { shot("1_main.png"); link.fireLaser(); }},
         {1500, [&]() { shot("2_laser.png"); mouse(QEvent::MouseButtonPress, QPointF(1000, 560)); }},
         {100, [&]() { mouse(QEvent::MouseMove, QPointF(1040, 550)); }},
@@ -1269,6 +1419,13 @@ int main(int argc, char *argv[])
              expect(numbers && numbers->isVisible() && numbers->property("text").toString().contains(QStringLiteral("pictures/s")),
                     "lock: the line of numbers for a field video shows", numbers ? numbers->property("text").toString() : QString());
              shot("14b_lock_on_the_cross.png");
+             // During a lock the laser button measures, as before, and the box keeps the readings (task Y).
+             tap("vamaLaserButton");
+         }},
+        {700, [&]() {
+             QQuickItem *box = findItem("vamaResultBox");
+             expect(link.lockActive() && box && box->isVisible(), "lock: the laser button does not hide the box during a lock",
+                    link.lockMessage());
              camera.setWalkerVisible(false);  // the walker is gone
          }},
         {700, [&]() {
@@ -2007,6 +2164,106 @@ int main(int argc, char *argv[])
              QQuickItem *drag = findItem("vamaVideoDrag");
              expect(drag && drag->property("enabled").toBool() && drag->isVisible(),
                     "3D view: back on the video, taps and drags work again", QString());
+             // The admin password for Advanced Mode (task Z), in QGC's app menu.
+             openMenu();
+         }},
+        {400, [&]() {
+             QQuickItem *fly = menuItem("toolbar_viewFly");
+             QQuickItem *analyze = menuItem("toolbar_viewAnalyze");
+             expect(menuOpen() && fly && fly->isVisible() && !menuItem("vamaAdminPasswordField"),
+                    "admin: the app menu opens with its buttons, no password asked", QString());
+             expect(analyze && !analyze->isVisible(), "admin: no Analyze button outside Advanced Mode", QString());
+             menuTap("vamaAdvancedModeTap");
+         }},
+        {300, [&]() {
+             QQuickItem *field = menuItem("vamaAdminPasswordField");
+             QQuickItem *fly = menuItem("toolbar_viewFly");
+             QQuickItem *ok = menuItem("vamaAdminPasswordOk");
+             expect(menuOpen() && field && field->isVisible() && fly && !fly->isVisible(),
+                    "admin: the hidden tap asks for the admin password, in the menu in place of its buttons", QString());
+             expect(field && field->hasFocus(), "admin: the password field has the keyboard", QString());
+             expect(field && field->property("echoMode").toInt() == 2,  // TextInput.Password
+                    "admin: the password shows as dots, not as typed",
+                    field ? QStringLiteral("echo mode %1").arg(field->property("echoMode").toInt()) : QString());
+             const qreal fieldBottom = field ? field->mapToScene(QPointF(0, field->height())).y() : 1e9;
+             expect(fieldBottom < menuWindow->height() / 2.0, "admin: the field is in the top half, clear of the RC's keyboard",
+                    QStringLiteral("down to %1 of %2").arg(fieldBottom, 0, 'f', 0).arg(menuWindow->height()));
+             expect(!global.core.showAdvancedUI(), "admin: Advanced Mode is still off", QString());
+             expect(ok && !ok->isEnabled(), "admin: OK is off while the field is empty", QString());
+             shotOf(menuWindow, "29_admin_password.png");
+             if (field) {
+                 typeInto(field, QStringLiteral("not the password"));
+             }
+             menuTap("vamaAdminPasswordOk");
+             // At once, not only at the panel's next timer tick (250 ms).
+             expect(menuText("vamaAdminPasswordMessage") == QStringLiteral("Wrong password. Try again in 5 s."),
+                    "admin: the wait shows at once", menuText("vamaAdminPasswordMessage"));
+         }},
+        {300, [&]() {
+             QQuickItem *field = menuItem("vamaAdminPasswordField");
+             QQuickItem *ok = menuItem("vamaAdminPasswordOk");
+             expect(global.core.tries == 1 && !global.core.showAdvancedUI() && menuOpen(),
+                    "admin: a wrong password leaves Advanced Mode off and the menu open", QStringLiteral("%1 tries").arg(global.core.tries));
+             expect(menuText("vamaAdminPasswordMessage") == QStringLiteral("Wrong password. Try again in 5 s.") &&
+                        menuItem("vamaAdminPasswordMessage")->isVisible(),
+                    "admin: it says the password was wrong, and how long to wait", menuText("vamaAdminPasswordMessage"));
+             expect(menuText("vamaAdminPasswordField").isEmpty(), "admin: the field is emptied", menuText("vamaAdminPasswordField"));
+             // The right password now: during the wait OK is off, and the Enter key checks nothing.
+             if (field) {
+                 typeInto(field, QString::fromLatin1(vama::kTestAdminPassword));
+             }
+             expect(ok && !ok->isEnabled(), "admin: OK is off during the wait", QString());
+             if (field) {
+                 pressEnter(field);
+             }
+             shotOf(menuWindow, "30_admin_wrong.png");
+         }},
+        {300, [&]() {
+             expect(global.core.tries == 1 && !global.core.showAdvancedUI(), "admin: during the wait Enter checks nothing",
+                    QStringLiteral("%1 tries").arg(global.core.tries));
+             // A tap beside the menu closes it, as in the app.
+             menuTapAt(QPointF(1500, 900));
+         }},
+        {300, [&]() {
+             expect(!menuOpen(), "admin: a tap beside the menu closes it", QString());
+             openMenu();
+         }},
+        {400, [&]() {
+             QQuickItem *fly = menuItem("toolbar_viewFly");
+             expect(menuOpen() && fly && fly->isVisible() && !menuItem("vamaAdminPasswordField"),
+                    "admin: opened again, the menu has its buttons (the panel went with the old menu)", QString());
+             menuTap("vamaAdvancedModeTap");
+         }},
+        {300, [&]() {
+             expect(menuText("vamaAdminPasswordMessage") == QStringLiteral("Try again in 5 s."),
+                    "admin: the wait goes on in the new menu", menuText("vamaAdminPasswordMessage"));
+             global.core.nowMs += 5000;  // the wait is over
+         }},
+        {500, [&]() {
+             QQuickItem *message = menuItem("vamaAdminPasswordMessage");
+             QQuickItem *field = menuItem("vamaAdminPasswordField");
+             expect(message && !message->isVisible(), "admin: after the wait the message goes", menuText("vamaAdminPasswordMessage"));
+             if (field) {
+                 typeInto(field, QString::fromLatin1(vama::kTestAdminPassword));
+                 pressEnter(field);  // the keyboard's Enter (Done on the RC)
+             }
+         }},
+        {300, [&]() {
+             expect(global.core.tries == 2 && global.core.showAdvancedUI(), "admin: the right password turns Advanced Mode on",
+                    QStringLiteral("%1 tries").arg(global.core.tries));
+             expect(!menuOpen(), "admin: and the menu closes", QString());
+             openMenu();
+         }},
+        {400, [&]() {
+             QQuickItem *analyze = menuItem("toolbar_viewAnalyze");
+             expect(analyze && analyze->isVisible(), "admin: Advanced Mode shows the Analyze button", QString());
+             menuTap("vamaAdvancedModeTap");
+         }},
+        {300, [&]() {
+             expect(menuWindow->property("offQuestions").toInt() == 1 && !menuOpen() && !menuItem("vamaAdminPasswordField"),
+                    "admin: in Advanced Mode the tap asks QGC's question to turn it off, with no password",
+                    QStringLiteral("%1 questions").arg(menuWindow->property("offQuestions").toInt()));
+             menuWindow->close();
          }},
         {100, [&]() { QCoreApplication::quit(); }},
     };

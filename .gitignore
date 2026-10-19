@@ -72,3 +72,5 @@ secrets/
 *.jks
 *.keystore
 *.keystore.pass
+# A customer build's admin password hash (task Z): written by apk/build_android.ps1 for that build only.
+/apk/custom/src/admin_password.inc

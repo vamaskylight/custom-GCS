@@ -102,15 +102,17 @@ QGC's custom build guide: https://dev.qgroundcontrol.com/en/custom_build/custom_
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File apk\make_release_key.ps1
+powershell -ExecutionPolicy Bypass -File apk\make_admin_password.ps1
 powershell -ExecutionPolicy Bypass -File apk\build_android.ps1 -Customer -Version 1.0.0 -CheckOnly
 powershell -ExecutionPolicy Bypass -File apk\build_android.ps1 -Customer -Version 1.0.0
 ```
 
 1. Make the release key once (`make_release_key.ps1`), and back up its two files (see Signing keys).
-2. Set the app menu text in `apk/custom/src/SelectViewDropdown.qml` to "Version 1.0.0", and commit everything under `apk/`.
-3. `-CheckOnly` says what is still missing, and builds nothing.
-4. The build runs in its own folder, `C:\vama-apk\build-Customer` (about 9 GB; the first build there takes longer than a test build).
-5. The result is `apk\build\VAMA-GCS-1.0.0.apk`. The script proves that it is signed with the release key, and prints its SHA-256.
+2. Make the admin password once (`make_admin_password.ps1`). Advanced Mode, with the drone's parameters, asks for it. Only a salted hash of it is kept, in `%USERPROFILE%\.vama\vama-admin-password.txt`. Keep the password itself in a safe place: the file cannot give it back. `-Replace` makes a new one, for the next customer build.
+3. Set the app menu text in `apk/custom/src/SelectViewDropdown.qml` to "Version 1.0.0", and commit everything under `apk/`.
+4. `-CheckOnly` says what is still missing, and builds nothing.
+5. The build runs in its own folder, `C:\vama-apk\build-Customer` (about 9 GB; the first build there takes longer than a test build).
+6. The result is `apk\build\VAMA-GCS-1.0.0.apk`. The script proves that it is signed with the release key and that it holds the admin password's hash, and prints its SHA-256.
 
 What is different from a test build:
 
@@ -118,6 +120,7 @@ What is different from a test build:
 - It is QGC's stable build (`QGC_STABLE_BUILD=ON`). The app's own name is "VAMA-GCS" without "Daily", so its settings and its folder on the device are new.
 - It is made from committed files only, and only when the app menu names the version. A customer never gets an app that says "Test build".
 - A version is built once: the script stops when `apk\build\VAMA-GCS-<version>.apk` is already there.
+- Advanced Mode asks for the team's admin password. A test build asks for the test password, `vama1234`. For the build, the script writes the hash into `apk/custom/src/admin_password.inc` (git ignores it) and removes it again at the end.
 - Android's own app info still shows QGC's version (5.1.5), with the same version code as the test builds. The VAMA version is the text in the app menu. A later customer build installs over an earlier one, because both are signed with the release key.
 
 The customer build was prepared on 2026-10-13 and its checks were tried with a throwaway key. A whole customer build has not been run yet.
@@ -135,6 +138,7 @@ powershell -ExecutionPolicy Bypass -File apk\custom\test\run_android_link_check.
 - `run_link_test.ps1` runs the real camera link (`SkydroidLink`) against fake cameras on 127.0.0.1, with stand-ins for QGC's vehicle classes (`test/link/stubs`): angles, address search, touch and RC wheel motion, laser and target rules.
 - `run_preview.ps1` loads the real camera screen (`FlyViewCustomLayer.qml` from `custom.qrc`) with stand-ins for QGC's QML controls (`test/preview/stubs`) and a fake camera, prints every QML warning, and saves screenshots to `%TEMP%\vama-preview`. Run it after every QML change: the app only finds QML mistakes when it runs.
 - The preview also opens our copies of QGC's files by QGC's own addresses, the way the app does: the video (thermal colours checked against VGCS's tables at 64 grey levels) and Application Settings. After changing VGCS's colour modes or the shader, run `python apk/make_thermal_palettes.py` (needs Qt's `qsb`, from the `msvc2022_64` kit).
+- `run_link_test.ps1` also checks the admin password of Advanced Mode (`admin_password_test`), and the same code built as a customer build with a team password (`admin_password_team_test`).
 - `run_link_test.ps1` also runs the object finder with its real network on three photos from the air (`marks_net_test`). That needs the ncnn library built for this PC, once: `powershell -ExecutionPolicy Bypass -File apk\build_ncnn.ps1 -ForHost -Abis ''`. Without it that test is left out, and the runner says so.
 - `run_android_link_check.ps1` compiles the object finder with the NDK and links it with the ncnn library, for each ABI, with nothing left undefined. It proves that part of the APK without building one. It cannot prove that the code runs right on the phone's processor.
 - They need MinGW 13.1 (`C:\Qt\Tools\mingw1310_64`) and, for the link test and the preview, the Qt 6.11.1 MinGW kit (`C:\Qt\6.11.1\mingw_64`).

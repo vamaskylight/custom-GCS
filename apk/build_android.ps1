@@ -25,6 +25,11 @@ apk\make_release_key.ps1, is QGC's stable build (the app's own name has no
 "Daily"), and has its own build folder. It is made only from committed files,
 and only when the app menu names the version given with -Version.
 
+Advanced Mode (with the drone's parameters) asks for the admin password. A
+customer build gets the team's, made once by apk\make_admin_password.ps1 (only
+its salted hash is kept, outside the repo). A test build has the test password
+of apk\custom\src\AdminPassword.cc.
+
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File apk\build_android.ps1
 powershell -ExecutionPolicy Bypass -File apk\build_android.ps1 -Abis arm64-v8a
@@ -54,15 +59,58 @@ param(
     [switch]$ConfigureOnly,
     # An app without the object finder: it does not mark people and vehicles, and says so.
     # (The finder needs the ncnn library, which apk\build_ncnn.ps1 builds before the app.)
-    [switch]$NoFinder
+    [switch]$NoFinder,
+    # The admin password of customer builds: its salt and hash, from apk\make_admin_password.ps1.
+    [string]$AdminPasswordFile = (Join-Path $env:USERPROFILE '.vama\vama-admin-password.txt')
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# A customer build writes the admin password's hash into the source for itself only
+# (apk\custom\src\admin_password.inc). It is removed again when the script ends.
+$script:AdminInc = ''
+
+function Remove-AdminInc {
+    if ($script:AdminInc -and (Test-Path -LiteralPath $script:AdminInc)) {
+        Remove-Item -LiteralPath $script:AdminInc -Force
+    }
+}
+
 function Fail([string]$Message) {
     Write-Host "ERROR: $Message" -ForegroundColor Red
+    Remove-AdminInc
     exit 1
+}
+
+# An error that stops the script removes it too. (A build cut off with Ctrl+C can leave it:
+# the next test build removes it, and git ignores it.)
+trap {
+    Remove-AdminInc
+    break
+}
+
+# The salt, hash and rounds of apk\make_admin_password.ps1's file. Nothing: not such a file.
+function Read-AdminSecret([string]$Path) {
+    $v = @{}
+    foreach ($line in (Get-Content -LiteralPath $Path)) {
+        if ($line -match '^(salt|hash|iterations)=(.+)$') { $v[$Matches[1]] = $Matches[2].Trim() }
+    }
+    # Small hex letters, as apk\make_admin_password.ps1 writes them (-cnotmatch: -notmatch ignores case).
+    if (-not $v.ContainsKey('salt') -or $v['salt'] -cnotmatch '^[0-9a-f]{32}$') { return $null }
+    if (-not $v.ContainsKey('hash') -or $v['hash'] -cnotmatch '^[0-9a-f]{64}$') { return $null }
+    # 100000 rounds at least. No leading 0: C++ would read the number as octal.
+    if (-not $v.ContainsKey('iterations') -or $v['iterations'] -notmatch '^[1-9]\d{5,6}$') { return $null }
+    return $v
+}
+
+# Writes a customer build's admin password for AdminPassword.cc (its three VAMA_ADMIN_ names).
+function Write-AdminInc([string]$Path, $Secret) {
+    Set-Content -LiteralPath $Path -Encoding ASCII -Value @(
+        '// Written by apk\build_android.ps1 for one customer build, and removed after it. Not in git.',
+        "#define VAMA_ADMIN_SALT_HEX `"$($Secret['salt'])`"",
+        "#define VAMA_ADMIN_HASH_HEX `"$($Secret['hash'])`"",
+        "#define VAMA_ADMIN_ITERATIONS $($Secret['iterations'])")
 }
 
 # Native tools write progress to stderr, which Windows PowerShell 5.1 turns
@@ -115,9 +163,8 @@ function Get-ApkDigest([string]$Apksigner, [string]$Apk) {
     return ''
 }
 
-# The ABIs of an APK whose code holds the object finder: the word "VAMA-FINDER ncnn"
-# is in the app's own library only when the finder was built in.
-function Get-ApkFinderAbis([string]$Apk) {
+# The ABIs of an APK whose app code (its own large library) holds a word, as plain bytes.
+function Get-ApkAbisWith([string]$Apk, [string]$Word) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $latin1 = [System.Text.Encoding]::GetEncoding(28591)
     $found = New-Object System.Collections.Generic.List[string]
@@ -133,7 +180,7 @@ function Get-ApkFinderAbis([string]$Apk) {
                 $memory = New-Object System.IO.MemoryStream
                 $stream.CopyTo($memory)
                 $text = $latin1.GetString($memory.ToArray())
-                if ($text.IndexOf('VAMA-FINDER ncnn ', [System.StringComparison]::Ordinal) -ge 0 -and -not $found.Contains($abi)) {
+                if ($text.IndexOf($Word, [System.StringComparison]::Ordinal) -ge 0 -and -not $found.Contains($abi)) {
                     $found.Add($abi)
                 }
             } finally {
@@ -144,6 +191,12 @@ function Get-ApkFinderAbis([string]$Apk) {
         $zip.Dispose()
     }
     return $found.ToArray()
+}
+
+# The ABIs of an APK whose code holds the object finder: the word "VAMA-FINDER ncnn"
+# is in the app's own library only when the finder was built in.
+function Get-ApkFinderAbis([string]$Apk) {
+    return Get-ApkAbisWith $Apk 'VAMA-FINDER ncnn '
 }
 
 $ApkDir = $PSScriptRoot
@@ -271,6 +324,14 @@ if ($Customer) {
         if ($LASTEXITCODE -ne 0) { $problems.Add('git status failed: a customer build is made from committed files only.') }
         elseif ($dirty.Count -gt 0) { $problems.Add("apk\ has $($dirty.Count) file(s) that are not committed. A customer build is made from committed files only.") }
     }
+    # The team's admin password for Advanced Mode (never the test password in a customer's app).
+    $adminSecret = $null
+    if (-not (Test-Path -LiteralPath $AdminPasswordFile)) {
+        $problems.Add("The admin password is missing: $AdminPasswordFile. Make it once with apk\make_admin_password.ps1.")
+    } else {
+        $adminSecret = Read-AdminSecret $AdminPasswordFile
+        if (-not $adminSecret) { $problems.Add("$AdminPasswordFile is not a file of apk\make_admin_password.ps1.") }
+    }
     if ($Version -and (Test-Path -LiteralPath (Join-Path $ApkDir "build\VAMA-GCS-$Version.apk"))) {
         $problems.Add("apk\build\VAMA-GCS-$Version.apk is already there. A version is built once: move the file away, or use the next version.")
     }
@@ -337,6 +398,22 @@ if ($NoFinder) {
     }
 }
 
+# --- The admin password (task Z) ----------------------------------------------
+# A customer build: the team's password hash, in the source for this build only (both ABI
+# builds compile the same file; QGC forwards only some CMake values to the second ABI).
+# A test build: none there, so AdminPassword.cc uses the test password.
+$adminIncPath = Join-Path $ApkDir 'custom\src\admin_password.inc'
+if ($Customer) {
+    $script:AdminInc = $adminIncPath
+    Write-AdminInc $adminIncPath $adminSecret
+    Write-Host "Admin password: the team's, from $AdminPasswordFile"
+} else {
+    if (Test-Path -LiteralPath $adminIncPath) {
+        Remove-Item -LiteralPath $adminIncPath -Force  # left by a customer build that was cut off
+    }
+    Write-Host 'Admin password: the test password'
+}
+
 # --- Configure -----------------------------------------------------------
 $configureArgs = @(
     '-S', $SrcLink, '-B', $BuildDir, '-G', 'Ninja',
@@ -357,7 +434,7 @@ $configureArgs = @(
 # device) is "VAMA-GCS", without "Daily".
 if ($Customer) { $configureArgs += '-DQGC_STABLE_BUILD=ON' }
 if ((Invoke-Native $Cmake $configureArgs) -ne 0) { Fail 'CMake configure failed.' }
-if ($ConfigureOnly) { Write-Host 'Configure done.'; exit 0 }
+if ($ConfigureOnly) { Write-Host 'Configure done.'; Remove-AdminInc; exit 0 }
 
 # --- Build ---------------------------------------------------------------
 if ((Invoke-Native $Cmake @('--build', $BuildDir, '--parallel')) -ne 0) { Fail 'Build failed.' }
@@ -388,6 +465,12 @@ if ($Customer) {
     $apkDigest = Get-ApkDigest (Join-Path $buildTools.FullName 'apksigner.bat') $signed.FullName
     if (-not $apkDigest) { Fail "The signature of $($signed.FullName) does not verify." }
     if ($apkDigest -ne $releaseDigest) { Fail "The APK is signed with certificate $apkDigest, not with the release key ($releaseDigest)." }
+    # The team's admin password is in the app for every ABI (its hash is in the code as text).
+    $withAdmin = Get-ApkAbisWith $signed.FullName $adminSecret['hash']
+    foreach ($abi in $abiList) {
+        if ($withAdmin -notcontains $abi) { Fail "The APK's $abi code does not hold the team's admin password hash." }
+    }
+    Write-Host "Admin password: the team's, in the APK for $($abiList -join ', ')"
     $outDir = Join-Path $ApkDir 'build'
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     $out = Join-Path $outDir "VAMA-GCS-$Version.apk"
@@ -398,3 +481,4 @@ if ($Customer) {
     Write-Host "  signed by:  the release key, certificate SHA-256 $apkDigest"
     Write-Host '  It does not install over a test build (another key): the test build is uninstalled first.'
 }
+Remove-AdminInc

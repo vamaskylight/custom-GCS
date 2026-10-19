@@ -41,6 +41,7 @@ CustomPlugin::CustomPlugin(QObject *parent)
     qCDebug(CustomLog) << this;
 
     _showAdvancedUI = false;
+    _adminClock.start();
     (void) connect(this, &QGCCorePlugin::showAdvancedUIChanged, this, &CustomPlugin::_advancedChanged);
 }
 
@@ -66,8 +67,38 @@ void CustomPlugin::init()
 
 void CustomPlugin::_advancedChanged(bool changed)
 {
+    // VAMA (task Z): Advanced Mode, with Parameters, only with the admin password. QGC's own
+    // dialog (MainWindow.qml) or any other QML could still turn it on: then it goes off again,
+    // after everything has heard of the change, so the last word is "off".
+    if (changed && !_adminUnlocked) {
+        (void) QMetaObject::invokeMethod(this, [this]() {
+            if (_showAdvancedUI && !_adminUnlocked) {
+                _showAdvancedUI = false;
+                emit showAdvancedUIChanged(false);
+            }
+        }, Qt::QueuedConnection);
+        return;
+    }
+    if (!changed) {
+        _adminUnlocked = false;  // the next time asks again
+    }
     // Firmware Upgrade page is only show in Advanced mode
     emit _options->showFirmwareUpgradeChanged(changed);
+}
+
+bool CustomPlugin::unlockAdvanced(const QString &password)
+{
+    if (_adminPassword.check(password, _adminClock.elapsed()) != vama::AdminPassword::Result::Right) {
+        return false;
+    }
+    _adminUnlocked = true;
+    setProperty("showAdvancedUI", true);  // QGC's own way in (its property's WRITE function)
+    return true;
+}
+
+int CustomPlugin::adminWaitSeconds() const
+{
+    return _adminPassword.waitSeconds(_adminClock.elapsed());
 }
 
 void CustomPlugin::_addSettingsEntry(const QString &title, const char *qmlFile, const char *iconFile)

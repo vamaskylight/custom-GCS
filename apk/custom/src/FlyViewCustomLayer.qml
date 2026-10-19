@@ -53,6 +53,10 @@ Item {
     property bool  _is3DView:      QGCViewer3DManager.displayMode === QGCViewer3DManager.View3D
     property bool  _videoIsMain:   mapControl ? (mapControl.pipState.state !== mapControl.pipState.fullState && !_is3DView) : false
     property bool  _laserBoxHidden: false
+    // A reading is up in the result box, and no lock is on: the laser button then hides it.
+    // (While it measures, the button is off.)
+    readonly property bool _laserReadingShown: !_lockOn && !_laserBoxHidden &&
+                                               (_link.laserValid || _link.targetValid || _link.laserMessage !== "")
     property bool  _hintShown:     false
     property string _detectResult: ""
     // After the lock button: the next box or tap on the video picks the object.
@@ -398,12 +402,24 @@ Item {
                 fill:      _link.recording ? Qt.rgba(0.85, 0.12, 0.12, 0.9) : Qt.rgba(0, 0, 0, 0.55)
                 onClicked: _link.toggleRecord()
             }
+            // VAMA (Nish 2026-10-16, task Y): a press measures and shows the reading, the next press
+            // hides it. During a lock the box keeps the object's readings, as Nish asked (22:00):
+            // there a press measures, as before.
             IconButton {
-                icon:      _iconPath + "vama_laser.svg"
-                size:      _buttonSize
-                enabled:   !_link.laserBusy
-                fill:      _link.laserBusy ? qgcPal.colorOrange : Qt.rgba(0, 0, 0, 0.55)
-                onClicked: _link.fireLaser()
+                objectName: "vamaLaserButton"
+                icon:       _iconPath + "vama_laser.svg"
+                size:       _buttonSize
+                enabled:    !_link.laserBusy
+                fill:       _link.laserBusy ? qgcPal.colorOrange
+                                            : (_laserReadingShown ? qgcPal.buttonHighlight : Qt.rgba(0, 0, 0, 0.55))
+                onClicked: {
+                    if (_laserReadingShown) {
+                        _laserBoxHidden = true
+                    } else {
+                        _laserBoxHidden = false
+                        _link.fireLaser()
+                    }
+                }
             }
             // Lock on an object: press, then draw a box around it on the video
             // (or tap it). Orange while locked; press again to stop.

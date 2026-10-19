@@ -12,3 +12,6 @@ QGCColoredImage 1.0 QGCColoredImage.qml
 DeadMouseArea 1.0 DeadMouseArea.qml
 SettingsButton 1.0 SettingsButton.qml
 SidebarDivider 1.0 SidebarDivider.qml
+ToolIndicatorPage 1.0 ToolIndicatorPage.qml
+SubMenuButton 1.0 SubMenuButton.qml
+QGCMouseArea 1.0 QGCMouseArea.qml

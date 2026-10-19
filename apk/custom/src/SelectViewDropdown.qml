@@ -6,6 +6,10 @@
 //    does not reach this one.
 //  - The version lines name VAMA GCS and our test build, not "VAMA-GCS Daily
 //    Version" and QGC's commit date. The hidden Advanced Mode tap stays.
+//  - Advanced Mode asks for the admin password (task Z): the tap shows
+//    VamaAdminPasswordPanel.qml in place of the buttons. QGC's own question
+//    (advancedModeOnConfirmation) is not asked. The page's content is in a
+//    ColumnLayout for that, around QGC's GridLayout.
 // When moving to a new QGC release, compare with QGC's new file.
 
 import QtQuick
@@ -21,160 +25,184 @@ ToolIndicatorPage {
     property real _toolButtonHeight: ScreenTools.defaultFontPixelHeight * 3
 
     contentComponent: Component {
-        GridLayout {
-            columns: 2
-            columnSpacing: ScreenTools.defaultFontPixelWidth
-            rowSpacing: columnSpacing
+        // VAMA (task Z): the menu, or in its place the admin password for Advanced Mode.
+        ColumnLayout {
+            id:      menuContent
+            spacing: 0
 
-            SubMenuButton {
-                objectName: "toolbar_viewFly"
-                implicitHeight: root._toolButtonHeight
-                Layout.fillWidth: true
-                text: qsTr("Fly")
-                imageResource: "/res/FlyingPaperPlane.svg"
-                onClicked: {
-                    if (mainWindow.allowViewSwitch()) {
-                        mainWindow.closeIndicatorDrawer()
-                        mainWindow.showFlyView()
-                    }
-                }
-            }
+            property bool askAdminPassword: false
 
-            SubMenuButton {
-                objectName: "toolbar_viewPlan"
-                implicitHeight: root._toolButtonHeight
-                Layout.fillWidth: true
-                text: qsTr("Plan")
-                imageResource: "/qmlimages/Plan.svg"
-                onClicked: {
-                    if (mainWindow.allowViewSwitch()) {
-                        mainWindow.closeIndicatorDrawer()
-                        mainWindow.showPlanView()
-                    }
-                }
-            }
+            GridLayout {
+                visible: !menuContent.askAdminPassword  // VAMA (task Z)
+                columns: 2
+                columnSpacing: ScreenTools.defaultFontPixelWidth
+                rowSpacing: columnSpacing
 
-            SubMenuButton {
-                objectName: "toolbar_viewAnalyze"
-                implicitHeight: root._toolButtonHeight
-                Layout.fillWidth: true
-                text: qsTr("Analyze")
-                imageResource: "/qmlimages/Analyze.svg"
-                visible: QGroundControl.corePlugin.showAdvancedUI
-                onClicked: {
-                    if (mainWindow.allowViewSwitch()) {
-                        mainWindow.closeIndicatorDrawer()
-                        mainWindow.showAnalyzeTool()
-                    }
-                }
-            }
-
-            SubMenuButton {
-                id: setupButton
-                objectName: "toolbar_viewConfigure"
-                implicitHeight: root._toolButtonHeight
-                Layout.fillWidth: true
-                text: qsTr("Configure")
-                imageResource: "/res/GearWithPaperPlane.svg"
-                onClicked: {
-                    if (mainWindow.allowViewSwitch()) {
-                        mainWindow.closeIndicatorDrawer()
-                        mainWindow.showVehicleConfig()
-                    }
-                }
-            }
-
-            SubMenuButton {
-                id: settingsButton
-                objectName: "toolbar_viewSettings"
-                implicitHeight: root._toolButtonHeight
-                Layout.fillWidth: true
-                text: qsTr("Settings")
-                imageResource: "/custom/img/vama_logo_white.svg" // VAMA
-                visible: !QGroundControl.corePlugin.options.combineSettingsAndSetup
-                onClicked: {
-                    if (mainWindow.allowViewSwitch()) {
-                        mainWindow.closeIndicatorDrawer()
-                        mainWindow.showSettingsTool()
-                    }
-                }
-            }
-
-            SubMenuButton {
-                id: closeButton
-                objectName: "toolbar_viewClose"
-                implicitHeight: root._toolButtonHeight
-                Layout.fillWidth: true
-                text: qsTr("Close")
-                imageResource: "/res/OpenDoor.svg"
-                onClicked: {
-                    if (mainWindow.allowViewSwitch()) {
-                        mainWindow.closeIndicatorDrawer()
-                        // Route through the window close handler so the unsaved
-                        // mission / pending parameter / active connection checks
-                        // run, matching the desktop window-close behavior.
-                        mainWindow.close()
-                    }
-                }
-            }
-
-            ColumnLayout {
-                id: versionColumnLayout
-                Layout.fillWidth: true
-                Layout.columnSpan: 2
-                spacing: 0
-
-                QGCLabel {
-                    id: versionLabel
+                SubMenuButton {
+                    objectName: "toolbar_viewFly"
+                    implicitHeight: root._toolButtonHeight
                     Layout.fillWidth: true
-                    horizontalAlignment: Text.AlignHCenter
-                    text: qsTr("VAMA GCS") // VAMA
-                    font.pointSize: ScreenTools.smallFontPointSize
-                    wrapMode: QGCLabel.WordWrap
+                    text: qsTr("Fly")
+                    imageResource: "/res/FlyingPaperPlane.svg"
+                    onClicked: {
+                        if (mainWindow.allowViewSwitch()) {
+                            mainWindow.closeIndicatorDrawer()
+                            mainWindow.showFlyView()
+                        }
+                    }
                 }
 
-                // VAMA: our build. Change it for every APK sent out.
-                QGCLabel {
+                SubMenuButton {
+                    objectName: "toolbar_viewPlan"
+                    implicitHeight: root._toolButtonHeight
                     Layout.fillWidth: true
-                    horizontalAlignment: Text.AlignHCenter
-                    text: qsTr("Test build 11, 17 October 2026")
-                    font.pointSize: ScreenTools.smallFontPointSize
-                    wrapMode: QGCLabel.WordWrap
+                    text: qsTr("Plan")
+                    imageResource: "/qmlimages/Plan.svg"
+                    onClicked: {
+                        if (mainWindow.allowViewSwitch()) {
+                            mainWindow.closeIndicatorDrawer()
+                            mainWindow.showPlanView()
+                        }
+                    }
                 }
 
-                // VAMA: the QGC release it is built on, in place of QGC's commit date.
-                // Always shown, as it carries the hidden Advanced Mode tap.
-                QGCLabel {
+                SubMenuButton {
+                    objectName: "toolbar_viewAnalyze"
+                    implicitHeight: root._toolButtonHeight
                     Layout.fillWidth: true
-                    horizontalAlignment: Text.AlignHCenter
-                    text: QGroundControl.qgcVersion
-                    font.pointSize: ScreenTools.smallFontPointSize
-                    wrapMode: QGCLabel.WrapAnywhere
+                    text: qsTr("Analyze")
+                    imageResource: "/qmlimages/Analyze.svg"
+                    visible: QGroundControl.corePlugin.showAdvancedUI
+                    onClicked: {
+                        if (mainWindow.allowViewSwitch()) {
+                            mainWindow.closeIndicatorDrawer()
+                            mainWindow.showAnalyzeTool()
+                        }
+                    }
+                }
 
-                    QGCMouseArea {
-                        anchors.topMargin: -(parent.y - versionLabel.y)
-                        anchors.fill: parent
+                SubMenuButton {
+                    id: setupButton
+                    objectName: "toolbar_viewConfigure"
+                    implicitHeight: root._toolButtonHeight
+                    Layout.fillWidth: true
+                    text: qsTr("Configure")
+                    imageResource: "/res/GearWithPaperPlane.svg"
+                    onClicked: {
+                        if (mainWindow.allowViewSwitch()) {
+                            mainWindow.closeIndicatorDrawer()
+                            mainWindow.showVehicleConfig()
+                        }
+                    }
+                }
 
-                        onClicked: (mouse) => {
-                            if (mouse.modifiers & Qt.ControlModifier) {
-                                QGroundControl.corePlugin.showTouchAreas = !QGroundControl.corePlugin.showTouchAreas
-                                showTouchAreasNotification.open()
-                            } else if (ScreenTools.isMobile || mouse.modifiers & Qt.ShiftModifier) {
-                                mainWindow.closeIndicatorDrawer()
-                                if (!QGroundControl.corePlugin.showAdvancedUI) {
-                                    advancedModeOnConfirmation.open()
-                                } else {
-                                    advancedModeOffConfirmation.open()
+                SubMenuButton {
+                    id: settingsButton
+                    objectName: "toolbar_viewSettings"
+                    implicitHeight: root._toolButtonHeight
+                    Layout.fillWidth: true
+                    text: qsTr("Settings")
+                    imageResource: "/custom/img/vama_logo_white.svg" // VAMA
+                    visible: !QGroundControl.corePlugin.options.combineSettingsAndSetup
+                    onClicked: {
+                        if (mainWindow.allowViewSwitch()) {
+                            mainWindow.closeIndicatorDrawer()
+                            mainWindow.showSettingsTool()
+                        }
+                    }
+                }
+
+                SubMenuButton {
+                    id: closeButton
+                    objectName: "toolbar_viewClose"
+                    implicitHeight: root._toolButtonHeight
+                    Layout.fillWidth: true
+                    text: qsTr("Close")
+                    imageResource: "/res/OpenDoor.svg"
+                    onClicked: {
+                        if (mainWindow.allowViewSwitch()) {
+                            mainWindow.closeIndicatorDrawer()
+                            // Route through the window close handler so the unsaved
+                            // mission / pending parameter / active connection checks
+                            // run, matching the desktop window-close behavior.
+                            mainWindow.close()
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    id: versionColumnLayout
+                    Layout.fillWidth: true
+                    Layout.columnSpan: 2
+                    spacing: 0
+
+                    QGCLabel {
+                        id: versionLabel
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        text: qsTr("VAMA GCS") // VAMA
+                        font.pointSize: ScreenTools.smallFontPointSize
+                        wrapMode: QGCLabel.WordWrap
+                    }
+
+                    // VAMA: our build. Change it for every APK sent out.
+                    QGCLabel {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        text: qsTr("Test build 11, 17 October 2026")
+                        font.pointSize: ScreenTools.smallFontPointSize
+                        wrapMode: QGCLabel.WordWrap
+                    }
+
+                    // VAMA: the QGC release it is built on, in place of QGC's commit date.
+                    // Always shown, as it carries the hidden Advanced Mode tap.
+                    QGCLabel {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        text: QGroundControl.qgcVersion
+                        font.pointSize: ScreenTools.smallFontPointSize
+                        wrapMode: QGCLabel.WrapAnywhere
+
+                        QGCMouseArea {
+                            objectName: "vamaAdvancedModeTap" // VAMA: for the screen preview
+                            anchors.topMargin: -(parent.y - versionLabel.y)
+                            anchors.fill: parent
+
+                            onClicked: (mouse) => {
+                                if (mouse.modifiers & Qt.ControlModifier) {
+                                    QGroundControl.corePlugin.showTouchAreas = !QGroundControl.corePlugin.showTouchAreas
+                                    showTouchAreasNotification.open()
+                                } else if (ScreenTools.isMobile || mouse.modifiers & Qt.ShiftModifier) {
+                                    if (!QGroundControl.corePlugin.showAdvancedUI) {
+                                        // VAMA (task Z): the admin password, here in the menu.
+                                        menuContent.askAdminPassword = true
+                                    } else {
+                                        mainWindow.closeIndicatorDrawer()
+                                        advancedModeOffConfirmation.open()
+                                    }
                                 }
                             }
-                        }
 
-                        // This allows you to change this on mobile
-                        onPressAndHold: {
-                            QGroundControl.corePlugin.showTouchAreas = !QGroundControl.corePlugin.showTouchAreas
-                            showTouchAreasNotification.open()
+                            // This allows you to change this on mobile
+                            onPressAndHold: {
+                                QGroundControl.corePlugin.showTouchAreas = !QGroundControl.corePlugin.showTouchAreas
+                                showTouchAreasNotification.open()
+                            }
                         }
                     }
+                }
+            }
+
+            // VAMA (task Z): made when asked, gone when the menu closes.
+            Loader {
+                id:      adminPasswordLoader
+                active:  menuContent.askAdminPassword
+                visible: active
+                source:  "qrc:/Custom/qml/QGroundControl/Toolbar/VamaAdminPasswordPanel.qml"
+
+                Connections {
+                    target: adminPasswordLoader.item
+                    function onFinished() { mainWindow.closeIndicatorDrawer() }
                 }
             }
         }

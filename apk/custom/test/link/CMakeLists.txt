@@ -155,3 +155,24 @@ if(EXISTS "${QGC_SRC}/src/QtLocationPlugin/QGCTileCacheDatabase.cpp")
 else()
     message(WARNING "map_pack_test and map_pack_loader_test are left out: no QGC source in ${QGC_SRC} (apk/fetch_qgc.ps1 makes it)")
 endif()
+
+# The admin password for Advanced Mode (task Z). admin_password_test is built as a test build
+# (the test password), admin_password_team_test as a customer build: it reads the team's salt
+# and hash from a file as apk/build_android.ps1 writes it, made here for the password
+# Team-Pass-For-Tests-42.
+# Overridable so a mutation check can build against a modified copy.
+set(ADMIN_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src CACHE PATH "Folder with AdminPassword.cc")
+foreach(test admin_password_test admin_password_team_test)
+    add_executable(${test} admin_password_test.cc ${ADMIN_SRC}/AdminPassword.cc ${ADMIN_SRC}/AdminPassword.h)
+    target_include_directories(${test} PRIVATE ${ADMIN_SRC})
+    target_link_libraries(${test} PRIVATE Qt6::Core Qt6::Network Qt6::Test)
+endforeach()
+set(TEAM_PASSWORD_DIR ${CMAKE_CURRENT_BINARY_DIR}/team_password)
+file(CONFIGURE OUTPUT ${TEAM_PASSWORD_DIR}/admin_password.inc @ONLY CONTENT
+"// As apk/build_android.ps1 writes it, for the password Team-Pass-For-Tests-42.
+#define VAMA_ADMIN_SALT_HEX \"5eed0f7e57c0ffee5eed0f7e57c0ffee\"
+#define VAMA_ADMIN_HASH_HEX \"08d75cd548314a2c406e87ec97e20fae37a9cd0fb259188684ad06156d97436d\"
+#define VAMA_ADMIN_ITERATIONS 100000
+")
+target_include_directories(admin_password_team_test PRIVATE ${TEAM_PASSWORD_DIR})
+target_compile_definitions(admin_password_team_test PRIVATE VAMA_TEST_TEAM_PASSWORD="Team-Pass-For-Tests-42")
