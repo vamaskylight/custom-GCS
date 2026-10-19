@@ -2088,14 +2088,10 @@ void SkydroidLink::finderLooked(const std::vector<skydroid::find::Found> &found,
         break;
     case skydroid::check::Verdict::NotThere:
         if (!_lockDoubt) {
-            // The box holds something else: at once the camera waits and the box says NOT SEEN, and
-            // the lock ends as for an object not seen, unless the object is found again.
+            // The box holds something else: at once the box says NOT SEEN. With the next picture the
+            // camera waits, and the lock ends as for an object not seen, unless it is found again.
             _lockDoubt = true;
-            _setFollowSpeed(0.0, 0.0);
             _lockSeen = false;
-            if (!_lockLost.isValid()) {
-                _lockLost.start();
-            }
             _lockMessage = _doubtMessage();
             emit lockBoxChanged();
             emit lockChanged();

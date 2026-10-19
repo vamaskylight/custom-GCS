@@ -4198,6 +4198,10 @@ private slots:
         QVERIFY2(_link->lockSeen() && _link->lockNumbers().endsWith(", check: ok"), qPrintable(_link->lockNumbers()));
         QCOMPARE(_marks->count(), 0);
         QVERIFY(_lastSpeed("GSY") > 0.0);
+        // About once a second: the next look is not wanted half a second later, and is a second later.
+        _goOn(400, 0.7, 0.5);
+        QVERIFY(!_marks->wantsPicture());
+        QVERIFY(_goOnUntil([this]() { return _marks->wantsPicture(); }, 1500, 0.7, 0.5));
         // The finder sees no person there any more, while the tracker still has its object (a look-alike).
         _see({});
         QVERIFY(_checkLook(0.7, 0.5));
@@ -4369,6 +4373,8 @@ private slots:
         QVERIFY2(_link->lockActive() && _link->lockSeen(), qPrintable(_link->lockMessage()));
         QVERIFY2(std::abs(_link->lockBoxU() - 0.51) < 0.02, qPrintable(QString::number(_link->lockBoxU())));
         QVERIFY(_goOnUntil([this]() { return std::abs(_link->lockBoxU() - 0.51) < 0.02 && _link->lockSeen(); }, 500, 0.51, 0.5));
+        // The mark told the lock what it is: a person, checked from the start.
+        QVERIFY2(_link->lockNumbers().endsWith(", check: ok"), qPrintable(_link->lockNumbers()));
         _link->stopLock();
     }
 
