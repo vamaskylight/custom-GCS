@@ -22,6 +22,7 @@ add_executable(skydroid_link_test
     ${SKYDROID_SRC}/SkydroidTop.cc
     ${SKYDROID_SRC}/LaserGeo.cc
     ${SKYDROID_SRC}/ObjectTracker.cc
+    ${SKYDROID_SRC}/LockCheck.cc
     # Follow Me, with a stand-in for the drone in the test.
     ${SKYDROID_SRC}/FollowDrone.h
     ${SKYDROID_SRC}/FollowGuide.cc

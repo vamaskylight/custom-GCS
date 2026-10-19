@@ -18,6 +18,10 @@
 //  - A tap on a mark locks that object. The lock starts on the picture the
 //    object was found in (SkydroidLink::lockAtFound), so it is on the object
 //    also when that has moved on since.
+//  - While a person or a vehicle is locked, the finder goes on looking about
+//    once a second, with no marks shown ("checking"): the link checks that the
+//    object is still on its box, and finds it again (SkydroidLink::finderLooked,
+//    LockCheck.h, task AC).
 //
 // A mark is an offer to the operator. Nothing is locked, and no drone is
 // flown, without their tap. What the finder does not mark can still be locked
@@ -58,6 +62,10 @@ class ObjectMarks : public QObject
     Q_PROPERTY(bool looking READ looking WRITE setLooking NOTIFY lookingChanged)
     /// Objects are being marked: enabled, looking, and the finder works.
     Q_PROPERTY(bool running READ running NOTIFY runningChanged)
+    /// The finder checks the app's lock (task AC): enabled, the finder works, and a person or a
+    /// vehicle is locked (SkydroidLink::lockWantsLooks). Its pictures are wanted as for marks; no
+    /// marks are shown.
+    Q_PROPERTY(bool checking READ checking NOTIFY runningChanged)
     /// False once the finder has said that it cannot work (a build without it).
     Q_PROPERTY(bool usable READ usable NOTIFY stateChanged)
     /// The marks: for each, u and v (its centre) and w and h (its size) in parts
@@ -105,6 +113,7 @@ public:
     bool looking() const { return _looking; }
     void setLooking(bool looking);
     bool running() const { return _running; }
+    bool checking() const { return _checking; }
     bool usable() const { return _usable; }
     QVariantList marks() const;
     int count() const { return static_cast<int>(_marks.size()); }
@@ -167,6 +176,7 @@ private:
     bool _enabled = true;
     bool _looking = false;
     bool _running = false;
+    bool _checking = false;    // looks for the link's check of its lock (task AC)
     bool _usable = true;
     QString _whyNot;
     bool _busy = false;        // a picture is with the worker

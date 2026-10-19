@@ -141,6 +141,8 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ObjectTracker.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ObjectTracker.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LockCheck.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LockCheck.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/FollowDrone.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/FollowGuide.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/FollowGuide.h

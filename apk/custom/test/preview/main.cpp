@@ -19,8 +19,10 @@
 //   13_locked.png         locked: the app turned the camera to the walker, the box is on it
 //   14_lock_following.png the walker walks and the app turns the camera after it
 //   14b_lock_on_the_cross.png  the walker stands: under the cross, measured by the laser
+//   14d_lock_check_not_there.png  the finder sees no person on the box in three looks: NOT SEEN (task AC)
+//   14e_lock_found_again.png   the walker came out further on, and the finder found them again (task AC)
 //   14c_lock_not_seen.png      the walker is gone: the box turns red, the camera waits
-//   15_lock_lost.png      two seconds later the lock has ended and says why
+//   15_lock_lost.png      eight seconds later the lock has ended and says why
 //   15b_camera_tracker.png     the same with the camera's own tracker (lock mode "camera")
 //   15c_lock_stopped.png  after the lock button again
 //   16_no_gps_lock.png    a laser shot while the drone has no GPS lock: distance, and why no lat long
@@ -1206,6 +1208,7 @@ int main(int argc, char *argv[])
     QQuickItem *walkerItem = findItem("previewWalker");
     QQuickItem *carItem = findItem("previewCar");
     double carScore = 0.7;  // how sure it is of the car (under 0.5 for an unsure mark, task AD)
+    bool finderSeesWalker = true;  // false: it does not take the walker for a person (task AC)
     QTimer seenTimer;
     seenTimer.setInterval(30);
     QObject::connect(&seenTimer, &QTimer::timeout, &app, [&]() {
@@ -1225,7 +1228,9 @@ int main(int argc, char *argv[])
             thing.h = r.height() / window->height();
             things.push_back(thing);
         };
-        add(walkerItem, skydroid::find::Kind::Person);
+        if (finderSeesWalker) {
+            add(walkerItem, skydroid::find::Kind::Person);
+        }
         add(carItem, skydroid::find::Kind::Vehicle);
         QMutexLocker lock(&seen->mutex);
         seen->things = things;
@@ -1488,6 +1493,55 @@ int main(int argc, char *argv[])
              QQuickItem *box = findItem("vamaResultBox");
              expect(link.lockActive() && box && box->isVisible(), "lock: the laser button does not hide the box during a lock",
                     link.lockMessage());
+             // The finder's check (task AC): the drawn box holds a person, so the finder looks.
+             expect(link.lockWantsLooks() && marks.checking() && !marks.running() && findItems("vamaMark").isEmpty(),
+                    "lock check: a drawn box on a person is checked by the finder, with no marks shown",
+                    QStringLiteral("looks %1, checking %2").arg(link.lockWantsLooks()).arg(marks.checking()));
+             // From now on the finder does not take the walker for a person: as the board stacks it stays
+             // on, the box holds something else.
+             finderSeesWalker = false;
+         }},
+        {300, [&]() {
+             // Three looks in a row, about a second apart.
+             waitFor([&]() { return !link.lockSeen(); }, 6000);
+             expect(link.lockActive() && !link.lockSeen() &&
+                        link.lockMessage() == QStringLiteral("Locked, but the app sees no person in the box any more. The camera waits."),
+                    "lock check: no person on the box in three looks: NOT SEEN, and the state says why", link.lockMessage());
+             expect(boxLabel() == QStringLiteral("NOT SEEN"), "lock check: the box says NOT SEEN", boxLabel());
+             expect(camera.yawRate == 0.0 && camera.pitchRate == 0.0, "lock check: the camera waits",
+                    QStringLiteral("%1 / %2 deg/s").arg(camera.yawRate).arg(camera.pitchRate));
+             // (The line of numbers comes with the next picture.)
+             QQuickItem *numbers = findItem("vamaLockNumbers");
+             waitFor([&]() { return numbers && numbers->property("text").toString().endsWith(QStringLiteral(", check: not there")); }, 1000);
+             const QString line = numbers ? numbers->property("text").toString() : QString();
+             expect(line.endsWith(QStringLiteral(", check: not there")), "lock check: the line of numbers says so", line);
+             shot("14d_lock_check_not_there.png");
+             finderSeesWalker = true;
+         }},
+        {300, [&]() {
+             waitFor([&]() { return link.lockSeen(); }, 3000);
+             expect(link.lockActive() && link.lockSeen() && link.lockMessage().startsWith(QStringLiteral("Locked.")),
+                    "lock check: the person on the box again: the lock goes on", link.lockMessage());
+             // The walker goes behind a tree...
+             camera.setWalkerVisible(false);
+         }},
+        {1000, [&]() {
+             expect(link.lockActive() && !link.lockSeen(), "lock check: behind the tree the object is not seen", link.lockMessage());
+             // ... and comes out three of its widths further on, where the tracker does not look.
+             camera.placeWalker(camera.walkerRight() + 9.0, camera.walkerUp());
+             camera.setWalkerVisible(true);
+         }},
+        {300, [&]() {
+             waitFor([&]() { return link.lockSeen() && boxOnWalker(); }, 4000);
+             expect(link.lockActive() && link.lockSeen() && link.lockMessage().startsWith(QStringLiteral("Found the person again.")),
+                    "lock check: a person coming out near where the object went is found again, and the state says so",
+                    link.lockMessage());
+             expect(boxOnWalker(), "lock check: the box is on the walker there", boxText());
+             shot("14e_lock_found_again.png");
+         }},
+        {1500, [&]() {
+             const QPointF off = walkerOff();
+             expect(std::abs(off.x()) < 2.0 && std::abs(off.y()) < 1.5, "lock check: and the camera has turned to them", offText());
              camera.setWalkerVisible(false);  // the walker is gone
          }},
         {700, [&]() {
@@ -1497,9 +1551,9 @@ int main(int argc, char *argv[])
                     QStringLiteral("%1 / %2 deg/s").arg(camera.yawRate).arg(camera.pitchRate));
              shot("14c_lock_not_seen.png");
          }},
-        {2200, [&]() {
+        {7800, [&]() {
              expect(!link.lockActive() && link.lockMessage().contains(QStringLiteral("Lock lost")),
-                    "lock: after two seconds without the object the lock ends and says why", link.lockMessage());
+                    "lock: after eight seconds without the object the lock ends and says why", link.lockMessage());
              QQuickItem *chip = findItem("vamaLockChip");
              expect(chip && chip->isVisible(), "lock: the reason is on the screen", link.lockMessage());
              shot("15_lock_lost.png");

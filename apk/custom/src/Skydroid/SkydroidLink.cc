@@ -124,7 +124,10 @@ constexpr int kFollowLeaseMs = 400;          // no picture this long: the camera
 constexpr int kFollowHistoryMs = 1000;
 constexpr int kLockPictureWaitMs = 1500;     // no picture at all after the lock: the app cannot follow
 constexpr int kLockNoPictureEndMs = 3000;    // the pictures stopped this long: the lock ends
-constexpr int kLockLostMs = 2000;            // the object not seen this long: the lock ends
+// The object not seen this long: the lock ends. 2 s until task AC: a person the client
+// locked was behind a thin tree for about 6 s (video 2026-10-19), and the developer chose
+// 8 s, so the finder can find them again when they come out (LockCheck.h).
+constexpr int kLockLostMs = 8000;
 constexpr double kLockOnCrossDeg = 1.5;      // the laser measures the object only this near the cross
 constexpr double kLockTurningDeg = 2.0;      // further off, the state says the camera is turning to it
 constexpr double kLockDefaultBox = 0.12;     // a tap: a square box of this share of the picture's height
@@ -136,6 +139,15 @@ constexpr int kLockPictureMinSide = 64;      // a smaller picture is not looked 
 constexpr int kKeepPicturesMs = 2500;
 constexpr int kKeepPicturesMost = 40;
 constexpr int kFoundPictureGapMs = 120;
+// The finder's own pictures are kept too (at the size of the others), for a lock that starts
+// at a moment with no other picture near it: with 9 to 10 pictures a second, unevenly, there
+// was none in the preview on a busy PC (2026-10-20), and a lock on the mark of a walker
+// started on the mark's old place. No more than this many: the finder looks about twice a second.
+constexpr int kFinderPicturesMost = 6;
+// The box in each picture is kept this long, for the finder's looks at those pictures (task AC).
+constexpr int kLockBoxesKeepMs = 3000;
+// After the finder found the object again, the lock's state says so this long.
+constexpr int kFoundAgainNoteMs = 3000;
 // A video that has stopped still gives pictures: the last one, again and again. While the
 // camera turns, the picture must change. The same picture this long, while the gimbal turned
 // this far since it came (or, with no gimbal angles, while the app asks it to turn): the
@@ -1674,6 +1686,13 @@ bool SkydroidLink::lockAtBox(double u, double v, double w, double h)
     _lockLost.invalidate();
     _followSent.clear();
     _forgetGround();  // another object: the ground under it is not known
+    // The finder's check (task AC): the finder's first looks may say what a drawn box holds.
+    // (A lock on a mark knows it: lockAtFound.)
+    _check.start();
+    _lockDoubt = false;
+    _lockBoxes.clear();
+    _lastSeenAtMs = -1;
+    _foundAgainAt.invalidate();
     _lockElapsed.start();
     // The camera's own tracker must not pull against the app.
     _send(top::buildSumTrack(false, _options));
@@ -1826,6 +1845,7 @@ void SkydroidLink::lockPicture(const QImage &image, double pictureX, double pict
         _pictureRate = 0.8 * _pictureRate + 0.2 / seconds;
     }
     _pictureAge.start();
+    _pictureAtMs = _pictureClock.elapsed();
     _trackPicture(pixels, left, top, width, height, true);
 }
 
@@ -1870,6 +1890,7 @@ void SkydroidLink::_keepPicture(const QImage &pixels, double left, double top, d
         if (last.pixels.size() != pixels.size() || last.pixels.format() != pixels.format() || last.left != left ||
             last.top != top || last.width != width || last.height != height) {
             _kept.clear();
+            _finderKept.clear();
         }
     }
     KeptPicture kept;
@@ -1895,15 +1916,70 @@ void SkydroidLink::keepPictures(bool keep)
     _keepPictures = keep;
     if (!keep) {
         _kept.clear();
+        _finderKept.clear();
     }
     if (wanted != lockWantsPictures()) {
         emit lockChanged();
     }
 }
 
-bool SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 atMs)
+void SkydroidLink::keepFinderPicture(const QImage &image, double pictureX, double pictureY, double pictureW,
+                                     double pictureH)
 {
-    // The kept picture of that moment.
+    if (!_keepPictures || _kept.empty() || image.isNull()) {
+        return;
+    }
+    // At the size of the pictures given for the lock, so that the tracker takes it as one of them.
+    // The two are copies of one video item, at two sizes: the video picture is at the same part of each.
+    const KeptPicture &last = _kept.back();
+    const double width = last.pixels.width();
+    const double height = last.pixels.height();
+    if (!std::isfinite(pictureX + pictureY + pictureW + pictureH) ||
+        std::abs(std::clamp(pictureX, 0.0, 1.0) * width - last.left) > 1.5 ||
+        std::abs(std::clamp(pictureY, 0.0, 1.0) * height - last.top) > 1.5 ||
+        std::abs(std::clamp(pictureW, 0.0, 1.0) * width - last.width) > 1.5 ||
+        std::abs(std::clamp(pictureH, 0.0, 1.0) * height - last.height) > 1.5) {
+        return;  // another view
+    }
+    KeptPicture kept;
+    kept.pixels = image.scaled(last.pixels.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+                      .convertToFormat(last.pixels.format());
+    if (kept.pixels.isNull()) {
+        return;
+    }
+    kept.left = last.left;
+    kept.top = last.top;
+    kept.width = last.width;
+    kept.height = last.height;
+    kept.atMs = _pictureClock.elapsed();
+    _finderKept.push_back(kept);
+    while (!_finderKept.empty() && (_finderKept.size() > static_cast<size_t>(kFinderPicturesMost) ||
+                                    kept.atMs - _finderKept.front().atMs > kKeepPicturesMs)) {
+        _finderKept.pop_front();
+    }
+}
+
+bool SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 atMs,
+                               std::optional<skydroid::find::Kind> kind, double score)
+{
+    // Copies of the pictures from that moment on (they share their bytes): a new lock may clear the kept ones.
+    const std::vector<KeptPicture> pictures = _picturesFrom(atMs);
+    if (!lockAtBox(u, v, w, h)) {
+        return false;  // no lock now: the lock message says why
+    }
+    if (_lockByApp && kind) {
+        _check.start(kind, score);  // what the finder took it for
+    }
+    if (pictures.empty() || !_lockByApp || !_lockBusy) {
+        return true;  // mode "camera", or no picture of that moment: locked as a drawn box is
+    }
+    _playFrom(pictures);
+    return true;
+}
+
+std::vector<SkydroidLink::KeptPicture> SkydroidLink::_picturesFrom(qint64 atMs) const
+{
+    // A picture given for the lock near that moment.
     int from = -1;
     qint64 nearest = kFoundPictureGapMs + 1;
     for (size_t i = 0; i < _kept.size(); ++i) {
@@ -1913,19 +1989,38 @@ bool SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 at
             from = static_cast<int>(i);
         }
     }
-    // Copies of the pictures since then (they share their bytes): a new lock may clear the kept ones.
-    const std::vector<KeptPicture> since(from < 0 ? _kept.end() : _kept.begin() + from, _kept.end());
-    if (!lockAtBox(u, v, w, h)) {
-        return false;  // no lock now: the lock message says why
+    if (from >= 0) {
+        return std::vector<KeptPicture>(_kept.begin() + from, _kept.end());
     }
-    if (since.empty() || !_lockByApp || !_lockBusy) {
-        return true;  // mode "camera", or no picture of that moment: locked as a drawn box is
+    // None: the finder's own picture of that moment, then the ones given since (kFinderPicturesMost).
+    const KeptPicture *finder = nullptr;
+    for (const KeptPicture &kept : _finderKept) {
+        const qint64 gap = std::abs(kept.atMs - atMs);
+        if (gap < nearest) {
+            nearest = gap;
+            finder = &kept;
+        }
     }
+    if (!finder) {
+        return {};
+    }
+    std::vector<KeptPicture> pictures{*finder};
+    for (const KeptPicture &kept : _kept) {
+        if (kept.atMs > finder->atMs) {
+            pictures.push_back(kept);
+        }
+    }
+    return pictures;
+}
+
+void SkydroidLink::_playFrom(const std::vector<KeptPicture> &pictures)
+{
     // The tracker starts on the object where it was found, and follows it through the pictures
     // since, as it would have then. The camera is turned for the last of them only: the newest.
-    for (size_t i = 0; i < since.size() && (_lockBusy || _lockActive); ++i) {
-        const KeptPicture &kept = since[i];
-        _trackPicture(kept.pixels, kept.left, kept.top, kept.width, kept.height, i + 1 == since.size());
+    for (size_t i = 0; i < pictures.size() && (_lockBusy || _lockActive); ++i) {
+        const KeptPicture &kept = pictures[i];
+        _pictureAtMs = kept.atMs;
+        _trackPicture(kept.pixels, kept.left, kept.top, kept.width, kept.height, i + 1 == pictures.size());
     }
     // The camera swings over to the object only now. The tracker's first pictures (task Q's soft
     // start) are for that swing: the play-back, up to kKeepPicturesMost pictures, must not use
@@ -1936,7 +2031,112 @@ bool SkydroidLink::lockAtFound(double u, double v, double w, double h, qint64 at
         // as any lock does when the video stops (kLockNoPictureEndMs).
         _pictureAge.start();
     }
-    return true;
+}
+
+bool SkydroidLink::lockWantsLooks() const
+{
+    return _lockByApp && _lockActive && _check.wanted();
+}
+
+void SkydroidLink::finderLooked(const std::vector<skydroid::find::Found> &found, qint64 atMs, double aspect)
+{
+    if (!lockWantsLooks()) {
+        return;
+    }
+    // The lock box in the picture the finder looked at.
+    const LockBoxAt *at = nullptr;
+    qint64 nearest = kFoundPictureGapMs + 1;
+    for (const LockBoxAt &box : _lockBoxes) {
+        const qint64 gap = std::abs(box.atMs - atMs);
+        if (gap < nearest) {
+            nearest = gap;
+            at = &box;
+        }
+    }
+    if (!at) {
+        return;  // no picture of the lock near that moment
+    }
+    // Where the app had seen the object last by then, and how long before.
+    skydroid::check::Box lastSeen;
+    double sinceSeenS = 0.0;
+    if (at->seen) {
+        lastSeen = at->box;
+    } else {
+        bool known = false;
+        for (auto it = _lockBoxes.rbegin(); it != _lockBoxes.rend(); ++it) {
+            if (it->seen && it->atMs <= atMs) {
+                lastSeen = it->box;
+                sinceSeenS = static_cast<double>(atMs - it->atMs) / 1000.0;
+                known = true;
+                break;
+            }
+        }
+        if (!known && _lastSeenAtMs >= 0 && _lastSeenAtMs <= atMs) {
+            lastSeen = _lastSeenBox;
+            sinceSeenS = static_cast<double>(atMs - _lastSeenAtMs) / 1000.0;
+        }
+    }
+    const skydroid::check::Box box = at->box;
+    const bool seen = at->seen;
+    const bool wanted = _check.wanted();
+    const skydroid::check::Answer answer = _check.look(found, box, seen, lastSeen, sinceSeenS, aspect);
+    switch (answer.verdict) {
+    case skydroid::check::Verdict::OnTheBox:
+    case skydroid::check::Verdict::Nothing:
+        // The object is on the box (or cannot be checked): no doubt. The next picture shows it as seen.
+        _lockDoubt = false;
+        break;
+    case skydroid::check::Verdict::NotThere:
+        if (!_lockDoubt) {
+            // The box holds something else: at once the camera waits and the box says NOT SEEN, and
+            // the lock ends as for an object not seen, unless the object is found again.
+            _lockDoubt = true;
+            _setFollowSpeed(0.0, 0.0);
+            _lockSeen = false;
+            if (!_lockLost.isValid()) {
+                _lockLost.start();
+            }
+            _lockMessage = _doubtMessage();
+            emit lockBoxChanged();
+            emit lockChanged();
+        }
+        break;
+    case skydroid::check::Verdict::FoundAgain:
+        _lockAgainOn(answer.again, atMs);
+        break;
+    case skydroid::check::Verdict::Missed:
+        break;
+    }
+    if (wanted != _check.wanted()) {
+        emit lockChanged();  // a drawn box that holds no person or vehicle: no more looks
+    }
+}
+
+void SkydroidLink::_lockAgainOn(const skydroid::check::Box &box, qint64 atMs)
+{
+    const std::vector<KeptPicture> pictures = _picturesFrom(atMs);
+    if (pictures.empty()) {
+        return;  // no picture of that moment: a later look may find it again
+    }
+    // The tracker starts again on the object where the finder found it, and goes through the
+    // pictures since, as a lock on a mark does. The lock itself goes on.
+    _pendingU = std::clamp(box.cx, 0.0, 1.0);
+    _pendingV = std::clamp(box.cy, 0.0, 1.0);
+    _pendingW = std::clamp(box.w, 0.0, 0.9);
+    _pendingH = std::clamp(box.h, 0.0, 0.9);
+    _lockActive = false;
+    _lockBusy = true;
+    _lockDoubt = false;
+    _lockLost.invalidate();
+    _foundAgainAt.start();
+    _playFrom(pictures);
+}
+
+QString SkydroidLink::_doubtMessage() const
+{
+    return _check.kind() == skydroid::find::Kind::Vehicle
+               ? tr("Locked, but the app sees no vehicle in the box any more. The camera waits.")
+               : tr("Locked, but the app sees no person in the box any more. The camera waits.");
 }
 
 void SkydroidLink::_turnedSincePicture(double &yawDeg, double &pitchDeg) const
@@ -2022,15 +2222,28 @@ void SkydroidLink::_follow(const skydroid::track::Result &result, double left, d
                            double height)
 {
     const bool wasSeen = _lockSeen;
-    _lockSeen = result.found;
+    // While the finder does not see the object on the box (task AC), what the tracker found is
+    // something else: not the object.
+    const bool seen = result.found && !_lockDoubt;
+    _lockSeen = seen;
     _lockBoxValid = true;
     _lockBoxU = (result.box.cx - left) / width;
     _lockBoxV = (result.box.cy - top) / height;
     _lockBoxW = result.box.w / width;
     _lockBoxH = result.box.h / height;
+    // The box in this picture, for the finder's looks at it.
+    const skydroid::check::Box box{_lockBoxU, _lockBoxV, _lockBoxW, _lockBoxH};
+    _lockBoxes.push_back(LockBoxAt{_pictureAtMs, box, seen});
+    while (!_lockBoxes.empty() && _pictureAtMs - _lockBoxes.front().atMs > kLockBoxesKeepMs) {
+        _lockBoxes.pop_front();
+    }
+    if (seen) {
+        _lastSeenBox = box;
+        _lastSeenAtMs = _pictureAtMs;
+    }
 
     QString message;
-    if (result.found) {
+    if (seen) {
         _lockLost.invalidate();
         // The lens of the picture the object was found in: on the thermal picture the thermal
         // lens (the day lens made the camera turn 1.7 to 1.9 times too fast there).
@@ -2050,8 +2263,16 @@ void SkydroidLink::_follow(const skydroid::track::Result &result, double left, d
         const double maxPitch = std::clamp(0.5 * _lockBoxH * vfov * _pictureRate, kFollowMinMaxDps, kFollowMaxDps);
         _setFollowSpeed(followSpeed(right - turnedYaw, maxYaw), followSpeed(up - turnedPitch, maxPitch));
         _placeObject(right - turnedYaw, up - turnedPitch, hfov, vfov);
-        message = _lockOffDeg > kLockTurningDeg ? tr("Locked. Turning the camera to the object...")
-                                                : tr("Locked. The camera follows the object.");
+        const bool turning = _lockOffDeg > kLockTurningDeg;
+        if (_foundAgainAt.isValid() && _foundAgainAt.elapsed() < kFoundAgainNoteMs) {
+            // The finder found it again (task AC): said for a while, so the operator sees why.
+            message = (_check.kind() == skydroid::find::Kind::Vehicle ? tr("Found the vehicle again.")
+                                                                       : tr("Found the person again.")) +
+                      QLatin1Char(' ') +
+                      (turning ? tr("Turning the camera to it...") : tr("The camera follows it."));
+        } else {
+            message = turning ? tr("Locked. Turning the camera to the object...") : tr("Locked. The camera follows the object.");
+        }
     } else {
         // Not seen: the camera waits where it last saw the object. (Letting it turn on for a
         // second, as the object was going, was tried on the test bench: no walk more was kept.)
@@ -2063,7 +2284,7 @@ void SkydroidLink::_follow(const skydroid::track::Result &result, double left, d
             _endLock(tr("Lock lost: the app does not see the object any more. Lock it again."));
             return;
         }
-        message = tr("Locked, but the object is not seen right now.");
+        message = _lockDoubt ? _doubtMessage() : tr("Locked, but the object is not seen right now.");
     }
     _lockNumbers = QStringLiteral("off %1 deg, speed %2 / %3 deg/s, match %4, colours %5, %6 pictures/s")
                        .arg(_lockOffDeg, 0, 'f', 1)
@@ -2074,6 +2295,12 @@ void SkydroidLink::_follow(const skydroid::track::Result &result, double left, d
                        .arg(_pictureRate, 0, 'f', 0) +
                    // The first pictures of a lock, with the tracker's rules of before task Q.
                    (result.starting ? QStringLiteral(", lock start") : QString());
+    if (_check.kind()) {
+        // The finder's check, for a field video (task AC).
+        _lockNumbers += _lockDoubt           ? QStringLiteral(", check: not there")
+                        : _check.misses() > 0 ? QStringLiteral(", check: missed %1").arg(_check.misses())
+                                              : QStringLiteral(", check: ok");
+    }
     emit lockBoxChanged();
     if (message != _lockMessage || wasSeen != _lockSeen) {
         _lockMessage = message;
@@ -2313,6 +2540,12 @@ void SkydroidLink::_endLock(const QString &message)
     }
     _lockByApp = false;
     _lockSeen = false;
+    // No lock, no finder's check (task AC).
+    _check.stop();
+    _lockDoubt = false;
+    _lockBoxes.clear();
+    _lastSeenAtMs = -1;
+    _foundAgainAt.invalidate();
     if (_lockBoxValid) {
         _lockBoxValid = false;
         emit lockBoxChanged();
@@ -2331,6 +2564,7 @@ void SkydroidLink::_endAppLockForZoom()
 {
     // What was found, and the pictures kept, show the scene at the old size.
     _kept.clear();
+    _finderKept.clear();
     emit zoomAsked();
     // The app's tracker knows the object at one size: a zoom step changes it.
     if (_lockByApp && (_lockActive || _lockBusy)) {

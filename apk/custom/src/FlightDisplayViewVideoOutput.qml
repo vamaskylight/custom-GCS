@@ -3,7 +3,7 @@
 // QGC's file again after every QGC update. The changes are marked "VAMA": the
 // thermal colour modes of VGCS (client request 2026-10-07), the pictures for
 // the object lock (2026-10-09), and the pictures for the object finder
-// (2026-10-13). QGC's comment on orientation has a colon in place of its long dash.
+// (2026-10-13, and for its check of a lock 2026-10-20). QGC's comment on orientation has a colon in place of its long dash.
 
 import QtQuick
 import QtMultimedia
@@ -82,15 +82,17 @@ VideoOutput {
     }
 
     // VAMA: pictures for the object finder. While the app marks people and
-    // vehicles (ObjectMarks.running), a picture of the video at the camera's own
-    // size goes to it whenever it asks for one: after each look, a few times a
-    // second at most. One grab at a time, as above.
+    // vehicles (ObjectMarks.running), or checks the lock on one (ObjectMarks.checking,
+    // task AC), a picture of the video at the camera's own size goes to it whenever
+    // it asks for one: after each look, a few times a second at most. One grab at
+    // a time, as above.
     Timer {
         id:       markPictures
         objectName: "vamaMarkPictures"
         interval: 40
         repeat:   true
-        running:  ObjectMarks.running && videoOutput.visible && videoOutput.width > 0 && videoOutput.height > 0
+        running:  (ObjectMarks.running || ObjectMarks.checking) && videoOutput.visible && videoOutput.width > 0 &&
+                  videoOutput.height > 0
 
         property bool waiting: false
         property int  skipped: 0

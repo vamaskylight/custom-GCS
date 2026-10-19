@@ -1446,8 +1446,9 @@ private slots:
         _link->stopLock();
     }
 
-    void appLockSaysWhenTheObjectIsNotSeenAndEndsAfterTwoSeconds()
+    void appLockSaysWhenTheObjectIsNotSeenAndEndsAfterEightSeconds()
     {
+        // 2 s until task AC: a person the client locked was behind a tree for about 6 s.
         _link->lockAtBox(0.7, 0.5, 0.06, 0.2);
         _link->lockPicture(_picture(0.7, 0.5), 0.0, 0.0, 1.0, 1.0);
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG2wGSY") >= 1, 1000);
@@ -1462,12 +1463,12 @@ private slots:
         QVERIFY(_link->lockMessage().contains("not seen right now"));
         // The camera waits: it does not keep turning after an object it does not see.
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeed(0.0, 0.0)) >= 1, 1000);
-        while (_link->lockActive() && gone.elapsed() < 4000) {
+        while (_link->lockActive() && gone.elapsed() < 10000) {
             QTest::qWait(90);
             _link->lockPicture(_picture(0.7, 0.5, false), 0.0, 0.0, 1.0, 1.0);
         }
         QVERIFY(!_link->lockActive());
-        QVERIFY2(gone.elapsed() >= 1900 && gone.elapsed() < 3000, qPrintable(QString::number(gone.elapsed())));
+        QVERIFY2(gone.elapsed() >= 7900 && gone.elapsed() < 9000, qPrintable(QString::number(gone.elapsed())));
         QVERIFY(_link->lockMessage().contains("Lock lost"));
         QVERIFY(!_link->lockWantsPictures());
         QVERIFY(!_link->lockBoxValid());
@@ -3671,8 +3672,8 @@ private slots:
         _goOn(700);
         QVERIFY(_follow->active() && !_follow->waiting());
         QVERIFY(_follow->message().startsWith("Following."));
-        // Hidden for good: the lock ends after 2 s, and Follow with it.
-        _goOn(2600, 0.5, 0.5, false);
+        // Hidden for good: the lock ends after 8 s (task AC), and Follow with it.
+        _goOn(8600, 0.5, 0.5, false);
         QVERIFY(!_link->lockActive());
         QVERIFY(!_follow->active());
         QVERIFY(_follow->message().startsWith("Follow ended: the lock ended."));
@@ -4173,6 +4174,201 @@ private slots:
         // An unsure mark locks like any other: a mark is an offer to the operator.
         QVERIFY(_marks->lockAt(300.0 / 1280.0, 0.5));
         QVERIFY(_link->lockBusy() || _link->lockActive());
+        _link->stopLock();
+    }
+
+    // --- The finder's check of a lock (task AC, client videos of 2026-10-19) ---------------------
+    // The lock's pictures have the object (22 x 44 of 384 x 216 points) at u, v; the stand-in
+    // finder sees what the test puts into _seen, in points of the finder's 1280 x 720.
+
+    void aPersonLockIsCheckedAndSaysWhenTheBoxHoldsSomethingElse()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        // Right of the cross: the camera turns after it.
+        _see({_personAt(0.7, 0.5)});
+        QVERIFY(_link->lockAtFound(0.7, 0.5, 22.0 / 384.0, 44.0 / 216.0, _link->pictureClockMs(), Kind::Person, 0.8));
+        QVERIFY(_goOnUntil([this]() { return _link->lockActive() && _link->lockSeen(); }, 2000, 0.7, 0.5));
+        // The finder looks while a person is locked: no marks shown, pictures wanted.
+        QVERIFY(_link->lockWantsLooks());
+        QVERIFY(_marks->checking() && !_marks->running());
+        QVERIFY(_link->keepsPictures());
+        QVERIFY(_checkLook(0.7, 0.5));
+        _goOn(100, 0.7, 0.5);  // (the numbers line comes with the next picture)
+        QVERIFY2(_link->lockSeen() && _link->lockNumbers().endsWith(", check: ok"), qPrintable(_link->lockNumbers()));
+        QCOMPARE(_marks->count(), 0);
+        QVERIFY(_lastSpeed("GSY") > 0.0);
+        // The finder sees no person there any more, while the tracker still has its object (a look-alike).
+        _see({});
+        QVERIFY(_checkLook(0.7, 0.5));
+        QVERIFY(_checkLook(0.7, 0.5));
+        _goOn(100, 0.7, 0.5);
+        QVERIFY2(_link->lockSeen() && _link->lockNumbers().endsWith(", check: missed 2"), qPrintable(_link->lockNumbers()));
+        QVERIFY(_lastSpeed("GSY") > 0.0);
+        _camera->clear();
+        QVERIFY(_checkLook(0.7, 0.5));
+        // The third look in a row: at once NOT SEEN, the camera waits, and the state says why.
+        QVERIFY(_link->lockActive() && !_link->lockSeen());
+        QVERIFY2(_link->lockMessage() == "Locked, but the app sees no person in the box any more. The camera waits.",
+                 qPrintable(_link->lockMessage()));
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeed(0.0, 0.0)) >= 1, 1000);
+        _goOn(300, 0.7, 0.5);
+        QVERIFY2(!_link->lockSeen() && _link->lockNumbers().endsWith(", check: not there"), qPrintable(_link->lockNumbers()));
+        const double yaw = _lastSpeed("GSY");
+        QVERIFY2(std::isnan(yaw) || yaw == 0.0, qPrintable(QString::number(yaw)));
+        // The person is on the box again: the lock goes on.
+        _see({_personAt(0.7, 0.5)});
+        QVERIFY(_checkLook(0.7, 0.5));
+        QVERIFY(_goOnUntil([this]() { return _link->lockSeen(); }, 1000, 0.7, 0.5));
+        QVERIFY2(_link->lockMessage().startsWith("Locked."), qPrintable(_link->lockMessage()));
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        _link->stopLock();
+        QVERIFY(!_link->lockWantsLooks() && !_marks->checking());
+        QVERIFY(!_link->keepsPictures());
+    }
+
+    void aLockThatIsNotThereEndsAfterTheWait()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _see({});
+        QVERIFY(_link->lockAtFound(0.5, 0.5, 22.0 / 384.0, 44.0 / 216.0, _link->pictureClockMs(), Kind::Person, 0.8));
+        QVERIFY(_goOnUntil([this]() { return _link->lockActive() && _link->lockSeen(); }, 2000));
+        for (int i = 0; i < skydroid::check::kMissesNotThere; ++i) {
+            QVERIFY(_checkLook());
+        }
+        QVERIFY(!_link->lockSeen());
+        QElapsedTimer doubt;
+        doubt.start();
+        // The tracker goes on seeing its look-alike, the finder no person: the lock waits 8 s, then ends.
+        QVERIFY(_goOnUntil([this]() { return !_link->lockActive(); }, 10000));
+        QVERIFY2(doubt.elapsed() >= 7500 && doubt.elapsed() < 9000, qPrintable(QString::number(doubt.elapsed())));
+        QVERIFY(_link->lockMessage().contains("Lock lost"));
+    }
+
+    void theFinderFindsThePersonAgainNearWhereTheyWent()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _see({_personAt(0.5, 0.5)});
+        QVERIFY(_link->lockAtFound(0.5, 0.5, 22.0 / 384.0, 44.0 / 216.0, _link->pictureClockMs(), Kind::Person, 0.8));
+        QVERIFY(_goOnUntil([this]() { return _link->lockActive() && _link->lockSeen(); }, 2000));
+        QVERIFY(_checkLook());
+        // Behind a tree: the object is gone from the pictures, the finder sees no one.
+        _see({});
+        _goOn(700, 0.5, 0.5, false);
+        QVERIFY(!_link->lockSeen());
+        // It comes out 2 of its widths further on, where the tracker does not look.
+        const double outU = 0.5 + 2.0 * 22.0 / 384.0;
+        _see({_personAt(outU, 0.5, 0.75)});
+        _goOn(300, outU, 0.5, true);
+        QVERIFY(!_link->lockSeen());
+        _camera->clear();
+        QVERIFY(_checkLook(outU, 0.5));
+        // Found again: the lock goes on there, says so, and the camera turns to it (to the right).
+        QVERIFY2(_link->lockActive() && _link->lockSeen(), qPrintable(_link->lockMessage()));
+        QVERIFY2(_link->lockMessage().startsWith("Found the person again."), qPrintable(_link->lockMessage()));
+        QVERIFY2(std::abs(_link->lockBoxU() - outU) < 0.02, qPrintable(QString::number(_link->lockBoxU())));
+        QTRY_VERIFY_WITH_TIMEOUT(_lastSpeed("GSY") > 0.0, 1000);
+        QVERIFY(_goOnUntil([this]() { return _link->lockSeen() && _link->lockMessage().startsWith("Found the person again."); },
+                           1000, outU, 0.5));
+        _goOn(3200, outU, 0.5);
+        QVERIFY2(_link->lockMessage().startsWith("Locked."), qPrintable(_link->lockMessage()));
+        _link->stopLock();
+    }
+
+    void neitherAFarPersonNorAVehicleIsTakenForTheObject()
+    {
+        using skydroid::find::Kind;
+        _withMarks();
+        _see({_personAt(0.5, 0.5)});
+        QVERIFY(_link->lockAtFound(0.5, 0.5, 22.0 / 384.0, 44.0 / 216.0, _link->pictureClockMs(), Kind::Person, 0.8));
+        QVERIFY(_goOnUntil([this]() { return _link->lockActive() && _link->lockSeen(); }, 2000));
+        QVERIFY(_checkLook());
+        _see({});
+        _goOn(300, 0.5, 0.5, false);
+        QVERIFY(!_link->lockSeen());
+        // A person 6 widths away about a second after: further than it could have gone (3.5 widths).
+        const double farU = 0.5 + 6.0 * 22.0 / 384.0;
+        _see({_personAt(farU, 0.5)});
+        QVERIFY(_checkLook(farU, 0.5));
+        QVERIFY(!_link->lockSeen());
+        // A vehicle right where it went: not a person.
+        skydroid::find::Found car = _personAt(0.5, 0.5);
+        car.kind = Kind::Vehicle;
+        car.label = 2;
+        _see({car});
+        QVERIFY(_checkLook(0.5, 0.5, false));
+        QVERIFY(!_link->lockSeen());
+        // A look-alike the finder is far less sure of (0.45 against 0.8), near where it went.
+        _see({_personAt(0.5 + 1.0 * 22.0 / 384.0, 0.5, 0.45)});
+        QVERIFY(_checkLook(0.5, 0.5, false));
+        QVERIFY(!_link->lockSeen());
+        QVERIFY(_link->lockActive());
+        _link->stopLock();
+    }
+
+    void aDrawnBoxIsCheckedWhenTheFinderSeesAPersonInIt()
+    {
+        _withMarks();
+        _see({_personAt(0.5, 0.5, 0.7)});
+        QVERIFY(_link->lockAtBox(0.5, 0.5, 0.07, 0.25));
+        QVERIFY(_goOnUntil([this]() { return _link->lockActive() && _link->lockSeen(); }, 2000));
+        QVERIFY(_link->lockWantsLooks() && _marks->checking());
+        QVERIFY(_checkLook());
+        _goOn(100);  // (the numbers line comes with the next picture)
+        QVERIFY2(_link->lockNumbers().endsWith(", check: ok"), qPrintable(_link->lockNumbers()));
+        _see({});
+        for (int i = 0; i < skydroid::check::kMissesNotThere; ++i) {
+            QVERIFY(_checkLook());
+        }
+        QVERIFY2(!_link->lockSeen() && _link->lockMessage().contains("sees no person"), qPrintable(_link->lockMessage()));
+        _link->stopLock();
+
+        // A box on something that is no person or vehicle: three looks, then no more.
+        _see({});
+        QVERIFY(_link->lockAtBox(0.5, 0.5, 0.07, 0.25));
+        QVERIFY(_goOnUntil([this]() { return _link->lockActive() && _link->lockSeen(); }, 2000));
+        for (int i = 0; i < 3; ++i) {
+            QVERIFY(_checkLook());
+        }
+        QVERIFY(!_link->lockWantsLooks() && !_marks->checking());
+        QVERIFY(!_link->lockNumbers().contains("check"));
+        _goOn(500);
+        QVERIFY2(_link->lockSeen(), qPrintable(_link->lockMessage()));  // followed as before
+        _link->stopLock();
+    }
+
+    void aMarkTapStartsOnTheFindersOwnPictureWhenNoOtherIsNearThatMoment()
+    {
+        // In the preview on a busy PC (2026-10-20) the lock pictures came 9 to 10 a second,
+        // unevenly, and none was within 120 ms of a mark's moment: the lock started on the mark's
+        // old place, and the walker had walked on.
+        using skydroid::find::Kind;
+        _withMarks();
+        _marks->setLooking(true);
+        for (int i = 0; i < 5; ++i) {
+            _link->lockPicture(_picture(0.40, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        QTest::qWait(200);  // no lock picture for a while
+        // The finder's picture: the object at 0.45 (the same scene, at the finder's size).
+        _see({_personAt(0.45, 0.5)});
+        const QImage scene = _scenePicture(0.45, 0.5);
+        QVERIFY(_lookAgain(QRectF(0.0, 0.0, 1.0, 1.0), &scene));
+        QCOMPARE(_marks->count(), 1);
+        QTest::qWait(200);  // and none after it for a while
+        // It walked on: the next pictures have it at 0.47, 0.49 and 0.51.
+        for (const double u : {0.47, 0.49, 0.51}) {
+            _link->lockPicture(_picture(u, 0.5), 0.0, 0.0, 1.0, 1.0);
+            QTest::qWait(30);
+        }
+        QVERIFY(_marks->lockAt(0.45, 0.5));
+        _marks->setLooking(false);
+        // The lock started on the finder's picture and went through the ones since: it is on the object.
+        QVERIFY2(_link->lockActive() && _link->lockSeen(), qPrintable(_link->lockMessage()));
+        QVERIFY2(std::abs(_link->lockBoxU() - 0.51) < 0.02, qPrintable(QString::number(_link->lockBoxU())));
+        QVERIFY(_goOnUntil([this]() { return std::abs(_link->lockBoxU() - 0.51) < 0.02 && _link->lockSeen(); }, 500, 0.51, 0.5));
         _link->stopLock();
     }
 
@@ -5123,6 +5319,33 @@ private:
             QTest::qWait(5);
         }
         return _look(pictureRect, image);
+    }
+
+    /// The finder's check of a lock (task AC): the video goes on (a lock picture every 90 ms, with the
+    /// object at u, v or without it) until the finder wants a picture; then a lock picture of that
+    /// moment, and the finder's look. False when no look was wanted or no answer came.
+    bool _checkLook(double u = 0.5, double v = 0.5, bool objectThere = true)
+    {
+        if (!_goOnUntil([this]() { return _marks->wantsPicture(); }, 4000, u, v, objectThere)) {
+            return false;
+        }
+        _link->lockPicture(_picture(u, v, objectThere), 0.0, 0.0, 1.0, 1.0);
+        return _look();
+    }
+
+    /// A person as the stand-in finder sees it, where the lock's pictures have the object at u, v
+    /// (22 x 44 of their 384 x 216 points), in points of the finder's 1280 x 720.
+    static skydroid::find::Found _personAt(double u, double v, double score = 0.8)
+    {
+        return _thing(skydroid::find::Kind::Person, u * 1280.0, v * 720.0, 22.0 / 384.0 * 1280.0, 44.0 / 216.0 * 720.0, score);
+    }
+
+    /// The lock's picture with the object at u, v at the finder's size (1280 x 720, three colours):
+    /// the same scene, as the app's two copies of the video item are.
+    static QImage _scenePicture(double u, double v)
+    {
+        return _picture(u, v).scaled(1280, 720, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+            .convertToFormat(QImage::Format_RGB888);
     }
 
     int _asks() const

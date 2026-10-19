@@ -41,6 +41,8 @@ constexpr double kTapGrowShare = 0.3;
 constexpr double kTapGrowLeast = 0.012;
 // The finder gives its memory back when it was not used this long.
 constexpr int kIdleRestMs = 30000;
+// While it checks a lock, it looks about this often (from the start of one look to the next).
+constexpr int kCheckEveryMs = 1000;
 // The two looks at a picture run side by side on a device with this many processor cores.
 constexpr int kSideBySideCores = 4;
 
@@ -67,6 +69,8 @@ ObjectMarks::ObjectMarks(SkydroidLink *link, PictureFinder *finder, bool ownThre
     // A zoom step, or the other lens: what was found is somewhere else in the picture now.
     connect(_link, &SkydroidLink::zoomAsked, this, &ObjectMarks::_clearMarks);
     connect(_link, &SkydroidLink::thermalPictureChanged, this, &ObjectMarks::_clearMarks);
+    // A lock that wants the finder's check starts or ends.
+    connect(_link, &SkydroidLink::lockChanged, this, &ObjectMarks::_update);
     _ageTimer.setInterval(kAgeTickMs);
     connect(&_ageTimer, &QTimer::timeout, this, &ObjectMarks::_dropOldMarks);
     _idleTimer.setSingleShot(true);
@@ -133,32 +137,46 @@ void ObjectMarks::setLooking(bool looking)
 void ObjectMarks::_update()
 {
     const bool run = _enabled && _looking && _usable;
-    if (run == _running) {
+    // The finder's check of the app's lock (task AC), while no marks are shown.
+    const bool check = !run && _enabled && _usable && _link->lockWantsLooks();
+    if (run == _running && check == _checking) {
         return;
     }
+    const bool started = (run && !_running) || (check && !_checking);
+    const bool runChanged = run != _running;
+    // (Set before the link is told: what it says back comes here again.)
     _running = run;
-    // The link keeps the pictures a lock on a mark starts with, for as long as marks are shown.
-    _link->keepPictures(run);
-    _answered = false;
-    _trouble.clear();
-    _closeLook = QRectF();
-    if (run) {
-        _startedAtMs = _now();
+    _checking = check;
+    // The link keeps the pictures a lock on a mark starts with, for as long as marks are shown,
+    // and those in which the check of a lock may find its object again.
+    _link->keepPictures(run || check);
+    if (started) {
         _nextLookAtMs = 0;
-        _ageTimer.start();
+    }
+    if (runChanged) {
+        _answered = false;
+        _trouble.clear();
+        _closeLook = QRectF();
+        if (run) {
+            _startedAtMs = _now();
+            _ageTimer.start();
+        } else {
+            _ageTimer.stop();
+        }
+        _clearMarks();
+    }
+    if (run || check) {
         _idleTimer.stop();
     } else {
-        _ageTimer.stop();
         _idleTimer.start();
     }
-    _clearMarks();
     emit runningChanged();
     emit stateChanged();
 }
 
 bool ObjectMarks::wantsPicture() const
 {
-    return _running && !_busy && _now() >= _nextLookAtMs;
+    return (_running || _checking) && !_busy && _now() >= _nextLookAtMs;
 }
 
 void ObjectMarks::picture(const QImage &image, double pictureX, double pictureY, double pictureW, double pictureH,
@@ -169,6 +187,8 @@ void ObjectMarks::picture(const QImage &image, double pictureX, double pictureY,
     }
     _grabMs = grabMs > 0.0 && std::isfinite(grabMs) ? grabMs : 0.0;
     _busy = true;
+    // The link keeps it too: a lock on what this look finds may start on it.
+    _link->keepFinderPicture(image, pictureX, pictureY, pictureW, pictureH);
     emit lookWanted(image, QRectF(pictureX, pictureY, pictureW, pictureH), _unitMs, _now());
 }
 
@@ -210,6 +230,15 @@ void ObjectMarks::_looked(const MarksAnswer &answer)
         _unitMs = _unitMs > 0.0 ? 0.7 * _unitMs + 0.3 * answer.unitMs : answer.unitMs;
     }
     _nextLookAtMs = _now() + (answer.blank ? kBlankRestMs : restAfter(answer.lookMs));
+    if (_checking && !_running) {
+        // A look for the check of the lock (task AC): no marks, the link decides.
+        _nextLookAtMs = std::max(_nextLookAtMs, answer.atMs + kCheckEveryMs);
+        if (!answer.blank && answer.trouble.isEmpty()) {
+            _link->finderLooked(answer.found, answer.atMs, answer.aspect);
+        }
+        emit lookDone();
+        return;
+    }
     if (!_running || answer.atMs < _startedAtMs) {
         emit lookDone();
         return;  // a picture from before the operator asked: its marks are not shown
@@ -393,6 +422,7 @@ bool ObjectMarks::lockAt(double u, double v)
         return false;
     }
     const Mark mark = _marks[static_cast<std::size_t>(index)];
-    _link->lockAtFound(mark.box.cx, mark.box.cy, mark.box.w, mark.box.h, mark.atMs);
+    // With what the finder took it for: the lock's check looks for that (task AC).
+    _link->lockAtFound(mark.box.cx, mark.box.cy, mark.box.w, mark.box.h, mark.atMs, mark.box.kind, mark.box.score);
     return true;
 }

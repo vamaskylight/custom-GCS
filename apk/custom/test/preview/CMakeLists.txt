@@ -26,6 +26,7 @@ add_executable(vama_preview
     ${CUSTOM_DIR}/src/Skydroid/SkydroidTop.cc
     ${CUSTOM_DIR}/src/Skydroid/LaserGeo.cc
     ${CUSTOM_DIR}/src/Skydroid/ObjectTracker.cc
+    ${CUSTOM_DIR}/src/Skydroid/LockCheck.cc
     # Follow Me, with a stand-in for the drone in main.cpp.
     ${CUSTOM_DIR}/src/Skydroid/FollowDrone.h
     ${CUSTOM_DIR}/src/Skydroid/FollowGuide.cc
