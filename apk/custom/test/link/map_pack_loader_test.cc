@@ -159,6 +159,27 @@ private slots:
         QCOMPARE(_loadedAt.constFirst().y(), (72.85956517290967 + 72.86723482709033) / 2.0);
     }
 
+    void aPackWithTheOverviewIsLoadedAndPlacedByItsDetail()
+    {
+        // VGCS's export since task AB: zoom 10 to 13 over the area and 5 km round it, then the detail.
+        // Every picture is loaded, and the map goes to the middle of the detail (pack.json's area), not
+        // to the middle of the wider pictures.
+        QVERIFY(copyFolder(packFolder(QStringLiteral("esri_overview")), _own + QStringLiteral("/kalol")));
+        QVERIFY(run());
+        QCOMPARE(qgcApp()->messages.size(), 1);
+        QCOMPARE(qgcApp()->messages.constFirst().second, loadedLine(QStringLiteral("kalol"), 23, 10, 15) + QStringLiteral("\n\n") + kSwitchedLine);
+        QCOMPARE(_loadingSeen.value(0), QStringLiteral("Loading map pack \"kalol\": 23 map pictures, zoom 10 to 15. "
+                                                     "The map shows them when this is done."));
+        QCOMPARE(int(namedSets().constFirst().numTiles), 23);
+        // The zoom 10 picture of the client's place, as QGC's map asks for it.
+        const std::unique_ptr<QGCCacheTile> tile = _store->getTile(UrlFactory::getTileHash(kSatellite, 719, 452, 10));
+        QVERIFY(tile);
+        QCOMPARE(tile->img, bytesOf(packFolder(QStringLiteral("esri_overview/10/719/452.png"))));
+        QCOMPARE(_loadedAt.size(), 1);
+        QCOMPARE(_loadedAt.constFirst().x(), (20.442206755300035 + 20.449393244699962) / 2.0);
+        QCOMPARE(_loadedAt.constFirst().y(), (72.85956517290967 + 72.86723482709033) / 2.0);
+    }
+
     void aLoadedPackIsOnlyChecked()
     {
         QVERIFY(copyFolder(packFolder(QStringLiteral("esri_satellite")), _own + QStringLiteral("/kalol")));

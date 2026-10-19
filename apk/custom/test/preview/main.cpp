@@ -1205,6 +1205,7 @@ int main(int argc, char *argv[])
     // What the stand-in finder is to find: the walker and the car where they are on the screen now.
     QQuickItem *walkerItem = findItem("previewWalker");
     QQuickItem *carItem = findItem("previewCar");
+    double carScore = 0.7;  // how sure it is of the car (under 0.5 for an unsure mark, task AD)
     QTimer seenTimer;
     seenTimer.setInterval(30);
     QObject::connect(&seenTimer, &QTimer::timeout, &app, [&]() {
@@ -1217,7 +1218,7 @@ int main(int argc, char *argv[])
             skydroid::find::Found thing;
             thing.kind = kind;
             thing.label = kind == skydroid::find::Kind::Person ? 0 : 2;
-            thing.score = kind == skydroid::find::Kind::Person ? 0.8 : 0.7;
+            thing.score = kind == skydroid::find::Kind::Person ? 0.8 : carScore;
             thing.cx = r.center().x() / window->width();
             thing.cy = r.center().y() / window->height();
             thing.w = r.width() / window->width();
@@ -1750,6 +1751,7 @@ int main(int argc, char *argv[])
              camera.walkerSpeed = 0.0;
              camera.placeWalker(camera.lookRight() + 9.0, camera.pitch() - 5.0);
              camera.placeCar(camera.lookRight() - 15.0, camera.pitch() - 14.0);
+             carScore = 0.46;  // the finder is unsure of the car (task AD)
              expect(marks.enabled() && marks.usable() && !marks.running() && marks.count() == 0,
                     "marks: the switch is on, and nothing is looked at before the lock button", marks.state());
              speedsBefore = camera.speedCommands;
@@ -1771,10 +1773,34 @@ int main(int argc, char *argv[])
              QQuickItem *state = findItem("vamaMarksState");
              const QString stateText = state ? state->property("text").toString() : QString();
              // A look of the stand-in finder takes about 0.3 s, more on a busy PC.
-             static const QRegularExpression lookLine(QStringLiteral("^Marked: 1 person, 1 vehicle\\. A look takes 0\\.\\d s\\."));
+             static const QRegularExpression lookLine(
+                 QStringLiteral("^Marked: 1 person, 1 vehicle \\(1 unsure\\)\\. A look takes 0\\.\\d s\\."));
              expect(state && state->isVisible() && lookLine.match(stateText).hasMatch() &&
                         stateText.contains(QStringLiteral("Getting a picture takes 0.")),
-                    "marks: a line says what is marked, how long a look takes, and how long a picture takes to get", stateText);
+                    "marks: a line says what is marked (and how much of it unsure), how long a look takes, and how long a picture takes to get",
+                    stateText);
+             // Each mark says how sure the finder is. The car's (46 %) is unsure: thinner, faint, with a "?" (task AD).
+             QString labels;
+             bool personSure = false;
+             bool vehicleUnsure = false;
+             for (QQuickItem *box : findItems("vamaMark")) {
+                 QString text;
+                 for (QQuickItem *child : box->childItems()) {
+                     if (child->objectName() == QStringLiteral("vamaMarkLabel")) {
+                         text = child->property("text").toString();
+                     }
+                 }
+                 QObject *border = box->property("border").value<QObject *>();
+                 const double borderWidth = border ? border->property("width").toDouble() : 0.0;
+                 labels += text + QStringLiteral(" (border %1, opacity %2); ").arg(borderWidth).arg(box->opacity());
+                 if (box->property("person").toBool()) {
+                     personSure = text == QStringLiteral("Person 80%") && borderWidth == 2.0 && box->opacity() == 1.0;
+                 } else {
+                     vehicleUnsure = text == QStringLiteral("Vehicle 46%?") && borderWidth == 1.0 && box->opacity() < 0.7;
+                 }
+             }
+             expect(personSure, "marks: a mark says how sure the finder is (Person 80%)", labels);
+             expect(vehicleUnsure, "marks: a mark it is unsure of is thinner and faint, with a \"?\" (Vehicle 46%?)", labels);
              // This finder takes 0.12 s for a look of 640 x 384 points: the app looks closely at the
              // middle 960 x 544 of the camera's 1280 x 720 points (0.26 s), and shows that part with corners.
              // (Where the picture is on the screen is the lock box's own count, as for the marks.)
@@ -1811,6 +1837,7 @@ int main(int argc, char *argv[])
              mouse(QEvent::MouseButtonRelease, at);
          }},
         {100, [&]() {
+             carScore = 0.7;
              // At once: a mark is not a place to wait for a second tap.
              expect(link.lockActive() && link.lockByApp(), "marks: a tap on a mark locks its object at once", link.lockMessage());
              expect(!marks.running() && findItems("vamaMark").isEmpty(), "marks: the marks go when an object is locked",

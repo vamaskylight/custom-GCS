@@ -61,7 +61,8 @@ class ObjectMarks : public QObject
     /// False once the finder has said that it cannot work (a build without it).
     Q_PROPERTY(bool usable READ usable NOTIFY stateChanged)
     /// The marks: for each, u and v (its centre) and w and h (its size) in parts
-    /// of the video picture, and kind ("person" or "vehicle").
+    /// of the video picture, kind ("person" or "vehicle"), score (how sure the
+    /// finder is, 0 to 1) and sure (score kSureScore or more).
     Q_PROPERTY(QVariantList marks READ marks NOTIFY marksChanged)
     Q_PROPERTY(int count READ count NOTIFY marksChanged)
     /// One line for the screen: what is marked, and how long a look takes. Empty when not running.
@@ -84,6 +85,11 @@ public:
 
     /// The pictures the finder gets: the camera's own size.
     static constexpr int kPictureWidth = 1280;
+    /// A mark the finder is less sure of is shown as unsure: thin and faint, with a "?".
+    /// (Task AD, client video 2026-10-19: upright board stacks marked as people. Measured
+    /// on 1169 photo views on 2026-10-20: a higher score limit takes away real people about
+    /// as fast as wrong marks, so all marks stay, and the operator sees how sure each one is.)
+    static constexpr double kSureScore = 0.50;
 
     /// link: the camera link, which keeps the pictures a lock can start on.
     /// finder: taken over. ownThread false (tests): the looks run on the caller's

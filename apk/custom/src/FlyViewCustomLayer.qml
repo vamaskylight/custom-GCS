@@ -1000,6 +1000,8 @@ Item {
         // The people and vehicles the app has found, while the lock button waits
         // for an object: a thin box for each, where the object was in the picture
         // it was found in (some tenths of a second ago). A tap on one locks it.
+        // Each says how sure the finder is. One it is less sure of (under 50 %) is
+        // thinner and faint, with a "?" (task AD: board stacks marked as people).
         Repeater {
             id:    markBoxes
             model: _root._lockPicking ? _marks.marks : []
@@ -1009,6 +1011,7 @@ Item {
 
                 required property var modelData
                 readonly property bool person: modelData.kind === "person"
+                readonly property bool sure:   modelData.sure !== false
 
                 width:        Math.max(lockBox.minSize / 2, modelData.w * lockBox.picture.width)
                 height:       Math.max(lockBox.minSize / 2, modelData.h * lockBox.picture.height)
@@ -1016,9 +1019,11 @@ Item {
                 y:            lockBox.picture.y + modelData.v * lockBox.picture.height - height / 2
                 color:        "transparent"
                 border.color: person ? "#5CFF8A" : "#4FD8FF"
-                border.width: 2
+                border.width: sure ? 2 : 1
+                opacity:      sure ? 1.0 : 0.6
 
                 QGCLabel {
+                    objectName:           "vamaMarkLabel"
                     anchors.left:         parent.left
                     anchors.bottom:       parent.top
                     anchors.bottomMargin: 1
@@ -1026,7 +1031,10 @@ Item {
                     color:                parent.border.color
                     style:                Text.Outline
                     styleColor:           "black"
-                    text:                 parent.person ? qsTr("Person") : qsTr("Vehicle")
+                    text:                 (parent.person ? qsTr("Person") : qsTr("Vehicle")) +
+                                          (typeof parent.modelData.score === "number"
+                                           ? " " + Math.round(parent.modelData.score * 100) + "%" : "") +
+                                          (parent.sure ? "" : "?")
                 }
             }
         }
@@ -1221,6 +1229,7 @@ Item {
                 // The small map is 3 zooms out, as QGC's FlyViewMap.qml has it.
                 mapControl.zoomLevel = mapControl.pipMode ? _mapPackZoom - 3 : _mapPackZoom
             }
+            QGroundControl.flightMapPosition = place
             QGroundControl.flightMapZoom = _mapPackZoom
         }
     }

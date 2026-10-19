@@ -4140,7 +4140,40 @@ private slots:
         QCOMPARE(vehicle.value("kind").toString(), QString("vehicle"));
         QVERIFY(_near(vehicle.value("u").toDouble(), 200.0 / 1280.0) && _near(vehicle.value("v").toDouble(), 600.0 / 720.0));
         QVERIFY(_near(vehicle.value("w").toDouble(), 0.1) && _near(vehicle.value("h").toDouble(), 0.1));
+        // How sure the finder is (task AD).
+        QVERIFY(_near(person.value("score").toDouble(), 0.9) && person.value("sure").toBool());
+        QVERIFY(_near(vehicle.value("score").toDouble(), 0.7) && vehicle.value("sure").toBool());
         QVERIFY2(_marks->state().startsWith("Marked: 1 person, 1 vehicle. A look takes "), qPrintable(_marks->state()));
+    }
+
+    void aMarkSaysHowSureTheFinderIs()
+    {
+        // Task AD (client video 2026-10-19): upright board stacks were marked as people. All marks
+        // stay, and a mark the finder is less sure of than 50 % says so.
+        using skydroid::find::Kind;
+        QCOMPARE(ObjectMarks::kSureScore, 0.50);
+        _withMarks();
+        _see({_thing(Kind::Person, 640.0, 360.0, 32.0, 72.0, 0.72), _thing(Kind::Person, 300.0, 360.0, 32.0, 72.0, 0.44),
+              _thing(Kind::Vehicle, 200.0, 600.0, 128.0, 72.0, 0.50), _thing(Kind::Vehicle, 900.0, 600.0, 128.0, 72.0, 0.49)});
+        _marks->setLooking(true);
+        QVERIFY(_look());
+        QCOMPARE(_marks->count(), 4);
+        QMap<QString, QVariantMap> byPlace;
+        for (const QVariant &item : _marks->marks()) {
+            const QVariantMap mark = item.toMap();
+            byPlace.insert(QString::number(qRound(mark.value("u").toDouble() * 1280.0)), mark);
+        }
+        QVERIFY(_near(byPlace.value("640").value("score").toDouble(), 0.72) && byPlace.value("640").value("sure").toBool());
+        QVERIFY(_near(byPlace.value("300").value("score").toDouble(), 0.44) && !byPlace.value("300").value("sure").toBool());
+        // 50 % is sure, just under it is not.
+        QVERIFY(byPlace.value("200").value("sure").toBool());
+        QVERIFY(!byPlace.value("900").value("sure").toBool());
+        QVERIFY2(_marks->state().startsWith("Marked: 2 people (1 unsure), 2 vehicles (1 unsure). A look takes "),
+                 qPrintable(_marks->state()));
+        // An unsure mark locks like any other: a mark is an offer to the operator.
+        QVERIFY(_marks->lockAt(300.0 / 1280.0, 0.5));
+        QVERIFY(_link->lockBusy() || _link->lockActive());
+        _link->stopLock();
     }
 
     void theStateLineCountsWhatIsMarked()

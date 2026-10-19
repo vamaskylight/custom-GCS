@@ -280,6 +280,8 @@ QVariantList ObjectMarks::marks() const
         map.insert(QStringLiteral("w"), mark.box.w);
         map.insert(QStringLiteral("h"), mark.box.h);
         map.insert(QStringLiteral("kind"), QString::fromLatin1(skydroid::find::kindName(mark.box.kind)));
+        map.insert(QStringLiteral("score"), mark.box.score);
+        map.insert(QStringLiteral("sure"), mark.box.score >= kSureScore);
         list.append(map);
     }
     return list;
@@ -301,19 +303,27 @@ QString ObjectMarks::state() const
     }
     int people = 0;
     int vehicles = 0;
+    int unsurePeople = 0;
+    int unsureVehicles = 0;
     for (const Mark &mark : _marks) {
+        const bool unsure = mark.box.score < kSureScore;
         if (mark.box.kind == Kind::Person) {
             ++people;
+            unsurePeople += unsure ? 1 : 0;
         } else {
             ++vehicles;
+            unsureVehicles += unsure ? 1 : 0;
         }
     }
+    const auto unsureNote = [](int unsure) {
+        return unsure > 0 ? QStringLiteral(" (") + tr("%1 unsure").arg(unsure) + QLatin1Char(')') : QString();
+    };
     QStringList parts;
     if (people > 0) {
-        parts.append(people == 1 ? tr("1 person") : tr("%1 people").arg(people));
+        parts.append((people == 1 ? tr("1 person") : tr("%1 people").arg(people)) + unsureNote(unsurePeople));
     }
     if (vehicles > 0) {
-        parts.append(vehicles == 1 ? tr("1 vehicle") : tr("%1 vehicles").arg(vehicles));
+        parts.append((vehicles == 1 ? tr("1 vehicle") : tr("%1 vehicles").arg(vehicles)) + unsureNote(unsureVehicles));
     }
     QString text = parts.isEmpty() ? tr("No person or vehicle found.") : tr("Marked: %1.").arg(parts.join(QStringLiteral(", ")));
     if (!_trouble.isEmpty()) {

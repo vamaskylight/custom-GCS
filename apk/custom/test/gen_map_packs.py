@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT))
 from PySide6.QtCore import QBuffer, QIODevice  # noqa: E402
 from PySide6.QtGui import QColor, QGuiApplication, QImage  # noqa: E402
 
-from vgcs.map.tile_pack import download_tile_pack, plan_pack_for_area  # noqa: E402
+from vgcs.map.tile_pack import OVERVIEW_PACK_ZOOMS, download_tile_pack, plan_pack_for_area  # noqa: E402
 
 OUT = Path(__file__).resolve().parent / "map_packs"
 
@@ -39,10 +39,12 @@ ESRI_STREETS = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Stree
 OSM = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
 
 PACKS = [
-    # name, template, zooms, radius in km, picture format (Esri's imagery is JPEG, as on the internet)
-    ("esri_satellite", ESRI_IMAGERY, (14, 15, 16), 0.4, "JPG"),
-    ("esri_streets", ESRI_STREETS, (15,), 0.4, "PNG"),
-    ("osm_streets", OSM, (15,), 0.4, "PNG"),
+    # name, template, zooms, radius in km, picture format (Esri's imagery is JPEG, as on the internet),
+    # and the zoomed-out overview of VGCS's export (since 2026-10-19, task AB)
+    ("esri_satellite", ESRI_IMAGERY, (14, 15, 16), 0.4, "JPG", ()),
+    ("esri_streets", ESRI_STREETS, (15,), 0.4, "PNG", ()),
+    ("osm_streets", OSM, (15,), 0.4, "PNG", ()),
+    ("esri_overview", ESRI_IMAGERY, (15,), 0.4, "JPG", OVERVIEW_PACK_ZOOMS),
 ]
 
 
@@ -65,8 +67,8 @@ def main() -> int:
     app = QGuiApplication.instance() or QGuiApplication([])  # noqa: F841 (image writers need it)
     if OUT.exists():
         shutil.rmtree(OUT)
-    for name, template, zooms, radius, fmt in PACKS:
-        plan = plan_pack_for_area(LAT, LON, radius_km=radius, template=template, zooms=zooms)
+    for name, template, zooms, radius, fmt, overview in PACKS:
+        plan = plan_pack_for_area(LAT, LON, radius_km=radius, template=template, zooms=zooms, overview_zooms=overview)
         result = download_tile_pack(
             plan,
             OUT / name,

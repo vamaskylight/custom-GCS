@@ -381,6 +381,8 @@ private slots:
         QTest::newRow("Esri satellite") << QStringLiteral("esri_satellite") << kSatellite << QStringLiteral("jpg") << 17 << 14 << 16;
         QTest::newRow("Esri streets") << QStringLiteral("esri_streets") << QStringLiteral("Esri World Street") << QStringLiteral("png") << 4 << 15 << 15;
         QTest::newRow("OpenStreetMap") << QStringLiteral("osm_streets") << QStringLiteral("Street Map") << QStringLiteral("png") << 4 << 15 << 15;
+        // VGCS's export since task AB: the overview, zoom 10 to 13, before the detail.
+        QTest::newRow("Esri satellite with the overview") << QStringLiteral("esri_overview") << kSatellite << QStringLiteral("jpg") << 23 << 10 << 15;
     }
 
     void qgcImportsThePackAsANamedSet()
