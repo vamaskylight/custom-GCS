@@ -1617,6 +1617,9 @@ class PlanFlightPanel(QWidget):
             self._pf_mission, "distance", p.get("missionDistanceM", p.get("missionDistanceFt", "0 m"))
         )
         self._set_metric(self._pf_mission, "time", p.get("missionTime", "00:00:00"))
+        # The parts of the time, as the check of Upload counts them (2026-10-21).
+        if self._pf_mission and "time" in self._pf_mission:
+            self._pf_mission["time"].setToolTip(p.get("missionTimeParts", ""))
         self._set_metric(
             self._pf_max_telem, "max telem dist", p.get("maxTelemDistM", p.get("maxTelemDistFt", "0 m"))
         )

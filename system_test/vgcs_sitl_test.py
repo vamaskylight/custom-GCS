@@ -587,7 +587,7 @@ def mission_flight(version: str, r: Report) -> None:
 
 
 def mission_time_on_the_battery(version: str, r: Report) -> None:
-    """The mission check's time against a mission the drone flies, in still air and against the wind on the way home."""
+    """The mission check's time against missions the drone flies: still air, wind on the way home, and a survey."""
     from vgcs.app.vehicle_params import READ_ON_CONNECT
     from vgcs.mission.flight_time import drone_speeds, mission_flight_time
 
@@ -596,12 +596,16 @@ def mission_time_on_the_battery(version: str, r: Report) -> None:
         return {"lat": lat, "lon": lon, "alt_m": alt, "speed_mps": speed, "hover_s": hover}
 
     # Out 300 m north at 30 m, then 300 m east climbing to 50 m with a 10 s hover. Home at 60 m.
-    mission = [wp(300, 0, 30, 8), wp(300, 300, 50, 8, hover=10)]
+    out_and_back = [wp(300, 0, 30, 8), wp(300, 300, 50, 8, hover=10)]
+    # Right angles, short legs, a turn straight back, and a climb straight up at one place.
+    survey = [wp(100, 0, 30, 6), wp(100, 50, 30, 6), wp(0, 50, 30, 6), wp(0, 100, 30, 6), wp(100, 100, 30, 6),
+              wp(50, 100, 30, 6), wp(50, 100, 45, 6), wp(50, 150, 45, 6)]
     rtl = {"4.6": {"RTL_ALT": 6000}, "4.7": {"RTL_ALT_M": 60}}[version[:3]]
     # The wind blows from the south-west: against the way home from the north-east. It grows with
     # height (SIM_WIND_T 0), 6 m/s at the RTL height and none at the ground, as near a real field.
-    for wind in (0.0, 6.0):
-        words = "in still air" if not wind else f"against {wind:g} m/s of wind"
+    for words, mission, wind in (("in still air", out_and_back, 0.0),
+                                 ("against 6 m/s of wind", out_and_back, 6.0),
+                                 ("a survey in still air", survey, 0.0)):
         f = Flight(version, params=dict(rtl, SIM_WIND_SPD=wind, SIM_WIND_DIR=225, SIM_WIND_T=0))
         try:
             rec, sim, link = f.rec, f.sim, f.link
@@ -611,7 +615,8 @@ def mission_time_on_the_battery(version: str, r: Report) -> None:
             speeds = drone_speeds(rec.params[-1] if rec.params else {})
             r.check(speeds.read_from_drone and speeds.rtl_alt_m == 60.0 and speeds.rtl_speed_mps,
                     f"{words}: VGCS read the drone's speeds (up {speeds.climb_mps:g}, down {speeds.descent_mps:g}, "
-                    f"home {speeds.rtl_speed_mps} m/s at {speeds.rtl_alt_m} m)")
+                    f"home {speeds.rtl_speed_mps} m/s at {speeds.rtl_alt_m} m, speeding up at {speeds.accel_mps2:g} "
+                    "m/s/s)")
             link.queue_mission_upload(mission, "rtl")
             r.check(f.wait(lambda: bool(rec.uploaded), 60), f"{words}: the mission is on the drone")
             link.queue_mission_start()
@@ -621,7 +626,7 @@ def mission_time_on_the_battery(version: str, r: Report) -> None:
             def reached() -> list[int]:
                 return [p["wp_index"] for _t, p in rec.progress if p.get("reached") and p.get("wp_index") is not None]
 
-            r.check(f.wait(lambda: 1 in reached(), 400), f"{words}: it flew the route")
+            r.check(f.wait(lambda: len(mission) - 1 in reached(), 600), f"{words}: it flew the route")
             ground: list[float] = []
 
             def note() -> None:
@@ -633,11 +638,11 @@ def mission_time_on_the_battery(version: str, r: Report) -> None:
             r.check(not sim.armed and math.hypot(sim.north, sim.east) < 3.0,
                     f"{words}: it came home, landed and disarmed ({math.hypot(sim.north, sim.east):.1f} m from home)")
             told = mission_flight_time(HOME, mission, speeds, headwind_mps=wind)
-            # Speeding up and slowing down, the take-off and the touchdown are not in the estimate:
-            # about 25 s on this mission (2026-10-20, both versions).
-            r.check(0.8 * flown <= told.total_s <= flown,
-                    f"{words}: the estimate {told.total_s:.0f} s ({told.parts()}) is under the {flown:.0f} s "
-                    "flown, by less than a fifth")
+            # 2026-10-21, with the speeding up and slowing down: 3 to 5 s off on both versions.
+            # Before that the estimate was about 25 s short.
+            r.check(abs(told.total_s - flown) <= 0.04 * flown,
+                    f"{words}: the estimate {told.total_s:.0f} s ({told.parts()}) is within 4 % of the "
+                    f"{flown:.0f} s flown ({told.total_s - flown:+.0f} s)")
             if wind:
                 typical = sorted(ground)[len(ground) // 2] if ground else 0.0
                 expected = speeds.rtl_speed_mps - wind

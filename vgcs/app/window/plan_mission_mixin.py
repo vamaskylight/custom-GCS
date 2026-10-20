@@ -843,26 +843,35 @@ class MainWindowPlanMissionMixin:
         self._maybe_refresh_map_web_overlays()
 
     def _estimate_plan_timing(self, model: list):
-        """Leg-by-leg timing at each waypoint's own speed, including the return.
+        """The mission's time on the battery, as the check of Upload counts it (vgcs/mission/flight_time.py).
 
-        Falls back to an empty timing on any error — a wrong number in the plan
+        The take-off, the route at each waypoint's own speed, the hover, the way
+        home as RTL flies it to the drone's home against the planning wind, and
+        the landing. Until 2026-10-21 the bar timed only the legs, with a way home
+        at the last leg's speed: another number than the check's.
+
+        Falls back to an empty timing on any error: a wrong number in the plan
         bar is worse than a blank one, because an operator sizes a battery
         against it.
         """
-        from vgcs.mission.mission_timing import MissionTiming, estimate_mission_time
+        from vgcs.mission.flight_time import FlightTime, drone_speeds, mission_flight_time
 
         try:
             start = self._map_widget.get_vehicle_position()
         except Exception:
             start = None
         try:
-            end_action = self._map_widget.get_mission_end_action()
+            wind_mps, _wind_from = self._plan_wind()
+            return mission_flight_time(
+                start,
+                model,
+                drone_speeds(dict(getattr(self, "_last_params", {}) or {})),
+                home=self._plan_drone_home(),
+                headwind_mps=wind_mps,
+                takeoff_alt_m=self._plan_takeoff_alt_for_check(),
+            )
         except Exception:
-            end_action = "hold"
-        try:
-            return estimate_mission_time(model, start=start, end_action=end_action)
-        except Exception:
-            return MissionTiming()
+            return FlightTime()
 
     def _on_plan_waypoint_selection_changed(self, index: int) -> None:
         self._refresh_plan_flight_metrics()
@@ -913,15 +922,21 @@ class MainWindowPlanMissionMixin:
         mission_distance_m = timing.total_m
         mission_distance_text = f"{mission_distance_m:.0f} m"
 
-        if self._armed_since is not None:
-            elapsed = int(time.monotonic() - self._armed_since)
-            mission_time = f"{elapsed // 3600:02d}:{(elapsed % 3600) // 60:02d}:{elapsed % 60:02d}"
-        elif timing.total_s > 0.5:
-            from vgcs.mission.mission_timing import format_hms
+        from vgcs.mission.flight_time import format_hms
 
+        if self._armed_since is not None:
+            mission_time = format_hms(time.monotonic() - self._armed_since)
+            mission_time_parts = "Time since the drone armed."
+        elif timing.wind_too_strong:
+            mission_time = "no way home"
+            mission_time_parts = (f"Against {round(timing.headwind_mps, 1):g} m/s of wind the drone may not get "
+                                  f"home: it returns at {timing.home_speed_mps:.1f} m/s.")
+        elif timing.total_s > 0.5:
             mission_time = format_hms(timing.total_s)
+            mission_time_parts = f"On the battery: {timing.parts()}."
         else:
             mission_time = "00:00:00"
+            mission_time_parts = ""
 
         max_telem_dist_m = f"{self._max_telem_dist_m:.0f} m"
         self._map_widget.set_plan_flight_metrics(
@@ -932,6 +947,7 @@ class MainWindowPlanMissionMixin:
             dist_prev_wp_m=dist_prev_wp_m,
             mission_distance_m=mission_distance_text,
             mission_time=mission_time,
+            mission_time_parts=mission_time_parts,
             max_telem_dist_m=max_telem_dist_m,
         )
 

@@ -200,6 +200,7 @@ class PlanMissionMixin:
         mission_distance_m: str,
         mission_time: str,
         max_telem_dist_m: str,
+        mission_time_parts: str = "",
     ) -> None:
         payload = {
             "altDiffM": alt_diff_m,
@@ -209,6 +210,7 @@ class PlanMissionMixin:
             "distPrevWpM": dist_prev_wp_m,
             "missionDistanceM": mission_distance_m,
             "missionTime": mission_time,
+            "missionTimeParts": mission_time_parts,
             "maxTelemDistM": max_telem_dist_m,
         }
         if payload == self._last_plan_flight_metrics_payload:

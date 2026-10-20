@@ -560,8 +560,8 @@ def _check_endurance(report, endurance_min, cruise_speed_mps, waypoints, *, star
     minutes = calm.total_s / 60.0
     if minutes > endur:
         report.errors.append(
-            f"Round trip needs about {minutes:.0f} min ({calm.parts()}), but the flight time on one battery is "
-            f"{endur:.0f} min. The aircraft cannot get home."
+            f"Round trip needs about {_minutes(minutes, endur)} min ({calm.parts()}), but the flight time on one "
+            f"battery is {endur:g} min. The aircraft cannot get home."
         )
         return
     if windy is not calm and not windy.wind_too_strong:
@@ -570,15 +570,26 @@ def _check_endurance(report, endurance_min, cruise_speed_mps, waypoints, *, star
             share = "That is more than the" if windy_minutes > endur else "That is most of the"
             report.warnings.append(
                 f"With {round(headwind, 1):g} m/s of wind against the way home{source}, the round trip may need about "
-                f"{windy_minutes:.0f} min ({windy.parts()}). {share} {endur:.0f} min flight time on one battery. "
-                "Plan a shorter mission, or wait for less wind."
+                f"{_minutes(windy_minutes, endur)} min ({windy.parts()}). {share} {endur:g} min flight time on one "
+                "battery. Plan a shorter mission, or wait for less wind."
             )
             return
     if minutes > endur * ENDURANCE_WARN_FRACTION:
         report.warnings.append(
-            f"Round trip needs about {minutes:.0f} min of the {endur:.0f} min flight time ({calm.parts()}). "
-            "That leaves very little reserve for wind or a diversion."
+            f"Round trip needs about {_minutes(minutes, endur)} min of the {endur:g} min flight time "
+            f"({calm.parts()}). That leaves very little reserve for wind or a diversion."
         )
+
+
+def _minutes(minutes: float, endur: float) -> str:
+    """Whole minutes, and tenths within a minute of the flight time, rounded away from it.
+
+    "Needs about 25 min, but the flight time is 25 min" said nothing: it was 25.2.
+    """
+    if abs(minutes - endur) >= 1.0:
+        return f"{minutes:.0f}"
+    tenths = math.ceil(minutes * 10.0 - 1e-9) if minutes > endur else math.floor(minutes * 10.0 + 1e-9)
+    return f"{tenths / 10.0:.1f}"
 
 
 # --------------------------------------------------------------------------- #

@@ -42,7 +42,8 @@ EDITABLE = (
 )
 
 # The speeds of the mission's time on the battery (vgcs/mission/flight_time.py,
-# 2026-10-20), renamed in 4.7 too: centimetres became metres. Not in "Set param".
+# 2026-10-20, the accelerations 2026-10-21), renamed in 4.7 too: centimetres
+# became metres (the jerk was in metres already). Not in "Set param".
 SPEEDS_RENAMED_IN_4_7 = {
     "WPNAV_SPEED_UP": "WP_SPD_UP",
     "WPNAV_SPEED_DN": "WP_SPD_DN",
@@ -50,6 +51,9 @@ SPEEDS_RENAMED_IN_4_7 = {
     "LAND_SPEED_HIGH": "LAND_SPD_HIGH_MS",
     "LAND_ALT_LOW": "LAND_ALT_LOW_M",
     "RTL_SPEED": "RTL_SPEED_MS",
+    "WPNAV_ACCEL": "WP_ACC",
+    "WPNAV_ACCEL_Z": "WP_ACC_Z",
+    "WPNAV_JERK": "WP_JERK",
 }
 
 # Read as well, because VGCS checks them: the 10 km mission check

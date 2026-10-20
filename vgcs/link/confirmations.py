@@ -35,6 +35,12 @@ PARAM_WRITE_TRIES = 3
 # still missing after that is not on this drone (or the link is very bad).
 PARAM_READ_WAIT_S = 2.5
 PARAM_READ_ROUNDS = 2
+# ArduPilot keeps at most 20 settings requests waiting (GCS_MAVLINK::param_requests,
+# shared by its links) and drops the rest without a word. Asked all at once, 42
+# names lost their last three on 2026-10-21, the payload release output among
+# them, and VGCS called them "not on this drone". So no more than this many names
+# are asked and not yet answered at a time.
+PARAM_READ_WINDOW = 10
 
 # ArduCopter sends its heartbeat once a second, so a mode it entered shows
 # within about a second. One more SET_MODE goes out if neither a heartbeat in
@@ -158,13 +164,28 @@ class ParamWrites:
 
 
 class ParamReads:
-    """Settings asked for and not yet answered. Several reads may be open at once."""
+    """Settings asked for and not yet answered. Several reads may be open at once.
 
-    def __init__(self, wait_s: float = PARAM_READ_WAIT_S, rounds: int = PARAM_READ_ROUNDS) -> None:
+    At most `window` names are asked and not answered at a time; the next ones go
+    out as answers come (tick()). ArduPilot answers in the order it was asked, so
+    a name passed over while a name asked after it was answered is not on this
+    drone, or its answer was lost: it is asked once more at once, not after a
+    wait. With no answers at all, a name is asked again after `wait_s`. After
+    `rounds` asks it is given up.
+    """
+
+    def __init__(self, wait_s: float = PARAM_READ_WAIT_S, rounds: int = PARAM_READ_ROUNDS,
+                 window: int = PARAM_READ_WINDOW) -> None:
         self.wait_s = float(wait_s)
         self.rounds = max(1, int(rounds))
-        # each: [wanted names (ordered), got {name: value}, round started, round number, on_done]
+        self.window = max(1, int(window))
+        # each: [wanted names (ordered), got {name: value}, on_done]
         self._open: list[list] = []
+        # asked and not answered: name -> [time of the last ask, asks so far, order of the last ask, passed over]
+        self._asked: dict[str, list] = {}
+        self._order = 0
+        # given up, while an open read still wants them
+        self._gone: set[str] = set()
 
     def start(self, names: list[str], now: float,
               on_done: Callable[[dict[str, float], list[str]], None]) -> list[str]:
@@ -181,50 +202,86 @@ class ParamReads:
         if not wanted:
             on_done({}, [])
             return []
-        self._open.append([wanted, {}, now, 1, on_done])
-        return list(wanted)
+        self._open.append([wanted, {}, on_done])
+        return self._next(now)
 
     def heard(self, name: str, value: float) -> bool:
         """The drone sent PARAM_VALUE. True when an open read wanted it."""
         name = clean_name(name)
+        asked = self._asked.pop(name, None)
+        if asked is not None:
+            # Everything asked before it and still unanswered was passed over.
+            for other in self._asked.values():
+                if other[2] < asked[2]:
+                    other[3] = True
         used = False
-        for entry in list(self._open):
-            wanted, got = entry[0], entry[1]
-            if name in wanted:
-                got[name] = float(value)
+        for entry in self._open:
+            if name in entry[0]:
+                entry[1][name] = float(value)
                 used = True
-                if len(got) == len(wanted):
-                    self._open.remove(entry)
-                    entry[4](dict(got), [])
+        self._finish()
         return used
 
     def tick(self, now: float) -> list[str]:
-        """Finish the reads that ran out of time. Returns the names to ask for again."""
+        """Ask again what was passed over or got no answer, give up after the last round, ask the next names.
+
+        Returns the names to ask for now.
+        """
         again: list[str] = []
-        for entry in list(self._open):
-            wanted, got, started, round_no, on_done = entry
-            if now - started < self.wait_s:
+        for name, entry in list(self._asked.items()):
+            sent_at, asks, _order, passed_over = entry
+            if not passed_over and now - sent_at < self.wait_s:
                 continue
-            missing = [n for n in wanted if n not in got]
-            if round_no < self.rounds:
-                entry[2] = now
-                entry[3] = round_no + 1
-                again.extend(n for n in missing if n not in again)
-                continue
-            self._open.remove(entry)
-            on_done(dict(got), missing)
-        return again
+            if asks < self.rounds:
+                self._asked[name] = [now, asks + 1, self._take_order(), False]
+                again.append(name)
+            else:
+                del self._asked[name]
+                self._gone.add(name)
+        self._finish()
+        return again + self._next(now)
 
     def pending(self) -> list[str]:
         out: list[str] = []
         for entry in self._open:
-            out.extend(n for n in entry[0] if n not in entry[1] and n not in out)
+            out.extend(n for n in entry[0] if n not in entry[1] and n not in self._gone and n not in out)
         return out
 
     def cancel_all(self) -> None:
+        open_reads, self._open = self._open, []
+        self._asked.clear()
+        self._gone.clear()
+        for wanted, got, on_done in open_reads:
+            on_done(dict(got), [n for n in wanted if n not in got])
+
+    def _take_order(self) -> int:
+        self._order += 1
+        return self._order
+
+    def _next(self, now: float) -> list[str]:
+        """The names to ask for next, while fewer than `window` are open."""
+        out: list[str] = []
+        for wanted, got, _on_done in self._open:
+            for name in wanted:
+                if len(self._asked) >= self.window:
+                    return out
+                if name in got or name in self._asked or name in self._gone:
+                    continue
+                self._asked[name] = [now, 1, self._take_order(), False]
+                out.append(name)
+        return out
+
+    def _finish(self) -> None:
+        """Report the reads that have each name answered or given up."""
         for entry in list(self._open):
-            self._open.remove(entry)
-            entry[4](dict(entry[1]), [n for n in entry[0] if n not in entry[1]])
+            wanted, got, on_done = entry
+            if all(n in got or n in self._gone for n in wanted):
+                self._open.remove(entry)
+                on_done(dict(got), [n for n in wanted if n not in got])
+        still = {n for entry in self._open for n in entry[0]}
+        self._gone &= still      # a later read asks for them again
+        for name in [n for n in self._asked if n not in still]:
+            del self._asked[name]
 
 
 def _mode_key(name: str) -> str:
