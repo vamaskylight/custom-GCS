@@ -385,7 +385,13 @@ def parameters(version: str, r: Report) -> None:
         rec, sim, link = f.rec, f.sim, f.link
         r.check(f.ready_to_fly(), "the drone is ready")
         # What VGCS reads on connect and on "Refresh params": both firmware's names.
-        from vgcs.app.vehicle_params import EDITABLE, READ_ON_CONNECT, RENAMED_IN_4_7, editable_on_this_drone
+        from vgcs.app.vehicle_params import (
+            EDITABLE,
+            READ_ON_CONNECT,
+            RENAMED_IN_4_7,
+            SPEEDS_RENAMED_IN_4_7,
+            editable_on_this_drone,
+        )
 
         names = list(READ_ON_CONNECT)
         t0 = time.monotonic()
@@ -393,10 +399,12 @@ def parameters(version: str, r: Report) -> None:
         f.wait_real(lambda: bool(rec.params), 15)
         took = time.monotonic() - t0
         got = rec.params[-1] if rec.params else {}
-        for old, new in RENAMED_IN_4_7.items():
+        renamed = {**RENAMED_IN_4_7, **SPEEDS_RENAMED_IN_4_7}
+        for old, new in renamed.items():
             has = [n for n in (old, new) if n in got]
-            r.check(len(has) == 1, f"{old} / {new}: the drone has exactly one of the two names ({has})")
-        must_have = [n for n in names if n not in RENAMED_IN_4_7 and n not in RENAMED_IN_4_7.values()]
+            r.check(len(has) == 1 and has[0] == (old if version.startswith("4.6") else new),
+                    f"{old} / {new}: the drone has exactly one of the two names, this version's ({has})")
+        must_have = [n for n in names if n not in renamed and n not in renamed.values()]
         missing = [n for n in must_have if n not in got]
         r.check(not missing, f"every other setting VGCS reads is on this firmware ({len(must_have) - len(missing)} of {len(must_have)})"
                 + (f". Missing: {missing}" if missing else ""))
@@ -576,6 +584,68 @@ def mission_flight(version: str, r: Report) -> None:
         r.check(not rec.errors, f"VGCS reported no error {[e[1] for e in rec.errors][:3]}")
     finally:
         f.close()
+
+
+def mission_time_on_the_battery(version: str, r: Report) -> None:
+    """The mission check's time against a mission the drone flies, in still air and against the wind on the way home."""
+    from vgcs.app.vehicle_params import READ_ON_CONNECT
+    from vgcs.mission.flight_time import drone_speeds, mission_flight_time
+
+    def wp(north: float, east: float, alt: float, speed: float, hover: int = 0) -> dict:
+        lat, lon = offset_to_lat_lon(north, east)
+        return {"lat": lat, "lon": lon, "alt_m": alt, "speed_mps": speed, "hover_s": hover}
+
+    # Out 300 m north at 30 m, then 300 m east climbing to 50 m with a 10 s hover. Home at 60 m.
+    mission = [wp(300, 0, 30, 8), wp(300, 300, 50, 8, hover=10)]
+    rtl = {"4.6": {"RTL_ALT": 6000}, "4.7": {"RTL_ALT_M": 60}}[version[:3]]
+    # The wind blows from the south-west: against the way home from the north-east. It grows with
+    # height (SIM_WIND_T 0), 6 m/s at the RTL height and none at the ground, as near a real field.
+    for wind in (0.0, 6.0):
+        words = "in still air" if not wind else f"against {wind:g} m/s of wind"
+        f = Flight(version, params=dict(rtl, SIM_WIND_SPD=wind, SIM_WIND_DIR=225, SIM_WIND_T=0))
+        try:
+            rec, sim, link = f.rec, f.sim, f.link
+            r.check(f.ready_to_fly(), f"{words}: the drone is ready")
+            link.queue_params_fetch(list(READ_ON_CONNECT))
+            f.wait_real(lambda: bool(rec.params), 15)
+            speeds = drone_speeds(rec.params[-1] if rec.params else {})
+            r.check(speeds.read_from_drone and speeds.rtl_alt_m == 60.0 and speeds.rtl_speed_mps,
+                    f"{words}: VGCS read the drone's speeds (up {speeds.climb_mps:g}, down {speeds.descent_mps:g}, "
+                    f"home {speeds.rtl_speed_mps} m/s at {speeds.rtl_alt_m} m)")
+            link.queue_mission_upload(mission, "rtl")
+            r.check(f.wait(lambda: bool(rec.uploaded), 60), f"{words}: the mission is on the drone")
+            link.queue_mission_start()
+            r.check(f.wait(lambda: sim.armed, 40), f"{words}: Start Mission armed it")
+            armed_at = sim.sim_s
+
+            def reached() -> list[int]:
+                return [p["wp_index"] for _t, p in rec.progress if p.get("reached") and p.get("wp_index") is not None]
+
+            r.check(f.wait(lambda: 1 in reached(), 400), f"{words}: it flew the route")
+            ground: list[float] = []
+
+            def note() -> None:
+                if math.hypot(sim.north, sim.east) > 30.0 and sim.alt > 55.0:   # on the way home, at the RTL height
+                    ground.append(math.hypot(sim.vn, sim.ve))
+
+            sim.fly(900, until=lambda: not sim.armed, each_second=note)
+            flown = sim.sim_s - armed_at
+            r.check(not sim.armed and math.hypot(sim.north, sim.east) < 3.0,
+                    f"{words}: it came home, landed and disarmed ({math.hypot(sim.north, sim.east):.1f} m from home)")
+            told = mission_flight_time(HOME, mission, speeds, headwind_mps=wind)
+            # Speeding up and slowing down, the take-off and the touchdown are not in the estimate:
+            # about 25 s on this mission (2026-10-20, both versions).
+            r.check(0.8 * flown <= told.total_s <= flown,
+                    f"{words}: the estimate {told.total_s:.0f} s ({told.parts()}) is under the {flown:.0f} s "
+                    "flown, by less than a fifth")
+            if wind:
+                typical = sorted(ground)[len(ground) // 2] if ground else 0.0
+                expected = speeds.rtl_speed_mps - wind
+                r.check(abs(typical - expected) < 1.5,
+                        f"{words}: it came home at {typical:.1f} m/s over the ground, about its {speeds.rtl_speed_mps:g} "
+                        f"m/s less the wind ({expected:g} m/s), as the check counts it")
+        finally:
+            f.close()
 
 
 def mission_speeds(version: str, r: Report) -> None:
@@ -1492,7 +1562,8 @@ def vama_lock_with_vgcs(version: str, r: Report) -> None:
 
 
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
-         mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_speeds, missions_as_they_come_back,
+         mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_time_on_the_battery,
+         mission_speeds, missions_as_they_come_back,
          another_stations_mission, takeoff_fence_and_land, polygon_fence, link_silence, signed_commands, vama_lock_with_vgcs]
 
 

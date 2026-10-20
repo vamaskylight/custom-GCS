@@ -36,7 +36,12 @@ from PySide6.QtWidgets import (
 
 from vgcs.mission import clamp_hover_seconds
 from vgcs.mission.fence import NO_POLYGON_WORDS
-from vgcs.mission.long_range_safety import FLIGHT_TIME_SETTING, flight_time_from_setting
+from vgcs.mission.long_range_safety import (
+    FLIGHT_TIME_SETTING,
+    PLANNING_WIND_SETTING,
+    flight_time_from_setting,
+    planning_wind_from_setting,
+)
 
 
 _TOOLS: tuple[tuple[str, str], ...] = (
@@ -1011,6 +1016,19 @@ class PlanFlightPanel(QWidget):
         self._flight_time.editingFinished.connect(self._save_flight_time)
         tbv.addWidget(self._flight_time)
         self._show_flight_time_in_use()
+        # The wind the way home is checked against (2026-10-20). Until then the
+        # check left the wind out.
+        tbv.addWidget(self._field_label("Wind for planning (m/s)"))
+        self._planning_wind = self._unit_input("", "m/s")
+        self._planning_wind.setPlaceholderText("not set")
+        self._planning_wind.setObjectName("planWind")
+        self._planning_wind.setToolTip(
+            "The strongest wind you expect. Upload and Start Mission count it against the way home. "
+            "Empty: only the drone's own wind estimate, which it has while it flies."
+        )
+        self._planning_wind.editingFinished.connect(self._save_planning_wind)
+        tbv.addWidget(self._planning_wind)
+        self._show_planning_wind_in_use()
         tc.addWidget(self._takeoff_body)
         body_v.addWidget(self._takeoff_card)
 
@@ -2120,39 +2138,56 @@ class PlanFlightPanel(QWidget):
         return math.floor(alt * 10.0 + 0.5) / 10.0, math.floor(spd * 10.0 + 0.5) / 10.0
 
     @staticmethod
-    def _flight_time_in_use() -> float | None:
-        """The flight time on one battery (minutes) the mission check uses, or None when it is not set."""
+    def _stored_figure(key: str, parse) -> float | None:
+        """The figure a setting holds that the mission check uses, or None when it is not set."""
         try:
-            return flight_time_from_setting(QSettings("VGCS", "VGCS").value(FLIGHT_TIME_SETTING, ""))
+            return parse(QSettings("VGCS", "VGCS").value(key, ""))
         except Exception:
             return None
 
-    def _save_flight_time(self) -> None:
-        """Leaving the field: a flight time is kept, an empty field or 0 is "not set", anything else is undone."""
-        text = self._flight_time.text().strip().replace(",", ".")
+    def _save_figure(self, field: QLineEdit, key: str, parse) -> None:
+        """Leaving the field: a figure is kept, an empty field or 0 is "not set", anything else is undone."""
+        text = field.text().strip().replace(",", ".")
         try:
             settings = QSettings("VGCS", "VGCS")
             if not text or self._float(text, -1.0) == 0.0:
-                settings.remove(FLIGHT_TIME_SETTING)
+                settings.remove(key)
             else:
-                value = flight_time_from_setting(text)
+                value = parse(text)
                 if value is not None:
-                    settings.setValue(FLIGHT_TIME_SETTING, f"{value:g}")
+                    settings.setValue(key, f"{value:g}")
             settings.sync()
         except Exception:
             pass
-        self._show_flight_time_in_use()
+        self._show_figure_in_use(field, key, parse)
+
+    def _show_figure_in_use(self, field: QLineEdit, key: str, parse) -> None:
+        """The field shows the figure in use: a word or a 500 does not stay on screen while nothing checks it."""
+        value = self._stored_figure(key, parse)
+        text = "" if value is None else f"{value:g}"
+        if field.text() != text:
+            field.blockSignals(True)
+            try:
+                field.setText(text)
+            finally:
+                field.blockSignals(False)
+
+    @staticmethod
+    def _flight_time_in_use() -> float | None:
+        """The flight time on one battery (minutes) the mission check uses, or None when it is not set."""
+        return PlanFlightPanel._stored_figure(FLIGHT_TIME_SETTING, flight_time_from_setting)
+
+    def _save_flight_time(self) -> None:
+        self._save_figure(self._flight_time, FLIGHT_TIME_SETTING, flight_time_from_setting)
 
     def _show_flight_time_in_use(self) -> None:
-        """The field shows the flight time in use: a word or a 500 does not stay on screen while nothing checks it."""
-        value = self._flight_time_in_use()
-        text = "" if value is None else f"{value:g}"
-        if self._flight_time.text() != text:
-            self._flight_time.blockSignals(True)
-            try:
-                self._flight_time.setText(text)
-            finally:
-                self._flight_time.blockSignals(False)
+        self._show_figure_in_use(self._flight_time, FLIGHT_TIME_SETTING, flight_time_from_setting)
+
+    def _save_planning_wind(self) -> None:
+        self._save_figure(self._planning_wind, PLANNING_WIND_SETTING, planning_wind_from_setting)
+
+    def _show_planning_wind_in_use(self) -> None:
+        self._show_figure_in_use(self._planning_wind, PLANNING_WIND_SETTING, planning_wind_from_setting)
 
     def _show_initial_wp_values_in_use(self) -> None:
         """Once the operator leaves one of the two fields, it shows the value in

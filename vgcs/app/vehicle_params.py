@@ -41,8 +41,20 @@ EDITABLE = (
     "SUPER_SIMPLE",
 )
 
+# The speeds of the mission's time on the battery (vgcs/mission/flight_time.py,
+# 2026-10-20), renamed in 4.7 too: centimetres became metres. Not in "Set param".
+SPEEDS_RENAMED_IN_4_7 = {
+    "WPNAV_SPEED_UP": "WP_SPD_UP",
+    "WPNAV_SPEED_DN": "WP_SPD_DN",
+    "LAND_SPEED": "LAND_SPD_MS",
+    "LAND_SPEED_HIGH": "LAND_SPD_HIGH_MS",
+    "LAND_ALT_LOW": "LAND_ALT_LOW_M",
+    "RTL_SPEED": "RTL_SPEED_MS",
+}
+
 # Read as well, because VGCS checks them: the 10 km mission check
-# (vgcs/mission/long_range_safety.py) and the motor test.
+# (vgcs/mission/long_range_safety.py), the mission's time on the battery
+# (both names of each speed) and the motor test.
 CHECKED = (
     "FENCE_ACTION",
     "FENCE_TYPE",
@@ -54,6 +66,8 @@ CHECKED = (
     "BATT_LOW_VOLT",
     "BATT_LOW_MAH",
     "FRAME_CLASS",
+    *(name for pair in SPEEDS_RENAMED_IN_4_7.items() for name in pair),
+    "RTL_LOIT_TIME",
 )
 
 # Read once the drone has answered, and again on "Refresh params". The mission

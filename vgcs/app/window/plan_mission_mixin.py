@@ -66,6 +66,7 @@ from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.app.vehicle_messages import EVENT_NOTICE_HOLD_S, NOTICE_EVENT
 from vgcs.mode import AP_COPTER_MODE_MAP, human_mode_name, modes_for_vehicle_type
 from vgcs.mission import (
+    DEFAULT_MISSION_END_ACTION,
     Waypoint,
     normalize_end_action,
     plan_signature,
@@ -259,6 +260,7 @@ class MainWindowPlanMissionMixin:
         try:
             from vgcs.mission.long_range_safety import check_long_range_mission
 
+            wind_mps, wind_from = self._plan_wind()
             report = check_long_range_mission(
                 waypoints,
                 home=home,
@@ -266,6 +268,11 @@ class MainWindowPlanMissionMixin:
                 dem_elevation_fn=self._plan_dem_elevation_fn(),
                 endurance_min=self._plan_endurance_min(),
                 fence_polygon=self._plan_fence_polygon(),
+                end_action=self._plan_end_action(),
+                headwind_mps=wind_mps,
+                wind_from=wind_from,
+                drone_home=self._plan_drone_home(),
+                takeoff_alt_m=self._plan_takeoff_alt_for_check(),
             )
         except Exception:
             return ([], [], [])
@@ -298,6 +305,55 @@ class MainWindowPlanMissionMixin:
             return self._map_widget.fence_polygon_on_drone()
         except Exception:
             return None
+
+    # Each of these is asked for on its own, as the polygon is: a fault in one
+    # leaves that figure out, and the other checks still run.
+
+    def _plan_end_action(self) -> str:
+        """What the plan does after its last waypoint (hold, rtl or land)."""
+        try:
+            return str(self._map_widget.get_mission_end_action() or DEFAULT_MISSION_END_ACTION)
+        except Exception:
+            return DEFAULT_MISSION_END_ACTION
+
+    def _plan_drone_home(self):
+        """The home the drone on screen reported, where RTL flies to. None when it has reported none."""
+        try:
+            return self._map_widget.drone_home()
+        except Exception:
+            return None
+
+    def _plan_takeoff_alt_for_check(self):
+        """The take-off height the upload sends (None: the first waypoint's height)."""
+        try:
+            return self._plan_takeoff_alt_m_from_launch_settings()
+        except Exception:
+            return None
+
+    def _plan_wind(self) -> tuple[float, str]:
+        """The wind the way home is checked against (m/s), and where that figure came from.
+
+        The larger of the wind entered in Plan Flight and the drone's own estimate
+        (which is there only while it flies).
+        """
+        planned = None
+        try:
+            from PySide6.QtCore import QSettings
+
+            from vgcs.mission.long_range_safety import PLANNING_WIND_SETTING, planning_wind_from_setting
+
+            planned = planning_wind_from_setting(QSettings("VGCS", "VGCS").value(PLANNING_WIND_SETTING, ""))
+        except Exception:
+            planned = None
+        try:
+            live = float(self._wind.wind_speed_mps())
+        except Exception:
+            live = None
+        if live is not None and math.isfinite(live) and live > (planned or 0.0):
+            return live, "the drone's estimate"
+        if planned:
+            return planned, "entered in Plan Flight"
+        return 0.0, ""
 
     def _plan_dem_elevation_fn(self):
         """The DEM the observation tools already load, reused for terrain."""

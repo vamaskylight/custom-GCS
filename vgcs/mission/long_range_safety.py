@@ -30,10 +30,20 @@ not.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 
-from vgcs.mission.fence import ON_EDGE_M, TYPE_ALT_MAX, TYPE_CIRCLE, TYPE_POLYGON, distance_inside_m, leaves
+from vgcs.mission.fence import (
+    ON_EDGE_M,
+    TYPE_ALT_MAX,
+    TYPE_CIRCLE,
+    TYPE_POLYGON,
+    distance_inside_m,
+    leaves,
+    nearest_edge_m,
+)
+from vgcs.mission.flight_time import drone_speeds, mission_flight_time
 from vgcs.mission.mission_plan import haversine_m
 
 __all__ = [
@@ -54,6 +64,14 @@ RTL_TERRAIN_CLEARANCE_M = 30.0
 # Fraction of endurance the round trip may consume before it is called tight.
 ENDURANCE_WARN_FRACTION = 0.8
 
+# How far inside the fence a waypoint and the flight between two waypoints should
+# stay. A position wanders by a few metres, and the drone acts the moment it is
+# outside: in the simulator it flew about 5 m past the edge at 4 m/s before it
+# turned back. Closer is a warning, not an error (2026-10-20).
+FENCE_PLAN_MARGIN_M = 10.0
+# The same below the fence's max height.
+FENCE_HEIGHT_MARGIN_M = 5.0
+
 # The drone's flight time on one battery, in minutes, as the operator enters it
 # in Plan Flight (the Mission tab). Stored under this key. Until 2026-10-14
 # nothing on screen set it, so the check could only say it had no figure.
@@ -61,15 +79,31 @@ FLIGHT_TIME_SETTING = "plan/endurance_min"
 FLIGHT_TIME_RANGE_MIN = (1.0, 300.0)
 
 
-def flight_time_from_setting(raw) -> float | None:
-    """The flight time (minutes) a stored setting holds, or None when it holds none that makes sense."""
+# The wind the way home is planned against, in m/s, as the operator enters it in
+# Plan Flight (the Mission tab, 2026-10-20). Empty or 0: no wind is planned for.
+PLANNING_WIND_SETTING = "plan/wind_mps"
+PLANNING_WIND_RANGE_MPS = (0.0, 30.0)
+
+
+def _setting_number(raw, low: float, high: float) -> float | None:
     try:
         value = float(str(raw if raw is not None else "").strip().replace(",", "."))
     except (TypeError, ValueError):
         return None
-    if not FLIGHT_TIME_RANGE_MIN[0] <= value <= FLIGHT_TIME_RANGE_MIN[1]:
+    if not low <= value <= high:
         return None
     return value
+
+
+def flight_time_from_setting(raw) -> float | None:
+    """The flight time (minutes) a stored setting holds, or None when it holds none that makes sense."""
+    return _setting_number(raw, *FLIGHT_TIME_RANGE_MIN)
+
+
+def planning_wind_from_setting(raw) -> float | None:
+    """The planning wind (m/s) a stored setting holds, or None when it holds none, or 0, or one that makes no sense."""
+    value = _setting_number(raw, *PLANNING_WIND_RANGE_MPS)
+    return value if value else None
 
 # --- ArduCopter parameter values ------------------------------------------ #
 # FS_GCS_ENABLE / FS_THR_ENABLE: the actions that bring the aircraft home.
@@ -130,14 +164,29 @@ def check_long_range_mission(
     endurance_min: float | None = None,
     cruise_speed_mps: float | None = None,
     fence_polygon: list | None = None,
+    end_action: str = "rtl",
+    headwind_mps: float = 0.0,
+    wind_from: str = "",
+    drone_home: tuple[float, float] | None = None,
+    takeoff_alt_m: float | None = None,
 ) -> LongRangeReport:
     """Assess a mission for the failure modes that lose distant aircraft.
+
+    ``home`` is where the vehicle is now: the route starts there. ``drone_home``
+    is the home the drone reported, where RTL flies to and the circle fence is
+    centred (``home`` when it is not known).
 
     ``params`` is the vehicle parameter cache; missing keys are reported as
     unchecked rather than assumed safe.
 
     ``fence_polygon`` is the polygon fence the vehicle holds, as (lat, lon)
     corners: what VGCS sent or read. None when VGCS does not know it.
+
+    ``end_action`` is what the plan does after its last waypoint (hold, rtl or
+    land). ``headwind_mps`` is the wind the way home is timed against, and
+    ``wind_from`` says where that figure came from ("entered in Plan Flight").
+    ``takeoff_alt_m`` is the take-off height the upload sends (None: the first
+    waypoint's height).
     """
     report = LongRangeReport()
     pts = _points(waypoints)
@@ -145,30 +194,40 @@ def check_long_range_mission(
         if home is None:
             report.unchecked.append("Home position unknown — range checks skipped")
         return report
+    rtl_home = home
+    if drone_home is not None:
+        try:
+            rtl_home = (float(drone_home[0]), float(drone_home[1]))
+        except (TypeError, ValueError, IndexError):
+            rtl_home = home
 
     legs = _leg_distances(home, pts)
     report.farthest_m = max(haversine_m(home[0], home[1], la, lo) for la, lo in pts)
     # Out along the route and straight back to home, which is what RTL flies.
-    report.round_trip_m = sum(legs) + haversine_m(home[0], home[1], pts[-1][0], pts[-1][1])
+    report.round_trip_m = sum(legs) + haversine_m(rtl_home[0], rtl_home[1], pts[-1][0], pts[-1][1])
 
     p = {str(k).upper(): v for k, v in (params or {}).items()}
-    _check_fence(report, p, home, waypoints, fence_polygon)
+    end = str(end_action or "rtl").strip().lower()
+    _check_fence(report, p, home, rtl_home, waypoints, fence_polygon, end)
+    timing = dict(start=home, rtl_home=rtl_home, params=p, takeoff_alt_m=takeoff_alt_m,
+                  headwind_mps=headwind_mps, wind_from=wind_from)
     if report.is_long_range:
         _check_failsafes(report, p)
         _check_rtl_altitude(report, p, home, pts, dem_elevation_fn)
-        _check_endurance(report, endurance_min, cruise_speed_mps, waypoints)
+        _check_endurance(report, endurance_min, cruise_speed_mps, waypoints, **timing)
     elif (_f(endurance_min) or 0.0) > 0.0:
         # A flight time that was given holds for any mission: a short one can
         # hover long (2026-10-14).
-        _check_endurance(report, endurance_min, cruise_speed_mps, waypoints)
+        _check_endurance(report, endurance_min, cruise_speed_mps, waypoints, **timing)
     return report
 
 
 # --------------------------------------------------------------------------- #
 
 
-def _check_fence(report: LongRangeReport, p: dict, start, waypoints, fence_polygon) -> None:
-    """Does the mission stay inside the fence the vehicle uses?
+def _check_fence(report: LongRangeReport, p: dict, start, rtl_home, waypoints, fence_polygon,
+                 end_action: str = "rtl") -> None:
+    """Does the mission stay inside the fence the vehicle uses, with some room to spare?
 
     FENCE_TYPE says which limits are in use: 1 the max height, 2 the circle
     around home, 4 the polygon. Until 2026-10-14 only FENCE_RADIUS was looked
@@ -190,18 +249,54 @@ def _check_fence(report: LongRangeReport, p: dict, start, waypoints, fence_polyg
     if bits is None or bits & TYPE_CIRCLE:
         if radius is None:
             report.unchecked.append("Geofence (FENCE_ENABLE / FENCE_RADIUS not read yet)")
-        elif radius > 0.0 and report.farthest_m > radius:
-            report.errors.append(
-                f"Mission reaches {report.farthest_m / 1000.0:.2f} km from home but the "
-                f"geofence radius is {radius:.0f} m. The vehicle will hit the fence "
-                "mid-mission. Raise FENCE_RADIUS or shorten the route."
-            )
+        elif radius > 0.0:
+            _check_fence_circle(report, radius, rtl_home, waypoints)
     if bits is None:
         return
     if bits & TYPE_ALT_MAX:
         _check_fence_height(report, p, waypoints)
     if bits & TYPE_POLYGON:
-        _check_fence_polygon(report, start, waypoints, fence_polygon)
+        _check_fence_polygon(report, start, rtl_home, waypoints, fence_polygon, end_action)
+
+
+def _check_fence_circle(report: LongRangeReport, radius: float, centre, waypoints) -> None:
+    """The circle is centred on the drone's home."""
+    far: list[tuple[int, float]] = []
+    for number, wp in enumerate(waypoints or [], start=1):
+        la, lo = _wp_latlon(wp)
+        if la is None or lo is None or (abs(la) < 1e-7 and abs(lo) < 1e-7):
+            continue
+        far.append((number, haversine_m(centre[0], centre[1], la, lo)))
+    if not far:
+        return
+    farthest = max(d for _n, d in far)
+    if farthest > radius:
+        report.errors.append(
+            f"Mission reaches {farthest / 1000.0:.2f} km from home but the "
+            f"geofence radius is {radius:.0f} m. The vehicle will hit the fence "
+            "mid-mission. Raise FENCE_RADIUS or shorten the route."
+        )
+        return
+    near = [(n, radius - d) for n, d in far if radius - d < FENCE_PLAN_MARGIN_M]
+    if near:
+        report.warnings.append(_near_edge_words([n for n, _room in near], "the circle fence",
+                                                min(room for _n, room in near), FENCE_PLAN_MARGIN_M))
+
+
+def _near_edge_words(numbers: list[int], fence: str, closest_m: float, margin_m: float, *,
+                     below: bool = False) -> str:
+    several = len(numbers) > 1
+    where = f"below {fence}" if below else f"inside {fence}"
+    return (
+        f"{_numbers(numbers)} {'are' if several else 'is'} less than {margin_m:.0f} m {where} "
+        f"({_down(closest_m)} m at the closest). A position wanders by some metres, and the drone acts the "
+        f"moment it is outside. Keep waypoints {margin_m:.0f} m or more {'below' if below else 'inside'}."
+    )
+
+
+def _down(metres: float) -> str:
+    """Rounded down to a tenth: 9.97 m is "9.9", never "10.0" beside "less than 10 m"."""
+    return f"{math.floor(max(0.0, metres) * 10.0 + 1e-6) / 10.0:.1f}"
 
 
 def _numbers(numbers: list[int]) -> str:
@@ -236,9 +331,20 @@ def _check_fence_height(report: LongRangeReport, p: dict, waypoints) -> None:
             "The vehicle will hit the fence mid-mission. Lower the waypoint, or raise Max height "
             "(Plan Flight, Fence)."
         )
+        return
+    near: list[tuple[int, float]] = []
+    for number, wp in enumerate(waypoints or [], start=1):
+        alt = _f(_attr(wp, "alt_m"))
+        if alt is not None and alt_max - alt < FENCE_HEIGHT_MARGIN_M:
+            near.append((number, alt_max - alt))
+    if near:
+        report.warnings.append(_near_edge_words([n for n, _room in near], "the fence's max height",
+                                                min(room for _n, room in near), FENCE_HEIGHT_MARGIN_M,
+                                                below=True))
 
 
-def _check_fence_polygon(report: LongRangeReport, start, waypoints, fence_polygon) -> None:
+def _check_fence_polygon(report: LongRangeReport, start, rtl_home, waypoints, fence_polygon,
+                         end_action: str = "rtl") -> None:
     if fence_polygon is None:
         # A warning, not a line in the log: one press reads the fence.
         report.warnings.append(
@@ -286,6 +392,45 @@ def _check_fence_polygon(report: LongRangeReport, start, waypoints, fence_polygo
                 "The vehicle will hit the fence there. Add a waypoint to go around, or upload another fence."
             )
             return
+    # The way home: RTL flies straight home from where it starts. From the last
+    # waypoint that is the plan itself (end action RTL), from any other one a
+    # failsafe or a press of Return can start it.
+    home_inside = distance_inside_m(corners, float(rtl_home[0]), float(rtl_home[1])) >= 0.0
+    if home_inside:
+        out_home = [n for n, place in places if leaves(corners, place, rtl_home)]
+        last = places[-1][0] if places else None
+        if last is not None and last in out_home and end_action == "rtl":
+            report.errors.append(
+                f"The straight way home from waypoint {last}, where the mission ends with Return to launch, "
+                "leaves the polygon fence. The vehicle will hit the fence on its way home. Add a waypoint to "
+                "go around, end the mission with Land or Hold, or upload another fence."
+            )
+            return
+        if out_home:
+            report.warnings.append(
+                f"From {_numbers(out_home).lower()}, the straight way home leaves the polygon fence. If the drone "
+                "returns home from there (a failsafe, or Return), it hits the fence on the way."
+            )
+    # Room to spare: a waypoint, or the flight between two, close to the edge.
+    near = [(n, inside) for n, inside in ((n, distance_inside_m(corners, la, lo)) for n, (la, lo) in places)
+            if inside < FENCE_PLAN_MARGIN_M]
+    if near:
+        report.warnings.append(_near_edge_words([n for n, _inside in near], "the polygon fence",
+                                                min(inside for _n, inside in near), FENCE_PLAN_MARGIN_M))
+        return
+    close: list[tuple[str, str, float]] = []
+    for (name_a, a), (name_b, b) in zip(route, route[1:]):
+        gap = nearest_edge_m(corners, a, b)
+        if gap < FENCE_PLAN_MARGIN_M:
+            close.append((name_a, name_b, gap))
+    if close:
+        name_a, name_b, gap = min(close, key=lambda c: c[2])
+        others = len(close) - 1
+        more = f" ({others} more way{'s' if others > 1 else ''} too)" if others else ""
+        report.warnings.append(
+            f"The straight way from {name_a} to {name_b} passes {_down(gap)} m from the polygon fence's edge{more}. "
+            f"Keep the flight {FENCE_PLAN_MARGIN_M:.0f} m or more inside: add a waypoint, or move one."
+        )
 
 
 def _check_failsafes(report: LongRangeReport, p: dict) -> None:
@@ -371,44 +516,69 @@ def _check_rtl_altitude(report, p: dict, home, pts, dem_elevation_fn) -> None:
         )
 
 
-def _check_endurance(report, endurance_min, cruise_speed_mps, waypoints) -> None:
-    speed = _f(cruise_speed_mps) or _planned_speed(waypoints)
-    if speed is None or speed <= 0.0:
-        report.unchecked.append("Flight time (no cruise speed available)")
-        return
-    flying = (report.round_trip_m / speed) / 60.0
-    # The hover at the waypoints counts too. Until 2026-10-14 it did not.
-    hovering = _planned_hover_s(waypoints) / 60.0
-    minutes = flying + hovering
-    how = f"at {speed:.1f} m/s" + (f", with {hovering:.0f} min of hovering" if hovering >= 0.5 else "")
+def _check_endurance(report, endurance_min, cruise_speed_mps, waypoints, *, start, rtl_home, params,
+                     takeoff_alt_m=None, headwind_mps=0.0, wind_from="") -> None:
+    """The mission against the flight time on one battery (vgcs/mission/flight_time.py).
+
+    Until 2026-10-20 this was the round trip at the slowest planned speed plus
+    the hover. The climb, the landing, the drone's own speed home and the wind
+    were not in it.
+
+    The time in still air is needed in any case: over the flight time it is an
+    error. The wind only warns. VGCS does not know from where it will blow, nor
+    how much faster than its return speed the drone can fly through the air.
+    """
+    speeds = drone_speeds(params)
+    if not speeds.read_from_drone:
+        report.unchecked.append(
+            "Climb and landing speeds (the drone's are not read yet: ArduPilot's defaults are used)"
+        )
+    timed = functools.partial(
+        mission_flight_time, start, waypoints, speeds, home=rtl_home,
+        fallback_speed_mps=_f(cruise_speed_mps) or _planned_speed(waypoints), takeoff_alt_m=takeoff_alt_m,
+    )
+    calm = timed()
+    headwind = _f(headwind_mps)
+    headwind = headwind if headwind is not None and math.isfinite(headwind) and headwind > 0.0 else 0.0
+    windy = timed(headwind_mps=headwind) if headwind > 0.0 else calm
+    source = f" ({wind_from})" if wind_from else ""
+    if windy.wind_too_strong:
+        report.warnings.append(
+            f"Against {round(headwind, 1):g} m/s of wind{source}, the drone may not get home: it returns at "
+            f"{windy.home_speed_mps:.1f} m/s. Only a drone that can fly faster than that through the air gets "
+            "home. Wait for less wind, or raise the drone's return speed (RTL_SPEED, or RTL_SPEED_MS on 4.7)."
+        )
     endur = _f(endurance_min)
     if endur is None or endur <= 0.0:
+        shown = calm if windy.wind_too_strong else windy
         report.warnings.append(
-            f"Round trip is {report.round_trip_m / 1000.0:.1f} km, about {minutes:.0f} min {how}. "
-            "Confirm the battery covers that with reserve. VGCS has no flight time to check it against: "
-            "enter it in Plan Flight, Mission tab, \"Flight time on one battery (min)\"."
+            f"Round trip is {report.round_trip_m / 1000.0:.1f} km, about {shown.total_s / 60.0:.0f} min "
+            f"({shown.parts()}). Confirm the battery covers that with reserve. VGCS has no flight time to check "
+            "it against: enter it in Plan Flight, Mission tab, \"Flight time on one battery (min)\"."
         )
         return
+    minutes = calm.total_s / 60.0
     if minutes > endur:
         report.errors.append(
-            f"Round trip needs about {minutes:.0f} min {how}, but the flight time on one battery is "
+            f"Round trip needs about {minutes:.0f} min ({calm.parts()}), but the flight time on one battery is "
             f"{endur:.0f} min. The aircraft cannot get home."
         )
-    elif minutes > endur * ENDURANCE_WARN_FRACTION:
+        return
+    if windy is not calm and not windy.wind_too_strong:
+        windy_minutes = windy.total_s / 60.0
+        if windy_minutes > endur * ENDURANCE_WARN_FRACTION:
+            share = "That is more than the" if windy_minutes > endur else "That is most of the"
+            report.warnings.append(
+                f"With {round(headwind, 1):g} m/s of wind against the way home{source}, the round trip may need about "
+                f"{windy_minutes:.0f} min ({windy.parts()}). {share} {endur:.0f} min flight time on one battery. "
+                "Plan a shorter mission, or wait for less wind."
+            )
+            return
+    if minutes > endur * ENDURANCE_WARN_FRACTION:
         report.warnings.append(
-            f"Round trip needs about {minutes:.0f} min of the {endur:.0f} min flight time. "
+            f"Round trip needs about {minutes:.0f} min of the {endur:.0f} min flight time ({calm.parts()}). "
             "That leaves very little reserve for wind or a diversion."
         )
-
-
-def _planned_hover_s(waypoints) -> float:
-    """The hover time of all waypoints together, in seconds."""
-    total = 0.0
-    for wp in waypoints or []:
-        hover = _f(_attr(wp, "hover_s"))
-        if hover is not None and math.isfinite(hover) and hover > 0.0:
-            total += hover
-    return total
 
 
 # --------------------------------------------------------------------------- #

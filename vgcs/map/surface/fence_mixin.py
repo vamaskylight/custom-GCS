@@ -80,6 +80,10 @@ class FenceMixin:
         self._drone_home = home
         self._refresh_fence_view()
 
+    def drone_home(self) -> tuple[float, float] | None:
+        """The home the drone on screen reported, where RTL flies to. None when it has reported none."""
+        return getattr(self, "_drone_home", None)
+
     # --- the drawing --------------------------------------------------------
 
     def fence_polygon(self) -> list[tuple[float, float]]:

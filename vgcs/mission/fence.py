@@ -240,6 +240,23 @@ def leaves(corners: list[Corner], a: Corner, b: Corner) -> bool:
     return distance_inside_m(corners, (a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0) < 0.0
 
 
+def nearest_edge_m(corners: list[Corner], a: Corner, b: Corner) -> float:
+    """How near a straight flight from a to b comes to the fence's edge, in metres (0 where it crosses it)."""
+    if len(corners) < MIN_CORNERS:
+        return float("inf")
+    flat = _flat(list(corners) + [(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))], corners[0])
+    ring, start, end = flat[:-2], flat[-2], flat[-1]
+    count = len(ring)
+    nearest = float("inf")
+    for i in range(count):
+        c, d = ring[i], ring[(i + 1) % count]
+        if _cross(start, end, c, d):
+            return 0.0
+        nearest = min(nearest, _to_side_m(start, c, d), _to_side_m(end, c, d),
+                      _to_side_m(c, start, end), _to_side_m(d, start, end))
+    return nearest
+
+
 def outside_words(what: str, inside_m: float, edge_m: float = EDGE_MIN_M) -> str:
     """Why a fence does not hold a position, in the operator's words. `what`: "The drone", "The drone's home point"."""
     if inside_m < 0.0:
