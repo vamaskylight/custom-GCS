@@ -8,5 +8,9 @@ KEY_VIDEO_RTSP_TRANSPORT = "video/rtsp_transport"
 KEY_VIDEO_LOW_LATENCY = "video/low_latency"
 KEY_VIDEO_RECORD_FORMAT = "video/record_format"
 KEY_VIDEO_DEFAULT_VIEW = "video/default_view"
+# "Auto", "16:9", "4:3" or "1:1": the shape the picture is drawn in (vgcs/video/display_aspect.py).
+KEY_VIDEO_ASPECT = "video/aspect"
+# "Normal", "Prefer Hardware" or "Prefer Software" (vgcs/video/pipeline.py, _hwaccel_wanted).
+KEY_VIDEO_DECODE_PRIORITY = "video/decode_priority"
 # Thermal colour mode (M12); a mode id from vgcs/video/thermal_palette.py.
 KEY_VIDEO_THERMAL_PALETTE = "video/thermal_palette"

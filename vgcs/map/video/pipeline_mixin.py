@@ -15,6 +15,8 @@ from vgcs.map.app_settings import QS_APP, QS_ORG
 from vgcs.map.video.encode_bridge import VideoEncodeBridge, VideoEncodeTask
 from vgcs.map.video.helpers import _format_video_zoom_label
 from vgcs.map.video.settings_keys import (
+    KEY_VIDEO_ASPECT,
+    KEY_VIDEO_DECODE_PRIORITY,
     KEY_VIDEO_DEFAULT_VIEW,
     KEY_VIDEO_ENABLED,
     KEY_VIDEO_LOW_LATENCY,
@@ -382,6 +384,7 @@ class VideoPipelineMixin:
             transport=str(getattr(self, "_video_settings_rtsp_transport", "auto") or "auto"),
             stream_kind=kind,
             low_latency=bool(getattr(self, "_video_settings_low_latency", False)),
+            decode_priority=str(getattr(self, "_video_settings_decode_priority", "Normal") or "Normal"),
         )
 
     def _read_video_settings(self) -> None:
@@ -401,6 +404,9 @@ class VideoPipelineMixin:
         rec_fmt = str(s.value(KEY_VIDEO_RECORD_FORMAT, "mp4") or "mp4").strip().lower()
         self._video_settings_record_format = rec_fmt if rec_fmt in ("mp4", "mkv") else "mp4"
         self._video_settings_default_view = str(s.value(KEY_VIDEO_DEFAULT_VIEW, "Single") or "Single")
+        # Read since 2026-10-20 (they were saved, and did nothing before).
+        self._video_settings_aspect = str(s.value(KEY_VIDEO_ASPECT, "Auto") or "Auto")
+        self._video_settings_decode_priority = str(s.value(KEY_VIDEO_DECODE_PRIORITY, "Normal") or "Normal")
 
     def _video_record_suffix(self) -> str:
         return str(getattr(self, "_video_settings_record_format", "mp4") or "mp4")

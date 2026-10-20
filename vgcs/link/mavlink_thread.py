@@ -374,6 +374,24 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 updated_mono=time.monotonic(),
             )
 
+    def _emit_home_position(self, msg) -> None:
+        """The drone's home, for the window (the circle fence is drawn around it).
+
+        Asked for once when the drone is first heard (_request_telemetry_streams);
+        ArduPilot also sends it when the home moves, at arming.
+        """
+        if not self._is_primary_source(msg):
+            return
+        try:
+            lat = float(getattr(msg, "latitude", 0) or 0) / 1e7
+            lon = float(getattr(msg, "longitude", 0) or 0) / 1e7
+            alt_m = float(getattr(msg, "altitude", 0) or 0) / 1000.0
+        except (TypeError, ValueError):
+            return
+        if abs(lat) < 1e-9 and abs(lon) < 1e-9:
+            return
+        self._emit_telemetry_payload("HOME_POSITION", {"lat": lat, "lon": lon, "alt_m": alt_m})
+
     def _emit_telemetry_payload(self, msg_type: str, payload: dict) -> None:
         """Emit telemetry to the GUI at a capped rate for known high-frequency message types."""
         if msg_type == "STATUSTEXT":
@@ -867,6 +885,11 @@ class MavlinkThread(FenceLinkMixin, QThread):
                         self._request_telemetry_streams()
                     except Exception:
                         pass
+                    # The home the drone holds now (the circle fence is centred on it).
+                    try:
+                        self._send_home_request()
+                    except Exception:
+                        pass
                     self._prox_streams_last_request_mono = now_req
                 elif now_req - float(self._prox_streams_last_request_mono) >= _PROX_STREAM_RESEND_S:
                     try:
@@ -898,6 +921,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
             self._hear_fence_count(msg)
         elif msg_type == "HOME_POSITION":
             self._hear_home_position(msg)
+            self._emit_home_position(msg)
         elif msg_type == "STATUSTEXT":
             self._handle_statustext(msg)
         elif msg_type == "COMMAND_ACK":

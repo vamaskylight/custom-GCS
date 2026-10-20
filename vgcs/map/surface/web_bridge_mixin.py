@@ -23,6 +23,9 @@ from vgcs.video.pipeline import (
     QS_KEY_LAST_PHOTO_SAVE_DIR,
     notify_companion_app_background,
     notify_companion_app_foreground,
+    suggested_photo_save_path,
+    suggested_recording_save_path,
+    wait_qmedia_recorder_stopped,
 )
 
 
@@ -239,12 +242,12 @@ class WebBridgeMixin:
                     # mid-collapse and being reopened. Previously this fell
                     # straight through and the press vanished without a word.
                     try:
-                        print("[VGCS:cam_rail] RECORD start FAILED — no active video source")
+                        print("[VGCS:cam_rail] RECORD start FAILED: no active video source")
                     except Exception:
                         pass
-                    self._set_status(
-                        "Recording did not start — no video source yet; "
-                        "wait for the picture and retry"
+                    self._tell_operator(
+                        "Recording did not start: no video yet. Wait for the picture and press again.",
+                        log=False,
                     )
                 # RTSP sources use ffmpeg recording.
                 if src is not None and hasattr(src, "start_recording") and hasattr(src, "stop_recording"):
@@ -291,19 +294,19 @@ class WebBridgeMixin:
                             # 2026-08-19: "I click recording, video should save on
                             # the PC, that's not shown".
                             reason = (
-                                "no live video — recording captures the preview stream, "
-                                "so wait for the feed to come back and retry"
+                                "no live video (a recording takes the preview stream). "
+                                "Wait for the picture and press again"
                             )
                             try:
                                 if shutil.which("ffmpeg") is None:
-                                    reason = "ffmpeg not found on this PC (required for recording)"
+                                    reason = "FFmpeg is not on this PC, and recording needs it"
                             except Exception:
                                 pass
                             try:
-                                print(f"[VGCS:cam_rail] RECORD start FAILED — {reason}")
+                                print(f"[VGCS:cam_rail] RECORD start FAILED: {reason}")
                             except Exception:
                                 pass
-                            self._set_status(f"Recording did not start — {reason}")
+                            self._tell_operator(f"Recording did not start: {reason}.", log=False)
                     if (not want_on) and bool(getattr(self, "_video_recording", False)):
                         stop_sid = str(getattr(self, "_video_recording_source_id", "") or "").strip()
                         stop_src = self._video_source_by_id(stop_sid) if stop_sid else src

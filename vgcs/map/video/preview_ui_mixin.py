@@ -29,6 +29,7 @@ from vgcs.video.camera_control import (
     camera_zoom_ui_level,
 )
 from vgcs.video import thermal_palette
+from vgcs.video.display_aspect import fit_size, forced_aspect
 from vgcs.video.ffmpeg_locator import MISSING_ON_SCREEN as FFMPEG_MISSING_ON_SCREEN
 from vgcs.video.ffmpeg_locator import ffmpeg_available
 from vgcs.video.pipeline import (
@@ -1018,7 +1019,16 @@ class VideoPreviewUiMixin:
                 if swap_on
                 else Qt.AspectRatioMode.KeepAspectRatio
             )
-            scaled_pm = pm.scaled(size, ar_mode, Qt.TransformationMode.FastTransformation)
+            # Application Settings, Video, "Aspect ratio": the single picture is drawn in the
+            # chosen shape (the 2x2 grid keeps its own cells). Auto: as it comes.
+            shape = None if split_on else forced_aspect(getattr(self, "_video_settings_aspect", "Auto"))
+            if shape is not None:
+                tw, th = fit_size(size.width(), size.height(), shape)
+                scaled_pm = pm.scaled(
+                    QSize(tw, th), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation
+                )
+            else:
+                scaled_pm = pm.scaled(size, ar_mode, Qt.TransformationMode.FastTransformation)
             self._native_video_preview.setPixmap(scaled_pm)
             # Record PiP layout for split-grid hit-testing (must match paint; pixmap().size() alone
             # mis-maps clicks on HiDPI — device pixels vs logical coords skew u,v into cell 0 / day).

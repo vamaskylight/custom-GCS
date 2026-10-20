@@ -837,6 +837,9 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     # Offline map tile packs: progress, and the result (also of an import).
     tile_pack_progress = Signal(str)
     tile_pack_finished = Signal(str)
+    # A one-off result for the operator (a recording, a plan file). The map's own
+    # status line is hidden in the map-first window: the main window shows these.
+    operator_notice = Signal(str)
 
     def __init__(self, parent=None, *, video_pipeline: VideoPipeline | None = None) -> None:
         super().__init__(parent)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -39,15 +40,26 @@ class Waypoint:
 
 
 def save_waypoints_json(
-    path: str | Path, waypoints: list[Waypoint], *, end_action: str | None = None
+    path: str | Path,
+    waypoints: list[Waypoint],
+    *,
+    end_action: str | None = None,
+    fence_polygon: list[tuple[float, float]] | None = None,
 ) -> None:
-    """Write the plan file. ``end_action`` (hold/rtl/land) is stored when given."""
+    """Write the plan file. ``end_action`` (hold/rtl/land) is stored when given, and so is the
+    polygon fence drawn on the map (``fence_polygon``: its corners in order).
+
+    Version 4 added the fence. Readers of older versions ignore it.
+    """
     payload: dict[str, object] = {
-        "version": 3,
+        "version": 4,
         "waypoints": [asdict(wp) for wp in waypoints],
     }
     if end_action:
         payload["end_action"] = str(end_action)
+    corners = [[float(lat), float(lon)] for lat, lon in (fence_polygon or [])]
+    if corners:
+        payload["fence"] = {"polygon": corners}
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -93,6 +105,31 @@ def load_waypoints_json(path: str | Path) -> list[Waypoint]:
             )
         )
     return out
+
+
+def load_fence_polygon(path: str | Path) -> list[tuple[float, float]] | None:
+    """The polygon fence stored with a plan file, its corners in order.
+
+    None when the file holds no fence (plans saved before version 4, or without
+    a fence). Raises ValueError when the file holds a fence that cannot be read.
+    """
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    fence = raw.get("fence") if isinstance(raw, dict) else None
+    if fence is None:
+        return None
+    rows = fence.get("polygon") if isinstance(fence, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("its fence has no list of corners")
+    corners: list[tuple[float, float]] = []
+    for n, row in enumerate(rows, start=1):
+        try:
+            lat, lon = float(row[0]), float(row[1])
+        except (TypeError, ValueError, IndexError):
+            raise ValueError(f"fence corner {n} is not a latitude and longitude") from None
+        if not (math.isfinite(lat) and math.isfinite(lon) and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise ValueError(f"fence corner {n} is not a latitude and longitude")
+        corners.append((lat, lon))
+    return corners
 
 
 def load_mission_end_action(path: str | Path) -> str | None:

@@ -369,7 +369,8 @@ def _companion_release_rtsp_host(source_id: str, url: str) -> None:
             _COMPANION_RTSP_HOST_OWNER.pop(host, None)
 
 # Set when D3D11VA/hwdownload fails once (Impossible to convert / hwdownload on Windows).
-_SIYI_HWACCEL_UNAVAILABLE = False
+# Hardware decoding failed once in this run: every source decodes in software from then on.
+_HWACCEL_UNAVAILABLE = False
 
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
@@ -1583,20 +1584,51 @@ def _rtsp_url_is_loopback(url: str) -> bool:
         return False
 
 
+# Application Settings, Video, "Video decode priority" (the words are the setting's own).
+DECODE_NORMAL = "Normal"
+DECODE_PREFER_HARDWARE = "Prefer Hardware"
+DECODE_PREFER_SOFTWARE = "Prefer Software"
+
+
 def _siyi_hwaccel_enabled(url: str) -> bool:
     """Off by default — software decode matches VLC on SIYI ZR10; set VGCS_SIYI_HWACCEL=1 to try GPU."""
-    global _SIYI_HWACCEL_UNAVAILABLE
     if not _rtsp_url_is_siyi_style(url):
         return False
-    if _SIYI_HWACCEL_UNAVAILABLE:
+    if _HWACCEL_UNAVAILABLE:
         return False
     raw = str(os.environ.get("VGCS_SIYI_HWACCEL", "0") or "0").strip().lower()
     return raw in ("1", "on", "true", "yes")
 
 
-def _siyi_mark_hwaccel_unavailable() -> None:
-    global _SIYI_HWACCEL_UNAVAILABLE
-    _SIYI_HWACCEL_UNAVAILABLE = True
+def _hwaccel_wanted(url: str, decode_priority: str = DECODE_NORMAL) -> bool:
+    """Decode this stream in hardware?
+
+    Normal: as before 2026-10-20 (software, but SIYI-style streams with
+    VGCS_SIYI_HWACCEL=1). Prefer Hardware: every stream, until hardware decoding
+    fails once (then software for the rest of the run). Prefer Software: never.
+    """
+    priority = str(decode_priority or DECODE_NORMAL).strip().lower()
+    if priority == DECODE_PREFER_SOFTWARE.lower():
+        return False
+    if priority == DECODE_PREFER_HARDWARE.lower():
+        return not _HWACCEL_UNAVAILABLE
+    return _siyi_hwaccel_enabled(url)
+
+
+def _mark_hwaccel_unavailable() -> None:
+    global _HWACCEL_UNAVAILABLE
+    _HWACCEL_UNAVAILABLE = True
+
+
+# Words in FFmpeg's error output of a session without frames that point at hardware decoding.
+_HWACCEL_FAILURE_WORDS = (
+    b"hwaccel", b"hwdownload", b"impossible to convert", b"invalid data", b"d3d11", b"d3d12",
+    b"dxva", b"cuda", b"qsv", b"vaapi", b"no device",
+)
+
+
+def _looks_like_hwaccel_failure(stderr_lower: bytes) -> bool:
+    return any(word in stderr_lower for word in _HWACCEL_FAILURE_WORDS)
 
 
 def _ffmpeg_preflags_before_input(
@@ -1604,9 +1636,9 @@ def _ffmpeg_preflags_before_input(
     *,
     rtsp_transport: str | None,
     low_latency: bool = False,
-    siyi_hwaccel: bool = False,
+    hwaccel: bool = False,
 ) -> list[str]:
-    """Flags immediately before `-i` (after optional `-f`)."""
+    """Flags immediately before `-i` (after optional `-f`). ``hwaccel``: decode in hardware."""
     sc = _url_scheme(str(url or "").strip())
     out: list[str] = []
     if sc == "rtsp" and rtsp_transport in ("udp", "tcp"):
@@ -1679,8 +1711,10 @@ def _ffmpeg_preflags_before_input(
             out.extend(["-thread_queue_size", "512", "-max_delay", str(max_delay_us)])
             # Decoder opts must be before `-i` (after `-i` they apply to rawvideo output and fail).
             out.extend(["-threads", "1"])
-        if siyi_hwaccel and _rtsp_url_is_siyi_style(u):
-            out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
+    if hwaccel:
+        # FFmpeg hands the decoded pictures back in normal memory, so the filter
+        # needs no hwdownload (_ffmpeg_vf_rgb_fixed_size).
+        out.extend(["-hwaccel", "auto", "-extra_hw_frames", "8"])
     if _rtsp_url_is_companion_rtsp(str(url or "").strip()):
         # ignore_err: FFmpeg still outputs frames; Python quality gate hides tears.
         out.extend(["-err_detect", "ignore_err"])
@@ -1717,7 +1751,7 @@ def _url_scheme(url: str) -> str:
         return ""
 
 
-def _ffmpeg_vf_rgb_fixed_size(w: int, h: int, *, hwaccel: bool = False) -> str:
+def _ffmpeg_vf_rgb_fixed_size(w: int, h: int) -> str:
     """
     Scale to fit inside WxH, then pad to exactly WxH.
 
@@ -1725,6 +1759,11 @@ def _ffmpeg_vf_rgb_fixed_size(w: int, h: int, *, hwaccel: bool = False) -> str:
     stream aspect does not match the target box; our rawvideo reader assumes
     every packet is exactly w*h*3 bytes. Padding avoids silent decode drops
     (symptom: first frame OK, then frozen preview).
+
+    The same filter serves hardware decoding: with ``-hwaccel auto`` and no output
+    format FFmpeg returns the pictures in normal memory. Until 2026-10-20 a
+    hardware session began with ``hwdownload,format=nv12``, which FFmpeg 9.0.2
+    refuses on such pictures ("Impossible to convert"), so it never gave a frame.
     """
     w = max(2, int(w))
     h = max(2, int(h))
@@ -1732,8 +1771,6 @@ def _ffmpeg_vf_rgb_fixed_size(w: int, h: int, *, hwaccel: bool = False) -> str:
         f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
     )
-    if hwaccel:
-        return f"hwdownload,format=nv12,{core}"
     return core
 
 
@@ -1905,11 +1942,13 @@ class RtspSource(QObject):
         transport: str = "auto",
         udp_input_format: str = "",
         low_latency: bool = False,
+        decode_priority: str = DECODE_NORMAL,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.source_id = str(source_id)
         self._url = str(url or "").strip()
+        self._decode_priority = str(decode_priority or DECODE_NORMAL)
         self._label = str(label or source_id)
         self._transport = str(transport or "auto").strip().lower()
         self._udp_input_format = str(udp_input_format or "").strip().lower()
@@ -3021,7 +3060,7 @@ class RtspSource(QObject):
         h = max(2, h)
         self._ffmpeg_dims = (w, h)
         frame_bytes = int(w) * int(h) * 3
-        siyi_hw = _siyi_hwaccel_enabled(url)
+        use_hw = _hwaccel_wanted(url, self._decode_priority)
 
         # UI emit cap: avoid unbounded QueuedConnection backlog on the GUI thread.
         # Default 20 Hz — preview still looks smooth; higher rates + map work freeze Windows
@@ -3103,7 +3142,7 @@ class RtspSource(QObject):
             except Exception:
                 pass
             if siyi_url:
-                mode = "hwaccel=auto" if siyi_hw else "sw (auto codec)"
+                mode = "hwaccel=auto" if use_hw else "sw (auto codec)"
                 print(f"[VGCS:video] SIYI HEVC decode path: {mode}")
 
         while not _ended():
@@ -3172,7 +3211,7 @@ class RtspSource(QObject):
                                 )
                             except Exception:
                                 pass
-                        vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h, hwaccel=siyi_hw)
+                        vf_rgb = _ffmpeg_vf_rgb_fixed_size(w, h)
                         cmd_base = [
                             "ffmpeg",
                             "-hide_banner",
@@ -3184,7 +3223,7 @@ class RtspSource(QObject):
                                 url,
                                 rtsp_transport=use_transport,
                                 low_latency=self._low_latency,
-                                siyi_hwaccel=siyi_hw,
+                                hwaccel=use_hw,
                             ),
                             "-i",
                             url,
@@ -3702,32 +3741,26 @@ class RtspSource(QObject):
                                     print(
                                         "[VGCS:video] ffmpeg stderr (session, no frames):\n" + txt
                                     )
-                                    if companion_rtsp:
-                                        tl = tail.lower()
+                                    tl = tail.lower()
+                                    if use_hw and _looks_like_hwaccel_failure(tl):
+                                        # Any stream (Prefer Hardware), not only SIYI's: software
+                                        # from the next session on, and for the rest of this run.
+                                        use_hw = False
+                                        _mark_hwaccel_unavailable()
+                                        print(
+                                            "[VGCS:video] hardware decoding failed, "
+                                            "using software decoding"
+                                        )
+                                    elif companion_rtsp:
                                         if b"codec avoption ec" in tl:
                                             reconnect_delay = max(reconnect_delay, 3.0)
-                                        elif siyi_hw and (
-                                            b"hwaccel" in tl
-                                            or b"hwdownload" in tl
-                                            or b"impossible to convert" in tl
-                                            or b"invalid data" in tl
-                                            or b"d3d11" in tl
-                                            or b"dxva" in tl
-                                            or b"no device" in tl
-                                        ):
-                                            siyi_hw = False
-                                            _siyi_mark_hwaccel_unavailable()
-                                            print(
-                                                "[VGCS:video] SIYI: hwaccel failed, "
-                                                "using software decode (VLC-style)"
-                                            )
                                         elif (
                                             b"could not find ref" in tl
                                             or b"-10054" in tl
                                             or b"-138" in tl
                                             or b"error number -138" in tl
                                         ):
-                                            siyi_hw = False
+                                            use_hw = False
                                             if not _siyi_rtsp_camera_busy(tail):
                                                 reconnect_delay = max(
                                                     reconnect_delay,
@@ -3855,7 +3888,7 @@ class RtspSource(QObject):
                             if companion_rtsp:
                                 _companion_wait_until_foreground(should_stop=_ended)
                             if companion_rtsp:
-                                siyi_hw = False
+                                use_hw = False
                                 try:
                                     if hevc_glitch:
                                         streak = int(
@@ -3986,6 +4019,7 @@ class VideoPipeline(QObject):
         self._rtsp_thermal_url: str = ""
         self._rtsp_transport: str = "auto"
         self._low_latency: bool = False
+        self._decode_priority: str = DECODE_NORMAL
         # Application Settings → Video → Source (`rtsp` | `udp_h264` | `udp_h265`).
         self._stream_kind: str = "rtsp"
         self._defer_refresh_timer = QTimer(self)
@@ -4100,6 +4134,7 @@ class VideoPipeline(QObject):
                         transport=self._rtsp_transport,
                         udp_input_format=udp_demux,
                         low_latency=self._low_latency,
+                        decode_priority=self._decode_priority,
                         parent=self,
                     )
                     day.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
@@ -4112,6 +4147,7 @@ class VideoPipeline(QObject):
                         transport=self._rtsp_transport,
                         udp_input_format=udp_demux,
                         low_latency=self._low_latency,
+                        decode_priority=self._decode_priority,
                         parent=self,
                     )
                     th.frame.connect(self._on_source_frame, Qt.ConnectionType.QueuedConnection)
@@ -4171,6 +4207,7 @@ class VideoPipeline(QObject):
         transport: str = "auto",
         stream_kind: str = "rtsp",
         low_latency: bool = False,
+        decode_priority: str = DECODE_NORMAL,
         defer_refresh: bool = False,
     ) -> None:
         _ = defer_refresh
@@ -4180,6 +4217,7 @@ class VideoPipeline(QObject):
         sk = str(stream_kind or "rtsp").strip().lower()
         sk = sk if sk in ("rtsp", "udp_h264", "udp_h265") else "rtsp"
         ll = bool(low_latency)
+        dp = str(decode_priority or DECODE_NORMAL)
         if day_u and th_u and day_u == th_u:
             th_u = ""
         unchanged = (
@@ -4188,12 +4226,14 @@ class VideoPipeline(QObject):
             and tr == self._rtsp_transport
             and sk == self._stream_kind
             and ll == self._low_latency
+            and dp == self._decode_priority
             and bool(self._sources)
         )
         self._rtsp_day_url = day_u
         self._rtsp_thermal_url = th_u
         self._rtsp_transport = tr
         self._low_latency = ll
+        self._decode_priority = dp
         self._stream_kind = sk
         if unchanged:
             return

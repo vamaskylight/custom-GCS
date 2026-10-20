@@ -170,7 +170,6 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._home_lon: float | None = None
         self._home_amsl_m: float | None = None
         self._auto_center_pending = True
-        self._plan_hover_speed_mps = 11.18
         self._last_gps_lat: float | None = None
         self._last_gps_lon: float | None = None
         # WebEngine overlay refresh budget (~10 Hz) — avoids full-map flicker from 25–50 Hz MAVLink.
@@ -448,6 +447,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         # they end, where the operator looks (the map's own status line is hidden).
         self._map_widget.tile_pack_progress.connect(self._on_tile_pack_message)
         self._map_widget.tile_pack_finished.connect(self._on_tile_pack_done)
+        self._map_widget.operator_notice.connect(self._on_map_operator_notice)
         self._map_widget.plan_tool_requested.connect(self._on_plan_tool_requested)
         self._map_widget.plan_action_requested.connect(self._on_plan_flight_action)
         self._map_widget.plan_flight_exited.connect(self._on_plan_flight_exited)

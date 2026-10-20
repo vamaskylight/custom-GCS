@@ -1233,17 +1233,8 @@ class PlanFlightPanel(QWidget):
         wrap2 = QWidget()
         wrap2.setLayout(vrow2)
         vbody.addWidget(wrap2)
-        note = QLabel(
-            "The following speed values are used to calculate total mission time. "
-            "They do not affect the flight speed for the mission."
-        )
-        note.setProperty("class", "planNoteMission")
-        note.setWordWrap(True)
-        vbody.addWidget(note)
-        vbody.addWidget(self._field_label("Hover speed"))
-        self._hover_input = self._unit_input("11.18", "m/s")
-        self._hover_input.textChanged.connect(lambda _t: self._schedule_emit())
-        vbody.addWidget(self._hover_input)
+        # "Hover speed" was here until 2026-10-20. It changed nothing: the
+        # mission time uses each waypoint's own speed.
         body_v.addWidget(self._vehicle_section)
 
         # Launch position collapsible
@@ -1765,8 +1756,6 @@ class PlanFlightPanel(QWidget):
                 )
             if "initialWpSpeedMps" in state:
                 self._initial_wp_speed.setText(str(state.get("initialWpSpeedMps") or DEFAULT_NEW_WP_SPEED_MPS))
-            if "hoverMps" in state or "hoverMph" in state:
-                self._hover_input.setText(str(state.get("hoverMps", state.get("hoverMph")) or "11.18"))
             if "launchAltM" in state or "launchAltFt" in state:
                 self._launch_alt.setText(str(state.get("launchAltM", state.get("launchAltFt")) or "0.0"))
             lat = str(state.get("launchLat", "") or "").strip()
@@ -2199,7 +2188,6 @@ class PlanFlightPanel(QWidget):
             "altRef": str(self._alt_ref_combo.currentData() or "rel"),
             "initialWpAltM": initial_alt_m,
             "initialWpSpeedMps": initial_speed_mps,
-            "hoverMps": self._float(self._hover_input.text(), 11.18),
             "launchAltM": self._float(self._launch_alt.text(), 0.0),
             "launchLat": self._launch_lat_value.text().strip().replace("\u2014", ""),
             "launchLon": self._launch_lon_value.text().strip().replace("\u2014", ""),

@@ -18,6 +18,7 @@ from vgcs.mission import (
     DEFAULT_MISSION_END_ACTION,
     Waypoint,
     clamp_hover_seconds,
+    load_fence_polygon,
     load_mission_end_action,
     load_waypoints_json,
     normalize_end_action,
@@ -559,8 +560,10 @@ class PlanMissionMixin:
             )
             if not path:
                 return
+        # The polygon fence drawn on the map goes into the plan file too.
+        fence = self.fence_polygon()
         try:
-            save_waypoints_json(path, wps, end_action=self.get_mission_end_action())
+            save_waypoints_json(path, wps, end_action=self.get_mission_end_action(), fence_polygon=fence)
         except Exception:
             self._set_status("Save failed")
             QMessageBox.warning(self, "Plan Flight", "Could not save the mission file.")
@@ -569,10 +572,11 @@ class PlanMissionMixin:
         if settings.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
             settings.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
         self._set_status(f"Current mission saved ({len(wps)} WPs)")
+        with_fence = f" and the polygon fence ({len(fence)} corners)" if fence else ""
         QMessageBox.information(
             self,
             "Plan saved",
-            f"Saved {len(wps)} waypoint(s) to:\n{path}",
+            f"Saved {len(wps)} waypoint(s){with_fence} to:\n{path}",
         )
 
     def save_plan_mission_kml(self) -> None:
@@ -643,9 +647,17 @@ class PlanMissionMixin:
             return
         try:
             waypoints = load_waypoints_json(path)
-        except Exception:
-            self._set_status("Import failed")
+        except Exception as exc:
+            # Said on screen and in the log. This used to go to the map's status
+            # line only, which the map-first window never shows.
+            self._tell_operator(f"The plan could not be opened: {exc}")
+            QMessageBox.warning(self, "Plan Flight", f"The plan could not be opened:\n{path}\n\n{exc}")
             return
+        try:
+            fence = load_fence_polygon(path)
+            fence_problem = ""
+        except Exception as exc:
+            fence, fence_problem = None, str(exc)
         stored_end = load_mission_end_action(path)
         if stored_end:
             self.set_mission_end_action(stored_end)
@@ -664,7 +676,21 @@ class PlanMissionMixin:
         s.setValue(_KEY_PLAN_CURRENT_MISSION_JSON, path)
         if s.contains(_KEY_PLAN_LAST_MISSION_JSON_LEGACY):
             s.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
-        self._set_status(f"Mission opened as current file ({len(waypoints)} WPs)")
+        # A fence saved with the plan comes back as a drawing: it is on the
+        # drone only once it is uploaded (or when the drone holds the same one).
+        # A plan saved without a fence leaves the fence on the map as it is.
+        fence_words = ""
+        if fence is not None:
+            nm = getattr(self, "_native_map", None)
+            if nm is not None:
+                nm.set_fence_points([[lat, lon] for lat, lon in fence])
+            self._refresh_fence_view()
+            fence_words = f" and the polygon fence ({len(fence)} corners)" if fence else ""
+        said = f"Plan opened: {len(waypoints)} waypoint(s){fence_words}."
+        if fence_problem:
+            said += f" Its fence was not read: {fence_problem}."
+        self._tell_operator(said)
+        QMessageBox.information(self, "Plan opened", f"{said}\n\n{path}")
 
     def set_waypoints(
         self, waypoints: list[Waypoint], *, clear_plan_current_file: bool = False

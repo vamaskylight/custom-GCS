@@ -666,15 +666,11 @@ class MainWindowPlanMissionMixin:
         initial_wp_speed_mps = float(
             s.value("plan_initial_wp_speed_mps", DEFAULT_NEW_WP_SPEED_MPS) or DEFAULT_NEW_WP_SPEED_MPS
         )
-        hover_mps = float(
-            s.value("plan_hover_speed_mps", s.value("plan_hover_speed_mph", 11.18)) or 11.18
-        )
         launch_alt_m = float(s.value("plan_launch_alt_m", s.value("plan_launch_alt_ft", 0.0)) or 0.0)
         state = {
             "altRef": str(s.value("plan_alt_ref", "rel") or "rel"),
             "initialWpAltM": initial_wp_alt_m,
             "initialWpSpeedMps": initial_wp_speed_mps,
-            "hoverMps": hover_mps,
             "launchAltM": launch_alt_m,
             "launchLat": str(s.value("plan_launch_lat_str", "") or ""),
             "launchLon": str(s.value("plan_launch_lon_str", "") or ""),
@@ -715,7 +711,6 @@ class MainWindowPlanMissionMixin:
         initial_wp_alt_m = float(
             data.get("initialWpAltM", data.get("initialWpAltFt", DEFAULT_NEW_WP_ALT_M)) or DEFAULT_NEW_WP_ALT_M
         )
-        hover_mps = float(data.get("hoverMps", data.get("hoverMph", 11.18)) or 11.18)
         launch_alt_m = float(data.get("launchAltM", data.get("launchAltFt", 0.0)) or 0.0)
         if "initialWpSpeedMps" in data:
             s.setValue(
@@ -723,11 +718,9 @@ class MainWindowPlanMissionMixin:
                 max(0.1, float(data.get("initialWpSpeedMps") or DEFAULT_NEW_WP_SPEED_MPS)),
             )
         s.setValue("plan_initial_wp_alt_m", initial_wp_alt_m)
-        s.setValue("plan_hover_speed_mps", hover_mps)
         s.setValue("plan_launch_alt_m", launch_alt_m)
         # Legacy keys kept in sync for compatibility with older builds/config.
         s.setValue("plan_initial_wp_alt_ft", initial_wp_alt_m)
-        s.setValue("plan_hover_speed_mph", hover_mps)
         s.setValue("plan_launch_alt_ft", launch_alt_m)
         lat = str(data.get("launchLat", "") or "").strip()
         lon = str(data.get("launchLon", "") or "").strip()
@@ -791,8 +784,6 @@ class MainWindowPlanMissionMixin:
             self._map_widget.set_default_waypoint_speed_mps(
                 float(state.get("initialWpSpeedMps") or DEFAULT_NEW_WP_SPEED_MPS)
             )
-        speed_mps = float(state.get("hoverMps", state.get("hoverMph", 11.18)) or 11.18)
-        self._plan_hover_speed_mps = max(0.5, speed_mps)
         self._maybe_refresh_map_web_overlays()
 
     def _estimate_plan_timing(self, model: list):
@@ -813,12 +804,7 @@ class MainWindowPlanMissionMixin:
         except Exception:
             end_action = "hold"
         try:
-            return estimate_mission_time(
-                model,
-                start=start,
-                end_action=end_action,
-                default_speed_mps=max(0.5, float(self._plan_hover_speed_mps)),
-            )
+            return estimate_mission_time(model, start=start, end_action=end_action)
         except Exception:
             return MissionTiming()
 

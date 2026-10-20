@@ -255,6 +255,11 @@ def connect_and_telemetry(version: str, r: Report) -> None:
         r.check(10.0 < status.get("voltage_v", 0.0) < 14.0, f"battery reads {status.get('voltage_v', 0.0):.2f} V (the simulated pack is 12.6 V)")
         att = rec.last("ATTITUDE")
         r.check(abs(att.get("roll_deg", 99)) < 2 and abs(att.get("pitch_deg", 99)) < 2, "the drone reads level on the ground")
+        # The drone's own home reaches the window (the circle fence is drawn around it, 2026-10-20).
+        f.wait(lambda: bool(rec.last("HOME_POSITION")), 20)
+        home = rec.last("HOME_POSITION")
+        home_off = distance_m(HOME[0], HOME[1], home.get("lat", 0.0), home.get("lon", 0.0)) if home else -1.0
+        r.check(0.0 <= home_off < 3.0, f"the drone's home reaches VGCS ({home_off:.1f} m from where it stands)")
 
         now = parse_prearm_health(sensors_present=status.get("sensors_present", 0), sensors_enabled=status.get("sensors_enabled", 0),
                                   sensors_health=status.get("sensors_health", 0), now=time.monotonic())

@@ -314,6 +314,12 @@ class MainWindowMapChromeMixin:
     def _on_tile_pack_message(self, text: str) -> None:
         self._post_gcs_notice(text)
 
+    def _on_map_operator_notice(self, text: str) -> None:
+        # A recording or plan file result. Not a popup: it can come in flight.
+        from vgcs.app.vehicle_messages import NOTICE_EVENT
+
+        self._post_gcs_notice(text, kind=NOTICE_EVENT, hold_s=12.0)
+
     def _on_tile_pack_done(self, text: str) -> None:
         # Not a popup: a download can end in the middle of a flight.
         from vgcs.app.vehicle_messages import NOTICE_EVENT

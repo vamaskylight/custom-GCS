@@ -8,12 +8,14 @@ import time
 
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
+from vgcs.map.app_settings import QS_APP, QS_ORG
 from vgcs.map.image_io import save_qimage_to_path
 from vgcs.video.camera_control import NoopCameraControl
+from vgcs.video.recording_storage import prune_recordings
 from vgcs.video.pipeline import (
     suggested_photo_save_path,
     suggested_recording_save_path,
@@ -23,6 +25,28 @@ from vgcs.video.pipeline import (
 
 class VideoRecordingMixin:
     """Extracted from MapWidget — uses host widget state via self."""
+
+    def _tell_operator(self, text: str, *, log: bool = True) -> None:
+        """A one-off message for the operator: a recording or a plan file result.
+
+        The map's status line is hidden in the map-first window, so the message
+        also goes to the header's MESSAGE cell (MapWidget.operator_notice, shown
+        by the main window) and, unless the caller printed it already, to the
+        session log.
+        """
+        msg = str(text or "")
+        self._set_status(msg)
+        if log:
+            try:
+                print(f"[VGCS:map] {msg}", flush=True)
+            except Exception:
+                pass
+        notice = getattr(self, "operator_notice", None)
+        if notice is not None:
+            try:
+                notice.emit(msg)
+            except Exception:
+                pass
 
     def _trigger_hardware_photo(self) -> None:
         cc = getattr(self, "_camera_control", None)
@@ -78,7 +102,7 @@ class VideoRecordingMixin:
         if img is not None:
             # The photo shows what the operator sees, thermal colours included.
             img = self._thermal_palette_frame(self._operator_preview_source_id(), img)
-        if img is not None and _save_qimage_to_path(img, dest):
+        if img is not None and save_qimage_to_path(img, dest):
             return str(dest)
 
         # Last resort: QtMultimedia capture (can block; avoid on observation hot path).
@@ -332,31 +356,57 @@ class VideoRecordingMixin:
         except Exception:
             size = 0
         if size <= 0:
-            msg = "Recording stopped but the file is empty — no frames were captured"
+            msg = "Recording stopped, but its file is empty: no pictures were recorded"
             if reason:
                 msg += f" ({reason})"
             try:
-                print(f"[VGCS:cam_rail] RECORD save skipped — {msg}")
+                print(f"[VGCS:cam_rail] RECORD save skipped: {msg}")
             except Exception:
                 pass
-            self._set_status(msg)
+            self._tell_operator(msg, log=False)
             return
         if reason:
-            self._set_status(f"Recording stopped — {reason}. Choose where to save it.")
+            self._tell_operator(f"Recording stopped ({reason}). Choose where to save it.")
+        # The suggested name carries the recording's own kind (mp4 or mkv, Application Settings).
+        suggested = str(Path(suggested_recording_save_path()).with_suffix(Path(path).suffix or ".mp4"))
         save_to, _ = QFileDialog.getSaveFileName(
             self,
             "Save recording",
-            suggested_recording_save_path(),
+            suggested,
             "Video (*.mp4 *.mov *.mkv)",
         )
         if not save_to:
-            self._set_status("Recording discarded (no file name chosen)")
+            self._tell_operator("Recording not saved (no file name chosen)")
             return
         try:
             shutil.move(path, str(save_to))
-            self._set_status(f"Recording saved: {save_to}")
         except Exception as e:
-            self._set_status(f"Could not save recording: {e}")
+            self._tell_operator(f"Could not save the recording: {e}")
+            return
+        print(f"[VGCS:cam_rail] RECORD saved -> {save_to}")
+        said = f"Recording saved: {Path(save_to).name}."
+        cleaned = self._apply_recording_storage_limit(str(save_to))
+        if cleaned:
+            said += f" {cleaned}"
+        self._tell_operator(said, log=False)
+
+    def _apply_recording_storage_limit(self, saved_path: str) -> str:
+        """Application Settings, Video: "Auto-delete saved recordings" keeps the folder of a saved
+        recording under "Max storage usage (MB)" (vgcs.video.recording_storage). What it did, or ""."""
+        try:
+            s = QSettings(QS_ORG, QS_APP)
+            on = str(s.value("video/auto_delete", False)).strip().lower() in ("1", "true", "yes", "on")
+            max_mb = int(float(s.value("video/max_storage_mb", 10240) or 0))
+        except Exception:
+            return ""
+        if not on or max_mb <= 0:
+            return ""
+        result = prune_recordings(Path(saved_path).parent, max_mb, keep=saved_path)
+        for old in result.deleted:
+            print(f"[VGCS:cam_rail] RECORD auto-delete (over {max_mb} MB): {old}")
+        for old in result.failed:
+            print(f"[VGCS:cam_rail] RECORD auto-delete failed: {old}")
+        return result.words(max_mb)
 
     def _stop_native_cam_recording_tick_timer(self, *, reset_label: bool = True) -> None:
         t = getattr(self, "_native_cam_recording_tick_timer", None)
@@ -398,8 +448,8 @@ class VideoRecordingMixin:
             # Photo mode repurposes this button as the shutter, so a record
             # press here is meaningless — but silently doing nothing looks
             # identical to a broken button.
-            self._set_status(
-                "Recording is video mode only — switch the camera rail from Photo to Video"
+            self._tell_operator(
+                "Recording works in video mode only. Switch the camera rail from Photo to Video."
             )
             return
         self._on_web_title_changed(f"VGCS_CAM_RECORD_TOGGLE:{1 if on else 0}:0")

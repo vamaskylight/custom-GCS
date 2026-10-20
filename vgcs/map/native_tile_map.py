@@ -538,6 +538,8 @@ class NativeTileMapView(QWidget):
         self._waypoints: list[tuple[float, float]] = []
         self._fence_points: list[tuple[float, float]] = []
         self._fence_circle: tuple[float, float, float] | None = None  # lat, lon, radius_m
+        self._fence_circle_on_drone = True   # in use: green and solid; else amber and dashed
+        self._fence_circle_tag = ""
         self._track: list[tuple[float, float]] = []
         self._mission_nav_seq = 0
         # Plan index (0-based) of the waypoint the vehicle is flying to, or None.
@@ -862,6 +864,30 @@ class NativeTileMapView(QWidget):
         self._fence_tag = tag
         self.update()
 
+    def set_fence_circle(self, lat: float, lon: float, radius_m: float, *, on_drone: bool, tag: str = "") -> None:
+        """The circle fence around the drone's home: green and solid in use, amber and dashed otherwise."""
+        circle = (float(lat), float(lon), float(radius_m))
+        on_drone, tag = bool(on_drone), str(tag or "")
+        if (circle, on_drone, tag) == (self._fence_circle, self._fence_circle_on_drone, self._fence_circle_tag):
+            return
+        self._fence_circle = circle
+        self._fence_circle_on_drone = on_drone
+        self._fence_circle_tag = tag
+        self.update()
+
+    def clear_fence_circle(self) -> None:
+        if self._fence_circle is None and not self._fence_circle_tag:
+            return
+        self._fence_circle = None
+        self._fence_circle_tag = ""
+        self.update()
+
+    def fence_circle(self) -> tuple[float, float, float, bool, str] | None:
+        """The circle fence drawn: (lat, lon, radius_m, in use, words), or None."""
+        if self._fence_circle is None:
+            return None
+        return (*self._fence_circle, self._fence_circle_on_drone, self._fence_circle_tag)
+
     def fence_draw_mode(self) -> bool:
         return bool(self._fence_draw_mode)
 
@@ -892,6 +918,7 @@ class NativeTileMapView(QWidget):
     def clear_fence_visual(self) -> None:
         self._fence_points.clear()
         self._fence_circle = None
+        self._fence_circle_tag = ""
         self.update()
 
     def set_mission_nav_seq(self, seq: int) -> None:
@@ -1370,22 +1397,40 @@ class NativeTileMapView(QWidget):
                     painter.drawLine(prev, pt)
                 prev = pt
 
-        # Circular fence preview (from setFence)
+        # The circle fence around the drone's home (set_fence_circle), with the
+        # polygon's look: green and solid in use, amber and dashed when the drone
+        # holds it but does not use it. The words above it say which.
         if self._fence_circle is not None:
             flat_lat, flat_lon, r_m = self._fence_circle
+            painter.save()
             try:
-                pts = _circle_ring_points(flat_lat, flat_lon, float(r_m), segments=28)
-                pen = QPen(QColor(120, 255, 160, 210))
-                pen.setWidth(2)
+                in_use = bool(self._fence_circle_on_drone)
+                colour = QColor(90, 230, 140, 240) if in_use else QColor(255, 196, 60, 240)
+                pen = QPen(colour)
+                pen.setWidth(3 if in_use else 2)
+                if not in_use:
+                    pen.setStyle(Qt.PenStyle.DashLine)
                 painter.setPen(pen)
-                prev = None
-                for la, lo in pts:
-                    pt = self._project(la, lo, z, fx, fy, w, h)
-                    if prev is not None:
-                        painter.drawLine(prev, pt)
-                    prev = pt
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                ring = [self._project(la, lo, z, fx, fy, w, h)
+                        for la, lo in _circle_ring_points(flat_lat, flat_lon, float(r_m), segments=64)]
+                for i in range(1, len(ring)):
+                    painter.drawLine(ring[i - 1], ring[i])
+                if self._fence_circle_tag and ring:
+                    top = min(ring, key=lambda p: p.y())
+                    painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                    metrics = painter.fontMetrics()
+                    tw = metrics.horizontalAdvance(self._fence_circle_tag) + 10
+                    th = metrics.height() + 4
+                    tx = max(4.0, min(float(top.x()) - tw / 2.0, float(w) - tw - 4.0))
+                    ty = max(4.0, float(top.y()) - th - 6.0)
+                    painter.fillRect(QRectF(tx, ty, tw, th), QColor(0, 0, 0, 215))
+                    painter.setPen(colour)
+                    painter.drawText(QRectF(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, self._fence_circle_tag)
             except Exception:
                 pass
+            finally:
+                painter.restore()
 
         # Fence polygon. Green and solid: the drone has confirmed this very
         # polygon and uses it. Amber and dashed: a drawing, or a polygon the

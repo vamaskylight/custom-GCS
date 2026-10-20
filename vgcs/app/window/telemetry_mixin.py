@@ -815,6 +815,10 @@ class MainWindowTelemetryMixin:
         elif msg_type == "WIND":
             if self._wind.update_wind(data.get("speed_mps"), data.get("direction_deg")):
                 self._publish_wind()
+        elif msg_type == "HOME_POSITION":
+            # The drone's own home, for the circle fence on the map. The window's
+            # _home_lat/_home_lon stay as they are (a position heard by VGCS).
+            self._map_widget.set_drone_home(data.get("lat"), data.get("lon"))
         elif msg_type == "NAMED_VALUE_FLOAT":
             if self._wind.update_failsafe_value(data.get("name"), data.get("value")):
                 self._publish_wind()
