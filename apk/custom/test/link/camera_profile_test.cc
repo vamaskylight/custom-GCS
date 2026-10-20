@@ -92,6 +92,49 @@ QByteArray cameraFile(const Profile &p)
     return QJsonDocument(camera::toJson(p)).toJson();
 }
 
+// The camera files of the check that the app and VGCS read each other's files (VAMA_CAMERA_FILES):
+// vgcs/ written by VGCS (apk/custom/test/gen_camera_files.py), apk/ by this test.
+QString sampleFolder(const char *who)
+{
+    return QStringLiteral(VAMA_CAMERA_FILES "/") + QString::fromLatin1(who);
+}
+
+/// Both the same, numbers by their value (VGCS writes 30.0 where Qt writes 30). where: the first difference.
+bool sameJson(const QJsonValue &a, const QJsonValue &b, const QString &at, QString *where)
+{
+    if (a.isDouble() && b.isDouble()) {
+        if (a.toDouble() == b.toDouble()) {
+            return true;
+        }
+    } else if (a.isArray() && b.isArray()) {
+        const QJsonArray x = a.toArray();
+        const QJsonArray y = b.toArray();
+        if (x.size() == y.size()) {
+            for (qsizetype i = 0; i < x.size(); ++i) {
+                if (!sameJson(x.at(i), y.at(i), QStringLiteral("%1[%2]").arg(at).arg(i), where)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    } else if (a.isObject() && b.isObject()) {
+        const QJsonObject x = a.toObject();
+        const QJsonObject y = b.toObject();
+        if (x.keys() == y.keys()) {
+            for (const QString &key : x.keys()) {
+                if (!sameJson(x.value(key), y.value(key), at + QLatin1Char('.') + key, where)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    } else if (a == b) {
+        return true;
+    }
+    *where = at;
+    return false;
+}
+
 }  // namespace
 
 class CameraProfileTest : public QObject
@@ -111,6 +154,8 @@ private slots:
     void builtInCamerasStay();
     void filesThatAreNoCamerasAreSkippedWithANote();
     void deletingRemovesTheFile();
+    void theFilesVgcsWritesAreRead();
+    void theAppWritesTheFilesVgcsReads();
 };
 
 void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
@@ -489,6 +534,59 @@ void CameraProfileTest::deletingRemovesTheFile()
     QVERIFY(!store.find(id));
     QCOMPARE(store.profiles().size(), 3);
     QVERIFY(store.remove(id).contains(QStringLiteral("no such camera")));
+}
+
+// A camera added in VGCS works in the app once its file is copied over: the app reads every
+// file VGCS wrote, and its own file of that camera has the same values.
+void CameraProfileTest::theFilesVgcsWritesAreRead()
+{
+    camera::Store store;
+    store.setFolder(sampleFolder("vgcs"));
+    store.load();
+    QVERIFY2(store.notes().isEmpty(), qPrintable(store.notes().join(QLatin1Char('\n'))));
+    const QFileInfoList files = QDir(sampleFolder("vgcs")).entryInfoList({QStringLiteral("*.json")}, QDir::Files, QDir::Name);
+    QCOMPARE(files.size(), 7);
+    for (const QFileInfo &file : files) {
+        const Profile *p = store.find(file.completeBaseName());
+        QVERIFY2(p && !p->builtIn, qPrintable(file.fileName()));
+        QFile f(file.filePath());
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QString where;
+        QVERIFY2(sameJson(camera::toJson(*p), QJsonDocument::fromJson(f.readAll()).object(), file.fileName(), &where),
+                 qPrintable(where));
+    }
+}
+
+// The app's own files of the same cameras, as it saves them: VGCS's test reads these
+// (tests/test_camera_files_cross_app.py). VAMA_WRITE_CAMERA_FILES=1 writes them again.
+void CameraProfileTest::theAppWritesTheFilesVgcsReads()
+{
+    camera::Store store;
+    store.setFolder(sampleFolder("vgcs"));
+    store.load();
+    const bool write = qEnvironmentVariableIntValue("VAMA_WRITE_CAMERA_FILES") == 1;
+    QDir apk(sampleFolder("apk"));
+    if (write) {
+        QVERIFY(QDir().mkpath(apk.path()));
+    }
+    int added = 0;
+    for (const Profile &p : store.profiles()) {
+        if (p.builtIn) {
+            continue;
+        }
+        ++added;
+        const QString path = apk.filePath(p.id + QStringLiteral(".json"));
+        const QByteArray bytes = QJsonDocument(camera::toJson(p)).toJson(QJsonDocument::Indented);
+        if (write) {
+            writeFile(path, bytes);
+            continue;
+        }
+        QFile f(path);
+        QVERIFY2(f.open(QIODevice::ReadOnly), qPrintable(path + QStringLiteral(" is missing: run once with VAMA_WRITE_CAMERA_FILES=1")));
+        QCOMPARE(f.readAll(), bytes);
+    }
+    QCOMPARE(added, 7);
+    QCOMPARE(apk.entryList({QStringLiteral("*.json")}, QDir::Files).size(), added);
 }
 
 QTEST_GUILESS_MAIN(CameraProfileTest)

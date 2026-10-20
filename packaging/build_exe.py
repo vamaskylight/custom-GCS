@@ -13,6 +13,9 @@ Steps:
   5. Single file: pack that folder into one VGCS.exe (single_file_launcher.cs).
      Folder: zip dist/VGCS for delivery.
   6. Run "VGCS.exe --selfcheck" on the result. Stop if any check fails.
+
+With --customer the exe gets the team's admin password (its salted hash) instead of the
+test password: see ADMIN_PASSWORD_FILE.
 """
 
 from __future__ import annotations
@@ -47,6 +50,12 @@ BUILD = REPO / "build"
 DIST = REPO / "dist"
 APP_DIR = DIST / "VGCS"
 VENV_PYTHON = BUILD / "venv" / "Scripts" / "python.exe"
+# The team's admin password for customer exes (--customer): its salt and hash only, made once
+# by apk\make_admin_password.ps1 outside the repo. Customer APKs get theirs from the same file.
+# The camera editor asks for it (vgcs/app/admin_password.py). Never put it in the repo.
+ADMIN_PASSWORD_FILE = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".vama" / "vama-admin-password.txt"
+# What the exe carries of it, for one build only (vgcs.spec bundles it).
+ADMIN_SECRET_WORK = BUILD / "admin" / "vgcs_admin_password.txt"
 # The C# compiler of the .NET Framework, which is part of Windows 10 and 11.
 CSC = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
 
@@ -141,11 +150,52 @@ def make_icon() -> Path:
     return icon
 
 
-def run_pyinstaller(icon: Path, ffmpeg_dir: Path | None) -> None:
+def prepare_admin_secret(customer: bool, source: Path | None = None) -> Path | None:
+    """A customer exe: the team's admin password for vgcs.spec (a file), else None (the test password)."""
+    ADMIN_SECRET_WORK.unlink(missing_ok=True)
+    if not customer:
+        return None
+    source = source or ADMIN_PASSWORD_FILE
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+    from vgcs.app.admin_password import TEST_ADMIN_PASSWORD, derive_hash, parse_secret, secret_text
+
+    if not source.is_file():
+        sys.exit(
+            f"A customer exe needs the team's admin password, and {source} is not there.\n"
+            r"Make it once: powershell -ExecutionPolicy Bypass -File apk\make_admin_password.ps1"
+        )
+    secret = parse_secret(source.read_text(encoding="utf-8", errors="replace"))
+    if secret is None:
+        sys.exit(f"{source} has no salt, hash and rounds. Make it again with apk\\make_admin_password.ps1 -Replace")
+    if derive_hash(TEST_ADMIN_PASSWORD, secret.salt, secret.iterations) == secret.hash:
+        sys.exit(f"{source} holds the test password. A customer exe needs the team's own.")
+    ADMIN_SECRET_WORK.parent.mkdir(parents=True, exist_ok=True)
+    ADMIN_SECRET_WORK.write_text(secret_text(secret), encoding="ascii")
+    return ADMIN_SECRET_WORK
+
+
+def check_admin_secret(admin_secret: Path | None) -> None:
+    """A customer build carries the team's admin password. A test build carries none: it has the test one."""
+    bundled = APP_DIR / "_internal" / ADMIN_SECRET_WORK.name
+    if admin_secret is None:
+        if bundled.exists():
+            sys.exit(f"A test build must not carry an admin password file: {bundled}")
+        print("\nAdmin password: the test password (a test exe).")
+        return
+    if not bundled.is_file() or bundled.read_bytes() != admin_secret.read_bytes():
+        sys.exit(f"The team's admin password did not reach the build: {bundled}")
+    print("\nAdmin password: the team's (a customer exe).")
+
+
+def run_pyinstaller(icon: Path, ffmpeg_dir: Path | None, admin_secret: Path | None = None) -> None:
     env = dict(os.environ, VGCS_ICON=str(icon))
     env.pop("VGCS_FFMPEG_DIR", None)
     if ffmpeg_dir is not None:
         env["VGCS_FFMPEG_DIR"] = str(ffmpeg_dir)
+    env.pop("VGCS_ADMIN_SECRET_FILE", None)
+    if admin_secret is not None:
+        env["VGCS_ADMIN_SECRET_FILE"] = str(admin_secret)
     run(
         [
             VENV_PYTHON, "-m", "PyInstaller", "--noconfirm", "--clean",
@@ -262,6 +312,11 @@ def main() -> int:
         help="only download the pinned FFmpeg into build\\ffmpeg, for running VGCS from source (py -m vgcs)",
     )
     parser.add_argument("--no-zip", action="store_true", help="with --folder: do not zip dist/VGCS")
+    parser.add_argument(
+        "--customer", action="store_true",
+        help=r"a customer exe: the team's admin password (%%USERPROFILE%%\.vama\vama-admin-password.txt) "
+        "instead of the test password",
+    )
     args = parser.parse_args()
     if os.name != "nt":
         sys.exit("VGCS.exe can only be built on Windows.")
@@ -273,22 +328,28 @@ def main() -> int:
         print("VGCS finds it there when it is started from source (py -m vgcs).")
         return 0
 
-    prepare_venv(install=not args.skip_install)
-    ffmpeg_dir = None if args.no_ffmpeg else (args.ffmpeg_dir or prepare_ffmpeg())
-    icon = make_icon()
-    run_pyinstaller(icon, ffmpeg_dir)
-    if args.folder:
-        run_selfcheck(APP_DIR / "VGCS.exe")
-        print(f"\nBuilt {APP_DIR / 'VGCS.exe'}")
-        if not args.no_zip:
-            archive = make_zip()
-            print(f"Zip to deliver: {archive} ({archive.stat().st_size / 1e6:.0f} MB)")
+    # First, so that a customer build without the team's password stops at once.
+    admin_secret = prepare_admin_secret(args.customer)
+    try:
+        prepare_venv(install=not args.skip_install)
+        ffmpeg_dir = None if args.no_ffmpeg else (args.ffmpeg_dir or prepare_ffmpeg())
+        icon = make_icon()
+        run_pyinstaller(icon, ffmpeg_dir, admin_secret)
+        check_admin_secret(admin_secret)
+        if args.folder:
+            run_selfcheck(APP_DIR / "VGCS.exe")
+            print(f"\nBuilt {APP_DIR / 'VGCS.exe'}")
+            if not args.no_zip:
+                archive = make_zip()
+                print(f"Zip to deliver: {archive} ({archive.stat().st_size / 1e6:.0f} MB)")
+            return 0
+        exe = make_single_file(icon)
+        run_selfcheck(exe)
+        print(f"\nBuilt {exe}")
+        print(f"Deliver this one file: {exe} ({exe.stat().st_size / 1e6:.0f} MB)")
         return 0
-    exe = make_single_file(icon)
-    run_selfcheck(exe)
-    print(f"\nBuilt {exe}")
-    print(f"Deliver this one file: {exe} ({exe.stat().st_size / 1e6:.0f} MB)")
-    return 0
+    finally:
+        ADMIN_SECRET_WORK.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

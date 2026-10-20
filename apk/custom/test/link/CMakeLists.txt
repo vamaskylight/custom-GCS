@@ -166,6 +166,10 @@ add_executable(camera_profile_test
     ${SKYDROID_SRC}/CameraProfile.h
 )
 target_include_directories(camera_profile_test PRIVATE ${SKYDROID_SRC})
+# The camera files of VGCS and of the app, which each must read (gen_camera_files.py).
+target_compile_definitions(camera_profile_test PRIVATE
+    VAMA_CAMERA_FILES="${CMAKE_CURRENT_SOURCE_DIR}/../camera_files"
+)
 target_link_libraries(camera_profile_test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
 
 # The admin password for Advanced Mode (task Z). admin_password_test is built as a test build

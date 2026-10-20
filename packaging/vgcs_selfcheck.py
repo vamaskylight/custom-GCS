@@ -113,6 +113,19 @@ def check_license() -> str:
     raise CheckWarning(f"machine code {code}, no valid key saved ({result.status.value})")
 
 
+def check_admin_password() -> str:
+    """The camera editor and its admin password window are bundled, and which password the exe has."""
+    from vgcs.app import admin_password_dialog, camera_editor_dialog  # noqa: F401  (bundled windows)
+    from vgcs.app.admin_password import built_in_secret
+
+    _secret, kind = built_in_secret()
+    if kind == "broken":
+        raise RuntimeError("the admin password file of this build cannot be read: no password opens the camera editor")
+    if kind == "team":
+        return "the team's password (a customer exe)"
+    return "the test password (a test exe, or source)"
+
+
 def check_mavlink() -> str:
     import pymavlink
     from pymavlink import mavutil  # noqa: F401  (loads the default dialect, like the app does)
@@ -369,6 +382,7 @@ def run_selfcheck(build: str = "VGCS from source", data_dir: Path | None = None)
         ("data folder", lambda: check_data_dir(folder)),
         ("bundled files", check_bundled_files),
         ("license", check_license),
+        ("admin password", check_admin_password),
         ("MAVLink", check_mavlink),
         ("serial ports", check_serial_ports),
         ("MGRS grid reference", check_grid_reference),

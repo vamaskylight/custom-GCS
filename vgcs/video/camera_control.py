@@ -348,9 +348,19 @@ class SkydroidCameraControl:
         except Exception:
             pass
 
+    def _zoom_max(self) -> float:
+        """The highest counted zoom of this camera (an added camera's own, else 30x)."""
+        try:
+            return max(ZOOM_MIN, float(getattr(self._adapter._profile, "max_zoom", ZOOM_MAX_SKYDROID)))
+        except Exception:
+            return ZOOM_MAX_SKYDROID
+
     def set_zoom(self, level: float) -> None:
         try:
-            lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(level)))
+            top = self._zoom_max()
+            if top <= ZOOM_MIN and not self._adapter.zoom_is_dzm_step():
+                return  # a camera without zoom: nothing is sent
+            lvl = max(ZOOM_MIN, min(top, float(level)))
             self._adapter.camera_zoom(lvl)
         except Exception:
             return
@@ -359,6 +369,8 @@ class SkydroidCameraControl:
         try:
             if int(step) == 0:
                 return
+            if self._zoom_max() <= ZOOM_MIN and not self._adapter.zoom_is_dzm_step():
+                return  # a camera without zoom: nothing is sent
             if self._adapter.zoom_is_dzm_step():
                 # C14 Pro: one DZM step per click and nothing else. There is no
                 # absolute level to sync - a rail level is not a magnification
@@ -371,7 +383,7 @@ class SkydroidCameraControl:
                 return
             # PROTOCAL §4.7 / ZMC step per click (not fractional absolute DZM).
             self._adapter.camera_zoom_step(int(step))
-            lvl = max(ZOOM_MIN, min(ZOOM_MAX_SKYDROID, float(ui_level)))
+            lvl = max(ZOOM_MIN, min(self._zoom_max(), float(ui_level)))
             # Sync absolute burst only on whole-number × (1×, 2×, 3×…).
             if abs(lvl - round(lvl)) < 0.05:
                 self._adapter.camera_zoom(round(lvl))
@@ -440,7 +452,8 @@ class SkydroidCameraControl:
                 return (ZOOM_MIN, ZOOM_MIN + top * ZOOM_STEP_SKYDROID, ZOOM_STEP_SKYDROID)
         except Exception:
             pass
-        return (ZOOM_MIN, ZOOM_MAX_SKYDROID, ZOOM_STEP_SKYDROID)
+        # Counted zoom: up to this camera's highest (an added camera's own, 1.0 without zoom).
+        return (ZOOM_MIN, self._zoom_max(), ZOOM_STEP_SKYDROID)
 
     def zoom_ui_level(self) -> float | None:
         """Where the rail should believe the zoom is, or None to keep its own count.
@@ -560,13 +573,29 @@ class SkydroidCameraControl:
         except Exception:
             return ""
 
+    def camera_supports(self, feature: str) -> bool:
+        """Whether this camera takes photos ("photo") or records ("record") on its own card.
+
+        Every built-in camera does. An added camera says so in its file (task AA).
+        """
+        try:
+            return bool(getattr(self._adapter._profile, str(feature), True))
+        except Exception:
+            return True
+
     def camera_trigger_photo(self) -> None:
+        if not self.camera_supports("photo"):
+            print("[VGCS:skydroid] photo: this camera takes no photos (its camera file says so)")
+            return
         try:
             self._adapter.camera_photo()
         except Exception:
             return
 
     def camera_toggle_record(self) -> None:
+        if not self.camera_supports("record"):
+            print("[VGCS:skydroid] record: this camera does not record (its camera file says so)")
+            return
         try:
             self._adapter.camera_record_toggle()
         except Exception:

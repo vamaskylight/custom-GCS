@@ -1,0 +1,43 @@
+{
+    "cropStepH": 20,
+    "cropStepW": 36,
+    "dayFovH": 61.4,
+    "dayFovV": 47.9,
+    "dayVideoUrl": "rtsp://192.168.144.108:554/stream=1",
+    "format": "vama-camera-1",
+    "host": "192.168.144.108",
+    "laser": true,
+    "laserMaxM": 1500.0,
+    "lenses": [
+        {
+            "firstStep": 0,
+            "fovH": 61.4,
+            "fovV": 47.9,
+            "lastStep": 85
+        },
+        {
+            "firstStep": 86,
+            "fovH": 14.7,
+            "fovV": 11.1,
+            "lastStep": 184
+        }
+    ],
+    "maxZoom": 30.0,
+    "name": "Copy of V14 Pro",
+    "ownTracker": true,
+    "photo": true,
+    "pitchMax": 60.0,
+    "pitchMin": -90.0,
+    "port": 5000,
+    "protocol": "skydroid-top",
+    "record": true,
+    "sensorH": 2160,
+    "sensorW": 3840,
+    "thermalFovH": 32.84,
+    "thermalFovSure": true,
+    "thermalFovV": 26.35,
+    "thermalVideoUrl": "rtsp://192.168.144.108:555/stream=2",
+    "upperGimbalHeader": true,
+    "yawLimit": 120.0,
+    "zoom": "reported"
+}

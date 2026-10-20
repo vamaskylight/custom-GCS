@@ -128,6 +128,13 @@ class SkydroidCommandProfile:
     # "" disables the retry - it must for any camera whose optics differ from
     # C13, or a successful retry would swap this camera onto C13's lens.
     probe_fallback_profile_id: str = "c13_alt"
+    # --- Fields below were added for cameras the admin adds (task AA,
+    # camera_files.py). The defaults are what every built-in camera has always had. ---
+    # The highest counted zoom on the rail (1.0: a camera without zoom).
+    max_zoom: float = 30.0
+    # The camera takes photos and records on its own card.
+    photo: bool = True
+    record: bool = True
 
     def fov_at_dzm_step(self, step: int | None) -> tuple[float, float] | None:
         """(hfov, vfov) at ``step``, or None when this camera's zoom optics are unknown.
@@ -352,6 +359,13 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
 
 
 def get_profile(profile_id: str) -> SkydroidCommandProfile:
-    pid = str(profile_id or "").strip().lower()
-    return SKYDROID_PROFILES.get(pid, SKYDROID_PROFILES["c13_default"])
+    pid = str(profile_id or "").strip()
+    # A camera the admin added (task AA): "file:<id>", read from its file in the camera folder.
+    # A file that is gone or broken: the C13, as an unknown profile (the APK does the same).
+    if pid.lower().startswith("file:"):
+        from vgcs.skydroid.camera_files import command_profile, load_camera
+
+        cam = load_camera(pid[len("file:"):])
+        return command_profile(cam) if cam is not None else SKYDROID_PROFILES["c13_default"]
+    return SKYDROID_PROFILES.get(pid.lower(), SKYDROID_PROFILES["c13_default"])
 

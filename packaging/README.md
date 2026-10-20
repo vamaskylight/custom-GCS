@@ -100,6 +100,24 @@ py -3.14 packaging\vgcs_license_tool.py this-machine
   Anyone who has it can make keys; without it, no new keys can be made for the exes already given out.
   Its public half is `LICENSE_PUBLIC_KEY` in `vgcs/app/license_key.py`; changing that makes every key given out so far invalid.
 
+### Admin password (customer exes)
+
+The camera editor (Application Settings, Video, Camera / gimbal control, Skydroid, "Cameras...") asks for the admin password, as the APK's Advanced Mode does.
+Choosing a camera does not ask.
+A test exe, and VGCS from source, has the test password of the APK's test builds.
+A customer exe has the team's password:
+
+```
+py -3.14 packaging\build_exe.py --customer
+```
+
+- It needs `%USERPROFILE%\.vama\vama-admin-password.txt`, made once with `apk\make_admin_password.ps1`.
+  Customer APKs use the same file, so both apps take the same password.
+- Only the password's salted hash goes into the exe (`_internal\vgcs_admin_password.txt`), never the password.
+  The build checks that it is there, and that a test build has none.
+- The file is not in the repo and must never be. The hash can be read out of an exe, so the password must be long.
+- `VGCS.exe --selfcheck` says which password the exe has.
+
 ### Where things are kept
 
 - The unpacked program: `%LOCALAPPDATA%\VGCS\app`.
@@ -111,6 +129,8 @@ py -3.14 packaging\vgcs_license_tool.py this-machine
   These are the same settings as the source version on the same machine.
   The license key is saved there too (`license/key`).
 - Map tile cache: `%USERPROFILE%\.vgcs\tile-cache`, as before.
+- Cameras the admin added: one file each in `%USERPROFILE%\.vgcs\Cameras` (the environment variable `VGCS_CAMERA_DIR` moves it).
+  They are the APK's camera files: a file copied from one app's folder into the other's adds the camera there.
 
 ## FFmpeg
 
@@ -154,7 +174,7 @@ VGCS.exe --selfcheck
 ```
 
 It checks the parts that break when packaging goes wrong:
-bundled files, the license window and this computer's machine code (WARN until a key is saved), MAVLink, serial ports, MGRS, GeoTIFF DEM (GDAL and PROJ), OpenCV,
+bundled files, the license window and this computer's machine code (WARN until a key is saved), which admin password the exe has, MAVLink, serial ports, MGRS, GeoTIFF DEM (GDAL and PROJ), OpenCV,
 the tracker and detector worker processes, FFmpeg, and the Qt WebEngine map page (with the network blocked).
 It writes one line per check.
 FAIL means the build is broken.

@@ -209,15 +209,15 @@ void aDrawnBox()
     check(c.wanted() && !c.kind(), "a drawn box: looks are wanted, what it holds is not known yet");
     const Box drawn{0.5, 0.5, 0.06, 0.25};
     check(c.look({}, drawn, true, drawn, 0.0, kAspect).verdict == Verdict::Nothing, "a look with nothing on it says nothing");
-    check(c.look({found(Kind::Vehicle, 0.55, 0.5, 0.5, 0.05, 0.2), found(Kind::Person, 0.48, 0.5, 0.52, 0.03, 0.22)}, drawn, true,
+    check(c.look({found(Kind::Person, 0.48, 0.5, 0.52, 0.03, 0.22), found(Kind::Vehicle, 0.55, 0.5, 0.5, 0.05, 0.2)}, drawn, true,
                  drawn, 0.0, kAspect)
                   .verdict == Verdict::OnTheBox &&
               c.kind() == Kind::Vehicle && near(c.score(), 0.55),
-          "the surest on it says what it holds, and how sure the finder is of it");
+          "the surest on it (not the first) says what it holds, and how sure the finder is of it");
     check(c.look({}, drawn, true, drawn, 0.0, kAspect).verdict == Verdict::Missed, "from then on it is checked");
 
     c.start();
-    for (int i = 0; i < kAdoptLooks - 1; ++i) {
+    for (int i = 0; i < 2; ++i) {
         c.look({found(Kind::Person, 0.9, 0.9, 0.2, 0.03, 0.2)}, drawn, true, drawn, 0.0, kAspect);
     }
     check(c.wanted(), "nothing on it in two looks: still asked");

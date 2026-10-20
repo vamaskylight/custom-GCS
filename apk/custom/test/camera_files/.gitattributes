@@ -1,0 +1,2 @@
+# Camera files compared byte for byte by the tests (gen_camera_files.py): no line-end changes.
+*.json text eol=lf

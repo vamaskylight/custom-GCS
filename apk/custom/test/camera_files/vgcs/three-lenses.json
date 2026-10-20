@@ -1,0 +1,49 @@
+{
+    "cropStepH": 7,
+    "cropStepW": 10,
+    "dayFovH": 70.0,
+    "dayFovV": 52.5,
+    "dayVideoUrl": "rtsp://192.168.144.108:554/stream=1",
+    "format": "vama-camera-1",
+    "host": "192.168.144.108",
+    "laser": true,
+    "laserMaxM": 1500.0,
+    "lenses": [
+        {
+            "firstStep": 0,
+            "fovH": 70.0,
+            "fovV": 52.5,
+            "lastStep": 40
+        },
+        {
+            "firstStep": 41,
+            "fovH": 30.5,
+            "fovV": 22.9,
+            "lastStep": 120
+        },
+        {
+            "firstStep": 121,
+            "fovH": 8.25,
+            "fovV": 6.2,
+            "lastStep": 200
+        }
+    ],
+    "maxZoom": 30.0,
+    "name": "Three lenses",
+    "ownTracker": true,
+    "photo": true,
+    "pitchMax": 60.0,
+    "pitchMin": -90.0,
+    "port": 5000,
+    "protocol": "skydroid-top",
+    "record": true,
+    "sensorH": 3000,
+    "sensorW": 4000,
+    "thermalFovH": 32.84,
+    "thermalFovSure": true,
+    "thermalFovV": 26.35,
+    "thermalVideoUrl": "rtsp://192.168.144.108:555/stream=2",
+    "upperGimbalHeader": true,
+    "yawLimit": 120.0,
+    "zoom": "reported"
+}

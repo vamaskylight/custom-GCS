@@ -440,6 +440,89 @@ class MainWindowSettingsDialogsMixin:
         skydroid_profile.addItem("C13 Alternate (GAC/GSP/GAP)", "c13_alt")
         skydroid_profile.addItem("C12 Default (AI follow)", "c12_default")
         skydroid_profile.addItem("C14 Pro (dual lens, zoom by step)", "c14pro_default")
+        built_in_profile_items = skydroid_profile.count()
+        # Names for the tests of the camera list.
+        skydroid_profile.setObjectName("skydroidProfile")
+        skydroid_host.setObjectName("skydroidHost")
+        skydroid_port.setObjectName("skydroidPort")
+        rtsp_day.setObjectName("rtspDay")
+        rtsp_th.setObjectName("rtspThermal")
+
+        # Cameras the admin added (task AA): one file each in VGCS's camera folder, the same
+        # files as the APK's. Listed after the built-in profiles.
+        def _fill_added_cameras() -> None:
+            keep = str(skydroid_profile.currentData() or "")
+            while skydroid_profile.count() > built_in_profile_items:
+                skydroid_profile.removeItem(skydroid_profile.count() - 1)
+            try:
+                from vgcs.skydroid.camera_files import CameraStore, profile_id_for
+
+                store = CameraStore()
+                store.load()
+                for cam in store.cameras:
+                    if not cam.built_in:
+                        skydroid_profile.addItem(f"{cam.name} (added camera)", profile_id_for(cam))
+                for note in store.notes:
+                    print(f"[VGCS:cameras] not read: {note}")
+            except Exception as exc:
+                print(f"[VGCS:cameras] the camera folder could not be read: {exc!r}")
+            index = skydroid_profile.findData(keep)
+            if index >= 0:
+                skydroid_profile.setCurrentIndex(index)
+
+        _fill_added_cameras()
+
+        # Choosing an added camera sets its addresses (as the APK's camera list does). They can
+        # still be changed here before Apply. The built-in profiles leave the addresses alone.
+        def _on_skydroid_profile_chosen(index: int) -> None:
+            profile_id = str(skydroid_profile.itemData(index) or "")
+            if not profile_id.startswith("file:"):
+                return
+            try:
+                from vgcs.skydroid.camera_files import load_camera
+
+                cam = load_camera(profile_id[len("file:"):])
+            except Exception:
+                cam = None
+            if cam is None:
+                return
+            skydroid_host.setText(cam.host)
+            skydroid_port.setValue(int(cam.port))
+            rtsp_day.setText(cam.day_video_url)
+            rtsp_th.setText(cam.thermal_video_url)
+
+        skydroid_profile.activated.connect(_on_skydroid_profile_chosen)
+
+        # The camera editor is for the admin: it asks for the admin password first (as the APK's
+        # Advanced Mode). Choosing a camera in the list above stays open to everyone.
+        def _open_camera_editor() -> None:
+            from vgcs.app.admin_password_dialog import ask_admin_password
+            from vgcs.app.camera_editor_dialog import CameraEditorDialog
+
+            if not ask_admin_password(dlg):
+                return
+            editor = CameraEditorDialog(
+                in_use_profile_id=str(skydroid_profile.currentData() or ""),
+                addresses_in_use=lambda: (
+                    skydroid_host.text().strip(),
+                    int(skydroid_port.value()),
+                    rtsp_day.text().strip(),
+                    rtsp_th.text().strip(),
+                ),
+                parent=dlg,
+            )
+            editor.exec()
+            in_use = str(skydroid_profile.currentData() or "")
+            _fill_added_cameras()
+            if in_use.startswith("file:"):
+                index = skydroid_profile.findData(in_use)
+                if index < 0:
+                    # The camera in use was deleted: the V13's profile, as for a missing file.
+                    skydroid_profile.setCurrentIndex(max(0, skydroid_profile.findData("c13_default")))
+                elif in_use[len("file:"):] in editor.saved_ids:
+                    # The camera in use was changed: its addresses as saved.
+                    _on_skydroid_profile_chosen(index)
+
         skydroid_grid.addWidget(QLabel("Host / IP"), 0, 0)
         skydroid_grid.addWidget(skydroid_host, 0, 1)
         skydroid_grid.addWidget(QLabel("UDP port"), 1, 0)
@@ -447,7 +530,15 @@ class MainWindowSettingsDialogsMixin:
         skydroid_grid.addWidget(QLabel("Timeout (ms)"), 2, 0)
         skydroid_grid.addWidget(skydroid_timeout, 2, 1)
         skydroid_grid.addWidget(QLabel("Firmware profile"), 3, 0)
-        skydroid_grid.addWidget(skydroid_profile, 3, 1)
+        skydroid_profile_row = QHBoxLayout()
+        skydroid_profile_row.addWidget(skydroid_profile, 1)
+        skydroid_cameras_btn = QPushButton("Cameras...")
+        skydroid_cameras_btn.setObjectName("skydroidCamerasBtn")
+        skydroid_cameras_btn.setToolTip("Add, change or delete cameras (asks for the admin password)")
+        skydroid_cameras_btn.setAutoDefault(False)
+        skydroid_cameras_btn.clicked.connect(_open_camera_editor)
+        skydroid_profile_row.addWidget(skydroid_cameras_btn)
+        skydroid_grid.addLayout(skydroid_profile_row, 3, 1)
         skydroid_gimbal_speed_yaw = QDoubleSpinBox()
         skydroid_gimbal_speed_yaw.setRange(0.5, 9.9)
         skydroid_gimbal_speed_yaw.setDecimals(1)

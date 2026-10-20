@@ -4,6 +4,7 @@
 # wraps that folder into the single VGCS.exe. Environment variables it sets:
 #   VGCS_FFMPEG_DIR  folder with ffmpeg.exe and ffprobe.exe to bundle (optional)
 #   VGCS_ICON        .ico file for the exe (optional)
+#   VGCS_ADMIN_SECRET_FILE  a customer exe's admin password, its salt and hash (--customer)
 
 import os
 import re
@@ -101,6 +102,21 @@ def ffmpeg_files():
     # FFmpeg is GPL: its license and source notes travel with it.
     datas = [(str(folder / name), "ffmpeg") for name in FFMPEG_DOCS if (folder / name).is_file()]
     return binaries, datas
+
+
+def admin_secret_files():
+    """A customer exe's admin password (its salt and hash, vgcs/app/admin_password.py), else none.
+
+    build_exe.py --customer writes the file for one build. Without it the exe has the test password.
+    """
+    path = os.environ.get("VGCS_ADMIN_SECRET_FILE", "").strip()
+    if not path:
+        print("NOTE: a test exe. The camera editor takes the test admin password.")
+        return []
+    if not Path(path).is_file():
+        raise SystemExit(f"VGCS_ADMIN_SECRET_FILE={path} is not there")
+    print("NOTE: a customer exe. The camera editor takes the team's admin password.")
+    return [(path, ".")]
 
 
 def unneeded_reason(dest):
@@ -211,6 +227,7 @@ datas = [
     *collect_data_files("rasterio"),
     *rasterio_datas,
     *ffmpeg_datas,
+    *admin_secret_files(),
     (build_stamp_file(), "."),
 ]
 
