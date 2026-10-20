@@ -13,7 +13,18 @@ from pathlib import Path
 from urllib.request import Request, build_opener
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QRunnable, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPolygonF,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import QWidget
 
 from vgcs.observe.dooaf_map_symbols import bearing_deg, paint_gun_marker, paint_target_marker
@@ -595,6 +606,19 @@ class NativeTileMapView(QWidget):
         # widget, which knows what the drone answered.
         self._fence_on_drone = False
         self._fence_tag = ""
+        # Areas to stay out of (2026-10-21): {"polygon": [(lat, lon), ...]} or
+        # {"circle": (lat, lon), "radius_m": r}. Red and hatched; solid when the
+        # drone uses these very areas, dashed otherwise.
+        self._nofly: list[dict] = []
+        self._nofly_mode = ""                # "", "polygon" (corners of the area drawn now), "circle"
+        self._nofly_target: int | None = None
+        self._nofly_radius_m = 50.0
+        self._nofly_on_drone = False
+        self._nofly_tag = ""
+        # Moving a corner of the area drawn now, or a circle's centre: (area, corner or -1).
+        self._nofly_drag: tuple[int, int] | None = None
+        self._nofly_drag_press_screen: QPointF | None = None
+        self._nofly_dragging = False
         # Dragging a corner of the fence, while the fence tool is on.
         self._fence_drag_index: int | None = None
         self._fence_drag_press_screen: QPointF | None = None
@@ -891,6 +915,177 @@ class NativeTileMapView(QWidget):
     def fence_draw_mode(self) -> bool:
         return bool(self._fence_draw_mode)
 
+    # --- areas to stay out of ----------------------------------------------------
+
+    def nofly_areas(self) -> list[dict]:
+        """The areas to stay out of on the map, as the link takes them."""
+        out: list[dict] = []
+        for area in self._nofly:
+            if "circle" in area:
+                lat, lon = area["circle"]
+                out.append({"circle": [lat, lon], "radius_m": float(area["radius_m"])})
+            else:
+                out.append({"polygon": [[lat, lon] for lat, lon in area["polygon"]]})
+        return out
+
+    def set_nofly_areas(self, rows) -> None:
+        """Show areas that did not come from clicks here (read from the drone, or a plan file)."""
+        areas: list[dict] = []
+        for row in rows or []:
+            try:
+                if "circle" in row:
+                    areas.append({"circle": (float(row["circle"][0]), float(row["circle"][1])),
+                                  "radius_m": float(row["radius_m"])})
+                else:
+                    areas.append({"polygon": [(float(p[0]), float(p[1])) for p in row["polygon"]]})
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+        self._nofly = areas
+        self._nofly_mode = ""
+        self._nofly_target = None
+        self._nofly_drag = None
+        self._nofly_dragging = False
+        self.update()
+
+    def nofly_mode(self) -> str:
+        return self._nofly_mode
+
+    def start_nofly_polygon(self) -> None:
+        """Clicks add corners to a new area to stay out of from now on."""
+        self._clear_pending_plan_map_taps()
+        self._drop_empty_nofly_target()
+        self._add_wp_mode = False
+        self._fence_draw_mode = False
+        self._nofly.append({"polygon": []})
+        self._nofly_target = len(self._nofly) - 1
+        self._nofly_mode = "polygon"
+        self.set_inspected_point(None, None)
+        self.update()
+
+    def start_nofly_circles(self, radius_m: float | None = None) -> None:
+        """Each click puts a circle to stay out of there, with the radius set."""
+        self._clear_pending_plan_map_taps()
+        self._drop_empty_nofly_target()
+        self._add_wp_mode = False
+        self._fence_draw_mode = False
+        if radius_m is not None:
+            self.set_nofly_radius(radius_m)
+        self._nofly_mode = "circle"
+        self.set_inspected_point(None, None)
+        self.update()
+
+    def set_nofly_radius(self, radius_m: float) -> None:
+        """The radius of the next circle placed."""
+        try:
+            self._nofly_radius_m = max(1.0, float(radius_m))
+        except (TypeError, ValueError):
+            pass
+
+    def stop_nofly_drawing(self) -> None:
+        self._clear_pending_plan_map_taps()
+        self._drop_empty_nofly_target()
+        self._nofly_mode = ""
+        self.update()
+
+    def _drop_empty_nofly_target(self) -> None:
+        """An area started and given no corner is no area."""
+        target = self._nofly_target
+        self._nofly_target = None
+        if target is not None and 0 <= target < len(self._nofly):
+            area = self._nofly[target]
+            if "polygon" in area and not area["polygon"]:
+                self._nofly.pop(target)
+
+    def remove_nofly_area(self, index: int) -> bool:
+        if not 0 <= int(index) < len(self._nofly):
+            return False
+        self._nofly.pop(int(index))
+        if self._nofly_target is not None:
+            if self._nofly_target == int(index):
+                self._nofly_target = None
+                if self._nofly_mode == "polygon":
+                    self._nofly_mode = ""
+            elif self._nofly_target > int(index):
+                self._nofly_target -= 1
+        self.update()
+        return True
+
+    def clear_nofly_areas(self) -> None:
+        self._nofly = []
+        self._nofly_target = None
+        if self._nofly_mode == "polygon":
+            self._nofly_mode = ""
+        self.update()
+
+    def remove_last_nofly_corner(self) -> bool:
+        """Take back the corner added last to the area drawn now. False when there is none."""
+        target = self._nofly_target
+        if target is None or not 0 <= target < len(self._nofly) or not self._nofly[target].get("polygon"):
+            return False
+        self._nofly[target]["polygon"].pop()
+        self.update()
+        return True
+
+    def set_nofly_look(self, on_drone: bool, tag: str = "") -> None:
+        on_drone, tag = bool(on_drone), str(tag or "")
+        if on_drone == self._nofly_on_drone and tag == self._nofly_tag:
+            return
+        self._nofly_on_drone = on_drone
+        self._nofly_tag = tag
+        self.update()
+
+    def _nofly_hit(self, pos: QPointF) -> tuple[int, int] | None:
+        """The corner of the area drawn now, or in circle mode a circle's centre, under the pointer."""
+        vf = self._view_frame()
+        if vf is None or not self._nofly_mode:
+            return None
+        z, fx, fy, w, h = vf
+        if self._nofly_mode == "polygon":
+            target = self._nofly_target
+            if target is None or not 0 <= target < len(self._nofly):
+                return None
+            places = [(target, i, p) for i, p in enumerate(self._nofly[target].get("polygon") or [])]
+        else:
+            places = [(i, -1, area["circle"]) for i, area in enumerate(self._nofly) if "circle" in area]
+        best, best_d2 = None, 14.0 * 14.0 + 1.0
+        for area, corner, (lat, lon) in places:
+            c = self._project(lat, lon, z, fx, fy, w, h)
+            d2 = float(pos.x() - c.x()) ** 2 + float(pos.y() - c.y()) ** 2
+            if d2 < best_d2:
+                best, best_d2 = (area, corner), d2
+        return best
+
+    def _nofly_add_at(self, lat: float, lon: float) -> None:
+        if self._nofly_mode == "polygon":
+            target = self._nofly_target
+            if target is None or not 0 <= target < len(self._nofly):
+                return
+            self._nofly[target]["polygon"].append((lat, lon))
+        elif self._nofly_mode == "circle":
+            self._nofly.append({"circle": (lat, lon), "radius_m": float(self._nofly_radius_m)})
+        else:
+            return
+        self.update()
+        self.user_fence_changed.emit()
+
+    def _nofly_move(self, hit: tuple[int, int], lat: float, lon: float) -> None:
+        area, corner = hit
+        if not 0 <= area < len(self._nofly):
+            return
+        if corner < 0:
+            self._nofly[area]["circle"] = (lat, lon)
+        elif 0 <= corner < len(self._nofly[area].get("polygon") or []):
+            self._nofly[area]["polygon"][corner] = (lat, lon)
+
+    def _nofly_remove_hit(self, hit: tuple[int, int]) -> None:
+        area, corner = hit
+        if corner < 0:
+            self.remove_nofly_area(area)
+        else:
+            self._nofly[area]["polygon"].pop(corner)
+            self.update()
+        self.user_fence_changed.emit()
+
     def disable_plan_edit_modes(self) -> None:
         """Match legacy JS `disablePlanEditModes`: turn off waypoint/fence placement modes.
 
@@ -901,6 +1096,8 @@ class NativeTileMapView(QWidget):
         self._clear_pending_plan_map_taps()
         self._add_wp_mode = False
         self._fence_draw_mode = False
+        self._drop_empty_nofly_target()
+        self._nofly_mode = ""
         self.update()
 
     def _clear_pending_plan_map_taps(self) -> None:
@@ -914,11 +1111,17 @@ class NativeTileMapView(QWidget):
         self._fence_drag_index = None
         self._fence_drag_press_screen = None
         self._fence_dragging = False
+        self._nofly_drag = None
+        self._nofly_drag_press_screen = None
+        self._nofly_dragging = False
 
     def clear_fence_visual(self) -> None:
         self._fence_points.clear()
         self._fence_circle = None
         self._fence_circle_tag = ""
+        self._nofly = []
+        self._nofly_target = None
+        self._nofly_mode = ""
         self.update()
 
     def set_mission_nav_seq(self, seq: int) -> None:
@@ -1259,6 +1462,8 @@ class NativeTileMapView(QWidget):
             self._clear_pending_plan_map_taps()
             self._add_wp_mode = True
             self._fence_draw_mode = False
+            self._drop_empty_nofly_target()
+            self._nofly_mode = ""
             # A leftover coordinate crosshair reads as a placed point once a
             # tool is live.
             self.set_inspected_point(None, None)
@@ -1267,6 +1472,8 @@ class NativeTileMapView(QWidget):
             self._clear_pending_plan_map_taps()
             self._fence_draw_mode = True
             self._add_wp_mode = False
+            self._drop_empty_nofly_target()
+            self._nofly_mode = ""
             # The corners that are there stay: the tool goes on with them.
             # (It used to start from nothing every time, so a fence could not
             # be changed, only drawn again.)
@@ -1476,6 +1683,17 @@ class NativeTileMapView(QWidget):
                 painter.setPen(colour)
                 painter.drawText(QRectF(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, self._fence_tag)
             painter.restore()
+
+        # Areas to stay out of: red and hatched. Solid when the drone uses these
+        # very areas, dashed for a drawing. Each is named "No-fly 1", "No-fly 2"...
+        if self._nofly:
+            painter.save()
+            try:
+                self._paint_nofly(painter, z, fx, fy, w, h)
+            except Exception:
+                pass
+            finally:
+                painter.restore()
 
         # Waypoint markers. The waypoint the vehicle is currently flying to (reported via
         # MISSION_CURRENT and translated to a plan index by MissionPlan) is drawn larger
@@ -1903,6 +2121,64 @@ class NativeTileMapView(QWidget):
             self.update()
             self.user_waypoints_changed.emit()
 
+    def _paint_nofly(self, painter: QPainter, z, fx, fy, w, h) -> None:
+        on_drone = bool(self._nofly_on_drone)
+        colour = QColor(240, 70, 70, 240)
+        pen = QPen(colour)
+        pen.setWidth(3 if on_drone else 2)
+        if not on_drone:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        tint = QBrush(QColor(240, 70, 70, 45))
+        hatch = QBrush(QColor(240, 70, 70, 110), Qt.BrushStyle.BDiagPattern)
+        painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        metrics = painter.fontMetrics()
+        for number, area in enumerate(self._nofly, start=1):
+            if "circle" in area:
+                lat, lon = area["circle"]
+                ring = [self._project(la, lo, z, fx, fy, w, h)
+                        for la, lo in _circle_ring_points(lat, lon, float(area["radius_m"]), segments=64)]
+                corners: list[QPointF] = []
+                centre = self._project(lat, lon, z, fx, fy, w, h)
+            else:
+                ring = [self._project(a, b, z, fx, fy, w, h) for a, b in area.get("polygon") or []]
+                corners = list(ring)
+                centre = None
+            if not ring:
+                continue
+            painter.setPen(pen)
+            if len(ring) >= 3:
+                shape = QPolygonF(ring)
+                painter.setBrush(tint)
+                painter.drawPolygon(shape)
+                painter.setBrush(hatch)
+                painter.drawPolygon(shape)
+            else:
+                for i in range(1, len(ring)):
+                    painter.drawLine(ring[i - 1], ring[i])
+            editing = self._nofly_mode == "polygon" and self._nofly_target == number - 1
+            for i, pt in enumerate(corners):
+                painter.setPen(QPen(colour, 2))
+                painter.setBrush(QColor(20, 24, 30, 235))
+                painter.drawRect(QRectF(pt.x() - 5.0, pt.y() - 5.0, 10.0, 10.0))
+                if editing:
+                    label = QRectF(pt.x() + 8.0, pt.y() - 17.0, 30.0, 15.0)
+                    painter.fillRect(label, QColor(0, 0, 0, 170))
+                    painter.setPen(QColor(255, 255, 255))
+                    painter.drawText(label, Qt.AlignmentFlag.AlignCenter, str(i + 1))
+            if centre is not None and self._nofly_mode == "circle":
+                painter.setPen(QPen(colour, 2))
+                painter.drawLine(QPointF(centre.x() - 6.0, centre.y() - 6.0), QPointF(centre.x() + 6.0, centre.y() + 6.0))
+                painter.drawLine(QPointF(centre.x() - 6.0, centre.y() + 6.0), QPointF(centre.x() + 6.0, centre.y() - 6.0))
+            words = f"No-fly {number}" + (f": {self._nofly_tag}" if self._nofly_tag else "")
+            top = min(ring, key=lambda p: p.y())
+            tw = metrics.horizontalAdvance(words) + 10
+            th = metrics.height() + 4
+            tx = max(4.0, min(float(top.x()) - tw / 2.0, float(w) - tw - 4.0))
+            ty = max(4.0, float(top.y()) - th - (24.0 if editing else 10.0))
+            painter.fillRect(QRectF(tx, ty, tw, th), QColor(0, 0, 0, 215))
+            painter.setPen(colour)
+            painter.drawText(QRectF(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, words)
+
     def _fence_hit_index(self, pos: QPointF) -> int | None:
         """The fence corner under the pointer, or None."""
         vf = self._view_frame()
@@ -2279,7 +2555,7 @@ class NativeTileMapView(QWidget):
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
         # Not while the fence tool is on: a second click near a waypoint is
         # then about the fence, and must not delete the waypoint under it.
-        if event.button() == Qt.MouseButton.LeftButton and not self._fence_draw_mode:
+        if event.button() == Qt.MouseButton.LeftButton and not self._fence_draw_mode and not self._nofly_mode:
             idx = self._waypoint_hit_index(QPointF(event.position()))
             if idx is not None:
                 self._remove_waypoint_index(idx)
@@ -2291,6 +2567,14 @@ class NativeTileMapView(QWidget):
         pos = QPointF(event.position())
         if event.button() == Qt.MouseButton.RightButton:
             self._clear_pending_plan_map_taps()
+            if self._nofly_mode:
+                # The no-fly tool is on: a right-click removes a corner of the
+                # area drawn now, or a circle, and never a waypoint.
+                hit = self._nofly_hit(pos)
+                if hit is not None:
+                    self._nofly_remove_hit(hit)
+                event.accept()
+                return
             if self._fence_draw_mode:
                 # The fence tool is on: a right-click is about the fence, and
                 # never deletes a waypoint that lies under a corner.
@@ -2330,6 +2614,20 @@ class NativeTileMapView(QWidget):
                     self._add_wp_press_candidate = True
                     self._add_wp_press_geo = (lat, lon)
                     self._add_wp_press_screen = QPointF(pos)
+                    super().mousePressEvent(event)
+                    return
+                if self._nofly_mode:
+                    hit = self._nofly_hit(pos)
+                    if hit is not None:
+                        # A press on a corner (or a circle's centre) moves it.
+                        self._nofly_drag = hit
+                        self._nofly_drag_press_screen = QPointF(pos)
+                        self._nofly_dragging = False
+                        super().mousePressEvent(event)
+                        return
+                    self._fence_press_candidate = True
+                    self._fence_press_geo = (lat, lon)
+                    self._fence_press_screen = QPointF(pos)
                     super().mousePressEvent(event)
                     return
                 if self._fence_draw_mode:
@@ -2376,6 +2674,17 @@ class NativeTileMapView(QWidget):
                     self._move_waypoint_index(self._wp_drag_index, latlon[0], latlon[1])
             # Never pan while a point is being moved: the map sliding under the
             # cursor would drag the waypoint away from where it is being put.
+            super().mouseMoveEvent(event)
+            return
+        if self._nofly_drag is not None and self._nofly_drag_press_screen is not None:
+            if not self._nofly_dragging and (cur - self._nofly_drag_press_screen).manhattanLength() > _WP_DRAG_SLOP_PX:
+                self._nofly_dragging = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self._nofly_dragging:
+                latlon = self._screen_to_lat_lon(cur)
+                if latlon is not None:
+                    self._nofly_move(self._nofly_drag, float(latlon[0]), float(latlon[1]))
+                    self.update()
             super().mouseMoveEvent(event)
             return
         if self._fence_drag_index is not None and self._fence_drag_press_screen is not None:
@@ -2447,6 +2756,19 @@ class NativeTileMapView(QWidget):
                     self.waypoint_picked.emit(picked)
                 event.accept()
                 return
+            if self._nofly_drag is not None:
+                moved = self._nofly_dragging
+                self._nofly_drag = None
+                self._nofly_drag_press_screen = None
+                self._nofly_dragging = False
+                self.unsetCursor()
+                self._dragging = False
+                self._drag_last = None
+                if moved:
+                    self.update()
+                    self.user_fence_changed.emit()
+                event.accept()
+                return
             if self._fence_drag_index is not None:
                 moved = self._fence_dragging
                 self._fence_drag_index = None
@@ -2487,6 +2809,8 @@ class NativeTileMapView(QWidget):
                 self._fence_points.append((lat, lon))
                 self.update()
                 self.user_fence_changed.emit()
+            elif self._fence_press_candidate and self._fence_press_geo is not None and self._nofly_mode:
+                self._nofly_add_at(*self._fence_press_geo)
             self._fence_press_candidate = False
             self._fence_press_geo = None
             self._fence_press_screen = None
@@ -2497,6 +2821,7 @@ class NativeTileMapView(QWidget):
                 and self._press_for_obs is not None
                 and not self._add_wp_mode
                 and not self._fence_draw_mode
+                and not self._nofly_mode
             ):
                 latlon = self._screen_to_lat_lon(self._press_for_obs)
                 if latlon is not None:
@@ -2520,7 +2845,7 @@ class NativeTileMapView(QWidget):
         if press is None:
             return
         # Any active tool owns the click; this is only for a bare map.
-        if self._obs_mark_mode or self._add_wp_mode or self._fence_draw_mode:
+        if self._obs_mark_mode or self._add_wp_mode or self._fence_draw_mode or self._nofly_mode:
             return
         try:
             rel = QPointF(event.position())

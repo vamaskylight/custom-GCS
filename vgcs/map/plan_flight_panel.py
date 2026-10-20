@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -35,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from vgcs.mission import clamp_hover_seconds
-from vgcs.mission.fence import NO_POLYGON_WORDS
+from vgcs.mission.fence import NO_NOFLY_WORDS, NO_POLYGON_WORDS
 from vgcs.mission.long_range_safety import (
     FLIGHT_TIME_SETTING,
     PLANNING_WIND_SETTING,
@@ -1346,6 +1347,8 @@ class PlanFlightPanel(QWidget):
         # Its button used to be on the hidden dashboard only.
         bv.addWidget(self._circle_fence_section())
         bv.addWidget(self._polygon_fence_section())
+        # Areas to stay out of (2026-10-21): they go with either fence.
+        bv.addWidget(self._nofly_section())
         bv.addWidget(self._fence_on_drone_section())
 
         bv.addStretch(1)
@@ -1435,7 +1438,8 @@ class PlanFlightPanel(QWidget):
         g.addWidget(self._fence_radius_spin, 1, 1)
         upload = self._geo_button(
             "Upload circle fence", "planFenceUpload",
-            "Send this fence to the drone on screen and switch it on. It takes the place of a polygon fence.")
+            "Send this fence to the drone on screen and switch it on, with the areas to stay out of below. "
+            "It takes the place of a polygon fence.")
         upload.clicked.connect(lambda: self.action_requested.emit("fence_upload_circle"))
         g.addWidget(upload, 2, 0, 1, 2)
         return host
@@ -1471,11 +1475,113 @@ class PlanFlightPanel(QWidget):
         self._fence_polygon_upload_btn = self._geo_button(
             "Upload polygon fence", "planFencePolygonUpload",
             "Send this polygon to the drone on screen and switch it on, with the max height and the "
-            "action above. It takes the place of the circle fence.")
+            "action above, and the areas to stay out of below. It takes the place of the circle fence.")
         self._fence_polygon_upload_btn.clicked.connect(lambda: self.action_requested.emit("fence_upload_polygon"))
         g.addWidget(self._fence_polygon_upload_btn, 4, 0, 1, 2)
         self.set_fence_polygon_state(NO_POLYGON_WORDS, can_upload=False, corners=0)
         return host
+
+    def _nofly_section(self) -> QWidget:
+        host = QWidget()
+        g = QGridLayout(host)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        title = QLabel("Areas to stay out of")
+        title.setProperty("class", "planGeoTitle")
+        g.addWidget(title, 0, 0, 1, 2)
+        self._nofly_area_btn = self._geo_button(
+            "Draw a no-fly area", "planNoFlyDraw",
+            "Click the map at each corner of an area the drone must not enter, in order around it. Drag a "
+            "corner to move it, right-click a corner to remove it. Press again when the area is done.")
+        self._nofly_area_btn.setCheckable(True)
+        self._nofly_area_btn.clicked.connect(
+            lambda on=False: self.action_requested.emit("nofly_draw_on" if on else "nofly_draw_off"))
+        g.addWidget(self._nofly_area_btn, 1, 0, 1, 2)
+        self._nofly_circle_btn = self._geo_button(
+            "Add no-fly circles", "planNoFlyCircles",
+            "Each click on the map puts a circle the drone must not enter there, with the radius below. Drag a "
+            "centre to move its circle, right-click a centre to remove it. Press again when done.")
+        self._nofly_circle_btn.setCheckable(True)
+        self._nofly_circle_btn.clicked.connect(
+            lambda on=False: self.action_requested.emit("nofly_circle_on" if on else "nofly_circle_off"))
+        g.addWidget(self._nofly_circle_btn, 2, 0, 1, 2)
+        g.addWidget(self._field_label("Circle radius (m)"), 3, 0)
+        self._nofly_radius_spin = QDoubleSpinBox()
+        self._nofly_radius_spin.setObjectName("planNoFlyRadius")
+        self._nofly_radius_spin.setProperty("class", "planPatternSpin")
+        self._nofly_radius_spin.setRange(5.0, 20000.0)
+        self._nofly_radius_spin.setDecimals(0)
+        self._nofly_radius_spin.setSingleStep(10.0)
+        self._nofly_radius_spin.setValue(50.0)
+        self._nofly_radius_spin.setSuffix(" m")
+        self._nofly_radius_spin.setToolTip("The radius of the next circle placed on the map.")
+        self._nofly_radius_spin.valueChanged.connect(lambda _v: self.action_requested.emit("nofly_radius"))
+        g.addWidget(self._nofly_radius_spin, 3, 1)
+        self._nofly_list = QListWidget()
+        self._nofly_list.setObjectName("planNoFlyList")
+        self._nofly_list.setMaximumHeight(96)
+        self._nofly_list.setToolTip("The areas on the map, by their number there.")
+        self._nofly_list.currentRowChanged.connect(lambda _r: self._show_nofly_buttons())
+        g.addWidget(self._nofly_list, 4, 0, 1, 2)
+        self._nofly_undo_btn = self._geo_button("Remove last corner", "planNoFlyUndo",
+                                                "Take back the corner added last to the area drawn now.")
+        self._nofly_undo_btn.clicked.connect(lambda: self.action_requested.emit("nofly_undo"))
+        self._nofly_remove_btn = self._geo_button("Remove chosen", "planNoFlyRemove",
+                                                  "Remove the area chosen in the list from the map.")
+        self._nofly_remove_btn.clicked.connect(lambda: self.action_requested.emit("nofly_remove"))
+        g.addWidget(self._nofly_undo_btn, 5, 0)
+        g.addWidget(self._nofly_remove_btn, 5, 1)
+        self._nofly_clear_btn = self._geo_button(
+            "Remove all", "planNoFlyClear",
+            "Remove every area to stay out of from the map. The fence on the drone stays as it is.")
+        self._nofly_clear_btn.clicked.connect(lambda: self.action_requested.emit("nofly_clear"))
+        g.addWidget(self._nofly_clear_btn, 6, 0, 1, 2)
+        self._nofly_status = self._geo_note("")
+        self._nofly_status.setObjectName("planNoFlyStatus")
+        g.addWidget(self._nofly_status, 7, 0, 1, 2)
+        self._nofly_mode = ""
+        self._nofly_corners = 0
+        self.set_nofly_state(NO_NOFLY_WORDS, [], mode="", corners=0)
+        return host
+
+    def nofly_radius_m(self) -> float:
+        return float(self._nofly_radius_spin.value())
+
+    def selected_nofly_index(self) -> int | None:
+        row = self._nofly_list.currentRow()
+        return row if 0 <= row < self._nofly_list.count() else None
+
+    def set_nofly_state(self, text: str, rows: list[str], *, mode: str, corners: int) -> None:
+        """What the map holds of areas to stay out of, and which drawing tool is on. Emits nothing."""
+        self._nofly_status.setText(str(text or ""))
+        wanted = [str(r) for r in rows or []]
+        shown = [self._nofly_list.item(i).text() for i in range(self._nofly_list.count())]
+        if wanted != shown:
+            row = self._nofly_list.currentRow()
+            self._nofly_list.blockSignals(True)
+            self._nofly_list.clear()
+            self._nofly_list.addItems(wanted)
+            if wanted:
+                self._nofly_list.setCurrentRow(min(max(row, 0), len(wanted) - 1) if row >= 0 else -1)
+            self._nofly_list.blockSignals(False)
+        self._nofly_mode, self._nofly_corners = str(mode or ""), int(corners)
+        for btn, on, words in ((self._nofly_area_btn, self._nofly_mode == "polygon",
+                                ("Drawing: click its corners", "Draw a no-fly area")),
+                               (self._nofly_circle_btn, self._nofly_mode == "circle",
+                                ("Placing: click the map", "Add no-fly circles"))):
+            if btn.isChecked() != on:
+                btn.blockSignals(True)
+                btn.setChecked(on)
+                btn.blockSignals(False)
+            btn.setText(words[0] if on else words[1])
+        self._show_nofly_buttons()
+
+    def _show_nofly_buttons(self) -> None:
+        has = self._nofly_list.count() > 0
+        self._nofly_undo_btn.setEnabled(self._nofly_mode == "polygon" and self._nofly_corners > 0)
+        self._nofly_remove_btn.setEnabled(has and self.selected_nofly_index() is not None)
+        self._nofly_clear_btn.setEnabled(has)
 
     def _fence_on_drone_section(self) -> QWidget:
         host = QWidget()

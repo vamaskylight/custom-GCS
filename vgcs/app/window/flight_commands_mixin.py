@@ -405,9 +405,26 @@ class MainWindowFlightCommandsMixin:
             "alt_max_m": float(self._geofence_alt_max_spin.value()),
             "action": float(self._geofence_action_combo.currentData()),
         }
+        # The areas to stay out of on the map go with the circle (2026-10-21).
+        try:
+            nofly = list(self._map_widget.fence_nofly())
+        except Exception:
+            nofly = []
+        if nofly:
+            from vgcs.mission.fence import check_nofly
+
+            areas, problem = check_nofly(nofly)
+            if problem:
+                self._map_widget.set_plan_fence_result(False, f"{problem} Not sent.")
+                return
+            cfg["nofly"] = nofly
+            self._map_widget.set_plan_fence_result(
+                None, f"Sending the circle and {len(areas)} area{'' if len(areas) == 1 else 's'} to stay out of "
+                      "to the drone, and reading them back...")
         self._thread.queue_geofence_upload(cfg)
         self._append_log(
             f"Fence upload queued: r={cfg['radius_m']:.0f}m alt={cfg['alt_max_m']:.0f}m action={int(cfg['action'])}"
+            + (f" with {len(nofly)} area(s) to stay out of" if nofly else "")
         )
 
     def _upload_fence_from_plan_panel(self) -> None:
@@ -450,19 +467,22 @@ class MainWindowFlightCommandsMixin:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before fence upload.")
             return
-        from vgcs.mission.fence import check_polygon
+        from vgcs.mission.fence import check_nofly, check_polygon
 
         cfg = self._map_widget.plan_polygon_fence_cfg()
         corners, problem = check_polygon(cfg["points"])
+        if not problem:
+            areas, problem = check_nofly(cfg.get("nofly") or [])
         if problem:
             # Said here, without a round trip. (The link says the same if asked.)
             self._map_widget.set_plan_fence_result(False, f"{problem} Not sent.")
             return
         self._thread.queue_geofence_upload(cfg)
+        also = (f" and {len(areas)} area{'' if len(areas) == 1 else 's'} to stay out of" if areas else "")
         self._map_widget.set_plan_fence_result(
-            None, f"Sending a polygon of {len(corners)} corners to the drone, and reading it back...")
+            None, f"Sending a polygon of {len(corners)} corners{also} to the drone, and reading it back...")
         self._append_log(
-            f"Polygon fence upload queued: {len(corners)} corners alt={cfg['alt_max_m']:.0f}m "
+            f"Polygon fence upload queued: {len(corners)} corners{also} alt={cfg['alt_max_m']:.0f}m "
             f"action={int(cfg['action'])}"
         )
 
@@ -474,7 +494,7 @@ class MainWindowFlightCommandsMixin:
             answer = QMessageBox.question(
                 self,
                 "Read fence from drone",
-                "The polygon on the map is not on the drone.\n\n"
+                "The fence drawn on the map is not on the drone.\n\n"
                 "If the drone holds a polygon, it takes the place of the one on the map. Read it?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
@@ -513,21 +533,26 @@ class MainWindowFlightCommandsMixin:
         self._map_widget.set_plan_fence_result(None, "Not sent yet: VGCS asks first.")
         answer = QMessageBox.question(
             self,
-            "Polygon fence",
+            "Fence",
             text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
             self._map_widget.set_plan_fence_result(False, "Not sent: the fence on the drone is unchanged.")
-            self._append_log("Polygon fence: not sent (the operator answered no)")
+            self._append_log("Fence: not sent (the operator answered no)")
             return
         if self._thread is None or not self._thread.isRunning():
             self._map_widget.set_plan_fence_result(False, "Not sent: the link is gone.")
             return
         self._thread.queue_geofence_upload(dict(cfg))
-        self._map_widget.set_plan_fence_result(None, "Sending the polygon to the drone, and reading it back...")
-        self._append_log("Polygon fence upload queued again (the operator answered yes)")
+        # The question can come for the circle too, when it goes with areas to stay out of.
+        if cfg.get("points"):
+            sending = "Sending the polygon to the drone, and reading it back..."
+        else:
+            sending = "Sending the circle and the areas to stay out of to the drone, and reading them back..."
+        self._map_widget.set_plan_fence_result(None, sending)
+        self._append_log("Fence upload queued again (the operator answered yes)")
 
     def _on_map_geofence_requested(self, cfg: object) -> None:
         if self._thread is None or not self._thread.isRunning():

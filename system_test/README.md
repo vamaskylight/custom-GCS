@@ -32,7 +32,7 @@ The same set-up as the wind failsafe tests, see [drone/README.md](../drone/READM
 From the repo root:
 
 ```powershell
-py system_test/vgcs_sitl_test.py                      # 16 cases on 4.6.2 and 4.7.0, about 12 minutes
+py system_test/vgcs_sitl_test.py                      # 17 cases on 4.6.2 and 4.7.0, about 12 minutes
 py system_test/vgcs_sitl_test.py 4.7.0 -k mission     # one version, only cases with "mission" in the name
 py system_test/vgcs_sitl_test.py --report results.md  # also write the results as Markdown
 
@@ -85,7 +85,8 @@ The simulated clock runs 10 times faster than real time.
 | missions_as_they_come_back | a Download shows VGCS's own mission with its payload releases, and another station's mission with what a plan cannot hold named |
 | another_stations_mission | another station replaces the mission with one of the same size and VGCS is told nothing: "start it as it is" starts nothing, Fly to WP sends no jump, Resume sends no speed, and in flight the drone's own word drops the plan. VGCS's own upload in flight is not taken for another station's |
 | takeoff_fence_and_land | a 40 m fence with a 30 m height limit: the drone turns back at both, VGCS shows RTL and the drone's message, landing from VGCS |
-| polygon_fence | a polygon fence: the drone holds its corners to the last digit (read on the checking connection), it turns back at the edge and at the height limit, a fence that does not hold the flying drone is not sent, a larger one is taken in flight, Read fence from drone, another station's areas named and asked about, the circle fence in its place |
+| polygon_fence | a polygon fence: the drone holds its corners to the last digit (read on the checking connection), it turns back at the edge and at the height limit, a fence that does not hold the flying drone is not sent, a larger one is taken in flight, Read fence from drone, another station's area to stay out of shown and its circle named, both asked about, the circle fence in its place |
+| nofly_areas | areas to stay out of (a square and a circle) sent with the polygon: the drone holds them to the last digit, it turns back at the edge of each, a circle over the flying drone is not sent, Read fence from drone shows both, and with the circle around home they become the drone's only items with FENCE_TYPE 7 |
 | link_silence | the radio goes quiet in flight (the simulator is frozen), VGCS reports it within its 2 second watchdog, and recovers by itself |
 | signed_commands | VGCS gives the drone its signing key: an outsider ground station (third port) can no longer change the mode, arm, or remove the key, VGCS still can, and after the key is removed the outsider is obeyed again |
 | vama_lock_with_vgcs | The VAMA lock script (`drone/scripts/vama_lock.lua`) on the drone: VGCS puts its key on it, turns the lock on, and its signed heartbeat unlocks the drone, so VGCS can arm it. When VGCS goes away the drone is locked again and the sticks do not arm it |
@@ -154,6 +155,10 @@ It checks the acceptance test of client requirement 14:
 - The reason for a fence the drone does not take ("Invalid vertex count (2)") comes in a STATUSTEXT after the MISSION_ACK.
 - A fence that does not hold a flying drone makes it turn back (4.6.2) or land (4.7.0) at once.
   The polygon case checks that VGCS refuses to send one, and never sends one itself in flight.
+- An area to stay out of (5002, 5004) is stored exactly, and a fence of only such areas arms.
+  The drone does not arm inside one ("Vehicle breaching Polygon fence"), and in flight it turns back at its edge ("Polygon fence breached").
+  In AUTO at 10 m/s it was 21 m inside before it turned.
+  The circle around home and the items are on together with FENCE_TYPE 7.
 - The window test reads the checking connection in its own thread.
-- The window test's timing checks need a quiet PC. On 2026-10-14 another program used 10 of the PC's cores, every handler ran twice as slow, and the two timing checks failed (the worst late tick 257 ms).
   A second exchange on it (a mission sent "as another station") has to be driven by the messages that thread reads, like `MissionReader` and `MissionSender`, not by a blocking wait.
+- The window test's timing checks need a quiet PC. On 2026-10-14 another program used 10 of the PC's cores, every handler ran twice as slow, and the two timing checks failed (the worst late tick 257 ms).

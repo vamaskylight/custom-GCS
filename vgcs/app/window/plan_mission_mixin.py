@@ -268,6 +268,7 @@ class MainWindowPlanMissionMixin:
                 dem_elevation_fn=self._plan_dem_elevation_fn(),
                 endurance_min=self._plan_endurance_min(),
                 fence_polygon=self._plan_fence_polygon(),
+                fence_nofly=self._plan_fence_nofly(),
                 end_action=self._plan_end_action(),
                 headwind_mps=wind_mps,
                 wind_from=wind_from,
@@ -308,6 +309,13 @@ class MainWindowPlanMissionMixin:
 
     # Each of these is asked for on its own, as the polygon is: a fault in one
     # leaves that figure out, and the other checks still run.
+
+    def _plan_fence_nofly(self):
+        """The areas to stay out of the drone on screen holds (2026-10-21). None when VGCS does not know."""
+        try:
+            return self._map_widget.fence_nofly_on_drone()
+        except Exception:
+            return None
 
     def _plan_end_action(self) -> str:
         """What the plan does after its last waypoint (hold, rtl or land)."""
@@ -1183,6 +1191,20 @@ class MainWindowPlanMissionMixin:
             return
         if a == "fence_upload_polygon":
             self._upload_polygon_fence_from_plan_panel()
+            return
+        # Areas to stay out of (2026-10-21).
+        nofly = {
+            "nofly_draw_on": "start_nofly_area",
+            "nofly_draw_off": "stop_nofly_drawing",
+            "nofly_circle_on": "start_nofly_circles",
+            "nofly_circle_off": "stop_nofly_drawing",
+            "nofly_radius": "set_nofly_radius_from_panel",
+            "nofly_undo": "remove_last_nofly_corner",
+            "nofly_remove": "remove_selected_nofly_area",
+            "nofly_clear": "clear_nofly_areas",
+        }.get(a)
+        if nofly is not None:
+            getattr(self._map_widget, nofly)()
             return
         if a == "fence_download":
             self._read_fence_from_plan_panel()

@@ -45,21 +45,27 @@ def save_waypoints_json(
     *,
     end_action: str | None = None,
     fence_polygon: list[tuple[float, float]] | None = None,
+    fence_nofly: list[dict] | None = None,
 ) -> None:
     """Write the plan file. ``end_action`` (hold/rtl/land) is stored when given, and so is the
-    polygon fence drawn on the map (``fence_polygon``: its corners in order).
+    polygon fence drawn on the map (``fence_polygon``: its corners in order) and its areas to
+    stay out of (``fence_nofly``: {"polygon": [...]} or {"circle": [lat, lon], "radius_m": r}).
 
-    Version 4 added the fence. Readers of older versions ignore it.
+    Version 4 added the fence, version 5 the areas to stay out of. Readers of older
+    versions ignore what they do not know.
     """
     payload: dict[str, object] = {
-        "version": 4,
+        "version": 5,
         "waypoints": [asdict(wp) for wp in waypoints],
     }
     if end_action:
         payload["end_action"] = str(end_action)
     corners = [[float(lat), float(lon)] for lat, lon in (fence_polygon or [])]
-    if corners:
+    nofly = [dict(row) for row in (fence_nofly or []) if isinstance(row, dict)]
+    if corners or nofly:
         payload["fence"] = {"polygon": corners}
+        if nofly:
+            payload["fence"]["nofly"] = nofly
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -130,6 +136,27 @@ def load_fence_polygon(path: str | Path) -> list[tuple[float, float]] | None:
             raise ValueError(f"fence corner {n} is not a latitude and longitude")
         corners.append((lat, lon))
     return corners
+
+
+def load_fence_nofly(path: str | Path) -> list[dict] | None:
+    """The areas to stay out of stored with a plan file (version 5), as the map takes them.
+
+    None when the file holds none. Raises ValueError, naming the area, when one
+    cannot be read.
+    """
+    from vgcs.mission.fence import check_nofly
+
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    fence = raw.get("fence") if isinstance(raw, dict) else None
+    rows = fence.get("nofly") if isinstance(fence, dict) else None
+    if rows is None:
+        return None
+    if not isinstance(rows, list):
+        raise ValueError("its areas to stay out of are not a list")
+    areas, problem = check_nofly(rows)
+    if problem:
+        raise ValueError(problem[:1].lower() + problem[1:].rstrip("."))
+    return [area.row() for area in areas]
 
 
 def load_mission_end_action(path: str | Path) -> str | None:

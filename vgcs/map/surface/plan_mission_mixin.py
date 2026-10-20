@@ -18,6 +18,7 @@ from vgcs.mission import (
     DEFAULT_MISSION_END_ACTION,
     Waypoint,
     clamp_hover_seconds,
+    load_fence_nofly,
     load_fence_polygon,
     load_mission_end_action,
     load_waypoints_json,
@@ -562,10 +563,11 @@ class PlanMissionMixin:
             )
             if not path:
                 return
-        # The polygon fence drawn on the map goes into the plan file too.
+        # The polygon fence drawn on the map goes into the plan file too, with its areas to stay out of.
         fence = self.fence_polygon()
         try:
-            save_waypoints_json(path, wps, end_action=self.get_mission_end_action(), fence_polygon=fence)
+            save_waypoints_json(path, wps, end_action=self.get_mission_end_action(), fence_polygon=fence,
+                                fence_nofly=self.fence_nofly())
         except Exception:
             self._set_status("Save failed")
             QMessageBox.warning(self, "Plan Flight", "Could not save the mission file.")
@@ -575,6 +577,9 @@ class PlanMissionMixin:
             settings.remove(_KEY_PLAN_LAST_MISSION_JSON_LEGACY)
         self._set_status(f"Current mission saved ({len(wps)} WPs)")
         with_fence = f" and the polygon fence ({len(fence)} corners)" if fence else ""
+        nofly = self.fence_nofly()
+        if nofly:
+            with_fence += f" and {len(nofly)} area{'' if len(nofly) == 1 else 's'} to stay out of"
         QMessageBox.information(
             self,
             "Plan saved",
@@ -657,9 +662,10 @@ class PlanMissionMixin:
             return
         try:
             fence = load_fence_polygon(path)
+            nofly = load_fence_nofly(path)
             fence_problem = ""
         except Exception as exc:
-            fence, fence_problem = None, str(exc)
+            fence, nofly, fence_problem = None, None, str(exc)
         stored_end = load_mission_end_action(path)
         if stored_end:
             self.set_mission_end_action(stored_end)
@@ -686,8 +692,11 @@ class PlanMissionMixin:
             nm = getattr(self, "_native_map", None)
             if nm is not None:
                 nm.set_fence_points([[lat, lon] for lat, lon in fence])
+                nm.set_nofly_areas(nofly or [])
             self._refresh_fence_view()
             fence_words = f" and the polygon fence ({len(fence)} corners)" if fence else ""
+            if nofly:
+                fence_words += f" and {len(nofly)} area{'' if len(nofly) == 1 else 's'} to stay out of"
         said = f"Plan opened: {len(waypoints)} waypoint(s){fence_words}."
         if fence_problem:
             said += f" Its fence was not read: {fence_problem}."

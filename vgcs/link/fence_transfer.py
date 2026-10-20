@@ -309,10 +309,11 @@ class FenceJob:
     """
 
     def __init__(self, kind: str, cfg: dict, now: float) -> None:
-        self.kind = str(kind)              # "polygon", "circle", "read"
+        self.kind = str(kind)              # "polygon", "circle", "circle_items" (with areas to stay out of), "read"
         self.cfg = dict(cfg)
         self.started = float(now)
         self.corners: list = []
+        self.nofly: list = []              # the areas to stay out of (vgcs.mission.fence.NoFly)
         self.items: list = []
         self.radius_m = 0.0
         self.alt_max_m = 0.0

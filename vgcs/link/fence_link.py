@@ -21,6 +21,12 @@ before the next:
 
 Only then VGCS says that the fence is on. Nothing here waits for the drone:
 the link's loop feeds in what it hears (see fence_transfer.py).
+
+Areas to stay out of (2026-10-21) go with either fence as fence items of their
+own: with the polygon, or with the circle around home (then the circle and the
+items are both on, FENCE_TYPE 7). The drone has to be 5 m or more outside each
+of them, as it has to be inside the polygon, and in flight its home point too.
+A circle without such areas is only settings, as before.
 """
 
 from __future__ import annotations
@@ -42,15 +48,19 @@ from vgcs.mission.fence import (
     TYPE_CIRCLE,
     TYPE_POLYGON,
     action_words,
+    check_nofly,
     check_polygon,
     distance_inside_m,
     distance_m,
+    fence_items,
     item_from_row,
     kinds_words,
+    nofly_from_rows,
+    nofly_outside_m,
     outside_words,
-    polygon_items,
     read_fence,
     same_items,
+    same_nofly,
 )
 
 MISSION_TYPE_FENCE = 1
@@ -176,7 +186,11 @@ class FenceLinkMixin:
         if cfg.get("points") is not None:
             # A polygon was asked for. One that cannot be sent is said so: it
             # is never replaced by a circle the operator did not ask for.
-            self._polygon_fence_start(cfg)
+            self._items_fence_start(cfg, "polygon")
+            return
+        if cfg.get("nofly"):
+            # The circle around home, with areas to stay out of: they are items.
+            self._items_fence_start(cfg, "circle_items")
             return
         self._circle_fence_start(cfg)
 
@@ -197,7 +211,7 @@ class FenceLinkMixin:
 
     @staticmethod
     def _mavlink1_words() -> str:
-        return ("This link speaks MAVLink 1, which cannot carry a polygon fence. "
+        return ("This link speaks MAVLink 1, which cannot carry a polygon fence or areas to stay out of. "
                 "Set the drone's telemetry port to MAVLink 2 (SERIALx_PROTOCOL 2).")
 
     # --- the circle fence around home -----------------------------------------
@@ -259,11 +273,18 @@ class FenceLinkMixin:
 
     # --- the polygon fence ----------------------------------------------------
 
-    def _polygon_fence_start(self, cfg: dict) -> None:
+    def _items_fence_start(self, cfg: dict, kind: str) -> None:
+        """A fence of items: the polygon ("polygon") or the circle ("circle_items"), with areas to stay out of."""
         if self._fence_job_open():
             self._fence_refuse("Another fence request is still running. Try again in a moment.")
             return
-        corners, problem = check_polygon(cfg.get("points"))
+        corners: list = []
+        if kind == "polygon":
+            corners, problem = check_polygon(cfg.get("points"))
+            if problem:
+                self._fence_refuse(f"{problem} Not sent.")
+                return
+        nofly, problem = check_nofly(cfg.get("nofly") or [])
         if problem:
             self._fence_refuse(f"{problem} Not sent.")
             return
@@ -272,10 +293,13 @@ class FenceLinkMixin:
             return
         alt_max_m = max(5.0, float(cfg.get("alt_max_m", 120.0)))
         action = float(cfg.get("action", 1.0))
-        job = FenceJob("polygon", cfg, time.monotonic())
+        job = FenceJob(kind, cfg, time.monotonic())
         job.corners = corners
-        job.items = polygon_items(corners)
+        job.nofly = nofly
+        job.items = fence_items(corners, nofly)
         job.alt_max_m, job.action = alt_max_m, action
+        if kind == "circle_items":
+            job.radius_m = max(10.0, float(cfg.get("radius_m", 80.0)))
         position = self._fence_position()
 
         if bool(getattr(self, "_vehicle_armed", False)):
@@ -283,9 +307,14 @@ class FenceLinkMixin:
                 self._fence_refuse("The drone is armed and VGCS does not know its position, so it cannot tell "
                                    "whether this fence holds the drone. Not sent.")
                 return
-            inside = distance_inside_m(corners, position[0], position[1])
-            if inside < EDGE_MIN_M:
-                self._fence_refuse(f"{outside_words('The drone', inside)} {_AT_ONCE}")
+            if corners:
+                inside = distance_inside_m(corners, position[0], position[1])
+                if inside < EDGE_MIN_M:
+                    self._fence_refuse(f"{outside_words('The drone', inside)} {_AT_ONCE}")
+                    return
+            problem = _nofly_problem(nofly, position[0], position[1], "The drone")
+            if problem:
+                self._fence_refuse(f"{problem} {_AT_ONCE}")
                 return
             problem = self._height_problem(position[2], alt_max_m)
             if problem:
@@ -302,15 +331,24 @@ class FenceLinkMixin:
         if position is None:
             job.notes.append("The drone's position is not known, so VGCS did not check that the fence holds it")
         else:
-            inside = distance_inside_m(corners, position[0], position[1])
-            if inside < EDGE_MIN_M:
-                if not bool(cfg.get("allow_outside")):
+            if corners:
+                inside = distance_inside_m(corners, position[0], position[1])
+                if inside < EDGE_MIN_M:
+                    if not bool(cfg.get("allow_outside")):
+                        self._fence_ask_operator(
+                            "outside", cfg, "allow_outside",
+                            f"{outside_words('The drone', inside)} It will not arm until it stands inside the fence."
+                            "\n\nSend this fence anyway?")
+                        return
+                    job.notes.append("The drone is not inside this fence: it will not arm until it is")
+            problem = _nofly_problem(nofly, position[0], position[1], "The drone")
+            if problem:
+                if not bool(cfg.get("allow_nofly")):
                     self._fence_ask_operator(
-                        "outside", cfg, "allow_outside",
-                        f"{outside_words('The drone', inside)} It will not arm until it stands inside the fence."
-                        "\n\nSend this fence anyway?")
+                        "nofly", cfg, "allow_nofly",
+                        f"{problem} It will not arm in an area to stay out of.\n\nSend this fence anyway?")
                     return
-                job.notes.append("The drone is not inside this fence: it will not arm until it is")
+                job.notes.append("The drone stands in or near an area to stay out of: it will not arm inside one")
         self._fence_job = job
         self._fence_read(job, "before")
 
@@ -348,12 +386,17 @@ class FenceLinkMixin:
             self._fence_fail("The drone did not tell its home point, so VGCS cannot tell whether this fence "
                              "holds it. Not sent.")
             return
-        if job.kind == "polygon":
+        if job.corners:
             inside = distance_inside_m(job.corners, home[0], home[1])
             if inside < EDGE_MIN_M:
                 words = outside_words("The drone's home point", inside)
                 self._fence_fail(f"{words} The drone could not return home inside this fence. Not sent.")
                 return
+        problem = _nofly_problem(getattr(job, "nofly", []), home[0], home[1], "The drone's home point")
+        if problem:
+            self._fence_fail(f"{problem} The drone could not return home. Not sent.")
+            return
+        if job.kind == "polygon":
             self._fence_read(job, "before")
             return
         # The circle is around home.
@@ -366,6 +409,9 @@ class FenceLinkMixin:
         if away > job.radius_m - EDGE_MIN_M:
             self._fence_fail(f"The drone is {away:.0f} m from its home point. A fence of {job.radius_m:.0f} m "
                              f"around home has to leave it {EDGE_MIN_M:.0f} m or more. {_AT_ONCE}")
+            return
+        if job.kind == "circle_items":
+            self._fence_read(job, "before")
             return
         self._fence_job = None
         self._circle_fence_write(job.radius_m, job.alt_max_m, job.action)
@@ -443,7 +489,7 @@ class FenceLinkMixin:
                                  "Press Read fence from drone to see what the drone holds now.")
             else:
                 self._fence_fail("The drone took the fence, but what it gives back is not what VGCS sent "
-                                 f"({len(items)} items instead of {len(job.items)} corners, or other places). "
+                                 f"({len(items)} items instead of {len(job.items)}, or other places). "
                                  "Switch the fence off, or upload it again.")
             return
 
@@ -454,12 +500,16 @@ class FenceLinkMixin:
             return
         on_drone = read_fence(items)
         if purpose == "before":
-            if on_drone.other and not bool(job.cfg.get("replace_other")):
+            # Its areas to stay out of that this upload does not hold again, and what VGCS does not show.
+            gone = [area.drone_words() for area in on_drone.nofly
+                    if not any(same_nofly(area, kept) for kept in job.nofly)]
+            removed = gone + list(on_drone.other)
+            if removed and not bool(job.cfg.get("replace_other")):
                 self._fence_job = None
                 self._fence_ask_operator(
                     "other", job.cfg, "replace_other",
-                    "The fence on the drone also holds: " + "; ".join(on_drone.other) + "."
-                    "\nVGCS does not show these, and this upload removes them."
+                    "The fence on the drone also holds: " + "; ".join(removed) + "."
+                    "\nThey are not on the map, and this upload removes them."
                     "\n\nSend this fence anyway?")
                 return
             self._fence_send(job)
@@ -478,7 +528,8 @@ class FenceLinkMixin:
     def _fence_send(self, job: FenceJob) -> None:
         job.upload = FenceUpload(job.items, time.monotonic(),
                                  lambda ok, detail: self._fence_upload_done(job, ok, detail))
-        self.log_line.emit(f"Geofence: sending a polygon of {len(job.items)} corners")
+        self.log_line.emit(f"Geofence: sending {len(job.items)} fence items"
+                           + (f" with {len(job.nofly)} area(s) to stay out of" if job.nofly else ""))
         self._fence_try(self._send_fence_count, len(job.items))
 
     def _hear_fence_request(self, msg) -> None:
@@ -518,43 +569,54 @@ class FenceLinkMixin:
             # outside the fence, its home point was not asked for). Armed
             # since, it gets no fence switched on that was never checked for
             # flight.
-            self._fence_fail("The drone was armed while the fence was on its way. It holds the new polygon, "
+            what = "polygon" if job.kind == "polygon" else "areas to stay out of"
+            self._fence_fail(f"The drone was armed while the fence was on its way. It holds the new {what}, "
                              "and its fence settings were left as they were. Press Read fence from drone to "
                              "see whether its fence is on, or upload the fence again.")
             return
         job.settings_open = True
-        kinds = TYPE_ALT_MAX | TYPE_POLYGON
-        self._write_params(
-            {
-                "FENCE_ALT_MAX": job.alt_max_m,
-                "FENCE_ACTION": job.action,
-                "FENCE_TYPE": float(kinds),
-                # Last: the fence is switched on once it is the right one.
-                "FENCE_ENABLE": 1.0,
-            },
-            lambda results: self._polygon_fence_written(job, results),
-        )
+        settings = {"FENCE_ALT_MAX": job.alt_max_m, "FENCE_ACTION": job.action}
+        if job.kind == "circle_items":
+            # The circle around home, and the items (the areas to stay out of) too.
+            settings["FENCE_RADIUS"] = job.radius_m
+            settings["FENCE_TYPE"] = float(TYPE_ALT_MAX | TYPE_CIRCLE | TYPE_POLYGON)
+        else:
+            settings["FENCE_TYPE"] = float(TYPE_ALT_MAX | TYPE_POLYGON)
+        # Last: the fence is switched on once it is the right one.
+        settings["FENCE_ENABLE"] = 1.0
+        self._write_params(settings, lambda results: self._polygon_fence_written(job, results))
 
     def _polygon_fence_written(self, job: FenceJob, results: dict) -> None:
         if getattr(self, "_fence_job", None) is job:
             self._fence_job = None
         failed = [f"{name}: {detail}" for name, (ok, detail) in results.items() if not ok]
+        what = "polygon" if job.kind == "polygon" else "areas to stay out of"
         if failed:
-            text = ("The drone holds the polygon, but these settings were not confirmed: " + "; ".join(failed)
+            text = (f"The drone holds the {what}, but these settings were not confirmed: " + "; ".join(failed)
                     + ". The fence may not be switched on. Upload it again.")
             self.geofence_result.emit(False, text)
             self.error.emit(f"Geofence: {text}")
             return
-        count = len(job.corners)
-        text = (f"Polygon fence on: {count} corners, max height {job.alt_max_m:.0f} m, "
-                f"on breach {action_words(job.action)}")
+        nofly = _nofly_count_words(len(job.nofly))
+        if job.kind == "polygon":
+            text = (f"Polygon fence on: {len(job.corners)} corners{nofly}, max height {job.alt_max_m:.0f} m, "
+                    f"on breach {action_words(job.action)}")
+            kinds = TYPE_ALT_MAX | TYPE_POLYGON
+        else:
+            text = (f"Circle fence on: {job.radius_m:.0f} m around home{nofly}, max height {job.alt_max_m:.0f} m, "
+                    f"on breach {action_words(job.action)}")
+            kinds = TYPE_ALT_MAX | TYPE_CIRCLE | TYPE_POLYGON
         if job.notes:
             text += ". " + ". ".join(job.notes)
-        self.fence_state.emit({
-            "source": "upload", "enabled": True, "kinds": TYPE_ALT_MAX | TYPE_POLYGON,
+        state = {
+            "source": "upload", "enabled": True, "kinds": kinds,
             "alt_max_m": job.alt_max_m, "action": job.action,
-            "polygon": [[lat, lon] for lat, lon in job.corners], "other": [], "problem": "",
-        })
+            "polygon": [[lat, lon] for lat, lon in job.corners],
+            "nofly": [area.row() for area in job.nofly], "other": [], "problem": "",
+        }
+        if job.kind == "circle_items":
+            state["radius_m"] = job.radius_m
+        self.fence_state.emit(state)
         self.geofence_result.emit(True, text)
         self.log_line.emit(f"Geofence confirmed by the drone: {text}")
 
@@ -570,6 +632,7 @@ class FenceLinkMixin:
             "alt_max_m": values.get("FENCE_ALT_MAX"), "action": values.get("FENCE_ACTION"),
             "radius_m": values.get("FENCE_RADIUS"),
             "polygon": [[lat, lon] for lat, lon in on_drone.polygon],
+            "nofly": [area.row() for area in on_drone.nofly],
             "other": list(on_drone.other), "problem": on_drone.problem,
         }
         self.fence_state.emit(state)
@@ -613,11 +676,30 @@ class FenceLinkMixin:
         self.geofence_result.emit(False, f"The fence request was not finished: {reason}.")
 
 
+def _nofly_problem(nofly, lat: float, lon: float, what: str) -> str:
+    """Why a position is in, or too near to, an area to stay out of. "" when it is 5 m or more outside each."""
+    for number, area in enumerate(nofly, start=1):
+        outside = nofly_outside_m(area, lat, lon)
+        if outside < 0.0:
+            return f"{what} is inside no-fly area {number} ({area.words()})."
+        if outside < EDGE_MIN_M:
+            return (f"{what} is only {outside:.0f} m from no-fly area {number}. Its edge has to be "
+                    f"{EDGE_MIN_M:.0f} m away or more.")
+    return ""
+
+
+def _nofly_count_words(count: int) -> str:
+    if count <= 0:
+        return ""
+    return f", {count} area{'' if count == 1 else 's'} to stay out of"
+
+
 def describe_fence(state: dict) -> str:
     """What the drone's fence is, in a sentence or two for the operator."""
     enabled = state.get("enabled")
     kinds = state.get("kinds")
     polygon = state.get("polygon") or []
+    nofly = nofly_from_rows(state.get("nofly"))
     parts: list[str] = []
     if enabled is None:
         parts.append("The drone did not tell whether its fence is switched on")
@@ -631,13 +713,21 @@ def describe_fence(state: dict) -> str:
         if bits & TYPE_CIRCLE and state.get("radius_m") is not None:
             limits.append(f"circle of {float(state['radius_m']):.0f} m around home")
         if bits & TYPE_POLYGON:
-            limits.append(f"polygon of {len(polygon)} corners" if polygon else "polygon (but the drone holds none)")
+            if polygon:
+                limits.append(f"polygon of {len(polygon)} corners")
+            elif not nofly:
+                limits.append("polygon (but the drone holds none)")
+            if nofly:
+                limits.append(f"{len(nofly)} area{'' if len(nofly) == 1 else 's'} to stay out of")
         if not limits:
             limits.append(f"no limit chosen ({kinds_words(kinds)})")
         parts.append("The drone's fence is switched on: " + ", ".join(limits)
                      + f", on breach {action_words(state.get('action'))}")
     if polygon and not (enabled and int(kinds or 0) & TYPE_POLYGON):
         parts.append(f"It holds a polygon of {len(polygon)} corners that is not in use")
+    if nofly and not (enabled and int(kinds or 0) & TYPE_POLYGON):
+        parts.append(f"It holds {len(nofly)} area{'' if len(nofly) == 1 else 's'} to stay out of that "
+                     f"{'is' if len(nofly) == 1 else 'are'} not in use")
     if state.get("problem"):
         parts.append(str(state["problem"]).rstrip("."))
     if state.get("other"):

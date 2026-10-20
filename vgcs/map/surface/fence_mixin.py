@@ -8,11 +8,23 @@ drawing again, since the drone then holds something else.
 What the drone holds is only what the link has reported for the drone on
 screen (after an upload, after "Read fence from drone", after switching the
 fence off). With another drone on screen, or no link, nothing is known.
+
+The areas to stay out of (2026-10-21) are red and hatched, with the same rule:
+solid only for the very areas the drone holds and uses.
 """
 
 from __future__ import annotations
 
-from vgcs.mission.fence import NO_POLYGON_WORDS, TYPE_CIRCLE, TYPE_POLYGON, check_polygon
+from vgcs.mission.fence import (
+    NO_NOFLY_WORDS,
+    NO_POLYGON_WORDS,
+    TYPE_CIRCLE,
+    TYPE_POLYGON,
+    check_nofly,
+    check_polygon,
+    nofly_from_rows,
+    same_nofly,
+)
 
 
 def _same_place(a, b) -> bool:
@@ -45,6 +57,45 @@ def polygon_words(count: int, problem: str, on_drone: bool, in_use: bool) -> str
         return (f"{corners} The drone holds this polygon, but does not use it. "
                 "Press Upload polygon fence to switch it on.")
     return f"{corners} Not on the drone yet: press Upload polygon fence."
+
+
+def same_nofly_rows(drawing, on_drone) -> bool:
+    """The areas on the map are the ones the drone holds: each the same, in the same order."""
+    drawing, on_drone = list(drawing or []), list(on_drone or [])
+    if not drawing or len(drawing) != len(on_drone):
+        return False
+    mine, theirs = nofly_from_rows(drawing), nofly_from_rows(on_drone)
+    return len(mine) == len(drawing) and len(theirs) == len(on_drone) and all(
+        same_nofly(a, b) for a, b in zip(mine, theirs))
+
+
+def nofly_words(count: int, problem: str, on_drone: bool, in_use: bool) -> str:
+    """The line under the list of areas to stay out of in the Fence tab."""
+    if count == 0:
+        return NO_NOFLY_WORDS
+    areas = f"{count} area{'' if count == 1 else 's'} to stay out of."
+    if problem:
+        return f"{areas} {problem}"
+    if on_drone and in_use:
+        return f"{areas} On the drone and switched on."
+    if on_drone:
+        return f"{areas} The drone holds them, but does not use them. Upload a fence to switch them on."
+    return f"{areas} Not on the drone yet: they go with Upload circle fence or Upload polygon fence."
+
+
+def nofly_list_words(rows) -> list[str]:
+    """One line for each area in the Fence tab's list: "1. Area of 5 corners", "2. Circle of 50 m"."""
+    out: list[str] = []
+    for number, row in enumerate(rows or [], start=1):
+        if isinstance(row, dict) and "circle" in row:
+            try:
+                out.append(f"{number}. Circle of {float(row.get('radius_m')):.0f} m")
+            except (TypeError, ValueError):
+                out.append(f"{number}. Circle")
+        else:
+            corners = len((row or {}).get("polygon") or []) if isinstance(row, dict) else 0
+            out.append(f"{number}. Area of {corners} corner{'' if corners == 1 else 's'}")
+    return out
 
 
 def circle_look(state: dict, home) -> tuple[tuple[float, float, float], bool, str] | None:
@@ -130,9 +181,93 @@ class FenceMixin:
         settings = self.plan_fence_settings() or {}
         return {
             "points": [[float(lat), float(lon)] for lat, lon in self.fence_polygon()],
+            "nofly": self.fence_nofly(),
             "alt_max_m": float(settings.get("alt_max_m", 120.0)),
             "action": float(settings.get("action", 1.0)),
         }
+
+    # --- areas to stay out of ---------------------------------------------------
+
+    def fence_nofly(self) -> list[dict]:
+        """The areas to stay out of on the map, as the link takes them."""
+        nm = getattr(self, "_native_map", None)
+        return list(nm.nofly_areas()) if nm is not None else []
+
+    def _nofly_tool_allowed(self) -> bool:
+        if bool(getattr(self, "_is_3d_mode", False)):
+            self.set_plan_fence_result(False, "Areas to stay out of are drawn on the 2D map. Switch the 3D view "
+                                              "off first.")
+            self._refresh_fence_view()
+            return False
+        return getattr(self, "_native_map", None) is not None
+
+    def start_nofly_area(self) -> None:
+        """Clicks on the map add corners to a new area to stay out of from now on."""
+        if self._nofly_tool_allowed():
+            self._native_map.start_nofly_polygon()
+        self._refresh_fence_view()
+
+    def start_nofly_circles(self, radius_m: float | None = None) -> None:
+        """Each click on the map puts a circle to stay out of there (the Fence tab's radius when none is given)."""
+        if self._nofly_tool_allowed():
+            self._native_map.start_nofly_circles(self.plan_nofly_radius() if radius_m is None else radius_m)
+        self._refresh_fence_view()
+
+    def set_nofly_radius(self, radius_m: float) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            nm.set_nofly_radius(radius_m)
+
+    def plan_nofly_radius(self) -> float | None:
+        """The radius set in the Fence tab for the next circle."""
+        panel = getattr(self, "_plan_flight_panel", None)
+        read = getattr(panel, "nofly_radius_m", None)
+        try:
+            return float(read()) if callable(read) else None
+        except (TypeError, ValueError):
+            return None
+
+    def set_nofly_radius_from_panel(self) -> None:
+        radius = self.plan_nofly_radius()
+        if radius is not None:
+            self.set_nofly_radius(radius)
+
+    def remove_selected_nofly_area(self) -> None:
+        """Remove the area chosen in the Fence tab's list."""
+        panel = getattr(self, "_plan_flight_panel", None)
+        read = getattr(panel, "selected_nofly_index", None)
+        index = read() if callable(read) else None
+        if index is not None:
+            self.remove_nofly_area(int(index))
+
+    def stop_nofly_drawing(self) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            nm.stop_nofly_drawing()
+        self._refresh_fence_view()
+
+    def remove_last_nofly_corner(self) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is not None and nm.remove_last_nofly_corner():
+            self._refresh_fence_view()
+
+    def remove_nofly_area(self, index: int) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is not None and nm.remove_nofly_area(index):
+            self._refresh_fence_view()
+
+    def clear_nofly_areas(self) -> None:
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            nm.clear_nofly_areas()
+        self._refresh_fence_view()
+
+    def fence_nofly_on_drone(self) -> list[dict] | None:
+        """The areas to stay out of the drone on screen holds. None when VGCS does not know its fence."""
+        state = getattr(self, "_fence_drone_state", None) or {}
+        if state.get("polygon") is None:
+            return None
+        return list(state.get("nofly") or [])
 
     # --- what the drone holds -------------------------------------------------
 
@@ -142,8 +277,11 @@ class FenceMixin:
         return same_polygon(self.fence_polygon(), state.get("polygon"))
 
     def fence_drawing_not_on_drone(self) -> bool:
-        """There is a polygon on the map that a read from the drone would replace."""
-        return bool(self.fence_polygon()) and not self.fence_on_drone()
+        """There is a polygon, or an area to stay out of, on the map that a read from the drone would replace."""
+        state = getattr(self, "_fence_drone_state", None) or {}
+        nofly = self.fence_nofly()
+        return ((bool(self.fence_polygon()) and not self.fence_on_drone())
+                or (bool(nofly) and not same_nofly_rows(nofly, state.get("nofly"))))
 
     def fence_polygon_on_drone(self) -> list[tuple[float, float]] | None:
         """The polygon the drone on screen holds, as VGCS sent or read it. None when VGCS does not know.
@@ -177,6 +315,9 @@ class FenceMixin:
                 nm = getattr(self, "_native_map", None)
                 if polygon and nm is not None:
                     nm.set_fence_points(polygon)
+                nofly = state.get("nofly") or []
+                if nofly and nm is not None:
+                    nm.set_nofly_areas(nofly)
                 panel = getattr(self, "_plan_flight_panel", None)
                 show = getattr(panel, "set_fence_settings", None)
                 if callable(show):
@@ -224,6 +365,19 @@ class FenceMixin:
         else:
             tag = "Fence: not on the drone"
         nm.set_fence_look(in_use, tag)
+        # The areas to stay out of: in use with the polygon bit, also with the circle.
+        nofly = self.fence_nofly()
+        nofly_on_drone = same_nofly_rows(nofly, state.get("nofly"))
+        nofly_in_use = nofly_on_drone and state.get("enabled") is True and uses_polygon
+        if not nofly:
+            nofly_tag = ""
+        elif nofly_in_use:
+            nofly_tag = "on the drone"
+        elif nofly_on_drone:
+            nofly_tag = "on the drone, not in use"
+        else:
+            nofly_tag = "not on the drone"
+        nm.set_nofly_look(nofly_in_use, nofly_tag)
         # The circle fence the drone holds, around its home (it was never drawn before 2026-10-20).
         circle = circle_look(state, getattr(self, "_drone_home", None))
         if circle is None:
@@ -235,10 +389,17 @@ class FenceMixin:
         if panel is None:
             return
         _corners, problem = check_polygon([[lat, lon] for lat, lon in drawing])
+        _areas, nofly_problem = check_nofly(nofly)
         show = getattr(panel, "set_fence_polygon_state", None)
         if callable(show):
             show(polygon_words(len(drawing), problem, on_drone, in_use),
-                 can_upload=bool(drawing) and not problem, corners=len(drawing))
+                 can_upload=bool(drawing) and not problem and not nofly_problem, corners=len(drawing))
+        show_nofly = getattr(panel, "set_nofly_state", None)
+        if callable(show_nofly):
+            mode = nm.nofly_mode() if hasattr(nm, "nofly_mode") else ""
+            show_nofly(nofly_words(len(nofly), nofly_problem, nofly_on_drone, nofly_in_use),
+                       nofly_list_words(nofly), mode=mode,
+                       corners=len(nofly[-1].get("polygon") or []) if nofly and mode == "polygon" else 0)
         drawing_on = getattr(panel, "set_fence_drawing", None)
         if callable(drawing_on):
             drawing_on(bool(nm.fence_draw_mode()))

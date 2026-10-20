@@ -39,9 +39,13 @@ from vgcs.mission.fence import (
     TYPE_ALT_MAX,
     TYPE_CIRCLE,
     TYPE_POLYGON,
+    action_words,
     distance_inside_m,
     leaves,
     nearest_edge_m,
+    nofly_from_rows,
+    nofly_gap_m,
+    nofly_outside_m,
 )
 from vgcs.mission.flight_time import drone_speeds, mission_flight_time
 from vgcs.mission.mission_plan import haversine_m
@@ -164,6 +168,7 @@ def check_long_range_mission(
     endurance_min: float | None = None,
     cruise_speed_mps: float | None = None,
     fence_polygon: list | None = None,
+    fence_nofly: list | None = None,
     end_action: str = "rtl",
     headwind_mps: float = 0.0,
     wind_from: str = "",
@@ -181,6 +186,8 @@ def check_long_range_mission(
 
     ``fence_polygon`` is the polygon fence the vehicle holds, as (lat, lon)
     corners: what VGCS sent or read. None when VGCS does not know it.
+    ``fence_nofly`` are its areas to stay out of, as the link reports them
+    ({"polygon": [...]} or {"circle": [lat, lon], "radius_m": r}).
 
     ``end_action`` is what the plan does after its last waypoint (hold, rtl or
     land). ``headwind_mps`` is the wind the way home is timed against, and
@@ -208,7 +215,7 @@ def check_long_range_mission(
 
     p = {str(k).upper(): v for k, v in (params or {}).items()}
     end = str(end_action or "rtl").strip().lower()
-    _check_fence(report, p, home, rtl_home, waypoints, fence_polygon, end)
+    _check_fence(report, p, home, rtl_home, waypoints, fence_polygon, end, fence_nofly)
     timing = dict(start=home, rtl_home=rtl_home, params=p, takeoff_alt_m=takeoff_alt_m,
                   headwind_mps=headwind_mps, wind_from=wind_from)
     if report.is_long_range:
@@ -226,7 +233,7 @@ def check_long_range_mission(
 
 
 def _check_fence(report: LongRangeReport, p: dict, start, rtl_home, waypoints, fence_polygon,
-                 end_action: str = "rtl") -> None:
+                 end_action: str = "rtl", fence_nofly: list | None = None) -> None:
     """Does the mission stay inside the fence the vehicle uses, with some room to spare?
 
     FENCE_TYPE says which limits are in use: 1 the max height, 2 the circle
@@ -257,6 +264,8 @@ def _check_fence(report: LongRangeReport, p: dict, start, rtl_home, waypoints, f
         _check_fence_height(report, p, waypoints)
     if bits & TYPE_POLYGON:
         _check_fence_polygon(report, start, rtl_home, waypoints, fence_polygon, end_action)
+        # The areas to stay out of are items too, on with the polygon bit (with a circle too).
+        _check_nofly(report, p, start, rtl_home, waypoints, fence_nofly, end_action)
 
 
 def _check_fence_circle(report: LongRangeReport, radius: float, centre, waypoints) -> None:
@@ -431,6 +440,108 @@ def _check_fence_polygon(report: LongRangeReport, start, rtl_home, waypoints, fe
             f"The straight way from {name_a} to {name_b} passes {_down(gap)} m from the polygon fence's edge{more}. "
             f"Keep the flight {FENCE_PLAN_MARGIN_M:.0f} m or more inside: add a waypoint, or move one."
         )
+
+
+def _check_nofly(report: LongRangeReport, p: dict, start, rtl_home, waypoints, nofly_rows,
+                 end_action: str = "rtl") -> None:
+    """No waypoint, no straight way and no way home into an area to stay out of (2026-10-21).
+
+    The drone turns back at such an area's edge like at any fence, and the mission
+    is over (simulator: in AUTO at 10 m/s it was 21 m inside before it turned).
+    Not known (None): the polygon check has said already that the fence was not read.
+    """
+    areas = nofly_from_rows(nofly_rows) if nofly_rows is not None else []
+    if not areas:
+        return
+    action = action_words(p.get("FENCE_ACTION")) if p.get("FENCE_ACTION") is not None else ""
+    at_edge = ("At its edge the drone ends the mission and does the fence's action"
+               + (f" ({action})." if action else "."))
+    if start is not None:
+        for number, area in enumerate(areas, start=1):
+            if nofly_outside_m(area, start[0], start[1]) < ON_EDGE_M:
+                report.errors.append(
+                    f"The drone stands inside no-fly area {number} ({area.words()}). It does not arm there, and "
+                    "in flight it turns back at once."
+                )
+                return
+    places: list[tuple[int, tuple[float, float]]] = []
+    for number, wp in enumerate(waypoints or [], start=1):
+        la, lo = _wp_latlon(wp)
+        if la is None or lo is None or (abs(la) < 1e-7 and abs(lo) < 1e-7):
+            continue
+        places.append((number, (la, lo)))
+    inside = [(n, number) for n, place in places for number, area in enumerate(areas, start=1)
+              if nofly_outside_m(area, place[0], place[1]) < ON_EDGE_M]
+    if inside:
+        waypoint_numbers = sorted({n for n, _number in inside})
+        area_numbers = sorted({number for _n, number in inside})
+        several = len(waypoint_numbers) > 1
+        report.errors.append(
+            f"{_numbers(waypoint_numbers)} {'are' if several else 'is'} inside {_area_numbers(area_numbers)}. "
+            f"{at_edge} Move the waypoint{'s' if several else ''}."
+        )
+        return
+    route: list[tuple[str, tuple[float, float]]] = []
+    if start is not None:
+        route.append(("the vehicle", (float(start[0]), float(start[1]))))
+    route += [(f"waypoint {n}", place) for n, place in places]
+    for (name_a, a), (name_b, b) in zip(route, route[1:]):
+        for number, area in enumerate(areas, start=1):
+            if nofly_gap_m(area, a, b) < ON_EDGE_M:
+                report.errors.append(
+                    f"The straight way from {name_a} to {name_b} crosses no-fly area {number} ({area.words()}). "
+                    f"{at_edge} Add a waypoint to go around."
+                )
+                return
+    # The way home: straight from where RTL starts.
+    home = (float(rtl_home[0]), float(rtl_home[1]))
+    home_cross = [n for n, place in places if any(nofly_gap_m(area, place, home) < ON_EDGE_M for area in areas)]
+    last = places[-1][0] if places else None
+    if last is not None and last in home_cross and end_action == "rtl":
+        report.errors.append(
+            f"The straight way home from waypoint {last}, where the mission ends with Return to launch, crosses "
+            "an area to stay out of. The drone turns back there and does not get home that way. Add a waypoint to "
+            "go around, or end the mission with Land or Hold."
+        )
+        return
+    if home_cross:
+        report.warnings.append(
+            f"From {_numbers(home_cross).lower()}, the straight way home crosses an area to stay out of. If the "
+            "drone returns home from there (a failsafe, or Return), it turns back at that area's edge."
+        )
+    # Room to spare.
+    near = [(n, min(nofly_outside_m(area, place[0], place[1]) for area in areas)) for n, place in places]
+    near = [(n, room) for n, room in near if room < FENCE_PLAN_MARGIN_M]
+    if near:
+        several = len(near) > 1
+        report.warnings.append(
+            f"{_numbers([n for n, _room in near])} {'are' if several else 'is'} less than "
+            f"{FENCE_PLAN_MARGIN_M:.0f} m from an area to stay out of ({_down(min(room for _n, room in near))} m "
+            "at the closest). A position wanders by some metres, and the drone acts the moment it is inside. "
+            f"Keep waypoints {FENCE_PLAN_MARGIN_M:.0f} m or more away."
+        )
+        return
+    close: list[tuple[str, str, float]] = []
+    for (name_a, a), (name_b, b) in zip(route, route[1:]):
+        gap = min(nofly_gap_m(area, a, b) for area in areas)
+        if gap < FENCE_PLAN_MARGIN_M:
+            close.append((name_a, name_b, gap))
+    if close:
+        name_a, name_b, gap = min(close, key=lambda c: c[2])
+        others = len(close) - 1
+        more = f" ({others} more way{'s' if others > 1 else ''} too)" if others else ""
+        report.warnings.append(
+            f"The straight way from {name_a} to {name_b} passes {_down(gap)} m from an area to stay out of{more}. "
+            f"Keep the flight {FENCE_PLAN_MARGIN_M:.0f} m or more away: add a waypoint, or move one."
+        )
+
+
+def _area_numbers(numbers: list[int]) -> str:
+    """"no-fly area 2", "no-fly areas 1 and 3"."""
+    if len(numbers) == 1:
+        return f"no-fly area {numbers[0]}"
+    shown = [str(n) for n in numbers]
+    return f"no-fly areas {', '.join(shown[:-1])} and {shown[-1]}"
 
 
 def _check_failsafes(report: LongRangeReport, p: dict) -> None:
