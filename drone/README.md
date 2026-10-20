@@ -13,10 +13,13 @@ drone/
   scripts/
     vama_wind_failsafe.lua        the high wind failsafe (copy it to the SD card)
     vama_wind_failsafe.md         what it does, how to install it, its parameters and messages
+    vama_lock.lua                 the VAMA lock, part 1 of the firmware lock (copy it to the SD card)
+    vama_lock.md                  what it does and does not stop, how to bind a drone, parameters, messages
   test/
     setup_sitl.sh                 downloads the ArduCopter simulator programs (run once, inside WSL)
     sitl_session.py               starts a simulated drone and talks MAVLink to it
     wind_failsafe_test.py         flies the wind failsafe in the simulator
+    lock_test.py                  tries the VAMA lock in the simulator
 ```
 
 ## High wind failsafe
@@ -29,9 +32,17 @@ Short version:
 2. Copy `scripts/vama_wind_failsafe.lua` to the SD card folder `APM/scripts/` and reboot.
 3. Fly the first flights with `WFS_ACTION` 1 (warning only). Then set it to 2 (RTL).
 
+## VAMA lock
+
+Read [scripts/vama_lock.md](scripts/vama_lock.md).
+
+Short version: once the team's MAVLink signing key is on the drone and `VLCK_ENABLE` is 1, the drone arms only while VGCS or the VAMA app is connected to it over the radio with that key.
+It never acts in flight.
+It does not stop someone who opens the drone (USB, SD card, flashing): that is part 2 of the firmware lock.
+
 ## Simulator tests
 
-The script is tested in ArduPilot's own simulator (SITL), with the real ArduCopter 4.6.2 and 4.7.0 programs.
+The scripts are tested in ArduPilot's own simulator (SITL), with the real ArduCopter 4.6.2 and 4.7.0 programs.
 Nothing is sent over the network: the simulator runs in WSL and the test talks to it on this computer.
 
 What you need:
@@ -54,9 +65,12 @@ cd drone\test
 py wind_failsafe_test.py               # all cases on both versions, about 10 minutes
 py wind_failsafe_test.py 4.7.0         # one version
 py wind_failsafe_test.py -k blown      # only the cases with "blown" in their name
+py lock_test.py                        # the VAMA lock: all cases on both versions, about 3 minutes
 ```
 
 Each case flies one situation and prints `PASS` or `FAIL` with the reason.
+The cases of the VAMA lock are listed in [scripts/vama_lock.md](scripts/vama_lock.md).
+The wind failsafe's are below.
 The simulated clock runs 10 times faster than real time.
 
 | Case | What it proves |

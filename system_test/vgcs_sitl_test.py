@@ -172,9 +172,10 @@ class Recorder:
 class Flight:
     """One simulated drone with VGCS's link connected to it."""
 
-    def __init__(self, version: str, params: dict | None = None, speedup: int = 10) -> None:
+    def __init__(self, version: str, params: dict | None = None, speedup: int = 10,
+                 scripts: dict | None = None, script_ready: str = "") -> None:
         self.version = version
-        self.sim = Sitl(version, {}, dict(BASE, **(params or {})), speedup=speedup)
+        self.sim = Sitl(version, scripts or {}, dict(BASE, **(params or {})), speedup=speedup, script_ready=script_ready)
         self.link = MavlinkThread(VGCS_PORT)
         self.rec = Recorder(self.link)
         self.link.start()
@@ -1442,9 +1443,52 @@ def signed_commands(version: str, r: Report) -> None:
         f.close()
 
 
+def vama_lock_with_vgcs(version: str, r: Report) -> None:
+    """The VAMA lock (drone/scripts/vama_lock.lua): VGCS with its key unlocks the drone, and only while it is connected."""
+    f = Flight(version, params={"SCR_ENABLE": 1, "SCR_HEAP_SIZE": 300000, "FS_GCS_ENABLE": 0},
+               scripts={"vama_lock.lua": REPO / "drone" / "scripts" / "vama_lock.lua"}, script_ready="VAMA lock: ready")
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        r.check(f.ready_to_fly(), "the drone is ready")
+
+        def signing_state() -> str:
+            rows = rec.telemetry.get("SIGNING", [])
+            return rows[-1][1].get("state", "") if rows else ""
+
+        link.queue_signing_key(bytes(range(1, 33)), 9)
+        f.wait_real(lambda: signing_state() == "drone_unsigned", 8)
+        since = rec.now()
+        link.queue_signing_to_drone(True)
+        f.wait_real(lambda: rec.action("signing", since) is not None, 10)
+        f.wait_real(lambda: signing_state() == "drone_signs", 5)
+        r.check(signing_state() == "drone_signs", f"VGCS put its key on the drone ({signing_state()})")
+
+        # Only a ground station with the key can turn the lock on now: VGCS does.
+        link.queue_param_set("VLCK_ENABLE", 1)
+        r.check(f.wait(lambda: sim.saw("VAMA lock: unlocked by GCS"), 20),
+                f"VGCS's signed heartbeat unlocks the drone {sim.texts_with('VAMA lock')}")
+        link.queue_arm(True)
+        r.check(f.wait(lambda: sim.armed, 15), "VGCS arms it")
+        link.queue_arm(False)
+        f.wait(lambda: not sim.armed, 15)
+
+        # VGCS goes away: locked again, and the sticks do not arm it.
+        link.stop()
+        link.wait(4000)
+        gone = sim.sim_s
+        r.check(f.wait(lambda: sim.saw("locked, no signed ground station", gone), 15), "without VGCS it is locked again")
+        sim.rc(rc3=1000, rc4=2000)
+        sim.fly(5, until=lambda: sim.armed)
+        sim.rc(rc4=1500)
+        r.check(not sim.armed, "and the sticks do not arm it")
+        r.check(any("VAMA locked" in t for t in sim.texts_with("locked", gone)), "the refusal names the lock")
+    finally:
+        f.close()
+
+
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
          mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_speeds, missions_as_they_come_back,
-         another_stations_mission, takeoff_fence_and_land, polygon_fence, link_silence, signed_commands]
+         another_stations_mission, takeoff_fence_and_land, polygon_fence, link_silence, signed_commands, vama_lock_with_vgcs]
 
 
 def write_report(path: pathlib.Path, results: list[tuple[str, Report, float]]) -> None:

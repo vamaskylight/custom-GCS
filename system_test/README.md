@@ -32,7 +32,7 @@ The same set-up as the wind failsafe tests, see [drone/README.md](../drone/READM
 From the repo root:
 
 ```powershell
-py system_test/vgcs_sitl_test.py                      # 13 cases on 4.6.2 and 4.7.0, about 7 minutes
+py system_test/vgcs_sitl_test.py                      # 15 cases on 4.6.2 and 4.7.0, about 8 minutes
 py system_test/vgcs_sitl_test.py 4.7.0 -k mission     # one version, only cases with "mission" in the name
 py system_test/vgcs_sitl_test.py --report results.md  # also write the results as Markdown
 
@@ -88,6 +88,7 @@ The simulated clock runs 10 times faster than real time.
 | polygon_fence | a polygon fence: the drone holds its corners to the last digit (read on the checking connection), it turns back at the edge and at the height limit, a fence that does not hold the flying drone is not sent, a larger one is taken in flight, Read fence from drone, another station's areas named and asked about, the circle fence in its place |
 | link_silence | the radio goes quiet in flight (the simulator is frozen), VGCS reports it within its 2 second watchdog, and recovers by itself |
 | signed_commands | VGCS gives the drone its signing key: an outsider ground station (third port) can no longer change the mode, arm, or remove the key, VGCS still can, and after the key is removed the outsider is obeyed again |
+| vama_lock_with_vgcs | The VAMA lock script (`drone/scripts/vama_lock.lua`) on the drone: VGCS puts its key on it, turns the lock on, and its signed heartbeat unlocks the drone, so VGCS can arm it. When VGCS goes away the drone is locked again and the sticks do not arm it |
 
 ## `vgcs_window_test.py`: the window, and how well it keeps up
 
