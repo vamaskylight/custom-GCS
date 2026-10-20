@@ -1,10 +1,12 @@
 name: tests
 
-# CI gate for VGCS / DOOAF. Runs the pytest suite on every push and PR.
+# CI gate for VGCS / DOOAF, on every push and PR.
 #
-# NOTE: the `tests/` directory is currently gitignored — untrack it (remove the tests entry
-# from .gitignore and commit the suite) for this workflow to actually run the tests. Until
-# then this file documents the intended gate.
+# The unit test suite (`tests/`) is gitignored on purpose and is not in this repo, so a
+# checkout here has no tests. This job checks what the repo does hold: every Python file
+# compiles, and every vgcs module imports on a clean checkout (this catches a commit that
+# is missing a file). The suite itself runs on the developer's machine. The last step runs
+# it here as well, if `tests/` is ever committed.
 
 on:
   push:
@@ -18,13 +20,15 @@ on:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moves to Ubuntu 26 from 2026-10-19, and these steps were
+    # checked on 24.04.
+    runs-on: ubuntu-24.04
     env:
       # PySide6 (Qt) is imported by the map/observation mixins; run headless.
       QT_QPA_PLATFORM: offscreen
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install system libs for Qt
@@ -36,5 +40,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest
+      - name: Compile every Python file
+        run: python -m compileall -q .
+      - name: Import every vgcs module
+        run: python .github/scripts/import_check.py
       - name: Run tests
-        run: pytest tests/ -q
+        run: |
+          if [ -d tests ]; then
+            pytest tests/ -q
+          else
+            echo "tests/ is not in this repo (gitignored, kept private). The suite runs on the developer's machine."
+          fi

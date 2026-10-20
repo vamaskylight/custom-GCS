@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Signal
 
-from vgcs.video.pipeline import AiVideoHook, VideoFrame
+from vgcs.video.pipeline import VideoFrame
 
 
 @dataclass(frozen=True)
@@ -14,11 +14,15 @@ class DummyDetection:
     label: str
 
 
-class DummyAiTracker(QObject, AiVideoHook):
+class DummyAiTracker(QObject):
     """
     Example AI hook that can be swapped with a real tracker later.
 
     This does no heavy compute; it just emits a heartbeat detection every N frames.
+
+    It meets the ``AiVideoHook`` protocol by its ``on_frame`` method. It does not
+    subclass the protocol: a Protocol's metaclass conflicts with QObject's, and
+    the class could not be created at all.
     """
 
     detection = Signal(object)  # DummyDetection
