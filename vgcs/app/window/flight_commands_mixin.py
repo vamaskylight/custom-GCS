@@ -471,23 +471,38 @@ class MainWindowFlightCommandsMixin:
         if self._thread is None or not self._thread.isRunning():
             QMessageBox.warning(self, "VGCS", "Connect vehicle before fence upload.")
             return
-        from vgcs.mission.fence import check_nofly, check_polygon
+        from vgcs.mission.fence import check_keepin, check_nofly, check_polygon, check_return_point
 
         cfg = self._map_widget.plan_polygon_fence_cfg()
-        corners, problem = check_polygon(cfg["points"])
+        # The polygon may be left out when there are more areas to stay inside (2026-10-27).
+        keepin, problem = check_keepin(cfg.get("keepin") or [])
+        corners: list = []
+        areas: list = []
+        point = None
+        if not problem and (cfg["points"] or not keepin):
+            corners, problem = check_polygon(cfg["points"])
         if not problem:
             areas, problem = check_nofly(cfg.get("nofly") or [])
+        if not problem:
+            point, problem = check_return_point(cfg.get("return_point"))
         if problem:
             # Said here, without a round trip. (The link says the same if asked.)
             self._map_widget.set_plan_fence_result(False, f"{problem} Not sent.")
             return
         self._thread.queue_geofence_upload(cfg)
-        also = (f" and {len(areas)} area{'' if len(areas) == 1 else 's'} to stay out of" if areas else "")
-        self._map_widget.set_plan_fence_result(
-            None, f"Sending a polygon of {len(corners)} corners{also} to the drone, and reading it back...")
+        parts = [f"a polygon of {len(corners)} corners"] if corners else []
+        if keepin:
+            parts.append(f"{len(keepin)} {'more ' if corners else ''}area{'' if len(keepin) == 1 else 's'} to stay "
+                         "inside")
+        if point is not None:
+            parts.append("a return point")
+        if areas:
+            parts.append(f"{len(areas)} area{'' if len(areas) == 1 else 's'} to stay out of")
+        what = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+        self._map_widget.set_plan_fence_result(None, f"Sending {what} to the drone, and reading it back...")
         self._append_log(
-            f"Polygon fence upload queued: {len(corners)} corners{also} alt={cfg['alt_max_m']:.0f}m "
-            f"action={int(cfg['action'])}"
+            f"Fence upload queued: {what}, alt={cfg['alt_max_m']:.0f}m action={int(cfg['action'])}"
+            + (", inside any of the areas" if cfg.get("union") and len(keepin) + (1 if corners else 0) > 1 else "")
         )
 
     def _upload_nofly_from_plan_panel(self) -> None:
@@ -525,7 +540,8 @@ class MainWindowFlightCommandsMixin:
                 self,
                 "Read fence from drone",
                 "The fence drawn on the map is not on the drone.\n\n"
-                "If the drone holds a polygon, it takes the place of the one on the map. Read it?",
+                "If the drone holds a polygon, areas or a return point, they take the place of those on the map. "
+                "Read it?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
@@ -579,6 +595,10 @@ class MainWindowFlightCommandsMixin:
         # The question can come for the circle too, when it goes with areas to stay out of.
         if cfg.get("points"):
             sending = "Sending the polygon to the drone, and reading it back..."
+        elif cfg.get("keepin"):
+            sending = "Sending the areas to stay inside to the drone, and reading them back..."
+        elif cfg.get("areas_only"):
+            sending = "Sending the areas to stay out of to the drone, and reading them back..."
         else:
             sending = "Sending the circle and the areas to stay out of to the drone, and reading them back..."
         self._map_widget.set_plan_fence_result(None, sending)

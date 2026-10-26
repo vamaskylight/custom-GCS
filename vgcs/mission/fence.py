@@ -33,6 +33,17 @@ param1 the radius in metres). Measured in the simulator, 4.6.2 and 4.7.0:
   FENCE_ACTION). In AUTO at 10 m/s it was 21 m inside before it turned, and the
   mission was over: it returned home and landed.
 
+More areas to stay inside (2026-10-27, DGCA FEN-12): polygons (item 5001, as
+the first one) and circles (item 5003, param1 the radius), and a return point
+(item 5000). Read in ArduPilot's 4.7.0 source (AC_Fence, AC_PolyFence_loader):
+
+- With several areas to stay inside, the drone has to be inside all of them at
+  once (the place where they overlap). With FENCE_OPTIONS bit 1 it may be in any
+  of them instead (their union).
+- Only ArduPlane flies to the return point. A multicopter keeps it, and on a
+  breach does its FENCE_ACTION (return home, land, brake) as before.
+- FENCE_TOTAL counts polygon corners and circles, not the return point.
+
 Pure Python, no Qt and no pymavlink, so it is tested without a link.
 """
 
@@ -53,6 +64,12 @@ TYPE_ALT_MAX = 1
 TYPE_CIRCLE = 2
 TYPE_POLYGON = 4
 TYPE_ALT_MIN = 8
+# FENCE_OPTIONS bit 1: the areas to stay inside are a union (inside any), not an intersection (inside all).
+OPTION_UNION = 2
+# A straight flight is looked at every this many metres for the union of areas to stay inside
+# (where it can go from one area into another), and at this many points at most.
+UNION_STEP_M = 1.0
+UNION_STEPS_MAX = 20_000
 
 MIN_CORNERS = 3
 # The corner count is one byte on the drone.
@@ -79,6 +96,11 @@ NO_POLYGON_WORDS = ("No polygon yet. Press Draw on the map, then click the map a
 # What the Fence tab says before an area to stay out of is drawn.
 NO_NOFLY_WORDS = ("No areas to stay out of. Press Draw a no-fly area and click its corners on the map, "
                   "or Add no-fly circles and click where each one goes.")
+# What the Fence tab says before a further area to stay inside is drawn.
+NO_KEEPIN_WORDS = ("No more areas to stay inside. Press Draw an area to stay inside and click its corners on "
+                   "the map, or Add circles to stay inside and click where each one goes.")
+# What the Fence tab says before a return point is set.
+NO_RETURN_POINT_WORDS = "No return point. Press Set return point, then click the map where it goes."
 
 _M_PER_DEG = 111_320.0
 
@@ -286,11 +308,15 @@ def outside_words(what: str, inside_m: float, edge_m: float = EDGE_MIN_M) -> str
 
 @dataclass(frozen=True)
 class NoFly:
-    """An area to stay out of: a polygon (its corners), or a circle (its centre and radius)."""
+    """An area to stay out of: a polygon (its corners), or a circle (its centre and radius).
+
+    With `inside` it is an area to stay inside instead (2026-10-27): the same shapes, other items.
+    """
 
     corners: tuple[Corner, ...] = ()
     centre: Corner | None = None
     radius_m: float = 0.0
+    inside: bool = False
 
     @property
     def is_circle(self) -> bool:
@@ -304,15 +330,20 @@ class NoFly:
 
     def drone_words(self) -> str:
         """As a list of what a drone holds names it: "a circle to stay out of (50 m)"."""
+        side = "inside" if self.inside else "out of"
         if self.is_circle:
-            return f"a circle to stay out of ({self.radius_m:.0f} m)"
-        return f"an area to stay out of ({_corner_words(len(self.corners))})"
+            return f"a circle to stay {side} ({self.radius_m:.0f} m)"
+        return f"an area to stay {side} ({_corner_words(len(self.corners))})"
 
     def row(self) -> dict:
-        """As the map, the link and a plan file keep it."""
+        """As the map, the link and a plan file keep it. An area to stay inside says so."""
         if self.is_circle:
-            return {"circle": [self.centre[0], self.centre[1]], "radius_m": float(self.radius_m)}
-        return {"polygon": [[lat, lon] for lat, lon in self.corners]}
+            row = {"circle": [self.centre[0], self.centre[1]], "radius_m": float(self.radius_m)}
+        else:
+            row = {"polygon": [[lat, lon] for lat, lon in self.corners]}
+        if self.inside:
+            row["inside"] = True
+        return row
 
 
 def _radius(raw: object) -> float | None:
@@ -323,31 +354,41 @@ def _radius(raw: object) -> float | None:
     return value if NOFLY_RADIUS_RANGE_M[0] <= value <= NOFLY_RADIUS_RANGE_M[1] else None
 
 
+def _check_areas(rows: object, inside: bool) -> tuple[list[NoFly], str]:
+    name = "Area to stay inside" if inside else "No-fly area"
+    areas: list[NoFly] = []
+    for number, row in enumerate(list(rows) if isinstance(rows, (list, tuple)) else [], start=1):
+        if not isinstance(row, dict):
+            return areas, f"{name} {number} is not an area."
+        if "circle" in row:
+            centre = _a_position(row.get("circle"))
+            if centre is None:
+                return areas, f"{name} {number}: its centre is not a position on the map."
+            radius = _radius(row.get("radius_m"))
+            if radius is None:
+                low, high = NOFLY_RADIUS_RANGE_M
+                return areas, f"{name} {number}: a circle needs a radius of {low:.0f} to {high:.0f} m."
+            areas.append(NoFly(centre=centre, radius_m=radius, inside=inside))
+            continue
+        corners, problem = check_polygon(row.get("polygon"))
+        if problem:
+            return areas, f"{name} {number}: {problem[:1].lower()}{problem[1:]}"
+        areas.append(NoFly(corners=tuple(corners), inside=inside))
+    return areas, ""
+
+
 def check_nofly(rows: object) -> tuple[list[NoFly], str]:
     """The areas to stay out of drawn on the map, and what is wrong with the first one that cannot be sent.
 
     Returns (areas, problem). problem is "" when every area can be sent, else one
     sentence for the operator that names the area by its number.
     """
-    areas: list[NoFly] = []
-    for number, row in enumerate(list(rows) if isinstance(rows, (list, tuple)) else [], start=1):
-        if not isinstance(row, dict):
-            return areas, f"No-fly area {number} is not an area."
-        if "circle" in row:
-            centre = _a_position(row.get("circle"))
-            if centre is None:
-                return areas, f"No-fly area {number}: its centre is not a position on the map."
-            radius = _radius(row.get("radius_m"))
-            if radius is None:
-                low, high = NOFLY_RADIUS_RANGE_M
-                return areas, f"No-fly area {number}: a circle needs a radius of {low:.0f} to {high:.0f} m."
-            areas.append(NoFly(centre=centre, radius_m=radius))
-            continue
-        corners, problem = check_polygon(row.get("polygon"))
-        if problem:
-            return areas, f"No-fly area {number}: {problem[:1].lower()}{problem[1:]}"
-        areas.append(NoFly(corners=tuple(corners)))
-    return areas, ""
+    return _check_areas(rows, inside=False)
+
+
+def check_keepin(rows: object) -> tuple[list[NoFly], str]:
+    """The further areas to stay inside drawn on the map (polygons and circles), as check_nofly."""
+    return _check_areas(rows, inside=True)
 
 
 def nofly_outside_m(area: NoFly, lat: float, lon: float) -> float:
@@ -385,14 +426,109 @@ def same_nofly(a: NoFly, b: NoFly) -> bool:
     return len(a.corners) == len(b.corners) and all(_same_place(p, q) for p, q in zip(a.corners, b.corners))
 
 
-def nofly_from_rows(rows: object) -> list[NoFly]:
+def nofly_from_rows(rows: object, inside: bool = False) -> list[NoFly]:
     """The areas in rows the link or a plan file holds. A row that is no area is left out."""
     out: list[NoFly] = []
     for row in list(rows) if isinstance(rows, (list, tuple)) else []:
-        areas, problem = check_nofly([row])
+        areas, problem = _check_areas([row], inside)
         if not problem:
             out.extend(areas)
     return out
+
+
+def keepin_from_rows(rows: object) -> list[NoFly]:
+    """The areas to stay inside in rows the link or a plan file holds."""
+    return nofly_from_rows(rows, inside=True)
+
+
+# --- the areas to stay inside, together --------------------------------------
+
+def area_inside_m(area: NoFly, lat: float, lon: float) -> float:
+    """How far inside an area a position is, in metres to its edge. Less than 0 outside it."""
+    return -nofly_outside_m(area, lat, lon)
+
+
+def inside_margin_m(areas: list[NoFly], lat: float, lon: float, union: bool) -> float:
+    """How far inside the areas to stay inside a position is, as the drone takes them together.
+
+    Inside all of them (an intersection, the drone's default): the least of the
+    distances. Inside any (FENCE_OPTIONS bit 1): the most. No area: no limit (inf).
+    """
+    if not areas:
+        return float("inf")
+    distances = [area_inside_m(area, lat, lon) for area in areas]
+    return max(distances) if union else min(distances)
+
+
+def _leaves_area(area: NoFly, a: Corner, b: Corner) -> bool:
+    if not area.is_circle:
+        return leaves(list(area.corners), a, b)
+    # A circle has no dent: a straight flight with both ends inside stays inside.
+    return area_inside_m(area, a[0], a[1]) < 0.0 or area_inside_m(area, b[0], b[1]) < 0.0
+
+
+def leaves_areas(areas: list[NoFly], a: Corner, b: Corner, union: bool) -> bool:
+    """A straight flight from a to b is outside the areas to stay inside at some point.
+
+    Inside all of them: it must leave none. Inside any: it may go from one into
+    another where they overlap, so the flight is looked at every UNION_STEP_M.
+    """
+    if not areas:
+        return False
+    if not union or len(areas) == 1:
+        return any(_leaves_area(area, a, b) for area in areas)
+    if inside_margin_m(areas, a[0], a[1], True) < 0.0 or inside_margin_m(areas, b[0], b[1], True) < 0.0:
+        return True
+    if any(not _leaves_area(area, a, b) for area in areas):
+        return False           # all the way inside one of them
+    return _union_least_margin(areas, a, b, 0.0) < 0.0
+
+
+def _union_least_margin(areas: list[NoFly], a: Corner, b: Corner, floor_m: float) -> float:
+    """The least room inside any of the areas along a straight flight from a to b (less than 0: it leaves them).
+
+    The room changes by a metre at most for each metre flown. So after a look with this much room the
+    flight is looked at again only that much (less floor_m) further on: deep inside in long steps, near
+    the edge every UNION_STEP_M (longer for a flight of more than UNION_STEPS_MAX metres). Exact to that
+    step below floor_m. Above it the answer is only floor_m or more. The first look below 0 ends it.
+    """
+    length = distance_m(a, b)
+    least_step = max(UNION_STEP_M, length / UNION_STEPS_MAX)
+    least = float("inf")
+    walked = 0.0
+    for _look in range(UNION_STEPS_MAX + 2):
+        t = 1.0 if length <= 0.0 else min(1.0, walked / length)
+        room = inside_margin_m(areas, a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), True)
+        least = min(least, room)
+        if room < 0.0 or t >= 1.0:
+            break
+        walked += max(least_step, room - floor_m)
+    return least
+
+
+def inside_gap_m(areas: list[NoFly], a: Corner, b: Corner, union: bool, enough_m: float = math.inf) -> float:
+    """How near a straight flight from a to b comes to the edge of the areas to stay inside, in metres
+    (0 where it leaves them, inf with no area).
+
+    Inside all of them: the nearest that any area's edge comes. Inside any: the least room the flight
+    has, in the area that gives it the most room there. A caller that only wants to know whether it is
+    less than enough_m gets any value of enough_m or more above that (it is found sooner).
+    """
+    if not areas:
+        return float("inf")
+    if leaves_areas(areas, a, b, union):
+        return 0.0
+    if union and len(areas) > 1:
+        return max(0.0, _union_least_margin(areas, a, b, enough_m))
+    gaps = []
+    for area in areas:
+        if area.is_circle:
+            # A circle's edge is nearest at an end of the flight: the farthest from its middle.
+            far = max(distance_m(area.centre, a), distance_m(area.centre, b))
+            gaps.append(max(0.0, float(area.radius_m) - far))
+        else:
+            gaps.append(nearest_edge_m(list(area.corners), a, b))
+    return min(gaps)
 
 
 # --- what goes over the link ----------------------------------------------
@@ -414,19 +550,44 @@ def polygon_items(corners: list[Corner]) -> list[FenceItem]:
             for lat, lon in corners]
 
 
-def fence_items(corners: list[Corner], nofly: list[NoFly]) -> list[FenceItem]:
-    """The items of a fence: the area to stay inside (when there is one), then each area to stay out of."""
+def _area_items(area: NoFly) -> list[FenceItem]:
+    if area.is_circle:
+        lat, lon = area.centre
+        command = CMD_CIRCLE_INCLUSION if area.inside else CMD_CIRCLE_EXCLUSION
+        return [FenceItem(command, float(area.radius_m), int(round(lat * 1e7)), int(round(lon * 1e7)))]
+    command = CMD_POLYGON_INCLUSION if area.inside else CMD_POLYGON_EXCLUSION
+    count = float(len(area.corners))
+    return [FenceItem(command, count, int(round(lat * 1e7)), int(round(lon * 1e7))) for lat, lon in area.corners]
+
+
+def fence_items(corners: list[Corner], nofly: list[NoFly], keepin: list[NoFly] | tuple = (),
+                return_point: Corner | None = None) -> list[FenceItem]:
+    """The items of a fence: the area to stay inside (when there is one), the further areas to stay
+    inside, each area to stay out of, and the return point last (as QGC sends them)."""
     items = polygon_items(corners) if corners else []
+    for area in keepin:
+        items.extend(_area_items(area))
     for area in nofly:
-        if area.is_circle:
-            lat, lon = area.centre
-            items.append(FenceItem(CMD_CIRCLE_EXCLUSION, float(area.radius_m), int(round(lat * 1e7)),
-                                   int(round(lon * 1e7))))
-            continue
-        count = float(len(area.corners))
-        items.extend(FenceItem(CMD_POLYGON_EXCLUSION, count, int(round(lat * 1e7)), int(round(lon * 1e7)))
-                     for lat, lon in area.corners)
+        items.extend(_area_items(area))
+    if return_point is not None:
+        lat, lon = return_point
+        items.append(FenceItem(CMD_RETURN_POINT, 0.0, int(round(lat * 1e7)), int(round(lon * 1e7))))
     return items
+
+
+def fence_total_points(items: list[FenceItem]) -> int:
+    """What ArduPilot's FENCE_TOTAL counts of these items: corners and circles, not the return point."""
+    return sum(1 for item in items if item.command != CMD_RETURN_POINT)
+
+
+def check_return_point(row: object) -> tuple[Corner | None, str]:
+    """The return point set on the map (None when there is none), and what is wrong with it."""
+    if row is None:
+        return None, ""
+    position = _a_position(row)
+    if position is None:
+        return None, "The return point is not a position on the map."
+    return position, ""
 
 
 def item_from_row(row: dict) -> FenceItem:
@@ -459,6 +620,10 @@ class FenceOnDrone:
     polygon: list[Corner] = field(default_factory=list)
     # The areas to stay out of, in the drone's order (VGCS draws them since 2026-10-21).
     nofly: list[NoFly] = field(default_factory=list)
+    # The further areas to stay inside (polygons after the first, and circles) and the return
+    # point, in the drone's order (VGCS draws them since 2026-10-27).
+    keepin: list[NoFly] = field(default_factory=list)
+    return_point: Corner | None = None
     # What the fence holds besides, one line each. VGCS does not show these,
     # and an upload from VGCS removes them.
     other: list[str] = field(default_factory=list)
@@ -486,17 +651,20 @@ def read_fence(items: list[FenceItem]) -> FenceOnDrone:
             if item.command == CMD_POLYGON_INCLUSION and not out.polygon:
                 out.polygon = corners
             elif item.command == CMD_POLYGON_INCLUSION:
-                out.other.append(f"another area to stay inside ({_corner_words(count)})")
+                out.keepin.append(NoFly(corners=tuple(corners), inside=True))
             else:
                 out.nofly.append(NoFly(corners=tuple(corners)))
             i += count
             continue
         if item.command == CMD_CIRCLE_INCLUSION:
-            out.other.append(f"a circle to stay inside ({item.p1:.0f} m)")
+            out.keepin.append(NoFly(centre=(item.lat_e7 / 1e7, item.lon_e7 / 1e7), radius_m=float(item.p1),
+                                    inside=True))
         elif item.command == CMD_CIRCLE_EXCLUSION:
             out.nofly.append(NoFly(centre=(item.lat_e7 / 1e7, item.lon_e7 / 1e7), radius_m=float(item.p1)))
+        elif item.command == CMD_RETURN_POINT and out.return_point is None:
+            out.return_point = (item.lat_e7 / 1e7, item.lon_e7 / 1e7)
         elif item.command == CMD_RETURN_POINT:
-            out.other.append("a return point")
+            out.other.append("another return point")
         else:
             out.other.append(f"an item VGCS does not know (command {item.command})")
         i += 1
@@ -516,6 +684,11 @@ def action_words(action: object) -> str:
     except (TypeError, ValueError):
         return "not known"
     return _ACTIONS.get(number, f"action {number}")
+
+
+def union_words(union: bool) -> str:
+    """How the drone takes its areas to stay inside together, in words."""
+    return "inside any of them" if union else "inside all of them at once"
 
 
 def kinds_words(kinds: object) -> str:

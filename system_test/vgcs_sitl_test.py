@@ -1375,12 +1375,13 @@ def polygon_fence(version: str, r: Report) -> None:
         r.check(sent == 0, f"another station adds an area to stay out of and a circle ({sent})")
         f.wait(lambda: False, 2)
         state, answer = read()
-        # Since 2026-10-21 VGCS shows areas to stay out of; it names only what it does not show.
+        # Since 2026-10-21 VGCS shows areas to stay out of, and since 2026-10-27 areas to stay inside too.
         nofly = state.get("nofly") or []
         r.check(len(nofly) == 1 and len(nofly[0].get("polygon") or []) == 4,
                 f"Read shows the area to stay out of ({len(nofly)} area(s))")
-        r.check(state.get("other") == ["a circle to stay inside (55 m)"],
-                f"Read names what VGCS does not show ({state.get('other')})")
+        keepin = state.get("keepin") or []
+        r.check(len(keepin) == 1 and keepin[0].get("radius_m") == 55.0 and state.get("other") == [],
+                f"and the circle to stay inside, with nothing left unshown ({keepin}, {state.get('other')})")
         n_questions, n_fences = len(rec.fence_questions), len(rec.fences)
         link.queue_geofence_upload({"points": small, "alt_max_m": 30.0, "action": 1.0})
         f.wait_real(lambda: len(rec.fence_questions) > n_questions, 15)
@@ -1518,6 +1519,127 @@ def nofly_areas(version: str, r: Report) -> None:
         r.check(bool(said), f"the drone's reason reaches VGCS {said[:2]}")
         r.check(not rec.errors or all("Geofence" in e[1] for e in rec.errors),
                 f"no other error from VGCS {[e[1] for e in rec.errors if 'Geofence' not in e[1]][:2]}")
+    finally:
+        f.close()
+
+
+def keepin_areas(version: str, r: Report) -> None:
+    """More areas to stay inside and a return point from VGCS (DGCA FEN-12): stored to the last digit, the drone keeps inside all of them at once, or inside any of them with FENCE_OPTIONS (set before the upload), and they are read back."""
+    f = Flight(version, params={"AVOID_ENABLE": 0})
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        r.check(f.ready_to_fly(), "the drone is ready")
+
+        def ask(cfg: dict, seconds: float = 25.0) -> tuple[bool, str] | None:
+            n = len(rec.fences)
+            link.queue_geofence_upload(cfg)
+            f.wait_real(lambda: len(rec.fences) > n, seconds)
+            return rec.fences[-1] if len(rec.fences) > n else None
+
+        def read() -> tuple[dict, tuple[bool, str] | None]:
+            n_states, n = len(rec.fence_states), len(rec.fences)
+            link.queue_geofence_download()
+            f.wait_real(lambda: len(rec.fences) > n, 20)
+            return (rec.fence_states[-1] if len(rec.fence_states) > n_states else {},
+                    rec.fences[-1] if len(rec.fences) > n else None)
+
+        def e7(place) -> tuple[int, int]:
+            return int(round(place[0] * 1e7)), int(round(place[1] * 1e7))
+
+        # The polygon reaches 150 m from home, the circle to stay inside 60 m: all at once, the circle is the fence.
+        big = square_fence(150.0)
+        ring = {"circle": list(offset_to_lat_lon(0.0, 0.0)), "radius_m": 60.0, "inside": True}
+        ring_item = (5003, 60.0, *e7(ring["circle"]))
+        point = list(offset_to_lat_lon(10.0, 0.0))
+        point_item = (5000, 0.0, *e7(point))
+        r.check(sim.get_param("FENCE_OPTIONS") == 0.0,
+                f"this firmware has FENCE_OPTIONS for a copter, at 0 ({sim.get_param('FENCE_OPTIONS')})")
+
+        # --- inside all of them at once (the drone's own way) ---------------------------
+        answer = ask({"points": big, "keepin": [ring], "return_point": point, "alt_max_m": 40.0, "action": 1.0})
+        r.check(answer is not None and answer[0] and "1 more area to stay inside, the drone has to be inside all of "
+                "them at once, a return point" in answer[1], f"the polygon, a circle and a return point: on ({answer})")
+        r.check(fence_on_the_drone(sim) == as_stored(big) + [ring_item, point_item],
+                "the drone holds the polygon, the circle and the return point last, the same to the last digit")
+        r.check(int(sim.get_param("FENCE_TYPE") or 0) == 5 and sim.get_param("FENCE_OPTIONS") == 0.0,
+                f"FENCE_TYPE 5, FENCE_OPTIONS left at 0 ({sim.get_param('FENCE_TYPE')}, {sim.get_param('FENCE_OPTIONS')})")
+        total = sim.get_param("FENCE_TOTAL")
+        r.check(total in (7.0, None), f"FENCE_TOTAL counts the 4 corners and the circle, not the return point: "
+                                      f"5 + 2 = 7 ({total})")
+        link.queue_auto_takeoff(15.0)
+        r.check(f.wait(lambda: sim.armed, 40), "take-off inside all of them: armed")
+        r.check(f.wait(lambda: sim.alt > 14.5, 60), f"climbed to 15 m ({sim.alt:.1f} m)")
+        f.wait(lambda: False, 5)
+        text_since = rec.now()
+        out = sim.fly(60, until=lambda: sim.mode == "RTL", each_second=lambda: fly_at(sim, 4.0, 0.0, 0.0))
+        r.check(out and 55.0 < sim.north < 72.0, f"flown north: it turned back at the circle's edge, 60 m, though the "
+                                                 f"polygon reaches 150 m ({sim.mode} at {sim.north:.0f} m)")
+        f.wait(lambda: False, 3)
+        r.check(any("fence" in t.lower() for t in rec.texts(text_since)),
+                f"and its words reached VGCS {[t for t in rec.texts(text_since) if 'ence' in t][:2]}")
+        r.check(f.wait(lambda: math.hypot(sim.north, sim.east) < 6.0, 90), "it came back over home")
+
+        # --- in flight: inside any of them, its bit set before the circle reaches the drone ---
+        link.queue_mode_change("GUIDED")
+        r.check(f.wait(lambda: sim.mode == "GUIDED", 15), f"GUIDED again ({sim.mode})")
+        f.wait(lambda: False, 3)
+        n, n_questions = len(rec.fences), len(rec.fence_questions)
+        link.queue_geofence_upload({"points": big, "alt_max_m": 40.0, "action": 1.0})
+        f.wait_real(lambda: len(rec.fences) > n or len(rec.fence_questions) > n_questions, 15)
+        asked = rec.fence_questions[-1] if len(rec.fence_questions) > n_questions else {}
+        r.check(len(rec.fences) == n and "a circle to stay inside (60 m); a return point." in str(asked.get("text", "")),
+                f"in flight, the polygon alone would remove the circle and the return point: VGCS asks first "
+                f"({str(asked.get('text', ''))[:90]!r})")
+        answer = ask(dict(asked.get("cfg") or {}))
+        r.check(answer is not None and answer[0], f"after the yes, the polygon alone: on ({answer})")
+        sim.fly(60, until=lambda: sim.mode == "RTL" or sim.north > 100.0, each_second=lambda: fly_at(sim, 4.0, 0.0, 0.0))
+        f.wait(lambda: False, 4)
+        r.check(sim.north > 100.0 and sim.mode == "GUIDED", f"it flies out past 60 m ({sim.north:.0f} m, {sim.mode})")
+        answer = ask({"points": big, "keepin": [ring], "alt_max_m": 40.0, "action": 1.0})
+        r.check(answer is not None and not answer[0] and "outside this fence" in answer[1] and "Not sent" in answer[1],
+                f"{sim.north:.0f} m north, the circle as inside all of them at once: refused ({answer})")
+        answer = ask({"points": big, "keepin": [ring], "union": True, "alt_max_m": 40.0, "action": 1.0})
+        r.check(answer is not None and answer[0] and "inside any of them" in answer[1],
+                f"the circle as inside any of them: on ({answer})")
+        r.check(sim.get_param("FENCE_OPTIONS") == 2.0, f"FENCE_OPTIONS bit 1 set ({sim.get_param('FENCE_OPTIONS')})")
+        f.wait(lambda: False, 5)
+        r.check(sim.mode == "GUIDED", f"the drone, outside the circle, flew on: the bit was set before the circle was on "
+                                      f"it ({sim.mode})")
+        r.check(fence_on_the_drone(sim) == as_stored(big) + [ring_item], "and the drone holds the polygon and the circle")
+        out = sim.fly(80, until=lambda: sim.mode == "RTL", each_second=lambda: fly_at(sim, 4.0, 0.0, 0.0))
+        r.check(out and 140.0 < sim.north < 165.0, f"inside any of them: it turned back at the polygon's edge, 150 m "
+                                                   f"({sim.mode} at {sim.north:.0f} m)")
+        r.check(f.wait(lambda: math.hypot(sim.north, sim.east) < 6.0, 150), "it came back over home")
+        link.queue_auto_land()
+        r.check(f.wait(lambda: not sim.armed, 150), "landed and disarmed")
+
+        # --- reading it back --------------------------------------------------------------
+        state, answer = read()
+        keepin = state.get("keepin") or []
+        r.check(state.get("union") is True and len(keepin) == 1 and keepin[0].get("radius_m") == 60.0
+                and state.get("other") == [], f"Read fence from drone shows the circle and inside any of them ({keepin})")
+        r.check(answer is not None and "it has to be inside any of them" in answer[1], f"and says so ({answer})")
+
+        # --- all at once again: the bit is cleared, after the upload ---------------------------
+        answer = ask({"points": big, "keepin": [ring], "return_point": point, "alt_max_m": 40.0, "action": 1.0})
+        r.check(answer is not None and answer[0] and sim.get_param("FENCE_OPTIONS") == 0.0,
+                f"inside all of them at once again: FENCE_OPTIONS back to 0 ({sim.get_param('FENCE_OPTIONS')})")
+        state, _answer = read()
+        shown = state.get("return_point")
+        r.check(shown is not None and e7(shown) == point_item[2:], f"Read shows the return point ({shown})")
+
+        # --- two circles and a return point, no polygon (FENCE_TOTAL: two points) -------------
+        near = {"circle": list(offset_to_lat_lon(0.0, 20.0)), "radius_m": 50.0, "inside": True}
+        answer = ask({"keepin": [ring, near], "return_point": point, "alt_max_m": 40.0, "action": 1.0})
+        r.check(answer is not None and answer[0] and answer[1].startswith("Fence on: 2 areas to stay inside"),
+                f"two circles to stay inside and a return point, no polygon: on ({answer})")
+        stored = fence_on_the_drone(sim)
+        r.check(stored == [ring_item, (5003, 50.0, *e7(near["circle"])), point_item],
+                f"after the larger fence the drone keeps both circles and the return point ({stored})")
+        total = sim.get_param("FENCE_TOTAL")
+        r.check(total in (0.0, None), f"FENCE_TOTAL 0: two points, the return point is no point ({total})")
+        errors = [e[1] for e in rec.errors if not e[1].startswith("Geofence: ")]
+        r.check(not errors, f"VGCS reported no error but the fence it refused {errors[:3]}")
     finally:
         f.close()
 
@@ -1743,7 +1865,8 @@ def vama_lock_with_vgcs(version: str, r: Report) -> None:
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
          mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_time_on_the_battery,
          mission_speeds, missions_as_they_come_back,
-         another_stations_mission, takeoff_fence_and_land, polygon_fence, nofly_areas, link_silence, signed_commands,
+         another_stations_mission, takeoff_fence_and_land, polygon_fence, nofly_areas, keepin_areas, link_silence,
+         signed_commands,
          signing_seen_without_a_key, vama_lock_with_vgcs]
 
 

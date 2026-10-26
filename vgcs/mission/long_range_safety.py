@@ -39,10 +39,12 @@ from vgcs.mission.fence import (
     TYPE_ALT_MAX,
     TYPE_CIRCLE,
     TYPE_POLYGON,
+    NoFly,
     action_words,
-    distance_inside_m,
-    leaves,
-    nearest_edge_m,
+    inside_gap_m,
+    inside_margin_m,
+    keepin_from_rows,
+    leaves_areas,
     nofly_from_rows,
     nofly_gap_m,
     nofly_outside_m,
@@ -169,6 +171,8 @@ def check_long_range_mission(
     cruise_speed_mps: float | None = None,
     fence_polygon: list | None = None,
     fence_nofly: list | None = None,
+    fence_keepin: list | None = None,
+    fence_union: bool = False,
     end_action: str = "rtl",
     headwind_mps: float = 0.0,
     wind_from: str = "",
@@ -188,6 +192,9 @@ def check_long_range_mission(
     corners: what VGCS sent or read. None when VGCS does not know it.
     ``fence_nofly`` are its areas to stay out of, as the link reports them
     ({"polygon": [...]} or {"circle": [lat, lon], "radius_m": r}).
+    ``fence_keepin`` are its further areas to stay inside, the same way, and
+    ``fence_union`` says whether the drone may be inside any of them (with the
+    polygon) instead of inside all of them at once (DGCA FEN-12, 2026-10-27).
 
     ``end_action`` is what the plan does after its last waypoint (hold, rtl or
     land). ``headwind_mps`` is the wind the way home is timed against, and
@@ -215,7 +222,7 @@ def check_long_range_mission(
 
     p = {str(k).upper(): v for k, v in (params or {}).items()}
     end = str(end_action or "rtl").strip().lower()
-    _check_fence(report, p, home, rtl_home, waypoints, fence_polygon, end, fence_nofly)
+    _check_fence(report, p, home, rtl_home, waypoints, fence_polygon, end, fence_nofly, fence_keepin, fence_union)
     timing = dict(start=home, rtl_home=rtl_home, params=p, takeoff_alt_m=takeoff_alt_m,
                   headwind_mps=headwind_mps, wind_from=wind_from)
     if report.is_long_range:
@@ -233,7 +240,8 @@ def check_long_range_mission(
 
 
 def _check_fence(report: LongRangeReport, p: dict, start, rtl_home, waypoints, fence_polygon,
-                 end_action: str = "rtl", fence_nofly: list | None = None) -> None:
+                 end_action: str = "rtl", fence_nofly: list | None = None, fence_keepin: list | None = None,
+                 fence_union: bool = False) -> None:
     """Does the mission stay inside the fence the vehicle uses, with some room to spare?
 
     FENCE_TYPE says which limits are in use: 1 the max height, 2 the circle
@@ -263,7 +271,8 @@ def _check_fence(report: LongRangeReport, p: dict, start, rtl_home, waypoints, f
     if bits & TYPE_ALT_MAX:
         _check_fence_height(report, p, waypoints)
     if bits & TYPE_POLYGON:
-        _check_fence_polygon(report, start, rtl_home, waypoints, fence_polygon, end_action)
+        _check_fence_polygon(report, start, rtl_home, waypoints, fence_polygon, end_action, fence_keepin,
+                             fence_union)
         # The areas to stay out of are items too, on with the polygon bit (with a circle too).
         _check_nofly(report, p, start, rtl_home, waypoints, fence_nofly, end_action)
 
@@ -353,7 +362,9 @@ def _check_fence_height(report: LongRangeReport, p: dict, waypoints) -> None:
 
 
 def _check_fence_polygon(report: LongRangeReport, start, rtl_home, waypoints, fence_polygon,
-                         end_action: str = "rtl") -> None:
+                         end_action: str = "rtl", fence_keepin: list | None = None, fence_union: bool = False) -> None:
+    """The polygon, and since 2026-10-27 the further areas to stay inside (DGCA FEN-12), as the drone
+    takes them together: inside all of them at once, or inside any of them (``fence_union``)."""
     if fence_polygon is None:
         # A warning, not a line in the log: one press reads the fence.
         report.warnings.append(
@@ -367,69 +378,79 @@ def _check_fence_polygon(report: LongRangeReport, start, rtl_home, waypoints, fe
             corners.append((float(row[0]), float(row[1])))
         except (TypeError, ValueError, IndexError):
             continue
-    if len(corners) < 3:
-        return  # the polygon is chosen as a limit, but the vehicle holds none
+    areas = ([NoFly(corners=tuple(corners), inside=True)] if len(corners) >= 3 else [])
+    areas += keepin_from_rows(fence_keepin)
+    if not areas:
+        return  # the polygon is chosen as a limit, but the vehicle holds no area to stay inside
+    union = bool(fence_union) and len(areas) > 1
+    if len(areas) == 1 and len(corners) >= 3:
+        fence, edge = "the polygon fence", "the polygon fence's edge"     # the words from before 2026-10-27
+    else:
+        fence = "the area to stay inside" if len(areas) == 1 else "the areas to stay inside"
+        edge = f"the edge of {fence}"
+
+    def inside(place) -> float:
+        return inside_margin_m(areas, float(place[0]), float(place[1]), union)
+
     places: list[tuple[int, tuple[float, float]]] = []
     for number, wp in enumerate(waypoints or [], start=1):
         la, lo = _wp_latlon(wp)
         if la is None or lo is None or (abs(la) < 1e-7 and abs(lo) < 1e-7):
             continue
         places.append((number, (la, lo)))
-    outside = [(n, distance_inside_m(corners, la, lo)) for n, (la, lo) in places]
+    outside = [(n, inside(place)) for n, place in places]
     # On the fence counts: the vehicle breaches the moment it is there.
-    outside = [(n, inside) for n, inside in outside if inside < ON_EDGE_M]
+    outside = [(n, room) for n, room in outside if room < ON_EDGE_M]
     if outside:
         several = len(outside) > 1
-        far = max(abs(inside) for _n, inside in outside)
-        where = (f"outside the polygon fence (by up to {far:.0f} m)" if far >= 0.5
-                 else "on the edge of the polygon fence")
+        far = max(abs(room) for _n, room in outside)
+        where = (f"outside {fence} (by up to {far:.0f} m)" if far >= 0.5 else f"on the edge of {fence}")
         report.errors.append(
-            f"{_numbers([n for n, _inside in outside])} {'are' if several else 'is'} {where}. "
+            f"{_numbers([n for n, _room in outside])} {'are' if several else 'is'} {where}. "
             "The vehicle will hit the fence mid-mission. Move the "
             f"waypoint{'s' if several else ''}, or upload a larger fence."
         )
         return
     # Every waypoint is inside. A fence with a dent can still lie between two of them.
     route: list[tuple[str, tuple[float, float]]] = []
-    if start is not None and distance_inside_m(corners, start[0], start[1]) >= 0.0:
+    if start is not None and inside(start) >= 0.0:
         route.append(("the vehicle", (float(start[0]), float(start[1]))))
     route += [(f"waypoint {n}", place) for n, place in places]
     for (name_a, a), (name_b, b) in zip(route, route[1:]):
-        if leaves(corners, a, b):
+        if leaves_areas(areas, a, b, union):
             report.errors.append(
-                f"The straight way from {name_a} to {name_b} leaves the polygon fence and comes back in. "
+                f"The straight way from {name_a} to {name_b} leaves {fence} and comes back in. "
                 "The vehicle will hit the fence there. Add a waypoint to go around, or upload another fence."
             )
             return
     # The way home: RTL flies straight home from where it starts. From the last
     # waypoint that is the plan itself (end action RTL), from any other one a
     # failsafe or a press of Return can start it.
-    home_inside = distance_inside_m(corners, float(rtl_home[0]), float(rtl_home[1])) >= 0.0
-    if home_inside:
-        out_home = [n for n, place in places if leaves(corners, place, rtl_home)]
+    home = (float(rtl_home[0]), float(rtl_home[1]))
+    if inside(home) >= 0.0:
+        out_home = [n for n, place in places if leaves_areas(areas, place, home, union)]
         last = places[-1][0] if places else None
         if last is not None and last in out_home and end_action == "rtl":
             report.errors.append(
                 f"The straight way home from waypoint {last}, where the mission ends with Return to launch, "
-                "leaves the polygon fence. The vehicle will hit the fence on its way home. Add a waypoint to "
+                f"leaves {fence}. The vehicle will hit the fence on its way home. Add a waypoint to "
                 "go around, end the mission with Land or Hold, or upload another fence."
             )
             return
         if out_home:
             report.warnings.append(
-                f"From {_numbers(out_home).lower()}, the straight way home leaves the polygon fence. If the drone "
+                f"From {_numbers(out_home).lower()}, the straight way home leaves {fence}. If the drone "
                 "returns home from there (a failsafe, or Return), it hits the fence on the way."
             )
     # Room to spare: a waypoint, or the flight between two, close to the edge.
-    near = [(n, inside) for n, inside in ((n, distance_inside_m(corners, la, lo)) for n, (la, lo) in places)
-            if inside < FENCE_PLAN_MARGIN_M]
+    near = [(n, room) for n, room in ((n, inside(place)) for n, place in places) if room < FENCE_PLAN_MARGIN_M]
     if near:
-        report.warnings.append(_near_edge_words([n for n, _inside in near], "the polygon fence",
-                                                min(inside for _n, inside in near), FENCE_PLAN_MARGIN_M))
+        report.warnings.append(_near_edge_words([n for n, _room in near], fence,
+                                                min(room for _n, room in near), FENCE_PLAN_MARGIN_M))
         return
     close: list[tuple[str, str, float]] = []
     for (name_a, a), (name_b, b) in zip(route, route[1:]):
-        gap = nearest_edge_m(corners, a, b)
+        gap = inside_gap_m(areas, a, b, union, enough_m=FENCE_PLAN_MARGIN_M)
         if gap < FENCE_PLAN_MARGIN_M:
             close.append((name_a, name_b, gap))
     if close:
@@ -437,7 +458,7 @@ def _check_fence_polygon(report: LongRangeReport, start, rtl_home, waypoints, fe
         others = len(close) - 1
         more = f" ({others} more way{'s' if others > 1 else ''} too)" if others else ""
         report.warnings.append(
-            f"The straight way from {name_a} to {name_b} passes {_down(gap)} m from the polygon fence's edge{more}. "
+            f"The straight way from {name_a} to {name_b} passes {_down(gap)} m from {edge}{more}. "
             f"Keep the flight {FENCE_PLAN_MARGIN_M:.0f} m or more inside: add a waypoint, or move one."
         )
 

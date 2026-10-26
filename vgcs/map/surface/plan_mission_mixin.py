@@ -18,8 +18,11 @@ from vgcs.mission import (
     DEFAULT_MISSION_END_ACTION,
     Waypoint,
     clamp_hover_seconds,
+    load_fence_keepin,
     load_fence_nofly,
     load_fence_polygon,
+    load_fence_return_point,
+    load_fence_union,
     load_mission_end_action,
     load_waypoints_json,
     normalize_end_action,
@@ -563,11 +566,15 @@ class PlanMissionMixin:
             )
             if not path:
                 return
-        # The polygon fence drawn on the map goes into the plan file too, with its areas to stay out of.
+        # The polygon fence drawn on the map goes into the plan file too, with its areas to stay out of,
+        # its further areas to stay inside and its return point.
         fence = self.fence_polygon()
+        keepin = self.fence_keepin()
+        point = self.fence_return_point()
         try:
             save_waypoints_json(path, wps, end_action=self.get_mission_end_action(), fence_polygon=fence,
-                                fence_nofly=self.fence_nofly())
+                                fence_nofly=self.fence_nofly(), fence_keepin=keepin, fence_union=self.fence_union(),
+                                fence_return_point=point)
         except Exception:
             self._set_status("Save failed")
             QMessageBox.warning(self, "Plan Flight", "Could not save the mission file.")
@@ -580,6 +587,10 @@ class PlanMissionMixin:
         nofly = self.fence_nofly()
         if nofly:
             with_fence += f" and {len(nofly)} area{'' if len(nofly) == 1 else 's'} to stay out of"
+        if keepin:
+            with_fence += f" and {len(keepin)} more area{'' if len(keepin) == 1 else 's'} to stay inside"
+        if point is not None:
+            with_fence += " and the return point"
         QMessageBox.information(
             self,
             "Plan saved",
@@ -663,9 +674,12 @@ class PlanMissionMixin:
         try:
             fence = load_fence_polygon(path)
             nofly = load_fence_nofly(path)
+            keepin = load_fence_keepin(path)
+            union = load_fence_union(path)
+            point = load_fence_return_point(path)
             fence_problem = ""
         except Exception as exc:
-            fence, nofly, fence_problem = None, None, str(exc)
+            fence, nofly, keepin, union, point, fence_problem = None, None, None, None, None, str(exc)
         stored_end = load_mission_end_action(path)
         if stored_end:
             self.set_mission_end_action(stored_end)
@@ -693,10 +707,20 @@ class PlanMissionMixin:
             if nm is not None:
                 nm.set_fence_points([[lat, lon] for lat, lon in fence])
                 nm.set_nofly_areas(nofly or [])
+                nm.set_keepin_areas(keepin or [])
+                nm.set_return_point(point)
+            panel = getattr(self, "_plan_flight_panel", None)
+            show_union = getattr(panel, "set_keepin_union", None)
+            if callable(show_union) and union is not None:
+                show_union(union)
             self._refresh_fence_view()
             fence_words = f" and the polygon fence ({len(fence)} corners)" if fence else ""
             if nofly:
                 fence_words += f" and {len(nofly)} area{'' if len(nofly) == 1 else 's'} to stay out of"
+            if keepin:
+                fence_words += f" and {len(keepin)} more area{'' if len(keepin) == 1 else 's'} to stay inside"
+            if point is not None:
+                fence_words += " and the return point"
         said = f"Plan opened: {len(waypoints)} waypoint(s){fence_words}."
         if fence_problem:
             said += f" Its fence was not read: {fence_problem}."

@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from vgcs.mission import clamp_hover_seconds
-from vgcs.mission.fence import NO_NOFLY_WORDS, NO_POLYGON_WORDS
+from vgcs.mission.fence import NO_KEEPIN_WORDS, NO_NOFLY_WORDS, NO_POLYGON_WORDS, NO_RETURN_POINT_WORDS
 from vgcs.mission.long_range_safety import (
     FLIGHT_TIME_SETTING,
     PLANNING_WIND_SETTING,
@@ -1347,6 +1347,9 @@ class PlanFlightPanel(QWidget):
         # Its button used to be on the hidden dashboard only.
         bv.addWidget(self._circle_fence_section())
         bv.addWidget(self._polygon_fence_section())
+        # More areas to stay inside and a return point (2026-10-27, DGCA FEN-12): they go with the polygon.
+        bv.addWidget(self._keepin_section())
+        bv.addWidget(self._return_point_section())
         # Areas to stay out of (2026-10-21): they go with either fence.
         bv.addWidget(self._nofly_section())
         bv.addWidget(self._fence_on_drone_section())
@@ -1475,11 +1478,207 @@ class PlanFlightPanel(QWidget):
         self._fence_polygon_upload_btn = self._geo_button(
             "Upload polygon fence", "planFencePolygonUpload",
             "Send this polygon to the drone on screen and switch it on, with the max height and the "
-            "action above, and the areas to stay out of below. It takes the place of the circle fence.")
+            "action above, and the more areas to stay inside, the return point and the areas to stay out of "
+            "below. It takes the place of the circle fence.")
         self._fence_polygon_upload_btn.clicked.connect(lambda: self.action_requested.emit("fence_upload_polygon"))
         g.addWidget(self._fence_polygon_upload_btn, 4, 0, 1, 2)
         self.set_fence_polygon_state(NO_POLYGON_WORDS, can_upload=False, corners=0)
         return host
+
+    def _keepin_section(self) -> QWidget:
+        """More areas to stay inside: polygons and circles, with the polygon above or without it (DGCA FEN-12)."""
+        host = QWidget()
+        g = QGridLayout(host)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        title = QLabel("More areas to stay inside")
+        title.setProperty("class", "planGeoTitle")
+        g.addWidget(title, 0, 0, 1, 2)
+        lead = self._geo_note("Areas and circles the drone has to stay inside, with the polygon above or without it.")
+        lead.setObjectName("planKeepinLead")
+        g.addWidget(lead, 1, 0, 1, 2)
+        self._keepin_area_btn = self._geo_button(
+            "Draw an area to stay inside", "planKeepinDraw",
+            "Click the map at each corner of an area the drone has to stay inside, in order around it. Drag a "
+            "corner to move it, right-click a corner to remove it. Press again when the area is done.")
+        self._keepin_area_btn.setCheckable(True)
+        self._keepin_area_btn.clicked.connect(
+            lambda on=False: self.action_requested.emit("keepin_draw_on" if on else "keepin_draw_off"))
+        g.addWidget(self._keepin_area_btn, 2, 0, 1, 2)
+        self._keepin_circle_btn = self._geo_button(
+            "Add circles to stay inside", "planKeepinCircles",
+            "Each click on the map puts a circle the drone has to stay inside there, with the radius below. Drag "
+            "a centre to move its circle, right-click a centre to remove it. Press again when done.")
+        self._keepin_circle_btn.setCheckable(True)
+        self._keepin_circle_btn.clicked.connect(
+            lambda on=False: self.action_requested.emit("keepin_circle_on" if on else "keepin_circle_off"))
+        g.addWidget(self._keepin_circle_btn, 3, 0, 1, 2)
+        g.addWidget(self._field_label("Circle radius (m)"), 4, 0)
+        self._keepin_radius_spin = QDoubleSpinBox()
+        self._keepin_radius_spin.setObjectName("planKeepinRadius")
+        self._keepin_radius_spin.setProperty("class", "planPatternSpin")
+        self._keepin_radius_spin.setRange(5.0, 20000.0)
+        self._keepin_radius_spin.setDecimals(0)
+        self._keepin_radius_spin.setSingleStep(10.0)
+        self._keepin_radius_spin.setValue(200.0)
+        self._keepin_radius_spin.setSuffix(" m")
+        self._keepin_radius_spin.setToolTip("The radius of the next circle to stay inside placed on the map.")
+        self._keepin_radius_spin.valueChanged.connect(lambda _v: self.action_requested.emit("keepin_radius"))
+        g.addWidget(self._keepin_radius_spin, 4, 1)
+        self._keepin_list = QListWidget()
+        self._keepin_list.setObjectName("planKeepinList")
+        self._keepin_list.setMaximumHeight(96)
+        self._keepin_list.setToolTip("The areas to stay inside on the map, by their number there (Inside 1, ...).")
+        self._keepin_list.currentRowChanged.connect(lambda _r: self._show_keepin_buttons())
+        g.addWidget(self._keepin_list, 5, 0, 1, 2)
+        self._keepin_undo_btn = self._geo_button("Remove last corner", "planKeepinUndo",
+                                                 "Take back the corner added last to the area drawn now.")
+        self._keepin_undo_btn.clicked.connect(lambda: self.action_requested.emit("keepin_undo"))
+        self._keepin_remove_btn = self._geo_button("Remove chosen", "planKeepinRemove",
+                                                   "Remove the area chosen in the list from the map.")
+        self._keepin_remove_btn.clicked.connect(lambda: self.action_requested.emit("keepin_remove"))
+        g.addWidget(self._keepin_undo_btn, 6, 0)
+        g.addWidget(self._keepin_remove_btn, 6, 1)
+        self._keepin_clear_btn = self._geo_button(
+            "Remove all", "planKeepinClear",
+            "Remove every area to stay inside from the map (not the polygon). The fence on the drone stays as it is.")
+        self._keepin_clear_btn.clicked.connect(lambda: self.action_requested.emit("keepin_clear"))
+        g.addWidget(self._keepin_clear_btn, 7, 0, 1, 2)
+        g.addWidget(self._field_label("The drone has to be"), 8, 0)
+        self._keepin_union_combo = QComboBox()
+        self._keepin_union_combo.setObjectName("planKeepinUnion")
+        self._keepin_union_combo.addItem("Inside all of them at once")
+        self._keepin_union_combo.addItem("Inside any of them")
+        self._keepin_union_combo.setToolTip(
+            "With two or more areas to stay inside (the polygon counts too). Inside all of them at once: only where "
+            "they overlap, as ArduPilot does on its own. Inside any of them: needs ArduCopter 4.6 or newer "
+            "(FENCE_OPTIONS).")
+        self._keepin_union_combo.currentIndexChanged.connect(lambda _i: self.action_requested.emit("keepin_union"))
+        g.addWidget(self._keepin_union_combo, 8, 1)
+        self._keepin_status = self._geo_note("")
+        self._keepin_status.setObjectName("planKeepinStatus")
+        g.addWidget(self._keepin_status, 9, 0, 1, 2)
+        self._keepin_upload_btn = self._geo_button(
+            "Upload areas to stay inside", "planKeepinUpload",
+            "Send these areas to the drone on screen and switch them on, with the polygon above when there is one, "
+            "the return point and the areas to stay out of below, and the max height and the action at the top. "
+            "It takes the place of the circle fence.")
+        self._keepin_upload_btn.clicked.connect(lambda: self.action_requested.emit("fence_upload_keepin"))
+        g.addWidget(self._keepin_upload_btn, 10, 0, 1, 2)
+        self._keepin_mode = ""
+        self._keepin_corners = 0
+        self._keepin_can_upload = False
+        self.set_keepin_state(NO_KEEPIN_WORDS, [], mode="", corners=0)
+        return host
+
+    def keepin_radius_m(self) -> float:
+        return float(self._keepin_radius_spin.value())
+
+    def selected_keepin_index(self) -> int | None:
+        row = self._keepin_list.currentRow()
+        return row if 0 <= row < self._keepin_list.count() else None
+
+    def keepin_union(self) -> bool:
+        """The drone may be inside any of the areas to stay inside, not all of them at once."""
+        return self._keepin_union_combo.currentIndex() == 1
+
+    def set_keepin_union(self, union: bool) -> None:
+        """Show how the drone takes its areas to stay inside (read from it). Emits nothing."""
+        index = 1 if union else 0
+        if self._keepin_union_combo.currentIndex() != index:
+            self._keepin_union_combo.blockSignals(True)
+            self._keepin_union_combo.setCurrentIndex(index)
+            self._keepin_union_combo.blockSignals(False)
+
+    def set_keepin_state(self, text: str, rows: list[str], *, mode: str, corners: int, can_upload: bool = False,
+                         union_matters: bool = False) -> None:
+        """What the map holds of areas to stay inside, and which drawing tool is on. Emits nothing.
+
+        union_matters: there are two areas to stay inside or more (the polygon counts), so how the drone
+        takes them together makes a difference.
+        """
+        self._keepin_status.setText(str(text or ""))
+        self._keepin_can_upload = bool(can_upload)
+        self._set_list_rows(self._keepin_list, rows)
+        self._keepin_mode, self._keepin_corners = str(mode or ""), int(corners)
+        for btn, on, words in ((self._keepin_area_btn, self._keepin_mode == "polygon",
+                                ("Drawing: click its corners", "Draw an area to stay inside")),
+                               (self._keepin_circle_btn, self._keepin_mode == "circle",
+                                ("Placing: click the map", "Add circles to stay inside"))):
+            self._set_checked(btn, on)
+            btn.setText(words[0] if on else words[1])
+        self._keepin_union_combo.setEnabled(bool(union_matters))
+        self._show_keepin_buttons()
+
+    def _show_keepin_buttons(self) -> None:
+        has = self._keepin_list.count() > 0
+        self._keepin_undo_btn.setEnabled(self._keepin_mode == "polygon" and self._keepin_corners > 0)
+        self._keepin_remove_btn.setEnabled(has and self.selected_keepin_index() is not None)
+        self._keepin_clear_btn.setEnabled(has)
+        self._keepin_upload_btn.setEnabled(has and self._keepin_can_upload)
+
+    def _return_point_section(self) -> QWidget:
+        """The fence's return point (DGCA FEN-12). A multicopter keeps it, and does not fly to it."""
+        host = QWidget()
+        g = QGridLayout(host)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        title = QLabel("Return point")
+        title.setProperty("class", "planGeoTitle")
+        g.addWidget(title, 0, 0, 1, 2)
+        lead = self._geo_note("ArduCopter keeps the return point with its fence, but does not fly to it: on a breach "
+                              "it does the action at the top. Only ArduPlane flies to it.")
+        lead.setObjectName("planReturnPointLead")
+        g.addWidget(lead, 1, 0, 1, 2)
+        self._return_point_btn = self._geo_button(
+            "Set return point", "planReturnPointSet",
+            "Then click the map where the return point goes. It has to be inside the areas to stay inside.")
+        self._return_point_btn.setCheckable(True)
+        self._return_point_btn.clicked.connect(
+            lambda on=False: self.action_requested.emit("return_point_on" if on else "return_point_off"))
+        self._return_point_clear_btn = self._geo_button(
+            "Remove return point", "planReturnPointClear",
+            "Remove the return point from the map. The fence on the drone stays as it is.")
+        self._return_point_clear_btn.clicked.connect(lambda: self.action_requested.emit("return_point_clear"))
+        g.addWidget(self._return_point_btn, 2, 0)
+        g.addWidget(self._return_point_clear_btn, 2, 1)
+        self._return_point_status = self._geo_note("")
+        self._return_point_status.setObjectName("planReturnPointStatus")
+        g.addWidget(self._return_point_status, 3, 0, 1, 2)
+        self.set_return_point_state(NO_RETURN_POINT_WORDS, has_point=False, picking=False)
+        return host
+
+    def set_return_point_state(self, text: str, *, has_point: bool, picking: bool) -> None:
+        """Whether there is a return point on the map, and whether the next click puts it. Emits nothing."""
+        self._return_point_status.setText(str(text or ""))
+        self._set_checked(self._return_point_btn, bool(picking))
+        self._return_point_btn.setText("Click the map for it" if picking
+                                       else ("Move return point" if has_point else "Set return point"))
+        self._return_point_clear_btn.setEnabled(bool(has_point))
+
+    @staticmethod
+    def _set_checked(btn: QPushButton, on: bool) -> None:
+        if btn.isChecked() != bool(on):
+            btn.blockSignals(True)
+            btn.setChecked(bool(on))
+            btn.blockSignals(False)
+
+    @staticmethod
+    def _set_list_rows(widget: QListWidget, rows) -> None:
+        """Fill a list with these lines, keeping the row chosen where it can stay."""
+        wanted = [str(r) for r in rows or []]
+        shown = [widget.item(i).text() for i in range(widget.count())]
+        if wanted == shown:
+            return
+        row = widget.currentRow()
+        widget.blockSignals(True)
+        widget.clear()
+        widget.addItems(wanted)
+        if wanted:
+            widget.setCurrentRow(min(max(row, 0), len(wanted) - 1) if row >= 0 else -1)
+        widget.blockSignals(False)
 
     def _nofly_section(self) -> QWidget:
         host = QWidget()
@@ -1575,25 +1774,13 @@ class PlanFlightPanel(QWidget):
         """
         self._nofly_status.setText(str(text or ""))
         self._nofly_can_upload = bool(can_upload)
-        wanted = [str(r) for r in rows or []]
-        shown = [self._nofly_list.item(i).text() for i in range(self._nofly_list.count())]
-        if wanted != shown:
-            row = self._nofly_list.currentRow()
-            self._nofly_list.blockSignals(True)
-            self._nofly_list.clear()
-            self._nofly_list.addItems(wanted)
-            if wanted:
-                self._nofly_list.setCurrentRow(min(max(row, 0), len(wanted) - 1) if row >= 0 else -1)
-            self._nofly_list.blockSignals(False)
+        self._set_list_rows(self._nofly_list, rows)
         self._nofly_mode, self._nofly_corners = str(mode or ""), int(corners)
         for btn, on, words in ((self._nofly_area_btn, self._nofly_mode == "polygon",
                                 ("Drawing: click its corners", "Draw a no-fly area")),
                                (self._nofly_circle_btn, self._nofly_mode == "circle",
                                 ("Placing: click the map", "Add no-fly circles"))):
-            if btn.isChecked() != on:
-                btn.blockSignals(True)
-                btn.setChecked(on)
-                btn.blockSignals(False)
+            self._set_checked(btn, on)
             btn.setText(words[0] if on else words[1])
         self._show_nofly_buttons()
 
@@ -1615,7 +1802,8 @@ class PlanFlightPanel(QWidget):
         g.addWidget(title, 0, 0, 1, 2)
         read = self._geo_button(
             "Read fence from drone", "planFenceDownload",
-            "Ask the drone on screen for its fence: whether it is on, its limits, and its polygon.")
+            "Ask the drone on screen for its fence: whether it is on, its limits, its polygon, its areas and its "
+            "return point.")
         read.clicked.connect(lambda: self.action_requested.emit("fence_download"))
         off = self._geo_button("Switch fence off", "planFenceOff",
                                "Switch the fence off on the drone on screen. Asks first.")

@@ -46,26 +46,39 @@ def save_waypoints_json(
     end_action: str | None = None,
     fence_polygon: list[tuple[float, float]] | None = None,
     fence_nofly: list[dict] | None = None,
+    fence_keepin: list[dict] | None = None,
+    fence_union: bool = False,
+    fence_return_point: tuple[float, float] | None = None,
 ) -> None:
     """Write the plan file. ``end_action`` (hold/rtl/land) is stored when given, and so is the
     polygon fence drawn on the map (``fence_polygon``: its corners in order) and its areas to
     stay out of (``fence_nofly``: {"polygon": [...]} or {"circle": [lat, lon], "radius_m": r}).
+    So are its further areas to stay inside (``fence_keepin``, the same rows), whether the drone
+    may be inside any of them (``fence_union``), and its return point (``fence_return_point``).
 
-    Version 4 added the fence, version 5 the areas to stay out of. Readers of older
-    versions ignore what they do not know.
+    Version 4 added the fence, version 5 the areas to stay out of, version 6 (2026-10-27) the
+    areas to stay inside and the return point. Readers of older versions ignore what they do not
+    know.
     """
     payload: dict[str, object] = {
-        "version": 5,
+        "version": 6,
         "waypoints": [asdict(wp) for wp in waypoints],
     }
     if end_action:
         payload["end_action"] = str(end_action)
     corners = [[float(lat), float(lon)] for lat, lon in (fence_polygon or [])]
     nofly = [dict(row) for row in (fence_nofly or []) if isinstance(row, dict)]
-    if corners or nofly:
-        payload["fence"] = {"polygon": corners}
+    keepin = [dict(row, inside=True) for row in (fence_keepin or []) if isinstance(row, dict)]
+    if corners or nofly or keepin or fence_return_point is not None:
+        fence: dict[str, object] = {"polygon": corners}
         if nofly:
-            payload["fence"]["nofly"] = nofly
+            fence["nofly"] = nofly
+        if keepin:
+            fence["keepin"] = keepin
+            fence["union"] = bool(fence_union)
+        if fence_return_point is not None:
+            fence["return_point"] = [float(fence_return_point[0]), float(fence_return_point[1])]
+        payload["fence"] = fence
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -157,6 +170,55 @@ def load_fence_nofly(path: str | Path) -> list[dict] | None:
     if problem:
         raise ValueError(problem[:1].lower() + problem[1:].rstrip("."))
     return [area.row() for area in areas]
+
+
+def _fence_of(path: str | Path) -> dict | None:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    fence = raw.get("fence") if isinstance(raw, dict) else None
+    return fence if isinstance(fence, dict) else None
+
+
+def load_fence_keepin(path: str | Path) -> list[dict] | None:
+    """The further areas to stay inside stored with a plan file (version 6), as the map takes them.
+
+    None when the file holds none. Raises ValueError, naming the area, when one cannot be read.
+    """
+    from vgcs.mission.fence import check_keepin
+
+    fence = _fence_of(path)
+    rows = fence.get("keepin") if fence is not None else None
+    if rows is None:
+        return None
+    if not isinstance(rows, list):
+        raise ValueError("its areas to stay inside are not a list")
+    areas, problem = check_keepin(rows)
+    if problem:
+        raise ValueError(problem[:1].lower() + problem[1:].rstrip("."))
+    return [area.row() for area in areas]
+
+
+def load_fence_union(path: str | Path) -> bool | None:
+    """Whether the drone may be inside any of the areas to stay inside (version 6). None when not stored."""
+    fence = _fence_of(path)
+    value = fence.get("union") if fence is not None else None
+    return value if isinstance(value, bool) else None
+
+
+def load_fence_return_point(path: str | Path) -> tuple[float, float] | None:
+    """The return point stored with a plan file (version 6). None when there is none.
+
+    Raises ValueError when the file holds one that is no position.
+    """
+    from vgcs.mission.fence import check_return_point
+
+    fence = _fence_of(path)
+    row = fence.get("return_point") if fence is not None else None
+    if row is None:
+        return None
+    point, problem = check_return_point(row)
+    if problem:
+        raise ValueError("its return point is not a latitude and longitude")
+    return point
 
 
 def load_mission_end_action(path: str | Path) -> str | None:

@@ -315,6 +315,12 @@ class FenceJob:
         self.started = float(now)
         self.corners: list = []
         self.nofly: list = []              # the areas to stay out of (vgcs.mission.fence.NoFly)
+        self.keepin: list = []             # the further areas to stay inside (NoFly with inside)
+        self.inside_areas: list = []       # every area to stay inside: the polygon (as a NoFly) and keepin
+        self.return_point = None           # (lat, lon), or None
+        self.union = False                 # the drone may be inside any area to stay inside, not all at once
+        self.options: int | None = None    # FENCE_OPTIONS read before the upload (None: not read, or none)
+        self.union_set_before = False      # its union bit was set before the upload (fence_link.py)
         self.items: list = []
         self.radius_m = 0.0
         self.alt_max_m = 0.0

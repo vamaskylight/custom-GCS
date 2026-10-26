@@ -610,7 +610,8 @@ class NativeTileMapView(QWidget):
         # {"circle": (lat, lon), "radius_m": r}. Red and hatched; solid when the
         # drone uses these very areas, dashed otherwise.
         self._nofly: list[dict] = []
-        self._nofly_mode = ""                # "", "polygon" (corners of the area drawn now), "circle"
+        # "", "polygon" (corners of the area drawn now), "circle", "return" (the next click is the return point)
+        self._nofly_mode = ""
         self._nofly_target: int | None = None
         self._nofly_radius_m = 50.0
         self._nofly_on_drone = False
@@ -619,6 +620,16 @@ class NativeTileMapView(QWidget):
         self._nofly_drag: tuple[int, int] | None = None
         self._nofly_drag_press_screen: QPointF | None = None
         self._nofly_dragging = False
+        # Further areas to stay inside (2026-10-27, DGCA FEN-12) are in the same list, marked
+        # "inside": True, and drawn in the polygon's colours. The tool adds this kind now:
+        self._nofly_inside = False
+        self._keepin_radius_m = 200.0
+        self._keepin_on_drone = False
+        self._keepin_tag = ""
+        # The fence's return point (item 5000), put with one click in "return" mode.
+        self._return_point: tuple[float, float] | None = None
+        self._return_point_on_drone = False
+        self._return_point_tag = ""
         # Dragging a corner of the fence, while the fence tool is on.
         self._fence_drag_index: int | None = None
         self._fence_drag_press_screen: QPointF | None = None
@@ -919,27 +930,45 @@ class NativeTileMapView(QWidget):
 
     def nofly_areas(self) -> list[dict]:
         """The areas to stay out of on the map, as the link takes them."""
-        out: list[dict] = []
-        for area in self._nofly:
-            if "circle" in area:
-                lat, lon = area["circle"]
-                out.append({"circle": [lat, lon], "radius_m": float(area["radius_m"])})
-            else:
-                out.append({"polygon": [[lat, lon] for lat, lon in area["polygon"]]})
-        return out
+        return [self._area_row(area) for area in self._nofly if not area.get("inside")]
+
+    def keepin_areas(self) -> list[dict]:
+        """The further areas to stay inside on the map, as the link takes them (each with "inside": True)."""
+        return [self._area_row(area) for area in self._nofly if area.get("inside")]
+
+    @staticmethod
+    def _area_row(area: dict) -> dict:
+        if "circle" in area:
+            lat, lon = area["circle"]
+            row = {"circle": [lat, lon], "radius_m": float(area["radius_m"])}
+        else:
+            row = {"polygon": [[lat, lon] for lat, lon in area["polygon"]]}
+        if area.get("inside"):
+            row["inside"] = True
+        return row
 
     def set_nofly_areas(self, rows) -> None:
         """Show areas that did not come from clicks here (read from the drone, or a plan file)."""
-        areas: list[dict] = []
+        self._set_areas(rows, inside=False)
+
+    def set_keepin_areas(self, rows) -> None:
+        """Show areas to stay inside that did not come from clicks here. The areas to stay out of stay."""
+        self._set_areas(rows, inside=True)
+
+    def _set_areas(self, rows, inside: bool) -> None:
+        areas = [area for area in self._nofly if bool(area.get("inside")) != inside]   # the other kind stays
         for row in rows or []:
             try:
                 if "circle" in row:
-                    areas.append({"circle": (float(row["circle"][0]), float(row["circle"][1])),
-                                  "radius_m": float(row["radius_m"])})
+                    area = {"circle": (float(row["circle"][0]), float(row["circle"][1])),
+                            "radius_m": float(row["radius_m"])}
                 else:
-                    areas.append({"polygon": [(float(p[0]), float(p[1])) for p in row["polygon"]]})
+                    area = {"polygon": [(float(p[0]), float(p[1])) for p in row["polygon"]]}
             except (TypeError, ValueError, IndexError, KeyError):
                 continue
+            if inside:
+                area["inside"] = True
+            areas.append(area)
         self._nofly = areas
         self._nofly_mode = ""
         self._nofly_target = None
@@ -948,38 +977,101 @@ class NativeTileMapView(QWidget):
         self.update()
 
     def nofly_mode(self) -> str:
-        return self._nofly_mode
+        """The tool on for areas to stay out of: "", "polygon" or "circle"."""
+        return self._nofly_mode if self._nofly_mode in ("polygon", "circle") and not self._nofly_inside else ""
+
+    def keepin_mode(self) -> str:
+        """The tool on for areas to stay inside: "", "polygon" or "circle"."""
+        return self._nofly_mode if self._nofly_mode in ("polygon", "circle") and self._nofly_inside else ""
+
+    def return_point_mode(self) -> bool:
+        """The next click on the map puts the return point."""
+        return self._nofly_mode == "return"
+
+    def area_drawing_corners(self) -> int:
+        """The corners of the area drawn now (either kind). 0 when none is drawn."""
+        target = self._nofly_target
+        if self._nofly_mode != "polygon" or target is None or not 0 <= target < len(self._nofly):
+            return 0
+        return len(self._nofly[target].get("polygon") or [])
 
     def start_nofly_polygon(self) -> None:
         """Clicks add corners to a new area to stay out of from now on."""
+        self._start_area_polygon(inside=False)
+
+    def start_keepin_polygon(self) -> None:
+        """Clicks add corners to a new area to stay inside from now on."""
+        self._start_area_polygon(inside=True)
+
+    def _start_area_polygon(self, inside: bool) -> None:
         self._clear_pending_plan_map_taps()
         self._drop_empty_nofly_target()
         self._add_wp_mode = False
         self._fence_draw_mode = False
-        self._nofly.append({"polygon": []})
+        self._nofly.append({"polygon": [], "inside": True} if inside else {"polygon": []})
         self._nofly_target = len(self._nofly) - 1
         self._nofly_mode = "polygon"
+        self._nofly_inside = inside
         self.set_inspected_point(None, None)
         self.update()
 
     def start_nofly_circles(self, radius_m: float | None = None) -> None:
         """Each click puts a circle to stay out of there, with the radius set."""
+        self._start_area_circles(radius_m, inside=False)
+
+    def start_keepin_circles(self, radius_m: float | None = None) -> None:
+        """Each click puts a circle to stay inside there, with the radius set for those."""
+        self._start_area_circles(radius_m, inside=True)
+
+    def _start_area_circles(self, radius_m: float | None, inside: bool) -> None:
         self._clear_pending_plan_map_taps()
         self._drop_empty_nofly_target()
         self._add_wp_mode = False
         self._fence_draw_mode = False
         if radius_m is not None:
-            self.set_nofly_radius(radius_m)
+            (self.set_keepin_radius if inside else self.set_nofly_radius)(radius_m)
         self._nofly_mode = "circle"
+        self._nofly_inside = inside
         self.set_inspected_point(None, None)
         self.update()
 
     def set_nofly_radius(self, radius_m: float) -> None:
-        """The radius of the next circle placed."""
+        """The radius of the next circle to stay out of placed."""
         try:
             self._nofly_radius_m = max(1.0, float(radius_m))
         except (TypeError, ValueError):
             pass
+
+    def set_keepin_radius(self, radius_m: float) -> None:
+        """The radius of the next circle to stay inside placed."""
+        try:
+            self._keepin_radius_m = max(1.0, float(radius_m))
+        except (TypeError, ValueError):
+            pass
+
+    def start_return_point(self) -> None:
+        """The next click on the map puts the fence's return point there."""
+        self._clear_pending_plan_map_taps()
+        self._drop_empty_nofly_target()
+        self._add_wp_mode = False
+        self._fence_draw_mode = False
+        self._nofly_mode = "return"
+        self.set_inspected_point(None, None)
+        self.update()
+
+    def return_point(self) -> tuple[float, float] | None:
+        """The return point on the map, or None."""
+        return self._return_point
+
+    def set_return_point(self, point) -> None:
+        """Show a return point that did not come from a click here (read from the drone, a plan file). None removes it."""
+        try:
+            self._return_point = None if point is None else (float(point[0]), float(point[1]))
+        except (TypeError, ValueError, IndexError):
+            self._return_point = None
+        if self._nofly_mode == "return":
+            self._nofly_mode = ""
+        self.update()
 
     def stop_nofly_drawing(self) -> None:
         self._clear_pending_plan_map_taps()
@@ -997,23 +1089,45 @@ class NativeTileMapView(QWidget):
                 self._nofly.pop(target)
 
     def remove_nofly_area(self, index: int) -> bool:
-        if not 0 <= int(index) < len(self._nofly):
+        """Remove the index-th area to stay out of, as nofly_areas() lists them."""
+        return self._remove_area(self._area_index(int(index), inside=False))
+
+    def remove_keepin_area(self, index: int) -> bool:
+        """Remove the index-th area to stay inside, as keepin_areas() lists them."""
+        return self._remove_area(self._area_index(int(index), inside=True))
+
+    def _area_index(self, index: int, inside: bool) -> int:
+        """Where the index-th area of one kind is in the list of both. -1 when there is none."""
+        kind = [i for i, area in enumerate(self._nofly) if bool(area.get("inside")) == inside]
+        return kind[index] if 0 <= index < len(kind) else -1
+
+    def _remove_area(self, at: int) -> bool:
+        if not 0 <= at < len(self._nofly):
             return False
-        self._nofly.pop(int(index))
+        self._nofly.pop(at)
         if self._nofly_target is not None:
-            if self._nofly_target == int(index):
+            if self._nofly_target == at:
                 self._nofly_target = None
                 if self._nofly_mode == "polygon":
                     self._nofly_mode = ""
-            elif self._nofly_target > int(index):
+            elif self._nofly_target > at:
                 self._nofly_target -= 1
         self.update()
         return True
 
     def clear_nofly_areas(self) -> None:
-        self._nofly = []
-        self._nofly_target = None
-        if self._nofly_mode == "polygon":
+        self._clear_areas(inside=False)
+
+    def clear_keepin_areas(self) -> None:
+        self._clear_areas(inside=True)
+
+    def _clear_areas(self, inside: bool) -> None:
+        """Remove every area of one kind. An area of the other kind drawn now stays the one drawn."""
+        target = self._nofly_target
+        drawn = self._nofly[target] if target is not None and 0 <= target < len(self._nofly) else None
+        self._nofly = [area for area in self._nofly if bool(area.get("inside")) != inside]
+        self._nofly_target = next((i for i, area in enumerate(self._nofly) if area is drawn), None)
+        if self._nofly_target is None and self._nofly_mode == "polygon":
             self._nofly_mode = ""
         self.update()
 
@@ -1034,10 +1148,28 @@ class NativeTileMapView(QWidget):
         self._nofly_tag = tag
         self.update()
 
+    def set_keepin_look(self, on_drone: bool, tag: str = "") -> None:
+        """Green and solid for the areas to stay inside the drone uses, amber and dashed for a drawing."""
+        on_drone, tag = bool(on_drone), str(tag or "")
+        if on_drone == self._keepin_on_drone and tag == self._keepin_tag:
+            return
+        self._keepin_on_drone = on_drone
+        self._keepin_tag = tag
+        self.update()
+
+    def set_return_point_look(self, on_drone: bool, tag: str = "") -> None:
+        on_drone, tag = bool(on_drone), str(tag or "")
+        if on_drone == self._return_point_on_drone and tag == self._return_point_tag:
+            return
+        self._return_point_on_drone = on_drone
+        self._return_point_tag = tag
+        self.update()
+
     def _nofly_hit(self, pos: QPointF) -> tuple[int, int] | None:
-        """The corner of the area drawn now, or in circle mode a circle's centre, under the pointer."""
+        """The corner of the area drawn now, or in circle mode a circle's centre (of the kind placed now), under
+        the pointer."""
         vf = self._view_frame()
-        if vf is None or not self._nofly_mode:
+        if vf is None or self._nofly_mode not in ("polygon", "circle"):
             return None
         z, fx, fy, w, h = vf
         if self._nofly_mode == "polygon":
@@ -1046,7 +1178,8 @@ class NativeTileMapView(QWidget):
                 return None
             places = [(target, i, p) for i, p in enumerate(self._nofly[target].get("polygon") or [])]
         else:
-            places = [(i, -1, area["circle"]) for i, area in enumerate(self._nofly) if "circle" in area]
+            places = [(i, -1, area["circle"]) for i, area in enumerate(self._nofly)
+                      if "circle" in area and bool(area.get("inside")) == self._nofly_inside]
         best, best_d2 = None, 14.0 * 14.0 + 1.0
         for area, corner, (lat, lon) in places:
             c = self._project(lat, lon, z, fx, fy, w, h)
@@ -1062,7 +1195,13 @@ class NativeTileMapView(QWidget):
                 return
             self._nofly[target]["polygon"].append((lat, lon))
         elif self._nofly_mode == "circle":
-            self._nofly.append({"circle": (lat, lon), "radius_m": float(self._nofly_radius_m)})
+            if self._nofly_inside:
+                self._nofly.append({"circle": (lat, lon), "radius_m": float(self._keepin_radius_m), "inside": True})
+            else:
+                self._nofly.append({"circle": (lat, lon), "radius_m": float(self._nofly_radius_m)})
+        elif self._nofly_mode == "return":
+            self._return_point = (lat, lon)
+            self._nofly_mode = ""              # one click puts it
         else:
             return
         self.update()
@@ -1080,7 +1219,7 @@ class NativeTileMapView(QWidget):
     def _nofly_remove_hit(self, hit: tuple[int, int]) -> None:
         area, corner = hit
         if corner < 0:
-            self.remove_nofly_area(area)
+            self._remove_area(area)
         else:
             self._nofly[area]["polygon"].pop(corner)
             self.update()
@@ -1122,6 +1261,7 @@ class NativeTileMapView(QWidget):
         self._nofly = []
         self._nofly_target = None
         self._nofly_mode = ""
+        self._return_point = None
         self.update()
 
     def set_mission_nav_seq(self, seq: int) -> None:
@@ -1686,10 +1826,20 @@ class NativeTileMapView(QWidget):
 
         # Areas to stay out of: red and hatched. Solid when the drone uses these
         # very areas, dashed for a drawing. Each is named "No-fly 1", "No-fly 2"...
+        # Areas to stay inside ("Inside 1"...) and the return point are drawn in
+        # the polygon's colours (2026-10-27).
         if self._nofly:
             painter.save()
             try:
                 self._paint_nofly(painter, z, fx, fy, w, h)
+            except Exception:
+                pass
+            finally:
+                painter.restore()
+        if self._return_point is not None:
+            painter.save()
+            try:
+                self._paint_return_point(painter, z, fx, fy, w, h)
             except Exception:
                 pass
             finally:
@@ -2122,17 +2272,31 @@ class NativeTileMapView(QWidget):
             self.user_waypoints_changed.emit()
 
     def _paint_nofly(self, painter: QPainter, z, fx, fy, w, h) -> None:
-        on_drone = bool(self._nofly_on_drone)
-        colour = QColor(240, 70, 70, 240)
-        pen = QPen(colour)
-        pen.setWidth(3 if on_drone else 2)
-        if not on_drone:
-            pen.setStyle(Qt.PenStyle.DashLine)
-        tint = QBrush(QColor(240, 70, 70, 45))
-        hatch = QBrush(QColor(240, 70, 70, 110), Qt.BrushStyle.BDiagPattern)
+        """Areas to stay out of: red and hatched. Areas to stay inside (2026-10-27): the polygon's colours (green
+        and solid in use, amber and dashed for a drawing), lightly tinted. Each kind is counted on its own."""
         painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         metrics = painter.fontMetrics()
-        for number, area in enumerate(self._nofly, start=1):
+        counts = {False: 0, True: 0}
+        for index, area in enumerate(self._nofly):
+            inside = bool(area.get("inside"))
+            counts[inside] += 1
+            number = counts[inside]
+            if inside:
+                on_drone = bool(self._keepin_on_drone)
+                colour = QColor(90, 230, 140, 240) if on_drone else QColor(255, 196, 60, 240)
+                tint = QBrush(QColor(colour.red(), colour.green(), colour.blue(), 28))
+                hatch = None
+                name, tag = f"Inside {number}", self._keepin_tag
+            else:
+                on_drone = bool(self._nofly_on_drone)
+                colour = QColor(240, 70, 70, 240)
+                tint = QBrush(QColor(240, 70, 70, 45))
+                hatch = QBrush(QColor(240, 70, 70, 110), Qt.BrushStyle.BDiagPattern)
+                name, tag = f"No-fly {number}", self._nofly_tag
+            pen = QPen(colour)
+            pen.setWidth(3 if on_drone else 2)
+            if not on_drone:
+                pen.setStyle(Qt.PenStyle.DashLine)
             if "circle" in area:
                 lat, lon = area["circle"]
                 ring = [self._project(la, lo, z, fx, fy, w, h)
@@ -2150,12 +2314,13 @@ class NativeTileMapView(QWidget):
                 shape = QPolygonF(ring)
                 painter.setBrush(tint)
                 painter.drawPolygon(shape)
-                painter.setBrush(hatch)
-                painter.drawPolygon(shape)
+                if hatch is not None:
+                    painter.setBrush(hatch)
+                    painter.drawPolygon(shape)
             else:
                 for i in range(1, len(ring)):
                     painter.drawLine(ring[i - 1], ring[i])
-            editing = self._nofly_mode == "polygon" and self._nofly_target == number - 1
+            editing = self._nofly_mode == "polygon" and self._nofly_target == index
             for i, pt in enumerate(corners):
                 painter.setPen(QPen(colour, 2))
                 painter.setBrush(QColor(20, 24, 30, 235))
@@ -2165,11 +2330,11 @@ class NativeTileMapView(QWidget):
                     painter.fillRect(label, QColor(0, 0, 0, 170))
                     painter.setPen(QColor(255, 255, 255))
                     painter.drawText(label, Qt.AlignmentFlag.AlignCenter, str(i + 1))
-            if centre is not None and self._nofly_mode == "circle":
+            if centre is not None and self._nofly_mode == "circle" and self._nofly_inside == inside:
                 painter.setPen(QPen(colour, 2))
                 painter.drawLine(QPointF(centre.x() - 6.0, centre.y() - 6.0), QPointF(centre.x() + 6.0, centre.y() + 6.0))
                 painter.drawLine(QPointF(centre.x() - 6.0, centre.y() + 6.0), QPointF(centre.x() + 6.0, centre.y() - 6.0))
-            words = f"No-fly {number}" + (f": {self._nofly_tag}" if self._nofly_tag else "")
+            words = name + (f": {tag}" if tag else "")
             top = min(ring, key=lambda p: p.y())
             tw = metrics.horizontalAdvance(words) + 10
             th = metrics.height() + 4
@@ -2178,6 +2343,32 @@ class NativeTileMapView(QWidget):
             painter.fillRect(QRectF(tx, ty, tw, th), QColor(0, 0, 0, 215))
             painter.setPen(colour)
             painter.drawText(QRectF(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, words)
+
+    def _paint_return_point(self, painter: QPainter, z, fx, fy, w, h) -> None:
+        """The fence's return point: a diamond with an R, in the polygon's colours."""
+        lat, lon = self._return_point
+        c = self._project(lat, lon, z, fx, fy, w, h)
+        on_drone = bool(self._return_point_on_drone)
+        colour = QColor(90, 230, 140, 240) if on_drone else QColor(255, 196, 60, 240)
+        pen = QPen(colour, 2)
+        if not on_drone:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(QColor(20, 24, 30, 235))
+        r = 10.0
+        painter.drawPolygon(QPolygonF([QPointF(c.x(), c.y() - r), QPointF(c.x() + r, c.y()),
+                                       QPointF(c.x(), c.y() + r), QPointF(c.x() - r, c.y())]))
+        painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        painter.setPen(colour)
+        painter.drawText(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), Qt.AlignmentFlag.AlignCenter, "R")
+        words = "Return point" + (f": {self._return_point_tag}" if self._return_point_tag else "")
+        metrics = painter.fontMetrics()
+        tw = metrics.horizontalAdvance(words) + 10
+        th = metrics.height() + 4
+        tx = max(4.0, min(float(c.x()) - tw / 2.0, float(w) - tw - 4.0))
+        ty = max(4.0, float(c.y()) - r - th - 4.0)
+        painter.fillRect(QRectF(tx, ty, tw, th), QColor(0, 0, 0, 215))
+        painter.drawText(QRectF(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, words)
 
     def _fence_hit_index(self, pos: QPointF) -> int | None:
         """The fence corner under the pointer, or None."""
