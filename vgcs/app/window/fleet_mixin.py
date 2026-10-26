@@ -13,6 +13,9 @@ running. This mixin ties it to the window:
   last message. Hold, return home and land go to one drone or to all.
 - A warning from a drone that is not on screen (link lost, a low battery, a
   fence breach) is logged and shown in the message line, with its name.
+- While the link to any drone is lost, the link alarm sounds (vgcs/app/link_alarm.py),
+  until the link is back, the drone is disconnected, or the pilot presses
+  "Silence alarm" in the header.
 
 Missions stay one per drone: plan, make the drone active, upload. VGCS never
 sends one route to several drones, which would fly them into each other.
@@ -38,6 +41,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from vgcs.app.link_alarm import LinkAlarm, make_player
 from vgcs.link.fleet import LINK_LOST, LINK_UP, LINK_WAITING, Fleet, row_cells
 
 FLEET_COLUMNS = ["Drone", "Link", "Mode", "Armed", "Height", "Battery", "GPS", "Signing", "Mission", "Last message"]
@@ -78,6 +82,8 @@ class MainWindowFleetMixin:
     def _init_fleet(self) -> None:
         self._fleet = Fleet(thread_factory=getattr(self, "_make_link_thread", None))
         self._fleet.alert.connect(self._on_fleet_alert)
+        self._link_alarm = LinkAlarm(make_player(self), self)
+        self._link_alarm.changed.connect(self._show_link_alarm)
         self._fleet_dialog = None
         self._fleet_table = None
         self._fleet_status_label = None
@@ -178,14 +184,47 @@ class MainWindowFleetMixin:
             self._on_disconnect()
         self._fleet.remove(vid)
         self._append_log(f"Fleet: {vehicle.name} disconnected")
-        self._refresh_fleet_view()
+        self._refresh_fleet_view()     # also brings the link alarm up to date
 
     def _stop_fleet(self) -> None:
         """Stop every drone's link (the window is closing)."""
         try:
+            self._link_alarm.stop()
+        except Exception:
+            pass
+        try:
             self._fleet.stop_all()
         except Exception:
             pass
+
+    # --- the link alarm ----------------------------------------------------
+    def _update_link_alarm(self) -> None:
+        """Sound, or not, from the drones whose link is lost now (on each alert, and twice a second)."""
+        try:
+            self._link_alarm.update(self._fleet.lost_links())
+        except Exception:
+            pass
+
+    def _on_silence_alarm_clicked(self) -> None:
+        names = ", ".join(self._link_alarm.lost_names())
+        self._link_alarm.silence()
+        self._append_log(f"Link alarm silenced by the pilot ({names})")
+
+    def _show_link_alarm(self) -> None:
+        """The header's Silence button shows while the alarm sounds."""
+        alarm = self._link_alarm
+        names = ", ".join(alarm.lost_names())
+        btn = getattr(self, "_hdr_silence_btn", None)
+        if btn is not None:
+            btn.setVisible(alarm.sounding)
+            btn.setToolTip(f"Link lost: {names}. Silence stops the sound until a link is lost again."
+                           if names else "")
+        if alarm.sounding:
+            self._append_log(f"Link alarm sounding: link lost ({names})")
+        elif names:
+            self._append_log(f"Link alarm silent: still lost ({names})")
+        else:
+            self._append_log("Link alarm stopped: no link is lost")
 
     # --- commands ----------------------------------------------------------
     def _fleet_command(self, command: str, vid: str = "") -> list[str]:
@@ -207,6 +246,8 @@ class MainWindowFleetMixin:
 
     # --- what the drones that are not on screen say ------------------------
     def _on_fleet_alert(self, vid: str, text: str) -> None:
+        # The alarm for every drone, the one on screen too ("link lost", "link back", "link closed").
+        self._update_link_alarm()
         vehicle = self._fleet.get(vid)
         if vehicle is None or vid == self._fleet.active_id:
             return    # the window already shows the active drone's own messages
@@ -230,6 +271,7 @@ class MainWindowFleetMixin:
         return items
 
     def _refresh_fleet_view(self) -> None:
+        self._update_link_alarm()
         vehicles = self._fleet.vehicles()
         several = len(vehicles) >= 2
         try:

@@ -25,6 +25,7 @@
     "thermalFovSure": false,
     "thermalFovV": 38.6,
     "thermalVideoUrl": "",
+    "transport": "udp",
     "upperGimbalHeader": false,
     "yawLimit": 90,
     "zoom": "counted"

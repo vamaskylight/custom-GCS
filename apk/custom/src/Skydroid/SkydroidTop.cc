@@ -249,9 +249,44 @@ std::string buildPhoto(const Options &options)
     return buildSystemCommand("CAP", "01", true, options);
 }
 
-std::string buildRecord(const Options &options)
+std::string buildRecord(bool start, const Options &options)
 {
-    return buildSystemCommand("REC", "01", true, options);
+    return buildSystemCommand("REC", start ? "01" : "00", true, options);
+}
+
+std::string buildRecordQuery(const Options &options)
+{
+    return buildSystemCommand("REC", "00", false, options);
+}
+
+std::string buildSdCardQuery(const Options &options)
+{
+    return buildSystemCommand("SDC", "00", false, options);
+}
+
+std::optional<bool> decodeRecordState(const std::string &dataField)
+{
+    const std::string s = trim(dataField);
+    if (s.empty() || s.size() > 2 || !std::all_of(s.begin(), s.end(), isHex)) {
+        return std::nullopt;
+    }
+    const int value = static_cast<int>(std::stol(s, nullptr, 16));
+    if (value != 0 && value != 1) {
+        return std::nullopt;
+    }
+    return value == 1;
+}
+
+std::optional<SdCard> decodeSdCard(const std::string &dataField)
+{
+    const std::string s = trim(dataField);
+    if (s.size() != 10 || !std::all_of(s.begin(), s.end(), isHex)) {
+        return std::nullopt;
+    }
+    SdCard card;
+    card.freeMb = static_cast<int>(std::stol(s.substr(0, 5), nullptr, 16));
+    card.totalMb = static_cast<int>(std::stol(s.substr(5, 5), nullptr, 16));
+    return card;
 }
 
 // --- Laser rangefinder (SLR) -------------------------------------------------
@@ -532,8 +567,61 @@ std::optional<DecodedFrame> parseTpFrame(const std::string &raw, const Options &
     } else if (frame.tag == "DZM" && !data.empty() && ctrl == 'r') {
         // Read replies only: a write echo carries an action code, not a step.
         frame.dzmStep = decodeDzmStep(data);
+    } else if (frame.tag == "REC" && ctrl == 'r') {
+        // Read replies only: a write echo carries the command, not the state.
+        frame.recording = decodeRecordState(data);
+    } else if (frame.tag == "SDC" && ctrl == 'r') {
+        frame.sdCard = decodeSdCard(data);
     }
     return frame;
+}
+
+std::vector<std::string> takeFrames(std::string &stream)
+{
+    std::vector<std::string> frames;
+    const std::string data = stream;
+    size_t i = 0;
+    for (;;) {
+        const size_t start = std::min(data.find("#TP", i), data.find("#tp", i));  // npos is the largest
+        if (start == std::string::npos) {
+            // Keep a header that is cut off at the end ("#" or "#T").
+            for (size_t keep : {size_t{2}, size_t{1}}) {
+                if (data.size() >= keep && data.size() - keep >= i) {
+                    const std::string tail = data.substr(data.size() - keep);
+                    if (tail == "#" || tail == "#T" || tail == "#t") {
+                        stream = tail;
+                        return frames;
+                    }
+                }
+            }
+            stream.clear();
+            return frames;
+        }
+        if (data.size() - start < 6) {
+            stream = data.substr(start);
+            return frames;
+        }
+        const char c = data[start + 5];
+        int length = -1;
+        if (c >= '0' && c <= '9') {
+            length = c - '0';
+        } else if (c >= 'A' && c <= 'F') {
+            length = c - 'A' + 10;
+        } else if (c >= 'a' && c <= 'f') {
+            length = c - 'a' + 10;
+        }
+        if (length < 0) {
+            i = start + 1;  // not a frame after all
+            continue;
+        }
+        const size_t size = 12 + static_cast<size_t>(length);
+        if (data.size() - start < size) {
+            stream = data.substr(start);
+            return frames;
+        }
+        frames.push_back(data.substr(start, size));
+        i = start + size;
+    }
 }
 
 } // namespace skydroid::top

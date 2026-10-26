@@ -1487,6 +1487,35 @@ def nofly_areas(version: str, r: Report) -> None:
         r.check(fence_on_the_drone(sim) == stored_nofly, "the drone holds the two areas as its only items")
         r.check(int(sim.get_param("FENCE_TYPE") or 0) == 7 and sim.get_param("FENCE_RADIUS") == 200.0,
                 f"FENCE_TYPE 7 (circle and items) with the 200 m radius ({sim.get_param('FENCE_TYPE')})")
+
+        # --- the areas alone (task AI, client 2026-10-22: no way to send them without the circle) ---
+        answer = ask({"areas_only": True, "alt_max_m": 40.0, "action": 1.0, "nofly": nofly})
+        r.check(answer is not None and answer[0] and answer[1].startswith("Areas to stay out of on: 2 areas")
+                and answer[1].endswith("No circle and no polygon fence"),
+                f"the two areas alone: VGCS reports them on ({answer})")
+        r.check(fence_on_the_drone(sim) == stored_nofly, "the drone holds the two areas as its only items")
+        r.check(int(sim.get_param("FENCE_TYPE") or 0) == 5 and int(sim.get_param("FENCE_ENABLE") or 0) == 1,
+                f"FENCE_TYPE 5 (the height and the items, the circle off), the fence on ({sim.get_param('FENCE_TYPE')})")
+        # The client's case: the drone stands in an area. VGCS asks first; with a yes the drone does not arm.
+        over = [{"circle": list(offset_to_lat_lon(sim.north, sim.east)), "radius_m": 30.0}]
+        n_questions = len(rec.fence_questions)
+        link.queue_geofence_upload({"areas_only": True, "alt_max_m": 40.0, "action": 1.0, "nofly": over,
+                                    "replace_other": True})
+        f.wait_real(lambda: len(rec.fence_questions) > n_questions, 15)
+        asked = rec.fence_questions[-1] if len(rec.fence_questions) > n_questions else {}
+        r.check(asked.get("kind") == "nofly" and (asked.get("cfg") or {}).get("areas_only") is True,
+                f"an area over the drone on the ground: VGCS asks first ({str(asked.get('text', ''))[:70]!r})")
+        answer = ask(asked["cfg"]) if asked.get("cfg") else None
+        r.check(answer is not None and answer[0], f"with a yes it is sent ({answer})")
+        f.wait(lambda: False, 3)      # the drone takes a new fence in, in its own loop
+        since = rec.now()
+        link.queue_arm(True)
+        f.wait(lambda: sim.armed, 10)
+        r.check(not sim.armed, "and the drone does not arm inside it")
+        # VGCS reports "ARM sent" at once; the refusal is the drone's own words.
+        f.wait_real(lambda: any("fence" in t.lower() for t in rec.texts(since)), 10)
+        said = [t for t in rec.texts(since) if "ence" in t]
+        r.check(bool(said), f"the drone's reason reaches VGCS {said[:2]}")
         r.check(not rec.errors or all("Geofence" in e[1] for e in rec.errors),
                 f"no other error from VGCS {[e[1] for e in rec.errors if 'Geofence' not in e[1]][:2]}")
     finally:
@@ -1613,6 +1642,61 @@ def signed_commands(version: str, r: Report) -> None:
         f.close()
 
 
+def signing_seen_without_a_key(version: str, r: Report) -> None:
+    """The client's laptop 2 (2026-10-22): a VGCS without the key says that the drone signs and ignores it."""
+    # Until 2026-10-26 such a laptop showed "Off", as for a drone that does not sign.
+    f = Flight(version)
+    laptop2 = None
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        r.check(f.ready_to_fly(), "the drone is ready")
+
+        def state(recorder: Recorder) -> str:
+            rows = recorder.telemetry.get("SIGNING", [])
+            return rows[-1][1].get("state", "") if rows else ""
+
+        link.queue_signing_key(bytes(range(1, 33)), 9)
+        f.wait_real(lambda: state(rec) == "drone_unsigned", 8)
+        since = rec.now()
+        link.queue_signing_to_drone(True)
+        f.wait_real(lambda: rec.action("signing", since) is not None, 10)
+        f.wait_real(lambda: state(rec) == "drone_signs", 5)
+        r.check(state(rec) == "drone_signs", f"VGCS put its key on the drone ({state(rec)})")
+
+        # Laptop 2: VGCS without a key, on the simulator's third port (a telemetry radio's channel).
+        laptop2 = MavlinkThread(f"tcp:127.0.0.1:{sim.port + 3}")
+        rec2 = Recorder(laptop2)
+        laptop2.start()
+        f.wait_real(lambda: state(rec2) == "drone_signs_no_key", 10)
+        r.check(state(rec2) == "drone_signs_no_key", f"laptop 2 says that the drone signs and ignores it ({state(rec2)})")
+        r.check(rec2.last("SIGNING").get("level") == "bad"
+                and str(rec2.last("SIGNING").get("text", "")).startswith("No key on this laptop, and the drone signs"),
+                f"in words, in red ({rec2.last('SIGNING')})")
+        mode_before = sim.mode
+        since2 = rec2.now()
+        laptop2.queue_mode_change("GUIDED")
+        f.wait_real(lambda: any(m[0] >= since2 for m in rec2.modes), 20)
+        said = [m for m in rec2.modes if m[0] >= since2]
+        r.check(bool(said) and said[-1][1] == "GUIDED" and not said[-1][2] and sim.mode == mode_before,
+                f"its mode change is ignored and reported as failed ({said}, the drone in {sim.mode})")
+        errors = [e[1] for e in rec2.errors if e[0] >= since2]
+        r.check(any(e.startswith("Mode change failed: no heartbeat in GUIDED") for e in errors),
+                f"as no answer, which the window names signing for ({errors[:2]})")
+
+        since = rec.now()
+        link.queue_signing_to_drone(False)
+        f.wait_real(lambda: rec.action("signing", since) is not None, 10)
+        result = rec.action("signing", since)
+        r.check(result is not None and result[0], f"VGCS removes the key from the drone ({result})")
+        f.wait_real(lambda: state(rec2) == "off", 8)
+        r.check(state(rec2) == "off", f"and laptop 2 says Off again ({state(rec2)})")
+    finally:
+        if laptop2 is not None:
+            laptop2.stop()
+            laptop2.wait(4000)
+        f.close()
+
+
 def vama_lock_with_vgcs(version: str, r: Report) -> None:
     """The VAMA lock (drone/scripts/vama_lock.lua): VGCS with its key unlocks the drone, and only while it is connected."""
     f = Flight(version, params={"SCR_ENABLE": 1, "SCR_HEAP_SIZE": 300000, "FS_GCS_ENABLE": 0},
@@ -1660,7 +1744,7 @@ CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why
          mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_time_on_the_battery,
          mission_speeds, missions_as_they_come_back,
          another_stations_mission, takeoff_fence_and_land, polygon_fence, nofly_areas, link_silence, signed_commands,
-         vama_lock_with_vgcs]
+         signing_seen_without_a_key, vama_lock_with_vgcs]
 
 
 def write_report(path: pathlib.Path, results: list[tuple[str, Report, float]]) -> None:

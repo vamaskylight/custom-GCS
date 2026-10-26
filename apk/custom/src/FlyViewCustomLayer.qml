@@ -5,7 +5,10 @@
 // video stays clear, with round icon buttons on both sides.
 //  - Left: photo, record, laser, lock, IR. While IR is on, the thermal
 //    colours sit beside IR (the modes of VGCS, drawn by
-//    FlightDisplayViewVideoOutput.qml).
+//    FlightDisplayViewVideoOutput.qml). Photos and videos go to the camera's
+//    own SD card, and a copy to the RC's Photo and Video folders: after a
+//    press, a note at the top says what the camera did, and where
+//    the copy goes.
 //  - Right: yaw centre, gimbal centre, look down, zoom in, zoom out, zoom 1x.
 //  - Top right: camera status and settings.
 // The camera moves when a finger drags on the video (further = faster), or
@@ -141,6 +144,22 @@ Item {
             }
         }
         _cameraEditor.open()
+    }
+
+    // VAMA (task AG): the app menu asks for the camera settings or the camera editor. They open
+    // once the menu has closed, and the settings from their top, where the camera model and
+    // the Cameras button are. The editor is for Advanced Mode only, as its button.
+    Connections {
+        target: QGroundControl.corePlugin
+        function onCameraWindowRequested(which) { Qt.callLater(_openCameraWindow, which) }
+    }
+    function _openCameraWindow(which) {
+        if (which === "settings") {
+            settingsFlick.contentY = 0
+            settingsPopup.open()
+        } else if (which === "editor" && QGroundControl.corePlugin.showAdvancedUI) {
+            _openCameraEditor()
+        }
     }
 
     QGCPalette { id: qgcPal; colorGroupEnabled: true }
@@ -335,12 +354,32 @@ Item {
                         text:           qsTr("Yaw %1°  Pitch %2°").arg(_fmt(_link.gimbalYaw, 1)).arg(_fmt(_link.gimbalPitch, 1))
                     }
                 }
+                // VAMA (task AL): "REC?" while the camera has not said that it records.
                 QGCLabel {
+                    objectName: "vamaRecLabel"
                     anchors.verticalCenter: parent.verticalCenter
                     visible:   _link.enabled && _link.recording
                     color:     qgcPal.colorRed
                     font.bold: true
-                    text:      qsTr("REC")
+                    text:      _link.recordingConfirmed ? qsTr("REC") : qsTr("REC?")
+                }
+                // The copy on the RC records.
+                QGCLabel {
+                    objectName: "vamaRcRecLabel"
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible:   _link.enabled && _rcRecording
+                    color:     qgcPal.colorRed
+                    font.bold: true
+                    text:      qsTr("RC REC")
+                }
+                // Photos and videos go to the camera's SD card: none, or almost full.
+                QGCLabel {
+                    objectName: "vamaSdCardWarning"
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible:   _link.enabled && _link.sdCardWarning !== ""
+                    color:     qgcPal.colorRed
+                    font.bold: true
+                    text:      _link.sdCardWarning
                 }
             }
 
@@ -424,22 +463,22 @@ Item {
             anchors.centerIn: parent
             spacing:          _margin
 
-            // VAMA (task AA): each button only for a camera that can do it.
+            // VAMA (task AA): each button only for a camera that can do it. Photo and record are
+            // for every camera since task AL: they keep a copy on the RC as well.
             IconButton {
                 id:        photoButton
                 objectName: "vamaPhotoButton"
-                visible:   _link.camera.photo
                 icon:      _iconPath + "vama_photo.svg"
                 size:      _buttonSize
-                onClicked: { _link.takePhoto(); photoButton.flash() }
+                onClicked: { _takePhoto(); photoButton.flash() }
             }
             IconButton {
+                id:        recordButton
                 objectName: "vamaRecordButton"
-                visible:   _link.camera.record
                 icon:      _iconPath + "vama_record.svg"
                 size:      _buttonSize
-                fill:      _link.recording ? Qt.rgba(0.85, 0.12, 0.12, 0.9) : Qt.rgba(0, 0, 0, 0.55)
-                onClicked: _link.toggleRecord()
+                fill:      _recordingShown ? Qt.rgba(0.85, 0.12, 0.12, 0.9) : Qt.rgba(0, 0, 0, 0.55)
+                onClicked: _record(!_recordingShown)
             }
             // VAMA (Nish 2026-10-16, task Y): a press measures and shows the reading, the next press
             // hides it. During a lock the box keeps the object's readings, as Nish asked (22:00):
@@ -513,6 +552,125 @@ Item {
             width:            parent.width * 0.56
             height:           parent.height * 0.22
             paletteIndex:     _link.thermalPaletteIndex
+        }
+    }
+
+    // VAMA (task AL, client 2026-10-26: "photos and recordings are not saved in rc"): what the
+    // camera did with the last photo or record press, at the top, for a few seconds or
+    // until tapped. The camera keeps its photos and videos on its own SD card.
+    property string _cameraNoteText:    ""
+    property bool   _cameraNoteProblem: false
+    Connections {
+        target: _link
+        function onCameraNote(text, problem) {
+            _cameraNoteText = text
+            _cameraNoteProblem = problem
+            cameraNoteTimer.restart()
+        }
+    }
+
+    // VAMA (task AL, the client's Stage 1.1 of 2026-10-26: "photo and video recording into the rc"):
+    // a copy of each photo and recording on the RC as well, made by QGC's own video code: a picture
+    // of the video into QGC's Photo folder, and a recording of the video the RC receives into its
+    // Video folder (mp4, QGC's default). The record button shows a recording while the camera or
+    // the RC records, and its next press stops both. The note says where the copy goes (QGC does not
+    // say when a picture is written).
+    property var           _videoManager:   QGroundControl.videoManager
+    readonly property bool _rcRecording:    _videoManager ? _videoManager.recording === true : false
+    readonly property bool _recordingShown: _link.recording || _rcRecording
+    property string        _rcNoteText:     ""
+
+    function _showRcNote(text) {
+        _rcNoteText = text
+        cameraNoteTimer.restart()
+    }
+    function _takePhoto() {
+        _cameraNoteText = ""  // the note of the press before
+        _link.takePhoto()
+        if (!_videoManager) {
+            return
+        }
+        if (_videoManager.decoding !== true) {
+            _showRcNote(qsTr("No copy on this RC: there is no video."))
+            return
+        }
+        _videoManager.grabImage()
+        _showRcNote(qsTr("A copy is saved on this RC, in its Photo folder."))
+    }
+    function _record(start) {
+        _cameraNoteText = ""
+        _link.setRecord(start)  // the camera's own recording, when it has one
+        if (!_videoManager) {
+            return
+        }
+        if (start && !_rcRecording) {
+            if (_videoManager.decoding === true) {
+                _videoManager.startRecording()
+            } else {
+                _showRcNote(qsTr("No copy on this RC: there is no video."))
+            }
+        } else if (!start && _rcRecording) {
+            _videoManager.stopRecording()
+        }
+    }
+    Connections {
+        target: _videoManager
+        function onRecordingChanged() {
+            // From the video manager itself: the binding of _rcRecording may not have its new value yet.
+            _showRcNote(_videoManager.recording === true ? qsTr("A copy is recorded on this RC, in its Video folder.")
+                                                         : qsTr("The copy is saved on this RC, in its Video folder."))
+        }
+    }
+
+    Timer {
+        id:          cameraNoteTimer
+        interval:    6000
+        onTriggered: { _cameraNoteText = ""; _rcNoteText = "" }
+    }
+    // At the top in the middle, under the boxes that show there (the result, the lock message,
+    // Follow's message): beside the buttons it ran into them (preview, 2026-10-26).
+    Rectangle {
+        id:           cameraNoteChip
+        objectName:   "vamaCameraNote"
+        visible:      actionColumn.visible && (_cameraNoteText !== "" || _rcNoteText !== "")
+        anchors.horizontalCenter: parent.horizontalCenter
+        y:            followChip.visible ? followChip.y + followChip.height + _margin
+                    : (lockChip.visible ? lockChip.y + lockChip.height + _margin
+                    : (laserBox.visible ? laserBox.y + laserBox.height + _margin
+                                        : parentToolInsets.topEdgeCenterInset + _margin))
+        width:        cameraNoteColumn.width + _margin * 3
+        height:       Math.max(_buttonSize, cameraNoteColumn.height + _margin * 2)
+        radius:       _margin
+        color:        _panelColor
+        border.color: _cameraNoteProblem ? qgcPal.colorOrange : "transparent"
+        border.width: 2
+
+        Column {
+            id:               cameraNoteColumn
+            anchors.centerIn: parent
+            spacing:          _margin / 3
+
+            QGCLabel {
+                objectName: "vamaCameraNoteText"
+                visible:    text !== ""
+                width:      Math.min(implicitWidth, ScreenTools.defaultFontPixelWidth * 34, _root.width * 0.45)
+                wrapMode:   Text.WordWrap
+                color:      "white"
+                text:       _cameraNoteText
+            }
+            QGCLabel {
+                objectName: "vamaRcNoteText"
+                visible:    text !== ""
+                width:      Math.min(implicitWidth, ScreenTools.defaultFontPixelWidth * 34, _root.width * 0.45)
+                wrapMode:   Text.WordWrap
+                color:      "white"
+                text:       _rcNoteText
+            }
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked:    { _cameraNoteText = ""; _rcNoteText = "" }
         }
     }
 
@@ -1637,6 +1795,7 @@ Item {
         }
 
         QGCFlickable {
+            id:            settingsFlick
             objectName:    "vamaCameraSettingsFlick"
             anchors.fill:  parent
             contentWidth:  width
@@ -1706,6 +1865,19 @@ Item {
                     text: !_link.enabled ? qsTr("Usually 192.168.144.108 and port 5000.")
                                          : (_link.attitudeValid ? qsTr("The camera answers at %1.").arg(_link.activeEndpoint)
                                                                 : qsTr("Waiting for the camera. The app also tries 192.168.144.12 and the other usual ports."))
+                }
+
+                // VAMA (task AL): where photos and videos go. The client looked for them on the RC.
+                QGCLabel {
+                    objectName:       "vamaCameraStorage"
+                    Layout.fillWidth: true
+                    wrapMode:         Text.WordWrap
+                    font.pointSize:   ScreenTools.smallFontPointSize
+                    text:             (_link.camera.photo || _link.camera.record)
+                                      ? qsTr("The camera saves its photos and videos on its own SD card.") +
+                                        (_link.sdCardText !== "" ? " " + _link.sdCardText : "") + " " +
+                                        qsTr("A copy of each is saved on this remote control, in its Photo and Video folders.")
+                                      : qsTr("Photos and videos of the picture are saved on this remote control, in its Photo and Video folders.")
                 }
 
                 // What the camera itself says about its zoom, to check the zoom number on a C13.

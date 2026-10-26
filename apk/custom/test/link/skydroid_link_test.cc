@@ -23,6 +23,8 @@
 #include <QtCore/QThread>
 #include <QtGui/QImage>
 #include <QtNetwork/QNetworkDatagram>
+#include <QtNetwork/QTcpServer>
+#include <QtNetwork/QTcpSocket>
 #include <QtNetwork/QUdpSocket>
 #include <QtQml/QQmlComponent>
 #include <QtQml/QQmlEngine>
@@ -100,6 +102,16 @@ public:
     // moved the aim).
     double lockJumpDeg = 0.0;
     bool tracking = false;
+    // Photos and recording (task AL). REC 01 starts the recording (when it can), REC 00 stops it.
+    bool recording = false;
+    bool canRecord = true;      // false: REC 01 does nothing, as with no SD card
+    bool canStop = true;        // false: REC 00 does nothing
+    int recordStartDelayMs = 0; // REC 01 starts the recording this much later
+    bool answerRec = true;      // answer a REC question
+    int recAnswerDelayMs = 0;   // ... this late, with the state of when it was asked
+    bool echoCommands = true;   // echo CAP and REC commands, as TOP says a camera does
+    int photos = 0;             // CAP commands received
+    std::optional<std::string> sdCard;  // the SDC answer: free MB, then total MB, five hex digits each
     QStringList received;
     QList<qint64> receivedAtMs;  // arrival time of each frame in received
 
@@ -190,6 +202,21 @@ private slots:
                 }
                 continue;
             }
+            if ((f->tag == "REC" || f->tag == "CAP") && f->ctrl == 'w') {
+                if (f->tag == "CAP") {
+                    ++photos;
+                } else if (f->data == "00" && canStop) {
+                    recording = false;
+                } else if (f->data == "01" && canRecord && recordStartDelayMs > 0) {
+                    QTimer::singleShot(recordStartDelayMs, this, [this]() { recording = true; });
+                } else if (f->data == "01" && canRecord) {
+                    recording = true;
+                }
+                if (echoCommands) {
+                    _reply(d, top::buildTpFrame('U', 'w', f->tag, f->data, 'D', 0));
+                }
+                continue;
+            }
             if (f->ctrl != 'r') {
                 continue;
             }
@@ -209,6 +236,15 @@ private slots:
                 char buf[4];
                 std::snprintf(buf, sizeof(buf), "%02X", *dzmStep);
                 _reply(d, top::buildTpFrame('U', 'r', "DZM", buf, 'D', 0));
+            } else if (f->tag == "REC" && answerRec) {
+                const std::string frame = top::buildTpFrame('U', 'r', "REC", recording ? "01" : "00", 'D', 0);
+                if (recAnswerDelayMs > 0) {
+                    QTimer::singleShot(recAnswerDelayMs, this, [this, d, frame]() { _reply(d, frame); });
+                } else {
+                    _reply(d, frame);
+                }
+            } else if (f->tag == "SDC" && sdCard) {
+                _reply(d, top::buildTpFrame('U', 'r', "SDC", *sdCard, 'D', 1));
             }
         }
     }
@@ -237,6 +273,110 @@ private:
     QElapsedTimer _speedClock;
     QElapsedTimer _clock;
     QNetworkDatagram _pushTo;
+};
+
+/// A camera that takes TOP over TCP only, like the C20 (task AJ), on 127.0.0.1: one user at a time.
+class FakeTcpCamera : public QObject
+{
+    Q_OBJECT
+
+public:
+    FakeTcpCamera()
+    {
+        _server.listen(QHostAddress::LocalHost, 0);
+        connect(&_server, &QTcpServer::newConnection, this, [this]() {
+            while (QTcpSocket *socket = _server.nextPendingConnection()) {
+                ++accepts;
+                hangUp();  // the one before goes
+                _conn = socket;
+                connect(socket, &QTcpSocket::readyRead, this, &FakeTcpCamera::_read);
+                connect(socket, &QTcpSocket::disconnected, this, [this, socket]() {
+                    if (socket == _conn) {
+                        ++closedByLink;
+                    }
+                });
+            }
+        });
+    }
+
+    quint16 port() const { return _server.serverPort(); }
+
+    int accepts = 0;
+    int closedByLink = 0;
+    double yaw = 0.0;
+    double pitch = -30.0;
+    bool answerGac = true;
+    bool splitReplies = false;  // each answer in two pieces, a moment apart
+    QStringList received;
+
+    int countStartingWith(const QString &prefix) const
+    {
+        int n = 0;
+        for (const QString &f : received) {
+            if (f.startsWith(prefix)) {
+                ++n;
+            }
+        }
+        return n;
+    }
+    int countEqual(const std::string &frame) const { return received.count(QString::fromStdString(frame)); }
+    bool connected() const { return _conn && _conn->state() == QAbstractSocket::ConnectedState; }
+
+    void hangUp()
+    {
+        if (_conn) {
+            QTcpSocket *conn = _conn;
+            _conn = nullptr;
+            conn->disconnect(this);
+            conn->abort();
+            conn->deleteLater();
+        }
+        _rx.clear();
+    }
+
+    std::string gacFrame() const
+    {
+        return top::buildTpFrame('U', 'r', "GAC",
+                                 top::encodeAttitudeField4(yaw) + top::encodeAttitudeField4(pitch) +
+                                     top::encodeAttitudeField4(0.0),
+                                 'G', 1);
+    }
+
+private:
+    void _read()
+    {
+        if (!_conn) {
+            return;
+        }
+        const QByteArray data = _conn->readAll();
+        _rx.append(data.constData(), static_cast<size_t>(data.size()));
+        for (const std::string &raw : top::takeFrames(_rx)) {
+            received << QString::fromStdString(raw);
+            const auto f = top::parseTpFrame(raw);
+            if (f && f->tag == "GAC" && f->ctrl == 'r' && answerGac) {
+                _answer(gacFrame());
+            }
+        }
+    }
+
+    void _answer(const std::string &frame)
+    {
+        if (!splitReplies) {
+            _conn->write(frame.data(), static_cast<qint64>(frame.size()));
+            return;
+        }
+        _conn->write(frame.data(), 7);
+        const std::string rest = frame.substr(7);
+        QTimer::singleShot(40, this, [this, rest]() {
+            if (_conn) {
+                _conn->write(rest.data(), static_cast<qint64>(rest.size()));
+            }
+        });
+    }
+
+    QTcpServer _server;
+    QTcpSocket *_conn = nullptr;
+    std::string _rx;
 };
 
 /// A stand-in for the drone of Follow Me: the test says what its telemetry is, and sees what it is sent.
@@ -459,6 +599,135 @@ private slots:
         SkydroidLink::setProbeTargets({}, {});
     }
 
+    // --- A camera that takes TOP over TCP (the C20, task AJ) -----------------
+
+    void c20TalksOverTcp()
+    {
+        FakeTcpCamera c20;
+        c20.yaw = 33.5;
+        c20.pitch = -12.0;
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        // The UDP camera of init() may have answered first: wait for the C20's own angles.
+        QTRY_COMPARE_WITH_TIMEOUT(_link->gimbalYaw(), 33.5, 3000);
+        QCOMPARE(_link->gimbalPitch(), -12.0);
+        QVERIFY(_link->attitudeValid());
+        QCOMPARE(c20.accepts, 1);
+        QVERIFY(c20.countEqual(top::buildGaaEnable(5)) >= 1);
+        QVERIFY(c20.countEqual(top::buildGacQuery()) >= 1);
+        // Small frames go out at once (Qt drops this option when it is set before the connection).
+        int connectedSockets = 0;
+        for (QTcpSocket *socket : _link->findChildren<QTcpSocket *>()) {
+            if (socket->state() == QAbstractSocket::ConnectedState) {
+                ++connectedSockets;
+                QCOMPARE(socket->socketOption(QAbstractSocket::LowDelayOption).toInt(), 1);
+            }
+        }
+        QCOMPARE(connectedSockets, 1);
+        // Nothing goes to the UDP camera of init() any more.
+        _camera->clear();
+        QTest::qWait(600);
+        QCOMPARE(_camera->received.size(), 0);
+    }
+
+    void c20AnswersInPieces()
+    {
+        FakeTcpCamera c20;
+        c20.splitReplies = true;
+        c20.yaw = -45.0;
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_COMPARE_WITH_TIMEOUT(_link->gimbalYaw(), -45.0, 3000);
+    }
+
+    void c20ConnectsAgainAfterAHangUp()
+    {
+        FakeTcpCamera c20;
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        c20.hangUp();
+        c20.received.clear();
+        QTRY_COMPARE_WITH_TIMEOUT(c20.accepts, 2, 6000);
+        QTRY_VERIFY_WITH_TIMEOUT(c20.countEqual(top::buildGacQuery()) >= 1, 3000);
+    }
+
+    void c20GetsEachFrameOnceAndNoProbes()
+    {
+        // Other addresses and the C13's extra zoom ports are for UDP cameras.
+        FakeCamera other;
+        SkydroidLink::setProbeTargets({"127.0.0.1"}, {other.port()});
+        FakeTcpCamera c20;
+        c20.answerGac = false;  // no angles: a UDP camera would be probed now
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+        QTest::qWait(3500);
+        QCOMPARE(other.received.size(), 0);
+        c20.received.clear();
+        _link->zoom(1);
+        QTest::qWait(500);
+        for (const std::string &frame : top::buildC13ZoomStepFrames(1, top::Options{true, 0x2710})) {
+            QCOMPARE(c20.countEqual(frame), 1);
+        }
+        QCOMPARE(other.received.size(), 0);
+    }
+
+    void c20GimbalFramesAreUpperCase()
+    {
+        FakeTcpCamera c20;
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+        c20.received.clear();
+        _link->pointDown();
+        QTRY_VERIFY_WITH_TIMEOUT(c20.countStartingWith("#TPUG") >= 1, 2000);
+        QTest::qWait(300);
+        QCOMPARE(c20.countStartingWith("#tpUG"), 0);  // never the lower-case form, never twice
+    }
+
+    void c20StopReachesItBeforeTheLinkCloses()
+    {
+        FakeTcpCamera c20;
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+        _link->setTouchMotion(0.0, 1.0);  // tilting up
+        QTRY_VERIFY_WITH_TIMEOUT(c20.countStartingWith("#TPUG2wGSP") >= 1, 2000);
+        c20.received.clear();
+        _link->setEnabled(false);
+        QTRY_VERIFY_WITH_TIMEOUT(c20.countEqual(top::buildGimbalSpeedAxis("GSP", 0.0)) >= 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.closedByLink, 1, 2000);
+        QTest::qWait(2500);
+        QCOMPARE(c20.accepts, 1);  // off: not opened again
+    }
+
+    void c20ChosenAtItsAddressConnects()
+    {
+        // The address first, then the camera: the camera alone opens the connection.
+        FakeTcpCamera c20;
+        _link->setPort(c20.port());
+        _link->setModel("C20");
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+    }
+
+    void aUdpCameraAfterTheC20ClosesTheTcpLink()
+    {
+        FakeTcpCamera c20;
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+        _link->setModel("C13");
+        // The camera alone closes it (an address change would close it too).
+        QTRY_COMPARE_WITH_TIMEOUT(c20.closedByLink, 1, 2000);
+        _link->setPort(_camera->port());
+        _camera->clear();
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGacQuery()) >= 1, 2000);
+        QTest::qWait(2500);
+        QCOMPARE(c20.accepts, 1);
+    }
+
     // --- Angles and addresses ------------------------------------------------
 
     void readsGimbalAngles()
@@ -494,7 +763,9 @@ private slots:
     void stopsTrustingAnglesWhenCameraGoesQuiet()
     {
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 2000);
+        // Quiet: no answer at all. (An answer to the record question is an answer too, task AL.)
         _camera->answerGac = false;
+        _camera->answerRec = false;
         QTRY_VERIFY_WITH_TIMEOUT(!_link->answering(), 6000);
         QVERIFY(!_link->attitudeValid());
     }
@@ -2018,6 +2289,276 @@ private slots:
         _link->toggleRecord();
         QVERIFY(_link->recording());
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countStartingWith("#TPUD2wREC01"), 1, 2000);
+        // The second press stops it. Until test build 13 it sent REC 01 again (task AL).
+        _link->toggleRecord();
+        QVERIFY(!_link->recording());
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildRecord(false)), 1, 2000);
+        QCOMPARE(_camera->countEqual(top::buildRecord(true)), 1);
+    }
+
+    // --- Photos and recording: what the camera says (task AL) --------------------
+
+    void recordAsksTheCameraAndSaysWhatItDid()
+    {
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        // Pressed just after a question of the poll (every 2 s): the camera is asked again soon
+        // after the press, so the note does not wait for the next one.
+        const int asked = _camera->countEqual(top::buildRecordQuery());
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildRecordQuery()) > asked, 3000);
+        _link->toggleRecord();
+        QVERIFY(_link->recording());
+        QVERIFY(!_link->recordingConfirmed());  // until the camera says so
+        QTRY_VERIFY_WITH_TIMEOUT(_link->recordingConfirmed(), 1300);
+        QVERIFY(_camera->recording);
+        QCOMPARE(notes.size(), 1);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("Recording on the camera's SD card."));
+        QVERIFY(!notes.at(0).at(1).toBool());
+        _link->toggleRecord();
+        QVERIFY(!_link->recording());
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 2000);
+        QVERIFY(!_camera->recording);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("Recording stopped. The video is on the camera's SD card."));
+        QVERIFY(!notes.at(1).at(1).toBool());
+        QVERIFY(_link->recordingConfirmed());  // "not recording", as the camera says
+        // One note a press: none later, when the camera's time is up.
+        QTest::qWait(2800);
+        QCOMPARE(notes.size(), 2);
+    }
+
+    void setRecordStartsOrStopsAndSaysNothingWhenNothingChanges()
+    {
+        // For the screen that records a copy on the RC as well: it says start or stop itself.
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        _link->setRecord(true);
+        QVERIFY(_link->recording());
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 3000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("Recording on the camera's SD card."));
+        // Asked again: the frame again, to make sure, and no note.
+        _link->setRecord(true);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildRecord(true)), 2, 1000);
+        _link->setRecord(false);
+        QVERIFY(!_link->recording());
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 3000);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("Recording stopped. The video is on the camera's SD card."));
+        _link->setRecord(false);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildRecord(false)), 2, 1000);
+        QTest::qWait(2800);
+        QCOMPARE(notes.size(), 2);
+        QVERIFY(!_camera->recording);
+    }
+
+    void aRecordingStartedElsewhereShowsAndTheNextPressStopsIt()
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        _camera->recording = true;  // the RC's own button, or another app
+        QTRY_VERIFY_WITH_TIMEOUT(_link->recording() && _link->recordingConfirmed(), 3000);
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildRecord(false)), 1, 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(!_camera->recording, 2000);
+        QCOMPARE(_camera->countEqual(top::buildRecord(true)), 0);
+        // And stopped elsewhere: the screen follows.
+        QTRY_VERIFY_WITH_TIMEOUT(_link->recordingConfirmed(), 3000);
+        _camera->recording = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->recording(), 3000);
+        _camera->recording = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->recording(), 3000);
+    }
+
+    void aRecordingThatDoesNotStartIsTold()
+    {
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _camera->canRecord = false;
+        _camera->sdCard = "0000000000";
+        QTRY_COMPARE_WITH_TIMEOUT(_link->sdCardWarning(), QString("No SD card"), 3000);
+        QCOMPARE(_link->sdCardText(), QString("The camera says it has no SD card."));
+        _link->toggleRecord();
+        QVERIFY(_link->recording());
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 4000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("Recording did not start. The camera has no SD card."));
+        QVERIFY(notes.at(0).at(1).toBool());
+        QVERIFY(!_link->recording());  // as the camera says
+        // So the next press starts again, it does not stop.
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildRecord(true)), 2, 2000);
+        QCOMPARE(_camera->countEqual(top::buildRecord(false)), 0);
+    }
+
+    void aStopThatTheCameraDoesNotDoIsTold()
+    {
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 3000);
+        _camera->canStop = false;
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 4000);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("Recording did not stop. Press the button again."));
+        QVERIFY(notes.at(1).at(1).toBool());
+        QVERIFY(_link->recording() && _link->recordingConfirmed());  // as the camera says
+        _camera->canStop = true;
+        _link->toggleRecord();
+        QTRY_VERIFY_WITH_TIMEOUT(!_camera->recording, 2000);
+        QCOMPARE(_camera->countEqual(top::buildRecord(false)), 2);
+    }
+
+    void aCameraThatStartsSlowlyIsNotShownAsStopped()
+    {
+        // It still says "not recording" at the first question after the press: the screen keeps
+        // what was asked until the camera has had its time.
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        _camera->recordStartDelayMs = 1200;
+        _link->toggleRecord();
+        QTest::qWait(1100);
+        QVERIFY(_link->recording());
+        QCOMPARE(notes.size(), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 2500);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("Recording on the camera's SD card."));
+        QVERIFY(_link->recording() && _link->recordingConfirmed());
+    }
+
+    void anOldAnswerNoLongerConfirmsTheRecording()
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        _link->toggleRecord();
+        QTRY_VERIFY_WITH_TIMEOUT(_link->recordingConfirmed(), 3000);
+        _camera->answerRec = false;  // "REC" becomes "REC?": the camera no longer says so
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->recordingConfirmed(), 8000);
+        QVERIFY(_link->recording());
+    }
+
+    void anOldSdCardAnswerIsForgotten()
+    {
+        _camera->sdCard = "0000000000";
+        QTRY_COMPARE_WITH_TIMEOUT(_link->sdCardWarning(), QString("No SD card"), 3000);
+        _camera->sdCard.reset();  // it no longer answers: after 30 s nothing is known
+        QTest::qWait(25000);
+        QCOMPARE(_link->sdCardWarning(), QString("No SD card"));
+        QTRY_COMPARE_WITH_TIMEOUT(_link->sdCardWarning(), QString(), 7000);
+    }
+
+    void aCameraThatDoesNotSayWhetherItRecords()
+    {
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _camera->answerRec = false;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 4000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("The camera was told to record. It does not say whether it does."));
+        QVERIFY(notes.at(0).at(1).toBool());
+        // The screen keeps what was asked for ("REC?"), so the next press stops.
+        QVERIFY(_link->recording() && !_link->recordingConfirmed());
+        _link->toggleRecord();
+        QVERIFY(!_link->recording());
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildRecord(false)), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 4000);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("The camera was told to stop recording. It does not say whether it did."));
+    }
+
+    void anAnswerToAQuestionBeforeThePressDoesNotDecideIt()
+    {
+        // The camera answers a question of the poll late, after the press, and then nothing
+        // (busy starting its recording). That answer tells how things were before the press:
+        // it must not say "did not start".
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        _camera->recAnswerDelayMs = 300;
+        const int asked = _camera->countEqual(top::buildRecordQuery());
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildRecordQuery()) > asked, 3000);
+        _link->toggleRecord();
+        _camera->answerRec = false;  // the late answer of "not recording" is on its way
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 4000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("The camera was told to record. It does not say whether it does."));
+        QVERIFY(_camera->recording && _link->recording());
+    }
+
+    void anAnswerFromBeforeThePressDoesNotDecideItEither()
+    {
+        // The camera said "not recording" at the poll before the press, and says nothing after it
+        // (busy, or its answers are lost). That answer is still fresh when the time is up, and it
+        // tells how things were before the press: it must not say "did not start".
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->recordingConfirmed(), 3000);  // "not recording", as the camera says
+        _camera->answerRec = false;
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 4000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("The camera was told to record. It does not say whether it does."));
+        QVERIFY(_camera->recording && _link->recording() && !_link->recordingConfirmed());
+    }
+
+    void aPhotoSaysWhereItWentAndWhatTheCardHasRoomFor()
+    {
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _camera->sdCard = "03200076E4";  // 12800 MB free of 30436 MB
+        QTRY_COMPARE_WITH_TIMEOUT(_link->sdCardText(), QString("The camera's SD card has 12.5 GB free of 29.7 GB."), 3000);
+        QCOMPARE(_link->sdCardWarning(), QString());
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 2000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("Photo taken. It is saved on the camera's SD card."));
+        QVERIFY(!notes.at(0).at(1).toBool());
+        QCOMPARE(_camera->photos, 1);
+        // Almost full. The room is asked again a second after a photo (else every 10 s).
+        _camera->sdCard = "0003200100";  // 50 MB free of 256 MB
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(_link->sdCardWarning(), QString("SD card almost full"), 1500);
+        QCOMPARE(_link->sdCardText(), QString("The camera's SD card has 50 MB free of 256 MB."));
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 3, 2000);
+        QCOMPARE(notes.at(2).at(0).toString(), QString("Photo taken. The camera's SD card is almost full: 50 MB free."));
+        QVERIFY(notes.at(2).at(1).toBool());
+        // No card.
+        _camera->sdCard = "0000000000";
+        QTRY_COMPARE_WITH_TIMEOUT(_link->sdCardWarning(), QString("No SD card"), 1500);
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 4, 2000);
+        QCOMPARE(notes.at(3).at(0).toString(), QString("The camera has no SD card. The photo is not saved."));
+        QVERIFY(notes.at(3).at(1).toBool());
+        // No echo of the command.
+        _camera->echoCommands = false;
+        _link->takePhoto();
+        QTest::qWait(1000);
+        QCOMPARE(notes.size(), 4);
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 5, 1500);
+        QCOMPARE(notes.at(4).at(0).toString(), QString("The camera did not answer the photo command. The camera has no SD card."));
+        QCOMPARE(_camera->photos, 5);
+    }
+
+    void aCameraThatDoesNotSayItsSdCard()
+    {
+        QSignalSpy changes(_link, &SkydroidLink::sdCardChanged);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->sdCardText(), QString("The camera does not say how much room its SD card has."), 8000);
+        QCOMPARE(_link->sdCardWarning(), QString());
+        QCOMPARE(changes.size(), 1);
+        // It answers after all.
+        _camera->sdCard = "03200076E4";
+        QTRY_COMPARE_WITH_TIMEOUT(_link->sdCardText(), QString("The camera's SD card has 12.5 GB free of 29.7 GB."), 3000);
+    }
+
+    void whatTheCameraSaidIsForgottenForAnotherCameraOrWithTheLinkOff()
+    {
+        _camera->sdCard = "0000000000";
+        _camera->recording = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->sdCardWarning() == QString("No SD card") && _link->recordingConfirmed(), 3000);
+        _link->setModel("C12");
+        QCOMPARE(_link->sdCardWarning(), QString());
+        QVERIFY(_link->recording() && !_link->recordingConfirmed());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->sdCardWarning() == QString("No SD card") && _link->recordingConfirmed(), 3000);
+        _link->setEnabled(false);
+        QCOMPARE(_link->sdCardWarning(), QString());
+        QCOMPARE(_link->sdCardText(), QString());
+        QVERIFY(!_link->recordingConfirmed());
+        // With the link off, the buttons do nothing.
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _camera->clear();
+        _link->takePhoto();
+        _link->toggleRecord();
+        QTest::qWait(3000);
+        QCOMPARE(_camera->received.size(), 0);
+        QCOMPARE(notes.size(), 0);
+        QVERIFY(_link->recording());
     }
 
     // --- Laser -------------------------------------------------------------------
@@ -2532,12 +3073,14 @@ private slots:
     void screenShowsVamaCameraNames()
     {
         // The screen shows VAMA's names; the code and settings keep Skydroid's.
-        QCOMPARE(_link->models(), QStringList({"C12", "C13", "C14 Pro"}));
-        QCOMPARE(_link->modelNames(), QStringList({"V12", "V13", "V14 Pro"}));
+        QCOMPARE(_link->models(), QStringList({"C12", "C13", "C14 Pro", "C20"}));
+        QCOMPARE(_link->modelNames(), QStringList({"V12", "V13", "V14 Pro", "V20"}));
         QCOMPARE(_link->model(), QString("C13"));
         QCOMPARE(_link->modelName(), QString("V13"));
         _link->setModel("C14 Pro");
         QCOMPARE(_link->modelName(), QString("V14 Pro"));
+        _link->setModel("C20");
+        QCOMPARE(_link->modelName(), QString("V20"));
         _link->setModel("C12");
         QCOMPARE(_link->modelName(), QString("V12"));
         _link->setModel("V13");  // not a model id: ignored
@@ -2688,7 +3231,11 @@ private slots:
         QTest::qWait(600);  // a zoom asks for the zoom 350 ms after its command
         QCOMPARE(_camera->countEqual(top::buildSlrTrigger('E', plain)), 0);
         QCOMPARE(_camera->countEqual(top::buildPhoto(plain)), 0);
-        QCOMPARE(_camera->countEqual(top::buildRecord(plain)), 0);
+        QCOMPARE(_camera->countEqual(top::buildRecord(true, plain)), 0);
+        // Nor is it asked whether it records, or for its SD card (task AL).
+        QTest::qWait(1600);  // the questions come every 2 s
+        QCOMPARE(_camera->countEqual(top::buildRecordQuery(plain)), 0);
+        QCOMPARE(_camera->countEqual(top::buildSdCardQuery(plain)), 0);
         QCOMPARE(_camera->countEqual(top::buildDzmQuery(plain)), 0);
         for (const std::string &frame : top::buildC13ZoomStepFrames(1, plain)) {
             QCOMPARE(_camera->countEqual(frame), 0);

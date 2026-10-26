@@ -821,14 +821,33 @@ class VideoPreviewUiMixin:
         except Exception:
             pass
 
+    def _recording_thermal_palette_id(self, source_id: str) -> str:
+        """The thermal colours a recording of this feed keeps: the ones on screen
+        (DGCA VID-06). Only the operator's recording asks: observation clips
+        keep the camera's own picture."""
+        pid = self.thermal_palette_id()
+        if pid == thermal_palette.AS_RECEIVED:
+            return pid
+        try:
+            return pid if self._feed_is_thermal(source_id) else thermal_palette.AS_RECEIVED
+        except Exception:
+            return thermal_palette.AS_RECEIVED
+
     def _sync_video_recording_preview_transform(self, source_id: str | None = None) -> None:
-        """Keep RTSP recording frames aligned with on-screen preview (thermal software zoom)."""
+        """Keep RTSP recording frames aligned with on-screen preview (thermal software
+        zoom and thermal colours)."""
         if not bool(getattr(self, "_video_recording", False)):
             return
         sid = str(source_id or getattr(self, "_video_recording_source_id", "") or "").strip()
         if not sid:
             sid = self._operator_preview_source_id()
         self._apply_video_recording_preview_transform(sid)
+        src = self._video_source_by_id(sid)
+        if src is not None and hasattr(src, "set_recording_thermal_palette"):
+            try:
+                src.set_recording_thermal_palette(self._recording_thermal_palette_id(sid))
+            except Exception:
+                pass
 
     def _resync_zoom_from_camera(self) -> None:
         """Pull the rail onto the zoom position the camera reports (C14 Pro).
@@ -1907,6 +1926,8 @@ class VideoPreviewUiMixin:
 
                 now = toggle_camera_video_sensor(cc)
                 if now:
+                    # A recording that runs keeps its stream: its colours follow the sensor.
+                    self._sync_video_recording_preview_transform()
                     self._set_status(
                         f"Camera sensor → {'thermal IR' if now == 'ir' else 'day (EO)'} "
                         "— restarting video for the new format…"

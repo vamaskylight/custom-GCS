@@ -59,6 +59,8 @@ class CameraControl(Protocol):
 
     def camera_toggle_record(self) -> None: ...
 
+    def camera_set_record(self, on: bool) -> None: ...
+
     def get_gimbal_status(self) -> GimbalStatus | None: ...
 
     def gimbal_center(self) -> None: ...
@@ -96,6 +98,9 @@ class NoopCameraControl:
         return
 
     def camera_toggle_record(self) -> None:
+        return
+
+    def camera_set_record(self, on: bool) -> None:
         return
 
     def get_gimbal_status(self) -> GimbalStatus | None:
@@ -167,13 +172,15 @@ class MavlinkCameraControl:
             return
 
     def camera_toggle_record(self) -> None:
+        self.camera_set_record(not self._recording)
+
+    def camera_set_record(self, on: bool) -> None:
         try:
-            if self._recording:
-                self._t.queue_camera_video_stop()
-                self._recording = False
-            else:
+            if on:
                 self._t.queue_camera_video_start()
-                self._recording = True
+            else:
+                self._t.queue_camera_video_stop()
+            self._recording = bool(on)
         except Exception:
             return
 
@@ -598,6 +605,16 @@ class SkydroidCameraControl:
             return
         try:
             self._adapter.camera_record_toggle()
+        except Exception:
+            return
+
+    def camera_set_record(self, on: bool) -> None:
+        """Start (REC 01) or stop (REC 00) the camera's own recording to its SD card."""
+        if not self.camera_supports("record"):
+            print("[VGCS:skydroid] record: this camera does not record (its camera file says so)")
+            return
+        try:
+            self._adapter.camera_record_set(bool(on))
         except Exception:
             return
 
@@ -1053,6 +1070,11 @@ class SiyiCameraControl:
         except Exception:
             return
 
+    def camera_set_record(self, on: bool) -> None:
+        # SIYI's protocol has a toggle only. VGCS calls this when the state it wants changes.
+        del on
+        self.camera_toggle_record()
+
     def get_gimbal_status(self) -> GimbalStatus | None:
         try:
             st = self._adapter.get_status()
@@ -1179,6 +1201,11 @@ class ViewproCameraControl:
 
     def camera_toggle_record(self) -> None:
         self._adapter.camera_record_toggle()
+
+    def camera_set_record(self, on: bool) -> None:
+        # The adapter knows from the camera's status whether it records: toggle only to change that.
+        if bool(self._adapter.is_recording()) != bool(on):
+            self._adapter.camera_record_toggle()
 
     def get_gimbal_status(self) -> GimbalStatus | None:
         return self._adapter.get_status()

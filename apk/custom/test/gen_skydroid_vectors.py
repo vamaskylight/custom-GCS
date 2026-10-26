@@ -20,6 +20,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
 from vgcs.skydroid import protocol as p  # noqa: E402
+from vgcs.skydroid.transport import split_top_frames  # noqa: E402
 
 OUT = Path(__file__).with_name("skydroid_top_vectors.inc")
 
@@ -87,7 +88,12 @@ case("buildGimbalAngles(30.0, -45.0, 25.0, 20.0)",
 
 # Camera and system
 case("buildPhoto()", lambda: frame(p.build_top_frame("CAM_PHOTO")))
-case("buildRecord()", lambda: frame(p.build_top_frame("CAM_REC")))
+case("buildRecord(true)", lambda: frame(p.build_top_frame("CAM_REC")))  # no "on": start, as before
+case("buildRecord(true)", lambda: frame(p.build_top_frame("CAM_RECORD", {"on": True})))
+case("buildRecord(false)", lambda: frame(p.build_top_frame("CAM_REC", {"on": False})))
+case("buildRecord(false)", lambda: frame(p.build_record(False)))
+case("buildRecordQuery()", lambda: frame(p.build_record_query()))
+case("buildSdCardQuery()", lambda: frame(p.build_sd_card_query()))
 case('buildSystemCommand("rec", "01", false)', lambda: frame(p.build_system_command("rec", "01", write=False)))
 case('buildSystemCommand("IMG", "0102")', lambda: frame(p.build_system_command("IMG", "0102")))
 
@@ -139,8 +145,20 @@ for f in ("0032", "0031", "2710", "2711", "01F4", "FFFF", "01f4", "0x01F4", "12"
     DECODE_CASES.append((f"decodeSlrDecimeters({cpp_str(f)})", lambda f=f: p.decode_slr_decimeters(f)))
 for f in ("00", "46", "8B", "FF", "1", "123", "0x46"):
     DECODE_CASES.append((f"decodeDzmStep({cpp_str(f)})", lambda f=f: p.decode_dzm_step(f)))
+for f in ("00", "01", "0", "1", " 01 ", "02", "0A", "", "001", "x1", "0x1"):
+    DECODE_CASES.append((f"decodeRecordState({cpp_str(f)})", lambda f=f: p.decode_record_state(f)))
+
+# SD card replies: (C++ data field, Python result (free MB, total MB) or None)
+SD_CARD_CASES = ["0000000000", "03200076E4", "FFFFFFFFFF", "03200076e4", " 03200076E4 ", "03200076E", "03200076E4F",
+                 "0320G076E4", ""]
 
 SLR_MAX_CASES = [None, 500.0, 1000.0, 1200.0, 1500.4, 99999.0]
+
+
+def camera_reply(tag: str, data: str, control: str = "r") -> str:
+    """A frame as the camera sends it: from the system address (D) to us (U)."""
+    return frame(p.build_tp_frame(dest="U", src="D", control=control, tag=tag, data=data, variable=len(data) != 2))
+
 
 # Replies: (raw frame, expected fields)
 REPLIES = [
@@ -155,6 +173,27 @@ REPLIES = [
     "#TPUG2xGAA0100",
     "hello",
     "#TPUG2wGAA01",
+    # Photos, recording and the SD card (task AL).
+    camera_reply("REC", "01"),
+    camera_reply("REC", "00"),
+    camera_reply("REC", "1", control="r"),
+    camera_reply("REC", "05"),
+    camera_reply("REC", "00", control="w"),  # the echo of a stop: no state in it
+    camera_reply("CAP", "01", control="w"),
+    camera_reply("SDC", "03200076E4"),
+    camera_reply("SDC", "0000000000"),
+    camera_reply("SDC", "0000"),
+    "#TPDU2wERE!!" + p.tp_checksum("#TPDU2wERE!!"),  # TOP's answer to a command the camera does not know
+]
+
+# A TCP byte stream (the C20): what is cut out as whole frames, and what is kept for the next read.
+_GAC = frame(p.build_tp_frame(dest="U", src="G", control="r", tag="GAC", data="0064FF9C0000"))
+_ACK = frame(p.build_tp_frame(dest="U", src="D", control="w", tag="REC", data="01"))
+_LONG = frame(p.build_tp_frame(dest="D", control="w", tag="ZMC", data="000A"))
+SPLIT_CASES = [
+    _GAC, _GAC[:9], _GAC + _ACK + _LONG[:4], _ACK + "#", _ACK + "#T", _ACK + "#t", "\r\nOK" + _ACK, "noise",
+    "#TPUGZw" + _ACK, _LONG + _ACK, "", "#", "#tp", "##TP", _ACK + "x#TP", "#TPUG" + _ACK, _ACK + _ACK + _ACK,
+    "#tpUGaw" + "0123456789" + "x" + _ACK, "#TPUG2wGAA01", "#TPUG2wGAA01" + "36" + "tail",
 ]
 
 
@@ -173,6 +212,12 @@ def main() -> int:
         v = fn()
         lines.append(f"CHECK_DECODE({cpp}, {'true' if v is not None else 'false'}, {float(v) if v is not None else 0.0!r});")
     lines.append("")
+    lines.append("// CHECK_SD_CARD(data_field, has_value, free_mb, total_mb)")
+    for f in SD_CARD_CASES:
+        card = p.decode_sd_card(f)
+        has, free, total = ("true", card[0], card[1]) if card is not None else ("false", 0, 0)
+        lines.append(f"CHECK_SD_CARD({cpp_str(f)}, {has}, {free}, {total});")
+    lines.append("")
     lines.append("// CHECK_SLR_MAX(metres_or_nan, expected_dm)")
     for m in SLR_MAX_CASES:
         expected = int(round(p.set_slr_max_range_m(m) * 10))
@@ -180,11 +225,13 @@ def main() -> int:
         lines.append(f"CHECK_SLR_MAX({arg}, {expected});")
     p.set_slr_max_range_m(None)
     lines.append("")
-    lines.append("// CHECK_REPLY(raw, parsed, tag, ctrl, has_yaw, yaw, has_pitch, pitch, has_roll, roll, has_slr, slr_dm, has_dzm, dzm_step)")
+    lines.append("// CHECK_REPLY(raw, parsed, tag, ctrl, has_yaw, yaw, has_pitch, pitch, has_roll, roll, has_slr, slr_dm,")
+    lines.append("//             has_dzm, dzm_step, has_recording, recording, has_sd_card, free_mb, total_mb)")
     for raw in REPLIES:
         dec = p.parse_tp_frame(raw.encode("ascii"))
         if dec is None:
-            lines.append(f"CHECK_REPLY({cpp_str(raw)}, false, \"\", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0);")
+            lines.append(f"CHECK_REPLY({cpp_str(raw)}, false, \"\", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, "
+                         "false, 0, false, false, false, 0, 0);")
             continue
         q = dec.params
 
@@ -195,13 +242,23 @@ def main() -> int:
         hr, rv = opt("roll")
         hs, sv = opt("slr_dm", int)
         hd, dv = opt("dzm_step", int)
+        hrec, rec = ("true", "true" if q["recording"] == "1" else "false") if "recording" in q else ("false", "false")
+        hsd = "true" if "sd_free_mb" in q else "false"
+        free, total = int(q.get("sd_free_mb", 0)), int(q.get("sd_total_mb", 0))
         lines.append(
             f"CHECK_REPLY({cpp_str(raw)}, true, {cpp_str(dec.command)}, '{q['ctrl']}', "
-            f"{hy}, {yv}, {hp}, {pv}, {hr}, {rv}, {hs}, {sv}, {hd}, {dv});"
+            f"{hy}, {yv}, {hp}, {pv}, {hr}, {rv}, {hs}, {sv}, {hd}, {dv}, {hrec}, {rec}, {hsd}, {free}, {total});"
         )
+    lines.append("")
+    lines.append("// CHECK_SPLIT(tcp_stream, expected_frames_joined_by_bar, expected_rest)")
+    for stream in SPLIT_CASES:
+        frames, rest = split_top_frames(stream.encode("ascii"))
+        joined = "|".join(f.decode("ascii") for f in frames)
+        lines.append(f"CHECK_SPLIT({cpp_str(stream)}, {cpp_str(joined)}, {cpp_str(rest.decode('ascii'))});")
     OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"wrote {OUT.relative_to(REPO)}: {len(CASES)} frames, {len(LIST_CASES)} lists, "
-          f"{len(DECODE_CASES)} decodes, {len(SLR_MAX_CASES)} laser limits, {len(REPLIES)} replies")
+          f"{len(DECODE_CASES)} decodes, {len(SD_CARD_CASES)} SD cards, {len(SLR_MAX_CASES)} laser limits, "
+          f"{len(REPLIES)} replies, {len(SPLIT_CASES)} TCP streams")
     return 0
 
 

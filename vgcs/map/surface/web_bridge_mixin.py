@@ -265,7 +265,13 @@ class WebBridgeMixin:
                             notify_companion_recording(active=True)
                         except Exception:
                             pass
-                        ok = bool(src.start_recording(str(tmp)))
+                        # The thermal colours on screen go into the file from its first frame.
+                        ok = bool(
+                            src.start_recording(
+                                str(tmp),
+                                thermal_palette_id=self._recording_thermal_palette_id(rec_sid),
+                            )
+                        )
                         self._video_recording = bool(ok)
                         if not ok:
                             try:

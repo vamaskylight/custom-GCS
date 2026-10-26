@@ -131,3 +131,26 @@ def apply_palette(image: QImage, palette_id: str) -> QImage:
         return image  # not the grey table this relies on: leave the picture alone
     indexed.setColorTable(list(_color_table(pid)))
     return indexed.convertToFormat(QImage.Format.Format_RGB888)
+
+
+def apply_palette_rgb24(raw: bytes, width: int, height: int, palette_id: str) -> bytes:
+    """``apply_palette`` for one packed RGB24 frame, as the recording gets them.
+
+    The same Qt conversions as the picture on screen, so a recording keeps the
+    very colours the operator saw (DGCA VID-06). "As received", and a frame
+    that is not width x height x 3 bytes, come back untouched.
+    """
+    pid = normalize_palette_id(palette_id)
+    w, h = int(width), int(height)
+    if pid == AS_RECEIVED or w <= 0 or h <= 0 or len(raw) != w * h * 3:
+        return raw
+    out = apply_palette(QImage(raw, w, h, w * 3, QImage.Format.Format_RGB888), pid)
+    if out.isNull() or out.format() != QImage.Format.Format_RGB888:
+        return raw
+    line = w * 3
+    bpl = out.bytesPerLine()
+    data = bytes(out.constBits())[: bpl * h]  # a copy, taken while ``out`` is alive
+    if bpl == line:
+        return data
+    # Qt pads each line to 4 bytes when the width is not a multiple of 4.
+    return b"".join(data[y * bpl : y * bpl + line] for y in range(h))

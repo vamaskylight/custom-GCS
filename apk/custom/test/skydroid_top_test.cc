@@ -56,6 +56,14 @@ bool sameOptional(const std::optional<T> &got, bool has, double value)
     return !has || std::fabs(static_cast<double>(*got) - value) < 1e-6;
 }
 
+bool sameSdCard(const std::optional<SdCard> &got, bool has, int freeMb, int totalMb)
+{
+    if (got.has_value() != has) {
+        return false;
+    }
+    return !has || (got->freeMb == freeMb && got->totalMb == totalMb);
+}
+
 } // namespace
 
 #define CHECK_FRAME(expr, want)                                     \
@@ -78,6 +86,16 @@ bool sameOptional(const std::optional<T> &got, bool has, double value)
 
 #define CHECK_DECODE(expr, has, value) checkDecode(#expr, (expr), (has), (value))
 
+#define CHECK_SPLIT(w_stream, w_frames, w_rest)                     \
+    do {                                                            \
+        ++g_checks;                                                 \
+        std::string s_ = (w_stream);                                \
+        const std::string got_ = join(takeFrames(s_));              \
+        if (got_ != (w_frames) || s_ != (w_rest)) {                 \
+            fail("takeFrames(" #w_stream ")", got_ + " / kept " + s_, std::string(w_frames) + " / kept " + (w_rest)); \
+        }                                                           \
+    } while (0)
+
 #define CHECK_SLR_MAX(metres, want)                                 \
     do {                                                            \
         ++g_checks;                                                 \
@@ -87,7 +105,18 @@ bool sameOptional(const std::optional<T> &got, bool has, double value)
         }                                                           \
     } while (0)
 
-#define CHECK_REPLY(w_raw, w_parsed, w_tag, w_ctrl, w_hy, w_yaw, w_hp, w_pitch, w_hr, w_roll, w_hs, w_slr, w_hd, w_dzm) \
+#define CHECK_SD_CARD(w_data, w_has, w_free, w_total)              \
+    do {                                                            \
+        ++g_checks;                                                 \
+        const auto c_ = decodeSdCard(w_data);                       \
+        if (!sameSdCard(c_, (w_has), (w_free), (w_total))) {        \
+            fail("decodeSdCard(" #w_data ")", c_ ? std::to_string(c_->freeMb) + " of " + std::to_string(c_->totalMb) : "none", \
+                 (w_has) ? std::to_string(w_free) + " of " + std::to_string(w_total) : "none"); \
+        }                                                           \
+    } while (0)
+
+#define CHECK_REPLY(w_raw, w_parsed, w_tag, w_ctrl, w_hy, w_yaw, w_hp, w_pitch, w_hr, w_roll, w_hs, w_slr, w_hd, w_dzm, \
+                    w_hrec, w_rec, w_hsd, w_free, w_total)          \
     do {                                                            \
         ++g_checks;                                                 \
         const auto f_ = parseTpFrame(w_raw);                        \
@@ -99,7 +128,9 @@ bool sameOptional(const std::optional<T> &got, bool has, double value)
                 && sameOptional(f_->pitch, (w_hp), (w_pitch))       \
                 && sameOptional(f_->roll, (w_hr), (w_roll))         \
                 && sameOptional(f_->slrDm, (w_hs), (w_slr))         \
-                && sameOptional(f_->dzmStep, (w_hd), (w_dzm));      \
+                && sameOptional(f_->dzmStep, (w_hd), (w_dzm))       \
+                && sameOptional(f_->recording, (w_hrec), (w_rec) ? 1.0 : 0.0) \
+                && sameSdCard(f_->sdCard, (w_hsd), (w_free), (w_total)); \
             if (!ok_) {                                             \
                 fail("parseTpFrame(" #w_raw ") fields", f_->tag + " " + f_->data, (w_tag)); \
             }                                                       \

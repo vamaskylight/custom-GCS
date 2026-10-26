@@ -309,7 +309,8 @@ class FenceJob:
     """
 
     def __init__(self, kind: str, cfg: dict, now: float) -> None:
-        self.kind = str(kind)              # "polygon", "circle", "circle_items" (with areas to stay out of), "read"
+        self.kind = str(kind)              # "polygon", "circle", "circle_items" (with areas to stay out of),
+                                           # "nofly" (those areas alone), "read"
         self.cfg = dict(cfg)
         self.started = float(now)
         self.corners: list = []
@@ -327,5 +328,6 @@ class FenceJob:
         self.read_purpose = ""             # "before", "check", "show"
         self.check_tries = 0
         self.check_again_at: float | None = None
+        self.send_at: float | None = None  # the items go out then, once FENCE_TOTAL was set to 0 (fence_link.py)
         self.on_drone = None               # what the read found (vgcs.mission.fence.FenceOnDrone)
         self.settings_open = False         # the fence settings are being written or read

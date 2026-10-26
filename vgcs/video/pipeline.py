@@ -374,6 +374,9 @@ _HWACCEL_UNAVAILABLE = False
 
 from PySide6.QtCore import QObject, QTimer, Signal, QMetaObject, Qt, Slot
 from PySide6.QtGui import QImage
+
+from vgcs.video import thermal_palette
+
 try:
     import numpy as np  # type: ignore[import-not-found]
 
@@ -1985,6 +1988,8 @@ class RtspSource(QObject):
         self._rec_lock = threading.Lock()
         self._rec_digital_zoom: float = 1.0
         self._rec_apply_digital_zoom: bool = False
+        # The thermal colours of the recording that runs (DGCA VID-06).
+        self._rec_thermal_palette: str = thermal_palette.AS_RECEIVED
         self._running = False
 
     @property
@@ -2259,12 +2264,33 @@ class RtspSource(QObject):
                 self._rec_digital_zoom = 1.0
             self._rec_apply_digital_zoom = bool(apply_digital_zoom)
 
-    def start_recording(self, filename: str) -> bool:
+    def set_recording_thermal_palette(self, palette_id: str) -> None:
+        """Change the thermal colours of the recording that runs now.
+
+        The operator's recording keeps the colours shown on screen (DGCA
+        VID-06), so the window calls this when the operator picks another mode
+        or the camera switches sensor. Each recording starts with the colours
+        given to ``start_recording``.
+        """
+        pid = thermal_palette.normalize_palette_id(palette_id)
+        with self._rec_lock:
+            self._rec_thermal_palette = pid
+
+    def start_recording(
+        self,
+        filename: str,
+        *,
+        thermal_palette_id: str = thermal_palette.AS_RECEIVED,
+    ) -> bool:
         """
         Record the **same** decoded RGB stream used for preview.
 
         A second FFmpeg pulling the RTSP URL directly often fails on companion cameras
         that only allow **one** RTSP client (symptom: a tiny broken ``.mp4``).
+
+        ``thermal_palette_id``: the thermal colours the frames are saved in, from
+        the first frame on. The default keeps the camera's own picture (the
+        observation clips).
         """
         path = str(filename or "").strip()
         if not path:
@@ -2359,6 +2385,7 @@ class RtspSource(QObject):
 
         with self._rec_lock:
             self._rec_proc = proc
+            self._rec_thermal_palette = thermal_palette.normalize_palette_id(thermal_palette_id)
         return True
 
     def stop_recording(self) -> None:
@@ -2401,6 +2428,27 @@ class RtspSource(QObject):
                 pass
         except Exception:
             pass
+
+    def _write_recording_frame(self, raw: bytes, w: int, h: int) -> None:
+        """Hand one decoded frame to the recording that runs, as it is shown:
+        the preview's software zoom (thermal), then the thermal colours."""
+        with self._rec_lock:
+            recp = self._rec_proc
+            if recp is None or recp.poll() is not None or recp.stdin is None:
+                return
+            rec_raw = raw
+            if self._rec_apply_digital_zoom:
+                z = float(self._rec_digital_zoom)
+                if z > 1.001:
+                    rec_raw = apply_digital_zoom_rgb24(raw, w, h, z)
+            if self._rec_thermal_palette != thermal_palette.AS_RECEIVED:
+                rec_raw = thermal_palette.apply_palette_rgb24(rec_raw, w, h, self._rec_thermal_palette)
+            try:
+                recp.stdin.write(rec_raw)
+            except BrokenPipeError:
+                pass
+            except Exception:
+                pass
 
     def _on_video_frame_changed(self, frame) -> None:
         try:
@@ -3394,24 +3442,7 @@ class RtspSource(QObject):
                                                 pass
                                         self._end_decode_session_proc(p)
                                         break
-                                with self._rec_lock:
-                                    recp = self._rec_proc
-                                    rec_raw = raw
-                                    if self._rec_apply_digital_zoom:
-                                        z = float(self._rec_digital_zoom)
-                                        if z > 1.001:
-                                            rec_raw = apply_digital_zoom_rgb24(raw, w, h, z)
-                                    if (
-                                        recp is not None
-                                        and recp.poll() is None
-                                        and recp.stdin is not None
-                                    ):
-                                        try:
-                                            recp.stdin.write(rec_raw)
-                                        except BrokenPipeError:
-                                            pass
-                                        except Exception:
-                                            pass
+                                self._write_recording_frame(raw, w, h)
                                 now = time.monotonic()
                                 if (now - last_emit_mono) < min_emit_dt:
                                     continue

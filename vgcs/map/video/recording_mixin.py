@@ -65,7 +65,9 @@ class VideoRecordingMixin:
         if cc is None or isinstance(cc, NoopCameraControl):
             return
         try:
-            cc.camera_toggle_record()
+            # Start or stop, not a toggle: the Skydroid toggle sent REC 01 for the stop too, so the
+            # camera never stopped recording to its SD card (task AL, 2026-10-26).
+            cc.camera_set_record(want)
             self._payload_hardware_recording = want
         except Exception:
             pass

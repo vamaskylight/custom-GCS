@@ -9,6 +9,10 @@
   on screen signs with the same key, so only signed commands reach it.
 - "Send key to the drone" and "Remove key from the drone" act on the drone on
   screen, while it is disarmed, and are reported once the drone shows it.
+- Without a key, a drone that signs is said too: it ignores this laptop's
+  commands (since 2026-10-26, the client's laptop 2 showed only "Off"). Once
+  per connection the MESSAGE cell says so, like a vehicle warning, and a
+  command that got no answer names it as the likely reason.
 """
 
 from __future__ import annotations
@@ -28,14 +32,18 @@ from PySide6.QtWidgets import (
 )
 
 from vgcs.app import secret_store
+from vgcs.app.vehicle_messages import SEVERITY_WARNING
 from vgcs.link.signing import (
+    DRONE_SIGNS_NO_KEY,
     MIN_PASSPHRASE,
     OFF,
     WAITING,
     fingerprint,
+    ignored_words,
     key_from_passphrase,
     state_level,
     state_text,
+    with_ignored_reason,
 )
 
 KEY_SIGNING_KEY = "signing/key"            # protected (DPAPI), never the passphrase
@@ -182,14 +190,28 @@ class MainWindowSigningMixin:
         self._append_log("Signing: key sent to the drone" if enable else "Signing: asked the drone to stop signing")
         return True
 
+    def _with_signing_reason(self, detail: str) -> str:
+        """A failed command's words, with the likely reason when the drone on screen ignores this laptop."""
+        return with_ignored_reason(detail, getattr(self, "_signing_state", OFF))
+
     # --- what the dashboard shows -----------------------------------------------
     def _publish_signing(self, data: dict) -> None:
         """The "Command signing" value. data is a SIGNING payload from the link, or {} for this laptop's state."""
         field = getattr(self, "_fields", {}).get("signing")
         if data:
+            was = self._signing_state
             self._signing_state = str(data.get("state") or self._signing_state)
             text = str(data.get("text") or "")
             level = str(data.get("level") or "na")
+            reason = ignored_words(self._signing_state)
+            if reason and self._signing_state != was:
+                # Not only in a field few open: this laptop cannot command the drone on screen.
+                line = f"Signing: {reason}, except over USB."
+                self._append_log(line)
+                board = getattr(self, "_vehicle_msg_board", None)
+                if board is not None:
+                    board.push_vehicle_message(line, severity=SEVERITY_WARNING)
+                    self._publish_vehicle_msg_cell()
         else:
             self._signing_state = WAITING if self._signing_key else OFF
             text = state_text(self._signing_state, self._signing_fingerprint())
@@ -214,6 +236,8 @@ class MainWindowSigningMixin:
                 line = f"Key {self._signing_fingerprint()} is set on this laptop. " + state_text(
                     self._signing_state, self._signing_fingerprint()
                 ) + "."
+            elif self._signing_state == DRONE_SIGNS_NO_KEY:
+                line = state_text(DRONE_SIGNS_NO_KEY) + " (Set passphrase...)."
             else:
                 line = "No key: VGCS does not sign its commands, and a drone takes commands from anyone in range."
             if self._signing_note:
@@ -236,6 +260,8 @@ class MainWindowSigningMixin:
             "With a key, VGCS signs every command it sends (256-bit key, MAVLink 2 signing). A drone that holds "
             "the key ignores commands that are not signed with it, so nobody else in radio range can arm it, "
             "change its mode or its mission. It does not encrypt: telemetry and video can still be received. "
+            "It covers only the commands of ground stations: the RC's sticks and switches (its mode switch too), "
+            "and the camera's gimbal and zoom over the camera's own link, work without the key. "
             "The same passphrase works in the VAMA APK (Settings, Telemetry, MAVLink 2 Signing, Add Signing Key). "
             "The passphrase is not stored. The key is, encrypted for this Windows user."
         )

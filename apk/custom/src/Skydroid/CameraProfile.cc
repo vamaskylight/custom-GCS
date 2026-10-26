@@ -146,7 +146,25 @@ QList<Profile> builtInProfiles()
     c14.laserMaxM = 1500.0;
     c14.upperGimbalHeader = true;
 
-    return {c12, c13, c14};
+    // The C20 (task AJ): TOP over TCP port 5000 only, "#TP" on every gimbal frame (TOP document
+    // V1.1.6, sections 2.1.1 and 2.2.2). 22x optical zoom, 58.3 degrees wide at 1x, 1080p
+    // (34.9 high), -90 to +45 degrees, 150 either way, no laser, no thermal picture. Its day
+    // video as the client's own camera file had it (2026-10-22, the picture worked). TOP lists
+    // no photo, recording or zoom command for the C20: they are on, to be tried on the camera.
+    Profile c20 = skydroid("C20", "V20");
+    c20.tcp = true;
+    c20.dayVideoUrl = QStringLiteral("rtsp://192.168.144.108:554/main");
+    c20.thermalVideoUrl.clear();
+    c20.fovHDeg = 58.3;
+    c20.fovVDeg = 34.9;
+    c20.maxZoom = 22.0;
+    c20.pitchMaxDeg = 45.0;
+    c20.yawLimitDeg = 150.0;
+    c20.laser = false;
+    c20.ownTracker = false;
+    c20.upperGimbalHeader = true;
+
+    return {c12, c13, c14, c20};
 }
 
 QString defaultId()
@@ -282,6 +300,7 @@ QJsonObject toJson(const Profile &p)
     o[QStringLiteral("protocol")] = QString::fromLatin1(kProtocol);
     o[QStringLiteral("host")] = p.host;
     o[QStringLiteral("port")] = p.port;
+    o[QStringLiteral("transport")] = p.tcp ? QStringLiteral("tcp") : QStringLiteral("udp");
     o[QStringLiteral("dayVideoUrl")] = p.dayVideoUrl;
     o[QStringLiteral("thermalVideoUrl")] = p.thermalVideoUrl;
     o[QStringLiteral("zoom")] = zoomName(p.zoom);
@@ -352,7 +371,14 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
     if (json.value(QStringLiteral("protocol")).toString() != QLatin1String(kProtocol)) {
         return fail(text("its protocol is not Skydroid TOP (\"%1\"), the only one the app speaks.").arg(QLatin1String(kProtocol)));
     }
+    // Files from before the C20 have no transport: UDP, as every camera had then.
+    const QJsonValue transport = json.value(QStringLiteral("transport"));
+    if (!transport.isUndefined() && transport != QJsonValue(QStringLiteral("udp"))
+        && transport != QJsonValue(QStringLiteral("tcp"))) {
+        return fail(text("its transport is not \"udp\" or \"tcp\"."));
+    }
     Profile p;
+    p.tcp = transport == QJsonValue(QStringLiteral("tcp"));
     p.id = id;
     p.builtIn = false;
     p.name = value("name").toString().trimmed();

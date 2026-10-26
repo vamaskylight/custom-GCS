@@ -72,7 +72,12 @@ CHECK_FRAME(buildGimbalAngleAxis("GAY", -170.25, 30.0), "#tpUG6wGAYBD7F3CAA");
 CHECK_FRAME(buildGimbalAngleAxis("GAX", 1.0, 1.0), "");
 CHECK_FRAME(buildGimbalAngles(30.0, -45.0, 25.0, 20.0), "#tpUGCwGAM0BB832EE6C28F0");
 CHECK_FRAME(buildPhoto(), "#TPUD2wCAP013E");
-CHECK_FRAME(buildRecord(), "#TPUD2wREC0144");
+CHECK_FRAME(buildRecord(true), "#TPUD2wREC0144");
+CHECK_FRAME(buildRecord(true), "#TPUD2wREC0144");
+CHECK_FRAME(buildRecord(false), "#TPUD2wREC0043");
+CHECK_FRAME(buildRecord(false), "#TPUD2wREC0043");
+CHECK_FRAME(buildRecordQuery(), "#TPUD2rREC003E");
+CHECK_FRAME(buildSdCardQuery(), "#TPUD2rSDC003E");
 CHECK_FRAME(buildSystemCommand("rec", "01", false), "#TPUD2rREC013F");
 CHECK_FRAME(buildSystemCommand("IMG", "0102"), "#tpUD4wIMG0102EB");
 CHECK_FRAME(buildSlrQuery(), "#TPUD2rSLR0055");
@@ -184,6 +189,28 @@ CHECK_DECODE(decodeDzmStep("FF"), true, 255.0);
 CHECK_DECODE(decodeDzmStep("1"), false, 0.0);
 CHECK_DECODE(decodeDzmStep("123"), false, 0.0);
 CHECK_DECODE(decodeDzmStep("0x46"), false, 0.0);
+CHECK_DECODE(decodeRecordState("00"), true, 0.0);
+CHECK_DECODE(decodeRecordState("01"), true, 1.0);
+CHECK_DECODE(decodeRecordState("0"), true, 0.0);
+CHECK_DECODE(decodeRecordState("1"), true, 1.0);
+CHECK_DECODE(decodeRecordState(" 01 "), true, 1.0);
+CHECK_DECODE(decodeRecordState("02"), false, 0.0);
+CHECK_DECODE(decodeRecordState("0A"), false, 0.0);
+CHECK_DECODE(decodeRecordState(""), false, 0.0);
+CHECK_DECODE(decodeRecordState("001"), false, 0.0);
+CHECK_DECODE(decodeRecordState("x1"), false, 0.0);
+CHECK_DECODE(decodeRecordState("0x1"), false, 0.0);
+
+// CHECK_SD_CARD(data_field, has_value, free_mb, total_mb)
+CHECK_SD_CARD("0000000000", true, 0, 0);
+CHECK_SD_CARD("03200076E4", true, 12800, 30436);
+CHECK_SD_CARD("FFFFFFFFFF", true, 1048575, 1048575);
+CHECK_SD_CARD("03200076e4", true, 12800, 30436);
+CHECK_SD_CARD(" 03200076E4 ", true, 12800, 30436);
+CHECK_SD_CARD("03200076E", false, 0, 0);
+CHECK_SD_CARD("03200076E4F", false, 0, 0);
+CHECK_SD_CARD("0320G076E4", false, 0, 0);
+CHECK_SD_CARD("", false, 0, 0);
 
 // CHECK_SLR_MAX(metres_or_nan, expected_dm)
 CHECK_SLR_MAX(std::nullopt, 10000);
@@ -193,15 +220,48 @@ CHECK_SLR_MAX(1200.0, 12000);
 CHECK_SLR_MAX(1500.4, 15004);
 CHECK_SLR_MAX(99999.0, 65534);
 
-// CHECK_REPLY(raw, parsed, tag, ctrl, has_yaw, yaw, has_pitch, pitch, has_roll, roll, has_slr, slr_dm, has_dzm, dzm_step)
-CHECK_REPLY("#TPGU4rGAC11940000000022", true, "GAC", 'r', true, 45.0, true, 0.0, true, 0.0, false, 0, false, 0);
-CHECK_REPLY("#tpGUCrGAC1194EE6C000A00", true, "GAC", 'r', true, 45.0, true, -45.0, true, 0.1, false, 0, false, 0);
-CHECK_REPLY("#TPDU4rSLR01F4F4", true, "SLR", 'r', false, 0.0, false, 0.0, false, 0.0, true, 500, false, 0);
-CHECK_REPLY("#TPDU4rSLRFFFF00", true, "SLR", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0);
-CHECK_REPLY("#TPDU2rDZM4600", true, "DZM", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, true, 70);
-CHECK_REPLY("#TPDU2wDZM0A00", true, "DZM", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0);
-CHECK_REPLY("  #tpUG4wGSM0A0A1C\r\n", true, "GSM", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0);
-CHECK_REPLY("#TPXX2rGAC00", false, "", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0);
-CHECK_REPLY("#TPUG2xGAA0100", false, "", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0);
-CHECK_REPLY("hello", false, "", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0);
-CHECK_REPLY("#TPUG2wGAA01", true, "GAA", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0);
+// CHECK_REPLY(raw, parsed, tag, ctrl, has_yaw, yaw, has_pitch, pitch, has_roll, roll, has_slr, slr_dm,
+//             has_dzm, dzm_step, has_recording, recording, has_sd_card, free_mb, total_mb)
+CHECK_REPLY("#TPGU4rGAC11940000000022", true, "GAC", 'r', true, 45.0, true, 0.0, true, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#tpGUCrGAC1194EE6C000A00", true, "GAC", 'r', true, 45.0, true, -45.0, true, 0.1, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPDU4rSLR01F4F4", true, "SLR", 'r', false, 0.0, false, 0.0, false, 0.0, true, 500, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPDU4rSLRFFFF00", true, "SLR", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPDU2rDZM4600", true, "DZM", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, true, 70, false, false, false, 0, 0);
+CHECK_REPLY("#TPDU2wDZM0A00", true, "DZM", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("  #tpUG4wGSM0A0A1C\r\n", true, "GSM", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPXX2rGAC00", false, "", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPUG2xGAA0100", false, "", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("hello", false, "", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPUG2wGAA01", true, "GAA", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPDU2rREC013F", true, "REC", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, true, true, false, 0, 0);
+CHECK_REPLY("#TPDU2rREC003E", true, "REC", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, true, false, false, 0, 0);
+CHECK_REPLY("#tpDU1rREC14E", true, "REC", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, true, true, false, 0, 0);
+CHECK_REPLY("#TPDU2rREC0543", true, "REC", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPDU2wREC0043", true, "REC", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPDU2wCAP013E", true, "CAP", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#tpDUArSDC03200076E438", true, "SDC", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, true, 12800, 30436);
+CHECK_REPLY("#tpDUArSDC00000000000D", true, "SDC", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, true, 0, 0);
+CHECK_REPLY("#tpDU4rSDC0000E0", true, "SDC", 'r', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+CHECK_REPLY("#TPDU2wERE!!27", true, "ERE", 'w', false, 0.0, false, 0.0, false, 0.0, false, 0, false, 0, false, false, false, 0, 0);
+
+// CHECK_SPLIT(tcp_stream, expected_frames_joined_by_bar, expected_rest)
+CHECK_SPLIT("#tpGUCrGAC0064FF9C0000B5", "#tpGUCrGAC0064FF9C0000B5", "");
+CHECK_SPLIT("#tpGUCrGA", "", "#tpGUCrGA");
+CHECK_SPLIT("#tpGUCrGAC0064FF9C0000B5#TPDU2wREC0144#tpU", "#tpGUCrGAC0064FF9C0000B5|#TPDU2wREC0144", "#tpU");
+CHECK_SPLIT("#TPDU2wREC0144#", "#TPDU2wREC0144", "#");
+CHECK_SPLIT("#TPDU2wREC0144#T", "#TPDU2wREC0144", "#T");
+CHECK_SPLIT("#TPDU2wREC0144#t", "#TPDU2wREC0144", "#t");
+CHECK_SPLIT("\r\nOK#TPDU2wREC0144", "#TPDU2wREC0144", "");
+CHECK_SPLIT("noise", "", "");
+CHECK_SPLIT("#TPUGZw#TPDU2wREC0144", "#TPDU2wREC0144", "");
+CHECK_SPLIT("#tpUD4wZMC000A06#TPDU2wREC0144", "#tpUD4wZMC000A06|#TPDU2wREC0144", "");
+CHECK_SPLIT("", "", "");
+CHECK_SPLIT("#", "", "#");
+CHECK_SPLIT("#tp", "", "#tp");
+CHECK_SPLIT("##TP", "", "#TP");
+CHECK_SPLIT("#TPDU2wREC0144x#TP", "#TPDU2wREC0144", "#TP");
+CHECK_SPLIT("#TPUG#TPDU2wREC0144", "#TPDU2wREC0144", "");
+CHECK_SPLIT("#TPDU2wREC0144#TPDU2wREC0144#TPDU2wREC0144", "#TPDU2wREC0144|#TPDU2wREC0144|#TPDU2wREC0144", "");
+CHECK_SPLIT("#tpUGaw0123456789x#TPDU2wREC0144", "#tpUGaw0123456789x#TPD", "");
+CHECK_SPLIT("#TPUG2wGAA01", "", "#TPUG2wGAA01");
+CHECK_SPLIT("#TPUG2wGAA0136tail", "#TPUG2wGAA0136", "");

@@ -45,6 +45,11 @@ ZOOM_COUNTED = "counted"
 ZOOM_REPORTED = "reported"
 ZOOMS = (ZOOM_NONE, ZOOM_COUNTED, ZOOM_REPORTED)
 
+# How TOP reaches the camera. A file from before the C20 has no "transport": UDP.
+TRANSPORT_UDP = "udp"
+TRANSPORT_TCP = "tcp"
+TRANSPORTS = (TRANSPORT_UDP, TRANSPORT_TCP)
+
 # The addresses of Skydroid's cameras: day picture on RTSP port 554, thermal on 555.
 SKYDROID_HOST = "192.168.144.108"
 SKYDROID_PORT = 5000
@@ -75,6 +80,9 @@ class Camera:
     # Addresses. Choosing the camera sets them.
     host: str = ""
     port: int = SKYDROID_PORT
+    # TOP over TCP, not UDP: the C20 takes it on TCP port 5000 only (TOP document V1.1.6,
+    # section 2.1.1). Its file says "transport": "tcp" (else "udp").
+    transport: str = TRANSPORT_UDP
     day_video_url: str = ""
     thermal_video_url: str = ""  # empty: no thermal picture
     # The day picture
@@ -149,11 +157,33 @@ def built_in_cameras() -> list[Camera]:
             laser_max_m=1500.0,
             upper_gimbal_header=True,
         ),
+        # The C20: TOP over TCP port 5000 only, "#TP" on every gimbal frame, 22x optical zoom,
+        # 58.3 x 34.9 at 1x (1080p), -90 to +45 degrees, 150 either way, no laser, no thermal
+        # picture, its day video as the client's own camera file had it (2026-10-22).
+        replace(
+            _skydroid("C20", "V20"),
+            transport=TRANSPORT_TCP,
+            day_video_url="rtsp://192.168.144.108:554/main",
+            thermal_video_url="",
+            fov_h_deg=58.3,
+            fov_v_deg=34.9,
+            max_zoom=22.0,
+            pitch_max_deg=45.0,
+            yaw_limit_deg=150.0,
+            laser=False,
+            own_tracker=False,
+            upper_gimbal_header=True,
+        ),
     ]
 
 
 # VGCS's built-in profile of each built-in camera (for a copy made from what VGCS uses).
-BUILT_IN_PROFILE_IDS = {"C12": "c12_default", "C13": "c13_default", "C14 Pro": "c14pro_default"}
+BUILT_IN_PROFILE_IDS = {
+    "C12": "c12_default",
+    "C13": "c13_default",
+    "C14 Pro": "c14pro_default",
+    "C20": "c20_default",
+}
 
 
 def _is_built_in_id(camera_id: str) -> bool:
@@ -254,6 +284,7 @@ def to_json(cam: Camera) -> dict[str, Any]:
         "protocol": PROTOCOL,
         "host": cam.host,
         "port": cam.port,
+        "transport": cam.transport if cam.transport in TRANSPORTS else TRANSPORT_UDP,
         "dayVideoUrl": cam.day_video_url,
         "thermalVideoUrl": cam.thermal_video_url,
         "zoom": cam.zoom if cam.zoom in ZOOMS else ZOOM_COUNTED,
@@ -327,6 +358,10 @@ def from_json(data: Any, camera_id: str) -> tuple[Camera | None, str]:
         return None, f'it is not a camera file of this app (no "format": "{FORMAT}").'
     if data.get("protocol") != PROTOCOL:
         return None, f'its protocol is not Skydroid TOP ("{PROTOCOL}"), the only one the app speaks.'
+    # Files from before the C20 have no transport: UDP, as every camera had then.
+    transport = data.get("transport", TRANSPORT_UDP)
+    if transport not in TRANSPORTS:
+        return None, 'its transport is not "udp" or "tcp".'
     name = text("name")
     host = text("host")
     port = _whole(value("port"))
@@ -338,7 +373,16 @@ def from_json(data: Any, camera_id: str) -> tuple[Camera | None, str]:
         if not missing:
             return None, "its zoom is not one of none, counted or reported."
         zoom = ZOOM_COUNTED
-    cam = Camera(id=camera_id, name=name, host=host, port=port, day_video_url=day, thermal_video_url=thermal, zoom=zoom)
+    cam = Camera(
+        id=camera_id,
+        name=name,
+        host=host,
+        port=port,
+        transport=transport,
+        day_video_url=day,
+        thermal_video_url=thermal,
+        zoom=zoom,
+    )
     if zoom == ZOOM_REPORTED:
         lenses = []
         raw = value("lenses")
@@ -603,6 +647,7 @@ def command_profile(cam: Camera) -> SkydroidCommandProfile:
         max_zoom=1.0 if cam.zoom == ZOOM_NONE else (float(cam.max_zoom) if cam.zoom == ZOOM_COUNTED else 30.0),
         photo=bool(cam.photo),
         record=bool(cam.record),
+        transport=cam.transport if cam.transport in TRANSPORTS else TRANSPORT_UDP,
     )
 
 
@@ -626,6 +671,9 @@ __all__ = [
     "MAX_LENSES",
     "MAX_NAME_LENGTH",
     "PROTOCOL",
+    "TRANSPORTS",
+    "TRANSPORT_TCP",
+    "TRANSPORT_UDP",
     "ZOOMS",
     "ZOOM_COUNTED",
     "ZOOM_NONE",

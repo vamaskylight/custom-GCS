@@ -108,6 +108,11 @@ int CustomPlugin::adminWaitSeconds() const
     return _adminPassword.waitSeconds(_adminClock.elapsed());
 }
 
+void CustomPlugin::requestCameraWindow(const QString &which)
+{
+    emit cameraWindowRequested(which);
+}
+
 void CustomPlugin::_addSettingsEntry(const QString &title, const char *qmlFile, const char *iconFile)
 {
     Q_CHECK_PTR(qmlFile);

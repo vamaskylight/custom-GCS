@@ -63,6 +63,8 @@ class VehicleSummary:
     signing: str = ""               # vgcs/link/signing.py state, "" before the first report
     last_heard_mono: float = 0.0
     lost_since_mono: Optional[float] = None
+    # The link closed although nobody asked (Disconnect, closing VGCS): lost too (link alarm).
+    closed_by_itself: bool = False
     history: list = field(default_factory=list)   # recent alerts, newest last
 
 
@@ -110,6 +112,7 @@ def signing_text(s: VehicleSummary) -> str:
         "drone_unsigned": "NOT signed",
         "key_mismatch": "OTHER KEY",
         "mavlink1": "MAVLink 1",
+        "drone_signs_no_key": "NEEDS KEY",
     }.get(s.signing, "")
 
 
@@ -178,6 +181,7 @@ class FleetVehicle(QObject):
     def _on_heartbeat(self, sysid: int, _compid: int, _mav: int) -> None:
         was_lost = self.summary.link == LINK_LOST
         self.summary.link = LINK_UP
+        self.summary.closed_by_itself = False
         self.summary.sysid = int(sysid)
         self.summary.last_heard_mono = time.monotonic()
         self.summary.lost_since_mono = None
@@ -193,6 +197,10 @@ class FleetVehicle(QObject):
     def _on_link_down(self) -> None:
         was = self.summary.link
         self.summary.link = LINK_CLOSED
+        # A port that failed while the link was up: the pilot has lost the drone as surely
+        # as by a radio dropout. A thread that cannot say counts as asked.
+        asked = getattr(self.thread, "stop_requested", None)
+        self.summary.closed_by_itself = was in (LINK_UP, LINK_LOST) and callable(asked) and not asked()
         if was in (LINK_UP, LINK_LOST):
             self._alert("link closed")
 
@@ -232,6 +240,8 @@ class FleetVehicle(QObject):
             s.signing = str(d.get("state", "") or "")
             if s.signing == "key_mismatch" and was != "key_mismatch":
                 self._alert("signs with another key: it ignores VGCS's commands")
+            elif s.signing == "drone_signs_no_key" and was != "drone_signs_no_key":
+                self._alert("signs, and this laptop has no key: it ignores VGCS's commands")
         elif kind == "STATUSTEXT":
             text = str(d.get("text", "") or "").strip()
             # 0 is EMERGENCY, so not "or 7": that would hide the worst ones.
@@ -356,6 +366,18 @@ class Fleet(QObject):
     def stop_all(self) -> None:
         for vehicle in list(self._vehicles.values()):
             vehicle.stop()
+
+    def lost_links(self) -> dict[str, str]:
+        """The drones whose link is lost now, {vid: name}: lost by the watchdog, or closed by itself."""
+        return {v.vid: v.name for v in self._vehicles.values()
+                if v.summary.link == LINK_LOST or (v.summary.link == LINK_CLOSED and v.summary.closed_by_itself)}
+
+    def set_link_loss_time(self, seconds: float) -> None:
+        """A new link loss time for every running link (new links get it when they are made)."""
+        for v in self._vehicles.values():
+            setter = getattr(v.thread, "set_link_loss_time", None)
+            if callable(setter):
+                setter(seconds)
 
     # --- commands to several drones --------------------------------------
     def connected(self) -> list[FleetVehicle]:

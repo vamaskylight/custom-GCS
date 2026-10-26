@@ -146,6 +146,7 @@ private slots:
     void theDayLensIsTheOldFormula();
     void theZoomIsTheOldOne();
     void aFileGivesTheSameCameraBack();
+    void theTransportIsInTheFile();
     void theEditorsFieldsNeedNoFormat();
     void wrongValuesAreRefusedWithASentence();
     void namesBecomeFileNames();
@@ -161,16 +162,34 @@ private slots:
 void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
 {
     const QList<Profile> all = camera::builtInProfiles();
-    QCOMPARE(all.size(), 3);
+    QCOMPARE(all.size(), 4);
     QCOMPARE(all.at(0).id, QStringLiteral("C12"));
     QCOMPARE(all.at(1).id, QStringLiteral("C13"));
     QCOMPARE(all.at(2).id, QStringLiteral("C14 Pro"));
+    QCOMPARE(all.at(3).id, QStringLiteral("C20"));
     QCOMPARE(all.at(0).name, QStringLiteral("V12"));
     QCOMPARE(all.at(1).name, QStringLiteral("V13"));
     QCOMPARE(all.at(2).name, QStringLiteral("V14 Pro"));
+    QCOMPARE(all.at(3).name, QStringLiteral("V20"));
     QCOMPARE(camera::defaultId(), QStringLiteral("C13"));
-    for (const Profile &p : all) {
-        QVERIFY(p.builtIn);
+    // The C20 (task AJ): TOP over TCP, its own video address, no thermal picture or laser.
+    const Profile c20 = all.at(3);
+    QVERIFY(c20.builtIn && c20.tcp);
+    QCOMPARE(c20.host, QStringLiteral("192.168.144.108"));
+    QCOMPARE(c20.port, 5000);
+    QCOMPARE(c20.dayVideoUrl, QStringLiteral("rtsp://192.168.144.108:554/main"));
+    QVERIFY(!c20.hasThermal() && !c20.laser && !c20.ownTracker && c20.photo && c20.record);
+    QVERIFY(c20.zoom == Zoom::Counted);
+    QCOMPARE(c20.maxZoom, 22.0);
+    QCOMPARE(c20.fovHDeg, 58.3);
+    QCOMPARE(c20.fovVDeg, 34.9);
+    QCOMPARE(c20.pitchMinDeg, -90.0);
+    QCOMPARE(c20.pitchMaxDeg, 45.0);
+    QCOMPARE(c20.yawLimitDeg, 150.0);
+    QVERIFY(c20.upperGimbalHeader);
+    QVERIFY2(camera::problem(c20).isEmpty(), qPrintable(camera::problem(c20)));
+    for (const Profile &p : all.mid(0, 3)) {
+        QVERIFY(p.builtIn && !p.tcp);
         QCOMPARE(p.host, QStringLiteral("192.168.144.108"));
         QCOMPARE(p.port, 5000);
         QCOMPARE(p.dayVideoUrl, QStringLiteral("rtsp://192.168.144.108:554/stream=1"));
@@ -297,6 +316,36 @@ void CameraProfileTest::aFileGivesTheSameCameraBack()
     QVERIFY(back->zoom == Zoom::None);
 }
 
+void CameraProfileTest::theTransportIsInTheFile()
+{
+    const QList<Profile> all = camera::builtInProfiles();
+    QCOMPARE(camera::toJson(all.at(1)).value(QStringLiteral("transport")).toString(), QStringLiteral("udp"));
+    QCOMPARE(camera::toJson(all.at(3)).value(QStringLiteral("transport")).toString(), QStringLiteral("tcp"));
+    // A file from before the C20 has no transport: UDP.
+    QJsonObject old = camera::toJson(all.at(3));
+    old.remove(QStringLiteral("transport"));
+    QString why;
+    std::optional<Profile> p = camera::fromJson(old, QStringLiteral("old"), &why);
+    QVERIFY2(p.has_value(), qPrintable(why));
+    QVERIFY(!p->tcp);
+    // Anything else is refused, with VGCS's sentence.
+    for (const QJsonValue &wrong : {QJsonValue(QStringLiteral("serial")), QJsonValue(QJsonValue::Null), QJsonValue(true),
+                                    QJsonValue(QStringLiteral("TCP"))}) {
+        QJsonObject bad = camera::toJson(all.at(3));
+        bad[QStringLiteral("transport")] = wrong;
+        why.clear();
+        QVERIFY(!camera::fromJson(bad, QStringLiteral("bad"), &why).has_value());
+        QCOMPARE(why, QStringLiteral("its transport is not \"udp\" or \"tcp\"."));
+    }
+    // The editor's fields carry it.
+    QJsonObject fields = camera::toJson(all.at(1));
+    fields[QStringLiteral("transport")] = QStringLiteral("tcp");
+    fields[QStringLiteral("id")] = QString();
+    p = camera::fromFields(fields, &why);
+    QVERIFY2(p.has_value(), qPrintable(why));
+    QVERIFY(p->tcp);
+}
+
 void CameraProfileTest::theEditorsFieldsNeedNoFormat()
 {
     QJsonObject fields = camera::toJson(added(QStringLiteral("Gimbal X")));
@@ -399,13 +448,13 @@ void CameraProfileTest::savingMakesAFileThatIsReadAgain()
     store.setFolder(folder);
     store.load();
     QVERIFY(QDir(folder).exists());  // made, so files can be copied in
-    QCOMPARE(store.profiles().size(), 3);
+    QCOMPARE(store.profiles().size(), 4);
 
     QString id;
     QCOMPARE(store.save(added(QStringLiteral("Gimbal X")), &id), QString());
     QCOMPARE(id, QStringLiteral("gimbal-x"));
     QVERIFY(QFile::exists(QDir(folder).filePath(QStringLiteral("gimbal-x.json"))));
-    QCOMPARE(store.profiles().size(), 4);
+    QCOMPARE(store.profiles().size(), 5);
     QVERIFY(store.find(id) && !store.find(id)->builtIn);
 
     // Another store reads the file as it was saved.
@@ -421,7 +470,7 @@ void CameraProfileTest::savingMakesAFileThatIsReadAgain()
     changed.name = QStringLiteral("Gimbal X2");
     QCOMPARE(store.save(changed, &id), QString());
     QCOMPARE(id, QStringLiteral("gimbal-x"));
-    QCOMPARE(store.profiles().size(), 4);
+    QCOMPARE(store.profiles().size(), 5);
     QCOMPARE(store.find(id)->pitchMaxDeg, 25.0);
     QCOMPARE(store.find(id)->name, QStringLiteral("Gimbal X2"));
 
@@ -438,7 +487,8 @@ void CameraProfileTest::savingMakesAFileThatIsReadAgain()
         names.append(p.name);
     }
     QCOMPARE(names, QStringList({QStringLiteral("V12"), QStringLiteral("V13"), QStringLiteral("V14 Pro"),
-                                 QStringLiteral("C13"), QStringLiteral("Gimbal X!"), QStringLiteral("Gimbal X2")}));
+                                 QStringLiteral("V20"), QStringLiteral("C13"), QStringLiteral("Gimbal X!"),
+                                 QStringLiteral("Gimbal X2")}));
 
     // Wrong values: refused, nothing written.
     Profile wrong = added(QStringLiteral("Wrong"));
@@ -457,7 +507,7 @@ void CameraProfileTest::namesAreNotTwice()
     QCOMPARE(store.save(added(QStringLiteral("Gimbal X")), &id), QString());
     QVERIFY(store.save(added(QStringLiteral("gimbal x")), &id).contains(QStringLiteral("there already")));
     QVERIFY(store.save(added(QStringLiteral("V13")), &id).contains(QStringLiteral("there already")));
-    QCOMPARE(store.profiles().size(), 4);
+    QCOMPARE(store.profiles().size(), 5);
 }
 
 void CameraProfileTest::builtInCamerasStay()
@@ -476,7 +526,7 @@ void CameraProfileTest::builtInCamerasStay()
     QCOMPARE(store.find(QStringLiteral("C13"))->pitchMaxDeg, 10.0);
     QVERIFY(store.find(QStringLiteral("C13"))->builtIn);
     QVERIFY(store.remove(QStringLiteral("C13")).contains(QStringLiteral("built-in")));
-    QCOMPARE(store.profiles().size(), 4);
+    QCOMPARE(store.profiles().size(), 5);
 }
 
 void CameraProfileTest::filesThatAreNoCamerasAreSkippedWithANote()
@@ -508,7 +558,7 @@ void CameraProfileTest::filesThatAreNoCamerasAreSkippedWithANote()
     camera::Store store;
     store.setFolder(dir.path());
     store.load();
-    QCOMPARE(store.profiles().size(), 4);
+    QCOMPARE(store.profiles().size(), 5);
     QVERIFY(store.find(QStringLiteral("good")));
     const QString notes = store.notes().join(QLatin1Char('\n'));
     QCOMPARE(store.notes().size(), 9);
@@ -532,7 +582,7 @@ void CameraProfileTest::deletingRemovesTheFile()
     QCOMPARE(store.remove(id), QString());
     QVERIFY(!QFile::exists(QDir(dir.path()).filePath(id + QStringLiteral(".json"))));
     QVERIFY(!store.find(id));
-    QCOMPARE(store.profiles().size(), 3);
+    QCOMPARE(store.profiles().size(), 4);
     QVERIFY(store.remove(id).contains(QStringLiteral("no such camera")));
 }
 
@@ -545,7 +595,7 @@ void CameraProfileTest::theFilesVgcsWritesAreRead()
     store.load();
     QVERIFY2(store.notes().isEmpty(), qPrintable(store.notes().join(QLatin1Char('\n'))));
     const QFileInfoList files = QDir(sampleFolder("vgcs")).entryInfoList({QStringLiteral("*.json")}, QDir::Files, QDir::Name);
-    QCOMPARE(files.size(), 7);
+    QCOMPARE(files.size(), 8);
     for (const QFileInfo &file : files) {
         const Profile *p = store.find(file.completeBaseName());
         QVERIFY2(p && !p->builtIn, qPrintable(file.fileName()));
@@ -585,7 +635,7 @@ void CameraProfileTest::theAppWritesTheFilesVgcsReads()
         QVERIFY2(f.open(QIODevice::ReadOnly), qPrintable(path + QStringLiteral(" is missing: run once with VAMA_WRITE_CAMERA_FILES=1")));
         QCOMPARE(f.readAll(), bytes);
     }
-    QCOMPARE(added, 7);
+    QCOMPARE(added, 8);
     QCOMPARE(apk.entryList({QStringLiteral("*.json")}, QDir::Files).size(), added);
 }
 

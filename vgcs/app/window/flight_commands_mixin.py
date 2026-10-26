@@ -69,6 +69,7 @@ from vgcs.map import MapWidget
 from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_MAP_WEBENGINE
 from vgcs.app.widgets import CompassWidget
 from vgcs.link.mavlink_thread import MavlinkThread
+from vgcs.link.signing import ignored_words
 from vgcs.video.pipeline import VideoPipeline
 from vgcs.video.widgets import CameraControlPanel
 from vgcs.video.camera_control import (
@@ -110,8 +111,11 @@ class MainWindowFlightCommandsMixin:
             self._append_log(f"Mode change requested: {mode_name}")
             self._post_gcs_notice(f"Mode cmd: {mode_name}")
         else:
-            self._append_log(f"Mode change failed: {mode_name}")
-            self._post_gcs_notice("Mode change failed")
+            # The drone answers a mode change it refuses, so with its signing against this laptop the
+            # likely reason is that it never took the command.
+            reason = ignored_words(getattr(self, "_signing_state", ""))
+            self._append_log(f"Mode change failed: {mode_name}" + (f". Likely why: {reason}" if reason else ""))
+            self._post_gcs_notice("Mode change failed" + (": the drone ignores this laptop (signing)" if reason else ""))
 
     def _takeoff_altitude_m(self, *, from_plan_rail: bool) -> float:
         """Target climb (m) for NAV_TAKEOFF: plan launch alt when set on rail; else dashboard spin."""
@@ -485,6 +489,32 @@ class MainWindowFlightCommandsMixin:
             f"Polygon fence upload queued: {len(corners)} corners{also} alt={cfg['alt_max_m']:.0f}m "
             f"action={int(cfg['action'])}"
         )
+
+    def _upload_nofly_from_plan_panel(self) -> None:
+        """Plan Flight, Fence tab: the areas to stay out of alone, with the tab's max height and action.
+
+        No circle and no polygon (task AI, client 2026-10-22): the areas could go only with one of
+        those, and the client wanted them without the circle. The link checks them against the drone,
+        as for the other uploads, and may come back with a question first.
+        """
+        if self._thread is None or not self._thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect vehicle before fence upload.")
+            return
+        from vgcs.mission.fence import check_nofly
+
+        cfg = self._map_widget.plan_nofly_fence_cfg()
+        areas, problem = check_nofly(cfg.get("nofly") or [])
+        if not problem and not areas:
+            problem = "There is no area to stay out of on the map."
+        if problem:
+            self._map_widget.set_plan_fence_result(False, f"{problem} Not sent.")
+            return
+        self._thread.queue_geofence_upload(cfg)
+        count = f"{len(areas)} area{'' if len(areas) == 1 else 's'} to stay out of"
+        self._map_widget.set_plan_fence_result(
+            None, f"Sending {count} to the drone, without a circle or a polygon fence, and reading them back...")
+        self._append_log(f"Fence upload queued: {count} alone, alt={cfg['alt_max_m']:.0f}m "
+                         f"action={int(cfg['action'])}")
 
     def _read_fence_from_plan_panel(self) -> None:
         if self._thread is None or not self._thread.isRunning():

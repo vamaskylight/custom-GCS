@@ -572,6 +572,20 @@ class MainWindowUiLayoutMixin:
         self._hdr_estop_btn.setEnabled(False)
         self._hdr_estop_btn.clicked.connect(self._on_emergency_motor_stop)
 
+        # The link alarm (vgcs/app/link_alarm.py): shown only while it sounds, in every
+        # header state, because the lost drone need not be the one on screen.
+        self._hdr_silence_btn = QPushButton("Silence alarm")
+        self._hdr_silence_btn.setObjectName("hdrSilenceAlarmBtn")
+        self._hdr_silence_btn.setFixedHeight(26)
+        self._hdr_silence_btn.setCursor(Qt.PointingHandCursor)
+        self._hdr_silence_btn.setStyleSheet(
+            "QPushButton#hdrSilenceAlarmBtn { background: #f9a825; color: #1b1b1b; font-weight: 700;"
+            " border: 1px solid #ffe082; border-radius: 4px; padding: 0px 10px; }"
+            "QPushButton#hdrSilenceAlarmBtn:hover { background: #fbc02d; }"
+        )
+        self._hdr_silence_btn.setVisible(False)
+        self._hdr_silence_btn.clicked.connect(self._on_silence_alarm_clicked)
+
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -679,6 +693,7 @@ class MainWindowUiLayoutMixin:
 
         header_outer.addWidget(left_panel, 0, Qt.AlignVCenter)
         header_outer.addWidget(self._header_banner_stack, 1, Qt.AlignVCenter)
+        header_outer.addWidget(self._hdr_silence_btn, 0, Qt.AlignVCenter)
         header_outer.addWidget(self._hdr_estop_btn, 0, Qt.AlignVCenter)
         header_outer.addWidget(self._hdr_map_mode_btn, 0, Qt.AlignVCenter)
 

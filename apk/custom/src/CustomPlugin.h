@@ -84,6 +84,10 @@ public:
     Q_INVOKABLE bool unlockAdvanced(const QString &password);
     /// Seconds until the next password may be tried (after a wrong one). 0: now.
     Q_INVOKABLE int adminWaitSeconds() const;
+    /// The app menu asks for a camera window (task AG): "settings" (the camera settings) or
+    /// "editor" (the cameras the admin adds). The fly view opens it, because a window made
+    /// from the menu stops working when the menu closes.
+    Q_INVOKABLE void requestCameraWindow(const QString &which);
 
     QString mapPackLoading() const;
 
@@ -92,6 +96,8 @@ signals:
     /// A map pack was loaded at this start: the middle of its area (task AB). With no position
     /// from the drone, the fly view moves the map there.
     void mapPackLoaded(double latitude, double longitude);
+    /// See requestCameraWindow.
+    void cameraWindowRequested(const QString &which);
 
 private slots:
     void _advancedChanged(bool advanced);

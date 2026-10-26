@@ -42,8 +42,12 @@
 //   30_admin_wrong.png    after a wrong password: the wait before the next try
 //   31_cameras.png        the camera editor (task AA): the built-in cameras, to copy
 //   32_camera_form.png    a copy of the V13 being made into a camera without laser, photo, recording, zoom or IR
-//   33_plain_camera.png   that camera in use: its buttons only
+//   33_plain_camera.png   that camera in use: its buttons only (and photo and record, for the copy on the RC)
 //   34_map_pack_loading.png  a map pack loading: the fly view says so (task AB)
+//   35_photo_note.png     after the photo button: a note beside it says the photo is on the camera's SD card,
+//                         and that a copy is on the RC (task AL)
+//   36_recording.png      the camera records and says so ("REC"), and the RC records a copy ("RC REC")
+//   37_no_sd_card.png     a camera without an SD card: the status says so, and the note of a photo
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
 // The lock is tried for real: the day picture is a look into a world that
@@ -58,10 +62,14 @@
 // override rule, and checked for the client feedback of 2026-10-07 (tasks E
 // and F in DOCS/APK-V1-DEV-PLAN.md).
 // Every QML warning or error is printed; the exit code is 1 when there was one.
+// Real mouse and key input from the PC is dropped and counted (RealInputBlocker): the developer
+// works on the same PC while the preview runs.
 
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QFile>
+#include <QtCore/QJsonDocument>
+#include <QtCore/QJsonObject>
 #include <QtCore/QLoggingCategory>
 #include <QtCore/QMutex>
 #include <QtCore/QRegularExpression>
@@ -124,19 +132,99 @@ void messageHandler(QtMsgType type, const QMessageLogContext &, const QString &m
 
 } // namespace
 
+/// Real mouse, wheel and key input from the PC is not for the preview: the developer works on the
+/// same PC while it runs. On 2026-10-26 a click meant for another window landed on the preview's
+/// video, measured a point there, and the laser button hid that reading in place of measuring. The
+/// preview's own input is sent with sendEvent, which is not "spontaneous", so it still arrives.
+/// (Not with -Touch: QTest's touches come the way real ones do.)
+class RealInputBlocker : public QObject
+{
+public:
+    int blocked = 0;
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->spontaneous()) {
+            switch (event->type()) {
+            case QEvent::MouseButtonPress:
+            case QEvent::MouseButtonRelease:
+            case QEvent::MouseButtonDblClick:
+            case QEvent::MouseMove:
+            case QEvent::Wheel:
+            case QEvent::KeyPress:
+            case QEvent::KeyRelease:
+                ++blocked;
+                return true;
+            default:
+                break;
+            }
+        }
+        return QObject::eventFilter(watched, event);
+    }
+};
+
 class FakeVideoManager : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(bool fullScreen MEMBER fullScreen NOTIFY fullScreenChanged)
     Q_PROPERTY(double aspectRatio READ aspectRatio CONSTANT)
+    // QGC's recording of the video it receives, and its picture of it: the copy on the RC (task AL).
+    Q_PROPERTY(bool recording READ recording NOTIFY recordingChanged)
+    Q_PROPERTY(bool decoding READ decoding NOTIFY decodingChanged)
 
 public:
     bool fullScreen = false;
     double aspectRatio() const { return 16.0 / 9.0; }  // the C13 stream, 1280 x 720
+    bool recording() const { return _recording; }
+    bool decoding() const { return _decoding; }
+    void setDecoding(bool on)
+    {
+        if (on != _decoding) {
+            _decoding = on;
+            emit decodingChanged();
+        }
+    }
+    // As QGC's: it names the file, and the video item (FlightDisplayViewVideoOutput.qml) grabs its
+    // picture and writes it there. Here into the preview's output folder.
+    Q_INVOKABLE void grabImage(const QString &file = QString())
+    {
+        ++grabs;
+        lastImageFile = file.isEmpty() ? QStringLiteral("%1/rc_copy_%2.jpg").arg(photoFolder).arg(grabs) : file;
+        QFile::remove(lastImageFile);  // one of a run before must not count
+        emit imageFileChanged(lastImageFile);
+    }
+    Q_INVOKABLE void startRecording(const QString & = QString())
+    {
+        ++recordStarts;
+        if (!_recording) {
+            _recording = true;
+            emit recordingChanged(true);
+        }
+    }
+    Q_INVOKABLE void stopRecording()
+    {
+        ++recordStops;
+        if (_recording) {
+            _recording = false;
+            emit recordingChanged(false);
+        }
+    }
+    int grabs = 0;
+    int recordStarts = 0;
+    int recordStops = 0;
+    QString photoFolder;
+    QString lastImageFile;
 
 signals:
     void fullScreenChanged();
     void imageFileChanged(const QString &filename);  // QGC's video snapshot
+    void recordingChanged(bool recording);
+    void decodingChanged();
+
+private:
+    bool _recording = false;
+    bool _decoding = true;  // the stand-in video shows pictures
 };
 
 /// Stand-in for a QGC Fact: only rawValue.
@@ -300,6 +388,8 @@ public:
         return true;
     }
     Q_INVOKABLE int adminWaitSeconds() const { return _password.waitSeconds(nowMs); }
+    // CustomPlugin's ask for a camera window from the app menu (task AG).
+    Q_INVOKABLE void requestCameraWindow(const QString &which) { emit cameraWindowRequested(which); }
 
     // CustomPlugin's map pack line and signal (task AB).
     Q_PROPERTY(QString mapPackLoading MEMBER mapPackLoading NOTIFY mapPackLoadingChanged)
@@ -319,6 +409,7 @@ signals:
     void showTouchAreasChanged();
     void mapPackLoadingChanged();
     void mapPackLoaded(double latitude, double longitude);
+    void cameraWindowRequested(const QString &which);
 
 private:
     FakeCoreOptions _options;
@@ -340,7 +431,7 @@ class FakeGlobal : public QObject
     Q_PROPERTY(double flightMapZoom MEMBER flightMapZoom NOTIFY flightMapChanged)
 
 public:
-    QObject *videoManager() { return &_videoManager; }
+    QObject *videoManager() { return &videos; }
     qreal zOrderTopMost() const { return 1000; }  // QGC's value
     QObject *settingsManager() { return &settings; }
     QObject *multiVehicleManager() { return &vehicles; }
@@ -349,14 +440,12 @@ public:
     FakeSettingsManager settings;
     FakeQmlVehicleManager vehicles;
     FakeCorePlugin core;
+    FakeVideoManager videos;
     QGeoCoordinate flightMapPosition;
     double flightMapZoom = 16.0;
 
 signals:
     void flightMapChanged();
-
-private:
-    FakeVideoManager _videoManager;
 };
 
 /// Answers angle questions and laser reads like the client's V13 (C13). Like it,
@@ -450,6 +539,12 @@ public:
     QString lastGot;        // its data: where the point is, in the camera's count
     int sumConfirms = 0;    // the camera's own tracker: SUM 01
     int sumStops = 0;       // the camera's own tracker: SUM 00
+    // Photos and recording (task AL): it echoes CAP and REC as TOP says a camera does, records
+    // from REC 01 to REC 00 (not without an SD card), and answers REC and SDC questions.
+    int photos = 0;
+    bool recording = false;
+    std::string sdCard = "03200076E4";  // free MB, then total MB: 12.5 GB free of 29.7 GB
+    static constexpr const char *kNoSdCard = "0000000000";
 
 signals:
     void lookChanged();
@@ -528,6 +623,16 @@ private slots:
                 }
                 continue;
             }
+            if (f && (f->tag == "CAP" || f->tag == "REC") && f->ctrl == 'w') {
+                if (f->tag == "CAP") {
+                    ++photos;
+                } else {
+                    recording = f->data == "01" && sdCard != kNoSdCard;
+                }
+                const std::string echo = top::buildTpFrame('U', 'w', f->tag, f->data, 'D', 0);
+                _socket.writeDatagram(echo.data(), static_cast<qint64>(echo.size()), d.senderAddress(), d.senderPort());
+                continue;
+            }
             if (!f || f->ctrl != 'r') {
                 continue;
             }
@@ -542,6 +647,10 @@ private slots:
                 if (laserAnswers && f->address.size() == 2 && f->address[1] == 'E') {
                     reply = top::buildTpFrame('U', 'r', "SLR", "03A0", 'E', 1);  // 92.8 m
                 }
+            } else if (f->tag == "REC") {
+                reply = top::buildTpFrame('U', 'r', "REC", recording ? "01" : "00", 'D', 0);
+            } else if (f->tag == "SDC") {
+                reply = top::buildTpFrame('U', 'r', "SDC", sdCard, 'D', 1);
             }
             if (!reply.empty()) {
                 _socket.writeDatagram(reply.data(), static_cast<qint64>(reply.size()), d.senderAddress(),
@@ -679,6 +788,16 @@ QString vamaFinderName()
     return QStringLiteral("a stand-in for the preview");
 }
 
+/// The "transport" a camera file holds (A1, the C20), or what is wrong with the file.
+QString cameraTransport(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return QStringLiteral("no file %1").arg(path);
+    }
+    return QJsonDocument::fromJson(file.readAll()).object().value(QStringLiteral("transport")).toString(QStringLiteral("no transport"));
+}
+
 /// The notices as the app reads them: from the app's own resources (custom.qrc is in the preview).
 QString vamaFinderNotices()
 {
@@ -777,6 +896,7 @@ int main(int argc, char *argv[])
     ObjectMarks marks(&link, new PreviewFinder(seen), true);
 
     FakeGlobal global;
+    global.videos.photoFolder = outDir;  // the copies on the "RC" (task AL)
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "SkydroidLink", &link);
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "ObjectFollow", &follow);
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "ObjectMarks", &marks);
@@ -807,6 +927,10 @@ int main(int argc, char *argv[])
     // touch of one finger, as on the remote control, through Qt's own touch path. (Client video
     // 2026-10-15, a tap on a mark that locked nothing: every check passed with touches too.)
     QPointingDevice *touchScreen = qEnvironmentVariableIsSet("VAMA_PREVIEW_TOUCH") ? QTest::createTouchDevice() : nullptr;
+    RealInputBlocker realInput;
+    if (!touchScreen) {
+        app.installEventFilter(&realInput);
+    }
     auto mouseOn = [&](QQuickWindow *target, QEvent::Type type, QPointF pos) {
         if (touchScreen) {
             if (type == QEvent::MouseButtonPress) {
@@ -847,6 +971,7 @@ int main(int argc, char *argv[])
     int anglesBeforePoint = 0;  // a point from the picture: the camera must not be turned,
     int lasersBeforePoint = 0;  // and the laser not asked
     int laserFramesBefore = 0;  // the laser button's steps (task Y)
+    int flyViewsBefore = 0;     // the menu's switches to the fly view (task AG)
 
     // Application Settings (client feedback 2026-10-07, tasks E and F).
     QQuickWindow *settingsWindow = nullptr;
@@ -1061,6 +1186,24 @@ int main(int argc, char *argv[])
             slice.exec();
         }
         return true;
+    };
+    // The note of a photo or record press (task AL): at the top in the middle, and clear of the
+    // boxes there (beside the buttons it ran into the result box and the lock message).
+    auto noteInItsPlace = [&]() -> bool {
+        QQuickItem *note = findItem("vamaCameraNote");
+        if (!note || !note->isVisible()) {
+            return false;
+        }
+        const QRectF n = note->mapRectToScene(QRectF(0, 0, note->width(), note->height()));
+        bool ok = qAbs(n.center().x() - window->width() / 2.0) < 2.0;
+        for (const char *name : {"vamaResultBox", "vamaLockChip", "vamaFollowChip"}) {
+            QQuickItem *box = findItem(name);
+            if (box && box->isVisible() && box->mapRectToScene(QRectF(0, 0, box->width(), box->height())).intersects(n)) {
+                std::fprintf(stderr, "the note overlaps %s\n", name);
+                ok = false;
+            }
+        }
+        return ok;
     };
     // The lock button toggles: with a lock on it stops it, without one it starts or ends
     // picking (the hint shows while it picks). One press in the wrong state turned every press
@@ -1303,6 +1446,36 @@ int main(int argc, char *argv[])
              link.zoom(1);
              // Tap the photo button to run its click handler.
              tap("vamaPhotoButton");
+         }},
+        // The photo (task AL, client 2026-10-26: "photos and recordings are not saved in rc"): the
+        // camera echoes the command, and a note at the top says where the photo is.
+        {200, [&]() {
+             const bool shown = waitFor([&]() {
+                 QQuickItem *note = findItem("vamaCameraNote");
+                 return note && note->isVisible();
+             }, 2000);
+             QQuickItem *note = findItem("vamaCameraNote");
+             QQuickItem *text = findItem("vamaCameraNoteText");
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString says = text ? text->property("text").toString() : QString();
+             expect(shown && camera.photos == 1 && says == QStringLiteral("Photo taken. It is saved on the camera's SD card.") &&
+                        noteInItsPlace(),
+                    "photo: a note at the top says the photo is on the camera's SD card", says);
+             // And the copy on the RC (the client's Stage 1.1): QGC's picture of the video, written by
+             // the app's video item.
+             const QString rcSays = rcText ? rcText->property("text").toString() : QString();
+             const bool written = waitFor([&]() { return QFile::exists(global.videos.lastImageFile); }, 2000);
+             expect(global.videos.grabs == 1 && written && rcSays == QStringLiteral("A copy is saved on this RC, in its Photo folder."),
+                    "photo: a copy goes to the RC's Photo folder (the video item writes it), and the note says so",
+                    rcSays + QStringLiteral(" | ") + global.videos.lastImageFile);
+             shot("35_photo_note.png");
+             if (note) {
+                 tapItem(note);  // a tap closes it
+             }
+         }},
+        {300, [&]() {
+             QQuickItem *note = findItem("vamaCameraNote");
+             expect(note && !note->isVisible(), "photo: a tap on the note closes it", QString());
          }},
         // The laser button (task Y, Nish 2026-10-16): a press measures and shows the reading, the
         // next press hides it without a shot, and the press after that measures again.
@@ -2315,6 +2488,10 @@ int main(int argc, char *argv[])
              expect(menuOpen() && fly && fly->isVisible() && !menuItem("vamaAdminPasswordField"),
                     "admin: the app menu opens with its buttons, no password asked", QString());
              expect(analyze && !analyze->isVisible(), "admin: no Analyze button outside Advanced Mode", QString());
+             QQuickItem *cameraSettings = menuItem("vamaMenuCameraSettings");
+             QQuickItem *cameras = menuItem("vamaMenuCameras");
+             expect(cameraSettings && cameraSettings->isVisible() && cameras && !cameras->isVisible(),
+                    "menu: Camera settings is in the menu, Cameras only in Advanced Mode (task AG)", QString());
              menuTap("vamaAdvancedModeTap");
          }},
         {300, [&]() {
@@ -2399,8 +2576,55 @@ int main(int argc, char *argv[])
         {400, [&]() {
              QQuickItem *analyze = menuItem("toolbar_viewAnalyze");
              expect(analyze && analyze->isVisible(), "admin: Advanced Mode shows the Analyze button", QString());
-             menuTap("vamaAdvancedModeTap");
+             // Task AG: the camera windows from the menu. The settings were left scrolled down.
+             QQuickItem *cameras = menuItem("vamaMenuCameras");
+             expect(cameras && cameras->isVisible(), "menu: Advanced Mode shows Cameras in the menu (task AG)", QString());
+             shotOf(menuWindow, "29b_menu_cameras.png");
+             QObject *flick = window->findChild<QObject *>(QStringLiteral("vamaCameraSettingsFlick"));
+             if (flick) {
+                 flick->setProperty("contentY", 120);
+             }
+             flyViewsBefore = menuWindow->property("flyViews").toInt();
+             menuTap("vamaMenuCameraSettings");
          }},
+        {400, [&]() {
+             QObject *settings = window->findChild<QObject *>(QStringLiteral("vamaCameraSettings"));
+             QObject *flick = window->findChild<QObject *>(QStringLiteral("vamaCameraSettingsFlick"));
+             expect(!menuOpen() && settings && settings->property("opened").toBool(),
+                    "menu: Camera settings closes the menu and opens the camera settings", QString());
+             expect(flick && flick->property("contentY").toReal() == 0.0,
+                    "menu: the camera settings open at their top, with the camera model and the Cameras button",
+                    flick ? QString::number(flick->property("contentY").toReal()) : QStringLiteral("no flick"));
+             QQuickItem *button = findItem("vamaCamerasButton");
+             expect(button && button->isVisible(), "menu: there, the Cameras button is shown in Advanced Mode", QString());
+             expect(menuWindow->property("flyViews").toInt() == flyViewsBefore + 1,
+                    "menu: Camera settings also shows the fly view, where the camera windows are",
+                    QString::number(menuWindow->property("flyViews").toInt() - flyViewsBefore));
+             if (settings) {
+                 QMetaObject::invokeMethod(settings, "close");
+             }
+             openMenu();
+         }},
+        {400, [&]() {
+             flyViewsBefore = menuWindow->property("flyViews").toInt();
+             menuTap("vamaMenuCameras");
+         }},
+        {500, [&]() {
+             QObject *editor = window->findChild<QObject *>(QStringLiteral("vamaCameraEditor"));
+             QObject *settings = window->findChild<QObject *>(QStringLiteral("vamaCameraSettings"));
+             expect(!menuOpen() && editor && editor->property("opened").toBool(),
+                    "menu: Cameras closes the menu and opens the camera editor", QString());
+             expect(settings && !settings->property("opened").toBool(), "menu: and only the editor, not the settings too",
+                    QString());
+             expect(menuWindow->property("flyViews").toInt() == flyViewsBefore + 1, "menu: Cameras also shows the fly view",
+                    QString::number(menuWindow->property("flyViews").toInt() - flyViewsBefore));
+             shot("29c_cameras_from_menu.png");
+             if (editor) {
+                 QMetaObject::invokeMethod(editor, "close");
+             }
+             openMenu();
+         }},
+        {400, [&]() { menuTap("vamaAdvancedModeTap"); }},
         {300, [&]() {
              expect(menuWindow->property("offQuestions").toInt() == 1 && !menuOpen() && !menuItem("vamaAdminPasswordField"),
                     "admin: in Advanced Mode the tap asks QGC's question to turn it off, with no password",
@@ -2408,11 +2632,16 @@ int main(int argc, char *argv[])
              menuWindow->close();
              // The cameras the admin adds (task AA), from the camera settings.
              global.core.setShowAdvancedUI(false);
+             // The editor is for Advanced Mode only, also when it is asked for by name (task AG).
+             global.core.requestCameraWindow(QStringLiteral("editor"));
              QMetaObject::invokeMethod(window->findChild<QObject *>(QStringLiteral("vamaCameraSettings")), "open");
          }},
         {400, [&]() {
              QQuickItem *button = findItem("vamaCamerasButton");
              expect(button && !button->isVisible(), "cameras: no Cameras button outside Advanced Mode", QString());
+             QObject *editor = window->findChild<QObject *>(QStringLiteral("vamaCameraEditor"));
+             expect(editor && !editor->property("opened").toBool(),
+                    "menu: outside Advanced Mode an ask for the editor opens nothing (task AG)", QString());
              global.core.setShowAdvancedUI(true);
          }},
         {300, [&]() {
@@ -2502,15 +2731,19 @@ int main(int argc, char *argv[])
          }},
         {400, [&]() {
              QStringList shown;
-             for (const char *button : {"vamaLaserButton", "vamaPhotoButton", "vamaRecordButton", "vamaIrButton", "vamaZoomInButton"}) {
+             for (const char *button : {"vamaLaserButton", "vamaIrButton", "vamaZoomInButton"}) {
                  QQuickItem *item = findItem(button);
                  if (!item || item->isVisible()) {
                      shown.append(QString::fromLatin1(button));
                  }
              }
+             // Photo and record stay (task AL): they keep a copy on the RC, also for a camera without them.
              QQuickItem *lock = findItem("vamaLockButton");
-             expect(shown.isEmpty() && lock && lock->isVisible(),
-                    "cameras: its screen has no laser, photo, record, IR or zoom button, and still the lock", shown.join(QStringLiteral(", ")));
+             QQuickItem *photo = findItem("vamaPhotoButton");
+             QQuickItem *record = findItem("vamaRecordButton");
+             expect(shown.isEmpty() && lock && lock->isVisible() && photo && photo->isVisible() && record && record->isVisible(),
+                    "cameras: its screen has no laser, IR or zoom button, and still the lock, and photo and record for the copy on the RC",
+                    shown.join(QStringLiteral(", ")));
              shot("33_plain_camera.png");
              // Deleted while in use: the V13 again, with the addresses as they are.
              QMetaObject::invokeMethod(window->property("layer").value<QObject *>(), "_openCameraEditor");
@@ -2524,6 +2757,41 @@ int main(int argc, char *argv[])
                     QStringLiteral("%1 at %2").arg(link.model(), link.host()));
              QQuickItem *laser = findItem("vamaLaserButton");
              expect(laser && laser->isVisible(), "cameras: the V13's buttons are back", QString());
+             // The form's control link (the C20, A1): the box is shown and saved both ways. Only
+             // the file is checked: the preview's stand-in camera speaks UDP, and the link's TCP
+             // has its own tests.
+             press("vamaCameraCopy_C20");
+         }},
+        {400, [&]() {
+             QQuickItem *transport = findItem("vamaCameraTransport");
+             expect(transport && transport->isVisible() && transport->property("currentIndex").toInt() == 1,
+                    "cameras: a copy of the V20 has TCP as its control link",
+                    transport ? transport->property("currentText").toString() : QStringLiteral("no box"));
+             press("vamaCameraSave");
+         }},
+        {400, [&]() {
+             expect(cameraTransport(cameraFolder + QStringLiteral("/v20-copy.json")) == QStringLiteral("tcp"),
+                    "cameras: Save writes TCP into its file", cameraTransport(cameraFolder + QStringLiteral("/v20-copy.json")));
+             press("vamaCameraEdit_v20-copy");
+         }},
+        {400, [&]() {
+             QQuickItem *transport = findItem("vamaCameraTransport");
+             expect(transport && transport->property("currentIndex").toInt() == 1, "cameras: Change shows the TCP it was saved with",
+                    transport ? transport->property("currentText").toString() : QStringLiteral("no box"));
+             setOn("vamaCameraTransport", "currentIndex", 0);
+             press("vamaCameraSave");
+         }},
+        {400, [&]() {
+             expect(cameraTransport(cameraFolder + QStringLiteral("/v20-copy.json")) == QStringLiteral("udp") &&
+                        link.model() == QStringLiteral("C13"),
+                    "cameras: UDP picked in the box is saved as UDP, and the camera in use stays",
+                    cameraTransport(cameraFolder + QStringLiteral("/v20-copy.json")));
+             press("vamaCameraDelete_v20-copy");
+         }},
+        {300, [&]() { tapFound("vamaCameraDeleteYes"); }},
+        {400, [&]() {
+             expect(!QFile::exists(cameraFolder + QStringLiteral("/v20-copy.json")) && link.model() == QStringLiteral("C13"),
+                    "cameras: the copy is deleted", link.model());
              press("vamaCameraEditorClose");
              // A map pack loading, then loaded (task AB).
              global.core.setMapPackLoading(QStringLiteral("Loading map pack \"kalol\": 2374 map pictures, zoom 10 to 18. "
@@ -2567,6 +2835,109 @@ int main(int argc, char *argv[])
              const QGeoCoordinate centre = map ? map->property("center").value<QGeoCoordinate>() : QGeoCoordinate();
              expect(map && std::abs(centre.latitude() - 18.52) < 1e-9, "map pack: with a position from the drone, the map is not moved",
                     QStringLiteral("%1").arg(centre.latitude(), 0, 'f', 4));
+             // Recording (task AL): the second press stops the camera's recording (every press
+             // started it until test build 13), and the screen says what the camera did.
+             tap("vamaRecordButton");
+         }},
+        {200, [&]() {
+             const bool recording = waitFor([&]() { return camera.recording && link.recordingConfirmed(); }, 3000);
+             QQuickItem *rec = findItem("vamaRecLabel");
+             QQuickItem *rcRec = findItem("vamaRcRecLabel");
+             QQuickItem *text = findItem("vamaCameraNoteText");
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString says = text ? text->property("text").toString() : QString();
+             const QString rcSays = rcText ? rcText->property("text").toString() : QString();
+             expect(recording && rec && rec->isVisible() && rec->property("text").toString() == QStringLiteral("REC") &&
+                        says == QStringLiteral("Recording on the camera's SD card."),
+                    "record: the camera records and says so, and the note says where the video goes", says);
+             // Here the result box and the lock message show at the top: the note goes under them.
+             expect(noteInItsPlace(), "record: the note is under the boxes at the top, not over them", QString());
+             expect(global.videos.recording() && rcRec && rcRec->isVisible() &&
+                        rcSays == QStringLiteral("A copy is recorded on this RC, in its Video folder."),
+                    "record: the RC records a copy as well, and the status and the note say so", rcSays);
+             shot("36_recording.png");
+             tap("vamaRecordButton");
+         }},
+        {200, [&]() {
+             const bool stopped = waitFor([&]() { return !camera.recording && link.recordingConfirmed(); }, 3000);
+             QQuickItem *rec = findItem("vamaRecLabel");
+             QQuickItem *rcRec = findItem("vamaRcRecLabel");
+             QQuickItem *text = findItem("vamaCameraNoteText");
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString says = text ? text->property("text").toString() : QString();
+             const QString rcSays = rcText ? rcText->property("text").toString() : QString();
+             expect(stopped && rec && !rec->isVisible() && says == QStringLiteral("Recording stopped. The video is on the camera's SD card."),
+                    "record: the second press stops the camera's recording", says);
+             expect(!global.videos.recording() && global.videos.recordStops == 1 && rcRec && !rcRec->isVisible() &&
+                        rcSays == QStringLiteral("The copy is saved on this RC, in its Video folder."),
+                    "record: and the RC's copy, which is saved", rcSays);
+             // No SD card. The camera is asked about its card a second after a photo.
+             camera.sdCard = FakeCamera::kNoSdCard;
+             tap("vamaPhotoButton");
+         }},
+        {200, [&]() {
+             const bool told = waitFor([&]() { return link.sdCardWarning() == QStringLiteral("No SD card"); }, 3000);
+             QQuickItem *warning = findItem("vamaSdCardWarning");
+             expect(told && warning && warning->isVisible() && warning->property("text").toString() == QStringLiteral("No SD card"),
+                    "SD card: the camera status says when the camera has none", link.sdCardWarning());
+             tap("vamaPhotoButton");
+         }},
+        {600, [&]() {
+             QQuickItem *text = findItem("vamaCameraNoteText");
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString says = text ? text->property("text").toString() : QString();
+             expect(says == QStringLiteral("The camera has no SD card. The photo is not saved.") && rcText &&
+                        rcText->property("text").toString() == QStringLiteral("A copy is saved on this RC, in its Photo folder."),
+                    "SD card: a photo without a card says that it is not saved, and the RC has its copy", says);
+             shot("37_no_sd_card.png");
+             // The camera cannot record (no card), the RC can: the button shows the RC's recording, and
+             // its next press stops it.
+             tap("vamaRecordButton");
+         }},
+        {200, [&]() {
+             QQuickItem *text = findItem("vamaCameraNoteText");
+             const bool told = waitFor([&]() {
+                 return text && text->property("text").toString() == QStringLiteral("Recording did not start. The camera has no SD card.");
+             }, 4000);
+             QObject *layer = window->property("layer").value<QObject *>();
+             expect(told && !link.recording() && global.videos.recording() && layer && layer->property("_recordingShown").toBool(),
+                    "record without an SD card: the camera did not start, the RC records, and the button shows it",
+                    text ? text->property("text").toString() : QString());
+             tap("vamaRecordButton");
+         }},
+        {300, [&]() {
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             expect(!global.videos.recording() && camera.recording == false && rcText &&
+                        rcText->property("text").toString() == QStringLiteral("The copy is saved on this RC, in its Video folder."),
+                    "record without an SD card: the next press stops the RC's copy", QString());
+             // No video: no copy, and the note says why.
+             global.videos.setDecoding(false);
+             tap("vamaPhotoButton");
+         }},
+        {300, [&]() {
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString says = rcText ? rcText->property("text").toString() : QString();
+             expect(global.videos.grabs == 3 && says == QStringLiteral("No copy on this RC: there is no video."),
+                    "photo without video: no copy on the RC, and the note says why", says);
+             global.videos.setDecoding(true);
+             QMetaObject::invokeMethod(window->findChild<QObject *>(QStringLiteral("vamaCameraSettings")), "open");
+         }},
+        {400, [&]() {
+             QQuickItem *storage = findItem("vamaCameraStorage");
+             const QString says = storage ? storage->property("text").toString() : QString();
+             expect(storage && storage->isVisible() &&
+                        says == QStringLiteral("The camera saves its photos and videos on its own SD card. The camera says it has no SD card. "
+                                               "A copy of each is saved on this remote control, in its Photo and Video folders."),
+                    "camera settings: where photos and videos go, and what the camera says of its SD card", says);
+             QMetaObject::invokeMethod(window->findChild<QObject *>(QStringLiteral("vamaCameraSettings")), "close");
+         }},
+        {100, [&]() {
+             // The note of the last photo goes by itself, some seconds after it came.
+             const bool gone = waitFor([&]() {
+                 QQuickItem *note = findItem("vamaCameraNote");
+                 return note && !note->isVisible();
+             }, 7000);
+             expect(gone, "photo: the note goes by itself after a few seconds", QString());
          }},
         {100, [&]() { QCoreApplication::quit(); }},
     };
@@ -2591,6 +2962,9 @@ int main(int argc, char *argv[])
     if (stepsRun != steps.size()) {
         std::fprintf(stderr, "only %d of %d steps ran\n", int(stepsRun), int(steps.size()));
         ++g_problems;
+    }
+    if (realInput.blocked > 0) {
+        std::fprintf(stderr, "real input from the PC, not passed on: %d events\n", realInput.blocked);
     }
     std::fprintf(stderr, "QML problems: %d\n", g_problems);
     return (code == 0 && g_problems == 0) ? 0 : 1;

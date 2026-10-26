@@ -23,6 +23,15 @@ The key comes from a passphrase exactly the way QGroundControl 5.1.5 makes it
 (PBKDF2-HMAC-SHA256, its fixed salt, 600,000 rounds), so the same passphrase
 gives the same key in VGCS and in the VAMA APK (QGC's MAVLink signing keys).
 
+Signing covers the MAVLink commands of ground stations, nothing else. The RC's
+sticks and switches (its mode switch too) reach the flight controller over the
+RC's own radio, and a camera's gimbal and zoom go over the camera's own network
+link (Skydroid TOP, SIYI, Viewpro). Both work without the key. The client's
+test of 2026-10-22 ("laptop 2 could still send commands") moved the gimbal.
+
+A laptop without the key also reads the drone's heartbeats: a drone that signs
+ignores that laptop's commands (except over USB), and "Off" alone did not say so.
+
 Pure Python, no Qt and no pymavlink, so it is tested without a link.
 """
 
@@ -48,6 +57,7 @@ DRONE_SIGNS = "drone_signs"        # the drone signs with this key: commands are
 DRONE_UNSIGNED = "drone_unsigned"  # the drone does not sign: it has no key, anyone can command it
 KEY_MISMATCH = "key_mismatch"      # the drone signs with another key: it ignores VGCS's commands
 MAVLINK1 = "mavlink1"              # the link speaks MAVLink 1, which cannot be signed
+DRONE_SIGNS_NO_KEY = "drone_signs_no_key"  # no key here, and the drone signs: it ignores VGCS's commands
 
 # A drone that changes key or stops signing shows it within a heartbeat or
 # two. A single odd packet is not a state change.
@@ -111,7 +121,7 @@ class SigningMonitor:
     def note(self, present: bool, valid: bool) -> bool:
         """One heartbeat from the drone. True when the state changed."""
         if not self.key_set:
-            seen = OFF
+            seen = DRONE_SIGNS_NO_KEY if present else OFF
         elif valid:
             seen = DRONE_SIGNS
         elif present:
@@ -145,6 +155,8 @@ def state_text(state: str, key_fp: str = "") -> str:
         DRONE_UNSIGNED: f"On{key}, but the drone does not sign: anyone in range can command it. Send it the key.",
         KEY_MISMATCH: f"The drone signs with another key{key}: it ignores VGCS's commands",
         MAVLINK1: "The link speaks MAVLink 1, which cannot be signed",
+        DRONE_SIGNS_NO_KEY: "No key on this laptop, and the drone signs: it ignores VGCS's commands, except over USB. "
+                            "Set the passphrase the drone was given",
     }.get(state, state)
 
 
@@ -152,11 +164,37 @@ def state_level(state: str) -> str:
     """ok, warn or bad, for the dashboard colour."""
     if state == DRONE_SIGNS:
         return "ok"
-    if state in (KEY_MISMATCH, MAVLINK1):
+    if state in (KEY_MISMATCH, MAVLINK1, DRONE_SIGNS_NO_KEY):
         return "bad"
     if state == DRONE_UNSIGNED:
         return "warn"
     return "na"
+
+
+def ignored_words(state: str) -> str:
+    """Why the drone does not answer VGCS's commands, when its signing tells: "" when it does not."""
+    if state == DRONE_SIGNS_NO_KEY:
+        return "the drone signs, and this laptop has no key: it ignores VGCS's commands"
+    if state == KEY_MISMATCH:
+        return "the drone signs with another key: it ignores VGCS's commands"
+    return ""
+
+
+# How a command that the drone never answered ends (vgcs/link/confirmations.py, fence_transfer.py).
+_NO_ANSWER_WORDS = ("no answer", "no heartbeat", "did not ask", "did not give")
+
+
+def with_ignored_reason(detail: str, state: str) -> str:
+    """A failed command's words, with the likely reason when the drone ignores VGCS's commands.
+
+    Only for a command that got no answer: a refusal came from the drone, so it took the command
+    (over USB, where it takes unsigned commands too).
+    """
+    text = str(detail or "")
+    reason = ignored_words(state)
+    if not reason or not any(words in text.lower() for words in _NO_ANSWER_WORDS):
+        return text
+    return f"{text.rstrip(' .')}. Likely why: {reason}"
 
 
 class KeyTransfer:

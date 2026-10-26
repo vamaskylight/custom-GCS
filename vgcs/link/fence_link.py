@@ -27,6 +27,11 @@ own: with the polygon, or with the circle around home (then the circle and the
 items are both on, FENCE_TYPE 7). The drone has to be 5 m or more outside each
 of them, as it has to be inside the polygon, and in flight its home point too.
 A circle without such areas is only settings, as before.
+
+They can also go alone (2026-10-26, client feedback of 2026-10-22: there was no
+way to send them without the circle): the items are the areas only, and
+FENCE_TYPE is the max height and the items (5), so a circle fence the drone had
+is off afterwards.
 """
 
 from __future__ import annotations
@@ -72,6 +77,11 @@ MSG_ID_HOME_POSITION = 242
 POSITION_MAX_AGE_S = 5.0
 # The first read after an upload: the drone gets a moment to list what it stored.
 FIRST_CHECK_WAIT_S = 0.2
+# A fence of fewer than this many points (corners and circles) makes ArduPilot set FENCE_TOTAL to 0,
+# and after FENCE_TOTAL is set to 0 the drone gets this long to clear its old fence (it looks 10
+# times a second). See _fence_clear_then_send.
+FENCE_TOTAL_MIN_POINTS = 3
+TOTAL_CLEAR_WAIT_S = 0.5
 
 FENCE_SETTINGS = ("FENCE_ENABLE", "FENCE_TYPE", "FENCE_ALT_MAX", "FENCE_ACTION", "FENCE_RADIUS")
 
@@ -188,6 +198,10 @@ class FenceLinkMixin:
             # is never replaced by a circle the operator did not ask for.
             self._items_fence_start(cfg, "polygon")
             return
+        if cfg.get("areas_only"):
+            # The areas to stay out of alone: no circle, no polygon.
+            self._items_fence_start(cfg, "nofly")
+            return
         if cfg.get("nofly"):
             # The circle around home, with areas to stay out of: they are items.
             self._items_fence_start(cfg, "circle_items")
@@ -274,7 +288,8 @@ class FenceLinkMixin:
     # --- the polygon fence ----------------------------------------------------
 
     def _items_fence_start(self, cfg: dict, kind: str) -> None:
-        """A fence of items: the polygon ("polygon") or the circle ("circle_items"), with areas to stay out of."""
+        """A fence of items: the polygon ("polygon") or the circle ("circle_items"), with areas to stay out
+        of, or those areas alone ("nofly")."""
         if self._fence_job_open():
             self._fence_refuse("Another fence request is still running. Try again in a moment.")
             return
@@ -287,6 +302,9 @@ class FenceLinkMixin:
         nofly, problem = check_nofly(cfg.get("nofly") or [])
         if problem:
             self._fence_refuse(f"{problem} Not sent.")
+            return
+        if kind == "nofly" and not nofly:
+            self._fence_refuse("There is no area to stay out of on the map. Not sent.")
             return
         if not self._link_is_mavlink2():
             self._fence_refuse(self._mavlink1_words())
@@ -396,7 +414,7 @@ class FenceLinkMixin:
         if problem:
             self._fence_fail(f"{problem} The drone could not return home. Not sent.")
             return
-        if job.kind == "polygon":
+        if job.kind in ("polygon", "nofly"):
             self._fence_read(job, "before")
             return
         # The circle is around home.
@@ -512,7 +530,7 @@ class FenceLinkMixin:
                     "\nThey are not on the map, and this upload removes them."
                     "\n\nSend this fence anyway?")
                 return
-            self._fence_send(job)
+            self._fence_clear_then_send(job)
             return
         # "show": the settings belong to the picture.
         job.on_drone = on_drone
@@ -524,6 +542,31 @@ class FenceLinkMixin:
             self._send_param_request(name)
 
     # --- step: sending the corners ---------------------------------------------
+
+    def _fence_clear_then_send(self, job: FenceJob) -> None:
+        """Send the items, first setting FENCE_TOTAL to 0 when the fence has fewer than 3 points.
+
+        ArduPilot's write_fence sets FENCE_TOTAL to 0 for a fence of fewer than 3 points (corners
+        and circles), and a firmware with the old fence point protocol (4.6, and every simulator
+        build) erases its whole fence store when FENCE_TOTAL goes from a number to 0: that was how an
+        old ground station cleared its fence. So one or two circles sent after a larger fence were
+        stored and erased at once (simulator, 4.6.2 and 4.7.0, 2026-10-26: "0 items instead of 1").
+        With FENCE_TOTAL set to 0 first, the drone clears the old fence now (the operator was asked
+        about what it holds, see "before"), and the new fence is then no change to FENCE_TOTAL. Where
+        FENCE_TOTAL is 0 already, or the firmware has no such protocol (4.7 on a flight controller),
+        this changes nothing.
+        """
+        if len(job.items) >= FENCE_TOTAL_MIN_POINTS:
+            self._fence_send(job)
+            return
+        self.log_line.emit("Geofence: FENCE_TOTAL 0 first, so the drone keeps a fence of fewer than 3 points")
+        self._write_params({"FENCE_TOTAL": 0.0}, lambda results: self._fence_total_cleared(job, results))
+
+    def _fence_total_cleared(self, job: FenceJob, results: dict) -> None:
+        if getattr(self, "_fence_job", None) is not job:
+            return
+        # Not confirmed (a firmware without FENCE_TOTAL): the items go anyway, and the read back decides.
+        job.send_at = time.monotonic() + TOTAL_CLEAR_WAIT_S
 
     def _fence_send(self, job: FenceJob) -> None:
         job.upload = FenceUpload(job.items, time.monotonic(),
@@ -602,6 +645,11 @@ class FenceLinkMixin:
             text = (f"Polygon fence on: {len(job.corners)} corners{nofly}, max height {job.alt_max_m:.0f} m, "
                     f"on breach {action_words(job.action)}")
             kinds = TYPE_ALT_MAX | TYPE_POLYGON
+        elif job.kind == "nofly":
+            count = len(job.nofly)
+            text = (f"Areas to stay out of on: {count} area{'' if count == 1 else 's'}, max height "
+                    f"{job.alt_max_m:.0f} m, on breach {action_words(job.action)}. No circle and no polygon fence")
+            kinds = TYPE_ALT_MAX | TYPE_POLYGON
         else:
             text = (f"Circle fence on: {job.radius_m:.0f} m around home{nofly}, max height {job.alt_max_m:.0f} m, "
                     f"on breach {action_words(job.action)}")
@@ -651,6 +699,10 @@ class FenceLinkMixin:
         if job.home is not None and job.home.tick(now):
             self._fence_try(self._send_home_request)
         if getattr(self, "_fence_job", None) is not job:
+            return
+        if job.send_at is not None and now >= job.send_at:
+            job.send_at = None
+            self._fence_send(job)
             return
         if job.upload is not None and job.upload.tick(now):
             self._fence_try(self._send_fence_count, len(job.items))

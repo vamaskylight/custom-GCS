@@ -26,11 +26,12 @@ FOLDER = Path(__file__).resolve().parent / "camera_files"
 
 def sample_cameras() -> list[Camera]:
     """Every kind of camera: copies of the built-in ones, and cameras with other values in every field."""
-    c12, c13, c14 = built_in_cameras()
+    c12, c13, c14, c20 = built_in_cameras()
     return [
         replace(c12, name="Copy of V12"),
         replace(c13, name="Copy of V13"),
         replace(c14, name="Copy of V14 Pro"),
+        replace(c20, name="Copy of V20"),  # TOP over TCP
         replace(
             c13, name="Bare camera", host="10.0.0.5", port=6000, day_video_url="rtsp://10.0.0.5/live",
             thermal_video_url="", laser=False, photo=False, record=False, own_tracker=False,

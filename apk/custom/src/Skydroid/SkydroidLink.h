@@ -66,6 +66,13 @@
 // folder "Cameras"). Choosing another camera (chooseCamera) also sets its
 // addresses. setModel changes the camera alone, as it always did.
 //
+// Photos and recording (task AL, client 2026-10-26: "photos and recordings are not saved in
+// rc"). The buttons tell the camera to take a photo (CAP) or to start or stop its recording
+// (REC 01, REC 00). The camera saves them on its own SD card: the app keeps nothing on the RC.
+// Until test build 13 every record press sent REC 01, so the second press never stopped the
+// camera. The camera is asked whether it records (REC read) and for its SD card's space (SDC),
+// and after each press the screen says what the camera did (cameraNote).
+//
 // One shared instance; QML uses it as the singleton "SkydroidLink" from the
 // QGC module.
 
@@ -96,6 +103,7 @@
 
 class QJSEngine;
 class QQmlEngine;
+class QTcpSocket;
 class QUdpSocket;
 class Vehicle;
 
@@ -156,6 +164,12 @@ class SkydroidLink : public QObject
     Q_PROPERTY(QString zoomLabel READ zoomLabel NOTIFY zoomChanged)
     Q_PROPERTY(QString zoomReport READ zoomReport NOTIFY zoomChanged)
     Q_PROPERTY(bool recording READ recording NOTIFY recordingChanged)
+    /// The camera itself said lately that it records as the screen shows (REC read).
+    Q_PROPERTY(bool recordingConfirmed READ recordingConfirmed NOTIFY recordingChanged)
+    /// "No SD card", "SD card almost full", or empty: for the camera status.
+    Q_PROPERTY(QString sdCardWarning READ sdCardWarning NOTIFY sdCardChanged)
+    /// What the camera says of its SD card, in a sentence, or empty while that is not known.
+    Q_PROPERTY(QString sdCardText READ sdCardText NOTIFY sdCardChanged)
     Q_PROPERTY(bool targetValid READ targetValid NOTIFY targetChanged)
     Q_PROPERTY(double targetLat READ targetLat NOTIFY targetChanged)
     Q_PROPERTY(double targetLon READ targetLon NOTIFY targetChanged)
@@ -335,8 +349,12 @@ public:
     QString zoomLabel() const;
     /// The data of the camera's last zoom read reply, as sent (for checking a C13).
     QString zoomReport() const { return _zoomReport; }
-    /// What we last asked for. The camera does not report recording state.
+    /// The camera records to its SD card: what it said when asked (every 2 s), and right after a
+    /// press what the press asked for, until the camera answers.
     bool recording() const { return _recording; }
+    bool recordingConfirmed() const { return _recordConfirmed; }
+    QString sdCardWarning() const;
+    QString sdCardText() const;
     bool targetValid() const { return _target.ok; }
     double targetLat() const { return _target.targetLatDeg; }
     double targetLon() const { return _target.targetLonDeg; }
@@ -466,8 +484,15 @@ public:
     /// False when that lens is known only from a data sheet (the C12's and the
     /// C13's thermal lens): good enough to turn the camera, not to place a point.
     bool pictureFov(double &horizontalDeg, double &verticalDeg) const;
+    /// CAP: the camera takes a photo onto its SD card. cameraNote says how that went.
     Q_INVOKABLE void takePhoto();
+    /// REC: starts the camera's recording when the screen shows none, else stops it.
+    /// cameraNote says how that went.
     Q_INVOKABLE void toggleRecord();
+    /// REC 01 (start) or REC 00 (stop), for a screen that records a copy on the RC as well and
+    /// decides for both. Asking for what the screen shows already sends the frame again, to make
+    /// sure, with no note.
+    Q_INVOKABLE void setRecord(bool start);
     /// +1 zoom in, -1 zoom out (one step).
     Q_INVOKABLE void zoom(int direction);
     Q_INVOKABLE void zoomHome();
@@ -497,6 +522,10 @@ signals:
     void laserChanged();
     void zoomChanged();
     void recordingChanged();
+    void sdCardChanged();
+    /// What the camera did with a photo or record press, for the screen. problem: it did not
+    /// do it, it does not say, or its SD card is missing or almost full.
+    void cameraNote(const QString &text, bool problem);
     void targetChanged();
     void thermalPictureChanged();
     void lockChanged();
@@ -526,6 +555,8 @@ private slots:
     void _aimTick();
     void _lockTick();
     void _sendLockConfirm();
+    void _photoVerdict();
+    void _recordVerdict();
 
 private:
     // Plain functions, not slots: a slot taking Vehicle* would need the full
@@ -560,6 +591,13 @@ private:
     /// form VGCS uses, when the camera's frames are lower-case (C12, C13).
     void _sendGimbal(const std::string &frame);
     void _handleFrame(const skydroid::top::DecodedFrame &frame, const Endpoint &from);
+    /// A camera that takes TOP over TCP (the C20): one connection to its address while the
+    /// link runs, opened again a moment after it is lost.
+    void _syncTcp();
+    void _openTcp();
+    void _closeTcp();
+    void _readTcp();
+    void _tcpLost();
     Endpoint _knownEndpointFor(const QHostAddress &address, quint16 port) const;
     bool _attitudeFresh() const;
     void _probe();
@@ -569,6 +607,18 @@ private:
     /// To the control port, and to the other ports some C13 firmware takes zoom on.
     void _sendZoomFrames(const std::vector<std::string> &frames);
     int _zoomStepsMax() const;
+
+    // Photos and recording
+    /// The camera answered whether it records.
+    void _recordAnswered(bool on);
+    /// The state on the screen, and whether the camera's last answer says the same.
+    void _setRecording(bool on);
+    void _askSdCard();
+    void _sdCardAnswered(const skydroid::top::SdCard &card);
+    /// The camera's SD card has no room, in words (" It has no SD card."), or nothing.
+    QString _sdCardProblem() const;
+    /// Forgets what the camera said (another camera, or the link stopped).
+    void _forgetCameraReports();
     /// Drone position and attitude now, from QGC. False when there is no usable GPS fix.
     bool _sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &why) const;
     /// The drone's height above its take-off point, when it is known.
@@ -647,7 +697,13 @@ private:
     std::optional<int> _rcValue(int channel) const;
     void _updateWheelAngles();
 
-    QUdpSocket *_socket = nullptr;
+    QUdpSocket *_socket = nullptr;  // made while the link runs, also for a TCP camera
+    QTcpSocket *_tcp = nullptr;
+    QString _tcpHost;
+    int _tcpPort = 0;
+    std::string _tcpRx;             // what came over TCP that is not a whole frame yet
+    QTimer _tcpRetryTimer;
+    QTimer _tcpConnectTimer;
     QTimer _pollTimer;
     QTimer _answerTimer;
     QTimer _laserShotTimer;
@@ -810,7 +866,22 @@ private:
     int _zoomOutLeft = 0;   // steps still to send for "back to 1x"
     QTimer _zoomOutTimer;
     QString _zoomReport;
+
+    // Photos and recording
     bool _recording = false;
+    bool _recordConfirmed = false;
+    std::optional<bool> _recordReported;  // the camera's last answer: it records
+    QElapsedTimer _recordReportAt;        // since then
+    bool _recordChecking = false;         // a press waits for the camera's answer
+    bool _recordWanted = false;           // what that press asked for
+    QElapsedTimer _recordPressAt;
+    quint64 _recordPresses = 0;
+    QTimer _recordVerdictTimer;
+    bool _photoWaiting = false;           // a photo press waits for the camera's echo
+    QTimer _photoVerdictTimer;
+    std::optional<skydroid::top::SdCard> _sdCard;
+    QElapsedTimer _sdCardAt;              // since its answer
+    int _sdCardAsked = 0;                 // SDC questions since the last answer
 
     // Motion
     QTimer _motionTimer;

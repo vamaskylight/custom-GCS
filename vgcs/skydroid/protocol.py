@@ -174,6 +174,46 @@ def build_system_command(tag: str, data: str, *, write: bool = True) -> bytes:
     )
 
 
+def build_record(start: bool) -> bytes:
+    """Start (REC 01) or stop (REC 00) the camera's own recording to its SD card.
+
+    TOP "REC" also has 0A, a toggle, which is not used: a command that reaches the
+    camera twice (VGCS tries a second command name when no reply comes) would
+    start and stop it again. VGCS sent REC 01 for the stop too until 2026-10-26,
+    so a stop never stopped the camera (task AL).
+    """
+    return build_system_command("REC", "01" if start else "00")
+
+
+def build_record_query() -> bytes:
+    """Ask whether the camera records (REC read). It answers 0 (no) or 1 (yes)."""
+    return build_system_command("REC", "00", write=False)
+
+
+def build_sd_card_query() -> bytes:
+    """Ask for the camera's SD card space (SDC read)."""
+    return build_system_command("SDC", "00", write=False)
+
+
+def decode_record_state(data: str) -> bool | None:
+    """A REC read reply: True while the camera records, False when it does not, None for anything else."""
+    s = str(data or "").strip()
+    if not re.fullmatch(r"[0-9A-Fa-f]{1,2}", s):
+        return None
+    value = int(s, 16)
+    if value not in (0, 1):
+        return None
+    return value == 1
+
+
+def decode_sd_card(data: str) -> tuple[int, int] | None:
+    """An SDC read reply: (free MB, total MB), five hex digits each. All zero means no card."""
+    s = str(data or "").strip()
+    if not re.fullmatch(r"[0-9A-Fa-f]{10}", s):
+        return None
+    return int(s[:5], 16), int(s[5:], 16)
+
+
 def build_slr_query(*, dest: str = "D") -> bytes:
     """C13 single laser rangefinding read (PROTOCAL §4.22, tag SLR)."""
     return build_tp_frame(
@@ -608,16 +648,11 @@ def build_top_frame(command: str, params: Mapping[str, object] | None = None) ->
         spd = float(p.get("speed", 16.0) or 16.0)
         return build_gimbal_angle_axis(cmd, deg, spd)
 
-    # Camera / system (best-effort fixed 2-byte data)
-    cam_map = {
-        "CAM_REC": ("REC", "01"),
-        "CAM_RECORD": ("REC", "01"),
-        "CAM_SNAP": ("CAP", "01"),
-        "CAM_PHOTO": ("CAP", "01"),
-    }
-    if cmd in cam_map:
-        tag, data = cam_map[cmd]
-        return build_system_command(tag, data)
+    # Camera / system. Recording: "on" says start (True) or stop (False); without it, start.
+    if cmd in ("CAM_REC", "CAM_RECORD"):
+        return build_record(bool(p.get("on", True)))
+    if cmd in ("CAM_SNAP", "CAM_PHOTO"):
+        return build_system_command("CAP", "01")
 
     if cmd in ("CAM_ZOOM", "CAM_Z"):
         level = float(p.get("level", p.get("zoom", 1.0)) or 1.0)
@@ -696,6 +731,16 @@ def parse_tp_frame(raw: bytes) -> DecodedTopFrame | None:
         step = decode_dzm_step(data)
         if step is not None:
             params["dzm_step"] = str(step)
+    elif tag_u == "REC" and str(_ctrl).lower() == "r":
+        # Read replies only: a write echo carries the command, not the state.
+        state = decode_record_state(data)
+        if state is not None:
+            params["recording"] = "1" if state else "0"
+    elif tag_u == "SDC" and str(_ctrl).lower() == "r":
+        card = decode_sd_card(data)
+        if card is not None:
+            params["sd_free_mb"] = str(card[0])
+            params["sd_total_mb"] = str(card[1])
     return DecodedTopFrame(command=tag_u, params=params, raw=text, protocol="tp")
 
 

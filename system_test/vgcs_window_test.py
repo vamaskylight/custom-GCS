@@ -1299,10 +1299,16 @@ def session(version: str, minutes: float, speedup: int, r: Report, profile_to: p
         r.check("Communication lost" in banner(w), f"and the banner says so ({banner(w)!r})")
         r.check(w._hdr_banner_disconnect_btn.isVisible() and w._hdr_banner_disconnect_btn.isEnabled(),
                 "and the header still offers Disconnect")
+        # The link alarm (2026-10-21). Offscreen it plays nothing; its player counts the starts.
+        alarm = w._link_alarm
+        r.check(alarm.sounding and alarm.player.playing and w._hdr_silence_btn.isVisible(),
+                f"and the link alarm sounds, with Silence alarm in the header ({alarm.lost_names()})")
         wait_qt(lambda: False, 4.0)
         wsl("pkill -CONT -x arducopter")
         r.check(wait_qt(lambda: not w._watchdog.text().startswith("Lost"), 15), f"back: the window shows the link again ({w._watchdog.text()!r})")
         r.check(wait_qt(lambda: "Communication lost" not in banner(w), 10), f"and the banner clears ({banner(w)!r})")
+        r.check(not alarm.sounding and not alarm.player.playing and not w._hdr_silence_btn.isVisible(),
+                "and the alarm stops by itself")
 
         # Land through the window's own button handler.
         w._on_land()

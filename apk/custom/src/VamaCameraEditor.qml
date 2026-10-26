@@ -33,6 +33,8 @@ Popup {
 
     // The zoom kinds of CameraProfile.h, in the order of the zoom box.
     readonly property var _zoomKinds: ["none", "counted", "reported"]
+    // How the control commands reach the camera, in the order of the link box (the C20: TCP).
+    readonly property var _transportKinds: ["udp", "tcp"]
 
     onOpened: {
         link.reloadCameras()  // files copied in meanwhile
@@ -60,6 +62,7 @@ Popup {
         nameField.text = f.name
         hostField.text = f.host
         portField.text = String(f.port)
+        transportBox.currentIndex = Math.max(0, _transportKinds.indexOf(f.transport))
         dayVideoField.text = f.dayVideoUrl
         thermalVideoField.text = f.thermalVideoUrl
         zoomBox.currentIndex = Math.max(0, _zoomKinds.indexOf(f.zoom))
@@ -100,6 +103,7 @@ Popup {
         f.name = nameField.text
         f.host = hostField.text
         f.port = _number(portField.text)
+        f.transport = _transportKinds[transportBox.currentIndex]
         f.dayVideoUrl = dayVideoField.text
         f.thermalVideoUrl = thermalVideoField.text
         f.zoom = _zoomKinds[zoomBox.currentIndex]
@@ -272,6 +276,14 @@ Popup {
 
                 QGCLabel { text: qsTr("Control port"); Layout.preferredWidth: root._labelWidth }
                 NumberField { id: portField; objectName: "vamaCameraPort" }
+
+                QGCLabel { text: qsTr("Control link"); Layout.preferredWidth: root._labelWidth }
+                QGCComboBox {
+                    id:               transportBox
+                    objectName:       "vamaCameraTransport"
+                    Layout.fillWidth: true
+                    model:            [qsTr("UDP (as the V12, V13 and V14 Pro)"), qsTr("TCP (as the V20)")]
+                }
 
                 QGCLabel { text: qsTr("Day video"); Layout.preferredWidth: root._labelWidth }
                 QGCTextField { id: dayVideoField; objectName: "vamaCameraDayVideo"; Layout.fillWidth: true }

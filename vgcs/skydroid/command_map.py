@@ -135,6 +135,10 @@ class SkydroidCommandProfile:
     # The camera takes photos and records on its own card.
     photo: bool = True
     record: bool = True
+    # How TOP reaches the camera: "udp" (every Skydroid camera before), or "tcp" for a
+    # camera that takes it on TCP only (the C20, TOP document V1.1.6 section 2.1.1). A TCP
+    # camera has one address: no other host or port is tried.
+    transport: str = "udp"
 
     def fov_at_dzm_step(self, step: int | None) -> tuple[float, float] | None:
         """(hfov, vfov) at ``step``, or None when this camera's zoom optics are unknown.
@@ -354,6 +358,49 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         # long (field logs 2026-09-18, VLC clean on the same PC).
         video_qc_mode="colour",
         probe_fallback_profile_id="",
+    ),
+    "c20_default": SkydroidCommandProfile(
+        profile_id="c20_default",
+        display_name="C20",
+        # TOP V1.1.6 (the client's PROTOCAL(c10 & c20).pdf, 2026-10-05): the C20 takes TOP on
+        # TCP port 5000 only (section 2.1.1), and every G-class frame needs "#TP" (2.2.2).
+        # PTZ, GSY/GSP/GSM and GAY/GAP/GAM list the C20; REC, CAP, DZM and VER do not, and
+        # its zoom is in the appendix only (ZMC): photo, record and zoom are to be tried on
+        # the camera. The same tags and frames as the C13, so the C13's command lists.
+        ptz_commands={
+            "up": ["PT_UP"],
+            "down": ["PT_DOWN"],
+            "left": ["PT_LEFT"],
+            "right": ["PT_RIGHT"],
+            "center": ["PT_CENTER"],
+            "nadir": ["PTZ_NADIR"],
+            "stop": ["PT_STOP"],
+        },
+        speed_commands=["GSY", "GSP", "GSM"],
+        angle_commands=["GAY", "GAP", "GAM"],
+        status_commands=["GAC", "GAA"],
+        status_response_commands=["GAA", "GAC", "GAY", "GAP", "ACK"],
+        camera_commands={
+            "record_toggle": ["CAM_REC", "CAM_RECORD"],
+            "photo": ["CAM_SNAP", "CAM_PHOTO"],
+            "zoom": ["CAM_ZOOM", "CAM_Z"],
+            "focus_in": ["CAM_FOCUS_NEAR", "CAM_FN", "FOCUS_NEAR"],
+            "focus_out": ["CAM_FOCUS_FAR", "CAM_FF", "FOCUS_FAR"],
+        },
+        # The data sheet: 1080p, 22x optical zoom, 58.3 degrees wide at 1x (34.9 high at
+        # 16:9). Not measured on the camera.
+        frame_w=1920,
+        frame_h=1080,
+        fov_h_deg=58.3,
+        fov_v_deg=34.9,
+        frame_specs_confirmed=False,
+        aim_fov_from_profile=True,
+        max_zoom=22.0,
+        g_frames_upper_header=True,
+        # Its picture is not the C13's, which the full checks were tuned on.
+        video_qc_mode="colour",
+        probe_fallback_profile_id="",
+        transport="tcp",
     ),
 }
 

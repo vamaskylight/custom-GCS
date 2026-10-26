@@ -697,11 +697,15 @@ class VideoPipelineMixin:
             QSettings(QS_ORG, QS_APP).setValue(KEY_VIDEO_THERMAL_PALETTE, pid)
         except Exception:
             pass
-        for refresh in ("_sync_native_palette_button", "_retry_native_video_pixmap"):
+        for refresh in (
+            "_sync_native_palette_button",
+            "_retry_native_video_pixmap",
+            "_sync_video_recording_preview_transform",
+        ):
             fn = getattr(self, refresh, None)
             if callable(fn):
                 try:
-                    fn()  # the button's swatch, then the frame on screen
+                    fn()  # the button's swatch, the frame on screen, a recording that runs
                 except Exception:
                     pass
         try:

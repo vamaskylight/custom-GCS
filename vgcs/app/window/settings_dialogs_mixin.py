@@ -198,7 +198,29 @@ class MainWindowSettingsDialogsMixin:
         g = QVBoxLayout(general_body)
         g.setContentsMargins(0, 0, 0, 0)
         g.setSpacing(10)
-        g.addWidget(QLabel("General settings are available in the main window (Connection + Theme)."))
+        # The link loss time (the watchdog). Its field was in a panel the map-first window
+        # never shows, so it could not be changed (found 2026-10-21).
+        link_group = QGroupBox("Link to the drone")
+        lg = QGridLayout()
+        lg.addWidget(QLabel("Link loss time (s)"), 0, 0)
+        link_loss = QDoubleSpinBox()
+        link_loss.setObjectName("linkLossTimeSpin")
+        link_loss.setRange(1.0, 10.0)
+        link_loss.setDecimals(1)
+        link_loss.setSingleStep(0.5)
+        link_loss.setValue(max(1.0, min(10.0, float(self._timeout_s))))
+        lg.addWidget(link_loss, 0, 1)
+        link_hint = QLabel(
+            "When nothing comes from a drone for this time, VGCS says the link is lost: the header turns red "
+            "with the last known position, and the link alarm sounds until the link is back or you press "
+            "Silence alarm. It also counts for the links that run now."
+        )
+        link_hint.setWordWrap(True)
+        link_hint.setStyleSheet("color: #aab4c8; font-size: 11px;")
+        lg.addWidget(link_hint, 1, 0, 1, 2)
+        lg.setColumnStretch(1, 1)
+        link_group.setLayout(lg)
+        g.addWidget(link_group)
 
         wind_group = QGroupBox("Wind warning")
         wg = QGridLayout()
@@ -440,6 +462,7 @@ class MainWindowSettingsDialogsMixin:
         skydroid_profile.addItem("C13 Alternate (GAC/GSP/GAP)", "c13_alt")
         skydroid_profile.addItem("C12 Default (AI follow)", "c12_default")
         skydroid_profile.addItem("C14 Pro (dual lens, zoom by step)", "c14pro_default")
+        skydroid_profile.addItem("C20 (control over TCP)", "c20_default")
         built_in_profile_items = skydroid_profile.count()
         # Names for the tests of the camera list.
         skydroid_profile.setObjectName("skydroidProfile")
@@ -921,6 +944,7 @@ class MainWindowSettingsDialogsMixin:
                 s.setValue("observe/dem_csv", dem_p)
                 s.setValue("observe/dem_terrain_enabled", bool(dem_enabled.isChecked()))
                 s.setValue("observe/camera_hfov_deg", float(observe_hfov.value()))
+                self._apply_link_loss_time(float(link_loss.value()))
                 s.setValue(KEY_WIND_WARN_MPS, float(wind_warn.value()))
                 self._wind.set_warn_mps(wind_warn.value())
                 self._publish_wind()

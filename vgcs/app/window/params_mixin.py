@@ -156,6 +156,8 @@ class MainWindowParamsMixin:
         self._append_log(f"Param set queued: {name}={value}")
 
     def _on_action_result(self, action: str, ok: bool, detail: str) -> None:
+        if not ok:
+            detail = self._with_signing_reason(detail)    # no answer: maybe the drone ignores this laptop
         msg = f"{action.upper()} {'OK' if ok else 'FAIL'}: {detail}"
         self._append_log(msg)
         if action in _MISSION_ACTIONS_IN_WORDS:
@@ -171,6 +173,8 @@ class MainWindowParamsMixin:
         self._post_gcs_notice(msg[:80])
 
     def _on_geofence_result(self, ok: bool, detail: str) -> None:
+        if not ok:
+            detail = self._with_signing_reason(detail)
         msg = f"Fence {'OK' if ok else 'FAIL'}: {detail}"
         self._append_log(msg)
         self._post_gcs_notice(msg[:80])

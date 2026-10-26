@@ -265,6 +265,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
         self._timeout_s = timeout_s
         self._master: Optional[mavutil.mavlink_connection] = None
         self._running = False
+        self._stop_asked = False   # stop() was called: the link closes because the operator let go
         self._target_sysid = 1
         self._target_compid = 1
         self._cmd_lock = threading.Lock()
@@ -628,7 +629,16 @@ class MavlinkThread(FenceLinkMixin, QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("camera_video_stop", None))
 
+    def stop_requested(self) -> bool:
+        """True once stop() was called. A link that ends without it closed by itself (link alarm)."""
+        return bool(self._stop_asked)
+
+    def set_link_loss_time(self, seconds: float) -> None:
+        """The watchdog time (1 to 10 s), also for a link that runs: the loop reads it on each pass."""
+        self._timeout_s = max(1.0, min(10.0, float(seconds)))
+
     def stop(self) -> None:
+        self._stop_asked = True
         self._running = False
         if self._master is not None:
             try:
@@ -2497,19 +2507,23 @@ class MavlinkThread(FenceLinkMixin, QThread):
         self.log_line.emit(f"Signing: VGCS signs its commands (key {fingerprint(key)})")
 
     def _hear_signature(self, msg) -> None:
-        """A heartbeat from the flight controller: did it sign it, and with our key?"""
-        if getattr(self, "_signing_key", None) is None:
-            return
+        """A heartbeat from the flight controller: did it sign it, and with our key?
+
+        Without a key too: a drone that signs ignores this laptop's commands, and that is
+        said (client test 2026-10-22, laptop 2 without the key showed only "Off").
+        """
+        key_set = getattr(self, "_signing_key", None) is not None
         if str(getattr(self._master, "WIRE_PROTOCOL_VERSION", "2.0")) != "2.0":
-            self._signing_monitor.mavlink1()
-            self._report_signing()
+            if key_set:
+                self._signing_monitor.mavlink1()
+                self._report_signing()
             return
         try:
             buf = msg.get_msgbuf()
             present = len(buf) > 2 and buf[0] == 0xFD and bool(buf[2] & 0x01)
         except Exception:
             present = False
-        valid = bool(getattr(msg, "_signed", False))
+        valid = bool(getattr(msg, "_signed", False))     # without a key the monitor goes by present alone
         changed = self._signing_monitor.note(present, valid)
         transfer = getattr(self, "_key_transfer", None)
         if transfer is not None:

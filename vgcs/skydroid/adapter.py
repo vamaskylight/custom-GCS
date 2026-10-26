@@ -37,7 +37,7 @@ from vgcs.skydroid.protocol import (
     _LRF_FRAME_H,
     _LRF_FRAME_W,
 )
-from vgcs.skydroid.transport import TopUdpTransport
+from vgcs.skydroid.transport import TopTcpTransport, TopUdpTransport
 
 # PROTOCAL.doc: TOP UDP port 5000; lens/system also on 9003 on some C13 builds.
 _C13_PROBE_PORTS = (5000, 9003, 19856)
@@ -292,7 +292,10 @@ class SkydroidTopUdpAdapter:
             merged.append("192.168.144.108")
         self._hosts = merged
         self._active_host = merged[0]
-        self._transport = TopUdpTransport(
+        self._profile: SkydroidCommandProfile = get_profile(profile_id)
+        # TOP over TCP for a camera that takes it on TCP only (the C20), else UDP.
+        transport_cls = TopTcpTransport if self._profile.transport == "tcp" else TopUdpTransport
+        self._transport = transport_cls(
             self._active_host,
             port,
             timeout_s=timeout_s,
@@ -302,7 +305,6 @@ class SkydroidTopUdpAdapter:
         self._queue: queue.Queue[tuple[list[str], dict[str, object], bool]] = queue.Queue(maxsize=128)
         self._status = GimbalStatus()
         self._status_lock = threading.Lock()
-        self._profile: SkydroidCommandProfile = get_profile(profile_id)
         self._profile_id = str(profile_id or "c13_default")
         fov_h, fov_v = apply_profile_optics(self._profile)
         # The picture on the screen is the day camera's until the window says
@@ -794,6 +796,11 @@ class SkydroidTopUdpAdapter:
         x_px = max(0, min(int(fw), int(round(rx))))
         y_px = max(0, min(int(fh), int(round(ry))))
         return x_px, y_px
+
+    def _one_address(self) -> bool:
+        """A TCP camera (the C20) has one connection, to its own address. The other hosts and
+        ports a UDP camera is tried on would each drop it, so they are left out."""
+        return isinstance(self._transport, TopTcpTransport)
 
     def _ensure_active_transport(self) -> None:
         host = str(self._active_host or self._hosts[0] or "").strip()
@@ -2449,6 +2456,8 @@ class SkydroidTopUdpAdapter:
 
     def _slr_probe_ports(self) -> tuple[int, ...]:
         active = int(self._active_port or self._transport._port or 5000)
+        if self._one_address():
+            return (active,)
         ordered: list[int] = [active]
         for port in _C13_PROBE_PORTS:
             p = int(port)
@@ -2464,7 +2473,7 @@ class SkydroidTopUdpAdapter:
         hosts: list[str] = []
         if active_host:
             hosts.append(active_host)
-        for h in list(getattr(self, "_hosts", []) or []):
+        for h in [] if self._one_address() else list(getattr(self, "_hosts", []) or []):
             hs = str(h or "").strip()
             if hs and hs not in hosts:
                 hosts.append(hs)
@@ -3875,8 +3884,17 @@ class SkydroidTopUdpAdapter:
             return ["GSP"]
         return []
 
+    def camera_record_set(self, on: bool) -> None:
+        """Start (REC 01) or stop (REC 00) the camera's own recording to its SD card.
+
+        Until 2026-10-26 every call sent REC 01, so a stop never stopped the camera (task AL).
+        """
+        self._camera_record_on = bool(on)
+        self._enqueue(self._profile.camera_commands.get("record_toggle", []), {"on": bool(on)}, True)
+
     def camera_record_toggle(self) -> None:
-        self._enqueue(self._profile.camera_commands.get("record_toggle", []), {}, True)
+        """Stop when the last call started the recording, else start."""
+        self.camera_record_set(not bool(getattr(self, "_camera_record_on", False)))
 
     def camera_photo(self) -> None:
         self._enqueue(self._profile.camera_commands.get("photo", []), {}, True)
@@ -4238,7 +4256,7 @@ class SkydroidTopUdpAdapter:
 
     def poll_attitude_now(self) -> GimbalStatus | None:
         """Blocking poll — background threads only (never call from UI thread)."""
-        for host in self._hosts:
+        for host in [self._active_host] if self._one_address() else self._hosts:
             self._transport._host = host
             if self._poll_host_once(host):
                 with self._status_lock:
@@ -4294,7 +4312,7 @@ class SkydroidTopUdpAdapter:
         """Find host/port/profile that returns GAA/GAC/GAY attitude (C13 + RC gateway paths)."""
         configured = int(self._transport._port)
         ports: list[int] = []
-        for p in (configured, *_C13_PROBE_PORTS):
+        for p in (configured, *(() if self._one_address() else _C13_PROBE_PORTS)):
             if int(p) not in ports:
                 ports.append(int(p))
         profiles: list[SkydroidCommandProfile] = [self._profile]
@@ -4308,7 +4326,7 @@ class SkydroidTopUdpAdapter:
         for profile in profiles:
             prev = self._profile
             self._profile = profile
-            for host in self._hosts:
+            for host in [self._active_host] if self._one_address() else self._hosts:
                 self._transport.set_route_host(host)
                 self._transport._host = host
                 for port in ports:
@@ -4579,7 +4597,7 @@ class SkydroidTopUdpAdapter:
             pass
         active_port = int(self._transport._port)
         ports: list[int] = []
-        for p in (active_port, *_ZOOM_EXTRA_PORTS):
+        for p in (active_port, *(() if self._one_address() else _ZOOM_EXTRA_PORTS)):
             if int(p) not in ports:
                 ports.append(int(p))
         for port in ports:
@@ -4614,7 +4632,7 @@ class SkydroidTopUdpAdapter:
             pass
         active_port = int(self._transport._port)
         ports: list[int] = []
-        for p in (active_port, *_ZOOM_EXTRA_PORTS):
+        for p in (active_port, *(() if self._one_address() else _ZOOM_EXTRA_PORTS)):
             if int(p) not in ports:
                 ports.append(int(p))
         for port in ports:

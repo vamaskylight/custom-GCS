@@ -94,6 +94,23 @@ class MainWindowLifecycleMixin:
         self._watchdog.setText(f"OK · {self._timeout_s:.1f}s")
         self._apply_state_style(self._watchdog, "ok")
 
+    def _apply_link_loss_time(self, seconds: float) -> None:
+        """Application Settings, General: the link loss time (1 to 10 s), saved, and used by
+        the links that run now as well as by the next ones."""
+        value = max(1.0, min(10.0, float(seconds)))
+        changed = abs(value - float(self._timeout_s)) > 1e-9
+        self._timeout_s = value
+        self._settings.setValue("watchdog_timeout_s", value)
+        # The connection panel's own field (the map-first window does not show it) reads the same.
+        self._timeout_spin.blockSignals(True)
+        self._timeout_spin.setValue(value)
+        self._timeout_spin.blockSignals(False)
+        fleet = getattr(self, "_fleet", None)
+        if fleet is not None:
+            fleet.set_link_loss_time(value)
+        if changed:
+            self._append_log(f"Link loss time: {value:.1f} s")
+
     def _on_reset_telemetry(self) -> None:
         self._hb.setText("—")
         self._apply_state_style(self._hb, "na")

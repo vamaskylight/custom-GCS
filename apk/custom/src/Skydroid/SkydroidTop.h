@@ -66,7 +66,21 @@ std::string buildGimbalAngles(double yawDeg, double pitchDeg, double yawSpeed, d
 std::string buildSystemCommand(const std::string &tag, const std::string &data, bool write = true,
                                const Options &options = {});
 std::string buildPhoto(const Options &options = {});   // CAP 01
-std::string buildRecord(const Options &options = {});  // REC 01
+/// REC 01 starts the camera's own recording (to its SD card), REC 00 stops it.
+std::string buildRecord(bool start, const Options &options = {});
+/// REC read: the camera answers 0 (not recording) or 1 (recording).
+std::string buildRecordQuery(const Options &options = {});
+/// SDC read: the camera's SD card space.
+std::string buildSdCardQuery(const Options &options = {});
+/// A REC read reply: true while the camera records, false when not, nothing for anything else.
+std::optional<bool> decodeRecordState(const std::string &dataField);
+struct SdCard
+{
+    int freeMb = 0;
+    int totalMb = 0;  // 0 with freeMb 0: no card
+};
+/// An SDC read reply: five hex digits of free MB, then five of total MB.
+std::optional<SdCard> decodeSdCard(const std::string &dataField);
 
 // --- Laser rangefinder (SLR) -------------------------------------------------
 std::string buildSlrQuery(char dest = 'D', const Options &options = {});
@@ -119,9 +133,18 @@ struct DecodedFrame
     std::optional<double> roll;    // GAC
     std::optional<int> slrDm;      // SLR
     std::optional<int> dzmStep;    // DZM read reply only
+    std::optional<bool> recording; // REC read reply only
+    std::optional<SdCard> sdCard;  // SDC read reply only
 };
 
 /// Parses a #TP / #tp reply. Like the Python code, it does not check the checksum.
 std::optional<DecodedFrame> parseTpFrame(const std::string &raw, const Options &options = {});
+
+/// Cuts the whole frames off the front of a TCP byte stream (a camera that takes TOP over
+/// TCP, the C20): "#TP" or "#tp", then 12 characters plus the data, its length in the
+/// header. TCP can bring half a frame or several. stream keeps what is left (the start of
+/// the next frame); characters that cannot start a frame are dropped. Port of
+/// split_top_frames in vgcs/skydroid/transport.py.
+std::vector<std::string> takeFrames(std::string &stream);
 
 } // namespace skydroid::top

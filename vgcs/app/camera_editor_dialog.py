@@ -47,6 +47,8 @@ from vgcs.skydroid.camera_files import (
     MAX_LENSES,
     PROTOCOL,
     SKYDROID_HOST,
+    TRANSPORT_TCP,
+    TRANSPORT_UDP,
     ZOOM_COUNTED,
     ZOOM_NONE,
     ZOOM_REPORTED,
@@ -54,6 +56,12 @@ from vgcs.skydroid.camera_files import (
     CameraStore,
     from_json,
     profile_id_for,
+)
+
+# How the control commands reach the camera, in the order of the box (as the APK's).
+TRANSPORT_CHOICES = (
+    (TRANSPORT_UDP, "UDP (as the V12, V13 and V14 Pro)"),
+    (TRANSPORT_TCP, "TCP (as the V20)"),
 )
 
 # The zoom kinds, in the order of the zoom box (as the APK's).
@@ -307,6 +315,13 @@ class CameraEditorDialog(QDialog):
         self._name = line("Name", "cameraName")
         self._host = line("Camera IP address", "cameraHost")
         self._port = line("Control port", "cameraPort")
+        self._transport = QComboBox()
+        self._transport.setObjectName("cameraTransport")
+        for kind, text in TRANSPORT_CHOICES:
+            self._transport.addItem(text, kind)
+        grid.addWidget(QLabel("Control link"), row, 0)
+        grid.addWidget(self._transport, row, 1, 1, 2)
+        row += 1
         self._day = line("Day video", "cameraDayVideo")
         self._thermal = line("Thermal video", "cameraThermalVideo", "Empty: no thermal picture")
         self._take = self._button("Take the addresses in use now", "cameraTakeAddresses", self._take_addresses)
@@ -446,6 +461,7 @@ class CameraEditorDialog(QDialog):
         self._name.setText(cam.name)
         self._host.setText(cam.host)
         self._port.setText(_shown(cam.port))
+        self._transport.setCurrentIndex(max(0, self._transport.findData(cam.transport)))
         self._day.setText(cam.day_video_url)
         self._thermal.setText(cam.thermal_video_url)
         self._zoom.setCurrentIndex(max(0, self._zoom.findData(cam.zoom)))
@@ -544,6 +560,7 @@ class CameraEditorDialog(QDialog):
             "name": self._name.text(),
             "host": self._host.text(),
             "port": _number(self._port.text()),
+            "transport": self._transport.currentData(),
             "dayVideoUrl": self._day.text(),
             "thermalVideoUrl": self._thermal.text(),
             "zoom": self._zoom.currentData(),

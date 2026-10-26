@@ -49,6 +49,9 @@ struct Profile
     // Addresses. Choosing the camera sets them.
     QString host;
     int port = 5000;
+    /// TOP over TCP, not UDP: the C20 takes it on TCP port 5000 only (TOP document V1.1.6,
+    /// section 2.1.1). Its file says "transport": "tcp" (else "udp").
+    bool tcp = false;
     QString dayVideoUrl;
     QString thermalVideoUrl;  ///< empty: no thermal picture (no IR button)
 

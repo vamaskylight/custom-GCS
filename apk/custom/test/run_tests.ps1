@@ -6,6 +6,10 @@ Builds and runs the host unit tests for our C++ code that has no Qt in it.
 Uses the MinGW compiler from Qt's tools (C:\Qt\Tools\mingw1310_64), or any
 g++ on PATH. Regenerate the expected values first if the VGCS protocol changed:
     python apk/custom/test/gen_skydroid_vectors.py
+    python apk/custom/test/gen_siyi_vectors.py
+    python apk/custom/test/gen_viewpro_vectors.py
+    python apk/custom/test/gen_siyi_camera_vectors.py
+    python apk/custom/test/gen_viewpro_camera_vectors.py
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File apk\custom\test\run_tests.ps1
@@ -35,7 +39,7 @@ if (-not $Compiler) {
 $OutDir = Join-Path $env:TEMP 'vama-apk-tests'
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-# Each test: its own .cc file plus the source file it checks.
+# Each test: its own .cc file plus the source file (or files) it checks.
 $tests = @(
     @{ Name = 'skydroid_top_test'; Source = 'SkydroidTop.cc' },
     @{ Name = 'laser_geo_test'; Source = 'LaserGeo.cc' },
@@ -43,7 +47,11 @@ $tests = @(
     @{ Name = 'object_tracker_walk_test'; Source = 'ObjectTracker.cc' },
     @{ Name = 'follow_guide_test'; Source = 'FollowGuide.cc' },
     @{ Name = 'object_finder_test'; Source = 'ObjectFinder.cc' },
-    @{ Name = 'lock_check_test'; Source = 'LockCheck.cc' }
+    @{ Name = 'lock_check_test'; Source = 'LockCheck.cc' },
+    @{ Name = 'siyi_protocol_test'; Source = 'SiyiProtocol.cc' },
+    @{ Name = 'viewpro_protocol_test'; Source = 'ViewproProtocol.cc' },
+    @{ Name = 'siyi_camera_test'; Source = @('SiyiCamera.cc', 'SiyiProtocol.cc') },
+    @{ Name = 'viewpro_camera_test'; Source = @('ViewproCamera.cc', 'ViewproProtocol.cc') }
 )
 
 $failed = 0
@@ -52,7 +60,7 @@ foreach ($t in $tests) {
     $saved = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     & $Compiler -std=c++17 -O2 -Wall -Wextra -Werror -I $SrcDir `
-        (Join-Path $TestDir "$($t.Name).cc") (Join-Path $SrcDir $t.Source) -o $exe | Out-Host
+        (Join-Path $TestDir "$($t.Name).cc") @($t.Source | ForEach-Object { Join-Path $SrcDir $_ }) -o $exe | Out-Host
     $compileCode = $LASTEXITCODE
     $ErrorActionPreference = $saved
     if ($compileCode -ne 0) {

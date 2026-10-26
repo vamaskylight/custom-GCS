@@ -70,17 +70,24 @@ def same_nofly_rows(drawing, on_drone) -> bool:
 
 
 def nofly_words(count: int, problem: str, on_drone: bool, in_use: bool) -> str:
-    """The line under the list of areas to stay out of in the Fence tab."""
+    """The line under the list of areas to stay out of in the Fence tab.
+
+    Task AI (client 2026-10-22): the drone armed inside an area that was drawn and never sent, so a
+    drawing says plainly that it does not stop the drone yet, and which button sends it.
+    """
     if count == 0:
         return NO_NOFLY_WORDS
     areas = f"{count} area{'' if count == 1 else 's'} to stay out of."
+    them = "it" if count == 1 else "them"
     if problem:
         return f"{areas} {problem}"
     if on_drone and in_use:
         return f"{areas} On the drone and switched on."
     if on_drone:
-        return f"{areas} The drone holds them, but does not use them. Upload a fence to switch them on."
-    return f"{areas} Not on the drone yet: they go with Upload circle fence or Upload polygon fence."
+        return (f"{areas} The drone holds {them} but does not use {them}: no protection. "
+                f"Press Upload areas only, or upload a fence above, to switch {them} on.")
+    return (f"{areas} Not on the drone yet: no protection, the drone can arm and fly in {them}. "
+            f"Press Upload areas only, or upload {them} with a fence above.")
 
 
 def nofly_list_words(rows) -> list[str]:
@@ -181,6 +188,17 @@ class FenceMixin:
         settings = self.plan_fence_settings() or {}
         return {
             "points": [[float(lat), float(lon)] for lat, lon in self.fence_polygon()],
+            "nofly": self.fence_nofly(),
+            "alt_max_m": float(settings.get("alt_max_m", 120.0)),
+            "action": float(settings.get("action", 1.0)),
+        }
+
+    def plan_nofly_fence_cfg(self) -> dict:
+        """The areas to stay out of on the map alone (no circle, no polygon), with the Fence tab's max height
+        and action, as the link takes them (task AI)."""
+        settings = self.plan_fence_settings() or {}
+        return {
+            "areas_only": True,
             "nofly": self.fence_nofly(),
             "alt_max_m": float(settings.get("alt_max_m", 120.0)),
             "action": float(settings.get("action", 1.0)),
@@ -374,9 +392,10 @@ class FenceMixin:
         elif nofly_in_use:
             nofly_tag = "on the drone"
         elif nofly_on_drone:
-            nofly_tag = "on the drone, not in use"
+            nofly_tag = "on the drone, not in use, no protection"
         else:
-            nofly_tag = "not on the drone"
+            # Task AI: "not on the drone" alone did not tell the client that it does not stop the drone.
+            nofly_tag = "not on the drone, no protection"
         nm.set_nofly_look(nofly_in_use, nofly_tag)
         # The circle fence the drone holds, around its home (it was never drawn before 2026-10-20).
         circle = circle_look(state, getattr(self, "_drone_home", None))
@@ -399,7 +418,8 @@ class FenceMixin:
             mode = nm.nofly_mode() if hasattr(nm, "nofly_mode") else ""
             show_nofly(nofly_words(len(nofly), nofly_problem, nofly_on_drone, nofly_in_use),
                        nofly_list_words(nofly), mode=mode,
-                       corners=len(nofly[-1].get("polygon") or []) if nofly and mode == "polygon" else 0)
+                       corners=len(nofly[-1].get("polygon") or []) if nofly and mode == "polygon" else 0,
+                       can_upload=bool(nofly) and not nofly_problem)
         drawing_on = getattr(panel, "set_fence_drawing", None)
         if callable(drawing_on):
             drawing_on(bool(nm.fence_draw_mode()))

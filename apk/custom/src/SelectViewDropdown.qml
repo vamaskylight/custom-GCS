@@ -10,6 +10,8 @@
 //    VamaAdminPasswordPanel.qml in place of the buttons. QGC's own question
 //    (advancedModeOnConfirmation) is not asked. The page's content is in a
 //    ColumnLayout for that, around QGC's GridLayout.
+//  - "Camera settings", and in Advanced Mode "Cameras" (the camera editor),
+//    task AG: the client looked for them here. The fly view opens them.
 // When moving to a new QGC release, compare with QGC's new file.
 
 import QtQuick
@@ -112,6 +114,40 @@ ToolIndicatorPage {
                     }
                 }
 
+                // VAMA (task AG): the camera windows belong to the fly view, which lives as long as
+                // the app. This menu only asks for them (CustomPlugin::requestCameraWindow) before it
+                // closes: a window made here would stop working with the menu.
+                SubMenuButton {
+                    objectName: "vamaMenuCameraSettings"
+                    implicitHeight: root._toolButtonHeight
+                    Layout.fillWidth: true
+                    text: qsTr("Camera settings")
+                    imageResource: "/custom/img/vama_settings.svg"
+                    onClicked: {
+                        if (mainWindow.allowViewSwitch()) {
+                            QGroundControl.corePlugin.requestCameraWindow("settings")
+                            mainWindow.closeIndicatorDrawer()
+                            mainWindow.showFlyView()
+                        }
+                    }
+                }
+
+                SubMenuButton {
+                    objectName: "vamaMenuCameras"
+                    implicitHeight: root._toolButtonHeight
+                    Layout.fillWidth: true
+                    text: qsTr("Cameras")
+                    imageResource: "/custom/img/vama_photo.svg"
+                    visible: QGroundControl.corePlugin.showAdvancedUI
+                    onClicked: {
+                        if (mainWindow.allowViewSwitch()) {
+                            QGroundControl.corePlugin.requestCameraWindow("editor")
+                            mainWindow.closeIndicatorDrawer()
+                            mainWindow.showFlyView()
+                        }
+                    }
+                }
+
                 SubMenuButton {
                     id: closeButton
                     objectName: "toolbar_viewClose"
@@ -149,7 +185,7 @@ ToolIndicatorPage {
                     QGCLabel {
                         Layout.fillWidth: true
                         horizontalAlignment: Text.AlignHCenter
-                        text: qsTr("Test build 12, 20 October 2026")
+                        text: qsTr("Test build 14, 26 October 2026")
                         font.pointSize: ScreenTools.smallFontPointSize
                         wrapMode: QGCLabel.WordWrap
                     }

@@ -18,6 +18,7 @@ Window {
 
     readonly property bool menuOpen: indicatorDrawer.opened
     property int offQuestions: 0  // QGC's "Turn off Advanced Mode?" was asked
+    property int flyViews: 0      // the menu switched to the fly view (task AG)
 
     function openMenu() { indicatorDrawer.open() }
 
@@ -26,7 +27,7 @@ Window {
         id: mainWindow
         function allowViewSwitch() { return true }
         function closeIndicatorDrawer() { indicatorDrawer.close() }
-        function showFlyView() {}
+        function showFlyView() { window.flyViews++ }
         function showPlanView() {}
         function showAnalyzeTool() {}
         function showVehicleConfig() {}

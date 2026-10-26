@@ -4,6 +4,7 @@
 #include <QtCore/QSettings>
 #include <QtCore/QStandardPaths>
 #include <QtNetwork/QNetworkDatagram>
+#include <QtNetwork/QTcpSocket>
 #include <QtNetwork/QUdpSocket>
 #include <QtPositioning/QGeoCoordinate>
 #include <QtQml/QJSEngine>
@@ -64,6 +65,29 @@ constexpr int kLaserWaitMs = 1000;
 constexpr int kZoomQueryAfterCmdMs = 350;  // VGCS _DZM_POLL_AFTER_CMD_S
 constexpr int kZoomHomeExtraSteps = 5;   // "1x" steps out this many more than counted
 constexpr int kZoomOutIntervalMs = 60;
+constexpr int kTcpRetryMs = 2000;        // a TCP camera (C20) that is gone is tried again after this
+constexpr int kTcpConnectMs = 3000;      // and a connection not made by then is given up
+
+// Photos and recording (task AL). Both go to the camera's own SD card. While the camera answers,
+// it is asked whether it records every 2 s (the RC's own button can start it too), and for its
+// SD card every 10 s (every 2 s until it has answered once).
+constexpr int kRecordPollEvery = 10;
+constexpr int kRecordPollAt = 3;           // the first 0.6 s after start
+constexpr int kSdCardPollEvery = 50;
+constexpr int kSdCardPollEveryUnknown = 10;
+constexpr int kSdCardPollAt = 4;
+constexpr int kSdCardSilentAsks = 3;       // asked this often with no answer: the camera does not report it
+constexpr int kSdCardFreshMs = 30000;      // an older answer is forgotten
+constexpr int kSdCardLowMb = 100;          // less free: almost full (a minute of video or less)
+constexpr int kSdCardAskAgainMs = 1000;    // asked again after a photo or a recording: its room changed
+// After a record press: an answer this soon may answer a question asked before the press, so it
+// is not taken. The camera is asked twice, and what it says then is the press's result.
+constexpr int kRecordSettleMs = 500;
+constexpr int kRecordAskAfterMs[] = {700, 1800};
+constexpr int kRecordVerdictMs = 2600;
+constexpr int kRecordFreshMs = 5000;       // an older answer no longer confirms the state on screen
+// The camera echoes a command it takes ("Valid command: echoed back"), the photo's within this.
+constexpr int kPhotoVerdictMs = 1500;
 
 constexpr int kMotionIntervalMs = 100;   // speed refresh, 10 per second (VGCS: 80 ms)
 constexpr int kTouchLeaseMs = 450;       // no setTouchMotion this long = the finger is gone
@@ -256,6 +280,21 @@ std::string withUpperHeader(const std::string &frame)
     return body + top::checksum(body);
 }
 
+/// Two sentences, or the first alone when the second is empty.
+QString joined(const QString &first, const QString &second)
+{
+    return second.isEmpty() ? first : first + QLatin1Char(' ') + second;
+}
+
+/// A size the camera gives in MB, as the screen shows it: "850 MB", "12.5 GB".
+QString sizeText(int mb)
+{
+    if (mb < 1024) {
+        return QStringLiteral("%1 MB").arg(mb);
+    }
+    return QStringLiteral("%1 GB").arg(mb / 1024.0, 0, 'f', 1);
+}
+
 /// The value encodeSpeed2 sends, in 0.5 deg/s units.
 int speedUnits(double degPerSecond)
 {
@@ -319,6 +358,14 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _zoomOutTimer.setInterval(kZoomOutIntervalMs);
     _aimTimer.setInterval(100);
     _lockTimer.setInterval(kLockTickMs);
+    _recordVerdictTimer.setSingleShot(true);
+    _recordVerdictTimer.setInterval(kRecordVerdictMs);
+    _photoVerdictTimer.setSingleShot(true);
+    _photoVerdictTimer.setInterval(kPhotoVerdictMs);
+    _tcpRetryTimer.setSingleShot(true);
+    _tcpRetryTimer.setInterval(kTcpRetryMs);
+    _tcpConnectTimer.setSingleShot(true);
+    _tcpConnectTimer.setInterval(kTcpConnectMs);
     _pictureClock.start();
 
     connect(&_pollTimer, &QTimer::timeout, this, &SkydroidLink::_poll);
@@ -331,6 +378,10 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_zoomOutTimer, &QTimer::timeout, this, &SkydroidLink::_zoomOutTick);
     connect(&_aimTimer, &QTimer::timeout, this, &SkydroidLink::_aimTick);
     connect(&_lockTimer, &QTimer::timeout, this, &SkydroidLink::_lockTick);
+    connect(&_recordVerdictTimer, &QTimer::timeout, this, &SkydroidLink::_recordVerdict);
+    connect(&_photoVerdictTimer, &QTimer::timeout, this, &SkydroidLink::_photoVerdict);
+    connect(&_tcpRetryTimer, &QTimer::timeout, this, &SkydroidLink::_syncTcp);
+    connect(&_tcpConnectTimer, &QTimer::timeout, this, &SkydroidLink::_tcpLost);
 
     MultiVehicleManager *manager = MultiVehicleManager::instance();
     connect(manager, &MultiVehicleManager::activeVehicleChanged, this, &SkydroidLink::_activeVehicleChanged);
@@ -632,6 +683,7 @@ void SkydroidLink::_useCamera(const camera::Profile &profile, bool withAddresses
         // From a camera without a thermal picture: this one's, if it has one.
         _thermalVideoUrl = profile.thermalVideoUrl;
     }
+    _syncTcp();  // another camera can take TOP over the other transport
     _saveSettings();
     emit settingsChanged();
 }
@@ -783,6 +835,8 @@ void SkydroidLink::_applyModel()
         _zoomReport.clear();
         emit zoomChanged();
     }
+    // Nor about its recording and its SD card.
+    _forgetCameraReports();
 }
 
 // --- Addresses -------------------------------------------------------------
@@ -823,6 +877,7 @@ void SkydroidLink::_rebuildEndpoints()
     }
     _sinceAttitude.invalidate();
     _setActive(_configured);
+    _syncTcp();  // a TCP camera at another address: connect there
 }
 
 void SkydroidLink::_setActive(const Endpoint &endpoint)
@@ -868,6 +923,7 @@ bool SkydroidLink::_attitudeFresh() const
 void SkydroidLink::_probe()
 {
     // Only harmless questions go to the other addresses: angle push on, and angles.
+    // A TCP camera gets none of them (_sendTo sends it nothing for another address).
     const std::string gaa = top::buildGaaEnable(kGaaHz, _options);
     const std::string gac = top::buildGacQuery(_options);
     for (const Endpoint &endpoint : _endpoints) {
@@ -913,6 +969,7 @@ void SkydroidLink::_start()
     _pollCount = 0;
     _pollTimer.start();
     _answerTimer.start();
+    _syncTcp();
     _poll();
 }
 
@@ -944,6 +1001,8 @@ void SkydroidLink::_stop()
     _answerTimer.stop();
     _laserShotTimer.stop();
     _laserTimeoutTimer.stop();
+    _tcpRetryTimer.stop();
+    _closeTcp();  // after the stop above: it goes out over TCP too
     if (_socket) {
         _socket->close();
         _socket->deleteLater();
@@ -961,11 +1020,20 @@ void SkydroidLink::_stop()
         _attitudeValid = false;
         emit attitudeChanged();
     }
+    _forgetCameraReports();
 }
 
 void SkydroidLink::_sendTo(const Endpoint &endpoint, const std::string &frame)
 {
     if (!_socket || frame.empty() || endpoint.address.isNull() || endpoint.port == 0) {
+        return;
+    }
+    if (_camera.tcp) {
+        // One connection, to the camera's own address. What would go to other addresses over
+        // UDP (questions to other ports, zoom to more ports, the laser's other addresses) is not sent.
+        if (endpoint == _active && _tcp && _tcp->state() == QAbstractSocket::ConnectedState) {
+            _tcp->write(frame.data(), static_cast<qint64>(frame.size()));
+        }
         return;
     }
     _socket->writeDatagram(frame.data(), static_cast<qint64>(frame.size()), endpoint.address, endpoint.port);
@@ -992,6 +1060,84 @@ void SkydroidLink::_readPending()
         if (frame) {
             const quint16 port = datagram.senderPort() > 0 ? static_cast<quint16>(datagram.senderPort()) : 0;
             _handleFrame(*frame, _knownEndpointFor(datagram.senderAddress(), port));
+        }
+    }
+}
+
+void SkydroidLink::_syncTcp()
+{
+    // While the link runs and the camera takes TOP over TCP: one connection to its address.
+    if (!_socket || !_camera.tcp) {
+        _tcpRetryTimer.stop();
+        _closeTcp();
+        return;
+    }
+    if (_tcp && _tcpHost == _host && _tcpPort == _port) {
+        return;  // connected there, or on the way
+    }
+    _closeTcp();
+    _openTcp();
+}
+
+void SkydroidLink::_openTcp()
+{
+    _tcp = new QTcpSocket(this);
+    _tcpHost = _host;
+    _tcpPort = _port;
+    _tcpRx.clear();
+    connect(_tcp, &QTcpSocket::connected, this, [this]() {
+        _tcpConnectTimer.stop();
+        // Small frames go out at once. Set here: Qt 6.11 drops an option set before
+        // the connection exists (measured 2026-10-26), so a jog could wait for the camera's ACK.
+        _tcp->setSocketOption(QAbstractSocket::LowDelayOption, 1);
+        // A new connection: angle push on, and the angles, at once (as a new UDP link does).
+        _send(top::buildGaaEnable(kGaaHz, _options));
+        _send(top::buildGacQuery(_options));
+    });
+    connect(_tcp, &QTcpSocket::readyRead, this, &SkydroidLink::_readTcp);
+    connect(_tcp, &QTcpSocket::disconnected, this, &SkydroidLink::_tcpLost);
+    connect(_tcp, &QTcpSocket::errorOccurred, this, &SkydroidLink::_tcpLost);
+    // A camera that is not there may not refuse at all: the system would try for a long time.
+    // Started first, so an error at once (which closes the socket and stops it) leaves none running.
+    _tcpConnectTimer.start();
+    _tcp->connectToHost(_host, static_cast<quint16>(_port));
+}
+
+void SkydroidLink::_closeTcp()
+{
+    if (!_tcp) {
+        return;
+    }
+    QTcpSocket *tcp = _tcp;
+    _tcp = nullptr;
+    _tcpConnectTimer.stop();
+    tcp->disconnect(this);  // a close asked for is not a lost camera
+    tcp->flush();           // a stop just written still goes out
+    tcp->abort();
+    tcp->deleteLater();
+    _tcpRx.clear();
+}
+
+void SkydroidLink::_tcpLost()
+{
+    // The camera went away, or did not take the connection: again in a moment, while the link runs.
+    _closeTcp();
+    if (_socket && _camera.tcp) {
+        _tcpRetryTimer.start();
+    }
+}
+
+void SkydroidLink::_readTcp()
+{
+    if (!_tcp) {
+        return;
+    }
+    const QByteArray data = _tcp->readAll();
+    _tcpRx.append(data.constData(), static_cast<size_t>(data.size()));
+    // A stream: half a frame or several can come in one read.
+    for (const std::string &raw : top::takeFrames(_tcpRx)) {
+        if (const auto frame = top::parseTpFrame(raw, _options)) {
+            _handleFrame(*frame, _active);
         }
     }
 }
@@ -1050,6 +1196,23 @@ void SkydroidLink::_handleFrame(const top::DecodedFrame &frame, const Endpoint &
         if (changed) {
             emit zoomChanged();
         }
+    } else if (frame.tag == "REC" && frame.ctrl == 'r' && frame.recording) {
+        _recordAnswered(*frame.recording);
+    } else if (frame.tag == "CAP" && frame.ctrl == 'w' && _photoWaiting) {
+        // The camera echoes a command it takes.
+        _photoWaiting = false;
+        _photoVerdictTimer.stop();
+        const QString problem = _sdCardProblem();
+        if (_sdCard && _sdCard->totalMb == 0 && _sdCard->freeMb == 0) {
+            emit cameraNote(tr("The camera has no SD card. The photo is not saved."), true);
+        } else if (!problem.isEmpty()) {
+            emit cameraNote(joined(tr("Photo taken."), problem), true);
+        } else {
+            emit cameraNote(tr("Photo taken. It is saved on the camera's SD card."), false);
+        }
+        QTimer::singleShot(kSdCardAskAgainMs, this, &SkydroidLink::_askSdCard);
+    } else if (frame.tag == "SDC" && frame.ctrl == 'r' && frame.sdCard) {
+        _sdCardAnswered(*frame.sdCard);
     }
 }
 
@@ -1064,6 +1227,14 @@ void SkydroidLink::_poll()
     _send(top::buildGacQuery(_options));
     if (_isZoomStepCamera() && (_pollCount % kZoomPollEvery) == 1) {
         _send(top::buildDzmQuery(_options));
+    }
+    // Photos and recording go to the camera's SD card: whether it records, and the card's room.
+    if (_answering && _camera.record && (_pollCount % kRecordPollEvery) == kRecordPollAt) {
+        _send(top::buildRecordQuery(_options));
+    }
+    if (_answering && (_camera.photo || _camera.record) &&
+        (_pollCount % (_sdCard ? kSdCardPollEvery : kSdCardPollEveryUnknown)) == kSdCardPollAt) {
+        _askSdCard();
     }
     if (!fresh && _pollCount >= kProbeFirstPoll && ((_pollCount - kProbeFirstPoll) % kProbeEveryPolls) == 0) {
         _probe();
@@ -1082,6 +1253,15 @@ void SkydroidLink::_checkAnswering()
         // Old angles must never be used to place a target.
         _attitudeValid = false;
         emit attitudeChanged();
+    }
+    // Old answers about the recording and the SD card no longer say how things are.
+    if (_recordReported && _recordReportAt.elapsed() >= kRecordFreshMs) {
+        _recordReported.reset();
+        _setRecording(_recording);
+    }
+    if (_sdCard && _sdCardAt.elapsed() >= kSdCardFreshMs) {
+        _sdCard.reset();
+        emit sdCardChanged();
     }
 }
 
@@ -2784,20 +2964,183 @@ void SkydroidLink::_finishWheelDetect()
 
 void SkydroidLink::takePhoto()
 {
-    if (!_camera.photo) {
+    if (!_camera.photo || !_socket) {
         return;
     }
     _send(top::buildPhoto(_options));
+    _photoWaiting = true;
+    _photoVerdictTimer.start();
+}
+
+void SkydroidLink::_photoVerdict()
+{
+    if (!_photoWaiting) {
+        return;
+    }
+    _photoWaiting = false;
+    emit cameraNote(joined(tr("The camera did not answer the photo command."), _sdCardProblem()), true);
 }
 
 void SkydroidLink::toggleRecord()
 {
-    if (!_camera.record) {
+    // Start or stop, by what the screen shows. (Until test build 13 every press sent REC 01, so
+    // the second press never stopped the camera.)
+    setRecord(!_recording);
+}
+
+void SkydroidLink::setRecord(bool start)
+{
+    if (!_camera.record || !_socket) {
         return;
     }
-    _send(top::buildRecord(_options));
-    _recording = !_recording;
+    _send(top::buildRecord(start, _options));
+    if (start == _recording) {
+        return;  // nothing changes on the screen: the frame makes sure, no note
+    }
+    _recordWanted = start;
+    _recordChecking = true;
+    _recordPressAt.start();
+    _recordVerdictTimer.start();
+    const quint64 press = ++_recordPresses;
+    for (const int ms : kRecordAskAfterMs) {
+        QTimer::singleShot(ms, this, [this, press]() {
+            if (press == _recordPresses && _recordChecking) {
+                _send(top::buildRecordQuery(_options));
+            }
+        });
+    }
+    _setRecording(start);
+}
+
+void SkydroidLink::_recordAnswered(bool on)
+{
+    if (_recordChecking && _recordPressAt.elapsed() < kRecordSettleMs) {
+        return;  // it may answer a question asked before the press
+    }
+    _recordReported = on;
+    _recordReportAt.start();
+    if (!_recordChecking) {
+        _setRecording(on);  // as the camera says: the RC's own button can start it too
+        return;
+    }
+    if (on != _recordWanted) {
+        _setRecording(_recording);  // the camera may still be starting: the verdict decides
+        return;
+    }
+    _recordChecking = false;
+    _recordVerdictTimer.stop();
+    _setRecording(on);
+    if (on) {
+        const QString problem = _sdCardProblem();
+        emit cameraNote(joined(tr("Recording on the camera's SD card."), problem), !problem.isEmpty());
+    } else {
+        emit cameraNote(tr("Recording stopped. The video is on the camera's SD card."), false);
+        QTimer::singleShot(kSdCardAskAgainMs, this, &SkydroidLink::_askSdCard);
+    }
+}
+
+void SkydroidLink::_recordVerdict()
+{
+    if (!_recordChecking) {
+        return;
+    }
+    _recordChecking = false;
+    // Only an answer after the press counts (one right after it was not taken).
+    const bool answered = _recordReported && _recordReportAt.isValid() && _recordReportAt.elapsed() < _recordPressAt.elapsed();
+    if (!answered) {
+        emit cameraNote(_recordWanted ? joined(tr("The camera was told to record. It does not say whether it does."), _sdCardProblem())
+                                      : tr("The camera was told to stop recording. It does not say whether it did."),
+                        true);
+        return;
+    }
+    // It said the other thing: an answer that matched would have ended the check.
+    _setRecording(*_recordReported);
+    emit cameraNote(_recordWanted ? joined(tr("Recording did not start."), _sdCardProblem())
+                                  : tr("Recording did not stop. Press the button again."),
+                    true);
+}
+
+void SkydroidLink::_setRecording(bool on)
+{
+    const bool confirmed = _recordReported && *_recordReported == on;
+    if (on == _recording && confirmed == _recordConfirmed) {
+        return;
+    }
+    _recording = on;
+    _recordConfirmed = confirmed;
     emit recordingChanged();
+}
+
+void SkydroidLink::_askSdCard()
+{
+    _send(top::buildSdCardQuery(_options));
+    // A camera that never answers: the camera settings say so.
+    if (!_sdCard && ++_sdCardAsked == kSdCardSilentAsks) {
+        emit sdCardChanged();
+    }
+}
+
+void SkydroidLink::_sdCardAnswered(const top::SdCard &card)
+{
+    const bool changed = !_sdCard || _sdCard->freeMb != card.freeMb || _sdCard->totalMb != card.totalMb;
+    _sdCard = card;
+    _sdCardAt.start();
+    _sdCardAsked = 0;
+    if (changed) {
+        emit sdCardChanged();
+    }
+}
+
+QString SkydroidLink::_sdCardProblem() const
+{
+    if (!_sdCard) {
+        return QString();
+    }
+    if (_sdCard->totalMb == 0 && _sdCard->freeMb == 0) {
+        return tr("The camera has no SD card.");
+    }
+    if (_sdCard->freeMb < kSdCardLowMb) {
+        return tr("The camera's SD card is almost full: %1 free.").arg(sizeText(_sdCard->freeMb));
+    }
+    return QString();
+}
+
+QString SkydroidLink::sdCardWarning() const
+{
+    if (!_sdCard) {
+        return QString();
+    }
+    if (_sdCard->totalMb == 0 && _sdCard->freeMb == 0) {
+        return tr("No SD card");
+    }
+    return _sdCard->freeMb < kSdCardLowMb ? tr("SD card almost full") : QString();
+}
+
+QString SkydroidLink::sdCardText() const
+{
+    if (!_sdCard) {
+        return _sdCardAsked >= kSdCardSilentAsks ? tr("The camera does not say how much room its SD card has.") : QString();
+    }
+    if (_sdCard->totalMb == 0 && _sdCard->freeMb == 0) {
+        return tr("The camera says it has no SD card.");
+    }
+    return tr("The camera's SD card has %1 free of %2.").arg(sizeText(_sdCard->freeMb), sizeText(_sdCard->totalMb));
+}
+
+void SkydroidLink::_forgetCameraReports()
+{
+    _recordChecking = false;
+    _recordVerdictTimer.stop();
+    _photoWaiting = false;
+    _photoVerdictTimer.stop();
+    _recordReported.reset();
+    _setRecording(_recording);  // no longer confirmed
+    const bool sdShown = _sdCard.has_value() || _sdCardAsked >= kSdCardSilentAsks;
+    _sdCard.reset();
+    _sdCardAsked = 0;
+    if (sdShown) {
+        emit sdCardChanged();
+    }
 }
 
 void SkydroidLink::zoom(int direction)

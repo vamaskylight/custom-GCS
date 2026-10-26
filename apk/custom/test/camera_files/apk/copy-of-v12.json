@@ -25,6 +25,7 @@
     "thermalFovSure": false,
     "thermalFovV": 27.7,
     "thermalVideoUrl": "rtsp://192.168.144.108:555/stream=2",
+    "transport": "udp",
     "upperGimbalHeader": false,
     "yawLimit": 90,
     "zoom": "counted"

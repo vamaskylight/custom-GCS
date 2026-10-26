@@ -1192,6 +1192,9 @@ class MainWindowPlanMissionMixin:
         if a == "fence_upload_polygon":
             self._upload_polygon_fence_from_plan_panel()
             return
+        if a == "fence_upload_nofly":
+            self._upload_nofly_from_plan_panel()
+            return
         # Areas to stay out of (2026-10-21).
         nofly = {
             "nofly_draw_on": "start_nofly_area",
