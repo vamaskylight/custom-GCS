@@ -33,6 +33,7 @@
 #include <QtTest/QSignalSpy>
 #include <QtTest/QtTest>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -377,6 +378,217 @@ private:
     QTcpServer _server;
     QTcpSocket *_conn = nullptr;
     std::string _rx;
+};
+
+/// A Viewpro camera (task AK) on 127.0.0.1. The app's frames come over TCP, a serial frame in a TCP
+/// envelope each. It answers every heartbeat with its status, as the real one does, and keeps what it
+/// was told. Its angles, zoom, view and recording are the test's to set.
+class FakeViewproCamera : public QObject
+{
+    Q_OBJECT
+
+public:
+    struct Command
+    {
+        int servo = 0;  // the A1 gimbal mode
+        long long p1 = 0;
+        long long p2 = 0;
+        int op = 0;     // the C1 optics operation
+        int sensor = 0;
+    };
+
+    FakeViewproCamera()
+    {
+        _server.listen(QHostAddress::LocalHost, 0);
+        connect(&_server, &QTcpServer::newConnection, this, [this]() {
+            while (QTcpSocket *socket = _server.nextPendingConnection()) {
+                ++accepts;
+                if (_conn) {
+                    _conn->disconnect(this);
+                    _conn->abort();
+                    _conn->deleteLater();
+                }
+                _conn = socket;
+                _rx.clear();
+                connect(socket, &QTcpSocket::readyRead, this, &FakeViewproCamera::_read);
+                connect(socket, &QTcpSocket::disconnected, this, [this, socket]() {
+                    if (socket == _conn) {
+                        ++closedByLink;
+                    }
+                });
+            }
+        });
+    }
+
+    quint16 port() const { return _server.serverPort(); }
+    bool connected() const { return _conn && _conn->state() == QAbstractSocket::ConnectedState; }
+    int countServo(int servo) const
+    {
+        return static_cast<int>(std::count_if(commands.begin(), commands.end(), [servo](const Command &c) { return c.servo == servo; }));
+    }
+    int countOp(int op) const
+    {
+        return static_cast<int>(std::count_if(commands.begin(), commands.end(), [op](const Command &c) { return c.op == op; }));
+    }
+
+    int accepts = 0;
+    int closedByLink = 0;
+    int heartbeats = 0;
+    int strayBytes = 0;  // bytes that start no Viewpro frame (a TOP frame would land here)
+    double yaw = 12.0;
+    double pitch = -20.0;
+    double zoomX = 1.0;
+    double hfov = 70.2;
+    double vfov = 43.1;
+    bool recording = false;
+    QList<Command> commands;
+
+private:
+    static void putU16(viewpro::Bytes &out, size_t at, long long value)
+    {
+        const unsigned u = static_cast<unsigned>(value) & 0xFFFF;
+        out[at] = static_cast<std::uint8_t>(u >> 8);
+        out[at + 1] = static_cast<std::uint8_t>(u & 0xFF);
+    }
+    static long long i16(const viewpro::Bytes &in, size_t at)
+    {
+        const int u = (in[at] << 8) | in[at + 1];
+        return u >= 0x8000 ? u - 0x10000 : u;
+    }
+
+    QByteArray _status() const
+    {
+        // T1 (22) and F1 (1) empty, B1 (6) at 23: mode 1 (speed), roll 0, yaw and pitch; D1 (12) at 29.
+        viewpro::Bytes body(41, 0);
+        const int rollRaw = 2048;  // 0 degrees
+        body[23] = static_cast<std::uint8_t>((0x1 << 4) | ((rollRaw >> 8) & 0x0F));
+        body[24] = static_cast<std::uint8_t>(rollRaw & 0xFF);
+        putU16(body, 25, std::lround(yaw * 65536.0 / 360.0));
+        putU16(body, 27, std::lround(pitch * 65536.0 / 360.0));
+        putU16(body, 31, recording ? 1 : 0);
+        putU16(body, 35, std::lround(vfov * 100.0));
+        putU16(body, 37, std::lround(hfov * 100.0));
+        putU16(body, 39, std::lround(zoomX * 10.0));
+        const viewpro::Bytes frame = viewpro::wrapTcp(viewpro::buildSerialFrame(viewpro::kCmdStatus, body));
+        return QByteArray(reinterpret_cast<const char *>(frame.data()), static_cast<int>(frame.size()));
+    }
+
+    void _read()
+    {
+        if (!_conn) {
+            return;
+        }
+        const QByteArray data = _conn->readAll();
+        _rx.insert(_rx.end(), data.begin(), data.end());
+        while (_rx.size() >= 4) {
+            if (_rx[0] != 0xEB || _rx[1] != 0x90) {
+                ++strayBytes;
+                _rx.erase(_rx.begin());
+                continue;
+            }
+            const size_t size = static_cast<size_t>(_rx[2]) + 4;
+            if (_rx.size() < size) {
+                break;
+            }
+            const viewpro::Bytes packet(_rx.begin(), _rx.begin() + static_cast<std::ptrdiff_t>(size));
+            _rx.erase(_rx.begin(), _rx.begin() + static_cast<std::ptrdiff_t>(size));
+            const std::optional<viewpro::Bytes> inner = viewpro::unwrapTcp(packet);
+            const auto frame = inner ? viewpro::parseSerialFrame(*inner) : std::nullopt;
+            if (!frame) {
+                strayBytes += static_cast<int>(size);
+            } else if (frame->first == viewpro::kCmdHeartbeat) {
+                ++heartbeats;
+                _conn->write(_status());
+            } else if (frame->first == viewpro::kCmdA1C1E1 && frame->second.size() >= 11) {
+                const viewpro::Bytes &d = frame->second;
+                const unsigned c1 = (static_cast<unsigned>(d[9]) << 8) | d[10];
+                commands.append(Command{d[0], i16(d, 1), i16(d, 3), static_cast<int>((c1 >> 6) & 0x7F),
+                                        static_cast<int>(c1 & 0x7)});
+            }
+        }
+    }
+
+    QTcpServer _server;
+    QTcpSocket *_conn = nullptr;
+    std::vector<std::uint8_t> _rx;
+};
+
+bool hasCommand(const FakeViewproCamera &camera, int servo, long long p1, long long p2)
+{
+    return std::any_of(camera.commands.begin(), camera.commands.end(), [&](const FakeViewproCamera::Command &c) {
+        return c.servo == servo && c.p1 == p1 && c.p2 == p2;
+    });
+}
+
+/// A SIYI camera (task AK) on 127.0.0.1, by UDP. It answers the attitude question (0x0D) with its
+/// angles and keeps every other request.
+class FakeSiyiCamera : public QObject
+{
+    Q_OBJECT
+
+public:
+    struct Request
+    {
+        std::uint8_t cmd = 0;
+        siyi::Bytes data;
+    };
+
+    FakeSiyiCamera()
+    {
+        _socket.bind(QHostAddress::LocalHost, 0);
+        connect(&_socket, &QUdpSocket::readyRead, this, &FakeSiyiCamera::_read);
+    }
+
+    quint16 port() const { return _socket.localPort(); }
+    int count(std::uint8_t cmd, std::optional<std::uint8_t> firstByte = std::nullopt) const
+    {
+        return static_cast<int>(std::count_if(requests.begin(), requests.end(), [&](const Request &r) {
+            return r.cmd == cmd && (!firstByte || (!r.data.empty() && r.data[0] == *firstByte));
+        }));
+    }
+
+    bool answer = true;  // answer the attitude question
+    quint16 linkPort = 0;  // where the link sends from
+    int attitudeQuestions = 0;
+    int notSiyi = 0;  // datagrams that were no SIYI frame (a TOP frame would land here)
+    double yaw = -5.0;
+    double pitch = -45.0;
+    QList<Request> requests;
+
+private:
+    void _read()
+    {
+        while (_socket.hasPendingDatagrams()) {
+            const QNetworkDatagram datagram = _socket.receiveDatagram();
+            const QByteArray raw = datagram.data();
+            linkPort = static_cast<quint16>(datagram.senderPort());
+            const auto frame = siyi::parseFrame(siyi::Bytes(raw.begin(), raw.end()));
+            if (!frame) {
+                ++notSiyi;
+                continue;
+            }
+            if (frame->cmdId != siyi::kCmdGimbalAttitude) {
+                requests.append(Request{frame->cmdId, frame->data});
+                continue;
+            }
+            ++attitudeQuestions;
+            if (!answer) {
+                continue;
+            }
+            // Yaw, pitch, roll and their speeds: int16 of 0.1 degrees, little-endian.
+            siyi::Bytes data;
+            for (double v : {yaw, pitch, 0.0, 0.0, 0.0, 0.0}) {
+                const int r = static_cast<int>(std::lround(v * 10.0));
+                data.push_back(static_cast<std::uint8_t>(r & 0xFF));
+                data.push_back(static_cast<std::uint8_t>((r >> 8) & 0xFF));
+            }
+            const siyi::Bytes reply = siyi::buildRequest(siyi::kCmdGimbalAttitude, data, frame->seq);
+            _socket.writeDatagram(reinterpret_cast<const char *>(reply.data()), static_cast<qint64>(reply.size()),
+                                  datagram.senderAddress(), static_cast<quint16>(datagram.senderPort()));
+        }
+    }
+
+    QUdpSocket _socket;
 };
 
 /// A stand-in for the drone of Follow Me: the test says what its telemetry is, and sees what it is sent.
@@ -726,6 +938,347 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGacQuery()) >= 1, 2000);
         QTest::qWait(2500);
         QCOMPARE(c20.accepts, 1);
+    }
+
+    // --- Viewpro and SIYI cameras (task AK) ------------------------------------
+
+    void viewproTalksOverTcp()
+    {
+        FakeViewproCamera viewpro;
+        viewpro.yaw = 33.0;
+        viewpro.pitch = -12.5;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && std::abs(_link->gimbalYaw() - 33.0) < 0.01, 3000);
+        QVERIFY(std::abs(_link->gimbalPitch() + 12.5) < 0.01);
+        QVERIFY(_link->answering());
+        QCOMPARE(viewpro.accepts, 1);
+        // Its status twice a second, as VGCS asks for it.
+        const int beats = viewpro.heartbeats;
+        QTest::qWait(1100);
+        QVERIFY2(viewpro.heartbeats - beats >= 2 && viewpro.heartbeats - beats <= 3, qPrintable(QString::number(viewpro.heartbeats - beats)));
+        // No TOP frame reaches it, nor the UDP camera of init().
+        QCOMPARE(viewpro.strayBytes, 0);
+        _camera->clear();
+        QTest::qWait(600);
+        QCOMPARE(_camera->received.size(), 0);
+    }
+
+    void viewproJogsAndHoldsWhereItCameToRest()
+    {
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        viewpro.commands.clear();
+        _link->setTouchMotion(1.0, 0.0);  // to the right: yaw positive, as VGCS sends it
+        QTRY_VERIFY_WITH_TIMEOUT(viewpro.countServo(viewpro::kServoManualSpeed) >= 1, 2000);
+        QVERIFY(viewpro.commands.first().p1 > 0 && viewpro.commands.first().p2 == 0);
+        _link->stopTouchMotion();
+        // Speed 0, then a moment later the hold: speed 0 alone leaves it in a mode that drifts.
+        QTRY_VERIFY_WITH_TIMEOUT(hasCommand(viewpro, viewpro::kServoManualSpeed, 0, 0), 2000);
+        QTRY_VERIFY_WITH_TIMEOUT(viewpro.countServo(viewpro::kServoManualRelativeAngle) >= 1, 2000);
+        // Up is pitch positive on its speed command (VGCS's field test).
+        viewpro.commands.clear();
+        _link->ptz("up");
+        QTRY_VERIFY_WITH_TIMEOUT(!viewpro.commands.isEmpty(), 2000);
+        QCOMPARE(viewpro.commands.first().servo, int(viewpro::kServoManualSpeed));
+        QVERIFY(viewpro.commands.first().p2 > 0 && viewpro.commands.first().p1 == 0);
+    }
+
+    void viewproZoomsByClicksAndSaysItsZoom()
+    {
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 3000);
+        viewpro.commands.clear();
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.countOp(viewpro::kOpZoomIn), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.countOp(viewpro::kOpStop), 1, 1000);  // the click's stop, a moment later
+        // Its zoom and view as it says them.
+        viewpro.zoomX = 2.5;
+        viewpro.hfov = 30.0;
+        viewpro.vfov = 17.5;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("2.5x"), 2000);
+        double h = 0.0;
+        double v = 0.0;
+        QVERIFY(_link->pictureFov(h, v));
+        QCOMPARE(h, 30.0);
+        QCOMPARE(v, 17.5);
+        // Back to 1x: it zooms out until it says 1x, then stops.
+        viewpro.commands.clear();
+        _link->zoomHome();
+        QTRY_VERIFY_WITH_TIMEOUT(viewpro.countOp(viewpro::kOpZoomOut) >= 2, 1000);
+        viewpro.zoomX = 1.0;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.commands.last().op, int(viewpro::kOpStop), 1000);
+        const int outs = viewpro.countOp(viewpro::kOpZoomOut);
+        QTest::qWait(500);
+        QCOMPARE(viewpro.countOp(viewpro::kOpZoomOut), outs);
+    }
+
+    void viewproPhotoAndRecordingAsTheCameraSays()
+    {
+        FakeViewproCamera viewpro;
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->recordingConfirmed(), 3000);  // "not recording", as its status says
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.countOp(viewpro::kOpTakePicture), 1, 1000);
+        QCOMPARE(notes.size(), 1);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("The camera was told to take a photo. It saves it on its own SD card."));
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.countOp(viewpro::kOpStartRecord), 1, 1000);
+        viewpro.recording = true;
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 3000);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("Recording on the camera's SD card."));
+        QVERIFY(_link->recording() && _link->recordingConfirmed());
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.countOp(viewpro::kOpStopRecord), 1, 1000);
+        viewpro.recording = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->recording() && _link->recordingConfirmed(), 3000);
+        // Started on the camera itself: the screen follows its status.
+        viewpro.recording = true;
+        QTRY_VERIFY_WITH_TIMEOUT(_link->recording() && _link->recordingConfirmed(), 3000);
+        // The link asks a TOP camera after a press whether it records: never this one.
+        QCOMPARE(viewpro.strayBytes, 0);
+    }
+
+    void viewproCentresAndLooksDownWithItsOwnCommands()
+    {
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        viewpro.commands.clear();
+        _link->center();
+        _link->pointDown();
+        _link->centerYaw();
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.commands.size(), 3, 2000);
+        QCOMPARE(viewpro.commands.at(0).servo, int(viewpro::kServoHomePosition));
+        QCOMPARE(viewpro.commands.at(1).servo, int(viewpro::kServoLookDown));
+        // Left and right to the middle in one frame with the tilt where it is (-20).
+        QCOMPARE(viewpro.commands.at(2).servo, int(viewpro::kServoManualAbsoluteAngle));
+        QCOMPARE(viewpro.commands.at(2).p1, 0LL);
+        QVERIFY(viewpro.commands.at(2).p2 < 0);
+    }
+
+    void viewproYawCountsToTheRight()
+    {
+        // As VGCS takes a Viewpro's yaw (positive right): a point under the cross with the camera
+        // 30 degrees right of the nose is 30 degrees right of north.
+        FakeViewproCamera viewpro;
+        viewpro.yaw = 30.0;
+        viewpro.pitch = -30.0;
+        _link->setPointMode("picture");
+        _vehicle.vehicle.set("altitudeRelative", 100.0);
+        _vehicle.vehicle.set("altitudeAMSL", 350.0);
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && std::abs(_link->gimbalYaw() - 30.0) < 0.01, 3000);
+        _link->aimAndMeasure(0.5, 0.5);
+        QVERIFY2(_link->targetValid(), qPrintable(_link->laserMessage()));
+        QVERIFY2(std::abs(_link->targetBearingDeg() - 30.0) < 0.1, qPrintable(QString::number(_link->targetBearingDeg())));
+    }
+
+    void viewproSwitchesItsThermalPictureInItsOneVideo()
+    {
+        FakeViewproCamera viewpro;
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->setThermalPicture(true);  // as the screen says while a C13 shows its thermal stream
+        _link->setModel("A20KTR");
+        QVERIFY(!_link->thermalPicture());  // a camera that switches starts on its day picture
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        QVERIFY(_link->camera().value("thermal").toBool() && _link->camera().value("thermalBySwitch").toBool());
+        viewpro.commands.clear();
+        _link->switchThermal(true);
+        QTRY_VERIFY_WITH_TIMEOUT(!viewpro.commands.isEmpty(), 1000);
+        QCOMPARE(viewpro.commands.first().sensor, int(viewpro::kSensorIr));
+        QVERIFY(_link->thermalPicture());
+        QCOMPARE(notes.size(), 1);
+        QVERIFY2(notes.at(0).at(0).toString().contains("thermal picture"), qPrintable(notes.at(0).at(0).toString()));
+        // Its thermal lens is not known: a point on that picture is placed at the cross only.
+        double h = 0.0;
+        double v = 0.0;
+        QVERIFY(!_link->pictureFov(h, v));
+        _link->switchThermal(false);
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.commands.size(), 2, 1000);
+        QCOMPARE(viewpro.commands.at(1).sensor, int(viewpro::kSensorEo1));
+        QVERIFY(!_link->thermalPicture());
+        // A camera with a thermal address of its own: the screen switches the address, not the link.
+        _link->setModel("C13");
+        _link->switchThermal(true);
+        QVERIFY(!_link->thermalPicture());
+    }
+
+    void viewproWheelsTurnBothAxesInOneFrame()
+    {
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        _link->setWheelHoldsPosition(true);
+        _link->setWheelPitchChannel(9);
+        _link->setWheelYawChannel(10);
+        _vehicle.sendRc(_rc(9, 1500));
+        QTest::qWait(200);
+        viewpro.commands.clear();
+        // Both wheels turned in one message: one frame with both angles (two would undo each other).
+        QVector<int> rc = _rc(9, 1000);
+        rc[10 - 1] = 2000;
+        _vehicle.sendRc(rc);
+        QTRY_VERIFY_WITH_TIMEOUT(hasCommand(viewpro, viewpro::kServoManualAbsoluteAngle, 16384, -16384), 2000);  // +90, -90
+        QCOMPARE(viewpro.countServo(viewpro::kServoManualAbsoluteAngle), 1);
+    }
+
+    void siyiTakesAnglesOnlyFromItsOwnAddress()
+    {
+        FakeSiyiCamera siyi;
+        siyi.yaw = 10.0;
+        _link->setModel("ZR10");
+        _link->setPort(siyi.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && std::abs(_link->gimbalYaw() - 10.0) < 0.01, 3000);
+        QUdpSocket other;
+        if (!other.bind(QHostAddress(QStringLiteral("127.0.0.2")), 0)) {
+            QSKIP("127.0.0.2 cannot be bound on this PC");
+        }
+        siyi.answer = false;  // only the other address says angles now
+        siyi::Bytes data;
+        for (double v : {99.0, -10.0, 0.0}) {
+            const int r = static_cast<int>(std::lround(v * 10.0));
+            data.push_back(static_cast<std::uint8_t>(r & 0xFF));
+            data.push_back(static_cast<std::uint8_t>((r >> 8) & 0xFF));
+        }
+        const siyi::Bytes frame = siyi::buildRequest(siyi::kCmdGimbalAttitude, data, 0);
+        for (int i = 0; i < 5; ++i) {
+            other.writeDatagram(reinterpret_cast<const char *>(frame.data()), static_cast<qint64>(frame.size()),
+                                QHostAddress::LocalHost, siyi.linkPort);
+            QTest::qWait(100);
+        }
+        QVERIFY2(std::abs(_link->gimbalYaw() - 10.0) < 0.01, qPrintable(QString::number(_link->gimbalYaw())));
+    }
+
+    void aTopCameraAfterTheViewproClosesItsLink()
+    {
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(viewpro.connected(), 3000);
+        _link->setModel("C13");
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.closedByLink, 1, 2000);
+        _link->setPort(_camera->port());
+        _camera->clear();
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGacQuery()) >= 1, 2000);
+        QTest::qWait(2500);
+        QCOMPARE(viewpro.accepts, 1);
+    }
+
+    void siyiTalksOverUdp()
+    {
+        FakeSiyiCamera siyi;
+        siyi.yaw = -7.5;
+        siyi.pitch = -40.0;
+        _link->setModel("ZR10");
+        _link->setPort(siyi.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && std::abs(_link->gimbalYaw() + 7.5) < 0.01, 3000);
+        QCOMPARE(_link->gimbalPitch(), -40.0);
+        QVERIFY(_link->answering());
+        QCOMPARE(siyi.notSiyi, 0);  // no TOP frame
+        const int asked = siyi.attitudeQuestions;
+        QTest::qWait(1100);
+        QVERIFY2(siyi.attitudeQuestions - asked >= 2 && siyi.attitudeQuestions - asked <= 3,
+                 qPrintable(QString::number(siyi.attitudeQuestions - asked)));
+        _camera->clear();
+        QTest::qWait(600);
+        QCOMPARE(_camera->received.size(), 0);
+    }
+
+    void siyiJogsZoomsAndTakesPhotos()
+    {
+        FakeSiyiCamera siyi;
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->setModel("ZR10");
+        _link->setPort(siyi.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        _link->setTouchMotion(0.0, 1.0);  // up
+        QTRY_VERIFY_WITH_TIMEOUT(siyi.count(siyi::kCmdGimbalRotation) >= 1, 2000);
+        QVERIFY(siyi.requests.first().data == siyi::Bytes({0, 100}));  // pitch positive, at its top speed
+        _link->stopTouchMotion();
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(siyi.requests.begin(), siyi.requests.end(), [](const FakeSiyiCamera::Request &r) {
+                                     return r.cmd == siyi::kCmdGimbalRotation && r.data == siyi::Bytes({0, 0});
+                                 }), 2000);
+        // A zoom click: in, then its stop a moment later. How far it went, it does not say.
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(siyi.count(siyi::kCmdManualZoom, 1), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(siyi.count(siyi::kCmdManualZoom, 0), 1, 1000);
+        QCOMPARE(_link->zoomLabel(), QString());
+        // Photo, and recording: a toggle, and it does not say whether it records.
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(siyi.count(siyi::kCmdPhotoRecord, siyi::kTakePhoto), 1, 1000);
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(siyi.count(siyi::kCmdPhotoRecord, siyi::kRecordToggle), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 4000);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("The camera was told to record. It does not say whether it does."));
+        _link->setRecord(true);  // what the screen shows already: nothing is toggled
+        QTest::qWait(300);
+        QCOMPARE(siyi.count(siyi::kCmdPhotoRecord, siyi::kRecordToggle), 1);
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(siyi.count(siyi::kCmdPhotoRecord, siyi::kRecordToggle), 2, 1000);
+        // The link asks a TOP camera after a press whether it records: never this one.
+        QTest::qWait(2000);
+        QCOMPARE(siyi.notSiyi, 0);
+    }
+
+    void siyiPicturePointWaitsForBackTo1x()
+    {
+        FakeSiyiCamera siyi;
+        siyi.yaw = 0.0;
+        siyi.pitch = -30.0;
+        _link->setPointMode("picture");
+        _vehicle.vehicle.set("altitudeRelative", 100.0);
+        _vehicle.vehicle.set("altitudeAMSL", 350.0);
+        _link->setModel("ZR10");
+        _link->setPort(siyi.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && _link->gimbalPitch() == -30.0, 3000);
+        // Its zoom is not known yet: the cross only.
+        _link->aimAndMeasure(0.7, 0.6);
+        QVERIFY(!_link->targetValid());
+        QVERIFY2(_link->laserMessage().contains("does not say how far it zoomed"), qPrintable(_link->laserMessage()));
+        _link->aimAndMeasure(0.5, 0.5);
+        QVERIFY2(_link->targetValid(), qPrintable(_link->laserMessage()));
+        // Back to 1x: it zooms out for a while, then its view is known.
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 10000);
+        QVERIFY(siyi.count(siyi::kCmdManualZoom, 0xFF) >= 10);
+        _link->aimAndMeasure(0.7, 0.6);
+        QVERIFY2(_link->targetValid(), qPrintable(_link->laserMessage()));
+        // Zoomed in: not known again.
+        _link->zoom(1);
+        QCOMPARE(_link->zoomLabel(), QString());
+        _link->aimAndMeasure(0.7, 0.6);
+        QVERIFY(!_link->targetValid());
+    }
+
+    void aViewproOrSiyiGetsNoTopFrameAndNoProbe()
+    {
+        // The probe targets and the C13's extra zoom ports are for UDP TOP cameras, and a camera
+        // that does not answer is when the probe would go out.
+        FakeCamera other;
+        SkydroidLink::setProbeTargets({"127.0.0.1"}, {other.port()});
+        FakeSiyiCamera siyi;
+        siyi.answer = false;
+        _link->setModel("ZR10");
+        _link->setPort(siyi.port());
+        _link->zoom(1);
+        _link->fireLaser();
+        _link->takePhoto();
+        QTest::qWait(3500);
+        QVERIFY(siyi.attitudeQuestions >= 5);
+        QCOMPARE(siyi.notSiyi, 0);
+        QCOMPARE(other.received.size(), 0);
     }
 
     // --- Angles and addresses ------------------------------------------------
@@ -3073,8 +3626,8 @@ private slots:
     void screenShowsVamaCameraNames()
     {
         // The screen shows VAMA's names; the code and settings keep Skydroid's.
-        QCOMPARE(_link->models(), QStringList({"C12", "C13", "C14 Pro", "C20"}));
-        QCOMPARE(_link->modelNames(), QStringList({"V12", "V13", "V14 Pro", "V20"}));
+        QCOMPARE(_link->models(), QStringList({"C12", "C13", "C14 Pro", "C20", "A20KTR", "ZR10"}));
+        QCOMPARE(_link->modelNames(), QStringList({"V12", "V13", "V14 Pro", "V20", "Viewpro A20KTR", "SIYI ZR10"}));
         QCOMPARE(_link->model(), QString("C13"));
         QCOMPARE(_link->modelName(), QString("V13"));
         _link->setModel("C14 Pro");

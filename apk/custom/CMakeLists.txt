@@ -137,6 +137,14 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/CameraProfile.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidLink.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidLink.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ViewproProtocol.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ViewproProtocol.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ViewproCamera.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ViewproCamera.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SiyiProtocol.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SiyiProtocol.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SiyiCamera.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SiyiCamera.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ObjectTracker.cc

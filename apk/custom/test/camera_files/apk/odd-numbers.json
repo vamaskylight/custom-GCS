@@ -21,6 +21,7 @@
     "record": true,
     "sensorH": 2160,
     "sensorW": 3840,
+    "thermalBySwitch": false,
     "thermalFovH": 32.84,
     "thermalFovSure": true,
     "thermalFovV": 26.35,

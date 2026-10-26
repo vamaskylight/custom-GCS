@@ -2,13 +2,18 @@
 
 The client asked for an admin panel to add a camera to the exe and the APK without new
 code. The APK came first (apk/custom/src/Skydroid/CameraProfile.h/.cc). These are the same
-files, read and written by the same rules: format "vama-camera-1", Skydroid's TOP protocol,
-the same checks with the same sentences, and the same file names. So a camera made in
-either app works in the other once its file is copied over (the APK keeps them in
+files, read and written by the same rules: format "vama-camera-1", the same checks with the
+same sentences, and the same file names. So a Skydroid camera made in either app works in
+the other once its file is copied over (the APK keeps them in
 Android/data/com.vama.gcs/files/Cameras, VGCS in its own folder, default_camera_folder()).
 
-The three Skydroid cameras both apps were written for are built in, with the APK's numbers
-(V12, V13, V14 Pro). They cannot be changed: the admin copies one as the start of a new
+A file names its protocol: Skydroid's TOP, Viewpro or SIYI (the APK speaks all three since
+task AK). VGCS uses the Skydroid cameras of these files. A Viewpro or SIYI camera file is for
+the APK: VGCS reads it, says so in the notes, and leaves it out of its list (VGCS sets up those
+cameras in Application Settings, Video).
+
+The Skydroid cameras both apps were written for are built in, with the APK's numbers (V12,
+V13, V14 Pro, V20). They cannot be changed: the admin copies one as the start of a new
 camera. In VGCS the built-in cameras keep their own profiles (command_map.py); an added
 camera becomes a profile through command_profile().
 """
@@ -33,7 +38,12 @@ from vgcs.skydroid.command_map import (
 )
 
 FORMAT = "vama-camera-1"
-PROTOCOL = "skydroid-top"
+# The protocols the APK speaks. VGCS uses the Skydroid TOP cameras only.
+PROTOCOL_TOP = "skydroid-top"
+PROTOCOL_VIEWPRO = "viewpro"
+PROTOCOL_SIYI = "siyi"
+PROTOCOLS = (PROTOCOL_TOP, PROTOCOL_VIEWPRO, PROTOCOL_SIYI)
+PROTOCOL = PROTOCOL_TOP  # the one VGCS uses, and the one of every file before task AK
 MAX_FILE_BYTES = 64 * 1024
 MAX_LENSES = 4
 MAX_NAME_LENGTH = 40
@@ -43,18 +53,33 @@ COUNTED_STEP_ZOOM = 0.1
 ZOOM_NONE = "none"
 ZOOM_COUNTED = "counted"
 ZOOM_REPORTED = "reported"
-ZOOMS = (ZOOM_NONE, ZOOM_COUNTED, ZOOM_REPORTED)
+ZOOM_LIVE = "live"  # the camera says its zoom and its view (Viewpro)
+ZOOM_PULSE = "pulse"  # the camera zooms while it is told to, and does not say how far (SIYI)
+ZOOMS = (ZOOM_NONE, ZOOM_COUNTED, ZOOM_REPORTED, ZOOM_LIVE, ZOOM_PULSE)
+PROTOCOL_ZOOMS = {
+    PROTOCOL_TOP: (ZOOM_NONE, ZOOM_COUNTED, ZOOM_REPORTED),
+    PROTOCOL_VIEWPRO: (ZOOM_NONE, ZOOM_LIVE),
+    PROTOCOL_SIYI: (ZOOM_NONE, ZOOM_PULSE),
+}
 
 # How TOP reaches the camera. A file from before the C20 has no "transport": UDP.
 TRANSPORT_UDP = "udp"
 TRANSPORT_TCP = "tcp"
 TRANSPORTS = (TRANSPORT_UDP, TRANSPORT_TCP)
+# Only a TOP camera has the choice: Viewpro takes its commands over TCP, SIYI over UDP.
+PROTOCOL_TRANSPORTS = {PROTOCOL_VIEWPRO: TRANSPORT_TCP, PROTOCOL_SIYI: TRANSPORT_UDP}
 
 # The addresses of Skydroid's cameras: day picture on RTSP port 554, thermal on 555.
 SKYDROID_HOST = "192.168.144.108"
 SKYDROID_PORT = 5000
 SKYDROID_DAY_URL = "rtsp://192.168.144.108:554/stream=1"
 SKYDROID_THERMAL_URL = "rtsp://192.168.144.108:555/stream=2"
+
+# The addresses of the APK's Viewpro and SIYI cameras, as VGCS has them (vgcs/video/camera_control.py).
+VIEWPRO_HOST = "192.168.2.119"  # the factory address printed on the unit
+VIEWPRO_PORT = 2000
+SIYI_HOST = "192.168.144.25"
+SIYI_PORT = 37260
 
 # The profile id an added camera has in VGCS's settings (camera/skydroid_profile).
 FILE_PROFILE_PREFIX = "file:"
@@ -74,9 +99,10 @@ class Lens:
 class Camera:
     """A camera. The values without a note are the C13's (as in the APK)."""
 
-    id: str = ""  # built in: "C12", "C13", "C14 Pro"; added: its file name without ".json"
+    id: str = ""  # built in: "C12", "C13", "C14 Pro", "C20"; added: its file name without ".json"
     name: str = ""  # on screen
     built_in: bool = False
+    protocol: str = PROTOCOL_TOP  # VGCS uses the TOP cameras; Viewpro and SIYI ones are the APK's
     # Addresses. Choosing the camera sets them.
     host: str = ""
     port: int = SKYDROID_PORT
@@ -84,7 +110,9 @@ class Camera:
     # section 2.1.1). Its file says "transport": "tcp" (else "udp").
     transport: str = TRANSPORT_UDP
     day_video_url: str = ""
-    thermal_video_url: str = ""  # empty: no thermal picture
+    thermal_video_url: str = ""  # empty: no thermal picture (unless thermal_by_switch)
+    # The thermal picture comes in the day video after a sensor switch (a Viewpro): no address of its own.
+    thermal_by_switch: bool = False
     # The day picture
     fov_h_deg: float = 83.4  # at the widest zoom (none and counted)
     fov_v_deg: float = 46.9
@@ -115,7 +143,15 @@ class Camera:
 
     @property
     def has_thermal(self) -> bool:
-        return bool(self.thermal_video_url)
+        return bool(self.thermal_video_url) or self.thermal_by_switch
+
+    @property
+    def control_transport(self) -> str:
+        """How the commands reach the camera: a TOP camera's own choice, else its protocol's."""
+        own = PROTOCOL_TRANSPORTS.get(self.protocol)
+        if own:
+            return own
+        return self.transport if self.transport in TRANSPORTS else TRANSPORT_UDP
 
 
 def _skydroid(camera_id: str, name: str, **values: Any) -> Camera:
@@ -177,6 +213,57 @@ def built_in_cameras() -> list[Camera]:
     ]
 
 
+def apk_built_in_cameras() -> list[Camera]:
+    """The APK's built-in Viewpro and SIYI cameras (task AK). VGCS does not use them: they are
+    here for the cross-app files, so that both apps hold the same numbers.
+
+    The A20KTR: Viewpro over TCP 2000, its main stream, the view its own screen showed at 1x
+    (70.2 x 43.1, used until the camera says its own), its zoom said by the camera. Its tilt and
+    turn are estimates, not from a data sheet. Its thermal picture comes in the same video after
+    a sensor switch; its thermal lens is not known (so a point there is placed at the cross only).
+    No laser in the APK yet, and no tracker of its own.
+
+    The ZR10: SIYI over UDP 37260, 71.5 x 45.2 at 1x (the ZR10 manual), a zoom that does not say
+    how far it went, -90 to +25 degrees and 45 either way (the range it can be told to go).
+    """
+    return [
+        Camera(
+            id="A20KTR",
+            name="Viewpro A20KTR",
+            built_in=True,
+            protocol=PROTOCOL_VIEWPRO,
+            host=VIEWPRO_HOST,
+            port=VIEWPRO_PORT,
+            transport=TRANSPORT_TCP,
+            day_video_url="rtsp://192.168.2.119:554/stream0",
+            thermal_by_switch=True,
+            fov_h_deg=70.2,
+            fov_v_deg=43.1,
+            zoom=ZOOM_LIVE,
+            pitch_max_deg=30.0,
+            yaw_limit_deg=150.0,
+            laser=False,
+            own_tracker=False,
+        ),
+        Camera(
+            id="ZR10",
+            name="SIYI ZR10",
+            built_in=True,
+            protocol=PROTOCOL_SIYI,
+            host=SIYI_HOST,
+            port=SIYI_PORT,
+            day_video_url="rtsp://192.168.144.25:8554/main.264",
+            fov_h_deg=71.5,
+            fov_v_deg=45.2,
+            zoom=ZOOM_PULSE,
+            pitch_max_deg=25.0,
+            yaw_limit_deg=45.0,
+            laser=False,
+            own_tracker=False,
+        ),
+    ]
+
+
 # VGCS's built-in profile of each built-in camera (for a copy made from what VGCS uses).
 BUILT_IN_PROFILE_IDS = {
     "C12": "c12_default",
@@ -187,7 +274,8 @@ BUILT_IN_PROFILE_IDS = {
 
 
 def _is_built_in_id(camera_id: str) -> bool:
-    return any(c.id.casefold() == str(camera_id).casefold() for c in built_in_cameras())
+    # The APK's own built-in ids too: a file with one of those names is refused there.
+    return any(c.id.casefold() == str(camera_id).casefold() for c in built_in_cameras() + apk_built_in_cameras())
 
 
 def _in_range(value: Any, low: float, high: float) -> bool:
@@ -225,6 +313,25 @@ def problem(cam: Camera) -> str:
         return "The day video must be an RTSP address (rtsp://...)."
     if cam.thermal_video_url.strip() and not _is_rtsp(cam.thermal_video_url.strip()):
         return "The thermal video must be an RTSP address (rtsp://...), or empty for a camera without one."
+    zooms = PROTOCOL_ZOOMS.get(cam.protocol)
+    if zooms is None:
+        return 'The protocol must be "skydroid-top", "viewpro" or "siyi".'
+    if cam.zoom not in zooms:
+        return {
+            PROTOCOL_TOP: "A Skydroid TOP camera's zoom is none, counted or reported.",
+            PROTOCOL_VIEWPRO: "A Viewpro camera's zoom is none or live.",
+            PROTOCOL_SIYI: "A SIYI camera's zoom is none or pulse.",
+        }[cam.protocol]
+    if cam.protocol != PROTOCOL_TOP:
+        if cam.laser:
+            return "The app has no laser for a Viewpro or SIYI camera yet. Untick Laser."
+        if cam.own_tracker:
+            return 'The app uses no tracker of a Viewpro or SIYI camera. Untick "Its own object tracker".'
+    if cam.thermal_by_switch:
+        if cam.protocol != PROTOCOL_VIEWPRO:
+            return "Only a Viewpro camera switches its day video to the thermal picture."
+        if cam.thermal_video_url.strip():
+            return "A camera that switches to its thermal picture has no thermal video of its own: leave it empty."
     if cam.zoom == ZOOM_REPORTED:
         if not cam.lenses or len(cam.lenses) > MAX_LENSES:
             return f"A camera that reports its zoom step needs 1 to {MAX_LENSES} lenses."
@@ -251,7 +358,7 @@ def problem(cam: Camera) -> str:
             return "The day lens's view must be 1 to 179 degrees."
         if cam.zoom == ZOOM_COUNTED and not _in_range(cam.max_zoom, 1.1, 100.0):
             return "The highest zoom must be 1.1x to 100x."
-    if cam.thermal_video_url.strip() and (
+    if (cam.thermal_video_url.strip() or cam.thermal_by_switch) and (
         not _in_range(cam.thermal_fov_h_deg, 1.0, 179.0) or not _in_range(cam.thermal_fov_v_deg, 1.0, 179.0)
     ):
         return "The thermal lens's view must be 1 to 179 degrees."
@@ -281,12 +388,13 @@ def to_json(cam: Camera) -> dict[str, Any]:
     return {
         "format": FORMAT,
         "name": cam.name,
-        "protocol": PROTOCOL,
+        "protocol": cam.protocol if cam.protocol in PROTOCOLS else PROTOCOL_TOP,
         "host": cam.host,
         "port": cam.port,
-        "transport": cam.transport if cam.transport in TRANSPORTS else TRANSPORT_UDP,
+        "transport": cam.control_transport,
         "dayVideoUrl": cam.day_video_url,
         "thermalVideoUrl": cam.thermal_video_url,
+        "thermalBySwitch": cam.thermal_by_switch,
         "zoom": cam.zoom if cam.zoom in ZOOMS else ZOOM_COUNTED,
         "dayFovH": _finite(cam.fov_h_deg),
         "dayFovV": _finite(cam.fov_v_deg),
@@ -356,31 +464,36 @@ def from_json(data: Any, camera_id: str) -> tuple[Camera | None, str]:
 
     if data.get("format") != FORMAT:
         return None, f'it is not a camera file of this app (no "format": "{FORMAT}").'
-    if data.get("protocol") != PROTOCOL:
-        return None, f'its protocol is not Skydroid TOP ("{PROTOCOL}"), the only one the app speaks.'
+    protocol = data.get("protocol")
+    if protocol not in PROTOCOLS:
+        return None, 'its protocol is not "skydroid-top", "viewpro" or "siyi".'
     # Files from before the C20 have no transport: UDP, as every camera had then.
     transport = data.get("transport", TRANSPORT_UDP)
     if transport not in TRANSPORTS:
         return None, 'its transport is not "udp" or "tcp".'
+    transport = PROTOCOL_TRANSPORTS.get(protocol, transport)  # Viewpro and SIYI have their own
     name = text("name")
     host = text("host")
     port = _whole(value("port"))
     day = text("dayVideoUrl")
     thermal = data.get("thermalVideoUrl")
     thermal = thermal.strip() if isinstance(thermal, str) else ""
+    by_switch = flag("thermalBySwitch", False)  # files from before task AK have none: no switch
     zoom = value("zoom")
     if zoom not in ZOOMS:
         if not missing:
-            return None, "its zoom is not one of none, counted or reported."
+            return None, "its zoom is not one of none, counted, reported, live or pulse."
         zoom = ZOOM_COUNTED
     cam = Camera(
         id=camera_id,
         name=name,
+        protocol=protocol,
         host=host,
         port=port,
         transport=transport,
         day_video_url=day,
         thermal_video_url=thermal,
+        thermal_by_switch=by_switch,
         zoom=zoom,
     )
     if zoom == ZOOM_REPORTED:
@@ -413,7 +526,7 @@ def from_json(data: Any, camera_id: str) -> tuple[Camera | None, str]:
         cam = replace(cam, fov_h_deg=number("dayFovH"), fov_v_deg=number("dayFovV"))
         if zoom == ZOOM_COUNTED:
             cam = replace(cam, max_zoom=number("maxZoom"))
-    if thermal:
+    if thermal or by_switch:
         cam = replace(cam, thermal_fov_h_deg=number("thermalFovH"), thermal_fov_v_deg=number("thermalFovV"))
     laser = flag("laser", True)
     cam = replace(
@@ -463,11 +576,18 @@ class CameraStore:
     def __init__(self, folder: Path | str | None = None) -> None:
         self.folder = Path(folder) if folder is not None else default_camera_folder()
         self._cameras: list[Camera] = []
+        self._app_only: list[Camera] = []
         self._notes: list[str] = []
 
     @property
     def cameras(self) -> list[Camera]:
+        """The cameras VGCS can use: the built-in ones, then the added Skydroid ones."""
         return list(self._cameras)
+
+    @property
+    def app_only(self) -> list[Camera]:
+        """The Viewpro and SIYI cameras of the folder: good files, for the APK only."""
+        return list(self._app_only)
 
     @property
     def notes(self) -> list[str]:
@@ -477,6 +597,7 @@ class CameraStore:
     def load(self) -> None:
         """Reads the folder again (and makes it, so that files can be copied into it)."""
         self._cameras = built_in_cameras()
+        self._app_only = []
         self._notes = []
         try:
             self.folder.mkdir(parents=True, exist_ok=True)
@@ -484,6 +605,7 @@ class CameraStore:
             self._notes.append(f"The folder for cameras cannot be made: {self.folder}")
             return
         added: list[Camera] = []
+        app_only: list[Camera] = []
         for path in sorted(self.folder.glob("*.json"), key=lambda p: p.name):
             if not path.is_file():
                 continue
@@ -510,16 +632,26 @@ class CameraStore:
                     else:
                         cam, why = from_json(data, camera_id)
                         if cam is not None:
-                            for other in self._cameras + added:
+                            # Names are checked over every file, as the APK reads them all.
+                            for other in self._cameras + added + app_only:
                                 if other.name.casefold() == cam.name.casefold():
                                     why = f'a camera named "{other.name}" is there already.'
                                     break
-                            if not why:
+                            if not why and cam.protocol != PROTOCOL_TOP:
+                                app_only.append(cam)
+                                kind = "Viewpro" if cam.protocol == PROTOCOL_VIEWPRO else "SIYI"
+                                why = (
+                                    f"a {kind} camera, for the APK only. VGCS sets up Viewpro and SIYI "
+                                    "cameras in Application Settings, Video, Camera / gimbal control."
+                                )
+                            elif not why:
                                 added.append(cam)
             if why:
                 self._notes.append(f"{path.name}: {why}")
         added.sort(key=lambda c: c.name.casefold())
+        app_only.sort(key=lambda c: c.name.casefold())
         self._cameras += added
+        self._app_only = app_only
 
     def find(self, camera_id: str) -> Camera | None:
         for cam in self._cameras:
@@ -528,7 +660,7 @@ class CameraStore:
         return None
 
     def _name_problem(self, cam: Camera) -> str:
-        for other in self._cameras:
+        for other in self._cameras + self._app_only:
             if other.id != cam.id and other.name.casefold() == cam.name.strip().casefold():
                 return f'A camera named "{other.name}" is there already. Give this one another name.'
         return ""
@@ -671,13 +803,26 @@ __all__ = [
     "MAX_LENSES",
     "MAX_NAME_LENGTH",
     "PROTOCOL",
+    "PROTOCOLS",
+    "PROTOCOL_SIYI",
+    "PROTOCOL_TOP",
+    "PROTOCOL_TRANSPORTS",
+    "PROTOCOL_VIEWPRO",
+    "PROTOCOL_ZOOMS",
     "TRANSPORTS",
     "TRANSPORT_TCP",
     "TRANSPORT_UDP",
     "ZOOMS",
     "ZOOM_COUNTED",
+    "ZOOM_LIVE",
     "ZOOM_NONE",
+    "ZOOM_PULSE",
     "ZOOM_REPORTED",
+    "SIYI_HOST",
+    "SIYI_PORT",
+    "VIEWPRO_HOST",
+    "VIEWPRO_PORT",
+    "apk_built_in_cameras",
     "built_in_cameras",
     "command_profile",
     "default_camera_folder",

@@ -20,6 +20,11 @@ add_executable(skydroid_link_test
     ${SKYDROID_SRC}/SkydroidLink.h
     ${SKYDROID_SRC}/CameraProfile.cc
     ${SKYDROID_SRC}/SkydroidTop.cc
+    # The Viewpro and SIYI cameras (task AK).
+    ${SKYDROID_SRC}/ViewproProtocol.cc
+    ${SKYDROID_SRC}/ViewproCamera.cc
+    ${SKYDROID_SRC}/SiyiProtocol.cc
+    ${SKYDROID_SRC}/SiyiCamera.cc
     ${SKYDROID_SRC}/LaserGeo.cc
     ${SKYDROID_SRC}/ObjectTracker.cc
     ${SKYDROID_SRC}/LockCheck.cc

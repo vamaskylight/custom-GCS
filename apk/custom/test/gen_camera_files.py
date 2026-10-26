@@ -19,19 +19,32 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
-from vgcs.skydroid.camera_files import ZOOM_NONE, Camera, CameraStore, Lens, built_in_cameras  # noqa: E402
+from vgcs.skydroid.camera_files import (  # noqa: E402
+    ZOOM_NONE,
+    Camera,
+    CameraStore,
+    Lens,
+    apk_built_in_cameras,
+    built_in_cameras,
+)
 
 FOLDER = Path(__file__).resolve().parent / "camera_files"
 
 
 def sample_cameras() -> list[Camera]:
-    """Every kind of camera: copies of the built-in ones, and cameras with other values in every field."""
+    """Every kind of camera: copies of the built-in ones, and cameras with other values in every field.
+
+    The app's Viewpro and SIYI cameras (task AK) are files VGCS writes and reads but does not use.
+    """
     c12, c13, c14, c20 = built_in_cameras()
+    a20ktr, zr10 = apk_built_in_cameras()
     return [
         replace(c12, name="Copy of V12"),
         replace(c13, name="Copy of V13"),
         replace(c14, name="Copy of V14 Pro"),
         replace(c20, name="Copy of V20"),  # TOP over TCP
+        replace(a20ktr, name="Copy of A20KTR"),  # Viewpro
+        replace(zr10, name="Copy of ZR10"),  # SIYI
         replace(
             c13, name="Bare camera", host="10.0.0.5", port=6000, day_video_url="rtsp://10.0.0.5/live",
             thermal_video_url="", laser=False, photo=False, record=False, own_tracker=False,

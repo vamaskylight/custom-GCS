@@ -99,7 +99,9 @@
 #include "LaserGeo.h"
 #include "LockCheck.h"
 #include "ObjectTracker.h"
+#include "SiyiCamera.h"
 #include "SkydroidTop.h"
+#include "ViewproCamera.h"
 
 class QJSEngine;
 class QQmlEngine;
@@ -374,6 +376,9 @@ public:
     void setPointMode(const QString &mode);
     bool thermalPicture() const { return _thermalPicture; }
     void setThermalPicture(bool thermal);
+    /// A camera whose thermal picture comes in its day video (a Viewpro, thermalBySwitch): switch
+    /// its sensor. For the others the screen switches the video address.
+    Q_INVOKABLE void switchThermal(bool on);
     static QStringList lockModes();
     /// The names on screen, in the order of lockModes().
     static QStringList lockModeNames();
@@ -557,6 +562,7 @@ private slots:
     void _sendLockConfirm();
     void _photoVerdict();
     void _recordVerdict();
+    void _sendDue();
 
 private:
     // Plain functions, not slots: a slot taking Vehicle* would need the full
@@ -598,6 +604,22 @@ private:
     void _closeTcp();
     void _readTcp();
     void _tcpLost();
+    // Viewpro and SIYI (task AK): their rules (ViewproCamera, SiyiCamera) make the bytes, these send
+    // them (Viewpro over the TCP connection, SIYI by UDP) and take what the camera says. A TOP frame
+    // never goes to such a camera (_sendTo).
+    bool _top() const { return _camera.protocol == skydroid::camera::Protocol::Top; }
+    long long _nowMs() const;
+    void _sendBytes(const std::vector<std::uint8_t> &bytes);
+    void _sendAllBytes(const std::vector<std::vector<std::uint8_t>> &frames);
+    /// While a Viewpro or SIYI link runs, the rules' frames due later go out on _dueTimer.
+    void _syncDueTimer();
+    void _takeViewproStatus();
+    /// A Viewpro or SIYI angle command on both axes, the other axis where the camera is now.
+    void _sendAnglesOther(std::optional<double> yawDeg, std::optional<double> pitchDeg);
+    void _markAnswering();
+    void _takeAttitude(double yawDeg, double pitchDeg, double rollDeg);
+    /// Which way the gimbal yaw counts against the picture (the screen's switch turns it round).
+    bool _yawLeftPositive() const;
     Endpoint _knownEndpointFor(const QHostAddress &address, quint16 port) const;
     bool _attitudeFresh() const;
     void _probe();
@@ -639,6 +661,7 @@ private:
     double _setAimFor(double u, double v);
     /// Sends the aim angles and starts watching the turn.
     void _startTurn();
+    void _sendAimAngles();
     /// Where the aimed point is in the picture now, from the gimbal angles.
     void _aimPointInPicture(double &u, double &v) const;
     void _armLock(double u, double v);
@@ -704,6 +727,16 @@ private:
     std::string _tcpRx;             // what came over TCP that is not a whole frame yet
     QTimer _tcpRetryTimer;
     QTimer _tcpConnectTimer;
+    viewpro::Camera _viewpro;       // the rules of a Viewpro camera in use (task AK)
+    siyi::Camera _siyi;             // and of a SIYI camera
+    QTimer _dueTimer;               // sends the rules' frames due later (a zoom stop, a hold after a jog)
+    QElapsedTimer _rulesClock;
+    double _liveZoomX = 0.0;        // the zoom a Viewpro says (0: not yet)
+    double _liveFovHDeg = 0.0;      // and its view
+    double _liveFovVDeg = 0.0;
+    /// A SIYI's zoom is not known: it never went back to 1x here, or zoomed in since. Its view
+    /// (and so a point from the picture) holds at 1x only.
+    bool _zoomUnknown = true;
     QTimer _pollTimer;
     QTimer _answerTimer;
     QTimer _laserShotTimer;

@@ -67,6 +67,15 @@ constexpr int kZoomHomeExtraSteps = 5;   // "1x" steps out this many more than c
 constexpr int kZoomOutIntervalMs = 60;
 constexpr int kTcpRetryMs = 2000;        // a TCP camera (C20) that is gone is tried again after this
 constexpr int kTcpConnectMs = 3000;      // and a connection not made by then is given up
+// Viewpro and SIYI (task AK): their rules want the status asked twice a second, and send some
+// frames later (a zoom click's stop, the hold after a jog). Their clock starts at 1 s, as in the
+// scripts they were checked with (VGCS takes a time of 0 as "never").
+constexpr int kRulesPollMs = static_cast<int>(viewpro::Camera::kPollMs);
+static_assert(viewpro::Camera::kPollMs == siyi::Camera::kPollMs, "one poll timer for both");
+constexpr int kRulesDueMs = 25;
+constexpr long long kRulesClockStartMs = 1000;
+// "Back to 1x" on a Viewpro or SIYI: zoom out until the Viewpro says 1x, a SIYI this long (it does not say).
+constexpr int kZoomHomeOutMs = 8000;
 
 // Photos and recording (task AL). Both go to the camera's own SD card. While the camera answers,
 // it is asked whether it records every 2 s (the RC's own button can start it too), and for its
@@ -366,6 +375,8 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _tcpRetryTimer.setInterval(kTcpRetryMs);
     _tcpConnectTimer.setSingleShot(true);
     _tcpConnectTimer.setInterval(kTcpConnectMs);
+    _dueTimer.setInterval(kRulesDueMs);
+    _rulesClock.start();
     _pictureClock.start();
 
     connect(&_pollTimer, &QTimer::timeout, this, &SkydroidLink::_poll);
@@ -382,6 +393,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_photoVerdictTimer, &QTimer::timeout, this, &SkydroidLink::_photoVerdict);
     connect(&_tcpRetryTimer, &QTimer::timeout, this, &SkydroidLink::_syncTcp);
     connect(&_tcpConnectTimer, &QTimer::timeout, this, &SkydroidLink::_tcpLost);
+    connect(&_dueTimer, &QTimer::timeout, this, &SkydroidLink::_sendDue);
 
     MultiVehicleManager *manager = MultiVehicleManager::instance();
     connect(manager, &MultiVehicleManager::activeVehicleChanged, this, &SkydroidLink::_activeVehicleChanged);
@@ -673,6 +685,9 @@ void SkydroidLink::_useCamera(const camera::Profile &profile, bool withAddresses
 {
     _camera = profile;
     _applyModel();
+    if (_camera.thermalBySwitch) {
+        setThermalPicture(false);  // taken to start on its day picture (the screen does not switch an address)
+    }
     if (withAddresses) {
         _host = profile.host;
         _port = profile.port;
@@ -828,11 +843,22 @@ void SkydroidLink::_applyModel()
     _options = top::Options{};
     _options.gClassUpperHeader = _camera.upperGimbalHeader;
     _options.slrMaxDm = top::slrMaxDmForRange(_camera.laserMaxM);
+    // A Viewpro's or SIYI's rules start again (task AK): the status twice a second.
+    _viewpro = viewpro::Camera{};
+    _siyi = siyi::Camera{};
+    _pollTimer.setInterval(_top() ? kPollIntervalMs : kRulesPollMs);
+    _syncDueTimer();
     // Another camera: nothing known about its zoom yet.
-    if (_zoomStep != -1 || _zoomCount != 0 || !_zoomReport.isEmpty()) {
-        _zoomStep = -1;
-        _zoomCount = 0;
-        _zoomReport.clear();
+    const bool zoomShown = _zoomStep != -1 || _zoomCount != 0 || !_zoomReport.isEmpty() || _liveZoomX != 0.0 ||
+                           !_zoomUnknown;
+    _zoomStep = -1;
+    _zoomCount = 0;
+    _zoomReport.clear();
+    _liveZoomX = 0.0;
+    _liveFovHDeg = 0.0;
+    _liveFovVDeg = 0.0;
+    _zoomUnknown = true;
+    if (zoomShown) {
         emit zoomChanged();
     }
     // Nor about its recording and its SD card.
@@ -970,6 +996,7 @@ void SkydroidLink::_start()
     _pollTimer.start();
     _answerTimer.start();
     _syncTcp();
+    _syncDueTimer();
     _poll();
 }
 
@@ -1008,6 +1035,7 @@ void SkydroidLink::_stop()
         _socket->deleteLater();
         _socket = nullptr;
     }
+    _syncDueTimer();
     if (_laserBusy) {
         _laserBusy = false;
         emit laserBusyChanged();
@@ -1025,7 +1053,8 @@ void SkydroidLink::_stop()
 
 void SkydroidLink::_sendTo(const Endpoint &endpoint, const std::string &frame)
 {
-    if (!_socket || frame.empty() || endpoint.address.isNull() || endpoint.port == 0) {
+    // TOP frames never go to a Viewpro or SIYI camera: it gets its own (_sendBytes).
+    if (!_socket || !_top() || frame.empty() || endpoint.address.isNull() || endpoint.port == 0) {
         return;
     }
     if (_camera.tcp) {
@@ -1056,6 +1085,19 @@ void SkydroidLink::_readPending()
     while (_socket && _socket->hasPendingDatagrams()) {
         const QNetworkDatagram datagram = _socket->receiveDatagram();
         const QByteArray data = datagram.data();
+        if (_camera.protocol == camera::Protocol::Siyi) {
+            // From the camera's own address only (it answers from its port 37260).
+            const auto *bytes = reinterpret_cast<const std::uint8_t *>(data.constData());
+            if (datagram.senderAddress().isEqual(_active.address) &&
+                _siyi.feed(siyi::Bytes(bytes, bytes + data.size()), _nowMs()) && _siyi.attitude()) {
+                _markAnswering();
+                _takeAttitude(_siyi.attitude()->yawDeg, _siyi.attitude()->pitchDeg, _siyi.attitude()->rollDeg);
+            }
+            continue;
+        }
+        if (!_top()) {
+            continue;  // a Viewpro speaks over TCP only
+        }
         const auto frame = top::parseTpFrame(std::string(data.constData(), static_cast<size_t>(data.size())), _options);
         if (frame) {
             const quint16 port = datagram.senderPort() > 0 ? static_cast<quint16>(datagram.senderPort()) : 0;
@@ -1066,8 +1108,9 @@ void SkydroidLink::_readPending()
 
 void SkydroidLink::_syncTcp()
 {
-    // While the link runs and the camera takes TOP over TCP: one connection to its address.
-    if (!_socket || !_camera.tcp) {
+    // While the link runs and the camera takes its commands over TCP (the C20, a Viewpro): one
+    // connection to its address.
+    if (!_socket || !_camera.controlOverTcp()) {
         _tcpRetryTimer.stop();
         _closeTcp();
         return;
@@ -1090,6 +1133,10 @@ void SkydroidLink::_openTcp()
         // Small frames go out at once. Set here: Qt 6.11 drops an option set before
         // the connection exists (measured 2026-10-26), so a jog could wait for the camera's ACK.
         _tcp->setSocketOption(QAbstractSocket::LowDelayOption, 1);
+        if (_camera.protocol == camera::Protocol::Viewpro) {
+            _sendBytes(_viewpro.poll());  // its status at once
+            return;
+        }
         // A new connection: angle push on, and the angles, at once (as a new UDP link does).
         _send(top::buildGaaEnable(kGaaHz, _options));
         _send(top::buildGacQuery(_options));
@@ -1122,7 +1169,7 @@ void SkydroidLink::_tcpLost()
 {
     // The camera went away, or did not take the connection: again in a moment, while the link runs.
     _closeTcp();
-    if (_socket && _camera.tcp) {
+    if (_socket && _camera.controlOverTcp()) {
         _tcpRetryTimer.start();
     }
 }
@@ -1133,6 +1180,14 @@ void SkydroidLink::_readTcp()
         return;
     }
     const QByteArray data = _tcp->readAll();
+    if (_camera.protocol == camera::Protocol::Viewpro) {
+        // Its rules take the stream in any pieces.
+        const auto *bytes = reinterpret_cast<const std::uint8_t *>(data.constData());
+        if (_viewpro.feed(viewpro::Bytes(bytes, bytes + data.size()), _nowMs())) {
+            _takeViewproStatus();
+        }
+        return;
+    }
     _tcpRx.append(data.constData(), static_cast<size_t>(data.size()));
     // A stream: half a frame or several can come in one read.
     for (const std::string &raw : top::takeFrames(_tcpRx)) {
@@ -1142,13 +1197,32 @@ void SkydroidLink::_readTcp()
     }
 }
 
-void SkydroidLink::_handleFrame(const top::DecodedFrame &frame, const Endpoint &from)
+void SkydroidLink::_markAnswering()
 {
     _sinceReply.start();
     if (!_answering) {
         _answering = true;
         emit answeringChanged();
     }
+}
+
+void SkydroidLink::_takeAttitude(double yawDeg, double pitchDeg, double rollDeg)
+{
+    if (_attitudeValid && _angleSentAt.isValid() && _angleSentAt.elapsed() < kAngleTurnMaxMs &&
+        std::max(std::abs(yawDeg - _yaw), std::abs(pitchDeg - _pitch)) >= kAngleTurnStepDeg) {
+        _cameraMovedAt.start();  // the turn that was asked for is still going on
+    }
+    _sinceAttitude.start();
+    _yaw = yawDeg;
+    _pitch = pitchDeg;
+    _roll = rollDeg;
+    _attitudeValid = true;
+    emit attitudeChanged();
+}
+
+void SkydroidLink::_handleFrame(const top::DecodedFrame &frame, const Endpoint &from)
+{
+    _markAnswering();
 
     if (frame.tag == "GAC" && frame.yaw && frame.pitch) {
         if (!(from == _active)) {
@@ -1159,16 +1233,7 @@ void SkydroidLink::_handleFrame(const top::DecodedFrame &frame, const Endpoint &
             }
             _setActive(from);
         }
-        if (_attitudeValid && _angleSentAt.isValid() && _angleSentAt.elapsed() < kAngleTurnMaxMs &&
-            std::max(std::abs(*frame.yaw - _yaw), std::abs(*frame.pitch - _pitch)) >= kAngleTurnStepDeg) {
-            _cameraMovedAt.start();  // the turn that was asked for is still going on
-        }
-        _sinceAttitude.start();
-        _yaw = *frame.yaw;
-        _pitch = *frame.pitch;
-        _roll = frame.roll.value_or(0.0);
-        _attitudeValid = true;
-        emit attitudeChanged();
+        _takeAttitude(*frame.yaw, *frame.pitch, frame.roll.value_or(0.0));
     } else if (frame.tag == "SLR" && _laserBusy) {
         const char source = frame.address.empty() ? ' ' : frame.address[0];
         if (source == 'E') {
@@ -1216,8 +1281,115 @@ void SkydroidLink::_handleFrame(const top::DecodedFrame &frame, const Endpoint &
     }
 }
 
+// --- Viewpro and SIYI (task AK) ----------------------------------------------
+
+long long SkydroidLink::_nowMs() const
+{
+    return kRulesClockStartMs + _rulesClock.elapsed();
+}
+
+void SkydroidLink::_sendBytes(const std::vector<std::uint8_t> &bytes)
+{
+    if (!_socket || bytes.empty()) {
+        return;
+    }
+    const char *data = reinterpret_cast<const char *>(bytes.data());
+    const qint64 size = static_cast<qint64>(bytes.size());
+    if (_camera.controlOverTcp()) {
+        // A Viewpro: over its one connection, once it is there.
+        if (_tcp && _tcp->state() == QAbstractSocket::ConnectedState) {
+            _tcp->write(data, size);
+        }
+        return;
+    }
+    if (!_active.address.isNull() && _active.port != 0) {
+        _socket->writeDatagram(data, size, _active.address, _active.port);
+    }
+}
+
+void SkydroidLink::_sendAllBytes(const std::vector<std::vector<std::uint8_t>> &frames)
+{
+    for (const std::vector<std::uint8_t> &frame : frames) {
+        _sendBytes(frame);
+    }
+}
+
+void SkydroidLink::_syncDueTimer()
+{
+    if (_socket && !_top()) {
+        if (!_dueTimer.isActive()) {
+            _dueTimer.start();
+        }
+    } else {
+        _dueTimer.stop();
+    }
+}
+
+void SkydroidLink::_sendDue()
+{
+    const long long now = _nowMs();
+    if (_camera.protocol == camera::Protocol::Viewpro) {
+        _sendAllBytes(_viewpro.tick(now));
+    } else if (_camera.protocol == camera::Protocol::Siyi) {
+        _sendAllBytes(_siyi.tick(now));
+    }
+}
+
+void SkydroidLink::_takeViewproStatus()
+{
+    const std::optional<viewpro::Status> &status = _viewpro.status();
+    if (!status) {
+        return;
+    }
+    _markAnswering();
+    // Its angles as VGCS takes them: yaw positive right, pitch positive up (VGCS read that off the
+    // speed command in the field, 2026-07-30; for the angles it is not proven).
+    _takeAttitude(status->attitude.yawDeg, status->attitude.pitchDeg, status->attitude.rollDeg);
+    // Its zoom and its view, once it says them.
+    const double zoomX = _viewpro.zoomX().value_or(0.0);
+    const double hfov = _viewpro.hfovDeg().value_or(0.0);
+    const double vfov = _viewpro.vfovDeg().value_or(0.0);
+    if (zoomX != _liveZoomX || hfov != _liveFovHDeg || vfov != _liveFovVDeg) {
+        _liveZoomX = zoomX;
+        _liveFovHDeg = hfov;
+        _liveFovVDeg = vfov;
+        emit zoomChanged();
+    }
+    // Whether it records, as the camera says (the RC's own button can start it too).
+    if (status->camera && _camera.record) {
+        _recordAnswered(_viewpro.recording());
+    }
+}
+
+void SkydroidLink::_sendAnglesOther(std::optional<double> yawDeg, std::optional<double> pitchDeg)
+{
+    // One frame for both axes: the other one where the camera is now (0 before it said).
+    const double yaw = yawDeg.value_or(_attitudeValid ? _yaw : 0.0);
+    const double pitch = pitchDeg.value_or(_attitudeValid ? _pitch : 0.0);
+    if (_camera.protocol == camera::Protocol::Viewpro) {
+        _sendBytes(_viewpro.setAngle(yaw, pitch));
+    } else {
+        _sendAllBytes(_siyi.setAngle(yaw, pitch));
+    }
+    _angleSentAt.start();
+    _cameraMovedAt.start();
+}
+
+bool SkydroidLink::_yawLeftPositive() const
+{
+    // The C13's GAC yaw runs opposite to the picture (VGCS _LRF_C13_NEGATE_IMAGE_YAW). VGCS takes a
+    // Viewpro's and a SIYI's yaw as it comes (yaw_left_positive off). The screen's switch turns it round.
+    const bool own = _top() ? kNegateImageYaw : false;
+    return own != _reverseTapYaw;
+}
+
 void SkydroidLink::_poll()
 {
+    if (!_top()) {
+        // A Viewpro: the heartbeat, which it answers with its status. A SIYI: the angle question.
+        _sendBytes(_camera.protocol == camera::Protocol::Viewpro ? _viewpro.poll() : _siyi.poll());
+        return;
+    }
     ++_pollCount;
     const bool fresh = _attitudeFresh();
     // VGCS order: angle push on (GAA), then the angle question (GAC).
@@ -1287,6 +1459,14 @@ void SkydroidLink::ptz(const QString &action)
 {
     _endLockByHand();
     const QString a = action.trimmed().toLower();
+    if (_camera.protocol == camera::Protocol::Viewpro) {
+        _sendBytes(_viewpro.ptz(a.toStdString(), _nowMs()));
+        return;
+    }
+    if (_camera.protocol == camera::Protocol::Siyi) {
+        _sendAllBytes(_siyi.ptz(a.toStdString()));
+        return;
+    }
     const std::string frame = top::buildPtz(a.toStdString(), _options);
     // VGCS ptz_stop_burst: C13 can coast after a single stop.
     const int repeats = (a == QStringLiteral("stop")) ? 3 : 1;
@@ -1413,6 +1593,13 @@ void SkydroidLink::_motionTick()
 
 void SkydroidLink::_sendAngle(const char *axis, double degrees, double dps)
 {
+    if (!_top()) {
+        // Both axes in one frame (two would undo each other): callers that turn both use _sendAnglesOther.
+        const bool yaw = std::string(axis) == "GAY";
+        _sendAnglesOther(yaw ? std::optional<double>(degrees) : std::nullopt,
+                         yaw ? std::nullopt : std::optional<double>(degrees));
+        return;
+    }
     _sendGimbal(top::buildGimbalAngleAxis(axis, degrees, dps, _options));
     _angleSentAt.start();
     _cameraMovedAt.start();
@@ -1420,6 +1607,20 @@ void SkydroidLink::_sendAngle(const char *axis, double degrees, double dps)
 
 void SkydroidLink::_sendSpeed(double yawDps, double pitchDps)
 {
+    if (!_top()) {
+        // One frame for both axes. The link's speeds are VGCS's: yaw positive right, pitch positive up.
+        if (speedUnits(yawDps) != 0 || speedUnits(pitchDps) != 0) {
+            _cameraMovedAt.start();
+        }
+        if (_camera.protocol == camera::Protocol::Viewpro) {
+            _sendBytes(_viewpro.gimbalSpeed(yawDps, pitchDps, _nowMs()));
+        } else {
+            _sendAllBytes(_siyi.gimbalSpeed(yawDps, pitchDps));
+        }
+        _lastYawUnits = speedUnits(yawDps);
+        _lastPitchUnits = speedUnits(pitchDps);
+        return;
+    }
     // Like VGCS: one frame per moving axis (GSY yaw, GSP pitch), never the
     // combined GSM, which dropped yaw on a C12 in the field.
     const int yawUnits = speedUnits(yawDps);
@@ -1456,6 +1657,17 @@ void SkydroidLink::_sendSpeed(double yawDps, double pitchDps)
 
 void SkydroidLink::_sendStop()
 {
+    if (!_top()) {
+        // A Viewpro's rules pin the gimbal where it came to rest a moment later (its hold).
+        if (_camera.protocol == camera::Protocol::Viewpro) {
+            _sendBytes(_viewpro.gimbalSpeed(0.0, 0.0, _nowMs()));
+        } else {
+            _sendAllBytes(_siyi.gimbalSpeed(0.0, 0.0));
+        }
+        _lastYawUnits = 0;
+        _lastPitchUnits = 0;
+        return;
+    }
     // Each axis gets its own zero, then GSM zero (the stop VGCS sends), so the
     // gimbal stops whichever of these the firmware listens to.
     _send(top::buildGimbalSpeedAxis("GSY", 0.0, _options));
@@ -1470,6 +1682,17 @@ void SkydroidLink::_sendStop()
 void SkydroidLink::center()
 {
     _endLockByHand();
+    if (!_top()) {
+        // Their own "home" command, as VGCS sends it.
+        if (_camera.protocol == camera::Protocol::Viewpro) {
+            _sendBytes(_viewpro.center());
+        } else {
+            _sendAllBytes(_siyi.center());
+        }
+        _angleSentAt.start();
+        _cameraMovedAt.start();
+        return;
+    }
     // One axis per frame, like the speed commands (a combined frame dropped
     // yaw on a C12 in the field).
     _sendAngle("GAY", 0.0, kAngleMoveDps);
@@ -1479,12 +1702,23 @@ void SkydroidLink::center()
 void SkydroidLink::centerYaw()
 {
     _endLockByHand();
-    _sendAngle("GAY", 0.0, kCenterYawDps);
+    _sendAngle("GAY", 0.0, kCenterYawDps);  // a Viewpro or SIYI keeps its tilt
 }
 
 void SkydroidLink::pointDown()
 {
     _endLockByHand();
+    if (!_top()) {
+        // A Viewpro's own "look down"; a SIYI keeps its yaw and tilts to -90 (VGCS's default).
+        if (_camera.protocol == camera::Protocol::Viewpro) {
+            _sendBytes(_viewpro.lookDown());
+        } else {
+            _sendAllBytes(_siyi.pointDown());
+        }
+        _angleSentAt.start();
+        _cameraMovedAt.start();
+        return;
+    }
     // Pitch -90 is straight down: the C13 tilts from -90 to +10, and its
     // gimbal angles read negative when looking down (VGCS tries -90 first too).
     _sendAngle("GAP", -90.0, kAngleMoveDps);
@@ -1492,6 +1726,12 @@ void SkydroidLink::pointDown()
 
 void SkydroidLink::currentFov(double &horizontalDeg, double &verticalDeg) const
 {
+    // A Viewpro's view as it says it (VGCS uses that too).
+    if (_camera.zoom == camera::Zoom::Live && _liveFovHDeg > 0.0 && _liveFovVDeg > 0.0) {
+        horizontalDeg = _liveFovHDeg;
+        verticalDeg = _liveFovVDeg;
+        return;
+    }
     // The lens and crop for the step the camera reported (C14 Pro), or narrowed by the zoom
     // we counted (C12, C13), as VGCS does.
     camera::dayFov(_camera, _zoomCount, _zoomStep, horizontalDeg, verticalDeg);
@@ -1501,7 +1741,8 @@ bool SkydroidLink::pictureFov(double &horizontalDeg, double &verticalDeg) const
 {
     if (!_thermalPicture) {
         currentFov(horizontalDeg, verticalDeg);
-        return true;
+        // A SIYI's view holds at 1x only, and its zoom is known only after "back to 1x".
+        return !(_camera.zoom == camera::Zoom::Pulse && _zoomUnknown);
     }
     horizontalDeg = _camera.thermalFovHDeg;
     verticalDeg = _camera.thermalFovVDeg;
@@ -1537,6 +1778,21 @@ void SkydroidLink::setThermalPicture(bool thermal)
     }
 }
 
+void SkydroidLink::switchThermal(bool on)
+{
+    if (!_camera.thermalBySwitch || !_socket) {
+        return;
+    }
+    if (_camera.protocol == camera::Protocol::Viewpro) {
+        _sendBytes(_viewpro.setSensor(on));
+    }
+    setThermalPicture(on);
+    // A Viewpro drops its whole network while it switches: 5 to 40 s in VGCS's field tests.
+    emit cameraNote(on ? tr("The camera switches to its thermal picture. Its video and link stop for some seconds.")
+                       : tr("The camera switches to its day picture. Its video and link stop for some seconds."),
+                    false);
+}
+
 void SkydroidLink::_measureFromPicture(double u, double v)
 {
     // One result shows at a time: another point ends a lock, as a tap by laser does.
@@ -1565,14 +1821,17 @@ void SkydroidLink::_measureFromPicture(double u, double v)
                 u = 0.5;
                 v = 0.5;
                 lensKnown = true;
-            } else {
+            } else if (_thermalPicture) {
                 whyNot = tr("On the thermal picture the app can place the cross only: the thermal lens of this camera "
                             "is not known exactly. Put the cross on the point, then tap the cross.");
+            } else {
+                whyNot = tr("This camera does not say how far it zoomed, so the app can place the cross only. Zoom back "
+                            "to 1x first (four corner arrows), or put the cross on the point and tap the cross.");
             }
         }
         if (lensKnown) {
             view.gimbalYawDeg = _yaw;
-            view.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
+            view.gimbalYawLeftPositive = _yawLeftPositive();
             view.gimbalPitchDeg = _pitch;
             view.videoXNorm = std::clamp(u, 0.0, 1.0);
             view.videoYNorm = std::clamp(v, 0.0, 1.0);
@@ -1682,7 +1941,7 @@ double SkydroidLink::_setAimFor(double u, double v)
     pictureFov(hfov, vfov);
     const double dyawImage = (std::clamp(u, 0.0, 1.0) - 0.5) * hfov;    // right is +
     const double dpitchImage = (std::clamp(v, 0.0, 1.0) - 0.5) * vfov;  // down is +
-    const bool negate = kNegateImageYaw != _reverseTapYaw;
+    const bool negate = _yawLeftPositive();
     // The camera's own limits (C13: up to +10, C12: +30, C14 Pro: +60 and 120 either way).
     _aimPointYaw = _yaw + (negate ? -dyawImage : dyawImage);
     _aimPointPitch = _pitch - dpitchImage;
@@ -1691,10 +1950,19 @@ double SkydroidLink::_setAimFor(double u, double v)
     return std::max(std::abs(dyawImage), std::abs(dpitchImage));
 }
 
-void SkydroidLink::_startTurn()
+void SkydroidLink::_sendAimAngles()
 {
+    if (!_top()) {
+        _sendAnglesOther(_aimYaw, _aimPitch);
+        return;
+    }
     _sendAngle("GAY", _aimYaw, kAngleMoveDps);
     _sendAngle("GAP", _aimPitch, kAngleMoveDps);
+}
+
+void SkydroidLink::_startTurn()
+{
+    _sendAimAngles();
     _aimResent = false;
     _aimElapsed.start();
     _aimSettled.invalidate();
@@ -1707,7 +1975,7 @@ void SkydroidLink::_aimPointInPicture(double &u, double &v) const
     double hfov = 0.0;
     double vfov = 0.0;
     pictureFov(hfov, vfov);
-    const bool negate = kNegateImageYaw != _reverseTapYaw;
+    const bool negate = _yawLeftPositive();
     const double yawToGo = _aimPointYaw - _yaw;
     const double dyawImage = negate ? -yawToGo : yawToGo;
     const double dpitchImage = _pitch - _aimPointPitch;
@@ -1748,8 +2016,7 @@ void SkydroidLink::_aimTick()
     _aimSettled.invalidate();
     if (!_aimResent && _aimElapsed.elapsed() >= kAimResendMs) {
         _aimResent = true;
-        _sendAngle("GAY", _aimYaw, kAngleMoveDps);
-        _sendAngle("GAP", _aimPitch, kAngleMoveDps);
+        _sendAimAngles();
     }
     if (_aimElapsed.elapsed() >= kAimTimeoutMs) {
         _aimTimer.stop();
@@ -2499,7 +2766,7 @@ void SkydroidLink::_placeObject(double rightDeg, double upDeg, double hfovDeg, d
     // The object's direction as a point of the picture the camera would give now. (What the
     // camera has turned since the picture was taken is off already, as for its speeds.)
     view.gimbalYawDeg = _yaw;
-    view.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
+    view.gimbalYawLeftPositive = _yawLeftPositive();
     view.gimbalPitchDeg = _pitch;
     view.videoXNorm = std::clamp(0.5 + rightDeg / hfovDeg, 0.0, 1.0);
     view.videoYNorm = std::clamp(0.5 - upDeg / vfovDeg, 0.0, 1.0);
@@ -2662,7 +2929,7 @@ void SkydroidLink::_measureLockedObject()
         return;
     }
     view.gimbalYawDeg = _yaw;
-    view.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
+    view.gimbalYawLeftPositive = _yawLeftPositive();
     view.gimbalPitchDeg = _pitch;
     if (_setTargetFromPicture(view, _sampleHeight(), whyNot)) {
         _laserValid = false;
@@ -2899,6 +3166,7 @@ void SkydroidLink::_sendWheelAngles()
         return;
     }
     const char *const tags[2] = {"GAY", "GAP"};
+    std::optional<double> other[2];  // a Viewpro or SIYI: both in one frame
     for (int a = 0; a < 2; ++a) {
         if (!_wheelTarget[a]) {
             continue;
@@ -2906,8 +3174,15 @@ void SkydroidLink::_sendWheelAngles()
         if (_wheelSent[a] && std::abs(*_wheelSent[a] - *_wheelTarget[a]) < kWheelAngleStepDeg) {
             continue;
         }
-        _sendAngle(tags[a], *_wheelTarget[a], kWheelApproachDps);
+        if (_top()) {
+            _sendAngle(tags[a], *_wheelTarget[a], kWheelApproachDps);
+        } else {
+            other[a] = _wheelTarget[a];
+        }
         _wheelSent[a] = _wheelTarget[a];
+    }
+    if (other[YawAxis] || other[PitchAxis]) {
+        _sendAnglesOther(other[YawAxis], other[PitchAxis]);
     }
     _wheelSentAt.start();
 }
@@ -2967,6 +3242,16 @@ void SkydroidLink::takePhoto()
     if (!_camera.photo || !_socket) {
         return;
     }
+    if (!_top()) {
+        // Neither says that it took one (VGCS does not ask either).
+        if (_camera.protocol == camera::Protocol::Viewpro) {
+            _sendBytes(_viewpro.photo());
+        } else {
+            _sendAllBytes(_siyi.photo());
+        }
+        emit cameraNote(tr("The camera was told to take a photo. It saves it on its own SD card."), false);
+        return;
+    }
     _send(top::buildPhoto(_options));
     _photoWaiting = true;
     _photoVerdictTimer.start();
@@ -2993,7 +3278,17 @@ void SkydroidLink::setRecord(bool start)
     if (!_camera.record || !_socket) {
         return;
     }
-    _send(top::buildRecord(start, _options));
+    if (_camera.protocol == camera::Protocol::Viewpro) {
+        // Nothing when it already does what is asked (it says so in its status, which answers the press).
+        _sendBytes(_viewpro.setRecording(start));
+    } else if (_camera.protocol == camera::Protocol::Siyi) {
+        // A toggle only, and it does not say whether it records: by what the screen shows.
+        if (start != _recording) {
+            _sendAllBytes(_siyi.toggleRecording());
+        }
+    } else {
+        _send(top::buildRecord(start, _options));
+    }
     if (start == _recording) {
         return;  // nothing changes on the screen: the frame makes sure, no note
     }
@@ -3150,6 +3445,22 @@ void SkydroidLink::zoom(int direction)
     }
     const int d = direction > 0 ? 1 : -1;
     _endAppLockForZoom();
+    if (!_top()) {
+        // One click: the rules send the stop a moment later, the next click takes that back
+        // (so a button held down zooms on). A tap ends a "back to 1x" run.
+        _zoomOutLeft = 0;
+        _zoomOutTimer.stop();
+        if (_camera.protocol == camera::Protocol::Viewpro) {
+            _sendBytes(_viewpro.zoomStep(d, _nowMs()));
+        } else {
+            _sendAllBytes(_siyi.zoomStep(d, _nowMs()));
+            if (d > 0 && !_zoomUnknown) {
+                _zoomUnknown = true;  // zoomed in: how far, the SIYI does not say
+                emit zoomChanged();
+            }
+        }
+        return;
+    }
     if (_isZoomStepCamera()) {
         for (const std::string &frame : top::buildDzmStepFrames(d, _options)) {
             _send(frame);
@@ -3175,6 +3486,13 @@ void SkydroidLink::zoomHome()
         return;
     }
     _endAppLockForZoom();
+    if (!_top()) {
+        // Neither has a "1x" command in VGCS: zoom out, until a Viewpro says 1x, a SIYI for a while.
+        _zoomOutLeft = kZoomHomeOutMs / kZoomOutIntervalMs;
+        _zoomOutTimer.start();
+        _zoomOutTick();
+        return;
+    }
     if (_isZoomStepCamera()) {
         for (const std::string &frame : top::buildDzmHomeFrames(_options)) {
             _send(frame);
@@ -3198,6 +3516,29 @@ void SkydroidLink::zoomHome()
 
 void SkydroidLink::_zoomOutTick()
 {
+    if (!_top()) {
+        const bool viewpro = _camera.protocol == camera::Protocol::Viewpro;
+        const bool atOne = viewpro && _liveZoomX > 0.0 && _liveZoomX <= 1.05;
+        if (_zoomOutLeft <= 0 || !_socket || atOne) {
+            const bool ranOut = _zoomOutLeft <= 0;
+            _zoomOutLeft = 0;
+            _zoomOutTimer.stop();
+            if (viewpro) {
+                _sendBytes(_viewpro.zoomStep(0, _nowMs()));  // stop now
+            } else if (_socket && ranOut && _zoomUnknown) {
+                _zoomUnknown = false;  // zoomed out long enough: at 1x (it does not say)
+                emit zoomChanged();
+            }
+            return;
+        }
+        if (viewpro) {
+            _sendBytes(_viewpro.zoomStep(-1, _nowMs()));
+        } else {
+            _sendAllBytes(_siyi.zoomStep(-1, _nowMs()));
+        }
+        --_zoomOutLeft;
+        return;
+    }
     if (_zoomOutLeft <= 0 || !_socket) {
         _zoomOutLeft = 0;
         _zoomOutTimer.stop();
@@ -3238,6 +3579,13 @@ int SkydroidLink::_zoomStepsMax() const
 
 QString SkydroidLink::zoomLabel() const
 {
+    // A Viewpro says its zoom; a SIYI does not, so its 1x only after "back to 1x".
+    if (_camera.zoom == camera::Zoom::Live) {
+        return _liveZoomX > 0.0 ? QStringLiteral("%1x").arg(_liveZoomX, 0, 'f', 1) : QString();
+    }
+    if (_camera.zoom == camera::Zoom::Pulse) {
+        return _zoomUnknown ? QString() : QStringLiteral("1.0x");
+    }
     // A camera that reports its step: until it does, nothing rather than a guess.
     return camera::zoomLabel(_camera, _zoomCount, _zoomStep);
 }
@@ -3275,7 +3623,7 @@ void SkydroidLink::_fireLaser(bool keepLastResult)
     // Which way that yaw counts: the same switch as the tap aiming, because it
     // is one camera. Without this the target landed on the wrong side of the
     // drone's nose whenever the camera was turned (field video, 2026-10-06).
-    _shotPose.gimbalYawLeftPositive = (kNegateImageYaw != _reverseTapYaw);
+    _shotPose.gimbalYawLeftPositive = _yawLeftPositive();
     _shotPose.gimbalPitchDeg = _pitch;
     _shotHeightM = _sampleHeight();
     _measuredByPicture = false;

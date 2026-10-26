@@ -24,6 +24,11 @@ add_executable(vama_preview
     ${CUSTOM_DIR}/src/Skydroid/SkydroidLink.h
     ${CUSTOM_DIR}/src/Skydroid/CameraProfile.cc
     ${CUSTOM_DIR}/src/Skydroid/SkydroidTop.cc
+    # The Viewpro and SIYI cameras (task AK): SkydroidLink uses their rules.
+    ${CUSTOM_DIR}/src/Skydroid/ViewproProtocol.cc
+    ${CUSTOM_DIR}/src/Skydroid/ViewproCamera.cc
+    ${CUSTOM_DIR}/src/Skydroid/SiyiProtocol.cc
+    ${CUSTOM_DIR}/src/Skydroid/SiyiCamera.cc
     ${CUSTOM_DIR}/src/Skydroid/LaserGeo.cc
     ${CUSTOM_DIR}/src/Skydroid/ObjectTracker.cc
     ${CUSTOM_DIR}/src/Skydroid/LockCheck.cc

@@ -20,6 +20,7 @@
 
 namespace camera = skydroid::camera;
 using camera::Profile;
+using camera::Protocol;
 using camera::Zoom;
 
 namespace {
@@ -149,6 +150,7 @@ private slots:
     void theTransportIsInTheFile();
     void theEditorsFieldsNeedNoFormat();
     void wrongValuesAreRefusedWithASentence();
+    void eachProtocolHasItsZoomsAndFeatures();
     void namesBecomeFileNames();
     void savingMakesAFileThatIsReadAgain();
     void namesAreNotTwice();
@@ -162,19 +164,57 @@ private slots:
 void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
 {
     const QList<Profile> all = camera::builtInProfiles();
-    QCOMPARE(all.size(), 4);
+    QCOMPARE(all.size(), 6);
     QCOMPARE(all.at(0).id, QStringLiteral("C12"));
     QCOMPARE(all.at(1).id, QStringLiteral("C13"));
     QCOMPARE(all.at(2).id, QStringLiteral("C14 Pro"));
     QCOMPARE(all.at(3).id, QStringLiteral("C20"));
+    QCOMPARE(all.at(4).id, QStringLiteral("A20KTR"));
+    QCOMPARE(all.at(5).id, QStringLiteral("ZR10"));
     QCOMPARE(all.at(0).name, QStringLiteral("V12"));
     QCOMPARE(all.at(1).name, QStringLiteral("V13"));
     QCOMPARE(all.at(2).name, QStringLiteral("V14 Pro"));
     QCOMPARE(all.at(3).name, QStringLiteral("V20"));
+    QCOMPARE(all.at(4).name, QStringLiteral("Viewpro A20KTR"));
+    QCOMPARE(all.at(5).name, QStringLiteral("SIYI ZR10"));
     QCOMPARE(camera::defaultId(), QStringLiteral("C13"));
+    for (const Profile &p : all.mid(0, 4)) {
+        QVERIFY(p.protocol == Protocol::Top);
+    }
+    // The Viewpro A20KTR and the SIYI ZR10 (task AK), with VGCS's numbers
+    // (camera_files.apk_built_in_cameras, held equal through the cross-app files).
+    const Profile a20 = all.at(4);
+    QVERIFY(a20.builtIn && a20.protocol == Protocol::Viewpro && a20.controlOverTcp());
+    QCOMPARE(a20.host, QStringLiteral("192.168.2.119"));
+    QCOMPARE(a20.port, 2000);
+    QCOMPARE(a20.dayVideoUrl, QStringLiteral("rtsp://192.168.2.119:554/stream0"));
+    QVERIFY(a20.zoom == Zoom::Live);
+    QCOMPARE(a20.fovHDeg, 70.2);
+    QCOMPARE(a20.fovVDeg, 43.1);
+    QCOMPARE(a20.pitchMaxDeg, 30.0);
+    QCOMPARE(a20.yawLimitDeg, 150.0);
+    const Profile zr10 = all.at(5);
+    QVERIFY(zr10.builtIn && zr10.protocol == Protocol::Siyi && !zr10.controlOverTcp());
+    QCOMPARE(zr10.host, QStringLiteral("192.168.144.25"));
+    QCOMPARE(zr10.port, 37260);
+    QCOMPARE(zr10.dayVideoUrl, QStringLiteral("rtsp://192.168.144.25:8554/main.264"));
+    QVERIFY(zr10.zoom == Zoom::Pulse);
+    QCOMPARE(zr10.fovHDeg, 71.5);
+    QCOMPARE(zr10.fovVDeg, 45.2);
+    QCOMPARE(zr10.pitchMaxDeg, 25.0);
+    QCOMPARE(zr10.yawLimitDeg, 45.0);
+    for (const Profile &p : {a20, zr10}) {
+        QVERIFY(!p.laser && !p.ownTracker && p.photo && p.record && !p.upperGimbalHeader);
+        QVERIFY(p.thermalVideoUrl.isEmpty() && !p.thermalFovSure);
+        QCOMPARE(p.pitchMinDeg, -90.0);
+        QVERIFY2(camera::problem(p).isEmpty(), qPrintable(camera::problem(p)));
+    }
+    // The A20KTR's thermal picture comes in its day video after a switch; the ZR10 has none.
+    QVERIFY(a20.thermalBySwitch && a20.hasThermal());
+    QVERIFY(!zr10.thermalBySwitch && !zr10.hasThermal());
     // The C20 (task AJ): TOP over TCP, its own video address, no thermal picture or laser.
     const Profile c20 = all.at(3);
-    QVERIFY(c20.builtIn && c20.tcp);
+    QVERIFY(c20.builtIn && c20.tcp && c20.controlOverTcp());
     QCOMPARE(c20.host, QStringLiteral("192.168.144.108"));
     QCOMPARE(c20.port, 5000);
     QCOMPARE(c20.dayVideoUrl, QStringLiteral("rtsp://192.168.144.108:554/main"));
@@ -189,7 +229,7 @@ void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
     QVERIFY(c20.upperGimbalHeader);
     QVERIFY2(camera::problem(c20).isEmpty(), qPrintable(camera::problem(c20)));
     for (const Profile &p : all.mid(0, 3)) {
-        QVERIFY(p.builtIn && !p.tcp);
+        QVERIFY(p.builtIn && !p.tcp && !p.controlOverTcp());
         QCOMPARE(p.host, QStringLiteral("192.168.144.108"));
         QCOMPARE(p.port, 5000);
         QCOMPARE(p.dayVideoUrl, QStringLiteral("rtsp://192.168.144.108:554/stream=1"));
@@ -265,6 +305,14 @@ void CameraProfileTest::theDayLensIsTheOldFormula()
     camera::dayFov(fixed, 12, 40, h, v);
     QCOMPARE(h, 50.0);
     QCOMPARE(v, 30.0);
+    // A Viewpro says its own view (the link takes that): this is its 1x view until it does. A SIYI
+    // does not say how far it zoomed: its 1x view, right only at 1x.
+    camera::dayFov(builtIn(QStringLiteral("A20KTR")), 12, 40, h, v);
+    QCOMPARE(h, 70.2);
+    QCOMPARE(v, 43.1);
+    camera::dayFov(builtIn(QStringLiteral("ZR10")), 12, 40, h, v);
+    QCOMPARE(h, 71.5);
+    QCOMPARE(v, 45.2);
 }
 
 void CameraProfileTest::theZoomIsTheOldOne()
@@ -288,6 +336,11 @@ void CameraProfileTest::theZoomIsTheOldOne()
     Profile one = builtIn(QStringLiteral("C14 Pro"));
     one.lenses.resize(1);
     QCOMPARE(camera::zoomLabel(one, 0, 0), QStringLiteral("1.0x"));
+    // Nothing counted for a Viewpro (the link shows the zoom it says) or a SIYI (no one knows it).
+    for (const QString &id : {QStringLiteral("A20KTR"), QStringLiteral("ZR10")}) {
+        QCOMPARE(camera::countedStepsMax(builtIn(id)), 0);
+        QCOMPARE(camera::zoomLabel(builtIn(id), 5, 5), QString());
+    }
 }
 
 void CameraProfileTest::aFileGivesTheSameCameraBack()
@@ -344,24 +397,125 @@ void CameraProfileTest::theTransportIsInTheFile()
     p = camera::fromFields(fields, &why);
     QVERIFY2(p.has_value(), qPrintable(why));
     QVERIFY(p->tcp);
+    // Only a TOP camera chooses: Viewpro takes its commands over TCP, SIYI over UDP (task AK),
+    // whatever the file says. A wrong value is still wrong.
+    Profile a20 = all.at(4);
+    Profile zr10 = all.at(5);
+    a20.tcp = false;
+    zr10.tcp = true;
+    QCOMPARE(camera::toJson(a20).value(QStringLiteral("transport")).toString(), QStringLiteral("tcp"));
+    QCOMPARE(camera::toJson(zr10).value(QStringLiteral("transport")).toString(), QStringLiteral("udp"));
+    QJsonObject viewpro = camera::toJson(all.at(4));
+    viewpro[QStringLiteral("transport")] = QStringLiteral("udp");
+    p = camera::fromJson(viewpro, QStringLiteral("v"), &why);
+    QVERIFY2(p.has_value(), qPrintable(why));
+    QVERIFY(p->controlOverTcp());
+    QJsonObject siyi = camera::toJson(all.at(5));
+    siyi[QStringLiteral("transport")] = QStringLiteral("tcp");
+    p = camera::fromJson(siyi, QStringLiteral("s"), &why);
+    QVERIFY2(p.has_value(), qPrintable(why));
+    QVERIFY(!p->controlOverTcp());
+    siyi.remove(QStringLiteral("transport"));
+    p = camera::fromJson(siyi, QStringLiteral("s"), &why);
+    QVERIFY2(p.has_value() && !p->controlOverTcp(), qPrintable(why));
+    viewpro[QStringLiteral("transport")] = QStringLiteral("serial");
+    QVERIFY(!camera::fromJson(viewpro, QStringLiteral("v"), &why).has_value());
+    QCOMPARE(why, QStringLiteral("its transport is not \"udp\" or \"tcp\"."));
 }
 
 void CameraProfileTest::theEditorsFieldsNeedNoFormat()
 {
     QJsonObject fields = camera::toJson(added(QStringLiteral("Gimbal X")));
     fields.remove(QStringLiteral("format"));
-    fields[QStringLiteral("protocol")] = QStringLiteral("anything");
+    fields.remove(QStringLiteral("protocol"));
     fields[QStringLiteral("id")] = QStringLiteral("gimbal-x");
     QString why;
-    const std::optional<Profile> p = camera::fromFields(fields, &why);
+    std::optional<Profile> p = camera::fromFields(fields, &why);
     QVERIFY2(p.has_value(), qPrintable(why));
     QCOMPARE(p->id, QStringLiteral("gimbal-x"));
-    // A file is not taken without them.
+    QVERIFY(p->protocol == Protocol::Top);  // fields without a protocol: Skydroid TOP
+    // The editor's protocol is taken (task AK), and one the app does not speak is refused.
+    QJsonObject viewpro = camera::toJson(builtIn(QStringLiteral("A20KTR")));
+    viewpro.remove(QStringLiteral("format"));
+    viewpro[QStringLiteral("name")] = QStringLiteral("Roof Viewpro");
+    viewpro[QStringLiteral("id")] = QString();
+    p = camera::fromFields(viewpro, &why);
+    QVERIFY2(p.has_value(), qPrintable(why));
+    QVERIFY(p->protocol == Protocol::Viewpro && p->zoom == Zoom::Live && p->controlOverTcp());
+    fields[QStringLiteral("protocol")] = QStringLiteral("anything");
+    QVERIFY(!camera::fromFields(fields, &why));
+    QCOMPARE(why, QStringLiteral("its protocol is not \"skydroid-top\", \"viewpro\" or \"siyi\"."));
+    // A file is not taken without its format.
+    fields[QStringLiteral("protocol")] = QStringLiteral("skydroid-top");
     QVERIFY(!camera::fromJson(fields, QStringLiteral("gimbal-x"), &why));
     QVERIFY2(why.contains(QStringLiteral("not a camera file")), qPrintable(why));
-    fields[QStringLiteral("format")] = QStringLiteral("vama-camera-1");
-    QVERIFY(!camera::fromJson(fields, QStringLiteral("gimbal-x"), &why));
-    QVERIFY2(why.contains(QStringLiteral("Skydroid TOP")), qPrintable(why));
+}
+
+// The same sentences as VGCS's (tests/test_camera_files.py, test_each_protocol_has_its_zooms_and_features).
+void CameraProfileTest::eachProtocolHasItsZoomsAndFeatures()
+{
+    const Profile a20 = builtIn(QStringLiteral("A20KTR"));
+    const Profile zr10 = builtIn(QStringLiteral("ZR10"));
+    const Profile top = added(QStringLiteral("Gimbal X"));
+    struct Case
+    {
+        Profile camera;
+        std::function<void(Profile &)> change;
+        const char *says;
+    };
+    const QList<Case> cases = {
+        {top, [](Profile &p) { p.zoom = Zoom::Live; }, "A Skydroid TOP camera's zoom is none, counted or reported."},
+        {top, [](Profile &p) { p.zoom = Zoom::Pulse; }, "A Skydroid TOP camera's zoom is none, counted or reported."},
+        {a20, [](Profile &p) { p.zoom = Zoom::Counted; }, "A Viewpro camera's zoom is none or live."},
+        {a20, [](Profile &p) { p.zoom = Zoom::Pulse; }, "A Viewpro camera's zoom is none or live."},
+        {zr10, [](Profile &p) { p.zoom = Zoom::Live; }, "A SIYI camera's zoom is none or pulse."},
+        {zr10, [](Profile &p) { p.zoom = Zoom::Reported; }, "A SIYI camera's zoom is none or pulse."},
+        {a20, [](Profile &p) { p.laser = true; }, "The app has no laser for a Viewpro or SIYI camera yet. Untick Laser."},
+        {zr10, [](Profile &p) { p.laser = true; }, "The app has no laser for a Viewpro or SIYI camera yet. Untick Laser."},
+        {a20, [](Profile &p) { p.ownTracker = true; },
+         "The app uses no tracker of a Viewpro or SIYI camera. Untick \"Its own object tracker\"."},
+        {top, [](Profile &p) { p.protocol = static_cast<Protocol>(9); },
+         "The protocol must be \"skydroid-top\", \"viewpro\" or \"siyi\"."},
+        {zr10, [](Profile &p) { p.thermalBySwitch = true; }, "Only a Viewpro camera switches its day video to the thermal picture."},
+        {top, [](Profile &p) { p.thermalBySwitch = true; }, "Only a Viewpro camera switches its day video to the thermal picture."},
+        {a20, [](Profile &p) { p.thermalVideoUrl = QStringLiteral("rtsp://192.168.2.119:554/stream1"); },
+         "A camera that switches to its thermal picture has no thermal video of its own: leave it empty."},
+        {a20, [](Profile &p) { p.thermalFovHDeg = 0.5; }, "The thermal lens's view must be 1 to 179 degrees."},
+    };
+    for (const Case &c : cases) {
+        Profile p = c.camera;
+        c.change(p);
+        QCOMPARE(camera::problem(p), QString::fromLatin1(c.says));
+    }
+    for (Profile p : {a20, zr10, top}) {
+        p.zoom = Zoom::None;
+        p.maxZoom = 0.0;
+        QVERIFY2(camera::problem(p).isEmpty(), qPrintable(camera::problem(p)));
+    }
+    // A file's zoom is checked against its protocol once it is read.
+    QJsonObject json = camera::toJson(a20);
+    json[QStringLiteral("zoom")] = QStringLiteral("counted");
+    QString why;
+    QVERIFY(!camera::fromJson(json, QStringLiteral("x"), &why));
+    QCOMPARE(why, QStringLiteral("A Viewpro camera's zoom is none or live."));
+    // A live or pulse zoom has the 1x view of the day lens, as none and counted do.
+    json = camera::toJson(a20);
+    json.remove(QStringLiteral("dayFovH"));
+    QVERIFY(!camera::fromJson(json, QStringLiteral("x"), &why));
+    QCOMPARE(why, QStringLiteral("it has no \"dayFovH\"."));
+    json = camera::toJson(zr10);
+    json.remove(QStringLiteral("maxZoom"));
+    QVERIFY2(camera::fromJson(json, QStringLiteral("x"), &why), qPrintable(why));
+    // The switch is read, with the thermal lens it needs; a file from before has none.
+    json = camera::toJson(a20);
+    QCOMPARE(json.value(QStringLiteral("thermalBySwitch")), QJsonValue(true));
+    json.remove(QStringLiteral("thermalFovH"));
+    QVERIFY(!camera::fromJson(json, QStringLiteral("x"), &why));
+    QCOMPARE(why, QStringLiteral("it has no \"thermalFovH\"."));
+    json = camera::toJson(top);
+    json.remove(QStringLiteral("thermalBySwitch"));
+    const std::optional<Profile> old = camera::fromJson(json, QStringLiteral("x"), &why);
+    QVERIFY2(old && !old->thermalBySwitch, qPrintable(why));
 }
 
 void CameraProfileTest::wrongValuesAreRefusedWithASentence()
@@ -448,13 +602,13 @@ void CameraProfileTest::savingMakesAFileThatIsReadAgain()
     store.setFolder(folder);
     store.load();
     QVERIFY(QDir(folder).exists());  // made, so files can be copied in
-    QCOMPARE(store.profiles().size(), 4);
+    QCOMPARE(store.profiles().size(), 6);
 
     QString id;
     QCOMPARE(store.save(added(QStringLiteral("Gimbal X")), &id), QString());
     QCOMPARE(id, QStringLiteral("gimbal-x"));
     QVERIFY(QFile::exists(QDir(folder).filePath(QStringLiteral("gimbal-x.json"))));
-    QCOMPARE(store.profiles().size(), 5);
+    QCOMPARE(store.profiles().size(), 7);
     QVERIFY(store.find(id) && !store.find(id)->builtIn);
 
     // Another store reads the file as it was saved.
@@ -470,7 +624,7 @@ void CameraProfileTest::savingMakesAFileThatIsReadAgain()
     changed.name = QStringLiteral("Gimbal X2");
     QCOMPARE(store.save(changed, &id), QString());
     QCOMPARE(id, QStringLiteral("gimbal-x"));
-    QCOMPARE(store.profiles().size(), 5);
+    QCOMPARE(store.profiles().size(), 7);
     QCOMPARE(store.find(id)->pitchMaxDeg, 25.0);
     QCOMPARE(store.find(id)->name, QStringLiteral("Gimbal X2"));
 
@@ -487,8 +641,11 @@ void CameraProfileTest::savingMakesAFileThatIsReadAgain()
         names.append(p.name);
     }
     QCOMPARE(names, QStringList({QStringLiteral("V12"), QStringLiteral("V13"), QStringLiteral("V14 Pro"),
-                                 QStringLiteral("V20"), QStringLiteral("C13"), QStringLiteral("Gimbal X!"),
-                                 QStringLiteral("Gimbal X2")}));
+                                 QStringLiteral("V20"), QStringLiteral("Viewpro A20KTR"), QStringLiteral("SIYI ZR10"),
+                                 QStringLiteral("C13"), QStringLiteral("Gimbal X!"), QStringLiteral("Gimbal X2")}));
+    // A camera named like the ZR10's id: the file is never "zr10.json" either.
+    QCOMPARE(store.save(added(QStringLiteral("ZR10")), &id), QString());
+    QCOMPARE(id, QStringLiteral("zr10-2"));
 
     // Wrong values: refused, nothing written.
     Profile wrong = added(QStringLiteral("Wrong"));
@@ -507,7 +664,8 @@ void CameraProfileTest::namesAreNotTwice()
     QCOMPARE(store.save(added(QStringLiteral("Gimbal X")), &id), QString());
     QVERIFY(store.save(added(QStringLiteral("gimbal x")), &id).contains(QStringLiteral("there already")));
     QVERIFY(store.save(added(QStringLiteral("V13")), &id).contains(QStringLiteral("there already")));
-    QCOMPARE(store.profiles().size(), 5);
+    QVERIFY(store.save(added(QStringLiteral("siyi zr10")), &id).contains(QStringLiteral("there already")));
+    QCOMPARE(store.profiles().size(), 7);
 }
 
 void CameraProfileTest::builtInCamerasStay()
@@ -526,7 +684,8 @@ void CameraProfileTest::builtInCamerasStay()
     QCOMPARE(store.find(QStringLiteral("C13"))->pitchMaxDeg, 10.0);
     QVERIFY(store.find(QStringLiteral("C13"))->builtIn);
     QVERIFY(store.remove(QStringLiteral("C13")).contains(QStringLiteral("built-in")));
-    QCOMPARE(store.profiles().size(), 5);
+    QVERIFY(store.remove(QStringLiteral("A20KTR")).contains(QStringLiteral("built-in")));
+    QCOMPARE(store.profiles().size(), 7);
 }
 
 void CameraProfileTest::filesThatAreNoCamerasAreSkippedWithANote()
@@ -538,6 +697,10 @@ void CameraProfileTest::filesThatAreNoCamerasAreSkippedWithANote()
     QJsonObject other = camera::toJson(added(QStringLiteral("Other")));
     other[QStringLiteral("format")] = QStringLiteral("someone-else-1");
     writeFile(folder.filePath(QStringLiteral("other.json")), QJsonDocument(other).toJson());
+    QJsonObject visca = camera::toJson(added(QStringLiteral("Visca")));
+    visca[QStringLiteral("protocol")] = QStringLiteral("visca");
+    writeFile(folder.filePath(QStringLiteral("visca.json")), QJsonDocument(visca).toJson());
+    // A V13's file that says SIYI: its counted zoom is no SIYI zoom.
     QJsonObject siyi = camera::toJson(added(QStringLiteral("Siyi")));
     siyi[QStringLiteral("protocol")] = QStringLiteral("siyi");
     writeFile(folder.filePath(QStringLiteral("siyi.json")), QJsonDocument(siyi).toJson());
@@ -558,13 +721,15 @@ void CameraProfileTest::filesThatAreNoCamerasAreSkippedWithANote()
     camera::Store store;
     store.setFolder(dir.path());
     store.load();
-    QCOMPARE(store.profiles().size(), 5);
+    QCOMPARE(store.profiles().size(), 7);
     QVERIFY(store.find(QStringLiteral("good")));
     const QString notes = store.notes().join(QLatin1Char('\n'));
-    QCOMPARE(store.notes().size(), 9);
+    QCOMPARE(store.notes().size(), 10);
     for (const char *says : {"broken.json: it is not a camera file", "other.json: it is not a camera file",
-                             "siyi.json: its protocol is not Skydroid TOP", "noport.json: it has no \"port\"",
-                             "badzoom.json: its zoom is not one of", "C13.json: it has the file name of a built-in camera",
+                             "visca.json: its protocol is not \"skydroid-top\", \"viewpro\" or \"siyi\".",
+                             "siyi.json: A SIYI camera's zoom is none or pulse.", "noport.json: it has no \"port\"",
+                             "badzoom.json: its zoom is not one of none, counted, reported, live or pulse.",
+                             "C13.json: it has the file name of a built-in camera",
                              "twin.json: a camera named \"Good\" is there already", "wrong.json: The turn either way",
                              "big.json: it is too big"}) {
         QVERIFY2(notes.contains(QLatin1String(says)), qPrintable(QStringLiteral("%1 not in:\n%2").arg(QLatin1String(says), notes)));
@@ -582,7 +747,7 @@ void CameraProfileTest::deletingRemovesTheFile()
     QCOMPARE(store.remove(id), QString());
     QVERIFY(!QFile::exists(QDir(dir.path()).filePath(id + QStringLiteral(".json"))));
     QVERIFY(!store.find(id));
-    QCOMPARE(store.profiles().size(), 4);
+    QCOMPARE(store.profiles().size(), 6);
     QVERIFY(store.remove(id).contains(QStringLiteral("no such camera")));
 }
 
@@ -595,7 +760,7 @@ void CameraProfileTest::theFilesVgcsWritesAreRead()
     store.load();
     QVERIFY2(store.notes().isEmpty(), qPrintable(store.notes().join(QLatin1Char('\n'))));
     const QFileInfoList files = QDir(sampleFolder("vgcs")).entryInfoList({QStringLiteral("*.json")}, QDir::Files, QDir::Name);
-    QCOMPARE(files.size(), 8);
+    QCOMPARE(files.size(), 10);  // with a Viewpro and a SIYI camera, which VGCS writes for the app
     for (const QFileInfo &file : files) {
         const Profile *p = store.find(file.completeBaseName());
         QVERIFY2(p && !p->builtIn, qPrintable(file.fileName()));
@@ -635,7 +800,7 @@ void CameraProfileTest::theAppWritesTheFilesVgcsReads()
         QVERIFY2(f.open(QIODevice::ReadOnly), qPrintable(path + QStringLiteral(" is missing: run once with VAMA_WRITE_CAMERA_FILES=1")));
         QCOMPARE(f.readAll(), bytes);
     }
-    QCOMPARE(added, 8);
+    QCOMPARE(added, 10);
     QCOMPARE(apk.entryList({QStringLiteral("*.json")}, QDir::Files).size(), added);
 }
 

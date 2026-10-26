@@ -7,10 +7,11 @@ import QGroundControl.Controls
 
 // VAMA (task AA, client 2026-10-16): the cameras the app knows, for the admin. The camera
 // settings open this in Advanced Mode, so only after the admin password (task Z).
-//  - A built-in camera (V12, V13, V14 Pro) is copied, never changed.
+//  - A built-in camera (V12, V13, V14 Pro, V20, Viewpro A20KTR, SIYI ZR10) is copied, never changed.
 //  - An added camera is a file in the app's folder "Cameras" (SkydroidLink.cameraFolder).
 //    Copied into that folder on another remote control, it is in the list there too.
-//  - Every camera speaks Skydroid's TOP protocol (CameraProfile.h).
+//  - A copy speaks the protocol of the camera it was copied from: Skydroid TOP, Viewpro or SIYI
+//    (task AK, CameraProfile.h). The form shows what that protocol has.
 // FlyViewCustomLayer.qml makes this window when it is first asked for.
 Popup {
     id:          root
@@ -31,9 +32,23 @@ Popup {
     property string _askDelete:  ""    // the id of the camera that Delete asks about
     property real   _labelWidth: ScreenTools.defaultFontPixelWidth * 20
 
-    // The zoom kinds of CameraProfile.h, in the order of the zoom box.
-    readonly property var _zoomKinds: ["none", "counted", "reported"]
+    // The protocol of the camera in the form, and the zoom kinds it has (CameraProfile.h), in
+    // the order of the zoom box.
+    readonly property string _protocol: _fields && _fields.protocol ? _fields.protocol : "skydroid-top"
+    readonly property bool   _top:      _protocol === "skydroid-top"
+    readonly property var    _protocolZooms: ({ "skydroid-top": ["none", "counted", "reported"],
+                                                "viewpro":      ["none", "live"],
+                                                "siyi":         ["none", "pulse"] })
+    readonly property var    _zoomKinds: _protocolZooms[_protocol] || _protocolZooms["skydroid-top"]
+    readonly property var    _zoomNames: ({ "none":     qsTr("No zoom"),
+                                            "counted":  qsTr("Steps of 0.1x (as the V12 and V13)"),
+                                            "reported": qsTr("The camera reports its zoom step (as the V14 Pro)"),
+                                            "live":     qsTr("The camera says its zoom and its view (as the A20KTR)"),
+                                            "pulse":    qsTr("It zooms and does not say how far (as the ZR10)") })
+    readonly property string _zoomKind:  _zoomKinds[zoomBox.currentIndex] || "none"
+    readonly property bool   _thermalBySwitch: _protocol === "viewpro" && thermalBySwitchBox.checked
     // How the control commands reach the camera, in the order of the link box (the C20: TCP).
+    // Only a TOP camera has the choice: Viewpro takes TCP, SIYI UDP.
     readonly property var _transportKinds: ["udp", "tcp"]
 
     onOpened: {
@@ -65,6 +80,7 @@ Popup {
         transportBox.currentIndex = Math.max(0, _transportKinds.indexOf(f.transport))
         dayVideoField.text = f.dayVideoUrl
         thermalVideoField.text = f.thermalVideoUrl
+        thermalBySwitchBox.checked = f.thermalBySwitch === true
         zoomBox.currentIndex = Math.max(0, _zoomKinds.indexOf(f.zoom))
         fovHField.text = String(f.dayFovH)
         fovVField.text = String(f.dayFovV)
@@ -105,7 +121,8 @@ Popup {
         f.port = _number(portField.text)
         f.transport = _transportKinds[transportBox.currentIndex]
         f.dayVideoUrl = dayVideoField.text
-        f.thermalVideoUrl = thermalVideoField.text
+        f.thermalBySwitch = _thermalBySwitch
+        f.thermalVideoUrl = _thermalBySwitch ? "" : thermalVideoField.text  // the day video carries it
         f.zoom = _zoomKinds[zoomBox.currentIndex]
         f.dayFovH = _number(fovHField.text)
         f.dayFovV = _number(fovVField.text)
@@ -188,7 +205,7 @@ Popup {
                 visible:          root._fields === null
                 wrapMode:         Text.WordWrap
                 font.pointSize:   ScreenTools.smallFontPointSize
-                text:             qsTr("Copy a camera to add a new one. Every camera here speaks Skydroid's TOP protocol: a camera with another protocol needs an app update. Cameras you add are files in %1. Copy such a file into that folder on another remote control, and the camera is in its list too.").arg(root.link.cameraFolder)
+                text:             qsTr("Copy a camera to add a new one. The copy speaks the protocol of the camera it was copied from: Skydroid TOP, Viewpro or SIYI. A camera with another protocol needs an app update. Cameras you add are files in %1. Copy such a file into that folder on another remote control, and the camera is in its list too.").arg(root.link.cameraFolder)
             }
 
             QGCLabel {
@@ -277,23 +294,44 @@ Popup {
                 QGCLabel { text: qsTr("Control port"); Layout.preferredWidth: root._labelWidth }
                 NumberField { id: portField; objectName: "vamaCameraPort" }
 
-                QGCLabel { text: qsTr("Control link"); Layout.preferredWidth: root._labelWidth }
+                QGCLabel { text: qsTr("Protocol"); Layout.preferredWidth: root._labelWidth }
+                QGCLabel {
+                    objectName:       "vamaCameraProtocol"
+                    Layout.fillWidth: true
+                    wrapMode:         Text.WordWrap
+                    text:             root._protocol === "viewpro" ? qsTr("Viewpro, over TCP (as the A20KTR)")
+                                    : root._protocol === "siyi"    ? qsTr("SIYI, over UDP (as the ZR10)")
+                                                                   : qsTr("Skydroid TOP")
+                }
+
+                QGCLabel { text: qsTr("Control link"); Layout.preferredWidth: root._labelWidth; visible: root._top }
                 QGCComboBox {
                     id:               transportBox
                     objectName:       "vamaCameraTransport"
                     Layout.fillWidth: true
+                    visible:          root._top
                     model:            [qsTr("UDP (as the V12, V13 and V14 Pro)"), qsTr("TCP (as the V20)")]
                 }
 
                 QGCLabel { text: qsTr("Day video"); Layout.preferredWidth: root._labelWidth }
                 QGCTextField { id: dayVideoField; objectName: "vamaCameraDayVideo"; Layout.fillWidth: true }
 
-                QGCLabel { text: qsTr("Thermal video"); Layout.preferredWidth: root._labelWidth }
+                QGCLabel { text: qsTr("Thermal video"); Layout.preferredWidth: root._labelWidth; visible: !root._thermalBySwitch }
                 QGCTextField {
                     id:               thermalVideoField
                     objectName:       "vamaCameraThermalVideo"
                     Layout.fillWidth: true
+                    visible:          !root._thermalBySwitch
                     placeholderText:  qsTr("Empty: no thermal picture")
+                }
+
+                // A Viewpro shows its thermal picture in its one video, after a sensor switch.
+                Item { width: 1; height: 1; visible: root._protocol === "viewpro" }
+                QGCCheckBox {
+                    id:         thermalBySwitchBox
+                    objectName: "vamaCameraThermalBySwitch"
+                    visible:    root._protocol === "viewpro"
+                    text:       qsTr("The thermal picture comes in the day video, by a switch (as the A20KTR)")
                 }
 
                 Item { width: 1; height: 1 }
@@ -313,18 +351,18 @@ Popup {
                     id:               zoomBox
                     objectName:       "vamaCameraZoom"
                     Layout.fillWidth: true
-                    model:            [qsTr("No zoom"), qsTr("Steps of 0.1x (as the V12 and V13)"),
-                                       qsTr("The camera reports its zoom step (as the V14 Pro)")]
+                    model:            root._zoomKinds.map(function(kind) { return root._zoomNames[kind] })
                 }
 
                 QGCLabel {
-                    text:                  qsTr("Day lens, across and up-down (degrees)")
+                    text:                  root._zoomKind === "live" ? qsTr("Day lens at 1x, until the camera says its view (degrees)")
+                                                                     : qsTr("Day lens, across and up-down (degrees)")
                     Layout.preferredWidth: root._labelWidth
                     wrapMode:              Text.WordWrap
-                    visible:               zoomBox.currentIndex !== 2
+                    visible:               root._zoomKind !== "reported"
                 }
                 RowLayout {
-                    visible: zoomBox.currentIndex !== 2
+                    visible: root._zoomKind !== "reported"
                     NumberField { id: fovHField; objectName: "vamaCameraFovH" }
                     NumberField { id: fovVField; objectName: "vamaCameraFovV" }
                 }
@@ -332,15 +370,15 @@ Popup {
                 QGCLabel {
                     text:                  qsTr("Highest zoom (times)")
                     Layout.preferredWidth: root._labelWidth
-                    visible:               zoomBox.currentIndex === 1
+                    visible:               root._zoomKind === "counted"
                 }
-                NumberField { id: maxZoomField; objectName: "vamaCameraMaxZoom"; visible: zoomBox.currentIndex === 1 }
+                NumberField { id: maxZoomField; objectName: "vamaCameraMaxZoom"; visible: root._zoomKind === "counted" }
             }
 
             // The lenses of a camera that reports its zoom step: across, up-down, first and last step.
             ColumnLayout {
                 Layout.fillWidth: true
-                visible:          root._fields !== null && zoomBox.currentIndex === 2
+                visible:          root._fields !== null && root._zoomKind === "reported"
                 spacing:          ScreenTools.defaultFontPixelHeight / 4
 
                 QGCLabel {
@@ -421,8 +459,10 @@ Popup {
                 QGCLabel { text: qsTr("Turn either way (degrees)"); Layout.preferredWidth: root._labelWidth }
                 NumberField { id: yawLimitField; objectName: "vamaCameraYawLimit" }
 
-                QGCCheckBox { id: laserBox; objectName: "vamaCameraLaser"; text: qsTr("Laser") }
+                // The app has no laser and no tracker of a Viewpro or SIYI camera (CameraProfile.h).
+                QGCCheckBox { id: laserBox; objectName: "vamaCameraLaser"; text: qsTr("Laser"); visible: root._top }
                 RowLayout {
+                    visible: root._top
                     QGCLabel { text: qsTr("Longest reading (m)"); enabled: laserBox.checked }
                     NumberField { id: laserMaxField; objectName: "vamaCameraLaserMax"; enabled: laserBox.checked }
                 }
@@ -430,8 +470,8 @@ Popup {
                 QGCCheckBox { id: photoBox; objectName: "vamaCameraPhoto"; text: qsTr("Photo") }
                 QGCCheckBox { id: recordBox; objectName: "vamaCameraRecord"; text: qsTr("Video recording") }
 
-                QGCCheckBox { id: trackerBox; objectName: "vamaCameraOwnTracker"; text: qsTr("Its own object tracker") }
-                QGCCheckBox { id: upperHeaderBox; text: qsTr("Upper-case gimbal frames only (as the V14 Pro)") }
+                QGCCheckBox { id: trackerBox; objectName: "vamaCameraOwnTracker"; text: qsTr("Its own object tracker"); visible: root._top }
+                QGCCheckBox { id: upperHeaderBox; text: qsTr("Upper-case gimbal frames only (as the V14 Pro)"); visible: root._top }
             }
 
             QGCLabel {

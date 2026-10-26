@@ -17,7 +17,9 @@ namespace skydroid::camera {
 namespace {
 
 constexpr const char kFormat[] = "vama-camera-1";
-constexpr const char kProtocol[] = "skydroid-top";
+constexpr const char kProtocolTop[] = "skydroid-top";
+constexpr const char kProtocolViewpro[] = "viewpro";
+constexpr const char kProtocolSiyi[] = "siyi";
 constexpr double kPi = 3.14159265358979323846;
 constexpr qint64 kMaxFileBytes = 64 * 1024;
 constexpr int kMaxLenses = 4;
@@ -29,6 +31,12 @@ constexpr const char kSkydroidHost[] = "192.168.144.108";
 constexpr int kSkydroidPort = 5000;
 constexpr const char kSkydroidDayUrl[] = "rtsp://192.168.144.108:554/stream=1";
 constexpr const char kSkydroidThermalUrl[] = "rtsp://192.168.144.108:555/stream=2";
+
+// Viewpro and SIYI as VGCS has them (vgcs/video/camera_control.py, vgcs/skydroid/camera_files.py).
+constexpr const char kViewproHost[] = "192.168.2.119";  // the factory address printed on the unit
+constexpr int kViewproPort = 2000;
+constexpr const char kSiyiHost[] = "192.168.144.25";
+constexpr int kSiyiPort = 37260;
 
 QString text(const char *sentence)
 {
@@ -78,10 +86,27 @@ QString zoomName(Zoom zoom)
         return QStringLiteral("none");
     case Zoom::Reported:
         return QStringLiteral("reported");
+    case Zoom::Live:
+        return QStringLiteral("live");
+    case Zoom::Pulse:
+        return QStringLiteral("pulse");
     case Zoom::Counted:
         break;
     }
     return QStringLiteral("counted");
+}
+
+QString protocolName(Protocol protocol)
+{
+    switch (protocol) {
+    case Protocol::Viewpro:
+        return QString::fromLatin1(kProtocolViewpro);
+    case Protocol::Siyi:
+        return QString::fromLatin1(kProtocolSiyi);
+    case Protocol::Top:
+        break;
+    }
+    return QString::fromLatin1(kProtocolTop);
 }
 
 bool isRtsp(const QString &url)
@@ -164,7 +189,50 @@ QList<Profile> builtInProfiles()
     c20.ownTracker = false;
     c20.upperGimbalHeader = true;
 
-    return {c12, c13, c14, c20};
+    // The Viewpro A20KTR (task AK): Viewpro's protocol over TCP 2000, its main stream. 70.2 x 43.1
+    // is the view its own screen showed at 1x, used until the camera says its own (it says its zoom
+    // and its view in every status). Its tilt and turn are estimates, not from a data sheet. Its
+    // thermal picture comes in the same video after a sensor switch; its thermal lens is not known,
+    // so a point on the thermal picture is placed at the cross only. No laser in the app yet. Its
+    // own tracker is not used (as in VGCS).
+    Profile a20;
+    a20.id = QStringLiteral("A20KTR");
+    a20.name = QStringLiteral("Viewpro A20KTR");
+    a20.builtIn = true;
+    a20.protocol = Protocol::Viewpro;
+    a20.host = QString::fromLatin1(kViewproHost);
+    a20.port = kViewproPort;
+    a20.dayVideoUrl = QStringLiteral("rtsp://192.168.2.119:554/stream0");
+    a20.thermalBySwitch = true;
+    a20.fovHDeg = 70.2;
+    a20.fovVDeg = 43.1;
+    a20.zoom = Zoom::Live;
+    a20.pitchMaxDeg = 30.0;
+    a20.yawLimitDeg = 150.0;
+    a20.laser = false;
+    a20.ownTracker = false;
+
+    // The SIYI ZR10 (task AK): SIYI's protocol over UDP 37260. 71.5 degrees wide at 1x (ZR10
+    // manual), 45.2 high (from its diagonal). It zooms while it is told to and does not say how
+    // far, so its view holds at 1x only. -90 to +25 degrees, 45 either way: the range it can be
+    // told to go (DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md). No laser, no thermal picture.
+    Profile zr10;
+    zr10.id = QStringLiteral("ZR10");
+    zr10.name = QStringLiteral("SIYI ZR10");
+    zr10.builtIn = true;
+    zr10.protocol = Protocol::Siyi;
+    zr10.host = QString::fromLatin1(kSiyiHost);
+    zr10.port = kSiyiPort;
+    zr10.dayVideoUrl = QStringLiteral("rtsp://192.168.144.25:8554/main.264");
+    zr10.fovHDeg = 71.5;
+    zr10.fovVDeg = 45.2;
+    zr10.zoom = Zoom::Pulse;
+    zr10.pitchMaxDeg = 25.0;
+    zr10.yawLimitDeg = 45.0;
+    zr10.laser = false;
+    zr10.ownTracker = false;
+
+    return {c12, c13, c14, c20, a20, zr10};
 }
 
 QString defaultId()
@@ -243,6 +311,42 @@ QString problem(const Profile &p)
     if (!p.thermalVideoUrl.trimmed().isEmpty() && !isRtsp(p.thermalVideoUrl.trimmed())) {
         return text("The thermal video must be an RTSP address (rtsp://...), or empty for a camera without one.");
     }
+    // Each protocol has its zooms, and the app uses no laser or tracker of a Viewpro or SIYI camera.
+    switch (p.protocol) {
+    case Protocol::Top:
+        if (p.zoom != Zoom::None && p.zoom != Zoom::Counted && p.zoom != Zoom::Reported) {
+            return text("A Skydroid TOP camera's zoom is none, counted or reported.");
+        }
+        break;
+    case Protocol::Viewpro:
+        if (p.zoom != Zoom::None && p.zoom != Zoom::Live) {
+            return text("A Viewpro camera's zoom is none or live.");
+        }
+        break;
+    case Protocol::Siyi:
+        if (p.zoom != Zoom::None && p.zoom != Zoom::Pulse) {
+            return text("A SIYI camera's zoom is none or pulse.");
+        }
+        break;
+    default:
+        return text("The protocol must be \"skydroid-top\", \"viewpro\" or \"siyi\".");
+    }
+    if (p.protocol != Protocol::Top) {
+        if (p.laser) {
+            return text("The app has no laser for a Viewpro or SIYI camera yet. Untick Laser.");
+        }
+        if (p.ownTracker) {
+            return text("The app uses no tracker of a Viewpro or SIYI camera. Untick \"Its own object tracker\".");
+        }
+    }
+    if (p.thermalBySwitch) {
+        if (p.protocol != Protocol::Viewpro) {
+            return text("Only a Viewpro camera switches its day video to the thermal picture.");
+        }
+        if (!p.thermalVideoUrl.trimmed().isEmpty()) {
+            return text("A camera that switches to its thermal picture has no thermal video of its own: leave it empty.");
+        }
+    }
     if (p.zoom == Zoom::Reported) {
         if (p.lenses.empty() || p.lenses.size() > static_cast<size_t>(kMaxLenses)) {
             return text("A camera that reports its zoom step needs 1 to %1 lenses.").arg(kMaxLenses);
@@ -275,7 +379,7 @@ QString problem(const Profile &p)
             return text("The highest zoom must be 1.1x to 100x.");
         }
     }
-    if (!p.thermalVideoUrl.trimmed().isEmpty() &&
+    if ((!p.thermalVideoUrl.trimmed().isEmpty() || p.thermalBySwitch) &&
         (!inRange(p.thermalFovHDeg, 1.0, 179.0) || !inRange(p.thermalFovVDeg, 1.0, 179.0))) {
         return text("The thermal lens's view must be 1 to 179 degrees.");
     }
@@ -297,12 +401,13 @@ QJsonObject toJson(const Profile &p)
     QJsonObject o;
     o[QStringLiteral("format")] = QString::fromLatin1(kFormat);
     o[QStringLiteral("name")] = p.name;
-    o[QStringLiteral("protocol")] = QString::fromLatin1(kProtocol);
+    o[QStringLiteral("protocol")] = protocolName(p.protocol);
     o[QStringLiteral("host")] = p.host;
     o[QStringLiteral("port")] = p.port;
-    o[QStringLiteral("transport")] = p.tcp ? QStringLiteral("tcp") : QStringLiteral("udp");
+    o[QStringLiteral("transport")] = p.controlOverTcp() ? QStringLiteral("tcp") : QStringLiteral("udp");
     o[QStringLiteral("dayVideoUrl")] = p.dayVideoUrl;
     o[QStringLiteral("thermalVideoUrl")] = p.thermalVideoUrl;
+    o[QStringLiteral("thermalBySwitch")] = p.thermalBySwitch;
     o[QStringLiteral("zoom")] = zoomName(p.zoom);
     o[QStringLiteral("dayFovH")] = p.fovHDeg;
     o[QStringLiteral("dayFovV")] = p.fovVDeg;
@@ -368,8 +473,16 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
     if (json.value(QStringLiteral("format")).toString() != QLatin1String(kFormat)) {
         return fail(text("it is not a camera file of this app (no \"format\": \"%1\").").arg(QLatin1String(kFormat)));
     }
-    if (json.value(QStringLiteral("protocol")).toString() != QLatin1String(kProtocol)) {
-        return fail(text("its protocol is not Skydroid TOP (\"%1\"), the only one the app speaks.").arg(QLatin1String(kProtocol)));
+    Profile p;
+    const QJsonValue protocol = json.value(QStringLiteral("protocol"));
+    if (protocol == QJsonValue(QLatin1String(kProtocolTop))) {
+        p.protocol = Protocol::Top;
+    } else if (protocol == QJsonValue(QLatin1String(kProtocolViewpro))) {
+        p.protocol = Protocol::Viewpro;
+    } else if (protocol == QJsonValue(QLatin1String(kProtocolSiyi))) {
+        p.protocol = Protocol::Siyi;
+    } else {
+        return fail(text("its protocol is not \"skydroid-top\", \"viewpro\" or \"siyi\"."));
     }
     // Files from before the C20 have no transport: UDP, as every camera had then.
     const QJsonValue transport = json.value(QStringLiteral("transport"));
@@ -377,7 +490,7 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
         && transport != QJsonValue(QStringLiteral("tcp"))) {
         return fail(text("its transport is not \"udp\" or \"tcp\"."));
     }
-    Profile p;
+    // The file's own; it counts for TOP only (controlOverTcp: Viewpro takes TCP, SIYI UDP).
     p.tcp = transport == QJsonValue(QStringLiteral("tcp"));
     p.id = id;
     p.builtIn = false;
@@ -386,6 +499,7 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
     p.port = integer("port");
     p.dayVideoUrl = value("dayVideoUrl").toString().trimmed();
     p.thermalVideoUrl = json.value(QStringLiteral("thermalVideoUrl")).toString().trimmed();
+    p.thermalBySwitch = flag("thermalBySwitch", false);  // files from before task AK have none: no switch
     const QString zoom = value("zoom").toString();
     if (zoom == QLatin1String("none")) {
         p.zoom = Zoom::None;
@@ -393,8 +507,12 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
         p.zoom = Zoom::Counted;
     } else if (zoom == QLatin1String("reported")) {
         p.zoom = Zoom::Reported;
+    } else if (zoom == QLatin1String("live")) {
+        p.zoom = Zoom::Live;
+    } else if (zoom == QLatin1String("pulse")) {
+        p.zoom = Zoom::Pulse;
     } else if (missing.isEmpty()) {
-        return fail(text("its zoom is not one of none, counted or reported."));
+        return fail(text("its zoom is not one of none, counted, reported, live or pulse."));
     }
     if (p.zoom == Zoom::Reported) {
         p.lenses.clear();
@@ -426,7 +544,7 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
             p.maxZoom = number("maxZoom");
         }
     }
-    if (!p.thermalVideoUrl.isEmpty()) {
+    if (p.hasThermal()) {
         p.thermalFovHDeg = number("thermalFovH");
         p.thermalFovVDeg = number("thermalFovV");
     }
@@ -456,7 +574,9 @@ std::optional<Profile> fromFields(const QJsonObject &fields, QString *why)
 {
     QJsonObject json = fields;
     json[QStringLiteral("format")] = QString::fromLatin1(kFormat);
-    json[QStringLiteral("protocol")] = QString::fromLatin1(kProtocol);
+    if (!json.contains(QStringLiteral("protocol"))) {
+        json[QStringLiteral("protocol")] = QString::fromLatin1(kProtocolTop);
+    }
     return fromJson(json, fields.value(QStringLiteral("id")).toString(), why);
 }
 

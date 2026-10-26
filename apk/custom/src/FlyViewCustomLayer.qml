@@ -88,16 +88,30 @@ Item {
 
     // IR: the thermal picture is a second RTSP stream, so the button switches
     // QGC's video address between the day and thermal streams (as VGCS does).
+    // A Viewpro shows it in its one video after a sensor switch (thermalBySwitch, task AK):
+    // then the link switches the camera, and says which picture shows.
     property var  _videoSettings: QGroundControl.settingsManager.videoSettings
+    readonly property bool _thermalBySwitch: _link.camera.thermalBySwitch === true
     // (A camera without a thermal picture has an empty address: then IR is never on.)
-    property bool _thermalOn:     _videoSettings && _link.camera.thermal && _link.thermalVideoUrl !== ""
-                                  ? _videoSettings.rtspUrl.rawValue === _link.thermalVideoUrl : false
+    property bool _thermalOn:     _thermalBySwitch ? _link.thermalPicture
+                                  : (_videoSettings && _link.camera.thermal && _link.thermalVideoUrl !== ""
+                                     ? _videoSettings.rtspUrl.rawValue === _link.thermalVideoUrl : false)
     // A point from the picture needs the lens of the picture that shows.
-    Binding { target: _link; property: "thermalPicture"; value: _thermalOn }
+    Binding {
+        target:      _link
+        property:    "thermalPicture"
+        value:       _thermalOn
+        when:        !_thermalBySwitch
+        restoreMode: Binding.RestoreNone
+    }
     // While the lock button waits for an object, the app marks the people and vehicles it finds.
     Binding { target: _marks; property: "looking"; value: _lockPicking && _dragAvailable }
 
     function _toggleThermal() {
+        if (_thermalBySwitch) {
+            _link.switchThermal(!_link.thermalPicture)
+            return
+        }
         if (!_videoSettings) {
             return
         }
