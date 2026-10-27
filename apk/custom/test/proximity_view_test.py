@@ -10,10 +10,13 @@ does not know (the client's RPLidar A3).
 QGC's own ProximityRadarValues.qml put a "0.00" label in the middle of the
 video for each empty direction of such a sensor. The checks below run our copy
 (src/ProximityRadarValues.qml, served by custom.qrc in place of QGC's file),
-and QGC's own file once, to show that the copy is still needed.
+and QGC's own file once, to show that the copy is still needed. Our copy takes
+the directions from the app's store (src/ProximityStore.h): here a stand-in
+gives what the store publishes, NaN for a direction with nothing in range or
+not heard lately (test/link/proximity_store_test.cc checks the store itself).
 
-QGC's own modules (ScreenTools, QGCLabel) are stood in for by small QML files
-in a temporary folder.
+QGC's own modules (ScreenTools, QGCLabel) and the store are stood in for by
+small QML files in a temporary folder.
 
 Usage:
     py apk/custom/test/proximity_view_test.py
@@ -60,7 +63,12 @@ def stand_ins(root: pathlib.Path, values_file: pathlib.Path) -> None:
     gc = root / "QGroundControl"
     for sub in ("Controls", "FlyView", "FlightMap"):
         (gc / sub).mkdir(parents=True, exist_ok=True)
-    (gc / "qmldir").write_text("module QGroundControl\nsingleton ScreenTools 1.0 ScreenTools.qml\n")
+    (gc / "qmldir").write_text("module QGroundControl\nsingleton ScreenTools 1.0 ScreenTools.qml\n"
+                               "singleton ProximityStore 1.0 ProximityStore.qml\n")
+    # The app's store (src/ProximityStore.h): forVehicle gives the scene's stand-in for the drone's directions.
+    (gc / "ProximityStore.qml").write_text(
+        "pragma Singleton\nimport QtQuick\nQtObject {\n    id: store\n    property var current: null\n"
+        "    function forVehicle(vehicleId) { return store.current }\n}\n")
     (gc / "ScreenTools.qml").write_text(
         "pragma Singleton\nimport QtQuick\nQtObject { property real defaultFontPixelHeight: 16 }\n")
     (gc / "Controls" / "qmldir").write_text("module QGroundControl.Controls\nQGCLabel 1.0 QGCLabel.qml\n")
@@ -76,8 +84,18 @@ def stand_ins(root: pathlib.Path, values_file: pathlib.Path) -> None:
         "module QGroundControl.FlightMap\nProximityRadarMapView 1.0 ProximityRadarMapView.qml\n")
 
 
+def published(sectors: list, max_m: float | None) -> list[float]:
+    """What the app's store gives for these readings: nothing in range (0 or less, or the range) is NaN."""
+    out = []
+    for value in sectors:
+        empty = value is None or math.isnan(value) or value <= 0 or (bool(max_m) and value >= max_m)
+        out.append(math.nan if empty else float(value))
+    return out
+
+
 def drone_qml(sectors: list, max_m: float | None, heading: float, telemetry: bool = True) -> str:
-    """A made-up vehicle with QGC's distanceSensors fact group: each fact a value and its text."""
+    """A made-up vehicle with QGC's distanceSensors fact group (each fact a value and its text), and what
+    the app's store publishes for the same readings (vamaSectors, given to the stand-in store)."""
     def fact(value):
         number = "NaN" if value is None else repr(float(value))
         return (f"QtObject {{ property real value: {number}; "
@@ -90,6 +108,11 @@ def drone_qml(sectors: list, max_m: float | None, heading: float, telemetry: boo
             f"{rows}\n"
             f"        property QtObject maxDistance: {fact(max_m)}\n"
             "    }\n"
+            "    property QtObject vamaSectors: QtObject {\n"
+            f"        property bool telemetryAvailable: {'true' if telemetry else 'false'}\n"
+            f"        property var values: [{', '.join('NaN' if math.isnan(v) else repr(v) for v in published(sectors, max_m))}]\n"
+            f"        property real maxDistance: {float(max_m or 0.0)!r}\n"
+            "    }\n"
             "}\n")
 
 
@@ -98,9 +121,11 @@ def scene(folder: pathlib.Path, kind: str, drone: str) -> pathlib.Path:
         body = f"""import QtQuick
 import QtLocation
 import QtPositioning
+import QGroundControl
 import QGroundControl.FlightMap
 Rectangle {{
     width: {MAP_SIZE[0]}; height: {MAP_SIZE[1]}; color: "#202428"
+    Component.onCompleted: ProximityStore.current = theDrone.vamaSectors
     Map {{
         id: theMap
         anchors.fill: parent
@@ -120,9 +145,11 @@ Rectangle {{
 """
     else:
         body = f"""import QtQuick
+import QGroundControl
 import QGroundControl.FlyView
 Rectangle {{
     width: {VIDEO_SIZE[0]}; height: {VIDEO_SIZE[1]}; color: "#202428"
+    Component.onCompleted: ProximityStore.current = theDrone.vamaSectors
     ProximityRadarVideoView {{
         objectName: "radar"
         vehicle: theDrone
@@ -188,9 +215,14 @@ def render(app, folder: pathlib.Path, kind: str, drone: str, change: dict | None
     wait(500)
     image = view.grabWindow()
     if change:
-        sensors = view.rootObject().property("theDrone").property("distanceSensors")
+        drone_object = view.rootObject().property("theDrone")
+        sensors = drone_object.property("distanceSensors")
         for name, metres in change.items():
             sensors.property(name).setProperty("value", float(metres))
+        # And what the store publishes for the new readings.
+        readings = [float(sensors.property(name).property("value")) for name in ROTATIONS]
+        top = float(sensors.property("maxDistance").property("value"))
+        drone_object.property("vamaSectors").setProperty("values", published(readings, None if math.isnan(top) else top))
         wait(300)
         image = view.grabWindow()
 
@@ -280,6 +312,14 @@ def main() -> int:
                 f"map, the A3: the arc follows to 2 m (mean {sum(distances) / max(1, len(distances)):.1f} px)")
         video = render(app, ours, "video", a3_ahead, change={"rotationNone": 0.0})
         r.check(not video.labels and not video.red, f"video, the A3: the object gone, nothing left ({video.labels})")
+
+        # Something in every direction: then only the direction that changed tells the video radar to redraw
+        # (an empty direction is NaN, and QML announces a NaN again at every update, so it redraws the rest too).
+        all_round = drone_qml([5.0, 5.5, 5.0, 5.5, 5.0, 5.5, 5.0, 5.5], 0.0, 0.0)
+        video = render(app, ours, "video", all_round, change={"rotationNone": 2.0})
+        ahead = [d for d, a in zip(video.red_distance_px(), video.red_angles_deg()) if abs((a + 180.0) % 360.0 - 180.0) < 20.0]
+        r.check("2.00" in [t for t, _x, _y in video.labels] and bool(ahead) and max(ahead) < 100.0,
+                f"video, something all round: the arc ahead follows to 2 m (out to {max(ahead, default=0.0):.0f} px)")
 
         a3_two = drone_qml([0, 0, 3.0, 0, 4.0, 0, 0, 0], 0.0, 0.0)       # 3 m right, 4 m behind
         video = render(app, ours, "video", a3_two)

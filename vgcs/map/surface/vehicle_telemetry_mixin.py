@@ -15,6 +15,11 @@ from vgcs.map.surface.constants import (
     _MAP_MOVE_DISARM_SPEED_MPS,
     _MAP_POSITION_MIN_MOVE_M,
 )
+from vgcs.observe.target_measure import downward_rangefinder_height_m, is_downward_sensor_orientation
+
+# The downward rangefinder's height goes this long after its last reading. VGCS asks for its
+# messages at 5 Hz (MavlinkThread._request_proximity_streams).
+_RANGEFINDER_DOWN_MAX_AGE_MS = 2000
 
 
 class VehicleTelemetryMixin:
@@ -301,10 +306,7 @@ class VehicleTelemetryMixin:
     def set_distance_sensor(self, payload: dict) -> None:
         """M9 — forward DISTANCE_SENSOR (rangefinder) to the radar panel."""
         try:
-            ori = int(payload.get("orientation", 0) or 0)
-            cur = payload.get("current_distance_m")
-            if cur is not None and is_downward_sensor_orientation(ori):
-                self._rangefinder_down_m = float(cur)
+            self._hear_downward_rangefinder(payload)
         except Exception:
             pass
         try:
@@ -316,6 +318,39 @@ class VehicleTelemetryMixin:
                 QTimer.singleShot(0, self._layout_native_hud)
         except Exception:
             pass
+
+    def _hear_downward_rangefinder(self, payload: dict) -> None:
+        """The height above the ground from a rangefinder looking down, for measuring from the picture
+        (the observation context reads ``_rangefinder_down_m``). Only a good reading counts, and the
+        height goes _RANGEFINDER_DOWN_MAX_AGE_MS after the last one.
+
+        ArduPilot sends the same sensor twice: as DISTANCE_SENSOR, with its range, and as its older
+        RANGEFINDER message, without. The older one counts only for a drone that sends no
+        DISTANCE_SENSOR looking down.
+        """
+        if not is_downward_sensor_orientation(int(payload.get("orientation", 0) or 0)):
+            return
+        now = time.monotonic()
+        if payload.get("legacy_rangefinder"):
+            if now - getattr(self, "_rangefinder_down_heard_s", -1e9) < _RANGEFINDER_DOWN_MAX_AGE_MS / 1000.0:
+                return
+        else:
+            self._rangefinder_down_heard_s = now
+        height = downward_rangefinder_height_m(payload)
+        self._rangefinder_down_m = height
+        expiry = getattr(self, "_rangefinder_down_expiry", None)
+        if expiry is None:
+            expiry = QTimer(self)
+            expiry.setSingleShot(True)
+            expiry.timeout.connect(self._forget_downward_rangefinder)
+            self._rangefinder_down_expiry = expiry
+        if height is None:
+            expiry.stop()
+        else:
+            expiry.start(_RANGEFINDER_DOWN_MAX_AGE_MS)
+
+    def _forget_downward_rangefinder(self) -> None:
+        self._rangefinder_down_m = None
 
     def set_proximity_view(self, view: object) -> None:
         """The drone's obstacle sensor in 8 directions (vgcs.app.obstacle_watch ``radar_view``), or None.

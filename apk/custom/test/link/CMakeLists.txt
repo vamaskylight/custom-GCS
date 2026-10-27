@@ -177,6 +177,17 @@ target_compile_definitions(camera_profile_test PRIVATE
 )
 target_link_libraries(camera_profile_test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
 
+# The app's obstacle sensor store (A7): the radar's directions from the proximity sensor's own
+# messages. Overridable so a mutation check can build against a modified copy.
+set(PROXIMITY_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src CACHE PATH "Folder with ProximityStore.cc")
+add_executable(proximity_store_test
+    proximity_store_test.cc
+    ${PROXIMITY_SRC}/ProximityStore.cc
+    ${PROXIMITY_SRC}/ProximityStore.h
+)
+target_include_directories(proximity_store_test PRIVATE ${PROXIMITY_SRC})
+target_link_libraries(proximity_store_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
+
 # The admin password for Advanced Mode (task Z). admin_password_test is built as a test build
 # (the test password), admin_password_team_test as a customer build: it reads the team's salt
 # and hash from a file as apk/build_android.ps1 writes it, made here for the password

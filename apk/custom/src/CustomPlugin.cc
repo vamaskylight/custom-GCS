@@ -7,8 +7,10 @@
 #include "APMMavlinkStreamRateSettings.h"
 #include "FlightMapSettings.h"
 #include "MapPackLoader.h"
+#include "ProximityStore.h"
 #include "SettingsManager.h"
 #include "VideoSettings.h"
+#include "Vehicle.h"
 #include "Viewer3DSettings.h"
 
 #include <QtCore/QApplicationStatic>
@@ -371,6 +373,17 @@ void CustomPlugin::destroyQmlApplicationEngine(QQmlApplicationEngine *qmlEngine)
     }
 
     QGCCorePlugin::destroyQmlApplicationEngine(qmlEngine);
+}
+
+bool CustomPlugin::mavlinkMessage(Vehicle *vehicle, LinkInterface *link, const mavlink_message_t &message)
+{
+    if ((vehicle != nullptr) && (message.msgid == MAVLINK_MSG_ID_DISTANCE_SENSOR)) {
+        mavlink_distance_sensor_t sensor{};
+        mavlink_msg_distance_sensor_decode(&message, &sensor);
+        ProximityStore::instance()->hear(vehicle->id(), sensor.id, sensor.orientation, sensor.current_distance,
+                                         sensor.max_distance);
+    }
+    return QGCCorePlugin::mavlinkMessage(vehicle, link, message);
 }
 
 /*===========================================================================*/

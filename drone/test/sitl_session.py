@@ -42,7 +42,7 @@ class Sitl:
     def __init__(self, version: str, scripts: dict[str, pathlib.Path], params: dict[str, float],
                  script_params: dict[str, float] | None = None, script_ready: str = "",
                  speedup: int = 10, home: str = "20.4347,72.8696,30,0", instance: int = 0,
-                 sysid: int = 0) -> None:
+                 sysid: int = 0, serial: dict[int, str] | None = None) -> None:
         """params go into the start-up file. script_params are parameters that a script
         creates, so they are set after the script has said `script_ready`.
 
@@ -85,6 +85,9 @@ class Sitl:
         # The system id: SYSID_THISMAV on 4.6, MAV_SYSID on 4.7. --sysid sets either.
         if sysid:
             inst += f" --sysid {int(sysid)}"
+        # A simulated device on a serial port, for example {5: "sim:benewake_tf02"}.
+        for port, device in (serial or {}).items():
+            inst += f" --serial{int(port)}={device}"
         cmd = (f"cd {run} && ({SITL_HOME}/{version}/arducopter --model quad --speedup {speedup} -w{inst} "
                f"--defaults ../{version}/copter.parm,extra.parm --home {home} > sitl.log 2>&1 & "
                f"echo $! > arducopter.pid; wait $!; echo exit=$? >> sitl.log)")

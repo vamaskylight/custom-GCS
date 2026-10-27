@@ -131,6 +131,8 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/CustomPlugin.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/AdminPassword.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/AdminPassword.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ProximityStore.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ProximityStore.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidTop.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidTop.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/CameraProfile.cc

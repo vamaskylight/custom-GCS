@@ -65,7 +65,7 @@ if ($code -ne 0) { Write-Host 'ERROR: build failed.' -ForegroundColor Red; exit 
 # only when the QGC source is in apk/qgc-src.
 $failed = 0
 foreach ($test in 'skydroid_link_test', 'follow_drone_test', 'marks_net_test', 'map_pack_test', 'map_pack_loader_test',
-                  'camera_profile_test', 'admin_password_test', 'admin_password_team_test') {
+                  'camera_profile_test', 'admin_password_test', 'admin_password_team_test', 'proximity_store_test') {
     $exe = Join-Path $build "$test.exe"
     if (-not (Test-Path -LiteralPath $exe)) {
         Write-Host "$test was not built (see the configure output)." -ForegroundColor Yellow

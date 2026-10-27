@@ -140,8 +140,35 @@ _MAV_ORIENTATION_PITCH_270 = 25
 
 
 def is_downward_sensor_orientation(orientation: int) -> bool:
-    o = int(orientation)
-    return o in (_MAV_ORIENTATION_PITCH_270, 24, 26)
+    """Only PITCH_270 looks down. 24 is PITCH_90, looking up (ArduPilot's obstacle sensor sends its
+    upward reading so), and 26 is PITCH_180_YAW_90. Both counted as down until 2026-10-28."""
+    return int(orientation) == _MAV_ORIENTATION_PITCH_270
+
+
+def downward_rangefinder_height_m(payload: dict[str, Any]) -> float | None:
+    """The height above the ground in one rangefinder payload of the link, or None for no good reading.
+
+    ArduPilot's own rule (AP_RangeFinder_Backend::update_status): a reading is good between the
+    sensor's min and max distance. It sends readings out of range too, for example 1 m past the max
+    when a Benewake sees nothing. Its older RANGEFINDER message (``legacy_rangefinder``) carries no
+    range, so that reading is taken as it is.
+    """
+    try:
+        cur = float(payload.get("current_distance_m"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(cur) or cur <= 0.0:
+        return None
+    if payload.get("legacy_rangefinder"):
+        return cur
+    try:
+        low = float(payload.get("min_distance_m") or 0.0)
+        high = float(payload.get("max_distance_m") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if cur < low or (high > 0.0 and cur > high):
+        return None
+    return cur
 
 
 def resolve_vehicle_agl_m(

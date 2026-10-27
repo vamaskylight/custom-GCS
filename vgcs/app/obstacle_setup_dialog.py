@@ -35,6 +35,7 @@ from vgcs.app.obstacle_setup import (
     MODELS,
     PLANNER_CHOICES,
     RANGE_LIMIT_M,
+    TF02_LIMIT_M,
     YAW_RANGE_DEG,
     Change,
     Choices,
@@ -134,11 +135,33 @@ class ObstacleSetupDialog(QDialog):
             box.setToolTip(f"{name}: readings beyond it are left out (the drone's own legs, far noise). none: 0.")
         form.addRow("Leave out nearer than", self._min)
         form.addRow("Leave out farther than", self._max)
-        others = QLabel("The TF02 Pro and the MTF-01P are not set here yet: their ports and what they are for are "
-                        "not known.")
-        others.setWordWrap(True)
-        form.addRow(others)
         lay.addWidget(lidar)
+
+        tf02 = QGroupBox("TF02 Pro, one direction (a rangefinder, RNGFND1)")
+        form = QFormLayout(tf02)
+        self._tf02_on = QCheckBox("A Benewake TF02 Pro is on the drone (RNGFND1_TYPE 19, 115200 baud)")
+        self._tf02_on.setObjectName("obstacleSetupTf02")
+        form.addRow(self._tf02_on)
+        self._tf02_port = QComboBox()
+        self._tf02_port.setObjectName("obstacleSetupTf02Port")
+        form.addRow("Port", self._tf02_port)
+        self._tf02_looks = QComboBox()
+        self._tf02_looks.addItem("Ahead: an obstacle sensor too (RNGFND1_ORIENT 0, PRX type 4)", True)
+        self._tf02_looks.addItem("Down: the height above the ground (RNGFND1_ORIENT 25)", False)
+        form.addRow("Looks", self._tf02_looks)
+        self._tf02_min = QDoubleSpinBox()
+        self._tf02_max = QDoubleSpinBox()
+        for box in (self._tf02_min, self._tf02_max):
+            box.setRange(*TF02_LIMIT_M)
+            box.setDecimals(2)
+            box.setSingleStep(0.1)
+            box.setSuffix(" m")
+        form.addRow("Nearest reading", self._tf02_min)
+        form.addRow("Farthest reading", self._tf02_max)
+        mtf = QLabel("The MTF-01P is not set here yet: what it is for is not known.")
+        mtf.setWordWrap(True)
+        form.addRow(mtf)
+        lay.addWidget(tf02)
 
         avoid = QGroupBox("Keep away from objects (Loiter, AltHold, FlowHold, ZigZag)")
         form = QFormLayout(avoid)
@@ -197,14 +220,16 @@ class ObstacleSetupDialog(QDialog):
         self._btn_restart.clicked.connect(self._restart)
         close.clicked.connect(self.reject)
 
-        for box in (self._model, self._port, self._mount, self._behave, self._planner):
+        for box in (self._model, self._port, self._mount, self._behave, self._planner, self._tf02_port,
+                    self._tf02_looks):
             box.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             box.setMinimumContentsLength(18)
-        for w in (self._lidar_on, self._keep_away):
+        for w in (self._lidar_on, self._keep_away, self._tf02_on):
             w.toggled.connect(self._changed)
-        for w in (self._model, self._port, self._mount, self._behave, self._planner):
+        for w in (self._model, self._port, self._mount, self._behave, self._planner, self._tf02_port,
+                  self._tf02_looks):
             w.currentIndexChanged.connect(self._changed)
-        for w in (self._yaw, self._min, self._max, self._stop_m):
+        for w in (self._yaw, self._min, self._max, self._stop_m, self._tf02_min, self._tf02_max):
             w.valueChanged.connect(self._changed)
         self._set_busy(True)
 
@@ -226,6 +251,11 @@ class ObstacleSetupDialog(QDialog):
             stop_m=float(self._stop_m.value()),
             stop=bool(self._behave.currentData()),
             planner=int(self._planner.currentData() or 0),
+            tf02_on=self._tf02_on.isChecked(),
+            tf02_port=int(self._tf02_port.currentData() or 0),
+            tf02_ahead=bool(self._tf02_looks.currentData()),
+            tf02_min_m=float(self._tf02_min.value()),
+            tf02_max_m=float(self._tf02_max.value()),
         )
 
     def _show(self, c: Choices) -> None:
@@ -234,10 +264,11 @@ class ObstacleSetupDialog(QDialog):
         try:
             self._lidar_on.setChecked(c.lidar_on)
             self._model.setCurrentIndex(max(0, self._model.findData(c.model)))
-            self._port.clear()
-            for port in ports_on_drone(self._values):
-                self._port.addItem(port_words(port, self._values), port)
-            self._port.setCurrentIndex(max(0, self._port.findData(c.port)))
+            for box, chosen in ((self._port, c.port), (self._tf02_port, c.tf02_port)):
+                box.clear()
+                for port in ports_on_drone(self._values):
+                    box.addItem(port_words(port, self._values), port)
+                box.setCurrentIndex(max(0, box.findData(chosen)))
             self._mount.setCurrentIndex(1 if c.upside_down else 0)
             self._yaw.setValue(round(c.yaw_corr_deg))
             self._min.setValue(c.min_m)
@@ -246,6 +277,10 @@ class ObstacleSetupDialog(QDialog):
             self._stop_m.setValue(c.stop_m)
             self._behave.setCurrentIndex(0 if c.stop else 1)
             self._planner.setCurrentIndex(max(0, self._planner.findData(c.planner)))
+            self._tf02_on.setChecked(c.tf02_on)
+            self._tf02_looks.setCurrentIndex(0 if c.tf02_ahead else 1)
+            self._tf02_min.setValue(c.tf02_min_m)
+            self._tf02_max.setValue(c.tf02_max_m)
         finally:
             self._filling = False
         self._changed()
@@ -258,6 +293,8 @@ class ObstacleSetupDialog(QDialog):
             w.setEnabled(self._lidar_on.isChecked())
         for w in (self._stop_m, self._behave):
             w.setEnabled(self._keep_away.isChecked())
+        for w in (self._tf02_port, self._tf02_looks, self._tf02_min, self._tf02_max):
+            w.setEnabled(self._tf02_on.isChecked())
         if not self._values:
             self._preview.setText("")
             self._switch.setText("")
@@ -335,7 +372,12 @@ class ObstacleSetupDialog(QDialog):
             self._check_written()
             return
         self._show(choices_from_drone(self._values))
-        missing = sorted(n for n in self._missing if not n.startswith(("BRD_SER", "SERIAL")))
+        missing = {n for n in self._missing if not n.startswith(("BRD_SER", "SERIAL"))}
+        # A firmware has the range in metres (4.7) or in centimetres (4.6): one pair is always missing.
+        metres, centimetres = {"RNGFND1_MIN", "RNGFND1_MAX"}, {"RNGFND1_MIN_CM", "RNGFND1_MAX_CM"}
+        if not (metres <= missing and centimetres <= missing):
+            missing -= metres | centimetres
+        missing = sorted(missing)
         text = "Read from the drone."
         if missing:
             text += " This drone has no " + ", ".join(missing) + "."

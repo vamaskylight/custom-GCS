@@ -1299,8 +1299,8 @@ class MainWindowSettingsDialogsMixin:
         btn_obstacle = QPushButton("Obstacle sensor settings...")
         btn_obstacle.setObjectName("vehicleConfigObstacleSetup")
         btn_obstacle.setEnabled(can_send)
-        btn_obstacle.setToolTip("The LiDAR's port and mounting, keeping away from objects, and flying around them in "
-                                "a mission. Reads the drone first, asks before it writes.")
+        btn_obstacle.setToolTip("The LiDAR and the TF02 Pro (ports, mounting, range), keeping away from objects, and "
+                                "flying around them in a mission. Reads the drone first, asks before it writes.")
         btn_obstacle.clicked.connect(self._open_obstacle_setup)
         obstacle_lay.addWidget(btn_obstacle)
         obstacle_group.setLayout(obstacle_lay)

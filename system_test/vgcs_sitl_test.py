@@ -173,9 +173,13 @@ class Flight:
     """One simulated drone with VGCS's link connected to it."""
 
     def __init__(self, version: str, params: dict | None = None, speedup: int = 10,
-                 scripts: dict | None = None, script_ready: str = "") -> None:
+                 scripts: dict | None = None, script_ready: str = "", serial: dict | None = None,
+                 home: str | None = None) -> None:
         self.version = version
-        self.sim = Sitl(version, scripts or {}, dict(BASE, **(params or {})), speedup=speedup, script_ready=script_ready)
+        # serial: simulated devices on serial ports, for example {5: "sim:benewake_tf02"}.
+        # home: "lat,lon,alt,heading", the simulator's usual one when None.
+        self.sim = Sitl(version, scripts or {}, dict(BASE, **(params or {})), speedup=speedup, script_ready=script_ready,
+                        serial=serial, **({"home": home} if home else {}))
         self.link = MavlinkThread(VGCS_PORT)
         self.rec = Recorder(self.link)
         self.link.start()
@@ -1902,9 +1906,12 @@ def obstacle_settings(version: str, r: Report) -> None:
 
         values = read()
         missing = sorted(asked - set(values))
-        r.check(len(values) > 30 and all(n.startswith(("BRD_SER", "SERIAL8")) for n in missing),
+        # And the other firmware's names of the rangefinder's range (centimetres on 4.6, metres on 4.7).
+        other = {"RNGFND1_MIN_CM", "RNGFND1_MAX_CM"} if version.startswith("4.7") else {"RNGFND1_MIN", "RNGFND1_MAX"}
+        r.check(len(values) > 30 and other <= set(missing)
+                and all(n.startswith(("BRD_SER", "SERIAL8")) or n in other for n in missing),
                 f"VGCS reads the page's settings, {len(values)} of {len(asked)}: the simulator lacks only flow "
-                f"control and SERIAL8 ({missing[:2]}...)")
+                f"control, SERIAL8 and the other version's range names ({missing[:2]}...)")
         start = choices_from_drone(values)
         r.check(not start.lidar_on and start.port == 2 and start.keep_away and start.planner == 0,
                 f"the page shows no LiDAR, TELEM2 offered, keep away on, no planner ({start})")
@@ -1989,6 +1996,223 @@ def obstacle_settings(version: str, r: Report) -> None:
         f.wait_real(lambda: any("PRX1" in t for t in rec.texts(since)), 15)
         r.check(not sim.armed and any("PRX1" in t for t in rec.texts(since)),
                 f"and refuses to arm, its reason reaching VGCS {[t for t in rec.texts(since) if 'PRX' in t][:1]}")
+    finally:
+        f.close()
+
+
+def restart_through_vgcs(f: Flight, r: Report, label: str) -> None:
+    """The settings page's Restart the drone. Over TCP VGCS's link closes with it, and it is connected again."""
+    since = f.rec.now()
+    f.link.queue_reboot()
+    f.wait_real(lambda: f.rec.action("reboot", since) is not None, 8)
+    result = f.rec.action("reboot", since)
+    r.check(result is not None and result[0], f"{label}: the restart, the drone said yes ({result})")
+    r.check(reconnect_after_restart(f.sim), f"{label}: the simulator is back after its restart")
+    f.wait_real(lambda: not f.link.isRunning(), 15)
+    f.link.wait(4000)
+    f.link = MavlinkThread(VGCS_PORT)
+    f.rec = Recorder(f.link)
+    f.link.start()
+    r.check(f.wait_real(lambda: any(e == "heartbeat" for _t, e in f.rec.link_events), 30),
+            f"{label}: VGCS connected again and hears the drone")
+
+
+def obstacle_read(f: Flight) -> dict:
+    """The drone's settings the obstacle settings page reads, read as VGCS reads them."""
+    from vgcs.app.obstacle_setup import read_names
+
+    asked = set(read_names())
+    n = len(f.rec.params)
+    f.link.queue_params_fetch(sorted(asked))
+    f.wait_real(lambda: any(p and set(p) <= asked for p in f.rec.params[n:]), 25)
+    got = [p for p in f.rec.params[n:] if p and set(p) <= asked]
+    return got[-1] if got else {}
+
+
+def obstacle_write(f: Flight, r: Report, plan, label: str) -> None:
+    """The page's Write to drone: every change confirmed by the drone, then read back."""
+    from vgcs.app.obstacle_setup import read_back_mismatches
+
+    since = len(f.rec.param_sets)
+    for c in plan.changes:
+        f.link.queue_param_set(c.name, c.new)
+    f.wait_real(lambda: len(f.rec.param_sets) - since >= len(plan.changes), 20)
+    done = f.rec.param_sets[since:]
+    r.check(len(done) == len(plan.changes) and all(ok for _n, ok, _d in done),
+            f"{label}: every write confirmed by the drone ({[(n, ok) for n, ok, _d in done]})")
+    wrong = read_back_mismatches(plan.changes, obstacle_read(f))
+    r.check(wrong == [], f"{label}: and read back {wrong}")
+
+
+def proximity_flags(f: Flight) -> tuple[bool, bool]:
+    """SYS_STATUS: the drone's obstacle sensor (enabled, healthy)."""
+    from vgcs.app.obstacle_watch import SENSOR_PROXIMITY
+
+    last = f.rec.last("SYS_STATUS")
+    return (bool(int(last.get("sensors_enabled", 0)) & SENSOR_PROXIMITY),
+            bool(int(last.get("sensors_health", 0)) & SENSOR_PROXIMITY))
+
+
+def obstacle_tf02(version: str, r: Report) -> None:
+    """The TF02 Pro on the obstacle settings page (A7, the client's second sensor), with ArduPilot's simulated TF02 on SERIAL5: looking down it is written and the drone restarted, and its height reaches VGCS as a rangefinder; looking ahead it becomes an obstacle sensor too (PRX1 type 4, the first free slot), its reading reaches VGCS as the direction ahead, ArduPilot no longer sends it as a rangefinder, and the drone arms with it."""
+    from dataclasses import replace
+
+    from vgcs.app.obstacle_setup import choices_from_drone, plan_writes
+
+    f = Flight(version, speedup=5, serial={5: "sim:benewake_tf02"})
+    try:
+        sim = f.sim
+        r.check(f.ready_to_fly(), "the drone is ready")
+        far = "RNGFND1_MAX" if version.startswith("4.7") else "RNGFND1_MAX_CM"
+        near = "RNGFND1_MIN" if version.startswith("4.7") else "RNGFND1_MIN_CM"
+
+        def fly_and_land(label: str, seen) -> None:
+            r.check(f.ready_to_fly(), f"{label}: the drone has its position again after the restart")
+            f.link.queue_auto_takeoff(10.0)
+            r.check(f.wait(lambda: sim.armed, 40), f"{label}: armed and taking off")
+            r.check(f.wait(lambda: sim.alt > 9.5, 60), f"{label}: climbed to 10 m ({sim.alt:.1f} m)")
+            f.wait_real(seen, 10)
+            r.check(seen(), f"{label}: {seen.__doc__}")
+            f.link.queue_auto_land()
+            r.check(f.wait(lambda: not sim.armed, 120), f"{label}: landed and disarmed")
+
+        values = obstacle_read(f)
+        r.check(far in values and near in values, f"this firmware keeps the range as {near} and {far}")
+        start = choices_from_drone(values)
+        r.check(not start.tf02_on and start.tf02_port == 5,
+                f"the page: no TF02 Pro yet, SERIAL5 offered (nothing on it) (port {start.tf02_port})")
+
+        # --- looking down: a rangefinder ---------------------------------------------------
+        plan = plan_writes(values, replace(start, tf02_on=True, tf02_port=5, tf02_ahead=False), armed=False)
+        names = [c.name for c in plan.changes]
+        r.check(names == ["RNGFND1_TYPE", "SERIAL5_PROTOCOL", "SERIAL5_BAUD", near, far],
+                f"looking down: the rangefinder, its port, speed and range, no obstacle sensor slot ({names})")
+        r.check(plan.warnings == ["No obstacle sensor is set up: keeping away from objects does nothing until one is."],
+                f"and the page says a downward TF02 is no obstacle sensor ({plan.warnings})")
+        obstacle_write(f, r, plan, "looking down")
+        restart_through_vgcs(f, r, "looking down")
+
+        def height_seen() -> bool:
+            """its height reaches VGCS as a rangefinder looking down (id 0, orientation 25), about 10 m"""
+            last = f.rec.last("DISTANCE_SENSOR")
+            return last.get("orientation") == 25 and 9.0 < float(last.get("current_distance_m") or 0.0) < 11.5
+
+        fly_and_land("looking down", height_seen)
+
+        # --- looking ahead: an obstacle sensor too ------------------------------------------
+        values = obstacle_read(f)
+        now = choices_from_drone(values)
+        r.check(now.tf02_on and now.tf02_port == 5 and not now.tf02_ahead,
+                "the page shows the TF02 Pro on SERIAL5 looking down, as written")
+        plan = plan_writes(values, replace(now, tf02_ahead=True), armed=False)
+        names = [c.words() for c in plan.changes]
+        r.check(names == ["PRX1_TYPE: 0 to 4 (the TF02 Pro as an obstacle sensor)", "RNGFND1_ORIENT: 25 to 0 (looks ahead)"],
+                f"looking ahead: PRX1 type 4, the first free slot, and the direction ({names})")
+        obstacle_write(f, r, plan, "looking ahead")
+        restart_through_vgcs(f, r, "looking ahead")
+
+        f.wait_real(lambda: proximity_flags(f) == (True, True), 15)
+        r.check(proximity_flags(f) == (True, True),
+                f"the drone has an obstacle sensor now, and it is healthy ({proximity_flags(f)})")
+        heard = len(f.rec.telemetry.get("DISTANCE_SENSOR", []))
+
+        def ahead_seen() -> bool:
+            """its reading reaches VGCS as the obstacle sensor's direction ahead, about 10 m (the simulated TF02
+            measures down, whatever way it looks)"""
+            d = (f.rec.last("PROXIMITY").get("directions_m") or [None])[0]
+            return d is not None and 9.0 < d < 11.5
+
+        fly_and_land("looking ahead", ahead_seen)
+        rangefinder = [p for _t, p in f.rec.telemetry.get("DISTANCE_SENSOR", [])[heard:] if p.get("orientation") == 0]
+        r.check(not rangefinder, "ArduPilot no longer sends it as a rangefinder (no mix with the direction ahead)")
+        errors = [e[1] for e in f.rec.errors]
+        r.check(not errors, f"VGCS reported no error {errors[:3]}")
+    finally:
+        f.close()
+
+
+# ArduPilot's simulated LiDARs (sim:rplidara2 and the others) see a grid of posts 10 m apart, 1 m round, at its own
+# test site (SITL.cpp, post_origin), and nothing anywhere else. From this home the nearest post's middle is 3 m north
+# and 1.93 m east, 34 degrees off ahead: at the edge of the direction ahead (45 degrees wide).
+POSTS_HOME = "51.8752066,14.6487840,54.15,0"
+# 4 m south of that post (metres from home): its middle straight ahead, 3 m from its side.
+POST_STRAIGHT_AHEAD = (-1.0, 1.93)
+
+
+def obstacle_lidar_tf02(version: str, r: Report) -> None:
+    """The client's two sensors together (A7): ArduPilot's simulated RPLidar A2 on SERIAL4 and simulated TF02 on SERIAL5, written by the settings page's rules (the LiDAR as PRX1, the TF02 Pro looking ahead as PRX2), where the simulator's LiDAR sees a grid of posts. After the restart the drone's obstacle sensor is healthy and it arms with both; the posts reach VGCS in all 8 directions; the range is the TF02 Pro's 40 m (the A2 reads 16); and ahead ArduPilot gives the nearer of the two: the TF02's reading low down (the simulated TF02 measures down: the height), and higher up a post straight ahead."""
+    from dataclasses import replace
+
+    from vgcs.app.obstacle_setup import choices_from_drone, plan_writes
+
+    # WP_YAW_BEHAVIOR 0: the drone keeps its nose north when it flies to a point, so "ahead" stays north.
+    f = Flight(version, params={"WP_YAW_BEHAVIOR": 0}, speedup=5, serial={4: "sim:rplidara2", 5: "sim:benewake_tf02"},
+               home=POSTS_HOME)
+    try:
+        sim = f.sim
+        r.check(f.ready_to_fly(), "the drone is ready")
+        values = obstacle_read(f)
+        start = choices_from_drone(values)
+        plan = plan_writes(values, replace(start, lidar_on=True, model="a1a2", port=4, tf02_on=True, tf02_port=5,
+                                           tf02_ahead=True), armed=False)
+        wanted = {"PRX1_TYPE": 5, "SERIAL4_PROTOCOL": 11, "SERIAL4_BAUD": 115, "PRX2_TYPE": 4, "RNGFND1_TYPE": 19,
+                  "SERIAL5_PROTOCOL": 9, "SERIAL5_BAUD": 115, "RNGFND1_ORIENT": 0}
+        got = {c.name: c.new for c in plan.changes}
+        r.check(plan.refusal is None and all(got.get(k) == v for k, v in wanted.items()),
+                f"the page: the LiDAR as PRX1 on SERIAL4, the TF02 Pro as PRX2 on SERIAL5 looking ahead "
+                f"({plan.refusal or [c.words() for c in plan.changes]})")
+        obstacle_write(f, r, plan, "both sensors")
+        restart_through_vgcs(f, r, "both sensors")
+
+        f.wait_real(lambda: proximity_flags(f) == (True, True), 15)
+        r.check(proximity_flags(f) == (True, True),
+                f"the drone's obstacle sensor is healthy with both ({proximity_flags(f)})")
+
+        def directions() -> list:
+            return list(f.rec.last("PROXIMITY").get("directions_m") or [None] * 8)
+
+        f.wait_real(lambda: all(d is not None for d in directions()), 10)
+        seen = directions()
+        r.check(all(d is not None and 1.0 < d < 16.5 for d in seen),
+                f"the LiDAR's posts reach VGCS in all 8 directions ({seen})")
+        top = f.rec.last("PROXIMITY").get("max_m")
+        r.check(top is not None and abs(top - 40.0) < 0.5,
+                f"the range is the TF02 Pro's 40 m (the A2 reads 16): ArduPilot uses both ({top})")
+        post = seen[0]
+
+        r.check(f.ready_to_fly(), "the drone has its position again after the restart")
+        f.link.queue_auto_takeoff(1.5)
+        r.check(f.wait(lambda: sim.armed, 40), "armed with both sensors, and taking off")
+        r.check(f.wait(lambda: sim.alt > 1.3, 40), f"at 1.5 m ({sim.alt:.1f} m)")
+
+        def tf02_nearer() -> bool:
+            d = directions()[0]
+            return d is not None and post is not None and abs(d - sim.alt) < 0.5 and d < post - 0.5
+
+        f.wait_real(tf02_nearer, 10)
+        r.check(tf02_nearer(), f"ahead, the TF02's reading, nearer than the LiDAR's post "
+                               f"({directions()[0]} m, height {sim.alt:.1f} m, post {post} m)")
+
+        north, east = POST_STRAIGHT_AHEAD
+        sim.goto(north, east, 7.0)
+
+        def there() -> bool:
+            return abs(sim.north - north) < 0.3 and abs(sim.east - east) < 0.3 and abs(sim.alt - 7.0) < 0.3
+
+        f.wait(there, 60)
+        r.check(there(), f"7 m up with a post straight ahead ({sim.north:.1f} m north, {sim.east:.1f} m east, "
+                         f"{sim.alt:.1f} m up)")
+
+        def post_nearer() -> bool:
+            d = directions()[0]
+            return d is not None and abs(d - 3.0) < 0.5
+
+        f.wait_real(post_nearer, 10)
+        r.check(post_nearer(), f"ahead, the LiDAR's post 3 m away, nearer than the TF02's 7 m ({directions()[0]} m)")
+        f.link.queue_auto_land()
+        r.check(f.wait(lambda: not sim.armed, 120), "landed and disarmed")
+        errors = [e[1] for e in f.rec.errors]
+        r.check(not errors, f"VGCS reported no error {errors[:3]}")
     finally:
         f.close()
 
@@ -2215,7 +2439,7 @@ CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why
          mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_time_on_the_battery,
          mission_speeds, missions_as_they_come_back,
          another_stations_mission, takeoff_fence_and_land, polygon_fence, nofly_areas, keepin_areas, obstacle_sensor,
-         obstacle_settings,
+         obstacle_settings, obstacle_tf02, obstacle_lidar_tf02,
          link_silence,
          signed_commands,
          signing_seen_without_a_key, vama_lock_with_vgcs]

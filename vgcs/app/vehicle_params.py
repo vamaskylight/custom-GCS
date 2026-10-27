@@ -78,8 +78,11 @@ CHECKED = (
     "AVOID_MARGIN",
     "AVOID_BEHAVE",
     "OA_TYPE",
-    # And whether it has one, for the line in Vehicle Configuration (vgcs/app/obstacle_setup.py).
+    # And whether it has one, for the line in Vehicle Configuration (vgcs/app/obstacle_setup.py),
+    # with the TF02 Pro and the way it looks.
     "PRX1_TYPE",
+    "RNGFND1_TYPE",
+    "RNGFND1_ORIENT",
 )
 
 # Read once the drone has answered, and again on "Refresh params". The mission
