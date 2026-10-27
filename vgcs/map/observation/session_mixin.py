@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QThreadPool, QTimer, Qt
+from PySide6.QtCore import QSettings, QThreadPool, QTimer, Qt, QUrl
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
@@ -33,6 +33,7 @@ from vgcs.observe.dooaf import (
     assemble_observation_report_html,
     build_dooaf_session,
     dooaf_export_blockers,
+    dooaf_intended_impact_video_segment,
     dooaf_role_display,
     format_dooaf_html_summary,
     format_dooaf_status,
@@ -63,6 +64,7 @@ from vgcs.observe.target_measure import (
     target_track_from_observations,
     video_mark_span_norm,
 )
+from vgcs.video.pipeline import wait_qmedia_recorder_stopped
 
 
 def _open_path_in_system_viewer(path: str) -> None:

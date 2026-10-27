@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import time
-from urllib.request import Request
 
 from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QApplication
-
-from vgcs.map.native_tile_map import fetch_tile_http_bytes
 
 
 class NativeMinimapMixin:
@@ -322,25 +319,6 @@ class NativeMinimapMixin:
             return len(colors) <= 24
         except Exception:
             return False
-
-    def _fetch_tile_image(self, url: str) -> QImage:
-        try:
-            req = Request(
-                str(url),
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                    ),
-                    "Referer": "https://www.arcgis.com/",
-                },
-                method="GET",
-            )
-            with urlopen(req, timeout=2.2) as resp:
-                raw = resp.read()
-            return QImage.fromData(raw)
-        except Exception:
-            return QImage()
 
     def _schedule_native_minimap_refresh(self, *, force: bool = False) -> None:
         """Throttle swap minimap grabs — full map `grab()` on every telemetry tick freezes video."""

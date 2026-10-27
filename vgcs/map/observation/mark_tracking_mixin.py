@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QTimer
 
 from vgcs.map.native_video_overlay import VideoOverlayMark, VideoOverlayOffscreenHint, offscreen_hint_edge_uv
@@ -40,6 +42,16 @@ _DOOAF_GEO_TRACK_GIMBAL_DEADBAND_DEG = _DOOAF_PAN_TRACK_GIMBAL_DEADBAND_DEG
 # can resolve to the same screen spot. When two markers fall within this normalized distance
 # we draw only the one the camera is aimed at, so the target never sits on top of the gun.
 _MARK_OVERLAP_UV = 0.05
+
+
+def _num_or_none(value: object) -> float | None:
+    """A finite number, or None (missing, or not a number). Used since 2026-07-13 and never
+    defined until 2026-10-28: the NameError stopped the video marks' refresh."""
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
 
 
 class VideoMarkTrackingMixin:

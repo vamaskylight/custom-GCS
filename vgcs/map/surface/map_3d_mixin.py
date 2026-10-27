@@ -13,6 +13,7 @@ from vgcs.map.map_web_3d import HAS_WEBENGINE as HAS_WEBENGINE_3D, assets_base_u
 from vgcs.map.surface.helpers import _web_2d_fallback_allowed
 from vgcs.map.surface.settings_keys import _KEY_MAP_OFFLINE_TILE_ROOT
 from vgcs.observe.dooaf import DOOAF_ROLE_IMPACT, latest_mark
+from vgcs.observe.target_measure import target_track_from_observations
 
 
 def _offline_tile_root_setting() -> str:
