@@ -1644,6 +1644,355 @@ def keepin_areas(version: str, r: Report) -> None:
         f.close()
 
 
+class ObstacleFeed:
+    """What VGCS's window makes of the drone's obstacle sensor, fed as the window feeds it.
+
+    The window's _publish_obstacle (vgcs/app/window/telemetry_mixin.py) on the
+    link's own messages, without the window: its warnings, sensor words and
+    detour words are kept here with the time they came.
+    """
+
+    def __init__(self, link: MavlinkThread, rec: Recorder) -> None:
+        from vgcs.app.obstacle_watch import ObstacleWatch
+
+        self.rec = rec
+        self.watch = ObstacleWatch()
+        self.warnings: list[tuple[float, str]] = []
+        self.events: list[tuple[float, str, bool]] = []
+        self.detours: list[tuple[float, str]] = []
+        direct = Qt.ConnectionType.DirectConnection
+        link.telemetry.connect(self._on, direct)
+        link.params_snapshot.connect(lambda values: self.watch.update_params(dict(values)), direct)
+
+    def _on(self, kind: str, payload: dict) -> None:
+        w = self.watch
+        if kind == "HEARTBEAT":
+            w.update_mode(payload.get("mode_text"), bool(payload.get("armed")))
+        elif kind == "SYS_STATUS":
+            w.update_sensor_flags(payload.get("sensors_present", 0), payload.get("sensors_enabled", 0),
+                                  payload.get("sensors_health", 0))
+        elif kind == "PROXIMITY":
+            w.update_sectors(payload)
+        elif kind == "MISSION_TARGET":
+            w.update_target(payload)
+        else:
+            return
+        warning = w.take_warning()
+        if warning:
+            self.warnings.append((self.rec.now(), warning))
+        event = w.take_sensor_event()
+        if event is not None:
+            self.events.append((self.rec.now(), event[0], event[1]))
+        detour = w.take_detour_event()
+        if detour:
+            self.detours.append((self.rec.now(), detour))
+
+
+def obstacle_sensor(version: str, r: Report) -> None:
+    """The drone's obstacle sensor (client Stage 1.4, A7): the simulator's LiDAR (PRX1_TYPE 10) sees the fence's edges as objects. VGCS says when it does not work, gets its 8 directions together, warns near an object in Loiter (which stops 3 m from it), and shows a mission's detour round an area to stay out of (OA_TYPE 1)."""
+    from vgcs.app.obstacle_watch import (
+        FAULT_WORDS,
+        OBSTACLE_PARAMS,
+        SENSOR_PROXIMITY,
+        WORKS_AGAIN_WORDS,
+    )
+
+    # Speed 5: the link passes the drone's target at most every 0.4 s (real time), a detour lasts seconds.
+    f = Flight(version, params={"PRX1_TYPE": 10, "AVOID_ENABLE": 2, "AVOID_MARGIN": 3, "AVOID_BEHAVE": 1,
+                                "OA_TYPE": 1}, speedup=5)
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        feed = ObstacleFeed(link, rec)
+        r.check(f.ready_to_fly(), "the drone is ready")
+        link.queue_params_fetch(list(OBSTACLE_PARAMS))
+        f.wait_real(lambda: any("AVOID_MARGIN" in p for p in rec.params), 15)
+        r.check(feed.watch.stop_m() == 3.0 and feed.watch._params.get("OA_TYPE") == 1.0,
+                f"VGCS reads the avoidance settings: AVOID_MARGIN 3, OA_TYPE 1 ({feed.watch._params})")
+
+        def flags() -> tuple[bool, bool]:
+            last = rec.last("SYS_STATUS")
+            return (bool(int(last.get("sensors_enabled", 0)) & SENSOR_PROXIMITY),
+                    bool(int(last.get("sensors_health", 0)) & SENSOR_PROXIMITY))
+
+        def directions() -> list:
+            return list(rec.last("PROXIMITY").get("directions_m") or [None] * 8)
+
+        # --- no fence yet: the simulator's LiDAR has nothing to see, "No Data" --------------------
+        f.wait_real(lambda: any(e[1] == FAULT_WORDS for e in feed.events), 8)
+        r.check(flags() == (True, False), f"SYS_STATUS: the sensor is set up and not healthy ({flags()})")
+        r.check(any(e[1] == FAULT_WORDS and e[2] for e in feed.events),
+                f"VGCS warns that the obstacle sensor does not work ({[e[1] for e in feed.events]})")
+        r.check(not any(d is not None for d in directions()), f"no directions from a sensor without data ({directions()})")
+        since = rec.now()
+        link.queue_auto_takeoff(10.0)
+        f.wait_real(lambda: any("PRX1" in t for t in rec.texts(since)), 15)
+        f.wait(lambda: False, 3)
+        r.check(not sim.armed and any("PRX1: No Data" in t for t in rec.texts(since)),
+                f"the drone refuses to arm and its reason reaches VGCS {[t for t in rec.texts(since) if 'PRX' in t][:1]}")
+
+        # --- a fence 20 m round home: the LiDAR sees its edges --------------------------------------
+        n = len(rec.fences)
+        link.queue_geofence_upload({"points": square_fence(20.0), "alt_max_m": 40.0, "action": 1.0})
+        f.wait_real(lambda: len(rec.fences) > n, 25)
+        r.check(len(rec.fences) > n and rec.fences[-1][0], f"the fence is on ({rec.fences[-1] if rec.fences else None})")
+        f.wait_real(lambda: all(d is not None for d in directions()), 10)
+        seen = directions()
+        r.check(all(d is not None for d in seen), f"all 8 directions reach VGCS together ({seen})")
+        straight = [seen[i] for i in (0, 2, 4, 6)]
+        slanted = [seen[i] for i in (1, 3, 5, 7)]
+        r.check(all(d is not None and 18.5 < d < 21.5 for d in straight),
+                f"ahead, right, behind and left: the fence's edges 20 m away ({straight})")
+        r.check(all(d is not None and 26.5 < d < 30.0 for d in slanted),
+                f"the four corners: 28 m away ({slanted})")
+        # FENCE_ALT_MAX is written after the corners, so the upward reading follows a moment later.
+        f.wait_real(lambda: 38.0 < (rec.last("PROXIMITY").get("up_m") or 0.0) <= 40.5, 5)
+        up = rec.last("PROXIMITY").get("up_m")
+        r.check(up is not None and 38.0 < up <= 40.5, f"upward: the fence's height limit, 40 m ({up})")
+        f.wait_real(lambda: any(e[1] == WORKS_AGAIN_WORDS for e in feed.events), 8)
+        r.check(flags() == (True, True) and any(e[1] == WORKS_AGAIN_WORDS for e in feed.events),
+                f"healthy now, and VGCS says it works again ({flags()})")
+        shown = feed.watch.field_text()
+        r.check(re.fullmatch(r"(19|20|21) m (ahead|right|behind|left)", shown) is not None,
+                f"the dashboard names the nearest object, 20 m away ({shown})")
+
+        # --- Loiter toward the north edge: it stops 3 m before it, and VGCS warns --------------------
+        link.queue_auto_takeoff(10.0)
+        r.check(f.wait(lambda: sim.armed, 40), "armed and taking off inside the fence")
+        r.check(f.wait(lambda: sim.alt > 9.5, 60), f"climbed to 10 m ({sim.alt:.1f} m)")
+        sim.rc(rc1=1500, rc2=1500, rc3=1500, rc4=1500)
+        link.queue_mode_change("LOITER")
+        r.check(f.wait(lambda: sim.mode == "LOITER", 15), f"LOITER ({sim.mode})")
+        f.wait(lambda: False, 3)
+        warned_before = len(feed.warnings)
+        sim.rc(rc1=1500, rc2=1200, rc3=1500, rc4=1500)      # the pitch stick forward: fly north
+        far = [0.0]
+
+        def note_north() -> None:
+            far[0] = max(far[0], sim.north)
+
+        sim.fly(30, each_second=note_north)
+        speed = math.hypot(sim.vn, sim.ve)
+        r.check(13.0 < far[0] < 18.5, f"with the stick held forward it stopped 3 m before the edge at 20 m "
+                                      f"(at most {far[0]:.1f} m north)")
+        r.check(speed < 0.6 and sim.mode == "LOITER", f"and holds there in LOITER ({speed:.2f} m/s, {sim.mode})")
+        new = [w for _t, w in feed.warnings[warned_before:]]
+        r.check(any(w.startswith("Object ") and w.endswith("ahead. Loiter stops 3 m from it.") for w in new),
+                f"VGCS warns with what the mode does {new[:2]}")
+        near = feed.watch.nearest()
+        r.check(near is not None and near[0] == 0 and 2.0 < near[1] < 5.0,
+                f"the nearest object is ahead, about 3 m ({near})")
+        sim.rc(rc1=1500, rc2=1500, rc3=1500, rc4=1500)
+        # Landed where it stands. Not RTL: in this 40 m box the path planner (OA_TYPE 1) held RTL
+        # 13 m from home for minutes (4.7.0, 2026-10-27), the box's walls all round it.
+        link.queue_auto_land()
+        landed = f.wait(lambda: not sim.armed, 120)
+        r.check(landed, f"landed where it stopped ({sim.mode}, {sim.alt:.1f} m up, {sim.north:.1f} m north)")
+        sim.rc(rc3=1000)                                    # the throttle stick down on the ground
+        # The planner remembers what the sensor saw for OA_DB_EXPIRE (10 s): the box's walls go first.
+        f.wait(lambda: False, 15)
+
+        # --- missions 100 m north, the path planner on (OA_TYPE 1) ---------------------------------
+        lat, lon = offset_to_lat_lon(100.0, 0.0)
+        mission = [{"lat": lat, "lon": lon, "alt_m": 10.0, "speed_mps": 5.0}]
+
+        def fly_mission(fence: dict, label: str) -> tuple[list[dict], float, list[str]]:
+            """Fence, mission, start, the leg to the waypoint and home again.
+
+            (targets seen as a detour, closest to 50 m north, the detour words VGCS said).
+            """
+            said = len(feed.detours)
+            n = len(rec.fences)
+            link.queue_geofence_upload(fence)
+            f.wait_real(lambda: len(rec.fences) > n, 25)
+            r.check(len(rec.fences) > n and rec.fences[-1][0], f"{label}: the fence is on "
+                                                              f"({rec.fences[-1] if rec.fences else None})")
+            uploads = len(rec.uploaded)
+            link.queue_mission_upload(mission, "rtl")
+            r.check(f.wait(lambda: len(rec.uploaded) > uploads, 60), f"{label}: the mission is on the drone")
+            closest = [1e9]
+            seen: list[dict] = []
+            heard = len(rec.telemetry.get("MISSION_TARGET", []))
+
+            def watch_leg() -> None:
+                closest[0] = min(closest[0], math.hypot(sim.north - 50.0, sim.east))
+                for _t, p in rec.telemetry.get("MISSION_TARGET", [])[heard:]:
+                    if p.get("detour") and p not in seen:
+                        seen.append(p)
+
+            link.queue_mission_start()
+            r.check(f.wait(lambda: sim.armed and sim.mode == "AUTO", 40), f"{label}: mission start ({sim.mode})")
+            sim.fly(120, until=lambda: sim.north > 95.0, each_second=watch_leg)
+            r.check(sim.north > 95.0 and sim.mode == "AUTO", f"{label}: it reached the waypoint 100 m north "
+                                                             f"({sim.north:.0f} m, {sim.mode})")
+            targets = len(rec.telemetry.get("MISSION_TARGET", [])) - heard
+            r.check(targets >= 5, f"{label}: the drone's target reached VGCS on the way ({targets} times)")
+            r.check(f.wait(lambda: not sim.armed, 240), f"{label}: the mission's return home: landed and disarmed")
+            f.wait(lambda: False, 15)                       # its planner forgets what it saw
+            return seen, closest[0], [d for _t, d in feed.detours[said:]]
+
+        # Nothing in the way: the planner flies straight, and VGCS says nothing about a detour.
+        seen, _closest, words = fly_mission({"points": square_fence(150.0), "alt_max_m": 40.0, "action": 1.0},
+                                            "open way")
+        r.check(not seen and not words,
+                f"open way: no detour seen and none said ({[round(p.get('off_m') or 0) for p in seen][:4]} m off, "
+                f"{words[:1]})")
+
+        # A circle of 8 m to stay out of, half-way: the drone goes around it.
+        centre = list(offset_to_lat_lon(50.0, 0.0))
+        seen, closest, words = fly_mission({"points": square_fence(150.0),
+                                            "nofly": [{"circle": centre, "radius_m": 8.0}],
+                                            "alt_max_m": 40.0, "action": 1.0}, "circle in the way")
+        r.check(8.0 < closest < 1e9, f"it never entered the circle of 8 m (closest {closest:.1f} m from its centre)")
+        r.check(bool(seen) and all(p.get("wp_index") == 0 for p in seen),
+                f"VGCS saw the drone's target beside the waypoint: a detour on the way to waypoint 1 "
+                f"({len(seen)} times, {[round(p.get('off_m') or 0) for p in seen][:4]} m off)")
+        r.check("Going around an obstacle on the way to waypoint 1" in words, f"and says so ({words[:2]})")
+        # The refused take-off above is the one error VGCS was meant to report.
+        refused = [e[1] for e in rec.errors if "PRX1: No Data" in e[1]]
+        r.check(bool(refused), f"VGCS's own error for the refused take-off names the reason ({refused[:1]})")
+        errors = [e[1] for e in rec.errors if not e[1].startswith("Geofence: ") and "PRX1: No Data" not in e[1]]
+        r.check(not errors, f"VGCS reported no other error {errors[:3]}")
+    finally:
+        f.close()
+
+
+def reconnect_after_restart(sim: Sitl) -> bool:
+    """The test's own connection again, after the simulator restarted (its TCP port closes)."""
+    from pymavlink import mavutil
+
+    try:
+        sim.mav.close()
+    except Exception:
+        pass
+    time.sleep(2.0)
+    sim.mav = mavutil.mavlink_connection(f"tcp:127.0.0.1:{sim.port}", source_system=255, retries=30)
+    if sim.mav.wait_heartbeat(timeout=60) is None:
+        return False
+    sim.mav.mav.request_data_stream_send(sim.mav.target_system, sim.mav.target_component,
+                                         mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)
+    return True
+
+
+def obstacle_settings(version: str, r: Report) -> None:
+    """The obstacle settings page on the drone (A7 item 1): VGCS reads its settings, warns about a port that speaks MAVLink, writes only what changes and reads it back, refuses while armed (and so does the drone), restarts the drone, and the drone then has the RPLidar (with no device: enabled, not healthy, arming refused)."""
+    from dataclasses import replace
+
+    from vgcs.app.obstacle_setup import (
+        PROTOCOL_LIDAR360,
+        choices_from_drone,
+        mode_switch_warnings,
+        plan_writes,
+        read_back_mismatches,
+        read_names,
+    )
+    from vgcs.app.obstacle_watch import SENSOR_PROXIMITY
+
+    f = Flight(version, speedup=5)
+    try:
+        rec, sim, link = f.rec, f.sim, f.link
+        r.check(f.ready_to_fly(), "the drone is ready")
+        asked = set(read_names())
+
+        def read() -> dict:
+            n = len(rec.params)
+            link.queue_params_fetch(sorted(asked))
+            f.wait_real(lambda: any(p and set(p) <= asked for p in rec.params[n:]), 25)
+            got = [p for p in rec.params[n:] if p and set(p) <= asked]
+            return got[-1] if got else {}
+
+        values = read()
+        missing = sorted(asked - set(values))
+        r.check(len(values) > 30 and all(n.startswith(("BRD_SER", "SERIAL8")) for n in missing),
+                f"VGCS reads the page's settings, {len(values)} of {len(asked)}: the simulator lacks only flow "
+                f"control and SERIAL8 ({missing[:2]}...)")
+        start = choices_from_drone(values)
+        r.check(not start.lidar_on and start.port == 2 and start.keep_away and start.planner == 0,
+                f"the page shows no LiDAR, TELEM2 offered, keep away on, no planner ({start})")
+        own = plan_writes(values, replace(start, lidar_on=True, port=1), armed=False)
+        r.check(any("a ground station on it loses the drone" in w for w in own.warnings),
+                "SERIAL1, the port VGCS talks to the simulator on, is warned about (MAVLink 2 now)")
+        want = replace(start, lidar_on=True, port=5, stop_m=3.0, stop=True, planner=1)
+        plan = plan_writes(values, want, armed=False)
+        names = [c.name for c in plan.changes]
+        r.check(names == ["PRX1_TYPE", "SERIAL5_PROTOCOL", "SERIAL5_BAUD", "AVOID_MARGIN", "AVOID_BEHAVE", "OA_TYPE"]
+                and not plan.warnings,
+                f"an RPLidar on SERIAL5 (nothing on it), stop 3 m, the planner on: six settings, no warning ({names})")
+        r.check(plan.restart_names == ["PRX1_TYPE", "SERIAL5_PROTOCOL", "SERIAL5_BAUD", "OA_TYPE"],
+                f"four of them only at the drone's next start ({plan.restart_names})")
+        r.check(len(mode_switch_warnings(plan.values_after(values))) == 3,
+                "the simulator's mode switch: Circle, Land and Stabilize do not avoid (Auto and RTL do, planner on)")
+
+        # --- armed: VGCS refuses, and so does ArduPilot ----------------------------------
+        link.queue_mode_change("GUIDED")
+        f.wait(lambda: sim.mode == "GUIDED", 15)
+        link.queue_arm(True)
+        r.check(f.wait(lambda: sim.armed and rec.last("HEARTBEAT").get("armed"), 20), "armed on the ground")
+        r.check(plan_writes(values, want, armed=True).refusal is not None, "the page refuses to write while armed")
+        since = rec.now()
+        link.queue_reboot()
+        f.wait_real(lambda: rec.action("reboot", since) is not None, 6)
+        result = rec.action("reboot", since)
+        r.check(result is not None and not result[0] and "armed" in result[1], f"VGCS refuses the restart ({result})")
+        from pymavlink import mavutil
+
+        sim.mav.mav.command_long_send(sim.mav.target_system, sim.mav.target_component,
+                                      mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, 0, 1, 0, 0, 0, 0, 0, 0)
+        ack = sim.mav.recv_match(type="COMMAND_ACK", blocking=True, timeout=5)
+        r.check(ack is not None and int(ack.result) != 0, f"and the drone refuses it while armed too (result "
+                                                          f"{None if ack is None else ack.result})")
+        link.queue_arm(False)
+        r.check(f.wait(lambda: not sim.armed, 20), "disarmed")
+
+        # --- write, read back, restart ---------------------------------------------------
+        since = len(rec.param_sets)
+        for c in plan.changes:
+            link.queue_param_set(c.name, c.new)
+        f.wait_real(lambda: len(rec.param_sets) - since >= len(plan.changes), 20)
+        done = rec.param_sets[since:]
+        r.check(len(done) == len(plan.changes) and all(ok for _n, ok, _d in done),
+                f"every write confirmed by the drone ({[(n, ok) for n, ok, _d in done]})")
+        wrong = read_back_mismatches(plan.changes, read())
+        r.check(wrong == [], f"and read back {wrong}")
+        r.check(int(sim.get_param("PRX1_TYPE") or 0) == 5, "the simulator holds PRX1_TYPE 5 (its own connection)")
+        since = rec.now()
+        link.queue_reboot()
+        f.wait_real(lambda: rec.action("reboot", since) is not None, 8)
+        result = rec.action("reboot", since)
+        r.check(result is not None and result[0], f"the restart: the drone said yes ({result})")
+        r.check(reconnect_after_restart(sim), "the simulator is back after its restart")
+        # Over TCP (and USB) the drone's port closes with the restart. pymavlink tries again while it is still
+        # starting, is refused, and VGCS closes the link (2026-10-27): the operator connects again. Over a radio
+        # (UDP) nothing closes.
+        f.wait_real(lambda: not link.isRunning(), 15)
+        r.check(not link.isRunning() and any(e == "down" for t, e in rec.link_events if t > since),
+                "over TCP VGCS closes its link after the restart (the window says so; connect again)")
+        link.wait(4000)
+        f.link = link = MavlinkThread(VGCS_PORT)
+        f.rec = rec = Recorder(link)
+        link.start()
+        r.check(f.wait_real(lambda: any(e == "heartbeat" for _t, e in rec.link_events), 30),
+                "connected again, VGCS hears the drone")
+        r.check(int(sim.get_param("PRX1_TYPE") or 0) == 5 and
+                int(sim.get_param("SERIAL5_PROTOCOL") or 0) == PROTOCOL_LIDAR360 and
+                int(sim.get_param("OA_TYPE") or 0) == 1, "the drone kept the settings over its restart")
+
+        def flags() -> tuple[bool, bool]:
+            last = rec.last("SYS_STATUS")
+            return (bool(int(last.get("sensors_enabled", 0)) & SENSOR_PROXIMITY),
+                    bool(int(last.get("sensors_health", 0)) & SENSOR_PROXIMITY))
+
+        f.wait_real(lambda: flags() == (True, False), 15)
+        r.check(flags() == (True, False), f"the drone took the RPLidar at its start: enabled, and not healthy with "
+                                          f"no device on SERIAL5 ({flags()})")
+        since = rec.now()
+        link.queue_auto_takeoff(5.0)
+        f.wait_real(lambda: any("PRX1" in t for t in rec.texts(since)), 15)
+        r.check(not sim.armed and any("PRX1" in t for t in rec.texts(since)),
+                f"and refuses to arm, its reason reaching VGCS {[t for t in rec.texts(since) if 'PRX' in t][:1]}")
+    finally:
+        f.close()
+
+
 def as_rows(points: list[list[float]], command: int = 5001) -> list[tuple]:
     return [(command, float(len(points)), lat, lon) for lat, lon in points]
 
@@ -1865,7 +2214,9 @@ def vama_lock_with_vgcs(version: str, r: Report) -> None:
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
          mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_time_on_the_battery,
          mission_speeds, missions_as_they_come_back,
-         another_stations_mission, takeoff_fence_and_land, polygon_fence, nofly_areas, keepin_areas, link_silence,
+         another_stations_mission, takeoff_fence_and_land, polygon_fence, nofly_areas, keepin_areas, obstacle_sensor,
+         obstacle_settings,
+         link_silence,
          signed_commands,
          signing_seen_without_a_key, vama_lock_with_vgcs]
 

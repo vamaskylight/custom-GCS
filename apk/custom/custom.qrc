@@ -42,6 +42,7 @@
         <file alias="QGroundControl/FlyView/FlyViewCustomLayer.qml">src/FlyViewCustomLayer.qml</file>
         <file alias="QGroundControl/FlyView/VamaCameraEditor.qml">src/VamaCameraEditor.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewTopRightColumnLayout.qml">src/FlyViewTopRightColumnLayout.qml</file>
+        <file alias="QGroundControl/FlyView/ProximityRadarValues.qml">src/ProximityRadarValues.qml</file>
         <file alias="QGroundControl/FlyView/VehicleWarnings.qml">src/VehicleWarnings.qml</file>
         <file alias="QGroundControl/Toolbar/SelectViewDropdown.qml">src/SelectViewDropdown.qml</file>
         <file alias="QGroundControl/Toolbar/VamaAdminPasswordPanel.qml">src/VamaAdminPasswordPanel.qml</file>

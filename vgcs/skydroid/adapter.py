@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from vgcs.skydroid.command_map import (
     ZOOM_MODEL_DZM_STEP,
+    ZOOM_MODEL_LENS_PULSE,
     SkydroidCommandProfile,
     get_profile,
 )
@@ -22,6 +23,7 @@ from vgcs.skydroid.protocol import (
     build_gac_query,
     build_gimbal_speed,
     build_got_target,
+    build_lens_zoom,
     build_slr_query,
     build_slr_trigger,
     build_sum_track,
@@ -151,6 +153,11 @@ _DZM_POLL_TIMEOUT_S = 0.25
 _DZM_POLL_AFTER_CMD_S = 0.35
 # A reported step older than this no longer vouches for where the zoom is.
 _DZM_STEP_FRESH_S = 10.0
+# Lens-pulse cameras (the C20, task AN): the lens stops this long after the last zoom click (as a
+# tap in the app; VGCS's zoom buttons do not repeat while held), and "1x" zooms out this long before
+# the lens counts as wide open (it does not say).
+_LENS_ZOOM_PULSE_S = 0.55
+_LENS_HOME_S = 8.0
 _LRF_REPOINT_AFTER_S = 4.0
 _LRF_GIMBAL_SLEW_SPEED_DPS = 2.0
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
@@ -328,6 +335,14 @@ class SkydroidTopUdpAdapter:
         self._zoom_poll_due_mono: float = 0.0
         self._zoom_poll_failures: int = 0
         self._zoom_block_logged: str = ""
+        # Lens-pulse zoom (the C20, task AN): the stop after the last click, the end of a "1x" run,
+        # and whether the lens is known to be at 1x (only after such a run: it does not say).
+        self._lens_stop_timer: threading.Timer | None = None
+        self._lens_at_one = False
+        self._lens_homing = False  # a "1x" run is under way
+        # Zoom-in clicks not zoomed out again since the last "1x" run: the zoom rail's count. Without
+        # it the rail kept a level of its own and dropped a "-" at its floor, the lens still zoomed in.
+        self._lens_clicks = 0
         port_i = int(port)
         if port_i not in _C13_PROBE_PORTS:
             try:
@@ -3809,6 +3824,12 @@ class SkydroidTopUdpAdapter:
         self._probe_thread.start()
 
     def stop(self) -> None:
+        if self._cancel_lens_timer():
+            # Never leave a C20's lens zooming: its stop goes out before the link closes.
+            try:
+                self._send_lens_frame("stop")
+            except Exception:
+                pass
         self._running = False
         try:
             self._queue.put_nowait(("NOOP", {}, False))
@@ -3900,6 +3921,8 @@ class SkydroidTopUdpAdapter:
         self._enqueue(self._profile.camera_commands.get("photo", []), {}, True)
 
     def camera_zoom(self, level: float) -> None:
+        if self.zoom_is_lens_pulse():
+            return  # no absolute zoom: the lens zooms while it is told to
         if self.zoom_is_dzm_step():
             # No absolute zoom on a DZM-step camera: a "level" is not a step
             # and the step->magnification formula is unknown. The one absolute
@@ -3910,6 +3933,9 @@ class SkydroidTopUdpAdapter:
         self._enqueue(["ZOOM_BURST"], {"level": float(level)}, False)
 
     def camera_zoom_step(self, direction: int) -> None:
+        if self.zoom_is_lens_pulse():
+            self._lens_pulse(int(direction))
+            return
         if self.zoom_is_dzm_step():
             d = 1 if int(direction) > 0 else (-1 if int(direction) < 0 else 0)
             if d == 0:
@@ -3921,6 +3947,78 @@ class SkydroidTopUdpAdapter:
             return
         self._enqueue(["C13_ZOOM_STEP"], {"direction": int(direction)}, False)
 
+    # --- Lens-pulse zoom (the C20, task AN) ---------------------------------------
+    # Client video 2026-10-27 (the app, test build 14): the C13's step (ZMC, DZM, ZMC stop at once)
+    # did not zoom a C20. Its lens takes ZMC to M while it zooms, then a stop, and says nothing back.
+
+    def zoom_is_lens_pulse(self) -> bool:
+        return str(getattr(self._profile, "zoom_model", "") or "") == ZOOM_MODEL_LENS_PULSE
+
+    def _lens_pulse(self, direction: int) -> None:
+        d = 1 if int(direction) > 0 else (-1 if int(direction) < 0 else 0)
+        if d == 0:
+            return
+        with self._zoom_lock:
+            if d > 0:
+                self._lens_at_one = False  # zoomed in: how far, it does not say
+            self._lens_clicks = max(0, self._lens_clicks + d)
+        self._enqueue(["LENS_ZOOM"], {"action": "in" if d > 0 else "out"}, False)
+        self._arm_lens_timer(_LENS_ZOOM_PULSE_S, home=False)
+
+    def _arm_lens_timer(self, seconds: float, *, home: bool) -> None:
+        """The stop after a click, or the end of a "1x" run. A new one takes the place of the old one."""
+        def due() -> None:
+            with self._zoom_lock:
+                if self._lens_stop_timer is not timer:
+                    return  # replaced or cancelled meanwhile
+                self._lens_stop_timer = None
+                self._lens_homing = False
+                if home:
+                    self._lens_at_one = True  # zoomed out long enough: at 1x (it does not say)
+            self._enqueue(["LENS_ZOOM"], {"action": "stop"}, False)
+
+        timer = threading.Timer(float(seconds), due)
+        timer.daemon = True
+        with self._zoom_lock:
+            old, self._lens_stop_timer = self._lens_stop_timer, timer
+            self._lens_homing = bool(home)
+        if old is not None:
+            old.cancel()
+        timer.start()
+
+    def _cancel_lens_timer(self) -> bool:
+        """Cancel a pending lens stop or "1x" run. True when one was pending (the lens was moving)."""
+        with self._zoom_lock:
+            timer, self._lens_stop_timer = self._lens_stop_timer, None
+            self._lens_homing = False
+        if timer is None:
+            return False
+        timer.cancel()
+        return True
+
+    def _send_lens_frame(self, action: str) -> None:
+        self._ensure_active_transport()
+        frame = build_lens_zoom(action)
+        try:
+            print(f"[VGCS:skydroid] lens zoom {action} host={self._transport._host}:{self._transport._port}")
+        except Exception:
+            pass
+        self._transport.send_and_receive(frame, expect_reply=False, log=True, timeout_s=0.05)
+
+    def lens_at_one(self) -> bool:
+        with self._zoom_lock:
+            return bool(self._lens_at_one)
+
+    def lens_homing(self) -> bool:
+        """A "1x" run is under way: the lens zooms out to its wide end."""
+        with self._zoom_lock:
+            return bool(self._lens_homing)
+
+    def lens_zoom_clicks(self) -> int:
+        """Zoom-in clicks not zoomed out again since the last "1x" run (the zoom rail counts them)."""
+        with self._zoom_lock:
+            return int(self._lens_clicks)
+
     # --- DZM-step zoom (C14 Pro) ---------------------------------------------
 
     def zoom_is_dzm_step(self) -> bool:
@@ -3928,6 +4026,12 @@ class SkydroidTopUdpAdapter:
 
     def camera_zoom_home(self) -> None:
         """Short-focus lens at 1x - the one zoom state whose FOV is known."""
+        if self.zoom_is_lens_pulse():
+            with self._zoom_lock:
+                self._lens_clicks = 0
+            self._enqueue(["LENS_ZOOM"], {"action": "out"}, False)
+            self._arm_lens_timer(_LENS_HOME_S, home=True)
+            return
         if not self.zoom_is_dzm_step():
             return
         with self._zoom_lock:
@@ -3976,7 +4080,14 @@ class SkydroidTopUdpAdapter:
         "T12.5x"); without it, the raw step, because a made-up "x" on a camera
         whose zoom curve we do not have would be a lie. "?" means the figure is
         our own count, not the camera's report.
+
+        A lens-pulse camera (C20): "1.0x" from the start of a "1x" run, else "Zoom ?":
+        the rail's count of clicks is no magnification. The rail sets its label only
+        when it is clicked, not when the run ends 8 s later, so the label shows where
+        the run goes; a click on the video waits for its end (video_pick_block_reason).
         """
+        if self.zoom_is_lens_pulse():
+            return "1.0x" if (self.lens_at_one() or self.lens_homing()) else "Zoom ?"
         if not self.zoom_is_dzm_step():
             return ""
         step, reported = self.zoom_step_best()
@@ -4054,6 +4165,14 @@ class SkydroidTopUdpAdapter:
         the only failure the operator can see.
         """
         prof = self._profile
+        if self.zoom_is_lens_pulse():
+            if self.lens_at_one():
+                return ""
+            name = str(getattr(prof, "display_name", "") or prof.profile_id)
+            if self.lens_homing():
+                return f"{name} is zooming out to 1x. Wait a few seconds, then click again."
+            return (f"{name} does not say how far it zoomed, so a click cannot be turned into an angle. "
+                    "Zoom fully out: press - until the zoom shows 1.0x, then click again.")
         if not self.zoom_is_dzm_step():
             return ""
         step, reported = self.zoom_step_best()
@@ -4480,6 +4599,12 @@ class SkydroidTopUdpAdapter:
                     else:
                         lens = str(params.get("lens", "") or "")
                         self._send_dzm_frames([build_dzm_lens_select(lens)], what=f"lens {lens}")
+                except Exception:
+                    pass
+                continue
+            if commands and commands[0] == "LENS_ZOOM":
+                try:
+                    self._send_lens_frame(str(params.get("action", "stop") or "stop"))
                 except Exception:
                     pass
                 continue

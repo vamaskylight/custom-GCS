@@ -76,6 +76,14 @@ constexpr int kRulesDueMs = 25;
 constexpr long long kRulesClockStartMs = 1000;
 // "Back to 1x" on a Viewpro or SIYI: zoom out until the Viewpro says 1x, a SIYI this long (it does not say).
 constexpr int kZoomHomeOutMs = 8000;
+// The C20's lens (task AN, TOP's ZMC): it moves while it is told to, and gets its stop a moment
+// after the last click. A held zoom button clicks at once, again 400 ms later, then every 120 ms
+// (FlyViewCustomLayer.qml). So the first click waits well past that first gap (a shorter wait
+// stopped the lens once at the start of every hold), and a click that comes while the lens moves
+// waits well past 120 ms, but not long (so the lens stops soon after the button is let go). A tap
+// moves the lens for the first wait. The margins are for a busy remote control, whose timers run late.
+constexpr int kLensZoomPulseMs = 550;
+constexpr int kLensZoomHeldMs = 300;
 
 // Photos and recording (task AL). Both go to the camera's own SD card. While the camera answers,
 // it is asked whether it records every 2 s (the RC's own button can start it too), and for its
@@ -365,6 +373,10 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _detectTimer.setSingleShot(true);
     _detectTimer.setInterval(kDetectMs);
     _zoomOutTimer.setInterval(kZoomOutIntervalMs);
+    _lensStopTimer.setSingleShot(true);
+    _lensStopTimer.setInterval(kLensZoomPulseMs);
+    _lensHomeTimer.setSingleShot(true);
+    _lensHomeTimer.setInterval(kZoomHomeOutMs);
     _aimTimer.setInterval(100);
     _lockTimer.setInterval(kLockTickMs);
     _recordVerdictTimer.setSingleShot(true);
@@ -387,6 +399,8 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_wheelAngleTimer, &QTimer::timeout, this, &SkydroidLink::_sendWheelAngles);
     connect(&_detectTimer, &QTimer::timeout, this, &SkydroidLink::_finishWheelDetect);
     connect(&_zoomOutTimer, &QTimer::timeout, this, &SkydroidLink::_zoomOutTick);
+    connect(&_lensStopTimer, &QTimer::timeout, this, [this]() { _send(top::buildLensZoom("stop", _options)); });
+    connect(&_lensHomeTimer, &QTimer::timeout, this, &SkydroidLink::_lensHomeDone);
     connect(&_aimTimer, &QTimer::timeout, this, &SkydroidLink::_aimTick);
     connect(&_lockTimer, &QTimer::timeout, this, &SkydroidLink::_lockTick);
     connect(&_recordVerdictTimer, &QTimer::timeout, this, &SkydroidLink::_recordVerdict);
@@ -683,6 +697,13 @@ void SkydroidLink::setModel(const QString &model)
 
 void SkydroidLink::_useCamera(const camera::Profile &profile, bool withAddresses)
 {
+    // A C20's lens that is still zooming gets its stop while it is still the camera: frames go out
+    // in the camera's own way (TCP for the C20).
+    if (_lensStopTimer.isActive() || _lensHomeTimer.isActive()) {
+        _send(top::buildLensZoom("stop", _options));
+        _lensStopTimer.stop();
+        _lensHomeTimer.stop();
+    }
     _camera = profile;
     _applyModel();
     if (_camera.thermalBySwitch) {
@@ -1018,6 +1039,11 @@ void SkydroidLink::_stop()
     _wheelAngleTimer.stop();
     _zoomOutTimer.stop();
     _zoomOutLeft = 0;
+    if (_socket && (_lensStopTimer.isActive() || _lensHomeTimer.isActive())) {
+        _send(top::buildLensZoom("stop", _options));  // never leave the C20's lens moving
+    }
+    _lensStopTimer.stop();
+    _lensHomeTimer.stop();
     _aimTimer.stop();
     if (_aimBusy) {
         _aimBusy = false;
@@ -3461,6 +3487,10 @@ void SkydroidLink::zoom(int direction)
         }
         return;
     }
+    if (_camera.zoom == camera::Zoom::Pulse) {
+        _lensZoom(d);
+        return;
+    }
     if (_isZoomStepCamera()) {
         for (const std::string &frame : top::buildDzmStepFrames(d, _options)) {
             _send(frame);
@@ -3491,6 +3521,13 @@ void SkydroidLink::zoomHome()
         _zoomOutLeft = kZoomHomeOutMs / kZoomOutIntervalMs;
         _zoomOutTimer.start();
         _zoomOutTick();
+        return;
+    }
+    if (_camera.zoom == camera::Zoom::Pulse) {
+        // The C20: zoom out as long as a SIYI's "back to 1x", then stop. It is at 1x then.
+        _lensStopTimer.stop();
+        _send(top::buildLensZoom("out", _options));
+        _lensHomeTimer.start();
         return;
     }
     if (_isZoomStepCamera()) {
@@ -3547,6 +3584,31 @@ void SkydroidLink::_zoomOutTick()
     }
     _sendZoomStepFrames(-1);
     --_zoomOutLeft;
+}
+
+void SkydroidLink::_lensZoom(int direction)
+{
+    // The C20 (task AN): its lens moves while it is told to and does not say how far, like a
+    // SIYI. Each click tells it again and puts the stop off: a held button zooms on, a tap moves
+    // the lens a little. A click ends a "back to 1x" run. (In build 14 it got the V13's step,
+    // whose stop came at once: the client's C20 did not zoom.)
+    _lensHomeTimer.stop();
+    _send(top::buildLensZoom(direction > 0 ? "in" : "out", _options));
+    _lensStopTimer.setInterval(_lensStopTimer.isActive() ? kLensZoomHeldMs : kLensZoomPulseMs);
+    _lensStopTimer.start();
+    if (direction > 0 && !_zoomUnknown) {
+        _zoomUnknown = true;  // zoomed in: how far, the C20 does not say
+        emit zoomChanged();
+    }
+}
+
+void SkydroidLink::_lensHomeDone()
+{
+    _send(top::buildLensZoom("stop", _options));
+    if (_socket && _zoomUnknown) {
+        _zoomUnknown = false;  // zoomed out long enough: at 1x (it does not say)
+        emit zoomChanged();
+    }
 }
 
 void SkydroidLink::_sendZoomStepFrames(int direction)

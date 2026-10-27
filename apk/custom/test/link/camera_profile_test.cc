@@ -219,7 +219,7 @@ void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
     QCOMPARE(c20.port, 5000);
     QCOMPARE(c20.dayVideoUrl, QStringLiteral("rtsp://192.168.144.108:554/main"));
     QVERIFY(!c20.hasThermal() && !c20.laser && !c20.ownTracker && c20.photo && c20.record);
-    QVERIFY(c20.zoom == Zoom::Counted);
+    QVERIFY(c20.zoom == Zoom::Pulse);  // its lens (task AN, client 2026-10-27)
     QCOMPARE(c20.maxZoom, 22.0);
     QCOMPARE(c20.fovHDeg, 58.3);
     QCOMPARE(c20.fovVDeg, 34.9);
@@ -464,8 +464,7 @@ void CameraProfileTest::eachProtocolHasItsZoomsAndFeatures()
         const char *says;
     };
     const QList<Case> cases = {
-        {top, [](Profile &p) { p.zoom = Zoom::Live; }, "A Skydroid TOP camera's zoom is none, counted or reported."},
-        {top, [](Profile &p) { p.zoom = Zoom::Pulse; }, "A Skydroid TOP camera's zoom is none, counted or reported."},
+        {top, [](Profile &p) { p.zoom = Zoom::Live; }, "A Skydroid TOP camera's zoom is none, counted, reported or pulse."},
         {a20, [](Profile &p) { p.zoom = Zoom::Counted; }, "A Viewpro camera's zoom is none or live."},
         {a20, [](Profile &p) { p.zoom = Zoom::Pulse; }, "A Viewpro camera's zoom is none or live."},
         {zr10, [](Profile &p) { p.zoom = Zoom::Live; }, "A SIYI camera's zoom is none or pulse."},
@@ -491,6 +490,17 @@ void CameraProfileTest::eachProtocolHasItsZoomsAndFeatures()
         p.zoom = Zoom::None;
         p.maxZoom = 0.0;
         QVERIFY2(camera::problem(p).isEmpty(), qPrintable(camera::problem(p)));
+    }
+    // A TOP camera with a lens that zooms while told to and says nothing, like the C20 (task AN).
+    {
+        Profile p = top;
+        p.zoom = Zoom::Pulse;
+        QVERIFY2(camera::problem(p).isEmpty(), qPrintable(camera::problem(p)));
+        QCOMPARE(builtIn(QStringLiteral("C20")).zoom, Zoom::Pulse);
+        QString why;
+        const std::optional<Profile> back = camera::fromJson(camera::toJson(p), QStringLiteral("lens-cam"), &why);
+        QVERIFY2(back, qPrintable(why));
+        QVERIFY(back->zoom == Zoom::Pulse);
     }
     // A file's zoom is checked against its protocol once it is read.
     QJsonObject json = camera::toJson(a20);

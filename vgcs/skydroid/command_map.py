@@ -15,6 +15,9 @@ from dataclasses import dataclass
 #    formula for this model is blank in the vendor document.
 ZOOM_MODEL_COMMANDED_OPTICAL = "commanded_optical"
 ZOOM_MODEL_DZM_STEP = "dzm_step"
+# The C20 (task AN): an optical lens that zooms while it is told to (ZMC to M, then a stop) and
+# does not say how far. Its picture carries the zoom; how far it is zoomed, nobody knows.
+ZOOM_MODEL_LENS_PULSE = "lens_pulse"
 
 
 @dataclass(frozen=True)
@@ -396,6 +399,10 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         frame_specs_confirmed=False,
         aim_fov_from_profile=True,
         max_zoom=22.0,
+        # The lens zooms (client video 2026-10-27: the C13's step did not zoom it in the app),
+        # and the picture carries it: no crop of the preview on top.
+        zoom_model=ZOOM_MODEL_LENS_PULSE,
+        preview_carries_zoom=True,
         g_frames_upper_header=True,
         # Its picture is not the C13's, which the full checks were tuned on.
         video_qc_mode="colour",

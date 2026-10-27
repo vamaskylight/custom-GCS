@@ -879,9 +879,13 @@ private slots:
         QCOMPARE(other.received.size(), 0);
         c20.received.clear();
         _link->zoom(1);
-        QTest::qWait(500);
+        // Its lens's zoom (task AN) and its stop, each once, and not the C13's step frames.
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 2000);
+        QTest::qWait(200);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("in")), 1);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 1);
         for (const std::string &frame : top::buildC13ZoomStepFrames(1, top::Options{true, 0x2710})) {
-            QCOMPARE(c20.countEqual(frame), 1);
+            QCOMPARE(c20.countEqual(frame), 0);
         }
         QCOMPARE(other.received.size(), 0);
     }
@@ -906,7 +910,16 @@ private slots:
         _link->setPort(c20.port());
         QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
         _link->setTouchMotion(0.0, 1.0);  // tilting up
-        QTRY_VERIFY_WITH_TIMEOUT(c20.countStartingWith("#TPUG2wGSP") >= 1, 2000);
+        // As a finger on the screen, the touch keeps coming. A touch without news for 450 ms ends by
+        // itself (kTouchLeaseMs): on a busy PC the first frame took longer to be seen, the touch's own
+        // stop came before the clear below, and the link had nothing left to stop (2026-10-27).
+        QElapsedTimer waited;
+        waited.start();
+        while (c20.countStartingWith("#TPUG2wGSP") < 1 && waited.elapsed() < 2000) {
+            QTest::qWait(50);
+            _link->setTouchMotion(0.0, 1.0);
+        }
+        QVERIFY(c20.countStartingWith("#TPUG2wGSP") >= 1);
         c20.received.clear();
         _link->setEnabled(false);
         QTRY_VERIFY_WITH_TIMEOUT(c20.countEqual(top::buildGimbalSpeedAxis("GSP", 0.0)) >= 1, 2000);
@@ -938,6 +951,148 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGacQuery()) >= 1, 2000);
         QTest::qWait(2500);
         QCOMPARE(c20.accepts, 1);
+    }
+
+    // --- The C20's lens zoom (task AN, client video 2026-10-27, build 14) ------------
+    // Build 14 sent it the V13's step (ZMC start, DZM, ZMC stop at once): it did not zoom, while the
+    // screen counted 5.5x. Its lens takes ZMC to M ("#TPUM2wZMC02"), held, and says nothing back.
+
+    void connectC20(FakeTcpCamera &c20)
+    {
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        c20.received.clear();
+    }
+
+    void c20ZoomTellsTheLensAndStopsItAMomentLater()
+    {
+        FakeTcpCamera c20;
+        connectC20(c20);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("in")), 1, 1000);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 0);  // the lens moves until the stop
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
+        // None of the V13's zoom frames, and no zoom question.
+        QCOMPARE(c20.countStartingWith(QStringLiteral("#tpPM")), 0);
+        QCOMPARE(c20.countStartingWith(QStringLiteral("#tpPD")), 0);
+        QCOMPARE(c20.countStartingWith(QStringLiteral("#TPUD2wDZM")), 0);
+        QCOMPARE(c20.countStartingWith(QStringLiteral("#TPUD2rDZM")), 0);
+        // How far it zoomed, it does not say: no number, and no point from the picture.
+        QCOMPARE(_link->zoomLabel(), QString());
+        double h = 0.0;
+        double v = 0.0;
+        QVERIFY(!_link->pictureFov(h, v));
+        _link->zoom(-1);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("out")), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 2, 1500);
+    }
+
+    void c20HeldButtonZoomsWithoutAPause()
+    {
+        // As the screen's button clicks while it is held (FlyViewCustomLayer.qml, IconButton): at
+        // once, 400 ms later, then every 120 ms. The lens must not get a stop in that first gap.
+        FakeTcpCamera c20;
+        connectC20(c20);
+        _link->zoom(1);
+        QTest::qWait(400);
+        _link->zoom(1);
+        QTest::qWait(120);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("in")), 3, 1000);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
+    }
+
+    void c20LensStopsSoonAfterTheHeldButtonIsLetGo()
+    {
+        // While the lens moves, a click puts its stop off only a little longer than the button's
+        // 120 ms: the lens stops soon after the button is let go, not a whole first wait later.
+        FakeTcpCamera c20;
+        connectC20(c20);
+        _link->zoom(1);
+        QTest::qWait(400);
+        for (int i = 0; i < 3; ++i) {
+            _link->zoom(1);
+            QTest::qWait(120);
+        }
+        _link->zoom(1);  // the last click before the button is let go
+        QElapsedTimer sinceLastClick;
+        sinceLastClick.start();
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
+        QVERIFY2(sinceLastClick.elapsed() < 450,
+                 qPrintable(QString("the stop came %1 ms after the last click").arg(sinceLastClick.elapsed())));
+    }
+
+    void c20HeldZoomGoesOnUntilTheLastClick()
+    {
+        // The screen's button clicks every 120 ms while it is held.
+        FakeTcpCamera c20;
+        connectC20(c20);
+        for (int i = 0; i < 5; ++i) {
+            _link->zoom(1);
+            QTest::qWait(120);
+        }
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("in")), 5, 1000);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
+        QTest::qWait(400);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 1);
+    }
+
+    void c20BackToOneZoomsOutThenSaysOneX()
+    {
+        FakeTcpCamera c20;
+        connectC20(c20);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
+        QCOMPARE(_link->zoomLabel(), QString());
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("out")), 1, 1000);
+        QTest::qWait(1500);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 1);  // still zooming out
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 2, 9000);
+        QCOMPARE(_link->zoomLabel(), QStringLiteral("1.0x"));
+        double h = 0.0;
+        double v = 0.0;
+        QVERIFY(_link->pictureFov(h, v));
+        QCOMPARE(h, 58.3);
+        // A tap during the run ends it: the tap's own stop follows, and the zoom is not known again.
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("out")), 2, 1000);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 3, 1500);
+        QCOMPARE(_link->zoomLabel(), QString());
+        QTest::qWait(8500);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 3);  // the run ended with the tap
+        QCOMPARE(_link->zoomLabel(), QString());
+    }
+
+    void c20LensStopsBeforeAnotherCameraIsChosen()
+    {
+        // The stop goes over the C20's own TCP link, before the C13 (UDP) takes its place.
+        FakeTcpCamera c20;
+        connectC20(c20);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("in")), 1, 1000);
+        _link->setModel("C13");
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1000);
+        QTest::qWait(500);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 1);
+        QCOMPARE(_camera->countEqual(top::buildLensZoom("stop")), 0);  // not to the C13
+    }
+
+    void c20LensStopsWhenTheLinkGoesOff()
+    {
+        FakeTcpCamera c20;
+        connectC20(c20);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("in")), 1, 1000);
+        _link->setEnabled(false);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
+        QTest::qWait(600);
+        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 1);  // once, and nothing after the link went off
     }
 
     // --- Viewpro and SIYI cameras (task AK) ------------------------------------

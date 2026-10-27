@@ -33,6 +33,7 @@ from vgcs.skydroid.command_map import (
     SKYDROID_PROFILES,
     ZOOM_MODEL_COMMANDED_OPTICAL,
     ZOOM_MODEL_DZM_STEP,
+    ZOOM_MODEL_LENS_PULSE,
     SkydroidCommandProfile,
     SkydroidLens,
 )
@@ -54,10 +55,10 @@ ZOOM_NONE = "none"
 ZOOM_COUNTED = "counted"
 ZOOM_REPORTED = "reported"
 ZOOM_LIVE = "live"  # the camera says its zoom and its view (Viewpro)
-ZOOM_PULSE = "pulse"  # the camera zooms while it is told to, and does not say how far (SIYI)
+ZOOM_PULSE = "pulse"  # the camera zooms while it is told to, and does not say how far (SIYI, the C20's lens)
 ZOOMS = (ZOOM_NONE, ZOOM_COUNTED, ZOOM_REPORTED, ZOOM_LIVE, ZOOM_PULSE)
 PROTOCOL_ZOOMS = {
-    PROTOCOL_TOP: (ZOOM_NONE, ZOOM_COUNTED, ZOOM_REPORTED),
+    PROTOCOL_TOP: (ZOOM_NONE, ZOOM_COUNTED, ZOOM_REPORTED, ZOOM_PULSE),
     PROTOCOL_VIEWPRO: (ZOOM_NONE, ZOOM_LIVE),
     PROTOCOL_SIYI: (ZOOM_NONE, ZOOM_PULSE),
 }
@@ -195,10 +196,12 @@ def built_in_cameras() -> list[Camera]:
         ),
         # The C20: TOP over TCP port 5000 only, "#TP" on every gimbal frame, 22x optical zoom,
         # 58.3 x 34.9 at 1x (1080p), -90 to +45 degrees, 150 either way, no laser, no thermal
-        # picture, its day video as the client's own camera file had it (2026-10-22).
+        # picture, its day video as the client's own camera file had it (2026-10-22). Its lens
+        # zooms while told to and does not say how far (task AN, client 2026-10-27): "pulse".
         replace(
             _skydroid("C20", "V20"),
             transport=TRANSPORT_TCP,
+            zoom=ZOOM_PULSE,
             day_video_url="rtsp://192.168.144.108:554/main",
             thermal_video_url="",
             fov_h_deg=58.3,
@@ -318,7 +321,7 @@ def problem(cam: Camera) -> str:
         return 'The protocol must be "skydroid-top", "viewpro" or "siyi".'
     if cam.zoom not in zooms:
         return {
-            PROTOCOL_TOP: "A Skydroid TOP camera's zoom is none, counted or reported.",
+            PROTOCOL_TOP: "A Skydroid TOP camera's zoom is none, counted, reported or pulse.",
             PROTOCOL_VIEWPRO: "A Viewpro camera's zoom is none or live.",
             PROTOCOL_SIYI: "A SIYI camera's zoom is none or pulse.",
         }[cam.protocol]
@@ -524,7 +527,9 @@ def from_json(data: Any, camera_id: str) -> tuple[Camera | None, str]:
             cam = replace(cam, fov_h_deg=lenses[0].fov_h_deg, fov_v_deg=lenses[0].fov_v_deg)
     else:
         cam = replace(cam, fov_h_deg=number("dayFovH"), fov_v_deg=number("dayFovV"))
-        if zoom == ZOOM_COUNTED:
+        # A pulse zoom keeps its lens's range too, when its file has one (the V20's 22x), though
+        # nothing counts it.
+        if zoom == ZOOM_COUNTED or (zoom == ZOOM_PULSE and "maxZoom" in data):
             cam = replace(cam, max_zoom=number("maxZoom"))
     if thermal or by_switch:
         cam = replace(cam, thermal_fov_h_deg=number("thermalFovH"), thermal_fov_v_deg=number("thermalFovV"))
@@ -765,10 +770,11 @@ def command_profile(cam: Camera) -> SkydroidCommandProfile:
         fov_h_deg=fov_h,
         fov_v_deg=fov_v,
         aim_fov_from_profile=True,
-        zoom_model=ZOOM_MODEL_DZM_STEP if reported else ZOOM_MODEL_COMMANDED_OPTICAL,
+        zoom_model=(ZOOM_MODEL_DZM_STEP if reported
+                    else ZOOM_MODEL_LENS_PULSE if cam.zoom == ZOOM_PULSE else ZOOM_MODEL_COMMANDED_OPTICAL),
         lenses=lenses,
         zoom_fov_confirmed=True,
-        preview_carries_zoom=reported,
+        preview_carries_zoom=reported or cam.zoom == ZOOM_PULSE,  # a lens's zoom is in the picture
         thermal_fov_h_deg=float(cam.thermal_fov_h_deg) if cam.has_thermal else None,
         thermal_fov_v_deg=float(cam.thermal_fov_v_deg) if cam.has_thermal else None,
         thermal_fov_estimated=not cam.thermal_fov_sure,

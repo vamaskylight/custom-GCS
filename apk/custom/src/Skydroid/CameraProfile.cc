@@ -175,9 +175,12 @@ QList<Profile> builtInProfiles()
     // V1.1.6, sections 2.1.1 and 2.2.2). 22x optical zoom, 58.3 degrees wide at 1x, 1080p
     // (34.9 high), -90 to +45 degrees, 150 either way, no laser, no thermal picture. Its day
     // video as the client's own camera file had it (2026-10-22, the picture worked). TOP lists
-    // no photo, recording or zoom command for the C20: they are on, to be tried on the camera.
+    // no photo or recording command for the C20: they are on, to be tried on the camera. Its
+    // zoom is the lens's (task AN): ZMC to the lens address M, held while it zooms, and no zoom
+    // report, so the "pulse" zoom. The V13's counted step did not zoom it (client 2026-10-27).
     Profile c20 = skydroid("C20", "V20");
     c20.tcp = true;
+    c20.zoom = Zoom::Pulse;
     c20.dayVideoUrl = QStringLiteral("rtsp://192.168.144.108:554/main");
     c20.thermalVideoUrl.clear();
     c20.fovHDeg = 58.3;
@@ -314,8 +317,8 @@ QString problem(const Profile &p)
     // Each protocol has its zooms, and the app uses no laser or tracker of a Viewpro or SIYI camera.
     switch (p.protocol) {
     case Protocol::Top:
-        if (p.zoom != Zoom::None && p.zoom != Zoom::Counted && p.zoom != Zoom::Reported) {
-            return text("A Skydroid TOP camera's zoom is none, counted or reported.");
+        if (p.zoom != Zoom::None && p.zoom != Zoom::Counted && p.zoom != Zoom::Reported && p.zoom != Zoom::Pulse) {
+            return text("A Skydroid TOP camera's zoom is none, counted, reported or pulse.");
         }
         break;
     case Protocol::Viewpro:
@@ -540,7 +543,9 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
     } else {
         p.fovHDeg = number("dayFovH");
         p.fovVDeg = number("dayFovV");
-        if (p.zoom == Zoom::Counted) {
+        // A pulse zoom keeps its lens's range too, when its file has one (the V20's 22x), though
+        // nothing counts it.
+        if (p.zoom == Zoom::Counted || (p.zoom == Zoom::Pulse && json.contains(QStringLiteral("maxZoom")))) {
             p.maxZoom = number("maxZoom");
         }
     }

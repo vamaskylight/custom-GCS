@@ -29,5 +29,5 @@
     "transport": "tcp",
     "upperGimbalHeader": true,
     "yawLimit": 150,
-    "zoom": "counted"
+    "zoom": "pulse"
 }

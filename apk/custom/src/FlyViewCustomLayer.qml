@@ -586,13 +586,22 @@ Item {
     // VAMA (task AL, the client's Stage 1.1 of 2026-10-26: "photo and video recording into the rc"):
     // a copy of each photo and recording on the RC as well, made by QGC's own video code: a picture
     // of the video into QGC's Photo folder, and a recording of the video the RC receives into its
-    // Video folder (mp4, QGC's default). The record button shows a recording while the camera or
+    // Video folder (MKV since task AM, see CustomPlugin.cc). The record button shows a recording while the camera or
     // the RC records, and its next press stops both. The note says where the copy goes (QGC does not
     // say when a picture is written).
     property var           _videoManager:   QGroundControl.videoManager
     readonly property bool _rcRecording:    _videoManager ? _videoManager.recording === true : false
     readonly property bool _recordingShown: _link.recording || _rcRecording
     property string        _rcNoteText:     ""
+    // The operator wants the copy on the RC, from the press that started it to the press that stops
+    // it. QGC's recording also ends by itself when its video restarts (a GStreamer error, an IR
+    // switch, a lost link): build 14 then said "The copy is saved" while the file was empty
+    // (client 2026-10-27). A copy that stopped by itself starts again when the video is back, a few
+    // times for one recording.
+    property bool          _rcCopyWanted:   false
+    property bool          _rcCopyAgain:    false  // start a new copy when the video is back
+    property int           _rcCopyRestarts: 0
+    readonly property int  _rcCopyRestartsMax: 3
 
     function _showRcNote(text) {
         _rcNoteText = text
@@ -617,8 +626,15 @@ Item {
         if (!_videoManager) {
             return
         }
+        if (!start) {
+            _rcCopyWanted = false
+            _rcCopyAgain = false
+            rcCopyAgainTimer.stop()
+        }
         if (start && !_rcRecording) {
             if (_videoManager.decoding === true) {
+                _rcCopyWanted = true
+                _rcCopyRestarts = 0
                 _videoManager.startRecording()
             } else {
                 _showRcNote(qsTr("No copy on this RC: there is no video."))
@@ -627,13 +643,49 @@ Item {
             _videoManager.stopRecording()
         }
     }
+    function _startCopyAgain() {
+        if (!_rcCopyAgain || !_rcCopyWanted || _videoManager.decoding !== true || _videoManager.recording === true) {
+            return
+        }
+        _rcCopyAgain = false
+        _rcCopyRestarts += 1
+        _videoManager.startRecording()
+    }
     Connections {
         target: _videoManager
         function onRecordingChanged() {
             // From the video manager itself: the binding of _rcRecording may not have its new value yet.
-            _showRcNote(_videoManager.recording === true ? qsTr("A copy is recorded on this RC, in its Video folder.")
-                                                         : qsTr("The copy is saved on this RC, in its Video folder."))
+            if (_videoManager.recording === true) {
+                _showRcNote(_rcCopyRestarts > 0 ? qsTr("A new copy is recorded on this RC, in its Video folder.")
+                                                : qsTr("A copy is recorded on this RC, in its Video folder."))
+                return
+            }
+            if (!_rcCopyWanted) {
+                _showRcNote(qsTr("The copy is saved on this RC, in its Video folder."))
+                return
+            }
+            // Nobody pressed stop: the RC's video restarted, and the file may be empty.
+            if (_rcCopyRestarts >= _rcCopyRestartsMax) {
+                _rcCopyWanted = false
+                _showRcNote(qsTr("The copy on this RC keeps stopping, so no new one starts. The camera's own recording goes on."))
+                return
+            }
+            _rcCopyAgain = true
+            _showRcNote(qsTr("The copy on this RC stopped: its video restarted. A new copy starts when the video is back."))
+            if (_videoManager.decoding === true) {
+                rcCopyAgainTimer.restart()  // the video did not stop: a moment, not at once
+            }
         }
+        function onDecodingChanged() {
+            if (_videoManager.decoding === true && _rcCopyAgain) {
+                rcCopyAgainTimer.restart()
+            }
+        }
+    }
+    Timer {
+        id:          rcCopyAgainTimer
+        interval:    1500
+        onTriggered: _startCopyAgain()
     }
 
     Timer {

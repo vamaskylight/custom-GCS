@@ -124,6 +124,8 @@ for n in (0, 1, 2, 4, 5):
 for a in ("stop", "in", "out", "tele", "wide", "x"):
     case(f"buildDzmStepZoom({cpp_str(a)})", lambda a=a: frame(safe(lambda: p.build_dzm_step_zoom(a))))
     case(f"buildZmcZoom({cpp_str(a)})", lambda a=a: frame(safe(lambda: p.build_zmc_zoom(a))))
+    # The C20's lens zoom (task AN): ZMC to M as TOP V1.1.6 writes it, "#TP" from U.
+    case(f"buildLensZoom({cpp_str(a)})", lambda a=a: frame(safe(lambda: p.build_lens_zoom(a))))
 for a in ("stop", "near", "far", "in", "out", "auto", "x"):
     case(f"buildFccFocus({cpp_str(a)})", lambda a=a: frame(safe(lambda: p.build_fcc_focus(a))))
 

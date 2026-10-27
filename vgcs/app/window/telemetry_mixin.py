@@ -63,6 +63,7 @@ from vgcs.app.window.helpers import (
 )
 from vgcs.app.arm_readiness import parse_prearm_health
 from vgcs.app.battery_tracker import pack_voltage_v_from_cells, voltage_v_from_mv
+from vgcs.app.obstacle_watch import OBSTACLE_PARAMS
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.vehicle_messages import NOTICE_EVENT, SEVERITY_INFO, SEVERITY_WARNING
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
@@ -248,6 +249,54 @@ class MainWindowTelemetryMixin:
                 self._post_gcs_notice(message, kind=NOTICE_EVENT)
             self._append_log(f"GPS: {message}")
 
+    def _publish_obstacle(self) -> None:
+        """The drone's obstacle sensor everywhere it shows, and its warnings (A7, 2026-10-27).
+
+        Called on each PROXIMITY, MISSION_TARGET and SYS_STATUS, and once a
+        second from the flight timer: the readings expire, and a sensor that
+        went quiet must not keep its last picture (vgcs.app.obstacle_watch).
+        """
+        watch = self._obstacle
+        now = time.monotonic()
+        params = getattr(self, "_last_params", None)
+        if not isinstance(params, dict):
+            # Only the window's own dict: "name in" on anything else may never end (a stand-in that
+            # answers every index, as a test's window does, hung the whole suite on 2026-10-27).
+            params = {}
+        watch.update_params({name: params[name] for name in OBSTACLE_PARAMS if name in params})
+        view = watch.radar_view(now)
+        self._map_widget.set_proximity_view(view)
+        self._map_widget.set_detour_point(watch.detour(now))
+        # The field is the obstacle sensor's while the drone has one, and "N/A" once more when it has
+        # gone (OBSTACLE_DISTANCE from a companion computer writes it otherwise).
+        shown = view["state"] != "none"
+        if shown or getattr(self, "_obstacle_field_shown", False):
+            field = self._fields["obstacle_prox"]
+            text = watch.field_text(now)
+            if field.text() != text:
+                field.setText(text)
+            self._apply_state_style(field, watch.level(now))
+        self._obstacle_field_shown = shown
+        warning = watch.take_warning(now)
+        if warning:
+            # Shown like a vehicle warning, so routine chatter cannot bury it.
+            self._vehicle_msg_board.push_vehicle_message(warning, severity=SEVERITY_WARNING)
+            self._publish_vehicle_msg_cell()
+            self._append_log(f"OBSTACLE: {warning}")
+        event = watch.take_sensor_event(now)
+        if event is not None:
+            message, is_warning = event[0], event[1]
+            if is_warning:
+                self._vehicle_msg_board.push_vehicle_message(message, severity=SEVERITY_WARNING)
+                self._publish_vehicle_msg_cell()
+            else:
+                self._post_gcs_notice(message, kind=NOTICE_EVENT)
+            self._append_log(f"OBSTACLE: {message}")
+        detour = watch.take_detour_event(now)
+        if detour:
+            self._post_gcs_notice(detour, kind=NOTICE_EVENT)
+            self._append_log(f"OBSTACLE: {detour}")
+
     def _reset_telemetry_fields(self) -> None:
         self._armed_since = None
         publish_signing = getattr(self, "_publish_signing", None)
@@ -256,6 +305,7 @@ class MainWindowTelemetryMixin:
         self._battery.reset()
         self._wind.reset()
         self._rtk.reset()
+        self._obstacle.reset()
         self._vehicle_msg_board.reset()
         self._prearm_health = None
         self._fields["battery"].setToolTip("")
@@ -316,6 +366,7 @@ class MainWindowTelemetryMixin:
         self._top_remote_id.setText("N/A")
         self._publish_wind()
         self._publish_rtk()
+        self._publish_obstacle()
         self._publish_vehicle_msg_cell()
         self._map_widget.set_header_mode("—")
         self._map_widget.set_header_gps(0, "N/A")
@@ -524,6 +575,8 @@ class MainWindowTelemetryMixin:
                     vehicle_type=int(data.get("vehicle_type", 0) or 0),
                     custom_mode=int(data.get("custom_mode", 0) or 0),
                 )
+            # Before the early return below: what the drone does about an object depends on both.
+            self._obstacle.update_mode(mode_text, armed)
             hb_key = (armed, system_status, mode_text)
             arm_ready = self._compute_hb_arm_ready(
                 armed=armed,
@@ -767,6 +820,8 @@ class MainWindowTelemetryMixin:
             # Kept whole: the pre-arm parse reads one bit out of this triplet,
             # but the motor/ESC row needs others from the same message.
             self._last_sensor_flags = (sensors_present, sensors_enabled, sensors_health)
+            self._obstacle.update_sensor_flags(sensors_present, sensors_enabled, sensors_health)
+            self._publish_obstacle()
             self._prearm_health = parse_prearm_health(
                 sensors_present=sensors_present,
                 sensors_enabled=sensors_enabled,
@@ -830,6 +885,13 @@ class MainWindowTelemetryMixin:
                 self._fields["obstacle_prox"],
                 "ok" if prox != "N/A" else "na",
             )
+        elif msg_type == "PROXIMITY":
+            # The drone's proximity sensor, its 8 directions together (vgcs/link/proximity.py).
+            self._obstacle.update_sectors(data)
+            self._publish_obstacle()
+        elif msg_type == "MISSION_TARGET":
+            self._obstacle.update_target(data)
+            self._publish_obstacle()
         elif msg_type == "DISTANCE_SENSOR":
             self._map_widget.set_distance_sensor(data)
             _, rf = self._map_widget.get_obstacle_sensor_summary()

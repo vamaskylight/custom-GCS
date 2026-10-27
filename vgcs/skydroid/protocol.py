@@ -516,6 +516,22 @@ def build_zmc_zoom(action: str) -> bytes:
     return build_pod_camera_command("ZMC", code, dest="M")
 
 
+def build_lens_zoom(action: str) -> bytes:
+    """The lens zoom of a camera with an optical lens and no zoom report: the C20 (22x).
+
+    TOP V1.1.6 (the client's PDF) puts zoom and focus on the lens address M and names ZMC in its
+    appendix only, and lists the digital zoom DZM for the C12 alone. Its frame form for 2 data
+    characters is "#TP" from source U: "#TPUM2wZMC02" zooms in, 01 out (as ZMC above), 00 stops.
+    The lens moves while it is told to, so the stop follows a moment later (client video
+    2026-10-27, test build 14: the V13's step, with its stop at once, did not zoom a C20).
+    """
+    act = str(action or "").strip().lower()
+    code = {"stop": "00", "out": "01", "in": "02", "wide": "01", "tele": "02"}.get(act)
+    if code is None:
+        raise ValueError(f"unsupported lens zoom action {action!r}")
+    return build_tp_frame(dest="M", src="U", control="w", tag="ZMC", data=code, variable=False)
+
+
 def build_fcc_focus(action: str) -> bytes:
     """Focus control (PROTOCAL §2.1, FCC tag)."""
     act = str(action or "").strip().lower()

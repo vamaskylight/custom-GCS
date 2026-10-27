@@ -8,6 +8,7 @@
 #include "FlightMapSettings.h"
 #include "MapPackLoader.h"
 #include "SettingsManager.h"
+#include "VideoSettings.h"
 #include "Viewer3DSettings.h"
 
 #include <QtCore/QApplicationStatic>
@@ -173,6 +174,16 @@ void CustomPlugin::adjustSettingMetaData(const QString& settingsGroup, FactMetaD
         // a setting only when it is changed). The map type stays QGC's "Hybrid".
         if (metaData.name() == FlightMapSettings::mapProviderName) {
             metaData.setRawDefaultValue(QStringLiteral("Google"));
+            return;
+        }
+    } else if (settingsGroup == VideoSettings::settingsGroup) {
+        // VAMA (client videos 2026-10-27, test build 14, task AM): the RC's copy of a recording
+        // was a 0 B file. QGC's MP4 recorder (mp4mux with faststart, which first writes into a
+        // temporary file) failed as soon as frames reached it, and QGC then restarts its whole
+        // video. MKV is written straight into its file. Only the default changes: MP4 and MOV
+        // stay in QGC's video settings. QGC's list: mkv 0, mov 1, mp4 2.
+        if (metaData.name() == VideoSettings::recordingFormatName) {
+            metaData.setRawDefaultValue(0);
             return;
         }
     }

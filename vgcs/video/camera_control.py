@@ -378,6 +378,15 @@ class SkydroidCameraControl:
                 return
             if self._zoom_max() <= ZOOM_MIN and not self._adapter.zoom_is_dzm_step():
                 return  # a camera without zoom: nothing is sent
+            if self._adapter.zoom_is_lens_pulse():
+                # The C20's lens (task AN): a short zoom per click, no absolute level. A "-"
+                # that reaches the bottom of the rail zooms the lens out to its wide end, as
+                # on the C14 Pro: the one state whose field of view is known.
+                if int(step) < 0 and float(ui_level) <= ZOOM_MIN + 1e-6:
+                    self._adapter.camera_zoom_home()
+                else:
+                    self._adapter.camera_zoom_step(int(step))
+                return
             if self._adapter.zoom_is_dzm_step():
                 # C14 Pro: one DZM step per click and nothing else. There is no
                 # absolute level to sync - a rail level is not a magnification
@@ -469,8 +478,14 @@ class SkydroidCameraControl:
         instead of drifting from it - otherwise a zoom made on the handset
         leaves the rail pinned at its floor and the operator unable to zoom
         back out from here.
+
+        The C20's lens says nothing (task AN): the rail believes the adapter's
+        count of zoom-in clicks since the last "1x" run. With a level of its
+        own the rail dropped a "-" at its floor, the lens still zoomed in.
         """
         try:
+            if self._adapter.zoom_is_lens_pulse():
+                return ZOOM_MIN + self._adapter.lens_zoom_clicks() * ZOOM_STEP_SKYDROID
             if not self._adapter.zoom_is_dzm_step():
                 return None
             step, _reported = self._adapter.zoom_step_best()

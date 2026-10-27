@@ -196,6 +196,11 @@ class MainWindowLifecycleMixin:
             self._publish_rtk()
         except Exception:
             pass
+        # The obstacle sensor's readings expire too (and it sends nothing when nothing is in range).
+        try:
+            self._publish_obstacle()
+        except Exception:
+            pass
         try:
             self._publish_rtk_corrections()
         except Exception:

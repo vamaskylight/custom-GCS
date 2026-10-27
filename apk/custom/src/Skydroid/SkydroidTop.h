@@ -117,6 +117,9 @@ std::vector<std::string> buildC13ZoomStepFrames(int direction, const Options &op
 std::string buildDzmStepZoom(const std::string &action, const Options &options = {});
 /// stop, out, in, wide, tele
 std::string buildZmcZoom(const std::string &action, const Options &options = {});
+/// The C20's lens zoom (task AN): ZMC to the lens address M in TOP V1.1.6's form, "#TPUM2wZMC02"
+/// in, 01 out, 00 stop. The lens moves while it is told to: the stop follows a moment later.
+std::string buildLensZoom(const std::string &action, const Options &options = {});
 /// stop, near, far, in, out, auto
 std::string buildFccFocus(const std::string &action, const Options &options = {});
 

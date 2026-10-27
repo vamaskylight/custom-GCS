@@ -25,9 +25,10 @@ from vgcs.mission import (
     normalize_end_action,
     plan_signature,
 )
-from vgcs.link.confirmations import ModeChange, ParamReads, ParamWrites, clean_name
+from vgcs.link.confirmations import CommandAck, ModeChange, ParamReads, ParamWrites, clean_name
 from vgcs.link.fence_link import FenceLinkMixin
 from vgcs.link.mission_speed import LegSpeed
+from vgcs.link.proximity import ProximitySectors, mission_target
 from vgcs.link.signing import (
     KeyTransfer,
     SigningMonitor,
@@ -75,6 +76,8 @@ _AUTOPILOT_ONLY_MESSAGES = frozenset(
         "NAMED_VALUE_FLOAT",
         # RTK status of the aircraft's own GPS.
         "GPS_RTK",
+        # Where the drone flies now (its waypoint, or the path planner's point).
+        "POSITION_TARGET_GLOBAL_INT",
     }
 )
 
@@ -289,6 +292,9 @@ class MavlinkThread(FenceLinkMixin, QThread):
             "OBSTACLE_DISTANCE": 0.1,
             "DISTANCE_SENSOR": 0.15,
             "RANGEFINDER": 0.15,
+            # The proximity sensor's 8 directions, together (vgcs/link/proximity.py).
+            "PROXIMITY": 0.2,
+            "MISSION_TARGET": 0.4,
             "WIND": 0.4,
             "GPS_RTK": 0.4,
         }
@@ -301,6 +307,11 @@ class MavlinkThread(FenceLinkMixin, QThread):
         self._vehicle_armed = False
         self._prox_streams_last_request_mono = 0.0
         self._proximity_log_once: set[str] = set()
+        self._proximity = ProximitySectors()
+        # The mission item the drone flies to (MISSION_CURRENT), for its target beside the waypoint,
+        # and the item whose waypoint the last target was away from (a detour is two in a row).
+        self._mission_current_seq: int | None = None
+        self._detour_seq: int | None = None
         self._gimbal_lock = threading.Lock()
         self._gimbal_status = GimbalStatus()
         # RTK corrections (RTCM 3) waiting to go to the vehicle. Kept apart from
@@ -316,6 +327,8 @@ class MavlinkThread(FenceLinkMixin, QThread):
         self._param_writes = ParamWrites()
         self._param_reads = ParamReads()
         self._mode_request: ModeChange | None = None
+        # A restart asked for (MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN), until the drone answers it.
+        self._reboot_request: CommandAck | None = None
         # The planned speed of each leg, kept across jumps and returns to AUTO
         # (vgcs/link/mission_speed.py). Made on first use, see _legs().
         self._leg_speed: LegSpeed | None = None
@@ -557,6 +570,11 @@ class MavlinkThread(FenceLinkMixin, QThread):
         with self._cmd_lock:
             self._cmd_queue.append(("signing_to_drone", bool(enable)))
 
+    def queue_reboot(self) -> None:
+        """Restart the drone's flight controller (action_result "reboot"). Refused while it is armed."""
+        with self._cmd_lock:
+            self._cmd_queue.append(("reboot", None))
+
     def queue_motor_test(
         self,
         *,
@@ -650,6 +668,9 @@ class MavlinkThread(FenceLinkMixin, QThread):
     def run(self) -> None:
         self._running = True
         self._proximity_log_once.clear()
+        self._proximity.reset()
+        self._mission_current_seq = None
+        self._detour_seq = None
         self._prox_streams_last_request_mono = 0.0
         raw = self._connection_string.strip()
 
@@ -912,6 +933,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
             state = getattr(msg, "mission_state", None)
             self._emit_telemetry_payload("MISSION_CURRENT", {"seq": cur_seq})
             if self._is_primary_source(msg):
+                self._mission_current_seq = cur_seq
                 # First, so a mission that is no longer the one VGCS knows
                 # is dropped before its progress is named.
                 self._legs().heard_current(cur_seq, time.monotonic(), getattr(msg, "total", None), state)
@@ -1159,6 +1181,16 @@ class MavlinkThread(FenceLinkMixin, QThread):
             }
             self._log_proximity_once(msg_type, payload)
             self._emit_telemetry_payload("OBSTACLE_DISTANCE", payload)
+        elif msg_type == "DISTANCE_SENSOR" and self._proximity.hear(
+            getattr(msg, "id", 0), getattr(msg, "orientation", 0), getattr(msg, "current_distance", 0),
+            getattr(msg, "min_distance", 0), getattr(msg, "max_distance", 0), time.monotonic()
+        ):
+            # A direction of the proximity sensor (ids 10 to 17, upward 19): all of them together.
+            snapshot = self._proximity.snapshot(time.monotonic())
+            self._log_proximity_once("PROXIMITY", snapshot)
+            self._emit_telemetry_payload("PROXIMITY", snapshot)
+        elif msg_type == "POSITION_TARGET_GLOBAL_INT":
+            self._hear_position_target(msg)
         elif msg_type == "DISTANCE_SENSOR":
             cur_cm = int(getattr(msg, "current_distance", 0xFFFF) or 0xFFFF)
             cur_m: float | None = None
@@ -1277,6 +1309,8 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 self._set_signing_key(data.get("key"), int(data.get("link_id", 1) or 1))
             elif cmd == "signing_to_drone":
                 self._signing_to_drone(bool(payload))
+            elif cmd == "reboot":
+                self._reboot()
             elif cmd == "motor_test":
                 self._motor_test(payload if isinstance(payload, dict) else {})
             elif cmd == "preflight_calibration":
@@ -1578,8 +1612,47 @@ class MavlinkThread(FenceLinkMixin, QThread):
             self.log_line.emit(
                 f"Proximity: {key} range={cur if cur is not None else '—'} m"
             )
+        elif key == "PROXIMITY":
+            seen = sum(1 for d in payload.get("directions_m") or [] if d is not None)
+            self.log_line.emit(f"Proximity sensor: its directions arrive ({seen} of 8 with an object), "
+                               f"range {payload.get('min_m', 0.0):g} to {payload.get('max_m', 0.0):g} m")
         else:
             self.log_line.emit(f"Proximity: {key} active")
+
+    def _hear_position_target(self, msg) -> None:
+        """Where the drone flies now. In a mission, beside the waypoint it flies to: a detour shows (A7, 2026-10-27).
+
+        Only for a mission VGCS knows (its plan gives the waypoint's place).
+        """
+        try:
+            target = (int(msg.lat_int) / 1e7, int(msg.lon_int) / 1e7)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if abs(target[0]) < 1e-9 and abs(target[1]) < 1e-9:
+            return
+        mode = str(self._current_mode_name() or "")
+        plan = self._mission_plan
+        seq = self._mission_current_seq
+        waypoint = None
+        after = None
+        wp_index = None
+        if mode.upper() == "AUTO" and plan is not None and seq is not None:
+            waypoint = plan.position_for_seq(seq)
+            wp_index = plan.waypoint_index_for_seq(seq)
+            after = next((plan.position_for_seq(item.seq) for item in sorted(plan.items, key=lambda i: i.seq)
+                          if item.seq > seq and item.wp_index is not None), None)
+        payload = mission_target(target, waypoint, after)
+        # A detour once two targets in a row, under the same mission item, are away from its waypoint.
+        # The first may be the next item's target before its MISSION_CURRENT (an RTL, a landing).
+        if payload["detour"]:
+            if self._detour_seq != seq:
+                self._detour_seq = seq
+                payload["detour"] = None
+        else:
+            self._detour_seq = None
+        payload["mode"] = mode
+        payload["wp_index"] = wp_index
+        self._emit_telemetry_payload("MISSION_TARGET", payload)
 
     def _request_proximity_streams(self) -> None:
         """Re-request LiDAR / rangefinder MAVLink (safe to call periodically)."""
@@ -2446,6 +2519,11 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 self.log_line.emit("Signing: no sign from the drone yet, key sent again")
             if transfer.done:
                 self._key_transfer = None
+        reboot = getattr(self, "_reboot_request", None)
+        if reboot is not None:
+            reboot.tick(now)
+            if reboot.done:
+                self._reboot_request = None
         self._legs().tick(now)
         self._tick_fence(now)
 
@@ -2458,6 +2536,10 @@ class MavlinkThread(FenceLinkMixin, QThread):
             request.done = True
             request.on_done(False, reason)
         self._legs().cancel(reason)
+        reboot = getattr(self, "_reboot_request", None)
+        self._reboot_request = None
+        if reboot is not None:
+            reboot.give_up(reason)
         transfer = getattr(self, "_key_transfer", None)
         self._key_transfer = None
         if transfer is not None and not transfer.done:
@@ -3229,6 +3311,9 @@ class MavlinkThread(FenceLinkMixin, QThread):
         except (TypeError, ValueError):
             return
         self._legs().heard_ack(command, result, time.monotonic())
+        reboot = getattr(self, "_reboot_request", None)
+        if reboot is not None:
+            reboot.heard_ack(command, result)
 
     def _hear_flight_plan_received(self) -> None:
         """ "Flight plan received": the drone has taken a new mission.
@@ -3420,6 +3505,41 @@ class MavlinkThread(FenceLinkMixin, QThread):
             )
         except Exception as e:
             self.action_result.emit("motor_test", False, str(e))
+
+    def _reboot(self) -> None:
+        """Restart the flight controller (obstacle settings page, A7, 2026-10-27).
+
+        Sent once, never again on no answer: ArduPilot answers before it
+        restarts, and a second command could restart the drone again once it is
+        back. Refused here while armed, and ArduPilot refuses it then too
+        (GCS_Common.cpp ``handle_preflight_reboot``).
+        """
+        if self._master is None:
+            self.action_result.emit("reboot", False, "Link not ready")
+            return
+        if bool(getattr(self, "_vehicle_armed", False)):
+            self.action_result.emit("reboot", False, "Refused: the drone is armed. It restarts on the ground only")
+            return
+        if getattr(self, "_reboot_request", None) is not None:
+            self.action_result.emit("reboot", False, "A restart is already asked for, the drone has not answered yet")
+            return
+
+        def done(ok: bool, detail: str) -> None:
+            if ok:
+                self.action_result.emit("reboot", True, "The drone restarts now")
+                self.log_line.emit("Restart: the drone accepted it")
+            else:
+                self.action_result.emit("reboot", False, detail)
+                self.error.emit(f"Restart failed: {detail}")
+
+        command = int(mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN)
+        self._sync_link_targets()
+        try:
+            self._send_command_long(command, p1=1.0)     # 1: restart the autopilot
+        except Exception as e:
+            self.action_result.emit("reboot", False, str(e))
+            return
+        self._reboot_request = CommandAck(command, time.monotonic(), done, resend_s=3.0, tries=1)
 
     def _send_command_long(
         self,

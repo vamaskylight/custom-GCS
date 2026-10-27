@@ -72,6 +72,14 @@ CHECKED = (
     "FRAME_CLASS",
     *(name for pair in SPEEDS_RENAMED_IN_4_7.items() for name in pair),
     "RTL_LOIT_TIME",
+    # The obstacle sensor's words (vgcs/app/obstacle_watch.py, 2026-10-27): what the drone does
+    # about an object in its mode. The same names on 4.6 and 4.7.
+    "AVOID_ENABLE",
+    "AVOID_MARGIN",
+    "AVOID_BEHAVE",
+    "OA_TYPE",
+    # And whether it has one, for the line in Vehicle Configuration (vgcs/app/obstacle_setup.py).
+    "PRX1_TYPE",
 )
 
 # Read once the drone has answered, and again on "Refresh params". The mission

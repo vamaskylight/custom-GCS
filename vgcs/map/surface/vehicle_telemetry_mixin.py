@@ -317,6 +317,28 @@ class VehicleTelemetryMixin:
         except Exception:
             pass
 
+    def set_proximity_view(self, view: object) -> None:
+        """The drone's obstacle sensor in 8 directions (vgcs.app.obstacle_watch ``radar_view``), or None.
+
+        On the radar card and as arcs round the drone on the map (A7, 2026-10-27), also while nothing
+        is in range ("Path clear"). The card itself is shown by the link (it is up whenever a drone is
+        connected) and hidden while Plan Flight is open: a reading does not show it again.
+        """
+        shown = view if isinstance(view, dict) and view.get("state") != "none" else None
+        try:
+            self._obstacle_radar.set_proximity_view(shown)
+        except Exception:
+            pass
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            nm.set_proximity_view(shown)
+
+    def set_detour_point(self, point: object) -> None:
+        """In a mission, where the drone flies while it goes around an obstacle ({lat, lon}), or None."""
+        nm = getattr(self, "_native_map", None)
+        if nm is not None:
+            nm.set_detour_point(point if isinstance(point, dict) else None)
+
     def get_obstacle_sensor_summary(self) -> tuple[str, str]:
         """Nearest obstacle + rangefinder text for dashboard telemetry panel."""
         try:

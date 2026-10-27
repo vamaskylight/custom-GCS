@@ -62,6 +62,8 @@ from vgcs.app.window.helpers import (
     _settings_truthy,
 )
 from vgcs.app.gcs_style import gcs_stylesheet
+from vgcs.app.obstacle_setup import summary as obstacle_summary
+from vgcs.app.obstacle_setup_dialog import ObstacleSetupDialog
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
 from vgcs.app.wind_monitor import DEFAULT_WARN_MPS, KEY_WIND_WARN_MPS, MAX_WARN_MPS, clamp_warn_mps
 from vgcs.app.window.rtk_base_mixin import KEY_RTK_BASE_SOURCE
@@ -1063,6 +1065,15 @@ class MainWindowSettingsDialogsMixin:
 
         return group, save
 
+    def _open_obstacle_setup(self) -> None:
+        """The obstacle sensor settings of the drone on screen (A7, 2026-10-27)."""
+        thread = getattr(self, "_thread", None)
+        if thread is None or not thread.isRunning():
+            QMessageBox.warning(self, "VGCS", "Connect the drone first.")
+            return
+        dlg = ObstacleSetupDialog(self, thread, lambda: bool(getattr(self, "_hb_armed", False)), self._append_log)
+        dlg.exec()
+
     def _show_vehicle_configuration_help(self) -> None:
         QMessageBox.information(
             self,
@@ -1277,6 +1288,23 @@ class MainWindowSettingsDialogsMixin:
         fs_lay.addWidget(btn_failsafes)
         fs_group.setLayout(fs_lay)
         lay.addWidget(fs_group)
+
+        # The drone's obstacle sensor (LiDAR) and what it does about objects (A7, 2026-10-27).
+        obstacle_group = QGroupBox("Obstacle sensor (LiDAR)")
+        obstacle_lay = QVBoxLayout()
+        obstacle_lay.setSpacing(8)
+        obstacle_note = QLabel(f"On the drone now: {obstacle_summary(known)}")
+        obstacle_note.setWordWrap(True)
+        obstacle_lay.addWidget(obstacle_note)
+        btn_obstacle = QPushButton("Obstacle sensor settings...")
+        btn_obstacle.setObjectName("vehicleConfigObstacleSetup")
+        btn_obstacle.setEnabled(can_send)
+        btn_obstacle.setToolTip("The LiDAR's port and mounting, keeping away from objects, and flying around them in "
+                                "a mission. Reads the drone first, asks before it writes.")
+        btn_obstacle.clicked.connect(self._open_obstacle_setup)
+        obstacle_lay.addWidget(btn_obstacle)
+        obstacle_group.setLayout(obstacle_lay)
+        lay.addWidget(obstacle_group)
 
         # Advanced parameters (collapsed)
         adv_box = QGroupBox("Advanced parameters")

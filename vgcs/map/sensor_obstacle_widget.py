@@ -117,15 +117,17 @@ def _sensor_family_label(sensor_type: int) -> str:
 
 
 def _orientation_label(orientation: int) -> str:
+    # MAV_SENSOR_ORIENTATION: 0 ahead, then every 45 degrees clockwise (1 is ahead right, 2 right, ...),
+    # 24 up, 25 down. It said "FWD-R" for 2 and "RIGHT" for 4 until 2026-10-27.
     names = {
         0: "FWD",
-        2: "FWD-R",
-        4: "RIGHT",
-        6: "AFT-R",
-        8: "AFT",
-        10: "AFT-L",
-        12: "LEFT",
-        14: "FWD-L",
+        1: "FWD-R",
+        2: "RIGHT",
+        3: "AFT-R",
+        4: "AFT",
+        5: "AFT-L",
+        6: "LEFT",
+        7: "FWD-L",
         25: "DOWN",
         24: "UP",
     }
@@ -195,6 +197,8 @@ class ObstacleRadarCanvas(QWidget):
         self._obstacle = ObstacleDistanceState()
         self._stale = True
         self._has_proximity = False
+        # The drone's own proximity sensor in 8 directions (vgcs.app.obstacle_watch radar_view), or None.
+        self._sectors: dict | None = None
         self._sweep_deg = 0.0
         # The idle sweep turns at about 71 degrees a second. It was drawn every
         # 45 ms, and with its see-through corners each frame also redraws the
@@ -215,7 +219,20 @@ class ObstacleRadarCanvas(QWidget):
     def set_obstacle_state(self, state: ObstacleDistanceState) -> None:
         self._obstacle = state
         self._stale = (time.monotonic() - float(state.updated_mono or 0.0)) > 2.5
-        self._has_proximity = state.active_bin_count() > 0
+        if self._sectors is None:
+            self._has_proximity = state.active_bin_count() > 0
+        self.update()
+
+    def set_sector_view(self, view: dict | None) -> None:
+        """The drone's proximity sensor, 8 directions (None: back to OBSTACLE_DISTANCE)."""
+        new = dict(view) if isinstance(view, dict) else None
+        if new == self._sectors:
+            return
+        self._sectors = new
+        if self._sectors is None:
+            self._has_proximity = self._obstacle.active_bin_count() > 0
+        else:
+            self._has_proximity = any(d is not None for d in self._sectors.get("directions_m") or [])
         self.update()
 
     @staticmethod
@@ -250,6 +267,37 @@ class ObstacleRadarCanvas(QWidget):
         except Exception:
             pass
 
+    def _paint_sectors(self, p: QPainter, cx: float, cy: float, radius: float, max_r_m: float, view: dict) -> None:
+        """One arc for each direction with an object, at its distance, and the stop distance as a dashed ring.
+
+        Red within the stop distance, amber within the warning distance, green beyond.
+        """
+        stop = view.get("stop_m")
+        red_m = float(view.get("red_m") or 0.0)
+        near_m = float(view.get("near_m") or 0.0)
+        if stop:
+            rr = radius * 0.9 * min(1.0, float(stop) / max_r_m)
+            p.setPen(QPen(QColor(248, 113, 113, 150), 1.2, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), rr, rr)
+        for index, d in enumerate(view.get("directions_m") or []):
+            if d is None:
+                continue
+            dist = min(float(d), max_r_m)
+            r = max(radius * 0.14, radius * 0.9 * dist / max_r_m)
+            colour = _HUD_DANGER if d <= red_m else (_HUD_WARN if d <= near_m else _HUD_SAFE)
+            p.setPen(QPen(colour, 5.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+            # Qt's angles run counter-clockwise from 3 o'clock: the arc starts at the direction's right edge.
+            start = _mav_to_qt_deg(index * 45.0 + 20.0)
+            p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), int(start * 16), int(40.0 * 16))
+        up = view.get("up_m")
+        if up is not None:
+            f_up = QFont("Segoe UI", 8)
+            f_up.setWeight(QFont.Weight.DemiBold)
+            p.setFont(f_up)
+            p.setPen(_HUD_DANGER if up <= red_m else _HUD_TEXT)
+            p.drawText(QRectF(2, 2, 70, 14), int(Qt.AlignmentFlag.AlignLeft), f"UP {up:.1f} m")
+
     def _paint_radar(self, p: QPainter) -> None:
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
@@ -266,7 +314,11 @@ class ObstacleRadarCanvas(QWidget):
         p.drawEllipse(QPointF(cx, cy), inner_r, inner_r)
         radius = inner_r
 
-        max_r_m = max(0.5, float(self._obstacle.max_distance_m or 30.0))
+        sectors = self._sectors
+        if sectors is not None:
+            max_r_m = max(1.0, float(sectors.get("scale_m") or 10.0))
+        else:
+            max_r_m = max(0.5, float(self._obstacle.max_distance_m or 30.0))
         ring_fracs = (0.33, 0.66, 1.0)
         f_ring = QFont("Segoe UI", 8)
         f_ring.setWeight(QFont.Weight.DemiBold)
@@ -323,8 +375,10 @@ class ObstacleRadarCanvas(QWidget):
         off = float(obs.angle_offset_deg or 0.0)
         r_in = max(5.0, radius * 0.12)
 
+        if sectors is not None:
+            self._paint_sectors(p, cx, cy, radius, max_r_m, sectors)
         p.setPen(Qt.PenStyle.NoPen)
-        for i, d_cm in enumerate(obs.distances_cm[:_OBSTACLE_BIN_COUNT]):
+        for i, d_cm in enumerate([] if sectors is not None else obs.distances_cm[:_OBSTACLE_BIN_COUNT]):
             if d_cm <= 0 or d_cm >= _NO_READING_CM:
                 continue
             dist_m = min(float(d_cm) / 100.0, max_r_m)
@@ -346,11 +400,13 @@ class ObstacleRadarCanvas(QWidget):
             p.setBrush(glow)
             p.drawEllipse(QRectF(hx - 5, hy - 5, 10, 10))
 
+        # The card is drawn with the drone's nose up (the readings are the drone's own directions),
+        # so the top is ahead, not north. It said "N" until 2026-10-27.
         p.setPen(QColor(248, 113, 113, 230))
         f_n = QFont("Segoe UI", 9)
         f_n.setWeight(QFont.Weight.Bold)
         p.setFont(f_n)
-        p.drawText(int(cx - 8), int(cy - radius + 8), 16, 14, int(Qt.AlignmentFlag.AlignCenter), "N")
+        p.drawText(int(cx - 16), int(cy - radius + 8), 32, 14, int(Qt.AlignmentFlag.AlignCenter), "FWD")
 
         tri_r = max(8.0, radius * 0.1)
         tri = QPolygonF(
@@ -717,6 +773,8 @@ class ObstacleRadarPanel(QFrame):
         self._obstacle = ObstacleDistanceState()
         self._rangefinder = DistanceSensorState()
         self._rangefinder_subtitle = "Rangefinder"
+        # The drone's proximity sensor in 8 directions, as vgcs.app.obstacle_watch says it (or None).
+        self._sector_view: dict | None = None
         self._proximity_stream_seen = False
         self._rangefinder_stream_seen = False
         self._active_sensor: str | None = None
@@ -767,6 +825,13 @@ class ObstacleRadarPanel(QFrame):
                 close = rf < 15.0
                 self._set_status_mode("alert" if close else "live")
                 return
+
+        view = self._sector_view
+        if view is not None:
+            self._lbl_status.setText(str(view.get("status") or ""))
+            state = str(view.get("state") or "")
+            self._set_status_mode("alert" if view.get("near") or state == "fault" else "live")
+            return
 
         now = time.monotonic()
         obs_age = now - float(self._obstacle.updated_mono or 0.0)
@@ -840,6 +905,8 @@ class ObstacleRadarPanel(QFrame):
             self._panel_connected_mono = 0.0
             self._proximity_stream_seen = False
             self._rangefinder_stream_seen = False
+            self._sector_view = None
+            self._radar.set_sector_view(None)
             self._c13_lrf_ui = False
             self._c13_lrf_armed = False
             self._c13_lrf_locked = False
@@ -891,6 +958,26 @@ class ObstacleRadarPanel(QFrame):
 
         self._sync_status_line()
 
+    def set_proximity_view(self, view: dict | None) -> None:
+        """The drone's proximity sensor in 8 directions (vgcs.app.obstacle_watch ``radar_view``).
+
+        None takes the card back to OBSTACLE_DISTANCE and the waiting words. It comes several times a
+        second, mostly unchanged: nothing is restyled then.
+        """
+        new = dict(view) if isinstance(view, dict) else None
+        if new == self._sector_view:
+            return
+        self._sector_view = new
+        self._radar.set_sector_view(self._sector_view)
+        if self._sector_view is not None:
+            self._proximity_stream_seen = True
+            where = str(self._sector_view.get("nearest_where") or "") or "LiDAR"
+            self._metric_nearest.set_reading(str(self._sector_view.get("nearest_text") or "—"), subtitle=where,
+                                             alert=bool(self._sector_view.get("near")))
+            if self._active_sensor != "lidar":
+                self._set_sensor_active("lidar")
+        self._sync_status_line()
+
     def set_distance_sensor(self, payload: dict) -> None:
         if bool(getattr(self, "_c13_lrf_ui", False)):
             return
@@ -919,7 +1006,10 @@ class ObstacleRadarPanel(QFrame):
         else:
             self._metric_range.set_reading("—", subtitle="Rangefinder")
 
-        self._set_sensor_active("rf")
+        # With the drone's own obstacle sensor on the card, its pill stays lit (a rangefinder beside
+        # it would make the pills flicker between the two several times a second).
+        if self._sector_view is None:
+            self._set_sensor_active("rf")
         self._sync_status_line()
 
     def enable_c13_lrf_ui(self, enabled: bool = True) -> None:
@@ -1048,6 +1138,10 @@ class ObstacleRadarPanel(QFrame):
     def summary_text(self) -> tuple[str, str]:
         nearest = self._obstacle.nearest_m()
         n_text = "N/A" if nearest is None else f"{nearest:.1f} m"
+        view = self._sector_view
+        if view is not None:
+            where = str(view.get("nearest_where") or "")
+            n_text = str(view.get("nearest_text") or "N/A") + (f" {where.lower()}" if where else "")
         rf = self._rangefinder.current_distance_m
         if rf is None or rf < 0:
             r_text = "N/A"

@@ -185,7 +185,7 @@ ToolIndicatorPage {
                     QGCLabel {
                         Layout.fillWidth: true
                         horizontalAlignment: Text.AlignHCenter
-                        text: qsTr("Test build 14, 26 October 2026")
+                        text: qsTr("Test build 15, 27 October 2026")
                         font.pointSize: ScreenTools.smallFontPointSize
                         wrapMode: QGCLabel.WordWrap
                     }

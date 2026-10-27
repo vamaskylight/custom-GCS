@@ -210,6 +210,15 @@ public:
             emit recordingChanged(false);
         }
     }
+    // QGC's recording ending by itself, with nobody pressing stop: its video restarted (a GStreamer
+    // error, as on the client's RC with build 14, an IR switch, a lost link).
+    void failRecording()
+    {
+        if (_recording) {
+            _recording = false;
+            emit recordingChanged(false);
+        }
+    }
     int grabs = 0;
     int recordStarts = 0;
     int recordStops = 0;
@@ -2777,11 +2786,20 @@ int main(int argc, char *argv[])
              expect(transport && transport->isVisible() && transport->property("currentIndex").toInt() == 1,
                     "cameras: a copy of the V20 has TCP as its control link",
                     transport ? transport->property("currentText").toString() : QStringLiteral("no box"));
+             // Its lens zoom (task AN): a TOP camera has four zooms to choose from.
+             QQuickItem *zoom = findItem("vamaCameraZoom");
+             const QString zoomText = zoom ? zoom->property("currentText").toString() : QStringLiteral("no box");
+             expect(zoom && zoom->property("count").toInt() == 4 &&
+                        zoomText.startsWith(QStringLiteral("Its lens zooms and does not say how far")),
+                    "cameras: and the V20's lens zoom", zoomText);
              press("vamaCameraSave");
          }},
         {400, [&]() {
-             expect(cameraTransport(cameraFolder + QStringLiteral("/v20-copy.json")) == QStringLiteral("tcp"),
-                    "cameras: Save writes TCP into its file", cameraTransport(cameraFolder + QStringLiteral("/v20-copy.json")));
+             const QString file = cameraFolder + QStringLiteral("/v20-copy.json");
+             expect(cameraTransport(file) == QStringLiteral("tcp") && cameraFileValue(file, "zoom") == QJsonValue(QStringLiteral("pulse")) &&
+                        cameraFileValue(file, "maxZoom").toDouble() == 22.0,
+                    "cameras: Save writes TCP and the lens zoom into its file, with the lens's range",
+                    cameraTransport(file) + QStringLiteral(" | ") + cameraFileValue(file, "zoom").toString());
              press("vamaCameraEdit_v20-copy");
          }},
         {400, [&]() {
@@ -2960,6 +2978,62 @@ int main(int argc, char *argv[])
              expect(!global.videos.recording() && global.videos.recordStops == 1 && rcRec && !rcRec->isVisible() &&
                         rcSays == QStringLiteral("The copy is saved on this RC, in its Video folder."),
                     "record: and the RC's copy, which is saved", rcSays);
+             // The RC's copy ending by itself (task AM, client 2026-10-27: build 14 said "The copy is
+             // saved" over an empty file): its video restarts, and a new copy starts when it is back.
+             tap("vamaRecordButton");
+         }},
+        {200, [&]() {
+             const bool both = waitFor([&]() { return camera.recording && global.videos.recording(); }, 3000);
+             expect(both && global.videos.recordStarts == 2, "record: a new recording, on the camera and on the RC", QString());
+             global.videos.setDecoding(false);
+             global.videos.failRecording();
+         }},
+        {300, [&]() {
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString rcSays = rcText ? rcText->property("text").toString() : QString();
+             QObject *layer = window->property("layer").value<QObject *>();
+             expect(rcSays == QStringLiteral("The copy on this RC stopped: its video restarted. A new copy starts when the video is back.") &&
+                        global.videos.recordStops == 1 && camera.recording && layer && layer->property("_recordingShown").toBool(),
+                    "RC copy stopped by itself: the note says so, not \"saved\", nothing was stopped, the camera records on", rcSays);
+             global.videos.setDecoding(true);
+         }},
+        {300, [&]() {
+             const bool again = waitFor([&]() { return global.videos.recording(); }, 3000);
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString rcSays = rcText ? rcText->property("text").toString() : QString();
+             expect(again && global.videos.recordStarts == 3 && rcSays == QStringLiteral("A new copy is recorded on this RC, in its Video folder."),
+                    "RC copy stopped by itself: a new copy starts when the video is back", rcSays);
+             global.videos.failRecording();  // the video runs on: a new copy a moment later
+         }},
+        {300, [&]() {
+             const bool again = waitFor([&]() { return global.videos.recording(); }, 3000);
+             expect(again && global.videos.recordStarts == 4, "RC copy stopped by itself with the video running: a new copy a moment later",
+                    QString::number(global.videos.recordStarts));
+             global.videos.failRecording();
+         }},
+        {300, [&]() {
+             const bool again = waitFor([&]() { return global.videos.recording(); }, 3000);
+             expect(again && global.videos.recordStarts == 5, "RC copy: a third new copy", QString::number(global.videos.recordStarts));
+             global.videos.failRecording();
+         }},
+        {2000, [&]() {
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString rcSays = rcText ? rcText->property("text").toString() : QString();
+             expect(!global.videos.recording() && global.videos.recordStarts == 5 &&
+                        rcSays == QStringLiteral("The copy on this RC keeps stopping, so no new one starts. The camera's own recording goes on."),
+                    "RC copy that keeps stopping: no fourth new copy, and the note says the camera records on", rcSays);
+             tap("vamaRecordButton");  // stops the camera's recording
+         }},
+        {200, [&]() {
+             const bool stopped = waitFor([&]() { return !camera.recording; }, 3000);
+             // The link says what the camera did when it has asked it (up to 2.6 s after the press):
+             // wait for that note, or it comes during the SD card steps below and hides theirs.
+             QQuickItem *text = findItem("vamaCameraNoteText");
+             const QString stopNote = QStringLiteral("Recording stopped. The video is on the camera's SD card.");
+             const bool said = waitFor([&]() { return text && text->property("text").toString() == stopNote; }, 4000);
+             expect(stopped && said && global.videos.recordStarts == 5 && global.videos.recordStops == 1,
+                    "RC copy: the next press stops the camera's recording, and starts no copy",
+                    text ? text->property("text").toString() : QStringLiteral("no note"));
              // No SD card. The camera is asked about its card a second after a photo.
              camera.sdCard = FakeCamera::kNoSdCard;
              tap("vamaPhotoButton");

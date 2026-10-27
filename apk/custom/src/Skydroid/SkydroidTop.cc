@@ -494,6 +494,22 @@ std::string buildZmcZoom(const std::string &action, const Options &options)
     return buildPodCameraCommand("ZMC", code, 'M', true, options);
 }
 
+std::string buildLensZoom(const std::string &action, const Options &options)
+{
+    const std::string a = lower(trim(action));
+    std::string code;
+    if (a == "stop") {
+        code = "00";
+    } else if (a == "out" || a == "wide") {
+        code = "01";
+    } else if (a == "in" || a == "tele") {
+        code = "02";
+    } else {
+        return {};
+    }
+    return buildTpFrame('M', 'w', "ZMC", code, 'U', 0, options);
+}
+
 std::string buildFccFocus(const std::string &action, const Options &options)
 {
     const std::string a = lower(trim(action));

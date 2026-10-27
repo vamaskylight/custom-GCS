@@ -1,0 +1,19 @@
+diff --git a/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc b/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
+--- a/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
++++ b/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
+@@ -907,6 +907,15 @@ GstElement* GstVideoReceiver::_makeFileSink(const QString& videoFile, FILE_FORMA
+                 nullptr);
+             g_object_set(splitmux, "muxer-properties", muxerProps, nullptr);
+             gst_structure_free(muxerProps);
++        } else if (format == FILE_FORMAT_MKV) {
++            // VAMA patch (apk/qgc-patches/0002): an MKV from 0. Without the pad offset (patch 0001)
++            // matroskamux kept the stream's time, so a recording started minutes into the file; mp4mux
++            // starts at 0 by itself. Desktop GStreamer 1.24: start 0.000 s, every frame.
++            GstStructure *muxerProps = gst_structure_new("properties",
++                "offset-to-zero", G_TYPE_BOOLEAN, TRUE,
++                nullptr);
++            g_object_set(splitmux, "muxer-properties", muxerProps, nullptr);
++            gst_structure_free(muxerProps);
+         }
+ 
+         bin = gst_bin_new("sinkbin");

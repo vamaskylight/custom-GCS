@@ -630,6 +630,11 @@ class NativeTileMapView(QWidget):
         self._return_point: tuple[float, float] | None = None
         self._return_point_on_drone = False
         self._return_point_tag = ""
+        # The drone's obstacle sensor (2026-10-27, LiDAR): arcs round the drone in the directions it
+        # sees something (vgcs.app.obstacle_watch radar_view), and in a mission the point it flies to
+        # while it goes around an obstacle.
+        self._proximity_view: dict | None = None
+        self._detour: dict | None = None
         # Dragging a corner of the fence, while the fence tool is on.
         self._fence_drag_index: int | None = None
         self._fence_drag_press_screen: QPointF | None = None
@@ -1062,6 +1067,31 @@ class NativeTileMapView(QWidget):
     def return_point(self) -> tuple[float, float] | None:
         """The return point on the map, or None."""
         return self._return_point
+
+    def set_proximity_view(self, view: dict | None) -> None:
+        """What the drone's obstacle sensor sees, drawn as arcs round the drone. None draws nothing.
+
+        It comes several times a second, mostly unchanged: the map is drawn again only when it changed.
+        """
+        new = dict(view) if isinstance(view, dict) else None
+        if new == self._proximity_view:
+            return
+        self._proximity_view = new
+        self.update()
+
+    def set_detour_point(self, point: dict | None) -> None:
+        """In a mission, the point the drone flies to while it goes around an obstacle ({lat, lon}), or None."""
+        try:
+            new = None if point is None else {"lat": float(point["lat"]), "lon": float(point["lon"])}
+        except (KeyError, TypeError, ValueError):
+            new = None
+        if new == self._detour:
+            return
+        self._detour = new
+        self.update()
+
+    def detour_point(self) -> tuple[float, float] | None:
+        return None if self._detour is None else (self._detour["lat"], self._detour["lon"])
 
     def set_return_point(self, point) -> None:
         """Show a return point that did not come from a click here (read from the drone, a plan file). None removes it."""
@@ -2085,6 +2115,17 @@ class NativeTileMapView(QWidget):
         if self._fleet_items:
             self._draw_fleet_vehicles(painter, z, fx, fy, w, h)
 
+        # The obstacle sensor's arcs and a detour point, under the drone's arrow too.
+        if self._vehicle_lat is not None and self._vehicle_lon is not None and (
+                self._proximity_view is not None or self._detour is not None):
+            painter.save()
+            try:
+                self._paint_obstacles(painter, z, fx, fy, w, h)
+            except Exception:
+                pass
+            finally:
+                painter.restore()
+
         # Vehicle — navigation-style arrow (matches compass HUD: sharp tip, concave base,
         # thick white outline, red fill, center dot). Heading=0 points toward -Y.
         if self._vehicle_lat is not None and self._vehicle_lon is not None:
@@ -2340,6 +2381,72 @@ class NativeTileMapView(QWidget):
             th = metrics.height() + 4
             tx = max(4.0, min(float(top.x()) - tw / 2.0, float(w) - tw - 4.0))
             ty = max(4.0, float(top.y()) - th - (24.0 if editing else 10.0))
+            painter.fillRect(QRectF(tx, ty, tw, th), QColor(0, 0, 0, 215))
+            painter.setPen(colour)
+            painter.drawText(QRectF(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, words)
+
+    def _paint_obstacles(self, painter: QPainter, z, fx, fy, w, h) -> None:
+        """Arcs round the drone where its sensor sees something, and the detour point.
+
+        Each of the 8 directions with an object gets an arc at the object's distance (true to the map
+        when zoomed in), never nearer than just outside the drone's arrow, so it shows at any zoom.
+        Red within the stop distance, amber within the warning distance, green beyond.
+        """
+        c = self._project(self._vehicle_lat, self._vehicle_lon, z, fx, fy, w, h)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        view = self._proximity_view
+        if view is not None:
+            north = self._project(self._vehicle_lat + 50.0 / 111_320.0, self._vehicle_lon, z, fx, fy, w, h)
+            px_per_m = abs(float(c.y()) - float(north.y())) / 50.0
+            r_min = 34.0 * float(getattr(self, "_vehicle_arrow_scale", 1.0))
+            red_m = float(view.get("red_m") or 0.0)
+            near_m = float(view.get("near_m") or 0.0)
+            nearest = view.get("nearest")
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            metrics = painter.fontMetrics()
+            for index, d in enumerate(view.get("directions_m") or []):
+                if d is None:
+                    continue
+                r = max(r_min, float(d) * px_per_m)
+                if r > 2.0 * max(w, h):
+                    continue
+                if d <= red_m:
+                    colour = QColor(248, 70, 70, 235)
+                elif d <= near_m:
+                    colour = QColor(255, 196, 60, 235)
+                else:
+                    colour = QColor(90, 230, 140, 200)
+                painter.setPen(QPen(colour, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+                bearing = float(self._heading_deg) + index * 45.0
+                # Qt's angles run counter-clockwise from 3 o'clock; a bearing runs clockwise from north.
+                start = (90.0 - (bearing + 20.0)) % 360.0
+                painter.drawArc(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), int(start * 16), 40 * 16)
+                if nearest is not None and int(nearest[0]) == index:
+                    words = f"{float(d):.1f} m" if d < 10.0 else f"{float(d):.0f} m"
+                    rad = math.radians(bearing)
+                    lx = float(c.x()) + (r + 12.0) * math.sin(rad)
+                    ly = float(c.y()) - (r + 12.0) * math.cos(rad)
+                    tw = metrics.horizontalAdvance(words) + 8
+                    th = metrics.height() + 2
+                    painter.fillRect(QRectF(lx - tw / 2.0, ly - th / 2.0, tw, th), QColor(0, 0, 0, 200))
+                    painter.setPen(colour)
+                    painter.drawText(QRectF(lx - tw / 2.0, ly - th / 2.0, tw, th), Qt.AlignmentFlag.AlignCenter, words)
+        if self._detour is not None:
+            p = self._project(self._detour["lat"], self._detour["lon"], z, fx, fy, w, h)
+            colour = QColor(255, 170, 60, 240)
+            painter.setPen(QPen(colour, 2, Qt.PenStyle.DashLine))
+            painter.drawLine(c, p)
+            painter.setPen(QPen(colour, 2))
+            painter.setBrush(QColor(20, 24, 30, 235))
+            painter.drawEllipse(p, 7.0, 7.0)
+            painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            metrics = painter.fontMetrics()
+            words = "Going around an obstacle"
+            tw = metrics.horizontalAdvance(words) + 10
+            th = metrics.height() + 4
+            tx = max(4.0, min(float(p.x()) - tw / 2.0, float(w) - tw - 4.0))
+            ty = max(4.0, float(p.y()) - th - 12.0)
             painter.fillRect(QRectF(tx, ty, tw, th), QColor(0, 0, 0, 215))
             painter.setPen(colour)
             painter.drawText(QRectF(tx, ty, tw, th), Qt.AlignmentFlag.AlignCenter, words)

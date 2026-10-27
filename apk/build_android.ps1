@@ -379,7 +379,42 @@ Write-Host "CMake:      $Cmake"
 Write-Host "Build dir:  $BuildDir"
 Write-Host "Signed by:  $Keystore"
 Write-Host "Finder:     $(if ($NoFinder) { 'NOT in this build (-NoFinder): the app will not mark people and vehicles' } else { 'people and vehicles are marked (ncnn)' })"
+
+# --- Our patches to QGC (apk\qgc-patches) -------------------------------------
+# QGC's source is fetched and not ours, so a fix to it is a patch file there. Each one goes into
+# apk\qgc-src once (git apply) and stays, and no build runs without them. 0001: the RC's
+# recordings were empty files (test build 14, client 2026-10-27).
+function Test-QgcPatch([string]$Patch, [switch]$Reverse) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $gitArgs = @('-C', $SrcReal, 'apply', '--check')
+        if ($Reverse) { $gitArgs += '--reverse' }
+        & git @gitArgs $Patch 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+}
+$qgcPatches = @(Get-ChildItem -LiteralPath (Join-Path $ApkDir 'qgc-patches') -Filter '*.patch' -ErrorAction SilentlyContinue |
+    Sort-Object Name)
+$qgcPatchesToApply = @()
+foreach ($patch in $qgcPatches) {
+    if (Test-QgcPatch $patch.FullName -Reverse) { continue }  # in already
+    if (-not (Test-QgcPatch $patch.FullName)) {
+        Fail "The QGC patch $($patch.Name) does not fit apk\qgc-src (another QGC release, or a hand edit there)."
+    }
+    $qgcPatchesToApply += $patch
+}
+Write-Host ("QGC patches: {0}{1}" -f $qgcPatches.Count,
+    $(if ($qgcPatchesToApply.Count) { ", to apply now: $(($qgcPatchesToApply | ForEach-Object { $_.Name }) -join ', ')" } else { ', all in' }))
 if ($CheckOnly) { Write-Host 'Check done. Nothing was built.'; exit 0 }
+foreach ($patch in $qgcPatchesToApply) {
+    if ((Invoke-Native 'git' @('-C', $SrcReal, 'apply', $patch.FullName)) -ne 0) {
+        Fail "The QGC patch $($patch.Name) did not apply."
+    }
+    Write-Host "QGC patch applied: $($patch.Name)"
+}
 
 # --- The object finder's library ---------------------------------------------
 # The app marks people and vehicles with a small neural network, which the ncnn

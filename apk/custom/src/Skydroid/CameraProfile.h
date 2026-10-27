@@ -40,7 +40,7 @@ enum class Zoom
     Counted,   ///< C12, C13: the app counts the steps it sent, 0.1x each (VGCS "commanded_optical")
     Reported,  ///< C14 Pro: the camera reports its zoom step, which picks a lens and a crop (VGCS "dzm_step")
     Live,      ///< Viewpro: the camera says its zoom and its view
-    Pulse,     ///< SIYI: the camera zooms while it is told to, and does not say how far
+    Pulse,     ///< SIYI, and the C20's lens (TOP's ZMC): the camera zooms while it is told to, and does not say how far
 };
 
 /// One lens of a camera that reports its zoom step: its view at its first step, and its steps.

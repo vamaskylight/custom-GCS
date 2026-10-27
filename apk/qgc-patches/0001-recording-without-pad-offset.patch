@@ -1,0 +1,18 @@
+diff --git a/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc b/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
+index 395626a..c996294 100644
+--- a/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
++++ b/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
+@@ -1721,8 +1721,11 @@ GstPadProbeReturn GstVideoReceiver::_keyframeWatch(GstPad *pad, GstPadProbeInfo
+         return GST_PAD_PROBE_DROP;
+     }
+ 
+-    // set media file '0' offset to current timeline position - we don't want to touch other elements in the graph, except these which are downstream!
+-    gst_pad_set_offset(pad, -static_cast<gint64>(buf->pts));
++    // VAMA patch (apk/qgc-patches/0001): no pad offset here. Since the recorder became a splitmuxsink,
++    // "gst_pad_set_offset(pad, -buf->pts)" made every recording empty: 0 B files on the remote control
++    // (test build 14, 2026-10-27), a header and no frames on desktop GStreamer 1.24 for MP4 and MKV.
++    // Without it the file holds every frame, and mp4mux starts the MP4 at 0 by itself.
++    Q_UNUSED(pad);
+ 
+     qCDebug(GstVideoReceiverLog) << "Got keyframe, stop dropping buffers";
+ 

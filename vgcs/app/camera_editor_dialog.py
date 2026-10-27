@@ -51,6 +51,7 @@ from vgcs.skydroid.camera_files import (
     TRANSPORT_UDP,
     ZOOM_COUNTED,
     ZOOM_NONE,
+    ZOOM_PULSE,
     ZOOM_REPORTED,
     Camera,
     CameraStore,
@@ -69,6 +70,7 @@ ZOOM_CHOICES = (
     (ZOOM_NONE, "No zoom"),
     (ZOOM_COUNTED, "Steps of 0.1x (as the V12 and V13)"),
     (ZOOM_REPORTED, "The camera reports its zoom step (as the V14 Pro)"),
+    (ZOOM_PULSE, "Its lens zooms and does not say how far (as the V20)"),
 )
 
 UNUSED_NOTE = (

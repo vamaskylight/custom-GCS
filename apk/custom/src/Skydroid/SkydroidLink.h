@@ -626,6 +626,8 @@ private:
     QList<Endpoint> _laserEndpoints() const;
     bool _isZoomStepCamera() const { return _camera.zoom == skydroid::camera::Zoom::Reported; }
     void _sendZoomStepFrames(int direction);
+    void _lensZoom(int direction);
+    void _lensHomeDone();
     /// To the control port, and to the other ports some C13 firmware takes zoom on.
     void _sendZoomFrames(const std::vector<std::string> &frames);
     int _zoomStepsMax() const;
@@ -898,6 +900,8 @@ private:
     int _zoomCount = 0;     // C12/C13: our zoom steps in from 1x
     int _zoomOutLeft = 0;   // steps still to send for "back to 1x"
     QTimer _zoomOutTimer;
+    QTimer _lensStopTimer;  // the C20: its lens stops this long after the last zoom click
+    QTimer _lensHomeTimer;  // the C20: the end of a "back to 1x" run
     QString _zoomReport;
 
     // Photos and recording

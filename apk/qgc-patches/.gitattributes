@@ -1,0 +1,2 @@
+# Patches to QGC (applied by apk/build_android.ps1). Kept byte for byte: no line ending changes.
+*.patch -text
