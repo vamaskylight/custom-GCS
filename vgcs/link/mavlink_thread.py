@@ -44,6 +44,10 @@ from vgcs.skydroid.adapter import GimbalStatus
 _MAV_MSG_ID_OBSTACLE_DISTANCE = int(mav_apm.MAVLINK_MSG_ID_OBSTACLE_DISTANCE)
 _MAV_MSG_ID_DISTANCE_SENSOR = int(mav_apm.MAVLINK_MSG_ID_DISTANCE_SENSOR)
 _MAV_MSG_ID_RANGEFINDER = int(mav_apm.MAVLINK_MSG_ID_RANGEFINDER)
+# A MAVLink 2 message. pymavlink's MAVLink 1 dialect, which it keeps until the drone's first
+# MAVLink 2 packet, has no name for it: asked by that name, a MAVLink 1 link skipped every
+# stream request after it (found 2026-10-28).
+_MAV_MSG_ID_MOUNT_ORIENTATION = int(mav_apm.MAVLINK_MSG_ID_MOUNT_ORIENTATION)
 _PROX_STREAM_RESEND_S = 20.0
 # About ten seconds of corrections from a base that sends five messages a second.
 _RTCM_QUEUE_MAX = 50
@@ -1852,7 +1856,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 tc,
                 mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                 0,
-                float(mavutil.mavlink.MAVLINK_MSG_ID_MOUNT_ORIENTATION),
+                float(_MAV_MSG_ID_MOUNT_ORIENTATION),
                 float(mount_interval_us),
                 0.0,
                 0.0,
@@ -1891,7 +1895,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
                         cam_comp,
                         mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
                         0,
-                        float(mavutil.mavlink.MAVLINK_MSG_ID_MOUNT_ORIENTATION),
+                        float(_MAV_MSG_ID_MOUNT_ORIENTATION),
                         float(mount_interval_us),
                         0.0,
                         0.0,
