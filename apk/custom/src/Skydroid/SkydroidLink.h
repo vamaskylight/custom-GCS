@@ -533,6 +533,10 @@ signals:
     void cameraNote(const QString &text, bool problem);
     void targetChanged();
     void thermalPictureChanged();
+    /// A camera that switched the picture of its one video (a Viewpro, whose network stops for some
+    /// seconds) answers on its video port again, or the wait for that is over: the screen opens the
+    /// video again if it shows none.
+    void videoReopenWanted();
     void lockChanged();
     void lockBoxChanged();
     /// A zoom step was asked for: what was found in the pictures so far has another size now.
@@ -718,9 +722,20 @@ private:
     void _startMotionTimer();
     /// How far a speed-mode wheel is turned, -1 to 1, or 0 when it is off or has no fresh value.
     double _wheelDeflection(int channel) const;
+    /// _wheelDeflection of an axis's wheel, or 0 until that wheel has been turned (_wheelTurnedSinceStart).
+    double _speedWheelDeflection(int axis) const;
+    /// Whether the wheel of an axis has been turned since the link first saw it. Never only
+    /// because the link started, or because a channel rests away from its middle.
+    bool _wheelTurnedSinceStart(int axis, int value);
     /// The RC value of a channel when it is fresh and plausible.
     std::optional<int> _rcValue(int channel) const;
     void _updateWheelAngles();
+    // After a Viewpro's sensor switch (switchThermal): knock on its video port until it answers again.
+    void _startVideoWait();
+    void _probeVideoPort();
+    void _videoPortAnswered(QTcpSocket *probe);
+    void _endVideoWait(bool back);
+    void _dropVideoProbe();
 
     QUdpSocket *_socket = nullptr;  // made while the link runs, also for a TCP camera
     QTcpSocket *_tcp = nullptr;
@@ -903,6 +918,12 @@ private:
     QTimer _lensStopTimer;  // the C20: its lens stops this long after the last zoom click
     QTimer _lensHomeTimer;  // the C20: the end of a "back to 1x" run
     QString _zoomReport;
+
+    // The wait for a Viewpro's video after its sensor switch (_startVideoWait)
+    QTimer _videoWaitTimer;
+    QElapsedTimer _videoWaitClock;
+    QTcpSocket *_videoProbe = nullptr;
+    bool _videoWaitSawDown = false;  // a knock went unanswered: the camera's network went away
 
     // Photos and recording
     bool _recording = false;

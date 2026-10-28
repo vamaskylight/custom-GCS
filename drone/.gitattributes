@@ -1,3 +1,5 @@
 # These run on Linux (WSL) and on the flight controller: keep Unix line ends.
 *.sh text eol=lf
 *.lua text eol=lf
+*.service text eol=lf
+*.ini text eol=lf

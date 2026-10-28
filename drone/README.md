@@ -15,11 +15,14 @@ drone/
     vama_wind_failsafe.md         what it does, how to install it, its parameters and messages
     vama_lock.lua                 the VAMA lock, part 1 of the firmware lock (copy it to the SD card)
     vama_lock.md                  what it does and does not stop, how to bind a drone, parameters, messages
+  gps_denied/                     GPS-denied navigation (item A8); step 1, the flight recorder for a
+                                  Raspberry Pi on the drone (see gps_denied/README.md, RECORDER.md)
   test/
     setup_sitl.sh                 downloads the ArduCopter simulator programs (run once, inside WSL)
     sitl_session.py               starts a simulated drone and talks MAVLink to it
     wind_failsafe_test.py         flies the wind failsafe in the simulator
     lock_test.py                  tries the VAMA lock in the simulator
+    recorder_sitl_test.py         flies the flight recorder against the simulator
 ```
 
 ## High wind failsafe
@@ -94,3 +97,10 @@ The simulated clock runs 10 times faster than real time.
 
 The simulated quadcopter leans at most 30 degrees and holds its place in up to 10 m/s of wind.
 A real drone has other numbers, so these tests prove the logic, not the limits of a real drone.
+
+## GPS-denied navigation, the flight recorder
+
+Read [gps_denied/RECORDER.md](gps_denied/RECORDER.md) (the set-up on the drone) and [gps_denied/README.md](gps_denied/README.md) (how it works).
+
+Short version: on a Raspberry Pi 5 with a Pi camera looking straight down and three wires to a free serial port of the Cube (MAVLink 2), `sudo bash install.sh`.
+During day flights it saves a picture a second with the drone's position and angles at that moment.

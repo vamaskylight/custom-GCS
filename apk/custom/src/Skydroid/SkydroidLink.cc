@@ -3,6 +3,7 @@
 #include <QtCore/QCoreApplication>
 #include <QtCore/QSettings>
 #include <QtCore/QStandardPaths>
+#include <QtCore/QUrl>
 #include <QtNetwork/QNetworkDatagram>
 #include <QtNetwork/QTcpSocket>
 #include <QtNetwork/QUdpSocket>
@@ -21,6 +22,7 @@
 #include "Vehicle.h"
 
 #include <algorithm>
+#include <utility>
 #include <climits>
 #include <cmath>
 #include <type_traits>
@@ -84,6 +86,15 @@ constexpr int kZoomHomeOutMs = 8000;
 // moves the lens for the first wait. The margins are for a busy remote control, whose timers run late.
 constexpr int kLensZoomPulseMs = 550;
 constexpr int kLensZoomHeldMs = 300;
+// A Viewpro's sensor switch takes its whole network away for 5 to 40 s (VGCS, the client's camera,
+// 2026-08-26), and QGC's video then tries again later each time (up to 30 s apart). So the link
+// knocks on the camera's video port (VGCS's readiness probe) and has the video opened the moment
+// it answers again (B13, 2026-10-28). A port that never went away: the video went on by itself.
+constexpr int kVideoWaitFirstMs = 700;
+constexpr int kVideoWaitEveryMs = 300;
+constexpr int kVideoWaitNoDropMs = 6000;
+constexpr int kVideoWaitMaxMs = 45000;
+constexpr int kRtspPort = 554;
 
 // Photos and recording (task AL). Both go to the camera's own SD card. While the camera answers,
 // it is asked whether it records every 2 s (the RC's own button can start it too), and for its
@@ -116,7 +127,8 @@ constexpr int kRcHalfRange = 400;        // full speed at 1100 or 1900 us
 constexpr int kRcFreshMs = 1000;         // older RC values are ignored (RC link lost)
 constexpr int kRcMin = 800;              // outside 800..2200 us is not a real channel value
 constexpr int kRcMax = 2200;
-constexpr int kWheelMoveUs = 25;         // a hold-position wheel must move this much before it drives the gimbal
+constexpr int kWheelMoveUs = 25;         // a wheel of either type must move this much before it drives the gimbal
+constexpr int kWheelRestFarUs = 150;     // a wheel that springs back, first seen this far from 1500 us: the screen says so
 constexpr double kWheelAngleStepDeg = 0.5;
 constexpr int kWheelAngleIntervalMs = 150;
 constexpr double kWheelApproachDps = 30.0;
@@ -387,6 +399,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _tcpRetryTimer.setInterval(kTcpRetryMs);
     _tcpConnectTimer.setSingleShot(true);
     _tcpConnectTimer.setInterval(kTcpConnectMs);
+    _videoWaitTimer.setSingleShot(true);
     _dueTimer.setInterval(kRulesDueMs);
     _rulesClock.start();
     _pictureClock.start();
@@ -407,6 +420,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_photoVerdictTimer, &QTimer::timeout, this, &SkydroidLink::_photoVerdict);
     connect(&_tcpRetryTimer, &QTimer::timeout, this, &SkydroidLink::_syncTcp);
     connect(&_tcpConnectTimer, &QTimer::timeout, this, &SkydroidLink::_tcpLost);
+    connect(&_videoWaitTimer, &QTimer::timeout, this, &SkydroidLink::_probeVideoPort);
     connect(&_dueTimer, &QTimer::timeout, this, &SkydroidLink::_sendDue);
 
     MultiVehicleManager *manager = MultiVehicleManager::instance();
@@ -704,6 +718,8 @@ void SkydroidLink::_useCamera(const camera::Profile &profile, bool withAddresses
         _lensStopTimer.stop();
         _lensHomeTimer.stop();
     }
+    _videoWaitTimer.stop();  // another camera: its video is not the one that was waited for
+    _dropVideoProbe();
     _camera = profile;
     _applyModel();
     if (_camera.thermalBySwitch) {
@@ -1055,6 +1071,8 @@ void SkydroidLink::_stop()
     _laserShotTimer.stop();
     _laserTimeoutTimer.stop();
     _tcpRetryTimer.stop();
+    _videoWaitTimer.stop();
+    _dropVideoProbe();
     _closeTcp();  // after the stop above: it goes out over TCP too
     if (_socket) {
         _socket->close();
@@ -1569,8 +1587,8 @@ void SkydroidLink::_desiredSpeed(double &yawDps, double &pitchDps)
         }
     }
     if (!_touchActive && !_wheelHoldsPosition) {
-        yawDps = shapedSpeed(_wheelDeflection(_wheelYawChannel), _maxSpeed, kWheelDeadZone);
-        pitchDps = shapedSpeed(_wheelDeflection(_wheelPitchChannel), _maxSpeed, kWheelDeadZone);
+        yawDps = shapedSpeed(_speedWheelDeflection(YawAxis), _maxSpeed, kWheelDeadZone);
+        pitchDps = shapedSpeed(_speedWheelDeflection(PitchAxis), _maxSpeed, kWheelDeadZone);
     }
     // The app's own lock: the speeds set from the last picture, for as long as
     // pictures keep coming. The lease runs only while that lock follows: a finger,
@@ -1817,6 +1835,83 @@ void SkydroidLink::switchThermal(bool on)
     emit cameraNote(on ? tr("The camera switches to its thermal picture. Its video and link stop for some seconds.")
                        : tr("The camera switches to its day picture. Its video and link stop for some seconds."),
                     false);
+    _startVideoWait();
+}
+
+void SkydroidLink::_startVideoWait()
+{
+    _dropVideoProbe();
+    _videoWaitSawDown = false;
+    _videoWaitClock.start();
+    _videoWaitTimer.start(kVideoWaitFirstMs);
+}
+
+void SkydroidLink::_dropVideoProbe()
+{
+    // Not ours any more before it is aborted: whatever it says while it closes counts for nothing.
+    if (QTcpSocket *probe = std::exchange(_videoProbe, nullptr)) {
+        probe->abort();
+        probe->deleteLater();
+    }
+}
+
+void SkydroidLink::_probeVideoPort()
+{
+    // The last knock got no answer in time: the camera's network is away.
+    if (_videoProbe) {
+        _videoWaitSawDown = true;
+        _dropVideoProbe();
+    }
+    if (_videoWaitClock.elapsed() >= kVideoWaitMaxMs) {
+        _endVideoWait(false);
+        return;
+    }
+    // The video's own address (the one QGC opens), else the camera's at RTSP's port.
+    const QUrl url(_dayVideoUrl.trimmed());
+    const QString host = url.host().isEmpty() ? _host : url.host();
+    // A test or a preview (no probe targets, setProbeTargets) knocks on no real address.
+    if (g_probeHosts.isEmpty() && !QHostAddress(host).isLoopback()) {
+        _videoWaitTimer.stop();
+        _videoWaitClock.invalidate();
+        return;
+    }
+    QTcpSocket *probe = new QTcpSocket(this);
+    _videoProbe = probe;
+    connect(probe, &QTcpSocket::connected, this, [this, probe]() { _videoPortAnswered(probe); });
+    connect(probe, &QAbstractSocket::errorOccurred, this, [this, probe](QAbstractSocket::SocketError) {
+        if (probe == _videoProbe) {
+            _videoWaitSawDown = true;
+        }
+    });
+    probe->connectToHost(host, static_cast<quint16>(url.port(kRtspPort)));
+    _videoWaitTimer.start(kVideoWaitEveryMs);
+}
+
+void SkydroidLink::_videoPortAnswered(QTcpSocket *probe)
+{
+    if (probe != _videoProbe) {
+        return;
+    }
+    _dropVideoProbe();
+    // Back after it went away, or it never went away: either way nothing is left to wait for.
+    if (_videoWaitSawDown || _videoWaitClock.elapsed() >= kVideoWaitNoDropMs) {
+        _endVideoWait(true);
+    }
+}
+
+void SkydroidLink::_endVideoWait(bool back)
+{
+    _videoWaitTimer.stop();
+    _dropVideoProbe();
+    _videoWaitClock.invalidate();
+    if (!back) {
+        emit cameraNote(tr("The camera's video has not come back after %1 s. Check the camera and its network.")
+                            .arg(kVideoWaitMaxMs / 1000),
+                        true);
+    } else if (_videoWaitSawDown) {
+        emit cameraNote(tr("The camera's video is back. The app opens it again."), false);
+    }
+    emit videoReopenWanted();
 }
 
 void SkydroidLink::_measureFromPicture(double u, double v)
@@ -3103,6 +3198,23 @@ double SkydroidLink::_wheelDeflection(int channel) const
     return std::clamp(d, -1.0, 1.0);
 }
 
+double SkydroidLink::_speedWheelDeflection(int axis) const
+{
+    return _wheelMoved[axis] ? _wheelDeflection(axis == YawAxis ? _wheelYawChannel : _wheelPitchChannel) : 0.0;
+}
+
+bool SkydroidLink::_wheelTurnedSinceStart(int axis, int value)
+{
+    if (!_wheelStart[axis]) {
+        _wheelStart[axis] = value;
+        return false;
+    }
+    if (!_wheelMoved[axis] && std::abs(value - *_wheelStart[axis]) >= kWheelMoveUs) {
+        _wheelMoved[axis] = true;
+    }
+    return _wheelMoved[axis];
+}
+
 void SkydroidLink::_rcChannelsReceived(QVector<int> values)
 {
     _rc = values;
@@ -3131,8 +3243,26 @@ void SkydroidLink::_rcChannelsReceived(QVector<int> values)
         _updateWheelAngles();
         return;
     }
-    const bool wheelTurned = speedUnits(shapedSpeed(_wheelDeflection(_wheelYawChannel), _maxSpeed, kWheelDeadZone)) != 0 ||
-                             speedUnits(shapedSpeed(_wheelDeflection(_wheelPitchChannel), _maxSpeed, kWheelDeadZone)) != 0;
+    // A wheel that springs back drives only after it was turned, as one that stays does. A
+    // channel resting away from its middle turned the camera at full speed on every RC update,
+    // which undoes a centre at once (the client's SIYI went back down after its centre, 2026-10-28).
+    const int channels[2] = {_wheelYawChannel, _wheelPitchChannel};
+    for (int a = 0; a < 2; ++a) {
+        const std::optional<int> value = _rcValue(channels[a]);
+        if (!value) {
+            continue;
+        }
+        const bool firstLook = !_wheelStart[a];
+        _wheelTurnedSinceStart(a, *value);
+        if (firstLook && std::abs(*value - kRcCentre) > kWheelRestFarUs) {
+            emit cameraNote(tr("The RC wheel on channel %1 is at %2 us, far from its middle (1500 us). It turns the camera only "
+                               "after it moves. If this wheel stays where you leave it, choose \"Stays where you leave it\" "
+                               "as its Wheel type in Camera settings.").arg(channels[a]).arg(*value),
+                            true);
+        }
+    }
+    const bool wheelTurned = speedUnits(shapedSpeed(_speedWheelDeflection(YawAxis), _maxSpeed, kWheelDeadZone)) != 0 ||
+                             speedUnits(shapedSpeed(_speedWheelDeflection(PitchAxis), _maxSpeed, kWheelDeadZone)) != 0;
     if (wheelTurned) {
         _endLockByHand();
         _startMotionTimer();
@@ -3149,15 +3279,8 @@ void SkydroidLink::_updateWheelAngles()
             continue;
         }
         // Never move the gimbal only because the link started: wait until the wheel is turned.
-        if (!_wheelStart[a]) {
-            _wheelStart[a] = *value;
+        if (!_wheelTurnedSinceStart(a, *value)) {
             continue;
-        }
-        if (!_wheelMoved[a]) {
-            if (std::abs(*value - *_wheelStart[a]) < kWheelMoveUs) {
-                continue;
-            }
-            _wheelMoved[a] = true;
         }
         double t = std::clamp((*value - 1000) / 1000.0, 0.0, 1.0);
         if (_wheelReverse) {

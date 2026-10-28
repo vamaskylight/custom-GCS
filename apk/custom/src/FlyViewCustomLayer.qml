@@ -1546,6 +1546,12 @@ Item {
             _detectResult = channel > 0 ? qsTr("Found the wheel on channel %1.").arg(channel)
                                         : qsTr("No wheel moved. Check that the drone is connected, then try again.")
         }
+        // A Viewpro's video after its sensor switch (B13): QGC's own retries wait longer each time.
+        function onVideoReopenWanted() {
+            if (_videoManager && _videoManager.decoding !== true) {
+                _videoManager.startVideo()
+            }
+        }
     }
 
     // Never leave the camera turning when the app goes to the background. And the

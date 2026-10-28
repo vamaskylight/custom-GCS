@@ -77,7 +77,9 @@ SKYDROID_DAY_URL = "rtsp://192.168.144.108:554/stream=1"
 SKYDROID_THERMAL_URL = "rtsp://192.168.144.108:555/stream=2"
 
 # The addresses of the APK's Viewpro and SIYI cameras, as VGCS has them (vgcs/video/camera_control.py).
-VIEWPRO_HOST = "192.168.2.119"  # the factory address printed on the unit
+# The client's Viewpro sits on the Skydroid link's network (rtsp://192.168.144.119:554, 2026-10-28);
+# Viewpro's factory address, printed on the unit, is 192.168.2.119.
+VIEWPRO_HOST = "192.168.144.119"
 VIEWPRO_PORT = 2000
 SIYI_HOST = "192.168.144.25"
 SIYI_PORT = 37260
@@ -220,26 +222,30 @@ def apk_built_in_cameras() -> list[Camera]:
     """The APK's built-in Viewpro and SIYI cameras (task AK). VGCS does not use them: they are
     here for the cross-app files, so that both apps hold the same numbers.
 
-    The A20KTR: Viewpro over TCP 2000, its main stream, the view its own screen showed at 1x
-    (70.2 x 43.1, used until the camera says its own), its zoom said by the camera. Its tilt and
-    turn are estimates, not from a data sheet. Its thermal picture comes in the same video after
-    a sensor switch; its thermal lens is not known (so a point there is placed at the cross only).
+    The A20KTR, named "VPro" by the client (2026-10-28): Viewpro over TCP 2000, its one video at
+    the client's address, the view its own screen showed at 1x (70.2 x 43.1, used until the camera
+    says its own), its zoom said by the camera. Its tilt and turn are estimates, not from a data
+    sheet. Its thermal picture comes in the same video after a sensor switch. Its thermal lens is
+    Viewpro's (35 mm on 640 x 512 at 12 um, 12.5 x 10.0 degrees), not "sure": how the 5:4 thermal
+    picture sits in the 16:9 video is not known (so a point there is placed at the cross only).
     No laser in the APK yet, and no tracker of its own.
 
-    The ZR10: SIYI over UDP 37260, 71.5 x 45.2 at 1x (the ZR10 manual), a zoom that does not say
+    The ZR10, named "VR10" by the client: SIYI over UDP 37260, 71.5 x 45.2 at 1x (the ZR10 manual), a zoom that does not say
     how far it went, -90 to +25 degrees and 45 either way (the range it can be told to go).
     """
     return [
         Camera(
             id="A20KTR",
-            name="Viewpro A20KTR",
+            name="VPro",
             built_in=True,
             protocol=PROTOCOL_VIEWPRO,
             host=VIEWPRO_HOST,
             port=VIEWPRO_PORT,
             transport=TRANSPORT_TCP,
-            day_video_url="rtsp://192.168.2.119:554/stream0",
+            day_video_url="rtsp://192.168.144.119:554",
             thermal_by_switch=True,
+            thermal_fov_h_deg=12.5,
+            thermal_fov_v_deg=10.0,
             fov_h_deg=70.2,
             fov_v_deg=43.1,
             zoom=ZOOM_LIVE,
@@ -250,7 +256,7 @@ def apk_built_in_cameras() -> list[Camera]:
         ),
         Camera(
             id="ZR10",
-            name="SIYI ZR10",
+            name="VR10",
             built_in=True,
             protocol=PROTOCOL_SIYI,
             host=SIYI_HOST,
@@ -322,17 +328,17 @@ def problem(cam: Camera) -> str:
     if cam.zoom not in zooms:
         return {
             PROTOCOL_TOP: "A Skydroid TOP camera's zoom is none, counted, reported or pulse.",
-            PROTOCOL_VIEWPRO: "A Viewpro camera's zoom is none or live.",
+            PROTOCOL_VIEWPRO: "A VPro camera's zoom is none or live.",
             PROTOCOL_SIYI: "A SIYI camera's zoom is none or pulse.",
         }[cam.protocol]
     if cam.protocol != PROTOCOL_TOP:
         if cam.laser:
-            return "The app has no laser for a Viewpro or SIYI camera yet. Untick Laser."
+            return "The app has no laser for a VPro or SIYI camera yet. Untick Laser."
         if cam.own_tracker:
-            return 'The app uses no tracker of a Viewpro or SIYI camera. Untick "Its own object tracker".'
+            return 'The app uses no tracker of a VPro or SIYI camera. Untick "Its own object tracker".'
     if cam.thermal_by_switch:
         if cam.protocol != PROTOCOL_VIEWPRO:
-            return "Only a Viewpro camera switches its day video to the thermal picture."
+            return "Only a VPro camera switches its day video to the thermal picture."
         if cam.thermal_video_url.strip():
             return "A camera that switches to its thermal picture has no thermal video of its own: leave it empty."
     if cam.zoom == ZOOM_REPORTED:
@@ -644,9 +650,9 @@ class CameraStore:
                                     break
                             if not why and cam.protocol != PROTOCOL_TOP:
                                 app_only.append(cam)
-                                kind = "Viewpro" if cam.protocol == PROTOCOL_VIEWPRO else "SIYI"
+                                kind = "VPro" if cam.protocol == PROTOCOL_VIEWPRO else "SIYI"
                                 why = (
-                                    f"a {kind} camera, for the APK only. VGCS sets up Viewpro and SIYI "
+                                    f"a {kind} camera, for the APK only. VGCS sets up VPro and VR10 "
                                     "cameras in Application Settings, Video, Camera / gimbal control."
                                 )
                             elif not why:

@@ -1100,12 +1100,13 @@ class SiyiCameraControl:
             return None
 
 
-def resolve_viewpro_host(settings, *, default: str = "192.168.2.119") -> str:
+def resolve_viewpro_host(settings, *, default: str = "192.168.144.119") -> str:
     """Viewpro/ViewLink gimbal IP from settings or RTSP stream URL hostname.
 
-    192.168.2.119 is the factory-default gimbal IP printed on the unit's
-    label per the ViewLink manual (§2.2.3) — same fallback pattern as
-    resolve_siyi_host/resolve_skydroid_host.
+    192.168.144.119 is where the client's Viewpro sits, on the Skydroid link's network
+    (rtsp://192.168.144.119:554, the client 2026-10-28). The factory-default gimbal IP printed
+    on the unit's label is 192.168.2.119 (ViewLink manual, section 2.2.3). Same fallback
+    pattern as resolve_siyi_host/resolve_skydroid_host.
     """
     host = str(settings.value("camera/viewpro_host", "") or "").strip()
     if host:

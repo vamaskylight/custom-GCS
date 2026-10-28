@@ -1,0 +1,14 @@
+[Unit]
+Description=VAMA flight recorder (GPS-denied navigation, step 1)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=/opt/vama-recorder
+ExecStart=/opt/vama-recorder/venv/bin/python -m vama_recorder --config /etc/vama-recorder.ini
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

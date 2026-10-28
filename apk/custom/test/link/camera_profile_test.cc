@@ -175,8 +175,8 @@ void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
     QCOMPARE(all.at(1).name, QStringLiteral("V13"));
     QCOMPARE(all.at(2).name, QStringLiteral("V14 Pro"));
     QCOMPARE(all.at(3).name, QStringLiteral("V20"));
-    QCOMPARE(all.at(4).name, QStringLiteral("Viewpro A20KTR"));
-    QCOMPARE(all.at(5).name, QStringLiteral("SIYI ZR10"));
+    QCOMPARE(all.at(4).name, QStringLiteral("VPro"));  // the client's names (2026-10-28)
+    QCOMPARE(all.at(5).name, QStringLiteral("VR10"));
     QCOMPARE(camera::defaultId(), QStringLiteral("C13"));
     for (const Profile &p : all.mid(0, 4)) {
         QVERIFY(p.protocol == Protocol::Top);
@@ -185,9 +185,12 @@ void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
     // (camera_files.apk_built_in_cameras, held equal through the cross-app files).
     const Profile a20 = all.at(4);
     QVERIFY(a20.builtIn && a20.protocol == Protocol::Viewpro && a20.controlOverTcp());
-    QCOMPARE(a20.host, QStringLiteral("192.168.2.119"));
+    QCOMPARE(a20.host, QStringLiteral("192.168.144.119"));  // the client's camera, not Viewpro's factory address
     QCOMPARE(a20.port, 2000);
-    QCOMPARE(a20.dayVideoUrl, QStringLiteral("rtsp://192.168.2.119:554/stream0"));
+    QCOMPARE(a20.dayVideoUrl, QStringLiteral("rtsp://192.168.144.119:554"));
+    // Viewpro's thermal lens (35 mm, 640 x 512 at 12 um), not the C13's 48.7 x 38.6 the client saw.
+    QCOMPARE(a20.thermalFovHDeg, 12.5);
+    QCOMPARE(a20.thermalFovVDeg, 10.0);
     QVERIFY(a20.zoom == Zoom::Live);
     QCOMPARE(a20.fovHDeg, 70.2);
     QCOMPARE(a20.fovVDeg, 43.1);
@@ -465,18 +468,18 @@ void CameraProfileTest::eachProtocolHasItsZoomsAndFeatures()
     };
     const QList<Case> cases = {
         {top, [](Profile &p) { p.zoom = Zoom::Live; }, "A Skydroid TOP camera's zoom is none, counted, reported or pulse."},
-        {a20, [](Profile &p) { p.zoom = Zoom::Counted; }, "A Viewpro camera's zoom is none or live."},
-        {a20, [](Profile &p) { p.zoom = Zoom::Pulse; }, "A Viewpro camera's zoom is none or live."},
+        {a20, [](Profile &p) { p.zoom = Zoom::Counted; }, "A VPro camera's zoom is none or live."},
+        {a20, [](Profile &p) { p.zoom = Zoom::Pulse; }, "A VPro camera's zoom is none or live."},
         {zr10, [](Profile &p) { p.zoom = Zoom::Live; }, "A SIYI camera's zoom is none or pulse."},
         {zr10, [](Profile &p) { p.zoom = Zoom::Reported; }, "A SIYI camera's zoom is none or pulse."},
-        {a20, [](Profile &p) { p.laser = true; }, "The app has no laser for a Viewpro or SIYI camera yet. Untick Laser."},
-        {zr10, [](Profile &p) { p.laser = true; }, "The app has no laser for a Viewpro or SIYI camera yet. Untick Laser."},
+        {a20, [](Profile &p) { p.laser = true; }, "The app has no laser for a VPro or SIYI camera yet. Untick Laser."},
+        {zr10, [](Profile &p) { p.laser = true; }, "The app has no laser for a VPro or SIYI camera yet. Untick Laser."},
         {a20, [](Profile &p) { p.ownTracker = true; },
-         "The app uses no tracker of a Viewpro or SIYI camera. Untick \"Its own object tracker\"."},
+         "The app uses no tracker of a VPro or SIYI camera. Untick \"Its own object tracker\"."},
         {top, [](Profile &p) { p.protocol = static_cast<Protocol>(9); },
          "The protocol must be \"skydroid-top\", \"viewpro\" or \"siyi\"."},
-        {zr10, [](Profile &p) { p.thermalBySwitch = true; }, "Only a Viewpro camera switches its day video to the thermal picture."},
-        {top, [](Profile &p) { p.thermalBySwitch = true; }, "Only a Viewpro camera switches its day video to the thermal picture."},
+        {zr10, [](Profile &p) { p.thermalBySwitch = true; }, "Only a VPro camera switches its day video to the thermal picture."},
+        {top, [](Profile &p) { p.thermalBySwitch = true; }, "Only a VPro camera switches its day video to the thermal picture."},
         {a20, [](Profile &p) { p.thermalVideoUrl = QStringLiteral("rtsp://192.168.2.119:554/stream1"); },
          "A camera that switches to its thermal picture has no thermal video of its own: leave it empty."},
         {a20, [](Profile &p) { p.thermalFovHDeg = 0.5; }, "The thermal lens's view must be 1 to 179 degrees."},
@@ -507,7 +510,7 @@ void CameraProfileTest::eachProtocolHasItsZoomsAndFeatures()
     json[QStringLiteral("zoom")] = QStringLiteral("counted");
     QString why;
     QVERIFY(!camera::fromJson(json, QStringLiteral("x"), &why));
-    QCOMPARE(why, QStringLiteral("A Viewpro camera's zoom is none or live."));
+    QCOMPARE(why, QStringLiteral("A VPro camera's zoom is none or live."));
     // A live or pulse zoom has the 1x view of the day lens, as none and counted do.
     json = camera::toJson(a20);
     json.remove(QStringLiteral("dayFovH"));
@@ -651,7 +654,7 @@ void CameraProfileTest::savingMakesAFileThatIsReadAgain()
         names.append(p.name);
     }
     QCOMPARE(names, QStringList({QStringLiteral("V12"), QStringLiteral("V13"), QStringLiteral("V14 Pro"),
-                                 QStringLiteral("V20"), QStringLiteral("Viewpro A20KTR"), QStringLiteral("SIYI ZR10"),
+                                 QStringLiteral("V20"), QStringLiteral("VPro"), QStringLiteral("VR10"),
                                  QStringLiteral("C13"), QStringLiteral("Gimbal X!"), QStringLiteral("Gimbal X2")}));
     // A camera named like the ZR10's id: the file is never "zr10.json" either.
     QCOMPARE(store.save(added(QStringLiteral("ZR10")), &id), QString());
@@ -674,7 +677,8 @@ void CameraProfileTest::namesAreNotTwice()
     QCOMPARE(store.save(added(QStringLiteral("Gimbal X")), &id), QString());
     QVERIFY(store.save(added(QStringLiteral("gimbal x")), &id).contains(QStringLiteral("there already")));
     QVERIFY(store.save(added(QStringLiteral("V13")), &id).contains(QStringLiteral("there already")));
-    QVERIFY(store.save(added(QStringLiteral("siyi zr10")), &id).contains(QStringLiteral("there already")));
+    QVERIFY(store.save(added(QStringLiteral("vr10")), &id).contains(QStringLiteral("there already")));
+    QVERIFY(store.save(added(QStringLiteral("vpro")), &id).contains(QStringLiteral("there already")));
     QCOMPARE(store.profiles().size(), 7);
 }
 

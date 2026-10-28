@@ -368,7 +368,7 @@ class MainWindowSettingsDialogsMixin:
         conn_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         rtsp_day = QLineEdit()
         rtsp_day.setPlaceholderText(
-            "ZR10: rtsp://192.168.144.25:8554/main.264  (video2 not on all firmware)"
+            "VR10: rtsp://192.168.144.25:8554/main.264  (video2 not on all firmware)"
         )
         rtsp_th = QLineEdit()
         conn_form.addRow("Stream URL 1 (Day / primary)", rtsp_day)
@@ -382,11 +382,11 @@ class MainWindowSettingsDialogsMixin:
         provider_group = QButtonGroup(camera_group)
         rb_mavlink = QRadioButton("MAVLink (ArduPilot mount)")
         rb_mavlink.setProperty("provider_id", "mavlink")
-        rb_siyi = QRadioButton("ZR Gimbal Camera (UDP)")
+        rb_siyi = QRadioButton("VR10 Gimbal Camera (UDP)")
         rb_siyi.setProperty("provider_id", "siyi")
         rb_skydroid = QRadioButton("Skydroid C12 / C13 / C14 Pro (UDP)")
         rb_skydroid.setProperty("provider_id", "skydroid")
-        rb_viewpro = QRadioButton("Viewpro Gimbal Camera (TCP)")
+        rb_viewpro = QRadioButton("VPro Gimbal Camera (TCP)")
         rb_viewpro.setProperty("provider_id", "viewpro")
         provider_wrap = QWidget()
         provider_wrap.setObjectName("cameraProviderWrap")
@@ -583,7 +583,7 @@ class MainWindowSettingsDialogsMixin:
         viewpro_grid.setHorizontalSpacing(12)
         viewpro_grid.setVerticalSpacing(8)
         viewpro_host = QLineEdit()
-        viewpro_host.setPlaceholderText("Empty = RTSP hostname or 192.168.2.119")
+        viewpro_host.setPlaceholderText("Empty = RTSP hostname or 192.168.144.119")
         viewpro_port = QSpinBox()
         viewpro_port.setRange(1, 65535)
         viewpro_port.setValue(2000)
@@ -635,9 +635,9 @@ class MainWindowSettingsDialogsMixin:
         _CAMERA_STACK_INDEX = {"mavlink": 0, "siyi": 1, "skydroid": 2, "viewpro": 3}
         _RTSP_PLACEHOLDER = {
             "mavlink": "rtsp://host/stream or udp://0.0.0.0:5600",
-            "siyi": "ZR10: rtsp://192.168.144.25:8554/main.264",
+            "siyi": "VR10: rtsp://192.168.144.25:8554/main.264",
             "skydroid": "C12/C13/C14 Pro: rtsp://192.168.144.108:554/stream=1",
-            "viewpro": "Viewpro: rtsp://192.168.2.119:554/stream0",
+            "viewpro": "VPro: rtsp://192.168.144.119:554",
         }
 
         def _camera_provider_id() -> str:

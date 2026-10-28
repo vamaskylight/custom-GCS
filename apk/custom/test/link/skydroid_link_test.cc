@@ -1316,6 +1316,97 @@ private slots:
         QVERIFY2(std::abs(_link->gimbalYaw() - 10.0) < 0.01, qPrintable(QString::number(_link->gimbalYaw())));
     }
 
+    void aViewproSwitchOpensTheVideoAgainWhenItsPortAnswers()
+    {
+        // B13 (the client, 2026-10-28: no thermal picture after the switch). The camera's whole
+        // network goes away for some seconds: the link knocks on its video port and asks for the
+        // video the moment it answers again, not after QGC's retries, which wait longer each time.
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        QTcpServer video;
+        QVERIFY(video.listen(QHostAddress::LocalHost, 0));
+        const quint16 videoPort = video.serverPort();
+        video.close();  // the camera's network is away
+        _link->setDayVideoUrl(QStringLiteral("rtsp://127.0.0.1:%1").arg(videoPort));
+        QSignalSpy reopen(_link, &SkydroidLink::videoReopenWanted);
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->switchThermal(true);
+        QVERIFY(_link->thermalPicture());
+        QTest::qWait(1500);
+        QCOMPARE(reopen.count(), 0);  // nothing to open while it is away
+        QVERIFY(video.listen(QHostAddress::LocalHost, videoPort));  // back
+        QElapsedTimer back;
+        back.start();
+        QTRY_COMPARE_WITH_TIMEOUT(reopen.count(), 1, 3000);
+        QVERIFY2(back.elapsed() < 1500, qPrintable(QString::number(back.elapsed())));
+        QCOMPARE(notes.last().at(0).toString(), QString("The camera's video is back. The app opens it again."));
+        QVERIFY(!notes.last().at(1).toBool());
+        QTest::qWait(700);
+        QCOMPARE(reopen.count(), 1);  // and no more knocks after that
+    }
+
+    void aViewproSwitchWithoutADropAsksOnlyAfterTheWait()
+    {
+        // A port that answers at once is no news: the switch may not have taken the network yet.
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTcpServer video;
+        QVERIFY(video.listen(QHostAddress::LocalHost, 0));
+        _link->setDayVideoUrl(QStringLiteral("rtsp://127.0.0.1:%1").arg(video.serverPort()));
+        QSignalSpy reopen(_link, &SkydroidLink::videoReopenWanted);
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->switchThermal(true);
+        QTest::qWait(4500);
+        QCOMPARE(reopen.count(), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(reopen.count(), 1, 4000);
+        // It never went away: only the switch's own note, no "back".
+        QCOMPARE(notes.size(), 1);
+        QVERIFY(notes.at(0).at(0).toString().startsWith(QStringLiteral("The camera switches to its thermal picture.")));
+    }
+
+    void anotherCameraEndsTheWaitForTheVideo()
+    {
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTcpServer video;
+        QVERIFY(video.listen(QHostAddress::LocalHost, 0));
+        const quint16 videoPort = video.serverPort();
+        video.close();
+        _link->setDayVideoUrl(QStringLiteral("rtsp://127.0.0.1:%1").arg(videoPort));
+        QSignalSpy reopen(_link, &SkydroidLink::videoReopenWanted);
+        _link->switchThermal(true);
+        QTest::qWait(1000);
+        _link->setModel("C13");
+        _link->setDayVideoUrl(QStringLiteral("rtsp://127.0.0.1:%1").arg(videoPort));
+        QVERIFY(video.listen(QHostAddress::LocalHost, videoPort));
+        QTest::qWait(1500);
+        QCOMPARE(reopen.count(), 0);
+    }
+
+    void turningTheLinkOffEndsTheWaitForTheVideo()
+    {
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTcpServer video;
+        QVERIFY(video.listen(QHostAddress::LocalHost, 0));
+        const quint16 videoPort = video.serverPort();
+        video.close();
+        _link->setDayVideoUrl(QStringLiteral("rtsp://127.0.0.1:%1").arg(videoPort));
+        QSignalSpy reopen(_link, &SkydroidLink::videoReopenWanted);
+        _link->switchThermal(true);
+        QTest::qWait(1000);
+        _link->setEnabled(false);
+        QVERIFY(video.listen(QHostAddress::LocalHost, videoPort));
+        QTest::qWait(1500);
+        QCOMPARE(reopen.count(), 0);
+        _link->setEnabled(true);
+    }
+
     void aTopCameraAfterTheViewproClosesItsLink()
     {
         FakeViewproCamera viewpro;
@@ -2055,6 +2146,7 @@ private slots:
 
         // An RC wheel.
         _link->setWheelYawChannel(10);
+        _vehicle.sendRc(_rc(10, 1500));  // at rest first: a wheel drives only after it is turned (B11)
         _link->lockAt(0.5, 0.5);
         QVERIFY(_link->lockActive());
         _vehicle.sendRc(_rc(10, 1900));
@@ -2777,6 +2869,7 @@ private slots:
         _link->stopGimbal();
         // An RC wheel.
         _link->setWheelYawChannel(10);
+        _vehicle.sendRc(_rc(10, 1500));  // at rest first: a wheel drives only after it is turned (B11)
         QTRY_VERIFY_WITH_TIMEOUT(!_link->aimBusy(), 10000);
         QVERIFY(locked());
         _camera->clear();
@@ -2844,6 +2937,7 @@ private slots:
     void wheelThatSpringsBackSetsTheSpeed()
     {
         _link->setWheelPitchChannel(9);
+        _vehicle.sendRc(_rc(9, 1500));  // at rest first: a wheel drives only after it is turned (B11)
         _vehicle.sendRc(_rc(9, 1900));
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeedAxis("GSP", 20.0)) >= 1, 2000);
         _vehicle.sendRc(_rc(9, 1500));
@@ -2857,6 +2951,7 @@ private slots:
     void wheelStopsWhenRcValuesStop()
     {
         _link->setWheelYawChannel(10);
+        _vehicle.sendRc(_rc(10, 1500));  // at rest first: a wheel drives only after it is turned (B11)
         _vehicle.sendRc(_rc(10, 1100));
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeedAxis("GSY", -20.0)) >= 1, 2000);
         // No more RC_CHANNELS (RC link lost): the gimbal must stop.
@@ -2877,6 +2972,67 @@ private slots:
         // C13 pitch stops at +10 degrees (its limit), so the top of the wheel is +10.
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalAngleAxis("GAP", 10.0, 30.0)), 1, 2000);
         QCOMPARE(_camera->countStartingWith("#TPUG2wGS"), 0);  // no speed frames in this mode
+    }
+
+    void aWheelThatSpringsBackDrivesOnlyAfterItIsTurned()
+    {
+        // B11 (the client, 2026-10-28): a channel resting away from its middle turned the camera at
+        // full speed on every RC update. Now the screen says so once, and nothing turns until it moves.
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        // The wheel's notes, each marked when it does not come as a problem (it must).
+        const auto wheelNotes = [&notes]() {
+            QStringList out;
+            for (const QList<QVariant> &n : notes) {
+                if (n.at(0).toString().startsWith(QStringLiteral("The RC wheel"))) {
+                    out.append(n.at(0).toString() + (n.at(1).toBool() ? QString() : QStringLiteral(" [not as a problem]")));
+                }
+            }
+            return out;
+        };
+        _link->setWheelPitchChannel(9);
+        for (int i = 0; i < 5; ++i) {
+            _vehicle.sendRc(_rc(9, 1000));
+            QTest::qWait(60);
+        }
+        QTest::qWait(300);
+        QCOMPARE(_camera->countStartingWith("#TPUG2wGSP"), 0);
+        QCOMPARE(wheelNotes(), QStringList({QStringLiteral(
+            "The RC wheel on channel 9 is at 1000 us, far from its middle (1500 us). It turns the camera only after it "
+            "moves. If this wheel stays where you leave it, choose \"Stays where you leave it\" as its Wheel type in "
+            "Camera settings.")}));
+        // Turned: from then on it drives, as before.
+        _vehicle.sendRc(_rc(9, 1900));
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeedAxis("GSP", 20.0)) >= 1, 2000);
+        _vehicle.sendRc(_rc(9, 1500));
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildGimbalSpeed(0.0, 0.0)) >= 1, 2000);
+        QCOMPARE(wheelNotes().size(), 1);
+        // A wheel first seen at its middle says nothing.
+        _link->setWheelYawChannel(10);
+        _vehicle.sendRc(_rc(10, 1520));
+        QTest::qWait(100);
+        QCOMPARE(wheelNotes().size(), 1);
+    }
+
+    void aSiyiCentreHoldsWhileTheWheelRestsAwayFromItsMiddle()
+    {
+        // B11: the client's SIYI went back down after its centre, the wheel's channel resting at 1000 us.
+        FakeSiyiCamera siyi;
+        _link->setModel("ZR10");
+        _link->setPort(siyi.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        _link->setWheelPitchChannel(9);
+        _vehicle.sendRc(_rc(9, 1000));
+        _link->center();
+        for (int i = 0; i < 8; ++i) {
+            _vehicle.sendRc(_rc(9, 1000));
+            QTest::qWait(60);
+        }
+        QTest::qWait(300);
+        // The centre (pitch 0, yaw 0, then speed 0), and no speed after it that turns the camera.
+        QCOMPARE(siyi.count(siyi::kCmdGimbalAngle), 1);
+        QVERIFY(std::all_of(siyi.requests.begin(), siyi.requests.end(), [](const FakeSiyiCamera::Request &r) {
+            return r.cmd != siyi::kCmdGimbalRotation || r.data == siyi::Bytes({0, 0});
+        }));
     }
 
     void detectWheelPicksTheTurnedWheelNotAStick()
@@ -3782,7 +3938,7 @@ private slots:
     {
         // The screen shows VAMA's names; the code and settings keep Skydroid's.
         QCOMPARE(_link->models(), QStringList({"C12", "C13", "C14 Pro", "C20", "A20KTR", "ZR10"}));
-        QCOMPARE(_link->modelNames(), QStringList({"V12", "V13", "V14 Pro", "V20", "Viewpro A20KTR", "SIYI ZR10"}));
+        QCOMPARE(_link->modelNames(), QStringList({"V12", "V13", "V14 Pro", "V20", "VPro", "VR10"}));
         QCOMPARE(_link->model(), QString("C13"));
         QCOMPARE(_link->modelName(), QString("V13"));
         _link->setModel("C14 Pro");

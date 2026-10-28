@@ -202,6 +202,8 @@ public:
             emit recordingChanged(true);
         }
     }
+    // QGC's: opens the video again (B13, after a Viewpro's sensor switch).
+    Q_INVOKABLE void startVideo() { ++videoStarts; }
     Q_INVOKABLE void stopRecording()
     {
         ++recordStops;
@@ -222,6 +224,7 @@ public:
     int grabs = 0;
     int recordStarts = 0;
     int recordStops = 0;
+    int videoStarts = 0;
     QString photoFolder;
     QString lastImageFile;
 
@@ -2831,7 +2834,7 @@ int main(int argc, char *argv[])
              QQuickItem *bySwitch = findItem("vamaCameraThermalBySwitch");
              QQuickItem *thermal = findItem("vamaCameraThermalVideo");
              const QString zoomText = zoom ? zoom->property("currentText").toString() : QString();
-             expect(protocol && protocol->property("text").toString() == QStringLiteral("Viewpro, over TCP (as the A20KTR)") &&
+             expect(protocol && protocol->property("text").toString() == QStringLiteral("VPro, over TCP") &&
                         transport && !transport->isVisible() && laser && !laser->isVisible() && zoom &&
                         zoom->property("count").toInt() == 2 && zoomText.startsWith(QStringLiteral("The camera says its zoom")) &&
                         bySwitch && bySwitch->isVisible() && bySwitch->property("checked").toBool() && thermal && !thermal->isVisible(),
@@ -2844,7 +2847,7 @@ int main(int argc, char *argv[])
              press("vamaCameraSave");
          }},
         {400, [&]() {
-             const QString file = cameraFolder + QStringLiteral("/viewpro-a20ktr-copy.json");
+             const QString file = cameraFolder + QStringLiteral("/vpro-copy.json");
              expect(cameraFileValue(file, "protocol") == QJsonValue(QStringLiteral("viewpro")) &&
                         cameraFileValue(file, "zoom") == QJsonValue(QStringLiteral("live")) &&
                         cameraFileValue(file, "thermalBySwitch") == QJsonValue(true) &&
@@ -2856,12 +2859,12 @@ int main(int argc, char *argv[])
         {300, [&]() {
              // Chosen as the camera list chooses it (the list is in the camera settings, closed now).
              QMetaObject::invokeMethod(window->property("layer").value<QObject *>(), "_chooseCamera",
-                                       Q_ARG(QVariant, QVariant(QStringLiteral("viewpro-a20ktr-copy"))));
+                                       Q_ARG(QVariant, QVariant(QStringLiteral("vpro-copy"))));
          }},
         {500, [&]() {
              const QString video = global.settings.video.rtspUrlFact.rawValue().toString();
              QQuickItem *ir = findItem("vamaIrButton");
-             expect(link.model() == QStringLiteral("viewpro-a20ktr-copy") && video == QStringLiteral("rtsp://127.0.0.1:8554/viewpro") &&
+             expect(link.model() == QStringLiteral("vpro-copy") && video == QStringLiteral("rtsp://127.0.0.1:8554/viewpro") &&
                         ir && ir->isVisible() && !link.thermalPicture(),
                     "cameras: the Viewpro copy in use has an IR button, on its day picture", video);
          }},
@@ -2878,10 +2881,20 @@ int main(int argc, char *argv[])
                     "cameras: and back to the day picture", QString());
              QMetaObject::invokeMethod(window->property("layer").value<QObject *>(), "_openCameraEditor");
          }},
-        {400, [&]() { tapFound("vamaCameraDelete_viewpro-a20ktr-copy"); }},
+        {200, [&]() {
+             // A Viewpro's video after its sensor switch (B13): the link asks, and the screen opens
+             // QGC's video again, only while it shows none.
+             global.videos.setDecoding(false);
+             emit link.videoReopenWanted();
+             global.videos.setDecoding(true);
+             emit link.videoReopenWanted();
+             expect(global.videos.videoStarts == 1, "Viewpro thermal switch: the video opens again only while it shows none",
+                    QString::number(global.videos.videoStarts));
+         }},
+        {400, [&]() { tapFound("vamaCameraDelete_vpro-copy"); }},
         {300, [&]() { tapFound("vamaCameraDeleteYes"); }},
         {400, [&]() {
-             expect(link.model() == QStringLiteral("C13") && !QFile::exists(cameraFolder + QStringLiteral("/viewpro-a20ktr-copy.json")),
+             expect(link.model() == QStringLiteral("C13") && !QFile::exists(cameraFolder + QStringLiteral("/vpro-copy.json")),
                     "cameras: the Viewpro copy deleted, the V13 in use again", link.model());
              press("vamaCameraCopy_ZR10");
          }},
@@ -2891,7 +2904,7 @@ int main(int argc, char *argv[])
              QQuickItem *bySwitch = findItem("vamaCameraThermalBySwitch");
              QQuickItem *tracker = findItem("vamaCameraOwnTracker");
              const QString zoomText = zoom ? zoom->property("currentText").toString() : QString();
-             expect(protocol && protocol->property("text").toString() == QStringLiteral("SIYI, over UDP (as the ZR10)") && zoom &&
+             expect(protocol && protocol->property("text").toString() == QStringLiteral("SIYI, over UDP (as the VR10)") && zoom &&
                         zoom->property("count").toInt() == 2 && zoomText.startsWith(QStringLiteral("It zooms and does not say")) &&
                         bySwitch && !bySwitch->isVisible() && tracker && !tracker->isVisible(),
                     "cameras: a copy of the ZR10 shows SIYI and its zoom that says nothing, no thermal switch or tracker",

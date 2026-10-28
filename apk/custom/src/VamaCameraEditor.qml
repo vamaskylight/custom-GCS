@@ -43,9 +43,9 @@ Popup {
     readonly property var    _zoomNames: ({ "none":     qsTr("No zoom"),
                                             "counted":  qsTr("Steps of 0.1x (as the V12 and V13)"),
                                             "reported": qsTr("The camera reports its zoom step (as the V14 Pro)"),
-                                            "live":     qsTr("The camera says its zoom and its view (as the A20KTR)"),
+                                            "live":     qsTr("The camera says its zoom and its view (as the VPro)"),
                                             "pulse":    _top ? qsTr("Its lens zooms and does not say how far (as the V20)")
-                                                             : qsTr("It zooms and does not say how far (as the ZR10)") })
+                                                             : qsTr("It zooms and does not say how far (as the VR10)") })
     readonly property string _zoomKind:  _zoomKinds[zoomBox.currentIndex] || "none"
     readonly property bool   _thermalBySwitch: _protocol === "viewpro" && thermalBySwitchBox.checked
     // How the control commands reach the camera, in the order of the link box (the C20: TCP).
@@ -206,7 +206,7 @@ Popup {
                 visible:          root._fields === null
                 wrapMode:         Text.WordWrap
                 font.pointSize:   ScreenTools.smallFontPointSize
-                text:             qsTr("Copy a camera to add a new one. The copy speaks the protocol of the camera it was copied from: Skydroid TOP, Viewpro or SIYI. A camera with another protocol needs an app update. Cameras you add are files in %1. Copy such a file into that folder on another remote control, and the camera is in its list too.").arg(root.link.cameraFolder)
+                text:             qsTr("Copy a camera to add a new one. The copy speaks the protocol of the camera it was copied from: Skydroid TOP, VPro or SIYI. A camera with another protocol needs an app update. Cameras you add are files in %1. Copy such a file into that folder on another remote control, and the camera is in its list too.").arg(root.link.cameraFolder)
             }
 
             QGCLabel {
@@ -300,8 +300,8 @@ Popup {
                     objectName:       "vamaCameraProtocol"
                     Layout.fillWidth: true
                     wrapMode:         Text.WordWrap
-                    text:             root._protocol === "viewpro" ? qsTr("Viewpro, over TCP (as the A20KTR)")
-                                    : root._protocol === "siyi"    ? qsTr("SIYI, over UDP (as the ZR10)")
+                    text:             root._protocol === "viewpro" ? qsTr("VPro, over TCP")
+                                    : root._protocol === "siyi"    ? qsTr("SIYI, over UDP (as the VR10)")
                                                                    : qsTr("Skydroid TOP")
                 }
 
@@ -332,7 +332,7 @@ Popup {
                     id:         thermalBySwitchBox
                     objectName: "vamaCameraThermalBySwitch"
                     visible:    root._protocol === "viewpro"
-                    text:       qsTr("The thermal picture comes in the day video, by a switch (as the A20KTR)")
+                    text:       qsTr("The thermal picture comes in the day video, by a switch (as the VPro)")
                 }
 
                 Item { width: 1; height: 1 }

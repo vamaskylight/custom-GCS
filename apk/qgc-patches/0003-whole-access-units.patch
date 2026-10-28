@@ -1,0 +1,59 @@
+diff --git a/src/VideoManager/VideoReceiver/GStreamer/GstSourceFactory.cc b/src/VideoManager/VideoReceiver/GStreamer/GstSourceFactory.cc
+--- a/src/VideoManager/VideoReceiver/GStreamer/GstSourceFactory.cc
++++ b/src/VideoManager/VideoReceiver/GStreamer/GstSourceFactory.cc
+@@ -80,6 +80,43 @@ gboolean filterParserCaps([[maybe_unused]] GstElement* bin, [[maybe_unused]] Gst
+ }
+ #endif
+ 
++// VAMA patch (apk/qgc-patches/0003): the H.264/H.265 parser that parsebin plugs hands out one whole
++// access unit per buffer, as byte-stream. rtph26xdepay's default output is one NAL unit per buffer,
++// and the parser keeps that when the decoder branch takes anything (decodebin3), so the tee carried
++// NAL units with a timestamp on the first one of each access unit only, and the recording branch
++// opened on a NAL without one. On the RC (test build 15, 2026-10-28) every file began after its first
++// keyframe, at the stream's own time, and each later keyframe was cut down to a lone VPS: black in every
++// player. Desktop GStreamer 1.24 with NAL units on the tee shows the first two (not the lone VPS), and
++// good files with whole access units. The RC's decoder (amcviddec) takes byte-stream, au anyway.
++gboolean answerAccessUnitCaps([[maybe_unused]] GstElement* bin, GstPad* pad, GstElement* element, GstQuery* query,
++                              [[maybe_unused]] gpointer data)
++{
++    if ((GST_QUERY_TYPE(query) != GST_QUERY_CAPS) || (GST_PAD_DIRECTION(pad) != GST_PAD_SRC)) {
++        return FALSE;
++    }
++
++    GstElementFactory* factory = gst_element_get_factory(element);
++    const char* name = factory ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)) : nullptr;
++    const char* media = (g_strcmp0(name, "h265parse") == 0) ? "video/x-h265"
++                      : (g_strcmp0(name, "h264parse") == 0) ? "video/x-h264" : nullptr;
++    if (!media) {
++        return FALSE;
++    }
++
++    GstCaps* result = gst_caps_new_simple(media, "stream-format", G_TYPE_STRING, "byte-stream", "alignment",
++                                          G_TYPE_STRING, "au", nullptr);
++    GstCaps* filter = nullptr;
++    gst_query_parse_caps(query, &filter);
++    if (filter && !gst_caps_is_any(filter)) {
++        GstCaps* both = gst_caps_intersect(filter, result);
++        gst_caps_unref(result);
++        result = both;
++    }
++    gst_query_set_caps_result(query, result);
++    gst_caps_unref(result);
++    return TRUE;
++}
++
+ void wrapWithGhostPad(GstElement* element, GstPad* pad, [[maybe_unused]] gpointer data)
+ {
+     gchar* name = gst_pad_get_name(pad);
+@@ -587,6 +624,11 @@ GstElement* create(const QString& uri, const Config& config)
+         if (!isUdpH265) {
+             (void) g_signal_connect(parser, "autoplug-query", G_CALLBACK(filterParserCaps), nullptr);
+         }
++#else
++        // VAMA patch (0003): whole access units for the tee and the recording (answerAccessUnitCaps).
++        if (!isUdpH265) {
++            (void) g_signal_connect(parser, "autoplug-query", G_CALLBACK(answerAccessUnitCaps), nullptr);
++        }
+ #endif
+ 
+         // Add individually so ownership is unambiguous on failure: gst_bin_add sinks the ref only

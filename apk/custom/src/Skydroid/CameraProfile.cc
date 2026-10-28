@@ -33,7 +33,9 @@ constexpr const char kSkydroidDayUrl[] = "rtsp://192.168.144.108:554/stream=1";
 constexpr const char kSkydroidThermalUrl[] = "rtsp://192.168.144.108:555/stream=2";
 
 // Viewpro and SIYI as VGCS has them (vgcs/video/camera_control.py, vgcs/skydroid/camera_files.py).
-constexpr const char kViewproHost[] = "192.168.2.119";  // the factory address printed on the unit
+// The client's Viewpro sits on the Skydroid link's network (rtsp://192.168.144.119:554, the client
+// 2026-10-28); Viewpro's factory address, printed on the unit, is 192.168.2.119.
+constexpr const char kViewproHost[] = "192.168.144.119";
 constexpr int kViewproPort = 2000;
 constexpr const char kSiyiHost[] = "192.168.144.25";
 constexpr int kSiyiPort = 37260;
@@ -192,21 +194,25 @@ QList<Profile> builtInProfiles()
     c20.ownTracker = false;
     c20.upperGimbalHeader = true;
 
-    // The Viewpro A20KTR (task AK): Viewpro's protocol over TCP 2000, its main stream. 70.2 x 43.1
-    // is the view its own screen showed at 1x, used until the camera says its own (it says its zoom
-    // and its view in every status). Its tilt and turn are estimates, not from a data sheet. Its
-    // thermal picture comes in the same video after a sensor switch; its thermal lens is not known,
-    // so a point on the thermal picture is placed at the cross only. No laser in the app yet. Its
-    // own tracker is not used (as in VGCS).
+    // The Viewpro A20KTR (task AK), named "VPro" by the client (2026-10-28): Viewpro's protocol over
+    // TCP 2000, its one video at the client's address. 70.2 x 43.1 is the view its own screen showed
+    // at 1x, used until the camera says its own (it says its zoom and its view in every status). Its
+    // tilt and turn are estimates, not from a data sheet. Its thermal picture comes in the same video
+    // after a sensor switch. Its thermal lens is Viewpro's: 35 mm on 640 x 512 at 12 um, 12.5 x 10.0
+    // degrees (also by the sensor's size). Not "sure": how the 5:4 thermal picture sits in the 16:9
+    // video is not known, so a point on the thermal picture is placed at the cross only. No laser in
+    // the app yet. Its own tracker is not used (as in VGCS).
     Profile a20;
     a20.id = QStringLiteral("A20KTR");
-    a20.name = QStringLiteral("Viewpro A20KTR");
+    a20.name = QStringLiteral("VPro");
     a20.builtIn = true;
     a20.protocol = Protocol::Viewpro;
     a20.host = QString::fromLatin1(kViewproHost);
     a20.port = kViewproPort;
-    a20.dayVideoUrl = QStringLiteral("rtsp://192.168.2.119:554/stream0");
+    a20.dayVideoUrl = QStringLiteral("rtsp://192.168.144.119:554");
     a20.thermalBySwitch = true;
+    a20.thermalFovHDeg = 12.5;
+    a20.thermalFovVDeg = 10.0;
     a20.fovHDeg = 70.2;
     a20.fovVDeg = 43.1;
     a20.zoom = Zoom::Live;
@@ -215,13 +221,14 @@ QList<Profile> builtInProfiles()
     a20.laser = false;
     a20.ownTracker = false;
 
-    // The SIYI ZR10 (task AK): SIYI's protocol over UDP 37260. 71.5 degrees wide at 1x (ZR10
-    // manual), 45.2 high (from its diagonal). It zooms while it is told to and does not say how
-    // far, so its view holds at 1x only. -90 to +25 degrees, 45 either way: the range it can be
-    // told to go (DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md). No laser, no thermal picture.
+    // The SIYI ZR10 (task AK), named "VR10" by the client (2026-10-28): SIYI's protocol over UDP
+    // 37260. 71.5 degrees wide at 1x (ZR10 manual), 45.2 high (from its diagonal). It zooms while
+    // it is told to and does not say how far, so its view holds at 1x only. -90 to +25 degrees, 45
+    // either way: the range it can be told to go (DOCS/SIYI-ZR10-HARDWARE-REFERENCE.md). No laser,
+    // no thermal picture.
     Profile zr10;
     zr10.id = QStringLiteral("ZR10");
-    zr10.name = QStringLiteral("SIYI ZR10");
+    zr10.name = QStringLiteral("VR10");
     zr10.builtIn = true;
     zr10.protocol = Protocol::Siyi;
     zr10.host = QString::fromLatin1(kSiyiHost);
@@ -323,7 +330,7 @@ QString problem(const Profile &p)
         break;
     case Protocol::Viewpro:
         if (p.zoom != Zoom::None && p.zoom != Zoom::Live) {
-            return text("A Viewpro camera's zoom is none or live.");
+            return text("A VPro camera's zoom is none or live.");
         }
         break;
     case Protocol::Siyi:
@@ -336,15 +343,15 @@ QString problem(const Profile &p)
     }
     if (p.protocol != Protocol::Top) {
         if (p.laser) {
-            return text("The app has no laser for a Viewpro or SIYI camera yet. Untick Laser.");
+            return text("The app has no laser for a VPro or SIYI camera yet. Untick Laser.");
         }
         if (p.ownTracker) {
-            return text("The app uses no tracker of a Viewpro or SIYI camera. Untick \"Its own object tracker\".");
+            return text("The app uses no tracker of a VPro or SIYI camera. Untick \"Its own object tracker\".");
         }
     }
     if (p.thermalBySwitch) {
         if (p.protocol != Protocol::Viewpro) {
-            return text("Only a Viewpro camera switches its day video to the thermal picture.");
+            return text("Only a VPro camera switches its day video to the thermal picture.");
         }
         if (!p.thermalVideoUrl.trimmed().isEmpty()) {
             return text("A camera that switches to its thermal picture has no thermal video of its own: leave it empty.");
