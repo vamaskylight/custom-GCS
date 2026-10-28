@@ -206,8 +206,11 @@ void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
     QCOMPARE(zr10.fovVDeg, 45.2);
     QCOMPARE(zr10.pitchMaxDeg, 25.0);
     QCOMPARE(zr10.yawLimitDeg, 45.0);
+    // The VPro's laser (B13 c): at least 3000 m on a car (the maker's page), 4000 m taken. The VR10 has none.
+    QVERIFY(a20.laser && !zr10.laser);
+    QCOMPARE(a20.laserMaxM, 4000.0);
     for (const Profile &p : {a20, zr10}) {
-        QVERIFY(!p.laser && !p.ownTracker && p.photo && p.record && !p.upperGimbalHeader);
+        QVERIFY(!p.ownTracker && p.photo && p.record && !p.upperGimbalHeader);
         QVERIFY(p.thermalVideoUrl.isEmpty() && !p.thermalFovSure);
         QCOMPARE(p.pitchMinDeg, -90.0);
         QVERIFY2(camera::problem(p).isEmpty(), qPrintable(camera::problem(p)));
@@ -472,8 +475,8 @@ void CameraProfileTest::eachProtocolHasItsZoomsAndFeatures()
         {a20, [](Profile &p) { p.zoom = Zoom::Pulse; }, "A VPro camera's zoom is none or live."},
         {zr10, [](Profile &p) { p.zoom = Zoom::Live; }, "A SIYI camera's zoom is none or pulse."},
         {zr10, [](Profile &p) { p.zoom = Zoom::Reported; }, "A SIYI camera's zoom is none or pulse."},
-        {a20, [](Profile &p) { p.laser = true; }, "The app has no laser for a VPro or SIYI camera yet. Untick Laser."},
-        {zr10, [](Profile &p) { p.laser = true; }, "The app has no laser for a VPro or SIYI camera yet. Untick Laser."},
+        {zr10, [](Profile &p) { p.laser = true; }, "The app has no laser for a SIYI camera. Untick Laser."},
+        {a20, [](Profile &p) { p.laserMaxM = 7000.0; }, "The laser's longest reading must be 5 to 6553 m."},
         {a20, [](Profile &p) { p.ownTracker = true; },
          "The app uses no tracker of a VPro or SIYI camera. Untick \"Its own object tracker\"."},
         {top, [](Profile &p) { p.protocol = static_cast<Protocol>(9); },

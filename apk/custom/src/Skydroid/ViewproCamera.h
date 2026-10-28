@@ -62,6 +62,12 @@ public:
     Bytes setSensor(bool ir);
     bool sensorIsIr() const { return m_sensorIr; }
 
+    /// The laser: continuous ranging (true), as VGCS ranges, or off. While it ranges, each status
+    /// carries the last range it measured (rangeM()). VGCS's single shots came back with nothing
+    /// in the field (2026-08-03), so there is none here. Off stops the emitter.
+    Bytes setLaser(bool on);
+    bool laserOn() const { return m_laserOn; }
+
     /// The status request (a heartbeat: the camera answers with its status).
     Bytes poll() const;
     /// Frames due by nowMs: the zoom stop, the hold after a jog.
@@ -91,6 +97,7 @@ private:
     long long m_servoModeMs = -1;
     bool m_recording = false;
     bool m_sensorIr = false;
+    bool m_laserOn = false;
     std::optional<double> m_rangeM;
     long long m_rangeMs = -1;
     std::optional<double> m_hfovDeg;

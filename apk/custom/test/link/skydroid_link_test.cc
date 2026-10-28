@@ -395,6 +395,7 @@ public:
         long long p2 = 0;
         int op = 0;     // the C1 optics operation
         int sensor = 0;
+        int lrf = 0;    // the C1 laser bits
     };
 
     FakeViewproCamera()
@@ -422,6 +423,16 @@ public:
 
     quint16 port() const { return _server.serverPort(); }
     bool connected() const { return _conn && _conn->state() == QAbstractSocket::ConnectedState; }
+    /// Its network gone for a moment (as after a sensor switch): what it does keeps going.
+    void dropConnection()
+    {
+        if (_conn) {
+            _conn->disconnect(this);
+            _conn->abort();
+            _conn->deleteLater();
+            _conn = nullptr;
+        }
+    }
     int countServo(int servo) const
     {
         return static_cast<int>(std::count_if(commands.begin(), commands.end(), [servo](const Command &c) { return c.servo == servo; }));
@@ -429,6 +440,10 @@ public:
     int countOp(int op) const
     {
         return static_cast<int>(std::count_if(commands.begin(), commands.end(), [op](const Command &c) { return c.op == op; }));
+    }
+    int countLrf(int lrf) const
+    {
+        return static_cast<int>(std::count_if(commands.begin(), commands.end(), [lrf](const Command &c) { return c.lrf == lrf; }));
     }
 
     int accepts = 0;
@@ -441,6 +456,12 @@ public:
     double hfov = 70.2;
     double vfov = 43.1;
     bool recording = false;
+    // Its laser, as the real one: it ranges from a start to a stop, its status carries the range it
+    // measured (0 while it measures nothing), and its first range comes laserFirstMs after the start.
+    double rangeM = 0.0;
+    int laserFirstMs = 0;
+    int ignoreLaserStarts = 0;  // starts that are lost on the way
+    bool laserOn = false;
     QList<Command> commands;
 
 private:
@@ -465,6 +486,12 @@ private:
         body[24] = static_cast<std::uint8_t>(rollRaw & 0xFF);
         putU16(body, 25, std::lround(yaw * 65536.0 / 360.0));
         putU16(body, 27, std::lround(pitch * 65536.0 / 360.0));
+        if (laserOn && _laserSince.elapsed() >= laserFirstMs && rangeM > 0.0) {
+            const long raw = std::lround(rangeM * 10.0);  // D1 bytes 1, 4 and 5: decimetres
+            body[30] = static_cast<std::uint8_t>((raw >> 16) & 0xFF);
+            body[33] = static_cast<std::uint8_t>((raw >> 8) & 0xFF);
+            body[34] = static_cast<std::uint8_t>(raw & 0xFF);
+        }
         putU16(body, 31, recording ? 1 : 0);
         putU16(body, 35, std::lround(vfov * 100.0));
         putU16(body, 37, std::lround(hfov * 100.0));
@@ -502,8 +529,17 @@ private:
             } else if (frame->first == viewpro::kCmdA1C1E1 && frame->second.size() >= 11) {
                 const viewpro::Bytes &d = frame->second;
                 const unsigned c1 = (static_cast<unsigned>(d[9]) << 8) | d[10];
+                const int lrf = static_cast<int>((c1 >> 13) & 0x7);
                 commands.append(Command{d[0], i16(d, 1), i16(d, 3), static_cast<int>((c1 >> 6) & 0x7F),
-                                        static_cast<int>(c1 & 0x7)});
+                                        static_cast<int>(c1 & 0x7), lrf});
+                if (lrf == viewpro::kLrfContinuousStart && ignoreLaserStarts > 0) {
+                    --ignoreLaserStarts;
+                } else if (lrf == viewpro::kLrfContinuousStart && !laserOn) {
+                    laserOn = true;
+                    _laserSince.start();
+                } else if (lrf == viewpro::kLrfStop) {
+                    laserOn = false;
+                }
             }
         }
     }
@@ -511,6 +547,7 @@ private:
     QTcpServer _server;
     QTcpSocket *_conn = nullptr;
     std::vector<std::uint8_t> _rx;
+    QElapsedTimer _laserSince;
 };
 
 bool hasCommand(const FakeViewproCamera &camera, int servo, long long p1, long long p2)
@@ -1405,6 +1442,187 @@ private slots:
         QTest::qWait(1500);
         QCOMPARE(reopen.count(), 0);
         _link->setEnabled(true);
+    }
+
+    // --- A VPro's laser (B13 c, the client 2026-10-28: "it has 3km lrf range so please add lrf") ---
+
+    void aVproShotStartsItsLaserAndTakesTheRangeItMeasures()
+    {
+        // As VGCS ranges with it: continuous ranging (its single shots came back with nothing in the
+        // field), and the range the camera measured after the shot.
+        FakeViewproCamera viewpro;
+        viewpro.rangeM = 1234.5;
+        viewpro.laserFirstMs = 600;  // a laser that starts measures after a while
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        _link->fireLaser();
+        QVERIFY(_link->laserBusy());
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.countLrf(viewpro::kLrfContinuousStart), 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(_link->laserValid());
+        QCOMPARE(_link->laserRangeM(), 1234.5);
+        QVERIFY(_link->targetValid());  // its lat long, from the drone's pose and the camera's angles
+        // The next shot finds it ranging: no start again, and the range of this shot.
+        viewpro.rangeM = 876.5;
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QCOMPARE(_link->laserRangeM(), 876.5);
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfContinuousStart), 1);
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfSingle), 0);
+        QVERIFY(viewpro.laserOn);  // on for the next shot
+    }
+
+    void aVproShotTakesNoRangeOfBeforeAndNoneBeyondItsLaser()
+    {
+        FakeViewproCamera viewpro;
+        viewpro.rangeM = 450.0;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QCOMPARE(_link->laserRangeM(), 450.0);
+        // The sky: it ranges and measures nothing, so its status says 0. The range of the shot
+        // before is not this shot's. It ranges already, so it is given 3 s.
+        const QString none("No laser reading. The target may be too near or farther than 4000 m, or the laser did not answer.");
+        viewpro.rangeM = 0.0;
+        QElapsedTimer shot;
+        shot.start();
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 5000);
+        QVERIFY2(shot.elapsed() >= 2900 && shot.elapsed() < 4000, qPrintable(QString::number(shot.elapsed())));
+        QVERIFY(!_link->laserValid());
+        QCOMPARE(_link->laserMessage(), none);
+        // Farther than its laser reaches (4000 m taken for the VPro): not taken as real.
+        viewpro.rangeM = 4500.0;
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 5000);
+        QVERIFY(!_link->laserValid());
+        QCOMPARE(_link->laserMessage(), none);
+    }
+
+    void aVproLaserGetsItsStartOnceMoreWhenTheFirstIsLost()
+    {
+        // A start can be lost on the way: once more after 2 s, as VGCS sends it, and not again.
+        FakeViewproCamera viewpro;
+        viewpro.rangeM = 300.0;
+        viewpro.ignoreLaserStarts = 1;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        QElapsedTimer shot;
+        shot.start();
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 5000);
+        QVERIFY2(shot.elapsed() >= 1900, qPrintable(QString::number(shot.elapsed())));
+        QVERIFY(_link->laserValid());
+        QCOMPARE(_link->laserRangeM(), 300.0);
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfContinuousStart), 2);
+    }
+
+    void aVproLaserThatStartsIsGivenTenSeconds()
+    {
+        // VGCS's field data: the first ranges of a laser that had to start came after 2.0 to 5.6 s.
+        FakeViewproCamera viewpro;
+        viewpro.rangeM = 0.0;  // nothing to measure
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        QElapsedTimer shot;
+        shot.start();
+        _link->fireLaser();
+        QTest::qWait(6000);
+        QVERIFY(_link->laserBusy());
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 5000);
+        QVERIFY2(shot.elapsed() >= 9900 && shot.elapsed() < 11000, qPrintable(QString::number(shot.elapsed())));
+        QVERIFY(!_link->laserValid());
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfContinuousStart), 2);  // the start, and once more at 2 s
+    }
+
+    void aVproLaserGoesOffTenSecondsAfterItsLastShot()
+    {
+        // It is an emitter, not only a sensor: off when no shot came for 10 s (VGCS _LRF_IDLE_STOP_S).
+        FakeViewproCamera viewpro;
+        viewpro.rangeM = 150.0;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QElapsedTimer since;
+        since.start();
+        QTest::qWait(8500);
+        QVERIFY(viewpro.laserOn);
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfStop), 0);
+        QTRY_VERIFY_WITH_TIMEOUT(!viewpro.laserOn, 3000);
+        QVERIFY2(since.elapsed() >= 9800, qPrintable(QString::number(since.elapsed())));
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfStop), 1);
+    }
+
+    void turningTheLinkOffOrAnotherCameraTurnsTheVproLaserOff()
+    {
+        FakeViewproCamera viewpro;
+        viewpro.rangeM = 150.0;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QVERIFY(viewpro.laserOn);
+        _link->setEnabled(false);
+        QTRY_VERIFY_WITH_TIMEOUT(!viewpro.laserOn, 2000);
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfStop), 1);
+        _link->setEnabled(true);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        viewpro.rangeM = 0.0;
+        _link->fireLaser();  // a shot that starts it again, and during it another camera
+        QTRY_VERIFY_WITH_TIMEOUT(viewpro.laserOn, 2000);
+        _link->setModel("C13");
+        QTRY_VERIFY_WITH_TIMEOUT(!viewpro.laserOn, 2000);
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfStop), 2);
+    }
+
+    void aVproLaserGetsItsOffWhenItsConnectionIsBack()
+    {
+        // A sensor switch takes the camera's network away for seconds, and its laser may still range
+        // then: the off it could not get goes out when the connection is back.
+        FakeViewproCamera viewpro;
+        viewpro.rangeM = 150.0;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 3000);
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        viewpro.dropConnection();
+        QTRY_COMPARE_WITH_TIMEOUT(viewpro.accepts, 2, 6000);  // the link connects again
+        QTRY_VERIFY_WITH_TIMEOUT(!viewpro.laserOn, 2000);
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfStop), 1);
+        // The next shot starts it again.
+        viewpro.rangeM = 222.0;
+        _link->fireLaser();
+        QTRY_VERIFY_WITH_TIMEOUT(!_link->laserBusy(), 3000);
+        QCOMPARE(_link->laserRangeM(), 222.0);
+        QCOMPARE(viewpro.countLrf(viewpro::kLrfContinuousStart), 2);
+    }
+
+    void theDigitalZoomIsOneToFourTimesAndOneWithAnotherCamera()
+    {
+        // B10: the screen's own zoom of the picture (the client asked for more than the V20's 22x).
+        QSignalSpy changed(_link, &SkydroidLink::digitalZoomChanged);
+        QCOMPARE(_link->digitalZoom(), 1.0);
+        _link->setDigitalZoom(2.0);
+        QCOMPARE(_link->digitalZoom(), 2.0);
+        _link->setDigitalZoom(9.0);  // more only blurs
+        QCOMPARE(_link->digitalZoom(), 4.0);
+        _link->setDigitalZoom(0.5);
+        QCOMPARE(_link->digitalZoom(), 1.0);
+        _link->setDigitalZoom(std::nan(""));
+        QCOMPARE(_link->digitalZoom(), 1.0);
+        _link->setDigitalZoom(4.0);
+        _link->setModel("C12");  // another camera: its whole picture
+        QCOMPARE(_link->digitalZoom(), 1.0);
+        QCOMPARE(changed.count(), 5);
     }
 
     void aTopCameraAfterTheViewproClosesItsLink()

@@ -114,6 +114,8 @@ Frames play(Camera &cam, const Step *steps, size_t count, long long finalMs)
             add(s.t, cam.toggleRecording());
         } else if (action == "sensor") {
             add(s.t, cam.setSensor(s.a != 0.0));
+        } else if (action == "laser") {
+            add(s.t, cam.setLaser(s.a != 0.0));
         } else if (action == "status") {
             cam.feed(fromHex(s.text), s.t);
         } else if (action != "wait") {

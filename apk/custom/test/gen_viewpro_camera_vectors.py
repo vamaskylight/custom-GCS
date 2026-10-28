@@ -125,6 +125,7 @@ SCRIPTS: dict[str, list[tuple]] = {
         (1600, "record_toggle", 0, 0, ""), (1700, "record_toggle", 0, 0, ""), (1800, "record", 0, 0, ""),
     ],
     "sensor": [(1000, "sensor", 1, 0, ""), (1100, "sensor", 0, 0, ""), (1200, "sensor", 1, 0, "")],
+    "laser": [(1000, "laser", 1, 0, ""), (1100, "laser", 0, 0, ""), (1200, "laser", 1, 0, ""), (1300, "laser", 1, 0, "")],
     "the_cameras_tracker_keeps_the_gimbal": [
         (1000, "status", 0, 0, status_frame(servo_mode=0x06).hex()), (1100, "speed", 5.0, 0.0, ""),
         (1200, "speed", 0.0, 0.0, ""), (1700, "wait", 0, 0, ""),
@@ -193,6 +194,12 @@ def run(script: list[tuple]) -> tuple[list[tuple[int, bytes]], bool, bool]:
             adapter.camera_record_toggle()
         elif action == "sensor":
             adapter.set_video_sensor("ir" if a else "eo")
+        elif action == "laser":
+            # Continuous ranging, as VGCS ranges (its single shot is laser_range_once, not used).
+            if a:
+                adapter.laser_range_start()
+            else:
+                adapter.laser_range_stop()
         elif action == "status":
             adapter._update_from_reply(bytes.fromhex(text))
         elif action != "wait":

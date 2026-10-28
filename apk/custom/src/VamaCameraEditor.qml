@@ -460,10 +460,10 @@ Popup {
                 QGCLabel { text: qsTr("Turn either way (degrees)"); Layout.preferredWidth: root._labelWidth }
                 NumberField { id: yawLimitField; objectName: "vamaCameraYawLimit" }
 
-                // The app has no laser and no tracker of a Viewpro or SIYI camera (CameraProfile.h).
-                QGCCheckBox { id: laserBox; objectName: "vamaCameraLaser"; text: qsTr("Laser"); visible: root._top }
+                // The app has no laser of a SIYI camera, and no tracker of a Viewpro or SIYI camera (CameraProfile.h).
+                QGCCheckBox { id: laserBox; objectName: "vamaCameraLaser"; text: qsTr("Laser"); visible: root._protocol !== "siyi" }
                 RowLayout {
-                    visible: root._top
+                    visible: root._protocol !== "siyi"
                     QGCLabel { text: qsTr("Longest reading (m)"); enabled: laserBox.checked }
                     NumberField { id: laserMaxField; objectName: "vamaCameraLaserMax"; enabled: laserBox.checked }
                 }

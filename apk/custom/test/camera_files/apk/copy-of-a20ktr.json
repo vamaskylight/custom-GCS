@@ -6,8 +6,8 @@
     "dayVideoUrl": "rtsp://192.168.144.119:554",
     "format": "vama-camera-1",
     "host": "192.168.144.119",
-    "laser": false,
-    "laserMaxM": 1000,
+    "laser": true,
+    "laserMaxM": 4000,
     "lenses": [
     ],
     "maxZoom": 30,

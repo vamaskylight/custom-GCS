@@ -2,8 +2,9 @@
 // video picture). custom.qrc serves it in place of QGC's file. Compare it with
 // QGC's file again after every QGC update. The changes are marked "VAMA": the
 // thermal colour modes of VGCS (client request 2026-10-07), the pictures for
-// the object lock (2026-10-09), and the pictures for the object finder
-// (2026-10-13, and for its check of a lock 2026-10-20). QGC's comment on orientation has a colon in place of its long dash.
+// the object lock (2026-10-09), the pictures for the object finder
+// (2026-10-13, and for its check of a lock 2026-10-20), and the app's own
+// digital zoom (2026-10-28). QGC's comment on orientation has a colon in place of its long dash.
 
 import QtQuick
 import QtMultimedia
@@ -23,6 +24,12 @@ VideoOutput {
     fillMode: QGroundControl.settingsManager.videoSettings.videoFit.rawValue === 2
               ? VideoOutput.PreserveAspectCrop
               : VideoOutput.PreserveAspectFit
+
+    // VAMA (B10, the client 2026-10-28: "can add more digital zoom"): the app's own zoom of the
+    // picture, about its centre, while the camera link is on (its buttons are hidden while it is
+    // off). QGC's video view clips it to its own size. The grabs below and QGC's snapshot are of
+    // this item itself, without its scale, so the lock, the marks and the copy keep the whole picture.
+    scale: SkydroidLink.enabled ? SkydroidLink.digitalZoom : 1.0
 
     Connections {
         target: QGroundControl.videoManager

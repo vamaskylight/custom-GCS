@@ -48,6 +48,7 @@
 //                         and that a copy is on the RC (task AL)
 //   36_recording.png      the camera records and says so ("REC"), and the RC records a copy ("RC REC")
 //   37_no_sd_card.png     a camera without an SD card: the status says so, and the note of a photo
+//   38_digital_zoom.png   the app's own zoom of the picture at 2x, and its button ("D 2x", B10)
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
 // The lock is tried for real: the day picture is a look into a world that
@@ -283,14 +284,39 @@ public:
     QString rtspVideoSource() const { return QStringLiteral("RTSP Video Stream"); }
 };
 
+/// QGC's AppSettings: the folders of the copies on the RC. Empty while QGC has no save folder, as on
+/// Android without the Storage permission (B14).
+class FakeAppSettings : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString videoSavePath READ videoSavePath NOTIFY savePathsChanged)
+    Q_PROPERTY(QString photoSavePath READ photoSavePath NOTIFY savePathsChanged)
+
+public:
+    QString videoSavePath() const { return hasFolder ? QStringLiteral("VAMA-GCS/Video") : QString(); }
+    QString photoSavePath() const { return hasFolder ? QStringLiteral("VAMA-GCS/Photo") : QString(); }
+    void setHasFolder(bool on)
+    {
+        hasFolder = on;
+        emit savePathsChanged();
+    }
+    bool hasFolder = true;
+
+signals:
+    void savePathsChanged();
+};
+
 class FakeSettingsManager : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QObject *videoSettings READ videoSettings CONSTANT)
+    Q_PROPERTY(QObject *appSettings READ appSettings CONSTANT)
 
 public:
     QObject *videoSettings() { return &video; }
+    QObject *appSettings() { return &app; }
     FakeVideoSettings video;
+    FakeAppSettings app;
 };
 
 /// One value that QML reads by name ("isValid", "supported").
@@ -1461,6 +1487,9 @@ int main(int argc, char *argv[])
                      : QStringLiteral("row %1, bar %2 %3 %4").arg(row).arg(bar.red()).arg(bar.green()).arg(bar.blue()));
     };
 
+    int grabsBeforeNoFolder = 0;  // B14's step: no picture is grabbed without a save folder
+    QPointF zoomTap;              // B10's steps: the same tap at 1x and at 2x
+    double yawAt1x = 0.0;
     const QList<std::pair<int, std::function<void()>>> steps = {
         {1500, [&]() {
              link.zoom(1);
@@ -2400,6 +2429,20 @@ int main(int argc, char *argv[])
          }},
         {400, [&]() {
              shot("5_settings_wheel.png");
+             // B13 d: with no channel chosen, the wheel part says that the wheel is off and how to set it.
+             QObject *wheel = window->findChild<QObject *>(QStringLiteral("vamaWheelStatus"));
+             const QString off = wheel ? wheel->property("text").toString() : QString();
+             expect(off.startsWith(QStringLiteral("The RC wheel is off: no channel is chosen.")),
+                    "RC wheel: with no channel chosen, it says that the wheel is off", off);
+             link.setWheelPitchChannel(9);
+         }},
+        {300, [&]() {
+             QObject *wheel = window->findChild<QObject *>(QStringLiteral("vamaWheelStatus"));
+             const QString set = wheel ? wheel->property("text").toString() : QString();
+             expect(!set.contains(QStringLiteral("The RC wheel is off")) &&
+                        (set.contains(QStringLiteral("Channel 9 now")) || set.contains(QStringLiteral("No RC values from the drone yet."))),
+                    "RC wheel: with a channel chosen, it shows that channel's value, not the off line", set);
+             link.setWheelPitchChannel(0);
              QObject *popup = window->findChild<QObject *>(QStringLiteral("vamaCameraSettings"));
              if (popup) {
                  QMetaObject::invokeMethod(popup, "close");
@@ -2835,10 +2878,10 @@ int main(int argc, char *argv[])
              QQuickItem *thermal = findItem("vamaCameraThermalVideo");
              const QString zoomText = zoom ? zoom->property("currentText").toString() : QString();
              expect(protocol && protocol->property("text").toString() == QStringLiteral("VPro, over TCP") &&
-                        transport && !transport->isVisible() && laser && !laser->isVisible() && zoom &&
-                        zoom->property("count").toInt() == 2 && zoomText.startsWith(QStringLiteral("The camera says its zoom")) &&
+                        transport && !transport->isVisible() && laser && laser->isVisible() && laser->property("checked").toBool() &&
+                        zoom && zoom->property("count").toInt() == 2 && zoomText.startsWith(QStringLiteral("The camera says its zoom")) &&
                         bySwitch && bySwitch->isVisible() && bySwitch->property("checked").toBool() && thermal && !thermal->isVisible(),
-                    "cameras: a copy of the A20KTR shows Viewpro, the zoom it says, the thermal picture by a switch, no control link or laser",
+                    "cameras: a copy of the A20KTR shows Viewpro, the zoom it says, the thermal picture by a switch, its laser, no control link",
                     protocol ? protocol->property("text").toString() + QStringLiteral(" | ") + zoomText : QStringLiteral("no form"));
              // On 127.0.0.1, never the camera's own address: the preview reaches no network.
              setOn("vamaCameraHost", "text", QStringLiteral("127.0.0.1"));
@@ -2852,8 +2895,9 @@ int main(int argc, char *argv[])
                         cameraFileValue(file, "zoom") == QJsonValue(QStringLiteral("live")) &&
                         cameraFileValue(file, "thermalBySwitch") == QJsonValue(true) &&
                         cameraFileValue(file, "thermalVideoUrl") == QJsonValue(QString()) &&
-                        cameraFileValue(file, "transport") == QJsonValue(QStringLiteral("tcp")),
-                    "cameras: Save writes a Viewpro camera, its thermal picture by a switch", cameraTransport(file));
+                        cameraFileValue(file, "transport") == QJsonValue(QStringLiteral("tcp")) &&
+                        cameraFileValue(file, "laser") == QJsonValue(true) && cameraFileValue(file, "laserMaxM") == QJsonValue(4000.0),
+                    "cameras: Save writes a Viewpro camera, its thermal picture by a switch and its laser", cameraTransport(file));
              press("vamaCameraEditorClose");
          }},
         {300, [&]() {
@@ -2903,11 +2947,12 @@ int main(int argc, char *argv[])
              QQuickItem *zoom = findItem("vamaCameraZoom");
              QQuickItem *bySwitch = findItem("vamaCameraThermalBySwitch");
              QQuickItem *tracker = findItem("vamaCameraOwnTracker");
+             QQuickItem *laser = findItem("vamaCameraLaser");
              const QString zoomText = zoom ? zoom->property("currentText").toString() : QString();
              expect(protocol && protocol->property("text").toString() == QStringLiteral("SIYI, over UDP (as the VR10)") && zoom &&
                         zoom->property("count").toInt() == 2 && zoomText.startsWith(QStringLiteral("It zooms and does not say")) &&
-                        bySwitch && !bySwitch->isVisible() && tracker && !tracker->isVisible(),
-                    "cameras: a copy of the ZR10 shows SIYI and its zoom that says nothing, no thermal switch or tracker",
+                        bySwitch && !bySwitch->isVisible() && tracker && !tracker->isVisible() && laser && !laser->isVisible(),
+                    "cameras: a copy of the ZR10 shows SIYI and its zoom that says nothing, no thermal switch, laser or tracker",
                     protocol ? protocol->property("text").toString() + QStringLiteral(" | ") + zoomText : QStringLiteral("no form"));
              press("vamaCameraCancel");
          }},
@@ -3114,6 +3159,81 @@ int main(int argc, char *argv[])
                  return note && !note->isVisible();
              }, 7000);
              expect(gone, "photo: the note goes by itself after a few seconds", QString());
+             // B14: QGC has no save folder (Android without the Storage permission): no copy on the
+             // RC, and the note says how to allow it.
+             global.settings.app.setHasFolder(false);
+             grabsBeforeNoFolder = global.videos.grabs;
+             tap("vamaPhotoButton");
+         }},
+        {300, [&]() {
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString says = rcText ? rcText->property("text").toString() : QString();
+             expect(global.videos.grabs == grabsBeforeNoFolder &&
+                        says.startsWith(QStringLiteral("No copy on this RC: the app has no folder to save it in.")) &&
+                        says.contains(QStringLiteral("Allow Storage for VAMA GCS")),
+                    "photo without a save folder: no copy on the RC, and the note says how to allow it", says);
+             tap("vamaRecordButton");
+         }},
+        {300, [&]() {
+             QQuickItem *rcText = findItem("vamaRcNoteText");
+             const QString says = rcText ? rcText->property("text").toString() : QString();
+             expect(!global.videos.recording() && says.startsWith(QStringLiteral("No copy on this RC: the app has no folder to save it in.")),
+                    "record without a save folder: no copy on the RC, and the note says how to allow it", says);
+             global.settings.app.setHasFolder(true);
+             // B10: the app's own zoom of the picture. Its button goes 1x, 2x, 4x and back.
+             tap("vamaDigitalZoomButton");
+         }},
+        {300, [&]() {
+             QQuickItem *video = findItem("videoContent");
+             expect(link.digitalZoom() == 2.0 && video && video->scale() == 2.0,
+                    "digital zoom: its button makes it 2x, and the picture is scaled", QString::number(video ? video->scale() : 0.0));
+             shot("38_digital_zoom.png");
+             tap("vamaDigitalZoomButton");
+         }},
+        {300, [&]() {
+             expect(link.digitalZoom() == 4.0, "digital zoom: then 4x", QString::number(link.digitalZoom()));
+             tap("vamaDigitalZoomButton");
+         }},
+        {300, [&]() {
+             QQuickItem *video = findItem("videoContent");
+             expect(link.digitalZoom() == 1.0 && video && video->scale() == 1.0, "digital zoom: then 1x again",
+                    QString::number(link.digitalZoom()));
+             // A tap is a place in the whole picture: the same tap turns the camera half as far at 2x.
+             link.setPointMode(QStringLiteral("laser"));
+             camera.setYaw(0.0);
+             camera.setPitch(-30.0);
+         }},
+        {1200, [&]() {
+             // On the picture, clear of the boxes in the middle (the lock box and the notes), the
+             // gimbal buttons and QGC's telemetry.
+             QQuickItem *drag = findItem("vamaVideoDrag");
+             zoomTap = drag ? drag->mapToScene(QPointF(drag->width() * 0.78, drag->height() * 0.70)) : QPointF();
+             mouse(QEvent::MouseButtonPress, zoomTap);
+             mouse(QEvent::MouseButtonRelease, zoomTap);
+         }},
+        {2500, [&]() {
+             yawAt1x = camera.yaw();
+             camera.setYaw(0.0);
+             camera.setPitch(-30.0);
+             link.setDigitalZoom(2.0);
+         }},
+        {1200, [&]() {
+             // The link has heard the camera's angles again: a tap aims from where the camera looks.
+             mouse(QEvent::MouseButtonPress, zoomTap);
+             mouse(QEvent::MouseButtonRelease, zoomTap);
+         }},
+        {2500, [&]() {
+             const double yawAt2x = camera.yaw();
+             QQuickItem *drag = findItem("vamaVideoDrag");
+             expect(std::abs(yawAt1x) > 2.0 && std::abs(yawAt2x * 2.0 - yawAt1x) < 0.1 * std::abs(yawAt1x),
+                    "digital zoom: a tap is a place in the whole picture (at 2x the same tap turns the camera half as far)",
+                    QStringLiteral("%1 degrees at 1x, %2 at 2x; tap at %3,%4, tap area %5, point mode %6, aim %7, laser %8 "
+                                   "\"%9\", angles %10")
+                        .arg(yawAt1x).arg(yawAt2x).arg(zoomTap.x()).arg(zoomTap.y())
+                        .arg(drag && drag->property("enabled").toBool() ? QStringLiteral("on") : QStringLiteral("off"))
+                        .arg(link.pointMode()).arg(link.aimBusy()).arg(link.laserBusy()).arg(link.laserMessage())
+                        .arg(link.attitudeValid()));
+             link.setDigitalZoom(1.0);
          }},
         {100, [&]() { QCoreApplication::quit(); }},
     };

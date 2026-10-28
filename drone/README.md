@@ -15,14 +15,16 @@ drone/
     vama_wind_failsafe.md         what it does, how to install it, its parameters and messages
     vama_lock.lua                 the VAMA lock, part 1 of the firmware lock (copy it to the SD card)
     vama_lock.md                  what it does and does not stop, how to bind a drone, parameters, messages
-  gps_denied/                     GPS-denied navigation (item A8); step 1, the flight recorder for a
-                                  Raspberry Pi on the drone (see gps_denied/README.md, RECORDER.md)
+  gps_denied/                     GPS-denied navigation (item A8): step 1, the flight recorder for a
+                                  Raspberry Pi on the drone (see gps_denied/README.md, RECORDER.md),
+                                  and step 3a, our position into ArduPilot as its GPS 2 (vama_nav)
   test/
     setup_sitl.sh                 downloads the ArduCopter simulator programs (run once, inside WSL)
     sitl_session.py               starts a simulated drone and talks MAVLink to it
     wind_failsafe_test.py         flies the wind failsafe in the simulator
     lock_test.py                  tries the VAMA lock in the simulator
     recorder_sitl_test.py         flies the flight recorder against the simulator
+    gps_input_sitl_test.py        flies a mission on GPS 2 from vama_nav, with GPS 1 off
 ```
 
 ## High wind failsafe
@@ -69,6 +71,8 @@ py wind_failsafe_test.py               # all cases on both versions, about 10 mi
 py wind_failsafe_test.py 4.7.0         # one version
 py wind_failsafe_test.py -k blown      # only the cases with "blown" in their name
 py lock_test.py                        # the VAMA lock: all cases on both versions, about 3 minutes
+py recorder_sitl_test.py               # the flight recorder, both versions, in real time
+py gps_input_sitl_test.py              # GPS 2 from vama_nav, both versions, in real time, about 9 minutes
 ```
 
 Each case flies one situation and prints `PASS` or `FAIL` with the reason.
@@ -104,3 +108,6 @@ Read [gps_denied/RECORDER.md](gps_denied/RECORDER.md) (the set-up on the drone) 
 
 Short version: on a Raspberry Pi 5 with a Pi camera looking straight down and three wires to a free serial port of the Cube (MAVLink 2), `sudo bash install.sh`.
 During day flights it saves a picture a second with the drone's position and angles at that moment.
+
+Step 3a, `gps_denied/vama_nav`, gives our position to ArduPilot as its GPS 2 (`GPS_INPUT`).
+It is tried in the simulator only, and its flight controller settings are not for the drone yet: see [gps_denied/README.md](gps_denied/README.md).

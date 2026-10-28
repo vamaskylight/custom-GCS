@@ -12,8 +12,8 @@ The recorder does not control the drone. It only listens to the flight controlle
 | Part | What |
 |------|------|
 | Computer | Raspberry Pi 5 (yours has 16 GB) with Raspberry Pi OS (64-bit, Bookworm or newer) |
-| Camera | A Raspberry Pi camera on the Pi's camera port: Camera Module 3 (the normal one, not the Wide), the HQ Camera, or the Global Shutter Camera |
-| Card | A fast microSD card of 128 GB, or an NVMe SSD. One picture is about 4 MB, so 30 minutes of flight is about 7 GB |
+| Camera | A Raspberry Pi camera on the Pi's camera port. Yours is the AI Camera (Sony IMX500): it works here as a normal camera. Camera Module 3 (the normal one, not the Wide), the HQ Camera and the Global Shutter Camera work too |
+| Card | Your 64 GB card is fine to start. With the size 2028x1520 (part 6) a picture is about 1 MB: about 15 hours of flight. At the full size it is about 4 MB |
 | Power | 5 V and at least 5 A for the Pi, from its own regulator on the drone battery. A cooler on the Pi |
 | Wires | Three wires from the Pi to a free serial port of the flight controller (part 4) |
 
@@ -23,6 +23,7 @@ The recorder does not control the drone. It only listens to the flight controlle
 - On a damped mount, so the pictures are sharp.
 - Nothing of the drone in the picture (legs, propellers, the lidar).
 - Note which way the top of the picture points. If it points to the drone's nose, `mount_yaw_deg` stays 0. If it points to the right side, set 90 (part 6).
+- The AI Camera, the HQ and the Global Shutter camera have a focus ring: set it to far (infinity) by hand before mounting, and check the test picture of part 7. Camera Module 3 focuses by itself (`focus = far`).
 
 ## 3. Set up the Pi
 
@@ -79,8 +80,8 @@ The ones you may change:
 |------|------|------|
 | `device`, `baud` | `/dev/serial0`, `115200` | The serial port, and the same speed as `SERIALn_BAUD` |
 | `interval_s` | 1.0 | Seconds between two pictures |
-| `size` | full | The picture size. `2304x1296` gives pictures of about 1 MB |
-| `focus` | far | Camera Module 3: focus fixed at far. Use `none` for the HQ or Global Shutter camera |
+| `size` | full | The picture size. For the AI Camera use `2028x1520`: about 0.3 m of ground per pixel from 500 m, which is enough, and pictures of about 1 MB |
+| `focus` | far | Camera Module 3: focus fixed at far. Use `none` for the AI Camera, the HQ or the Global Shutter camera (their focus is set by hand) |
 | `mount_yaw_deg` | 0 | Which way the top of the picture points (part 2) |
 | `start_height_m` | 30 | Pictures from this height above home, while armed |
 

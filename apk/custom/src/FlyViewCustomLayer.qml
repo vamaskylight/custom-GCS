@@ -443,7 +443,7 @@ Item {
                 IconButton { icon: _iconPath + "vama_center.svg";     size: _buttonSize; onClicked: _link.center() }
                 IconButton { visible: _link.camera.zoom !== "none"; icon: _iconPath + "vama_zoom_out.svg"; size: _buttonSize; repeat: true; onClicked: _link.zoom(-1) }
                 IconButton { icon: _iconPath + "vama_down.svg";       size: _buttonSize; onClicked: _link.pointDown() }
-                IconButton { visible: _link.camera.zoom !== "none"; icon: _iconPath + "vama_zoom_reset.svg"; size: _buttonSize; onClicked: _link.zoomHome() }
+                IconButton { visible: _link.camera.zoom !== "none"; icon: _iconPath + "vama_zoom_reset.svg"; size: _buttonSize; onClicked: { _link.zoomHome(); _link.digitalZoom = 1 } }
             }
 
             // The zoom now, under the zoom column.
@@ -453,6 +453,31 @@ Item {
                 color:          "white"
                 font.bold:      true
                 text:           _link.zoomLabel
+            }
+
+            // VAMA (B10, the client 2026-10-28: "it has 22x optical zoom so can add more digital zoom in that?"):
+            // the app's own zoom of the picture on this screen, 1x, 2x, 4x and back. The camera, its
+            // recording and the copy on the RC keep the whole picture.
+            Rectangle {
+                objectName:   "vamaDigitalZoomButton"
+                x:            panelGrid.width - _buttonSize
+                width:        _buttonSize
+                height:       _buttonSize * 0.7
+                radius:       height / 2
+                color:        _link.digitalZoom > 1 ? qgcPal.colorOrange : "transparent"
+                border.color: "white"
+                border.width: 1
+
+                QGCLabel {
+                    anchors.centerIn: parent
+                    color:            "white"
+                    font.bold:        true
+                    text:             qsTr("D %1x").arg(_link.digitalZoom)
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked:    _link.digitalZoom = _link.digitalZoom >= 4 ? 1 : _link.digitalZoom * 2
+                }
             }
         }
     }
@@ -590,6 +615,11 @@ Item {
     // the RC records, and its next press stops both. The note says where the copy goes (QGC does not
     // say when a picture is written).
     property var           _videoManager:   QGroundControl.videoManager
+    // QGC saves the copies under its own folder, and has no path for them while that folder is not
+    // there: on Android 9 it needs the Storage permission (the client's SIYI MK15, 2026-10-28, had no
+    // folder and no copies until it was allowed). Then nothing is saved, so the note says why.
+    property var           _appSettings:    QGroundControl.settingsManager ? QGroundControl.settingsManager.appSettings : null
+    readonly property string _rcNoFolder:   qsTr("No copy on this RC: the app has no folder to save it in. Allow Storage for VAMA GCS in Android Settings (Apps, VAMA GCS, Permissions), then start the app again.")
     readonly property bool _rcRecording:    _videoManager ? _videoManager.recording === true : false
     readonly property bool _recordingShown: _link.recording || _rcRecording
     property string        _rcNoteText:     ""
@@ -617,6 +647,10 @@ Item {
             _showRcNote(qsTr("No copy on this RC: there is no video."))
             return
         }
+        if (_appSettings && _appSettings.photoSavePath === "") {
+            _showRcNote(_rcNoFolder)
+            return
+        }
         _videoManager.grabImage()
         _showRcNote(qsTr("A copy is saved on this RC, in its Photo folder."))
     }
@@ -632,12 +666,14 @@ Item {
             rcCopyAgainTimer.stop()
         }
         if (start && !_rcRecording) {
-            if (_videoManager.decoding === true) {
+            if (_videoManager.decoding !== true) {
+                _showRcNote(qsTr("No copy on this RC: there is no video."))
+            } else if (_appSettings && _appSettings.videoSavePath === "") {
+                _showRcNote(_rcNoFolder)
+            } else {
                 _rcCopyWanted = true
                 _rcCopyRestarts = 0
                 _videoManager.startRecording()
-            } else {
-                _showRcNote(qsTr("No copy on this RC: there is no video."))
             }
         } else if (!start && _rcRecording) {
             _videoManager.stopRecording()
@@ -1057,7 +1093,9 @@ Item {
         }
 
         // Where the picture is drawn: the same sizes QGC's video view uses
-        // for its fit setting (FlightDisplayViewVideo.qml getWidth/getHeight).
+        // for its fit setting (FlightDisplayViewVideo.qml getWidth/getHeight),
+        // and the app's own zoom about the centre (B10, FlightDisplayViewVideoOutput.qml).
+        // Taps, the lock box and the marks are parts of the whole picture.
         function _videoRect() {
             const ar = QGroundControl.videoManager.aspectRatio > 0 ? QGroundControl.videoManager.aspectRatio : 16 / 9
             const fit = QGroundControl.settingsManager.videoSettings.videoFit.rawValue
@@ -1070,6 +1108,9 @@ Item {
             if (fit === 0 || (fit === 2 && screenAr > ar) || (fit === 3 && screenAr < ar)) {
                 h = width / ar
             }
+            const zoom = _link.enabled ? _link.digitalZoom : 1
+            w *= zoom
+            h *= zoom
             return Qt.rect((width - w) / 2, (height - h) / 2, w, h)
         }
 
@@ -2127,6 +2168,7 @@ Item {
                 }
 
                 QGCLabel {
+                    objectName:       "vamaWheelStatus"
                     Layout.fillWidth: true
                     wrapMode:         Text.WordWrap
                     font.pointSize:   ScreenTools.smallFontPointSize
@@ -2137,6 +2179,9 @@ Item {
                             lines.push(qsTr("Turn the wheel all the way, both ways."))
                         } else if (_detectResult !== "") {
                             lines.push(_detectResult)
+                        } else if (_link.wheelPitchChannel <= 0 && _link.wheelYawChannel <= 0) {
+                            // The client's VPro did not turn with the wheel (2026-10-28): most likely none was chosen.
+                            lines.push(qsTr("The RC wheel is off: no channel is chosen. Choose one above, or press Detect and turn the wheel. The app reads the wheel from the drone, so the drone must be connected."))
                         }
                         var p = settingsPopup._rcText(_link.wheelPitchChannel)
                         if (p !== "") {

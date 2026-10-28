@@ -200,8 +200,9 @@ QList<Profile> builtInProfiles()
     // tilt and turn are estimates, not from a data sheet. Its thermal picture comes in the same video
     // after a sensor switch. Its thermal lens is Viewpro's: 35 mm on 640 x 512 at 12 um, 12.5 x 10.0
     // degrees (also by the sensor's size). Not "sure": how the 5:4 thermal picture sits in the 16:9
-    // video is not known, so a point on the thermal picture is placed at the cross only. No laser in
-    // the app yet. Its own tracker is not used (as in VGCS).
+    // video is not known, so a point on the thermal picture is placed at the cross only. Its laser
+    // reaches at least 3000 m on a car and 2000 m on a person, 15 m least (the maker's page): 4000 m
+    // taken. The app ranges with it as VGCS does (SkydroidLink). Its own tracker is not used (as in VGCS).
     Profile a20;
     a20.id = QStringLiteral("A20KTR");
     a20.name = QStringLiteral("VPro");
@@ -218,7 +219,7 @@ QList<Profile> builtInProfiles()
     a20.zoom = Zoom::Live;
     a20.pitchMaxDeg = 30.0;
     a20.yawLimitDeg = 150.0;
-    a20.laser = false;
+    a20.laserMaxM = 4000.0;
     a20.ownTracker = false;
 
     // The SIYI ZR10 (task AK), named "VR10" by the client (2026-10-28): SIYI's protocol over UDP
@@ -321,7 +322,7 @@ QString problem(const Profile &p)
     if (!p.thermalVideoUrl.trimmed().isEmpty() && !isRtsp(p.thermalVideoUrl.trimmed())) {
         return text("The thermal video must be an RTSP address (rtsp://...), or empty for a camera without one.");
     }
-    // Each protocol has its zooms, and the app uses no laser or tracker of a Viewpro or SIYI camera.
+    // Each protocol has its zooms. The app uses no tracker of a Viewpro or SIYI camera, and no laser of a SIYI.
     switch (p.protocol) {
     case Protocol::Top:
         if (p.zoom != Zoom::None && p.zoom != Zoom::Counted && p.zoom != Zoom::Reported && p.zoom != Zoom::Pulse) {
@@ -341,10 +342,10 @@ QString problem(const Profile &p)
     default:
         return text("The protocol must be \"skydroid-top\", \"viewpro\" or \"siyi\".");
     }
+    if (p.protocol == Protocol::Siyi && p.laser) {
+        return text("The app has no laser for a SIYI camera. Untick Laser.");
+    }
     if (p.protocol != Protocol::Top) {
-        if (p.laser) {
-            return text("The app has no laser for a VPro or SIYI camera yet. Untick Laser.");
-        }
         if (p.ownTracker) {
             return text("The app uses no tracker of a VPro or SIYI camera. Untick \"Its own object tracker\".");
         }

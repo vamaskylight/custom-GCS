@@ -228,7 +228,8 @@ def apk_built_in_cameras() -> list[Camera]:
     sheet. Its thermal picture comes in the same video after a sensor switch. Its thermal lens is
     Viewpro's (35 mm on 640 x 512 at 12 um, 12.5 x 10.0 degrees), not "sure": how the 5:4 thermal
     picture sits in the 16:9 video is not known (so a point there is placed at the cross only).
-    No laser in the APK yet, and no tracker of its own.
+    Its laser reaches at least 3000 m on a car and 2000 m on a person, 15 m least (the maker's
+    page): 4000 m taken. No tracker of its own in the APK.
 
     The ZR10, named "VR10" by the client: SIYI over UDP 37260, 71.5 x 45.2 at 1x (the ZR10 manual), a zoom that does not say
     how far it went, -90 to +25 degrees and 45 either way (the range it can be told to go).
@@ -251,7 +252,7 @@ def apk_built_in_cameras() -> list[Camera]:
             zoom=ZOOM_LIVE,
             pitch_max_deg=30.0,
             yaw_limit_deg=150.0,
-            laser=False,
+            laser_max_m=4000.0,
             own_tracker=False,
         ),
         Camera(
@@ -331,9 +332,9 @@ def problem(cam: Camera) -> str:
             PROTOCOL_VIEWPRO: "A VPro camera's zoom is none or live.",
             PROTOCOL_SIYI: "A SIYI camera's zoom is none or pulse.",
         }[cam.protocol]
+    if cam.protocol == PROTOCOL_SIYI and cam.laser:
+        return "The app has no laser for a SIYI camera. Untick Laser."
     if cam.protocol != PROTOCOL_TOP:
-        if cam.laser:
-            return "The app has no laser for a VPro or SIYI camera yet. Untick Laser."
         if cam.own_tracker:
             return 'The app uses no tracker of a VPro or SIYI camera. Untick "Its own object tracker".'
     if cam.thermal_by_switch:

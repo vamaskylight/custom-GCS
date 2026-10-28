@@ -1,7 +1,7 @@
 diff --git a/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc b/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
 --- a/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
 +++ b/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc
-@@ -167,14 +167,20 @@ void GstVideoReceiver::start(uint32_t timeout)
+@@ -167,14 +167,22 @@ void GstVideoReceiver::start(uint32_t timeout)
              break;
          }
  
@@ -13,10 +13,12 @@ diff --git a/src/VideoManager/VideoReceiver/GStreamer/GstVideoReceiver.cc b/src/
 +        // default non-leaky semantics so every frame reaches the muxer.
 +        // VAMA patch (apk/qgc-patches/0004): one second deep, not two buffers. What this queue
 +        // drops is coded video, and the decoder then shows grey, smeared blocks until the next
-+        // keyframe. Two buffers are one frame on a tee that carries NAL units (AUD and slice), so
-+        // a thread one frame late lost a frame. The SIYI RC's live picture broke while the camera
-+        // turned, and its recording from the branch below was whole (test build 15, 2026-10-28).
-+        // The queue holds data only while its thread is behind, so it adds no delay otherwise.
++        // keyframe. On a tee of NAL units two buffers are one frame (AUD and slice). The SIYI RC's
++        // live picture broke while the camera turned, and its recording from the branch below was
++        // whole (test build 15, 2026-10-28). Desktop GStreamer 1.24, a SIYI-like stream, this
++        // thread 40 to 70 ms late now and then: two buffers dropped 28 and left 14.5 s of 25 s
++        // corrupted, one second dropped nothing, with the same delay. The queue holds data only
++        // while its thread is behind.
          g_object_set(decoderQueue,
                       "leaky", 2,
 -                     "max-size-buffers", 2,

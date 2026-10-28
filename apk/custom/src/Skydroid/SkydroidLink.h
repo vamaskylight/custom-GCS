@@ -148,6 +148,10 @@ class SkydroidLink : public QObject
     Q_PROPERTY(int thermalPaletteIndex READ thermalPaletteIndex NOTIFY settingsChanged)
     Q_PROPERTY(QStringList thermalPalettes READ thermalPalettes CONSTANT)
     Q_PROPERTY(QStringList thermalPaletteNames READ thermalPaletteNames CONSTANT)
+    /// The app's own zoom of the picture on this screen (B10, digital zoom), 1x to 4x. The camera,
+    /// its recording, the copy on the RC and the pictures for the lock and the marks keep the whole
+    /// picture. Back to 1x with another camera.
+    Q_PROPERTY(double digitalZoom READ digitalZoom WRITE setDigitalZoom NOTIFY digitalZoomChanged)
 
     // Camera state
     Q_PROPERTY(bool answering READ answering NOTIFY answeringChanged)
@@ -330,6 +334,8 @@ public:
     QString thermalPalette() const { return _thermalPalette; }
     /// An unknown id means the picture as received, as in VGCS.
     void setThermalPalette(const QString &id);
+    double digitalZoom() const { return _digitalZoom; }
+    void setDigitalZoom(double zoom);
     int thermalPaletteIndex() const { return thermalPalettes().indexOf(_thermalPalette); }
 
     bool answering() const { return _answering; }
@@ -533,6 +539,7 @@ signals:
     void cameraNote(const QString &text, bool problem);
     void targetChanged();
     void thermalPictureChanged();
+    void digitalZoomChanged();
     /// A camera that switched the picture of its one video (a Viewpro, whose network stops for some
     /// seconds) answers on its video port again, or the wait for that is over: the screen opens the
     /// video again if it shows none.
@@ -557,6 +564,8 @@ private slots:
     void _checkAnswering();
     void _laserReadAfterShot();
     void _laserFinish();
+    /// A Viewpro's laser off, now or as soon as its connection is back (it is an emitter).
+    void _viewproLaserOff();
     void _motionTick();
     void _finishWheelDetect();
     void _sendWheelAngles();
@@ -749,6 +758,7 @@ private:
     QTimer _dueTimer;               // sends the rules' frames due later (a zoom stop, a hold after a jog)
     QElapsedTimer _rulesClock;
     double _liveZoomX = 0.0;        // the zoom a Viewpro says (0: not yet)
+    double _digitalZoom = 1.0;      // the screen's own zoom of the picture (B10)
     double _liveFovHDeg = 0.0;      // and its view
     double _liveFovVDeg = 0.0;
     /// A SIYI's zoom is not known: it never went back to 1x here, or zoomed in since. Its view
@@ -758,6 +768,7 @@ private:
     QTimer _answerTimer;
     QTimer _laserShotTimer;
     QTimer _laserTimeoutTimer;
+    QTimer _viewproLaserIdleTimer;  // a Viewpro's laser goes off when it fires
     QElapsedTimer _sinceReply;
     QElapsedTimer _sinceAttitude;
     QElapsedTimer _cameraMovedAt;  // since the app last moved the camera, or saw its turn go on
@@ -896,6 +907,8 @@ private:
     QString _laserMessage;
     std::optional<int> _laserFromE;  // decimeters from the laser module
     std::optional<int> _laserFromD;  // decimeters from the system address
+    std::optional<double> _laserFromViewproM;  // a Viewpro's range, measured after the shot
+    long long _viewproShotMs = -1;             // when that shot was fired
 
     // Captured when the laser fires, so the target uses the pose of the shot.
     skydroid::geo::LaserInput _shotPose;

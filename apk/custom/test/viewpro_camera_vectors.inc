@@ -174,6 +174,21 @@ const Sent kSent_sensor[] = {
 };
 CHECK_SCRIPT(sensor, false, true);
 
+// laser
+const Step kSteps_laser[] = {
+    {1000, "laser", 1.0, 0.0, ""},
+    {1100, "laser", 0.0, 0.0, ""},
+    {1200, "laser", 1.0, 0.0, ""},
+    {1300, "laser", 1.0, 0.0, ""},
+};
+const Sent kSent_laser[] = {
+    {1000, "EB901455AADC11300F000000000000000040000000006ED9"},
+    {1100, "EB901455AADC11300F0000000000000000A0000000008E59"},
+    {1200, "EB901455AADC11300F000000000000000040000000006ED9"},
+    {1300, "EB901455AADC11300F000000000000000040000000006ED9"},
+};
+CHECK_SCRIPT(laser, false, false);
+
 // the_cameras_tracker_keeps_the_gimbal
 const Step kSteps_the_cameras_tracker_keeps_the_gimbal[] = {
     {1000, "status", 0.0, 0.0, "eb902f55aadc2c40000000000000000000000000000000000000000000000067ff1bf0e38c00000000000010d61b6c000acb69"},

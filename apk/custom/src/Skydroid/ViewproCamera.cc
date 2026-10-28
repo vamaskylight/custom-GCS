@@ -188,6 +188,14 @@ Bytes Camera::setSensor(bool ir)
     return encodeGimbalCameraCommand(c);
 }
 
+Bytes Camera::setLaser(bool on)
+{
+    GimbalCameraCommand c;
+    c.c1Lrf = on ? kLrfContinuousStart : kLrfStop;
+    m_laserOn = on;
+    return encodeGimbalCameraCommand(c);
+}
+
 Bytes Camera::poll() const
 {
     return encodeHeartbeat();

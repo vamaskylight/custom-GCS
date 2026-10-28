@@ -64,6 +64,15 @@ constexpr int kAnswerTimeoutMs = 3000;   // no reply this long = camera not answ
 constexpr int kAttitudeFreshMs = 1500;   // older angles: send GAA again and try other addresses
 constexpr int kLaserShotSettleMs = 120;  // VGCS _LRF_SLR_SHOT_SETTLE_S
 constexpr int kLaserWaitMs = 1000;
+// A Viewpro's laser, as VGCS ranges with it (camera_control.py, field data 2026-08-04 and 08-17):
+// continuous ranging, and a range measured after the shot within 3 s when it ranges already, 10 s
+// when it has to start (its first ranges came after 2.0 to 5.6 s), with its start once more after
+// 2 s. Off 10 s after the last shot (VGCS _LRF_IDLE_STOP_S).
+constexpr int kViewproLaserWarmMs = 3000;
+constexpr int kViewproLaserColdMs = 10000;
+constexpr int kViewproLaserRestartMs = 2000;
+constexpr int kViewproLaserIdleMs = 10000;
+constexpr double kDigitalZoomMax = 4.0;  // the screen's own zoom of the picture (B10)
 constexpr int kZoomQueryAfterCmdMs = 350;  // VGCS _DZM_POLL_AFTER_CMD_S
 constexpr int kZoomHomeExtraSteps = 5;   // "1x" steps out this many more than counted
 constexpr int kZoomOutIntervalMs = 60;
@@ -380,6 +389,8 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _laserShotTimer.setInterval(kLaserShotSettleMs);
     _laserTimeoutTimer.setSingleShot(true);
     _laserTimeoutTimer.setInterval(kLaserWaitMs);
+    _viewproLaserIdleTimer.setSingleShot(true);
+    _viewproLaserIdleTimer.setInterval(kViewproLaserIdleMs);
     _motionTimer.setInterval(kMotionIntervalMs);
     _wheelAngleTimer.setSingleShot(true);
     _detectTimer.setSingleShot(true);
@@ -408,6 +419,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_answerTimer, &QTimer::timeout, this, &SkydroidLink::_checkAnswering);
     connect(&_laserShotTimer, &QTimer::timeout, this, &SkydroidLink::_laserReadAfterShot);
     connect(&_laserTimeoutTimer, &QTimer::timeout, this, &SkydroidLink::_laserFinish);
+    connect(&_viewproLaserIdleTimer, &QTimer::timeout, this, &SkydroidLink::_viewproLaserOff);
     connect(&_motionTimer, &QTimer::timeout, this, &SkydroidLink::_motionTick);
     connect(&_wheelAngleTimer, &QTimer::timeout, this, &SkydroidLink::_sendWheelAngles);
     connect(&_detectTimer, &QTimer::timeout, this, &SkydroidLink::_finishWheelDetect);
@@ -718,10 +730,12 @@ void SkydroidLink::_useCamera(const camera::Profile &profile, bool withAddresses
         _lensStopTimer.stop();
         _lensHomeTimer.stop();
     }
+    _viewproLaserOff();  // a Viewpro's laser too, while it is still the camera
     _videoWaitTimer.stop();  // another camera: its video is not the one that was waited for
     _dropVideoProbe();
     _camera = profile;
     _applyModel();
+    setDigitalZoom(1.0);  // another camera: its whole picture
     if (_camera.thermalBySwitch) {
         setThermalPicture(false);  // taken to start on its day picture (the screen does not switch an address)
     }
@@ -868,6 +882,17 @@ void SkydroidLink::setThermalPalette(const QString &id)
     _thermalPalette = palette;
     _saveSettings();
     emit settingsChanged();
+}
+
+void SkydroidLink::setDigitalZoom(double zoom)
+{
+    // More than 4x of a picture only blurs it.
+    const double z = std::isfinite(zoom) ? std::clamp(zoom, 1.0, kDigitalZoomMax) : 1.0;
+    if (z == _digitalZoom) {
+        return;
+    }
+    _digitalZoom = z;
+    emit digitalZoomChanged();
 }
 
 void SkydroidLink::_applyModel()
@@ -1070,10 +1095,11 @@ void SkydroidLink::_stop()
     _answerTimer.stop();
     _laserShotTimer.stop();
     _laserTimeoutTimer.stop();
+    _viewproLaserOff();  // never leave a Viewpro's laser on when the link goes away
     _tcpRetryTimer.stop();
     _videoWaitTimer.stop();
     _dropVideoProbe();
-    _closeTcp();  // after the stop above: it goes out over TCP too
+    _closeTcp();  // after the stops above: they go out over TCP too
     if (_socket) {
         _socket->close();
         _socket->deleteLater();
@@ -1178,6 +1204,11 @@ void SkydroidLink::_openTcp()
         // the connection exists (measured 2026-10-26), so a jog could wait for the camera's ACK.
         _tcp->setSocketOption(QAbstractSocket::LowDelayOption, 1);
         if (_camera.protocol == camera::Protocol::Viewpro) {
+            if (_viewpro.laserOn()) {
+                // It may still range from before the connection went (a sensor switch takes its
+                // network for seconds), or never got its start: off, and the next shot starts it.
+                _sendBytes(_viewpro.setLaser(false));
+            }
             _sendBytes(_viewpro.poll());  // its status at once
             return;
         }
@@ -1402,6 +1433,13 @@ void SkydroidLink::_takeViewproStatus()
     // Whether it records, as the camera says (the RC's own button can start it too).
     if (status->camera && _camera.record) {
         _recordAnswered(_viewpro.recording());
+    }
+    // A shot takes the first range measured after it, within the camera's laser range (VGCS too
+    // waits for a range newer than the shot: an older one belongs to where the camera looked before).
+    const std::optional<double> rangeM = _viewpro.rangeM();
+    if (_laserBusy && rangeM && _viewpro.rangeMs() > _viewproShotMs && *rangeM <= _camera.laserMaxM) {
+        _laserFromViewproM = rangeM;
+        _laserFinish();
     }
 }
 
@@ -3822,18 +3860,37 @@ void SkydroidLink::_fireLaser(bool keepLastResult)
     emit laserBusyChanged();
     emit laserChanged();
 
+    if (_camera.protocol == camera::Protocol::Viewpro) {
+        // Continuous ranging, as VGCS ranges (its single shots came back with nothing in the
+        // field). Only a range measured after this moment counts (_takeViewproStatus). The laser
+        // stays on for the next shot, and goes off when none came for a while.
+        _viewproLaserIdleTimer.stop();
+        const bool ranging = _viewpro.laserOn();
+        _laserFromViewproM.reset();
+        _viewproShotMs = _nowMs();
+        if (!ranging) {
+            _sendBytes(_viewpro.setLaser(true));
+            _laserShotTimer.start(kViewproLaserRestartMs);
+        }
+        _laserTimeoutTimer.start(ranging ? kViewproLaserWarmMs : kViewproLaserColdMs);
+        return;
+    }
     // VGCS order: fire the shot at the laser module (E), read, settle, read again.
     for (const Endpoint &endpoint : _laserEndpoints()) {
         _sendTo(endpoint, top::buildSlrTrigger('E', _options));
         _sendTo(endpoint, top::buildSlrQuery('E', _options));
     }
-    _laserShotTimer.start();
-    _laserTimeoutTimer.start();
+    _laserShotTimer.start(kLaserShotSettleMs);
+    _laserTimeoutTimer.start(kLaserWaitMs);
 }
 
 void SkydroidLink::_laserReadAfterShot()
 {
     if (!_laserBusy) {
+        return;
+    }
+    if (_camera.protocol == camera::Protocol::Viewpro) {
+        _sendBytes(_viewpro.setLaser(true));  // its start once more: it may have been lost (VGCS)
         return;
     }
     for (const Endpoint &endpoint : _laserEndpoints()) {
@@ -3850,21 +3907,44 @@ void SkydroidLink::_laserFinish()
     _laserShotTimer.stop();
     _laserTimeoutTimer.stop();
 
-    // Prefer the laser module (E); the system address (D) is the fallback.
-    const std::optional<int> dm = _laserFromE ? _laserFromE : _laserFromD;
-    if (dm) {
+    // Prefer the laser module (E); the system address (D) is the fallback. A Viewpro says its range in its status.
+    const bool viewpro = _camera.protocol == camera::Protocol::Viewpro;
+    std::optional<double> rangeM = _laserFromViewproM;
+    if (!viewpro) {
+        const std::optional<int> dm = _laserFromE ? _laserFromE : _laserFromD;
+        rangeM = dm ? std::optional<double>(*dm / 10.0) : std::nullopt;
+    }
+    if (rangeM) {
         _laserValid = true;
-        _laserRangeM = *dm / 10.0;
+        _laserRangeM = *rangeM;
         _laserMessage.clear();
+    } else if (viewpro) {
+        _laserValid = false;
+        _laserMessage = tr("No laser reading. The target may be too near or farther than %1 m, or the laser did not answer.")
+                            .arg(static_cast<int>(_camera.laserMaxM));
     } else {
         _laserValid = false;
         _laserMessage = tr("No laser reading. The target may be out of range (5 to %1 m), or the laser did not answer.")
                             .arg(_options.slrMaxDm / 10);
     }
     _laserBusy = false;
+    if (viewpro) {
+        _viewproLaserIdleTimer.start();
+    }
     emit laserBusyChanged();
     emit laserChanged();
     _computeTarget();
+}
+
+void SkydroidLink::_viewproLaserOff()
+{
+    // From the idle wait (never during a shot: a shot stops it, its end starts it), and when the
+    // link stops or another camera is chosen, also during a shot. Without a connection it stays
+    // "on" here, so the off goes out when the connection is back.
+    _viewproLaserIdleTimer.stop();
+    if (_viewpro.laserOn() && _tcp && _tcp->state() == QAbstractSocket::ConnectedState) {
+        _sendBytes(_viewpro.setLaser(false));
+    }
 }
 
 bool SkydroidLink::_sampleVehiclePose(skydroid::geo::LaserInput &pose, QString &why) const
