@@ -29,6 +29,11 @@ class Shot:
     lens_position: float | None = None
     _save: Callable[[Path], None] | None = field(default=None, repr=False)
     _release: Callable[[], None] | None = field(default=None, repr=False)
+    _pixels: Callable[[], object] | None = field(default=None, repr=False)
+
+    def pixels(self):
+        """The picture as a numpy array (for the matching), or None. Before save or discard."""
+        return self._pixels() if self._pixels is not None else None
 
     def save(self, path: Path) -> None:
         """Write the picture. The shot is finished after this, saved or not."""
@@ -102,7 +107,8 @@ class PiCamera:
         return Shot(sensor_ns=int(sensor_ns) if sensor_ns else time.monotonic_ns(), extension="jpg",
                     exposure_us=md.get("ExposureTime"), gain=md.get("AnalogueGain"),
                     lens_position=md.get("LensPosition"),
-                    _save=lambda path: request.save("main", str(path)), _release=request.release)
+                    _save=lambda path: request.save("main", str(path)), _release=request.release,
+                    _pixels=lambda: request.make_array("main"))
 
     def stop(self) -> None:
         cam, self._cam = self._cam, None

@@ -156,6 +156,16 @@ class Telemetry:
         with self._lock:
             return self.clock.boot_ms(local_ns)
 
+    def local_ns_at(self, boot_ms: float) -> int | None:
+        """This computer's clock at the controller's ``boot_ms`` (near the newest messages)."""
+        with self._lock:
+            return self.clock.local_ns(boot_ms)
+
+    def newest_position_ms(self) -> float | None:
+        """The controller's time of its newest position (GLOBAL_POSITION_INT), or None."""
+        with self._lock:
+            return float(self._position[-1][0]) if self._position else None
+
     def offset_ms(self) -> float | None:
         with self._lock:
             offset = self.clock.offset_ns
