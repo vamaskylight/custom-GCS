@@ -4,7 +4,7 @@ The drone's own position will come from the down camera's pictures, matched with
 The program takes two pictures a second.
 This check tells whether the Pi 5 is fast enough for that.
 
-It takes about two minutes on the bench.
+It takes about two minutes on the bench. It draws its pictures as from 500 m, the planned height.
 It needs no camera, no flight controller and no flight.
 Nothing is sent to the drone: the program draws its own pictures from aerial photos and matches them, one after the other, as in flight.
 
@@ -34,9 +34,9 @@ venv/bin/python -m vama_nav.bench --map ~/vama-test-maps/davis-2020-z17.mbtiles 
 It prints about ten lines, for example from my PC:
 
 ```
-positions: 40 of 40, off by middle 0.8 m, 1 in 10 over 1.4, worst 1.7 m
-time a picture: middle 0.085 s, 1 in 10 over 0.117, worst 0.145 s
-one matching thread: about 11.8 pictures a second
+positions: 40 of 40, off by middle 0.9 m, 1 in 10 over 1.3, worst 2.3 m
+time a picture: middle 0.147 s, 1 in 10 over 0.183, worst 0.205 s
+one matching thread: about 6.8 pictures a second
 two pictures a second (vama_nav's default): yes
 ```
 

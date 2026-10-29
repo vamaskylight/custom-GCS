@@ -6,7 +6,7 @@ the drone would see at the simulator's true position and angles, from aerial pho
 drone's map is the same place photographed in 2020, so the pictures and the map differ as the
 real ground and a map do. vama_nav matches each picture with the map and sends the position as GPS 2.
 
-The drone flies a mission at 300 m over east Davis, California (the test photos, see
+The drone flies a mission at 300 m (or --height-m) over east Davis, California (the test photos, see
 fetch_test_map.py). Its real GPS is switched off for two legs of 800 m, during which the ground
 shows nothing for a few seconds (fog, water), and on again.
 
@@ -20,6 +20,9 @@ Usage:
                                          with PyTorch and XFeat (vama_nav/xfeat_match.py) to run this test
     py matching_sitl_test.py 4.7.0 --interval 1
                                          one picture a second (vama_nav --interval-s 1; its default is 0.5)
+    py matching_sitl_test.py 4.7.0 --height-m 500 --wind-mps 8 [--wind-from-deg 270] [--gusts-mps 2]
+                                         the client's height and wind (full from 60 m up, none on the ground;
+                                         from the west by default: headwind on the west leg)
     py matching_sitl_test.py 4.7.0 --keep
                                          the work folder stays (the results, the tracks, the angles in
                                          attitude.csv, the recorded flight); a failed case always keeps it
@@ -59,7 +62,7 @@ VERSIONS = ["4.6.2", "4.7.0"]
 SENDER_PORT = 5763
 HOME = (38.5375, -121.7135)                # east Davis: the edge of the town and the orchards
 HOME_ALT_M = 15.0
-ALT_M = 300.0
+ALT_M = 300.0                              # --height-m: the flight's height above home
 LEG_M = 800.0
 SPEED_MPS = 12.0                           # the client's speed
 MAP, GROUND = "davis-2020-z17", "davis-2022-z18"
@@ -67,17 +70,27 @@ FEATURES = "orb"                           # --features: the matcher (vama_nav -
 KEEP = False                               # --keep: the work folder stays also when the case passes
 INTERVAL_S = 0.5                           # --interval S: seconds between two pictures (vama_nav --interval-s, its default)
 BLANK_S = 4.0
+WIND_MPS, WIND_FROM_DEG, GUSTS_MPS = 0.0, 270.0, 0.0   # --wind-mps, --wind-from-deg, --gusts-mps
 FLY_PARAMS = {"WPNAV_SPEED": SPEED_MPS * 100, "WPNAV_SPEED_UP": 500, "WPNAV_SPEED_DN": 500, "FENCE_ENABLE": 0}
-# (command, (param 1 to 4), metres north and east of home, height). Take-off and RTL have no place.
-MISSION = [
-    (16, (0, 0, 0, 0), 0.0, 0.0, 0.0),                 # 0: home (the drone keeps its own)
-    (22, (0, 0, 0, 0), None, None, ALT_M),             # 1: take off to 300 m
-    (16, (0, 0, 0, 0), LEG_M, 0.0, ALT_M),             # 2: WP1, north through the town
-    (16, (0, 0, 0, 0), LEG_M, -LEG_M, ALT_M),          # 3: WP2, west
-    (16, (0, 0, 0, 0), 0.0, -LEG_M, ALT_M),            # 4: WP3, south
-    (16, (0, 0, 0, 0), 0.0, 0.0, ALT_M),               # 5: WP4, east, back over home
-    (20, (0, 0, 0, 0), None, None, 0.0),               # 6: RTL
-]
+
+
+def leg_s(distance_m: float, calm_s: float) -> float:
+    """How long the test waits for a leg: as set for calm air, and in wind as for 1.5 m/s over the ground (the
+    simulator's quadcopter, leaning its 30 degrees, made only 2.2 m/s into 8 m/s of wind)."""
+    return calm_s if WIND_MPS <= 0 else max(calm_s, distance_m / 1.5 + 60.0)
+
+
+def mission(alt_m: float) -> list[tuple]:
+    """(command, (param 1 to 4), metres north and east of home, height). Take-off and RTL have no place."""
+    return [
+        (16, (0, 0, 0, 0), 0.0, 0.0, 0.0),             # 0: home (the drone keeps its own)
+        (22, (0, 0, 0, 0), None, None, alt_m),         # 1: take off to the flight's height
+        (16, (0, 0, 0, 0), LEG_M, 0.0, alt_m),         # 2: WP1, north through the town
+        (16, (0, 0, 0, 0), LEG_M, -LEG_M, alt_m),      # 3: WP2, west
+        (16, (0, 0, 0, 0), 0.0, -LEG_M, alt_m),        # 4: WP3, south
+        (16, (0, 0, 0, 0), 0.0, 0.0, alt_m),           # 5: WP4, east, back over home
+        (20, (0, 0, 0, 0), None, None, 0.0),           # 6: RTL
+    ]
 
 
 def place(north_m: float, east_m: float) -> tuple[float, float]:
@@ -196,7 +209,7 @@ def spread(values: list[float]) -> str:
 
 
 def mission_on_matched_positions(version: str, r: Report) -> None:
-    """GPS 2 is GPS 1 passed on while disarmed; above 50 m it carries matched positions, near the true position while GPS 1 works; with GPS 1 off for two legs of 800 m at 300 m and 12 m/s the mission flies on them, through a few seconds of blank ground; GPS 1 back is taken again; the drone lands; the port stays private and the messages keep their rate."""
+    """GPS 2 is GPS 1 passed on while disarmed; above 50 m it carries matched positions, near the true position while GPS 1 works; with GPS 1 off for two legs of 800 m at the flight's height and 12 m/s the mission flies on them, through a few seconds of blank ground; GPS 1 back is taken again; the drone lands; the port stays private and the messages keep their rate."""
     missing = [name for name in (MAP, GROUND) if not path_of(name).is_file()]
     if missing:
         r.check(False, f"the test maps are not there ({', '.join(missing)}): run py fetch_test_map.py once "
@@ -205,7 +218,10 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
     work = pathlib.Path(tempfile.mkdtemp(prefix="vama-match-A-"))
     ctl = work / "control.json"
     control(ctl)
-    params = {"RC_OVERRIDE_TIME": -1, "SIM_WIND_SPD": 0, **NAV_PARAMS, **PRIVATE[version[:3]], **FLY_PARAMS}
+    # SIM_WIND_T 0 (the default): the full wind from SIM_WIND_T_ALT (60 m) up, less and less below it to none on
+    # the ground, as real wind. With the same wind on the ground (1) the landed drone was never seen as landed.
+    wind = {"SIM_WIND_SPD": WIND_MPS, "SIM_WIND_DIR": WIND_FROM_DEG, "SIM_WIND_T": 0, "SIM_WIND_TURB": GUSTS_MPS}
+    params = {"RC_OVERRIDE_TIME": -1, **wind, **NAV_PARAMS, **PRIVATE[version[:3]], **FLY_PARAMS}
     sim = Sitl(version, {}, params, speedup=1, home=f"{HOME[0]},{HOME[1]},{HOME_ALT_M:g},0")
     proc = None
     log_path = work / "nav.log"
@@ -238,16 +254,16 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
         r.check(any(t > started and fix >= 3 for t, fix, *_ in w.gps2),
                 "disarmed, GPS 2 has a 3D fix: vama_nav passes GPS 1 on")
 
-        r.check(upload(sim, MISSION) == 0, "mission accepted (take-off to 300 m, 4 legs of 800 m, RTL)")
+        r.check(upload(sim, mission(ALT_M)) == 0, f"mission accepted (take-off to {ALT_M:g} m, 4 legs of 800 m, RTL)")
         sim.arm_and_takeoff(8)
         r.check(sim.armed, "the drone arms with GPS 2 set up and vama_nav running")
         sim.rc(rc3=1500)
         sim.set_mode("AUTO")
-        sim.pump(150, until=lambda last: w.mission_seq >= 2 and w.height() > ALT_M - 5)
+        sim.pump(max(150.0, 60.0 + ALT_M / 3.0), until=lambda last: w.mission_seq >= 2 and w.height() > ALT_M - 5)
         r.check(w.mission_seq >= 2 and w.height() > ALT_M - 5, f"climbed to {w.height():.0f} m in AUTO")
 
         # GPS 1 works on the way to WP1: the matched positions reach GPS 2, and how near they are.
-        sim.pump(120, until=lambda last: w.mission_seq >= 3)
+        sim.pump(leg_s(LEG_M, 120.0), until=lambda last: w.mission_seq >= 3)
         r.check(w.mission_seq >= 3, "WP1 reached (800 m north)")
         on_gps1 = w.errors(w.gps2, started + 60_000_000_000, time.monotonic_ns(), fixes=(3,))
         r.check(len(on_gps1) >= 30 and statistics.median(on_gps1) < 5.0 and max(on_gps1) < 15.0,
@@ -261,18 +277,18 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
         set_gps1(sim, False)
         gps_off = time.monotonic_ns()
         off_since = sim.sim_s
-        sim.pump(150, until=lambda last: w.mission_seq >= 4 or not sim.armed)
+        sim.pump(leg_s(LEG_M, 150.0), until=lambda last: w.mission_seq >= 4 or not sim.armed)
         r.check(w.mission_seq >= 4, f"GPS 1 off at WP1: the drone flew to WP2 on the matched positions "
                                     f"({(time.monotonic_ns() - gps_off) / 1e9:.0f} s)")
         # Halfway to WP3 the ground shows nothing for a few seconds: no position, then positions again.
-        sim.pump(40, until=lambda last: w.truth and metres_between(*place(LEG_M / 2, -LEG_M),
+        sim.pump(leg_s(LEG_M / 2, 40.0), until=lambda last: w.truth and metres_between(*place(LEG_M / 2, -LEG_M),
                                                                    w.truth[-1][1], w.truth[-1][2]) < 30)
         control(ctl, blank=True)
         blank_from = time.monotonic_ns()
         sim.pump(BLANK_S)
         control(ctl)
         blank_to = time.monotonic_ns()
-        sim.pump(120, until=lambda last: w.mission_seq >= 5 or not sim.armed)
+        sim.pump(leg_s(LEG_M / 2, 120.0), until=lambda last: w.mission_seq >= 5 or not sim.armed)
         wp3 = time.monotonic_ns()
         r.check(w.mission_seq >= 5, f"... and on to WP3 ({(wp3 - gps_off) / 1e9:.0f} s with GPS 1 off, "
                                     f"mission item {w.mission_seq})")
@@ -317,7 +333,7 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
         back = w.ekf_errors(gps_on + 9_000_000_000, time.monotonic_ns())
         r.check(bool(back) and max(back) < 2.0, f"GPS 1 back at WP3: taken again ({summary(back)})")
 
-        sim.pump(400, until=lambda last: not sim.armed)
+        sim.pump(leg_s(LEG_M, 400.0) + (ALT_M / 3.0 if WIND_MPS > 0 else 0.0), until=lambda last: not sim.armed)
         r.check(not sim.armed, f"back home, landed and disarmed (mode {sim.mode})")
         r.check(w.forwarded == 0, f"vama_nav's port is private: none of its messages reached this port "
                                   f"({w.forwarded} did)")
@@ -390,7 +406,7 @@ CASES = [mission_on_matched_positions]
 
 
 def main(argv: list[str]) -> int:
-    global MAP, FEATURES, KEEP, INTERVAL_S
+    global MAP, FEATURES, KEEP, INTERVAL_S, ALT_M, WIND_MPS, WIND_FROM_DEG, GUSTS_MPS
     KEEP = "--keep" in argv
     for i, a in enumerate(argv[:-1]):
         if a == "--map":
@@ -399,8 +415,17 @@ def main(argv: list[str]) -> int:
             FEATURES = argv[i + 1]
         elif a == "--interval":
             INTERVAL_S = float(argv[i + 1])
+        elif a == "--height-m":
+            ALT_M = float(argv[i + 1])
+        elif a == "--wind-mps":
+            WIND_MPS = float(argv[i + 1])
+        elif a == "--wind-from-deg":
+            WIND_FROM_DEG = float(argv[i + 1])
+        elif a == "--gusts-mps":
+            GUSTS_MPS = float(argv[i + 1])
     versions = [a for a in argv if re.fullmatch(r"\d+\.\d+\.\d+", a)] or VERSIONS
-    print(f"map {MAP}, the camera sees {GROUND}, features {FEATURES}, a picture each {INTERVAL_S:g} s")
+    print(f"map {MAP}, the camera sees {GROUND}, features {FEATURES}, a picture each {INTERVAL_S:g} s, at {ALT_M:g} m, "
+          f"wind {WIND_MPS:g} m/s from {WIND_FROM_DEG:g} degrees, gusts {GUSTS_MPS:g} m/s")
     failed_cases = 0
     began = time.monotonic()
     for version in versions:

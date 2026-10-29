@@ -3,7 +3,7 @@ how many pictures a second the drone's computer can match (vama_nav takes two a 
 
 No camera and no flight controller, nothing is sent anywhere: the pictures are drawn from aerial
 photos (the test photos of fetch_test_map.py, or any MBTiles map) as the simulator's stand-in camera
-draws them, along a straight flight at 300 m and 12 m/s, and matched with the map one after the other
+draws them, along a straight flight at 500 m and 12 m/s, and matched with the map one after the other
 as in flight (the movement between pictures too). The picture is the AI Camera's, 2028 x 1520.
 
     python -m vama_nav.bench --map davis-2020-z17.mbtiles --ground davis-2022-z18.mbtiles [--features xfeat]
@@ -57,7 +57,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--pictures", type=int, default=40, help="how many (default 40, about a minute on a Pi)")
     p.add_argument("--picture", type=_size, default=(2028, 1520), help="picture size (default 2028x1520)")
     p.add_argument("--hfov-deg", type=float, default=66.0, help="the lens's field of view across the picture")
-    p.add_argument("--height-m", type=float, default=300.0)
+    p.add_argument("--height-m", type=float, default=500.0,
+                   help="the flight's height (default 500 m, the client's: a picture takes about twice as long as from 300 m)")
     p.add_argument("--speed-mps", type=float, default=12.0)
     p.add_argument("--interval-s", type=float, default=0.5, help="the pictures' spacing in flight (vama_nav's default)")
     p.add_argument("--threads", type=int, help="OpenCV's threads (default: as it starts)")
