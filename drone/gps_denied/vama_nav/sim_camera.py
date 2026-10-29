@@ -134,16 +134,19 @@ class SimCamera:
         if truth is None or self.clock() - truth[0] > TRUTH_MAX_AGE_NS:
             raise CameraError("no SIM_STATE from the simulator")
         t, lat, lon, alt, roll, pitch, yaw = truth
-        width, height = self.size
-        picture = None
-        if not self.blank:
-            picture = render(self.world, self.lens, Pose(roll, pitch, yaw, max(alt - ground, 1.0)), lat, lon, width, height)
-        if picture is None:
-            picture = np.full((height, width), 128, np.uint8)
-        picture = self._as_camera(picture)
+        picture = self.draw(Pose(roll, pitch, yaw, max(alt - ground, 1.0)), lat, lon, blank=self.blank)
         self.taken += 1
         return Shot(sensor_ns=t, extension="jpg", exposure_us=1000, gain=1.0,
                     _save=lambda path: self._save(path, picture), _pixels=lambda: picture)
+
+    def draw(self, pose: Pose, lat: float, lon: float, blank: bool = False) -> np.ndarray:
+        """What the camera would see from ``pose`` above (lat, lon): the world drawn, a little blur,
+        uneven light and the sensor's noise. Grey where the world has no picture (or ``blank``)."""
+        width, height = self.size
+        picture = None if blank else render(self.world, self.lens, pose, lat, lon, width, height)
+        if picture is None:
+            picture = np.full((height, width), 128, np.uint8)
+        return self._as_camera(picture)
 
     def _as_camera(self, picture: np.ndarray) -> np.ndarray:
         h, w = picture.shape

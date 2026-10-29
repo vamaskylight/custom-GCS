@@ -21,6 +21,7 @@ The steps:
 gps_denied/
   README.md                  this file
   RECORDER.md                the set-up and use, for the team on the drone
+  BENCH.md                   the matching's speed on their Pi, for the team on the drone (vama_nav.bench)
   recorder.ini               the settings, each with a note (installed as /etc/vama-recorder.ini)
   install.sh                 installs the recorder on the Raspberry Pi as a service
   vama-recorder.service      the service
@@ -47,6 +48,7 @@ gps_denied/
     match_source.py            the camera, the matching and the fixes, in their own threads
     recording.py               --record: the recorder's flight folders from the same pictures
     replay.py                  step 2: python -m vama_nav.replay FLIGHT... --map MAP.mbtiles
+    bench.py                   python -m vama_nav.bench: how fast this computer matches pictures (no camera, no link)
     sim_camera.py              the stand-in camera for the simulator: the ground drawn from a map
     sim_truth.py               step 3a's stand-in: the simulator's true position with noise
 ```
@@ -203,6 +205,13 @@ With GPS 1 off it tipped 8 degrees a second (middle, by the gyro), against 0.2 w
 The speed between two pictures is not sent while the drone tips that fast (over 0.8 m/s of possible error), so it went out for only 30 of 164 pictures, and the EKF swung further.
 Step 2 on that flight: a position for 466 of 519 pictures, middle 2.4 m, worst 14.5 m (the summer map with ORB: 499 of 516, middle 1.8 m, worst 4.9 m).
 
+Flown again on 2026-10-30 with the gyros' turn between pictures and two pictures a second (see "Step 3b"), it passed every check.
+The EKF stayed within 1.9 m (middle) and 5.4 m (worst), 5.4 m also after the blank, and the matched positions were 1.75 m off (middle) instead of 3.2 m.
+With GPS 1 off the drone tipped 3.8 degrees a second (middle; 1 in 10 over 12), still more than on the summer map with ORB (1.6).
+XFeat took 0.29 s a picture here, so about 1.8 fixes a second came through (310 in 174 s), with this PC's own programs keeping it 30 to 57 % busy.
+Step 2 on that flight: a position for 927 of 1046 pictures, middle 2.1 m, worst 10.4 m.
+One flight before and one after: how much is the change and how much the flight is not known.
+
 The best map is still one of the same season, or the client's own survey flight of the area (made into map tiles).
 
 ### Running it
@@ -285,6 +294,19 @@ What it took, each found in the simulator on the way:
 - Taken as they come, the gyros' rates made the shift worse in turns (twice the error of no correction): they are about 11 ms late through the gyros' filter.
 - A speed from the shift's mean alone, brought to the picture's moment by the flight controller's own speed change, was nearer the truth on paper (0.26 against 0.40 m/s). But it tells the EKF its speed error of a second or more ago as if it were now: flown, the drone tipped 7.9 degrees a second and the EKF was 11 m off. The flight controller's speed plus the shift's correction stays.
 
+### The matching's speed (vama_nav.bench)
+
+```bash
+python -m vama_nav.bench --map davis-2020-z17.mbtiles --ground davis-2022-z18.mbtiles [--features xfeat]
+```
+
+It draws 40 pictures of 2028 x 1520 (the AI Camera's) from the ground photos, along a straight flight at 300 m and 12 m/s, and matches them with the map one after the other, as in flight.
+No camera and no flight controller: nothing is sent anywhere.
+It prints the computer, how many pictures gave a position and how close, each stage's time, and how many pictures a second one matching thread manages.
+Two pictures a second (the default) want a picture in under 0.4 s, which leaves room for the camera and the rest.
+On this PC (2026-10-30, 16 processors, with its own programs keeping it 30 to 50 % busy): ORB 0.085 s a picture (middle; about 12 a second), positions 0.8 m off; XFeat 0.24 s (about 4 a second), 2.1 m off on the summer map and 0.9 m on Esri's winter map.
+`BENCH.md` is the guide for the team on the drone, to run it on their Pi 5. On the Pi it needs `python3-opencv` (the recorder's install does not have it), the `vama_nav` folder beside `vama_recorder`, and the two test maps (about 9 MB); XFeat also PyTorch.
+
 ### Open for step 3
 
 - Hills: the height above the ground is the flight controller's height above home, corrected by what the matches show (at most 25 percent). Steep ground needs ground heights.
@@ -292,8 +314,8 @@ What it took, each found in the simulator on the way:
 - The Pi camera's pictures for the matching (picamera2) are written but not tried. The matching's speed on the Pi 5 is not measured.
 - Water, fog, night and fields without features give no position. Over these the flight controller holds a few seconds, then its EKF failsafe acts.
 - Where the map pictures for the client's area come from, and their licence.
-- A map of another season gives no position with ORB (see "The map"). XFeat finds it, and in the simulator the drone flew on it, less exactly (the EKF up to 13.7 m off, one check failed). Its speed on the Pi 5 is not measured: at 0.3 s a picture here, the Pi may need fewer points or the Hailo.
-- On camera positions the drone still tips 5 to 8 times as much as on GPS 1 (1.1 to 1.6 against 0.2 degrees a second, middle, at two pictures a second with the gyros' turn). Whether the Pi 5 matches two pictures a second is not measured; if not, it skips pictures by itself. The winter map's flight with XFeat (8 degrees a second, one check failed) is not flown again yet.
+- A map of another season gives no position with ORB (see "The map"). XFeat finds it, and in the simulator the drone flew on it and passed every check (with the gyros' turn and two pictures a second; before them one check failed). Its speed on the Pi 5 is not measured: at 0.3 s a picture here, the Pi may need fewer points or the Hailo.
+- On camera positions the drone still tips 5 to 8 times as much as on GPS 1 (1.1 to 1.6 against 0.2 degrees a second, middle, at two pictures a second with the gyros' turn). Whether the Pi 5 matches two pictures a second is not measured yet (the bench check, `BENCH.md`, measures it); if not, it skips pictures by itself. On the winter map with XFeat it tipped 3.8 degrees a second.
 - The app (step 4): show GPS 2 and where the position comes from.
 
 ## Step 2: the matching on recorded flights (vama_nav.replay)
@@ -319,6 +341,7 @@ The other options are those of `vama_nav` (`--features`, `--hfov-deg`, the mount
 - `tests/test_gps_denied_nav.py` (local): each GPS_INPUT as ArduPilot decodes it, what is sent when, the settings check, step 3a's stand-in, the link loop on a stand-in link and clock, the command line.
 - `../test/gps_input_sitl_test.py`: the sender as its own program against the ArduCopter simulator (4.6.2 and 4.7.0) in real time. Without the sender the drone does not arm. A mission in AUTO: GPS 1 off for two legs of 250 m (flown on the camera's positions), back on, then both gone (the EKF failsafe lands the drone). Also a camera position 150 m off while GPS 1 works (ignored), and the private port.
 - `tests/test_gps_denied_match.py` (local; its XFeat test runs only with PyTorch and XFeat): the map file, the camera's geometry (a white spot drawn and turned north up lands where it is), the matching on a made-up aerial map and a second "year" of it, each check against a wrong position, the heading and height that are followed, the track, the stand-in camera and its moments, the source with a simulated flight controller (positions and speeds against the truth), recording, step 2 (also the camera's mount angles), the command lines. Two pictures a second: each fix's weight by the time since the last one, the follow by the second, the movement still over 3 s at five a second, the program's default. The gyros' turn between two pictures: the rates summed (order, ends, gaps), the shift a tilt the drone did not make gives, the measured shift freed of the angles' error, the EKF's tilt corrections kept out of the speed, the bias learnt from the EKF, the rates' lag from INS_GYRO_FILTER, ATTITUDE at 100 Hz.
+- The bench check in `tests/test_gps_denied_match.py`: what it prints on the made-up maps, the shared ground from the maps' bounds or their tiles, what it says when a map, the ground or PyTorch is missing.
 - `../test/fetch_test_map.py`: downloads the test photos once (USDA NAIP, public domain, east Davis, California, about 10 MB) into `%LOCALAPPDATA%\vama-test-maps`, outside the repo.
 - `../test/matching_sitl_test.py`: the matching as its own program against the ArduCopter simulator (4.6.2 and 4.7.0) in real time, at 300 m and 12 m/s over the test photos. The map is the photos of 2020, the stand-in camera sees those of 2022. GPS 1 off for two legs of 800 m, a few seconds of blank ground, GPS 1 back. Then step 2 on the flight it recorded. It also notes how much the drone tipped and how far the EKF's roll and pitch were off (ATTITUDE at 100 Hz on its own port, beside SIM_STATE); `--keep` keeps its folder also when it passes.
 
