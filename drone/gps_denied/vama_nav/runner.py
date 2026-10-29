@@ -73,7 +73,8 @@ class Runner:
     def __init__(self, conn, sender: Sender, source=None, clock: Callable[[], int] = time.monotonic_ns,
                  rate_hz: float = RATE_HZ) -> None:
         """``conn``: an open pymavlink connection. ``source``: an optional position source with
-        ``hear(msg, arrival_ns)``, ``tick(now_ns)`` and the streams it needs in ``STREAMS_HZ``."""
+        ``hear(msg, arrival_ns)``, ``tick(now_ns)``, the streams it needs in ``STREAMS_HZ`` and the
+        settings it reads (from the PARAM_VALUE it hears) in ``PARAMS``."""
         self.conn = conn
         self.sender = sender
         self.source = source
@@ -165,7 +166,7 @@ class Runner:
             for msg_id, hz in self.streams().items():
                 mav.command_long_send(target[0], target[1], mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
                                       float(msg_id), float(int(1_000_000 / hz)), 0, 0, 0, 0, 0)
-            for name in (*REQUIRED, *ADVISED):
+            for name in (*REQUIRED, *ADVISED, *getattr(self.source, "PARAMS", ())):
                 mav.param_request_read_send(target[0], target[1], name.encode(), -1)
             self._asked_for = target
             self._next_request = now_ns + int(REQUEST_EVERY_S * 1e9)

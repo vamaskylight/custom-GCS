@@ -140,13 +140,17 @@ VideoOutput {
     }
 
     // VAMA: thermal colour modes, the same as VGCS (vgcs/video/thermal_palette.py).
-    // While the IR button shows the thermal stream (QGC's video address is the
-    // thermal address, the same test as _thermalOn in FlyViewCustomLayer.qml),
-    // the picture is drawn through the chosen mode's row of the colour table
-    // (thermal_palettes.png, made from VGCS by apk/make_thermal_palettes.py).
+    // While the thermal picture shows, the picture is drawn through the chosen
+    // mode's row of the colour table (thermal_palettes.png, made from VGCS by
+    // apk/make_thermal_palettes.py). The same test as _thermalOn in FlyViewCustomLayer.qml:
+    // QGC's video address is the thermal address, or, for a camera that switches its
+    // one video to the thermal picture (a VPro, thermalBySwitch), the link says it
+    // shows (B17, 2026-10-29: the address test alone left a VPro's colours off).
     // "White hot (as received)" leaves the picture alone and costs nothing.
     // Photos and recordings on the camera keep the camera's own picture.
-    readonly property bool _vamaThermal:    QGroundControl.settingsManager.videoSettings.rtspUrl.rawValue === SkydroidLink.thermalVideoUrl
+    readonly property bool _vamaThermal:    SkydroidLink.camera.thermalBySwitch === true
+                                            ? SkydroidLink.thermalPicture
+                                            : QGroundControl.settingsManager.videoSettings.rtspUrl.rawValue === SkydroidLink.thermalVideoUrl
     readonly property int  _vamaPaletteRow: _vamaThermal ? Math.max(0, SkydroidLink.thermalPaletteIndex) : 0
 
     layer.enabled: _vamaPaletteRow > 0

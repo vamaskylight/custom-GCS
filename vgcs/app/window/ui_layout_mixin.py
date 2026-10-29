@@ -990,6 +990,11 @@ class MainWindowUiLayoutMixin:
         sg.addWidget(lc, sr, 0)
         sg.addWidget(add_field("rtk_corrections"), sr, 1, 1, 3)
         sr += 1
+        lp = QLabel("Position source")
+        lp.setStyleSheet("color: #7d869c;")
+        sg.addWidget(lp, sr, 0)
+        sg.addWidget(add_field("position_source"), sr, 1, 1, 3)
+        sr += 1
         ls = QLabel("Command signing")
         ls.setStyleSheet("color: #7d869c;")
         sg.addWidget(ls, sr, 0)

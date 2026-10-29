@@ -66,6 +66,7 @@ from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.rtk_corrections import CorrectionStream
 from vgcs.app.obstacle_watch import ObstacleWatch
 from vgcs.app.rtk_status import RtkStatus
+from vgcs.app.position_source import PositionSource
 from vgcs.app.vehicle_messages import VehicleMessageBoard
 from vgcs.app.vehicle_params import EDITABLE as EDITABLE_PARAMS
 from vgcs.app.wind_monitor import DEFAULT_WARN_MPS, KEY_WIND_WARN_MPS, WindMonitor
@@ -153,6 +154,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._wind = WindMonitor(self._settings.value(KEY_WIND_WARN_MPS, DEFAULT_WARN_MPS))
         # RTK fix, accuracy and correction status of the vehicle's GPS (see vgcs.app.rtk_status).
         self._rtk = RtkStatus()
+        # GPS 1 or the down camera as GPS 2 (GPS-denied navigation, see vgcs.app.position_source).
+        self._position_source = PositionSource()
         # What the drone's obstacle sensor sees, and its warnings (see vgcs.app.obstacle_watch).
         self._obstacle = ObstacleWatch()
         # The RTK base station on this PC, and what is known about its corrections

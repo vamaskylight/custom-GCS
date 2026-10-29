@@ -44,7 +44,7 @@ import numpy as np
 
 from .geometry import Lens, Pose, Rectified, rectify
 
-FEATURES = ("orb", "akaze", "sift")
+FEATURES = ("orb", "akaze", "sift", "xfeat")      # xfeat: learned, for a map of another season (xfeat_match.py)
 # How far a picture's moment may be off the moment of the drone's angles it is turned with (the
 # camera's own time stamp, its rolling shutter). While the drone tips, the picture moves by its
 # tipping rate times this: at 300 m and 20 degrees a second, 2 m.
@@ -54,6 +54,8 @@ TIMING_S = 0.02
 @dataclass(frozen=True)
 class MatchSettings:
     features: str = "orb"
+    xfeat_dir: str = ""                 # --features xfeat: XFeat's folder (xfeat_match.default_dir() when empty)
+    xfeat_top_k: int = 4000
     max_features: int = 3000            # per picture, and per map search area
     ratio: float = 0.8                  # a pair counts when its best map feature is clearly better than the next
     ransac_px: float = 3.0              # a pair agrees with a fit within this many map pixels
@@ -259,11 +261,21 @@ class Matcher:
         problem = self.settings.problem()
         if problem:
             raise ValueError(problem)
-        self.features = Features(self.settings.features, self.settings.max_features)
+        kind = self.settings.features
+        # XFeat matches with the map only. The movement between two pictures a second apart (the
+        # same season) stays with ORB, which is fast.
+        self.features = Features("orb" if kind == "xfeat" else kind, self.settings.max_features)
+        self._xfeat = None
+        if kind == "xfeat":
+            from .xfeat_match import XFeatMatcher
+
+            self._xfeat = XFeatMatcher(self.settings.xfeat_dir or None, self.settings.xfeat_top_k)
         self.heading_error_deg = 0.0        # added to the flight controller's heading
         self.height_factor = 1.0            # times the flight controller's height above home
-        # The last pictures, for the movement: (moment, turned north up, features, descriptors).
-        self._history: deque[tuple[int, Rectified, np.ndarray, np.ndarray | None]] = deque(maxlen=8)
+        self._followed_ns: int | None = None    # the moment of the last picture whose fit was followed
+        # The last pictures, for the movement: (moment, turned north up, features, descriptors). 16
+        # reach the 3 s of vo_max_gap_s back also at five pictures a second (--interval-s 0.2).
+        self._history: deque[tuple[int, Rectified, np.ndarray, np.ndarray | None]] = deque(maxlen=16)
 
     def _try(self, job: Job, yaw: float, m_per_px: float, timings: dict) -> _Try:
         s = self.settings
@@ -300,24 +312,33 @@ class Matcher:
         if cmask.mean() < 0.5 * 255:
             attempt.why = "outside the map, or the map has no picture there"
             return attempt
-        t = time.perf_counter()
-        mpts, mdesc = self.features.find(crop, cmask)
-        timed("map_features", t)
-        t = time.perf_counter()
-        pairs = self.features.pair(attempt.desc, mdesc, s.ratio)
-        timed("pair", t)
-        attempt.pairs = len(pairs)
-        if len(pairs) < s.min_inliers:
-            attempt.why = f"only {len(pairs)} features pair with the map"
-            return attempt
-        attempt.src = attempt.pts[[i for i, _ in pairs]]
-        attempt.dst = mpts[[j for _, j in pairs]]
+        if self._xfeat is not None:
+            t = time.perf_counter()
+            attempt.src, attempt.dst = self._xfeat.match(rect.image, rect.mask, crop, cmask)
+            timed("xfeat", t)
+            attempt.pairs = len(attempt.src)
+            if attempt.pairs < s.min_inliers:
+                attempt.why = f"only {attempt.pairs} features pair with the map"
+                return attempt
+        else:
+            t = time.perf_counter()
+            mpts, mdesc = self.features.find(crop, cmask)
+            timed("map_features", t)
+            t = time.perf_counter()
+            pairs = self.features.pair(attempt.desc, mdesc, s.ratio)
+            timed("pair", t)
+            attempt.pairs = len(pairs)
+            if len(pairs) < s.min_inliers:
+                attempt.why = f"only {len(pairs)} features pair with the map"
+                return attempt
+            attempt.src = attempt.pts[[i for i, _ in pairs]]
+            attempt.dst = mpts[[j for _, j in pairs]]
         t = time.perf_counter()
         fit = _fit(attempt.src, attempt.dst, s.ransac_px)
         timed("fit", t)
         n = 0 if fit is None else int(fit.inliers.sum())
         if n < s.min_inliers:
-            attempt.why = f"only {n} of {len(pairs)} pairs agree on one place"
+            attempt.why = f"only {n} of {attempt.pairs} pairs agree on one place"
         else:
             attempt.fit = fit
         return attempt
@@ -388,12 +409,16 @@ class Matcher:
         out.horiz_acc_m = max(math.sqrt(s.map_error_m ** 2 + att_m ** 2 + fit_m ** 2 + out.motion_m ** 2),
                               s.min_accuracy_m)
         out.lat, out.lon, out.ok = lat, lon, True
-        # What this fit says of the flight controller's heading and height, for the next pictures. A
-        # second try means a new heading error (a reset): taken at once.
-        gain = 1.0 if out.rechecked else s.follow
+        # What this fit says of the flight controller's heading and height, for the next pictures:
+        # ``follow`` of it a second, so as much with two pictures a second as with one (and as before
+        # with one or fewer). A second try means a new heading error (a reset): taken at once.
+        since = 1.0 if self._followed_ns is None else min(1.0, max(0.0, (job.local_ns - self._followed_ns) / 1e9))
+        self._followed_ns = job.local_ns
+        follow = 1.0 - (1.0 - s.follow) ** since
+        gain = 1.0 if out.rechecked else follow
         self.heading_error_deg = max(-60.0, min(60.0, self.heading_error_deg
                                                 + (out.turn_deg - self.heading_error_deg) * gain))
-        self.height_factor = max(0.7, min(1.4, self.height_factor * (1.0 + (fit.scale - 1.0) * s.follow)))
+        self.height_factor = max(0.7, min(1.4, self.height_factor * (1.0 + (fit.scale - 1.0) * follow)))
         return self._done(out, began)
 
     def _movement(self, local_ns: int, rect: Rectified, pts: np.ndarray, desc) -> Movement | None:

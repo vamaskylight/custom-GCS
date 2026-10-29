@@ -83,6 +83,11 @@ CHECKED = (
     "PRX1_TYPE",
     "RNGFND1_TYPE",
     "RNGFND1_ORIENT",
+    # The GPS-denied navigation (A8 step 4, vgcs/app/position_source.py): GPS 2 is the down
+    # camera when it is a MAVLink GPS (14). GPS_TYPE2 is its name before ArduPilot 4.6.
+    "GPS2_TYPE",
+    "GPS_TYPE2",
+    "GPS_AUTO_SWITCH",
 )
 
 # Read once the drone has answered, and again on "Refresh params". The mission

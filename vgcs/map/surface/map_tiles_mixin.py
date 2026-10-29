@@ -1041,6 +1041,106 @@ class MapTilesMixin:
         dest = _ntm._TILE_CACHE_ROOT / plan.source_id
         self.start_offline_tile_pack(dest, plan)
 
+    # The drone's map for the GPS-denied navigation (A8 step 4, vgcs/map/drone_map.py).
+
+    def _plan_points(self) -> list[tuple[float, float]]:
+        """The mission's points and the drone's position, for an area to cover."""
+        points: list[tuple[float, float]] = []
+        try:
+            for wp in self._plan_waypoints_snapshot():
+                points.append((float(wp.lat), float(wp.lon)))
+        except Exception:
+            points = []
+        try:
+            home = self.get_vehicle_position()
+            if home is not None:
+                points.append((float(home[0]), float(home[1])))
+        except Exception:
+            pass
+        return points
+
+    def drone_map_has_mission(self) -> bool:
+        try:
+            return bool(list(self._plan_waypoints_snapshot()))
+        except Exception:
+            return False
+
+    def plan_drone_map(self, *, radius_km: float | None = None):
+        """The drone's map: the mission and the drone with a margin, or with ``radius_km`` a
+        square that far round the drone (the map's middle when there is none)."""
+        from vgcs.map.drone_map import plan_drone_map
+
+        template = self._pack_source_template()
+        if radius_km is None:
+            plan = plan_drone_map(self._plan_points(), template=template)
+            if plan is not None:
+                return plan
+            radius_km = 5.0
+        center = None
+        try:
+            here = self.get_vehicle_position()
+            if here is not None:
+                center = (float(here[0]), float(here[1]))
+        except Exception:
+            center = None
+        if center is None:
+            nm = getattr(self, "_native_map", None)
+            center = (float(getattr(nm, "_center_lat", 0.0) or 0.0), float(getattr(nm, "_center_lon", 0.0) or 0.0))
+        return plan_drone_map([], template=template, center=center, radius_km=float(radius_km))
+
+    def start_drone_map(self, out_path, plan, *, fetch=None) -> bool:
+        """Download the plan's tiles into this PC's map cache, then write the drone's map
+        file, in the background. False when a download already runs."""
+        from PySide6.QtCore import QThreadPool
+
+        from vgcs.map import native_tile_map as _ntm
+        from vgcs.map.surface.tile_pack_task import DroneMapTask, TilePackBridge
+        import threading
+
+        if getattr(self, "_tile_pack_cancel", None) is not None:
+            self._emit_tile_pack("tile_pack_progress", "A map download already runs: wait for it to end")
+            return False
+        if plan is None or plan.count == 0:
+            self._emit_tile_pack("tile_pack_progress", "Nothing to download for this area")
+            return False
+        bridge = TilePackBridge(self)
+        cancel = threading.Event()
+        self._tile_pack_bridge = bridge
+        self._tile_pack_cancel = cancel
+        self._tile_pack_dest = str(out_path)
+        bridge.progress.connect(self._on_drone_map_progress)
+        bridge.finished.connect(self._on_drone_map_finished)
+        host = plan.template.split("/")[2] if "://" in plan.template else plan.template
+        task = DroneMapTask(plan, _ntm._TILE_CACHE_ROOT / plan.source_id, Path(out_path), bridge, cancel,
+                            attribution=f"Map pictures from {host}", fetch=fetch)
+        QThreadPool.globalInstance().start(task)
+        self._emit_tile_pack("tile_pack_progress", f"Making the drone's map: {plan.count} map pictures. "
+                                                   "Keep the internet connection until it ends")
+        return True
+
+    def _on_drone_map_progress(self, done: int, total: int, stored: int, failed: int) -> None:
+        pct = int(100.0 * done / total) if total else 100
+        msg = f"The drone's map: {pct} percent, {done} of {total} pictures checked, {stored} downloaded"
+        if failed:
+            msg += f", {failed} failed"
+        self._emit_tile_pack("tile_pack_progress", msg)
+
+    def _on_drone_map_finished(self, results, dest: str) -> None:
+        self._tile_pack_cancel = None
+        self._tile_pack_bridge = None
+        pack, drone = results
+        if pack.cancelled or drone.cancelled:
+            msg = "The drone's map was stopped: no map file was written"
+        elif drone.path is None:
+            msg = f"The drone's map was not written: {drone.error or 'no map pictures'}"
+        else:
+            msg = (f"The drone's map is ready: {drone.tiles} map pictures, {drone.size_bytes / 1e6:.0f} MB, in "
+                   f"{drone.path}. Copy it to the drone's Raspberry Pi and give it to vama_nav with --map")
+            if drone.missing:
+                msg += (f". {drone.missing} pictures could not be downloaded ({pack.failed} failed, "
+                        f"{pack.placeholders} with no imagery): make it again to fill them")
+        self._emit_tile_pack("tile_pack_finished", msg)
+
     def import_offline_tile_pack(self, src) -> None:
         """Bring a pack made elsewhere into this machine's cache.
 

@@ -172,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--map", type=Path, required=True, help="the map (MBTiles) of the flights' area")
     p.add_argument("--map-zoom", type=int, help="the map's zoom level to match with (default: its finest)")
     p.add_argument("--features", default="orb", choices=FEATURES)
+    p.add_argument("--xfeat-dir", type=Path, help="--features xfeat: XFeat's folder (default VAMA_XFEAT_DIR)")
     p.add_argument("--hfov-deg", type=float, default=66.0, help="the camera's field of view across the picture")
     p.add_argument("--mount-yaw-deg", type=float, default=0.0)
     p.add_argument("--mount-pitch-deg", type=float, default=0.0)
@@ -196,8 +197,15 @@ def main(argv: list[str] | None = None) -> int:
     except MapError as exc:
         print(f"map: {exc}", file=sys.stderr)
         return 2
-    matcher = Matcher(tile_map, Lens(args.hfov_deg, args.mount_yaw_deg, args.mount_pitch_deg, args.mount_roll_deg),
-                      MatchSettings(features=args.features))
+    from .xfeat_match import XFeatError
+
+    try:
+        matcher = Matcher(tile_map, Lens(args.hfov_deg, args.mount_yaw_deg, args.mount_pitch_deg, args.mount_roll_deg),
+                          MatchSettings(features=args.features, xfeat_dir=str(args.xfeat_dir or "")))
+    except XFeatError as exc:
+        print(f"xfeat: {exc}", file=sys.stderr)
+        tile_map.close()
+        return 2
     rng = random.Random(args.seed)
     out_file = open(args.out, "w", newline="", encoding="utf-8") if args.out else None  # noqa: SIM115
     rows = csv.writer(out_file) if out_file else None

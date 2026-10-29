@@ -14,8 +14,17 @@ Usage:
     py fetch_test_map.py                 once: the test photos (about 10 MB, outside the repo)
     py matching_sitl_test.py             4.6.2 and 4.7.0
     py matching_sitl_test.py 4.7.0       one version
+    py matching_sitl_test.py 4.7.0 --map davis-esri-z17 --features xfeat
+                                         another map in the test photos' folder (here one VGCS made from
+                                         Esri: winter at Davis), and another matcher; xfeat needs a Python
+                                         with PyTorch and XFeat (vama_nav/xfeat_match.py) to run this test
+    py matching_sitl_test.py 4.7.0 --interval 1
+                                         one picture a second (vama_nav --interval-s 1; its default is 0.5)
+    py matching_sitl_test.py 4.7.0 --keep
+                                         the work folder stays (the results, the tracks, the angles in
+                                         attitude.csv, the recorded flight); a failed case always keeps it
 
-The simulator runs in real time (speedup 1), like gps_input_sitl_test.py: about 9 minutes a version.
+The simulator runs in real time (speedup 1), like gps_input_sitl_test.py: about 14 minutes a version.
 
 Ports:
     5760  this test: it flies the drone and reads the simulator's true position (SIM_STATE)
@@ -54,6 +63,9 @@ ALT_M = 300.0
 LEG_M = 800.0
 SPEED_MPS = 12.0                           # the client's speed
 MAP, GROUND = "davis-2020-z17", "davis-2022-z18"
+FEATURES = "orb"                           # --features: the matcher (vama_nav --features)
+KEEP = False                               # --keep: the work folder stays also when the case passes
+INTERVAL_S = 0.5                           # --interval S: seconds between two pictures (vama_nav --interval-s, its default)
 BLANK_S = 4.0
 FLY_PARAMS = {"WPNAV_SPEED": SPEED_MPS * 100, "WPNAV_SPEED_UP": 500, "WPNAV_SPEED_DN": 500, "FENCE_ENABLE": 0}
 # (command, (param 1 to 4), metres north and east of home, height). Take-off and RTL have no place.
@@ -93,16 +105,24 @@ def upload(sim: Sitl, items: list[tuple]) -> int | None:
 
 
 class Truth:
-    """The simulator's true position and speed (SIM_STATE), by this computer's clock."""
+    """The simulator's true position and speed (SIM_STATE), by this computer's clock, and for the
+    drone's tipping its true angles and turn rates beside the EKF's own (ATTITUDE)."""
 
     def __init__(self, sim: Sitl) -> None:
         self.samples: list[tuple] = []      # (arrival_ns, lat, lon, vn, ve)
+        self.angles: list[tuple] = []       # (arrival_ns, roll, pitch, yaw, roll rate, pitch rate, yaw rate), rad
+        self.ekf_angles: list[tuple] = []   # (arrival_ns, time_boot_ms, the same from ATTITUDE)
         take = sim._take
 
         def taking(msg) -> None:
-            if msg.get_type() == "SIM_STATE":
-                self.samples.append((time.monotonic_ns(), msg.lat_int / 1e7, msg.lon_int / 1e7, float(msg.vn),
-                                     float(msg.ve)))
+            kind = msg.get_type()
+            if kind == "SIM_STATE":
+                now = time.monotonic_ns()
+                self.samples.append((now, msg.lat_int / 1e7, msg.lon_int / 1e7, float(msg.vn), float(msg.ve)))
+                self.angles.append((now, msg.roll, msg.pitch, msg.yaw, msg.xgyro, msg.ygyro, msg.zgyro))
+            elif kind == "ATTITUDE":
+                self.ekf_angles.append((time.monotonic_ns(), msg.time_boot_ms, msg.roll, msg.pitch, msg.yaw,
+                                        msg.rollspeed, msg.pitchspeed, msg.yawspeed))
             take(msg)
 
         sim._take = taking
@@ -116,6 +136,33 @@ class Truth:
             return None
         f = (t_ns - a[0]) / (b[0] - a[0])
         return tuple(x + f * (y - x) for x, y in zip(a[1:], b[1:], strict=True))
+
+    def tipping(self, since_ns: int, until_ns: int) -> tuple[list[float], list[float]]:
+        """(the drone's true roll and pitch rate, deg/s; the EKF's roll and pitch error, deg) between two moments."""
+        rates = [math.degrees(math.hypot(p, q)) for t, _r, _p, _y, p, q, _w in self.angles if since_ns <= t <= until_ns]
+        times = [a[0] for a in self.angles]
+        errors = []
+        for t, _boot, roll, pitch, *_ in self.ekf_angles[::10]:
+            i = bisect.bisect_left(times, t)
+            if not since_ns <= t <= until_ns or i == 0 or i >= len(times) or times[i] - times[i - 1] > 300_000_000:
+                continue
+            a, b = self.angles[i - 1], self.angles[i]
+            f = (t - a[0]) / (b[0] - a[0])
+            errors.append(math.degrees(math.hypot(roll - (a[1] + f * (b[1] - a[1])), pitch - (a[2] + f * (b[2] - a[2])))))
+        return rates, errors
+
+
+def tipping_note(truth: Truth, spans: list[tuple[str, int, int]]) -> list[str]:
+    """How much the drone tipped (its true roll and pitch rates) and how far the EKF's roll and pitch were off."""
+    rates, errors = [], []
+    for name, since_ns, until_ns in spans:
+        tip, err = truth.tipping(since_ns, until_ns)
+        if tip:
+            rates.append(f"{name} middle {statistics.median(tip):.1f}, 1 in 10 over {sorted(tip)[int(0.9 * len(tip))]:.1f}")
+        if err:
+            errors.append(f"{name} middle {statistics.median(err):.2f}, 1 in 10 over {sorted(err)[int(0.9 * len(err))]:.2f}")
+    return [f"the drone's tipping (its true roll and pitch rate): {'; '.join(rates)} deg/s",
+            f"the EKF's roll and pitch error: {'; '.join(errors)} deg"]
 
 
 def judged(results: pathlib.Path, truth: Truth, since_ns: int, until_ns: int) -> dict[str, list[float]]:
@@ -152,7 +199,8 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
     """GPS 2 is GPS 1 passed on while disarmed; above 50 m it carries matched positions, near the true position while GPS 1 works; with GPS 1 off for two legs of 800 m at 300 m and 12 m/s the mission flies on them, through a few seconds of blank ground; GPS 1 back is taken again; the drone lands; the port stays private and the messages keep their rate."""
     missing = [name for name in (MAP, GROUND) if not path_of(name).is_file()]
     if missing:
-        r.check(False, f"the test photos are not there ({', '.join(missing)}): run py fetch_test_map.py once")
+        r.check(False, f"the test maps are not there ({', '.join(missing)}): run py fetch_test_map.py once "
+                       "(a map made with VGCS's \"Make the drone's map\" goes in the same folder)")
         return
     work = pathlib.Path(tempfile.mkdtemp(prefix="vama-match-A-"))
     ctl = work / "control.json"
@@ -172,6 +220,9 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
     try:
         sim.mav.mav.command_long_send(sim.mav.target_system, sim.mav.target_component,
                                       mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, 108, 100_000, 0, 0, 0, 0, 0)
+        # ATTITUDE at 100 Hz on this port only: the EKF's angles and rates beside the truth (attitude.csv).
+        sim.mav.mav.command_long_send(sim.mav.target_system, sim.mav.target_component,
+                                      mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, 30, 10_000, 0, 0, 0, 0, 0)
         sim.pump(120, until=lambda last: "EKF_STATUS_REPORT" in last
                  and (last["EKF_STATUS_REPORT"].flags & 0x18) == 0x18
                  and "GPS_RAW_INT" in last and last["GPS_RAW_INT"].fix_type >= 3)
@@ -179,7 +230,8 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         proc = subprocess.Popen([sys.executable, "-m", "vama_nav", "--map", str(path_of(MAP)), "--sim-camera",
                                  str(path_of(GROUND)), "--device", f"tcp:127.0.0.1:{SENDER_PORT}", "--control", str(ctl),
-                                 "--seed", "7", "--results", str(results), "--record", "--config", str(ini)],
+                                 "--seed", "7", "--results", str(results), "--record", "--config", str(ini),
+                                 "--features", FEATURES, "--interval-s", f"{INTERVAL_S:g}"],
                                 cwd=PACKAGE_DIR, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         started = time.monotonic_ns()
         sim.pump(30, until=lambda last: any(t > started and fix >= 3 for t, fix, *_ in w.gps2[-3:]))
@@ -234,8 +286,9 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
         fixes = [t for t, fix, *_ in w.gps2 if gps_off < t < wp3 and fix == 3]
         gaps = [(b - a) / 1e9 for a, b in zip(fixes, fixes[1:], strict=False)]
         blank_gap = max((g for a, g in zip(fixes, gaps, strict=False) if blank_from - 3e9 < a < blank_to), default=0)
-        r.check(len(fixes) >= 0.7 * (wp3 - gps_off) / 1e9,
-                f"a matched position for {len(fixes)} of {(wp3 - gps_off) / 1e9:.0f} seconds")
+        with_fix = len({(t - gps_off) // 1_000_000_000 for t in fixes})      # seconds, also at 2 pictures a second
+        r.check(with_fix >= 0.7 * (wp3 - gps_off) / 1e9,
+                f"a matched position for {with_fix} of {(wp3 - gps_off) / 1e9:.0f} seconds ({len(fixes)} fixes)")
         # The stand-in reads its control file once a second: the blank lasts BLANK_S, give or take 1 s.
         r.check(BLANK_S - 1.5 <= blank_gap < BLANK_S + 4,
                 f"no position while the ground showed nothing for about {BLANK_S:g} s: no 3D fix for "
@@ -255,6 +308,8 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
         r.note(f"GPS 1 off, matched at the picture's moment: {spread(j['matched'])} m; sent fix: {spread(j['sent'])} m")
         r.note(f"GPS 1 off, sent speed minus true: {spread(j['speed'])} m/s, along the track "
                f"{spread(j['speed_along'])}, across {spread(j['speed_across'])}")
+        for line in tipping_note(truth, [("GPS 1 on", started + 60_000_000_000, gps_off), ("GPS 1 off", gps_off, wp3)]):
+            r.note(line)
 
         set_gps1(sim, True)
         gps_on = time.monotonic_ns()
@@ -275,6 +330,12 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
             rows.writerows(("truth", t, lat, lon, "") for t, lat, lon, *_ in truth.samples)
             rows.writerows(("ekf", t, lat, lon, "") for t, lat, lon, _h in w.ekf)
             rows.writerows(("gps2", t, lat, lon, fix) for t, fix, lat, lon in w.gps2)
+        # The angles (rad) and turn rates (rad/s): the simulator's truth and the EKF's ATTITUDE.
+        with (work / "attitude.csv").open("w", newline="", encoding="utf-8") as f:
+            rows = csv.writer(f)
+            rows.writerow(["kind", "t_ns", "boot_ms", "roll", "pitch", "yaw", "roll_rate", "pitch_rate", "yaw_rate"])
+            rows.writerows(("true", t, "", *rest) for t, *rest in truth.angles)
+            rows.writerows(("ekf", *row) for row in truth.ekf_angles)
         if proc is not None and proc.poll() is None:
             proc.terminate()
             try:
@@ -309,7 +370,7 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
     if folders:
         # From 150 m: on the way up and down the camera sees little of the map (300 m is the flight's height).
         replay = subprocess.run([sys.executable, "-m", "vama_nav.replay", str(folders[0]), "--map", str(path_of(MAP)),
-                                 "--match-above-m", "150"],
+                                 "--match-above-m", "150", "--features", FEATURES],
                                 cwd=PACKAGE_DIR, capture_output=True, text=True, timeout=900,
                                 env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
         found = re.search(r"high enough to try (\d+), a position from (\d+)", replay.stdout)
@@ -319,7 +380,7 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
         for line in replay.stdout.splitlines():
             if "position error" in line or "speed between" in line or "seems" in line:
                 r.note("step 2: " + line.strip())
-    if r.failed:
+    if r.failed or KEEP:
         r.note(f"kept for a look: {work}")
     else:
         shutil.rmtree(work, ignore_errors=True)
@@ -329,7 +390,17 @@ CASES = [mission_on_matched_positions]
 
 
 def main(argv: list[str]) -> int:
+    global MAP, FEATURES, KEEP, INTERVAL_S
+    KEEP = "--keep" in argv
+    for i, a in enumerate(argv[:-1]):
+        if a == "--map":
+            MAP = argv[i + 1]
+        elif a == "--features":
+            FEATURES = argv[i + 1]
+        elif a == "--interval":
+            INTERVAL_S = float(argv[i + 1])
     versions = [a for a in argv if re.fullmatch(r"\d+\.\d+\.\d+", a)] or VERSIONS
+    print(f"map {MAP}, the camera sees {GROUND}, features {FEATURES}, a picture each {INTERVAL_S:g} s")
     failed_cases = 0
     began = time.monotonic()
     for version in versions:

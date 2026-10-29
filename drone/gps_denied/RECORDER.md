@@ -39,7 +39,10 @@ The recorder does not control the drone. It only listens to the flight controlle
 ## 4. Wire the Pi to the flight controller
 
 Use a free serial port of the Cube. On the Cube Orange Plus, TELEM1 is SERIAL1, TELEM2 is SERIAL2, GPS1 is SERIAL3 and GPS2 is SERIAL4.
-TELEM1 is in use, and TELEM2 is for the RPLidar. Please tell us which port you use.
+TELEM1 is in use, and TELEM2 is for the RPLidar. Please tell me which port you use.
+
+On a Brahma H7 with ArduPilot, use T3 and R3: that is SERIAL3, so n is 3 below (its SERIAL1 is MAVLink, 2 is GPS, 4 DisplayPort, 6 RC in, 7 MAVLink with flow control, 8 ESC telemetry).
+Its 5 V supply gives 3 A for everything on the board, so the Pi must have its own 5 V, 5 A supply.
 
 | Raspberry Pi | Cube port |
 |------|------|
@@ -110,7 +113,7 @@ It also saves one test picture as `~/vama-flights/check.jpg`. Look at it: sharp,
 
 ## 9. After the flight
 
-Copy the flight folders from the Pi (a USB stick, or `scp -r`) and send us one or two first.
+Copy the flight folders from the Pi (a USB stick, or `scp -r`) and send me one or two first.
 In each folder:
 
 | File | What |
@@ -120,7 +123,7 @@ In each folder:
 | `telemetry.jsonl` | All the flight controller's messages of that flight, to work the data again later |
 | `flight.json` | The settings, the camera, the start and the end |
 
-Please also tell us the camera model and the Cube port you used.
+Please also tell me the camera model and the Cube port you used.
 
 ## 10. When something is wrong
 

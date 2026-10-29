@@ -233,7 +233,9 @@ class MainWindowTelemetryMixin:
         sats = getattr(self, "_last_gps_sats", None)
         header_line = getattr(self, "_top_gps_sat", None)
         if rtk.has_report() and sats is not None and header_line is not None:
-            tag = rtk.header_tag(now)
+            source = getattr(self, "_position_source", None)
+            tags = [rtk.header_tag(now), source.header_tag(now) if source is not None else ""]
+            tag = " ".join(t for t in tags if t)
             header = f"{sats} {tag}" if tag else str(sats)
             if header_line.text() != header:
                 header_line.setText(header)
@@ -243,6 +245,34 @@ class MainWindowTelemetryMixin:
             message, is_warning = event
             if is_warning:
                 # Losing RTK in flight matters: shown like a vehicle warning.
+                self._vehicle_msg_board.push_vehicle_message(message, severity=SEVERITY_WARNING)
+                self._publish_vehicle_msg_cell()
+            else:
+                self._post_gcs_notice(message, kind=NOTICE_EVENT)
+            self._append_log(f"GPS: {message}")
+
+    def _publish_position_source(self) -> None:
+        """Where the position comes from (A8 step 4): GPS 1, or the down camera as GPS 2.
+        Called on GPS_RAW_INT and GPS2_RAW, and once a second: the readings expire."""
+        source = self._position_source
+        now = time.monotonic()
+        params = getattr(self, "_last_params", None)
+        if isinstance(params, dict):
+            source.update_settings(params)
+        field = self._fields.get("position_source")
+        if field is not None:
+            text = source.field_text(now)
+            if field.text() != text:
+                field.setText(text)
+            level = source.level(now)
+            if str(field.property("state_role") or "") != level:
+                self._apply_state_style(field, level)
+            field.setToolTip(source.tooltip(now))
+        event = source.take_event(now)
+        if isinstance(event, tuple):
+            message, is_warning = event
+            if is_warning:
+                # Shown like a vehicle warning: the drone now flies on the camera, or on nothing.
                 self._vehicle_msg_board.push_vehicle_message(message, severity=SEVERITY_WARNING)
                 self._publish_vehicle_msg_cell()
             else:
@@ -305,6 +335,7 @@ class MainWindowTelemetryMixin:
         self._battery.reset()
         self._wind.reset()
         self._rtk.reset()
+        self._position_source.reset()
         self._obstacle.reset()
         self._vehicle_msg_board.reset()
         self._prearm_health = None
@@ -577,6 +608,7 @@ class MainWindowTelemetryMixin:
                 )
             # Before the early return below: what the drone does about an object depends on both.
             self._obstacle.update_mode(mode_text, armed)
+            self._position_source.armed = armed
             hb_key = (armed, system_status, mode_text)
             arm_ready = self._compute_hb_arm_ready(
                 armed=armed,
@@ -769,6 +801,8 @@ class MainWindowTelemetryMixin:
             self._rtk.update_gps(
                 fix_type, satellites=sat, h_acc_m=data.get("h_acc_m"), v_acc_m=data.get("v_acc_m")
             )
+            self._position_source.update_gps1(fix_type)
+            self._publish_position_source()
             # Writes the satellite line of the header too, with the RTK state beside the count.
             self._publish_rtk()
             self._top_gps_hdop.setText(hdop_text)
@@ -794,6 +828,13 @@ class MainWindowTelemetryMixin:
                     )
                     if alt_msl:
                         self._map_msl_alt_m = alt_msl
+        elif msg_type == "GPS2_RAW":
+            # GPS 2: the down camera's position when the drone has the GPS-denied navigation.
+            self._position_source.update_gps2(
+                data.get("fix_type", 0), h_acc_m=data.get("h_acc_m"), satellites=data.get("satellites_visible", 0)
+            )
+            self._publish_position_source()
+            self._publish_rtk()           # the header's tag beside the satellites
         elif msg_type == "SYS_STATUS":
             now = time.monotonic()
             pct = int(data.get("battery_remaining", -1))

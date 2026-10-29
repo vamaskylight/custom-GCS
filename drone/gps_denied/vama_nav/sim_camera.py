@@ -44,7 +44,9 @@ SAME_BURST_NS = 5_000_000           # an ATTITUDE this close before a SIM_STATE 
 
 
 class SimCamera:
-    STREAMS_HZ = {108: 20.0, 30: 20.0}  # SIM_STATE, and ATTITUDE at the same rate: asked for by the runner
+    # SIM_STATE, and ATTITUDE at the same rate (each true state right after the ATTITUDE of its moment):
+    # asked for by the runner. 100 Hz, as match_source asks ATTITUDE for the gyros' turn between pictures.
+    STREAMS_HZ = {108: 100.0, 30: 100.0}
 
     def __init__(self, world, lens: Lens, size: tuple[int, int] = (2028, 1520), ground_alt_m: float | None = None,
                  noise: float = 2.0, blur: float = 0.8, control: Path | None = None,
@@ -63,7 +65,7 @@ class SimCamera:
         self.blank = self.paused = False
         self.taken = 0
         self._lock = threading.Lock()
-        self._truth: deque = deque(maxlen=40)    # (moment_ns, lat, lon, alt, roll, pitch, yaw)
+        self._truth: deque = deque(maxlen=400)   # (moment_ns, lat, lon, alt, roll, pitch, yaw): 4 s at 100 Hz
         self._clock = AutopilotClock()
         self._attitude: tuple[int, int] | None = None     # (time_boot_ms, arrival_ns) of the last ATTITUDE
         self.paired = self.unpaired = 0

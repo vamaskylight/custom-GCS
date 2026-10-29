@@ -80,6 +80,8 @@ _AUTOPILOT_ONLY_MESSAGES = frozenset(
         "NAMED_VALUE_FLOAT",
         # RTK status of the aircraft's own GPS.
         "GPS_RTK",
+        # GPS 2: the down camera's position on a drone with the GPS-denied navigation.
+        "GPS2_RAW",
         # Where the drone flies now (its waypoint, or the path planner's point).
         "POSITION_TARGET_GLOBAL_INT",
     }
@@ -301,6 +303,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
             "MISSION_TARGET": 0.4,
             "WIND": 0.4,
             "GPS_RTK": 0.4,
+            "GPS2_RAW": 0.2,
         }
         self._last_hb_log_mono = 0.0
         self._last_hb_emit_mono = 0.0
@@ -1099,6 +1102,16 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 gps_payload["lon"] = raw_lon
                 gps_payload["alt_msl_m"] = float(raw_alt_mm) / 1000.0
             self._emit_telemetry_payload("GPS_RAW_INT", gps_payload)
+        elif msg_type == "GPS2_RAW":
+            # GPS 2 (vgcs/app/position_source.py): its fix and accuracy, nothing else is shown.
+            self._emit_telemetry_payload(
+                "GPS2_RAW",
+                {
+                    "fix_type": int(getattr(msg, "fix_type", 0) or 0),
+                    "satellites_visible": int(getattr(msg, "satellites_visible", 0) or 0),
+                    "h_acc_m": _mm_to_m_or_none(getattr(msg, "h_acc", 0)),
+                },
+            )
         elif msg_type == "SYS_STATUS":
             self._emit_telemetry_payload(
                 "SYS_STATUS",

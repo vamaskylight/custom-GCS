@@ -2918,11 +2918,25 @@ int main(int argc, char *argv[])
              expect(link.thermalPicture() && video == QStringLiteral("rtsp://127.0.0.1:8554/viewpro"),
                     "cameras: its IR button switches the camera, and the video address stays", video);
              shot("33b_viewpro_ir.png");
+             // B17 (build 16): its thermal picture takes the colour modes too, though its address stays.
+             link.setThermalPalette(QStringLiteral("ironbow"));
+         }},
+        {300, [&]() {
+             QQuickItem *video = findItem("videoContent");
+             QQuickItem *button = findItem("vamaPaletteButton");
+             const int row = video ? video->property("_vamaPaletteRow").toInt() : -1;
+             expect(row > 0 && button && button->isVisible(),
+                    "cameras: a Viewpro's thermal picture is coloured in the chosen mode, and the colour button shows",
+                    QStringLiteral("row %1").arg(row));
              tap("vamaIrButton");
          }},
         {300, [&]() {
              expect(!link.thermalPicture() && global.settings.video.rtspUrlFact.rawValue().toString() == QStringLiteral("rtsp://127.0.0.1:8554/viewpro"),
                     "cameras: and back to the day picture", QString());
+             QQuickItem *video = findItem("videoContent");
+             expect(video && video->property("_vamaPaletteRow").toInt() == 0,
+                    "cameras: the Viewpro's day picture is not coloured", link.thermalPalette());
+             link.setThermalPalette(QStringLiteral("camera"));
              QMetaObject::invokeMethod(window->property("layer").value<QObject *>(), "_openCameraEditor");
          }},
         {200, [&]() {

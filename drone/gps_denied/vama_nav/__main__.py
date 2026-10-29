@@ -41,14 +41,19 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--source-component", type=int, default=MAV_COMP_ID_GPS2)
     m = p.add_argument_group("matching (--map)")
     m.add_argument("--map-zoom", type=int, help="the map's zoom level to match with (default: its finest)")
-    m.add_argument("--features", default="orb", choices=("orb", "akaze", "sift"), help="default orb (the fastest)")
+    m.add_argument("--features", default="orb", choices=("orb", "akaze", "sift", "xfeat"),
+                   help="default orb (the fastest). xfeat: learned features for a map of another season, needs PyTorch "
+                        "and XFeat's folder (see vama_nav/xfeat_match.py)")
+    m.add_argument("--xfeat-dir", type=Path, help="--features xfeat: XFeat's folder (default VAMA_XFEAT_DIR)")
     m.add_argument("--hfov-deg", type=float, default=66.0,
                    help="the camera's field of view across the picture (default 66, the Raspberry Pi AI Camera)")
     m.add_argument("--mount-yaw-deg", type=float, default=0.0,
                    help="0: the top of the picture toward the drone's nose, 90: toward its right side")
     m.add_argument("--mount-pitch-deg", type=float, default=0.0, help="the camera looks this far ahead of straight down")
     m.add_argument("--mount-roll-deg", type=float, default=0.0, help="the camera looks this far right of straight down")
-    m.add_argument("--interval-s", type=float, default=1.0, help="seconds between two pictures")
+    m.add_argument("--interval-s", type=float, default=0.5,
+                   help="seconds between two pictures (default 0.5: two a second, each fix then weighs half, and "
+                        "the drone tips less; a matching too slow for that skips pictures by itself)")
     p.add_argument("--match-above-m", type=float,
                    help="no positions below this height above home (default 50 m with --map, 15 m with --sim-truth)")
     m.add_argument("--search-m", type=float, default=60.0,
@@ -164,7 +169,15 @@ def main(argv: list[str] | None = None) -> int:
         except MapError as exc:
             print(f"map: {exc}", file=sys.stderr)
             return 2
-        matcher = Matcher(tile_map, lens, MatchSettings(features=args.features))
+        from .xfeat_match import XFeatError
+
+        try:
+            matcher = Matcher(tile_map, lens, MatchSettings(features=args.features,
+                                                            xfeat_dir=str(args.xfeat_dir or "")))
+        except XFeatError as exc:
+            print(f"xfeat: {exc}", file=sys.stderr)
+            _close(None, maps)
+            return 2
         telemetry = Telemetry()
         recording = None
         if args.record:

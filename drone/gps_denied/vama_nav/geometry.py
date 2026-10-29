@@ -82,9 +82,67 @@ def rot_z(a: float) -> np.ndarray:
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
+def body_in_ned(pose: Pose) -> np.ndarray:
+    """Turns a direction in the drone's axes (x forward, y right, z down) into north, east, down."""
+    return rot_z(pose.yaw) @ rot_y(pose.pitch) @ rot_x(pose.roll)
+
+
+def rotation(w: np.ndarray) -> np.ndarray:
+    """The rotation by the vector ``w`` (its length is the angle in radians)."""
+    angle = float(np.linalg.norm(w))
+    if angle < 1e-12:
+        return np.eye(3)
+    k = w / angle
+    skew = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    return np.eye(3) + math.sin(angle) * skew + (1.0 - math.cos(angle)) * skew @ skew
+
+
+def rotation_vector(m: np.ndarray) -> np.ndarray:
+    """The vector of a small rotation (radians about x, y, z): the inverse of ``rotation`` near no turn."""
+    return 0.5 * np.array([m[2, 1] - m[1, 2], m[0, 2] - m[2, 0], m[1, 0] - m[0, 1]])
+
+
+def turn_of(rates: list[tuple], boot_a: float, boot_b: float, max_gap_ms: float) -> np.ndarray | None:
+    """The drone's own turn from ``boot_a`` to ``boot_b`` (ms) by its gyros: ATTITUDE's turn rates
+    (boot_ms, roll, pitch and yaw rate in rad/s, the body's) summed step by step, interpolated at both
+    ends, as a rotation in the drone's axes. None when the samples do not reach both ends or leave a
+    gap over ``max_gap_ms`` (summed from too few samples, a tipping drone's turn comes out wrong)."""
+    if not rates or rates[0][0] > boot_a or rates[-1][0] < boot_b or boot_b < boot_a:
+        return None
+    if any(b[0] - a[0] > max_gap_ms for a, b in zip(rates, rates[1:])):
+        return None
+
+    def rate_at(t: float) -> np.ndarray:
+        for a, b in zip(rates, rates[1:]):
+            if a[0] <= t <= b[0]:
+                f = (t - a[0]) / (b[0] - a[0]) if b[0] > a[0] else 0.0
+                return np.array(a[1:4]) + f * (np.array(b[1:4]) - np.array(a[1:4]))
+        return np.array(rates[-1][1:4])
+
+    points = [(boot_a, rate_at(boot_a))] + [(s[0], np.array(s[1:4])) for s in rates if boot_a < s[0] < boot_b] \
+        + [(boot_b, rate_at(boot_b))]
+    turn = np.eye(3)
+    for (ta, wa), (tb, wb) in zip(points, points[1:]):
+        turn = turn @ rotation(0.5 * (wa + wb) * (tb - ta) / 1000.0)
+    return turn
+
+
+def tilt_shift_m(pose_a: Pose, pose_b: Pose, turn: np.ndarray) -> tuple[float, float]:
+    """(north, east) metres to add to the ground's shift measured between two pictures turned north up
+    with ``pose_a`` and ``pose_b`` (the flight controller's angles), when ``turn`` is the drone's own
+    turn in between (its gyros, ``turn_of``).
+
+    An EKF corrects its roll and pitch now and then. A change of its angles that the drone did not
+    make shifts the second picture's ground by the height (``pose_b``'s) times that change, and the
+    measured shift with it: from 300 m, 0.1 degree is 0.5 m. Without GPS the EKF's corrections follow
+    the camera's own positions and speeds, so this error would go round and round."""
+    wx, wy, _wz = rotation_vector(body_in_ned(pose_b) @ turn.T @ body_in_ned(pose_a).T)   # what the drone did not turn
+    return pose_b.height_m * float(wy), -pose_b.height_m * float(wx)
+
+
 def ned_from_camera(lens: Lens, pose: Pose) -> np.ndarray:
     """Turns a direction in the camera's axes into north, east, down."""
-    body = rot_z(pose.yaw) @ rot_y(pose.pitch) @ rot_x(pose.roll)
+    body = body_in_ned(pose)
     # A positive turn about the drone's x axis tips the camera to look left (as rolling right does),
     # so the right-looking mount roll goes in with its sign turned.
     mount = rot_z(math.radians(lens.mount_yaw_deg)) @ rot_y(math.radians(lens.mount_pitch_deg)) \

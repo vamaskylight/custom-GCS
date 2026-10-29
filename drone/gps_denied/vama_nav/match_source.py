@@ -17,11 +17,14 @@ controller's own movement in between (a few tenths of a second, which its sensor
 so the matching's delay does not show as a position or a speed late by that much. The speed is the
 flight controller's own, corrected by how much the ground's shift between two pictures (up to 3 s
 apart) differs from the controller's own movement over the same time: right whatever the drone did
-in between, a turn too. Only a fix that agrees with the track (track.py) goes to the sender.
+in between, a turn too. The shift is first freed of the EKF's own roll and pitch corrections in
+between, by the gyros' turn (ATTITUDE's rates at 100 Hz, ``_tilt_shift``). Only a fix that agrees
+with the track (track.py) goes to the sender.
 """
 
 from __future__ import annotations
 
+import bisect
 import csv
 import logging
 import math
@@ -42,16 +45,18 @@ from vama_recorder.camera import CameraError
 from vama_recorder.telemetry import Telemetry
 
 from .geo import north_east, offset
-from .geometry import Pose
+from .geometry import Pose, body_in_ned, rotation, rotation_vector, tilt_shift_m, turn_of
 from .gps_input import Fix
 from .matcher import Job, Matcher, Result, motion_m
 from .track import Point, Track
 
 log = logging.getLogger("vama_nav.match")
 
-# ATTITUDE (a picture's angles matter most: one degree is about 9 m on the ground from 500 m up),
-# GLOBAL_POSITION_INT (position, height, speed), SYSTEM_TIME (the clock fit, the recorded rows' time).
-STREAMS_HZ = {30: 20.0, 33: 10.0, 2: 1.0}
+# ATTITUDE (a picture's angles matter most: one degree is about 9 m on the ground from 500 m up; at
+# 100 Hz its turn rates summed between two pictures keep the EKF's own angle corrections out of the
+# speed, see _tilt_shift), GLOBAL_POSITION_INT (position, height, speed), SYSTEM_TIME (the clock fit,
+# the recorded rows' time).
+STREAMS_HZ = {30: 100.0, 33: 10.0, 2: 1.0}
 COVER_WAIT_NS = 600_000_000         # a picture waits this long at most for the samples after its moment
 STATUS_EVERY_NS = 10_000_000_000
 WHY_EVERY_NS = 5_000_000_000        # "no position: ..." at most this often, unless the reason changes
@@ -62,11 +67,22 @@ EKF_SPEED_ACC = 1.0                 # no speed measured: the controller's own sp
 SPEED_TIPPING_MAX = 0.8             # m/s a speed may be off from the drone's tipping (TIMING_S): over it, unused
 SPEED_GATE_MPS = 4.0                # a measured speed this far from the controller's own: unused
 RATE_SPAN_NS = 100_000_000          # the drone's turning rates over this time before a picture
+MAX_RATE_GAP_MS = 30.0              # ATTITUDE's turn rates further apart: the gyros' turn is not summed
+RATES_KEEP_MS = 10_000              # ATTITUDE's turn rates kept this long behind the newest
+GYRO_BIAS_TAU_S = 40.0              # the gyros' bias left in ATTITUDE's rates is learnt over this long
+GYRO_BIAS_MAX_RAD_S = math.radians(0.5)   # gyros and EKF differ more (a heading reset): not learnt from
+# ATTITUDE's rates come through the gyros' low-pass filter (INS_GYRO_FILTER, two poles), its angles do
+# not: the rates are late by about 0.225 s / the filter's Hz. ArduCopter's default 20 Hz: 11 ms. Not
+# taken out, entering and leaving a turn (10 to 20 degrees a second of roll) the gyros' turn between two
+# pictures was 0.2 degrees off, 1 m from 300 m (the simulator, 2026-10-29).
+GYRO_FILTER_PARAM = "INS_GYRO_FILTER"
+GYRO_FILTER_DEFAULT_HZ = 20.0
+GYRO_LAG_S_HZ = math.sqrt(2.0) / (2.0 * math.pi)
 HEADING_NOTE_DEG = 5.0              # the controller's heading found this far off (or changed by this): said
 # One row per picture (--results): what was found, what the flight controller said, what was sent.
 RESULT_FIELDS = ["local_ns", "ok", "why", "lat", "lon", "horiz_acc_m", "inliers", "pairs", "turn_deg", "scale",
                  "rechecked", "heading_error_deg", "height_factor", "motion_m", "off_prior_m", "moved_n_m",
-                 "moved_e_m", "moved_s", "speed_used", "fc_lat", "fc_lon", "fc_vn", "fc_ve", "fc_yaw_deg",
+                 "moved_e_m", "moved_s", "tilt_shift_n_m", "tilt_shift_e_m", "speed_used", "fc_lat", "fc_lon", "fc_vn", "fc_ve", "fc_yaw_deg",
                  "fc_rel_alt_m", "sent", "fix_local_ns", "fix_lat", "fix_lon", "fix_vn", "fix_ve", "fix_speed_acc",
                  "seconds", "true_lat", "true_lon", "true_fix_lat", "true_fix_lon"]
 # true_*: only with the simulator's stand-in camera, its truth at the picture's and at the fix's moment.
@@ -97,6 +113,8 @@ class _Picture:
 
 
 class MatchSource:
+    PARAMS = (GYRO_FILTER_PARAM,)       # the settings it reads, asked for by the runner
+
     def __init__(self, offer: Callable[[Fix], object], camera, matcher: Matcher, settings: SourceSettings | None = None,
                  telemetry: Telemetry | None = None, clock: Callable[[], int] = time.monotonic_ns,
                  threaded: bool = True, results: Path | None = None, recording=None) -> None:
@@ -135,6 +153,13 @@ class MatchSource:
         self._gps_good_ns: int | None = None
         self._speed: tuple[int, float, float, float] | None = None  # (moment, vn, ve, its extra error) last measured
         self._motion: dict[int, float] = {}         # picture moment: how far its tipping may move it (m)
+        self._shift: tuple[int, tuple | None] = (0, None)   # (picture moment, its tilt shift (north, east) or None)
+        self._turn_rates: list[tuple] = []          # ATTITUDE's (boot_ms, roll, pitch, yaw rate) rad/s, the body's
+        self._turn_rates_lock = threading.Lock()    # the link's thread hands the messages in
+        self._gyro_bias = np.zeros(3)               # rad/s left in ATTITUDE's rates, learnt (_tilt_shift)
+        self._gyro_bias_boot = 0.0                  # the controller's time it was last learnt at
+        self.gyro_lag_ms = 1000.0 * GYRO_LAG_S_HZ / GYRO_FILTER_DEFAULT_HZ   # until INS_GYRO_FILTER is read
+        self.gyro_filter_hz: float | None = None
         self._speed_note = ""
         self._heading_said = 0.0
         self._next_status: int | None = None
@@ -174,7 +199,23 @@ class MatchSource:
             self._results_file = self._rows = None
 
     def hear(self, msg, arrival_ns: int) -> None:
-        self.telemetry.hear(msg, arrival_ns)
+        fc = self.telemetry.hear(msg, arrival_ns)
+        if fc and msg.get_type() == "PARAM_VALUE" and str(msg.param_id).rstrip("\x00") == GYRO_FILTER_PARAM:
+            hz = float(msg.param_value)
+            if hz != self.gyro_filter_hz:
+                self.gyro_filter_hz = hz
+                self.gyro_lag_ms = 1000.0 * GYRO_LAG_S_HZ / hz if hz > 0 else 0.0     # 0: no filter
+                self.gyro_lag_ms = min(self.gyro_lag_ms, 50.0)
+                log.info("the gyros' filter is %g Hz: ATTITUDE's turn rates are about %.1f ms late", hz,
+                         self.gyro_lag_ms)
+        if fc and msg.get_type() == "ATTITUDE":
+            sample = (int(msg.time_boot_ms), float(msg.rollspeed), float(msg.pitchspeed), float(msg.yawspeed))
+            with self._turn_rates_lock:
+                if self._turn_rates and sample[0] < self._turn_rates[-1][0] - 1000:
+                    self._turn_rates.clear()                    # the controller restarted: its clock began again
+                bisect.insort(self._turn_rates, sample, key=lambda s: s[0])
+                cut = bisect.bisect_left(self._turn_rates, self._turn_rates[-1][0] - RATES_KEEP_MS, key=lambda s: s[0])
+                del self._turn_rates[:cut]
         hear = getattr(self.camera, "hear", None)
         if hear is not None:
             hear(msg, arrival_ns)
@@ -371,6 +412,46 @@ class MatchSource:
             return None
         return north_east(a["lat"], a["lon"], b["lat"], b["lon"])
 
+    def _tilt_shift(self, from_ns: int, to_ns: int, boot_a: float | None, boot_b: float | None,
+                    at: dict) -> tuple[float, float] | None:
+        """(north, east) metres the EKF's own roll and pitch corrections between two pictures put into
+        the ground's measured shift, by the gyros' turn in between; None without enough turn rates."""
+        before = self._state(from_ns)
+        if boot_a is None or boot_b is None or before is None or at.get("rel_alt_m") is None:
+            self.counts["speeds without the gyros' turn"] += 1
+            return None
+        # The rates measured the turn gyro_lag_ms before they were stamped (the gyros' filter).
+        lag_a, lag_b = boot_a + self.gyro_lag_ms, boot_b + self.gyro_lag_ms
+        with self._turn_rates_lock:
+            i = bisect.bisect_right(self._turn_rates, lag_a, key=lambda s: s[0]) - 1
+            j = bisect.bisect_left(self._turn_rates, lag_b, key=lambda s: s[0])
+            rates = self._turn_rates[i:j + 1] if i >= 0 else []
+        if rates and rates[-1][0] < lag_b <= rates[-1][0] + MAX_RATE_GAP_MS:
+            rates.append((lag_b, *rates[-1][1:]))      # the newest rate held for the last few ms
+        turn = turn_of(rates, lag_a, lag_b, MAX_RATE_GAP_MS)
+        if turn is None:
+            self.counts["speeds without the gyros' turn"] += 1
+            return None
+        height = float(at["rel_alt_m"]) * getattr(self.matcher, "height_factor", 1.0)
+
+        def pose(state: dict) -> Pose:
+            return Pose(math.radians(state["roll_deg"]), math.radians(state["pitch_deg"]),
+                        math.radians(state["yaw_deg"]), height)
+
+        a, b = pose(before), pose(at)
+        dt = (boot_b - boot_a) / 1000.0
+        # ATTITUDE's rates are the gyros corrected by the EKF's own bias estimate, which lags (the
+        # simulator drifts its gyros on purpose, 0.02 to 0.04 degrees a second were left). What is left
+        # is learnt slowly from how much more the gyros turned than the EKF's angles, which are right in
+        # the long run; over the seconds between two pictures the gyros are the better.
+        used = turn @ rotation(-self._gyro_bias * dt)
+        seen = rotation_vector((body_in_ned(a).T @ body_in_ned(b)).T @ turn) / max(dt, 1e-3)
+        if np.linalg.norm(seen) < GYRO_BIAS_MAX_RAD_S:
+            gain = min(1.0, max(0.0, (boot_b - self._gyro_bias_boot) / 1000.0) / GYRO_BIAS_TAU_S)
+            self._gyro_bias = self._gyro_bias + (seen - self._gyro_bias) * gain
+        self._gyro_bias_boot = boot_b
+        return tilt_shift_m(a, b, used)
+
     def _use(self, result: Result, now_ns: int) -> None:
         at = self._state(result.local_ns)
         fix = self._judge(result, at, now_ns)
@@ -393,6 +474,8 @@ class MatchSource:
         if mv is not None:
             row.update(moved_n_m=f"{mv.north_m:.3f}", moved_e_m=f"{mv.east_m:.3f}",
                        moved_s=f"{(result.local_ns - mv.since_ns) / 1e9:.3f}")
+            if self._shift[0] == result.local_ns and self._shift[1] is not None:
+                row.update(tilt_shift_n_m=f"{self._shift[1][0]:.3f}", tilt_shift_e_m=f"{self._shift[1][1]:.3f}")
         if at:
             row.update(fc_lat=f"{at['lat']:.7f}", fc_lon=f"{at['lon']:.7f}", fc_vn=f"{at['vn_mps']:.2f}",
                        fc_ve=f"{at['ve_mps']:.2f}", fc_yaw_deg=f"{at['yaw_deg']:.1f}",
@@ -419,10 +502,18 @@ class MatchSource:
             b1, b2 = self.telemetry.boot_ms_at(mv.since_ns), self.telemetry.boot_ms_at(result.local_ns)
             dt = (b2 - b1) / 1000.0 if b1 is not None and b2 is not None else (result.local_ns - mv.since_ns) / 1e9
             fc_moved = self._moved(mv.since_ns, result.local_ns)
+            # The EKF's own corrections of its roll and pitch between the two pictures, taken out by the
+            # gyros' turn (geometry.tilt_shift_m). Without the rates the shift stays as measured.
+            shift = self._tilt_shift(mv.since_ns, result.local_ns, b1, b2, at)
+            self._shift = (result.local_ns, shift)
+            north, east = (mv.north_m + shift[0], mv.east_m + shift[1]) if shift else (mv.north_m, mv.east_m)
             if fc_moved is not None and dt > 0:
                 # The controller's speed, plus what the measured movement says it got wrong meanwhile.
-                vn = at["vn_mps"] + (mv.north_m - fc_moved[0]) / dt
-                ve = at["ve_mps"] + (mv.east_m - fc_moved[1]) / dt
+                # (The shift's mean speed brought forward by the controller's speed change was nearer
+                # the truth, but it tells the EKF its speed error of a second or more ago as if it were
+                # now: in the simulator the drone then tipped three times as much, 2026-10-29.)
+                vn = at["vn_mps"] + (north - fc_moved[0]) / dt
+                ve = at["ve_mps"] + (east - fc_moved[1]) / dt
                 tipping = (self._motion.get(mv.since_ns, 0.0) + self._motion.get(result.local_ns, 0.0)) / dt
                 off = math.hypot(vn - at["vn_mps"], ve - at["ve_mps"])
                 if tipping > SPEED_TIPPING_MAX:
@@ -494,8 +585,17 @@ class MatchSource:
             speed_acc += sp[3] + (0.2 * (moment - sp[0]) / 1e9 if sp[0] != result.local_ns else 0.0)
         else:
             vn, ve, speed_acc = now["vn_mps"], now["ve_mps"], EKF_SPEED_ACC
+        # More than one fix a second: each weighs as much less as there are more of them, so that a
+        # second of fixes weighs what one fix a second did. Pictures that close see nearly the same
+        # ground, and their errors are nearly the same (a second apart they were 55 to 80 % alike
+        # without GPS 1, in the simulator): the EKF must not take them as new knowledge each time. By
+        # the time since the last fix sent: a picture skipped (a slow matching, no position) leaves
+        # the next one its full weight.
+        since = 1.0 if self._last_sent_ns is None else (result.local_ns - self._last_sent_ns) / 1e9
+        weight = math.sqrt(1.0 / min(1.0, max(since, self.settings.interval_s)))
         return Fix(local_ns=moment, lat=lat, lon=lon, alt_msl_m=float(now["alt_msl_m"]), vn=vn, ve=ve,
-                   horiz_acc_m=result.horiz_acc_m, vert_acc_m=ALT_ACC_M, speed_acc_mps=min(speed_acc, EKF_SPEED_ACC))
+                   horiz_acc_m=result.horiz_acc_m * weight, vert_acc_m=ALT_ACC_M,
+                   speed_acc_mps=min(speed_acc, EKF_SPEED_ACC) * weight)
 
     def _no_position(self, now_ns: int, why: str) -> None:
         kind = re.sub(r"\d+(\.\d+)?", "N", why.split(" (")[0].split(";")[0])   # "only N features pair with the map"

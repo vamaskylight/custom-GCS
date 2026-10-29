@@ -1,0 +1,151 @@
+diff --git a/src/VideoManager/VideoReceiver/GStreamer/GstSourceFactory.cc b/src/VideoManager/VideoReceiver/GStreamer/GstSourceFactory.cc
+--- a/src/VideoManager/VideoReceiver/GStreamer/GstSourceFactory.cc
++++ b/src/VideoManager/VideoReceiver/GStreamer/GstSourceFactory.cc
+@@ -32,10 +32,139 @@
+     }
+ }
+ 
++// VAMA patch (apk/qgc-patches/0005): the RTP marker bit stays only on a packet that carries picture
++// data (a slice, or a fragment or an aggregate holding one). Some cameras also set it on a packet that
++// holds only parameter sets: the client's Viewpro A20KTR (H.264) after its SPS, the Skydroid V12
++// (H.265) after its VPS. The depayloader ends an access unit at every marked packet (whole access
++// units since patch 0003), so each keyframe came out in two: the parameter sets, then the picture with
++// the same timestamp, which the parser hands on without one. The recording's muxer dropped that half:
++// every RC copy began after a keyframe, at the stream's own time, and no keyframe in it had a picture,
++// so it played black or grey (test build 16, 2026-10-29; build 15's V12 copies kept only the VPS of
++// each keyframe). Desktop GStreamer 1.24 with a stand-in camera that marks its SPS or VPS gives the
++// same files; with this probe, whole keyframes, files from 0, every picture decoded. Each picture
++// still ends at its own marked packet, so the live picture waits for nothing more.
++bool isPictureNal(guint type, bool h265)
++{
++    return h265 ? (type < 32) : (((type >= 1) && (type <= 5)) || (type == 20) || (type == 21));
++}
++
++bool rtpPayloadHasPicture(const guint8* payload, gsize size, bool h265)
++{
++    if (size < (h265 ? 3u : 2u)) {
++        return true;  // too short to tell: the marker stays as it is
++    }
++    const guint type = h265 ? ((payload[0] >> 1) & 0x3F) : (payload[0] & 0x1F);
++    const bool fragment = h265 ? (type == 49) : ((type == 28) || (type == 29));
++    const bool aggregate = h265 ? (type == 48) : (type == 24);
++    if (fragment) {
++        return isPictureNal(h265 ? (payload[2] & 0x3F) : (payload[1] & 0x1F), h265);
++    }
++    if (aggregate) {
++        gsize pos = h265 ? 2 : 1;
++        bool picture = false;
++        while ((pos + 2) < size) {
++            const gsize length = (static_cast<gsize>(payload[pos]) << 8) | payload[pos + 1];
++            pos += 2;
++            if ((length == 0) || ((pos + length) > size)) {
++                return true;  // not as expected: the marker stays as it is
++            }
++            picture = picture || isPictureNal(h265 ? ((payload[pos] >> 1) & 0x3F) : (payload[pos] & 0x1F), h265);
++            pos += length;
++        }
++        return picture;
++    }
++    if (h265 ? (type > 47) : ((type == 0) || (type > 23))) {
++        return true;  // a packet type not looked into here (STAP-B, MTAP, PACI): the marker stays
++    }
++    return isPictureNal(type, h265);
++}
++
++bool rtpMarkerWithoutPicture(GstBuffer* buffer, bool h265)
++{
++    GstMapInfo map;
++    if (!buffer || !gst_buffer_map(buffer, &map, GST_MAP_READ)) {
++        return false;
++    }
++    bool result = false;
++    const guint8* data = map.data;
++    const gsize size = map.size;
++    if ((size > 12) && ((data[0] >> 6) == 2) && (data[1] & 0x80)) {
++        gsize head = 12 + (4 * static_cast<gsize>(data[0] & 0x0F));
++        if ((data[0] & 0x10) && ((head + 4) <= size)) {
++            head += 4 + (4 * ((static_cast<gsize>(data[head + 2]) << 8) | data[head + 3]));
++        }
++        gsize end = size;
++        if ((data[0] & 0x20) && (data[size - 1] <= size)) {
++            end -= data[size - 1];
++        }
++        if (head < end) {
++            result = !rtpPayloadHasPicture(data + head, end - head, h265);
++        }
++    }
++    gst_buffer_unmap(buffer, &map);
++    return result;
++}
++
++void clearRtpMarker(GstBuffer* buffer)
++{
++    guint8 second = 0;
++    if (gst_buffer_extract(buffer, 1, &second, 1) == 1) {
++        second &= 0x7F;
++        (void) gst_buffer_fill(buffer, 1, &second, 1);
++    }
++}
++
++GstPadProbeReturn keepRtpMarkerOnPictures([[maybe_unused]] GstPad* pad, GstPadProbeInfo* info, gpointer data)
++{
++    const bool h265 = (GPOINTER_TO_INT(data) != 0);
++    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
++        GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
++        if (rtpMarkerWithoutPicture(buffer, h265)) {
++            buffer = gst_buffer_make_writable(buffer);
++            clearRtpMarker(buffer);
++            GST_PAD_PROBE_INFO_DATA(info) = buffer;
++        }
++    } else if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
++        GstBufferList* list = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
++        const guint length = list ? gst_buffer_list_length(list) : 0;
++        for (guint i = 0; i < length; ++i) {
++            if (rtpMarkerWithoutPicture(gst_buffer_list_get(list, i), h265)) {
++                list = gst_buffer_list_make_writable(list);
++                clearRtpMarker(gst_buffer_list_get_writable(list, i));
++                GST_PAD_PROBE_INFO_DATA(info) = list;
++            }
++        }
++    }
++    return GST_PAD_PROBE_OK;
++}
++
++void watchRtpMarker(GstElement* element)
++{
++    GstElementFactory* factory = gst_element_get_factory(element);
++    if (!factory) {
++        return;
++    }
++
++    const char* factoryName = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
++    const bool h264 = (g_strcmp0(factoryName, "rtph264depay") == 0);
++    const bool h265 = (g_strcmp0(factoryName, "rtph265depay") == 0);
++    if (!h264 && !h265) {
++        return;
++    }
++    GstPad* sinkPad = gst_element_get_static_pad(element, "sink");
++    if (sinkPad) {
++        (void) gst_pad_add_probe(sinkPad,
++                                 static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
++                                 keepRtpMarkerOnPictures, GINT_TO_POINTER(h265 ? 1 : 0), nullptr);
++        gst_object_unref(sinkPad);
++    }
++}
++
+ void configureAutopluggedParser([[maybe_unused]] GstBin* bin, [[maybe_unused]] GstBin* subBin, GstElement* element,
+                                 [[maybe_unused]] gpointer data)
+ {
+     configureH26xParser(element);
++    watchRtpMarker(element);  // VAMA patch (0005): the depayloader that parsebin plugs
+ }
+ 
+ // Older Linux/system GStreamer needs an autoplug-query caps filter to keep parsebin on byte-stream output.
+@@ -611,6 +740,7 @@
+                 qCCritical(GstSourceFactoryLog) << "gst_element_factory_make('rtph265depay') failed";
+                 break;
+             }
++            watchRtpMarker(rtpDepay);  // VAMA patch (0005)
+             configureH26xParser(parser);
+         } else {
+             // parsebin creates the codec parser only after it sees the stream caps. Configure that

@@ -210,6 +210,12 @@ class MainWindowMapChromeMixin:
         action_tiles_export.setToolTip("Download the same tiles into a folder, to carry to a PC that is never online.")
         action_tiles_import = tiles_menu.addAction("Import tile pack...")
         action_tiles_import.setToolTip("Bring a tile pack made on another PC into this PC's cache.")
+        tiles_menu.addSeparator()
+        action_tiles_drone_map = tiles_menu.addAction("Make the drone's map...")
+        action_tiles_drone_map.setToolTip(
+            "GPS-denied navigation: the satellite pictures the drone's down camera is matched with, as one file "
+            "for the drone's Raspberry Pi."
+        )
         action_toggle_3d = menu.addAction("Toggle 3D View")
         action_toggle_3d.setToolTip("Switch between 2D and 3D map view.")
         menu.addSeparator()
@@ -278,6 +284,8 @@ class MainWindowMapChromeMixin:
             self._on_tiles_export_pack()
         elif picked is action_tiles_import:
             self._on_tiles_import_pack()
+        elif picked is action_tiles_drone_map:
+            self._on_tiles_drone_map()
         elif picked is action_toggle_3d:
             current = bool(getattr(self._map_widget, "_is_3d_mode", False))
             self._on_toggle_map_3d(not current)
@@ -384,6 +392,56 @@ class MainWindowMapChromeMixin:
         fn = getattr(self._map_widget, "start_offline_tile_pack", None)
         if callable(fn) and fn(dest, plan):
             self._append_log(f"Map tiles: exporting a {plan.count}-tile pack to {dest}")
+
+    _DRONE_MAP_AREAS = ("The mission plan, and 2 km round it", "A square round the drone (or the map's middle)")
+
+    def _on_tiles_drone_map(self) -> None:
+        """Make the drone's map for the GPS-denied navigation (A8 step 4, vgcs/map/drone_map.py):
+        the area, the question with its size, the file, then the download in the background."""
+        title = "The drone's map"
+        mw = self._map_widget
+        if not callable(getattr(mw, "plan_drone_map", None)):
+            return
+        radius_km = None
+        areas = list(self._DRONE_MAP_AREAS)
+        if not mw.drone_map_has_mission():
+            areas = areas[1:]
+        area, ok = QInputDialog.getItem(self, title, "The map covers:", areas, 0, False)
+        if not ok:
+            return
+        if area == self._DRONE_MAP_AREAS[1]:
+            radius_km, ok = QInputDialog.getDouble(self, title, "How far round the drone, in km:", 10.0, 1.0, 40.0, 1)
+            if not ok:
+                return
+        try:
+            plan = mw.plan_drone_map(radius_km=radius_km)
+        except Exception as e:
+            QMessageBox.warning(self, title, f"Could not work out the area to cover:\n{e}")
+            return
+        if plan is None or plan.count == 0:
+            QMessageBox.information(self, title, "Nothing to download for this area.")
+            return
+        from vgcs.map.drone_map import DRONE_MAP_FILE, describe_drone_map_plan
+
+        answer = QMessageBox.question(
+            self,
+            title,
+            f"Download {describe_drone_map_plan(plan)}?\n\n"
+            "The drone's camera is matched with these pictures to find its position without GPS. "
+            "Their licence must allow using them offline on the drone: check the map source's terms.\n\n"
+            "Keep the internet connection until it ends. Pictures already on this PC are not downloaded again.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        out, _ = QFileDialog.getSaveFileName(self, "Save the drone's map", DRONE_MAP_FILE, "Map file (*.mbtiles)")
+        if not out:
+            return
+        if not out.lower().endswith(".mbtiles"):
+            out += ".mbtiles"
+        if mw.start_drone_map(out, plan):
+            self._append_log(f"Map tiles: making the drone's map, {plan.count} pictures, into {out}")
 
     def _on_tiles_import_pack(self) -> None:
         """Bring a tile pack made on another PC into this one's cache."""
