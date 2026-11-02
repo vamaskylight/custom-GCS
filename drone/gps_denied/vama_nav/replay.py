@@ -33,6 +33,7 @@ import cv2
 
 from .geo import north_east, offset
 from .geometry import Lens, Pose
+from .heights import heights_for_map
 from .map_tiles import MapError, TileMap
 from .matcher import FEATURES, Job, Matcher, MatchSettings
 
@@ -112,6 +113,7 @@ def replay(folder: Path, matcher: Matcher, match_above_m: float = 50.0, prior_er
     for row in frames:
         s.pictures += 1
         values = {k: _number(row, k) for k in ("lat", "lon", "rel_alt_m", "roll_deg", "pitch_deg", "yaw_deg")}
+        msl = _number(row, "alt_msl_m")
         local_ns = int(row["local_ns"])
         if any(v is None for v in values.values()) or values["rel_alt_m"] < match_above_m:
             seen.clear()
@@ -126,8 +128,12 @@ def replay(folder: Path, matcher: Matcher, match_above_m: float = 50.0, prior_er
         r = rng.uniform(0.0, prior_error_m)
         a = rng.uniform(0.0, 2.0 * math.pi)
         prior = offset(lat, lon, r * math.cos(a), r * math.sin(a))
+        height = values["rel_alt_m"]
+        ground = matcher.heights.at(lat, lon) if matcher.heights is not None and msl is not None else None
+        if ground is not None:
+            height = max(1.0, msl - ground)         # above the ground here, not above home
         pose = Pose(math.radians(values["roll_deg"]), math.radians(values["pitch_deg"]),
-                    math.radians(values["yaw_deg"]), values["rel_alt_m"])
+                    math.radians(values["yaw_deg"]), height)
         result = matcher.process(Job(local_ns, image, prior[0], prior[1], pose, search_m))
         s.seconds.append(result.seconds)
         out = {"flight": folder.name, "frame": row.get("frame", ""), "image": row["image"], "local_ns": local_ns,
@@ -171,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("flights", nargs="+", type=Path, help="flight folders (each with frames.csv and images/)")
     p.add_argument("--map", type=Path, required=True, help="the map (MBTiles) of the flights' area")
     p.add_argument("--map-zoom", type=int, help="the map's zoom level to match with (default: its finest)")
+    p.add_argument("--heights", type=Path, help="the ground's heights (MBTiles of terrarium tiles), for hills "
+                                                "(default: the file beside the map named MAP-heights.mbtiles)")
     p.add_argument("--features", default="orb", choices=FEATURES)
     p.add_argument("--xfeat-dir", type=Path, help="--features xfeat: XFeat's folder (default VAMA_XFEAT_DIR)")
     p.add_argument("--hfov-deg", type=float, default=66.0, help="the camera's field of view across the picture")
@@ -194,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         tile_map = TileMap(args.map, zoom=args.map_zoom)
+        heights = heights_for_map(tile_map, args.heights)
     except MapError as exc:
         print(f"map: {exc}", file=sys.stderr)
         return 2
@@ -201,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         matcher = Matcher(tile_map, Lens(args.hfov_deg, args.mount_yaw_deg, args.mount_pitch_deg, args.mount_roll_deg),
-                          MatchSettings(features=args.features, xfeat_dir=str(args.xfeat_dir or "")))
+                          MatchSettings(features=args.features, xfeat_dir=str(args.xfeat_dir or "")), heights=heights)
     except XFeatError as exc:
         print(f"xfeat: {exc}", file=sys.stderr)
         tile_map.close()

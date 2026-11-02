@@ -378,10 +378,11 @@ class SkydroidCameraControl:
                 return
             if self._zoom_max() <= ZOOM_MIN and not self._adapter.zoom_is_dzm_step():
                 return  # a camera without zoom: nothing is sent
-            if self._adapter.zoom_is_lens_pulse():
-                # The C20's lens (task AN): a short zoom per click, no absolute level. A "-"
-                # that reaches the bottom of the rail zooms the lens out to its wide end, as
-                # on the C14 Pro: the one state whose field of view is known.
+            if self._adapter.zoom_is_lens_pulse() or self._adapter.zoom_is_c20_port():
+                # A TOP lens (task AN), or the C20's camera port (row B10): a short zoom per
+                # click, no absolute level. A "-" that reaches the bottom of the rail zooms the
+                # lens out to its wide end, as on the C14 Pro: the one state whose field of view
+                # is known.
                 if int(step) < 0 and float(ui_level) <= ZOOM_MIN + 1e-6:
                     self._adapter.camera_zoom_home()
                 else:
@@ -466,6 +467,9 @@ class SkydroidCameraControl:
             if self._adapter.zoom_is_dzm_step():
                 top = max(1, int(self._adapter._profile.zoom_step_max))
                 return (ZOOM_MIN, ZOOM_MIN + top * ZOOM_STEP_SKYDROID, ZOOM_STEP_SKYDROID)
+            if self._adapter.zoom_is_c20_port():
+                # It says its zoom in whole steps of 1x (row B10): one rail step a click.
+                return (ZOOM_MIN, self._zoom_max(), 1.0)
         except Exception:
             pass
         # Counted zoom: up to this camera's highest (an added camera's own, 1.0 without zoom).
@@ -486,6 +490,12 @@ class SkydroidCameraControl:
         try:
             if self._adapter.zoom_is_lens_pulse():
                 return ZOOM_MIN + self._adapter.lens_zoom_clicks() * ZOOM_STEP_SKYDROID
+            if self._adapter.zoom_is_c20_port():
+                # The C20 says its zoom (row B10); before it does, the clicks, one step each.
+                zoom = self._adapter.c20_zoom_x()
+                if zoom is not None:
+                    return float(zoom)
+                return min(self._zoom_max(), ZOOM_MIN + float(self._adapter.lens_zoom_clicks()))
             if not self._adapter.zoom_is_dzm_step():
                 return None
             step, _reported = self._adapter.zoom_step_best()

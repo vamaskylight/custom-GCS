@@ -1,27 +1,18 @@
 """
-M9 — Sensor visualization & obstacle detection display (AeroGCS-style radar).
+M9: sensor visualization & obstacle detection display.
 
-Native Qt (PySide6): unified map HUD card — polar plot + labeled metrics + sensor pills.
+Native Qt (PySide6): unified map HUD card: labeled metrics + sensor pills + status. Its polar plot (the four sides
+of B19 and the idle sweep) is a round view in a window of its own since B25 (the client, 2026-10-31: "this proximity
+into hidden button"), opened with the card's "Proximity view" button (vgcs/map/proximity_window.py).
 """
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (
-    QColor,
-    QConicalGradient,
-    QFont,
-    QFontMetrics,
-    QPainter,
-    QPainterPath,
-    QPen,
-    QPolygonF,
-    QRadialGradient,
-)
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -34,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from vgcs.map.proximity_window import ProximityWindow
 from vgcs.skydroid.protocol import format_slr_display_m
 
 _SENSOR_LASER = 0
@@ -44,19 +36,20 @@ _OBSTACLE_BIN_COUNT = 72
 _NO_READING_CM = 0xFFFF
 
 _CARD_WIDTH_PX = 200
-_RADAR_PLOT_PX = 184
-# Idle sweep: 6.4 degrees every 90 ms, about 71 degrees a second.
-_SWEEP_FRAME_MS = 90
-_SWEEP_STEP_DEG = 6.4
+_VIEW_BUTTON_PX = 30
 _PANEL_WIDTH_PX = _CARD_WIDTH_PX
 
 _HUD_TEXT = QColor(230, 238, 252)
-_HUD_TEXT_DIM = QColor(130, 142, 168)
-_HUD_ACCENT = QColor(64, 180, 255)
-_HUD_RING = QColor(90, 118, 158)
-_HUD_SAFE = QColor(52, 211, 153)
-_HUD_WARN = QColor(251, 191, 36)
-_HUD_DANGER = QColor(248, 113, 113)
+
+_VIEW_BTN_QSS = (
+    "QPushButton#obstacleViewBtn {"
+    " color: #dce5f5; font-size: 12px; font-weight: 600;"
+    " background: rgba(36, 48, 68, 200);"
+    " border: 1px solid rgba(100, 180, 255, 110);"
+    " border-radius: 8px; padding: 0 6px;"
+    "}"
+    "QPushButton#obstacleViewBtn:hover { background: rgba(50, 66, 92, 230); }"
+)
 
 _CARD_QSS = (
     "QFrame#obstacleHudCard {"
@@ -134,22 +127,6 @@ def _orientation_label(orientation: int) -> str:
     return names.get(int(orientation), f"#{int(orientation)}")
 
 
-def _mav_to_qt_deg(mav_deg: float) -> float:
-    return (90.0 - float(mav_deg)) % 360.0
-
-
-def _threat_color(dist_m: float, max_r_m: float, *, stale: bool) -> QColor:
-    t = 1.0 - min(1.0, dist_m / max(max_r_m * 0.35, 1.0))
-    if t < 0.45:
-        col = QColor(_HUD_SAFE)
-    elif t < 0.75:
-        col = QColor(_HUD_WARN)
-    else:
-        col = QColor(_HUD_DANGER)
-    col.setAlpha(90 if stale else 200)
-    return col
-
-
 @dataclass
 class ObstacleDistanceState:
     sensor_type: int = _SENSOR_LASER
@@ -183,256 +160,6 @@ class DistanceSensorState:
     min_distance_m: float = 0.0
     max_distance_m: float = 30.0
     updated_mono: float = 0.0
-
-
-class ObstacleRadarCanvas(QWidget):
-    """Hero polar plot — vehicle forward = top."""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setFixedSize(_RADAR_PLOT_PX, _RADAR_PLOT_PX)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAutoFillBackground(False)
-        self._obstacle = ObstacleDistanceState()
-        self._stale = True
-        self._has_proximity = False
-        # The drone's own proximity sensor in 8 directions (vgcs.app.obstacle_watch radar_view), or None.
-        self._sectors: dict | None = None
-        self._sweep_deg = 0.0
-        # The idle sweep turns at about 71 degrees a second. It was drawn every
-        # 45 ms, and with its see-through corners each frame also redraws the
-        # map under it: the largest single cost on the window's thread in the
-        # window test against the simulator (2026-10-07). Every 90 ms, twice
-        # the step, turns it just as fast for half the drawing.
-        self._anim = QTimer(self)
-        self._anim.setInterval(_SWEEP_FRAME_MS)
-        self._anim.timeout.connect(self._advance_sweep)
-        self._anim.start()
-
-    def _advance_sweep(self) -> None:
-        if self._has_proximity:
-            return
-        self._sweep_deg = (self._sweep_deg + _SWEEP_STEP_DEG) % 360.0
-        self.update()
-
-    def set_obstacle_state(self, state: ObstacleDistanceState) -> None:
-        self._obstacle = state
-        self._stale = (time.monotonic() - float(state.updated_mono or 0.0)) > 2.5
-        if self._sectors is None:
-            self._has_proximity = state.active_bin_count() > 0
-        self.update()
-
-    def set_sector_view(self, view: dict | None) -> None:
-        """The drone's proximity sensor, 8 directions (None: back to OBSTACLE_DISTANCE)."""
-        new = dict(view) if isinstance(view, dict) else None
-        if new == self._sectors:
-            return
-        self._sectors = new
-        if self._sectors is None:
-            self._has_proximity = self._obstacle.active_bin_count() > 0
-        else:
-            self._has_proximity = any(d is not None for d in self._sectors.get("directions_m") or [])
-        self.update()
-
-    @staticmethod
-    def _annular_wedge(
-        path: QPainterPath,
-        cx: float,
-        cy: float,
-        r_in: float,
-        r_out: float,
-        mav_start_deg: float,
-        mav_end_deg: float,
-    ) -> None:
-        qs = _mav_to_qt_deg(mav_start_deg)
-        qe = _mav_to_qt_deg(mav_end_deg)
-        span = qe - qs
-        if span <= 0.1:
-            span += 360.0
-        rect_out = QRectF(cx - r_out, cy - r_out, 2 * r_out, 2 * r_out)
-        rect_in = QRectF(cx - r_in, cy - r_in, 2 * r_in, 2 * r_in)
-        path.arcMoveTo(rect_out, qs)
-        path.arcTo(rect_out, qs, span)
-        path.arcTo(rect_in, qs + span, -span)
-        path.closeSubpath()
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        del event
-        p = QPainter(self)
-        if not p.isActive():
-            return
-        try:
-            self._paint_radar(p)
-        except Exception:
-            pass
-
-    def _paint_sectors(self, p: QPainter, cx: float, cy: float, radius: float, max_r_m: float, view: dict) -> None:
-        """One arc for each direction with an object, at its distance, and the stop distance as a dashed ring.
-
-        Red within the stop distance, amber within the warning distance, green beyond.
-        """
-        stop = view.get("stop_m")
-        red_m = float(view.get("red_m") or 0.0)
-        near_m = float(view.get("near_m") or 0.0)
-        if stop:
-            rr = radius * 0.9 * min(1.0, float(stop) / max_r_m)
-            p.setPen(QPen(QColor(248, 113, 113, 150), 1.2, Qt.PenStyle.DashLine))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(cx, cy), rr, rr)
-        for index, d in enumerate(view.get("directions_m") or []):
-            if d is None:
-                continue
-            dist = min(float(d), max_r_m)
-            r = max(radius * 0.14, radius * 0.9 * dist / max_r_m)
-            colour = _HUD_DANGER if d <= red_m else (_HUD_WARN if d <= near_m else _HUD_SAFE)
-            p.setPen(QPen(colour, 5.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
-            # Qt's angles run counter-clockwise from 3 o'clock: the arc starts at the direction's right edge.
-            start = _mav_to_qt_deg(index * 45.0 + 20.0)
-            p.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), int(start * 16), int(40.0 * 16))
-        up = view.get("up_m")
-        if up is not None:
-            f_up = QFont("Segoe UI", 8)
-            f_up.setWeight(QFont.Weight.DemiBold)
-            p.setFont(f_up)
-            p.setPen(_HUD_DANGER if up <= red_m else _HUD_TEXT)
-            p.drawText(QRectF(2, 2, 70, 14), int(Qt.AlignmentFlag.AlignLeft), f"UP {up:.1f} m")
-
-    def _paint_radar(self, p: QPainter) -> None:
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        cx, cy = w / 2.0, h / 2.0
-        radius = min(w, h) * 0.46
-
-        p.setPen(QPen(QColor(255, 255, 255, 35), 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(cx, cy), radius * 1.02, radius * 1.02)
-
-        inner_r = radius * 0.96
-        p.setPen(QPen(QColor(148, 160, 180, 82), 2))
-        p.setBrush(QColor(22, 26, 34, int(0.96 * 255)))
-        p.drawEllipse(QPointF(cx, cy), inner_r, inner_r)
-        radius = inner_r
-
-        sectors = self._sectors
-        if sectors is not None:
-            max_r_m = max(1.0, float(sectors.get("scale_m") or 10.0))
-        else:
-            max_r_m = max(0.5, float(self._obstacle.max_distance_m or 30.0))
-        ring_fracs = (0.33, 0.66, 1.0)
-        f_ring = QFont("Segoe UI", 8)
-        f_ring.setWeight(QFont.Weight.DemiBold)
-        p.setFont(f_ring)
-
-        for i, frac in enumerate(ring_fracs):
-            rr = radius * frac * 0.92
-            alpha = 95 if i < 2 else 130
-            p.setPen(QPen(QColor(_HUD_RING.red(), _HUD_RING.green(), _HUD_RING.blue(), alpha), 1.2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - rr, cy - rr, 2 * rr, 2 * rr))
-            dist_lbl = max_r_m * frac
-            p.setPen(_HUD_TEXT_DIM)
-            p.drawText(
-                int(cx + rr - 22),
-                int(cy - 6),
-                20,
-                12,
-                int(Qt.AlignmentFlag.AlignRight),
-                f"{dist_lbl:.0f}",
-            )
-
-        p.setPen(QPen(QColor(140, 160, 190, 90), 1.0))
-        for deg in range(0, 360, 30):
-            rad = math.radians(deg - 90.0)
-            r0 = radius * 0.88
-            r1 = radius * 0.96
-            p.drawLine(
-                QPointF(cx + r0 * math.cos(rad), cy + r0 * math.sin(rad)),
-                QPointF(cx + r1 * math.cos(rad), cy + r1 * math.sin(rad)),
-            )
-
-        p.setPen(QPen(QColor(100, 130, 170, 50), 1.0))
-        p.drawLine(int(cx - radius * 0.9), int(cy), int(cx + radius * 0.9), int(cy))
-        p.drawLine(int(cx), int(cy - radius * 0.9), int(cx), int(cy + radius * 0.9))
-
-        if not self._has_proximity:
-            sweep_rad = math.radians(self._sweep_deg - 90.0)
-            sweep_grad = QConicalGradient(cx, cy, self._sweep_deg - 90.0)
-            sweep_grad.setColorAt(0.0, QColor(64, 180, 255, 0))
-            sweep_grad.setColorAt(0.08, QColor(64, 180, 255, 55))
-            sweep_grad.setColorAt(0.2, QColor(64, 180, 255, 0))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(sweep_grad)
-            p.drawEllipse(QRectF(cx - radius * 0.92, cy - radius * 0.92, 1.84 * radius, 1.84 * radius))
-            p.setPen(QPen(QColor(64, 180, 255, 120), 2.0))
-            p.drawLine(
-                QPointF(cx, cy),
-                QPointF(cx + radius * 0.88 * math.cos(sweep_rad), cy + radius * 0.88 * math.sin(sweep_rad)),
-            )
-
-        obs = self._obstacle
-        inc = float(obs.increment_deg or 5.0)
-        off = float(obs.angle_offset_deg or 0.0)
-        r_in = max(5.0, radius * 0.12)
-
-        if sectors is not None:
-            self._paint_sectors(p, cx, cy, radius, max_r_m, sectors)
-        p.setPen(Qt.PenStyle.NoPen)
-        for i, d_cm in enumerate([] if sectors is not None else obs.distances_cm[:_OBSTACLE_BIN_COUNT]):
-            if d_cm <= 0 or d_cm >= _NO_READING_CM:
-                continue
-            dist_m = min(float(d_cm) / 100.0, max_r_m)
-            center_deg = off + float(i) * inc
-            half = inc * 0.46
-            r_out = radius * 0.9 * (dist_m / max_r_m)
-            wedge_path = QPainterPath()
-            self._annular_wedge(wedge_path, cx, cy, r_in, r_out, center_deg - half, center_deg + half)
-            p.setBrush(_threat_color(dist_m, max_r_m, stale=self._stale))
-            p.drawPath(wedge_path)
-
-            rad = math.radians(center_deg - 90.0)
-            r_px = radius * 0.9 * (dist_m / max_r_m)
-            hx = cx + r_px * math.cos(rad)
-            hy = cy + r_px * math.sin(rad)
-            glow = QRadialGradient(hx, hy, 8)
-            glow.setColorAt(0, QColor(255, 255, 255, 220))
-            glow.setColorAt(1, QColor(255, 255, 255, 0))
-            p.setBrush(glow)
-            p.drawEllipse(QRectF(hx - 5, hy - 5, 10, 10))
-
-        # The card is drawn with the drone's nose up (the readings are the drone's own directions),
-        # so the top is ahead, not north. It said "N" until 2026-10-27.
-        p.setPen(QColor(248, 113, 113, 230))
-        f_n = QFont("Segoe UI", 9)
-        f_n.setWeight(QFont.Weight.Bold)
-        p.setFont(f_n)
-        p.drawText(int(cx - 16), int(cy - radius + 8), 32, 14, int(Qt.AlignmentFlag.AlignCenter), "FWD")
-
-        tri_r = max(8.0, radius * 0.1)
-        tri = QPolygonF(
-            [
-                QPointF(cx, cy - tri_r),
-                QPointF(cx - tri_r * 0.7, cy + tri_r * 0.58),
-                QPointF(cx + tri_r * 0.7, cy + tri_r * 0.58),
-            ]
-        )
-        p.setPen(QPen(_HUD_TEXT, 1.6))
-        fill = _HUD_ACCENT if not self._stale else QColor(_HUD_ACCENT.red(), _HUD_ACCENT.green(), _HUD_ACCENT.blue(), 150)
-        p.setBrush(fill)
-        p.drawPolygon(tri)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(255, 255, 255, 180))
-        p.drawEllipse(QRectF(cx - 2.5, cy - 2.5, 5, 5))
-
-        f_max = QFont("Segoe UI", 8)
-        f_max.setWeight(QFont.Weight.DemiBold)
-        p.setFont(f_max)
-        p.setPen(QColor(241, 245, 255, 160))
-        p.drawText(
-            QRectF(cx - radius, cy + radius - 18, 2 * radius, 14),
-            int(Qt.AlignmentFlag.AlignHCenter),
-            f"MAX {max_r_m:.0f} m",
-        )
 
 
 class _MetricBlock(QWidget):
@@ -678,9 +405,11 @@ class _SensorPills(QWidget):
 
 
 class ObstacleRadarPanel(QFrame):
-    """Top-left map HUD — single card: radar + metrics + sensor pills + status."""
+    """Top-left map HUD, a single card: the round view's button + metrics + sensor pills + status."""
 
     c13_lrf_lock_clicked = Signal()
+    # The range of the round view, chosen in its window (the main window saves it, vgcs.app.obstacle_watch).
+    bar_range_chosen = Signal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -715,15 +444,16 @@ class ObstacleRadarPanel(QFrame):
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         card_lay.addWidget(header)
 
-        self._radar = ObstacleRadarCanvas(card)
-        radar_wrap = QWidget()
-        radar_wrap.setStyleSheet("background: transparent; border: none;")
-        radar_lay = QHBoxLayout(radar_wrap)
-        radar_lay.setContentsMargins(0, 0, 0, 0)
-        radar_lay.addStretch(1)
-        radar_lay.addWidget(self._radar)
-        radar_lay.addStretch(1)
-        card_lay.addWidget(radar_wrap)
+        # The round view (B25): in its own window, which the user places and sizes, opened from here.
+        self._view_button = QPushButton("Proximity view")
+        self._view_button.setObjectName("obstacleViewBtn")
+        self._view_button.setStyleSheet(_VIEW_BTN_QSS)
+        self._view_button.setFixedHeight(_VIEW_BUTTON_PX)
+        self._view_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._view_button.setToolTip("The obstacles round the drone, as Mission Planner shows them, in a window")
+        self._view_button.clicked.connect(self.open_proximity_window)
+        card_lay.addWidget(self._view_button)
+        self._window: ProximityWindow | None = None
 
         divider = QFrame()
         divider.setStyleSheet(_DIVIDER_QSS)
@@ -792,8 +522,36 @@ class ObstacleRadarPanel(QFrame):
 
     @staticmethod
     def _panel_height_px() -> int:
-        # Card: header(16) + radar(184) + divider + metrics(~48) + pills(~32) + status(~20) + margins/spacing
-        return 8 + 16 + 8 + _RADAR_PLOT_PX + 8 + 1 + 8 + 48 + 8 + 32 + 8 + 20 + 8
+        # Card: header(16) + view button + divider + metrics(~48) + pills(~32) + status(~20) + margins/spacing
+        return 8 + 16 + 8 + _VIEW_BUTTON_PX + 8 + 1 + 8 + 48 + 8 + 32 + 8 + 20 + 8
+
+    # -- the round view's window (B25) ------------------------------------------------------
+    def open_proximity_window(self) -> ProximityWindow:
+        """Show the round view's window (made the first time), with what the card knows now."""
+        if self._window is None:
+            self._window = ProximityWindow(self.window())
+            self._window.bar_range_chosen.connect(self.bar_range_chosen.emit)
+        self._feed_window()
+        self._window.show()
+        self._window.raise_()
+        self._window.activateWindow()
+        return self._window
+
+    def proximity_window(self) -> ProximityWindow | None:
+        return self._window
+
+    def _feed_window(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        if self._sector_view is not None:
+            window.set_view(self._sector_view)
+        elif self._obstacle.active_bin_count() > 0:
+            window.set_view(None)
+            window.set_obstacle_bins(self._obstacle.distances_cm, self._obstacle.increment_deg,
+                                     self._obstacle.angle_offset_deg, self._obstacle.max_distance_m)
+        else:
+            window.clear()
 
     def sizeHint(self) -> QSize:  # noqa: N802
         return QSize(_PANEL_WIDTH_PX, self._panel_height_px())
@@ -906,7 +664,8 @@ class ObstacleRadarPanel(QFrame):
             self._proximity_stream_seen = False
             self._rangefinder_stream_seen = False
             self._sector_view = None
-            self._radar.set_sector_view(None)
+            self._obstacle = ObstacleDistanceState()
+            self._feed_window()
             self._c13_lrf_ui = False
             self._c13_lrf_armed = False
             self._c13_lrf_locked = False
@@ -939,7 +698,8 @@ class ObstacleRadarPanel(QFrame):
         )
         self._obstacle = st
         self._proximity_stream_seen = True
-        self._radar.set_obstacle_state(st)
+        if self._sector_view is None:
+            self._feed_window()
 
         nearest = st.nearest_m()
         fam = _sensor_family_label(st.sensor_type)
@@ -959,7 +719,7 @@ class ObstacleRadarPanel(QFrame):
         self._sync_status_line()
 
     def set_proximity_view(self, view: dict | None) -> None:
-        """The drone's proximity sensor in 8 directions (vgcs.app.obstacle_watch ``radar_view``).
+        """The drone's proximity sensor (vgcs.app.obstacle_watch ``radar_view``).
 
         None takes the card back to OBSTACLE_DISTANCE and the waiting words. It comes several times a
         second, mostly unchanged: nothing is restyled then.
@@ -968,7 +728,7 @@ class ObstacleRadarPanel(QFrame):
         if new == self._sector_view:
             return
         self._sector_view = new
-        self._radar.set_sector_view(self._sector_view)
+        self._feed_window()
         if self._sector_view is not None:
             self._proximity_stream_seen = True
             where = str(self._sector_view.get("nearest_where") or "") or "LiDAR"
@@ -1124,15 +884,8 @@ class ObstacleRadarPanel(QFrame):
         self._sensor_pills.set_active(which)
 
     def _refresh_stale_ui(self) -> None:
-        now = time.monotonic()
-        obs_age = now - float(self._obstacle.updated_mono or 0.0)
-        rf_age = now - float(self._rangefinder.updated_mono or 0.0)
         if self._obstacle.updated_mono <= 0 and self._rangefinder.updated_mono <= 0:
             return
-        if obs_age > 2.5:
-            self._radar.set_obstacle_state(self._obstacle)
-        elif obs_age <= 2.5:
-            self._radar.set_obstacle_state(self._obstacle)
         self._sync_status_line()
 
     def summary_text(self) -> tuple[str, str]:

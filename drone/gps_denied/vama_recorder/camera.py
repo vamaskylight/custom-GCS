@@ -67,7 +67,8 @@ class PiCamera:
             cam = Picamera2(self.settings.camera_index)
         except (IndexError, RuntimeError) as exc:
             raise CameraError(f"no camera found on camera port {self.settings.camera_index} ({exc}). "
-                              "Check the ribbon cable and: rpicam-hello --list-cameras") from None
+                              "Check that no other program uses it (sudo systemctl stop vama-recorder), the ribbon cable, "
+                              "and: rpicam-hello --list-cameras") from None
         self._cam = cam
         self._size = tuple(self.settings.size or cam.sensor_resolution)
         config = cam.create_still_configuration(main={"size": self._size}, buffer_count=2)

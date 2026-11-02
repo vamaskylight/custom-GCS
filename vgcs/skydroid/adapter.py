@@ -8,7 +8,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from vgcs.skydroid import c20_camera
 from vgcs.skydroid.command_map import (
+    ZOOM_MODEL_C20_PORT,
     ZOOM_MODEL_DZM_STEP,
     ZOOM_MODEL_LENS_PULSE,
     SkydroidCommandProfile,
@@ -158,6 +160,13 @@ _DZM_STEP_FRESH_S = 10.0
 # the lens counts as wide open (it does not say).
 _LENS_ZOOM_PULSE_S = 0.55
 _LENS_HOME_S = 8.0
+# The C20's camera port (row B10): "1x" zooms out until it says 1x, at most this long (its 22x
+# lens's travel is not measured); its zoom is asked this long after a stop, this often during
+# "1x", and this often otherwise (it can be zoomed by Skydroid's own app too).
+_C20_HOME_S = 30.0
+_C20_ASK_AFTER_STOP_S = 0.35
+_C20_HOME_ASK_S = 0.25
+_C20_ASK_EVERY_S = 2.0
 _LRF_REPOINT_AFTER_S = 4.0
 _LRF_GIMBAL_SLEW_SPEED_DPS = 2.0
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
@@ -343,6 +352,11 @@ class SkydroidTopUdpAdapter:
         # Zoom-in clicks not zoomed out again since the last "1x" run: the zoom rail's count. Without
         # it the rail kept a level of its own and dropped a "-" at its floor, the lens still zoomed in.
         self._lens_clicks = 0
+        # The C20's camera port (row B10, vgcs/skydroid/c20_camera.py), opened by start(). A zoom it
+        # said before its last click or "1x" no longer says where it is.
+        self._c20_port: c20_camera.C20CameraPort | None = None
+        self._c20_moved_mono = 0.0
+        self._c20_ask_due_mono = 0.0
         port_i = int(port)
         if port_i not in _C13_PROBE_PORTS:
             try:
@@ -3822,6 +3836,7 @@ class SkydroidTopUdpAdapter:
         self._status_poller.start()
         self._probe_thread = threading.Thread(target=self._probe_endpoints_bg, daemon=True)
         self._probe_thread.start()
+        self._sync_c20_port()
 
     def stop(self) -> None:
         if self._cancel_lens_timer():
@@ -3836,6 +3851,9 @@ class SkydroidTopUdpAdapter:
         except Exception:
             pass
         self._transport.close()
+        port, self._c20_port = self._c20_port, None
+        if port is not None:
+            port.close()
 
     def ptz(self, action: str) -> None:
         action_l = str(action or "").strip().lower()
@@ -3921,7 +3939,7 @@ class SkydroidTopUdpAdapter:
         self._enqueue(self._profile.camera_commands.get("photo", []), {}, True)
 
     def camera_zoom(self, level: float) -> None:
-        if self.zoom_is_lens_pulse():
+        if self.zoom_is_lens_pulse() or self.zoom_is_c20_port():
             return  # no absolute zoom: the lens zooms while it is told to
         if self.zoom_is_dzm_step():
             # No absolute zoom on a DZM-step camera: a "level" is not a step
@@ -3933,7 +3951,7 @@ class SkydroidTopUdpAdapter:
         self._enqueue(["ZOOM_BURST"], {"level": float(level)}, False)
 
     def camera_zoom_step(self, direction: int) -> None:
-        if self.zoom_is_lens_pulse():
+        if self.zoom_is_lens_pulse() or self.zoom_is_c20_port():
             self._lens_pulse(int(direction))
             return
         if self.zoom_is_dzm_step():
@@ -3962,6 +3980,7 @@ class SkydroidTopUdpAdapter:
             if d > 0:
                 self._lens_at_one = False  # zoomed in: how far, it does not say
             self._lens_clicks = max(0, self._lens_clicks + d)
+            self._c20_moved_mono = time.monotonic()
         self._enqueue(["LENS_ZOOM"], {"action": "in" if d > 0 else "out"}, False)
         self._arm_lens_timer(_LENS_ZOOM_PULSE_S, home=False)
 
@@ -3997,6 +4016,16 @@ class SkydroidTopUdpAdapter:
         return True
 
     def _send_lens_frame(self, action: str) -> None:
+        if self.zoom_is_c20_port():
+            # Its camera port (row B10): Skydroid's packets, and its zoom asked a moment after a stop.
+            packet = {"in": c20_camera.build_zoom_in(), "out": c20_camera.build_zoom_out()}.get(
+                action, c20_camera.build_zoom_stop())
+            self._c20_send(packet, what=f"zoom {action}")
+            if action not in ("in", "out"):
+                timer = threading.Timer(_C20_ASK_AFTER_STOP_S, lambda: self._enqueue(["C20_ASK"], {}, False))
+                timer.daemon = True
+                timer.start()
+            return
         self._ensure_active_transport()
         frame = build_lens_zoom(action)
         try:
@@ -4008,6 +4037,73 @@ class SkydroidTopUdpAdapter:
     def lens_at_one(self) -> bool:
         with self._zoom_lock:
             return bool(self._lens_at_one)
+
+    # --- The C20's camera port (row B10, Skydroid's RC SDK, 2026-11-03) -------------
+    # Its zoom takes Skydroid's binary packets on TCP 8100, beside TOP on 5000 (c20_camera.py), with
+    # the clicks, stops and "1x" run of a lens zoom above. It says its zoom there.
+
+    def zoom_is_c20_port(self) -> bool:
+        return str(getattr(self._profile, "zoom_model", "") or "") == ZOOM_MODEL_C20_PORT
+
+    def _sync_c20_port(self) -> None:
+        """Open the camera port of a C20 at the camera's address; close it for another camera."""
+        want = self.zoom_is_c20_port()
+        host = str(getattr(self._transport, "_host", "") or "")
+        port = self._c20_port
+        if port is not None and (not want or port.address[0] != host):
+            self._c20_port = None
+            port.close()
+            port = None
+        if want and port is None and host:
+            port = c20_camera.C20CameraPort(host, c20_camera.PORT, log=lambda text: print(text, flush=True))
+            port.start()
+            self._c20_port = port
+
+    def _c20_send(self, packet: bytes, *, what: str = "") -> None:
+        port = self._c20_port
+        sent = port is not None and port.send(packet)
+        if what:
+            try:
+                print(f"[VGCS:skydroid] C20 camera port: {what}{'' if sent else ' (not connected)'}", flush=True)
+            except Exception:
+                pass
+
+    def _c20_ask_if_due(self) -> None:
+        """Its zoom every _C20_ASK_EVERY_S from the status loop (Skydroid's own app can zoom it too)."""
+        if self._c20_port is None or not self.zoom_is_c20_port():
+            return
+        now = time.monotonic()
+        if now >= self._c20_ask_due_mono:
+            self._c20_ask_due_mono = now + _C20_ASK_EVERY_S
+            self._enqueue(["C20_ASK"], {}, False)
+
+    def c20_zoom_x(self) -> int | None:
+        """The zoom the C20 said since it last zoomed (1 to 22), or None."""
+        port = self._c20_port
+        if port is None:
+            return None
+        with self._zoom_lock:
+            moved = self._c20_moved_mono
+        if port.zoom_said_mono() <= moved:
+            return None
+        return port.zoom_x(max_age_s=_DZM_STEP_FRESH_S)
+
+    def _c20_watch_home(self, run: threading.Timer | None) -> None:
+        """While a C20's "1x" run lasts: ask its zoom, and stop the run as soon as it says 1x."""
+        started = time.monotonic()
+        while self._running:
+            with self._zoom_lock:
+                if run is None or self._lens_stop_timer is not run:
+                    return  # the run ended, or a click ended it
+            self._enqueue(["C20_ASK"], {}, False)
+            port = self._c20_port
+            if port is not None and port.zoom_said_mono() > started and port.zoom_x() == 1:
+                if self._cancel_lens_timer():
+                    with self._zoom_lock:
+                        self._lens_at_one = True
+                    self._enqueue(["LENS_ZOOM"], {"action": "stop"}, False)
+                return
+            time.sleep(_C20_HOME_ASK_S)
 
     def lens_homing(self) -> bool:
         """A "1x" run is under way: the lens zooms out to its wide end."""
@@ -4026,6 +4122,17 @@ class SkydroidTopUdpAdapter:
 
     def camera_zoom_home(self) -> None:
         """Short-focus lens at 1x - the one zoom state whose FOV is known."""
+        if self.zoom_is_c20_port():
+            # Out until it says 1x (_c20_watch_home stops it then), at most _C20_HOME_S.
+            with self._zoom_lock:
+                self._lens_clicks = 0
+                self._c20_moved_mono = time.monotonic()
+            self._enqueue(["LENS_ZOOM"], {"action": "out"}, False)
+            self._arm_lens_timer(_C20_HOME_S, home=True)
+            with self._zoom_lock:
+                run = self._lens_stop_timer
+            threading.Thread(target=self._c20_watch_home, args=(run,), daemon=True).start()
+            return
         if self.zoom_is_lens_pulse():
             with self._zoom_lock:
                 self._lens_clicks = 0
@@ -4088,6 +4195,14 @@ class SkydroidTopUdpAdapter:
         """
         if self.zoom_is_lens_pulse():
             return "1.0x" if (self.lens_at_one() or self.lens_homing()) else "Zoom ?"
+        if self.zoom_is_c20_port():
+            # As it says it (row B10); "1.0x" from the start of a "1x" run, as above.
+            if self.lens_homing():
+                return "1.0x"
+            zoom = self.c20_zoom_x()
+            if zoom is not None:
+                return f"{float(zoom):.1f}x"
+            return "1.0x" if self.lens_at_one() else "Zoom ?"
         if not self.zoom_is_dzm_step():
             return ""
         step, reported = self.zoom_step_best()
@@ -4165,6 +4280,19 @@ class SkydroidTopUdpAdapter:
         the only failure the operator can see.
         """
         prof = self._profile
+        if self.zoom_is_c20_port():
+            # It says its zoom in whole steps of 1x only: a click is turned into an angle at 1x only.
+            name = str(getattr(prof, "display_name", "") or prof.profile_id)
+            if self.lens_homing():
+                return f"{name} is zooming out to 1x. Wait a moment, then click again."
+            zoom = self.c20_zoom_x()
+            if zoom == 1 or (zoom is None and self.lens_at_one()):
+                return ""
+            if zoom is not None:
+                return (f"{name} says its zoom in whole steps only ({zoom}x now), so a click is turned into an "
+                        "angle at 1x only. Zoom fully out: press - until the zoom shows 1.0x, then click again.")
+            return (f"{name} has not said its zoom since it last zoomed, so a click cannot be turned into an "
+                    "angle. Zoom fully out: press - until the zoom shows 1.0x, then click again.")
         if self.zoom_is_lens_pulse():
             if self.lens_at_one():
                 return ""
@@ -4608,6 +4736,9 @@ class SkydroidTopUdpAdapter:
                 except Exception:
                     pass
                 continue
+            if commands and commands[0] == "C20_ASK":
+                self._c20_send(c20_camera.build_zoom_query())
+                continue
             if commands and commands[0] == "GSY_GSP_SPLIT":
                 try:
                     self._send_split_axis_speed(
@@ -4783,6 +4914,7 @@ class SkydroidTopUdpAdapter:
                 self._poll_zoom_step_if_due()
             except Exception:
                 pass
+            self._c20_ask_if_due()
             interval = 1.0 if not self.gimbal_telemetry_ok() else 0.5
             time.sleep(interval)
 

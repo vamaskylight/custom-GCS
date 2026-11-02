@@ -92,6 +92,8 @@ QString zoomName(Zoom zoom)
         return QStringLiteral("live");
     case Zoom::Pulse:
         return QStringLiteral("pulse");
+    case Zoom::C20:
+        return QStringLiteral("c20");
     case Zoom::Counted:
         break;
     }
@@ -178,11 +180,12 @@ QList<Profile> builtInProfiles()
     // (34.9 high), -90 to +45 degrees, 150 either way, no laser, no thermal picture. Its day
     // video as the client's own camera file had it (2026-10-22, the picture worked). TOP lists
     // no photo or recording command for the C20: they are on, to be tried on the camera. Its
-    // zoom is the lens's (task AN): ZMC to the lens address M, held while it zooms, and no zoom
-    // report, so the "pulse" zoom. The V13's counted step did not zoom it (client 2026-10-27).
+    // zoom (row B10): neither the V13's step nor TOP's lens zoom (ZMC to M) moved it (client
+    // 2026-10-27, 2026-10-30). Skydroid's RC SDK zooms it by binary packets on TCP 8100, its
+    // camera port, which also says the zoom (C20Camera.h): the "c20" zoom.
     Profile c20 = skydroid("C20", "V20");
     c20.tcp = true;
-    c20.zoom = Zoom::Pulse;
+    c20.zoom = Zoom::C20;
     c20.dayVideoUrl = QStringLiteral("rtsp://192.168.144.108:554/main");
     c20.thermalVideoUrl.clear();
     c20.fovHDeg = 58.3;
@@ -269,9 +272,9 @@ void dayFov(const Profile &p, int countedSteps, int reportedStep, double &horizo
         verticalDeg = narrow(lens.fovVDeg, static_cast<double>(p.sensorH - p.cropStepH * m) / p.sensorH);
         return;
     }
-    if (p.zoom == Zoom::Counted) {
-        // Narrowed by the zoom counted, as VGCS does (tan(fov/2) / zoom).
-        const double zoomX = 1.0 + countedSteps * kCountedStepZoom;
+    if (p.zoom == Zoom::Counted || p.zoom == Zoom::C20) {
+        // Narrowed by the zoom counted, or the zoom a C20 says, as VGCS does (tan(fov/2) / zoom).
+        const double zoomX = p.zoom == Zoom::C20 ? std::max(1, reportedStep) : 1.0 + countedSteps * kCountedStepZoom;
         horizontalDeg = narrow(p.fovHDeg, 1.0 / zoomX);
         verticalDeg = narrow(p.fovVDeg, 1.0 / zoomX);
         return;
@@ -284,6 +287,9 @@ QString zoomLabel(const Profile &p, int countedSteps, int reportedStep)
 {
     if (p.zoom == Zoom::Counted) {
         return QStringLiteral("%1x").arg(1.0 + countedSteps * kCountedStepZoom, 0, 'f', 1);
+    }
+    if (p.zoom == Zoom::C20) {
+        return reportedStep > 0 ? QStringLiteral("%1x").arg(static_cast<double>(reportedStep), 0, 'f', 1) : QString();
     }
     if (p.zoom != Zoom::Reported || p.lenses.empty() || reportedStep < 0) {
         // A reported zoom: until the camera reports its step, nothing rather than a guess.
@@ -325,8 +331,9 @@ QString problem(const Profile &p)
     // Each protocol has its zooms. The app uses no tracker of a Viewpro or SIYI camera, and no laser of a SIYI.
     switch (p.protocol) {
     case Protocol::Top:
-        if (p.zoom != Zoom::None && p.zoom != Zoom::Counted && p.zoom != Zoom::Reported && p.zoom != Zoom::Pulse) {
-            return text("A Skydroid TOP camera's zoom is none, counted, reported or pulse.");
+        if (p.zoom != Zoom::None && p.zoom != Zoom::Counted && p.zoom != Zoom::Reported && p.zoom != Zoom::Pulse &&
+            p.zoom != Zoom::C20) {
+            return text("A Skydroid TOP camera's zoom is none, counted, reported, pulse or c20.");
         }
         break;
     case Protocol::Viewpro:
@@ -522,8 +529,10 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
         p.zoom = Zoom::Live;
     } else if (zoom == QLatin1String("pulse")) {
         p.zoom = Zoom::Pulse;
+    } else if (zoom == QLatin1String("c20")) {
+        p.zoom = Zoom::C20;
     } else if (missing.isEmpty()) {
-        return fail(text("its zoom is not one of none, counted, reported, live or pulse."));
+        return fail(text("its zoom is not one of none, counted, reported, live, pulse or c20."));
     }
     if (p.zoom == Zoom::Reported) {
         p.lenses.clear();
@@ -553,7 +562,8 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
         p.fovVDeg = number("dayFovV");
         // A pulse zoom keeps its lens's range too, when its file has one (the V20's 22x), though
         // nothing counts it.
-        if (p.zoom == Zoom::Counted || (p.zoom == Zoom::Pulse && json.contains(QStringLiteral("maxZoom")))) {
+        if (p.zoom == Zoom::Counted ||
+            ((p.zoom == Zoom::Pulse || p.zoom == Zoom::C20) && json.contains(QStringLiteral("maxZoom")))) {
             p.maxZoom = number("maxZoom");
         }
     }

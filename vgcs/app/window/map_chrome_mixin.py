@@ -214,7 +214,7 @@ class MainWindowMapChromeMixin:
         action_tiles_drone_map = tiles_menu.addAction("Make the drone's map...")
         action_tiles_drone_map.setToolTip(
             "GPS-denied navigation: the satellite pictures the drone's down camera is matched with, as one file "
-            "for the drone's Raspberry Pi."
+            "for the drone's Raspberry Pi, and the ground's heights of the area as a second."
         )
         action_toggle_3d = menu.addAction("Toggle 3D View")
         action_toggle_3d.setToolTip("Switch between 2D and 3D map view.")
@@ -429,6 +429,8 @@ class MainWindowMapChromeMixin:
             f"Download {describe_drone_map_plan(plan)}?\n\n"
             "The drone's camera is matched with these pictures to find its position without GPS. "
             "Their licence must allow using them offline on the drone: check the map source's terms.\n\n"
+            "The ground's heights of the area come too, as a second small file: over hills the matching needs them. "
+            "They are the open Terrain Tiles (on land SRTM, courtesy of the U.S. Geological Survey).\n\n"
             "Keep the internet connection until it ends. Pictures already on this PC are not downloaded again.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,

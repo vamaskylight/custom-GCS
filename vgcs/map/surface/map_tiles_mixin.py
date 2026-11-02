@@ -1094,6 +1094,7 @@ class MapTilesMixin:
         from PySide6.QtCore import QThreadPool
 
         from vgcs.map import native_tile_map as _ntm
+        from vgcs.map.drone_map import plan_drone_heights
         from vgcs.map.surface.tile_pack_task import DroneMapTask, TilePackBridge
         import threading
 
@@ -1109,10 +1110,13 @@ class MapTilesMixin:
         self._tile_pack_cancel = cancel
         self._tile_pack_dest = str(out_path)
         bridge.progress.connect(self._on_drone_map_progress)
+        bridge.heights_progress.connect(self._on_drone_heights_progress)
         bridge.finished.connect(self._on_drone_map_finished)
         host = plan.template.split("/")[2] if "://" in plan.template else plan.template
+        heights = plan_drone_heights(plan)
         task = DroneMapTask(plan, _ntm._TILE_CACHE_ROOT / plan.source_id, Path(out_path), bridge, cancel,
-                            attribution=f"Map pictures from {host}", fetch=fetch)
+                            attribution=f"Map pictures from {host}", fetch=fetch,
+                            heights_plan=heights, heights_dir=_ntm._TILE_CACHE_ROOT / heights.source_id)
         QThreadPool.globalInstance().start(task)
         self._emit_tile_pack("tile_pack_progress", f"Making the drone's map: {plan.count} map pictures. "
                                                    "Keep the internet connection until it ends")
@@ -1124,6 +1128,20 @@ class MapTilesMixin:
         if failed:
             msg += f", {failed} failed"
         self._emit_tile_pack("tile_pack_progress", msg)
+
+    def _on_drone_heights_progress(self, done: int, total: int) -> None:
+        self._emit_tile_pack("tile_pack_progress", f"The ground's heights: {done} of {total} pictures checked")
+
+    @staticmethod
+    def _drone_heights_words(heights) -> str:
+        """What the end of "Make the drone's map" says of the file of the ground's heights."""
+        if heights is None or heights.path is None:
+            return (". The ground's heights were not made, so the drone takes the ground as flat: fine on plains, "
+                    "not safe over hills. Make the map again to get them")
+        words = f". The ground's heights are in {heights.path}: copy that too, beside the map, and vama_nav finds it"
+        if heights.missing:
+            words += f" ({heights.missing} of its pictures could not be downloaded: that ground counts as flat)"
+        return words
 
     def _on_drone_map_finished(self, results, dest: str) -> None:
         self._tile_pack_cancel = None
@@ -1139,6 +1157,7 @@ class MapTilesMixin:
             if drone.missing:
                 msg += (f". {drone.missing} pictures could not be downloaded ({pack.failed} failed, "
                         f"{pack.placeholders} with no imagery): make it again to fill them")
+            msg += self._drone_heights_words(drone.heights)
         self._emit_tile_pack("tile_pack_finished", msg)
 
     def import_offline_tile_pack(self, src) -> None:

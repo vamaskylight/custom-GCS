@@ -27,13 +27,13 @@ The recorder does not control the drone. It only listens to the flight controlle
 
 ## 3. Set up the Pi
 
-1. Turn on the serial port on the Pi's pins (GPIO 14 and 15):
-   `sudo raspi-config`, then Interface Options, Serial Port.
-   "Login shell over serial": No.
-   "Serial port hardware": Yes.
-   Reboot.
-2. Check that the port is there: `ls -l /dev/serial0` must show a line.
-   If not, add the line `dtparam=uart0=on` to `/boot/firmware/config.txt` and reboot.
+1. Turn on the serial port on the Pi's pins 8 and 10 (GPIO 14 and 15).
+   Raspberry Pi 5: add the line `dtoverlay=uart0-pi5` at the end of `/boot/firmware/config.txt` (for example with `sudo nano /boot/firmware/config.txt`), then reboot.
+   The port is then `/dev/ttyAMA0`.
+   On a Pi 5, `/dev/serial0` is the small 3-pin debug connector, not pins 8 and 10: do not use it.
+   If the recorder was installed before, set `device = /dev/ttyAMA0` in `/etc/vama-recorder.ini` too (part 6): installing again keeps that file.
+   Raspberry Pi 4 or older: `sudo raspi-config`, then Interface Options, Serial Port. "Login shell over serial": No. "Serial port hardware": Yes. Reboot. The port is then `/dev/serial0`: put it as `device` in part 6.
+2. Check that the port is there. Raspberry Pi 5: `ls -l /dev/ttyAMA0` must show a line. Raspberry Pi 4 or older: `ls -l /dev/serial0`.
 3. Check the camera: `rpicam-hello --list-cameras` must list it (for Camera Module 3: imx708).
 
 ## 4. Wire the Pi to the flight controller
@@ -42,6 +42,7 @@ Use a free serial port of the Cube. On the Cube Orange Plus, TELEM1 is SERIAL1, 
 TELEM1 is in use, and TELEM2 is for the RPLidar. Please tell me which port you use.
 
 On a Brahma H7 with ArduPilot, use T3 and R3: that is SERIAL3, so n is 3 below (its SERIAL1 is MAVLink, 2 is GPS, 4 DisplayPort, 6 RC in, 7 MAVLink with flow control, 8 ESC telemetry).
+Set the parameters by their names, `SERIAL3_PROTOCOL` and `SERIAL3_BAUD`. The word "UART" with a number on a ground station's serial screen is not the board's T and R number: on the client's Brahma H7 the screen's "UART2" line is SERIAL3, and its "UART3" line is SERIAL4.
 Its 5 V supply gives 3 A for everything on the board, so the Pi must have its own 5 V, 5 A supply.
 
 | Raspberry Pi | Cube port |
@@ -81,7 +82,7 @@ The ones you may change:
 
 | Setting | Default | What |
 |------|------|------|
-| `device`, `baud` | `/dev/serial0`, `115200` | The serial port, and the same speed as `SERIALn_BAUD` |
+| `device`, `baud` | `/dev/ttyAMA0`, `115200` | The serial port (pins 8 and 10 of a Raspberry Pi 5; on a Pi 4 or older `/dev/serial0`), and the same speed as `SERIALn_BAUD` |
 | `interval_s` | 1.0 | Seconds between two pictures |
 | `size` | full | The picture size. For the AI Camera use `2028x1520`: about 0.3 m of ground per pixel from 500 m, which is enough, and pictures of about 1 MB |
 | `focus` | far | Camera Module 3: focus fixed at far. Use `none` for the AI Camera, the HQ or the Global Shutter camera (their focus is set by hand) |
@@ -128,7 +129,8 @@ Please also tell me the camera model and the Cube port you used.
 ## 10. When something is wrong
 
 - What the recorder says: `journalctl -u vama-recorder -f`, or the file `~/vama-flights/recorder.log`.
-- "no heartbeat from the flight controller": check the three wires (TX to RX, RX to TX), and `SERIALn_PROTOCOL` and `SERIALn_BAUD` on the Cube.
-- "no camera found": check the ribbon cable, and `rpicam-hello --list-cameras`.
+- "no heartbeat from the flight controller": check that `device` is the port of pins 8 and 10 (on a Raspberry Pi 5 `/dev/ttyAMA0`, with the line of part 3, not `/dev/serial0`), the three wires (TX to RX, RX to TX), and `SERIALn_PROTOCOL` and `SERIALn_BAUD` on the Cube. The port's protocol must be MAVLink 2, not GPS.
+- "the recorder service is running": it holds the camera and the serial port. Stop it first, as in part 7.
+- "no camera found": check that no other program uses the camera, the ribbon cable, and `rpicam-hello --list-cameras`.
 - "the card is nearly full": copy the flights off the card and delete them on the Pi.
 - No pictures in a flight: the drone was below `start_height_m`, or the GPS height was not known yet.

@@ -3,12 +3,17 @@
 // own range, an empty direction has no value, and a direction not heard for 2 s has none either. QGC's
 // own values (VehicleDistanceSensorFactGroup) froze when the sensor stopped, took the range of any
 // sensor, and showed an empty direction of the RPLidar A3 (range 0) as "0.00".
+// The four sides the screen shows (B19, the client 2026-10-30), inside the range the user sets.
 // Run with apk/custom/test/run_link_test.ps1.
 
+#include <QtCore/QCoreApplication>
+#include <QtCore/QDir>
+#include <QtCore/QSettings>
 #include <QtQml/QJSEngine>
 #include <QtTest/QSignalSpy>
 #include <QtTest/QTest>
 
+#include <array>
 #include <cmath>
 #include <type_traits>
 
@@ -25,6 +30,14 @@ bool none(double v)
     return std::isnan(v);
 }
 
+// One message for each of the 8 directions, in metres. A negative distance: nothing in range.
+void hearAll(ProximitySectors &s, const std::array<double, 8> &metres, qint64 nowMs = 1000)
+{
+    for (int i = 0; i < 8; ++i) {
+        s.hear(kAhead + i, i, metres[i] < 0 ? 4000 : qRound(metres[i] * 100.0), 4000, nowMs);
+    }
+}
+
 } // namespace
 
 class ProximityStoreTest : public QObject
@@ -32,6 +45,8 @@ class ProximityStoreTest : public QObject
     Q_OBJECT
 
 private slots:
+    void initTestCase();
+    void init();
     void theEightDirectionsInTheirPlaces();
     void anEmptyDirectionHasNoValue();
     void theA3sRangeIsZero();
@@ -45,7 +60,31 @@ private slots:
     void theStoreExpiresOnItsTimer();
     void qmlGetsTheOneStore();
     void qmlNeverOwnsTheStoreOrADrone();
+    void aSideIsTheNearestOfItsThreeDirections();
+    void aDiagonalObjectIsOnBothItsSides();
+    void aSideOnlyWithinTheBarRange();
+    void aDirectionOutOfDateIsOnNoSide();
+    void aSideChangeIsAnnounced();
+    void theBarRangeListIsVgcss();
+    void theBarRangeIsSavedForTheNextStart();
+    void aRangeNotOnTheListIsRefused();
+    void aBadSavedRangeIsTheDefault();
+    void everyDroneTakesTheBarRange();
 };
+
+void ProximityStoreTest::initTestCase()
+{
+    // Never the user's settings: an INI file in a temporary folder.
+    QCoreApplication::setOrganizationName("VamaProximityTest");
+    QCoreApplication::setApplicationName("VamaProximityTest");
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, QDir::tempPath() + "/vama-proximity-test");
+}
+
+void ProximityStoreTest::init()
+{
+    QSettings().remove("VamaProximity");
+}
 
 void ProximityStoreTest::theEightDirectionsInTheirPlaces()
 {
@@ -224,6 +263,142 @@ void ProximityStoreTest::qmlNeverOwnsTheStoreOrADrone()
     QVERIFY(sectors != nullptr);
     QCOMPARE(sectors, store->forVehicle(7));
     QCOMPARE(QJSEngine::objectOwnership(sectors), QJSEngine::CppOwnership);
+}
+
+void ProximityStoreTest::aSideIsTheNearestOfItsThreeDirections()
+{
+    ProximitySectors s;
+    s.setBarRange(40.0);
+    // Ahead 3 m, ahead right 2 m, right 9 m, ahead left 4 m. The same cases as VGCS's four_sides test.
+    hearAll(s, {3, 2, 9, -1, -1, -1, -1, 4});
+    QCOMPARE(s.side(0), 2.0);   // front: ahead left, ahead, ahead right
+    QCOMPARE(s.side(1), 2.0);   // right: ahead right, right, behind right
+    QVERIFY(none(s.side(2)));   // back: nothing
+    QCOMPARE(s.side(3), 4.0);   // left: behind left, left, ahead left
+    // Right 6 m, behind right 7 m, behind 8 m, behind left 9 m, left 10 m.
+    hearAll(s, {-1, -1, 6, 7, 8, 9, 10, -1});
+    QVERIFY(none(s.side(0)));
+    QCOMPARE(s.side(1), 6.0);
+    QCOMPARE(s.side(2), 7.0);
+    QCOMPARE(s.side(3), 9.0);
+    QVERIFY(none(s.side(-1)));
+    QVERIFY(none(s.side(4)));
+    const QVariantList sides = s.sides();
+    QCOMPARE(sides.size(), 4);
+    QVERIFY(none(sides.at(0).toDouble()));
+    QCOMPARE(sides.at(1).toDouble(), 6.0);
+    QCOMPARE(sides.at(2).toDouble(), 7.0);
+    QCOMPARE(sides.at(3).toDouble(), 9.0);
+}
+
+void ProximityStoreTest::aDiagonalObjectIsOnBothItsSides()
+{
+    ProximitySectors s;
+    hearAll(s, {-1, -1, -1, 2.5, -1, -1, -1, -1});  // behind right only
+    QVERIFY(none(s.side(0)));
+    QCOMPARE(s.side(1), 2.5);
+    QCOMPARE(s.side(2), 2.5);
+    QVERIFY(none(s.side(3)));
+    hearAll(s, {-1, -1, -1, -1, -1, -1, -1, 3.5});  // ahead left only: the list wraps round
+    QCOMPARE(s.side(0), 3.5);
+    QVERIFY(none(s.side(1)));
+    QVERIFY(none(s.side(2)));
+    QCOMPARE(s.side(3), 3.5);
+}
+
+void ProximityStoreTest::aSideOnlyWithinTheBarRange()
+{
+    ProximitySectors s;     // 5 m, as the client's example, until the store says otherwise
+    hearAll(s, {5.0, -1, 5.01, -1, 12.0, -1, -1, -1});
+    QCOMPARE(s.side(0), 5.0);   // on the limit it shows
+    QVERIFY(none(s.side(1)));
+    QVERIFY(none(s.side(2)));
+    QVERIFY(none(s.side(3)));
+    QCOMPARE(s.value(4), 12.0); // the direction itself keeps its reading
+    s.setBarRange(15.0);
+    QCOMPARE(s.side(1), 5.01);
+    QCOMPARE(s.side(2), 12.0);
+    s.setBarRange(4.0);
+    QVERIFY(none(s.side(0)));
+    QVERIFY(none(s.side(2)));
+}
+
+void ProximityStoreTest::aDirectionOutOfDateIsOnNoSide()
+{
+    ProximitySectors s;
+    hearAll(s, {3, -1, -1, -1, -1, -1, -1, -1});
+    QCOMPARE(s.side(0), 3.0);
+    s.expire(1000 + ProximitySectors::kMaxAgeMs + 1);
+    QVERIFY(none(s.side(0)));
+}
+
+void ProximityStoreTest::aSideChangeIsAnnounced()
+{
+    ProximitySectors s;
+    hearAll(s, {3, -1, -1, -1, -1, -1, -1, -1});
+    QSignalSpy spy(&s, &ProximitySectors::changed);
+    s.setBarRange(2.0);     // the bar goes
+    QCOMPARE(spy.size(), 1);
+    s.setBarRange(2.0);
+    QCOMPARE(spy.size(), 1);
+    s.hear(kAhead, 0, 150, 4000, 1100);     // an object comes inside it
+    QCOMPARE(spy.size(), 2);
+}
+
+void ProximityStoreTest::theBarRangeListIsVgcss()
+{
+    ProximityStore store(nullptr);
+    QCOMPARE(store.barRange(), 5.0);
+    const QVariantList wanted = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0, 30.0, 40.0};
+    QCOMPARE(store.barRangeChoices(), wanted);
+}
+
+void ProximityStoreTest::theBarRangeIsSavedForTheNextStart()
+{
+    {
+        ProximityStore store(nullptr);
+        QSignalSpy spy(&store, &ProximityStore::barRangeChanged);
+        store.setBarRange(8.0);
+        QCOMPARE(spy.size(), 1);
+        QCOMPARE(store.barRange(), 8.0);
+        store.setBarRange(8.0);
+        QCOMPARE(spy.size(), 1);
+    }
+    ProximityStore next(nullptr);
+    QCOMPARE(next.barRange(), 8.0);
+}
+
+void ProximityStoreTest::aRangeNotOnTheListIsRefused()
+{
+    ProximityStore store(nullptr);
+    QSignalSpy spy(&store, &ProximityStore::barRangeChanged);
+    store.setBarRange(7.0);
+    store.setBarRange(0.0);
+    QCOMPARE(store.barRange(), 5.0);
+    QCOMPARE(spy.size(), 0);
+    QVERIFY(!QSettings().contains(ProximityStore::kBarRangeKey));
+}
+
+void ProximityStoreTest::aBadSavedRangeIsTheDefault()
+{
+    QSettings().setValue(ProximityStore::kBarRangeKey, 7.0);
+    QCOMPARE(ProximityStore(nullptr).barRange(), 5.0);
+    QSettings().setValue(ProximityStore::kBarRangeKey, "far");
+    QCOMPARE(ProximityStore(nullptr).barRange(), 5.0);
+}
+
+void ProximityStoreTest::everyDroneTakesTheBarRange()
+{
+    QSettings().setValue(ProximityStore::kBarRangeKey, 3.0);
+    ProximityStore store(nullptr);
+    qint64 now = 1000;
+    store.setClock([&now] { return now; });
+    store.hear(1, kAhead, 0, 400, 4000);
+    QVERIFY(none(store.forVehicle(1)->side(0)));    // a drone made after the setting was read
+    store.setBarRange(5.0);
+    QCOMPARE(store.forVehicle(1)->side(0), 4.0);    // a drone that was there
+    store.hear(2, kAhead, 0, 450, 4000);
+    QCOMPARE(store.forVehicle(2)->side(0), 4.5);    // a drone made after the change
 }
 
 QTEST_GUILESS_MAIN(ProximityStoreTest)

@@ -25,6 +25,7 @@ import numpy as np
 CAMERA_IN_BODY = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
 MAX_RAY_DEG = 75.0          # a picture corner looking further from straight down: no picture
 MAX_OUT_PX = 2400           # the longest side of a picture turned north up
+COARSE_PX = 8               # over hills the ground's heights are used every so many pixels, the rest follows smoothly
 
 
 @dataclass(frozen=True)
@@ -173,9 +174,25 @@ def footprint(lens: Lens, pose: Pose, width: int, height: int) -> np.ndarray | N
     return ground_of(lens, pose, width, height, [(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)])
 
 
-def rectify(image: np.ndarray, lens: Lens, pose: Pose, m_per_px: float) -> Rectified | None:
+def _coarse_grid(width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
+    """(x, y) of the pixels of a picture COARSE_PX times smaller, in the full picture's pixels."""
+    f = COARSE_PX
+    return np.meshgrid(np.arange(math.ceil(width / f)) * f + (f - 1) / 2.0, np.arange(math.ceil(height / f)) * f + (f - 1) / 2.0)
+
+
+def _from_coarse(field: np.ndarray, width: int, height: int) -> np.ndarray:
+    """A field on ``_coarse_grid`` at full size. By a whole factor, so each coarse value stays on its pixel."""
+    rows, cols = field.shape
+    return cv2.resize(field.astype(np.float32), (cols * COARSE_PX, rows * COARSE_PX),
+                      interpolation=cv2.INTER_LINEAR)[:height, :width]
+
+
+def rectify(image: np.ndarray, lens: Lens, pose: Pose, m_per_px: float, rise=None) -> Rectified | None:
     """The picture turned north up at ``m_per_px`` metres a pixel, around the point below the drone.
-    None when the drone leans too far, or the picture would be too large."""
+    None when the drone leans too far, or the picture would be too large. ``rise``: for ground points
+    (arrays of metres north and east of the point below the drone), how far each is above that point
+    (heights.Heights.around); each is then taken from where the camera sees it at its own height.
+    None: flat ground."""
     h, w = image.shape[:2]
     if pose.height_m <= 0 or m_per_px <= 0:
         return None
@@ -196,27 +213,42 @@ def rectify(image: np.ndarray, lens: Lens, pose: Pose, m_per_px: float) -> Recti
         return None
     ox, oy = -e_min / m_per_px, n_max / m_per_px
     s = m_per_px
-    ground_from_out = np.array([[0.0, -s, oy * s], [s, 0.0, -ox * s], [0.0, 0.0, 1.0]])
-    m = image_from_ground(lens, pose, w, h) @ ground_from_out
-    flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
-    out = cv2.warpPerspective(image, m, (out_w, out_h), flags=flags, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    mask = cv2.warpPerspective(np.full((h, w), 255, np.uint8), m, (out_w, out_h),
-                               flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP, borderValue=0)
+    if rise is None:
+        ground_from_out = np.array([[0.0, -s, oy * s], [s, 0.0, -ox * s], [0.0, 0.0, 1.0]])
+        m = image_from_ground(lens, pose, w, h) @ ground_from_out
+        flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
+        out = cv2.warpPerspective(image, m, (out_w, out_h), flags=flags, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        mask = cv2.warpPerspective(np.full((h, w), 255, np.uint8), m, (out_w, out_h),
+                                   flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP, borderValue=0)
+    else:
+        uu, vv = _coarse_grid(out_w, out_h)
+        north, east = (oy - vv) * s, (uu - ox) * s
+        below = np.maximum(pose.height_m - rise(north, east), 1.0)      # how far below the camera each point is
+        p = lens.matrix(w, h) @ ned_from_camera(lens, pose).T @ np.vstack([north.ravel(), east.ravel(), below.ravel()])
+        ahead = p[2] > 1e-6
+        map_x = _from_coarse(np.where(ahead, p[0] / np.where(ahead, p[2], 1.0), -1e6).reshape(uu.shape), out_w, out_h)
+        map_y = _from_coarse(np.where(ahead, p[1] / np.where(ahead, p[2], 1.0), -1e6).reshape(uu.shape), out_w, out_h)
+        out = cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        mask = np.where((map_x >= 0) & (map_x <= w - 1) & (map_y >= 0) & (map_y <= h - 1), 255, 0).astype(np.uint8)
     # No features on the picture's edge: also where it meets the result's border (erode pads the
     # border as inside unless told otherwise).
     mask = cv2.erode(mask, np.ones((7, 7), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0)
     return Rectified(out, mask, ox, oy, s)
 
 
-def render(tile_map, lens: Lens, pose: Pose, lat: float, lon: float, width: int, height: int) -> np.ndarray | None:
-    """What the camera sees at (lat, lon) with ``pose`` over flat ground, made from ``tile_map``
-    (a ``TileMap``): grey, ``width`` by ``height``. None when it would look too far (see
-    ``ground_of``). Ground the map does not have is black."""
+def render(tile_map, lens: Lens, pose: Pose, lat: float, lon: float, width: int, height: int,
+           rise=None) -> np.ndarray | None:
+    """What the camera sees at (lat, lon) with ``pose``, made from ``tile_map`` (a ``TileMap``): grey,
+    ``width`` by ``height``. None when it would look too far (see ``ground_of``). Ground the map does
+    not have is black. Over flat ground, or with ``rise`` over hills (see ``rectify``): ``pose``'s
+    height is then above the ground at (lat, lon)."""
     corners = footprint(lens, pose, width, height)
     if corners is None:
         return None
     s = tile_map.m_per_px(lat)
     cx, cy = tile_map.px(lat, lon)
+    if rise is not None:
+        return _render_hills(tile_map, lens, pose, width, height, rise, s, cx, cy)
     xs = cx + corners[:, 1] / s
     ys = cy - corners[:, 0] / s
     x0, y0 = math.floor(xs.min()) - 2, math.floor(ys.min()) - 2
@@ -229,3 +261,24 @@ def render(tile_map, lens: Lens, pose: Pose, lat: float, lon: float, width: int,
     m = crop_from_ground @ np.linalg.inv(image_from_ground(lens, pose, width, height))
     return cv2.warpPerspective(crop, m, (width, height), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _render_hills(tile_map, lens: Lens, pose: Pose, width: int, height: int, rise, s: float, cx: float,
+                  cy: float) -> np.ndarray | None:
+    """``render`` over hills: where each ray meets the ground, found by a few steps along it."""
+    uu, vv = _coarse_grid(width, height)
+    rays = ned_from_camera(lens, pose) @ np.linalg.inv(lens.matrix(width, height)) @ np.vstack([uu.ravel(), vv.ravel(),
+                                                                                               np.ones(uu.size)])
+    t = pose.height_m / rays[2]
+    for _ in range(12):
+        t = 0.5 * t + 0.5 * (pose.height_m - rise(rays[0] * t, rays[1] * t)) / rays[2]
+    xs, ys = cx + rays[1] * t / s, cy - rays[0] * t / s
+    x0, y0 = math.floor(xs.min()) - 2, math.floor(ys.min()) - 2
+    cw, ch = math.ceil(xs.max()) + 3 - x0, math.ceil(ys.max()) + 3 - y0
+    if max(cw, ch) > 4 * MAX_OUT_PX:
+        return None
+    crop, _mask = tile_map.crop(x0, y0, cw, ch)
+    # Map pixel k covers k to k + 1, OpenCV's pixel k is centred on k: half a pixel between them.
+    map_x = _from_coarse((xs - x0 - 0.5).reshape(uu.shape), width, height)
+    map_y = _from_coarse((ys - y0 - 0.5).reshape(uu.shape), width, height)
+    return cv2.remap(crop, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)

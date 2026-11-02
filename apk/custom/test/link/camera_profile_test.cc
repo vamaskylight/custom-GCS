@@ -225,7 +225,7 @@ void CameraProfileTest::theBuiltInCamerasAreTheTestedOnes()
     QCOMPARE(c20.port, 5000);
     QCOMPARE(c20.dayVideoUrl, QStringLiteral("rtsp://192.168.144.108:554/main"));
     QVERIFY(!c20.hasThermal() && !c20.laser && !c20.ownTracker && c20.photo && c20.record);
-    QVERIFY(c20.zoom == Zoom::Pulse);  // its lens (task AN, client 2026-10-27)
+    QVERIFY(c20.zoom == Zoom::C20);  // its camera port, TCP 8100 (row B10, Skydroid's RC SDK)
     QCOMPARE(c20.maxZoom, 22.0);
     QCOMPARE(c20.fovHDeg, 58.3);
     QCOMPARE(c20.fovVDeg, 34.9);
@@ -470,7 +470,9 @@ void CameraProfileTest::eachProtocolHasItsZoomsAndFeatures()
         const char *says;
     };
     const QList<Case> cases = {
-        {top, [](Profile &p) { p.zoom = Zoom::Live; }, "A Skydroid TOP camera's zoom is none, counted, reported or pulse."},
+        {top, [](Profile &p) { p.zoom = Zoom::Live; }, "A Skydroid TOP camera's zoom is none, counted, reported, pulse or c20."},
+        {a20, [](Profile &p) { p.zoom = Zoom::C20; }, "A VPro camera's zoom is none or live."},
+        {zr10, [](Profile &p) { p.zoom = Zoom::C20; }, "A SIYI camera's zoom is none or pulse."},
         {a20, [](Profile &p) { p.zoom = Zoom::Counted; }, "A VPro camera's zoom is none or live."},
         {a20, [](Profile &p) { p.zoom = Zoom::Pulse; }, "A VPro camera's zoom is none or live."},
         {zr10, [](Profile &p) { p.zoom = Zoom::Live; }, "A SIYI camera's zoom is none or pulse."},
@@ -502,11 +504,33 @@ void CameraProfileTest::eachProtocolHasItsZoomsAndFeatures()
         Profile p = top;
         p.zoom = Zoom::Pulse;
         QVERIFY2(camera::problem(p).isEmpty(), qPrintable(camera::problem(p)));
-        QCOMPARE(builtIn(QStringLiteral("C20")).zoom, Zoom::Pulse);
         QString why;
         const std::optional<Profile> back = camera::fromJson(camera::toJson(p), QStringLiteral("lens-cam"), &why);
         QVERIFY2(back, qPrintable(why));
         QVERIFY(back->zoom == Zoom::Pulse);
+    }
+    // A TOP camera on the C20's camera port (row B10): "c20" in its file, its highest zoom with it.
+    {
+        Profile p = top;
+        p.zoom = Zoom::C20;
+        p.maxZoom = 22.0;
+        QVERIFY2(camera::problem(p).isEmpty(), qPrintable(camera::problem(p)));
+        const QJsonObject json = camera::toJson(p);
+        QCOMPARE(json.value(QStringLiteral("zoom")).toString(), QStringLiteral("c20"));
+        QString why;
+        const std::optional<Profile> back = camera::fromJson(json, QStringLiteral("port-cam"), &why);
+        QVERIFY2(back, qPrintable(why));
+        QVERIFY(back->zoom == Zoom::C20);
+        QCOMPARE(back->maxZoom, 22.0);
+        // Its view and label follow the zoom it says, 1x before it says one.
+        double h = 0.0;
+        double v = 0.0;
+        camera::dayFov(*back, 0, 0, h, v);
+        QCOMPARE(h, back->fovHDeg);
+        camera::dayFov(*back, 0, 4, h, v);
+        QVERIFY(std::abs(std::tan(h * M_PI / 360.0) - std::tan(back->fovHDeg * M_PI / 360.0) / 4.0) < 1e-9);
+        QCOMPARE(camera::zoomLabel(*back, 0, 0), QString());
+        QCOMPARE(camera::zoomLabel(*back, 0, 4), QStringLiteral("4.0x"));
     }
     // A file's zoom is checked against its protocol once it is read.
     QJsonObject json = camera::toJson(a20);
@@ -745,7 +769,7 @@ void CameraProfileTest::filesThatAreNoCamerasAreSkippedWithANote()
     for (const char *says : {"broken.json: it is not a camera file", "other.json: it is not a camera file",
                              "visca.json: its protocol is not \"skydroid-top\", \"viewpro\" or \"siyi\".",
                              "siyi.json: A SIYI camera's zoom is none or pulse.", "noport.json: it has no \"port\"",
-                             "badzoom.json: its zoom is not one of none, counted, reported, live or pulse.",
+                             "badzoom.json: its zoom is not one of none, counted, reported, live, pulse or c20.",
                              "C13.json: it has the file name of a built-in camera",
                              "twin.json: a camera named \"Good\" is there already", "wrong.json: The turn either way",
                              "big.json: it is too big"}) {

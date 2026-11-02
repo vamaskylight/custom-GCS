@@ -10,6 +10,7 @@ g++ on PATH. Regenerate the expected values first if the VGCS protocol changed:
     python apk/custom/test/gen_viewpro_vectors.py
     python apk/custom/test/gen_siyi_camera_vectors.py
     python apk/custom/test/gen_viewpro_camera_vectors.py
+    python apk/custom/test/gen_c20_vectors.py
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File apk\custom\test\run_tests.ps1
@@ -51,7 +52,11 @@ $tests = @(
     @{ Name = 'siyi_protocol_test'; Source = 'SiyiProtocol.cc' },
     @{ Name = 'viewpro_protocol_test'; Source = 'ViewproProtocol.cc' },
     @{ Name = 'siyi_camera_test'; Source = @('SiyiCamera.cc', 'SiyiProtocol.cc') },
-    @{ Name = 'viewpro_camera_test'; Source = @('ViewproCamera.cc', 'ViewproProtocol.cc') }
+    @{ Name = 'viewpro_camera_test'; Source = @('ViewproCamera.cc', 'ViewproProtocol.cc') },
+    # The C20's camera port (row B10): Skydroid's SDK bytes, and VGCS's c20_camera.py.
+    @{ Name = 'c20_camera_test'; Source = 'C20Camera.cc' },
+    # The app's choice of voice (the client 2026-10-30); its file is in src, not src\Skydroid.
+    @{ Name = 'voice_pick_test'; Source = '..\VoicePick.cc' }
 )
 
 $failed = 0

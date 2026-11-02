@@ -44,6 +44,13 @@ Window {
             source:       "qrc:/qml/QGroundControl/FlyView/FlightDisplayViewVideoOutput.qml"
         }
 
+        // QGC's FlyViewVideo.qml makes its obstacle radar by this address: the VAMA file answers (B19).
+        Loader {
+            objectName:   "qgcVideoRadar"
+            anchors.fill: parent
+            source:       "qrc:/qml/QGroundControl/FlyView/ProximityRadarVideoView.qml"
+        }
+
         // QGC's widget layer: tool strip top left, instruments bottom right.
         Item {
             id:                widgetLayer

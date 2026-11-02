@@ -8,7 +8,9 @@ is nearly full. Each flight is one folder (see flight.py).
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -231,6 +233,31 @@ class Recorder:
 
 # --- the bench check --------------------------------------------------------------------------
 
+def port_hint(device: str) -> str:
+    """A word on the serial port when it is likely the wrong one, else "". On a Raspberry Pi 5, /dev/serial0
+    is the 3-pin debug connector (ttyAMA10), not pins 8 and 10, and pins 8 and 10 (/dev/ttyAMA0) need an
+    overlay (the client's bench check, 2026-10-30: no heartbeat on /dev/serial0)."""
+    if os.path.basename(os.path.realpath(device)) == "ttyAMA10":
+        return (f" {device} is the Raspberry Pi 5's small 3-pin debug connector, not pins 8 and 10: add the line "
+                "dtoverlay=uart0-pi5 to /boot/firmware/config.txt, reboot, and set device = /dev/ttyAMA0 "
+                "(RECORDER.md part 3).")
+    if device == "/dev/ttyAMA0" and not os.path.exists(device):
+        return (" On a Raspberry Pi 5, pins 8 and 10 are /dev/ttyAMA0 only with the line dtoverlay=uart0-pi5 in "
+                "/boot/firmware/config.txt, and a reboot (RECORDER.md part 3).")
+    return ""
+
+
+def service_running() -> bool:
+    """Whether the recorder's own service runs. It then holds the camera and the serial port, and a check beside
+    it reports a missing camera and a dead link that are neither (the client's bench check, 2026-10-31)."""
+    if shutil.which("systemctl") is None:
+        return False
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", "vama-recorder"], timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def check(settings: Settings, camera, link_factory: Callable | None = None, listen_s: float = 6.0,
           out: Callable[[str], None] = print, clock: Callable[[], int] = time.monotonic_ns,
           heartbeat_wait_s: float = 10.0, settle_s: float = 1.5) -> int:
@@ -239,6 +266,10 @@ def check(settings: Settings, camera, link_factory: Callable | None = None, list
 
     problems = 0
     out(f"VAMA recorder {__version__}, settings: {settings.source}")
+    if service_running():
+        out("PROBLEM service: the recorder service is running, and it holds the camera and the serial port. "
+            "Run: sudo systemctl stop vama-recorder, then this check again, then: sudo systemctl start vama-recorder")
+        return 1
     root = settings.flights_dir
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -275,7 +306,7 @@ def check(settings: Settings, camera, link_factory: Callable | None = None, list
     try:
         link.open()
     except Exception as exc:
-        out(f"PROBLEM link: {exc}")
+        out(f"PROBLEM link: {str(exc).rstrip('.')}.{port_hint(settings.device)}")
         return problems + 1
     link.start()
     try:
@@ -285,7 +316,7 @@ def check(settings: Settings, camera, link_factory: Callable | None = None, list
         if telemetry.autopilot is None:
             out(f"PROBLEM link: no heartbeat from the flight controller on {settings.device} at {settings.baud}. "
                 "Check the wires (Pi TX to the Cube's RX, Pi RX to the Cube's TX, and ground), and on the Cube "
-                "that port's SERIALn_PROTOCOL 2 and SERIALn_BAUD")
+                f"that port's SERIALn_PROTOCOL 2 (MAVLink 2, not GPS) and SERIALn_BAUD.{port_hint(settings.device)}")
             return problems + 1
         out(f"OK      flight controller: system {telemetry.autopilot[0]}, component {telemetry.autopilot[1]}")
         time.sleep(settle_s)                # the stream request goes out and the rates change

@@ -12,6 +12,10 @@
 //    ColumnLayout for that, around QGC's GridLayout.
 //  - "Camera settings", and in Advanced Mode "Cameras" (the camera editor),
 //    task AG: the client looked for them here. The fly view opens them.
+//  - "Voice" (the client, 2026-10-30): the voice the app speaks with,
+//    VamaVoicePanel.qml in place of the buttons, as the admin password.
+//  - "Proximity range" (B19, the client 2026-10-30; the round view since B25): how far the round
+//    proximity view reaches, VamaObstacleRangePanel.qml in place of the buttons, as the voice.
 // When moving to a new QGC release, compare with QGC's new file.
 
 import QtQuick
@@ -33,9 +37,11 @@ ToolIndicatorPage {
             spacing: 0
 
             property bool askAdminPassword: false
+            property bool chooseVoice: false  // VAMA (the client, 2026-10-30)
+            property bool chooseObstacleRange: false  // VAMA (B19)
 
             GridLayout {
-                visible: !menuContent.askAdminPassword  // VAMA (task Z)
+                visible: !menuContent.askAdminPassword && !menuContent.chooseVoice && !menuContent.chooseObstacleRange  // VAMA (task Z, the voice, B19)
                 columns: 2
                 columnSpacing: ScreenTools.defaultFontPixelWidth
                 rowSpacing: columnSpacing
@@ -148,6 +154,26 @@ ToolIndicatorPage {
                     }
                 }
 
+                // VAMA (the client, 2026-10-30): the voice the app speaks with, chosen here in the menu.
+                SubMenuButton {
+                    objectName: "vamaMenuVoice"
+                    implicitHeight: root._toolButtonHeight
+                    Layout.fillWidth: true
+                    text: qsTr("Voice")
+                    imageResource: "/InstrumentValueIcons/volume-up.svg"
+                    onClicked: menuContent.chooseVoice = true
+                }
+
+                // VAMA (B19, the client 2026-10-30; B25): how far the round proximity view reaches.
+                SubMenuButton {
+                    objectName: "vamaMenuObstacleRange"
+                    implicitHeight: root._toolButtonHeight
+                    Layout.fillWidth: true
+                    text: qsTr("Proximity range")
+                    imageResource: "/InstrumentValueIcons/radar.svg"
+                    onClicked: menuContent.chooseObstacleRange = true
+                }
+
                 SubMenuButton {
                     id: closeButton
                     objectName: "toolbar_viewClose"
@@ -185,7 +211,7 @@ ToolIndicatorPage {
                     QGCLabel {
                         Layout.fillWidth: true
                         horizontalAlignment: Text.AlignHCenter
-                        text: qsTr("Test build 17, 29 October 2026")
+                        text: qsTr("Test build 18, 31 October 2026")
                         font.pointSize: ScreenTools.smallFontPointSize
                         wrapMode: QGCLabel.WordWrap
                     }
@@ -238,6 +264,32 @@ ToolIndicatorPage {
 
                 Connections {
                     target: adminPasswordLoader.item
+                    function onFinished() { mainWindow.closeIndicatorDrawer() }
+                }
+            }
+
+            // VAMA (the client, 2026-10-30): the voice, made when asked, gone when the menu closes.
+            Loader {
+                id:      voiceLoader
+                active:  menuContent.chooseVoice
+                visible: active
+                source:  "qrc:/Custom/qml/QGroundControl/Toolbar/VamaVoicePanel.qml"
+
+                Connections {
+                    target: voiceLoader.item
+                    function onFinished() { mainWindow.closeIndicatorDrawer() }
+                }
+            }
+
+            // VAMA (B19): the range of the obstacle bars, made when asked, gone when the menu closes.
+            Loader {
+                id:      obstacleRangeLoader
+                active:  menuContent.chooseObstacleRange
+                visible: active
+                source:  "qrc:/Custom/qml/QGroundControl/Toolbar/VamaObstacleRangePanel.qml"
+
+                Connections {
+                    target: obstacleRangeLoader.item
                     function onFinished() { mainWindow.closeIndicatorDrawer() }
                 }
             }

@@ -60,8 +60,12 @@ FLAGS_MAX_AGE_S = 5.0
 # The drone's target comes at 2 Hz in Auto, Guided and RTL.
 TARGET_MAX_AGE_S = 3.0
 DETOUR_EVENT_GAP_S = 10.0
-# Radar and map scales, in metres: the first that holds the farthest object.
-_SCALES_M = (10.0, 20.0, 30.0, 50.0, 100.0, 200.0)
+# The card's four sides (B19, the client 2026-10-30): how far they reach is the user's choice. The same
+# list and first value as the app (apk/custom/src/ProximityStore.cc).
+BAR_RANGE_CHOICES_M = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0, 30.0, 40.0)
+DEFAULT_BAR_RANGE_M = 5.0
+# The window's saved choice.
+BAR_RANGE_SETTING = "obstacle/bar_range_m"
 
 STOP_MODES = frozenset({"LOITER", "ALT_HOLD", "FLOWHOLD", "ZIGZAG"})
 PLANNER_MODES = frozenset({"AUTO", "GUIDED", "RTL", "AUTO_RTL", "SMART_RTL"})
@@ -142,20 +146,29 @@ def mode_effect(mode: object, params: dict) -> tuple[str, bool | None]:
     return f"{name} does not avoid it.", False
 
 
-def scale_m(directions_m: list, stop_m: float | None = None) -> float:
-    """The radar's and the map's reach: the first of 10, 20, 30, 50, 100, 200 m that holds the farthest object."""
-    farthest = max([d for d in directions_m if d is not None] + [2.0 * (stop_m or 0.0)], default=0.0)
-    return next((s for s in _SCALES_M if s >= farthest), _SCALES_M[-1])
+def four_sides(directions_m: list, range_m: float) -> list[float | None]:
+    """Front, right, back and left: the nearest object of the three directions facing each, or None.
+
+    None also when that object is farther than ``range_m``. A diagonal object is on both its sides,
+    so none is left out. The client asked for 4 of the 8 directions, at fixed places.
+    """
+    sides: list[float | None] = []
+    for middle in (0, 2, 4, 6):
+        facing = [directions_m[(middle + step) % DIRECTIONS] for step in (-1, 0, 1)]
+        nearest = min((d for d in facing if d is not None), default=None)
+        sides.append(nearest if nearest is not None and nearest <= range_m else None)
+    return sides
 
 
 class ObstacleWatch:
     """Hold the obstacle sensor's readings and the drone's state, and say what to show and to warn."""
 
     def __init__(self) -> None:
+        self._bar_range_m = DEFAULT_BAR_RANGE_M
         self.reset()
 
     def reset(self) -> None:
-        """Forget everything (link closed, another drone on screen)."""
+        """Forget everything about the drone (link closed, another drone on screen)."""
         self._snapshot: dict | None = None
         self._snapshot_mono = 0.0
         self._enabled: bool | None = None
@@ -222,6 +235,18 @@ class ObstacleWatch:
                 number = _number(value)
                 if number is not None:
                     self._params[key] = number
+
+    def bar_range_m(self) -> float:
+        """How far the four sides on the card reach, in metres."""
+        return self._bar_range_m
+
+    def set_bar_range_m(self, metres: object) -> bool:
+        """The range chosen on the card, or the saved one. False, and no change, when it is not on the list."""
+        number = _number(metres)
+        if number not in BAR_RANGE_CHOICES_M:
+            return False
+        self._bar_range_m = number
+        return True
 
     def update_target(self, payload: object, now: float | None = None) -> None:
         """The link's MISSION_TARGET: where the drone flies now, and whether that is a detour."""
@@ -304,17 +329,19 @@ class ObstacleWatch:
         near = self.nearest(now_f)
         stop = self.stop_m()
         state = self.sensor_state(now_f)
-        seen = sum(1 for d in directions if d is not None)
+        sides = four_sides(directions, self._bar_range_m)
         if state == STATE_FAULT:
             status = "Sensor not working"
         elif state == STATE_NONE:
             status = "No obstacle sensor"
-        elif seen:
-            status = f"LiDAR · {seen} of 8 directions"
+        elif any(d is not None for d in sides):
+            status = f"Object within {self._bar_range_m:g} m"
         else:
-            status = "Path clear"
+            status = f"Clear within {self._bar_range_m:g} m"
         return {
             "directions_m": directions,
+            "sides_m": sides,
+            "bar_range_m": self._bar_range_m,
             "up_m": self.up_m(now_f),
             "nearest": near,
             "nearest_text": ("Clear" if near is None else metres_words(near[1])),
@@ -323,8 +350,6 @@ class ObstacleWatch:
             "near_m": self.near_m(),
             # Red within the stop distance (ArduPilot's own 2 m while the drone's is not read).
             "red_m": DEFAULT_MARGIN_M if stop is None else stop,
-            "stop_m": stop,
-            "scale_m": scale_m(directions, stop),
             "state": state,
             "status": status,
         }

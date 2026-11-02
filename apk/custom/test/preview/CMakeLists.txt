@@ -29,6 +29,7 @@ add_executable(vama_preview
     ${CUSTOM_DIR}/src/Skydroid/ViewproCamera.cc
     ${CUSTOM_DIR}/src/Skydroid/SiyiProtocol.cc
     ${CUSTOM_DIR}/src/Skydroid/SiyiCamera.cc
+    ${CUSTOM_DIR}/src/Skydroid/C20Camera.cc
     ${CUSTOM_DIR}/src/Skydroid/LaserGeo.cc
     ${CUSTOM_DIR}/src/Skydroid/ObjectTracker.cc
     ${CUSTOM_DIR}/src/Skydroid/LockCheck.cc
@@ -48,6 +49,18 @@ add_executable(vama_preview
     # The admin password for Advanced Mode (task Z), with the test build's password.
     ${CUSTOM_DIR}/src/AdminPassword.cc
     ${CUSTOM_DIR}/src/AdminPassword.h
+    # Where the drone's position comes from (A8 step 4): the note when it changes in the air.
+    ${CUSTOM_DIR}/src/PositionSource.cc
+    ${CUSTOM_DIR}/src/PositionSourceStore.cc
+    ${CUSTOM_DIR}/src/PositionSourceStore.h
+    # The voice the app speaks with (the client, 2026-10-30): its list and choice, with made-up
+    # voices (the engine side, VamaVoiceEngine, needs Qt Speech, which this Qt kit has not).
+    ${CUSTOM_DIR}/src/VamaVoice.cc
+    ${CUSTOM_DIR}/src/VamaVoice.h
+    ${CUSTOM_DIR}/src/VoicePick.cc
+    # The obstacle sensor's store, for the bars on the screen (B19).
+    ${CUSTOM_DIR}/src/ProximityStore.cc
+    ${CUSTOM_DIR}/src/ProximityStore.h
     # The app's own resources: the QML override path and the icons.
     ${CUSTOM_DIR}/custom.qrc
     # QGC's tinting for QGCColoredImage, as in the app.

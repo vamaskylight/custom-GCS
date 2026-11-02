@@ -20,6 +20,16 @@ apart) differs from the controller's own movement over the same time: right what
 in between, a turn too. The shift is first freed of the EKF's own roll and pitch corrections in
 between, by the gyros' turn (ATTITUDE's rates at 100 Hz, ``_tilt_shift``). Only a fix that agrees
 with the track (track.py) goes to the sender.
+
+Each position carries the EKF's own roll and pitch error times the height (the picture is turned with
+its angles). Without GPS 1 that error was 0.2 to 0.35 degrees in the simulator, 2 to 3 m from 500 m, and
+when the EKF corrected its angles fast (after a stretch of ground with nothing to match) the positions
+moved with them and confirmed its mistake. So while the EKF's angles change more than the gyros say the
+drone turned, a fix says it is that much less sure (``_ekf_tilt_moved_m``); its value is not changed.
+
+A fix far from where the controller thinks it is says it is less sure too, as the square root of how far
+(``_far_factor``): one of the two is wrong, and in the simulator such fixes set off the EKF's swings. That
+only changes how much the EKF listens, never what it is told.
 """
 
 from __future__ import annotations
@@ -66,9 +76,14 @@ ALT_ACC_M = 5.0                     # the height sent is the flight controller's
 EKF_SPEED_ACC = 1.0                 # no speed measured: the controller's own speed, weakly
 SPEED_TIPPING_MAX = 0.8             # m/s a speed may be off from the drone's tipping (TIMING_S): over it, unused
 SPEED_GATE_MPS = 4.0                # a measured speed this far from the controller's own: unused
+PULL_STEP_NS = 100_000_000          # the controller's speed is summed in these steps (its position comes at 10 Hz)
+FIX_FAR_SIGMAS = 1.5                # a fix further than this many of its own accuracy from the controller: _far_factor
 RATE_SPAN_NS = 100_000_000          # the drone's turning rates over this time before a picture
 MAX_RATE_GAP_MS = 30.0              # ATTITUDE's turn rates further apart: the gyros' turn is not summed
 RATES_KEEP_MS = 10_000              # ATTITUDE's turn rates kept this long behind the newest
+# The EKF's own roll and pitch corrections over this long before a picture make its fix less sure (_fix).
+TILT_WINDOW_NS = 3_000_000_000
+HOME_READ_NS = 1_000_000_000        # --heights: how often the ground at home is read while disarmed
 GYRO_BIAS_TAU_S = 40.0              # the gyros' bias left in ATTITUDE's rates is learnt over this long
 GYRO_BIAS_MAX_RAD_S = math.radians(0.5)   # gyros and EKF differ more (a heading reset): not learnt from
 # ATTITUDE's rates come through the gyros' low-pass filter (INS_GYRO_FILTER, two poles), its angles do
@@ -84,7 +99,8 @@ RESULT_FIELDS = ["local_ns", "ok", "why", "lat", "lon", "horiz_acc_m", "inliers"
                  "rechecked", "heading_error_deg", "height_factor", "motion_m", "off_prior_m", "moved_n_m",
                  "moved_e_m", "moved_s", "tilt_shift_n_m", "tilt_shift_e_m", "speed_used", "fc_lat", "fc_lon", "fc_vn", "fc_ve", "fc_yaw_deg",
                  "fc_rel_alt_m", "sent", "fix_local_ns", "fix_lat", "fix_lon", "fix_vn", "fix_ve", "fix_speed_acc",
-                 "seconds", "true_lat", "true_lon", "true_fix_lat", "true_fix_lon"]
+                 "ekf_tilt_moved_m", "pull_mps", "fix_horiz_acc", "seconds", "true_lat", "true_lon", "true_fix_lat",
+                 "true_fix_lon"]
 # true_*: only with the simulator's stand-in camera, its truth at the picture's and at the fix's moment.
 
 
@@ -154,6 +170,8 @@ class MatchSource:
         self._speed: tuple[int, float, float, float] | None = None  # (moment, vn, ve, its extra error) last measured
         self._motion: dict[int, float] = {}         # picture moment: how far its tipping may move it (m)
         self._shift: tuple[int, tuple | None] = (0, None)   # (picture moment, its tilt shift (north, east) or None)
+        self._tilt_moved: tuple[int, float] = (0, 0.0)      # (picture moment, _ekf_tilt_moved_m of its fix)
+        self._pull: tuple[int, float] = (0, 0.0)            # (picture moment, _pull_mps of its speed)
         self._turn_rates: list[tuple] = []          # ATTITUDE's (boot_ms, roll, pitch, yaw rate) rad/s, the body's
         self._turn_rates_lock = threading.Lock()    # the link's thread hands the messages in
         self._gyro_bias = np.zeros(3)               # rad/s left in ATTITUDE's rates, learnt (_tilt_shift)
@@ -169,6 +187,10 @@ class MatchSource:
         self._rows = None
         self.recording = recording
         self.matching = False               # pictures go to the matching (armed, high enough)
+        self.heights = getattr(matcher, "heights", None)    # the ground's heights, for hills
+        self._home_ground_m: float | None = None    # the height of the ground where the drone was last disarmed
+        self._home_read_ns = 0
+        self._no_height_said = False
 
     # --- the runner's calls ---------------------------------------------------------------
 
@@ -227,6 +249,12 @@ class MatchSource:
         gps = t.gps_now(now_ns)
         if gps is not None and gps.get("fix", 0) >= 3:
             self._gps_good_ns = now_ns
+            if self.heights is not None and not t.armed and now_ns - self._home_read_ns >= HOME_READ_NS:
+                self._home_read_ns = now_ns
+                state = self._state(now_ns)
+                ground = self.heights.at(state["lat"], state["lon"]) if state is not None else None
+                if ground is not None:
+                    self._home_ground_m = ground
         height = t.rel_alt_now(now_ns)
         match = t.link_alive(now_ns) and t.armed and height is not None and height >= self.settings.match_above_m
         if match and not self.matching:
@@ -356,6 +384,22 @@ class MatchSource:
         age = max(0.0, (now_ns - max(good)) / 1e9)
         return min(s.search_m + s.search_grow_mps * age, s.max_search_m)
 
+    def _height_m(self, state: dict) -> float:
+        """The drone's height above the ground below it, as far as known: its height above home, and with
+        the ground's heights (--heights) less how far the ground here is above the ground at home. The
+        ground at home is where the drone was last disarmed; started in the air, the controller's own
+        height of home. Where the file has no height: as without the file."""
+        height = float(state["rel_alt_m"])
+        ground = self.heights.at(state["lat"], state["lon"]) if self.heights is not None else None
+        if ground is None:
+            if self.heights is not None and not self._no_height_said:
+                self._no_height_said = True
+                log.warning("the file of the ground's heights has no height at %.5f, %.5f: the ground counts as flat "
+                            "where it has none", state["lat"], state["lon"])
+            return height
+        home = self._home_ground_m if self._home_ground_m is not None else float(state["alt_msl_m"]) - height
+        return max(1.0, height + home - ground)
+
     def _state(self, local_ns: int) -> dict | None:
         """The flight controller's state at this computer's ``local_ns``, or None."""
         boot = self.telemetry.boot_ms_at(local_ns)
@@ -379,7 +423,7 @@ class MatchSource:
                 self._no_position(now_ns, "no flight controller samples at the picture's moment")
                 continue
             pose = Pose(math.radians(state["roll_deg"]), math.radians(state["pitch_deg"]),
-                        math.radians(state["yaw_deg"]), float(state["rel_alt_m"]))
+                        math.radians(state["yaw_deg"]), self._height_m(state))
             rates = self._rates(pic.local_ns, state)
             self._motion[pic.local_ns] = motion_m(pose, rates, pose.height_m)
             while len(self._motion) > 20:
@@ -406,11 +450,34 @@ class MatchSource:
     # --- the answers --------------------------------------------------------------------------
 
     def _moved(self, from_ns: int, to_ns: int) -> tuple[float, float] | None:
-        """The flight controller's own movement (north, east) between two moments."""
+        """The flight controller's own movement (north, east) between two moments: the change of its
+        position, with the jumps toward each camera fix it takes, on purpose. Measured that way the speed
+        and the moved fixes stay in the EKF's own frame. Its speed summed instead is nearer the truth on
+        paper (0.3 to 0.6 m/s off without GPS 1 instead of 0.4 to 1.2, from 500 m), but in the simulator
+        the drone then swung and the EKF failsafe landed it, 225 m off (2026-10-30)."""
         a, b = self._state(from_ns), self._state(to_ns)
         if a is None or b is None:
             return None
         return north_east(a["lat"], a["lon"], b["lat"], b["lon"])
+
+    def _pull_mps(self, from_ns: int, to_ns: int, moved: tuple[float, float], dt: float) -> float:
+        """How fast the controller's position moved between two moments beyond what its own speed says: how
+        hard the fixes it takes are pulling it, in m/s, for the results file. The speed between two pictures
+        carries that pull (see _moved). Do not stop using the speed for it: the controller's own speed then goes
+        out, the EKF is told its speed error is right, and in the simulator the drone swung 42 m off for a whole
+        leg (2026-10-31). 0 without the samples."""
+        steps = max(1, round((to_ns - from_ns) / PULL_STEP_NS))
+        north = east = 0.0
+        last = None
+        for k in range(steps + 1):
+            state = self._state(from_ns + (to_ns - from_ns) * k // steps)
+            if state is None:
+                return 0.0
+            if last is not None:
+                north += 0.5 * (last["vn_mps"] + state["vn_mps"]) * dt / steps
+                east += 0.5 * (last["ve_mps"] + state["ve_mps"]) * dt / steps
+            last = state
+        return math.hypot(moved[0] - north, moved[1] - east) / dt
 
     def _tilt_shift(self, from_ns: int, to_ns: int, boot_a: float | None, boot_b: float | None,
                     at: dict) -> tuple[float, float] | None:
@@ -420,25 +487,11 @@ class MatchSource:
         if boot_a is None or boot_b is None or before is None or at.get("rel_alt_m") is None:
             self.counts["speeds without the gyros' turn"] += 1
             return None
-        # The rates measured the turn gyro_lag_ms before they were stamped (the gyros' filter).
-        lag_a, lag_b = boot_a + self.gyro_lag_ms, boot_b + self.gyro_lag_ms
-        with self._turn_rates_lock:
-            i = bisect.bisect_right(self._turn_rates, lag_a, key=lambda s: s[0]) - 1
-            j = bisect.bisect_left(self._turn_rates, lag_b, key=lambda s: s[0])
-            rates = self._turn_rates[i:j + 1] if i >= 0 else []
-        if rates and rates[-1][0] < lag_b <= rates[-1][0] + MAX_RATE_GAP_MS:
-            rates.append((lag_b, *rates[-1][1:]))      # the newest rate held for the last few ms
-        turn = turn_of(rates, lag_a, lag_b, MAX_RATE_GAP_MS)
+        turn = self._gyro_turn(boot_a, boot_b)
         if turn is None:
             self.counts["speeds without the gyros' turn"] += 1
             return None
-        height = float(at["rel_alt_m"]) * getattr(self.matcher, "height_factor", 1.0)
-
-        def pose(state: dict) -> Pose:
-            return Pose(math.radians(state["roll_deg"]), math.radians(state["pitch_deg"]),
-                        math.radians(state["yaw_deg"]), height)
-
-        a, b = pose(before), pose(at)
+        a, b = self._tilt_poses(before, at)
         dt = (boot_b - boot_a) / 1000.0
         # ATTITUDE's rates are the gyros corrected by the EKF's own bias estimate, which lags (the
         # simulator drifts its gyros on purpose, 0.02 to 0.04 degrees a second were left). What is left
@@ -451,6 +504,48 @@ class MatchSource:
             self._gyro_bias = self._gyro_bias + (seen - self._gyro_bias) * gain
         self._gyro_bias_boot = boot_b
         return tilt_shift_m(a, b, used)
+
+    def _gyro_turn(self, boot_a: float, boot_b: float) -> np.ndarray | None:
+        """The drone's own turn between two of the controller's moments by its gyros (ATTITUDE's rates),
+        or None without enough rates."""
+        # The rates measured the turn gyro_lag_ms before they were stamped (the gyros' filter).
+        lag_a, lag_b = boot_a + self.gyro_lag_ms, boot_b + self.gyro_lag_ms
+        with self._turn_rates_lock:
+            i = bisect.bisect_right(self._turn_rates, lag_a, key=lambda s: s[0]) - 1
+            j = bisect.bisect_left(self._turn_rates, lag_b, key=lambda s: s[0])
+            rates = self._turn_rates[i:j + 1] if i >= 0 else []
+        if rates and rates[-1][0] < lag_b <= rates[-1][0] + MAX_RATE_GAP_MS:
+            rates.append((lag_b, *rates[-1][1:]))      # the newest rate held for the last few ms
+        return turn_of(rates, lag_a, lag_b, MAX_RATE_GAP_MS)
+
+    def _tilt_poses(self, before: dict, at: dict) -> tuple[Pose, Pose]:
+        """The controller's angles at two moments, at the height the pictures are turned with."""
+        height = self._height_m(at) * getattr(self.matcher, "height_factor", 1.0)
+
+        def pose(state: dict) -> Pose:
+            return Pose(math.radians(state["roll_deg"]), math.radians(state["pitch_deg"]),
+                        math.radians(state["yaw_deg"]), height)
+
+        return pose(before), pose(at)
+
+    def _ekf_tilt_moved_m(self, picture_ns: int, at: dict) -> float:
+        """How far the EKF's own roll and pitch corrections of the last TILT_WINDOW_NS before a picture
+        (what its angles did beyond the gyros' turn) moved the ground under the camera, in metres; 0
+        without the rates. A fix carries the EKF's angle error times the height, so while the EKF corrects
+        its angles fast its fixes move with them and confirm its own mistake: from 500 m in the simulator
+        the EKF's pitch swung 1.3 degrees after a blank, the fixes moved 11 m with it, and the EKF
+        followed them (2026-10-30). Nothing is learnt here (the gyros' bias is learnt in _tilt_shift)."""
+        since = picture_ns - TILT_WINDOW_NS
+        boot_a, boot_b = self.telemetry.boot_ms_at(since), self.telemetry.boot_ms_at(picture_ns)
+        before = self._state(since)
+        if boot_a is None or boot_b is None or before is None or at.get("rel_alt_m") is None:
+            return 0.0
+        turn = self._gyro_turn(boot_a, boot_b)
+        if turn is None:
+            return 0.0
+        a, b = self._tilt_poses(before, at)
+        used = turn @ rotation(-self._gyro_bias * (boot_b - boot_a) / 1000.0)
+        return math.hypot(*tilt_shift_m(a, b, used))
 
     def _use(self, result: Result, now_ns: int) -> None:
         at = self._state(result.local_ns)
@@ -476,13 +571,18 @@ class MatchSource:
                        moved_s=f"{(result.local_ns - mv.since_ns) / 1e9:.3f}")
             if self._shift[0] == result.local_ns and self._shift[1] is not None:
                 row.update(tilt_shift_n_m=f"{self._shift[1][0]:.3f}", tilt_shift_e_m=f"{self._shift[1][1]:.3f}")
+        if fix is not None and self._tilt_moved[0] == result.local_ns:
+            row.update(ekf_tilt_moved_m=f"{self._tilt_moved[1]:.2f}")
+        if self._pull[0] == result.local_ns:
+            row.update(pull_mps=f"{self._pull[1]:.2f}")
         if at:
             row.update(fc_lat=f"{at['lat']:.7f}", fc_lon=f"{at['lon']:.7f}", fc_vn=f"{at['vn_mps']:.2f}",
                        fc_ve=f"{at['ve_mps']:.2f}", fc_yaw_deg=f"{at['yaw_deg']:.1f}",
                        fc_rel_alt_m=f"{at['rel_alt_m']:.1f}")
         if fix is not None:
             row.update(fix_local_ns=fix.local_ns, fix_lat=f"{fix.lat:.7f}", fix_lon=f"{fix.lon:.7f}",
-                       fix_vn=f"{fix.vn:.2f}", fix_ve=f"{fix.ve:.2f}", fix_speed_acc=f"{fix.speed_acc_mps:.2f}")
+                       fix_vn=f"{fix.vn:.2f}", fix_ve=f"{fix.ve:.2f}", fix_speed_acc=f"{fix.speed_acc_mps:.2f}",
+                       fix_horiz_acc=f"{fix.horiz_acc_m:.2f}")
         truth_at = getattr(self.camera, "truth_at", None)
         if truth_at is not None:
             for prefix, moment in (("true_", result.local_ns), ("true_fix_", fix.local_ns if fix else None)):
@@ -516,6 +616,8 @@ class MatchSource:
                 ve = at["ve_mps"] + (east - fc_moved[1]) / dt
                 tipping = (self._motion.get(mv.since_ns, 0.0) + self._motion.get(result.local_ns, 0.0)) / dt
                 off = math.hypot(vn - at["vn_mps"], ve - at["ve_mps"])
+                pull = self._pull_mps(mv.since_ns, result.local_ns, fc_moved, dt)
+                self._pull = (result.local_ns, pull)
                 if tipping > SPEED_TIPPING_MAX:
                     note = "the drone tipped too fast for the speed between two pictures"
                 elif off > SPEED_GATE_MPS:
@@ -593,9 +695,25 @@ class MatchSource:
         # the next one its full weight.
         since = 1.0 if self._last_sent_ns is None else (result.local_ns - self._last_sent_ns) / 1e9
         weight = math.sqrt(1.0 / min(1.0, max(since, self.settings.interval_s)))
+        # While the EKF corrects its own roll and pitch fast, the fix moves with its angles: it is that
+        # much less sure (_ekf_tilt_moved_m). Its value stays as matched: changed values unsettled the EKF.
+        tilt_moved = self._ekf_tilt_moved_m(result.local_ns, at)
+        self._tilt_moved = (result.local_ns, tilt_moved)
+        horiz = math.hypot(result.horiz_acc_m, tilt_moved)
+        horiz *= self._far_factor(result.off_prior_m, horiz)
         return Fix(local_ns=moment, lat=lat, lon=lon, alt_msl_m=float(now["alt_msl_m"]), vn=vn, ve=ve,
-                   horiz_acc_m=result.horiz_acc_m * weight, vert_acc_m=ALT_ACC_M,
+                   horiz_acc_m=horiz * weight, vert_acc_m=ALT_ACC_M,
                    speed_acc_mps=min(speed_acc, EKF_SPEED_ACC) * weight)
+
+    @staticmethod
+    def _far_factor(off_m: float, horiz_m: float) -> float:
+        """How much less sure a fix is for lying ``off_m`` from the controller's position. Within FIX_FAR_SIGMAS
+        of its accuracy not at all. Beyond that as the square root of the distance (a Huber weight): the EKF's
+        step toward the fix then stops growing with the distance, so one wrong fix cannot throw it, and it
+        does not fall off either, so a controller that really is far off still comes back. In the simulator
+        a fix over 10 m from the controller was 10 m off (middle) and said 4.6 m, and such fixes set off
+        the swings of the EKF's tilt at a corner and after a blank (2026-10-31)."""
+        return max(1.0, math.sqrt(off_m / (FIX_FAR_SIGMAS * horiz_m)))
 
     def _no_position(self, now_ns: int, why: str) -> None:
         kind = re.sub(r"\d+(\.\d+)?", "N", why.split(" (")[0].split(";")[0])   # "only N features pair with the map"

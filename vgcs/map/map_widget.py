@@ -821,6 +821,8 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     return_requested = Signal()
     land_requested = Signal()
     disarm_requested = Signal()
+    # The range of the PROXIMITY card's four sides, chosen on the card (B19, the window saves it).
+    obstacle_bar_range_chosen = Signal(float)
     plan_tool_requested = Signal(str)
     plan_action_requested = Signal(str)
     plan_flight_exited = Signal()
@@ -1360,6 +1362,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         # M9 — obstacle radar on `_panel` (same stacking layer as PiP / compass).
         self._obstacle_radar = ObstacleRadarPanel(self._panel)
         self._obstacle_radar.c13_lrf_lock_clicked.connect(self._on_c13_lrf_icon_clicked)
+        self._obstacle_radar.bar_range_chosen.connect(self.obstacle_bar_range_chosen.emit)
         self._obstacle_radar.hide()
 
         # Legacy Web `#actionRail` / `.actionBtn` — parent `_panel` (not `_map_canvas`) so Takeoff/Return

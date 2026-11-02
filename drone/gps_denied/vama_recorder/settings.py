@@ -19,7 +19,9 @@ class SettingsError(ValueError):
 @dataclass(frozen=True)
 class Settings:
     # [link]
-    device: str = "/dev/serial0"
+    # Pins 8 and 10 of a Raspberry Pi 5 (with dtoverlay=uart0-pi5). Its /dev/serial0 is the 3-pin debug connector;
+    # on a Pi 4 or older the pins are /dev/serial0.
+    device: str = "/dev/ttyAMA0"
     baud: int = 115200
     # The recorder's own MAVLink address: the drone's system and the onboard computer component.
     source_system: int = 1

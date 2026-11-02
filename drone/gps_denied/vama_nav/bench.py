@@ -33,7 +33,7 @@ from .geo import distance_m, offset
 from .geometry import Lens, Pose
 from .map_tiles import MapError, TileMap
 from .matcher import FEATURES, Job, Matcher, MatchSettings
-from .sim_camera import SimCamera
+from .sim_camera import Hills, SimCamera
 
 WARM_UP = 2                     # the first pictures are not counted (the libraries start up)
 TWO_A_SECOND_S = 0.4            # a picture's middle time under this: two a second leave room for the rest
@@ -60,7 +60,14 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--height-m", type=float, default=500.0,
                    help="the flight's height (default 500 m, the client's: a picture takes about twice as long as from 300 m)")
     p.add_argument("--speed-mps", type=float, default=12.0)
+    p.add_argument("--pitch-deg", type=float, default=-8.0,
+                   help="the drone's nose down this much (default -8; the simulator's quadcopter flies at -30)")
     p.add_argument("--interval-s", type=float, default=0.5, help="the pictures' spacing in flight (vama_nav's default)")
+    p.add_argument("--hills-m", type=float, default=0.0,
+                   help="the ground as made-up hills of plus or minus this much, about 3 km from top to top")
+    p.add_argument("--use-heights", action="store_true", help="--hills-m: the matching knows the ground's heights")
+    p.add_argument("--heights-off-m", type=float, default=8.0,
+                   help="--use-heights: its heights are off by up to this much, as an elevation model's are")
     p.add_argument("--threads", type=int, help="OpenCV's threads (default: as it starts)")
     p.add_argument("--seed", type=int, default=1)
     return p
@@ -104,11 +111,14 @@ def run(args, out=print) -> int:
         cv2.setNumThreads(int(args.threads))
     tile_map, ground = TileMap(args.map), TileMap(args.ground)
     try:
-        matcher = Matcher(tile_map, Lens(args.hfov_deg),
-                          MatchSettings(features=args.features, xfeat_dir=str(args.xfeat_dir or "")))
         a, b = _area(tile_map), _area(ground)
         west, south, east, north = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
         lat0, lon0 = 0.5 * (south + north), 0.5 * (west + east)
+        # The flight (north, through the middle) crosses from a valley to a hilltop (phase -0.7).
+        hills = Hills(args.hills_m, (lat0, lon0), phase=-0.7) if args.hills_m > 0 else None
+        known = Hills(args.hills_m, (lat0, lon0), phase=-0.7, off_m=args.heights_off_m) if hills and args.use_heights else None
+        matcher = Matcher(tile_map, Lens(args.hfov_deg),
+                          MatchSettings(features=args.features, xfeat_dir=str(args.xfeat_dir or "")), heights=known)
         span_m = args.pictures * args.interval_s * args.speed_mps
         if (distance_m(south, lon0, north, lon0) < span_m + 2 * MARGIN_M
                 or distance_m(lat0, west, lat0, east) < 2 * MARGIN_M):
@@ -117,24 +127,34 @@ def run(args, out=print) -> int:
             return 2
         rng = random.Random(args.seed)
         camera = SimCamera(ground, Lens(args.hfov_deg), size=args.picture, ground_alt_m=0.0,
-                           rng=np.random.default_rng(args.seed))
+                           rng=np.random.default_rng(args.seed), hills=hills)
         out(f"vama_nav bench check, {datetime.now(UTC).isoformat(timespec='minutes').replace('+00:00', 'Z')}")
         out(f"computer: {_computer(args.features, matcher)}")
         out(f"map: {tile_map.describe()}; pictures drawn from {ground.describe()}")
+        if hills:
+            out(f"over made-up hills of plus or minus {args.hills_m:g} m, "
+                + (f"the matching knows the ground's heights, up to {args.heights_off_m:g} m off" if known
+                   else "the matching takes the ground as level"))
         out(f"{args.features} features, pictures {camera.size[0]}x{camera.size[1]} from {args.height_m:g} m, "
             f"{args.speed_mps * args.interval_s:g} m apart ({args.speed_mps:g} m/s, a picture each {args.interval_s:g} s)")
         times, errors, why = [], [], []
         stages: dict[str, list[float]] = {}
         for i in range(args.pictures + WARM_UP):
             lat, lon = offset(lat0, lon0, -0.5 * span_m + i * args.speed_mps * args.interval_s, 0.0)
-            pose = Pose(math.radians(rng.uniform(-1.0, 1.0)), math.radians(-8.0 + rng.uniform(-1.0, 1.0)),
-                        math.radians(rng.uniform(-2.0, 2.0)), args.height_m)
+            # The flight keeps its height above the take-off level, so its height above the ground changes.
+            roll, pitch = math.radians(rng.uniform(-1.0, 1.0)), math.radians(args.pitch_deg + rng.uniform(-1.0, 1.0))
+            yaw = math.radians(rng.uniform(-2.0, 2.0))
+            pose = Pose(roll, pitch, yaw, args.height_m - (hills.at(lat, lon) if hills else 0.0))
             picture = camera.draw(pose, lat, lon)
             r, angle = rng.uniform(0.0, 10.0), rng.uniform(0.0, 2.0 * math.pi)   # the flight controller's own error
             prior = offset(lat, lon, r * math.cos(angle), r * math.sin(angle))
             local_ns = 10_000_000_000 + int(i * args.interval_s * 1e9)
+            # What the flight controller and the matching know of the height: above the take-off level, or
+            # with the heights above the ground below the drone.
+            known_height = args.height_m - known.at(prior[0], prior[1]) if known else args.height_m
+            job_pose = Pose(pose.roll, pose.pitch, pose.yaw, known_height)
             began = time.perf_counter()
-            result = matcher.process(Job(local_ns, picture, prior[0], prior[1], pose, 60.0))
+            result = matcher.process(Job(local_ns, picture, prior[0], prior[1], job_pose, 60.0))
             took = time.perf_counter() - began
             if i < WARM_UP:
                 continue

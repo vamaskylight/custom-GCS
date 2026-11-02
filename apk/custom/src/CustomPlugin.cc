@@ -7,15 +7,23 @@
 #include "APMMavlinkStreamRateSettings.h"
 #include "FlightMapSettings.h"
 #include "MapPackLoader.h"
+#include "MultiVehicleManager.h"
+#include "ParameterManager.h"
+#include "PositionSourceStore.h"
 #include "ProximityStore.h"
 #include "SettingsManager.h"
+#include "AudioOutput.h"
+#include "VamaVoice.h"
+#include "VamaVoiceEngine.h"
 #include "VideoSettings.h"
 #include "Vehicle.h"
 #include "Viewer3DSettings.h"
 
 #include <QtCore/QApplicationStatic>
+#include <QtCore/QTimer>
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlFile>
+#include <QtTextToSpeech/QTextToSpeech>
 
 QGC_LOGGING_CATEGORY(CustomLog, "Custom.CustomPlugin")
 
@@ -68,6 +76,19 @@ void CustomPlugin::init()
     (void) connect(_mapPacks, &MapPackLoader::loadingChanged, this, &CustomPlugin::mapPackLoadingChanged);
     (void) connect(_mapPacks, &MapPackLoader::packLoaded, this, &CustomPlugin::mapPackLoaded);
     _mapPacks->start();
+
+    // VAMA (A8 step 4): a drone that went away starts again with nothing known about where its
+    // position comes from (PositionSourceStore.h; VGCS: a new link).
+    (void) connect(MultiVehicleManager::instance(), &MultiVehicleManager::vehicleRemoved, this, [](Vehicle *vehicle) {
+        PositionSourceStore::instance()->reset(vehicle->id());
+    });
+
+    // VAMA (the client, 2026-10-30): the voice the app speaks with, Indian English (VamaVoice.h).
+    // QGCApplication sets up AudioOutput's engine after this init and before the event loop, so it
+    // is attached once the loop runs, after QGC's own choice of voice.
+    QTimer::singleShot(0, this, [this] {
+        (new VamaVoiceEngine(VamaVoice::instance(), this))->attach(AudioOutput::instance()->findChild<QTextToSpeech *>());
+    });
 }
 
 QString CustomPlugin::mapPackLoading() const
@@ -383,7 +404,39 @@ bool CustomPlugin::mavlinkMessage(Vehicle *vehicle, LinkInterface *link, const m
         ProximityStore::instance()->hear(vehicle->id(), sensor.id, sensor.orientation, sensor.current_distance,
                                          sensor.max_distance);
     }
+    if ((vehicle != nullptr) && (message.compid == vehicle->defaultComponentId()) &&
+        ((message.msgid == MAVLINK_MSG_ID_GPS_RAW_INT) || (message.msgid == MAVLINK_MSG_ID_GPS2_RAW))) {
+        _hearPositionSource(vehicle, message);
+    }
     return QGCCorePlugin::mavlinkMessage(vehicle, link, message);
+}
+
+void CustomPlugin::_hearPositionSource(Vehicle *vehicle, const mavlink_message_t &message)
+{
+    // VAMA (A8 step 4): GPS 1 is GPS_RAW_INT, GPS 2 (the down camera of the GPS-denied navigation)
+    // GPS2_RAW. The armed state and the GPS settings are those QGC holds.
+    PositionSourceStore *store = PositionSourceStore::instance();
+    store->setArmed(vehicle->id(), vehicle->armed());
+    if (message.msgid == MAVLINK_MSG_ID_GPS_RAW_INT) {
+        mavlink_gps_raw_int_t gps{};
+        mavlink_msg_gps_raw_int_decode(&message, &gps);
+        store->hearGps1(vehicle->id(), gps.fix_type);
+        return;
+    }
+    mavlink_gps2_raw_t gps{};
+    mavlink_msg_gps2_raw_decode(&message, &gps);
+    // Read again with every GPS2_RAW: a setting changed in the parameters counts at once.
+    ParameterManager *params = vehicle->parameterManager();
+    if ((params != nullptr) && params->parametersReady()) {
+        std::map<std::string, double> settings;
+        for (const char *name : {"GPS2_TYPE", "GPS_TYPE2", "GPS_AUTO_SWITCH"}) {
+            if (params->parameterExists(ParameterManager::defaultComponentId, name)) {
+                settings[name] = params->getParameter(ParameterManager::defaultComponentId, name)->rawValue().toDouble();
+            }
+        }
+        store->setSettings(vehicle->id(), settings);
+    }
+    store->hearGps2(vehicle->id(), gps.fix_type, gps.h_acc, gps.satellites_visible);
 }
 
 /*===========================================================================*/

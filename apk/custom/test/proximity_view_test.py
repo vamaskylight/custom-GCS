@@ -1,19 +1,25 @@
-"""QGC's obstacle radar, on the map and on the video, with our ProximityRadarValues.qml (A7, 2026-10-27).
+"""QGC's obstacle radar on the map, with our ProximityRadarValues.qml (A7, 2026-10-27).
 
-Renders QGC 5.1.5's own ProximityRadarMapView.qml (on an offline map) and
-ProximityRadarVideoView.qml from apk/qgc-src, offscreen, with Qt 6.11.1 (the
-app's Qt, through PySide6), and a made-up drone whose obstacle sensor sends
-what ArduPilot sends: a distance in each of 8 directions, an empty direction as
-the sensor's maximum, and 0 as the maximum of a sensor whose range ArduPilot
-does not know (the client's RPLidar A3).
+Renders QGC 5.1.5's own ProximityRadarMapView.qml (on an offline map) from
+apk/qgc-src, offscreen, with Qt 6.11.1 (the app's Qt, through PySide6), and a
+made-up drone whose obstacle sensor sends what ArduPilot sends: a distance in
+each of 8 directions, an empty direction as the sensor's maximum, and 0 as the
+maximum of a sensor whose range ArduPilot does not know (the client's RPLidar A3).
 
-QGC's own ProximityRadarValues.qml put a "0.00" label in the middle of the
-video for each empty direction of such a sensor. The checks below run our copy
-(src/ProximityRadarValues.qml, served by custom.qrc in place of QGC's file),
-and QGC's own file once, to show that the copy is still needed. Our copy takes
-the directions from the app's store (src/ProximityStore.h): here a stand-in
-gives what the store publishes, NaN for a direction with nothing in range or
-not heard lately (test/link/proximity_store_test.cc checks the store itself).
+QGC's own ProximityRadarValues.qml drew each empty direction as a red arc on the
+range circle. The checks below run our copy (src/ProximityRadarValues.qml, served
+by custom.qrc in place of QGC's file), and QGC's own file once, to show that the
+copy is still needed. Our copy takes the directions from the app's store
+(src/ProximityStore.h): here a stand-in gives what the store publishes, NaN for a
+direction with nothing in range or not heard lately
+(test/link/proximity_store_test.cc checks the store itself), and it leaves out what
+is beyond the proximity range the user set (B19, the client 2026-10-30; the round
+view's range since B25).
+
+QGC's radar on the video moved each reading with its distance, so the app replaces
+it with an empty file (src/ProximityRadarVideoView.qml, checked here to draw
+nothing). The app shows the readings in its round proximity view instead, in a box
+its button opens (src/VamaProximityWindow.qml, B25, checked by run_preview.ps1).
 
 QGC's own modules (ScreenTools, QGCLabel) and the store are stood in for by
 small QML files in a temporary folder.
@@ -38,6 +44,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 HERE = pathlib.Path(__file__).resolve().parent
 QGC_SRC = HERE.parents[1] / "qgc-src" / "src"
 OURS = HERE.parent / "src" / "ProximityRadarValues.qml"
+OUR_VIDEO_VIEW = HERE.parent / "src" / "ProximityRadarVideoView.qml"
 
 ROTATIONS = ["rotationNone", "rotationYaw45", "rotationYaw90", "rotationYaw135", "rotationYaw180",
              "rotationYaw225", "rotationYaw270", "rotationYaw315"]
@@ -68,13 +75,14 @@ def stand_ins(root: pathlib.Path, values_file: pathlib.Path) -> None:
     # The app's store (src/ProximityStore.h): forVehicle gives the scene's stand-in for the drone's directions.
     (gc / "ProximityStore.qml").write_text(
         "pragma Singleton\nimport QtQuick\nQtObject {\n    id: store\n    property var current: null\n"
+        "    property real barRange: 40\n"
         "    function forVehicle(vehicleId) { return store.current }\n}\n")
     (gc / "ScreenTools.qml").write_text(
         "pragma Singleton\nimport QtQuick\nQtObject { property real defaultFontPixelHeight: 16 }\n")
     (gc / "Controls" / "qmldir").write_text("module QGroundControl.Controls\nQGCLabel 1.0 QGCLabel.qml\n")
     (gc / "Controls" / "QGCLabel.qml").write_text("import QtQuick\nText { color: \"white\"; font.pixelSize: 16 }\n")
     shutil.copy2(values_file, gc / "FlyView" / "ProximityRadarValues.qml")
-    shutil.copy2(QGC_SRC / "FlyView" / "ProximityRadarVideoView.qml", gc / "FlyView" / "ProximityRadarVideoView.qml")
+    shutil.copy2(OUR_VIDEO_VIEW, gc / "FlyView" / "ProximityRadarVideoView.qml")
     (gc / "FlyView" / "qmldir").write_text(
         "module QGroundControl.FlyView\nProximityRadarValues 1.0 ProximityRadarValues.qml\n"
         "ProximityRadarVideoView 1.0 ProximityRadarVideoView.qml\n")
@@ -116,7 +124,8 @@ def drone_qml(sectors: list, max_m: float | None, heading: float, telemetry: boo
             "}\n")
 
 
-def scene(folder: pathlib.Path, kind: str, drone: str) -> pathlib.Path:
+def scene(folder: pathlib.Path, kind: str, drone: str, bar_range: float) -> pathlib.Path:
+    start = f"Component.onCompleted: {{ ProximityStore.current = theDrone.vamaSectors; ProximityStore.barRange = {bar_range!r} }}"
     if kind == "map":
         body = f"""import QtQuick
 import QtLocation
@@ -125,7 +134,7 @@ import QGroundControl
 import QGroundControl.FlightMap
 Rectangle {{
     width: {MAP_SIZE[0]}; height: {MAP_SIZE[1]}; color: "#202428"
-    Component.onCompleted: ProximityStore.current = theDrone.vamaSectors
+    {start}
     Map {{
         id: theMap
         anchors.fill: parent
@@ -149,9 +158,10 @@ import QGroundControl
 import QGroundControl.FlyView
 Rectangle {{
     width: {VIDEO_SIZE[0]}; height: {VIDEO_SIZE[1]}; color: "#202428"
-    Component.onCompleted: ProximityStore.current = theDrone.vamaSectors
+    {start}
     ProximityRadarVideoView {{
         objectName: "radar"
+        anchors.fill: parent  // as QGC's FlyViewVideo.qml makes it
         vehicle: theDrone
     }}
     property QtObject theDrone: {drone}
@@ -190,9 +200,10 @@ class Rendered:
         return [math.hypot(x - cx, y - cy) for x, y in self.red]
 
 
-def render(app, folder: pathlib.Path, kind: str, drone: str, change: dict | None = None) -> Rendered:
+def render(app, folder: pathlib.Path, kind: str, drone: str, change: dict | None = None, bar_range: float = 40.0) -> Rendered:
     """Show the view and take its picture. ``change`` ({fact name: metres}): new readings after the first
-    picture, and the picture after them (a view that draws only once would keep its first)."""
+    picture, and the picture after them (a view that draws only once would keep its first).
+    ``bar_range``: the proximity range the user set (ProximityStore.barRange)."""
     from PySide6.QtCore import QPointF, QTimer, QUrl
     from PySide6.QtGui import QColor
     from PySide6.QtQuick import QQuickView
@@ -206,7 +217,7 @@ def render(app, folder: pathlib.Path, kind: str, drone: str, change: dict | None
     view = QQuickView()
     view.engine().addImportPath(str(folder / "imports"))
     view.setColor(QColor("#202428"))
-    view.setSource(QUrl.fromLocalFile(str(scene(folder, kind, drone))))
+    view.setSource(QUrl.fromLocalFile(str(scene(folder, kind, drone, bar_range))))
     errors = [e.toString() for e in view.errors()]
     size = MAP_SIZE if kind == "map" else VIDEO_SIZE
     view.resize(*size)
@@ -254,7 +265,7 @@ def within_deg(angles: list[float], centre: float, half_width: float) -> bool:
 
 
 def main() -> int:
-    if not (QGC_SRC / "FlyView" / "ProximityRadarVideoView.qml").exists():
+    if not (QGC_SRC / "FlightMap" / "MapItems" / "ProximityRadarMapView.qml").exists():
         print(f"SKIPPED: QGC's source is not in {QGC_SRC.parent} (run apk/fetch_qgc.ps1)")
         return 0
     from PySide6.QtGui import QGuiApplication
@@ -273,24 +284,12 @@ def main() -> int:
         qgc = with_values(QGC_SRC / "FlyView" / "ProximityRadarValues.qml")
         a3_ahead = drone_qml([5.0, 0, 0, 0, 0, 0, 0, 0], 0.0, 0.0)       # the A3: range 0, 5 m ahead
 
-        # --- why the copy exists: QGC's own file ---------------------------------------------
-        video = render(app, qgc, "video", a3_ahead)
-        piled = [t for t, x, y in video.labels if abs(x) < 2 and abs(y) < 2]
-        r.check(len(piled) == 7, f"QGC's own file: 7 labels in the middle of the video for the A3's empty directions "
-                                 f"({piled}); when this fails QGC has changed and the copy may not be needed")
-
-        # --- ours, the A3 (range 0) -------------------------------------------------------------
+        # --- the video: QGC's moving radar is replaced, the app's round view is in its own box -------
         video = render(app, ours, "video", a3_ahead)
-        r.check(not video.errors, f"the views load with our file {video.errors[:1]}")
-        r.check([t for t, _x, _y in video.labels] == ["5.00"],
-                f"video, the A3: only the reading is labelled, nothing in the middle ({video.labels})")
-        if video.labels:
-            _t, x, y = video.labels[0]
-            # QGC's video radar shows 6 m to the picture's half height: 30 px a metre at 360 px.
-            r.check(near(x, 0.0, 2.0) and near(y, -150.0, 3.0), f"and the label is ahead, 5 m out ({x:.0f}, {y:.0f})")
-        # Stretched across the picture, the arc's 38 degrees look like 62 from the middle.
-        r.check(within_deg(video.red_angles_deg(), 0.0, 40.0), "video, the A3: the one arc is ahead")
+        r.check(not video.errors, f"our video file loads {video.errors[:1]}")
+        r.check(not video.labels and not video.red, f"video: our file draws nothing ({video.labels})")
 
+        # --- the map, the A3 (range 0) -------------------------------------------------------------
         shown = render(app, ours, "map", a3_ahead)
         r.check(not shown.errors, f"the map view loads with our file {shown.errors[:1]}")
         distances = shown.red_distance_px()
@@ -300,34 +299,30 @@ def main() -> int:
                 f"({len(shown.red)} red pixels, mean {sum(distances) / max(1, len(distances)):.1f} px)")
         r.check(shown.white == 0, "map, the A3: no range circle (ArduPilot knows no range for it)")
 
-        # The object comes nearer: both views follow (the video radar redraws only when told to).
-        video = render(app, ours, "video", a3_ahead, change={"rotationNone": 2.0})
-        r.check([(t, round(y)) for t, _x, y in video.labels] == [("2.00", -60)]
-                and bool(video.red) and max(video.red_distance_px()) < 100.0,
-                f"video, the A3: the object comes to 2 m, label and arc follow ({video.labels}, "
-                f"arc out to {max(video.red_distance_px(), default=0.0):.0f} px)")
+        # The object comes nearer: the map follows.
         shown = render(app, ours, "map", a3_ahead, change={"rotationNone": 2.0})
         distances = shown.red_distance_px()
         r.check(bool(distances) and near(sum(distances) / len(distances), 7.2, 3.0),
                 f"map, the A3: the arc follows to 2 m (mean {sum(distances) / max(1, len(distances)):.1f} px)")
-        video = render(app, ours, "video", a3_ahead, change={"rotationNone": 0.0})
-        r.check(not video.labels and not video.red, f"video, the A3: the object gone, nothing left ({video.labels})")
+        shown = render(app, ours, "map", a3_ahead, change={"rotationNone": 0.0})
+        r.check(not shown.red, "map, the A3: the object gone, nothing left")
 
-        # Something in every direction: then only the direction that changed tells the video radar to redraw
-        # (an empty direction is NaN, and QML announces a NaN again at every update, so it redraws the rest too).
+        # Something in every direction: the map shows each where it is.
         all_round = drone_qml([5.0, 5.5, 5.0, 5.5, 5.0, 5.5, 5.0, 5.5], 0.0, 0.0)
-        video = render(app, ours, "video", all_round, change={"rotationNone": 2.0})
-        ahead = [d for d, a in zip(video.red_distance_px(), video.red_angles_deg()) if abs((a + 180.0) % 360.0 - 180.0) < 20.0]
-        r.check("2.00" in [t for t, _x, _y in video.labels] and bool(ahead) and max(ahead) < 100.0,
-                f"video, something all round: the arc ahead follows to 2 m (out to {max(ahead, default=0.0):.0f} px)")
+        shown = render(app, ours, "map", all_round)
+        angles = shown.red_angles_deg()
+        r.check(all(any(abs((a - k * 45.0 + 180.0) % 360.0 - 180.0) < 15.0 for a in angles) for k in range(8)),
+                "map, something all round: an arc in each of the 8 directions (the map keeps where the object is)")
 
-        a3_two = drone_qml([0, 0, 3.0, 0, 4.0, 0, 0, 0], 0.0, 0.0)       # 3 m right, 4 m behind
-        video = render(app, ours, "video", a3_two)
-        got = sorted((t, round(x), round(y)) for t, x, y in video.labels)
-        # The video radar is stretched to the picture's width: 30 px a metre up and down, 53 across.
-        r.check(len(got) == 2 and got[0][0] == "3.00" and near(got[0][1], 160, 3) and near(got[0][2], 0, 3)
-                and got[1][0] == "4.00" and near(got[1][1], 0, 3) and near(got[1][2], 120, 3),
-                f"video, the A3: 3 m right and 4 m behind, where they are ({got})")
+        # --- the proximity range the user set (B19, B25) --------------------------------------------
+        shown = render(app, ours, "map", a3_ahead, bar_range=4.0)
+        r.check(not shown.red, "map: a reading beyond the proximity range is not drawn (5 m of 4 m)")
+        shown = render(app, ours, "map", a3_ahead, bar_range=5.0)
+        r.check(bool(shown.red), "map: a reading on the limit is drawn (5 m of 5 m)")
+        two = drone_qml([4.9, 0, 8.0, 0, 0, 0, 0, 0], 0.0, 0.0)
+        shown = render(app, ours, "map", two, bar_range=5.0)
+        r.check(within_deg(shown.red_angles_deg(), 0.0, 30.0),
+                "map: of 4.9 m ahead and 8 m right with a range of 5 m, only the one ahead")
 
         # --- ours, a sensor with a known range (40 m) --------------------------------------------
         ranged = drone_qml([5.0, 40, 40, 40, 40, 40, 40, 40], 40.0, 0.0)
@@ -336,17 +331,14 @@ def main() -> int:
                 f"map, 40 m range: only the reading is red, the empty directions are not drawn on the circle "
                 f"({len(shown.red)} red pixels)")
         r.check(shown.white > 1000, f"map, 40 m range: the range circle is drawn ({shown.white} white pixels)")
-        video = render(app, ours, "video", ranged)
-        r.check([t for t, _x, _y in video.labels] == ["5.00"], f"video, 40 m range: one label ({video.labels})")
 
         qgc_map = render(app, qgc, "map", ranged)
         r.check(len(qgc_map.red) > 5 * max(1, len(shown.red)),
                 f"(QGC's own file drew the 7 empty directions as red arcs on the circle: {len(qgc_map.red)} red pixels)")
 
         near_max = drone_qml([39.9, 40, 40, 40, 40, 40, 40, 40], 40.0, 0.0)
-        video = render(app, ours, "video", near_max)
-        r.check([t for t, _x, _y in video.labels] == ["39.90"],
-                f"a reading just inside the range still counts ({video.labels})")
+        shown = render(app, ours, "map", near_max)
+        r.check(bool(shown.red), "a reading just inside the sensor's range still counts")
 
         # --- the drone's heading, and nothing before the first reading -----------------------------
         east = drone_qml([5.0, 0, 0, 0, 0, 0, 0, 0], 0.0, 90.0)
@@ -354,11 +346,11 @@ def main() -> int:
         r.check(within_deg(shown.red_angles_deg(), 90.0, 30.0),
                 "map: the arc ahead of a drone facing east is east of it (QGC turns the radar with the heading)")
         nothing = drone_qml([None] * 8, None, 0.0)
-        video = render(app, ours, "video", nothing)
-        r.check(not video.labels and not video.red, "before the first reading: no label, no arc")
+        shown = render(app, ours, "map", nothing)
+        r.check(not shown.red, "before the first reading: no arc")
         silent = drone_qml([5.0, 0, 0, 0, 0, 0, 0, 0], 0.0, 0.0, telemetry=False)
-        video = render(app, ours, "video", silent)
-        r.check(not video.labels and not video.red, "no DISTANCE_SENSOR from the drone: the radar is not shown")
+        shown = render(app, ours, "map", silent)
+        r.check(not shown.red, "no DISTANCE_SENSOR from the drone: the radar is not shown")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

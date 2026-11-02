@@ -4,7 +4,8 @@ see at the simulator's true position and angles (SIM_STATE), made from a map of 
 Give it a map of another year than the drone's own map, so the two differ as a map and the real
 ground do. On top it blurs the picture a little, darkens its corners (as a lens does), changes its
 brightness and adds the sensor's noise. Not simulated: the rolling shutter, motion blur, clouds and
-shadows of the moment, hills (the simulator's ground is flat).
+shadows of the moment. The simulator's ground is flat; ``hills`` (a made-up ground, see Hills) lays the
+photos over rolling hills for the camera alone.
 
 Each picture's moment is the flight controller's own time of its truth, not the moment the truth
 reached this program (that can be tens of milliseconds late, and at 300 m a drone that tips at 20
@@ -34,13 +35,69 @@ import numpy as np
 from vama_recorder.camera import CameraError, Shot
 from vama_recorder.clock import AutopilotClock
 
+from .geo import TILE, latlon, m_per_px, north_east, world_px
 from .geometry import Lens, Pose, render
+from .heights import ENCODING, terrarium_png
+from .map_tiles import TileWriter
 
 log = logging.getLogger("vama_nav.sim_camera")
 
 TRUTH_MAX_AGE_NS = 500_000_000
 CONTROL_EVERY_NS = 1_000_000_000
 SAME_BURST_NS = 5_000_000           # an ATTITUDE this close before a SIM_STATE was sent with it
+HEIGHTS_OFF_WAVE_M = 700.0          # Hills' ``off_m``: an elevation model's error has hills of its own
+
+
+class Hills:
+    """A made-up ground: rolling hills within plus or minus ``amp_m``, about ``wave_m`` from one top to the
+    next, level with ``origin`` at that place. Asked as a heights.Heights is, with heights above the
+    origin. ``off_m``: its heights are off by up to that much, smoothly, as an elevation model's are
+    (SRTM's about 5 to 10 m): for what the drone knows of the ground, not for what the camera sees."""
+
+    def __init__(self, amp_m: float, origin: tuple[float, float], wave_m: float = 3000.0, phase: float = 0.0,
+                 off_m: float = 0.0) -> None:
+        self.amp_m, self.origin, self.wave_m, self.phase, self.off_m = float(amp_m), origin, float(wave_m), float(phase), float(off_m)
+
+    @staticmethod
+    def _wavy(amp: float, wave: float, phase: float, north, east):
+        k = 2.0 * np.pi / wave
+        return amp * (0.6 * np.sin(k * north + 0.7 + phase) * np.cos(0.8 * k * east + 0.3 + phase)
+                      + 0.4 * np.sin(1.7 * k * east + 1.1 + phase) * np.cos(1.3 * k * north + 2.1 + phase))
+
+    def _z(self, north, east):
+        """The height at metres north and east of the origin, level with the origin there."""
+        z = self._wavy(self.amp_m, self.wave_m, self.phase, north, east) - self._wavy(self.amp_m, self.wave_m, self.phase, 0.0, 0.0)
+        if self.off_m:
+            z = z + self._wavy(self.off_m, HEIGHTS_OFF_WAVE_M, self.phase + 1.3, north, east)
+        return z
+
+    def at(self, lat: float, lon: float) -> float:
+        return float(self._z(*north_east(self.origin[0], self.origin[1], lat, lon)))
+
+    def around(self, lat: float, lon: float):
+        n0, e0 = north_east(self.origin[0], self.origin[1], lat, lon)
+        below = float(self._z(n0, e0))
+        return lambda north, east: self._z(n0 + np.asarray(north), e0 + np.asarray(east)) - below
+
+    def write_file(self, path: Path, ground_alt_m: float, south: float, west: float, north: float, east: float,
+                   zoom: int = 13) -> None:
+        """A heights file of the box (heights.Heights reads it): for a test, as an elevation model's would be."""
+        writer = TileWriter(path, "made-up hills", "png", "made up for a test", f"plus or minus {self.amp_m:g} m")
+        writer.meta["encoding"] = ENCODING
+        x0, y0 = world_px(north, west, zoom)
+        x1, y1 = world_px(south, east, zoom)
+        s = m_per_px(0.5 * (south + north), zoom)
+        for ty in range(int(y0 // TILE), int(y1 // TILE) + 1):
+            for tx in range(int(x0 // TILE), int(x1 // TILE) + 1):
+                top, left = latlon(tx * TILE + 0.5, ty * TILE + 0.5, zoom)
+                n0, e0 = north_east(self.origin[0], self.origin[1], top, left)
+                jj, ii = np.mgrid[0:TILE, 0:TILE]
+                z = ground_alt_m + self._z(n0 - jj * s, e0 + ii * s)
+                if z.min() < 0.0:
+                    raise ValueError(f"the made-up valleys go {-z.min():.0f} m below sea level, where a heights file "
+                                     "means the sea: put the ground higher")
+                writer.put(zoom, tx, ty, terrarium_png(z))
+        writer.close()
 
 
 class SimCamera:
@@ -50,10 +107,12 @@ class SimCamera:
 
     def __init__(self, world, lens: Lens, size: tuple[int, int] = (2028, 1520), ground_alt_m: float | None = None,
                  noise: float = 2.0, blur: float = 0.8, control: Path | None = None,
-                 rng: np.random.Generator | None = None, clock=time.monotonic_ns) -> None:
-        """``world``: the ground as a TileMap. ``ground_alt_m``: the ground's height above sea level;
-        None takes the simulator's first height (start the program before take-off)."""
+                 rng: np.random.Generator | None = None, clock=time.monotonic_ns, hills: Hills | None = None) -> None:
+        """``world``: the ground as a TileMap. ``ground_alt_m``: the ground's height above sea level at
+        take-off; None takes the simulator's first height (start the program before take-off). ``hills``:
+        the ground's rolling hills above that, for the pictures only."""
         self.world = world
+        self.hills = hills
         self.lens = lens
         self.size = (int(size[0]), int(size[1]))
         self.ground_alt_m = ground_alt_m
@@ -134,7 +193,8 @@ class SimCamera:
         if truth is None or self.clock() - truth[0] > TRUTH_MAX_AGE_NS:
             raise CameraError("no SIM_STATE from the simulator")
         t, lat, lon, alt, roll, pitch, yaw = truth
-        picture = self.draw(Pose(roll, pitch, yaw, max(alt - ground, 1.0)), lat, lon, blank=self.blank)
+        hill = self.hills.at(lat, lon) if self.hills is not None else 0.0
+        picture = self.draw(Pose(roll, pitch, yaw, max(alt - ground - hill, 1.0)), lat, lon, blank=self.blank)
         self.taken += 1
         return Shot(sensor_ns=t, extension="jpg", exposure_us=1000, gain=1.0,
                     _save=lambda path: self._save(path, picture), _pixels=lambda: picture)
@@ -143,7 +203,8 @@ class SimCamera:
         """What the camera would see from ``pose`` above (lat, lon): the world drawn, a little blur,
         uneven light and the sensor's noise. Grey where the world has no picture (or ``blank``)."""
         width, height = self.size
-        picture = None if blank else render(self.world, self.lens, pose, lat, lon, width, height)
+        rise = self.hills.around(lat, lon) if self.hills is not None else None
+        picture = None if blank else render(self.world, self.lens, pose, lat, lon, width, height, rise)
         if picture is None:
             picture = np.full((height, width), 128, np.uint8)
         return self._as_camera(picture)

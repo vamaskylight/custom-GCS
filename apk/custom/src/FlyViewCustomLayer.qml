@@ -413,6 +413,7 @@ Item {
     // --- Gimbal and zoom, right edge ----------------------------------------------
     Rectangle {
         id:                  gimbalPanel
+        objectName:          "vamaGimbalPanel"
         visible:             _link.enabled
         anchors.right:       parent.right
         anchors.rightMargin: _margin
@@ -485,6 +486,7 @@ Item {
     // --- Photo, record and laser, left edge ----------------------------------------
     Rectangle {
         id:      actionColumn
+        objectName: "vamaActionColumn"
         visible: _link.enabled
         // Beside QGC's tool strip when it reaches this far down, else at the edge.
         y:       Math.max(_margin, (parent.height - parentToolInsets.bottomEdgeLeftInset - height) / 2)
@@ -773,6 +775,69 @@ Item {
         MouseArea {
             anchors.fill: parent
             onClicked:    { _cameraNoteText = ""; _rcNoteText = "" }
+        }
+    }
+
+    // VAMA (A8 step 4, 2026-10-30): where the drone's position comes from changed in the air, in
+    // VGCS's words (PositionSourceStore.h): GPS 1 lost its 3D fix and the drone flies on the down
+    // camera's position (GPS 2), or on none, or GPS 1 is back. The toolbar shows "CAM" meanwhile
+    // (VehicleGPSIndicator.qml). With the map or the video, at the top in the middle under the
+    // boxes there, until tapped: a warning for 15 s, else 6 s.
+    readonly property var _positionSource: QGroundControl.multiVehicleManager.activeVehicle
+                                           ? PositionSourceStore.forVehicle(QGroundControl.multiVehicleManager.activeVehicle.id)
+                                           : null
+    property string _positionNoteText:    ""
+    property bool   _positionNoteWarning: false
+    Connections {
+        target: _positionSource
+        function onSaid(text, warning) {
+            _positionNoteText = text
+            _positionNoteWarning = warning
+            positionNoteTimer.interval = warning ? 15000 : 6000
+            positionNoteTimer.restart()
+        }
+    }
+    Timer {
+        id:          positionNoteTimer
+        interval:    6000
+        onTriggered: _positionNoteText = ""
+    }
+    Rectangle {
+        id:                       positionNoteChip
+        objectName:               "vamaPositionNote"
+        visible:                  _positionNoteText !== ""
+        z:                        1
+        anchors.horizontalCenter: parent.horizontalCenter
+        y: {
+            // Under the lowest of the boxes at the top in the middle.
+            var below = parentToolInsets.topEdgeCenterInset + _margin
+            for (var box of [laserBox, lockChip, followChip, cameraNoteChip, lockHint, mapPackChip]) {
+                if (box.visible) {
+                    below = Math.max(below, box.y + box.height + _margin)
+                }
+            }
+            return below
+        }
+        width:                    positionNoteLabel.width + _margin * 3
+        height:                   Math.max(_buttonSize, positionNoteLabel.height + _margin * 2)
+        radius:                   _margin
+        color:                    _panelColor
+        border.color:             _positionNoteWarning ? qgcPal.colorOrange : "transparent"
+        border.width:             2
+
+        QGCLabel {
+            id:               positionNoteLabel
+            objectName:       "vamaPositionNoteText"
+            anchors.centerIn: parent
+            width:            Math.min(implicitWidth, ScreenTools.defaultFontPixelWidth * 34, _root.width * 0.45)
+            wrapMode:         Text.WordWrap
+            color:            "white"
+            text:             _positionNoteText
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked:    _positionNoteText = ""
         }
     }
 
@@ -2268,6 +2333,39 @@ Item {
             Rectangle { anchors.centerIn: parent; width: parent.width; height: 2; color: "red" }
             Rectangle { anchors.centerIn: parent; width: 2; height: parent.height; color: "red" }
         }
+    }
+
+    // --- The round proximity view ----------------------------------------------------
+    // VAMA (B25, the client 2026-10-31: "Just like the mission planner proximity", "this proximity into hidden
+    // button", and of B19's four bars: "the round view replace them"): a button opens the round view in a box
+    // that the user drags and sizes (VamaProximityWindow.qml). The button shows while the drone sends its
+    // proximity sensor's readings; with the box closed the screen shows no obstacle (QGC's radar on the map
+    // stays). QGC's radar on the video moved each reading with its distance and is gone
+    // (ProximityRadarVideoView.qml).
+    readonly property var _obstacleSides: QGroundControl.multiVehicleManager.activeVehicle
+                                          ? ProximityStore.forVehicle(QGroundControl.multiVehicleManager.activeVehicle.id)
+                                          : null
+
+    IconButton {
+        id:         proximityButton
+        objectName: "vamaProximityButton"
+        visible:    _obstacleSides !== null && _obstacleSides.telemetryAvailable
+        icon:       "/InstrumentValueIcons/radar.svg"
+        size:       _buttonSize
+        fill:       proximityWindow.visible ? qgcPal.buttonHighlight : Qt.rgba(0, 0, 0, 0.55)
+        // Beside the top of the photo and laser column (as the colours beside IR), or at the left edge
+        // when the camera link is off.
+        x:          actionColumn.visible ? actionColumn.x + actionColumn.width + _margin : _toolInsets.leftEdgeCenterInset + _margin
+        y:          actionColumn.visible ? actionColumn.y + actionButtons.y : (parent.height - height) / 2
+        onClicked:  proximityWindow.visible = !proximityWindow.visible
+    }
+
+    VamaProximityWindow {
+        id:         proximityWindow
+        objectName: "vamaProximityWindow"
+        visible:    false
+        sectors:    _obstacleSides
+        z:          10
     }
 
     Component.onCompleted: {

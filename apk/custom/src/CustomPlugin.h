@@ -78,8 +78,9 @@ public:
     QQmlApplicationEngine *createQmlApplicationEngine(QObject *parent) final;
     /// Releases the url interceptor attached in createQmlApplicationEngine before the engine is destroyed
     void destroyQmlApplicationEngine(QQmlApplicationEngine *qmlEngine) final;
-    /// Every DISTANCE_SENSOR to ProximityStore, for the obstacle radar on the map and the video (A7).
-    /// QGC handles the message as before.
+    /// Every DISTANCE_SENSOR to ProximityStore, for the obstacle radar on the map and the video (A7),
+    /// and the autopilot's GPS_RAW_INT and GPS2_RAW to PositionSourceStore, for where the position
+    /// comes from (A8 step 4). QGC handles the messages as before.
     bool mavlinkMessage(Vehicle *vehicle, LinkInterface *link, const mavlink_message_t &message) final;
 
     /// Advanced Mode (with Parameters) needs the admin password (task Z, AdminPassword.h).
@@ -107,6 +108,7 @@ private slots:
 
 private:
     void _addSettingsEntry(const QString& title, const char* qmlFile, const char* iconFile = nullptr);
+    void _hearPositionSource(Vehicle *vehicle, const mavlink_message_t &message);
 
     CustomOptions *_options = nullptr;
     QQmlApplicationEngine *_qmlEngine = nullptr;

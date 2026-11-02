@@ -7,6 +7,10 @@
         <file alias="PaperPlane.svg">../../../qgc-src/src/Toolbar/Images/PaperPlane.svg</file>
         <file alias="Plan.svg">../../../qgc-src/src/Toolbar/Images/Plan.svg</file>
         <file alias="RidIconManNoID.svg">../../../qgc-src/src/Toolbar/Images/RidIconManNoID.svg</file>
+        <!-- The icons of Vehicle Configuration's own lines (VehicleConfigView.qml). -->
+        <file alias="VehicleSummaryIcon.png">../../../qgc-src/src/Vehicle/VehicleSetup/VehicleSummaryIcon.png</file>
+        <file alias="FirmwareUpgradeIcon.png">../../../qgc-src/src/Vehicle/VehicleSetup/FirmwareUpgradeIcon.png</file>
+        <file alias="subMenuButtonImage.png">../../../qgc-src/resources/CogWheels.png</file>
     </qresource>
     <qresource prefix="/qml/QGroundControl/Viewer3D">
         <file alias="City3DMapIcon.svg">../../../qgc-src/src/Viewer3D/Viewer3DQml/Images/city_3d_map_icon.svg</file>
@@ -22,7 +26,17 @@
         <file alias="inbox-download.svg">../../../qgc-src/resources/InstrumentValueIcons/inbox-download.svg</file>
         <file alias="photo.svg">../../../qgc-src/resources/InstrumentValueIcons/photo.svg</file>
         <file alias="question.svg">../../../qgc-src/resources/InstrumentValueIcons/question.svg</file>
+        <file alias="radar.svg">../../../qgc-src/resources/InstrumentValueIcons/radar.svg</file>
         <file alias="usb.svg">../../../qgc-src/resources/InstrumentValueIcons/usb.svg</file>
+        <file alias="volume-up.svg">../../../qgc-src/resources/InstrumentValueIcons/volume-up.svg</file>
+    </qresource>
+    <!-- Stand-in for the page Vehicle Configuration opens first (VehicleConfigView.qml). -->
+    <qresource prefix="/qml/QGroundControl/VehicleSetup">
+        <file alias="VehicleSummary.qml">pages/VehicleSummary.qml</file>
+    </qresource>
+    <!-- Stand-in for one component's setup page, at the made-up address of main.cpp's FakeVehicleComponent. -->
+    <qresource prefix="/preview/vehicle">
+        <file alias="APMFailsafesComponent.qml">pages/FailsafesPage.qml</file>
     </qresource>
     <!-- Stand-ins for the two QGC pages the check can open. QGC's
          Controls/AppSettings.qml is left out on purpose: only the VAMA copy

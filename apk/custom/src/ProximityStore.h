@@ -25,6 +25,13 @@ class QQmlEngine;
 ///
 /// Here only the proximity sensor's own messages count, each with its own range, an empty
 /// direction has no value (NaN), and a direction not heard for kMaxAgeMs has none either.
+///
+/// The four sides of the drone were B19's red bars (the client 2026-10-30: "i just need 4 of them", at
+/// fixed places, only inside a range the user sets). A side's distance is the nearest object of the
+/// three directions facing it, so a diagonal object is on both its sides and none is left out.
+/// Since B25 (2026-10-31, "the round view replace them") the screen shows `values` in the round view
+/// (VamaProximityWindow.qml) and nothing shows `sides`. Kept, with its tests, until the client says
+/// whether the bars come back as a warning.
 class ProximitySectors : public QObject
 {
     Q_OBJECT
@@ -36,9 +43,12 @@ class ProximitySectors : public QObject
     Q_PROPERTY(QVariantList values READ values NOTIFY changed)
     /// The sensor's range in metres, 0 when ArduPilot does not know it.
     Q_PROPERTY(double maxDistance READ maxDistance NOTIFY changed)
+    /// The 4 sides in metres: front, right, back, left. NaN: nothing within the range. Not shown since B25.
+    Q_PROPERTY(QVariantList sides READ sides NOTIFY changed)
 
 public:
     static constexpr int kDirections = 8;
+    static constexpr int kSides = 4;
     static constexpr int kFirstId = 10;
     static constexpr qint64 kMaxAgeMs = 2000;
 
@@ -48,6 +58,10 @@ public:
     QVariantList values() const;
     double value(int direction) const;
     double maxDistance() const { return _maxM; }
+    QVariantList sides() const;
+    double side(int index) const;
+    /// Objects farther than this are on no side (the store's barRange).
+    void setBarRange(double metres);
 
     /// One DISTANCE_SENSOR. True when it was a direction of the proximity sensor (else nothing changes).
     bool hear(int sensorId, int orientation, int currentCm, int maxCm, qint64 nowMs);
@@ -61,6 +75,7 @@ private:
     double _metres[kDirections];
     qint64 _heardMs[kDirections];
     double _maxM = 0.0;
+    double _barRangeM = 5.0;
     bool _heard = false;
 };
 
@@ -72,8 +87,15 @@ class ProximityStore : public QObject
     QML_ELEMENT
     QML_SINGLETON
 
+    /// How far the screen shows objects, in metres: one of barRangeChoices. Saved for the next start.
+    Q_PROPERTY(double barRange READ barRange WRITE setBarRange NOTIFY barRangeChanged)
+    /// The ranges the user can choose in the app menu (src/VamaObstacleRangePanel.qml).
+    Q_PROPERTY(QVariantList barRangeChoices READ barRangeChoices CONSTANT)
+
 public:
     static constexpr int kExpiryCheckMs = 500;
+    static constexpr double kDefaultBarRange = 5.0;
+    static constexpr const char *kBarRangeKey = "VamaProximity/barRangeM";
 
     /// No default for the parent, on purpose: QML makes a singleton with a constructor that needs no
     /// argument when there is one, instead of using create() (see SkydroidLink.h, tasks X and V).
@@ -86,6 +108,10 @@ public:
     /// The drone with this MAVLink system id (QGC's Vehicle::id()), made at the first ask.
     Q_INVOKABLE ProximitySectors *forVehicle(int vehicleId);
 
+    double barRange() const { return _barRangeM; }
+    void setBarRange(double metres);
+    QVariantList barRangeChoices() const;
+
     /// One DISTANCE_SENSOR of that drone.
     void hear(int vehicleId, int sensorId, int orientation, int currentCm, int maxCm);
     /// Clears what was not heard lately. The store's timer calls it every kExpiryCheckMs.
@@ -93,10 +119,14 @@ public:
     /// For tests: the clock, in milliseconds.
     void setClock(std::function<qint64()> clock) { _clock = std::move(clock); }
 
+signals:
+    void barRangeChanged();
+
 private:
     qint64 _now() const;
 
     QHash<int, ProximitySectors *> _vehicles;
+    double _barRangeM = kDefaultBarRange;
     QTimer _expiry;
     QElapsedTimer _elapsed;
     std::function<qint64()> _clock;

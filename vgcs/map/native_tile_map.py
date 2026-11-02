@@ -2402,11 +2402,13 @@ class NativeTileMapView(QWidget):
             red_m = float(view.get("red_m") or 0.0)
             near_m = float(view.get("near_m") or 0.0)
             nearest = view.get("nearest")
+            # Only inside the range the user set on the PROXIMITY card (B19).
+            reach = float(view.get("bar_range_m") or float("inf"))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
             metrics = painter.fontMetrics()
             for index, d in enumerate(view.get("directions_m") or []):
-                if d is None:
+                if d is None or d > reach:
                     continue
                 r = max(r_min, float(d) * px_per_m)
                 if r > 2.0 * max(w, h):

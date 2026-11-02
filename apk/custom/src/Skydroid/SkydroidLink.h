@@ -95,6 +95,7 @@
 #include <string>
 #include <vector>
 
+#include "C20Camera.h"
 #include "CameraProfile.h"
 #include "LaserGeo.h"
 #include "LockCheck.h"
@@ -506,6 +507,9 @@ public:
     Q_INVOKABLE void setRecord(bool start);
     /// +1 zoom in, -1 zoom out (one step).
     Q_INVOKABLE void zoom(int direction);
+    /// Back to 1x: the camera's own "1x" where it has one, and then a run of zoom out, which a zoom
+    /// tap ends. Each kind of camera ends the run as it can: when it says it is there (C14 Pro,
+    /// Viewpro), after a time (SIYI), after more steps than it counted (C12, C13).
     Q_INVOKABLE void zoomHome();
     /// One laser shot at the centre of the picture.
     Q_INVOKABLE void fireLaser();
@@ -519,6 +523,8 @@ public:
     /// Hosts and ports also tried while the camera does not answer on the
     /// configured address. Tests replace them with local ones.
     static void setProbeTargets(const QStringList &hosts, const QList<int> &ports);
+    /// The C20's camera port (8100, C20Camera.h). Tests use another.
+    static void setC20CameraPort(int port);
 
 signals:
     void enabledChanged();
@@ -570,6 +576,7 @@ private slots:
     void _finishWheelDetect();
     void _sendWheelAngles();
     void _zoomOutTick();
+    void _zoomOutTickReported();
     void _aimTick();
     void _lockTick();
     void _sendLockConfirm();
@@ -640,7 +647,20 @@ private:
     bool _isZoomStepCamera() const { return _camera.zoom == skydroid::camera::Zoom::Reported; }
     void _sendZoomStepFrames(int direction);
     void _lensZoom(int direction);
+    /// The stop of a lens zoom, in the camera's own way: TOP's ZMC, or the C20's camera port.
+    void _sendLensStop();
+    /// The end of a zoom click: its stop, and a C20 is asked its zoom a moment later.
+    void _lensStopped();
     void _lensHomeDone();
+    /// The C20's camera port (row B10): a second TCP connection, to its address on port 8100, while
+    /// the link runs and the camera is a C20. Its zoom goes there, and it says its zoom there.
+    void _syncC20Port();
+    void _closeC20Port();
+    void _c20PortLost();
+    void _readC20Port();
+    void _sendC20(const std::vector<std::uint8_t> &packet);
+    /// The zoom (1 to 22) the C20 says, and its reply's payload in hex (zoomReport).
+    void _takeC20Zoom(int zoom, const QString &report);
     /// To the control port, and to the other ports some C13 firmware takes zoom on.
     void _sendZoomFrames(const std::vector<std::string> &frames);
     int _zoomStepsMax() const;
@@ -753,6 +773,11 @@ private:
     std::string _tcpRx;             // what came over TCP that is not a whole frame yet
     QTimer _tcpRetryTimer;
     QTimer _tcpConnectTimer;
+    QTcpSocket *_c20Port = nullptr;  // the C20's camera port (_syncC20Port)
+    QString _c20PortHost;
+    QTimer _c20PortRetryTimer;
+    QTimer _c20PortConnectTimer;
+    int _c20Zoom = 0;               // the zoom the C20 says, 1 to 22 (0: not yet)
     viewpro::Camera _viewpro;       // the rules of a Viewpro camera in use (task AK)
     siyi::Camera _siyi;             // and of a SIYI camera
     QTimer _dueTimer;               // sends the rules' frames due later (a zoom stop, a hold after a jog)
@@ -927,6 +952,7 @@ private:
     int _zoomStep = -1;
     int _zoomCount = 0;     // C12/C13: our zoom steps in from 1x
     int _zoomOutLeft = 0;   // steps still to send for "back to 1x"
+    int _zoomOutWaitTicks = 0;  // C14 Pro: ticks until its first answer after the "1x" frames
     QTimer _zoomOutTimer;
     QTimer _lensStopTimer;  // the C20: its lens stops this long after the last zoom click
     QTimer _lensHomeTimer;  // the C20: the end of a "back to 1x" run

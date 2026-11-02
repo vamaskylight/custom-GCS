@@ -64,7 +64,7 @@ from vgcs.app.arm_readiness import PrearmHealth
 from vgcs.app.battery_tracker import BatteryTracker
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.rtk_corrections import CorrectionStream
-from vgcs.app.obstacle_watch import ObstacleWatch
+from vgcs.app.obstacle_watch import BAR_RANGE_SETTING, ObstacleWatch
 from vgcs.app.rtk_status import RtkStatus
 from vgcs.app.position_source import PositionSource
 from vgcs.app.vehicle_messages import VehicleMessageBoard
@@ -158,6 +158,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._position_source = PositionSource()
         # What the drone's obstacle sensor sees, and its warnings (see vgcs.app.obstacle_watch).
         self._obstacle = ObstacleWatch()
+        self._obstacle.set_bar_range_m(self._settings.value(BAR_RANGE_SETTING))
         # The RTK base station on this PC, and what is known about its corrections
         # (see vgcs.app.window.rtk_base_mixin).
         self._rtk_corrections = CorrectionStream()
@@ -449,6 +450,7 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._map_widget.return_requested.connect(self._on_map_return_requested)
         self._map_widget.land_requested.connect(self._on_land)
         self._map_widget.disarm_requested.connect(self._on_disarm)
+        self._map_widget.obstacle_bar_range_chosen.connect(self._on_obstacle_bar_range_chosen)
         # Offline map downloads run for minutes: say how far they got, and when
         # they end, where the operator looks (the map's own status line is hidden).
         self._map_widget.tile_pack_progress.connect(self._on_tile_pack_message)

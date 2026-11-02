@@ -49,6 +49,14 @@
 //   36_recording.png      the camera records and says so ("REC"), and the RC records a copy ("RC REC")
 //   37_no_sd_card.png     a camera without an SD card: the status says so, and the note of a photo
 //   38_digital_zoom.png   the app's own zoom of the picture at 2x, and its button ("D 2x", B10)
+//   40_voice.png          the app menu's Voice panel: the voice the app speaks with (the client, 2026-10-30)
+//   40b_voice_note.png    the same without an Indian English voice: the note says where to add one
+//   41_vehicle_config.png         Vehicle Configuration outside Advanced Mode: Summary, Radio, Sensors
+//   41b_vehicle_config_advanced.png  the same in Advanced Mode: every line, and Parameters
+//   41c_vehicle_config_why.png    a hidden component opened another way: why, not its page
+//   42_proximity_view.png         the round proximity view's box: front and right within the range (B25, 2026-10-31)
+//   42b_proximity_view_moved.png  the same box, moved and made bigger by the user
+//   43_obstacle_range.png         the app menu's panel for the range of the round view
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
 // The lock is tried for real: the day picture is a look into a world that
@@ -85,11 +93,13 @@
 #include <QtNetwork/QUdpSocket>
 #include <QtQml/QQmlAbstractUrlInterceptor>
 #include <QtQml/QQmlApplicationEngine>
+#include <QtQml/QQmlComponent>
 #include <QtQml/QQmlContext>
 #include <QtQuick/QQuickItem>
 #include <QtQuick/QQuickWindow>
 #include <QtTest/QTest>
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -105,8 +115,11 @@
 #include "FollowGuide.h"
 #include "ObjectFollow.h"
 #include "ObjectMarks.h"
+#include "PositionSourceStore.h"
+#include "ProximityStore.h"
 #include "SkydroidLink.h"
 #include "SkydroidTop.h"
+#include "VamaVoice.h"
 #include "Vehicle.h"
 
 // VGCS's thermal colour modes (made by apk/make_thermal_palettes.py).
@@ -344,10 +357,97 @@ private:
     bool _value;
 };
 
+/// One component of QGC's Vehicle Configuration list, as VehicleConfigView.qml reads it. Its setup
+/// page is a made-up address with QGC's file name, which is what the VAMA copy goes by.
+class FakeVehicleComponent : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QString name MEMBER name CONSTANT)
+    Q_PROPERTY(QUrl setupSource MEMBER setupSource CONSTANT)
+    Q_PROPERTY(QUrl summaryQmlSource READ summaryQmlSource CONSTANT)
+    Q_PROPERTY(QString iconResource READ iconResource CONSTANT)
+    Q_PROPERTY(bool setupComplete READ setupComplete CONSTANT)
+    Q_PROPERTY(bool requiresSetup READ requiresSetup CONSTANT)
+    Q_PROPERTY(QStringList sectionIds READ sectionIds CONSTANT)
+    Q_PROPERTY(QVariantMap sectionKeywords READ sectionKeywords CONSTANT)
+    Q_PROPERTY(QUrl vehicleConfigJson READ vehicleConfigJson CONSTANT)
+    Q_PROPERTY(bool showFirstSectionOnRootClick READ showFirstSectionOnRootClick CONSTANT)
+
+public:
+    FakeVehicleComponent(const QString &componentName, const QString &page, QObject *parent)
+        : QObject(parent), name(componentName), setupSource(QStringLiteral("qrc:/preview/vehicle/") + page)
+    {
+    }
+    QUrl summaryQmlSource() const { return QUrl(); }
+    QString iconResource() const { return QString(); }
+    bool setupComplete() const { return true; }
+    bool requiresSetup() const { return false; }
+    QStringList sectionIds() const { return {}; }
+    QVariantMap sectionKeywords() const { return {}; }
+    QUrl vehicleConfigJson() const { return QUrl(); }
+    bool showFirstSectionOnRootClick() const { return false; }
+
+    QString name;
+    QUrl setupSource;
+};
+
+/// The ArduPilot plugin's components, with QGC's setup page names (APMAutoPilotPlugin).
+class FakeAutopilotPlugin : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(QVariantList vehicleComponents READ vehicleComponents CONSTANT)
+
+public:
+    explicit FakeAutopilotPlugin(QObject *parent) : QObject(parent)
+    {
+        const QList<QPair<QString, QString>> components = {
+            {QStringLiteral("Frame"), QStringLiteral("APMAirframeComponent.qml")},
+            {QStringLiteral("Radio"), QStringLiteral("RadioComponent.qml")},
+            {QStringLiteral("Sensors"), QStringLiteral("APMSensorsComponent.qml")},
+            {QStringLiteral("Failsafes"), QStringLiteral("APMFailsafesComponent.qml")},
+            {QStringLiteral("Motors"), QStringLiteral("APMMotorComponent.qml")},
+        };
+        for (const auto &[name, page] : components) {
+            _components.append(QVariant::fromValue<QObject *>(new FakeVehicleComponent(name, page, this)));
+        }
+    }
+    QVariantList vehicleComponents() const { return _components; }
+    Q_INVOKABLE QString prerequisiteSetup(QObject *component) const
+    {
+        Q_UNUSED(component);
+        return QString();
+    }
+
+private:
+    QVariantList _components;
+};
+
+/// QGC's parameter manager as VehicleConfigView.qml reads it: all parameters are there.
+class FakeParameterManager : public QObject
+{
+    Q_OBJECT
+    Q_PROPERTY(double loadProgress READ loadProgress CONSTANT)
+    Q_PROPERTY(bool missingParameters READ missingParameters CONSTANT)
+    Q_PROPERTY(bool parameterDownloadSkipped READ parameterDownloadSkipped CONSTANT)
+
+public:
+    using QObject::QObject;
+    double loadProgress() const { return 0.0; }
+    bool missingParameters() const { return false; }
+    bool parameterDownloadSkipped() const { return false; }
+    Q_INVOKABLE void refreshAllParameters() {}
+};
+
 /// What QGC's VehicleWarnings.qml reads of the active vehicle.
 class FakeQmlVehicle : public QObject
 {
     Q_OBJECT
+    // Vehicle Configuration (the client, 2026-10-30).
+    Q_PROPERTY(QObject *autopilotPlugin READ autopilotPlugin CONSTANT)
+    Q_PROPERTY(QObject *parameterManager READ parameterManager CONSTANT)
+    Q_PROPERTY(int flowImageIndex READ flowImageIndex CONSTANT)
+    Q_PROPERTY(bool usingHighLatencyLink READ usingHighLatencyLink CONSTANT)
+    Q_PROPERTY(int id READ id CONSTANT)
     Q_PROPERTY(bool requiresGpsFix READ requiresGpsFix CONSTANT)
     Q_PROPERTY(bool armed READ armed CONSTANT)
     Q_PROPERTY(QObject *coordinate READ coordinate CONSTANT)
@@ -355,10 +455,15 @@ class FakeQmlVehicle : public QObject
     Q_PROPERTY(QObject *healthAndArmingCheckReport READ report CONSTANT)
 
 public:
+    int id() const { return 1; }  // its MAVLink system id
     bool requiresGpsFix() const { return true; }
     bool armed() const { return false; }
     QObject *coordinate() { return &position; }
     QObject *report() { return &_report; }
+    QObject *autopilotPlugin() { return &_autopilot; }
+    QObject *parameterManager() { return &_parameters; }
+    int flowImageIndex() const { return 1; }  // it sends optical flow pictures: QGC shows an Optical Flow line
+    bool usingHighLatencyLink() const { return false; }
     QString prearmError() const { return _prearmError; }
     void setPrearmError(const QString &text)
     {
@@ -373,16 +478,24 @@ signals:
 private:
     FakeFlag _report{false};  // an ArduPilot that sends pre-arm texts, not the newer report
     QString _prearmError;
+    FakeAutopilotPlugin _autopilot{this};
+    FakeParameterManager _parameters{this};
 };
 
 class FakeQmlVehicleManager : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QObject *activeVehicle READ activeVehicle CONSTANT)
+    Q_PROPERTY(bool parameterReadyVehicleAvailable READ parameterReadyVehicleAvailable
+                   NOTIFY parameterReadyVehicleAvailableChanged)
 
 public:
     QObject *activeVehicle() { return &vehicle; }
+    bool parameterReadyVehicleAvailable() const { return true; }
     FakeQmlVehicle vehicle;
+
+signals:
+    void parameterReadyVehicleAvailableChanged(bool parametersReady);
 };
 
 /// What the app menu reads of QGC's options.
@@ -390,9 +503,11 @@ class FakeCoreOptions : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(bool combineSettingsAndSetup READ combineSettingsAndSetup CONSTANT)
+    Q_PROPERTY(bool showFirmwareUpgrade READ showFirmwareUpgrade CONSTANT)
 
 public:
     bool combineSettingsAndSetup() const { return false; }  // QGC's default
+    bool showFirmwareUpgrade() const { return false; }
 };
 
 /// QGC's core plugin as the app menu and the admin password panel use it (task Z). The password
@@ -463,6 +578,7 @@ class FakeGlobal : public QObject
     Q_PROPERTY(QObject *multiVehicleManager READ multiVehicleManager CONSTANT)
     Q_PROPERTY(QObject *corePlugin READ corePlugin CONSTANT)
     Q_PROPERTY(QString qgcVersion READ qgcVersion CONSTANT)
+    Q_PROPERTY(QString appName READ appName CONSTANT)
     Q_PROPERTY(qreal zOrderTopMost READ zOrderTopMost CONSTANT)
     // QGC's saved map position and zoom (QGroundControlQmlGlobal).
     Q_PROPERTY(QGeoCoordinate flightMapPosition MEMBER flightMapPosition NOTIFY flightMapChanged)
@@ -475,6 +591,10 @@ public:
     QObject *multiVehicleManager() { return &vehicles; }
     QObject *corePlugin() { return &core; }
     QString qgcVersion() const { return QStringLiteral("v5.1.5"); }
+    QString appName() const { return QStringLiteral("VAMA GCS"); }
+    // QGC's test of its speech (General settings, and the voice in the app menu): counted, not spoken.
+    Q_INVOKABLE void testAudioOutput() { ++audioTests; }
+    int audioTests = 0;
     FakeSettingsManager settings;
     FakeQmlVehicleManager vehicles;
     FakeCorePlugin core;
@@ -896,6 +1016,9 @@ int main(int argc, char *argv[])
     QSettings().remove(QStringLiteral("VamaSkydroid"));
     QSettings().remove(QStringLiteral("VamaFollow"));
     QSettings().remove(QStringLiteral("VamaMarks"));
+    QSettings().remove(QStringLiteral("VamaVoice"));
+    QSettings().remove(QStringLiteral("VamaProximity"));
+    QSettings().remove(QStringLiteral("VamaProximityWindow"));  // the round view's place and size (B25)
 
     const QString outDir = argc > 1 ? QString::fromLocal8Bit(argv[1]) : QDir::currentPath();
 
@@ -948,6 +1071,29 @@ int main(int argc, char *argv[])
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "SkydroidLink", &link);
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "ObjectFollow", &follow);
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "ObjectMarks", &marks);
+    // Where the drone's position comes from (A8 step 4), on a clock the steps move.
+    PositionSourceStore positionStore(nullptr);
+    qint64 positionMs = 1000;
+    positionStore.setClock([&positionMs]() { return positionMs; });
+    qmlRegisterSingletonInstance("QGroundControl", 1, 0, "PositionSourceStore", &positionStore);
+    // The obstacle sensor (B19), on a clock that stands still: a reading stays until the steps change it.
+    ProximityStore proximity(nullptr);
+    proximity.setClock([]() { return qint64(1000); });
+    qmlRegisterSingletonInstance("QGroundControl", 1, 0, "ProximityStore", &proximity);
+    // The voice the app speaks with (the client, 2026-10-30): an older Google engine's English voices,
+    // whose names tell the gender. No engine: nothing is spoken.
+    using vama::voice::Gender;
+    const std::vector<vama::voice::Voice> olderVoices = {
+        {"en-us-x-sfg#female_1-local", "en", "US", Gender::Female},
+        {"en-in-x-cxx#male_1-local", "en", "IN", Gender::Male},
+        {"en-in-x-cxx#female_2-network", "en", "IN", Gender::Female},
+        {"en-in-x-cxx#female_1-local", "en", "IN", Gender::Female},
+    };
+    VamaVoice voice(nullptr);
+    voice.setVoices(olderVoices);
+    int voiceListsAsked = 0;  // the panel asking the engine for its voices again (B23)
+    voice.setLister([&voiceListsAsked]() { ++voiceListsAsked; });
+    qmlRegisterSingletonInstance("QGroundControl", 1, 0, "VamaVoice", &voice);
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "QGroundControl", &global);
 
     OverrideInterceptor interceptor;  // declared first: the engine must not outlive it
@@ -1145,6 +1291,21 @@ int main(int argc, char *argv[])
         }
         menuTapAt(item->mapToScene(QPointF(item->width() / 2, item->height() / 2)));
     };
+    // A real tap on a line of an open list in the menu. Qt's ComboBox then sets its index itself,
+    // from C++, and a binding on it stays. False when the line is not there.
+    auto menuTapListLine = [&](const QString &text) {
+        QList<QQuickItem *> items;
+        if (menuWindow) {
+            collect(menuWindow->contentItem(), items);
+        }
+        for (QQuickItem *item : std::as_const(items)) {
+            if (item->inherits("QQuickAbstractButton") && item->isVisible() && item->property("text").toString() == text) {
+                menuTapAt(item->mapToScene(QPointF(item->width() / 2, item->height() / 2)));
+                return true;
+            }
+        }
+        return false;
+    };
     // Keys as the keyboard sends them to the text field.
     auto typeInto = [&](QQuickItem *field, const QString &text) {
         for (const QChar c : text) {
@@ -1169,6 +1330,26 @@ int main(int argc, char *argv[])
         QQuickItem *item = menuItem(objectName);
         return item ? item->property("text").toString() : QStringLiteral("not there");
     };
+    // Vehicle Configuration (the client, 2026-10-30): config.qml is QGC's MainWindow around the page.
+    // Its lines come from a Repeater, so they are looked for in the window's items, not its QObjects.
+    QQuickWindow *configWindow = nullptr;
+    auto configItem = [&](const char *objectName) -> QQuickItem * {
+        if (!configWindow) {
+            return nullptr;
+        }
+        QList<QQuickItem *> items;
+        collect(configWindow->contentItem(), items);
+        for (QQuickItem *item : std::as_const(items)) {
+            if (item->objectName() == QLatin1String(objectName)) {
+                return item;
+            }
+        }
+        return nullptr;
+    };
+    auto configShown = [&](const char *objectName) {
+        QQuickItem *item = configItem(objectName);
+        return item && item->isVisible();
+    };
 
     // The steps, one after another (delay in ms before each).
     // Thermal colours (client request 2026-10-07).
@@ -1181,6 +1362,74 @@ int main(int argc, char *argv[])
             }
         }
         return nullptr;
+    };
+    // The round proximity view (B25). Whether the object red (#f02020) is drawn where the box's plot puts
+    // an object in this direction (degrees from the nose, to the right) at this distance, as
+    // VamaProximityWindow.qml works it out; and how many red points the plot has.
+    auto proximityPlotRect = [&]() -> QRectF {
+        QQuickItem *plot = findItem("vamaProximityPlot");
+        return plot ? plot->mapRectToScene(QRectF(0, 0, plot->width(), plot->height())) : QRectF();
+    };
+    auto proximityRedAt = [&](double directionDeg, double metres) -> bool {
+        QQuickItem *box = findItem("vamaProximityWindow");
+        const QRectF plot = proximityPlotRect();
+        if (!box || !box->isVisible() || plot.isEmpty()) {
+            return false;
+        }
+        const double font = std::max(9.0, std::min(14.0, std::round(std::min(plot.width(), plot.height()) / 26.0)));
+        const double radius = std::max(10.0, std::min(plot.width(), plot.height()) / 2.0 - font * 1.9);
+        const double r = radius * metres / proximity.barRange();
+        const double a = (directionDeg - 90.0) * std::acos(-1.0) / 180.0;
+        const QPointF at(plot.center().x() + r * std::cos(a), plot.center().y() + r * std::sin(a));
+        const QImage image = window->grabWindow();
+        const qreal dpr = image.devicePixelRatio();
+        for (int dy = -3; dy <= 3; ++dy) {
+            for (int dx = -3; dx <= 3; ++dx) {
+                const QColor c = image.pixelColor(qRound((at.x() + dx) * dpr), qRound((at.y() + dy) * dpr));
+                if (c.red() > 200 && c.green() < 90 && c.blue() < 90) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    auto proximityRedCount = [&]() -> int {
+        const QRectF plot = proximityPlotRect();
+        const QImage image = window->grabWindow();
+        const qreal dpr = image.devicePixelRatio();
+        int n = 0;
+        for (int y = qRound(plot.top() * dpr); y < qRound(plot.bottom() * dpr); ++y) {
+            for (int x = qRound(plot.left() * dpr); x < qRound(plot.right() * dpr); ++x) {
+                const QColor c = image.pixelColor(x, y);
+                n += (c.red() > 200 && c.green() < 90 && c.blue() < 90) ? 1 : 0;
+            }
+        }
+        return n;
+    };
+    auto shownAt = [&](const char *objectName) -> QRectF {
+        QQuickItem *item = findItem(objectName);
+        return item ? item->mapRectToScene(QRectF(0, 0, item->width(), item->height())) : QRectF();
+    };
+    QRectF proximityBoxBefore;
+    // The rings' distances as drawn, on the line ahead (right of it, from the middle to the outer ring).
+    QImage proximityRingWords;
+    auto proximityRingWordsNow = [&]() -> QImage {
+        const QRectF plot = proximityPlotRect();
+        if (plot.isEmpty()) {
+            return QImage();
+        }
+        const double font = std::max(9.0, std::min(14.0, std::round(std::min(plot.width(), plot.height()) / 26.0)));
+        const double radius = std::max(10.0, std::min(plot.width(), plot.height()) / 2.0 - font * 1.9);
+        const QImage image = window->grabWindow();
+        const qreal dpr = image.devicePixelRatio();
+        return image.copy(QRect(qRound((plot.center().x() + 2) * dpr), qRound((plot.center().y() - radius - 2) * dpr),
+                                qRound(70 * dpr), qRound((radius + 2) * dpr)));
+    };
+    // One DISTANCE_SENSOR for each direction, as ArduPilot sends them, in metres. Negative: nothing in range.
+    auto hearObstacle = [&](const std::array<double, 8> &metres) {
+        for (int i = 0; i < 8; ++i) {
+            proximity.hear(1, ProximitySectors::kFirstId + i, i, metres[i] < 0 ? 4000 : qRound(metres[i] * 100.0), 4000);
+        }
     };
     // An item's property set, or a problem when the item is not there.
     auto setOn = [&](const char *objectName, const char *property, const QVariant &value) {
@@ -2832,19 +3081,19 @@ int main(int argc, char *argv[])
              expect(transport && transport->isVisible() && transport->property("currentIndex").toInt() == 1,
                     "cameras: a copy of the V20 has TCP as its control link",
                     transport ? transport->property("currentText").toString() : QStringLiteral("no box"));
-             // Its lens zoom (task AN): a TOP camera has four zooms to choose from.
+             // Its zoom on its camera port (row B10): a TOP camera has five zooms to choose from.
              QQuickItem *zoom = findItem("vamaCameraZoom");
              const QString zoomText = zoom ? zoom->property("currentText").toString() : QStringLiteral("no box");
-             expect(zoom && zoom->property("count").toInt() == 4 &&
-                        zoomText.startsWith(QStringLiteral("Its lens zooms and does not say how far")),
-                    "cameras: and the V20's lens zoom", zoomText);
+             expect(zoom && zoom->property("count").toInt() == 5 &&
+                        zoomText.startsWith(QStringLiteral("Zoom on its camera port 8100, which says the zoom")),
+                    "cameras: and the V20's zoom on its camera port", zoomText);
              press("vamaCameraSave");
          }},
         {400, [&]() {
              const QString file = cameraFolder + QStringLiteral("/v20-copy.json");
-             expect(cameraTransport(file) == QStringLiteral("tcp") && cameraFileValue(file, "zoom") == QJsonValue(QStringLiteral("pulse")) &&
+             expect(cameraTransport(file) == QStringLiteral("tcp") && cameraFileValue(file, "zoom") == QJsonValue(QStringLiteral("c20")) &&
                         cameraFileValue(file, "maxZoom").toDouble() == 22.0,
-                    "cameras: Save writes TCP and the lens zoom into its file, with the lens's range",
+                    "cameras: Save writes TCP and the camera port zoom into its file, with the lens's range",
                     cameraTransport(file) + QStringLiteral(" | ") + cameraFileValue(file, "zoom").toString());
              press("vamaCameraEdit_v20-copy");
          }},
@@ -3248,6 +3497,496 @@ int main(int argc, char *argv[])
                         .arg(link.pointMode()).arg(link.aimBusy()).arg(link.laserBusy()).arg(link.laserMessage())
                         .arg(link.attitudeValid()));
              link.setDigitalZoom(1.0);
+             // A8 step 4: where the drone's position comes from. In the air GPS 1 loses its 3D fix and
+             // the camera's position (GPS 2) takes over: once that has lasted 2 s, a note says so.
+             positionStore.setSettings(1, {{"GPS2_TYPE", 14.0}, {"GPS_AUTO_SWITCH", 4.0}});
+             positionStore.setArmed(1, true);
+             positionStore.hearGps1(1, 3);
+             positionStore.hearGps2(1, 3, 1500, 10);
+             positionMs = 3500;
+             positionStore.publishAll();  // GPS 1 from the start is no news
+             positionStore.hearGps1(1, 0);
+             positionStore.hearGps2(1, 3, 1500, 10);
+             positionMs = 6000;
+             positionStore.hearGps2(1, 3, 1500, 10);
+         }},
+        {300, [&]() {
+             QQuickItem *note = findItem("vamaPositionNote");
+             QQuickItem *text = findItem("vamaPositionNoteText");
+             QObject *border = note ? note->property("border").value<QObject *>() : nullptr;
+             const QString says = text ? text->property("text").toString() : QStringLiteral("not there");
+             expect(note && note->isVisible() && says == QStringLiteral("GPS 1 has no 3D fix: the position comes from the camera (GPS 2)"),
+                    "position source: the camera takes over in the air, and a note says so", says);
+             expect(border && border->property("color").value<QColor>() != QColor(Qt::transparent),
+                    "position source: the note is a warning (orange border)", QString());
+             shot("39_position_note.png");
+             tap("vamaPositionNote");
+         }},
+        {300, [&]() {
+             QQuickItem *note = findItem("vamaPositionNote");
+             expect(note && !note->isVisible(), "position source: a tap closes the note", QString());
+             // GPS 1 is back: once that has lasted 2 s, a note without the warning's border.
+             positionStore.hearGps1(1, 3);
+             positionMs = 8600;
+             positionStore.hearGps1(1, 3);
+         }},
+        {300, [&]() {
+             QQuickItem *note = findItem("vamaPositionNote");
+             QQuickItem *text = findItem("vamaPositionNoteText");
+             QObject *border = note ? note->property("border").value<QObject *>() : nullptr;
+             const QString says = text ? text->property("text").toString() : QStringLiteral("not there");
+             expect(note && note->isVisible() && says == QStringLiteral("The position comes from GPS 1 again") && border &&
+                        border->property("color").value<QColor>().alpha() == 0,
+                    "position source: GPS 1 back, a note without the warning's border", says);
+             // The note sits under the boxes at the top, never over one.
+             bool clear = note != nullptr;
+             for (const char *name : {"vamaResultBox", "vamaLockChip", "vamaFollowChip", "vamaCameraNote", "vamaLockHint",
+                                      "vamaMapPackLoading"}) {
+                 QQuickItem *box = findItem(name);
+                 if (note && box && box->isVisible()) {
+                     const QRectF a = note->mapRectToScene(QRectF(0, 0, note->width(), note->height()));
+                     const QRectF b = box->mapRectToScene(QRectF(0, 0, box->width(), box->height()));
+                     clear = clear && !a.intersects(b);
+                 }
+             }
+             expect(clear, "position source: the note lies over no box at the top", QString());
+             tap("vamaPositionNote");
+         }},
+        // The round proximity view (B25, Nish 2026-10-31: "Just like the mission planner proximity", "this proximity
+        // into hidden button", "adjustable dialogue box", "the round view replace them").
+        {300, [&]() {
+             QQuickItem *button = findItem("vamaProximityButton");
+             QQuickItem *box = findItem("vamaProximityWindow");
+             expect(button && !button->isVisible() && box && !box->isVisible(),
+                    "proximity: no button and no box before the sensor says anything", QString());
+             expect(!findItem("vamaObstacleFront") && !findItem("vamaObstacleBack"), "proximity: B19's four bars are gone", QString());
+             QQuickItem *qgcRadar = findItem("qgcVideoRadar");
+             QObject *radar = qgcRadar ? qgcRadar->property("item").value<QObject *>() : nullptr;
+             expect(radar && radar->objectName() == QStringLiteral("vamaNoVideoRadar") && !radar->property("visible").toBool(),
+                    "proximity: QGC's moving radar on the video is replaced, its address draws nothing", QString());
+             hearObstacle({3.0, -1, 2.2, -1, -1, -1, 5.5, -1});  // left: just past the range, inside the plot
+         }},
+        {300, [&]() {
+             QQuickItem *button = findItem("vamaProximityButton");
+             QQuickItem *box = findItem("vamaProximityWindow");
+             expect(button && button->isVisible() && box && !box->isVisible(),
+                    "proximity: with the sensor the button shows, and the box stays closed until it is pressed", QString());
+             QQuickItem *column = findItem("vamaActionColumn");
+             const QRectF b = shownAt("vamaProximityButton");
+             const QRectF c = shownAt("vamaActionColumn");
+             expect(column && b.left() >= c.right() && !b.intersects(c), "proximity: the button is beside the left buttons, on none", QString());
+             tap("vamaProximityButton");
+         }},
+        {400, [&]() {
+             QQuickItem *box = findItem("vamaProximityWindow");
+             expect(box && box->isVisible(), "proximity: the button opens the box", QString());
+             const QRectF shown = shownAt("vamaProximityWindow");
+             const QRectF screen = shownAt("vamaProximityButton").united(shownAt("vamaActionColumn"));
+             QQuickItem *layerItem = qobject_cast<QQuickItem *>(window->property("layer").value<QObject *>());
+             const QRectF layer = layerItem ? layerItem->mapRectToScene(QRectF(0, 0, layerItem->width(), layerItem->height())) : QRectF();
+             expect(!layer.isEmpty() && qAbs(shown.center().x() - layer.center().x()) < 2 && qAbs(shown.center().y() - layer.center().y()) < 2 &&
+                        !shown.intersects(screen),
+                    "proximity: it opens in the middle the first time, clear of the buttons",
+                    QStringLiteral("%1,%2 middle %3,%4").arg(shown.center().x()).arg(shown.center().y()).arg(layer.center().x()).arg(layer.center().y()));
+             // Over the screen's notes and hints too (some lie at z 1), wherever the user drags it.
+             qreal highestOther = -1000;
+             for (QQuickItem *other : (layerItem ? layerItem->childItems() : QList<QQuickItem *>())) {
+                 if (other != box) {
+                     highestOther = std::max(highestOther, other->z());
+                 }
+             }
+             expect(box && box->z() > highestOther, "proximity: the box lies over every other item of the screen",
+                    QStringLiteral("z %1, the highest other %2").arg(box ? box->z() : 0).arg(highestOther));
+             expect(proximityRedAt(0.0, 3.0) && proximityRedAt(90.0, 2.2),
+                    "proximity: each object a red arc in its direction (nose up) at its distance", QString());
+             expect(!proximityRedAt(270.0, 5.5) && !proximityRedAt(270.0, 4.9), "proximity: nothing beyond the range (5.5 m of 5 m)", QString());
+             const QString title = findItem("vamaProximityTitle") ? findItem("vamaProximityTitle")->property("text").toString() : QString();
+             const QString status = findItem("vamaProximityStatus") ? findItem("vamaProximityStatus")->property("text").toString() : QString();
+             expect(title == QStringLiteral("Proximity, within 5 m") && status == QStringLiteral("Object within 5 m"),
+                    "proximity: the box says its range and that an object is within it", title + " | " + status);
+             shot("42_proximity_view.png");
+             hearObstacle({4.8, -1, 2.2, -1, -1, -1, 5.5, -1});  // the object ahead moves away
+         }},
+        {300, [&]() {
+             expect(proximityRedAt(0.0, 4.8) && !proximityRedAt(0.0, 3.0), "proximity: the arc moves out with the object", QString());
+             // Dragged by its top.
+             proximityBoxBefore = shownAt("vamaProximityWindow");
+             const QRectF top = shownAt("vamaProximityDrag");
+             mouse(QEvent::MouseButtonPress, top.center());
+             // Qt starts a drag only after the first move of about 10 points: the box follows from there.
+             mouse(QEvent::MouseMove, top.center() + QPointF(20, 10));
+             mouse(QEvent::MouseMove, top.center() + QPointF(100, 40));
+             mouse(QEvent::MouseButtonRelease, top.center() + QPointF(100, 40));
+         }},
+        {700, [&]() {
+             const QRectF now = shownAt("vamaProximityWindow");
+             expect(qAbs(now.left() - (proximityBoxBefore.left() + 80)) < 2 && qAbs(now.top() - (proximityBoxBefore.top() + 30)) < 2 &&
+                        qAbs(now.width() - proximityBoxBefore.width()) < 0.5,
+                    "proximity: the box goes where its top is dragged",
+                    QStringLiteral("%1,%2 from %3,%4").arg(now.left()).arg(now.top()).arg(proximityBoxBefore.left()).arg(proximityBoxBefore.top()));
+             // Saved when it is let go (QtCore's Settings writes half a second later).
+             QQuickItem *dragged = findItem("vamaProximityWindow");
+             const QSettings savedPlace;
+             expect(dragged && qAbs(savedPlace.value(QStringLiteral("VamaProximityWindow/x")).toDouble() - dragged->x()) < 0.5 &&
+                        qAbs(savedPlace.value(QStringLiteral("VamaProximityWindow/y")).toDouble() - dragged->y()) < 0.5,
+                    "proximity: the place it is dragged to is saved",
+                    QStringLiteral("%1,%2").arg(savedPlace.value(QStringLiteral("VamaProximityWindow/x")).toDouble())
+                        .arg(savedPlace.value(QStringLiteral("VamaProximityWindow/y")).toDouble()));
+             // Made bigger by its corner.
+             proximityBoxBefore = now;
+             const QRectF corner = shownAt("vamaProximityResize");
+             mouse(QEvent::MouseButtonPress, corner.center());
+             mouse(QEvent::MouseMove, corner.center() + QPointF(20, 20));
+             mouse(QEvent::MouseMove, corner.center() + QPointF(100, 70));
+             mouse(QEvent::MouseButtonRelease, corner.center() + QPointF(100, 70));
+         }},
+        {400, [&]() {
+             const QRectF now = shownAt("vamaProximityWindow");
+             expect(qAbs(now.width() - (proximityBoxBefore.width() + 100)) < 2 && qAbs(now.height() - (proximityBoxBefore.height() + 70)) < 2 &&
+                        qAbs(now.left() - proximityBoxBefore.left()) < 0.5,
+                    "proximity: its corner makes the box bigger, and the view with it",
+                    QStringLiteral("%1 x %2").arg(now.width()).arg(now.height()));
+             expect(proximityRedAt(0.0, 4.8) && proximityRedAt(90.0, 2.2), "proximity: the bigger view draws the objects in their places", QString());
+             shot("42b_proximity_view_moved.png");
+             proximityBoxBefore = now;
+             window->setProperty("mapIsMain", true);
+         }},
+        {300, [&]() {
+             const QRectF now = shownAt("vamaProximityWindow");
+             expect(findItem("vamaProximityWindow")->isVisible() && qAbs(now.left() - proximityBoxBefore.left()) < 0.5 &&
+                        qAbs(now.top() - proximityBoxBefore.top()) < 0.5 && proximityRedAt(0.0, 4.8),
+                    "proximity: the same with the map as the main view", QString());
+             window->setProperty("mapIsMain", false);
+             tap("vamaProximityClose");
+         }},
+        {300, [&]() {
+             QQuickItem *box = findItem("vamaProximityWindow");
+             expect(box && !box->isVisible() && findItem("vamaProximityButton")->isVisible(),
+                    "proximity: X closes the box, the button stays", QString());
+             tap("vamaProximityButton");
+         }},
+        {300, [&]() {
+             const QRectF now = shownAt("vamaProximityWindow");
+             expect(findItem("vamaProximityWindow")->isVisible() && qAbs(now.left() - proximityBoxBefore.left()) < 0.5 &&
+                        qAbs(now.width() - proximityBoxBefore.width()) < 0.5,
+                    "proximity: opened again where the user left it, as big", QString());
+             QQuickItem *shownBox = findItem("vamaProximityWindow");
+             const QSettings saved;
+             const auto savedAs = [&](const char *key, double value) {
+                 return qAbs(saved.value(QStringLiteral("VamaProximityWindow/") + QLatin1String(key)).toDouble() - value) < 0.5;
+             };
+             expect(shownBox && savedAs("x", shownBox->x()) && savedAs("y", shownBox->y()) && savedAs("w", shownBox->width()) &&
+                        savedAs("h", shownBox->height()),
+                    "proximity: its place and size are saved for the next start",
+                    QStringLiteral("%1 x %2").arg(saved.value(QStringLiteral("VamaProximityWindow/w")).toDouble())
+                        .arg(saved.value(QStringLiteral("VamaProximityWindow/h")).toDouble()));
+             // The next start: a new box from the same file opens where this one was left, as big.
+             QQmlComponent fileOfTheBox(&engine, QUrl(QStringLiteral("qrc:/Custom/qml/QGroundControl/FlyView/VamaProximityWindow.qml")));
+             QQuickItem *again = qobject_cast<QQuickItem *>(fileOfTheBox.createWithInitialProperties({{QStringLiteral("visible"), false}}));
+             if (again && shownBox) {
+                 again->setParentItem(shownBox->parentItem());
+                 again->setVisible(true);
+             }
+             const QRectF next = again ? again->mapRectToScene(QRectF(0, 0, again->width(), again->height())) : QRectF();
+             expect(again && qAbs(next.left() - now.left()) < 0.5 && qAbs(next.top() - now.top()) < 0.5 &&
+                        qAbs(next.width() - now.width()) < 0.5 && qAbs(next.height() - now.height()) < 0.5,
+                    "proximity: at the next start it opens where it was left, as big",
+                    again ? QStringLiteral("%1,%2 %3 x %4").arg(next.left()).arg(next.top()).arg(next.width()).arg(next.height())
+                          : fileOfTheBox.errorString());
+             if (again) {
+                 again->setVisible(false);
+                 again->deleteLater();
+             }
+             hearObstacle({-1, -1, -1, -1, -1, -1, 8.0, -1});
+         }},
+        {300, [&]() {
+             const QString status = findItem("vamaProximityStatus") ? findItem("vamaProximityStatus")->property("text").toString() : QString();
+             expect(proximityRedCount() == 0 && status == QStringLiteral("Clear within 5 m"),
+                    "proximity: the objects gone or beyond the range, no red left", status);
+             // Ten rings, one every tenth of the range (as Mission Planner's), counted on the line just
+             // below the middle, right and left of the drone, up to the outer ring.
+             {
+                 const QRectF plot = proximityPlotRect();
+                 const double font = std::max(9.0, std::min(14.0, std::round(std::min(plot.width(), plot.height()) / 26.0)));
+                 const double radius = std::max(10.0, std::min(plot.width(), plot.height()) / 2.0 - font * 1.9);
+                 const QImage image = window->grabWindow();
+                 const qreal dpr = image.devicePixelRatio();
+                 QList<double> rings[2];  // where each ring starts, out from the middle
+                 for (int side = 0; side < 2; ++side) {
+                     bool inRing = false;
+                     for (double d = radius * 0.05; d <= radius + 1.0; d += 0.5) {
+                         const double x = plot.center().x() + (side == 0 ? d : -d);
+                         const QColor c = image.pixelColor(qRound(x * dpr), qRound((plot.center().y() + 3) * dpr));
+                         const bool grid = c.red() > 55 && c.red() < 150 && qAbs(c.red() - c.blue()) < 15 && qAbs(c.green() - c.blue()) < 15;
+                         if (grid && !inRing) {
+                             rings[side].append(d);
+                         }
+                         inRing = grid;
+                     }
+                 }
+                 bool placed = true;
+                 for (const QList<double> &found : rings) {
+                     placed = placed && found.size() == 10 && qAbs(found.first() - radius / 10.0) < 2.5 && qAbs(found.last() - radius) < 2.5;
+                 }
+                 expect(placed, "proximity: ten rings, one every tenth of the range, the last on it",
+                        QStringLiteral("%1 right, %2 left, the last at %3 of %4").arg(rings[0].size()).arg(rings[1].size())
+                            .arg(rings[0].isEmpty() ? 0.0 : rings[0].last()).arg(radius));
+             }
+             tap("vamaProximityButton");  // the button closes it too
+         }},
+        {300, [&]() {
+             expect(!findItem("vamaProximityWindow")->isVisible(), "proximity: the button closes the box too", QString());
+         }},
+        // The voice the app speaks with (the client, Nish 2026-10-30: Indian English, female).
+        // The admin steps closed the menu's window: shown again first, or its pictures cannot be taken.
+        {300, [&]() {
+             if (menuWindow) {
+                 menuWindow->show();
+             }
+             openMenu();
+         }},
+        {400, [&]() {
+             QQuickItem *item = menuItem("vamaMenuVoice");
+             expect(menuOpen() && item && item->isVisible(), "voice: the menu has a Voice line", QString());
+             menuTap("vamaMenuVoice");
+         }},
+        {400, [&]() {
+             QQuickItem *box = menuItem("vamaVoiceBox");
+             QQuickItem *fly = menuItem("toolbar_viewFly");
+             const QStringList choices = voice.choices();
+             expect(box && box->isVisible() && fly && !fly->isVisible(),
+                    "voice: the Voice panel takes the place of the menu's buttons", QString());
+             expect(voiceListsAsked == 0, "voice: with an Indian English voice, the panel asks the engine nothing (B23)",
+                    QString::number(voiceListsAsked));
+             expect(voice.current() == QStringLiteral("en-in-x-cxx#female_1-local"),
+                    "voice: automatic, the offline Indian English female voice speaks", voice.current());
+             expect(choices.size() == 5 &&
+                        choices.at(0) == QStringLiteral("Automatic: English (India), female, en-in-x-cxx#female_1-local") &&
+                        choices.at(1).endsWith(QStringLiteral(", en-in-x-cxx#female_1-local")) &&
+                        choices.at(2) == QStringLiteral("English (India), male, en-in-x-cxx#male_1-local") &&
+                        choices.at(3) == QStringLiteral("English (India), female, needs the internet, en-in-x-cxx#female_2-network") &&
+                        choices.at(4).startsWith(QStringLiteral("English (United States), female")),
+                    "voice: the list, Indian English first (offline, then female), then the others",
+                    choices.join(QStringLiteral(" | ")));
+             expect(box && box->property("currentIndex").toInt() == 0 && menuText("vamaVoiceNote").isEmpty(),
+                    "voice: Automatic is shown, and no note when Android tells the genders", menuText("vamaVoiceNote"));
+             shotOf(menuWindow, "40_voice.png");
+             menuTap("vamaVoiceBox");  // opens the list
+         }},
+        {300, [&]() {
+             // A real tap on the third line: the panel's binding must stay (the check after the RC's
+             // voices change, below, needs it).
+             const QStringList choices = voice.choices();
+             expect(choices.size() > 2 && menuTapListLine(choices.at(2)), "voice: a tap on the list opens it, with the voices in it",
+                    QString());
+         }},
+        {300, [&]() {
+             QQuickItem *box = menuItem("vamaVoiceBox");
+             const QString saved = QSettings().value(QLatin1String(VamaVoice::kSettingsKey)).toString();
+             expect(voice.choiceIndex() == 2 && voice.current() == QStringLiteral("en-in-x-cxx#male_1-local") && box &&
+                        box->property("currentIndex").toInt() == 2,
+                    "voice: a voice chosen in the list speaks, and the list shows it", voice.current());
+             expect(saved == QStringLiteral("en-in-x-cxx#male_1-local"), "voice: the choice is saved for the next start", saved);
+             menuTap("vamaVoiceTest");
+         }},
+        {300, [&]() {
+             expect(global.audioTests == 1, "voice: Test is QGC's own test of its speech, with the voice in use",
+                    QString::number(global.audioTests));
+             // The RC's voices change while the panel is open (the engine became ready, or another
+             // engine): a second offline Indian English female voice moves the chosen one a line down.
+             std::vector<vama::voice::Voice> more = olderVoices;
+             more.push_back({"en-in-x-ahp#female_3-local", "en", "IN", vama::voice::Gender::Female});
+             voice.setVoices(more);
+         }},
+        {300, [&]() {
+             QQuickItem *box = menuItem("vamaVoiceBox");
+             expect(voice.choiceIndex() == 3 && voice.current() == QStringLiteral("en-in-x-cxx#male_1-local") && box &&
+                        box->property("count").toInt() == 6 && box->property("currentIndex").toInt() == 3,
+                    "voice: the RC's voices change, the chosen voice still speaks, and the list shows it on its new line",
+                    box ? QStringLiteral("line %1 of %2").arg(box->property("currentIndex").toInt()).arg(box->property("count").toInt())
+                        : QStringLiteral("no list"));
+             if (box) {
+                 QMetaObject::invokeMethod(box, "activated", Q_ARG(int, 0));
+             }
+         }},
+        {300, [&]() {
+             expect(voice.choiceIndex() == 0 && voice.current() == QStringLiteral("en-in-x-cxx#female_1-local") &&
+                        !QSettings().contains(QLatin1String(VamaVoice::kSettingsKey)),
+                    "voice: back to Automatic, and the saved choice is gone", voice.current());
+             // A newer Google engine: no gender in the names.
+             voice.setVoices({{"en-us-x-iol-local", "en", "US", vama::voice::Gender::Unknown},
+                              {"en-in-x-ena-network", "en", "IN", vama::voice::Gender::Unknown},
+                              {"en-in-x-enc-local", "en", "IN", vama::voice::Gender::Unknown}});
+         }},
+        {300, [&]() {
+             QQuickItem *note = menuItem("vamaVoiceNote");
+             const QString says = menuText("vamaVoiceNote");
+             expect(voice.current() == QStringLiteral("en-in-x-enc-local") && note && note->isVisible() &&
+                        says.startsWith(QStringLiteral("Android does not say which of these voices are female")),
+                    "voice: without genders, the first offline Indian English voice, and a note to try them with Test", says);
+             // An engine without Indian English voice data.
+             voice.setVoices({{"en-us-x-iol-local", "en", "US", vama::voice::Gender::Unknown}});
+         }},
+        {300, [&]() {
+             const QString says = menuText("vamaVoiceNote");
+             const QStringList choices = voice.choices();
+             expect(says.startsWith(QStringLiteral("This remote control has no Indian English voice")) &&
+                        choices.size() == 2 && choices.at(0) == QStringLiteral("Automatic"),
+                    "voice: no Indian English voice, and the note says where to add one", says);
+             shotOf(menuWindow, "40b_voice_note.png");
+             menuTap("vamaVoiceDone");
+         }},
+        {300, [&]() {
+             expect(!menuOpen(), "voice: Done closes the menu", QString());
+             // Still no Indian English voice: the note says to add one and choose it here, so the
+             // panel asks the engine again when it opens (B23: messages no longer do).
+             openMenu();
+         }},
+        {400, [&]() { menuTap("vamaMenuVoice"); }},
+        {400, [&]() {
+             expect(voiceListsAsked == 1, "voice: without an Indian English voice, the panel asks the engine again (B23)",
+                    QString::number(voiceListsAsked));
+             voice.setVoices(olderVoices);
+             menuTap("vamaVoiceDone");
+         }},
+        {300, [&]() {
+             expect(!menuOpen(), "voice: Done closes the panel again", QString());
+             // The range of the round proximity view, in the app menu (B19, B25).
+             openMenu();
+         }},
+        {400, [&]() {
+             QQuickItem *item = menuItem("vamaMenuObstacleRange");
+             expect(menuOpen() && item && item->isVisible() && item->property("text").toString() == QStringLiteral("Proximity range"),
+                    "proximity range: the menu has a line for it", item ? item->property("text").toString() : QString());
+             menuTap("vamaMenuObstacleRange");
+         }},
+        {400, [&]() {
+             QQuickItem *box = menuItem("vamaObstacleRangeBox");
+             QQuickItem *fly = menuItem("toolbar_viewFly");
+             expect(box && box->isVisible() && fly && !fly->isVisible(),
+                    "proximity range: its panel takes the place of the menu's buttons", QString());
+             const QString shown = box ? box->property("currentText").toString() : QStringLiteral("no list");
+             expect(shown == QStringLiteral("5 m"), "proximity range: 5 m until the user chooses, the client's example", shown);
+             shotOf(menuWindow, "43_obstacle_range.png");
+             menuTap("vamaObstacleRangeBox");
+         }},
+        {300, [&]() {
+             expect(menuTapListLine(QStringLiteral("10 m")), "proximity range: a tap on the list opens it, with the ranges in it", QString());
+         }},
+        {300, [&]() {
+             QQuickItem *box = menuItem("vamaObstacleRangeBox");
+             const QString shown = box ? box->property("currentText").toString() : QStringLiteral("no list");
+             expect(proximity.barRange() == 10.0 && shown == QStringLiteral("10 m") &&
+                        QSettings().value(QLatin1String(ProximityStore::kBarRangeKey)).toDouble() == 10.0,
+                    "proximity range: the range chosen counts, the list shows it, and it is saved for the next start", shown);
+             menuTap("vamaObstacleRangeDone");
+         }},
+        {300, [&]() {
+             expect(!menuOpen(), "proximity range: Done closes the menu", QString());
+             tap("vamaProximityButton");
+         }},
+        {400, [&]() {
+             const QString title = findItem("vamaProximityTitle") ? findItem("vamaProximityTitle")->property("text").toString() : QString();
+             expect(proximityRedAt(270.0, 8.0) && title == QStringLiteral("Proximity, within 10 m"),
+                    "proximity range: with 10 m the view reaches the object at 8 m", title);
+             // The drone gone while the box is open (its sensor with it), then a new range: no reading draws
+             // the view again then, so the range itself must (the rings' distances follow it).
+             if (QQuickItem *box = findItem("vamaProximityWindow")) {
+                 box->setProperty("sectors", QVariant::fromValue<QObject *>(nullptr));
+             }
+         }},
+        {300, [&]() {
+             proximityRingWords = proximityRingWordsNow();
+             proximity.setBarRange(5.0);
+         }},
+        {300, [&]() {
+             expect(!proximityRingWords.isNull() && proximityRingWordsNow() != proximityRingWords,
+                    "proximity range: without a drone, a new range draws the rings' distances again", QString());
+             tap("vamaProximityButton");
+             // Vehicle Configuration (the client, Nish 2026-10-30): outside Advanced Mode only Summary, Radio, Sensors.
+             global.core.setShowAdvancedUI(false);
+             const qsizetype windows = engine.rootObjects().size();
+             engine.load(QUrl::fromLocalFile(QStringLiteral(VAMA_PREVIEW_DIR "/config.qml")));
+             if (engine.rootObjects().size() == windows ||
+                 !(configWindow = qobject_cast<QQuickWindow *>(engine.rootObjects().last()))) {
+                 std::fprintf(stderr, "Vehicle Configuration window not loaded\n");
+                 ++g_problems;
+             }
+         }},
+        {600, [&]() {
+             expect(configItem("vehicleConfig_root") != nullptr,
+                    "vehicle configuration: QGC's address opens the VAMA copy", QString());
+             expect(configShown("vehicleConfig_summary") && configShown("vehicleConfig_comp_Radio") &&
+                        configShown("vehicleConfig_comp_Sensors"),
+                    "vehicle configuration: outside Advanced Mode, Summary, Radio and Sensors", QString());
+             expect(!configShown("vehicleConfig_comp_Frame") && !configShown("vehicleConfig_comp_Failsafes") &&
+                        !configShown("vehicleConfig_comp_Motors") && !configShown("vehicleConfig_opticalFlowButton") &&
+                        !configShown("vehicleConfig_parametersButton"),
+                    "vehicle configuration: and nothing else (no Frame, Failsafes, Motors, Optical Flow or Parameters)",
+                    QString());
+             if (configWindow) {
+                 shotOf(configWindow, "41_vehicle_config.png");
+             }
+             global.core.setShowAdvancedUI(true);
+         }},
+        {300, [&]() {
+             expect(configShown("vehicleConfig_comp_Frame") && configShown("vehicleConfig_comp_Radio") &&
+                        configShown("vehicleConfig_comp_Sensors") && configShown("vehicleConfig_comp_Failsafes") &&
+                        configShown("vehicleConfig_comp_Motors") && configShown("vehicleConfig_opticalFlowButton") &&
+                        configShown("vehicleConfig_parametersButton"),
+                    "vehicle configuration: in Advanced Mode every line, Optical Flow and Parameters", QString());
+             if (configWindow) {
+                 shotOf(configWindow, "41b_vehicle_config_advanced.png");
+             }
+             // An admin opens Failsafes (the fourth), then turns Advanced Mode off with the page still open.
+             if (QQuickItem *root = configItem("vehicleConfig_root")) {
+                 QMetaObject::invokeMethod(root, "_navigateToComponent", Q_ARG(QVariant, 3), Q_ARG(QVariant, -1));
+             }
+         }},
+        {300, [&]() {
+             QQuickItem *root = configItem("vehicleConfig_root");
+             expect(root && root->property("_selectedComponentIndex").toInt() == 3 && configItem("previewFailsafesPage"),
+                    "vehicle configuration: in Advanced Mode Failsafes opens", QString());
+             global.core.setShowAdvancedUI(false);
+         }},
+        {300, [&]() {
+             QQuickItem *root = configItem("vehicleConfig_root");
+             expect(!configShown("vehicleConfig_comp_Failsafes") && configShown("vehicleConfig_comp_Radio"),
+                    "vehicle configuration: Advanced Mode off hides them again", QString());
+             expect(root && root->property("_selectedSpecial").toString() == QStringLiteral("summary") &&
+                        root->property("_selectedComponentIndex").toInt() == -1 && !configItem("previewFailsafesPage"),
+                    "vehicle configuration: and the open Failsafes page closes (back to the Summary)",
+                    root ? root->property("_selectedSpecial").toString() : QStringLiteral("no page"));
+             QQuickItem *search = configItem("vehicleConfig_searchField");
+             if (search) {
+                 search->setProperty("text", QStringLiteral("fail"));
+             }
+         }},
+        {300, [&]() {
+             QQuickItem *root = configItem("vehicleConfig_root");
+             expect(root && root->property("_searchQuery").toString() == QStringLiteral("fail") &&
+                        !configShown("vehicleConfig_comp_Failsafes"),
+                    "vehicle configuration: the search finds no hidden line outside Advanced Mode", QString());
+             QQuickItem *search = configItem("vehicleConfig_searchField");
+             if (search) {
+                 search->setProperty("text", QString());
+             }
+             // Any other way to open a hidden component (Failsafes is the fourth) shows why.
+             if (root) {
+                 QMetaObject::invokeMethod(root, "_navigateToComponent", Q_ARG(QVariant, 3), Q_ARG(QVariant, -1));
+             }
+         }},
+        {300, [&]() {
+             QQuickItem *root = configItem("vehicleConfig_root");
+             QQuickItem *panel = configItem("vehicleConfig_messagePanel");
+             const QString says = root ? root->property("_messagePanelText").toString() : QStringLiteral("no page");
+             expect(panel && panel->isVisible() && root->property("_selectedComponentIndex").toInt() == -1 &&
+                        says == QStringLiteral("Failsafes opens only in Advanced Mode, which asks for the admin password."),
+                    "vehicle configuration: a hidden component opened another way shows why, not its page", says);
+             if (configWindow) {
+                 shotOf(configWindow, "41c_vehicle_config_why.png");
+                 configWindow->close();
+             }
          }},
         {100, [&]() { QCoreApplication::quit(); }},
     };

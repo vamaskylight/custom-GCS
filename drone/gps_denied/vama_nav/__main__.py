@@ -25,6 +25,15 @@ def _size(text: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
+def _hills(text: str) -> tuple[float, float, float, float]:
+    try:
+        amp, wave, lat, lon = (float(p) for p in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"made-up hills are AMP_M,WAVE_M,LAT,LON, for example 100,3000,38.53,-121.71 "
+                                         f"(not '{text}')") from None
+    return amp, wave, lat, lon
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vama_nav",
                                 description="Sends the drone's position from the down camera to the flight controller "
@@ -35,12 +44,20 @@ def _parser() -> argparse.ArgumentParser:
                         "simulator's true position")
     p.add_argument("--sim-truth", action="store_true",
                    help="no matching: the ArduCopter simulator's true position with noise (step 3a's stand-in)")
-    p.add_argument("--device", default="/dev/serial0", help="serial port, or tcp:HOST:PORT (default /dev/serial0)")
+    p.add_argument("--device", default="/dev/ttyAMA0",
+                   help="serial port, or tcp:HOST:PORT (default /dev/ttyAMA0: pins 8 and 10 of a Raspberry Pi 5 with "
+                        "dtoverlay=uart0-pi5; /dev/serial0 on a Pi 4, where on a Pi 5 it is the debug connector)")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--source-system", type=int, default=1, help="the drone's system id (default 1)")
     p.add_argument("--source-component", type=int, default=MAV_COMP_ID_GPS2)
     m = p.add_argument_group("matching (--map)")
     m.add_argument("--map-zoom", type=int, help="the map's zoom level to match with (default: its finest)")
+    m.add_argument("--heights", type=Path,
+                   help="the ground's heights (an MBTiles file of terrarium tiles), for hills: over hills of plus or "
+                        "minus 60 m and more the positions stay closer. Default: the file beside the map named "
+                        "MAP-heights.mbtiles (VGCS makes it), without one the ground is taken as level")
+    m.add_argument("--sim-hills", type=_hills,
+                   help="--sim-camera: the camera sees made-up hills: AMP_M,WAVE_M,LAT,LON (level with LAT,LON there)")
     m.add_argument("--features", default="orb", choices=("orb", "akaze", "sift", "xfeat"),
                    help="default orb (the fastest). xfeat: learned features for a map of another season, needs PyTorch "
                         "and XFeat's folder (see vama_nav/xfeat_match.py)")
@@ -86,6 +103,10 @@ def _check(args) -> str | None:
         return f"one position source only: {sources}"
     if args.sim_camera and not args.map:
         return "--sim-camera needs --map"
+    if args.heights and not args.map:
+        return "--heights needs --map"
+    if args.sim_hills and not args.sim_camera:
+        return "--sim-hills needs --sim-camera"
     if args.match_above_m is None:
         args.match_above_m = 15.0 if args.sim_truth else 50.0
     for name in ("noise_m", "speed_noise", "delay_s", "match_above_m", "mount_pitch_deg", "mount_roll_deg"):
@@ -139,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         from vama_recorder.camera import CameraError
 
         from .geometry import Lens
+        from .heights import beside_map, heights_for_map
         from .map_tiles import MapError, TileMap
         from .match_source import MatchSource, SourceSettings
         from .matcher import Matcher, MatchSettings
@@ -155,13 +177,24 @@ def main(argv: list[str] | None = None) -> int:
         try:
             tile_map = TileMap(args.map, zoom=args.map_zoom)
             maps.append(tile_map)
+            heights = heights_for_map(tile_map, args.heights)
+            if heights is not None:
+                maps.append(heights)
+            else:
+                log.warning("no file of the ground's heights (%s, or --heights): the ground counts as flat. Fine on "
+                            "plains. Over hills the positions are less sure, and in the simulator over hills of plus "
+                            "or minus 100 m the EKF failsafe landed the drone", beside_map(args.map).name)
             if args.sim_camera:
-                from .sim_camera import SimCamera
+                from .sim_camera import Hills, SimCamera
 
                 ground = TileMap(args.sim_camera)
                 maps.append(ground)
+                hills = None
+                if args.sim_hills:
+                    amp, wave, lat, lon = args.sim_hills
+                    hills = Hills(amp, (lat, lon), wave)
                 camera = SimCamera(ground, lens, size=args.picture, ground_alt_m=args.ground_alt_m,
-                                   control=args.control, rng=np.random.default_rng(args.seed))
+                                   control=args.control, rng=np.random.default_rng(args.seed), hills=hills)
             else:
                 from vama_recorder.camera import PiCamera
 
@@ -173,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             matcher = Matcher(tile_map, lens, MatchSettings(features=args.features,
-                                                            xfeat_dir=str(args.xfeat_dir or "")))
+                                                            xfeat_dir=str(args.xfeat_dir or "")), heights=heights)
         except XFeatError as exc:
             print(f"xfeat: {exc}", file=sys.stderr)
             _close(None, maps)
@@ -195,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         what = (f"positions from the camera's pictures matched with {tile_map.describe()}, {args.features} features, "
                 f"a picture each {args.interval_s:g} s above {args.match_above_m:g} m"
+                + (f", the ground's heights from {heights.describe()}" if heights is not None else "")
                 + (f", the stand-in camera on {ground.describe()}" if args.sim_camera else "")
                 + (f", recording flights in {recorder_settings.flights_dir} from {recorder_settings.start_height_m:g} m"
                    if args.record else ""))

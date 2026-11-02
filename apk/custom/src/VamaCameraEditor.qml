@@ -36,7 +36,7 @@ Popup {
     // the order of the zoom box.
     readonly property string _protocol: _fields && _fields.protocol ? _fields.protocol : "skydroid-top"
     readonly property bool   _top:      _protocol === "skydroid-top"
-    readonly property var    _protocolZooms: ({ "skydroid-top": ["none", "counted", "reported", "pulse"],
+    readonly property var    _protocolZooms: ({ "skydroid-top": ["none", "counted", "reported", "pulse", "c20"],
                                                 "viewpro":      ["none", "live"],
                                                 "siyi":         ["none", "pulse"] })
     readonly property var    _zoomKinds: _protocolZooms[_protocol] || _protocolZooms["skydroid-top"]
@@ -44,8 +44,9 @@ Popup {
                                             "counted":  qsTr("Steps of 0.1x (as the V12 and V13)"),
                                             "reported": qsTr("The camera reports its zoom step (as the V14 Pro)"),
                                             "live":     qsTr("The camera says its zoom and its view (as the VPro)"),
-                                            "pulse":    _top ? qsTr("Its lens zooms and does not say how far (as the V20)")
-                                                             : qsTr("It zooms and does not say how far (as the VR10)") })
+                                            "pulse":    _top ? qsTr("Its lens zooms by TOP and does not say how far")
+                                                             : qsTr("It zooms and does not say how far (as the VR10)"),
+                                            "c20":      qsTr("Zoom on its camera port 8100, which says the zoom (as the V20)") })
     readonly property string _zoomKind:  _zoomKinds[zoomBox.currentIndex] || "none"
     readonly property bool   _thermalBySwitch: _protocol === "viewpro" && thermalBySwitchBox.checked
     // How the control commands reach the camera, in the order of the link box (the C20: TCP).

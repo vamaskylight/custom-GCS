@@ -40,7 +40,10 @@ enum class Zoom
     Counted,   ///< C12, C13: the app counts the steps it sent, 0.1x each (VGCS "commanded_optical")
     Reported,  ///< C14 Pro: the camera reports its zoom step, which picks a lens and a crop (VGCS "dzm_step")
     Live,      ///< Viewpro: the camera says its zoom and its view
-    Pulse,     ///< SIYI, and the C20's lens (TOP's ZMC): the camera zooms while it is told to, and does not say how far
+    Pulse,     ///< SIYI, and a TOP lens (ZMC): the camera zooms while it is told to, and does not say how far
+    /// The C20 (row B10): zoomed by Skydroid's binary packets on its camera port, TCP 8100 (C20Camera.h),
+    /// while it is told to, and it says its zoom there in whole steps of 1x, up to maxZoom.
+    C20,
 };
 
 /// One lens of a camera that reports its zoom step: its view at its first step, and its steps.
@@ -124,10 +127,12 @@ constexpr double kCountedStepZoom = 0.1;
 int countedStepsMax(const Profile &p);
 
 /// The field of view of the day picture, in degrees, at a zoom: the steps counted (Counted)
-/// or the step the camera reported (Reported, -1 when not known yet: its first step).
+/// or the step the camera reported (Reported, -1 when not known yet: its first step), or the
+/// zoom a C20 says (C20, 0 when not known yet: 1x).
 void dayFov(const Profile &p, int countedSteps, int reportedStep, double &horizontalDeg, double &verticalDeg);
 
-/// The zoom to show ("2.0x", "W2.9x", "T5.3x"), or nothing (no zoom, or no step reported yet).
+/// The zoom to show ("2.0x", "W2.9x", "T5.3x", a C20's "3.0x"), or nothing (no zoom, or no step
+/// reported yet).
 QString zoomLabel(const Profile &p, int countedSteps, int reportedStep);
 
 /// What is wrong with a camera's values, as a sentence for the editor, or nothing.

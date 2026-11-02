@@ -25,6 +25,8 @@ add_executable(skydroid_link_test
     ${SKYDROID_SRC}/ViewproCamera.cc
     ${SKYDROID_SRC}/SiyiProtocol.cc
     ${SKYDROID_SRC}/SiyiCamera.cc
+    # The C20's camera port (row B10).
+    ${SKYDROID_SRC}/C20Camera.cc
     ${SKYDROID_SRC}/LaserGeo.cc
     ${SKYDROID_SRC}/ObjectTracker.cc
     ${SKYDROID_SRC}/LockCheck.cc
@@ -187,6 +189,36 @@ add_executable(proximity_store_test
 )
 target_include_directories(proximity_store_test PRIVATE ${PROXIMITY_SRC})
 target_link_libraries(proximity_store_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
+
+# The app's position source (A8 step 4): GPS 1, or the down camera as GPS 2. The rules against
+# VGCS's own (../position_source_vectors.inc), and the store the screen reads. Overridable so a
+# mutation check can build against a modified copy.
+set(POSITION_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src CACHE PATH "Folder with PositionSource.cc")
+add_executable(position_source_test
+    position_source_test.cc
+    ${POSITION_SRC}/PositionSource.cc
+    ${POSITION_SRC}/PositionSourceStore.cc
+    ${POSITION_SRC}/PositionSourceStore.h
+)
+target_include_directories(position_source_test PRIVATE ${POSITION_SRC})
+target_link_libraries(position_source_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
+
+# The app's voice on the speech engine (B21, B23): the real VamaVoice and VamaVoiceEngine against a
+# stand-in for Qt Speech (voice_stubs), which this Qt kit lacks. It counts what goes to Android.
+# Overridable so a mutation check can build against a modified copy.
+set(VOICE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src CACHE PATH "Folder with VamaVoiceEngine.cc")
+add_executable(voice_engine_test
+    voice_engine_test.cc
+    ${VOICE_SRC}/VamaVoice.cc
+    ${VOICE_SRC}/VamaVoice.h
+    ${VOICE_SRC}/VamaVoiceEngine.cc
+    ${VOICE_SRC}/VamaVoiceEngine.h
+    ${VOICE_SRC}/VoicePick.cc
+    # Listed so AUTOMOC sees its signals.
+    voice_stubs/QtTextToSpeech/qtexttospeech.h
+)
+target_include_directories(voice_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/voice_stubs ${VOICE_SRC})
+target_link_libraries(voice_engine_test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
 
 # The admin password for Advanced Mode (task Z). admin_password_test is built as a test build
 # (the test password), admin_password_team_test as a customer build: it reads the team's salt

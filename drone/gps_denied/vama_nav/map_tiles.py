@@ -69,15 +69,18 @@ class TileMap:
                 return self._cache[key]
             row = self._db.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
                                    (self.zoom, key[0], (1 << self.zoom) - 1 - key[1])).fetchone()
-            grey = None
-            if row is not None:
-                grey = cv2.imdecode(np.frombuffer(row[0], np.uint8), cv2.IMREAD_GRAYSCALE)
-                if grey is not None and grey.shape != (TILE, TILE):
-                    grey = cv2.resize(grey, (TILE, TILE), interpolation=cv2.INTER_AREA)
+            grey = self._decode(row[0]) if row is not None else None
             self._cache[key] = grey
             while len(self._cache) > self._cache_tiles:
                 self._cache.popitem(last=False)
             return grey
+
+    def _decode(self, data: bytes) -> np.ndarray | None:
+        """One tile's file as an array of TILE x TILE."""
+        grey = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+        if grey is not None and grey.shape != (TILE, TILE):
+            grey = cv2.resize(grey, (TILE, TILE), interpolation=cv2.INTER_AREA)
+        return grey
 
     def crop(self, x0: int, y0: int, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
         """The map's pixels from world pixel (x0, y0), ``width`` by ``height``: (grey, mask), the mask

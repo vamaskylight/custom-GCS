@@ -18,6 +18,16 @@ features, and 30 km around home is about 44,000 tiles (about 0.9 GB).
 The pictures must be allowed for use offline on the drone. The usual online
 maps (Google, Bing) do not allow it, and Esri's terms are not checked here: the
 operator's choice of source, said where the file is made.
+
+The ground's heights: over hills the matching needs them. They are a second small
+MBTiles file beside the map (where ``vama_nav`` finds it), from the open Terrain Tiles
+(on land mostly SRTM, 30 m, about zoom 12: a finer tile only repeats it). 30 km
+around home is about 64 tiles, about 3 MB. There is no one licence for the set:
+each source has its own terms, and credit is asked (``HEIGHTS_ATTRIBUTION``, kept
+in the file). The pages call SRTM public domain, and also quote a copyright asserted
+outside the United States. ETOPO1, which fills the sea and gaps, says it is not to
+be used for navigation: the drone reads any height below 0 as the sea's level
+(vama_nav/heights.py). The drone's README has what was read.
 """
 
 from __future__ import annotations
@@ -29,7 +39,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from vgcs.map.tile_pack import PackPlan, pack_tile_path, plan_pack_for_area, plan_pack_for_waypoints
+from vgcs.map.tile_pack import PackPlan, pack_tile_path, plan_pack_for_area, plan_pack_for_bbox, plan_pack_for_waypoints
 
 DRONE_MAP_ZOOM = 17
 # Around a mission: room for a detour, a drift off the line and the way home.
@@ -38,6 +48,27 @@ DRONE_MAP_MARGIN_KM = 2.0
 # a bigger file is a mistake (a whole state), not a flight area.
 DRONE_MAP_MAX_TILES = 90_000
 DRONE_MAP_FILE = "vama-map.mbtiles"
+
+HEIGHTS_TEMPLATE = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+HEIGHTS_ZOOM = 12
+HEIGHTS_ENCODING = "terrarium"              # the metadata vama_nav/heights.py looks for
+# The credit the Terrain Tiles' pages ask for, all their sources: the file can be of any place.
+HEIGHTS_ATTRIBUTION = (
+    "Ground heights from the Terrain Tiles, https://registry.opendata.aws/terrain-tiles. "
+    "ArcticDEM terrain data DEM(s) were created from DigitalGlobe, Inc., imagery and funded under National Science "
+    "Foundation awards 1043681, 1559691, and 1542736; "
+    "Australia terrain data \u00a9 Commonwealth of Australia (Geoscience Australia) 2017; "
+    "Austria terrain data \u00a9 offene Daten \u00d6sterreichs - Digitales Gel\u00e4ndemodell (DGM) \u00d6sterreich; "
+    "Canada terrain data contains information licensed under the Open Government Licence - Canada; "
+    "Europe terrain data produced using Copernicus data and information funded by the European Union - EU-DEM layers; "
+    "Global ETOPO1 terrain data U.S. National Oceanic and Atmospheric Administration; "
+    "Mexico terrain data source: INEGI, Continental relief, 2016; "
+    "New Zealand terrain data Copyright 2011 Crown copyright (c) Land Information New Zealand and the New Zealand "
+    "Government (All rights reserved); "
+    "Norway terrain data \u00a9 Kartverket; "
+    "United Kingdom terrain data \u00a9 Environment Agency copyright and/or database right 2015. All rights reserved; "
+    "United States 3DEP (formerly NED) and global GMTED2010 and SRTM terrain data courtesy of the U.S. Geological Survey."
+)
 
 
 @dataclass
@@ -52,6 +83,7 @@ class DroneMapResult:
     bounds: tuple[float, float, float, float] | None = None     # west, south, east, north
     cancelled: bool = False
     error: str = ""
+    heights: DroneMapResult | None = None                       # the file of the ground's heights made beside the map
 
 
 def plan_drone_map(
@@ -75,6 +107,25 @@ def plan_drone_map(
         return None
     return plan_pack_for_area(center[0], center[1], radius_km=radius_km, template=template, zooms=(int(zoom),),
                               max_tiles=max_tiles)
+
+
+def plan_drone_heights(plan: PackPlan, *, margin_km: float = DRONE_MAP_MARGIN_KM) -> PackPlan:
+    """The ground's heights of a map's area. With room round it: the drone can be beyond the
+    map's edge while its camera, leaning, still sees the map."""
+    lat0, lon0, lat1, lon1 = plan.bbox
+    return plan_pack_for_bbox(lat0, lon0, lat1, lon1, template=HEIGHTS_TEMPLATE, zooms=(HEIGHTS_ZOOM,), margin_km=margin_km)
+
+
+def drone_heights_path(map_path: Path) -> Path:
+    """The heights file of a map file: beside it, its name with "-heights" (as vama_nav/heights.py looks for it)."""
+    path = Path(map_path)
+    return path.with_name(f"{path.stem}-heights{path.suffix}")
+
+
+def accept_heights_tile(raw: bytes, _zoom: int) -> bool:
+    """Any PNG picture. The map's test for a placeholder is not for these: flat ground and the
+    sea are one colour."""
+    return _tile_format(raw) == "png"
 
 
 def _tile_format(data: bytes) -> str:
@@ -102,6 +153,8 @@ def write_drone_map(
     *,
     name: str = "VAMA drone map",
     attribution: str = "",
+    description: str = "VAMA GPS-denied navigation: the drone's map (vama_nav --map)",
+    encoding: str = "",
     cancel: threading.Event | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> DroneMapResult:
@@ -155,9 +208,11 @@ def write_drone_map(
         result.fmt = formats.pop() if len(formats) == 1 else ("mixed" if formats else "png")
         result.bounds = (west, south, east, north)
         meta = {"name": name, "format": "png" if result.fmt == "mixed" else result.fmt, "type": "baselayer",
-                "version": "1.0", "description": "VAMA GPS-denied navigation: the drone's map (vama_nav --map)",
+                "version": "1.0", "description": description,
                 "attribution": attribution, "minzoom": str(min(zooms)), "maxzoom": str(max(zooms)),
                 "bounds": ",".join(f"{v:.7f}" for v in result.bounds)}
+        if encoding:
+            meta["encoding"] = encoding
         db.executemany("INSERT INTO metadata VALUES (?, ?)", sorted(meta.items()))
         db.commit()
     except BaseException:
@@ -169,6 +224,19 @@ def write_drone_map(
     result.path = out_path
     result.size_bytes = out_path.stat().st_size
     return result
+
+
+def write_drone_heights(
+    pack_dir: Path,
+    out_path: Path,
+    plan: PackPlan,
+    *,
+    cancel: threading.Event | None = None,
+) -> DroneMapResult:
+    """Pack the plan's heights tiles found in ``pack_dir`` into one MBTiles file, as ``write_drone_map``."""
+    return write_drone_map(pack_dir, out_path, plan, name="VAMA ground heights", attribution=HEIGHTS_ATTRIBUTION,
+                           description="VAMA GPS-denied navigation: the ground's heights (vama_nav --heights)",
+                           encoding=HEIGHTS_ENCODING, cancel=cancel)
 
 
 def read_drone_map(path: Path) -> dict:

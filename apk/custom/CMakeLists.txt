@@ -133,6 +133,16 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/AdminPassword.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ProximityStore.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ProximityStore.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/PositionSource.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/PositionSource.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/PositionSourceStore.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/PositionSourceStore.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/VamaVoice.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/VamaVoice.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/VamaVoiceEngine.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/VamaVoiceEngine.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/VoicePick.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/VoicePick.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidTop.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SkydroidTop.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/CameraProfile.cc
@@ -147,6 +157,8 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SiyiProtocol.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SiyiCamera.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/SiyiCamera.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/C20Camera.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/C20Camera.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/LaserGeo.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Skydroid/ObjectTracker.cc

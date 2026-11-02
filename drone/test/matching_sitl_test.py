@@ -23,6 +23,15 @@ Usage:
     py matching_sitl_test.py 4.7.0 --height-m 500 --wind-mps 8 [--wind-from-deg 270] [--gusts-mps 2]
                                          the client's height and wind (full from 60 m up, none on the ground;
                                          from the west by default: headwind on the west leg)
+    py matching_sitl_test.py 4.7.0 --hills-m 100 [--no-heights]
+                                         the stand-in camera sees made-up hills of plus or minus 100 m (the
+                                         drone flies level, so its height above the ground changes), and
+                                         vama_nav knows the ground's heights, up to 8 m off (--no-heights: it
+                                         takes the ground as level)
+    py matching_sitl_test.py 4.7.0 --blank-s 12
+                                         the ground shows nothing for 12 s instead of 4: a stress test, the
+                                         EKF far off when the positions come back makes its swing happen in
+                                         every flight
     py matching_sitl_test.py 4.7.0 --keep
                                          the work folder stays (the results, the tracks, the angles in
                                          attitude.csv, the recorded flight); a failed case always keeps it
@@ -69,9 +78,18 @@ MAP, GROUND = "davis-2020-z17", "davis-2022-z18"
 FEATURES = "orb"                           # --features: the matcher (vama_nav --features)
 KEEP = False                               # --keep: the work folder stays also when the case passes
 INTERVAL_S = 0.5                           # --interval S: seconds between two pictures (vama_nav --interval-s, its default)
-BLANK_S = 4.0
+BLANK_S = 4.0                              # --blank-s
 WIND_MPS, WIND_FROM_DEG, GUSTS_MPS = 0.0, 270.0, 0.0   # --wind-mps, --wind-from-deg, --gusts-mps
-FLY_PARAMS = {"WPNAV_SPEED": SPEED_MPS * 100, "WPNAV_SPEED_UP": 500, "WPNAV_SPEED_DN": 500, "FENCE_ENABLE": 0}
+HILLS_M, USE_HEIGHTS = 0.0, True                       # --hills-m, --no-heights
+HILLS_WAVE_M = 3000.0
+HEIGHTS_OFF_M = 8.0                                    # what vama_nav knows of the hills is off by up to this much
+HILLS_HOME_ALT_M = 400.0                               # with hills: home higher, the valleys stay above sea level
+FLY_PARAMS = {"FENCE_ENABLE": 0}
+# The mission's speeds, set while it runs (a name the version does not know fails the case): 4.7 renamed them
+# and counts in m/s. In the start-up file 4.7.0 skipped the 4.6 names without a word and flew its defaults
+# (10 m/s, climbing 2.5, coming down 1.5: from 500 m the landing then took longer than the test waited).
+SPEED_PARAMS = {"4.6": {"WPNAV_SPEED": SPEED_MPS * 100, "WPNAV_SPEED_UP": 500, "WPNAV_SPEED_DN": 500},
+                "4.7": {"WP_SPD": SPEED_MPS, "WP_SPD_UP": 5.0, "WP_SPD_DN": 5.0}}
 
 
 def leg_s(distance_m: float, calm_s: float) -> float:
@@ -96,6 +114,18 @@ def mission(alt_m: float) -> list[tuple]:
 def place(north_m: float, east_m: float) -> tuple[float, float]:
     return (HOME[0] + north_m / 111_320.0,
             HOME[1] + east_m / (111_320.0 * math.cos(math.radians(HOME[0]))))
+
+
+def heights_file(work: pathlib.Path) -> pathlib.Path:
+    """What vama_nav knows of the stand-in camera's hills: a heights file, off as an elevation model's is."""
+    sys.path.insert(0, str(PACKAGE_DIR))
+    from vama_nav.sim_camera import Hills
+
+    path = work / "heights.mbtiles"
+    south, west = place(-2000.0, -3000.0)
+    north, east = place(3000.0, 2000.0)
+    Hills(HILLS_M, HOME, HILLS_WAVE_M, off_m=HEIGHTS_OFF_M).write_file(path, HILLS_HOME_ALT_M, south, west, north, east)
+    return path
 
 
 def upload(sim: Sitl, items: list[tuple]) -> int | None:
@@ -222,7 +252,8 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
     # the ground, as real wind. With the same wind on the ground (1) the landed drone was never seen as landed.
     wind = {"SIM_WIND_SPD": WIND_MPS, "SIM_WIND_DIR": WIND_FROM_DEG, "SIM_WIND_T": 0, "SIM_WIND_TURB": GUSTS_MPS}
     params = {"RC_OVERRIDE_TIME": -1, **wind, **NAV_PARAMS, **PRIVATE[version[:3]], **FLY_PARAMS}
-    sim = Sitl(version, {}, params, speedup=1, home=f"{HOME[0]},{HOME[1]},{HOME_ALT_M:g},0")
+    home_alt = HILLS_HOME_ALT_M if HILLS_M > 0 else HOME_ALT_M
+    sim = Sitl(version, {}, params, speedup=1, home=f"{HOME[0]},{HOME[1]},{home_alt:g},0")
     proc = None
     log_path = work / "nav.log"
     results = work / "results.csv"
@@ -242,12 +273,19 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
         sim.pump(120, until=lambda last: "EKF_STATUS_REPORT" in last
                  and (last["EKF_STATUS_REPORT"].flags & 0x18) == 0x18
                  and "GPS_RAW_INT" in last and last["GPS_RAW_INT"].fix_type >= 3)
+        for name, value in SPEED_PARAMS[version[:3]].items():
+            sim.set_param(name, value)
 
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        ground_args = []
+        if HILLS_M > 0:
+            ground_args = ["--sim-hills", f"{HILLS_M:g},{HILLS_WAVE_M:g},{HOME[0]},{HOME[1]}"]
+            if USE_HEIGHTS:
+                ground_args += ["--heights", str(heights_file(work))]
         proc = subprocess.Popen([sys.executable, "-m", "vama_nav", "--map", str(path_of(MAP)), "--sim-camera",
                                  str(path_of(GROUND)), "--device", f"tcp:127.0.0.1:{SENDER_PORT}", "--control", str(ctl),
                                  "--seed", "7", "--results", str(results), "--record", "--config", str(ini),
-                                 "--features", FEATURES, "--interval-s", f"{INTERVAL_S:g}"],
+                                 "--features", FEATURES, "--interval-s", f"{INTERVAL_S:g}", *ground_args],
                                 cwd=PACKAGE_DIR, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         started = time.monotonic_ns()
         sim.pump(30, until=lambda last: any(t > started and fix >= 3 for t, fix, *_ in w.gps2[-3:]))
@@ -385,8 +423,9 @@ def mission_on_matched_positions(version: str, r: Report) -> None:
     r.check(len(folders) == 1 and rows >= 300, f"vama_nav --record kept one flight folder with {rows} pictures")
     if folders:
         # From 150 m: on the way up and down the camera sees little of the map (300 m is the flight's height).
+        replay_heights = ["--heights", str(work / "heights.mbtiles")] if HILLS_M > 0 and USE_HEIGHTS else []
         replay = subprocess.run([sys.executable, "-m", "vama_nav.replay", str(folders[0]), "--map", str(path_of(MAP)),
-                                 "--match-above-m", "150", "--features", FEATURES],
+                                 "--match-above-m", "150", "--features", FEATURES, *replay_heights],
                                 cwd=PACKAGE_DIR, capture_output=True, text=True, timeout=900,
                                 env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
         found = re.search(r"high enough to try (\d+), a position from (\d+)", replay.stdout)
@@ -406,8 +445,9 @@ CASES = [mission_on_matched_positions]
 
 
 def main(argv: list[str]) -> int:
-    global MAP, FEATURES, KEEP, INTERVAL_S, ALT_M, WIND_MPS, WIND_FROM_DEG, GUSTS_MPS
+    global MAP, FEATURES, KEEP, INTERVAL_S, ALT_M, WIND_MPS, WIND_FROM_DEG, GUSTS_MPS, HILLS_M, USE_HEIGHTS, BLANK_S
     KEEP = "--keep" in argv
+    USE_HEIGHTS = "--no-heights" not in argv
     for i, a in enumerate(argv[:-1]):
         if a == "--map":
             MAP = argv[i + 1]
@@ -423,9 +463,15 @@ def main(argv: list[str]) -> int:
             WIND_FROM_DEG = float(argv[i + 1])
         elif a == "--gusts-mps":
             GUSTS_MPS = float(argv[i + 1])
+        elif a == "--hills-m":
+            HILLS_M = float(argv[i + 1])
+        elif a == "--blank-s":
+            BLANK_S = float(argv[i + 1])
     versions = [a for a in argv if re.fullmatch(r"\d+\.\d+\.\d+", a)] or VERSIONS
     print(f"map {MAP}, the camera sees {GROUND}, features {FEATURES}, a picture each {INTERVAL_S:g} s, at {ALT_M:g} m, "
-          f"wind {WIND_MPS:g} m/s from {WIND_FROM_DEG:g} degrees, gusts {GUSTS_MPS:g} m/s")
+          f"wind {WIND_MPS:g} m/s from {WIND_FROM_DEG:g} degrees, gusts {GUSTS_MPS:g} m/s"
+          + (f", hills of plus or minus {HILLS_M:g} m, " + (f"heights known, up to {HEIGHTS_OFF_M:g} m off" if USE_HEIGHTS
+                                                            else "the ground taken as level") if HILLS_M > 0 else ""))
     failed_cases = 0
     began = time.monotonic()
     for version in versions:

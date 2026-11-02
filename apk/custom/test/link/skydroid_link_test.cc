@@ -46,6 +46,7 @@
 #include "MultiVehicleManager.h"
 #include "ObjectFollow.h"
 #include "ObjectMarks.h"
+#include "C20Camera.h"
 #include "SkydroidLink.h"
 #include "SkydroidTop.h"
 #include "Vehicle.h"
@@ -94,6 +95,10 @@ public:
     std::optional<std::string> slrE;  // SLR data field from the laser module
     std::optional<std::string> slrD;  // SLR data field from the system address
     std::optional<int> dzmStep;
+    // A C14 Pro's DZM commands move dzmStep: 0A up, 0B down. Its 1x preset (01) only if dzmPresetWorks:
+    // the client's reset stopped at 1.5x or 1.7x (2026-10-31).
+    bool dzmMoves = false;
+    bool dzmPresetWorks = true;
     int laserModuleDelayMs = 0;  // answer E reads late
     // After a SUM confirm the yaw drifts this fast, like a camera following an
     // object, until a SUM stop.
@@ -215,6 +220,16 @@ private slots:
                 }
                 if (echoCommands) {
                     _reply(d, top::buildTpFrame('U', 'w', f->tag, f->data, 'D', 0));
+                }
+                continue;
+            }
+            if (f->tag == "DZM" && f->ctrl == 'w' && dzmMoves && dzmStep) {
+                if (f->data == "0A") {
+                    ++*dzmStep;
+                } else if (f->data == "0B") {
+                    dzmStep = std::max(0, *dzmStep - 1);
+                } else if (f->data == "01" && dzmPresetWorks) {
+                    dzmStep = 0;
                 }
                 continue;
             }
@@ -378,6 +393,82 @@ private:
     QTcpServer _server;
     QTcpSocket *_conn = nullptr;
     std::string _rx;
+};
+
+/// The C20's camera port (row B10) on 127.0.0.1: Skydroid's binary packets (C20Camera.h). Its zoom
+/// moves one step of 1x every 100 ms while it is told to, between 1x and 22x, and it answers a zoom
+/// question with a reply as Skydroid's SDK reads it (payload byte 9, three values for each 1x).
+class FakeC20Port : public QObject
+{
+    Q_OBJECT
+
+public:
+    FakeC20Port()
+    {
+        _server.listen(QHostAddress::LocalHost, 0);
+        connect(&_server, &QTcpServer::newConnection, this, [this]() {
+            while (QTcpSocket *socket = _server.nextPendingConnection()) {
+                ++accepts;
+                hangUp();
+                _conn = socket;
+                connect(socket, &QTcpSocket::readyRead, this, &FakeC20Port::_read);
+            }
+        });
+        _motion.setInterval(100);
+        connect(&_motion, &QTimer::timeout, this, [this]() { zoom = std::clamp(zoom + _direction, 1, 22); });
+    }
+
+    quint16 port() const { return _server.serverPort(); }
+    bool connected() const { return _conn && _conn->state() == QAbstractSocket::ConnectedState; }
+
+    int accepts = 0;
+    int zoom = 1;
+    bool answer = true;     // answers a zoom question
+    bool stopWorks = true;  // a stop stops the zoom
+    std::vector<c20::Bytes> received;
+
+    int count(const c20::Bytes &packet) const { return static_cast<int>(std::count(received.begin(), received.end(), packet)); }
+    bool moving() const { return _direction != 0; }
+
+    void hangUp()
+    {
+        if (_conn) {
+            QTcpSocket *conn = std::exchange(_conn, nullptr);
+            conn->disconnect(this);
+            conn->abort();
+            conn->deleteLater();
+        }
+    }
+
+private:
+    void _read()
+    {
+        if (!_conn) {
+            return;
+        }
+        const QByteArray data = _conn->readAll();
+        const auto *bytes = reinterpret_cast<const std::uint8_t *>(data.constData());
+        for (const c20::Bytes &packet : c20::splitPackets(c20::Bytes(bytes, bytes + data.size()))) {
+            received.push_back(packet);
+            if (packet == c20::zoomIn() || packet == c20::zoomOut()) {
+                _direction = packet == c20::zoomIn() ? 1 : -1;
+                _motion.start();
+            } else if (packet == c20::zoomStop() && stopWorks) {
+                _direction = 0;
+                _motion.stop();
+            } else if (packet == c20::zoomQuery() && answer) {
+                c20::Bytes payload(16, 0);
+                payload[9] = static_cast<std::uint8_t>(zoom * 3 - 1);  // the middle of its band
+                const c20::Bytes reply = c20::packet(c20::kGroupZoom, c20::kCmdZoomRead, payload);
+                _conn->write(reinterpret_cast<const char *>(reply.data()), static_cast<qint64>(reply.size()));
+            }
+        }
+    }
+
+    QTcpServer _server;
+    QTcpSocket *_conn = nullptr;
+    QTimer _motion;
+    int _direction = 0;
 };
 
 /// A Viewpro camera (task AK) on 127.0.0.1. The app's frames come over TCP, a serial frame in a TCP
@@ -817,6 +908,7 @@ private slots:
         QSettings().remove("VamaMarks");
         QDir(_cameraFolder()).removeRecursively();
         SkydroidLink::setProbeTargets({}, {});
+        SkydroidLink::setC20CameraPort(c20::kPort);
         _vehicle.position = QGeoCoordinate(20.0, 72.0);
         _vehicle.gps.set("lock", 3);
         _vehicle.vehicle.set("heading", 0.0);
@@ -909,18 +1001,23 @@ private slots:
         SkydroidLink::setProbeTargets({"127.0.0.1"}, {other.port()});
         FakeTcpCamera c20;
         c20.answerGac = false;  // no angles: a UDP camera would be probed now
+        FakeC20Port camera;
+        SkydroidLink::setC20CameraPort(camera.port());
         _link->setModel("C20");
         _link->setPort(c20.port());
         QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
         QTest::qWait(3500);
         QCOMPARE(other.received.size(), 0);
         c20.received.clear();
+        camera.received.clear();
         _link->zoom(1);
-        // Its lens's zoom (task AN) and its stop, each once, and not the C13's step frames.
-        QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 2000);
+        // Its zoom and its stop on its camera port (row B10), each once: nothing of it over TOP, and
+        // not the C13's step frames.
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 2000);
         QTest::qWait(200);
-        QCOMPARE(c20.countEqual(top::buildLensZoom("in")), 1);
-        QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 1);
+        QCOMPARE(camera.count(c20::zoomIn()), 1);
+        QCOMPARE(camera.count(c20::zoomStop()), 1);
+        QCOMPARE(c20.countStartingWith(QStringLiteral("#TPUM")), 0);
         for (const std::string &frame : top::buildC13ZoomStepFrames(1, top::Options{true, 0x2710})) {
             QCOMPARE(c20.countEqual(frame), 0);
         }
@@ -990,23 +1087,32 @@ private slots:
         QCOMPARE(c20.accepts, 1);
     }
 
-    // --- The C20's lens zoom (task AN, client video 2026-10-27, build 14) ------------
-    // Build 14 sent it the V13's step (ZMC start, DZM, ZMC stop at once): it did not zoom, while the
-    // screen counted 5.5x. Its lens takes ZMC to M ("#TPUM2wZMC02"), held, and says nothing back.
+    // --- A TOP lens zoom (task AN, client video 2026-10-27, build 14) ----------------
+    // Build 14 sent the C20 the V13's step (ZMC start, DZM, ZMC stop at once): it did not zoom, while
+    // the screen counted 5.5x. TOP's lens zoom is ZMC to M ("#TPUM2wZMC02"), held, saying nothing back.
+    // It did not zoom the C20 either (row B10): the V20 has its camera port since, below. A camera
+    // file can still choose it ("pulse"): here a copy of the V20 that does.
 
-    void connectC20(FakeTcpCamera &c20)
+    void connectTopLens(FakeTcpCamera &c20)
     {
-        _link->setModel("C20");
-        _link->setPort(c20.port());
+        QVariantMap fields = _link->cameraProfile("C20");
+        fields["id"] = QString();
+        fields["name"] = "TOP lens";
+        fields["zoom"] = "pulse";
+        fields["host"] = "127.0.0.1";
+        fields["port"] = int(c20.port());
+        const QString id = _saveCamera(fields);
+        QVERIFY(!id.isEmpty());
+        _link->chooseCamera(id);
         QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
         QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
         c20.received.clear();
     }
 
-    void c20ZoomTellsTheLensAndStopsItAMomentLater()
+    void topLensZoomTellsTheLensAndStopsItAMomentLater()
     {
         FakeTcpCamera c20;
-        connectC20(c20);
+        connectTopLens(c20);
         _link->zoom(1);
         QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("in")), 1, 1000);
         QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 0);  // the lens moves until the stop
@@ -1026,12 +1132,12 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 2, 1500);
     }
 
-    void c20HeldButtonZoomsWithoutAPause()
+    void topLensHeldButtonZoomsWithoutAPause()
     {
         // As the screen's button clicks while it is held (FlyViewCustomLayer.qml, IconButton): at
         // once, 400 ms later, then every 120 ms. The lens must not get a stop in that first gap.
         FakeTcpCamera c20;
-        connectC20(c20);
+        connectTopLens(c20);
         _link->zoom(1);
         QTest::qWait(400);
         _link->zoom(1);
@@ -1042,12 +1148,12 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
     }
 
-    void c20LensStopsSoonAfterTheHeldButtonIsLetGo()
+    void topLensLensStopsSoonAfterTheHeldButtonIsLetGo()
     {
         // While the lens moves, a click puts its stop off only a little longer than the button's
         // 120 ms: the lens stops soon after the button is let go, not a whole first wait later.
         FakeTcpCamera c20;
-        connectC20(c20);
+        connectTopLens(c20);
         _link->zoom(1);
         QTest::qWait(400);
         for (int i = 0; i < 3; ++i) {
@@ -1062,11 +1168,11 @@ private slots:
                  qPrintable(QString("the stop came %1 ms after the last click").arg(sinceLastClick.elapsed())));
     }
 
-    void c20HeldZoomGoesOnUntilTheLastClick()
+    void topLensHeldZoomGoesOnUntilTheLastClick()
     {
         // The screen's button clicks every 120 ms while it is held.
         FakeTcpCamera c20;
-        connectC20(c20);
+        connectTopLens(c20);
         for (int i = 0; i < 5; ++i) {
             _link->zoom(1);
             QTest::qWait(120);
@@ -1078,10 +1184,10 @@ private slots:
         QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 1);
     }
 
-    void c20BackToOneZoomsOutThenSaysOneX()
+    void topLensBackToOneZoomsOutThenSaysOneX()
     {
         FakeTcpCamera c20;
-        connectC20(c20);
+        connectTopLens(c20);
         _link->zoom(1);
         QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
         QCOMPARE(_link->zoomLabel(), QString());
@@ -1106,11 +1212,11 @@ private slots:
         QCOMPARE(_link->zoomLabel(), QString());
     }
 
-    void c20LensStopsBeforeAnotherCameraIsChosen()
+    void topLensLensStopsBeforeAnotherCameraIsChosen()
     {
-        // The stop goes over the C20's own TCP link, before the C13 (UDP) takes its place.
+        // The stop goes over the camera's own TCP link, before the C13 (UDP) takes its place.
         FakeTcpCamera c20;
-        connectC20(c20);
+        connectTopLens(c20);
         _link->zoom(1);
         QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("in")), 1, 1000);
         _link->setModel("C13");
@@ -1120,16 +1226,224 @@ private slots:
         QCOMPARE(_camera->countEqual(top::buildLensZoom("stop")), 0);  // not to the C13
     }
 
-    void c20LensStopsWhenTheLinkGoesOff()
+    void topLensLensStopsWhenTheLinkGoesOff()
     {
         FakeTcpCamera c20;
-        connectC20(c20);
+        connectTopLens(c20);
         _link->zoom(1);
         QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("in")), 1, 1000);
         _link->setEnabled(false);
         QTRY_COMPARE_WITH_TIMEOUT(c20.countEqual(top::buildLensZoom("stop")), 1, 1500);
         QTest::qWait(600);
         QCOMPARE(c20.countEqual(top::buildLensZoom("stop")), 1);  // once, and nothing after the link went off
+    }
+
+    // --- The C20's camera port (row B10, Skydroid's RC SDK, 2026-11-03) --------------
+    // Its zoom takes Skydroid's binary packets on TCP 8100, beside TOP on 5000, and says its zoom there.
+
+    void connectC20(FakeTcpCamera &c20, FakeC20Port &camera)
+    {
+        SkydroidLink::setC20CameraPort(camera.port());
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(camera.connected(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 3000);  // asked on the connection
+        c20.received.clear();
+        camera.received.clear();
+    }
+
+    void c20ZoomGoesToItsCameraPortAndStopsAMomentLater()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomIn()), 1, 1000);
+        QCOMPARE(camera.count(c20::zoomStop()), 0);  // it zooms until the stop
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 1500);
+        // No TOP lens zoom on 5000, nor the V13's.
+        QCOMPARE(c20.countStartingWith(QStringLiteral("#TPUM")), 0);
+        QCOMPARE(c20.countStartingWith(QStringLiteral("#tpPM")), 0);
+        QCOMPARE(c20.countStartingWith(QStringLiteral("#TPUD2wDZM")), 0);
+        // Asked its zoom after the stop: it zoomed about 550 ms, 5 steps of 100 ms.
+        QTRY_VERIFY_WITH_TIMEOUT(camera.count(c20::zoomQuery()) >= 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("%1x").arg(double(camera.zoom), 0, 'f', 1), 1000);
+        QVERIFY(camera.zoom >= 3);
+        _link->zoom(-1);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomOut()), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 2, 1500);
+    }
+
+    void c20ViewFollowsTheZoomItSays()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        double h = 0.0;
+        double v = 0.0;
+        QVERIFY(_link->pictureFov(h, v));  // at the 1x it says
+        QCOMPARE(h, 58.3);
+        camera.zoom = 5;  // zoomed with Skydroid's own app: the poll finds it
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("5.0x"), 3000);
+        _link->currentFov(h, v);
+        QVERIFY(std::abs(std::tan(h * M_PI / 360.0) - std::tan(58.3 * M_PI / 360.0) / 5.0) < 1e-9);
+        // Whole steps of 1x say too little for a point from the picture: the cross only, and why.
+        QVERIFY(!_link->pictureFov(h, v));
+        _link->setPointMode("picture");
+        _vehicle.vehicle.set("altitudeRelative", 100.0);
+        _link->aimAndMeasure(0.7, 0.6);
+        QVERIFY(!_link->targetValid());
+        QVERIFY2(_link->laserMessage().contains("whole steps"), qPrintable(_link->laserMessage()));
+        camera.zoom = 1;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 3000);
+        QVERIFY(_link->pictureFov(h, v));
+        QVERIFY(!_link->zoomReport().isEmpty());  // its reply, for the camera settings
+    }
+
+    void c20BackTo1xStopsWhenItSays1x()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        camera.zoom = 12;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("12.0x"), 3000);
+        QElapsedTimer run;
+        run.start();
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomOut()), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 4000);  // 11 steps of 100 ms
+        QVERIFY2(run.elapsed() < 3000, qPrintable(QString::number(run.elapsed())));
+        QCOMPARE(camera.zoom, 1);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 1000);
+        double h = 0.0;
+        double v = 0.0;
+        QVERIFY(_link->pictureFov(h, v));
+        QTest::qWait(600);
+        QCOMPARE(camera.count(c20::zoomStop()), 1);  // the run is over
+        QVERIFY(!camera.moving());
+    }
+
+    void c20BackTo1xAsksItsZoomAllTheWay()
+    {
+        // From 22x the run takes 2.1 s. Its zoom is asked at every poll on the way (200 ms), not every
+        // 2 s as when it stands, so the stop comes soon after it says 1x (about 10 asks, every 2 s: 3).
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        camera.zoom = 22;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("22.0x"), 3000);
+        const int askedBefore = camera.count(c20::zoomQuery());
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 6000);
+        const int asked = camera.count(c20::zoomQuery()) - askedBefore;
+        QVERIFY2(asked >= 6, qPrintable(QString::number(asked)));
+        QCOMPARE(camera.zoom, 1);
+    }
+
+    void c20TapEndsTheRunBackTo1x()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        camera.zoom = 20;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("20.0x"), 3000);
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomOut()), 1, 1000);
+        QTest::qWait(300);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 1500);  // the tap's own stop
+        QTest::qWait(1000);
+        QCOMPARE(camera.count(c20::zoomStop()), 1);
+        QVERIFY(camera.zoom > 1);
+    }
+
+    void c20BackTo1xWithoutAnAnswerEndsAfterItsTime()
+    {
+        // A camera port that never says its zoom: out for 30 s, then 1x is taken as known, as for a SIYI.
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        camera.answer = false;
+        SkydroidLink::setC20CameraPort(camera.port());
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(camera.connected(), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);
+        QCOMPARE(_link->zoomLabel(), QString());
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomOut()), 1, 1000);
+        QTest::qWait(28000);
+        QCOMPARE(camera.count(c20::zoomStop()), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 4000);
+        QCOMPARE(_link->zoomLabel(), QString("1.0x"));
+    }
+
+    void c20HeldButtonZoomsWithoutAPause()
+    {
+        // As the screen's button clicks while it is held: at once, 400 ms later, then every 120 ms.
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        _link->zoom(1);
+        QTest::qWait(400);
+        _link->zoom(1);
+        QTest::qWait(120);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomIn()), 3, 1000);
+        QCOMPARE(camera.count(c20::zoomStop()), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 1500);
+    }
+
+    void c20PortStopsBeforeAnotherCameraAndCloses()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomIn()), 1, 1000);
+        _link->setModel("C13");
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 1000);
+        QTRY_VERIFY_WITH_TIMEOUT(!camera.connected(), 2000);
+        QTest::qWait(2500);
+        QCOMPARE(camera.accepts, 1);  // not opened again for the C13
+    }
+
+    void c20PortStopsWhenTheLinkGoesOff()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomIn()), 1, 1000);
+        _link->setEnabled(false);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomStop()), 1, 1500);
+        QTRY_VERIFY_WITH_TIMEOUT(!camera.connected(), 2000);
+    }
+
+    void c20PortConnectsAgainAfterAHangUp()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        const int asked = camera.count(c20::zoomQuery());
+        camera.hangUp();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.accepts, 2, 5000);
+        // Connected on the link's side too (it asks the zoom as it connects): a click sent while its
+        // connection is still opening is dropped, as with no connection.
+        QTRY_VERIFY_WITH_TIMEOUT(camera.count(c20::zoomQuery()) > asked, 2000);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomIn()), 1, 1000);
+    }
+
+    void onlyTheC20UsesTheCameraPort()
+    {
+        FakeC20Port camera;
+        SkydroidLink::setC20CameraPort(camera.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid(), 3000);  // the C13 of init()
+        _link->zoom(1);
+        QTest::qWait(1500);
+        QCOMPARE(camera.accepts, 0);
     }
 
     // --- Viewpro and SIYI cameras (task AK) ------------------------------------
@@ -1202,10 +1516,36 @@ private slots:
         viewpro.commands.clear();
         _link->zoomHome();
         QTRY_VERIFY_WITH_TIMEOUT(viewpro.countOp(viewpro::kOpZoomOut) >= 2, 1000);
+        // Still zooming out after the 8 s it once had, as it does not say 1x yet (the client's reset
+        // stopped at 1.5x or 1.7x, 2026-10-31).
+        QTest::qWait(8500);
+        const int outsSoFar = viewpro.countOp(viewpro::kOpZoomOut);
+        QTest::qWait(300);
+        QVERIFY(viewpro.countOp(viewpro::kOpZoomOut) > outsSoFar);
         viewpro.zoomX = 1.0;
         QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 2000);
         QTRY_COMPARE_WITH_TIMEOUT(viewpro.commands.last().op, int(viewpro::kOpStop), 1000);
         const int outs = viewpro.countOp(viewpro::kOpZoomOut);
+        QTest::qWait(500);
+        QCOMPARE(viewpro.countOp(viewpro::kOpZoomOut), outs);
+    }
+
+    void viewproBackTo1xEndsAfterItsTimeWithAStop()
+    {
+        // A camera that never says 1x: the run ends after 30 s, and the lens is told to stop.
+        FakeViewproCamera viewpro;
+        _link->setModel("A20KTR");
+        _link->setPort(viewpro.port());
+        viewpro.zoomX = 3.0;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("3.0x"), 3000);
+        viewpro.commands.clear();
+        _link->zoomHome();
+        QTest::qWait(28000);
+        const int outsSoFar = viewpro.countOp(viewpro::kOpZoomOut);
+        QTRY_VERIFY_WITH_TIMEOUT(viewpro.countOp(viewpro::kOpZoomOut) > outsSoFar, 1000);  // still zooming out
+        QTest::qWait(3500);
+        const int outs = viewpro.countOp(viewpro::kOpZoomOut);
+        QCOMPARE(viewpro.commands.last().op, int(viewpro::kOpStop));
         QTest::qWait(500);
         QCOMPARE(viewpro.countOp(viewpro::kOpZoomOut), outs);
     }
@@ -1713,10 +2053,12 @@ private slots:
         QVERIFY2(_link->laserMessage().contains("does not say how far it zoomed"), qPrintable(_link->laserMessage()));
         _link->aimAndMeasure(0.5, 0.5);
         QVERIFY2(_link->targetValid(), qPrintable(_link->laserMessage()));
-        // Back to 1x: it zooms out for a while, then its view is known.
+        // Back to 1x: it zooms out for a while (16 s, it does not say), then its view is known.
         _link->zoomHome();
-        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 10000);
-        QVERIFY(siyi.count(siyi::kCmdManualZoom, 0xFF) >= 10);
+        QTest::qWait(10000);
+        QCOMPARE(_link->zoomLabel(), QString());  // still zooming out
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 8000);
+        QVERIFY(siyi.count(siyi::kCmdManualZoom, 0xFF) >= 60);  // fewer on a busy PC than the 133 of 120 ms
         _link->aimAndMeasure(0.7, 0.6);
         QVERIFY2(_link->targetValid(), qPrintable(_link->laserMessage()));
         // Zoomed in: not known again.
@@ -3302,12 +3644,79 @@ private slots:
         const int outBefore = _camera->countEqual(top::buildDzmZoomStepV47("out"));
         _link->zoomHome();
         QCOMPARE(_link->zoomLabel(), QString("1.0x"));
-        // The absolute 1x and the 1x preset at once, then the steps back out
-        // (4 counted plus 5 more), one every 60 ms.
+        // The absolute 1x and the 1x preset at once, then the steps back out: 40 at least, as the
+        // count knows nothing of another app's zoom, plus 5 more, one every 120 ms.
         QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmPreset(1)), 1, 2000);
-        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")), outBefore + 9, 3000);
+        QTest::qWait(1000);
+        QVERIFY(_camera->countEqual(top::buildDzmZoomStepV47("out")) <= outBefore + 10);  // not at 60 ms
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")), outBefore + 45, 8000);
         QTest::qWait(300);
-        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), outBefore + 9);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), outBefore + 45);
+    }
+
+    void c13BackTo1xStepsOutTwiceWhatItCounted()
+    {
+        // The client's reset stopped at 1.5x or 1.7x (2026-10-31): a count can be short by lost steps.
+        for (int i = 0; i < 30; ++i) {
+            _link->zoom(1);
+        }
+        QCOMPARE(_link->zoomLabel(), QString("4.0x"));
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("in")), 30, 2000);
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")), 2 * 30 + 5, 11000);
+        QTest::qWait(300);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), 2 * 30 + 5);
+    }
+
+    void c12StopsAtItsHighestZoom()
+    {
+        // The client (2026-10-31): "in c12 if we zoom 4x after that also we can zoom in".
+        _link->setModel("C12");
+        for (int i = 0; i < 35; ++i) {
+            _link->zoom(1);
+        }
+        QCOMPARE(_link->zoomLabel(), QString("4.0x"));
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("in")), 30, 2000);
+        QTest::qWait(300);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("in")), 30);
+        QCOMPARE(_camera->countEqual(top::buildZmcZoom("in")), 30);
+        // A tap that does nothing keeps the app's lock.
+        _link->lockAtBox(0.5, 0.5, 0.06, 0.2);
+        _link->lockPicture(_picture(0.5, 0.5), 0.0, 0.0, 1.0, 1.0);
+        QVERIFY(_link->lockActive());
+        _link->zoom(1);
+        QVERIFY(_link->lockActive());
+        _link->stopLock();
+        // Out and in again work from there.
+        _link->zoom(-1);
+        QCOMPARE(_link->zoomLabel(), QString("3.9x"));
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")), 1, 2000);
+        _link->zoom(1);
+        QCOMPARE(_link->zoomLabel(), QString("4.0x"));
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("in")), 31, 2000);
+    }
+
+    void c12BackTo1xStepsOutItsWholeRange()
+    {
+        // Whatever it counted: 2 steps here, and the camera perhaps at 3x by another app.
+        _link->setModel("C12");
+        _link->zoom(1);
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("in")), 2, 2000);
+        _link->zoomHome();
+        QCOMPARE(_link->zoomLabel(), QString("1.0x"));
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")), 30 + 5, 6000);
+        QTest::qWait(300);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), 30 + 5);
+    }
+
+    void aCountedCameraAtOneXCanStillStepOut()
+    {
+        // The way out by hand when the camera is further in than the app counted.
+        _link->setModel("C12");
+        _link->zoom(-1);
+        QCOMPARE(_link->zoomLabel(), QString("1.0x"));
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")), 1, 2000);
     }
 
     void zoomTapStopsTheRunBackTo1x()
@@ -3361,6 +3770,97 @@ private slots:
         _link->stopGimbal();
         QTRY_VERIFY_WITH_TIMEOUT(_camera->countStartingWith("#TPUG4wGSM0000") >= 1, 2000);
         QCOMPARE(_camera->countStartingWith("#tpUG4wGSM"), 0);
+    }
+
+    void c14ProBackTo1xStepsOutUntilItSaysStepZero()
+    {
+        // The client's reset stopped at 1.5x or 1.7x (2026-10-31). Here the 1x preset does nothing.
+        _link->setModel("C14 Pro");
+        _camera->dzmMoves = true;
+        _camera->dzmPresetWorks = false;
+        _camera->dzmStep = 30;
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomStep(), 31, 3000);
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmPreset(1)), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmLensSelect("short")), 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomStep(), 0, 7000);  // the label says W1.0x from step 5 on
+        QCOMPARE(*_camera->dzmStep, 0);
+        QCOMPARE(_link->zoomLabel(), QString("W1.0x"));
+        // It stops after that. Its answer can lag by a few steps, which do nothing at step 0.
+        QTest::qWait(600);
+        const int outs = _camera->countEqual(top::buildDzmZoomStepV47("out"));
+        QVERIFY2(outs >= 31 && outs <= 31 + 6, qPrintable(QString::number(outs)));
+        QTest::qWait(500);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), outs);
+    }
+
+    void c14ProBackTo1xWithItsPresetSendsNoSteps()
+    {
+        _link->setModel("C14 Pro");
+        _camera->dzmMoves = true;
+        _camera->dzmStep = 30;
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomStep(), 31, 3000);
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomStep(), 0, 2000);
+        QTest::qWait(600);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), 0);
+    }
+
+    void c14ProBackTo1xWaitsForItsAnswerAfterThePreset()
+    {
+        // What it said before the "1x" frames is no reason to step: no step goes out before the answer
+        // to the question after those frames can have come.
+        _link->setModel("C14 Pro");
+        _camera->dzmMoves = true;
+        _camera->dzmPresetWorks = false;
+        _camera->dzmStep = 31;
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomStep(), 32, 3000);
+        _link->zoomHome();
+        QTest::qWait(300);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), 0);
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")) >= 1, 1000);
+    }
+
+    void c14ProTapEndsTheRunBackTo1x()
+    {
+        _link->setModel("C14 Pro");
+        _camera->dzmMoves = true;
+        _camera->dzmPresetWorks = false;
+        _camera->dzmStep = 60;
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomStep(), 61, 3000);
+        _link->zoomHome();
+        QTRY_VERIFY_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")) >= 3, 3000);
+        _link->zoom(-1);
+        const int out = _camera->countEqual(top::buildDzmZoomStepV47("out"));
+        QTest::qWait(500);
+        QVERIFY(_camera->countEqual(top::buildDzmZoomStepV47("out")) <= out + 1);  // the tap's own step
+    }
+
+    void c14ProThatNeverSaidGetsNoStepsAfterTheFrames()
+    {
+        _link->setModel("C14 Pro");
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmPreset(1)), 1, 2000);
+        QTest::qWait(900);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), 0);
+    }
+
+    void c14ProRunEndsAtItsLastStep()
+    {
+        // A camera that takes no step: the run does not go on for ever. Its last step (184) plus 5.
+        _link->setModel("C14 Pro");
+        _camera->dzmPresetWorks = false;
+        _camera->dzmStep = 100;  // dzmMoves off: it stays there
+        _link->zoom(1);
+        QTRY_COMPARE_WITH_TIMEOUT(_link->zoomStep(), 100, 3000);
+        _link->zoomHome();
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("out")), 184 + 5, 26000);
+        QTest::qWait(500);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("out")), 184 + 5);
     }
 
     void photoAndRecord()
@@ -4257,6 +4757,9 @@ private slots:
             _link->zoom(1);
         }
         QCOMPARE(_link->zoomLabel(), QString("2.0x"));  // no further than its highest zoom
+        QTRY_COMPARE_WITH_TIMEOUT(_camera->countEqual(top::buildDzmZoomStepV47("in")), 10, 2000);
+        QTest::qWait(200);
+        QCOMPARE(_camera->countEqual(top::buildDzmZoomStepV47("in")), 10);  // nor does it send more
         _link->setThermalPicture(true);
         QVERIFY(_link->pictureFov(h, v));  // its thermal lens is known
         QVERIFY(std::abs(h - 40.0) < 1e-9 && std::abs(v - 30.0) < 1e-9);

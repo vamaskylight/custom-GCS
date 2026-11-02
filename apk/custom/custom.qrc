@@ -43,9 +43,15 @@
         <file alias="QGroundControl/FlyView/VamaCameraEditor.qml">src/VamaCameraEditor.qml</file>
         <file alias="QGroundControl/FlyView/FlyViewTopRightColumnLayout.qml">src/FlyViewTopRightColumnLayout.qml</file>
         <file alias="QGroundControl/FlyView/ProximityRadarValues.qml">src/ProximityRadarValues.qml</file>
+        <file alias="QGroundControl/FlyView/ProximityRadarVideoView.qml">src/ProximityRadarVideoView.qml</file>
+        <file alias="QGroundControl/FlyView/VamaProximityWindow.qml">src/VamaProximityWindow.qml</file>
         <file alias="QGroundControl/FlyView/VehicleWarnings.qml">src/VehicleWarnings.qml</file>
         <file alias="QGroundControl/Toolbar/SelectViewDropdown.qml">src/SelectViewDropdown.qml</file>
         <file alias="QGroundControl/Toolbar/VamaAdminPasswordPanel.qml">src/VamaAdminPasswordPanel.qml</file>
+        <file alias="QGroundControl/Toolbar/VamaVoicePanel.qml">src/VamaVoicePanel.qml</file>
+        <file alias="QGroundControl/Toolbar/VamaObstacleRangePanel.qml">src/VamaObstacleRangePanel.qml</file>
+        <file alias="QGroundControl/VehicleSetup/VehicleConfigView.qml">src/VehicleConfigView.qml</file>
+        <file alias="QGroundControl/Toolbar/VehicleGPSIndicator.qml">src/VehicleGPSIndicator.qml</file>
     </qresource>
     <qresource prefix="/Custom/res">
         <file alias="QGCLogoFull.svg">res/Images/QGCLogoFull.svg</file>

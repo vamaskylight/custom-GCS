@@ -14,8 +14,11 @@
 // - a range circle that changed size with a downward rangefinder beside it.
 // Here the values come from the app's own store (src/ProximityStore.h, fed by
 // CustomPlugin::mavlinkMessage): only the proximity sensor's own messages, an
-// empty direction or one not heard for 2 s has no value (NaN), so both views
-// leave it out. Checked by rendering QGC's own views on Qt 6.11.1:
+// empty direction or one not heard for 2 s has no value (NaN), so the view
+// leaves it out. Nor has a direction beyond the range the user set for the obstacle
+// bars (B19, ProximityStore.barRange: red only inside that range). QGC's video radar is
+// replaced (ProximityRadarVideoView.qml), so these values now draw only QGC's map radar.
+// Checked by rendering QGC's own view on Qt 6.11.1:
 // test/proximity_view_test.py; the store by test/link/proximity_store_test.cc.
 
 import QtQuick
@@ -58,12 +61,13 @@ QtObject {
     property string _noValueStr:            qsTr("–.––")
 
     // VAMA: a direction's distance in metres, NaN when it has nothing in range (the store decides)
+    // or is beyond the range set for the obstacle bars (B19)
     function _value(direction) {
         if (!_sectors) {
             return NaN
         }
         var distance = _sectors.values[direction]
-        return (distance === undefined || distance === null) ? NaN : distance
+        return (distance === undefined || distance === null || distance > ProximityStore.barRange) ? NaN : distance
     }
 
     // VAMA: as QGC's facts wrote their values (2 decimals)

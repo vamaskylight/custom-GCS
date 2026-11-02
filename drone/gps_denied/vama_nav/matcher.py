@@ -4,7 +4,8 @@ Each picture is turned north up at the map's scale with the drone's angles and h
 moment (geometry.rectify). It then lies on the map by a shift alone, so features found in both
 (ORB by default, AKAZE or SIFT on request, all in OpenCV) are paired, and the shift is fitted to
 the pairs that agree (RANSAC, a shift with a small turn and scale, estimateAffinePartial2D). The
-point below the drone, carried by that fit onto the map, is its position.
+point below the drone, carried by that fit onto the map, is its position. With the ground's heights
+(heights.py) each ground point is turned at its own height, for the map and for the movement alike.
 
 Only near where the drone should be is searched (``search_m`` around the flight controller's own
 position), and a fit is a position only when it passes every check below. A position that is not
@@ -49,6 +50,11 @@ FEATURES = ("orb", "akaze", "sift", "xfeat")      # xfeat: learned, for a map of
 # camera's own time stamp, its rolling shutter). While the drone tips, the picture moves by its
 # tipping rate times this: at 300 m and 20 degrees a second, 2 m.
 TIMING_S = 0.02
+# --features xfeat matches at most this much of the picture turned north up (at the map's scale), round the
+# point below the drone: about the ground of a picture from 300 m (the AI Camera, 66 degrees), where it found
+# Esri's winter map 19 times out of 20. From 500 m the whole picture took it 0.53 s on a desktop processor,
+# against 0.24 s from 300 m.
+XFEAT_MAX_AREA_PX = 480 * 360
 
 
 @dataclass(frozen=True)
@@ -215,6 +221,35 @@ def _apply(m: np.ndarray, x: float, y: float) -> tuple[float, float]:
     return float(m[0, 0] * x + m[0, 1] * y + m[0, 2]), float(m[1, 0] * x + m[1, 1] * y + m[1, 2])
 
 
+def _xfeat_windows(mask: np.ndarray, crop_shape: tuple[int, ...], mx: float, my: float, margin: float,
+                   max_area_px: int, below: tuple[float, float]) -> tuple[tuple[int, int, int, int],
+                                                                      tuple[int, int, int, int]]:
+    """((x0, y0, x1, y1) in the picture turned north up, the same in the map crop) for XFeat: the whole
+    picture when it holds at most ``max_area_px``, else a window of that area and the picture's shape
+    round the point ``below`` the drone, kept inside the picture; in the crop, that window where the
+    flight controller puts it (picture pixel u is crop pixel u + mx, v + my) and the search's
+    ``margin`` round it.
+
+    Round the point below the drone, not the middle of the picture's ground: leaning 30 degrees (the
+    simulator's quadcopter at 10 m/s) the fixed camera looks back, and from 500 m the ground's middle
+    is some 400 m behind the drone, seen slantwise and stretched, where a small error of the fit
+    grows most on its way to the drone. Near the drone the picture is sharpest."""
+    h, w = mask.shape
+    if w * h <= max_area_px:
+        x0, y0, x1, y1 = 0, 0, w, h
+    else:
+        k = math.sqrt(max_area_px / float(w * h))
+        ww, wh = max(1, int(w * k)), max(1, int(h * k))
+        cx, cy = below
+        x0 = min(max(0, int(round(cx - ww / 2.0))), w - ww)
+        y0 = min(max(0, int(round(cy - wh / 2.0))), h - wh)
+        x1, y1 = x0 + ww, y0 + wh
+    ch, cw = crop_shape[:2]
+    cx0, cy0 = max(0, math.floor(x0 + mx - margin)), max(0, math.floor(y0 + my - margin))
+    cx1, cy1 = min(cw, math.ceil(x1 + mx + margin)), min(ch, math.ceil(y1 + my + margin))
+    return (x0, y0, x1, y1), (cx0, cy0, cx1, cy1)
+
+
 def second_place(src: np.ndarray, dst: np.ndarray, fit: _Fit, s: MatchSettings, nadir: tuple[float, float],
                  m_per_px: float) -> tuple[int, float] | None:
     """Another place, nearly as good, that the pairs left out of ``fit`` agree on: (its agreeing
@@ -254,9 +289,12 @@ class _Try:
 class Matcher:
     """Matches pictures with the map, one at a time (one thread)."""
 
-    def __init__(self, tile_map, lens: Lens, settings: MatchSettings | None = None) -> None:
+    def __init__(self, tile_map, lens: Lens, settings: MatchSettings | None = None, heights=None) -> None:
+        """``heights``: the ground's heights (heights.Heights), for hills. With them each ``Job``'s height is
+        above the ground below the drone. None: the ground is taken as level."""
         self.map = tile_map
         self.lens = lens
+        self.heights = heights
         self.settings = settings or MatchSettings()
         problem = self.settings.problem()
         if problem:
@@ -285,7 +323,8 @@ class Matcher:
 
         t = time.perf_counter()
         pose = Pose(job.pose.roll, job.pose.pitch, yaw, job.pose.height_m * self.height_factor)
-        attempt = _Try(rectify(job.image, self.lens, pose, m_per_px), yaw)
+        rise = self.heights.around(job.prior_lat, job.prior_lon) if self.heights is not None else None
+        attempt = _Try(rectify(job.image, self.lens, pose, m_per_px, rise), yaw)
         timed("rectify", t)
         rect = attempt.rect
         if rect is None:
@@ -314,7 +353,15 @@ class Matcher:
             return attempt
         if self._xfeat is not None:
             t = time.perf_counter()
-            attempt.src, attempt.dst = self._xfeat.match(rect.image, rect.mask, crop, cmask)
+            # XFeat's time grows with the ground the picture holds (from 500 m 2.3 times that from 300 m), so it
+            # matches as much ground as from 300 m, round the point below the drone, with the map round just that.
+            (rx0, ry0, rx1, ry1), (cx0, cy0, cx1, cy1) = _xfeat_windows(
+                rect.mask, cmask.shape, px - rect.ox - x0, py - rect.oy - y0, margin, XFEAT_MAX_AREA_PX,
+                (rect.ox, rect.oy))
+            src, dst = self._xfeat.match(rect.image[ry0:ry1, rx0:rx1], rect.mask[ry0:ry1, rx0:rx1],
+                                         crop[cy0:cy1, cx0:cx1], cmask[cy0:cy1, cx0:cx1])
+            attempt.src = src + np.float32([rx0, ry0])
+            attempt.dst = dst + np.float32([cx0, cy0])
             timed("xfeat", t)
             attempt.pairs = len(attempt.src)
             if attempt.pairs < s.min_inliers:

@@ -353,10 +353,10 @@ class VehicleTelemetryMixin:
         self._rangefinder_down_m = None
 
     def set_proximity_view(self, view: object) -> None:
-        """The drone's obstacle sensor in 8 directions (vgcs.app.obstacle_watch ``radar_view``), or None.
+        """The drone's obstacle sensor (vgcs.app.obstacle_watch ``radar_view``), or None.
 
-        On the radar card and as arcs round the drone on the map (A7, 2026-10-27), also while nothing
-        is in range ("Path clear"). The card itself is shown by the link (it is up whenever a drone is
+        On the card as its four sides, and as arcs round the drone on the map (A7, 2026-10-27; B19), also
+        while nothing is in range ("Clear within 5 m"). The card itself is shown by the link (it is up whenever a drone is
         connected) and hidden while Plan Flight is open: a reading does not show it again.
         """
         shown = view if isinstance(view, dict) and view.get("state") != "none" else None

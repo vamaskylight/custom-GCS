@@ -1,9 +1,12 @@
 #include "ProximityStore.h"
 
 #include <QtCore/QCoreApplication>
+#include <QtCore/QSettings>
 #include <QtQml/QJSEngine>
 
+#include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <type_traits>
 
@@ -11,6 +14,13 @@ namespace {
 
 constexpr int kNoReadingCm = 0xFFFF;
 const double kNone = std::numeric_limits<double>::quiet_NaN();
+// The same list as VGCS's PROXIMITY card (vgcs/app/obstacle_watch.py BAR_RANGE_CHOICES_M).
+constexpr double kBarRanges[] = {1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 40};
+
+bool isBarRange(double metres)
+{
+    return std::find(std::begin(kBarRanges), std::end(kBarRanges), metres) != std::end(kBarRanges);
+}
 
 /// The distance in metres, or NaN for "nothing in range": no reading, or the sensor's own range
 /// (an empty direction comes as the range; 0 for a sensor of unknown range).
@@ -76,6 +86,41 @@ bool ProximitySectors::hear(int sensorId, int orientation, int currentCm, int ma
     return true;
 }
 
+QVariantList ProximitySectors::sides() const
+{
+    QVariantList out;
+    out.reserve(kSides);
+    for (int i = 0; i < kSides; ++i) {
+        out.append(side(i));
+    }
+    return out;
+}
+
+double ProximitySectors::side(int index) const
+{
+    if (index < 0 || index >= kSides) {
+        return kNone;
+    }
+    // Side 0 faces direction 0, side 1 direction 2, and so on, with the diagonal on each hand of it.
+    const int middle = index * 2;
+    double nearest = kNone;
+    for (const int direction : {middle + kDirections - 1, middle, middle + 1}) {
+        const double metres = _metres[direction % kDirections];
+        if (!std::isnan(metres) && (std::isnan(nearest) || metres < nearest)) {
+            nearest = metres;
+        }
+    }
+    return nearest <= _barRangeM ? nearest : kNone;
+}
+
+void ProximitySectors::setBarRange(double metres)
+{
+    if (metres != _barRangeM) {
+        _barRangeM = metres;
+        emit changed();
+    }
+}
+
 void ProximitySectors::expire(qint64 nowMs)
 {
     bool cleared = false;
@@ -95,6 +140,8 @@ void ProximitySectors::expire(qint64 nowMs)
 ProximityStore::ProximityStore(QObject *parent)
     : QObject(parent)
 {
+    const double saved = QSettings().value(QLatin1String(kBarRangeKey), kDefaultBarRange).toDouble();
+    _barRangeM = isBarRange(saved) ? saved : kDefaultBarRange;
     _elapsed.start();
     _expiry.setInterval(kExpiryCheckMs);
     connect(&_expiry, &QTimer::timeout, this, &ProximityStore::expireAll);
@@ -125,10 +172,33 @@ ProximitySectors *ProximityStore::forVehicle(int vehicleId)
     ProximitySectors *sectors = _vehicles.value(vehicleId, nullptr);
     if (sectors == nullptr) {
         sectors = new ProximitySectors(this);
+        sectors->setBarRange(_barRangeM);
         QJSEngine::setObjectOwnership(sectors, QJSEngine::CppOwnership);
         _vehicles.insert(vehicleId, sectors);
     }
     return sectors;
+}
+
+void ProximityStore::setBarRange(double metres)
+{
+    if (!isBarRange(metres) || metres == _barRangeM) {
+        return;
+    }
+    _barRangeM = metres;
+    QSettings().setValue(QLatin1String(kBarRangeKey), metres);
+    for (ProximitySectors *sectors : std::as_const(_vehicles)) {
+        sectors->setBarRange(metres);
+    }
+    emit barRangeChanged();
+}
+
+QVariantList ProximityStore::barRangeChoices() const
+{
+    QVariantList out;
+    for (const double metres : kBarRanges) {
+        out.append(metres);
+    }
+    return out;
 }
 
 void ProximityStore::hear(int vehicleId, int sensorId, int orientation, int currentCm, int maxCm)

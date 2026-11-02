@@ -63,7 +63,7 @@ from vgcs.app.window.helpers import (
 )
 from vgcs.app.arm_readiness import parse_prearm_health
 from vgcs.app.battery_tracker import pack_voltage_v_from_cells, voltage_v_from_mv
-from vgcs.app.obstacle_watch import OBSTACLE_PARAMS
+from vgcs.app.obstacle_watch import BAR_RANGE_SETTING, OBSTACLE_PARAMS
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.vehicle_messages import NOTICE_EVENT, SEVERITY_INFO, SEVERITY_WARNING
 from vgcs.app.runtime_ui import build_base_font, select_font_profile
@@ -278,6 +278,12 @@ class MainWindowTelemetryMixin:
             else:
                 self._post_gcs_notice(message, kind=NOTICE_EVENT)
             self._append_log(f"GPS: {message}")
+
+    def _on_obstacle_bar_range_chosen(self, metres: float) -> None:
+        """The range chosen on the PROXIMITY card: saved for the next start, and shown at once (B19)."""
+        if self._obstacle.set_bar_range_m(metres):
+            self._settings.setValue(BAR_RANGE_SETTING, float(metres))
+            self._publish_obstacle()
 
     def _publish_obstacle(self) -> None:
         """The drone's obstacle sensor everywhere it shows, and its warnings (A7, 2026-10-27).

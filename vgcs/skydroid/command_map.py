@@ -18,6 +18,9 @@ ZOOM_MODEL_DZM_STEP = "dzm_step"
 # The C20 (task AN): an optical lens that zooms while it is told to (ZMC to M, then a stop) and
 # does not say how far. Its picture carries the zoom; how far it is zoomed, nobody knows.
 ZOOM_MODEL_LENS_PULSE = "lens_pulse"
+# The C20 (row B10): zoomed by Skydroid's binary packets on its camera port, TCP 8100
+# (vgcs/skydroid/c20_camera.py), while it is told to; it says its zoom there, 1x to 22x.
+ZOOM_MODEL_C20_PORT = "c20_port"
 
 
 @dataclass(frozen=True)
@@ -399,9 +402,10 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         frame_specs_confirmed=False,
         aim_fov_from_profile=True,
         max_zoom=22.0,
-        # The lens zooms (client video 2026-10-27: the C13's step did not zoom it in the app),
-        # and the picture carries it: no crop of the preview on top.
-        zoom_model=ZOOM_MODEL_LENS_PULSE,
+        # Its zoom (row B10): neither the C13's step nor TOP's lens zoom moved it (the client,
+        # 2026-10-27 and 2026-10-30). Skydroid's RC SDK zooms it on its camera port, TCP 8100,
+        # which says the zoom. The picture carries it: no crop of the preview on top.
+        zoom_model=ZOOM_MODEL_C20_PORT,
         preview_carries_zoom=True,
         g_frames_upper_header=True,
         # Its picture is not the C13's, which the full checks were tuned on.
