@@ -145,6 +145,8 @@ class SkydroidCommandProfile:
     # camera that takes it on TCP only (the C20, TOP document V1.1.6 section 2.1.1). A TCP
     # camera has one address: no other host or port is tried.
     transport: str = "udp"
+    # A torch the rail switches (the C20, row B27): text on the TOP connection.
+    torch: bool = False
 
     def fov_at_dzm_step(self, step: int | None) -> tuple[float, float] | None:
         """(hfov, vfov) at ``step``, or None when this camera's zoom optics are unknown.
@@ -371,8 +373,9 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         # TOP V1.1.6 (the client's PROTOCAL(c10 & c20).pdf, 2026-10-05): the C20 takes TOP on
         # TCP port 5000 only (section 2.1.1), and every G-class frame needs "#TP" (2.2.2).
         # PTZ, GSY/GSP/GSM and GAY/GAP/GAM list the C20; REC, CAP, DZM and VER do not, and
-        # its zoom is in the appendix only (ZMC): photo, record and zoom are to be tried on
-        # the camera. The same tags and frames as the C13, so the C13's command lists.
+        # its zoom is in the appendix only (ZMC). The same tags and frames as the C13, so the
+        # C13's command lists. Its zoom (row B10), photos and recordings (row B26) go to its
+        # camera port instead (c20_camera.py), so the lists below are not used for them.
         ptz_commands={
             "up": ["PT_UP"],
             "down": ["PT_DOWN"],
@@ -412,6 +415,7 @@ SKYDROID_PROFILES: dict[str, SkydroidCommandProfile] = {
         video_qc_mode="colour",
         probe_fallback_profile_id="",
         transport="tcp",
+        torch=True,  # its searchlight (row B27)
     ),
 }
 

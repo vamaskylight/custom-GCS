@@ -71,7 +71,8 @@
 // (REC 01, REC 00). The camera saves them on its own SD card: the app keeps nothing on the RC.
 // Until test build 13 every record press sent REC 01, so the second press never stopped the
 // camera. The camera is asked whether it records (REC read) and for its SD card's space (SDC),
-// and after each press the screen says what the camera did (cameraNote).
+// and after each press the screen says what the camera did (cameraNote). A C20 takes them on
+// its camera port instead (row B26, C20Camera.h), and its reply there says whether it did.
 //
 // One shared instance; QML uses it as the singleton "SkydroidLink" from the
 // QGC module.
@@ -177,6 +178,8 @@ class SkydroidLink : public QObject
     Q_PROPERTY(QString sdCardWarning READ sdCardWarning NOTIFY sdCardChanged)
     /// What the camera says of its SD card, in a sentence, or empty while that is not known.
     Q_PROPERTY(QString sdCardText READ sdCardText NOTIFY sdCardChanged)
+    /// The camera's torch (the V20, row B27) as the screen last told it: the camera says nothing back.
+    Q_PROPERTY(bool torchOn READ torchOn NOTIFY torchChanged)
     Q_PROPERTY(bool targetValid READ targetValid NOTIFY targetChanged)
     Q_PROPERTY(double targetLat READ targetLat NOTIFY targetChanged)
     Q_PROPERTY(double targetLon READ targetLon NOTIFY targetChanged)
@@ -362,6 +365,7 @@ public:
     /// press what the press asked for, until the camera answers.
     bool recording() const { return _recording; }
     bool recordingConfirmed() const { return _recordConfirmed; }
+    bool torchOn() const { return _torchOn; }
     QString sdCardWarning() const;
     QString sdCardText() const;
     bool targetValid() const { return _target.ok; }
@@ -505,6 +509,9 @@ public:
     /// decides for both. Asking for what the screen shows already sends the frame again, to make
     /// sure, with no note.
     Q_INVOKABLE void setRecord(bool start);
+    /// The torch on or off, for a camera whose file says it has one (the V20, row B27): the text of
+    /// Skydroid's SDK on the TOP connection. cameraNote says when it could not be sent.
+    Q_INVOKABLE void setTorch(bool on);
     /// +1 zoom in, -1 zoom out (one step).
     Q_INVOKABLE void zoom(int direction);
     /// Back to 1x: the camera's own "1x" where it has one, and then a run of zoom out, which a zoom
@@ -539,6 +546,7 @@ signals:
     void laserChanged();
     void zoomChanged();
     void recordingChanged();
+    void torchChanged();
     void sdCardChanged();
     /// What the camera did with a photo or record press, for the screen. problem: it did not
     /// do it, it does not say, or its SD card is missing or almost full.
@@ -582,6 +590,7 @@ private slots:
     void _sendLockConfirm();
     void _photoVerdict();
     void _recordVerdict();
+    void _c20CaptureVerdict();
     void _sendDue();
 
 private:
@@ -661,6 +670,11 @@ private:
     void _sendC20(const std::vector<std::uint8_t> &packet);
     /// The zoom (1 to 22) the C20 says, and its reply's payload in hex (zoomReport).
     void _takeC20Zoom(int zoom, const QString &report);
+    /// A photo or record command on the C20's camera port (row B26), and its reply there: done or
+    /// failed, as Skydroid's SDK reads it.
+    enum class C20Capture { None, Photo, RecordStart, RecordStop };
+    void _sendC20Capture(C20Capture what);
+    void _c20CaptureAnswered(bool done);
     /// To the control port, and to the other ports some C13 firmware takes zoom on.
     void _sendZoomFrames(const std::vector<std::string> &frames);
     int _zoomStepsMax() const;
@@ -976,6 +990,10 @@ private:
     QTimer _recordVerdictTimer;
     bool _photoWaiting = false;           // a photo press waits for the camera's echo
     QTimer _photoVerdictTimer;
+    // A C20 takes them on its camera port (row B26): the press that waits for its reply there.
+    C20Capture _c20Capture = C20Capture::None;
+    QTimer _c20CaptureTimer;
+    bool _torchOn = false;                // the torch as last told (row B27)
     std::optional<skydroid::top::SdCard> _sdCard;
     QElapsedTimer _sdCardAt;              // since its answer
     int _sdCardAsked = 0;                 // SDC questions since the last answer

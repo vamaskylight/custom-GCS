@@ -352,6 +352,28 @@ class CameraRailMixin:
         except Exception:
             pass
 
+    def _on_native_torch_toggled(self, checked: bool) -> None:
+        """The camera's torch (row B27). It says nothing back: the button shows what was sent."""
+        from vgcs.video.camera_control import camera_set_torch
+
+        if not camera_set_torch(getattr(self, "_camera_control", None), bool(checked)):
+            self._sync_native_torch_button()  # no torch on this camera: the button goes
+
+    def _sync_native_torch_button(self) -> None:
+        btn = getattr(self, "_btn_native_torch", None)
+        if btn is None:
+            return
+        from vgcs.video.camera_control import camera_has_torch, camera_torch_on
+
+        cc = getattr(self, "_camera_control", None)
+        try:
+            btn.blockSignals(True)
+            btn.setChecked(camera_torch_on(cc))
+            btn.blockSignals(False)
+            btn.setVisible(camera_has_torch(cc))
+        except Exception:
+            pass
+
     def _on_native_follow_rail_toggled(self, _checked: bool) -> None:
         try:
             self._follow_rail_debounce.start()
@@ -398,6 +420,7 @@ class CameraRailMixin:
                 self._btn_native_follow.setChecked(fen)
                 self._btn_native_follow.blockSignals(False)
             self._sync_native_thermal_feed_button()
+            self._sync_native_torch_button()
         except Exception:
             pass
 

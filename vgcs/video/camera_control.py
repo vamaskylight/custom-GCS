@@ -643,6 +643,28 @@ class SkydroidCameraControl:
         except Exception:
             return
 
+    def camera_has_torch(self) -> bool:
+        """A torch the rail switches: the V20 (row B27), or a camera whose file says it has one."""
+        try:
+            return getattr(self._adapter._profile, "torch", False) is True
+        except Exception:
+            return False
+
+    def camera_torch_on(self) -> bool:
+        try:
+            return self._adapter.torch_on() is True
+        except Exception:
+            return False
+
+    def camera_set_torch(self, on: bool) -> None:
+        if not self.camera_has_torch():
+            print("[VGCS:skydroid] torch: this camera has none (its camera file says so)")
+            return
+        try:
+            self._adapter.camera_torch_set(bool(on))
+        except Exception:
+            return
+
     def get_gimbal_status(self) -> GimbalStatus | None:
         try:
             st = self._adapter.get_status_cached()
@@ -1977,6 +1999,41 @@ def supports_m13_track(control: object | None) -> bool:
     return callable(getattr(primary, "set_gimbal_speed", None)) and callable(
         getattr(primary, "active_camera_profile", None)
     )
+
+
+def camera_has_torch(control: object | None) -> bool:
+    """A camera with a torch the rail switches (the V20, row B27). Only a real True counts, so a
+    stand-in's answer never shows the button."""
+    fn = getattr(resolve_camera_control_primary(control), "camera_has_torch", None)
+    if not callable(fn):
+        return False
+    try:
+        return fn() is True
+    except Exception:
+        return False
+
+
+def camera_torch_on(control: object | None) -> bool:
+    """The torch as it was last told (it says nothing back)."""
+    fn = getattr(resolve_camera_control_primary(control), "camera_torch_on", None)
+    if not callable(fn):
+        return False
+    try:
+        return fn() is True
+    except Exception:
+        return False
+
+
+def camera_set_torch(control: object | None, on: bool) -> bool:
+    """Switch the torch. False when the camera has none."""
+    primary = resolve_camera_control_primary(control)
+    if not camera_has_torch(primary):
+        return False
+    try:
+        primary.camera_set_torch(bool(on))
+    except Exception:
+        return False
+    return True
 
 
 def camera_has_laser_rangefinder(control: object | None) -> bool:

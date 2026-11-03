@@ -240,3 +240,18 @@ file(CONFIGURE OUTPUT ${TEAM_PASSWORD_DIR}/admin_password.inc @ONLY CONTENT
 ")
 target_include_directories(admin_password_team_test PRIVATE ${TEAM_PASSWORD_DIR})
 target_compile_definitions(admin_password_team_test PRIVATE VAMA_TEST_TEAM_PASSWORD="Team-Pass-For-Tests-42")
+
+# The app's license key (row A9): Ed25519 and the key rules against keys made by VGCS's own code
+# (../license_key_vectors.inc), and the app's lock. Overridable so a mutation check can build against
+# a modified copy.
+find_package(Qt6 REQUIRED COMPONENTS Quick)
+set(LICENSE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../../src CACHE PATH "Folder with LicenseKey.cc")
+add_executable(license_key_test
+    license_key_test.cc
+    ${LICENSE_SRC}/Ed25519.cc
+    ${LICENSE_SRC}/LicenseKey.cc
+    ${LICENSE_SRC}/VamaLicense.cc
+    ${LICENSE_SRC}/VamaLicense.h
+)
+target_include_directories(license_key_test PRIVATE ${LICENSE_SRC})
+target_link_libraries(license_key_test PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::Test)

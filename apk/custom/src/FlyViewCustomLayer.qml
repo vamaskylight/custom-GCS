@@ -541,6 +541,16 @@ Item {
                     }
                 }
             }
+            // VAMA (Nish 2026-11-03, row B27): the V20's torch. It says nothing back: yellow shows
+            // what was sent. The V20 has no laser or IR, so its column has four buttons.
+            IconButton {
+                objectName: "vamaTorchButton"
+                visible:    _link.camera.torch === true
+                icon:       _iconPath + "vama_torch.svg"
+                size:       _buttonSize
+                fill:       _link.torchOn ? Qt.rgba(0.95, 0.75, 0.1, 0.9) : Qt.rgba(0, 0, 0, 0.55)
+                onClicked:  _link.setTorch(!_link.torchOn)
+            }
             // Lock on an object: press, then draw a box around it on the video
             // (or tap it). Orange while locked; press again to stop.
             IconButton {

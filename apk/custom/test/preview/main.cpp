@@ -57,6 +57,9 @@
 //   42_proximity_view.png         the round proximity view's box: front and right within the range (B25, 2026-10-31)
 //   42b_proximity_view_moved.png  the same box, moved and made bigger by the user
 //   43_obstacle_range.png         the app menu's panel for the range of the round view
+//   44_license_lock.png           the license lock over the whole window: the RC's device code (row A9)
+//   44b_license_wrong.png         after a key for another RC: why it does not open the app
+//   44c_license_open.png          after the right key: the lock is gone, QGC's dialog under it takes taps
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
 // The lock is tried for real: the day picture is a look into a world that
@@ -81,6 +84,7 @@
 #include <QtCore/QJsonObject>
 #include <QtCore/QLoggingCategory>
 #include <QtCore/QMutex>
+#include <QtCore/QPointer>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QSettings>
 #include <QtCore/QThread>
@@ -119,8 +123,14 @@
 #include "ProximityStore.h"
 #include "SkydroidLink.h"
 #include "SkydroidTop.h"
+#include "VamaLicense.h"
 #include "VamaVoice.h"
 #include "Vehicle.h"
+
+// Keys and device codes made by VGCS's own rules (gen_license_vectors.py), for the license lock (row A9).
+namespace licenseVectors {
+#include "../license_key_vectors.inc"
+}
 
 // VGCS's thermal colour modes (made by apk/make_thermal_palettes.py).
 #include "../thermal_palette_vectors.inc"
@@ -703,6 +713,7 @@ public:
     bool recording = false;
     std::string sdCard = "03200076E4";  // free MB, then total MB: 12.5 GB free of 29.7 GB
     static constexpr const char *kNoSdCard = "0000000000";
+    QStringList texts;  // what came as text, not as a TOP frame: the V20's torch (row B27)
 
 signals:
     void lookChanged();
@@ -734,6 +745,10 @@ private slots:
             const QNetworkDatagram d = _socket.receiveDatagram();
             const std::string raw(d.data().constData(), static_cast<size_t>(d.data().size()));
             if (raw.rfind("#tp", 0) == 0) {
+                continue;
+            }
+            if (raw.rfind("AT+", 0) == 0) {
+                texts << QString::fromStdString(raw);
                 continue;
             }
             const auto f = top::parseTpFrame(raw);
@@ -1019,6 +1034,7 @@ int main(int argc, char *argv[])
     QSettings().remove(QStringLiteral("VamaVoice"));
     QSettings().remove(QStringLiteral("VamaProximity"));
     QSettings().remove(QStringLiteral("VamaProximityWindow"));  // the round view's place and size (B25)
+    QSettings().remove(QStringLiteral("VamaLicense"));          // the saved license key (row A9)
 
     const QString outDir = argc > 1 ? QString::fromLocal8Bit(argv[1]) : QDir::currentPath();
 
@@ -1095,6 +1111,15 @@ int main(int argc, char *argv[])
     voice.setLister([&voiceListsAsked]() { ++voiceListsAsked; });
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "VamaVoice", &voice);
     qmlRegisterSingletonInstance("QGroundControl", 1, 0, "QGroundControl", &global);
+    // The license lock (row A9): a stand-in RC (an ID and a day), the test key pair, and a clipboard of
+    // its own (the PC's is the developer's).
+    VamaLicense license(nullptr);
+    license.setAndroidId(QString::fromLatin1(licenseVectors::kDevices[0].androidId));
+    license.setPublicKey(QByteArray::fromHex(licenseVectors::kTestPublicKeyHex));
+    license.setToday(QDate(2026, 11, 4));
+    QString licenseClipboard;
+    license.setClipboard([&licenseClipboard]() { return licenseClipboard; },
+                         [&licenseClipboard](const QString &text) { licenseClipboard = text; });
 
     OverrideInterceptor interceptor;  // declared first: the engine must not outlive it
     QQmlApplicationEngine engine;
@@ -1739,6 +1764,45 @@ int main(int argc, char *argv[])
     int grabsBeforeNoFolder = 0;  // B14's step: no picture is grabbed without a save folder
     QPointF zoomTap;              // B10's steps: the same tap at 1x and at 2x
     double yawAt1x = 0.0;
+    // The license lock (row A9): license.qml stands in for QGC's main window under the lock. The lock is a
+    // popup, so its items are looked for in the window's items (the overlay), not its QObjects.
+    QQuickWindow *licenseWindow = nullptr;
+    QPointer<QObject> licenseLock;
+    auto licenseItem = [&](const char *objectName) -> QQuickItem * {
+        if (!licenseWindow) {
+            return nullptr;
+        }
+        QList<QQuickItem *> items;
+        collect(licenseWindow->contentItem(), items);
+        for (QQuickItem *item : std::as_const(items)) {
+            if (item->objectName() == QLatin1String(objectName)) {
+                return item;
+            }
+        }
+        return nullptr;
+    };
+    auto licenseShown = [&](const char *objectName) {
+        QQuickItem *item = licenseItem(objectName);
+        return item && item->isVisible();
+    };
+    auto licenseText = [&](const char *objectName) {
+        QQuickItem *item = licenseItem(objectName);
+        return item ? item->property("text").toString() : QStringLiteral("not there");
+    };
+    auto licenseTap = [&](const char *objectName) {
+        QQuickItem *item = licenseItem(objectName);
+        if (!item) {
+            std::fprintf(stderr, "%s not found in the license window\n", objectName);
+            ++g_problems;
+            return;
+        }
+        const QPointF centre = item->mapToScene(QPointF(item->width() / 2, item->height() / 2));
+        mouseOn(licenseWindow, QEvent::MouseButtonPress, centre);
+        mouseOn(licenseWindow, QEvent::MouseButtonRelease, centre);
+    };
+    const QString licenseDeviceCode = QString::fromLatin1(licenseVectors::kDevices[0].code);
+    const QString licenseKeyHere = QString::fromLatin1(licenseVectors::kKeys[0].key);
+    const QString licenseKeyElsewhere = QString::fromLatin1(licenseVectors::kKeys[3].key);  // for another RC
     const QList<std::pair<int, std::function<void()>>> steps = {
         {1500, [&]() {
              link.zoom(1);
@@ -3045,7 +3109,7 @@ int main(int argc, char *argv[])
          }},
         {400, [&]() {
              QStringList shown;
-             for (const char *button : {"vamaLaserButton", "vamaIrButton", "vamaZoomInButton"}) {
+             for (const char *button : {"vamaLaserButton", "vamaIrButton", "vamaZoomInButton", "vamaTorchButton"}) {
                  QQuickItem *item = findItem(button);
                  if (!item || item->isVisible()) {
                      shown.append(QString::fromLatin1(button));
@@ -3056,7 +3120,7 @@ int main(int argc, char *argv[])
              QQuickItem *photo = findItem("vamaPhotoButton");
              QQuickItem *record = findItem("vamaRecordButton");
              expect(shown.isEmpty() && lock && lock->isVisible() && photo && photo->isVisible() && record && record->isVisible(),
-                    "cameras: its screen has no laser, IR or zoom button, and still the lock, and photo and record for the copy on the RC",
+                    "cameras: its screen has no laser, IR, zoom or torch button, and still the lock, and photo and record for the copy on the RC",
                     shown.join(QStringLiteral(", ")));
              shot("33_plain_camera.png");
              // Deleted while in use: the V13 again, with the addresses as they are.
@@ -3115,6 +3179,67 @@ int main(int argc, char *argv[])
         {400, [&]() {
              expect(!QFile::exists(cameraFolder + QStringLiteral("/v20-copy.json")) && link.model() == QStringLiteral("C13"),
                     "cameras: the copy is deleted", link.model());
+             // The V20's torch (row B27): its box in the form, its button on the screen. A copy on
+             // 127.0.0.1 over UDP, so that the preview's stand-in camera gets the torch's text.
+             press("vamaCameraCopy_C20");
+         }},
+        {400, [&]() {
+             QQuickItem *torch = findItem("vamaCameraTorch");
+             expect(torch && torch->isVisible() && torch->property("checked").toBool(), "torch: a copy of the V20 has its torch ticked",
+                    QString());
+             setOn("vamaCameraTorch", "checked", false);  // saved both ways
+             setOn("vamaCameraHost", "text", QStringLiteral("127.0.0.1"));
+             setOn("vamaCameraPort", "text", QString::number(camera.port()));
+             setOn("vamaCameraTransport", "currentIndex", 0);
+             setOn("vamaCameraDayVideo", "text", QStringLiteral("rtsp://127.0.0.1:8554/v20"));
+             press("vamaCameraSave");
+         }},
+        {400, [&]() {
+             const QString file = cameraFolder + QStringLiteral("/v20-copy.json");
+             expect(cameraFileValue(file, "torch") == QJsonValue(false), "torch: Save writes an unticked torch into the file",
+                    cameraFileValue(file, "torch").toVariant().toString());
+             press("vamaCameraEdit_v20-copy");
+         }},
+        {400, [&]() {
+             QQuickItem *torch = findItem("vamaCameraTorch");
+             expect(torch && !torch->property("checked").toBool(), "torch: Change shows it unticked, as it was saved", QString());
+             setOn("vamaCameraTorch", "checked", true);
+             press("vamaCameraSave");
+         }},
+        {400, [&]() {
+             const QString file = cameraFolder + QStringLiteral("/v20-copy.json");
+             expect(cameraFileValue(file, "torch") == QJsonValue(true), "torch: and a ticked one", cameraTransport(file));
+             press("vamaCameraEditorClose");
+         }},
+        {300, [&]() {
+             SkydroidLink::setC20CameraPort(1);  // its camera port: nothing there, on 127.0.0.1
+             QMetaObject::invokeMethod(window->property("layer").value<QObject *>(), "_chooseCamera",
+                                       Q_ARG(QVariant, QVariant(QStringLiteral("v20-copy"))));
+         }},
+        {500, [&]() {
+             QQuickItem *button = findItem("vamaTorchButton");
+             expect(link.model() == QStringLiteral("v20-copy") && button && button->isVisible() && !link.torchOn(),
+                    "torch: a camera with one has the torch button, off at the start", link.model());
+             tap("vamaTorchButton");
+         }},
+        {400, [&]() {
+             expect(link.torchOn() && camera.texts.contains(QStringLiteral("AT+LED -t1\r\n")),
+                    "torch: a tap switches it on, by the text of Skydroid's SDK", camera.texts.join(QStringLiteral(" | ")).trimmed());
+             tap("vamaTorchButton");
+         }},
+        {400, [&]() {
+             expect(!link.torchOn() && camera.texts.contains(QStringLiteral("AT+LED -t0\r\n")), "torch: the next tap switches it off",
+                    camera.texts.join(QStringLiteral(" | ")).trimmed());
+             // Deleted while in use: the V13 again, with the addresses as they are.
+             QMetaObject::invokeMethod(window->property("layer").value<QObject *>(), "_openCameraEditor");
+         }},
+        {400, [&]() { tapFound("vamaCameraDelete_v20-copy"); }},
+        {300, [&]() { tapFound("vamaCameraDeleteYes"); }},
+        {400, [&]() {
+             SkydroidLink::setC20CameraPort(c20::kPort);
+             QQuickItem *button = findItem("vamaTorchButton");
+             expect(link.model() == QStringLiteral("C13") && link.host() == QStringLiteral("127.0.0.1") && button && !button->isVisible(),
+                    "torch: the V13 has no torch button", link.model());
              // A copy of the Viewpro A20KTR (task AK): the form shows its protocol and what that has.
              press("vamaCameraCopy_A20KTR");
          }},
@@ -3987,6 +4112,108 @@ int main(int argc, char *argv[])
                  shotOf(configWindow, "41c_vehicle_config_why.png");
                  configWindow->close();
              }
+         }},
+        // The license lock (row A9): the app opens only with a key made for this RC. The lock is made over
+        // the stand-in window as CustomPlugin::createRootWindow makes it over QGC's (VamaLicense::showLock).
+        {300, [&]() {
+             license.load();
+             const qsizetype windows = engine.rootObjects().size();
+             engine.load(QUrl::fromLocalFile(QStringLiteral(VAMA_PREVIEW_DIR "/license.qml")));
+             if (engine.rootObjects().size() == windows ||
+                 !(licenseWindow = qobject_cast<QQuickWindow *>(engine.rootObjects().last()))) {
+                 std::fprintf(stderr, "license window not loaded\n");
+                 ++g_problems;
+                 return;
+             }
+             licenseLock = license.showLock(&engine, licenseWindow);
+             expect(license.locked() && licenseLock, "license: without a key the app is locked, and the lock screen is made",
+                    QString());
+             // QGC opens its own dialogs at the start too (the first-run questions), after the lock.
+             QMetaObject::invokeMethod(licenseWindow, "openQgcDialog");
+         }},
+        {500, [&]() {
+             if (!licenseWindow || !licenseLock) {
+                 return;
+             }
+             const qreal width = licenseLock->property("width").toReal();
+             const qreal height = licenseLock->property("height").toReal();
+             expect(licenseLock->property("opened").toBool() && qFuzzyCompare(width, qreal(licenseWindow->width())) &&
+                        qFuzzyCompare(height, qreal(licenseWindow->height())),
+                    "license: the lock screen covers the whole window", QStringLiteral("%1 x %2").arg(width).arg(height));
+             expect(licenseText("vamaLicenseDeviceCode") == licenseDeviceCode,
+                    "license: it shows this RC's device code, as VGCS's rules make it", licenseText("vamaLicenseDeviceCode"));
+             expect(!licenseShown("vamaLicenseProblem"), "license: no words about a key before one is tried",
+                    licenseText("vamaLicenseProblem"));
+             shotOf(licenseWindow, "44_license_lock.png");
+             licenseTap("previewUnderTheLock");
+             licenseTap("vamaLicenseCopyButton");
+             if (QQuickItem *field = licenseItem("vamaLicenseKeyField")) {
+                 field->setProperty("text", licenseKeyElsewhere);
+             }
+             licenseTap("vamaLicenseActivateButton");
+         }},
+        {300, [&]() {
+             if (!licenseWindow) {
+                 return;
+             }
+             const int under = licenseWindow->property("pressesUnder").toInt();
+             expect(under == 0, "license: no tap reaches the screen or QGC's dialog under the lock, and its buttons work "
+                                "above a dialog opened after it", QString::number(under));
+             expect(licenseClipboard == licenseDeviceCode && licenseText("vamaLicenseCopyButton") == QStringLiteral("Copied"),
+                    "license: Copy puts the device code on the clipboard, and says so", licenseClipboard);
+             const QString why = licenseText("vamaLicenseProblem");
+             expect(licenseShown("vamaLicenseProblem") &&
+                        why == QStringLiteral("This key is for another RC. Send the device code above to VAMA for a key "
+                                              "for this one."),
+                    "license: a key for another RC is refused, and the lock says why", why);
+             expect(license.locked() && licenseLock, "license: and the app stays locked", QString());
+             shotOf(licenseWindow, "44b_license_wrong.png");
+             // QGC's question to close the app would open under the lock: the lock takes the back key. Sent
+             // to the lock's content itself: the stand-in window need not be the active one, and a key sent to
+             // an inactive window reaches no item and stays "accepted" (that once passed without the handler).
+             QQuickItem *content = licenseItem("vamaLicenseLockContent");
+             QKeyEvent back(QEvent::KeyPress, Qt::Key_Back, Qt::NoModifier);
+             if (content) {
+                 QCoreApplication::sendEvent(content, &back);
+             }
+             expect(content && back.isAccepted() && licenseLock && licenseLock->property("opened").toBool(),
+                    "license: the RC's back key is taken by the lock, which stays", QString());
+             licenseClipboard = QStringLiteral("\n") + licenseKeyHere + QStringLiteral("\n");  // as pasted from a message
+             licenseTap("vamaLicensePasteButton");
+         }},
+        {300, [&]() {
+             QQuickItem *field = licenseItem("vamaLicenseKeyField");
+             const QString text = field ? field->property("text").toString() : QStringLiteral("no field");
+             expect(text == licenseClipboard && !licenseShown("vamaLicenseProblem"),
+                    "license: Paste puts the key in the field, and the words about the last key go", text.trimmed().left(20));
+             licenseTap("vamaLicenseActivateButton");
+         }},
+        {300, [&]() {
+             expect(!license.locked() && licenseLock.isNull(), "license: the right key opens the app, and the lock screen goes",
+                    license.keySummary());
+             const QString saved = QSettings().value(QStringLiteral("VamaLicense/key")).toString();
+             expect(saved == licenseKeyHere, "license: the key is saved for the next start", saved.left(20));
+             licenseTap("previewQgcDialogButton");
+         }},
+        {300, [&]() {
+             if (!licenseWindow) {
+                 return;
+             }
+             const int under = licenseWindow->property("pressesUnder").toInt();
+             expect(under == 100, "license: then QGC's dialog takes taps", QString::number(under));
+             shotOf(licenseWindow, "44c_license_open.png");
+             QMetaObject::invokeMethod(licenseWindow, "closeQgcDialog");
+         }},
+        {300, [&]() {
+             licenseTap("previewUnderTheLock");
+         }},
+        {300, [&]() {
+             if (!licenseWindow) {
+                 return;
+             }
+             const int under = licenseWindow->property("pressesUnder").toInt();
+             expect(under == 101, "license: and so does the screen", QString::number(under));
+             licenseWindow->close();
          }},
         {100, [&]() { QCoreApplication::quit(); }},
     };

@@ -255,6 +255,13 @@ _GIT_CAM_FOLLOW_SVG = (
     '<circle cx="12" cy="12" r="2.2" fill="#e8edf8"/>'
     "</svg>"
 )
+# The camera's torch (`#camTorchBtn`, row B27): a hand torch, its light upwards.
+_GIT_CAM_TORCH_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<path d="M7 3h10v3l-2.5 4.5V20a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-9.5L7 6z" fill="#e8edf8"/>'
+    '<rect x="11" y="12.5" width="2" height="3.5" rx="1" fill="rgba(39,47,61,242)"/>'
+    "</svg>"
+)
 
 
 def _git_cam_icon_from_svg(svg_xml: str, logical_px: int = 22) -> QIcon:
@@ -394,7 +401,8 @@ QPushButton#camPhotoBtn:checked {
   border: 1px solid rgba(214, 224, 241, 230);
   background: rgba(27, 33, 45, 245);
 }
-QPushButton#camSplitBtn, QPushButton#camFollowBtn, QPushButton#camThermalBtn, QPushButton#camPaletteBtn {
+QPushButton#camSplitBtn, QPushButton#camFollowBtn, QPushButton#camThermalBtn, QPushButton#camPaletteBtn,
+QPushButton#camTorchBtn {
   width: 28px;
   height: 28px;
   min-width: 28px;
@@ -412,9 +420,13 @@ QPushButton#camSplitBtn, QPushButton#camFollowBtn, QPushButton#camThermalBtn, QP
   font-weight: 700;
 }
 QPushButton#camSplitBtn:hover, QPushButton#camFollowBtn:hover, QPushButton#camThermalBtn:hover,
-QPushButton#camPaletteBtn:hover {
+QPushButton#camPaletteBtn:hover, QPushButton#camTorchBtn:hover {
   background-color: rgba(40, 48, 62, 245);
   border-color: rgba(229, 237, 251, 85);
+}
+QPushButton#camTorchBtn:checked {
+  border: 1px solid rgba(255, 214, 92, 230);
+  background-color: rgba(70, 58, 18, 250);
 }
 QPushButton#camSplitBtn:checked, QPushButton#camFollowBtn:checked, QPushButton#camThermalBtn:checked {
   border: 1px solid rgba(105, 232, 111, 220);
@@ -1193,9 +1205,26 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         )
         self._btn_native_palette.hide()
 
+        # The camera's torch (row B27): only for a camera with one (_sync_native_torch_button).
+        self._btn_native_torch = QPushButton()
+        self._btn_native_torch.setObjectName("camTorchBtn")
+        self._btn_native_torch.setCheckable(True)
+        self._btn_native_torch.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_native_torch.setFixedSize(28, 28)
+        self._btn_native_torch.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._btn_native_torch.setToolTip("The camera's torch, on or off")
+        _it = _git_cam_icon_from_svg(_GIT_CAM_TORCH_SVG, _ico_main)
+        if _it.isNull():
+            self._btn_native_torch.setText("T")
+        else:
+            self._btn_native_torch.setIcon(_it)
+            self._btn_native_torch.setIconSize(QSize(_ico_main, _ico_main))
+        self._btn_native_torch.hide()
+
         ctr_layout.addWidget(self._btn_native_split, 0)
         ctr_layout.addWidget(self._btn_native_thermal, 0)
         ctr_layout.addWidget(self._btn_native_palette, 0)
+        ctr_layout.addWidget(self._btn_native_torch, 0)
         ctr_layout.addWidget(self._btn_native_follow, 0)
         self._lbl_camera_top_zoom = QLabel(_format_video_zoom_label(1.0))
         self._lbl_camera_top_zoom.setObjectName("camMagnificationLabel")
@@ -1692,6 +1721,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_native_split.toggled.connect(self._on_native_split_rail_toggled)
         self._btn_native_thermal.toggled.connect(self._on_native_thermal_feed_toggled)
         self._btn_native_palette.clicked.connect(self._on_native_palette_clicked)
+        self._btn_native_torch.toggled.connect(self._on_native_torch_toggled)
         self._btn_native_follow.toggled.connect(self._on_native_follow_rail_toggled)
         self._btn_native_record.clicked.connect(self._on_native_record_center_clicked)
         self._btn_native_record.toggled.connect(self._on_native_record_toggled)

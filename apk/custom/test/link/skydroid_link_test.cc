@@ -323,7 +323,20 @@ public:
     double pitch = -30.0;
     bool answerGac = true;
     bool splitReplies = false;  // each answer in two pieces, a moment apart
+    QByteArray textBeforeGac;   // text sent before each angle answer, which the link must skip (row B27)
     QStringList received;
+    QByteArray raw;             // every byte it got, text too (the torch, row B27)
+
+    /// Frames with this tag and control (TOP's CAP or REC write, 'w').
+    int countTag(const char *tag, char ctrl) const
+    {
+        int n = 0;
+        for (const QString &f : received) {
+            const auto frame = top::parseTpFrame(f.toStdString());
+            n += frame && frame->tag == tag && frame->ctrl == ctrl ? 1 : 0;
+        }
+        return n;
+    }
 
     int countStartingWith(const QString &prefix) const
     {
@@ -365,11 +378,15 @@ private:
             return;
         }
         const QByteArray data = _conn->readAll();
+        raw.append(data);
         _rx.append(data.constData(), static_cast<size_t>(data.size()));
-        for (const std::string &raw : top::takeFrames(_rx)) {
-            received << QString::fromStdString(raw);
-            const auto f = top::parseTpFrame(raw);
+        for (const std::string &frameText : top::takeFrames(_rx)) {
+            received << QString::fromStdString(frameText);
+            const auto f = top::parseTpFrame(frameText);
             if (f && f->tag == "GAC" && f->ctrl == 'r' && answerGac) {
+                if (!textBeforeGac.isEmpty()) {
+                    _conn->write(textBeforeGac);
+                }
                 _answer(gacFrame());
             }
         }
@@ -425,6 +442,9 @@ public:
     int zoom = 1;
     bool answer = true;     // answers a zoom question
     bool stopWorks = true;  // a stop stops the zoom
+    /// A photo or record command (row B26) gets a reply with this much payload: 32 or more is done
+    /// to Skydroid's SDK, less failed. -1: no reply.
+    int captureReplyPayload = 32;
     std::vector<c20::Bytes> received;
 
     int count(const c20::Bytes &packet) const { return static_cast<int>(std::count(received.begin(), received.end(), packet)); }
@@ -460,6 +480,11 @@ private:
                 c20::Bytes payload(16, 0);
                 payload[9] = static_cast<std::uint8_t>(zoom * 3 - 1);  // the middle of its band
                 const c20::Bytes reply = c20::packet(c20::kGroupZoom, c20::kCmdZoomRead, payload);
+                _conn->write(reinterpret_cast<const char *>(reply.data()), static_cast<qint64>(reply.size()));
+            } else if ((packet == c20::photo() || packet == c20::recordStart() || packet == c20::recordStop()) &&
+                       captureReplyPayload >= 0) {
+                const c20::Bytes reply = c20::packet(c20::kGroupCamera, c20::kCmdCapture,
+                                                     c20::Bytes(static_cast<std::size_t>(captureReplyPayload), 0x5A));
                 _conn->write(reinterpret_cast<const char *>(reply.data()), static_cast<qint64>(reply.size()));
             }
         }
@@ -1434,6 +1459,197 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(camera.count(c20::zoomQuery()) > asked, 2000);
         _link->zoom(1);
         QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::zoomIn()), 1, 1000);
+    }
+
+    // --- The C20's photos and recordings (row B26) and its torch (row B27), 2026-11-04 ---------
+    // On build 19 TOP's CAP and REC on 5000 made only the RC's copies. Skydroid's SDK sends them on
+    // the camera port, and takes a reply with 32 bytes of payload as done, a shorter one as failed.
+
+    static quint16 portNobodyListensOn()
+    {
+        QTcpServer server;
+        server.listen(QHostAddress::LocalHost, 0);
+        const quint16 port = server.serverPort();
+        server.close();
+        return port;
+    }
+
+    void c20PhotoGoesToItsCameraPortAndItsReplySaysDone()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::photo()), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 2000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("Photo taken. It is saved on the camera's SD card."));
+        QCOMPARE(notes.at(0).at(1).toBool(), false);
+        QCOMPARE(c20.countTag("CAP", 'w'), 0);  // not TOP's photo on 5000
+        QTest::qWait(3500);
+        QCOMPARE(notes.size(), 1);  // and no verdict after its time
+    }
+
+    void c20PhotoTheCameraRefusesOrDoesNotAnswer()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        camera.captureReplyPayload = 2;  // less than Skydroid's SDK takes as done
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 2000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("The camera did not take the photo."));
+        QCOMPARE(notes.at(0).at(1).toBool(), true);
+        camera.captureReplyPayload = -1;
+        _link->takePhoto();
+        QTest::qWait(2500);
+        QCOMPARE(notes.size(), 1);  // it waits 3 s for the reply
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 2000);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("The camera did not answer the photo command."));
+        QCOMPARE(camera.count(c20::photo()), 2);
+    }
+
+    void c20RecordStartsAndStopsOnItsCameraPort()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::recordStart()), 1, 1000);
+        QVERIFY(_link->recording());
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 2000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("Recording on the camera's SD card."));
+        QVERIFY(_link->recordingConfirmed());
+        // It is never asked whether it records: what it said stays ("REC", not "REC?"), where a TOP
+        // camera's answer is old after 5 s.
+        QTest::qWait(5600);
+        QVERIFY(_link->recording() && _link->recordingConfirmed());
+        QCOMPARE(c20.countTag("REC", 'w'), 0);  // not TOP's REC on 5000
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::recordStop()), 1, 1000);
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 2000);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("Recording stopped. The video is on the camera's SD card."));
+        QVERIFY(!_link->recording());
+        // The screen asks for what it shows: the packet again, to make sure, with no note.
+        _link->setRecord(false);
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::recordStop()), 2, 1000);
+        QTest::qWait(500);
+        QCOMPARE(notes.size(), 2);
+        QCOMPARE(camera.count(c20::recordStart()), 1);
+    }
+
+    void c20RecordTheCameraRefusesOrDoesNotAnswer()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        camera.captureReplyPayload = 0;
+        _link->toggleRecord();
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 1, 2000);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("Recording did not start."));
+        QVERIFY(!_link->recording());
+        camera.captureReplyPayload = -1;
+        _link->toggleRecord();
+        QVERIFY(_link->recording());  // as pressed, until it says otherwise
+        QTRY_COMPARE_WITH_TIMEOUT(notes.size(), 2, 4500);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("The camera was told to record. It does not say whether it does."));
+        QVERIFY(_link->recording() && !_link->recordingConfirmed());
+    }
+
+    void c20PhotoAndRecordWithoutItsCameraPortSaySo()
+    {
+        FakeTcpCamera c20;
+        SkydroidLink::setC20CameraPort(portNobodyListensOn());
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(_link->attitudeValid() && c20.connected(), 3000);
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->takePhoto();
+        QCOMPARE(notes.size(), 1);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("The app has no link to the camera's port 8100. The photo was not taken."));
+        QCOMPARE(notes.at(0).at(1).toBool(), true);
+        _link->toggleRecord();
+        QCOMPARE(notes.size(), 2);
+        QCOMPARE(notes.at(1).at(0).toString(), QString("The app has no link to the camera's port 8100. Recording did not start."));
+        QVERIFY(!_link->recording());
+        QCOMPARE(c20.countTag("CAP", 'w') + c20.countTag("REC", 'w'), 0);
+    }
+
+    void c20AnotherCameraEndsTheWaitForAReply()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        camera.captureReplyPayload = -1;
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->takePhoto();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.count(c20::photo()), 1, 1000);
+        _link->setModel("C13");
+        QTest::qWait(3500);
+        QCOMPARE(notes.size(), 0);  // no verdict for the camera that went
+    }
+
+    void c20TorchTextGoesOnTheGimbalConnection()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        QVERIFY(_link->camera().value("torch").toBool());
+        QVERIFY(!_link->torchOn());  // off at the start, as Skydroid's SDK
+        QSignalSpy changed(_link, &SkydroidLink::torchChanged);
+        _link->setTorch(true);
+        QTRY_VERIFY_WITH_TIMEOUT(c20.raw.contains("AT+LED -t1\r\n"), 1000);
+        QVERIFY(_link->torchOn());
+        QCOMPARE(changed.size(), 1);
+        _link->setTorch(false);
+        QTRY_VERIFY_WITH_TIMEOUT(c20.raw.contains("AT+LED -t0\r\n"), 1000);
+        QVERIFY(!_link->torchOn());
+        QCOMPARE(changed.size(), 2);
+        for (const c20::Bytes &packet : camera.received) {  // nothing of it on the camera port
+            QVERIFY(std::string(packet.begin(), packet.end()).find("AT+LED") == std::string::npos);
+        }
+        // A text answer on the gimbal connection is skipped: the angles still come.
+        c20.textBeforeGac = "OK\r\n";
+        c20.yaw = 21.5;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->gimbalYaw(), 21.5, 3000);
+        c20.textBeforeGac = "AT+ERROR\r\n#";  // and one that ends like the start of a frame
+        c20.yaw = -8.0;
+        QTRY_COMPARE_WITH_TIMEOUT(_link->gimbalYaw(), -8.0, 3000);
+    }
+
+    void c20TorchGoesOffWithItsCamera()
+    {
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        _link->setTorch(true);
+        QTRY_VERIFY_WITH_TIMEOUT(c20.raw.contains("AT+LED -t1\r\n"), 1000);
+        _link->setModel("C13");
+        QTRY_VERIFY_WITH_TIMEOUT(c20.raw.contains("AT+LED -t0\r\n"), 1000);
+        QVERIFY(!_link->torchOn());
+        // The C13 has none: nothing is sent, and the screen shows it off.
+        QVERIFY(!_link->camera().value("torch").toBool());
+        _camera->clear();
+        _link->setTorch(true);
+        QTest::qWait(400);
+        QVERIFY(!_link->torchOn());
+        for (const QString &frame : _camera->received) {
+            QVERIFY2(!frame.contains("AT+LED"), qPrintable(frame));
+        }
+    }
+
+    void c20TorchWithoutTheGimbalConnectionSaysSo()
+    {
+        _link->setModel("C20");
+        _link->setPort(portNobodyListensOn());
+        QSignalSpy notes(_link, &SkydroidLink::cameraNote);
+        _link->setTorch(true);
+        QCOMPARE(notes.size(), 1);
+        QCOMPARE(notes.at(0).at(0).toString(), QString("The app has no link to the camera. The torch was not switched."));
+        QVERIFY(!_link->torchOn());
     }
 
     void onlyTheC20UsesTheCameraPort()

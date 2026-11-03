@@ -139,6 +139,9 @@ constexpr int kRecordVerdictMs = 2600;
 constexpr int kRecordFreshMs = 5000;       // an older answer no longer confirms the state on screen
 // The camera echoes a command it takes ("Valid command: echoed back"), the photo's within this.
 constexpr int kPhotoVerdictMs = 1500;
+// A C20's reply to a photo or record command on its camera port (row B26), within this. Skydroid's
+// SDK waits for one too; its time is not known, and a recording may take a moment to start.
+constexpr int kC20CaptureVerdictMs = 3000;
 
 constexpr int kMotionIntervalMs = 100;   // speed refresh, 10 per second (VGCS: 80 ms)
 constexpr int kTouchLeaseMs = 450;       // no setTouchMotion this long = the finger is gone
@@ -423,6 +426,8 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _recordVerdictTimer.setInterval(kRecordVerdictMs);
     _photoVerdictTimer.setSingleShot(true);
     _photoVerdictTimer.setInterval(kPhotoVerdictMs);
+    _c20CaptureTimer.setSingleShot(true);
+    _c20CaptureTimer.setInterval(kC20CaptureVerdictMs);
     _tcpRetryTimer.setSingleShot(true);
     _tcpRetryTimer.setInterval(kTcpRetryMs);
     _tcpConnectTimer.setSingleShot(true);
@@ -451,6 +456,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_lockTimer, &QTimer::timeout, this, &SkydroidLink::_lockTick);
     connect(&_recordVerdictTimer, &QTimer::timeout, this, &SkydroidLink::_recordVerdict);
     connect(&_photoVerdictTimer, &QTimer::timeout, this, &SkydroidLink::_photoVerdict);
+    connect(&_c20CaptureTimer, &QTimer::timeout, this, &SkydroidLink::_c20CaptureVerdict);
     connect(&_tcpRetryTimer, &QTimer::timeout, this, &SkydroidLink::_syncTcp);
     connect(&_tcpConnectTimer, &QTimer::timeout, this, &SkydroidLink::_tcpLost);
     connect(&_c20PortRetryTimer, &QTimer::timeout, this, &SkydroidLink::_syncC20Port);
@@ -759,6 +765,13 @@ void SkydroidLink::_useCamera(const camera::Profile &profile, bool withAddresses
         _lensHomeTimer.stop();
     }
     _viewproLaserOff();  // a Viewpro's laser too, while it is still the camera
+    if (_torchOn) {
+        // And a torch, quietly (the link may be down): the next camera starts with it off, as
+        // Skydroid's SDK does.
+        _sendTo(_active, c20::torch(false));
+        _torchOn = false;
+        emit torchChanged();
+    }
     _videoWaitTimer.stop();  // another camera: its video is not the one that was waited for
     _dropVideoProbe();
     _camera = profile;
@@ -1367,6 +1380,9 @@ void SkydroidLink::_readC20Port()
                                      static_cast<qsizetype>(packet.size() - c20::kHeaderLen));
             _takeC20Zoom(*zoom, QString::fromLatin1(payload.toHex(' ').toUpper()));
         }
+        if (const std::optional<bool> done = c20::captureReplyOk(packet)) {
+            _c20CaptureAnswered(*done);
+        }
     }
 }
 
@@ -1633,8 +1649,9 @@ void SkydroidLink::_checkAnswering()
         _attitudeValid = false;
         emit attitudeChanged();
     }
-    // Old answers about the recording and the SD card no longer say how things are.
-    if (_recordReported && _recordReportAt.elapsed() >= kRecordFreshMs) {
+    // Old answers about the recording and the SD card no longer say how things are. A C20 is never
+    // asked (row B26): its reply to the press stays.
+    if (_recordReported && _recordReportAt.elapsed() >= kRecordFreshMs && _camera.zoom != camera::Zoom::C20) {
         _recordReported.reset();
         _setRecording(_recording);
     }
@@ -3560,6 +3577,10 @@ void SkydroidLink::takePhoto()
     if (!_camera.photo || !_socket) {
         return;
     }
+    if (_camera.zoom == camera::Zoom::C20) {
+        _sendC20Capture(C20Capture::Photo);  // TOP's CAP made only the RC's copy (row B26)
+        return;
+    }
     if (!_top()) {
         // Neither says that it took one (VGCS does not ask either).
         if (_camera.protocol == camera::Protocol::Viewpro) {
@@ -3594,6 +3615,15 @@ void SkydroidLink::toggleRecord()
 void SkydroidLink::setRecord(bool start)
 {
     if (!_camera.record || !_socket) {
+        return;
+    }
+    if (_camera.zoom == camera::Zoom::C20) {
+        // Its camera port (row B26): it takes no TOP REC, and is never asked whether it records.
+        if (start == _recording) {
+            _sendC20(start ? c20::recordStart() : c20::recordStop());  // to make sure, with no note
+        } else {
+            _sendC20Capture(start ? C20Capture::RecordStart : C20Capture::RecordStop);
+        }
         return;
     }
     if (_camera.protocol == camera::Protocol::Viewpro) {
@@ -3673,6 +3703,81 @@ void SkydroidLink::_recordVerdict()
                     true);
 }
 
+void SkydroidLink::_sendC20Capture(C20Capture what)
+{
+    const bool photo = what == C20Capture::Photo;
+    const bool start = what == C20Capture::RecordStart;
+    if (!_c20Port || _c20Port->state() != QAbstractSocket::ConnectedState) {
+        emit cameraNote(photo   ? tr("The app has no link to the camera's port 8100. The photo was not taken.")
+                        : start ? tr("The app has no link to the camera's port 8100. Recording did not start.")
+                                : tr("The app has no link to the camera's port 8100. Recording did not stop."),
+                        true);
+        return;
+    }
+    _sendC20(photo ? c20::photo() : start ? c20::recordStart() : c20::recordStop());
+    _c20Capture = what;  // an earlier press that still waits is not answered any more
+    _c20CaptureTimer.start();
+    if (!photo) {
+        _setRecording(start);  // the screen follows the press until the camera answers
+    }
+}
+
+void SkydroidLink::_c20CaptureAnswered(bool done)
+{
+    // Skydroid's SDK takes a reply with 32 bytes of payload or more as done, a shorter one as failed.
+    const C20Capture what = std::exchange(_c20Capture, C20Capture::None);
+    if (what == C20Capture::None) {
+        return;  // no press waits for it
+    }
+    _c20CaptureTimer.stop();
+    if (what == C20Capture::Photo) {
+        emit cameraNote(done ? tr("Photo taken. It is saved on the camera's SD card.") : tr("The camera did not take the photo."),
+                        !done);
+        return;
+    }
+    const bool start = what == C20Capture::RecordStart;
+    // What it said stays: it is never asked again (the freshness check in _checkAnswering leaves it).
+    _recordReported = done ? start : !start;
+    _recordReportAt.start();
+    _setRecording(*_recordReported);
+    if (start) {
+        emit cameraNote(done ? tr("Recording on the camera's SD card.") : tr("Recording did not start."), !done);
+    } else {
+        emit cameraNote(done ? tr("Recording stopped. The video is on the camera's SD card.")
+                             : tr("Recording did not stop. Press the button again."),
+                        !done);
+    }
+}
+
+void SkydroidLink::_c20CaptureVerdict()
+{
+    const C20Capture what = std::exchange(_c20Capture, C20Capture::None);
+    if (what == C20Capture::Photo) {
+        emit cameraNote(tr("The camera did not answer the photo command."), true);
+    } else if (what == C20Capture::RecordStart) {
+        emit cameraNote(tr("The camera was told to record. It does not say whether it does."), true);
+    } else if (what == C20Capture::RecordStop) {
+        emit cameraNote(tr("The camera was told to stop recording. It does not say whether it did."), true);
+    }
+}
+
+void SkydroidLink::setTorch(bool on)
+{
+    if (!_camera.torch || !_socket || !_top()) {
+        return;
+    }
+    // Skydroid's SDK writes this text on the gimbal connection and reads nothing back (row B27).
+    if (_camera.controlOverTcp() && !(_tcp && _tcp->state() == QAbstractSocket::ConnectedState)) {
+        emit cameraNote(tr("The app has no link to the camera. The torch was not switched."), true);
+        return;
+    }
+    _sendTo(_active, c20::torch(on));
+    if (on != _torchOn) {
+        _torchOn = on;
+        emit torchChanged();
+    }
+}
+
 void SkydroidLink::_setRecording(bool on)
 {
     const bool confirmed = _recordReported && *_recordReported == on;
@@ -3746,6 +3851,8 @@ void SkydroidLink::_forgetCameraReports()
     _recordVerdictTimer.stop();
     _photoWaiting = false;
     _photoVerdictTimer.stop();
+    _c20Capture = C20Capture::None;
+    _c20CaptureTimer.stop();
     _recordReported.reset();
     _setRecording(_recording);  // no longer confirmed
     const bool sdShown = _sdCard.has_value() || _sdCardAsked >= kSdCardSilentAsks;

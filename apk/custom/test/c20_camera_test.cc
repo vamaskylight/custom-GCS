@@ -73,6 +73,13 @@ int main()
     check(toHex(zoomStop()) == "0000000000002231000" "30B0101", "the SDK's stop");
     check(toHex(zoomQuery()) == "000000000000224A00020000", "the SDK's zoom read");
     check(kPort == 8100, "the camera port of the SDK's demo");
+    // Its takePicture, startRecordVideo, stopRecordVideo (row B26): 32 bytes, all zero but two.
+    const std::string zeros(60, '0');
+    check(toHex(photo()) == "00000000000033810020" "0A0C" + zeros, "the SDK's photo");
+    check(toHex(recordStart()) == "00000000000033810020" "0A0B" + zeros, "the SDK's record start");
+    check(toHex(recordStop()) == "00000000000033810020" "0A0A" + zeros, "the SDK's record stop");
+    // C20Gimbal.toggleLED (row B27): text, on the gimbal connection.
+    check(torch(true) == "AT+LED -t1\r\n" && torch(false) == "AT+LED -t0\r\n", "the SDK's torch text");
 
     for (const auto &v : kC20Packets) {
         Bytes got;
@@ -85,6 +92,15 @@ int main()
             got = zoomStop();
         } else if (name == "zoomQuery") {
             got = zoomQuery();
+        } else if (name == "photo") {
+            got = photo();
+        } else if (name == "recordStart") {
+            got = recordStart();
+        } else if (name == "recordStop") {
+            got = recordStop();
+        } else if (name == "torchOn" || name == "torchOff") {
+            const std::string text = torch(name == "torchOn");
+            got = Bytes(text.begin(), text.end());
         }
         check(toHex(got) == v.hex, std::string("as VGCS: ") + v.name);
     }
@@ -93,10 +109,15 @@ int main()
         const std::vector<Bytes> packets = splitPackets(fromHex(v.read));
         const std::vector<std::string> wantPackets = splitText(v.packets, '|');
         const std::vector<std::string> wantZooms = splitText(v.zooms, ',');
-        bool same = packets.size() == wantPackets.size() && packets.size() == wantZooms.size();
+        const std::vector<std::string> wantCaptures = splitText(v.captures, ',');
+        bool same = packets.size() == wantPackets.size() && packets.size() == wantZooms.size() &&
+                    packets.size() == wantCaptures.size();
         for (std::size_t i = 0; same && i < packets.size(); ++i) {
             const std::optional<int> zoom = zoomOfReply(packets[i]);
-            same = toHex(packets[i]) == wantPackets[i] && std::to_string(zoom.value_or(0)) == wantZooms[i];
+            const std::optional<bool> done = captureReplyOk(packets[i]);
+            const std::string capture = done ? (*done ? "1" : "0") : "-";
+            same = toHex(packets[i]) == wantPackets[i] && std::to_string(zoom.value_or(0)) == wantZooms[i] &&
+                   capture == wantCaptures[i];
         }
         check(same, std::string("as VGCS reads it: ") + v.name);
     }

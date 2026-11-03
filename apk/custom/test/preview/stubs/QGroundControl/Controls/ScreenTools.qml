@@ -12,4 +12,5 @@ QtObject {
     property real largeFontPointSize:     36
     property real defaultBorderRadius:    8
     property bool isMobile:               true
+    property string fixedFontFamily:      "Consolas"  // QGC's: the system's fixed-width font
 }

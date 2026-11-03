@@ -1,5 +1,7 @@
 #include "CameraProfile.h"
 
+#include "C20Camera.h"
+
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
 #include <QtCore/QFile>
@@ -182,7 +184,8 @@ QList<Profile> builtInProfiles()
     // no photo or recording command for the C20: they are on, to be tried on the camera. Its
     // zoom (row B10): neither the V13's step nor TOP's lens zoom (ZMC to M) moved it (client
     // 2026-10-27, 2026-10-30). Skydroid's RC SDK zooms it by binary packets on TCP 8100, its
-    // camera port, which also says the zoom (C20Camera.h): the "c20" zoom.
+    // camera port, which also says the zoom (C20Camera.h): the "c20" zoom. Its photos and
+    // recordings go there too (row B26). Its torch (row B27).
     Profile c20 = skydroid("C20", "V20");
     c20.tcp = true;
     c20.zoom = Zoom::C20;
@@ -194,6 +197,7 @@ QList<Profile> builtInProfiles()
     c20.pitchMaxDeg = 45.0;
     c20.yawLimitDeg = 150.0;
     c20.laser = false;
+    c20.torch = true;
     c20.ownTracker = false;
     c20.upperGimbalHeader = true;
 
@@ -349,6 +353,15 @@ QString problem(const Profile &p)
     default:
         return text("The protocol must be \"skydroid-top\", \"viewpro\" or \"siyi\".");
     }
+    // The client's own V20 file had 8100 as its control port (c20.txt, 2026-11-04): the gimbal
+    // frames would have gone to the camera port.
+    if (p.zoom == Zoom::C20 && p.port == c20::kPort) {
+        return text("A camera with the c20 zoom has its gimbal on the control port (5000 on a V20). "
+                    "The app opens its camera port %1 by itself.").arg(c20::kPort);
+    }
+    if (p.torch && p.protocol != Protocol::Top) {
+        return text("Only a Skydroid TOP camera has a torch the app can switch. Untick Torch.");
+    }
     if (p.protocol == Protocol::Siyi && p.laser) {
         return text("The app has no laser for a SIYI camera. Untick Laser.");
     }
@@ -454,6 +467,7 @@ QJsonObject toJson(const Profile &p)
     o[QStringLiteral("laserMaxM")] = p.laserMaxM;
     o[QStringLiteral("photo")] = p.photo;
     o[QStringLiteral("record")] = p.record;
+    o[QStringLiteral("torch")] = p.torch;
     o[QStringLiteral("ownTracker")] = p.ownTracker;
     o[QStringLiteral("upperGimbalHeader")] = p.upperGimbalHeader;
     return o;
@@ -581,6 +595,8 @@ std::optional<Profile> fromJson(const QJsonObject &json, const QString &id, QStr
     }
     p.photo = flag("photo", true);
     p.record = flag("record", true);
+    // Files from before row B27 have none: a camera with the c20 zoom is a V20, which has one.
+    p.torch = flag("torch", p.zoom == Zoom::C20);
     p.ownTracker = flag("ownTracker", true);
     p.upperGimbalHeader = flag("upperGimbalHeader", false);
     if (!missing.isEmpty()) {

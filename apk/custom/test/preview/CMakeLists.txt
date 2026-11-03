@@ -61,6 +61,11 @@ add_executable(vama_preview
     # The obstacle sensor's store, for the bars on the screen (B19).
     ${CUSTOM_DIR}/src/ProximityStore.cc
     ${CUSTOM_DIR}/src/ProximityStore.h
+    # The license lock (row A9): the app's own lock, made as the app makes it, on a stand-in RC.
+    ${CUSTOM_DIR}/src/Ed25519.cc
+    ${CUSTOM_DIR}/src/LicenseKey.cc
+    ${CUSTOM_DIR}/src/VamaLicense.cc
+    ${CUSTOM_DIR}/src/VamaLicense.h
     # The app's own resources: the QML override path and the icons.
     ${CUSTOM_DIR}/custom.qrc
     # QGC's tinting for QGCColoredImage, as in the app.

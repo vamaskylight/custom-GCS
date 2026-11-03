@@ -302,16 +302,21 @@ class MainWindowLinkMixin:
             )
             self._wire_camera_control(cc)
             ah, ap, pid = cc._adapter.active_endpoint()
-            tried = ", ".join(getattr(cc._adapter, "_hosts", [])[:5])
+            # A TCP camera (the C20) has one address and no probe: the client's log said UDP for it
+            # (c20.txt, 2026-11-04).
+            over = "TCP" if cc._adapter._one_address() else "UDP"
+            if over == "TCP":
+                where = "one address, no probe"
+            else:
+                where = "probe hosts: " + ", ".join(getattr(cc._adapter, "_hosts", [])[:5])
             self._append_log(
-                f"Camera control: Skydroid TOP UDP {ah}:{ap} profile={pid} "
-                f"(probe hosts: {tried}; MAVLink mount fallback)"
+                f"Camera control: Skydroid TOP {over} {ah}:{ap} profile={pid} ({where}; MAVLink mount fallback)"
             )
             def _skydroid_gimbal_hint() -> None:
                 try:
                     if cc._adapter.gimbal_telemetry_ok():
                         ah2, ap2, pid2 = cc._adapter.active_endpoint()
-                        self._append_log(f"Skydroid gimbal OK: TOP UDP {ah2}:{ap2} profile={pid2}")
+                        self._append_log(f"Skydroid gimbal OK: TOP {over} {ah2}:{ap2} profile={pid2}")
                         return
                 except Exception:
                     pass

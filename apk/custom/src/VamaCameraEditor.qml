@@ -102,6 +102,7 @@ Popup {
         laserMaxField.text = String(f.laserMaxM)
         photoBox.checked = f.photo
         recordBox.checked = f.record
+        torchBox.checked = f.torch === true
         trackerBox.checked = f.ownTracker
         upperHeaderBox.checked = f.upperGimbalHeader
     }
@@ -144,6 +145,7 @@ Popup {
         f.laserMaxM = _number(laserMaxField.text)
         f.photo = photoBox.checked
         f.record = recordBox.checked
+        f.torch = torchBox.checked
         f.ownTracker = trackerBox.checked
         f.upperGimbalHeader = upperHeaderBox.checked
         var result = link.saveCamera(f)
@@ -471,6 +473,8 @@ Popup {
 
                 QGCCheckBox { id: photoBox; objectName: "vamaCameraPhoto"; text: qsTr("Photo") }
                 QGCCheckBox { id: recordBox; objectName: "vamaCameraRecord"; text: qsTr("Video recording") }
+                // The V20's (row B27): a Skydroid TOP camera only (CameraProfile.h).
+                QGCCheckBox { id: torchBox; objectName: "vamaCameraTorch"; text: qsTr("Torch"); visible: root._top }
 
                 QGCCheckBox { id: trackerBox; objectName: "vamaCameraOwnTracker"; text: qsTr("Its own object tracker"); visible: root._top }
                 QGCCheckBox { id: upperHeaderBox; text: qsTr("Upper-case gimbal frames only (as the V14 Pro)"); visible: root._top }

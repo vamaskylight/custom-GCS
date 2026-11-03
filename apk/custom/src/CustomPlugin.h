@@ -13,6 +13,7 @@ class CustomPlugin;
 class CustomSettings;
 class MapPackLoader;
 class QQmlApplicationEngine;
+class VamaLicense;
 
 Q_DECLARE_LOGGING_CATEGORY(CustomLog)
 
@@ -76,6 +77,8 @@ public:
     void paletteOverride(const QString &colorName, QGCPalette::PaletteColorInfo_t &colorInfo) final;
     /// We override this so we can get access to QQmlApplicationEngine and use it to register our qml module
     QQmlApplicationEngine *createQmlApplicationEngine(QObject *parent) final;
+    /// QGC's main window, and over it the lock screen while this RC has no license key (row A9)
+    void createRootWindow(QQmlApplicationEngine *qmlEngine) final;
     /// Releases the url interceptor attached in createQmlApplicationEngine before the engine is destroyed
     void destroyQmlApplicationEngine(QQmlApplicationEngine *qmlEngine) final;
     /// Every DISTANCE_SENSOR to ProximityStore, for the obstacle radar on the map and the video (A7),
@@ -109,8 +112,10 @@ private slots:
 private:
     void _addSettingsEntry(const QString& title, const char* qmlFile, const char* iconFile = nullptr);
     void _hearPositionSource(Vehicle *vehicle, const mavlink_message_t &message);
+    void _holdLinksWhileLocked();
 
     CustomOptions *_options = nullptr;
+    VamaLicense *_license = nullptr;  // null where no key is needed (VamaLicense::required)
     QQmlApplicationEngine *_qmlEngine = nullptr;
     MapPackLoader *_mapPacks = nullptr;
     vama::AdminPassword _adminPassword{vama::builtInAdminSecret()};

@@ -421,6 +421,9 @@ class CameraEditorDialog(QDialog):
         self._record.setObjectName("cameraRecord")
         grid2.addWidget(self._photo, 6, 0)
         grid2.addWidget(self._record, 6, 1)
+        self._torch = QCheckBox("Torch")  # the V20's (row B27)
+        self._torch.setObjectName("cameraTorch")
+        grid2.addWidget(self._torch, 6, 2)
         self._own_tracker = QCheckBox("Its own object tracker")
         self._own_tracker.setObjectName("cameraOwnTracker")
         self._upper_header = QCheckBox("Upper-case gimbal frames only (as the V14 Pro)")
@@ -491,6 +494,7 @@ class CameraEditorDialog(QDialog):
         self._laser_max.setEnabled(cam.laser)
         self._photo.setChecked(cam.photo)
         self._record.setChecked(cam.record)
+        self._torch.setChecked(cam.torch)
         self._own_tracker.setChecked(cam.own_tracker)
         self._upper_header.setChecked(cam.upper_gimbal_header)
         self._show_zoom_fields()
@@ -589,6 +593,7 @@ class CameraEditorDialog(QDialog):
             "laserMaxM": _number(self._laser_max.text()),
             "photo": self._photo.isChecked(),
             "record": self._record.isChecked(),
+            "torch": self._torch.isChecked(),
             "ownTracker": self._own_tracker.isChecked(),
             "upperGimbalHeader": self._upper_header.isChecked(),
         }

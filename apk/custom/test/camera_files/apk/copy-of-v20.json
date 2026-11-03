@@ -26,6 +26,7 @@
     "thermalFovSure": false,
     "thermalFovV": 38.6,
     "thermalVideoUrl": "",
+    "torch": true,
     "transport": "tcp",
     "upperGimbalHeader": true,
     "yawLimit": 150,

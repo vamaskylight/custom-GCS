@@ -46,6 +46,9 @@ def status_text(result: CheckResult) -> str:
         return f"This key ended on {result.info.expires.isoformat()}. Ask VAMA for a new key."
     if result.status is Status.NO_MACHINE_ID:
         return NO_MACHINE_ID_TEXT
+    if result.status is Status.OTHER_PRODUCT:
+        return ("This key is for the Vama GCS app on an RC, not for VGCS. "
+                "Send the machine code above to VAMA for a key for this computer.")
     return ""
 
 

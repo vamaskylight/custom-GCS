@@ -27,6 +27,14 @@ the computer's clock back would also get past an end date.
 The check runs only in the packaged exe. Running from source ("python -m vgcs")
 is how developers work and has no check. VGCS_REQUIRE_LICENSE=1 turns it on
 there, to try it.
+
+The Vama GCS app on an RC has the same lock (row A9, asked 2026-11-03): an
+RC's device code, from Android's ANDROID_ID, and a key made for it with the
+same private key and tool. Each key names its product (its first byte, and
+the text its signature covers), so a VGCS key never opens the app and an app
+key never opens VGCS. The app's check is a C++ port of these rules
+(apk/custom/src/LicenseKey.cc), tested against keys made here
+(apk/custom/test/gen_license_vectors.py).
 """
 
 from __future__ import annotations
@@ -47,11 +55,14 @@ from vgcs.app import ed25519
 LICENSE_PUBLIC_KEY = bytes.fromhex("d5bd5e5523238b32d6b885a4006f36c1dacef1893e2fd7e439e89dc43ba12798")
 
 KEY_VERSION = 1
+APP_KEY_VERSION = 0x11  # the first byte of an app key: product 1, key version 1
 ALL_FEATURES = 0xFF
 FINGERPRINT_BYTES = 9
 
 _EPOCH = date(2026, 1, 1)  # dates in a key are days after this
 _SIGNED_PREFIX = b"VGCS license key v1\x00"
+_APP_SIGNED_PREFIX = b"VAMA app license key v1\x00"
+_APP_FINGERPRINT_PREFIX = b"VAMA app device code v1\x00android-id:"
 _PAYLOAD_BYTES = 1 + FINGERPRINT_BYTES + 2 + 2 + 2 + 1
 _SIGNATURE_BYTES = 64
 _KEY_BYTES = _PAYLOAD_BYTES + _SIGNATURE_BYTES
@@ -66,6 +77,26 @@ _LOOK_ALIKES = str.maketrans({"0": "O", "1": "I", "8": "B"})
 _PLACEHOLDER_UUID = bytes.fromhex("00020003000400050006000700080009")
 
 
+class Product(enum.Enum):
+    """What a key opens."""
+
+    VGCS = "vgcs"  # the VGCS exe on a laptop, by its machine code
+    APP = "app"    # the Vama GCS app on an RC, by its device code
+
+
+@dataclass(frozen=True)
+class _Rules:
+    version: int          # the key's first byte
+    signed_prefix: bytes  # what the signature covers before the payload
+    code_check: bytes     # the code's last byte is a hash of this and the fingerprint
+
+
+_RULES = {
+    Product.VGCS: _Rules(KEY_VERSION, _SIGNED_PREFIX, b"VGCS machine code check\x00"),
+    Product.APP: _Rules(APP_KEY_VERSION, _APP_SIGNED_PREFIX, b"VAMA app device code check\x00"),
+}
+
+
 class Status(enum.Enum):
     OK = "ok"
     MISSING = "missing"              # no key entered yet
@@ -74,6 +105,7 @@ class Status(enum.Enum):
     WRONG_MACHINE = "wrong_machine"  # a real key, for another computer
     EXPIRED = "expired"
     NO_MACHINE_ID = "no_machine_id"  # this computer's ID cannot be read
+    OTHER_PRODUCT = "other_product"  # a real key, for the other product (VGCS or the app)
 
 
 @dataclass(frozen=True)
@@ -197,13 +229,30 @@ def machine_fingerprint(read_uuid=read_smbios_uuid, read_guid=read_machine_guid)
     return hashlib.sha256(b"VGCS machine code v1\x00" + source).digest()[:FINGERPRINT_BYTES]
 
 
-def _code_check(fingerprint: bytes) -> bytes:
-    return hashlib.sha256(b"VGCS machine code check\x00" + fingerprint).digest()[:1]
+def app_fingerprint(android_id: str) -> bytes | None:
+    """The 9 bytes that tie an app key to one RC, from Android's ANDROID_ID, or None without one.
+
+    ANDROID_ID differs for every RC, and on Android 8 and later also for every signing key, so
+    a test build and a customer build of the app have different device codes. A factory reset
+    changes it.
+    """
+    text = str(android_id or "").strip().lower()
+    if not text:
+        return None
+    return hashlib.sha256(_APP_FINGERPRINT_PREFIX + text.encode("utf-8")).digest()[:FINGERPRINT_BYTES]
 
 
-def machine_code(fingerprint: bytes) -> str:
-    """The code the user sends to VAMA: 16 characters in four groups."""
-    text = base64.b32encode(fingerprint + _code_check(fingerprint)).decode("ascii")
+def _code_check(fingerprint: bytes, product: Product = Product.VGCS) -> bytes:
+    return hashlib.sha256(_RULES[product].code_check + fingerprint).digest()[:1]
+
+
+def machine_code(fingerprint: bytes, product: Product = Product.VGCS) -> str:
+    """The code the user sends to VAMA: 16 characters in four groups.
+
+    For the app (Product.APP) it is the RC's device code, which has a check of its own: a laptop's
+    machine code is not a device code, nor the other way round, except by a 1 in 256 chance.
+    """
+    text = base64.b32encode(fingerprint + _code_check(fingerprint, product)).decode("ascii")
     return "-".join(text[i:i + 4] for i in range(0, 16, 4))
 
 
@@ -219,13 +268,13 @@ def _b32decode(text: str) -> bytes | None:
         return None
 
 
-def parse_machine_code(text: str) -> bytes | None:
-    """The fingerprint in a machine code, or None if it is mistyped."""
+def parse_machine_code(text: str, product: Product = Product.VGCS) -> bytes | None:
+    """The fingerprint in a machine code (or a device code), or None if it is mistyped."""
     raw = _b32decode(_normalise(text))
     if raw is None or len(raw) != FINGERPRINT_BYTES + 1:
         return None
     fingerprint, check = raw[:FINGERPRINT_BYTES], raw[FINGERPRINT_BYTES:]
-    return fingerprint if check == _code_check(fingerprint) else None
+    return fingerprint if check == _code_check(fingerprint, product) else None
 
 
 # --- Keys ------------------------------------------------------------------------
@@ -246,25 +295,35 @@ def make_key(
     issued: date,
     expires: date | None = None,
     features: int = ALL_FEATURES,
+    product: Product = Product.VGCS,
 ) -> str:
-    """A license key for one computer. Needs the private key: vendor side only."""
+    """A license key for one computer (or for the app, one RC). Needs the private key: vendor side only."""
     if len(fingerprint) != FINGERPRINT_BYTES:
         raise ValueError("fingerprint must be 9 bytes")
     if not 1 <= serial <= 0xFFFF:
         raise ValueError("serial must be 1 to 65535")
     if expires is not None and expires <= _EPOCH:
         raise ValueError("end date must be after 2026-01-01")
+    rules = _RULES[product]
     payload = (
-        bytes([KEY_VERSION])
+        bytes([rules.version])
         + fingerprint
         + serial.to_bytes(2, "big")
         + _day_number(issued).to_bytes(2, "big")
         + (_day_number(expires) if expires else 0).to_bytes(2, "big")
         + bytes([features & 0xFF])
     )
-    signature = ed25519.sign(secret, _SIGNED_PREFIX + payload)
+    signature = ed25519.sign(secret, rules.signed_prefix + payload)
     text = base64.b32encode(payload + signature).decode("ascii").rstrip("=")
     return "-".join(text[i:i + 5] for i in range(0, len(text), 5))
+
+
+def key_product(text: str) -> Product | None:
+    """Which product a complete key is for, by its first byte (not checked), or None."""
+    raw = _b32decode(_normalise(text))
+    if raw is None or len(raw) != _KEY_BYTES:
+        return None
+    return next((product for product, rules in _RULES.items() if rules.version == raw[0]), None)
 
 
 def check_key(
@@ -273,20 +332,30 @@ def check_key(
     *,
     today: date | None = None,
     public_key: bytes | None = None,
+    product: Product = Product.VGCS,
 ) -> CheckResult:
-    """Whether a key may run VGCS on the computer with this fingerprint."""
+    """Whether a key may run VGCS on the computer with this fingerprint (or the app on the RC)."""
     if fingerprint is None:
         return CheckResult(Status.NO_MACHINE_ID)
     normalised = _normalise(text)
     if not normalised:
         return CheckResult(Status.MISSING)
     raw = _b32decode(normalised)
-    if raw is None or len(raw) != _KEY_BYTES or raw[0] != KEY_VERSION:
+    if raw is None or len(raw) != _KEY_BYTES:
         return CheckResult(Status.DAMAGED)
     payload, signature = raw[:_PAYLOAD_BYTES], raw[_PAYLOAD_BYTES:]
     key = LICENSE_PUBLIC_KEY if public_key is None else public_key
+    rules = _RULES[product]
+    if raw[0] != rules.version:
+        other = key_product(normalised)
+        if other is None:
+            return CheckResult(Status.DAMAGED)
+        # Said only of a key VAMA really made, and without what it is for.
+        if ed25519.verify(key, _RULES[other].signed_prefix + payload, signature):
+            return CheckResult(Status.OTHER_PRODUCT)
+        return CheckResult(Status.INVALID)
     # The signature first: a made-up key must never be told which computer it is for.
-    if not ed25519.verify(key, _SIGNED_PREFIX + payload, signature):
+    if not ed25519.verify(key, rules.signed_prefix + payload, signature):
         return CheckResult(Status.INVALID)
     expires_day = int.from_bytes(payload[14:16], "big")
     info = LicenseInfo(

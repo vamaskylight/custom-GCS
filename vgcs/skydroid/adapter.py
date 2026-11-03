@@ -167,6 +167,8 @@ _C20_HOME_S = 30.0
 _C20_ASK_AFTER_STOP_S = 0.35
 _C20_HOME_ASK_S = 0.25
 _C20_ASK_EVERY_S = 2.0
+# A photo or record command on its camera port (row B26): the log says its answer after this long.
+_C20_CAPTURE_WAIT_S = 3.0
 _LRF_REPOINT_AFTER_S = 4.0
 _LRF_GIMBAL_SLEW_SPEED_DPS = 2.0
 _LRF_GIMBAL_HOLD_REFRESH_S = 0.08
@@ -357,6 +359,8 @@ class SkydroidTopUdpAdapter:
         self._c20_port: c20_camera.C20CameraPort | None = None
         self._c20_moved_mono = 0.0
         self._c20_ask_due_mono = 0.0
+        # The V20's torch (row B27): as it was last told, off at the start (it says nothing back).
+        self._torch_on = False
         port_i = int(port)
         if port_i not in _C13_PROBE_PORTS:
             try:
@@ -3927,8 +3931,12 @@ class SkydroidTopUdpAdapter:
         """Start (REC 01) or stop (REC 00) the camera's own recording to its SD card.
 
         Until 2026-10-26 every call sent REC 01, so a stop never stopped the camera (task AL).
+        A C20 takes it on its camera port instead (row B26).
         """
         self._camera_record_on = bool(on)
+        if self.zoom_is_c20_port():
+            self._enqueue(["C20_CAPTURE"], {"what": "record start" if on else "record stop"}, False)
+            return
         self._enqueue(self._profile.camera_commands.get("record_toggle", []), {"on": bool(on)}, True)
 
     def camera_record_toggle(self) -> None:
@@ -3936,7 +3944,32 @@ class SkydroidTopUdpAdapter:
         self.camera_record_set(not bool(getattr(self, "_camera_record_on", False)))
 
     def camera_photo(self) -> None:
+        if self.zoom_is_c20_port():
+            self._enqueue(["C20_CAPTURE"], {"what": "photo"}, False)  # its camera port (row B26)
+            return
         self._enqueue(self._profile.camera_commands.get("photo", []), {}, True)
+
+    def camera_torch_set(self, on: bool) -> None:
+        """Switch the torch (the V20, row B27). Skydroid's SDK writes it as text on the gimbal
+        connection (``C20Gimbal.toggleLED``) and reads nothing back."""
+        self._torch_on = bool(on)
+        self._enqueue(["TORCH"], {"on": bool(on)}, False)
+
+    def torch_on(self) -> bool:
+        """The torch as it was last told (off at the start)."""
+        return bool(self._torch_on)
+
+    def _send_torch(self, on: bool) -> None:
+        self._ensure_active_transport()
+        host, port = self._transport._host, self._transport._port
+        word = "on" if on else "off"
+        try:
+            self._transport.send_and_receive(
+                c20_camera.build_torch(on), expect_reply=False, log=True, timeout_s=0.05, host=host, port=port)
+        except Exception as ex:
+            print(f"[VGCS:skydroid] torch {word}: not sent ({ex!r}) host={host}:{port}", flush=True)
+            return
+        print(f"[VGCS:skydroid] torch {word} host={host}:{port}", flush=True)
 
     def camera_zoom(self, level: float) -> None:
         if self.zoom_is_lens_pulse() or self.zoom_is_c20_port():
@@ -4059,7 +4092,7 @@ class SkydroidTopUdpAdapter:
             port.start()
             self._c20_port = port
 
-    def _c20_send(self, packet: bytes, *, what: str = "") -> None:
+    def _c20_send(self, packet: bytes, *, what: str = "") -> bool:
         port = self._c20_port
         sent = port is not None and port.send(packet)
         if what:
@@ -4067,6 +4100,36 @@ class SkydroidTopUdpAdapter:
                 print(f"[VGCS:skydroid] C20 camera port: {what}{'' if sent else ' (not connected)'}", flush=True)
             except Exception:
                 pass
+        return sent
+
+    def _c20_capture(self, what: str) -> None:
+        """A photo, a record start or a record stop on its camera port (row B26). The log says
+        its answer as Skydroid's SDK reads it: done, failed, or none."""
+        packet = {
+            "photo": c20_camera.build_photo(),
+            "record start": c20_camera.build_record_start(),
+        }.get(what, c20_camera.build_record_stop())
+        port = self._c20_port
+        before = port.capture_replies()[0] if port is not None else 0
+        if not self._c20_send(packet, what=what) or port is None:
+            return
+
+        def answer() -> None:
+            count, done, raw = port.capture_replies()
+            if count == before:
+                text = f"no answer in {_C20_CAPTURE_WAIT_S:g} s"
+            elif done:
+                text = f"done, the camera says ({raw})"
+            else:
+                text = f"the camera answered with less than Skydroid's SDK takes as done ({raw})"
+            try:
+                print(f"[VGCS:skydroid] C20 camera port: {what}: {text}", flush=True)
+            except Exception:
+                pass
+
+        timer = threading.Timer(_C20_CAPTURE_WAIT_S, answer)
+        timer.daemon = True
+        timer.start()
 
     def _c20_ask_if_due(self) -> None:
         """Its zoom every _C20_ASK_EVERY_S from the status loop (Skydroid's own app can zoom it too)."""
@@ -4738,6 +4801,12 @@ class SkydroidTopUdpAdapter:
                 continue
             if commands and commands[0] == "C20_ASK":
                 self._c20_send(c20_camera.build_zoom_query())
+                continue
+            if commands and commands[0] == "C20_CAPTURE":
+                self._c20_capture(str(params.get("what", "") or ""))
+                continue
+            if commands and commands[0] == "TORCH":
+                self._send_torch(bool(params.get("on", False)))
                 continue
             if commands and commands[0] == "GSY_GSP_SPLIT":
                 try:

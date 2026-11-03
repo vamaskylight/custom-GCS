@@ -131,6 +131,12 @@ set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/CustomPlugin.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/AdminPassword.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/AdminPassword.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Ed25519.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Ed25519.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/LicenseKey.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/LicenseKey.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/VamaLicense.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/VamaLicense.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ProximityStore.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ProximityStore.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/PositionSource.cc

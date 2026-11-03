@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from vgcs.skydroid.c20_camera import PORT as C20_CAMERA_PORT
 from vgcs.skydroid.command_map import (
     SKYDROID_PROFILES,
     ZOOM_MODEL_COMMANDED_OPTICAL,
@@ -142,6 +143,7 @@ class Camera:
     # Other features
     photo: bool = True
     record: bool = True
+    torch: bool = False  # a torch the rail switches, by text on the TOP connection (the V20, row B27)
     own_tracker: bool = True  # the camera's own tracker (else VGCS follows in software)
     # A detail of the protocol: every gimbal frame with the upper-case "#TP" header (C14 Pro).
     upper_gimbal_header: bool = False
@@ -202,6 +204,7 @@ def built_in_cameras() -> list[Camera]:
         # 58.3 x 34.9 at 1x (1080p), -90 to +45 degrees, 150 either way, no laser, no thermal
         # picture, its day video as the client's own camera file had it (2026-10-22). Its zoom
         # (row B10) is on its camera port, TCP 8100, which says the zoom (Skydroid's RC SDK): "c20".
+        # Its photos and recordings go there too (row B26). Its torch (row B27).
         replace(
             _skydroid("C20", "V20"),
             transport=TRANSPORT_TCP,
@@ -214,6 +217,7 @@ def built_in_cameras() -> list[Camera]:
             pitch_max_deg=45.0,
             yaw_limit_deg=150.0,
             laser=False,
+            torch=True,
             own_tracker=False,
             upper_gimbal_header=True,
         ),
@@ -334,6 +338,13 @@ def problem(cam: Camera) -> str:
             PROTOCOL_VIEWPRO: "A VPro camera's zoom is none or live.",
             PROTOCOL_SIYI: "A SIYI camera's zoom is none or pulse.",
         }[cam.protocol]
+    # The client's own V20 file had 8100 as its control port (c20.txt, 2026-11-04): the gimbal
+    # frames would have gone to the camera port.
+    if cam.zoom == ZOOM_C20 and cam.port == C20_CAMERA_PORT:
+        return ("A camera with the c20 zoom has its gimbal on the control port (5000 on a V20). "
+                f"The app opens its camera port {C20_CAMERA_PORT} by itself.")
+    if cam.torch and cam.protocol != PROTOCOL_TOP:
+        return "Only a Skydroid TOP camera has a torch the app can switch. Untick Torch."
     if cam.protocol == PROTOCOL_SIYI and cam.laser:
         return "The app has no laser for a SIYI camera. Untick Laser."
     if cam.protocol != PROTOCOL_TOP:
@@ -434,6 +445,7 @@ def to_json(cam: Camera) -> dict[str, Any]:
         "laserMaxM": _finite(cam.laser_max_m),
         "photo": cam.photo,
         "record": cam.record,
+        "torch": cam.torch,
         "ownTracker": cam.own_tracker,
         "upperGimbalHeader": cam.upper_gimbal_header,
     }
@@ -553,6 +565,8 @@ def from_json(data: Any, camera_id: str) -> tuple[Camera | None, str]:
         laser_max_m=number("laserMaxM") if laser else 1000.0,
         photo=flag("photo", True),
         record=flag("record", True),
+        # Files from before row B27 have none: a camera with the c20 zoom is a V20, which has one.
+        torch=flag("torch", zoom == ZOOM_C20),
         own_tracker=flag("ownTracker", True),
         upper_gimbal_header=flag("upperGimbalHeader", False),
     )
@@ -796,6 +810,7 @@ def command_profile(cam: Camera) -> SkydroidCommandProfile:
         photo=bool(cam.photo),
         record=bool(cam.record),
         transport=cam.transport if cam.transport in TRANSPORTS else TRANSPORT_UDP,
+        torch=bool(cam.torch),
     )
 
 

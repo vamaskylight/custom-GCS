@@ -148,6 +148,7 @@ private slots:
     void theZoomIsTheOldOne();
     void aFileGivesTheSameCameraBack();
     void theTransportIsInTheFile();
+    void theTorchIsInTheFile();
     void theEditorsFieldsNeedNoFormat();
     void wrongValuesAreRefusedWithASentence();
     void eachProtocolHasItsZoomsAndFeatures();
@@ -427,6 +428,44 @@ void CameraProfileTest::theTransportIsInTheFile()
     viewpro[QStringLiteral("transport")] = QStringLiteral("serial");
     QVERIFY(!camera::fromJson(viewpro, QStringLiteral("v"), &why).has_value());
     QCOMPARE(why, QStringLiteral("its transport is not \"udp\" or \"tcp\"."));
+}
+
+void CameraProfileTest::theTorchIsInTheFile()
+{
+    // Row B27: the V20 has one, the others none.
+    const QList<Profile> all = camera::builtInProfiles();
+    for (const Profile &p : all) {
+        QCOMPARE(p.torch, p.id == QStringLiteral("C20"));
+        QCOMPARE(camera::toJson(p).value(QStringLiteral("torch")).toBool(), p.torch);
+    }
+    // A file from before row B27 has none: a camera with the c20 zoom is a V20, which has one.
+    QString why;
+    for (const int i : {1, 3}) {
+        QJsonObject old = camera::toJson(all.at(i));
+        old.remove(QStringLiteral("torch"));
+        const std::optional<Profile> p = camera::fromJson(old, QStringLiteral("old"), &why);
+        QVERIFY2(p.has_value(), qPrintable(why));
+        QCOMPARE(p->torch, i == 3);
+    }
+    // The editor's fields carry it.
+    QJsonObject fields = camera::toJson(all.at(1));
+    fields[QStringLiteral("torch")] = true;
+    fields[QStringLiteral("id")] = QString();
+    const std::optional<Profile> withTorch = camera::fromFields(fields, &why);
+    QVERIFY2(withTorch.has_value() && withTorch->torch, qPrintable(why));
+    // Only a TOP camera: its text goes on TOP's connection. VGCS's sentences.
+    for (const int i : {4, 5}) {
+        Profile other = all.at(i);
+        other.torch = true;
+        QCOMPARE(camera::problem(other), QStringLiteral("Only a Skydroid TOP camera has a torch the app can switch. Untick Torch."));
+    }
+    // The client's own V20 file had 8100, its camera port, as the control port (c20.txt, 2026-11-04).
+    Profile v20 = all.at(3);
+    v20.port = 8100;
+    QCOMPARE(camera::problem(v20), QStringLiteral("A camera with the c20 zoom has its gimbal on the control port "
+                                                  "(5000 on a V20). The app opens its camera port 8100 by itself."));
+    v20.zoom = Zoom::Pulse;  // TOP's lens zoom has no camera port: any port
+    QVERIFY2(camera::problem(v20).isEmpty(), qPrintable(camera::problem(v20)));
 }
 
 void CameraProfileTest::theEditorsFieldsNeedNoFormat()

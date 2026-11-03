@@ -105,6 +105,7 @@ struct Profile
     // Other features
     bool photo = true;
     bool record = true;
+    bool torch = false;         ///< a torch the screen switches, by text on the TOP connection (the V20, row B27)
     bool ownTracker = true;     ///< the camera's own tracker (object lock "The camera's own tracker")
 
     // A detail of the protocol: every gimbal frame with the upper-case "#TP" header (C14 Pro).

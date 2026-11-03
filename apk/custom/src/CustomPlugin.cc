@@ -6,6 +6,7 @@
 #include "AppSettings.h"
 #include "APMMavlinkStreamRateSettings.h"
 #include "FlightMapSettings.h"
+#include "LinkManager.h"
 #include "MapPackLoader.h"
 #include "MultiVehicleManager.h"
 #include "ParameterManager.h"
@@ -13,6 +14,7 @@
 #include "ProximityStore.h"
 #include "SettingsManager.h"
 #include "AudioOutput.h"
+#include "VamaLicense.h"
 #include "VamaVoice.h"
 #include "VamaVoiceEngine.h"
 #include "VideoSettings.h"
@@ -23,6 +25,7 @@
 #include <QtCore/QTimer>
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlFile>
+#include <QtQuick/QQuickWindow>
 #include <QtTextToSpeech/QTextToSpeech>
 
 QGC_LOGGING_CATEGORY(CustomLog, "Custom.CustomPlugin")
@@ -64,6 +67,17 @@ QGCCorePlugin *CustomPlugin::instance()
 void CustomPlugin::init()
 {
     QGCCorePlugin::init();
+
+    // VAMA (row A9, the client 2026-11-03): the app opens only on an RC with a license key made for
+    // it (VamaLicense.h). This runs before QGC starts its links. Without a key they wait, and the
+    // lock screen covers the app (createRootWindow).
+    if (VamaLicense::required()) {
+        _license = new VamaLicense(this);
+        _license->load();
+        if (_license->locked()) {
+            _holdLinksWhileLocked();
+        }
+    }
 
     // VAMA (client request 2026-10-08, task H): QGC 5.1.5 hides the whole "3D View"
     // settings page on Android (Viewer3DSettings). It comes back here, so the 3D view
@@ -382,6 +396,41 @@ QQmlApplicationEngine* CustomPlugin::createQmlApplicationEngine(QObject* parent)
     _qmlEngine->addUrlInterceptor(_urlInterceptor);
 
     return _qmlEngine;
+}
+
+void CustomPlugin::createRootWindow(QQmlApplicationEngine *qmlEngine)
+{
+    QGCCorePlugin::createRootWindow(qmlEngine);
+
+    // VAMA (row A9): over QGC's main window, the lock screen until a key opens the app.
+    if (_license && _license->locked()) {
+        QQuickWindow *window = qmlEngine->rootObjects().isEmpty()
+                                   ? nullptr
+                                   : qobject_cast<QQuickWindow *>(qmlEngine->rootObjects().constFirst());
+        if (!_license->showLock(qmlEngine, window)) {
+            qCWarning(CustomLog) << "No lock screen: the drone links stay held back.";
+        }
+    }
+}
+
+void CustomPlugin::_holdLinksWhileLocked()
+{
+    // QGC's own switch, as while it flashes firmware: no new link, auto-connect included.
+    LinkManager::instance()->setConnectionsSuspended(tr("this RC has no license key for the app"));
+    // The links saved with "connect at start" QGC opens without asking that switch, at the end of
+    // its start (QGCApplication::_initForNormalAppBoot). So they are closed again once the app runs,
+    // and so is every link a drone appears on while the lock is up.
+    const auto closeLinks = [this]() {
+        if (_license && _license->locked()) {
+            LinkManager::instance()->disconnectAll();
+        }
+    };
+    QTimer::singleShot(0, this, closeLinks);
+    (void) connect(MultiVehicleManager::instance(), &MultiVehicleManager::vehicleAdded, this,
+                   [this, closeLinks](Vehicle *) { QTimer::singleShot(0, this, closeLinks); });
+    // With a key, QGC's auto-connect makes the links again within a second, and reconnects those it
+    // had opened at the start (LinkManager::_reconnectAutoConnectLinks).
+    (void) connect(_license, &VamaLicense::unlocked, this, []() { LinkManager::instance()->setConnectionsAllowed(); });
 }
 
 void CustomPlugin::destroyQmlApplicationEngine(QQmlApplicationEngine *qmlEngine)

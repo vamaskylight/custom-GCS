@@ -1,4 +1,5 @@
-"""The Skydroid C20's camera port: its zoom (row B10, 2026-11-03).
+"""The Skydroid C20's camera port: its zoom (row B10, 2026-11-03), its photos and recordings
+(row B26, 2026-11-04), and the text that switches its torch (row B27).
 
 Skydroid's RC SDK (rcsdk 1.9.2 and 1.6.5, ``com.skydroid.rcsdk.common.payload.C20Camera``,
 read with javap) opens the C20's camera on TCP port 8100 of the camera's address, and its
@@ -9,7 +10,16 @@ frames that went to port 5000 never zoomed it (the client, 2026-10-27 and 2026-1
 
 The zoom moves while it is told to: start in or out, then stop. Its zoom can be read back
 (group 0x22, command 0x4A): the reply's payload byte 9 runs from 1 to 66, three values for
-each 1x (the SDK's ``getZoom``), so 1x to 22x. None of this is tried on a C20.
+each 1x (the SDK's ``getZoom``), so 1x to 22x. It zooms on the client's V20 (APK test build 19).
+
+A photo, a record start and a record stop are group 0x33, command 0x81, with 32 bytes of
+payload (the SDK's ``takePicture``, ``startRecordVideo``, ``stopRecordVideo``). TOP's CAP and
+REC on port 5000 only made the RC's own copies (the client, build 19). The SDK counts a reply
+with the same group and command and at least 32 bytes of payload as done, a shorter one as
+failed (``DataAbortException``), and none as a time-out. What the payload says it does not read.
+
+The torch is not on this port: ``C20Gimbal.toggleLED`` writes the text ``AT+LED -t1`` (on) or
+``AT+LED -t0`` (off) on the gimbal connection, port 5000, and reads nothing back.
 
 The app has the same in C++ (apk/custom/src/Skydroid/C20Camera.*), checked against this file
 by apk/custom/test/gen_c20_vectors.py.
@@ -31,6 +41,19 @@ CMD_ZOOM_READ = 0x4A
 ZOOM_MAX = 22
 # The SDK takes a zoom reply only with this much payload (its getZoom).
 ZOOM_READ_MIN_PAYLOAD = 16
+GROUP_CAMERA = 0x33
+CMD_CAPTURE = 0x81  # a photo, a record start, a record stop
+CAPTURE_PAYLOAD_LEN = 32
+# The SDK takes a reply to a photo or record command as done only with this much payload.
+CAPTURE_REPLY_MIN_PAYLOAD = 32
+_CAPTURE_PHOTO = 0x0C
+_CAPTURE_RECORD_START = 0x0B
+_CAPTURE_RECORD_STOP = 0x0A
+# A reply the SDK reads as one packet, and the payload it wants in it.
+_REPLY_MIN_PAYLOAD = {
+    (GROUP_ZOOM, CMD_ZOOM_READ): ZOOM_READ_MIN_PAYLOAD,
+    (GROUP_CAMERA, CMD_CAPTURE): CAPTURE_REPLY_MIN_PAYLOAD,
+}
 
 
 def build_packet(group: int, command: int, payload: bytes = b"") -> bytes:
@@ -57,20 +80,46 @@ def build_zoom_query() -> bytes:
     return build_packet(GROUP_ZOOM, CMD_ZOOM_READ, b"\x00\x00")
 
 
+def _build_capture(action: int) -> bytes:
+    """32 bytes of payload, all zero but 0x0A and the action (the SDK's own)."""
+    payload = bytearray(CAPTURE_PAYLOAD_LEN)
+    payload[0] = 0x0A
+    payload[1] = action
+    return build_packet(GROUP_CAMERA, CMD_CAPTURE, bytes(payload))
+
+
+def build_photo() -> bytes:
+    return _build_capture(_CAPTURE_PHOTO)
+
+
+def build_record_start() -> bytes:
+    return _build_capture(_CAPTURE_RECORD_START)
+
+
+def build_record_stop() -> bytes:
+    return _build_capture(_CAPTURE_RECORD_STOP)
+
+
+def build_torch(on: bool) -> bytes:
+    """The text that switches the torch, for the gimbal connection (port 5000), not this port."""
+    return b"AT+LED -t1\r\n" if on else b"AT+LED -t0\r\n"
+
+
 def split_packets(chunk: bytes) -> list[bytes]:
     """The packets in what one read brought, cut by their length.
 
     The SDK takes each read as one packet and never looks at the length. So a packet whose
-    length runs past the read, or a zoom reply that says less than its 16 bytes, takes the
-    rest of the read, as the SDK would. Less than a header at the end is dropped.
+    length runs past the read, or a reply that says less than the SDK wants in it (16 bytes for
+    a zoom, 32 for a photo or record), takes the rest of the read, as the SDK would. Less than
+    a header at the end is dropped.
     """
     out: list[bytes] = []
     i = 0
     while len(chunk) - i >= HEADER_LEN:
         length = (chunk[i + 8] << 8) | chunk[i + 9]
         end = i + HEADER_LEN + length
-        short_zoom = chunk[i + 6] == GROUP_ZOOM and chunk[i + 7] == CMD_ZOOM_READ and length < ZOOM_READ_MIN_PAYLOAD
-        if end > len(chunk) or short_zoom:
+        short = length < _REPLY_MIN_PAYLOAD.get((chunk[i + 6], chunk[i + 7]), 0)
+        if end > len(chunk) or short:
             out.append(bytes(chunk[i:]))
             break
         out.append(bytes(chunk[i:end]))
@@ -91,9 +140,17 @@ def zoom_of_reply(packet: bytes) -> int | None:
     return None
 
 
+def capture_reply_ok(packet: bytes) -> bool | None:
+    """What a reply to a photo or record command says, as the SDK reads it: True (done), False
+    (less than 32 bytes of payload, the SDK's failure), None (not such a reply)."""
+    if len(packet) < HEADER_LEN or packet[6] != GROUP_CAMERA or packet[7] != CMD_CAPTURE:
+        return None
+    return len(packet) - HEADER_LEN >= CAPTURE_REPLY_MIN_PAYLOAD
+
+
 class C20CameraPort:
-    """One TCP connection to the camera port while the C20 is in use, and its zoom as it
-    last said it.
+    """One TCP connection to the camera port while the C20 is in use, its zoom as it last said
+    it, and its replies to photo and record commands.
 
     A thread keeps the connection (tried again 2 s after a failure, said once in the log)
     and reads the replies. ``send`` never waits for a connection: a packet sent while there
@@ -115,6 +172,9 @@ class C20CameraPort:
         self._zoom_x: int | None = None
         self._zoom_mono = 0.0
         self._zoom_raw = ""
+        self._capture_count = 0  # replies to photo and record commands
+        self._capture_ok = False
+        self._capture_raw = ""
         self._said_cannot_connect = False
 
     @property
@@ -172,6 +232,12 @@ class C20CameraPort:
         with self._lock:
             return self._zoom_raw
 
+    def capture_replies(self) -> tuple[int, bool, str]:
+        """How many replies to photo and record commands came, whether the last one says done
+        (capture_reply_ok), and its payload in hex."""
+        with self._lock:
+            return self._capture_count, self._capture_ok, self._capture_raw
+
     # -----------------------------------------------------------------------
 
     def _loop(self) -> None:
@@ -210,6 +276,11 @@ class C20CameraPort:
                         self._zoom_x = zoom
                         self._zoom_mono = time.monotonic()
                         self._zoom_raw = packet[HEADER_LEN:].hex().upper()
+                    done = capture_reply_ok(packet)
+                    if done is not None:
+                        self._capture_count += 1
+                        self._capture_ok = done
+                        self._capture_raw = packet[HEADER_LEN:].hex().upper()
 
     def _connect(self) -> bool:
         try:

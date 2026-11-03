@@ -22,6 +22,7 @@
         <file alias="vama_photo.svg">res/Images/vama_photo.svg</file>
         <file alias="vama_record.svg">res/Images/vama_record.svg</file>
         <file alias="vama_settings.svg">res/Images/vama_settings.svg</file>
+        <file alias="vama_torch.svg">res/Images/vama_torch.svg</file>
         <file alias="vama_yaw_center.svg">res/Images/vama_yaw_center.svg</file>
         <file alias="vama_zoom_in.svg">res/Images/vama_zoom_in.svg</file>
         <file alias="vama_zoom_out.svg">res/Images/vama_zoom_out.svg</file>
@@ -52,6 +53,7 @@
         <file alias="QGroundControl/Toolbar/VamaObstacleRangePanel.qml">src/VamaObstacleRangePanel.qml</file>
         <file alias="QGroundControl/VehicleSetup/VehicleConfigView.qml">src/VehicleConfigView.qml</file>
         <file alias="QGroundControl/Toolbar/VehicleGPSIndicator.qml">src/VehicleGPSIndicator.qml</file>
+        <file alias="Vama/VamaLicenseLock.qml">src/VamaLicenseLock.qml</file>
     </qresource>
     <qresource prefix="/Custom/res">
         <file alias="QGCLogoFull.svg">res/Images/QGCLogoFull.svg</file>
