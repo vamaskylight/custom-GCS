@@ -7,4 +7,4 @@ moment of each picture. These flights are the data to train and test the picture
 Run it as ``python -m vama_recorder`` from the folder that holds this package. See RECORDER.md.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"  # 1.1.0 (2026-11-04): no GPS receiver (fix 0) is a PROBLEM in the bench check, and a warning in flight

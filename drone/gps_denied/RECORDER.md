@@ -103,11 +103,13 @@ sudo systemctl start vama-recorder
 
 Each line starts with OK, NOTE or PROBLEM. The last line says "All checks passed." when all is well.
 It also saves one test picture as `~/vama-flights/check.jpg`. Look at it: sharp, and nothing of the drone in it.
-"GPS: no 3D fix yet" indoors is normal.
+"NOTE GPS: the receiver is there, no 3D fix yet" indoors is normal.
+But "PROBLEM GPS: the flight controller sees no GPS receiver at all" is not: fix it before you fly (part 10). A flight without a GPS has no true positions, and is no use for the navigation.
 
 ## 8. Fly
 
 - Fly normal day flights. The recorder starts taking pictures when the drone is armed and above 30 m, and stops when it disarms.
+- Before take-off, wait until the flight controller has a 3D GPS fix. If the drone is armed without a GPS receiver or without a 3D fix, the recorder writes a warning in its log.
 - Fly over different ground: fields, villages, roads, water edges. Straight lines and turns.
 - Fly at the height you plan to use (500 m) when you can, and some flights lower.
 - Each flight is a new folder in `~/vama-flights` on the Pi, for example `003_2026-10-30_09-41-12Z` (the GPS time in UTC).
@@ -122,7 +124,7 @@ In each folder:
 | `images/` | The pictures, `000001.jpg` and on |
 | `frames.csv` | One row per picture: its time, the drone's position, heights, speed, heading and angles at that moment, the GPS fix, the flight mode |
 | `telemetry.jsonl` | All the flight controller's messages of that flight, to work the data again later |
-| `flight.json` | The settings, the camera, the start and the end |
+| `flight.json` | The settings, the camera, the start and the end, and how many pictures were taken without a 3D GPS fix (`frames_without_3d_gps_fix`, 0 in a good flight) |
 
 Please also tell me the camera model and the Cube port you used.
 
@@ -131,6 +133,7 @@ Please also tell me the camera model and the Cube port you used.
 - What the recorder says: `journalctl -u vama-recorder -f`, or the file `~/vama-flights/recorder.log`.
 - "no heartbeat from the flight controller": check that `device` is the port of pins 8 and 10 (on a Raspberry Pi 5 `/dev/ttyAMA0`, with the line of part 3, not `/dev/serial0`), the three wires (TX to RX, RX to TX), and `SERIALn_PROTOCOL` and `SERIALn_BAUD` on the Cube. The port's protocol must be MAVLink 2, not GPS.
 - "the recorder service is running": it holds the camera and the serial port. Stop it first, as in part 7.
+- "no GPS receiver at all" (fix 0): the flight controller does not see its GPS. Check the GPS cable, `GPS1_TYPE` 1 (auto; `GPS_TYPE` before ArduPilot 4.6), and that the GPS port's `SERIALn_PROTOCOL` is 5 (GPS). On your Brahma H7 the GPS port is SERIAL4, which was set to 2 on 31 October: set `SERIAL4_PROTOCOL` back to 5. Restart the flight controller, then run the bench check again. Outdoors it says "OK GPS: fix 3" after a minute or two.
 - "no camera found": check that no other program uses the camera, the ribbon cable, and `rpicam-hello --list-cameras`.
 - "the card is nearly full": copy the flights off the card and delete them on the Pi.
 - No pictures in a flight: the drone was below `start_height_m`, or the GPS height was not known yet.

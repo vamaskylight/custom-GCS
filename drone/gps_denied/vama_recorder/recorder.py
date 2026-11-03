@@ -26,6 +26,16 @@ log = logging.getLogger("vama_recorder")
 
 DISK_CHECK_NS = 5_000_000_000
 STATUS_EVERY_NS = 10_000_000_000
+GPS_AFTER_ARMING_NS = 2_000_000_000     # the GPS is judged this long after arming, once its messages are in
+
+# GPS_RAW_INT's fix_type: 0 is MAVLink's GPS_FIX_TYPE_NO_GPS, no receiver at all, not one that still waits for
+# satellites (1). The client's first flight (2026-11-03) had fix 0 from start to end, after a bench check that
+# called it "no 3D fix yet", which is normal indoors: its pictures got no true positions.
+GPS_FIX_NO_GPS = 0
+GPS_FIX_3D = 3
+
+GPS_RECEIVER_HELP = ("Check the GPS cable, GPS1_TYPE 1 (auto; GPS_TYPE before ArduPilot 4.6), and that the GPS "
+                     "port's SERIALn_PROTOCOL is 5 (GPS), then restart the flight controller")
 
 
 def disk_free_mb(folder: Path) -> int | None:
@@ -53,6 +63,36 @@ def recording_wanted(*, link_alive: bool, armed: bool, rel_alt_m: float | None, 
     return True, ""
 
 
+def gps_check_line(gps: dict | None) -> tuple[bool, str]:
+    """The bench check's line on the GPS, and True when it is a problem."""
+    if gps is None:
+        return False, "NOTE    GPS: no GPS_RAW_INT heard (see its line above)"
+    fix, sats = gps.get("fix"), gps.get("sats")
+    if fix == GPS_FIX_NO_GPS:
+        return True, ("PROBLEM GPS: the flight controller sees no GPS receiver at all (fix 0, not only no fix yet). "
+                      "A flight like that has no true positions and is no use for the navigation. "
+                      f"{GPS_RECEIVER_HELP}")
+    if fix is not None and fix >= GPS_FIX_3D:
+        return False, f"OK      GPS: fix {fix}, {sats} satellites"
+    return False, (f"NOTE    GPS: the receiver is there, no 3D fix yet (fix {fix}, {sats} satellites). "
+                   "Indoors that is normal; outdoors it comes after a minute or two")
+
+
+def armed_gps_warning(gps: dict | None) -> str:
+    """What the log says when the drone was armed without a GPS ready to give positions, else ""."""
+    if gps is None:
+        return "armed, but the flight controller sends no GPS_RAW_INT: its GPS is not known"
+    fix, sats = gps.get("fix"), gps.get("sats")
+    if fix == GPS_FIX_NO_GPS:
+        return ("armed with NO GPS RECEIVER (fix 0): the flight controller sees no GPS, so the pictures of this "
+                f"flight get no true positions and are no use for the navigation. {GPS_RECEIVER_HELP}, and run "
+                "the bench check before the next flight (RECORDER.md part 7)")
+    if fix is None or fix < GPS_FIX_3D:
+        return (f"armed without a 3D GPS fix (fix {fix}, {sats} satellites): the pictures' positions are not sure "
+                "until it has one. Wait for the fix before take-off")
+    return ""
+
+
 def _default_link_factory(*args, **kwargs):
     from .link import Link
     return Link(*args, **kwargs)
@@ -77,6 +117,9 @@ class Recorder:
         self.camera_errors = 0
         self.save_errors = 0
         self.why_not = ""
+        self.frames_without_3d_fix = 0        # in the flight now
+        self._was_armed = False
+        self._gps_check_at: int | None = None
 
     # --- the link's thread ------------------------------------------------------------------
 
@@ -134,6 +177,7 @@ class Recorder:
         if now >= self._next_disk:
             self._free = self._free_mb(self._root)
             self._next_disk = now + DISK_CHECK_NS
+        self._watch_arming(now)
         want, why = recording_wanted(link_alive=t.link_alive(now), armed=t.armed, rel_alt_m=t.rel_alt_now(now),
                                      start_height_m=s.start_height_m, free_mb=self._free,
                                      min_free_mb=s.min_free_mb, recording=self.flight is not None)
@@ -163,6 +207,20 @@ class Recorder:
             self._next_status = now + STATUS_EVERY_NS
         return True
 
+    def _watch_arming(self, now: int) -> None:
+        """Once in each arming, a little after it: a warning in the log when the GPS cannot give positions."""
+        armed = bool(self.telemetry.armed) and self.telemetry.link_alive(now)
+        if armed and not self._was_armed:
+            self._gps_check_at = now + GPS_AFTER_ARMING_NS
+        elif not armed:
+            self._gps_check_at = None
+        self._was_armed = armed
+        if self._gps_check_at is not None and now >= self._gps_check_at:
+            self._gps_check_at = None
+            warning = armed_gps_warning(self.telemetry.gps_now(now))
+            if warning:
+                log.warning(warning)
+
     def _open_flight(self, root: Path, now: int) -> None:
         t = self.telemetry
         boot = t.boot_ms_at(now)
@@ -179,7 +237,10 @@ class Recorder:
                                    "controller's clock; the row's state is interpolated there"}
         with self._flight_lock:
             self.flight = Flight(root, Flight.next_name(root, stamp), info)
-        log.info("flight %s started (height %s m)", self.flight.folder.name, t.rel_alt_now(now))
+        self.frames_without_3d_fix = 0
+        gps = t.gps_now(now) or {}
+        log.info("flight %s started (height %s m, GPS fix %s with %s satellites)", self.flight.folder.name,
+                 t.rel_alt_now(now), gps.get("fix"), gps.get("sats"))
 
     def _close_flight(self, now: int, reason: str) -> None:
         t = self.telemetry
@@ -189,9 +250,13 @@ class Recorder:
                 return
             flight.close(t, now, reason, {"clock_offset_ms_end": t.offset_ms(), "controller_restarts": t.clock.restarts,
                                           "messages_heard": dict(t.counts), "camera_errors": self.camera_errors,
-                                          "save_errors": self.save_errors})
+                                          "save_errors": self.save_errors,
+                                          "frames_without_3d_gps_fix": self.frames_without_3d_fix})
         self.flights_closed += 1
         log.info("flight %s ended: %s, %d pictures", flight.folder.name, reason, flight.frames)
+        if self.frames_without_3d_fix:
+            log.warning("flight %s: %d of its %d pictures were taken without a 3D GPS fix: their positions are not "
+                        "true", flight.folder.name, self.frames_without_3d_fix, flight.frames)
 
     def _take(self, now: int) -> None:
         t = self.telemetry
@@ -212,6 +277,8 @@ class Recorder:
             log.error("picture %s not saved: %s", image, exc)
             return
         self.flight.add_frame(image, shot, snapshot)
+        if (gps.get("fix") or 0) < GPS_FIX_3D:
+            self.frames_without_3d_fix += 1
 
     def _status(self, now: int, before: dict[str, int], free: int | None) -> dict[str, int]:
         t = self.telemetry
@@ -334,11 +401,10 @@ def check(settings: Settings, camera, link_factory: Callable | None = None, list
             else:
                 out(f"OK      {name}: {got:.1f} a second")
         now = clock()
-        gps = telemetry.gps_now(now) or {}
-        if gps.get("fix", 0) >= 3:
-            out(f"OK      GPS: fix {gps['fix']}, {gps.get('sats')} satellites")
-        else:
-            out(f"NOTE    GPS: no 3D fix yet (fix {gps.get('fix')}). Outdoors it comes after a minute or two")
+        gps_problem, gps_line = gps_check_line(telemetry.gps_now(now))
+        out(gps_line)
+        if gps_problem:
+            problems += 1
         offset = telemetry.offset_ms()
         out(f"OK      clock: the flight controller's time is known (offset {offset:.1f} ms)" if offset is not None
             else "PROBLEM clock: no time from the flight controller")
