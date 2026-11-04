@@ -28,8 +28,9 @@ The script:
 2. downloads the pinned FFmpeg build and checks its SHA-256,
 3. makes the exe icon from the VGCS logo,
 4. runs PyInstaller with `vgcs.spec`, which makes the folder `dist\VGCS`,
-5. packs that folder into the single `dist\VGCS.exe`,
-6. runs `VGCS.exe --selfcheck` and stops if any check fails.
+5. with a certificate only: signs `dist\VGCS\VGCS.exe` (see "Code signing" below),
+6. packs that folder into the single `dist\VGCS.exe`, and signs that too with a certificate,
+7. runs `VGCS.exe --selfcheck` and stops if any check fails.
 
 The first line VGCS prints names the git commit it was built from.
 If the build had uncommitted changes, it says "with local changes".
@@ -117,6 +118,37 @@ py -3.14 packaging\build_exe.py --customer
   The build checks that it is there, and that a test build has none.
 - The file is not in the repo and must never be. The hash can be read out of an exe, so the password must be long.
 - `VGCS.exe --selfcheck` says which password the exe has.
+
+### Code signing
+
+Without a signature, Windows names the publisher "Unknown", SmartScreen warns when a downloaded exe is first started, and antivirus programs trust the file less.
+With a code signing certificate, the build signs both exes: the inner `dist\VGCS\VGCS.exe` before it is packed, then the single `dist\VGCS.exe`.
+
+```
+py -3.14 packaging\build_exe.py --sign-cert THUMBPRINT
+```
+
+- The certificate: an OV or EV code signing certificate from a certificate authority, in the name Windows should show as the publisher (VAMA, or the developer).
+  Since June 2023 its private key must stay on a USB token or in the authority's cloud service, so it is no longer a plain file.
+- A USB token's certificate shows in the Windows certificate store once the token's driver is installed.
+  List the code signing certificates and their thumbprints:
+
+  ```
+  powershell -Command "Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Format-List Subject, Thumbprint, NotAfter"
+  ```
+
+  The token may ask for its PIN when each exe is signed.
+- A certificate in a `.pfx` file: `--sign-pfx FILE`, with its password in the environment variable `VGCS_SIGN_PFX_PASSWORD`, never on the command line.
+- Before the long build, the build checks that the certificate is there, has its private key, is for code signing and has not ended.
+- Each exe gets a SHA-256 signature and a time stamp from `http://timestamp.digicert.com` (`--timestamp-url` names another server).
+  The time stamp keeps the signature valid after the certificate has ended.
+  Windows PowerShell writes the older Authenticode time stamp, not RFC 3161; Windows accepts both.
+- After signing, Windows must call the signature valid, or the build stops.
+  `--allow-untrusted-signature` lets a test certificate through. Never deliver an exe built with it.
+- SmartScreen also weighs the reputation of the file and the certificate, so a new certificate can still show a warning at first.
+- Nothing extra to install: `sign_exe.ps1` uses Windows PowerShell's own `Set-AuthenticodeSignature`, and reads a `.pfx` into memory only (the certificate store is not changed).
+  Microsoft's cloud signing (Trusted Signing) needs `signtool` from the Windows SDK, which this build does not use yet.
+- To check a signed exe: right click, Properties, Digital Signatures, or `powershell -Command "Get-AuthenticodeSignature dist\VGCS.exe | Format-List"`.
 
 ### Where things are kept
 

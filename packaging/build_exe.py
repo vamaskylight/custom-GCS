@@ -10,12 +10,17 @@ Steps:
   2. Download the pinned FFmpeg build on the first run, and check its SHA-256.
   3. Make the exe icon from the VGCS logo.
   4. Run PyInstaller with packaging/vgcs.spec. This makes the folder dist/VGCS.
-  5. Single file: pack that folder into one VGCS.exe (single_file_launcher.cs).
-     Folder: zip dist/VGCS for delivery.
-  6. Run "VGCS.exe --selfcheck" on the result. Stop if any check fails.
+  5. Signing only: sign dist/VGCS/VGCS.exe, before it is packed or zipped.
+  6. Single file: pack that folder into one VGCS.exe (single_file_launcher.cs), and sign
+     that too. Folder: zip dist/VGCS for delivery.
+  7. Run "VGCS.exe --selfcheck" on the result. Stop if any check fails.
 
 With --customer the exe gets the team's admin password (its salted hash) instead of the
 test password: see ADMIN_PASSWORD_FILE.
+
+With --sign-cert THUMBPRINT (a code signing certificate in the Windows certificate store, also
+one on a USB token) or --sign-pfx FILE, the exe is signed by sign_exe.ps1, and the certificate
+is checked before the long build: see packaging/README.md, "Code signing".
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ import sys
 import urllib.request
 import zipfile
 from pathlib import Path
+from typing import NamedTuple
 
 TESTED_PYTHON = "3.14"
 
@@ -58,6 +64,11 @@ ADMIN_PASSWORD_FILE = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".
 ADMIN_SECRET_WORK = BUILD / "admin" / "vgcs_admin_password.txt"
 # The C# compiler of the .NET Framework, which is part of Windows 10 and 11.
 CSC = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
+# Code signing (--sign-cert, --sign-pfx): Windows PowerShell's own Set-AuthenticodeSignature, so no
+# Windows SDK is needed. The password of a .pfx file only ever travels in this environment variable.
+SIGN_SCRIPT = PACKAGING / "sign_exe.ps1"
+DEFAULT_TIMESTAMP_URL = "http://timestamp.digicert.com"
+PFX_PASSWORD_ENV = "VGCS_SIGN_PFX_PASSWORD"
 
 # Runs in the build venv, which has Pillow. The logo is wide, so it is
 # trimmed and centred on a square canvas before it is scaled to icon sizes.
@@ -279,6 +290,45 @@ def make_zip() -> Path:
     return Path(shutil.make_archive(str(DIST / name), "zip", root_dir=DIST, base_dir=APP_DIR.name))
 
 
+class Signing(NamedTuple):
+    thumbprint: str | None          # a certificate in the Windows certificate store
+    pfx: Path | None                # or a .pfx file, its password in PFX_PASSWORD_ENV
+    timestamp_url: str              # "none": no time stamp
+    allow_untrusted: bool           # a test certificate only
+
+
+def signing_from_args(args: argparse.Namespace) -> Signing | None:
+    if not (args.sign_cert or args.sign_pfx):
+        if args.allow_untrusted_signature:
+            sys.exit("--allow-untrusted-signature goes with --sign-cert or --sign-pfx.")
+        return None
+    if args.sign_pfx and os.environ.get(PFX_PASSWORD_ENV) is None:
+        sys.exit(f"--sign-pfx needs the password of the .pfx file in the environment variable {PFX_PASSWORD_ENV}.")
+    return Signing(args.sign_cert, args.sign_pfx, args.timestamp_url, args.allow_untrusted_signature)
+
+
+def sign_command(signing: Signing, path: Path | None) -> list[str]:
+    """sign_exe.ps1's command line: never the .pfx password, which the script reads from PFX_PASSWORD_ENV."""
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SIGN_SCRIPT)]
+    cmd += ["-Thumbprint", signing.thumbprint] if signing.thumbprint else ["-PfxPath", str(signing.pfx)]
+    if path is None:
+        cmd.append("-CheckOnly")
+    else:
+        cmd += ["-Path", str(path), "-TimestampUrl", signing.timestamp_url]
+    if signing.allow_untrusted:
+        cmd.append("-AllowUntrusted")
+    return cmd
+
+
+def check_signing(signing: Signing) -> None:
+    """Before the long build: the certificate is there, has its private key, is for code signing and has not ended."""
+    run(sign_command(signing, None))
+
+
+def sign_file(path: Path, signing: Signing) -> None:
+    run(sign_command(signing, path))
+
+
 def run_selfcheck(exe: Path) -> None:
     print(f"\n> {exe} --selfcheck", flush=True)
     # Read the output through a pipe. That is how the single VGCS.exe knows a
@@ -294,7 +344,7 @@ def run_selfcheck(exe: Path) -> None:
         sys.exit(f"\nSelf-check failed ({proc.returncode} check(s)). This build is not ready to ship.")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build VGCS.exe (see packaging/README.md).")
     parser.add_argument(
         "--folder", action="store_true",
@@ -317,7 +367,25 @@ def main() -> int:
         help=r"a customer exe: the team's admin password (%%USERPROFILE%%\.vama\vama-admin-password.txt) "
         "instead of the test password",
     )
-    args = parser.parse_args()
+    sign = parser.add_mutually_exclusive_group()
+    sign.add_argument(
+        "--sign-cert", metavar="THUMBPRINT",
+        help="sign the exe with this code signing certificate from the Windows certificate store (one on a USB "
+        "token too): Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert lists them",
+    )
+    sign.add_argument(
+        "--sign-pfx", type=Path, metavar="FILE",
+        help=f"sign the exe with this .pfx file; its password in the environment variable {PFX_PASSWORD_ENV}",
+    )
+    parser.add_argument(
+        "--timestamp-url", default=DEFAULT_TIMESTAMP_URL,
+        help="the time stamp server for the signature (default %(default)s; 'none' for no time stamp)",
+    )
+    parser.add_argument(
+        "--allow-untrusted-signature", action="store_true",
+        help="only for a test certificate: a signature that Windows does not trust does not stop the build",
+    )
+    args = parser.parse_args(argv)
     if os.name != "nt":
         sys.exit("VGCS.exe can only be built on Windows.")
     sys.stdout.reconfigure(errors="replace")  # the self-check output may hold characters the console lacks
@@ -328,24 +396,33 @@ def main() -> int:
         print("VGCS finds it there when it is started from source (py -m vgcs).")
         return 0
 
-    # First, so that a customer build without the team's password stops at once.
+    # First, so that a customer build without the team's password, or with a certificate that
+    # cannot sign, stops at once.
+    signing = signing_from_args(args)
     admin_secret = prepare_admin_secret(args.customer)
     try:
+        if signing:
+            check_signing(signing)
         prepare_venv(install=not args.skip_install)
         ffmpeg_dir = None if args.no_ffmpeg else (args.ffmpeg_dir or prepare_ffmpeg())
         icon = make_icon()
         run_pyinstaller(icon, ffmpeg_dir, admin_secret)
         check_admin_secret(admin_secret)
+        if signing:
+            sign_file(APP_DIR / "VGCS.exe", signing)  # before it is packed into the single exe or zipped
+        signed = " (signed)" if signing else " (not signed)"
         if args.folder:
             run_selfcheck(APP_DIR / "VGCS.exe")
-            print(f"\nBuilt {APP_DIR / 'VGCS.exe'}")
+            print(f"\nBuilt {APP_DIR / 'VGCS.exe'}{signed}")
             if not args.no_zip:
                 archive = make_zip()
                 print(f"Zip to deliver: {archive} ({archive.stat().st_size / 1e6:.0f} MB)")
             return 0
         exe = make_single_file(icon)
+        if signing:
+            sign_file(exe, signing)
         run_selfcheck(exe)
-        print(f"\nBuilt {exe}")
+        print(f"\nBuilt {exe}{signed}")
         print(f"Deliver this one file: {exe} ({exe.stat().st_size / 1e6:.0f} MB)")
         return 0
     finally:
