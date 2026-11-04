@@ -269,6 +269,10 @@ class MainWindowSettingsDialogsMixin:
         g.addWidget(rtk_group)
         payload_group, save_payload_release = self._build_payload_release_group()
         g.addWidget(payload_group)
+        build_follow = getattr(self, "_build_follow_settings_group", None)
+        follow_group, save_follow = build_follow() if build_follow is not None else (None, lambda: None)
+        if follow_group is not None:
+            g.addWidget(follow_group)
         build_signing = getattr(self, "_build_signing_settings_group", None)
         if build_signing is not None:
             g.addWidget(build_signing())
@@ -953,6 +957,7 @@ class MainWindowSettingsDialogsMixin:
                 s.setValue(KEY_RTK_BASE_SOURCE, str(rtk_base_edit.text()).strip())
                 self._apply_rtk_base_setting()
                 save_payload_release()
+                save_follow()
                 try:
                     from vgcs.observe.dem import clear_dem_cache
 

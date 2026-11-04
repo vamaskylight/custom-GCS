@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import os
 import pathlib
+import random
 import re
 import sys
 import time
@@ -68,6 +69,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from sitl_session import GPS_OFF, Sitl, wsl  # noqa: E402
 from vgcs.app.arm_readiness import parse_prearm_health  # noqa: E402
+from vgcs.app.follow_drone import LinkFollowDrone  # noqa: E402
+from vgcs.app.object_follow import FollowLock, ObjectFollow  # noqa: E402
 from vgcs.link.mavlink_thread import MavlinkThread  # noqa: E402
 
 VERSIONS = ["4.6.2", "4.7.0"]
@@ -2435,12 +2438,267 @@ def vama_lock_with_vgcs(version: str, r: Report) -> None:
         f.close()
 
 
+# --- Follow Me (vgcs/app/object_follow.py) -----------------------------------
+
+class WalkingObject(FollowLock):
+    """The object Follow follows: it walks a set path, and the lock places it ten times a second as VGCS's tracker
+    would (the picture 0.3 s old, about a metre off). Only the lock is made up here. Follow's rules, VGCS's link and
+    the drone are the real ones."""
+
+    PLACE_EVERY_S = 0.1
+    PICTURE_AGE_S = 0.3
+    ERROR_M = 0.7            # each place is off by about this much, north and east
+
+    def __init__(self, lat: float, lon: float) -> None:
+        super().__init__()
+        self.lat, self.lon = lat, lon
+        self.vn = self.ve = 0.0
+        self.active = False
+        self.t = time.monotonic()
+        self.history: list[tuple[float, float, float]] = [(self.t, lat, lon)]
+        self.placed_at = 0.0
+        self.rng = random.Random(7)
+
+    def lock_active(self) -> bool:
+        return self.active
+
+    def lock_seen(self) -> bool:
+        return self.active
+
+    def lock(self, on: bool) -> None:
+        self.active = bool(on)
+        self.lock_changed.emit()
+
+    def put(self, lat: float, lon: float) -> None:
+        self.lat, self.lon = lat, lon
+        self.history = [(time.monotonic(), lat, lon)]
+
+    def walk(self, north_mps: float, east_mps: float) -> None:
+        self.vn, self.ve = north_mps, east_mps
+
+    def step(self, now: float) -> None:
+        dt, self.t = now - self.t, now
+        self.lat += self.vn * dt / 111_320.0
+        self.lon += self.ve * dt / (111_320.0 * math.cos(math.radians(self.lat)))
+        self.history.append((now, self.lat, self.lon))
+        while len(self.history) > 2 and self.history[1][0] < now - 2.0:
+            self.history.pop(0)
+        if self.active and now - self.placed_at >= self.PLACE_EVERY_S:
+            self.placed_at = now
+            then = next((h for h in reversed(self.history) if h[0] <= now - self.PICTURE_AGE_S), self.history[0])
+            lat = then[1] + self.rng.gauss(0.0, self.ERROR_M) / 111_320.0
+            lon = then[2] + self.rng.gauss(0.0, self.ERROR_M) / (111_320.0 * math.cos(math.radians(then[1])))
+            self.object_placed.emit(lat, lon, 1.0, math.nan, int(self.PICTURE_AGE_S * 1000))
+
+
+class DroneWatch:
+    """The checking connection, read between Qt's events: where the drone really is, its heading, its target."""
+
+    def __init__(self, sim: Sitl) -> None:
+        self.sim = sim
+        self.lat = self.lon = self.rel_alt = self.yaw_deg = None
+        self.target: tuple | None = None       # POSITION_TARGET_LOCAL_NED: vx, vy, type mask, frame
+
+    def read(self) -> None:
+        while True:
+            msg = self.sim.mav.recv_match(blocking=False)
+            if msg is None:
+                return
+            self.sim._take(msg)
+            kind = msg.get_type()
+            if kind == "GLOBAL_POSITION_INT":
+                self.lat, self.lon, self.rel_alt = msg.lat / 1e7, msg.lon / 1e7, msg.relative_alt / 1000.0
+            elif kind == "ATTITUDE":
+                self.yaw_deg = math.degrees(msg.yaw) % 360.0
+            elif kind == "POSITION_TARGET_LOCAL_NED":
+                self.target = (float(msg.vx), float(msg.vy), int(msg.type_mask), int(msg.coordinate_frame))
+
+    def speed(self) -> float:
+        return math.hypot(self.sim.vn, self.sim.ve)
+
+
+def _offset(lat: float, lon: float, north_m: float, east_m: float) -> tuple[float, float]:
+    return lat + north_m / 111_320.0, lon + east_m / (111_320.0 * math.cos(math.radians(lat)))
+
+
+def _turn_deg(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def _mean(rows: list[dict], key: str) -> float:
+    return sum(s[key] for s in rows) / len(rows) if rows else math.nan
+
+
+def object_follow(version: str, r: Report) -> None:
+    """Follow Me: VGCS's Follow flies the drone after a walking object at the distance of the start (30 m), never nearer than 15 m, never another height or heading, and stops it when the lock ends, the pilot changes the mode or the range limit is reached. Real time (speedup 1): Follow's clock is the PC's."""
+    f = Flight(version, speedup=1)
+    follow = None
+    try:
+        sim, link = f.sim, f.link
+        app = QApplication.instance()
+        r.check(f.ready_to_fly(), "the drone is ready")
+        sim.hover_in_loiter(30.0)
+        r.check(sim.mode == "LOITER" and sim.alt > 28.0, f"it hovers in LOITER at {sim.alt:.1f} m")
+        sent: list[tuple[float, float, float, float]] = []
+        to_link = link.queue_follow_speed
+        link.queue_follow_speed = lambda n, e, h: (sent.append((time.monotonic(), n, e, h)), to_link(n, e, h))[1]
+        watch = DroneWatch(sim)
+        obj = WalkingObject(0.0, 0.0)
+        samples: list[dict] = []
+        start = {"heading": 0.0, "height": 0.0}   # of the Follow run now: it keeps both
+        # The drone's own target speed, on the checking connection only (each port has its own message rates).
+        sim.mav.mav.command_long_send(sim.mav.target_system, sim.mav.target_component, 511, 0,  # SET_MESSAGE_INTERVAL
+                                      85, 200_000, 0, 0, 0, 0, 0)                              # POSITION_TARGET_LOCAL_NED
+
+        def run(seconds: float, until=None) -> bool:
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                now = time.monotonic()
+                obj.step(now)
+                app.processEvents()
+                watch.read()
+                if follow is not None and follow.active() and watch.lat is not None and watch.yaw_deg is not None:
+                    samples.append({"t": now, "d": distance_m(watch.lat, watch.lon, obj.lat, obj.lon),
+                                    "dz": abs(watch.rel_alt - start["height"]),
+                                    "dh": _turn_deg(watch.yaw_deg, start["heading"]), "vn": sim.vn, "ve": sim.ve})
+                if until is not None and until():
+                    return True
+                time.sleep(0.01)
+            return until is None
+
+        def since(t0: float) -> list[dict]:
+            return [s for s in samples if s["t"] >= t0]
+
+        def start_follow() -> None:
+            start["heading"], start["height"] = watch.yaw_deg, watch.rel_alt
+            follow.refresh()
+            follow.start()
+
+        def away_from_object() -> tuple[float, float]:
+            north = (watch.lat - obj.lat) * 111_320.0
+            east = (watch.lon - obj.lon) * 111_320.0 * math.cos(math.radians(obj.lat))
+            size = math.hypot(north, east) or 1.0
+            return north / size, east / size
+
+        run(2.0, until=lambda: watch.lat is not None and watch.yaw_deg is not None)
+        drone = LinkFollowDrone()
+        drone.set_thread(link)
+        obj.put(*_offset(watch.lat, watch.lon, 15.0, 0.0))
+        follow = ObjectFollow(obj, drone)
+        obj.lock(True)
+        run(4.0)
+        follow.start()
+        r.check(not follow.active() and "15 m away" in follow.message() and not sent and sim.mode == "LOITER",
+                f"15 m from the object it does not start ({follow.message()})")
+
+        # The start: 30 m north of the drone.
+        obj.lock(False)
+        obj.put(*_offset(watch.lat, watch.lon, 30.0, 0.0))
+        obj.lock(True)
+        run(4.0)
+        follow.refresh()
+        r.check(follow.ready(), f"30 m from the object it would start ({follow.not_ready_text() or 'ready'})")
+        start_follow()
+        r.check(follow.active(), f"Follow starts ({follow.message()})")
+        r.check(run(4.0, until=lambda: sim.mode == "GUIDED"), f"VGCS asked for GUIDED and the drone changed ({sim.mode})")
+        run(2.0)
+
+        obj.walk(2.0, 0.0)
+        began = time.monotonic()
+        run(20.0)
+        late = since(began + 10.0)
+        r.check(abs(_mean(late, "d") - 30.0) < 3.0, f"the object walks north at 2 m/s: the drone keeps {_mean(late, 'd'):.1f} m")
+        r.check(abs(_mean(late, "vn") - 2.0) < 0.5, f"and flies after it at {_mean(late, 'vn'):.2f} m/s north")
+        vx, vy, _mask, _frame = watch.target if watch.target is not None else (math.nan, math.nan, 0, 0)
+        n, e = (sent[-1][1], sent[-1][2]) if sent else (math.nan, math.nan)
+        r.check(abs(vx - n) < 0.3 and abs(vy - e) < 0.3,
+                f"the drone's own target is VGCS's last speed ({vx:.2f}, {vy:.2f} against {n:.2f}, {e:.2f})")
+
+        obj.walk(0.0, 3.0)
+        began = time.monotonic()
+        run(15.0)
+        late = since(began + 7.0)
+        r.check(abs(_mean(late, "d") - 30.0) < 4.0, f"it turns east at 3 m/s: the drone keeps {_mean(late, 'd'):.1f} m")
+        r.check(abs(_mean(late, "ve") - 3.0) < 0.7, f"and flies {_mean(late, 've'):.2f} m/s east")
+
+        obj.walk(0.0, 0.0)
+        run(10.0)
+        r.check(watch.speed() < 0.5, f"the object stands: the drone stands ({watch.speed():.2f} m/s)")
+
+        # Towards the drone at 2 m/s: the drone goes back, and never lets it nearer than 15 m.
+        north, east = away_from_object()
+        obj.walk(2.0 * north, 2.0 * east)
+        began = time.monotonic()
+        run(12.0)
+        toward = since(began)
+        least = min((s["d"] for s in toward), default=0.0)
+        r.check(least > 20.0, f"the object walks at the drone: the drone goes back, at least {least:.1f} m away")
+
+        # The lock ends while the drone flies: it is told to stop at once.
+        ended = time.monotonic()
+        obj.lock(False)
+        r.check(not follow.active() and follow.message().startswith("Follow ended: the lock ended."),
+                f"the lock ends: Follow ends ({follow.message()})")
+        r.check(run(4.0, until=lambda: watch.speed() < 0.5), f"and the drone stops ({watch.speed():.2f} m/s)")
+        obj.walk(0.0, 0.0)
+        run(2.0)
+        after = [s for s in sent if s[0] >= ended]
+        stop_for = after[-1][0] - ended if after else 0.0
+        r.check(bool(after) and all(s[1] == 0.0 and s[2] == 0.0 for s in after) and stop_for < 2.0,
+                f"VGCS sent only 'stop' after it, for {stop_for:.1f} s, then nothing")
+        r.check(sim.mode == "GUIDED", f"the drone holds its place in GUIDED ({sim.mode})")
+
+        # Again, and the pilot takes over: VGCS sends nothing more.
+        obj.lock(True)
+        run(4.0)
+        start_follow()
+        r.check(follow.active(), f"Follow starts again, from GUIDED ({follow.message()})")
+        north, east = away_from_object()
+        obj.walk(-2.0 * north, -2.0 * east)
+        run(6.0)
+        sim.request_mode("LOITER")
+        r.check(run(3.0, until=lambda: not follow.active()), "the pilot changes to LOITER: Follow ends")
+        took = time.monotonic()
+        r.check(follow.message() == "Follow ended: the flight mode was changed to LOITER.", f"and says so ({follow.message()})")
+        obj.walk(0.0, 0.0)
+        run(4.0)
+        r.check(not [s for s in sent if s[0] > took], "VGCS sends the drone nothing more")
+        r.check(sim.mode == "LOITER" and watch.speed() < 1.0, f"the drone holds in LOITER ({sim.mode}, {watch.speed():.2f} m/s)")
+
+        # The range limit: Follow ends 50 m from where it started.
+        follow.set_range_limit(50.0)
+        start_lat, start_lon = watch.lat, watch.lon
+        north, east = away_from_object()
+        start_follow()
+        r.check(follow.active(), f"Follow starts from LOITER ({follow.message()})")
+        obj.walk(-4.0 * north, -4.0 * east)
+        r.check(run(30.0, until=lambda: not follow.active()), "the object walks off at 4 m/s: Follow ends")
+        r.check(follow.message().startswith("Follow ended: the drone is 50 m from where Follow started"),
+                f"at the range limit ({follow.message()})")
+        obj.walk(0.0, 0.0)
+        run(6.0, until=lambda: watch.speed() < 0.3)
+        out = distance_m(start_lat, start_lon, watch.lat, watch.lon)
+        r.check(48.0 <= out <= 58.0 and watch.speed() < 0.5, f"the drone stopped {out:.1f} m from the start")
+
+        # The whole time Follow flew: the height and the heading of its start, never nearer than 15 m.
+        worst_dz = max((s["dz"] for s in samples), default=99.0)
+        worst_dh = max((s["dh"] for s in samples), default=99.0)
+        least = min((s["d"] for s in samples), default=0.0)
+        r.check(worst_dz < 1.5, f"the height of the start kept (at most {worst_dz:.2f} m off, {len(samples)} readings)")
+        r.check(worst_dh < 6.0, f"the heading of the start kept (at most {worst_dh:.1f} degrees off)")
+        r.check(least >= 15.0, f"never nearer than 15 m (the least {least:.1f} m)")
+    finally:
+        if follow is not None:
+            follow.shutdown()
+        f.close()
+
+
 CASES = [connect_and_telemetry, modes_and_arming_on_the_ground, refusals_say_why, parameters,
          mission_upload_and_download, mission_transfer_keeps_telemetry, mission_flight, mission_time_on_the_battery,
          mission_speeds, missions_as_they_come_back,
          another_stations_mission, takeoff_fence_and_land, polygon_fence, nofly_areas, keepin_areas, obstacle_sensor,
          obstacle_settings, obstacle_tf02, obstacle_lidar_tf02,
-         link_silence,
+         link_silence, object_follow,
          signed_commands,
          signing_seen_without_a_key, vama_lock_with_vgcs]
 

@@ -833,6 +833,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
     return_requested = Signal()
     land_requested = Signal()
     disarm_requested = Signal()
+    follow_object_requested = Signal()  # Follow Me: the TRACK block's Follow button (the main window asks first)
     # The range of the PROXIMITY card's four sides, chosen on the card (B19, the window saves it).
     obstacle_bar_range_chosen = Signal(float)
     plan_tool_requested = Signal(str)
@@ -1289,6 +1290,12 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
         self._btn_native_m13_track = QPushButton("Track")
         self._btn_native_m13_track.setCheckable(True)
         self._btn_native_m13_track.hide()
+        # Follow Me (vgcs/app/object_follow.py): the DRONE follows the tracked object at its distance. Not the
+        # "Follow vehicle" button of the top row, which makes the map follow the drone. Checked while Follow runs;
+        # a click asks the main window to start (it asks the operator first) or to stop.
+        self._btn_follow_object = QPushButton("Follow")
+        self._btn_follow_object.setObjectName("followObject")
+        self._btn_follow_object.setCheckable(True)
         for b in (
             self._btn_native_gimbal_up,
             self._btn_native_gimbal_down,
@@ -1332,7 +1339,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
             self._btn_native_reset,
         )
         self._native_observe_body = observe_body
-        m13_track_body = CamM13TrackBlock(self._btn_native_m13_track)
+        m13_track_body = CamM13TrackBlock(self._btn_native_m13_track, self._btn_follow_object)
         self._native_m13_track_body = m13_track_body
         m13_track_body.hide()
 
@@ -1785,6 +1792,7 @@ class MapWidget(MapObservationMixins, MapVideoMixins, MapSurfaceMixins, QWidget)
             self._set_m13_track_armed(bool(on))
 
         self._btn_native_m13_track.toggled.connect(_m13_track_toggle)
+        self._btn_follow_object.clicked.connect(lambda _checked=False: self.follow_object_requested.emit())
 
         self._status = QLabel("Map status: waiting for telemetry")
         self._status.setObjectName("telemetryValue")

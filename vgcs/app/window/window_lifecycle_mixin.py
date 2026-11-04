@@ -235,6 +235,9 @@ class MainWindowLifecycleMixin:
             return
         self._mission_upload_pending = False
         self._thread = None
+        sync_follow = getattr(self, "_sync_follow_drone", None)
+        if callable(sync_follow):
+            sync_follow()
 
     def _on_application_state_changed(self, state: Qt.ApplicationState) -> None:
         mw = getattr(self, "_map_widget", None)
@@ -323,6 +326,10 @@ class MainWindowLifecycleMixin:
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+        # Follow Me leaves no speed flying: "stand" goes out while the link is still open.
+        shutdown_follow = getattr(self, "_shutdown_object_follow", None)
+        if callable(shutdown_follow):
+            shutdown_follow()
         # Before anything else: the pre-flight popup is a top-level window, so
         # it survives this one and keeps the application alive with it.
         self._close_preflight_dialog()

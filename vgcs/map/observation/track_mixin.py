@@ -316,7 +316,105 @@ class M13MovingTargetTrackMixin:
         elif not on and not self._m13_track_is_active():
             self._set_status("M13 track off")
 
+    # --- Follow Me (vgcs/app/object_follow.py): VGCS's own tracker is the lock the drone follows ---
+
+    def follow_lock(self):
+        """The lock Follow Me listens to (vgcs/map/observation/follow_lock.py), made on first use."""
+        lock = getattr(self, "_follow_lock_obj", None)
+        if lock is None:
+            from PySide6.QtCore import QObject
+
+            from vgcs.map.observation.follow_lock import TrackFollowLock
+            from vgcs.observe.follow_place import GroundRise
+
+            # Kept by its attribute; a Qt parent only when this is a real QObject (tests build the mixin bare).
+            lock = TrackFollowLock(self if isinstance(self, QObject) else None)
+            self._follow_lock_obj = lock
+            self._follow_ground = GroundRise()
+            self._follow_placed_mono = 0.0
+        return lock
+
+    def set_follow_object_state(self, active: bool, tip: str) -> None:
+        """The Follow button shows whether Follow runs, and its tooltip what it does or why it would not start."""
+        btn = getattr(self, "_btn_follow_object", None)
+        if btn is None:
+            return
+        if btn.isChecked() != bool(active):
+            btn.blockSignals(True)
+            btn.setChecked(bool(active))
+            btn.blockSignals(False)
+        btn.setToolTip(str(tip or ""))
+
+    def _follow_lock_sync(self) -> None:
+        """Tell Follow's lock whether a track runs, and whether it is VGCS's own tracker (every track change)."""
+        active = self._m13_track_is_active()
+        if self.follow_lock().set_lock(active, active and self._m14_ai_follow_active()):
+            self._follow_ground.forget()   # the laser's ground was the last object's
+            self._follow_placed_mono = 0.0
+
+    def _follow_picture_fov(self) -> tuple[tuple[float, float], tuple[float, float] | None]:
+        """The picture's lens as the tracker sees it (hfov, vfov), and the camera's own lens at its zoom when known
+        (the thermal lens on the thermal picture: the day lens would be wrong there)."""
+        from vgcs.video.camera_control import camera_thermal_picture_lens_deg
+
+        picture = self._m14_picture_fov(self._m14_active_profile())
+        thermal = camera_thermal_picture_lens_deg(getattr(self, "_camera_control", None))
+        lens = (float(thermal[0]), float(thermal[1])) if thermal is not None else self._lens_fov_for_a_measured_click()
+        return picture, lens
+
+    def _follow_place_tracked(self, u: float, v: float) -> None:
+        """The tracked object on the ground for Follow, at most every follow_place.PLACE_EVERY_S."""
+        import time
+
+        from vgcs.observe.follow_place import PLACE_EVERY_S, place_object
+
+        lock = self.follow_lock()
+        now = time.monotonic()
+        if not lock.lock_by_us() or now - self._follow_placed_mono < PLACE_EVERY_S:
+            return
+        try:
+            (hfov, vfov), lens = self._follow_picture_fov()
+            place = place_object(self._observation_context(), u, v, hfov, vfov,
+                                 rise_m=self._follow_ground.rise_m(now), lens=lens,
+                                 digital_zoom=self._effective_preview_digital_zoom())
+        except Exception as ex:
+            print(f"[VGCS:follow] the tracked object could not be placed: {ex!r}")
+            return
+        if place is not None:
+            self._follow_placed_mono = now
+            lock.place(place)
+
+    def _follow_learn_ground(self, range_m: float) -> None:
+        """A laser range during VGCS's own track: the ground at the object above the take-off point, when the object
+        was on the cross (follow_place.LASER_ON_CROSS_DEG)."""
+        import time
+
+        from vgcs.observe.follow_place import (
+            LASER_ON_CROSS_DEG,
+            off_cross_deg,
+            place_object,
+        )
+
+        if not self.follow_lock().lock_by_us():
+            return
+        click = getattr(self, "_m13_track_click_uv", None)
+        try:
+            (hfov, vfov), lens = self._follow_picture_fov()
+            zoom = self._effective_preview_digital_zoom()   # the tracker's picture is the zoomed one
+            if (not isinstance(click, tuple)
+                    or off_cross_deg(click[0], click[1], hfov, vfov, zoom) > LASER_ON_CROSS_DEG):
+                return  # the laser measured whatever was on the cross, not the object
+            ctx = self._observation_context()
+            beam = place_object(ctx, 0.5, 0.5, hfov, vfov, lens=lens)
+            height = ctx.get("vehicle_rel_alt_m")
+            if beam is None or height is None:
+                return
+            self._follow_ground.learn(float(height), float(range_m), beam.look_down_deg, time.monotonic())
+        except Exception as ex:
+            print(f"[VGCS:follow] the laser's ground was not taken: {ex!r}")
+
     def _sync_m13_track_button(self) -> None:
+        self._follow_lock_sync()
         btn = getattr(self, "_btn_native_m13_track", None)
         if btn is None:
             return
@@ -1246,6 +1344,7 @@ class M13MovingTargetTrackMixin:
             return  # stale — track was stopped/restarted while this update was in flight
         if not self._m14_ai_follow_active():
             return
+        self.follow_lock().saw(bool(ok))
         if not ok:
             self._m14_follow_lost_streak = int(lost_streak)
             if int(lost_streak) >= _M14_LOST_STREAK_STOP:
@@ -1270,6 +1369,7 @@ class M13MovingTargetTrackMixin:
             return
         self._m14_follow_lost_streak = 0
         self._m13_track_click_uv = (float(u_norm), float(v_norm))
+        self._follow_place_tracked(float(u_norm), float(v_norm))
         # Real CSRT-tracked box size (px), normalized against the frame it was
         # measured on — feeds the overlay's true-size marker (see
         # _refresh_m13_track_overlay / VideoOverlayM13Track.box_w/box_h).
@@ -1639,6 +1739,7 @@ class M13MovingTargetTrackMixin:
 
                 self._m13_track_range_mono = time.monotonic()
                 self._m13_track_range_aged_out = False
+                self._follow_learn_ground(self._m13_track_range_m)
         self._recompute_m13_track_geo()
 
     @staticmethod

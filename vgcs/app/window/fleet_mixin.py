@@ -135,6 +135,9 @@ class MainWindowFleetMixin:
         self._thread = vehicle.thread
         self._wire_link_signals(self._thread)
         self._fleet.set_active(vid)
+        sync_follow = getattr(self, "_sync_follow_drone", None)
+        if callable(sync_follow):
+            sync_follow()  # Follow never goes on with another drone
         # The next heartbeat goes through the first-heartbeat path again (it
         # reads this drone's settings), but a switch is not a new connection,
         # so the pre-flight popup is not shown for it.

@@ -51,6 +51,13 @@ _MAV_MSG_ID_MOUNT_ORIENTATION = int(mav_apm.MAVLINK_MSG_ID_MOUNT_ORIENTATION)
 _PROX_STREAM_RESEND_S = 20.0
 # About ten seconds of corrections from a base that sends five messages a second.
 _RTCM_QUEUE_MAX = 50
+# Follow Me's speed for Guided (vgcs/app/object_follow.py; the same numbers are in vgcs/app/follow_guide.py, from the
+# app's FollowGuide.h): SET_POSITION_TARGET_LOCAL_NED with the speed and a yaw angle to keep, or with a yaw rate of 0
+# when the heading is not known. After a speed the loop waits for messages briefly, so the next goes out at once.
+_FOLLOW_TYPE_MASK = 0x09C7
+_FOLLOW_TYPE_MASK_NO_HEADING = 0x05C7
+_FOLLOW_FRAME = 1  # MAV_FRAME_LOCAL_NED
+_FOLLOW_LIVELY_S = 1.0
 # The drone's messages (STATUSTEXT) are not rate limited like telemetry: they
 # come in bursts (two EKF lines, a list of PreArm reasons) a few milliseconds
 # apart. Only a flood is cut, at this many a second.
@@ -328,6 +335,9 @@ class MavlinkThread(FenceLinkMixin, QThread):
         self._rtcm_queue: deque[bytes] = deque(maxlen=_RTCM_QUEUE_MAX)
         self._rtcm_sequence = 0
         self._rtcm_bytes_sent = 0
+        # Follow Me's newest speed for Guided, also kept apart from the command queue. Only the newest counts.
+        self._follow_speed: tuple[float, float, float] | None = None
+        self._follow_speed_mono = 0.0
         # Settings and mode changes that are only done once the drone says so
         # (see vgcs/link/confirmations.py). Answered from the main loop, so
         # waiting for them never stops the telemetry.
@@ -450,6 +460,39 @@ class MavlinkThread(FenceLinkMixin, QThread):
     def rtcm_bytes_sent(self) -> int:
         """How many bytes of corrections have gone to the vehicle on this link."""
         return int(self._rtcm_bytes_sent)
+
+    def queue_follow_speed(self, north_mps: float, east_mps: float, heading_deg: float) -> None:
+        """Follow Me: a speed over the ground for Guided, north and east in m/s, and the heading to keep in degrees
+        from north (NaN: a yaw rate of 0). It goes out at once, from the loop and from every wait, apart from the
+        command queue; a newer speed replaces one not sent yet. A speed that is not a number goes out as 0."""
+        self._follow_speed = (float(north_mps), float(east_mps), float(heading_deg))
+        self._follow_speed_mono = time.monotonic()
+
+    def _send_pending_follow_speed(self) -> None:
+        # getattr: tests build links bare (__new__), with only the state of their own day.
+        pending = getattr(self, "_follow_speed", None)
+        if pending is None or self._master is None:
+            return
+        self._follow_speed = None
+        if not self._streams_requested:
+            return  # the drone has not been heard yet: there is no address to send to
+        north, east, heading = pending
+        sane = math.isfinite(north) and math.isfinite(east)
+        vx, vy = (north, east) if sane else (0.0, 0.0)
+        if math.isfinite(heading):
+            mask, yaw = _FOLLOW_TYPE_MASK, math.radians(math.remainder(heading, 360.0))
+        else:
+            mask, yaw = _FOLLOW_TYPE_MASK_NO_HEADING, 0.0
+        try:
+            self._master.mav.set_position_target_local_ned_send(
+                0, int(self._target_sysid), int(self._target_compid), _FOLLOW_FRAME, mask,
+                0.0, 0.0, 0.0, vx, vy, 0.0, 0.0, 0.0, 0.0, yaw, 0.0)
+        except Exception as e:
+            # One failed send must not cost the link: the next speed comes 0.2 s later. Said once in a while.
+            now = time.monotonic()
+            if now - float(getattr(self, "_follow_error_log_mono", 0.0)) >= 10.0:
+                self._follow_error_log_mono = now
+                self.log_line.emit(f"Follow: a speed could not be sent ({e})")
 
     def _send_pending_rtcm(self) -> None:
         """Send the waiting corrections as GPS_RTCM_DATA (see vgcs.link.rtcm for the cutting rules).
@@ -759,15 +802,17 @@ class MavlinkThread(FenceLinkMixin, QThread):
             self._process_pending_commands()
             self._maybe_send_gcs_heartbeat()
             self._send_pending_rtcm()
+            self._send_pending_follow_speed()
             self._ensure_signing()
             self._tick_confirmations()
             try:
-                # Short wait while corrections flow or a request waits for its
-                # answer, so neither is held back for up to a second on a link
-                # where the vehicle is quiet.
+                # Short wait while corrections flow, a request waits for its
+                # answer or Follow sends speeds, so none is held back for up to
+                # a second on a link where the vehicle is quiet.
+                lively = time.monotonic() - getattr(self, "_follow_speed_mono", -1e9) < _FOLLOW_LIVELY_S
                 msg = self._master.recv_match(
                     blocking=True,
-                    timeout=0.2 if (self._rtcm_bytes_sent or self._confirmations_open()) else 1.0,
+                    timeout=0.2 if (self._rtcm_bytes_sent or self._confirmations_open() or lively) else 1.0,
                 )
             except Exception as e:
                 if not self._running:
@@ -1040,6 +1085,8 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 "relative_alt_m": float(getattr(msg, "relative_alt", 0) or 0) / 1000.0,
                 "alt_msl_m": float(getattr(msg, "alt", 0) or 0) / 1000.0,
                 "groundspeed_mps": spd_cm / 100.0,
+                "vn_mps": vx / 100.0,  # north and east over the ground (Follow Me)
+                "ve_mps": vy / 100.0,
             }
             if hdg_deg is not None:
                 gpi["hdg_deg"] = hdg_deg
@@ -2841,6 +2888,7 @@ class MavlinkThread(FenceLinkMixin, QThread):
                 return None
             self._maybe_send_gcs_heartbeat()
             self._send_pending_rtcm()
+            self._send_pending_follow_speed()
             msg = self._master.recv_match(blocking=True, timeout=min(remaining, 0.35))
             if msg is None:
                 continue

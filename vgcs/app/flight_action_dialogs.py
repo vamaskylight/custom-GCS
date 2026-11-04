@@ -161,6 +161,25 @@ def confirm_land(parent) -> bool:
     return _confirm(parent, "Land", land_message(), "Land here")
 
 
+def follow_message(distance_m: float, speed_limit_mps: float, range_limit_m: float, min_distance_m: float,
+                   flies_on_s: float = -1.0) -> str:
+    """The question before Follow Me (vgcs/app/object_follow.py) takes the aircraft."""
+    flies_on = (f"for {flies_on_s:.0f} s" if flies_on_s >= 0.0 else "for a few seconds (GUID_TIMEOUT)")
+    return (
+        f"The aircraft will follow the tracked object and keep its distance of {distance_m:.0f} m, at the height "
+        "and heading it has now. It changes to Guided for this.\n\n"
+        f"It never flies nearer than {min_distance_m:.0f} m to the object, at most {speed_limit_mps:.0f} m/s, and "
+        f"no further than {range_limit_m:.0f} m from here. It stands still while the object is not seen. Follow "
+        "ends when the lock ends or another flight mode is chosen.\n\n"
+        f"If VGCS or the radio link stops, the aircraft flies its last speed {flies_on}, then holds its place. "
+        "Follow itself does not see obstacles: watch the aircraft and what is around it."
+    )
+
+
+def confirm_follow(parent, text: str) -> bool:
+    return _confirm(parent, "Follow", text, "Start following")
+
+
 def disarm_message() -> str:
     return (
         "The motors will stop and the aircraft will be disarmed.\n\n"

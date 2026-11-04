@@ -118,6 +118,9 @@ class MainWindowLinkMixin:
         self._fleet.set_active(vehicle.vid)
         self._thread = vehicle.thread
         self._wire_link_signals(self._thread)
+        sync_follow = getattr(self, "_sync_follow_drone", None)
+        if callable(sync_follow):
+            sync_follow()
         self._suppress_preflight_popup = False
         # Keep the click handler light: Skydroid / map camera wiring can touch sockets and QSettings.
         def _deferred_camera_after_connect() -> None:

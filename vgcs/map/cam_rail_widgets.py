@@ -338,7 +338,7 @@ class CamObserveBlock(QWidget):
 class CamM13TrackBlock(QWidget):
     """M13 moving-target track — arm, click video, gimbal follow."""
 
-    def __init__(self, track_btn: QWidget, parent=None) -> None:
+    def __init__(self, track_btn: QWidget, follow_btn: QWidget | None = None, parent=None) -> None:
         super().__init__(parent)
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -352,6 +352,9 @@ class CamM13TrackBlock(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(4)
         row.addWidget(track_btn, 1)
+        if follow_btn is not None:
+            # Follow Me beside Track, in the same row: the rail does not scroll, and has no height to spare.
+            row.addWidget(follow_btn, 1)
         hint = QLabel("Track ON → click target on video · gimbal follow · map trail")
         hint.setObjectName("m13TrackHint")
         hint.setWordWrap(True)

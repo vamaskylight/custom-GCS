@@ -450,6 +450,8 @@ class MainWindow(MainWindowMixins, QMainWindow):
         self._map_widget.return_requested.connect(self._on_map_return_requested)
         self._map_widget.land_requested.connect(self._on_land)
         self._map_widget.disarm_requested.connect(self._on_disarm)
+        # Follow Me: the drone follows the tracked object (vgcs/app/window/follow_mixin.py).
+        self._setup_object_follow()
         self._map_widget.obstacle_bar_range_chosen.connect(self._on_obstacle_bar_range_chosen)
         # Offline map downloads run for minutes: say how far they got, and when
         # they end, where the operator looks (the map's own status line is hidden).

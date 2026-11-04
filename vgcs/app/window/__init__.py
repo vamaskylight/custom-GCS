@@ -5,6 +5,7 @@ from __future__ import annotations
 from vgcs.app.window.flight_commands_mixin import MainWindowFlightCommandsMixin
 from vgcs.app.window.flight_status_mixin import MainWindowFlightStatusMixin
 from vgcs.app.window.fleet_mixin import MainWindowFleetMixin
+from vgcs.app.window.follow_mixin import MainWindowFollowMixin
 from vgcs.app.window.link_mixin import MainWindowLinkMixin
 from vgcs.app.window.map_chrome_mixin import MainWindowMapChromeMixin
 from vgcs.app.window.params_mixin import MainWindowParamsMixin
@@ -29,6 +30,7 @@ class MainWindowMixins(
     MainWindowTelemetryMixin,
     MainWindowRtkBaseMixin,
     MainWindowFlightCommandsMixin,
+    MainWindowFollowMixin,
     MainWindowParamsMixin,
     MainWindowLifecycleMixin,
 ):
@@ -39,6 +41,7 @@ __all__ = [
     "MainWindowMixins",
     "MainWindowFlightCommandsMixin",
     "MainWindowFleetMixin",
+    "MainWindowFollowMixin",
     "MainWindowFlightStatusMixin",
     "MainWindowLifecycleMixin",
     "MainWindowLinkMixin",

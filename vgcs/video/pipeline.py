@@ -1465,6 +1465,47 @@ def _siyi_rtsp_camera_busy(tail_b: bytes) -> bool:
     )
 
 
+def _siyi_rtsp_timed_out(tail_b: bytes) -> bool:
+    """True when FFmpeg's stderr holds -138, which is ETIMEDOUT on Windows.
+
+    The camera never answered in time. That is first a question of this PC's
+    link to the camera, and only then of another viewer holding the camera's
+    one RTSP slot: in the B28 field log (2026-11-05) all 18 opens of a ZR10
+    ended -138, and that PC most likely had no path to the camera at all.
+    -10054 (reset) and "operation not permitted" are answers: the camera, or
+    Windows, closed the connection.
+    """
+    return bool(tail_b) and b"-138" in tail_b.lower()
+
+
+def _siyi_rtsp_camera_name(url: str) -> str:
+    host = _companion_rtsp_host(url)
+    return f"camera {host}" if host else "the camera"
+
+
+def _siyi_rtsp_failed_opens_text(tail_b: bytes, url: str = "") -> str:
+    """The operator's message after five companion RTSP opens without a frame."""
+    if _siyi_rtsp_timed_out(tail_b):
+        return (
+            f"No answer from {_siyi_rtsp_camera_name(url)} (-138, time-out). "
+            "Ping it from this PC first. No reply means this PC has no link to the camera. "
+            "If ping works, close RC/VLC/handheld video, wait 10s, retry."
+        )
+    code = "-10054" if b"-10054" in (tail_b or b"").lower() else "Operation not permitted"
+    return f"Companion RTSP busy ({code}). Close RC/VLC/handheld video, wait 10s, retry."
+
+
+def _siyi_rtsp_retry_hint(tail_b: bytes, url: str = "") -> str:
+    """The log's hint while the decode loop retries a companion RTSP camera."""
+    if _siyi_rtsp_timed_out(tail_b):
+        return (
+            f"no answer from {_siyi_rtsp_camera_name(url)} (-138, time-out): "
+            "ping it from this PC first (no reply means no link to the camera), "
+            "then close VLC/other viewers on it"
+        )
+    return "close VLC/other viewers on this camera, confirm 192.168.144.x is reachable"
+
+
 def _siyi_hevc_glitch_release_sleep(*, brief_session: bool = False) -> None:
     """Pause before reopening RTSP after HEVC POC/RPS loss (avoids -138 on immediate reconnect)."""
     raw = str(os.environ.get("VGCS_SIYI_HEVC_RELEASE_S", "3.5") or "3.5").strip()
@@ -1517,10 +1558,16 @@ def _siyi_camera_release_sleep(
         # unattended loop; here it is just dead time in front of a button press.
         delay = min(delay, 1.5)
     try:
-        print(
-            f"[VGCS:video] companion RTSP: waiting {delay:.1f}s for camera RTSP slot "
-            "(close VLC/handheld viewer first)"
-        )
+        if _siyi_rtsp_timed_out(tail_b):
+            print(
+                f"[VGCS:video] companion RTSP: waiting {delay:.1f}s, "
+                + _siyi_rtsp_retry_hint(tail_b)
+            )
+        else:
+            print(
+                f"[VGCS:video] companion RTSP: waiting {delay:.1f}s for camera RTSP slot "
+                "(close VLC/handheld viewer first)"
+            )
     except Exception:
         pass
     if sleeper is not None:
@@ -3047,7 +3094,7 @@ class RtspSource(QObject):
             if streak >= 5 and streak % 5 == 0:
                 try:
                     self.error.emit(
-                        "Companion RTSP busy (-138). Close RC/VLC/handheld video, wait 10s, retry."
+                        _siyi_rtsp_failed_opens_text(tail, str(getattr(self, "_url", "") or ""))
                     )
                 except Exception:
                     pass
@@ -3801,9 +3848,9 @@ class RtspSource(QObject):
                                             if empty_sessions >= 3 and empty_sessions % 3 == 0:
                                                 try:
                                                     print(
-                                                        "[VGCS:video] companion RTSP connect timeout (-138): "
-                                                        "close VLC/other viewers on this camera, confirm "
-                                                        "192.168.144.x is reachable; will try UDP if TCP fails"
+                                                        "[VGCS:video] companion RTSP: "
+                                                        + _siyi_rtsp_retry_hint(tail, url)
+                                                        + "; will try UDP if TCP fails"
                                                     )
                                                 except Exception:
                                                     pass
