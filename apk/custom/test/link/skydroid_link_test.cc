@@ -1523,8 +1523,8 @@ private slots:
         QCOMPARE(notes.at(0).at(0).toString(), QString("Recording on the camera's SD card."));
         QVERIFY(_link->recordingConfirmed());
         // It is never asked whether it records: what it said stays ("REC", not "REC?"), where a TOP
-        // camera's answer is old after 5 s.
-        QTest::qWait(5600);
+        // camera's answer is old after 5 s (seen at the next answer check, once a second: 6.5 s).
+        QTest::qWait(6500);
         QVERIFY(_link->recording() && _link->recordingConfirmed());
         QCOMPARE(c20.countTag("REC", 'w'), 0);  // not TOP's REC on 5000
         _link->toggleRecord();

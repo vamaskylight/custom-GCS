@@ -21,8 +21,8 @@ if [ "$USER_NAME" = "root" ]; then
     exit 1
 fi
 
-echo "== The system packages (picamera2 comes with Raspberry Pi OS)"
-apt-get install -y python3-picamera2 python3-venv
+echo "== The system packages (picamera2 and pyserial come with Raspberry Pi OS)"
+apt-get install -y python3-picamera2 python3-venv python3-serial
 
 echo "== /opt/vama-recorder"
 mkdir -p /opt/vama-recorder

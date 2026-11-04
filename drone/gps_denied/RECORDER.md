@@ -15,7 +15,7 @@ The recorder does not control the drone. It only listens to the flight controlle
 | Camera | A Raspberry Pi camera on the Pi's camera port. Yours is the AI Camera (Sony IMX500): it works here as a normal camera. Camera Module 3 (the normal one, not the Wide), the HQ Camera and the Global Shutter Camera work too |
 | Card | Your 64 GB card is fine to start. With the size 2028x1520 (part 6) a picture is about 1 MB: about 15 hours of flight. At the full size it is about 4 MB |
 | Power | 5 V and at least 5 A for the Pi, from its own regulator on the drone battery. A cooler on the Pi |
-| Wires | Three wires from the Pi to a free serial port of the flight controller (part 4) |
+| Wires | Three wires from the Pi to a serial port of the flight controller that nothing else uses (part 4) |
 
 ## 2. Mount the camera
 
@@ -38,29 +38,44 @@ The recorder does not control the drone. It only listens to the flight controlle
 
 ## 4. Wire the Pi to the flight controller
 
-Use a free serial port of the Cube. On the Cube Orange Plus, TELEM1 is SERIAL1, TELEM2 is SERIAL2, GPS1 is SERIAL3 and GPS2 is SERIAL4.
+The Pi needs a serial port of the flight controller for itself.
+It must never share a port with the GPS or another device: a port is MAVLink for the Pi (`SERIALn_PROTOCOL` 2) or GPS for the GPS (5), never both.
+
+On the Cube Orange Plus, TELEM1 is SERIAL1, TELEM2 is SERIAL2, GPS1 is SERIAL3 and GPS2 is SERIAL4.
 TELEM1 is in use, and TELEM2 is for the RPLidar. Please tell me which port you use.
 
-On a Brahma H7 with ArduPilot, use T3 and R3: that is SERIAL3, so n is 3 below (its SERIAL1 is MAVLink, 2 is GPS, 4 DisplayPort, 6 RC in, 7 MAVLink with flow control, 8 ESC telemetry).
-Set the parameters by their names, `SERIAL3_PROTOCOL` and `SERIAL3_BAUD`. The word "UART" with a number on a ground station's serial screen is not the board's T and R number: on the client's Brahma H7 the screen's "UART2" line is SERIAL3, and its "UART3" line is SERIAL4.
+On your Brahma H7, the Pi's link worked only while `SERIAL4_PROTOCOL` was 2, and the GPS only while it was 5.
+So the Pi's wires are on the GPS's port, SERIAL4.
+Keep `SERIAL4_PROTOCOL` at 5 for the GPS, and move the Pi's two wires from that port to another pair of pads Tn and Rn, with the same number n, that nothing else uses.
+Never use the pads of the receiver (RC input), the ESCs or the GPS. The ground wire can stay.
+Which SERIALn belongs to which pads depends on the board's firmware, and the "UART" number on a ground station's serial screen is no proof either.
+So find the Pi's port with the bench check (part 7):
+
+1. In the full parameter list, write down each `SERIALn_PROTOCOL` that is -1 (off). Leave out the port of the receiver, the ESCs and the GPS, even if it shows -1.
+2. Set each port you wrote down to 2, and its `SERIALn_BAUD` to 115. Leave all the other ports as they are.
+3. Restart the flight controller, and run the bench check.
+4. "OK flight controller" means the Pi is on one of those ports. Send me a photo of the wiring and the parameter list, and I will tell you which port it is, so the others can go back to -1.
+5. Before you fly, check on the ground station's radio screen that the sticks still move the channels.
+
+Set the parameters by their names (`SERIALn_PROTOCOL` and `SERIALn_BAUD`, with the port's number n), not by a line of the ground station's serial screen: on your board that screen's "UART3" line is SERIAL4.
 Its 5 V supply gives 3 A for everything on the board, so the Pi must have its own 5 V, 5 A supply.
 
-| Raspberry Pi | Cube port |
+| Raspberry Pi | Flight controller port |
 |------|------|
 | Pin 8 (GPIO 14, TX) | RX |
 | Pin 10 (GPIO 15, RX) | TX |
 | Pin 6 (ground) | GND |
 
-Do not connect the Cube port's 5 V pin to the Pi. The Pi has its own power.
+Do not connect the port's 5 V pin to the Pi. The Pi has its own power.
 
-On the Cube (Mission Planner or QGroundControl, full parameter list), for that port's number n:
+On the flight controller (Mission Planner or QGroundControl, full parameter list), for that port's number n:
 
 | Setting | Value |
 |------|------|
 | `SERIALn_PROTOCOL` | 2 (MAVLink 2) |
 | `SERIALn_BAUD` | 115 (115200) |
 
-Then reboot the Cube.
+Then restart the flight controller.
 
 ## 5. Install the recorder
 
@@ -105,6 +120,7 @@ Each line starts with OK, NOTE or PROBLEM. The last line says "All checks passed
 It also saves one test picture as `~/vama-flights/check.jpg`. Look at it: sharp, and nothing of the drone in it.
 "NOTE GPS: the receiver is there, no 3D fix yet" indoors is normal.
 But "PROBLEM GPS: the flight controller sees no GPS receiver at all" is not: fix it before you fly (part 10). A flight without a GPS has no true positions, and is no use for the navigation.
+When no heartbeat comes, the check listens to the port for up to 18 seconds more, and its PROBLEM line says what arrives there: nothing at all, GPS data, MAVLink at another speed, or other data (part 10).
 
 ## 8. Fly
 
@@ -126,14 +142,18 @@ In each folder:
 | `telemetry.jsonl` | All the flight controller's messages of that flight, to work the data again later |
 | `flight.json` | The settings, the camera, the start and the end, and how many pictures were taken without a 3D GPS fix (`frames_without_3d_gps_fix`, 0 in a good flight) |
 
-Please also tell me the camera model and the Cube port you used.
+Please also tell me the camera model and the flight controller port you used.
 
 ## 10. When something is wrong
 
 - What the recorder says: `journalctl -u vama-recorder -f`, or the file `~/vama-flights/recorder.log`.
-- "no heartbeat from the flight controller": check that `device` is the port of pins 8 and 10 (on a Raspberry Pi 5 `/dev/ttyAMA0`, with the line of part 3, not `/dev/serial0`), the three wires (TX to RX, RX to TX), and `SERIALn_PROTOCOL` and `SERIALn_BAUD` on the Cube. The port's protocol must be MAVLink 2, not GPS.
+- "no heartbeat from the flight controller": the rest of the line says what arrives on the port.
+  - "nothing at all arrives": check that `device` is the port of pins 8 and 10 (on a Raspberry Pi 5 `/dev/ttyAMA0`, with the line of part 3, not `/dev/serial0`), the three wires (TX to RX, RX to TX, ground), and that the flight controller's port has `SERIALn_PROTOCOL` 2.
+  - "The port carries GPS data": the Pi is on a port that the flight controller uses for a GPS, or on the GPS's wires. The Pi needs a port of its own (part 4).
+  - "MAVLink arrives on this port at" a speed: set that port's `SERIALn_BAUD` to 115, or `baud` in the settings to the speed the line names.
+  - "Data arrives, but it is not MAVLink": the port's protocol or speed is wrong, or another device shares its wires.
 - "the recorder service is running": it holds the camera and the serial port. Stop it first, as in part 7.
-- "no GPS receiver at all" (fix 0): the flight controller does not see its GPS. Check the GPS cable, `GPS1_TYPE` 1 (auto; `GPS_TYPE` before ArduPilot 4.6), and that the GPS port's `SERIALn_PROTOCOL` is 5 (GPS). On your Brahma H7 the GPS port is SERIAL4, which was set to 2 on 31 October: set `SERIAL4_PROTOCOL` back to 5. Restart the flight controller, then run the bench check again. Outdoors it says "OK GPS: fix 3" after a minute or two.
+- "no GPS receiver at all" (fix 0): the flight controller does not see its GPS. Check the GPS cable, `GPS1_TYPE` 1 (auto; `GPS_TYPE` before ArduPilot 4.6), and that the GPS port's `SERIALn_PROTOCOL` is 5 (GPS). On your Brahma H7 the GPS port is SERIAL4, which was set to 2 on 31 October: set `SERIAL4_PROTOCOL` back to 5. Restart the flight controller, then run the bench check again. Outdoors it says "OK GPS: fix 3" after a minute or two. If the Pi then gets no heartbeat, its wires are on the GPS's port too: move them to a port of their own (part 4).
 - "no camera found": check that no other program uses the camera, the ribbon cable, and `rpicam-hello --list-cameras`.
 - "the card is nearly full": copy the flights off the card and delete them on the Pi.
 - No pictures in a flight: the drone was below `start_height_m`, or the GPS height was not known yet.

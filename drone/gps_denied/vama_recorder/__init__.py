@@ -7,4 +7,6 @@ moment of each picture. These flights are the data to train and test the picture
 Run it as ``python -m vama_recorder`` from the folder that holds this package. See RECORDER.md.
 """
 
-__version__ = "1.1.0"  # 1.1.0 (2026-11-04): no GPS receiver (fix 0) is a PROBLEM in the bench check, and a warning in flight
+__version__ = "1.2.0"  # 1.1.0 (2026-11-04): no GPS receiver (fix 0) is a PROBLEM in the bench check, and a warning in flight
+# 1.2.0 (2026-11-04): without a heartbeat the bench check says what arrives on the port (nothing, GPS data, MAVLink
+# at another speed, other data): on the client's board the Pi and the GPS shared one port

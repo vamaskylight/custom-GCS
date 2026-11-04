@@ -8,7 +8,9 @@ is nearly full. Each flight is one folder (see flight.py).
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -325,10 +327,161 @@ def service_running() -> bool:
         return False
 
 
+# Without a heartbeat, what arrives on the port tells a dead wire from a port that carries something else. On the
+# client's Brahma H7 (2026-11-04) the Pi's link worked only while SERIAL4 was MAVLink and the GPS only while it was
+# GPS: the Pi and the GPS shared one port, and "no heartbeat" alone pointed at the wires.
+LISTEN_BAUDS = (230400, 57600, 38400, 9600, 460800, 921600, 115200)   # after the recorder's own; 230400: ArduPilot's u-blox
+LISTEN_S = 2.5                           # ArduPilot asks a u-blox GPS something about every 2 s once it is set up
+SERIAL_BAUD_CODES = {9600: 9, 19200: 19, 38400: 38, 57600: 57, 115200: 115, 230400: 230, 460800: 460, 921600: 921}
+NETWORK_DEVICES = ("tcp:", "tcpin:", "udp:", "udpin:", "udpout:", "udpbcast:")
+_NMEA = re.compile(rb"\$([A-Z]{5}|PUBX),[^$*\r\n]{0,79}\*([0-9A-F]{2})")
+
+
+def read_port(device: str, baud: int, seconds: float) -> bytes:
+    """What arrives on a serial port in so many seconds at that speed. It sends nothing."""
+    import serial  # pyserial, as pymavlink's own serial link
+
+    data = bytearray()
+    with serial.Serial(device, baudrate=baud, timeout=0.1) as port:
+        port.reset_input_buffer()
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            data += port.read(4096)
+    return bytes(data)
+
+
+def _ubx_frames(data: bytes) -> int:
+    """Whole u-blox UBX frames in the bytes: B5 62, class, id, length, payload, a right checksum."""
+    count, i = 0, data.find(b"\xb5\x62")
+    while 0 <= i <= len(data) - 8:
+        end = i + 6 + (data[i + 4] | data[i + 5] << 8)
+        if end + 2 <= len(data):
+            a = b = 0
+            for byte in data[i + 2:end]:
+                a = (a + byte) & 0xFF
+                b = (b + a) & 0xFF
+            if data[end] == a and data[end + 1] == b:
+                count += 1
+                i = data.find(b"\xb5\x62", end + 2)
+                continue
+        i = data.find(b"\xb5\x62", i + 1)
+    return count
+
+
+def _nmea_sentences(data: bytes) -> int:
+    """NMEA sentences with a right checksum: a GPS's $GPRMC and the like, and u-blox's $PUBX, which ArduPilot sends to
+    set a GPS's speed."""
+    count = 0
+    for m in _NMEA.finditer(data):
+        x = 0
+        for byte in m.group(0)[1:-3]:
+            x ^= byte
+        count += x == int(m.group(2), 16)
+    return count
+
+
+def _mavlink_messages(data: bytes) -> int:
+    """MAVLink 1 or 2 messages of a known kind with a right checksum, tried at every start byte. pymavlink's own
+    stream parser is not used: after a bad frame it skips that frame's whole length (a true frame behind noise is
+    lost), and it hands out a message of an unknown kind without a checksum check (noise looks like MAVLink)."""
+    from pymavlink.dialects.v20 import ardupilotmega as mavlink2
+
+    parser = mavlink2.MAVLink(None)
+    count = free_from = 0
+    for marker in re.finditer(rb"[\xfd\xfe]", data):
+        i = marker.start()
+        if i < free_from or i + 8 > len(data):
+            continue
+        if data[i] == 0xFE:
+            size = data[i + 1] + 8                           # v1: 6 header bytes, the payload, 2 checksum bytes
+        elif data[i + 2] in (0, 1):
+            size = data[i + 1] + 12 + 13 * data[i + 2]       # v2: 10 header bytes, the payload, 2, a signature
+        else:
+            continue
+        if i + size > len(data):
+            continue
+        try:
+            msg = parser.decode(bytearray(data[i:i + size]))
+        except Exception:  # noqa: BLE001, S112 (noise fails pymavlink's decode in many ways: checksum, length, fields)
+            continue
+        if msg.get_msgId() in mavlink2.mavlink_map:
+            count += 1
+            free_from = i + size
+    return count
+
+
+def port_traffic(data: bytes) -> str:
+    """What bytes from a serial port are: "nothing", "ubx" or "nmea" (GPS data), "mavlink", or "other". MAVLink needs
+    two messages: one in noise passes its 16-bit checksum by chance about once in 65536 tries, and a flight
+    controller sends at least a heartbeat a second on every MAVLink port."""
+    if not data:
+        return "nothing"
+    if _ubx_frames(data):
+        return "ubx"
+    if _nmea_sentences(data):
+        return "nmea"
+    if _mavlink_messages(data) >= 2:
+        return "mavlink"
+    return "other"
+
+
+def what_the_port_carries(device: str, baud: int, read: Callable[[str, int, float], bytes] = read_port,
+                          seconds: float = LISTEN_S) -> tuple[str, int | None]:
+    """What arrives on a serial port, at the recorder's speed first and then at the usual others, until one shows
+    GPS data or MAVLink: (what, at which speed). ("unknown", None) for a network link or a port that cannot be read."""
+    if device.lower().startswith(NETWORK_DEVICES):
+        return "unknown", None
+    read_once = data_seen = False
+    for b in [baud] + [x for x in LISTEN_BAUDS if x != baud]:
+        try:
+            data = read(device, b, seconds)
+        except Exception as exc:  # noqa: BLE001 (no pyserial, a speed the port cannot do; pyserial lets termios.error out)
+            log.debug("listening on %s at %s: %s", device, b, exc)
+            continue
+        read_once = True
+        kind = port_traffic(data)
+        if kind not in ("nothing", "other"):
+            return kind, b
+        data_seen = data_seen or kind == "other"
+    if not read_once:
+        return "unknown", None
+    return ("other" if data_seen else "nothing"), None
+
+
+def no_heartbeat_line(device: str, baud: int, kind: str, found_at: int | None, waited_s: float) -> str:
+    """The bench check's PROBLEM line when no heartbeat came, from what the port carries (what_the_port_carries)."""
+    head = f"PROBLEM link: no heartbeat from the flight controller on {device} at {baud}"
+    code = SERIAL_BAUD_CODES.get(baud)
+    speed = f"SERIALn_BAUD {code}" if code else f"the speed of baud = {baud}"
+    if kind in ("ubx", "nmea"):
+        return (f"{head}. The port carries GPS data ({'u-blox' if kind == 'ubx' else 'NMEA'} at {found_at}), not MAVLink: "
+                "the flight controller uses this port for a GPS (SERIALn_PROTOCOL 5), or the Pi shares the GPS's wires. "
+                "The Pi needs a port of its own: keep the GPS's port at 5, and wire the Pi to a free port with "
+                "SERIALn_PROTOCOL 2 (RECORDER.md part 4)")
+    if kind == "mavlink" and found_at != baud:
+        fix = f"Set that port's SERIALn_BAUD to {code} on the flight controller, or" if code else "Set"
+        return f"{head}, but MAVLink arrives on this port at {found_at}. {fix} baud = {found_at} in the recorder's settings"
+    if kind == "mavlink":
+        return (f"{head} in {waited_s:g} s, but MAVLink arrives now. If the flight controller was still starting, run "
+                "the check again. If not, the Pi is on another MAVLink device, not on the flight controller")
+    if kind == "nothing":
+        return (f"{head}, and nothing at all arrives on the port, at any usual speed. Check the wires (the Pi's TX, "
+                "pin 8, to the flight controller's RX, the Pi's RX, pin 10, to its TX, and ground), that the flight "
+                "controller is on, and that its port has SERIALn_PROTOCOL 2 (MAVLink 2): a port at -1 is off, and a "
+                "port set for a GPS (5) can be silent too")
+    if kind == "other":
+        return (f"{head}. Data arrives, but it is not MAVLink at any usual speed. Check that the port has "
+                f"SERIALn_PROTOCOL 2 (MAVLink 2, not GPS) and {speed}, and that no other device shares its wires")
+    return (f"{head}. Check the wires (Pi TX to the Cube's RX, Pi RX to the Cube's TX, and ground), and on the Cube "
+            "that port's SERIALn_PROTOCOL 2 (MAVLink 2, not GPS) and SERIALn_BAUD")
+
+
 def check(settings: Settings, camera, link_factory: Callable | None = None, listen_s: float = 6.0,
           out: Callable[[str], None] = print, clock: Callable[[], int] = time.monotonic_ns,
-          heartbeat_wait_s: float = 10.0, settle_s: float = 1.5) -> int:
-    """Check the camera, the card and the link on the ground. 0 when all is well."""
+          heartbeat_wait_s: float = 10.0, settle_s: float = 1.5,
+          read: Callable[[str, int, float], bytes] = read_port, port_listen_s: float = LISTEN_S) -> int:
+    """Check the camera, the card and the link on the ground. 0 when all is well. Without a heartbeat it listens to
+    what arrives on the port (``read``, ``port_listen_s`` at each speed) to say what is wrong."""
     from .link import STREAMS_HZ
 
     problems = 0
@@ -381,9 +534,14 @@ def check(settings: Settings, camera, link_factory: Callable | None = None, list
         while telemetry.autopilot is None and time.monotonic() < end:
             time.sleep(0.1)
         if telemetry.autopilot is None:
-            out(f"PROBLEM link: no heartbeat from the flight controller on {settings.device} at {settings.baud}. "
-                "Check the wires (Pi TX to the Cube's RX, Pi RX to the Cube's TX, and ground), and on the Cube "
-                f"that port's SERIALn_PROTOCOL 2 (MAVLink 2, not GPS) and SERIALn_BAUD.{port_hint(settings.device)}")
+            link.stop()                  # the port is free again for the listening
+            if not settings.device.lower().startswith(NETWORK_DEVICES):
+                speeds = len({settings.baud, *LISTEN_BAUDS})
+                out(f"NOTE    link: no heartbeat in {heartbeat_wait_s:g} s, listening to what arrives on "
+                    f"{settings.device} at {speeds} speeds (up to {math.ceil(speeds * port_listen_s)} s)")
+            kind, found_at = what_the_port_carries(settings.device, settings.baud, read=read, seconds=port_listen_s)
+            out(f"{no_heartbeat_line(settings.device, settings.baud, kind, found_at, heartbeat_wait_s)}."
+                f"{port_hint(settings.device)}")
             return problems + 1
         out(f"OK      flight controller: system {telemetry.autopilot[0]}, component {telemetry.autopilot[1]}")
         time.sleep(settle_s)                # the stream request goes out and the rates change
