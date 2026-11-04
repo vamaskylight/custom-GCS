@@ -451,10 +451,11 @@ class MainWindowUiLayoutMixin:
             if not logo_path.exists():
                 continue
             reader = QImageReader(str(logo_path))
-            # Qt 6 defaults ~256MB allocation guard on IHDR × bpp before scaled decode.
-            # Shipped `Vama Logo.png` has a very large declared canvas (~15k×6k) but small IDAT;
-            # without this, read() returns null and the UI falls back to "VGCS Logo" text.
-            reader.setAllocationLimit(512)
+            # The shipped `Vama Logo.png` is 670 x 300 (under 1 MB decoded). Until 2026-11-05 it was
+            # 15,171 x 6,793, and Qt's PNG reader cannot decode at a smaller size (setScaledSize below
+            # scales after a full decode): every start took about 0.6 s and 800 MB of peak memory for a
+            # logo 32 px high. A logo that big is refused here, and the button keeps its text.
+            reader.setAllocationLimit(64)
             reader.setAutoTransform(True)
             sz = reader.size()
             if sz.isValid():

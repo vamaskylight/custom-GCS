@@ -65,7 +65,7 @@ ICON_SCRIPT = r"""
 import sys
 from PIL import Image
 
-Image.MAX_IMAGE_PIXELS = None  # the logo is 15171 x 6793 pixels
+Image.MAX_IMAGE_PIXELS = None  # the logo was 15171 x 6793 pixels until 2026-11-05 (670 x 300 since)
 source, target = sys.argv[1], sys.argv[2]
 logo = Image.open(source).convert("RGBA")
 logo = logo.crop(logo.getbbox())
