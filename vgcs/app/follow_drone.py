@@ -29,6 +29,9 @@ _ARDUPILOT = 3          # MAV_AUTOPILOT_ARDUPILOTMEGA
 # VGCS hears no landed state: the drone counts as flying when it is armed and this high above its take-off point
 # (Follow starts at follow_guide.MIN_HEIGHT_M and ends under END_HEIGHT_M anyway).
 FLYING_HEIGHT_M = 1.0
+# ArduCopter flies the last speed for this many seconds when no new one comes, then stops (3 s as shipped). Read with
+# the drone's settings at the connect (vgcs/app/vehicle_params.py), as the app reads it from QGC's.
+GUID_TIMEOUT = "GUID_TIMEOUT"
 
 
 def _number(value) -> float:
@@ -52,6 +55,7 @@ class LinkFollowDrone(FollowDrone):
         self._vehicle_type: int | None = None
         self._autopilot: int | None = None
         self._mode_text = ""
+        self._flies_on_s = -1.0  # GUID_TIMEOUT, once the drone has said it
 
     def set_thread(self, thread) -> None:
         """VGCS's active drone's link (None: none). Another one than before: other_drone."""
@@ -62,10 +66,19 @@ class LinkFollowDrone(FollowDrone):
                 self._thread.telemetry.disconnect(self._on_telemetry)
             except (RuntimeError, TypeError):
                 pass
+            settings = getattr(self._thread, "params_snapshot", None)
+            if settings is not None:
+                try:
+                    settings.disconnect(self._on_params)
+                except (RuntimeError, TypeError):
+                    pass
         self._thread = thread
         self._reset()  # nothing of the last drone counts for this one
         if thread is not None:
             thread.telemetry.connect(self._on_telemetry)
+            settings = getattr(thread, "params_snapshot", None)  # a stand-in link may have none
+            if settings is not None:
+                settings.connect(self._on_params)
         self.other_drone.emit()
 
     def thread(self):
@@ -105,6 +118,19 @@ class LinkFollowDrone(FollowDrone):
                 heading_deg=_number(payload.get("hdg_deg")),
                 armed=self._armed, flying=self._armed and height >= FLYING_HEIGHT_M,
                 gps3d=self._gps3d, mode=self._mode()))
+
+    def _on_params(self, payload) -> None:
+        """The drone's settings as read (MavlinkThread.params_snapshot): GUID_TIMEOUT says how long it flies on."""
+        if not isinstance(payload, dict):
+            return
+        for name, value in payload.items():
+            if str(name).strip().upper() == GUID_TIMEOUT:
+                seconds = _number(value)
+                if math.isfinite(seconds) and seconds >= 0.0:
+                    self._flies_on_s = seconds
+
+    def flies_on_s(self) -> float:
+        return self._flies_on_s
 
     def _running(self) -> bool:
         thread = self._thread

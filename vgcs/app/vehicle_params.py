@@ -88,6 +88,9 @@ CHECKED = (
     "GPS2_TYPE",
     "GPS_TYPE2",
     "GPS_AUTO_SWITCH",
+    # Follow Me's question (vgcs/app/follow_drone.py): how long the drone flies its last speed
+    # when the speeds stop coming, before it stops (3 s as shipped).
+    "GUID_TIMEOUT",
 )
 
 # Read once the drone has answered, and again on "Refresh params". The mission

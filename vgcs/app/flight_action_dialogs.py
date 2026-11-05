@@ -164,7 +164,12 @@ def confirm_land(parent) -> bool:
 def follow_message(distance_m: float, speed_limit_mps: float, range_limit_m: float, min_distance_m: float,
                    flies_on_s: float = -1.0) -> str:
     """The question before Follow Me (vgcs/app/object_follow.py) takes the aircraft."""
-    flies_on = (f"for {flies_on_s:.0f} s" if flies_on_s >= 0.0 else "for a few seconds (GUID_TIMEOUT)")
+    # The drone's GUID_TIMEOUT as the app words it: whole seconds without a decimal, else one.
+    if flies_on_s > 0.0:
+        whole = abs(flies_on_s - round(flies_on_s)) < 1e-9
+        flies_on = f"for {flies_on_s:.0f} s" if whole else f"for {flies_on_s:.1f} s"
+    else:
+        flies_on = "for a few seconds (GUID_TIMEOUT)"
     return (
         f"The aircraft will follow the tracked object and keep its distance of {distance_m:.0f} m, at the height "
         "and heading it has now. It changes to Guided for this.\n\n"

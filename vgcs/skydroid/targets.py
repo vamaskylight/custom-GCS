@@ -93,3 +93,24 @@ def resolve_skydroid_control_hosts(settings, *, default: str = "192.168.144.108"
     _add(str(default))
     _add("192.168.144.12")  # legacy field note; PROTOCAL uses camera IP (.108) on UDP 5000
     return out
+
+
+def resolve_skydroid_tcp_host(settings, *, default: str = "192.168.144.108") -> str:
+    """
+    The one address of a camera that takes TOP over TCP (the C20, sold as the V20): the Host
+    setting, else the host of an RTSP URL, else the camera's own default address.
+
+    Never the PC's gateway (row B10, 2026-11-06): a TCP camera is asked at one address and never
+    probed, and on the RC's WiFi hotspot the gateway is the RC, which takes no TOP. A Host the
+    user typed is kept as it is.
+    """
+    host = str(settings.value("camera/skydroid_host", "") or "").strip()
+    if host:
+        return host
+    for key in ("video/rtsp_day", "video/rtsp_thermal"):
+        url = str(settings.value(key, "") or "").strip()
+        if url.lower().startswith("rtsp://"):
+            parsed = urlparse(url)
+            if parsed.hostname:
+                return str(parsed.hostname)
+    return str(default)

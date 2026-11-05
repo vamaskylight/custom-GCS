@@ -2583,6 +2583,13 @@ def object_follow(version: str, r: Report) -> None:
         run(2.0, until=lambda: watch.lat is not None and watch.yaw_deg is not None)
         drone = LinkFollowDrone()
         drone.set_thread(link)
+        # How long the drone flies its last speed when no new one comes (GUID_TIMEOUT): in the settings VGCS reads
+        # at the connect, for the question before the start (2026-11-06).
+        from vgcs.app.vehicle_params import READ_ON_CONNECT
+
+        link.queue_params_fetch(list(READ_ON_CONNECT))
+        r.check(run(20.0, until=lambda: drone.flies_on_s() >= 0.0) and abs(drone.flies_on_s() - 3.0) < 1e-6,
+                f"the drone says how long it flies its last speed: GUID_TIMEOUT {drone.flies_on_s():g} s (3 s as shipped)")
         obj.put(*_offset(watch.lat, watch.lon, 15.0, 0.0))
         follow = ObjectFollow(obj, drone)
         obj.lock(True)

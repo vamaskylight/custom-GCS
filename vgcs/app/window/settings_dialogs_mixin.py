@@ -570,7 +570,7 @@ class MainWindowSettingsDialogsMixin:
                 tcp = False
             skydroid_port_label.setText("TCP port" if tcp else "UDP port")
             skydroid_host.setPlaceholderText(
-                "Empty = the RTSP URL's host (a TCP camera is asked at one address)"
+                "Empty = the RTSP URL's host, else 192.168.144.108 (one address, never the RC gateway)"
                 if tcp
                 else "Empty = RTSP host + RC Wi-Fi gateway + 192.168.144.108"
             )

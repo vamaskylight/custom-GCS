@@ -85,6 +85,16 @@ from vgcs.video.camera_control import (
     resolve_skydroid_host,
     resolve_viewpro_host,
 )
+from vgcs.skydroid.command_map import get_profile
+from vgcs.skydroid.targets import resolve_skydroid_tcp_host
+
+
+def skydroid_profile_over_tcp(profile_id: str) -> bool:
+    """True for a camera that takes TOP over TCP at one address (the C20, or an added TCP camera)."""
+    try:
+        return get_profile(profile_id).transport == "tcp"
+    except Exception:
+        return False
 
 
 def skydroid_no_angles_hint(over: str, host: str, port: int) -> str:
@@ -97,7 +107,8 @@ def skydroid_no_angles_hint(over: str, host: str, port: int) -> str:
         return (
             f"Skydroid gimbal: no angles from {host}:{port} over TCP yet. A TCP camera (the V20) is asked "
             "at this one address only. Give the camera's own address as Host (192.168.144.108 on a V20), "
-            f"or leave Host empty for the RTSP URL's host, never the RC gateway. Ping {host} from this PC first."
+            "or leave Host empty for the RTSP URL's host (else 192.168.144.108), never the RC gateway. "
+            f"Ping {host} from this PC first."
         )
     return (
         "Skydroid gimbal: no TOP attitude yet. If RTSP works on RC Wi-Fi hotspot, "
@@ -308,11 +319,17 @@ class MainWindowLinkMixin:
             self._warn_camera_control_host_mismatch("siyi", host)
             return
         if provider == "skydroid":
-            hosts = resolve_skydroid_control_hosts(self._settings)
-            host = hosts[0] if hosts else resolve_skydroid_host(self._settings)
+            profile_id = str(self._settings.value("camera/skydroid_profile", "c13_default") or "c13_default")
+            if skydroid_profile_over_tcp(profile_id):
+                # A TCP camera (the V20) is asked at one address, never at the PC's gateway: on the RC's
+                # hotspot that is the RC, and the gimbal's commands would go there (row B10, 2026-11-06).
+                host = resolve_skydroid_tcp_host(self._settings)
+                hosts = [host]
+            else:
+                hosts = resolve_skydroid_control_hosts(self._settings)
+                host = hosts[0] if hosts else resolve_skydroid_host(self._settings)
             port = int(self._settings.value("camera/skydroid_port", 5000) or 5000)
             timeout_ms = int(self._settings.value("camera/skydroid_timeout_ms", 250) or 250)
-            profile_id = str(self._settings.value("camera/skydroid_profile", "c13_default") or "c13_default")
             cc = SkydroidCameraControl(
                 host=host,
                 hosts=hosts,
