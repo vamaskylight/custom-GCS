@@ -14,6 +14,7 @@
 #include "ProximityStore.h"
 #include "SettingsManager.h"
 #include "AudioOutput.h"
+#include "SkydroidLink.h"
 #include "VamaLicense.h"
 #include "VamaVoice.h"
 #include "VamaVoiceEngine.h"
@@ -22,6 +23,7 @@
 #include "Viewer3DSettings.h"
 
 #include <QtCore/QApplicationStatic>
+#include <QtCore/QCoreApplication>
 #include <QtCore/QTimer>
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlFile>
@@ -402,13 +404,16 @@ void CustomPlugin::createRootWindow(QQmlApplicationEngine *qmlEngine)
 {
     QGCCorePlugin::createRootWindow(qmlEngine);
 
-    // VAMA (row A9): over QGC's main window, the lock screen until a key opens the app.
+    // VAMA (row A9): over QGC's main window, the lock screen until a key opens the app. The app never
+    // opens without a key (2026-11-06): when the lock screen cannot be made, a plain screen covers the
+    // app and says why, and when no screen at all can be made, the app closes.
     if (_license && _license->locked()) {
         QQuickWindow *window = qmlEngine->rootObjects().isEmpty()
                                    ? nullptr
                                    : qobject_cast<QQuickWindow *>(qmlEngine->rootObjects().constFirst());
-        if (!_license->showLock(qmlEngine, window)) {
-            qCWarning(CustomLog) << "No lock screen: the drone links stay held back.";
+        if (!_license->lockWindow(qmlEngine, window)) {
+            qCWarning(CustomLog) << "No lock screen at all, so the app closes:" << _license->lockScreenProblem();
+            QTimer::singleShot(0, this, []() { QCoreApplication::quit(); });
         }
     }
 }
@@ -431,6 +436,9 @@ void CustomPlugin::_holdLinksWhileLocked()
     // With a key, QGC's auto-connect makes the links again within a second, and reconnects those it
     // had opened at the start (LinkManager::_reconnectAutoConnectLinks).
     (void) connect(_license, &VamaLicense::unlocked, this, []() { LinkManager::instance()->setConnectionsAllowed(); });
+    // The camera link waits too (2026-11-06): no gimbal, zoom, photo, record, torch or laser without a
+    // key, even where no lock screen could cover the app. It starts with the key, if it is switched on.
+    _license->holdWhileLocked([](bool held) { SkydroidLink::holdAll(held); });
 }
 
 void CustomPlugin::destroyQmlApplicationEngine(QQmlApplicationEngine *qmlEngine)

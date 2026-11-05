@@ -87,6 +87,24 @@ from vgcs.video.camera_control import (
 )
 
 
+def skydroid_no_angles_hint(over: str, host: str, port: int) -> str:
+    """The log's hint when a Skydroid camera has given no gimbal angles 4 s after the start.
+
+    A TCP camera (the V20) is asked at this one address and never probed, so the RC gateway is
+    no help there: the gimbal's commands would go to the RC (row B10, 2026-11-05).
+    """
+    if over == "TCP":
+        return (
+            f"Skydroid gimbal: no angles from {host}:{port} over TCP yet. A TCP camera (the V20) is asked "
+            "at this one address only. Give the camera's own address as Host (192.168.144.108 on a V20), "
+            f"or leave Host empty for the RTSP URL's host, never the RC gateway. Ping {host} from this PC first."
+        )
+    return (
+        "Skydroid gimbal: no TOP attitude yet. If RTSP works on RC Wi-Fi hotspot, "
+        "set Host to the RC gateway (e.g. 192.168.43.1) or connect PC Ethernet to the camera"
+    )
+
+
 class MainWindowLinkMixin:
     """Extracted from MainWindow — uses host state via self."""
 
@@ -323,10 +341,7 @@ class MainWindowLinkMixin:
                         return
                 except Exception:
                     pass
-                self._append_log(
-                    "Skydroid gimbal: no TOP attitude yet — if RTSP works on RC Wi-Fi hotspot, "
-                    "set Host to the RC gateway (e.g. 192.168.43.1) or connect PC Ethernet to the camera"
-                )
+                self._append_log(skydroid_no_angles_hint(over, ah, ap))
 
             QTimer.singleShot(4000, _skydroid_gimbal_hint)
             return

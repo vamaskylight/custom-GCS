@@ -514,7 +514,8 @@ class ObservationSessionMixin:
         elif row.get("gimbal_yaw_deg") is None and row.get("gimbal_pitch_deg") is None:
             msg += (
                 " — gimbal N/A (Skydroid C13: TOP UDP port 5000; on RC hotspot try Host=RC gateway "
-                "e.g. 192.168.43.1; ZR10: SIYI SDK UDP 37260)"
+                "e.g. 192.168.43.1; V20: TOP TCP port 5000 at the camera's own address, never the RC gateway; "
+                "VR10: SIYI SDK UDP 37260)"
             )
         elif dooaf_role != DOOAF_ROLE_SURVEY:
             session = build_dooaf_session(

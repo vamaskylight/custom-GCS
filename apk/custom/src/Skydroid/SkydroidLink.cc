@@ -1,6 +1,7 @@
 #include "SkydroidLink.h"
 
 #include <QtCore/QCoreApplication>
+#include <QtCore/QPointer>
 #include <QtCore/QSettings>
 #include <QtCore/QStandardPaths>
 #include <QtCore/QUrl>
@@ -48,6 +49,10 @@ constexpr int kDefaultPort = 5000;
 // The added cameras: a file each, in this folder of the app's own folder (as the map packs).
 constexpr const char *kCameraFolder = "Cameras";
 QString g_cameraFolder;  // given by tests and the screen preview
+// The app's one link (instance()), and whether links are held while the app has no license key
+// (holdAll, row A9).
+QPointer<SkydroidLink> g_appLink;
+bool g_holdAll = false;
 constexpr int kDefaultMaxSpeed = 20;     // deg/s at full deflection
 constexpr int kMinMaxSpeed = 5;
 constexpr int kMaxMaxSpeed = 60;         // GSY/GSP carry at most 63.5 deg/s
@@ -474,7 +479,8 @@ SkydroidLink::SkydroidLink(QObject *parent)
     _loadSettings();
     _applyModel();
     _rebuildEndpoints();
-    if (_enabled) {
+    _held = g_holdAll;  // made while the app has no key (row A9): it waits from the start
+    if (_enabled && !_held) {
         _start();
     }
 }
@@ -486,8 +492,35 @@ SkydroidLink::~SkydroidLink()
 
 SkydroidLink *SkydroidLink::instance()
 {
-    static SkydroidLink *link = new SkydroidLink(QCoreApplication::instance());
+    static SkydroidLink *link = []() {
+        auto *made = new SkydroidLink(QCoreApplication::instance());
+        g_appLink = made;
+        return made;
+    }();
     return link;
+}
+
+void SkydroidLink::holdAll(bool held)
+{
+    g_holdAll = held;
+    if (g_appLink) {
+        g_appLink->setHeld(held);
+    }
+}
+
+void SkydroidLink::setHeld(bool held)
+{
+    if (held == _held) {
+        return;
+    }
+    _held = held;
+    // Closed as when it is switched off: the gimbal stopped, the lens and the laser off first (_stop).
+    if (_held) {
+        _stop();
+    } else if (_enabled) {
+        _start();
+    }
+    emit heldChanged();
 }
 
 SkydroidLink *SkydroidLink::create(QQmlEngine *qmlEngine, QJSEngine *jsEngine)
@@ -715,7 +748,7 @@ void SkydroidLink::setEnabled(bool enabled)
     }
     _enabled = enabled;
     _saveSettings();
-    if (_enabled) {
+    if (_enabled && !_held) {
         _start();
     } else {
         _stop();

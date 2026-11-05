@@ -119,6 +119,8 @@ class SkydroidLink : public QObject
 
     // Settings, saved between runs
     Q_PROPERTY(bool enabled READ enabled WRITE setEnabled NOTIFY enabledChanged)
+    /// Closed while the app has no license key for this RC, whatever "enabled" says (row A9). Not saved.
+    Q_PROPERTY(bool held READ held NOTIFY heldChanged)
     Q_PROPERTY(QString host READ host WRITE setHost NOTIFY settingsChanged)
     Q_PROPERTY(int port READ port WRITE setPort NOTIFY settingsChanged)
     Q_PROPERTY(QString model READ model WRITE setModel NOTIFY settingsChanged)
@@ -263,6 +265,13 @@ public:
 
     bool enabled() const { return _enabled; }
     void setEnabled(bool enabled);
+    /// VAMA (row A9, 2026-11-06): while the app has no license key for this RC, the camera link stays
+    /// closed (no gimbal, zoom, photo, record, torch or laser), as QGC's drone links wait. "Camera link
+    /// on" is kept, and the link starts when a key opens the app. holdAll() is the plugin's switch: the
+    /// app's one link (instance()) and every link made after it. setHeld() is one link's.
+    static void holdAll(bool held);
+    bool held() const { return _held; }
+    void setHeld(bool held);
     QString host() const { return _host; }
     void setHost(const QString &host);
     int port() const { return _port; }
@@ -535,6 +544,7 @@ public:
 
 signals:
     void enabledChanged();
+    void heldChanged();
     void settingsChanged();
     /// A camera was added, changed or deleted (the camera editor), or the folder read again.
     void camerasChanged();
@@ -820,6 +830,7 @@ private:
 
     skydroid::top::Options _options;
     bool _enabled = false;
+    bool _held = false;  // row A9: no license key yet
     QString _host;
     int _port = 5000;
     skydroid::camera::Store _cameraStore;

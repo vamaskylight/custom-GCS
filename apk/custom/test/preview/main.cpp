@@ -60,6 +60,7 @@
 //   44_license_lock.png           the license lock over the whole window: the RC's device code (row A9)
 //   44b_license_wrong.png         after a key for another RC: why it does not open the app
 //   44c_license_open.png          after the right key: the lock is gone, QGC's dialog under it takes taps
+//   44d_license_plain.png         the plain screen when the lock screen cannot be made: why, the device code
 // It also taps the IR button twice and checks QGC's video address each time,
 // and checks the frames the camera got for the tap and the lock.
 // The lock is tried for real: the day picture is a look into a world that
@@ -140,6 +141,9 @@ namespace top = skydroid::top;
 namespace {
 
 int g_problems = 0;
+// Warnings a step makes on purpose (the plain lock screen, row A9): each one is passed over once, and
+// the step checks that it came.
+QStringList g_expectedWarnings;
 
 void messageHandler(QtMsgType type, const QMessageLogContext &, const QString &message)
 {
@@ -148,6 +152,12 @@ void messageHandler(QtMsgType type, const QMessageLogContext &, const QString &m
     // not the app (it cost one run of six a problem, 2026-10-15).
     if (message == QLatin1String("Retrying to obtain clipboard.")) {
         return;
+    }
+    for (qsizetype i = 0; i < g_expectedWarnings.size(); ++i) {
+        if (type == QtWarningMsg && message.startsWith(g_expectedWarnings.at(i))) {
+            g_expectedWarnings.removeAt(i);
+            return;
+        }
     }
     if (type != QtDebugMsg && type != QtInfoMsg) {
         ++g_problems;
@@ -714,6 +724,7 @@ public:
     std::string sdCard = "03200076E4";  // free MB, then total MB: 12.5 GB free of 29.7 GB
     static constexpr const char *kNoSdCard = "0000000000";
     QStringList texts;  // what came as text, not as a TOP frame: the V20's torch (row B27)
+    int datagrams = 0;  // everything that came (row A9: nothing while the app is locked)
 
 signals:
     void lookChanged();
@@ -743,6 +754,7 @@ private slots:
     {
         while (_socket.hasPendingDatagrams()) {
             const QNetworkDatagram d = _socket.receiveDatagram();
+            ++datagrams;
             const std::string raw(d.data().constData(), static_cast<size_t>(d.data().size()));
             if (raw.rfind("#tp", 0) == 0) {
                 continue;
@@ -1120,6 +1132,12 @@ int main(int argc, char *argv[])
     QString licenseClipboard;
     license.setClipboard([&licenseClipboard]() { return licenseClipboard; },
                          [&licenseClipboard](const QString &text) { licenseClipboard = text; });
+    // The same RC, with a lock screen that cannot be made (row A9, 2026-11-06): a plain screen instead.
+    VamaLicense plainLicense(nullptr);
+    plainLicense.setAndroidId(QString::fromLatin1(licenseVectors::kDevices[0].androidId));
+    plainLicense.setPublicKey(QByteArray::fromHex(licenseVectors::kTestPublicKeyHex));
+    plainLicense.setToday(QDate(2026, 11, 4));
+    plainLicense.setLockScreenUrl(QUrl(QStringLiteral("qrc:/Custom/qml/Vama/NoSuchLockScreen.qml")));
 
     OverrideInterceptor interceptor;  // declared first: the engine must not outlive it
     QQmlApplicationEngine engine;
@@ -1768,6 +1786,8 @@ int main(int argc, char *argv[])
     // popup, so its items are looked for in the window's items (the overlay), not its QObjects.
     QQuickWindow *licenseWindow = nullptr;
     QPointer<QObject> licenseLock;
+    QPointer<QObject> plainLock;  // the plain screen, when the lock screen cannot be made (2026-11-06)
+    int heldDatagrams = 0;        // what had come to the camera once its link was held (row A9)
     auto licenseItem = [&](const char *objectName) -> QQuickItem * {
         if (!licenseWindow) {
             return nullptr;
@@ -4117,6 +4137,10 @@ int main(int argc, char *argv[])
         // the stand-in window as CustomPlugin::createRootWindow makes it over QGC's (VamaLicense::showLock).
         {300, [&]() {
              license.load();
+             // The camera link waits while the app is locked, as CustomPlugin holds the app's one
+             // (SkydroidLink::holdAll, 2026-11-06).
+             license.holdWhileLocked([&link](bool held) { link.setHeld(held); });
+             expect(link.held() && !link.answering(), "license: while locked, the camera link is held", QString());
              const qsizetype windows = engine.rootObjects().size();
              engine.load(QUrl::fromLocalFile(QStringLiteral(VAMA_PREVIEW_DIR "/license.qml")));
              if (engine.rootObjects().size() == windows ||
@@ -4125,13 +4149,14 @@ int main(int argc, char *argv[])
                  ++g_problems;
                  return;
              }
-             licenseLock = license.showLock(&engine, licenseWindow);
-             expect(license.locked() && licenseLock, "license: without a key the app is locked, and the lock screen is made",
-                    QString());
+             licenseLock = license.lockWindow(&engine, licenseWindow);  // as CustomPlugin::createRootWindow
+             expect(license.locked() && licenseLock && licenseLock->objectName() == QStringLiteral("vamaLicenseLock"),
+                    "license: without a key the app is locked, and the lock screen is made", QString());
              // QGC opens its own dialogs at the start too (the first-run questions), after the lock.
              QMetaObject::invokeMethod(licenseWindow, "openQgcDialog");
          }},
         {500, [&]() {
+             heldDatagrams = camera.datagrams;  // what was on its way when the link was held has come
              if (!licenseWindow || !licenseLock) {
                  return;
              }
@@ -4186,11 +4211,19 @@ int main(int argc, char *argv[])
              const QString text = field ? field->property("text").toString() : QStringLiteral("no field");
              expect(text == licenseClipboard && !licenseShown("vamaLicenseProblem"),
                     "license: Paste puts the key in the field, and the words about the last key go", text.trimmed().left(20));
+             expect(link.held() && camera.datagrams == heldDatagrams,
+                    "license: nothing went to the camera while the app was locked",
+                    QString::number(camera.datagrams - heldDatagrams));
              licenseTap("vamaLicenseActivateButton");
          }},
         {300, [&]() {
              expect(!license.locked() && licenseLock.isNull(), "license: the right key opens the app, and the lock screen goes",
                     license.keySummary());
+             const bool talking = waitFor([&]() { return link.answering(); }, 3000);
+             expect(!link.held() && talking && camera.datagrams > heldDatagrams,
+                    "license: with the key, the camera link starts again", QString::number(camera.datagrams - heldDatagrams));
+             license.holdWhileLocked([&link](bool held) { link.setHeld(held); });
+             expect(!link.held(), "license: an open app holds nothing", QString());
              const QString saved = QSettings().value(QStringLiteral("VamaLicense/key")).toString();
              expect(saved == licenseKeyHere, "license: the key is saved for the next start", saved.left(20));
              licenseTap("previewQgcDialogButton");
@@ -4213,6 +4246,58 @@ int main(int argc, char *argv[])
              }
              const int under = licenseWindow->property("pressesUnder").toInt();
              expect(under == 101, "license: and so does the screen", QString::number(under));
+             licenseWindow->close();
+         }},
+        // When the lock screen cannot be made (row A9, 2026-11-06), a plain screen covers the app, made
+        // as CustomPlugin makes it (VamaLicense::lockWindow). It says why and shows the device code, and
+        // nothing under it takes a tap or a key. The same RC, its key gone again.
+        {300, [&]() {
+             QSettings().remove(QStringLiteral("VamaLicense"));
+             plainLicense.load();
+             const qsizetype windows = engine.rootObjects().size();
+             engine.load(QUrl::fromLocalFile(QStringLiteral(VAMA_PREVIEW_DIR "/license.qml")));
+             if (engine.rootObjects().size() == windows ||
+                 !(licenseWindow = qobject_cast<QQuickWindow *>(engine.rootObjects().last()))) {
+                 std::fprintf(stderr, "license window not loaded again\n");
+                 ++g_problems;
+                 return;
+             }
+             g_expectedWarnings = {QStringLiteral("the lock screen could not be made:"),
+                                   QStringLiteral("a plain screen covers the app in place of the lock screen")};
+             plainLock = plainLicense.lockWindow(&engine, licenseWindow);
+             expect(plainLicense.locked() && plainLock && plainLock->objectName() == QStringLiteral("vamaLicensePlainLock"),
+                    "license: when the lock screen cannot be made, a plain screen is made in its place",
+                    plainLicense.lockScreenProblem().left(120));
+             expect(g_expectedWarnings.isEmpty(), "license: and the app's log says so, with no other warning",
+                    g_expectedWarnings.join(QStringLiteral(" | ")));
+             g_expectedWarnings.clear();
+         }},
+        {300, [&]() {
+             auto *plain = qobject_cast<QQuickItem *>(plainLock.data());
+             if (!licenseWindow || !plain) {
+                 return;
+             }
+             expect(plain->isVisible() && qFuzzyCompare(plain->width(), qreal(licenseWindow->width())) &&
+                        qFuzzyCompare(plain->height(), qreal(licenseWindow->height())),
+                    "license: the plain screen covers the whole window",
+                    QStringLiteral("%1 x %2").arg(plain->width()).arg(plain->height()));
+             const QString says = licenseText("vamaLicensePlainLockText");
+             const QString why = plainLicense.lockScreenProblem();
+             expect(!why.isEmpty() && says.contains(QStringLiteral("its lock screen could not open")) &&
+                        says.contains(licenseDeviceCode) && says.contains(why),
+                    "license: it says why, with the device code, for a photo to VAMA", says.left(120));
+             shotOf(licenseWindow, "44d_license_plain.png");
+             licenseTap("previewUnderTheLock");
+             QKeyEvent back(QEvent::KeyPress, Qt::Key_Back, Qt::NoModifier);
+             QCoreApplication::sendEvent(plain, &back);
+             expect(back.isAccepted(), "license: the RC's back key stays on the plain screen", QString());
+         }},
+        {300, [&]() {
+             if (!licenseWindow) {
+                 return;
+             }
+             const int under = licenseWindow->property("pressesUnder").toInt();
+             expect(under == 0, "license: no tap reaches the screen under the plain one", QString::number(under));
              licenseWindow->close();
          }},
         {100, [&]() { QCoreApplication::quit(); }},

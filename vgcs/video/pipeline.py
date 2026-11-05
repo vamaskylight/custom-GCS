@@ -765,7 +765,9 @@ def _companion_hevc_showall_enabled() -> bool:
 #              texture heuristics all the time (C14 Pro, 2026-09-18: frames hidden
 #              at zoom step 0 with the gimbal still, VLC clean on the same PC).
 #   "off"    - show every decoded frame.
-# Set by the camera backend when it starts (SkydroidCameraControl); overridden
+# Set by the camera backend when it starts (SkydroidCameraControl from its
+# profile, the other camera controls "full"). Closing a backend leaves it, as the
+# camera's video runs on after a Disconnect (row B29, 2026-11-06). Overridden
 # by VGCS_COMPANION_QC_MODE=full|colour|off. VGCS_COMPANION_QC_GATE=0 == "off".
 QC_MODE_FULL = "full"
 QC_MODE_COLOUR = "colour"
@@ -3572,7 +3574,7 @@ class RtspSource(QObject):
                                                             "[VGCS:video] companion HEVC: "
                                                             "waiting for clean GOP before preview "
                                                             f"(skipped={corrupt_skip_streak}, "
-                                                            f"check={detail}"
+                                                            f"mode={_companion_qc_mode_active()}, check={detail}"
                                                             + (f", saved={dumped}" if dumped else "")
                                                             + ")"
                                                         )
@@ -3649,7 +3651,7 @@ class RtspSource(QObject):
                                                         "[VGCS:video] companion HEVC: "
                                                         f"hiding {why} frame "
                                                         f"(streak={corrupt_skip_streak}, "
-                                                        f"check={detail}, hold last good preview"
+                                                        f"mode={_companion_qc_mode_active()}, check={detail}, hold last good preview"
                                                         + (f", saved={dumped}" if dumped else "")
                                                         + ")"
                                                     )

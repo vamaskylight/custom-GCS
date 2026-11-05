@@ -23,11 +23,54 @@ namespace {
 const char kSettingsGroup[] = "VamaLicense";
 const char kLockScreen[] = "qrc:/Custom/qml/Vama/VamaLicenseLock.qml";
 
+// The screen that covers the app when the lock screen cannot be made (row A9, 2026-11-06). Only
+// QtQuick, so it can be made where the lock screen could not. It takes no key: it says why and
+// shows the device code, for a photo to VAMA. Every tap and key, the RC's back key too, stays here.
+const char kPlainLock[] = R"QML(
+import QtQuick
+
+Rectangle {
+    id: plain
+    objectName: "vamaLicensePlainLock"
+    required property string deviceCode
+    required property string problem
+    anchors.fill: parent
+    z: 1000000
+    color: "#101418"
+    focus: true
+    Component.onCompleted: forceActiveFocus()
+    Keys.onPressed: (event) => { event.accepted = true }
+    Keys.onReleased: (event) => { event.accepted = true }
+
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.AllButtons
+        hoverEnabled: true
+        preventStealing: true
+        onWheel: (wheel) => { wheel.accepted = true }
+    }
+
+    Text {
+        objectName: "vamaLicensePlainLockText"
+        anchors.centerIn: parent
+        width: parent.width * 0.85
+        wrapMode: Text.WordWrap
+        horizontalAlignment: Text.AlignHCenter
+        color: "#ffffff"
+        font.pixelSize: Math.max(16, Math.min(plain.width, plain.height) / 26)
+        text: qsTr("This copy of Vama GCS needs a license key for this RC, and its lock screen could not open.")
+              + "\n\n" + (plain.deviceCode !== "" ? qsTr("Device code: %1").arg(plain.deviceCode) + "\n\n" : "")
+              + qsTr("Please send a photo of this screen to VAMA.") + "\n\n" + plain.problem
+    }
+}
+)QML";
+
 } // namespace
 
 VamaLicense::VamaLicense(QObject *parent)
     : QObject(parent)
     , _publicKey(vama::license::builtInPublicKey())
+    , _lockScreenUrl(QString::fromLatin1(kLockScreen))
 {
 }
 
@@ -156,20 +199,63 @@ QString VamaLicense::clipboardText() const
 QObject *VamaLicense::showLock(QQmlEngine *engine, QQuickWindow *window)
 {
     if (!engine || !window || !window->contentItem()) {
-        qCWarning(VamaLicenseLog) << "no window for the lock screen";
+        _lockScreenProblem = QStringLiteral("no window for the lock screen");
+        qCWarning(VamaLicenseLog) << _lockScreenProblem;
         return nullptr;
     }
-    QQmlComponent component(engine, QUrl(QString::fromLatin1(kLockScreen)));
-    QObject *lock = component.createWithInitialProperties(QVariantMap{
-        {QStringLiteral("license"), QVariant::fromValue<QObject *>(this)},
-        {QStringLiteral("parent"), QVariant::fromValue<QQuickItem *>(window->contentItem())},
-    });
+    QQmlComponent component(engine, _lockScreenUrl);
+    QObject *lock = component.isReady() ? component.createWithInitialProperties(QVariantMap{
+                                              {QStringLiteral("license"), QVariant::fromValue<QObject *>(this)},
+                                              {QStringLiteral("parent"), QVariant::fromValue<QQuickItem *>(window->contentItem())},
+                                          })
+                                        : nullptr;
     if (!lock) {
-        qCWarning(VamaLicenseLog) << "the lock screen could not be made:" << component.errorString();
+        _lockScreenProblem = component.errorString().trimmed();
+        qCWarning(VamaLicenseLog) << "the lock screen could not be made:" << _lockScreenProblem;
         return nullptr;
     }
+    _lockScreenProblem.clear();
     lock->setParent(window);
     (void) QMetaObject::invokeMethod(lock, "open");
     (void) connect(this, &VamaLicense::unlocked, lock, &QObject::deleteLater);
     return lock;
+}
+
+QObject *VamaLicense::lockWindow(QQmlEngine *engine, QQuickWindow *window)
+{
+    if (QObject *lock = showLock(engine, window)) {
+        return lock;
+    }
+    return _showPlainLock(engine, window);
+}
+
+QObject *VamaLicense::_showPlainLock(QQmlEngine *engine, QQuickWindow *window)
+{
+    if (!engine || !window || !window->contentItem()) {
+        return nullptr;
+    }
+    QQmlComponent component(engine);
+    component.setData(QByteArray(kPlainLock), QUrl(QStringLiteral("qrc:/Custom/qml/Vama/VamaLicensePlainLock.qml")));
+    QObject *plain = component.isReady() ? component.createWithInitialProperties(QVariantMap{
+                                               {QStringLiteral("deviceCode"), deviceCode()},
+                                               {QStringLiteral("problem"), _lockScreenProblem},
+                                               {QStringLiteral("parent"), QVariant::fromValue<QQuickItem *>(window->contentItem())},
+                                           })
+                                         : nullptr;
+    if (!plain) {
+        qCWarning(VamaLicenseLog) << "the plain lock screen could not be made either:" << component.errorString();
+        return nullptr;
+    }
+    plain->setParent(window);
+    qCWarning(VamaLicenseLog) << "a plain screen covers the app in place of the lock screen";
+    return plain;
+}
+
+void VamaLicense::holdWhileLocked(std::function<void(bool)> hold)
+{
+    if (!hold || !_locked) {
+        return;
+    }
+    hold(true);
+    (void) connect(this, &VamaLicense::unlocked, this, [hold]() { hold(false); });
 }

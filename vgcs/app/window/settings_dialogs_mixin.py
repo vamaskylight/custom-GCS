@@ -388,7 +388,7 @@ class MainWindowSettingsDialogsMixin:
         rb_mavlink.setProperty("provider_id", "mavlink")
         rb_siyi = QRadioButton("VR10 Gimbal Camera (UDP)")
         rb_siyi.setProperty("provider_id", "siyi")
-        rb_skydroid = QRadioButton("Skydroid C12 / C13 / C14 Pro (UDP)")
+        rb_skydroid = QRadioButton("Skydroid C12 / C13 / C14 Pro (UDP), V20 (TCP)")
         rb_skydroid.setProperty("provider_id", "skydroid")
         rb_viewpro = QRadioButton("VPro Gimbal Camera (TCP)")
         rb_viewpro.setProperty("provider_id", "viewpro")
@@ -554,8 +554,29 @@ class MainWindowSettingsDialogsMixin:
 
         skydroid_grid.addWidget(QLabel("Host / IP"), 0, 0)
         skydroid_grid.addWidget(skydroid_host, 0, 1)
-        skydroid_grid.addWidget(QLabel("UDP port"), 1, 0)
+        skydroid_port_label = QLabel("UDP port")
+        skydroid_port_label.setObjectName("skydroidPortLabel")
+        skydroid_grid.addWidget(skydroid_port_label, 1, 0)
         skydroid_grid.addWidget(skydroid_port, 1, 1)
+
+        # A TCP camera (the V20) is asked at one address and never at the RC gateway (row B10,
+        # 2026-11-05), so the port's name and the empty Host's words follow the chosen profile.
+        def _sync_skydroid_transport_texts() -> None:
+            try:
+                from vgcs.skydroid.command_map import get_profile
+
+                tcp = get_profile(str(skydroid_profile.currentData() or "")).transport == "tcp"
+            except Exception:
+                tcp = False
+            skydroid_port_label.setText("TCP port" if tcp else "UDP port")
+            skydroid_host.setPlaceholderText(
+                "Empty = the RTSP URL's host (a TCP camera is asked at one address)"
+                if tcp
+                else "Empty = RTSP host + RC Wi-Fi gateway + 192.168.144.108"
+            )
+
+        skydroid_profile.currentIndexChanged.connect(lambda _index: _sync_skydroid_transport_texts())
+        _sync_skydroid_transport_texts()
         skydroid_grid.addWidget(QLabel("Timeout (ms)"), 2, 0)
         skydroid_grid.addWidget(skydroid_timeout, 2, 1)
         skydroid_grid.addWidget(QLabel("Firmware profile"), 3, 0)
@@ -626,6 +647,8 @@ class MainWindowSettingsDialogsMixin:
             "skydroid": (
                 "Skydroid gimbal TOP (PROTOCAL): UDP 192.168.144.108 port 5000 (#TP frames). "
                 "RTSP: rtsp://192.168.144.108:554/stream=1 (thermal :555/stream=2). "
+                "V20: Firmware profile C20, TOP over TCP port 5000 at the camera's own address "
+                "(never the RC gateway), RTSP rtsp://192.168.144.108:554/main. "
                 "PC Ethernet 192.168.144.10/24. Pick the camera model under Firmware profile - "
                 "it sets the lens the aim math uses. C14 Pro: video picks work at the widest "
                 "view only until Skydroid confirms its zoom formula."
@@ -640,7 +663,7 @@ class MainWindowSettingsDialogsMixin:
         _RTSP_PLACEHOLDER = {
             "mavlink": "rtsp://host/stream or udp://0.0.0.0:5600",
             "siyi": "VR10: rtsp://192.168.144.25:8554/main.264",
-            "skydroid": "C12/C13/C14 Pro: rtsp://192.168.144.108:554/stream=1",
+            "skydroid": "C12/C13/C14 Pro: rtsp://192.168.144.108:554/stream=1, V20: rtsp://192.168.144.108:554/main",
             "viewpro": "VPro: rtsp://192.168.144.119:554",
         }
 

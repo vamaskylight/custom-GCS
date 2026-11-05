@@ -113,12 +113,29 @@ class NoopCameraControl:
         return
 
 
+def _set_picture_checks(mode: str) -> str:
+    """Tell the video pipeline which artifact checks suit the camera whose control starts.
+
+    The pipeline does not know which camera is connected, so each camera control says
+    it when it starts. Closing a control changes nothing: a Disconnect closes it while
+    the camera's video runs on (row B29, 2026-11-06).
+    """
+    try:
+        from vgcs.video.pipeline import set_companion_qc_mode
+
+        return set_companion_qc_mode(mode)
+    except Exception:
+        return "full"
+
+
 class MavlinkCameraControl:
     """
     Stage 1 implementation: send camera control via MAVLink commands.
     """
 
     def __init__(self, mavlink_thread) -> None:
+        # Never a Skydroid camera's lighter checks (C20, C14 Pro) for another camera.
+        _set_picture_checks("full")
         self._t = mavlink_thread
         self._recording = False
 
@@ -347,13 +364,11 @@ class SkydroidCameraControl:
 
     def close(self) -> None:
         self._adapter.stop()
-        # Never leave this camera's leniency behind for the next one.
-        try:
-            from vgcs.video.pipeline import set_companion_qc_mode
-
-            set_companion_qc_mode("full")
-        except Exception:
-            pass
+        # The picture checks stay. A Disconnect closes this control while the
+        # camera's video runs on, and the full checks hide the frames of a sharp
+        # picture: in the client's V20 log the picture froze right after the
+        # disconnect (row B29, 2026-11-05). The next camera control sets its own
+        # checks when it starts.
 
     def _zoom_max(self) -> float:
         """The highest counted zoom of this camera (an added camera's own, else 30x)."""
@@ -1010,6 +1025,8 @@ class SiyiCameraControl:
         timeout_s: float = 0.25,
         retries: int = 1,
     ) -> None:
+        # Never a Skydroid camera's lighter checks (C20, C14 Pro) for another camera.
+        _set_picture_checks("full")
         self._adapter = SiyiGimbalUdpAdapter(
             host=host,
             port=port,
@@ -1183,6 +1200,8 @@ class ViewproCameraControl:
         port: int = 2000,
         timeout_s: float = 1.0,
     ) -> None:
+        # Never a Skydroid camera's lighter checks (C20, C14 Pro) for another camera.
+        _set_picture_checks("full")
         self._adapter = ViewproGimbalTcpAdapter(host=host, port=port, timeout_s=timeout_s)
         self._lrf_locked = False
         self._lrf_lock_error = ""

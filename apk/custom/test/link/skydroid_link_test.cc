@@ -963,7 +963,99 @@ private slots:
         _link = nullptr;
         _camera = nullptr;
         SkydroidLink::setProbeTargets({}, {});
+        SkydroidLink::holdAll(false);
     }
+
+    // --- Held while the app has no license key (row A9, 2026-11-06) ----------------------
+    // Nothing reaches a camera while the app is locked, even where no lock screen covers the app.
+
+    void aHeldLinkSendsNothingAndStartsWhenLetGo()
+    {
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        QSignalSpy held(_link, &SkydroidLink::heldChanged);
+        _link->setHeld(true);
+        QVERIFY(_link->held());
+        QCOMPARE(held.size(), 1);
+        QVERIFY(!_link->answering());
+        QVERIFY(_link->enabled());  // "Camera link on" is kept
+        QTest::qWait(300);          // what was on its way
+        _camera->clear();
+        _link->setTouchMotion(1.0, 0.0);
+        _link->zoom(1);
+        _link->takePhoto();
+        _link->fireLaser();
+        QTest::qWait(700);
+        QCOMPARE(_camera->received.size(), 0);
+        // Switched off and on again while held: still nothing.
+        _link->setEnabled(false);
+        _link->setEnabled(true);
+        QTest::qWait(700);
+        QCOMPARE(_camera->received.size(), 0);
+        QVERIFY(!_link->answering());
+        _link->setHeld(false);
+        QCOMPARE(held.size(), 2);
+        QTRY_VERIFY_WITH_TIMEOUT(_link->answering(), 2000);
+        QVERIFY(_camera->received.size() > 0);
+    }
+
+    void aLinkLetGoWhileSwitchedOffStaysClosed()
+    {
+        _link->setHeld(true);
+        _link->setEnabled(false);
+        QTest::qWait(300);
+        _camera->clear();
+        _link->setHeld(false);
+        QTest::qWait(700);
+        QCOMPARE(_camera->received.size(), 0);
+        QVERIFY(!_link->answering());
+    }
+
+    void holdingStopsAMovingGimbalAndClosesItsConnection()
+    {
+        FakeTcpCamera c20;
+        _link->setModel("C20");
+        _link->setPort(c20.port());
+        QTRY_VERIFY_WITH_TIMEOUT(c20.connected(), 3000);
+        _link->setTouchMotion(0.0, 1.0);  // tilting up, kept going as a finger does (see the C20 tests)
+        QElapsedTimer waited;
+        waited.start();
+        while (c20.countStartingWith("#TPUG2wGSP") < 1 && waited.elapsed() < 2000) {
+            QTest::qWait(50);
+            _link->setTouchMotion(0.0, 1.0);
+        }
+        QVERIFY(c20.countStartingWith("#TPUG2wGSP") >= 1);
+        c20.received.clear();
+        _link->setHeld(true);
+        QTRY_VERIFY_WITH_TIMEOUT(c20.countEqual(top::buildGimbalSpeedAxis("GSP", 0.0)) >= 1, 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.closedByLink, 1, 2000);
+        _link->setTouchMotion(0.0, 1.0);  // a touch while held moves nothing
+        QTest::qWait(2500);
+        QCOMPARE(c20.accepts, 1);  // held: not opened again
+        QCOMPARE(c20.countStartingWith("#TPUG2wGSP"), c20.countEqual(top::buildGimbalSpeedAxis("GSP", 0.0)));  // only the stop
+        _link->setHeld(false);
+        QTRY_COMPARE_WITH_TIMEOUT(c20.accepts, 2, 3000);
+    }
+
+    void aLinkMadeWhileAllAreHeldWaitsFromTheStart()
+    {
+        // The plugin holds the links before QML makes the app's one (SkydroidLink::holdAll); this link
+        // finds init()'s camera in the settings, switched on.
+        _link->setHeld(true);
+        QTest::qWait(300);
+        _camera->clear();
+        SkydroidLink::holdAll(true);
+        SkydroidLink later(nullptr);
+        QVERIFY(later.held());
+        QVERIFY(later.enabled());
+        QTest::qWait(700);
+        QCOMPARE(_camera->received.size(), 0);
+        later.setHeld(false);
+        QTRY_VERIFY_WITH_TIMEOUT(later.answering(), 2000);
+        SkydroidLink::holdAll(false);
+        SkydroidLink after(nullptr);  // made once the app has its key
+        QVERIFY(!after.held());
+    }
+    // aKeyLetsTheAppsOneLinkGo is the last test: the app's one link lives on after its test.
 
     // --- A camera that takes TOP over TCP (the C20, task AJ) -----------------
 
@@ -7563,6 +7655,30 @@ private slots:
         QTRY_VERIFY2_WITH_TIMEOUT(!follow->notReadyText().contains("Lock the object first"), qPrintable(follow->notReadyText()), 2000);
         link->stopLock();
         link->setEnabled(false);
+    }
+
+    void aKeyLetsTheAppsOneLinkGo()
+    {
+        // Row A9 (2026-11-06): the app's link (instance(), which QML makes; the test above made it when
+        // the whole test runs) waits while the plugin holds every link (CustomPlugin), and the key lets
+        // it go. The last test, as the app's link lives on after it.
+        _link->setHeld(true);
+        QTest::qWait(300);
+        _camera->clear();
+        SkydroidLink::holdAll(true);
+        SkydroidLink *app = SkydroidLink::instance();
+        QVERIFY(app->held());
+        app->setHost("127.0.0.1");
+        app->setPort(_camera->port());
+        app->setModel("C13");
+        app->setEnabled(true);  // switched on while held: it waits
+        QTest::qWait(700);
+        QCOMPARE(_camera->received.size(), 0);
+        QVERIFY(!app->answering());
+        SkydroidLink::holdAll(false);
+        QVERIFY(!app->held());
+        QTRY_VERIFY_WITH_TIMEOUT(app->answering(), 2000);
+        app->setEnabled(false);
     }
 
 private:
