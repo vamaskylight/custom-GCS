@@ -57,6 +57,7 @@ def main() -> None:
     ]
     for name, packet in (("zoomIn", c.build_zoom_in()), ("zoomOut", c.build_zoom_out()),
                          ("zoomStop", c.build_zoom_stop()), ("zoomQuery", c.build_zoom_query()),
+                         ("stateQuery", c.build_state_query()),
                          ("photo", c.build_photo()), ("recordStart", c.build_record_start()),
                          ("recordStop", c.build_record_stop()),
                          ("torchOn", c.build_torch(True)), ("torchOff", c.build_torch(False))):

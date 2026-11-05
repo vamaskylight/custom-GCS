@@ -19,6 +19,10 @@
 // payload says it does not read. The torch is not on this port: C20Gimbal.toggleLED writes the text
 // "AT+LED -t1" (on) or "AT+LED -t0" (off) on the gimbal connection, port 5000, and reads nothing back.
 //
+// The camera's state (group 0x33, command 0x55, no payload) is asked as the SDK's ReadStateThread
+// asks it: at once, then every 15 s, its answer left unread. The client's V20 closed VGCS's connection,
+// which asked nothing, every 20 to 24 s (row B29, 2026-11-05).
+//
 // A port of vgcs/skydroid/c20_camera.py, checked against it (gen_c20_vectors.py). Plain C++17 with no
 // Qt, unit tested by apk/custom/test/c20_camera_test.cc.
 
@@ -43,6 +47,8 @@ constexpr std::uint8_t kGroupCamera = 0x33;
 constexpr std::uint8_t kCmdCapture = 0x81;            // a photo, a record start, a record stop
 constexpr std::size_t kCapturePayloadLen = 32;
 constexpr std::size_t kCaptureReplyMinPayload = 32;  // the SDK takes a reply to one as done only with this much
+constexpr std::uint8_t kCmdState = 0x55;              // the SDK's getCameraState
+constexpr int kStateAskMs = 15000;                    // its ReadStateThread's wait between two
 
 /// 6 zero bytes, group, command, the payload's length (high byte first), the payload.
 Bytes packet(std::uint8_t group, std::uint8_t command, const Bytes &payload = {});
@@ -52,6 +58,8 @@ Bytes zoomOut();
 /// The SDK's stopZoomOrFucus: it stops a zoom and a focus move.
 Bytes zoomStop();
 Bytes zoomQuery();
+/// The SDK's getCameraState: no payload, so a length of 0.
+Bytes stateQuery();
 
 Bytes photo();
 Bytes recordStart();

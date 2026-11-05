@@ -331,6 +331,8 @@ QList<int> g_probePorts = {5000, 9003, 19856};
 
 // The C20's camera port (row B10): Skydroid's binary packets on TCP 8100 (C20Camera.h). Tests use another.
 int g_c20CameraPort = c20::kPort;
+// How often its state is asked there (row B29, 2026-11-06): 15 s, as Skydroid's SDK. Tests use less.
+int g_c20StateAskMs = c20::kStateAskMs;
 
 /// The same frame with the upper-case "#TP" header that Skydroid's TOP
 /// documents use for every gimbal frame (the checksum covers the header).
@@ -466,6 +468,7 @@ SkydroidLink::SkydroidLink(QObject *parent)
     connect(&_tcpConnectTimer, &QTimer::timeout, this, &SkydroidLink::_tcpLost);
     connect(&_c20PortRetryTimer, &QTimer::timeout, this, &SkydroidLink::_syncC20Port);
     connect(&_c20PortConnectTimer, &QTimer::timeout, this, &SkydroidLink::_c20PortLost);
+    connect(&_c20StateTimer, &QTimer::timeout, this, [this]() { _sendC20(c20::stateQuery()); });
     connect(&_videoWaitTimer, &QTimer::timeout, this, &SkydroidLink::_probeVideoPort);
     connect(&_dueTimer, &QTimer::timeout, this, &SkydroidLink::_sendDue);
 
@@ -668,6 +671,11 @@ void SkydroidLink::setProbeTargets(const QStringList &hosts, const QList<int> &p
 void SkydroidLink::setC20CameraPort(int port)
 {
     g_c20CameraPort = port;
+}
+
+void SkydroidLink::setC20StateAskMs(int ms)
+{
+    g_c20StateAskMs = ms;
 }
 
 // --- Settings --------------------------------------------------------------
@@ -1369,6 +1377,10 @@ void SkydroidLink::_syncC20Port()
     connect(_c20Port, &QTcpSocket::connected, this, [this]() {
         _c20PortConnectTimer.stop();
         _c20Port->setSocketOption(QAbstractSocket::LowDelayOption, 1);  // after the connection (see _openTcp)
+        // Its state at once and then every 15 s, as Skydroid's SDK asks it (its ReadStateThread): the
+        // client's V20 closed a connection that asked nothing every 20 to 24 s (row B29).
+        _sendC20(c20::stateQuery());
+        _c20StateTimer.start(g_c20StateAskMs);
         _sendC20(c20::zoomQuery());
     });
     connect(_c20Port, &QTcpSocket::readyRead, this, &SkydroidLink::_readC20Port);
@@ -1385,6 +1397,7 @@ void SkydroidLink::_closeC20Port()
     }
     QTcpSocket *port = std::exchange(_c20Port, nullptr);
     _c20PortConnectTimer.stop();
+    _c20StateTimer.stop();
     port->disconnect(this);  // a close asked for is not a lost camera
     port->flush();           // a stop just written still goes out
     port->abort();

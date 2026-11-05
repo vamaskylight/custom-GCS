@@ -423,16 +423,25 @@ public:
     FakeC20Port()
     {
         _server.listen(QHostAddress::LocalHost, 0);
+        _clock.start();
         connect(&_server, &QTcpServer::newConnection, this, [this]() {
             while (QTcpSocket *socket = _server.nextPendingConnection()) {
                 ++accepts;
                 hangUp();
                 _conn = socket;
+                _lastState = _clock.elapsed();
                 connect(socket, &QTcpSocket::readyRead, this, &FakeC20Port::_read);
             }
         });
         _motion.setInterval(100);
         connect(&_motion, &QTimer::timeout, this, [this]() { zoom = std::clamp(zoom + _direction, 1, 22); });
+        _watchdog.setInterval(50);
+        connect(&_watchdog, &QTimer::timeout, this, [this]() {
+            if (stateWatchdogMs >= 0 && _conn && _clock.elapsed() - _lastState > stateWatchdogMs) {
+                hangUp();  // closed by the camera
+            }
+        });
+        _watchdog.start();
     }
 
     quint16 port() const { return _server.serverPort(); }
@@ -445,6 +454,10 @@ public:
     /// A photo or record command (row B26) gets a reply with this much payload: 32 or more is done
     /// to Skydroid's SDK, less failed. -1: no reply.
     int captureReplyPayload = 32;
+    /// As the client's V20 seemed to (row B29): a connection that has not asked the state within this many
+    /// ms is closed by the camera (-1: never).
+    int stateWatchdogMs = -1;
+    std::vector<qint64> stateAt;  // when each state question came, ms on this camera's clock
     std::vector<c20::Bytes> received;
 
     int count(const c20::Bytes &packet) const { return static_cast<int>(std::count(received.begin(), received.end(), packet)); }
@@ -470,7 +483,12 @@ private:
         const auto *bytes = reinterpret_cast<const std::uint8_t *>(data.constData());
         for (const c20::Bytes &packet : c20::splitPackets(c20::Bytes(bytes, bytes + data.size()))) {
             received.push_back(packet);
-            if (packet == c20::zoomIn() || packet == c20::zoomOut()) {
+            if (packet == c20::stateQuery()) {
+                _lastState = _clock.elapsed();
+                stateAt.push_back(_lastState);
+                const c20::Bytes reply = c20::packet(c20::kGroupCamera, c20::kCmdState, c20::Bytes(12, 0x01));
+                _conn->write(reinterpret_cast<const char *>(reply.data()), static_cast<qint64>(reply.size()));
+            } else if (packet == c20::zoomIn() || packet == c20::zoomOut()) {
                 _direction = packet == c20::zoomIn() ? 1 : -1;
                 _motion.start();
             } else if (packet == c20::zoomStop() && stopWorks) {
@@ -494,6 +512,9 @@ private:
     QTcpSocket *_conn = nullptr;
     QTimer _motion;
     int _direction = 0;
+    QElapsedTimer _clock;
+    qint64 _lastState = 0;  // the last state question, or the connection
+    QTimer _watchdog;
 };
 
 /// A Viewpro camera (task AK) on 127.0.0.1. The app's frames come over TCP, a serial frame in a TCP
@@ -934,6 +955,7 @@ private slots:
         QDir(_cameraFolder()).removeRecursively();
         SkydroidLink::setProbeTargets({}, {});
         SkydroidLink::setC20CameraPort(c20::kPort);
+        SkydroidLink::setC20StateAskMs(c20::kStateAskMs);
         _vehicle.position = QGeoCoordinate(20.0, 72.0);
         _vehicle.gps.set("lock", 3);
         _vehicle.vehicle.set("heading", 0.0);
@@ -1369,6 +1391,58 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(_link->zoomLabel(), QString("1.0x"), 3000);  // asked on the connection
         c20.received.clear();
         camera.received.clear();
+    }
+
+    // --- The C20's state on its camera port (row B29, 2026-11-06) ---------------------
+    // The client's V20 closed VGCS's camera port every 20 to 24 s, and Skydroid's SDK asks the state at
+    // once and every 15 s (its ReadStateThread). The tests shorten both times.
+
+    void c20PortAsksTheStateAtOnceAndEverySoOften()
+    {
+        SkydroidLink::setC20StateAskMs(300);
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        QTRY_VERIFY_WITH_TIMEOUT(camera.stateAt.size() >= 4, 3000);
+        for (std::size_t i = 1; i < camera.stateAt.size(); ++i) {
+            const qint64 gap = camera.stateAt[i] - camera.stateAt[i - 1];
+            QVERIFY2(gap > 200 && gap < 600, qPrintable(QString::number(gap)));
+        }
+    }
+
+    void c20PortAsksTheStateAtOnceOnANewConnection()
+    {
+        SkydroidLink::setC20StateAskMs(5000);
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        connectC20(c20, camera);
+        QTRY_COMPARE_WITH_TIMEOUT(static_cast<int>(camera.stateAt.size()), 1, 1000);
+        camera.hangUp();
+        QTRY_COMPARE_WITH_TIMEOUT(camera.accepts, 2, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(static_cast<int>(camera.stateAt.size()), 2, 1000);  // at once, not 5 s later
+    }
+
+    void c20PortThatWantsTheStateQuestionStaysOpen()
+    {
+        SkydroidLink::setC20StateAskMs(200);
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        camera.stateWatchdogMs = 600;
+        connectC20(c20, camera);
+        QTest::qWait(2000);
+        QCOMPARE(camera.accepts, 1);
+        QVERIFY(camera.connected());
+    }
+
+    void c20PortWithoutTheStateQuestionIsClosedBySuchACamera()
+    {
+        // As the app was before 2026-11-06, asking nothing between: closed again and again.
+        SkydroidLink::setC20StateAskMs(60000);
+        FakeTcpCamera c20;
+        FakeC20Port camera;
+        camera.stateWatchdogMs = 600;
+        connectC20(c20, camera);
+        QTRY_VERIFY_WITH_TIMEOUT(camera.accepts >= 2, 6000);
     }
 
     void c20ZoomGoesToItsCameraPortAndStopsAMomentLater()

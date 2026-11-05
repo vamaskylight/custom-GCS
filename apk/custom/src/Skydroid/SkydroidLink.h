@@ -541,6 +541,8 @@ public:
     static void setProbeTargets(const QStringList &hosts, const QList<int> &ports);
     /// The C20's camera port (8100, C20Camera.h). Tests use another.
     static void setC20CameraPort(int port);
+    /// How often its state is asked on that port (15 s, as Skydroid's SDK). Tests use less.
+    static void setC20StateAskMs(int ms);
 
 signals:
     void enabledChanged();
@@ -801,6 +803,7 @@ private:
     QString _c20PortHost;
     QTimer _c20PortRetryTimer;
     QTimer _c20PortConnectTimer;
+    QTimer _c20StateTimer;          // its state asked while the port is connected (row B29)
     int _c20Zoom = 0;               // the zoom the C20 says, 1 to 22 (0: not yet)
     viewpro::Camera _viewpro;       // the rules of a Viewpro camera in use (task AK)
     siyi::Camera _siyi;             // and of a SIYI camera

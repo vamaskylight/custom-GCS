@@ -58,6 +58,11 @@ Bytes zoomQuery()
     return packet(kGroupZoom, kCmdZoomRead, {0x00, 0x00});
 }
 
+Bytes stateQuery()
+{
+    return packet(kGroupCamera, kCmdState);
+}
+
 Bytes photo()
 {
     return capture(0x0C);

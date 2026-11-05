@@ -21,6 +21,10 @@ failed (``DataAbortException``), and none as a time-out. What the payload says i
 The torch is not on this port: ``C20Gimbal.toggleLED`` writes the text ``AT+LED -t1`` (on) or
 ``AT+LED -t0`` (off) on the gimbal connection, port 5000, and reads nothing back.
 
+The camera's state (group 0x33, command 0x55, no payload) is asked as the SDK's ``ReadStateThread``
+asks it: at once, then every 15 s, its answer left unread. The client's V20 closed a connection that
+asked nothing every 20 to 24 s (row B29, 2026-11-05).
+
 The app has the same in C++ (apk/custom/src/Skydroid/C20Camera.*), checked against this file
 by apk/custom/test/gen_c20_vectors.py.
 """
@@ -43,6 +47,12 @@ ZOOM_MAX = 22
 ZOOM_READ_MIN_PAYLOAD = 16
 GROUP_CAMERA = 0x33
 CMD_CAPTURE = 0x81  # a photo, a record start, a record stop
+# The camera's state (the SDK's getCameraState: group 0x33, command 0x55, no payload). The SDK's
+# ReadStateThread asks it at once and then every 15 s, and does nothing with the answer. VGCS asked
+# nothing while idle, and the client's V20 closed VGCS's connection every 20 to 24 s ("forcibly
+# closed by the remote host", v20_log.txt of 2026-11-05, row B29): asked as the SDK does since 2026-11-06.
+CMD_STATE = 0x55
+STATE_ASK_S = 15.0
 CAPTURE_PAYLOAD_LEN = 32
 # The SDK takes a reply to a photo or record command as done only with this much payload.
 CAPTURE_REPLY_MIN_PAYLOAD = 32
@@ -78,6 +88,11 @@ def build_zoom_stop() -> bytes:
 
 def build_zoom_query() -> bytes:
     return build_packet(GROUP_ZOOM, CMD_ZOOM_READ, b"\x00\x00")
+
+
+def build_state_query() -> bytes:
+    """The SDK's getCameraState: no payload, so a length of 0."""
+    return build_packet(GROUP_CAMERA, CMD_STATE)
 
 
 def _build_capture(action: int) -> bytes:
@@ -152,19 +167,23 @@ class C20CameraPort:
     """One TCP connection to the camera port while the C20 is in use, its zoom as it last said
     it, and its replies to photo and record commands.
 
-    A thread keeps the connection (tried again 2 s after a failure, said once in the log)
-    and reads the replies. ``send`` never waits for a connection: a packet sent while there
-    is none is dropped, and says so by returning False.
+    A thread keeps the connection (tried again 2 s after a failure, said once in the log),
+    asks the camera's state at once and every ``state_ask_s`` as the SDK does, and reads the
+    replies. ``send`` never waits for a connection: a packet sent while there is none is
+    dropped, and says so by returning False.
     """
 
     _CONNECT_TIMEOUT_S = 1.0
     _RETRY_GAP_S = 2.0
     _SEND_TIMEOUT_S = 0.5
 
-    def __init__(self, host: str, port: int = PORT, *, log: Callable[[str], None] | None = None) -> None:
+    def __init__(self, host: str, port: int = PORT, *, log: Callable[[str], None] | None = None,
+                 state_ask_s: float = STATE_ASK_S) -> None:
         self._host = str(host or "").strip()
         self._port = int(port)
         self._log = log
+        self._state_ask_s = max(0.05, float(state_ask_s))
+        self._next_state_ask = 0.0  # time.monotonic of the next state question
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
         self._running = False
@@ -250,6 +269,9 @@ class C20CameraPort:
                     while self._running and time.monotonic() < deadline:
                         time.sleep(0.05)
                 continue
+            if time.monotonic() >= self._next_state_ask:
+                self._next_state_ask = time.monotonic() + self._state_ask_s
+                self.send(build_state_query())  # its answer is read and left, as by the SDK
             try:
                 readable, _, _ = select.select([sock], [], [], 0.1)
             except (OSError, ValueError):
@@ -296,6 +318,7 @@ class C20CameraPort:
                 sock.close()
                 return False
             self._sock = sock
+        self._next_state_ask = 0.0  # a new connection asks the state at once, as the SDK's thread starts
         self._said_cannot_connect = False
         self._say(f"connected to {self._host}:{self._port}")
         return True

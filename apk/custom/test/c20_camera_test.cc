@@ -72,6 +72,8 @@ int main()
     check(toHex(zoomOut()) == "0000000000002231000" "30C0001", "the SDK's zoom out");
     check(toHex(zoomStop()) == "0000000000002231000" "30B0101", "the SDK's stop");
     check(toHex(zoomQuery()) == "000000000000224A00020000", "the SDK's zoom read");
+    // Its getCameraState (row B29): group 0x33, command 0x55, no payload; asked every 15 s.
+    check(toHex(stateQuery()) == "00000000000033550000" && kStateAskMs == 15000, "the SDK's state question");
     check(kPort == 8100, "the camera port of the SDK's demo");
     // Its takePicture, startRecordVideo, stopRecordVideo (row B26): 32 bytes, all zero but two.
     const std::string zeros(60, '0');
@@ -92,6 +94,8 @@ int main()
             got = zoomStop();
         } else if (name == "zoomQuery") {
             got = zoomQuery();
+        } else if (name == "stateQuery") {
+            got = stateQuery();
         } else if (name == "photo") {
             got = photo();
         } else if (name == "recordStart") {
