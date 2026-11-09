@@ -13,9 +13,10 @@ import math
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSettings, QSize, Qt, Signal, QTimer
+from PySide6.QtCore import QEvent, QSettings, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QMouseEvent, QPixmap, QRegion
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -477,7 +478,10 @@ class _TallScrollArea(QScrollArea):
             return super().sizeHint()
         frame = 2 * self.frameWidth()
         hint = inner.sizeHint()
-        return QSize(hint.width() + frame, hint.height() + frame)
+        # Room for the scroll bar too: when it comes (a low window), it would otherwise take its width
+        # from what it holds, and the right edge of the Create Plan cards went under it (2026-11-09).
+        bar = self.verticalScrollBar().sizeHint().width()
+        return QSize(hint.width() + frame + bar, hint.height() + frame)
 
 
 class PlanTemplateCard(QFrame):
@@ -553,6 +557,16 @@ class PlanFlightPanel(QWidget):
         self._refresh_chrome()
         self._render_waypoint_rows()
         self.set_sequence_template("")
+        # A list box asks for the width of its longest choice. In the 340 px mission column that pushed
+        # the Fence tab past the column's edge, its text and its fields cut off on the right (by 9 px
+        # with the old style, by 38 px with the 2026-11-09 restyle's padding). The lists take the
+        # column's width now, and show every choice in full when opened.
+        for combo in self.findChildren(QComboBox):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            # Qt keeps a list box's first minimum width until its style changes; a new policy alone
+            # leaves the old width in force.
+            QApplication.sendEvent(combo, QEvent(QEvent.Type.StyleChange))
         self._relayout()
 
     # ------------------------------------------------------------------ Top bar

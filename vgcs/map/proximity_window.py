@@ -20,11 +20,12 @@ from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QMenu, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
+from vgcs.app import ui_theme
 from vgcs.app.obstacle_watch import BAR_RANGE_CHOICES_M, DEFAULT_BAR_RANGE_M, metres_words
 
 GEOMETRY_SETTING = "proximity/window_geometry"
 
-BACKGROUND = QColor(37, 39, 43)
+BACKGROUND = QColor(ui_theme.WINDOW)  # the theme's window (2026-11-09 restyle)
 GRID = QColor(200, 200, 200, 110)
 GRID_TEXT = QColor(170, 174, 180)
 RING_TEXT = QColor(40, 170, 70)  # Mission Planner's green ring labels
@@ -212,11 +213,11 @@ class ProximityWindow(QDialog):
         self.setMinimumSize(260, 300)
         self.resize(460, 500)
         self.setStyleSheet(
-            "QDialog#proximityWindow { background: #25272b; }"
-            "QLabel { color: #d6dae2; background: transparent; }"
-            "QPushButton { color: #e6eaf2; background: #343841; border: 1px solid #4a505c; border-radius: 4px;"
-            " padding: 4px 10px; }"
-            "QPushButton:hover { background: #3d424c; }"
+            f"QDialog#proximityWindow {{ background: {ui_theme.WINDOW}; }}"
+            f"QLabel {{ color: {ui_theme.TEXT_DIM}; background: transparent; }}"
+            f"QPushButton {{ color: {ui_theme.TEXT}; background: {ui_theme.BUTTON}; border: 1px solid {ui_theme.BUTTON_BORDER};"
+            " border-radius: 6px; padding: 4px 10px; }"
+            f"QPushButton:hover {{ background: {ui_theme.BUTTON_HOVER}; }}"
         )
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
