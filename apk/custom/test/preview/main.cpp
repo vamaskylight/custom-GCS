@@ -326,14 +326,24 @@ class FakeAppSettings : public QObject
     Q_PROPERTY(QString photoSavePath READ photoSavePath NOTIFY savePathsChanged)
 
 public:
-    QString videoSavePath() const { return hasFolder ? QStringLiteral("VAMA-GCS/Video") : QString(); }
-    QString photoSavePath() const { return hasFolder ? QStringLiteral("VAMA-GCS/Photo") : QString(); }
+    QString videoSavePath() const { return hasFolder ? root + QLatin1Char('/') + appName + QStringLiteral("/Video") : QString(); }
+    QString photoSavePath() const { return hasFolder ? root + QLatin1Char('/') + appName + QStringLiteral("/Photo") : QString(); }
     void setHasFolder(bool on)
     {
         hasFolder = on;
         emit savePathsChanged();
     }
+    void setPlace(const QString &newRoot, const QString &newAppName)
+    {
+        root = newRoot;
+        appName = newAppName;
+        emit savePathsChanged();
+    }
     bool hasFolder = true;
+    // As QGC makes the folder on Android: the RC's own storage, or its SD card's root, and the app's
+    // name (AppSettings.cc). Only text here: the copies of the preview go to its own folder.
+    QString root = QStringLiteral("/storage/emulated/0");
+    QString appName = QStringLiteral("VAMA-GCS");
 
 signals:
     void savePathsChanged();
@@ -1849,7 +1859,7 @@ int main(int argc, char *argv[])
              // the app's video item.
              const QString rcSays = rcText ? rcText->property("text").toString() : QString();
              const bool written = waitFor([&]() { return QFile::exists(global.videos.lastImageFile); }, 2000);
-             expect(global.videos.grabs == 1 && written && rcSays == QStringLiteral("A copy is saved on this RC, in its Photo folder."),
+             expect(global.videos.grabs == 1 && written && rcSays == QStringLiteral("A copy is saved on this RC, in VAMA-GCS/Photo."),
                     "photo: a copy goes to the RC's Photo folder (the video item writes it), and the note says so",
                     rcSays + QStringLiteral(" | ") + global.videos.lastImageFile);
              shot("35_photo_note.png");
@@ -3426,7 +3436,7 @@ int main(int argc, char *argv[])
              // Here the result box and the lock message show at the top: the note goes under them.
              expect(noteInItsPlace(), "record: the note is under the boxes at the top, not over them", QString());
              expect(global.videos.recording() && rcRec && rcRec->isVisible() &&
-                        rcSays == QStringLiteral("A copy is recorded on this RC, in its Video folder."),
+                        rcSays == QStringLiteral("A copy is recorded on this RC, in VAMA-GCS/Video."),
                     "record: the RC records a copy as well, and the status and the note say so", rcSays);
              shot("36_recording.png");
              tap("vamaRecordButton");
@@ -3442,7 +3452,7 @@ int main(int argc, char *argv[])
              expect(stopped && rec && !rec->isVisible() && says == QStringLiteral("Recording stopped. The video is on the camera's SD card."),
                     "record: the second press stops the camera's recording", says);
              expect(!global.videos.recording() && global.videos.recordStops == 1 && rcRec && !rcRec->isVisible() &&
-                        rcSays == QStringLiteral("The copy is saved on this RC, in its Video folder."),
+                        rcSays == QStringLiteral("The copy is saved on this RC, in VAMA-GCS/Video."),
                     "record: and the RC's copy, which is saved", rcSays);
              // The RC's copy ending by itself (task AM, client 2026-10-27: build 14 said "The copy is
              // saved" over an empty file): its video restarts, and a new copy starts when it is back.
@@ -3467,7 +3477,7 @@ int main(int argc, char *argv[])
              const bool again = waitFor([&]() { return global.videos.recording(); }, 3000);
              QQuickItem *rcText = findItem("vamaRcNoteText");
              const QString rcSays = rcText ? rcText->property("text").toString() : QString();
-             expect(again && global.videos.recordStarts == 3 && rcSays == QStringLiteral("A new copy is recorded on this RC, in its Video folder."),
+             expect(again && global.videos.recordStarts == 3 && rcSays == QStringLiteral("A new copy is recorded on this RC, in VAMA-GCS/Video."),
                     "RC copy stopped by itself: a new copy starts when the video is back", rcSays);
              global.videos.failRecording();  // the video runs on: a new copy a moment later
          }},
@@ -3516,7 +3526,7 @@ int main(int argc, char *argv[])
              QQuickItem *rcText = findItem("vamaRcNoteText");
              const QString says = text ? text->property("text").toString() : QString();
              expect(says == QStringLiteral("The camera has no SD card. The photo is not saved.") && rcText &&
-                        rcText->property("text").toString() == QStringLiteral("A copy is saved on this RC, in its Photo folder."),
+                        rcText->property("text").toString() == QStringLiteral("A copy is saved on this RC, in VAMA-GCS/Photo."),
                     "SD card: a photo without a card says that it is not saved, and the RC has its copy", says);
              shot("37_no_sd_card.png");
              // The camera cannot record (no card), the RC can: the button shows the RC's recording, and
@@ -3537,7 +3547,7 @@ int main(int argc, char *argv[])
         {300, [&]() {
              QQuickItem *rcText = findItem("vamaRcNoteText");
              expect(!global.videos.recording() && camera.recording == false && rcText &&
-                        rcText->property("text").toString() == QStringLiteral("The copy is saved on this RC, in its Video folder."),
+                        rcText->property("text").toString() == QStringLiteral("The copy is saved on this RC, in VAMA-GCS/Video."),
                     "record without an SD card: the next press stops the RC's copy", QString());
              // No video: no copy, and the note says why.
              global.videos.setDecoding(false);
@@ -3556,8 +3566,22 @@ int main(int argc, char *argv[])
              const QString says = storage ? storage->property("text").toString() : QString();
              expect(storage && storage->isVisible() &&
                         says == QStringLiteral("The camera saves its photos and videos on its own SD card. The camera says it has no SD card. "
-                                               "A copy of each is saved on this remote control, in its Photo and Video folders."),
+                                               "A copy of each is saved on this remote control, in VAMA-GCS/Photo and VAMA-GCS/Video."),
                     "camera settings: where photos and videos go, and what the camera says of its SD card", says);
+             // B30: QGC saves on the RC's SD card when it can (most likely where the client's copy was), and a
+             // customer's own build has its own name, so its own folder.
+             global.settings.app.setPlace(QStringLiteral("/storage/1A2B-3C4D"), QStringLiteral("Customer GCS"));
+             const QString cardSays = storage ? storage->property("text").toString() : QString();
+             QObject *layer = window->property("layer").value<QObject *>();
+             QVariant place;
+             const bool asked = layer && QMetaObject::invokeMethod(layer, "_rcPlace", Q_RETURN_ARG(QVariant, place),
+                                                                   Q_ARG(QVariant, QVariant(QStringLiteral("Video"))));
+             expect(cardSays.endsWith(QStringLiteral("A copy of each is saved on this remote control's SD card, "
+                                                     "in Customer GCS/Photo and Customer GCS/Video.")) &&
+                        asked && place.toString() == QStringLiteral("on this RC's SD card, in Customer GCS/Video"),
+                    "RC copies: the notes name the app's own folder, and the SD card when QGC saves there",
+                    cardSays + QStringLiteral(" | ") + place.toString());
+             global.settings.app.setPlace(QStringLiteral("/storage/emulated/0"), QStringLiteral("VAMA-GCS"));
              QMetaObject::invokeMethod(window->findChild<QObject *>(QStringLiteral("vamaCameraSettings")), "close");
          }},
         {100, [&]() {

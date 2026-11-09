@@ -24,6 +24,8 @@ _COMPANION_RTSP_OPEN_LOCK = threading.Lock()
 _COMPANION_RTSP_LAST_OPEN_MONO: float = 0.0
 # Same camera IP (e.g. 192.168.144.108) may only host one FFmpeg RTSP session.
 _COMPANION_RTSP_HOST_OWNER: dict[str, str] = {}
+# One closer per decode FFmpeg (RtspSource._close_decode_proc, row B32).
+_DECODE_PROC_CLOSE_LOCK = threading.Lock()
 # While gimbal is slewing, never freeze preview on "corrupt" vs last-good (scene changed).
 _companion_preview_motion_until: float = 0.0
 # App minimized / alt-tab — pause RTSP reconnect churn until foreground.
@@ -2809,6 +2811,34 @@ class RtspSource(QObject):
         self._ffmpeg_proc = None
         if p is None:
             return
+        self._close_decode_proc(p)
+
+    def _close_session_decode_proc(self, proc: subprocess.Popen[bytes] | None) -> None:
+        """End a decode session's own FFmpeg (row B32, 2026-11-07).
+
+        Not `_close_ffmpeg_decode_proc`: a restart joins the old decode thread for 3 s at
+        most and then starts the next session, so when an old session ends,
+        `self._ffmpeg_proc` may hold the next session's FFmpeg. Ending that one stuck the
+        new picture, and the old session's own FFmpeg, stored nowhere then, kept the
+        camera's only RTSP slot. The stored one is cleared only while it is this one.
+        """
+        if proc is None:
+            return
+        if self._ffmpeg_proc is proc:
+            self._ffmpeg_proc = None
+        self._close_decode_proc(proc)
+
+    def _close_decode_proc(self, p: subprocess.Popen[bytes]) -> None:
+        """End one decode FFmpeg: "q" for its RTSP TEARDOWN, else kill, then its pipes.
+
+        Once per FFmpeg. The stop (GUI thread) and the session's own end can come at the
+        same time, and the second "q" found stdin closed, so its caller killed FFmpeg and
+        the camera got no TEARDOWN. The second closer leaves it, and counts no miss.
+        """
+        with _DECODE_PROC_CLOSE_LOCK:
+            if getattr(p, "_vgcs_closing", False):
+                return
+            p._vgcs_closing = True  # type: ignore[attr-defined]
         # On Windows, closing the pipe before the child exits can block the calling thread.
         # Kill first so the reader thread wakes, then close the handle.
         try:
@@ -3108,6 +3138,8 @@ class RtspSource(QObject):
             pass
         # This thread owns exactly one decode generation; a newer one supersedes it.
         my_gen = int(self._ffmpeg_gen) if gen is None else int(gen)
+        # The last FFmpeg this thread started: `self._ffmpeg_proc` may be the next session's (B32).
+        own_proc: subprocess.Popen[bytes] | None = None
 
         def _ended() -> bool:
             return self._decode_session_ended(my_gen)
@@ -3298,6 +3330,10 @@ class RtspSource(QObject):
                                 getattr(self, "_siyi_last_open_tail", b"") or b"",
                                 sleeper=_backoff,
                             )
+                        # Superseded during that wait (the backoff gives up at once): open no
+                        # RTSP session on the one-client camera the next session needs (row B32).
+                        if _ended():
+                            break
                         if siyi_url and (
                             transport_got_frames or self._companion_transport_override
                         ):
@@ -3346,6 +3382,7 @@ class RtspSource(QObject):
                                 # (see `_quit_ffmpeg_gracefully`).
                                 stdin=subprocess.PIPE,
                             )
+                            own_proc = p
                             self._ffmpeg_proc = p
 
                             def _drain_stderr(
@@ -3391,7 +3428,9 @@ class RtspSource(QObject):
                             ).start()
                         except Exception as e:
                             self.error.emit(f"FFmpeg start (continuous) failed: {e}")
-                            self._ffmpeg_proc = None
+                            # This session's own FFmpeg if it started, never the stored one of
+                            # the next session (row B32).
+                            self._close_session_decode_proc(p)
                             empty_sessions += 1
                             if empty_sessions >= empty_session_limit:
                                 break
@@ -3399,7 +3438,7 @@ class RtspSource(QObject):
                             continue
 
                         if p.stdout is None:
-                            self._close_ffmpeg_decode_proc()
+                            self._close_session_decode_proc(p)
                             empty_sessions += 1
                             if empty_sessions >= empty_session_limit:
                                 break
@@ -3805,7 +3844,7 @@ class RtspSource(QObject):
                         finally:
                             session_stop.set()
 
-                        proc = self._ffmpeg_proc
+                        proc = p  # this session's own: the stored one may be the next session's (B32)
                         rc: int | None = None
                         try:
                             if proc is not None:
@@ -3919,7 +3958,7 @@ class RtspSource(QObject):
                                 tcp_138_streak = 0
                             if companion_rtsp:
                                 self._siyi_mark_rtsp_open_result(frames_this_session, tail)
-                        self._close_ffmpeg_decode_proc()
+                        self._close_session_decode_proc(p)
 
                         if _ended():
                             break
@@ -4076,9 +4115,12 @@ class RtspSource(QObject):
                 _backoff(round_backoff_s)
                 round_backoff_s = min(max_round_backoff_s, round_backoff_s * 1.35)
 
-        # User called stop() or thread tear-down; only close the child.
-        self._close_ffmpeg_decode_proc()
-        _companion_release_rtsp_host(self.source_id, url)
+        # User called stop() or thread tear-down; only close the child. This thread's own: a
+        # restart may have started the next session already, with its FFmpeg stored (row B32).
+        self._close_session_decode_proc(own_proc)
+        if not (self._running and int(self._ffmpeg_gen) != my_gen):
+            # Superseded by a restart, the next session of this source holds the host: keep it.
+            _companion_release_rtsp_host(self.source_id, url)
 
 
 class VideoPipeline(QObject):

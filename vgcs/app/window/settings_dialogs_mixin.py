@@ -960,6 +960,12 @@ class MainWindowSettingsDialogsMixin:
                         pass
                     sk_port = 5000
                     skydroid_port.setValue(5000)
+                # The V20 takes TOP on TCP port 5000 only. A port the mouse wheel stepped while the page
+                # scrolled (4981, then 4977 at the client, row B31, 2026-11-06) is put back.
+                elif str(skydroid_profile.currentData() or "") == "c20_default" and sk_port != 5000:
+                    print(f"[VGCS:skydroid] settings: TCP port {sk_port} corrected to 5000 (the V20's gimbal port)")
+                    sk_port = 5000
+                    skydroid_port.setValue(5000)
                 s.setValue("camera/skydroid_port", sk_port)
                 s.setValue("camera/skydroid_timeout_ms", int(skydroid_timeout.value()))
                 s.setValue("camera/skydroid_profile", str(skydroid_profile.currentData() or "c13_default"))

@@ -104,8 +104,17 @@ def skydroid_no_angles_hint(over: str, host: str, port: int) -> str:
     no help there: the gimbal's commands would go to the RC (row B10, 2026-11-05).
     """
     if over == "TCP":
+        # A port the mouse wheel stepped in Application Settings looked like a dead gimbal (row B31).
+        port_note = (
+            ""
+            if int(port) == 5000
+            else f"A V20 takes TOP on TCP port 5000, not {port}: set TCP port 5000 in Application Settings, "
+            "Video, then Apply. "
+        )
         return (
-            f"Skydroid gimbal: no angles from {host}:{port} over TCP yet. A TCP camera (the V20) is asked "
+            f"Skydroid gimbal: no angles from {host}:{port} over TCP yet. "
+            + port_note
+            + "A TCP camera (the V20) is asked "
             "at this one address only. Give the camera's own address as Host (192.168.144.108 on a V20), "
             "or leave Host empty for the RTSP URL's host (else 192.168.144.108), never the RC gateway. "
             f"Ping {host} from this PC first."

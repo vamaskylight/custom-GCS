@@ -41,7 +41,7 @@ from vgcs.skydroid.protocol import (
     _LRF_FRAME_H,
     _LRF_FRAME_W,
 )
-from vgcs.skydroid.transport import TopTcpTransport, TopUdpTransport
+from vgcs.skydroid.transport import TopTcpTransport, TopUdpTransport, append_top_log
 
 # PROTOCAL.doc: TOP UDP port 5000; lens/system also on 9003 on some C13 builds.
 _C13_PROBE_PORTS = (5000, 9003, 19856)
@@ -362,7 +362,14 @@ class SkydroidTopUdpAdapter:
         # The V20's torch (row B27): as it was last told, off at the start (it says nothing back).
         self._torch_on = False
         port_i = int(port)
-        if port_i not in _C13_PROBE_PORTS:
+        if port_i != 5000 and self._one_address():
+            # A TCP camera (the V20) is asked at this one port, and no other port is tried. The line
+            # below said the probe used 5000 while every command went to 4977 (row B31, 2026-11-06).
+            print(
+                f"[VGCS:skydroid] configured TOP TCP port {port_i} is not 5000, the V20's gimbal port: "
+                f"every gimbal command goes to {self._active_host}:{port_i}, and no other port is tried"
+            )
+        elif port_i not in _C13_PROBE_PORTS:
             try:
                 print(
                     f"[VGCS:skydroid] configured TOP UDP port {port_i} is not PROTOCAL "
@@ -4088,9 +4095,26 @@ class SkydroidTopUdpAdapter:
             port.close()
             port = None
         if want and port is None and host:
-            port = c20_camera.C20CameraPort(host, c20_camera.PORT, log=lambda text: print(text, flush=True))
+            port = c20_camera.C20CameraPort(
+                host, c20_camera.PORT, log=lambda text: print(text, flush=True),
+                trace=self._c20_trace_to_log(host),
+            )
             port.start()
             self._c20_port = port
+
+    def _c20_trace_to_log(self, host: str) -> Callable[[str, bytes], None] | None:
+        """The camera port's packets, in hex, into the timed log of the camera's commands
+        (logs/skydroid_top_udp.log) beside the gimbal's (row B33: the client's V20 stopped its
+        video twice, and nothing said what reached its camera port just before)."""
+        log_path = str(getattr(self._transport, "_log_path", "") or "")
+        if not log_path:
+            return None
+        target = f"{host}:{c20_camera.PORT}"
+
+        def trace(direction: str, packet: bytes) -> None:
+            append_top_log(log_path, direction, packet.hex().upper().encode("ascii"), target)
+
+        return trace
 
     def _c20_send(self, packet: bytes, *, what: str = "") -> bool:
         port = self._c20_port

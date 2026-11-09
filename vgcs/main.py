@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from vgcs.app.gcs_style import gcs_stylesheet
 from vgcs.app.license_key import license_required
+from vgcs.app.log_clock import install_log_clock
 from vgcs.app.main_thread_gc import collect_in_main_thread_only
 from vgcs.app.main_window import MainWindow
 from vgcs.app.runtime_ui import (
@@ -18,6 +19,7 @@ from vgcs.app.runtime_ui import (
     configure_high_dpi_policy,
     select_font_profile,
 )
+from vgcs.app.wheel_guard import install_wheel_guard
 
 # Kept open for the process lifetime — faulthandler needs a live file object.
 _crash_log_file = None
@@ -123,6 +125,8 @@ def install_ctrl_c_handler(app, win, *, tick_ms: int = 250) -> "QTimer | None":
 
 
 def main() -> int:
+    # The PC's clock before every line printed from here on (vgcs/app/log_clock.py, row B33).
+    install_log_clock()
     _enable_crash_diagnostics()
     # A run from source uses the PC's FFmpeg. Look for one before the video starts.
     from vgcs.video.ffmpeg_locator import ensure_ffmpeg_on_path
@@ -138,6 +142,9 @@ def main() -> int:
     # thread runs: a collection in the link thread or a map tile task destroys
     # Qt objects there (vgcs/app/main_thread_gc.py, 2026-10-14).
     collect_in_main_thread_only(app)
+    # Number and list boxes never take the mouse wheel, so it scrolls the page they are in
+    # (vgcs/app/wheel_guard.py, row B31, 2026-11-06).
+    install_wheel_guard(app)
     ui_scale = 1.0
     profile = select_font_profile()
     app.setFont(build_base_font(profile, ui_scale=ui_scale))

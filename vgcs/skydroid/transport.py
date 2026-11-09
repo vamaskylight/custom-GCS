@@ -268,6 +268,11 @@ class TopUdpTransport:
         _append_top_log(self._log_path, direction, payload, target or f"{self._host}:{self._port}")
 
 
+def append_top_log(log_path: str, direction: str, payload: bytes, target: str) -> None:
+    """One timed line in the log of the camera's commands (its text: the payload's letters)."""
+    _append_top_log(log_path, direction, payload, target)
+
+
 def _append_top_log(log_path: str, direction: str, payload: bytes, target: str) -> None:
     if not log_path:
         return

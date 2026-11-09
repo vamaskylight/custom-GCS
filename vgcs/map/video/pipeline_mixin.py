@@ -9,7 +9,7 @@ import time
 
 from PySide6.QtCore import QSettings, QThreadPool, Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QLabel, QMessageBox
 
 from vgcs.map.app_settings import QS_APP, QS_ORG
 from vgcs.map.video.encode_bridge import VideoEncodeBridge, VideoEncodeTask
@@ -44,6 +44,23 @@ from vgcs.video.pipeline import (
     suggested_recording_save_path,
     wait_qmedia_recorder_stopped,
 )
+
+
+def video_stale_notice_s() -> float:
+    """Seconds without a new frame before the picture says it is not live (VGCS_VIDEO_STALE_NOTICE_S)."""
+    try:
+        seconds = float(str(os.environ.get("VGCS_VIDEO_STALE_NOTICE_S", "3") or "3").strip())
+    except ValueError:
+        seconds = 3.0
+    return max(1.0, min(60.0, seconds))
+
+
+def video_live_notice_text(age_s: float) -> str:
+    """The words over a held frame (row B33)."""
+    return (
+        f"No live picture for {int(age_s)} s. This is the last frame, "
+        "waiting for the camera's video."
+    )
 
 
 class VideoPipelineMixin:
@@ -324,6 +341,11 @@ class VideoPipelineMixin:
             self._video_preview_stall_timer = QTimer(self)
             self._video_preview_stall_timer.setInterval(1000)
             self._video_preview_stall_timer.timeout.connect(self._on_video_preview_stall_check)
+        if not hasattr(self, "_video_live_notice_timer") or self._video_live_notice_timer is None:
+            # A held frame never looks live (row B33): it runs with the preview.
+            self._video_live_notice_timer = QTimer(self)
+            self._video_live_notice_timer.setInterval(1000)
+            self._video_live_notice_timer.timeout.connect(self._on_video_live_notice_tick)
         if not hasattr(self, "_split_render_timer") or self._split_render_timer is None:
             self._split_render_timer = QTimer(self)
             self._split_render_timer.setSingleShot(True)
@@ -925,6 +947,79 @@ class VideoPipelineMixin:
         # SIYI companion: off by default — killing a live FFmpeg session causes RTSP -138 freezes.
         return False
 
+    def _on_video_live_notice_tick(self) -> None:
+        """Say on the picture when it is not live (row B33).
+
+        On 2026-11-07 the V20's stream ended, VGCS reopened it for a minute and held the last
+        good frame all that time, and the operator could not tell it from a live picture: "screen
+        froze". The stall recovery above is opt-in and says nothing on the screen.
+        """
+        age = self._video_picture_age_s()
+        if age is None or age < video_stale_notice_s():
+            self._hide_video_live_notice()
+            return
+        self._show_video_live_notice(age)
+
+    def _video_picture_age_s(self) -> float | None:
+        """Seconds since the last new frame, or None while there is nothing to say: no preview,
+        or no frame yet (the placeholder says "connecting")."""
+        if not bool(getattr(self, "_video_preview_enabled", False)):
+            return None
+        lab = getattr(self, "_native_video_preview", None)
+        if lab is None or not lab.isVisible():
+            return None
+        last_img = getattr(self, "_native_video_last", None)
+        if last_img is None or last_img.isNull():
+            return None
+        last = float(getattr(self, "_native_video_last_frame_mono", 0.0) or 0.0)
+        if last <= 0.0:
+            return None
+        return max(0.0, time.monotonic() - last)
+
+    def _show_video_live_notice(self, age_s: float) -> None:
+        lab = self._native_video_preview
+        note = getattr(self, "_video_live_notice", None)
+        if note is None:
+            note = QLabel(lab)
+            note.setObjectName("videoLiveNotice")
+            note.setWordWrap(True)
+            note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Clicks on the picture (swap, split, tap to lock) go on as before.
+            note.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            note.setStyleSheet(
+                "QLabel#videoLiveNotice {"
+                "background: rgba(110, 24, 24, 0.86);"
+                "color: #ffffff;"
+                "font: 600 12px \"Segoe UI\", Arial, sans-serif;"
+                "border-radius: 6px;"
+                "padding: 4px 8px;"
+                "}"
+            )
+            self._video_live_notice = note
+        note.setText(video_live_notice_text(age_s))
+        margin = 8
+        # A message, not a stripe across a full-size picture.
+        width = max(80, min(560, lab.width() - 2 * margin))
+        note.setFixedWidth(width)
+        note.adjustSize()
+        # In the middle: the banners of a recording or an observation clip sit at the top.
+        note.move((lab.width() - width) // 2, max(margin, (lab.height() - note.height()) // 2))
+        note.show()
+        note.raise_()  # above the marks and reticles of the overlay layer
+
+    def _hide_video_live_notice(self) -> None:
+        note = getattr(self, "_video_live_notice", None)
+        if note is not None and note.isVisible():
+            note.hide()
+
+    def _video_live_again(self) -> None:
+        """A new frame: the notice goes, and its timer runs. Several paths show the preview
+        (a start, a new source list, the first frame), and every one of them gets frames here."""
+        self._hide_video_live_notice()
+        timer = getattr(self, "_video_live_notice_timer", None)
+        if timer is not None and not timer.isActive():
+            timer.start()
+
     def _on_video_preview_stall_check(self) -> None:
         """Restart decode when preview paint stalls (opt-in via VGCS_VIDEO_GUI_STALL=1)."""
         if not self._video_gui_stall_recovery_enabled():
@@ -1084,6 +1179,9 @@ class VideoPipelineMixin:
                     t_stall = getattr(self, "_video_preview_stall_timer", None)
                     if t_stall is not None and self._video_gui_stall_recovery_enabled():
                         t_stall.start()
+                    t_notice = getattr(self, "_video_live_notice_timer", None)
+                    if t_notice is not None:
+                        t_notice.start()
                 except Exception:
                     pass
                 try:
@@ -1126,6 +1224,10 @@ class VideoPipelineMixin:
                 t_stall.stop()
         except Exception:
             pass
+        t_notice = getattr(self, "_video_live_notice_timer", None)
+        if t_notice is not None and t_notice.isActive():
+            t_notice.stop()
+        self._hide_video_live_notice()
         try:
             self._native_video_preview.hide()
             self._native_minimap_wrap.hide()
@@ -1230,6 +1332,7 @@ class VideoPipelineMixin:
                 return
         now_frame = time.monotonic()
         self._native_video_last_frame_mono = now_frame
+        self._video_live_again()
         last_render = float(getattr(self, "_video_ui_render_mono", 0.0) or 0.0)
         render_ui = (now_frame - last_render) >= 0.04  # ~25 Hz paint cap (RTSP may be 30 Hz)
         self._video_preview_got_frame = True
@@ -1307,6 +1410,7 @@ class VideoPipelineMixin:
             return
         cache_times[sid] = now_frame
         self._native_video_last_frame_mono = now_frame
+        self._video_live_again()
         self._video_preview_got_frame = True
         try:
             img = vf.image

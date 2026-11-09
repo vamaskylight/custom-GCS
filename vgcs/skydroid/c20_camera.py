@@ -25,6 +25,13 @@ The camera's state (group 0x33, command 0x55, no payload) is asked as the SDK's 
 asks it: at once, then every 15 s, its answer left unread. The client's V20 closed a connection that
 asked nothing every 20 to 24 s (row B29, 2026-11-05).
 
+For a field log (row B33, 2026-11-09): the client's V20 stopped its video twice in one run, with
+nothing in VGCS's log to say how it streams or what reached its camera port just before. So each
+new connection also asks the camera's video settings and its version once (the SDK's
+getEncodingConfig and getVersion, only read, never set), the log says them and says the state's
+answer when it changes, and every packet of this port goes into the timed log of the camera's
+commands (logs/skydroid_top_udp.log), beside the gimbal's.
+
 The app has the same in C++ (apk/custom/src/Skydroid/C20Camera.*), checked against this file
 by apk/custom/test/gen_c20_vectors.py.
 """
@@ -59,10 +66,25 @@ CAPTURE_REPLY_MIN_PAYLOAD = 32
 _CAPTURE_PHOTO = 0x0C
 _CAPTURE_RECORD_START = 0x0B
 _CAPTURE_RECORD_STOP = 0x0A
+# The camera's video settings and its version (row B33, 2026-11-09: the client's V20 stopped its
+# video twice in one run, and nothing in the log said how it streams). The SDK's getEncodingConfig
+# (and getResolution, getBitrate, getFrameRate, getGOP, getEncodingFormat, which read the same reply)
+# sends group 0x11, command 0x03, no payload, and takes a reply with at least 46 bytes of payload:
+# byte 1 the resolution (4 720p, 5 960p, 6 1080p, 7 3M), byte 5 the bitrate in hundreds, byte 6 the
+# frame rate plus 100, byte 7 the coding (10 H.264, 11 H.265), byte 13 the GOP. getVersion sends
+# group 0x11, command 0x01 and hands its reply on unread. Both are only read here, never set.
+GROUP_SETUP = 0x11
+CMD_VERSION = 0x01
+CMD_ENCODING_READ = 0x03
+ENCODING_REPLY_MIN_PAYLOAD = 46
+_SETUP_ASK_GAP_S = 0.5  # after the connect's state question, then between the two
+_RESOLUTIONS = {4: "720p", 5: "960p", 6: "1080p", 7: "3M"}
+_CODINGS = {10: "H.264", 11: "H.265"}
 # A reply the SDK reads as one packet, and the payload it wants in it.
 _REPLY_MIN_PAYLOAD = {
     (GROUP_ZOOM, CMD_ZOOM_READ): ZOOM_READ_MIN_PAYLOAD,
     (GROUP_CAMERA, CMD_CAPTURE): CAPTURE_REPLY_MIN_PAYLOAD,
+    (GROUP_SETUP, CMD_ENCODING_READ): ENCODING_REPLY_MIN_PAYLOAD,
 }
 
 
@@ -93,6 +115,40 @@ def build_zoom_query() -> bytes:
 def build_state_query() -> bytes:
     """The SDK's getCameraState: no payload, so a length of 0."""
     return build_packet(GROUP_CAMERA, CMD_STATE)
+
+
+def build_encoding_query() -> bytes:
+    """The SDK's getEncodingConfig: group 0x11, command 0x03, no payload."""
+    return build_packet(GROUP_SETUP, CMD_ENCODING_READ)
+
+
+def build_version_query() -> bytes:
+    """The SDK's getVersion: group 0x11, command 0x01, no payload."""
+    return build_packet(GROUP_SETUP, CMD_VERSION)
+
+
+def encoding_of_reply(packet: bytes) -> str | None:
+    """The video settings a reply to ``build_encoding_query`` says, in words, as the SDK reads them
+    (for example "H.264, 1080p, 30 fps, bitrate 4000, GOP 30"), or None (another packet, or less
+    than the SDK takes). A value the SDK has no name for is given as its number."""
+    if len(packet) < HEADER_LEN + ENCODING_REPLY_MIN_PAYLOAD:
+        return None
+    if packet[6] != GROUP_SETUP or packet[7] != CMD_ENCODING_READ:
+        return None
+    p = packet[HEADER_LEN:]
+    resolution = _RESOLUTIONS.get(p[1], f"resolution {p[1]}")
+    coding = _CODINGS.get(p[7], f"coding {p[7]}")
+    return f"{coding}, {resolution}, {p[6] - 100} fps, bitrate {p[5] * 100}, GOP {p[13]}"
+
+
+def _is_reply_to(packet: bytes, group: int, command: int) -> bool:
+    return len(packet) >= HEADER_LEN and packet[6] == group and packet[7] == command
+
+
+def _hex_and_text(data: bytes) -> str:
+    """Bytes in hex, with their printable letters after them when there are some (a version)."""
+    text = "".join(chr(b) for b in data if 32 <= b < 127).strip()
+    return data.hex().upper() + (f" ({text})" if len(text) >= 3 else "")
 
 
 def _build_capture(action: int) -> bytes:
@@ -171,6 +227,11 @@ class C20CameraPort:
     asks the camera's state at once and every ``state_ask_s`` as the SDK does, and reads the
     replies. ``send`` never waits for a connection: a packet sent while there is none is
     dropped, and says so by returning False.
+
+    For a field log (row B33): each new connection asks the camera's video settings and its
+    version once, and the log says them; the log says the state's answer when it changes; and
+    ``trace`` (if given) gets every packet sent ("TX") and read ("RX"), for the timed log of
+    the camera's commands.
     """
 
     _CONNECT_TIMEOUT_S = 1.0
@@ -178,10 +239,17 @@ class C20CameraPort:
     _SEND_TIMEOUT_S = 0.5
 
     def __init__(self, host: str, port: int = PORT, *, log: Callable[[str], None] | None = None,
-                 state_ask_s: float = STATE_ASK_S) -> None:
+                 state_ask_s: float = STATE_ASK_S,
+                 trace: Callable[[str, bytes], None] | None = None) -> None:
         self._host = str(host or "").strip()
         self._port = int(port)
         self._log = log
+        self._trace = trace
+        # A new connection asks the video settings and the version once, each in a packet of its
+        # own a moment apart (the SDK waits for each answer; a camera may read a TCP read as one packet).
+        self._setup_asks: list[tuple[float, bytes]] = []
+        self._state_raw: str | None = None  # the payload of the last state answer, in hex
+        self._encoding = ""  # the video settings the camera last said, in words
         self._state_ask_s = max(0.05, float(state_ask_s))
         self._next_state_ask = 0.0  # time.monotonic of the next state question
         self._lock = threading.Lock()
@@ -227,10 +295,16 @@ class C20CameraPort:
             try:
                 sock.settimeout(self._SEND_TIMEOUT_S)
                 sock.sendall(packet)
-                return True
             except OSError as e:
                 self._drop(f"lost ({e})")
                 return False
+        self._trace_packet("TX", packet)
+        return True
+
+    def video_settings(self) -> str:
+        """The video settings the camera last said, in words ("" if it never said them)."""
+        with self._lock:
+            return self._encoding
 
     def zoom_x(self, max_age_s: float | None = None) -> int | None:
         """The zoom the camera last said (1 to 22), or None (never, or older than ``max_age_s``)."""
@@ -271,7 +345,9 @@ class C20CameraPort:
                 continue
             if time.monotonic() >= self._next_state_ask:
                 self._next_state_ask = time.monotonic() + self._state_ask_s
-                self.send(build_state_query())  # its answer is read and left, as by the SDK
+                self.send(build_state_query())  # the SDK leaves its answer; the log says a change
+            if self._setup_asks and time.monotonic() >= self._setup_asks[0][0]:
+                self.send(self._setup_asks.pop(0)[1])
             try:
                 readable, _, _ = select.select([sock], [], [], 0.1)
             except (OSError, ValueError):
@@ -292,7 +368,9 @@ class C20CameraPort:
                 if not data:
                     self._drop("closed by the camera")
                     continue
-                for packet in split_packets(data):
+                packets = split_packets(data)
+                said = self._read_setup_and_state(packets)
+                for packet in packets:
                     zoom = zoom_of_reply(packet)
                     if zoom is not None:
                         self._zoom_x = zoom
@@ -303,6 +381,41 @@ class C20CameraPort:
                         self._capture_count += 1
                         self._capture_ok = done
                         self._capture_raw = packet[HEADER_LEN:].hex().upper()
+            for packet in packets:
+                self._trace_packet("RX", packet)
+            for text in said:
+                self._say(text)
+
+    def _read_setup_and_state(self, packets: list[bytes]) -> list[str]:
+        """With the lock held: what the log says about these packets (the video settings and the
+        version, and the state's answer when it is new)."""
+        said: list[str] = []
+        for packet in packets:
+            if _is_reply_to(packet, GROUP_SETUP, CMD_ENCODING_READ):
+                words = encoding_of_reply(packet)
+                if words is None:
+                    said.append("video settings: an answer shorter than Skydroid's SDK takes "
+                                f"({packet[HEADER_LEN:].hex().upper()})")
+                else:
+                    self._encoding = words
+                    said.append(f"video settings: {words}")
+            elif _is_reply_to(packet, GROUP_SETUP, CMD_VERSION):
+                said.append(f"version: {_hex_and_text(packet[HEADER_LEN:])}")
+            elif _is_reply_to(packet, GROUP_CAMERA, CMD_STATE):
+                raw = packet[HEADER_LEN:].hex().upper()
+                if raw != self._state_raw:
+                    word = "state" if self._state_raw is None else "state changed"
+                    self._state_raw = raw
+                    said.append(f"{word}: {raw or 'no payload'}")
+        return said
+
+    def _trace_packet(self, direction: str, packet: bytes) -> None:
+        if self._trace is None:
+            return
+        try:
+            self._trace(direction, packet)
+        except (OSError, ValueError, RuntimeError):
+            return  # a field log that cannot be written never stops the camera port
 
     def _connect(self) -> bool:
         try:
@@ -319,6 +432,9 @@ class C20CameraPort:
                 return False
             self._sock = sock
         self._next_state_ask = 0.0  # a new connection asks the state at once, as the SDK's thread starts
+        now = time.monotonic()
+        self._setup_asks = [(now + _SETUP_ASK_GAP_S, build_encoding_query()),
+                            (now + 2 * _SETUP_ASK_GAP_S, build_version_query())]
         self._said_cannot_connect = False
         self._say(f"connected to {self._host}:{self._port}")
         return True

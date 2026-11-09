@@ -649,6 +649,31 @@ Item {
         _rcNoteText = text
         cameraNoteTimer.restart()
     }
+    // Where QGC saves the copies, as the RC's Files app shows the folder: "VAMA-GCS/Video", and "on this
+    // RC's SD card" when QGC saves there (its choice when a card is in and allowed, AppSettings.cc). The
+    // folder is named after the app, so a customer's own build has its own. "In its Video folder" sent the
+    // client to the app's files, to Recordings and to another app's folder, while the copy was most
+    // likely on the RC's SD card (row B30, 2026-11-06).
+    function _rcFolder(path, kind) {
+        var parts = String(path || "").split("/").filter(function(part) { return part !== "" })
+        return parts.length >= 2 ? parts[parts.length - 2] + "/" + parts[parts.length - 1]
+                                 : qsTr("its %1 folder").arg(kind)
+    }
+    function _rcOnCard(path) {
+        var p = String(path || "")
+        return p.indexOf("/storage/") === 0 && p.indexOf("/storage/emulated/") !== 0
+    }
+    function _rcPlace(kind) {  // "on this RC, in VAMA-GCS/Video"
+        var path = _appSettings ? (kind === "Photo" ? _appSettings.photoSavePath : _appSettings.videoSavePath) : ""
+        return (_rcOnCard(path) ? qsTr("on this RC's SD card, in %1") : qsTr("on this RC, in %1")).arg(_rcFolder(path, kind))
+    }
+    function _rcBothPlaces() {  // "on this remote control, in VAMA-GCS/Photo and VAMA-GCS/Video"
+        var photo = _appSettings ? _appSettings.photoSavePath : ""
+        var video = _appSettings ? _appSettings.videoSavePath : ""
+        return (_rcOnCard(video) ? qsTr("on this remote control's SD card, in %1 and %2")
+                                 : qsTr("on this remote control, in %1 and %2"))
+               .arg(_rcFolder(photo, "Photo")).arg(_rcFolder(video, "Video"))
+    }
     function _takePhoto() {
         _cameraNoteText = ""  // the note of the press before
         _link.takePhoto()
@@ -664,7 +689,7 @@ Item {
             return
         }
         _videoManager.grabImage()
-        _showRcNote(qsTr("A copy is saved on this RC, in its Photo folder."))
+        _showRcNote(qsTr("A copy is saved %1.").arg(_rcPlace("Photo")))
     }
     function _record(start) {
         _cameraNoteText = ""
@@ -704,12 +729,12 @@ Item {
         function onRecordingChanged() {
             // From the video manager itself: the binding of _rcRecording may not have its new value yet.
             if (_videoManager.recording === true) {
-                _showRcNote(_rcCopyRestarts > 0 ? qsTr("A new copy is recorded on this RC, in its Video folder.")
-                                                : qsTr("A copy is recorded on this RC, in its Video folder."))
+                _showRcNote((_rcCopyRestarts > 0 ? qsTr("A new copy is recorded %1.") : qsTr("A copy is recorded %1."))
+                            .arg(_rcPlace("Video")))
                 return
             }
             if (!_rcCopyWanted) {
-                _showRcNote(qsTr("The copy is saved on this RC, in its Video folder."))
+                _showRcNote(qsTr("The copy is saved %1.").arg(_rcPlace("Video")))
                 return
             }
             // Nobody pressed stop: the RC's video restarted, and the file may be empty.
@@ -2064,8 +2089,8 @@ Item {
                     text:             (_link.camera.photo || _link.camera.record)
                                       ? qsTr("The camera saves its photos and videos on its own SD card.") +
                                         (_link.sdCardText !== "" ? " " + _link.sdCardText : "") + " " +
-                                        qsTr("A copy of each is saved on this remote control, in its Photo and Video folders.")
-                                      : qsTr("Photos and videos of the picture are saved on this remote control, in its Photo and Video folders.")
+                                        qsTr("A copy of each is saved %1.").arg(_rcBothPlaces())
+                                      : qsTr("Photos and videos of the picture are saved %1.").arg(_rcBothPlaces())
                 }
 
                 // What the camera itself says about its zoom, to check the zoom number on a C13.
